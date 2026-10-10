@@ -255,6 +255,88 @@ impl Feedback {
     }
 }
 
+/// Control-stream frame types a client before the feedback datagram (0.43 and older) sends.
+/// Retired: the registry never hands these numbers out again.
+const RETIRED_LINK_REPORT: u64 = 0x27;
+const RETIRED_LOSS_REPORT: u64 = 0x2E;
+const RETIRED_DELIVERY_REPORT: u64 = 0x2F;
+const RETIRED_RFI_REQUEST: u64 = 0x36;
+const RETIRED_REQUEST_KEYFRAME: u64 = 0x37;
+const RETIRED: [u64; 5] = [
+    RETIRED_LINK_REPORT,
+    RETIRED_LOSS_REPORT,
+    RETIRED_DELIVERY_REPORT,
+    RETIRED_RFI_REQUEST,
+    RETIRED_REQUEST_KEYFRAME,
+];
+
+/// An older client's control-stream reports and asks, read as the [`Feedback`] a current
+/// client sends, numbered from 1. Such a client sends its loss report and then its delivery
+/// count each window; the count closes the window.
+#[derive(Debug, Default)]
+pub struct RetiredFeedback {
+    window: u32,
+    ask: u16,
+    loss_ppm: u32,
+    link_kbps: u32,
+}
+
+impl RetiredFeedback {
+    pub fn reads(ty: u64) -> bool {
+        RETIRED.contains(&ty)
+    }
+
+    /// The feedback frame `ty` stands for. `None` for a loss report, which waits for its
+    /// window's delivery count, and for a body that does not parse.
+    pub fn read(&mut self, ty: u64, body: &[u8]) -> Option<Feedback> {
+        let (mut one, mut two) = (None, None);
+        let mut r = FieldReader::new(body);
+        while let Some((tag, v)) = r.next_field().ok()? {
+            match tag {
+                1 => one = Some(v),
+                2 => two = Some(v),
+                _ => {}
+            }
+        }
+        let u32_at = |v: Option<&[u8]>| v.map_or(Ok(0), u32_of).ok();
+        let mut fb = Feedback {
+            link_kbps: self.link_kbps,
+            ..Feedback::default()
+        };
+        match ty {
+            RETIRED_LOSS_REPORT => {
+                self.loss_ppm = u32_at(one)?;
+                return None;
+            }
+            RETIRED_DELIVERY_REPORT => {
+                fb.packets_received = one.map_or(Ok(0), u64_of).ok()?;
+                self.window += 1;
+                fb.window = self.window;
+                fb.loss_ppm = std::mem::take(&mut self.loss_ppm);
+            }
+            RETIRED_LINK_REPORT => {
+                self.link_kbps = u32_at(one)?;
+                fb.link_kbps = self.link_kbps;
+            }
+            RETIRED_RFI_REQUEST => {
+                fb.invalidate = Some((u32_at(one)?, u32_at(two)?));
+                fb.ask = self.next_ask();
+            }
+            RETIRED_REQUEST_KEYFRAME => {
+                fb.keyframe = true;
+                fb.ask = self.next_ask();
+            }
+            _ => return None,
+        }
+        Some(fb)
+    }
+
+    fn next_ask(&mut self) -> u16 {
+        self.ask = self.ask.wrapping_add(1).max(1);
+        self.ask
+    }
+}
+
 /// A probe carries `t1` (1); an echo adds the host's receive and send times (2, 3).
 pub fn encode_clock_probe(p: &ClockProbe) -> Vec<u8> {
     encode(DGRAM_CLOCK, &Fields::new().u64(1, p.t1_ns).into_body())
@@ -338,6 +420,51 @@ mod tests {
         assert_eq!(client_payload(&Feedback::default().encode()), None);
         assert_eq!(client_payload(&encode(DGRAM_MEDIA, &[9, 9])), None);
         assert_eq!(client_payload(&[]), None);
+    }
+
+    /// The frames a 0.43 client sends, field for field as it encoded them.
+    #[test]
+    fn an_older_clients_control_frames_read_as_feedback() {
+        let body = |f: Fields| f.into_body();
+        let mut r = RetiredFeedback::default();
+        assert!(RetiredFeedback::reads(RETIRED_RFI_REQUEST));
+        assert!(!RetiredFeedback::reads(MSG_SET_BITRATE));
+        assert!(FRAMES.iter().all(|(_, t, _)| !RETIRED.contains(t)));
+
+        let link = r.read(RETIRED_LINK_REPORT, &body(Fields::new().u32(1, 80_000)));
+        assert_eq!(
+            link.map(|f| (f.link_kbps, f.window, f.ask)),
+            Some((80_000, 0, 0))
+        );
+        assert_eq!(
+            r.read(RETIRED_LOSS_REPORT, &body(Fields::new().u32(1, 1_500))),
+            None
+        );
+        let w = r
+            .read(RETIRED_DELIVERY_REPORT, &body(Fields::new().u64(1, 9_000)))
+            .unwrap();
+        assert_eq!(
+            (w.window, w.loss_ppm, w.packets_received, w.link_kbps, w.ask),
+            (1, 1_500, 9_000, 80_000, 0)
+        );
+        // A window's loss is its own: the next window without a loss report reads none.
+        let next = r.read(RETIRED_DELIVERY_REPORT, &body(Fields::new().u64(1, 9_400)));
+        assert_eq!(next.map(|f| (f.window, f.loss_ppm)), Some((2, 0)));
+
+        let rfi = r
+            .read(
+                RETIRED_RFI_REQUEST,
+                &body(Fields::new().u32(1, 40).u32(2, 42)),
+            )
+            .unwrap();
+        assert_eq!(
+            (rfi.ask, rfi.invalidate, rfi.window),
+            (1, Some((40, 42)), 0)
+        );
+        r.ask = u16::MAX;
+        let kf = r.read(RETIRED_REQUEST_KEYFRAME, &[]).unwrap();
+        assert_eq!((kf.ask, kf.keyframe), (1, true));
+        assert_eq!(r.read(RETIRED_RFI_REQUEST, &[0xFF]), None);
     }
 
     #[test]

@@ -268,6 +268,10 @@ pub(super) struct Task {
     /// The client's feedback datagrams, from the session's datagram reader.
     pub(super) feedback_rx:
         tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::v2::dgram::Feedback>,
+    /// Weak, so the channel still closes with the datagram reader. An older client's
+    /// control-stream reports join the datagram's feedback through it.
+    pub(super) feedback_tx:
+        tokio::sync::mpsc::WeakUnboundedSender<punktfunk_core::quic::v2::dgram::Feedback>,
     /// A diagnostic session (`EXT_DELIVERY_PROBE_ONLY`): every probe is served, with no
     /// spacing. The session holds no pipeline, and the stream thread bounds what it costs.
     pub(super) probe_only: bool,
@@ -354,6 +358,7 @@ pub(super) async fn run(task: Task) {
         audio_kbps,
         ack_reason,
         mut feedback_rx,
+        feedback_tx,
         probe_only,
         ends:
             super::wiring::ControlEnds {
@@ -474,6 +479,7 @@ pub(super) async fn run(task: Task) {
     link_tick.tick().await;
     // Feedback numbers acted on so far; a repeat or a reordered older copy is skipped.
     let (mut last_window, mut last_ask) = (0u32, 0u32);
+    let mut retired = punktfunk_core::quic::v2::dgram::RetiredFeedback::default();
     // The client reads this host's link facts off the first config, anchored or not.
     if v2io::send(&mut ctrl_send, &initial_config).await.is_err() {
         return;
@@ -841,6 +847,10 @@ pub(super) async fn run(task: Task) {
                         });
                     } else {
                         denied.note(GrantClass::Clipboard);
+                    }
+                } else if punktfunk_core::quic::v2::dgram::RetiredFeedback::reads(ty) {
+                    if let (Some(fb), Some(tx)) = (retired.read(ty, &body), feedback_tx.upgrade()) {
+                        let _ = tx.send(fb);
                     }
                 } else {
                     tracing::debug!(ty, "control frame of a type this host does not read");

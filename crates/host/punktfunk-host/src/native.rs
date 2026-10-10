@@ -1354,6 +1354,7 @@ pub(crate) async fn run_admitted(
         audio_kbps: audio_reserved_kbps(&welcome),
         ack_reason: abr_features & punktfunk_core::quic::EXT_ABR_ACK_REASON != 0,
         feedback_rx,
+        feedback_tx: feedback_tx.downgrade(),
         probe_only,
         ends: control_ends,
         shared: shared.clone(),
