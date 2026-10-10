@@ -86,6 +86,9 @@ struct PumpLoop {
     /// AUs dropped while nothing popped the channel (embedder decoder not
     /// started yet). The first pop after one owes the host a keyframe.
     unconsumed_aus: u64,
+    /// That keyframe has not arrived: the decoder holds none of the pictures the frames
+    /// before it reference, and a hardware decoder fed one can die.
+    awaiting_idr: bool,
     seen_clock_gen: u32,
     seen_mode_gen: u32,
     /// Epoch of the last frame handed on; a new one may move the mode ([`super::anchor`]).
@@ -192,6 +195,7 @@ impl DataPump {
             ingress_since: (Instant::now(), self.session.stats()),
             last_index: None,
             unconsumed_aus: 0,
+            awaiting_idr: false,
             seen_clock_gen: self.clock_gen.load(Ordering::Relaxed),
             seen_mode_gen: self.mode_gen.load(Ordering::Relaxed),
             last_epoch: None,
@@ -766,8 +770,9 @@ impl DataPump {
         }
         // No decoder yet (a console launch hold delays it up to 15 s). Hold the
         // opening GOP so a prompt decoder starts on the stream's own IDR; past
-        // PREROLL_AUS drop it and ask for one keyframe once something pops. A
-        // queue nobody drains is not link distress, so no detector runs.
+        // PREROLL_AUS drop it, ask for one keyframe once something pops and hand
+        // on nothing before it. A queue nobody drains is not link distress, so
+        // no detector runs.
         if !self.shared.frames.consumer_seen() {
             lp.unconsumed_aus += if lp.unconsumed_aus == 0 {
                 self.shared.frames.preroll(frame) as u64
@@ -783,7 +788,15 @@ impl DataPump {
                 "decoder attached after the stream started — asking for a keyframe"
             );
             lp.unconsumed_aus = 0;
+            lp.awaiting_idr = self.negotiated_codec != crate::quic::CODEC_PYROWAVE;
             self.shared.ask_keyframe();
+        }
+        if lp.awaiting_idr {
+            if frame.flags & u32::from(crate::packet::FLAG_SOF) == 0 {
+                lp.jump.idle();
+                return;
+            }
+            lp.awaiting_idr = false;
         }
         if probe_active {
             // Probe measures a saturated queue; a primed run would fire the
@@ -1047,6 +1060,70 @@ mod tests {
             shared.shutdown.store(true, Ordering::SeqCst);
             pump_thread.join().unwrap();
         }
+    }
+
+    /// A decoder that attaches after the preroll is gone starts on the keyframe it asked for:
+    /// the frames before it reference pictures it never had.
+    #[test]
+    fn a_late_decoder_starts_on_the_keyframe_it_asked_for() {
+        use crate::packet::{FLAG_PIC, FLAG_SOF};
+        use crate::transport::Transport;
+        let mode = crate::config::Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60,
+        };
+        let origin = crate::quic::wall_clock_ns();
+        let (host_tp, session) = idle_client_session(origin);
+        let shared = Arc::new(ClientShared::new(mode));
+        let (pump, _ctrl_rx, _fb_rx) = test_pump(session, shared.clone(), crate::quic::CODEC_HEVC);
+        let pump_thread = std::thread::spawn(move || pump.run());
+        let (spare, _) = crate::transport::loopback_pair(0, 0);
+        let mut host = Session::new(
+            loopback_config(crate::config::Role::Host),
+            loopback_media(origin),
+            Box::new(spare),
+        )
+        .unwrap();
+        let mut pts = crate::quic::wall_clock_ns();
+        let mut send = |flags: u8| {
+            pts += 16_666_667;
+            for p in host.seal_frame(&[9u8; 512], pts, u32::from(flags)).unwrap() {
+                host_tp.send(&p).unwrap();
+            }
+        };
+        let (idr, p) = (FLAG_PIC | FLAG_SOF, FLAG_PIC);
+        send(idr);
+        for _ in 0..super::super::frame_channel::PREROLL_AUS + 4 {
+            send(p);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        // The decoder attaches with the opening GOP already dropped.
+        assert!(matches!(
+            shared.frames.pop(Duration::ZERO),
+            FramePop::Timeout
+        ));
+        for _ in 0..3 {
+            send(p);
+        }
+        send(idr);
+        send(p);
+        let first = match shared.frames.pop(Duration::from_secs(1)) {
+            FramePop::Frame(f) => f,
+            _ => panic!("no frame after the keyframe"),
+        };
+        assert_ne!(
+            first.flags & u32::from(FLAG_SOF),
+            0,
+            "the decoder's first frame is the IDR"
+        );
+        assert!(matches!(
+            shared.frames.pop(Duration::from_secs(1)),
+            FramePop::Frame(f) if f.flags & u32::from(FLAG_SOF) == 0
+        ));
+
+        shared.shutdown.store(true, Ordering::SeqCst);
+        pump_thread.join().unwrap();
     }
 
     /// Frames short of their parity on a round trip inside a frame interval ask for their
