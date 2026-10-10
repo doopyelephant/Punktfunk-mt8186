@@ -639,6 +639,30 @@ fn concurrent_provider_syncs_keep_every_row() {
     assert_eq!(rows.len(), 8, "one row per provider: {rows:?}");
 }
 
+/// A plugin re-sends its whole set on a timer; only a set that differs is news to clients.
+#[test]
+fn an_unchanged_provider_sync_stays_quiet() {
+    let _dir = ConfigDirOverride::new();
+    let mut live = crate::events::bus().subscribe_live();
+    let sync = |title: &str| {
+        let row = serde_json::json!({"external_id": "a", "title": title});
+        let inputs = vec![serde_json::from_value(row).unwrap()];
+        crate::library::reconcile_provider("quiet-sync", None, inputs).expect("sync saved");
+    };
+    sync("A");
+    sync("A");
+    sync("B");
+    let mut changed = 0;
+    while let Ok(ev) = live.try_recv() {
+        if matches!(&ev.kind, crate::events::EventKind::LibraryChanged { source } if source == "quiet-sync")
+        {
+            changed += 1;
+        }
+    }
+    assert_eq!(changed, 2);
+    assert_eq!(crate::library::load_custom()[0].title, "B");
+}
+
 /// Unknown titles are counted, not refused: a report races its own reconcile, and 400-ing
 /// the whole report would drop every other running title. Catalog is untouched, so every
 /// id here is unknown by construction.
