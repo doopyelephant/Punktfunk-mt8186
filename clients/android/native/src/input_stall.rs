@@ -17,6 +17,11 @@ pub(crate) struct InputStall {
 }
 
 impl InputStall {
+    /// A stall is being timed.
+    pub(crate) fn armed(&self) -> bool {
+        self.since.is_some()
+    }
+
     /// One loop pass. `offered`: the codec freed an input slot this pass. `waiting`: access units
     /// are still parked after feeding.
     pub(crate) fn poll(&mut self, offered: bool, waiting: bool, now: Instant) -> bool {

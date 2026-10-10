@@ -762,6 +762,9 @@ struct State {
     /// The codec stopped taking input with AUs waiting: this run ends and the codec is rebuilt.
     wedged: bool,
     stall: InputStall,
+    /// The codec handing back no buffer for a slot it offered: it left the executing state,
+    /// whether or not its error callback ran.
+    refused: InputStall,
     /// A rebuilt run drops every AU before the first keyframe.
     await_keyframe: bool,
     backstops: Backstops,
@@ -827,6 +830,7 @@ impl State {
             fatal: false,
             wedged: false,
             stall: InputStall::default(),
+            refused: InputStall::default(),
             await_keyframe: false,
             backstops: Backstops::new(),
             admit: None,
@@ -1071,16 +1075,25 @@ impl State {
                 }
             }
             let Some(dst) = codec.input_buffer(idx) else {
-                // Nothing was written and nothing was queued, so BOTH stay ours: forgetting the
-                // slot leaks one of the codec's input buffers per occurrence, and dropping the AU
-                // punches a hole in the reference chain with no keyframe request behind it.
-                // `break`, not `continue`: a codec that cannot hand out an input buffer it just
-                // advertised is in no state to be fed the rest of the parked queue this pass.
-                log::warn!("decode: input_buffer({idx}) returned None — retrying next pass");
+                // Slot and AU both stay ours: forgetting the slot leaks a codec buffer, dropping
+                // the AU holes the reference chain. `break`: a codec that refuses a slot it just
+                // offered takes nothing else this pass. Refusing for the hang patience, it is
+                // gone and is rebuilt.
+                if !self.refused.armed() {
+                    log::warn!("decode: input_buffer({idx}) returned None — retrying next pass");
+                }
+                if self.refused.poll(false, true, Instant::now()) {
+                    log::warn!(
+                        "decode: the codec refused input for {} ms — treating it as hung",
+                        INPUT_STALL_PATIENCE.as_millis()
+                    );
+                    self.wedged = true;
+                }
                 self.free_inputs.push_front(idx);
                 self.pending_aus.push_front(frame);
                 break;
             };
+            self.refused = InputStall::default();
             let au = &frame.data;
             if au.len() > dst.len() {
                 // The slot was never queued, so it stays ours — recycle it for the next AU.
