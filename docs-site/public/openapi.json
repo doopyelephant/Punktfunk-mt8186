@@ -4027,7 +4027,7 @@
           "library"
         ],
         "summary": "Replace a provider's entries",
-        "description": "The payload is the desired set, keyed by `external_id`. The host diffs, keeps surviving\nhost ids stable, and drops orphans. Empty array removes everything this provider owns.\nEmits `library.changed` with the provider as `source`.\n\n`?store=` claims that store: entries surface as `<store>:<external_id>` with the store\nbadge. One provider per store; a second claimant gets 409. Release the claim with\n`DELETE`, not an empty reconcile — a store can have zero installed titles.",
+        "description": "The payload is the desired set, keyed by `external_id`. The host diffs, keeps surviving\nhost ids stable, and drops orphans. Empty array removes everything this provider owns.\nEmits `library.changed` with the provider as `source` when its rows or claim change.\n\n`?store=` claims that store: entries surface as `<store>:<external_id>` with the store\nbadge. One provider per store; a second claimant gets 409. Release the claim with\n`DELETE`, not an empty reconcile — a store can have zero installed titles.",
         "operationId": "reconcileProviderEntries",
         "parameters": [
           {
