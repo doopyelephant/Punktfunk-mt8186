@@ -1224,7 +1224,15 @@ impl Ring {
             );
             if spec.is_none() && editing {
                 // Editor: empty slot shows a plus. In-stream: plain glass.
-                crate::icons::draw_icon(canvas, crate::icons::PLUS, x, y, r * 0.7, white(0.35 * q));
+                crate::icons::draw_icon(
+                    canvas,
+                    crate::icons::PLUS,
+                    x,
+                    y,
+                    r * 0.7,
+                    scale,
+                    white(0.35 * q),
+                );
             }
             canvas.draw_circle(
                 Point::new(x, y),
@@ -1447,13 +1455,21 @@ fn draw_disc(
         keycap_text(canvas, fonts, x, y, r, size, &spec.short, color);
         return;
     }
-    // Device marks are drawn at their own 1.5-unit weight (`glyphs::pad_mark`).
     if let Some(mark) = spec.glyph {
-        crate::icons::draw_icon_weight(canvas, mark, x, y, r * 1.05, 1.5 * scale, color);
+        let w = r * 1.05;
+        crate::glyphs::pad_mark(
+            canvas,
+            mark,
+            f64::from(x - w / 2.0),
+            f64::from(y),
+            f64::from(w),
+            f64::from(scale),
+            color,
+        );
         return;
     }
     if let Some(icon) = slot_icon(&spec.id, &spec.state) {
-        crate::icons::draw_icon(canvas, icon, x, y, r * 1.05, color);
+        crate::icons::draw_icon(canvas, icon, x, y, r * 1.05, scale, color);
         return;
     }
     let tw = fonts.measure(&spec.short, W::SemiBold, size);

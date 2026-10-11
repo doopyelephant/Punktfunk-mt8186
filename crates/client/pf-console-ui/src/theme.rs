@@ -143,6 +143,14 @@ pub fn art_sampling() -> skia_safe::SamplingOptions {
 pub const ERROR: Color4f = Color4f::new(1.0, 0.576, 0.541, 1.0);
 pub const ONLINE_GREEN: Color4f = Color4f::new(0.20, 0.84, 0.29, 1.0);
 
+/// Glyph stroke, dp: every Lucide mark and device silhouette, whatever its box, so a 44 dp
+/// mark and a 20 dp chevron on one screen share a weight. `icons::draw_icon` and
+/// `glyphs::pad_mark` apply it; nothing else picks a stroke for a glyph.
+pub const GLYPH_STROKE: f64 = 1.5;
+/// Hairline, dp: the edge of a badge, a keycap or a battery cell — a container, not a glyph.
+/// Unscaled it reads thinner than every other edge on HiDPI.
+pub const HAIRLINE: f64 = 1.2;
+
 /// Green text for what is live (online, playing) on glass: pastel under white ink, deep
 /// under dark ink.
 pub fn live() -> Color4f {

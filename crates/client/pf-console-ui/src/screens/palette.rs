@@ -8,7 +8,7 @@
 use crate::anim::approach;
 use crate::el::{Axis, El, Id, Tree};
 use crate::glyphs::{Hint, HintKey};
-use crate::icons::{by_name, draw_icon_weight};
+use crate::icons::{by_name, draw_icon};
 use crate::palette::{Palette, PALETTES, VIOLET_FIELD};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Ctx, Outbox, ScreenView};
@@ -305,7 +305,7 @@ fn draw_card(canvas: &Canvas, fonts: &Fonts, p: &Palette, rect: Rect, chosen: bo
             Color4f::new(1.0, 1.0, 1.0, 1.0)
         };
         if let Some(icon) = by_name("check") {
-            draw_icon_weight(canvas, icon, cx, cy, r * 1.3, (2.2 * k) as f32, on_accent);
+            draw_icon(canvas, icon, cx, cy, r * 1.3, k as f32, on_accent);
         }
     }
 }

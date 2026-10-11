@@ -10,7 +10,7 @@
 
 use crate::icons::{self, Icon};
 use crate::platform::Platform;
-use crate::theme::{fg, fill, stroke, Fonts, W};
+use crate::theme::{fg, fill, stroke, Fonts, GLYPH_STROKE, HAIRLINE, W};
 use punktfunk_core::config::GamepadPref;
 use skia_safe::{Canvas, Color4f, PathBuilder, Point, RRect, Rect};
 
@@ -99,8 +99,8 @@ pub fn pad_icon(pref: GamepadPref) -> Icon {
     }
 }
 
-/// One device mark: left edge `x`, centred on `cy`, in a `w`-wide 24-unit box.
-/// 1.5 dp at every size, so the 15 dp chip and the 44 dp card share one weight.
+/// One device mark: left edge `x`, centred on `cy`, in a `w`-wide 24-unit box, at
+/// [`GLYPH_STROKE`] whatever the size, so the 15 dp chip and a 44 dp mark share one weight.
 pub fn pad_mark(canvas: &Canvas, icon: Icon, x: f64, cy: f64, w: f64, k: f64, ink: Color4f) {
     icons::draw_icon_weight(
         canvas,
@@ -108,7 +108,7 @@ pub fn pad_mark(canvas: &Canvas, icon: Icon, x: f64, cy: f64, w: f64, k: f64, in
         (x + w / 2.0) as f32,
         cy as f32,
         w as f32,
-        (1.5 * k) as f32,
+        (GLYPH_STROKE * k) as f32,
         ink,
     );
 }
@@ -135,7 +135,7 @@ pub fn battery_pip(
     } else {
         crate::theme::fg(0.7)
     };
-    let outline = stroke(ink, (1.2 * k) as f32);
+    let outline = stroke(ink, (HAIRLINE * k) as f32);
     let r = (2.0 * k) as f32;
     canvas.draw_rrect(RRect::new_rect_xy(cell, r, r), &outline);
     // Terminal nub — without it the cell reads as a text field.
@@ -428,7 +428,7 @@ fn draw_glyph(
             let r = BADGE_D * k / 2.0;
             let center = Point::new((x + r) as f32, cy as f32);
             canvas.draw_circle(center, r as f32, &fill(fg(0.10)));
-            canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (1.2 * k) as f32));
+            canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (HAIRLINE * k) as f32));
             if style == GlyphStyle::Shapes {
                 let (r, w) = ((5.2 * k) as f32, (1.8 * k) as f32);
                 draw_ps_shape(canvas, face, center, r, w, fg(0.92));
@@ -451,7 +451,7 @@ fn draw_glyph(
             let r = BADGE_D * k / 2.0;
             let center = Point::new((x + r) as f32, cy as f32);
             canvas.draw_circle(center, r as f32, &fill(fg(0.10)));
-            canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (1.2 * k) as f32));
+            canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (HAIRLINE * k) as f32));
             let size = 9.5 * k;
             let w = fonts.measure("OK", W::SemiBold, size) as f64;
             fonts.draw(
@@ -468,7 +468,7 @@ fn draw_glyph(
             let r = BADGE_D * k / 2.0;
             let center = Point::new((x + r) as f32, cy as f32);
             canvas.draw_circle(center, r as f32, &fill(fg(0.10)));
-            canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (1.2 * k) as f32));
+            canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (HAIRLINE * k) as f32));
             // 12.5 dp sits inside the 22 dp badge.
             crate::icons::draw_icon(
                 canvas,
@@ -476,6 +476,7 @@ fn draw_glyph(
                 center.x,
                 center.y,
                 (12.5 * k) as f32,
+                k as f32,
                 fg(0.92),
             );
         }
@@ -492,7 +493,7 @@ fn draw_glyph(
                 // Same hairline as the keycaps so every container shares one edge.
                 canvas.draw_rrect(
                     RRect::new_rect_xy(rect, (4.0 * k) as f32, (4.0 * k) as f32),
-                    &stroke(fg(0.28), (1.2 * k) as f32),
+                    &stroke(fg(0.28), (HAIRLINE * k) as f32),
                 );
                 let size = 10.0 * k;
                 let tw = fonts.measure(label, W::SemiBold, size) as f64;
@@ -522,6 +523,7 @@ fn draw_glyph(
                 (x + r) as f32,
                 cy as f32,
                 (BADGE_D * k) as f32,
+                k as f32,
                 fg(0.92),
             );
         }
@@ -535,6 +537,7 @@ fn draw_glyph(
                 cx - (4.6 * k) as f32,
                 cyf,
                 b,
+                k as f32,
                 fg(0.92),
             );
             crate::icons::draw_icon(
@@ -543,6 +546,7 @@ fn draw_glyph(
                 cx + (4.6 * k) as f32,
                 cyf,
                 b,
+                k as f32,
                 fg(0.92),
             );
         }
@@ -556,8 +560,7 @@ fn draw_glyph(
             );
             canvas.draw_rrect(
                 RRect::new_rect_xy(rect, (5.0 * k) as f32, (5.0 * k) as f32),
-                // 1.2 * k: an unscaled hairline reads thinner than every other edge on HiDPI.
-                &stroke(fg(0.28), (1.2 * k) as f32),
+                &stroke(fg(0.28), (HAIRLINE * k) as f32),
             );
             let size = 11.0 * k;
             let tw = fonts.measure(text, W::SemiBold, size) as f64;

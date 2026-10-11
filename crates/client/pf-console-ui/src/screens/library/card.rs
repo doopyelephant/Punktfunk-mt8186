@@ -283,7 +283,15 @@ fn files_badge(
     };
     if let Some(icon) = crate::icons::by_name(icon) {
         let (cx, cy) = (x + 6.0 * k + mark / 2.0, y + bh / 2.0);
-        crate::icons::draw_icon(canvas, icon, cx as f32, cy as f32, mark as f32, ink);
+        crate::icons::draw_icon(
+            canvas,
+            icon,
+            cx as f32,
+            cy as f32,
+            mark as f32,
+            k as f32,
+            ink,
+        );
     }
     fonts.draw(
         canvas,
@@ -316,7 +324,7 @@ pub(super) fn desk_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, r: Rect, k:
         None => {
             if let Some(icon) = crate::icons::by_name(crate::library::DESKTOP_ICON) {
                 let (cx, cy) = (mark.center_x(), mark.center_y());
-                crate::icons::draw_icon(canvas, icon, cx, cy, side as f32, fg(0.92));
+                crate::icons::draw_icon(canvas, icon, cx, cy, side as f32, k as f32, fg(0.92));
             }
         }
     }
