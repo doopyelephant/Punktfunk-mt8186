@@ -23,14 +23,14 @@
 ==> Drivers (a hiccup warns and never aborts)
   + "C:\Program Files\punktfunk\punktfunk-host.exe" driver install --dir <staging>\pfvdisplay
   + "C:\Program Files\punktfunk\punktfunk-host.exe" driver install --gamepad --dir <staging>\gamepad
+==> Plugin runner
+  + schtasks /Create /TN PunktfunkScripting /XML <generated> /F
+  + schtasks /Run /TN PunktfunkScripting
 ==> Service
   + "C:\Program Files\punktfunk\punktfunk-host.exe" service install --gamestream=off --allow-public-network=off --web-bind=0.0.0.0
   + "C:\Program Files\punktfunk\punktfunk-host.exe" service start
 ==> Web console
   + "C:\Program Files\punktfunk\punktfunk-host.exe" web setup --app-dir "C:\Program Files\punktfunk" --password-file "<temp>\webpw.txt"
-==> Plugin runner
-  + schtasks /Create /TN PunktfunkScripting /XML <generated> /F
-  + schtasks /Run /TN PunktfunkScripting
 ==> Shortcut
   ok would create <common start menu>\Punktfunk Host.lnk → C:\Program Files\punktfunk\punktfunk-tray.exe --start-host
 ==> Tray
