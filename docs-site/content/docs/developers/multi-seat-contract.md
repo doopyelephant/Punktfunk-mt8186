@@ -68,10 +68,18 @@ A failed check changes nothing: the answer is 200 with `enabled: false` and the 
 2. Installs `pf_vdisplay_seats.inf` from `staging\pfvdisplay\` beside `punktfunk-host.exe`.
 3. Turns the Remote Desktop listener on if it was off, and limits the **Remote Desktop**
    firewall rules to `127.0.0.0/8` unless `allow_rdp_from_network` is `true`.
-4. Records the Remote Desktop certificate, as `punktfunk-seat-keeper trust` does.
+4. Adds the seat listener `punktfunk-tcp`: a copy of `RDP-Tcp` on port 3390 whose sessions load
+   `pf_seat_audio.dll`, with port 3390 blocked from every address but loopback. The x64 build goes
+   to `System32\punktfunk` and the x86 build to `SysWOW64\punktfunk`. Every seat start brings
+   them up to date. Not on ARM64.
+5. Records the Remote Desktop certificate, as `punktfunk-seat-keeper trust` does.
 
-Turning off puts the listener and the firewall scope back and removes the marker. The seat
-display driver stays in the driver store. Off Windows and off a door, `GET` answers `enabled: false`
+The keeper connects to 3390 when it listens, else to 3389. TermService opens and closes a listener
+as its key appears and goes; nothing restarts.
+
+Turning off puts the listener and the firewall scope back, removes the seat listener and its
+files, and removes the marker. A file the audio services still hold goes at the next restart. The
+seat display driver stays in the driver store. Off Windows and off a door, `GET` answers `enabled: false`
 with `platform: other`, and `PUT` answers 409.
 
 ## The environment a seat host is started with
@@ -156,6 +164,13 @@ session by design, and display activation fails while its session is inactive.
   open it or receive its input. A pad the host can't fence is not created. A Remote Desktop session
   into a single-seat box therefore no longer sees the console host's pads. The box has 16 pad
   indices; each host takes the lowest one that no other host's pad holds.
+- **Its pads' audio is its own.** A Remote Desktop session lists only what its listener's audio
+  endpoint enumerator returns. Through the seat listener, that is Remote Audio plus one
+  "Wireless Controller" render endpoint per DualSense the seat host serves, in that pad's container
+  and in that session alone. The seat host claims a pad's index by creating
+  `Global\punktfunk-seat-pad-<session>-<index>` and its ring `…-pcm`, before the pad appears; the
+  endpoint inside audiodg writes what games render there into the ring, and the seat host streams
+  it as pad audio. A seat on `RDP-Tcp` has no pad audio.
 - **No status tray.** A seat host doesn't start or supervise one; the supervisor is the control
   surface.
 
@@ -203,7 +218,8 @@ A seat usually has no sound card, so the host mints a render endpoint per seat b
 Remote Play streaming drivers. `SteamStreamingSpeakers.inf` and `SteamStreamingMicrophone.inf` must
 be bound to a device already, or sit in
 `%CommonProgramFiles(x86)%\Steam\drivers\Windows10\<x64|arm64>\`. Steam never has to run. Without
-them a seat streams video with no audio.
+them a seat streams video with no audio. Pad audio needs neither: it comes from the seat
+listener.
 
 ```
 powershell -File check-seat-audio.ps1

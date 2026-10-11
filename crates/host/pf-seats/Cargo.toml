@@ -30,6 +30,8 @@ zeroize = "1"
 rustix = { version = "1", features = ["fs", "net"] }
 
 [target.'cfg(windows)'.dependencies]
+# The seat listener's name and port, shared with the keeper and `pf_seat_audio.dll`.
+pf-driver-proto = { path = "../pf-driver-proto" }
 windows-service = "0.8"
 winreg = "0.56"
 windows = { version = "0.62", features = [

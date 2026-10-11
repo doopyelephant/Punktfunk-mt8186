@@ -231,6 +231,36 @@ if (Test-Path (Join-Path $layerSrc 'Cargo.toml')) {
 }
 else { Write-Host "no pf-vkhdr-layer crate -> installer built WITHOUT the HDR Vulkan layer" }
 
+# --- pf_seat_audio.dll: the seat listener's audio endpoint enumerator (crates/host/pf-seat-audio).
+# Every process of a seat session that uses MMDevAPI loads it at its own bitness, so the x64
+# installer carries an x64 and an x86 build. Static CRT: it runs inside Windows' audio services.
+# Own target dir, so the RUSTFLAGS change does not rebuild the host's tree. ARM64 seats keep RDP-Tcp.
+$seatAudioStage = $null
+if ($Arch -eq 'x64') {
+    $seatAudioTarget = Join-Path $OutDir 'seat-audio-target'
+    $seatAudioStage = Join-Path $OutDir 'seat-audio'
+    $manifest = Join-Path $here '..\..\Cargo.toml'
+    $prevTarget = $env:CARGO_TARGET_DIR
+    $prevFlags = $env:RUSTFLAGS
+    $env:CARGO_TARGET_DIR = $seatAudioTarget
+    $env:RUSTFLAGS = '-C target-feature=+crt-static'
+    try {
+        foreach ($build in @(@('x64', 'x86_64-pc-windows-msvc'), @('x86', 'i686-pc-windows-msvc'))) {
+            Write-Host "==> building pf_seat_audio.dll ($($build[1]))"
+            & cargo build --release --locked --manifest-path $manifest -p pf-seat-audio --target $build[1]
+            if ($LASTEXITCODE -ne 0) { throw "pf-seat-audio build failed for $($build[1]) ($LASTEXITCODE)" }
+            $dir = Join-Path $seatAudioStage $build[0]
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            Copy-Item (Join-Path $seatAudioTarget "$($build[1])\release\pf_seat_audio.dll") $dir -Force
+            Sign-File $signing (Join-Path $dir 'pf_seat_audio.dll')
+        }
+    }
+    finally {
+        if ($prevTarget) { $env:CARGO_TARGET_DIR = $prevTarget } else { Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue }
+        if ($prevFlags) { $env:RUSTFLAGS = $prevFlags } else { Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue }
+    }
+}
+
 # --- build the wizard + pack the installer -----------------------------------------------------
 $setup = Join-Path $OutDir "punktfunk-host-setup-$Version$archSuffix.exe"
 # The wizard crate builds into a target dir of its own: windows-reactor-setup stages the
@@ -277,6 +307,8 @@ if ($wantWeb -or $wantScripting) {
 if ($wantWeb) { Copy-Item $webStage -Destination (Join-Path $appStage 'web\.output') -Recurse -Force }
 if ($wantScripting) { Copy-Item $scrStage -Destination (Join-Path $appStage 'scripting') -Recurse -Force }
 if ($layerStage -and (Test-Path $layerStage)) { Copy-Item $layerStage -Destination (Join-Path $appStage 'vklayer') -Recurse -Force }
+# Seats copy these into System32/SysWOW64 when they turn on (pf-seats seat_listener.rs).
+if ($seatAudioStage) { Copy-Item $seatAudioStage -Destination (Join-Path $appStage 'seat-audio') -Recurse -Force }
 # The seats display driver stays on disk beside the host, since the extracted staging tree below is
 # deleted after setup. Setup never installs it: the console does, when the operator turns seats on.
 if (-not $NoDriver) {

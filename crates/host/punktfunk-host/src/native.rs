@@ -332,9 +332,12 @@ pub(crate) async fn serve(
     };
     // Windows (`PUNKTFUNK_PAD_AUDIO` / `_SLOTS`): pre-provision DualSense speaker endpoints
     // once. A stored-but-not-served stamp triggers one Audiosrv restart before any session.
-    // Failure logs once and leaves pads working without pad audio.
+    // Failure logs once and leaves pads working without pad audio. A seat's pad endpoints come
+    // from its listener's enumerator; the box-wide ones are the console host's.
     #[cfg(target_os = "windows")]
-    crate::audio::pad_endpoint::provision_at_startup(true);
+    if !pf_paths::seat::is_seat_host() {
+        crate::audio::pad_endpoint::provision_at_startup(true);
+    }
     // Windows: mint "Punktfunk Speakers/Microphone" (Valve streaming drivers). Best-effort;
     // without Steam's drivers the wiring plan keeps its name-based ladder.
     #[cfg(target_os = "windows")]

@@ -1,10 +1,17 @@
-//! Windows: capture the pad's WASAPI loopback endpoint ([`crate::audio::pad_endpoint`]).
+//! Windows: capture the pad's WASAPI loopback endpoint ([`crate::audio::pad_endpoint`]), or in a
+//! seat, the ring the seat listener's enumerator fills ([`crate::audio::seat_pad`]).
 
 use super::engine::{pad_audio_thread, KIND_BIT_HAPTICS, KIND_BIT_SPEAKER};
 use super::*;
 
-/// A source exists when the host has a provisioned endpoint.
+/// A source exists when the host has a provisioned endpoint, or in a seat, when the session came
+/// in through the seat listener.
 pub(super) fn host_cap(asked: bool) -> bool {
+    if pf_paths::seat::is_seat_host() {
+        return asked
+            && pf_host_config::row_bool("PUNKTFUNK_PAD_AUDIO")
+            && crate::audio::seat_pad::available();
+    }
     // Startup can fail transiently with nothing latched; retry here — first session ask.
     if asked {
         crate::audio::pad_endpoint::ensure_provisioned();
@@ -31,6 +38,9 @@ pub(in crate::native) fn spawn(
 ) -> Option<PadAudioHandle> {
     if kinds & (KIND_BIT_HAPTICS | KIND_BIT_SPEAKER) == 0 {
         return None;
+    }
+    if pf_paths::seat::is_seat_host() {
+        return spawn_seat(conn, pad, slot, kinds, stop);
     }
     let Some(ep) = crate::audio::pad_endpoint::endpoint_for(slot) else {
         tracing::debug!(
@@ -106,6 +116,40 @@ pub(in crate::native) fn spawn(
             super::SHOWN.hide_if_newest(slot, ticket, || {
                 crate::audio::pad_endpoint::set_visibility(&vis_id, pad, false)
             });
+        }) {
+        Ok(join) => Some(PadAudioHandle {
+            stop,
+            join: Some(join),
+        }),
+        Err(e) => {
+            tracing::warn!(pad, error = %e, "pad-audio thread spawn failed — pad streams without audio");
+            None
+        }
+    }
+}
+
+/// A seat's pad: claim the slot so its endpoint appears in this session, stream the ring, and
+/// give the slot back when the streamer ends.
+fn spawn_seat(
+    conn: super::link::SessionLink,
+    pad: u8,
+    slot: u8,
+    kinds: u8,
+    stop: Arc<AtomicBool>,
+) -> Option<PadAudioHandle> {
+    let source = match crate::audio::seat_pad::SeatPadSource::create(slot) {
+        Ok(source) => source,
+        Err(e) => {
+            tracing::warn!(pad, slot, error = %format!("{e:#}"), "seat pad audio slot did not open — pad streams without audio");
+            return None;
+        }
+    };
+    let stop_t = stop.clone();
+    match std::thread::Builder::new()
+        .name(format!("punktfunk1-pad{pad}"))
+        .spawn(move || {
+            pad_audio_thread(conn, pad, kinds, || Ok(source.capturer()), stop_t);
+            drop(source);
         }) {
         Ok(join) => Some(PadAudioHandle {
             stop,
