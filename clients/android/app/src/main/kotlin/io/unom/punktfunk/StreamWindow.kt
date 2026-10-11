@@ -1,5 +1,7 @@
 package io.unom.punktfunk
 
+import android.app.GameManager
+import android.app.GameState
 import android.content.Context
 import android.content.pm.ActivityInfo
 import android.hardware.display.DisplayManager
@@ -89,8 +91,9 @@ internal fun Display.streamPanelFps(hz: Int, size: Pair<Int, Int>? = null): Int 
 
 /**
  * Everything a stream does to the activity's WINDOW, and how to put it back: the wake and Wi-Fi
- * locks, the Wi-Fi link log, the panel's refresh pin, HDMI ALLM, the soft-keyboard and cutout
- * modes, the landscape lock, unbuffered input dispatch and the render-rate vote.
+ * locks, the Wi-Fi link log, the panel's refresh pin, HDMI ALLM, the Game Mode state, the
+ * soft-keyboard and cutout modes, the landscape lock, unbuffered input dispatch and the
+ * render-rate vote.
  *
  * It is one object because it is one obligation — every field below is a prior value captured on the
  * way in, and [detach] is the only thing that ever restores one. Held in [StreamScreen]'s session
@@ -219,6 +222,12 @@ internal class StreamWindow(
         if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window?.setPreferMinimalPostProcessing(true)
         }
+        // Game Mode state (API 33): a game is in play, so the OEM power HAL applies its game
+        // profile (MediaTek sizes CPU clocks by it). Interruptible: a stream has no match to guard.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.getSystemService(GameManager::class.java)
+                ?.setGameState(GameState(false, GameState.MODE_GAMEPLAY_INTERRUPTIBLE))
+        }
         // System bars: NOT hidden here — App.kt owns hide/show (one owner; the AnimatedContent
         // handoff broke per-screen ownership, see the `immersive` effect there).
         // The soft keyboard (three-finger swipe up → KeyCaptureView) must OVERLAY the stream, never
@@ -319,6 +328,10 @@ internal class StreamWindow(
         window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (lowLatencyMode && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window?.setPreferMinimalPostProcessing(false)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.getSystemService(GameManager::class.java)
+                ?.setGameState(GameState(false, GameState.MODE_NONE))
         }
         wifiLocks.forEach { runCatching { if (it.isHeld) it.release() } }
         mainHandler.removeCallbacks(pollWifiLink)
