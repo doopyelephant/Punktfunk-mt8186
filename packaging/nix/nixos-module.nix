@@ -957,6 +957,8 @@ in
       # The seats' pad fence; its helper resolves the seat user with getent.
       services.udev.packages = [ cfg.seats.package ];
       services.udev.path = [ pkgs.getent ];
+      # Each seat's /dev/uinput is a CUSE device the supervisor makes through /dev/cuse.
+      boot.kernelModules = [ "cuse" ];
 
       systemd.services.punktfunk-seats = {
         wantedBy = [ "multi-user.target" ];

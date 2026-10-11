@@ -392,14 +392,16 @@ pub fn scroll_supported() -> bool {
 }
 
 /// Full-fidelity stylus (`HOST_CAP_PEN`). Linux only: [`pen::VirtualPen`] uinput tablet.
-/// Probe is "can we open /dev/uinput" (same permission as virtual gamepads) plus the
-/// `PUNKTFUNK_PEN` row. Welcome-time; clients without the bit fold pen into touch/pointer.
+/// Probe is "can we open the kernel's /dev/uinput" (same permission as virtual gamepads) plus
+/// the `PUNKTFUNK_PEN` row. A seat's proxy there refuses a tablet. Welcome-time; clients
+/// without the bit fold pen into touch/pointer.
 #[cfg(target_os = "linux")]
 pub fn pen_supported() -> bool {
     if !pf_host_config::row_bool("PUNKTFUNK_PEN") {
         return false;
     }
-    uapi::open_nonblock("/dev/uinput").is_ok()
+    let node = std::path::Path::new("/dev/uinput");
+    uapi::open_nonblock("/dev/uinput").is_ok() && !pad_broker::proxied(node)
 }
 
 /// Synthetic PT_PEN/PT_TOUCH on Win10 1809+. Probe creates then destroys a PT_PEN device.

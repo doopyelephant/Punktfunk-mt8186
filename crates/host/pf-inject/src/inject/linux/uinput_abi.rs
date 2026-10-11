@@ -36,6 +36,12 @@ const UI_BEGIN_FF_UPLOAD: libc::c_ulong = 0xc068_55c8;
 const UI_END_FF_UPLOAD: libc::c_ulong = 0x4068_55c9;
 const UI_BEGIN_FF_ERASE: libc::c_ulong = 0xc00c_55ca;
 const UI_END_FF_ERASE: libc::c_ulong = 0x400c_55cb;
+/// `_IOR('U', 45, unsigned int)`.
+const UI_GET_VERSION: libc::c_ulong = 0x8004_552d;
+/// `UI_GET_SYSNAME(len)`, `_IOC(_IOC_READ, 'U', 44, len)`, with `len` zero.
+const UI_GET_SYSNAME_0: libc::c_ulong = 0x8000_552c;
+/// The bits `_IOC_SIZE` reads.
+const IOCSIZE_MASK: libc::c_ulong = 0x3fff << 16;
 
 pub(crate) const EV_SYN: u16 = 0x00;
 pub(crate) const EV_KEY: u16 = 0x01;
@@ -482,9 +488,119 @@ impl Drop for UinputDevice {
     }
 }
 
+/// A `/dev/uinput` fd the seat supervisor replays a seat's own uinput requests onto (the
+/// `punktfunk-seats` uinput proxy). Only uinput's by-value and fixed-size requests pass, so
+/// nothing a seat sends reaches the kernel as a pointer; anything else is `EINVAL`. Drop
+/// destroys the device, though systemd's fd store may still hold the fd.
+pub struct ReplayUinput(File);
+
+fn einval() -> std::io::Error {
+    std::io::Error::from_raw_os_error(libc::EINVAL)
+}
+
+impl ReplayUinput {
+    /// A fresh `/dev/uinput` fd, non-blocking.
+    pub fn open() -> std::io::Result<ReplayUinput> {
+        uapi::open_nonblock("/dev/uinput").map(ReplayUinput)
+    }
+
+    /// An fd systemd's fd store kept across a restart.
+    pub fn adopt(fd: OwnedFd) -> ReplayUinput {
+        ReplayUinput(File::from(fd))
+    }
+
+    /// `UI_DEV_CREATE`, `UI_DEV_DESTROY`, or a `UI_SET_*BIT` (not `UI_SET_PHYS`) with `value`.
+    pub fn ioctl_value(&self, req: u32, value: u32) -> std::io::Result<()> {
+        let req = libc::c_ulong::from(req);
+        let bit = req & !0xff == 0x4004_5500 && matches!(req & 0xff, 100..=107 | 109 | 110);
+        if !(bit || req == UI_DEV_CREATE || req == UI_DEV_DESTROY) {
+            return Err(einval());
+        }
+        uapi::ioctl_value(self.0.as_fd(), req, value.into()).map(drop)
+    }
+
+    /// A request that copies exactly `N` bytes in, out or both: `UI_DEV_SETUP`, `UI_ABS_SETUP`,
+    /// the four FF halves, `UI_GET_VERSION` and `UI_GET_SYSNAME(N)`. The kernel's return value.
+    pub fn ioctl_buffer<const N: usize>(
+        &self,
+        req: u32,
+        buf: &mut [u8; N],
+    ) -> std::io::Result<i32> {
+        let req = libc::c_ulong::from(req);
+        let fixed = [
+            UI_DEV_SETUP,
+            UI_ABS_SETUP,
+            UI_BEGIN_FF_UPLOAD,
+            UI_END_FF_UPLOAD,
+            UI_BEGIN_FF_ERASE,
+            UI_END_FF_ERASE,
+            UI_GET_VERSION,
+        ];
+        let known = fixed.contains(&req) || req & !IOCSIZE_MASK == UI_GET_SYSNAME_0;
+        if !known || uapi::arg_size(req) != N {
+            return Err(einval());
+        }
+        uapi::ioctl_with(self.0.as_fd(), req, buf)
+    }
+
+    /// `UI_SET_PHYS`, before `UI_DEV_CREATE`: the marker the udev fence reads.
+    pub fn set_phys(&self, phys: &str) -> std::io::Result<()> {
+        let phys = std::ffi::CString::new(phys).map_err(|_| einval())?;
+        uapi::ioctl_cstr(self.0.as_fd(), UI_SET_PHYS, &phys).map(drop)
+    }
+
+    /// Events the kernel queued for the device's creator, `EV_UINPUT` requests among them.
+    pub fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&self.0).read(buf)
+    }
+
+    /// Events, or a legacy `uinput_user_dev` before `UI_DEV_CREATE`.
+    pub fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+        (&self.0).write(buf)
+    }
+}
+
+impl AsFd for ReplayUinput {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+
+impl Drop for ReplayUinput {
+    fn drop(&mut self) {
+        let _ = uapi::ioctl_value(self.0.as_fd(), UI_DEV_DESTROY, 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request that takes a pointer, or a size other than its own, never reaches the kernel.
+    #[test]
+    fn a_replay_device_passes_only_value_and_fixed_size_requests() {
+        let null = File::open("/dev/null").unwrap();
+        let dev = ReplayUinput::adopt(OwnedFd::from(null));
+        let einval = |r: std::io::Result<()>| r.unwrap_err().raw_os_error() == Some(libc::EINVAL);
+        assert!(einval(dev.ioctl_value(UI_SET_PHYS as u32, 0x1000)));
+        assert!(einval(dev.ioctl_value(UI_BEGIN_FF_UPLOAD as u32, 0)));
+        assert!(einval(dev.ioctl_value(0x4004_5563, 0)), "nr 99");
+        let mut short = [0u8; 12];
+        assert!(einval(
+            dev.ioctl_buffer(UI_BEGIN_FF_UPLOAD as u32, &mut short)
+                .map(drop)
+        ));
+        assert!(einval(
+            dev.ioctl_buffer(UI_SET_PHYS as u32, &mut [0u8; 8])
+                .map(drop)
+        ));
+        // Allowed, so /dev/null answers for itself.
+        let tty = dev.ioctl_value(UI_SET_KEYBIT as u32, 0x130).unwrap_err();
+        assert_eq!(tty.raw_os_error(), Some(libc::ENOTTY));
+        let tty = dev.ioctl_buffer(0x8040_552c, &mut [0u8; 64]).unwrap_err();
+        assert_eq!(tty.raw_os_error(), Some(libc::ENOTTY), "UI_GET_SYSNAME(64)");
+        assert_eq!(uapi::arg_size(UI_GET_VERSION), 4);
+    }
 
     #[test]
     fn input_event_round_trips() {

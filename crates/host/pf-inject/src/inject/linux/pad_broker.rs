@@ -30,6 +30,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+pub use crate::uinput_abi::ReplayUinput;
 pub use pf_paths::seat::PADS_SOCKET as SOCKET;
 
 /// A pad a seat may ask for. The number is the wire value: append, never renumber. 1–9 are
@@ -280,14 +281,30 @@ fn recv_frame(sock: &impl AsFd, buf: &mut [u8]) -> Result<(usize, Option<OwnedFd
 // ---- the seat's side ----
 
 /// Whether this host makes a pad on `node` (`/dev/uinput`, `/dev/uhid`, vhci's `attach`)
-/// through the broker: a seat host that can't write it. The owner's own host at the desk holds
-/// seat0's ACL and opens the node itself, as the box's host does.
+/// through the broker: a seat host that can't write it, or finds the supervisor's uinput proxy
+/// there, which is the seat's Steam's. The owner's own host at the desk holds seat0's ACL and
+/// opens the node itself, as the box's host does.
 pub fn brokered(node: &Path) -> bool {
-    asks_broker(pf_paths::seat::is_seat_host(), writable(node))
+    asks_broker(
+        pf_paths::seat::is_seat_host(),
+        writable(node) && !proxied(node),
+    )
 }
 
 fn asks_broker(seat_host: bool, writable: bool) -> bool {
     seat_host && !writable
+}
+
+/// The misc major, where the kernel's own `/dev/uinput` and `/dev/uhid` live.
+const MISC_MAJOR: u32 = 10;
+
+/// Whether `node` is a character device off the misc major: on a seat, the supervisor's uinput
+/// proxy bound over `/dev/uinput`.
+pub fn proxied(node: &Path) -> bool {
+    rustix::fs::stat(node).is_ok_and(|st| {
+        rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::CharacterDevice
+            && rustix::fs::major(st.st_rdev) != MISC_MAJOR
+    })
 }
 
 /// Whether this process may write `node`, ACL included. Nothing is opened.
@@ -511,6 +528,17 @@ pub fn forget_usb(port: u16, recorded: RawFd) {
     notify(&format!("FDSTOREREMOVE=1\nFDNAME={name}"), None);
 }
 
+/// Parks `fd` in systemd's fd store under `name`, which is neither a pad's nor a USB socket's
+/// and holds no `:`; [`kept`] hands it back in [`Kept::other`].
+pub fn keep_fd(name: &str, fd: BorrowedFd<'_>) {
+    notify(&format!("FDSTORE=1\nFDNAME={name}"), Some(fd));
+}
+
+/// Takes every fd stored under `name` out of the store.
+pub fn forget_fd(name: &str) {
+    notify(&format!("FDSTOREREMOVE=1\nFDNAME={name}"), None);
+}
+
 /// One message to systemd's notify socket, with `fd` beside it. A path socket only, which is
 /// what systemd hands a system service.
 fn notify(message: &str, fd: Option<BorrowedFd<'_>>) {
@@ -555,21 +583,31 @@ pub struct KeptPad {
     pub relay: UnixDatagram,
 }
 
-/// What systemd kept across a restart (`LISTEN_FDS`, `LISTEN_FDNAMES`): the relayed pads, and
-/// each attached USB socket as `(port, recorded, socket)`. A kernel fd whose relay end systemd
-/// dropped (the seat hung up) is forgotten and closed, which destroys the pad. Every fd is
-/// close-on-exec from here. Once per process; a second call finds nothing.
-pub fn kept() -> (Vec<KeptPad>, Vec<(u16, RawFd, OwnedFd)>) {
+/// What systemd kept across a restart ([`kept`]).
+#[derive(Default)]
+pub struct Kept {
+    pub pads: Vec<KeptPad>,
+    /// Each attached USB socket as `(port, recorded, socket)`.
+    pub usb: Vec<(u16, RawFd, OwnedFd)>,
+    /// Every other fd, by the name [`keep_fd`] gave it.
+    pub other: Vec<(String, OwnedFd)>,
+}
+
+/// What systemd kept across a restart (`LISTEN_FDS`, `LISTEN_FDNAMES`). A kernel fd whose
+/// relay end systemd dropped (the seat hung up) is forgotten and closed, which destroys the
+/// pad. Every fd is close-on-exec from here. Once per process; a second call finds nothing.
+pub fn kept() -> Kept {
     static TAKEN: AtomicBool = AtomicBool::new(false);
     let env = |name: &str| std::env::var(name).unwrap_or_default();
     let ours = env("LISTEN_PID").parse::<u32>().ok() == Some(std::process::id());
     let count = env("LISTEN_FDS").parse::<RawFd>().unwrap_or(0);
     if !ours || count <= 0 || TAKEN.swap(true, Ordering::SeqCst) {
-        return (Vec::new(), Vec::new());
+        return Kept::default();
     }
     let names = env("LISTEN_FDNAMES");
     let mut names = names.split(':');
-    let (mut kernels, mut relays, mut usb) = (HashMap::new(), HashMap::new(), Vec::new());
+    let (mut kernels, mut relays) = (HashMap::new(), HashMap::new());
+    let (mut usb, mut other) = (Vec::new(), Vec::new());
     for raw in LISTEN_FDS_START..LISTEN_FDS_START + count {
         // SAFETY: systemd passes fds 3 through 3 + LISTEN_FDS - 1 to the process LISTEN_PID
         // names, this one. Nothing else here owns them, and `TAKEN` adopts each once.
@@ -580,10 +618,16 @@ pub fn kept() -> (Vec<KeptPad>, Vec<(u16, RawFd, OwnedFd)>) {
             usb.push((port, recorded, fd));
             continue;
         }
-        match name.rsplit_once('/') {
+        match name
+            .strip_prefix("pad/")
+            .and_then(|_| name.rsplit_once('/'))
+        {
             Some((stem, "k")) => kernels.insert(stem.to_owned(), fd),
             Some((stem, "r")) => relays.insert(stem.to_owned(), fd),
-            _ => None,
+            _ => {
+                other.push((name.to_owned(), fd));
+                None
+            }
         };
     }
     let mut out = Vec::new();
@@ -609,7 +653,11 @@ pub fn kept() -> (Vec<KeptPad>, Vec<(u16, RawFd, OwnedFd)>) {
         });
     }
     relays.into_keys().for_each(|name| forget(&name));
-    (out, usb)
+    Kept {
+        pads: out,
+        usb,
+        other,
+    }
 }
 
 /// Move the seat's events into the pad and the pad's back, until the seat hangs up. Blocks:
@@ -674,6 +722,17 @@ mod tests {
         std::fs::write(&node, b"").unwrap();
         assert!(writable(&node));
         let _ = std::fs::remove_file(&node);
+    }
+
+    /// The kernel's `/dev/uinput` is misc `10:223`; the supervisor's proxy has a major of its
+    /// own, as `/dev/null` (`1:3`) does here.
+    #[test]
+    fn a_character_device_off_the_misc_major_reads_as_the_proxy() {
+        assert!(proxied(Path::new("/dev/null")));
+        assert!(!proxied(Path::new("/proc/self/status")), "not a device");
+        assert!(!proxied(Path::new("/no/such/node")));
+        let uinput = Path::new("/dev/uinput");
+        assert!(!uinput.exists() || !proxied(uinput));
     }
 
     #[test]

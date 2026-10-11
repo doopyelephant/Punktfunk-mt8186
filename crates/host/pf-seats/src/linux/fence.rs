@@ -2,7 +2,8 @@
 //! (`packaging/linux/65-punktfunk-seats.rules`). It reads the device's `phys` out of sysfs and
 //! prints the seat user it names, so the rule can hand the node to that user alone. A device it
 //! cannot map prints nothing, and the node keeps the distro's rules. A device under a vhci port
-//! is the binary's to map, by the port the supervisor recorded.
+//! is the binary's to map, by the port the supervisor recorded. A seat's uinput proxy carries
+//! its account in its name.
 
 use super::accounts;
 use crate::ipc::{Diagnostic, DiagnosticLevel};
@@ -27,7 +28,8 @@ pub fn rule_installed() -> bool {
         .any(|dir| Path::new(dir).join(RULE).exists())
 }
 
-/// The doctor's rows for seat pads: the fence rule, and the broker's socket.
+/// The doctor's rows for seat pads: the fence rule, the broker's socket, and `/dev/cuse`, which
+/// a seat's uinput proxy is made through.
 pub fn diagnostics() -> Vec<Diagnostic> {
     let row = |ok: bool, code: &str, good: &str, bad: &str| Diagnostic {
         level: if ok {
@@ -54,14 +56,26 @@ pub fn diagnostics() -> Vec<Diagnostic> {
             "The pad broker isn't listening, so a seat gets no controller. Restart \
              punktfunk-seats.",
         ),
+        row(
+            Path::new("/dev/cuse").exists(),
+            "uinput_proxy",
+            "/dev/cuse is present for the seats' uinput proxy",
+            "/dev/cuse is missing, so a seat's Steam can't make the controller games read. Load \
+             the cuse kernel module.",
+        ),
     ]
 }
 
-/// The udev program. Never fails: udev takes the lines it gets.
+/// The udev program. Never fails: udev takes the lines it gets. A seat's uinput proxy names
+/// its account in its own name.
 pub fn run() {
     let Some(devpath) = std::env::var_os("DEVPATH") else {
         return;
     };
+    if let Some(account) = devpath.to_str().and_then(account_of_proxy) {
+        print_for(&account);
+        return;
+    }
     let dev = Path::new("/sys").join(
         Path::new(&devpath)
             .strip_prefix("/")
@@ -113,8 +127,18 @@ fn hid_phys(uevent: &str) -> Option<String> {
 
 /// `punktfunk-seat:<account>/<index>` → the account, when it is a plain user name.
 pub fn account_of_phys(phys: &str) -> Option<String> {
-    let rest = phys.strip_prefix(PHYS_PREFIX)?;
-    let account = rest.split('/').next()?;
+    plain(phys.strip_prefix(PHYS_PREFIX)?.split('/').next()?)
+}
+
+/// The account in a uinput proxy's devpath, `/devices/virtual/cuse/punktfunk!uinput-<account>`,
+/// when it is a plain user name. Sysfs spells the devname's `/` as `!`.
+fn account_of_proxy(devpath: &str) -> Option<String> {
+    let name = devpath.strip_prefix("/devices/virtual/cuse/")?;
+    let prefix = pf_paths::seat::uinput_devname("").replace('/', "!");
+    plain(name.strip_prefix(&prefix)?)
+}
+
+fn plain(account: &str) -> Option<String> {
     let plain = !account.is_empty()
         && account.len() <= 32
         && account
@@ -141,6 +165,25 @@ mod tests {
         assert_eq!(account_of_phys("punktfunk-seat:/0"), None);
         assert_eq!(account_of_phys("punktfunk-seat:../root/0"), None);
         assert_eq!(account_of_phys("punktfunk-seat:a b/0"), None);
+    }
+
+    #[test]
+    fn a_uinput_proxy_names_its_seat() {
+        let cuse = "/devices/virtual/cuse/";
+        assert_eq!(
+            account_of_proxy(&format!("{cuse}punktfunk!uinput-pf-seat-2")),
+            Some("pf-seat-2".into())
+        );
+        assert_eq!(account_of_proxy(&format!("{cuse}punktfunk!uinput-")), None);
+        assert_eq!(
+            account_of_proxy(&format!("{cuse}punktfunk!uinput-a!b")),
+            None
+        );
+        assert_eq!(account_of_proxy(&format!("{cuse}fuse-thing")), None);
+        assert_eq!(
+            account_of_proxy("/devices/virtual/misc/punktfunk!uinput-pf-seat-2"),
+            None
+        );
     }
 
     #[test]

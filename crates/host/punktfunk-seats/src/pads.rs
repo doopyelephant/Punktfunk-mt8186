@@ -67,10 +67,15 @@ fn release(held: &mut HashMap<String, usize>, account: &str) {
 }
 
 /// Relays again every pad systemd kept across a supervisor restart, and watches again every
-/// USB socket. First thing at start: until then the kept fds would leak into a child.
-pub fn resume() {
+/// USB socket. The other kept fds are the caller's. First thing at start: until then the kept
+/// fds would leak into a child.
+pub fn resume() -> Vec<(String, OwnedFd)> {
     let _ = std::fs::remove_dir_all(RELAYED);
-    let (pads, sockets) = pad_broker::kept();
+    let pad_broker::Kept {
+        pads,
+        usb: sockets,
+        other,
+    } = pad_broker::kept();
     for kept in pads {
         let Some(slot) = Slot::take(&kept.account) else {
             pad_broker::forget(&kept.name);
@@ -111,6 +116,7 @@ pub fn resume() {
             tracing::warn!(%error, port, "kept seat USB thread did not start");
         }
     }
+    other
 }
 
 /// Relays `pad` until its seat hangs up, listed for `list` and in systemd's fd store meanwhile.

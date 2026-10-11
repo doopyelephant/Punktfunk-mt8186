@@ -20,7 +20,11 @@ ACTION!="remove", SUBSYSTEM=="hidraw|input", KERNEL=="hidraw*|event*|js*", \
 # `udevadm trigger` too, so every line runs on all but `remove`.
 ACTION!="remove", DEVPATH=="/devices/platform/vhci_hcd*/usb*/*", \
     IMPORT{program}="/usr/libexec/punktfunk/punktfunk-seats fence"
-ACTION!="remove", SUBSYSTEM=="input|hidraw|usb|sound|tty", ENV{PF_SEAT_USER}=="?*", \
+# A seat's /dev/uinput, the supervisor's CUSE device /dev/punktfunk/uinput-<account>: the
+# helper reads the account from its name.
+ACTION!="remove", SUBSYSTEM=="cuse", DEVPATH=="/devices/virtual/cuse/punktfunk!uinput-*", \
+    IMPORT{program}="/usr/libexec/punktfunk/punktfunk-seats fence"
+ACTION!="remove", SUBSYSTEM=="input|hidraw|usb|sound|tty|cuse", ENV{PF_SEAT_USER}=="?*", \
     OWNER:="$env{PF_SEAT_USER}", GROUP:="root", MODE:="0600", TAG-="uaccess", \
     ENV{ID_SEAT}="$env{PF_SEAT}", ENV{ID_MM_DEVICE_IGNORE}="1"
 # While seats run (the pads socket exists), every other hidraw node is the box's: it keeps its
