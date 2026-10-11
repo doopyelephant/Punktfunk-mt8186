@@ -143,7 +143,10 @@ mod linux {
             );
         };
         match result {
-            CommandResult::List { seats } => seats.iter().for_each(line),
+            CommandResult::List { seats } => {
+                seats.iter().for_each(line);
+                pads::listing().iter().for_each(|pad| println!("{pad}"));
+            }
             CommandResult::Created { seat }
             | CommandResult::Started { seat }
             | CommandResult::Stopped { seat } => line(seat),
@@ -177,6 +180,8 @@ mod linux {
     /// Seats are units of their own, so stopping the supervisor leaves them running.
     fn serve(socket_path: &std::path::Path, steam_source: Option<PathBuf>) -> Result<(), String> {
         pf_seats::logging::to_stderr();
+        // Adopts systemd's kept fds close-on-exec before anything here can spawn a child.
+        pads::resume();
         let backend = LinuxBackend::open(pf_paths::config_dir(), steam_source)
             .map_err(|e| format!("open the seat backend: {e}"))?;
         let service = Arc::new(

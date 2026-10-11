@@ -17,16 +17,6 @@ use std::sync::{Mutex, MutexGuard};
 pub const MAP: &str = "/run/punktfunk/pads/vhci";
 /// Ports one seat may hold: four of a 16-port controller leaves the box and the others theirs.
 pub const MAX_PER_SEAT: usize = 4;
-/// The fence rule, the only thing that authorizes a gated interface. Without it the gate stays
-/// open, or the owner's own virtual Deck would never bind.
-const RULE: &str = "65-punktfunk-seats.rules";
-const RULE_DIRS: [&str; 5] = [
-    "/etc/udev/rules.d",
-    "/run/udev/rules.d",
-    "/usr/lib/udev/rules.d",
-    "/lib/udev/rules.d",
-    "/usr/local/lib/udev/rules.d",
-];
 
 /// Port choice and the map change together.
 static LOCK: Mutex<()> = Mutex::new(());
@@ -44,12 +34,11 @@ pub fn prepare() {
         tracing::warn!(%error, dir = MAP, "vhci port map not made");
     }
     prune(dir, &usbip::vhci_used_rows());
-    let ruled = RULE_DIRS.iter().any(|d| Path::new(d).join(RULE).exists());
+    // The fence rule is the only thing that authorizes a gated interface; without it the gate
+    // stays open, or the owner's own virtual Deck never binds.
+    let ruled = pf_seats::linux::fence::rule_installed();
     if !ruled {
-        tracing::warn!(
-            rule = RULE,
-            "seat USB interfaces are not gated: the udev rule is missing"
-        );
+        tracing::warn!("seat USB interfaces are not gated: the udev fence rule is missing");
     }
     set_gate(ruled);
 }
@@ -103,9 +92,10 @@ pub fn attach(account: &str, sock: BorrowedFd<'_>, devid: u32, speed: u32) -> Re
     Ok(Some(port))
 }
 
-/// Holds `sock` until its connection ends, then forgets `port`'s row if it still names it.
-/// Held, the fd's number stays the row's.
-pub fn watch(port: u16, sock: OwnedFd) {
+/// Holds `sock` until its connection ends, then forgets `port`'s row if it still names
+/// `recorded`, the number `attach` took, and takes the socket out of systemd's fd store. After a
+/// restart `sock` has another number; the row and `status` keep the recorded one.
+pub fn watch(port: u16, recorded: RawFd, sock: OwnedFd) {
     loop {
         let mut fds = [PollFd::new(&sock, PollFlags::RDHUP)];
         match poll(&mut fds, None) {
@@ -116,9 +106,11 @@ pub fn watch(port: u16, sock: OwnedFd) {
     }
     let _held = lock();
     let dir = Path::new(MAP);
-    if read_row(dir, port).is_some_and(|(_, fd)| fd == sock.as_raw_fd()) {
+    if read_row(dir, port).is_some_and(|(_, fd)| fd == recorded) {
         let _ = std::fs::remove_file(dir.join(port.to_string()));
     }
+    // Before `sock` closes: its number, once free, can name a new attach on this port.
+    pf_inject::pad_broker::forget_usb(port, recorded);
 }
 
 /// Detach `port` for `account`, while it still holds the socket its row names. A port no seat

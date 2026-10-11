@@ -26,6 +26,8 @@ ExecStart=/usr/libexec/punktfunk/punktfunk-seats serve --socket /run/punktfunk/s
 ExecStopPost=-/usr/libexec/punktfunk/punktfunk-seats ungate
 Restart=on-failure
 RestartSec=2
+# A relayed pad's fds wait here across a restart, so an update keeps a seat's controllers.
+FileDescriptorStoreMax=256
 # What useradd, systemctl, setfacl and chown need, and nothing more.
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_FSETID CAP_KILL CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE
 NoNewPrivileges=yes
