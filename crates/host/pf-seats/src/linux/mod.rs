@@ -14,7 +14,8 @@
 //!
 //! A seat's pads are the daemon's too: its host asks the pad broker in the `punktfunk-seats`
 //! binary for them ([`LinuxBackend::running_account`] is its gate), and [`fence`] gives udev the
-//! user each one belongs to.
+//! user each one belongs to. The binary's uinput proxy, the seat's `/dev/uinput`, comes and goes
+//! with the unit ([`LinuxBackend::on_unit`]).
 
 mod accounts;
 pub mod fence;
@@ -35,7 +36,7 @@ use crate::service::SeatService;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 /// A seat has this long to bring up its compositor and open the host's management port.
@@ -83,6 +84,18 @@ struct Inner {
     running: Mutex<HashMap<SeatId, Tracked>>,
     /// A seat stopped since the ACL mask was last repaired.
     acl_dirty: AtomicBool,
+    /// What the binary runs beside a seat's unit ([`LinuxBackend::on_unit`]).
+    hook: OnceLock<UnitHook>,
+}
+
+/// Runs beside a seat's unit: `Some(uid)` before the unit starts and for a seat found running,
+/// never for the owner's row; `None` once a unit stopped. Every call must be idempotent.
+pub type UnitHook = Box<dyn Fn(&str, Option<u32>) + Send + Sync>;
+
+fn unit_hook(inner: &Inner, account: &str, uid: Option<u32>) {
+    if let Some(hook) = inner.hook.get() {
+        hook(account, uid);
+    }
 }
 
 /// What the keep-level thread and the pad broker need of a running seat.
@@ -116,7 +129,8 @@ impl Tracked {
     }
 }
 
-/// Stops `account`'s unit if it is up. A unit that was never started is fine.
+/// Stops `account`'s unit if it is up, then ends what runs beside it. A unit that was never
+/// started is fine.
 fn stop_unit(inner: &Inner, id: &SeatId, account: &str) -> Result<(), BackendError> {
     let unit = session::unit(account);
     if session::state(account)?.active != "inactive" {
@@ -125,10 +139,13 @@ fn stop_unit(inner: &Inner, id: &SeatId, account: &str) -> Result<(), BackendErr
     // A failed unit keeps its state until reset, and would read as failed after a stop.
     let _ = run("systemctl_failed", "systemctl", &["reset-failed", &unit]);
     // The owner's row stays tracked: its own host reads the trust copy while the unit is down.
-    let mut running = inner.running.lock().unwrap_or_else(|e| e.into_inner());
-    if running.get(id).is_some_and(|t| t.owner.is_none()) {
-        running.remove(id);
+    {
+        let mut running = inner.running.lock().unwrap_or_else(|e| e.into_inner());
+        if running.get(id).is_some_and(|t| t.owner.is_none()) {
+            running.remove(id);
+        }
     }
+    unit_hook(inner, account, None);
     inner.acl_dirty.store(true, Ordering::SeqCst);
     Ok(())
 }
@@ -183,6 +200,7 @@ impl LinuxBackend {
             steam_source,
             running: Mutex::new(HashMap::new()),
             acl_dirty: AtomicBool::new(false),
+            hook: OnceLock::new(),
         });
         let weak = Arc::downgrade(&inner);
         std::thread::Builder::new()
@@ -190,6 +208,12 @@ impl LinuxBackend {
             .spawn(move || keep_level(weak))
             .map_err(|e| err("thread", format!("start the trust thread: {e}")))?;
         Ok(Self { inner })
+    }
+
+    /// Sets what runs beside each seat's unit: the binary's uinput proxy. The first call wins.
+    pub fn on_unit(self, hook: UnitHook) -> Self {
+        let _ = self.inner.hook.set(hook);
+        self
     }
 
     /// Opens the ledger in `seats` under the box directory and gives the service this backend.
@@ -481,6 +505,7 @@ impl PlatformBackend for LinuxBackend {
         shared::ensure_seat_dirs(box_dir, &seat.id, &passwd)?;
         shared::refresh_trust(box_dir, &seat.id, shared::Reader::group(passwd.gid))?;
         let unit = session::unit(&seat.account);
+        unit_hook(&self.inner, &seat.account, Some(passwd.uid));
         // A unit already up keeps its token: the host read it when it started.
         if !session::state(&seat.account)?.live() {
             if session::port_open(seat.mgmt_port) {
@@ -536,9 +561,11 @@ impl PlatformBackend for LinuxBackend {
                 .contains_key(&seat.id);
             if !known && let Some(passwd) = accounts::lookup(&seat.account)? {
                 self.track(&seat.id, Tracked::of(seat, &passwd));
+                unit_hook(&self.inner, &seat.account, Some(passwd.uid));
             }
         } else {
             self.untrack(&seat.id);
+            unit_hook(&self.inner, &seat.account, None);
         }
         Ok(state.runtime())
     }

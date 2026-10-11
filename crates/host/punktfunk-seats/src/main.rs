@@ -1,9 +1,10 @@
 //! `punktfunk-seats`: the Linux seat supervisor and the operator's client for it.
 //!
 //! `serve` is the root daemon (`punktfunk-seats.service`). The other verbs send one request to
-//! its socket, as the box host does, and print the answer. The pad broker, [`pads`], is the
-//! daemon's too; it lives here rather than in `pf-seats` because it links `pf-inject`, whose
-//! dependencies the Windows seat keeper's own workspace cannot resolve beside IronRDP.
+//! its socket, as the box host does, and print the answer. The pad broker, [`pads`], and each
+//! seat's `/dev/uinput`, [`uinput`], are the daemon's too; they live here rather than in
+//! `pf-seats` because they link `pf-inject`, whose dependencies the Windows seat keeper's own
+//! workspace cannot resolve beside IronRDP.
 
 #![forbid(unsafe_code)]
 
@@ -19,7 +20,11 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(target_os = "linux")]
+mod cuse;
+#[cfg(target_os = "linux")]
 mod pads;
+#[cfg(target_os = "linux")]
+mod uinput;
 #[cfg(target_os = "linux")]
 mod vhci;
 
@@ -178,13 +183,15 @@ mod linux {
     }
 
     /// Runs the supervisor: autostart seats first, then the socket until the process is stopped.
-    /// Seats are units of their own, so stopping the supervisor leaves them running.
+    /// Seats are units of their own, so stopping the supervisor leaves them running. Each seat's
+    /// uinput proxy comes and goes with its unit.
     fn serve(socket_path: &std::path::Path, steam_source: Option<PathBuf>) -> Result<(), String> {
         pf_seats::logging::to_stderr();
         // Adopts systemd's kept fds close-on-exec before anything here can spawn a child.
-        pads::resume();
+        crate::uinput::resume(pads::resume());
         let backend = LinuxBackend::open(pf_paths::config_dir(), steam_source)
-            .map_err(|e| format!("open the seat backend: {e}"))?;
+            .map_err(|e| format!("open the seat backend: {e}"))?
+            .on_unit(Box::new(crate::uinput::hook));
         let service = Arc::new(
             backend
                 .open_service()

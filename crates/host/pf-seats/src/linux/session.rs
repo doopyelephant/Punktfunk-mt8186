@@ -4,7 +4,8 @@
 //! writes its files under `/run` before each start: `punktfunk/seats/<user>.env`, the seat
 //! contract the host reads plus its management token; a drop-in that binds the seat's private
 //! `compatdata`, `shadercache` and `downloading` over the shared games folder's, shows it the
-//! owner's libraries and hides the box's mounted drives; and one that
+//! owner's libraries, hides the box's mounted drives and binds the supervisor's uinput proxy
+//! over `/dev/uinput`; and one that
 //! binds [`NO_UPDATE`] over Steam's OS and firmware update helpers. All are rewritten from the
 //! ledger on a start, so a reboot that empties `/run` loses nothing.
 
@@ -125,11 +126,13 @@ pub(super) fn render_env(seat: &Seat, home: &Path, box_dir: &Path, token: &str) 
 }
 
 /// The drop-in that gives the unit its private prefix directories, the owner's libraries
-/// ([`libraries`]), and an empty `/run/media`: a SteamOS-mode Steam adopts every mounted drive
-/// holding a `steamapps` as a library, and the drive as mounted is the owner's alone.
+/// ([`libraries`]), an empty `/run/media` and the supervisor's uinput proxy as `/dev/uinput`.
+/// A SteamOS-mode Steam adopts every mounted drive holding a `steamapps` as a library, and the
+/// drive as mounted is the owner's alone. Without the proxy the unit starts all the same.
 pub(super) fn render_binds(
     box_dir: &Path,
     id: &SeatId,
+    account: &str,
     shares: Option<&libraries::Shares>,
 ) -> String {
     let seat = shared::seat_dir(box_dir, id);
@@ -145,6 +148,8 @@ pub(super) fn render_binds(
     if let Some(shares) = shares {
         out.push_str(&libraries::unit_lines(box_dir, id, shares));
     }
+    let proxy = pf_paths::seat::uinput_devname(account);
+    out.push_str(&format!("BindPaths=-/dev/{proxy}:/dev/uinput\n"));
     out
 }
 
@@ -225,7 +230,10 @@ pub(super) fn write_unit_files(
     let (name, contents) = if seat.owner {
         ("class.conf", render_class().to_owned())
     } else {
-        ("binds.conf", render_binds(box_dir, &seat.id, shares))
+        (
+            "binds.conf",
+            render_binds(box_dir, &seat.id, &seat.account, shares),
+        )
     };
     let dropin = dropin_dir(&seat.account).join(name);
     let mut changed = write_if_changed(&dropin, &contents, 0o644)
@@ -434,15 +442,16 @@ mod tests {
     }
 
     #[test]
-    fn the_binds_drop_in_maps_each_private_dir_over_the_shared_one() {
+    fn the_binds_drop_in_maps_each_private_dir_and_the_uinput_proxy() {
         let id = SeatId::parse("0123456789abcdef0123456789abcdef").unwrap();
         assert_eq!(
-            render_binds(Path::new("/var/lib/punktfunk"), &id, None),
+            render_binds(Path::new("/var/lib/punktfunk"), &id, "pf-seat-1", None),
             "[Service]\n\
              TemporaryFileSystem=/run/media:ro\n\
              BindPaths=/var/lib/punktfunk/seats/0123456789abcdef0123456789abcdef/compatdata:/var/lib/punktfunk/games/steamapps/compatdata\n\
              BindPaths=/var/lib/punktfunk/seats/0123456789abcdef0123456789abcdef/shadercache:/var/lib/punktfunk/games/steamapps/shadercache\n\
-             BindPaths=/var/lib/punktfunk/seats/0123456789abcdef0123456789abcdef/downloading:/var/lib/punktfunk/games/steamapps/downloading\n"
+             BindPaths=/var/lib/punktfunk/seats/0123456789abcdef0123456789abcdef/downloading:/var/lib/punktfunk/games/steamapps/downloading\n\
+             BindPaths=-/dev/punktfunk/uinput-pf-seat-1:/dev/uinput\n"
         );
     }
 

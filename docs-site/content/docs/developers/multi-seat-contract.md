@@ -284,6 +284,22 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   shows what each seat holds. While the daemon runs, every other hidraw node is the box's: it
   keeps its group and seat0's ACL but loses `other` access, which some distros grant on every
   hidraw (Bazzite's `MODE="0666"`) and which would hand the box's pads to every seat's Steam.
+- **`/dev/uinput`.** Games read Steam Input's virtual controller, which the seat's Steam makes
+  through `/dev/uinput`. Before a seat's unit starts, the daemon serves it a CUSE device,
+  `/dev/punktfunk/uinput-<user>` (the user's, `0600`; the fence rule keeps it so on every udev
+  event), and the unit binds it over `/dev/uinput`. Each open of it is one real uinput device the
+  daemon makes and replays the seat's requests onto, 16 per seat. Only gamepad capabilities
+  pass: `EV_SYN`, `EV_KEY` for joystick and gamepad buttons, `BTN_DPAD_*` and
+  `BTN_TRIGGER_HAPPY*`, `EV_ABS` without pressure, tilt, tool or multitouch axes, `EV_MSC`,
+  `EV_FF` and the accelerometer property. Any other bit is refused with `EPERM`, and the daemon
+  logs each refused code once, so a seat never makes a keyboard or a mouse, which would reach
+  the console's SysRq and `/dev/input/mice`. The daemon stamps each device's `phys` as
+  `punktfunk-seat:<account>/steam/<n>`, whatever the seat asked, so the fence takes it. A 32-bit
+  Steam's events and FF uploads are translated. The CUSE fd and each device's fd wait in the fd
+  store, so a restart of the daemon keeps the bound node and the devices on it; a stop of the
+  daemon ends them until the seat restarts. The seat host's own pads still go through the
+  broker, and a seat host offers no pen. It needs `/dev/cuse`, which the `cuse` module autoloads
+  on first open; `doctor` reports it.
 - **USB pads.** A USB/IP pad (the virtual Deck, the SC2, the Switch 2) stays the seat host's own
   usbip server. A seat that can't write vhci's `attach` runs the import handshake and sends the
   connected socket with an `Attach`; the daemon picks the vhci port, records it in `/run/punktfunk/pads/vhci/<port>` and

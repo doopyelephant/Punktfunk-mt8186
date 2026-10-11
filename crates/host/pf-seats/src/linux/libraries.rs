@@ -552,7 +552,8 @@ mod tests {
                 key: "00aa".into(),
             }],
         };
-        let text = super::super::session::render_binds(Path::new("/b"), &id(), Some(&shares));
+        let text =
+            super::super::session::render_binds(Path::new("/b"), &id(), "pf-seat-1", Some(&shares));
         let seat = "/b/seats/0123456789abcdef0123456789abcdef";
         let stage = "/run/punktfunk/libraries/0123456789abcdef0123456789abcdef/00aa";
         let owner = "/run/media/bazzite/QEMU HARDDISK/steamapps";
@@ -575,7 +576,8 @@ mod tests {
         }
         expected.push_str(&format!(
             "BindReadOnlyPaths=-{stage}/libraryfolders.vdf:\
-             {seat}/libraries/00aa/steamapps/libraryfolders.vdf\n"
+             {seat}/libraries/00aa/steamapps/libraryfolders.vdf\n\
+             BindPaths=-/dev/punktfunk/uinput-pf-seat-1:/dev/uinput\n"
         ));
         assert_eq!(text, expected);
     }
