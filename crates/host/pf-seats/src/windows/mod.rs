@@ -15,6 +15,7 @@ pub mod keeper;
 pub mod pipe;
 mod process;
 mod rdp;
+mod seat_listener;
 mod steam;
 mod supervisor;
 mod util;
@@ -162,6 +163,11 @@ impl PlatformBackend for WindowsBackend {
 
     fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
         self.ensure_runtime_prerequisites()?;
+        // An upgrade's new enumerator reaches the listener here. Without it the seat still
+        // starts, on `RDP-Tcp`, with Remote Audio and no pad audio.
+        if let Err(cause) = seat_listener::ensure(&self.host_path) {
+            tracing::warn!(%cause, "seat listener not ready — seats start without pad audio");
+        }
         self.supervisor.start(seat)
     }
 

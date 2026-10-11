@@ -219,7 +219,7 @@ impl WinExecutor<'_> {
                 Ok(())
             }
             WinAction::RemoveFiles { dir } => {
-                self.remove_tree(dir);
+                self.remove_tree(&expand_env(dir));
                 Ok(())
             }
             WinAction::PathAdd { machine, dir } => self.path_edit(*machine, dir, true),
@@ -813,8 +813,41 @@ fn to_utf16le_bom(text: &str) -> Vec<u8> {
     bytes
 }
 
+/// `%NAME%` from the environment, so a plan can name `%SystemRoot%` and stay the same text on
+/// every machine. An unset or empty name stays as written.
+fn expand_env(path: &str) -> String {
+    let mut out = String::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('%') {
+        let Some(len) = rest[open + 1..].find('%') else {
+            break;
+        };
+        let name = &rest[open + 1..open + 1 + len];
+        out.push_str(&rest[..open]);
+        match std::env::var(name) {
+            Ok(value) if !name.is_empty() => out.push_str(&value),
+            _ => out.push_str(&rest[open..open + len + 2]),
+        }
+        rest = &rest[open + len + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_plan_path_expands_its_environment_names() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        assert_eq!(super::expand_env("%PATH%\\x"), format!("{path}\\x"));
+        assert_eq!(
+            super::expand_env(r"%PF_NO_SUCH_NAME%\x"),
+            r"%PF_NO_SUCH_NAME%\x"
+        );
+        assert_eq!(super::expand_env("50% off, %% kept"), "50% off, %% kept");
+        assert_eq!(super::expand_env("plain"), "plain");
+    }
+
     use super::super::choices::WinChoices;
     use super::super::plan::{self, Artifact};
     use super::super::{FakeNet, WinFacts, WinInstall};

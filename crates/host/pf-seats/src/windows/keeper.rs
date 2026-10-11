@@ -14,6 +14,9 @@ pub use crate::bootstrap::RdpBootstrap;
 /// The keeper's file name, beside `punktfunk-host.exe`.
 pub const KEEPER_EXE: &str = "punktfunk-seat-keeper.exe";
 
+/// The seat listener's loopback port, where a session also gets its pads' audio endpoints.
+pub const SEAT_LISTENER_PORT: u16 = pf_driver_proto::seat_audio::LISTENER_PORT;
+
 /// The keeper beside `host_path`.
 pub fn keeper_path(host_path: &Path) -> PathBuf {
     host_path.with_file_name(KEEPER_EXE)

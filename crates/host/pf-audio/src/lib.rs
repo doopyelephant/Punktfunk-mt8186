@@ -353,7 +353,8 @@ use self::windows as plat;
 // Flat names for the session, the devtests and the installer: `pf_audio::pad_endpoint`.
 #[cfg(target_os = "windows")]
 pub use self::windows::{
-    audio_control, audio_probe, devnode_cleanup, minted, pad_capture, pad_endpoint, voice_route,
+    audio_control, audio_probe, devnode_cleanup, minted, pad_capture, pad_endpoint, seat_pad,
+    voice_route,
 };
 #[cfg(target_os = "linux")]
 mod linux;

@@ -333,10 +333,18 @@ pub fn restrict_existing_secret_file(_path: &std::path::Path) {}
 /// elevated or as SYSTEM, so a system tool is never spawned by bare name. `rel` may carry a
 /// subdirectory ([`POWERSHELL`]). Ungated: string work only.
 pub fn system32(rel: &str) -> String {
-    let root = std::env::var("SystemRoot")
+    format!(r"{}\System32\{rel}", system_root())
+}
+
+/// `%SystemRoot%\SysWOW64\<rel>`: where 32-bit processes find what [`system32`] names.
+pub fn syswow64(rel: &str) -> String {
+    format!(r"{}\SysWOW64\{rel}", system_root())
+}
+
+fn system_root() -> String {
+    std::env::var("SystemRoot")
         .or_else(|_| std::env::var("WINDIR"))
-        .unwrap_or_else(|_| r"C:\Windows".to_string());
-    format!(r"{root}\System32\{rel}")
+        .unwrap_or_else(|_| r"C:\Windows".to_string())
 }
 
 /// Windows PowerShell under System32, for [`system32`].

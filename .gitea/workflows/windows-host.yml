@@ -89,6 +89,7 @@ on:
       - 'crates/host/pf-paths/**'
       - 'crates/host/pf-paths-win/**'
       - 'crates/host/pf-portal/**'
+      - 'crates/host/pf-seat-audio/**'
       - 'crates/host/pf-seat-keeper/**'
       - 'crates/host/pf-seats/**'
       - 'crates/host/pf-vdisplay/**'
@@ -131,6 +132,7 @@ on:
       - 'crates/host/pf-paths/**'
       - 'crates/host/pf-paths-win/**'
       - 'crates/host/pf-portal/**'
+      - 'crates/host/pf-seat-audio/**'
       - 'crates/host/pf-seat-keeper/**'
       - 'crates/host/pf-seats/**'
       - 'crates/host/pf-vdisplay/**'
@@ -228,14 +230,14 @@ jobs:
         # every extra feature set re-checks the crates the runs share.
         run: |
           cargo clippy --release --locked -p punktfunk-host -p punktfunk-tray --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
-          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p display-disturb --all-targets --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p pf-seat-audio -p display-disturb --all-targets --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
           # The seat keeper is its own workspace (IronRDP's lockfile); see its Cargo.toml.
           cargo clippy --release --locked --manifest-path crates/host/pf-seat-keeper/Cargo.toml --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "seat keeper clippy" }
 
       - name: Format check
         # Cheap, needs no compile, and the Linux lane cannot see these crates' Windows modules.
         run: |
-          cargo fmt -p punktfunk-host -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p punktfunk-tray -p punktfunk-capture-worker --check; if ($LASTEXITCODE) { throw "fmt" }
+          cargo fmt -p punktfunk-host -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p pf-seat-audio -p punktfunk-tray -p punktfunk-capture-worker --check; if ($LASTEXITCODE) { throw "fmt" }
           cargo fmt --manifest-path crates/host/pf-seat-keeper/Cargo.toml --check; if ($LASTEXITCODE) { throw "seat keeper fmt" }
 
       - name: Test (pf-capture + pf-vdisplay + pf-win-display, Windows)
