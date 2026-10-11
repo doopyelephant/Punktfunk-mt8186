@@ -18,14 +18,17 @@ use pf_driver_proto::gamepad::{
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use windows::core::{GUID, HSTRING, PCWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_Child, CM_Get_Device_IDW, CM_Get_Device_Interface_ListW,
+    CM_Get_Child, CM_Get_DevNode_PropertyW, CM_Get_Device_IDW, CM_Get_Device_Interface_ListW,
     CM_Get_Device_Interface_List_SizeW, CM_Get_Sibling, CM_Locate_DevNodeW,
-    CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_LOCATE_DEVNODE_NORMAL, CR_SUCCESS,
+    CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_LOCATE_DEVNODE_NORMAL, CR_NO_SUCH_VALUE, CR_SUCCESS,
 };
 use windows::Win32::Devices::HumanInterfaceDevice::{
     HidD_FreePreparsedData, HidD_GetAttributes, HidD_GetFeature, HidD_GetIndexedString,
     HidD_GetPreparsedData, HidD_GetProductString, HidD_GetSerialNumberString, HidD_SetFeature,
     HidP_GetCaps, GUID_DEVINTERFACE_HID, HIDD_ATTRIBUTES, HIDP_CAPS, PHIDP_PREPARSED_DATA,
+};
+use windows::Win32::Devices::Properties::{
+    DEVPKEY_Device_SessionId, DEVPROPTYPE, DEVPROP_TYPE_UINT32,
 };
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
@@ -559,9 +562,7 @@ fn interface_paths(class: &GUID, device_id: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Immediate children of `instance_id`. For a HID minidriver those are the collection PDOs
-/// hidclass created under our devnode — the HID interface lives there, not on the parent.
-fn child_device_ids(instance_id: &str) -> Result<Vec<String>> {
+fn locate(instance_id: &str) -> Result<u32> {
     let wide = HSTRING::from(instance_id);
     let mut devinst = 0u32;
     // SAFETY: `devinst` is a valid out-param; `wide` is a NUL-terminated id valid for the call.
@@ -578,6 +579,45 @@ fn child_device_ids(instance_id: &str) -> Result<Vec<String>> {
             cr.0
         );
     }
+    Ok(devinst)
+}
+
+/// `DEVPKEY_Device_SessionId` on a devnode; `None` when it carries none. A devnode fenced to
+/// another session does not locate from this one, so that reads as an error.
+pub(crate) fn get_devnode_session(instance_id: &str) -> Result<Option<u32>> {
+    let devinst = locate(instance_id)?;
+    let mut ty = DEVPROPTYPE(0);
+    let mut buf = [0u8; 4];
+    let mut size = buf.len() as u32;
+    // SAFETY: `devinst` was just located; the key is a static; `buf` holds `size` bytes and
+    // `ty` / `size` are valid out-params for the call.
+    let cr = unsafe {
+        CM_Get_DevNode_PropertyW(
+            devinst,
+            &DEVPKEY_Device_SessionId,
+            &mut ty,
+            Some(buf.as_mut_ptr()),
+            &mut size,
+            0,
+        )
+    };
+    if cr == CR_NO_SUCH_VALUE {
+        return Ok(None);
+    }
+    if cr != CR_SUCCESS || ty != DEVPROP_TYPE_UINT32 || size != 4 {
+        bail!(
+            "read the session id of {instance_id}: CONFIGRET {}, type {}, {size} bytes",
+            cr.0,
+            ty.0
+        );
+    }
+    Ok(Some(u32::from_ne_bytes(buf)))
+}
+
+/// Immediate children of `instance_id`. For a HID minidriver those are the collection PDOs
+/// hidclass created under our devnode — the HID interface lives there, not on the parent.
+pub(crate) fn child_device_ids(instance_id: &str) -> Result<Vec<String>> {
+    let devinst = locate(instance_id)?;
     let mut out = Vec::new();
     let mut child = 0u32;
     // SAFETY: `devinst` is the devnode just located; `child` is a valid out-param.

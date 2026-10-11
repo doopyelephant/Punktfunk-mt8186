@@ -738,6 +738,8 @@ pub mod gamepad;
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/gamepad_raii.rs"]
 mod gamepad_raii;
+#[cfg(target_os = "windows")]
+pub use gamepad_raii::set_pad_session;
 /// `vmouse-spike --selftest`: checks the device's input reads as hardware.
 #[cfg(target_os = "windows")]
 #[path = "inject/windows/hid_selftest.rs"]

@@ -33,13 +33,13 @@ use windows::Win32::Devices::Enumeration::Pnp::{
     SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
 };
 use windows::Win32::Devices::Properties::{
-    DEVPKEY_Device_HardwareIds, DEVPROPCOMPKEY, DEVPROPERTY, DEVPROPTYPE, DEVPROP_STORE_SYSTEM,
-    DEVPROP_TYPE_BINARY, DEVPROP_TYPE_STRING_LIST,
+    DEVPKEY_Device_HardwareIds, DEVPKEY_Device_SessionId, DEVPROPCOMPKEY, DEVPROPERTY, DEVPROPTYPE,
+    DEVPROP_STORE_SYSTEM, DEVPROP_TYPE_BINARY, DEVPROP_TYPE_STRING_LIST, DEVPROP_TYPE_UINT32,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, LocalFree, SetLastError, DUPLICATE_HANDLE_OPTIONS,
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, E_FAIL, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0, WIN32_ERROR,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, SetLastError, DEVPROPKEY,
+    DUPLICATE_HANDLE_OPTIONS, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, E_FAIL, HANDLE, HLOCAL,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WIN32_ERROR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -763,7 +763,115 @@ fn bthenum_id(vid_pid: &str) -> String {
     format!("{BTH_HID_SERVICE}_VID&0002{vid}_PID&{pid}")
 }
 
-/// Spawn a virtual devnode under `p.enumerator` and return it with its PnP instance id.
+static PAD_SESSION: OnceLock<u32> = OnceLock::new();
+
+/// The session every [`create_swdevice`] devnode is fenced to: this process's own, unless
+/// [`set_pad_session`] ran first. `None` only while Windows can't say.
+pub fn pad_session() -> Option<u32> {
+    if let Some(&session) = PAD_SESSION.get() {
+        return Some(session);
+    }
+    pf_win_display::own_session_id().map(|own| *PAD_SESSION.get_or_init(|| own))
+}
+
+/// Fence this process's devnodes to `session` instead of its own. First call wins, so call it
+/// before the first device opens.
+pub fn set_pad_session(session: u32) {
+    let _ = PAD_SESSION.set(session);
+}
+
+/// `SwDeviceCreate`'s `pProperties`: the profile's binary property, then
+/// `DEVPKEY_Device_SessionId`. hidclass's children inherit the session from birth, which hides
+/// them from every other session. Each `Buffer` points into `binary` or `session`.
+fn devnode_properties(binary: Option<(u128, u32, &[u8])>, session: &[u8; 4]) -> Vec<DEVPROPERTY> {
+    let prop = |key: DEVPROPKEY, ty: DEVPROPTYPE, bytes: &[u8]| DEVPROPERTY {
+        CompKey: DEVPROPCOMPKEY {
+            Key: key,
+            Store: DEVPROP_STORE_SYSTEM,
+            LocaleName: PCWSTR::null(),
+        },
+        Type: ty,
+        BufferSize: bytes.len() as u32,
+        Buffer: bytes.as_ptr() as *mut c_void,
+    };
+    let mut props = Vec::with_capacity(2);
+    if let Some((fmtid, pid, bytes)) = binary {
+        let key = DEVPROPKEY {
+            fmtid: GUID::from_u128(fmtid),
+            pid,
+        };
+        props.push(prop(key, DEVPROP_TYPE_BINARY, bytes));
+    }
+    props.push(prop(DEVPKEY_Device_SessionId, DEVPROP_TYPE_UINT32, session));
+    props
+}
+
+/// Where a devnode's game-facing interfaces live, so [`verify_fence`] reads the session there.
+pub(super) enum FenceAt {
+    /// hidclass's children. `pad` also marks the pad driver unattached when none appears.
+    HidChildren { pad: bool },
+    /// The devnode itself: `pf-xusb` owns its XUSB interface and has no child.
+    Parent,
+}
+
+/// Read [`pad_session`] back where `at` says games look. A devnode that does not carry it is
+/// [`PadCreateFault::SessionFence`], logged with what was read; the caller drops the
+/// [`SwDevice`], which removes it. No HID child within 500 ms is a driver that never bound: an
+/// unclassified error carrying the devnode's PnP status, so the driver hint still applies.
+pub(super) fn verify_fence(instance_id: Option<&str>, at: FenceAt) -> Result<()> {
+    let (Some(id), Some(want)) = (instance_id, pad_session()) else {
+        return Err(anyhow!(
+            "the devnode's instance id or this host's session id is unknown"
+        ))
+        .context(PadCreateFault::SessionFence);
+    };
+    let nodes = match at {
+        FenceAt::Parent => vec![id.to_owned()],
+        FenceAt::HidChildren { pad } => hid_children(id, pad)?,
+    };
+    for node in nodes {
+        let read = match channel_proof::get_devnode_session(&node) {
+            Ok(Some(s)) if s == want => continue,
+            Ok(Some(s)) => s.to_string(),
+            Ok(None) => "none".to_owned(),
+            Err(e) => format!("{e:#}"),
+        };
+        tracing::warn!(
+            devnode = %node,
+            read = %read,
+            want,
+            "virtual devnode without this host's session id — removing it"
+        );
+        return Err(anyhow!("{node} carries session {read}, not {want}"))
+            .context(PadCreateFault::SessionFence);
+    }
+    Ok(())
+}
+
+/// `id`'s HID children. hidclass makes them ~40 ms after the driver starts; the caller has
+/// already waited for that, so 500 ms more is the margin.
+fn hid_children(id: &str, pad: bool) -> Result<Vec<String>> {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let kids = channel_proof::child_device_ids(id)?;
+        if !kids.is_empty() {
+            return Ok(kids);
+        }
+        if Instant::now() >= deadline {
+            if pad {
+                crate::note_pad_driver(crate::PadDriverVerdict::NotAttached);
+            }
+            return Err(anyhow!(
+                "no HID collection under the new devnode: {}",
+                devnode_status_line(id, pad)
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Spawn a virtual devnode under `p.enumerator`, fenced to [`pad_session`], and return it with
+/// its PnP instance id. No session, no devnode.
 ///
 /// Game detection (`design/windows-dualsense-game-detection.md`): `HIDD_ATTRIBUTES` VID/PID
 /// satisfies SDL/HIDAPI/RawInput, but a native PS5 path classifies connection type by walking
@@ -778,6 +886,9 @@ fn bthenum_id(vid_pid: &str) -> String {
 /// mandatory — either yields `E_INVALIDARG`. The caller must be Administrator (the host runs as
 /// LocalSystem).
 pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(SwDevice, Option<String>)> {
+    let session = pad_session()
+        .context("fence the devnode to this host's session: the session id is unknown")
+        .context(PadCreateFault::SessionFence)?;
     let multi_sz = |ids: &[&str]| -> Vec<u16> {
         ids.iter()
             .flat_map(|s| s.encode_utf16().chain(std::iter::once(0)))
@@ -829,20 +940,9 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(SwDevice, Option<S
         ..Default::default()
     };
 
-    // `bytes` outlives the call; SwDeviceCreate only reads `Buffer`.
-    let property = p.property.map(|(fmtid, pid, bytes)| DEVPROPERTY {
-        CompKey: DEVPROPCOMPKEY {
-            Key: windows::Win32::Foundation::DEVPROPKEY {
-                fmtid: GUID::from_u128(fmtid),
-                pid,
-            },
-            Store: DEVPROP_STORE_SYSTEM,
-            LocaleName: PCWSTR::null(),
-        },
-        Type: DEVPROP_TYPE_BINARY,
-        BufferSize: bytes.len() as u32,
-        Buffer: bytes.as_ptr() as *mut c_void,
-    });
+    // `p.property`'s bytes and `session_bytes` outlive the call; SwDeviceCreate only reads them.
+    let session_bytes = session.to_ne_bytes();
+    let props = devnode_properties(p.property, &session_bytes);
 
     // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
     let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
@@ -855,15 +955,15 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(SwDevice, Option<S
         result: E_FAIL,
         instance_id: [0; 128],
     }));
-    // SAFETY: info + the buffers outlive the call; `ctx` is a live heap allocation that outlives
-    // every path below (reclaimed only where the callback provably ran). windows-rs returns the
-    // HSWDEVICE (the C out-param) as the Result value.
+    // SAFETY: info, `props` + the buffers outlive the call; `ctx` is a live heap allocation that
+    // outlives every path below (reclaimed only where the callback provably ran). windows-rs
+    // returns the HSWDEVICE (the C out-param) as the Result value.
     let hsw = match unsafe {
         SwDeviceCreate(
             PCWSTR(enumerator.as_ptr()),
             w!("HTREE\\ROOT\\0"),
             &info,
-            property.as_ref().map(core::slice::from_ref),
+            Some(props.as_slice()),
             Some(sw_create_cb),
             Some(ctx as *const c_void),
         )
@@ -904,7 +1004,11 @@ pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(SwDevice, Option<S
             ctx.result
         ));
     }
-    Ok((sw, ctx.instance_id()))
+    let instance_id = ctx.instance_id();
+    if let Some(id) = &instance_id {
+        tracing::debug!(devnode = %id, session, "virtual devnode fenced to this session");
+    }
+    Ok((sw, instance_id))
 }
 
 impl Drop for SwDevice {
@@ -1247,6 +1351,30 @@ mod tests {
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
+
+    /// Every devnode carries a 4-byte UINT32 `SessionId`, after the profile's binary property
+    /// when it has one.
+    #[test]
+    fn every_devnode_carries_the_session_property() {
+        let session = 15u32.to_ne_bytes();
+        let only = devnode_properties(None, &session);
+        assert_eq!(only.len(), 1, "no binary property, only the fence");
+        let fence = &only[0];
+        assert_eq!(fence.CompKey.Key, DEVPKEY_Device_SessionId);
+        assert_eq!(fence.Type, DEVPROP_TYPE_UINT32);
+        assert_eq!(fence.BufferSize, 4);
+        assert_eq!(fence.Buffer, session.as_ptr() as *mut c_void);
+
+        let blob = [1u8, 2, 3];
+        let both = devnode_properties(Some((0x1234, 7, &blob)), &session);
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0].CompKey.Key.pid, 7);
+        assert_eq!(both[0].Type, DEVPROP_TYPE_BINARY);
+        assert_eq!(both[0].BufferSize, 3);
+        assert_eq!(both[0].Buffer, blob.as_ptr() as *mut c_void);
+        assert_eq!(both[1].CompKey.Key, DEVPKEY_Device_SessionId);
+        assert_eq!(both[1].BufferSize, 4);
+    }
 
     /// Pin [`Delivered::exited`] to the process object, not the pid.
     /// Alive refuses a takeover; exited still lets UMDF restart re-deliver.

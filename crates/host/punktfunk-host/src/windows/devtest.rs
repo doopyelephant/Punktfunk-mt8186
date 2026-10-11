@@ -53,10 +53,19 @@ pub fn channel_proof_probe(_args: &[String]) -> Result<()> {
 ///
 /// `Get-PnpDevice` VID_054C. Exit closes the devnode. Same entry for DS4 / Xbox / Edge /
 /// Deck / Triton via flags. `--idle-after` / `--resume-after` are Moonlight's change-only
-/// cadence.
+/// cadence. The pad is fenced to this process's session; `--session-tag N` fences it to
+/// session `N` instead ([`crate::inject::set_pad_session`]).
 pub fn dualsense_windows_test(args: &[String]) -> Result<()> {
     use punktfunk_core::input::{GamepadEvent, GamepadFrame};
     use std::time::{Duration, Instant};
+    if let Some(session) = args
+        .iter()
+        .skip_while(|a| *a != "--session-tag")
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+    {
+        crate::inject::set_pad_session(session);
+    }
     let secs: u64 = args
         .iter()
         .skip_while(|a| *a != "--seconds")

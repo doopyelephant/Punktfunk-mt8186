@@ -12,7 +12,8 @@
 //! and the abandoned-rumble force-off are [`UhidManager`]'s.
 
 use super::gamepad_raii::{
-    create_swdevice, DriverAttach, PadChannel, ProofTransport, SwDevice, SwDeviceProfile,
+    create_swdevice, verify_fence, DriverAttach, FenceAt, PadChannel, ProofTransport, SwDevice,
+    SwDeviceProfile,
 };
 use super::xbox_proto::XboxState;
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
@@ -66,7 +67,8 @@ pub struct XusbWinPad {
 
 impl XusbWinPad {
     /// Unnamed DATA + `Global\pfxusb-boot-<index>` mailbox. Stamp pad index, then magic LAST
-    /// (the driver accepts the section only once magic is set).
+    /// (the driver accepts the section only once magic is set). The XUSB interface sits on the
+    /// devnode itself, so [`verify_fence`] reads the session there.
     fn open(index: u8) -> Result<XusbWinPad> {
         let boot_name = pf_driver_proto::gamepad::xusb_boot_name(index);
         let mut channel = PadChannel::create(boot_name.clone(), SHM_SIZE)?;
@@ -92,6 +94,7 @@ impl XusbWinPad {
         channel.bind_devnode(index as u32, instance_id.clone(), ProofTransport::XusbIoctl);
         // 1500 ms: EvtDeviceAdd publishes the pid immediately; miss and `service` keeps pumping.
         channel.deliver_eager(Duration::from_millis(1500));
+        verify_fence(instance_id.as_deref(), FenceAt::Parent)?;
         Ok(XusbWinPad {
             _sw: sw,
             channel,

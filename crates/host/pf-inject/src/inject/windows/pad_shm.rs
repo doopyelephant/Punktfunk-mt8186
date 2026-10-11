@@ -5,7 +5,8 @@
 //! the channel is `design/gamepad-channel-sealing.md`.
 
 use super::gamepad_raii::{
-    create_swdevice, DriverAttach, PadChannel, ProofTransport, SwDevice, SwDeviceProfile,
+    create_swdevice, verify_fence, DriverAttach, FenceAt, PadChannel, ProofTransport, SwDevice,
+    SwDeviceProfile,
 };
 use crate::pad_shm_ring::{driver_marks, publish_input, stamp, OutputDrain, SHM_SIZE};
 use anyhow::Result;
@@ -28,7 +29,8 @@ pub(super) struct ShmPad {
 }
 
 impl ShmPad {
-    /// Create the sealed channel, [`stamp`] it, spawn the devnode and deliver the section.
+    /// Create the sealed channel, [`stamp`] it, spawn the devnode, deliver the section and
+    /// [`verify_fence`] the HID children. A pad that fails the fence is removed before return.
     pub(super) fn open(
         index: u8,
         devtype: u8,
@@ -51,6 +53,8 @@ impl ShmPad {
         // The driver must hold the section (and read `device_type`) before hidclass asks for
         // descriptors, or the pad enumerates as a DualSense. 1500 ms bounds that wait.
         channel.deliver_eager(Duration::from_millis(1500));
+        // `?` drops `sw`, which removes the devnode.
+        verify_fence(instance_id.as_deref(), FenceAt::HidChildren { pad: true })?;
         Ok(ShmPad {
             _sw: sw,
             channel,
