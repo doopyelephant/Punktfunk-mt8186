@@ -5,7 +5,6 @@
 //! frame, so the pick shows behind the cards. The focus plate is the shell's; a card
 //! draws no halo of its own.
 
-use crate::anim::approach;
 use crate::el::{Axis, El, Id, Tree};
 use crate::glyphs::{Hint, HintKey};
 use crate::icons::{by_name, draw_icon};
@@ -203,22 +202,12 @@ impl ScreenView for PaletteScreen {
             })
             .children(rows);
         let frame = tree.layout(root, view);
-        // Centre the focused card's row, eased, while no finger has the grid.
+        // The tree glides to centre the focused card's row; a finger parks it.
         let (_, max) = frame.scroll(grid).expect("the grid is a scroll");
         let target = frame
             .rect(card_id(self.cursor))
             .map_or(0.0, |r| (r.center_y() - rect.center_y()).clamp(0.0, max));
-        if !tree.moving(grid) {
-            let next = approach(f64::from(tree.offset(grid)), f64::from(target), dt, 0.08) as f32;
-            tree.set_offset(
-                grid,
-                if (next - target).abs() < 0.25 {
-                    target
-                } else {
-                    next
-                },
-            );
-        }
+        tree.follow(grid, target, false);
         tree.set_focus(Some(card_id(self.cursor)));
         let cheap = super::settings::rows::reduce_ui_res(
             ctx.settings,
