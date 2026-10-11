@@ -276,6 +276,11 @@ impl LibraryScreen {
             .is_none_or(|s| s.cell_of(self.cursor.max(0) as usize).0 == 0)
     }
 
+    /// A finger has pulled the grid down past its top.
+    pub(crate) fn pulled_past_top(&self) -> bool {
+        self.grid.borrow().offset(Id::new(GRID, 0)) < 0.0
+    }
+
     /// Arm once neighbourhood posters exist, or after 400 ms (art-less libraries still enter).
     fn arm_entrance(&mut self, t: f64) {
         if self.entrance_armed || !matches!(self.phase, LibraryPhase::Ready) {

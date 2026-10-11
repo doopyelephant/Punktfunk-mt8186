@@ -371,9 +371,17 @@ impl ScreenView for HomeScreen {
         }
     }
 
-    /// A finger drag on the games scrolls them.
+    /// A finger drag on the games scrolls them. Lifted with them pulled down past their
+    /// top, it hands focus back to the row.
     fn pan(&mut self, p: Pointer) -> bool {
-        self.below && self.shelf.as_mut().is_some_and(|s| s.pan(p))
+        let Some(shelf) = self.shelf.as_mut().filter(|_| self.below) else {
+            return false;
+        };
+        let taken = shelf.pan(p);
+        if taken && matches!(p.kind, PointerKind::Fling { .. }) && shelf.pulled_past_top() {
+            self.go_up(false);
+        }
+        taken
     }
 
     fn menu(&mut self, ev: MenuEvent, ctx: &mut Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
@@ -488,6 +496,13 @@ impl ScreenView for HomeScreen {
             let Some(shelf) = self.shelf.as_mut() else {
                 return false;
             };
+            // A step up from the games' top row is the row's, as Up is on the pad.
+            if p.kind == (PointerKind::Scroll { up: true }) && shelf.at_top() {
+                if self.below {
+                    self.go_up(false);
+                }
+                return true;
+            }
             if !self.below && shelf.has_titles() {
                 shelf.set_quiet(false);
                 self.below = true;

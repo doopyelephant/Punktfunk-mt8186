@@ -268,6 +268,53 @@ fn a_quiet_shelf_rests_on_its_top_row() {
     assert!(s.follow, "the scroll chases it");
 }
 
+/// Under the Hosts row, a finger that pulls the games down past their top hands focus back
+/// to the row at its lift. A pull the other way keeps it in the games.
+#[test]
+fn pulling_the_games_past_their_top_brings_the_hosts_row_back() {
+    use crate::screens::home::HomeScreen;
+    let (_, library) = live_shelf();
+    let mut settings = pf_client_core::trust::Settings::default();
+    let hosts = [host()];
+    let mut ctx = Ctx {
+        hosts: &hosts,
+        ..Ctx::test(&mut settings, &library)
+    };
+    let fonts = crate::theme::build_fonts().unwrap();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
+    let rect = Rect::from_xywh(0.0, 0.0, 1280.0, 800.0);
+    let mut frames = |home: &mut HomeScreen, ctx: &mut Ctx, n: usize| {
+        for _ in 0..n {
+            ctx.t += 1.0 / 60.0;
+            home.render(surface.canvas(), rect, 1.0, 1.0 / 60.0, &fonts, ctx);
+        }
+    };
+    let mut home = HomeScreen::new();
+    home.set_shelf(LibraryScreen::embedded(&host()));
+    frames(&mut home, &mut ctx, 60);
+    let mut fx = Outbox::default();
+    home.menu(down(), &mut ctx, &mut fx);
+    home.menu(down(), &mut ctx, &mut fx);
+    assert!(home.shelf().is_some(), "focus went down into the games");
+    frames(&mut home, &mut ctx, 60);
+
+    let finger = |kind| Pointer {
+        x: 640.0,
+        y: 500.0,
+        kind,
+    };
+    let pull = |home: &mut HomeScreen, dy: f64| {
+        assert!(home.pan(finger(PointerKind::PanStart { horizontal: false })));
+        assert!(home.pan(finger(PointerKind::Pan { dx: 0.0, dy })));
+        assert!(home.pan(finger(PointerKind::Fling { vx: 0.0, vy: 0.0 })));
+    };
+    pull(&mut home, -40.0);
+    assert!(home.shelf().is_some(), "a pull up stays in the games");
+    frames(&mut home, &mut ctx, 60);
+    pull(&mut home, 80.0);
+    assert!(home.shelf().is_none(), "the row has focus again");
+}
+
 /// On a plain grid, Up from row 0 reaches the pills; anywhere else it is a row move.
 #[test]
 fn up_reaches_the_pills_from_the_grids_top_row_only() {
