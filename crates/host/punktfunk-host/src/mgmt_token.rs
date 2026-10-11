@@ -47,7 +47,7 @@ fn env_token(env_var: &str) -> Option<String> {
 const ENV_VAR: &str = "PUNKTFUNK_MGMT_TOKEN";
 const FILE: &str = "mgmt-token";
 const PLUGIN_ENV_VAR: &str = "PUNKTFUNK_PLUGIN_TOKEN";
-const PLUGIN_FILE: &str = "plugin-token";
+pub(crate) const PLUGIN_FILE: &str = "plugin-token";
 /// `{ "<plugin id>": "<token>" }` — see [`load_or_generate_per_plugin`].
 const PER_PLUGIN_FILE: &str = "plugin-tokens.json";
 const TRAY_ENV_VAR: &str = "PUNKTFUNK_TRAY_TOKEN";

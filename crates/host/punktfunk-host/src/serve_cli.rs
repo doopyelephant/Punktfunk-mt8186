@@ -173,7 +173,7 @@ pub(crate) fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
 /// `(mgmt, native, gamestream)`.
 ///
 /// The token exists before the endpoint file names it, and the config-dir ACLs converge before
-/// any runner grant.
+/// any runner grant. A first mint of the runner's token marks the runner for a restart.
 pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::NativeServe, bool)> {
     let mut opts = mgmt::Options {
         bind: args.mgmt_bind,
@@ -204,6 +204,11 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
     let runner = crate::plugins::runtime_status();
     // The plugin runner is the owner's: the door has none to hand a token to.
     if runner.installed && !pf_paths::seat::is_door() {
+        // A Windows seat host shares the box's runner and must not bounce it.
+        opts.restart_runner = !seat_host
+            && !pf_paths::config_dir()
+                .join(crate::mgmt_token::PLUGIN_FILE)
+                .exists();
         opts.plugin_token = Some(crate::mgmt_token::load_or_generate_plugin()?);
         // One token per installed plugin, so the API can tell them apart: a plugin may write its
         // own registration and its own provider, and no other's.
