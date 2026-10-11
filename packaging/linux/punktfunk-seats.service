@@ -35,6 +35,8 @@ PrivateTmp=yes
 ProtectKernelTunables=yes
 # The pad broker attaches a seat's USB devices and gates the vhci hubs.
 ReadWritePaths=-/sys/devices/platform/vhci_hcd.0 -/sys/devices/platform/vhci_hcd
+# Each seat's /dev/uinput is a CUSE device made here: no PrivateDevices= or DeviceAllow=. The
+# first open of /dev/cuse still autoloads cuse; the kernel runs that modprobe, not this unit.
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
