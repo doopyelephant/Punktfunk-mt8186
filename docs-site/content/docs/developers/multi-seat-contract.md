@@ -246,7 +246,24 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   service doesn't see them. The daemon repairs the ACL mask under `games/` after a seat stops and
   every 10 minutes, because a file created with mode `0644` is otherwise read-only to the other
   seats. A seat other than the owner's sees an empty `/run/media`: Steam in Game Mode adopts
-  every mounted drive with a `steamapps` as a library, and the owner's drives are read-only to it.
+  every mounted drive with a `steamapps` as a library, and a drive as mounted is the owner's
+  alone. The owner's drives reach the seat as below.
+- **The owner's libraries.** At each start the daemon reads every library the box owner's Steam
+  lists (`steamapps/libraryfolders.vdf` of the Steam a seat is cloned from) and shows each at
+  `seats/<id>/libraries/<key>`, `<key>` a hash of its path. Its `steamapps` is the owner's own,
+  through an idmapped mount: the seat's Steam reads and writes it as the seat user, plays, updates
+  and runs Proton from it, and every file stays the owner's on disk. The seat's own `compatdata`,
+  `shadercache`, `downloading` and `temp` under `seats/<id>/private/<key>` cover the owner's, and
+  the library's own path is inaccessible to the unit, so the owner's prefixes never reach a seat.
+  The owner's `steamapps/libraryfolders.vdf` there is read-only to the seat.
+  The unit mounts each library at `/run/punktfunk/libraries/<id>/<key>` (root only) in PID 1's
+  namespace before it starts and unmounts it after, so a drive a seat shows stays in use until
+  the seat stops. A library is skipped, with a line in the daemon's log, when it is gone, its
+  `steamapps` isn't the owner's, or its filesystem takes no idmapped mount (anything but btrfs,
+  ext4, xfs and f2fs). The daemon lists each shown library in both of the seat's
+  `libraryfolders.vdf` copies, and drops one no longer shown and any under `/run/media`; Steam's
+  own entries and fields stay. The owner's Steam settings are never changed. Two Steam clients
+  updating one game in a shared library at once take no lock.
 - **Stopping.** `pam_systemd` moves the runner into the session's scope, so stopping the unit
   can't reach it. The runner ends its children on `SIGTERM`, and `seat-reap` ends the session
   by the id the runner recorded.

@@ -5,7 +5,8 @@
 //! - `games/steamapps/{common,compatdata,shadercache,downloading}` is one library every seat
 //!   writes. `compatdata`, `shadercache` and `downloading` are covered per seat by bind mounts
 //!   (`session.rs`), so Wine prefixes and download state never cross.
-//! - `seats/<id>/` holds the seat user's home and those three private directories.
+//! - `seats/<id>/` holds the seat user's home, those three private directories, and the box
+//!   owner's libraries as the seat sees them (`libraries.rs`).
 //! - `trust/<id>/` is a read-only copy of the box's identity, pairing store and profiles, so a
 //!   seat user can read what it needs and nothing else in the box directory.
 //! - `seats/hosts/<id>/mgmt-token` is the token the box presents to that seat host's loopback
@@ -210,7 +211,9 @@ fn needs_copy(src: (SystemTime, u64), dst: Option<(SystemTime, u64)>) -> bool {
 }
 
 /// Opens `path` as a regular file with one link, never through a symlink. `None` when absent.
-fn open_regular(path: &Path) -> std::io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+pub(super) fn open_regular(
+    path: &Path,
+) -> std::io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(OFlags::NOFOLLOW.bits() as i32)

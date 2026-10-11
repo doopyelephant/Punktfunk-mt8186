@@ -2,8 +2,8 @@
 #
 # The instance is the seat's Linux account (`punktfunk-seat@pf-seat-1`). The supervisor writes
 # /run/punktfunk/seats/<user>.env and a drop-in with the BindPaths for this seat's private
-# compatdata, shadercache and downloading before each start; start the unit through
-# `punktfunk-seats start <id>`, not by hand.
+# compatdata, shadercache and downloading, and the mounts of the owner's libraries, before each
+# start; start the unit through `punktfunk-seats start <id>`, not by hand.
 [Unit]
 Description=punktfunk seat %i
 After=systemd-logind.service systemd-user-sessions.service
