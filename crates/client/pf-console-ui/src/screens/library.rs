@@ -1512,7 +1512,11 @@ impl LibraryScreen {
         if game.running {
             card::running_badge(canvas, fonts, crect, k, alpha);
         }
-        canvas.draw_rrect(rr.with_inset((0.5, 0.5)), &stroke(fg(0.12 * alpha), 1.0));
+        let hair = (k as f32).max(1.0);
+        canvas.draw_rrect(
+            rr.with_inset((hair / 2.0, hair / 2.0)),
+            &stroke(fg(0.12 * alpha), hair),
+        );
         if layered {
             canvas.restore();
         }

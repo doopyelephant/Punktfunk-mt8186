@@ -583,7 +583,7 @@ impl Shell {
         }
         canvas.draw_rrect(
             RRect::new_rect_xy(card, corner, corner),
-            &crate::theme::stroke(fg(0.14), 1.0),
+            &crate::theme::stroke(fg(0.14), k.max(1.0) as f32),
         );
         canvas.restore();
 

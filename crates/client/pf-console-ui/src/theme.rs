@@ -384,8 +384,9 @@ pub enum PanelStroke {
 }
 
 /// A panel: a wash where the caller asks for one, and a hairline round it. The console's
-/// material is the field showing through a line; nothing fills a card. `corner` and the dash
-/// pattern are design units; the caller's `k` scales them.
+/// material is the field showing through a line; nothing fills a card. `corner`, the dash
+/// pattern and the line are design units; the caller's `k` scales them. The line keeps a
+/// one-pixel floor.
 pub fn panel(
     canvas: &Canvas,
     rect: Rect,
@@ -399,7 +400,7 @@ pub fn panel(
         canvas.draw_rrect(rr, &fill(tint));
     }
     // Opaque: Plain/Brand overwrite colour; the Edge is the one line every card shares.
-    let mut sp = shaded_stroke(1.0);
+    let mut sp = shaded_stroke(k.max(1.0));
     match stroke {
         PanelStroke::Plain(alpha) => {
             sp.set_color4f(fg(alpha), None);
@@ -466,10 +467,10 @@ const RECEDE_SATURATION: f64 = 0.34;
 const RECEDE_BRIGHTNESS: f64 = 0.20;
 
 /// The accent hairline round a focused card, with no glass: a poster under it keeps its
-/// brightness. `corner` is design units.
+/// brightness. `corner` and the line are design units, the line one pixel at least.
 pub fn focus_ring(canvas: &Canvas, rect: Rect, corner: f32, k: f32) {
     let rr = RRect::new_rect_xy(rect, corner * k, corner * k);
-    canvas.draw_rrect(rr, &stroke(accent(0.9), 1.0));
+    canvas.draw_rrect(rr, &stroke(accent(0.9), k.max(1.0)));
 }
 
 /// [`focus_halo`] growth past the card, design units. Applied to both rect and corner radius.

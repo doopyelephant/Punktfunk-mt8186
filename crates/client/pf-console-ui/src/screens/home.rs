@@ -1064,7 +1064,7 @@ fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: Ac
     let badge = Rect::from_xywh(l as f32, (cy - side / 2.0) as f32, side as f32, side as f32);
     let rr = RRect::new_rect_xy(badge, (14.0 * k) as f32, (14.0 * k) as f32);
     canvas.draw_rrect(rr, &fill(fg(0.14)));
-    canvas.draw_rrect(rr, &stroke(fg(0.35), 1.0));
+    canvas.draw_rrect(rr, &stroke(fg(0.35), k.max(1.0) as f32));
     let (bcx, bcy) = (l + side / 2.0, cy);
     let ink = fg(0.9);
     let mut p = stroke(ink, (3.0 * k) as f32);
@@ -1161,7 +1161,7 @@ pub(crate) fn draw_badge(
         accent(1.0)
     } else {
         canvas.draw_rrect(rr, &fill(fg(0.14)));
-        canvas.draw_rrect(rr, &stroke(fg(0.35), 1.0));
+        canvas.draw_rrect(rr, &stroke(fg(0.35), k.max(1.0) as f32));
         fg(0.9)
     };
     // ~54% of the badge so the mark sits on it, not cropped to it. `os_mark`
