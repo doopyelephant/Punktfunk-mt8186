@@ -1373,3 +1373,38 @@ fn the_chips_line_scrolls_the_focused_chip_into_view() {
         "chip {chip:?} inside {view:?}"
     );
 }
+
+/// A band wider than its line is a sideways scroll the tree follows: six covers in a 400 px
+/// line overflow, and a follow to the end brings the last one into view.
+#[test]
+fn a_wide_band_scrolls_its_focused_item_into_view() {
+    let (s, _library) = live_shelf();
+    let fonts = crate::theme::build_fonts().unwrap();
+    let band = games::Band {
+        section: crate::library::Section::Favorites,
+        items: (0..6).map(games::Item::Game).collect(),
+    };
+    let hits = std::cell::RefCell::new(Vec::new());
+    let mut tree = crate::el::Tree::new();
+    let view = Rect::from_xywh(0.0, 0.0, 400.0, 400.0);
+    let row = games::band_id(0);
+    let el = s.band_el(&band, 0, &fonts, 400.0, (150.0, 200.0), 1.0, &hits);
+    let frame = tree.layout(el, view);
+    let (_, max) = frame.scroll(row).expect("the band's row is a scroll");
+    assert!(max > 0.0, "six covers overflow a 400 px line: {max}");
+    tree.follow(row, max, true);
+    let el = s.band_el(&band, 0, &fonts, 400.0, (150.0, 200.0), 1.0, &hits);
+    let frame = tree.layout(el, view);
+    let mut surface = skia_safe::surfaces::raster_n32_premul((400, 400)).unwrap();
+    tree.paint(surface.canvas(), frame);
+    let last = tree
+        .rect(games::band_item_id(0, 5))
+        .expect("the last item is placed");
+    assert!(last.left >= -1.0 && last.right <= 401.0, "{last:?}");
+    assert!(
+        hits.borrow()
+            .iter()
+            .any(|(z, _)| *z == Zone::Band { band: 0, item: 5 }),
+        "and painted"
+    );
+}

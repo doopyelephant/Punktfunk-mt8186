@@ -983,27 +983,16 @@ impl MenuList {
             }));
         let mut tree = this.tree.borrow_mut();
         let frame = tree.layout(root, view);
-        // Centre the focused row in `rect`, eased, while the list follows focus and no finger
-        // has it.
+        // The tree glides to centre the focused row in `rect` while the list follows focus;
+        // a finger parks it until a move asks again.
         let (_, max) = frame.scroll(list).expect("the list is a scroll");
         let target = frame
             .rect(row_id(this.cursor))
             .map_or(0.0, |r| (r.center_y() - rect.center_y()).clamp(0.0, max));
-        let following = this.follow && !tree.moving(list);
-        if following {
-            let next = if snap {
-                target
-            } else {
-                approach(f64::from(tree.offset(list)), f64::from(target), dt, 0.08) as f32
-            };
-            let next = if (next - target).abs() < 0.25 {
-                target
-            } else {
-                next
-            };
-            tree.set_offset(list, next);
+        if this.follow {
+            tree.follow(list, target, snap);
         }
-        let scroll_settled = !tree.moving(list) && (!following || tree.offset(list) == target);
+        let scroll_settled = !tree.moving(list) && !tree.following(list);
         tree.set_focus(active.then(|| row_id(this.cursor)));
         if bleed {
             tree.paint_focus(canvas, frame, k as f32, dt, false);

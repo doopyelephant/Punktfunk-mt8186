@@ -66,6 +66,11 @@ pub(super) fn band_item_id(band: usize, item: usize) -> Id {
     Id::new("games-band", band * 10_000 + item)
 }
 
+/// Band `band`'s row: its own sideways scroll.
+pub(super) fn band_id(band: usize) -> Id {
+    Id::new("games-band-row", band)
+}
+
 pub(super) fn state_id() -> Id {
     Id::new("games-state", 0)
 }
@@ -647,27 +652,6 @@ impl LibraryScreen {
         (HEADING_H + BAND_AIR) * k + row_h(band, ch, k)
     }
 
-    /// Chase each band's scroll toward its focused item, centred, clamped to its ends.
-    pub(super) fn step_bands(&mut self, bands: &[Band], width: f64, cw: f64, k: f64, snap: bool) {
-        self.band_x
-            .resize(bands.len(), crate::anim::Spring::rest(0.0));
-        let Zone::Band { band, item } = self.zone else {
-            return;
-        };
-        let Some(b) = bands.get(band) else { return };
-        let (iw, pitch) = item_pitch(b, cw, k);
-        let span = pitch * b.items.len() as f64 - (pitch - iw);
-        let want =
-            (item as f64 * pitch + iw / 2.0 - width / 2.0).clamp(0.0, (span - width).max(0.0));
-        let s = &mut self.band_x[band];
-        if snap || crate::theme::reduce_motion() {
-            *s = crate::anim::Spring::rest(want);
-        } else {
-            s.step_spec(want, crate::anim::springs::FOCUS, 1.0 / 60.0);
-            s.settle(want, 0.05, 0.5);
-        }
-    }
-
     /// The chips line, as a child of the screen's scroll: one row that scrolls sideways.
     /// `draw_field` keeps the focused chip in view; a finger swipes it.
     pub(super) fn chips_el<'a>(
@@ -712,8 +696,8 @@ impl LibraryScreen {
             .child(row.size((x - 10.0 * k).max(width) as f32, line_h))
     }
 
-    /// Band `b`, as a child of the screen's scroll: its heading, then its row at its own
-    /// horizontal scroll. Items past `view`'s sides are not drawn.
+    /// Band `b`, as a child of the screen's scroll: its heading, then its row as a sideways
+    /// scroll that `draw_field` follows and a finger swipes. Items out of view are not drawn.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn band_el<'a>(
         &'a self,
@@ -722,7 +706,6 @@ impl LibraryScreen {
         fonts: &'a Fonts,
         width: f64,
         (cw, ch): (f64, f64),
-        view: Rect,
         k: f64,
         hits: &'a RefCell<Vec<(Zone, Rect)>>,
     ) -> El<'a> {
@@ -738,30 +721,18 @@ impl LibraryScreen {
             (HEADING_H * k) as f32,
         ));
         let (iw, pitch) = item_pitch(band, cw, k);
-        let off = self.band_x.get(b).map_or(0.0, |s| s.pos);
         let corner = match band.section {
             Section::Desktops => 14.0,
             Section::Collections => TILE_CORNER,
             _ => card::COVER_CORNER,
         };
-        let mut el = El::column()
-            .size(width as f32, Self::band_h(band, ch, k) as f32)
-            .child(heading);
+        let rh = row_h(band, ch, k) as f32;
+        let mut row = El::column();
         for (i, it) in band.items.iter().enumerate() {
-            let x = i as f64 * pitch - off;
-            let slot = Rect::from_xywh(
-                x as f32,
-                (HEADING_H * k) as f32,
-                iw as f32,
-                row_h(band, ch, k) as f32,
-            );
+            let slot = Rect::from_xywh((i as f64 * pitch) as f32, 0.0, iw as f32, rh);
             let z = Zone::Band { band: b, item: i };
-            el = el.child(
+            row = row.child(
                 El::paint(move |canvas, slot| {
-                    // Past the viewport's sides the band draws nothing and takes no press.
-                    if slot.right < view.left || slot.left > view.right {
-                        return;
-                    }
                     hits.borrow_mut().push((z, slot));
                     match it {
                         Item::Desktop(h) => card::desk_tile(canvas, fonts, h, slot, k),
@@ -779,7 +750,20 @@ impl LibraryScreen {
                 .place(slot),
             );
         }
-        el
+        let span = (band.items.len() as f64 * pitch - (pitch - iw)).max(width) as f32;
+        El::column()
+            .size(width as f32, Self::band_h(band, ch, k) as f32)
+            .child(heading)
+            .child(
+                El::scroll(band_id(b), Axis::Horizontal)
+                    .child(row.size(span, rh))
+                    .place(Rect::from_xywh(
+                        0.0,
+                        (HEADING_H * k) as f32,
+                        width as f32,
+                        rh,
+                    )),
+            )
     }
 
     /// A card in a band; Recently played captions it with when it was played.

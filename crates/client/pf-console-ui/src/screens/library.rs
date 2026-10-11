@@ -147,8 +147,6 @@ pub(crate) struct LibraryScreen {
     /// The sort/view pills' sliding capsules. Boxed: `Screen` moves by value and this
     /// variant is already the largest.
     bar: Box<bar::Bar>,
-    /// The scroll while it follows focus; after a pan, where the finger left it.
-    scroll: Spring,
     /// Seat scroll and capsules next frame: a new arrangement does not glide from the old.
     snap_scroll: bool,
     /// The grid's layout, scroll and hit rects. A cell: the card painters borrow the
@@ -189,8 +187,6 @@ pub(crate) struct LibraryScreen {
     zone: Zone,
     /// The zone is the player's or the ready list's, not the arrival guess.
     seated: bool,
-    /// Each band's horizontal scroll.
-    band_x: Vec<Spring>,
     /// Pills, chips, band items and the state button as last drawn, for the pointer and
     /// the line handoff.
     hits: Vec<(Zone, Rect)>,
@@ -222,7 +218,6 @@ impl LibraryScreen {
             bump: Spring::rest(0.0),
             view_mode: LibraryView::default(),
             bar: Box::default(),
-            scroll: Spring::rest(0.0),
             snap_scroll: true,
             grid: RefCell::new(Box::new(Tree::new())),
             follow: true,
@@ -245,7 +240,6 @@ impl LibraryScreen {
             sections: crate::library::sections(""),
             zone: Zone::Grid,
             seated: false,
-            band_x: Vec::new(),
             hits: Vec::new(),
             embedded: false,
             quiet: false,
@@ -930,7 +924,8 @@ impl LibraryScreen {
         // band; a line taller than the view shows its top. Never centred: on a phone that
         // walked the first row up over the host's verbs.
         let breath = REVEAL_AIR * k;
-        let mut want = self.scroll.pos;
+        let grid = Id::new(GRID, 0);
+        let mut want = f64::from(self.grid.borrow().offset(grid));
         if item_top + item_h + breath > want + g.usable {
             want = item_top + item_h + breath - g.usable;
         }
@@ -938,10 +933,8 @@ impl LibraryScreen {
             want = item_top - breath;
         }
         let want = want.clamp(0.0, (g.content_h - view_h).max(0.0));
-        let grid = Id::new(GRID, 0);
         let snap = std::mem::take(&mut self.snap_scroll);
         self.follow |= snap;
-        self.step_bands(&bands, avail, cw, k, snap);
         let applied = self.applied();
         self.bar.step(fonts, k, avail, true, applied, dt, snap);
         self.follow_scroll(want, snap, dt);
@@ -1058,9 +1051,7 @@ impl LibraryScreen {
                     .child(El::column().size(avail as f32, (BAR_AIR * k) as f32)),
                 Line::Chips => root.child(this.chips_el(ctx.hosts, fonts, avail, k, hits)),
                 Line::Band(b) => {
-                    let band =
-                        this.band_el(&bands[b], b, fonts, avail, (cw, ch), viewport, k, hits);
-                    root.child(band)
+                    root.child(this.band_el(&bands[b], b, fonts, avail, (cw, ch), k, hits))
                 }
                 Line::Grid => match (geo, &shelf_cards) {
                     (Some(g), Some(cards)) => root.child(this.shelf_el(g, cards, fonts, avail, k)),
@@ -1099,14 +1090,19 @@ impl LibraryScreen {
         root = root.child(El::column().size(avail as f32, g.pad as f32));
         let mut tree = this.grid.borrow_mut();
         let frame = tree.layout(root, viewport);
-        // The chips line keeps its focused chip in view; the screen's scroll keeps the line.
-        if let Zone::Chip(i) = this.zone {
-            if let (Some(r), Some((view, max))) = (
-                frame.rect(games::chip_id(i)),
-                frame.scroll(games::chips_id()),
-            ) {
+        // The chips line and each band keep their focused item in view, centred; the
+        // screen's scroll keeps the line.
+        let sideways = match this.zone {
+            Zone::Chip(i) => Some((games::chips_id(), games::chip_id(i))),
+            Zone::Band { band, item } => {
+                Some((games::band_id(band), games::band_item_id(band, item)))
+            }
+            _ => None,
+        };
+        if let Some((line, item)) = sideways {
+            if let (Some(r), Some((view, max))) = (frame.rect(item), frame.scroll(line)) {
                 let want = (r.center_x() - view.center_x()).clamp(0.0, max);
-                tree.follow(games::chips_id(), want, snap);
+                tree.follow(line, want, snap);
             }
         }
         let field = match geo {
@@ -1197,23 +1193,14 @@ impl LibraryScreen {
         g
     }
 
-    /// Follow focus to `want` while no finger has the scroll. After a pan the spring starts
-    /// from wherever the finger left it, so the next move glides instead of jumping.
+    /// Follow focus to `want` while the list follows focus: a pan lets go until a move asks
+    /// again. The tree glides there and parks under a finger ([`Tree::follow`]).
     fn follow_scroll(&mut self, want: f64, snap: bool, dt: f64) {
         let grid = Id::new(GRID, 0);
         let tree = self.grid.get_mut();
         tree.tick(dt as f32);
-        if self.follow && !tree.moving(grid) {
-            if snap || crate::theme::reduce_motion() {
-                self.scroll = Spring::rest(want);
-            } else {
-                self.scroll
-                    .step_spec(want, crate::anim::springs::FOCUS, 1.0 / 60.0);
-                self.scroll.settle(want, 0.05, 0.5);
-            }
-            tree.set_offset(grid, self.scroll.pos as f32);
-        } else {
-            self.scroll = Spring::rest(f64::from(tree.offset(grid)));
+        if self.follow {
+            tree.follow(grid, want as f32, snap);
         }
     }
 
@@ -1654,11 +1641,20 @@ impl ScreenView for LibraryScreen {
         }
     }
 
-    /// A finger drag on the screen's scrolls: the chips line sideways, else the lines up
-    /// and down; a lift flings them.
+    /// A finger drag on the screen's scrolls: the chips line or a band sideways, else the
+    /// lines up and down; a lift flings them.
     fn pan(&mut self, p: Pointer) -> bool {
+        let mut bands: Vec<usize> = Vec::new();
+        for (z, _) in &self.hits {
+            if let Zone::Band { band, .. } = z {
+                if !bands.contains(band) {
+                    bands.push(*band);
+                }
+            }
+        }
         let tree = self.grid.get_mut();
-        if tree.drag(games::chips_id(), p) {
+        if tree.drag(games::chips_id(), p) || bands.iter().any(|b| tree.drag(games::band_id(*b), p))
+        {
             return true;
         }
         let taken = tree.drag(Id::new(GRID, 0), p);
