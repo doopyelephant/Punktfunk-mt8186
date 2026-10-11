@@ -150,9 +150,10 @@ public final class ConsoleMetalView: ConsolePlatformView {
     }
 
     /// Design units per pixel. A TV takes the shell's own couch formula (`0`). A phone or
-    /// tablet in the hand takes the device scale alone, so an iPad draws at the iPhone's size
-    /// rather than stretching the Deck's 800-unit field over its height. A Mac or visionOS
-    /// window takes the larger of the couch fit and the device scale, as Android does.
+    /// tablet in the hand takes the device scale alone, rather than stretching the Deck's
+    /// 800-unit field over an iPad's height: a unit is 0.75 pt on a phone and a point on a
+    /// tablet, which sits further from the eye. A Mac or visionOS window takes the larger of
+    /// the couch fit and the device scale, as Android does.
     private var designScale: Double {
         #if os(tvOS)
         return 0
@@ -163,7 +164,8 @@ public final class ConsoleMetalView: ConsolePlatformView {
         let scale = window?.backingScaleFactor ?? 2
         #endif
         #if os(iOS)
-        return min(max(scale * 0.75, 0.75), 3)
+        let perPoint = traitCollection.userInterfaceIdiom == .pad ? 1.0 : 0.75
+        return min(max(scale * perPoint, 0.75), 3)
         #else
         let pixels = min(bounds.width, bounds.height) * scale
         guard pixels > 0 else { return 0 }
