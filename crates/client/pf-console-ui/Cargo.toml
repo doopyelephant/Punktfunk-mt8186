@@ -126,5 +126,13 @@ sdl3 = { version = "0.20", features = ["hidapi", "ash", "build-from-source"], op
 [dev-dependencies]
 serde_json = "1"
 
+# `examples/scene.rs`: the shell in an SDL window on a Mac with scripted hosts and pads, for
+# looking at a screen without a device. Links the Homebrew SDL3. With `--no-default-features
+# --features metal` it draws on the GPU through the window's CAMetalLayer (`metal` wraps the
+# device, queue and drawables); with the defaults it rasters on the CPU, which is slow.
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+sdl3 = { version = "0.20" }
+metal = "0.33"
+
 [lints]
 workspace = true

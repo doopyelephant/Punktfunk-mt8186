@@ -30,8 +30,18 @@ pub struct Item {
     pub text: &'static str,
 }
 
+/// Which device a group's rows are pressed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Remote,
+    Keyboard,
+    Touch,
+    Pad,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Group {
+    pub kind: Kind,
     pub title: &'static str,
     pub items: &'static [Item],
 }
@@ -166,23 +176,27 @@ pub fn groups(client: Client, touchscreen: bool) -> Vec<Group> {
     let mut out = Vec::new();
     if !remote.is_empty() {
         out.push(Group {
+            kind: Kind::Remote,
             title: "Remote",
             items: remote,
         });
     }
     if !keys.is_empty() {
         out.push(Group {
+            kind: Kind::Keyboard,
             title: "Keyboard",
             items: keys,
         });
     }
     if touchscreen && !touch.is_empty() {
         out.push(Group {
+            kind: Kind::Touch,
             title: "Touchscreen (Trackpad and Direct pointer modes)",
             items: touch,
         });
     }
     out.push(Group {
+        kind: Kind::Pad,
         title: "Controller (Select is Back or View)",
         items: pad,
     });

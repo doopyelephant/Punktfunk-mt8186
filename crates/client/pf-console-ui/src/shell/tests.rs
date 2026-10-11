@@ -913,20 +913,19 @@ fn the_stream_controls_draw_and_a_pad_leaves_them() {
     let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
     let mut settings = pf_client_core::trust::Settings::default();
     let lib = crate::library::LibraryShared::default();
-    let controls = crate::screens::licenses::LicensesScreen::controls(&crate::screens::Ctx::test(
+    let controls = crate::screens::controls::ControlsScreen::new(&crate::screens::Ctx::test(
         &mut settings,
         &lib,
-    ))
-    .expect("a desktop has controls");
+    ));
     let (mut s, _console, _library) = shell(vec![
         Screen::Home(HomeScreen::new()),
-        Screen::Licenses(controls),
+        Screen::Controls(controls),
     ]);
     s.render(surface.canvas(), 1280, 800, &fonts, None, None, &[]);
-    let Some(Screen::Licenses(l)) = s.stack.last() else {
+    let Some(Screen::Controls(c)) = s.stack.last() else {
         panic!("the controls are on top");
     };
-    assert!(!l.waiting() && l.title() == "Stream controls");
+    assert_eq!(c.title(), "Stream controls");
     s.handle_menu(MenuEvent::Back);
     finish_motion(&mut s);
     assert!(matches!(s.stack.last(), Some(Screen::Home(_))));
@@ -1485,6 +1484,43 @@ fn frame(s: &mut Shell) {
     let pads: Vec<PadInfo> = Vec::new();
     let mut surface = skia_safe::surfaces::raster_n32_premul((480, 300)).unwrap();
     s.render(surface.canvas(), 480, 300, &fonts, None, None, &pads);
+}
+
+/// The shape of a double-card report: a tab switch into Games, Down onto the Desktops
+/// tile, and the plate a shift off the tile it rests on. Through the shell, with its clock,
+/// its tab slide and a TV's scale, the library tree's plate must sit on that tile.
+#[test]
+fn the_plate_sits_on_the_desktops_tile_after_a_tab_switch() {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((1920, 1080)).unwrap();
+    let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
+    s.fake_clock = Some((100.0, 1.0 / 60.0));
+    let mut frame = |s: &mut Shell| s.render(surface.canvas(), 1920, 1080, &fonts, None, None, &[]);
+    for _ in 0..45 {
+        frame(&mut s);
+    }
+    s.handle_menu(MenuEvent::JumpForward);
+    for _ in 0..45 {
+        frame(&mut s);
+    }
+    s.handle_menu(MenuEvent::Move(MenuDir::Down));
+    for _ in 0..240 {
+        frame(&mut s);
+    }
+    let Some(Screen::Library(l)) = s.stack.last() else {
+        panic!("the Games tab is on top");
+    };
+    let (plate, item) = l.plate_vs_focus().expect("the plate rests on a tile");
+    let off = (
+        plate.left - item.left,
+        plate.top - item.top,
+        plate.right - item.right,
+        plate.bottom - item.bottom,
+    );
+    assert!(
+        off.0.abs() < 1.0 && off.1.abs() < 1.0 && off.2.abs() < 1.0 && off.3.abs() < 1.0,
+        "plate {plate:?} vs tile {item:?}: off by {off:?}"
+    );
 }
 
 fn mixed_library(library: &LibraryShared) {

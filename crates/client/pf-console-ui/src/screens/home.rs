@@ -4,8 +4,8 @@
 //! Every card and verb is a focus target in one [`el::Tree`], so the plate travels from
 //! card to verb. The row keeps the focused card on the shared margin until its end reaches
 //! the screen's. OK connects, wakes, or pairs; Down reaches the verbs (Games, Connect
-//! with…, Wake, Details…, More…), then the games; Y (OK held on a remote) opens the
-//! card's menu; X jumps to Settings; Up from the row, or B, is the tab strip's.
+//! with…, Wake, Details…), then the games; Y (OK held on a remote) opens the card's
+//! menu; X jumps to Settings; Up from the row, or B, is the tab strip's.
 //!
 //! The games are the Games tab's grid for that host ([`LibraryScreen::embedded`]). The
 //! shell fetches them once the row settles on a paired, online host. With focus in them
@@ -104,8 +104,6 @@ enum Verb {
     ConnectWith,
     Wake,
     Details,
-    /// The card's whole menu, the hold's.
-    More,
 }
 
 impl Verb {
@@ -116,12 +114,12 @@ impl Verb {
             Verb::ConnectWith => "Connect with\u{2026}",
             Verb::Wake => "Wake",
             Verb::Details => "Details\u{2026}",
-            Verb::More => "More\u{2026}",
         }
     }
 }
 
-/// The verbs under a card. The action tiles have none: OK is all they do.
+/// The verbs under a card. The action tiles have none: OK is all they do. The card's whole
+/// menu is the hold's; a More… here only repeated these.
 fn verbs(slot: &Slot<'_>) -> Vec<Verb> {
     let Slot::Host(h) = slot else {
         return Vec::new();
@@ -134,7 +132,7 @@ fn verbs(slot: &Slot<'_>) -> Vec<Verb> {
     } else if h.can_wake {
         v.push(Verb::Wake);
     }
-    v.extend([Verb::Details, Verb::More]);
+    v.push(Verb::Details);
     v
 }
 
@@ -158,7 +156,6 @@ fn run_verb(verb: Verb, h: &HostRow, ctx: &mut Ctx, fx: &mut Outbox) {
             fx.toast = Some(format!("Waking {}\u{2026}", h.name));
         }
         Verb::Details => fx.push(Screen::CardMenu(CardMenu::host_details(h))),
-        Verb::More => fx.options(CardMenu::for_host(h)),
     }
 }
 
@@ -918,7 +915,7 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
     let stroke = if h.saved {
         PanelStroke::Plain(0.08)
     } else {
-        PanelStroke::GradientDashed
+        PanelStroke::EdgeDashed
     };
     crate::theme::panel(canvas, rect, TILE_CORNER as f32, None, stroke, k as f32);
     let pad = 20.0 * k;
@@ -1057,7 +1054,7 @@ fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: Ac
         rect,
         TILE_CORNER as f32,
         None,
-        PanelStroke::GradientDashed,
+        PanelStroke::EdgeDashed,
         k as f32,
     );
     let pad = 20.0 * k;
@@ -1333,8 +1330,8 @@ mod tests {
             Some(crate::shell::Tab::Games),
             "Games opens its tab"
         );
-        // Games, Connect with…, Details…, More…, and no further.
-        for _ in 0..3 {
+        // Games, Connect with…, Details…, and no further.
+        for _ in 0..2 {
             go(&mut s, MenuEvent::Move(MenuDir::Right));
         }
         let (pulse, _) = go(&mut s, MenuEvent::Move(MenuDir::Right));
@@ -1342,7 +1339,7 @@ mod tests {
         let (_, fx) = go(&mut s, MenuEvent::Confirm);
         assert!(
             matches!(fx.nav, Some(crate::screens::Nav::Push(ref sc)) if matches!(**sc, Screen::CardMenu(_))),
-            "More… is the card's menu"
+            "Details… is the host's details"
         );
         // No games here yet: Down past the verbs refuses, Up returns to the card.
         let (pulse, _) = go(&mut s, MenuEvent::Move(MenuDir::Down));

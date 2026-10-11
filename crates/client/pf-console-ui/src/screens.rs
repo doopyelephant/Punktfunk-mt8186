@@ -8,6 +8,7 @@ pub(crate) mod add_host;
 pub(crate) mod bind_preset;
 pub(crate) mod card_menu;
 pub(crate) mod collections;
+pub(crate) mod controls;
 pub(crate) mod grants;
 pub(crate) mod home;
 pub(crate) mod input_test;
@@ -444,6 +445,8 @@ pub(crate) enum Screen {
     PadMenu(pad_menu::PadMenuScreen),
     /// A question the app asks through the console ([`prompt::Prompt`]).
     Prompt(prompt::PromptScreen),
+    /// The stream controls. Raised by the About section.
+    Controls(controls::ControlsScreen),
     /// Open-source licences. Raised by the About section.
     Licenses(licenses::LicensesScreen),
     /// A title search over one host's shelf. Raised by the shelf's Search pill.
@@ -544,6 +547,7 @@ impl Screen {
             Screen::Grants(s) => s,
             Screen::PadMenu(s) => s,
             Screen::Prompt(s) => s,
+            Screen::Controls(s) => s,
             Screen::Licenses(s) => s,
             Screen::Search(s) => s,
             Screen::PresetMenu(s) => s,
@@ -572,6 +576,7 @@ impl Screen {
             Screen::Grants(s) => s,
             Screen::PadMenu(s) => s,
             Screen::Prompt(s) => s,
+            Screen::Controls(s) => s,
             Screen::Licenses(s) => s,
             Screen::Search(s) => s,
             Screen::PresetMenu(s) => s,

@@ -1789,7 +1789,7 @@ fn about_opens_the_stream_controls_where_the_client_has_them() {
     let Some(crate::screens::Nav::Push(b)) = fx.nav else {
         panic!("a press opens the screen");
     };
-    assert!(matches!(*b, Screen::Licenses(ref l) if l.title() == "Stream controls"));
+    assert!(matches!(*b, Screen::Controls(ref c) if c.title() == "Stream controls"));
 
     for platform in crate::platform::Platform::ALL {
         let mut settings = Settings::default();

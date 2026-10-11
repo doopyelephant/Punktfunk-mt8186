@@ -99,16 +99,18 @@ pub fn pad_icon(pref: GamepadPref) -> Icon {
     }
 }
 
-/// One device mark: left edge `x`, centred on `cy`, in a `w`-wide 24-unit box, at
-/// [`GLYPH_STROKE`] whatever the size, so the 15 dp chip and a 44 dp mark share one weight.
+/// One device mark: left edge `x`, centred on `cy`, in a `w`-wide 24-unit box. The pen is
+/// [`GLYPH_STROKE`] from 24 dp up; under that it thins with the box, or the 15 dp chip's
+/// silhouette clogs round its buttons.
 pub fn pad_mark(canvas: &Canvas, icon: Icon, x: f64, cy: f64, w: f64, k: f64, ink: Color4f) {
+    let weight = GLYPH_STROKE * k * (w / (24.0 * k)).min(1.0);
     icons::draw_icon_weight(
         canvas,
         icon,
         (x + w / 2.0) as f32,
         cy as f32,
         w as f32,
-        (GLYPH_STROKE * k) as f32,
+        weight as f32,
         ink,
     );
 }
@@ -173,7 +175,7 @@ pub fn battery_pip(
 }
 
 /// `Key` is a literal keycap in any style (Deck "Steam + X").
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HintKey {
     Confirm,
     Back,
@@ -275,8 +277,6 @@ pub fn hint_bar(
         crate::theme::PanelStroke::Plain(0.12),
         k as f32,
     );
-    // One highlight for the whole pill: the ration counts rows, and this is chrome.
-    crate::theme::panel_highlight(canvas, rect, corner, k as f32);
 
     let cy = bottom - h / 2.0;
     let mut pen = x + pad;
@@ -605,9 +605,163 @@ fn draw_ps_shape(canvas: &Canvas, face: Face, center: Point, r: f32, width: f32,
     }
 }
 
+/// A reference page's badges are this much bigger than the hint bar's: read, not glanced at.
+const CHORD_K: f64 = 1.25;
+/// Air either side of a word between badges, dp, and the word's size.
+const WORD_GAP: f64 = 6.0;
+const WORD_SIZE: f64 = 13.0;
+
+/// One part of a chord as [`pf_client_core::shortcuts`] writes it.
+#[derive(Debug, PartialEq)]
+enum Piece {
+    Glyph(HintKey),
+    /// A TV remote's colour key.
+    Colour(Color4f),
+    /// `+`, `or`, `Hold`: a word between badges.
+    Word(&'static str),
+}
+
+/// "Select + A", "Ctrl+Alt+Shift+Q", "Hold Back", "F11 or Alt+Enter". A letter is a face
+/// button only in a pad style; the keyboard's own letters stay keycaps. Back and OK are the
+/// remote's badges in [`GlyphStyle::Remote`], keycaps elsewhere.
+fn pieces(chord: &'static str, style: GlyphStyle) -> Vec<Piece> {
+    let pad = !matches!(style, GlyphStyle::Keyboard | GlyphStyle::Remote);
+    let remote = style == GlyphStyle::Remote;
+    let mut out = Vec::new();
+    for (i, alt) in chord.split(" or ").enumerate() {
+        if i > 0 {
+            out.push(Piece::Word("or"));
+        }
+        let alt = match alt.strip_prefix("Hold ") {
+            Some(rest) => {
+                out.push(Piece::Word("Hold"));
+                rest
+            }
+            None => alt,
+        };
+        for (j, key) in alt.split('+').map(str::trim).enumerate() {
+            if j > 0 {
+                out.push(Piece::Word("+"));
+            }
+            out.push(match key {
+                "A" if pad => Piece::Glyph(HintKey::Confirm),
+                "B" if pad => Piece::Glyph(HintKey::Back),
+                "X" if pad => Piece::Glyph(HintKey::Tertiary),
+                "Y" if pad => Piece::Glyph(HintKey::Secondary),
+                "Back" if remote => Piece::Glyph(HintKey::Back),
+                "OK" if remote => Piece::Glyph(HintKey::Confirm),
+                "Red" => Piece::Colour(Color4f::new(0.90, 0.27, 0.22, 1.0)),
+                "Green" => Piece::Colour(Color4f::new(0.24, 0.72, 0.33, 1.0)),
+                "Yellow" => Piece::Colour(Color4f::new(0.95, 0.78, 0.20, 1.0)),
+                "Blue" => Piece::Colour(Color4f::new(0.25, 0.50, 0.95, 1.0)),
+                _ => Piece::Glyph(HintKey::Key(key)),
+            });
+        }
+    }
+    out
+}
+
+fn piece_width(fonts: &Fonts, piece: &Piece, style: GlyphStyle, k: f64) -> f64 {
+    match piece {
+        Piece::Glyph(key) => glyph_width(fonts, *key, style, k).unwrap_or(0.0),
+        Piece::Colour(_) => BADGE_D * k,
+        Piece::Word(w) => {
+            f64::from(fonts.measure(w, W::Regular, WORD_SIZE * k)) + 2.0 * WORD_GAP * k
+        }
+    }
+}
+
+/// A chord's badges run this tall, px.
+pub fn chord_height(k: f64) -> f64 {
+    BADGE_D * k * CHORD_K
+}
+
+/// The width [`draw_chord`] takes, px.
+pub fn chord_width(fonts: &Fonts, chord: &'static str, style: GlyphStyle, k: f64) -> f64 {
+    let k = k * CHORD_K;
+    pieces(chord, style)
+        .iter()
+        .map(|p| piece_width(fonts, p, style, k))
+        .sum()
+}
+
+/// A chord's badges in a row, left edge at `x`, centred on `cy`.
+pub fn draw_chord(
+    canvas: &Canvas,
+    fonts: &Fonts,
+    chord: &'static str,
+    style: GlyphStyle,
+    x: f64,
+    cy: f64,
+    k: f64,
+) {
+    let k = k * CHORD_K;
+    let mut pen = x;
+    for piece in pieces(chord, style) {
+        let w = piece_width(fonts, &piece, style, k);
+        match piece {
+            Piece::Glyph(key) => draw_glyph(canvas, fonts, key, style, pen, cy, k),
+            Piece::Colour(colour) => {
+                let r = BADGE_D * k / 2.0;
+                let center = Point::new((pen + r) as f32, cy as f32);
+                canvas.draw_circle(center, r as f32, &fill(colour));
+                canvas.draw_circle(center, r as f32, &stroke(fg(0.25), (HAIRLINE * k) as f32));
+            }
+            Piece::Word(word) => {
+                let size = WORD_SIZE * k;
+                fonts.draw(
+                    canvas,
+                    word,
+                    pen + WORD_GAP * k,
+                    cy + size * 0.36,
+                    W::Regular,
+                    size,
+                    fg(0.5),
+                );
+            }
+        }
+        pen += w;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chord splits into badges and the words between them; a letter is a face button
+    /// only on a pad, and Back is the remote's arrow only on a remote.
+    #[test]
+    fn a_chord_splits_into_badges_and_words() {
+        let p = pieces("L1 + R1 + Start + Select", GlyphStyle::Letters);
+        assert_eq!(p.len(), 7);
+        assert_eq!(p[0], Piece::Glyph(HintKey::Key("L1")));
+        assert_eq!(p[1], Piece::Word("+"));
+        let p = pieces("Hold Back", GlyphStyle::Remote);
+        assert_eq!(p, [Piece::Word("Hold"), Piece::Glyph(HintKey::Back)]);
+        let p = pieces("F11 or Alt+Enter", GlyphStyle::Keyboard);
+        assert!(p.len() == 5 && p[1] == Piece::Word("or"));
+        assert_eq!(
+            pieces("Select + A", GlyphStyle::Shapes)[2],
+            Piece::Glyph(HintKey::Confirm)
+        );
+        assert_eq!(
+            pieces("Ctrl+Alt+Shift+A", GlyphStyle::Keyboard)[6],
+            Piece::Glyph(HintKey::Key("A"))
+        );
+        assert!(matches!(
+            pieces("Green", GlyphStyle::Remote)[0],
+            Piece::Colour(_)
+        ));
+    }
+
+    /// A longer chord is wider, and the page's badges outsize the hint bar's.
+    #[test]
+    fn a_chord_measures_its_badges() {
+        let fonts = crate::theme::build_fonts().unwrap();
+        let one = chord_width(&fonts, "A", GlyphStyle::Letters, 1.0);
+        let two = chord_width(&fonts, "Select + A", GlyphStyle::Letters, 1.0);
+        assert!(one > BADGE_D && two > one + BADGE_D, "{one} {two}");
+    }
 
     #[test]
     fn style_follows_pad_kind() {

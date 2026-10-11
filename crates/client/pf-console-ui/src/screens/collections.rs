@@ -77,10 +77,9 @@ pub(crate) fn paint_tile(
         rect,
         TILE_CORNER as f32,
         Some(accent(0.16)),
-        PanelStroke::Gradient,
+        PanelStroke::Edge,
         k as f32,
     );
-    crate::theme::panel_highlight(canvas, rect, TILE_CORNER as f32, k as f32);
 
     let pad = 20.0 * k;
     let (l, t) = (f64::from(rect.left) + pad, f64::from(rect.top) + pad);

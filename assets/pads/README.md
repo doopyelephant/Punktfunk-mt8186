@@ -41,7 +41,7 @@ Drawn here. Proportions were measured from these; no image or model data ships.
 | --- | --- |
 | `xboxone` | Commons "Xbox Series Controller Carbon Black.jpg"; controls from Microsoft's Elite Series 2 render |
 | `xboxelite` | Microsoft's xbox.com front render |
-| `xbox360` | Commons "Xbox 360 controller top (3455250267).jpg", dimensions.com drawing |
+| `xbox360` | Commons "Xbox360 gamepad.svg" — the shell, lower panel, bumpers and every control's centre re-traced from it at 155 mm wide |
 | `dualsense` | Commons "Playstation 5 DualSense controller in Midnight Black, 2026-02-07 (front).jpg" |
 | `dualsenseedge` | Commons "DualSense Edge Controller.jpg", Sony's part-name diagrams |
 | `dualshock4` | Commons "Dualshock 4 Layout.svg" |

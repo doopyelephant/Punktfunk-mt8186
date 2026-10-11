@@ -71,6 +71,10 @@ pub(super) fn band_id(band: usize) -> Id {
     Id::new("games-band-row", band)
 }
 
+/// Room under a band's row for the plate's shadow, design units: it sits 10 down with a 12
+/// blur past the plate's outset.
+const PLATE_REACH: f64 = 36.0;
+
 pub(super) fn state_id() -> Id {
     Id::new("games-state", 0)
 }
@@ -664,6 +668,9 @@ impl LibraryScreen {
     ) -> El<'a> {
         let names = chip_hosts(hosts).map(|h| (h.name.as_str(), Some(self.own(h))));
         let (mut x, top, h) = (0.0, TOP_AIR * k, CHIP_H * k);
+        // Room round the line for the plate's outset: a scroll clips what it draws, and a
+        // plate cut at a chip's edge reads as a second chip.
+        let air = (super::PLATE_AIR * k) as f32;
         let mut row = El::column();
         for (i, (label, mine)) in names.chain([("Customize", None)]).enumerate() {
             let w = match mine {
@@ -672,7 +679,7 @@ impl LibraryScreen {
                 }
                 None => button_w(fonts, label, k),
             };
-            let chip = Rect::from_xywh(x as f32, top as f32, w as f32, h as f32);
+            let chip = Rect::from_xywh(air + x as f32, air + top as f32, w as f32, h as f32);
             row = row.child(
                 El::paint(move |canvas, r| {
                     hits.borrow_mut().push((Zone::Chip(i), r));
@@ -691,9 +698,17 @@ impl LibraryScreen {
             x += w + 10.0 * k;
         }
         let line_h = Self::chips_h(k) as f32;
-        El::scroll(chips_id(), Axis::Horizontal)
-            .size(width as f32, line_h)
-            .child(row.size((x - 10.0 * k).max(width) as f32, line_h))
+        let span = (x - 10.0 * k).max(width) as f32 + 2.0 * air;
+        El::column().size(width as f32, line_h).child(
+            El::scroll(chips_id(), Axis::Horizontal)
+                .child(row.size(span, line_h + 2.0 * air))
+                .place(Rect::from_xywh(
+                    -air,
+                    -air,
+                    width as f32 + 2.0 * air,
+                    line_h + 2.0 * air,
+                )),
+        )
     }
 
     /// Band `b`, as a child of the screen's scroll: its heading, then its row as a sideways
@@ -727,9 +742,13 @@ impl LibraryScreen {
             _ => card::COVER_CORNER,
         };
         let rh = row_h(band, ch, k) as f32;
+        // Room round the row for the plate's outset, and under it for the plate's shadow: a
+        // scroll clips what it draws, and a plate cut at a tile's edge reads as a second tile.
+        let air = (super::PLATE_AIR * k) as f32;
+        let reach = (PLATE_REACH * k) as f32;
         let mut row = El::column();
         for (i, it) in band.items.iter().enumerate() {
-            let slot = Rect::from_xywh((i as f64 * pitch) as f32, 0.0, iw as f32, rh);
+            let slot = Rect::from_xywh(air + (i as f64 * pitch) as f32, air, iw as f32, rh);
             let z = Zone::Band { band: b, item: i };
             row = row.child(
                 El::paint(move |canvas, slot| {
@@ -750,18 +769,18 @@ impl LibraryScreen {
                 .place(slot),
             );
         }
-        let span = (band.items.len() as f64 * pitch - (pitch - iw)).max(width) as f32;
+        let span = (band.items.len() as f64 * pitch - (pitch - iw)).max(width) as f32 + 2.0 * air;
         El::column()
             .size(width as f32, Self::band_h(band, ch, k) as f32)
             .child(heading)
             .child(
                 El::scroll(band_id(b), Axis::Horizontal)
-                    .child(row.size(span, rh))
+                    .child(row.size(span, rh + air + reach))
                     .place(Rect::from_xywh(
-                        0.0,
-                        (HEADING_H * k) as f32,
-                        width as f32,
-                        rh,
+                        -air,
+                        (HEADING_H * k) as f32 - air,
+                        width as f32 + 2.0 * air,
+                        rh + air + reach,
                     )),
             )
     }
