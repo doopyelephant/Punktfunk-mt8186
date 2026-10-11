@@ -184,6 +184,9 @@ pub(crate) struct HomeScreen {
     verb: Option<usize>,
     /// How far the row and verbs have slid up for the games, px.
     page: Spring,
+    /// A scroll handed focus back to the row: a pointer resting on the games leaves it
+    /// there until it moves off them.
+    scrolled_up: bool,
 }
 
 impl HomeScreen {
@@ -202,6 +205,7 @@ impl HomeScreen {
             shelf_rect: Rect::new_empty(),
             verb: None,
             page: Spring::rest(0.0),
+            scrolled_up: false,
         }
     }
 
@@ -380,6 +384,7 @@ impl ScreenView for HomeScreen {
         let taken = shelf.pan(p);
         if taken && matches!(p.kind, PointerKind::Fling { .. }) && shelf.pulled_past_top() {
             self.go_up(false);
+            self.scrolled_up = true;
         }
         taken
     }
@@ -500,10 +505,18 @@ impl ScreenView for HomeScreen {
             if p.kind == (PointerKind::Scroll { up: true }) && shelf.at_top() {
                 if self.below {
                     self.go_up(false);
+                    self.scrolled_up = true;
                 }
                 return true;
             }
             if !self.below && shelf.has_titles() {
+                // Once a scroll gave the row focus back, only a press or a scroll takes it.
+                if self.scrolled_up
+                    && !matches!(p.kind, PointerKind::Press | PointerKind::Scroll { .. })
+                {
+                    return false;
+                }
+                self.scrolled_up = false;
                 shelf.set_quiet(false);
                 self.below = true;
                 // A quiet shelf shows no focus, so a tap that wakes it only takes focus, as on
@@ -521,6 +534,9 @@ impl ScreenView for HomeScreen {
         }
         if self.below && matches!(p.kind, PointerKind::Move | PointerKind::Press) {
             self.go_up(false);
+        }
+        if p.kind == PointerKind::Move {
+            self.scrolled_up = false;
         }
         let hit = self.tree.hit(p.x as f32, p.y as f32);
         let verb = (0..verbs(&self.slot(ctx.hosts)).len()).find(|&i| hit == Some(verb_id(i)));

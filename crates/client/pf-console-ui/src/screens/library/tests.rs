@@ -269,7 +269,8 @@ fn a_quiet_shelf_rests_on_its_top_row() {
 }
 
 /// Under the Hosts row, a finger that pulls the games down past their top hands focus back
-/// to the row at its lift. A pull the other way keeps it in the games.
+/// to the row at its lift. A pull the other way keeps it in the games. A trackpad's cursor
+/// resting on the games leaves the row its focus until it moves off them.
 #[test]
 fn pulling_the_games_past_their_top_brings_the_hosts_row_back() {
     use crate::screens::home::HomeScreen;
@@ -313,6 +314,18 @@ fn pulling_the_games_past_their_top_brings_the_hosts_row_back() {
     frames(&mut home, &mut ctx, 60);
     pull(&mut home, 80.0);
     assert!(home.shelf().is_none(), "the row has focus again");
+
+    let hover = |x, y| Pointer {
+        x,
+        y,
+        kind: PointerKind::Move,
+    };
+    home.pointer(hover(640.0, 500.0), &mut ctx, &mut fx);
+    assert!(home.shelf().is_none(), "a cursor resting on the games");
+    frames(&mut home, &mut ctx, 60);
+    home.pointer(hover(640.0, 60.0), &mut ctx, &mut fx);
+    home.pointer(hover(640.0, 500.0), &mut ctx, &mut fx);
+    assert!(home.shelf().is_some(), "back onto the games from the row");
 }
 
 /// On a plain grid, Up from row 0 reaches the pills; anywhere else it is a row move.
