@@ -1325,3 +1325,51 @@ fn dump_library() {
     menu(&mut s, &[down(), down(), down(), down()]);
     phone(&mut s, 60, "LP2-phone-grid");
 }
+
+/// Twelve paired hosts overflow the chips line. Right walks it, and the line scrolls to
+/// keep the focused chip in view instead of letting it run off the edge.
+#[test]
+fn the_chips_line_scrolls_the_focused_chip_into_view() {
+    let (mut s, library) = live_shelf();
+    let mut settings = pf_client_core::trust::Settings {
+        library_view: LibraryView::Grid.id().to_string(),
+        ..Default::default()
+    };
+    let hosts: Vec<HostRow> = (0..12)
+        .map(|i| HostRow::fixture(&format!("h{i}"), &format!("Living room host {i}")))
+        .collect();
+    let fonts = crate::theme::build_fonts().unwrap();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
+    let rect = Rect::from_xywh(0.0, 0.0, 1280.0, 800.0);
+    let chips = games::chips_id();
+    let mut frame = |s: &mut LibraryScreen, ev: Option<MenuEvent>| {
+        let mut ctx = Ctx {
+            hosts: &hosts,
+            ..Ctx::test(&mut settings, &library)
+        };
+        if let Some(ev) = ev {
+            s.menu(ev, &mut ctx, &mut Outbox::default());
+        }
+        s.render(surface.canvas(), rect, 1.0, 1.0 / 60.0, &fonts, &mut ctx);
+    };
+    s.grid_cols_last = Some(3);
+    frame(&mut s, None);
+    frame(&mut s, Some(up()));
+    assert_eq!(s.zone, Zone::Chip(0), "Up from the Desktops band");
+    assert_eq!(s.grid.borrow().offset(chips), 0.0);
+    for _ in 0..11 {
+        frame(&mut s, Some(MenuEvent::Move(MenuDir::Right)));
+    }
+    assert_eq!(s.zone, Zone::Chip(11));
+    for _ in 0..180 {
+        frame(&mut s, None);
+    }
+    let tree = s.grid.borrow();
+    assert!(tree.offset(chips) > 0.0, "the line scrolled");
+    let chip = tree.rect(games::chip_id(11)).expect("the chip is placed");
+    let view = tree.rect(chips).expect("the line is placed");
+    assert!(
+        chip.left >= view.left - 1.0 && chip.right <= view.right + 1.0,
+        "chip {chip:?} inside {view:?}"
+    );
+}

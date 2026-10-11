@@ -1099,6 +1099,16 @@ impl LibraryScreen {
         root = root.child(El::column().size(avail as f32, g.pad as f32));
         let mut tree = this.grid.borrow_mut();
         let frame = tree.layout(root, viewport);
+        // The chips line keeps its focused chip in view; the screen's scroll keeps the line.
+        if let Zone::Chip(i) = this.zone {
+            if let (Some(r), Some((view, max))) = (
+                frame.rect(games::chip_id(i)),
+                frame.scroll(games::chips_id()),
+            ) {
+                let want = (r.center_x() - view.center_x()).clamp(0.0, max);
+                tree.follow(games::chips_id(), want, snap);
+            }
+        }
         let field = match geo {
             Some(_) => shelf_cover(this.cursor.max(0) as usize),
             None => grid_cell(this.cursor.max(0) as usize),
@@ -1644,9 +1654,14 @@ impl ScreenView for LibraryScreen {
         }
     }
 
-    /// A finger drag on the screen's scroll: the lines follow it and a lift flings them.
+    /// A finger drag on the screen's scrolls: the chips line sideways, else the lines up
+    /// and down; a lift flings them.
     fn pan(&mut self, p: Pointer) -> bool {
-        let taken = self.grid.get_mut().drag(Id::new(GRID, 0), p);
+        let tree = self.grid.get_mut();
+        if tree.drag(games::chips_id(), p) {
+            return true;
+        }
+        let taken = tree.drag(Id::new(GRID, 0), p);
         if taken && matches!(p.kind, PointerKind::PanStart { .. }) {
             self.follow = false;
         }
