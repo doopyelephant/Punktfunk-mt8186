@@ -92,9 +92,10 @@ pub fn attach(account: &str, sock: BorrowedFd<'_>, devid: u32, speed: u32) -> Re
     Ok(Some(port))
 }
 
-/// Holds `sock` until its connection ends, then forgets `port`'s row if it still names it.
-/// Held, the fd's number stays the row's.
-pub fn watch(port: u16, sock: OwnedFd) {
+/// Holds `sock` until its connection ends, then forgets `port`'s row if it still names
+/// `recorded`, the number `attach` took, and takes the socket out of systemd's fd store. After a
+/// restart `sock` has another number; the row and `status` keep the recorded one.
+pub fn watch(port: u16, recorded: RawFd, sock: OwnedFd) {
     loop {
         let mut fds = [PollFd::new(&sock, PollFlags::RDHUP)];
         match poll(&mut fds, None) {
@@ -105,9 +106,11 @@ pub fn watch(port: u16, sock: OwnedFd) {
     }
     let _held = lock();
     let dir = Path::new(MAP);
-    if read_row(dir, port).is_some_and(|(_, fd)| fd == sock.as_raw_fd()) {
+    if read_row(dir, port).is_some_and(|(_, fd)| fd == recorded) {
         let _ = std::fs::remove_file(dir.join(port.to_string()));
     }
+    // Before `sock` closes: its number, once free, can name a new attach on this port.
+    pf_inject::pad_broker::forget_usb(port, recorded);
 }
 
 /// Detach `port` for `account`, while it still holds the socket its row names. A port no seat

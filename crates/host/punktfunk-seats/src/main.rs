@@ -180,6 +180,8 @@ mod linux {
     /// Seats are units of their own, so stopping the supervisor leaves them running.
     fn serve(socket_path: &std::path::Path, steam_source: Option<PathBuf>) -> Result<(), String> {
         pf_seats::logging::to_stderr();
+        // Adopts systemd's kept fds close-on-exec before anything here can spawn a child.
+        pads::resume();
         let backend = LinuxBackend::open(pf_paths::config_dir(), steam_source)
             .map_err(|e| format!("open the seat backend: {e}"))?;
         let service = Arc::new(
@@ -192,7 +194,6 @@ mod linux {
             .map_err(|e| format!("bind {}: {e}", socket_path.display()))?;
         // The pad broker: a seat host's pads, made here and relayed to it.
         crate::vhci::prepare();
-        pads::resume();
         let pads_path = std::path::Path::new(pads::SOCKET_PATH);
         let pads_listener =
             pads::bind(pads_path).map_err(|e| format!("bind {}: {e}", pads_path.display()))?;

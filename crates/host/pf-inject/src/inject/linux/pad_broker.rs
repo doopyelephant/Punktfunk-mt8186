@@ -470,6 +470,31 @@ pub fn forget(name: &str) {
     notify(&format!("FDSTOREREMOVE=1\nFDNAME={name}/r"), None);
 }
 
+/// A seat's attached USB socket's name in the fd store, `usb/<port>/<recorded>`: `recorded` is
+/// the number `attach` took, which the port map and vhci's `status` keep after a restart.
+fn usb_store_name(port: u16, recorded: RawFd) -> String {
+    format!("usb/{port}/{recorded}")
+}
+
+/// What a stored USB socket's name says: `(port, recorded)`.
+fn parse_usb_store_name(name: &str) -> Option<(u16, RawFd)> {
+    let (port, recorded) = name.strip_prefix("usb/")?.split_once('/')?;
+    Some((port.parse().ok()?, recorded.parse().ok()?))
+}
+
+/// Parks a seat's attached USB socket in systemd's fd store, so a restarted supervisor
+/// watches it again ([`kept`]).
+pub fn keep_usb(port: u16, recorded: RawFd, sock: BorrowedFd<'_>) {
+    let name = usb_store_name(port, recorded);
+    notify(&format!("FDSTORE=1\nFDNAME={name}"), Some(sock));
+}
+
+/// Takes a USB socket out of the store: its connection ended.
+pub fn forget_usb(port: u16, recorded: RawFd) {
+    let name = usb_store_name(port, recorded);
+    notify(&format!("FDSTOREREMOVE=1\nFDNAME={name}"), None);
+}
+
 /// One message to systemd's notify socket, with `fd` beside it. A path socket only, which is
 /// what systemd hands a system service.
 fn notify(message: &str, fd: Option<BorrowedFd<'_>>) {
@@ -514,26 +539,32 @@ pub struct KeptPad {
     pub relay: UnixDatagram,
 }
 
-/// The pads systemd kept across a restart (`LISTEN_FDS`, `LISTEN_FDNAMES`). A kernel fd whose
-/// relay end systemd dropped (the seat hung up) is forgotten and closed, which destroys the
-/// pad. Once per process; a second call finds nothing.
-pub fn kept() -> Vec<KeptPad> {
+/// What systemd kept across a restart (`LISTEN_FDS`, `LISTEN_FDNAMES`): the relayed pads, and
+/// each attached USB socket as `(port, recorded, socket)`. A kernel fd whose relay end systemd
+/// dropped (the seat hung up) is forgotten and closed, which destroys the pad. Every fd is
+/// close-on-exec from here. Once per process; a second call finds nothing.
+pub fn kept() -> (Vec<KeptPad>, Vec<(u16, RawFd, OwnedFd)>) {
     static TAKEN: AtomicBool = AtomicBool::new(false);
     let env = |name: &str| std::env::var(name).unwrap_or_default();
     let ours = env("LISTEN_PID").parse::<u32>().ok() == Some(std::process::id());
     let count = env("LISTEN_FDS").parse::<RawFd>().unwrap_or(0);
     if !ours || count <= 0 || TAKEN.swap(true, Ordering::SeqCst) {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let names = env("LISTEN_FDNAMES");
     let mut names = names.split(':');
-    let (mut kernels, mut relays) = (HashMap::new(), HashMap::new());
+    let (mut kernels, mut relays, mut usb) = (HashMap::new(), HashMap::new(), Vec::new());
     for raw in LISTEN_FDS_START..LISTEN_FDS_START + count {
         // SAFETY: systemd passes fds 3 through 3 + LISTEN_FDS - 1 to the process LISTEN_PID
         // names, this one. Nothing else here owns them, and `TAKEN` adopts each once.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let _ = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC);
-        match names.next().unwrap_or("").rsplit_once('/') {
+        let name = names.next().unwrap_or("");
+        if let Some((port, recorded)) = parse_usb_store_name(name) {
+            usb.push((port, recorded, fd));
+            continue;
+        }
+        match name.rsplit_once('/') {
             Some((stem, "k")) => kernels.insert(stem.to_owned(), fd),
             Some((stem, "r")) => relays.insert(stem.to_owned(), fd),
             _ => None,
@@ -562,7 +593,7 @@ pub fn kept() -> Vec<KeptPad> {
         });
     }
     relays.into_keys().for_each(|name| forget(&name));
-    out
+    (out, usb)
 }
 
 /// Move the seat's events into the pad and the pad's back, until the seat hangs up. Blocks:
@@ -686,6 +717,17 @@ mod tests {
             None,
             "a suffix is not a name"
         );
+    }
+
+    /// A kept USB socket's name carries the port and the number its map row records.
+    #[test]
+    fn a_usb_store_name_round_trips() {
+        let name = usb_store_name(9, 17);
+        assert!(!name.contains(':'), "systemd's LISTEN_FDNAMES separator");
+        assert_eq!(parse_usb_store_name(&name), Some((9, 17)));
+        assert_eq!(parse_store_name(&name), None, "not a pad");
+        assert_eq!(parse_usb_store_name("pad/1-0/10/0/x/k"), None);
+        assert_eq!(parse_usb_store_name("usb/9/x"), None);
     }
 
     /// An `Attach` crosses with its socket; the answer carries the port.

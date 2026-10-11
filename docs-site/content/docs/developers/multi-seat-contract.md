@@ -270,7 +270,8 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   While the daemon runs, a new vhci interface starts unauthorized and the fence authorizes it.
   A seat's binds only when its device is one the host emulates (`usbip::EMULATED` in
   `pf-inject`) and the interface, as the kernel parsed it, is HID, audio, CDC-ACM or
-  vendor-specific; anyone else's always.
+  vendor-specific; anyone else's always. The attached socket waits in the fd store too, so a
+  restarted daemon still drops the port's row when the seat hangs up.
 - **Game Mode.** The seat host keeps the seat's mode, `desktop` or `game`, in `seat-session` in
   its config directory, and starts in the one it ran last. It owns
   `com.steampowered.SteamOSManager1` on the seat's session bus and serves `SessionManagement1`,

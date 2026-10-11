@@ -5,15 +5,15 @@
 //! running seat's (the owner's row included) is closed unanswered. A seat holds at most
 //! [`MAX_PER_SEAT`] pads and [`vhci::MAX_PER_SEAT`] USB devices; past that the answer is
 //! `capacity`. A pad lives as long as its relay thread, a USB device as long as its connection:
-//! the seat hanging up, or its host dying, ends both. A relayed pad also sits in systemd's fd
-//! store, so a supervisor restart picks it up again ([`resume`]).
+//! the seat hanging up, or its host dying, ends both. A relayed pad and an attached USB socket
+//! also sit in systemd's fd store, so a supervisor restart picks them up again ([`resume`]).
 
 use crate::vhci;
 use pf_inject::pad_broker::{self, BrokeredPad, PadKind, Request, Status};
 use pf_seats::linux::{socket, LinuxBackend};
 use pf_seats::SeatService;
 use std::collections::HashMap;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::Path;
@@ -66,11 +66,12 @@ fn release(held: &mut HashMap<String, usize>, account: &str) {
     }
 }
 
-/// Relays again every pad systemd kept across a supervisor restart. At start, before the
-/// socket answers.
+/// Relays again every pad systemd kept across a supervisor restart, and watches again every
+/// USB socket. First thing at start: until then the kept fds would leak into a child.
 pub fn resume() {
     let _ = std::fs::remove_dir_all(RELAYED);
-    for kept in pad_broker::kept() {
+    let (pads, sockets) = pad_broker::kept();
+    for kept in pads {
         let Some(slot) = Slot::take(&kept.account) else {
             pad_broker::forget(&kept.name);
             continue;
@@ -96,6 +97,18 @@ pub fn resume() {
             });
         if let Err(error) = spawned {
             tracing::warn!(%error, "kept seat pad thread did not start");
+        }
+    }
+    for (port, recorded, sock) in sockets {
+        tracing::info!(port, "seat USB device kept across a restart");
+        let spawned = std::thread::Builder::new()
+            .name("seat-usb".into())
+            .spawn(move || {
+                vhci::watch(port, recorded, sock);
+                tracing::info!(port, "seat USB device gone");
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(%error, port, "kept seat USB thread did not start");
         }
     }
 }
@@ -301,7 +314,9 @@ fn attach(stream: UnixStream, account: &str, sock: Option<OwnedFd>, devid: u32, 
     }
     drop(stream);
     tracing::info!(account, port, "seat USB device attached");
-    vhci::watch(port, sock);
+    let recorded = sock.as_raw_fd();
+    pad_broker::keep_usb(port, recorded, sock.as_fd());
+    vhci::watch(port, recorded, sock);
     tracing::info!(account, port, "seat USB device gone");
 }
 
