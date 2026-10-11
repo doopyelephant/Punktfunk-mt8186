@@ -219,6 +219,7 @@ const ISOLATE_HOLD: Duration = Duration::from_secs(3);
 
 /// Every CCD isolate in this file, as one topology transaction: descriptor-following holds for
 /// `hold`, and the generation moves only when the verification read saw a path switch off.
+/// `store` stores the isolate for the connected set (see [`isolate_displays_ccd_checked`]).
 /// Returns the pre-isolate snapshot (`None` when nothing was attempted) and the finished
 /// transaction. Tests fail the next N isolates through [`FAIL_NEXT_ISOLATES`], so an injected
 /// failure passes the same gates a real one does.
@@ -226,6 +227,7 @@ fn isolate_txn(
     reason: &'static str,
     keep: &[CcdTargetKey],
     hold: Duration,
+    store: bool,
 ) -> (Option<SavedConfig>, Finished) {
     let txn = topology_churn::begin(reason, hold);
     #[cfg(test)]
@@ -242,7 +244,7 @@ fn isolate_txn(
         );
         None
     } else {
-        isolate_displays_ccd_checked(keep)
+        isolate_displays_ccd_checked(keep, store)
     };
     let finished =
         topology_churn::finish(txn, isolate_txn_outcome(isolated.as_ref().map(|(_, o)| *o)));
@@ -473,19 +475,20 @@ impl MgrInner {
         Some((keep, survivors))
     }
 
-    /// One re-assert through [`isolate_txn`]. Only a finished `Changed` bumps
-    /// [`topology_reassert_gen`] and parks the re-lit display's devnode for the session; a
-    /// change seen past the hold deadline finishes as unknown.
+    /// One re-assert through [`isolate_txn`], stored for the connected set: Windows re-applies
+    /// the stored layout when a display re-plugs itself, so storing the isolate ends that fight.
+    /// Only a finished `Changed` bumps [`topology_reassert_gen`] and parks the re-lit display's
+    /// devnode for the session; a change seen past the hold deadline finishes as unknown.
     fn reassert_isolate(&mut self, keep: &[CcdTargetKey], hold: Duration) {
-        let (_, finished) = isolate_txn("exclusive-reassert", keep, hold);
+        let (_, finished) = isolate_txn("exclusive-reassert", keep, hold, true);
         if finished.outcome != Outcome::Changed {
             return;
         }
         // The forced re-commit hands the IDD path a fresh swap-chain: the session
         // re-attaches capture instead of streaming a frozen frame.
         TOPOLOGY_REASSERT_GEN.fetch_add(1, Ordering::Relaxed);
-        // A display that re-lit itself while held off would evict again on its next HPD
-        // pulse. Leased like the acquire's park, re-enabled at teardown.
+        // Quiets the re-lit display's wake events; it does not stop a re-plug re-resolving
+        // the layout. Leased like the acquire's park, re-enabled at teardown.
         if !crate::policy::prefs().standby_sink_neutralise() {
             return;
         }
@@ -1124,9 +1127,9 @@ impl VirtualDisplayManager {
 
     /// Start the exclusive-topology re-assert watchdog (idempotent).
     ///
-    /// A verified [`isolate_displays_ccd_checked`] is not durable: the isolated topology
-    /// is deliberately not saved to the CCD database (teardown must restore the
-    /// user's layout), so a later re-resolution can bring the stored layout back.
+    /// A verified [`isolate_displays_ccd_checked`] is not durable: until a re-assert stores it,
+    /// the CCD database still holds the user's layout for the connected set, and a re-resolution
+    /// (a display re-plugging itself) brings that back.
     ///
     /// Each cycle, at most every [`knobs::exclusive_reassert_ms`]: wait, `try_lock` the
     /// state, read the survivors, ask the [`ReassertBreaker`], act. A re-assert evicts via full
@@ -1460,7 +1463,9 @@ impl VirtualDisplayManager {
 
     /// Host topology for a member that just activated as `gdi`. The CCD isolate is a property
     /// of the whole managed GROUP, not of one member, so a per-device topology has no meaning
-    /// here — the first member's answer already governs the group (design §6.1). Exclusive:
+    /// here — the first member's answer already governs the group (design §6.1). First, outside
+    /// a live exclusive group, a set that came up from a dead host's stored isolate lights its
+    /// panels again. Exclusive:
     /// the first member captures the restore, later ones re-isolate the grown set.
     /// Primary/Extend leave physicals lit.
     fn apply_group_topology_on_add(
@@ -1471,14 +1476,22 @@ impl VirtualDisplayManager {
         first_member: bool,
     ) {
         use crate::policy::Topology;
+        // A live exclusive group's stored isolate is its own; its teardown stores the restore.
+        if !inner.group.ccd_exclusive {
+            pf_win_display::layout_db::repair();
+        }
         match topology_action(None) {
             Topology::Exclusive if first_member => self.isolate_group_first(inner, added_key, gdi),
             Topology::Exclusive => {
                 // Re-isolate so the fresh member joins the composited set. Discard the
                 // snapshot unless the first member's isolate failed — then adopt this one,
                 // or teardown cannot restore the physicals.
-                let (snap, _) =
-                    isolate_txn("sibling-isolate", &inner.keep_with(added_key), ISOLATE_HOLD);
+                let (snap, _) = isolate_txn(
+                    "sibling-isolate",
+                    &inner.keep_with(added_key),
+                    ISOLATE_HOLD,
+                    false,
+                );
                 if inner.group.ccd_saved.is_none() {
                     if let Some(snap) = snap {
                         tracing::warn!(
@@ -1555,8 +1568,12 @@ impl VirtualDisplayManager {
             inner.group.edid_locked = pf_win_display::adl_emul::lock_for_stream();
         }
         // The PnP leases below are stamped with this transaction's generation.
-        let (saved, finished) =
-            isolate_txn("acquire-isolate", &inner.keep_with(added_key), ISOLATE_HOLD);
+        let (saved, finished) = isolate_txn(
+            "acquire-isolate",
+            &inner.keep_with(added_key),
+            ISOLATE_HOLD,
+            false,
+        );
         inner.group.ccd_saved = saved;
         // After isolate, disable deactivated monitor PnP devnodes so standby wake events do
         // not cascade. Evidence: `windows/monitor_devnode.rs`.
@@ -1847,7 +1864,12 @@ impl VirtualDisplayManager {
             Topology::Exclusive => {
                 // Grown-set semantics: isolate to the surviving siblings + the new target. The returned
                 // snapshot is DISCARDED — the group keeps the first member's (design §6.1).
-                let _ = isolate_txn("swap-isolate", &inner.keep_with(new_target), ISOLATE_HOLD);
+                let _ = isolate_txn(
+                    "swap-isolate",
+                    &inner.keep_with(new_target),
+                    ISOLATE_HOLD,
+                    false,
+                );
             }
             Topology::Primary => {
                 // Predecessor held primary. The call recaptures a snapshot, so
@@ -1951,7 +1973,8 @@ impl VirtualDisplayManager {
                 // Re-issue isolate over the shrunk set. Snapshot discarded;
                 // the group keeps the first member's.
                 ShrinkAction::Reisolate => {
-                    let _ = isolate_txn("shrink-isolate", &inner.target_keys(), ISOLATE_HOLD);
+                    let _ =
+                        isolate_txn("shrink-isolate", &inner.target_keys(), ISOLATE_HOLD, false);
                 }
                 // Re-promote a survivor rather than leave primary on a target
                 // about to be REMOVEd. Save/restore the snapshot: the call

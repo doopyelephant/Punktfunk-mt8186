@@ -9,6 +9,7 @@
 //!   display-config lock, and timestamps events so a capture stall can say whether an OS display
 //!   event coincided with it.
 //! - [`snapshot`]: the platform-neutral snapshot types and cache rules (tested everywhere).
+//! - [`layout_db`]: isolates stored in the Windows display database, and their repair.
 //! - [`console_display`]: the console display's power state and the wake a new monitor needs.
 //! - [`compose_probe`]: the recovery canary — a 1-pixel window repaint, never input.
 //! - [`open_wudfhost`]: the WUDFHost a driver channel duplicates handles into, image-path proved.
@@ -29,6 +30,8 @@ pub mod display_events;
 mod input_desktop;
 #[cfg(target_os = "windows")]
 pub use input_desktop::{refresh_secure_desktop, secure_desktop};
+/// Stored-isolate journal: pure rules everywhere, file and CCD writes on Windows.
+pub mod layout_db;
 #[cfg(target_os = "windows")]
 pub mod monitor_devnode;
 /// Display identity, inventory and the snapshot cache — pure std, unit-tested on every platform.
