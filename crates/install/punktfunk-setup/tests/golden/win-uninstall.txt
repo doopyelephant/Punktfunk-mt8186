@@ -10,8 +10,8 @@
   + reg delete "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\punktfunk-tcp" /f
   + netsh advfirewall firewall delete rule "name=punktfunk seat listener (TCP)"
   + netsh advfirewall firewall delete rule "name=punktfunk seat listener (UDP)"
-  ok would remove C:\Windows\System32\punktfunk
-  ok would remove C:\Windows\SysWOW64\punktfunk
+  ok would remove %SystemRoot%\System32\punktfunk
+  ok would remove %SystemRoot%\SysWOW64\punktfunk
   + schtasks /End /TN PunktfunkWeb
   + schtasks /Delete /TN PunktfunkWeb /F
   + schtasks /End /TN PunktfunkScripting

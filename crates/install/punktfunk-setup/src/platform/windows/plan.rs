@@ -637,10 +637,10 @@ fn host_uninstall(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
                 "name=punktfunk seat listener (UDP)",
             ]),
             WinAction::RemoveFiles {
-                dir: pf_paths::system32("punktfunk"),
+                dir: r"%SystemRoot%\System32\punktfunk".into(),
             },
             WinAction::RemoveFiles {
-                dir: pf_paths::syswow64("punktfunk"),
+                dir: r"%SystemRoot%\SysWOW64\punktfunk".into(),
             },
             run_lenient(&["schtasks", "/End", "/TN", "PunktfunkWeb"]),
             run_lenient(&["schtasks", "/Delete", "/TN", "PunktfunkWeb", "/F"]),
