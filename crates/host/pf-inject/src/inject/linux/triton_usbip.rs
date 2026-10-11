@@ -38,9 +38,9 @@ pub fn usbip_preferred() -> bool {
     super::steam_usbip::usbip_preferred()
 }
 
-const TRITON_VENDOR: u16 = 0x28DE;
-const TRITON_WIRED_PRODUCT: u16 = 0x1302;
-const TRITON_PUCK_PRODUCT: u16 = 0x1304;
+pub(crate) const TRITON_VENDOR: u16 = 0x28DE;
+pub(crate) const TRITON_WIRED_PRODUCT: u16 = 0x1302;
+pub(crate) const TRITON_PUCK_PRODUCT: u16 = 0x1304;
 
 /// Interface 6: Puck management HID. Not a controller slot.
 const PUCK_MANAGEMENT_RDESC: &[u8] = &[
@@ -880,6 +880,7 @@ mod tests {
         let feedback = Arc::new(Mutex::new(TritonUsbFeedback::default()));
         let dev = build_triton_device(3, &reports, &feedback, None);
         assert_eq!((dev.vendor_id, dev.product_id), (0x28DE, 0x1302));
+        assert!(crate::usbip::EMULATED.contains(&(dev.vendor_id, dev.product_id)));
         assert_eq!(
             (dev.device_class, dev.device_subclass, dev.device_protocol),
             (0xEF, 0x02, 0x01)
@@ -964,6 +965,7 @@ mod tests {
         assert!(hub.seat(0, 1, None));
         let dev = build_puck_device("FVPFPUCK0001", &hub.slots);
         assert_eq!((dev.vendor_id, dev.product_id), (0x28DE, 0x1304));
+        assert!(crate::usbip::EMULATED.contains(&(dev.vendor_id, dev.product_id)));
         assert_eq!(
             (
                 dev.usb_version.major,

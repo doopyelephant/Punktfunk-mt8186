@@ -952,6 +952,15 @@ mod tests {
         assert_eq!(got[7], 7, "sequence number");
     }
 
+    /// A seat's vhci port binds only listed devices.
+    #[test]
+    fn the_dualsense_is_a_listed_device() {
+        let report = Arc::new(Mutex::new([0u8; DS_INPUT_REPORT_LEN]));
+        let (tx, _rx) = sync_channel::<Vec<f32>>(1);
+        let dev = build_device(0, &report, &Arc::default(), &tx);
+        assert!(crate::usbip::EMULATED.contains(&(dev.vendor_id, dev.product_id)));
+    }
+
     #[test]
     fn audio_receiver_handoff_is_take_once_per_pad() {
         let (tx, rx) = sync_channel::<Vec<f32>>(1);
