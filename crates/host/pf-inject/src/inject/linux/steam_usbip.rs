@@ -20,8 +20,8 @@ use usbip_sim::{
     Direction, SetupPacket, UsbDevice, UsbEndpoint, UsbInterface, UsbInterfaceHandler, Version,
 };
 
-const STEAM_VENDOR: u16 = 0x28DE;
-const STEAMDECK_PRODUCT: u16 = 0x1205;
+pub(crate) const STEAM_VENDOR: u16 = 0x28DE;
+pub(crate) const STEAMDECK_PRODUCT: u16 = 0x1205;
 
 /// Interface 2 (vendor HID). Steam Input filters on this layout; idle mouse/kbd
 /// on 0/1 stay silent.
@@ -214,6 +214,14 @@ mod tests {
     use crate::usbip::ensure_modules;
     use std::os::fd::AsRawFd;
     use std::time::{Duration, Instant};
+
+    /// A seat's vhci port binds only listed devices.
+    #[test]
+    fn the_deck_is_a_listed_device() {
+        let report = Arc::new(Mutex::new(neutral_deck_report()));
+        let dev = build_device(0, &report, &Arc::default());
+        assert!(crate::usbip::EMULATED.contains(&(dev.vendor_id, dev.product_id)));
+    }
 
     /// hid-steam hidraw on iface 2; `bInterfaceNumber` is the HID parent's attribute.
     fn hid_steam_iface2() -> Option<String> {

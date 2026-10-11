@@ -4,14 +4,14 @@
 //!
 //! [`MAP`] holds one file per port a seat attached: `<account> <sockfd>`, the socket number
 //! `attach` took, as vhci's `status` shows it. A row whose port is free or holds another socket
-//! is stale. While the supervisor runs, a new vhci device starts unauthorized: the fence lets a
-//! seat's configure only when every interface is a class [`classes_allowed`] takes.
+//! is stale. While the supervisor runs, a new vhci interface starts unauthorized: the fence
+//! authorizes a seat's only when [`interface_allowed`] takes what the kernel parsed.
 
 use anyhow::{bail, Context, Result};
 use pf_inject::usbip;
 use rustix::event::{poll, PollFd, PollFlags};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 pub const MAP: &str = "/run/punktfunk/pads/vhci";
@@ -26,7 +26,7 @@ fn lock() -> MutexGuard<'static, ()> {
 }
 
 /// At the supervisor's start: makes the map, drops stale rows (attachments outlive a restart,
-/// the kernel holds their sockets) and starts every new vhci device unauthorized.
+/// the kernel holds their sockets) and starts every new vhci interface unauthorized.
 pub fn prepare() {
     let _held = lock();
     let dir = Path::new(MAP);
@@ -34,20 +34,41 @@ pub fn prepare() {
         tracing::warn!(%error, dir = MAP, "vhci port map not made");
     }
     prune(dir, &usbip::vhci_used_rows());
-    // The fence rule lifts the gate; without it the owner's own virtual Deck never configures.
-    if !pf_seats::linux::fence::rule_installed() {
-        tracing::warn!("seat USB devices are not class-gated: the udev fence rule is missing");
+    // The fence rule is the only thing that authorizes a gated interface; without it the gate
+    // stays open, or the owner's own virtual Deck never binds.
+    let ruled = pf_seats::linux::fence::rule_installed();
+    if !ruled {
+        tracing::warn!("seat USB interfaces are not gated: the udev fence rule is missing");
+    }
+    set_gate(ruled);
+}
+
+/// Opens the gate again at the supervisor's stop (`ExecStopPost=`): no seat attaches while it
+/// is down. A seat that still holds a port keeps it shut, or its device could re-configure into
+/// an interface the kernel binds before the fence runs.
+pub fn ungate() {
+    let dir = Path::new(MAP);
+    prune(dir, &usbip::vhci_used_rows());
+    let held = std::fs::read_dir(dir).map_or(0, |entries| entries.count());
+    if held > 0 {
+        tracing::warn!(held, "vhci gate stays shut: a seat holds a port");
         return;
     }
+    set_gate(false);
+}
+
+/// Every vhci root hub's `interface_authorized_default`: `0` while `gated`.
+fn set_gate(gated: bool) {
     let Some(entries) = usbip::vhci_base().and_then(|base| std::fs::read_dir(base).ok()) else {
         return;
     };
-    let hubs = entries
+    let value = if gated { "0" } else { "1" };
+    let knobs = entries
         .flatten()
-        .map(|e| e.path().join("authorized_default"));
-    for knob in hubs.filter(|knob| knob.exists()) {
-        if let Err(error) = std::fs::write(&knob, "0") {
-            tracing::warn!(%error, hub = %knob.display(), "vhci hub left ungated");
+        .map(|e| e.path().join("interface_authorized_default"));
+    for knob in knobs.filter(|knob| knob.exists()) {
+        if let Err(error) = std::fs::write(&knob, value) {
+            tracing::warn!(%error, hub = %knob.display(), gated, "vhci hub gate not set");
         }
     }
 }
@@ -108,8 +129,8 @@ pub fn detach(account: &str, port: u16) -> Result<()> {
 }
 
 /// udev's program for a device under a vhci hub; `false` when `devpath` is not one. Prints the
-/// seat's lines when the port is a seat's, and `PF_VHCI_USB=allow` for a USB device that may
-/// configure: a seat's when its classes pass, anyone else's always.
+/// seat's lines when the port is a seat's. On an interface, it authorizes and probes its
+/// device's interfaces ([`authorize`]): a seat's only as [`seat_may_bind`] says.
 pub fn fence(devpath: &str) -> bool {
     let Some(busid) = busid_of(devpath) else {
         return false;
@@ -118,17 +139,80 @@ pub fn fence(devpath: &str) -> bool {
     if let Some(account) = &account {
         pf_seats::linux::fence::print_for(account);
     }
-    if std::env::var("DEVTYPE").as_deref() == Ok("usb_device") {
-        let descriptors = Path::new("/sys")
-            .join(devpath.trim_start_matches('/'))
-            .join("descriptors");
-        let allowed =
-            account.is_none() || std::fs::read(descriptors).is_ok_and(|d| classes_allowed(&d));
-        if allowed {
-            println!("PF_VHCI_USB=allow");
+    if std::env::var("DEVTYPE").as_deref() == Ok("usb_interface") {
+        let interface = Path::new("/sys").join(devpath.trim_start_matches('/'));
+        if let Some(device) = interface.parent() {
+            authorize(device, account.is_some());
         }
     }
     true
+}
+
+/// Authorizes each of `device`'s interfaces that may bind, then probes those still unbound:
+/// the kernel probes none it made unauthorized, and a driver that claims a sibling at probe
+/// (`cdc_acm`, `snd-usb-audio`) is refused an unauthorized one.
+fn authorize(device: &Path, seat: bool) {
+    let Some(prefix) = device
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| format!("{n}:"))
+    else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(device) else {
+        return;
+    };
+    let interfaces: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .map(|e| e.path())
+        .collect();
+    for interface in &interfaces {
+        if !seat || seat_may_bind(device, interface) == Some(true) {
+            let _ = std::fs::write(interface.join("authorized"), "1");
+        }
+    }
+    for interface in &interfaces {
+        let authorized =
+            std::fs::read_to_string(interface.join("authorized")).is_ok_and(|a| a.trim() == "1");
+        if authorized
+            && !interface.join("driver").exists()
+            && let Some(name) = interface.file_name()
+        {
+            let _ = std::fs::write("/sys/bus/usb/drivers_probe", name.as_encoded_bytes());
+        }
+    }
+}
+
+/// [`interface_allowed`] on the ids and class sysfs shows the kernel parsed for `interface`.
+fn seat_may_bind(device: &Path, interface: &Path) -> Option<bool> {
+    let hex = |dir: &Path, name: &str| -> Option<u16> {
+        let text = std::fs::read_to_string(dir.join(name)).ok()?;
+        u16::from_str_radix(text.trim(), 16).ok()
+    };
+    let byte = |name: &str| u8::try_from(hex(interface, name)?).ok();
+    Some(interface_allowed(
+        hex(device, "idVendor")?,
+        hex(device, "idProduct")?,
+        byte("bInterfaceClass")?,
+        byte("bInterfaceSubClass")?,
+        byte("bInterfaceProtocol")?,
+    ))
+}
+
+/// Whether a seat's interface may bind: its device is one [`usbip::EMULATED`] lists, and it is
+/// HID, audio, CDC-ACM, CDC data or vendor-specific. A vendor interface binds by VID:PID alone,
+/// so the list keeps a NIC's driver off it; ACM stops at protocol 6, short of RNDIS's `ff`.
+fn interface_allowed(vid: u16, pid: u16, class: u8, subclass: u8, protocol: u8) -> bool {
+    usbip::EMULATED.contains(&(vid, pid))
+        && matches!(
+            (class, subclass, protocol),
+            (0x01 | 0x03 | 0x0a | 0xff, _, _) | (0x02, 0x02, 0x00..=0x06)
+        )
 }
 
 /// The seat whose port holds device `busid`: the port's row, when its socket is the one
@@ -155,36 +239,6 @@ fn busid_of(devpath: &str) -> Option<String> {
     let (bus, port) = busid.split_once('-')?;
     let plain = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     (plain(bus) && plain(port)).then(|| busid.to_owned())
-}
-
-/// Whether a seat's USB device may configure: at least one interface, and every one HID,
-/// audio, CDC-ACM (with its data interface) or vendor-specific. `descriptors` is sysfs's: the
-/// device descriptor, then each configuration's descriptors.
-pub fn classes_allowed(descriptors: &[u8]) -> bool {
-    const INTERFACE: u8 = 4;
-    let mut interfaces = 0;
-    let mut at = 0;
-    while at + 2 <= descriptors.len() {
-        let (length, kind) = (descriptors[at] as usize, descriptors[at + 1]);
-        if length < 2 || at + length > descriptors.len() {
-            return false;
-        }
-        if kind == INTERFACE {
-            if length < 7 {
-                return false;
-            }
-            let allowed = matches!(
-                (descriptors[at + 5], descriptors[at + 6]),
-                (0x03, _) | (0x01, _) | (0x02, 0x02) | (0x0a, _) | (0xff, _)
-            );
-            if !allowed {
-                return false;
-            }
-            interfaces += 1;
-        }
-        at += length;
-    }
-    interfaces > 0 && at == descriptors.len()
 }
 
 fn write_row(dir: &Path, port: u16, account: &str, fd: RawFd) -> std::io::Result<()> {
@@ -234,43 +288,27 @@ fn held_in(dir: &Path, account: &str) -> usize {
 mod tests {
     use super::*;
 
-    /// The gate: every interface HID, audio, ACM or vendor, and at least one.
+    /// The gate: a listed device, and an interface class no NIC or disk driver takes.
     #[test]
-    fn the_class_gate_takes_pads_and_refuses_storage() {
-        fn iface(class: u8, sub: u8) -> [u8; 9] {
-            [9, 4, 0, 0, 1, class, sub, 0, 0]
-        }
-        let device = [
-            18u8, 1, 0, 2, 0, 0, 0, 64, 0xde, 0x28, 0x05, 0x12, 0, 3, 1, 2, 3, 1,
+    fn the_interface_gate_takes_pads_and_refuses_nics_and_storage() {
+        let cases = [
+            ((0x28de, 0x1205, 0x03, 0x00, 0x00), true, "Deck HID"),
+            ((0x057e, 0x2069, 0xff, 0x00, 0x00), true, "Switch 2 vendor"),
+            ((0x28de, 0x1304, 0x02, 0x02, 0x00), true, "Puck ACM"),
+            ((0x28de, 0x1304, 0x0a, 0x00, 0x00), true, "Puck CDC data"),
+            ((0x054c, 0x0ce6, 0x01, 0x02, 0x00), true, "DualSense audio"),
+            ((0x0bda, 0x8153, 0xff, 0xff, 0x00), false, "an r8152 NIC"),
+            ((0x28de, 0x1205, 0x02, 0x02, 0xff), false, "RNDIS"),
+            ((0x28de, 0x1205, 0x02, 0x06, 0x00), false, "CDC ethernet"),
+            ((0x28de, 0x1205, 0x08, 0x06, 0x50), false, "mass storage"),
         ];
-        let config = [9u8, 2, 0, 0, 1, 1, 0, 0x80, 50];
-        let endpoint = [7u8, 5, 0x81, 3, 64, 0, 4];
-        let mut deck = Vec::new();
-        deck.extend(device);
-        deck.extend(config);
-        for sub in [0, 1, 0] {
-            deck.extend(iface(3, sub));
-            deck.extend(endpoint);
+        for ((vid, pid, class, sub, protocol), allowed, what) in cases {
+            assert_eq!(
+                interface_allowed(vid, pid, class, sub, protocol),
+                allowed,
+                "{what}"
+            );
         }
-        assert!(classes_allowed(&deck), "three HID interfaces");
-
-        let mut puck = deck.clone();
-        puck.extend(iface(2, 2));
-        puck.extend(iface(0x0a, 0));
-        puck.extend(iface(0xff, 0));
-        puck.extend(iface(1, 1));
-        assert!(classes_allowed(&puck), "ACM, data, vendor and audio");
-
-        let mut stick = deck.clone();
-        stick.extend(iface(8, 6));
-        assert!(!classes_allowed(&stick), "mass storage");
-        let mut modem = deck.clone();
-        modem.extend(iface(2, 6));
-        assert!(!classes_allowed(&modem), "CDC ethernet");
-        assert!(!classes_allowed(&deck[..27]), "no interface");
-        let mut torn = deck.clone();
-        torn.push(0);
-        assert!(!classes_allowed(&torn), "a torn descriptor");
     }
 
     /// The fence finds the port's device under the vhci hub, hub-attached or not.

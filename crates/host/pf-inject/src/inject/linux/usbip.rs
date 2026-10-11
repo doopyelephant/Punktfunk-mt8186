@@ -22,6 +22,35 @@ const BUS_ID: &str = "0-0-0";
 /// usbip CLI default; [`attach_via_cli`] must listen here.
 const USBIP_TCP_PORT: u16 = 3240;
 
+/// Every `idVendor:idProduct` a usbip pad here presents: the only devices a seat's vhci port
+/// binds drivers for. Each builder's test checks its device is listed.
+pub const EMULATED: [(u16, u16); 6] = [
+    (
+        crate::steam_usbip::STEAM_VENDOR,
+        crate::steam_usbip::STEAMDECK_PRODUCT,
+    ),
+    (
+        crate::triton_usbip::TRITON_VENDOR,
+        crate::triton_usbip::TRITON_WIRED_PRODUCT,
+    ),
+    (
+        crate::triton_usbip::TRITON_VENDOR,
+        crate::triton_usbip::TRITON_PUCK_PRODUCT,
+    ),
+    (
+        crate::dualsense_proto::DS_VENDOR as u16,
+        crate::dualsense_proto::DS_PRODUCT as u16,
+    ),
+    (
+        crate::switch2_proto::VENDOR,
+        crate::switch2_proto::Model::Pro.product(),
+    ),
+    (
+        crate::switch2_proto::VENDOR,
+        crate::switch2_proto::Model::GameCube.product(),
+    ),
+];
+
 /// HID class descriptor: one report descriptor of `report_len` bytes.
 pub(crate) fn hid_class_descriptor(bcd_hid: u16, country: u8, report_len: usize) -> Vec<u8> {
     let [bcd_lo, bcd_hi] = bcd_hid.to_le_bytes();

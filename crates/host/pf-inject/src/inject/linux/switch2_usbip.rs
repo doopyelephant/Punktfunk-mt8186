@@ -319,6 +319,17 @@ mod tests {
         assert_eq!(eps(1), vec![(0x82, 2, 0), (0x02, 2, 0)]);
     }
 
+    /// A seat's vhci port binds only listed devices.
+    #[test]
+    fn every_model_is_a_listed_device() {
+        let state = Arc::new(Mutex::new(Switch2State::neutral()));
+        let feedback = Arc::new(Mutex::new(Switch2Feedback::default()));
+        for model in [Model::Pro, Model::GameCube] {
+            let dev = build_device(model, 0, &state, &feedback);
+            assert!(crate::usbip::EMULATED.contains(&(dev.vendor_id, dev.product_id)));
+        }
+    }
+
     /// Holds a Switch 2 Pro and a GameCube pad live for `PF_PAD_HOLD_SECS` (default 3) so an SDL
     /// probe can read them: faces, GR/GL and the triggers beat every 400 ms, a steady 100 °/s
     /// pitch, rumble and lights echoed to stdout.
