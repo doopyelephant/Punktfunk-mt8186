@@ -502,6 +502,7 @@ impl NvencD3d11Encoder {
                 split_mode = s.split_mode,
                 engines = s.encoder_engines,
                 subframe = s.subframe_on,
+                preset = %format_args!("P{}", s.preset),
                 "NVENC D3D11 session: {}x{}@{} {}-bit{} {} Mbps {:?}",
                 s.width,
                 s.height,

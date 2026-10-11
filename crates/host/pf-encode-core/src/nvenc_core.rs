@@ -358,6 +358,20 @@ pub fn codec_guid(codec: Codec) -> nv::GUID {
     }
 }
 
+/// `PUNKTFUNK_NVENC_PRESET` as NVENC's preset: `2..=7` = P2..P7, anything else P1. A higher
+/// preset buys quality per bit with encode time, which every frame of latency pays.
+pub fn preset_guid(preset: u8) -> nv::GUID {
+    match preset {
+        2 => nv::NV_ENC_PRESET_P2_GUID,
+        3 => nv::NV_ENC_PRESET_P3_GUID,
+        4 => nv::NV_ENC_PRESET_P4_GUID,
+        5 => nv::NV_ENC_PRESET_P5_GUID,
+        6 => nv::NV_ENC_PRESET_P6_GUID,
+        7 => nv::NV_ENC_PRESET_P7_GUID,
+        _ => nv::NV_ENC_PRESET_P1_GUID,
+    }
+}
+
 /// H.264/HEVC slice count: `PUNKTFUNK_NVENC_SLICES` (1..=32; 1 = single-slice
 /// escape) else `default_slices`. AV1 is always 1 (tiles, not slices). Shared by
 /// [`apply_low_latency_config`] and the Linux chunked-poll arm so they cannot
@@ -852,6 +866,14 @@ mod tests {
     use super::*;
     use crate::{clamp_to_engines, max_forced_split_mode, resolve_split_mode};
     use nv::NV_ENC_SPLIT_ENCODE_MODE as M;
+
+    #[test]
+    fn preset_knob_maps_to_its_guid_and_defaults_to_p1() {
+        assert!(preset_guid(0) == nv::NV_ENC_PRESET_P1_GUID);
+        assert!(preset_guid(4) == nv::NV_ENC_PRESET_P4_GUID);
+        assert!(preset_guid(7) == nv::NV_ENC_PRESET_P7_GUID);
+        assert!(preset_guid(8) == nv::NV_ENC_PRESET_P1_GUID);
+    }
 
     // Assumes `PUNKTFUNK_SPLIT_ENCODE` is unset (CI); an operator override wins.
 
@@ -1468,14 +1490,15 @@ pub fn session_wave_cycle(codec: Codec, height: u32, fps: u32) -> u32 {
     crate::rfi::wave_cycle(wave_rows(height), fps, 256, crate::rfi::pinned_cycle())
 }
 
-/// Shared `NV_ENC_INITIALIZE_PARAMS` (P1/ULL, PTD, session dims/rate) pointing
-/// at `cfg`. The returned struct borrows `cfg` as a raw pointer; keep `cfg`
+/// Shared `NV_ENC_INITIALIZE_PARAMS` (`preset` under ULL tuning, PTD, session dims/rate)
+/// pointing at `cfg`. The returned struct borrows `cfg` as a raw pointer; keep `cfg`
 /// alive across the NVENC call. Open and in-place reconfigure must present
 /// the same init params. `enable_async` is the Windows two-thread retrieve;
 /// Linux is sync-only (`enableEncodeAsync = 0`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_init_params(
     codec_guid: nv::GUID,
+    preset: nv::GUID,
     width: u32,
     height: u32,
     fps: u32,
@@ -1487,7 +1510,7 @@ pub fn build_init_params(
     let mut init = nv::NV_ENC_INITIALIZE_PARAMS {
         version: nv::NV_ENC_INITIALIZE_PARAMS_VER,
         encodeGUID: codec_guid,
-        presetGUID: nv::NV_ENC_PRESET_P1_GUID,
+        presetGUID: preset,
         tuningInfo: nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
         encodeWidth: width,
         encodeHeight: height,
@@ -1514,8 +1537,9 @@ pub fn build_init_params(
 
 /// Low-latency NVENC config onto a **preset-seeded** `cfg`: CBR, infinite GOP,
 /// P-only, ~1-frame VBV, per-codec tier/level, chroma + bit depth, colour
-/// signaling, the H.264 reorder bound, RFI DPB. Caller seeds from the P1/ULL preset for
-/// [`LowLatencyConfig::codec`], which names the union arm every access here uses.
+/// signaling, the H.264 reorder bound, RFI DPB. Caller seeds from the session's
+/// preset under ULL tuning for [`LowLatencyConfig::codec`], which names the union
+/// arm every access here uses.
 pub fn apply_low_latency_config(cfg: &mut nv::NV_ENC_CONFIG, c: LowLatencyConfig) {
     cfg.gopLength = nv::NVENC_INFINITE_GOPLENGTH;
     cfg.frameIntervalP = 1;

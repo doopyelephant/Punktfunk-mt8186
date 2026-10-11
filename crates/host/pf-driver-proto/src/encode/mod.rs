@@ -174,8 +174,10 @@ pub struct EncodeKnobs {
     pub pyrowave_streamed_au: u8,
     /// `PUNKTFUNK_PYROWAVE_CHUNK_KIB` / 64: streamed-AU chunk target; `0` = 256 KiB.
     pub pyrowave_chunk_64kib: u8,
+    /// `PUNKTFUNK_NVENC_PRESET`: `1..=7` = P1..P7; `0` = P1.
+    pub nvenc_preset: u8,
     /// Reserved; send `0`.
-    pub _reserved: [u8; 4],
+    pub _reserved: [u8; 3],
 }
 
 /// The trimmed, case-folded truthy set every `PUNKTFUNK_*` flag shares.
@@ -190,7 +192,7 @@ pub fn truthy(v: &str) -> bool {
 
 impl EncodeKnobs {
     /// Every variable [`Self::apply_env`] knows, for a caller that walks the environment.
-    pub const ENV_NAMES: [&'static str; 17] = [
+    pub const ENV_NAMES: [&'static str; 18] = [
         "PUNKTFUNK_SPLIT_ENCODE",
         "PUNKTFUNK_NVENC_ASYNC",
         "PUNKTFUNK_NVENC_ASYNC_DEPTH",
@@ -208,6 +210,7 @@ impl EncodeKnobs {
         "PUNKTFUNK_VBV_FRAMES",
         "PUNKTFUNK_PYROWAVE_STREAMED_AU",
         "PUNKTFUNK_PYROWAVE_CHUNK_KIB",
+        "PUNKTFUNK_NVENC_PRESET",
     ];
 
     /// Set the knob `name` names from its environment spelling. Unparseable values leave
@@ -252,6 +255,12 @@ impl EncodeKnobs {
                     "0" => 1,
                     "1" => 2,
                     _ => self.nvenc_subframe,
+                }
+            }
+            "PUNKTFUNK_NVENC_PRESET" => {
+                let n = v.strip_prefix(['p', 'P']).unwrap_or(v);
+                if let Some(n) = n.parse::<u8>().ok().filter(|n| (1..=7).contains(n)) {
+                    self.nvenc_preset = n;
                 }
             }
             "PUNKTFUNK_NVENC_MAX_SESSIONS" => {
@@ -659,7 +668,8 @@ const _: () = {
     assert!(offset_of!(SetEncodeRequest, knobs) == SET_ENCODE_REQUEST_LEGACY_SIZE);
     assert!(size_of::<EncodeKnobs>() == 24);
     assert!(offset_of!(EncodeKnobs, split_encode) == 6);
-    assert!(offset_of!(EncodeKnobs, _reserved) == 20);
+    assert!(offset_of!(EncodeKnobs, nvenc_preset) == 20);
+    assert!(offset_of!(EncodeKnobs, _reserved) == 21);
 
     assert!(size_of::<EncoderCapsWire>() == 24);
     assert!(size_of::<SetEncodeReply>() == 72);
@@ -1098,6 +1108,10 @@ mod tests {
         assert_eq!(k.nvenc_async, 0);
         k.apply_env("PUNKTFUNK_NVENC_SUBFRAME", "0");
         assert_eq!(k.nvenc_subframe, 1);
+        k.apply_env("PUNKTFUNK_NVENC_PRESET", "P4");
+        assert_eq!(k.nvenc_preset, 4);
+        k.apply_env("PUNKTFUNK_NVENC_PRESET", "8");
+        assert_eq!(k.nvenc_preset, 4, "past P7 is ignored");
         k.apply_env("PUNKTFUNK_NVENC_SLICES", "33");
         assert_eq!(k.nvenc_slices, 0, "out of range is ignored");
         k.apply_env("PUNKTFUNK_INTRA_REFRESH", "0");

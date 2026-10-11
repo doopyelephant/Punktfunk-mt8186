@@ -13,11 +13,11 @@
 
 use super::nvenc_core::{
     apply_low_latency_config, build_init_params, cached_ceiling, cached_split_verdict, encode_cap,
-    force_frame_mode, open_split_mode, plan_range_recovery, prefix_diverged, resolve_slices,
-    resolve_split_subframe, resolve_subframe, seed_config, seed_pic_params, seed_preset_config,
-    session_wave_cycle, slice_offsets_len, store_ceiling, store_split_verdict, subframe_env_forced,
-    ArbAction, BitstreamLock, CeilingKey, EncodeApi, LowLatencyConfig, NvStatusExt, RangePlan,
-    SplitArbiter, SplitKey,
+    force_frame_mode, open_split_mode, plan_range_recovery, prefix_diverged, preset_guid,
+    resolve_slices, resolve_split_subframe, resolve_subframe, seed_config, seed_pic_params,
+    seed_preset_config, session_wave_cycle, slice_offsets_len, store_ceiling, store_split_verdict,
+    subframe_env_forced, ArbAction, BitstreamLock, CeilingKey, EncodeApi, LowLatencyConfig,
+    NvStatusExt, RangePlan, SplitArbiter, SplitKey,
 };
 use super::nvenc_status;
 use super::{max_forced_split_mode, resolve_split_mode, AuChunk, Codec, EncodedFrame};
@@ -365,6 +365,8 @@ pub struct NvSession {
     encoder: *mut c_void,
     pub codec: Codec,
     pub codec_guid: nv::GUID,
+    /// `PUNKTFUNK_NVENC_PRESET` as P1..P7, latched so open and reconfigure present one preset.
+    pub preset: u8,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -478,6 +480,7 @@ impl NvSession {
             encoder: std::ptr::null_mut(),
             codec,
             codec_guid: super::nvenc_core::codec_guid(codec),
+            preset: crate::knobs::get().nvenc_preset.max(1),
             width,
             height,
             fps,
@@ -722,8 +725,9 @@ impl NvSession {
         split_mode
     }
 
-    /// Session `NV_ENC_CONFIG` at `bitrate`: the P1/ULL preset plus the low-latency contract.
-    /// Open and reconfigure both author it, so a retarget moves only bitrate and derived VBV.
+    /// Session `NV_ENC_CONFIG` at `bitrate`: the session's preset under ULL tuning plus the
+    /// low-latency contract. Open and reconfigure both author it, so a retarget moves only
+    /// bitrate and derived VBV.
     ///
     /// # Safety
     /// `enc` is a live session.
@@ -741,7 +745,7 @@ impl NvSession {
             (self.api.get_encode_preset_config_ex)(
                 enc,
                 self.codec_guid,
-                nv::NV_ENC_PRESET_P1_GUID,
+                preset_guid(self.preset),
                 nv::NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 &mut preset,
             )
@@ -826,6 +830,7 @@ impl NvSession {
         // `build_init_params` refuses sub-frame on an async session.
         let mut init = build_init_params(
             self.codec_guid,
+            preset_guid(self.preset),
             self.width,
             self.height,
             self.fps,
@@ -1625,6 +1630,7 @@ impl NvSession {
             // `enableSubFrameWrite` mid-session.
             reInitEncodeParams: build_init_params(
                 self.codec_guid,
+                preset_guid(self.preset),
                 self.width,
                 self.height,
                 self.fps,
