@@ -1,5 +1,6 @@
-//! The sort and view pills: SORT's six on the leading edge, VIEW's two on the trailing,
-//! and Search last, uncaptioned: it opens a screen rather than applying a state.
+//! The sort and view pills: the sorts on the leading edge behind an arrows mark, the views
+//! on the trailing behind an eye, and Search last as a magnifier: it opens a screen rather
+//! than applying a state.
 //!
 //! A line of focus targets in the screen's own tree, so the plate walks onto it from the
 //! line below: Left and Right move between pills and OK applies the focused one. Each
@@ -9,6 +10,7 @@
 use crate::anim::Spring;
 use crate::collate::SortKey;
 use crate::el::{El, Id};
+use crate::icons::{self, Icon};
 use crate::library::LibraryView;
 use crate::theme::{accent, fg, on_accent, Fonts, PanelStroke, W};
 use skia_safe::Rect;
@@ -19,9 +21,9 @@ const PILL_H: f64 = 32.0;
 const PILL_TEXT: f64 = 15.0;
 const PILL_PAD: f64 = 13.0;
 const PILL_GAP: f64 = 6.0;
-const CAPTION: f64 = 11.0;
-const TRACK: f64 = 1.4;
-const CAPTION_GAP: f64 = 10.0;
+/// A group's mark and Search's magnifier.
+const MARK: f64 = 18.0;
+const MARK_GAP: f64 = 10.0;
 /// Least air between the two groups.
 const GROUP_GAP: f64 = 24.0;
 
@@ -56,23 +58,20 @@ pub(crate) fn pill_id(i: usize) -> Id {
     Id::new("library-pill", i)
 }
 
-/// Pill rects and the captions' pens, bar-local px.
+/// Pill rects and each group mark's left edge, bar-local px.
 struct Layout {
     pills: Vec<Rect>,
-    captions: Vec<(f64, &'static str)>,
-}
-
-fn caption_w(fonts: &Fonts, s: &str, k: f64) -> f64 {
-    // Tracking follows every glyph, the last included: the ink ends one gap short.
-    f64::from(fonts.measure(s, W::SemiBold, CAPTION * k))
-        + TRACK * k * s.chars().count().saturating_sub(1) as f64
+    marks: Vec<(f64, Icon)>,
 }
 
 fn layout(fonts: &Fonts, k: f64, width: f64, views: bool) -> Layout {
     let pills = Pill::all(views);
     let widths: Vec<f64> = (pills.iter())
-        .map(|p| {
-            f64::from(fonts.measure(p.label(), W::SemiBold, PILL_TEXT * k)) + 2.0 * PILL_PAD * k
+        .map(|p| match p {
+            Pill::Search => PILL_H * k,
+            _ => {
+                f64::from(fonts.measure(p.label(), W::SemiBold, PILL_TEXT * k)) + 2.0 * PILL_PAD * k
+            }
         })
         .collect();
     let run = |r: std::ops::Range<usize>| {
@@ -82,11 +81,12 @@ fn layout(fonts: &Fonts, k: f64, width: f64, views: bool) -> Layout {
     let top = (BAR_H - PILL_H) / 2.0 * k;
     let mut out = Layout {
         pills: Vec::new(),
-        captions: Vec::new(),
+        marks: Vec::new(),
     };
-    let mut place = |x0: f64, r: std::ops::Range<usize>, caption: &'static str| {
-        out.captions.push((x0, caption));
-        let mut x = x0 + caption_w(fonts, caption, k) + CAPTION_GAP * k;
+    let lead = (MARK + MARK_GAP) * k;
+    let mut place = |x0: f64, r: std::ops::Range<usize>, mark: Icon| {
+        out.marks.push((x0, mark));
+        let mut x = x0 + lead;
         for w in &widths[r] {
             out.pills.push(Rect::from_xywh(
                 x as f32,
@@ -98,15 +98,15 @@ fn layout(fonts: &Fonts, k: f64, width: f64, views: bool) -> Layout {
         }
     };
     let sorts = SortKey::ALL.len();
-    let sort_w = caption_w(fonts, "SORT", k) + CAPTION_GAP * k + run(0..sorts);
-    place(0.0, 0..sorts, "SORT");
+    let sort_w = lead + run(0..sorts);
+    place(0.0, 0..sorts, Icon(pf_client_core::lucide::ARROW_UP_DOWN));
     if views {
         let search = pills.len() - 1;
         let search_w = widths[search];
-        let view_w = caption_w(fonts, "VIEW", k) + CAPTION_GAP * k + run(sorts..search);
+        let view_w = lead + run(sorts..search);
         // A narrow window crowds the groups rather than pushing SORT off the leading edge.
         let x = (width - search_w - GROUP_GAP * k - view_w).max(sort_w + GROUP_GAP * k);
-        place(x, sorts..search, "VIEW");
+        place(x, sorts..search, Icon(pf_client_core::lucide::EYE));
         let x = (width - search_w).max(x + view_w + GROUP_GAP * k);
         out.pills.push(Rect::from_xywh(
             x as f32,
@@ -162,7 +162,7 @@ impl Bar {
         }
     }
 
-    /// The row `width` px wide: captions and capsules under the pills, each pill a focus
+    /// The row `width` px wide: group marks and capsules under the pills, each pill a focus
     /// target. `seen` hears each pill's rect as it is painted.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn el<'a>(
@@ -177,14 +177,14 @@ impl Bar {
     ) -> El<'a> {
         let l = layout(fonts, k, width, views);
         let h = (BAR_H * k) as f32;
-        let captions = l.captions;
+        let marks = l.marks;
         let pill_top = (BAR_H - PILL_H) / 2.0 * k;
         let under = El::paint(move |canvas, r| {
-            let base = f64::from(r.top) + BAR_H / 2.0 * k + CAPTION * k * 0.36;
-            for (x, cap) in &captions {
-                let x = f64::from(r.left) + x;
-                let size = CAPTION * k;
-                fonts.draw_tracked(canvas, cap, x, base, W::SemiBold, size, TRACK * k, fg(0.5));
+            let cy = r.top + (BAR_H / 2.0 * k) as f32;
+            for &(x, mark) in &marks {
+                let cx = r.left + (x + MARK / 2.0 * k) as f32;
+                let size = (MARK * k) as f32;
+                icons::draw_icon(canvas, mark, cx, cy, size, k as f32, fg(0.5));
             }
             for [left, right] in self.caps.iter().flatten() {
                 let pill = Rect::from_xywh(
@@ -217,6 +217,12 @@ impl Bar {
             row = row.child(
                 El::paint(move |canvas, r| {
                     seen(i, r);
+                    if pill == Pill::Search {
+                        let (cx, cy, size) = (r.center_x(), r.center_y(), (MARK * k) as f32);
+                        let mark = Icon(pf_client_core::lucide::SEARCH);
+                        icons::draw_icon(canvas, mark, cx, cy, size, k as f32, ink);
+                        return;
+                    }
                     let size = PILL_TEXT * k;
                     let tw = f64::from(fonts.measure(label, W::SemiBold, size));
                     let x = f64::from(r.center_x()) - tw / 2.0;
@@ -243,7 +249,7 @@ mod tests {
         let fonts = crate::theme::build_fonts().unwrap();
         let l = layout(&fonts, 1.0, 1200.0, true);
         assert_eq!(l.pills.len(), 9);
-        assert_eq!(l.captions[0].0, 0.0);
+        assert_eq!(l.marks[0].0, 0.0);
         assert!((f64::from(l.pills[8].right) - 1200.0).abs() < 0.5);
         assert!(l.pills.windows(2).all(|w| w[0].right < w[1].left));
         let narrow = layout(&fonts, 1.0, 400.0, true);
