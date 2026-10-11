@@ -256,6 +256,7 @@ struct PlanInputs {
     renders: Vec<Endpoint>,
     captures: Vec<Endpoint>,
     mic_want: Option<String>,
+    loopback_want: Option<String>,
     /// Pad-audio ids: platform identity the pure plan filters out of every role.
     pad_ids: Vec<String>,
     /// Minted Speakers/Microphone ids — empty until the provider latches.
@@ -267,11 +268,17 @@ impl PlanInputs {
     /// still appearing, and the plan would pick a device the capture will not use.
     fn read() -> PlanInputs {
         let (renders, captures) = enumerate_including_minted();
+        // Lowercased name substring. Empty would match every device, so it is unset.
+        let name_pin = |var: &str| {
+            std::env::var(var)
+                .ok()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+        };
         PlanInputs {
             pad_ids: pad_render_ids(&renders),
-            mic_want: std::env::var("PUNKTFUNK_MIC_DEVICE")
-                .ok()
-                .map(|s| s.to_lowercase()),
+            mic_want: name_pin("PUNKTFUNK_MIC_DEVICE"),
+            loopback_want: name_pin("PUNKTFUNK_LOOPBACK_DEVICE"),
             minted: super::minted::minted_ids(),
             renders,
             captures,
@@ -283,6 +290,7 @@ impl PlanInputs {
             &self.renders,
             &self.captures,
             self.mic_want.as_deref(),
+            self.loopback_want.as_deref(),
             host_audio_requested(),
             probe,
             // Stereo: the floor every session uses, and the only count a narrowing verdict
@@ -336,6 +344,17 @@ pub fn wire_now_full(park_defaults: bool) -> WiredPlan {
             renders = ?renders.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
             "audio wiring plan"
         );
+        if let Some(want) = &inputs.loopback_want {
+            let honoured = wiring
+                .loopback_render
+                .as_ref()
+                .is_some_and(|(n, _)| n.to_lowercase().contains(want.as_str()));
+            if !honoured {
+                tracing::warn!(want = %want,
+                    "PUNKTFUNK_LOOPBACK_DEVICE matches no output device the microphone leaves \
+                     free — capturing the automatic pick");
+            }
+        }
         if let (Some(why), Some((name, _))) = (&wiring.loopback_narrowing, &wiring.loopback_render)
         {
             tracing::warn!(
