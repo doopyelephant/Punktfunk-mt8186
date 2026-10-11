@@ -39,8 +39,8 @@ public final class ConsoleMetalView: ConsolePlatformView {
     private var scrollFrom: CGPoint?
     /// Where the remote's swipe last stepped from.
     private var swipeFrom: CGPoint?
-    /// A held remote direction and the timer that repeats it.
-    private var held: (press: ObjectIdentifier, timer: Timer)?
+    /// A held remote direction or keyboard key, and the timer that repeats it.
+    private var held: (press: UIPress, event: ConsoleBridge.Menu?, timer: Timer)?
     /// Presses taken on the way down. Their release stays ours, even when the Back one carried
     /// reached the root in between.
     private var claimed = Set<ObjectIdentifier>()
@@ -352,10 +352,12 @@ public final class ConsoleMetalView: ConsolePlatformView {
             bridge.key(key, shift: shift, repeated: repeated)
             // Space, Y and X are characters too: an open field types them and drops the key.
             if let typed { bridge.text(typed) }
+            if !repeated { hold(press) }
             return true
         }
         if let typed {
             bridge.text(typed)
+            if !repeated { hold(press) }
             return true
         }
         let event: ConsoleBridge.Menu
@@ -375,21 +377,32 @@ public final class ConsoleMetalView: ConsolePlatformView {
         return true
     }
 
-    /// Repeat a held direction at the pad poller's pace until its press ends.
-    private func hold(_ press: UIPress, _ event: ConsoleBridge.Menu) {
+    /// Repeat a held remote direction (`event`) or keyboard key at the pad poller's pace until
+    /// its press ends. UIKit sends no key repeats: a key goes back through `claim` marked
+    /// repeated, and the shell drops the ones that must not repeat.
+    private func hold(_ press: UIPress, _ event: ConsoleBridge.Menu? = nil) {
         held?.timer.invalidate()
         let timer = Timer(
             fire: Date() + GamepadMenuInput.initialRepeatDelay,
             interval: GamepadMenuInput.repeatInterval, repeats: true
         ) { [weak self] _ in
-            MainActor.assumeIsolated { _ = self?.bridge.menu(event, from: .keys) }
+            MainActor.assumeIsolated { self?.repeatHeld() }
         }
         RunLoop.main.add(timer, forMode: .common)
-        held = (ObjectIdentifier(press), timer)
+        held = (press, event, timer)
+    }
+
+    private func repeatHeld() {
+        guard let held else { return }
+        if let event = held.event {
+            _ = bridge.menu(event, from: .keys)
+        } else {
+            _ = claim(held.press, repeated: true)
+        }
     }
 
     private func release(_ presses: Set<UIPress>) {
-        guard let held, presses.contains(where: { ObjectIdentifier($0) == held.press }) else { return }
+        guard let held, presses.contains(where: { $0 === held.press }) else { return }
         held.timer.invalidate()
         self.held = nil
     }
