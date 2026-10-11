@@ -5,10 +5,12 @@
 //! what an activation means; every frame it hands the widget a fresh `RowSpec`
 //! slice. Ports of Apple's `GamepadMenuList` / `GamepadKeyboard`.
 
+mod flick;
 mod keyboard;
 mod list;
 mod tabs;
 
+pub use flick::*;
 pub use keyboard::*;
 pub use list::*;
 pub use tabs::*;

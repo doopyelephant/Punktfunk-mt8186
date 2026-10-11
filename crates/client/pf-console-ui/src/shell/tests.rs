@@ -913,20 +913,19 @@ fn the_stream_controls_draw_and_a_pad_leaves_them() {
     let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
     let mut settings = pf_client_core::trust::Settings::default();
     let lib = crate::library::LibraryShared::default();
-    let controls = crate::screens::licenses::LicensesScreen::controls(&crate::screens::Ctx::test(
+    let controls = crate::screens::controls::ControlsScreen::new(&crate::screens::Ctx::test(
         &mut settings,
         &lib,
-    ))
-    .expect("a desktop has controls");
+    ));
     let (mut s, _console, _library) = shell(vec![
         Screen::Home(HomeScreen::new()),
-        Screen::Licenses(controls),
+        Screen::Controls(controls),
     ]);
     s.render(surface.canvas(), 1280, 800, &fonts, None, None, &[]);
-    let Some(Screen::Licenses(l)) = s.stack.last() else {
+    let Some(Screen::Controls(c)) = s.stack.last() else {
         panic!("the controls are on top");
     };
-    assert!(!l.waiting() && l.title() == "Stream controls");
+    assert_eq!(c.title(), "Stream controls");
     s.handle_menu(MenuEvent::Back);
     finish_motion(&mut s);
     assert!(matches!(s.stack.last(), Some(Screen::Home(_))));

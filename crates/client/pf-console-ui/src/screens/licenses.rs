@@ -8,11 +8,11 @@
 
 use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, LicenseSection};
-use crate::pointer::{Pointer, PointerKind};
+use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, ScreenView};
 use crate::theme::{edge, fg, Fonts, W};
-use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
-use pf_client_core::shortcuts::{self, Client};
+use crate::widgets::{soft_scroll, Flick};
+use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
 const MIT: &str = include_str!("../../../../../LICENSE-MIT");
@@ -23,8 +23,6 @@ const GEIST_OFL: &str = include_str!("../../assets/fonts/Geist-OFL.txt");
 enum Style {
     Title,
     Heading,
-    /// A control's keys, bold over the line that says what they do.
-    Keys,
     Body,
     /// A licence file's own text: smaller and quieter than the prose around it.
     Text,
@@ -36,7 +34,6 @@ impl Style {
         match self {
             Style::Title => (26.0, W::Bold, 1.0),
             Style::Heading => (18.0, W::SemiBold, 0.95),
-            Style::Keys => (16.0, W::SemiBold, 1.0),
             Style::Body => (14.0, W::Regular, 0.8),
             Style::Text => (12.0, W::Regular, 0.62),
         }
@@ -52,22 +49,8 @@ struct Line {
     style: Style,
 }
 
-/// Up and Down scroll this many body lines, Left and Right a page (L1/R1 are the tabs).
-/// A fling decays at this rate per second.
-const STEP_LINES: f64 = 3.0;
-const FLING_DECAY: f64 = 4.0;
-
-/// What the screen scrolls.
-#[derive(Clone, Copy, PartialEq)]
-enum Doc {
-    Licenses,
-    /// The stream's keys, chords and gestures for this client ([`pf_client_core::shortcuts`]).
-    Controls(Client, bool),
-}
-
-/// Scrolling read-only text: the licences, or the stream controls.
+/// Scrolling read-only text: the console's own notices, then the host's.
 pub(crate) struct LicensesScreen {
-    doc: Doc,
     /// The host's sections; `None` until they arrive.
     host: Option<Vec<LicenseSection>>,
     lines: Vec<Line>,
@@ -75,10 +58,7 @@ pub(crate) struct LicensesScreen {
     tops: Vec<f64>,
     /// What `lines` were laid out for: width, scale, and whether the host's part was in.
     laid: Option<(f32, f64, bool)>,
-    scroll: f64,
-    velocity: f64,
-    view_h: f64,
-    step: f64,
+    flick: Flick,
 }
 
 impl LicensesScreen {
@@ -86,40 +66,12 @@ impl LicensesScreen {
     pub(crate) fn new(fx: &mut Outbox) -> LicensesScreen {
         fx.cmds.push(ConsoleCmd::LoadLicenses);
         LicensesScreen {
-            doc: Doc::Licenses,
             host: None,
             lines: Vec::new(),
             tops: Vec::new(),
             laid: None,
-            scroll: 0.0,
-            velocity: 0.0,
-            view_h: 0.0,
-            step: 0.0,
+            flick: Flick::default(),
         }
-    }
-
-    /// The stream controls this platform has. Every platform has a list today.
-    pub(crate) fn controls(ctx: &Ctx) -> Option<LicensesScreen> {
-        use crate::platform::Platform;
-        let client = match ctx.device.platform {
-            Platform::Desktop => Client::Desktop,
-            Platform::Android => Client::Android,
-            Platform::Apple => Client::Apple,
-            Platform::WebOS => Client::WebOS,
-            Platform::Web => Client::Web,
-            Platform::Tizen => Client::Tizen,
-        };
-        Some(LicensesScreen {
-            doc: Doc::Controls(client, !ctx.device.tv),
-            host: None,
-            lines: Vec::new(),
-            tops: Vec::new(),
-            laid: None,
-            scroll: 0.0,
-            velocity: 0.0,
-            view_h: 0.0,
-            step: 0.0,
-        })
     }
 
     pub(crate) fn set_host(&mut self, sections: Vec<LicenseSection>) {
@@ -127,23 +79,12 @@ impl LicensesScreen {
     }
 
     pub(crate) fn waiting(&self) -> bool {
-        self.doc == Doc::Licenses && self.host.is_none()
+        self.host.is_none()
     }
 
     #[cfg(test)]
     pub(crate) fn scrolled(&self) -> f64 {
-        self.scroll
-    }
-
-    /// `false` when already at that end.
-    fn scroll_by(&mut self, by: f64) -> bool {
-        let before = self.scroll;
-        self.scroll = (self.scroll + by).clamp(0.0, self.max_scroll());
-        self.scroll != before
-    }
-
-    fn max_scroll(&self) -> f64 {
-        (self.tops.last().copied().unwrap_or(0.0) - self.view_h).max(0.0)
+        self.flick.goal()
     }
 
     /// Every logical line, wrapped to `width`: the console's own texts, then the host's.
@@ -163,18 +104,6 @@ impl LicensesScreen {
                 });
             }
         };
-        if let Doc::Controls(client, touch) = self.doc {
-            push(Style::Body, "Press these while a stream is running.");
-            for g in shortcuts::groups(client, touch) {
-                push(Style::Body, "");
-                push(Style::Heading, g.title);
-                for i in g.items {
-                    push(Style::Keys, i.keys);
-                    push(Style::Body, &format!("  {}", i.text));
-                }
-            }
-            return self.wrap_lines(source, fonts, width, k);
-        }
         push(Style::Title, &format!("Punktfunk {}", crate::VERSION));
         push(
             Style::Body,
@@ -227,66 +156,30 @@ impl LicensesScreen {
             }
         }
         self.tops.push(y);
+        self.flick.content_h = y;
     }
 }
 
 impl ScreenView for LicensesScreen {
     fn title(&self) -> String {
-        match self.doc {
-            Doc::Licenses => "Open-source licences",
-            Doc::Controls(..) => "Stream controls",
-        }
-        .into()
+        "Open-source licences".into()
     }
 
     fn menu(&mut self, ev: MenuEvent, _ctx: &mut Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
-        let page = (self.view_h - self.step).max(self.step);
-        let by = match ev {
-            MenuEvent::Back => {
-                fx.pop();
-                return None;
-            }
-            MenuEvent::Move(MenuDir::Up) => -STEP_LINES * self.step,
-            MenuEvent::Move(MenuDir::Down) => STEP_LINES * self.step,
-            MenuEvent::Move(MenuDir::Left) => -page,
-            MenuEvent::Move(MenuDir::Right) => page,
-            _ => return None,
-        };
-        self.velocity = 0.0;
-        Some(if self.scroll_by(by) {
-            MenuPulse::Move
-        } else {
-            MenuPulse::Boundary
-        })
+        if ev == MenuEvent::Back {
+            fx.pop();
+            return None;
+        }
+        self.flick.menu(ev)
     }
 
-    /// A wheel step scrolls; every other press lands on the page and does nothing.
     fn pointer(&mut self, p: Pointer, _ctx: &mut Ctx, _fx: &mut Outbox) -> bool {
-        if let PointerKind::Scroll { up } = p.kind {
-            let by = STEP_LINES * self.step;
-            self.velocity = 0.0;
-            self.scroll_by(if up { -by } else { by });
-        }
+        self.flick.pointer(p);
         true
     }
 
-    /// A vertical drag moves the text with the finger; its fling coasts.
     fn pan(&mut self, p: Pointer) -> bool {
-        match p.kind {
-            PointerKind::PanStart { horizontal } => {
-                self.velocity = 0.0;
-                !horizontal
-            }
-            PointerKind::Pan { dy, .. } => {
-                self.scroll_by(-dy);
-                true
-            }
-            PointerKind::Fling { vy, .. } => {
-                self.velocity = -vy;
-                true
-            }
-            _ => false,
-        }
+        self.flick.pan(p)
     }
 
     fn hints(&self, _ctx: &Ctx) -> Vec<Hint> {
@@ -315,45 +208,38 @@ impl ScreenView for LicensesScreen {
             self.layout(fonts, width, k);
             self.laid = Some(key);
         }
-        self.view_h = f64::from(rect.height());
-        self.step = Style::Body.line_height(k);
-        if self.velocity != 0.0 {
-            let moved = self.scroll_by(self.velocity * dt);
-            self.velocity *= (-FLING_DECAY * dt).exp();
-            if !moved || self.velocity.abs() < 20.0 {
-                self.velocity = 0.0;
-            }
-        }
-        self.scroll = self.scroll.min(self.max_scroll());
+        self.flick.view_h = f64::from(rect.height());
+        self.flick.step = Style::Body.line_height(k);
+        self.flick.tick(dt);
 
-        canvas.save();
-        canvas.clip_rect(rect, None, true);
-        let top = f64::from(rect.top) - self.scroll;
-        let first = self
-            .tops
-            .partition_point(|t| top + t < f64::from(rect.top) - 40.0 * k);
-        for (line, y) in self
-            .lines
-            .iter()
-            .zip(&self.tops)
-            .skip(first.saturating_sub(1))
-        {
-            let y = top + y;
-            if y > f64::from(rect.bottom) {
-                break;
+        // Soft edges where the text runs past the viewport, as every list has.
+        soft_scroll(canvas, rect, rect, self.flick.scrolled(), k, || {
+            let top = f64::from(rect.top) - self.flick.scroll;
+            let first = self
+                .tops
+                .partition_point(|t| top + t < f64::from(rect.top) - 40.0 * k);
+            for (line, y) in self
+                .lines
+                .iter()
+                .zip(&self.tops)
+                .skip(first.saturating_sub(1))
+            {
+                let y = top + y;
+                if y > f64::from(rect.bottom) {
+                    break;
+                }
+                let (size, w, alpha) = line.style.look();
+                let lh = line.style.line_height(k);
+                let baseline = y + lh * 0.72;
+                fonts.draw(canvas, &line.text, left, baseline, w, size * k, fg(alpha));
             }
-            let (size, w, alpha) = line.style.look();
-            let lh = line.style.line_height(k);
-            let baseline = y + lh * 0.72;
-            fonts.draw(canvas, &line.text, left, baseline, w, size * k, fg(alpha));
-        }
-        canvas.restore();
+        });
     }
 }
 
 /// Greedy word wrap. A word wider than `width` on its own is cut by characters, so no
 /// text is ever clipped. An empty line stays one empty line.
-fn wrap(text: &str, width: f32, measure: impl Fn(&str) -> f32) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: f32, measure: impl Fn(&str) -> f32) -> Vec<String> {
     if text.is_empty() || measure(text) <= width {
         return vec![text.to_string()];
     }

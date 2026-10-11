@@ -388,9 +388,7 @@ impl SettingsScreen {
             RowId::StreamControls => {
                 return match msg {
                     ListMsg::Activate => {
-                        if let Some(screen) = super::licenses::LicensesScreen::controls(ctx) {
-                            fx.push(Screen::Licenses(screen));
-                        }
+                        fx.push(Screen::Controls(super::controls::ControlsScreen::new(ctx)));
                         pulse
                     }
                     ListMsg::Adjust(_) => Some(MenuPulse::Boundary),

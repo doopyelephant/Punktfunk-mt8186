@@ -297,11 +297,19 @@ mod scene {
                 )
             },
         ];
+        // `PF_SCENE_PLATFORM`: apple (default), desktop, android or webos. Only the desktop
+        // has a touchscreen here, so its controls page shows the touch card.
+        let platform = match std::env::var("PF_SCENE_PLATFORM").ok().as_deref() {
+            Some("desktop") => Platform::Desktop,
+            Some("android") => Platform::Android,
+            Some("webos") => Platform::WebOS,
+            _ => Platform::Apple,
+        };
         let create = CreateOptions {
             device_name: "Mac".into(),
             gpu_cache_bytes: 64 << 20,
             fallback_ui: false,
-            tv: true,
+            tv: !matches!(platform, Platform::Desktop),
             tizen: false,
             system_keyboard: false,
             av1_ok: true,
@@ -314,7 +322,7 @@ mod scene {
             screen: None,
             safe_area: None,
         };
-        let (opts, entry, _store) = create.into_console(Platform::Apple);
+        let (opts, entry, _store) = create.into_console(platform);
         let mut console = Console::new(opts, entry, &handles)?;
 
         let sdl = sdl3::init()?;
@@ -328,15 +336,30 @@ mod scene {
         eprintln!("arrows move · Return OK · Escape Back · Y hold (card menu) · X · mouse works");
 
         // Opens on Controllers: Tab is the keyboard's R1, two tabs on from Hosts, then down
-        // into the row (`PF_SCENE_TABS=1` stops on Games). One key every 45 frames: focus
-        // moves on the last painted rects, and a tab slide drops a key that lands mid-flight.
-        // Popped from the end.
+        // into the row (`PF_SCENE_TABS=1` stops on Games). `PF_SCENE_SCREEN` set goes on to
+        // Settings, Esc from a row to its section strip, Left round to About, down to its
+        // second row, Stream controls. A key waits its frames: a slide drops one mid-flight.
         let tabs = std::env::var("PF_SCENE_TABS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(2);
-        let mut script = vec![Key::Down];
-        script.extend(std::iter::repeat_n(Key::Tab, tabs));
+        let mut script: Vec<(u32, Key)> = if std::env::var_os("PF_SCENE_SCREEN").is_some() {
+            let mut s = vec![
+                (30, Key::Return),
+                (30, Key::Down),
+                (30, Key::Down),
+                (30, Key::Left),
+                (30, Key::Escape),
+                (30, Key::Down),
+            ];
+            s.extend(std::iter::repeat_n((45, Key::Tab), 3));
+            s
+        } else {
+            let mut s = vec![(45, Key::Down)];
+            s.extend(std::iter::repeat_n((45, Key::Tab), tabs));
+            s
+        };
+        let mut wait = script.last().map_or(0, |(f, _)| *f);
         let mut frames: u32 = 0;
         let mut last = Instant::now();
         'frames: loop {
@@ -410,9 +433,14 @@ mod scene {
                     _ => {}
                 }
             }
-            if frames % 45 == 0 {
-                if let Some(key) = script.pop() {
+            if let Some((_, key)) = script.last().copied() {
+                if wait == 0 {
+                    eprintln!("script: {key:?} at frame {frames}");
                     console.key(key, false, false);
+                    script.pop();
+                    wait = script.last().map_or(0, |(f, _)| *f);
+                } else {
+                    wait -= 1;
                 }
             }
             draw.frame(|canvas, w, h| {
