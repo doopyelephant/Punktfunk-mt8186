@@ -264,7 +264,9 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   of its own, so neither the box's own Steam nor another seat sees it. A box without the daemon
   gives a seat no pad; the seat host says so. The daemon parks each relayed pad's fds in
   systemd's fd store, so a restart of the daemon keeps a seat's pads; `punktfunk-seats list`
-  shows what each seat holds.
+  shows what each seat holds. While the daemon runs, every other hidraw node is the box's: it
+  keeps its group and seat0's ACL but loses `other` access, which some distros grant on every
+  hidraw (Bazzite's `MODE="0666"`) and which would hand the box's pads to every seat's Steam.
 - **USB pads.** A USB/IP pad (the virtual Deck, the SC2, the Switch 2) stays the seat host's own
   usbip server. A seat that can't write vhci's `attach` runs the import handshake and sends the
   connected socket with an `Attach`; the daemon picks the vhci port, records it in `/run/punktfunk/pads/vhci/<port>` and

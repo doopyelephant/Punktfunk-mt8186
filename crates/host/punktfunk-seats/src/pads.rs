@@ -182,6 +182,28 @@ pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// At the supervisor's stop (`ungate`): without the socket, the box's own hidraw nodes open to
+/// everyone again, as the distro's rules have them.
+pub fn unbind() {
+    let _ = std::fs::remove_file(SOCKET_PATH);
+    refresh_hidraw();
+}
+
+/// Has udev apply its rules to every hidraw node again. `65-punktfunk-seats.rules` closes the
+/// box's own nodes to other users while the pads socket exists; a node made before that keeps
+/// what it got until an event reaches it.
+pub fn refresh_hidraw() {
+    let Ok(entries) = std::fs::read_dir("/sys/class/hidraw") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Err(error) = std::fs::write(entry.path().join("uevent"), "change") {
+            tracing::warn!(%error, node = %entry.file_name().to_string_lossy(),
+                "hidraw node not refreshed");
+        }
+    }
+}
+
 /// Serves `listener` until the process ends: one thread per pad, for the pad's life.
 pub fn serve(listener: UnixListener, service: Arc<SeatService<LinuxBackend>>) {
     for stream in listener.incoming() {
