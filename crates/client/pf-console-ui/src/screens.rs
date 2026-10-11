@@ -14,6 +14,7 @@ pub(crate) mod input_test;
 pub(crate) mod library;
 pub(crate) mod licenses;
 
+pub(crate) mod pad_menu;
 pub(crate) mod pair;
 pub(crate) mod palette;
 pub(crate) mod pin_hosts;
@@ -439,6 +440,8 @@ pub(crate) enum Screen {
     Palette(palette::PaletteScreen),
     /// Controller grants and tests. Raised by the Controllers tab's last card.
     Grants(grants::GrantsScreen),
+    /// A pad's test and rumble rows. Raised by OK or a hold on its Controllers card.
+    PadMenu(pad_menu::PadMenuScreen),
     /// A question the app asks through the console ([`prompt::Prompt`]).
     Prompt(prompt::PromptScreen),
     /// Open-source licences. Raised by the About section.
@@ -451,7 +454,7 @@ pub(crate) enum Screen {
     PresetName(preset::PresetName),
     /// A preset's settings over the global ones.
     PresetEdit(preset::PresetEdit),
-    /// The live controller test. Raised by the Controllers tab's Test card.
+    /// The live controller test. Raised from a pad's menu on the Controllers tab.
     InputTest(input_test::InputTestScreen),
     /// Who plays on a host. Raised by Switch profile, and by a connect that needs a pick.
     Profiles(profiles::ProfilesScreen),
@@ -539,6 +542,7 @@ impl Screen {
             Screen::Customize(s) => s,
             Screen::Palette(s) => s,
             Screen::Grants(s) => s,
+            Screen::PadMenu(s) => s,
             Screen::Prompt(s) => s,
             Screen::Licenses(s) => s,
             Screen::Search(s) => s,
@@ -566,6 +570,7 @@ impl Screen {
             Screen::Customize(s) => s,
             Screen::Palette(s) => s,
             Screen::Grants(s) => s,
+            Screen::PadMenu(s) => s,
             Screen::Prompt(s) => s,
             Screen::Licenses(s) => s,
             Screen::Search(s) => s,

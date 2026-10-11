@@ -1,6 +1,6 @@
 //! A live controller test: the driving pad drawn large, each button lit while held, the sticks
-//! tilting and the triggers filling, and the last thing that moved named. Raised by the
-//! Controllers tab's Test card.
+//! tilting and the triggers filling, and the last thing that moved named. Raised from a pad
+//! card's menu on the Controllers tab, whose cards draw the same pad at rest ([`draw_pad`]).
 //!
 //! While it is on top the shell asks the host for [`PadTestState`]s and the host stops
 //! turning the pad into menu moves ([`crate::model::ConsoleCmd::PadTest`]), so B shows as a
@@ -165,7 +165,7 @@ impl PadTestState {
 
 /// The drawing for a pad family. Auto is the host's default build, the Xbox 360; an unknown
 /// pad draws as the One.
-fn art_for(pref: Option<GamepadPref>) -> &'static PadArt {
+pub(crate) fn art_for(pref: Option<GamepadPref>) -> &'static PadArt {
     let kind = match pref {
         None => "xboxone",
         Some(GamepadPref::Auto) => "xbox360",
@@ -175,13 +175,13 @@ fn art_for(pref: Option<GamepadPref>) -> &'static PadArt {
 }
 
 /// A [`PadArt`] with its path data parsed, one entry per part.
-struct Drawing {
-    art: &'static PadArt,
+pub(crate) struct Drawing {
+    pub(crate) art: &'static PadArt,
     paths: Vec<Option<Path>>,
 }
 
 impl Drawing {
-    fn new(art: &'static PadArt) -> Drawing {
+    pub(crate) fn new(art: &'static PadArt) -> Drawing {
         let paths = (art.parts.iter())
             .map(|part| match part {
                 Part::Body(d)
@@ -202,11 +202,12 @@ impl Drawing {
 const CAP: f32 = 0.72;
 const TRAVEL: f32 = 0.42;
 
-/// `drawing` at `scale` px per millimetre, top-left at `(x, y)`, lit from `state`. Every fill
-/// is the foreground over an opaque card face, so a bumper hides the trigger behind it. The
-/// web console's `PadDiagram.tsx` draws the same parts with the same tones.
+/// `drawing` at `scale` px per millimetre, top-left at `(x, y)`, lit from `state` (a default
+/// state is a pad at rest). Every fill is the foreground over an opaque card face, so a bumper
+/// hides the trigger behind it. The web console's `PadDiagram.tsx` draws the same parts with
+/// the same tones.
 #[allow(clippy::too_many_arguments)]
-fn draw_pad(
+pub(crate) fn draw_pad(
     canvas: &Canvas,
     fonts: &Fonts,
     drawing: &Drawing,
