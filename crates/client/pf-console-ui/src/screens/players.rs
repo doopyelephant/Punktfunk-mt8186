@@ -345,10 +345,9 @@ fn card(
         r,
         CARD_CORNER as f32,
         None,
-        PanelStroke::Gradient,
+        PanelStroke::Edge,
         k as f32,
     );
-    crate::theme::panel_highlight(canvas, r, CARD_CORNER as f32, k as f32);
     let pad = 20.0 * k;
     let (l, t0) = (f64::from(r.left) + pad, f64::from(r.top) + pad);
     let max_w = f64::from(r.width()) - 2.0 * pad;

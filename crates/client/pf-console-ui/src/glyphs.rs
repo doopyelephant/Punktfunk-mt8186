@@ -275,8 +275,6 @@ pub fn hint_bar(
         crate::theme::PanelStroke::Plain(0.12),
         k as f32,
     );
-    // One highlight for the whole pill: the ration counts rows, and this is chrome.
-    crate::theme::panel_highlight(canvas, rect, corner, k as f32);
 
     let cy = bottom - h / 2.0;
     let mut pen = x + pad;

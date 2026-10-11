@@ -915,7 +915,7 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
     let stroke = if h.saved {
         PanelStroke::Plain(0.08)
     } else {
-        PanelStroke::GradientDashed
+        PanelStroke::EdgeDashed
     };
     crate::theme::panel(canvas, rect, TILE_CORNER as f32, None, stroke, k as f32);
     let pad = 20.0 * k;
@@ -1054,7 +1054,7 @@ fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: Ac
         rect,
         TILE_CORNER as f32,
         None,
-        PanelStroke::GradientDashed,
+        PanelStroke::EdgeDashed,
         k as f32,
     );
     let pad = 20.0 * k;

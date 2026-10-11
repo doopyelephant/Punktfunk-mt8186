@@ -183,7 +183,6 @@ mod scene {
     use pf_client_core::menu_nav::{PadBattery, PadInfo};
     use pf_client_core::trust::Settings;
     use pf_console_ui::bridge::{self, CreateOptions};
-    use pf_console_ui::theme::{set_material, Material};
     use pf_console_ui::{Console, ConsoleHandles, HostRow, Key, OtherDevice, Platform, Viewport};
     use punktfunk_core::config::GamepadPref;
     use sdl3::event::{Event, WindowEvent};
@@ -327,17 +326,6 @@ mod scene {
         let mut draw = Draw::new(builder.build()?)?;
         let mut pump = sdl.event_pump()?;
         eprintln!("arrows move · Return OK · Escape Back · Y hold (card menu) · X · mouse works");
-        eprintln!(
-            "M cycles the panel material: {}",
-            Material::ALL.map(Material::name).join(" → ")
-        );
-        // `PF_SCENE_MATERIAL=<0..6>` opens on that material, for a capture per material.
-        let mut material = std::env::var("PF_SCENE_MATERIAL")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|i| *i < Material::ALL.len())
-            .unwrap_or(0);
-        set_material(Material::ALL[material]);
 
         // Opens on Controllers: Tab is the keyboard's R1, two tabs on from Hosts, then down
         // into the row (`PF_SCENE_TABS=1` stops on Games). One key every 45 frames: focus
@@ -371,15 +359,6 @@ mod scene {
                         win_event: WindowEvent::PixelSizeChanged(..) | WindowEvent::Resized(..),
                         ..
                     } => draw.resized()?,
-                    Event::KeyDown {
-                        keycode: Some(Keycode::M),
-                        repeat: false,
-                        ..
-                    } => {
-                        material = (material + 1) % Material::ALL.len();
-                        set_material(Material::ALL[material]);
-                        eprintln!("material: {}", Material::ALL[material].name());
-                    }
                     Event::KeyDown {
                         keycode: Some(code),
                         keymod,
