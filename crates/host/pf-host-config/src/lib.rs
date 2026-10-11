@@ -307,6 +307,9 @@ pub struct HostConfig {
     /// `PUNKTFUNK_SEAT_LIBRARY_WRITABLE` — a seat updates and installs into the owner's Steam
     /// libraries. **Default ON**; off mounts them read-only. Handed on in [`seat_defaults`].
     pub seat_library_writable: bool,
+    /// `PUNKTFUNK_DUALSENSE_USBIP` — a DualSense is a USB/IP device with a real sound card
+    /// instead of a uhid pad. **Default OFF**. Handed to every seat in [`seat_defaults`].
+    pub dualsense_usbip: bool,
     /// `PUNKTFUNK_GAMESCOPE_HDR` — allow HDR on gamescope. The host probes the
     /// punktfunk build (`packaging/gamescope`) and stays SDR if missing; this only
     /// decides whether HDR is *attempted*. **Default ON**, matching `PUNKTFUNK_10BIT`.
@@ -424,6 +427,7 @@ impl HostConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
             seat_library_writable: row_bool("PUNKTFUNK_SEAT_LIBRARY_WRITABLE"),
+            dualsense_usbip: row_bool("PUNKTFUNK_DUALSENSE_USBIP"),
             gamescope_hdr: row_bool("PUNKTFUNK_GAMESCOPE_HDR"),
             gamescope_sdr_nits: val("PUNKTFUNK_GAMESCOPE_SDR_NITS")
                 .and_then(|s| s.trim().parse::<u32>().ok())

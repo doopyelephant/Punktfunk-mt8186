@@ -4,7 +4,8 @@
 //! and after every settings write. A seat that follows the contract reads it from its trust dir,
 //! re-reading when the file changes, so a default reaches a running seat's next session. The
 //! Linux supervisor reads `library_writable` from the box's copy at each seat start. The box's
-//! upkeep reads the other two (kept warm, idle stop) from its own config.
+//! upkeep reads the other two (kept warm, idle stop) from its own config. `dualsense_usbip` is
+//! the box's own switch handed on, not a Seats row: a seat has no settings of its own.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,8 @@ pub struct SeatDefaults {
     pub max_mode: Option<String>,
     /// A seat updates and installs into the owner's Steam libraries; off mounts them read-only.
     pub library_writable: bool,
+    /// A seat's DualSense is a USB/IP device with a real sound card, as the box's is.
+    pub dualsense_usbip: bool,
 }
 
 impl SeatDefaults {
@@ -29,6 +32,7 @@ impl SeatDefaults {
             end_on_game_exit: config.seat_end_on_game_exit,
             max_mode: config.seat_max_mode.clone(),
             library_writable: config.seat_library_writable,
+            dualsense_usbip: config.dualsense_usbip,
         }
     }
 
@@ -37,6 +41,7 @@ impl SeatDefaults {
             "end_on_game_exit": self.end_on_game_exit,
             "max_mode": self.max_mode,
             "library_writable": self.library_writable,
+            "dualsense_usbip": self.dualsense_usbip,
         })
     }
 
@@ -50,6 +55,7 @@ impl SeatDefaults {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
             library_writable: v["library_writable"].as_bool().unwrap_or(true),
+            dualsense_usbip: v["dualsense_usbip"].as_bool().unwrap_or(false),
         }
     }
 }
@@ -102,6 +108,7 @@ mod tests {
             end_on_game_exit: false,
             max_mode: Some("2560x1440@120".into()),
             library_writable: false,
+            dualsense_usbip: true,
         };
         assert_eq!(SeatDefaults::from_json(&d.to_json()), d);
         assert_eq!(
@@ -110,6 +117,7 @@ mod tests {
                 end_on_game_exit: true,
                 max_mode: None,
                 library_writable: true,
+                dualsense_usbip: false,
             }
         );
     }

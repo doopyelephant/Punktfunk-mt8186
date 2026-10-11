@@ -119,7 +119,9 @@ session by design, and display activation fails while its session is inactive.
   `max_mode` (the largest mode a seat grants a device without a cap of its own). The seat re-reads
   it when it changes, so a change reaches the seat's next session. The box itself applies
   **Seats kept warm** and **Stop idle seats**. On Linux the file also carries `library_writable`,
-  which the daemon reads from the box's copy when a seat starts (see the owner's libraries below).
+  which the daemon reads from the box's copy when a seat starts (see the owner's libraries below),
+  and `dualsense_usbip`, the box's own **DualSense over USB/IP** switch: a seat's DualSense is a
+  USB/IP pad with a sound card exactly when the box's is.
 - **The box's trust, its own key.** The seat never writes the pairing store or profiles. A grant
   changed in the box console applies to the seat's next check. It mints and keeps its own identity
   in `PUNKTFUNK_CONFIG_DIR`, never the box's. The supervisor records its certificate's SHA-256 in

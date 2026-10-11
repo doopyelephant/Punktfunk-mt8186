@@ -832,6 +832,7 @@ mod tests {
                 end_on_game_exit: true,
                 max_mode: None,
                 library_writable,
+                dualsense_usbip: false,
             };
             std::fs::write(&path, defaults.to_json().to_string()).unwrap();
             assert_eq!(writable(temp.path()), library_writable);
