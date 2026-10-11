@@ -103,6 +103,17 @@ pub(super) fn native_port(host_env: &str) -> u16 {
         .unwrap_or(9777)
 }
 
+/// The UDP rule's ports: GameStream 47998-48010, native, each seat's native port (the box
+/// redirects a client to its seat there), mDNS 5353.
+fn udp_ports(host_env: &str) -> String {
+    let seats = pf_seats::model::DEFAULT_NATIVE_PORTS.map(|p| p.to_string());
+    format!(
+        "47998-48010,{},{},5353",
+        native_port(host_env),
+        seats.join(",")
+    )
+}
+
 /// Inbound streaming + mgmt rules. Best-effort; never fails the install. Scoped by
 /// [`firewall_profile_arg`] and this executable ([`fw_add_rule_args`]). The mgmt port is
 /// deliberate: `serve` binds mgmt/library to all interfaces; off-loopback
@@ -121,11 +132,11 @@ pub(super) fn add_firewall_rules(allow_public: bool) {
             None
         }
     };
-    // Mgmt/library (LAN read-only, paired-cert) and native on the ports host.env gives `serve`;
-    // `--mgmt-bind` lands there first. GameStream 47984/47989/48010, 47998-48010; mDNS 5353.
+    // Mgmt/library (LAN read-only, paired-cert) on the port host.env gives `serve`; `--mgmt-bind`
+    // lands there first. GameStream 47984/47989/48010.
     let host_env = std::fs::read_to_string(host_env_path()).unwrap_or_default();
     let tcp = format!("47984,47989,48010,{}", mgmt_port(&host_env));
-    let udp = format!("47998-48010,{},5353", native_port(&host_env));
+    let udp = udp_ports(&host_env);
     let rules = [("TCP", "TCP", tcp.as_str()), ("UDP", "UDP", udp.as_str())];
     for (suffix, proto, ports) in rules {
         let name = format!("Punktfunk {suffix}");
@@ -268,6 +279,16 @@ mod firewall_tests {
         assert!(args.contains(&"action=allow".to_string()));
         assert!(args.contains(&"profile=domain,private".to_string()));
         assert_eq!(&args[..4], &["advfirewall", "firewall", "add", "rule"]);
+    }
+
+    /// A client redirected to its seat lands on the seat's own port.
+    #[test]
+    fn the_udp_rule_opens_every_seat_port() {
+        assert_eq!(udp_ports(""), "47998-48010,9777,9779,9780,9781,9782,5353");
+        assert_eq!(
+            udp_ports("PUNKTFUNK_NATIVE_PORT=9800\n"),
+            "47998-48010,9800,9779,9780,9781,9782,5353"
+        );
     }
 
     /// Missing executable → port-only rule, not no rule. A looser rule still streams; none is black.
