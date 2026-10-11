@@ -5,7 +5,7 @@
 //! is the binary's to map, by the port the supervisor recorded.
 
 use super::accounts;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// What the supervisor stamps on a seat's pad: `punktfunk-seat:<account>/<index>`.
 const PHYS_PREFIX: &str = "punktfunk-seat:";
@@ -40,17 +40,20 @@ pub fn lines(account: &str, uid: u32) -> String {
     format!("PF_SEAT_USER={account}\nPF_SEAT_UID={uid}\nPF_SEAT=seat-punktfunk-{account}\n")
 }
 
-/// The account named by the `phys` of `dev` or of its parent: an `event*` node's is the input
-/// device's attribute, a `hidraw*` node's is `HID_PHYS` in the HID device's `uevent`.
+/// The account stamped on `dev` or its nearest stamped ancestor: an input device's `phys`, or a
+/// HID device's `HID_PHYS` in its `uevent`. A uhid pad's driver can leave its own input devices'
+/// `phys` empty, so the stamp sits on the HID device up to three levels above the node.
 fn seat_of_sysfs(dev: &Path) -> Option<String> {
-    [dev.to_path_buf(), dev.join("device")]
-        .iter()
-        .find_map(|d: &PathBuf| {
-            let phys = std::fs::read_to_string(d.join("phys"))
-                .ok()
-                .or_else(|| hid_phys(&std::fs::read_to_string(d.join("uevent")).ok()?))?;
-            account_of_phys(phys.trim())
-        })
+    dev.ancestors().take(5).find_map(|d| {
+        let phys = std::fs::read_to_string(d.join("phys")).ok();
+        let hid = std::fs::read_to_string(d.join("uevent"))
+            .ok()
+            .and_then(|uevent| hid_phys(&uevent));
+        [phys, hid]
+            .into_iter()
+            .flatten()
+            .find_map(|stamp| account_of_phys(stamp.trim()))
+    })
 }
 
 /// `HID_PHYS=` out of a HID device's `uevent`.
@@ -103,6 +106,29 @@ mod tests {
             Some("pf-seat-1".into())
         );
         assert_eq!(hid_phys("DRIVER=x\n"), None);
+    }
+
+    /// hid-playstation's input devices leave `phys` empty: the node's stamp is the HID device's,
+    /// three levels up. A node with no stamp anywhere above is nobody's.
+    #[test]
+    fn a_uhid_pads_input_node_finds_the_hid_devices_stamp() {
+        let root = std::env::temp_dir().join(format!("pf-fence-{}", std::process::id()));
+        let hid = root.join("uhid/0003:054C:0CE6.0014");
+        let input = hid.join("input/input77");
+        std::fs::create_dir_all(input.join("event5")).unwrap();
+        std::fs::write(input.join("phys"), "\n").unwrap();
+        std::fs::write(
+            hid.join("uevent"),
+            "HID_PHYS=punktfunk-seat:pf-seat-1/dualsense/0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            seat_of_sysfs(&input.join("event5")),
+            Some("pf-seat-1".into())
+        );
+        std::fs::write(hid.join("uevent"), "HID_PHYS=usb-0000:00:14.0-1/input0\n").unwrap();
+        assert_eq!(seat_of_sysfs(&input.join("event5")), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
