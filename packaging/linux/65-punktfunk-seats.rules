@@ -10,12 +10,11 @@ ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*|js*", ATTRS{phys}=="punktfunk
 ACTION=="add", SUBSYSTEM=="hidraw", DEVPATH=="/devices/virtual/misc/uhid/*", \
     IMPORT{program}="/usr/libexec/punktfunk/punktfunk-seats fence"
 # Everything under a vhci port: the helper maps the port to the seat that attached it. While
-# the supervisor runs, a vhci device starts unauthorized; the helper allows a seat's only for
-# HID, audio, CDC-ACM and vendor interfaces, and anyone else's always.
+# the supervisor runs, a vhci interface starts unauthorized and the helper authorizes and probes
+# it: a seat's only on a device the host emulates and only HID, audio, CDC-ACM or vendor
+# interfaces, anyone else's always.
 ACTION=="add", DEVPATH=="/devices/platform/vhci_hcd*/usb*/*", \
     IMPORT{program}="/usr/libexec/punktfunk/punktfunk-seats fence"
-ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{PF_VHCI_USB}=="allow", \
-    ATTR{authorized}="1"
 ACTION=="add", SUBSYSTEM=="input|hidraw|usb|sound|tty", ENV{PF_SEAT_USER}=="?*", \
     OWNER:="$env{PF_SEAT_USER}", GROUP:="root", MODE:="0600", TAG-="uaccess", \
     ENV{ID_SEAT}="$env{PF_SEAT}", ENV{ID_MM_DEVICE_IGNORE}="1"

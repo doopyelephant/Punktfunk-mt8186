@@ -21,6 +21,9 @@ TimeoutStartSec=30
 # The box host's config directory. The ledger lands in seats/ below it.
 Environment=PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk
 ExecStart=/usr/libexec/punktfunk/punktfunk-seats serve --socket /run/punktfunk/seats.sock
+# No seat attaches while the supervisor is down, so its stop opens the vhci gate once no seat
+# holds a port.
+ExecStopPost=-/usr/libexec/punktfunk/punktfunk-seats ungate
 Restart=on-failure
 RestartSec=2
 # What useradd, systemctl, setfacl and chown need, and nothing more.
@@ -29,7 +32,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectKernelTunables=yes
 # The pad broker attaches a seat's USB devices and gates the vhci hubs.
-ReadWritePaths=-/sys/devices/platform/vhci_hcd.0
+ReadWritePaths=-/sys/devices/platform/vhci_hcd.0 -/sys/devices/platform/vhci_hcd
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK

@@ -266,8 +266,10 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   usbip server. The seat runs the import handshake and sends the connected socket with an
   `Attach`; the daemon picks the vhci port, records it in `/run/punktfunk/pads/vhci/<port>` and
   writes `attach`, four ports per seat. The fence maps every node under that port to the seat.
-  While the daemon runs, a new vhci device starts unauthorized: a seat's configures only when
-  every interface is HID, audio, CDC-ACM or vendor-specific, anyone else's always.
+  While the daemon runs, a new vhci interface starts unauthorized and the fence authorizes it.
+  A seat's binds only when its device is one the host emulates (`usbip::EMULATED` in
+  `pf-inject`) and the interface, as the kernel parsed it, is HID, audio, CDC-ACM or
+  vendor-specific; anyone else's always.
 - **Game Mode.** The seat host keeps the seat's mode, `desktop` or `game`, in `seat-session` in
   its config directory, and starts in the one it ran last. It owns
   `com.steampowered.SteamOSManager1` on the seat's session bus and serves `SessionManagement1`,
