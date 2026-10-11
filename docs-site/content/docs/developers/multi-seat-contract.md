@@ -210,8 +210,9 @@ powershell -File check-seat-audio.ps1
 ```
 
 [`check-seat-audio.ps1`](https://git.unom.io/unom/punktfunk/src/branch/main/packaging/windows/check-seat-audio.ps1)
-exits 1 when neither is present. A virtual cable is no substitute: the host never loopback-captures
-a cable, and `PUNKTFUNK_MIC_DEVICE` only pins the microphone.
+exits 1 when neither is present. A virtual cable is no substitute: the host never picks one for
+desktop audio, `PUNKTFUNK_MIC_DEVICE` only pins the microphone, and a cable pinned with
+`PUNKTFUNK_LOOPBACK_DEVICE` is shared by every seat.
 
 ## Linux seats
 

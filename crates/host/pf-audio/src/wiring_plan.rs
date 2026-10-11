@@ -9,6 +9,8 @@
 //! outranks the optional mic: the Steam Streaming Microphone render side is also the
 //! only silent client-only sink, so the mic may take it only while the loopback still
 //! gets a preferred pick ([`Wiring::mic_withheld`]). `PUNKTFUNK_MIC_DEVICE` still wins.
+//! `PUNKTFUNK_LOOPBACK_DEVICE` pins the loopback above every tier and the automatic mic
+//! yields it; a pin the mic override took, or one matching nothing, falls back to the ladder.
 //!
 //! Default loopback prefers a silent working sink (Streaming Microphone, not Speakers);
 //! `host_audio` flips to real hardware. Speakers are a flagged last resort (silent
@@ -199,8 +201,7 @@ pub fn is_pad_render(id: &str, pad_renders: &[String]) -> bool {
     pad_renders.iter().any(|p| p == id)
 }
 
-/// Assign endpoints. `mic_want` (`PUNKTFUNK_MIC_DEVICE`, lowercased) beats the
-/// mic ladder. `host_audio` prefers real hardware; default prefers the silent sink.
+/// [`plan_with_formats`] with unknown mix formats, stereo, and no loopback pin.
 pub fn plan(
     renders: &[Endpoint],
     captures: &[Endpoint],
@@ -213,6 +214,7 @@ pub fn plan(
         renders,
         captures,
         mic_want,
+        None,
         host_audio,
         &no_formats,
         2,
@@ -221,7 +223,9 @@ pub fn plan(
     )
 }
 
-/// [`plan`] plus each render's engine mix format and the session channel count.
+/// Assign endpoints. `mic_want` (`PUNKTFUNK_MIC_DEVICE`) and `loopback_want`
+/// (`PUNKTFUNK_LOOPBACK_DEVICE`) are lowercased name substrings that beat their
+/// ladders. `host_audio` prefers real hardware; default prefers the silent sink.
 ///
 /// A silent sink must earn preference: if [`MixFormat::narrowing`] fires it
 /// drops below real hardware. Still taken when nothing better exists (narrow
@@ -232,6 +236,7 @@ pub fn plan_with_formats(
     renders: &[Endpoint],
     captures: &[Endpoint],
     mic_want: Option<&str>,
+    loopback_want: Option<&str>,
     host_audio: bool,
     format_of: FormatProbe,
     want_channels: u8,
@@ -261,15 +266,24 @@ pub fn plan_with_formats(
     };
     let minted_mic = find_by_id(&minted.mic_render);
     let minted_sink = find_by_id(&minted.speakers_render);
+    let loopback_pin = loopback_want.and_then(find_render);
+    let unpinned = |id: &str| loopback_pin.as_ref().is_none_or(|(_, pid)| pid != id);
+    let find_mic = |needle: &str| {
+        renders
+            .iter()
+            .find(|(n, id)| unpinned(id) && n.to_lowercase().contains(needle))
+            .cloned()
+    };
 
     // Mic first (narrower: must be a virtual cable). Minted mic outranks every
     // name candidate and never costs the loopback (minted sink is its pair).
-    // Operator override still beats it.
+    // Operator override still beats it; only an override may take the loopback pin.
     let mic_render = match mic_want {
         Some(w) => find_render(w),
         None => minted_mic
             .clone()
-            .or_else(|| MIC_CANDIDATES.iter().find_map(|c| find_render(c))),
+            .filter(|(_, id)| unpinned(id))
+            .or_else(|| MIC_CANDIDATES.iter().find_map(|c| find_mic(c))),
     };
     // Game audio outranks the optional mic: Streaming Microphone render is also
     // the only silent client-only sink. Keep it only while loopback still gets a
@@ -277,11 +291,12 @@ pub fn plan_with_formats(
     let mut mic_withheld = false;
     let mic_render = match mic_render {
         Some((name, id)) if mic_want.is_none() && silent_sink(&name.to_lowercase()) => {
-            let loopback_survives = renders.iter().any(|(n, rid)| {
-                let ln = n.to_lowercase();
-                *rid != id
-                    && (silent_sink(&ln) || (!excluded_from_loopback(&ln) && !virtualish(&ln)))
-            });
+            let loopback_survives = loopback_pin.is_some()
+                || renders.iter().any(|(n, rid)| {
+                    let ln = n.to_lowercase();
+                    *rid != id
+                        && (silent_sink(&ln) || (!excluded_from_loopback(&ln) && !virtualish(&ln)))
+                });
             if loopback_survives {
                 Some((name, id))
             } else {
@@ -290,7 +305,7 @@ pub fn plan_with_formats(
                 MIC_CANDIDATES
                     .iter()
                     .filter(|c| !silent_sink(c))
-                    .find_map(|c| find_render(c))
+                    .find_map(|c| find_mic(c))
             }
         }
         other => other,
@@ -357,21 +372,24 @@ pub fn plan_with_formats(
             .filter(|(_, id)| not_mic(id))
             .filter(|ep| narrowing_of(ep).is_some())
     };
-    // Narrowing silence sits below hardware in BOTH modes. The minted sink
-    // still heads its tier — that is the endpoint whose purpose is this role.
-    let preferred = if host_audio {
-        real_hw()
-            .or_else(minted_intact)
-            .or_else(silent_intact)
-            .or_else(minted_narrow)
-            .or_else(silent_narrow)
-    } else {
-        minted_intact()
-            .or_else(silent_intact)
-            .or_else(real_hw)
-            .or_else(minted_narrow)
-            .or_else(silent_narrow)
-    };
+    // An operator pin heads both modes. Below it, narrowing silence sits below
+    // hardware, and the minted sink heads its tier: its purpose is this role.
+    let loopback_pin = loopback_pin.filter(|(_, id)| not_mic(id));
+    let preferred = loopback_pin.as_ref().or_else(|| {
+        if host_audio {
+            real_hw()
+                .or_else(minted_intact)
+                .or_else(silent_intact)
+                .or_else(minted_narrow)
+                .or_else(silent_narrow)
+        } else {
+            minted_intact()
+                .or_else(silent_intact)
+                .or_else(real_hw)
+                .or_else(minted_narrow)
+                .or_else(silent_narrow)
+        }
+    });
     let (loopback_render, loopback_last_resort) = match preferred {
         Some(ep) => (Some(ep.clone()), false),
         None => match last_resort() {
@@ -817,6 +835,7 @@ mod tests {
             &renders,
             &captures,
             None,
+            None,
             false,
             &p,
             2,
@@ -853,6 +872,7 @@ mod tests {
             &renders,
             &[],
             None,
+            None,
             false,
             &p,
             2,
@@ -876,6 +896,7 @@ mod tests {
             &renders,
             &[],
             None,
+            None,
             false,
             &p,
             2,
@@ -898,6 +919,7 @@ mod tests {
         let w = plan_with_formats(
             &renders,
             &[],
+            None,
             None,
             false,
             &p,
@@ -934,6 +956,7 @@ mod tests {
                 &renders,
                 &captures,
                 None,
+                None,
                 host_audio,
                 &no_formats,
                 2,
@@ -955,7 +978,17 @@ mod tests {
             ("steam streaming microphone", fmt(24_000, 1)),
             ("realtek", fmt(48_000, 2)),
         ]);
-        let w = plan_with_formats(&renders, &[], None, true, &p, 2, &[], &MintedIds::default());
+        let w = plan_with_formats(
+            &renders,
+            &[],
+            None,
+            None,
+            true,
+            &p,
+            2,
+            &[],
+            &MintedIds::default(),
+        );
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
     }
 
@@ -1304,8 +1337,62 @@ mod tests {
             ..Default::default()
         };
         let p = probe(vec![("steam streaming", fmt(16_000, 1))]);
-        let w = plan_with_formats(&renders, &[], None, false, &p, 2, &[], &minted);
+        let w = plan_with_formats(&renders, &[], None, None, false, &p, 2, &[], &minted);
         assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
+    }
+
+    /// The pin outranks every tier and the automatic mic yields it. A mic override wins a
+    /// collision; a pin matching nothing plans as if unset.
+    #[test]
+    fn loopback_pin_wins_unless_the_mic_override_took_it() {
+        let (renders, captures, minted) = minted_zoo();
+        let w = plan_with_formats(
+            &renders,
+            &captures,
+            None,
+            Some("realtek"),
+            false,
+            &no_formats,
+            2,
+            &[],
+            &minted,
+        );
+        assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
+        assert_eq!(w.mic_render.unwrap().1, "id-minted-mic-r");
+
+        let renders = [
+            ep("Speakers (Realtek HD Audio)"),
+            ep("Speakers (Steam Streaming Microphone)"),
+        ];
+        let captures = [ep("Microphone (Steam Streaming Microphone)")];
+        let run = |mic: Option<&str>, pin: Option<&str>| {
+            let none = MintedIds::default();
+            plan_with_formats(
+                &renders,
+                &captures,
+                mic,
+                pin,
+                false,
+                &no_formats,
+                2,
+                &[],
+                &none,
+            )
+        };
+        let ssm = "steam streaming microphone";
+        let w = run(None, Some(ssm));
+        assert_eq!(
+            w.loopback_render.unwrap().0,
+            "Speakers (Steam Streaming Microphone)"
+        );
+        assert!(w.mic_render.is_none(), "the automatic mic took the pin");
+        let w = run(Some(ssm), Some(ssm));
+        assert_eq!(
+            w.mic_render.unwrap().0,
+            "Speakers (Steam Streaming Microphone)"
+        );
+        assert_eq!(w.loopback_render.unwrap().0, "Speakers (Realtek HD Audio)");
+        assert_eq!(run(None, Some("no such device")), run(None, None));
     }
 
     #[test]
