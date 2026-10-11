@@ -44,7 +44,7 @@ mod linux {
         \x20 doctor                      what a seat needs and what is missing\n\
         \x20 seating                     whether seats are on\n\
         \x20 fence                       udev's IMPORT{program}: whose a seat's pad is\n\
-        \x20 ungate                      let every vhci interface bind (ExecStopPost)\n";
+        \x20 ungate                      open the vhci gate and the box's hidraw (ExecStopPost)\n";
 
     pub fn main() -> ExitCode {
         match run(std::env::args().skip(1).collect()) {
@@ -89,6 +89,7 @@ mod linux {
             "ungate" => {
                 pf_seats::logging::to_stderr();
                 crate::vhci::ungate();
+                pads::unbind();
                 return Ok(());
             }
             "list" => Command::List,
@@ -197,6 +198,7 @@ mod linux {
         let pads_path = std::path::Path::new(pads::SOCKET_PATH);
         let pads_listener =
             pads::bind(pads_path).map_err(|e| format!("bind {}: {e}", pads_path.display()))?;
+        pads::refresh_hidraw();
         let for_pads = Arc::clone(&service);
         std::thread::Builder::new()
             .name("seat-pads".into())
