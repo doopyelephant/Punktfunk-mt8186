@@ -11,7 +11,7 @@ use crate::model::{ConsoleCmd, LicenseSection};
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, ScreenView};
 use crate::theme::{edge, fg, Fonts, W};
-use crate::widgets::{soft_scroll, Flick};
+use crate::widgets::{bleed_view, soft_scroll, Flick};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
 
@@ -212,12 +212,14 @@ impl ScreenView for LicensesScreen {
         self.flick.step = Style::Body.line_height(k);
         self.flick.tick(dt);
 
-        // Soft edges where the text runs past the viewport, as every list has.
-        soft_scroll(canvas, rect, rect, self.flick.scrolled(), k, || {
+        // With the trays on, the text runs on under the title and the legend and they blur
+        // it, as a list does; without them it fades at its own edges.
+        let view = bleed_view(canvas, rect);
+        let paint = || {
             let top = f64::from(rect.top) - self.flick.scroll;
             let first = self
                 .tops
-                .partition_point(|t| top + t < f64::from(rect.top) - 40.0 * k);
+                .partition_point(|t| top + t < f64::from(view.top) - 40.0 * k);
             for (line, y) in self
                 .lines
                 .iter()
@@ -225,7 +227,7 @@ impl ScreenView for LicensesScreen {
                 .skip(first.saturating_sub(1))
             {
                 let y = top + y;
-                if y > f64::from(rect.bottom) {
+                if y > f64::from(view.bottom) {
                     break;
                 }
                 let (size, w, alpha) = line.style.look();
@@ -233,7 +235,12 @@ impl ScreenView for LicensesScreen {
                 let baseline = y + lh * 0.72;
                 fonts.draw(canvas, &line.text, left, baseline, w, size * k, fg(alpha));
             }
-        });
+        };
+        if crate::blur::active() {
+            paint();
+        } else {
+            soft_scroll(canvas, view, view, self.flick.scrolled(), k, paint);
+        }
     }
 }
 

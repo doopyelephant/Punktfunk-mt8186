@@ -453,6 +453,22 @@ const PLATE_AIR: f64 = 12.0;
 /// the scroller fades and blurs toward it.
 const SOFT_EDGE: f64 = 40.0;
 
+/// The viewport a page scrolls in: out to the layer's top and bottom while the trays can
+/// blur what runs past `rect`, so the page fades under the chrome as a list does, else
+/// `rect` itself.
+pub fn bleed_view(canvas: &Canvas, rect: Rect) -> Rect {
+    if !crate::blur::active() {
+        return rect;
+    }
+    let clip = canvas.local_clip_bounds().unwrap_or(rect);
+    Rect::from_ltrb(
+        rect.left,
+        clip.top.min(rect.top),
+        rect.right,
+        clip.bottom.max(rect.bottom),
+    )
+}
+
 /// Paints a scroller through `paint` inside `view`, with soft edges where content hides
 /// past `rect`: `scrolled` is its offset and reach. A scroller at rest on its top keeps a
 /// crisp top; pinned text past it sits on the field, never on a row.

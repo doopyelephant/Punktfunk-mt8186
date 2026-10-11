@@ -343,19 +343,28 @@ mod scene {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(2);
+        // `PF_SCENE_SCROLL=n` then presses Down n more times, for a look at a scrolled page.
+        let steps = std::env::var("PF_SCENE_SCROLL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
         let mut script: Vec<(u32, Key)> = if std::env::var_os("PF_SCENE_SCREEN").is_some() {
-            let mut s = vec![
+            let mut s = Vec::new();
+            s.extend(std::iter::repeat_n((20, Key::Down), steps));
+            s.extend([
                 (30, Key::Return),
                 (30, Key::Down),
                 (30, Key::Down),
                 (30, Key::Left),
                 (30, Key::Escape),
                 (30, Key::Down),
-            ];
+            ]);
             s.extend(std::iter::repeat_n((45, Key::Tab), 3));
             s
         } else {
-            let mut s = vec![(45, Key::Down)];
+            let mut s = Vec::new();
+            s.extend(std::iter::repeat_n((20, Key::Down), steps));
+            s.push((45, Key::Down));
             s.extend(std::iter::repeat_n((45, Key::Tab), tabs));
             s
         };

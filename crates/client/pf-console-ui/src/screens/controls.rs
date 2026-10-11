@@ -9,7 +9,7 @@ use crate::pointer::Pointer;
 use crate::screens::licenses::wrap;
 use crate::screens::{Ctx, Outbox, ScreenView};
 use crate::theme::{edge, fg, panel, stroke, Fonts, PanelStroke, HAIRLINE, W};
-use crate::widgets::{soft_scroll, Flick};
+use crate::widgets::{bleed_view, soft_scroll, Flick};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use pf_client_core::shortcuts::{self, Client, Kind};
 use skia_safe::{Canvas, Rect};
@@ -285,8 +285,10 @@ impl ScreenView for ControlsScreen {
         self.flick.view_h = f64::from(rect.height());
         self.flick.tick(dt);
 
-        // Soft edges where the page runs past the viewport, as every list has.
-        soft_scroll(canvas, rect, rect, self.flick.scrolled(), k, || {
+        // With the trays on, the page runs on under the title and the legend and they blur
+        // it, as a list does; without them it fades at its own edges.
+        let view = bleed_view(canvas, rect);
+        let paint = || {
             let top = f64::from(rect.top) + 6.0 * k - self.flick.scroll;
             fonts.draw(
                 canvas,
@@ -299,12 +301,17 @@ impl ScreenView for ControlsScreen {
             );
             for card in &self.cards {
                 let ct = top + card.top;
-                if ct < f64::from(rect.bottom) && ct + card.h > f64::from(rect.top) {
+                if ct < f64::from(view.bottom) && ct + card.h > f64::from(view.top) {
                     let rect = Rect::from_xywh(x0 as f32, ct as f32, w as f32, card.h as f32);
                     self.draw_card(canvas, fonts, card, rect, k);
                 }
             }
-        });
+        };
+        if crate::blur::active() {
+            paint();
+        } else {
+            soft_scroll(canvas, view, view, self.flick.scrolled(), k, paint);
+        }
     }
 }
 
