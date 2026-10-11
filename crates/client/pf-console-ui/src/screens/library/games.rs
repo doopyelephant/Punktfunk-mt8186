@@ -11,7 +11,7 @@ use super::super::collections::{paint_tile, TILE_CORNER, TILE_H, TILE_W};
 use super::bar::{pill_id, Pill};
 use super::card::{self, Card, DESK_H, DESK_W};
 use super::{store_sort, store_view, LibraryScreen};
-use crate::el::{El, Id};
+use crate::el::{Axis, El, Id};
 use crate::glyphs::{Hint, HintKey};
 use crate::grid::GRID_GAP;
 use crate::library::{LibraryGame, LibraryPhase, LibraryView, Section};
@@ -55,6 +55,11 @@ pub(super) enum Zone {
 
 pub(super) fn chip_id(i: usize) -> Id {
     Id::new("games-chip", i)
+}
+
+/// The chips line's own sideways scroll.
+pub(super) fn chips_id() -> Id {
+    Id::new("games-chips", 0)
 }
 
 pub(super) fn band_item_id(band: usize, item: usize) -> Id {
@@ -663,7 +668,8 @@ impl LibraryScreen {
         }
     }
 
-    /// The chips line, as a child of the screen's scroll.
+    /// The chips line, as a child of the screen's scroll: one row that scrolls sideways.
+    /// `draw_field` keeps the focused chip in view; a finger swipes it.
     pub(super) fn chips_el<'a>(
         &'a self,
         hosts: &'a [HostRow],
@@ -674,8 +680,7 @@ impl LibraryScreen {
     ) -> El<'a> {
         let names = chip_hosts(hosts).map(|h| (h.name.as_str(), Some(self.own(h))));
         let (mut x, top, h) = (0.0, TOP_AIR * k, CHIP_H * k);
-        let mut row = El::column().size(width as f32, Self::chips_h(k) as f32);
-        // One line, no scroll: past about six hosts the last chips run off the edge.
+        let mut row = El::column();
         for (i, (label, mine)) in names.chain([("Customize", None)]).enumerate() {
             let w = match mine {
                 Some(_) => {
@@ -701,7 +706,10 @@ impl LibraryScreen {
             );
             x += w + 10.0 * k;
         }
-        row
+        let line_h = Self::chips_h(k) as f32;
+        El::scroll(chips_id(), Axis::Horizontal)
+            .size(width as f32, line_h)
+            .child(row.size((x - 10.0 * k).max(width) as f32, line_h))
     }
 
     /// Band `b`, as a child of the screen's scroll: its heading, then its row at its own

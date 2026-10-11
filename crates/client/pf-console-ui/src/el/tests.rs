@@ -1,4 +1,5 @@
 use super::*;
+use crate::pointer::{Pointer, PointerKind};
 use std::cell::RefCell;
 
 fn canvas() -> skia_safe::Surface {
@@ -471,4 +472,115 @@ fn up_from_the_top_row_leaves_focus_put() {
     assert_eq!(tree.focus(), Some(Id::new("card", 1)));
     shelf(&mut tree, &mut surface);
     assert_eq!(tree.move_focus(Up), None, "still, after a paint");
+}
+
+/// A row of 20 cells at a 100 px pitch, for the sideways cases.
+fn wide_row<'a>(id: Id, drawn: &'a RefCell<Vec<usize>>) -> El<'a> {
+    El::scroll(id, Axis::Horizontal)
+        .gap(10.0)
+        .children((0..20).map(move |i| {
+            El::paint(move |_, _| drawn.borrow_mut().push(i))
+                .id(Id::new("cell", i))
+                .width(90.0)
+        }))
+}
+
+#[test]
+fn a_follow_glides_to_its_target_and_lands() {
+    let list = Id::new("list", 0);
+    let mut tree = Tree::new();
+    frame_of(&mut tree, list);
+    tree.follow(list, 500.0, false);
+    assert!(tree.following(list));
+    tree.tick(1.0 / 120.0);
+    frame_of(&mut tree, list);
+    let first = tree.offset(list);
+    assert!(first > 0.0 && first < 500.0, "one frame in: {first}");
+    run(&mut tree, list, 2.0);
+    assert_eq!(tree.offset(list), 500.0);
+    assert!(!tree.following(list) && !tree.moving(list));
+    // A snap lands at once; a target past the end stops at the end.
+    tree.follow(list, 100.0, true);
+    assert_eq!(tree.offset(list), 100.0);
+    tree.follow(list, 5000.0, false);
+    run(&mut tree, list, 2.0);
+    assert_eq!(tree.offset(list), 1690.0);
+}
+
+/// A finger leaves the scroll where it let go; the follow resumes once focus asks for
+/// somewhere new.
+#[test]
+fn a_finger_parks_a_follow_until_focus_moves() {
+    let list = Id::new("list", 0);
+    let mut tree = Tree::new();
+    frame_of(&mut tree, list);
+    tree.follow(list, 500.0, true);
+    tree.pan(list, 200.0);
+    tree.release(list, 0.0);
+    run(&mut tree, list, 1.0);
+    assert_eq!(tree.offset(list), 700.0, "in range, it stays put");
+    tree.follow(list, 500.0, false);
+    run(&mut tree, list, 1.0);
+    assert_eq!(
+        tree.offset(list),
+        700.0,
+        "the same target does not pull it back"
+    );
+    tree.follow(list, 300.0, false);
+    run(&mut tree, list, 2.0);
+    assert_eq!(tree.offset(list), 300.0, "a new target does");
+}
+
+#[test]
+fn a_sideways_drag_moves_a_row_and_flings_it() {
+    let row = Id::new("row", 0);
+    let drawn = RefCell::new(Vec::new());
+    let mut tree = Tree::new();
+    let mut surface = canvas();
+    let view = Rect::from_xywh(0.0, 0.0, 400.0, 300.0);
+    let frame = tree.layout(wide_row(row, &drawn), view);
+    tree.paint(surface.canvas(), frame);
+    let at = |kind| Pointer {
+        x: 10.0,
+        y: 150.0,
+        kind,
+    };
+    assert!(
+        !tree.drag(row, at(PointerKind::PanStart { horizontal: false })),
+        "not a vertical scroll"
+    );
+    assert!(
+        !tree.drag(
+            row,
+            at(PointerKind::Pan {
+                dx: -100.0,
+                dy: 0.0
+            })
+        ),
+        "no start, no step"
+    );
+    assert!(tree.drag(row, at(PointerKind::PanStart { horizontal: true })));
+    assert!(tree.drag(
+        row,
+        at(PointerKind::Pan {
+            dx: -100.0,
+            dy: 0.0
+        })
+    ));
+    assert_eq!(tree.offset(row), 100.0);
+    assert!(tree.drag(
+        row,
+        at(PointerKind::Fling {
+            vx: -1000.0,
+            vy: 0.0
+        })
+    ));
+    for _ in 0..240 {
+        tree.tick(1.0 / 120.0);
+        let frame = tree.layout(wide_row(row, &drawn), view);
+        tree.paint(surface.canvas(), frame);
+    }
+    let coasted = tree.offset(row);
+    assert!(coasted > 400.0, "{coasted}");
+    assert!(!tree.moving(row));
 }

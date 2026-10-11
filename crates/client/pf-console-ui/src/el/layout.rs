@@ -34,6 +34,8 @@ pub struct Tree {
     /// Per group id, the child that last had focus.
     memory: HashMap<Id, Id>,
     plate: Plate,
+    /// The scroll whose `PanStart` was taken: its steps and lift go there alone.
+    dragging: Option<Id>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -45,9 +47,17 @@ struct Scroll {
     held: bool,
     /// The end it is springing back to, until the spring settles there.
     bounce: Option<f32>,
+    /// Where a [`Tree::follow`] is taking the offset, and its speed, until it lands.
+    goal: Option<(f32, f32)>,
+    /// The last target [`Tree::follow`] was asked for. A finger parks the scroll where
+    /// it left it until a different target arrives.
+    asked: Option<f32>,
+    parked: bool,
     /// Furthest in-range offset and the viewport's length, as of the last layout.
     max: f32,
     view: f32,
+    /// Set at layout; a drag is taken only along it.
+    axis: Option<Axis>,
 }
 
 impl Scroll {
@@ -160,6 +170,7 @@ impl Tree {
             held: false,
             memory: HashMap::new(),
             plate: Plate::default(),
+            dragging: None,
         }
     }
 
@@ -485,21 +496,55 @@ impl Tree {
         self.scrolls.get(&scroll).map_or(0.0, |s| s.offset)
     }
 
-    /// Jump there and stop; clamped to the content on the next [`Self::layout`].
+    /// Jump there and stop; clamped to the content on the next [`Self::layout`]. Ends a
+    /// follow and a finger's park.
     pub fn set_offset(&mut self, scroll: Id, offset: f32) {
         let s = self.scrolls.entry(scroll).or_default();
         s.offset = offset;
         s.vel = 0.0;
         s.bounce = None;
+        s.goal = None;
+        s.asked = None;
+        s.parked = false;
+    }
+
+    /// Take `scroll` to `target` on the focus spring — the move a focus change asks for;
+    /// call it every frame. A finger, a fling or a bounce holds it off, and a scroll a
+    /// finger parked waits for a target other than the one it left. `snap`, or reduced
+    /// motion, lands at once. Clamped to the content on the next [`Self::layout`].
+    pub fn follow(&mut self, scroll: Id, target: f32, snap: bool) {
+        let s = self.scrolls.entry(scroll).or_default();
+        if s.parked && s.asked == Some(target) {
+            return;
+        }
+        s.parked = false;
+        s.asked = Some(target);
+        if s.held || s.vel != 0.0 || s.bounce.is_some() {
+            return;
+        }
+        if snap || crate::theme::reduce_motion() || s.offset == target {
+            s.offset = target;
+            s.goal = None;
+        } else {
+            s.goal = Some((target, s.goal.map_or(0.0, |(_, v)| v)));
+        }
+    }
+
+    /// A follow is still gliding: keep drawing frames.
+    pub fn following(&self, scroll: Id) -> bool {
+        self.scrolls.get(&scroll).is_some_and(|s| s.goal.is_some())
     }
 
     /// A finger moved the offset by `delta`. Past an end the content lags the finger,
-    /// more the further it is stretched.
+    /// more the further it is stretched. The scroll stays parked where the finger leaves
+    /// it until focus asks for somewhere new.
     pub fn pan(&mut self, scroll: Id, delta: f32) {
         let s = self.scrolls.entry(scroll).or_default();
         s.held = true;
         s.vel = 0.0;
         s.bounce = None;
+        s.goal = None;
+        s.parked = true;
         let excess = s.excess();
         s.offset += if excess * delta > 0.0 {
             delta * RUBBER / (1.0 + excess.abs() / (RUBBER_SPAN * s.view.max(1.0)))
@@ -508,23 +553,40 @@ impl Tree {
         };
     }
 
-    /// A finger drag on the vertical scroll `scroll`: taken at `PanStart` when its anchor
-    /// is on it, its steps then move the offset and its lift flings it.
+    /// A finger drag on `scroll`: taken at `PanStart` when its anchor is on it along the
+    /// scroll's axis, its steps then move the offset and its lift flings it. Steps and
+    /// the lift reach only the scroll that took the start, so a screen offers each of
+    /// its scrolls in turn.
     pub fn drag(&mut self, scroll: Id, p: Pointer) -> bool {
+        let axis = self.scrolls.get(&scroll).and_then(|s| s.axis);
+        let along = |dx: f64, dy: f64| {
+            if axis == Some(Axis::Horizontal) {
+                dx
+            } else {
+                dy
+            }
+        };
         match p.kind {
-            PointerKind::PanStart { horizontal: false } => {
-                let on = self.scroll_at(p.x as f32, p.y as f32, Axis::Vertical) == Some(scroll);
+            PointerKind::PanStart { horizontal } => {
+                let want = if horizontal {
+                    Axis::Horizontal
+                } else {
+                    Axis::Vertical
+                };
+                let on = self.scroll_at(p.x as f32, p.y as f32, want) == Some(scroll);
                 if on {
+                    self.dragging = Some(scroll);
                     self.pan(scroll, 0.0);
                 }
                 on
             }
-            PointerKind::Pan { dy, .. } => {
-                self.pan(scroll, -dy as f32);
+            PointerKind::Pan { dx, dy } if self.dragging == Some(scroll) => {
+                self.pan(scroll, -along(dx, dy) as f32);
                 true
             }
-            PointerKind::Fling { vy, .. } => {
-                self.release(scroll, -vy as f32);
+            PointerKind::Fling { vx, vy } if self.dragging == Some(scroll) => {
+                self.dragging = None;
+                self.release(scroll, -along(vx, vy) as f32);
                 true
             }
             _ => false,
@@ -538,7 +600,7 @@ impl Tree {
         s.vel = vel;
     }
 
-    /// Advance flings and bounces by `dt` seconds.
+    /// Advance flings, bounces and follows by `dt` seconds.
     pub fn tick(&mut self, dt: f32) {
         for s in self.scrolls.values_mut().filter(|s| !s.held) {
             // Past an end: spring back to it, the fling's speed carried into the bounce.
@@ -564,6 +626,16 @@ impl Tree {
                 if s.vel.abs() < FLING_STOP {
                     s.vel = 0.0;
                 }
+            } else if let Some((goal, v)) = s.goal {
+                let goal = goal.clamp(0.0, s.max);
+                let mut sp = Spring {
+                    pos: f64::from(s.offset),
+                    vel: f64::from(v),
+                };
+                sp.step_spec(f64::from(goal), springs::FOCUS, f64::from(dt));
+                sp.settle(f64::from(goal), 0.5, 5.0);
+                s.offset = sp.pos as f32;
+                s.goal = (s.offset != goal || sp.vel != 0.0).then_some((goal, sp.vel as f32));
             }
         }
     }
@@ -666,6 +738,10 @@ impl<'a> Walk<'_, 'a> {
                     Axis::Vertical => l.size.height,
                     Axis::Horizontal => l.size.width,
                 };
+                s.axis = Some(axis);
+                if let Some((goal, _)) = s.goal.as_mut() {
+                    *goal = goal.clamp(0.0, max);
+                }
                 if !s.held && s.vel == 0.0 && s.bounce.is_none() {
                     s.offset = s.offset.clamp(0.0, max);
                 }

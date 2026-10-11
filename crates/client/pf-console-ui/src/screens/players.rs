@@ -3,8 +3,9 @@
 //! Android a last "Not showing?" card that opens the grants and tests only the host can
 //! perform ([`super::grants`]). The fourth tab.
 //!
-//! Cards are one focus row. OK on a pad is its rumble test. Only devices the OS classifies
-//! as a gamepad are forwarded; adapters often enumerate as something else, so each card's
+//! Cards are one focus row that glides to keep the focused card in view and takes a
+//! finger's swipe. OK on a pad is its rumble test. Only devices the OS classifies as a
+//! gamepad are forwarded; adapters often enumerate as something else, so each card's
 //! identity line is the support answer.
 //!
 //! A rumble pulse on a real device stays with the host via [`ConsoleCmd::PadAction`]; the
@@ -120,10 +121,17 @@ fn can_rumble(pad: &PadInfo, platform: Platform) -> bool {
     pad.rumble && matches!(platform, Platform::Android | Platform::Apple)
 }
 
+/// The card row's scroll.
+fn strip() -> Id {
+    Id::new("cards", 0)
+}
+
 pub(crate) struct PlayersScreen {
     tree: Tree,
     /// Set by the shell each frame from what the host reports.
     pub(crate) others: Vec<OtherDevice>,
+    /// The first frame seats the row on its focus; later frames glide.
+    snap: bool,
 }
 
 impl PlayersScreen {
@@ -131,6 +139,7 @@ impl PlayersScreen {
         PlayersScreen {
             tree: Tree::new(),
             others: Vec::new(),
+            snap: true,
         }
     }
 
@@ -181,6 +190,11 @@ impl ScreenView for PlayersScreen {
         true
     }
 
+    /// A finger swipe on the row.
+    fn pan(&mut self, p: Pointer) -> bool {
+        self.tree.drag(strip(), p)
+    }
+
     fn announcement(&self, ctx: &Ctx) -> Option<String> {
         Some(match self.focused(ctx) {
             Target::Pad(i) => format!("{}, {}", ctx.pads[i].name, pad_detail(&ctx.pads[i])),
@@ -218,16 +232,19 @@ impl ScreenView for PlayersScreen {
         // sits 10 down with a 12 blur, so the foot needs the plate's reach, not the air.
         let air = 28.0 * k;
         let reach = 64.0 * k;
-        // On the margin; past the screen's width the row scrolls to keep focus in view.
+        // On the margin; past the screen's width the row glides to centre the focused card.
+        // A swipe parks it until focus moves.
         let x0 = air + edge(k);
-        let strip = Id::new("cards", 0);
+        let strip = strip();
         let focus_x = cards
             .iter()
             .position(|t| Some(target_id(*t, pads)) == self.tree.focus())
             .map(|i| x0 + i as f64 * (cw + gap) + cw / 2.0);
         let max = (x0 * 2.0 + row_w - w).max(0.0);
-        let offset = focus_x.map_or(0.0, |x| (x - w / 2.0).clamp(0.0, max));
-        self.tree.set_offset(strip, offset as f32);
+        let want = focus_x.map_or(0.0, |x| (x - w / 2.0).clamp(0.0, max));
+        self.tree
+            .follow(strip, want as f32, std::mem::take(&mut self.snap));
+        self.tree.tick(dt as f32);
         let top = 24.0 * k;
         let row = El::scroll(strip, Axis::Horizontal)
             .group(Group::Row)
@@ -549,11 +566,13 @@ mod tests {
         }
     }
 
-    /// Render once so the tree has rects, then send `evs`; the outboxes, in order.
-    fn drive(
+    /// One frame `dt` long at 1280 × 800, then `evs`; the outboxes, in order.
+    fn step(
         screen: &mut PlayersScreen,
         platform: Platform,
         pads: &[PadInfo],
+        fonts: &Fonts,
+        dt: f64,
         evs: &[MenuEvent],
     ) -> Vec<(Outbox, Option<MenuPulse>)> {
         let mut settings = Settings::default();
@@ -567,10 +586,9 @@ mod tests {
             device: &device,
             ..Ctx::test(&mut settings, &library)
         };
-        let fonts = crate::theme::build_fonts().unwrap();
         let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
         let rect = Rect::from_xywh(0.0, 64.0, 1280.0, 650.0);
-        screen.render(surface.canvas(), rect, 1.0, 1.0 / 60.0, &fonts, &mut ctx);
+        screen.render(surface.canvas(), rect, 1.0, dt, fonts, &mut ctx);
         evs.iter()
             .map(|ev| {
                 let mut fx = Outbox::default();
@@ -578,6 +596,38 @@ mod tests {
                 (fx, pulse)
             })
             .collect()
+    }
+
+    /// Render once so the tree has rects, then send `evs`; the outboxes, in order.
+    fn drive(
+        screen: &mut PlayersScreen,
+        platform: Platform,
+        pads: &[PadInfo],
+        evs: &[MenuEvent],
+    ) -> Vec<(Outbox, Option<MenuPulse>)> {
+        let fonts = crate::theme::build_fonts().unwrap();
+        step(screen, platform, pads, &fonts, 1.0 / 60.0, evs)
+    }
+
+    /// Focus moves at once; the row glides after it rather than jumping, and lands.
+    #[test]
+    fn the_row_glides_to_keep_the_focused_card_in_view() {
+        let pads: Vec<PadInfo> = (0..6).map(|i| pad(&format!("Pad {i}"), true)).collect();
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut s = PlayersScreen::new();
+        let right = [MenuEvent::Move(MenuDir::Right); 5];
+        step(&mut s, Platform::Apple, &pads, &fonts, 1.0 / 60.0, &right);
+        assert_eq!(s.tree.offset(strip()), 0.0, "the first frame seats the row");
+        step(&mut s, Platform::Apple, &pads, &fonts, 1.0 / 60.0, &[]);
+        let early = s.tree.offset(strip());
+        assert!(early > 0.0, "one frame in it has moved: {early}");
+        assert!(s.tree.following(strip()));
+        for _ in 0..180 {
+            step(&mut s, Platform::Apple, &pads, &fonts, 1.0 / 60.0, &[]);
+        }
+        let landed = s.tree.offset(strip());
+        assert!(landed > early, "and keeps going: {early} → {landed}");
+        assert!(!s.tree.following(strip()), "then rests");
     }
 
     fn rumble(key: &str) -> ConsoleCmd {

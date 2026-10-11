@@ -6,9 +6,10 @@
 //! the last painted rects. Layout is in device pixels; hand-drawn content is a
 //! [`Kind::Paint`] node that receives its rect, exactly what today's painters take.
 //!
-//! A [`Kind::Scroll`] clips and offsets its children. A long list goes under it as a
-//! [`Kind::Virtual`], which builds only the items in view: a 2000-title grid laid out in
-//! full every frame is the one way to make this slow.
+//! A [`Kind::Scroll`] clips and offsets its children; [`Tree::follow`] glides it to keep
+//! the focused child in view, and a finger pans and flings it. A long list goes under it
+//! as a [`Kind::Virtual`], which builds only the items in view: a 2000-title grid laid
+//! out in full every frame is the one way to make this slow.
 //!
 //! Focus is the tree's too: a node marked [`El::focusable`] is a target, a [`Group`] is a
 //! container, and [`Tree::move_focus`] answers a direction from last frame's rects.
