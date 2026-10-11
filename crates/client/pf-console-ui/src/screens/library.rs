@@ -1193,6 +1193,16 @@ impl LibraryScreen {
         g
     }
 
+    /// The plate's rect and the focused item's, as last painted, for a test to compare.
+    #[cfg(test)]
+    pub(crate) fn plate_vs_focus(&self) -> Option<(Rect, Rect)> {
+        let tree = self.grid.borrow();
+        let (plate, _) = tree.plate_rect()?;
+        let field = grid_cell(self.cursor.max(0) as usize);
+        let item = tree.rect(games::zone_id(self.zone, field))?;
+        Some((plate, item))
+    }
+
     /// Follow focus to `want` while the list follows focus: a pan lets go until a move asks
     /// again. The tree glides there and parks under a finger ([`Tree::follow`]).
     fn follow_scroll(&mut self, want: f64, snap: bool, dt: f64) {

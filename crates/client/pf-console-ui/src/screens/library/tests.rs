@@ -1401,10 +1401,54 @@ fn a_wide_band_scrolls_its_focused_item_into_view() {
         .rect(games::band_item_id(0, 5))
         .expect("the last item is placed");
     assert!(last.left >= -1.0 && last.right <= 401.0, "{last:?}");
+    // The row's viewport leaves the plate's outset room above and below: a plate cut at the
+    // tile's edge reads as a second tile.
+    let view = tree.rect(row).expect("the row is placed");
+    let first = tree
+        .rect(games::band_item_id(0, 0))
+        .expect("the first item is placed");
+    assert!(
+        first.top - view.top >= 7.0 && view.bottom - first.bottom >= 7.0,
+        "the plate's outset is clipped: tile {first:?} in {view:?}"
+    );
     assert!(
         hits.borrow()
             .iter()
             .any(|(z, _)| *z == Zone::Band { band: 0, item: 5 }),
         "and painted"
+    );
+}
+
+/// The plate lands on the band item it rests on: same rect, scroll offsets and all. A band
+/// is a scroll inside the screen's scroll, and a plate in the wrong space sits a shift off.
+#[test]
+fn the_plate_lands_on_a_band_item() {
+    let (mut s, library) = live_shelf();
+    let mut settings = pf_client_core::trust::Settings {
+        library_view: LibraryView::Grid.id().to_string(),
+        ..Default::default()
+    };
+    s.grid_cols_last = Some(3);
+    grid_frames(&mut s, &library, &mut settings, 30, "plate-0");
+    assert_eq!(
+        s.zone,
+        Zone::Band { band: 0, item: 0 },
+        "arrival on Desktops"
+    );
+    grid_frames(&mut s, &library, &mut settings, 180, "plate-1");
+    let tree = s.grid.borrow();
+    let item = tree
+        .rect(games::band_item_id(0, 0))
+        .expect("the tile is placed");
+    let (plate, _) = tree.plate_rect().expect("the plate shows");
+    let off = (
+        plate.left - item.left,
+        plate.top - item.top,
+        plate.right - item.right,
+        plate.bottom - item.bottom,
+    );
+    assert!(
+        off.0.abs() < 1.0 && off.1.abs() < 1.0 && off.2.abs() < 1.0 && off.3.abs() < 1.0,
+        "plate {plate:?} vs tile {item:?}: off by {off:?}"
     );
 }
