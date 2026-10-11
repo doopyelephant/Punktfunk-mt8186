@@ -1079,9 +1079,6 @@ impl State {
                 // the AU holes the reference chain. `break`: a codec that refuses a slot it just
                 // offered takes nothing else this pass. Refusing for the hang patience, it is
                 // gone and is rebuilt.
-                if !self.refused.armed() {
-                    log::warn!("decode: input_buffer({idx}) returned None — retrying next pass");
-                }
                 if self.refused.poll(false, true, Instant::now()) {
                     log::warn!(
                         "decode: the codec refused input for {} ms — treating it as hung",
