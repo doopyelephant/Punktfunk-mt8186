@@ -18,6 +18,7 @@
 
 mod accounts;
 pub mod fence;
+mod libraries;
 mod logind;
 mod session;
 mod shared;
@@ -266,7 +267,7 @@ impl LinuxBackend {
             shared::token_owner(door.as_ref()),
         )?;
         let owner = Some((passwd.uid, passwd.gid));
-        session::write_unit_files(seat, &passwd.home, box_dir, token, owner)
+        session::write_unit_files(seat, &passwd.home, box_dir, token, owner, None)
     }
 
     /// Writes the owner's files again at supervisor start: `/run` is empty after a boot, and the
@@ -496,7 +497,11 @@ impl PlatformBackend for LinuxBackend {
                 &session::token_line(&token),
                 shared::token_owner(door.as_ref()),
             )?;
-            session::write_unit_files(seat, &passwd.home, box_dir, &token, None)?;
+            let source = self.steam_source();
+            let shares = libraries::share(box_dir, &seat.id, &passwd, source.as_deref());
+            let shown = shares.as_ref().map_or(&[][..], |s| s.libraries.as_slice());
+            libraries::register(box_dir, &seat.id, &passwd, shown);
+            session::write_unit_files(seat, &passwd.home, box_dir, &token, None, shares.as_ref())?;
             let _ = run("systemctl_failed", "systemctl", &["reset-failed", &unit]);
             run("systemctl_failed", "systemctl", &["start", &unit])?;
         }
