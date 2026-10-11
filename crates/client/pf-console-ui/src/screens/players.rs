@@ -26,13 +26,13 @@ use skia_safe::{Canvas, Rect};
 
 /// Card size and gap, design units.
 const CARD_W: f64 = 300.0;
-const CARD_H: f64 = 200.0;
+const CARD_H: f64 = 300.0;
 const CARD_GAP: f64 = 24.0;
 const CARD_CORNER: f64 = 22.0;
 /// Key-device silhouette box, dp, on the no-pads card.
 const MARK: f64 = 44.0;
 /// The pad drawing's widest, dp; the room above the card's text clamps it by height.
-const ART_W: f64 = 150.0;
+const ART_W: f64 = 240.0;
 
 /// Host-only pad work: a permission dialog or a real device handle. Neither
 /// exists on this side of the bridge.
@@ -292,9 +292,9 @@ impl ScreenView for PlayersScreen {
         self.tree.paint_focus(canvas, frame, k as f32, dt, cheap);
     }
 
-    /// What the focus is. Grant rows run under it on a short screen.
+    /// Why the no-pads and grants cards exist; a pad's card says all it has.
     fn foot(&self, ctx: &Ctx) -> Option<std::borrow::Cow<'static, str>> {
-        Some(detail(self.focused(ctx), ctx, &self.others).into())
+        detail(self.focused(ctx)).map(Into::into)
     }
 
     fn title(&self) -> String {
@@ -326,8 +326,8 @@ fn activate(t: Target, ctx: &Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
     }
 }
 
-/// A pad card: the pad drawn at rest, its name, what it streams as, battery, and what OK
-/// opens. The other cards are an icon, a title and a line.
+/// A pad card: the pad drawn at rest, its name, what it streams as, and battery. The other
+/// cards are an icon, a title and a line.
 #[allow(clippy::too_many_arguments)]
 fn card(
     canvas: &Canvas,
@@ -383,7 +383,7 @@ fn card(
                 _ => "pointer",
             };
             let (title, line) = others_lines(others);
-            return plain(icon, &title, line, fg(0.5));
+            return plain(icon, &title, &line, fg(0.5));
         }
         Target::Grants => {
             return plain(
@@ -425,7 +425,7 @@ fn card(
     let art = art_for(Some(p.pref));
     if let Some(d) = drawings.iter().find(|d| std::ptr::eq(d.art, art)) {
         // The pad fills the room above its text block, centred, at rest.
-        let room_h = base - 64.0 * k - t0;
+        let room_h = base - 44.0 * k - t0;
         let scale = (ART_W * k / f64::from(art.w)).min(room_h / f64::from(art.h));
         let (w, h) = (f64::from(art.w) * scale, f64::from(art.h) * scale);
         let x = f64::from(r.center_x()) - w / 2.0;
@@ -448,17 +448,11 @@ fn card(
         (true, true) => "Streams as Xbox 360".to_string(),
         (true, false) => format!("Streams as {kind}"),
     };
-    let test = match (can_test(platform), can_rumble(p, platform)) {
-        (true, true) => "OK to test it",
-        (true, false) => "OK opens the test",
-        (false, true) => "OK tests rumble",
-        (false, false) => "",
-    };
     fonts.draw_clipped(
         canvas,
         &p.name,
         l,
-        base - 44.0 * k,
+        base - 22.0 * k,
         W::Bold,
         17.0 * k,
         fg(1.0),
@@ -468,50 +462,53 @@ fn card(
         canvas,
         &status,
         l,
-        base - 22.0 * k,
+        base,
         W::Regular,
         13.0 * k,
         fg(0.7),
         max_w,
     );
-    fonts.draw_clipped(
-        canvas,
-        test,
-        l,
-        base,
-        W::SemiBold,
-        12.0 * k,
-        accent(1.0),
-        max_w,
-    );
 }
 
-/// The folded card's title and line: one device by its name, more by their count.
-fn others_lines(others: &[OtherDevice]) -> (String, &'static str) {
-    match others {
-        [one] => (one.name.clone(), "Not a controller"),
-        _ => (format!("{} other devices", others.len()), "Not controllers"),
+/// A device's kind as a word, where the host could tell.
+fn kind_word(kind: &str) -> Option<&'static str> {
+    match kind {
+        "keyboard" => Some("Keyboard"),
+        "mouse" => Some("Mouse"),
+        "remote" => Some("Remote"),
+        _ => None,
     }
 }
 
-fn detail(t: Target, ctx: &Ctx, others: &[OtherDevice]) -> String {
-    match t {
-        Target::Others => {
-            let names: Vec<&str> = others.iter().map(|d| d.name.as_str()).collect();
-            format!(
-                "{} \u{2014} streams take them as keyboard or mouse input, not as pads.",
-                names.join(" \u{b7} ")
-            )
+/// The folded card's title and line: one device by its name, more by their count; the line
+/// names the kinds the host could tell, and stays empty when it could not.
+fn others_lines(others: &[OtherDevice]) -> (String, String) {
+    let mut kinds: Vec<&str> = Vec::new();
+    for word in others.iter().filter_map(|d| kind_word(&d.kind)) {
+        if !kinds.contains(&word) {
+            kinds.push(word);
         }
-        Target::NoPads => "Punktfunk only forwards devices the system classifies as a gamepad or \
-                           joystick — a pad behind an adapter or hub may enumerate with the \
-                           adapter's identity, or not at all."
-            .into(),
-        Target::Pad(i) => pad_detail(&ctx.pads[i]),
-        Target::Grants => "A wired DualSense or Steam Controller 2 needs USB access before it can \
-                           be captured, and a Steam Controller 2 over Bluetooth needs Bluetooth \
-                           access to be seen at all. OK lists the grants and a haptics test."
-            .into(),
+    }
+    let line = kinds.join(" \u{b7} ");
+    match others {
+        [one] => (one.name.clone(), line),
+        _ => (format!("{} other devices", others.len()), line),
+    }
+}
+
+fn detail(t: Target) -> Option<&'static str> {
+    match t {
+        Target::Pad(_) | Target::Others => None,
+        Target::NoPads => Some(
+            "Punktfunk only forwards devices the system classifies as a gamepad or joystick — \
+             a pad behind an adapter or hub may enumerate with the adapter's identity, or not \
+             at all.",
+        ),
+        Target::Grants => Some(
+            "A wired DualSense or Steam Controller 2 needs USB access before it can be \
+             captured, and a Steam Controller 2 over Bluetooth needs Bluetooth access to be \
+             seen at all. OK lists the grants and a haptics test.",
+        ),
     }
 }
 
@@ -736,19 +733,27 @@ mod tests {
             s.announcement(&ctx).as_deref(),
             Some("No controller connected")
         );
-        assert_eq!(
-            detail(Target::Others, &ctx, &s.others),
-            "Keyboard \u{b7} Mouse \u{2014} streams take them as keyboard or mouse input, not \
-             as pads."
+        assert!(
+            s.foot(&ctx).is_some(),
+            "the no-pads card explains itself on the foot"
         );
         assert_eq!(
             others_lines(&s.others),
-            ("2 other devices".to_string(), "Not controllers")
+            (
+                "2 other devices".to_string(),
+                "Keyboard \u{b7} Mouse".to_string()
+            )
         );
         s.others.pop();
         assert_eq!(
             others_lines(&s.others),
-            ("Keyboard".to_string(), "Not a controller")
+            ("Keyboard".to_string(), "Keyboard".to_string())
+        );
+        s.others[0].kind = "other".into();
+        assert_eq!(
+            others_lines(&s.others).1,
+            "",
+            "an unknown kind says nothing"
         );
     }
 
