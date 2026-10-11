@@ -1884,13 +1884,9 @@ fn a_shaded_paint_is_opaque_enough_to_draw() {
     );
 }
 
-/// Every paint in the crate is built by `theme::fill`/`stroke`/`layer`. A pixel test
-/// only witnesses the shapes it draws; this witnesses the class. `&Paint::new(c, None)`
-/// is the natural inline spelling, so it reappears in whichever file is being written.
-#[test]
-fn paints_are_built_by_the_theme_constructors() {
-    // Concat so the needles do not appear in this file — the scan reads its own source.
-    let needles = [concat!("Paint", "::new("), concat!("Paint", "::default()")];
+/// Code lines in the crate's source, files named in `skip` aside, that carry one of
+/// `needles`. Comments are not code.
+fn source_offenders(needles: &[&str], skip: &[&str]) -> Vec<String> {
     let mut offenders = Vec::new();
     let mut stack = vec![std::path::PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1906,8 +1902,10 @@ fn paints_are_built_by_the_theme_constructors() {
             if path.extension().is_none_or(|e| e != "rs") {
                 continue;
             }
-            // theme.rs holds the sanctioned constructors; raw paints are allowed there only.
-            if path.file_name().is_some_and(|f| f == "theme.rs") {
+            if path
+                .file_name()
+                .is_some_and(|f| skip.iter().any(|s| f == *s))
+            {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("source is UTF-8");
@@ -1923,11 +1921,37 @@ fn paints_are_built_by_the_theme_constructors() {
             }
         }
     }
+    offenders
+}
+
+/// Every paint in the crate is built by `theme::fill`/`stroke`/`layer`. A pixel test
+/// only witnesses the shapes it draws; this witnesses the class. `&Paint::new(c, None)`
+/// is the natural inline spelling, so it reappears in whichever file is being written.
+#[test]
+fn paints_are_built_by_the_theme_constructors() {
+    // Concat so the needles do not appear in this file — the scan reads its own source.
+    let needles = [concat!("Paint", "::new("), concat!("Paint", "::default()")];
+    // theme.rs holds the sanctioned constructors; raw paints are allowed there only.
+    let offenders = source_offenders(&needles, &["theme.rs"]);
     assert!(
         offenders.is_empty(),
         "these build a Skia paint directly, which means anti-aliasing is OFF on whatever they \
          draw — use `theme::fill`, `theme::stroke`, or `theme::layer` for a `save_layer` \
          paint:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// Every glyph strokes at `theme::GLYPH_STROKE`: `icons::draw_icon` and `glyphs::pad_mark`
+/// hold the weight, so a caller naming its own puts an odd mark beside every other.
+#[test]
+fn glyphs_draw_through_the_one_weight() {
+    let needles = [concat!("draw_icon_", "weight(")];
+    let offenders = source_offenders(&needles, &["icons.rs", "glyphs.rs"]);
+    assert!(
+        offenders.is_empty(),
+        "these pick their own stroke — draw through `icons::draw_icon` or \
+         `glyphs::pad_mark`:\n  {}",
         offenders.join("\n  ")
     );
 }

@@ -335,6 +335,7 @@ pub(crate) fn draw_poster_placeholder(
             rect.center_x(),
             rect.center_y(),
             side,
+            k as f32,
             ink(0.85),
         );
         return;

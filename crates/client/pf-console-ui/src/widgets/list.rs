@@ -345,7 +345,7 @@ impl Foot<'_> {
             );
             if let Some(mark) = mark {
                 let (cx, cy) = ((left + 7.0 * k) as f32, (top + 8.0 * k) as f32);
-                crate::icons::draw_icon(canvas, mark, cx, cy, (14.0 * k) as f32, ink);
+                crate::icons::draw_icon(canvas, mark, cx, cy, (14.0 * k) as f32, k as f32, ink);
             }
         }
     }
@@ -1393,6 +1393,7 @@ fn paint_leading(canvas: &Canvas, row: &RowSpec, mut label_x: f64, cy: f64, k: f
             (label_x + 10.0 * k) as f32,
             cy as f32,
             (20.0 * k) as f32,
+            k as f32,
             row_tone(row, fg(0.85), fg(0.4)),
         );
         label_x += 32.0 * k;
@@ -1410,6 +1411,7 @@ fn paint_leading(canvas: &Canvas, row: &RowSpec, mut label_x: f64, cy: f64, k: f
                 (label_x + 8.0 * k) as f32,
                 cy as f32,
                 (20.0 * k) as f32,
+                k as f32,
                 grip_tone,
             );
         }
@@ -1445,6 +1447,7 @@ fn paint_buttons(canvas: &Canvas, row: &RowSpec, r: Rect, cy: f64, f: f64, k: f6
                 cx as f32,
                 cy as f32,
                 (18.0 * k) as f32,
+                k as f32,
                 icon_tone,
             );
         }

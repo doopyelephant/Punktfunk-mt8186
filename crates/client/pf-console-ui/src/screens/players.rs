@@ -359,7 +359,7 @@ fn card(
         if let Some(icon) = crate::icons::by_name(icon) {
             let box_px = (MARK * 0.62 * k) as f32;
             let x = (l + f64::from(box_px) / 2.0) as f32;
-            crate::icons::draw_icon(canvas, icon, x, mark_cy as f32, box_px, ink);
+            crate::icons::draw_icon(canvas, icon, x, mark_cy as f32, box_px, k as f32, ink);
         }
         let size = 21.0 * k;
         fonts.draw_clipped(

@@ -10,7 +10,7 @@
 //! https://kenney.nl/assets/input-prompts), refit to the 24-unit box. The tells
 //! inside them are drawn here.
 
-use crate::theme::stroke;
+use crate::theme::{stroke, GLYPH_STROKE};
 use skia_safe::{utils::parse_path, Canvas, Color4f, Matrix, PaintCap, PaintJoin, Path, Rect};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -102,13 +102,16 @@ pub fn by_name(name: &str) -> Option<Icon> {
     pf_client_core::lucide::path(name).map(Icon)
 }
 
-/// Centre `(x, y)`, 24-unit box scaled to `box_px`. Stroke 2 is Lucide's
-/// native weight, so it scales with the box.
-pub fn draw_icon(canvas: &Canvas, icon: Icon, x: f32, y: f32, box_px: f32, color: Color4f) {
-    draw_icon_weight(canvas, icon, x, y, box_px, 2.0 * box_px / 24.0, color);
+/// Centre `(x, y)`, 24-unit box scaled to `box_px`. Strokes [`GLYPH_STROKE`] dp whatever
+/// the box, so every glyph shares one weight; under 18 dp Lucide's native 2/24 is the
+/// thinner of the two and holds.
+pub fn draw_icon(canvas: &Canvas, icon: Icon, x: f32, y: f32, box_px: f32, k: f32, color: Color4f) {
+    let weight = (GLYPH_STROKE as f32 * k).min(2.0 * box_px / 24.0);
+    draw_icon_weight(canvas, icon, x, y, box_px, weight, color);
 }
 
-/// [`draw_icon`] with the stroke in pixels, so one weight holds at every box size.
+/// [`draw_icon`] with the stroke in pixels. [`draw_icon`] and `glyphs::pad_mark` are its
+/// callers; a screen that names its own weight puts an odd mark beside theirs.
 pub fn draw_icon_weight(
     canvas: &Canvas,
     icon: Icon,
