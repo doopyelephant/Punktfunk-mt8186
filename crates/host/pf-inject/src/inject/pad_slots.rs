@@ -33,6 +33,9 @@ pub enum PadCreateFault {
     /// `Global\pf…-boot-<index>` — is already held by another live process.
     /// Retrying cannot hurry the owner; a driver install does not free it.
     IndexOwnedElsewhere,
+    /// A devnode this host made does not carry its session id (`DEVPKEY_Device_SessionId`),
+    /// so every session could list and open it. The host removed it; no driver install sets it.
+    SessionFence,
 }
 
 impl PadCreateFault {
@@ -40,6 +43,7 @@ impl PadCreateFault {
     pub fn as_str(self) -> &'static str {
         match self {
             PadCreateFault::IndexOwnedElsewhere => "index-owned-elsewhere",
+            PadCreateFault::SessionFence => "session-fence",
         }
     }
 
@@ -53,6 +57,12 @@ impl PadCreateFault {
                  retry succeeds on its own once that process releases the index (end its session, \
                  or Restart-Service PunktfunkHost), or run against a pad index it does not hold."
             }
+            PadCreateFault::SessionFence => {
+                " — the pad was removed: it did not carry this host's session id, so every \
+                 session on the box could have seen and opened it. The retry makes a new one. If \
+                 every retry fails, PnP or a driver stacked on the pad drops the property; \
+                 reinstalling the punktfunk drivers does not set it."
+            }
         }
     }
 }
@@ -63,6 +73,9 @@ impl std::fmt::Display for PadCreateFault {
             PadCreateFault::IndexOwnedElsewhere => f.write_str(
                 "the OS name this pad index needs is already owned by another live process",
             ),
+            PadCreateFault::SessionFence => {
+                f.write_str("virtual device not fenced to this host's session")
+            }
         }
     }
 }
@@ -452,6 +465,13 @@ mod tests {
         );
         assert!(hint.contains("already owned"), "{hint}");
         assert!(hint.contains("Restart-Service"), "{hint}");
+    }
+
+    #[test]
+    fn the_fence_hint_never_tells_the_operator_to_reinstall_drivers() {
+        let hint = PadCreateFault::SessionFence.hint();
+        assert!(!hint.contains("driver install"), "{hint}");
+        assert!(hint.contains("session id"), "{hint}");
     }
 
     /// A named fault must not become a permanent latch — that is the

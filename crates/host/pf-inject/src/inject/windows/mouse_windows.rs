@@ -13,8 +13,8 @@
 //! [`ensure_resident`] never drops the devnode; it dies with the host service.
 
 use super::gamepad_raii::{
-    create_swdevice, DriverAttach, PadChannel, ProofTransport, SwDevice, SwDeviceProfile,
-    TRUST_MAILBOX_ENV,
+    create_swdevice, verify_fence, DriverAttach, FenceAt, PadChannel, ProofTransport, SwDevice,
+    SwDeviceProfile, TRUST_MAILBOX_ENV,
 };
 use anyhow::{Context, Result};
 use pf_driver_proto::mouse::{
@@ -104,7 +104,8 @@ unsafe impl Send for VirtualMouse {}
 
 impl VirtualMouse {
     /// Unnamed DATA + `Global\pfmouse-boot-<index>` for this host's [`mouse_index_for_slot`].
-    /// Stamp index, then magic LAST.
+    /// Stamp index, then magic LAST. A devnode whose HID children miss this host's session
+    /// fails [`verify_fence`] and is removed; the keeper retries.
     pub fn open() -> Result<VirtualMouse> {
         let index = mouse_index_for_slot(std::env::var_os(SEAT_SLOT_ENV).as_deref());
         let boot_name = mouse_boot_name(index);
@@ -145,6 +146,9 @@ impl VirtualMouse {
             ProofTransport::HidSerialString,
         );
         channel.deliver_eager(Duration::from_millis(1500));
+        if sw.is_some() {
+            verify_fence(instance_id.as_deref(), FenceAt::HidChildren { pad: false })?;
+        }
         Ok(VirtualMouse {
             _sw: sw,
             channel,
