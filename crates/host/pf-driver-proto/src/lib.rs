@@ -126,3 +126,6 @@ mod tests {
         assert_ne!(PF_VDISPLAY_INTERFACE_GUID_U128, SUDOVDA);
     }
 }
+
+// Seat pad audio: the ring between a seat's audio endpoint enumerator and its host.
+pub mod seat_audio;

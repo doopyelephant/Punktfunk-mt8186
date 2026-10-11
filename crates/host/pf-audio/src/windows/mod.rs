@@ -24,6 +24,8 @@ pub mod pad_capture;
 // DualSense pad-audio endpoint + loopback (design: pad haptics/audio). Session
 // queries by pad index; CLI `pad-endpoint`.
 pub mod pad_endpoint;
+// A seat host's pad audio: the ring `pf_seat_audio.dll` fills from audiodg.
+pub mod seat_pad;
 // Voice-chat apps pinned to the operator's output while the stream captures the silent
 // sink; also the `voice-route` subcommand that writes the pins as the console user.
 pub mod voice_route;

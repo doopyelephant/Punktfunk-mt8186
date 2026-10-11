@@ -1,6 +1,7 @@
 //! Pinned IronRDP keeper and credential-free trust handshake.
 //!
-//! Both roles connect only to `127.0.0.2:3389`, advertise CredSSP/NLA without
+//! Both roles connect only to `127.0.0.2`: the seat listener on its own port when it listens,
+//! else Remote Desktop's 3389. They advertise CredSSP/NLA without
 //! legacy TLS login, and require a HYBRID security selection. `trust` stops
 //! immediately after RDP negotiation and the TLS handshake, before CredSSP, and
 //! reports the observed SHA-256 leaf pin. Runtime TLS verifies that exact pin
@@ -27,7 +28,9 @@ use zeroize::Zeroize as _;
 
 type WinResult<T> = Result<T, BackendError>;
 
-const RDP_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 3389);
+const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+const RDP_ADDRESS: SocketAddr = SocketAddr::new(LOOPBACK, 3389);
+const SEAT_ADDRESS: SocketAddr = SocketAddr::new(LOOPBACK, keeper::SEAT_LISTENER_PORT);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const ACTIVE_READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -179,12 +182,24 @@ fn connector_config(
     }
 }
 
+/// The seat listener, or Remote Desktop's own when nothing listens there: same TermService, same
+/// certificate, but only the seat listener's sessions get pad audio endpoints.
+fn connect() -> WinResult<TcpStream> {
+    match TcpStream::connect_timeout(&SEAT_ADDRESS, CONNECT_TIMEOUT) {
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+            TcpStream::connect_timeout(&RDP_ADDRESS, CONNECT_TIMEOUT)
+                .map_err(|error| io_error("rdp_connect", "connect to 127.0.0.2:3389", error))
+        }
+        connected => connected
+            .map_err(|error| io_error("rdp_connect", &format!("connect to {SEAT_ADDRESS}"), error)),
+    }
+}
+
 fn negotiate_tls(
     config: connector::Config,
     expected_pin: Option<[u8; 32]>,
 ) -> WinResult<Negotiated> {
-    let stream = TcpStream::connect_timeout(&RDP_ADDRESS, CONNECT_TIMEOUT)
-        .map_err(|error| io_error("rdp_connect", "connect to 127.0.0.2:3389", error))?;
+    let stream = connect()?;
     stream
         .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
         .map_err(|error| io_error("rdp_connect", "set RDP read timeout", error))?;

@@ -1,5 +1,5 @@
 //! Turning seats on and off: the prerequisite checks, the seat display driver, the Remote
-//! Desktop listener and its firewall scope, and the pinned RDP certificate.
+//! Desktop listener and its firewall scope, the seat listener, and the pinned RDP certificate.
 //!
 //! [`checks`] only reads. [`turn_on`] creates the Seats key and records there what it changed
 //! (`ListenerWasOff`, `AllowRdpFromNetwork`, `RdpRulesOpened`); [`turn_off`] undoes exactly
@@ -151,6 +151,7 @@ pub(super) fn turn_off() -> WinResult<()> {
             )
         })?;
     }
+    super::seat_listener::remove();
     drop(seats);
     hklm.delete_subkey_with_flags(SEATS_KEY, KEY_WOW64_64KEY)
         .map_err(|cause| refuse("seats_key", "Couldn't turn seats off.", cause))
@@ -207,6 +208,9 @@ fn apply(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
     seats
         .set_value(RDP_FROM_NETWORK, &u32::from(allow_rdp_from_network))
         .map_err(|cause| refuse("seats_key", "Couldn't turn seats on.", cause))?;
+    if let Err(cause) = super::seat_listener::ensure(host_path) {
+        tracing::warn!(%cause, "seat listener not ready — seats start without pad audio");
+    }
     trust_rdp_certificate(host_path)
 }
 
@@ -429,7 +433,7 @@ fn powershell_args(script: &str) -> [&str; 6] {
 }
 
 /// A System32 tool's exit code, output discarded. `None` when it did not launch.
-fn run(tool: &str, args: &[&str]) -> Option<i32> {
+pub(super) fn run(tool: &str, args: &[&str]) -> Option<i32> {
     Command::new(pf_paths::system32(tool))
         .args(args)
         .stdin(Stdio::null())

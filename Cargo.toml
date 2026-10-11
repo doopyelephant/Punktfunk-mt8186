@@ -48,6 +48,7 @@ members = [
     "crates/host/pf-paths",
     "crates/host/pf-paths-win",
     "crates/host/pf-seats",
+    "crates/host/pf-seat-audio",
     # The seat supervisor's binary, apart from its library: it links pf-inject for the pads it
     # builds, which the Windows seat keeper's own workspace cannot resolve beside IronRDP.
     "crates/host/punktfunk-seats",

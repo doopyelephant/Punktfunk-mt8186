@@ -8,7 +8,8 @@
 //! verified fingerprint; literal PIN arguments are refused. `--discover` lists native mDNS hosts.
 //!
 //! Usage: `punktfunk-probe [--connect HOST:PORT] [--mode WxHxFPS] [--out FILE]
-//! [--bitrate KBPS] [--codec auto|h264|hevc|av1] [--input-test|--mic-test|--touch-test]
+//! [--bitrate KBPS] [--codec auto|h264|hevc|av1]
+//! [--input-test|--mic-test|--touch-test|--pad-audio-test]
 //! [--pin HEX|--pair -] [--compositor NAME] [--gamepad NAME] [--trajectory FILE] |
 //! --discover [SECS]`
 #![forbid(unsafe_code)]
@@ -50,6 +51,9 @@ struct Args {
     /// `--rich-input-test` — drive the DualSense touchpad + motion over 0xCC (host needs
     /// `PUNKTFUNK_GAMEPAD=dualsense`); also logs the 0xCD HID-output feedback that comes back.
     rich_input_test: bool,
+    /// `--pad-audio-test` — declare pad 0 a DualSense that renders haptics and speaker, and count
+    /// the `0xD1` pad-audio datagrams the host streams back, per lane.
+    pad_audio_test: bool,
     /// `--quit` — close the connection with the deliberate-quit code (`QUIT_CLOSE_CODE`) at end of
     /// stream, so the host tears its virtual display down immediately (skips keep-alive linger). A
     /// bare exit closes with code 0 → the host lingers for a reconnect. Tests the #2 quit path.
@@ -277,6 +281,7 @@ fn parse_argv(argv: Vec<String>) -> Args {
         mic_burst: argv.iter().any(|a| a == "--mic-burst"),
         touch_test: argv.iter().any(|a| a == "--touch-test"),
         rich_input_test: argv.iter().any(|a| a == "--rich-input-test"),
+        pad_audio_test: argv.iter().any(|a| a == "--pad-audio-test"),
         quit: argv.iter().any(|a| a == "--quit"),
         seconds: get("--seconds").and_then(|s| s.parse().ok()),
         pin,
@@ -542,6 +547,9 @@ struct Counters {
     audio_bytes: AtomicU64,
     rumble_pkts: AtomicU64,
     hidout_pkts: AtomicU64,
+    /// `0xD1` pad-audio datagrams by lane (haptics, speaker), and those carrying sound.
+    pad_audio_pkts: [AtomicU64; 2],
+    pad_audio_voiced: AtomicU64,
     /// A self-terminating v2 rumble envelope (0xCA with the seq+ttl tail) arrived. Asserted at
     /// report time under `PUNKTFUNK_TEST_FEEDBACK`; a legacy v1 datagram leaves it false.
     saw_v2_rumble: AtomicBool,
@@ -643,6 +651,9 @@ async fn session(mut args: Args) -> Result<()> {
     }
     if args.rich_input_test {
         spawn_rich_input_test(&conn);
+    }
+    if args.pad_audio_test {
+        spawn_pad_audio_test(&conn);
     }
     // Closed-flag for the blocking receive loop.
     {
@@ -854,6 +865,9 @@ async fn handshake(
                 // neither.
                 if args.audio_format.is_some() {
                     c |= punktfunk_core::quic::CLIENT_CAP_AUDIO_HIRES;
+                }
+                if args.pad_audio_test {
+                    c |= punktfunk_core::quic::CLIENT_CAP_PAD_AUDIO;
                 }
                 c
             },
@@ -1580,6 +1594,38 @@ fn spawn_rich_input_test(conn: &Wire) {
     });
 }
 
+/// Pad-audio plane: declare pad 0 a DualSense with haptics and speaker. The arrival repeats, as a
+/// real client's does, and a neutral axis creates the pad.
+fn spawn_pad_audio_test(conn: &Wire) {
+    let conn2 = conn.clone();
+    tokio::spawn(async move {
+        use punktfunk_core::input::{encode_gamepad_arrival, gamepad::AXIS_LS_X};
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let arrival = InputEvent {
+            kind: InputKind::GamepadArrival,
+            _pad: [0; 3],
+            code: u32::from(GamepadPref::DualSense.to_u8()),
+            x: 0,
+            y: 0,
+            flags: encode_gamepad_arrival(0, 0b11),
+        };
+        for _ in 0..3 {
+            let _ = conn2.send_datagram(arrival.encode().to_vec());
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        let axis = InputEvent {
+            kind: InputKind::GamepadAxis,
+            _pad: [0; 3],
+            code: AXIS_LS_X,
+            x: 0,
+            y: 0,
+            flags: 0,
+        };
+        let _ = conn2.send_datagram(axis.encode().to_vec());
+        tracing::info!("pad-audio-test: declared DualSense pad 0 with haptics and speaker");
+    });
+}
+
 /// Host→client datagrams: count Opus audio + rumble (playback is the platform clients'
 /// job; here we verify the planes flow), decode the audio, and forward per-AU host timings
 /// to the data plane.
@@ -1636,6 +1682,15 @@ fn spawn_datagram_rx(
             }
         };
         while let Ok(d) = conn2.read_datagram().await {
+            if let Some(frame) = punktfunk_core::quic::decode_pad_audio_datagram(&d) {
+                if let Some(lane) = c.pad_audio_pkts.get(usize::from(frame.kind)) {
+                    lane.fetch_add(1, Relaxed);
+                }
+                if !frame.opus.is_empty() {
+                    c.pad_audio_voiced.fetch_add(1, Relaxed);
+                }
+                continue;
+            }
             if let Some((_, _, pcm_wire)) =
                 punktfunk_core::quic::decode_audio_pcm_datagram(&d).filter(|_| lossless)
             {
@@ -1987,6 +2042,16 @@ fn report_side_planes(counters: &Counters) {
             rumble_pkts = r,
             hidout_pkts = h,
             "host→client datagrams (Opus 48 kHz stereo, 5 ms frames; rumble; DualSense HID)"
+        );
+    }
+    let [haptics, speaker] = &counters.pad_audio_pkts;
+    let (haptics, speaker) = (haptics.load(Relaxed), speaker.load(Relaxed));
+    if haptics > 0 || speaker > 0 {
+        tracing::info!(
+            haptics_pkts = haptics,
+            speaker_pkts = speaker,
+            voiced_pkts = counters.pad_audio_voiced.load(Relaxed),
+            "pad audio (0xD1)"
         );
     }
 }

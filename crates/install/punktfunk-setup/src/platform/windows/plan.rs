@@ -620,6 +620,28 @@ fn host_uninstall(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
             run_lenient(&[&host_exe, "driver", "uninstall"]),
             run_lenient(&[&host_exe, "driver", "uninstall", "--gamepad"]),
             run_lenient(&[&host_exe, "driver", "uninstall", "--audio"]),
+            // The seat listener and its enumerator (pf-seats `seat_listener.rs`). A copy audio
+            // services still hold goes at the next restart.
+            run_lenient(&[
+                "reg",
+                "delete",
+                r"HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\punktfunk-tcp",
+                "/f",
+            ]),
+            run_lenient(&[
+                "netsh", "advfirewall", "firewall", "delete", "rule",
+                "name=punktfunk seat listener (TCP)",
+            ]),
+            run_lenient(&[
+                "netsh", "advfirewall", "firewall", "delete", "rule",
+                "name=punktfunk seat listener (UDP)",
+            ]),
+            WinAction::RemoveFiles {
+                dir: pf_paths::system32("punktfunk"),
+            },
+            WinAction::RemoveFiles {
+                dir: pf_paths::syswow64("punktfunk"),
+            },
             run_lenient(&["schtasks", "/End", "/TN", "PunktfunkWeb"]),
             run_lenient(&["schtasks", "/Delete", "/TN", "PunktfunkWeb", "/F"]),
             run_lenient(&["schtasks", "/End", "/TN", "PunktfunkScripting"]),

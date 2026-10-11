@@ -37,6 +37,8 @@ pf-paths = { path = "../pf-paths" }
 [target.'cfg(target_os = "windows")'.dependencies]
 # Config dir, owner-private writes, the seat marker and `pnputil /remove-device`.
 pf-paths = { path = "../pf-paths" }
+# The seat pad ring's names and layout, shared with `pf_seat_audio.dll` (seat_pad.rs).
+pf-driver-proto = { path = "../pf-driver-proto" }
 # `multi_sz` for the minted devnodes' hardware id.
 pf-win-display = { path = "../pf-win-display" }
 # WASAPI loopback capture and the virtual-mic render.
@@ -70,6 +72,9 @@ windows = { version = "0.62", features = [
     # pin through RoGetActivationFactory(AudioPolicyConfig) (voice_route.rs).
     "Win32_System_RemoteDesktop",
     "Win32_System_WinRT",
+    # The seat pad ring and its ownership event (seat_pad.rs).
+    "Win32_System_Memory",
+    "Win32_System_Threading",
 ] }
 
 [lints]

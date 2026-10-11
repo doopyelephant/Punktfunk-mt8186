@@ -3249,6 +3249,7 @@ version = "0.43.1"
 dependencies = [
  "anyhow",
  "opus",
+ "pf-driver-proto",
  "pf-frame",
  "pf-host-config",
  "pf-inject",
@@ -3623,11 +3624,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-seat-audio"
+version = "0.0.1"
+dependencies = [
+ "pf-driver-proto",
+ "windows 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "windows-core 0.62.2 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "pf-seats"
 version = "0.43.1"
 dependencies = [
  "aws-lc-rs",
  "hex",
+ "pf-driver-proto",
  "pf-host-config",
  "pf-paths",
  "rand 0.10.3",
