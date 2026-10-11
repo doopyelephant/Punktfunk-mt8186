@@ -12,6 +12,10 @@
 //! systemd gives even a `+` command a namespace of its own once the unit has one. `BindPaths=`
 //! then carries the stage, idmap and all, into the seat. The libraries are read at each start; a
 //! drive the owner mounts later reaches the seat on its next start.
+//!
+//! The box's `seat_library_writable` off (`library_writable` in [`DEFAULTS`]) mounts them
+//! read-only: a seat plays what is installed, and can't update, install or rewrite an
+//! appmanifest there. The few files a game needs to write get private copies ([`spots`]).
 
 use super::accounts::Passwd;
 use super::shared::{self, make_dir};
@@ -22,7 +26,7 @@ use crate::steam;
 use std::collections::HashSet;
 use std::io::{Read as _, Write as _};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 /// What a seat keeps its own of in each library. Steam stages updates in `temp`.
@@ -33,6 +37,9 @@ const STAGE_ROOT: &str = "/run/punktfunk/libraries";
 
 /// Filesystems that take an idmapped mount. A library elsewhere (exFAT, NTFS, FUSE) is skipped.
 const IDMAP_FS: [&str; 4] = ["btrfs", "ext4", "xfs", "f2fs"];
+
+/// `pf_host_config::seat_defaults::FILE`, which the box writes into its config dir.
+const DEFAULTS: &str = "seat-defaults.json";
 
 const LIST: &str = "libraryfolders.vdf";
 const LIST_TEMP: &str = "libraryfolders.vdf.punktfunk";
@@ -45,6 +52,16 @@ pub(super) struct Library {
     pub steamapps: PathBuf,
     /// Its folder under the seat's: a hash of the path, so the seat's prefixes stay with it.
     pub key: String,
+    /// What the seat writes in it while it is read-only; empty while it is writable.
+    pub spots: Vec<Spot>,
+}
+
+/// A path under a read-only `steamapps` the seat gets a private copy of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Spot {
+    /// Relative to `steamapps`.
+    pub path: PathBuf,
+    pub dir: bool,
 }
 
 /// What a seat's unit needs to show the owner's libraries.
@@ -55,6 +72,8 @@ pub(super) struct Shares {
     pub umount: PathBuf,
     /// `X-mount.idmap=`: the owner's ids on disk, the seat's in the mount.
     pub idmap: String,
+    /// The box's `seat_library_writable` is off.
+    pub read_only: bool,
     pub libraries: Vec<Library>,
 }
 
@@ -128,6 +147,7 @@ fn check(
         Library {
             key: key(&steamapps),
             steamapps,
+            spots: Vec::new(),
         },
         inode,
     ))
@@ -156,6 +176,68 @@ fn find(
     out
 }
 
+/// The folders in `dir` a unit file can name, sorted. A link is not a folder.
+fn folders(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| unit_safe(name))
+        .collect();
+    out.sort();
+    out
+}
+
+/// What a game still writes in a read-only `steamapps`, as found there: each Steam Linux
+/// Runtime's `var` and each of its platforms' `files/.ref`, which pressure-vessel opens before a
+/// native game starts, and each Proton's `dist.lock`. Read-only, either fails the launch with
+/// EROFS. Links are never followed; a file that isn't there yet stays read-only.
+fn spots(steamapps: &Path) -> Vec<Spot> {
+    let found = |spot: &Spot| {
+        let meta = std::fs::symlink_metadata(steamapps.join(&spot.path));
+        meta.is_ok_and(|m| if spot.dir { m.is_dir() } else { m.is_file() })
+    };
+    let spot = |path: PathBuf, dir| Spot { path, dir };
+    let mut out = Vec::new();
+    for name in folders(&steamapps.join("common")) {
+        let tool = Path::new("common").join(&name);
+        if name.starts_with("SteamLinuxRuntime_") {
+            out.push(spot(tool.join("var"), true));
+            for platform in folders(&steamapps.join(&tool)) {
+                let files = spot(tool.join(platform).join("files"), true);
+                if found(&files) {
+                    out.push(spot(files.path.join(".ref"), false));
+                }
+            }
+        } else if name.starts_with("Proton") {
+            out.push(spot(tool.join("dist.lock"), false));
+        }
+    }
+    out.retain(found);
+    out
+}
+
+/// The box's `seat_library_writable`, read from its [`DEFAULTS`] in `box_dir`: on when the box
+/// wrote none or the file is unreadable.
+fn writable(box_dir: &Path) -> bool {
+    let read = || -> std::io::Result<Option<bool>> {
+        let Some((file, _)) = shared::open_regular(&box_dir.join(DEFAULTS))? else {
+            return Ok(None);
+        };
+        let defaults: serde_json::Value = serde_json::from_reader(file)?;
+        Ok(defaults["library_writable"].as_bool())
+    };
+    read()
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "seat defaults unreadable; the owner's libraries stay writable");
+            None
+        })
+        .unwrap_or(true)
+}
+
 fn fstype(path: &Path) -> Option<String> {
     let path = path.to_str()?;
     let found = run(
@@ -166,9 +248,10 @@ fn fstype(path: &Path) -> Option<String> {
     Some(found.ok()?.trim().to_owned())
 }
 
-/// The libraries of the owner's Steam at `steam_root` for seat `seat`, their folders in place.
-/// `None` when there is nothing to show: no such Steam, one that is root's or the seat's, or no
-/// list. Root's is never mapped: a seat would own every root file in the library.
+/// The libraries of the owner's Steam at `steam_root` for seat `seat`, their folders in place,
+/// read-only when the box says so. `None` when there is nothing to show: no such Steam, one that
+/// is root's or the seat's, or no list. Root's is never mapped: a seat would own every root file
+/// in the library.
 pub(super) fn share(
     box_dir: &Path,
     id: &SeatId,
@@ -202,8 +285,15 @@ pub(super) fn share(
             return None;
         }
     };
+    let read_only = !writable(box_dir);
     let libraries = find(&steam::library_paths(&vdf), owner.0, fstype)
         .into_iter()
+        .map(|mut library| {
+            if read_only {
+                library.spots = spots(&library.steamapps);
+            }
+            library
+        })
         .filter(|library| match prepare(box_dir, id, seat, owner, library) {
             Ok(()) => true,
             Err(error) => {
@@ -218,12 +308,14 @@ pub(super) fn share(
         mount,
         umount,
         idmap: idmap(owner, seat),
+        read_only,
         libraries,
     })
 }
 
-/// Every directory a library's binds name, before the unit starts: a missing one fails it with
-/// `226/NAMESPACE`, and none can be made inside the idmapped mount, where root has no id.
+/// Every directory a library's binds name, and the seat's copy of each of its [`Spot`]s, before
+/// the unit starts: a missing one fails it with `226/NAMESPACE`, and none can be made inside the
+/// idmapped mount, where root has no id.
 fn prepare(
     box_dir: &Path,
     id: &SeatId,
@@ -288,16 +380,40 @@ fn prepare(
         std::os::unix::fs::chown(&dir, Some(seat.uid), Some(seat.gid))
             .map_err(|e| io("own a private folder", e))?;
     }
+    make_spots(&private, &library.spots, seat).map_err(|e| io("create a private copy", e))?;
     make_dir(Path::new(STAGE_ROOT), 0o700).map_err(|e| io("create the stage", e))?;
     std::fs::create_dir_all(stage_dir(id, &library.key)).map_err(|e| io("create the stage", e))
 }
 
+/// The seat's own copy of each spot under `private`, empty and the seat user's. Root makes the
+/// folders on the way; a copy already there is kept.
+fn make_spots(private: &Path, spots: &[Spot], seat: &Passwd) -> std::io::Result<()> {
+    for spot in spots {
+        let path = private.join(&spot.path);
+        if spot.dir {
+            make_dir(&path, 0o700)?;
+            std::os::unix::fs::chown(&path, Some(seat.uid), Some(seat.gid))?;
+        } else {
+            std::fs::create_dir_all(path.parent().unwrap_or(private))?;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+                .mode(0o644)
+                .open(&path)?;
+            std::os::unix::fs::fchown(&file, Some(seat.uid), Some(seat.gid))?;
+        }
+    }
+    Ok(())
+}
+
 /// The drop-in lines that show `shares` to seat `id`: mount each library at its stage before the
-/// unit starts and unmount it after, hide its own path, bind the stage and the seat's private
-/// folders over it, and keep the owner's library list there read-only. A mount that fails leaves
-/// the seat an empty library, not a failed start.
+/// unit starts, read-only if the box says so, and unmount it after; hide its own path, bind the
+/// stage, the seat's private folders and its spots' copies over it, and keep the owner's library
+/// list there read-only. A mount that fails leaves the seat an empty library, not a failed start.
 pub(super) fn unit_lines(box_dir: &Path, id: &SeatId, shares: &Shares) -> String {
     let host = format!("{} -t 1 -m --", shares.nsenter.display());
+    let ro = if shares.read_only { "ro," } else { "" };
     let mut out = String::new();
     for library in &shares.libraries {
         let stage = stage_dir(id, &library.key);
@@ -305,7 +421,7 @@ pub(super) fn unit_lines(box_dir: &Path, id: &SeatId, shares: &Shares) -> String
         let private = private_dir(box_dir, id, &library.key);
         let (stage, owner) = (stage.display(), library.steamapps.display());
         out.push_str(&format!(
-            "ExecStartPre=-+{host} {} --bind -o \"nosuid,nodev,X-mount.idmap={}\" \"{owner}\" {stage}\n\
+            "ExecStartPre=-+{host} {} --bind -o \"{ro}nosuid,nodev,X-mount.idmap={}\" \"{owner}\" {stage}\n\
              ExecStopPost=-+{host} {} -l {stage}\n\
              InaccessiblePaths=\"-{owner}\"\n\
              BindPaths={stage}:{}\n",
@@ -319,6 +435,14 @@ pub(super) fn unit_lines(box_dir: &Path, id: &SeatId, shares: &Shares) -> String
                 "BindPaths={}:{}\n",
                 private.join(name).display(),
                 target.join(name).display()
+            ));
+        }
+        // Each side quoted on its own: a spot's path may hold a space.
+        for spot in &library.spots {
+            out.push_str(&format!(
+                "BindPaths=\"{}\":\"{}\"\n",
+                private.join(&spot.path).display(),
+                target.join(&spot.path).display()
             ));
         }
         let list = target.join(LIST);
@@ -537,23 +661,32 @@ mod tests {
         assert_eq!(found[0].steamapps, root.join("drive/steamapps"));
     }
 
+    fn shares(read_only: bool, spots: Vec<Spot>) -> Shares {
+        Shares {
+            nsenter: PathBuf::from("/usr/bin/nsenter"),
+            mount: PathBuf::from("/usr/bin/mount"),
+            umount: PathBuf::from("/usr/bin/umount"),
+            idmap: "u:1000:987:1 g:1000:956:1".into(),
+            read_only,
+            libraries: vec![Library {
+                steamapps: PathBuf::from("/run/media/bazzite/QEMU HARDDISK/steamapps"),
+                key: "00aa".into(),
+                spots,
+            }],
+        }
+    }
+
     /// The unit mounts each library idmapped at its stage, hides the owner's own path, binds the
     /// stage and the seat's private folders into the seat, and keeps the owner's list read-only.
     /// `/run/media` stays hidden.
     #[test]
     fn the_drop_in_binds_each_library_with_private_folders() {
-        let shares = Shares {
-            nsenter: PathBuf::from("/usr/bin/nsenter"),
-            mount: PathBuf::from("/usr/bin/mount"),
-            umount: PathBuf::from("/usr/bin/umount"),
-            idmap: "u:1000:987:1 g:1000:956:1".into(),
-            libraries: vec![Library {
-                steamapps: PathBuf::from("/run/media/bazzite/QEMU HARDDISK/steamapps"),
-                key: "00aa".into(),
-            }],
-        };
-        let text =
-            super::super::session::render_binds(Path::new("/b"), &id(), "pf-seat-1", Some(&shares));
+        let text = super::super::session::render_binds(
+            Path::new("/b"),
+            &id(),
+            "pf-seat-1",
+            Some(&shares(false, Vec::new())),
+        );
         let seat = "/b/seats/0123456789abcdef0123456789abcdef";
         let stage = "/run/punktfunk/libraries/0123456789abcdef0123456789abcdef/00aa";
         let owner = "/run/media/bazzite/QEMU HARDDISK/steamapps";
@@ -582,6 +715,124 @@ mod tests {
         assert_eq!(text, expected);
     }
 
+    /// Read-only, the mount gains `ro` and each spot gets the seat's copy; nothing else moves.
+    #[test]
+    fn a_read_only_library_mounts_ro_and_binds_each_spot() {
+        let spots = [
+            "common/Proton 10.0/dist.lock",
+            "common/SteamLinuxRuntime_sniper/var",
+        ];
+        let shares_spots = spots
+            .iter()
+            .map(|path| Spot {
+                path: PathBuf::from(path),
+                dir: path.ends_with("var"),
+            })
+            .collect();
+        let box_dir = Path::new("/b");
+        let writable = unit_lines(box_dir, &id(), &shares(false, Vec::new()));
+        let read_only = unit_lines(box_dir, &id(), &shares(true, shares_spots));
+        let seat = "/b/seats/0123456789abcdef0123456789abcdef";
+        let mut binds = String::new();
+        for spot in spots {
+            binds.push_str(&format!(
+                "BindPaths=\"{seat}/private/00aa/{spot}\":\
+                 \"{seat}/libraries/00aa/steamapps/{spot}\"\n"
+            ));
+        }
+        let expected = writable
+            .replace("-o \"nosuid,", "-o \"ro,nosuid,")
+            .replace("BindReadOnlyPaths=", &format!("{binds}BindReadOnlyPaths="));
+        assert_eq!(read_only, expected);
+    }
+
+    /// Each runtime's `var` and platform `.ref`, and each Proton's `dist.lock`, as they exist;
+    /// no link is followed. The seat's copies are its own and keep what it wrote.
+    #[test]
+    fn the_spots_are_what_a_game_writes_in_a_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let steamapps = temp.path().join("steamapps");
+        let common = steamapps.join("common");
+        for dir in [
+            "SteamLinuxRuntime_sniper/var",
+            "SteamLinuxRuntime_sniper/sniper_platform_1/files",
+            "SteamLinuxRuntime_sniper/sniper_platform_2/files",
+            "SteamLinuxRuntime_soldier/soldier_platform_1/files",
+            "SteamLinuxRuntime_linkedfiles/platform",
+            "Proton 10.0",
+            "Proton - Experimental",
+            "Proton linked lock",
+            "Some Game/var",
+        ] {
+            std::fs::create_dir_all(common.join(dir)).unwrap();
+        }
+        for file in [
+            "SteamLinuxRuntime_sniper/sniper_platform_1/files/.ref",
+            "SteamLinuxRuntime_soldier/soldier_platform_1/files/.ref",
+            "Proton 10.0/dist.lock",
+        ] {
+            std::fs::write(common.join(file), "").unwrap();
+        }
+        let link = |target: &str, at: &str| {
+            std::os::unix::fs::symlink(common.join(target), common.join(at)).unwrap()
+        };
+        link("SteamLinuxRuntime_sniper", "SteamLinuxRuntime_linked");
+        link("Proton 10.0", "Proton linked");
+        link(
+            "SteamLinuxRuntime_sniper/sniper_platform_1/files",
+            "SteamLinuxRuntime_linkedfiles/platform/files",
+        );
+        link("Proton 10.0/dist.lock", "Proton linked lock/dist.lock");
+
+        let found = spots(&steamapps);
+        let want = [
+            ("common/Proton 10.0/dist.lock", false),
+            ("common/SteamLinuxRuntime_sniper/var", true),
+            (
+                "common/SteamLinuxRuntime_sniper/sniper_platform_1/files/.ref",
+                false,
+            ),
+            (
+                "common/SteamLinuxRuntime_soldier/soldier_platform_1/files/.ref",
+                false,
+            ),
+        ]
+        .map(|(path, dir)| Spot {
+            path: PathBuf::from(path),
+            dir,
+        });
+        assert_eq!(found, want);
+
+        let private = temp.path().join("private");
+        let seat = me(temp.path());
+        make_spots(&private, &found, &seat).unwrap();
+        let lock = private.join("common/Proton 10.0/dist.lock");
+        assert!(private.join("common/SteamLinuxRuntime_sniper/var").is_dir());
+        assert_eq!(std::fs::metadata(&lock).unwrap().uid(), seat.uid);
+        std::fs::write(&lock, "held").unwrap();
+        make_spots(&private, &found, &seat).unwrap();
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), "held");
+    }
+
+    /// The box's Seat default decides; without one the libraries stay writable.
+    #[test]
+    fn the_box_s_seat_default_makes_the_libraries_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(writable(temp.path()));
+        let path = temp.path().join(pf_host_config::seat_defaults::FILE);
+        for library_writable in [false, true] {
+            let defaults = pf_host_config::seat_defaults::SeatDefaults {
+                end_on_game_exit: true,
+                max_mode: None,
+                library_writable,
+            };
+            std::fs::write(&path, defaults.to_json().to_string()).unwrap();
+            assert_eq!(writable(temp.path()), library_writable);
+        }
+        std::fs::write(&path, "{}").unwrap();
+        assert!(writable(temp.path()));
+    }
+
     fn steam_file(home: &Path, dir: &str) -> PathBuf {
         home.join(".local/share/Steam").join(dir).join(LIST)
     }
@@ -608,6 +859,7 @@ mod tests {
         let library = Library {
             steamapps: PathBuf::from("/x/steamapps"),
             key: "00aa".into(),
+            spots: Vec::new(),
         };
         register(
             Path::new("/b"),
