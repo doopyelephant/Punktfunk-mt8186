@@ -1017,8 +1017,8 @@ pub fn target_inventory_checked() -> Result<Vec<TargetInventory>, CcdError> {
 /// Crash-recovery journal for exclusive isolate: a marker so a fresh host can
 /// undo a dead one's deactivated physicals.
 ///
-/// The pre-isolate snapshot is process memory only; the isolated topology is
-/// never written to the CCD database. A crash therefore leaves the desk dark.
+/// The pre-isolate snapshot is process memory only, so a crash leaves the desk
+/// dark. A stored isolate is [`crate::layout_db`]'s.
 /// Same shape as [`monitor_devnode`](crate::monitor_devnode): mark while live,
 /// clear on a clean restore, re-light at startup if a marker survived.
 ///
@@ -1240,7 +1240,7 @@ pub mod isolate_journal {
 // pub so vdisplay::pf_vdisplay can reuse this backend-neutral CCD isolation helper
 // (it operates on real OS target ids — a pf-vdisplay monitor's target_id qualifies).
 pub fn isolate_displays_ccd(keep: &[CcdTargetKey]) -> Option<SavedConfig> {
-    isolate_displays_ccd_checked(keep).map(|(saved, _)| saved)
+    isolate_displays_ccd_checked(keep, false).map(|(saved, _)| saved)
 }
 
 /// What [`isolate_displays_ccd_checked`] observed — the truthful input a re-assert watchdog or a
@@ -1261,8 +1261,11 @@ pub enum IsolateOutcome {
 /// when the initial CCD read failed (nothing was attempted); otherwise the pre-isolate config plus
 /// what the verification observed. Callers that mutate on the strength of the result (the
 /// exclusive re-assert watchdog) read the outcome; acquire keeps the `Option<SavedConfig>` shape.
+/// `store` stores the isolate in the display database for the connected set, journaled in
+/// [`crate::layout_db`] first; [`restore_displays_ccd`] stores the operator's layout back.
 pub fn isolate_displays_ccd_checked(
     keep: &[CcdTargetKey],
+    store: bool,
 ) -> Option<(SavedConfig, IsolateOutcome)> {
     // Snapshot the ORIGINAL active config ONCE for restore-on-teardown, before any changes.
     let saved = query_active_config()?;
@@ -1288,9 +1291,18 @@ pub fn isolate_displays_ccd_checked(
         .filter(|k| !keep.contains(k))
         .collect();
     isolate_journal::mark(&doomed);
-    // The database keys a layout by the connected set: save only when nothing else is connected,
-    // or an inactive physical would inherit the virtual-only layout on its next arrival.
+    // The database keys a layout by the connected set: save when nothing else is connected, or
+    // when `store` asks and the journal names the panels it darkens. Unjournaled, a physical
+    // inherits the virtual-only layout on its next arrival.
     let sole = available_target_keys().is_some_and(|keys| keys.iter().all(|k| keep.contains(k)));
+    let save = sole || (store && crate::layout_db::mark(&target_inventory(), &doomed));
+    if save && !sole {
+        tracing::info!(
+            darkened = ?doomed,
+            "display isolate (CCD): storing the isolate for this monitor set, so a monitor that \
+             re-plugs itself keeps it (teardown stores the operator's layout back)"
+        );
+    }
 
     // Re-query and re-apply until only the keep set is active. One apply can
     // leave a panel lit; the lock screen must not land there.
@@ -1325,7 +1337,7 @@ pub fn isolate_displays_ccd_checked(
             anchor_kept_sources_at_origin(&paths, &mut modes);
         }
         // Re-commit even when nothing was deactivated: a GDI mode-set does not
-        // drive IddCx COMMIT_MODES. SAVE_TO_DATABASE only on a `sole` box.
+        // drive IddCx COMMIT_MODES. SAVE_TO_DATABASE only when `save`.
         // Pick the supplied shape once so a desktop retry does not log twice.
         let keep_only = (others > 0 && attempt >= 2).then(|| {
             // Attempt 2+: keep-only arrays. Last attempt also drops
@@ -1355,7 +1367,7 @@ pub fn isolate_displays_ccd_checked(
                         | SDC_USE_SUPPLIED_DISPLAY_CONFIG
                         | SDC_ALLOW_CHANGES
                         | SDC_FORCE_MODE_ENUMERATION;
-                    if sole {
+                    if save {
                         flags |= SDC_SAVE_TO_DATABASE;
                     }
                     SetDisplayConfig(Some(paths.as_slice()), Some(modes.as_slice()), flags)
@@ -1711,11 +1723,12 @@ static DARK_SINKS_FUTILE: std::sync::Mutex<Vec<(CcdTargetKey, String)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Restore the topology saved by [`isolate_displays_ccd`] (teardown, before
-/// the virtual is removed).
+/// the virtual is removed). A set holding a stored isolate gets this layout stored instead.
 pub fn restore_displays_ccd(saved: &SavedConfig) {
+    let store = crate::layout_db::holds_connected_set();
     // The marker goes only once the desk is known lit (or nothing external is connected). A
     // host that dies mid-restore, or a restore that lit nothing, leaves it for the next start.
-    if restore_displays_ccd_inner(saved) {
+    if restore_displays_ccd_inner(saved, store) {
         isolate_journal::clear();
     } else {
         tracing::warn!(
@@ -1796,8 +1809,8 @@ fn prune_saved_config_for_targets(
 }
 
 /// `true` when no connected external display is left dark — the restore lit one, the backstop
-/// did, or there is none to light.
-fn restore_displays_ccd_inner(saved: &SavedConfig) -> bool {
+/// did, or there is none to light. `store` replaces the connected set's stored isolate.
+fn restore_displays_ccd_inner(saved: &SavedConfig, store: bool) -> bool {
     let (saved_paths, saved_modes) = saved;
     if saved_paths.is_empty() {
         return true;
@@ -1830,18 +1843,21 @@ fn restore_displays_ccd_inner(saved: &SavedConfig) -> bool {
              skipping the replay (the dark-desk backstop decides what lights up)"
         );
     } else {
+        let mut flags = SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES;
+        if store {
+            flags |= SDC_SAVE_TO_DATABASE;
+        }
         // SAFETY: CCD contract — slices, so pointer and length agree; both outlive
         // this synchronous call. `retry_set_display_config` binds the input desktop.
         let rc = crate::input_desktop::retry_set_display_config(|| unsafe {
-            SetDisplayConfig(
-                Some(paths.as_slice()),
-                Some(modes.as_slice()),
-                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES,
-            )
+            SetDisplayConfig(Some(paths.as_slice()), Some(modes.as_slice()), flags)
         });
         apply_rc = rc;
         if rc == 0 {
-            tracing::info!("display isolate (CCD): restored original topology");
+            if store {
+                crate::layout_db::forget_if_lit();
+            }
+            tracing::info!(store, "display isolate (CCD): restored original topology");
         } else {
             tracing::warn!(
                 "display isolate (CCD): topology restore failed rc={rc:#x}{} — physical displays may be left deactivated",
