@@ -284,8 +284,11 @@ fn attach_in_process(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
     // Kernel vhci rx/tx honour SO_RCVTIMEO/SO_SNDTIMEO; handshake timeouts would idle-kill the device.
     sock.set_read_timeout(None).ok();
     sock.set_write_timeout(None).ok();
-    // A seat can't write `attach`; the supervisor attaches the socket for it.
-    let brokered = pf_paths::seat::is_seat_host();
+    // A seat that can't write `attach` has the supervisor attach the socket for it.
+    let attach = vhci_base()
+        .context("vhci_hcd sysfs not present")?
+        .join("attach");
+    let brokered = crate::pad_broker::brokered(&attach);
     let vhci_port = if brokered {
         crate::pad_broker::attach(sock.as_fd(), devid, speed)
             .context("attach through the seat pad broker")?

@@ -251,33 +251,37 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   can't reach it. The runner ends its children on `SIGTERM`, and `seat-reap` ends the session
   by the id the runner recorded.
 - **Pads.** A seat user can't open `/dev/uinput` or `/dev/uhid`: they are the console user's.
-  A seat host asks the daemon's pad broker, `/run/punktfunk/pads.sock`, for a pad by kind, and
-  the daemon builds it from its own tables, keeps the kernel fd and hands the seat one end of a
-  relay socket. A uinput pad's relay carries the seat's `input_event` frames down and rumble
+  A seat host that can write the node opens it itself, as the owner's host at the desk does
+  through seat0's ACL. One that can't asks the daemon's pad broker, `/run/punktfunk/pads.sock`,
+  for a pad by kind, and the daemon builds it from its own tables, keeps the kernel fd and hands
+  the seat one end of a relay socket. A uinput pad's relay carries the seat's `input_event` frames down and rumble
   back; a uhid pad's carries the same `uhid_event`s the seat would write and read, minus
   `CREATE2` and `DESTROY`, which stay the daemon's. The pad lives until the seat hangs up. The
   socket admits a running seat's user only (the owner's row included), eight pads per seat. The
   daemon stamps each pad's `phys` as `punktfunk-seat:<account>/…`, and
   `65-punktfunk-seats.rules` runs `punktfunk-seats fence` on every `input` and `hidraw` node
-  that carries it: the node becomes that user's, `0600`, on a seat of its own, so neither the
-  box's own Steam nor another seat sees it. A box without the daemon gives a seat no pad; the
-  seat host says so. The daemon parks each relayed pad's fds in systemd's fd store, so a
-  restart of the daemon keeps a seat's pads; `punktfunk-seats list` shows what each seat holds.
+  that carries it, on each event but `remove`: the node becomes that user's, `0600`, on a seat
+  of its own, so neither the box's own Steam nor another seat sees it. A box without the daemon
+  gives a seat no pad; the seat host says so. The daemon parks each relayed pad's fds in
+  systemd's fd store, so a restart of the daemon keeps a seat's pads; `punktfunk-seats list`
+  shows what each seat holds.
 - **USB pads.** A USB/IP pad (the virtual Deck, the SC2, the Switch 2) stays the seat host's own
-  usbip server. The seat runs the import handshake and sends the connected socket with an
-  `Attach`; the daemon picks the vhci port, records it in `/run/punktfunk/pads/vhci/<port>` and
+  usbip server. A seat that can't write vhci's `attach` runs the import handshake and sends the
+  connected socket with an `Attach`; the daemon picks the vhci port, records it in `/run/punktfunk/pads/vhci/<port>` and
   writes `attach`, four ports per seat. The fence maps every node under that port to the seat.
-  While the daemon runs, a new vhci interface starts unauthorized and the fence authorizes it.
-  A seat's binds only when its device is one the host emulates (`usbip::EMULATED` in
-  `pf-inject`) and the interface, as the kernel parsed it, is HID, audio, CDC-ACM or
-  vendor-specific; anyone else's always. The attached socket waits in the fd store too, so a
-  restarted daemon still drops the port's row when the seat hangs up.
+  While the daemon runs, a new vhci interface starts unauthorized and the fence authorizes it
+  on its `add`. A seat's binds only when its device is one the host emulates
+  (`usbip::EMULATED` in `pf-inject`) and the interface, as the kernel parsed it, is HID, audio,
+  CDC-ACM or vendor-specific; anyone else's always. The attached socket waits in the fd store
+  too, so a restarted daemon still drops the port's row when the seat hangs up.
 - **Game Mode.** The seat host keeps the seat's mode, `desktop` or `game`, in `seat-session` in
   its config directory, and starts in the one it ran last. It owns
   `com.steampowered.SteamOSManager1` on the seat's session bus and serves `SessionManagement1`,
   which `steamosctl` and Steam call; `steamos-session-select` and `steamos-desktop-return`, first
   on the seat's `PATH`, call it too. A switch never reaches the box's login. The runner masks the
-  seat user's own `steamos-manager.service` for the session.
+  seat user's own `steamos-manager.service` for the session. The runner starts the host with
+  `PUNKTFUNK_SEAT_HEADLESS=1`; on the owner's row only that host plays the seat's mode, and the
+  owner's own host at the desk leaves Game Mode, its bus name and its gamescope to the box.
 
   The desktop keeps running in Game Mode. A switch moves the seat's own live sessions in place
   between its KWin output and a gamescope the host spawns with `steam -gamepadui -steamos3`, so the
@@ -312,6 +316,7 @@ the profiles that share the owner's desktop and the light seats on it.
 | Variable | The owner's row |
 |---|---|
 | `PUNKTFUNK_SEAT_OWNER` | `1`: the seat host is the owner's own, and also serves the owner and light-seat profiles. |
+| `PUNKTFUNK_SEAT_HEADLESS` | `1`, set by the runner, not the file: the host runs in the row's headless session, not at the desk. |
 | `PUNKTFUNK_CONFIG_DIR`, `PUNKTFUNK_HOST_NAME`, `PUNKTFUNK_GAMESTREAM` | Not set: the owner keeps `~/.config/punktfunk` and their own settings. |
 
 Every row sets `PUNKTFUNK_MDNS=0`, since only the door advertises. The row's environment file is

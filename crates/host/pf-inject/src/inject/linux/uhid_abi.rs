@@ -149,14 +149,14 @@ pub struct UhidDevice {
 }
 
 impl UhidDevice {
-    /// `kind` as a seat gets it (the supervisor builds `id` from its own table, stamped), else
-    /// `id` opened here.
+    /// `id` opened here, or `kind` as a seat that can't write `/dev/uhid` gets it: the supervisor
+    /// builds it from its own table, stamped ([`crate::pad_broker::brokered`]).
     pub fn open_kind(
         kind: crate::pad_broker::PadKind,
         index: u8,
         id: &Identity,
     ) -> Result<UhidDevice> {
-        if pf_paths::seat::is_seat_host() {
+        if crate::pad_broker::brokered(std::path::Path::new(UHID_PATH)) {
             return UhidDevice::relayed(crate::pad_broker::request(kind, index)?);
         }
         UhidDevice::open(&id.as_create2())
