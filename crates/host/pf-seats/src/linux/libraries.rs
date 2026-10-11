@@ -107,11 +107,12 @@ fn idmap(owner: (u32, u32), seat: &Passwd) -> String {
     format!("u:{}:{}:1 g:{}:{}:1", owner.0, seat.uid, owner.1, seat.gid)
 }
 
-/// A path a unit file carries inside double quotes as written: no escape, specifier or variable.
+/// A path a unit file carries inside double quotes as written: no escape, specifier or variable,
+/// and no `:`, which `BindPaths=` reads as the source/target split.
 fn unit_safe(path: &str) -> bool {
     !path
         .chars()
-        .any(|c| c.is_control() || matches!(c, '"' | '\\' | '%' | '$'))
+        .any(|c| c.is_control() || matches!(c, '"' | '\\' | '%' | '$' | ':'))
 }
 
 /// The library at `path` as a seat would see it, with its `steamapps`' device and inode, or why
@@ -637,6 +638,12 @@ mod tests {
         assert_eq!(
             reason(&quoted, uid, "btrfs"),
             Err("its path has characters a unit file can't carry")
+        );
+        let split = library("a:b");
+        assert_eq!(
+            reason(&split, uid, "btrfs"),
+            Err("its path has characters a unit file can't carry"),
+            "a `:` would split a BindPaths= line"
         );
         let prefixes_elsewhere = library("prefixes elsewhere");
         let compatdata = root.join("prefixes elsewhere/steamapps/compatdata");
