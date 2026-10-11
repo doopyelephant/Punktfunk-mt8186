@@ -132,8 +132,10 @@ pub fn detach(account: &str, port: u16) -> Result<()> {
 }
 
 /// udev's program for a device under a vhci hub; `false` when `devpath` is not one. Prints the
-/// seat's lines when the port is a seat's. On an interface, it authorizes and probes its
-/// device's interfaces ([`authorize`]): a seat's only as [`seat_may_bind`] says.
+/// seat's lines when the port is a seat's, on every event. On an interface's `add` only, it
+/// authorizes and probes its device's interfaces ([`authorize`]): a seat's only as
+/// [`seat_may_bind`] says. A later event can come after the seat's row is gone, mid-teardown,
+/// and must not read the device as nobody's.
 pub fn fence(devpath: &str) -> bool {
     let Some(busid) = busid_of(devpath) else {
         return false;
@@ -142,7 +144,8 @@ pub fn fence(devpath: &str) -> bool {
     if let Some(account) = &account {
         pf_seats::linux::fence::print_for(account);
     }
-    if std::env::var("DEVTYPE").as_deref() == Ok("usb_interface") {
+    let added = std::env::var("ACTION").as_deref() == Ok("add");
+    if added && std::env::var("DEVTYPE").as_deref() == Ok("usb_interface") {
         let interface = Path::new("/sys").join(devpath.trim_start_matches('/'));
         if let Some(device) = interface.parent() {
             authorize(device, account.is_some());
