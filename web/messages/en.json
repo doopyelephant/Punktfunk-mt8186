@@ -1233,6 +1233,8 @@
 	"setting_seat_end_on_game_exit_hint": "Off keeps streaming the seat's desktop.",
 	"setting_seat_max_mode": "Highest mode per seat",
 	"setting_seat_max_mode_hint": "Like 2560x1440@120. A device's own cap outranks it; empty is no cap.",
+	"setting_seat_library_writable": "Seats update your games",
+	"setting_seat_library_writable_hint": "Off: seats play your installed games but can't update them or install into your libraries.",
 	"setting_tray_autostart": "Tray autostart",
 	"setting_tray_autostart_hint": "Starts the status icon next to the clock at sign-in.",
 	"library_search_placeholder": "Search games",

@@ -117,8 +117,9 @@ session by design, and display activation fails while its session is inactive.
 - **The Seat defaults.** The box writes `seat-defaults.json` into its config directory at start and
   after each settings change: `end_on_game_exit` (a seat's stream ends when its game exits) and
   `max_mode` (the largest mode a seat grants a device without a cap of its own). The seat re-reads
-  it when it changes, so a change reaches the seat's next session. The box itself applies the
-  other two: **Seats kept warm** and **Stop idle seats**.
+  it when it changes, so a change reaches the seat's next session. The box itself applies
+  **Seats kept warm** and **Stop idle seats**. On Linux the file also carries `library_writable`,
+  which the daemon reads from the box's copy when a seat starts (see the owner's libraries below).
 - **The box's trust, its own key.** The seat never writes the pairing store or profiles. A grant
   changed in the box console applies to the seat's next check. It mints and keeps its own identity
   in `PUNKTFUNK_CONFIG_DIR`, never the box's. The supervisor records its certificate's SHA-256 in
@@ -264,6 +265,14 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   `libraryfolders.vdf` copies, and drops one no longer shown and any under `/run/media`; Steam's
   own entries and fields stay. The owner's Steam settings are never changed. Two Steam clients
   updating one game in a shared library at once take no lock.
+  With **Seats update your games** off (`PUNKTFUNK_SEAT_LIBRARY_WRITABLE`, `library_writable` in
+  the box's `seat-defaults.json`) the mount is read-only: a seat plays what is installed but can't
+  update or install there, and its Steam can't rewrite the owner's appmanifests (it logs a failed
+  app state write every few seconds while a game runs). What a launch writes gets a private copy
+  under `seats/<id>/private/<key>`, found at each start: each `common/SteamLinuxRuntime_*/var`, each
+  `common/SteamLinuxRuntime_*/*/files/.ref` and each `common/Proton*/dist.lock`. Without them a
+  native game through the runtime or any Proton there fails with a read-only file system. A file
+  that doesn't exist yet, such as the `dist.lock` of a Proton the owner never ran, stays read-only.
 - **Stopping.** `pam_systemd` moves the runner into the session's scope, so stopping the unit
   can't reach it. The runner ends its children on `SIGTERM`, and `seat-reap` ends the session
   by the id the runner recorded.

@@ -549,6 +549,9 @@ pub static SETTINGS: &[Setting] = &[
     row("seat_end_on_game_exit", "PUNKTFUNK_SEAT_END_ON_GAME_EXIT", Kind::Bool, D::Bool(true), Seats, NextSession, "Seat game exit", "profiles").only(LINUX_WINDOWS),
     // `WIDTHxHEIGHT@HZ`; empty is no cap. A device's own cap outranks it.
     row("seat_max_mode", "PUNKTFUNK_SEAT_MAX_MODE", Kind::Text { max_len: 24 }, D::Str(""), Seats, NextSession, "Seat mode cap", "profiles").only(LINUX_WINDOWS),
+    // Off mounts the owner's Steam libraries read-only in a seat: it plays what is installed and
+    // can't update or install there. The supervisor reads it at each seat start.
+    row("seat_library_writable", "PUNKTFUNK_SEAT_LIBRARY_WRITABLE", Kind::Bool, D::Bool(true), Seats, NextSession, "Seats update games", "profiles").only(LINUX),
     // --- System
     row("update_check", "PUNKTFUNK_UPDATE_CHECK", Kind::Bool, D::Bool(true), System, Now, "Check for updates", "updating"),
     row("update_apply", "PUNKTFUNK_UPDATE_APPLY", Kind::Bool, D::Bool(true), System, Now, "Console updates", "updating").advanced(),
@@ -693,6 +696,7 @@ mod tests {
             "seat_idle_stop",
             "seat_end_on_game_exit",
             "seat_max_mode",
+            "seat_library_writable",
         ] {
             assert_eq!(
                 find(id).expect("the row exists").group,

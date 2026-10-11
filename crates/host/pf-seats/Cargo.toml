@@ -55,6 +55,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
+pf-host-config = { path = "../pf-host-config" }
 tempfile = "3"
 
 [lints]

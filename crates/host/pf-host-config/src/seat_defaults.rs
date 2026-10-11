@@ -3,7 +3,8 @@
 //! The box resolves them from its own settings and writes [`FILE`] into its config dir, at start
 //! and after every settings write. A seat that follows the contract reads it from its trust dir,
 //! re-reading when the file changes, so a default reaches a running seat's next session. The
-//! box's upkeep reads the other two (kept warm, idle stop) from its own config.
+//! Linux supervisor reads `library_writable` from the box's copy at each seat start. The box's
+//! upkeep reads the other two (kept warm, idle stop) from its own config.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,8 @@ pub struct SeatDefaults {
     pub end_on_game_exit: bool,
     /// The highest mode a seat grants a device without a cap of its own, `WIDTHxHEIGHT@HZ`.
     pub max_mode: Option<String>,
+    /// A seat updates and installs into the owner's Steam libraries; off mounts them read-only.
+    pub library_writable: bool,
 }
 
 impl SeatDefaults {
@@ -25,11 +28,16 @@ impl SeatDefaults {
         SeatDefaults {
             end_on_game_exit: config.seat_end_on_game_exit,
             max_mode: config.seat_max_mode.clone(),
+            library_writable: config.seat_library_writable,
         }
     }
 
-    fn to_json(&self) -> Value {
-        json!({ "end_on_game_exit": self.end_on_game_exit, "max_mode": self.max_mode })
+    pub fn to_json(&self) -> Value {
+        json!({
+            "end_on_game_exit": self.end_on_game_exit,
+            "max_mode": self.max_mode,
+            "library_writable": self.library_writable,
+        })
     }
 
     /// A field the file lacks takes its row default, so an older box's file still reads.
@@ -41,6 +49,7 @@ impl SeatDefaults {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
+            library_writable: v["library_writable"].as_bool().unwrap_or(true),
         }
     }
 }
@@ -92,13 +101,15 @@ mod tests {
         let d = SeatDefaults {
             end_on_game_exit: false,
             max_mode: Some("2560x1440@120".into()),
+            library_writable: false,
         };
         assert_eq!(SeatDefaults::from_json(&d.to_json()), d);
         assert_eq!(
             SeatDefaults::from_json(&json!({ "max_mode": "" })),
             SeatDefaults {
                 end_on_game_exit: true,
-                max_mode: None
+                max_mode: None,
+                library_writable: true,
             }
         );
     }

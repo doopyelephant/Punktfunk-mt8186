@@ -63,6 +63,8 @@ Every seat shares one set of **Seats** settings on **Host**, shown while seats a
 - **Stop an idle seat after**: 240 minutes by default; 0 never stops one.
 - **End a seat's stream when its game exits**: off keeps streaming the seat's desktop.
 - **Highest mode per seat**, such as `2560x1440@120`: a device's own cap outranks it.
+- **Seats update your games** (Linux): off, seats play the games you installed but can't update
+  them or install into your libraries. A seat picks up a change when it next starts.
 
 **Library**, **Game sources** and **Plugins** are per seat: once a seat exists, the page's title
 (**Anna's library ▾**) switches it to another seat's own.

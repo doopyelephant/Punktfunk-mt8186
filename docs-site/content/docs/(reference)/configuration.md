@@ -84,6 +84,7 @@ restart*.
 | Stop idle seats (Linux, Windows) | `PUNKTFUNK_SEAT_IDLE_STOP_MIN` | 0–1440 min | `240` | after a restart |
 | Seat game exit (Linux, Windows) | `PUNKTFUNK_SEAT_END_ON_GAME_EXIT` | `on` · `off` | `on` | next session |
 | Seat mode cap (Linux, Windows) | `PUNKTFUNK_SEAT_MAX_MODE` | text, up to 24 characters | — | next session |
+| Seats update games (Linux) | `PUNKTFUNK_SEAT_LIBRARY_WRITABLE` | `on` · `off` | `on` | next session |
 | Check for updates | `PUNKTFUNK_UPDATE_CHECK` | `on` · `off` | `on` | at once |
 | Console updates | `PUNKTFUNK_UPDATE_APPLY` | `on` · `off` | `on` | at once |
 | Tray autostart (Linux, Windows) | `PUNKTFUNK_TRAY_AUTOSTART` | `on` · `off` | `on` | at once |
