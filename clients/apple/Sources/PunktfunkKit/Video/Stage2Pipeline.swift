@@ -652,9 +652,7 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
     /// means the compositor runs a frame ahead of us. Tracks VRR rate changes.
     private let hud: HudSink?
     /// The pool depth this session vends from (`startDeadlinePresenter` sets it on the layer).
-    /// Carried only so the one-shot line below reports the two halves of the depth question
-    /// together — a `preferredFrameLatency` of 1 against a 3-slot pool is the configuration that
-    /// measured a two-refresh floor in the field, and reading either number alone hides that.
+    /// Logged beside the latency ask: the vend lead decides how many drawables the link needs.
     private let drawableCount: Int
     /// The `preferredFrameLatency` this session asks for — 1 by default, PUNKTFUNK_FRAME_LATENCY
     /// for the on-device ladder (see `startDeadlinePresenter` for the ladder's design).
@@ -1193,14 +1191,14 @@ public final class Stage2Pipeline {
             ? { ring.take() }
             : { ring.take(dueBy: CACurrentMediaTime(), due: { $0.dueMediaTime }) }
 
-        // Two drawables: the link vends every one, so a third only lets the compositor queue a
-        // second present ahead of scanout — a refresh of latency. Set before either thread exists;
+        // Three drawables: the link vends two refreshes before glass, so one scans out, one waits
+        // for its flip and one is ours. Two halve a 120 Hz panel. Set before either thread exists;
         // afterwards the link thread applies layer writes (`deferLayerWrites`).
-        // PUNKTFUNK_DRAWABLE_COUNT=3 restores the old depth; values outside 2...3 are ignored.
+        // PUNKTFUNK_DRAWABLE_COUNT=2 is the A/B; values outside 2...3 are ignored.
         let drawableCount =
             ProcessInfo.processInfo.environment["PUNKTFUNK_DRAWABLE_COUNT"]
                 .flatMap(Int.init)
-                .flatMap { (2...3).contains($0) ? $0 : nil } ?? 2
+                .flatMap { (2...3).contains($0) ? $0 : nil } ?? 3
         layer.maximumDrawableCount = drawableCount
 
         // The frame-latency ASK (default 1 — wake as late as fits: latch the NEXT refresh).
@@ -1267,16 +1265,9 @@ public final class Stage2Pipeline {
             linkThread.start()
         }
 
-        // Stale-link watchdog threshold. Stage-4 owns NO drawable source of its own — every
-        // drawable arrives as `update.drawable`, so a link that stops calling back is a stream
-        // that never presents again (the frozen picture keeps audio and input alive, so it reads
-        // as a hang, not a disconnect). Field 2026-08-28, iPad Pro / iOS 27 over Tailscale: three
-        // presents returned `presentedTime == 0` against the 2-slot pool, the link went silent
-        // mid-second, and `pf-present` then logged `ok=0 noDrawable=120 vendLeadMs n=0` until the
-        // user quit — twice in one session, both times cured instantly by reconnecting.
-        // 0.25 s is ~30 refreshes at 120 Hz against a normal vend wait of one refresh, so it
-        // cannot fire on ordinary phase jitter; the cost of a false positive is one relinked
-        // frame, the cost of missing it is the whole session.
+        // Stale-link watchdog: every drawable arrives as `update.drawable`, so a silent link
+        // freezes the picture while audio and input live on. 250 ms ≈ 30 refreshes at 120 Hz.
+        // A miss freezes the picture; a false positive costs one relinked frame.
         let linkStaleAfter: CFTimeInterval = 0.25
 
         let renderThread = Thread {
