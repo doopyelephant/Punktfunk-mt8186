@@ -65,11 +65,17 @@ fn cadence_budget(
     }
 }
 
-/// 80% of the cadence budget spent inside the host's submit+poll chain is encode
-/// pressure: activation follows the measured encoder cost, not the consumed-frame
-/// clock — a chain at the bottleneck still reads ≥80% of a budget it stretched.
-fn encode_chain_pressure(budget: std::time::Duration, chain_ns: u64) -> bool {
-    u128::from(chain_ns).saturating_mul(5) >= budget.as_nanos().saturating_mul(4)
+/// Encode pressure from the host's submit+poll chain, not the consumed-frame clock: a chain at
+/// the bottleneck still reads ≥80% of a budget it stretched. Pipelined retrieve takes the wait off
+/// the loop but blocks submit on the input copy, so its chain reads high while cadence holds;
+/// there only a chain that fills the budget is pressure, or the escalation could never unwind.
+fn encode_chain_pressure(budget: std::time::Duration, chain_ns: u64, pipelined: bool) -> bool {
+    let chain = u128::from(chain_ns);
+    if pipelined {
+        chain >= budget.as_nanos()
+    } else {
+        chain.saturating_mul(5) >= budget.as_nanos().saturating_mul(4)
+    }
 }
 
 /// The wire flags for one access unit: picture, keyframe, and the recovery marks the client
@@ -650,7 +656,8 @@ impl StreamState {
     }
 
     /// IDD pipeline depth / pipelined-retrieve escalation on a sustained behind-cadence score,
-    /// wound back after a clean run with a growing backoff. Also publishes the cadence verdict
+    /// wound back after a clean run with a growing backoff; pipelined retrieve is judged on a
+    /// full-budget chain (see [`encode_chain_pressure`]). Also publishes the cadence verdict
     /// the ABR climb gate reads.
     pub(super) fn adapt_depth(&mut self) {
         if !idd_adaptive_enabled() {
@@ -663,7 +670,8 @@ impl StreamState {
         let max_depth = self.capturer.pipeline_depth().max(1);
         let budget = cadence_budget(self.interval, self.src_period_ns);
         let schedule_behind = std::time::Instant::now() >= self.next + (budget - self.interval);
-        let encode_pressure = encode_chain_pressure(budget, self.encode_chain_ns);
+        let encode_pressure =
+            encode_chain_pressure(budget, self.encode_chain_ns, self.pipelined_active);
         let behind = schedule_behind || encode_pressure;
         self.behind_score = if behind {
             (self.behind_score + 1).min(DEPTH_BEHIND_CAP)
@@ -907,14 +915,26 @@ mod tests {
     #[test]
     fn encode_chain_pressure_fires_at_eighty_percent_of_budget() {
         let ms = std::time::Duration::from_millis;
-        assert!(!encode_chain_pressure(ms(10), 3_000_000));
-        assert!(encode_chain_pressure(ms(10), 8_000_000));
-        assert!(encode_chain_pressure(ms(10), 13_000_000));
+        assert!(!encode_chain_pressure(ms(10), 3_000_000, false));
+        assert!(encode_chain_pressure(ms(10), 8_000_000, false));
+        assert!(encode_chain_pressure(ms(10), 13_000_000, false));
         assert!(!encode_chain_pressure(
             ms(16) + std::time::Duration::from_micros(667),
-            13_000_000
+            13_000_000,
+            false
         ));
-        assert!(encode_chain_pressure(ms(13), 13_000_000));
+        assert!(encode_chain_pressure(ms(13), 13_000_000, false));
+    }
+
+    /// Pipelined, a blocking 7 ms copy at 120 Hz holds cadence; only a full budget is behind.
+    #[test]
+    fn a_pipelined_chain_is_pressure_only_at_the_full_budget() {
+        let budget = std::time::Duration::from_micros(8333);
+        assert!(encode_chain_pressure(budget, 7_000_000, false));
+        assert!(!encode_chain_pressure(budget, 7_000_000, true));
+        assert!(!encode_chain_pressure(budget, 8_332_000, true));
+        assert!(encode_chain_pressure(budget, 8_333_000, true));
+        assert!(encode_chain_pressure(budget, 12_000_000, true));
     }
 
     #[test]
