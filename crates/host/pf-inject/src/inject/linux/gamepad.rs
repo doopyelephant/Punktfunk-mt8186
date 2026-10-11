@@ -340,10 +340,10 @@ pub struct VirtualPad {
 }
 
 impl VirtualPad {
-    /// On a seat the supervisor builds the device and this holds its relay; the box's own host
-    /// opens `/dev/uinput` itself.
+    /// A host that can write `/dev/uinput` opens it itself; on a seat that can't, the supervisor
+    /// builds the device and this holds its relay ([`crate::pad_broker::brokered`]).
     pub fn create(index: usize, identity: PadIdentity) -> Result<VirtualPad> {
-        let dev = if pf_paths::seat::is_seat_host() {
+        let dev = if crate::pad_broker::brokered(std::path::Path::new("/dev/uinput")) {
             let relay = crate::pad_broker::request(identity.kind, index as u8)?;
             tracing::info!(
                 index,

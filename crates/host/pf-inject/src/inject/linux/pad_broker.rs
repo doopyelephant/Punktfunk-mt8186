@@ -279,6 +279,22 @@ fn recv_frame(sock: &impl AsFd, buf: &mut [u8]) -> Result<(usize, Option<OwnedFd
 
 // ---- the seat's side ----
 
+/// Whether this host makes a pad on `node` (`/dev/uinput`, `/dev/uhid`, vhci's `attach`)
+/// through the broker: a seat host that can't write it. The owner's own host at the desk holds
+/// seat0's ACL and opens the node itself, as the box's host does.
+pub fn brokered(node: &Path) -> bool {
+    asks_broker(pf_paths::seat::is_seat_host(), writable(node))
+}
+
+fn asks_broker(seat_host: bool, writable: bool) -> bool {
+    seat_host && !writable
+}
+
+/// Whether this process may write `node`, ACL included. Nothing is opened.
+pub fn writable(node: &Path) -> bool {
+    rustix::fs::access(node, rustix::fs::Access::WRITE_OK).is_ok()
+}
+
 /// Ask the supervisor for `kind` at `index`: the seat's end of its relay.
 pub fn request(kind: PadKind, index: u8) -> Result<OwnedFd> {
     let (status, _, relay) = ask(Request::Create { kind, index }, None)?;
@@ -646,6 +662,19 @@ fn relay_uinput(mut dev: UinputDevice, seat: UnixDatagram) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a seat host that can't write the node asks the broker.
+    #[test]
+    fn a_host_that_can_write_the_node_opens_it_itself() {
+        assert!(asks_broker(true, false));
+        assert!(!asks_broker(true, true), "the owner's host at the desk");
+        assert!(!asks_broker(false, false), "the box's host");
+        let node = std::env::temp_dir().join(format!("pf-pad-node-{}", std::process::id()));
+        assert!(!writable(&node), "no node");
+        std::fs::write(&node, b"").unwrap();
+        assert!(writable(&node));
+        let _ = std::fs::remove_file(&node);
+    }
 
     #[test]
     fn a_request_round_trips_and_junk_is_refused() {

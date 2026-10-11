@@ -478,7 +478,7 @@ pub fn uinput_probe() -> UinputVerdict {
 /// which is the host's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VhciVerdict {
-    /// Module loaded and this process can write `attach`.
+    /// Module loaded, and this process or the seat's pad broker can write `attach`.
     Ok,
     /// No `/sys/devices/platform/vhci_hcd*/status`: module not loaded.
     ModuleMissing,
@@ -488,34 +488,25 @@ pub enum VhciVerdict {
     Inapplicable { why: &'static str },
 }
 
-/// Probe the vhci attach node for the USB/IP pads: module present, writable by this process.
+/// Probe the vhci attach node for the USB/IP pads: module present, and `attach` writable by
+/// this process or, on a seat that can't write it, the supervisor's pad broker listening.
 ///
 /// Probed whatever the Deck, SC2 and DualSense gates say: a client can always ask for a
 /// Switch 2 pad, which has no other USB transport.
-/// Writability is what attach will attempt. `60-punktfunk.rules` `chgrp punktfunk` +
-/// `chmod 0660`, so only a process that actually carries the group gets `W_OK`.
+/// `60-punktfunk.rules` `chgrp punktfunk` + `chmod 0660`, so only a process that actually
+/// carries the group gets `W_OK`.
 #[cfg(target_os = "linux")]
 pub fn vhci_probe() -> VhciVerdict {
-    use std::os::unix::ffi::OsStrExt;
-
     let Some(base) = usbip::vhci_base() else {
         return VhciVerdict::ModuleMissing;
     };
-    // A seat attaches through the supervisor's pad broker.
-    if pf_paths::seat::is_seat_host() && std::path::Path::new(pf_paths::seat::PADS_SOCKET).exists()
-    {
-        return VhciVerdict::Ok;
-    }
     let attach = base.join("attach");
-    let Ok(c_path) = std::ffi::CString::new(attach.as_os_str().as_bytes()) else {
-        return VhciVerdict::NotWritable {
-            path: attach.display().to_string(),
-        };
+    let reachable = if pad_broker::brokered(&attach) {
+        std::path::Path::new(pf_paths::seat::PADS_SOCKET).exists()
+    } else {
+        pad_broker::writable(&attach)
     };
-    // SAFETY: `c_path` is a NUL-terminated path owned by this frame and outlives the call;
-    // `access` only reads it and retains nothing.
-    let writable = unsafe { libc::access(c_path.as_ptr(), libc::W_OK) } == 0;
-    if writable {
+    if reachable {
         VhciVerdict::Ok
     } else {
         VhciVerdict::NotWritable {

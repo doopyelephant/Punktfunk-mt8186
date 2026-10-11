@@ -251,9 +251,10 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   can't reach it. The runner ends its children on `SIGTERM`, and `seat-reap` ends the session
   by the id the runner recorded.
 - **Pads.** A seat user can't open `/dev/uinput` or `/dev/uhid`: they are the console user's.
-  A seat host asks the daemon's pad broker, `/run/punktfunk/pads.sock`, for a pad by kind, and
-  the daemon builds it from its own tables, keeps the kernel fd and hands the seat one end of a
-  relay socket. A uinput pad's relay carries the seat's `input_event` frames down and rumble
+  A seat host that can write the node opens it itself, as the owner's host at the desk does
+  through seat0's ACL. One that can't asks the daemon's pad broker, `/run/punktfunk/pads.sock`,
+  for a pad by kind, and the daemon builds it from its own tables, keeps the kernel fd and hands
+  the seat one end of a relay socket. A uinput pad's relay carries the seat's `input_event` frames down and rumble
   back; a uhid pad's carries the same `uhid_event`s the seat would write and read, minus
   `CREATE2` and `DESTROY`, which stay the daemon's. The pad lives until the seat hangs up. The
   socket admits a running seat's user only (the owner's row included), eight pads per seat. The
@@ -265,8 +266,8 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   systemd's fd store, so a restart of the daemon keeps a seat's pads; `punktfunk-seats list`
   shows what each seat holds.
 - **USB pads.** A USB/IP pad (the virtual Deck, the SC2, the Switch 2) stays the seat host's own
-  usbip server. The seat runs the import handshake and sends the connected socket with an
-  `Attach`; the daemon picks the vhci port, records it in `/run/punktfunk/pads/vhci/<port>` and
+  usbip server. A seat that can't write vhci's `attach` runs the import handshake and sends the
+  connected socket with an `Attach`; the daemon picks the vhci port, records it in `/run/punktfunk/pads/vhci/<port>` and
   writes `attach`, four ports per seat. The fence maps every node under that port to the seat.
   While the daemon runs, a new vhci interface starts unauthorized and the fence authorizes it
   on its `add`. A seat's binds only when its device is one the host emulates

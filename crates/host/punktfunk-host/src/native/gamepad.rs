@@ -145,11 +145,12 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
     chosen
 }
 
-/// Can this host make a uhid pad? A seat asks the supervisor's broker, so its socket is what
-/// counts there; the box's own host opens `/dev/uhid` (and drops it: nothing is created).
+/// Can this host make a uhid pad? A seat that can't write `/dev/uhid` asks the supervisor's
+/// broker, so its socket is what counts there; any other host opens `/dev/uhid` (and drops it:
+/// nothing is created).
 #[cfg(target_os = "linux")]
 fn uhid_reachable() -> bool {
-    if pf_paths::seat::is_seat_host() {
+    if crate::inject::pad_broker::brokered(std::path::Path::new("/dev/uhid")) {
         return std::path::Path::new(pf_paths::seat::PADS_SOCKET).exists();
     }
     std::fs::OpenOptions::new()
