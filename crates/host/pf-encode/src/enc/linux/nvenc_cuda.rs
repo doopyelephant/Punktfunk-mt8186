@@ -848,6 +848,7 @@ impl NvencCudaEncoder {
                 engines = s.encoder_engines,
                 slices = s.slices,
                 subframe = s.subframe_on,
+                preset = %format_args!("P{}", s.preset),
                 "NVENC CUDA session ready"
             );
             // Chunked poll: multi-slice + sub-frame + sync retrieve. AV1 is 1 slice —
