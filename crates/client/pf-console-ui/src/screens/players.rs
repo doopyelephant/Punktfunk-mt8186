@@ -1,20 +1,22 @@
-//! Controllers: the connected pads as cards, a Test card for the live input test where the
-//! host can run it ([`super::input_test`]), the keyboards and mice the host sees, and on
-//! Android a last "Not showing?" card that opens the grants and tests only the host can
-//! perform ([`super::grants`]). The fourth tab.
+//! Controllers: the connected pads as cards, each drawn as itself at rest, the keyboards and
+//! mice the host sees folded into one card, and on Android a last "Not showing?" card that
+//! opens the grants and tests only the host can perform ([`super::grants`]). The fourth tab.
 //!
 //! Cards are one focus row that glides to keep the focused card in view and takes a
-//! finger's swipe. OK on a pad is its rumble test. Only devices the OS classifies as a
-//! gamepad are forwarded; adapters often enumerate as something else, so each card's
-//! identity line is the support answer.
+//! finger's swipe. OK, or a hold, on a pad opens its menu ([`super::pad_menu`]): the live
+//! input test where the host can run it ([`super::input_test`]) and a rumble pulse where it
+//! holds the device. Only devices the OS classifies as a gamepad are forwarded; adapters
+//! often enumerate as something else, so each card's identity line is the support answer.
 //!
-//! A rumble pulse on a real device stays with the host via [`ConsoleCmd::PadAction`]; the
+//! A rumble pulse on a real device stays with the host via
+//! [`crate::model::ConsoleCmd::PadAction`]; the
 //! desktop has no device handle, so it lists pads and nothing more.
 //! Seat order joins when `seats.rs` lands (`console-ui-redesign.md` §2).
 
+use super::input_test::{art_for, draw_pad, Drawing};
 use crate::el::{Axis, El, Group, Id, Tree};
 use crate::glyphs::{device_icon, Hint};
-use crate::model::{ConsoleCmd, OtherDevice};
+use crate::model::{OtherDevice, PadTestState};
 use crate::platform::Platform;
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Ctx, Outbox, Screen, ScreenView};
@@ -24,11 +26,13 @@ use skia_safe::{Canvas, Rect};
 
 /// Card size and gap, design units.
 const CARD_W: f64 = 300.0;
-const CARD_H: f64 = 164.0;
+const CARD_H: f64 = 200.0;
 const CARD_GAP: f64 = 24.0;
 const CARD_CORNER: f64 = 22.0;
-/// Device mark box, dp: the size the tells inside each pad outline are drawn for.
+/// Key-device silhouette box, dp, on the no-pads card.
 const MARK: f64 = 44.0;
+/// The pad drawing's widest, dp; the room above the card's text clamps it by height.
+const ART_W: f64 = 150.0;
 
 /// Host-only pad work: a permission dialog or a real device handle. Neither
 /// exists on this side of the bridge.
@@ -76,10 +80,9 @@ enum Target {
     Pad(usize),
     /// The inert card that stands in for no pads, so the row is never empty.
     NoPads,
-    /// The live input test, after the pads.
-    Test,
-    /// A keyboard, mouse or other device the host reports. Never a pad to the host.
-    Other(usize),
+    /// Every keyboard, mouse or other device the host reports, in one card: never pads to
+    /// the host, and not what this row is about.
+    Others,
     /// The last card on Android: OK opens the grants and tests.
     Grants,
 }
@@ -95,10 +98,9 @@ fn targets(ctx: &Ctx, others: &[OtherDevice]) -> Vec<Target> {
     } else {
         (0..ctx.pads.len()).map(Target::Pad).collect()
     };
-    if !ctx.pads.is_empty() && can_test(ctx.device.platform) {
-        all.push(Target::Test);
+    if !others.is_empty() {
+        all.push(Target::Others);
     }
-    all.extend((0..others.len()).map(Target::Other));
     if ctx.device.platform == Platform::Android {
         all.push(Target::Grants);
     }
@@ -110,8 +112,7 @@ fn target_id(t: Target, pads: &[PadInfo]) -> Id {
     match t {
         Target::Pad(i) => Id::new(&pads[i].key, 0),
         Target::NoPads => Id::new("no-pads", 0),
-        Target::Test => Id::new("pad-test", 0),
-        Target::Other(i) => Id::new("other-device", i),
+        Target::Others => Id::new("other-devices", 0),
         Target::Grants => Id::new("grants", 0),
     }
 }
@@ -132,6 +133,8 @@ pub(crate) struct PlayersScreen {
     pub(crate) others: Vec<OtherDevice>,
     /// The first frame seats the row on its focus; later frames glide.
     snap: bool,
+    /// One parsed drawing per pad family on the row; the row redraws every frame.
+    drawings: Vec<Drawing>,
 }
 
 impl PlayersScreen {
@@ -140,6 +143,7 @@ impl PlayersScreen {
             tree: Tree::new(),
             others: Vec::new(),
             snap: true,
+            drawings: Vec::new(),
         }
     }
 
@@ -167,7 +171,8 @@ impl ScreenView for PlayersScreen {
                 Some(_) => Some(MenuPulse::Move),
                 None => Some(MenuPulse::Boundary),
             },
-            MenuEvent::Confirm => activate(at, ctx, fx),
+            // A hold (OK held, Y, a long press) opens the card's menu as OK does.
+            MenuEvent::Confirm | MenuEvent::Secondary => activate(at, ctx, fx),
             _ => None,
         }
     }
@@ -199,8 +204,7 @@ impl ScreenView for PlayersScreen {
         Some(match self.focused(ctx) {
             Target::Pad(i) => format!("{}, {}", ctx.pads[i].name, pad_detail(&ctx.pads[i])),
             Target::NoPads => "No controller connected".into(),
-            Target::Test => "Test controller".into(),
-            Target::Other(i) => self.others.get(i)?.name.clone(),
+            Target::Others => others_lines(&self.others).0,
             Target::Grants => "Controller not showing? Opens the access list".into(),
         })
     }
@@ -224,6 +228,12 @@ impl ScreenView for PlayersScreen {
             self.tree.set_focus(Some(target_id(all[0], ctx.pads)));
         }
         let (platform, pads) = (ctx.device.platform, ctx.pads);
+        for art in pads.iter().map(|p| art_for(Some(p.pref))) {
+            if !self.drawings.iter().any(|d| std::ptr::eq(d.art, art)) {
+                self.drawings.push(Drawing::new(art));
+            }
+        }
+        let drawings = &self.drawings;
         let (cw, ch, gap) = (CARD_W * k, CARD_H * k, CARD_GAP * k);
         let cards = &all;
         let row_w = cards.len() as f64 * (cw + gap) - gap;
@@ -259,10 +269,12 @@ impl ScreenView for PlayersScreen {
                 );
                 let t = *t;
                 let others = &self.others;
-                El::paint(move |canvas, r| card(canvas, fonts, t, pads, others, platform, r, k))
-                    .id(target_id(t, pads))
-                    .focusable((CARD_CORNER * k) as f32)
-                    .place(r)
+                El::paint(move |canvas, r| {
+                    card(canvas, fonts, t, pads, others, drawings, platform, r, k)
+                })
+                .id(target_id(t, pads))
+                .focusable((CARD_CORNER * k) as f32)
+                .place(r)
             }))
             .place(Rect::from_xywh(
                 -air as f32,
@@ -290,22 +302,23 @@ impl ScreenView for PlayersScreen {
     }
 }
 
-/// OK on `t`: a rumble pulse for a pad with a motor the host can reach; the grants list
-/// for the last card. Anything else is a thud.
+/// OK on `t`: a pad's menu where the host can test or pulse it; the grants list for the
+/// last card. Anything else is a thud.
 fn activate(t: Target, ctx: &Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
     match t {
-        Target::Pad(i) if can_rumble(&ctx.pads[i], ctx.device.platform) => {
-            fx.cmds.push(ConsoleCmd::PadAction {
-                action: PadAction::Rumble.id().to_string(),
-                pad_key: ctx.pads[i].key.clone(),
-            });
+        Target::Pad(i) => {
+            let p = &ctx.pads[i];
+            let platform = ctx.device.platform;
+            let (test, rumble) = (can_test(platform), can_rumble(p, platform));
+            if !test && !rumble {
+                return Some(MenuPulse::Boundary);
+            }
+            fx.push(Screen::PadMenu(super::pad_menu::PadMenuScreen::new(
+                p, test, rumble,
+            )));
             Some(MenuPulse::Confirm)
         }
-        Target::Pad(_) | Target::NoPads | Target::Other(_) => Some(MenuPulse::Boundary),
-        Target::Test => {
-            fx.push(Screen::InputTest(super::input_test::InputTestScreen::new()));
-            Some(MenuPulse::Confirm)
-        }
+        Target::NoPads | Target::Others => Some(MenuPulse::Boundary),
         Target::Grants => {
             fx.push(Screen::Grants(super::grants::GrantsScreen::new()));
             Some(MenuPulse::Confirm)
@@ -313,7 +326,8 @@ fn activate(t: Target, ctx: &Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
     }
 }
 
-/// A pad card: its family mark, name, what it streams as, battery, and the test OK runs.
+/// A pad card: the pad drawn at rest, its name, what it streams as, battery, and what OK
+/// opens. The other cards are an icon, a title and a line.
 #[allow(clippy::too_many_arguments)]
 fn card(
     canvas: &Canvas,
@@ -321,6 +335,7 @@ fn card(
     t: Target,
     pads: &[PadInfo],
     others: &[OtherDevice],
+    drawings: &[Drawing],
     platform: Platform,
     r: Rect,
     k: f64,
@@ -339,7 +354,7 @@ fn card(
     let max_w = f64::from(r.width()) - 2.0 * pad;
     let base = f64::from(r.bottom) - pad;
     let mark_cy = t0 + 16.0 * k;
-    // An icon, a title and a line: the Test card, a device that is not a pad.
+    // An icon, a title and a line: a card that is not a pad.
     let plain = |icon: &str, title: &str, line: &str, ink| {
         if let Some(icon) = crate::icons::by_name(icon) {
             let box_px = (MARK * 0.62 * k) as f32;
@@ -360,59 +375,25 @@ fn card(
         fonts.draw_clipped(canvas, line, l, base, W::Regular, 13.0 * k, fg(0.55), max_w);
     };
     match t {
-        Target::Test => {
-            return plain(
-                "gamepad-2",
-                "Test controller",
-                "See every button and stick",
-                accent(1.0),
-            );
-        }
-        Target::Other(i) => {
-            let Some(d) = others.get(i) else { return };
-            let icon = match d.kind.as_str() {
-                "keyboard" => "keyboard",
-                "mouse" => "mouse",
-                "remote" => "tv",
+        Target::Others => {
+            let icon = match others.first().map(|d| d.kind.as_str()) {
+                Some("mouse") => "mouse",
+                Some("remote") => "tv",
+                Some("keyboard") => "keyboard",
                 _ => "pointer",
             };
-            return plain(icon, &d.name, "Not a controller", fg(0.5));
+            let (title, line) = others_lines(others);
+            return plain(icon, &title, line, fg(0.5));
         }
-        _ => {}
-    }
-    if t == Target::Grants {
-        if let Some(icon) = crate::icons::by_name("circle-help") {
-            let box_px = (MARK * 0.62 * k) as f32;
-            crate::icons::draw_icon(
-                canvas,
-                icon,
-                (l + f64::from(box_px) / 2.0) as f32,
-                mark_cy as f32,
-                box_px,
+        Target::Grants => {
+            return plain(
+                "circle-help",
+                "Not showing?",
+                "Some controllers need access first",
                 accent(1.0),
             );
         }
-        fonts.draw_clipped(
-            canvas,
-            "Not showing?",
-            l,
-            base - 22.0 * k,
-            W::Bold,
-            21.0 * k,
-            fg(1.0),
-            max_w,
-        );
-        fonts.draw_clipped(
-            canvas,
-            "Some controllers need access first",
-            l,
-            base,
-            W::Regular,
-            13.0 * k,
-            fg(0.55),
-            max_w,
-        );
-        return;
+        _ => {}
     }
     let Target::Pad(i) = t else {
         // No pad: the key device that drives instead.
@@ -441,8 +422,16 @@ fn card(
         return;
     };
     let p = &pads[i];
-    let mark = device_icon(Some(p.pref), platform);
-    crate::glyphs::pad_mark(canvas, mark, l, mark_cy, MARK * k, k, accent(1.0));
+    let art = art_for(Some(p.pref));
+    if let Some(d) = drawings.iter().find(|d| std::ptr::eq(d.art, art)) {
+        // The pad fills the room above its text block, centred, at rest.
+        let room_h = base - 64.0 * k - t0;
+        let scale = (ART_W * k / f64::from(art.w)).min(room_h / f64::from(art.h));
+        let (w, h) = (f64::from(art.w) * scale, f64::from(art.h) * scale);
+        let x = f64::from(r.center_x()) - w / 2.0;
+        let y = t0 + (room_h - h) / 2.0;
+        draw_pad(canvas, fonts, d, &PadTestState::default(), x, y, scale, k);
+    }
     if let Some(b) = p.battery {
         crate::glyphs::battery_pip(
             canvas,
@@ -459,10 +448,11 @@ fn card(
         (true, true) => "Streams as Xbox 360".to_string(),
         (true, false) => format!("Streams as {kind}"),
     };
-    let test = if can_rumble(p, platform) {
-        "OK tests rumble"
-    } else {
-        ""
+    let test = match (can_test(platform), can_rumble(p, platform)) {
+        (true, true) => "OK to test it",
+        (true, false) => "OK opens the test",
+        (false, true) => "OK tests rumble",
+        (false, false) => "",
     };
     fonts.draw_clipped(
         canvas,
@@ -496,21 +486,23 @@ fn card(
     );
 }
 
+/// The folded card's title and line: one device by its name, more by their count.
+fn others_lines(others: &[OtherDevice]) -> (String, &'static str) {
+    match others {
+        [one] => (one.name.clone(), "Not a controller"),
+        _ => (format!("{} other devices", others.len()), "Not controllers"),
+    }
+}
+
 fn detail(t: Target, ctx: &Ctx, others: &[OtherDevice]) -> String {
     match t {
-        Target::Test => "Shows every button, trigger and stick as the controller sends it, to \
-                         tell a worn button from a setting. Hold B to finish."
-            .into(),
-        Target::Other(i) => (others.get(i))
-            .map(|d| {
-                let what = "Streams take it as keyboard or mouse input, not as a pad.";
-                if d.detail.is_empty() {
-                    what.into()
-                } else {
-                    format!("{} \u{2014} {what}", d.detail)
-                }
-            })
-            .unwrap_or_default(),
+        Target::Others => {
+            let names: Vec<&str> = others.iter().map(|d| d.name.as_str()).collect();
+            format!(
+                "{} \u{2014} streams take them as keyboard or mouse input, not as pads.",
+                names.join(" \u{b7} ")
+            )
+        }
         Target::NoPads => "Punktfunk only forwards devices the system classifies as a gamepad or \
                            joystick — a pad behind an adapter or hub may enumerate with the \
                            adapter's identity, or not at all."
@@ -630,15 +622,23 @@ mod tests {
         assert!(!s.tree.following(strip()), "then rests");
     }
 
-    fn rumble(key: &str) -> ConsoleCmd {
-        ConsoleCmd::PadAction {
-            action: "rumble".into(),
-            pad_key: key.into(),
+    fn other(name: &str, kind: &str) -> OtherDevice {
+        OtherDevice {
+            name: name.into(),
+            kind: kind.into(),
+            detail: String::new(),
         }
     }
 
+    fn opens(fx: &Outbox, menu: bool) -> bool {
+        matches!(fx.nav, Some(crate::screens::Nav::Push(ref b))
+            if matches!(**b, Screen::PadMenu(_)) == menu)
+    }
+
+    /// OK, or a hold, on a pad the host can test or pulse opens its menu; Right reaches the
+    /// next pad. A desktop has neither, so OK thuds there.
     #[test]
-    fn ok_on_a_card_asks_the_host_for_a_rumble_pulse() {
+    fn ok_or_a_hold_on_a_pad_opens_its_menu() {
         let pads = [pad("DualSense", true), pad("Edge", true)];
         let mut s = PlayersScreen::new();
         let out = drive(
@@ -648,19 +648,11 @@ mod tests {
             &[
                 MenuEvent::Confirm,
                 MenuEvent::Move(MenuDir::Right),
-                MenuEvent::Confirm,
+                MenuEvent::Secondary,
             ],
         );
-        assert_eq!(out[0].0.cmds, vec![rumble("054c:0ce6:DualSense")]);
-        assert_eq!(
-            out[2].0.cmds,
-            vec![rumble("054c:0ce6:Edge")],
-            "right reaches the next card"
-        );
-    }
-
-    #[test]
-    fn a_pad_the_host_cannot_pulse_thuds() {
+        assert!(opens(&out[0].0, true));
+        assert!(opens(&out[2].0, true), "right reaches the next card");
         let mut s = PlayersScreen::new();
         let out = drive(
             &mut s,
@@ -668,8 +660,10 @@ mod tests {
             &[pad("Adapter", false)],
             &[MenuEvent::Confirm],
         );
-        assert!(out[0].0.cmds.is_empty());
-        assert!(matches!(out[0].1, Some(MenuPulse::Boundary)));
+        assert!(
+            opens(&out[0].0, true),
+            "Android tests a pad it cannot pulse"
+        );
         let mut s = PlayersScreen::new();
         let out = drive(
             &mut s,
@@ -677,18 +671,18 @@ mod tests {
             &[pad("DualSense", true)],
             &[MenuEvent::Confirm],
         );
-        assert!(
-            out[0].0.cmds.is_empty(),
-            "the desktop has no device handle to pulse"
-        );
+        assert!(out[0].0.nav.is_none() && out[0].0.cmds.is_empty());
+        assert!(matches!(out[0].1, Some(MenuPulse::Boundary)));
     }
 
-    /// Right past the last pad lands on Test, whose OK opens the input test; on Android the
-    /// "Not showing?" card follows and opens the grants list. Off Android, Test ends the row.
+    /// Right past the last pad lands on the one card for every other device, which OK
+    /// leaves alone; on Android the "Not showing?" card follows and opens the grants list.
+    /// Off Android, the others' card ends the row.
     #[test]
-    fn right_from_the_cards_reaches_test_then_the_grants_card() {
+    fn right_from_the_cards_reaches_the_others_then_the_grants_card() {
         let pads = [pad("DualSense", true)];
         let mut s = PlayersScreen::new();
+        s.others = vec![other("Keyboard", "keyboard"), other("Mouse", "mouse")];
         let out = drive(
             &mut s,
             Platform::Android,
@@ -702,16 +696,14 @@ mod tests {
             ],
         );
         assert!(matches!(out[0].1, Some(MenuPulse::Boundary)));
-        assert!(
-            matches!(out[2].0.nav, Some(crate::screens::Nav::Push(ref b))
-            if matches!(**b, Screen::InputTest(_)))
-        );
+        assert!(matches!(out[2].1, Some(MenuPulse::Boundary)), "others thud");
         assert!(out[4].0.cmds.is_empty());
         assert!(
             matches!(out[4].0.nav, Some(crate::screens::Nav::Push(ref b))
             if matches!(**b, Screen::Grants(_)))
         );
         let mut s = PlayersScreen::new();
+        s.others = vec![other("Keyboard", "keyboard"), other("Mouse", "mouse")];
         let out = drive(
             &mut s,
             Platform::Apple,
@@ -721,10 +713,42 @@ mod tests {
                 MenuEvent::Move(MenuDir::Right),
             ],
         );
-        assert!(matches!(out[0].1, Some(MenuPulse::Move)), "onto Test");
+        assert!(matches!(out[0].1, Some(MenuPulse::Move)), "onto the others");
         assert!(
             matches!(out[1].1, Some(MenuPulse::Boundary)),
             "no grants off Android"
+        );
+    }
+
+    /// Several other devices fold into one card named by count; one keeps its name.
+    #[test]
+    fn other_devices_fold_into_one_card() {
+        let mut settings = Settings::default();
+        let library = crate::library::LibraryShared::default();
+        let ctx = Ctx::test(&mut settings, &library);
+        let mut s = PlayersScreen::new();
+        s.others = vec![other("Keyboard", "keyboard"), other("Mouse", "mouse")];
+        assert_eq!(
+            targets(&ctx, &s.others),
+            vec![Target::NoPads, Target::Others]
+        );
+        assert_eq!(
+            s.announcement(&ctx).as_deref(),
+            Some("No controller connected")
+        );
+        assert_eq!(
+            detail(Target::Others, &ctx, &s.others),
+            "Keyboard \u{b7} Mouse \u{2014} streams take them as keyboard or mouse input, not \
+             as pads."
+        );
+        assert_eq!(
+            others_lines(&s.others),
+            ("2 other devices".to_string(), "Not controllers")
+        );
+        s.others.pop();
+        assert_eq!(
+            others_lines(&s.others),
+            ("Keyboard".to_string(), "Not a controller")
         );
     }
 
