@@ -411,12 +411,18 @@ public final class StreamLayerView: NSView {
     // MARK: - Capture state machine
 
     /// Clicking into the video engages capture; that click is local (engagement), so
-    /// InputCapture suppresses its press/release toward the host. Clicks while captured
-    /// are the host's (GC forwards them) — nothing to do here.
+    /// InputCapture suppresses its press/release toward the host. A free press in the hidden
+    /// title bar's band drags the window instead. Clicks while captured are the host's (GC
+    /// forwards them) — nothing to do here.
     public override func mouseDown(with event: NSEvent) {
         if streamInputDebug {
             streamInputLog.debug(
                 "mouseDown: captureEnabled=\(self.captureEnabled, privacy: .public) captured=\(self.captured, privacy: .public)")
+        }
+        if mouseDownCanMoveWindow, let window,
+           event.locationInWindow.y >= window.contentLayoutRect.maxY {
+            window.performDrag(with: event)
+            return
         }
         if captureEnabled, !captured {
             engageCapture(fromClick: true)
@@ -428,8 +434,9 @@ public final class StreamLayerView: NSView {
     /// A click from another app counts (one click into the video captures, not two).
     public override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    /// The video runs under the hidden title bar, where AppKit drags the window for any view that
-    /// allows it and never delivers the click. Captured, that press is the host's.
+    /// The video runs under the hidden title bar. A key window delivers that band's press here
+    /// rather than dragging, so `mouseDown` drags while the pointer is free. Captured, the press is
+    /// the host's.
     public override var mouseDownCanMoveWindow: Bool { !captured && window?.isMovable == true }
 
     /// The engage click is complete — drop its suppression latch (see InputCapture;
