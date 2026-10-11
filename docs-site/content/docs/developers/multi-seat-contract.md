@@ -279,7 +279,9 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   `com.steampowered.SteamOSManager1` on the seat's session bus and serves `SessionManagement1`,
   which `steamosctl` and Steam call; `steamos-session-select` and `steamos-desktop-return`, first
   on the seat's `PATH`, call it too. A switch never reaches the box's login. The runner masks the
-  seat user's own `steamos-manager.service` for the session.
+  seat user's own `steamos-manager.service` for the session. The runner starts the host with
+  `PUNKTFUNK_SEAT_HEADLESS=1`; on the owner's row only that host plays the seat's mode, and the
+  owner's own host at the desk leaves Game Mode, its bus name and its gamescope to the box.
 
   The desktop keeps running in Game Mode. A switch moves the seat's own live sessions in place
   between its KWin output and a gamescope the host spawns with `steam -gamepadui -steamos3`, so the
@@ -314,6 +316,7 @@ the profiles that share the owner's desktop and the light seats on it.
 | Variable | The owner's row |
 |---|---|
 | `PUNKTFUNK_SEAT_OWNER` | `1`: the seat host is the owner's own, and also serves the owner and light-seat profiles. |
+| `PUNKTFUNK_SEAT_HEADLESS` | `1`, set by the runner, not the file: the host runs in the row's headless session, not at the desk. |
 | `PUNKTFUNK_CONFIG_DIR`, `PUNKTFUNK_HOST_NAME`, `PUNKTFUNK_GAMESTREAM` | Not set: the owner keeps `~/.config/punktfunk` and their own settings. |
 
 Every row sets `PUNKTFUNK_MDNS=0`, since only the door advertises. The row's environment file is

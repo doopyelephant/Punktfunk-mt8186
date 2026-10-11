@@ -96,6 +96,15 @@ pub fn follows_contract() -> bool {
     is_seat_host() && !is_owner_seat()
 }
 
+/// Whether this host runs a seat's own session, whose Game Mode is the host's: a seat's, or the
+/// owner's row in the headless session the seat runner starts it in
+/// (`PUNKTFUNK_SEAT_HEADLESS=1`). The owner's own host at the desk reads the row's contract too,
+/// but the box's session there is the owner's.
+pub fn runs_seat_session() -> bool {
+    follows_contract()
+        || (is_owner_seat() && std::env::var("PUNKTFUNK_SEAT_HEADLESS").as_deref() == Ok("1"))
+}
+
 /// The seat supervisor's pad broker: a seat host asks here for the pads it cannot make itself.
 pub const PADS_SOCKET: &str = "/run/punktfunk/pads.sock";
 

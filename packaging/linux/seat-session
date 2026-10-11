@@ -262,11 +262,12 @@ else
 fi
 
 # The host restarts on its own, backing off while it fails, for as long as the desktop lives. A
-# desktop that dies ends the seat and the unit's Restart= starts it over.
+# desktop that dies ends the seat and the unit's Restart= starts it over. PUNKTFUNK_SEAT_HEADLESS
+# tells the owner's host it runs here, not at the desk, so Game Mode is its own.
 delay=1
 while alive; do
     started=$SECONDS
-    PUNKTFUNK_MGMT_TOKEN="$TOKEN" "$HOST" serve &
+    PUNKTFUNK_SEAT_HEADLESS=1 PUNKTFUNK_MGMT_TOKEN="$TOKEN" "$HOST" serve &
     wait $!
     echo "seat-session: host exited with $?; restarting in ${delay}s" >&2
     ((SECONDS - started > 60)) && delay=1

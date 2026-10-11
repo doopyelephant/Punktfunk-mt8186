@@ -29,7 +29,7 @@ static DESKTOP_INPUT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock:
 
 /// Whether this seat is in Game Mode.
 pub(crate) fn in_game_mode() -> bool {
-    pf_paths::seat::is_seat_host() && GAME.load(Ordering::Relaxed)
+    pf_paths::seat::runs_seat_session() && GAME.load(Ordering::Relaxed)
 }
 
 /// Whether the seat has a desktop to switch to: its runner pins KWin, else gamescope only.
@@ -49,7 +49,7 @@ pub(crate) fn follow(follower: Follower) {
 pub(crate) fn input_backend_id(compositor: crate::vdisplay::Compositor) -> String {
     let gamescope = compositor == crate::vdisplay::Compositor::Gamescope;
     match DESKTOP_INPUT.get().cloned().flatten() {
-        Some(id) if pf_paths::seat::is_seat_host() && !gamescope => id,
+        Some(id) if pf_paths::seat::runs_seat_session() && !gamescope => id,
         _ => crate::vdisplay::input_backend_id(compositor).to_string(),
     }
 }
@@ -70,9 +70,10 @@ pub(crate) fn connect_route() -> (
     picked
 }
 
-/// Reads the saved mode and owns the name for this host's life.
+/// Reads the saved mode and owns the name for this host's life, in a seat's own session only
+/// ([`pf_paths::seat::runs_seat_session`]). At the desk, the name and the mode are the box's.
 pub(crate) fn spawn() {
-    if !pf_paths::seat::is_seat_host() {
+    if !pf_paths::seat::runs_seat_session() {
         return;
     }
     DESKTOP_INPUT.get_or_init(|| {

@@ -2361,13 +2361,13 @@ fn opens_game_mode(profile: &crate::profiles::Resolved) -> bool {
     crate::seats::session_switch::in_game_mode() && plays_seat_mode(profile)
 }
 
-/// The seat's own profile, or the owner on the owner's row: its sessions play the seat's desktop
-/// or Game Mode on shared planes and follow a switch. A light seat on the owner's row keeps a
-/// gamescope of its own.
+/// The seat's own profile, or the owner on the owner's row in its headless session: its sessions
+/// play the seat's desktop or Game Mode on shared planes and follow a switch. A light seat on the
+/// owner's row keeps a gamescope of its own; the owner's host at the desk plays as the box's.
 #[cfg(target_os = "linux")]
 pub(crate) fn plays_seat_mode(profile: &crate::profiles::Resolved) -> bool {
     use crate::profiles::{OsAccount, SeatTier};
-    pf_paths::seat::is_seat_host()
+    pf_paths::seat::runs_seat_session()
         && !matches!(
             profile.os_account,
             OsAccount::Seat {
