@@ -380,9 +380,87 @@ pub enum PanelStroke {
     Brand(f32),
 }
 
-/// Glass panel with its gloss: glass deepest at the top and clearing toward its foot, and a
-/// sheen from the top left, gone by the middle. `corner` and the dash pattern are design
-/// units; the caller's `k` scales them.
+/// What a card, row or tray is made of. [`Material::Glass`] shipped; the rest are the
+/// candidates under review, cycled live by `examples/scene.rs`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Material {
+    /// Glass deepest at the top clearing toward its foot, a sheen from the top left and a
+    /// stroke fading to nothing: three gradients.
+    Glass,
+    /// One flat colour and a hairline.
+    Solid,
+    /// [`Material::Solid`] with the 1 px lit top edge.
+    SolidLit,
+    /// The field blurred through the card under a thin tint: frosted glass.
+    Frosted,
+    /// [`Material::Solid`] under a wide, faint light from the top left.
+    Satin,
+    /// [`Material::Solid`] with fine grain: matte paper.
+    Grain,
+    /// No fill, a hairline alone.
+    Line,
+}
+
+impl Material {
+    pub const ALL: [Material; 7] = [
+        Material::Glass,
+        Material::Solid,
+        Material::SolidLit,
+        Material::Frosted,
+        Material::Satin,
+        Material::Grain,
+        Material::Line,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Material::Glass => "Glass (shipped)",
+            Material::Solid => "Solid",
+            Material::SolidLit => "Solid, lit edge",
+            Material::Frosted => "Frosted",
+            Material::Satin => "Satin",
+            Material::Grain => "Grain",
+            Material::Line => "Line",
+        }
+    }
+}
+
+thread_local! {
+    static MATERIAL: Cell<Material> = const { Cell::new(Material::Glass) };
+    static GRAIN: std::cell::OnceCell<Option<skia_safe::RuntimeEffect>> =
+        const { std::cell::OnceCell::new() };
+}
+
+pub fn set_material(material: Material) {
+    MATERIAL.with(|m| m.set(material));
+}
+
+pub fn material() -> Material {
+    MATERIAL.with(Cell::get)
+}
+
+/// The solid material: the glass's hue, denser.
+fn solid() -> Color4f {
+    let g = ink().glass;
+    Color4f::new(g.r, g.g, g.b, (g.a * 1.3).min(1.0))
+}
+
+/// Grey hash noise per pixel. `p` is local space, which the panel draw keeps 1:1 with
+/// device pixels.
+const GRAIN_SKSL: &str = "half4 main(float2 p) { float n = fract(sin(dot(floor(p), \
+                          float2(12.9898, 78.233))) * 43758.5453); return half4(n, n, n, 1.0); }";
+
+fn grain_shader() -> Option<skia_safe::Shader> {
+    GRAIN
+        .with(|e| {
+            e.get_or_init(|| skia_safe::RuntimeEffect::make_for_shader(GRAIN_SKSL, None).ok())
+                .clone()
+        })
+        .and_then(|e| e.make_shader(skia_safe::Data::new_empty(), &[], None))
+}
+
+/// A panel in the current [`Material`]: its fill, its light, and its edge. `corner` and
+/// the dash pattern are design units; the caller's `k` scales them.
 pub fn panel(
     canvas: &Canvas,
     rect: Rect,
@@ -392,43 +470,111 @@ pub fn panel(
     k: f32,
 ) {
     let rr = RRect::new_rect_xy(rect, corner * k, corner * k);
-    let mut glass = shaded();
-    glass.set_shader(gradient::shaders::linear_gradient(
-        (
-            Point::new(rect.left, rect.top),
-            Point::new(rect.left, rect.bottom),
-        ),
-        &gradient::Gradient::new(
-            gradient::Colors::new_evenly_spaced(
-                &[ink().glass, ink().glass_low],
-                TileMode::Clamp,
+    let material = material();
+    match material {
+        Material::Glass => {
+            let mut glass = shaded();
+            glass.set_shader(gradient::shaders::linear_gradient(
+                (
+                    Point::new(rect.left, rect.top),
+                    Point::new(rect.left, rect.bottom),
+                ),
+                &gradient::Gradient::new(
+                    gradient::Colors::new_evenly_spaced(
+                        &[ink().glass, ink().glass_low],
+                        TileMode::Clamp,
+                        None,
+                    ),
+                    gradient::Interpolation::default(),
+                ),
                 None,
-            ),
-            gradient::Interpolation::default(),
-        ),
-        None,
-    ));
-    canvas.draw_rrect(rr, &glass);
+            ));
+            canvas.draw_rrect(rr, &glass);
+        }
+        Material::Line => {}
+        // The field through the card; inside a transition layer no band can copy the frame,
+        // and the solid stands in.
+        Material::Frosted if crate::blur::can_backdrop() => {
+            canvas.save();
+            canvas.clip_rrect(rr, None, true);
+            // One band forty cards deep: its ramp never leaves full strength.
+            crate::blur::backdrop(
+                canvas,
+                rect,
+                crate::blur::Band {
+                    edge: rect.top,
+                    clear: rect.top + rect.height() * 40.0,
+                    sigma: 18.0 * k,
+                    over: 0.0,
+                },
+            );
+            let s = solid();
+            canvas.draw_rrect(rr, &fill(Color4f::new(s.r, s.g, s.b, s.a * 0.5)));
+            canvas.restore();
+        }
+        Material::Frosted
+        | Material::Solid
+        | Material::SolidLit
+        | Material::Satin
+        | Material::Grain => {
+            canvas.draw_rrect(rr, &fill(solid()));
+        }
+    }
     if let Some(tint) = tint {
         canvas.draw_rrect(rr, &fill(tint));
     }
-    let mut sheen = shaded();
-    let colors = [
-        Color4f::new(1.0, 1.0, 1.0, SHEEN),
-        Color4f::new(1.0, 1.0, 1.0, 0.0),
-    ];
-    sheen.set_shader(gradient::shaders::linear_gradient(
-        (
-            Point::new(rect.left, rect.top),
-            Point::new(rect.center_x(), rect.center_y()),
-        ),
-        &gradient::Gradient::new(
-            gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
-            gradient::Interpolation::default(),
-        ),
-        None,
-    ));
-    canvas.draw_rrect(rr, &sheen);
+    match material {
+        Material::Glass => {
+            let mut sheen = shaded();
+            let colors = [
+                Color4f::new(1.0, 1.0, 1.0, SHEEN),
+                Color4f::new(1.0, 1.0, 1.0, 0.0),
+            ];
+            sheen.set_shader(gradient::shaders::linear_gradient(
+                (
+                    Point::new(rect.left, rect.top),
+                    Point::new(rect.center_x(), rect.center_y()),
+                ),
+                &gradient::Gradient::new(
+                    gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
+                    gradient::Interpolation::default(),
+                ),
+                None,
+            ));
+            canvas.draw_rrect(rr, &sheen);
+        }
+        Material::Satin => {
+            let mut light = shaded();
+            let colors = [
+                Color4f::new(1.0, 1.0, 1.0, 0.09),
+                Color4f::new(1.0, 1.0, 1.0, 0.0),
+            ];
+            light.set_shader(gradient::shaders::radial_gradient(
+                (
+                    Point::new(
+                        rect.left + rect.width() * 0.2,
+                        rect.top + rect.height() * 0.1,
+                    ),
+                    rect.width().max(rect.height()) * 1.1,
+                ),
+                &gradient::Gradient::new(
+                    gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
+                    gradient::Interpolation::default(),
+                ),
+                None,
+            ));
+            canvas.draw_rrect(rr, &light);
+        }
+        Material::Grain => {
+            if let Some(shader) = grain_shader() {
+                let mut grain = shaded();
+                grain.set_shader(shader);
+                grain.set_alpha_f(0.05);
+                canvas.draw_rrect(rr, &grain);
+            }
+        }
+        _ => {}
+    }
     // Opaque: Plain/Brand overwrite colour; a shader's output is scaled by this paint's alpha.
     let mut sp = shaded_stroke(1.0);
     match stroke {
@@ -439,18 +585,28 @@ pub fn panel(
             sp.set_color4f(accent(alpha), None);
         }
         PanelStroke::Gradient | PanelStroke::GradientDashed => {
-            let colors = [fg(0.22), fg(0.04)];
-            sp.set_shader(gradient::shaders::linear_gradient(
-                (
-                    Point::new(rect.left, rect.top),
-                    Point::new(rect.left, rect.bottom),
-                ),
-                &gradient::Gradient::new(
-                    gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
-                    gradient::Interpolation::default(),
-                ),
-                None,
-            ));
+            if material == Material::Glass {
+                let colors = [fg(0.22), fg(0.04)];
+                sp.set_shader(gradient::shaders::linear_gradient(
+                    (
+                        Point::new(rect.left, rect.top),
+                        Point::new(rect.left, rect.bottom),
+                    ),
+                    &gradient::Gradient::new(
+                        gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
+                        gradient::Interpolation::default(),
+                    ),
+                    None,
+                ));
+            } else {
+                // One hairline the whole way round; the fading edge was the glass's.
+                let alpha = if material == Material::Line {
+                    0.22
+                } else {
+                    0.14
+                };
+                sp.set_color4f(fg(alpha), None);
+            }
             if matches!(stroke, PanelStroke::GradientDashed) {
                 sp.set_path_effect(PathEffect::dash(&[6.0 * k, 5.0 * k], 0.0));
             }
@@ -508,8 +664,14 @@ const RECEDE_SATURATION: f64 = 0.34;
 const RECEDE_BRIGHTNESS: f64 = 0.20;
 
 /// Inner 1 px top-edge highlight over the top 40 % of the panel. Separate from
-/// [`panel`] so resting rows skip the extra stroke.
+/// [`panel`] so resting rows skip the extra stroke. The flat materials have no lit edge.
 pub fn panel_highlight(canvas: &Canvas, rect: Rect, corner: f32, k: f32) {
+    if matches!(
+        material(),
+        Material::Solid | Material::Grain | Material::Line
+    ) {
+        return;
+    }
     let inset = rect.with_inset((0.5 * k, 0.5 * k));
     let mut p = shaded_stroke(k.max(1.0));
     let colors = [fg(0.10), fg(0.0)];
@@ -1214,5 +1376,33 @@ mod tests {
             }
         }
         set_ink(DARK_INK);
+    }
+
+    /// Every material paints a panel: the flat ones cover the field, Line leaves it bare.
+    #[test]
+    fn every_material_paints_a_panel() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((300, 200)).unwrap();
+        let rect = Rect::from_xywh(20.0, 20.0, 260.0, 160.0);
+        for material in Material::ALL {
+            set_material(material);
+            surface.canvas().clear(skia_safe::Color::BLACK);
+            panel(
+                surface.canvas(),
+                rect,
+                22.0,
+                None,
+                PanelStroke::Gradient,
+                1.5,
+            );
+            panel_highlight(surface.canvas(), rect, 22.0, 1.5);
+            let centre = surface.peek_pixels().unwrap().get_color((150, 100));
+            let bare = centre == skia_safe::Color::BLACK;
+            assert_eq!(
+                bare,
+                material == Material::Line,
+                "{material:?} centre {centre:?}"
+            );
+        }
+        set_material(Material::Glass);
     }
 }

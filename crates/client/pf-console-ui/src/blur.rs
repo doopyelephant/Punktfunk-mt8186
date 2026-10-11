@@ -157,6 +157,11 @@ pub fn active() -> bool {
     style() != Style::Off
 }
 
+/// A [`backdrop`] would draw right now: the style is on and no layer is being painted.
+pub fn can_backdrop() -> bool {
+    active() && !IN_LAYER.with(std::cell::Cell::get)
+}
+
 /// Set while the shell paints a screen into a layer; bands inside it are skipped.
 pub fn set_in_layer(on: bool) {
     IN_LAYER.with(|c| c.set(on));

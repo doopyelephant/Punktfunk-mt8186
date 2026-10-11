@@ -91,6 +91,9 @@ mod draw {
                 ) else {
                     anyhow::bail!("Skia could not wrap the {w}×{h} drawable");
                 };
+                // A drawable comes back holding a frame two or three old; the shell paints
+                // over it, not every pixel of it.
+                surface.canvas().clear(skia_safe::Color::BLACK);
                 paint(surface.canvas(), w as u32, h as u32);
                 drop(surface);
                 self.context.flush_and_submit();
@@ -180,6 +183,7 @@ mod scene {
     use pf_client_core::menu_nav::{PadBattery, PadInfo};
     use pf_client_core::trust::Settings;
     use pf_console_ui::bridge::{self, CreateOptions};
+    use pf_console_ui::theme::{set_material, Material};
     use pf_console_ui::{Console, ConsoleHandles, HostRow, Key, OtherDevice, Platform, Viewport};
     use punktfunk_core::config::GamepadPref;
     use sdl3::event::{Event, WindowEvent};
@@ -323,11 +327,28 @@ mod scene {
         let mut draw = Draw::new(builder.build()?)?;
         let mut pump = sdl.event_pump()?;
         eprintln!("arrows move · Return OK · Escape Back · Y hold (card menu) · X · mouse works");
+        eprintln!(
+            "M cycles the panel material: {}",
+            Material::ALL.map(Material::name).join(" → ")
+        );
+        // `PF_SCENE_MATERIAL=<0..6>` opens on that material, for a capture per material.
+        let mut material = std::env::var("PF_SCENE_MATERIAL")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|i| *i < Material::ALL.len())
+            .unwrap_or(0);
+        set_material(Material::ALL[material]);
 
         // Opens on Controllers: Tab is the keyboard's R1, two tabs on from Hosts, then down
-        // into the row. One key every 45 frames: focus moves on the last painted rects, and
-        // a tab slide drops a key that lands mid-flight. Popped from the end.
-        let mut script = vec![Key::Down, Key::Tab, Key::Tab];
+        // into the row (`PF_SCENE_TABS=1` stops on Games). One key every 45 frames: focus
+        // moves on the last painted rects, and a tab slide drops a key that lands mid-flight.
+        // Popped from the end.
+        let tabs = std::env::var("PF_SCENE_TABS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);
+        let mut script = vec![Key::Down];
+        script.extend(std::iter::repeat_n(Key::Tab, tabs));
         let mut frames: u32 = 0;
         let mut last = Instant::now();
         'frames: loop {
@@ -350,6 +371,15 @@ mod scene {
                         win_event: WindowEvent::PixelSizeChanged(..) | WindowEvent::Resized(..),
                         ..
                     } => draw.resized()?,
+                    Event::KeyDown {
+                        keycode: Some(Keycode::M),
+                        repeat: false,
+                        ..
+                    } => {
+                        material = (material + 1) % Material::ALL.len();
+                        set_material(Material::ALL[material]);
+                        eprintln!("material: {}", Material::ALL[material].name());
+                    }
                     Event::KeyDown {
                         keycode: Some(code),
                         keymod,
