@@ -355,8 +355,8 @@ impl LibraryScreen {
     fn grid_cols(&self, rect: Rect, k: f64) -> usize {
         let avail = f64::from(rect.width()) - 2.0 * edge(k);
         let pitch = (GRID_W + GRID_GAP) * k;
-        // Last column has no trailing gap.
-        (((avail + GRID_GAP * k) / pitch).floor() as i64).clamp(2, 8) as usize
+        // Last column has no trailing gap. As many as fit: the grid spans any width.
+        (((avail + GRID_GAP * k) / pitch).floor() as i64).max(2) as usize
     }
 
     /// Last drawn grid. `None` until a frame: do not invent a column count.
