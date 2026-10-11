@@ -179,22 +179,18 @@ pub(crate) fn paint_tile(
         GroupKey::Store(_) => "STORE",
         GroupKey::Platform(_) | GroupKey::Launchers => "PLATFORM",
     };
-    // `draw_tracked` tracks after every character including the last, so the ink
-    // ends one gap short of the pen — `n - 1` when hanging off the right edge.
-    let track = 1.4 * k;
-    let kind_w = f64::from(fonts.measure(kind, W::SemiBold, 11.0 * k))
-        + track * (kind.chars().count().saturating_sub(1)) as f64;
+    let kind_w = f64::from(fonts.measure(kind, W::SemiBold, 11.0 * k));
     // Never left of the deck's reserved corner: a narrow tile would otherwise
     // walk the caption back into the covers.
     let kind_x = (f64::from(rect.right) - pad - kind_w).max(l + (FAN_W + 10.0) * fk);
-    fonts.draw_tracked(
+    let kind_y = t + 12.0 * k;
+    fonts.draw(
         canvas,
         kind,
         kind_x,
-        t + 12.0 * k,
+        kind_y,
         W::SemiBold,
         11.0 * k,
-        track,
         fg(0.45),
     );
 }

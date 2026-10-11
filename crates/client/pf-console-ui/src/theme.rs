@@ -757,30 +757,6 @@ impl Fonts {
         font.measure_str(text, None).0
     }
 
-    /// Letter-spaced run. Skia's `draw_str` has no tracking, so each char is placed.
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw_tracked(
-        &self,
-        canvas: &Canvas,
-        text: &str,
-        x: f64,
-        baseline: f64,
-        w: W,
-        size: f64,
-        tracking: f64,
-        color: Color4f,
-    ) {
-        let font = self.font(w, size);
-        let paint = fill(color);
-        let mut pen = x as f32;
-        let mut buf = [0u8; 4];
-        for ch in text.chars() {
-            let s = ch.encode_utf8(&mut buf);
-            canvas.draw_str(&*s, Point::new(pen, baseline as f32), &font, &paint);
-            pen += font.measure_str(&*s, None).0 + tracking as f32;
-        }
-    }
-
     /// Bump the paragraph-cache clock. Entries not drawn this frame or the last
     /// are eviction candidates. The shell calls this once per `render_in`.
     pub fn begin_frame(&self) {
@@ -958,15 +934,6 @@ impl Fonts {
         fitted.push_str(ell);
         self.draw(canvas, &fitted, x, baseline, w, size, color);
     }
-}
-
-/// First family that matches. Linux fontconfig resolves generic aliases
-/// ("sans-serif"); Windows DirectWrite does not, so the list includes concrete names.
-#[cfg(feature = "vulkan-overlay")]
-pub fn match_first_family(mgr: &FontMgr, families: &[&str], style: FontStyle) -> Option<Typeface> {
-    families
-        .iter()
-        .find_map(|f| mgr.match_family_style(f, style))
 }
 
 /// `src` composited over an opaque `dst`: the opaque colour a stacked paint shows.

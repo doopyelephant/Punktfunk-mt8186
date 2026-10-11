@@ -351,18 +351,9 @@ pub(super) fn desk_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, r: Rect, k:
     fonts.draw_clipped(canvas, &h.name, l, name_base, W::Bold, 17.0 * k, fg(1.0), w);
 }
 
-/// A section's name over its row: semibold, tracked, in the secondary ink.
+/// A section's name over its row: semibold, in the secondary ink.
 pub(super) fn heading(canvas: &Canvas, fonts: &Fonts, label: &str, x: f64, baseline: f64, k: f64) {
-    fonts.draw_tracked(
-        canvas,
-        label,
-        x,
-        baseline,
-        W::SemiBold,
-        14.0 * k,
-        1.1 * k,
-        fg(0.62),
-    );
+    fonts.draw(canvas, label, x, baseline, W::SemiBold, 14.0 * k, fg(0.62));
 }
 
 /// The one line of text a band draws, centred in `max_w`, ellipsized.

@@ -314,17 +314,15 @@ impl Foot<'_> {
             );
         }
         if let Some(sub) = self.subtitle {
-            let (size, track) = (11.0 * k, 1.2 * k);
-            let tw = f64::from(fonts.measure(sub, W::SemiBold, size))
-                + track * sub.chars().count().saturating_sub(1) as f64;
-            fonts.draw_tracked(
+            let size = 11.0 * k;
+            let tw = f64::from(fonts.measure(sub, W::SemiBold, size));
+            fonts.draw(
                 canvas,
                 sub,
                 cx - tw / 2.0,
                 base,
                 W::SemiBold,
                 size,
-                track,
                 fg(0.55),
             );
         }
@@ -1100,14 +1098,13 @@ impl MenuList {
         let top =
             f64::from(cell.top) + self.bump.pos * k * whip + (1.0 - ent.travel) * ROW_RISE * k;
         if let Some(header) = row.header {
-            fonts.draw_tracked(
+            fonts.draw(
                 canvas,
                 &header.to_uppercase(),
                 x0 + 16.0 * k,
                 top - HEADER_RISE * k,
                 W::SemiBold,
                 12.0 * k,
-                1.4 * k,
                 fg(0.45),
             );
         }
