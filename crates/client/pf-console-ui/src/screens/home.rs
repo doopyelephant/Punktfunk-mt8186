@@ -42,8 +42,8 @@ const ROW_AIR: f64 = 16.0;
 /// The air above the verbs, and the gap between two.
 const VERB_AIR: f64 = 16.0;
 const VERB_GAP: f64 = 12.0;
-/// Air between the verbs and the games.
-const GAMES_AIR: f64 = 12.0;
+/// Air between the verbs and the games: a section break, wider than the air in the row.
+const GAMES_AIR: f64 = 24.0;
 
 /// Air over the row for a group's caption, when the hosts are grouped.
 const GROUP_AIR: f64 = 24.0;
