@@ -65,9 +65,10 @@ pub fn spawn_pin(pad: u8) {
     }
 }
 
-/// `Ok(0)` means the card is not in the graph yet. Matches the exact USB ids only: the
-/// usbip-minted pad always announces `device.vendor.id`/`device.product.id`, unlike the
-/// physical pads `pf_client_core::pad_audio` also matches by name.
+/// `Ok(0)` means the card is not in the graph yet. Matches the exact USB ids only, unlike the
+/// physical pads `pf_client_core::pad_audio` also matches by name. PipeWire 1.6 leaves
+/// `device.vendor.id`/`device.product.id` out of a card's announce, so each card is bound and
+/// read from its `info`.
 fn pin_pad_sinks() -> Result<usize> {
     use pipewire as pw;
     use std::cell::{Cell, RefCell};
@@ -84,38 +85,53 @@ fn pin_pad_sinks() -> Result<usize> {
         channels: Rc<Cell<u32>>,
     }
 
+    /// A bound card, kept alive until its `info` lands. `ds5` is set from that info, or from
+    /// the announce on a PipeWire that still publishes the ids there.
+    struct Card {
+        id: u32,
+        _device: pw::device::Device,
+        _listener: pw::device::DeviceListener,
+        ds5: Rc<Cell<bool>>,
+    }
+
     let sinks: Rc<RefCell<Vec<Sink>>> = Rc::default();
-    let ds5_cards: Rc<RefCell<Vec<u32>>> = Rc::default();
+    let cards: Rc<RefCell<Vec<Card>>> = Rc::default();
 
     let _reg_listener = session
         .registry
         .add_listener_local()
         .global({
-            let (registry, sinks, ds5_cards) =
-                (session.registry.clone(), sinks.clone(), ds5_cards.clone());
+            let (registry, sinks, cards) = (session.registry.clone(), sinks.clone(), cards.clone());
             move |g| {
                 let Some(props) = g.props else { return };
-                let usb_id = |k: &str| {
-                    props.get(k).and_then(|v| {
-                        let v = v.trim();
-                        // Explicit radix 16: a bare `054c` under base 0 is octal.
-                        v.strip_prefix("0x")
-                            .or_else(|| v.strip_prefix("0X"))
-                            .map(|h| u32::from_str_radix(h, 16))
-                            .unwrap_or_else(|| u32::from_str_radix(v, 16))
-                            .ok()
-                    })
-                };
                 match g.type_ {
-                    // Cards publish vendor/product on announce; no bind needed.
                     pw::types::ObjectType::Device => {
-                        let vendor = usb_id("device.vendor.id");
-                        let product = usb_id("device.product.id");
-                        if vendor == Some(DS5_VENDOR)
-                            && product.is_some_and(|p| DS5_PRODUCTS.contains(&p))
-                        {
-                            ds5_cards.borrow_mut().push(g.id);
-                        }
+                        let ds5 = Rc::new(Cell::new(is_ds5(
+                            props.get("device.vendor.id"),
+                            props.get("device.product.id"),
+                        )));
+                        let Ok(device) = registry.bind::<pw::device::Device, _>(g) else {
+                            return;
+                        };
+                        let listener = device
+                            .add_listener_local()
+                            .info({
+                                let ds5 = ds5.clone();
+                                move |info| {
+                                    let Some(p) = info.props() else { return };
+                                    if is_ds5(p.get("device.vendor.id"), p.get("device.product.id"))
+                                    {
+                                        ds5.set(true);
+                                    }
+                                }
+                            })
+                            .register();
+                        cards.borrow_mut().push(Card {
+                            id: g.id,
+                            _device: device,
+                            _listener: listener,
+                            ds5,
+                        });
                     }
                     pw::types::ObjectType::Node => {
                         if !props
@@ -157,12 +173,17 @@ fn pin_pad_sinks() -> Result<usize> {
         })
         .register();
 
-    session.round()?; // 1: globals replay; sinks get bound
-    session.round()?; // 2: the binds' `info` events land, carrying audio.channels
+    session.round()?; // 1: globals replay; cards and sinks get bound
+    session.round()?; // 2: the binds' `info` events land: the cards' ids, audio.channels
 
     let mut pinned = 0;
     {
-        let cards = ds5_cards.borrow();
+        let cards: Vec<u32> = cards
+            .borrow()
+            .iter()
+            .filter(|c| c.ds5.get())
+            .map(|c| c.id)
+            .collect();
         for s in sinks.borrow().iter() {
             // Card sink only. A host-minted pad sink publishes the DualSense identity
             // for Proton; `device.id` is what tells them apart.
@@ -184,6 +205,22 @@ fn pin_pad_sinks() -> Result<usize> {
     }
     session.round()?; // 3: flush the set_params before the loop and its proxies drop
     Ok(pinned)
+}
+
+/// A DualSense or DualSense Edge card, by its `device.vendor.id` and `device.product.id`.
+fn is_ds5(vendor: Option<&str>, product: Option<&str>) -> bool {
+    usb_id(vendor) == Some(DS5_VENDOR) && usb_id(product).is_some_and(|p| DS5_PRODUCTS.contains(&p))
+}
+
+/// A USB id as PipeWire writes it, `0x054c` or a bare `054c`. Explicit radix 16: a bare
+/// `054c` under base 0 is octal.
+fn usb_id(value: Option<&str>) -> Option<u32> {
+    let v = value?.trim();
+    v.strip_prefix("0x")
+        .or_else(|| v.strip_prefix("0X"))
+        .map(|h| u32::from_str_radix(h, 16))
+        .unwrap_or_else(|| u32::from_str_radix(v, 16))
+        .ok()
 }
 
 fn unity_volume_pod(channels: u32) -> Result<Vec<u8>> {
@@ -241,6 +278,18 @@ mod tests {
             assert_eq!(v.len(), channels as usize);
             assert!(v.iter().all(|&x| x == 1.0), "every channel must be unity");
         }
+    }
+
+    /// Both spellings PipeWire uses, either pad, nothing else.
+    #[test]
+    fn a_dualsense_card_is_known_by_its_ids() {
+        assert!(is_ds5(Some("0x054c"), Some("0x0ce6")));
+        assert!(is_ds5(Some("054c"), Some("0df2")));
+        assert!(is_ds5(Some(" 0X054C "), Some("0x0CE6")));
+        assert!(!is_ds5(Some("0x054c"), Some("0x05c4")), "a DualShock 4");
+        assert!(!is_ds5(Some("0x28de"), Some("0x0ce6")));
+        assert!(!is_ds5(None, Some("0x0ce6")), "ids not announced");
+        assert!(!is_ds5(Some("0x054c"), Some("junk")));
     }
 
     /// An empty `channelVolumes` is not "leave it"; PipeWire may apply it as-is.
