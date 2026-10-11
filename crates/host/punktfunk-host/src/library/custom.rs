@@ -731,9 +731,10 @@ fn reconcile_entries(
 }
 
 /// Replace `provider`'s rows (`PUT /library/provider/{provider}`), optionally under a store
-/// claim (`?store=steam`). Caller validates name and payload. Emits `library.changed`.
-/// Claiming is idempotent for the holder and 409 for anyone else. A provider holds at most
-/// one store: claiming a new one releases the old.
+/// claim (`?store=steam`). Caller validates name and payload. Saves and emits
+/// `library.changed` only when the provider's rows or claims change: plugins re-send their
+/// whole set on a timer. Claiming is idempotent for the holder and 409 for anyone else. A
+/// provider holds at most one store: claiming a new one releases the old.
 pub fn reconcile_provider(
     provider: &str,
     store: Option<&str>,
@@ -741,6 +742,17 @@ pub fn reconcile_provider(
 ) -> Result<MutateOutcome<Vec<CustomEntry>>> {
     let _serial = catalog_lock();
     let mut catalog = load_catalog();
+    // The provider's rows in its own order: a reconcile moves them to the end of the list.
+    let rows = |c: &Catalog| {
+        serde_json::to_value(
+            c.entries
+                .iter()
+                .filter(|e| e.provider.as_deref() == Some(provider))
+                .collect::<Vec<_>>(),
+        )
+        .ok()
+    };
+    let before = (rows(&catalog), catalog.claims.clone());
     if let Some(store) = store {
         if let Some(holder) = catalog.claims.get(store) {
             if holder != provider {
@@ -769,8 +781,10 @@ pub fn reconcile_provider(
         }
     }
     let result = reconcile_entries(&mut catalog.entries, provider, store, inputs);
-    save_catalog(&catalog)?;
-    emit_changed(provider);
+    if (rows(&catalog), catalog.claims.clone()) != before {
+        save_catalog(&catalog)?;
+        emit_changed(provider);
+    }
     Ok(MutateOutcome::Done(result))
 }
 

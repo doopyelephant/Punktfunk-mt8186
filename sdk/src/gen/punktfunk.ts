@@ -3854,7 +3854,7 @@ readonly "setLibraryArtPick": {
   /**
 * The payload is the desired set, keyed by `external_id`. The host diffs, keeps surviving
 * host ids stable, and drops orphans. Empty array removes everything this provider owns.
-* Emits `library.changed` with the provider as `source`.
+* Emits `library.changed` with the provider as `source` when its rows or claim change.
 * 
 * `?store=` claims that store: entries surface as `<store>:<external_id>` with the store
 * badge. One provider per store; a second claimant gets 409. Release the claim with
