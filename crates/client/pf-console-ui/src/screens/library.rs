@@ -60,7 +60,7 @@ fn shelf_cover(i: usize) -> Id {
 const ROW_GAP: f64 = 22.0;
 /// A heading over the grid: its line and the air to row 0.
 const GRID_HEADING: f64 = 34.0;
-/// Row 0's air under the Hosts row: the plate's outset and a breath.
+/// Row 0's air under the Hosts row with no heading over it: the plate's outset and a breath.
 const EMBED_AIR: f64 = 14.0;
 /// New covers a screen adopts a frame. Each is a texture upload on its first draw, and a
 /// shelf's worth landing together stalls the GPU for a frame.
@@ -1157,7 +1157,8 @@ impl LibraryScreen {
         let fit = (avail / ((cols as f64 * (GRID_W + GRID_GAP) - GRID_GAP) * k)).clamp(0.25, 1.0);
         let (cw, ch) = (GRID_W * k * fit, GRID_H * k * fit);
         let pitch_x = cw + GRID_GAP * k * fit;
-        let heading_h = if self.embedded {
+        // Under the Hosts row a heading (the launchers' band) takes the whole band too.
+        let heading_h = if self.embedded && shape.split == 0 {
             EMBED_AIR
         } else {
             GRID_HEADING
