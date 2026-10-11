@@ -190,9 +190,19 @@ pub(super) fn run_async(
     let mut barren = 0u32;
     // The failed codec's layer, still showing the last good frame until a rebuilt one presents.
     let mut stale: Option<Layer> = None;
+    // Monotonic ns of the feeder's last loss gap (each one fires an RFI ask); 0 = none yet.
+    let last_gap_ns = Arc::new(AtomicI64::new(0));
+    let (mut rebuilds, mut after_gap) = (0u32, 0u32);
     loop {
         match run_codec(
-            &client, &window, &shutdown, &stats, &opts, rebuilt, &mut stale,
+            &client,
+            &window,
+            &shutdown,
+            &stats,
+            &opts,
+            rebuilt,
+            &mut stale,
+            &last_gap_ns,
         ) {
             RunEnd::Stopped => return,
             RunEnd::Failed { presented } => {
@@ -204,7 +214,21 @@ pub(super) fn run_async(
                     );
                     return;
                 }
-                log::warn!("decode: rebuilding the decoder in place");
+                // Moonlight saw MediaTek HEVC decoders hang right after an RFI (GE8xxx GPUs).
+                // The 5 s window is a reading aid for the report, not a verdict.
+                rebuilds += 1;
+                let gap_age_ms = match last_gap_ns.load(Ordering::Relaxed) {
+                    0 => None,
+                    t => Some(now_monotonic_ns().saturating_sub(t) / 1_000_000),
+                };
+                if gap_age_ms.is_some_and(|ms| ms < 5_000) {
+                    after_gap += 1;
+                }
+                log::warn!(
+                    "decode: rebuilding the decoder in place (rebuild {rebuilds}, {after_gap} \
+                     within 5 s of a loss gap; last gap {})",
+                    gap_age_ms.map_or("none".to_string(), |ms| format!("{ms} ms ago"))
+                );
                 rebuilt = true;
             }
         }
@@ -221,7 +245,8 @@ pub(super) fn run_async(
 /// Each run owns its event channel, so a dead codec's late callbacks cannot hand this run a
 /// stale buffer index. `rebuilt`: a previous codec failed, so this one waits for a keyframe.
 /// `stale`: a failed run's layer, hidden at this run's first present; a failed run that
-/// presented leaves its own layer there.
+/// presented leaves its own layer there. `last_gap_ns`: where the feeder stamps each loss gap,
+/// for the rebuild log.
 #[allow(clippy::too_many_arguments)]
 fn run_codec(
     client: &Arc<NativeClient>,
@@ -231,6 +256,7 @@ fn run_codec(
     opts: &DecodeOptions,
     rebuilt: bool,
     stale: &mut Option<Layer>,
+    last_gap_ns: &Arc<AtomicI64>,
 ) -> RunEnd {
     let mode = client.mode();
     // The event channel: the callbacks + feeder push, this loop pulls. `Sender` is `Send`, so the
@@ -324,7 +350,14 @@ fn run_codec(
     }
 
     // `ev_tx` moves into the feeder: from here only it and the codec callbacks keep the channel up.
-    let feeder = Feeder::spawn(client, stats, measure_decode, in_flight, ev_tx);
+    let feeder = Feeder::spawn(
+        client,
+        stats,
+        measure_decode,
+        in_flight,
+        ev_tx,
+        last_gap_ns.clone(),
+    );
     // ADPF: register this thread now. `aux` creates the session on the first presented frame, by
     // when the pump, audio and feeder threads have registered their tids too.
     client.register_hot_thread();
@@ -1367,6 +1400,7 @@ impl Feeder {
         measure_decode: bool,
         in_flight: Arc<Mutex<VecDeque<(u64, i128)>>>,
         ev_tx: mpsc::Sender<DecodeEvent>,
+        last_gap_ns: Arc<AtomicI64>,
     ) -> Feeder {
         let stop = Arc::new(AtomicBool::new(false));
         let join = {
@@ -1376,7 +1410,15 @@ impl Feeder {
             std::thread::Builder::new()
                 .name("pf-decode-feed".into())
                 .spawn(move || {
-                    feeder_loop(client, stats, measure_decode, in_flight, stop, ev_tx);
+                    feeder_loop(
+                        client,
+                        stats,
+                        measure_decode,
+                        in_flight,
+                        stop,
+                        ev_tx,
+                        last_gap_ns,
+                    );
                 })
                 .ok()
         };
@@ -1393,8 +1435,8 @@ impl Feeder {
 
 /// The `pf-decode-feed` thread: block on the connector for the next access unit so the async loop
 /// never has to. Stamps receipt for the decode stage (the connector already noted it for the
-/// overlay), then hands the AU to the loop via the event channel. Exits when `shutdown` is set,
-/// the session closes, or the loop's receiver is gone.
+/// overlay), stamps `last_gap_ns` on a loss gap, then hands the AU to the loop via the event
+/// channel. Exits when `shutdown` is set, the session closes, or the loop's receiver is gone.
 fn feeder_loop(
     client: Arc<NativeClient>,
     stats: Arc<crate::stats::VideoStats>,
@@ -1402,6 +1444,7 @@ fn feeder_loop(
     in_flight: Arc<Mutex<VecDeque<(u64, i128)>>>,
     shutdown: Arc<AtomicBool>,
     ev_tx: mpsc::Sender<DecodeEvent>,
+    last_gap_ns: Arc<AtomicI64>,
 ) {
     while !shutdown.load(Ordering::Relaxed) {
         match client.next_frame(Duration::from_millis(5)) {
@@ -1416,6 +1459,9 @@ fn feeder_loop(
                 } else {
                     0
                 };
+                if gap > 0 {
+                    last_gap_ns.store(now_monotonic_ns(), Ordering::Relaxed);
+                }
                 // Park the receipt stamp whenever the `decode` stage is consumed: the HUD, or the
                 // ABR decode signal (`measure_decode`).
                 if (stats.enabled() || measure_decode) && frame.complete {
