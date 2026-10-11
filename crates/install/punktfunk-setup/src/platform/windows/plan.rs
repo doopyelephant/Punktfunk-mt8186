@@ -373,6 +373,18 @@ fn host_install(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
     if choices.start_service {
         service_steps.push(run(&[&host_exe, "service", "start"]));
     }
+    // A new task goes before the service: the host's first start grants the runner its access
+    // only when the task exists. An existing one stays after it, so the upgrade's stop holds.
+    let new_runner = facts.scripting_task == TaskState::Absent;
+    let runner = || {
+        vec![WinAction::RegisterScriptingTask {
+            app_dir: app.clone(),
+            start_now: new_runner,
+        }]
+    };
+    if new_runner {
+        plan.push("Plugin runner", runner());
+    }
     plan.push("Service", service_steps);
 
     plan.push(
@@ -383,13 +395,9 @@ fn host_install(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
         }],
     );
 
-    plan.push(
-        "Plugin runner",
-        vec![WinAction::RegisterScriptingTask {
-            app_dir: app.clone(),
-            start_now: facts.scripting_task == TaskState::Absent,
-        }],
-    );
+    if !new_runner {
+        plan.push("Plugin runner", runner());
+    }
 
     if upgrade {
         plan.push(

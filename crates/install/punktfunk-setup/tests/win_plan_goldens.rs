@@ -363,6 +363,28 @@ fn uninstall_order_is_service_tray_then_all_three_driver_legs() {
     assert!(pos("driver uninstall --gamepad") < pos("driver uninstall --audio"));
 }
 
+// The host's first start grants the runner its access only for a task that exists. An upgrade
+// keeps the task after the service, so the stop's disable still holds when the host starts.
+#[test]
+fn a_new_runner_task_is_registered_before_the_service_starts() {
+    let order = |facts: &WinFacts| {
+        let plan = host_plan(facts, &WinChoices::derive(facts, Artifact::Host));
+        let steps: Vec<&WinAction> = plan.steps().collect();
+        let runner = steps
+            .iter()
+            .position(|s| matches!(s, WinAction::RegisterScriptingTask { .. }))
+            .unwrap();
+        let start = ["service".to_string(), "start".to_string()];
+        let service = steps
+            .iter()
+            .position(|s| matches!(s, WinAction::Run(argv) if argv.ends_with(&start)))
+            .unwrap();
+        runner < service
+    };
+    assert!(order(&fresh()));
+    assert!(!order(&upgrade()));
+}
+
 // Restore carries the pre-install task states, so an upgrade puts back what was there.
 #[test]
 fn restore_carries_the_pre_install_task_states() {

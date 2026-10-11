@@ -145,6 +145,9 @@ pub struct Options {
     /// The tray's bearer for `/local/summary` (`mgmt_token::mint_tray_token`). `None` serves
     /// no summary: a seat host, or a token file that did not land.
     pub tray_token: Option<String>,
+    /// This start minted [`Self::plugin_token`]. A runner already up predates it and the TLS
+    /// pin, so it restarts once the API serves.
+    pub restart_runner: bool,
 }
 
 impl Default for Options {
@@ -155,6 +158,7 @@ impl Default for Options {
             plugin_token: None,
             plugin_tokens: std::collections::BTreeMap::new(),
             tray_token: None,
+            restart_runner: false,
         }
     }
 }
@@ -276,6 +280,9 @@ pub async fn run(
     // Plain HTTP answers only while the plane runs: a host serving no browsers listens exactly
     // as it did before.
     let plain = browser_plane.then(bootstrap_app);
+    if opts.restart_runner {
+        crate::plugins::restart_runtime_after_first_mint();
+    }
     serve_https_with_plain(opts.bind, app, tls, plain).await
 }
 
