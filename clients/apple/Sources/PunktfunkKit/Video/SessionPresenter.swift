@@ -13,7 +13,7 @@ import AVFoundation
 import Foundation
 import PunktfunkShared
 import QuartzCore
-#if os(tvOS)
+#if os(tvOS) || os(iOS)
 import UIKit
 #endif
 
@@ -57,8 +57,8 @@ enum PresenterChoice: Equatable {
     /// Resolve an explicit diagnostic override, or nil for no supported selection.
     ///
     /// Stage-2 remains a faithful arrival-pacing A/B. Stage-4 is limited to iOS/tvOS because the
-    /// macOS path has separate synchronization constraints. `decoded` is tvOS-only because its
-    /// displayed-IOSurface metering is validated there. Stage-1 additionally requires the
+    /// macOS path has separate synchronization constraints. `decoded` (the video-plane A/B) needs
+    /// iOS/tvOS 17.4 for its displayed-IOSurface metering. Stage-1 additionally requires the
     /// caller's release-build gate.
     static func explicit(setting: String?, env: String?, allowStage1: Bool) -> PresenterChoice? {
         let raw = env.flatMap { $0.isEmpty ? nil : $0 } ?? setting
@@ -73,8 +73,8 @@ enum PresenterChoice: Equatable {
             return .stage4
             #endif
         case "decoded":
-            #if os(tvOS)
-            if #available(tvOS 17.4, *) { return .decoded }
+            #if os(tvOS) || os(iOS)
+            if #available(iOS 17.4, tvOS 17.4, *) { return .decoded }
             return nil
             #else
             return nil
@@ -85,10 +85,10 @@ enum PresenterChoice: Equatable {
 
     /// iOS and tvOS use deadline-paced Metal, macOS arrival-paced Metal.
     ///
-    /// The deadline link late-latches each drawable to one refresh + 4 ms before glass
-    /// (`LatchBudget`). Filmed at 240 fps on a 60 Hz Apple TV, that answered controller presses
-    /// 9 ms sooner than the decoded video plane, whose displayed-surface metric reads about a
-    /// refresh early. `decoded` stays an explicit A/B on tvOS 17.4+.
+    /// The deadline link presents each drawable as late as its deadline allows
+    /// (`DeadlinePacer`). Filmed at 240 fps on a 60 Hz Apple TV, a late pick answered controller
+    /// presses 9 ms sooner than the decoded video plane, whose displayed-surface metric reads
+    /// about a refresh early. `decoded` stays an explicit A/B on tvOS 17.4+.
     static var platformDefault: PresenterChoice {
         #if os(macOS)
         return .stage2
@@ -233,6 +233,9 @@ final class SessionPresenter {
     private var pump: StreamPump?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
+    /// iOS: pushes `UIScreen.currentEDRHeadroom` twice a second. It follows brightness and posts
+    /// no change notification; the linear HDR shaders roll highlights onto it.
+    private var headroomTimer: Timer?
     private var panel = PanelInfo(minHz: 0, maxHz: 0)
 
     /// The hosting screen's refresh range and granularity, from the view on start and every
@@ -379,6 +382,14 @@ final class SessionPresenter {
                 stage2Link = link
             }
             syncFrameRate(hz: connection.currentMode().refreshHz)
+            #if os(iOS)
+            pipeline.setDisplayHeadroom(UIScreen.main.currentEDRHeadroom)
+            let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+                self?.stage2?.setDisplayHeadroom(UIScreen.main.currentEDRHeadroom)
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            headroomTimer = timer
+            #endif
             pipeline.setPanel(panel)
             pipeline.start(
                 connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd,
@@ -586,6 +597,8 @@ final class SessionPresenter {
         pump = nil
         stage2Link?.invalidate()
         stage2Link = nil
+        headroomTimer?.invalidate()
+        headroomTimer = nil
         stage2?.stop() // stops the pump (synchronous join) + drops the decode session
         stage2 = nil
         metalLayer?.removeFromSuperlayer()
@@ -597,6 +610,7 @@ final class SessionPresenter {
         // The owning view's stop() normally ran already; this covers a missed teardown so the
         // display link can't keep ticking a deallocated pipeline.
         stage2Link?.invalidate()
+        headroomTimer?.invalidate()
         stage2?.stop()
         pump?.stop()
     }

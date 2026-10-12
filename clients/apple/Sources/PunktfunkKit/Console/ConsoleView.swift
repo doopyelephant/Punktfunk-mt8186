@@ -39,8 +39,10 @@ public final class ConsoleMetalView: ConsolePlatformView {
     private var scrollFrom: CGPoint?
     /// Where the remote's swipe last stepped from.
     private var swipeFrom: CGPoint?
+    #if canImport(UIKit)
     /// A held remote direction or keyboard key, and the timer that repeats it.
     private var held: (press: UIPress, event: ConsoleBridge.Menu?, timer: Timer)?
+    #endif
     /// Presses taken on the way down. Their release stays ours, even when the Back one carried
     /// reached the root in between.
     private var claimed = Set<ObjectIdentifier>()
@@ -95,8 +97,10 @@ public final class ConsoleMetalView: ConsolePlatformView {
     public func stop() {
         link?.invalidate()
         link = nil
+        #if canImport(UIKit)
         held?.timer.invalidate()
         held = nil
+        #endif
     }
 
     @objc private func tick() {
