@@ -38,16 +38,19 @@ const PACKAGE: [&str; 3] = [
 /// The RDP listener takes a moment to come up after `fDenyTSConnections` flips.
 const TRUST_ATTEMPTS: u32 = 3;
 const TRUST_RETRY: Duration = Duration::from_secs(2);
-/// Role, licensing and a GPU as three `0`/`1` flags. The licensing types 2 and 4 are Per
-/// Device and Per User; an adapter named `Microsoft …` is the basic or remote display driver.
+/// The role's install state, then licensing and a GPU as `0`/`1` flags, on the last line. A role
+/// the cmdlet can't read is `Unknown`, after the cmdlet's error. The licensing types 2 and 4 are
+/// Per Device and Per User; an adapter named `Microsoft …` is the basic or remote display driver.
 const PROBE: &str = "$ProgressPreference='SilentlyContinue'; \
     $ErrorActionPreference='SilentlyContinue'; \
-    $role = [bool](Get-WindowsFeature RDS-RD-Server).Installed; \
+    $role = 'Unknown'; \
+    try { $state = (Get-WindowsFeature RDS-RD-Server -ErrorAction Stop).InstallState; \
+    if ($state) { $role = $state } } catch { $_.Exception.Message }; \
     $mode = (Get-CimInstance -Namespace root/cimv2/TerminalServices \
     -ClassName Win32_TerminalServiceSetting).LicensingType; \
     $gpu = [bool](Get-CimInstance Win32_VideoController | \
     Where-Object { $_.Name -notlike 'Microsoft *' }); \
-    '{0} {1} {2}' -f [int]$role, [int]($mode -in 2,4), [int]$gpu";
+    '{0} {1} {2}' -f $role, [int]($mode -in 2,4), [int]$gpu";
 
 /// The prerequisites for seats, one diagnostic each: info when met, an error with the next move
 /// when not. A desktop edition runs seats only through a Remote Desktop wrapper the operator
@@ -84,7 +87,7 @@ pub(super) fn checks() -> Vec<Diagnostic> {
             return checks;
         }
     };
-    let Some([role, licensing, gpu]) = probe() else {
+    let Some((role, [licensing, gpu])) = probe() else {
         checks.push(Diagnostic::error(
             "probe",
             "Couldn't read this machine's Remote Desktop and graphics settings.",
@@ -92,12 +95,7 @@ pub(super) fn checks() -> Vec<Diagnostic> {
         return checks;
     };
     if server {
-        checks.push(check(
-            role,
-            "rds_role",
-            "The Remote Desktop Session Host role is installed.",
-            "The Remote Desktop Session Host role isn't installed. Add it in Server Manager, then try again.",
-        ));
+        checks.push(role_check(&role));
         checks.push(check(
             licensing,
             "rds_licensing",
@@ -404,21 +402,42 @@ fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
     ))
 }
 
-fn probe() -> Option<[bool; 3]> {
+fn probe() -> Option<(String, [bool; 2])> {
     let output = Command::new(pf_paths::system32(POWERSHELL))
         .args(powershell_args(PROBE))
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    parse_probe(&String::from_utf8_lossy(&output.stdout))
+    let text = String::from_utf8_lossy(&output.stdout);
+    tracing::debug!(output = %text.trim(), "seat prerequisite probe");
+    parse_probe(&text)
 }
 
-/// The last non-empty line: three `0`/`1` flags.
-fn parse_probe(text: &str) -> Option<[bool; 3]> {
+/// The last non-empty line: the role's install state, then two `0`/`1` flags.
+fn parse_probe(text: &str) -> Option<(String, [bool; 2])> {
     let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
-    let flags: Vec<bool> = line.split_whitespace().map(|flag| flag == "1").collect();
-    flags.try_into().ok()
+    let mut fields = line.split_whitespace();
+    let role = fields.next()?.to_string();
+    let flags: Vec<bool> = fields.map(|flag| flag == "1").collect();
+    Some((role, flags.try_into().ok()?))
+}
+
+/// The Session Host role by its `Get-WindowsFeature` install state. A role the probe can't read
+/// warns instead of refusing, so a broken cmdlet never blocks a machine that has the role.
+fn role_check(state: &str) -> Diagnostic {
+    const CODE: &str = "rds_role";
+    match state {
+        "Installed" => Diagnostic::info(CODE, "The Remote Desktop Session Host role is installed."),
+        "Unknown" => Diagnostic::warning(
+            CODE,
+            "Couldn't confirm that the Remote Desktop Session Host role is installed. If it isn't, add it in Server Manager.",
+        ),
+        _ => Diagnostic::error(
+            CODE,
+            "The Remote Desktop Session Host role isn't installed. Add it in Server Manager, then try again.",
+        ),
+    }
 }
 
 fn powershell_args(script: &str) -> [&str; 6] {
@@ -461,13 +480,27 @@ fn refuse(code: &str, sentence: &str, cause: impl std::fmt::Display) -> BackendE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::DiagnosticLevel;
 
     #[test]
-    fn the_probe_answers_with_three_flags_on_its_last_line() {
-        assert_eq!(parse_probe("1 0 1\r\n"), Some([true, false, true]));
-        assert_eq!(parse_probe("noise\r\n0 0 0\r\n\r\n"), Some([false; 3]));
-        assert_eq!(parse_probe("1 1"), None);
+    fn the_probe_answers_on_its_last_line() {
+        let installed = ("Installed".to_string(), [false, true]);
+        assert_eq!(parse_probe("Installed 0 1\r\n"), Some(installed));
+        let unread = ("Unknown".to_string(), [true; 2]);
+        assert_eq!(
+            parse_probe("Access is denied.\r\nUnknown 1 1\r\n\r\n"),
+            Some(unread)
+        );
+        assert_eq!(parse_probe("Installed 1"), None);
         assert_eq!(parse_probe(""), None);
+    }
+
+    #[test]
+    fn only_an_absent_role_reads_as_not_installed() {
+        assert_eq!(role_check("Installed").level, DiagnosticLevel::Info);
+        assert_eq!(role_check("Unknown").level, DiagnosticLevel::Warning);
+        assert_eq!(role_check("Available").level, DiagnosticLevel::Error);
+        assert_eq!(role_check("Removed").level, DiagnosticLevel::Error);
     }
 
     #[test]
