@@ -60,6 +60,13 @@ let sdr10Drawable: MTLPixelFormat =
     ProcessInfo.processInfo.environment["PUNKTFUNK_SDR10_DRAWABLE"] == "8"
     ? .bgra8Unorm : .bgr10a2Unorm
 
+/// The HDR drawable: PQ-encoded BT.2020 R′G′B′ in [0,1] under the `itur_2100_PQ` colour space,
+/// the pairing Apple documents for HDR10. A 10-bit signal fits; half-float doubles the bytes
+/// every present moves. `PUNKTFUNK_HDR_DRAWABLE=16` keeps rgba16Float — the A/B lever.
+let hdrDrawable: MTLPixelFormat =
+    ProcessInfo.processInfo.environment["PUNKTFUNK_HDR_DRAWABLE"] == "16"
+    ? .rgba16Float : .bgr10a2Unorm
+
 /// Runtime-compiled (no metallib build step needed in SwiftPM): a fullscreen triangle and Y′CbCr→RGB
 /// fragment shaders whose conversion arrives as three constant rows computed per frame on the CPU
 /// (`CscRows` — the Swift port of pf-client-core's `csc_rows`, from the decoded buffer's actual
@@ -253,7 +260,7 @@ fragment float4 pf_frag_hdr_tv(VOut in [[stage_in]],
 // PyroWave planar HDR tone-map: three separate R16 planes (P010-style studio codes; the rows
 // fold in depth-10 MSB packing) → PQ R′G′B′ → the shared SDR tail. Used when a PQ pyrowave
 // stream must land on an 8-bit surface: tvOS without HDR headroom. The passthrough planar
-// HDR pipeline reuses pf_frag_planar itself on an rgba16Float drawable (identical math — the
+// HDR pipeline reuses pf_frag_planar itself on the HDR drawable (identical math — the
 // layer's itur_2100_PQ colour space + EDR metadata do the interpretation).
 fragment float4 pf_frag_planar_tm(VOut in [[stage_in]],
                                   texture2d<float> lumaTex [[texture(0)]],
@@ -282,7 +289,7 @@ public final class MetalVideoPresenter {
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue
-    /// SDR (BT.709 8-bit → bgra8) and HDR (BT.2020 PQ 10-bit → rgba16Float) pipelines. Selected per
+    /// SDR (BT.709 8-bit → bgra8) and HDR (BT.2020 PQ 10-bit → `hdrDrawable`) pipelines. Selected per
     /// frame in `render`; the layer is reconfigured to match when the session flips (HDR toggle).
     private let pipelineSDR: MTLRenderPipelineState
     /// `pf_frag` into `sdr10Drawable`: the SDR shader, wider attachment.
@@ -293,7 +300,7 @@ public final class MetalVideoPresenter {
     private let pipelineHDRToneMap: MTLRenderPipelineState?
     /// PyroWave's 3-plane SDR path (pf_frag_planar → bgra8) — see `renderPlanar`.
     private let pipelinePlanar: MTLRenderPipelineState
-    /// PyroWave planar HDR passthrough (pf_frag_planar → rgba16Float; the layer's PQ colour
+    /// PyroWave planar HDR passthrough (pf_frag_planar → `hdrDrawable`; the layer's PQ colour
     /// space + EDR interpret the samples) and the planar PQ→SDR tone-map (pf_frag_planar_tm →
     /// bgra8; tvOS without HDR headroom).
     private let pipelinePlanarHDR: MTLRenderPipelineState
@@ -419,7 +426,7 @@ public final class MetalVideoPresenter {
             let hdr = MTLRenderPipelineDescriptor()
             hdr.vertexFunction = vtx
             hdr.fragmentFunction = library.makeFunction(name: "pf_frag_hdr")
-            hdr.colorAttachments[0].pixelFormat = .rgba16Float // PQ passthrough
+            hdr.colorAttachments[0].pixelFormat = hdrDrawable // PQ passthrough
             pipelineHDR = try device.makeRenderPipelineState(descriptor: hdr)
             #if os(tvOS)
             // tvOS carries BOTH HDR pipelines: PQ passthrough when the display is composited
@@ -441,7 +448,7 @@ public final class MetalVideoPresenter {
             let planarHdr = MTLRenderPipelineDescriptor()
             planarHdr.vertexFunction = vtx
             planarHdr.fragmentFunction = library.makeFunction(name: "pf_frag_planar")
-            planarHdr.colorAttachments[0].pixelFormat = .rgba16Float // PQ passthrough
+            planarHdr.colorAttachments[0].pixelFormat = hdrDrawable // PQ passthrough
             pipelinePlanarHDR = try device.makeRenderPipelineState(descriptor: planarHdr)
             let planarTm = MTLRenderPipelineDescriptor()
             planarTm.vertexFunction = vtx
@@ -535,7 +542,7 @@ public final class MetalVideoPresenter {
     /// (main, before the render thread exists) and again per-frame from `render` on the RENDER THREAD
     /// (idempotent — the guard makes a same-state call a no-op), so a mid-session HDR toggle (the host
     /// re-inits its encoder; the decoded `frame.isHDR` flips) reconfigures here automatically. HDR uses
-    /// an rgba16Float drawable + BT.2020 PQ colour space + EDR with a 203-nit reference-white anchor;
+    /// `hdrDrawable` + BT.2020 PQ colour space + EDR with a 203-nit reference-white anchor;
     /// SDR uses the sRGB-tagged 8-bit drawable, or `sdr10Drawable` when `tenBitSDR` (a 10-bit
     /// session — HDR outranks it, an HDR frame never lands on the SDR-10 drawable).
     public func configure(hdr: Bool, tenBitSDR: Bool = false) {
@@ -584,7 +591,7 @@ public final class MetalVideoPresenter {
             // and the TV tone-maps. Without it PQ would composite blown out, so pf_frag_hdr_tv
             // tone-maps to BT.709 and the layer carries the SDR tag.
             let passthrough = hdrPassthroughActive
-            let format: MTLPixelFormat = passthrough ? .rgba16Float : .bgra8Unorm
+            let format: MTLPixelFormat = passthrough ? hdrDrawable : .bgra8Unorm
             let space = passthrough ? CGColorSpace(name: CGColorSpace.itur_2100_PQ) : sdrColorspace
             layerFormat = format
             writeLayer {
@@ -595,9 +602,9 @@ public final class MetalVideoPresenter {
             // Anchor reference white. Re-apply the real grade if one already arrived (0xCE before the
             // flip); otherwise the bare 203-nit anchor. Without this anchor the PQ signal is too bright.
             let edr = makeEDR(lastHdrMeta)
-            layerFormat = .rgba16Float
+            layerFormat = hdrDrawable
             writeLayer {
-                $0.pixelFormat = .rgba16Float
+                $0.pixelFormat = hdrDrawable
                 $0.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
                 $0.wantsExtendedDynamicRangeContent = true
                 $0.edrMetadata = edr

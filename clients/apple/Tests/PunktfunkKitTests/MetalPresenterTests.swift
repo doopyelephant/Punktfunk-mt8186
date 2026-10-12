@@ -29,13 +29,18 @@ final class MetalPresenterTests: XCTestCase {
             throw XCTSkip("no Metal device available in this environment")
         }
         presenter.configure(hdr: true)
-        XCTAssertEqual(presenter.layer.pixelFormat, .rgba16Float, "HDR uses an EDR-capable drawable")
+        XCTAssertEqual(presenter.layer.pixelFormat, hdrDrawable, "HDR uses the PQ drawable")
         XCTAssertNotNil(presenter.layer.colorspace, "HDR layer must be tagged (itur_2100_PQ)")
         XCTAssertTrue(
             presenter.layer.wantsExtendedDynamicRangeContent, "EDR must be requested on all platforms")
         XCTAssertNotNil(
             presenter.layer.edrMetadata,
             "HDR must anchor reference white via edrMetadata (the fix for 'too bright')")
+        presenter.layer.drawableSize = CGSize(width: 64, height: 64)
+        if let drawable = presenter.layer.nextDrawable() {
+            XCTAssertEqual(
+                drawable.texture.pixelFormat, hdrDrawable, "the layer must vend the HDR format")
+        }
 
         // Mid-session HDR→SDR flip: the 8-bit path, EDR off, no metadata.
         presenter.configure(hdr: false)
@@ -56,7 +61,7 @@ final class MetalPresenterTests: XCTestCase {
         XCTAssertEqual(presenter.layer.pixelFormat, .bgra8Unorm, "a queued write leaves the layer")
         XCTAssertNil(presenter.layer.edrMetadata)
         presenter.applyLayerWrites()
-        XCTAssertEqual(presenter.layer.pixelFormat, .rgba16Float)
+        XCTAssertEqual(presenter.layer.pixelFormat, hdrDrawable)
         XCTAssertNotNil(presenter.layer.edrMetadata)
         XCTAssertEqual(presenter.layer.drawableSize, CGSize(width: 64, height: 32))
     }
@@ -82,7 +87,9 @@ final class MetalPresenterTests: XCTestCase {
                 "the layer must vend the 10-bit format rather than fall back")
         }
         presenter.configure(hdr: true, tenBitSDR: true)
-        XCTAssertEqual(presenter.layer.pixelFormat, .rgba16Float, "HDR outranks the depth flag")
+        XCTAssertTrue(presenter.layer.wantsExtendedDynamicRangeContent, "HDR outranks the depth flag")
+        XCTAssertEqual(
+            presenter.layer.colorspace?.name, CGColorSpace.itur_2100_PQ, "PQ, not the SDR tag")
         presenter.configure(hdr: false, tenBitSDR: false)
         XCTAssertEqual(
             presenter.layer.pixelFormat, .bgra8Unorm, "an 8-bit session keeps the 8-bit drawable")
