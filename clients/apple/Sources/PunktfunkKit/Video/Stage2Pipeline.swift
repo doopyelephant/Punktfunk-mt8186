@@ -1672,8 +1672,8 @@ public final class Stage2Pipeline {
     }
 
     /// Forward the display's current EDR headroom to the presenter (MAIN thread — a `UIScreen`
-    /// read). tvOS flips HDR presentation between PQ passthrough and the in-shader tone-map on
-    /// it; see `MetalVideoPresenter.setDisplayHeadroom`.
+    /// read): tvOS picks PQ passthrough or the in-shader tone-map on it, iOS rolls linear HDR
+    /// highlights onto it. See `MetalVideoPresenter.setDisplayHeadroom`.
     public func setDisplayHeadroom(_ headroom: CGFloat) {
         presenter.setDisplayHeadroom(headroom)
     }

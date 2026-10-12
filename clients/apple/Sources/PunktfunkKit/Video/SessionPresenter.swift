@@ -13,7 +13,7 @@ import AVFoundation
 import Foundation
 import PunktfunkShared
 import QuartzCore
-#if os(tvOS)
+#if os(tvOS) || os(iOS)
 import UIKit
 #endif
 
@@ -233,6 +233,9 @@ final class SessionPresenter {
     private var pump: StreamPump?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
+    /// iOS: pushes `UIScreen.currentEDRHeadroom` twice a second. It follows brightness and posts
+    /// no change notification; the linear HDR shaders roll highlights onto it.
+    private var headroomTimer: Timer?
     private var panel = PanelInfo(minHz: 0, maxHz: 0)
 
     /// The hosting screen's refresh range and granularity, from the view on start and every
@@ -379,6 +382,14 @@ final class SessionPresenter {
                 stage2Link = link
             }
             syncFrameRate(hz: connection.currentMode().refreshHz)
+            #if os(iOS)
+            pipeline.setDisplayHeadroom(UIScreen.main.currentEDRHeadroom)
+            let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+                self?.stage2?.setDisplayHeadroom(UIScreen.main.currentEDRHeadroom)
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            headroomTimer = timer
+            #endif
             pipeline.setPanel(panel)
             pipeline.start(
                 connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd,
@@ -586,6 +597,8 @@ final class SessionPresenter {
         pump = nil
         stage2Link?.invalidate()
         stage2Link = nil
+        headroomTimer?.invalidate()
+        headroomTimer = nil
         stage2?.stop() // stops the pump (synchronous join) + drops the decode session
         stage2 = nil
         metalLayer?.removeFromSuperlayer()
@@ -597,6 +610,7 @@ final class SessionPresenter {
         // The owning view's stop() normally ran already; this covers a missed teardown so the
         // display link can't keep ticking a deallocated pipeline.
         stage2Link?.invalidate()
+        headroomTimer?.invalidate()
         stage2?.stop()
         pump?.stop()
     }

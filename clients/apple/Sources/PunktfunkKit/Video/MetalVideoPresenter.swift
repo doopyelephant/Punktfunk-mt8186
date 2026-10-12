@@ -60,11 +60,42 @@ let sdr10Drawable: MTLPixelFormat =
     ProcessInfo.processInfo.environment["PUNKTFUNK_SDR10_DRAWABLE"] == "8"
     ? .bgra8Unorm : .bgr10a2Unorm
 
-/// The HDR drawable: PQ-encoded BT.2020 R′G′B′ in [0,1] under the `itur_2100_PQ` colour space,
-/// the pairing Apple documents for HDR10. A 10-bit signal fits; half-float doubles the bytes
-/// every present moves. `PUNKTFUNK_HDR_DRAWABLE=16` keeps rgba16Float — the A/B lever.
+/// How an HDR frame reaches the layer.
+///
+/// - `linear` (iOS): the shader decodes PQ, rolls highlights off onto the display's EDR headroom
+///   and writes linear Display P3 (1.0 = 203 nits) into a half-float extended-linear layer with
+///   no EDR metadata. The system has nothing to tone-map, and the iPad scans it out Direct.
+/// - `pq` (macOS, visionOS, tvOS): PQ code values under `itur_2100_PQ`, with the HDR10 grade as
+///   EDR metadata; the system tone-maps. Composites on the iPad Pro.
+///
+/// `PUNKTFUNK_HDR_MODE=pq|linear` overrides the platform's choice, for A/B runs.
+enum HdrMode {
+    case pq, linear
+    static let current: HdrMode = {
+        switch ProcessInfo.processInfo.environment["PUNKTFUNK_HDR_MODE"] {
+        case "pq": return .pq
+        case "linear": return .linear
+        default:
+            #if os(iOS)
+            return .linear
+            #else
+            return .pq
+            #endif
+        }
+    }()
+}
+
+/// The shaders' `HdrTarget`: content peak and display peak, in nits.
+struct HdrTargetUniform {
+    var srcNits: Float
+    var dstNits: Float
+}
+
+/// The HDR drawable. Linear EDR values exceed 1, so `linear` takes half-float. PQ fits 10 bits,
+/// the pairing Apple documents for HDR10; `PUNKTFUNK_HDR_DRAWABLE=16` keeps half-float there.
 let hdrDrawable: MTLPixelFormat =
-    ProcessInfo.processInfo.environment["PUNKTFUNK_HDR_DRAWABLE"] == "16"
+    HdrMode.current == .linear
+        || ProcessInfo.processInfo.environment["PUNKTFUNK_HDR_DRAWABLE"] == "16"
     ? .rgba16Float : .bgr10a2Unorm
 
 /// Runtime-compiled (no metallib build step needed in SwiftPM): a fullscreen triangle and Y′CbCr→RGB
@@ -225,30 +256,55 @@ static inline float pqOetf(float y) {
     return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), 78.84375);
 }
 
+// BT.2390 EETF on luminance `l` (linear, 1.0 = 10 000 nits): content up to `srcNits` rolls off
+// onto `dstNits`, applied in PQ. Returns the factor that scales linear RGB.
+static inline float eetfScale(float l, float srcNits, float dstNits) {
+    if (l <= 0.0 || dstNits >= srcNits) return 1.0;
+    float src = pqOetf(srcNits / 10000.0);
+    float maxLum = pqOetf(dstNits / 10000.0) / src;
+    float ks = 1.5 * maxLum - 0.5;
+    float e = min(pqOetf(l) / src, 1.0);
+    if (e <= ks) return 1.0;
+    float t = (e - ks) / (1.0 - ks);
+    float t2 = t * t;
+    float t3 = t2 * t;
+    e = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks)
+        + (-2.0 * t3 + 3.0 * t2) * maxLum;
+    return pqEotf(e * src) / l;
+}
+
 static inline float3 pqToSdr(float3 pq) {
     float3 lin = float3(pqEotf(pq.r), pqEotf(pq.g), pqEotf(pq.b));
     lin = max(float3(
         dot(lin, float3( 1.6605, -0.5876, -0.0728)),
         dot(lin, float3(-0.1246,  1.1329, -0.0083)),
         dot(lin, float3(-0.0182, -0.1006,  1.1187))), 0.0);
-    float l = max(lin.r, max(lin.g, lin.b));
     const float white = 203.0 / 10000.0;
-    if (l > 0.0) {
-        float src = pqOetf(1000.0 / 10000.0);
-        float maxLum = pqOetf(white) / src;
-        float ks = 1.5 * maxLum - 0.5;
-        float e = min(pqOetf(l) / src, 1.0);
-        if (e > ks) {
-            float t = (e - ks) / (1.0 - ks);
-            float t2 = t * t;
-            float t3 = t2 * t;
-            e = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks)
-                + (-2.0 * t3 + 3.0 * t2) * maxLum;
-        }
-        lin *= pqEotf(e * src) / l;
-    }
+    lin *= eetfScale(max(lin.r, max(lin.g, lin.b)), 1000.0, 203.0);
     float3 c = saturate(lin / white);
     return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, 12.92 * c, c <= 0.0031308);
+}
+
+// HdrMode.linear: the content's peak and the display's (EDR headroom × 203 nits).
+struct HdrTarget { float srcNits; float dstNits; };
+
+// PQ BT.2020 → linear Display P3 with 1.0 = 203 nits, highlights rolled onto the display's peak.
+static inline float3 pqToLinearP3(float3 pq, constant HdrTarget& t) {
+    float3 lin = float3(pqEotf(pq.r), pqEotf(pq.g), pqEotf(pq.b));
+    lin = float3(dot(lin, float3( 1.3435783, -0.2821797, -0.0613986)),
+                 dot(lin, float3(-0.0652975,  1.0757879, -0.0104905)),
+                 dot(lin, float3( 0.0028218, -0.0195985,  1.0167767)));
+    float l = max(max(lin.r, max(lin.g, lin.b)), 0.0);
+    return lin * eetfScale(l, t.srcNits, t.dstNits) * (10000.0 / 203.0);
+}
+
+fragment float4 pf_frag_hdr_linear(VOut in [[stage_in]],
+                                   texture2d<float> lumaTex [[texture(0)]],
+                                   texture2d<float> chromaTex [[texture(1)]],
+                                   constant CscUniform& csc [[buffer(0)]],
+                                   constant HdrTarget& target [[buffer(1)]]) {
+    float3 pq = sampleRgb(lumaTex, chromaTex, in.luv, in.uv, in.upscale, csc);
+    return float4(pqToLinearP3(pq, target), 1.0);
 }
 
 fragment float4 pf_frag_hdr_tv(VOut in [[stage_in]],
@@ -277,6 +333,23 @@ fragment float4 pf_frag_planar_tm(VOut in [[stage_in]],
                                 dot(csc.r1.xyz, yuv) + csc.r1.w,
                                 dot(csc.r2.xyz, yuv) + csc.r2.w));
     return float4(pqToSdr(pq), 1.0);
+}
+
+// PyroWave planar HDR under HdrMode.linear: the planar sample, then pqToLinearP3.
+fragment float4 pf_frag_planar_hdr_linear(VOut in [[stage_in]],
+                                          texture2d<float> lumaTex [[texture(0)]],
+                                          texture2d<float> cbTex [[texture(1)]],
+                                          texture2d<float> crTex [[texture(2)]],
+                                          constant CscUniform& csc [[buffer(0)]],
+                                          constant HdrTarget& target [[buffer(1)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float lumaY = sampleLuma(lumaTex, s, in.luv, in.upscale);
+    float2 cuv = chromaUV(lumaTex, cbTex, in.uv);
+    float3 yuv = float3(lumaY, cbTex.sample(s, cuv).r, crTex.sample(s, cuv).r);
+    float3 pq = saturate(float3(dot(csc.r0.xyz, yuv) + csc.r0.w,
+                                dot(csc.r1.xyz, yuv) + csc.r1.w,
+                                dot(csc.r2.xyz, yuv) + csc.r2.w));
+    return float4(pqToLinearP3(pq, target), 1.0);
 }
 """
 
@@ -426,8 +499,10 @@ public final class MetalVideoPresenter {
             pipelineSDR10 = try device.makeRenderPipelineState(descriptor: sdr10)
             let hdr = MTLRenderPipelineDescriptor()
             hdr.vertexFunction = vtx
-            hdr.fragmentFunction = library.makeFunction(name: "pf_frag_hdr")
-            hdr.colorAttachments[0].pixelFormat = hdrDrawable // PQ passthrough
+            let linear = HdrMode.current == .linear
+            hdr.fragmentFunction = library.makeFunction(
+                name: linear ? "pf_frag_hdr_linear" : "pf_frag_hdr")
+            hdr.colorAttachments[0].pixelFormat = hdrDrawable
             pipelineHDR = try device.makeRenderPipelineState(descriptor: hdr)
             #if os(tvOS)
             // tvOS carries BOTH HDR pipelines: PQ passthrough when the display is composited
@@ -448,8 +523,9 @@ public final class MetalVideoPresenter {
             pipelinePlanar = try device.makeRenderPipelineState(descriptor: planar)
             let planarHdr = MTLRenderPipelineDescriptor()
             planarHdr.vertexFunction = vtx
-            planarHdr.fragmentFunction = library.makeFunction(name: "pf_frag_planar")
-            planarHdr.colorAttachments[0].pixelFormat = hdrDrawable // PQ passthrough
+            planarHdr.fragmentFunction = library.makeFunction(
+                name: linear ? "pf_frag_planar_hdr_linear" : "pf_frag_planar")
+            planarHdr.colorAttachments[0].pixelFormat = hdrDrawable
             pipelinePlanarHDR = try device.makeRenderPipelineState(descriptor: planarHdr)
             let planarTm = MTLRenderPipelineDescriptor()
             planarTm.vertexFunction = vtx
@@ -570,10 +646,9 @@ public final class MetalVideoPresenter {
         configureColor(hdr: hdr, tenBitSDR: wide)
     }
 
-    /// tvOS: park the display's current EDR headroom (a MAIN-thread `UIScreen` read — pushed by
-    /// SessionPresenter.layout and the stream view's mode-switch observers). > 1 flips HDR frames
-    /// to PQ passthrough (the display's own tone-map applies); ≤ 1 keeps the in-shader tone-map.
-    /// Applied by the render thread on the next frame, like every other staged value here.
+    /// Park the display's current EDR headroom (a MAIN-thread `UIScreen` read, pushed by
+    /// SessionPresenter). tvOS: > 1 flips HDR frames to PQ passthrough, ≤ 1 keeps the in-shader
+    /// tone-map. iOS: the linear HDR shaders roll highlights onto it. Applied on the next frame.
     public func setDisplayHeadroom(_ headroom: CGFloat) {
         stagingLock.lock()
         stagedDisplayHeadroom = headroom
@@ -600,13 +675,17 @@ public final class MetalVideoPresenter {
                 $0.colorspace = space
             }
             #else
-            // Anchor reference white. Re-apply the real grade if one already arrived (0xCE before the
-            // flip); otherwise the bare 203-nit anchor. Without this anchor the PQ signal is too bright.
-            let edr = makeEDR(lastHdrMeta)
+            // PQ: anchor reference white with the real grade if one already arrived (0xCE before
+            // the flip), else the bare 203-nit anchor; without it the PQ signal is too bright.
+            // Linear carries no metadata: the shader already tone-mapped (see HdrMode).
+            let edr = HdrMode.current == .pq ? makeEDR(lastHdrMeta) : nil
+            let space = HdrMode.current == .linear
+                ? CGColorSpace(name: CGColorSpace.extendedLinearDisplayP3)
+                : CGColorSpace(name: CGColorSpace.itur_2100_PQ)
             layerFormat = hdrDrawable
             writeLayer {
                 $0.pixelFormat = hdrDrawable
-                $0.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
+                $0.colorspace = space
                 $0.wantsExtendedDynamicRangeContent = true
                 $0.edrMetadata = edr
             }
@@ -663,6 +742,25 @@ public final class MetalVideoPresenter {
         writeLayer { $0.drawableSize = size }
     }
 
+    /// The `HdrTarget` the linear HDR shaders roll highlights with: the grade's peak (MaxCLL,
+    /// else mastering max, else 1000 nits) onto the display's (headroom × reference white). No
+    /// staged headroom means no roll-off. RENDER THREAD (`lastHdrMeta` is its own).
+    private func hdrTarget() -> HdrTargetUniform {
+        stagingLock.lock()
+        let headroom = stagedDisplayHeadroom
+        stagingLock.unlock()
+        var src: Float = 1000
+        if let meta = lastHdrMeta {
+            if meta.maxCLL > 0 {
+                src = Float(meta.maxCLL)
+            } else if meta.maxMasteringLuminance > 0 {
+                src = Float(meta.maxMasteringLuminance) / 10_000
+            }
+        }
+        let dst = headroom > 1 ? Float(headroom) * hdrReferenceWhiteNits : .greatestFiniteMagnitude
+        return HdrTargetUniform(srcNits: max(src, 400), dstNits: dst)
+    }
+
     #if !os(tvOS)
     private func makeEDR(_ meta: PunktfunkConnection.HdrMeta?) -> CAEDRMetadata {
         CAEDRMetadata.hdr10(
@@ -717,7 +815,7 @@ public final class MetalVideoPresenter {
         // tvOS has no edrMetadata — the cached grade still matters for a later flip's
         // configureColor. macOS/iOS refine the live tone-map now.
         #if !os(tvOS)
-        if hdrActive {
+        if hdrActive, HdrMode.current == .pq {
             let edr = makeEDR(newHdrMeta)
             writeLayer { $0.edrMetadata = edr }
         }
@@ -782,6 +880,7 @@ public final class MetalVideoPresenter {
         // expansion; recomputed per frame because the host can flip colour in-band (SDR↔HDR).
         var csc = CscRows.rows(
             CscRows.signal(of: pixelBuffer), depth: tenBit ? 10 : 8, msbPacked: tenBit)
+        var target = hdrTarget()
         guard let textureCache,
               let luma = makeTexture(
                 pixelBuffer, plane: 0, format: tenBit ? .r16Unorm : .r8Unorm, cache: textureCache),
@@ -815,6 +914,7 @@ public final class MetalVideoPresenter {
         ) { encoder in
             encoder.setFragmentTexture(CVMetalTextureGetTexture(chroma), index: 1)
             encoder.setFragmentBytes(&csc, length: MemoryLayout<CscUniform>.stride, index: 0)
+            encoder.setFragmentBytes(&target, length: MemoryLayout<HdrTargetUniform>.stride, index: 1)
         }
     }
 
@@ -836,6 +936,7 @@ public final class MetalVideoPresenter {
         configure(hdr: planes.pq)
         applyStagedHdrMeta()
         var csc = planes.csc
+        var target = hdrTarget()
         // PQ passthrough needs the HDR drawable; a PQ frame while the drawable is (still)
         // 8-bit — tvOS without display headroom, or a not-yet-flipped layer — tone-maps
         // in-shader instead (the pipeline must match the drawable's pixel format).
@@ -860,6 +961,7 @@ public final class MetalVideoPresenter {
             encoder.setFragmentTexture(planes.cb, index: 1)
             encoder.setFragmentTexture(planes.cr, index: 2)
             encoder.setFragmentBytes(&csc, length: MemoryLayout<CscUniform>.stride, index: 0)
+            encoder.setFragmentBytes(&target, length: MemoryLayout<HdrTargetUniform>.stride, index: 1)
         }
     }
 

@@ -20,22 +20,31 @@ final class MetalPresenterTests: XCTestCase {
             "stage-2 Metal shaders failed to compile (presenter init returned nil)")
     }
 
-    /// The HDR fix: `configure(hdr:)` must put the layer into the BT.2020-PQ EDR configuration with a
-    /// reference-white anchor (`edrMetadata`) — the missing anchor was what made HDR render "too
-    /// bright". SDR must use the plain 8-bit path with EDR off and no metadata. A mid-session flip is a
-    /// per-mode reconfigure, so the round trip back to SDR must fully restore the SDR config.
+    /// The layer colour space HDR takes under the session's `HdrMode`.
+    private var hdrSpace: CFString {
+        HdrMode.current == .linear ? CGColorSpace.extendedLinearDisplayP3 : CGColorSpace.itur_2100_PQ
+    }
+
+    /// `configure(hdr:)`: PQ mode tags BT.2100 PQ with EDR and a reference-white anchor
+    /// (`edrMetadata`; without it PQ renders too bright). Linear mode tags extended-linear P3 with
+    /// EDR and no metadata, on half-float. SDR is the plain 8-bit path, EDR off, no metadata, and a
+    /// mid-session flip back must restore it fully.
     func testConfigureHDRSetsEDRAnchor() throws {
         guard let presenter = MetalVideoPresenter.make() else {
             throw XCTSkip("no Metal device available in this environment")
         }
         presenter.configure(hdr: true)
-        XCTAssertEqual(presenter.layer.pixelFormat, hdrDrawable, "HDR uses the PQ drawable")
-        XCTAssertNotNil(presenter.layer.colorspace, "HDR layer must be tagged (itur_2100_PQ)")
+        XCTAssertEqual(presenter.layer.pixelFormat, hdrDrawable, "HDR uses the HDR drawable")
+        XCTAssertEqual(presenter.layer.colorspace?.name, hdrSpace)
         XCTAssertTrue(
             presenter.layer.wantsExtendedDynamicRangeContent, "EDR must be requested on all platforms")
-        XCTAssertNotNil(
-            presenter.layer.edrMetadata,
-            "HDR must anchor reference white via edrMetadata (the fix for 'too bright')")
+        if HdrMode.current == .linear {
+            XCTAssertEqual(hdrDrawable, .rgba16Float, "linear EDR values exceed 1")
+            XCTAssertNil(presenter.layer.edrMetadata, "linear leaves the system nothing to tone-map")
+        } else {
+            XCTAssertNotNil(
+                presenter.layer.edrMetadata, "PQ must anchor reference white via edrMetadata")
+        }
         presenter.layer.drawableSize = CGSize(width: 64, height: 64)
         if let drawable = presenter.layer.nextDrawable() {
             XCTAssertEqual(
@@ -75,7 +84,7 @@ final class MetalPresenterTests: XCTestCase {
         XCTAssertNil(presenter.layer.edrMetadata)
         presenter.applyLayerWrites()
         XCTAssertEqual(presenter.layer.pixelFormat, hdrDrawable)
-        XCTAssertNotNil(presenter.layer.edrMetadata)
+        XCTAssertEqual(presenter.layer.colorspace?.name, hdrSpace)
         XCTAssertEqual(presenter.layer.drawableSize, CGSize(width: 64, height: 32))
     }
 
@@ -101,8 +110,7 @@ final class MetalPresenterTests: XCTestCase {
         }
         presenter.configure(hdr: true, tenBitSDR: true)
         XCTAssertTrue(presenter.layer.wantsExtendedDynamicRangeContent, "HDR outranks the depth flag")
-        XCTAssertEqual(
-            presenter.layer.colorspace?.name, CGColorSpace.itur_2100_PQ, "PQ, not the SDR tag")
+        XCTAssertEqual(presenter.layer.colorspace?.name, hdrSpace, "the HDR tag, not the SDR one")
         presenter.configure(hdr: false, tenBitSDR: false)
         XCTAssertEqual(
             presenter.layer.pixelFormat, .bgra8Unorm, "an 8-bit session keeps the 8-bit drawable")
