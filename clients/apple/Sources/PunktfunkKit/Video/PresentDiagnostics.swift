@@ -188,9 +188,11 @@ final class FrameRateHint: @unchecked Sendable {
         _ = boosted
         return CAFrameRateRange(minimum: hz, maximum: hz, preferred: hz)
         #else
+        // Pinned at the panel's top rate: a frame shows at the first refresh after its pick, and
+        // a lower minimum lets the system drop the panel mid-stream (judder). `boosted` is moot.
+        _ = boosted
         let cap = max(hz, 120)
-        let preferred = boosted ? cap : hz
-        return CAFrameRateRange(minimum: preferred, maximum: cap, preferred: preferred)
+        return CAFrameRateRange(minimum: cap, maximum: cap, preferred: cap)
         #endif
     }
 }
