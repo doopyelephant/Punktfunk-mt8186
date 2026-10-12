@@ -77,8 +77,8 @@ target/release/punktfunk-host serve              # native clients only
 target/release/punktfunk-host serve --gamestream # plus Moonlight (trusted LAN only)
 ```
 
-The host finds `punktfunk-encode-worker` beside itself and runs PyroWave there at raised GPU
-priority. Grant it the capability the packages grant:
+The host finds `punktfunk-encode-worker` beside itself and runs PyroWave and the NVIDIA frame
+convert there at raised GPU priority. Grant it the capability the packages grant:
 `sudo setcap cap_sys_nice=ep target/release/punktfunk-encode-worker`.
 
 To run the host as a user service from a clone at `~/punktfunk`, copy

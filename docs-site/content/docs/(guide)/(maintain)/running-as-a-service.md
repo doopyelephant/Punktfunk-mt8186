@@ -117,10 +117,10 @@ host works too. No answer? Read `journalctl --user -u punktfunk-host` on the hos
 
 ## GPU scheduling priority
 
-[PyroWave](/docs/pyrowave) encodes on the same GPU cores as your game, so the host asks the driver
-to run the encode first. That request needs `CAP_SYS_NICE`, which every Linux install grants to a
-small helper, `punktfunk-encode-worker` — never to `punktfunk-host`. The other codecs use the GPU's
-video engine and don't need it.
+[PyroWave](/docs/pyrowave) encodes on the same GPU cores as your game, and on NVIDIA the host
+converts every frame there before the video engine encodes it. So the host asks the driver to run
+that work first. The request needs `CAP_SYS_NICE`, which every Linux install grants to a small
+helper, `punktfunk-encode-worker` — never to `punktfunk-host`.
 
 **Never give `punktfunk-host` a capability** — not with `setcap`, a systemd `AmbientCapabilities=`
 line or a NixOS `security.wrappers` entry. KWin can't identify a host that holds one, and every KDE
@@ -141,8 +141,8 @@ sudo setcap -r /usr/bin/punktfunk-host      # clears it; then restart the host
 On the Bazzite image `/usr` is read-only: run `sudo punktfunk-sysext update` instead. On NixOS the
 module wraps the worker for you.
 
-Without the grant the stream still runs, at normal priority; only frame pacing under a GPU-bound
-game suffers. `PYROWAVE_QUEUE_PRIORITY=off` and `PUNKTFUNK_ENCODE_WORKER=off` are the opt-outs —
+Without the grant the stream still runs, at normal priority, but a GPU-bound game adds milliseconds
+to every frame. The host log then says `VkBridge queue at default GPU priority`. `PYROWAVE_QUEUE_PRIORITY=off` and `PUNKTFUNK_ENCODE_WORKER=off` are the opt-outs —
 [Configuration](/docs/configuration#advanced-performance-tuning).
 
 ## Stopping and removing

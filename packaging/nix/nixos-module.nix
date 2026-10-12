@@ -534,8 +534,9 @@ in
       # The capability lives on the ENCODE WORKER instead — a different binary, and one nothing
       # ever has to identify.
       #
-      # punktfunk-encode-worker is spawned per PyroWave session, speaks one socketpair to its
-      # parent, and never connects to Wayland, D-Bus or the network. Nothing resolves ITS
+      # punktfunk-encode-worker is spawned per PyroWave session and per NVIDIA capture (the frame
+      # convert), speaks one socketpair to its parent, and never connects to Wayland, D-Bus or
+      # the network. Nothing resolves ITS
       # /proc/<pid>/exe, so the ambient grant a NixOS wrapper performs — the very thing that makes
       # a wrapper useless for the host — is exactly right here. (It must also stay a SEPARATE file:
       # a hardlink or a host subcommand would share the inode, hence the capability, and re-create

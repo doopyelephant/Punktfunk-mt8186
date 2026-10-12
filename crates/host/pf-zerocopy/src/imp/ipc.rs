@@ -249,6 +249,72 @@ pub fn self_exe() -> Option<&'static PinnedExe> {
         .as_ref()
 }
 
+/// Installed name. The only file that may carry `cap_sys_nice=ep`. Never a hardlink of
+/// `punktfunk-host`: a shared inode shares the file capability, KWin cannot identify the host,
+/// and the desktop session dies.
+pub const ENCODE_WORKER_BIN: &str = "punktfunk-encode-worker";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkerPath {
+    /// `PUNKTFUNK_ENCODE_WORKER=off` — debug hatch so worker vs in-process is a one-line change.
+    Off,
+    Found(PathBuf),
+    /// Not beside the host binary and not on `PATH`.
+    Missing,
+}
+
+/// Resolve [`ENCODE_WORKER_BIN`]: `PUNKTFUNK_ENCODE_WORKER` → alongside `/proc/self/exe` → `PATH`.
+///
+/// The env override is load-bearing on NixOS: a file capability cannot live on a read-only store
+/// path, so the module exposes the worker through `security.wrappers` and points this variable at
+/// the wrapper. Pure and injected so the table can be tested without mutating process env (races
+/// `getenv` in parallel tests).
+pub fn resolve_worker_path_in(
+    env: Option<&str>,
+    exe_dir: Option<&Path>,
+    path_var: Option<&str>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> WorkerPath {
+    if let Some(v) = env.map(str::trim).filter(|v| !v.is_empty()) {
+        if v.eq_ignore_ascii_case("off") {
+            return WorkerPath::Off;
+        }
+        // Not existence-checked: an operator-named path must fail by that name. Falling through
+        // to "beside the host binary" would hide a typo behind a working stream.
+        return WorkerPath::Found(PathBuf::from(v));
+    }
+    if let Some(p) = exe_dir
+        .map(|d| d.join(ENCODE_WORKER_BIN))
+        .filter(|p| exists(p))
+    {
+        return WorkerPath::Found(p);
+    }
+    if let Some(p) = path_var
+        .into_iter()
+        .flat_map(|v| v.split(':'))
+        .filter(|d| !d.is_empty())
+        .map(|d| Path::new(d).join(ENCODE_WORKER_BIN))
+        .find(|p| exists(p))
+    {
+        return WorkerPath::Found(p);
+    }
+    WorkerPath::Missing
+}
+
+pub fn resolve_worker_path() -> WorkerPath {
+    // `current_exe()` readlinks `/proc/self/exe`, which becomes `"<path> (deleted)"` after a
+    // replace-under-run. Harmless here: only the parent directory is used. The worker we then
+    // resolve is pinned by fd before exec, which is where that trap bites.
+    let exe_dir = std::env::current_exe().ok();
+    let path_var = std::env::var("PATH").ok();
+    resolve_worker_path_in(
+        std::env::var("PUNKTFUNK_ENCODE_WORKER").ok().as_deref(),
+        exe_dir.as_deref().and_then(Path::parent),
+        path_var.as_deref(),
+        &|p| p.is_file(),
+    )
+}
+
 /// Spawn `exe` (normally [`PinnedExe::exec_path`]) with a SEQPACKET socket on
 /// **fd 3**. Returns the host end and the child.
 ///
@@ -644,5 +710,73 @@ mod tests {
         // `adopted` now owns the number; forget the original so it closes once.
         std::mem::forget(a);
         drop((adopted, b));
+    }
+
+    #[test]
+    fn path_resolution_table() {
+        let here = Path::new("/opt/punktfunk/bin");
+        let installed = here.join(ENCODE_WORKER_BIN);
+        let on_path = Path::new("/usr/bin").join(ENCODE_WORKER_BIN);
+        let exists = {
+            let (a, b) = (installed.clone(), on_path.clone());
+            move |p: &Path| p == a || p == b
+        };
+
+        // `off`, in every spelling the row promises.
+        for v in ["off", "OFF", " Off "] {
+            assert_eq!(
+                resolve_worker_path_in(Some(v), Some(here), Some("/usr/bin"), &exists),
+                WorkerPath::Off
+            );
+        }
+        // An explicit path wins over both discoveries — the NixOS wrapper case.
+        assert_eq!(
+            resolve_worker_path_in(
+                Some("/run/wrappers/bin/punktfunk-encode-worker"),
+                Some(here),
+                Some("/usr/bin"),
+                &exists
+            ),
+            WorkerPath::Found("/run/wrappers/bin/punktfunk-encode-worker".into())
+        );
+        // Not existence-checked, so a typo surfaces as a spawn failure naming the path.
+        assert_eq!(
+            resolve_worker_path_in(
+                Some("/nope/pf-worker"),
+                Some(here),
+                Some("/usr/bin"),
+                &exists
+            ),
+            WorkerPath::Found("/nope/pf-worker".into())
+        );
+        // Empty/whitespace reads as unset, not as a path.
+        assert_eq!(
+            resolve_worker_path_in(Some("  "), Some(here), Some("/usr/bin"), &exists),
+            WorkerPath::Found(installed.clone())
+        );
+        // Beside the host binary beats PATH.
+        assert_eq!(
+            resolve_worker_path_in(None, Some(here), Some("/usr/bin"), &exists),
+            WorkerPath::Found(installed)
+        );
+        // Then PATH, entry by entry, skipping empties.
+        assert_eq!(
+            resolve_worker_path_in(
+                None,
+                Some(Path::new("/nowhere")),
+                Some(":/nope:/usr/bin"),
+                &exists
+            ),
+            WorkerPath::Found(on_path)
+        );
+        // Nothing anywhere: the missing-binary rung.
+        assert_eq!(
+            resolve_worker_path_in(None, Some(Path::new("/nowhere")), Some("/nope"), &exists),
+            WorkerPath::Missing
+        );
+        assert_eq!(
+            resolve_worker_path_in(None, None, None, &exists),
+            WorkerPath::Missing
+        );
     }
 }

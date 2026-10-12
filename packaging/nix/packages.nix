@@ -221,9 +221,9 @@ in
       # but carries neither the Khronos loader nor libva. A miss here is silent: the codepath just
       # reports "unavailable" and falls back.
       postFixup = ''
-        # Both binaries dlopen the GPU stack; the worker owns a Vulkan device of its own for
-        # PyroWave, and without it the host silently falls back to the in-process encoder at
-        # default priority. The tray (its own derivation, copied in above) does not.
+        # Both binaries dlopen the GPU stack; the worker owns the Vulkan devices for PyroWave and
+        # the NVIDIA frame convert, and without it the host silently falls back to default
+        # priority. The tray (its own derivation, copied in above) does not.
         for b in punktfunk-host punktfunk-encode-worker; do
           addDriverRunpath "$out/bin/$b"
           patchelf --add-rpath "${vulkan-loader.out}/lib" "$out/bin/$b"
