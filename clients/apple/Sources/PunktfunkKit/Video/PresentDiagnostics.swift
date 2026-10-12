@@ -217,6 +217,8 @@ final class PresentDebugStats: @unchecked Sendable {
     private var lastGlassPtsNs: UInt64 = 0
     private var glassDeltasMs: [Double] = []
     private var cadenceErrMs: [Double] = []
+    /// (glass step, source step) in ms per consecutive shown pair, for `glitch=`.
+    private var steps: [(glass: Double, source: Double)] = []
     private var displayMs: [Double] = []
     /// Present-issue → on-glass delay per frame (system presentedTime minus the render call's
     /// start) — the DIRECT decomposition of the display stage: ring/pairing wait lives upstream
@@ -304,6 +306,7 @@ final class PresentDebugStats: @unchecked Sendable {
                 if lastGlassPtsNs > 0, ptsNs > lastGlassPtsNs, !isRepeat {
                     let srcDeltaNs = Int64(ptsNs - lastGlassPtsNs)
                     cadenceErrMs.append(Double(abs(glassDeltaNs - srcDeltaNs)) / 1e6)
+                    steps.append((Double(glassDeltaNs) / 1e6, Double(srcDeltaNs) / 1e6))
                 }
             }
             lastGlassNs = atNs
@@ -326,6 +329,21 @@ final class PresentDebugStats: @unchecked Sendable {
         let sorted = counts.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
         let hist = sorted.prefix(4).map { "\($0.key):\($0.value)" }.joined(separator: ",")
         return (hist, 1 - Double(sorted[0].value) / Double(deltasMs.count))
+    }
+
+    /// Shown pairs whose glass step, in panel refreshes, is longer than their source step (a
+    /// repeat) or shorter (a skip). Exact at 1:1 and 2:1; a fractional cadence counts its own
+    /// alternation.
+    static func glitches(
+        steps: [(glass: Double, source: Double)], refreshMs: Double
+    ) -> (repeats: Int, skips: Int) {
+        guard refreshMs > 0 else { return (0, 0) }
+        var rep = 0, skip = 0
+        for s in steps {
+            let g = (s.glass / refreshMs).rounded(), c = (s.source / refreshMs).rounded()
+            if g > c { rep += 1 } else if g < c { skip += 1 }
+        }
+        return (rep, skip)
     }
 
     /// The window's per-frame samples so far, for tests.
@@ -363,12 +381,13 @@ final class PresentDebugStats: @unchecked Sendable {
         let (hist, judder) = Self.gridHistogram(deltasMs: glassDeltasMs, panel: panel)
         let cadErr = Self.percentiles(cadenceErrMs)
         let display = Self.percentiles(displayMs)
+        let glitch = Self.glitches(steps: steps, refreshMs: panel.minInterval * 1000)
         let glassLine = String(
             format: " displayMs p50=%.1f p95=%.1f cadErrMs p50=%.2f p95=%.2f n=%d "
-                + "grid=%.2f hist=%@ judder=%.2f repeats=%d/%d panel=%@",
+                + "grid=%.2f hist=%@ judder=%.2f glitch=%d/%d repeats=%d/%d panel=%@",
             display.p50, display.p95, cadErr.p50, cadErr.p95, cadenceErrMs.count,
-            panel.minInterval * 1000, hist, judder, decodedRepeats, shownRepeats,
-            panel.description)
+            panel.minInterval * 1000, hist, judder, glitch.repeats, glitch.skips,
+            decodedRepeats, shownRepeats, panel.description)
         // Loop health, appended only where a loop exists — `late`/`frames` is WP8's cushion
         // criterion and `reanchor` says whether the estimate is tracking at all.
         let loop = cadence?.health()
@@ -396,6 +415,7 @@ final class PresentDebugStats: @unchecked Sendable {
         maxInFlight = inFlight // the window peak restarts from the live depth
         glassDeltasMs.removeAll(keepingCapacity: true)
         cadenceErrMs.removeAll(keepingCapacity: true)
+        steps.removeAll(keepingCapacity: true)
         displayMs.removeAll(keepingCapacity: true)
         latchMs.removeAll(keepingCapacity: true)
         vendLeadMs.removeAll(keepingCapacity: true)
