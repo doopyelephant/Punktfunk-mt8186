@@ -258,6 +258,10 @@ in
       pname = "punktfunk-seats";
       cargoExtraArgs = "--locked -p punktfunk-seats --bin punktfunk-seats";
 
+      buildInputs = [
+        libxkbcommon # pf-inject's keymap
+      ];
+
       postInstall = ''
         install -d "$out/libexec/punktfunk"
         mv "$out/bin/punktfunk-seats" "$out/libexec/punktfunk/"
