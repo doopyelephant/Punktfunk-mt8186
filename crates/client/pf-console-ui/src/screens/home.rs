@@ -4,8 +4,8 @@
 //! Every card and verb is a focus target in one [`el::Tree`], so the plate travels from
 //! card to verb. The row keeps the focused card on the shared margin until its end reaches
 //! the screen's. OK connects, wakes, or pairs; Down reaches the verbs (Games, Connect
-//! with…, Wake, Details…), then the games; Y (OK held on a remote) opens the card's
-//! menu; X jumps to Settings; Up from the row, or B, is the tab strip's.
+//! with…, who plays, Wake, Details…), then the games; Y (OK held on a remote) opens the
+//! card's menu; X jumps to Settings; Up from the row, or B, is the tab strip's.
 //!
 //! The games are the Games tab's grid for that host ([`LibraryScreen::embedded`]). The
 //! shell fetches them once the row settles on a paired, online host. With focus in them
@@ -24,6 +24,7 @@ use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::card_menu::CardMenu;
 use crate::screens::library::LibraryScreen;
+use crate::screens::profiles::{ProfileBook, ProfilesScreen};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen, ScreenView};
 use crate::theme::{accent, edge, fg, fill, stroke, Fonts, PanelStroke, W};
 use crate::widgets::{button, button_w, BUTTON_H};
@@ -102,25 +103,32 @@ enum Verb {
     Pair,
     Games,
     ConnectWith,
+    /// Who plays: the remembered profile, or Who's playing? where each connect asks.
+    Profile,
     Wake,
     Details,
 }
 
 impl Verb {
-    fn label(self) -> &'static str {
+    fn label(self, h: &HostRow) -> String {
         match self {
-            Verb::Pair => "Pair\u{2026}",
-            Verb::Games => "Games",
-            Verb::ConnectWith => "Connect with\u{2026}",
-            Verb::Wake => "Wake",
-            Verb::Details => "Details\u{2026}",
+            Verb::Pair => "Pair\u{2026}".into(),
+            Verb::Games => "Games".into(),
+            Verb::ConnectWith => "Connect with\u{2026}".into(),
+            Verb::Profile => match h.remembered() {
+                Some(p) => format!("Playing as {}", p.display_name),
+                None => "Who\u{2019}s playing?".into(),
+            },
+            Verb::Wake => "Wake".into(),
+            Verb::Details => "Details\u{2026}".into(),
         }
     }
 }
 
 /// The verbs under a card. The action tiles have none: OK is all they do. The card's whole
-/// menu is the hold's; a More… here only repeated these.
-fn verbs(slot: &Slot<'_>) -> Vec<Verb> {
+/// menu is the hold's; a More… here only repeated these. Profile shows where who plays is
+/// a choice ([`ProfileBook::choice`]).
+fn verbs(slot: &Slot<'_>, book: &ProfileBook) -> Vec<Verb> {
     let Slot::Host(h) = slot else {
         return Vec::new();
     };
@@ -129,6 +137,9 @@ fn verbs(slot: &Slot<'_>) -> Vec<Verb> {
         v.push(Verb::Pair);
     } else if h.online {
         v.extend([Verb::Games, Verb::ConnectWith]);
+        if book.choice(h) {
+            v.push(Verb::Profile);
+        }
     } else if h.can_wake {
         v.push(Verb::Wake);
     }
@@ -148,6 +159,12 @@ fn run_verb(verb: Verb, h: &HostRow, ctx: &mut Ctx, fx: &mut Outbox) {
         ))),
         Verb::Games => fx.tab = Some(crate::shell::Tab::Games),
         Verb::ConnectWith => fx.push(Screen::CardMenu(CardMenu::connect_with(h))),
+        Verb::Profile => {
+            if let Some(s) = ProfilesScreen::switch(h, ctx.profiles) {
+                let screen = s.opened(h, fx);
+                fx.push(screen);
+            }
+        }
         Verb::Wake => {
             fx.cmds.push(ConsoleCmd::Wake {
                 key: h.key.clone(),
@@ -405,7 +422,7 @@ impl ScreenView for HomeScreen {
         }
         let len = Self::len(ctx.hosts);
         let slot = self.slot(ctx.hosts);
-        let on = verbs(&slot);
+        let on = verbs(&slot, ctx.profiles);
         if let Some(i) = self.verb {
             match ev {
                 MenuEvent::Move(MenuDir::Left) if i > 0 => {
@@ -539,7 +556,8 @@ impl ScreenView for HomeScreen {
             self.scrolled_up = false;
         }
         let hit = self.tree.hit(p.x as f32, p.y as f32);
-        let verb = (0..verbs(&self.slot(ctx.hosts)).len()).find(|&i| hit == Some(verb_id(i)));
+        let verb = (0..verbs(&self.slot(ctx.hosts), ctx.profiles).len())
+            .find(|&i| hit == Some(verb_id(i)));
         if let Some(i) = verb {
             let moved = self.verb != Some(i);
             self.verb = Some(i);
@@ -592,15 +610,15 @@ impl ScreenView for HomeScreen {
             return shelf.announcement(ctx);
         }
         let hosts = ctx.hosts;
-        if let Some(v) = self
+        let verb = self
             .verb
-            .and_then(|i| verbs(&self.slot(hosts)).get(i).copied())
-        {
-            return Some(v.label().trim_end_matches('\u{2026}').to_string());
+            .and_then(|i| verbs(&self.slot(hosts), ctx.profiles).get(i).copied());
+        if let (Some(v), Slot::Host(h)) = (verb, self.slot(hosts)) {
+            return Some(v.label(h).trim_end_matches('\u{2026}').to_string());
         }
         let say = |(title, sub): (&str, &str)| format!("{title}, {sub}");
         Some(match self.slot(hosts) {
-            Slot::Host(h) => match &h.profile {
+            Slot::Host(h) => match h.remembered() {
                 Some(p) => format!("{}, {}, as {}", h.name, status(h).0, p.display_name),
                 None => format!("{}, {}", h.name, status(h).0),
             },
@@ -686,7 +704,7 @@ impl ScreenView for HomeScreen {
         let pitch = tile_w + TILE_GAP * k;
         let len = Self::len(ctx.hosts);
         let slot = self.slot(ctx.hosts);
-        let verbs = verbs(&slot);
+        let verbs = verbs(&slot, ctx.profiles);
         if self.verb.is_some_and(|i| i >= verbs.len()) {
             self.verb = None;
         }
@@ -811,9 +829,12 @@ impl ScreenView for HomeScreen {
                 rect.width() + air,
                 rect.height(),
             ));
-        for (i, v) in verbs.iter().enumerate() {
-            let label = v.label();
-            let bw = button_w(fonts, label, k);
+        let labels: Vec<String> = match &slot {
+            Slot::Host(h) => verbs.iter().map(|v| v.label(h)).collect(),
+            _ => Vec::new(),
+        };
+        for (i, label) in labels.into_iter().enumerate() {
+            let bw = button_w(fonts, &label, k);
             let r = Rect::from_xywh(
                 (vx - f64::from(rect.left)) as f32 + air,
                 (vy - f64::from(rect.top)) as f32,
@@ -827,7 +848,7 @@ impl ScreenView for HomeScreen {
                     if layered {
                         crate::theme::save_layer_alpha(canvas, r.with_outset((8.0, 8.0)), fade);
                     }
-                    button(canvas, fonts, label, r, k);
+                    button(canvas, fonts, &label, r, k);
                     if layered {
                         canvas.restore();
                     }
@@ -931,7 +952,7 @@ impl TileLook {
 }
 
 /// A card: the badge, then what the host is doing over its name, a lock while OK would
-/// pair first, and the face of the profile it plays as.
+/// pair first, and the face of the profile it remembers.
 fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f64) {
     let stroke = if h.saved {
         PanelStroke::Plain(0.08)
@@ -958,10 +979,10 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
         draw_lock(canvas, right - 11.0 * k, cy - 9.0 * k, k);
         right -= 23.0 * k;
     }
-    if let Some(pick) = &h.profile {
+    if let Some(pick) = h.remembered() {
         let r = 17.0 * k;
         let cx = (right - r) as f32;
-        super::profiles::draw_pick(canvas, fonts, pick, cx, cy as f32, r);
+        super::profiles::draw_pick(canvas, fonts, Some(pick), cx, cy as f32, r);
         right -= 2.0 * r + 10.0 * k;
     }
     let max_w = right - tx;

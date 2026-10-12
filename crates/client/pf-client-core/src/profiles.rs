@@ -8,12 +8,16 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// The pick a device remembers for a box. Shown on the card, so it carries the name.
+/// The pick a device saves for a box. Shown on the card, so it carries the name.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfilePick {
     pub id: String,
     #[serde(default)]
     pub display_name: String,
+    /// The player asked this device to remember the pick. The console applies only such a
+    /// pick and asks otherwise; the other shells apply any saved pick.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remember: bool,
 }
 
 /// A seat profile's state right now. A word the host adds later reads as [`SeatState::Other`].
@@ -64,6 +68,7 @@ impl ListedProfile {
         ProfilePick {
             id: self.id.clone(),
             display_name: self.display_name.clone(),
+            remember: false,
         }
     }
 
@@ -123,7 +128,8 @@ pub struct Decision {
 }
 
 /// §10.1. `listed` is `None` for a box without profiles. `link` is a link's or a command's
-/// `as=`: it wins for this connect and leaves the saved pick alone.
+/// `as=`: it wins for this connect and leaves the saved pick alone. A kept pick keeps its
+/// `remember`.
 pub fn picker_decision(
     listed: Option<&[ListedProfile]>,
     remembered: Option<&ProfilePick>,
@@ -136,17 +142,27 @@ pub fn picker_decision(
             ..Decision::default()
         };
     };
-    let still = remembered.and_then(|r| listed.iter().find(|p| p.id == r.id));
+    let still = remembered.and_then(|r| {
+        let p = listed.iter().find(|p| p.id == r.id)?;
+        Some((
+            p,
+            ProfilePick {
+                remember: r.remember,
+                ..p.pick()
+            },
+        ))
+    });
+    let kept = || still.as_ref().map(|(_, pick)| pick.clone());
     if let Some(wanted) = link {
         return match find(listed, wanted) {
             Some(p) => Decision {
                 send: Some(p.id.clone()),
-                remember: still.map(ListedProfile::pick),
+                remember: kept(),
                 ..Decision::default()
             },
             None => Decision {
                 picker: true,
-                remember: still.map(ListedProfile::pick),
+                remember: kept(),
                 ..Decision::default()
             },
         };
@@ -154,14 +170,14 @@ pub fn picker_decision(
     if let [only] = listed {
         return Decision {
             send: Some(only.id.clone()),
-            remember: still.map(ListedProfile::pick),
+            remember: kept(),
             ..Decision::default()
         };
     }
-    if let Some(p) = still {
+    if let Some((p, _)) = &still {
         return Decision {
             send: Some(p.id.clone()),
-            remember: Some(p.pick()),
+            remember: kept(),
             ..Decision::default()
         };
     }
@@ -426,6 +442,33 @@ mod tests {
                 c.name
             );
         }
+    }
+
+    /// A kept pick keeps `remember`, so a shell that saves `remember` back never clears it.
+    #[test]
+    fn a_kept_pick_keeps_its_remember() {
+        let listed: Vec<ListedProfile> = serde_json::from_value(serde_json::json!([
+            {"id": "own", "display_name": "Ben"},
+            {"id": "kid", "display_name": "Kid"},
+        ]))
+        .unwrap();
+        let saved = ProfilePick {
+            id: "kid".into(),
+            display_name: "Old name".into(),
+            remember: true,
+        };
+        let d = picker_decision(Some(&listed), Some(&saved), None);
+        let kept = d.remember.expect("still listed");
+        assert!(kept.remember);
+        assert_eq!(kept.display_name, "Kid");
+        let old = ProfilePick {
+            remember: false,
+            ..saved
+        };
+        let d = picker_decision(Some(&listed), Some(&old), None);
+        assert_eq!(d.remember.map(|p| p.remember), Some(false));
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("remember"), "{json}");
     }
 
     #[test]

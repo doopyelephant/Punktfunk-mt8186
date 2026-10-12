@@ -2,7 +2,7 @@
 //!
 //! One screen on the shell stack. B pops; A launches the focused title in this window.
 //! The shell owns aurora, chrome and the connecting overlay. Every line lives in one
-//! scroll and one focus tree ([`games`]): the sort/view pills ([`bar`]), the host chips,
+//! scroll and one focus tree ([`games`]): the sort/view pills ([`bar`]), the host pill,
 //! the section rows, and the field, which is the grid or the shelf by `library_view`.
 //! A collection's shelf has only the pills and its field.
 //!
@@ -1054,7 +1054,9 @@ impl LibraryScreen {
                             .el(fonts, k, avail, true, applied, focus_pill, &pill_seen),
                     )
                     .child(El::column().size(avail as f32, (BAR_AIR * k) as f32)),
-                Line::Chips => root.child(this.chips_el(ctx.hosts, fonts, avail, k, hits)),
+                Line::Chips => {
+                    root.child(this.chips_el(ctx.hosts, ctx.profiles, fonts, avail, k, hits))
+                }
                 Line::Band(b) => {
                     root.child(this.band_el(&bands[b], b, fonts, avail, (cw, ch), k, hits))
                 }

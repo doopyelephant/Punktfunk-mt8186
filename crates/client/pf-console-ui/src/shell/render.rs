@@ -192,6 +192,7 @@ impl Shell {
             pads: &self.pads,
             device: &self.device,
             t,
+            profiles: &self.profiles,
             glyphs: self.glyphs,
             show_hints,
             cheap: false,
@@ -431,6 +432,7 @@ struct LayerEnv<'a> {
     pads: &'a [PadInfo],
     device: &'a crate::screens::Device,
     t: f64,
+    profiles: &'a crate::screens::profiles::ProfileBook,
     glyphs: GlyphStyle,
     show_hints: bool,
     /// Reduced UI resolution, as the last painted screen's settings say.
@@ -505,6 +507,7 @@ impl LayerEnv<'_> {
             pads: self.pads,
             device: self.device,
             t: self.t,
+            profiles: self.profiles,
         };
         // With focus on the tabs, a root's plate fades out. A root's target count says if
         // focus can enter.

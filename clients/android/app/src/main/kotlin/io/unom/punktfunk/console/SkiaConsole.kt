@@ -993,8 +993,7 @@ object SkiaConsole {
     /** `ConsoleCmd::SetProfile`: save (or with no profile, clear) the pick on a host. */
     private fun setProfile(c: JSONObject) {
         val kh = hostForKey(c.optString("key")) ?: return
-        val p = c.optJSONObject("profile")
-        HostRecords.savePick(knownHostStore, kh, p?.let { ProfilePick(it.optString("id"), it.optString("display_name")) })
+        HostRecords.savePick(knownHostStore, kh, ProfilePick.fromJson(c.optJSONObject("profile")))
         pushHosts(); pushKnownHosts()
     }
 

@@ -121,6 +121,15 @@ On a host with two or more profiles, the Apple, Android, Linux and Windows apps 
 on Living Room PC?** on the first connect and remember the answer for that host. The host card then
 shows the pick's initials, and **Switch profile…** in the host's menu changes it.
 
+The controller interface asks on every connect instead:
+
+- Turn on **Remember on this device** under the profiles to stop the question on that host. The
+  card then shows the pick's initials.
+- The button under a host card, **Playing as Kid** or **Who's playing?**, changes the pick or sets
+  **Ask every time**.
+- On **Games**, the pill with the host's name opens **Host and profile**: pick the host whose games
+  show and who plays there.
+
 - A device that had its own Steam seat before keeps playing as the profile named after it, without
   being asked.
 - A [`punktfunk://` link's `as=`](/docs/presets-and-links) or the command line's

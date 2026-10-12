@@ -214,10 +214,8 @@ internal object ConsoleJson {
             } ?: JSONObject.NULL,
         )
 
-    /** The saved profile pick as `{id, display_name}`, or `null`. */
-    private fun profileJson(h: KnownHost): Any = h.asProfile
-        ?.let { JSONObject().put("id", it.id).put("display_name", it.displayName) }
-        ?: JSONObject.NULL
+    /** The saved profile pick as `{id, display_name, remember}`, or `null`. */
+    private fun profileJson(h: KnownHost): Any = h.asProfile?.toJson() ?: JSONObject.NULL
 
     /** `KnownHosts` (Rust) — only what the console needs to build a link: id, address, fp. */
     fun knownHosts(saved: List<KnownHost>): String {

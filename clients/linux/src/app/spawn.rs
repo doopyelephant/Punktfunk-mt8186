@@ -180,6 +180,7 @@ mod tests {
                 profile: Some(pf_client_core::profiles::ProfilePick {
                     id: "saved".into(),
                     display_name: "Kid".into(),
+                    remember: false,
                 }),
                 ..Default::default()
             }],
