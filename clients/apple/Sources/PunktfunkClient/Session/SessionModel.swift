@@ -1274,15 +1274,11 @@ final class SessionModel: ObservableObject {
         if lines != hudLines { hudLines = lines } // an unchanged overlay must not re-render
     }
 
-    /// What only the app knows: the floor policy (macOS presents straight to the display, so
-    /// nothing is shaved there), this app's audio ring, the preset, and the Apple-only lines.
+    /// What only the app knows: this app's audio ring, the preset, and the Apple-only lines.
+    /// Nothing is shaved: display and end-to-end read capture → glass as measured, like Android.
     private func hudFacts() -> PunktfunkConnection.HudFacts {
         var f = PunktfunkConnection.HudFacts()
-        #if os(macOS)
         f.shaveOsFloor = false
-        #else
-        f.shaveOsFloor = true
-        #endif
         if let a = audio?.stats {
             f.audioBufferMs = UInt32(clamping: a.bufferMS)
             f.avOffsetMs = Int32(clamping: a.avOffsetMS)
