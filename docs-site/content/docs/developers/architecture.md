@@ -136,7 +136,7 @@ holds the installers, the tray and the update helper.
 | `crates/client/pf-presenter` | SDL3 window, Vulkan swapchain, input capture |
 | `crates/client/pf-console-ui` | Skia console: stats overlay, gamepad home, library, settings |
 | `crates/host/punktfunk-host` | The host: sessions, both protocol planes, management API, game library, CLI |
-| `crates/host/punktfunk-encode-worker` | Separate binary that runs PyroWave at raised GPU priority |
+| `crates/host/punktfunk-encode-worker` | Separate binary that runs PyroWave and the NVIDIA frame convert at raised GPU priority |
 | `crates/host/punktfunk-capture-worker` | Windows Graphics Capture and the encoder for a mirror or shared-screen session, as the signed-in user |
 | `crates/host/pf-vdisplay` | Virtual outputs, one backend per compositor plus the Windows driver backend |
 | `crates/host/pf-capture` | PipeWire portal capture (Linux) and driver push (Windows) behind `Capturer` |

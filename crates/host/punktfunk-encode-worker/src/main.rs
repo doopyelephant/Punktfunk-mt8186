@@ -1,6 +1,7 @@
-//! Linux helper spawned by `punktfunk-host` for one PyroWave session.
-//! The parent `dup2`s the socket onto fd 3 (`--fd` overrides); the run loop
-//! is [`pf_encode::worker`].
+//! Linux helper spawned by `punktfunk-host`: one PyroWave session ([`pf_encode::worker`]), or
+//! with `zerocopy-worker` first, one capture's GPU import and fused convert
+//! ([`pf_zerocopy::worker`]). Both want the elevated Vulkan queue only this file may hold.
+//! The parent `dup2`s the socket onto fd 3 (`--fd` overrides).
 //!
 //! Only this file may carry `cap_sys_nice=ep`. A hardlink or host subcommand
 //! shares the inode and the capability — see this crate's Cargo.toml.
@@ -25,7 +26,11 @@ fn main() -> std::process::ExitCode {
     #[cfg(target_os = "linux")]
     {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        match pf_encode::worker::run_from_args(&args) {
+        let run = match args.first().map(String::as_str) {
+            Some("zerocopy-worker") => pf_zerocopy::worker::run_from_args(&args[1..]),
+            _ => pf_encode::worker::run_from_args(&args),
+        };
+        match run {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
                 // The host already saw the socket die; this line is for `journalctl`.

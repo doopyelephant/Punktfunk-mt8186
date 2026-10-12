@@ -1,8 +1,12 @@
-//! Isolated GPU-import worker (`punktfunk-host zerocopy-worker`).
+//! Isolated GPU-import worker (`punktfunk-encode-worker zerocopy-worker`, or
+//! `punktfunk-host zerocopy-worker` when that binary is missing or refuses).
 //!
 //! Owns the headless EGLDisplay + GL context, the CUDA context, and the Vulkan bridge so a
 //! driver fault on a producer-invalidated dmabuf kills this process, not the streaming host.
 //! The host sees the dead socket, fails the frame, and the capture-loss rebuild takes over.
+//!
+//! Run from the encode worker, it holds `CAP_SYS_NICE`, so the Vulkan bridge's queue gets the
+//! elevated global priority and the convert schedules ahead of a GPU-bound game.
 //!
 //! One worker per capture (spawned per `pipewire_thread`). Exits on socket EOF, which the host
 //! sends only after the capturer and every in-flight frame are gone, so pooled device memory
@@ -15,6 +19,7 @@ use super::egl::{DmabufPlane, EglImporter};
 use super::ipc;
 use super::proto::{
     BufferDesc, ConvertOut, ConvertSrc, CursorRect, ImportKind, Reply, Request, PROTO_VERSION,
+    WORKSPACE_VERSION,
 };
 use anyhow::{bail, Context, Result};
 use pf_dmabuf::{ReadMap, Share};
@@ -34,10 +39,22 @@ pub fn run_from_args(args: &[String]) -> Result<()> {
     unsafe {
         libc::prctl(libc::PR_SET_NAME, c"pf-zerocopy".as_ptr());
     }
+    // Exec of the capped encode worker clears dumpable; a driver fault here should leave a core.
+    // Dumpable is not KWin's identifiability gate, and this process never speaks Wayland.
+    // SAFETY: `prctl(PR_SET_DUMPABLE, 1)` takes integers by value and affects only this process.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 1);
+    }
     run(ipc::adopt_spawned_socket(args)?)
 }
 
 fn run(sock: OwnedFd) -> Result<()> {
+    let mut buf = Vec::new();
+    match ipc::recv::<Request>(sock.as_fd(), &mut buf) {
+        Ok((Request::Hello, _)) => {}
+        Ok((other, _)) => bail!("first message was {other:?}, not Hello"),
+        Err(e) => return Err(e).context("recv Hello"),
+    }
     let importer = match EglImporter::new() {
         Ok(i) => i,
         Err(e) => {
@@ -56,6 +73,7 @@ fn run(sock: OwnedFd) -> Result<()> {
         sock.as_fd(),
         &Reply::Ready {
             version: PROTO_VERSION,
+            workspace: WORKSPACE_VERSION.to_string(),
         },
         None,
     )
@@ -138,6 +156,14 @@ pub(crate) fn serve(sock: &OwnedFd, backend: &mut dyn ImportBackend) -> Result<(
             Err(e) => return Err(e).context("worker recv"),
         };
         match req {
+            Request::Hello => {
+                let reply = Reply::Err {
+                    message: "Hello after the handshake".into(),
+                };
+                if send_or_eof(sock, &reply, None)? {
+                    return Ok(());
+                }
+            }
             Request::Modifiers { fourcc } => {
                 let reply = Reply::Modifiers {
                     modifiers: backend.modifiers(fourcc),

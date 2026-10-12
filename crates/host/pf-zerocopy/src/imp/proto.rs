@@ -1,5 +1,6 @@
 //! Request/reply vocabulary between the PipeWire capture thread and the isolated GPU-import
-//! worker (`punktfunk-host zerocopy-worker`; `design/zerocopy-worker-isolation.md`).
+//! worker (`punktfunk-encode-worker zerocopy-worker`, or `punktfunk-host zerocopy-worker`
+//! without it; `design/zerocopy-worker-isolation.md`).
 //!
 //! Transport is [`super::ipc`] (SEQPACKET + `SCM_RIGHTS`); this module versions the body
 //! independently of other workers. Pixels never ride the socket — they move GPU-side via
@@ -9,9 +10,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Bumped on any wire change. Echoed in [`Reply::Ready`]; the host refuses a mismatch.
-/// Same binary (`/proc/self/exe`) — trips only a stale re-exec.
-pub const PROTO_VERSION: u32 = 4;
+/// Bumped on any wire change. Echoed in [`Reply::Ready`]; the host refuses a mismatch. The
+/// encode-worker binary is a separate file, so a mismatch there is a stale install.
+pub const PROTO_VERSION: u32 = 5;
+
+/// Compared in the handshake as well: the protocol can stay still while the convert moves.
+pub const WORKSPACE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Mirrors the `EglImporter` entry points. Append-only: a worker can outlive a replaced host,
 /// so an unknown variant must fail decode, not remap.
@@ -53,6 +57,9 @@ impl ImportKind {
 /// host → worker.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum Request {
+    /// First message, before GPU init. An encode worker too old to know this mode fails to
+    /// decode it and exits, so the host falls back at once instead of waiting out the handshake.
+    Hello,
     /// EGL-importable DRM modifiers for `fourcc` (startup; advertised to PipeWire).
     Modifiers { fourcc: u32 },
     /// `key` is the dmabuf's `st_ino` (stable per object). The fd rides `SCM_RIGHTS` only on
@@ -138,6 +145,7 @@ pub enum Reply {
     /// Once, after EGL + CUDA init.
     Ready {
         version: u32,
+        workspace: String,
     },
     /// Init failed. Host falls back to CPU, as for in-process `EglImporter::new()`.
     InitErr {

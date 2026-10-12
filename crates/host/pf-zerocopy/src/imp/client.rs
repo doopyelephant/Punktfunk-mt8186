@@ -10,6 +10,7 @@ use super::egl::DmabufPlane;
 use super::ipc;
 use super::proto::{
     BufferDesc, ConvertOut, ConvertSrc, CursorRect, ImportKind, Reply, Request, PROTO_VERSION,
+    WORKSPACE_VERSION,
 };
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -79,25 +80,51 @@ pub struct RemoteImporter {
 }
 
 impl RemoteImporter {
-    /// Spawn this host binary as the worker and handshake. Exec is through the
-    /// pinned [`ipc::self_exe`] fd so a replaced install cannot change the
-    /// image. `Err` means no isolated zero-copy — same fallback as
-    /// `EglImporter::new()`. Do not copy this onto the capability-carrying
-    /// encode worker: a shared inode shares the file capability.
+    /// Spawn the worker and handshake. `Err` means no isolated zero-copy — same fallback as
+    /// `EglImporter::new()`.
+    ///
+    /// First choice is `punktfunk-encode-worker`: it holds `CAP_SYS_NICE`, the only way the
+    /// Vulkan bridge's convert gets a priority queue ahead of a GPU-bound game. Missing, off, or
+    /// refusing, this host binary re-execs as the worker at default priority. Never the other way
+    /// round: a host image carrying the worker's capability is unidentifiable to KWin.
     pub fn spawn() -> Result<RemoteImporter> {
+        match ipc::resolve_worker_path() {
+            ipc::WorkerPath::Found(path) => match Self::spawn_encode_worker(&path) {
+                Ok(importer) => return Ok(importer),
+                Err(e) => tracing::warn!(
+                    worker = %path.display(),
+                    error = %format!("{e:#}"),
+                    "zero-copy convert worker did not come up in the encode worker; the host \
+                     binary runs it at default GPU priority"
+                ),
+            },
+            ipc::WorkerPath::Missing => tracing::warn!(
+                worker = ipc::ENCODE_WORKER_BIN,
+                "encode worker not found beside the host binary or on PATH; the zero-copy \
+                 convert runs at default GPU priority"
+            ),
+            ipc::WorkerPath::Off => {}
+        }
         match ipc::self_exe() {
-            Some(exe) => Self::spawn_exe(&exe.exec_path()),
+            Some(exe) => Self::spawn_exe(&exe.exec_path(), "punktfunk-host"),
             None => Self::spawn_exe(
                 &std::env::current_exe().context("resolve /proc/self/exe for the worker")?,
+                "punktfunk-host",
             ),
         }
     }
 
-    fn spawn_exe(exe: &Path) -> Result<RemoteImporter> {
+    /// Pinned by fd like the host image, so a package upgrade mid-spawn execs one inode.
+    fn spawn_encode_worker(path: &Path) -> Result<RemoteImporter> {
+        let pinned = ipc::PinnedExe::open(path)
+            .with_context(|| format!("open {} for exec", path.display()))?;
+        Self::spawn_exe(&pinned.exec_path(), ipc::ENCODE_WORKER_BIN)
+    }
+
+    fn spawn_exe(exe: &Path, argv0: &str) -> Result<RemoteImporter> {
         // `exe` is normally `/proc/self/fd/<n>`; argv[0] is what `ps` shows.
-        let (host_end, child) =
-            ipc::spawn_worker(exe, "punktfunk-host", &["zerocopy-worker", "--fd", "3"])
-                .context("spawn zerocopy-worker")?;
+        let (host_end, child) = ipc::spawn_worker(exe, argv0, &["zerocopy-worker", "--fd", "3"])
+            .context("spawn zerocopy-worker")?;
         Self::from_socket(host_end, Some(child))
     }
 
@@ -114,21 +141,24 @@ impl RemoteImporter {
             sent_keys: HashSet::new(),
         };
         ipc::set_recv_timeout(importer.shared.sock.as_fd(), Some(HANDSHAKE_TIMEOUT))?;
-        let ready = ipc::recv::<Reply>(importer.shared.sock.as_fd(), &mut importer.rbuf);
+        let ready = ipc::send(importer.shared.sock.as_fd(), &Request::Hello, None)
+            .and_then(|()| ipc::recv::<Reply>(importer.shared.sock.as_fd(), &mut importer.rbuf));
         ipc::set_recv_timeout(importer.shared.sock.as_fd(), Some(REPLY_TIMEOUT))?;
         match ready {
-            Ok((Reply::Ready { version }, _)) if version == PROTO_VERSION => {
+            Ok((Reply::Ready { version, workspace }, _))
+                if version == PROTO_VERSION && workspace == WORKSPACE_VERSION =>
+            {
                 tracing::info!(
                     pid = importer.child.as_ref().map(|c| c.id()),
                     "zero-copy GPU import isolated in a worker process"
                 );
                 Ok(importer)
             }
-            Ok((Reply::Ready { version }, _)) => {
+            Ok((Reply::Ready { version, workspace }, _)) => {
                 importer.mark_dead();
                 bail!(
-                    "zerocopy worker protocol mismatch (worker v{version}, host v{})",
-                    PROTO_VERSION
+                    "zerocopy worker version skew (worker proto {version} v{workspace}, host \
+                     proto {PROTO_VERSION} v{WORKSPACE_VERSION})"
                 )
             }
             Ok((Reply::InitErr { message }, _)) => {
@@ -536,29 +566,49 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::thread;
 
-    fn handshake_server(reply: Reply) -> OwnedFd {
+    /// The reply is queued before the host's `Hello` lands. The worker end comes back so the
+    /// caller keeps it open: a closed peer fails the `Hello` send.
+    fn handshake_server(reply: Reply) -> (OwnedFd, OwnedFd) {
         let (host, worker) = ipc::socketpair_seqpacket().unwrap();
         ipc::send(worker.as_fd(), &reply, None).unwrap();
-        // Handshake is already queued; dropping the worker end still delivers it.
-        drop(worker);
-        host
+        (host, worker)
+    }
+
+    fn ready() -> Reply {
+        Reply::Ready {
+            version: PROTO_VERSION,
+            workspace: WORKSPACE_VERSION.into(),
+        }
     }
 
     #[test]
     fn handshake_ready_and_version_gate() {
-        let host = handshake_server(Reply::Ready {
-            version: PROTO_VERSION,
-        });
+        let (host, worker) = handshake_server(ready());
         let imp = RemoteImporter::from_socket(host, None).unwrap();
         assert!(!imp.dead());
+        let (hello, _) = ipc::recv::<Request>(worker.as_fd(), &mut Vec::new()).unwrap();
+        assert_eq!(hello, Request::Hello);
 
-        let host = handshake_server(Reply::Ready { version: 999 });
+        let (host, _worker) = handshake_server(Reply::Ready {
+            version: 999,
+            workspace: WORKSPACE_VERSION.into(),
+        });
         assert!(RemoteImporter::from_socket(host, None).is_err());
+
+        // A stale encode-worker binary can share the protocol number with a newer host.
+        let (host, _worker) = handshake_server(Reply::Ready {
+            version: PROTO_VERSION,
+            workspace: "0.0.0-stale".into(),
+        });
+        let Err(err) = RemoteImporter::from_socket(host, None) else {
+            panic!("a workspace mismatch must fail the handshake")
+        };
+        assert!(format!("{err:#}").contains("skew"), "{err:#}");
     }
 
     #[test]
     fn handshake_init_err() {
-        let host = handshake_server(Reply::InitErr {
+        let (host, _worker) = handshake_server(Reply::InitErr {
             message: "no GPU".into(),
         });
         let Err(err) = RemoteImporter::from_socket(host, None) else {
@@ -577,7 +627,7 @@ mod tests {
     #[test]
     fn spawning_a_non_worker_fails_cleanly() {
         // `true` exits with no handshake → EOF, same fallback as a GPU-less box.
-        let Err(err) = RemoteImporter::spawn_exe(Path::new("true")) else {
+        let Err(err) = RemoteImporter::spawn_exe(Path::new("true"), "true") else {
             panic!("spawning a non-worker must fail")
         };
         assert!(format!("{err:#}").contains("handshake"), "{err:#}");
@@ -603,19 +653,15 @@ mod tests {
         replies: Vec<Reply>,
     ) -> (RemoteImporter, thread::JoinHandle<Vec<SeenRequest>>) {
         let (host, worker) = ipc::socketpair_seqpacket().unwrap();
-        ipc::send(
-            worker.as_fd(),
-            &Reply::Ready {
-                version: PROTO_VERSION,
-            },
-            None,
-        )
-        .unwrap();
+        ipc::send(worker.as_fd(), &ready(), None).unwrap();
         let join = thread::spawn(move || {
             let mut buf = Vec::new();
             let mut seen = Vec::new();
             let mut replies = replies.into_iter();
             while let Ok((req, fd)) = ipc::recv::<Request>(worker.as_fd(), &mut buf) {
+                if req == Request::Hello {
+                    continue;
+                }
                 let needs_reply = matches!(req, Request::Modifiers { .. } | Request::Import { .. });
                 let ino = fd
                     .as_ref()
