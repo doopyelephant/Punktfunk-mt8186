@@ -82,11 +82,12 @@ private let shaderSource = """
 using namespace metal;
 
 // `uv` addresses the visible part of the frame (chroma, and luma drawn as decoded); `luv` is luma's
-// own, the unit square once `lumaForTarget` has already cropped and scaled it.
-struct VOut { float4 pos [[position]]; float2 uv; float2 luv; };
+// own, the unit square once `lumaForTarget` has already cropped and scaled it. `upscale` is 1 while
+// the bound luma is smaller than the target (or scaled by the shader), 0 when it is 1:1.
+struct VOut { float4 pos [[position]]; float2 uv; float2 luv; float upscale [[flat]]; };
 
-// Origin + size of each, in texture UV (see `UvRects` in Swift).
-struct UvRects { float4 frame; float4 luma; };
+// Origin + size of each, in texture UV, and the mode (see `UvRects` in Swift).
+struct UvRects { float4 frame; float4 luma; float4 mode; };
 
 // The CPU-computed CSC rows (CscRows.swift, layout-matched): rgb[i] = dot(ri.xyz, yuv) + ri.w.
 // Range expansion, the matrix, and the 10-bit MSB-packing factor are all folded in.
@@ -99,6 +100,7 @@ vertex VOut pf_vtx(uint vid [[vertex_id]], constant UvRects& rects [[buffer(0)]]
     float2 unit = float2(p.x, 1.0 - p.y);
     o.uv = rects.frame.xy + unit * rects.frame.zw;
     o.luv = rects.luma.xy + unit * rects.luma.zw;
+    o.upscale = rects.mode.x;
     return o;
 }
 
@@ -132,6 +134,18 @@ float catmullRomLuma(texture2d<float> tex, sampler s, float2 uv) {
     return r;
 }
 
+// Luma at `luv`: Catmull-Rom while upscaling. At 1:1 one bilinear tap lands on the texel centre
+// and returns it exactly, so the nine taps would buy nothing.
+// PUNKTFUNK_BILINEAR_LUMA=1 forces the single tap everywhere: if that visibly changes a 1:1
+// picture, the present is not 1:1.
+float sampleLuma(texture2d<float> tex, sampler s, float2 luv, float upscale) {
+#ifdef PF_BILINEAR_LUMA
+    return tex.sample(s, luv).r;
+#else
+    return upscale > 0.5 ? catmullRomLuma(tex, s, luv) : tex.sample(s, luv).r;
+#endif
+}
+
 // 4:2:0 chroma is left-cosited horizontally, centered vertically (H.273 chroma_loc 0); sampling at
 // the luma UV assumes center siting, so shift +0.25 chroma texels. The shift self-disables when
 // chroma is not narrower than the bound luma: 4:4:4, and 4:2:0 luma pre-scaled under 0.5×, where
@@ -149,17 +163,9 @@ float2 chromaUV(texture2d<float> lumaTex, texture2d<float> chromaTex, float2 uv)
 // gamma-encoded RGB, an HDR frame's rows yield PQ-encoded R′G′B′ — the fragment variants below
 // differ only in what they do next.
 float3 sampleRgb(texture2d<float> lumaTex, texture2d<float> chromaTex, float2 luv, float2 uv,
-                 constant CscUniform& csc) {
+                 float upscale, constant CscUniform& csc) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-#ifdef PF_BILINEAR_LUMA
-    // DEBUG (PUNKTFUNK_BILINEAR_LUMA=1): plain bilinear luma — Catmull-Rom OFF. A/B lever to see if
-    // the bicubic overshoot contributes to edge fringing. NOTE: at a true 1:1 present both paths
-    // reduce to the identity texel, so if this toggle VISIBLY changes the picture, the present is
-    // NOT 1:1 (there's a resample); if it looks identical, the fringing is upstream (codec/source/OS).
-    float lumaY = lumaTex.sample(s, luv).r;
-#else
-    float lumaY = catmullRomLuma(lumaTex, s, luv);
-#endif
+    float lumaY = sampleLuma(lumaTex, s, luv, upscale);
     float3 yuv = float3(lumaY,
                         chromaTex.sample(s, chromaUV(lumaTex, chromaTex, uv)).rg);
     return saturate(float3(dot(csc.r0.xyz, yuv) + csc.r0.w,
@@ -173,7 +179,7 @@ fragment float4 pf_frag(VOut in [[stage_in]],
                         texture2d<float> lumaTex [[texture(0)]],
                         texture2d<float> chromaTex [[texture(1)]],
                         constant CscUniform& csc [[buffer(0)]]) {
-    return float4(sampleRgb(lumaTex, chromaTex, in.luv, in.uv, csc), 1.0);
+    return float4(sampleRgb(lumaTex, chromaTex, in.luv, in.uv, in.upscale, csc), 1.0);
 }
 
 // PyroWave planar SDR: three separate R8 planes (Y full-res, Cb/Cr half-res 4:2:0) from the
@@ -185,11 +191,7 @@ fragment float4 pf_frag_planar(VOut in [[stage_in]],
                                texture2d<float> crTex [[texture(2)]],
                                constant CscUniform& csc [[buffer(0)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-#ifdef PF_BILINEAR_LUMA
-    float lumaY = lumaTex.sample(s, in.luv).r;
-#else
-    float lumaY = catmullRomLuma(lumaTex, s, in.luv);
-#endif
+    float lumaY = sampleLuma(lumaTex, s, in.luv, in.upscale);
     float2 cuv = chromaUV(lumaTex, cbTex, in.uv);
     float3 yuv = float3(lumaY, cbTex.sample(s, cuv).r, crTex.sample(s, cuv).r);
     float3 rgb = saturate(float3(dot(csc.r0.xyz, yuv) + csc.r0.w,
@@ -206,7 +208,7 @@ fragment float4 pf_frag_hdr(VOut in [[stage_in]],
                             texture2d<float> lumaTex [[texture(0)]],
                             texture2d<float> chromaTex [[texture(1)]],
                             constant CscUniform& csc [[buffer(0)]]) {
-    return float4(sampleRgb(lumaTex, chromaTex, in.luv, in.uv, csc), 1.0);
+    return float4(sampleRgb(lumaTex, chromaTex, in.luv, in.uv, in.upscale, csc), 1.0);
 }
 
 // tvOS without HDR headroom has no EDR API and composites a PQ tag untone-mapped, so PQ becomes
@@ -254,7 +256,7 @@ fragment float4 pf_frag_hdr_tv(VOut in [[stage_in]],
                                texture2d<float> chromaTex [[texture(1)]],
                                constant CscUniform& csc [[buffer(0)]]) {
     // Y′CbCr → full-range PQ R′G′B′ via the per-frame rows (as pf_frag_hdr), then the tail.
-    return float4(pqToSdr(sampleRgb(lumaTex, chromaTex, in.luv, in.uv, csc)), 1.0);
+    return float4(pqToSdr(sampleRgb(lumaTex, chromaTex, in.luv, in.uv, in.upscale, csc)), 1.0);
 }
 
 // PyroWave planar HDR tone-map: three separate R16 planes (P010-style studio codes; the rows
@@ -268,11 +270,7 @@ fragment float4 pf_frag_planar_tm(VOut in [[stage_in]],
                                   texture2d<float> crTex [[texture(2)]],
                                   constant CscUniform& csc [[buffer(0)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
-#ifdef PF_BILINEAR_LUMA
-    float lumaY = lumaTex.sample(s, in.luv).r;
-#else
-    float lumaY = catmullRomLuma(lumaTex, s, in.luv);
-#endif
+    float lumaY = sampleLuma(lumaTex, s, in.luv, in.upscale);
     float2 cuv = chromaUV(lumaTex, cbTex, in.uv);
     float3 yuv = float3(lumaY, cbTex.sample(s, cuv).r, crTex.sample(s, cuv).r);
     float3 pq = saturate(float3(dot(csc.r0.xyz, yuv) + csc.r0.w,
@@ -901,8 +899,7 @@ public final class MetalVideoPresenter {
 
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = drawable.texture
-        pass.colorAttachments[0].loadAction = .clear
-        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        pass.colorAttachments[0].loadAction = .dontCare // the fullscreen triangle writes every pixel
         pass.colorAttachments[0].storeAction = .store
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
             return false
@@ -946,7 +943,9 @@ public final class MetalVideoPresenter {
     /// Luma to bind for a draw into `target`, with the UV rects that sample it. The plane itself
     /// when the visible region is not larger than the target; otherwise that region Lanczos-scaled
     /// to the target's size, sampled over the unit square. r16Float holds a 10-bit code to within
-    /// one step and is writable and filterable on every Apple GPU. RENDER THREAD.
+    /// one step and is writable and filterable on every Apple GPU. The shader filters luma only
+    /// while it resamples: a 1:1 plane on the pixel grid, or the Lanczos output, takes one tap.
+    /// RENDER THREAD.
     private func lumaForTarget(
         _ luma: MTLTexture, target: MTLTexture, commandBuffer: MTLCommandBuffer
     ) -> (MTLTexture, UvRects) {
@@ -955,8 +954,14 @@ public final class MetalVideoPresenter {
         stagingLock.unlock()
         let frame = SIMD4<Float>(
             Float(src.minX), Float(src.minY), Float(src.width), Float(src.height))
-        let whole = UvRects(frame: frame, luma: frame)
         let cropW = src.width * CGFloat(luma.width), cropH = src.height * CGFloat(luma.height)
+        let onGrid = Self.lumaOnGrid(
+            target: CGSize(width: target.width, height: target.height),
+            crop: CGRect(
+                x: src.minX * CGFloat(luma.width), y: src.minY * CGFloat(luma.height),
+                width: cropW, height: cropH))
+        let whole = UvRects(
+            frame: frame, luma: frame, mode: SIMD4<Float>(onGrid ? 0 : 1, 0, 0, 0))
         guard CGFloat(target.width) < cropW - 0.5 || CGFloat(target.height) < cropH - 0.5,
               let lanczos = lanczos
         else { return (luma, whole) }
@@ -979,7 +984,17 @@ public final class MetalVideoPresenter {
         withUnsafePointer(to: &transform) { lanczos.scaleTransform = $0 }
         lanczos.encode(
             commandBuffer: commandBuffer, sourceTexture: luma, destinationTexture: scaledLuma)
-        return (scaledLuma, UvRects(frame: frame, luma: SIMD4<Float>(0, 0, 1, 1)))
+        return (
+            scaledLuma,
+            UvRects(frame: frame, luma: SIMD4<Float>(0, 0, 1, 1), mode: SIMD4<Float>(0, 0, 0, 0)))
+    }
+
+    /// A visible region (in luma texels) that lands 1:1 on a `target`-sized drawable: same size,
+    /// whole-texel origin, so every pixel centre is a texel centre. Internal for tests.
+    static func lumaOnGrid(target: CGSize, crop: CGRect) -> Bool {
+        abs(target.width - crop.width) < 0.5 && abs(target.height - crop.height) < 0.5
+            && abs(crop.minX - crop.minX.rounded()) < 0.01
+            && abs(crop.minY - crop.minY.rounded()) < 0.01
     }
 
     /// Returns the CVMetalTexture (not just its MTLTexture) so the caller can keep it alive past the
@@ -1022,10 +1037,12 @@ public final class MetalVideoPresenter {
     #endif
 }
 
-/// `UvRects` in the shader, field for field: two `float4`, 32 bytes.
+/// `UvRects` in the shader, field for field: three `float4`, 48 bytes. `mode.x` is the shader's
+/// `upscale`.
 private struct UvRects {
     var frame: SIMD4<Float>
     var luma: SIMD4<Float>
+    var mode: SIMD4<Float>
 }
 
 #endif

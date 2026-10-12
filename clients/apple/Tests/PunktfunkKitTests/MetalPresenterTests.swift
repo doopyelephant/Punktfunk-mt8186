@@ -49,6 +49,19 @@ final class MetalPresenterTests: XCTestCase {
         XCTAssertNil(presenter.layer.edrMetadata)
     }
 
+    /// The shader filters luma only while it resamples: 1:1 on the pixel grid takes one tap.
+    func testLumaIsOnGridOnlyAtOneToOneOnWholeTexels() {
+        let target = CGSize(width: 2752, height: 2064)
+        XCTAssertTrue(MetalVideoPresenter.lumaOnGrid(
+            target: target, crop: CGRect(x: 0, y: 0, width: 2752, height: 2064)))
+        XCTAssertFalse(MetalVideoPresenter.lumaOnGrid(
+            target: target, crop: CGRect(x: 0, y: 0, width: 2560, height: 1920)), "upscale")
+        XCTAssertFalse(MetalVideoPresenter.lumaOnGrid(
+            target: target, crop: CGRect(x: 0.5, y: 0, width: 2752, height: 2064)), "half-texel")
+        XCTAssertTrue(MetalVideoPresenter.lumaOnGrid(
+            target: target, crop: CGRect(x: 8, y: 4, width: 2752, height: 2064)), "whole-texel crop")
+    }
+
     /// Deadline pacing: once the link vends, layer writes wait for the link thread to apply them
     /// between vends, in order.
     func testDeferredLayerWritesWaitForTheLink() throws {
