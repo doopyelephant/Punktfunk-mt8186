@@ -474,51 +474,81 @@ final class LatestBox<T>: @unchecked Sendable {
 }
 
 /// A drawable the deadline link vended: when it did, Apple's deadline to call `present()`
-/// (`Update.targetTimestamp`) and the refresh it is for (all `CACurrentMediaTime`).
+/// (`Update.targetTimestamp`), the refresh it is for (all `CACurrentMediaTime`) and the link's
+/// refresh period (0 until two updates have run).
 struct VendedDrawable {
     let drawable: CAMetalDrawable
     let vendAt: CFTimeInterval
     let deadline: CFTimeInterval
     let target: CFTimeInterval
+    let period: CFTimeInterval
+}
+
+/// The largest of the last 32 samples of one cost. Lock-free; its owner guards it.
+struct RecentMax {
+    private var samples = [CFTimeInterval](repeating: 0, count: 32)
+    private var next = 0
+    var value: CFTimeInterval { samples.max() ?? 0 }
+    mutating func note(_ s: CFTimeInterval) {
+        samples[next] = s
+        next = (next + 1) % samples.count
+    }
 }
 
 /// Deadline pacing's present timing. The link hands each drawable over two refreshes before
-/// glass, with the deadline `present()` must beat.
+/// glass, with the deadline `present()` must beat (`Update.targetTimestamp`).
 ///
-/// - The latency intent picks as late as the deadline allows, less `margin` (the slowest of the
-///   last 32 render calls + 0.5 ms, 1...4 ms), so a frame decoded meanwhile still makes it.
-/// - A drawable paired past that pick is never presented: it would land a refresh late and shift
+/// - The last safe pick is the deadline less `margin`: the worst recent timer wake lateness, CPU
+///   encode and GPU time, + 0.5 ms, + a learned extra. The system lands a present or two a second
+///   late on its own; only three late events at the cutoff within 120 presents add 1 ms. 600
+///   on-target presents take 0.5 ms back.
+/// - A drawable paired past the cutoff is never presented: it would land a refresh late and shift
 ///   every present behind it. The frame waits for the next drawable.
-/// - A present shown late anyway arms one skipped vend, which drains the queue it left. Presents
-///   issued before that skip were already queued and arm nothing.
+/// - A present shown late arms one skipped vend, which drains the queue it left. Presents issued
+///   before that skip were already queued and count for nothing.
 ///
 /// Lock-guarded: the render thread asks, the link thread reads `margin`, Metal's completion
-/// thread reports.
+/// threads report.
 final class DeadlinePacer: @unchecked Sendable {
     enum Pair: Equatable {
         case skip
         case present(at: CFTimeInterval)
     }
 
-    /// A drawable paired at `now`: skip it (a drain is armed, or the pick has passed), or present
-    /// it at the latest pick (latency intent) or now.
+    /// The last safe pick for a drawable vended at `vendAt`: the deadline less `margin`, which
+    /// never takes more than 3/4 of the window. A margin past the window would expire every
+    /// drawable, and with nothing rendered its measured costs could never come down again.
+    static func cutoff(
+        vendAt: CFTimeInterval, deadline: CFTimeInterval, margin: CFTimeInterval
+    ) -> CFTimeInterval {
+        deadline - min(margin, (deadline - vendAt) * 0.75)
+    }
+
+    /// A drawable vended at `vendAt`, paired at `now`, with its last safe pick `last`: skip it (a
+    /// drain is armed, or `last` has passed), or present at `pick` (latency intent) or now. With
+    /// no window left after the vend it presents at once rather than skip every vend.
     static func pair(
-        now: CFTimeInterval, deadline: CFTimeInterval, margin: CFTimeInterval, latePick: Bool,
-        drain: Bool
+        now: CFTimeInterval, vendAt: CFTimeInterval, last: CFTimeInterval, pick: CFTimeInterval,
+        latePick: Bool, drain: Bool
     ) -> Pair {
-        let last = deadline - margin
-        if drain || now > last { return .skip }
-        return .present(at: latePick ? last : now)
+        if drain { return .skip }
+        if last <= vendAt { return .present(at: now) }
+        if now > last { return .skip }
+        return .present(at: latePick ? min(max(pick, now), last) : now)
     }
 
     private let lock = NSLock()
-    private var renders = [CFTimeInterval](repeating: 0, count: 32)
-    private var renderIndex = 0
+    private var cpu = RecentMax(), gpu = RecentMax(), wake = RecentMax()
+    private var extra: CFTimeInterval = 0
+    private var clean = 0
+    /// Presents observed since the last late event at the cutoff, and how many such events ran
+    /// within 120 presents of each other.
+    private var sinceLate = Int.max
+    private var lateRun = 0
     private var drainPending = false
     private var drainedThroughNs: Int64 = 0
     private var held = 0, superseded = 0, skips = 0, expired = 0, drains = 0, late = 0
-    private var dropped = 0
-    private var wakeLateMax: CFTimeInterval = 0
+    private var dropped = 0, bumps = 0
     private var vendToDeadline: [Double] = [], deadlineToGlass: [Double] = []
 
     var margin: CFTimeInterval {
@@ -528,28 +558,43 @@ final class DeadlinePacer: @unchecked Sendable {
     }
 
     private func marginLocked() -> CFTimeInterval {
-        min(max((renders.max() ?? 0) + 0.0005, 0.001), 0.004)
+        max(wake.value + cpu.value + gpu.value + 0.0005, 0.001) + extra
     }
 
-    func noteRender(seconds: CFTimeInterval) {
-        lock.lock()
-        renders[renderIndex] = seconds
-        renderIndex = (renderIndex + 1) % renders.count
-        lock.unlock()
-    }
+    func noteRender(seconds: CFTimeInterval) { lock.lock(); cpu.note(seconds); lock.unlock() }
+    func noteGPU(seconds: CFTimeInterval) { lock.lock(); gpu.note(seconds); lock.unlock() }
 
-    /// A present issued at `issuedNs` for `targetNs` reached glass at `presentedNs` (nil:
-    /// dropped). Any refresh is ≥ 4.17 ms, so 3 ms past the target is a refresh late.
-    func observe(issuedNs: Int64, presentedNs: Int64?, targetNs: Int64) {
+    /// A present issued at `issuedNs` for `targetNs`, whose cutoff sat `cutoffLeadNs` before the
+    /// target, reached glass at `presentedNs` (nil: dropped). Any refresh is ≥ 4.17 ms, so 3 ms
+    /// past the target is a refresh late.
+    func observe(issuedNs: Int64, presentedNs: Int64?, targetNs: Int64, cutoffLeadNs: Int64) {
         lock.lock()
         defer { lock.unlock() }
+        if sinceLate < Int.max { sinceLate += 1 }
         guard let presentedNs else {
             dropped += 1
             return
         }
-        guard presentedNs - targetNs > 3_000_000 else { return }
+        guard presentedNs - targetNs > 3_000_000 else {
+            clean += 1
+            if clean >= 600, extra > 0 {
+                clean = 0
+                extra = max(0, extra - 0.0005)
+            }
+            return
+        }
         late += 1
-        if issuedNs > drainedThroughNs { drainPending = true }
+        clean = 0
+        guard issuedNs > drainedThroughNs, !drainPending else { return }
+        drainPending = true
+        guard targetNs - issuedNs < cutoffLeadNs + 1_000_000 else { return }
+        lateRun = sinceLate <= 120 ? lateRun + 1 : 1
+        sinceLate = 0
+        if lateRun >= 3 {
+            lateRun = 0
+            extra = min(extra + 0.001, 0.008)
+            bumps += 1
+        }
     }
 
     /// The armed drain, once: presents issued before `nowNs` were queued behind the late one.
@@ -567,7 +612,7 @@ final class DeadlinePacer: @unchecked Sendable {
         lock.lock()
         held += 1
         if newer { superseded += 1 }
-        wakeLateMax = max(wakeLateMax, wakeLate)
+        wake.note(max(wakeLate, 0))
         lock.unlock()
     }
 
@@ -588,16 +633,70 @@ final class DeadlinePacer: @unchecked Sendable {
         defer { lock.unlock() }
         func p50(_ xs: [Double]) -> Double { xs.isEmpty ? 0 : xs.sorted()[xs.count / 2] }
         let line = String(
-            format: "pf-deadline marginMs=%.2f held=%d superseded=%d skips=%d expired=%d "
-                + "drains=%d late=%d dropped=%d wakeLateMaxMs=%.2f vendToDeadlineMs=%.2f "
-                + "deadlineToGlassMs=%.2f",
-            marginLocked() * 1000, held, superseded, skips, expired, drains, late, dropped,
-            wakeLateMax * 1000, p50(vendToDeadline), p50(deadlineToGlass))
+            format: "pf-deadline marginMs=%.2f extraMs=%.1f wakeMs=%.2f cpuMs=%.2f gpuMs=%.2f "
+                + "held=%d superseded=%d skips=%d expired=%d drains=%d late=%d dropped=%d "
+                + "bumps=%d vendToDeadlineMs=%.2f deadlineToGlassMs=%.2f",
+            marginLocked() * 1000, extra * 1000, wake.value * 1000, cpu.value * 1000,
+            gpu.value * 1000, held, superseded, skips, expired, drains, late, dropped, bumps,
+            p50(vendToDeadline), p50(deadlineToGlass))
         held = 0; superseded = 0; skips = 0; expired = 0; drains = 0; late = 0; dropped = 0
-        wakeLateMax = 0
+        bumps = 0
         vendToDeadline.removeAll(keepingCapacity: true)
         deadlineToGlass.removeAll(keepingCapacity: true)
         return line
+    }
+}
+
+/// Where decoded frames land in the refresh, as a fraction of the period after the vend. Host and
+/// panel clocks drift, so the phase walks; 60 frames are half a second at 120 Hz. Render-thread
+/// confined. Internal for tests.
+struct ArrivalPhase {
+    static let capacity = 60
+    private var samples: [Double] = []
+    private var next = 0
+
+    mutating func note(fraction: Double) {
+        let f = fraction - fraction.rounded(.down)
+        if samples.count < Self.capacity {
+            samples.append(f)
+        } else {
+            samples[next] = f
+        }
+        next = (next + 1) % Self.capacity
+    }
+
+    /// Circular mean and the p90 distance from it, both as fractions; nil until half full.
+    func estimate() -> (mean: Double, spread: Double)? {
+        guard samples.count >= Self.capacity / 2 else { return nil }
+        var sx = 0.0, sy = 0.0
+        for f in samples {
+            sx += cos(2 * .pi * f)
+            sy += sin(2 * .pi * f)
+        }
+        var mean = atan2(sy, sx) / (2 * .pi)
+        if mean < 0 { mean += 1 }
+        let dist = samples.map { f -> Double in
+            let d = abs(f - mean)
+            return min(d, 1 - d)
+        }.sorted()
+        return (mean, dist[dist.count * 9 / 10])
+    }
+
+    /// When to pick after the vend, in `0...window`, for frames landing `arrival` after it. Two
+    /// frames between picks lose one; none leaves a repeat. Mid-way between arrivals (after this
+    /// one: it shows this refresh) when that clears them by `need`; else whichever of that and
+    /// the gap before it (this frame waits a refresh) clears them more.
+    static func pickOffset(
+        arrival a: Double, period p: Double, window w: Double, need: Double
+    ) -> Double {
+        let w = max(w, 0)
+        func clearance(_ h: Double) -> Double {
+            min(abs(h - (a - p)), abs(h - a), abs(h - (a + p)))
+        }
+        let same = min(a + p / 2, w)
+        if same > a, clearance(same) >= need { return same }
+        let before = min(max(a - p / 2, 0), w)
+        return clearance(before) > clearance(same) ? before : same
     }
 }
 
@@ -708,6 +807,11 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
     /// The latency intent picks at the deadline; Smoothness presents on pairing.
     private let latePick: Bool
     private var loggedLinkUp = false
+    /// The refresh period: the shortest of the last 16 target steps, so a skipped update (two
+    /// refreshes) never counts and a rate change lands within 16.
+    private var lastTarget: CFTimeInterval = 0
+    private var steps = [CFTimeInterval](repeating: .infinity, count: 16)
+    private var stepIndex = 0
 
     /// Apple accepts 1 or 2 here; 1 is the shorter.
     static let frameLatency: Float = 1
@@ -757,10 +861,20 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
         if presentDebug { pacer.noteVend(at: vendAt, deadline: deadline, target: target) }
         // The OS floor the overlay takes off end-to-end: how far before glass the present goes
         // out — from the pick at the deadline, else from the vend.
-        let floorS = latePick ? target - deadline + pacer.margin : leadS
+        let floorS = latePick
+            ? target - DeadlinePacer.cutoff(vendAt: vendAt, deadline: deadline, margin: pacer.margin)
+            : leadS
         if floorS > 0 { hud?.floor(ns: Int64(floorS * 1_000_000_000)) }
+        let step = target - lastTarget
+        if step > 0.002, step < 0.1 {
+            steps[stepIndex] = step
+            stepIndex = (stepIndex + 1) % steps.count
+        }
+        lastTarget = target
+        let period = steps.min().flatMap { $0.isFinite ? $0 : nil } ?? 0
         stash.put(VendedDrawable(
-            drawable: update.drawable, vendAt: vendAt, deadline: deadline, target: target))
+            drawable: update.drawable, vendAt: vendAt, deadline: deadline, target: target,
+            period: period))
         renderSignal.signal()
     }
 }
@@ -1243,10 +1357,11 @@ public final class Stage2Pipeline {
                 .flatMap { (2...3).contains($0) ? $0 : nil } ?? 3
         layer.maximumDrawableCount = drawableCount
 
-        // The latency intent picks at the deadline; Smoothness keeps its cadence clock's timing
-        // and presents on pairing.
+        // The latency intent picks inside the window before the deadline; Smoothness keeps its
+        // cadence clock's timing and presents on pairing.
         let pacer = DeadlinePacer()
         let latePick = cadence == nil
+        presenter.onGPUTime = { pacer.noteGPU(seconds: $0) }
 
         // The link starts LAZILY — the render thread triggers this after the FIRST decoded
         // frame's reconcileLayer. Started eagerly it vends into the layer's initial 0×0
@@ -1302,6 +1417,7 @@ public final class Stage2Pipeline {
             // every (re)start too, so a fresh link gets its first vend before it can be judged.
             var lastVend = CACurrentMediaTime()
             var lastDeadlineLine = lastVend
+            var arrival = ArrivalPhase()
             // Relink once, rebuild if it stalls again (see LinkStallPolicy). `wedged` latches:
             // the rebuild replaces this pipeline, so the watchdog stops after one report.
             var stallPolicy = LinkStallPolicy()
@@ -1312,10 +1428,13 @@ public final class Stage2Pipeline {
                 // Wake on a signal, or when the stashed drawable's pick passes: one no frame
                 // claimed goes back to the pool then.
                 let margin = pacer.margin
-                let untilPick = stash.peek { $0.deadline - margin - CACurrentMediaTime() } ?? 0.1
+                let cutoff = { (v: VendedDrawable) in
+                    DeadlinePacer.cutoff(vendAt: v.vendAt, deadline: v.deadline, margin: margin)
+                }
+                let untilPick = stash.peek { cutoff($0) - CACurrentMediaTime() } ?? 0.1
                 let signaled =
                     renderSignal.wait(timeout: .now() + min(max(untilPick, 0), 0.1)) == .success
-                if stash.take(where: { CACurrentMediaTime() > $0.deadline - margin }) != nil {
+                if stash.take(where: { CACurrentMediaTime() > cutoff($0) }) != nil {
                     lastVend = CACurrentMediaTime() // the link is alive, just unclaimed
                     pacer.noteExpired()
                 }
@@ -1398,8 +1517,20 @@ public final class Stage2Pipeline {
                 let now = CACurrentMediaTime()
                 let drain = pacer.takeDrain(
                     nowNs: Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: now))
+                // The pick: mid-way between where frames land, inside the window up to the
+                // cutoff; the cutoff itself until the phase is known or while it is noise.
+                let last = cutoff(vended)
+                var pick = last
+                if latePick, vended.period > 0, let phase = arrival.estimate(),
+                   phase.spread < 0.25
+                {
+                    let p = vended.period
+                    pick = vended.vendAt + ArrivalPhase.pickOffset(
+                        arrival: phase.mean * p, period: p, window: last - vended.vendAt,
+                        need: max(0.001, phase.spread * p + 0.0005))
+                }
                 switch DeadlinePacer.pair(
-                    now: now, deadline: vended.deadline, margin: margin, latePick: latePick,
+                    now: now, vendAt: vended.vendAt, last: last, pick: pick, latePick: latePick,
                     drain: drain)
                 {
                 case .skip:
@@ -1421,12 +1552,20 @@ public final class Stage2Pipeline {
                     }
                 }
                 let shown = frame
+                if vended.period > 0, shown.decodedNs > 0 {
+                    let vendNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: vended.vendAt)
+                    arrival.note(
+                        fraction: Double(shown.decodedNs - vendNs) / (vended.period * 1e9))
+                }
                 let targetNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: vended.target)
+                let cutoffLeadNs = Int64((vended.target - last) * 1e9)
                 let renderStarted = CACurrentMediaTime()
                 lastVend = renderStarted
                 let issuedNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: renderStarted)
                 let onGlass: (Int64?) -> Void = { presentedNs in
-                    pacer.observe(issuedNs: issuedNs, presentedNs: presentedNs, targetNs: targetNs)
+                    pacer.observe(
+                        issuedNs: issuedNs, presentedNs: presentedNs, targetNs: targetNs,
+                        cutoffLeadNs: cutoffLeadNs)
                     let atNs = presentedNs
                         ?? Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: CACurrentMediaTime())
                     endToEndMeter?.record(ptsNs: shown.ptsNs, atNs: atNs, offsetNs: clockOffset())

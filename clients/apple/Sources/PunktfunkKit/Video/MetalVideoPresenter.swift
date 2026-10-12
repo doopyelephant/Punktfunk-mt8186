@@ -283,6 +283,9 @@ fragment float4 pf_frag_planar_tm(VOut in [[stage_in]],
 public final class MetalVideoPresenter {
     /// The layer the hosting view installs (as a sublayer) and sizes to its bounds.
     public let layer: CAMetalLayer
+    /// Each frame's GPU execution time, on a Metal completion thread (deadline pacing's margin).
+    /// Set before the render thread starts.
+    var onGPUTime: (@Sendable (CFTimeInterval) -> Void)?
 
 
     private let device: MTLDevice
@@ -929,7 +932,13 @@ public final class MetalVideoPresenter {
             #endif
         }
         // Keep the bound sources alive until the GPU finishes sampling (see the callers).
-        commandBuffer.addCompletedHandler { _ in _ = keepAlive }
+        let onGPUTime = onGPUTime
+        commandBuffer.addCompletedHandler { cb in
+            _ = keepAlive
+            if let onGPUTime, cb.gpuEndTime > cb.gpuStartTime {
+                onGPUTime(cb.gpuEndTime - cb.gpuStartTime)
+            }
+        }
         // An absolute link target is the fixed-grid path; without one, present when the GPU finishes.
         if let presentAtMediaTime {
             commandBuffer.present(drawable, atTime: presentAtMediaTime)
