@@ -233,9 +233,10 @@ mod tests {
     /// A decode submit waits for a present the presenter has taken up, and only for
     /// that: an older frame's end does not release it, a frame the presenter has not
     /// reached is not waited for, and a stuck presenter costs one bounded turn.
+    /// No sleeps under the turn: Windows rounds a 1 ms sleep past `PRESENT_TURN`.
     #[test]
     fn a_present_turn_holds_the_decode_submit_until_it_ends() {
-        let lock = std::sync::Arc::new(QueueLock::new());
+        let lock = QueueLock::new();
         lock.offer_present_turn(1);
         lock.begin_present_turn(1);
         let t = Instant::now();
@@ -257,24 +258,20 @@ mod tests {
         lock.offer_present_turn(2);
         lock.begin_present_turn(2);
         lock.end_present_turn(1);
-        let ender = {
-            let lock = lock.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(1));
-                lock.end_present_turn(2);
-            })
-        };
-        let t = Instant::now();
-        lock.yield_to_present();
-        let waited = t.elapsed();
-        ender.join().unwrap();
         assert!(
-            waited >= Duration::from_micros(900),
+            lock.turn.lock().unwrap().is_some(),
             "frame 1's end released frame 2"
         );
+        lock.end_present_turn(2);
         assert!(
-            waited < super::PRESENT_TURN,
+            lock.turn.lock().unwrap().is_none(),
             "frame 2's end did not release it"
+        );
+        let t = Instant::now();
+        lock.yield_to_present();
+        assert!(
+            t.elapsed() < Duration::from_millis(2),
+            "nothing left to wait for"
         );
 
         lock.offer_present_turn(3);
