@@ -318,9 +318,7 @@ fn dump_console_screens() {
         dump(&mut s6, 40, 8, "07g-games-tab", true);
         s6.handle_menu(MenuEvent::Move(MenuDir::Up));
         s6.handle_menu(MenuEvent::Move(MenuDir::Up)); // the chips
-        for _ in 0..3 {
-            s6.handle_menu(MenuEvent::Move(MenuDir::Right)); // to Customize
-        }
+        s6.handle_menu(MenuEvent::Move(MenuDir::Right)); // past the host pill, to Customize
         s6.handle_menu(MenuEvent::Confirm);
         finish_motion(&mut s6);
         s6.handle_menu(MenuEvent::Move(MenuDir::Down));
@@ -420,6 +418,7 @@ fn dump_profiles() {
         rows[0].profile = Some(ProfilePick {
             id: "theo".into(),
             display_name: "Theo".into(),
+            remember: true,
         });
         console8.set_hosts(rows.clone());
         let mut opts = test_options();
@@ -481,12 +480,49 @@ fn dump_profiles() {
                 ),
             ),
         ];
+        let answer = ProfilesAnswer::Listed(listed.clone());
         s8.start_connect(crate::screens::ConnectIntent::to_host(&rows[0], None));
         console8.set_profiles("aa11", ProfilesAnswer::Listed(listed));
         dump(&mut s8, 40, "12-profiles");
         s8.handle_menu(MenuEvent::Move(MenuDir::Right));
         s8.handle_menu(MenuEvent::Move(MenuDir::Right));
         dump(&mut s8, 40, "12b-profiles-focus");
+        s8.handle_menu(MenuEvent::Move(MenuDir::Down));
+        s8.handle_menu(MenuEvent::Move(MenuDir::Down));
+        s8.handle_menu(MenuEvent::Confirm);
+        dump(&mut s8, 40, "12c-profiles-remember");
+
+        // The card's verb names who plays; it opens the switch, Ask every time last.
+        s8.handle_menu(MenuEvent::Back);
+        finish_motion(&mut s8);
+        s8.profiles.learn("aa11", &answer);
+        s8.handle_menu(MenuEvent::Move(MenuDir::Down));
+        for _ in 0..2 {
+            s8.handle_menu(MenuEvent::Move(MenuDir::Right));
+        }
+        dump(&mut s8, 40, "01j-home-profile-verb");
+        s8.handle_menu(MenuEvent::Confirm);
+        dump(&mut s8, 40, "12d-profiles-switch");
+
+        // The Games tab's host pill, then Host and profile behind it.
+        let mut s9 = Shell::new(
+            console8.clone(),
+            library.clone(),
+            ConsoleBus::default(),
+            test_options(),
+            vec![Screen::Library(LibraryScreen::new(&rows[0]))],
+        )
+        .unwrap();
+        s9.profiles.learn("aa11", &answer);
+        dump(&mut s9, 60, "_13-settle");
+        if let Some(Screen::Library(l)) = s9.stack.first_mut() {
+            l.focus_pill();
+        }
+        dump(&mut s9, 40, "13-games-host-pill");
+        s9.handle_menu(MenuEvent::Confirm);
+        dump(&mut s9, 40, "13b-host-and-profile");
+        s9.handle_menu(MenuEvent::Move(MenuDir::Down));
+        dump(&mut s9, 40, "13c-host-and-profile-faces");
     }
 }
 

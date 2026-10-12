@@ -9,8 +9,22 @@ import org.json.JSONObject
  * `clients/shared/profile-picker-vectors.json` pins [pickerDecision] in both.
  */
 
-/** The pick a device remembers for a box. Shown on the card, so it carries the name. */
-data class ProfilePick(val id: String, val displayName: String = "")
+/**
+ * The pick a device saves for a box. Shown on the card, so it carries the name. [remember]: the
+ * player asked this device to keep it; the console applies only such a pick.
+ */
+data class ProfilePick(val id: String, val displayName: String = "", val remember: Boolean = false) {
+    /** `{id, display_name, remember}` as `pf-client-core` spells it; `remember` only when set. */
+    fun toJson(): JSONObject = JSONObject().put("id", id).put("display_name", displayName)
+        .also { if (remember) it.put("remember", true) }
+
+    companion object {
+        /** [toJson]'s shape back; `null` without an id. */
+        fun fromJson(j: JSONObject?): ProfilePick? = j
+            ?.let { ProfilePick(it.optString("id"), it.optString("display_name"), it.optBoolean("remember")) }
+            ?.takeIf { it.id.isNotEmpty() }
+    }
+}
 
 /** A seat profile's state right now. A word the host adds later reads as [OTHER]. */
 enum class SeatState {
@@ -125,16 +139,18 @@ fun pickerDecision(
 ): ProfileDecision {
     if (listed == null) return ProfileDecision(send = link, remember = remembered)
     val still = remembered?.let { r -> listed.firstOrNull { it.id == r.id } }
+    // A kept pick keeps `remember`: saving it back never clears the console's.
+    val kept = still?.pick()?.copy(remember = remembered?.remember == true)
     if (link != null) {
         val p = findProfile(listed, link)
         return if (p != null) {
-            ProfileDecision(send = p.id, remember = still?.pick())
+            ProfileDecision(send = p.id, remember = kept)
         } else {
-            ProfileDecision(picker = true, remember = still?.pick())
+            ProfileDecision(picker = true, remember = kept)
         }
     }
-    if (listed.size == 1) return ProfileDecision(send = listed[0].id, remember = still?.pick())
-    if (still != null) return ProfileDecision(send = still.id, remember = still.pick())
+    if (listed.size == 1) return ProfileDecision(send = listed[0].id, remember = kept)
+    if (still != null) return ProfileDecision(send = still.id, remember = kept)
     if (remembered == null) {
         listed.firstOrNull { it.legacySeat }?.let {
             return ProfileDecision(send = it.id, remember = it.pick())

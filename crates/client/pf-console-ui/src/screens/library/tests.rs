@@ -406,7 +406,13 @@ fn the_games_tab_walks_chips_bands_and_grid_as_lines() {
     assert!(matches!(pulse, Some(MenuPulse::Boundary)), "then the tabs");
     press(&mut s, &library, &mut settings, down());
     assert_eq!(s.zone, Zone::Chip(0), "and Down comes back");
-    // No other paired host here, so the only chip is Customize.
+    // The host pill opens Host and profile; Customize sits beside it.
+    let (_, fx) = press(&mut s, &library, &mut settings, MenuEvent::Confirm);
+    assert!(matches!(
+        fx.nav,
+        Some(crate::screens::Nav::Push(ref screen)) if matches!(**screen, Screen::Profiles(_))
+    ));
+    press(&mut s, &library, &mut settings, right());
     let (_, fx) = press(&mut s, &library, &mut settings, MenuEvent::Confirm);
     assert!(matches!(
         fx.nav,
@@ -1386,51 +1392,49 @@ fn dump_library() {
     phone(&mut s, 60, "LP2-phone-grid");
 }
 
-/// Twelve paired hosts overflow the chips line. Right walks it, and the line scrolls to
-/// keep the focused chip in view instead of letting it run off the edge.
+/// Twelve paired hosts still make two chips: the host pill, naming the shelf's host and
+/// who plays there, then Customize. The hosts themselves wait behind the pill.
 #[test]
-fn the_chips_line_scrolls_the_focused_chip_into_view() {
+fn many_hosts_wait_behind_one_host_pill() {
     let (mut s, library) = live_shelf();
     let mut settings = pf_client_core::trust::Settings {
         library_view: LibraryView::Grid.id().to_string(),
         ..Default::default()
     };
-    let hosts: Vec<HostRow> = (0..12)
+    let mut hosts: Vec<HostRow> = (0..12)
         .map(|i| HostRow::fixture(&format!("h{i}"), &format!("Living room host {i}")))
         .collect();
+    hosts[0] = s.host.clone();
+    hosts[0].profile = Some(pf_client_core::profiles::ProfilePick {
+        id: "kid".into(),
+        display_name: "Kid".into(),
+        remember: true,
+    });
     let fonts = crate::theme::build_fonts().unwrap();
     let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
     let rect = Rect::from_xywh(0.0, 0.0, 1280.0, 800.0);
-    let chips = games::chips_id();
     let mut frame = |s: &mut LibraryScreen, ev: Option<MenuEvent>| {
         let mut ctx = Ctx {
             hosts: &hosts,
             ..Ctx::test(&mut settings, &library)
         };
-        if let Some(ev) = ev {
-            s.menu(ev, &mut ctx, &mut Outbox::default());
-        }
+        let mut fx = Outbox::default();
+        let pulse = ev.and_then(|ev| s.menu(ev, &mut ctx, &mut fx));
         s.render(surface.canvas(), rect, 1.0, 1.0 / 60.0, &fonts, &mut ctx);
+        let title = s.zone_title(&ctx);
+        (pulse, fx, title)
     };
     s.grid_cols_last = Some(3);
     frame(&mut s, None);
-    frame(&mut s, Some(up()));
+    let (_, _, title) = frame(&mut s, Some(up()));
     assert_eq!(s.zone, Zone::Chip(0), "Up from the Desktops band");
-    assert_eq!(s.grid.borrow().offset(chips), 0.0);
-    for _ in 0..11 {
-        frame(&mut s, Some(MenuEvent::Move(MenuDir::Right)));
-    }
-    assert_eq!(s.zone, Zone::Chip(11));
-    for _ in 0..180 {
-        frame(&mut s, None);
-    }
-    let tree = s.grid.borrow();
-    assert!(tree.offset(chips) > 0.0, "the line scrolled");
-    let chip = tree.rect(games::chip_id(11)).expect("the chip is placed");
-    let view = tree.rect(chips).expect("the line is placed");
+    assert_eq!(title, Some(format!("{} \u{b7} Kid", s.host.name)));
+    frame(&mut s, Some(right()));
+    let (pulse, _, _) = frame(&mut s, Some(right()));
+    assert_eq!(s.zone, Zone::Chip(1));
     assert!(
-        chip.left >= view.left - 1.0 && chip.right <= view.right + 1.0,
-        "chip {chip:?} inside {view:?}"
+        matches!(pulse, Some(MenuPulse::Boundary)),
+        "Customize ends it"
     );
 }
 

@@ -406,11 +406,7 @@ class KnownHostStore(context: Context) {
             .put("added", host.addedAt ?: 0)
             .put("last_used", host.lastUsed ?: 0)
             // Not `profile`: that key is the old spelling of the settings preset.
-            .put(
-                "as_profile",
-                host.asProfile?.let { JSONObject().put("id", it.id).put("display_name", it.displayName) }
-                    ?: JSONObject.NULL,
-            )
+            .put("as_profile", host.asProfile?.toJson() ?: JSONObject.NULL)
             .toString()
 
         /** One stored record, or null when it does not parse. */
@@ -442,9 +438,7 @@ class KnownHostStore(context: Context) {
                 // 0 (or absent) = never stamped, the same sentinel as `mgmt`.
                 addedAt = j.optLong("added", 0).takeIf { it > 0 },
                 lastUsed = j.optLong("last_used", 0).takeIf { it > 0 },
-                asProfile = j.optJSONObject("as_profile")?.let {
-                    ProfilePick(it.optString("id"), it.optString("display_name")).takeIf { p -> p.id.isNotEmpty() }
-                },
+                asProfile = ProfilePick.fromJson(j.optJSONObject("as_profile")),
             )
         }.getOrNull()
 

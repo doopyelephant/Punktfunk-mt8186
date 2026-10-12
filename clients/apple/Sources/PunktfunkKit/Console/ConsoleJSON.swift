@@ -118,8 +118,7 @@ public enum ConsoleJSON {
             "bound_preset": bound.map(chip) ?? NSNull(),
             "running": running[fp] ?? "",
             "game_presets": host.gamePresets ?? [:],
-            "profile": host.pickedProfile.map { ["id": $0.id, "display_name": $0.displayName] }
-                ?? NSNull(),
+            "profile": host.pickedProfile?.bridgeJSON ?? NSNull(),
         ]
     }
 

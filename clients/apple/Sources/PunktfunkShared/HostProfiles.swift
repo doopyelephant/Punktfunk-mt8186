@@ -6,25 +6,44 @@
 
 import Foundation
 
-/// The pick a device remembers for a box. Shown on the card, so it carries the name.
+/// The pick a device saves for a box. Shown on the card, so it carries the name. `remember`: the
+/// player asked this device to keep it; the console applies only such a pick.
 public struct ProfilePick: Codable, Hashable, Sendable {
     public var id: String
     public var displayName: String
+    public var remember: Bool
 
-    public init(id: String, displayName: String = "") {
+    public init(id: String, displayName: String = "", remember: Bool = false) {
         self.id = id
         self.displayName = displayName
+        self.remember = remember
     }
 
     private enum CodingKeys: String, CodingKey {
         case id
         case displayName = "display_name"
+        case remember
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         displayName = try c.decodeIfPresent(String.self, forKey: .displayName) ?? ""
+        remember = try c.decodeIfPresent(Bool.self, forKey: .remember) ?? false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(displayName, forKey: .displayName)
+        if remember { try c.encode(true, forKey: .remember) }
+    }
+
+    /// The console bridge's `{id, display_name, remember}`; `remember` only when set.
+    public var bridgeJSON: [String: Any] {
+        var json: [String: Any] = ["id": id, "display_name": displayName]
+        if remember { json["remember"] = true }
+        return json
     }
 }
 
@@ -167,17 +186,23 @@ public enum HostProfiles {
             return Decision(send: link, remember: remembered)
         }
         let still = remembered.flatMap { r in listed.first { $0.id == r.id } }
+        // A kept pick keeps `remember`: saving it back never clears the console's.
+        let kept = still.map { p -> ProfilePick in
+            var pick = p.pick
+            pick.remember = remembered?.remember ?? false
+            return pick
+        }
         if let wanted = link {
             guard let p = find(listed, wanted) else {
-                return Decision(picker: true, remember: still?.pick)
+                return Decision(picker: true, remember: kept)
             }
-            return Decision(send: p.id, remember: still?.pick)
+            return Decision(send: p.id, remember: kept)
         }
         if listed.count == 1 {
-            return Decision(send: listed[0].id, remember: still?.pick)
+            return Decision(send: listed[0].id, remember: kept)
         }
         if let p = still {
-            return Decision(send: p.id, remember: p.pick)
+            return Decision(send: p.id, remember: kept)
         }
         if remembered == nil, let p = listed.first(where: \.legacySeat) {
             return Decision(send: p.id, remember: p.pick)

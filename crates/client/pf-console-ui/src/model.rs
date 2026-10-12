@@ -79,8 +79,8 @@ pub struct HostRow {
     /// outranks `bound_preset` at launch, which the host resolves.
     #[serde(default)]
     pub game_presets: BTreeMap<String, String>,
-    /// The profile this device plays as on this host (`KnownHost::profile`), shown on the
-    /// card and named in every launch. `None`: no pick yet, or a box without profiles.
+    /// The pick saved for this host (`KnownHost::profile`). The console shows and sends it
+    /// only while `remember` is set ([`Self::remembered`]); otherwise a connect asks.
     #[serde(default)]
     pub profile: Option<pf_client_core::profiles::ProfilePick>,
 }
@@ -110,6 +110,12 @@ impl HostRow {
     /// never a pinned card's composite key.
     pub fn host_key(&self) -> &str {
         self.key.split('\0').next().unwrap_or(&self.key)
+    }
+
+    /// The profile the player asked this device to remember here: the card's face, and
+    /// the one a connect plays as without asking.
+    pub fn remembered(&self) -> Option<&pf_client_core::profiles::ProfilePick> {
+        self.profile.as_ref().filter(|p| p.remember)
     }
 }
 

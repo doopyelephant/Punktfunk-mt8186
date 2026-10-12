@@ -13,6 +13,7 @@ use crate::glyphs::{Hint, HintKey};
 use crate::library::LibraryGame;
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::Pointer;
+use crate::screens::profiles::ProfileBook;
 use crate::screens::{Ctx, Outbox, Screen, ScreenView};
 use crate::store::SettingsStore;
 use crate::theme::{edge, fg, Fonts, W};
@@ -28,7 +29,7 @@ enum Action {
     ConnectWith,
     /// The Games tab on this card's shelf.
     Browse,
-    /// Who plays on this host: offered once the card carries a saved pick (§10.1).
+    /// Who plays on this host: offered where that is a choice ([`ProfileBook::choice`]).
     SwitchProfile,
     Wake,
     CopyLink,
@@ -198,15 +199,15 @@ impl CardMenu {
     }
 
     /// The rows this menu offers. A TV has no clipboard, so no Copy link.
-    fn actions(&self, store: &dyn SettingsStore, tv: bool) -> Vec<Action> {
-        let mut rows = self.all_actions(store);
+    fn actions(&self, store: &dyn SettingsStore, book: &ProfileBook, tv: bool) -> Vec<Action> {
+        let mut rows = self.all_actions(store, book);
         if tv {
             rows.retain(|a| *a != Action::CopyLink);
         }
         rows
     }
 
-    fn all_actions(&self, store: &dyn SettingsStore) -> Vec<Action> {
+    fn all_actions(&self, store: &dyn SettingsStore, book: &ProfileBook) -> Vec<Action> {
         let host = match (&self.subject, self.mode) {
             (_, Mode::ConnectWith) => {
                 return std::iter::once(Action::Preset(None))
@@ -266,7 +267,7 @@ impl CardMenu {
         let mut a = Vec::new();
         if host.paired {
             a.extend([Action::ConnectWith, Action::Browse]);
-            if host.profile.is_some() {
+            if book.choice(host) {
                 a.push(Action::SwitchProfile);
             }
         } else {
@@ -550,9 +551,9 @@ impl CardMenu {
             }
             Action::SwitchProfile => {
                 let host = self.host();
-                if let Some(screen) = super::profiles::ProfilesScreen::switch(host) {
-                    fx.cmds.push(super::profiles::ProfilesScreen::fetch(host));
-                    fx.replace(Screen::Profiles(screen));
+                if let Some(s) = super::profiles::ProfilesScreen::switch(host, ctx.profiles) {
+                    let screen = s.opened(host, fx);
+                    fx.replace(screen);
                 }
             }
             // The games under the row; the shell falls back to the Games tab.
@@ -864,7 +865,7 @@ impl ScreenView for CardMenu {
                 _ => {}
             }
         }
-        let actions = self.actions(ctx.store, ctx.device.tv);
+        let actions = self.actions(ctx.store, ctx.profiles, ctx.device.tv);
         let (msg, pulse) = self.list.menu(ev, actions.len());
         self.dispatch(msg, pulse, &actions, ctx, fx)
     }
@@ -881,7 +882,7 @@ impl ScreenView for CardMenu {
                 self.strip_focus = false;
             }
         }
-        let actions = self.actions(ctx.store, ctx.device.tv);
+        let actions = self.actions(ctx.store, ctx.profiles, ctx.device.tv);
         let (msg, pulse) = self.list.pointer(p, actions.len());
         if matches!(msg, ListMsg::None) && pulse.is_none() {
             return false;
@@ -923,7 +924,7 @@ impl ScreenView for CardMenu {
         };
         let strip_top = list_rect.top;
         list_rect.top += strip_h as f32;
-        let actions = self.actions(ctx.store, ctx.device.tv);
+        let actions = self.actions(ctx.store, ctx.profiles, ctx.device.tv);
         let rows: Vec<RowSpec> = actions
             .iter()
             .map(|&a| {
@@ -1054,7 +1055,11 @@ mod tests {
     }
 
     fn rows(s: &CardMenu) -> Vec<Action> {
-        s.actions(crate::store::file_store(), false)
+        s.actions(
+            crate::store::file_store(),
+            &crate::screens::profiles::NO_PROFILES,
+            false,
+        )
     }
 
     fn label(s: &CardMenu, a: Action) -> String {
@@ -1151,17 +1156,42 @@ mod tests {
             rows(&CardMenu::for_host(&asleep)),
             vec![ConnectWith, Browse, Wake, CopyLink, Details]
         );
-        let picked = HostRow {
-            profile: Some(pf_client_core::profiles::ProfilePick {
+        let pick = |remember| {
+            Some(pf_client_core::profiles::ProfilePick {
                 id: "kid".into(),
                 display_name: "Kid".into(),
-            }),
+                remember,
+            })
+        };
+        let picked = HostRow {
+            profile: pick(true),
             ..asleep.clone()
         };
         assert_eq!(
             rows(&CardMenu::for_host(&picked)),
             vec![ConnectWith, Browse, SwitchProfile, Wake, CopyLink, Details],
-            "a saved pick is one press away from changing"
+            "a remembered pick is one press away from changing"
+        );
+        let asked = HostRow {
+            profile: pick(false),
+            ..asleep.clone()
+        };
+        assert_eq!(
+            rows(&CardMenu::for_host(&asked)),
+            vec![ConnectWith, Browse, Wake, CopyLink, Details],
+            "a pick never remembered offers nothing until the host lists its profiles"
+        );
+        let profile = |id: &str| pf_client_core::profiles::ListedProfile {
+            id: id.into(),
+            display_name: id.into(),
+            ..Default::default()
+        };
+        let book =
+            crate::screens::profiles::ProfileBook::with("aa", vec![profile("own"), profile("kid")]);
+        assert_eq!(
+            CardMenu::for_host(&asked).actions(crate::store::file_store(), &book, false),
+            vec![ConnectWith, Browse, SwitchProfile, Wake, CopyLink, Details],
+            "two listed profiles are a choice"
         );
         assert_eq!(
             rows(&CardMenu::for_host(&host())),
@@ -1194,6 +1224,7 @@ mod tests {
             profile: Some(pf_client_core::profiles::ProfilePick {
                 id: "kid".into(),
                 display_name: "Kid".into(),
+                remember: true,
             }),
             ..host()
         };
@@ -1670,8 +1701,16 @@ mod tests {
     #[test]
     fn a_tv_offers_no_copy_link() {
         let menu = CardMenu::for_host(&host());
-        let desk = menu.actions(crate::store::file_store(), false);
-        let tv = menu.actions(crate::store::file_store(), true);
+        let desk = menu.actions(
+            crate::store::file_store(),
+            &crate::screens::profiles::NO_PROFILES,
+            false,
+        );
+        let tv = menu.actions(
+            crate::store::file_store(),
+            &crate::screens::profiles::NO_PROFILES,
+            true,
+        );
         assert!(desk.contains(&Action::CopyLink));
         assert!(!tv.contains(&Action::CopyLink));
         assert_eq!(desk.len(), tv.len() + 1);

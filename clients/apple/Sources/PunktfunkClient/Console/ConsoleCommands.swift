@@ -93,7 +93,9 @@ extension ConsoleModel {
                 store.setProfile(
                     host.id,
                     (pick?["id"] as? String).map {
-                        ProfilePick(id: $0, displayName: pick?["display_name"] as? String ?? "")
+                        ProfilePick(
+                            id: $0, displayName: pick?["display_name"] as? String ?? "",
+                            remember: pick?["remember"] as? Bool ?? false)
                     })
             }
         case "SetClipboard":

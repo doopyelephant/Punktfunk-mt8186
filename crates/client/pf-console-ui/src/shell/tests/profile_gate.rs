@@ -17,11 +17,26 @@ fn listed(ids: &[(&str, &str)]) -> ProfilesAnswer {
     )
 }
 
+/// A pick the player asked to remember.
 fn pick(id: &str, name: &str) -> Option<ProfilePick> {
     Some(ProfilePick {
         id: id.into(),
         display_name: name.into(),
+        remember: true,
     })
+}
+
+/// A pick saved without that ask: by this build's picker before Remember, or another app.
+fn old_pick(id: &str, name: &str) -> Option<ProfilePick> {
+    pick(id, name).map(|p| ProfilePick {
+        remember: false,
+        ..p
+    })
+}
+
+fn sets_profile(cmds: &[ConsoleCmd]) -> bool {
+    cmds.iter()
+        .any(|c| matches!(c, ConsoleCmd::SetProfile { .. }))
 }
 
 /// A shell that checks profiles, over `hosts()` with the first card's pick set to `saved`.
@@ -71,7 +86,14 @@ fn a_connect_asks_for_the_list_before_it_dials() {
     assert!(s.asking.is_none() && s.take_action().is_none());
 }
 
-/// Two profiles and no saved pick: the picker, whose pick dials as it and is saved.
+fn draw(s: &mut Shell) {
+    let fonts = crate::theme::build_fonts().unwrap();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
+    s.render(surface.canvas(), 1280, 800, &fonts, None, None, &[]);
+}
+
+/// Two profiles and no saved pick: the picker, whose pick dials as it and is not saved.
+/// The next connect asks again, led by that pick.
 #[test]
 fn two_profiles_and_no_pick_raise_the_picker() {
     let (mut s, console, bus, row) = asking(None);
@@ -82,16 +104,67 @@ fn two_profiles_and_no_pick_raise_the_picker() {
     assert!(s.take_action().is_none());
     finish_motion(&mut s);
     // Focus moves over the drawn grid.
-    let fonts = crate::theme::build_fonts().unwrap();
-    let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
-    s.render(surface.canvas(), 1280, 800, &fonts, None, None, &[]);
+    draw(&mut s);
     bus.drain();
     s.handle_menu(MenuEvent::Move(MenuDir::Right));
     s.handle_menu(MenuEvent::Confirm);
     assert_eq!(launched_as(&mut s), Some(Some("kid".into())));
+    assert!(!sets_profile(&bus.drain()), "Remember was off");
+    assert_eq!(s.profiles.last_pick("aa11"), Some("kid"));
+
+    finish_motion(&mut s);
+    s.session_ended(None);
+    s.start_connect(ConnectIntent::to_host(&row, None));
+    console.set_profiles("aa11", listed(&[("own", "Ben"), ("kid", "Kid")]));
+    s.sync();
+    finish_motion(&mut s);
+    draw(&mut s);
+    s.handle_menu(MenuEvent::Confirm);
+    assert_eq!(launched_as(&mut s), Some(Some("kid".into())), "Kid leads");
+}
+
+/// Remember on the picker saves the pick; the next connect plays as it unasked.
+#[test]
+fn remember_on_the_picker_saves_the_pick() {
+    let (mut s, console, bus, row) = asking(None);
+    s.start_connect(ConnectIntent::to_host(&row, None));
+    console.set_profiles("aa11", listed(&[("own", "Ben"), ("kid", "Kid")]));
+    s.sync();
+    finish_motion(&mut s);
+    draw(&mut s);
+    bus.drain();
+    // Down from the circles reaches the switch.
+    s.handle_menu(MenuEvent::Move(MenuDir::Down));
+    s.handle_menu(MenuEvent::Confirm);
+    draw(&mut s);
+    s.handle_menu(MenuEvent::Move(MenuDir::Up));
+    s.handle_menu(MenuEvent::Confirm);
+    let played = launched_as(&mut s).flatten().expect("a circle plays");
+    let name = if played == "own" { "Ben" } else { "Kid" };
     assert!(bus.drain().contains(&ConsoleCmd::SetProfile {
         key: "aa11".into(),
-        profile: pick("kid", "Kid"),
+        profile: pick(&played, name),
+    }));
+}
+
+/// A pick saved without Remember is never applied unasked: the picker comes up, led by it.
+#[test]
+fn an_unremembered_pick_asks_and_leads() {
+    let (mut s, console, bus, row) = asking(old_pick("kid", "Kid"));
+    assert_eq!(ConnectIntent::to_host(&row, None).profile, None);
+    s.start_connect(ConnectIntent::to_host(&row, None));
+    console.set_profiles("aa11", listed(&[("own", "Ben"), ("kid", "Kid")]));
+    bus.drain();
+    s.sync();
+    assert!(matches!(s.stack.last(), Some(Screen::Profiles(_))));
+    assert!(!sets_profile(&bus.drain()), "asking clears nothing");
+    finish_motion(&mut s);
+    draw(&mut s);
+    s.handle_menu(MenuEvent::Confirm);
+    assert_eq!(launched_as(&mut s), Some(Some("kid".into())));
+    assert!(bus.drain().contains(&ConsoleCmd::SetProfile {
+        key: "aa11".into(),
+        profile: None,
     }));
 }
 
@@ -200,6 +273,13 @@ fn a_silent_or_failed_host_dials_with_the_cards_pick() {
     );
     s.sync();
     assert_eq!(launched_as(&mut s), Some(Some("kid".into())));
+
+    // A pick never remembered is not the card's to send.
+    let (mut s, console, _bus, row) = asking(old_pick("kid", "Kid"));
+    s.start_connect(ConnectIntent::to_host(&row, None));
+    console.set_profiles("aa11", ProfilesAnswer::Failed("down".into()));
+    s.sync();
+    assert_eq!(launched_as(&mut s), Some(None));
 }
 
 /// A host that can't answer never gets asked: the connect dials as before.
@@ -207,6 +287,7 @@ fn a_silent_or_failed_host_dials_with_the_cards_pick() {
 fn a_host_without_profile_support_dials_at_once() {
     let (mut s, _console, bus, row) = asking(pick("kid", "Kid"));
     s.device.profiles = false;
+    bus.drain();
     s.start_connect(ConnectIntent::to_host(&row, None));
     assert_eq!(launched_as(&mut s), Some(Some("kid".into())));
     assert!(!bus
@@ -380,11 +461,11 @@ fn a_picked_stopped_seat_is_woken() {
     assert!(s.seat_wait.is_some());
 }
 
-/// Switch profile's list arrives through the shell, keyed on the host.
+/// Switch profile's list arrives through the shell, keyed on the host, and the book keeps it.
 #[test]
 fn the_switch_screen_takes_its_hosts_answer() {
     let (mut s, console, _bus, row) = asking(pick("kid", "Kid"));
-    let screen = crate::screens::profiles::ProfilesScreen::switch(&row).unwrap();
+    let screen = crate::screens::profiles::ProfilesScreen::switch(&row, &s.profiles).unwrap();
     s.push_screen(Screen::Profiles(screen));
     console.set_profiles("bb22", listed(&[("x", "Other")]));
     s.sync();
@@ -392,4 +473,25 @@ fn the_switch_screen_takes_its_hosts_answer() {
     console.set_profiles("aa11", listed(&[("own", "Ben"), ("kid", "Kid")]));
     s.sync();
     assert!(matches!(s.stack.last(), Some(Screen::Profiles(p)) if !p.waiting()));
+    assert_eq!(s.profiles.listed("aa11").map(<[_]>::len), Some(2));
+}
+
+/// A card the row rests on is asked for its profiles with its games; the answer nobody
+/// waits on goes into the book, and the card offers who plays.
+#[test]
+fn a_resting_card_learns_its_profiles() {
+    let (mut s, console, bus, row) = asking(None);
+    s.sync();
+    let sent = bus.drain();
+    let asks = |cmds: &[ConsoleCmd]| {
+        cmds.iter()
+            .filter(|c| matches!(c, ConsoleCmd::FetchProfiles { fp_hex, .. } if fp_hex == "aa11"))
+            .count()
+    };
+    assert_eq!(asks(&sent), 1, "{sent:?}");
+    assert!(!s.profiles.choice(&row));
+    console.set_profiles("aa11", listed(&[("own", "Ben"), ("kid", "Kid")]));
+    s.sync();
+    assert!(s.profiles.choice(&row));
+    assert!(s.profiles.asked().is_empty());
 }

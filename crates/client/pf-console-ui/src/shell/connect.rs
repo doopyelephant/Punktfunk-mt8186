@@ -3,10 +3,10 @@
 
 use super::{Shell, ToastKind};
 use crate::anim::Spring;
-use crate::model::{ConsoleCmd, ProfilesAnswer};
+use crate::model::{ConsoleCmd, HostRow, ProfilesAnswer};
 use crate::screens::{ConnectIntent, Nav, ProfileAsk, Screen, Seated};
 use pf_client_core::console::OverlayAction;
-use pf_client_core::profiles::{seat_gate, SeatGate};
+use pf_client_core::profiles::{seat_gate, ProfilePick, SeatGate};
 use skia_safe::Rect;
 
 /// A connect waiting on its box's profile list (§10.1) before it dials.
@@ -16,7 +16,7 @@ pub(super) struct Asking {
     pub(super) since: f64,
 }
 
-/// Seconds a connect waits for the profile list before it dials with the card's saved pick.
+/// Seconds a connect waits for the profile list before it dials with the remembered pick.
 pub(super) const PROFILES_WAIT: f64 = 3.0;
 /// A list slower than this puts the connect card up; a fast one shows nothing.
 pub(super) const ASKING_CARD_AFTER: f64 = 0.25;
@@ -390,7 +390,7 @@ impl Shell {
     }
 
     /// The asking connect, once its list lands: §10.1 through `picker_decision`. No answer
-    /// in [`PROFILES_WAIT`], or a failed one, dials with the card's saved pick.
+    /// in [`PROFILES_WAIT`], or a failed one, dials with the remembered pick, if any.
     pub(super) fn tick_asking(&mut self) {
         let Some(a) = &self.asking else { return };
         let answer = self.console.take_profiles(&a.intent.fp_hex);
@@ -408,6 +408,9 @@ impl Shell {
         else {
             return;
         };
+        if let Some(answer) = &answer {
+            self.profiles.learn(&intent.fp_hex, answer);
+        }
         self.connecting = None;
         // A first ask may come back `profile-unknown` and ask again; the second may not.
         let first = !std::mem::take(&mut self.reasking);
@@ -431,7 +434,9 @@ impl Shell {
             .iter()
             .find(|h| h.host_key() == ask.key)
             .map_or_else(|| ask.saved.clone(), |h| h.profile.clone());
-        let d = pf_client_core::profiles::picker_decision(listed.as_deref(), saved.as_ref(), None);
+        let remembered = saved.clone().filter(|p| p.remember);
+        let d =
+            pf_client_core::profiles::picker_decision(listed.as_deref(), remembered.as_ref(), None);
         let seat = d
             .send
             .as_deref()
@@ -442,23 +447,71 @@ impl Shell {
                 mgmt: ask.mgmt,
             });
         if d.picker {
+            // An unremembered pick, else this run's last, leads the circles.
+            let lead = (saved.as_ref().map(|p| p.id.as_str()))
+                .or_else(|| self.profiles.last_pick(&intent.fp_hex))
+                .map(str::to_string);
             let screen = crate::screens::profiles::ProfilesScreen::before(
                 intent,
                 ProfileAsk { saved, ..ask },
                 listed.unwrap_or_default(),
                 d.gone,
+                lead,
             );
             return self.apply_nav(Nav::Push(Box::new(Screen::Profiles(screen))));
         }
-        if d.remember != saved {
+        // The old seat's profile is the host's word for this device: it stays remembered.
+        let keep = d.remember.map(|p| ProfilePick {
+            remember: true,
+            ..p
+        });
+        if keep != remembered {
             self.send_cmd(ConsoleCmd::SetProfile {
                 key: ask.key,
-                profile: d.remember,
+                profile: keep,
             });
         }
         intent.profile = d.send;
         intent.seat = seat;
         self.dial_when_seated(intent);
+    }
+
+    /// Ask `host` for its profiles on the shell's own account, so its card and its shelf can
+    /// offer who plays. One ask per host at a time; an ask already waited on covers it.
+    pub(super) fn ask_profiles(&mut self, host: &HostRow) {
+        let fp = &host.fp_hex;
+        if !self.device.profiles || !host.paired || fp.is_empty() || self.waits_on_profiles(fp) {
+            return;
+        }
+        if self.profiles.ask(fp) {
+            self.bus.send(ConsoleCmd::FetchProfiles {
+                addr: host.addr.clone(),
+                mgmt: host.mgmt_port,
+                fp_hex: fp.clone(),
+            });
+        }
+    }
+
+    /// Answers to asks nothing waits on go into the book.
+    pub(super) fn collect_profiles(&mut self) {
+        for fp in self.profiles.asked().to_vec() {
+            if self.waits_on_profiles(&fp) {
+                continue;
+            }
+            if let Some(answer) = self.console.take_profiles(&fp) {
+                self.profiles.learn(&fp, &answer);
+            }
+        }
+    }
+
+    /// A connect, a seat wait or the screen on top takes `fp`'s next answer.
+    fn waits_on_profiles(&self, fp: &str) -> bool {
+        self.asking.as_ref().is_some_and(|a| a.intent.fp_hex == fp)
+            || self
+                .seat_wait
+                .as_ref()
+                .is_some_and(|w| w.intent.fp_hex == fp)
+            || matches!(self.stack.last(), Some(Screen::Profiles(p)) if p.waiting() && p.fp_hex() == fp)
     }
 
     /// The picked profile's seat decides the dial (§9.2): dial now, wake a stopped seat, or
@@ -500,7 +553,11 @@ impl Shell {
         let Some(mut w) = self.seat_wait.take() else {
             return;
         };
-        if let Some(ProfilesAnswer::Listed(listed)) = self.console.take_profiles(&w.intent.fp_hex) {
+        let answer = self.console.take_profiles(&w.intent.fp_hex);
+        if let Some(answer) = &answer {
+            self.profiles.learn(&w.intent.fp_hex, answer);
+        }
+        if let Some(ProfilesAnswer::Listed(listed)) = answer {
             // A profile the box no longer lists dials as it stands: the host answers for it.
             let gate = listed.iter().find(|p| p.id == w.id).map(seat_gate);
             match gate {
@@ -525,6 +582,9 @@ impl Shell {
     }
 
     fn dial(&mut self, intent: ConnectIntent) {
+        if let Some(id) = &intent.profile {
+            self.profiles.note_pick(&intent.fp_hex, id);
+        }
         // A game launch comes off a shelf, which knows both the host's management
         // port and where it just drew the tile. A picker on top is leaving: its shelf is under it.
         let shelf = self

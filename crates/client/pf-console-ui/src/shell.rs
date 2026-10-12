@@ -221,7 +221,7 @@ pub struct ConsoleOptions {
     /// TV: only a panel of an unusual shape (a phone) changes what the row offers.
     pub screen: Option<DeviceScreen>,
     /// The host answers [`ConsoleCmd::FetchProfiles`], so a connect checks the box's profiles
-    /// first. False connects with the card's saved pick, unchecked.
+    /// first. False connects with the card's remembered pick, unchecked.
     pub profiles: bool,
 }
 
@@ -340,6 +340,8 @@ pub(crate) struct Shell {
     reask_now: Option<ConnectIntent>,
     /// The ask in flight is that second ask.
     reasking: bool,
+    /// What each paired host listed of its profiles this run, and this run's picks.
+    profiles: crate::screens::profiles::ProfileBook,
     /// Host title of the last connect. [`Self::session_reconnecting`] has no
     /// `Launch` of its own, so nothing else can name the host.
     last_connect_title: Option<String>,
@@ -466,6 +468,7 @@ impl Shell {
             reask: None,
             reask_now: None,
             reasking: false,
+            profiles: Default::default(),
             last_connect_title: None,
             wake: None,
             wake_optimistic: false,
@@ -627,6 +630,7 @@ impl Shell {
             pads: &self.pads,
             device: &self.device,
             t,
+            profiles: &self.profiles,
         };
         (ctx, self.stack.last_mut().expect("non-empty stack"))
     }
@@ -680,6 +684,7 @@ impl Shell {
         self.sync_wake();
         self.tick_asking();
         self.tick_seat_wait();
+        self.collect_profiles();
         self.home_shelf();
         self.tick_launch();
         self.tick_downloads();
@@ -756,6 +761,7 @@ impl Shell {
         if let Some(Screen::Profiles(p)) = self.stack.last_mut() {
             if p.waiting() {
                 if let Some(answer) = self.console.take_profiles(p.fp_hex()) {
+                    self.profiles.learn(p.fp_hex(), &answer);
                     p.set_answer(answer);
                 }
             }
@@ -873,6 +879,7 @@ impl Shell {
             mgmt: host.mgmt_port,
             fp_hex: host.fp_hex.clone(),
         });
+        self.ask_profiles(&host);
     }
 
     /// This pairing is what turned its host into the default one. False for a second or
@@ -1031,6 +1038,7 @@ impl Shell {
         let keys = (self.games_key.take(), self.library_fp.take());
         let bus = std::mem::take(&mut self.bus);
         let library = std::mem::take(&mut self.library);
+        let profiles = std::mem::take(&mut self.profiles);
         // A host embedding this shell ticks its model after the warm-up, so no host is known
         // yet: without a stand-in, Games and its shelf would never draw here.
         let hosts = (
@@ -1057,6 +1065,7 @@ impl Shell {
         }
         (self.tab, self.stack, self.parked, self.motion) = (tab, stack, parked, motion);
         (self.strip_focus, self.bus, self.library) = (strip_focus, bus, library);
+        self.profiles = profiles;
         (self.games_key, self.library_fp) = keys;
         // The saved generation, so a list published meanwhile is still taken on the next sync.
         (self.hosts, self.hosts_gen) = hosts;
@@ -1116,8 +1125,25 @@ impl Shell {
             mgmt: host.mgmt_port,
             fp_hex: host.fp_hex.clone(),
         });
+        self.ask_profiles(host);
         self.games_key = Some(host.key.clone());
         Screen::Library(crate::screens::library::LibraryScreen::new(host))
+    }
+
+    /// The Games tab shows `host`'s games, focus on its host pill. Another tab's Games
+    /// root is left to [`Self::tab_root`], which follows the Hosts row.
+    fn show_shelf(&mut self, host: &HostRow) {
+        if self.tab != Tab::Games {
+            return;
+        }
+        if matches!(self.stack.first(), Some(Screen::Library(l)) if l.shelf_of(host)) {
+            return;
+        }
+        let mut root = self.shelf_root(host);
+        if let Screen::Library(l) = &mut root {
+            l.focus_pill();
+        }
+        self.stack[0] = root;
     }
 
     /// OK from a remote, both edges. A press acts on release; held [`HOLD_S`] it opens the
@@ -1519,6 +1545,7 @@ impl Shell {
             }
             if let ConsoleCmd::FetchProfiles { fp_hex, .. } = &cmd {
                 self.console.take_profiles(fp_hex);
+                self.profiles.ask(fp_hex);
             }
             // Gate wake in this call, like `connecting`. First WakeStatus is
             // ~100 ms–1 s away; without a placeholder the cursor keeps moving
@@ -1577,6 +1604,9 @@ impl Shell {
             if !below {
                 self.switch_tab(Tab::Games);
             }
+        }
+        if let Some(host) = fx.shelf {
+            self.show_shelf(&host);
         }
     }
 

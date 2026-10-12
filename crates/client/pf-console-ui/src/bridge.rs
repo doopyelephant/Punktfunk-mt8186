@@ -43,7 +43,7 @@ pub struct CreateOptions {
     #[serde(default)]
     pub pyrowave_ok: bool,
     /// The host answers `FetchProfiles`. Absent means it doesn't, and a connect sends the
-    /// card's saved pick unchecked.
+    /// card's remembered pick unchecked.
     #[serde(default)]
     pub profiles: bool,
     /// The settings snapshot the shell starts from.

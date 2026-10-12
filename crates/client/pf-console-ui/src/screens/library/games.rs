@@ -1,10 +1,11 @@
 //! The Games tab: the Apple library's rows over the shelf's field, and Customize.
 //!
-//! Focus walks lines top to bottom: the sort/view pills, the host chips and a Customize
-//! chip, the enabled sections in `library_sections` order, and the Games field (grid or
-//! shelf) where Games sits among them. An empty section hides. Desktops and Launchers
-//! never sit in the field, row on or off. A list that failed, is empty or still loading
-//! keeps the chips and the Desktops row, with the state's action where the field was.
+//! Focus walks lines top to bottom: the sort/view pills, the host pill and Customize, the
+//! enabled sections in `library_sections` order, and the Games field (grid or shelf) where
+//! Games sits among them. The host pill names the shelf's host and who plays there; OK
+//! opens Host and profile. An empty section hides. Desktops and Launchers never sit in the
+//! field, row on or off. A list that failed, is empty or still loading keeps the chips and
+//! the Desktops row, with the state's action where the field was.
 //! A collection's shelf has only the pills and its field.
 
 use super::super::collections::{paint_tile, TILE_CORNER, TILE_H, TILE_W};
@@ -14,14 +15,17 @@ use super::{store_sort, store_view, LibraryScreen};
 use crate::el::{Axis, El, Id};
 use crate::glyphs::{Hint, HintKey};
 use crate::grid::GRID_GAP;
+use crate::icons::{self, Icon};
 use crate::library::{LibraryGame, LibraryPhase, LibraryView, Section};
-use crate::model::{ConsoleCmd, HostRow};
+use crate::model::HostRow;
 use crate::pointer::Pointer;
 use crate::screens::card_menu::CardMenu;
+use crate::screens::profiles::{paired_hosts, ProfileBook, ProfilesScreen};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen, ScreenView};
-use crate::theme::{fg, Fonts, W};
-use crate::widgets::{button, button_w, text_tab, ListMsg, MenuList, RowSpec};
+use crate::theme::{fg, Fonts, PanelStroke, W};
+use crate::widgets::{button, button_w, ListMsg, MenuList, RowSpec};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
+use pf_client_core::profiles::ProfilePick;
 use skia_safe::{Canvas, Rect};
 use std::cell::RefCell;
 
@@ -31,9 +35,12 @@ const RECENT_MAX: usize = 12;
 const HEADING_H: f64 = 30.0;
 const BAND_AIR: f64 = 22.0;
 const CHIP_H: f64 = 38.0;
-/// A host chip's label size and side padding, as a section tab's.
-const TAB_TEXT: f64 = 16.0;
-const TAB_PAD: f64 = 10.0;
+/// The host pill and Customize.
+const CHIPS: usize = 2;
+/// The host pill's label, its face's radius and its side padding.
+const PILL_TEXT: f64 = 15.0;
+const PILL_FACE: f64 = 11.0;
+const PILL_PAD: f64 = 14.0;
 const TOP_AIR: f64 = 4.0;
 
 /// Where the D-pad is. The field keeps its own cursor under [`Zone::Grid`].
@@ -43,7 +50,7 @@ pub(super) enum Zone {
     Grid,
     /// Pill `i` of the sort/view row.
     Bar(usize),
-    /// A host chip; the one past the last is Customize.
+    /// The host pill (0) or Customize (1).
     Chip(usize),
     Band {
         band: usize,
@@ -143,14 +150,23 @@ pub(super) fn seat(lines: &[Line]) -> Zone {
     }
 }
 
-/// The hosts a chip opens: each paired host's own shelf.
-fn chip_hosts(hosts: &[HostRow]) -> impl Iterator<Item = &HostRow> {
-    hosts
-        .iter()
-        .filter(|h| h.paired && h.saved && h.pin.is_none())
-}
+/// The host pill's face: the remembered profile, `Some(None)` for Ask every time, `None`
+/// where who plays is no choice.
+type PillFace = Option<Option<ProfilePick>>;
 
 impl LibraryScreen {
+    /// The shelf's host as the carousel has it now: a pick made since the shelf opened.
+    fn live_host<'a>(&'a self, hosts: &'a [HostRow]) -> &'a HostRow {
+        let key = self.host.host_key();
+        hosts.iter().find(|h| h.key == key).unwrap_or(&self.host)
+    }
+
+    /// Focus the host pill, as a shelf swapped in from Host and profile does.
+    pub(crate) fn focus_pill(&mut self) {
+        self.zone = Zone::Chip(0);
+        self.seated = true;
+    }
+
     /// The shelf lays out as the Games tab: not a collection or a search, not under the
     /// Hosts row.
     pub(super) fn sectioned(&self) -> bool {
@@ -197,7 +213,7 @@ impl LibraryScreen {
             let items: Vec<Item> = match section {
                 Section::Desktops => {
                     // This shelf's host first: its tile led the grid.
-                    let mut hosts: Vec<&HostRow> = chip_hosts(ctx.hosts).collect();
+                    let mut hosts: Vec<&HostRow> = paired_hosts(ctx.hosts).collect();
                     hosts.sort_by_key(|h| !self.own(h));
                     if !hosts.iter().any(|h| self.own(h)) {
                         hosts.insert(0, &self.host);
@@ -280,7 +296,7 @@ impl LibraryScreen {
         let (bands, before) = self.bands(ctx);
         let lines = self.lines(&bands, before);
         let focus = self.focus_lines(lines.clone());
-        let chips = chip_hosts(ctx.hosts).count() + 1;
+        let chips = CHIPS;
         self.zone = if self.seated {
             self.clamp_zone(&focus, &bands, chips)
         } else {
@@ -335,7 +351,7 @@ impl LibraryScreen {
         }
         let (bands, lines) = self.place_zone(ctx);
         let lines = self.focus_lines(lines);
-        let chips = chip_hosts(ctx.hosts).count() + 1;
+        let chips = CHIPS;
         let Some(at) = lines.iter().position(|&l| l == line_of(self.zone)) else {
             // Nothing to stand on: Up still reaches the tabs, Back still leaves.
             return Some(match ev {
@@ -417,10 +433,7 @@ impl LibraryScreen {
                         }
                         Item::Collection(_) => return Some(Some(MenuPulse::Boundary)),
                     },
-                    Zone::Chip(_) => match self.chip_host(ctx) {
-                        Some(h) => fx.options(CardMenu::for_host(h)),
-                        None => return Some(Some(MenuPulse::Boundary)),
-                    },
+                    Zone::Chip(0) => fx.options(CardMenu::for_host(self.live_host(ctx.hosts))),
                     _ => return Some(Some(MenuPulse::Boundary)),
                 }
                 Some(Some(MenuPulse::Confirm))
@@ -475,32 +488,28 @@ impl LibraryScreen {
         [at(Pill::Sort(self.sort)), at(Pill::View(self.view_mode))]
     }
 
-    fn chip_host<'h>(&self, ctx: &Ctx<'h>) -> Option<&'h HostRow> {
-        let Zone::Chip(i) = self.zone else {
-            return None;
-        };
-        chip_hosts(ctx.hosts).nth(i)
-    }
-
-    /// A host chip swaps this shelf for that host's; the last chip opens Customize.
+    /// The host pill opens Host and profile, where the shell swaps this shelf for the host
+    /// picked there ([`Outbox::shelf`]); the other chip opens Customize.
     fn chip_confirm(&mut self, ctx: &Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
-        let Some(h) = self.chip_host(ctx) else {
+        if self.zone != Zone::Chip(0) {
             fx.push(Screen::Customize(CustomizeScreen::new()));
             return Some(MenuPulse::Confirm);
-        };
-        if self.own(h) {
-            return Some(MenuPulse::Boundary);
         }
-        let mut shelf = LibraryScreen::new(h);
-        shelf.zone = self.zone;
-        shelf.seated = true;
-        fx.cmds.push(ConsoleCmd::FetchLibrary {
-            addr: h.addr.clone(),
-            mgmt: h.mgmt_port,
-            fp_hex: h.fp_hex.clone(),
-        });
-        fx.replace(Screen::Library(shelf));
+        let host = self.live_host(ctx.hosts);
+        let screen = ProfilesScreen::games(host, ctx.hosts, ctx.profiles).opened(host, fx);
+        fx.push(screen);
         Some(MenuPulse::Confirm)
+    }
+
+    /// The host pill's words and face.
+    fn pill(&self, hosts: &[HostRow], book: &ProfileBook) -> (String, PillFace) {
+        let host = self.live_host(hosts);
+        let face = book.choice(host).then(|| host.remembered().cloned());
+        let label = match face.as_ref().and_then(Option::as_ref) {
+            Some(p) => format!("{} \u{b7} {}", host.name, p.display_name),
+            None => host.name.clone(),
+        };
+        (label, face)
     }
 
     /// Focus `line`, on what was drawn nearest the old focus's centre; by index when
@@ -589,7 +598,8 @@ impl LibraryScreen {
     pub(super) fn zone_title(&self, ctx: &Ctx) -> Option<String> {
         match self.zone {
             Zone::Grid | Zone::Bar(_) | Zone::State => None,
-            Zone::Chip(_) => Some(self.chip_host(ctx).map_or("Customize", |h| &h.name).into()),
+            Zone::Chip(0) => Some(self.pill(ctx.hosts, ctx.profiles).0),
+            Zone::Chip(_) => Some("Customize".into()),
             Zone::Band { band, item } => {
                 let (bands, _) = self.bands(ctx);
                 Some(match bands.get(band)?.items.get(item)? {
@@ -622,8 +632,8 @@ impl LibraryScreen {
             Zone::Grid => return None,
             Zone::Bar(_) => "Select",
             Zone::State => self.state_action()?,
-            Zone::Chip(_) if self.chip_host(ctx).is_none() => "Customize",
-            Zone::Chip(_) => "Open",
+            Zone::Chip(0) => "Change",
+            Zone::Chip(_) => "Customize",
             Zone::Band { band, item } => match bands.get(band)?.items.get(item)? {
                 Item::Desktop(h) if h.running.is_empty() => "Stream",
                 Item::Desktop(_) => "Resume",
@@ -638,7 +648,7 @@ impl LibraryScreen {
             Zone::Band { band, item } => {
                 !matches!(bands[band].items.get(item), Some(Item::Collection(_)))
             }
-            _ => self.chip_host(ctx).is_some(),
+            z => z == Zone::Chip(0),
         };
         if options {
             hints.push(Hint::new(HintKey::Secondary, "Options"));
@@ -656,47 +666,46 @@ impl LibraryScreen {
         (HEADING_H + BAND_AIR) * k + row_h(band, ch, k)
     }
 
-    /// The chips line, as a child of the screen's scroll: one row that scrolls sideways.
-    /// `draw_field` keeps the focused chip in view; a finger swipes it.
+    /// The chips line, as a child of the screen's scroll: the host pill, then Customize, in
+    /// a row that scrolls sideways. `draw_field` keeps the focused chip in view.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn chips_el<'a>(
         &'a self,
         hosts: &'a [HostRow],
+        book: &ProfileBook,
         fonts: &'a Fonts,
         width: f64,
         k: f64,
         hits: &'a RefCell<Vec<(Zone, Rect)>>,
     ) -> El<'a> {
-        let names = chip_hosts(hosts).map(|h| (h.name.as_str(), Some(self.own(h))));
-        let (mut x, top, h) = (0.0, TOP_AIR * k, CHIP_H * k);
+        let (label, face) = self.pill(hosts, book);
+        let face_w = face.as_ref().map_or(0.0, |_| (2.0 * PILL_FACE + 8.0) * k);
+        let text_w = f64::from(fonts.measure(&label, W::SemiBold, PILL_TEXT * k));
+        let pill_w = 2.0 * PILL_PAD * k + face_w + text_w + (8.0 + 14.0) * k;
+        let (top, h) = (TOP_AIR * k, CHIP_H * k);
         // Room round the line for the plate's outset: a scroll clips what it draws, and a
         // plate cut at a chip's edge reads as a second chip.
         let air = (super::PLATE_AIR * k) as f32;
-        let mut row = El::column();
-        for (i, (label, mine)) in names.chain([("Customize", None)]).enumerate() {
-            let w = match mine {
-                Some(_) => {
-                    f64::from(fonts.measure(label, W::Bold, TAB_TEXT * k)) + 2.0 * TAB_PAD * k
-                }
-                None => button_w(fonts, label, k),
-            };
-            let chip = Rect::from_xywh(air + x as f32, air + top as f32, w as f32, h as f32);
-            row = row.child(
-                El::paint(move |canvas, r| {
-                    hits.borrow_mut().push((Zone::Chip(i), r));
-                    match mine {
-                        Some(mine) => {
-                            let ink = fg(if mine { 1.0 } else { 0.6 });
-                            text_tab(canvas, fonts, label, r, TAB_TEXT * k, ink);
-                        }
-                        None => button(canvas, fonts, label, r, k),
-                    }
-                })
-                .id(chip_id(i))
-                .focusable((h / 2.0) as f32)
-                .place(chip),
-            );
-            x += w + 10.0 * k;
-        }
+        let place =
+            |x: f64, w: f64| Rect::from_xywh(air + x as f32, air + top as f32, w as f32, h as f32);
+        let pill = El::paint(move |canvas, r| {
+            hits.borrow_mut().push((Zone::Chip(0), r));
+            draw_host_pill(canvas, fonts, &label, face.as_ref(), r, k);
+        })
+        .id(chip_id(0))
+        .focusable((h / 2.0) as f32)
+        .place(place(0.0, pill_w));
+        let custom_w = button_w(fonts, "Customize", k);
+        let mut x = pill_w + 10.0 * k;
+        let customize = El::paint(move |canvas, r| {
+            hits.borrow_mut().push((Zone::Chip(1), r));
+            button(canvas, fonts, "Customize", r, k);
+        })
+        .id(chip_id(1))
+        .focusable((h / 2.0) as f32)
+        .place(place(x, custom_w));
+        x += custom_w + 10.0 * k;
+        let row = El::column().child(pill).child(customize);
         let line_h = Self::chips_h(k) as f32;
         let span = (x - 10.0 * k).max(width) as f32 + 2.0 * air;
         El::column().size(width as f32, line_h).child(
@@ -816,6 +825,49 @@ impl LibraryScreen {
         };
         card.paint(canvas, fonts, slot, ch, k, 1.0);
     }
+}
+
+/// The host pill: who plays (where that is a choice), the label, then a chevron that says
+/// it opens a choice.
+fn draw_host_pill(
+    canvas: &Canvas,
+    fonts: &Fonts,
+    label: &str,
+    face: Option<&Option<ProfilePick>>,
+    r: Rect,
+    k: f64,
+) {
+    let corner = (f64::from(r.height()) / 2.0 / k) as f32;
+    crate::theme::panel(canvas, r, corner, None, PanelStroke::Plain(0.08), k as f32);
+    let cy = f64::from(r.center_y());
+    let mut x = f64::from(r.left) + PILL_PAD * k;
+    if let Some(pick) = face {
+        let rad = PILL_FACE * k;
+        let cx = (x + rad) as f32;
+        super::super::profiles::draw_pick(canvas, fonts, pick.as_ref(), cx, cy as f32, rad);
+        x += (2.0 * PILL_FACE + 8.0) * k;
+    }
+    let size = PILL_TEXT * k;
+    fonts.draw(
+        canvas,
+        label,
+        x,
+        cy + size * 0.36,
+        W::SemiBold,
+        size,
+        fg(0.95),
+    );
+    let chevron = Icon(pf_client_core::lucide::CHEVRON_DOWN);
+    let cx = (f64::from(r.right) - (PILL_PAD + 7.0) * k) as f32;
+    icons::draw_icon(
+        canvas,
+        chevron,
+        cx,
+        cy as f32,
+        (14.0 * k) as f32,
+        k as f32,
+        fg(0.7),
+    );
 }
 
 /// A band's row height at grid poster height `ch`. Recently played holds a caption line.

@@ -1022,6 +1022,7 @@ mod tests {
                 profile: Some(crate::profiles::ProfilePick {
                     id: "9a3f1c2b7e40".into(),
                     display_name: "Kid".into(),
+                    remember: true,
                 }),
             }],
         };
@@ -1156,6 +1157,7 @@ mod tests {
                 profile: Some(crate::profiles::ProfilePick {
                     id: "9a3f1c2b7e40".into(),
                     display_name: "Kid".into(),
+                    remember: true,
                 }),
             }],
         };

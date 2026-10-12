@@ -92,6 +92,8 @@ pub struct Ctx<'a> {
     pub device: &'a Device,
     /// Shell clock in seconds (spinners, pulses).
     pub t: f64,
+    /// What each paired host listed of its profiles this run.
+    pub(crate) profiles: &'a profiles::ProfileBook,
 }
 
 #[cfg(test)]
@@ -128,6 +130,7 @@ impl<'a> Ctx<'a> {
             pads: &[],
             device: &DESKTOP,
             t: 0.0,
+            profiles: &profiles::NO_PROFILES,
         }
     }
 }
@@ -269,7 +272,8 @@ pub(crate) struct ConnectIntent {
     pub request_access: bool,
     /// One-off preset for this launch; `None` keeps the host's default binding.
     pub preset: Option<String>,
-    /// The profile id to play as: the host card's pick. `None` names none.
+    /// The profile id to play as: the host's remembered pick, or the picker's. `None` names
+    /// none.
     pub profile: Option<String>,
     /// Check the box's profiles before the dial (§10.1). `None` dials as it stands.
     pub ask: Option<ProfileAsk>,
@@ -292,6 +296,7 @@ pub(crate) struct ProfileAsk {
     pub key: String,
     pub name: String,
     pub mgmt: u16,
+    /// Remembered or not: only a remembered one skips the picker; any one leads it.
     pub saved: Option<pf_client_core::profiles::ProfilePick>,
 }
 
@@ -328,7 +333,7 @@ impl ConnectIntent {
             },
             request_access: false,
             preset: h.pin.as_ref().map(|p| p.id.clone()),
-            profile: h.profile.as_ref().map(|p| p.id.clone()),
+            profile: h.remembered().map(|p| p.id.clone()),
             ask: ProfileAsk::of(h),
             seat: None,
         }
@@ -362,6 +367,8 @@ pub(crate) struct Outbox {
     pub tab: Option<crate::shell::Tab>,
     /// Browse games: focus the games under the Hosts row.
     pub browse: bool,
+    /// Show this host's games on the Games tab.
+    pub shelf: Option<HostRow>,
     /// Leave the console: the exit question's yes.
     pub quit: bool,
 }
