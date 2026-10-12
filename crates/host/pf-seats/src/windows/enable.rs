@@ -428,14 +428,14 @@ fn parse_probe(text: &str) -> Option<(String, [bool; 2])> {
 fn role_check(state: &str) -> Diagnostic {
     const CODE: &str = "rds_role";
     match state {
-        "Installed" => Diagnostic::info(CODE, "The Remote Desktop Session Host role is installed."),
+        "Installed" => Diagnostic::info(CODE, "Remote Desktop Session Host is installed."),
         "Unknown" => Diagnostic::warning(
             CODE,
-            "Couldn't confirm that the Remote Desktop Session Host role is installed. If it isn't, add it in Server Manager.",
+            "Couldn't confirm that Remote Desktop Session Host is installed. If it isn't, add it under Remote Desktop Services in Server Manager.",
         ),
         _ => Diagnostic::error(
             CODE,
-            "The Remote Desktop Session Host role isn't installed. Add it in Server Manager, then try again.",
+            "Remote Desktop Session Host isn't installed. Add it under Remote Desktop Services in Server Manager, restart, then try again.",
         ),
     }
 }
