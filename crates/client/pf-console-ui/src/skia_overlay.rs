@@ -8,7 +8,7 @@
 
 use crate::console::{Console, ConsoleEntry, ConsoleHandles, FrameCost};
 use crate::shell::{ConsoleOptions, Shell};
-use crate::theme::{fill, match_first_family, Fonts};
+use crate::theme::{fill, Fonts, W};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk as avk;
 use ash::vk::Handle as _;
@@ -101,7 +101,7 @@ pub struct SkiaOverlay {
     /// Slot of the last returned frame; the next render takes the other.
     current: usize,
     drawn: Drawn,
-    /// Stats OSD face (system monospace; the console uses Geist).
+    /// Stats OSD face: Geist, as the console.
     font: Option<Font>,
     fonts: Option<Fonts>,
     /// `--browse` shell. `None` for a plain `--connect` session.
@@ -255,16 +255,11 @@ impl Overlay for SkiaOverlay {
             shell.device.av1_ok = shared.av1_decode;
         }
 
-        let typeface = match_first_family(
-            &FontMgr::new(),
-            &["monospace", "Consolas", "Cascadia Mono", "Courier New"],
-            skia_safe::FontStyle::normal(),
-        )
-        .context("no monospace typeface (fontconfig alias or system family)")?;
-        self.font = Some(Font::new(typeface, base::FONT_PX));
         if self.fonts.is_none() {
             self.fonts = Some(crate::theme::build_fonts()?);
         }
+        let fonts = self.fonts.as_ref().expect("built above");
+        self.font = Some(fonts.font(W::Medium, f64::from(base::FONT_PX)));
 
         self.gpu = Some(Gpu {
             device: shared.device.clone(),
@@ -878,8 +873,8 @@ fn role_color(role: Role) -> Color4f {
 
 /// A standing pill in a top corner, `row` pills down: words, led by an error-colour dot when
 /// `dot`. `at` is the window width, the row and whether it sits top-left. Drawn from state,
-/// not from the stats text, so it survives stats Off. Words: the runtime monospace may not
-/// ship a mute glyph. Every pill is one line tall, so rows stack on one pitch.
+/// not from the stats text, so it survives stats Off. Words, not a mute glyph Geist lacks.
+/// Every pill is one line tall, so rows stack on one pitch.
 fn corner_pill(
     canvas: &Canvas,
     base_font: &Font,

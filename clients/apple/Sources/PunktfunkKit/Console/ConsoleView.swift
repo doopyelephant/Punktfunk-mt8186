@@ -39,8 +39,8 @@ public final class ConsoleMetalView: ConsolePlatformView {
     private var scrollFrom: CGPoint?
     /// Where the remote's swipe last stepped from.
     private var swipeFrom: CGPoint?
-    /// A held remote direction and the timer that repeats it.
-    private var held: (press: ObjectIdentifier, timer: Timer)?
+    /// A held remote direction or keyboard key, and the timer that repeats it.
+    private var held: (press: UIPress, event: ConsoleBridge.Menu?, timer: Timer)?
     /// Presses taken on the way down. Their release stays ours, even when the Back one carried
     /// reached the root in between.
     private var claimed = Set<ObjectIdentifier>()
@@ -149,8 +149,11 @@ public final class ConsoleMetalView: ConsolePlatformView {
         #endif
     }
 
-    /// Design units per pixel, as Android's shell computes them: a TV takes the shell's own
-    /// couch formula (`0`), everything else the larger of the couch fit and the device scale.
+    /// Design units per pixel. A TV takes the shell's own couch formula (`0`). A phone or
+    /// tablet in the hand takes the device scale alone, rather than stretching the Deck's
+    /// 800-unit field over an iPad's height: a unit is 0.75 pt on a phone and a point on a
+    /// tablet, which sits further from the eye. A Mac or visionOS window takes the larger of
+    /// the couch fit and the device scale, as Android does.
     private var designScale: Double {
         #if os(tvOS)
         return 0
@@ -160,9 +163,14 @@ public final class ConsoleMetalView: ConsolePlatformView {
         #else
         let scale = window?.backingScaleFactor ?? 2
         #endif
+        #if os(iOS)
+        let perPoint = traitCollection.userInterfaceIdiom == .pad ? 1.0 : 0.75
+        return min(max(scale * perPoint, 0.75), 3)
+        #else
         let pixels = min(bounds.width, bounds.height) * scale
         guard pixels > 0 else { return 0 }
         return min(max(max(pixels / 800, scale * 0.75), 0.75), 3)
+        #endif
         #endif
     }
 
@@ -344,10 +352,12 @@ public final class ConsoleMetalView: ConsolePlatformView {
             bridge.key(key, shift: shift, repeated: repeated)
             // Space, Y and X are characters too: an open field types them and drops the key.
             if let typed { bridge.text(typed) }
+            if !repeated { hold(press) }
             return true
         }
         if let typed {
             bridge.text(typed)
+            if !repeated { hold(press) }
             return true
         }
         let event: ConsoleBridge.Menu
@@ -367,21 +377,32 @@ public final class ConsoleMetalView: ConsolePlatformView {
         return true
     }
 
-    /// Repeat a held direction at the pad poller's pace until its press ends.
-    private func hold(_ press: UIPress, _ event: ConsoleBridge.Menu) {
+    /// Repeat a held remote direction (`event`) or keyboard key at the pad poller's pace until
+    /// its press ends. UIKit sends no key repeats: a key goes back through `claim` marked
+    /// repeated, and the shell drops the ones that must not repeat.
+    private func hold(_ press: UIPress, _ event: ConsoleBridge.Menu? = nil) {
         held?.timer.invalidate()
         let timer = Timer(
             fire: Date() + GamepadMenuInput.initialRepeatDelay,
             interval: GamepadMenuInput.repeatInterval, repeats: true
         ) { [weak self] _ in
-            MainActor.assumeIsolated { _ = self?.bridge.menu(event, from: .keys) }
+            MainActor.assumeIsolated { self?.repeatHeld() }
         }
         RunLoop.main.add(timer, forMode: .common)
-        held = (ObjectIdentifier(press), timer)
+        held = (press, event, timer)
+    }
+
+    private func repeatHeld() {
+        guard let held else { return }
+        if let event = held.event {
+            _ = bridge.menu(event, from: .keys)
+        } else {
+            _ = claim(held.press, repeated: true)
+        }
     }
 
     private func release(_ presses: Set<UIPress>) {
-        guard let held, presses.contains(where: { ObjectIdentifier($0) == held.press }) else { return }
+        guard let held, presses.contains(where: { $0 === held.press }) else { return }
         held.timer.invalidate()
         self.held = nil
     }

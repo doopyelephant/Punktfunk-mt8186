@@ -42,8 +42,8 @@ const ROW_AIR: f64 = 16.0;
 /// The air above the verbs, and the gap between two.
 const VERB_AIR: f64 = 16.0;
 const VERB_GAP: f64 = 12.0;
-/// Air between the verbs and the games.
-const GAMES_AIR: f64 = 12.0;
+/// Air between the verbs and the games: a section break, wider than the air in the row.
+const GAMES_AIR: f64 = 24.0;
 
 /// Air over the row for a group's caption, when the hosts are grouped.
 const GROUP_AIR: f64 = 24.0;
@@ -184,6 +184,9 @@ pub(crate) struct HomeScreen {
     verb: Option<usize>,
     /// How far the row and verbs have slid up for the games, px.
     page: Spring,
+    /// A scroll handed focus back to the row: a pointer resting on the games leaves it
+    /// there until it moves off them.
+    scrolled_up: bool,
 }
 
 impl HomeScreen {
@@ -202,6 +205,7 @@ impl HomeScreen {
             shelf_rect: Rect::new_empty(),
             verb: None,
             page: Spring::rest(0.0),
+            scrolled_up: false,
         }
     }
 
@@ -371,9 +375,18 @@ impl ScreenView for HomeScreen {
         }
     }
 
-    /// A finger drag on the games scrolls them.
+    /// A finger drag on the games scrolls them. Lifted with them pulled down past their
+    /// top, it hands focus back to the row.
     fn pan(&mut self, p: Pointer) -> bool {
-        self.below && self.shelf.as_mut().is_some_and(|s| s.pan(p))
+        let Some(shelf) = self.shelf.as_mut().filter(|_| self.below) else {
+            return false;
+        };
+        let taken = shelf.pan(p);
+        if taken && matches!(p.kind, PointerKind::Fling { .. }) && shelf.pulled_past_top() {
+            self.go_up(false);
+            self.scrolled_up = true;
+        }
+        taken
     }
 
     fn menu(&mut self, ev: MenuEvent, ctx: &mut Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
@@ -488,7 +501,22 @@ impl ScreenView for HomeScreen {
             let Some(shelf) = self.shelf.as_mut() else {
                 return false;
             };
+            // A step up from the games' top row is the row's, as Up is on the pad.
+            if p.kind == (PointerKind::Scroll { up: true }) && shelf.at_top() {
+                if self.below {
+                    self.go_up(false);
+                    self.scrolled_up = true;
+                }
+                return true;
+            }
             if !self.below && shelf.has_titles() {
+                // Once a scroll gave the row focus back, only a press or a scroll takes it.
+                if self.scrolled_up
+                    && !matches!(p.kind, PointerKind::Press | PointerKind::Scroll { .. })
+                {
+                    return false;
+                }
+                self.scrolled_up = false;
                 shelf.set_quiet(false);
                 self.below = true;
                 // A quiet shelf shows no focus, so a tap that wakes it only takes focus, as on
@@ -506,6 +534,9 @@ impl ScreenView for HomeScreen {
         }
         if self.below && matches!(p.kind, PointerKind::Move | PointerKind::Press) {
             self.go_up(false);
+        }
+        if p.kind == PointerKind::Move {
+            self.scrolled_up = false;
         }
         let hit = self.tree.hit(p.x as f32, p.y as f32);
         let verb = (0..verbs(&self.slot(ctx.hosts)).len()).find(|&i| hit == Some(verb_id(i)));
@@ -752,18 +783,8 @@ impl ScreenView for HomeScreen {
                     if let Some(text) = &caption {
                         let (x, y) = (f64::from(tile.left), f64::from(tile.top) - 10.0 * k);
                         let size = GROUP_CAPTION * k;
-                        let tracking = 1.2 * k;
                         let upper = text.to_uppercase();
-                        fonts.draw_tracked(
-                            canvas,
-                            &upper,
-                            x,
-                            y,
-                            W::SemiBold,
-                            size,
-                            tracking,
-                            fg(0.55),
-                        );
+                        fonts.draw(canvas, &upper, x, y, W::SemiBold, size, fg(0.55));
                     }
                     look.paint(canvas, fonts, &slot)
                 })
@@ -1064,7 +1085,7 @@ fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: Ac
     let badge = Rect::from_xywh(l as f32, (cy - side / 2.0) as f32, side as f32, side as f32);
     let rr = RRect::new_rect_xy(badge, (14.0 * k) as f32, (14.0 * k) as f32);
     canvas.draw_rrect(rr, &fill(fg(0.14)));
-    canvas.draw_rrect(rr, &stroke(fg(0.35), 1.0));
+    canvas.draw_rrect(rr, &stroke(fg(0.35), k.max(1.0) as f32));
     let (bcx, bcy) = (l + side / 2.0, cy);
     let ink = fg(0.9);
     let mut p = stroke(ink, (3.0 * k) as f32);
@@ -1161,7 +1182,7 @@ pub(crate) fn draw_badge(
         accent(1.0)
     } else {
         canvas.draw_rrect(rr, &fill(fg(0.14)));
-        canvas.draw_rrect(rr, &stroke(fg(0.35), 1.0));
+        canvas.draw_rrect(rr, &stroke(fg(0.35), k.max(1.0) as f32));
         fg(0.9)
     };
     // ~54% of the badge so the mark sits on it, not cropped to it. `os_mark`

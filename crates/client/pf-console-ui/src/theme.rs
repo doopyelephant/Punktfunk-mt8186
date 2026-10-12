@@ -384,8 +384,9 @@ pub enum PanelStroke {
 }
 
 /// A panel: a wash where the caller asks for one, and a hairline round it. The console's
-/// material is the field showing through a line; nothing fills a card. `corner` and the dash
-/// pattern are design units; the caller's `k` scales them.
+/// material is the field showing through a line; nothing fills a card. `corner`, the dash
+/// pattern and the line are design units; the caller's `k` scales them. The line keeps a
+/// one-pixel floor.
 pub fn panel(
     canvas: &Canvas,
     rect: Rect,
@@ -399,7 +400,7 @@ pub fn panel(
         canvas.draw_rrect(rr, &fill(tint));
     }
     // Opaque: Plain/Brand overwrite colour; the Edge is the one line every card shares.
-    let mut sp = shaded_stroke(1.0);
+    let mut sp = shaded_stroke(k.max(1.0));
     match stroke {
         PanelStroke::Plain(alpha) => {
             sp.set_color4f(fg(alpha), None);
@@ -466,10 +467,10 @@ const RECEDE_SATURATION: f64 = 0.34;
 const RECEDE_BRIGHTNESS: f64 = 0.20;
 
 /// The accent hairline round a focused card, with no glass: a poster under it keeps its
-/// brightness. `corner` is design units.
+/// brightness. `corner` and the line are design units, the line one pixel at least.
 pub fn focus_ring(canvas: &Canvas, rect: Rect, corner: f32, k: f32) {
     let rr = RRect::new_rect_xy(rect, corner * k, corner * k);
-    canvas.draw_rrect(rr, &stroke(accent(0.9), 1.0));
+    canvas.draw_rrect(rr, &stroke(accent(0.9), k.max(1.0)));
 }
 
 /// [`focus_halo`] growth past the card, design units. Applied to both rect and corner radius.
@@ -756,30 +757,6 @@ impl Fonts {
         font.measure_str(text, None).0
     }
 
-    /// Letter-spaced run. Skia's `draw_str` has no tracking, so each char is placed.
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw_tracked(
-        &self,
-        canvas: &Canvas,
-        text: &str,
-        x: f64,
-        baseline: f64,
-        w: W,
-        size: f64,
-        tracking: f64,
-        color: Color4f,
-    ) {
-        let font = self.font(w, size);
-        let paint = fill(color);
-        let mut pen = x as f32;
-        let mut buf = [0u8; 4];
-        for ch in text.chars() {
-            let s = ch.encode_utf8(&mut buf);
-            canvas.draw_str(&*s, Point::new(pen, baseline as f32), &font, &paint);
-            pen += font.measure_str(&*s, None).0 + tracking as f32;
-        }
-    }
-
     /// Bump the paragraph-cache clock. Entries not drawn this frame or the last
     /// are eviction candidates. The shell calls this once per `render_in`.
     pub fn begin_frame(&self) {
@@ -957,15 +934,6 @@ impl Fonts {
         fitted.push_str(ell);
         self.draw(canvas, &fitted, x, baseline, w, size, color);
     }
-}
-
-/// First family that matches. Linux fontconfig resolves generic aliases
-/// ("sans-serif"); Windows DirectWrite does not, so the list includes concrete names.
-#[cfg(feature = "vulkan-overlay")]
-pub fn match_first_family(mgr: &FontMgr, families: &[&str], style: FontStyle) -> Option<Typeface> {
-    families
-        .iter()
-        .find_map(|f| mgr.match_family_style(f, style))
 }
 
 /// `src` composited over an opaque `dst`: the opaque colour a stacked paint shows.

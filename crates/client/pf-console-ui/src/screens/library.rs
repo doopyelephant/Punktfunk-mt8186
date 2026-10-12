@@ -60,7 +60,7 @@ fn shelf_cover(i: usize) -> Id {
 const ROW_GAP: f64 = 22.0;
 /// A heading over the grid: its line and the air to row 0.
 const GRID_HEADING: f64 = 34.0;
-/// Row 0's air under the Hosts row: the plate's outset and a breath.
+/// Row 0's air under the Hosts row with no heading over it: the plate's outset and a breath.
 const EMBED_AIR: f64 = 14.0;
 /// New covers a screen adopts a frame. Each is a texture upload on its first draw, and a
 /// shelf's worth landing together stalls the GPU for a frame.
@@ -276,6 +276,11 @@ impl LibraryScreen {
             .is_none_or(|s| s.cell_of(self.cursor.max(0) as usize).0 == 0)
     }
 
+    /// A finger has pulled the grid down past its top.
+    pub(crate) fn pulled_past_top(&self) -> bool {
+        self.grid.borrow().offset(Id::new(GRID, 0)) < 0.0
+    }
+
     /// Arm once neighbourhood posters exist, or after 400 ms (art-less libraries still enter).
     fn arm_entrance(&mut self, t: f64) {
         if self.entrance_armed || !matches!(self.phase, LibraryPhase::Ready) {
@@ -350,8 +355,8 @@ impl LibraryScreen {
     fn grid_cols(&self, rect: Rect, k: f64) -> usize {
         let avail = f64::from(rect.width()) - 2.0 * edge(k);
         let pitch = (GRID_W + GRID_GAP) * k;
-        // Last column has no trailing gap.
-        (((avail + GRID_GAP * k) / pitch).floor() as i64).clamp(2, 8) as usize
+        // Last column has no trailing gap. As many as fit: the grid spans any width.
+        (((avail + GRID_GAP * k) / pitch).floor() as i64).max(2) as usize
     }
 
     /// Last drawn grid. `None` until a frame: do not invent a column count.
@@ -1157,7 +1162,8 @@ impl LibraryScreen {
         let fit = (avail / ((cols as f64 * (GRID_W + GRID_GAP) - GRID_GAP) * k)).clamp(0.25, 1.0);
         let (cw, ch) = (GRID_W * k * fit, GRID_H * k * fit);
         let pitch_x = cw + GRID_GAP * k * fit;
-        let heading_h = if self.embedded {
+        // Under the Hosts row a heading (the launchers' band) takes the whole band too.
+        let heading_h = if self.embedded && shape.split == 0 {
             EMBED_AIR
         } else {
             GRID_HEADING
@@ -1512,7 +1518,11 @@ impl LibraryScreen {
         if game.running {
             card::running_badge(canvas, fonts, crect, k, alpha);
         }
-        canvas.draw_rrect(rr.with_inset((0.5, 0.5)), &stroke(fg(0.12 * alpha), 1.0));
+        let hair = (k as f32).max(1.0);
+        canvas.draw_rrect(
+            rr.with_inset((hair / 2.0, hair / 2.0)),
+            &stroke(fg(0.12 * alpha), hair),
+        );
         if layered {
             canvas.restore();
         }

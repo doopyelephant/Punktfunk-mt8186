@@ -5,7 +5,7 @@
 //! name through [`by_name`] so this list cannot drift from the slot table.
 //! GTK strokes the same path strings with `gsk::Path`.
 //!
-//! Device marks (`PAD_*`, [`KEYBOARD`], [`REMOTE`]) are this crate's own. Pad
+//! Device marks (`PAD_*`, [`KEYBOARD`], [`REMOTE`]) are this crate's own. Most pad
 //! outlines come from Kenney Input Prompts 1.5 (CC0,
 //! https://kenney.nl/assets/input-prompts), refit to the 24-unit box. The tells
 //! inside them are drawn here.
@@ -26,10 +26,10 @@ pub const CHEVRON_UP: Icon = Icon(pf_client_core::lucide::CHEVRON_UP);
 pub const CORNER_DOWN_LEFT: Icon = Icon(pf_client_core::lucide::CORNER_DOWN_LEFT);
 pub const PLUS: Icon = Icon(pf_client_core::lucide::PLUS);
 
-/// Kenney `controller_xbox360.svg` left half, mirrored about x = 12; sticks and the
-/// guide ring between them drawn here.
+/// Drawn here on Lucide's `gamepad-2` body: the Xbox layout's offset sticks and its ABXY
+/// diamond. Also the mark for a pad of no known kind.
 pub const PAD_XBOX_360: Icon = Icon(
-    "M12 15.6Q8.5 15.6 7.45 16.6Q5.65 18.66 4.3 19.18Q2.3 20.06 1.7 18.77Q1 17.08 1.35 14.26Q1.7 11.28 2.5 8.71L2.87 7.62Q3.3 6.4 3.95 5.35Q5.4 3.94 7.3 4.26L8.49 4.94Q9.39 5.41 10.48 5.5L12 5.5L13.52 5.5Q14.61 5.41 15.51 4.94L16.7 4.26Q18.6 3.94 20.05 5.35Q20.7 6.4 21.13 7.62L21.5 8.71Q22.3 11.28 22.65 14.26Q23 17.08 22.3 18.77Q21.7 20.06 19.7 19.18Q18.35 18.66 16.55 16.6Q15.5 15.6 12 15.6ZM4.9 9.4a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0 -3 0ZM13.9 12.8a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0 -3 0ZM10.8 8a1.2 1.2 0 1 0 2.4 0a1.2 1.2 0 1 0 -2.4 0Z",
+    "M17.32 5H6.68a4 4 0 0 0-3.978 3.59c-.006.052-.01.101-.017.152C2.604 9.416 2 14.456 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.414-1.414A2 2 0 0 1 9.828 16h4.344a2 2 0 0 1 1.414.586L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.545-.604-6.584-.685-7.258-.007-.05-.011-.1-.017-.151A4 4 0 0 0 17.32 5zM5.5 9.25a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0 -3 0ZM13 12.25a1.5 1.5 0 1 0 3 0a1.5 1.5 0 1 0 -3 0ZM18 7.6h.01M18 10.4h.01M16.6 9h.01M19.4 9h.01",
 );
 /// Kenney `controller_xboxone.svg` outline; sticks drawn here.
 pub const PAD_XBOX_ONE: Icon = Icon(
