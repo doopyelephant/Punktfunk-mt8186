@@ -20,7 +20,7 @@ use pf_presenter::overlay::{
 };
 use skia_safe::gpu::vk as skvk;
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin};
-use skia_safe::{Canvas, Color4f, Font, FontMgr, Point, RRect, Rect, Surface};
+use skia_safe::{Canvas, Color4f, Font, Point, RRect, Rect, Surface};
 use std::time::{Duration, Instant};
 
 /// An idle console redraws at most this often. 30 Hz keeps the aurora moving.
