@@ -85,10 +85,10 @@ enum PresenterChoice: Equatable {
 
     /// iOS and tvOS use deadline-paced Metal, macOS arrival-paced Metal.
     ///
-    /// The deadline link late-latches each drawable to one refresh + 4 ms before glass
-    /// (`LatchBudget`). Filmed at 240 fps on a 60 Hz Apple TV, that answered controller presses
-    /// 9 ms sooner than the decoded video plane, whose displayed-surface metric reads about a
-    /// refresh early. `decoded` stays an explicit A/B on tvOS 17.4+.
+    /// The deadline link presents each drawable as late as its deadline allows
+    /// (`DeadlinePacer`). Filmed at 240 fps on a 60 Hz Apple TV, a late pick answered controller
+    /// presses 9 ms sooner than the decoded video plane, whose displayed-surface metric reads
+    /// about a refresh early. `decoded` stays an explicit A/B on tvOS 17.4+.
     static var platformDefault: PresenterChoice {
         #if os(macOS)
         return .stage2

@@ -213,6 +213,17 @@ final class PresentPacingTests: XCTestCase {
         XCTAssertEqual(box.take(), 3, "the fresher vend wins over the stale return")
     }
 
+    /// The render thread drops a drawable past its pick: only that one, never a fresher vend.
+    func testLatestBoxTakeWhereChecksTheValueItTakes() {
+        let box = LatestBox<Int>()
+        XCTAssertNil(box.peek { $0 })
+        box.put(5)
+        XCTAssertEqual(box.peek { $0 * 2 }, 10, "peek reads without taking")
+        XCTAssertNil(box.take(where: { $0 < 5 }), "a fresher value stays")
+        XCTAssertEqual(box.take(where: { $0 == 5 }), 5)
+        XCTAssertNil(box.take(), "the matching take emptied the slot")
+    }
+
     // MARK: - PresenterChoice
 
     /// iOS and tvOS default to the deadline link, macOS to arrival-paced Metal. No selection or an
