@@ -57,8 +57,8 @@ enum PresenterChoice: Equatable {
     /// Resolve an explicit diagnostic override, or nil for no supported selection.
     ///
     /// Stage-2 remains a faithful arrival-pacing A/B. Stage-4 is limited to iOS/tvOS because the
-    /// macOS path has separate synchronization constraints. `decoded` is tvOS-only because its
-    /// displayed-IOSurface metering is validated there. Stage-1 additionally requires the
+    /// macOS path has separate synchronization constraints. `decoded` (the video-plane A/B) needs
+    /// iOS/tvOS 17.4 for its displayed-IOSurface metering. Stage-1 additionally requires the
     /// caller's release-build gate.
     static func explicit(setting: String?, env: String?, allowStage1: Bool) -> PresenterChoice? {
         let raw = env.flatMap { $0.isEmpty ? nil : $0 } ?? setting
@@ -73,8 +73,8 @@ enum PresenterChoice: Equatable {
             return .stage4
             #endif
         case "decoded":
-            #if os(tvOS)
-            if #available(tvOS 17.4, *) { return .decoded }
+            #if os(tvOS) || os(iOS)
+            if #available(iOS 17.4, tvOS 17.4, *) { return .decoded }
             return nil
             #else
             return nil

@@ -280,11 +280,11 @@ final class PresentPacingTests: XCTestCase {
         #endif
     }
 
-    /// The decoded video-layer path resolves only on tvOS. Other platforms treat an explicit
-    /// value as unknown and retain their platform default.
-    func testDecodedPresenterIsTvOSOnly() {
-        #if os(tvOS)
-        if #available(tvOS 17.4, *) {
+    /// The decoded video-layer A/B resolves on iOS and tvOS 17.4+. Elsewhere an explicit value is
+    /// unknown and the platform default stays.
+    func testDecodedPresenterIsIOSAndTvOSOnly() {
+        #if os(tvOS) || os(iOS)
+        if #available(iOS 17.4, tvOS 17.4, *) {
             XCTAssertEqual(
                 PresenterChoice.explicit(setting: nil, env: "decoded", allowStage1: true), .decoded)
         } else {

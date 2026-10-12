@@ -355,6 +355,20 @@ final class DecodedVideoSink: @unchecked Sendable {
         return true
     }
 
+    /// `PUNKTFUNK_PRESENT_DEBUG`: the renderer's cumulative counters, `optimized` being the frames
+    /// shown without compositing — the whole case for this path.
+    func logPerformance() {
+        guard #available(macOS 14.4, iOS 17.4, tvOS 17.4, *) else { return }
+        renderer.loadVideoPerformanceMetrics { m in
+            guard let m else { return }
+            print(String(
+                format: "pf-plane frames=%d dropped=%d corrupted=%d optimized=%d delaySum=%.3f",
+                m.totalNumberOfFrames, m.numberOfDroppedFrames, m.numberOfCorruptedFrames,
+                m.numberOfFramesDisplayedUsingOptimizedCompositing, m.totalAccumulatedFrameDelay))
+            fflush(stdout)
+        }
+    }
+
     func takeDisplayedStamp() -> Stamp? {
         guard #available(macOS 14.4, iOS 17.4, tvOS 17.4, *),
               let pixelBuffer = renderer.displayedPixelBuffer(),
@@ -794,6 +808,8 @@ public final class Stage2Pipeline {
     private let presenter: MetalVideoPresenter
     private let decoder: VideoDecoder
     private let decodedSink: DecodedVideoSink?
+    /// When `renderTick` last logged the decoded sink's metrics. Main thread.
+    private var lastPlaneLine: CFTimeInterval = 0
     /// Presentation mechanism, fixed for the pipeline lifetime and resolved per session by
     /// SessionPresenter. See PresentPacing for each path's ownership and cadence.
     private let pacing: PresentPacing
@@ -1460,7 +1476,7 @@ public final class Stage2Pipeline {
         period: CFTimeInterval
     ) {
         vsyncClock.set(target: targetMediaTime, period: period)
-        #if os(tvOS) || os(visionOS)
+        #if !os(macOS)
         if let stamp = decodedSink?.takeDisplayedStamp() {
             let atNs = Self.realtimeNs(forDisplayLinkTimestamp: displayedMediaTime)
             endToEndMeter?.record(ptsNs: stamp.ptsNs, atNs: atNs, offsetNs: clockOffset())
@@ -1468,6 +1484,10 @@ public final class Stage2Pipeline {
             debugStats.presented(
                 atNs: atNs, issuedNs: stamp.submittedNs, ptsNs: stamp.ptsNs,
                 decodedNs: stamp.decodedNs, isRepeat: stamp.isRepeat)
+        }
+        if presentDebug, let decodedSink, displayedMediaTime - lastPlaneLine >= 1 {
+            lastPlaneLine = displayedMediaTime
+            decodedSink.logPerformance()
         }
         #endif
         if pacing != .decoded {
