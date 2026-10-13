@@ -114,6 +114,13 @@ impl<B: PlatformBackend> SeatService<B> {
         let mut next = current.clone();
         for seat in &mut next.seats {
             if changing.as_ref() == Some(&seat.id) {
+                // A start in flight shows the step its backend is on.
+                if let Ok(status) = self.backend.status(seat)
+                    && status.state == RuntimeState::Starting
+                    && status.detail.is_some()
+                {
+                    seat.runtime = status;
+                }
                 continue;
             }
             seat.runtime = self
@@ -217,7 +224,16 @@ impl<B: PlatformBackend> SeatService<B> {
                 self.learn_pin(seat);
             }
             Err(error) => {
-                seat.runtime = RuntimeStatus::failed(error.to_string());
+                // The backend's own account of the failure, when it has one, is the sentence
+                // the console shows; the code and the operator's message go to the caller.
+                seat.runtime = match self.backend.status(&original) {
+                    Ok(status)
+                        if status.state == RuntimeState::Failed && status.detail.is_some() =>
+                    {
+                        status
+                    }
+                    _ => RuntimeStatus::failed(error.to_string()),
+                };
                 self.commit(&mut current, next)?;
                 return Err(ApiError::from(error));
             }

@@ -32,7 +32,8 @@ const QUALITY_TIMEOUT: Duration = Duration::from_secs(60);
 /// gets one; a fresh logon passes about 40% of the time on 9300.
 const QUALITY_SESSIONS: u32 = 5;
 const HOST_READY_TIMEOUT: Duration = Duration::from_secs(30);
-const START_TIMEOUT: Duration = Duration::from_secs(90);
+/// Room for a slow first logon plus two gate sessions, the usual worst healthy start.
+const START_TIMEOUT: Duration = Duration::from_secs(180);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
 
@@ -60,6 +61,9 @@ pub(super) struct RuntimeSnapshot {
     pub host_pid: Option<u32>,
     pub finished: bool,
     initial: Option<Result<(), crate::backend::BackendError>>,
+    step: Step,
+    /// Set when the start ran out of time: the seat then reads failed with this, not stopped.
+    timed_out: Option<String>,
 }
 
 impl Runtime {
@@ -70,13 +74,15 @@ impl Runtime {
             snapshot: Mutex::new(RuntimeSnapshot {
                 status: RuntimeStatus {
                     state: crate::model::RuntimeState::Starting,
-                    detail: Some("waiting for managed RDP session".into()),
+                    detail: Some(Step::SignIn.detail(0)),
                 },
                 session_id: None,
                 keeper_pid: None,
                 host_pid: None,
                 finished: false,
                 initial: None,
+                step: Step::SignIn,
+                timed_out: None,
             }),
             changed: Condvar::new(),
             join: Mutex::new(None),
@@ -97,6 +103,80 @@ impl Runtime {
     fn status(&self) -> RuntimeSnapshot {
         self.lock().clone()
     }
+
+    /// Enter `step` while starting: the console shows its detail, the log names it, and a
+    /// start that runs out of time says where it stood.
+    fn step(&self, seat: &Seat, step: Step, attempt: u32) {
+        tracing::info!(seat = %seat.id, step = step.name(), attempt, "seat start step");
+        self.update(|snapshot| {
+            snapshot.status = RuntimeStatus {
+                state: crate::model::RuntimeState::Starting,
+                detail: Some(step.detail(attempt)),
+            };
+            snapshot.step = step;
+        });
+    }
+}
+
+/// The stages of a seat start, in order.
+#[derive(Clone, Copy)]
+enum Step {
+    SignIn,
+    Display,
+    Host,
+}
+
+impl Step {
+    fn name(self) -> &'static str {
+        match self {
+            Self::SignIn => "sign_in",
+            Self::Display => "display_check",
+            Self::Host => "host_ready",
+        }
+    }
+
+    fn phrase(self) -> &'static str {
+        match self {
+            Self::SignIn => "signing in to the seat's Windows account",
+            Self::Display => "checking the seat's screen and graphics card",
+            Self::Host => "starting punktfunk on the seat",
+        }
+    }
+
+    /// What the console shows while the seat is on this step. `attempt` counts gate sessions.
+    fn detail(self, attempt: u32) -> String {
+        let phrase = self.phrase();
+        let mut text = phrase[..1].to_uppercase() + &phrase[1..];
+        if attempt > 1 {
+            text += &format!(" (try {attempt} of {QUALITY_SESSIONS})");
+        }
+        text + "…"
+    }
+}
+
+/// The sentence the console shows for a seat that didn't start, on its card and in Doctor. The
+/// log keeps the code and the operator's message.
+fn plain(error: &crate::backend::BackendError) -> String {
+    let code = error.code.as_str();
+    let text = match code {
+        "wts_timeout" | "rdp_keeper_exited" => {
+            "Windows didn't sign in to the seat's account. Remote Desktop may be off or out of licences."
+        }
+        _ if code.starts_with("quality_") => {
+            "The seat's screen didn't start. The graphics card or the seat display driver failed its check."
+        }
+        "host_ready_timeout" | "host_exited" => {
+            "punktfunk didn't start on the seat. The seat's log has the cause."
+        }
+        "port_in_use" => "Another program holds the seat's port. Restart the PC, then try again.",
+        "seats_off" => "Seats are off. Turn them on under Profiles → Seats.",
+        "termservice_stopped" => "Remote Desktop Services isn't running. Restart the PC.",
+        "seat_display_driver" => {
+            "The seat display driver isn't installed. Turn seats off and on again under Profiles → Seats."
+        }
+        _ => return error.message.clone(),
+    };
+    text.into()
 }
 
 impl Supervisor {
@@ -196,12 +276,21 @@ impl Supervisor {
             }
             let now = Instant::now();
             if now >= deadline {
+                let step = snapshot.step.phrase();
+                let error = backend_error(
+                    "start_timeout",
+                    format!(
+                        "seat did not become ready within {} seconds while {step}",
+                        START_TIMEOUT.as_secs()
+                    ),
+                );
+                tracing::warn!(seat = %seat.id, "{}", error.message);
+                let why = format!("The seat didn't start in time. It stopped while {step}.");
+                snapshot.status = RuntimeStatus::failed(why.clone());
+                snapshot.timed_out = Some(why);
                 runtime.stop.store(true, Ordering::Release);
                 runtime.changed.notify_all();
-                return Err(backend_error(
-                    "start_timeout",
-                    "seat did not become ready within 90 seconds",
-                ));
+                return Err(error);
             }
             let wait = deadline.saturating_duration_since(now);
             let (next, _) = runtime
@@ -278,6 +367,8 @@ impl Supervisor {
                 host_pid: None,
                 finished: true,
                 initial: Some(Ok(())),
+                step: Step::SignIn,
+                timed_out: None,
             })
     }
 
@@ -337,10 +428,6 @@ fn run_worker(
             break;
         }
         runtime.update(|snapshot| {
-            snapshot.status = RuntimeStatus {
-                state: crate::model::RuntimeState::Starting,
-                detail: Some("establishing managed RDP session".into()),
-            };
             snapshot.session_id = None;
             snapshot.keeper_pid = None;
             snapshot.host_pid = None;
@@ -351,7 +438,7 @@ fn run_worker(
             &accounts,
             &host_path,
             &seat,
-            &mut quality_done,
+            (&mut quality_done, gate_failures + 1),
         );
         match result {
             Ok(()) => break,
@@ -375,7 +462,9 @@ fn run_worker(
                     );
                 }
                 runtime.update(|snapshot| {
-                    snapshot.status = RuntimeStatus::failed(error.to_string());
+                    if !gate_retry {
+                        snapshot.status = RuntimeStatus::failed(plain(&error));
+                    }
                     if snapshot.initial.is_none() && !gate_retry {
                         snapshot.initial = Some(Err(error.clone()));
                     }
@@ -395,7 +484,10 @@ fn run_worker(
     }
     runtime.update(|snapshot| {
         if runtime.stop.load(Ordering::Acquire) {
-            snapshot.status = RuntimeStatus::stopped();
+            snapshot.status = match snapshot.timed_out.clone() {
+                Some(why) => RuntimeStatus::failed(why),
+                None => RuntimeStatus::stopped(),
+            };
             if snapshot.initial.is_none() {
                 snapshot.initial = Some(Err(backend_error(
                     "seat_stopping",
@@ -416,8 +508,9 @@ fn run_cycle(
     accounts: &AccountManager,
     host_path: &Path,
     seat: &Seat,
-    quality_done: &mut bool,
+    (quality_done, gate_attempt): (&mut bool, u32),
 ) -> WinResult<()> {
+    runtime.step(seat, Step::SignIn, 0);
     let pin = rdp::load_pin(root)?;
     let credential = accounts.credential_for_start(seat)?;
     let bootstrap = RdpBootstrap::new(seat.account.clone(), credential.copy_zeroizing(), pin)
@@ -470,6 +563,7 @@ fn run_cycle(
             .map_err(|error| io_error("seat_log", "resolve the seat log", error))?;
 
         if !*quality_done {
+            runtime.step(seat, Step::Display, gate_attempt);
             let gate_environment =
                 process::seat_environment(host_root.path(), seat, steam.as_deref(), false)?;
             run_quality_gate(
@@ -486,6 +580,7 @@ fn run_cycle(
             *quality_done = true;
         }
 
+        runtime.step(seat, Step::Host, 0);
         let mut host = spawn_host(session.id, host_path, workdir, &environment, &log)?;
         runtime.update(|snapshot| snapshot.host_pid = Some(host.pid()));
         wait_host_ready(runtime, &keeper, &host, seat)?;
@@ -514,11 +609,12 @@ fn run_cycle(
                 ));
             }
             if let Some(code) = host.exit_code()? {
+                tracing::warn!(seat = %seat.id, code, "seat host exited; restarting");
                 runtime.update(|snapshot| {
                     snapshot.status = RuntimeStatus {
                         state: crate::model::RuntimeState::Starting,
                         detail: Some(format!(
-                            "host exited with code {code}; restart in {} seconds",
+                            "punktfunk stopped on the seat. Restarting it in {} s…",
                             host_delay.as_secs()
                         )),
                     };
