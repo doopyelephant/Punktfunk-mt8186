@@ -36,5 +36,9 @@ rand = { version = "0.10", optional = true }
 rcgen = { workspace = true, optional = true }
 tokio = { version = "1", optional = true, features = ["rt-multi-thread", "macros", "time"] }
 
+[dev-dependencies]
+# `abi_header_hash` generates the header the way tools/gen-headers does.
+cbindgen = { version = "0.29", default-features = false }
+
 [lints]
 workspace = true

@@ -1017,3 +1017,85 @@ mod tests {
         assert_eq!(rate_fallback_ladder(SAMPLE_RATE_HZ), &[SAMPLE_RATE_HZ]);
     }
 }
+
+/// `clients/shared/connect-request-vectors.json`: the JSON Kotlin writes. The struct reads every
+/// key through `#[serde(default)]` and ignores unknown ones, so a key renamed on either side
+/// reads as its default; these tests fail instead.
+#[cfg(test)]
+mod request_vectors {
+    use super::ConnectRequest;
+    use serde::de::{self, Deserialize, Deserializer, Visitor};
+    use std::collections::BTreeSet;
+
+    /// The key names serde derived for [`ConnectRequest`], read from the `fields` the derive
+    /// hands `deserialize_struct`.
+    fn field_names() -> BTreeSet<String> {
+        struct Fields;
+        impl<'de> Deserializer<'de> for Fields {
+            type Error = de::value::Error;
+            fn deserialize_struct<V: Visitor<'de>>(
+                self,
+                _name: &'static str,
+                fields: &'static [&'static str],
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(de::Error::custom(fields.join(",")))
+            }
+            fn deserialize_any<V: Visitor<'de>>(
+                self,
+                _visitor: V,
+            ) -> Result<V::Value, Self::Error> {
+                Err(de::Error::custom("not a struct"))
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+                byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+                identifier ignored_any
+            }
+        }
+        let err = ConnectRequest::deserialize(Fields)
+            .err()
+            .expect("a struct reads fields");
+        err.to_string().split(',').map(str::to_owned).collect()
+    }
+
+    fn cases() -> Vec<serde_json::Value> {
+        let file: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../shared/connect-request-vectors.json"
+        ))
+        .unwrap();
+        file["cases"].as_array().expect("cases").clone()
+    }
+
+    #[test]
+    fn every_vector_key_is_a_field_and_every_field_is_in_a_vector() {
+        let known = field_names();
+        assert!(
+            known.contains("host") && known.contains("timeout_ms"),
+            "{known:?}"
+        );
+        let mut seen = BTreeSet::new();
+        for case in cases() {
+            let name = &case["name"];
+            for key in case["json"].as_object().expect("json").keys() {
+                assert!(
+                    known.contains(key),
+                    "{name}: ConnectRequest has no field `{key}`, so serde drops it"
+                );
+                seen.insert(key.clone());
+            }
+        }
+        let unwritten: Vec<_> = known.difference(&seen).collect();
+        assert!(unwritten.is_empty(), "no vector writes {unwritten:?}");
+    }
+
+    #[test]
+    fn every_vector_parses() {
+        for case in cases() {
+            let text = case["json"].to_string();
+            if let Err(e) = serde_json::from_str::<ConnectRequest>(&text) {
+                panic!("{}: {e}", case["name"]);
+            }
+        }
+    }
+}

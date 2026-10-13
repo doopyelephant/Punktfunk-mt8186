@@ -4161,6 +4161,7 @@ dependencies = [
 name = "punktfunk-ffi"
 version = "0.43.1"
 dependencies = [
+ "cbindgen",
  "log",
  "opus",
  "pf-bitstream",
