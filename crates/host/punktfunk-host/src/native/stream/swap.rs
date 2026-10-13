@@ -56,11 +56,16 @@ impl SwapReason {
         old.filter(|g| self != SwapReason::SessionSwitch && live != Some(*g))
     }
 
-    /// `enc_src` follows the frame. Left stale, `follow_source_mode` reopens the encoder at
-    /// what the source delivers and tells the client: a session switch relies on that, and a
-    /// rate rebuild leaves a source change it did not make to it.
+    /// `enc_src` follows the frame where the site publishes the delivered mode itself, or
+    /// rebuilds at the mode it had. A session switch and a capture loss can land on a backend
+    /// that delivers another size: left stale, `follow_source_mode` sees it, sets `cur_mode`,
+    /// re-resolves the rate and tells the client. A rate rebuild leaves a source change it did
+    /// not make to it too.
     fn rereads_enc_src(self) -> bool {
-        self != SwapReason::SessionSwitch && self != SwapReason::Bitrate
+        match self {
+            SwapReason::ModeSwitch | SwapReason::TopologyReassert | SwapReason::SourceMode => true,
+            SwapReason::SessionSwitch | SwapReason::CaptureLost | SwapReason::Bitrate => false,
+        }
     }
 }
 
@@ -576,12 +581,12 @@ mod tests {
         Row {
             site: "capture lost",
             why: SwapReason::CaptureLost,
-            next: || pipeline(SMALL),
+            next: || pipeline(WIDE),
             source_moved_first: false,
             epoch_moved: true,
-            ceiling_cleared: false,
+            ceiling_cleared: true,
             retarget_forgotten: true,
-            enc_src_reread: true,
+            enc_src_reread: false,
             retired: Some(1),
         },
         Row {
