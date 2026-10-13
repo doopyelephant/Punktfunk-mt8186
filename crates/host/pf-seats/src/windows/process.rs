@@ -445,8 +445,12 @@ pub(super) fn seat_environment(
     isolate: bool,
 ) -> WinResult<Vec<u16>> {
     let mut entries: BTreeMap<String, OsString> = BTreeMap::new();
+    // `CommonProgramFiles(x86)` locates Steam's streaming audio INFs, which mint a seat's sound.
     for name in [
         "ComSpec",
+        "CommonProgramFiles",
+        "CommonProgramFiles(x86)",
+        "CommonProgramW6432",
         "NUMBER_OF_PROCESSORS",
         "PATH",
         "PATHEXT",
