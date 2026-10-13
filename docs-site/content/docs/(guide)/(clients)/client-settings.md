@@ -40,7 +40,7 @@ Android. Most settings can differ per [preset](/docs/presets-and-links); the exc
 | Setting | Default | What it does | Where |
 |---|---|---|---|
 | **Resolution** | Native display | The host builds a display at exactly this size. **Native display** is the screen the window is on. **Aspect ratio** picks which sizes are listed; **Custom…** takes a typed width and height. | All. Apple TV: **Stream mode** (Native, or 720p, 1080p or 4K at 60 Hz) and **Custom size**. Android adds **Native display (safe area)**. |
-| **Match window** | Off | The stream follows the window's size; each resize renegotiates. Fullscreen uses the screen's own mode. | Linux, Windows, Mac, iPhone, iPad, console |
+| **Match window** | Off | The stream follows the window's size; each resize renegotiates. Fullscreen uses the screen's own mode. On a foldable iPhone that covers a fold, an unfold, a rotation and the upright half of a half-open one ([foldable iPhone](/docs/input#foldable-iphone)). | Linux, Windows, Mac, iPhone, iPad, console |
 | **Refresh rate** | Native | The stream's frame rate. | All. Apple TV sets it with **Stream mode**. |
 | **Bitrate** | Automatic | The whole budget on the wire: video, error correction and audio. **Automatic** starts at 20 Mbps, adapts to the link and never drops below 2 Mbps. A fixed rate holds for the session. | All. iPhone, iPad and Mac: **Automatic bitrate** plus a slider; elsewhere type any rate. |
 | **Render scale** | Native (1×) | The host renders at your resolution times this, 0.5× to 4×: pick a stop, or type any percent from 50 to 400. Your device scales the picture to the window. Above 1× is sharper and costs bandwidth. | All |

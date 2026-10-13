@@ -161,11 +161,10 @@ public final class StreamViewController: StreamViewControllerBase {
     /// Capture state at the last resign, restored on the next foreground — otherwise the
     /// mouse/keyboard stay released after navigating out and nothing re-grabs them.
     private var wasCapturedOnResign = false
-    /// Match-window resize follower (C3) — non-nil while a session is active AND the `matchWindow`
-    /// setting is on (DEFAULT on, for pixel-exact scene streaming); fed the view's physical-pixel
-    /// size from `viewDidLayoutSubviews` so an iPad Stage Manager / Split View scene resize
-    /// renegotiates the host mode (1:1, no presenter resample). iOS only (iPhone naturally no-ops
-    /// its fixed full-screen scene; tvOS drives display modes via AVDisplayManager instead).
+    /// Match window's follower, non-nil while a session is active and enabled by the `matchWindow`
+    /// setting. `viewDidLayoutSubviews` feeds it the view's pixel size, so a scene resize, a
+    /// rotation, a fold or the upright half of a half-open one renegotiates the host mode 1:1.
+    /// tvOS drives display modes through AVDisplayManager instead.
     private var matchFollower: MatchWindowFollower?
     /// The picture's surface on an attached monitor (see `ExternalDisplay`), and whether the
     /// stream presents there now. Input and the HUD stay on the phone either way.
@@ -175,6 +174,9 @@ public final class StreamViewController: StreamViewControllerBase {
         view.onLayout = { [weak self] in self?.layoutMetalLayer() }
         return view
     }()
+    /// This screen's native mode at the last layout pass, and the request a change of it queued.
+    private var lastNativeMode: (width: Int, height: Int, hz: Int)?
+    private var screenModeWork: DispatchWorkItem?
     #endif
     private var onExternal = false
     // `prefersPointerLocked` mirrors `wantsPointerLock`; SpringBoard grants or drops on its own
@@ -557,18 +559,24 @@ public final class StreamViewController: StreamViewControllerBase {
         }
         capture.start()
         inputCapture = capture
-        // Match-window (C3): when ON, follow the scene's pixel size so a resizable iPad scene
-        // streams 1:1 (pixel-exact) instead of the presenter resampling a fixed-mode frame into it.
-        // `viewDidLayoutSubviews` feeds it — covers Stage Manager / Split View resizes and rotation.
-        // iPhone is a fixed full-screen scene, so this naturally no-ops (reports the device mode).
-        // OPT-IN — `?? false` matches the Settings toggle (which also defaults off); an unset
-        // default keeps the explicit mode.
+        // Match window: follow the picture's own pixel size, so a resized scene, a fold or the
+        // upright half of a half-open one streams 1:1. `viewDidLayoutSubviews` feeds it. Off by
+        // default, like the Settings toggle.
         let follower = MatchWindowFollower(
             connection: connection,
             enabled: connection.settings.matchWindow,
             renderScale: connection.settings.renderScale,
             maxDimension: RenderScale.maxDimension(codec: connection.settings.codec))
         follower.onResizeTarget = onResizeTarget
+        #if os(iOS)
+        // A native rate follows the screen the picture is on.
+        follower.refreshHz = { [weak self] in
+            guard let self, self.connection?.settings.refreshHz == 0 else { return nil }
+            return UInt32(clamping: max(self.nativeMode.hz, 30))
+        }
+        // What the connect asked for: a session that starts on a half-open fold differs at once.
+        lastNativeMode = NativeDisplay.mode
+        #endif
         matchFollower = follower
         #endif
         #if os(iOS)
@@ -678,13 +686,15 @@ public final class StreamViewController: StreamViewControllerBase {
         })
         // The ring's Keyboard slot shows the soft keyboard, and hides it when it is up. iPhone's
         // keyboard has no dismiss key, and passthrough has no three-finger swipe. The slot names
-        // its session: every visionOS window is foreground-active at once.
+        // its session: every visionOS window is foreground-active at once. A trackpad half's
+        // swipe says which way it went.
         observers.append(NotificationCenter.default.addObserver(
             forName: .punktfunkToggleSoftKeyboard, object: connection, queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] note in
             guard let self,
                   self.view.window?.windowScene?.activationState == .foregroundActive else { return }
-            self.streamView.setSoftKeyboardVisible(!self.streamView.isFirstResponder)
+            let show = note.userInfo?[SoftKeyboardNote.show] as? Bool
+            self.streamView.setSoftKeyboardVisible(show ?? !self.streamView.isFirstResponder)
         })
         #if os(iOS)
         // A monitor plugged in or pulled mid-session takes the picture or hands it back.
@@ -787,6 +797,9 @@ public final class StreamViewController: StreamViewControllerBase {
         #if os(iOS) || os(visionOS)
         // The theater's panel is not the picture's size, so Match window sits it out.
         if !onExternal, presenter.theater == nil { noteMatchWindowSize() }
+        #if os(iOS)
+        noteScreen()
+        #endif
         // The window back at screen size (a windowed scene re-maximised) can hold the lock again.
         let fills = windowFillsScreen
         if fills, !windowFilledScreen { requestPointerLock() }
@@ -953,6 +966,37 @@ public final class StreamViewController: StreamViewControllerBase {
         matchFollower?.setEnabled(follows)
         if follows { noteMatchWindowSize() } else { requestSurfaceMode() }
     }
+
+    /// The native mode of what the picture fills: the screen this view is on, or the view's own
+    /// pixels while it holds only the upper part of its window (the upright half of a half-open
+    /// fold).
+    private var nativeMode: (width: Int, height: Int, hz: Int) {
+        let mode = NativeDisplay.mode(on: view.window?.windowScene?.screen ?? NativeDisplay.screen)
+        guard let window = view.window, streamView.bounds.height < window.bounds.height - 1
+        else { return mode }
+        let scale = renderScale
+        return (
+            Int((streamView.bounds.width * scale).rounded()),
+            Int((streamView.bounds.height * scale).rounded()), mode.hz)
+    }
+
+    /// The picture's native mode changed: it moved to another screen (a fold or unfold), or onto
+    /// or off the upright half of a half-open fold. A session streaming Native takes the new
+    /// mode. 0.4 s lets the hinge settle, so a flap costs the host no rebuild. Match window
+    /// follows the view's size on its own.
+    private func noteScreen() {
+        let native = nativeMode
+        defer { lastNativeMode = native }
+        guard let last = lastNativeMode, last != native else { return }
+        screenModeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.onExternal, self.connection?.settings.matchWindow == false
+            else { return }
+            self.requestSurfaceMode()
+        }
+        screenModeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
     #endif
 
     /// Match-window (C3): feed the follower the view's physical-pixel size (points × scale).
@@ -972,7 +1016,7 @@ public final class StreamViewController: StreamViewControllerBase {
         let settings = connection.settings
         #if os(iOS)
         let target = (onExternal ? ExternalDisplay.streamMode(settings) : nil)
-            ?? settings.streamMode(native: NativeDisplay.mode)
+            ?? settings.streamMode(native: nativeMode)
         #else
         let target = settings.streamMode(native: NativeDisplay.mode)
         #endif

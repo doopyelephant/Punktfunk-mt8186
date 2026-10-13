@@ -5,6 +5,8 @@
 import PunktfunkKit
 import SwiftUI
 
+private let foldLog = ClientLog(category: "display")
+
 struct StreamScene: View {
     @ObservedObject var model: SessionModel
     @ObservedObject var ring: RingState
@@ -31,157 +33,238 @@ struct StreamScene: View {
     }
 
     var body: some View {
-        let placement = HUDPlacement(rawValue: hudPlacement) ?? .topTrailing
-        return Group {
+        Group {
             if let conn = model.connection {
-                StreamView(
-                    connection: conn,
-                    captureEnabled: captureEnabled,
-                    onCaptureChange: { [weak model] captured in
-                        model?.mouseCaptured = captured
-                        #if os(visionOS)
-                        // The window that takes the keyboard takes the controllers too.
-                        if captured { model?.claimControllers() }
-                        #endif
-                    },
-                    onDisconnectRequest: { [weak model] in
-                        model?.disconnect() // the captured-state ⌃⌥⇧D combo
-                    },
-                    onDial: dialSink,
-                    onFrame: { [meter = model.meter, queue = model.clientQueue] au in
-                        meter.note(byteCount: au.data.count)
-                        // Receipt and the host split are the core's; the client-queue wait
-                        // (receipt → pull, both client-local) is Apple's own overlay line.
-                        queue.record(
-                            ptsNs: UInt64(bitPattern: au.receivedNs), atNs: au.pulledNs,
-                            offsetNs: 0)
-                    },
-                    onSessionEnd: { [weak model] in
-                        Task { @MainActor in model?.sessionEnded() }
-                    },
-                    // Resize overlay START — the follower is main-actor, so this drives the blur
-                    // + spinner synchronously the instant the window differs from the live mode.
-                    onResizeTarget: { [weak model] w, h in
-                        model?.resizeTargeted(width: w, height: h)
-                    },
-                    // Resize overlay END — the coded dims of each new-mode IDR, reported from the
-                    // decode pump thread; hop to the main actor to clear the overlay.
-                    onDecodedSize: { [weak model] w, h in
-                        Task { @MainActor in model?.resizeDecoded(width: w, height: h) }
-                    },
-                    endToEndMeter: model.endToEnd
-                )
-                #if os(visionOS)
-                .theater(TheaterStage.shared.renderers(for: conn))
-                .overlay {
-                    if TheaterStage.shared.renderers(for: conn) != nil { InTheaterPlaceholder() }
+                #if os(iOS)
+                // A half-open fold splits the session at its hinge. The picture keeps the upright
+                // half as one container, so its fit, gestures, HUD and ring need no second layout.
+                GeometryReader { geo in
+                    let fold = foldRead(geo)
+                    VStack(spacing: 0) {
+                        picture(conn, padOverPicture: fold.split == nil)
+                            .frame(height: fold.split?.video)
+                        if let split = fold.split {
+                            Color.black.frame(height: split.hinge)
+                            flatHalf(conn)
+                        }
+                    }
+                    .onChange(of: fold.trace, initial: true) { _, trace in
+                        foldLog.info("fold \(trace, privacy: .public)")
+                    }
                 }
-                .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
-                    StreamOrnament(connection: conn, quickActions: { ring.toggleCentred() })
+                #if DEBUG
+                // A capture starts with the virtual controller up.
+                .task {
+                    if ProcessInfo.processInfo.environment["PUNKTFUNK_SHOT_PAD"] != nil,
+                       !model.virtualPadShown { model.toggleVirtualPad() }
                 }
                 #endif
-                .overlay(alignment: placement.alignment) {
-                    // No `.id`: a tier change keeps the StreamHUDView identity, so its glass card
-                    // morphs to the new tier. The `.transition` fires only on off↔on, a scale-up
-                    // from the HUD's corner. The ZStack is the stable host `.animation` watches.
-                    ZStack {
-                        if captureEnabled && statsVerbosity != .off {
-                            StreamHUDView(
-                                model: model, connection: conn, placement: placement,
-                                verbosity: statsVerbosity,
-                                scale: Double(min(max(statsScalePct, 75), 200)) / 100)
-                                .transition(
-                                    .scale(scale: 0.8, anchor: placement.unitPoint)
-                                        .combined(with: .opacity))
-                        }
-                    }
-                    .animation(.smooth(duration: 0.28), value: statsVerbosity)
-                }
-                .overlay(alignment: .bottom) {
-                    StreamBadgeStack(
-                        model: model, captureEnabled: captureEnabled, statsVerbosity: statsVerbosity)
-                }
-                #if os(iOS) || os(visionOS)
-                // Touch has no menu or ⌘D: while the HUD shows no Disconnect (compact, off) a
-                // corner disc opens the ring. Off drops it after 8 s, since any overlay above the
-                // stream costs ~a refresh of latency; compact composites a pill anyway. The
-                // virtual controller carries its own ring button, so the discs leave while it is up.
-                .overlay(alignment: .topLeading) {
-                    if captureEnabled, !model.virtualPadShown,
-                       statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
-                        HStack(spacing: 10) {
-                            // Opens the quick-action ring (End stream is a slot inside, behind
-                            // a two-press arm), keeping the disc's fade rules.
-                            Button {
-                                ring.pressTick &+= 1
-                                ring.openAt(CGPoint(x: 30, y: 30))
-                            } label: { touchDisc("ellipsis.circle") }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("Quick actions")
-                            // The mic toggle rides the same discs, for the same reason: in these
-                            // tiers the HUD carries no buttons (compact is a stat pill, off is
-                            // nothing), so this is a touch-only user's ONLY way to mute. Absent —
-                            // not greyed — when the session sends no microphone at all.
-                            if model.micAvailable {
-                                Button { model.toggleMicMute() } label: {
-                                    touchDisc(model.micMuted ? "mic.slash.fill" : "mic.fill")
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel(
-                                    model.micMuted ? "Unmute microphone" : "Mute microphone")
-                            }
-                        }
-                        .padding(12)
-                        .transition(.opacity)
-                        .task {
-                            guard statsVerbosity == .off else { return }
-                            try? await Task.sleep(for: .seconds(8))
-                            withAnimation(.easeOut(duration: 0.6)) { showTouchExit = false }
-                        }
-                    }
-                }
-                // The virtual controller: above the stream's touch surface, so its controls take
-                // their fingers first and every other finger falls through; below the ring, whose
-                // scrim owns every finger while it is up. Mounted only while shown (tenet 1).
-                .overlay {
-                    if captureEnabled, model.virtualPadShown, let pad = model.virtualPad {
-                        VirtualPadLayer(config: OverlayConfig.parse(model.settings.overlayActions).pad,
-                                        wire: pad, openRing: { [ring] at in ring.openAt(at) })
-                    }
-                }
-                #endif
-                // The quick-action ring, over the virtual controller: opened by the iOS twist or
-                // disc, the pad's ring button, the remote's Back, the Mac's chord or the Vision
-                // Pro's ornament. Mounted only while open — a closed overlay costs nothing.
-                .overlay {
-                    if captureEnabled, ring.visible {
-                        RingOverlay(state: ring, cfg: ringConfig, actions: model.ringActions(conn, ring: ring))
-                    }
-                }
-                .onChange(of: ring.committed) { _, open in
-                    model.setRingOpen(open)
-                    #if os(macOS) || os(iOS)
-                    // The Mac's pointer is grabbed while streaming and an iPad's mouse is locked,
-                    // so the stream layer hands it back for as long as the ring is up (nothing
-                    // else can click a button above the video) and takes it again on close.
-                    NotificationCenter.default.post(
-                        name: .punktfunkRingOpen, object: NSNumber(value: open))
-                    #endif
-                }
-                #if !os(tvOS)
-                // ⌃⌥⇧O from InputCapture: the Mac's while captured, the iPad's in both states. It
-                // names its session; the Stream menu's item goes through `sessionFocus` instead.
-                .onReceive(NotificationCenter.default.publisher(
-                    for: .punktfunkToggleQuickActions
-                )) { note in
-                    guard captureEnabled, model.phase == .streaming,
-                          note.object as AnyObject === conn else { return }
-                    ring.toggleCentred()
-                }
+                #else
+                picture(conn, padOverPicture: true)
                 #endif
             }
         }
     }
+
+    /// The live stream and everything drawn over it. `padOverPicture` is false while the virtual
+    /// controller has the flat half of a fold to itself.
+    @ViewBuilder
+    private func picture(_ conn: PunktfunkConnection, padOverPicture: Bool) -> some View {
+        let placement = HUDPlacement(rawValue: hudPlacement) ?? .topTrailing
+        StreamView(
+            connection: conn,
+            captureEnabled: captureEnabled,
+            onCaptureChange: { [weak model] captured in
+                model?.mouseCaptured = captured
+                #if os(visionOS)
+                // The window that takes the keyboard takes the controllers too.
+                if captured { model?.claimControllers() }
+                #endif
+            },
+            onDisconnectRequest: { [weak model] in
+                model?.disconnect() // the captured-state ⌃⌥⇧D combo
+            },
+            onDial: dialSink,
+            onFrame: { [meter = model.meter, queue = model.clientQueue] au in
+                meter.note(byteCount: au.data.count)
+                // Receipt and the host split are the core's; the client-queue wait
+                // (receipt → pull, both client-local) is Apple's own overlay line.
+                queue.record(
+                    ptsNs: UInt64(bitPattern: au.receivedNs), atNs: au.pulledNs,
+                    offsetNs: 0)
+            },
+            onSessionEnd: { [weak model] in
+                Task { @MainActor in model?.sessionEnded() }
+            },
+            // Resize overlay START — the follower is main-actor, so this drives the blur
+            // + spinner synchronously the instant the window differs from the live mode.
+            onResizeTarget: { [weak model] w, h in
+                model?.resizeTargeted(width: w, height: h)
+            },
+            // Resize overlay END — the coded dims of each new-mode IDR, reported from the
+            // decode pump thread; hop to the main actor to clear the overlay.
+            onDecodedSize: { [weak model] w, h in
+                Task { @MainActor in model?.resizeDecoded(width: w, height: h) }
+            },
+            endToEndMeter: model.endToEnd
+        )
+        #if os(visionOS)
+        .theater(TheaterStage.shared.renderers(for: conn))
+        .overlay {
+            if TheaterStage.shared.renderers(for: conn) != nil { InTheaterPlaceholder() }
+        }
+        .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
+            StreamOrnament(connection: conn, quickActions: { ring.toggleCentred() })
+        }
+        #endif
+        .overlay(alignment: placement.alignment) {
+            // No `.id`: a tier change keeps the StreamHUDView identity, so its glass card
+            // morphs to the new tier. The `.transition` fires only on off↔on, a scale-up
+            // from the HUD's corner. The ZStack is the stable host `.animation` watches.
+            ZStack {
+                if captureEnabled && statsVerbosity != .off {
+                    StreamHUDView(
+                        model: model, connection: conn, placement: placement,
+                        verbosity: statsVerbosity,
+                        scale: Double(min(max(statsScalePct, 75), 200)) / 100)
+                        .transition(
+                            .scale(scale: 0.8, anchor: placement.unitPoint)
+                                .combined(with: .opacity))
+                }
+            }
+            .animation(.smooth(duration: 0.28), value: statsVerbosity)
+        }
+        .overlay(alignment: .bottom) {
+            StreamBadgeStack(
+                model: model, captureEnabled: captureEnabled, statsVerbosity: statsVerbosity)
+        }
+        #if os(iOS) || os(visionOS)
+        // Touch has no menu or ⌘D: while the HUD shows no Disconnect (compact, off) a
+        // corner disc opens the ring. Off drops it after 8 s, since any overlay above the
+        // stream costs ~a refresh of latency; compact composites a pill anyway. The
+        // virtual controller carries its own ring button, so the discs leave while it is up.
+        .overlay(alignment: .topLeading) {
+            if captureEnabled, !model.virtualPadShown,
+               statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
+                HStack(spacing: 10) {
+                    // Opens the quick-action ring (End stream is a slot inside, behind
+                    // a two-press arm), keeping the disc's fade rules.
+                    Button {
+                        ring.pressTick &+= 1
+                        ring.openAt(CGPoint(x: 30, y: 30))
+                    } label: { touchDisc("ellipsis.circle") }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Quick actions")
+                    // The mic toggle rides the same discs, for the same reason: in these
+                    // tiers the HUD carries no buttons (compact is a stat pill, off is
+                    // nothing), so this is a touch-only user's ONLY way to mute. Absent —
+                    // not greyed — when the session sends no microphone at all.
+                    if model.micAvailable {
+                        Button { model.toggleMicMute() } label: {
+                            touchDisc(model.micMuted ? "mic.slash.fill" : "mic.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(
+                            model.micMuted ? "Unmute microphone" : "Mute microphone")
+                    }
+                }
+                .padding(12)
+                .transition(.opacity)
+                .task {
+                    guard statsVerbosity == .off else { return }
+                    try? await Task.sleep(for: .seconds(8))
+                    withAnimation(.easeOut(duration: 0.6)) { showTouchExit = false }
+                }
+            }
+        }
+        // The virtual controller: above the stream's touch surface, so its controls take
+        // their fingers first and every other finger falls through; below the ring, whose
+        // scrim owns every finger while it is up. Mounted only while shown (tenet 1).
+        .overlay {
+            if padOverPicture, captureEnabled, model.virtualPadShown,
+                   let pad = model.virtualPad {
+                VirtualPadLayer(config: OverlayConfig.parse(model.settings.overlayActions).pad,
+                                wire: pad, openRing: { [ring] at in ring.openAt(at) })
+            }
+        }
+        #endif
+        // The quick-action ring, over the virtual controller: opened by the iOS twist or
+        // disc, the pad's ring button, the remote's Back, the Mac's chord or the Vision
+        // Pro's ornament. Mounted only while open — a closed overlay costs nothing.
+        .overlay {
+            if captureEnabled, ring.visible {
+                RingOverlay(state: ring, cfg: ringConfig, actions: model.ringActions(conn, ring: ring))
+            }
+        }
+        .onChange(of: ring.committed) { _, open in
+            model.setRingOpen(open)
+            #if os(macOS) || os(iOS)
+            // The Mac's pointer is grabbed while streaming and an iPad's mouse is locked,
+            // so the stream layer hands it back for as long as the ring is up (nothing
+            // else can click a button above the video) and takes it again on close.
+            NotificationCenter.default.post(
+                name: .punktfunkRingOpen, object: NSNumber(value: open))
+            #endif
+        }
+        #if !os(tvOS)
+        // ⌃⌥⇧O from InputCapture: the Mac's while captured, the iPad's in both states. It
+        // names its session; the Stream menu's item goes through `sessionFocus` instead.
+        .onReceive(NotificationCenter.default.publisher(
+            for: .punktfunkToggleQuickActions
+        )) { note in
+            guard captureEnabled, model.phase == .streaming,
+                  note.object as AnyObject === conn else { return }
+            ring.toggleCentred()
+        }
+        #endif
+    }
+
+    #if os(iOS)
+    /// The flat half of a half-open fold: the virtual controller while it is up, else a
+    /// trackpad. The ring opens centred on the picture, never down here.
+    @ViewBuilder
+    private func flatHalf(_ conn: PunktfunkConnection) -> some View {
+        ZStack {
+            Color.black
+            if captureEnabled, model.virtualPadShown, let pad = model.virtualPad {
+                VirtualPadLayer(config: OverlayConfig.parse(model.settings.overlayActions).pad,
+                                wire: pad, openRing: { [ring] _ in ring.toggleCentred() })
+            } else if captureEnabled, conn.canSendPointer {
+                TrackpadSurface(connection: conn, enabled: captureEnabled, onDial: dialSink)
+                    .background(
+                        Color.white.opacity(0.06),
+                        in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+                    .overlay {
+                        Label("Trackpad", systemImage: "hand.point.up.left")
+                            .font(.geist(13, relativeTo: .footnote))
+                            .foregroundStyle(.white.opacity(0.45))
+                            .allowsHitTesting(false)
+                    }
+                    .padding(12)
+            }
+        }
+    }
+
+    /// The tabletop split for this container, read off the system's fold region: nil on a flat,
+    /// shut or book-held device, and before iOS 27.1. `trace` is the log's line for it.
+    private func foldRead(_ geo: GeometryProxy) -> (split: FoldSplit?, trace: String) {
+        #if DEBUG
+        // A capture stands a fold up without a hinge: the fraction of the height it sits at.
+        if let at = ProcessInfo.processInfo.environment["PUNKTFUNK_SHOT_FOLD"].flatMap(Double.init) {
+            let hinge = CGRect(x: 0, y: geo.size.height * at - 20, width: geo.size.width, height: 40)
+            return (FoldSplit(hinge: hinge, in: geo.size), "capture at \(at)")
+        }
+        #endif
+        guard #available(iOS 27.1, *) else { return (nil, "unsupported") }
+        let folds = geo.reservedRegions(kind: .division, options: [.includeInactive])
+        let split = folds.first { $0.isActive }
+            .flatMap { FoldSplit(hinge: $0.frame, in: geo.size) }
+        let seen = folds.map { "active=\($0.isActive) frame=\($0.frame)" }
+            .joined(separator: " | ")
+        let cut = split.map { "\($0.video)+\($0.hinge)" } ?? "none"
+        return (split, "\(seen.isEmpty ? "none" : seen) split=\(cut)")
+    }
+    #endif
 
     #if os(iOS) || os(visionOS)
     /// The two-finger twist → the ring. Nil on the platforms without a twist.

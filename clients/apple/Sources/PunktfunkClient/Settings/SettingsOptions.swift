@@ -289,23 +289,22 @@ enum SettingsOptions {
     /// On iOS the safe-area variant is the same mode narrowed so the picture clears the sensor
     /// housing and the rounded corners — see [`SafeDisplay`] for why a narrower mode is the whole
     /// fix. A notched Mac gets the same pair from [`macDisplayModes`], shortened instead of
-    /// narrowed. On a device with no housing the two are identical and the second is dropped.
+    /// narrowed. A device with no housing has no second mode: an odd panel would otherwise
+    /// differ from its even-floored self.
     @MainActor
     static func nativeModes() -> [(name: String, w: Int, h: Int)] {
         var native: [(name: String, w: Int, h: Int)] = []
-        #if os(visionOS)
+        #if !os(macOS)
         let mode = NativeDisplay.mode
         native = [("This device", mode.width, mode.height)]
-        #elseif os(iOS) || os(tvOS)
-        let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels (tvOS: the TV mode)
-        let nativeW = Int(max(bounds.width, bounds.height))
-        let nativeH = Int(min(bounds.width, bounds.height))
-        native = [("This device", nativeW, nativeH)]
         #if os(iOS)
-        let safe = SafeDisplay.mode(
-            nativeWidth: nativeW, nativeHeight: nativeH,
-            sideInsetPoints: mainWindowSideInset(), scale: UIScreen.main.nativeScale)
-        native.append(("This device (safe area)", safe.width, safe.height))
+        let inset = mainWindowSideInset()
+        if inset > 0 {
+            let safe = SafeDisplay.mode(
+                nativeWidth: mode.width, nativeHeight: mode.height,
+                sideInsetPoints: inset, scale: NativeDisplay.screen.nativeScale)
+            native.append(("This device (safe area)", safe.width, safe.height))
+        }
         #endif
         #else
         native = macDisplayModes()
@@ -339,8 +338,8 @@ enum SettingsOptions {
     /// The key window's per-side safe-area inset in points, resolved for the LANDSCAPE stream even
     /// when this settings screen is currently portrait (see `SafeDisplay.sideInsetPoints`).
     ///
-    /// Zero when no window is up yet — the safe mode then equals the native one and `resolutionModes`
-    /// dedups the row away, which is the right answer for a device we can't measure.
+    /// Zero when no window is up yet: `nativeModes` then offers no safe mode, which is the right
+    /// answer for a device we can't measure.
     @MainActor
     private static func mainWindowSideInset() -> Double {
         let insets = UIApplication.shared.connectedScenes
@@ -360,11 +359,8 @@ enum SettingsOptions {
     /// A Mac lists the desktop clients' rates; a phone or tablet the few its panels run at.
     @MainActor
     static func refreshRates(including current: Int) -> [Int] {
-        #if os(visionOS)
+        #if !os(macOS)
         let maxHz = NativeDisplay.mode.hz
-        let ladder = [60, 120, 240]
-        #elseif os(iOS) || os(tvOS)
-        let maxHz = UIScreen.main.maximumFramesPerSecond
         let ladder = [60, 120, 240]
         #else
         let maxHz = NSScreen.main?.maximumFramesPerSecond ?? 60

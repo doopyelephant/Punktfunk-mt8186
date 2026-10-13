@@ -38,6 +38,9 @@ One app for macOS, iOS, iPadOS and tvOS. It adds:
 - Widgets for hosts and the game library, a Live Activity while you stream, and Shortcuts actions
   for Siri.
 - DualSense rumble, adaptive triggers, lightbar, motion and touchpad.
+- On a foldable iPhone, a stream that follows the fold: the cover screen, the inner screen, and the
+  upright half when it sits half open like a laptop
+  ([foldable iPhone](/docs/input#foldable-iphone)).
 
 ## Linux desktop client (GTK4)
 

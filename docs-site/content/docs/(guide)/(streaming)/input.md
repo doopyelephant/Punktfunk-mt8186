@@ -305,6 +305,18 @@ starts that way. The handheld remembers the layout per second screen, and an **A
 resolution follows it — the picture screen's mode, or two of them stacked when the picture spans
 both — at once where the host can change mode mid-stream, else from the next connect.
 
+### Foldable iPhone
+
+Set a foldable iPhone down half open, like a laptop, and the stream splits at the hinge: the
+picture takes the upright half and the flat half becomes a trackpad, or the
+[virtual controller](#virtual-controller) while it is shown. Open the phone flat and the picture
+takes the whole screen again. Held half open like a book, nothing changes.
+
+A **Native display** resolution follows the picture: the cover screen's mode when the phone is
+shut, the inner screen's when it is open, and the upright half's while it is half open. A size
+you picked stays as picked. With **Match window** on, the stream also follows a rotation and the
+space the phone gives the app beside another one. The host changes mode mid-stream where it can.
+
 ## Pen and stylus
 
 A stylus sends position, pressure, tilt, barrel roll, hover, the eraser and two barrel buttons,
