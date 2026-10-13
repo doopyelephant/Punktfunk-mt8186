@@ -2500,10 +2500,14 @@ pub(crate) fn force_release(slot: Option<u64>) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::ccd::fake::{CcdCall, FakeCcd};
     use super::{
-        needs_resize, shrink_action, Cycle, Mode, ReassertBreaker, ShrinkAction,
-        REASSERT_BREAKER_ROUNDS, REASSERT_WINDOW,
+        isolate_txn, lifecycle, needs_resize, shrink_action, topology_churn, topology_reassert_gen,
+        CcdTargetKey, Cycle, IsolateOutcome, MgrInner, Mode, Monitor, MonitorKey, Outcome,
+        ReassertBreaker, ShrinkAction, Slot, LUID, REASSERT_BREAKER_ROUNDS, REASSERT_WINDOW,
     };
+    use pf_win_display::snapshot::{DisplaySnapshot, TargetInventory};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     /// The alternating fight (lost / stable / lost …) reaches the breaker through the rolling
@@ -2591,5 +2595,214 @@ mod tests {
         let mode = m(1920, 1080, 60);
         assert!(!needs_resize(mode, mode, mode));
         assert!(needs_resize(mode, mode, m(2560, 1440, 60)));
+    }
+
+    /// The topology and re-assert generations are process globals: their tests take turns.
+    static GENERATIONS: Mutex<()> = Mutex::new(());
+
+    fn key(target_id: u32) -> CcdTargetKey {
+        CcdTargetKey::from_luid_parts(1, 0, target_id)
+    }
+
+    /// A live exclusive group: one monitor per target id, in acquire order.
+    fn exclusive_group(targets: &[u32]) -> MgrInner {
+        let mut inner = MgrInner::default();
+        for (generation, &target_id) in (1u64..).zip(targets) {
+            let mon = Monitor {
+                key: MonitorKey::Session(generation),
+                target_id,
+                luid: LUID {
+                    LowPart: 1,
+                    HighPart: 0,
+                },
+                render_pin: None,
+                hw_cursor: false,
+                cursor_excluded: false,
+                wudf_pid: 0,
+                gdi_name: None,
+                mode: m(1920, 1080, 60),
+                requested_mode: m(1920, 1080, 60),
+                resolved_monitor_id: target_id,
+                position: (0, 0),
+                generation,
+                client_fp: None,
+            };
+            let life = lifecycle::State::Active { refs: 1 };
+            inner.slots.insert(target_id, Slot { mon, life });
+        }
+        inner.group.ccd_saved = Some((Vec::new(), Vec::new()));
+        inner.group.ccd_exclusive = true;
+        inner
+    }
+
+    fn target(key: CcdTargetKey, active: bool) -> TargetInventory {
+        TargetInventory {
+            key,
+            target_id: key.target_id,
+            active,
+            external_physical: false,
+            internal_panel: false,
+            tech: "test",
+            friendly: String::new(),
+            monitor_device_path: String::new(),
+            ours: false,
+            gdi_name: String::new(),
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            refresh_mhz: 0,
+            primary: false,
+            hdr: None,
+            wcg: None,
+            sdr_white_level: None,
+            source_id: 0,
+            source_adapter_luid: 0,
+        }
+    }
+
+    fn snapshot(
+        generation: u64,
+        failures: u32,
+        targets: Vec<TargetInventory>,
+    ) -> Arc<DisplaySnapshot> {
+        Arc::new(DisplaySnapshot {
+            generation,
+            taken_at: Instant::now(),
+            failures,
+            targets: Arc::from(targets),
+        })
+    }
+
+    /// Only a path the verification read saw switch off moves the generation. A first read
+    /// that failed attempted nothing, so it leaves no restore snapshot either.
+    #[test]
+    fn an_isolate_moves_the_generation_only_on_a_verified_switch_off() {
+        let _turn = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let keep = [key(7), key(8)];
+        let verified = |deactivated| IsolateOutcome::Verified {
+            attempts: 1,
+            deactivated,
+        };
+        for (observed, outcome) in [
+            (Some(verified(2)), Outcome::Changed),
+            (Some(verified(0)), Outcome::Unchanged),
+            (Some(IsolateOutcome::NothingActive), Outcome::Unchanged),
+            (
+                Some(IsolateOutcome::Unverified { attempts: 3 }),
+                Outcome::Unknown,
+            ),
+            (None, Outcome::Unknown),
+        ] {
+            let ccd = FakeCcd::new();
+            ccd.script(|s| s.isolates.push_back(observed));
+            let before = topology_churn::generation();
+            let (saved, finished) = isolate_txn(&ccd, "test", &keep, Duration::from_secs(60), true);
+            assert_eq!(finished.outcome, outcome, "{observed:?}");
+            assert_eq!(saved.is_some(), observed.is_some(), "{observed:?}");
+            let moved = u64::from(outcome == Outcome::Changed);
+            assert_eq!(topology_churn::generation(), before + moved, "{observed:?}");
+            let keep = keep.to_vec();
+            assert_eq!(ccd.take_calls(), [CcdCall::Isolate { keep, store: true }]);
+        }
+        topology_churn::release();
+    }
+
+    /// The watch acts only on a read it can trust: a live exclusive isolate, a snapshot
+    /// that is not last-known-good, and one that carries a target of ours.
+    #[test]
+    fn the_exclusive_watch_counts_survivors_only_on_a_read_it_can_trust() {
+        let (ours, tv) = (key(7), key(9));
+        let ccd = FakeCcd::new();
+
+        // No live exclusive isolate: the display is not read at all.
+        let mut primary = exclusive_group(&[7]);
+        primary.group.ccd_exclusive = false;
+        let mut unsaved = exclusive_group(&[7]);
+        unsaved.group.ccd_saved = None;
+        let empty = exclusive_group(&[]);
+        for inner in [&primary, &unsaved, &empty] {
+            assert!(inner.exclusive_survivors(&ccd).is_none());
+        }
+        assert!(ccd.take_calls().is_empty());
+
+        let inner = exclusive_group(&[7]);
+        let lit = vec![target(ours, true), target(tv, true)];
+        let dark = vec![target(ours, true), target(tv, false)];
+        for (snap, survivors) in [
+            // Last-known-good after two failed refreshes.
+            (snapshot(4, 2, lit.clone()), None),
+            // None of our targets: an untrustworthy read, not an empty desk.
+            (snapshot(4, 0, vec![target(tv, true)]), None),
+            (snapshot(4, 0, lit.clone()), Some(1)),
+            (snapshot(4, 0, dark), Some(0)),
+            // The one-off read before the actor has published.
+            (snapshot(0, 0, lit), Some(1)),
+        ] {
+            ccd.script(|s| s.snapshot = snap);
+            let got = inner.exclusive_survivors(&ccd);
+            assert_eq!(got, survivors.map(|n| (vec![ours], n)));
+        }
+    }
+
+    /// One watch cycle that finds a display re-lit re-asserts the isolate and stores it.
+    /// Only a verified switch-off bumps the generation the stream heals from and parks the
+    /// display's devnode, once.
+    #[test]
+    fn a_reassert_heals_the_stream_only_after_a_verified_switch_off() {
+        let _turn = GENERATIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let (ours, tv) = (key(7), key(9));
+        let ccd = FakeCcd::new();
+        ccd.script(|s| {
+            s.snapshot = snapshot(4, 0, vec![target(ours, true), target(tv, true)]);
+            s.disabled = vec!["DISPLAY\\TV\\1".into()];
+        });
+        let mut inner = exclusive_group(&[7]);
+        let (keep, survivors) = inner.exclusive_survivors(&ccd).expect("a trusted read");
+        let cycle = ReassertBreaker::default().on_cycle(survivors, Instant::now());
+        assert_eq!(cycle, Cycle::Reassert { round: 1 });
+        ccd.take_calls();
+        let isolate = CcdCall::Isolate {
+            keep: keep.clone(),
+            store: true,
+        };
+        let hold = Duration::from_secs(60);
+
+        for observed in [
+            None,
+            Some(IsolateOutcome::Unverified { attempts: 3 }),
+            Some(IsolateOutcome::NothingActive),
+        ] {
+            ccd.script(|s| s.isolates.push_back(observed));
+            let before = topology_reassert_gen();
+            inner.reassert_isolate(&ccd, &keep, hold);
+            assert_eq!(topology_reassert_gen(), before, "{observed:?}");
+            assert_eq!(ccd.take_calls(), std::slice::from_ref(&isolate));
+        }
+        assert!(inner.group.pnp_disabled.is_empty());
+
+        // `PUNKTFUNK_STANDBY_SINK_KEEP` opts the park out, and a test sets no environment.
+        let parks = crate::policy::prefs().standby_sink_neutralise();
+        for _ in 0..2 {
+            let switched_off = IsolateOutcome::Verified {
+                attempts: 1,
+                deactivated: 1,
+            };
+            ccd.script(|s| s.isolates.push_back(Some(switched_off)));
+            let before = topology_reassert_gen();
+            inner.reassert_isolate(&ccd, &keep, hold);
+            assert_eq!(topology_reassert_gen(), before + 1);
+            let mut want = vec![isolate.clone()];
+            if parks {
+                want.push(CcdCall::DisableConnectedInactive {
+                    keep: keep.clone(),
+                    baseline_active: Vec::new(),
+                    generation: topology_churn::generation(),
+                });
+            }
+            assert_eq!(ccd.take_calls(), want);
+        }
+        assert_eq!(inner.group.pnp_disabled.len(), usize::from(parks));
+        topology_churn::release();
     }
 }
