@@ -269,10 +269,15 @@ impl WinExecutor<'_> {
     }
 
     fn deploy_files(&self, dest: &str) -> Result<(), Failed> {
-        let deferred = self
-            .payload
-            .deploy(Path::new(&self.sub(dest)))
-            .map_err(Failed)?;
+        let dest_dir = self.sub(dest);
+        let deferred = self.payload.deploy(Path::new(&dest_dir)).map_err(Failed)?;
+        // An earlier uninstall queued what it could not delete here, its own exe included.
+        let kept = super::sys::cancel_restart_deletes(Path::new(&dest_dir));
+        if kept > 0 {
+            self.ui.detail(&format!(
+                "{kept} file(s) an earlier uninstall left for the next restart stay"
+            ));
+        }
         if deferred.is_empty() {
             self.ui.ok(&format!("payload unpacked into {dest}"));
         } else {

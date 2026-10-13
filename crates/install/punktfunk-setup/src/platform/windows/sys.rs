@@ -39,6 +39,86 @@ pub fn delete_on_reboot(_path: &std::path::Path) -> bool {
     false
 }
 
+/// Take `dir` and everything under it out of the next boot's delete queue, and say how many
+/// deletes went. An uninstall queues the files it can't delete, its own exe above all; the
+/// install that writes them again must unqueue them, or the next restart deletes the new ones.
+#[cfg(windows)]
+pub fn cancel_restart_deletes(dir: &std::path::Path) -> usize {
+    use ::windows::core::HSTRING;
+    use ::windows::Win32::System::Registry::{
+        RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_LOCAL_MACHINE, REG_MULTI_SZ,
+        RRF_RT_REG_MULTI_SZ,
+    };
+    use pf_paths::restart_deletes as queue;
+    let (key, value) = (HSTRING::from(queue::KEY), HSTRING::from(queue::VALUE));
+    let mut bytes = 0u32;
+    // SAFETY: `key` and `value` are live NUL-terminated strings; a null data pointer asks only
+    // for the size, written to the live local `bytes`.
+    let sized = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            &key,
+            &value,
+            RRF_RT_REG_MULTI_SZ,
+            None,
+            None,
+            Some(&mut bytes),
+        )
+    };
+    if sized.is_err() {
+        return 0;
+    }
+    let mut data = vec![0u16; (bytes as usize).div_ceil(2)];
+    // SAFETY: as above; `data` is writable for `bytes` bytes and outlives the call.
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            &key,
+            &value,
+            RRF_RT_REG_MULTI_SZ,
+            None,
+            Some(data.as_mut_ptr().cast()),
+            Some(&mut bytes),
+        )
+    };
+    if read.is_err() {
+        return 0;
+    }
+    data.truncate(bytes as usize / 2);
+    let ops = queue::decode(&data);
+    let Some(kept) = queue::without_deletes_under(&ops, &dir.to_string_lossy()) else {
+        return 0;
+    };
+    let cancelled = ops.len().div_ceil(2) - kept.len() / 2;
+    let written = if kept.is_empty() {
+        // SAFETY: `key` and `value` are live NUL-terminated strings.
+        unsafe { RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, &key, &value) }
+    } else {
+        let data = queue::encode(&kept);
+        // SAFETY: as above; `data` is live for the call and its byte length is passed.
+        unsafe {
+            RegSetKeyValueW(
+                HKEY_LOCAL_MACHINE,
+                &key,
+                &value,
+                REG_MULTI_SZ.0,
+                Some(data.as_ptr().cast()),
+                (data.len() * 2) as u32,
+            )
+        }
+    };
+    if written.is_ok() {
+        cancelled
+    } else {
+        0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn cancel_restart_deletes(_dir: &std::path::Path) -> usize {
+    0
+}
+
 /// Queue `new` to replace `dest` at the next boot: Inno's `restartreplace` for an image
 /// still mapped by a process the pre-copy stop could not reach.
 #[cfg(windows)]

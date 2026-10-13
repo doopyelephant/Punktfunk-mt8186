@@ -9,8 +9,9 @@
 
 use super::enable::run;
 use pf_driver_proto::seat_audio::{LISTENER, LISTENER_PORT};
+use pf_paths::restart_deletes;
 use std::path::{Path, PathBuf};
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, KEY_READ, KEY_WOW64_64KEY};
+use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, KEY_READ, KEY_WOW64_64KEY, REG_MULTI_SZ};
 use winreg::types::ToRegValue;
 use winreg::{RegKey, RegValue};
 
@@ -90,7 +91,8 @@ fn wow_dir() -> PathBuf {
 }
 
 /// Copy both builds from `{app}\seat-audio` under a name that changes with their content, and
-/// return the path the listener names.
+/// return the path the listener names. A build in use again leaves the restart's delete queue,
+/// where [`sweep`] put it while seats were off.
 fn deploy(host_path: &Path) -> Result<PathBuf, String> {
     let source = host_path.with_file_name("seat-audio");
     let read = |arch: &str| {
@@ -101,12 +103,12 @@ fn deploy(host_path: &Path) -> Result<PathBuf, String> {
     let name = format!("{DLL}-{:016x}.dll", fnv1a(&[&x64, &x86]));
     for (dir, bytes) in [(native_dir(), &x64), (wow_dir(), &x86)] {
         let target = dir.join(&name);
-        if std::fs::read(&target).is_ok_and(|have| have == *bytes) {
-            continue;
+        if !std::fs::read(&target).is_ok_and(|have| have == *bytes) {
+            std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::write(&target, bytes))
+                .map_err(|e| format!("write {}: {e}", target.display()))?;
         }
-        std::fs::create_dir_all(&dir)
-            .and_then(|()| std::fs::write(&target, bytes))
-            .map_err(|e| format!("write {}: {e}", target.display()))?;
+        keep_at_restart(&target);
     }
     Ok(native_dir().join(name))
 }
@@ -132,12 +134,60 @@ fn sweep(dir: &Path, keep: Option<&Path>) {
     }
 }
 
+/// Queue a loaded DLL for the next restart, once: every seat start sweeps the same stale ones.
 fn delete_at_restart(path: &Path) {
     use windows::core::HSTRING;
     use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+    if restart_queue(KEY_READ)
+        .is_some_and(|(_, ops)| restart_deletes::deletes(&ops, &path.to_string_lossy()))
+    {
+        return;
+    }
     let path = HSTRING::from(path.as_os_str());
     // SAFETY: schedules a file this module wrote for deletion at the next restart.
     let _ = unsafe { MoveFileExW(&path, None, MOVEFILE_DELAY_UNTIL_REBOOT) };
+}
+
+/// The restart's file queue and its key, when the key opens and holds one.
+fn restart_queue(access: u32) -> Option<(RegKey, Vec<String>)> {
+    let key = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(restart_deletes::KEY, access | KEY_WOW64_64KEY)
+        .ok()?;
+    let raw = key.get_raw_value(restart_deletes::VALUE).ok()?;
+    let units: Vec<u16> = raw
+        .bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    Some((key, restart_deletes::decode(&units)))
+}
+
+/// Take `path` out of the restart's delete queue.
+fn keep_at_restart(path: &Path) {
+    let Some((key, ops)) = restart_queue(KEY_ALL_ACCESS) else {
+        return;
+    };
+    let Some(kept) = restart_deletes::without_deletes_under(&ops, &path.to_string_lossy()) else {
+        return;
+    };
+    let written = if kept.is_empty() {
+        key.delete_value(restart_deletes::VALUE)
+    } else {
+        let bytes: Vec<u8> = restart_deletes::encode(&kept)
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        key.set_raw_value(
+            restart_deletes::VALUE,
+            &RegValue {
+                bytes: bytes.into(),
+                vtype: REG_MULTI_SZ,
+            },
+        )
+    };
+    if let Err(error) = written {
+        tracing::warn!(%error, path = %path.display(), "seat audio DLL stays queued for deletion");
+    }
 }
 
 /// `RDP-Tcp`'s settings, our port and enumerator, then the enable flag last.
