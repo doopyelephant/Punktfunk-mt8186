@@ -751,6 +751,10 @@ impl Shell {
         if let Some(Screen::Players(p)) = self.stack.last_mut() {
             p.others = self.console.other_devices();
         }
+        if let Some(Screen::Controls(c)) = self.stack.last_mut() {
+            let devices = self.console.other_devices();
+            c.set_keyboard(devices.iter().any(|d| d.kind == "keyboard"));
+        }
         if let Some(Screen::Licenses(l)) = self.stack.last_mut() {
             if l.waiting() {
                 if let Some(sections) = self.console.licenses() {

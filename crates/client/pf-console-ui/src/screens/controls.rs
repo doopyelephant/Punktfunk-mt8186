@@ -30,13 +30,15 @@ const LINE_H: f64 = TEXT_SIZE * 1.4;
 const LEAD: &str = "Press these while a stream is running.";
 
 struct Card {
+    kind: Kind,
     icon: Icon,
     title: &'static str,
     /// The title's parenthetical, quieter beside it.
     note: Option<&'static str>,
     style: GlyphStyle,
     rows: Vec<Row>,
-    /// Laid out: top from the content's top, height and the badge column's width, px.
+    /// Laid out: top from the content's top, height and the badge column's width, px. A
+    /// card off the page has no height.
     top: f64,
     h: f64,
     keys_w: f64,
@@ -55,23 +57,34 @@ struct Row {
 
 pub(crate) struct ControlsScreen {
     cards: Vec<Card>,
+    /// The keyboard card waits for a keyboard: an iPhone's or iPad's keys need one attached.
+    keys_need_keyboard: bool,
+    /// One is attached, as the shell last said ([`Self::set_keyboard`]).
+    keyboard: bool,
     /// What the cards were laid out for: width and scale.
     laid: Option<(f32, f64)>,
     flick: Flick,
 }
 
 impl ControlsScreen {
-    /// This platform's controls. Pad chords draw in the first connected pad's style.
+    /// This platform's controls. The console is built for the device it runs on, so a
+    /// Mac's build is what tells it from an iPad.
     pub(crate) fn new(ctx: &Ctx) -> ControlsScreen {
         use crate::platform::Platform;
         let client = match ctx.device.platform {
             Platform::Desktop => Client::Desktop,
             Platform::Android => Client::Android,
+            Platform::Apple if cfg!(target_os = "macos") => Client::Mac,
             Platform::Apple => Client::Apple,
             Platform::WebOS => Client::WebOS,
             Platform::Web => Client::Web,
             Platform::Tizen => Client::Tizen,
         };
+        ControlsScreen::with_client(client, ctx)
+    }
+
+    /// `client`'s controls. Pad chords draw in the first connected pad's style.
+    fn with_client(client: Client, ctx: &Ctx) -> ControlsScreen {
         let pad = ctx.pads.first();
         let pad_style = pad.map_or(GlyphStyle::Letters, |p| GlyphStyle::from_pref(Some(p.pref)));
         let pad_icon = pad.map_or(icons::PAD_XBOX_360, |p| glyphs::pad_icon(p.pref));
@@ -90,6 +103,7 @@ impl ControlsScreen {
                     Kind::Pad => (pad_icon, pad_style),
                 };
                 Card {
+                    kind: g.kind,
                     icon,
                     title,
                     note,
@@ -114,8 +128,19 @@ impl ControlsScreen {
             .collect();
         ControlsScreen {
             cards,
+            keys_need_keyboard: client == Client::Apple,
+            keyboard: false,
             laid: None,
             flick: Flick::default(),
+        }
+    }
+
+    /// Whether a keyboard is attached, from the shell each frame: one can arrive or leave
+    /// while the page is up.
+    pub(crate) fn set_keyboard(&mut self, attached: bool) {
+        if self.keyboard != attached {
+            self.keyboard = attached;
+            self.laid = None;
         }
     }
 
@@ -125,7 +150,12 @@ impl ControlsScreen {
         let inner = f64::from(width) - 2.0 * PAD * k;
         let badge_h = glyphs::chord_height(k);
         let mut y = TEXT_SIZE * 1.45 * k + 18.0 * k;
+        let no_keys = self.keys_need_keyboard && !self.keyboard;
         for card in &mut self.cards {
+            if no_keys && card.kind == Kind::Keyboard {
+                card.h = 0.0;
+                continue;
+            }
             card.keys_w = card
                 .rows
                 .iter()
@@ -301,7 +331,8 @@ impl ScreenView for ControlsScreen {
             );
             for card in &self.cards {
                 let ct = top + card.top;
-                if ct < f64::from(view.bottom) && ct + card.h > f64::from(view.top) {
+                let on_page = card.h > 0.0;
+                if on_page && ct < f64::from(view.bottom) && ct + card.h > f64::from(view.top) {
                     let rect = Rect::from_xywh(x0 as f32, ct as f32, w as f32, card.h as f32);
                     self.draw_card(canvas, fonts, card, rect, k);
                 }
@@ -340,6 +371,34 @@ mod tests {
             .flat_map(|c| &c.rows)
             .all(|r| r.lines.len() == 1));
         assert!(s.flick.content_h > 600.0, "{}", s.flick.content_h);
+    }
+
+    /// An iPad's keys need a keyboard, which can arrive while the page is up. A Mac has one.
+    #[test]
+    fn an_ipad_lists_its_keys_only_while_a_keyboard_is_attached() {
+        let fonts = build_fonts().unwrap();
+        let mut settings = pf_client_core::trust::Settings::default();
+        let lib = crate::library::LibraryShared::default();
+        let ctx = Ctx::test(&mut settings, &lib);
+        let on_page = |s: &mut ControlsScreen| {
+            s.layout(&fonts, 960.0, 1.0);
+            let shown = s.cards.iter().filter(|c| c.h > 0.0);
+            shown.map(|c| c.kind).collect::<Vec<_>>()
+        };
+
+        let mut ipad = ControlsScreen::with_client(Client::Apple, &ctx);
+        assert_eq!(on_page(&mut ipad), [Kind::Pad]);
+        ipad.set_keyboard(true);
+        assert!(
+            ipad.laid.is_none(),
+            "a keyboard arriving lays the page out again"
+        );
+        assert_eq!(on_page(&mut ipad), [Kind::Keyboard, Kind::Pad]);
+        ipad.set_keyboard(false);
+        assert_eq!(on_page(&mut ipad), [Kind::Pad]);
+
+        let mut mac = ControlsScreen::with_client(Client::Mac, &ctx);
+        assert_eq!(on_page(&mut mac), [Kind::Keyboard, Kind::Pad]);
     }
 
     /// A phone's width stacks the badges over the text, and the text wraps whole.
