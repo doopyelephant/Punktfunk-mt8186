@@ -18,6 +18,14 @@ use utoipa::ToSchema;
 /// 90 s ≈ two missed 30 s SDK renewals before a plugin drops out of the listing.
 const LEASE_TTL: Duration = Duration::from_secs(90);
 
+/// The stages a plugin or hook may hold.
+pub const STAGES: &[&str] = &["game.launching"];
+
+/// The longest a plugin may hold. Clients cover a launch for 120 s.
+pub const HOLD_MAX_MS: u32 = 120_000;
+/// A plugin's deadline when it names none.
+pub const HOLD_DEFAULT_MS: u32 = 30_000;
+
 /// Request body only — carries the secret. [`PluginUiPublic`] is the response view.
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct PluginUi {
@@ -309,6 +317,15 @@ pub(crate) fn installer(id: &str) -> Option<UiCredential> {
     registry().credential_if(id, |u| u.install)
 }
 
+/// A hold's deadline from a registration: default when absent, `None` when out of range.
+pub fn deadline(ms: Option<u32>) -> Option<Duration> {
+    match ms.unwrap_or(HOLD_DEFAULT_MS) {
+        0 => None,
+        ms if ms > HOLD_MAX_MS => None,
+        ms => Some(Duration::from_millis(u64::from(ms))),
+    }
+}
+
 /// A title must not smuggle escapes, newlines or bidi marks into a log line or the nav.
 pub(crate) fn sanitize(s: &str) -> String {
     s.chars()
@@ -355,25 +372,18 @@ pub(crate) fn validate(reg: PluginRegistration, over_pipe: bool) -> Result<Valid
         }
         None => None,
     };
-    if let Some(bad) = reg
-        .holds
-        .iter()
-        .find(|h| !crate::holds::STAGES.contains(&h.as_str()))
-    {
+    if let Some(bad) = reg.holds.iter().find(|h| !STAGES.contains(&h.as_str())) {
         return Err(format!(
             "holds: unknown stage `{}` — known: {}",
             sanitize(bad),
-            crate::holds::STAGES.join(", ")
+            STAGES.join(", ")
         ));
     }
     if !reg.holds.is_empty() && ui.is_none() {
         return Err("holds needs ui.port and ui.secret — the host calls /__hold there".into());
     }
-    let Some(hold_timeout) = crate::holds::deadline(reg.hold_timeout_ms) else {
-        return Err(format!(
-            "hold_timeout_ms must be 1–{}",
-            crate::holds::HOLD_MAX_MS
-        ));
+    let Some(hold_timeout) = deadline(reg.hold_timeout_ms) else {
+        return Err(format!("hold_timeout_ms must be 1–{}", HOLD_MAX_MS));
     };
     let mut holds = reg.holds;
     holds.sort();
@@ -547,6 +557,14 @@ mod tests {
         assert_eq!((h[0].id.as_str(), h[0].port), ("slots", 49321));
         assert_eq!(h[0].timeout, Duration::from_secs(30));
         assert!(r.holders("game.exited").is_empty());
+    }
+
+    #[test]
+    fn a_deadline_defaults_and_refuses_the_out_of_range() {
+        assert_eq!(deadline(None), Some(Duration::from_secs(30)));
+        assert_eq!(deadline(Some(0)), None);
+        assert_eq!(deadline(Some(HOLD_MAX_MS + 1)), None);
+        assert_eq!(deadline(Some(500)), Some(Duration::from_millis(500)));
     }
 
     #[test]
