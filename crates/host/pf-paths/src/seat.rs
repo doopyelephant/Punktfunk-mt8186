@@ -132,6 +132,138 @@ pub fn is_door() -> bool {
 mod tests {
     use super::*;
 
+    /// What each predicate answers, by the markers set. Inputs: `S` `PUNKTFUNK_SEAT_SESSION=1`,
+    /// `O` `PUNKTFUNK_SEAT_OWNER=1`, `H` `PUNKTFUNK_SEAT_HEADLESS=1`, `D` the door (`serve --door`
+    /// or `PUNKTFUNK_DOOR=1`), `P` `PUNKTFUNK_PAIRING=refused`. Answers, in [`answers`]' order:
+    /// `s` seat host, `o` owner seat, `c` follows the contract, `r` runs a seat session, `d` door,
+    /// `p` pairing refused, `e` a missing seat id is an error.
+    const TRUTH: [(&str, &str); 32] = [
+        ("-----", "-------"),
+        ("----P", "-----p-"),
+        ("---D-", "----d--"),
+        ("---DP", "----dp-"),
+        ("--H--", "-------"),
+        ("--H-P", "-----p-"),
+        ("--HD-", "----d--"),
+        ("--HDP", "----dp-"),
+        ("-O---", "-------"),
+        ("-O--P", "-----p-"),
+        ("-O-D-", "----d--"),
+        ("-O-DP", "----dp-"),
+        ("-OH--", "-------"),
+        ("-OH-P", "-----p-"),
+        ("-OHD-", "----d--"),
+        ("-OHDP", "----dp-"),
+        ("S----", "s-cr--e"),
+        ("S---P", "s-cr-pe"),
+        ("S--D-", "s-crd-e"),
+        ("S--DP", "s-crdpe"),
+        ("S-H--", "s-cr--e"),
+        ("S-H-P", "s-cr-pe"),
+        ("S-HD-", "s-crd-e"),
+        ("S-HDP", "s-crdpe"),
+        ("SO---", "so----e"),
+        ("SO--P", "so---pe"),
+        ("SO-D-", "so--d-e"),
+        ("SO-DP", "so--dpe"),
+        ("SOH--", "so-r--e"),
+        ("SOH-P", "so-r-pe"),
+        ("SOHD-", "so-rd-e"),
+        ("SOHDP", "so-rdpe"),
+    ];
+
+    /// Each role variable in [`TRUTH`]'s input order: its name, the value that sets its marker,
+    /// and a value that must not.
+    const VARS: [(&str, &str, &str); 5] = [
+        ("PUNKTFUNK_SEAT_SESSION", "1", "true"),
+        ("PUNKTFUNK_SEAT_OWNER", "1", "0"),
+        ("PUNKTFUNK_SEAT_HEADLESS", "1", "yes"),
+        ("PUNKTFUNK_DOOR", "1", "true"),
+        ("PUNKTFUNK_PAIRING", "refused", "1"),
+    ];
+
+    /// Set on the child only: `flag` for a `serve --door` process.
+    const CHILD: &str = "PF_ROLE_TRUTH_CHILD";
+    const MARK: &str = "role-answers=";
+    /// Every variable unset, set and near-missed, with and without the flag.
+    const COMBINATIONS: usize = 3 * 3 * 3 * 3 * 3 * 2;
+
+    fn answers() -> String {
+        let answers = [
+            ('s', is_seat_host()),
+            ('o', is_owner_seat()),
+            ('c', follows_contract()),
+            ('r', runs_seat_session()),
+            ('d', is_door()),
+            ('p', pairing_refused()),
+            ('e', seat_id().is_err()),
+        ];
+        answers
+            .iter()
+            .map(|(letter, on)| if *on { *letter } else { '-' })
+            .collect()
+    }
+
+    /// The predicates read the process environment, so each combination runs this test again as
+    /// a child with that environment, and the child prints its answers.
+    #[test]
+    fn every_predicate_answers_its_truth_table_row() {
+        if let Some(door) = std::env::var_os(CHILD) {
+            if door == "flag" {
+                set_door();
+            }
+            println!("{MARK}{}", answers());
+            return;
+        }
+        let workers = std::thread::available_parallelism().map_or(1, usize::from);
+        std::thread::scope(|scope| {
+            for worker in 0..workers {
+                scope.spawn(move || (worker..COMBINATIONS).step_by(workers).for_each(check));
+            }
+        });
+    }
+
+    /// Bit 0 of `combination` is the flag; the rest is a base-3 digit per variable.
+    fn check(combination: usize) {
+        let flag = combination % 2 == 1;
+        let test = format!(
+            "{}::every_predicate_answers_its_truth_table_row",
+            module_path!().split_once("::").expect("crate::module").1
+        );
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("this test binary"));
+        child
+            .args(["--exact", &test, "--nocapture"])
+            .env(CHILD, if flag { "flag" } else { "none" })
+            .env_remove("PUNKTFUNK_SEAT_ID");
+        let mut digits = combination / 2;
+        let mut set = [false; 5];
+        for (at, (name, on, near_miss)) in VARS.iter().enumerate() {
+            match digits % 3 {
+                0 => child.env_remove(name),
+                1 => child.env(name, on),
+                _ => child.env(name, near_miss),
+            };
+            set[at] = digits % 3 == 1;
+            digits /= 3;
+        }
+        set[3] |= flag;
+        let inputs: String = "SOHDP"
+            .chars()
+            .zip(set)
+            .map(|(letter, on)| if on { letter } else { '-' })
+            .collect();
+        let row = TRUTH.iter().find(|(row, _)| *row == inputs);
+        let out = child.output().expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let got = stdout.split(MARK).nth(1).and_then(|rest| rest.get(..7));
+        assert_eq!(
+            got,
+            row.map(|(_, answers)| *answers),
+            "{inputs}, combination {combination}"
+        );
+    }
+
     #[test]
     fn seat_ids_reject_unsafe_marker_and_log_text() {
         for raw in [
