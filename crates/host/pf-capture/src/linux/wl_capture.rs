@@ -595,6 +595,26 @@ pub(crate) fn output_is_hdr10(output_name: &str) -> Option<bool> {
     Some(color.is_hdr10())
 }
 
+/// Whether the compositor advertises every global an HDR capture binds in [`open`]. No
+/// `wp_color_manager_v1` is the usual miss: Hyprland drops it under `render:cm_enabled = false`.
+pub(crate) fn hdr_capture_globals() -> bool {
+    let probe = || {
+        let conn = wayland_connect().ok()?;
+        let mut queue = conn.new_event_queue();
+        let qh = queue.handle();
+        let _registry = conn.display().get_registry(&qh, ());
+        let mut st = new_state().ok()?;
+        queue.roundtrip(&mut st).ok()?;
+        let (capture, colour) = (
+            st.source_mgr.is_some() && st.capture_mgr.is_some() && st.linux_dmabuf.is_some(),
+            st.color_mgr.is_some(),
+        );
+        tracing::debug!(capture, colour, "direct HDR capture globals");
+        Some(capture && colour)
+    };
+    probe().unwrap_or(false)
+}
+
 /// Pick the format to allocate, and the modifiers to allocate it with.
 ///
 /// Preference is the encoder's, not ours: `want` is what the consumer imports today.

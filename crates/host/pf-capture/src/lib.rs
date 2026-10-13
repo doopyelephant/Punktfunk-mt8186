@@ -794,6 +794,14 @@ pub fn output_hdr(output_name: &str) -> Option<bool> {
     linux::output_is_hdr10(output_name)
 }
 
+/// Whether the compositor advertises every global [`open_direct_output`] binds for an HDR
+/// capture: the capture protocol, dmabuf, and `wp_color_management_v1`. Answerable before
+/// the output exists, so the handshake can ask.
+#[cfg(target_os = "linux")]
+pub fn direct_hdr_globals() -> bool {
+    linux::hdr_capture_globals()
+}
+
 /// Windows IDD direct-push capturer on a pf-vdisplay target. `sender` delivers
 /// the sealed frame channel. On failure `keepalive` is handed back so the
 /// caller can retire the display.

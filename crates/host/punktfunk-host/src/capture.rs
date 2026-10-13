@@ -361,6 +361,9 @@ pub fn capturer_supports_hdr_for(
 /// `wp_color_management_v1` description); a Hyprland headless output is created in HDR
 /// by its backend. Needs an encoder that reads packed 10-bit RGB off a dmabuf, and no
 /// virtual-output latch from a rule or offer that did not take.
+///
+/// The compositor must advertise the globals an HDR capture binds: the portal a failed
+/// open falls back to is SDR, and the client already renders by the Welcome's colour.
 #[cfg(target_os = "linux")]
 fn direct_capture_hdr(compositor: crate::vdisplay::Compositor) -> bool {
     if !pf_capture::direct_capture()
@@ -371,7 +374,7 @@ fn direct_capture_hdr(compositor: crate::vdisplay::Compositor) -> bool {
     let ingests_rgb10 = crate::encode::linux_zero_copy_is_vaapi()
         || pf_encode::linux_hdr_cuda_ok()
         || pf_encode::linux_nvenc_raw_dmabuf_ok();
-    if !ingests_rgb10 {
+    if !ingests_rgb10 || !pf_capture::direct_hdr_globals() {
         return false;
     }
     match pf_vdisplay::capture_monitor() {
