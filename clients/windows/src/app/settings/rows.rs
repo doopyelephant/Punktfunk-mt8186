@@ -31,7 +31,7 @@ rows! {
 
     RESOLUTION: "resolution", "Resolution", "display", false;
     REFRESH: "refresh_hz", "Refresh rate", "display", false;
-    BITRATE: "bitrate_kbps", "Bitrate (Mb/s, 0 = automatic)", "display", false;
+    BITRATE: "bitrate_kbps", "Bitrate", "display", false;
     VIDEO_FIT: "video_fit", "Picture fit", "display", false;
     HDR: "hdr_enabled", "10-bit HDR", "display", false;
     PRESENT: "present_priority", "Prioritize", "display", false;

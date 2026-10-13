@@ -440,8 +440,8 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
             cx,
             &rows::BITRATE,
             bitrate_box,
-            "0 lets the host decide (its default, clamped to what it supports). A host \
-             card\u{2019}s context menu has a network speed test.",
+            "In Mb/s. 0 lets the host decide (its default, clamped to what it supports). A \
+             host card\u{2019}s context menu has a network speed test.",
         ));
     }
     picture.extend([
