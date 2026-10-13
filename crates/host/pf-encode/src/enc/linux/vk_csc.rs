@@ -7,6 +7,7 @@
 use crate::vk_util::{color_range, make_host_buffer, make_plain_image};
 use anyhow::Result;
 use ash::vk;
+use pf_zerocopy::vkdev::MappedMemory;
 
 /// Cursor overlay cap (px). The CSC shader bounds sampling by push constant, so one allocation
 /// fits every pointer bitmap; a larger one uploads its top-left corner.
@@ -109,15 +110,10 @@ impl CursorPlane {
                 let ch = c.h.min(CURSOR_MAX);
                 if self.serial != c.serial {
                     let px = if pq { c.pq_rgba() } else { c.rgba.clone() };
-                    let bytes = (cw as usize) * (ch as usize) * 4;
-                    let ptr = dev.map_memory(
-                        self.stage_mem,
-                        0,
-                        bytes as u64,
-                        vk::MemoryMapFlags::empty(),
-                    )?;
-                    std::ptr::copy_nonoverlapping(px.as_ptr(), ptr as *mut u8, bytes.min(px.len()));
-                    dev.unmap_memory(self.stage_mem);
+                    let n = ((cw as usize) * (ch as usize) * 4).min(px.len());
+                    // The plane's staging memory: host-visible, `CURSOR_MAX`² × 4 bytes, mapped
+                    // only here.
+                    MappedMemory::map(dev, self.stage_mem, n)?.copy_from_slice(&px[..n]);
                     let old = if self.ready {
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                     } else {

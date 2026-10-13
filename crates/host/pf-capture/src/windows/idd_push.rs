@@ -14,7 +14,7 @@ use crate::cursor_witness::CursorWitness;
 use anyhow::{bail, Context, Result};
 use pf_win_display::open_wudfhost;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::{w, PCWSTR};
@@ -95,11 +95,14 @@ pub(super) fn flow_watch() -> bool {
     })
 }
 
-/// File mapping + mapped view. Drop unmaps, then [`OwnedHandle`] closes.
-/// Borrowers hold the pointer, so declare this before whatever borrows it.
+/// A file mapping and its view of `len` bytes. Drop unmaps, then [`OwnedHandle`] closes.
+///
+/// The driver writes the same bytes, so this side reaches them only through the accessors:
+/// each checks its range and reads or writes an atomic. Every accessor panics out of range.
 struct MappedSection {
     handle: OwnedHandle,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
+    len: usize,
 }
 
 // SAFETY: `!Send` only through the view pointer. The mapping is process-wide, so its one
@@ -108,9 +111,69 @@ struct MappedSection {
 unsafe impl Send for MappedSection {}
 
 impl MappedSection {
-    /// View base; valid only while this section lives.
-    fn ptr<T>(&self) -> *mut T {
-        self.view.Value as *mut T
+    /// A pagefile-backed section of `len` bytes, mapped read/write. Windows hands its pages
+    /// over zeroed. `sa` is its DACL; `None` takes the process default.
+    fn create(len: usize, sa: Option<&open::SharedObjectSa>, what: &str) -> Result<Self> {
+        let size = u32::try_from(len).with_context(|| format!("size the {what} section"))?;
+        // SAFETY: `sa` outlives the call, and the handle it returns is new and owned from here.
+        let handle = unsafe {
+            let map = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                sa.map(open::SharedObjectSa::as_ptr),
+                PAGE_READWRITE,
+                0,
+                size,
+                PCWSTR::null(),
+            )
+            .with_context(|| format!("create the {what} section"))?;
+            OwnedHandle::from_raw_handle(map.0 as _)
+        };
+        // SAFETY: a live section handle of `len` bytes; a refused map returns null.
+        let view = unsafe {
+            MapViewOfFile(
+                HANDLE(handle.as_raw_handle()),
+                FILE_MAP_ALL_ACCESS,
+                0,
+                0,
+                len,
+            )
+        };
+        if view.Value.is_null() {
+            return Err(windows::core::Error::from_thread())
+                .with_context(|| format!("map the {what} section"));
+        }
+        Ok(Self { handle, view, len })
+    }
+
+    /// The 4-aligned word at `off`, as the atomic both sides treat it as.
+    fn word32(&self, off: usize) -> &AtomicU32 {
+        assert!(
+            off % 4 == 0 && off.checked_add(4).is_some_and(|end| end <= self.len),
+            "section word {off} out of bounds"
+        );
+        // SAFETY: an aligned word inside the live, page-aligned view; any bits are a `u32`.
+        unsafe { &*self.view.Value.cast::<u8>().add(off).cast::<AtomicU32>() }
+    }
+
+    /// Copy `dst.len()` bytes out from `off`. The driver may be writing them: the caller's
+    /// sequence check decides whether the copy is whole.
+    fn read_bytes(&self, off: usize, dst: &mut [u8]) {
+        assert!(
+            off.checked_add(dst.len())
+                .is_some_and(|end| end <= self.len),
+            "section range {off}+{} out of bounds",
+            dst.len()
+        );
+        for (i, byte) in dst.iter_mut().enumerate() {
+            // SAFETY: a byte inside the live view, read as the atomic it is.
+            let shared = unsafe { &*self.view.Value.cast::<AtomicU8>().add(off + i) };
+            *byte = shared.load(Ordering::Relaxed);
+        }
+    }
+
+    /// Base and length, for a reader that checks its own offsets against them.
+    fn raw(&self) -> (*mut u8, usize) {
+        (self.view.Value.cast(), self.len)
     }
 }
 

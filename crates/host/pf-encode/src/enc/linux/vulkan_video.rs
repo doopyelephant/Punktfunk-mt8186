@@ -26,6 +26,7 @@ use crate::{Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, ensure, Context, Result};
 use ash::vk;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
+use pf_zerocopy::vkdev::MappedMemory;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::os::fd::AsFd;
@@ -1968,7 +1969,6 @@ impl VulkanVideoEncoder {
         // RGB-direct uploads the image the encoder reads, so an undersized source must be
         // padded (edge duplicate). CSC keeps the raw copy (shader clamps). Guards below must
         // not be hoisted — they are only sound because `self.rgb.is_some()`.
-        // Every fallible step stays above the map: an error between map and unmap strands it.
         let pad = if self.rgb.is_some() && (src_w != w || src_h != h) {
             let (sw, sh) = (src_w as usize, src_h as usize);
             // Zero axis makes `sh - 1` underflow. Refuse by name so the padding write is infallible.
@@ -1997,9 +1997,8 @@ impl VulkanVideoEncoder {
                     bytes.len()
                 );
             }
-            // Slice is sized from `(w, h)` while staging is sized from `need`. Check equality
-            // above the map in release: a failed assert below the map would strand the mapping
-            // (`VUID-vkMapMemory-memory-00678` on the next `map_memory`).
+            // The rows below index by `(w, h)` while staging is sized from `need`: refuse a
+            // mismatch by name, not as a panic in the row copy.
             let dst_len = (w as usize)
                 .checked_mul(h as usize)
                 .and_then(|n| n.checked_mul(4))
@@ -2009,14 +2008,13 @@ impl VulkanVideoEncoder {
         } else {
             None
         };
-        let p = dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
+        let len = pad.map_or(bytes.len().min(need as usize), |(_, _, dst_len)| dst_len);
+        // The slot's staging memory: host-visible, kept only when at least `need` bytes, and
+        // mapped only here. HOST_COHERENT, so no explicit flush.
+        let mut dst = MappedMemory::map(&dev, m, len)?;
         match pad {
-            Some((sw, sh, dst_len)) => {
+            Some((sw, sh, _)) => {
                 let (dw, dh) = (w as usize, h as usize);
-                // SAFETY: `dst_len == dw * dh * 4 == need`, checked above the map; staging is
-                // kept only when size >= `need`. HOST_COHERENT so no explicit flush. Guards
-                // above make every index in-bounds.
-                let dst = std::slice::from_raw_parts_mut(p, dst_len);
                 for y in 0..dh {
                     let sy = y.min(sh - 1);
                     let srow = &bytes[sy * sw * 4..][..sw * 4];
@@ -2029,12 +2027,8 @@ impl VulkanVideoEncoder {
                     }
                 }
             }
-            None => {
-                let n = bytes.len().min(need as usize);
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, n);
-            }
+            None => dst.copy_from_slice(&bytes[..len]),
         }
-        dev.unmap_memory(m);
         Ok(self.frames[slot].cpu_img.unwrap().2)
     }
 

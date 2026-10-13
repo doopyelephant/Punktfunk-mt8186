@@ -647,6 +647,7 @@ impl Drop for PyroWaveEncoder {
 mod tests {
     use super::*;
     use crate::pyrowave_ffi::oracle;
+    use pf_frame::d3d11_map::MappedSubresource;
     use pf_frame::dxgi::{D3d11Frame, PyroFrameShare};
     use pf_frame::PixelFormat;
     use windows::Win32::Foundation::HMODULE;
@@ -654,9 +655,9 @@ mod tests {
     use windows::Win32::Graphics::Direct3D11::{
         D3D11CreateDevice, ID3D11Device, ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext4,
         ID3D11Fence, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_WRITE,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FENCE_FLAG_SHARED, D3D11_MAPPED_SUBRESOURCE,
-        D3D11_MAP_WRITE, D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
-        D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FENCE_FLAG_SHARED, D3D11_MAP_WRITE,
+        D3D11_RESOURCE_MISC_SHARED, D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
+        D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_FORMAT, DXGI_FORMAT_R16G16_UNORM, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R8G8_UNORM,
@@ -667,7 +668,7 @@ mod tests {
     /// Same SHARED|SHARED_NTHANDLE + RENDER_TARGET flags as the capturer out-ring.
     ///
     /// # Safety
-    /// `bytes.len() == bpp`; `device`/`context` are live.
+    /// `context` is `device`'s immediate context. `bytes` is one texel, `bpp` long.
     unsafe fn make_plane(
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
@@ -707,21 +708,16 @@ mod tests {
             .CreateTexture2D(&desc, None, Some(&mut staging))
             .expect("CreateTexture2D(plane staging)");
         let staging = staging.unwrap();
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        context
-            .Map(&staging, 0, D3D11_MAP_WRITE, 0, Some(&mut mapped))
-            .expect("Map(plane staging)");
-        let pitch = mapped.RowPitch as usize;
-        let base = mapped.pData as *mut u8;
-        for row in 0..(h as usize) {
-            let r = base.add(row * pitch);
-            for x in 0..(w as usize) {
-                for (b, &v) in bytes.iter().enumerate() {
-                    *r.add(x * bpp + b) = v;
+        {
+            let mut mapped = MappedSubresource::texture(context, &staging, D3D11_MAP_WRITE)
+                .expect("Map(plane staging)");
+            let pitch = mapped.row_pitch();
+            for row in mapped.bytes_mut().chunks_mut(pitch) {
+                for texel in row[..w as usize * bpp].chunks_exact_mut(bpp) {
+                    texel.copy_from_slice(bytes);
                 }
             }
         }
-        context.Unmap(&staging, 0);
         context.CopyResource(&tex, &staging);
         tex
     }

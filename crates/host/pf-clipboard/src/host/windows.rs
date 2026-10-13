@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 
-use ::windows::core::{w, PCWSTR};
+use ::windows::core::{w, Owned, PCWSTR};
 use ::windows::Win32::Foundation::{
-    GetLastError, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
+    GetLastError, HANDLE, HGLOBAL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
 };
 use ::windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
@@ -158,12 +158,11 @@ impl WinClip {
             self.clear(hwnd);
             return;
         }
-        if open_clipboard_retry(hwnd).is_err() {
+        let Ok(_open) = open_clipboard_retry(hwnd) else {
             tracing::debug!("clipboard: OpenClipboard for set_offer failed");
             return;
-        }
-        let _guard = ClipboardGuard;
-        // SAFETY: the clipboard is open (ClipboardGuard closes it); EmptyClipboard makes us the owner,
+        };
+        // SAFETY: the clipboard is open until `_open` drops; EmptyClipboard makes us the owner,
         // then each SetClipboardData(_, None) registers a delayed-render promise for that format.
         unsafe {
             let _ = EmptyClipboard();
@@ -191,11 +190,10 @@ impl WinClip {
         if owner.0 != hwnd.0 {
             return;
         }
-        if open_clipboard_retry(hwnd).is_err() {
+        let Ok(_open) = open_clipboard_retry(hwnd) else {
             return;
-        }
-        let _guard = ClipboardGuard;
-        // SAFETY: the clipboard is open (ClipboardGuard closes it); empty it to drop our promises.
+        };
+        // SAFETY: the clipboard is open until `_open` drops; empty it to drop our promises.
         unsafe {
             let _ = EmptyClipboard();
         }
@@ -217,9 +215,8 @@ impl WinClip {
         if unsafe { GetClipboardOwner() }.unwrap_or_default().0 == self.own_hwnd.0 {
             anyhow::bail!("clipboard currently held by our own offer");
         }
-        open_clipboard_retry(self.own_hwnd)?;
-        let _guard = ClipboardGuard;
-        // SAFETY: the clipboard is open (ClipboardGuard closes it). GetClipboardData hands back a
+        let _open = open_clipboard_retry(self.own_hwnd)?;
+        // SAFETY: the clipboard is open until `_open` drops. GetClipboardData hands back a
         // clipboard-owned HGLOBAL (we must NOT free it); GlobalLock/Size/Unlock are balanced and we
         // copy exactly GlobalSize bytes out before the lock is released.
         let raw = unsafe {
@@ -280,16 +277,9 @@ impl WinClip {
         } else {
             convert_to_win(wire, &bytes)
         };
-        let Ok(hg) = alloc_hglobal(&win_bytes) else {
-            return;
-        };
         // Do NOT OpenClipboard here — the pasting app already holds it open across WM_RENDERFORMAT.
-        // SAFETY: `hg` is a freshly-filled moveable HGLOBAL. On success the clipboard takes ownership
-        // (we must not free it); on failure ownership stays with us, so we free it.
-        unsafe {
-            if SetClipboardData(fmt, Some(HANDLE(hg.0))).is_err() {
-                let _ = GlobalFree(Some(hg));
-            }
+        if let Err(e) = publish(fmt, &win_bytes) {
+            tracing::debug!(error = %format!("{e:#}"), "clipboard render was not published");
         }
     }
 
@@ -449,12 +439,12 @@ impl Drop for WindowsClipboard {
     }
 }
 
-/// Pairs with a successful `open_clipboard_retry`; `CloseClipboard` on every exit, including `?`.
+/// The open clipboard. Only [`open_clipboard_retry`] makes one, and dropping it closes.
 struct ClipboardGuard;
 
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
-        // SAFETY: constructed only after a successful OpenClipboard on this thread.
+        // SAFETY: made only by a successful OpenClipboard on this thread.
         unsafe {
             let _ = CloseClipboard();
         }
@@ -471,33 +461,38 @@ fn register_format(name: PCWSTR) -> anyhow::Result<u32> {
     Ok(id)
 }
 
-/// Moveable HGLOBAL. Zero-init so a 0-byte payload still locks; ownership moves on `SetClipboardData`.
-fn alloc_hglobal(bytes: &[u8]) -> anyhow::Result<HGLOBAL> {
-    // SAFETY: allocate at least one byte (GlobalLock of a 0-size block is unreliable), lock it, copy
-    // the payload in, unlock. Alloc/lock/unlock are balanced; on lock failure we free before erroring.
+/// Hand `bytes` to the open clipboard as `fmt`, in a moveable block. The clipboard owns the
+/// block once it takes it; a failure before that frees it here.
+fn publish(fmt: u32, bytes: &[u8]) -> anyhow::Result<()> {
+    // SAFETY: the block is at least one zeroed byte (a 0-size block does not lock reliably) and
+    // `bytes.len()` long otherwise, so the copy fits; lock and unlock are balanced. `block`
+    // frees it on every early return.
     unsafe {
         let hg = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len().max(1))
-            .context("GlobalAlloc")?;
+            .context("allocate the clipboard block")?;
+        let block = Owned::new(hg);
         let p = GlobalLock(hg);
         if p.is_null() {
-            let _ = GlobalFree(Some(hg));
-            anyhow::bail!("GlobalLock failed");
+            anyhow::bail!("lock the clipboard block");
         }
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.cast::<u8>(), bytes.len());
         let _ = GlobalUnlock(hg);
-        Ok(hg)
+        SetClipboardData(fmt, Some(HANDLE(hg.0))).context("hand the block to the clipboard")?;
+        std::mem::forget(block);
+        Ok(())
     }
 }
 
-fn open_clipboard_retry(hwnd: HWND) -> anyhow::Result<()> {
+/// Open the clipboard as `hwnd`, retrying while another application holds it.
+fn open_clipboard_retry(hwnd: HWND) -> anyhow::Result<ClipboardGuard> {
     for _ in 0..OPEN_RETRIES {
-        // SAFETY: OpenClipboard with our window as owner; balanced by ClipboardGuard/CloseClipboard.
+        // SAFETY: OpenClipboard with our window as owner; the guard closes it.
         if unsafe { OpenClipboard(Some(hwnd)) }.is_ok() {
-            return Ok(());
+            return Ok(ClipboardGuard);
         }
         std::thread::sleep(OPEN_RETRY_DELAY);
     }
-    anyhow::bail!("OpenClipboard failed after retries")
+    anyhow::bail!("open the clipboard: still held after {OPEN_RETRIES} tries")
 }
 
 fn convert_from_win(wire: &str, raw: &[u8]) -> Vec<u8> {
@@ -674,5 +669,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         // SAFETY: arguments are the ones Windows delivered for this window.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No clipboard is open on this thread, so the hand-over is refused: the forced failure
+    /// between the allocation and the transfer. The block is freed on the way out.
+    #[test]
+    fn a_block_the_clipboard_refuses_is_an_error() {
+        assert!(publish(CF_UNICODETEXT.0 as u32, b"x").is_err());
     }
 }

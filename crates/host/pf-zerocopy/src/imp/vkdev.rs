@@ -1,9 +1,12 @@
 //! Vulkan helpers the LINEAR bridge ([`super::vulkan`]), the NVENC slot blend
 //! ([`super::vkslot`]) and pf-encode's Vulkan encoders share: the NVIDIA compute device CUDA
-//! runs on, the memory-type pick, and the explicit-modifier dmabuf import.
+//! runs on, the memory-type pick, a memory map held as a borrow, and the explicit-modifier
+//! dmabuf import.
 
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 
 /// NVIDIA's PCI vendor id.
 const NVIDIA: u32 = 0x10DE;
@@ -247,6 +250,67 @@ pub fn memory_type(
                     .contains(flags)
         })
         .ok_or_else(|| anyhow!("no Vulkan memory type with {flags:?} in bits {type_bits:#x}"))
+}
+
+/// Host-visible device memory, mapped from its start. Derefs to the bytes; `vkUnmapMemory`
+/// runs on drop, so no early return strands the mapping.
+pub struct MappedMemory<'a> {
+    device: &'a ash::Device,
+    memory: vk::DeviceMemory,
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+impl<'a> MappedMemory<'a> {
+    /// Map `memory` and view its first `len` bytes.
+    ///
+    /// # Safety
+    /// `memory` is a live, unmapped `HOST_VISIBLE` allocation of `device`, at least `len` bytes.
+    /// Until the guard drops, nothing frees or maps it and no submitted work writes the range.
+    pub unsafe fn map(
+        device: &'a ash::Device,
+        memory: vk::DeviceMemory,
+        len: usize,
+    ) -> ash::prelude::VkResult<Self> {
+        let flags = vk::MemoryMapFlags::empty();
+        // SAFETY: the caller's contract. `WHOLE_SIZE` because Vulkan refuses a zero size.
+        let ptr = unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, flags) }?;
+        let Some(ptr) = NonNull::new(ptr.cast::<u8>()) else {
+            // SAFETY: the map above succeeded.
+            unsafe { device.unmap_memory(memory) };
+            return Err(vk::Result::ERROR_MEMORY_MAP_FAILED);
+        };
+        Ok(Self {
+            device,
+            memory,
+            ptr,
+            len,
+        })
+    }
+}
+
+impl Deref for MappedMemory<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `map`'s caller vouched for `len` mapped bytes that nothing else writes, and
+        // they stay mapped until `drop`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl DerefMut for MappedMemory<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `deref`, and `&mut self` makes this the only view of the bytes.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for MappedMemory<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `self` holds the one mapping of `memory`, which the caller keeps alive.
+        unsafe { self.device.unmap_memory(self.memory) };
+    }
 }
 
 /// A dmabuf to import as a `TYPE_2D` image with an explicit DRM modifier layout.

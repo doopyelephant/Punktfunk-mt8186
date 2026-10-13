@@ -8,7 +8,8 @@
 //! Same seam: [`hdr`] (HDR10 static metadata / SEI, the HDR capture latch),
 //! [`metronome`] (periodic-stall detector), [`pace`] (stream-rate credit and timestamps
 //! for a faster panel), [`thread_qos`], [`session_tuning`], and on Windows [`dxgi`]
-//! (capture identity + D3D11 device) and [`privilege`] (token privileges).
+//! (capture identity + D3D11 device), [`d3d11_map`] (a `Map` as a borrow) and [`privilege`]
+//! (token privileges).
 
 pub mod hdr;
 pub use hdr::HdrMeta;
@@ -19,6 +20,8 @@ pub mod recovery;
 pub mod session_tuning;
 pub mod thread_qos;
 
+#[cfg(target_os = "windows")]
+pub mod d3d11_map;
 #[cfg(target_os = "windows")]
 pub mod dxgi;
 #[cfg(target_os = "windows")]
