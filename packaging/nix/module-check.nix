@@ -354,6 +354,12 @@ let
       );
     }
     {
+      # 78 is the runner refusing to run a plugin unsandboxed. Restarting it every two seconds
+      # would probe the same box and fill the journal; the unit has to stay failed.
+      name = "the plugin runner stays stopped after it refuses a box with no sandbox";
+      ok = has appliance "punktfunk-scripting" "RestartPreventExitStatus=78";
+    }
+    {
       # PrivateTmp is OFF on purpose (the VirtualHere field report: a private /tmp hides
       # /tmp/vhclient and /tmp/.X11-unix, so a plugin cannot reach the daemon it integrates with).
       name = "the plugin runner keeps the real /tmp";

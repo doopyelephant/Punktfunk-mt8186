@@ -31,7 +31,7 @@ import {
 	removePlugins,
 } from "./plugins.js";
 import { discoverUnits } from "./discover.js";
-import { runner, runOneUnit } from "./runner.js";
+import { runner, runnerExitStatus, runOneUnit } from "./runner.js";
 import { redirectUiServe, redirectUiServeToChannel } from "./ui-forward.js";
 
 const arg = (flag: string): string | undefined => {
@@ -237,7 +237,9 @@ const shutdown = (signal: string) => {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-await Effect.runPromise(Fiber.await(fiber));
+const ended = await Effect.runPromise(Fiber.await(fiber));
 await shipper.flush(); // every unit ended on its own — don't leave their last lines unsent
 shipper.stop();
 clearInterval(keepAlive); // …then let the process exit
+// A sandbox refusal leaves with its own status: a supervisor stops on it and does not restart.
+process.exitCode = runnerExitStatus(ended);

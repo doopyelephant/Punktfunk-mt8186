@@ -19,6 +19,7 @@ import {
 	Cause,
 	Duration,
 	Effect,
+	Exit,
 	Fiber,
 	Schedule,
 } from "effect";
@@ -324,41 +325,108 @@ const watchGrantChanges = (
 };
 
 /**
+ * The runner ended at start: the sandbox is on, this box builds none, and a plugin is installed.
+ * Running one without its sandbox is the operator's choice (`PUNKTFUNK_PLUGIN_SANDBOX=off`),
+ * never a fallback.
+ */
+export class SandboxRefused extends Error {}
+
+/**
+ * The exit status for `SandboxRefused`: sysexits' EX_CONFIG. Every supervisor leaves the runner
+ * stopped on it (`RestartPreventExitStatus=` in the systemd unit and the NixOS module, a clean
+ * exit in `scripting-run.cmd`), because a restart would only probe the same box again.
+ */
+export const SANDBOX_REFUSED_EXIT = 78;
+
+/**
+ * Leave the refusal's reason in `plugin-state/runner.refused` for the host's health check, or
+ * remove it once a start gets past the probe. The host can't repeat the probe: it runs outside
+ * this unit's confinement. Best effort, since it is a diagnostic.
+ */
+const noteRefusal = (config: string, reason: string | undefined): void => {
+	const file = path.join(config, "plugin-state", "runner.refused");
+	try {
+		if (reason === undefined) fs.rmSync(file, { force: true });
+		else {
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, `${reason}\n`);
+		}
+	} catch {
+		// The exit status and the log still say it.
+	}
+};
+
+/**
+ * This start's verdict with the sandbox on: the refusal when a plugin is installed and this box
+ * builds no sandbox, else nothing. With no plugin installed there is nothing to refuse. Logs
+ * either answer once and keeps `runner.refused` in step.
+ */
+const sandboxRefusal = (
+	found: Unit[],
+	config: string,
+	options: RunnerOptions,
+	log: LogSink,
+): SandboxRefused | undefined => {
+	const probe = (options.sandboxProbe ?? sandboxProbe)();
+	const plugins = found.filter((unit) => unit.manifest).map((unit) => unit.name);
+	if (probe.ok || plugins.length === 0) {
+		noteRefusal(config, undefined);
+		if (!probe.ok) {
+			log(
+				`[runner] plugins can't be sandboxed here: ${probe.reason} — none would start, so scripts still run`,
+				"warn",
+			);
+		}
+		return undefined;
+	}
+	noteRefusal(config, probe.reason);
+	log(`[runner] plugins can't be sandboxed here: ${probe.reason}`, "error");
+	log(
+		`[runner] stopping instead of running ${plugins.join(", ")} unsandboxed — repair the sandbox and start the runner again, or set PUNKTFUNK_PLUGIN_SANDBOX=off to accept that`,
+		"error",
+	);
+	return new SandboxRefused(probe.reason);
+};
+
+/** The process exit status for how `runner` ended. */
+export const runnerExitStatus = (exit: Exit.Exit<void, SandboxRefused>): number =>
+	Exit.isFailure(exit) && Cause.squash(exit.cause) instanceof SandboxRefused
+		? SANDBOX_REFUSED_EXIT
+		: 0;
+
+/**
  * Discover and supervise every unit until interrupted. Sandboxed units are tracked separately:
  * a grants-file poll compares their effective roots and restarts only the plugin whose roots
  * changed. Every supervisor and the poller share this scope, so shutdown interrupts all of them
  * and runs their finalizers.
+ *
+ * Fails with `SandboxRefused` before anything starts when a plugin is installed and this box
+ * builds no sandbox. With no plugin installed there is nothing to refuse, and scripts run.
  */
-export const runner = (options: RunnerOptions = {}): Effect.Effect<void> => {
+export const runner = (
+	options: RunnerOptions = {},
+): Effect.Effect<void, SandboxRefused> => {
 	const log = options.log ?? defaultLog;
 	return Effect.scoped(
 		Effect.gen(function* () {
 			// bwrap is the Linux sandbox, an AppContainer the Windows one; macOS has neither.
 			const confines = process.platform === "linux" || process.platform === "win32";
 			const sandbox = options.sandbox ?? (confines ? sandboxMode() : "off");
-			let capable = true;
 			if (sandbox === "off" && confines) {
 				log(
 					"[runner] PUNKTFUNK_PLUGIN_SANDBOX=off — plugins run with the runner's whole access",
 					"warn",
 				);
-			} else if (sandbox === "on") {
-				const probe = (options.sandboxProbe ?? sandboxProbe)();
-				capable = probe.ok;
-				if (!probe.ok) {
-					log(`[runner] plugins cannot be sandboxed: ${probe.reason}`, "error");
-					log("[runner] refusing to run plugins unsandboxed — set PUNKTFUNK_PLUGIN_SANDBOX=off to accept that", "error");
-				}
 			}
-			// A package runs in a sandbox built from its manifest. With no manifest, or on a box that
-			// builds no sandbox, it is never started: an attempt would only fail and back off forever.
-			const units = discoverUnits(options, log).filter((unit) => {
-				if (sandbox === "off" || !unit.packageDir) return true;
-				if (unit.manifest && capable) return true;
+			const config = options.configDir ?? configDir();
+			const found = discoverUnits(options, log);
+			const refused = sandbox === "on" ? sandboxRefusal(found, config, options, log) : undefined;
+			if (refused) return yield* Effect.fail(refused);
+			// A package with no manifest has nothing to build its sandbox from, so it does not run.
+			const units = found.filter((unit) => {
+				if (sandbox === "off" || !unit.packageDir || unit.manifest) return true;
 				log(
-					unit.manifest
-						? `[runner] not starting ${unit.name}: it can't be sandboxed on this box`
-						: `[runner] not starting ${unit.name}: no punktfunk manifest to sandbox it with — update the plugin`,
+					`[runner] not starting ${unit.name}: no punktfunk manifest to sandbox it with — update the plugin`,
 					"error",
 				);
 				return false;
@@ -369,7 +437,6 @@ export const runner = (options: RunnerOptions = {}): Effect.Effect<void> => {
 				);
 			}
 
-			const config = options.configDir ?? configDir();
 			const supervised = { ...options, sandbox };
 			const fibers = new Map<string, Fiber.Fiber<void, never>>();
 			for (const unit of units) {
