@@ -1,23 +1,21 @@
 //! Host-side capture through a capture worker: a monitor the host did not create, captured
 //! with Windows Graphics Capture and encoded in a process that runs as the signed-in user.
 //!
-//! [`WorkerLink`] is the host's end of one worker: its process handle and the two pipes of
-//! [`pf_driver_proto::worker`]. [`WgcCapturer`] is pixel-less like the IDD-push capturer — the
-//! worker owns the pixels and the encoder, and publishes into the same AU section the driver
-//! does, so [`open_worker_encoder`] hands the stream loop the same proxy.
+//! [`WorkerLink`] is the host's end of one worker: its process handle, and the two pipes of
+//! [`pf_driver_proto::worker`] behind a [`Link`], which checks and bounds everything the
+//! worker sends. [`WgcCapturer`] is pixel-less like the IDD-push capturer — the worker owns
+//! the pixels and the encoder, and publishes into the same AU section the driver does, so
+//! [`open_worker_encoder`] hands the stream loop the same proxy.
 //!
-//! The worker is less privileged than this process. Every reply is checked before use, a
-//! worker that answers late or wrongly is ended, and nothing it sends is waited on without a
-//! bound. Evidence: `design/windows-wgc-capture.md` §4.3, §4.7, §4.13.
+//! Evidence: `design/windows-wgc-capture.md` §4.3, §4.7, §4.13.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use bytemuck::Pod;
 use pf_driver_proto::encode as wire;
 use pf_driver_proto::worker::{self as proto, kind};
@@ -31,6 +29,7 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::idd_push::driver_encode::{open_remote_encoder, DriverEncodeParams, HandleTarget};
+use crate::worker_link::{Link, Message, Peer};
 use crate::{CapturedFrame, Capturer, EncodeCtlSender, FramePayload, PixelFormat, SetEncodeSender};
 
 /// How long the worker has to say hello. A process's first lines of `main`.
@@ -49,12 +48,6 @@ const MAX_SIDE: u32 = 16_384;
 /// A source with no new frame for this long reads as idle on the health surface.
 const IDLE_AFTER: Duration = Duration::from_secs(2);
 
-type Message = (proto::Frame, Vec<u8>);
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// A started capture worker, as whoever spawned it hands it over.
 pub struct WorkerProcess {
     /// The process, with the rights its creator holds: duplicate into, wait on, end.
@@ -68,41 +61,38 @@ pub struct WorkerProcess {
     pub log: File,
 }
 
+/// The worker's process, with the rights its creator holds: duplicate into, wait on, end.
+struct Process(OwnedHandle);
+
+impl Process {
+    fn handle(&self) -> HANDLE {
+        HANDLE(self.0.as_raw_handle())
+    }
+}
+
+impl Peer for Process {
+    fn kill(&self) {
+        // SAFETY: the handle is live while `self` is, with the terminate right its creator
+        // holds.
+        let _ = unsafe { TerminateProcess(self.handle(), 1) };
+    }
+
+    fn exit_code(&self) -> Option<u32> {
+        let mut code = 0u32;
+        // SAFETY: the handle is live while `self` is, for both calls; `code` a live out-param.
+        unsafe {
+            (WaitForSingleObject(self.handle(), 0) == WAIT_OBJECT_0
+                && GetExitCodeProcess(self.handle(), &mut code).is_ok())
+            .then_some(code)
+        }
+    }
+}
+
 /// The host's end of one capture worker. Dropping the last reference closes the request pipe,
 /// which is how a worker is told to exit; one that does not is ended.
 pub struct WorkerLink {
-    process: OwnedHandle,
+    link: Link<Process, File>,
     pid: u32,
-    /// The request pipe and the last sequence sent; `None` once closed. Held across a whole
-    /// round trip, so one request is in flight at a time.
-    requests: Mutex<Option<(File, u32)>>,
-    replies: Mutex<Receiver<Message>>,
-    events: Mutex<Receiver<Message>>,
-}
-
-/// Read whole messages off the worker's pipe until it closes or sends something that is not
-/// one. Both queues are bounded: a worker that floods loses messages, not the host its memory.
-fn pump(mut pipe: File, replies: SyncSender<Message>, events: SyncSender<Message>) {
-    loop {
-        let mut head = [0u8; 16];
-        if pipe.read_exact(&mut head).is_err() {
-            return;
-        }
-        let frame = match proto::header(&head) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(error = ?e, "capture worker sent no message header");
-                return;
-            }
-        };
-        let mut body = vec![0u8; frame.len as usize];
-        if pipe.read_exact(&mut body).is_err() {
-            return;
-        }
-        let answer = frame.kind & proto::REPLY != 0 || frame.kind == kind::HELLO;
-        let queue = if answer { &replies } else { &events };
-        let _ = queue.try_send((frame, body));
-    }
 }
 
 /// The worker's stderr into this process's log, a line at a time and a bounded line at that.
@@ -125,33 +115,14 @@ impl WorkerLink {
     /// Take over a started worker: pump its pipes and trade hellos. A worker of another
     /// build is ended here.
     pub fn start(worker: WorkerProcess) -> Result<Arc<Self>> {
-        let (reply_tx, reply_rx) = sync_channel(8);
-        let (event_tx, event_rx) = sync_channel(64);
-        let (replies, log, pid) = (worker.replies, worker.log, worker.pid);
-        std::thread::Builder::new()
-            .name("pf-cw-replies".into())
-            .spawn(move || pump(replies, reply_tx, event_tx))
-            .context("spawn the capture worker reply thread")?;
+        let (log, pid) = (worker.log, worker.pid);
+        let link = Link::open(Process(worker.process), worker.requests, worker.replies)?;
         std::thread::Builder::new()
             .name("pf-cw-log".into())
             .spawn(move || relay(log, pid))
             .context("spawn the capture worker log thread")?;
-        let link = Arc::new(Self {
-            process: worker.process,
-            pid,
-            requests: Mutex::new(Some((worker.requests, 0))),
-            replies: Mutex::new(reply_rx),
-            events: Mutex::new(event_rx),
-        });
-        let ours = proto::Hello::new(env!("CARGO_PKG_VERSION"));
-        let theirs: proto::Hello = link.request(kind::HELLO, &ours, HELLO_BOUND)?;
-        if theirs != ours {
-            link.kill();
-            bail!(
-                "capture worker is another build ({:?})",
-                String::from_utf8_lossy(&theirs.build).trim_end_matches('\0')
-            );
-        }
+        let link = Arc::new(Self { link, pid });
+        link.link.hello(HELLO_BOUND)?;
         Ok(link)
     }
 
@@ -160,25 +131,17 @@ impl WorkerLink {
     }
 
     fn process(&self) -> HANDLE {
-        HANDLE(self.process.as_raw_handle())
+        self.link.peer().handle()
     }
 
     /// The worker's exit code once it has exited.
     pub fn exit_code(&self) -> Option<u32> {
-        let mut code = 0u32;
-        // SAFETY: `process` is this link's live handle for both calls; `code` a live out-param.
-        unsafe {
-            (WaitForSingleObject(self.process(), 0) == WAIT_OBJECT_0
-                && GetExitCodeProcess(self.process(), &mut code).is_ok())
-            .then_some(code)
-        }
+        self.link.peer().exit_code()
     }
 
     /// End the worker now. It holds no state of ours: a session starts another.
     fn kill(&self) {
-        // SAFETY: `process` is this link's live handle, with the terminate right its creator
-        // holds.
-        let _ = unsafe { TerminateProcess(self.process(), 1) };
+        self.link.peer().kill();
     }
 
     /// Raise the worker's GPU scheduling class from outside: the user's token cannot.
@@ -187,58 +150,20 @@ impl WorkerLink {
         unsafe { pf_frame::dxgi::elevate_gpu_priority_of(self.process(), "capture worker") };
     }
 
-    /// Send one request and wait `bound` for its reply. A hello is answered by a hello and is
-    /// unnumbered on both sides. A worker that does not answer, or answers with the wrong
-    /// bytes, is ended.
+    /// [`Link::request`]: one request, its reply within `bound`, or the worker is ended.
     fn request<Q: Pod, R: Pod>(&self, op: u32, body: &Q, bound: Duration) -> Result<R> {
-        let mut requests = lock(&self.requests);
-        let Some((pipe, last)) = requests.as_mut() else {
-            bail!("capture worker is closed");
-        };
-        let (answer, seq) = if op == kind::HELLO {
-            (kind::HELLO, 0)
-        } else {
-            // `0` is an event's sequence.
-            *last = last.wrapping_add(1).max(1);
-            (op | proto::REPLY, *last)
-        };
-        if let Err(e) = pipe.write_all(&proto::encode(op, seq, body)) {
-            self.kill();
-            return Err(e).context("write to the capture worker");
-        }
-        let replies = lock(&self.replies);
-        let deadline = Instant::now() + bound;
-        loop {
-            match replies.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok((frame, bytes)) if frame.kind == answer && frame.seq == seq => {
-                    return proto::body(&bytes).ok_or_else(|| {
-                        self.kill();
-                        anyhow!("capture worker answered {op:#x} with {} bytes", bytes.len())
-                    });
-                }
-                // The answer to a request nobody waits for any more.
-                Ok(_) => {}
-                Err(RecvTimeoutError::Timeout) => {
-                    self.kill();
-                    bail!("capture worker did not answer {op:#x} within {bound:?}");
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    bail!("capture worker exited (code {:?})", self.exit_code())
-                }
-            }
-        }
+        self.link.request(op, body, bound)
     }
 
     /// The next event the worker sent, if any.
     fn event(&self) -> Option<Message> {
-        lock(&self.events).try_recv().ok()
+        self.link.event()
     }
 }
 
 impl Drop for WorkerLink {
     fn drop(&mut self) {
-        // The worker exits when its request pipe closes.
-        drop(lock(&self.requests).take());
+        self.link.close();
         // SAFETY: `process` is this link's live handle; a bounded wait only reads its state.
         let exited = unsafe {
             WaitForSingleObject(self.process(), EXIT_BOUND.as_millis() as u32) == WAIT_OBJECT_0
