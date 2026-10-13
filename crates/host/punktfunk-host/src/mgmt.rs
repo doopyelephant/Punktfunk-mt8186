@@ -45,10 +45,10 @@ mod host;
 mod library;
 mod native;
 #[cfg(windows)]
-pub(crate) mod pipes;
+mod pipes;
 mod plugin_access;
-pub(crate) mod plugin_channel;
-pub(crate) mod plugins;
+mod plugin_channel;
+mod plugins;
 mod profiles;
 mod session;
 mod settings;
