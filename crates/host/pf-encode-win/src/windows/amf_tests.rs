@@ -1181,9 +1181,10 @@ fn amf_sdr10_encode_live_smoke() {
 #[test]
 fn videoconverter_bgra_to_p010_bt709_live() {
     use crate::convert::VideoConverter;
+    use pf_frame::d3d11_map::MappedSubresource;
     use windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
-        D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SUBRESOURCE_DATA, D3D11_USAGE_STAGING,
+        D3D11_MAP_READ, D3D11_SUBRESOURCE_DATA, D3D11_USAGE_STAGING,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
     let Some(device) = amd_d3d11_device() else {
@@ -1250,18 +1251,12 @@ fn videoconverter_bgra_to_p010_bt709_live() {
     // SAFETY: as above.
     unsafe { device.CreateTexture2D(&stag_desc, None, Some(&mut stag)) }.expect("staging P010");
     let stag = stag.expect("staging P010");
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     // SAFETY: `stag` and `p010` are live same-device textures; `ctx` is their immediate context.
-    // `Map` fills `mapped`; `Unmap` releases it before the function returns.
-    let y10 = unsafe {
-        ctx.CopyResource(&stag, &p010);
-        ctx.Map(&stag, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            .expect("map staging");
-        // P010 Y plane: row 0, first 16-bit sample; the 10-bit code sits in the high bits.
-        let sample = *(mapped.pData as *const u16);
-        ctx.Unmap(&stag, 0);
-        sample >> 6
-    };
+    unsafe { ctx.CopyResource(&stag, &p010) };
+    let mapped = MappedSubresource::texture(&ctx, &stag, D3D11_MAP_READ).expect("map staging");
+    // P010 Y plane: row 0, first 16-bit sample; the 10-bit code sits in the high bits.
+    let y10 = u16::from_le_bytes([mapped[0], mapped[1]]) >> 6;
+    drop(mapped);
     eprintln!("VideoConverter BGRA(128)->P010 on AMD: Y10={y10} (expect ~504 studio grey)");
     assert!(
         (400..=620).contains(&y10),

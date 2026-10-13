@@ -9,12 +9,13 @@
 
 use super::*;
 use crate::convert::{HdrP010Converter, VideoConverter};
+use pf_frame::d3d11_map::MappedSubresource;
 use std::path::Path;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ,
+    D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_FORMAT_P010,
@@ -591,29 +592,16 @@ fn read_p010(
         MiscFlags: 0,
     };
     let mut stage = None;
-    // SAFETY: a complete staging description; the copy and map run on the device's own
-    // immediate context, and every read stays inside the mapped rows (CbCr at RowPitch × h).
-    unsafe {
-        device
-            .CreateTexture2D(&desc, None, Some(&mut stage))
-            .expect("staging");
-        let stage: ID3D11Texture2D = stage.expect("staging");
-        ctx.CopyResource(&stage, tex);
-        let mut m = D3D11_MAPPED_SUBRESOURCE::default();
-        ctx.Map(&stage, 0, D3D11_MAP_READ, 0, Some(&mut m))
-            .expect("map");
-        let mut out = Vec::with_capacity((w * h * 3 / 2) as usize);
-        for row in 0..h + h / 2 {
-            let p = (m.pData as *const u8).add((row * m.RowPitch) as usize) as *const u16;
-            out.extend(
-                std::slice::from_raw_parts(p, w as usize)
-                    .iter()
-                    .map(|v| v >> 6),
-            );
-        }
-        ctx.Unmap(&stage, 0);
-        out
-    }
+    // SAFETY: a complete staging description and a live out-param.
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut stage)) }.expect("staging");
+    let stage: ID3D11Texture2D = stage.expect("staging");
+    // SAFETY: both textures belong to `device`, whose immediate context `ctx` is.
+    unsafe { ctx.CopyResource(&stage, tex) };
+    let m = MappedSubresource::texture(ctx, &stage, D3D11_MAP_READ).expect("map");
+    m.chunks(m.row_pitch())
+        .flat_map(|row| row[..2 * w as usize].chunks_exact(2))
+        .map(|v| u16::from_le_bytes([v[0], v[1]]) >> 6)
+        .collect()
 }
 
 /// G5: the video processor's FP16 scRGB → P010 PQ against the shader's, bar by bar. With

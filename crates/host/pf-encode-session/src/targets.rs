@@ -692,6 +692,7 @@ impl Drop for Targets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pf_frame::d3d11_map::MappedSubresource;
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 
@@ -742,25 +743,16 @@ mod tests {
             MiscFlags: 0,
         };
         let mut stage: Option<Tex> = None;
-        // SAFETY: `desc` is a fully-initialized local and `stage` a valid out-param; the copy and
-        // the map below run on the same immediate context that owns both textures.
-        unsafe {
-            t.dev
-                .CreateTexture2D(&desc, None, Some(&mut stage))
-                .expect("staging texture");
-            let stage = stage.expect("staging texture");
-            ctx.CopyResource(&stage, &slots[0]);
-            let mut m = d3d::D3D11_MAPPED_SUBRESOURCE::default();
-            ctx.Map(&stage, 0, d3d::D3D11_MAP_READ, 0, Some(&mut m))
-                .expect("map staging");
-            let mut out = Vec::with_capacity((w * h * 4) as usize);
-            for row in 0..h {
-                let src = (m.pData as *const u8).add((row * m.RowPitch) as usize);
-                out.extend_from_slice(core::slice::from_raw_parts(src, (w * 4) as usize));
-            }
-            ctx.Unmap(&stage, 0);
-            out
-        }
+        // SAFETY: `desc` is a fully-initialized local and `stage` a valid out-param.
+        unsafe { t.dev.CreateTexture2D(&desc, None, Some(&mut stage)) }.expect("staging texture");
+        let stage = stage.expect("staging texture");
+        // SAFETY: both textures belong to the device whose immediate context `ctx` is.
+        unsafe { ctx.CopyResource(&stage, &slots[0]) };
+        let m = MappedSubresource::texture(ctx, &stage, d3d::D3D11_MAP_READ).expect("map staging");
+        m.chunks(m.row_pitch())
+            .flat_map(|row| &row[..(w * 4) as usize])
+            .copied()
+            .collect()
     }
 
     fn source(dev: &d3d::ID3D11Device, w: u32, h: u32) -> Tex {

@@ -13,6 +13,7 @@
 
 use anyhow::{bail, Context, Result};
 use pf_encode_win::convert::HdrP010Converter;
+use pf_frame::d3d11_map::MappedSubresource;
 use std::ffi::c_void;
 use windows::core::Interface;
 use windows::Win32::Foundation::HMODULE;
@@ -20,8 +21,8 @@ use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView,
     ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
-    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_P010, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16_UNORM,
@@ -404,28 +405,20 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
         let staging = staging.context("null staging")?;
         context.CopyResource(&staging, &p010);
 
-        let mut map = D3D11_MAPPED_SUBRESOURCE::default();
-        context
-            .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut map))
+        let map = MappedSubresource::texture(&context, &staging, D3D11_MAP_READ)
             .context("Map(P010 staging)")?;
-        let row_pitch = map.RowPitch as usize; // bytes per luma row
-        let base = map.pData as *const u8;
-        // P010: plane 1 starts at RowPitch * luma height (same pitch, no extra
-        // alignment on a STAGING texture). DepthPitch is the whole surface;
-        // drivers omit the chroma offset, so RowPitch*H is the portable read.
+        // Bytes per luma row. P010: plane 1 starts at RowPitch * luma height (same pitch, no
+        // extra alignment on a STAGING texture). DepthPitch is the whole surface; drivers omit
+        // the chroma offset, so RowPitch*H is the portable read.
+        let row_pitch = map.row_pitch();
         tracing::info!(
             row_pitch,
-            depth_pitch = map.DepthPitch,
+            depth_pitch = map.depth_pitch(),
             expected_chroma_base = row_pitch * H as usize,
             expected_total = row_pitch * H as usize * 3 / 2,
             "hdr-p010-selftest: mapped P010 layout (verify chroma plane offset here if chroma is wrong)"
         );
-        let read_u16 = |byte_off: usize| -> u16 {
-            // SAFETY: `base` is the mapped staging pointer; all offsets are within the P010 surface
-            // (luma H*RowPitch + chroma (H/2)*RowPitch ≤ DepthPitch). Already in the fn's unsafe scope.
-            let p = base.add(byte_off) as *const u16;
-            p.read_unaligned()
-        };
+        let read_u16 = |byte_off: usize| u16::from_le_bytes([map[byte_off], map[byte_off + 1]]);
         // Luma codes: stored u16 in the high 10 bits -> code10 = stored >> 6.
         let mut y_codes = vec![0u16; (W * H) as usize];
         for y in 0..H {
@@ -447,7 +440,7 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
                 cr_codes[(cy * cw + cx) as usize] = read_u16(off + 2) >> 6;
             }
         }
-        context.Unmap(&staging, 0);
+        drop(map);
 
         let mut max_y_err = 0.0f64;
         for y in 0..H {

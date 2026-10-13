@@ -11,15 +11,16 @@
 
 use super::{compile_shader, HDR_VS};
 use anyhow::{bail, Context, Result};
+use pf_frame::d3d11_map::MappedSubresource;
 use windows::core::s;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11BlendState, ID3D11Buffer, ID3D11PixelShader, ID3D11SamplerState, ID3D11VertexShader,
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BLEND_DESC, D3D11_BLEND_INV_SRC_ALPHA, D3D11_BLEND_ONE,
     D3D11_BLEND_OP_ADD, D3D11_BLEND_SRC_ALPHA, D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER,
-    D3D11_CPU_ACCESS_WRITE, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAPPED_SUBRESOURCE,
-    D3D11_MAP_WRITE_DISCARD, D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC,
-    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
+    D3D11_CPU_ACCESS_WRITE, D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_MAP_WRITE_DISCARD,
+    D3D11_RENDER_TARGET_BLEND_DESC, D3D11_SAMPLER_DESC, D3D11_SUBRESOURCE_DATA,
+    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DYNAMIC, D3D11_VIEWPORT,
 };
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11ShaderResourceView,
@@ -175,23 +176,20 @@ impl CursorBlendPass {
         ov: &pf_frame::CursorOverlay,
         linear_scale: f32,
     ) -> Result<()> {
-        // SAFETY: D3D11 work on the caller's live `device`/`ctx` borrows. The
-        // `copy_nonoverlapping` writes `cb.len()` `f32`s into the pointer `Map` of
-        // `self.cbuf` (16 bytes, DYNAMIC/WRITE_DISCARD) returned, inside the `is_ok()`
-        // arm and before the paired `Unmap`. `ensure_shape` forwards this `device` borrow.
+        // SAFETY: D3D11 work on the caller's live `device`/`ctx` borrows. `ensure_shape`
+        // forwards this `device` borrow.
         unsafe {
             self.ensure_shape(device, ov)?;
             let (_, srv, w, h) = self.shape.as_ref().expect("shape just ensured");
             if self.cbuf_scale != Some(linear_scale) {
-                let cb: [f32; 4] = [linear_scale, 0.0, 0.0, 0.0];
-                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                if ctx
-                    .Map(&self.cbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
-                    .is_ok()
+                // `linear_scale`, then the shader's three pad floats.
+                let mut cb = [0u8; 16];
+                cb[..4].copy_from_slice(&linear_scale.to_ne_bytes());
+                if let Ok(mut mapped) =
+                    MappedSubresource::buffer(ctx, &self.cbuf, D3D11_MAP_WRITE_DISCARD)
                 {
-                    std::ptr::copy_nonoverlapping(cb.as_ptr(), mapped.pData as *mut f32, cb.len());
-                    ctx.Unmap(&self.cbuf, 0);
-                    // Cache only after a successful `Map`. A failed upload must not mark
+                    mapped.bytes_mut()[..16].copy_from_slice(&cb);
+                    // Cache only after a successful map. A failed upload must not mark
                     // the new scale as current: the buffer still holds the old value, and
                     // no later call would retry.
                     self.cbuf_scale = Some(linear_scale);

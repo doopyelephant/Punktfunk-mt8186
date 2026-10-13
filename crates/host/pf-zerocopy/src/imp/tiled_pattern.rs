@@ -1,7 +1,7 @@
 //! A tiled BGRx dmabuf for the hand-run NVIDIA convert test: the shape a compositor hands
 //! the capture path. Test-only.
 
-use super::vkdev::memory_type;
+use super::vkdev::{memory_type, MappedMemory};
 use anyhow::{Context, Result};
 use ash::vk;
 use std::os::fd::OwnedFd;
@@ -202,14 +202,8 @@ impl TiledPattern {
                 .flat_map(|y| (0..width).flat_map(move |x| pattern(x, y)))
                 .collect();
             let (stage, stage_mem) = host_buffer(&device, &mem_props, bytes.len() as u64)?;
-            let ptr = device.map_memory(
-                stage_mem,
-                0,
-                bytes.len() as u64,
-                vk::MemoryMapFlags::empty(),
-            )?;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast(), bytes.len());
-            device.unmap_memory(stage_mem);
+            // The fresh host buffer above: `bytes.len()` long, not yet mapped or submitted.
+            MappedMemory::map(&device, stage_mem, bytes.len())?.copy_from_slice(&bytes);
             let pool = device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default().queue_family_index(qf),
                 None,

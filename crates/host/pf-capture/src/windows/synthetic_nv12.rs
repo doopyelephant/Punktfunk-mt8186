@@ -10,10 +10,11 @@
 use crate::dxgi::{make_device, D3d11Frame};
 use crate::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{Context, Result};
+use pf_frame::d3d11_map::MappedSubresource;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_CPU_ACCESS_WRITE, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_WRITE, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
+    D3D11_CPU_ACCESS_WRITE, D3D11_MAP_WRITE, D3D11_TEXTURE2D_DESC, D3D11_USAGE,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
@@ -82,35 +83,27 @@ impl SyntheticNv12Capturer {
 impl Capturer for SyntheticNv12Capturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
         let pts_ns = self.frame_idx * 1_000_000_000 / self.fps.max(1) as u64;
-        // SAFETY: Map/Unmap/CopyResource on this capturer's own single-threaded immediate context;
-        // all writes stay within the mapped NV12 surface (Y: H rows of RowPitch; UV: H/2 rows of
-        // RowPitch beginning at RowPitch*H — the standard NV12 plane layout).
-        unsafe {
-            let mut map = D3D11_MAPPED_SUBRESOURCE::default();
-            self.context
-                .Map(&self.staging, 0, D3D11_MAP_WRITE, 0, Some(&mut map))
+        let (w, h) = (self.width as usize, self.height as usize);
+        {
+            let mut map = MappedSubresource::texture(&self.context, &self.staging, D3D11_MAP_WRITE)
                 .context("Map(NV12 staging)")?;
-            let pitch = map.RowPitch as usize;
-            let base = map.pData as *mut u8;
+            let pitch = map.row_pitch();
+            let (luma, chroma) = map.bytes_mut().split_at_mut(pitch * h);
             // Diagonal luma ramp, +4 codes/frame — deterministic motion the encoder must see.
             let shift = (self.frame_idx as u32).wrapping_mul(4);
-            for y in 0..self.height {
-                let row = base.add(y as usize * pitch);
-                for x in 0..self.width {
-                    *row.add(x as usize) = x.wrapping_add(y).wrapping_add(shift) as u8;
+            for (y, row) in luma.chunks_mut(pitch).enumerate() {
+                for (x, px) in row[..w].iter_mut().enumerate() {
+                    *px = (x as u32).wrapping_add(y as u32).wrapping_add(shift) as u8;
                 }
             }
-            // Neutral chroma (128) at RowPitch*H: H/2 rows, `width` bytes (interleaved Cb,Cr).
-            let uv = base.add(pitch * self.height as usize);
-            for r in 0..(self.height / 2) {
-                let row = uv.add(r as usize * pitch);
-                for c in 0..self.width {
-                    *row.add(c as usize) = 128;
-                }
+            // Neutral chroma (128): H/2 rows of interleaved Cb,Cr, `width` bytes each.
+            for row in chroma.chunks_mut(pitch) {
+                row[..w].fill(128);
             }
-            self.context.Unmap(&self.staging, 0);
-            self.context.CopyResource(&self.default_tex, &self.staging);
         }
+        // SAFETY: both textures belong to this capturer's device, and this is its immediate
+        // context, used from this one thread.
+        unsafe { self.context.CopyResource(&self.default_tex, &self.staging) };
         self.frame_idx += 1;
         Ok(CapturedFrame {
             provenance: Default::default(),

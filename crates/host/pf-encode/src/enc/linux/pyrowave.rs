@@ -32,6 +32,7 @@ use anyhow::{bail, Context, Result};
 use ash::vk;
 use ash::vk::Handle as _;
 use pf_frame::{CapturedFrame, FramePayload};
+use pf_zerocopy::vkdev::MappedMemory;
 use pyrowave_sys as pw;
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd};
@@ -1425,10 +1426,9 @@ impl PyroWaveEncoder {
             self.slots[slot].cpu_stage = Some((buf, mem, need));
         }
         let (_, m, _) = self.slots[slot].cpu_stage.unwrap();
-        let p = dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *mut u8;
         let n = bytes.len().min(need as usize);
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, n);
-        dev.unmap_memory(m);
+        // The slot's staging memory: host-visible, at least `need` bytes, mapped only here.
+        MappedMemory::map(&dev, m, n)?.copy_from_slice(&bytes[..n]);
         Ok(self.slots[slot].cpu_img.unwrap().2)
     }
 
