@@ -341,6 +341,11 @@ pub fn syswow64(rel: &str) -> String {
     format!(r"{}\SysWOW64\{rel}", system_root())
 }
 
+/// `%SystemRoot%\<rel>`, with [`system32`]'s fallbacks.
+pub fn windows_dir(rel: &str) -> String {
+    format!(r"{}\{rel}", system_root())
+}
+
 fn system_root() -> String {
     std::env::var("SystemRoot")
         .or_else(|_| std::env::var("WINDIR"))

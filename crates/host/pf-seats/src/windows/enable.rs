@@ -180,7 +180,7 @@ fn apply(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
     let (seats, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
         .create_subkey_with_flags(SEATS_KEY, KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY)
         .map_err(|cause| refuse("seats_key", "Couldn't turn seats on.", cause))?;
-    install_driver(&dir)?;
+    install_driver(&dir, true)?;
     allow_listener(&seats)?;
     // A choice made earlier narrowed the rules; allowing the network now widens them again.
     let narrowed = seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok() == Some(0);
@@ -217,15 +217,127 @@ fn package_dir(host_path: &Path) -> PathBuf {
     host_path.with_file_name("staging").join("pfvdisplay")
 }
 
+/// Where the seats package stands against the one staged beside the host.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DriverState {
+    Current,
+    /// In the store, but not the staged version: an upgrade the store hasn't taken yet.
+    Outdated,
+    Missing,
+    /// No package beside the host to compare with.
+    Unstaged,
+}
+
+pub(super) fn driver_state(host_path: &Path) -> DriverState {
+    let Some(staged) = driver_ver(&package_dir(host_path).join(PACKAGE[0])) else {
+        return DriverState::Unstaged;
+    };
+    let stored = store_versions();
+    if stored.contains(&staged) {
+        DriverState::Current
+    } else if stored.is_empty() {
+        DriverState::Missing
+    } else {
+        DriverState::Outdated
+    }
+}
+
+/// Put the staged seats package in the driver store when the store lacks that version: an
+/// uninstall deletes it, and an upgrade stages a new one only beside the host. Seats running
+/// now keep theirs until their next session.
+pub(super) fn ensure_driver(host_path: &Path) -> WinResult<()> {
+    let state = driver_state(host_path);
+    if state == DriverState::Current {
+        return Ok(());
+    }
+    tracing::info!(
+        ?state,
+        "seat display driver not current in the driver store — installing"
+    );
+    let dir = package_dir(host_path);
+    if PACKAGE.iter().any(|name| !dir.join(name).is_file()) {
+        return Err(refuse(
+            "seat_display_driver",
+            "The seat display driver isn't on this machine. Reinstall punktfunk, then try again.",
+            dir.display(),
+        ));
+    }
+    install_driver(&dir, false).map_err(|error| backend_error("seat_display_driver", error.message))
+}
+
+/// The `DriverVer` value of an INF, such as `10/12/2026,9.9.1012.257`, spaces dropped.
+fn driver_ver(inf: &Path) -> Option<String> {
+    let bytes = std::fs::read(inf).ok()?;
+    let text = match bytes.as_slice() {
+        [0xFF, 0xFE, rest @ ..] => String::from_utf16_lossy(
+            &rest
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        ),
+        _ => String::from_utf8_lossy(&bytes).into_owned(),
+    };
+    inf_driver_ver(&text)
+}
+
+fn inf_driver_ver(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        key.trim().eq_ignore_ascii_case("DriverVer").then(|| {
+            let value = value.split(';').next().unwrap_or_default();
+            value.chars().filter(|c| !c.is_whitespace()).collect()
+        })
+    })
+}
+
+/// The `DriverVer` of every seats package in the driver store, one folder each.
+fn store_versions() -> Vec<String> {
+    let repository = pf_paths::system32(r"DriverStore\FileRepository");
+    let Ok(entries) = std::fs::read_dir(repository) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("pf_vdisplay_seats.inf_")
+        })
+        .filter_map(|entry| driver_ver(&entry.path().join(PACKAGE[0])))
+        .collect()
+}
+
+/// Whether Windows' own Remote Desktop display driver is dated after ours: the newer date wins
+/// the seat's display, and a seat on Microsoft's never streams. `None` when either is unreadable.
+pub(super) fn inbox_display_driver_newer(host_path: &Path) -> Option<bool> {
+    let ours = driver_ver(&package_dir(host_path).join(PACKAGE[0]))?;
+    let windows = driver_ver(Path::new(&pf_paths::windows_dir(r"INF\rdpidd.inf")))?;
+    Some(ver_date(&windows)? >= ver_date(&ours)?)
+}
+
+/// `mm/dd/yyyy,…` as `(yyyy, mm, dd)`, so dates compare in order.
+fn ver_date(driver_ver: &str) -> Option<(u32, u32, u32)> {
+    let date = driver_ver.split(',').next()?;
+    let mut parts = date.split('/').map(|part| part.parse::<u32>().ok());
+    let (month, day, year) = (parts.next()??, parts.next()??, parts.next()??);
+    Some((year, month, day))
+}
+
 /// Add the seats package to the driver store. The terminal-services stack makes the devnode
-/// when a seat's session starts, so none is created here. 3010 is a driver added that a
-/// restart would load.
-fn install_driver(dir: &Path) -> WinResult<()> {
+/// when a seat's session starts and picks the newest package then, so none is created here.
+/// `install` also moves live devnodes onto it, which restarts a running seat's display: only
+/// turning seats on asks for that. 3010 is a driver added that a restart would load.
+fn install_driver(dir: &Path, install: bool) -> WinResult<()> {
     let inf = dir.join(PACKAGE[0]);
-    match run(
-        "pnputil.exe",
-        &["/add-driver", &inf.to_string_lossy(), "/install"],
-    ) {
+    let inf = inf.to_string_lossy();
+    let args: &[&str] = if install {
+        &["/add-driver", &inf, "/install"]
+    } else {
+        &["/add-driver", &inf]
+    };
+    match run("pnputil.exe", args) {
         Some(0 | 3010) => Ok(()),
         code => Err(refuse(
             "driver_install",
@@ -493,6 +605,26 @@ mod tests {
         );
         assert_eq!(parse_probe("Installed 1"), None);
         assert_eq!(parse_probe(""), None);
+    }
+
+    #[test]
+    fn an_infs_driver_ver_reads_without_spaces_or_comment() {
+        let inf = "[Version]\r\nSignature=\"$Windows NT$\"\r\nDriverVer = 10/12/2026, 9.9.1012.257 ; build\r\n";
+        assert_eq!(
+            inf_driver_ver(inf).as_deref(),
+            Some("10/12/2026,9.9.1012.257")
+        );
+        assert_eq!(inf_driver_ver("[Version]\r\n"), None);
+    }
+
+    /// The newer date wins the seat's display, so dates compare year first.
+    #[test]
+    fn driver_dates_compare_year_first() {
+        let ours = ver_date("10/12/2026,9.9.1012.257").unwrap();
+        let windows = ver_date("06/21/2006,10.0.26100.7309").unwrap();
+        assert!(windows < ours);
+        assert!(ver_date("12/31/2025,1.0") < ver_date("01/01/2026,1.0"));
+        assert_eq!(ver_date("not a date"), None);
     }
 
     #[test]

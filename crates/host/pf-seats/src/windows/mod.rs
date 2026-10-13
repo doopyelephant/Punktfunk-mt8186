@@ -163,6 +163,9 @@ impl PlatformBackend for WindowsBackend {
 
     fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
         self.ensure_runtime_prerequisites()?;
+        // An uninstall deletes the seat display driver and an upgrade only stages the new one:
+        // without it the seat logs on to Microsoft's adapter and never streams.
+        enable::ensure_driver(&self.host_path)?;
         // An upgrade's new enumerator reaches the listener here. Without it the seat still
         // starts, on `RDP-Tcp`, with Remote Audio and no pad audio.
         if let Err(cause) = seat_listener::ensure(&self.host_path) {
