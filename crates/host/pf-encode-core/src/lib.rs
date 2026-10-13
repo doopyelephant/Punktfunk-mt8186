@@ -31,6 +31,12 @@ pub mod rfi;
 // The LTR slot mirror AMF and QSV keep. Pure, so its tests run wherever `rfi` builds.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod ltr;
+// A GPU-less `Encoder` that plans with `rfi`, for loop tests. Never in a shipped build.
+#[cfg(all(
+    any(target_os = "windows", target_os = "linux"),
+    any(test, feature = "test-support")
+))]
+pub mod fake;
 pub mod smoke_pattern;
 // Shared loss-recovery env knobs. Defaults and API clamps stay per-backend.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
