@@ -328,14 +328,12 @@ public enum PresentPacing: Sendable, Equatable {
     case decoded
 }
 
-/// Direct decoded-frame handoff to a system video renderer: a video layer's, or the renderer
-/// behind a visionOS theater screen.
+/// Direct decoded-frame handoff to a video layer's system renderer.
 ///
 /// VideoToolbox already produced an IOSurface-backed YUV image, so wrapping it as an immediate
 /// uncompressed sample adds no copy or second decode. Backpressure drops the frame instead of
 /// building a queue; the next decoder callback supplies a fresher image. Display-link polling maps
 /// the renderer's current IOSurface ID back to its capture/decode stamp for on-glass metrics.
-/// `mirror` gets the same surface when it has room and never throttles or meters the stream.
 /// The renderer owns each sample after enqueue. Sendable because AVSampleBufferVideoRenderer
 /// explicitly permits background-thread enqueueing.
 final class DecodedVideoSink: @unchecked Sendable {
@@ -348,18 +346,15 @@ final class DecodedVideoSink: @unchecked Sendable {
     }
 
     private let renderer: AVSampleBufferVideoRenderer
-    private let mirror: AVSampleBufferVideoRenderer?
     private let lock = NSLock()
     private var stamps: [IOSurfaceID: Stamp] = [:]
 
-    init(renderer: AVSampleBufferVideoRenderer, mirror: AVSampleBufferVideoRenderer? = nil) {
+    init(renderer: AVSampleBufferVideoRenderer) {
         self.renderer = renderer
-        self.mirror = mirror
     }
 
     func reset() {
         renderer.flush()
-        mirror?.flush()
         lock.lock()
         stamps.removeAll()
         lock.unlock()
@@ -382,12 +377,6 @@ final class DecodedVideoSink: @unchecked Sendable {
             isRepeat: frame.flags & PunktfunkConnection.userFlagRepeat != 0)
         lock.unlock()
         renderer.enqueue(sample)
-        if let mirror {
-            if mirror.requiresFlushToResumeDecoding || mirror.status == .failed { mirror.flush() }
-            if mirror.isReadyForMoreMediaData, let copy = Self.immediateSample(pixelBuffer) {
-                mirror.enqueue(copy)
-            }
-        }
         return true
     }
 
@@ -1142,13 +1131,12 @@ public final class Stage2Pipeline {
     /// overlay's stamps reach the core through the connection. Metering never gates the
     /// presenter choice. Returns nil if Metal can't be set up (headless / no GPU) — caller
     /// falls back to the stage-1 presenter. `pacing` also selects the decoded video sink when its
-    /// `videoRenderer` is supplied; `mirrorRenderer` gets a copy of each surface. `gateDepth`
-    /// bounds glass presents; `vsyncPaced` schedules macOS smoothness, while `adaptiveSlotPaced`
-    /// schedules latency onto the ordinary display-link grid.
+    /// `videoRenderer` is supplied. `gateDepth` bounds glass presents; `vsyncPaced` schedules
+    /// macOS smoothness, while `adaptiveSlotPaced` schedules latency onto the ordinary
+    /// display-link grid.
     public init?(
         endToEndMeter: LatencyMeter?,
         videoRenderer: AVSampleBufferVideoRenderer? = nil,
-        mirrorRenderer: AVSampleBufferVideoRenderer? = nil,
         pacing: PresentPacing = .arrival,
         gateDepth: Int = 1,
         storePolicy: FrameStorePolicy = .newestWins,
@@ -1158,7 +1146,7 @@ public final class Stage2Pipeline {
         let decodedSink: DecodedVideoSink?
         if pacing == .decoded {
             guard let videoRenderer else { return nil }
-            decodedSink = DecodedVideoSink(renderer: videoRenderer, mirror: mirrorRenderer)
+            decodedSink = DecodedVideoSink(renderer: videoRenderer)
         } else {
             decodedSink = nil
         }

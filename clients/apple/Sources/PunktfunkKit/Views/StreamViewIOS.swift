@@ -45,9 +45,6 @@ public struct StreamView: UIViewControllerRepresentable {
     private let onResizeTarget: ((UInt32, UInt32) -> Void)?
     private let onDecodedSize: (@Sendable (Int, Int) -> Void)?
     private let endToEndMeter: LatencyMeter?
-    #if os(visionOS)
-    private var theaterRenderers: TheaterRenderers?
-    #endif
 
     /// `onDisconnectRequest` (main queue) is the captured-state ⌃⌥⇧D from an iPad keyboard,
     /// as on the macOS StreamView; released, the Stream menu's key equivalent disconnects.
@@ -75,20 +72,8 @@ public struct StreamView: UIViewControllerRepresentable {
         self.endToEndMeter = endToEndMeter
     }
 
-    #if os(visionOS)
-    /// Present into a theater's renderers instead of this view while `renderers` is set.
-    public func theater(_ renderers: TheaterRenderers?) -> StreamView {
-        var view = self
-        view.theaterRenderers = renderers
-        return view
-    }
-    #endif
-
     public func makeUIViewController(context: Context) -> StreamViewController {
         let controller = StreamViewController()
-        #if os(visionOS)
-        controller.setTheater(theaterRenderers)
-        #endif
         controller.onCaptureChange = onCaptureChange
         controller.onDisconnectRequest = onDisconnectRequest
         controller.onDial = onDial
@@ -108,9 +93,6 @@ public struct StreamView: UIViewControllerRepresentable {
         controller.endToEndMeter = endToEndMeter
         controller.onResizeTarget = onResizeTarget
         controller.onDecodedSize = onDecodedSize
-        #if os(visionOS)
-        controller.setTheater(theaterRenderers)
-        #endif
         if controller.connection !== connection {
             controller.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         }
@@ -707,7 +689,7 @@ public final class StreamViewController: StreamViewControllerBase {
         #if os(visionOS)
         // Several windows can stream at once and none is "in front": input follows the window
         // the player last pinched into. Another app window's scene taking it (a host list being
-        // typed into) releases this one; this scene's ornaments and the theater's space do not.
+        // typed into) releases this one; this scene's ornaments do not.
         observers.append(NotificationCenter.default.addObserver(
             forName: UIWindow.didBecomeKeyNotification, object: nil, queue: .main
         ) { [weak self] note in
@@ -795,8 +777,7 @@ public final class StreamViewController: StreamViewControllerBase {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
         #if os(iOS) || os(visionOS)
-        // The theater's panel is not the picture's size, so Match window sits it out.
-        if !onExternal, presenter.theater == nil { noteMatchWindowSize() }
+        if !onExternal { noteMatchWindowSize() }
         #if os(iOS)
         noteScreen()
         #endif
@@ -899,30 +880,6 @@ public final class StreamViewController: StreamViewControllerBase {
         #endif
         return streamView.displayLayer
     }
-
-    #if os(visionOS)
-    /// The window's size before the theater shrank it.
-    private var sizeBeforeTheater: CGSize?
-    /// The window while the picture is on the theater's screen: a panel below its sightline.
-    public static let theaterPanel = CGSize(width: 480, height: 270)
-
-    /// Move the picture into a theater's renderers, or back here with nil. The window shrinks
-    /// to a panel meanwhile, then gets its size back. Main thread.
-    func setTheater(_ renderers: TheaterRenderers?) {
-        guard renderers !== presenter.theater else { return }
-        presenter.setTheater(renderers)
-        if let scene = view.window?.windowScene {
-            if renderers != nil, sizeBeforeTheater == nil {
-                sizeBeforeTheater = view.window?.bounds.size
-                scene.requestGeometryUpdate(.Vision(size: Self.theaterPanel))
-            } else if renderers == nil, let size = sizeBeforeTheater {
-                sizeBeforeTheater = nil
-                scene.requestGeometryUpdate(.Vision(size: size))
-            }
-        }
-        if connection != nil { layoutMetalLayer() }
-    }
-    #endif
 
     /// The decoded frames turned HDR or SDR. tvOS follows them with the display mode. Main thread.
     private func noteFrameHDR(_ hdr: Bool) {

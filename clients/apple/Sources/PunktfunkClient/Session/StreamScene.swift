@@ -109,12 +109,8 @@ struct StreamScene: View {
             endToEndMeter: model.endToEnd
         )
         #if os(visionOS)
-        .theater(TheaterStage.shared.renderers(for: conn))
-        .overlay {
-            if TheaterStage.shared.renderers(for: conn) != nil { InTheaterPlaceholder() }
-        }
         .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
-            StreamOrnament(connection: conn, quickActions: { ring.toggleCentred() })
+            StreamOrnament(quickActions: { ring.toggleCentred() })
         }
         #endif
         .overlay(alignment: placement.alignment) {
