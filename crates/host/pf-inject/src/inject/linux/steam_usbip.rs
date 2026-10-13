@@ -212,7 +212,7 @@ mod tests {
     use super::*;
     use crate::test_sysfs::{input_devices, wait_input_gone};
     use crate::usbip::ensure_modules;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::AsFd;
     use std::time::{Duration, Instant};
 
     /// A seat's vhci port binds only listed devices.
@@ -301,14 +301,7 @@ mod tests {
         // HIDIOCSFEATURE(12)
         let req: libc::c_ulong =
             (3 << 30) | ((buf.len() as libc::c_ulong) << 16) | (0x48 << 8) | 0x06;
-        // SAFETY: HIDIOCSFEATURE reads the 12-byte report from the live `buf` behind the valid
-        // hidraw fd `f`; the length is encoded in the request, so nothing is written past it.
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req as _, buf.as_mut_ptr()) };
-        assert!(
-            rc >= 0,
-            "HIDIOCSFEATURE: {}",
-            std::io::Error::last_os_error()
-        );
+        crate::uapi::ioctl_with(f.as_fd(), req, &mut buf).expect("HIDIOCSFEATURE");
         let start = Instant::now();
         let mut got = None;
         while got.is_none() && start.elapsed() < Duration::from_millis(1500) {
