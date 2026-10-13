@@ -151,6 +151,13 @@ pub(super) fn turn_off() -> WinResult<()> {
         })?;
     }
     super::seat_listener::remove();
+    // The box's Steam shortcuts go back first: they name the Seats key's record of them.
+    match crate::persistence::SecretRoot::open(crate::persistence::default_root())
+        .and_then(|root| root.open_child_dir("temp"))
+    {
+        Ok(temp) => super::steam::unwrap_box_shortcuts(temp.path()),
+        Err(error) => tracing::warn!(%error, "box steam shortcuts not restored"),
+    }
     drop(seats);
     hklm.delete_subkey_with_flags(SEATS_KEY, KEY_WOW64_64KEY)
         .map_err(|cause| refuse("seats_key", "Couldn't turn seats off.", cause))

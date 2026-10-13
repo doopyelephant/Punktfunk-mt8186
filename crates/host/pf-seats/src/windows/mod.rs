@@ -171,6 +171,11 @@ impl PlatformBackend for WindowsBackend {
         if let Err(cause) = seat_listener::ensure(&self.host_path) {
             tracing::warn!(%cause, "seat listener not ready — seats start without pad audio");
         }
+        // The box's shared Steam shortcuts start a seat's own copy on a seat.
+        match self.root.open_child_dir("temp") {
+            Ok(temp) => steam::wrap_box_shortcuts(&self.host_path, temp.path()),
+            Err(error) => tracing::warn!(%error, "box steam shortcuts not rewired"),
+        }
         self.supervisor.start(seat)
     }
 

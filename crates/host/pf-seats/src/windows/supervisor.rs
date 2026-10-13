@@ -444,8 +444,8 @@ fn run_cycle(
     };
     runtime.update(|snapshot| snapshot.session_id = Some(session.id));
     // The profile exists once the session does. A first copy runs beside the start; the seat's
-    // Steam titles start once it lands.
-    super::steam::ensure_copy(session.id, &seat.account);
+    // Steam titles start once it lands, and its launchers are pointed at it then.
+    super::steam::ensure_copy(session.id, &seat.account, seat.id.as_str());
     let steam = super::steam::box_install().and(super::steam::seat_exe(&seat.account));
     let result = (|| {
         let host_root = root

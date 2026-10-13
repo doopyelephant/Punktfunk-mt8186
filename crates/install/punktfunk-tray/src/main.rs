@@ -9,7 +9,8 @@
 //! loopback `GET /api/v1/local/summary` on `<config_dir>/tray-token`. `--mgmt-port`
 //! pins the port; otherwise it follows `<config_dir>/mgmt-endpoint`, then 47990.
 //!
-//! Poller: `status.rs`. Linux SNI: `linux.rs`. Windows notify-icon: `win.rs`.
+//! Poller: `status.rs`. Linux SNI: `linux.rs`. Windows notify-icon: `win.rs`. `--steam` is
+//! what the PC's shared Steam shortcuts start while seats are on: `steam.rs`.
 //!
 //! `#![windows_subsystem = "windows"]`: a console-subsystem exe in the HKLM
 //! Run key flashes a terminal at every sign-in.
@@ -19,6 +20,8 @@
 mod linux;
 #[cfg(any(windows, target_os = "linux"))]
 mod status;
+#[cfg(windows)]
+mod steam;
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
@@ -84,6 +87,14 @@ fn parse_args() -> anyhow::Result<Args> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // The shared Steam shortcuts' launcher: no icon, no instance lock.
+    #[cfg(windows)]
+    {
+        let mut raw = std::env::args_os().skip(1);
+        if raw.next().is_some_and(|a| a == "--steam") {
+            return steam::launch(raw);
+        }
+    }
     // Same cfg as `run`; other targets stub and never poll TLS.
     #[cfg(any(windows, target_os = "linux"))]
     punktfunk_core::tls::install_default_provider();

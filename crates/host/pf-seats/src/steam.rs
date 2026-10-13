@@ -33,6 +33,44 @@ pub fn ipc_name(seat_id: &str) -> String {
     format!("pfseat{seat_id}")
 }
 
+/// The arguments that start a seat's copy under its own name.
+pub fn ipc_args(ipc: &str) -> String {
+    format!("-master_ipc_name_override {ipc}")
+}
+
+/// A Windows command line that starts `exe` under `ipc`, then `rest`.
+pub fn seat_command(exe: &str, ipc: &str, rest: &str) -> String {
+    let rest = rest.trim();
+    let mut line = format!("\"{exe}\" {}", ipc_args(ipc));
+    if !rest.is_empty() {
+        line.push(' ');
+        line.push_str(rest);
+    }
+    line
+}
+
+/// Steam's autostart line pointed at the seat's copy under `ipc`, its other switches kept. Steam
+/// writes `"<its steam.exe>" -silent`, which would start the copy under the box's name.
+pub fn autostart_line(line: &str, exe: &str, ipc: &str) -> String {
+    let line = line.trim();
+    let rest = match line.strip_prefix('"') {
+        Some(quoted) => quoted.split_once('"').map_or("", |(_, rest)| rest),
+        None => line
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, rest)| rest),
+    };
+    let mut kept = Vec::new();
+    let mut words = rest.split_whitespace();
+    while let Some(word) = words.next() {
+        if word.eq_ignore_ascii_case("-master_ipc_name_override") {
+            words.next();
+        } else {
+            kept.push(word);
+        }
+    }
+    seat_command(exe, ipc, &kept.join(" "))
+}
+
 /// Copies `src` to `dst` without the [`skipped`] entries. The copy lands in `<dst>.partial` and
 /// is renamed when whole, so a stopped copy never passes for a finished one. Links are not
 /// followed: a folder every local user writes may hold one that points anywhere.
@@ -271,6 +309,37 @@ fn path_of(inner: &[Token]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EXE: &str = r"C:\Users\pf_seat1\Steam\steam.exe";
+
+    #[test]
+    fn a_seat_command_names_the_copy_and_its_ipc_name() {
+        assert_eq!(
+            seat_command(EXE, "pfseatab", r#"-- "%1""#),
+            r#""C:\Users\pf_seat1\Steam\steam.exe" -master_ipc_name_override pfseatab -- "%1""#
+        );
+        assert_eq!(
+            seat_command(EXE, "pfseatab", " "),
+            r#""C:\Users\pf_seat1\Steam\steam.exe" -master_ipc_name_override pfseatab"#
+        );
+    }
+
+    /// Steam's own line, the box's install, a bare path and our own line all come out as one
+    /// start of the copy under the seat's name, with `-silent` kept.
+    #[test]
+    fn an_autostart_line_starts_the_copy_under_the_seats_name() {
+        let want =
+            r#""C:\Users\pf_seat1\Steam\steam.exe" -master_ipc_name_override pfseatab -silent"#;
+        for line in [
+            r#""C:\Users\pf_seat1\Steam\steam.exe" -silent"#,
+            r#""C:\Program Files (x86)\Steam\steam.exe" -silent"#,
+            r#"C:\Users\pf_seat1\Steam\steam.exe -silent"#,
+            want,
+            r#""C:\Users\pf_seat1\Steam\steam.exe" -master_ipc_name_override pfseatold -silent"#,
+        ] {
+            assert_eq!(autostart_line(line, EXE, "pfseatab"), want, "{line}");
+        }
+    }
 
     #[test]
     fn a_copy_leaves_the_boxs_account_library_and_logs() {
