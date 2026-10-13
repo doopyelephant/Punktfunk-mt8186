@@ -241,9 +241,11 @@ pub fn serve(
             profiles.migrate_device_seats(&pf_paths::seats_dir(), &paired);
         }
     }
-    // A seat host is pairing-required whatever its flags say.
+    // A seat host is pairing-required whatever its flags say, and never advertises: clients reach
+    // it through the box's `Redirect`, so only the box shows up as a host.
     let native = crate::native::NativeServe {
         require_pairing: native.require_pairing || pf_paths::seat::is_seat_host(),
+        mdns: native.mdns && !pf_paths::seat::is_seat_host(),
         ..native
     };
     let profiles = Arc::new(profiles);
