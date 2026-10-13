@@ -29,9 +29,12 @@ use utoipa::ToSchema;
 /// and OpenAPI stay `{"mode":"off"}` / `{"mode":"duration","seconds":N}` /
 /// `{"mode":"forever"}`. On gamescope's bare spawn this also keeps the
 /// nested session and its game.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum KeepAlive {
+    // The default: what a host with nothing saved does. A saved document that names no
+    // `keep_alive` loads `saved_keep_alive` instead.
+    #[default]
     Off,
     /// Linger `seconds` after the last session leaves; a reconnect inside
     /// the window reuses the display.
@@ -44,14 +47,6 @@ pub enum KeepAlive {
     /// Until host shutdown or `POST /display/release` (force-releases
     /// `Pinned` like `Lingering`). The `gaming-rig` preset selects this.
     Forever,
-}
-
-impl Default for KeepAlive {
-    fn default() -> Self {
-        // 10 s covers a client's own reconnect (mode change, network blip)
-        // without leaving a leftover virtual display if they walk away.
-        KeepAlive::Duration { seconds: 10 }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,7 +228,7 @@ pub struct DisplayPolicy {
     pub version: u32,
     #[serde(default)]
     pub preset: Preset,
-    #[serde(default)]
+    #[serde(default = "saved_keep_alive")]
     pub keep_alive: KeepAlive,
     #[serde(default)]
     pub topology: Topology,
@@ -410,11 +405,18 @@ fn yes() -> bool {
 fn default_max_displays() -> u32 {
     4
 }
+/// A saved document that names no `keep_alive` loads 10 s, not the default: a file written by
+/// hand, or by a tool that sets one field, is a host that saved settings. 10 s covers a
+/// client's own reconnect without leaving a display behind when it walks away.
+fn saved_keep_alive() -> KeepAlive {
+    KeepAlive::Duration { seconds: 10 }
+}
 
 impl Default for DisplayPolicy {
     fn default() -> Self {
-        // Bit-for-bit the `default` preset, so an unconfigured host matches
-        // the un-overridden call sites.
+        // What a host with nothing saved reports, and the base its first save edits. Its
+        // `keep_alive` is off, as such a host tears a display down at once. The `default`
+        // preset is the one that keeps it 10 s.
         DisplayPolicy {
             version: CURRENT_VERSION,
             preset: Preset::Custom,
@@ -844,10 +846,11 @@ impl DisplayPolicyStore {
     ///   would hand governance to leftover explicit fields (`exclusive` +
     ///   `forever` + `steal`). An unreadable preset name refuses the file.
     /// * Salvaging *nothing* must not report configured. `configured()` is the
-    ///   console-has-configured gate; `DisplayPolicy::default()` is `PerClient`
-    ///   identity, while unconfigured Linux uses `Shared`. Judge "nothing" on
-    ///   the result (dropped something and landed on default), not surviving
-    ///   keys — serde ignores unknowns, and `version` names no axis.
+    ///   console-has-configured gate; an empty document is `PerClient` identity
+    ///   and a 10 s keep-alive, while unconfigured Linux uses `Shared` and none.
+    ///   Judge "nothing" on the result (dropped something and landed on what `{}`
+    ///   loads as), not surviving keys — serde ignores unknowns, and `version`
+    ///   names no axis.
     fn parse(path: &std::path::Path, bytes: &[u8]) -> Option<DisplayPolicy> {
         let mut value: serde_json::Value = match serde_json::from_slice(bytes) {
             Ok(v) => v,
@@ -920,11 +923,13 @@ impl DisplayPolicyStore {
                 match serde_json::from_value::<DisplayPolicy>(serde_json::Value::Object(obj)) {
                     // Dropped everything → not configured. Test the result,
                     // not the key list (unknown members and `version` survive
-                    // without teaching us an axis). `Some(default)` would
-                    // flip Linux identity Shared → PerClient.
+                    // without teaching us an axis). `Some` would flip Linux
+                    // identity Shared → PerClient and turn a 10 s linger on.
                     Ok(p) => {
                         let p = p.sanitized();
-                        if dropped > 0 && p == DisplayPolicy::default() {
+                        let nothing = serde_json::from_str::<DisplayPolicy>("{}")
+                            .map(DisplayPolicy::sanitized);
+                        if dropped > 0 && nothing.is_ok_and(|nothing| nothing == p) {
                             tracing::warn!(path = %path.display(),
                                 "display-settings.json had no setting this host could read — this \
                                  host is running on BUILT-IN DEFAULTS, not on its configured policy");
@@ -1145,7 +1150,7 @@ struct CatalogRead {
 /// is a compile error.
 #[derive(Deserialize)]
 struct StoredEffectivePolicy {
-    #[serde(default)]
+    #[serde(default = "saved_keep_alive")]
     keep_alive: KeepAlive,
     #[serde(default)]
     topology: Topology,
@@ -1500,14 +1505,50 @@ mod tests {
         assert_eq!(resolve_linger(None, None, Some("soon")), Linger::Immediate);
     }
 
+    /// A host with nothing saved tears a display down at once, and its policy says so. The
+    /// `default` preset is the one that keeps it 10 s.
     #[test]
-    fn default_policy_is_todays_behavior() {
+    fn the_default_policy_keeps_no_display() {
         let e = DisplayPolicy::default().effective();
-        assert_eq!(e.keep_alive, KeepAlive::Duration { seconds: 10 });
+        assert_eq!(e.keep_alive, KeepAlive::Off);
         assert_eq!(e.topology, Topology::Auto);
         assert_eq!(e.mode_conflict, ModeConflict::Separate);
         assert_eq!(e.identity, Identity::PerClient);
         assert_eq!(e.layout.mode, LayoutMode::AutoRow);
+        assert_eq!(
+            preset_fields(Preset::Default).unwrap().keep_alive,
+            KeepAlive::Duration { seconds: 10 }
+        );
+    }
+
+    /// Nothing saved: the store reports teardown at once, and saving some other answer writes
+    /// no keep-alive. A saved file that names none keeps its 10 s.
+    #[test]
+    fn a_first_save_writes_no_keep_alive() {
+        let dir = std::env::temp_dir().join(format!("pf-disp-first-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("display-settings.json");
+        let _ = std::fs::remove_file(&path);
+
+        let store = DisplayPolicyStore::load_from(path.clone());
+        assert_eq!(store.get().effective().keep_alive, KeepAlive::Off);
+        assert!(store
+            .update(|p| {
+                p.max_displays = 2;
+                true
+            })
+            .unwrap());
+        let reopened = DisplayPolicyStore::load_from(path.clone());
+        assert_eq!(reopened.configured().unwrap().keep_alive, KeepAlive::Off);
+
+        std::fs::write(&path, br#"{ "capture_monitor": "DP-2" }"#).unwrap();
+        let reopened = DisplayPolicyStore::load_from(path.clone());
+        assert_eq!(
+            reopened.configured_effective().unwrap().keep_alive,
+            KeepAlive::Duration { seconds: 10 }
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1628,7 +1669,7 @@ mod tests {
         let p: DisplayPolicy =
             serde_json::from_str(r#"{ "preset": "custom", "max_displays": 2 }"#).unwrap();
         assert_eq!(p.max_displays, 2);
-        assert_eq!(p.keep_alive, KeepAlive::default());
+        assert_eq!(p.keep_alive, KeepAlive::Duration { seconds: 10 });
         assert_eq!(p.topology, Topology::Auto);
         assert_eq!(p.version, 1);
         // Files from before these axes: DDC off, monitor PnP disable on.
@@ -1931,10 +1972,13 @@ mod tests {
         // Truncated/non-object → unconfigured. Half-reading would be worse.
         assert!(DisplayPolicyStore::parse(std::path::Path::new("t.json"), b"{ not json").is_none());
         assert!(DisplayPolicyStore::parse(std::path::Path::new("t.json"), b"[1, 2, 3]").is_none());
-        // Empty object is a policy: every axis defaults.
+        // Empty object is a policy: every axis at what a saved file defaults to.
         assert_eq!(
             DisplayPolicyStore::parse(std::path::Path::new("t.json"), b"{}"),
-            Some(DisplayPolicy::default())
+            Some(DisplayPolicy {
+                keep_alive: KeepAlive::Duration { seconds: 10 },
+                ..DisplayPolicy::default()
+            })
         );
     }
 
@@ -1987,7 +2031,7 @@ mod tests {
         // Omitted fields default (real `max_displays` default, not 0).
         let c = &read.presets[1];
         assert_eq!(c.fields.max_displays, default_max_displays());
-        assert_eq!(c.fields.keep_alive, KeepAlive::default());
+        assert_eq!(c.fields.keep_alive, KeepAlive::Duration { seconds: 10 });
         assert_eq!(c.fields.topology, Topology::Auto);
         assert_eq!(c.game_session, GameSession::Auto);
         assert_eq!(read.presets[0].fields.max_displays, 2);
@@ -2049,7 +2093,7 @@ mod tests {
         let f = &read.presets[0].fields;
         assert_eq!(f.topology, Topology::Exclusive);
         assert_eq!(f.max_displays, default_max_displays(), "not 0");
-        assert_eq!(f.keep_alive, KeepAlive::default());
+        assert_eq!(f.keep_alive, KeepAlive::Duration { seconds: 10 });
     }
 
     #[test]

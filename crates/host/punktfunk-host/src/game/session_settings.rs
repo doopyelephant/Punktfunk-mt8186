@@ -10,7 +10,7 @@
 //!   [`SessionSettings::disconnect_grace_seconds`] so a blip never costs a save.
 //!
 //! Its own store, not a display-policy axis: keep-alive is how long a *display*
-//! survives a disconnect (default 10 s); this is a *game* (default 5 minutes).
+//! survives a disconnect (off by default); this is a *game* (default 5 minutes).
 //!
 //! Same shape as `DisplayPolicyStore` / `pf_gpu::GpuPrefStore`: missing or
 //! corrupt means unconfigured with a warning (never fail host startup), writes
