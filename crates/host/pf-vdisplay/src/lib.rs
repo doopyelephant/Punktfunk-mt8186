@@ -52,6 +52,11 @@ pub use backend::{
 /// ([`VirtualDisplay::last_portal_cursor_mode`]). The verdict is the caller's.
 pub use portal_cursor::Mode as PortalCursorMode;
 
+/// A [`VirtualDisplay`] that records its calls and plays a script, for tests.
+#[cfg(test)]
+#[path = "vdisplay/fake.rs"]
+pub(crate) mod fake;
+
 /// Time-bounded child-process helpers. Compositor queries shell out; an unbounded wait wedges the session thread.
 #[path = "vdisplay/proc.rs"]
 pub(crate) mod proc;
