@@ -3475,6 +3475,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "pf-driver-proto",
+ "pf-encode-core",
  "pf-encode-win",
  "pf-frame",
  "tracing",

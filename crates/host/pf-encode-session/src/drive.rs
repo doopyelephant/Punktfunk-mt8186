@@ -837,3 +837,6 @@ impl Report {
         self.since = now;
     }
 }
+
+#[cfg(test)]
+mod tests;

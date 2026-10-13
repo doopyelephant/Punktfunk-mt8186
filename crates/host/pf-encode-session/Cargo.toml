@@ -32,6 +32,10 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi_Common",
 ] }
 
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+# The loop's tests drive `pf_encode_core::fake::FakeEncoder` in place of a GPU backend.
+pf-encode-core = { path = "../pf-encode-core", features = ["test-support"] }
+
 [features]
 default = []
 # One per x86-64-only backend; each side turns on what its target can link.
