@@ -323,7 +323,7 @@ impl StreamState {
         }
         let max_depth = self.capturer.pipeline_depth().max(1);
         let depth = if idd_adaptive_enabled() {
-            self.cur_depth.clamp(1, max_depth)
+            self.pipelining.cur_depth.clamp(1, max_depth)
         } else {
             max_depth
         };
@@ -667,26 +667,27 @@ impl StreamState {
         if !idd_adaptive_enabled() {
             return;
         }
-        self.depth_frames += 1;
-        if self.depth_frames <= DEPTH_WARMUP_FRAMES {
+        let p = &mut self.pipelining;
+        p.depth_frames += 1;
+        if p.depth_frames <= DEPTH_WARMUP_FRAMES {
             return;
         }
         let max_depth = self.capturer.pipeline_depth().max(1);
         let budget = cadence_budget(self.interval, self.src_period_ns);
         let schedule_behind = std::time::Instant::now() >= self.next + (budget - self.interval);
         let encode_pressure =
-            encode_chain_pressure(budget, self.encode_chain_ns, self.pipelined_active);
+            encode_chain_pressure(budget, self.encode_chain_ns, p.pipelined_active);
         let behind = schedule_behind || encode_pressure;
-        self.behind_score = if behind {
-            (self.behind_score + 1).min(DEPTH_BEHIND_CAP)
+        p.behind_score = if behind {
+            (p.behind_score + 1).min(DEPTH_BEHIND_CAP)
         } else {
-            self.behind_score.saturating_sub(1)
+            p.behind_score.saturating_sub(1)
         };
-        let escalated = self.cur_depth > 1 || self.pipelined_active || self.deescalating;
-        let degraded = encode_behind_cadence(escalated, self.behind_score, DEPTH_DEGRADE);
+        let escalated = p.cur_depth > 1 || p.pipelined_active || p.deescalating;
+        let degraded = encode_behind_cadence(escalated, p.behind_score, DEPTH_DEGRADE);
         self.cadence_degraded.store(degraded, Ordering::Relaxed);
         self.cadence_behind_score
-            .store(self.behind_score, Ordering::Relaxed);
+            .store(p.behind_score, Ordering::Relaxed);
         if degraded != self.was_degraded {
             let now = std::time::Instant::now();
             if self
@@ -695,7 +696,7 @@ impl StreamState {
             {
                 if degraded {
                     tracing::info!(
-                        behind_score = self.behind_score,
+                        behind_score = p.behind_score,
                         escalated,
                         encode_pressure,
                         budget_us = budget.as_micros() as u64,
@@ -708,7 +709,7 @@ impl StreamState {
                     crate::encoder_sessions::on_behind_cadence();
                 } else {
                     tracing::info!(
-                        behind_score = self.behind_score,
+                        behind_score = p.behind_score,
                         encode_pressure,
                         flips_suppressed = self.cadence_flips_suppressed,
                         "encode cadence recovered — ABR climbs allowed again"
@@ -721,34 +722,33 @@ impl StreamState {
             }
             self.was_degraded = degraded;
         }
-        if self.deescalating {
+        if p.deescalating {
             if !self.enc.set_pipelined(false) {
-                self.deescalating = false;
-                self.pipelined_active = false;
-                self.pipeline_asked = false;
+                p.deescalating = false;
+                p.pipelined_active = false;
+                p.pipeline_asked = false;
                 tracing::info!(
                     "encoder pipelined retrieve de-escalated — sync retrieve (and \
                      sub-frame streaming, where armed) restored; re-monitoring cadence"
                 );
-                self.behind_score = 0;
-                self.depth_frames = 0;
-                self.ahead_run = 0;
+                p.behind_score = 0;
+                p.depth_frames = 0;
+                p.ahead_run = 0;
             }
-        } else if self.behind_score >= DEPTH_ESCALATE
-            && (self.cur_depth < max_depth || !self.pipeline_asked)
+        } else if p.behind_score >= DEPTH_ESCALATE && (p.cur_depth < max_depth || !p.pipeline_asked)
         {
-            if self.cur_depth < max_depth {
-                self.cur_depth = max_depth;
+            if p.cur_depth < max_depth {
+                p.cur_depth = max_depth;
                 tracing::info!(
-                    depth = self.cur_depth,
+                    depth = p.cur_depth,
                     "IDD pipeline depth escalated — encode can't hold cadence at depth-1 \
                      (GPU contention); pipelining until cadence holds clean (latency \
                      trade for throughput)"
                 );
             } else {
-                self.pipeline_asked = true;
-                self.pipelined_active = self.enc.set_pipelined(true);
-                if self.pipelined_active {
+                p.pipeline_asked = true;
+                p.pipelined_active = self.enc.set_pipelined(true);
+                if p.pipelined_active {
                     tracing::info!(
                         "encoder pipelined retrieve escalated — encode can't hold \
                          cadence and the capturer has no depth to give; the encode wait \
@@ -757,34 +757,32 @@ impl StreamState {
                     );
                 }
             }
-            self.behind_score = 0;
-            self.ahead_run = 0;
+            p.behind_score = 0;
+            p.ahead_run = 0;
         } else if escalated {
-            self.ahead_run = if behind { 0 } else { self.ahead_run + 1 };
-            if self.ahead_run >= DEESCALATE_CLEAN_FRAMES
-                && self
-                    .deescalate_not_before
+            p.ahead_run = if behind { 0 } else { p.ahead_run + 1 };
+            if p.ahead_run >= DEESCALATE_CLEAN_FRAMES
+                && p.deescalate_not_before
                     .is_none_or(|t| std::time::Instant::now() >= t)
             {
-                self.ahead_run = 0;
-                self.deescalate_not_before =
-                    Some(std::time::Instant::now() + self.deescalate_backoff);
-                self.deescalate_backoff = (self.deescalate_backoff * 5).min(DEESCALATE_BACKOFF_MAX);
-                if self.pipelined_active {
+                p.ahead_run = 0;
+                p.deescalate_not_before = Some(std::time::Instant::now() + p.deescalate_backoff);
+                p.deescalate_backoff = (p.deescalate_backoff * 5).min(DEESCALATE_BACKOFF_MAX);
+                if p.pipelined_active {
                     tracing::info!(
                         "cadence held clean while escalated — winding the pipelined \
                          retrieve back (latency recovery; costs one IDR)"
                     );
-                    self.deescalating = true;
-                } else if self.cur_depth > 1 {
-                    self.cur_depth = 1;
+                    p.deescalating = true;
+                } else if p.cur_depth > 1 {
+                    p.cur_depth = 1;
                     tracing::info!(
-                        depth = self.cur_depth,
+                        depth = p.cur_depth,
                         "IDD pipeline depth de-escalated — cadence held clean at the \
                          escalated depth (latency recovery)"
                     );
-                    self.behind_score = 0;
-                    self.depth_frames = 0;
+                    p.behind_score = 0;
+                    p.depth_frames = 0;
                 }
             }
         }

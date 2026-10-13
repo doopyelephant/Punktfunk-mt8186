@@ -52,6 +52,20 @@ pub(super) struct AuClock {
     pub(super) last_forced_idr: Option<std::time::Instant>,
 }
 
+/// The escalation ladder `adapt_depth` climbs when encode cannot hold cadence: capturer depth
+/// first, then the encoder's pipelined retrieve, wound back after a clean run.
+pub(super) struct Pipelining {
+    pub(super) cur_depth: usize,
+    pub(super) behind_score: u32,
+    pub(super) depth_frames: u64,
+    pub(super) pipeline_asked: bool,
+    pub(super) pipelined_active: bool,
+    pub(super) deescalating: bool,
+    pub(super) ahead_run: u32,
+    pub(super) deescalate_not_before: Option<std::time::Instant>,
+    pub(super) deescalate_backoff: std::time::Duration,
+}
+
 pub(super) struct StreamState {
     // ---- loop bookkeeping ----
     pub(super) deadline: std::time::Instant,
@@ -93,10 +107,8 @@ pub(super) struct StreamState {
     pub(super) st_queue: Vec<u32>,
     /// The Windows driver's pool drops, handed to the send thread's recorder sample.
     pub(super) driver_dropped: Arc<AtomicU64>,
-    pub(super) cur_depth: usize,
-    pub(super) behind_score: u32,
+    pub(super) pipelining: Pipelining,
     pub(super) last_fec: u8,
-    pub(super) depth_frames: u64,
     /// EMA of real-frame arrivals. Negotiated refresh is the wrong deadline when the game is slower.
     pub(super) src_period_ns: Option<u64>,
     /// Longest host submit+poll chain observed this tick, independent of perf sampling.
@@ -105,12 +117,6 @@ pub(super) struct StreamState {
     pub(super) was_degraded: bool,
     pub(super) last_cadence_log: Option<std::time::Instant>,
     pub(super) cadence_flips_suppressed: u32,
-    pub(super) pipeline_asked: bool,
-    pub(super) pipelined_active: bool,
-    pub(super) deescalating: bool,
-    pub(super) ahead_run: u32,
-    pub(super) deescalate_not_before: Option<std::time::Instant>,
-    pub(super) deescalate_backoff: std::time::Duration,
 
     // ---- teardown order, which is field order: the status registration ends first, then
     // the send thread, then game policy, then capture, encoder, display ----
@@ -312,16 +318,16 @@ impl StreamState {
     /// A fresh encoder retrieves synchronously. The session's pipelined escalation carries onto
     /// it, or the flags claim a mode the encoder is not in and escalation never fires again.
     pub(super) fn carry_pipelining(&mut self) {
-        if self.deescalating {
+        if self.pipelining.deescalating {
             // The wind-back the old encoder owed: the new one is already there.
-            self.deescalating = false;
-            self.pipelined_active = false;
-            self.pipeline_asked = false;
-        } else if self.pipelined_active {
-            self.pipelined_active = self.enc.set_pipelined(true);
+            self.pipelining.deescalating = false;
+            self.pipelining.pipelined_active = false;
+            self.pipelining.pipeline_asked = false;
+        } else if self.pipelining.pipelined_active {
+            self.pipelining.pipelined_active = self.enc.set_pipelined(true);
         } else {
             // A refusal was the old encoder's; this one may say yes.
-            self.pipeline_asked = false;
+            self.pipelining.pipeline_asked = false;
         }
     }
 
@@ -878,22 +884,24 @@ impl StreamState {
             st_wait: Vec::new(),
             st_queue: Vec::new(),
             driver_dropped,
-            cur_depth: 1,
-            behind_score: 0,
+            pipelining: Pipelining {
+                cur_depth: 1,
+                behind_score: 0,
+                depth_frames: 0,
+                pipeline_asked: false,
+                pipelined_active: false,
+                deescalating: false,
+                ahead_run: 0,
+                deescalate_not_before: None,
+                deescalate_backoff: super::encode::DEESCALATE_BACKOFF_START,
+            },
             last_fec: fec_target.load(Ordering::Relaxed),
-            depth_frames: 0,
             src_period_ns: None,
             encode_chain_ns: 0,
             last_real_cap: None,
             was_degraded: false,
             last_cadence_log: None,
             cadence_flips_suppressed: 0,
-            pipeline_asked: false,
-            pipelined_active: false,
-            deescalating: false,
-            ahead_run: 0,
-            deescalate_not_before: None,
-            deescalate_backoff: super::encode::DEESCALATE_BACKOFF_START,
             live_session,
             _watcher: None,
             #[cfg(target_os = "linux")]

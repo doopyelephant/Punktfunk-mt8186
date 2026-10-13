@@ -120,7 +120,7 @@ impl StreamState {
             );
             self.note_applied_rate(new_kbps, applied_kbps);
             if applied_kbps < self.bitrate_kbps {
-                self.behind_score = 0;
+                self.pipelining.behind_score = 0;
             }
             self.counters.note_bitrate(applied_kbps);
             self.bitrate_kbps = applied_kbps;
@@ -164,9 +164,9 @@ impl StreamState {
                 self.clock.inflight.clear();
                 self.clock.watchdog.on_au();
                 self.clock.last_forced_idr = Some(std::time::Instant::now());
-                self.behind_score = 0;
-                self.depth_frames = 0;
-                self.ahead_run = 0;
+                self.pipelining.behind_score = 0;
+                self.pipelining.depth_frames = 0;
+                self.pipelining.ahead_run = 0;
                 announce_pipeline_gap(
                     &self.gap_tx,
                     rebuild_t0.elapsed().as_millis().min(u32::MAX as u128) as u32,
