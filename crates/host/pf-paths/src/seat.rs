@@ -7,7 +7,8 @@
 //!
 //! `serve` fixes the role with [`resolve`]. Any other process reads the environment at each
 //! [`role`] call. No other crate reads a role variable.
-//! `every_predicate_answers_its_truth_table_row` pins what each role answers.
+//! `every_predicate_answers_its_truth_table_row` pins what each role answers. [`ignored`] names
+//! each setting that is set and changes nothing, which `serve` warns of.
 //!
 //! The id is untrusted process input, so it is validated once here rather than
 //! at each use: it reaches a device-parameter marker and log lines.
@@ -158,6 +159,66 @@ fn current() -> (HostRole, bool) {
 /// This process's role: what [`resolve`] fixed, else the environment as it is now.
 pub fn role() -> HostRole {
     current().0
+}
+
+/// Each role variable, the one value that sets its marker, and what to say of any other.
+const MARKERS: [(&str, &str, &str); 5] = [
+    ("PUNKTFUNK_SEAT_SESSION", "1", ONLY_ONE),
+    ("PUNKTFUNK_SEAT_OWNER", "1", ONLY_ONE),
+    ("PUNKTFUNK_SEAT_HEADLESS", "1", ONLY_ONE),
+    ("PUNKTFUNK_DOOR", "1", ONLY_ONE),
+    ("PUNKTFUNK_PAIRING", "refused", ONLY_REFUSED),
+];
+const ONLY_ONE: &str = "only the value 1 sets it";
+const ONLY_REFUSED: &str = "only the value refused sets it";
+const NO_SEAT_MARKER: &str = "PUNKTFUNK_SEAT_SESSION is not 1";
+const ON_A_SEAT_HOST: &str = "a seat host is never the door";
+
+/// Each seat-contract setting that is set and changes nothing, with why: a role variable whose
+/// value is not its marker; the owner marker, the headless marker or a seat id without the seat
+/// marker; the door asked for on a seat host. `values` are the role variables' in [`MARKERS`]
+/// order, `None` when unset. Naming a setting here changes no answer.
+pub fn ignored_values(
+    values: [Option<&str>; 5],
+    door_flag: bool,
+    seat_id_set: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let [seat_session, seat_owner, seat_headless, door, _] = values;
+    let mut ignored = Vec::new();
+    for (value, (name, marker, why)) in values.into_iter().zip(MARKERS) {
+        if value.is_some_and(|value| value != marker) {
+            ignored.push((name, why));
+        }
+    }
+    let (stray, why) = if seat_session == Some("1") {
+        let door = vec![("PUNKTFUNK_DOOR", door == Some("1")), ("--door", door_flag)];
+        (door, ON_A_SEAT_HOST)
+    } else {
+        let seat = vec![
+            ("PUNKTFUNK_SEAT_OWNER", seat_owner == Some("1")),
+            ("PUNKTFUNK_SEAT_HEADLESS", seat_headless == Some("1")),
+            ("PUNKTFUNK_SEAT_ID", seat_id_set),
+        ];
+        (seat, NO_SEAT_MARKER)
+    };
+    ignored.extend(
+        stray
+            .into_iter()
+            .filter(|(_, set)| *set)
+            .map(|(name, _)| (name, why)),
+    );
+    ignored
+}
+
+/// [`ignored_values`] of this process, for `serve` to warn of once at startup.
+pub fn ignored(door_flag: bool) -> Vec<(&'static str, &'static str)> {
+    let values = MARKERS.map(|(name, ..)| std::env::var(name).ok());
+    let seat_id_set = std::env::var_os("PUNKTFUNK_SEAT_ID").is_some();
+    ignored_values(
+        values.each_ref().map(Option::as_deref),
+        door_flag,
+        seat_id_set,
+    )
 }
 
 /// 32 lowercase hexadecimal characters, so the id is safe as a device-parameter
@@ -430,6 +491,64 @@ mod tests {
                 "marker {marker:?}, id {id:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_setting_that_changes_nothing_is_named_with_why() {
+        let (seat, owner, headless) = (VARS[0].0, VARS[1].0, VARS[2].0);
+        let (door, pairing) = (VARS[3].0, VARS[4].0);
+        // A console host, a door, and the two seats a supervisor starts: nothing to say.
+        assert!(ignored_values([None; 5], false, false).is_empty());
+        assert!(ignored_values([None, None, None, Some("1"), None], true, false).is_empty());
+        let row = [Some("1"), None, Some("1"), None, Some("refused")];
+        assert!(ignored_values(row, false, true).is_empty());
+        let owner_row = [Some("1"), Some("1"), Some("1"), None, Some("refused")];
+        assert!(ignored_values(owner_row, false, true).is_empty());
+
+        let near_misses = [Some("true"), Some("0"), Some("yes"), Some(""), Some("1")];
+        assert_eq!(
+            ignored_values(near_misses, false, false),
+            [
+                (seat, ONLY_ONE),
+                (owner, ONLY_ONE),
+                (headless, ONLY_ONE),
+                (door, ONLY_ONE),
+                (pairing, "only the value refused sets it"),
+            ]
+        );
+        assert_eq!(
+            ignored_values([None, Some("1"), Some("1"), None, None], false, true),
+            [
+                (owner, NO_SEAT_MARKER),
+                (headless, NO_SEAT_MARKER),
+                ("PUNKTFUNK_SEAT_ID", NO_SEAT_MARKER),
+            ]
+        );
+        assert_eq!(
+            ignored_values([Some("1"), None, None, Some("1"), None], true, true),
+            [(door, ON_A_SEAT_HOST), ("--door", ON_A_SEAT_HOST)]
+        );
+    }
+
+    /// [`ignored`] reads each variable under its own name.
+    #[test]
+    fn the_settings_that_change_nothing_come_from_the_environment() {
+        const TEST: &str = "the_settings_that_change_nothing_come_from_the_environment";
+        if let Some(door) = std::env::var_os(CHILD) {
+            let settings: Vec<_> = ignored(door == "flag").into_iter().map(|s| s.0).collect();
+            println!("{MARK}{}", settings.join(" "));
+            return;
+        }
+        let mut near_misses = child(TEST);
+        near_misses.envs(VARS.map(|(name, _, near_miss)| (name, near_miss)));
+        near_misses.env("PUNKTFUNK_SEAT_ID", "stray");
+        let named = VARS.map(|(name, ..)| name).join(" ") + " PUNKTFUNK_SEAT_ID";
+        assert_eq!(printed(&mut near_misses), [named]);
+
+        let mut seat = child(TEST);
+        seat.env(CHILD, "flag")
+            .envs([(VARS[0].0, "1"), (VARS[3].0, "1")]);
+        assert_eq!(printed(&mut seat), ["PUNKTFUNK_DOOR --door"]);
     }
 
     /// A policy test walks [`HostRole::ALL`], so it holds each role the markers name, once.

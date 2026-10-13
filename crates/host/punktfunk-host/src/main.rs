@@ -486,7 +486,11 @@ fn real_main() -> Result<()> {
 
     // Before `startup`: it skips the display and GPU work for the door.
     if args.first().map(String::as_str) == Some("serve") {
-        pf_paths::seat::resolve(args.iter().any(|a| a == "--door"));
+        let door_flag = args.iter().any(|a| a == "--door");
+        pf_paths::seat::resolve(door_flag);
+        for (setting, reason) in pf_paths::seat::ignored(door_flag) {
+            tracing::warn!(setting, reason, "seat-contract setting ignored");
+        }
     }
     startup(&args);
 

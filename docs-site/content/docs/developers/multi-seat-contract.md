@@ -95,7 +95,7 @@ keeps its driver until its next session.
 ## The environment a seat host is started with
 
 The supervisor starts an ordinary `punktfunk-host serve` with these. Don't set them by hand; set
-them together.
+them together. The host logs a warning at startup for each one that is set and ignored.
 
 | Variable | Value | Rule |
 |---|---|---|
