@@ -302,14 +302,25 @@ executable on its `PATH`. Point `PUNKTFUNK_SCRIPTING` at it ([Configuration](/do
 Read its log: `journalctl --user -u punktfunk-scripting -f` on Linux,
 `%ProgramData%\punktfunk\plugin-state\runner.log` on Windows. The console's **Troubleshooting**
 page shows plugin output too, under the `plugin:<name>` sources (`plugin:runner` for the runner).
+A log that ends with `plugins can't be sandboxed here` is the [next entry](#plugins-cant-be-sandboxed-here).
 
 ### Plugins can't be sandboxed here
 
-Linux only: `bubblewrap` is missing, or the kernel doesn't allow unprivileged user namespaces, and
-no plugin starts. Install `bubblewrap` (0.8 or newer) or allow user namespaces, then
-`systemctl --user restart punktfunk-scripting`. As a last resort,
-`Environment=PUNKTFUNK_PLUGIN_SANDBOX=off` in `systemctl --user edit punktfunk-scripting` runs
-plugins with your whole account's access; the console warns while it is set.
+The game library is empty and the **Plugin runner** card says **Stopped**. The runner can't build
+the sandbox each plugin runs in, so it stops at start instead of running one without it.
+**Diagnostics** → **Troubleshooting** → **Health checks** lists it as **Plugins can't be sandboxed
+here** or **The plugin runner has stopped**, with the reason.
+
+Repair the sandbox, then start the runner. It stays stopped until you do.
+
+| Host | Repair | Start the runner |
+|---|---|---|
+| Linux | Install `bubblewrap` 0.8 or newer, or allow unprivileged user namespaces. | `systemctl --user restart punktfunk-scripting` |
+| Windows | Re-run the host setup. | `Start-ScheduledTask -TaskName PunktfunkScripting`, from an elevated PowerShell |
+
+As a last resort on Linux, `Environment=PUNKTFUNK_PLUGIN_SANDBOX=off` in
+`systemctl --user edit punktfunk-scripting` runs plugins with your whole account's access; the
+console warns while it is set.
 
 ### A plugin can't read one of its folders
 
