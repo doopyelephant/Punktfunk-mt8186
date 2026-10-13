@@ -1222,19 +1222,12 @@ mod tests {
         assert_eq!(g.next_index, 441);
     }
 
-    /// Live loopback round trip. Skipped unless `PUNKTFUNK_WASAPI_LIVE=1` and a render endpoint exists.
+    /// Live loopback round trip on the default render endpoint.
     #[test]
+    #[ignore = "needs a WASAPI render endpoint — run with --ignored on a box with an audio device"]
     fn live_open_and_read() {
-        if std::env::var("PUNKTFUNK_WASAPI_LIVE").is_err() {
-            return;
-        }
-        let mut cap = match WasapiLoopbackCapturer::open(2, SAMPLE_RATE) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("no render endpoint on this box ({e:#}) — skipping");
-                return;
-            }
-        };
+        let mut cap =
+            WasapiLoopbackCapturer::open(2, SAMPLE_RATE).expect("open the default render endpoint");
         assert_eq!(cap.channels(), 2);
         // Legacy rate is never an upward request, so the settled rate must equal the ask.
         assert_eq!(cap.sample_rate(), SAMPLE_RATE);

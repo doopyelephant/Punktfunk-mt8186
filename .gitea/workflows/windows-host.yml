@@ -240,7 +240,7 @@ jobs:
           cargo fmt -p punktfunk-host -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p pf-seat-audio -p punktfunk-tray -p punktfunk-capture-worker --check; if ($LASTEXITCODE) { throw "fmt" }
           cargo fmt --manifest-path crates/host/pf-seat-keeper/Cargo.toml --check; if ($LASTEXITCODE) { throw "seat keeper fmt" }
 
-      - name: Test (pf-capture + pf-vdisplay + pf-win-display, Windows)
+      - name: Test (subsystem crates, Windows)
         # The crates whose Windows test binaries link against nothing this runner lacks —
         # settled empirically when the package job's equivalents were added. The host and
         # pf-encode(-win) stay clippy-only: nvidia-video-codec-sdk cannot link on MSVC.
@@ -257,6 +257,12 @@ jobs:
           cargo test --release --locked -p pf-win-display --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-win-display tests" }
           # The seat ledger, accounts and pipe. The pipe test opens a SYSTEM/Administrators pipe.
           cargo test --release --locked -p pf-seats --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-seats tests" }
+          # The pad and mouse hardware ids against the INF, the SendInput tables, the minted
+          # audio devnodes, and the encode session's pixel targets (WARP when no GPU exists).
+          # A test that needs a device or a session is `#[ignore]`d with its reason.
+          cargo test --release --locked -p pf-inject --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-inject tests" }
+          cargo test --release --locked -p pf-audio --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-audio tests" }
+          cargo test --release --locked -p pf-encode-session --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-encode-session tests" }
 
   package:
     runs-on: windows-amd64
@@ -413,10 +419,10 @@ jobs:
           cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p display-disturb --all-targets ${{ matrix.encode_flags }} --target $t -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
           cargo clippy --release --locked --manifest-path crates/host/pf-seat-keeper/Cargo.toml --target $t -- -D warnings; if ($LASTEXITCODE) { throw "seat keeper clippy" }
 
-      - name: Test (pf-capture, Windows)
+      - name: Test (subsystem crates, Windows)
         if: matrix.arch == 'x64'
         shell: pwsh
-        # The only Rust tests that RUN on Windows CI. pf-capture's `#[cfg(target_os = "windows")]`
+        # pf-capture's `#[cfg(target_os = "windows")]`
         # test modules cover code no Linux job compiles, let alone executes: 19 declared, of which
         # 18 execute here — the IDD-push StallWatch state machine and ring-generation masking
         # (idd_push.rs), the cursor shape→wire truth table (idd_push/cursor_poll.rs), and
@@ -439,6 +445,11 @@ jobs:
           # its 29 CCD path/mode transform tests were compiled by clippy and run nowhere.
           cargo test --release --locked -p pf-win-display --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-win-display tests" }
           cargo test --release --locked -p pf-seats --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-seats tests" }
+          # Same tree shape: pf-encode-session takes pf-encode-win featureless, so no encoder
+          # SDK import library is asked for.
+          cargo test --release --locked -p pf-inject --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-inject tests" }
+          cargo test --release --locked -p pf-audio --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-audio tests" }
+          cargo test --release --locked -p pf-encode-session --target ${{ matrix.target }}; if ($LASTEXITCODE) { throw "pf-encode-session tests" }
 
       - name: Test (pf-vdisplay, Windows)
         if: matrix.arch == 'x64'
