@@ -74,10 +74,10 @@ fn plan_for(req: &ConnectRequest, fp_hex: &str, tofu: bool, opts: &SpawnOpts) ->
 /// [`AppMsg`]s. A ready event carries the request's cancel handle so the main loop
 /// rejects approval that was queued while Cancel ran.
 ///
-/// `tofu` persists an advertised fingerprint only after ready proves the host owns it.
-/// The plan supplies all effective settings, including preset fullscreen policy.
+/// `tofu` marks the plan's pin as an advertised one. The plan supplies all effective
+/// settings, including preset fullscreen policy.
 ///
-/// The caller takes `busy`; [`AppMsg::SessionExited`] releases it. `Ok` is the child's
+/// The caller takes the slot; [`AppMsg::SessionExited`] frees it. `Ok` is the child's
 /// handle; `Err` reports a spawn failure before supervision starts.
 pub fn spawn_session(
     sender: relm4::Sender<AppMsg>,
@@ -95,7 +95,6 @@ pub fn spawn_session(
             let _ = sender.send(AppMsg::SessionReady {
                 req: req.clone(),
                 fp_hex: fp_hex.clone(),
-                tofu,
                 persist_paired,
                 cancel: cancel.clone(),
             });
@@ -110,7 +109,6 @@ pub fn spawn_session(
                 code,
                 error: error.take(),
                 ended: ended.take(),
-                tofu,
             });
         }
     })

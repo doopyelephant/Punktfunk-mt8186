@@ -18,7 +18,8 @@ use crate::trust;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use pf_client_core::orchestrate::{
-    self, trust_route, ConnectOutcome, ExitRoute, HostTarget, TrustRoute, FINGERPRINT_CHANGED,
+    self, trust_route, ConnectAttempt, ConnectOutcome, ExitRoute, HostTarget, TrustRoute,
+    FINGERPRINT_CHANGED,
 };
 use pf_client_core::profiles::{ListedProfile as ProfileRow, ProfilePick};
 use pf_client_core::settings::GamepadUi;
@@ -54,36 +55,12 @@ pub struct AppModel {
     library: Controller<LibraryPage>,
     /// Hosts · Library.
     views: adw::ViewStack,
-    /// One session child at a time — connects while one runs are ignored.
-    busy: bool,
-    /// Armed by [`AppMsg::WakeConnect`] (a dial to a host that isn't advertising but has a
-    /// known MAC): if THAT dial's child exits with a connect failure, `SessionExited` falls
-    /// back into the visible wake-and-wait instead of an error. Consumed on the next exit and
-    /// matched against the exiting request, so it can never redirect an unrelated failure.
-    wake_fallback: Option<ConnectRequest>,
-    /// The request-access "waiting for approval" dialog, closed on the first child
-    /// event. A shared slot (not a message): dialogs are main-thread GTK objects and
-    /// `AppMsg` must stay `Send` for the session child's reader thread.
-    ///
-    /// The handler id rides along because `close()` EMITS the close response: closing this
-    /// dialog in code is indistinguishable from the user pressing Cancel unless the handler
-    /// is disconnected first ([`AppModel::close_waiting`]).
-    waiting: crate::app::gate::WaitingSlot,
-    /// Set when this shell kills the session child itself (the request-access Cancel). Read
-    /// once on the child's exit: without it, EVERY signal death read as "we meant that" and
-    /// an OOM-killed or crashed stream vanished with no message at all.
-    session_cancelled: bool,
-    /// The profile id the running session dialed, unless that dial is already the retry. A
-    /// `PROFILE_UNKNOWN` refusal at its exit reads the list again and dials once more.
-    retry_profile: Option<String>,
-    /// The dialog waiting for a profile's seat to come up.
-    seat_wait: Option<profile::SeatWait>,
+    /// One connect at a time: whatever asks while one is in flight is ignored.
+    flight: connect::Flight,
     /// Controllers attached at the last poll — the edge Controller-optimized UI opens on.
     pads: usize,
     /// Fullscreen Always put the window there, so turning it off may take it back out.
     fullscreen_by_setting: bool,
-    /// The running session's child, from spawn to exit.
-    session: Option<CancelHandle>,
     /// "Streaming from …" on both pages, with Disconnect.
     streaming: Banners,
 }
@@ -154,7 +131,6 @@ pub enum AppMsg {
     SessionReady {
         req: ConnectRequest,
         fp_hex: String,
-        tofu: bool,
         persist_paired: bool,
         cancel: Option<CancelHandle>,
     },
@@ -164,7 +140,6 @@ pub enum AppMsg {
         code: i32,
         error: Option<pf_client_core::orchestrate::SessionError>,
         ended: Option<String>,
-        tofu: bool,
     },
     /// Hand over to the gamepad console (`punktfunk-session --browse`) — the couch UI's
     /// door from the desktop shell.
@@ -188,7 +163,7 @@ pub enum AppMsg {
         label: String,
         danger: bool,
     },
-    /// The speed-test dialog resolved (either way) — release `busy`.
+    /// The speed-test page resolved, either way: it frees the slot.
     SpeedTestDone,
     ShowPreferences,
     /// Re-open Preferences editing a specific layer — the settings scope switcher's
@@ -427,14 +402,8 @@ impl SimpleComponent for AppModel {
             hosts,
             library,
             views,
-            busy: false,
-            wake_fallback: None,
-            waiting: Rc::new(RefCell::new(None)),
-            session_cancelled: false,
-            retry_profile: None,
-            seat_wait: None,
+            flight: connect::Flight::default(),
             pads: 0,
-            session: None,
             streaming,
             fullscreen_by_setting: false,
         };
@@ -534,7 +503,7 @@ impl SimpleComponent for AppModel {
             AppMsg::DeepLink(url) => self.open_deep_link(&url, &sender),
             AppMsg::Connect(req) => self.connect(req, &sender),
             AppMsg::WakeConnect(req) => {
-                if !self.busy {
+                if !self.flight.busy() {
                     // Never gate the dial on mDNS presence: a routed host (Tailscale/VPN) never
                     // advertises. The magic packet goes first, fire-and-forget, so an asleep box
                     // boots while the dial times out, and the fallback is armed for THIS request.
@@ -542,13 +511,13 @@ impl SimpleComponent for AppModel {
                     // error; the host-card menu's explicit "Wake host" stays ungated.
                     if self.store.settings().auto_wake {
                         crate::wol::wake(&req.host.mac, req.host.addr.parse().ok());
-                        self.wake_fallback = Some(req.clone());
+                        self.flight.attempt.arm_wake(&req.host);
                     }
                     sender.input(AppMsg::Connect(req));
                 }
             }
             AppMsg::Pair(req) => {
-                if !self.busy {
+                if !self.flight.busy() {
                     crate::app::gate::pin_dialog(
                         &self.window,
                         &sender,
@@ -593,7 +562,7 @@ impl SimpleComponent for AppModel {
                 label,
                 danger,
             } => self.host_action(req, mgmt, action_id, label, danger, &sender),
-            AppMsg::SpeedTestDone => self.busy = false,
+            AppMsg::SpeedTestDone => self.flight.release(),
             AppMsg::OpenLibrary(req) => {
                 self.show_view("library");
                 self.library.emit(LibraryMsg::Open(req));
@@ -616,21 +585,20 @@ impl SimpleComponent for AppModel {
             AppMsg::SessionReady {
                 req,
                 fp_hex,
-                tofu,
                 persist_paired,
                 cancel,
-            } => self.session_ready(req, fp_hex, tofu, persist_paired, cancel),
+            } => self.session_ready(req, fp_hex, persist_paired, cancel),
             AppMsg::SessionExited {
                 req,
                 code,
                 error,
                 ended,
-                tofu,
-            } => self.session_exited(req, code, error, ended, tofu, &sender),
+            } => self.session_exited(req, code, error, ended, &sender),
             AppMsg::OpenConsole => self.open_console(&sender, false),
             AppMsg::Pads(n) => {
                 let prev = std::mem::replace(&mut self.pads, n);
-                if !self.busy && console_opens(self.store.settings().gamepad_ui(), prev, n) {
+                if !self.flight.busy() && console_opens(self.store.settings().gamepad_ui(), prev, n)
+                {
                     self.open_console(&sender, true);
                 }
             }
@@ -643,7 +611,7 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::ConsoleExited(err) => {
-                self.busy = false;
+                self.flight.release();
                 // Quitting the console (B at its root) exits 0 and returns here silently.
                 if let Some(e) = err {
                     self.hosts
@@ -659,9 +627,9 @@ impl SimpleComponent for AppModel {
             AppMsg::ShowAbout => crate::settings::show_about(&self.window),
             AppMsg::ShowAddHost => self.hosts.emit(HostsMsg::ShowAddHost),
             AppMsg::Disconnect => {
-                if let Some(child) = &self.session {
-                    // Our own end: an escalated kill must not read as a crash.
-                    self.session_cancelled = true;
+                if let connect::Slot::Session(child) = &self.flight.slot {
+                    // `terminate` records our own end, so an escalated kill does not read as
+                    // a crash.
                     child.terminate(DISCONNECT_GRACE);
                     self.streaming.show("Disconnecting\u{2026}", None);
                 }

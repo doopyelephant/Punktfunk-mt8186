@@ -1,6 +1,7 @@
 //! The profile picker in front of a paired host's connect, the wait for a seat that is
 //! starting, and the rejections that follow.
 
+use super::connect::Slot;
 use super::*;
 use pf_client_core::profiles::{self, SeatGate};
 use std::sync::atomic::Ordering;
@@ -31,7 +32,7 @@ impl AppModel {
         sender: &ComponentSender<Self>,
     ) {
         if !switch {
-            self.busy = true;
+            self.flight.hold();
             self.hosts.emit(HostsMsg::SetSession(Some((
                 req.card_key(),
                 Phase::Connecting,
@@ -93,7 +94,7 @@ impl AppModel {
             let rows = listed.map(Option::unwrap_or_default);
             return self.profile_dialog(req, fp_hex, rows, saved, None, false, sender);
         }
-        self.busy = false;
+        self.flight.release();
         self.hosts.emit(HostsMsg::SetSession(None));
         // A failed or late ask dials with the link's `as=`, else the saved pick.
         let Some(listed) = listed else {
@@ -182,7 +183,7 @@ impl AppModel {
         msg: String,
         sender: &ComponentSender<Self>,
     ) {
-        self.busy = true;
+        self.flight.hold();
         self.hosts.emit(HostsMsg::SetSession(Some((
             req.card_key(),
             Phase::Connecting,
@@ -209,7 +210,7 @@ impl AppModel {
         listed: Option<Option<Vec<ProfileRow>>>,
         sender: &ComponentSender<Self>,
     ) {
-        self.busy = false;
+        self.flight.release();
         self.hosts.emit(HostsMsg::SetSession(None));
         let rows = listed.flatten().unwrap_or_default();
         match profiles::find(&rows, &id) {
@@ -236,7 +237,7 @@ impl AppModel {
         redial: bool,
         sender: &ComponentSender<Self>,
     ) {
-        if self.busy {
+        if self.flight.busy() {
             return;
         }
         let detail = row.seat.as_ref().and_then(|s| s.detail.as_deref());
@@ -253,7 +254,6 @@ impl AppModel {
             let _ = out.send(AppMsg::SeatCancelled(flag.clone()));
         });
         dialog.present(Some(&self.window));
-        self.busy = true;
         self.hosts.emit(HostsMsg::SetSession(Some((
             req.card_key(),
             Phase::Connecting,
@@ -269,14 +269,22 @@ impl AppModel {
                 out.send(AppMsg::SeatPolled { stop, row }).is_ok()
             });
         });
-        self.seat_wait = Some(SeatWait {
+        self.flight.slot = Slot::Seat(Box::new(SeatWait {
             dialog,
             stop,
             req,
             fp_hex,
             id: row.id.clone(),
             redial,
-        });
+        }));
+    }
+
+    /// The wait `stop` belongs to, while it holds the slot.
+    fn seat_wait(&self, stop: &Arc<AtomicBool>) -> Option<&SeatWait> {
+        match &self.flight.slot {
+            Slot::Seat(wait) if Arc::ptr_eq(&wait.stop, stop) => Some(wait.as_ref()),
+            _ => None,
+        }
     }
 
     /// A poll's row: the dialog follows the seat, `ready` dials, `unavailable` stops. `Err`
@@ -287,11 +295,7 @@ impl AppModel {
         row: Result<ProfileRow, String>,
         sender: &ComponentSender<Self>,
     ) {
-        let Some(wait) = self
-            .seat_wait
-            .as_ref()
-            .filter(|w| Arc::ptr_eq(&w.stop, &stop))
-        else {
+        let Some(wait) = self.seat_wait(&stop) else {
             return;
         };
         let gate = match &row {
@@ -324,23 +328,21 @@ impl AppModel {
 
     /// The dialog closed by Cancel or Escape.
     pub(super) fn seat_cancelled(&mut self, stop: &Arc<AtomicBool>) {
-        if self
-            .seat_wait
-            .as_ref()
-            .is_some_and(|w| Arc::ptr_eq(&w.stop, stop))
-        {
+        if self.seat_wait(stop).is_some() {
             self.end_seat_wait();
         }
     }
 
-    /// Stops the poll, closes the dialog and frees the card.
+    /// Stops the poll, closes the dialog and frees the slot and the card. Its callers have
+    /// matched the wait, so the slot is the seat's.
     fn end_seat_wait(&mut self) -> Option<SeatWait> {
-        let wait = self.seat_wait.take()?;
+        let Slot::Seat(wait) = std::mem::take(&mut self.flight.slot) else {
+            return None;
+        };
         wait.stop.store(true, Ordering::Relaxed);
         wait.dialog.close();
-        self.busy = false;
         self.hosts.emit(HostsMsg::SetSession(None));
-        Some(wait)
+        Some(*wait)
     }
 
     /// The host refused the saved profile: drop the pick so the next connect asks again.

@@ -2,12 +2,69 @@
 
 use super::*;
 
+/// What holds the shell's one slot. Whatever asks for it while it is taken is ignored.
+#[derive(Default)]
+pub(super) enum Slot {
+    #[default]
+    Free,
+    /// A profile read, the console or a speed test: it ends on its own.
+    Held,
+    /// The dialog waiting for a profile's seat to come up.
+    Seat(Box<profile::SeatWait>),
+    /// The session child, from spawn to exit.
+    Session(CancelHandle),
+}
+
+/// The one connect this shell runs at a time: its facts, what holds the slot, and the
+/// dialog a request for access leaves up.
+#[derive(Default)]
+pub(super) struct Flight {
+    /// What its session's ready and exit are read against.
+    pub(super) attempt: ConnectAttempt,
+    pub(super) slot: Slot,
+    /// The "waiting for approval" dialog with its Cancel handler. A shared slot, not a
+    /// message: a dialog is a main-thread object and `AppMsg` is `Send`.
+    pub(super) waiting: crate::app::gate::WaitingSlot,
+}
+
+impl Flight {
+    pub(super) fn busy(&self) -> bool {
+        !matches!(self.slot, Slot::Free)
+    }
+
+    /// Takes the slot for something that ends on its own. `false`: it is taken.
+    pub(super) fn hold(&mut self) -> bool {
+        let free = !self.busy();
+        if free {
+            self.slot = Slot::Held;
+        }
+        free
+    }
+
+    /// Frees a slot [`Flight::hold`] took.
+    pub(super) fn release(&mut self) {
+        if matches!(self.slot, Slot::Held) {
+            self.slot = Slot::Free;
+        }
+    }
+
+    /// Dismisses the waiting dialog without its Cancel handler running. `close()` emits the
+    /// close response, so the handler goes first, or closing it here reads as the user's
+    /// Cancel.
+    pub(super) fn close_waiting(&self) {
+        if let Some((w, handler)) = self.waiting.borrow_mut().take() {
+            w.disconnect(handler);
+            w.close();
+        }
+    }
+}
+
 impl AppModel {
     /// Opens the surface [`trust_route`] picks: the stored pin dials, a changed fingerprint
     /// gets the PIN dialog, a new `pair=optional` host gets the TOFU offer, and anything
     /// else gets delegated approval or PIN.
     pub(super) fn connect(&mut self, req: ConnectRequest, sender: &ComponentSender<Self>) {
-        if self.busy {
+        if self.flight.busy() {
             return;
         }
         let route = trust_route(
@@ -34,7 +91,7 @@ impl AppModel {
                 crate::app::gate::approval_dialog(
                     &self.window,
                     sender,
-                    self.waiting.clone(),
+                    self.flight.waiting.clone(),
                     self.identity.clone(),
                     req,
                 );
@@ -42,6 +99,7 @@ impl AppModel {
         }
     }
 
+    /// Spawns the session for a connect whose trust is decided, unless the slot is taken.
     pub(super) fn start_session(
         &mut self,
         req: ConnectRequest,
@@ -53,13 +111,14 @@ impl AppModel {
         // A request-access start carries the cancel its waiting dialog arms; one that never
         // spawns must close that dialog, or its Cancel tears down a session it does not own.
         let request = opts.cancel.is_some();
-        if std::mem::replace(&mut self.busy, true) {
+        if !self.flight.hold() {
             if request {
-                self.close_waiting();
+                self.flight.close_waiting();
             }
             return;
         }
-        self.retry_profile = opts.profile.clone().flatten().filter(|_| !opts.redial);
+        let profile = opts.profile.as_ref().and_then(|p| p.as_deref());
+        self.flight.attempt.dial(tofu, profile, opts.redial);
         self.hosts.emit(HostsMsg::ClearError);
         self.hosts.emit(HostsMsg::SetSession(Some((
             req.card_key(),
@@ -68,12 +127,12 @@ impl AppModel {
         // No settings ride along: the spawner resolves this host's effective ones
         // (globals + its preset) for both the argv and the child's spec.
         match spawn::spawn_session(sender.input_sender().clone(), req, fp_hex, tofu, opts) {
-            Ok(child) => self.session = Some(child),
+            Ok(child) => self.flight.slot = Slot::Session(child),
             Err(e) => {
                 if request {
-                    self.close_waiting();
+                    self.flight.close_waiting();
                 }
-                self.busy = false;
+                self.flight.release();
                 self.hosts.emit(HostsMsg::SetSession(None));
                 self.hosts.emit(HostsMsg::ShowError(e));
             }
@@ -86,14 +145,13 @@ impl AppModel {
         &mut self,
         req: ConnectRequest,
         fp_hex: String,
-        tofu: bool,
         persist_paired: bool,
         cancel: Option<CancelHandle>,
     ) {
         if ready_was_cancelled(cancel.as_ref()) {
             return;
         }
-        self.close_waiting();
+        self.flight.close_waiting();
         self.hosts.emit(HostsMsg::SetSession(Some((
             req.card_key(),
             Phase::Streaming,
@@ -102,10 +160,7 @@ impl AppModel {
             &format!("Streaming from {}", req.host.name),
             Some("Disconnect"),
         );
-        // A child that reported ready proves the host answered — the exact condition
-        // the dial-first wake fallback exists to rule out. Left armed, it turns a
-        // later ordinary failure into a spurious "waking…".
-        self.wake_fallback = None;
+        let tofu = self.flight.attempt.on_ready();
         // Request access: the operator's approval is the pairing. TOFU: ready proved the
         // advertised fingerprint. Either way the stream is up on a pin carried in memory, so
         // a failed save says so, or the host is gone at the next launch.
@@ -124,42 +179,28 @@ impl AppModel {
         self.hosts.emit(HostsMsg::Refresh);
     }
 
-    /// The child is gone: release `busy` and open the surface [`orchestrate::exit_route`]
-    /// picks.
+    /// The child is gone: frees the slot and opens the surface
+    /// [`ConnectAttempt::on_exit`] picks.
     pub(super) fn session_exited(
         &mut self,
         req: ConnectRequest,
         code: i32,
         error: Option<pf_client_core::orchestrate::SessionError>,
         ended: Option<String>,
-        tofu: bool,
         sender: &ComponentSender<Self>,
     ) {
-        self.close_waiting();
-        self.busy = false;
-        self.session = None;
+        self.flight.close_waiting();
+        // Our own Disconnect is on the child's handle, whatever exit code the kill leaves.
+        let held = std::mem::take(&mut self.flight.slot);
+        let cancelled = matches!(held, Slot::Session(child) if child.is_cancelled());
         self.streaming.hide();
         self.hosts.emit(HostsMsg::SetSession(None));
-        // The dial-first wake fallback (armed by `WakeConnect`, consumed on every exit). Matched
-        // by fingerprint (else address) so a stale armed request can never redirect another
-        // host's failure.
-        let cancelled = std::mem::take(&mut self.session_cancelled);
-        let retry = self.retry_profile.take();
-        let wake_armed =
-            self.wake_fallback
-                .take()
-                .is_some_and(|fb| match (fb.host.pin(), req.host.pin()) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => fb.host.addr == req.host.addr && fb.host.port == req.host.port,
-                });
         let outcome = ConnectOutcome::from_exit(code, error, ended, cancelled);
-        match orchestrate::exit_route(
-            &outcome,
-            tofu,
-            retry.as_deref(),
-            wake_armed,
-            "the client log",
-        ) {
+        let route = self
+            .flight
+            .attempt
+            .on_exit(&req.host, &outcome, "the client log");
+        match route {
             ExitRoute::Silent => {}
             ExitRoute::Banner(msg) => self.hosts.emit(HostsMsg::ShowError(msg)),
             ExitRoute::Repair(msg) => {
@@ -187,10 +228,10 @@ impl AppModel {
     /// `until_no_pads`: a controller connecting opened it, so it hands the desk back once the
     /// last one is gone (never mid-stream; the session decides that).
     pub(super) fn open_console(&mut self, sender: &ComponentSender<Self>, until_no_pads: bool) {
-        if std::mem::replace(&mut self.busy, true) {
+        if !self.flight.hold() {
             return;
         }
-        // The console owns the screen and the pads while it runs, so it takes `busy`
+        // The console owns the screen and the pads while it runs, so it takes the slot
         // like a stream does. `wait_check_async` lands the exit on this main loop —
         // no thread, no channel — and turns a non-zero exit into the error the
         // banner shows, which is also how a session built without `ui` surfaces.
@@ -217,7 +258,7 @@ impl AppModel {
                 });
             }
             Err(e) => {
-                self.busy = false;
+                self.flight.release();
                 self.hosts.emit(HostsMsg::ShowError(format!(
                     "Couldn't start the console UI — {e}"
                 )));
@@ -264,7 +305,7 @@ impl AppModel {
             Ok(PlanOutcome::Connect(plan)) => {
                 // Rule 2 of §3: never preempt a live session. Only this layer knows one is
                 // running, which is why the brain leaves the check here.
-                if self.busy {
+                if self.flight.busy() {
                     return self.toast("A session is already running — end it first.");
                 }
                 let req = ConnectRequest {
@@ -290,7 +331,7 @@ impl AppModel {
                 // .desktop, so any web page can hand us such a URL and both of those are
                 // guessable — the dial waits for a person. Deliberately not the PIN ceremony
                 // below: this host is already pinned, and re-pairing it would throw that away.
-                if self.busy {
+                if self.flight.busy() {
                     return self.toast("A session is already running — end it first.");
                 }
                 let req = ConnectRequest {
@@ -334,7 +375,7 @@ impl AppModel {
                 // Known-but-unpinned, or not known at all: the link may not pair and may not
                 // trust on its own, so it opens the ordinary ceremony under the user's eyes —
                 // the PIN dialog, seeded with what the link claimed.
-                if self.busy {
+                if self.flight.busy() {
                     return self.toast("A session is already running — end it first.");
                 }
                 let req = ConnectRequest {
@@ -367,14 +408,25 @@ impl AppModel {
             Err(e) => self.toast(&e.message()),
         }
     }
+}
 
-    /// Dismiss the waiting dialog without its Cancel handler running. `close()` emits the
-    /// close response, so the handler has to go first or the approval that just landed reads
-    /// as the user cancelling — and kills the child that reported ready.
-    pub(super) fn close_waiting(&mut self) {
-        if let Some((w, handler)) = self.waiting.borrow_mut().take() {
-            w.disconnect(handler);
-            w.close();
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The slot has one owner: a second taker is refused, and `release` frees only what
+    /// `hold` took.
+    #[test]
+    fn the_slot_has_one_owner() {
+        let mut flight = Flight::default();
+        assert!(flight.hold());
+        assert!(!flight.hold());
+        flight.release();
+        assert!(!flight.busy());
+
+        flight.slot = Slot::Session(CancelHandle::default());
+        assert!(!flight.hold());
+        flight.release();
+        assert!(flight.busy(), "a session's slot is not `hold`'s to free");
     }
 }
