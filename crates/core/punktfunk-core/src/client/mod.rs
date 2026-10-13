@@ -50,7 +50,8 @@ pub use self::planes::AudioPacket;
 pub use self::probe::ProbeOutcome;
 
 pub use crate::audio::{
-    audio_mute_label, audio_mute_notice, AUDIO_MUTE_HOST, AUDIO_MUTE_LOCAL, LOCAL_MUTE_NOTICE,
+    audio_mute_label, audio_mute_notice, mic_mute_label, mic_mute_notice, AUDIO_MUTE_HOST,
+    AUDIO_MUTE_LOCAL, LOCAL_MUTE_NOTICE,
 };
 
 /// Set or clear one bit of a mute mask. Read-modify-write on the atomic: the embedder and
@@ -1979,6 +1980,18 @@ mod mute_tests {
 
         set_mute_bit(&m, AUDIO_MUTE_HOST, false);
         assert_eq!(audio_mute_label(m.load(Ordering::Relaxed)), None);
+    }
+
+    /// A mute and an unmute both say so, and both stop: the microphone has no standing badge.
+    #[test]
+    fn the_microphone_names_each_switch_and_then_stops() {
+        let old = LOCAL_MUTE_NOTICE + Duration::from_secs(1);
+        assert_eq!(mic_mute_notice(true, Duration::ZERO), Some(true));
+        assert_eq!(mic_mute_notice(false, Duration::ZERO), Some(false));
+        assert_eq!(mic_mute_notice(true, old), None);
+        assert_eq!(mic_mute_notice(false, old), None);
+        assert_eq!(mic_mute_label(true), "Microphone muted");
+        assert_eq!(mic_mute_label(false), "Microphone live");
     }
 
     /// The badge's lifetime, not its wording: the player's own mute says itself once and

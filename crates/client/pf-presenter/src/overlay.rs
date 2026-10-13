@@ -58,11 +58,13 @@ pub struct FrameCtx<'a> {
     pub access: Option<&'a str>,
     /// Transient access toast. Occupies the hint slot while up; the run loop owns timing.
     pub notice: Option<&'a str>,
-    /// Mic muted mid-stream. Independent of the stats tier so the badge still
-    /// shows with chrome off. False when the session has no mic uplink.
-    pub mic_muted: bool,
-    /// The stream's mute sentence ([`punktfunk_core::client::audio_mute_label`]); `None`
-    /// while it is audible. Standing, like the mic badge, and independent of the stats tier.
+    /// The player just muted the microphone (`true`) or opened it again
+    /// ([`punktfunk_core::client::mic_mute_notice`]); `None` otherwise. Independent of the
+    /// stats tier, so it still shows with chrome off.
+    pub mic_notice: Option<bool>,
+    /// The stream's mute sentence ([`punktfunk_core::client::audio_mute_notice`]); `None`
+    /// while it is audible, or once a local mute has been read. A host mute stands.
+    /// Independent of the stats tier.
     pub audio_mute: Option<&'a str>,
     /// Mid-stream Match-window resize in flight (`design/midstream-resolution-resize.md`).
     /// Draw a full-screen scrim and spinner until the new-resolution frame arrives.

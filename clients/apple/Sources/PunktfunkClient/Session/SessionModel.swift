@@ -615,18 +615,19 @@ final class SessionModel: ObservableObject {
     }
 
     /// Flip the user's mute. The in-stream surfaces (HUD button, Stream menu, ⌃⌥⇧A while
-    /// captured, the iOS mic disc) all land here.
+    /// captured, the iOS mic disc, the dial) all land here.
     func toggleMicMute() {
         setMicMuted(!micMuted)
     }
 
-    /// Set the user's mute directly (the badge's tap-to-unmute). Ignored when the session has no
-    /// microphone, so a stale surface can't leave a phantom "muted" badge over a session that was
-    /// never sending anything.
+    /// Set the user's mute, and say so for a moment in either direction. Ignored when the
+    /// session has no microphone, so a stale surface can't raise a "muted" notice over a
+    /// session that was never sending anything.
     func setMicMuted(_ muted: Bool) {
         guard micAvailable, micMuted != muted else { return }
         micMuted = muted
         applyMicMute()
+        flash(\.micMute, muted)
     }
 
     /// Show `value` in the notice at `slot` for `seconds`. Last one wins and its clock restarts:

@@ -181,6 +181,8 @@ impl Shell {
             disconnect_rx,
             audio_mute_at: Instant::now(),
             audio_mute_seen: 0,
+            mic_muted_seen: false,
+            mic_muted_at: None,
             ring_opener: None,
             ring_was_open: false,
             chord_rx,
@@ -369,6 +371,15 @@ impl Shell {
             // the pump knows whether an uplink exists, and a mirrored copy would go stale
             // at session end.
             let mic_muted = stream.as_ref().is_some_and(|st| st.handle.mic.muted());
+            // A switch inside a stream starts the notice's clock. A stream ending muted is
+            // not the player unmuting, so that edge clears it instead.
+            if mic_muted != self.mic_muted_seen {
+                self.mic_muted_seen = mic_muted;
+                self.mic_muted_at = stream.is_some().then(Instant::now);
+            }
+            let mic_notice = self
+                .mic_muted_at
+                .and_then(|at| punktfunk_core::client::mic_mute_notice(mic_muted, at.elapsed()));
             // The badge clears itself once a local mute has been read; the mask's own clock
             // lives here because only the frame loop knows when it last moved.
             let audio_mute = stream
@@ -413,7 +424,7 @@ impl Shell {
                 hint,
                 access: access_chip.as_deref(),
                 notice: session_notice,
-                mic_muted,
+                mic_notice,
                 audio_mute,
                 resizing,
                 pad: pad.as_ref().map(|p| p.name.as_str()),

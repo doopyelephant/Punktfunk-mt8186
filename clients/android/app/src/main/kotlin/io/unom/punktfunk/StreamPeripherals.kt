@@ -89,11 +89,7 @@ internal class StreamPeripherals(
         // moment it is claimed, on the main thread.
         router.onMotionUnreachable = { ui.motionHint = true }
         router.onMicChord = {
-            if (ui.micRunning) {
-                val next = !ui.micMuted
-                ui.mute(next)
-                ui.micHint = if (next) "Microphone muted" else "Microphone live"
-            }
+            if (ui.micRunning) ui.mute(!ui.micMuted)
         }
         // Select + X steps the stats overlay one tier — the same live cycle the three-finger tap
         // performs, and the ONLY route to it on a TV or in a passthrough-touch session. Session-
