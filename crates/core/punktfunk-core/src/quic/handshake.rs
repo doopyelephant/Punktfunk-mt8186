@@ -98,13 +98,21 @@ pub const AUDIO_CODEC_PCM: u8 = 2;
 /// Longest [`ClientHello::client_label`] in UTF-8 bytes. A log field, so short.
 pub const EXT_CLIENT_MAX: usize = 96;
 
-/// `s` as a [`ClientHello::client_label`]: trimmed, control characters dropped, truncated to
+/// `s` as a [`ClientHello::client_label`]: control characters dropped, trimmed, truncated to
 /// [`EXT_CLIENT_MAX`] on a char boundary. Empty in means empty out, which is "say nothing".
 pub fn client_label(s: &str) -> String {
-    let mut out: String = s.trim().chars().filter(|c| !c.is_control()).collect();
-    while out.len() > EXT_CLIENT_MAX {
+    bounded_label(s, EXT_CLIENT_MAX)
+}
+
+/// Control characters go before the trim and the cut is trimmed again, so whitespace one of
+/// them hid or the cut exposed does not survive: a second pass changes nothing.
+fn bounded_label(s: &str, max: usize) -> String {
+    let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+    let mut out = clean.trim().to_string();
+    while out.len() > max {
         out.pop();
     }
+    out.truncate(out.trim_end().len());
     out
 }
 
@@ -169,10 +177,7 @@ impl SessionPreset {
             .filter(|c| c.is_ascii_graphic())
             .take(PRESET_ID_MAX)
             .collect();
-        let mut name: String = name.trim().chars().filter(|c| !c.is_control()).collect();
-        while name.len() > PRESET_NAME_MAX {
-            name.pop();
-        }
+        let name = bounded_label(name, PRESET_NAME_MAX);
         (!id.is_empty()).then_some(SessionPreset { id, name })
     }
 
@@ -397,6 +402,20 @@ mod tests {
             }
         );
         assert_eq!(LinkFacts::decode(&[]), LinkFacts::default());
+    }
+
+    /// A control character hides no whitespace from the trim: one decode settles the name.
+    #[test]
+    fn a_preset_settles_in_one_decode() {
+        let wire = [6, 37, 0, 37, 45, 3, 0, 9, 0, 0, 0, 32, 0, 0, 0, 0, 128, 0];
+        let once = SessionPreset::decode(&wire).unwrap();
+        assert_eq!(once.name, "\u{fffd}");
+        assert_eq!(SessionPreset::decode(&once.encode()), Some(once));
+        assert_eq!(client_label("\0 a \0"), "a");
+        assert_eq!(
+            client_label(&format!("{} b", "a".repeat(EXT_CLIENT_MAX - 1))).len(),
+            95
+        );
     }
 
     #[test]
