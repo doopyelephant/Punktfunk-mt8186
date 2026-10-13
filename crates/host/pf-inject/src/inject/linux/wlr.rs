@@ -195,8 +195,12 @@ struct TextKeyboard {
 
 impl WlrootsInjector {
     pub fn open() -> Result<Self> {
-        let conn = Connection::connect_to_env()
-            .context("connect to Wayland (is Sway up + WAYLAND_DISPLAY/XDG_RUNTIME_DIR set?)")?;
+        let conn = match pf_host_config::session::wayland_stream() {
+            Some(Ok(stream)) => Connection::from_socket(stream),
+            Some(Err(_)) => Err(wayland_client::ConnectError::NoCompositor),
+            None => Connection::connect_to_env(),
+        }
+        .context("connect to Wayland (is the compositor up?)")?;
         let mut queue = conn.new_event_queue();
         let qh = queue.handle();
         let _registry = conn.display().get_registry(&qh, ());

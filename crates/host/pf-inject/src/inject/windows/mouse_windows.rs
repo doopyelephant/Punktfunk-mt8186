@@ -10,12 +10,14 @@
 //! Transport is the sealed pad channel ([`PadChannel`], `design/gamepad-channel-sealing.md`):
 //! the unnamed `MouseShm` duplicated into WUDFHost, bootstrapped via
 //! `Global\pfmouse-boot-<index>` ([`mouse_index_for_slot`] — one host per seat, one index each).
-//! [`ensure_resident`] never drops the devnode; it dies with the host service.
+//! [`ensure_resident`]'s keeper drops the devnode only when it fails the session fence;
+//! otherwise it dies with the host service.
 
 use super::gamepad_raii::{
     create_swdevice, verify_fence, DriverAttach, FenceAt, PadChannel, ProofTransport, SwDevice,
     SwDeviceProfile, TRUST_MAILBOX_ENV,
 };
+use crate::pad_slots::PadCreateFault;
 use anyhow::{Context, Result};
 use pf_driver_proto::mouse::{
     abs_report, keyboard_report, mouse_boot_name, relative_report, ring_slot_off, MouseShm,
@@ -82,6 +84,9 @@ pub struct VirtualMouse {
     instance_id: Option<String>,
     /// Console host with HID input allowed: a seat's HID input would land in the console session.
     route_input: bool,
+    /// The HID children carry this host's session. `false` while no driver has made any:
+    /// [`Self::service`] reads them once they exist, and no input goes through before that.
+    fenced: bool,
     /// Write handle on the doorbell collection; `None` until hidclass publishes it.
     doorbell: Option<OwnedHandle>,
     doorbell_next_try: Instant,
@@ -104,8 +109,9 @@ unsafe impl Send for VirtualMouse {}
 
 impl VirtualMouse {
     /// Unnamed DATA + `Global\pfmouse-boot-<index>` for this host's [`mouse_index_for_slot`].
-    /// Stamp index, then magic LAST. A devnode whose HID children miss this host's session
-    /// fails [`verify_fence`] and is removed; the keeper retries.
+    /// Stamp index, then magic LAST. A devnode whose HID children carry another session fails
+    /// [`verify_fence`] and is removed; the keeper retries. A devnode no driver bound has no
+    /// children to read: it stays, unfenced, and [`Self::service`] reads them when they appear.
     pub fn open() -> Result<VirtualMouse> {
         let index = mouse_index_for_slot(std::env::var_os(SEAT_SLOT_ENV).as_deref());
         let boot_name = mouse_boot_name(index);
@@ -146,9 +152,18 @@ impl VirtualMouse {
             ProofTransport::HidSerialString,
         );
         channel.deliver_eager(Duration::from_millis(1500));
-        if sw.is_some() {
-            verify_fence(instance_id.as_deref(), FenceAt::HidChildren { pad: false })?;
-        }
+        let fenced = sw.is_none()
+            || match verify_fence(instance_id.as_deref(), FenceAt::HidChildren { pad: false }) {
+                Ok(()) => true,
+                Err(e) if PadCreateFault::broke_fence(&e) => return Err(e),
+                Err(e) => {
+                    tracing::info!(
+                        error = %format!("{e:#}"),
+                        "virtual HID mouse devnode kept without a driver; input stays on SendInput"
+                    );
+                    false
+                }
+            };
         Ok(VirtualMouse {
             _sw: sw,
             channel,
@@ -161,6 +176,7 @@ impl VirtualMouse {
             ),
             instance_id,
             route_input: index == 0 && std::env::var_os(HID_INPUT_ENV).is_none_or(|v| v != "0"),
+            fenced,
             doorbell: None,
             doorbell_next_try: Instant::now(),
             beat: (0, Instant::now()),
@@ -173,9 +189,31 @@ impl VirtualMouse {
     }
 
     /// Pump sealed-channel delivery and feed the attach watcher (8 ms timer stamps `driver_proto`).
-    pub fn service(&mut self) {
+    /// An unfenced device reads the fence once a late driver made its HID children. `false` means
+    /// they carry another session: the caller drops the device.
+    pub fn service(&mut self) -> bool {
         self.channel.pump();
         self.attach.observe(self.driver_proto());
+        if self.fenced || !self.has_hid_children() {
+            return true;
+        }
+        match verify_fence(
+            self.instance_id.as_deref(),
+            FenceAt::HidChildren { pad: false },
+        ) {
+            Ok(()) => self.fenced = true,
+            Err(e) if PadCreateFault::broke_fence(&e) => return false,
+            Err(_) => {}
+        }
+        true
+    }
+
+    /// Asked before [`verify_fence`], which waits 500 ms for a child that is not there yet.
+    fn has_hid_children(&self) -> bool {
+        self.instance_id
+            .as_deref()
+            .and_then(|id| crate::channel_proof::child_device_ids(id).ok())
+            .is_some_and(|kids| !kids.is_empty())
     }
 
     /// The driver drains the ring and ticked within [`DRIVER_STALE`].
@@ -374,11 +412,12 @@ fn open_for_write(path: &str) -> Result<OwnedHandle> {
 static RESIDENT: Mutex<Option<VirtualMouse>> = Mutex::new(None);
 
 /// Run `f` on the resident device when it carries this host's input: the console host,
-/// [`HID_INPUT_ENV`] not `0`, and a driver taking reports. `None` = use `SendInput`.
+/// [`HID_INPUT_ENV`] not `0`, a device inside the session fence, and a driver taking reports.
+/// `None` = use `SendInput`.
 pub(crate) fn with_hid<R>(f: impl FnOnce(&mut VirtualMouse) -> R) -> Option<R> {
     let mut resident = RESIDENT.lock().unwrap_or_else(PoisonError::into_inner);
     let m = resident.as_mut()?;
-    (m.route_input && m.ready()).then(|| f(m))
+    (m.route_input && m.fenced && m.ready()).then(|| f(m))
 }
 
 /// Ensure the one process-wide virtual mouse exists. Called from
@@ -407,8 +446,10 @@ pub(crate) fn ensure_resident() {
 }
 
 /// Open-with-retry, then publish the device to [`RESIDENT`] and pump it every 250 ms. Open
-/// fails on a mailbox squat (another host); a missing driver is not an open failure
-/// (`DriverAttach` diagnoses via the pump).
+/// fails on a mailbox squat (another host) or a devnode in another session. A missing driver
+/// is not an open failure: the devnode stays and `DriverAttach` diagnoses via the pump, since
+/// each retry is a device arrival and removal the desktop announces. A late driver that
+/// breaks the fence ends the pump; the device goes and the open is retried.
 fn keeper_thread() {
     loop {
         match VirtualMouse::open() {
@@ -419,13 +460,12 @@ fn keeper_thread() {
                 );
                 *RESIDENT.lock().unwrap_or_else(PoisonError::into_inner) = Some(m);
                 loop {
-                    if let Some(m) = RESIDENT
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .as_mut()
-                    {
-                        m.service();
+                    let mut resident = RESIDENT.lock().unwrap_or_else(PoisonError::into_inner);
+                    if resident.as_mut().is_some_and(|m| !m.service()) {
+                        *resident = None;
+                        break;
                     }
+                    drop(resident);
                     std::thread::sleep(Duration::from_millis(250));
                 }
             }
@@ -435,9 +475,9 @@ fn keeper_thread() {
                     "virtual HID mouse open failed — retrying in 60s (headless hosts stream an \
                      invisible cursor until it exists)"
                 );
-                std::thread::sleep(Duration::from_secs(60));
             }
         }
+        std::thread::sleep(Duration::from_secs(60));
     }
 }
 

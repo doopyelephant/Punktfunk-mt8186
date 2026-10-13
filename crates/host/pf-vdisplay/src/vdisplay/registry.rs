@@ -2442,4 +2442,33 @@ mod linux {
             release(self.generation, self.quit.load(Ordering::SeqCst));
         }
     }
+
+    #[cfg(test)]
+    #[path = "../registry/linux_tests.rs"]
+    mod tests;
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    use crate::fake::{Call, FakeDisplay};
+    use crate::Mode;
+
+    /// Off Linux the backend holds the lease, so the registry hands it the quit flag even
+    /// where the session did not, then creates.
+    #[test]
+    fn off_linux_an_acquire_hands_the_backend_the_quit_flag_then_creates() {
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        };
+        let fake = FakeDisplay::new("pf-vdisplay");
+        let quit = Arc::new(AtomicBool::new(false));
+        let out = super::acquire(&mut fake.boxed(), mode, quit, Some(7)).expect("create");
+        assert_eq!(out.node_id, 1);
+        assert_eq!(fake.take_calls(), [Call::SetQuitFlag, Call::Create(mode)]);
+    }
 }

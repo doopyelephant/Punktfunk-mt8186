@@ -169,7 +169,7 @@ fi
 cat > "$tmp/gate_c_baseline" <<'BASELINE'
 clients/linux/src/app/mod.rs:1
 clients/linux/src/app/spawn.rs:1
-clients/session/src/main.rs:4
+clients/session/src/main.rs:3
 crates/client/pf-console-ui/src/screens/settings/tests.rs:1
 crates/host/pf-encode-win/src/windows/nvenc_tests.rs:4
 crates/host/pf-encode/src/enc/linux/nvenc_cuda_tests.rs:2
@@ -177,7 +177,7 @@ crates/host/pf-encode/src/enc/linux/worker.rs:1
 crates/host/pf-inject/src/inject/linux/steam_gadget.rs:5
 crates/host/pf-vdisplay/src/lib.rs:1
 crates/host/pf-vdisplay/src/vdisplay/routing.rs:4
-crates/host/pf-vdisplay/src/vdisplay/session.rs:10
+crates/host/pf-vdisplay/src/vdisplay/session.rs:4
 crates/codec/pf-vkdecode/tests/common/mod.rs:1
 crates/codec/pf-vkdecode/tests/gpu_parity.rs:2
 crates/host/pf-win-display/src/win_display.rs:2

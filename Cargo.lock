@@ -3475,6 +3475,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "pf-driver-proto",
+ "pf-encode-core",
  "pf-encode-win",
  "pf-frame",
  "tracing",
@@ -3503,6 +3504,7 @@ name = "pf-frame"
 version = "0.43.1"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "libc",
  "pf-zerocopy",
  "tracing",

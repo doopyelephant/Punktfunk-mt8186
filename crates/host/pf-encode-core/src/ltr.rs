@@ -296,4 +296,95 @@ mod tests {
         );
         assert_eq!(m.distrust(), 0);
     }
+
+    /// AMF and QSV have no wave: a loss the mirror cannot anchor is the caller's keyframe.
+    const NO_WAVE: rfi::RecoveryPolicy = rfi::RecoveryPolicy {
+        cycle: None,
+        mid_wave: rfi::MidWave::Queue,
+        abandons: true,
+    };
+
+    /// The mirror's own order, checked frame by frame against [`rfi::plan_frame`] fed the
+    /// candidates the mirror holds. Events: `f` a frame, `k` a forced IDR, `a` the newest
+    /// frame lost, `l` every frame lost, `d` distrust, `+` / `-` confirmations one frame
+    /// behind, on and off. Returns the frames: `I`, `A` anchor, `K` confirmed, `.` chain.
+    fn drive(events: &[u8], keep: bool, drop_unforced: bool) -> String {
+        let mut m = LtrMirror::default();
+        let (mut cur, mut forced, mut confirming) = (0i64, true, false);
+        let mut frames = String::new();
+        for &e in events {
+            let floor = confirming.then_some(Acked {
+                last: cur - 1,
+                mask: 0xffff,
+            });
+            match e {
+                b'k' => forced = true,
+                b'+' | b'-' => confirming = e == b'+',
+                b'd' => _ = m.distrust(),
+                // The backends refuse a range below zero before the mirror sees it.
+                b'a' if cur == 0 => {}
+                b'a' => _ = m.invalidate(cur - 1, floor.as_ref()),
+                b'l' => _ = m.invalidate(0, floor.as_ref()),
+                _ => {
+                    let pending = rfi::Pending {
+                        idr: forced,
+                        anchor: m.pending_force.is_some_and(|s| m.trusted(s)),
+                        acked: floor.is_some_and(|f| {
+                            rfi::ltr_acked_step(&m.trusted_view(), &f, cur, m.next)
+                                .1
+                                .is_some()
+                        }),
+                        loss: false,
+                    };
+                    let plan = rfi::plan_frame(rfi::Recovery::default(), pending, &NO_WAVE);
+                    let step = m.step(forced, cur, 4, floor, keep, drop_unforced);
+                    let (was, letter) = match (forced, step.force, step.acked) {
+                        (true, ..) => (rfi::FrameRef::Idr, 'I'),
+                        (_, Some(_), false) => (rfi::FrameRef::Anchor, 'A'),
+                        (_, Some(_), true) => (rfi::FrameRef::Acked, 'K'),
+                        (_, None, _) => (rfi::FrameRef::Chain, '.'),
+                    };
+                    let seen = String::from_utf8_lossy(events);
+                    assert_eq!(plan.refs, was, "frame {cur} of {seen}");
+                    assert_eq!((plan.wave, plan.next), (None, rfi::Recovery::default()));
+                    frames.push(letter);
+                    (forced, cur) = (false, cur + 1);
+                }
+            }
+        }
+        frames
+    }
+
+    /// The order AMF and QSV follow today: an IDR, then a queued force, then the newest
+    /// confirmed slot, then the chain.
+    #[test]
+    fn ltr_recovery_order() {
+        for (events, frames, rule) in [
+            ("ff", "I.", "the first frame is an IDR"),
+            ("ffaff", "I.A.", "a loss with a clean slot before it"),
+            ("fflff", "I...", "a loss with none is declined"),
+            ("ffakff", "I.I.", "an IDR outranks the queued force"),
+            ("ff+ff-f", "I.KK.", "a confirmed reference"),
+            ("ff+aff", "I.AK", "a queued force outranks it"),
+            ("ffadf", "I..", "distrust drops the queued force"),
+            ("ffalf", "I..", "a later loss taints the queued slot"),
+        ] {
+            assert_eq!(drive(events.as_bytes(), false, true), frames, "{rule}");
+        }
+        // Every sequence of up to six events, as AMF in both LTR modes and as QSV.
+        const EVENTS: &[u8] = b"fkald+-";
+        for (keep, drop_unforced) in [(false, true), (true, true), (false, false)] {
+            for len in 1..=6u32 {
+                for n in 0..EVENTS.len().pow(len) {
+                    let mut seq = [0u8; 6];
+                    let mut digits = n;
+                    for e in seq.iter_mut().take(len as usize) {
+                        *e = EVENTS[digits % EVENTS.len()];
+                        digits /= EVENTS.len();
+                    }
+                    drive(&seq[..len as usize], keep, drop_unforced);
+                }
+            }
+        }
+    }
 }

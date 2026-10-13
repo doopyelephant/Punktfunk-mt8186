@@ -74,9 +74,7 @@ pub fn hdr_meta(bytes: &[u8; 28]) -> Option<HdrMeta> {
     if bytes.iter().all(|&b| b == 0) {
         return None;
     }
-    // SAFETY: `HdrMeta` is `repr(C)`, 28 bytes of plain integers with no invalid bit pattern;
-    // `read_unaligned` copies them out of the request's byte array.
-    Some(unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<HdrMeta>()) })
+    Some(bytemuck::pod_read_unaligned(bytes))
 }
 
 /// The request's `open` spec for backend `backend` of its list. The input comes from

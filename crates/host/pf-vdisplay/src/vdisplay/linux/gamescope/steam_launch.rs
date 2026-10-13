@@ -35,6 +35,8 @@ pub fn launch_into_session(
         .arg(held.as_deref().or(flatpak.as_deref()).unwrap_or(cmd));
     // Keeps AppImageLauncher's binfmt hook from replacing an .AppImage with its dialog.
     c.env("APPIMAGELAUNCHER_DISABLE", "1");
+    // The host's Wayland socket, for the arm below that finds no session display.
+    pf_host_config::session::export_to(&mut c);
     // A kept seat's Steam answers on its own `steam.pipe`; without this the forwarder hands the
     // launch to the box's Steam instead. Nothing else in the session takes that home.
     if let Some(home) = steam_home.filter(|h| seat_env_applies(cmd, seat::has_steam(h))) {
@@ -93,6 +95,7 @@ pub(super) fn shut_steam_down(
     cmd.arg("-shutdown")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    pf_host_config::session::export_to(&mut cmd);
     if let Some(home) = seat_home {
         cmd.envs(seat::env(home));
     }
@@ -401,6 +404,7 @@ pub(super) fn hand_launch_to_steam_when_up(
             tracing::info!(%uri, steam_up = up, "gamescope: handing the launch to the nested Steam");
             let mut forward = Command::new("steam");
             forward.arg(&uri).stdout(Stdio::null()).stderr(Stdio::null());
+            pf_host_config::session::export_to(&mut forward);
             if let Some(home) = &steam_home {
                 forward.envs(seat::env(home));
             }

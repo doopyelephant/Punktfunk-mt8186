@@ -277,6 +277,8 @@ pub fn launch_session_command(
             // AppImageLauncher's binfmt hook would swap an .AppImage for its integration
             // dialog on the host's own screen; this makes it exec the image directly.
             c.env("APPIMAGELAUNCHER_DISABLE", "1");
+            // Wayland apps take the live session's socket from the host, not its environment.
+            pf_host_config::session::export_to(&mut c);
             // X11 apps (Steam, Lutris, most native games) need a display of their own. A systemd
             // `--user` host has none to pass on, so take the session's — without it Steam opens
             // "Unable to open a connection to X" instead of the game.

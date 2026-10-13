@@ -15,8 +15,9 @@
 /// SMPTE ST.2086 mastering volume + CEA-861.3 content light level, in HDR10
 /// SEI fixed-point units. Field-for-field the wire `punktfunk_core::quic::HdrMeta`;
 /// this copy keeps the encoders free of the QUIC crate. `pf_encode` converts.
+/// `Pod`: the driver protocol carries it as its 28 bytes, and the derive rejects padding.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct HdrMeta {
     /// Primaries G, B, R as (x, y) in 1/50000 units (ST.2086 order is G, B, R).
     pub display_primaries: [[u16; 2]; 3],
@@ -353,6 +354,29 @@ pub fn clear_virtual_output_hdr_latch() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 28 bytes the driver protocol carries are the fields in declared order.
+    #[test]
+    fn hdr_meta_bytes_follow_field_order() {
+        let meta = HdrMeta {
+            display_primaries: [[1, 2], [3, 4], [5, 6]],
+            white_point: [7, 8],
+            max_display_mastering_luminance: 9,
+            min_display_mastering_luminance: 10,
+            max_cll: 11,
+            max_fall: 12,
+        };
+        let bytes: [u8; 28] = bytemuck::cast(meta);
+        let words: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(words[..8], [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(bytes[16..20], 9u32.to_ne_bytes());
+        assert_eq!(bytes[20..24], 10u32.to_ne_bytes());
+        assert_eq!(words[12..], [11, 12]);
+        assert_eq!(bytemuck::pod_read_unaligned::<HdrMeta>(&bytes), meta);
+    }
 
     #[test]
     fn hevc_hdr_sei_nal_escapes_and_carries_both_messages() {

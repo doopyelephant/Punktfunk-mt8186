@@ -147,6 +147,16 @@ public final class TheaterRenderers {
     public static func supports(_ connection: PunktfunkConnection) -> Bool {
         connection.videoCodec != .pyrowave && !connection.isChroma444
     }
+
+    #if DEBUG
+    /// Screenshot seam: one frame on the screen and its reflection, with no session behind it.
+    public func debugShow(_ pixelBuffer: CVPixelBuffer) {
+        for renderer in [screen, reflection] {
+            if renderer.requiresFlushToResumeDecoding || renderer.status == .failed { renderer.flush() }
+            if let sample = DecodedVideoSink.immediateSample(pixelBuffer) { renderer.enqueue(sample) }
+        }
+    }
+    #endif
 }
 
 final class SessionPresenter {
