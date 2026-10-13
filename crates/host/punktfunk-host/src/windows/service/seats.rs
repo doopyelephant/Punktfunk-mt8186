@@ -2,10 +2,10 @@
 //! `\\.\pipe\punktfunk-seats` pipe the console host reaches it through.
 //!
 //! Seat hosts run in the supervisor's own jobs, never the console host's, so a console relaunch
-//! leaves them running; the service stopping logs their accounts off. Autostart seats come up
-//! first, one at a time, then the pipe opens. Without `HKLM\SOFTWARE\Punktfunk\Seats` the ledger
-//! is still served and every start answers `seats_off`. A slot that cannot open logs the reason
-//! and stays inert: seats never stop the service.
+//! leaves them running; the service stopping logs their accounts off. The pipe opens first;
+//! autostart seats then come up one at a time beside it. Without `HKLM\SOFTWARE\Punktfunk\Seats`
+//! the ledger is still served and every start answers `seats_off`. A slot that cannot open logs
+//! the reason and stays inert: seats never stop the service.
 
 use super::*;
 use pf_seats::windows::pipe::{wake, PipeServer};
@@ -54,38 +54,44 @@ impl SeatsSlot {
     }
 }
 
-/// Autostart seats first, then the seats of recent players, then the pipe until the slot
-/// stops. An autostart's first failure is logged here; the supervisor logs every failure after
-/// that.
+/// The pipe until the slot stops, with autostart seats, then the seats of recent players, coming
+/// up beside it: a start takes minutes, and the console reads the seats meanwhile. A start's
+/// first failure is logged here; the supervisor logs every failure after that.
 fn serve(service: Arc<SeatService<WindowsBackend>>, stop: &Arc<AtomicBool>) {
-    if let Err(error) = service.reconcile_startup() {
-        tracing::warn!(code = ?error.code, "seat autostart: {}", error.message);
-    }
-    crate::seats::lifecycle::keep_warm(&*service);
+    let server = match PipeServer::bind(pf_seats::ipc::PIPE_NAME, Arc::clone(&service)) {
+        Ok(server) => server,
+        Err(error) => {
+            tracing::error!("seats pipe did not open: {error}");
+            return;
+        }
+    };
     {
         let (service, stop) = (Arc::clone(&service), Arc::clone(stop));
         let spawned = std::thread::Builder::new()
-            .name("seats-idle".into())
-            .spawn(move || crate::seats::lifecycle::stop_idle(&*service, &stop));
+            .name("seats-warm".into())
+            .spawn(move || warm(&service, &stop));
         if let Err(error) = spawned {
-            tracing::warn!("seat idle watch did not start: {error}");
+            tracing::warn!("seat warm-up did not start: {error}");
         }
     }
+    tracing::info!(pipe = pf_seats::ipc::PIPE_NAME, "seat supervisor serving");
+    server.serve_until(stop);
+}
+
+/// Autostart seats, the seats of recent players, then the idle watch until the slot stops.
+fn warm(service: &Arc<SeatService<WindowsBackend>>, stop: &Arc<AtomicBool>) {
+    if let Err(error) = service.reconcile_startup() {
+        tracing::warn!(code = ?error.code, "seat autostart: {}", error.message);
+    }
+    crate::seats::lifecycle::keep_warm(&**service);
     for seat in service.ledger().seats {
         if seat.runtime.state == pf_seats::RuntimeState::Failed {
             let why = seat.runtime.detail.as_deref().unwrap_or("no detail");
             tracing::warn!(seat = %seat.id, name = %seat.name, "seat did not start: {why}");
         }
     }
-    if stop.load(Ordering::SeqCst) {
-        return;
-    }
-    match PipeServer::bind(pf_seats::ipc::PIPE_NAME, service) {
-        Ok(server) => {
-            tracing::info!(pipe = pf_seats::ipc::PIPE_NAME, "seat supervisor serving");
-            server.serve_until(stop);
-        }
-        Err(error) => tracing::error!("seats pipe did not open: {error}"),
+    if !stop.load(Ordering::SeqCst) {
+        crate::seats::lifecycle::stop_idle(&**service, stop);
     }
 }
 

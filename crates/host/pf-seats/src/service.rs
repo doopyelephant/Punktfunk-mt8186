@@ -86,22 +86,38 @@ impl<B: PlatformBackend> SeatService<B> {
         }
     }
 
+    /// Refresh every seat's state, then start the autostart seats one at a time. A start runs
+    /// outside the ledger lock, as a `start` command does, so `list` answers meanwhile; a failed
+    /// start is recorded on its row, and the first one is returned once all have run.
     pub fn reconcile_startup(&self) -> Result<(), ApiError> {
-        let mut current = self.lock();
-        let mut next = current.clone();
-        for seat in &mut next.seats {
-            let result = if seat.autostart {
-                self.backend.start(seat)
-            } else {
-                self.backend.status(seat)
-            };
-            seat.runtime = result.unwrap_or_else(|error| RuntimeStatus::failed(error.to_string()));
-            self.learn_pin(seat);
+        let autostart: Vec<SeatId> = {
+            let mut current = self.lock();
+            let mut next = current.clone();
+            for seat in next.seats.iter_mut().filter(|seat| !seat.autostart) {
+                seat.runtime = self
+                    .backend
+                    .status(seat)
+                    .unwrap_or_else(|error| RuntimeStatus::failed(error.to_string()));
+                self.learn_pin(seat);
+            }
+            let ids = next
+                .seats
+                .iter()
+                .filter(|seat| seat.autostart)
+                .map(|seat| seat.id.clone())
+                .collect();
+            if next != *current {
+                self.commit(&mut current, next)?;
+            }
+            ids
+        };
+        let mut first = None;
+        for id in autostart {
+            if let Err(error) = self.change_runtime(&id, true) {
+                first.get_or_insert(error);
+            }
         }
-        if next != *current {
-            self.commit(&mut current, next)?;
-        }
-        Ok(())
+        first.map_or(Ok(()), Err)
     }
 
     fn list(&self) -> Result<CommandResult, ApiError> {
@@ -286,7 +302,8 @@ impl<B: PlatformBackend> SeatService<B> {
     }
 
     fn doctor(&self) -> CommandResult {
-        let current = self.lock();
+        // A copy: the backend's checks take seconds, and the ledger stays readable meanwhile.
+        let current = self.lock().clone();
         let mut diagnostics = vec![Diagnostic::info(
             "ledger",
             format!(
