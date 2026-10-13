@@ -73,6 +73,8 @@ pub fn observe_session_instance(active: &ActiveSession) {
                 epoch,
                 "desktop compositor instance changed — session epoch bumped"
             );
+            // A compositor that just came up can run the undos a dead host left for it.
+            crate::routing::reclaim_topology_journal();
         }
     }
 }

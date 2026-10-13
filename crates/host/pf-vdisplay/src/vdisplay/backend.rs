@@ -351,6 +351,18 @@ pub trait VirtualDisplay: Send {
     fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         None
     }
+    /// Journal seqs of the [`Undo`](crate::topology_journal::Undo)s this [`create`](Self::create)
+    /// pushed for the desk it changed. The registry keeps them with the display group and runs
+    /// them, newest first, when the group empties. Taken once; default none.
+    fn take_undo_seqs(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
+    /// Take back one desk change this backend journaled. `Ok`: the desk is as it was before the
+    /// step, or the change is moot. `Err`: what is still wrong, with the hand command. Default:
+    /// this backend journals nothing.
+    fn undo(&mut self, undo: &crate::topology_journal::Undo) -> Result<()> {
+        anyhow::bail!("no undo in {} for {undo:?}", self.name())
+    }
     /// Whether this [`create`](Self::create) is the first display in its group. Mutter exclusive
     /// `ApplyMonitorsConfig` applies only on first; a later sibling extends, because a fresh
     /// sole-monitor config would disable the first virtual. Registry sets this before `create`.
@@ -430,13 +442,30 @@ pub(crate) fn stash_topology_restore(
     }
 }
 
-/// Apply [`crate::policy::Topology`] where the only desk change is disabling heads (Hyprland,
-/// wlroots). `disable(ours)` returns the heads it turned off; a restore of exactly those lands
-/// in `slot` through [`stash_topology_restore`]. The last step of `create`: nothing fails after
-/// it, so no path disables heads and then unwinds past the hand-off.
-///
-/// `primary` logs and runs as `extend`: Wayland has no primary output, only a focused one, and
-/// the streamed head already holds focus.
+/// Whether [`crate::policy::Topology`] for `client_fp` darkens the desk here. `primary` logs
+/// and answers `false`: Wayland has no primary output, only a focused one, and the streamed
+/// head already holds focus.
+pub(crate) fn exclusive_wanted(tag: &str, client_fp: Option<[u8; 32]>) -> bool {
+    use crate::policy::Topology;
+    match crate::effective_topology(client_fp) {
+        Topology::Extend | Topology::Auto => false,
+        Topology::Primary => {
+            tracing::info!(
+                "{tag}: `topology: primary` has no equivalent here — Wayland has no primary \
+                 output, only a focused one, which the streamed head already holds. Treating it \
+                 as `extend`; use `exclusive` to disable the operator's heads."
+            );
+            false
+        }
+        Topology::Exclusive => true,
+    }
+}
+
+/// Apply [`crate::policy::Topology`] where the only desk change is disabling heads and the
+/// restore is still a closure (Hyprland). `disable(ours)` returns the heads it turned off; a
+/// restore of exactly those lands in `slot` through [`stash_topology_restore`]. The last step of
+/// `create`: nothing fails after it, so no path disables heads and then unwinds past the
+/// hand-off. wlroots journals instead ([`crate::topology_journal`]).
 pub(crate) fn apply_exclusive(
     tag: &str,
     client_fp: Option<[u8; 32]>,
@@ -445,21 +474,13 @@ pub(crate) fn apply_exclusive(
     disable: fn(&str) -> Vec<String>,
     restore: fn(&[String]),
 ) {
-    use crate::policy::Topology;
-    match crate::effective_topology(client_fp) {
-        Topology::Extend | Topology::Auto => {}
-        Topology::Primary => tracing::info!(
-            "{tag}: `topology: primary` has no equivalent here — Wayland has no primary output, \
-             only a focused one, which the streamed head already holds. Treating it as `extend`; \
-             use `exclusive` to disable the operator's heads."
-        ),
-        Topology::Exclusive => {
-            let disabled = disable(ours);
-            let prepared = (!disabled.is_empty())
-                .then(|| Box::new(move || restore(&disabled)) as Box<dyn FnOnce() + Send>);
-            stash_topology_restore(slot, prepared);
-        }
+    if !exclusive_wanted(tag, client_fp) {
+        return;
     }
+    let disabled = disable(ours);
+    let prepared = (!disabled.is_empty())
+        .then(|| Box::new(move || restore(&disabled)) as Box<dyn FnOnce() + Send>);
+    stash_topology_restore(slot, prepared);
 }
 
 #[cfg(test)]
