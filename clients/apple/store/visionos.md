@@ -95,6 +95,32 @@ game streaming,local,open source,remote play,gaming,spatial,immersive,theater,bi
 
 ---
 
+## Screenshots — 3840 × 2160, one to ten
+
+No rendered device here: Apple asks for the app in its surroundings and takes a Simulator capture
+at this size. Five captures, in listing order. Each carries the headline and subhead of the
+frame of that name on the other platforms, in German and English; the app's own strings are
+English in both.
+
+| Frame | Scene | Shows |
+|-------|-------|-------|
+| `pixel` | `01-stream` | The stream window and its ornament |
+| `anywhere` | `02-hosts` | The Hosts tab |
+| `library` | `15f-library-filter` | The Library tab |
+| `gamepad` | `06-console` | The gamepad UI |
+| `settings` | `05-settings` | Display settings |
+
+Capture them with `BUILD_VISIONOS=1 bash scripts/build-xcframework.sh`, then
+`OUT="$TMPDIR/shots" clients/apple/tools/screenshots.sh visionos`, with `PUNKTFUNK_SHOT_HERO`
+naming the store images' game frame on the internal disk. The type is set over them, and the
+upload runs, where the other platforms' store images are composed. No fenced block in this
+section: `check-limits.py` reads each one as a field.
+
+The theater is not in the set. `SCENES=30-vision-theater` captures it, with the stream's window
+panel over the lower middle of the screen: a player drags it clear, a capture cannot.
+
+---
+
 ## Review notes template — visionOS
 
 The steps of `review-notes.md`, rewritten for look-and-pinch and the stream window's controls.

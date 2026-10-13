@@ -904,7 +904,7 @@ public final class StreamViewController: StreamViewControllerBase {
     /// The window's size before the theater shrank it.
     private var sizeBeforeTheater: CGSize?
     /// The window while the picture is on the theater's screen: a panel below its sightline.
-    private static let theaterPanel = CGSize(width: 480, height: 270)
+    public static let theaterPanel = CGSize(width: 480, height: 270)
 
     /// Move the picture into a theater's renderers, or back here with nil. The window shrinks
     /// to a panel meanwhile, then gets its size back. Main thread.

@@ -35,6 +35,15 @@ final class TheaterStage {
     func renderers(for connection: PunktfunkConnection) -> TheaterRenderers? {
         owner == ObjectIdentifier(connection) ? renderers : nil
     }
+
+    #if DEBUG
+    /// Screenshot seam: the theater's renderers with no session behind them.
+    func debugEnter() -> TheaterRenderers {
+        let shot = TheaterRenderers()
+        renderers = shot
+        return shot
+    }
+    #endif
 }
 
 /// The immersive space's content.
@@ -127,27 +136,15 @@ struct StreamOrnament: View {
     private var inTheater: Bool { TheaterStage.shared.renderers(for: connection) != nil }
 
     var body: some View {
-        HStack(spacing: 12) {
-            Button(action: quickActions) {
-                Label("Quick Actions", systemImage: "ellipsis.circle")
+        StreamOrnamentBar(
+            inTheater: inTheater,
+            theater: TheaterRenderers.supports(connection) ? { Task { await toggleTheater() } } : nil,
+            quickActions: quickActions)
+            // A stream that ends in the theater takes the theater down with it.
+            .onDisappear {
+                guard inTheater else { return }
+                Task { await dismissImmersiveSpace() }
             }
-            if TheaterRenderers.supports(connection) {
-                Button { Task { await toggleTheater() } } label: {
-                    Label(
-                        inTheater ? "Leave Theater" : "Theater",
-                        systemImage: inTheater ? "rectangle.inset.filled" : "sparkles.tv")
-                }
-            }
-            NewWindowButton()
-        }
-        .labelStyle(.iconOnly)
-        .padding(12)
-        .glassBackgroundEffect()
-        // A stream that ends in the theater takes the theater down with it.
-        .onDisappear {
-            guard inTheater else { return }
-            Task { await dismissImmersiveSpace() }
-        }
     }
 
     private func toggleTheater() async {
@@ -163,6 +160,32 @@ struct StreamOrnament: View {
         case .opened: break
         default: stage.leave()
         }
+    }
+}
+
+/// The ornament's buttons, apart from the session they drive. A nil `theater` drops its button.
+struct StreamOrnamentBar: View {
+    let inTheater: Bool
+    let theater: (() -> Void)?
+    let quickActions: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button(action: quickActions) {
+                Label("Quick Actions", systemImage: "ellipsis.circle")
+            }
+            if let theater {
+                Button(action: theater) {
+                    Label(
+                        inTheater ? "Leave Theater" : "Theater",
+                        systemImage: inTheater ? "rectangle.inset.filled" : "sparkles.tv")
+                }
+            }
+            NewWindowButton()
+        }
+        .labelStyle(.iconOnly)
+        .padding(12)
+        .glassBackgroundEffect()
     }
 }
 
