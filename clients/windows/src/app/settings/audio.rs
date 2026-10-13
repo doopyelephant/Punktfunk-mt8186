@@ -1,7 +1,7 @@
 //! Audio: channels, format, host audio, microphone and this device's endpoints.
 
 use super::{
-    advanced_group, described_labeled, described_overridable, group, presets, setting_combo,
+    advanced_group, described_labeled, described_overridable, group, presets, rows, setting_combo,
     setting_toggle, Cx,
 };
 use crate::trust::Settings;
@@ -89,8 +89,7 @@ pub(super) fn audio_section(cx: &Cx) -> Vec<Element> {
         [
             Some(described_overridable(
                 cx,
-                "audio_channels",
-                "Audio channels",
+                &rows::AUDIO_CHANNELS,
                 channels_combo,
                 "The speaker layout requested from the host. It downmixes if its own \
                  output has fewer channels.",
@@ -101,7 +100,7 @@ pub(super) fn audio_section(cx: &Cx) -> Vec<Element> {
                 .then(|| {
                     speaker_combo.map(|c| {
                         described_labeled(
-                            "Speaker",
+                            rows::SPEAKER.label,
                             c,
                             "Host audio plays here \u{2014} System default follows \
                              the Windows output device.",
@@ -111,8 +110,7 @@ pub(super) fn audio_section(cx: &Cx) -> Vec<Element> {
                 .flatten(),
             Some(described_overridable(
                 cx,
-                "mic_enabled",
-                "Stream microphone",
+                &rows::MIC,
                 mic_toggle,
                 "This device\u{2019}s microphone feeds the host\u{2019}s virtual mic. \
                  Ctrl+Alt+Shift+V mutes and unmutes it during a stream.",
@@ -121,7 +119,7 @@ pub(super) fn audio_section(cx: &Cx) -> Vec<Element> {
                 .then(|| {
                     mic_dev_combo.map(|c| {
                         described_labeled(
-                            "Microphone",
+                            rows::MIC_DEVICE.label,
                             c,
                             "The input that feeds the host\u{2019}s virtual mic.",
                         )
@@ -143,8 +141,7 @@ pub(super) fn audio_section(cx: &Cx) -> Vec<Element> {
     if stereo {
         advanced.push(described_overridable(
             cx,
-            "audio_format",
-            "Audio quality",
+            &rows::AUDIO_FORMAT,
             format_combo,
             "Lossless sends uncompressed PCM instead of Opus \u{2014} bit-exact, at \
              2.3\u{2013}4.6 Mb/s taken off the top of the link and outside the \
@@ -156,16 +153,14 @@ pub(super) fn audio_section(cx: &Cx) -> Vec<Element> {
     advanced.extend([
         described_overridable(
             cx,
-            "keep_host_audio",
-            "Keep host audio playing",
+            &rows::KEEP_HOST_AUDIO,
             keep_host_audio_toggle,
             "The host\u{2019}s own speakers or headphones keep playing while you stream \
              \u{2014} both ends hear the same audio. Needs a host on 0.32 or newer.",
         ),
         described_overridable(
             cx,
-            "echo_cancel",
-            "Echo cancellation",
+            &rows::ECHO_CANCEL,
             echo_toggle,
             "Keeps the host\u{2019}s audio, playing from this machine\u{2019}s speakers, \
              from being picked up and sent straight back. Turn it off if your microphone \

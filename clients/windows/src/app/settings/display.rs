@@ -1,7 +1,7 @@
 //! Display: resolution, picture, decoding, presentation and host output.
 
 use super::{
-    advanced_group, commit, described_labeled, described_overridable, group, presets,
+    advanced_group, commit, described_labeled, described_overridable, group, presets, rows,
     setting_combo, setting_toggle, Cx,
 };
 use crate::trust::Settings;
@@ -417,8 +417,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
             ),
             described_overridable(
                 cx,
-                "resolution",
-                "Resolution",
+                &rows::RESOLUTION,
                 res_control,
                 "The host drives a real virtual output at exactly this size \u{2014} true \
                  pixels, no scaling. \u{201C}Native display\u{201D} follows the monitor this \
@@ -427,8 +426,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
             ),
             described_overridable(
                 cx,
-                "refresh_hz",
-                "Refresh rate",
+                &rows::REFRESH,
                 hz_combo,
                 "\u{201C}Native\u{201D} resolves to this display\u{2019}s refresh rate at \
                  connect.",
@@ -440,8 +438,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     if !pyrowave {
         picture.push(described_overridable(
             cx,
-            "bitrate_kbps",
-            "Bitrate (Mb/s, 0 = automatic)",
+            &rows::BITRATE,
             bitrate_box,
             "0 lets the host decide (its default, clamped to what it supports). A host \
              card\u{2019}s context menu has a network speed test.",
@@ -450,8 +447,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     picture.extend([
         described_overridable(
             cx,
-            "video_fit",
-            "Picture fit",
+            &rows::VIDEO_FIT,
             fit_combo,
             "When the stream's shape differs from the window. Fit shows the whole \
              picture with black bars, Crop to fill cuts the edges off, Stretch to \
@@ -459,16 +455,14 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         ),
         described_overridable(
             cx,
-            "hdr_enabled",
-            "10-bit HDR",
+            &rows::HDR,
             hdr_toggle,
             "HDR10, when the host has HDR content and this display supports it. \
              With H.264 the stream stays SDR.",
         ),
         described_overridable(
             cx,
-            "present_priority",
-            "Prioritize",
+            &rows::PRESENT,
             present_combo,
             "Lowest latency shows each frame the moment the display can take \
              it \u{2014} a network hiccup becomes an occasional repeated or \
@@ -487,8 +481,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     if smoothing {
         advanced.push(described_overridable(
             cx,
-            "smooth_buffer",
-            "Smoothness buffer",
+            &rows::SMOOTH_BUFFER,
             buffer_combo,
             "Frames held back before showing. Each one absorbs about a refresh of \
              network hiccup and adds a refresh of delay. Automatic holds two.",
@@ -497,16 +490,14 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     advanced.extend([
         described_overridable(
             cx,
-            "render_scale",
-            "Render scale",
+            &rows::RENDER_SCALE,
             scale_control,
             "Above native supersamples for sharpness; below renders lighter on the \
              host and the link. This device resamples the result to the window.",
         ),
         described_overridable(
             cx,
-            "codec",
-            "Video codec",
+            &rows::CODEC,
             codec_combo,
             "A preference \u{2014} the host falls back if it can\u{2019}t encode it. \
              PyroWave is the low-latency wavelet codec for a WIRED link: it trades \
@@ -517,8 +508,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     if pyrowave {
         advanced.push(described_overridable(
             cx,
-            "pyrowave_bpp",
-            "PyroWave quality",
+            &rows::PYROWAVE_QUALITY,
             quality_control,
             &quality_caption,
         ));
@@ -528,8 +518,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         // sentence names the real gate (host: PyroWave || NVENC).
         described_overridable(
             cx,
-            "enable_444",
-            "Full chroma (4:4:4)",
+            &rows::CHROMA,
             chroma_toggle,
             "Full-colour video: crisp small text and thin lines, at more bandwidth. \
              Requires an NVIDIA host (NVENC) or the PyroWave codec \u{2014} other \
@@ -537,16 +526,14 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         ),
         described_overridable(
             cx,
-            "ten_bit_sdr",
-            "10-bit SDR",
+            &rows::TEN_BIT_SDR,
             ten_bit_sdr_toggle,
             "Smoother gradients without HDR \u{2014} the picture is encoded at 10-bit \
              precision. Needs an NVIDIA host; HDR takes over when it engages.",
         ),
         described_overridable(
             cx,
-            "vsync",
-            "V-Sync",
+            &rows::VSYNC,
             vsync_toggle,
             "Tear-free. Turning it off removes the wait for the screen\u{2019}s refresh \
              \u{2014} the lowest possible delay, at the cost of visible tearing. Not \
@@ -554,8 +541,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         ),
         described_overridable(
             cx,
-            "allow_vrr",
-            "Follow variable refresh",
+            &rows::VRR,
             vrr_toggle,
             "On a VRR/FreeSync/G-Sync screen, let the panel refresh in step with the \
              stream instead of on a fixed cadence. Applies to fullscreen sessions; \
@@ -563,8 +549,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         ),
         described_overridable(
             cx,
-            "compositor",
-            "Host compositor",
+            &rows::COMPOSITOR,
             comp_combo,
             "The backend the host uses for its virtual output (Linux hosts only). A \
              specific choice falls back to auto-detection when that backend \
@@ -574,7 +559,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     // Decoder, GPU and the screen saver are facts about THIS device — never per preset.
     if !preset_mode {
         advanced.push(described_labeled(
-            "Keep screen awake",
+            rows::KEEP_AWAKE.label,
             setting_toggle(cx, scope, "keep_awake", s.keep_awake, |s, on| {
                 s.keep_awake = on
             }),
@@ -582,7 +567,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
              five minutes, it lets Windows\u{2019} own screen saver or sleep take over.",
         ));
         advanced.push(described_labeled(
-            "Video decoder",
+            rows::DECODER.label,
             decoder_combo,
             "Automatic picks the hardware path this GPU does best \u{2014} Direct3D 11 on \
              Intel, Vulkan Video on NVIDIA and AMD \u{2014} and falls back to the CPU. \
@@ -590,7 +575,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         ));
         if let Some(c) = gpu_combo {
             advanced.push(described_labeled(
-                "GPU",
+                rows::ADAPTER.label,
                 c,
                 "Which adapter decodes and presents the stream. Automatic uses the GPU \
                  driving this window\u{2019}s display.",

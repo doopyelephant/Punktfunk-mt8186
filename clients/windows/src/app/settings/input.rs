@@ -1,6 +1,6 @@
 //! Input: touch, keyboard and mouse, and the quick-action ring.
 
-use super::{described_overridable, group, presets, setting_combo, setting_toggle, Cx};
+use super::{described_overridable, group, presets, rows, setting_combo, setting_toggle, Cx};
 use windows_reactor::*;
 
 /// Touch-input presets: `(stored value, display label)` — how a touchscreen's fingers drive
@@ -46,8 +46,7 @@ pub(super) fn input_section(cx: &Cx) -> Vec<Element> {
         Some("Touch & pointer"),
         vec![described_overridable(
             cx,
-            "touch_mode",
-            "Touch input",
+            &rows::TOUCH,
             touch_combo,
             "How a touchscreen drives the host: Trackpad moves the host cursor like a \
              laptop trackpad (tap to click), Direct pointer jumps the cursor to wherever \
@@ -60,8 +59,7 @@ pub(super) fn input_section(cx: &Cx) -> Vec<Element> {
         vec![
             described_overridable(
                 cx,
-                "mouse_mode",
-                "Mouse input",
+                &rows::MOUSE,
                 mouse_combo,
                 "Capture locks the pointer to the stream and sends relative motion — \
                  best for games. Desktop leaves the pointer free to enter and leave \
@@ -70,16 +68,14 @@ pub(super) fn input_section(cx: &Cx) -> Vec<Element> {
             ),
             described_overridable(
                 cx,
-                "inhibit_shortcuts",
-                "Capture system shortcuts",
+                &rows::SHORTCUTS,
                 shortcuts_toggle,
                 "Alt+Tab, the Windows key and friends reach the host while the stream \
                  has input captured. Off, they act on this machine instead.",
             ),
             described_overridable(
                 cx,
-                "invert_scroll",
-                "Invert scroll direction",
+                &rows::INVERT_SCROLL,
                 invert_scroll_toggle,
                 "Reverses the wheel and trackpad scroll direction sent to the host.",
             ),
@@ -102,8 +98,7 @@ pub(super) fn quick_actions_section(cx: &Cx) -> Vec<Element> {
     } = *cx;
     vec![described_overridable(
         cx,
-        "overlay_actions",
-        "Quick actions",
+        &rows::QUICK_ACTIONS,
         component(
             crate::app::quick_actions::quick_actions_section,
             crate::app::quick_actions::Props {
