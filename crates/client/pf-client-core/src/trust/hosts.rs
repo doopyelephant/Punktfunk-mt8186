@@ -172,6 +172,13 @@ impl KnownHost {
         true
     }
 
+    /// Drop the pin and keep the record: the next connect pairs again. Returns the
+    /// fingerprint it leaves, which the host's caches are keyed on.
+    pub fn unpair(&mut self) -> String {
+        self.paired = false;
+        std::mem::take(&mut self.fp_hex)
+    }
+
     /// Pins that still exist, in card order, no duplicates. Dangling ids disappear —
     /// a pin is presentation state, never an error.
     pub fn resolved_pins<'a>(&self, catalog: &'a PresetsFile) -> Vec<&'a StreamPreset> {
@@ -1040,6 +1047,25 @@ mod tests {
         // The thread no longer counts as holding the lock: a later edit takes it again.
         assert!(!LOCK_HELD.get());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Unpairing takes the pin and `paired`, and hands the fingerprint back for the caches
+    /// keyed on it. The record, its id and what the user set on it stay.
+    #[test]
+    fn unpair_drops_the_pin_and_keeps_the_record() {
+        let mut h = KnownHost {
+            name: "Desk".into(),
+            fp_hex: fp('a'),
+            paired: true,
+            preset_id: Some("aaaaaaaaaaaa".into()),
+            ..Default::default()
+        };
+        let id = h.id.clone();
+        assert_eq!(h.unpair(), fp('a'));
+        assert!(h.fp_hex.is_empty() && !h.paired);
+        assert_eq!(h.name, "Desk");
+        assert_eq!(h.preset_id.as_deref(), Some("aaaaaaaaaaaa"));
+        assert_eq!(h.id, id);
     }
 
     /// WinUI known-hosts shape (no `last_used`) loads; same path so the two clients share it.

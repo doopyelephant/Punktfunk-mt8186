@@ -946,14 +946,38 @@ pub fn forget_host(
 ) -> anyhow::Result<Option<KnownHost>> {
     let gone = KnownHosts::update_if(|known| pick(known).map(|i| known.hosts.remove(i)))?;
     if let Some(gone) = &gone {
-        crate::library_cache::forget(&gone.fp_hex);
-        crate::host_actions::invalidate(&gone.fp_hex);
-        let mut settings = Settings::load();
-        if crate::start::clear_default(&mut settings, gone.id.as_deref()) {
-            settings.save();
-        }
+        drop_keyed(&gone.fp_hex, gone.id.as_deref());
     }
     Ok(gone)
+}
+
+/// Unpair the record `pick` names and keep it: it has to be paired again before it
+/// connects. Once saved, what was keyed on its pin goes as on a forget, and so does a
+/// default pointing at it: an unpaired host is no landing. Returns the record as saved;
+/// `None`: `pick` named nothing, and nothing was written.
+pub fn unpair_host(
+    pick: impl FnOnce(&KnownHosts) -> Option<usize>,
+) -> anyhow::Result<Option<KnownHost>> {
+    let unpaired = KnownHosts::update_if(|known| {
+        let i = pick(known)?;
+        let fp = known.hosts[i].unpair();
+        Some((fp, known.hosts[i].clone()))
+    })?;
+    Ok(unpaired.map(|(fp, host)| {
+        drop_keyed(&fp, host.id.as_deref());
+        host
+    }))
+}
+
+/// Drop what is keyed on a pin that left the store: the cached game catalog and action
+/// rows under `fp_hex`, and a default-host pointer at record `id`.
+fn drop_keyed(fp_hex: &str, id: Option<&str>) {
+    crate::library_cache::forget(fp_hex);
+    crate::host_actions::invalidate(fp_hex);
+    let mut settings = Settings::load();
+    if crate::start::clear_default(&mut settings, id) {
+        settings.save();
+    }
 }
 
 /// Session binary: installed next to this executable, else `$PATH` (a dev run

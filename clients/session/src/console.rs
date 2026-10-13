@@ -1037,26 +1037,11 @@ impl ServiceState {
     }
 
     fn unpair_host(&self, key: String) {
-        let mut unpaired = None;
-        self.edit_host(&key, "unpair", |h| {
-            let fp = std::mem::take(&mut h.fp_hex);
-            h.paired = false;
-            unpaired = Some((fp, h.id.clone(), h.name.clone()));
-            true
-        });
-        let Some((fp, id, name)) = unpaired else {
-            return;
-        };
-        // The catalog cache is keyed on the fingerprint just dropped; nothing reaches
-        // it again, so it goes now, as a forget's does.
-        pf_client_core::library_cache::forget(&fp);
-        // An unpaired host is no landing: the resolver skips it, and this stops a
-        // later re-pair inheriting the choice.
-        let mut settings = trust::Settings::load();
-        if start::clear_default(&mut settings, id.as_deref()) {
-            settings.save();
+        match orchestrate::unpair_host(|known| index_for_key(known, &key)) {
+            Ok(Some(host)) => tracing::info!(name = %host.name, "host unpaired"),
+            Ok(None) => tracing::warn!(%key, "unpair for an unknown host — ignoring"),
+            Err(e) => self.save_failed(&e),
         }
-        tracing::info!(%name, "host unpaired");
     }
 
     fn wake(&mut self, key: String, then_connect: bool) {
