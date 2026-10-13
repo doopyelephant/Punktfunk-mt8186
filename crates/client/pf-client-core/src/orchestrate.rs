@@ -168,6 +168,54 @@ pub fn exit_route(
     }
 }
 
+/// One connect, from a dial-first wake to its session's exit: the facts [`exit_route`]
+/// reads, kept in one place so a shell holds this and tracks none of them itself. Our own
+/// kill is on the session's [`CancelHandle`] and reaches [`ConnectAttempt::on_exit`] inside
+/// the outcome.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectAttempt {
+    /// The host a dial-first wake went out to, until a session is ready or exits.
+    wake: Option<HostTarget>,
+    /// The dial pins an advertised fingerprint, which a ready session proves.
+    tofu: bool,
+    /// The profile the dial names, unless the dial is already the retry.
+    retry_profile: Option<String>,
+}
+
+impl ConnectAttempt {
+    /// A dial-first wake went out to `host`: only its failed dial falls into wake-and-wait.
+    pub fn arm_wake(&mut self, host: &HostTarget) {
+        self.wake = Some(host.clone());
+    }
+
+    /// A session is about to dial. `tofu`: it pins an advertised fingerprint. `profile` is
+    /// the one it names. `redial` marks the one retry after a `PROFILE_UNKNOWN` refusal.
+    pub fn dial(&mut self, tofu: bool, profile: Option<&str>, redial: bool) {
+        self.tofu = tofu;
+        self.retry_profile = profile.filter(|_| !redial).map(str::to_string);
+    }
+
+    /// The session is streaming, so the host answered and no later exit is the asleep case.
+    /// `true`: the dial trusted its pin on first use, and the caller saves it now.
+    pub fn on_ready(&mut self) -> bool {
+        self.wake = None;
+        self.tofu
+    }
+
+    /// The session that dialed `host` is gone: where its exit leads. Every exit ends the
+    /// attempt. An armed wake counts only for the host it went out to, matched by pin, or by
+    /// address when either side has none.
+    pub fn on_exit(&mut self, host: &HostTarget, outcome: &ConnectOutcome, log: &str) -> ExitRoute {
+        let was = std::mem::take(self);
+        let wake_armed = was.wake.is_some_and(|w| match (w.pin(), host.pin()) {
+            (Some(a), Some(b)) => a == b,
+            _ => w.addr == host.addr && w.port == host.port,
+        });
+        let retry = was.retry_profile.as_deref();
+        exit_route(outcome, was.tofu, retry, wake_armed, log)
+    }
+}
+
 /// Save the pin a ready session proved: request access saves it `paired`, a TOFU dial
 /// unpaired. The target's MACs ride along, so a host first reached by TOFU keeps Wake-on-LAN.
 pub fn persist_on_ready(target: &HostTarget, fp: &str, paired: bool) -> anyhow::Result<()> {
@@ -1314,6 +1362,74 @@ mod tests {
             O::died_banner(1, "C:\\logs\\client.log"),
             "The session didn't start (punktfunk-session exited with code 1). Check C:\\logs\\client.log."
         );
+    }
+
+    /// An armed wake counts for the host it went out to, until a session answers or any
+    /// session exits. What a dial named is read at its own exit and at no later one.
+    #[test]
+    fn a_connect_attempt_reads_its_own_exit() {
+        use punktfunk_core::reject::RejectReason as R;
+        use ExitRoute::*;
+        let at = |fp: &str, addr: &str| HostTarget {
+            addr: addr.into(),
+            port: 9777,
+            fp_hex: Some(fp.into()),
+            ..Default::default()
+        };
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let (desk, typed) = (at(&a, "10.0.0.2"), at("", "10.0.0.2"));
+        let failed = ConnectOutcome::ConnectFailed("gone".into());
+        let banner = Banner("Couldn't connect — gone".into());
+        for (armed, ready, exiting, want) in [
+            (Some(&desk), false, at(&a, "10.0.0.2"), Wake),
+            (Some(&desk), false, at(&a, "10.0.0.9"), Wake), // its pin, on a new lease
+            (Some(&desk), false, at(&b, "10.0.0.2"), banner.clone()), // another host there
+            (Some(&desk), false, at("", "10.0.0.2"), Wake), // one side has no pin: the address
+            (Some(&typed), false, at(&a, "10.0.0.2"), Wake),
+            (Some(&desk), false, at("", "10.0.0.9"), banner.clone()),
+            (Some(&desk), true, at(&a, "10.0.0.2"), banner.clone()), // it answered
+            (None, false, at(&a, "10.0.0.2"), banner.clone()),
+        ] {
+            let mut attempt = ConnectAttempt::default();
+            if let Some(host) = armed {
+                attempt.arm_wake(host);
+            }
+            attempt.dial(false, None, false);
+            if ready {
+                assert!(!attempt.on_ready());
+            }
+            let got = attempt.on_exit(&exiting, &failed, "the client log");
+            assert_eq!(got, want, "armed {armed:?}, ready {ready}, {exiting:?}");
+            // The wake is spent on any exit, another host's included.
+            assert_eq!(attempt, ConnectAttempt::default());
+        }
+
+        let refused = ConnectOutcome::Refused {
+            msg: "no".into(),
+            reason: R::ProfileUnknown,
+        };
+        let rejected = ConnectOutcome::TrustRejected("pin".into());
+        let again = RedialProfile {
+            id: "kid".into(),
+            msg: "no".into(),
+        };
+        let (changed, forget) = (
+            Repair(FINGERPRINT_CHANGED.into()),
+            ForgetProfileThen("no".into()),
+        );
+        for (tofu, profile, redial, outcome, want) in [
+            (true, None, false, &rejected, Repair("pin".into())),
+            (false, None, false, &rejected, changed),
+            (false, Some("kid"), false, &refused, again),
+            (false, Some("kid"), true, &refused, forget),
+        ] {
+            let mut attempt = ConnectAttempt::default();
+            attempt.dial(tofu, profile, redial);
+            assert_eq!(attempt.on_ready(), tofu);
+            let got = attempt.on_exit(&desk, outcome, "the client log");
+            assert_eq!(got, want, "tofu {tofu}, {profile:?}, redial {redial}");
+            assert_eq!(attempt, ConnectAttempt::default());
+        }
     }
 
     /// Packet at 0 and every 6 s, presence each second, 90 s of budget, park (not
