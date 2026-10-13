@@ -219,6 +219,7 @@ pub(super) fn turn_off() -> WinResult<()> {
         Ok(temp) => super::steam::unwrap_box_shortcuts(temp.path()),
         Err(error) => tracing::warn!(%error, "box steam shortcuts not restored"),
     }
+    super::steam::restore_registration();
     drop(seats);
     hklm.delete_subkey_with_flags(SEATS_KEY, KEY_WOW64_64KEY)
         .map_err(|cause| refuse("seats_key", "Couldn't turn seats off.", cause))
