@@ -62,6 +62,12 @@ pub fn seats_enabled() -> bool {
         .is_ok()
 }
 
+/// Turn seats off without the supervisor, for the uninstaller once the service is gone: Remote
+/// Desktop's listener and firewall scope go back as they were. Seat accounts stay.
+pub fn turn_off() -> Result<(), BackendError> {
+    enable::turn_off()
+}
+
 /// Whether this is a Windows Server edition (`ProductType` other than `WinNT`), which
 /// allows concurrent RDP sessions without a session provider. `None` when unreadable.
 pub fn server_edition() -> Option<bool> {

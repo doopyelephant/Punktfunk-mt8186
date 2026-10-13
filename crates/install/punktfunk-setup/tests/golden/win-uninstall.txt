@@ -4,6 +4,7 @@
   + "C:\Program Files\punktfunk\punktfunk-host.exe" service uninstall
   + "C:\Program Files\punktfunk\punktfunk-tray.exe" --quit
   + taskkill /F /IM punktfunk-tray.exe
+  + "C:\Program Files\punktfunk\punktfunk-host.exe" seats off
   + "C:\Program Files\punktfunk\punktfunk-host.exe" driver uninstall
   + "C:\Program Files\punktfunk\punktfunk-host.exe" driver uninstall --gamepad
   + "C:\Program Files\punktfunk\punktfunk-host.exe" driver uninstall --audio

@@ -63,10 +63,21 @@ pub(crate) fn subcommand(cmd: &str, args: &[String]) -> Option<Result<()>> {
         // Installer work in-process: locale-parsed PowerShell files break on ANSI codepages.
         "driver" => crate::install::driver_main(&args[1..]),
         "web" => crate::install::web_main(&args[1..]),
+        "seats" => seats_cli(&args[1..]),
         // HKLM Run fires only at sign-in; this is how an upgrade/crash gets the icon back.
         "tray" => crate::tray::main(&args[1..]),
         _ => return None,
     })
+}
+
+/// `seats off`: what the uninstaller runs once the service is gone, and an operator can too.
+fn seats_cli(args: &[String]) -> Result<()> {
+    if args.first().map(String::as_str) != Some("off") {
+        anyhow::bail!("usage: punktfunk-host seats off");
+    }
+    pf_seats::windows::turn_off().map_err(|e| anyhow::anyhow!("turn seats off: {}", e.message))?;
+    println!("Seats are off.");
+    Ok(())
 }
 
 /// `WxH` (default 64×64) and vendor. 1080 is not 16-aligned — a different driver path.
