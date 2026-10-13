@@ -351,6 +351,11 @@ impl Supervisor {
         {
             runtimes.remove(&key);
         }
+        let idle = runtimes.is_empty();
+        drop(runtimes);
+        if idle {
+            super::steam::restore_registration();
+        }
         Ok(RuntimeStatus::stopped())
     }
 
@@ -406,10 +411,16 @@ impl Supervisor {
                 let _ = worker.join();
             }
         }
-        self.runtimes
+        let mut runtimes = self
+            .runtimes
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .retain(|_, runtime| !runtime.status().finished);
+            .unwrap_or_else(|poison| poison.into_inner());
+        runtimes.retain(|_, runtime| !runtime.status().finished);
+        let idle = runtimes.is_empty();
+        drop(runtimes);
+        if idle {
+            super::steam::restore_registration();
+        }
     }
 }
 

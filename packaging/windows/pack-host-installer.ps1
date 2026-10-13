@@ -68,6 +68,9 @@ $PSNativeCommandUseErrorActionPreference = $false
 trap { Remove-SigningPfx; break }
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+# An x64 build links the C runtime statically, as -TargetDir's exes must: a fresh Windows Server
+# has no Visual C++ runtime, and setup itself has to start there. arm64 keeps the runtime DLL.
+if ($Arch -eq 'x64' -and -not $env:RUSTFLAGS) { $env:RUSTFLAGS = '-C target-feature=+crt-static' }
 $triple = if ($Arch -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
 $archSuffix = if ($Arch -eq 'arm64') { '_arm64' } else { '' }
 $exe = Join-Path $TargetDir 'punktfunk-host.exe'
@@ -233,17 +236,14 @@ else { Write-Host "no pf-vkhdr-layer crate -> installer built WITHOUT the HDR Vu
 
 # --- pf_seat_audio.dll: the seat listener's audio endpoint enumerator (crates/host/pf-seat-audio).
 # Every process of a seat session that uses MMDevAPI loads it at its own bitness, so the x64
-# installer carries an x64 and an x86 build. Static CRT: it runs inside Windows' audio services.
-# Own target dir, so the RUSTFLAGS change does not rebuild the host's tree. ARM64 seats keep RDP-Tcp.
+# installer carries an x64 and an x86 build. ARM64 seats keep RDP-Tcp.
 $seatAudioStage = $null
 if ($Arch -eq 'x64') {
     $seatAudioTarget = Join-Path $OutDir 'seat-audio-target'
     $seatAudioStage = Join-Path $OutDir 'seat-audio'
     $manifest = Join-Path $here '..\..\Cargo.toml'
     $prevTarget = $env:CARGO_TARGET_DIR
-    $prevFlags = $env:RUSTFLAGS
     $env:CARGO_TARGET_DIR = $seatAudioTarget
-    $env:RUSTFLAGS = '-C target-feature=+crt-static'
     try {
         foreach ($build in @(@('x64', 'x86_64-pc-windows-msvc'), @('x86', 'i686-pc-windows-msvc'))) {
             Write-Host "==> building pf_seat_audio.dll ($($build[1]))"
@@ -257,7 +257,6 @@ if ($Arch -eq 'x64') {
     }
     finally {
         if ($prevTarget) { $env:CARGO_TARGET_DIR = $prevTarget } else { Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue }
-        if ($prevFlags) { $env:RUSTFLAGS = $prevFlags } else { Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue }
     }
 }
 

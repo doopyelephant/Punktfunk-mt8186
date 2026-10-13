@@ -8,6 +8,7 @@ import {
 	ImagePlus,
 	Pencil,
 	Plus,
+	RotateCw,
 	Trash2,
 	TriangleAlert,
 	Users,
@@ -435,6 +436,10 @@ export const AddProfileDialog: FC<{
 	/** ...or a Linux host's, once the door is on. */
 	door?: boolean;
 	seatHome?: SeatHome;
+	/** This Windows runs one desktop at a time: seats need Windows Server. */
+	needsServer?: boolean;
+	/** Colours other profiles have: the form starts on the first free one. */
+	takenAccents?: readonly string[];
 	onCancel: () => void;
 	onCreate: (body: ProfileCreate, picture: File | null) => void;
 	isPending: boolean;
@@ -446,21 +451,24 @@ export const AddProfileDialog: FC<{
 	seatsOn = false,
 	door = false,
 	seatHome = "on",
+	needsServer = false,
+	takenAccents = [],
 	onCancel,
 	onCreate,
 	isPending,
 }) => {
+	const freeAccent = firstFreeAccent(takenAccents);
 	const [name, setName] = useState("");
-	const [accent, setAccent] = useState<string>(ACCENTS[1]);
+	const [accent, setAccent] = useState<string>(freeAccent);
 	const [picture, setPicture] = useState<File | null>(null);
 	const [outcome, setOutcome] = useState<Outcome>(linux ? "steam" : "shared");
 	useEffect(() => {
 		if (!open) return;
 		setName("");
-		setAccent(ACCENTS[1]);
+		setAccent(freeAccent);
 		setPicture(null);
 		setOutcome(linux ? "steam" : "shared");
-	}, [open, linux]);
+	}, [open, linux, freeAccent]);
 	const submit = () => {
 		if (!name.trim()) return;
 		onCreate(
@@ -502,7 +510,9 @@ export const AddProfileDialog: FC<{
 			hint: windows
 				? seatsOn
 					? m.profiles_outcome_desktop_hint()
-					: m.profiles_outcome_seats_off()
+					: needsServer
+						? m.profiles_outcome_needs_server()
+						: m.profiles_outcome_seats_off()
 				: linux
 					? door
 						? m.profiles_outcome_desktop_hint_linux()
@@ -645,7 +655,9 @@ const DoctorFooter: FC<{ line: DoctorLine }> = ({ line }) => (
 		>
 			{line.message ??
 				(line.notes > 0
-					? m.profiles_doctor_notes({ count: line.notes })
+					? line.notes === 1
+						? m.profiles_doctor_note()
+						: m.profiles_doctor_notes({ count: line.notes })
 					: m.profiles_seats_healthy())}
 		</span>
 		<Button variant="outline" size="sm" onClick={line.onOpen}>
@@ -653,6 +665,12 @@ const DoctorFooter: FC<{ line: DoctorLine }> = ({ line }) => (
 		</Button>
 	</div>
 );
+
+/** The first palette colour no profile has, so two new profiles don't look alike. */
+export const firstFreeAccent = (taken: readonly string[]): string => {
+	const used = new Set(taken.map((c) => c.toLowerCase()));
+	return ACCENTS.find((c) => !used.has(c.toLowerCase())) ?? ACCENTS[1];
+};
 
 const LEVEL = {
 	error: { rank: 0, Icon: CircleX, tone: "text-destructive" },
@@ -663,11 +681,14 @@ const LEVEL = {
 const byLevel = (a: SeatCheck, b: SeatCheck) =>
 	LEVEL[a.level].rank - LEVEL[b.level].rank;
 
+/** A restart Windows asks for blocks like an error and reads as the next step. */
+const RESTART = { Icon: RotateCw, tone: "text-[var(--warning)]" } as const;
+
 /** Checks as a list, the worst first. */
 const CheckList: FC<{ checks: SeatCheck[] }> = ({ checks }) => (
 	<ul className="flex flex-col gap-1.5 text-sm">
 		{[...checks].sort(byLevel).map((c, i) => {
-			const { Icon, tone } = LEVEL[c.level];
+			const { Icon, tone } = c.code === "restart" ? RESTART : LEVEL[c.level];
 			return (
 				<li key={`${c.code}-${i}`} className="flex items-start gap-2">
 					<Icon className={cn("mt-0.5 size-4 shrink-0", tone)} />
@@ -754,9 +775,20 @@ export const SeatsDialog: FC<{
 	/** The pending change is **Set up Remote Desktop**, which takes minutes. */
 	preparing?: boolean;
 	onChange: (enabled: boolean, allowRdp: boolean, prepare?: boolean) => void;
+	/** Restart the host once the console password is re-entered. */
+	onRestart?: (password: string) => Promise<void>;
 	onClose: () => void;
-}> = ({ open, seating, isPending, preparing = false, onChange, onClose }) => {
+}> = ({
+	open,
+	seating,
+	isPending,
+	preparing = false,
+	onChange,
+	onRestart,
+	onClose,
+}) => {
 	const [allowRdp, setAllowRdp] = useState(false);
+	const [restarting, setRestarting] = useState(false);
 	const stored = seating?.allow_rdp_from_network === true;
 	useEffect(() => {
 		if (open) setAllowRdp(stored);
@@ -765,6 +797,26 @@ export const SeatsDialog: FC<{
 	const checks = seating?.checks ?? [];
 	const fixable =
 		!on && checks.some((c) => PREPARES.has(c.code) && c.level !== "info");
+	const needsRestart = checks.some((c) => c.code === "restart");
+	if (restarting && onRestart) {
+		return (
+			<PasswordConfirmDialog
+				open
+				id="seats-restart-password"
+				title={m.host_power_confirm_title({ action: m.host_power_reboot() })}
+				body={m.host_power_confirm_body()}
+				submitLabel={m.host_power_reboot()}
+				busyLabel={m.host_power_working()}
+				destructive
+				onSubmit={async (password) => {
+					await onRestart(password);
+					setRestarting(false);
+					onClose();
+				}}
+				onClose={() => setRestarting(false)}
+			/>
+		);
+	}
 	return (
 		<Dialog open={open} onOpenChange={(o) => !o && onClose()}>
 			<DialogContent className="max-w-md">
@@ -805,8 +857,20 @@ export const SeatsDialog: FC<{
 						</div>
 					</div>
 				)}
+				{!seating && (
+					<p className="text-sm text-muted-foreground">{m.common_loading()}</p>
+				)}
 				{checks.length > 0 && <CheckList checks={checks} />}
-				{fixable && (
+				{needsRestart && onRestart && (
+					<Button
+						variant="outline"
+						disabled={isPending}
+						onClick={() => setRestarting(true)}
+					>
+						{m.host_power_reboot()}
+					</Button>
+				)}
+				{fixable && !needsRestart && (
 					<div className="space-y-1">
 						<Button
 							variant="outline"

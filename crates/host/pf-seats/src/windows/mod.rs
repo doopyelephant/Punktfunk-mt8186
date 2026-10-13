@@ -143,6 +143,12 @@ impl WindowsBackend {
         self.supervisor.stop_all();
     }
 
+    /// Narrows Remote Desktop to this PC again where the operator chose that and a firewall
+    /// rule has opened it since. For the service's start.
+    pub fn keep_rdp_local(&self) {
+        enable::keep_rdp_local();
+    }
+
     fn ensure_runtime_prerequisites(&self) -> WinResult<()> {
         require_local_system()?;
         if !seats_enabled() {
@@ -241,7 +247,7 @@ impl PlatformBackend for WindowsBackend {
         let mut checks = enable::checks();
         // A role waiting on a restart can't take a licensing mode yet; the restart row says so.
         if prepared.iter().any(|row| row.code == "restart") {
-            checks.retain(|check| check.code != "rds_licensing");
+            checks.retain(|check| check.code != "rds_licensing" && check.code != "restart");
         }
         let blocked = prepared
             .iter()
@@ -332,6 +338,9 @@ impl WindowsBackend {
                 .into_iter()
                 .filter(|check| check.code != "windows_server"),
         );
+        if server_edition() == Some(true) {
+            rows.extend(enable::licensing_row());
+        }
         rows.push(match termservice_running() {
             Ok(true) => Diagnostic::info("termservice", "Remote Desktop Services is running."),
             _ => Diagnostic::error(

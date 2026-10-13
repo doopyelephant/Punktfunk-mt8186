@@ -19,6 +19,10 @@ use std::time::Duration;
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY};
 use winreg::RegKey;
 
+/// The role's state while it is installed and waits on a restart, as [`PROBE`] names it.
+const RESTART_PENDING: &str = "RestartPending";
+/// The row for it: an error so seats don't turn on, shown as the next step.
+const RESTART: &str = "Remote Desktop Session Host is installed. Restart the PC, then press Set up Remote Desktop again to finish.";
 const TERMINAL_SERVER_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Terminal Server";
 const LISTENER_DENIED: &str = "fDenyTSConnections";
 /// Seats key values: the listener was off before [`turn_on`], and the firewall choice.
@@ -28,6 +32,11 @@ const RDP_FROM_NETWORK: &str = "AllowRdpFromNetwork";
 const RDP_RULES_OPENED: &str = "RdpRulesOpened";
 /// The `Remote Desktop` firewall group by the resource id every Windows language shares.
 const RDP_RULE_GROUP: &str = "@FirewallAPI.dll,-28752";
+/// `Remote Desktop Services`, the Session Host role's group, and its two rules on the
+/// listener's port. The group's other rules manage the role and stay as they are.
+const RDS_RULE_GROUP: &str = "@FirewallAPI.dll,-28791";
+const RDS_LISTENER_RULES: &str =
+    "'RemoteDesktopServices-UserMode-In-TCP','RemoteDesktopServices-UserMode-In-UDP'";
 const LOOPBACK: &str = "127.0.0.0/8";
 /// The seats package, with the driver binary its INF lists, in `{app}\staging\pfvdisplay`.
 const PACKAGE: [&str; 3] = [
@@ -39,16 +48,22 @@ const PACKAGE: [&str; 3] = [
 const TRUST_ATTEMPTS: u32 = 3;
 const TRUST_RETRY: Duration = Duration::from_secs(2);
 /// The role's install state, then licensing and a GPU as `0`/`1` flags, on the last line. A role
-/// the cmdlet can't read is `Unknown`, after the cmdlet's error. The licensing types 2 and 4 are
-/// Per Device and Per User. A GPU sits on PCI and isn't `Microsoft …`, the basic display driver:
-/// punktfunk's own display (`ROOT\…`) and a seat's (`SWD\…`) don't count.
+/// the cmdlet can't read is `Unknown`, after the cmdlet's error. `Available`, a role not
+/// installed, is the state enum's zero and false in PowerShell, so the state is tested against
+/// null. The licensing types 2 and 4 are Per Device and Per User. A GPU sits on PCI and isn't
+/// `Microsoft …`, the basic display driver: punktfunk's own display (`ROOT\…`) and a seat's
+/// (`SWD\…`) don't count. An installed role reads `RestartPending` until the restart that
+/// starts it: Windows reports `Installed` at once and stays in administration mode until then.
 const PROBE: &str = "$ProgressPreference='SilentlyContinue'; \
     $ErrorActionPreference='SilentlyContinue'; \
     $role = 'Unknown'; \
     try { $state = (Get-WindowsFeature RDS-RD-Server -ErrorAction Stop).InstallState; \
-    if ($state) { $role = $state } } catch { $_.Exception.Message }; \
-    $mode = (Get-CimInstance -Namespace root/cimv2/TerminalServices \
-    -ClassName Win32_TerminalServiceSetting).LicensingType; \
+    if ($null -ne $state) { $role = $state } } catch { $_.Exception.Message }; \
+    $ts = Get-CimInstance -Namespace root/cimv2/TerminalServices \
+    -ClassName Win32_TerminalServiceSetting; \
+    $mode = $ts.LicensingType; \
+    if ([string]$role -eq 'Installed' -and $ts -and $ts.TerminalServerMode -ne 1) \
+    { $role = 'RestartPending' }; \
     $gpu = [bool](Get-CimInstance Win32_VideoController | \
     Where-Object { $_.PNPDeviceID -like 'PCI\\*' -and $_.Name -notlike 'Microsoft *' }); \
     '{0} {1} {2}' -f $role, [int]($mode -in 2,4), [int]$gpu";
@@ -97,12 +112,15 @@ pub(super) fn checks() -> Vec<Diagnostic> {
     };
     if server {
         checks.push(role_check(&role));
-        checks.push(check(
-            licensing,
-            "rds_licensing",
-            "Remote Desktop licensing is set.",
-            "Remote Desktop licensing isn't set. Press Set up Remote Desktop in Profiles → Seats to set it to Per User.",
-        ));
+        // Licensing takes a mode only once the restart has started the role.
+        if role != RESTART_PENDING {
+            checks.push(check(
+                licensing,
+                "rds_licensing",
+                "Remote Desktop licensing is set.",
+                "Remote Desktop licensing isn't set. Press Set up Remote Desktop in Profiles → Seats to set it to Per User.",
+            ));
+        }
     }
     checks.push(check(
         gpu,
@@ -115,13 +133,16 @@ pub(super) fn checks() -> Vec<Diagnostic> {
 
 /// Install the Session Host role and set licensing to Per User, where Windows Server lacks them.
 /// The last line is the role's outcome, then licensing's: `kept`, `installed` or `restart`, and
-/// `kept`, `set`, `skipped` (the role waits on a restart) or a `ChangeMode` return value.
+/// `kept`, `set`, `skipped` (the role waits on a restart) or a `ChangeMode` return value. A role
+/// installed earlier and not restarted since is `restart` again.
 const PREPARE: &str = "$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; \
     $role = 'kept'; \
     if ((Get-WindowsFeature RDS-RD-Server).InstallState -ne 'Installed') { \
     $r = Install-WindowsFeature RDS-RD-Server; \
     if (-not $r.Success) { throw 'Install-WindowsFeature did not succeed' }; \
-    $role = if ([string]$r.RestartNeeded -eq 'No') { 'installed' } else { 'restart' } }; \
+    $role = if ([string]$r.RestartNeeded -eq 'No') { 'installed' } else { 'restart' } } \
+    elseif ((Get-CimInstance -Namespace root/cimv2/TerminalServices \
+    -ClassName Win32_TerminalServiceSetting).TerminalServerMode -ne 1) { $role = 'restart' }; \
     $lic = 'skipped'; \
     if ($role -ne 'restart') { \
     $s = Get-CimInstance -Namespace root/cimv2/TerminalServices -ClassName Win32_TerminalServiceSetting; \
@@ -155,10 +176,7 @@ pub(super) fn prepare() -> Vec<Diagnostic> {
             "rds_role_installed",
             "Remote Desktop Session Host is now installed.",
         )),
-        "restart" => rows.push(Diagnostic::error(
-            "restart",
-            "Remote Desktop Session Host is installed. Restart the PC, then press Set up Remote Desktop again to finish.",
-        )),
+        "restart" => rows.push(Diagnostic::error("restart", RESTART)),
         _ => {}
     }
     match licensing {
@@ -217,17 +235,136 @@ pub(super) fn turn_off() -> WinResult<()> {
         Ok(temp) => super::steam::unwrap_box_shortcuts(temp.path()),
         Err(error) => tracing::warn!(%error, "box steam shortcuts not restored"),
     }
+    super::steam::restore_registration();
     drop(seats);
     hklm.delete_subkey_with_flags(SEATS_KEY, KEY_WOW64_64KEY)
         .map_err(|cause| refuse("seats_key", "Couldn't turn seats off.", cause))
 }
 
-/// Seats are on and the operator let the network reach Remote Desktop.
+/// Whether the network reaches Remote Desktop: the operator's choice while seats are on. While
+/// they are off it is what the machine does today, so turning seats on keeps a server that is
+/// managed over Remote Desktop reachable unless the operator unticks it.
 pub(super) fn rdp_from_network() -> bool {
-    RegKey::predef(HKEY_LOCAL_MACHINE)
+    match RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(SEATS_KEY, KEY_READ | KEY_WOW64_64KEY)
-        .and_then(|seats| seats.get_value::<u32, _>(RDP_FROM_NETWORK))
-        .is_ok_and(|allowed| allowed == 1)
+    {
+        Ok(seats) => seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok() == Some(1),
+        Err(_) => rdp_open_today(),
+    }
+}
+
+/// Where Windows Firewall keeps its local rules, one `|`-separated string each.
+const FIREWALL_RULES: &str =
+    r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules";
+
+/// The listener is on and a firewall rule lets any address reach it.
+fn rdp_open_today() -> bool {
+    let listening = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(TERMINAL_SERVER_KEY, KEY_READ | KEY_WOW64_64KEY)
+        .and_then(|key| key.get_value::<u32, _>(LISTENER_DENIED))
+        .is_ok_and(|denied| denied == 0);
+    listening && rdp_rule_open()
+}
+
+/// A local firewall rule lets any address reach Remote Desktop. Read from the registry: the
+/// dialog asks every time it opens, and PowerShell's firewall cmdlets take seconds, a minute
+/// after a restart.
+fn rdp_rule_open() -> bool {
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(FIREWALL_RULES, KEY_READ | KEY_WOW64_64KEY)
+        .is_ok_and(|rules| {
+            let names: Vec<String> = rules
+                .enum_values()
+                .flatten()
+                .map(|(name, _)| name)
+                .collect();
+            names
+                .iter()
+                .filter_map(|name| rules.get_value::<String, _>(name).ok())
+                .any(|rule| open_rdp_rule(&rule))
+        })
+}
+
+/// Narrow Remote Desktop again where the operator keeps it on this PC and a rule is open to
+/// the network: the Session Host role and Windows updates add rules of their own.
+pub(super) fn keep_rdp_local() {
+    let narrowed = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(SEATS_KEY, KEY_READ | KEY_WOW64_64KEY)
+        .is_ok_and(|seats| seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok() == Some(0));
+    if narrowed && rdp_rule_open() {
+        match firewall_scope(LOOPBACK) {
+            Ok(()) => tracing::info!("remote desktop narrowed to this pc again"),
+            Err(cause) => tracing::warn!(%cause, "remote desktop not narrowed to this pc"),
+        }
+    }
+}
+
+/// An enabled inbound rule of either Remote Desktop group on the listener's port, with no
+/// remote address named: `RA4=`/`RA6=` fields are how a rule limits who may connect.
+fn open_rdp_rule(rule: &str) -> bool {
+    let fields: Vec<&str> = rule.split('|').collect();
+    let has = |field: &str| fields.iter().any(|f| f.eq_ignore_ascii_case(field));
+    [RDP_RULE_GROUP, RDS_RULE_GROUP]
+        .iter()
+        .any(|group| has(&format!("EmbedCtxt={group}")))
+        && has("Active=TRUE")
+        && has("Dir=In")
+        && has("LPort=3389")
+        && !fields
+            .iter()
+            .any(|f| f.starts_with("RA4=") || f.starts_with("RA6="))
+}
+
+/// Days left without a licence server, then how many are named, as `days|servers`. The days
+/// are empty when Windows doesn't answer.
+const LICENSING: &str = "$ErrorActionPreference='SilentlyContinue'; \
+    $s = Get-CimInstance -Namespace root/cimv2/TerminalServices \
+    -ClassName Win32_TerminalServiceSetting; \
+    $days = ''; $g = $s | Invoke-CimMethod -MethodName GetGracePeriodDays; \
+    if ($g -and $g.ReturnValue -eq 0) { $days = [string]$g.DaysLeft }; \
+    $servers = @(($s | Invoke-CimMethod -MethodName GetSpecifiedLicenseServerList).SpecifiedLSList | \
+    Where-Object { $_ }).Count; \
+    '{0}|{1}' -f $days, $servers";
+
+/// How long Remote Desktop still runs without a licence server, for the doctor. Windows Server
+/// signs seats in for 120 days without one. `None` when Windows doesn't say.
+pub(super) fn licensing_row() -> Option<Diagnostic> {
+    let lines = powershell_lines(LICENSING).ok()?;
+    let (days, servers) = lines.last()?.split_once('|')?;
+    grace_row(
+        days.parse().ok(),
+        servers.parse::<u32>().is_ok_and(|n| n > 0),
+    )
+}
+
+/// A licence server ends the countdown. Without one the row warns for the last 30 days and
+/// refuses at zero, when Windows stops signing seats in.
+fn grace_row(days_left: Option<u32>, licence_server: bool) -> Option<Diagnostic> {
+    const CODE: &str = "rds_grace";
+    if licence_server {
+        return Some(Diagnostic::info(
+            CODE,
+            "Remote Desktop gets its licences from a licence server.",
+        ));
+    }
+    Some(match days_left? {
+        0 => Diagnostic::error(
+            CODE,
+            "Remote Desktop's days without a licence server are over, so seats can't sign in. \
+             Set up a licence server with CALs.",
+        ),
+        days @ 1..=30 => Diagnostic::warning(
+            CODE,
+            format!(
+                "Remote Desktop runs {days} more days without a licence server. After that \
+                 seats can't sign in: set one up with CALs."
+            ),
+        ),
+        days => Diagnostic::info(
+            CODE,
+            format!("Remote Desktop runs {days} more days without a licence server."),
+        ),
+    })
 }
 
 /// A refusal as the check list shows it.
@@ -440,10 +577,14 @@ fn deny_listener(deny: bool) -> std::io::Result<()> {
         .set_value(LISTENER_DENIED, &u32::from(deny))
 }
 
-/// Scope the `Remote Desktop` rule group to `remote`: an address range or `Any`.
+/// Scope the `Remote Desktop` rule group to `remote`: an address range or `Any`. The Session
+/// Host role's listener rules go first, where a machine has them: the last statement sets the
+/// exit code, and a lookup that finds no rule fails it.
 fn firewall_scope(remote: &str) -> Result<(), String> {
     let script = format!(
         "$ErrorActionPreference='Stop'; \
+         Get-NetFirewallRule -Name {RDS_LISTENER_RULES} -ErrorAction SilentlyContinue | \
+         Set-NetFirewallRule -RemoteAddress {remote}; \
          Set-NetFirewallRule -Group '{RDP_RULE_GROUP}' -RemoteAddress {remote}"
     );
     match run(POWERSHELL, &powershell_args(&script)) {
@@ -616,6 +757,7 @@ fn role_check(state: &str) -> Diagnostic {
     const CODE: &str = "rds_role";
     match state {
         "Installed" => Diagnostic::info(CODE, "Remote Desktop Session Host is installed."),
+        RESTART_PENDING => Diagnostic::error("restart", RESTART),
         "Unknown" => Diagnostic::warning(
             CODE,
             "Couldn't confirm that Remote Desktop Session Host is installed. If it isn't, press Set up Remote Desktop in Profiles → Seats.",
@@ -668,6 +810,55 @@ fn refuse(code: &str, sentence: &str, cause: impl std::fmt::Display) -> BackendE
 mod tests {
     use super::*;
     use crate::ipc::DiagnosticLevel;
+
+    #[test]
+    fn only_an_unscoped_enabled_listener_rule_counts_as_open() {
+        let rule = |active: &str, extra: &str| {
+            format!(
+                "v2.33|Action=Allow|Active={active}|Dir=In|Protocol=6|LPort=3389|\
+                 App=%SystemRoot%\\system32\\svchost.exe|Svc=termservice|\
+                 Name=@FirewallAPI.dll,-28775|{extra}EmbedCtxt=@FirewallAPI.dll,-28752|"
+            )
+        };
+        assert!(open_rdp_rule(&rule("TRUE", "")));
+        assert!(!open_rdp_rule(&rule("FALSE", "")));
+        assert!(!open_rdp_rule(&rule("TRUE", "RA4=127.0.0.0/255.0.0.0|")));
+        // The Session Host role's rule opens the same port from its own group.
+        assert!(open_rdp_rule(
+            "v2.33|Action=Allow|Active=TRUE|Dir=In|Protocol=6|LPort=3389|Svc=termservice|\
+             Name=@FirewallAPI.dll,-28805|EmbedCtxt=@FirewallAPI.dll,-28791|"
+        ));
+        // The shadow rule names no port, and the web-socket rules sit in another group.
+        assert!(!open_rdp_rule(
+            "v2.33|Action=Allow|Active=TRUE|Dir=In|Protocol=6|App=RdpSa.exe|\
+             EmbedCtxt=@FirewallAPI.dll,-28752|"
+        ));
+        assert!(!open_rdp_rule(
+            "v2.33|Action=Allow|Active=TRUE|Dir=In|Protocol=6|LPort=3389|\
+             EmbedCtxt=@FirewallAPI.dll,-28782|"
+        ));
+    }
+
+    #[test]
+    fn the_grace_row_warns_late_and_refuses_at_zero() {
+        let level = |days, server| grace_row(days, server).map(|row| row.level);
+        assert_eq!(level(Some(81), false), Some(DiagnosticLevel::Info));
+        assert_eq!(level(Some(30), false), Some(DiagnosticLevel::Warning));
+        assert_eq!(level(Some(0), false), Some(DiagnosticLevel::Error));
+        assert_eq!(level(Some(0), true), Some(DiagnosticLevel::Info));
+        assert_eq!(level(None, false), None);
+    }
+
+    #[test]
+    fn a_role_waiting_on_a_restart_asks_for_it() {
+        let row = role_check(RESTART_PENDING);
+        assert_eq!(
+            (row.code.as_str(), row.level),
+            ("restart", DiagnosticLevel::Error)
+        );
+        let waiting = (RESTART_PENDING.to_string(), [false, true]);
+        assert_eq!(parse_probe("RestartPending 0 1\r\n"), Some(waiting));
+    }
 
     #[test]
     fn the_probe_answers_on_its_last_line() {

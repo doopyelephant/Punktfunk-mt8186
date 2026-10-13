@@ -68,7 +68,9 @@ A failed check changes nothing: the answer is 200 with `enabled: false` and the 
 1. Writes the reservation marker.
 2. Installs `pf_vdisplay_seats.inf` from `staging\pfvdisplay\` beside `punktfunk-host.exe`.
 3. Turns the Remote Desktop listener on if it was off, and limits the **Remote Desktop**
-   firewall rules to `127.0.0.0/8` unless `allow_rdp_from_network` is `true`.
+   firewall rules to `127.0.0.0/8` unless `allow_rdp_from_network` is `true`, with the two
+   port 3389 rules the Session Host role adds. The service limits them again each time it
+   starts.
 4. Adds the seat listener `punktfunk-tcp`: a copy of `RDP-Tcp` on port 3390 whose sessions load
    `pf_seat_audio.dll`, with port 3390 blocked from every address but loopback. The x64 build goes
    to `System32\punktfunk` and the x86 build to `SysWOW64\punktfunk`. Every seat start brings
@@ -238,9 +240,9 @@ warns when our driver date isn't newer than `rdpidd.inf`'s, and on a client edit
 A seat usually has no sound card, so the host mints a render endpoint per seat by binding Valve's
 Remote Play streaming drivers. `SteamStreamingSpeakers.inf` and `SteamStreamingMicrophone.inf` must
 be bound to a device already, or sit in
-`%CommonProgramFiles(x86)%\Steam\drivers\Windows10\<x64|arm64>\`. Steam never has to run. Without
-them a seat streams video with no audio. Pad audio needs neither: it comes from the seat
-listener.
+`%CommonProgramFiles(x86)%\Steam\drivers\Windows10\<x64|arm64>\`. Steam's first start puts them
+there; its installer alone doesn't, and after that start Steam never has to run. Without them a
+seat streams video with no audio. Pad audio needs neither: it comes from the seat listener.
 
 ```
 powershell -File check-seat-audio.ps1

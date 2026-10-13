@@ -61,13 +61,13 @@ pub(super) fn box_install() -> Option<PathBuf> {
         .find(|dir| dir.join("steam.exe").is_file())
 }
 
+/// Where Steam registers its install machine-wide, as `InstallPath`.
+const REGISTRATIONS: [&str; 2] = [r"SOFTWARE\WOW6432Node\Valve\Steam", r"SOFTWARE\Valve\Steam"];
+
 /// The Steam registered machine-wide, when that isn't a seat's copy: a seat's copy rewrites
 /// `InstallPath` to itself whenever it runs. Only for telling the operator where Steam is.
 pub(super) fn registered_install() -> Option<PathBuf> {
-    let profiles = std::env::var_os("SystemDrive")
-        .map(|drive| PathBuf::from(format!(r"{}\Users", drive.to_string_lossy())))
-        .unwrap_or_else(|| PathBuf::from(r"C:\Users"));
-    [r"SOFTWARE\WOW6432Node\Valve\Steam", r"SOFTWARE\Valve\Steam"]
+    REGISTRATIONS
         .into_iter()
         .filter_map(|key| {
             RegKey::predef(HKEY_LOCAL_MACHINE)
@@ -77,13 +77,42 @@ pub(super) fn registered_install() -> Option<PathBuf> {
         })
         .map(PathBuf::from)
         .filter(|dir| dir.join("steam.exe").is_file())
-        .find(|dir| {
-            let seat_copy = dir
-                .parent()
-                .and_then(Path::parent)
-                .is_some_and(|grand| eq_path(grand, &profiles));
-            !seat_copy
-        })
+        .find(|dir| !seat_copy(dir))
+}
+
+/// Put the machine-wide registration back on the box's Steam where it names a seat's copy.
+/// The box's Steam and other software find Steam by it. Called once no seat runs: a running
+/// copy keeps the entry it wrote.
+pub(super) fn restore_registration() {
+    let Some(install) = box_install() else {
+        return;
+    };
+    let install = install.to_string_lossy().into_owned();
+    for name in REGISTRATIONS {
+        let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(name, KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY)
+        else {
+            continue;
+        };
+        let registered = key.get_value::<String, _>("InstallPath");
+        if !registered.is_ok_and(|dir| seat_copy(Path::new(&dir))) {
+            continue;
+        }
+        match key.set_value("InstallPath", &install) {
+            Ok(()) => tracing::info!(key = name, %install, "steam registration back on the box"),
+            Err(error) => tracing::warn!(key = name, %error, "steam registration not restored"),
+        }
+    }
+}
+
+/// `<profiles>\<account>\Steam`: a Steam under a Windows profile, as every seat's copy is.
+fn seat_copy(dir: &Path) -> bool {
+    let profiles = std::env::var_os("SystemDrive")
+        .map(|drive| PathBuf::from(format!(r"{}\Users", drive.to_string_lossy())))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Users"));
+    dir.parent()
+        .and_then(Path::parent)
+        .is_some_and(|grand| eq_path(grand, &profiles))
 }
 
 fn eq_path(a: &Path, b: &Path) -> bool {

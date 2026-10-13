@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
 import { type FC, useEffect, useState } from "react";
+import { apiFetch } from "@/api/fetcher";
 import {
 	getGetHostSettingsQueryKey,
 	patchHostSettings,
@@ -297,6 +298,12 @@ export const SectionProfiles: FC = () => {
 				seatsOn={seatsOn}
 				door={door}
 				seatHome={seatHome}
+				needsServer={
+					seating.data?.checks.some(
+						(c) => c.code === "windows_server" && c.level === "error",
+					) === true
+				}
+				takenAccents={profiles.data?.map((p) => p.accent ?? "") ?? []}
 				onCancel={() => setAdding(false)}
 				onCreate={onCreate}
 				isPending={create.isPending}
@@ -315,6 +322,13 @@ export const SectionProfiles: FC = () => {
 							data: { enabled, allow_rdp_from_network: allowRdp, prepare },
 						})
 					}
+					onRestart={async (password) => {
+						await apiFetch("/api/v1/actions/power.reboot", {
+							method: "POST",
+							headers: { "Content-Type": "application/json" },
+							body: JSON.stringify({ password }),
+						});
+					}}
 					onClose={() => setSeatsOpen(false)}
 				/>
 			)}

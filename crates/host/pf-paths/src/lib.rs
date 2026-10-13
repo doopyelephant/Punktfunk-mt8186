@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 
+pub mod restart_deletes;
 pub mod seat;
 #[cfg(not(windows))]
 pub mod tray_autostart;
