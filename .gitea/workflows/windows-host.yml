@@ -270,6 +270,10 @@ jobs:
     # the PR lane above covers the compile question without touching a secret.
     if: github.event_name != 'pull_request'
     timeout-minutes: 90
+    env:
+      # Every binary the installer ships links the C runtime statically: a fresh Windows Server
+      # has no Visual C++ runtime, and setup itself has to start there.
+      RUSTFLAGS: -C target-feature=+crt-static
     # The arm64 leg must never hold back the x64 canary (and its update manifest) while it is
     # unproven on hardware; drop the override once a Snapdragon box has run it.
     continue-on-error: ${{ matrix.arch == 'arm64' }}
