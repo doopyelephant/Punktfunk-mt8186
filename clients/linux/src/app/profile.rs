@@ -167,7 +167,6 @@ impl AppModel {
                 opts: SpawnOpts {
                     profile: Some(id),
                     redial,
-                    ..SpawnOpts::default()
                 },
             }),
         }
@@ -314,7 +313,6 @@ impl AppModel {
                         opts: SpawnOpts {
                             profile: Some(Some(w.id)),
                             redial: w.redial,
-                            ..SpawnOpts::default()
                         },
                     });
                 }

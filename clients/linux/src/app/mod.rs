@@ -126,13 +126,10 @@ pub enum AppMsg {
         tofu: bool,
         opts: SpawnOpts,
     },
-    /// The child presented its first frame. `cancel` remains live across the reader-to-main
-    /// queue so a Cancel that overtakes this message still wins.
+    /// The child presented its first frame.
     SessionReady {
         req: ConnectRequest,
         fp_hex: String,
-        persist_paired: bool,
-        cancel: Option<CancelHandle>,
     },
     /// The child exited (the session is over, or the connect failed).
     SessionExited {
@@ -177,10 +174,6 @@ pub enum AppMsg {
     Toast(String),
 }
 
-fn ready_was_cancelled(cancel: Option<&CancelHandle>) -> bool {
-    cancel.is_some_and(CancelHandle::is_cancelled)
-}
-
 /// Whether Controller-optimized UI opens the console on this poll: on the first controller
 /// and never on a later one, so a console the player quit stays closed until every
 /// controller has gone and one comes back. Always opens it once, at launch.
@@ -189,7 +182,7 @@ fn console_opens(ui: GamepadUi, prev: usize, now: usize) -> bool {
 }
 
 #[cfg(test)]
-mod cancel_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -200,16 +193,6 @@ mod cancel_tests {
         assert!(!console_opens(GamepadUi::WithController, 1, 0));
         assert!(!console_opens(GamepadUi::Off, 0, 1));
         assert!(!console_opens(GamepadUi::Always, 0, 1));
-    }
-
-    #[test]
-    fn cancelled_request_rejects_late_ready() {
-        let cancel = CancelHandle::default();
-        assert!(!ready_was_cancelled(Some(&cancel)));
-
-        cancel.kill();
-
-        assert!(ready_was_cancelled(Some(&cancel)));
     }
 }
 
@@ -582,12 +565,7 @@ impl SimpleComponent for AppModel {
                 tofu,
                 opts,
             } => self.start_session(req, fp_hex, tofu, opts, &sender),
-            AppMsg::SessionReady {
-                req,
-                fp_hex,
-                persist_paired,
-                cancel,
-            } => self.session_ready(req, fp_hex, persist_paired, cancel),
+            AppMsg::SessionReady { req, fp_hex } => self.session_ready(req, fp_hex),
             AppMsg::SessionExited {
                 req,
                 code,

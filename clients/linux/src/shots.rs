@@ -121,8 +121,6 @@ pub fn run_shot(ctx: &ShotCtx, scene: &str) {
                         ..ConnectRequest::default()
                     },
                     fp_hex: k.fp_hex.clone(),
-                    persist_paired: false,
-                    cancel: None,
                 });
             }
         }

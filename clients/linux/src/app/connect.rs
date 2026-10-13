@@ -108,13 +108,7 @@ impl AppModel {
         opts: SpawnOpts,
         sender: &ComponentSender<Self>,
     ) {
-        // A request-access start carries the cancel its waiting dialog arms; one that never
-        // spawns must close that dialog, or its Cancel tears down a session it does not own.
-        let request = opts.cancel.is_some();
         if !self.flight.hold() {
-            if request {
-                self.flight.close_waiting();
-            }
             return;
         }
         let profile = opts.profile.as_ref().and_then(|p| p.as_deref());
@@ -129,9 +123,6 @@ impl AppModel {
         match spawn::spawn_session(sender.input_sender().clone(), req, fp_hex, tofu, opts) {
             Ok(child) => self.flight.slot = Slot::Session(child),
             Err(e) => {
-                if request {
-                    self.flight.close_waiting();
-                }
                 self.flight.release();
                 self.hosts.emit(HostsMsg::SetSession(None));
                 self.hosts.emit(HostsMsg::ShowError(e));
@@ -139,18 +130,9 @@ impl AppModel {
         }
     }
 
-    /// The child is streaming. A request-access or TOFU pin is saved now, with the request's
+    /// The child is streaming. A pin trusted on first use is saved now, with the request's
     /// MACs.
-    pub(super) fn session_ready(
-        &mut self,
-        req: ConnectRequest,
-        fp_hex: String,
-        persist_paired: bool,
-        cancel: Option<CancelHandle>,
-    ) {
-        if ready_was_cancelled(cancel.as_ref()) {
-            return;
-        }
+    pub(super) fn session_ready(&mut self, req: ConnectRequest, fp_hex: String) {
         self.flight.close_waiting();
         self.hosts.emit(HostsMsg::SetSession(Some((
             req.card_key(),
@@ -160,15 +142,12 @@ impl AppModel {
             &format!("Streaming from {}", req.host.name),
             Some("Disconnect"),
         );
-        let tofu = self.flight.attempt.on_ready();
-        // Request access: the operator's approval is the pairing. TOFU: ready proved the
-        // advertised fingerprint. Either way the stream is up on a pin carried in memory, so
-        // a failed save says so, or the host is gone at the next launch.
-        if persist_paired || tofu {
-            let saved = orchestrate::persist_on_ready(&req.host, &fp_hex, persist_paired);
+        // Ready proved the advertised fingerprint. The stream is up on a pin carried in
+        // memory, so a failed save says so, or the host is gone at the next launch.
+        if self.flight.attempt.on_ready() {
+            let saved = orchestrate::persist_on_ready(&req.host, &fp_hex, false);
             self.store.reload(Changed::Hosts);
             match saved {
-                Ok(()) if persist_paired => self.toast("Approved — connected"),
                 Ok(()) => self.toast(&format!(
                     "Trusted on first use — fingerprint {}…",
                     &fp_hex[..16.min(fp_hex.len())]
