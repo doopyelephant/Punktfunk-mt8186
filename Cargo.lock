@@ -3503,6 +3503,7 @@ name = "pf-frame"
 version = "0.43.1"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "libc",
  "pf-zerocopy",
  "tracing",
