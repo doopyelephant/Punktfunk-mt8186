@@ -16,7 +16,7 @@ use crate::linux::pw_pods::{
     build_sync_timeline_meta_param, serialize_pod, video_raw, Extent, Pacing, HDR_FORMAT_ORDER,
     SPA_VIDEO_TRANSFER_SMPTE2084,
 };
-use crate::linux::sync_timeline::{hand_back, SyncDevice};
+use crate::linux::sync_timeline::{hand_back, StreamBuffers, SyncDevice};
 use crate::linux::CaptureSignals;
 use crate::ZeroCopyPolicy;
 use anyhow::{Context, Result};
@@ -199,29 +199,10 @@ pub(in crate::linux) fn pipewire_thread(
     let _listener = stream
         .add_local_listener_with_user_data(data)
         .state_changed(on_state_changed)
-        .param_changed(on_param_changed)
-        // Pool census. `remove_buffer` also purges the deferred-requeue book: the buffer is
-        // being freed under any hold, so that hold's later release must be a no-op (generation
-        // in `HoldBook::complete` also covers the address being reused by a new pool).
-        .add_buffer(|_stream, ud, buf| {
-            ud.pool.add();
-            if let Ok(mut pool) = ud.defer.pool.lock() {
-                pool.push(buf as usize);
-            }
-        })
-        .remove_buffer(|_stream, ud, buf| {
-            ud.pool.remove();
-            if let Ok(mut pool) = ud.defer.pool.lock() {
-                pool.retain(|&b| b != buf as usize);
-            }
-            if let Some(dev) = &ud.sync {
-                dev.forget(buf as usize);
-            }
-            if let Ok(mut book) = ud.defer.book.lock() {
-                book.purge(buf as usize);
-            }
-        })
-        .process(on_process)
+        .param_changed(|_stream, ud, id, param| on_param_changed(ud, id, param))
+        .add_buffer(|_stream, ud, buf| on_add_buffer(ud, buf as usize))
+        .remove_buffer(|_stream, ud, buf| on_remove_buffer(ud, buf as usize))
+        .process(|stream, ud| on_process(&stream.as_raw_ptr(), ud))
         .register()
         .context("register stream listener")?;
 
@@ -233,7 +214,7 @@ pub(in crate::linux) fn pipewire_thread(
         // SAFETY: the loop thread dispatches this. The stream outlives this attached receiver
         // (declared after it, dropped before it), and the loop stops dispatching once `run()`
         // returns.
-        unsafe { defer_cb.drain(stream_ptr as *mut pw::sys::pw_stream) };
+        unsafe { defer_cb.drain(&(stream_ptr as *mut pw::sys::pw_stream)) };
     });
     // On a timer, not from `.process`: a producer whose whole pool went undelivered sends
     // nothing more, and `.process` never runs again.
@@ -677,7 +658,33 @@ fn on_state_changed(
     }
 }
 
-fn on_param_changed(_stream: &pw::stream::Stream, ud: &mut UserData, id: u32, param: Option<&Pod>) {
+/// `add_buffer`: the pool census, and the list the undelivered sweep walks.
+fn on_add_buffer(ud: &mut UserData, buf: usize) {
+    ud.pool.add();
+    if let Ok(mut pool) = ud.defer.pool.lock() {
+        pool.push(buf);
+    }
+}
+
+/// `remove_buffer`: the buffer is freed under any hold, so the book forgets it and that
+/// hold's later release is a no-op. The generation in `HoldBook::complete` covers the
+/// address naming a buffer of the next pool.
+fn on_remove_buffer(ud: &mut UserData, buf: usize) {
+    ud.pool.remove();
+    if let Ok(mut pool) = ud.defer.pool.lock() {
+        pool.retain(|&b| b != buf);
+    }
+    if let Some(dev) = &ud.sync {
+        dev.forget(buf);
+    }
+    if let Ok(mut book) = ud.defer.book.lock() {
+        book.purge(buf);
+    }
+}
+
+/// `param_changed`: a fixated Format pod sets the size, format and modifier every later
+/// buffer is read by, and drops the imports cached for the pool it replaces.
+fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
     let Some(param) = param else { return };
     if id != pw::spa::param::ParamType::Format.as_raw() {
         return;
@@ -748,12 +755,12 @@ fn on_param_changed(_stream: &pw::stream::Stream, ud: &mut UserData, id: u32, pa
     }
 }
 
-/// `.process`: latest frame only. The newest buffer passes the birth gate, then a stale-frame
-/// skip, then [`consume_frame`]. It is requeued exactly once, unless a hold took it: then
-/// [`super::hold::BufferHold`] owns the requeue, and doing both hands the producer the buffer
-/// twice. Dequeue and requeue stay outside `catch_unwind`, where a panic would strand the
-/// buffer and shrink the fixed pool.
-fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
+/// `.process`, over the buffers of the stream that runs it: latest frame only. The newest
+/// buffer passes the birth gate, then a stale-frame skip, then [`consume_frame`]. It is
+/// requeued exactly once, unless a hold took it: then [`super::hold::BufferHold`] owns the
+/// requeue, and doing both hands the producer the buffer twice. Dequeue and requeue stay
+/// outside `catch_unwind`, where a panic would strand the buffer and shrink the fixed pool.
+fn on_process(stream: &dyn StreamBuffers, ud: &mut UserData) {
     let Some((newest, drained)) = drain_to_newest(stream, ud) else {
         return;
     };
@@ -773,7 +780,7 @@ fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
     if !birth_gate(ud) {
         // SAFETY: `newest` was dequeued from this stream and not yet requeued;
         // requeued exactly once here, then never touched (mirrors the null path).
-        unsafe { ud.requeue_unpublished(stream.as_raw_ptr(), newest) };
+        unsafe { ud.requeue_unpublished(stream, newest) };
         return;
     }
     // PipeWire dispatches from a C trampoline with no catch_unwind; a panic across that
@@ -820,7 +827,7 @@ fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
         if let Some(p) = &ud.pacer {
             p.on_paint();
         }
-        consume_frame(ud, spa_buf, newest, stream.as_raw_ptr(), header.pts);
+        consume_frame(ud, spa_buf, newest, stream, header.pts);
     }));
     // `newest`'s book entry is stable here: only this thread removes entries, never
     // `newest`'s inside `.process`. A panic after publish still leaves the hold live.
@@ -835,7 +842,7 @@ fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
         // completed inside the closure above; `newest` was dequeued from this stream,
         // not yet requeued, and — per the `withheld` check — carries no hold that would
         // requeue it a second time.
-        unsafe { hand_back(ud.sync.as_deref(), stream.as_raw_ptr(), newest) };
+        unsafe { hand_back(ud.sync.as_deref(), stream, newest) };
     }
     if outcome.is_err() {
         // `.process` is per-frame; a deterministic panic would flood. Power-of-two throttle.
@@ -920,20 +927,20 @@ unsafe fn damaged_area(spa_buf: *mut spa::sys::spa_buffer) -> Option<u64> {
 /// buffers are stale: each is requeued after its cursor meta is read. `None` when nothing
 /// was queued.
 fn drain_to_newest(
-    stream: &pw::stream::Stream,
+    stream: &dyn StreamBuffers,
     ud: &mut UserData,
 ) -> Option<(*mut pw::sys::pw_buffer, u32)> {
-    // SAFETY: `stream` is the live stream PipeWire passes into this `.process` callback on the
-    // loop thread; `dequeue_raw_buffer` returns a stream-owned `*mut pw_buffer` or null
-    // (null-checked), single-threaded so no concurrent access.
-    let mut newest = unsafe { stream.dequeue_raw_buffer() };
+    // SAFETY: `stream` is the live stream whose `.process` callback runs this on the loop
+    // thread; `dequeue` returns a stream-owned `*mut pw_buffer` or null (null-checked),
+    // single-threaded so no concurrent access.
+    let mut newest = unsafe { stream.dequeue() };
     if newest.is_null() {
         return None;
     }
     let mut drained = 1u32;
     loop {
         // SAFETY: same stream/loop-thread contract; returns the next stream-owned buffer or null.
-        let next = unsafe { stream.dequeue_raw_buffer() };
+        let next = unsafe { stream.dequeue() };
         if next.is_null() {
             break;
         }
@@ -947,7 +954,7 @@ fn drain_to_newest(
         }
         // SAFETY: `newest` was dequeued from this stream and not yet requeued; we immediately
         // overwrite it, so the requeued pointer is never touched again.
-        unsafe { ud.requeue_unpublished(stream.as_raw_ptr(), newest) };
+        unsafe { ud.requeue_unpublished(stream, newest) };
         newest = next;
         drained += 1;
     }
