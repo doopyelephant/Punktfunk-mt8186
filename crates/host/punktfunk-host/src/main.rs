@@ -485,8 +485,8 @@ fn real_main() -> Result<()> {
     }
 
     // Before `startup`: it skips the display and GPU work for the door.
-    if args.first().map(String::as_str) == Some("serve") && args.iter().any(|a| a == "--door") {
-        pf_paths::seat::set_door();
+    if args.first().map(String::as_str) == Some("serve") {
+        pf_paths::seat::resolve(args.iter().any(|a| a == "--door"));
     }
     startup(&args);
 
