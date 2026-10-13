@@ -26,7 +26,7 @@ host restart leaves them running; stopping the service logs every seat account o
   seat: it records the RDP certificate the keeper will accept. Turning seats on does this too.
 - **The seats group.** Every seat account is in the local group `punktfunk-seats`, rejoined at
   each start. The host denies that group on `%ProgramData%\punktfunk\ingest`, so a seat can't
-  replace the owner's Playnite library. The doctor's `account_policy` row reports the membership.
+  replace the owner's Playnite library. The doctor's `account` row reports the membership.
 - **Seats on and off.** Without the reservation marker below the ledger is still listed, and
   every start answers `seats_off`. [Turn seats on and off](#turn-seats-on-and-off) writes the marker.
 
@@ -58,8 +58,9 @@ never a paired device or a plugin.
 |---|---|
 | `GET /api/v1/profiles/seating` | Returns `enabled`, `platform` (`windows`, `linux` on a door, or `other`) and `checks`: Windows Server, the Remote Desktop Session Host role, licensing and a graphics card. |
 | `PUT /api/v1/profiles/seating` with `{"enabled": true, "allow_rdp_from_network": false}` | Turns seats on. |
+| The same with `"prepare": true` | First installs `RDS-RD-Server` and sets licensing to Per User where missing, then turns seats on. A role that needs a restart answers a `restart` error and leaves seats off. |
 | `PUT /api/v1/profiles/seating` with `{"enabled": false}` | Stops every seat and turns seats off. The accounts stay. |
-| `GET /api/v1/profiles/doctor` | Returns the supervisor's report. |
+| `GET /api/v1/profiles/doctor` | Returns the supervisor's report: one sentence per row, `seat_id` and `seat_name` on a seat's rows. |
 
 A failed check changes nothing: the answer is 200 with `enabled: false` and the check as an
 `error`. When every check passes, turning on:
@@ -78,9 +79,16 @@ The keeper connects to 3390 when it listens, else to 3389. TermService opens and
 as its key appears and goes; nothing restarts.
 
 Turning off puts the listener and the firewall scope back, removes the seat listener and its
-files, and removes the marker. A file the audio services still hold goes at the next restart. The
-seat display driver stays in the driver store. Off Windows and off a door, `GET` answers `enabled: false`
-with `platform: other`, and `PUT` answers 409.
+files, points the box's Steam shortcuts back at Steam, and removes the marker. A file the audio
+services still hold goes at the next restart. The seat display driver stays in the driver store.
+`punktfunk-host seats off` does the same without the service; the uninstaller runs it. Off
+Windows and off a door, `GET` answers `enabled: false` with `platform: other`, and `PUT` answers
+409.
+
+Every seat start compares the `DriverVer` of `staging\pfvdisplay\pf_vdisplay_seats.inf` with the
+seats packages in the driver store and adds the staged one when none matches: an uninstall's
+`driver uninstall` deletes the package, and an upgrade only stages the new one. A running seat
+keeps its driver until its next session.
 
 ## The environment a seat host is started with
 
@@ -107,6 +115,7 @@ presents its own certificate and honours the box's pairings and grants.
 | `PUNKTFUNK_NATIVE_PORT` | a per-seat port |
 | `PUNKTFUNK_HOST_NAME` | the seat's name |
 | `PUNKTFUNK_GAMESTREAM` | `0` |
+| `PUNKTFUNK_MDNS` | `0` |
 | `PUNKTFUNK_AUDIO_OUTPUT_MODE` | `follow_default` |
 
 The supervisor must keep each seat's RDP session active. A seat host runs outside the console
@@ -173,6 +182,18 @@ session by design, and display activation fails while its session is inactive.
   it as pad audio. A seat on `RDP-Tcp` has no pad audio.
 - **No status tray.** A seat host doesn't start or supervise one; the supervisor is the control
   surface.
+- **Steam starts as the seat's copy.** Once the copy exists, each seat start writes the seat
+  account's `Software\Punktfunk\SeatSteam` (`Exe`, `Ipc` = `pfseat<seat id>`), a `steam://`
+  handler in its classes hive (marker value `PunktfunkSeat`) and Steam's `Run` entry, all naming
+  the copy under its IPC name. SYSTEM owns both keys; the seat may only read them. The box's
+  public Desktop `Steam.lnk` and the shared Start menu's `Steam\Steam.lnk` start
+  `punktfunk-tray.exe --steam "<their steam.exe>" <their arguments>`, which starts the copy for
+  an account with `SeatSteam` and the box's Steam for any other. Their targets are kept in the
+  Seats key's `SteamLinks` and put back when seats go off. Starting the box's `steam.exe`
+  directly on a seat still closes the other Steam.
+- **Not a host of its own to clients.** A seat host never advertises over mDNS, whatever
+  `PUNKTFUNK_MDNS` says, and its `Welcome` carries management port `0`: its API answers on
+  loopback only, so a client keeps the box's port, where the library comes from.
 
 ## Checking a seat can actually stream
 
@@ -196,7 +217,7 @@ Remote Desktop included, so the build produces two packages from the same `.inx`
 | Package | Claims | Installed by |
 |---|---|---|
 | `pf_vdisplay.{inf,cat}` | the console display device, `Root\pf_vdisplay` | every punktfunk install |
-| `pf_vdisplay_seats.{inf,cat}` | `RdpIdd_IndirectDisplay` only | the console, when seats are turned on |
+| `pf_vdisplay_seats.{inf,cat}` | `RdpIdd_IndirectDisplay` only | turning seats on, and a seat start when the store lacks the staged version |
 
 A machine that never turned seats on never claims the id.
 

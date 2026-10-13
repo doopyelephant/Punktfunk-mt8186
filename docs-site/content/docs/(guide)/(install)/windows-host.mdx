@@ -111,9 +111,8 @@ The drivers carry a separate self-signed certificate (`CN=punktfunk-driver`, SHA
   10 MB. Only Administrators can read them, so use an elevated PowerShell or the console's
   **Troubleshooting** page. `RUST_LOG=debug` in `host.env` adds detail.
 - **Seats for several people.** Running a seat per person needs **Windows Server** and a **Remote
-  Desktop Services CAL for every seat**; Per-Device CALs fit fixed seats. Windows 10 and 11 serve
-  one session at a time, so a second seat can't stream beside the first there. How seats run is in
-  the [multi-seat contract](/docs/developers/multi-seat-contract).
+  Desktop Services CAL for every seat**. Windows 10 and 11 serve one session at a time, so a second
+  seat can't stream beside the first there. See [Seats on Windows](/docs/windows-seats).
 - **Two processes.** Task Manager shows two `punktfunk-host.exe`: the service and the worker it
   starts in your session. Ending the worker only makes the service start another; stop the host
   from the status icon or with `punktfunk-host service stop`.
@@ -127,8 +126,9 @@ run a newer setup over the old one. All three keep your config, pairings and con
 ## Uninstalling
 
 Open **Settings** → **Apps** → **Installed apps** → **Punktfunk Host** → **Uninstall**, or run
-`winget uninstall unom.PunktfunkHost`. It removes the service, the status icon and its Start menu
-entry, the virtual display, gamepad and audio devices with the driver certificate, the scheduled
-task, the firewall rules, the HDR layer and the `PATH` entry. `%ProgramData%\punktfunk` stays, so
+`winget uninstall unom.PunktfunkHost`. It turns [seats](/docs/windows-seats) off and removes the
+service, the status icon and its Start menu entry, the virtual display, gamepad and audio devices
+with the driver certificate, the scheduled task, the firewall rules, the HDR layer and the `PATH`
+entry. `%ProgramData%\punktfunk` stays, so
 a reinstall keeps your identity and pairings; [Uninstall → Windows host](/docs/uninstall#windows-host)
 clears it.
