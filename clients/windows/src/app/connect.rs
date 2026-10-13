@@ -9,8 +9,8 @@ use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
 use crate::trust::{self, KnownHosts};
 use pf_client_core::orchestrate::{
-    self, trust_route, wake_parked_line, CancelHandle, ConnectOutcome, ExitRoute, HostTarget,
-    TrustRoute, WakeOutcome, WakeWait, FINGERPRINT_CHANGED, WAKE_PARKED_HINT,
+    self, trust_route, wake_parked_line, CancelHandle, ConnectAttempt, ConnectOutcome, ExitRoute,
+    HostTarget, TrustRoute, WakeOutcome, WakeWait, FINGERPRINT_CHANGED, WAKE_PARKED_HINT,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -198,25 +198,9 @@ pub(crate) fn initiate_launch_waking(
     initiate_opts(ctx, target, Some(launch), set_screen, set_status, wake)
 }
 
-/// Tunables that differ between the normal connect and the no-PIN "request access" flow.
-/// `Default` is the normal connect: short handshake budget, persist *unpaired* on TOFU, and the
-/// plain "Connecting" screen.
+/// What one dial carries beyond its target. `Default` is a plain connect.
+#[derive(Default)]
 pub(crate) struct ConnectOpts {
-    /// Handshake budget. Request-access uses a long one because the host PARKS the connection
-    /// until the operator clicks Approve in its console (see the host's `PENDING_APPROVAL_WAIT`).
-    connect_timeout: Duration,
-    /// Persist the host as *paired* on a successful connect. Set for request-access, where the
-    /// operator's approval IS the pairing, so future connects are silent (rule 1). Normal TOFU
-    /// persists the host *unpaired* (pinned, but not PIN/approval-verified).
-    persist_paired: bool,
-    /// Show the cancelable "waiting for approval" screen instead of "Connecting" (request-access).
-    awaiting_approval: bool,
-    /// Set by the waiting screen's Cancel button. `NativeClient::connect` is blocking with no
-    /// abort, so Cancel returns the UI immediately and leaves the parked connect to resolve/time
-    /// out; this request's event loop (which captured the same `Arc` at spawn) then tears down
-    /// silently when the parked connect finally resolves — without touching a screen a new
-    /// session may already own.
-    cancel: Option<Arc<AtomicBool>>,
     /// Fall into the Wake-on-LAN wait ([`wake_and_connect`]) when THIS dial fails with a plain
     /// connect failure (not a trust rejection). Set by the dial-first path, with auto-wake on,
     /// for a saved host that isn't advertising but has a known MAC. The wait's own redial
@@ -229,21 +213,6 @@ pub(crate) struct ConnectOpts {
     profile: Option<String>,
     /// This dial is the one retry after the host refused the profile as unknown.
     retried: bool,
-}
-
-impl Default for ConnectOpts {
-    fn default() -> Self {
-        Self {
-            connect_timeout: Duration::from_secs(15),
-            persist_paired: false,
-            awaiting_approval: false,
-            cancel: None,
-            wake_on_fail: false,
-            launch: None,
-            profile: None,
-            retried: false,
-        }
-    }
 }
 
 /// A fresh pairing's first connect: it asks who plays, as any connect to a paired host does.
@@ -279,7 +248,7 @@ fn connect_with(
 /// Spawn-mode connect: run the stream in the punktfunk-session binary and turn its events
 /// into screens. The child never connects unpinned: a stored or ceremony pin, else the
 /// advertised fingerprint (TOFU, saved once ready proves the host holds it); no fingerprint
-/// routes to the PIN ceremony. Its exit goes where [`orchestrate::exit_route`] says.
+/// routes to the PIN ceremony. One [`ConnectAttempt`] reads its ready and its exit.
 fn connect_spawn(
     ctx: &Arc<AppCtx>,
     target: &Target,
@@ -308,15 +277,8 @@ fn connect_spawn(
     *ctx.shared.stats.lock().unwrap() = None;
     ctx.shared.browse.store(false, Ordering::SeqCst);
     set_status.call(String::new());
-    set_screen.call(if opts.awaiting_approval {
-        Screen::RequestAccess
-    } else {
-        Screen::Connecting
-    });
+    set_screen.call(Screen::Connecting);
 
-    let persist_paired = opts.persist_paired;
-    let cancel = opts.cancel;
-    let mut wake_on_fail = opts.wake_on_fail;
     let ctx2 = ctx.clone();
     let shared = ctx.shared.clone();
     let (ss, st) = (set_screen.clone(), set_status.clone());
@@ -331,40 +293,32 @@ fn connect_spawn(
     // The launch id: an explicit opts pick (the library's tap-to-play), else one riding
     // the target — a deep link's `launch=` that detoured through the PIN ceremony.
     let launch_arg = opts.launch.clone().or_else(|| target.launch.clone());
-    // What a `PROFILE_UNKNOWN` refusal may dial again: never the retry itself.
-    let (retry, retry_launch) = (
-        opts.profile.clone().filter(|_| !opts.retried),
-        launch_arg.clone(),
-    );
+    let retry_launch = launch_arg.clone();
+    let mut attempt = ConnectAttempt::default();
+    if opts.wake_on_fail {
+        attempt.arm_wake(&host);
+    }
+    attempt.dial(tofu, opts.profile.as_deref(), opts.retried);
     let spawned = crate::spawn::spawn_session(
         host.clone(),
-        opts.connect_timeout.as_secs(),
+        orchestrate::DEFAULT_CONNECT_TIMEOUT_SECS,
         launch_arg.as_deref(),
         preset_arg.as_deref(),
         profile_arg.as_deref(),
         child,
         move |event| {
             use crate::spawn::SpawnEvent;
-            // The child is gone — bring the shell back BEFORE the cancel gate below, so a
-            // Ready that raced a Cancel (and hid the shell) can never strand it hidden.
+            // The child is gone: bring the shell back, so a Ready that raced a Cancel and
+            // hid the shell never strands it hidden.
             if matches!(event, SpawnEvent::Exited { .. }) {
                 crate::shell_window::restore();
             }
-            // A cancelled request-access connect that resolved late: tear down silently —
-            // Cancel already killed the child and returned the UI to the host list.
-            if cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
-                return;
-            }
             match event {
                 SpawnEvent::Ready => {
-                    // Ready proves the host answered, so no later exit is the asleep case.
-                    wake_on_fail = false;
-                    // Request access saves the host PAIRED, plain TOFU pinned but unpaired. A
-                    // failed save waits on the status line, which a clean exit leaves for the
-                    // host list.
-                    if (persist_paired || tofu)
-                        && let Err(e) =
-                            orchestrate::persist_on_ready(&target.host, &fp_hex, persist_paired)
+                    // A pin trusted on first use is saved unpaired. A failed save waits on the
+                    // status line, which a clean exit leaves for the host list.
+                    if attempt.on_ready()
+                        && let Err(e) = orchestrate::persist_on_ready(&target.host, &fp_hex, false)
                     {
                         st.call(format!("Connected, but couldn't save — {e:#}"));
                     }
@@ -385,13 +339,7 @@ fn connect_spawn(
                         }
                     };
                     let log = crate::spawn::log_hint();
-                    match orchestrate::exit_route(
-                        &outcome,
-                        tofu,
-                        retry.as_deref(),
-                        wake_on_fail,
-                        &log,
-                    ) {
+                    match attempt.on_exit(&host, &outcome, &log) {
                         // The user closed the stream window, or Disconnect killed it.
                         ExitRoute::Silent => ss.call(Screen::Hosts),
                         ExitRoute::Banner(msg) => {
