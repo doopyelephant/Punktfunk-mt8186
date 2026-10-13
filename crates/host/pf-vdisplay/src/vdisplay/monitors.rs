@@ -251,8 +251,10 @@ pub(crate) const DISABLE_BUDGET: std::time::Duration = std::time::Duration::from
 /// dark are the restore's input. A listing error or a refused head leaves that screen lit, never
 /// the session down. `tag` prefixes the log lines.
 ///
-/// `refocus(ours)` runs once anything went dark: the compositor re-homes workspaces and picks a
-/// new focus, and launches must still land on the stream.
+/// `journal(plan)` runs before the first head goes dark, with every head about to: the
+/// write-ahead record of what to re-enable. `refocus(ours)` runs once anything went dark: the
+/// compositor re-homes workspaces and picks a new focus, and launches must still land on the
+/// stream.
 pub(crate) fn disable_for_exclusive(
     tag: &str,
     heads: Result<Vec<PhysicalMonitor>>,
@@ -260,6 +262,7 @@ pub(crate) fn disable_for_exclusive(
     keep: &[String],
     disable: impl Fn(&str) -> Result<()>,
     refocus: impl FnOnce(&str),
+    journal: impl FnOnce(&[String]),
 ) -> Vec<String> {
     let heads = match heads {
         Ok(h) => h,
@@ -280,6 +283,7 @@ pub(crate) fn disable_for_exclusive(
         );
         return Vec::new();
     }
+    journal(&targets);
     let disabled: Vec<String> = targets
         .into_iter()
         .filter(|name| match disable(name) {
@@ -452,25 +456,40 @@ mod tests {
         );
     }
 
-    /// Only heads the primitive accepted come back; refocus runs once, only after a disable.
+    /// Only heads the primitive accepted come back; the whole plan is journaled before the
+    /// first disable, refused head included; refocus runs once, only after a disable.
     #[test]
     fn exclusive_returns_the_heads_that_went_dark_and_refocuses_once() {
         let heads = vec![mon("DP-1"), mon("HDMI-A-1"), mon("PF-1-1")];
         let refocused = std::cell::RefCell::new(Vec::new());
+        let journaled = std::cell::RefCell::new(Vec::new());
         let refuse_hdmi = |n: &str| match n {
             "HDMI-A-1" => Err(anyhow::anyhow!("refused")),
             _ => Ok(()),
         };
-        let got = disable_for_exclusive("t", Ok(heads), "PF-1-1", &[], refuse_hdmi, |o| {
-            refocused.borrow_mut().push(o.to_string())
-        });
+        let got = disable_for_exclusive(
+            "t",
+            Ok(heads),
+            "PF-1-1",
+            &[],
+            refuse_hdmi,
+            |o| refocused.borrow_mut().push(o.to_string()),
+            |plan| journaled.borrow_mut().extend_from_slice(plan),
+        );
         assert_eq!(got, ["DP-1"]);
+        assert_eq!(*journaled.borrow(), ["DP-1", "HDMI-A-1"]);
         assert_eq!(*refocused.borrow(), ["PF-1-1"]);
 
         let unlisted = Err(anyhow::anyhow!("gone"));
-        let none = disable_for_exclusive("t", unlisted, "x", &[], refuse_hdmi, |_| {
-            panic!("nothing went dark, so nothing refocuses")
-        });
+        let none = disable_for_exclusive(
+            "t",
+            unlisted,
+            "x",
+            &[],
+            refuse_hdmi,
+            |_| panic!("nothing went dark, so nothing refocuses"),
+            |_| panic!("nothing listed, so nothing to journal"),
+        );
         assert!(none.is_empty());
     }
 
