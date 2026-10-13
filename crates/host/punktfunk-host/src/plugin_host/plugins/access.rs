@@ -3,7 +3,8 @@
 //! `plugin-run/plugin-grants.json` holds what the operator allowed (`{id: {grants, denied}}`; the
 //! v1 `{id: [path]}` shape still parses, each string a read-only grant).
 //! `plugin-access-pending.json` holds requests a plugin posted that await a decision. Both are
-//! written tmp+rename and re-read on every operation, so a CLI write is never stale here.
+//! written tmp+rename and re-read on every operation, so a CLI write is never stale here. A
+//! grants file that can't be read is never replaced: every write and listing fails, naming it.
 //!
 //! The runner binds these roots (read-only unless `write`); a plugin can ask, never grant —
 //! every request is validated against the real filesystem before it is stored. On Linux the
@@ -538,22 +539,37 @@ impl AccessStore {
         }
     }
 
-    /// Both records, fresh — a `plugins grant` from another process must be seen.
-    fn load_access(&self) -> BTreeMap<String, PluginAccess> {
+    /// The grants file, fresh — a `plugins grant` from another process must be seen. No file
+    /// is no grants. One that can't be read or parsed is an error naming it, so a caller that
+    /// writes stops before it replaces the file.
+    fn load_access(&self) -> io::Result<BTreeMap<String, PluginAccess>> {
         let path = self.runner_dir.join(GRANTS_FILE);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return BTreeMap::new();
+        let unreadable = |what: &str, e: &dyn std::fmt::Display| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{what} {}: {e}", path.display()),
+            )
         };
-        match serde_json::from_str::<BTreeMap<String, AccessEntry>>(&text) {
-            Ok(map) => map
-                .into_iter()
-                .map(|(id, e)| (id, e.into_access()))
-                .collect(),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "plugin grants: unreadable");
-                BTreeMap::new()
-            }
-        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) => return Err(unreadable("read", &e)),
+        };
+        let map: BTreeMap<String, AccessEntry> =
+            serde_json::from_str(&text).map_err(|e| unreadable("parse", &e))?;
+        Ok(map
+            .into_iter()
+            .map(|(id, e)| (id, e.into_access()))
+            .collect())
+    }
+
+    /// [`Self::load_access`] for a caller that binds or checks and never writes: an unreadable
+    /// file grants nothing.
+    fn granted(&self) -> BTreeMap<String, PluginAccess> {
+        self.load_access().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "plugin grants unreadable, none apply");
+            BTreeMap::new()
+        })
     }
 
     fn load_pending(&self) -> BTreeMap<String, Vec<PendingRequest>> {
@@ -591,7 +607,7 @@ impl AccessStore {
         reason: Option<String>,
     ) -> io::Result<Mutation<Vec<RequestOutcome>>> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut access = self.load_access();
+        let mut access = self.load_access()?;
         let mut pending_all = self.load_pending();
         let declared: Vec<(PathBuf, bool)> = crate::plugins::manifest::for_provider(id)
             .map(|m| {
@@ -773,7 +789,7 @@ impl AccessStore {
         saves: bool,
     ) -> io::Result<Mutation<RequestOutcome>> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let access = self.load_access();
+        let access = self.load_access()?;
         let mut pending_all = self.load_pending();
         let canon = path.to_string_lossy().into_owned();
         let entry = access.get(id).cloned().unwrap_or_default();
@@ -831,7 +847,7 @@ impl AccessStore {
             })
             .unwrap_or_default();
         let grants = self
-            .load_access()
+            .granted()
             .get(id)
             .map(|e| e.grants.clone())
             .unwrap_or_default();
@@ -879,7 +895,7 @@ impl AccessStore {
                 "the path must be absolute with no '..' component",
             )
         })?;
-        let mut access = self.load_access();
+        let mut access = self.load_access()?;
         let mut pending_all = self.load_pending();
         let mut grants_changed = false;
         let mut pending_changed = false;
@@ -982,7 +998,7 @@ impl AccessStore {
     /// Every plugin with a recorded entry or pending row.
     pub fn snapshot(&self) -> io::Result<Vec<PluginAccessSnapshot>> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let access = self.load_access();
+        let access = self.load_access()?;
         let pending = self.load_pending();
         let mut ids: Vec<String> = access
             .keys()
@@ -1001,13 +1017,13 @@ impl AccessStore {
     /// One plugin's grants, pending rows, and denials.
     pub fn snapshot_for(&self, id: &str) -> io::Result<PluginAccessSnapshot> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(snapshot_of(id, &self.load_access(), &self.load_pending()))
+        Ok(snapshot_of(id, &self.load_access()?, &self.load_pending()))
     }
 
     /// The grants the runner binds for `id` — empty when the file is absent or unreadable.
     pub fn grants_for(&self, id: &str) -> Vec<Grant> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.load_access()
+        self.granted()
             .get(id)
             .map(|a| a.grants.clone())
             .unwrap_or_default()
@@ -1020,7 +1036,7 @@ impl AccessStore {
     pub fn runner_roots(&self, manifests: &BTreeMap<String, PluginManifest>) -> Vec<RunnerRoot> {
         let access = {
             let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-            self.load_access()
+            self.granted()
         };
         let declared = manifests.values().flat_map(|m| {
             let reads = m.reads.iter().map(|p| (p.as_str(), false, false));
@@ -1038,7 +1054,7 @@ impl AccessStore {
     pub fn plugin_roots(&self, id: &str, manifest: &PluginManifest) -> Vec<RunnerRoot> {
         let access = {
             let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-            self.load_access()
+            self.granted()
         };
         let reads = manifest.reads.iter().map(|p| (p.as_str(), false, false));
         let writes = manifest.writes.iter().map(|p| (p.as_str(), true, false));
@@ -1120,7 +1136,7 @@ impl AccessStore {
     ) -> io::Result<Mutation<Vec<Grant>>> {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let kept: Vec<String> = keep.iter().flat_map(|p| grant_keys(Path::new(p))).collect();
-        let mut access = self.load_access();
+        let mut access = self.load_access()?;
         let Some(entry) = access.get_mut(id) else {
             return Ok(Mutation {
                 value: Vec::new(),
@@ -1177,7 +1193,7 @@ impl AccessStore {
                 format!("'{}' can't be granted ({rule})", canonical.display()),
             ));
         }
-        let mut access = self.load_access();
+        let mut access = self.load_access()?;
         let entry = access.entry(id.to_string()).or_default();
         let path = canonical.to_string_lossy().into_owned();
         let existing = entry.grants.iter().position(|g| same_path(&g.path, &path));
@@ -1238,7 +1254,7 @@ impl AccessStore {
                 "the path must be absolute with no '..' component",
             )
         })?;
-        let mut access = self.load_access();
+        let mut access = self.load_access()?;
         let mut changed = false;
         let grants = match access.get_mut(id) {
             Some(entry) => {
@@ -1778,7 +1794,7 @@ mod tests {
         assert_eq!(outcomes, ["granted", "granted", "pending"]);
         // Only the link into a grant; the canonical spelling needs none.
         assert_eq!(
-            s.load_access()["demo"].links,
+            s.load_access().unwrap()["demo"].links,
             BTreeMap::from([(asked[0].0.clone(), raw(&games))])
         );
     }
@@ -1885,15 +1901,72 @@ mod tests {
         );
     }
 
+    /// The pending queue is rebuilt by the plugins' next scan, so a damaged one reads empty.
     #[test]
-    fn corrupt_files_read_empty() {
+    fn a_corrupt_pending_file_reads_empty() {
         let f = fixture();
-        std::fs::create_dir_all(&f.store_dir).unwrap();
-        std::fs::write(f.store_dir.join(GRANTS_FILE), "{not json").unwrap();
         std::fs::write(f.store_dir.join(PENDING_FILE), "[nope").unwrap();
+        assert!(f.store().snapshot().unwrap().is_empty());
+    }
+
+    /// A grants file that does not parse stays byte for byte: every call that would write it,
+    /// and every listing, stops with an error naming it. What binds or checks sees no grant.
+    #[test]
+    fn an_unreadable_grants_file_is_kept_and_named() {
+        let f = fixture();
+        let (roms, saves) = (f.dir("data/roms"), f.dir("data/saves"));
+        let (roms_s, saves_s) = (roms.to_str().unwrap(), saves.to_str().unwrap());
         let s = f.store();
+        s.grant("demo", &roms, true, "cli").unwrap();
+        assert_eq!(f.request(saves_s), "pending");
+        assert!(s.may_write("demo", &roms));
+        let file = s.runner_dir.join(GRANTS_FILE);
+        let damaged = std::fs::read(&file).unwrap()[..20].to_vec();
+        std::fs::write(&file, &damaged).unwrap();
+        let acl = acl_calls();
+
+        let ask = [(roms_s.to_string(), false)];
+        let refused = [
+            ("request", s.request("demo", &ask, None).map(drop)),
+            (
+                "request_core",
+                s.request_core("demo", "snes9x", &roms, None).map(drop),
+            ),
+            (
+                "allow",
+                s.decide("demo", saves_s, Decision::Allow, "console")
+                    .map(drop),
+            ),
+            (
+                "deny",
+                s.decide("demo", saves_s, Decision::Deny, "console")
+                    .map(drop),
+            ),
+            (
+                "forget",
+                s.decide("demo", roms_s, Decision::Forget, "console")
+                    .map(drop),
+            ),
+            ("grant", s.grant("demo", &saves, false, "cli").map(drop)),
+            ("hand", s.hand("demo", &saves, true, "config").map(drop)),
+            ("release", s.release("demo", "config", &[]).map(drop)),
+            ("revoke", s.revoke("demo", &roms).map(drop)),
+            ("snapshot", s.snapshot().map(drop)),
+            ("snapshot_for", s.snapshot_for("demo").map(drop)),
+        ];
+        for (call, result) in refused {
+            let err = result.expect_err(call);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{call}");
+            assert!(
+                err.to_string().contains(file.to_str().unwrap()),
+                "{call}: {err}"
+            );
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), damaged, "kept as found");
+        assert_eq!(acl_calls(), acl, "no ACE for a grant that was not recorded");
         assert!(s.grants_for("demo").is_empty());
-        assert!(s.snapshot().unwrap().is_empty());
+        assert!(!s.may_write("demo", &roms));
+        assert!(s.runner_roots(&BTreeMap::new()).is_empty());
     }
 
     #[test]
