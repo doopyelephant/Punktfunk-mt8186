@@ -21,7 +21,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 sed -n -E 's/^[[:space:]]*((private|internal|public) )?external fun ([A-Za-z0-9_]+).*/\3/p' "$KOTLIN" \
     | sort -u > "$TMP/kotlin"
-grep -rh "^[^/]*$PREFIX" "$NATIVE" | grep -o "$PREFIX[A-Za-z0-9_]*" | sed "s/^$PREFIX//" \
+grep -rh "^[^/]*$PREFIX" "$NATIVE" | grep -o "${PREFIX}[A-Za-z0-9_]*" | sed "s/^$PREFIX//" \
     | sort -u > "$TMP/rust"
 
 # An empty side means a moved path or a changed shape, which would otherwise compare equal.

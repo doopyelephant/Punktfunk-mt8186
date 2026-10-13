@@ -23,7 +23,7 @@ for n in $names; do
 			rc=1
 		}
 	done
-	grep '^ *priority=1 ' "$AA" | grep -qE "[/{,]$n[,}/ ]" || {
+	grep '^ *priority=1 ' "$AA" | grep -qE "[/{,]${n}[,}/ ]" || {
 		echo "$AA: the runner reads \$config/$n and this profile never allows it"
 		rc=1
 	}
