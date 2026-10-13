@@ -134,31 +134,6 @@ enum PresentPriority: Equatable {
     }
 }
 
-/// The system video renderers a visionOS theater screen and its floor reflection draw from.
-/// While a session holds them it presents into them in place of its view.
-public final class TheaterRenderers {
-    public let screen = AVSampleBufferVideoRenderer()
-    public let reflection = AVSampleBufferVideoRenderer()
-
-    public init() {}
-
-    /// Whether `connection`'s frames can reach a system video renderer: the decoded path takes
-    /// VideoToolbox's biplanar 4:2:0 output, so PyroWave and 4:4:4 stay on Metal.
-    public static func supports(_ connection: PunktfunkConnection) -> Bool {
-        connection.videoCodec != .pyrowave && !connection.isChroma444
-    }
-
-    #if DEBUG
-    /// Screenshot seam: one frame on the screen and its reflection, with no session behind it.
-    public func debugShow(_ pixelBuffer: CVPixelBuffer) {
-        for renderer in [screen, reflection] {
-            if renderer.requiresFlushToResumeDecoding || renderer.status == .failed { renderer.flush() }
-            if let sample = DecodedVideoSink.immediateSample(pixelBuffer) { renderer.enqueue(sample) }
-        }
-    }
-    #endif
-}
-
 final class SessionPresenter {
     /// Map a presenter choice and codec to its execution path.
     ///
@@ -230,16 +205,6 @@ final class SessionPresenter {
         #endif
     }
 
-    private(set) var theater: TheaterRenderers?
-
-    /// Move a running session into `renderers`, or back to the view with nil. Costs one IDR.
-    /// Main thread.
-    func setTheater(_ renderers: TheaterRenderers?) {
-        guard renderers !== theater else { return }
-        theater = renderers
-        restartPresentation()
-    }
-
     private var pump: StreamPump?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
@@ -287,8 +252,7 @@ final class SessionPresenter {
     /// Start the resolved presenter for `connection`.
     ///
     /// Stage-1 sends compressed samples to `baseLayer`; tvOS's decoded path sends it VideoToolbox
-    /// output, and a visionOS theater takes that output in `baseLayer`'s place. Metal paths leave
-    /// that layer idle and overlay their own CAMetalLayer. The supplied
+    /// output. Metal paths leave that layer idle and overlay their own CAMetalLayer. The supplied
     /// display-link factory tracks the hosting display for ordinary pacing and decoded-frame
     /// metering; deadline pacing owns a CAMetalDisplayLink instead.
     ///
@@ -346,10 +310,8 @@ final class SessionPresenter {
             bufferSetting: connection.settings.smoothBuffer)
         // Direct video presentation is the zero-buffer latency path. A user who asks for a
         // smoothness buffer keeps the existing deadline engine, where FrameStore owns that buffer.
-        var pacing = Self.effectivePacing(
+        let pacing = Self.effectivePacing(
             selectedPacing, priority: priority, videoLayerCompatible: !connection.isChroma444)
-        let theater = theater.flatMap { TheaterRenderers.supports(connection) ? $0 : nil }
-        if theater != nil { pacing = .decoded }
         #if os(macOS)
         let vsyncPaced = priority != .latency && pacing == .arrival
         let adaptiveSlotPaced = Self.adaptiveSlotPaced(
@@ -361,9 +323,7 @@ final class SessionPresenter {
         if choice != .stage1,
            let pipeline = Stage2Pipeline(
                endToEndMeter: endToEndMeter,
-               videoRenderer: pacing == .decoded
-                   ? theater?.screen ?? baseLayer.sampleBufferRenderer : nil,
-               mirrorRenderer: theater?.reflection,
+               videoRenderer: pacing == .decoded ? baseLayer.sampleBufferRenderer : nil,
                pacing: pacing,
                gateDepth: Self.gateDepth(
                    env: ProcessInfo.processInfo.environment["PUNKTFUNK_GATE_DEPTH"]),

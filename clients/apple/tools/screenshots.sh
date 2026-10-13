@@ -52,8 +52,7 @@ BUNDLE_ID="io.unom.punktfunk"
 # ShotScenes.all is a dev scene; capture those with `SCENES="15-library-touch 16-host-page" ...`.
 SCENES_GIVEN="${SCENES:-}"
 SCENES=(${SCENES:-01-stream 02-hosts 15-library-touch 15f-library-filter 06-console 12-controllers 09e-waking-modal 05-settings 03-pair})
-# The Apple Vision Pro listing, in order. 30-vision-theater is the theater, a dev scene: its
-# window panel sits over the screen until a player moves it, which a capture cannot.
+# The Apple Vision Pro listing, in order.
 VISION_SCENES=(01-stream 02-hosts 15f-library-filter 06-console 05-settings)
 SETTLE="${SETTLE:-4}" # seconds to let a scene lay out before capturing
 
@@ -236,8 +235,8 @@ shoot_sim() {
         warn "$prefix/$scene: the app reported no window size — left uncropped"
       fi
     fi
-    if [ "$prefix" = visionpro ] && [ "$scene" != 30-vision-theater ]; then
-      # visionOS restores a window's last size, and the theater scene leaves its small panel.
+    if [ "$prefix" = visionpro ]; then
+      # visionOS restores a window's last size across launches.
       grep -q '^PF_SHOT_WINDOW_PX 2560 1440$' "$applog" \
         || warn "$prefix/$scene: the window is not 1280×720 pt — capture it again"
     fi

@@ -107,12 +107,6 @@ struct PunktfunkClientApp: App {
                 .tint(.brand)
         }
         #endif
-        #if os(visionOS)
-        ImmersiveSpace(id: TheaterStage.spaceID) {
-            TheaterView()
-        }
-        .immersionStyle(selection: .constant(TheaterStage.style), in: TheaterStage.style)
-        #endif
     }
 }
 

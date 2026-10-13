@@ -2,9 +2,8 @@
 
 Apple Vision Pro is a destination of the iOS target, so it inherits the iPhone/iPad feature set:
 microphone uplink, DualSense feedback, mouse and keyboard, HDR through EDR. What it adds, and what
-the copy leans on: a stream window beside other apps, several windows streaming at once, and the
-theater (`Session/Theater.swift`). The theater shows only H.264/H.265 4:2:0; PyroWave and 4:4:4 stay
-in the window, so the copy never promises the theater for every codec.
+the copy leans on: a stream window beside other apps and several windows streaming at once. The
+app has no theater and docks into no environment, so the copy promises neither.
 
 The description reuses the live iOS/tvOS/macOS template with the device swapped, plus a Vision Pro
 block. Keywords avoid Apple trademarks ("Vision Pro", "visionOS").
@@ -13,18 +12,18 @@ block. Keywords avoid Apple trademarks ("Vision Pro", "visionOS").
 
 ## Promotional Text (DE) — max 170 characters
 
-### Primary (167)
+### Primary (151)
 
 ```
-Dein Gaming-PC auf der Apple Vision Pro: im Fenster neben deinen Apps oder auf großer Leinwand im dunklen Kino. Niedrige Latenz, dein Controller, ohne Konto und Cloud.
+Dein Gaming-PC auf der Apple Vision Pro: im Fenster neben deinen Apps, mit bis zu 4K und 90 Hz. Niedrige Latenz, dein Controller, ohne Konto und Cloud.
 ```
 
 ## Promotional Text (EN) — max 170 characters
 
-### Primary (158)
+### Primary (143)
 
 ```
-Your gaming PC on Apple Vision Pro: in a window beside your apps, or on a big screen in a dark theater. Low latency, your controller, no account and no cloud.
+Your gaming PC on Apple Vision Pro: in a window beside your apps, at up to 4K and 90 Hz. Low latency, your controller, no account and no cloud.
 ```
 
 ---
@@ -36,7 +35,6 @@ Punktfunk ist die nächste Generation des lokalen Game-Streamings. Streame von d
 
 Auf der Apple Vision Pro:
 • Spiele in einem Fenster neben deinen anderen Apps
-• Theater: Der Stream wandert auf eine große Leinwand in einem abgedunkelten Raum. Sein Licht fällt in deine Umgebung und spiegelt sich im Boden. Mit der Digital Crown holst du deinen Raum zurück
 • Mehrere Fenster streamen gleichzeitig, die Eingabe folgt dem Fenster, das du zuletzt ausgewählt hast
 • Der native Modus streamt in 4K mit 90 Hz
 
@@ -61,7 +59,6 @@ Punktfunk is the next generation of local game streaming. Stream from your Linux
 
 On Apple Vision Pro:
 • Play in a window beside your other apps
-• Theater: the stream moves to a big screen in a darkened space. Its light spills into your surroundings and reflects off the floor. Turn the Digital Crown to bring your room back in
 • Several windows stream at once, and input follows the window you last pinched
 • Native mode streams in 4K at 90 Hz
 
@@ -81,16 +78,16 @@ More features:
 
 ## Keywords — max 100 characters
 
-### DE (96)
+### DE (94)
 
 ```
-Game-Streaming,Lokal,Open-Source,Gaming,Remote Play,Spatial,Immersiv,Kino,Leinwand,Controller,PC
+Game-Streaming,Lokal,Open-Source,Gaming,Remote Play,Spatial,Controller,PC,Linux,Windows,4K,HDR
 ```
 
-### EN (99)
+### EN (94)
 
 ```
-game streaming,local,open source,remote play,gaming,spatial,immersive,theater,big screen,controller
+game streaming,local,open source,remote play,gaming,spatial,controller,pc,linux,windows,4k,hdr
 ```
 
 ---
@@ -115,9 +112,6 @@ Capture them with `BUILD_VISIONOS=1 bash scripts/build-xcframework.sh`, then
 naming the store images' game frame on the internal disk. The type is set over them, and the
 upload runs, where the other platforms' store images are composed. No fenced block in this
 section: `check-limits.py` reads each one as a field.
-
-The theater is not in the set. `SCENES=30-vision-theater` captures it, with the stream's window
-panel over the lower middle of the screen: a player drags it clear, a capture cannot.
 
 ---
 
@@ -144,9 +138,8 @@ and input path a real PC uses. Like a demo login, it is reached with an address 
 3. A "Demo Host" card appears. Select it: the stream starts in the window. Pinch and drag to
    move the pointer, pinch to click, type on a keyboard or press controller buttons -- the host
    draws each input back and chimes.
-4. The controls below the stream window: Theater moves the stream to a screen in an immersive
-   space (turn the Digital Crown to bring the room back); New Window opens a second window that
-   can stream at the same time.
+4. The controls below the stream window: Quick Actions opens the in-stream menu; New Window
+   opens a second window that can stream at the same time.
    Disconnect: the Disconnect button in the stream overlay, or End stream in Quick Actions.
 5. Browse the Demo Host's library (four sample titles) and launch one: it streams under that
    title. Its host page shows connection, presets and pairing.
