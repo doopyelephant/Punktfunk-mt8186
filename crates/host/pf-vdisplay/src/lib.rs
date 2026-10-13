@@ -619,22 +619,32 @@ pub fn resolve_topology(t: policy::Topology) -> policy::Topology {
     }
 }
 
-/// Topology applied at create, for the client this display is being created for.
+/// Topology applied at create, for the client this display is being created for, and the
+/// one every readout names.
 ///
 /// Precedence: configured console policy — that client's overlay over the host's
-/// (`design/web-console-overhaul.md` §6.1) — else legacy
-/// `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` (`1`→exclusive, `0`→extend), else
-/// [`resolve_topology`] of `Auto`. Always concrete.
+/// (`design/web-console-overhaul.md` §6.1) — else `unconfigured_topology`, the platform's
+/// own rule. Always concrete.
 ///
 /// `None` for a client is the host policy, which is also what an unidentified session
 /// (shared identity, GameStream) gets.
 pub fn effective_topology(client: Option<[u8; 32]>) -> policy::Topology {
-    if let Some(p) = policy::prefs().configured() {
-        return resolve_topology(p.effective_for(policy::fp_hex(client).as_deref()).topology);
+    match policy::prefs().configured() {
+        Some(p) => resolve_topology(p.effective_for(policy::fp_hex(client).as_deref()).topology),
+        None => unconfigured_topology(),
     }
-    // Legacy env if present, else Auto. [`ENV_LOCK`]: this runs inside `create`,
-    // concurrent with another session's `apply_session_env`; racing `getenv` is
-    // UB even though nobody writes these keys.
+}
+
+// The Windows manager applies its own unconfigured rule (`PUNKTFUNK_NO_ISOLATE`).
+#[cfg(target_os = "windows")]
+use manager::unconfigured_topology;
+
+/// Legacy `PUNKTFUNK_{KWIN,MUTTER}_VIRTUAL_PRIMARY` (`1`→exclusive, `0`→extend), else
+/// [`resolve_topology`] of `Auto`.
+#[cfg(not(target_os = "windows"))]
+fn unconfigured_topology() -> policy::Topology {
+    // [`ENV_LOCK`]: this runs inside `create`, concurrent with another session's
+    // `apply_session_env`; racing `getenv` is UB even though nobody writes these keys.
     let legacy = with_env_lock(|| {
         [
             "PUNKTFUNK_KWIN_VIRTUAL_PRIMARY",

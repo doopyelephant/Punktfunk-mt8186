@@ -72,6 +72,24 @@ impl KeepAlive {
     }
 }
 
+/// Linger once the last session leaves the display of device `fp`. A configured console
+/// decides, that device's overlay over the host's `keep_alive`, and outranks `env_ms`
+/// (`PUNKTFUNK_MONITOR_LINGER_MS`): a leftover knob never overrides the console.
+/// Unconfigured: the knob, else teardown at once. A value that does not parse is unset.
+fn resolve_linger(
+    configured: Option<&DisplayPolicy>,
+    fp: Option<&str>,
+    env_ms: Option<&str>,
+) -> Linger {
+    match configured {
+        Some(p) => p.effective_for(fp).keep_alive.linger(),
+        None => match env_ms.and_then(|ms| ms.parse().ok()) {
+            Some(ms) => Linger::For(Duration::from_millis(ms)),
+            None => Linger::Immediate,
+        },
+    }
+}
+
 /// Host topology while managed virtual displays are up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -960,6 +978,14 @@ impl DisplayPolicyStore {
         self.configured().map(|p| p.effective())
     }
 
+    /// Linger once the last session leaves the display of device `fp`: this store's
+    /// `keep_alive`, else `PUNKTFUNK_MONITOR_LINGER_MS`, else teardown at once. The env read
+    /// takes the lock: a release runs beside another session's setup.
+    pub fn linger(&self, fp: Option<&str>) -> Linger {
+        let env_ms = crate::with_env_lock(|| std::env::var("PUNKTFUNK_MONITOR_LINGER_MS").ok());
+        resolve_linger(self.configured().as_ref(), fp, env_ms.as_deref())
+    }
+
     pub fn ddc_power_off(&self) -> bool {
         self.get().ddc_power_off
     }
@@ -1431,6 +1457,47 @@ mod tests {
             Linger::For(Duration::from_secs(30))
         );
         assert_eq!(KeepAlive::Forever.linger(), Linger::Forever);
+    }
+
+    /// The device overlay decides its own linger; everyone else follows the host,
+    /// and a configured host outranks the env knob.
+    #[test]
+    fn a_device_overlay_decides_its_own_linger() {
+        let mut p = DisplayPolicy {
+            keep_alive: KeepAlive::Off,
+            ..DisplayPolicy::default()
+        };
+        p.clients.insert(
+            "aa11".into(),
+            ClientOverlay {
+                keep_alive: Some(KeepAlive::Forever),
+                ..ClientOverlay::default()
+            },
+        );
+        assert_eq!(
+            resolve_linger(Some(&p), Some("aa11"), None),
+            Linger::Forever
+        );
+        assert_eq!(
+            resolve_linger(Some(&p), Some("bb22"), Some("60000")),
+            Linger::Immediate
+        );
+        assert_eq!(resolve_linger(Some(&p), None, None), Linger::Immediate);
+    }
+
+    /// A knob that does not parse is unset, not zero: zero would be a linger of its own.
+    #[test]
+    fn an_unconfigured_host_tears_down_at_once_unless_the_env_knob_says() {
+        assert_eq!(resolve_linger(None, None, None), Linger::Immediate);
+        assert_eq!(
+            resolve_linger(None, Some("aa11"), Some("250")),
+            Linger::For(Duration::from_millis(250))
+        );
+        assert_eq!(
+            resolve_linger(None, None, Some("0")),
+            Linger::For(Duration::ZERO)
+        );
+        assert_eq!(resolve_linger(None, None, Some("soon")), Linger::Immediate);
     }
 
     #[test]

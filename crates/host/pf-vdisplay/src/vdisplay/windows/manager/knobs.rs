@@ -1,38 +1,11 @@
 //! Runtime display-management knobs: linger and per-monitor topology action.
 //! Readers of [`crate::policy`] plus legacy env fallbacks — no manager state.
 
-use crate::policy::{DisplayPolicy, Linger};
-use std::time::Duration;
+use crate::policy::Linger;
 
-/// 10 s: an unconfigured host's linger when `PUNKTFUNK_MONITOR_LINGER_MS` is unset.
-const DEFAULT_LINGER_MS: u64 = 10_000;
-
-/// Linger for a monitor `client_fp` created: the console's `keep_alive` with that
-/// device's overlay applied (§6.1), so the TV can keep its screen forever while the
-/// tablet's goes at once.
+/// Linger for a monitor `client_fp` created.
 pub(super) fn linger_for(client_fp: Option<[u8; 32]>) -> Linger {
-    resolve_linger(
-        crate::policy::prefs().configured().as_ref(),
-        crate::policy::fp_hex(client_fp).as_deref(),
-        std::env::var("PUNKTFUNK_MONITOR_LINGER_MS")
-            .ok()
-            .and_then(|s| s.parse().ok()),
-    )
-}
-
-/// Console policy outranks the env knob: an operator who set the console
-/// must not have it silently overridden by a leftover
-/// `PUNKTFUNK_MONITOR_LINGER_MS`. Unconfigured: the env knob, else 10 s.
-/// Unparseable env arrives as `None` (`parse().ok()`), i.e. unset, not zero.
-fn resolve_linger(
-    configured: Option<&DisplayPolicy>,
-    fp: Option<&str>,
-    env_ms: Option<u64>,
-) -> Linger {
-    match configured {
-        Some(p) => p.effective_for(fp).keep_alive.linger(),
-        None => Linger::For(Duration::from_millis(env_ms.unwrap_or(DEFAULT_LINGER_MS))),
-    }
+    crate::policy::prefs().linger(crate::policy::fp_hex(client_fp).as_deref())
 }
 
 /// Exclusive-topology re-assert cadence. Default 2000 ms; `0` disables.
@@ -52,10 +25,17 @@ pub(super) fn topology_action(client: Option<[u8; 32]>) -> crate::policy::Topolo
     let configured = crate::policy::prefs()
         .configured_effective()
         .map(|_| crate::effective_topology(client));
-    resolve_topology_action(
-        configured,
-        pf_host_config::env_on("PUNKTFUNK_NO_ISOLATE") == Some(true),
-    )
+    resolve_topology_action(configured, no_isolate())
+}
+
+/// What an unconfigured host applies. [`crate::effective_topology`] answers with it, so a
+/// readout names the topology the manager uses.
+pub(crate) fn unconfigured_topology() -> crate::policy::Topology {
+    resolve_topology_action(None, no_isolate())
+}
+
+fn no_isolate() -> bool {
+    pf_host_config::env_on("PUNKTFUNK_NO_ISOLATE") == Some(true)
 }
 
 /// Unconfigured host: `PUNKTFUNK_NO_ISOLATE` → `Extend`, else `Exclusive`.
@@ -74,50 +54,8 @@ fn resolve_topology_action(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_linger, resolve_topology_action, DEFAULT_LINGER_MS};
-    use crate::policy::{ClientOverlay, DisplayPolicy, KeepAlive, Linger, Topology};
-    use std::time::Duration;
-
-    /// The device overlay decides its own linger; everyone else follows the host,
-    /// and a configured host outranks the legacy env knob.
-    #[test]
-    fn a_device_overlay_decides_its_own_linger() {
-        let mut p = DisplayPolicy {
-            keep_alive: KeepAlive::Off,
-            ..DisplayPolicy::default()
-        };
-        p.clients.insert(
-            "aa11".into(),
-            ClientOverlay {
-                keep_alive: Some(KeepAlive::Forever),
-                ..ClientOverlay::default()
-            },
-        );
-        assert_eq!(
-            resolve_linger(Some(&p), Some("aa11"), None),
-            Linger::Forever
-        );
-        assert_eq!(
-            resolve_linger(Some(&p), Some("bb22"), Some(60_000)),
-            Linger::Immediate
-        );
-        assert_eq!(resolve_linger(Some(&p), None, None), Linger::Immediate);
-    }
-
-    /// Unparseable env reaches here as `None` (`parse().ok()`), so it reads as
-    /// unset, not zero. A zero linger would tear the monitor down on every
-    /// disconnect.
-    #[test]
-    fn an_unconfigured_host_honours_the_env_knob_then_the_default() {
-        assert_eq!(
-            resolve_linger(None, Some("aa11"), Some(250)),
-            Linger::For(Duration::from_millis(250))
-        );
-        assert_eq!(
-            resolve_linger(None, None, None),
-            Linger::For(Duration::from_millis(DEFAULT_LINGER_MS))
-        );
-    }
+    use super::resolve_topology_action;
+    use crate::policy::Topology;
 
     /// Unconfigured rungs are `Exclusive` by default, `Extend` under the legacy
     /// opt-out — never `Auto`, which the manager's `match` would treat as extend

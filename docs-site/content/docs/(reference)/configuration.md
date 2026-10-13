@@ -143,6 +143,7 @@ Desktop) and rewrites them on every connect.
 | `PUNKTFUNK_INPUT_BACKEND` | `libei` · `kwin` · `gamescope` · `wlr` | Pins input injection. Detected with the compositor; an unknown value is ignored. |
 | `PUNKTFUNK_VIDEO_SOURCE` | `virtual` (default) · `portal` | Moonlight sessions only: `portal` streams an existing monitor, which the GNOME 50+ HDR mirror needs — see [HDR](/docs/hdr#linux--gnome). |
 | `PUNKTFUNK_CAPTURE_MONITOR` | connector name, e.g. `DP-2`; on Windows the display name, e.g. `\\.\DISPLAY1` | Linux and Windows: stream this physical monitor instead of a virtual display, overriding the console. `punktfunk-host list-monitors` lists the names; one that matches nothing fails the session. See [Virtual displays](/docs/virtual-displays#stream-a-real-monitor-instead). |
+| `PUNKTFUNK_MONITOR_LINGER_MS` | ms | Keep a client's virtual display this long after it disconnects. Unset, the display is removed at once. **After a device disconnects** in [Virtual displays](/docs/virtual-displays#keep-alive) supersedes it. |
 | `PUNKTFUNK_ZEROCOPY` | `1` · `0` | Linux: zero-copy capture to encode, on by default with a CPU fallback. `0` forces the CPU path; `1` turns a failed zero-copy setup into an error. |
 | `PUNKTFUNK_RENDER_NODE` | path, e.g. `/dev/dri/renderD129` | Linux: the GPU to capture and encode on (default `/dev/dri/renderD128`). A GPU picked under **Host → GPUs** wins. |
 | `PUNKTFUNK_RENDER_ADAPTER` | name substring, e.g. `4090` | The GPU to encode on, by adapter name. A GPU picked under **Host → GPUs** wins. |
@@ -212,7 +213,6 @@ Env-only additions to the **Game Mode** rows above. See [gamescope](/docs/gamesc
 
 | Variable | Values | What it does |
 |---|---|---|
-| `PUNKTFUNK_MONITOR_LINGER_MS` | ms (default `10000`) | Keep a client's virtual display this long after it disconnects. **Keep alive** in [Virtual displays](/docs/virtual-displays) supersedes it. |
 | `PUNKTFUNK_EXCLUSIVE_REASSERT_MS` | ms (default `2000`), `0` off | How often the host checks that exclusive topology held, re-applying it when Windows or a driver turns a physical monitor back on. |
 | `PUNKTFUNK_STANDBY_SINK_KEEP` | any value but `0`/`off` | Keep a connected but inactive external display (a TV on standby, a capture card) powered while streaming; by default the host turns it off, because Windows keeps drawing for it. Also keeps enabled the monitors **Disable monitor devices (PnP)** would disable. |
 | `PUNKTFUNK_NO_ISOLATE` | `1` | Extend the desktop onto the virtual display instead of making it the only one. **Topology** in [Virtual displays](/docs/virtual-displays) supersedes it. |
