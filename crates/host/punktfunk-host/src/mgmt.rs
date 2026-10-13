@@ -16,6 +16,7 @@
 
 use crate::host::AppState;
 use crate::https::serve_https_with_plain;
+use crate::plugin_host::PluginTokens;
 use anyhow::{Context, Result};
 use axum::extract::Request;
 use axum::http::StatusCode;
@@ -196,8 +197,6 @@ pub(crate) struct MgmtState {
     /// which case the device lane refuses rather than binding to nothing.
     identity_fingerprint: Option<[u8; 32]>,
 }
-
-pub(crate) type PluginTokens = Arc<RwLock<std::collections::BTreeMap<String, String>>>;
 
 /// `native` is the shared punktfunk/1 pairing handle when the unified host
 /// runs the native QUIC server.

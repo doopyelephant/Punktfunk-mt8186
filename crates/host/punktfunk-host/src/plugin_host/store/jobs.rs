@@ -12,6 +12,7 @@
 
 use super::index::{scope_of, Entry};
 use super::manifest::{self, Record, Tier};
+use crate::plugin_host::PluginTokens;
 use anyhow::{bail, Context, Result};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
@@ -265,10 +266,7 @@ fn parse_spec_pkg(spec: &str) -> Option<String> {
     )
 }
 
-pub(crate) fn spawn_install(
-    plan: Plan,
-    plugin_tokens: crate::mgmt::PluginTokens,
-) -> Result<String> {
+pub(crate) fn spawn_install(plan: Plan, plugin_tokens: PluginTokens) -> Result<String> {
     let target = plan.pkg.clone().unwrap_or_else(|| plan.spec.clone());
     let id = begin("install", &target)?;
     let job_id = id.clone();
@@ -283,10 +281,7 @@ pub(crate) fn spawn_install(
     Ok(id)
 }
 
-pub(crate) fn spawn_uninstall(
-    pkg: String,
-    plugin_tokens: crate::mgmt::PluginTokens,
-) -> Result<String> {
+pub(crate) fn spawn_uninstall(pkg: String, plugin_tokens: PluginTokens) -> Result<String> {
     if super::valid_installed_pkg(&pkg).is_err() {
         bail!("not an installable plugin package name");
     }
@@ -303,7 +298,7 @@ pub(crate) fn spawn_uninstall(
     Ok(id)
 }
 
-fn run_install(id: &str, plan: Plan, plugin_tokens: &crate::mgmt::PluginTokens) -> Result<()> {
+fn run_install(id: &str, plan: Plan, plugin_tokens: &PluginTokens) -> Result<()> {
     let dir = super::plugins_dir();
 
     // Pin must still match what the registry serves.
@@ -443,7 +438,7 @@ fn run_install(id: &str, plan: Plan, plugin_tokens: &crate::mgmt::PluginTokens) 
     Ok(())
 }
 
-fn run_uninstall(id: &str, pkg: &str, plugin_tokens: &crate::mgmt::PluginTokens) -> Result<()> {
+fn run_uninstall(id: &str, pkg: &str, plugin_tokens: &PluginTokens) -> Result<()> {
     let dir = super::plugins_dir();
     // Its titles leave with it: nothing would launch an exec tile of a removed plugin.
     let provider = crate::plugins::manifest::id_of_package(pkg);
@@ -477,7 +472,7 @@ fn run_uninstall(id: &str, pkg: &str, plugin_tokens: &crate::mgmt::PluginTokens)
 /// Persist the installed-id token set, then publish the same set to live authentication before
 /// the runner starts. The file is the runner's handoff; the lock is the API's view, and swapping
 /// it here also revokes an uninstalled plugin's token.
-fn refresh_plugin_tokens(id: &str, plugin_tokens: &crate::mgmt::PluginTokens) -> Result<()> {
+fn refresh_plugin_tokens(id: &str, plugin_tokens: &PluginTokens) -> Result<()> {
     set_phase(id, "refreshing credentials");
     let refreshed = crate::mgmt_token::load_or_generate_per_plugin()
         .context("refresh per-plugin credentials")?;
@@ -485,7 +480,7 @@ fn refresh_plugin_tokens(id: &str, plugin_tokens: &crate::mgmt::PluginTokens) ->
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = refreshed;
     #[cfg(windows)]
-    crate::mgmt::pipes::changed();
+    crate::plugin_host::TOKENS_CHANGED.notify_one();
     Ok(())
 }
 
