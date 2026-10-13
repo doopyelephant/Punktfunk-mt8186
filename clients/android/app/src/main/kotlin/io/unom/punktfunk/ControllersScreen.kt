@@ -953,6 +953,9 @@ private val TEST_BUTTONS = listOf(
     "Select" to KeyEvent.KEYCODE_BUTTON_SELECT,
     "Start" to KeyEvent.KEYCODE_BUTTON_START,
     "Guide" to KeyEvent.KEYCODE_BUTTON_MODE,
+    // A handheld's back buttons, as the grips [Gamepad.buttonBit] sends them.
+    "L4" to KeyEvent.KEYCODE_BUTTON_C,
+    "R4" to KeyEvent.KEYCODE_BUTTON_Z,
     // The two buttons Android has no keycode for, on the keycodes [Gamepad.buttonBit] borrows for
     // them. Only a driverless Sony pad reaches these; every other controller leaves them dark.
     "Touch" to KeyEvent.KEYCODE_BUTTON_15,
