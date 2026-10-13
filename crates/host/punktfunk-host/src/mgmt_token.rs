@@ -281,4 +281,35 @@ mod tests {
             tokens
         );
     }
+
+    /// The token map as the host writes it, for the runner's `pluginToken` to read; the SDK's
+    /// tests replay the checked-in copy. Both values are seeded, so nothing here is minted.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_token_map_the_runner_reads_is_checked_in() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(PER_PLUGIN_FILE),
+            r#"{"rom-manager":"sample-for-rom-manager","demo":"sample-for-demo"}"#,
+        )
+        .unwrap();
+        let ids = ["demo".to_string(), "rom-manager".to_string()];
+        load_or_generate_per_plugin_in(dir.path(), &ids).unwrap();
+        let written = Path::new(crate::plugins::RUNNER_DATA_DIR).join(PER_PLUGIN_FILE);
+        let fresh = fs::read_to_string(dir.path().join(&written)).unwrap();
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../sdk/test/host-config")
+            .join(written);
+        if std::env::var_os("UPDATE_VECTORS").is_some() {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, &fresh).unwrap();
+        }
+        let on_disk = fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            on_disk == fresh,
+            "{} is stale: rerun with UPDATE_VECTORS=1",
+            path.display()
+        );
+    }
 }
