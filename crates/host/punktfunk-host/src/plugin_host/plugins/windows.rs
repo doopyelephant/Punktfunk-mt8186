@@ -126,7 +126,8 @@ pub(super) fn converge_runner_acls(status: &RuntimeStatus) {
 
 /// Grant LocalService read on runner inputs. The data directory uses an inheritable ACE so atomic
 /// grant-file replacements stay readable; protected credential rewrites reapply a direct ACE.
-/// The ingest inbox opens to `BUILTIN\Users` and is closed to seat accounts.
+/// The ingest inbox opens to `BUILTIN\Users` and is closed to seat accounts. Warnings stay ASCII:
+/// `plugins enable` prints them on a console whose codepage drops an em dash.
 fn grant_runner_secret_reads() {
     let cfg = pf_paths::config_dir();
     for name in RUNNER_INPUT_DIRS {
@@ -135,7 +136,7 @@ fn grant_runner_secret_reads() {
             continue;
         }
         if let Err(e) = grant_runner_data_dir(&dir) {
-            eprintln!("warning: {e:#}");
+            tracing::warn!(error = %format!("{e:#}"), "runner data directory grant failed");
         }
     }
     for name in RUNNER_SECRET_FILES {
@@ -150,9 +151,9 @@ fn grant_runner_secret_reads() {
             continue;
         }
         if let Err(e) = grant_runner_secret_read(&path) {
-            eprintln!(
-                "warning: {e:#} - the plugin runner may fail to authenticate to the management \
-                 API"
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "runner secret grant failed - the plugin runner may not authenticate"
             );
         }
     }
@@ -168,10 +169,9 @@ fn grant_runner_secret_reads() {
             &["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(RX,WA)")],
         );
         if !ok {
-            eprintln!(
-                "warning: could not grant LocalService read on {} - the runner may fail to \
-                 import plugins/scripts from it",
-                dir.display()
+            tracing::warn!(
+                dir = %dir.display(),
+                "LocalService read not granted - the runner may not import plugins or scripts"
             );
         }
     }
@@ -185,10 +185,9 @@ fn grant_runner_secret_reads() {
             &["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(M)")],
         );
         if !ok {
-            eprintln!(
-                "warning: could not grant LocalService write on {} - state-writing plugins \
-                 (config/cache) may fail to persist",
-                dir.display()
+            tracing::warn!(
+                dir = %dir.display(),
+                "LocalService write not granted - plugins may not persist their state"
             );
         }
     }
@@ -199,10 +198,9 @@ fn grant_runner_secret_reads() {
         }
         let ok = icacls(&dir, &["/grant:r", &format!("{USERS_SID}:(OI)(CI)(M)")]);
         if !ok {
-            eprintln!(
-                "warning: could not open the ingest inbox {} for writes - a plugin fed by an \
-                 interactive-user app (e.g. playnite) may see no data",
-                dir.display()
+            tracing::warn!(
+                dir = %dir.display(),
+                "ingest inbox not opened for writes - a plugin fed by a desktop app may see no data"
             );
         }
     }
@@ -216,10 +214,9 @@ fn grant_runner_secret_reads() {
             &["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(RX,WA)")],
         );
         if !ok {
-            eprintln!(
-                "warning: could not grant LocalService read on {} - the plugin runner will not \
-                 start (bun exits EPERM on its own entry script)",
-                dir.display()
+            tracing::warn!(
+                dir = %dir.display(),
+                "LocalService read not granted on the runner bundle - the plugin runner will not start"
             );
         }
     }
@@ -295,7 +292,7 @@ fn create_runner_dir(dir: &std::path::Path) -> bool {
     match pf_paths::create_private_dir(dir) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("warning: {} not created: {e}", dir.display());
+            tracing::warn!(dir = %dir.display(), error = %e, "runner directory not created");
             false
         }
     }
