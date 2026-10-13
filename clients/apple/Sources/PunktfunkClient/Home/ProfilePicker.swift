@@ -231,12 +231,20 @@ struct ProfileAvatar: View {
     let size: CGFloat
 
     var body: some View {
-        Text(HostProfiles.initials(name))
-            .font(.system(size: size * 0.4, weight: .bold, design: .rounded))
-            .foregroundStyle(.white)
-            .minimumScaleFactor(0.5)
-            .lineLimit(1)
-            .frame(width: size, height: size)
-            .background(Circle().fill(Color(hex: accent ?? "") ?? .brand))
+        let letters = HostProfiles.initials(name)
+        Group {
+            if let ink = InitialsInk(letters, fontSize: size * 0.4) {
+                ink.fill(.white)
+            } else {
+                // An emoji has no outline; it keeps the text's own centring.
+                Text(letters)
+                    .font(.system(size: size * 0.4, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .minimumScaleFactor(0.5)
+                    .lineLimit(1)
+            }
+        }
+        .frame(width: size, height: size)
+        .background(Circle().fill(Color(hex: accent ?? "") ?? .brand))
     }
 }

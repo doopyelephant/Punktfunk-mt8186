@@ -1,6 +1,7 @@
 // The profile picker's rule, replayed from `clients/shared/profile-picker-vectors.json` (the
 // vectors `crates/client/pf-client-core/src/profiles.rs` runs too), plus how a host row decodes.
 
+import PunktfunkKit
 import XCTest
 @testable import PunktfunkShared
 
@@ -53,6 +54,15 @@ final class ProfilePickerTests: XCTestCase {
         XCTAssertEqual(rows[1].seat?.state, .other)
         XCTAssertNil(rows[1].note)
         XCTAssertEqual(HostProfiles.initials("anna lena x"), "AL")
+    }
+
+    func testInitialsCentreOnTheirInk() throws {
+        // The host card's mark on macOS: a 16.72 pt circle.
+        let circle = CGRect(x: 0, y: 0, width: 16.72, height: 16.72)
+        let ink = try XCTUnwrap(InitialsInk("EB", fontSize: 6.7)).path(in: circle).boundingRect
+        XCTAssertEqual(ink.midX, circle.midX, accuracy: 0.05)
+        XCTAssertEqual(ink.midY, circle.midY, accuracy: 0.05)
+        XCTAssertNil(InitialsInk("\u{1F3AE}", fontSize: 6.7), "an emoji has no outline")
     }
 
     func testASeatIsDialedWokenWaitedForOrRefused() {
