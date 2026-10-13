@@ -1730,6 +1730,7 @@ name = "gen-headers"
 version = "0.43.1"
 dependencies = [
  "cbindgen",
+ "punktfunk-core",
 ]
 
 [[package]]
@@ -4161,7 +4162,6 @@ dependencies = [
 name = "punktfunk-ffi"
 version = "0.43.1"
 dependencies = [
- "cbindgen",
  "log",
  "opus",
  "pf-bitstream",
