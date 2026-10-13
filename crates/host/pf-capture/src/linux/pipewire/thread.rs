@@ -16,7 +16,7 @@ use crate::linux::pw_pods::{
     build_sync_timeline_meta_param, serialize_pod, video_raw, Extent, Pacing, HDR_FORMAT_ORDER,
     SPA_VIDEO_TRANSFER_SMPTE2084,
 };
-use crate::linux::sync_timeline::{hand_back, SyncDevice};
+use crate::linux::sync_timeline::{hand_back, StreamBuffers, SyncDevice};
 use crate::linux::CaptureSignals;
 use crate::ZeroCopyPolicy;
 use anyhow::{Context, Result};
@@ -199,29 +199,10 @@ pub(in crate::linux) fn pipewire_thread(
     let _listener = stream
         .add_local_listener_with_user_data(data)
         .state_changed(on_state_changed)
-        .param_changed(on_param_changed)
-        // Pool census. `remove_buffer` also purges the deferred-requeue book: the buffer is
-        // being freed under any hold, so that hold's later release must be a no-op (generation
-        // in `HoldBook::complete` also covers the address being reused by a new pool).
-        .add_buffer(|_stream, ud, buf| {
-            ud.pool.add();
-            if let Ok(mut pool) = ud.defer.pool.lock() {
-                pool.push(buf as usize);
-            }
-        })
-        .remove_buffer(|_stream, ud, buf| {
-            ud.pool.remove();
-            if let Ok(mut pool) = ud.defer.pool.lock() {
-                pool.retain(|&b| b != buf as usize);
-            }
-            if let Some(dev) = &ud.sync {
-                dev.forget(buf as usize);
-            }
-            if let Ok(mut book) = ud.defer.book.lock() {
-                book.purge(buf as usize);
-            }
-        })
-        .process(on_process)
+        .param_changed(|_stream, ud, id, param| on_param_changed(ud, id, param))
+        .add_buffer(|_stream, ud, buf| on_add_buffer(ud, buf as usize))
+        .remove_buffer(|_stream, ud, buf| on_remove_buffer(ud, buf as usize))
+        .process(|stream, ud| on_process(&stream.as_raw_ptr(), ud))
         .register()
         .context("register stream listener")?;
 
@@ -233,7 +214,7 @@ pub(in crate::linux) fn pipewire_thread(
         // SAFETY: the loop thread dispatches this. The stream outlives this attached receiver
         // (declared after it, dropped before it), and the loop stops dispatching once `run()`
         // returns.
-        unsafe { defer_cb.drain(stream_ptr as *mut pw::sys::pw_stream) };
+        unsafe { defer_cb.drain(&(stream_ptr as *mut pw::sys::pw_stream)) };
     });
     // On a timer, not from `.process`: a producer whose whole pool went undelivered sends
     // nothing more, and `.process` never runs again.
@@ -677,7 +658,34 @@ fn on_state_changed(
     }
 }
 
-fn on_param_changed(_stream: &pw::stream::Stream, ud: &mut UserData, id: u32, param: Option<&Pod>) {
+/// `add_buffer`: the pool census, and the list the undelivered sweep walks.
+fn on_add_buffer(ud: &mut UserData, buf: usize) {
+    ud.pool.add();
+    if let Ok(mut pool) = ud.defer.pool.lock() {
+        pool.push(buf);
+    }
+}
+
+/// `remove_buffer`: the buffer is freed under any hold, so the book forgets it and that
+/// hold's later release is a no-op. The generation in `HoldBook::complete` covers the
+/// address naming a buffer of the next pool.
+fn on_remove_buffer(ud: &mut UserData, buf: usize) {
+    ud.pool.remove();
+    if let Ok(mut pool) = ud.defer.pool.lock() {
+        pool.retain(|&b| b != buf);
+    }
+    if let Some(dev) = &ud.sync {
+        dev.forget(buf);
+    }
+    if let Ok(mut book) = ud.defer.book.lock() {
+        book.purge(buf);
+    }
+}
+
+/// `param_changed`: a fixated Format pod sets the size, format and modifier every later
+/// buffer is read by, and drops the imports cached for the pool it replaces. Each pod is
+/// read on its own: what it leaves out is the default, not the format before.
+fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
     let Some(param) = param else { return };
     if id != pw::spa::param::ParamType::Format.as_raw() {
         return;
@@ -690,20 +698,20 @@ fn on_param_changed(_stream: &pw::stream::Stream, ud: &mut UserData, id: u32, pa
     {
         return;
     }
-    // Parse once (`parse` takes `&mut self`) and report failure. On `Err`, `negotiated`
-    // stays false so the timeout looks like "no accepted format" — a malformed pod we
-    // accepted, not a format mismatch.
-    let parsed = ud.info.parse(param);
-    if let Err(e) = &parsed {
+    // A fresh struct per pod: the parser writes only the properties a pod carries, so one
+    // without `modifier` or `transferFunction` must not inherit the last format's. On `Err`
+    // the format before stays and `negotiated` is not set: a malformed first pod times out
+    // as "no accepted format", not as a format mismatch.
+    let mut info = VideoInfoRaw::default();
+    if let Err(e) = info.parse(param) {
         tracing::error!(
             error = %e,
             "pipewire: the negotiated Format pod does not parse — capture will time out \
              with no usable format"
         );
-    }
-    if parsed.is_err() {
         return;
     }
+    ud.info = info;
     ud.signals.negotiated.store(true, Ordering::Relaxed);
     // Renegotiation replaces the pool: cached per-buffer imports key on buffers
     // that no longer exist, and a recycled fd/inode must not resolve to a stale import.
@@ -748,12 +756,12 @@ fn on_param_changed(_stream: &pw::stream::Stream, ud: &mut UserData, id: u32, pa
     }
 }
 
-/// `.process`: latest frame only. The newest buffer passes the birth gate, then a stale-frame
-/// skip, then [`consume_frame`]. It is requeued exactly once, unless a hold took it: then
-/// [`super::hold::BufferHold`] owns the requeue, and doing both hands the producer the buffer
-/// twice. Dequeue and requeue stay outside `catch_unwind`, where a panic would strand the
-/// buffer and shrink the fixed pool.
-fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
+/// `.process`, over the buffers of the stream that runs it: latest frame only. The newest
+/// buffer passes the birth gate, then a stale-frame skip, then [`consume_frame`]. It is
+/// requeued exactly once, unless a hold took it: then [`super::hold::BufferHold`] owns the
+/// requeue, and doing both hands the producer the buffer twice. Dequeue and requeue stay
+/// outside `catch_unwind`, where a panic would strand the buffer and shrink the fixed pool.
+fn on_process(stream: &dyn StreamBuffers, ud: &mut UserData) {
     let Some((newest, drained)) = drain_to_newest(stream, ud) else {
         return;
     };
@@ -773,7 +781,7 @@ fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
     if !birth_gate(ud) {
         // SAFETY: `newest` was dequeued from this stream and not yet requeued;
         // requeued exactly once here, then never touched (mirrors the null path).
-        unsafe { ud.requeue_unpublished(stream.as_raw_ptr(), newest) };
+        unsafe { ud.requeue_unpublished(stream, newest) };
         return;
     }
     // PipeWire dispatches from a C trampoline with no catch_unwind; a panic across that
@@ -820,7 +828,7 @@ fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
         if let Some(p) = &ud.pacer {
             p.on_paint();
         }
-        consume_frame(ud, spa_buf, newest, stream.as_raw_ptr(), header.pts);
+        consume_frame(ud, spa_buf, newest, stream, header.pts);
     }));
     // `newest`'s book entry is stable here: only this thread removes entries, never
     // `newest`'s inside `.process`. A panic after publish still leaves the hold live.
@@ -835,7 +843,7 @@ fn on_process(stream: &pw::stream::Stream, ud: &mut UserData) {
         // completed inside the closure above; `newest` was dequeued from this stream,
         // not yet requeued, and — per the `withheld` check — carries no hold that would
         // requeue it a second time.
-        unsafe { hand_back(ud.sync.as_deref(), stream.as_raw_ptr(), newest) };
+        unsafe { hand_back(ud.sync.as_deref(), stream, newest) };
     }
     if outcome.is_err() {
         // `.process` is per-frame; a deterministic panic would flood. Power-of-two throttle.
@@ -920,20 +928,20 @@ unsafe fn damaged_area(spa_buf: *mut spa::sys::spa_buffer) -> Option<u64> {
 /// buffers are stale: each is requeued after its cursor meta is read. `None` when nothing
 /// was queued.
 fn drain_to_newest(
-    stream: &pw::stream::Stream,
+    stream: &dyn StreamBuffers,
     ud: &mut UserData,
 ) -> Option<(*mut pw::sys::pw_buffer, u32)> {
-    // SAFETY: `stream` is the live stream PipeWire passes into this `.process` callback on the
-    // loop thread; `dequeue_raw_buffer` returns a stream-owned `*mut pw_buffer` or null
-    // (null-checked), single-threaded so no concurrent access.
-    let mut newest = unsafe { stream.dequeue_raw_buffer() };
+    // SAFETY: `stream` is the live stream whose `.process` callback runs this on the loop
+    // thread; `dequeue` returns a stream-owned `*mut pw_buffer` or null (null-checked),
+    // single-threaded so no concurrent access.
+    let mut newest = unsafe { stream.dequeue() };
     if newest.is_null() {
         return None;
     }
     let mut drained = 1u32;
     loop {
         // SAFETY: same stream/loop-thread contract; returns the next stream-owned buffer or null.
-        let next = unsafe { stream.dequeue_raw_buffer() };
+        let next = unsafe { stream.dequeue() };
         if next.is_null() {
             break;
         }
@@ -947,7 +955,7 @@ fn drain_to_newest(
         }
         // SAFETY: `newest` was dequeued from this stream and not yet requeued; we immediately
         // overwrite it, so the requeued pointer is never touched again.
-        unsafe { ud.requeue_unpublished(stream.as_raw_ptr(), newest) };
+        unsafe { ud.requeue_unpublished(stream, newest) };
         newest = next;
         drained += 1;
     }
@@ -1266,5 +1274,587 @@ mod tests {
         };
         let p = build_params(&cpu, &plan(), &opts(), None, false, false, None).unwrap();
         assert_eq!(param_ids(&p).len(), 1 + 4);
+    }
+}
+
+/// The stream callbacks with no daemon behind them: the stream is two lists, and the
+/// buffers are laid out by hand the way libpipewire hands them over.
+#[cfg(test)]
+mod callbacks {
+    use super::{
+        on_add_buffer, on_param_changed, on_process, on_remove_buffer, realtime_minus_monotonic_ns,
+        serialize_pod, video_raw, CaptureSignals, CursorState, DamageGate, Extent, ImportState,
+        Pacing, PassthroughFallbacks, Pod, PoolCensus, StreamBuffers, UserData,
+        SPA_VIDEO_TRANSFER_SMPTE2084,
+    };
+    use crate::linux::pipewire::hold::{DeferredRequeue, HoldBook};
+    use crate::linux::pipewire::plan::ImportPolicy;
+    use crate::{CapturedFrame, FramePayload, PixelFormat};
+    use pipewire::spa::param::video::{VideoFormat, VideoInfoRaw};
+    use pipewire::spa::param::ParamType;
+    use pipewire::spa::pod::Value;
+    use pipewire::spa::sys as spa_sys;
+    use pipewire::sys::pw_buffer;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::os::fd::IntoRawFd as _;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// A stream as two lists: what the producer sent, and what it got back.
+    #[derive(Default)]
+    struct Lists {
+        sent: RefCell<VecDeque<*mut pw_buffer>>,
+        back: RefCell<Vec<*mut pw_buffer>>,
+    }
+
+    impl StreamBuffers for Lists {
+        // unsafe-fn-no-op-ok: the trait's signature; a list keeps no contract.
+        unsafe fn dequeue(&self) -> *mut pw_buffer {
+            let next = self.sent.borrow_mut().pop_front();
+            next.unwrap_or(std::ptr::null_mut())
+        }
+
+        // unsafe-fn-no-op-ok: the trait's signature; a list keeps no contract.
+        unsafe fn queue(&self, buf: *mut pw_buffer) {
+            self.back.borrow_mut().push(buf);
+        }
+    }
+
+    fn leak<T>(v: T) -> *mut T {
+        Box::leak(Box::new(v))
+    }
+
+    fn pixels(len: usize) -> Vec<u8> {
+        (0..len).map(|i| i as u8).collect()
+    }
+
+    fn chunk(size: u32, stride: i32) -> spa_sys::spa_chunk {
+        spa_sys::spa_chunk {
+            offset: 0,
+            size,
+            stride,
+            flags: 0,
+        }
+    }
+
+    /// One plane of mapped memory holding `pixels`.
+    fn memory(pixels: &[u8]) -> spa_sys::spa_data {
+        spa_sys::spa_data {
+            type_: spa_sys::SPA_DATA_MemPtr,
+            flags: 0,
+            fd: -1,
+            mapoffset: 0,
+            maxsize: pixels.len() as u32,
+            data: pixels.to_vec().leak().as_mut_ptr().cast(),
+            chunk: std::ptr::null_mut(),
+        }
+    }
+
+    /// One pool buffer as libpipewire lays it out, leaked so every address in it stays
+    /// put: a `pw_buffer` over a `spa_buffer` of one plane and a header meta.
+    fn buffer(
+        data: spa_sys::spa_data,
+        chunk: spa_sys::spa_chunk,
+        header_flags: u32,
+    ) -> *mut pw_buffer {
+        let header = spa_sys::spa_meta_header {
+            flags: header_flags,
+            offset: 0,
+            pts: 0,
+            dts_offset: 0,
+            seq: 0,
+        };
+        let meta = spa_sys::spa_meta {
+            type_: spa_sys::SPA_META_Header,
+            size: std::mem::size_of::<spa_sys::spa_meta_header>() as u32,
+            data: leak(header).cast(),
+        };
+        let data = spa_sys::spa_data {
+            chunk: leak(chunk),
+            ..data
+        };
+        let spa_buf = spa_sys::spa_buffer {
+            n_metas: 1,
+            n_datas: 1,
+            metas: leak(meta),
+            datas: leak(data),
+        };
+        // SAFETY: a `pw_buffer` is pointers and integers, so all-zero is one.
+        let mut buf: pw_buffer = unsafe { std::mem::zeroed() };
+        buf.buffer = leak(spa_buf);
+        leak(buf)
+    }
+
+    /// A memory buffer of `pixels` at `stride`.
+    fn shm(pixels: &[u8], stride: i32) -> *mut pw_buffer {
+        buffer(memory(pixels), chunk(pixels.len() as u32, stride), 0)
+    }
+
+    /// A buffer that names an fd as its dmabuf, with the empty chunk a dmabuf reports.
+    /// The fd is a file of `pixels`: short of the fence ioctl, which it refuses, the
+    /// capture cannot tell.
+    fn dmabuf(pixels: &[u8], stride: i32) -> *mut pw_buffer {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "pf-capture-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Relaxed)
+        );
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, pixels).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let data = spa_sys::spa_data {
+            type_: spa_sys::SPA_DATA_DmaBuf,
+            fd: i64::from(file.into_raw_fd()),
+            maxsize: 0,
+            data: std::ptr::null_mut(),
+            ..memory(&[])
+        };
+        buffer(data, chunk(0, stride), 0)
+    }
+
+    /// 16x4 BGRx dmabufs at a 64-byte pitch, which every driver imports unrounded.
+    fn dmabufs<const N: usize>() -> [*mut pw_buffer; N] {
+        std::array::from_fn(|_| dmabuf(&pixels(256), 64))
+    }
+
+    /// The Format pod a producer fixates: one layout and one size, with the modifier
+    /// and transfer function it names.
+    fn format_pod(
+        format: VideoFormat,
+        (w, h): (u32, u32),
+        modifier: Option<u64>,
+        transfer: Option<u32>,
+    ) -> Vec<u8> {
+        use pipewire::spa::pod::{property, Property, PropertyFlags};
+        let layout = property!(
+            pipewire::spa::param::format::FormatProperties::VideoFormat,
+            Id,
+            format
+        );
+        let mut obj = video_raw(layout, Extent::Fixed(w, h), Pacing::Producer);
+        let named = |key, value| Property {
+            key,
+            flags: PropertyFlags::empty(),
+            value,
+        };
+        obj.properties.extend(
+            modifier.map(|m| named(spa_sys::SPA_FORMAT_VIDEO_modifier, Value::Long(m as i64))),
+        );
+        obj.properties.extend(transfer.map(|t| {
+            let id = Value::Id(pipewire::spa::utils::Id(t));
+            named(spa_sys::SPA_FORMAT_VIDEO_transferFunction, id)
+        }));
+        serialize_pod(obj).unwrap()
+    }
+
+    /// One capture stream without its daemon: the listener's state, and the stream as
+    /// lists.
+    struct Rig {
+        ud: UserData,
+        stream: Lists,
+        _wake: std::sync::mpsc::Receiver<()>,
+        _requeue: pipewire::channel::Receiver<()>,
+    }
+
+    impl Rig {
+        /// An active capture on the CPU lane that has negotiated nothing yet.
+        fn new() -> Rig {
+            static IDENTITY: AtomicU64 = AtomicU64::new(0x5e55_1200_0000);
+            let (wake, _wake) = std::sync::mpsc::sync_channel(1);
+            let (requeue, _requeue) = pipewire::channel::channel::<()>();
+            let health = pf_zerocopy::zero_copy_health(IDENTITY.fetch_add(1, Relaxed));
+            let signals = CaptureSignals::new(health);
+            signals.active.store(true, Relaxed);
+            let defer = Arc::new(DeferredRequeue {
+                book: Mutex::new(HoldBook::default()),
+                pending: Mutex::new(Vec::new()),
+                wake: requeue,
+                logged_active: AtomicBool::new(false),
+                logged_shallow: AtomicBool::new(false),
+                sync: None,
+                pool: Default::default(),
+                undelivered: Default::default(),
+            });
+            let ud = UserData {
+                info: VideoInfoRaw::default(),
+                format: None,
+                modifier: 0,
+                queue: Default::default(),
+                wake,
+                signals,
+                vaapi_passthrough: false,
+                hdr_tiled_raw: false,
+                import_policy: ImportPolicy::default(),
+                import_state: ImportState::default(),
+                dbg_log_n: 0,
+                pts: crate::pts_provenance::PtsProvenance::new(),
+                pts_reported: Instant::now(),
+                rt_minus_mono_ns: realtime_minus_monotonic_ns(),
+                hdr_pts_enabled: true,
+                pool: PoolCensus::default(),
+                passthrough_fallbacks: PassthroughFallbacks::default(),
+                cursor: CursorState::new(false),
+                expect_dims: None,
+                gate_skips: 0,
+                gate_since: None,
+                defer,
+                pacer: None,
+                held_drops: 0,
+                damage: DamageGate::new(Duration::from_millis(16)),
+                undamaged: 0,
+                sync: None,
+            };
+            Rig {
+                ud,
+                stream: Lists::default(),
+                _wake,
+                _requeue,
+            }
+        }
+
+        /// A raw-passthrough capture of 16x4 LINEAR BGRx whose producer allocated `pool`.
+        fn raw_lane(pool: &[*mut pw_buffer]) -> Rig {
+            let mut rig = Rig::new();
+            rig.ud.vaapi_passthrough = true;
+            rig.negotiate(VideoFormat::BGRx, (16, 4), 0);
+            rig.allocate(pool);
+            rig
+        }
+
+        /// The producer fixates `format` at `size`.
+        fn negotiate(&mut self, format: VideoFormat, size: (u32, u32), modifier: u64) {
+            let pod = format_pod(format, size, Some(modifier), None);
+            let id = ParamType::Format.as_raw();
+            on_param_changed(&mut self.ud, id, Pod::from_bytes(&pod));
+        }
+
+        /// The producer allocates `pool`.
+        fn allocate(&mut self, pool: &[*mut pw_buffer]) {
+            for &buf in pool {
+                on_add_buffer(&mut self.ud, buf as usize);
+            }
+        }
+
+        /// One `.process` with `arrivals` queued, oldest first.
+        fn process(&mut self, arrivals: &[*mut pw_buffer]) {
+            self.stream.sent.borrow_mut().extend(arrivals);
+            on_process(&self.stream, &mut self.ud);
+        }
+
+        /// The frame the consumer would take now.
+        fn take(&self) -> Option<CapturedFrame> {
+            let mut queue = self.ud.queue.lock().unwrap();
+            queue.take_ready(Instant::now()).map(|t| t.frame)
+        }
+
+        /// The loop servicing the wake of a dropped hold: how many buffers rejoined.
+        fn service(&self) -> usize {
+            // SAFETY: the lists are the stream, and every buffer on them is leaked.
+            unsafe { self.ud.defer.drain(&self.stream) }
+        }
+
+        /// The buffers handed back since the last look, in order.
+        fn back(&self) -> Vec<*mut pw_buffer> {
+            std::mem::take(&mut *self.stream.back.borrow_mut())
+        }
+    }
+
+    /// A published buffer stays out of the pool until the encoder lets go of its frame,
+    /// then rejoins once.
+    #[test]
+    fn a_held_buffer_rejoins_once_after_its_hold_drops() {
+        let pool = dmabufs::<4>();
+        let mut rig = Rig::raw_lane(&pool);
+        rig.process(&pool[..1]);
+        assert!(rig.back().is_empty(), "the hold owns the requeue");
+        let frame = rig.take().expect("a frame");
+        assert!(matches!(frame.payload, FramePayload::Dmabuf(_)));
+        assert_eq!(rig.service(), 0, "the encoder still reads it");
+        drop(frame);
+        assert_eq!(rig.service(), 1);
+        assert_eq!(rig.back(), [pool[0]]);
+        assert_eq!(rig.service(), 0, "one hold, one requeue");
+    }
+
+    /// With every hold out an arrival is dropped, not copied, and goes straight back. A
+    /// hold the encoder dropped is requeued first, so the next arrival takes its place.
+    #[test]
+    fn an_arrival_spends_only_a_hold_that_came_back() {
+        let [a, b, c, d, e] = dmabufs::<5>();
+        let mut rig = Rig::raw_lane(&[a, b, c]);
+        let mut encoding = Vec::new();
+        for buf in [a, b, c] {
+            rig.process(&[buf]);
+            encoding.push(rig.take().expect("a frame"));
+        }
+        rig.process(&[d]);
+        assert!(rig.take().is_none(), "no hold, no frame");
+        assert_eq!((rig.back(), rig.ud.held_drops), (vec![d], 1));
+        // The encoder lets `a` go; the loop has not serviced that wake when `e` arrives.
+        encoding.remove(0);
+        rig.process(&[e]);
+        assert_eq!(
+            rig.back(),
+            [a],
+            "the dropped hold's buffer, not the arrival"
+        );
+        assert!(rig.take().is_some());
+        assert_eq!(rig.ud.held_drops, 1);
+    }
+
+    /// A burst keeps its newest buffer and hands each older one back once, in order.
+    /// One of them the book still lists was re-sent while held: its stale hold then
+    /// releases nothing.
+    #[test]
+    fn a_burst_hands_its_stale_buffers_back_once() {
+        let pool = dmabufs::<4>();
+        let [a, b, c, _] = pool;
+        let mut rig = Rig::raw_lane(&pool);
+        rig.process(&[a]);
+        let held = rig.take().expect("a frame");
+        rig.process(&[a, b, c]);
+        assert_eq!(rig.back(), [a, b]);
+        assert_eq!(rig.ud.signals.resent.load(Relaxed), 1);
+        drop(held);
+        assert_eq!(rig.service(), 0, "the purged hold releases nothing");
+        assert!(rig.back().is_empty());
+        drop(rig.take().expect("the newest buffer's frame"));
+        assert_eq!(rig.service(), 1);
+        assert_eq!(rig.back(), [c]);
+    }
+
+    /// PipeWire below 1.6: the producer sends a buffer again while its hold is out. The
+    /// new frame re-holds it, the stale hold releases nothing, and it rejoins once.
+    #[test]
+    fn a_resent_buffer_is_reheld_under_the_new_frame() {
+        let pool = dmabufs::<4>();
+        let mut rig = Rig::raw_lane(&pool);
+        rig.process(&pool[..1]);
+        let stale = rig.take().expect("a frame");
+        rig.process(&pool[..1]);
+        let fresh = rig.take().expect("the re-sent buffer's frame");
+        assert_eq!(rig.ud.signals.resent.load(Relaxed), 1);
+        drop(stale);
+        assert_eq!(rig.service(), 0);
+        assert!(rig.back().is_empty(), "the new frame still reads it");
+        drop(fresh);
+        assert_eq!(rig.service(), 1);
+        assert_eq!(rig.back(), [pool[0]]);
+    }
+
+    /// Renegotiation frees the pool under its holds, and the next pool reuses the
+    /// addresses. A hold of the old pool releases nothing: not while its buffer is
+    /// freed, and not once the address has a new tenant.
+    #[test]
+    fn a_renegotiated_pool_takes_no_release_from_the_old_one() {
+        let pool = dmabufs::<4>();
+        let [a, b, ..] = pool;
+        let mut rig = Rig::raw_lane(&pool);
+        rig.process(&[a]);
+        let old_a = rig.take().expect("a frame");
+        rig.process(&[b]);
+        let old_b = rig.take().expect("a frame");
+        for &buf in &pool {
+            on_remove_buffer(&mut rig.ud, buf as usize);
+        }
+        drop(old_a);
+        assert_eq!(rig.service(), 0, "its buffer is freed");
+        rig.negotiate(VideoFormat::BGRx, (16, 4), 0);
+        rig.allocate(&pool);
+        rig.process(&[b]);
+        let new_b = rig.take().expect("the new pool's frame");
+        drop(old_b);
+        assert_eq!(rig.service(), 0, "the address has a new tenant");
+        assert!(rig.back().is_empty());
+        let resent = rig.ud.signals.resent.load(Relaxed);
+        assert_eq!(resent, 0, "a buffer of the new pool, not a re-send");
+        drop(new_b);
+        assert_eq!(rig.service(), 1);
+        assert_eq!(rig.back(), [b]);
+        assert_eq!((rig.ud.pool.live, rig.ud.pool.high_water), (4, 4));
+    }
+
+    /// A new Format pod is what the next buffer is read by: its size and its layout.
+    #[test]
+    fn a_new_format_is_what_the_next_buffer_is_read_by() {
+        let mut rig = Rig::new();
+        rig.negotiate(VideoFormat::BGRx, (2, 2), 0);
+        // Two rows of 8 bytes at a 12-byte stride.
+        let padded = shm(&pixels(24), 12);
+        rig.process(&[padded]);
+        let frame = rig.take().expect("a frame");
+        let FramePayload::Cpu(tight) = &frame.payload else {
+            panic!("a CPU frame");
+        };
+        assert_eq!((frame.width, frame.height), (2, 2));
+        assert_eq!(frame.format, PixelFormat::Bgrx);
+        assert_eq!(tight[..8], pixels(8)[..]);
+        assert_eq!(tight[8..], pixels(20)[12..]);
+
+        rig.negotiate(VideoFormat::RGB, (2, 1), 0);
+        assert_eq!(rig.ud.signals.frame_size.load(Relaxed), (2 << 32) | 1);
+        rig.process(&[padded]);
+        let frame = rig.take().expect("a frame");
+        let FramePayload::Cpu(tight) = &frame.payload else {
+            panic!("a CPU frame");
+        };
+        assert_eq!((frame.width, frame.height), (2, 1));
+        assert_eq!(frame.format, PixelFormat::Rgb);
+        assert_eq!(tight[..], pixels(6)[..]);
+        assert_eq!(rig.back(), [padded, padded], "a CPU frame holds no buffer");
+    }
+
+    /// gamescope offers its 10-bit formats under BT.709 too: the transfer function the
+    /// producer fixated decides, not the bit depth.
+    #[test]
+    fn a_ten_bit_format_is_hdr_only_under_pq() {
+        let mut rig = Rig::new();
+        let mut fixate = |transfer| {
+            let pod = format_pod(VideoFormat::xBGR_210LE, (2, 2), Some(0), Some(transfer));
+            let id = ParamType::Format.as_raw();
+            on_param_changed(&mut rig.ud, id, Pod::from_bytes(&pod));
+            rig.ud.signals.hdr_negotiated.load(Relaxed)
+        };
+        assert!(fixate(SPA_VIDEO_TRANSFER_SMPTE2084));
+        assert!(!fixate(spa_sys::SPA_VIDEO_TRANSFER_BT709));
+        assert_eq!(rig.ud.format, Some(PixelFormat::X2Bgr10));
+    }
+
+    /// PipeWire's fallback to memory buffers renegotiates with a pod that names neither a
+    /// modifier nor a transfer function. Neither carries over from the format before.
+    #[test]
+    fn a_pod_inherits_nothing_it_leaves_out() {
+        let mut rig = Rig::new();
+        let mut fixate = |modifier, transfer| {
+            let pod = format_pod(VideoFormat::xBGR_210LE, (2, 2), modifier, transfer);
+            let id = ParamType::Format.as_raw();
+            on_param_changed(&mut rig.ud, id, Pod::from_bytes(&pod));
+            let hdr = rig.ud.signals.hdr_negotiated.load(Relaxed);
+            (rig.ud.modifier, rig.ud.info.transfer_function(), hdr)
+        };
+        let pq = SPA_VIDEO_TRANSFER_SMPTE2084;
+        assert_eq!(fixate(Some(7), Some(pq)), (7, pq, true));
+        assert_eq!(fixate(None, None), (0, 0, false));
+    }
+
+    /// KWin's birth mode: buffers in the doomed size go straight back until the producer
+    /// renegotiates to the expected one.
+    #[test]
+    fn the_birth_gate_holds_frames_until_the_expected_mode() {
+        let mut rig = Rig::new();
+        rig.ud.expect_dims = Some((4, 2));
+        rig.negotiate(VideoFormat::BGRx, (2, 2), 0);
+        let doomed = shm(&pixels(16), 8);
+        rig.process(&[doomed]);
+        assert!(rig.take().is_none());
+        assert_eq!(rig.back(), [doomed]);
+        rig.negotiate(VideoFormat::BGRx, (4, 2), 0);
+        let real = shm(&pixels(32), 16);
+        rig.process(&[real]);
+        let frame = rig.take().expect("a frame in the expected mode");
+        assert_eq!((frame.width, frame.height), (4, 2));
+        assert_eq!(rig.ud.expect_dims, None);
+    }
+
+    /// A zero-copy session handed memory instead of a dmabuf takes the CPU copy.
+    #[test]
+    fn passthrough_copies_a_buffer_that_is_no_dmabuf() {
+        let mut rig = Rig::new();
+        rig.ud.vaapi_passthrough = true;
+        rig.negotiate(VideoFormat::BGRx, (2, 2), 0);
+        let memory = shm(&pixels(24), 12);
+        rig.process(&[memory]);
+        let frame = rig.take().expect("the CPU copy");
+        assert!(matches!(&frame.payload, FramePayload::Cpu(p) if p.len() == 16));
+        assert_eq!(rig.ud.passthrough_fallbacks.frames, 1);
+        assert_eq!(rig.back(), [memory]);
+        assert!(!rig.ud.signals.broken.load(Relaxed));
+    }
+
+    /// Tiled bytes read as linear are a scrambled picture, so a tiled session has no
+    /// CPU copy to take: it refuses the tiled offer and asks for a rebuild.
+    #[test]
+    fn a_tiled_session_handed_memory_rebuilds() {
+        let mut rig = Rig::new();
+        rig.ud.vaapi_passthrough = true;
+        rig.negotiate(VideoFormat::BGRx, (2, 2), 1);
+        let memory = shm(&pixels(24), 12);
+        for _ in 0..2 {
+            rig.process(&[memory]);
+            assert!(rig.take().is_none());
+            assert_eq!(rig.back(), [memory]);
+        }
+        assert!(rig.ud.signals.broken.load(Relaxed));
+        assert!(rig.ud.signals.health.passthrough_tiled_refused());
+        let read = rig.ud.passthrough_fallbacks.frames;
+        assert_eq!(read, 1, "a broken capture reads no more buffers");
+    }
+
+    /// A pool too shallow to lend a buffer: the dmabuf is copied, never published raw.
+    #[test]
+    fn a_pool_that_cannot_hold_takes_the_cpu_copy() {
+        let pool = dmabufs::<2>();
+        let mut rig = Rig::raw_lane(&pool);
+        rig.process(&pool[..1]);
+        let frame = rig.take().expect("the CPU copy");
+        let FramePayload::Cpu(tight) = &frame.payload else {
+            panic!("a CPU frame");
+        };
+        assert_eq!(tight[..], pixels(256)[..]);
+        assert_eq!(rig.back(), [pool[0]]);
+        assert_eq!(rig.ud.held_drops, 0);
+    }
+
+    /// What publishes nothing still goes back to the producer, once.
+    #[test]
+    fn a_buffer_that_publishes_nothing_goes_straight_back() {
+        let negotiated = |format| {
+            let mut rig = Rig::new();
+            rig.negotiate(format, (2, 2), 0);
+            rig
+        };
+        let good = shm(&pixels(16), 8);
+        let corrupted = spa_sys::SPA_META_HEADER_FLAG_CORRUPTED;
+        let corrupted = buffer(memory(&pixels(16)), chunk(16, 8), corrupted);
+        let empty = buffer(memory(&pixels(16)), chunk(0, 8), 0);
+        let idle = negotiated(VideoFormat::BGRx);
+        idle.ud.signals.active.store(false, Relaxed);
+        // Only a Format pod negotiates.
+        let mut unnegotiated = Rig::new();
+        let pod = format_pod(VideoFormat::BGRx, (2, 2), Some(0), None);
+        let buffers = ParamType::Buffers.as_raw();
+        on_param_changed(&mut unnegotiated.ud, buffers, Pod::from_bytes(&pod));
+        on_param_changed(&mut unnegotiated.ud, ParamType::Format.as_raw(), None);
+        assert!(!unnegotiated.ud.signals.negotiated.load(Relaxed));
+
+        for (what, mut rig, buf) in [
+            ("corrupted", negotiated(VideoFormat::BGRx), corrupted),
+            (
+                "an empty memory chunk",
+                negotiated(VideoFormat::BGRx),
+                empty,
+            ),
+            (
+                "shorter than its frame",
+                negotiated(VideoFormat::BGRx),
+                shm(&pixels(8), 8),
+            ),
+            (
+                "a layout no encoder reads",
+                negotiated(VideoFormat::I420),
+                good,
+            ),
+            ("not negotiated", unnegotiated, good),
+            ("between sessions", idle, good),
+        ] {
+            rig.process(&[buf]);
+            assert!(rig.take().is_none(), "{what}");
+            assert_eq!(rig.back(), [buf], "{what}");
+        }
     }
 }

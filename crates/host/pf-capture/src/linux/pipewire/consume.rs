@@ -9,7 +9,7 @@ use super::plan::{
 use super::queue::{RenderFence, RENDER_GUARD};
 use super::UserData;
 use crate::linux::pw_cursor::composite_cursor;
-use crate::linux::sync_timeline::{plane_count, SyncPoints};
+use crate::linux::sync_timeline::{plane_count, StreamBuffers, SyncPoints};
 use crate::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
 use pf_dmabuf::{ReadMap, Share};
 use pipewire as pw;
@@ -275,7 +275,7 @@ pub(super) fn consume_frame(
     ud: &mut UserData,
     spa_buf: *mut spa::sys::spa_buffer,
     pw_buf: *mut pw::sys::pw_buffer,
-    stream: *mut pw::sys::pw_stream,
+    stream: &dyn StreamBuffers,
     hdr_pts_ns: Option<i64>,
 ) {
     // Inactive: skip the de-pad (expensive at 5K).
@@ -343,7 +343,7 @@ struct Arrival<'a> {
     h: usize,
     pts_ns: u64,
     pw_buf: *mut pw::sys::pw_buffer,
-    stream: *mut pw::sys::pw_stream,
+    stream: &'a dyn StreamBuffers,
     fence: Option<RenderFence>,
 }
 

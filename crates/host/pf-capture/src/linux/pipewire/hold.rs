@@ -2,7 +2,7 @@
 //! go of it. The whole pool may be out: the producer then has nothing to paint and skips.
 
 use super::UserData;
-use crate::linux::sync_timeline::{hand_back, release_undelivered, SyncDevice};
+use crate::linux::sync_timeline::{hand_back, release_undelivered, StreamBuffers, SyncDevice};
 use pipewire as pw;
 use std::sync::atomic::Ordering;
 
@@ -19,7 +19,7 @@ impl UserData {
     pub(super) fn try_defer(
         &mut self,
         pw_buf: *mut pw::sys::pw_buffer,
-        stream: *mut pw::sys::pw_stream,
+        stream: &dyn StreamBuffers,
     ) -> Option<pf_frame::FrameHold> {
         if !zerocopy_hold_enabled() {
             return None;
@@ -79,7 +79,7 @@ impl UserData {
     /// Loop thread; `buf` was dequeued from the live `stream` and is not yet requeued.
     pub(super) unsafe fn requeue_unpublished(
         &self,
-        stream: *mut pw::sys::pw_stream,
+        stream: &dyn StreamBuffers,
         buf: *mut pw::sys::pw_buffer,
     ) {
         let held = self
@@ -275,7 +275,7 @@ impl DeferredRequeue {
     ///
     /// # Safety
     /// Loop thread only, and `stream` is the live stream whose buffers this book tracks.
-    pub(super) unsafe fn drain(&self, stream: *mut pw::sys::pw_stream) -> usize {
+    pub(super) unsafe fn drain(&self, stream: &dyn StreamBuffers) -> usize {
         self.drain_with(|buf| {
             // SAFETY: `drain_with` hands over only buffers the book still listed under the
             // dropping hold's generation, and `remove_buffer` purges the book: `buf` is a
