@@ -32,7 +32,8 @@ pub(super) enum SwapReason {
 }
 
 impl SwapReason {
-    /// A rate rebuild keeps the picture, so the client keeps what it holds.
+    /// A rate rebuild delivers the same picture at the same mode, so it keeps the epoch and
+    /// the client keeps what it holds.
     fn moves_epoch(self) -> bool {
         self != SwapReason::Bitrate
     }

@@ -164,7 +164,8 @@ pub(super) struct StreamState {
     pub(super) cur_node_id: u32,
     pub(super) cur_display_gen: Option<u64>,
     /// The `punktfunk/2` stream epoch every AU from now on carries. It moves whenever the
-    /// pipeline or the mode under it changes, so a client drops what was encoded before.
+    /// pipeline or the mode under it changes, so a client drops what was encoded before. A
+    /// rate rebuild keeps it: the same picture at the same mode.
     pub(super) epoch: u8,
     /// The live output's metadata for a capture-only rebuild (`on_capture_lost`).
     #[cfg(target_os = "linux")]
