@@ -61,6 +61,8 @@ export interface RunnerOptions {
 	configDir?: string;
 	/** Grants poll period. Default 2 seconds; tests shorten it. */
 	grantPollInterval?: Duration.Input;
+	/** Whether this box can build a sandbox (test seam). Default `sandboxProbe`. */
+	sandboxProbe?: () => { ok: true } | { ok: false; reason: string };
 	/** Run one sandbox attempt without spawning bwrap (test seam). */
 	sandboxRun?: (
 		unit: Unit,
@@ -334,23 +336,29 @@ export const runner = (options: RunnerOptions = {}): Effect.Effect<void> => {
 			// bwrap is the Linux sandbox, an AppContainer the Windows one; macOS has neither.
 			const confines = process.platform === "linux" || process.platform === "win32";
 			const sandbox = options.sandbox ?? (confines ? sandboxMode() : "off");
+			let capable = true;
 			if (sandbox === "off" && confines) {
 				log(
 					"[runner] PUNKTFUNK_PLUGIN_SANDBOX=off — plugins run with the runner's whole access",
 					"warn",
 				);
 			} else if (sandbox === "on") {
-				const probe = sandboxProbe();
+				const probe = (options.sandboxProbe ?? sandboxProbe)();
+				capable = probe.ok;
 				if (!probe.ok) {
 					log(`[runner] plugins cannot be sandboxed: ${probe.reason}`, "error");
 					log("[runner] refusing to run plugins unsandboxed — set PUNKTFUNK_PLUGIN_SANDBOX=off to accept that", "error");
 				}
 			}
-			// A package with no manifest has nothing to build its sandbox from, so it does not run.
+			// A package runs in a sandbox built from its manifest. With no manifest, or on a box that
+			// builds no sandbox, it is never started: an attempt would only fail and back off forever.
 			const units = discoverUnits(options, log).filter((unit) => {
-				if (sandbox === "off" || !unit.packageDir || unit.manifest) return true;
+				if (sandbox === "off" || !unit.packageDir) return true;
+				if (unit.manifest && capable) return true;
 				log(
-					`[runner] not starting ${unit.name}: no punktfunk manifest to sandbox it with — update the plugin`,
+					unit.manifest
+						? `[runner] not starting ${unit.name}: it can't be sandboxed on this box`
+						: `[runner] not starting ${unit.name}: no punktfunk manifest to sandbox it with — update the plugin`,
 					"error",
 				);
 				return false;

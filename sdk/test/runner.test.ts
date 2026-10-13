@@ -538,6 +538,7 @@ describe("supervision", () => {
 				configDir: d.dir,
 				grantPollInterval: "20 millis",
 				log: (line) => logs.push(line),
+				sandboxProbe: () => ({ ok: true }),
 				sandboxRun: (_unit, manifest) => {
 					const id = manifest.id as "one" | "two";
 					return Effect.scoped(
@@ -611,6 +612,45 @@ describe("supervision", () => {
 		await Effect.runPromise(Fiber.interrupt(fiber));
 		expect(logs.some((l) => l.includes("starting punktfunk-plugin-bare ("))).toBe(false);
 		expect(fs.existsSync(ran)).toBe(false);
+	});
+
+	test("a box that builds no sandbox starts no plugin, and still runs scripts", async () => {
+		const d = mkdirs("no-sandbox");
+		const pkg = path.join(d.pluginsDir, "node_modules", "punktfunk-plugin-demo");
+		write(
+			path.join(pkg, "package.json"),
+			JSON.stringify({
+				name: "punktfunk-plugin-demo",
+				main: "index.js",
+				punktfunk: { schema: 1, id: "demo" },
+			}),
+		);
+		write(path.join(pkg, "index.js"), "export default {};");
+		write(path.join(d.scriptsDir, "once.ts"), "export {};");
+		let attempts = 0;
+		const logs: string[] = [];
+		const fiber = Effect.runFork(
+			runner({
+				...d,
+				sandbox: "on",
+				restartBase: "10 millis",
+				log: (l) => logs.push(l),
+				sandboxProbe: () => ({ ok: false, reason: "no user namespaces" }),
+				sandboxRun: () =>
+					Effect.suspend(() => {
+						attempts += 1;
+						return Effect.fail("no sandbox");
+					}),
+			}),
+		);
+		await waitFor(() => logs.some((l) => l.includes("[once] script completed")));
+		await new Promise((r) => setTimeout(r, 200)); // several restarts by now
+		await Effect.runPromise(Fiber.interrupt(fiber));
+		expect(attempts).toBe(0);
+		const about = (text: string) => logs.filter((l) => l.includes(text));
+		expect(about("plugins cannot be sandboxed: no user namespaces")).toHaveLength(1);
+		expect(about("not starting punktfunk-plugin-demo")).toHaveLength(1);
+		expect(about("[punktfunk-plugin-demo]")).toEqual([]);
 	});
 
 	test("shutdown interrupts an Effect plugin STRUCTURALLY — its finalizer runs", async () => {
