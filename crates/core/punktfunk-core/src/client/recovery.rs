@@ -199,6 +199,17 @@ pub struct Decoded {
     pub decode_order: Option<u64>,
 }
 
+/// What [`NativeClient::recovery_on_au`](super::NativeClient::recovery_on_au) says of one AU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arrival {
+    /// Feed it. `false`: a straggler a reference decoder rewinds on, or a partial a newer
+    /// frame beat.
+    pub admit: bool,
+    /// Frames lost ahead of this AU, `0` for none: the gap
+    /// [`AuAdmission::note`](crate::reanchor::AuAdmission::note) takes.
+    pub gap: u32,
+}
+
 /// What the embedder does with a decoded picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Shown {
@@ -223,6 +234,8 @@ pub(crate) enum RecoveryEvent {
     NoOutput,
     /// A loss with no index gap: a parked-AU overflow, a wedge.
     Lost,
+    /// The decoder raised an error it recovers from: its next pictures may be concealment.
+    CodecError,
     /// The decoder asks (a rebuild, a demotion, a damaged AU).
     NeedKeyframe,
     /// The pump saw `index`'s tail arrive short of what its parity rebuilds.
@@ -241,6 +254,8 @@ pub(crate) struct RecoveryStep {
     /// `Arrived`: feed the AU. `false` drops a straggler a reference decoder rewinds on, or
     /// a partial a newer frame beat.
     pub(crate) admit: bool,
+    /// `Arrived`: frames lost ahead of the AU.
+    pub(crate) gap: u32,
     /// The freeze is up after this event.
     pub(crate) hold: bool,
     pub(crate) forgive_chain: bool,
@@ -254,8 +269,9 @@ pub(crate) struct RecoveryStep {
 /// lock, feeds the decoder's reports and the pump's ticks, and sends what it asks for.
 #[derive(Default)]
 pub(crate) struct RecoveryDriver {
-    /// `None` until an embedder reports through `recovery_on_*`. A client still driving
-    /// its own gate keeps the only one, so the tick cannot ask twice.
+    /// `None` while no decoder reports: before the first `recovery_on_*`, after
+    /// [`Self::reset`], and on a lane that keeps no freeze ([`Self::observe`]). The tick
+    /// then polls nothing, so a parked decoder costs no keyframe.
     gate: Option<ReanchorGate>,
     rfi: RfiRecovery,
     /// Newest index handed to the decoder: a partial behind it is the stale past.
@@ -280,9 +296,23 @@ impl RecoveryDriver {
         }
     }
 
+    /// The decoder is gone or parked: no gate until the next report starts a fresh one. The
+    /// lost range an RFI still owes stays.
+    pub(crate) fn reset(&mut self) {
+        self.gate = None;
+        self.arm_order = 0;
+        self.arms_seen = 0;
+    }
+
+    /// The freeze's arm count; `0` with no gate.
+    pub(crate) fn arms(&self) -> u64 {
+        self.gate.as_ref().map_or(0, ReanchorGate::arms)
+    }
+
     /// Fold one observation.
     pub(crate) fn step(&mut self, ev: RecoveryEvent, now: Instant) -> RecoveryStep {
         let mut admit = true;
+        let mut gap = 0;
         let mut forgive_chain = false;
         let mut want_keyframe = false;
         let mut ask = RecoveryAsk::None;
@@ -291,16 +321,18 @@ impl RecoveryDriver {
                 index,
                 complete,
                 decode_order,
-            } => (admit, ask) = self.arrived(index, complete, decode_order, now),
+            } => (admit, gap, ask) = self.arrived(index, complete, decode_order, now),
             RecoveryEvent::Decoded(d) => (forgive_chain, want_keyframe) = self.decoded(d, now),
             RecoveryEvent::NoOutput => {
                 want_keyframe = self.gate.as_mut().is_some_and(|g| g.on_no_output(now));
             }
-            RecoveryEvent::Lost => {
+            // A codec error is held, not asked for: an anchor on its way lifts it, else the
+            // backstop asks.
+            RecoveryEvent::Lost | RecoveryEvent::CodecError => {
                 if let Some(g) = &mut self.gate {
                     g.arm(now);
                 }
-                want_keyframe = true;
+                want_keyframe = ev == RecoveryEvent::Lost;
             }
             RecoveryEvent::NeedKeyframe => match &mut self.gate {
                 // The flag fires per damaged AU; a new loss re-arms by gap or climb.
@@ -310,7 +342,7 @@ impl RecoveryDriver {
                     }
                     want_keyframe = true;
                 }
-                // A client on its own gate asks as it always has: at once.
+                // No freeze to arm: the ask goes at once, outside the window.
                 None => {
                     self.rfi.keyframe_requested();
                     ask = RecoveryAsk::Keyframe;
@@ -333,27 +365,31 @@ impl RecoveryDriver {
         }
         RecoveryStep {
             admit,
+            gap,
             hold: self.gate.as_ref().is_some_and(ReanchorGate::is_holding),
             forgive_chain,
             ask,
         }
     }
 
-    /// One AU before decode: `(admit, ask)`. A gap asks for the range and arms with credit;
-    /// a straggler a reference decoder rewinds on, or a partial behind the newest decoded
-    /// frame, is not admitted. An admitted AU stamps the watermark when the gate re-armed.
+    /// One AU before decode: `(admit, gap, ask)`. A gap asks for the range and arms with
+    /// credit; a straggler a reference decoder rewinds on, or a partial behind the newest
+    /// decoded frame, is not admitted. An admitted AU stamps the watermark when the gate
+    /// re-armed.
     fn arrived(
         &mut self,
         index: u32,
         complete: bool,
         decode_order: u64,
         now: Instant,
-    ) -> (bool, RecoveryAsk) {
+    ) -> (bool, u32, RecoveryAsk) {
         let (order, ask) = self.rfi.observe(index, now);
         let mut admit = true;
+        let mut lost = 0;
         match order {
             // Credited: the reassembler books these frames ~120 ms from now.
             FrameOrder::Gap(gap) => {
+                lost = gap;
                 if let Some(g) = &mut self.gate {
                     g.arm_expecting_drops(now, u64::from(gap));
                 }
@@ -382,7 +418,7 @@ impl RecoveryDriver {
                 }
             }
         }
-        (admit, ask)
+        (admit, lost, ask)
     }
 
     /// One decoded picture: `(forgive_chain, want_keyframe)`. A recovery SEI on a picture
@@ -418,8 +454,8 @@ impl RecoveryDriver {
         RecoveryAsk::Keyframe
     }
 
-    // Until 22 moves Android and the C ABI onto `step`: the RFI side alone.
-
+    /// One AU on a lane that keeps no freeze (an all-intra decoder, a recorder): the RFI
+    /// side alone.
     pub(crate) fn observe(&mut self, index: u32, now: Instant) -> (FrameOrder, RecoveryAsk) {
         self.rfi.observe(index, now)
     }
@@ -1239,6 +1275,7 @@ mod driver_tests {
     fn want(admit: bool, hold: bool, forgive_chain: bool, ask: RecoveryAsk) -> RecoveryStep {
         RecoveryStep {
             admit,
+            gap: 0,
             hold,
             forgive_chain,
             ask,
@@ -1246,14 +1283,68 @@ mod driver_tests {
     }
 
     /// Replay `rows` (ms from a start, event, expected step) against one engaged driver.
+    /// The gap width has its own test.
     fn replay(rows: &[(u64, E, RecoveryStep)]) {
         let t0 = Instant::now();
         let mut d = RecoveryDriver::default();
         d.engage(0);
         for (i, (ms, ev, expect)) in rows.iter().enumerate() {
             let got = d.step(*ev, t0 + Duration::from_millis(*ms));
-            assert_eq!(got, *expect, "row {i}: {ev:?} at {ms} ms");
+            assert_eq!(
+                RecoveryStep { gap: 0, ..got },
+                *expect,
+                "row {i}: {ev:?} at {ms} ms"
+            );
         }
+    }
+
+    #[test]
+    fn a_gap_reports_its_width_and_a_straggler_none() {
+        let t0 = Instant::now();
+        let mut d = RecoveryDriver::default();
+        d.engage(0);
+        assert_eq!(d.step(au(100), t0).gap, 0);
+        assert_eq!(d.step(au(103), t0).gap, 2);
+        let late = d.step(au(101), t0);
+        assert_eq!((late.admit, late.gap), (false, 0));
+    }
+
+    #[test]
+    fn a_codec_error_holds_without_asking_until_the_backstop() {
+        replay(&[
+            (0, au(100), want(true, false, false, NONE)),
+            (0, E::CodecError, want(true, true, false, NONE)),
+            (
+                499,
+                E::Tick { frames_dropped: 0 },
+                want(true, true, false, NONE),
+            ),
+            (
+                500,
+                E::Tick { frames_dropped: 0 },
+                want(true, true, false, KEYFRAME),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_parked_decoder_asks_nothing_and_the_next_report_starts_fresh() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let mut d = RecoveryDriver::default();
+        d.engage(0);
+        d.step(au(100), t0);
+        assert_eq!(d.step(E::Lost, t0), want(true, true, false, KEYFRAME));
+        assert_eq!(d.arms(), 1);
+        d.reset();
+        assert_eq!(d.arms(), 0);
+        // Drops and the old freeze's deadline pass with the decoder parked.
+        let parked = d.step(E::Tick { frames_dropped: 5 }, at(600));
+        assert_eq!(parked, want(true, false, false, NONE));
+        d.engage(5);
+        assert_eq!(d.step(au(101), at(700)), want(true, false, false, NONE));
+        let fresh = d.step(E::Tick { frames_dropped: 5 }, at(701));
+        assert_eq!(fresh, want(true, false, false, NONE));
     }
 
     #[test]

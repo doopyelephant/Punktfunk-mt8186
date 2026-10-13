@@ -70,7 +70,7 @@ use self::frame_channel::{DecodeLatAcc, FrameChannel, FramePop};
 use self::planes::{PlaneRx, RawRumble};
 use self::probe::ProbeState;
 use self::pump::run_pump;
-pub use self::recovery::{Decoded, FrameOrder, Shown};
+pub use self::recovery::{Arrival, Decoded, FrameOrder, Shown};
 use self::recovery::{RecentRfis, RecoveryAsk, RecoveryDriver, RecoveryEvent, ShortFrames};
 pub use self::sc2::{Sc2Gate, SC2_GATE_CHORDS, SC2_GATE_MASKED, SC2_GATE_SYSTEM_LOCAL};
 use self::worker::{ClientShared, WorkerArgs};
@@ -881,12 +881,24 @@ impl NativeClient {
     /// for the lost range from here. `decode_order` is the decoder's count so far, the
     /// watermark a recovery SEI is paired against.
     pub fn recovery_on_frame(&self, frame: &Frame, decode_order: u64) -> bool {
+        self.recovery_on_au(frame.frame_index, frame.complete, decode_order)
+            .admit
+    }
+
+    /// [`recovery_on_frame`](Self::recovery_on_frame) by index, with the gap ahead of the AU
+    /// for the receiver rule. Report a sliced AU once, on its first part: parts repeat the
+    /// index.
+    pub fn recovery_on_au(&self, index: u32, complete: bool, decode_order: u64) -> Arrival {
         let arrived = RecoveryEvent::Arrived {
-            index: frame.frame_index,
-            complete: frame.complete,
+            index,
+            complete,
             decode_order,
         };
-        self.recovery_step(arrived, true).admit
+        let step = self.recovery_step(arrived, true);
+        Arrival {
+            admit: step.admit,
+            gap: step.gap,
+        }
     }
 
     /// One decoded picture: whether to show it, and whether the lift came from an
@@ -908,6 +920,25 @@ impl NativeClient {
     /// A loss the index gap cannot see (a parked AU overflowed, a wedge): arm and ask.
     pub fn recovery_lost(&self) {
         self.recovery_step(RecoveryEvent::Lost, true);
+    }
+
+    /// The decoder raised an error it recovers from: its next pictures may be concealment.
+    /// Arms the freeze without asking; the backstop asks if no re-anchor comes.
+    pub fn recovery_on_codec_error(&self) {
+        self.recovery_step(RecoveryEvent::CodecError, true);
+    }
+
+    /// The decoder is gone or parked (a rebuild, a lost surface, a background drain): drop
+    /// the freeze. Nothing polls or asks until the next report, which starts a fresh one at
+    /// that moment's drop count.
+    pub fn recovery_reset(&self) {
+        self.shared.recovery.lock().unwrap().reset();
+    }
+
+    /// The freeze's arm count, `0` with none up. A move since the last look is a loss: a
+    /// cadence loop re-anchors on it.
+    pub fn recovery_arms(&self) -> u64 {
+        self.shared.recovery.lock().unwrap().arms()
     }
 
     /// Fold one event under the lock and send what it asks for. An embedder's `report`
