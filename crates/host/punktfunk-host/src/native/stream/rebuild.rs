@@ -267,10 +267,10 @@ impl StreamState {
                 self.client_hdr,
                 self.clock.au_seq,
             ) {
-                // Same mode as before the bounce, so the built bitrate is the one
-                // already in force: nothing to adopt.
                 Ok(next_pipe) => {
-                    self.swap_pipeline(Next::Pipeline(next_pipe), SwapReason::TopologyReassert)
+                    let built = next_pipe.bitrate_kbps;
+                    self.swap_pipeline(Next::Pipeline(next_pipe), SwapReason::TopologyReassert);
+                    self.adopt_built_bitrate(built);
                 }
                 Err(e) => {
                     return Err(e).context(
