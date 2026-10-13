@@ -2231,7 +2231,10 @@ impl Parser {
         let header = &nalu.header;
         let hdr_len = header.len();
         // Skip the header
-        let mut r = BitReader::new(&data[hdr_len..], true);
+        let payload = data
+            .get(hdr_len..)
+            .ok_or("NALU is shorter than its header")?;
+        let mut r = BitReader::new(payload, true);
 
         let mut vps = Vps {
             video_parameter_set_id: r.read_bits(4)?,
@@ -3052,8 +3055,10 @@ impl Parser {
                 r.read_ue_max(128 - u32::from(scc.palette_max_size))?;
             scc.palette_predictor_initializers_present_flag = r.read_bit()?;
             if scc.palette_predictor_initializers_present_flag {
-                let max =
-                    u32::from(scc.palette_max_size + scc.delta_palette_max_predictor_size - 1);
+                let max = (u32::from(scc.palette_max_size)
+                    + u32::from(scc.delta_palette_max_predictor_size))
+                .checked_sub(1)
+                .ok_or("Palette predictor initializers for an empty palette")?;
                 scc.num_palette_predictor_initializer_minus1 = r.read_ue_max(max)?;
 
                 let num_comps = if sps.chroma_format_idc == 0 { 1 } else { 3 };
@@ -3107,7 +3112,10 @@ impl Parser {
         let header = &nalu.header;
         let hdr_len = header.len();
         // Skip the header
-        let mut r = BitReader::new(&data[hdr_len..], true);
+        let payload = data
+            .get(hdr_len..)
+            .ok_or("NALU is shorter than its header")?;
+        let mut r = BitReader::new(payload, true);
 
         let video_parameter_set_id = r.read_bits(4)?;
 
@@ -3394,7 +3402,7 @@ impl Parser {
         }
 
         let bit_depth_y = sps.bit_depth_luma_minus8 + 8;
-        let max = u32::from(std::cmp::max(0, bit_depth_y - 10));
+        let max = u32::from(bit_depth_y.saturating_sub(10));
 
         rext.log2_sao_offset_scale_luma = r.read_ue_max(max)?;
         rext.log2_sao_offset_scale_chroma = r.read_ue_max(max)?;
@@ -3416,7 +3424,10 @@ impl Parser {
         let header = &nalu.header;
         let hdr_len = header.len();
         // Skip the header
-        let mut r = BitReader::new(&data[hdr_len..], true);
+        let payload = data
+            .get(hdr_len..)
+            .ok_or("NALU is shorter than its header")?;
+        let mut r = BitReader::new(payload, true);
 
         let pic_parameter_set_id = r.read_ue_max(MAX_PPS_COUNT as u32 - 1)?;
         let seq_parameter_set_id = r.read_ue_max(MAX_SPS_COUNT as u32 - 1)?;
@@ -3807,7 +3818,10 @@ impl Parser {
         let nalu_header = &nalu.header;
         let hdr_len = nalu_header.len();
         // Skip the header
-        let mut r = BitReader::new(&data[hdr_len..], true);
+        let payload = data
+            .get(hdr_len..)
+            .ok_or("NALU is shorter than its header")?;
+        let mut r = BitReader::new(payload, true);
 
         let mut hdr = SliceHeader {
             first_slice_segment_in_pic_flag: r.read_bit()?,

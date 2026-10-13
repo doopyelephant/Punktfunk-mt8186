@@ -3498,4 +3498,28 @@ mod tests {
             Err(PlanError::Parse(_))
         ));
     }
+
+    /// A unit cut to one byte still gets a two-byte header: the parser reads the second byte
+    /// out of the next start code, and the payload then starts past the unit's end.
+    #[test]
+    fn a_one_byte_unit_is_a_parse_error_not_a_panic() {
+        for nut in [VPS_NUT, SPS_NUT, PPS_NUT, 19] {
+            let au = [0, 0, 1, nut << 1, 0, 0, 1, VPS_NUT << 1, 1];
+            assert!(H265Planner::new().plan_au(&au).is_err(), "unit type {nut}");
+        }
+    }
+
+    /// An SPS whose palette holds nothing still asks for initializers: the count's bound is
+    /// the palette size minus one, and the initializer arrays are 128 deep.
+    #[test]
+    fn an_sps_with_palette_initializers_for_an_empty_palette_is_a_parse_error_not_a_panic() {
+        let unit = [
+            0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00,
+            0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3f, 0xa0, 0x20, 0x81, 0x05, 0x96, 0x44, 0xe4,
+            0x93, 0x2b, 0xff, 0xc0, 0x00, 0x40, 0x00, 0x5a, 0x83, 0x03, 0x03, 0x02, 0x00, 0x00,
+            0x03, 0x00, 0x02, 0x4d, 0x8a, 0x8f, 0x80, 0xdb, 0x99, 0x16, 0xad, 0x8a, 0x09, 0x0b,
+            0xea, 0xf3, 0xc7, 0xfe, 0x00, 0x00, 0x01, 0x40, 0x01,
+        ];
+        assert!(H265Planner::new().plan_au(&unit).is_err());
+    }
 }

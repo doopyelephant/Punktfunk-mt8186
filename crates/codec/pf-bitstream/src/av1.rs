@@ -1345,4 +1345,40 @@ mod tests {
             "the pristine first packet must still plan"
         );
     }
+
+    /// A tile group reaches a parser that has read no frame header, so it counts no tiles:
+    /// its last-tile index and its row division have nothing to work on.
+    #[test]
+    fn a_tile_group_ahead_of_any_frame_header_is_an_error_not_a_panic() {
+        let mut au = SVT_KEY_HEAD.to_vec();
+        // OBU_TILE_GROUP with a size field, one payload byte.
+        au.extend_from_slice(&[0x22, 0x01, 0x00]);
+        assert!(Av1Planner::new().plan_au(&au).is_err());
+    }
+
+    /// A frame header that fails to parse leaves no header open. Left open, the next frame
+    /// OBU is read as a copy of the last good header and skipped by that header's length,
+    /// which a shorter OBU does not have.
+    #[test]
+    fn a_frame_obu_after_a_failed_header_is_parsed_on_its_own() {
+        let mut planner = Av1Planner::new();
+        let mut au = IvfIterator::new(AV1_25FPS)
+            .next()
+            .expect("a first packet")
+            .to_vec();
+        // An OBU_FRAME with a size field and nothing in it: its header cannot be read.
+        au.extend_from_slice(&[0x32, 0x00]);
+        let plans = planner
+            .plan_au(&au)
+            .expect("the frame ahead of it still plans");
+        assert!(matches!(
+            plans[0].warnings.as_slice(),
+            [PlanWarning::TruncatedAu { .. }]
+        ));
+        // The next unit opens with a one-byte OBU_FRAME and no temporal delimiter.
+        assert!(matches!(
+            planner.plan_au(&[0x32, 0x01, 0x00]),
+            Err(PlanError::Parse(_))
+        ));
+    }
 }
