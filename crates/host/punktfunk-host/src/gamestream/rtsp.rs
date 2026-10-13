@@ -14,6 +14,10 @@
 //! A sealed connection is recognised, not negotiated: [`ENCRYPTED_MESSAGE_TYPE_BIT`].
 
 use super::audio;
+use super::rtsp_wire::{
+    audio_passthrough, find_subslice, parse_announce, parse_request, stream_type, take_message,
+    Request, MAX_RTSP_HEADER,
+};
 use super::stream::{self, StreamConfig};
 use super::{LaunchSession, AUDIO_PORT, CONTROL_PORT, RTSP_PORT, VIDEO_PORT};
 use crate::encode::Codec;
@@ -34,8 +38,6 @@ const RTSP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 // Per-read timeout bounds one read, not the request: a byte just inside it
 // resets forever and pins a slot. This bounds the whole message instead.
 const RTSP_REQUEST_DEADLINE: Duration = Duration::from_secs(30);
-const MAX_RTSP_HEADER: usize = 16 * 1024;
-const MAX_RTSP_BODY: usize = 64 * 1024;
 const MAX_RTSP_MSG: usize = 128 * 1024;
 
 /// Live connection count. Cap is [`MAX_RTSP_CONNS`]; [`ConnGuard`] decrements on panic too.
@@ -81,14 +83,6 @@ pub fn spawn(state: Arc<AppState>) -> Result<()> {
         })
         .context("spawn RTSP thread")?;
     Ok(())
-}
-
-struct Request {
-    method: String,
-    uri: String,
-    cseq: String,
-    head: String,
-    body: String,
 }
 
 fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
@@ -149,32 +143,8 @@ fn read_message(
         if Instant::now() >= deadline {
             anyhow::bail!("RTSP request deadline exceeded");
         }
-        if let Some(end) = find_subslice(buf, b"\r\n\r\n") {
-            // Cap even when the terminator is present: an oversized block with `\r\n\r\n`
-            // would otherwise skip the no-terminator cap below.
-            if end > MAX_RTSP_HEADER {
-                anyhow::bail!("RTSP headers exceed limit");
-            }
-            let head = std::str::from_utf8(&buf[..end]).context("RTSP header utf8")?;
-            let content_len = header_value(head, "content-length")
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(0);
-            // Bound Content-Length before buffering it (allocation amplification).
-            if content_len > MAX_RTSP_BODY {
-                anyhow::bail!("RTSP Content-Length {content_len} exceeds limit");
-            }
-            let total = end + 4 + content_len;
-            if buf.len() < total {
-                // Headers complete; body still arriving.
-            } else {
-                let head = head.to_string();
-                let body = String::from_utf8_lossy(&buf[end + 4..total]).into_owned();
-                buf.drain(..total);
-                return Ok(Some(parse_request(&head, body)));
-            }
-        } else if buf.len() > MAX_RTSP_HEADER {
-            // No terminator within the cap — dribble would grow forever.
-            anyhow::bail!("RTSP headers exceed limit");
+        if let Some(req) = take_message(buf)? {
+            return Ok(Some(req));
         }
         let mut tmp = [0u8; 8192];
         let n = stream.read(&mut tmp).context("RTSP read")?;
@@ -185,22 +155,6 @@ fn read_message(
         if buf.len() > MAX_RTSP_MSG {
             anyhow::bail!("RTSP message exceeds limit");
         }
-    }
-}
-
-fn parse_request(head: &str, body: String) -> Request {
-    let mut lines = head.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let uri = parts.next().unwrap_or("").to_string();
-    let cseq = header_value(head, "cseq").unwrap_or("0").trim().to_string();
-    Request {
-        method,
-        uri,
-        cseq,
-        head: head.to_string(),
-        body,
     }
 }
 
@@ -636,18 +590,6 @@ fn describe_sdp(codecs: u32) -> String {
     lines.join("\r\n")
 }
 
-fn parse_announce(body: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for line in body.lines() {
-        if let Some(rest) = line.strip_prefix("a=") {
-            if let Some((k, v)) = rest.split_once(':') {
-                map.insert(k.to_string(), v.to_string());
-            }
-        }
-    }
-    map
-}
-
 /// ANNOUNCE keys → [`StreamConfig`]. Resolution and packetSize are required.
 fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
@@ -864,29 +806,6 @@ fn audio_params(map: &HashMap<String, String>, offer: EncOffer) -> audio::AudioP
     }
 }
 
-/// Moonlight V+'s passthrough ask (`x-ml-audio.codec`, absent for Opus): `Ok(true)` for 16-bit
-/// PCM, `Err` for a codec this host can't encode. Opus under another codec's label plays as
-/// noise or silence, so ANNOUNCE refuses those.
-fn audio_passthrough(map: &HashMap<String, String>) -> Result<bool, String> {
-    match map.get("x-ml-audio.codec").map(|s| s.trim()) {
-        None | Some("opus") => Ok(false),
-        Some("pcm" | "pcm_s16" | "s16") => Ok(true),
-        Some(other) => Err(other.to_string()),
-    }
-}
-
-/// SETUP URI `…/streamid=video/0/0` → `"video"` / `"audio"` / `"control"` / `"mic"`.
-/// Only the text between `=` and `/` counts, as Sunshine reads it: moonlight-common-rust
-/// sends `stream=control/13/0`.
-fn stream_type(uri: &str) -> Option<&str> {
-    let after = uri.split_once('=')?.1;
-    let token = after.split('/').next()?;
-    match token {
-        "audio" | "video" | "control" | "mic" => Some(token),
-        _ => None,
-    }
-}
-
 fn response(cseq: &str, headers: &[(&str, &str)], body: Option<&str>) -> String {
     response_status("200 OK", cseq, headers, body)
 }
@@ -907,20 +826,10 @@ fn response_status(
     out
 }
 
-fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
-fn header_value<'a>(head: &'a str, key_lower: &str) -> Option<&'a str> {
-    head.split("\r\n").find_map(|line| {
-        let (k, v) = line.split_once(':')?;
-        (k.trim().eq_ignore_ascii_case(key_lower)).then(|| v.trim_start())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gamestream::rtsp_wire::header_value;
 
     fn announce(extra: &[(&str, &str)]) -> HashMap<String, String> {
         let mut body = String::from(
