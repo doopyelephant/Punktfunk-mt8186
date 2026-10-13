@@ -278,7 +278,10 @@ pub(crate) async fn serve(
 
     // Held for the host lifetime — dropping `_advert` unregisters. Best-effort: a
     // discovery failure must not stop streaming (`--connect HOST:PORT` still works).
-    let _advert = if !opts.mdns {
+    let _advert = if pf_paths::seat::is_seat_host() {
+        tracing::info!("seat host: no mDNS advertisement — clients arrive through the box");
+        None
+    } else if !opts.mdns {
         tracing::info!(
             "mDNS advertisement disabled (--no-mdns / PUNKTFUNK_MDNS) — clients connect by address"
         );

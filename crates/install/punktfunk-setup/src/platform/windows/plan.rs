@@ -615,6 +615,9 @@ fn host_uninstall(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
             run_lenient(&[&host_exe, "service", "uninstall"]),
             run_lenient(&[&format!("{app}\\punktfunk-tray.exe"), "--quit"]),
             run_lenient(&["taskkill", "/F", "/IM", "punktfunk-tray.exe"]),
+            // Seats off before the drivers go: Remote Desktop's listener and firewall scope come
+            // back as they were, and a reinstall shows seats off rather than on without a driver.
+            run_lenient(&[&host_exe, "seats", "off"]),
             // All three legs even if this install never laid them down — an earlier
             // upgrade may have. `driver uninstall` also purges the trusted certs.
             run_lenient(&[&host_exe, "driver", "uninstall"]),

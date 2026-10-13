@@ -714,8 +714,13 @@ pub(super) async fn negotiate(
             } else {
                 0
             },
-        // `0` on the standalone binary (no management API); the client then keeps its default.
-        mgmt_port: crate::mgmt::effective_port(),
+        // `0` keeps the client's saved port: the standalone binary has no management API, and a
+        // seat's answers on loopback only, so the box's stays the one its library comes from.
+        mgmt_port: if pf_paths::seat::is_seat_host() {
+            0
+        } else {
+            crate::mgmt::effective_port()
+        },
         // Mask and remaining lifetime from admission. Full-control permanent is `GRANT_ALL, 0`.
         grants,
         expires_in_secs,

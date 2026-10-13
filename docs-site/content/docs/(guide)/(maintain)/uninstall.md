@@ -143,6 +143,9 @@ the firewall rules ([full list](/docs/windows-host#uninstalling)). Left behind o
 - **`%ProgramData%\punktfunk`**, your config and pairings:
   `Remove-Item -Recurse -Force "$env:ProgramData\punktfunk"`.
 - **The winget source**, if you added it: `winget source remove -n punktfunk` (admin PowerShell).
+- **Seat accounts**, `pf_seat1` to `pf_seat4`, if you used [seats](/docs/windows-seats). Remove
+  their profiles under **Profiles** before you uninstall, or delete the accounts in **Computer
+  Management** → **Local Users and Groups** afterwards.
 - **VB-CABLE**, if an older Punktfunk installed it. Other apps may use it; remove it with its own
   uninstaller (**VB-Audio Virtual Cable** in Installed apps).
 - **The old unom certificate**, if you imported it by hand for release 0.28.1 or earlier. Current

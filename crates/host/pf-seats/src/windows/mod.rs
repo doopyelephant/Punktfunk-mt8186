@@ -62,6 +62,12 @@ pub fn seats_enabled() -> bool {
         .is_ok()
 }
 
+/// Turn seats off without the supervisor, for the uninstaller once the service is gone: Remote
+/// Desktop's listener and firewall scope go back as they were. Seat accounts stay.
+pub fn turn_off() -> Result<(), BackendError> {
+    enable::turn_off()
+}
+
 /// Whether this is a Windows Server edition (`ProductType` other than `WinNT`), which
 /// allows concurrent RDP sessions without a session provider. `None` when unreadable.
 pub fn server_edition() -> Option<bool> {
@@ -163,10 +169,18 @@ impl PlatformBackend for WindowsBackend {
 
     fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
         self.ensure_runtime_prerequisites()?;
+        // An uninstall deletes the seat display driver and an upgrade only stages the new one:
+        // without it the seat logs on to Microsoft's adapter and never streams.
+        enable::ensure_driver(&self.host_path)?;
         // An upgrade's new enumerator reaches the listener here. Without it the seat still
         // starts, on `RDP-Tcp`, with Remote Audio and no pad audio.
         if let Err(cause) = seat_listener::ensure(&self.host_path) {
             tracing::warn!(%cause, "seat listener not ready — seats start without pad audio");
+        }
+        // The box's shared Steam shortcuts start a seat's own copy on a seat.
+        match self.root.open_child_dir("temp") {
+            Ok(temp) => steam::wrap_box_shortcuts(&self.host_path, temp.path()),
+            Err(error) => tracing::warn!(%error, "box steam shortcuts not rewired"),
         }
         self.supervisor.start(seat)
     }
@@ -215,12 +229,26 @@ impl PlatformBackend for WindowsBackend {
         })
     }
 
-    fn enable(&self, allow_rdp_from_network: bool) -> Result<SeatingStatus, BackendError> {
+    fn prepare(&self) -> Vec<Diagnostic> {
+        enable::prepare()
+    }
+
+    fn enable(
+        &self,
+        allow_rdp_from_network: bool,
+        prepared: Vec<Diagnostic>,
+    ) -> Result<SeatingStatus, BackendError> {
         let mut checks = enable::checks();
-        if !checks
+        // A role waiting on a restart can't take a licensing mode yet; the restart row says so.
+        if prepared.iter().any(|row| row.code == "restart") {
+            checks.retain(|check| check.code != "rds_licensing");
+        }
+        let blocked = prepared
             .iter()
-            .any(|check| check.level == DiagnosticLevel::Error)
-        {
+            .chain(&checks)
+            .any(|check| check.level == DiagnosticLevel::Error);
+        checks.splice(0..0, prepared);
+        if !blocked {
             let turned_on = enable::turn_on(&self.host_path, allow_rdp_from_network);
             checks.extend(turned_on.err().map(enable::refusal));
         }
@@ -242,238 +270,322 @@ impl PlatformBackend for WindowsBackend {
 }
 
 impl WindowsBackend {
+    /// The box's rows, then each seat's. Every row is one plain sentence; a problem names the
+    /// next move. `seating` adds what turning seats on checks (role, licensing, a GPU).
     fn doctor_report(&self, ledger: &Ledger) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-        match windows_build() {
-            Ok(build) if build >= 22621 => diagnostics.push(Diagnostic::info(
+        let mut rows = Vec::new();
+        rows.push(match windows_build() {
+            Ok(build) if build >= 22621 => Diagnostic::info(
                 "windows_build",
-                format!("Windows build {build} meets the 22621 minimum"),
-            )),
-            Ok(build) => diagnostics.push(Diagnostic::error(
+                format!("This Windows is new enough for seats (build {build})."),
+            ),
+            Ok(build) => Diagnostic::error(
                 "windows_build",
-                format!("Windows build {build} is below the 22621 minimum"),
-            )),
-            Err(error) => diagnostics.push(Diagnostic::error("windows_build", error.to_string())),
+                format!(
+                    "This Windows is too old for seats (build {build}). Seats need Windows Server 2025 or newer."
+                ),
+            ),
+            Err(error) => Diagnostic::error(
+                "windows_build",
+                format!("Couldn't read the Windows version — {}.", error.message),
+            ),
+        });
+        if !matches!(native_x64(), Ok(true)) {
+            rows.push(Diagnostic::error("architecture", "Seats need an x64 PC."));
         }
-        match native_x64() {
-            Ok(true) => diagnostics.push(Diagnostic::info("architecture", "native OS is x64")),
-            Ok(false) => {
-                diagnostics.push(Diagnostic::error("architecture", "native OS is not x64"))
-            }
-            Err(error) => diagnostics.push(Diagnostic::error("architecture", error.to_string())),
-        }
-        match util::is_local_system() {
-            Ok(true) => diagnostics.push(Diagnostic::info(
+        if !matches!(util::is_local_system(), Ok(true)) {
+            rows.push(Diagnostic::error(
                 "identity",
-                "service process is LocalSystem",
-            )),
-            Ok(false) => diagnostics.push(Diagnostic::error(
-                "identity",
-                "service process is not LocalSystem",
-            )),
-            Err(error) => diagnostics.push(Diagnostic::error("identity", error.to_string())),
-        }
-        if seats_enabled() {
-            diagnostics.push(Diagnostic::info(
-                "reservation",
-                r"HKLM\SOFTWARE\Punktfunk\Seats reserves slots 12 through 15",
+                "punktfunk's service isn't running as Local System. Reinstall punktfunk.",
             ));
+        }
+        rows.push(if seats_enabled() {
+            Diagnostic::info("reservation", "Seats are on.")
         } else {
-            diagnostics.push(Diagnostic::error(
+            Diagnostic::error(
                 "reservation",
-                "Windows display-slot reservation marker is missing",
-            ));
-        }
-        if self.host_path.is_file() {
-            diagnostics.push(Diagnostic::info(
-                "host_executable",
-                format!("host executable exists at {}", self.host_path.display()),
-            ));
-        } else {
-            diagnostics.push(Diagnostic::error(
-                "host_executable",
-                format!("host executable is missing at {}", self.host_path.display()),
-            ));
-        }
-        match rdp::load_pin_optional(&self.root) {
-            Ok(Some(pin)) => diagnostics.push(Diagnostic::info(
-                "rdp_pin",
-                format!("trusted RDP leaf SHA-256 is {}", hex::encode(pin)),
-            )),
-            Ok(None) => diagnostics.push(Diagnostic::error(
-                "rdp_pin",
-                "RDP certificate pin is missing",
-            )),
-            Err(error) => diagnostics.push(Diagnostic::error("rdp_pin", error.to_string())),
-        }
-        match termservice_running() {
-            Ok(true) => diagnostics.push(Diagnostic::info("termservice", "TermService is running")),
-            Ok(false) => {
-                diagnostics.push(Diagnostic::error("termservice", "TermService is stopped"))
-            }
-            Err(error) => diagnostics.push(Diagnostic::error("termservice", error.to_string())),
-        }
-        diagnostics.push(match server_edition() {
+                "Seats are off. Turn them on under Profiles → Seats.",
+            )
+        });
+        rows.push(match server_edition() {
             Some(true) => Diagnostic::info(
                 "session_provider",
-                "Windows Server runs concurrent seat sessions itself",
+                "Windows Server gives each seat a desktop of its own.",
             ),
             Some(false) if session_wrapper() => Diagnostic::warning(
                 "session_provider",
-                "a Remote Desktop wrapper runs concurrent seat sessions on this desktop edition; \
-                 only Windows Server is supported",
+                "A Remote Desktop wrapper gives each seat a desktop on this edition of Windows. \
+                 Only Windows Server is supported.",
             ),
             Some(false) => Diagnostic::error(
                 "session_provider",
-                "this Windows edition runs one session at a time, so it can't mint a seat session",
+                "This edition of Windows runs one desktop at a time, so seats can't start. \
+                 Seats need Windows Server.",
             ),
             None => Diagnostic::error(
                 "session_provider",
-                "the Windows edition can't be read, so seat sessions can't be confirmed",
+                "Couldn't tell which edition of Windows this is.",
             ),
         });
-        for seat in &ledger.seats {
-            self.doctor_seat(seat, &mut diagnostics);
+        rows.extend(
+            enable::checks()
+                .into_iter()
+                .filter(|check| check.code != "windows_server"),
+        );
+        rows.push(match termservice_running() {
+            Ok(true) => Diagnostic::info("termservice", "Remote Desktop Services is running."),
+            _ => Diagnostic::error(
+                "termservice",
+                "Remote Desktop Services isn't running. Start it under Services, or restart the PC.",
+            ),
+        });
+        let keeper = keeper::keeper_path(&self.host_path);
+        if let Some(missing) = [&self.host_path, &keeper]
+            .into_iter()
+            .find(|path| !path.is_file())
+        {
+            rows.push(Diagnostic::error(
+                "host_executable",
+                format!(
+                    "A punktfunk file is missing ({}). Reinstall punktfunk.",
+                    missing.display()
+                ),
+            ));
         }
-        diagnostics
+        rows.push(match enable::driver_state(&self.host_path) {
+            enable::DriverState::Current => {
+                Diagnostic::info("seat_display_driver", "The seat display driver is installed.")
+            }
+            enable::DriverState::Outdated => Diagnostic::warning(
+                "seat_display_driver",
+                "The seat display driver is older than this punktfunk. Seats update it when they next start.",
+            ),
+            enable::DriverState::Missing => Diagnostic::error(
+                "seat_display_driver",
+                "The seat display driver isn't installed. Seats put it back when they next start; \
+                 if this stays, turn seats off and on under Profiles → Seats.",
+            ),
+            enable::DriverState::Unstaged => Diagnostic::error(
+                "seat_display_driver",
+                "The seat display driver isn't on this PC. Reinstall punktfunk.",
+            ),
+        });
+        if enable::inbox_display_driver_newer(&self.host_path) == Some(true) {
+            rows.push(Diagnostic::error(
+                "seat_display_rank",
+                "Windows' own Remote Desktop display driver is newer than punktfunk's, so seats \
+                 start without a picture. Update punktfunk.",
+            ));
+        }
+        rows.push(match rdp::load_pin_optional(&self.root) {
+            Ok(Some(_)) => Diagnostic::info("rdp_pin", "Remote Desktop's certificate is recorded."),
+            _ => Diagnostic::error(
+                "rdp_pin",
+                "Remote Desktop's certificate isn't recorded, so seats can't sign in. \
+                 Turn seats off and on under Profiles → Seats.",
+            ),
+        });
+        rows.push(steam_row());
+        if !ledger.seats.is_empty() && !seat_sound() {
+            rows.push(Diagnostic::warning(
+                "seat_audio",
+                "Seats stream without sound: Steam's streaming audio driver isn't on this PC. \
+                 Install Steam, then restart the seats.",
+            ));
+        }
+        for seat in &ledger.seats {
+            self.doctor_seat(seat, &mut rows);
+        }
+        rows
     }
 
-    fn doctor_seat(&self, seat: &Seat, diagnostics: &mut Vec<Diagnostic>) {
+    fn doctor_seat(&self, seat: &Seat, rows: &mut Vec<Diagnostic>) {
         let index = usize::from(seat.display_slot.saturating_sub(12));
-        let resources_match = DEFAULT_NATIVE_PORTS.get(index) == Some(&seat.native_port)
-            && DEFAULT_MGMT_PORTS.get(index) == Some(&seat.mgmt_port);
-        diagnostics.push(seat_diagnostic(
-            if resources_match {
-                DiagnosticLevel::Info
-            } else {
-                DiagnosticLevel::Error
-            },
-            "seat_resources",
-            format!(
-                "slot {} uses native {} and management {}",
-                seat.display_slot, seat.native_port, seat.mgmt_port
-            ),
-            seat,
-        ));
-        match self.accounts.inspect(seat) {
-            Ok(inspection) => {
-                diagnostics.push(seat_diagnostic(
-                    if inspection.marker_matches {
-                        DiagnosticLevel::Info
-                    } else {
-                        DiagnosticLevel::Error
-                    },
-                    "account_marker",
-                    if inspection.marker_matches {
-                        "account marker matches the exact seat ID".into()
-                    } else {
-                        "account is absent or its marker does not match".into()
-                    },
-                    seat,
-                ));
-                diagnostics.push(seat_diagnostic(
-                    if inspection.credential_blob {
-                        DiagnosticLevel::Info
-                    } else {
-                        DiagnosticLevel::Error
-                    },
-                    "credential_blob",
-                    if inspection.credential_blob {
-                        "DPAPI credential blob exists".into()
-                    } else {
-                        "DPAPI credential blob is missing".into()
-                    },
-                    seat,
-                ));
-                let policy_ok = inspection.rdp_member
-                    && inspection.seats_member
-                    && !inspection.administrator
-                    && inspection.deny_console
-                    && !inspection.deny_remote;
-                diagnostics.push(seat_diagnostic(
-                    if policy_ok {
-                        DiagnosticLevel::Info
-                    } else {
-                        DiagnosticLevel::Error
-                    },
-                    "account_policy",
-                    format!(
-                        "rdp_member={} seats_member={} administrator={} deny_console={} \
-                         deny_remote={}",
-                        inspection.rdp_member,
-                        inspection.seats_member,
-                        inspection.administrator,
-                        inspection.deny_console,
-                        inspection.deny_remote
-                    ),
-                    seat,
-                ));
-            }
-            Err(error) => diagnostics.push(seat_diagnostic(
+        if DEFAULT_NATIVE_PORTS.get(index) != Some(&seat.native_port)
+            || DEFAULT_MGMT_PORTS.get(index) != Some(&seat.mgmt_port)
+        {
+            rows.push(seat_diagnostic(
                 DiagnosticLevel::Error,
-                "account_query",
-                error.to_string(),
+                "seat_resources",
+                format!(
+                    "Its display slot and ports don't match ({}, {}, {}). Remove the profile and add it again.",
+                    seat.display_slot, seat.native_port, seat.mgmt_port
+                ),
                 seat,
-            )),
+            ));
         }
-        diagnostics.push(match (steam::box_install(), steam::seat_exe(&seat.account)) {
-            (None, _) => seat_diagnostic(
-                DiagnosticLevel::Info,
-                "steam_client",
-                "the box has no Steam install".into(),
-                seat,
-            ),
-            (Some(_), Some(exe)) if exe.is_file() => seat_diagnostic(
-                DiagnosticLevel::Info,
-                "steam_client",
-                format!("own Steam client at {}", exe.display()),
-                seat,
-            ),
-            (Some(_), _) => seat_diagnostic(
-                DiagnosticLevel::Warning,
-                "steam_client",
-                "no Steam client of its own yet: the seat copies the box's when it starts, and \
-                 its Steam titles start once the copy lands"
-                    .into(),
+        rows.push(match self.accounts.inspect(seat) {
+            Ok(inspection) => account_row(seat, &inspection),
+            Err(error) => seat_diagnostic(
+                DiagnosticLevel::Error,
+                "account",
+                format!(
+                    "Couldn't read its Windows account {} — {}.",
+                    seat.account, error.message
+                ),
                 seat,
             ),
         });
-        let snapshot = self.supervisor.status(seat);
-        diagnostics.push(seat_diagnostic(
-            if snapshot.status.state == RuntimeState::Failed {
-                DiagnosticLevel::Error
-            } else {
-                DiagnosticLevel::Info
-            },
-            "child_state",
-            format!(
-                "state={:?} session={:?} keeper_pid={:?} host_pid={:?}",
-                snapshot.status.state, snapshot.session_id, snapshot.keeper_pid, snapshot.host_pid
+        let (level, message) = match (steam::box_install(), steam::seat_exe(&seat.account)) {
+            (None, _) => (
+                DiagnosticLevel::Info,
+                "No Steam: the PC has none to copy.".into(),
             ),
-            seat,
-        ));
-        for (kind, port) in [("native", seat.native_port), ("management", seat.mgmt_port)] {
-            let open = if kind == "native" {
-                !udp_port_owners(port).is_empty()
-            } else {
-                port_open(port)
-            };
-            let expected = snapshot.status.state == RuntimeState::Running;
-            diagnostics.push(seat_diagnostic(
-                if open == expected {
-                    DiagnosticLevel::Info
-                } else {
-                    DiagnosticLevel::Warning
-                },
+            (Some(_), Some(exe)) if exe.is_file() => (
+                DiagnosticLevel::Info,
+                "Has its own Steam. Steam opened on this seat starts that copy.".into(),
+            ),
+            (Some(_), _) => (
+                DiagnosticLevel::Warning,
+                "Its own Steam isn't set up yet. It's copied the first time the seat starts; \
+                 Steam games start on the seat once that's done."
+                    .into(),
+            ),
+        };
+        rows.push(seat_diagnostic(level, "steam_client", message, seat));
+        let snapshot = self.supervisor.status(seat);
+        let state = match snapshot.status.state {
+            RuntimeState::Running => Some(match snapshot.session_id {
+                Some(id) => format!("Running, in Windows session {id}."),
+                None => "Running.".into(),
+            }),
+            RuntimeState::Starting => Some(
+                snapshot
+                    .status
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "Starting…".into()),
+            ),
+            RuntimeState::Stopped | RuntimeState::Unknown => {
+                Some("Stopped. It starts when its player connects.".into())
+            }
+            RuntimeState::Stopping => Some("Stopping…".into()),
+            // The service's own `runtime_failed` row says why.
+            RuntimeState::Failed => None,
+        };
+        if let Some(state) = state {
+            rows.push(seat_diagnostic(
+                DiagnosticLevel::Info,
+                "child_state",
+                state,
+                seat,
+            ));
+        }
+        let running = snapshot.status.state == RuntimeState::Running;
+        let native_open = !udp_port_owners(seat.native_port).is_empty();
+        let mgmt_open = port_open(seat.mgmt_port);
+        if running && !(native_open && mgmt_open) {
+            rows.push(seat_diagnostic(
+                DiagnosticLevel::Warning,
                 "seat_port",
                 format!(
-                    "{kind} port {port} is {}",
-                    if open { "open" } else { "closed" }
+                    "It's running, but its ports {} and {} aren't both open. Stop and start the seat.",
+                    seat.native_port, seat.mgmt_port
+                ),
+                seat,
+            ));
+        } else if !running
+            && snapshot.status.state != RuntimeState::Starting
+            && (native_open || mgmt_open)
+        {
+            let port = if native_open {
+                seat.native_port
+            } else {
+                seat.mgmt_port
+            };
+            rows.push(seat_diagnostic(
+                DiagnosticLevel::Warning,
+                "seat_port",
+                format!(
+                    "Another program holds its port {port}, so the seat can't start. Restart the PC."
                 ),
                 seat,
             ));
         }
     }
+}
+
+/// The seat's Windows account as one row: fine, or the first thing wrong with it.
+fn account_row(seat: &Seat, inspection: &accounts::AccountInspection) -> Diagnostic {
+    let account = &seat.account;
+    let problem = if !inspection.marker_matches {
+        Some(format!(
+            "Its Windows account {account} is missing or isn't punktfunk's. Remove the profile and add it again."
+        ))
+    } else if !inspection.credential_blob {
+        Some(format!(
+            "punktfunk has lost the password of its Windows account {account}. Remove the profile and add it again."
+        ))
+    } else if inspection.administrator {
+        Some(format!(
+            "Its Windows account {account} is an administrator, which a seat must not be. \
+             Remove it from Administrators."
+        ))
+    } else if !inspection.rdp_member || !inspection.deny_console || inspection.deny_remote {
+        Some(format!(
+            "Its Windows account {account} lost a right it needs to sign in to its seat. \
+             Remove the profile and add it again."
+        ))
+    } else {
+        None
+    };
+    match problem {
+        Some(problem) => seat_diagnostic(DiagnosticLevel::Error, "account", problem, seat),
+        None if !inspection.seats_member => seat_diagnostic(
+            DiagnosticLevel::Warning,
+            "account",
+            format!(
+                "Its Windows account {account} left the {SEATS_GROUP} group. It's put back when the seat next starts."
+            ),
+            seat,
+        ),
+        None => seat_diagnostic(
+            DiagnosticLevel::Info,
+            "account",
+            format!("Its Windows account {account} is set up."),
+            seat,
+        ),
+    }
+}
+
+/// Where the box's Steam is, as seats see it. Seats copy only a Steam in its usual folder.
+fn steam_row() -> Diagnostic {
+    if let Some(dir) = steam::box_install() {
+        return Diagnostic::info(
+            "steam",
+            format!(
+                "Steam is installed in {}. Each seat gets a copy of its own.",
+                dir.display()
+            ),
+        );
+    }
+    match steam::registered_install() {
+        Some(dir) => Diagnostic::warning(
+            "steam",
+            format!(
+                "Steam is installed in {}, so seats get no Steam. Seats copy Steam only from \
+                 C:\\Program Files (x86)\\Steam; reinstall it there.",
+                dir.display()
+            ),
+        ),
+        None => Diagnostic::info("steam", "Steam isn't installed, so seats have no Steam."),
+    }
+}
+
+/// Steam's streaming speakers driver, which a seat's sound device binds, is on disk.
+fn seat_sound() -> bool {
+    std::env::var_os("CommonProgramFiles(x86)")
+        .map(PathBuf::from)
+        .is_some_and(|dir| {
+            dir.join(r"Steam\drivers\Windows10")
+                .join(if cfg!(target_arch = "aarch64") {
+                    "arm64"
+                } else {
+                    "x64"
+                })
+                .join("SteamStreamingSpeakers.inf")
+                .is_file()
+        })
 }
 
 fn windows_build() -> WinResult<u32> {

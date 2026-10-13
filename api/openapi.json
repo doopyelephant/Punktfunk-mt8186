@@ -5998,7 +5998,7 @@
           "profiles"
         ],
         "summary": "Check the seats",
-        "description": "The supervisor's own report: the ledger, Windows, Remote Desktop, the certificate pin and\neach seat's account, session and ports. Admin lane only.",
+        "description": "The supervisor's own report: Windows, Remote Desktop, the seat display driver, Steam, and\neach seat's account, Steam, state and ports, each row one sentence with the next move.\nAdmin lane only.",
         "operationId": "getSeatsDoctor",
         "responses": {
           "200": {
@@ -6203,7 +6203,7 @@
           "profiles"
         ],
         "summary": "Turn seats on or off",
-        "description": "On runs the checks, installs the seat display driver, turns Remote Desktop on for this\nmachine and records its certificate. A check that fails changes nothing: the answer is 200\nwith `enabled: false` and the failed check as an `error`. The driver replaces the display of\nevery Remote Desktop session on the machine. Off stops every seat, keeps their accounts\nand restores what on changed. Admin lane only.",
+        "description": "On runs the checks, installs the seat display driver, turns Remote Desktop on for this\nmachine and records its certificate. With `prepare` it first installs the Session Host role\nand sets licensing to Per User where they are missing. A check that fails changes nothing:\nthe answer is 200 with `enabled: false` and the failed check as an `error`. The driver\nreplaces the display of every Remote Desktop session on the machine. Off stops every seat,\nkeeps their accounts and restores what on changed. Admin lane only.",
         "operationId": "setSeating",
         "requestBody": {
           "content": {
@@ -15429,6 +15429,13 @@
               "null"
             ],
             "description": "The seat it is about; absent when it is about the box."
+          },
+          "seat_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name of the profile that plays on that seat, when one does."
           }
         }
       },
@@ -15546,6 +15553,10 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "prepare": {
+            "type": "boolean",
+            "description": "Windows Server: first install the Remote Desktop Session Host role and set licensing to\nPer User where they are missing. Installing the role can take minutes and asks for a\nrestart."
           }
         }
       },

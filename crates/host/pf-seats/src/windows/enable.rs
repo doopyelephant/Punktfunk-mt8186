@@ -38,16 +38,20 @@ const PACKAGE: [&str; 3] = [
 /// The RDP listener takes a moment to come up after `fDenyTSConnections` flips.
 const TRUST_ATTEMPTS: u32 = 3;
 const TRUST_RETRY: Duration = Duration::from_secs(2);
-/// Role, licensing and a GPU as three `0`/`1` flags. The licensing types 2 and 4 are Per
-/// Device and Per User; an adapter named `Microsoft …` is the basic or remote display driver.
+/// The role's install state, then licensing and a GPU as `0`/`1` flags, on the last line. A role
+/// the cmdlet can't read is `Unknown`, after the cmdlet's error. The licensing types 2 and 4 are
+/// Per Device and Per User. A GPU sits on PCI and isn't `Microsoft …`, the basic display driver:
+/// punktfunk's own display (`ROOT\…`) and a seat's (`SWD\…`) don't count.
 const PROBE: &str = "$ProgressPreference='SilentlyContinue'; \
     $ErrorActionPreference='SilentlyContinue'; \
-    $role = [bool](Get-WindowsFeature RDS-RD-Server).Installed; \
+    $role = 'Unknown'; \
+    try { $state = (Get-WindowsFeature RDS-RD-Server -ErrorAction Stop).InstallState; \
+    if ($state) { $role = $state } } catch { $_.Exception.Message }; \
     $mode = (Get-CimInstance -Namespace root/cimv2/TerminalServices \
     -ClassName Win32_TerminalServiceSetting).LicensingType; \
     $gpu = [bool](Get-CimInstance Win32_VideoController | \
-    Where-Object { $_.Name -notlike 'Microsoft *' }); \
-    '{0} {1} {2}' -f [int]$role, [int]($mode -in 2,4), [int]$gpu";
+    Where-Object { $_.PNPDeviceID -like 'PCI\\*' -and $_.Name -notlike 'Microsoft *' }); \
+    '{0} {1} {2}' -f $role, [int]($mode -in 2,4), [int]$gpu";
 
 /// The prerequisites for seats, one diagnostic each: info when met, an error with the next move
 /// when not. A desktop edition runs seats only through a Remote Desktop wrapper the operator
@@ -84,7 +88,7 @@ pub(super) fn checks() -> Vec<Diagnostic> {
             return checks;
         }
     };
-    let Some([role, licensing, gpu]) = probe() else {
+    let Some((role, [licensing, gpu])) = probe() else {
         checks.push(Diagnostic::error(
             "probe",
             "Couldn't read this machine's Remote Desktop and graphics settings.",
@@ -92,17 +96,12 @@ pub(super) fn checks() -> Vec<Diagnostic> {
         return checks;
     };
     if server {
-        checks.push(check(
-            role,
-            "rds_role",
-            "The Remote Desktop Session Host role is installed.",
-            "The Remote Desktop Session Host role isn't installed. Add it in Server Manager, then try again.",
-        ));
+        checks.push(role_check(&role));
         checks.push(check(
             licensing,
             "rds_licensing",
             "Remote Desktop licensing is set.",
-            "Remote Desktop licensing isn't set. Choose Per Device or Per User in Server Manager, then try again.",
+            "Remote Desktop licensing isn't set. Press Set up Remote Desktop in Profiles → Seats to set it to Per User.",
         ));
     }
     checks.push(check(
@@ -112,6 +111,65 @@ pub(super) fn checks() -> Vec<Diagnostic> {
         "No graphics card was found. Seats need a GPU.",
     ));
     checks
+}
+
+/// Install the Session Host role and set licensing to Per User, where Windows Server lacks them.
+/// The last line is the role's outcome, then licensing's: `kept`, `installed` or `restart`, and
+/// `kept`, `set`, `skipped` (the role waits on a restart) or a `ChangeMode` return value.
+const PREPARE: &str = "$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; \
+    $role = 'kept'; \
+    if ((Get-WindowsFeature RDS-RD-Server).InstallState -ne 'Installed') { \
+    $r = Install-WindowsFeature RDS-RD-Server; \
+    if (-not $r.Success) { throw 'Install-WindowsFeature did not succeed' }; \
+    $role = if ([string]$r.RestartNeeded -eq 'No') { 'installed' } else { 'restart' } }; \
+    $lic = 'skipped'; \
+    if ($role -ne 'restart') { \
+    $s = Get-CimInstance -Namespace root/cimv2/TerminalServices -ClassName Win32_TerminalServiceSetting; \
+    if ($s.LicensingType -in 2,4) { $lic = 'kept' } else { \
+    $c = $s | Invoke-CimMethod -MethodName ChangeMode -Arguments @{LicensingType=4}; \
+    $lic = if ($c.ReturnValue -eq 0) { 'set' } else { [string]$c.ReturnValue } } }; \
+    '{0} {1}' -f $role, $lic";
+
+/// What [`checks`] refuses and Windows Server can set up itself: the Session Host role, then a
+/// licensing mode. One row per change or refusal; nothing on a desktop edition.
+pub(super) fn prepare() -> Vec<Diagnostic> {
+    if server_edition() != Some(true) {
+        return Vec::new();
+    }
+    let lines = match powershell_lines(PREPARE) {
+        Ok(lines) => lines,
+        Err(cause) => {
+            tracing::warn!(%cause, "remote desktop setup did not complete");
+            return vec![Diagnostic::error(
+                "rds_setup",
+                "Windows couldn't set up Remote Desktop. Add Remote Desktop Session Host under Remote Desktop Services in Server Manager, restart, then try again.",
+            )];
+        }
+    };
+    tracing::info!(output = ?lines, "remote desktop setup");
+    let last = lines.last().map(String::as_str).unwrap_or_default();
+    let (role, licensing) = last.split_once(' ').unwrap_or((last, ""));
+    let mut rows = Vec::new();
+    match role {
+        "installed" => rows.push(Diagnostic::info(
+            "rds_role_installed",
+            "Remote Desktop Session Host is now installed.",
+        )),
+        "restart" => rows.push(Diagnostic::error(
+            "restart",
+            "Remote Desktop Session Host is installed. Restart the PC, then press Set up Remote Desktop again to finish.",
+        )),
+        _ => {}
+    }
+    match licensing {
+        "set" => rows.push(Diagnostic::info(
+            "rds_licensing_set",
+            "Remote Desktop licensing is now Per User.",
+        )),
+        "kept" | "skipped" => {}
+        code => tracing::warn!(code, "licensing mode change refused"),
+    }
+    rows
 }
 
 /// Turn seats on. A failure after the Seats key exists on a machine that had none puts the
@@ -152,6 +210,13 @@ pub(super) fn turn_off() -> WinResult<()> {
         })?;
     }
     super::seat_listener::remove();
+    // The box's Steam shortcuts go back first: they name the Seats key's record of them.
+    match crate::persistence::SecretRoot::open(crate::persistence::default_root())
+        .and_then(|root| root.open_child_dir("temp"))
+    {
+        Ok(temp) => super::steam::unwrap_box_shortcuts(temp.path()),
+        Err(error) => tracing::warn!(%error, "box steam shortcuts not restored"),
+    }
     drop(seats);
     hklm.delete_subkey_with_flags(SEATS_KEY, KEY_WOW64_64KEY)
         .map_err(|cause| refuse("seats_key", "Couldn't turn seats off.", cause))
@@ -182,7 +247,7 @@ fn apply(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
     let (seats, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
         .create_subkey_with_flags(SEATS_KEY, KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY)
         .map_err(|cause| refuse("seats_key", "Couldn't turn seats on.", cause))?;
-    install_driver(&dir)?;
+    install_driver(&dir, true)?;
     allow_listener(&seats)?;
     // A choice made earlier narrowed the rules; allowing the network now widens them again.
     let narrowed = seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok() == Some(0);
@@ -219,15 +284,127 @@ fn package_dir(host_path: &Path) -> PathBuf {
     host_path.with_file_name("staging").join("pfvdisplay")
 }
 
+/// Where the seats package stands against the one staged beside the host.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum DriverState {
+    Current,
+    /// In the store, but not the staged version: an upgrade the store hasn't taken yet.
+    Outdated,
+    Missing,
+    /// No package beside the host to compare with.
+    Unstaged,
+}
+
+pub(super) fn driver_state(host_path: &Path) -> DriverState {
+    let Some(staged) = driver_ver(&package_dir(host_path).join(PACKAGE[0])) else {
+        return DriverState::Unstaged;
+    };
+    let stored = store_versions();
+    if stored.contains(&staged) {
+        DriverState::Current
+    } else if stored.is_empty() {
+        DriverState::Missing
+    } else {
+        DriverState::Outdated
+    }
+}
+
+/// Put the staged seats package in the driver store when the store lacks that version: an
+/// uninstall deletes it, and an upgrade stages a new one only beside the host. Seats running
+/// now keep theirs until their next session.
+pub(super) fn ensure_driver(host_path: &Path) -> WinResult<()> {
+    let state = driver_state(host_path);
+    if state == DriverState::Current {
+        return Ok(());
+    }
+    tracing::info!(
+        ?state,
+        "seat display driver not current in the driver store — installing"
+    );
+    let dir = package_dir(host_path);
+    if PACKAGE.iter().any(|name| !dir.join(name).is_file()) {
+        return Err(refuse(
+            "seat_display_driver",
+            "The seat display driver isn't on this machine. Reinstall punktfunk, then try again.",
+            dir.display(),
+        ));
+    }
+    install_driver(&dir, false).map_err(|error| backend_error("seat_display_driver", error.message))
+}
+
+/// The `DriverVer` value of an INF, such as `10/12/2026,9.9.1012.257`, spaces dropped.
+fn driver_ver(inf: &Path) -> Option<String> {
+    let bytes = std::fs::read(inf).ok()?;
+    let text = match bytes.as_slice() {
+        [0xFF, 0xFE, rest @ ..] => String::from_utf16_lossy(
+            &rest
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>(),
+        ),
+        _ => String::from_utf8_lossy(&bytes).into_owned(),
+    };
+    inf_driver_ver(&text)
+}
+
+fn inf_driver_ver(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        key.trim().eq_ignore_ascii_case("DriverVer").then(|| {
+            let value = value.split(';').next().unwrap_or_default();
+            value.chars().filter(|c| !c.is_whitespace()).collect()
+        })
+    })
+}
+
+/// The `DriverVer` of every seats package in the driver store, one folder each.
+fn store_versions() -> Vec<String> {
+    let repository = pf_paths::system32(r"DriverStore\FileRepository");
+    let Ok(entries) = std::fs::read_dir(repository) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("pf_vdisplay_seats.inf_")
+        })
+        .filter_map(|entry| driver_ver(&entry.path().join(PACKAGE[0])))
+        .collect()
+}
+
+/// Whether Windows' own Remote Desktop display driver is dated after ours: the newer date wins
+/// the seat's display, and a seat on Microsoft's never streams. `None` when either is unreadable.
+pub(super) fn inbox_display_driver_newer(host_path: &Path) -> Option<bool> {
+    let ours = driver_ver(&package_dir(host_path).join(PACKAGE[0]))?;
+    let windows = driver_ver(Path::new(&pf_paths::windows_dir(r"INF\rdpidd.inf")))?;
+    Some(ver_date(&windows)? >= ver_date(&ours)?)
+}
+
+/// `mm/dd/yyyy,…` as `(yyyy, mm, dd)`, so dates compare in order.
+fn ver_date(driver_ver: &str) -> Option<(u32, u32, u32)> {
+    let date = driver_ver.split(',').next()?;
+    let mut parts = date.split('/').map(|part| part.parse::<u32>().ok());
+    let (month, day, year) = (parts.next()??, parts.next()??, parts.next()??);
+    Some((year, month, day))
+}
+
 /// Add the seats package to the driver store. The terminal-services stack makes the devnode
-/// when a seat's session starts, so none is created here. 3010 is a driver added that a
-/// restart would load.
-fn install_driver(dir: &Path) -> WinResult<()> {
+/// when a seat's session starts and picks the newest package then, so none is created here.
+/// `install` also moves live devnodes onto it, which restarts a running seat's display: only
+/// turning seats on asks for that. 3010 is a driver added that a restart would load.
+fn install_driver(dir: &Path, install: bool) -> WinResult<()> {
     let inf = dir.join(PACKAGE[0]);
-    match run(
-        "pnputil.exe",
-        &["/add-driver", &inf.to_string_lossy(), "/install"],
-    ) {
+    let inf = inf.to_string_lossy();
+    let args: &[&str] = if install {
+        &["/add-driver", &inf, "/install"]
+    } else {
+        &["/add-driver", &inf]
+    };
+    match run("pnputil.exe", args) {
         Some(0 | 3010) => Ok(()),
         code => Err(refuse(
             "driver_install",
@@ -393,6 +570,14 @@ fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
             .output()
         {
             Ok(output) if output.status.success() => return Ok(()),
+            // STATUS_DLL_NOT_FOUND: a fresh Windows Server has no Visual C++ runtime.
+            Ok(output) if output.status.code() == Some(0xC000_0135_u32 as i32) => {
+                return Err(refuse(
+                    "vc_runtime",
+                    "The Microsoft Visual C++ runtime is missing. Install the Visual C++ 2015–2022 Redistributable (x64) from Microsoft, then try again.",
+                    keeper.display(),
+                ));
+            }
             Ok(output) => cause = String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             Err(error) => cause = error.to_string(),
         }
@@ -404,21 +589,42 @@ fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
     ))
 }
 
-fn probe() -> Option<[bool; 3]> {
+fn probe() -> Option<(String, [bool; 2])> {
     let output = Command::new(pf_paths::system32(POWERSHELL))
         .args(powershell_args(PROBE))
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
         .ok()?;
-    parse_probe(&String::from_utf8_lossy(&output.stdout))
+    let text = String::from_utf8_lossy(&output.stdout);
+    tracing::debug!(output = %text.trim(), "seat prerequisite probe");
+    parse_probe(&text)
 }
 
-/// The last non-empty line: three `0`/`1` flags.
-fn parse_probe(text: &str) -> Option<[bool; 3]> {
+/// The last non-empty line: the role's install state, then two `0`/`1` flags.
+fn parse_probe(text: &str) -> Option<(String, [bool; 2])> {
     let line = text.lines().rev().find(|line| !line.trim().is_empty())?;
-    let flags: Vec<bool> = line.split_whitespace().map(|flag| flag == "1").collect();
-    flags.try_into().ok()
+    let mut fields = line.split_whitespace();
+    let role = fields.next()?.to_string();
+    let flags: Vec<bool> = fields.map(|flag| flag == "1").collect();
+    Some((role, flags.try_into().ok()?))
+}
+
+/// The Session Host role by its `Get-WindowsFeature` install state. A role the probe can't read
+/// warns instead of refusing, so a broken cmdlet never blocks a machine that has the role.
+fn role_check(state: &str) -> Diagnostic {
+    const CODE: &str = "rds_role";
+    match state {
+        "Installed" => Diagnostic::info(CODE, "Remote Desktop Session Host is installed."),
+        "Unknown" => Diagnostic::warning(
+            CODE,
+            "Couldn't confirm that Remote Desktop Session Host is installed. If it isn't, press Set up Remote Desktop in Profiles → Seats.",
+        ),
+        _ => Diagnostic::error(
+            CODE,
+            "Remote Desktop Session Host isn't installed. Press Set up Remote Desktop in Profiles → Seats to install it; Windows then needs a restart.",
+        ),
+    }
 }
 
 fn powershell_args(script: &str) -> [&str; 6] {
@@ -461,13 +667,47 @@ fn refuse(code: &str, sentence: &str, cause: impl std::fmt::Display) -> BackendE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::DiagnosticLevel;
 
     #[test]
-    fn the_probe_answers_with_three_flags_on_its_last_line() {
-        assert_eq!(parse_probe("1 0 1\r\n"), Some([true, false, true]));
-        assert_eq!(parse_probe("noise\r\n0 0 0\r\n\r\n"), Some([false; 3]));
-        assert_eq!(parse_probe("1 1"), None);
+    fn the_probe_answers_on_its_last_line() {
+        let installed = ("Installed".to_string(), [false, true]);
+        assert_eq!(parse_probe("Installed 0 1\r\n"), Some(installed));
+        let unread = ("Unknown".to_string(), [true; 2]);
+        assert_eq!(
+            parse_probe("Access is denied.\r\nUnknown 1 1\r\n\r\n"),
+            Some(unread)
+        );
+        assert_eq!(parse_probe("Installed 1"), None);
         assert_eq!(parse_probe(""), None);
+    }
+
+    #[test]
+    fn an_infs_driver_ver_reads_without_spaces_or_comment() {
+        let inf = "[Version]\r\nSignature=\"$Windows NT$\"\r\nDriverVer = 10/12/2026, 9.9.1012.257 ; build\r\n";
+        assert_eq!(
+            inf_driver_ver(inf).as_deref(),
+            Some("10/12/2026,9.9.1012.257")
+        );
+        assert_eq!(inf_driver_ver("[Version]\r\n"), None);
+    }
+
+    /// The newer date wins the seat's display, so dates compare year first.
+    #[test]
+    fn driver_dates_compare_year_first() {
+        let ours = ver_date("10/12/2026,9.9.1012.257").unwrap();
+        let windows = ver_date("06/21/2006,10.0.26100.7309").unwrap();
+        assert!(windows < ours);
+        assert!(ver_date("12/31/2025,1.0") < ver_date("01/01/2026,1.0"));
+        assert_eq!(ver_date("not a date"), None);
+    }
+
+    #[test]
+    fn only_an_absent_role_reads_as_not_installed() {
+        assert_eq!(role_check("Installed").level, DiagnosticLevel::Info);
+        assert_eq!(role_check("Unknown").level, DiagnosticLevel::Warning);
+        assert_eq!(role_check("Available").level, DiagnosticLevel::Error);
+        assert_eq!(role_check("Removed").level, DiagnosticLevel::Error);
     }
 
     #[test]

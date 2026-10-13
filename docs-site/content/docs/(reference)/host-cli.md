@@ -25,6 +25,7 @@ Look up a `punktfunk-host` command or flag here. Most behaviour comes from
 | [`service`](#service-windows) | Register, control and remove the Windows service. | Windows |
 | [`tray`](#tray-windows) | Start, stop or query the status tray. | Windows |
 | [`driver`](#driver-windows) | Check or remove the bundled drivers. | Windows |
+| [`seats`](#seats-windows) | Turn seats off without the service. | Windows |
 | [`web`](#web-windows) | Print the web-console login password. | Windows |
 
 `punktfunk-host --help` prints the common commands. `ctl`, `plugins`, `service`, `tray`, `driver`
@@ -208,6 +209,13 @@ punktfunk-host driver uninstall            # the virtual display driver
 punktfunk-host driver uninstall --gamepad  # the virtual gamepad driver
 punktfunk-host driver uninstall --audio    # the host's virtual speaker and microphone devices
 ```
+
+## `seats` (Windows)
+
+`punktfunk-host seats off`, run elevated, turns [seats](/docs/windows-seats) off without the
+service: Remote Desktop's listener and firewall rules and the shared Steam shortcuts go back to how
+they were before seats, and the seat listener goes. The seat accounts stay. Uninstalling runs it; while the host runs, use
+**Profiles** → **Seats** instead, which also stops the seats first.
 
 ## `web` (Windows)
 

@@ -16,6 +16,7 @@ import type { PendingDevice } from "@/api/gen/model/pendingDevice";
 import type { ProfileAdmin } from "@/api/gen/model/profileAdmin";
 import type { RuntimeStatus } from "@/api/gen/model/runtimeStatus";
 import type { Seating } from "@/api/gen/model/seating";
+import type { SeatsDoctor } from "@/api/gen/model/seatsDoctor";
 import type { SessionSummary } from "@/api/gen/model/sessionSummary";
 import type { StatsSample } from "@/api/gen/model/statsSample";
 import type { StatsStatus } from "@/api/gen/model/statsStatus";
@@ -826,18 +827,25 @@ export const seatingOn: Seating = {
 	checks: [
 		{
 			level: "info",
-			code: "windows_build",
-			message: "Windows build 26100 meets the 22621 minimum",
+			code: "windows_server",
+			message: "This is Windows Server.",
 		},
 		{
 			level: "info",
 			code: "rds_role",
-			message: "The Remote Desktop Session Host role is installed",
+			message: "Remote Desktop Session Host is installed.",
 		},
+		{
+			level: "info",
+			code: "rds_licensing",
+			message: "Remote Desktop licensing is set.",
+		},
+		{ level: "info", code: "gpu", message: "A graphics card is installed." },
 	],
 };
 
-/** A turn-on the checks refused: still off, the failing lines first. */
+/** A fresh Windows Server: no Session Host role and no licensing, which **Set up Remote Desktop**
+ * clears. */
 export const seatingRefused: Seating = {
 	enabled: false,
 	platform: "windows",
@@ -845,19 +853,84 @@ export const seatingRefused: Seating = {
 	checks: [
 		{
 			level: "info",
-			code: "windows_build",
-			message: "Windows build 26100 meets the 22621 minimum",
+			code: "windows_server",
+			message: "This is Windows Server.",
 		},
 		{
 			level: "error",
 			code: "rds_role",
-			message: "Install the Remote Desktop Session Host role, then try again.",
+			message:
+				"Remote Desktop Session Host isn't installed. Press Set up Remote Desktop in Profiles → Seats to install it; Windows then needs a restart.",
+		},
+		{
+			level: "error",
+			code: "rds_licensing",
+			message:
+				"Remote Desktop licensing isn't set. Press Set up Remote Desktop in Profiles → Seats to set it to Per User.",
+		},
+		{ level: "info", code: "gpu", message: "A graphics card is installed." },
+	],
+};
+
+/** **Doctor** on a box whose second seat lost its display driver and has no Steam yet. */
+export const seatsDoctor: SeatsDoctor = {
+	healthy: false,
+	diagnostics: [
+		{ level: "info", code: "ledger", message: "Seats set up: 2 of 4." },
+		{
+			level: "info",
+			code: "windows_build",
+			message: "This Windows is new enough for seats (build 26100).",
+		},
+		{ level: "info", code: "reservation", message: "Seats are on." },
+		{
+			level: "error",
+			code: "seat_display_driver",
+			message:
+				"The seat display driver isn't installed. Seats put it back when they next start; if this stays, turn seats off and on under Profiles → Seats.",
+		},
+		{
+			level: "info",
+			code: "steam",
+			message:
+				"Steam is installed in C:\\Program Files (x86)\\Steam. Each seat gets a copy of its own.",
+		},
+		{
+			level: "info",
+			code: "account",
+			message: "Its Windows account pf_seat1 is set up.",
+			seat_id: "0123456789abcdef0123456789abcdef",
+			seat_name: "Kid",
+		},
+		{
+			level: "info",
+			code: "steam_client",
+			message: "Has its own Steam. Steam opened on this seat starts that copy.",
+			seat_id: "0123456789abcdef0123456789abcdef",
+			seat_name: "Kid",
+		},
+		{
+			level: "info",
+			code: "child_state",
+			message: "Running, in Windows session 3.",
+			seat_id: "0123456789abcdef0123456789abcdef",
+			seat_name: "Kid",
 		},
 		{
 			level: "warning",
-			code: "rds_licensing",
+			code: "steam_client",
 			message:
-				"Remote Desktop licensing isn't set up. Seats stop after the grace period.",
+				"Its own Steam isn't set up yet. It's copied the first time the seat starts; Steam games start on the seat once that's done.",
+			seat_id: "fedcba9876543210fedcba9876543210",
+			seat_name: "Oma",
+		},
+		{
+			level: "error",
+			code: "runtime_failed",
+			message:
+				"The seat didn't start in time. It stopped while checking the seat's screen and graphics card.",
+			seat_id: "fedcba9876543210fedcba9876543210",
+			seat_name: "Oma",
 		},
 	],
 };

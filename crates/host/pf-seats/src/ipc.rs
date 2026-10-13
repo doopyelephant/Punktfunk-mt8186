@@ -38,9 +38,12 @@ pub enum Command {
     /// Whether seats are on, with what turning them on needs.
     Seating,
     /// Turn seats on. Remote Desktop stays reachable from this machine only unless
-    /// `allow_rdp_from_network`.
+    /// `allow_rdp_from_network`. `prepare` first installs what Windows lacks and punktfunk may
+    /// set up itself: the Session Host role and a licensing mode.
     Enable {
         allow_rdp_from_network: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        prepare: bool,
     },
     /// Stop every seat and turn seats off. Only `keep_accounts: true` is served: an account
     /// goes with its profile.
@@ -328,6 +331,7 @@ mod tests {
             (
                 Command::Enable {
                     allow_rdp_from_network: true,
+                    prepare: false,
                 },
                 r#"{"type":"enable","allow_rdp_from_network":true}"#,
             ),
@@ -413,6 +417,7 @@ mod tests {
             Command::Seating,
             Command::Enable {
                 allow_rdp_from_network: false,
+                prepare: false,
             },
             Command::Disable {
                 keep_accounts: true,

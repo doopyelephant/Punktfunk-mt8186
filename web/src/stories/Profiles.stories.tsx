@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import {
 	AddProfileDialog,
+	DoctorDialog,
 	DoorDialog,
 	ProfilesView,
 	RemoveProfileDialog,
@@ -13,6 +14,7 @@ import {
 	profilesWindows,
 	seatingOn,
 	seatingRefused,
+	seatsDoctor,
 } from "./lib/fixtures";
 
 const noop = () => {};
@@ -107,7 +109,7 @@ const seats = {
 	onStart: noop,
 	onStop: noop,
 	onEnd: noop,
-	doctor: { message: null, checking: false, onRun: noop },
+	doctor: { message: null, notes: 0, onOpen: noop },
 };
 
 /** A Windows Server host: a seat ready, in use, starting, stopped and unavailable. */
@@ -118,19 +120,35 @@ export const WindowsEveryState: Story = {
 	},
 };
 
-/** The doctor found a problem: its first error, and **Doctor** to run it again. */
+/** The doctor found a problem: its first error, and **Doctor** to see every check. */
 export const WindowsDoctorError: Story = {
 	args: {
 		profiles: { data: profilesWindows, isLoading: false, error: null },
 		seats: {
 			...seats,
 			doctor: {
-				message: "Remote Desktop licensing has run out for this server.",
-				checking: false,
-				onRun: noop,
+				message:
+					"The seat display driver isn't installed. Seats put it back when they next start; if this stays, turn seats off and on under Profiles → Seats.",
+				notes: 1,
+				onOpen: noop,
 			},
 		},
 	},
+};
+
+/** **Doctor**: the PC's checks, then one group per seat, the worst first. */
+export const Doctor: Story = {
+	render: () => (
+		<DoctorDialog
+			open
+			doctor={seatsDoctor}
+			error={null}
+			checking={false}
+			docs="windows-seats#troubleshooting"
+			onRecheck={noop}
+			onClose={noop}
+		/>
+	),
 };
 
 /** **Seats** with seats on: the switch and what the checks found. */
@@ -146,13 +164,27 @@ export const SeatsOn: Story = {
 	),
 };
 
-/** A turn-on the checks refused: seats stay off and the failing line comes first. */
+/** A fresh Windows Server: the failing lines first, and **Set up Remote Desktop** to clear them. */
 export const SeatsRefused: Story = {
 	render: () => (
 		<SeatsDialog
 			open
 			seating={seatingRefused}
 			isPending={false}
+			onChange={noop}
+			onClose={noop}
+		/>
+	),
+};
+
+/** **Set up Remote Desktop** under way: installing the role takes minutes. */
+export const SeatsPreparing: Story = {
+	render: () => (
+		<SeatsDialog
+			open
+			seating={seatingRefused}
+			isPending
+			preparing
 			onChange={noop}
 			onClose={noop}
 		/>

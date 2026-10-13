@@ -497,6 +497,8 @@ pub(super) fn seat_environment(
         ),
         ("PUNKTFUNK_HOST_NAME", OsString::from(&seat.name)),
         ("PUNKTFUNK_GAMESTREAM", OsString::from("0")),
+        // Only the box advertises; a client reaches a seat through its redirect.
+        ("PUNKTFUNK_MDNS", OsString::from("0")),
         (
             "PUNKTFUNK_AUDIO_OUTPUT_MODE",
             OsString::from("follow_default"),

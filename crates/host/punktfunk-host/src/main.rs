@@ -384,6 +384,7 @@ fn is_management_cli(args: &[String]) -> bool {
     match args.first().map(String::as_str) {
         Some("plugins")
         | Some("driver")
+        | Some("seats")
         | Some("web")
         | Some("tray")
         // Loopback API client; `watch` is long-lived — do not take GPU clocks or the DXGI hook.

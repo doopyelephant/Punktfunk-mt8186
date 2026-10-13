@@ -36,15 +36,9 @@ then the profile's card on the client says **Steam sign-in once**.
 ## On Windows Server
 
 An **Own desktop** profile signs in to a Windows account of its own, so two people play at once
-without sharing a desktop.
-
-1. Open **Profiles** → **Seats**. Seats need Windows Server with the Remote Desktop Session Host
-   role and licensing, and a GPU. The checks there list what is missing.
-2. Tick **Seats are on**. Leave **Allow Remote Desktop from the network** off to limit Remote
-   Desktop to this machine; tick it if you manage this server over Remote Desktop from another
-   computer.
-3. Open **Add profile** and pick **Own desktop**. Each profile gets a Windows account of its own,
-   and the player signs in to Steam and the stores once per seat.
+without sharing a desktop. [Seats on Windows](/docs/windows-seats) has what it needs, the setup
+and Steam on a seat. In short: open **Profiles** → **Seats**, press **Set up Remote Desktop** if
+the list asks for it, tick **Seats are on**, then **Add profile** → **Own desktop**.
 
 A player who picks a stopped seat sees `Getting Kid's desk ready…` while it starts. A card's
 **Start**, **Stop** and **End session** do the same by hand; **End session** keeps the seat
