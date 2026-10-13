@@ -106,7 +106,7 @@ fn env_value_on(value: &str) -> bool {
 /// (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
 pub const ABI_VERSION: u32 = 51;
 /// FNV-1a of the generated `include/punktfunk_core.h` without comments or the version define.
-/// `punktfunk-ffi`'s `abi_header_hash` fails on a change; update this beside `ABI_VERSION`.
+/// `gen-headers`'s `abi_header_hash` test fails on a change; update this beside `ABI_VERSION`.
 /// cbindgen:ignore
 pub const ABI_HEADER_HASH: u64 = 0x7301_6805_b1ba_fd83;
 
