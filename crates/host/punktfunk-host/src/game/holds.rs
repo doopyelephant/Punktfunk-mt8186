@@ -43,7 +43,7 @@ pub fn launching(game: GameRefPayload) {
 fn hold_plugin(p: &crate::plugin_host::registry::Holder, json: &str) {
     let timeout_ms = p.timeout.as_millis() as u64;
     if p.port == 0 {
-        use crate::mgmt::plugin_channel::{request_blocking, Unreached};
+        use crate::plugin_host::channel::{request_blocking, Unreached};
         match request_blocking(&p.id, "/__hold", json, p.timeout) {
             Ok((200..=299, _)) => tracing::debug!(plugin = %p.id, "plugin released the launch"),
             Ok((status, _)) => tracing::warn!(

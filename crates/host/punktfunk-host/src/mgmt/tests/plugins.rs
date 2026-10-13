@@ -490,7 +490,7 @@ async fn a_plugin_page_is_reached_over_its_parked_channel() {
     let sent = tokio::spawn(async move {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-forwarded-prefix", "/plugin-ui/demo".parse().unwrap());
-        crate::mgmt::plugin_channel::send(
+        crate::plugin_host::channel::send(
             "demo",
             "s3cret",
             axum::http::Method::GET,
@@ -524,7 +524,7 @@ async fn a_restarted_plugins_old_channel_is_skipped() {
     drop(gone);
     let mut plugin = attach_channel(app, "restarted").await;
     let sent = tokio::spawn(async move {
-        crate::mgmt::plugin_channel::send(
+        crate::plugin_host::channel::send(
             "restarted",
             "s3cret",
             axum::http::Method::GET,

@@ -217,7 +217,7 @@ pub async fn run(
     // Close a leftover apply-intent from the previous boot (`update/jobs.rs`).
     // Once per process, before serving.
     crate::update::reconcile_at_boot();
-    plugin_channel::remember_runtime();
+    crate::plugin_host::channel::remember_runtime();
     settings::write_seat_defaults();
     // The tray has no supervisor — HKLM `Run` is a sign-in trigger — so
     // `StopTrays` and a crash leave no icon until the next logon.

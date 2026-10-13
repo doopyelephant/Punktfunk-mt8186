@@ -1,6 +1,8 @@
 //! Plugins on this host: the runner and each plugin's access, and the store that installs
 //! them from signed catalogs.
 
+// A plugin's page without a listener: connections it parks, requests sent down them.
+pub(crate) mod channel;
 pub(crate) mod plugins;
 // Running plugins and their UI credentials; the `/plugins` routes sit on it.
 pub(crate) mod registry;
