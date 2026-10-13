@@ -39,14 +39,16 @@ const PACKAGE: [&str; 3] = [
 const TRUST_ATTEMPTS: u32 = 3;
 const TRUST_RETRY: Duration = Duration::from_secs(2);
 /// The role's install state, then licensing and a GPU as `0`/`1` flags, on the last line. A role
-/// the cmdlet can't read is `Unknown`, after the cmdlet's error. The licensing types 2 and 4 are
-/// Per Device and Per User. A GPU sits on PCI and isn't `Microsoft …`, the basic display driver:
-/// punktfunk's own display (`ROOT\…`) and a seat's (`SWD\…`) don't count.
+/// the cmdlet can't read is `Unknown`, after the cmdlet's error. `Available`, a role not
+/// installed, is the state enum's zero and false in PowerShell, so the state is tested against
+/// null. The licensing types 2 and 4 are Per Device and Per User. A GPU sits on PCI and isn't
+/// `Microsoft …`, the basic display driver: punktfunk's own display (`ROOT\…`) and a seat's
+/// (`SWD\…`) don't count.
 const PROBE: &str = "$ProgressPreference='SilentlyContinue'; \
     $ErrorActionPreference='SilentlyContinue'; \
     $role = 'Unknown'; \
     try { $state = (Get-WindowsFeature RDS-RD-Server -ErrorAction Stop).InstallState; \
-    if ($state) { $role = $state } } catch { $_.Exception.Message }; \
+    if ($null -ne $state) { $role = $state } } catch { $_.Exception.Message }; \
     $mode = (Get-CimInstance -Namespace root/cimv2/TerminalServices \
     -ClassName Win32_TerminalServiceSetting).LicensingType; \
     $gpu = [bool](Get-CimInstance Win32_VideoController | \
