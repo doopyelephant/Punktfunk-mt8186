@@ -16,8 +16,10 @@ import { motion } from "motion/react";
 import { type FC, useEffect, useRef, useState } from "react";
 import type { ProfileAdmin } from "@/api/gen/model/profileAdmin";
 import type { ProfileCreate } from "@/api/gen/model/profileCreate";
+import type { SeatCheck } from "@/api/gen/model/seatCheck";
 import type { Seating } from "@/api/gen/model/seating";
 import type { SeatState } from "@/api/gen/model/seatState";
+import type { SeatsDoctor } from "@/api/gen/model/seatsDoctor";
 import { DocsLink } from "@/components/docs-link";
 import { PasswordConfirmDialog } from "@/components/password-confirm";
 import { ProfileAvatar } from "@/components/profile-avatar";
@@ -99,11 +101,12 @@ export function playsLine(
 	return m.profiles_plays_steam();
 }
 
-/** The doctor's line under the cards. `message` is its first error; `null` is healthy. */
+/** The doctor's line under the cards. `message` is its first error, `notes` its warnings. */
 export type DoctorLine = {
 	message: string | null;
-	checking: boolean;
-	onRun: () => void;
+	notes: number;
+	/** Opens **Doctor** with every check. */
+	onOpen: () => void;
 };
 
 /** What a host with seats adds to the page: a seat's buttons and the doctor's line, and on
@@ -631,18 +634,21 @@ export const RemoveProfileDialog: FC<{
 	);
 };
 
-/** The doctor's verdict under the cards: quiet when healthy, its first error otherwise. */
+/** The doctor's verdict under the cards: its first error, else how many notes, else healthy. */
 const DoctorFooter: FC<{ line: DoctorLine }> = ({ line }) => (
 	<div className="flex items-center justify-between gap-4 text-sm text-muted-foreground">
-		<span className={cn(line.message && "text-destructive")}>
-			{line.message ?? m.profiles_seats_healthy()}
-		</span>
-		<Button
-			variant="outline"
-			size="sm"
-			disabled={line.checking}
-			onClick={line.onRun}
+		<span
+			className={cn(
+				line.message && "text-destructive",
+				!line.message && line.notes > 0 && "text-[var(--warning)]",
+			)}
 		>
+			{line.message ??
+				(line.notes > 0
+					? m.profiles_doctor_notes({ count: line.notes })
+					: m.profiles_seats_healthy())}
+		</span>
+		<Button variant="outline" size="sm" onClick={line.onOpen}>
 			{m.profiles_seats_doctor()}
 		</Button>
 	</div>
@@ -654,33 +660,120 @@ const LEVEL = {
 	info: { rank: 2, Icon: Check, tone: "text-muted-foreground" },
 } as const;
 
+const byLevel = (a: SeatCheck, b: SeatCheck) =>
+	LEVEL[a.level].rank - LEVEL[b.level].rank;
+
+/** Checks as a list, the worst first. */
+const CheckList: FC<{ checks: SeatCheck[] }> = ({ checks }) => (
+	<ul className="flex flex-col gap-1.5 text-sm">
+		{[...checks].sort(byLevel).map((c, i) => {
+			const { Icon, tone } = LEVEL[c.level];
+			return (
+				<li key={`${c.code}-${i}`} className="flex items-start gap-2">
+					<Icon className={cn("mt-0.5 size-4 shrink-0", tone)} />
+					<span>{c.message}</span>
+				</li>
+			);
+		})}
+	</ul>
+);
+
+/**
+ * **Doctor**: every check the supervisor ran, the PC's first and then one group per seat, named
+ * after the profile that plays there. Each line is the host's own sentence with the next move.
+ */
+export const DoctorDialog: FC<{
+	open: boolean;
+	doctor: SeatsDoctor | undefined;
+	error: string | null;
+	checking: boolean;
+	/** The docs route its troubleshooting lives at. */
+	docs: string;
+	onRecheck: () => void;
+	onClose: () => void;
+}> = ({ open, doctor, error, checking, docs, onRecheck, onClose }) => {
+	const rows = doctor?.diagnostics ?? [];
+	const box = rows.filter((d) => !d.seat_id);
+	const seats = [
+		...new Set(rows.flatMap((d) => (d.seat_id ? [d.seat_id] : []))),
+	];
+	return (
+		<Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+			<DialogContent className="max-h-[85vh] max-w-lg overflow-y-auto">
+				<DialogHeader>
+					<DialogTitle>{m.profiles_seats_doctor()}</DialogTitle>
+				</DialogHeader>
+				{error && <p className="text-sm text-destructive">{error}</p>}
+				{box.length > 0 && (
+					<section className="space-y-2">
+						<h3 className="text-sm font-medium">{m.profiles_doctor_box()}</h3>
+						<CheckList checks={box} />
+					</section>
+				)}
+				{seats.map((id) => {
+					const checks = rows.filter((d) => d.seat_id === id);
+					return (
+						<section key={id} className="space-y-2">
+							<h3 className="text-sm font-medium">
+								{checks.find((d) => d.seat_name)?.seat_name ??
+									m.profiles_doctor_seat()}
+							</h3>
+							<CheckList checks={checks} />
+						</section>
+					);
+				})}
+				<DialogFooter>
+					<DocsLink
+						path={docs}
+						className="mr-auto self-center text-sm text-muted-foreground"
+					/>
+					<Button variant="outline" disabled={checking} onClick={onRecheck}>
+						{checking && <Spinner className="size-4" />}
+						{m.profiles_doctor_again()}
+					</Button>
+					<Button onClick={onClose}>{m.common_done()}</Button>
+				</DialogFooter>
+			</DialogContent>
+		</Dialog>
+	);
+};
+
+/** Checks that **Set up Remote Desktop** can clear: the role, licensing, or a restart it asked for. */
+const PREPARES = new Set(["rds_role", "rds_licensing", "restart"]);
+
 /**
  * **Seats**: the switch, the Remote Desktop choice, and what the checks found. While seats are on,
  * changing the choice turns them on again with it. A refused turn-on answers off with its errors,
- * which is what the list shows.
+ * which is what the list shows. When Windows lacks the Session Host role or licensing, **Set up
+ * Remote Desktop** installs them and turns seats on in one go.
  */
 export const SeatsDialog: FC<{
 	open: boolean;
 	seating: Seating | undefined;
 	isPending: boolean;
-	onChange: (enabled: boolean, allowRdp: boolean) => void;
+	/** The pending change is **Set up Remote Desktop**, which takes minutes. */
+	preparing?: boolean;
+	onChange: (enabled: boolean, allowRdp: boolean, prepare?: boolean) => void;
 	onClose: () => void;
-}> = ({ open, seating, isPending, onChange, onClose }) => {
+}> = ({ open, seating, isPending, preparing = false, onChange, onClose }) => {
 	const [allowRdp, setAllowRdp] = useState(false);
 	const stored = seating?.allow_rdp_from_network === true;
 	useEffect(() => {
 		if (open) setAllowRdp(stored);
 	}, [open, stored]);
 	const on = seating?.enabled === true;
-	const checks = [...(seating?.checks ?? [])].sort(
-		(a, b) => LEVEL[a.level].rank - LEVEL[b.level].rank,
-	);
+	const checks = seating?.checks ?? [];
+	const fixable =
+		!on && checks.some((c) => PREPARES.has(c.code) && c.level !== "info");
 	return (
 		<Dialog open={open} onOpenChange={(o) => !o && onClose()}>
 			<DialogContent className="max-w-md">
 				<DialogHeader>
 					<DialogTitle>{m.profiles_seats()}</DialogTitle>
 				</DialogHeader>
+				<p className="text-sm text-muted-foreground">
+					{m.profiles_seats_intro()} <DocsLink path="windows-seats" />
+				</p>
 				<div className="flex items-center gap-2">
 					<Checkbox
 						id="seats-on"
@@ -712,18 +805,26 @@ export const SeatsDialog: FC<{
 						</div>
 					</div>
 				)}
-				{checks.length > 0 && (
-					<ul className="flex flex-col gap-1.5 text-sm">
-						{checks.map((c, i) => {
-							const { Icon, tone } = LEVEL[c.level];
-							return (
-								<li key={`${c.code}-${i}`} className="flex items-start gap-2">
-									<Icon className={cn("mt-0.5 size-4 shrink-0", tone)} />
-									<span>{c.message}</span>
-								</li>
-							);
-						})}
-					</ul>
+				{checks.length > 0 && <CheckList checks={checks} />}
+				{fixable && (
+					<div className="space-y-1">
+						<Button
+							variant="outline"
+							disabled={isPending}
+							onClick={() => onChange(true, allowRdp, true)}
+						>
+							{preparing && <Spinner className="size-4" />}
+							{preparing
+								? m.profiles_seats_preparing()
+								: m.profiles_seats_prepare()}
+						</Button>
+						<p className="text-xs text-muted-foreground">
+							{m.profiles_seats_prepare_hint()}
+						</p>
+					</div>
+				)}
+				{on && !isPending && (
+					<p className="text-sm">{m.profiles_seats_next()}</p>
 				)}
 				<DialogFooter>
 					<Button onClick={onClose}>{m.common_done()}</Button>

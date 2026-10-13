@@ -641,7 +641,11 @@ impl PlatformBackend for LinuxBackend {
     }
 
     /// Seats are on whenever the daemon runs.
-    fn enable(&self, _allow_rdp_from_network: bool) -> Result<SeatingStatus, BackendError> {
+    fn enable(
+        &self,
+        _allow_rdp_from_network: bool,
+        _prepared: Vec<Diagnostic>,
+    ) -> Result<SeatingStatus, BackendError> {
         self.seating()
     }
 

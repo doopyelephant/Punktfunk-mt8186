@@ -61,6 +61,37 @@ pub(super) fn box_install() -> Option<PathBuf> {
         .find(|dir| dir.join("steam.exe").is_file())
 }
 
+/// The Steam registered machine-wide, when that isn't a seat's copy: a seat's copy rewrites
+/// `InstallPath` to itself whenever it runs. Only for telling the operator where Steam is.
+pub(super) fn registered_install() -> Option<PathBuf> {
+    let profiles = std::env::var_os("SystemDrive")
+        .map(|drive| PathBuf::from(format!(r"{}\Users", drive.to_string_lossy())))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Users"));
+    [r"SOFTWARE\WOW6432Node\Valve\Steam", r"SOFTWARE\Valve\Steam"]
+        .into_iter()
+        .filter_map(|key| {
+            RegKey::predef(HKEY_LOCAL_MACHINE)
+                .open_subkey_with_flags(key, KEY_READ | KEY_WOW64_64KEY)
+                .and_then(|key| key.get_value::<String, _>("InstallPath"))
+                .ok()
+        })
+        .map(PathBuf::from)
+        .filter(|dir| dir.join("steam.exe").is_file())
+        .find(|dir| {
+            let seat_copy = dir
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|grand| eq_path(grand, &profiles));
+            !seat_copy
+        })
+}
+
+fn eq_path(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .trim_end_matches('\\')
+        .eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches('\\'))
+}
+
 /// `<profile>\Steam\steam.exe`, the seat's copy whether or not it is made yet. `None` while the
 /// account has no profile, which Windows makes at its first logon.
 pub(super) fn seat_exe(account: &str) -> Option<PathBuf> {

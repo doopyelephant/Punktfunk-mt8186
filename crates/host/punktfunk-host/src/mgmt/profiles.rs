@@ -823,6 +823,9 @@ pub(crate) struct SeatCheck {
     /// The seat it is about; absent when it is about the box.
     #[serde(skip_serializing_if = "Option::is_none")]
     seat_id: Option<String>,
+    /// The name of the profile that plays on that seat, when one does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seat_name: Option<String>,
 }
 
 impl From<Diagnostic> for SeatCheck {
@@ -836,8 +839,21 @@ impl From<Diagnostic> for SeatCheck {
             code: d.code,
             message: d.message,
             seat_id: d.seat_id.map(|id| id.to_string()),
+            seat_name: None,
         }
     }
+}
+
+/// Seat id → the display name of the profile playing on it.
+fn seat_names() -> std::collections::HashMap<String, String> {
+    crate::profiles::Profiles::load_with(None, None)
+        .list()
+        .into_iter()
+        .filter_map(|p| match p.os_account {
+            crate::profiles::OsAccount::Seat { seat: Some(id), .. } => Some((id, p.display_name)),
+            _ => None,
+        })
+        .collect()
 }
 
 #[derive(Serialize, ToSchema, Clone, Copy)]
@@ -869,6 +885,12 @@ pub(crate) struct SeatingChange {
     #[serde(default)]
     #[schema(required = false)]
     allow_rdp_from_network: bool,
+    /// Windows Server: first install the Remote Desktop Session Host role and set licensing to
+    /// Per User where they are missing. Installing the role can take minutes and asks for a
+    /// restart.
+    #[serde(default)]
+    #[schema(required = false)]
+    prepare: bool,
 }
 
 /// The seat supervisor's own checks.
@@ -961,10 +983,11 @@ pub(crate) async fn get_seating() -> Response {
 /// Turn seats on or off
 ///
 /// On runs the checks, installs the seat display driver, turns Remote Desktop on for this
-/// machine and records its certificate. A check that fails changes nothing: the answer is 200
-/// with `enabled: false` and the failed check as an `error`. The driver replaces the display of
-/// every Remote Desktop session on the machine. Off stops every seat, keeps their accounts
-/// and restores what on changed. Admin lane only.
+/// machine and records its certificate. With `prepare` it first installs the Session Host role
+/// and sets licensing to Per User where they are missing. A check that fails changes nothing:
+/// the answer is 200 with `enabled: false` and the failed check as an `error`. The driver
+/// replaces the display of every Remote Desktop session on the machine. Off stops every seat,
+/// keeps their accounts and restores what on changed. Admin lane only.
 #[utoipa::path(
     put,
     path = "/profiles/seating",
@@ -992,6 +1015,7 @@ pub(crate) async fn put_seating(ApiJson(input): ApiJson<SeatingChange>) -> Respo
     seating(if input.enabled {
         Command::Enable {
             allow_rdp_from_network: input.allow_rdp_from_network,
+            prepare: input.prepare,
         }
     } else {
         Command::Disable {
@@ -1003,8 +1027,9 @@ pub(crate) async fn put_seating(ApiJson(input): ApiJson<SeatingChange>) -> Respo
 
 /// Check the seats
 ///
-/// The supervisor's own report: the ledger, Windows, Remote Desktop, the certificate pin and
-/// each seat's account, session and ports. Admin lane only.
+/// The supervisor's own report: Windows, Remote Desktop, the seat display driver, Steam, and
+/// each seat's account, Steam, state and ports, each row one sentence with the next move.
+/// Admin lane only.
 #[utoipa::path(
     get,
     path = "/profiles/doctor",
@@ -1022,15 +1047,23 @@ pub(crate) async fn get_seats_doctor() -> Response {
         return api_error(StatusCode::CONFLICT, SEATS_NEED_WINDOWS);
     }
     match supervisor(Command::Doctor).await {
-        Ok(CommandResult::Doctor { report }) => Json(SeatsDoctor {
-            healthy: report.healthy,
-            diagnostics: report
-                .diagnostics
-                .into_iter()
-                .map(SeatCheck::from)
-                .collect(),
-        })
-        .into_response(),
+        Ok(CommandResult::Doctor { report }) => {
+            let names = seat_names();
+            Json(SeatsDoctor {
+                healthy: report.healthy,
+                diagnostics: report
+                    .diagnostics
+                    .into_iter()
+                    .map(|d| {
+                        let mut check = SeatCheck::from(d);
+                        check.seat_name =
+                            check.seat_id.as_ref().and_then(|id| names.get(id)).cloned();
+                        check
+                    })
+                    .collect(),
+            })
+            .into_response()
+        }
         Ok(_) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "The seat supervisor answered something unexpected.",

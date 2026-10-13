@@ -37,9 +37,20 @@ pub trait PlatformBackend: Send + Sync + 'static {
         Err(UnsupportedBackend::unavailable())
     }
 
-    /// Run the checks, then turn seats on. A refusal is `Ok` with an error-level check, so the
-    /// operator reads why; `Err` is a failure the operator can't act on.
-    fn enable(&self, _allow_rdp_from_network: bool) -> Result<SeatingStatus, BackendError> {
+    /// Set up what turning seats on needs and the platform can install itself, before the
+    /// ledger lock. One row per thing done or refused, for [`Self::enable`] to lead with.
+    fn prepare(&self) -> Vec<Diagnostic> {
+        Vec::new()
+    }
+
+    /// Run the checks, then turn seats on, after the rows [`Self::prepare`] gave. A refusal is
+    /// `Ok` with an error-level check, so the operator reads why; `Err` is a failure the
+    /// operator can't act on.
+    fn enable(
+        &self,
+        _allow_rdp_from_network: bool,
+        _prepared: Vec<Diagnostic>,
+    ) -> Result<SeatingStatus, BackendError> {
         Err(UnsupportedBackend::unavailable())
     }
 

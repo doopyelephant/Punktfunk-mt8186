@@ -101,7 +101,7 @@ pub(super) fn checks() -> Vec<Diagnostic> {
             licensing,
             "rds_licensing",
             "Remote Desktop licensing is set.",
-            "Remote Desktop licensing isn't set. Choose Per Device or Per User in Server Manager, then try again.",
+            "Remote Desktop licensing isn't set. Press Set up Remote Desktop in Profiles → Seats to set it to Per User.",
         ));
     }
     checks.push(check(
@@ -111,6 +111,65 @@ pub(super) fn checks() -> Vec<Diagnostic> {
         "No graphics card was found. Seats need a GPU.",
     ));
     checks
+}
+
+/// Install the Session Host role and set licensing to Per User, where Windows Server lacks them.
+/// The last line is the role's outcome, then licensing's: `kept`, `installed` or `restart`, and
+/// `kept`, `set`, `skipped` (the role waits on a restart) or a `ChangeMode` return value.
+const PREPARE: &str = "$ProgressPreference='SilentlyContinue'; $ErrorActionPreference='Stop'; \
+    $role = 'kept'; \
+    if ((Get-WindowsFeature RDS-RD-Server).InstallState -ne 'Installed') { \
+    $r = Install-WindowsFeature RDS-RD-Server; \
+    if (-not $r.Success) { throw 'Install-WindowsFeature did not succeed' }; \
+    $role = if ([string]$r.RestartNeeded -eq 'No') { 'installed' } else { 'restart' } }; \
+    $lic = 'skipped'; \
+    if ($role -ne 'restart') { \
+    $s = Get-CimInstance -Namespace root/cimv2/TerminalServices -ClassName Win32_TerminalServiceSetting; \
+    if ($s.LicensingType -in 2,4) { $lic = 'kept' } else { \
+    $c = $s | Invoke-CimMethod -MethodName ChangeMode -Arguments @{LicensingType=4}; \
+    $lic = if ($c.ReturnValue -eq 0) { 'set' } else { [string]$c.ReturnValue } } }; \
+    '{0} {1}' -f $role, $lic";
+
+/// What [`checks`] refuses and Windows Server can set up itself: the Session Host role, then a
+/// licensing mode. One row per change or refusal; nothing on a desktop edition.
+pub(super) fn prepare() -> Vec<Diagnostic> {
+    if server_edition() != Some(true) {
+        return Vec::new();
+    }
+    let lines = match powershell_lines(PREPARE) {
+        Ok(lines) => lines,
+        Err(cause) => {
+            tracing::warn!(%cause, "remote desktop setup did not complete");
+            return vec![Diagnostic::error(
+                "rds_setup",
+                "Windows couldn't set up Remote Desktop. Add Remote Desktop Session Host under Remote Desktop Services in Server Manager, restart, then try again.",
+            )];
+        }
+    };
+    tracing::info!(output = ?lines, "remote desktop setup");
+    let last = lines.last().map(String::as_str).unwrap_or_default();
+    let (role, licensing) = last.split_once(' ').unwrap_or((last, ""));
+    let mut rows = Vec::new();
+    match role {
+        "installed" => rows.push(Diagnostic::info(
+            "rds_role_installed",
+            "Remote Desktop Session Host is now installed.",
+        )),
+        "restart" => rows.push(Diagnostic::error(
+            "restart",
+            "Remote Desktop Session Host is installed. Restart the PC, then press Set up Remote Desktop again to finish.",
+        )),
+        _ => {}
+    }
+    match licensing {
+        "set" => rows.push(Diagnostic::info(
+            "rds_licensing_set",
+            "Remote Desktop licensing is now Per User.",
+        )),
+        "kept" | "skipped" => {}
+        code => tracing::warn!(code, "licensing mode change refused"),
+    }
+    rows
 }
 
 /// Turn seats on. A failure after the Seats key exists on a machine that had none puts the
@@ -511,6 +570,14 @@ fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
             .output()
         {
             Ok(output) if output.status.success() => return Ok(()),
+            // STATUS_DLL_NOT_FOUND: a fresh Windows Server has no Visual C++ runtime.
+            Ok(output) if output.status.code() == Some(0xC000_0135_u32 as i32) => {
+                return Err(refuse(
+                    "vc_runtime",
+                    "The Microsoft Visual C++ runtime is missing. Install the Visual C++ 2015–2022 Redistributable (x64) from Microsoft, then try again.",
+                    keeper.display(),
+                ));
+            }
             Ok(output) => cause = String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             Err(error) => cause = error.to_string(),
         }
@@ -551,11 +618,11 @@ fn role_check(state: &str) -> Diagnostic {
         "Installed" => Diagnostic::info(CODE, "Remote Desktop Session Host is installed."),
         "Unknown" => Diagnostic::warning(
             CODE,
-            "Couldn't confirm that Remote Desktop Session Host is installed. If it isn't, add it under Remote Desktop Services in Server Manager.",
+            "Couldn't confirm that Remote Desktop Session Host is installed. If it isn't, press Set up Remote Desktop in Profiles → Seats.",
         ),
         _ => Diagnostic::error(
             CODE,
-            "Remote Desktop Session Host isn't installed. Add it under Remote Desktop Services in Server Manager, restart, then try again.",
+            "Remote Desktop Session Host isn't installed. Press Set up Remote Desktop in Profiles → Seats to install it; Windows then needs a restart.",
         ),
     }
 }

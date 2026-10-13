@@ -61,9 +61,16 @@ impl<B: PlatformBackend> SeatService<B> {
             Command::Seating => self.seating(|backend| backend.seating()),
             Command::Enable {
                 allow_rdp_from_network,
+                prepare,
             } => {
+                // Installing a Windows role takes minutes; the ledger stays readable meanwhile.
+                let prepared = if prepare {
+                    self.backend.prepare()
+                } else {
+                    Vec::new()
+                };
                 let _serialized = self.lock();
-                self.seating(|backend| backend.enable(allow_rdp_from_network))
+                self.seating(|backend| backend.enable(allow_rdp_from_network, prepared))
             }
             Command::Disable { keep_accounts } => self.disable(keep_accounts),
             Command::AdoptOwner { account } => self.adopt_owner(&account),
@@ -306,12 +313,7 @@ impl<B: PlatformBackend> SeatService<B> {
         let current = self.lock().clone();
         let mut diagnostics = vec![Diagnostic::info(
             "ledger",
-            format!(
-                "schema {} generation {} contains {} of 4 seats",
-                current.schema_version,
-                current.generation,
-                current.seats.len()
-            ),
+            format!("Seats set up: {} of 4.", current.seats.len()),
         )];
         match self.backend.doctor(&current) {
             Ok(mut backend) => diagnostics.append(&mut backend),

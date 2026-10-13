@@ -34,6 +34,7 @@ import { useLocale } from "@/lib/i18n";
 import { m } from "@/paraglide/messages";
 import {
 	AddProfileDialog,
+	DoctorDialog,
 	DoorDialog,
 	ProfilesView,
 	RemoveProfileDialog,
@@ -96,6 +97,7 @@ export const SectionProfiles: FC = () => {
 		return () => clearTimeout(slow);
 	}, [switching]);
 	const [seatsOpen, setSeatsOpen] = useState(false);
+	const [doctorOpen, setDoctorOpen] = useState(false);
 	const settings = useGetHostSettings({ query: { enabled: linux } });
 	const seatRow = settings.data?.settings.find(
 		(s) => s.id === "steam_seat_home",
@@ -168,14 +170,20 @@ export const SectionProfiles: FC = () => {
 	const act = (p: ProfileAdmin, a: SeatAct) =>
 		seatAct.mutate({ id: p.id, act: a });
 	const firstError = doctor.data?.diagnostics.find((d) => d.level === "error");
+	const doctorError = doctor.error
+		? (apiErrorMessage(doctor.error) ?? m.common_error())
+		: null;
 	const doctorLine =
 		seatsOn && (doctor.data || doctor.error)
 			? {
-					message: doctor.data
-						? (firstError?.message ?? null)
-						: (apiErrorMessage(doctor.error) ?? m.common_error()),
-					checking: doctor.isFetching,
-					onRun: () => void doctor.refetch(),
+					message: doctor.data ? (firstError?.message ?? null) : doctorError,
+					notes:
+						doctor.data?.diagnostics.filter((d) => d.level === "warning")
+							.length ?? 0,
+					onOpen: () => {
+						setDoctorOpen(true);
+						void doctor.refetch();
+					},
 				}
 			: null;
 
@@ -298,12 +306,27 @@ export const SectionProfiles: FC = () => {
 					open={seatsOpen}
 					seating={seating.data}
 					isPending={changeSeating.isPending}
-					onChange={(enabled, allowRdp) =>
+					preparing={
+						changeSeating.isPending &&
+						changeSeating.variables?.data.prepare === true
+					}
+					onChange={(enabled, allowRdp, prepare) =>
 						changeSeating.mutate({
-							data: { enabled, allow_rdp_from_network: allowRdp },
+							data: { enabled, allow_rdp_from_network: allowRdp, prepare },
 						})
 					}
 					onClose={() => setSeatsOpen(false)}
+				/>
+			)}
+			{seatHost && (
+				<DoctorDialog
+					open={doctorOpen}
+					doctor={doctor.data}
+					error={doctorError}
+					checking={doctor.isFetching}
+					docs={windows ? "windows-seats#troubleshooting" : "profiles#on-linux"}
+					onRecheck={() => void doctor.refetch()}
+					onClose={() => setDoctorOpen(false)}
 				/>
 			)}
 			<DoorDialog
