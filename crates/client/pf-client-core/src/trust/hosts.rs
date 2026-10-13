@@ -437,10 +437,8 @@ impl KnownHosts {
         minted
     }
 
-    pub fn save(&self) -> Result<()> {
-        self.save_at(&Self::path()?)
-    }
-
+    /// Only [`locked_at`](Self::locked_at) writes the store: a write outside the lock can
+    /// drop another process's edit.
     fn save_at(&self, p: &Path) -> Result<()> {
         std::fs::create_dir_all(p.parent().unwrap())?;
         // Temp+rename: losing this file to a torn write costs the user every pairing.
@@ -475,6 +473,16 @@ impl KnownHosts {
         })
     }
 
+    /// [`update`](Self::update) for an edit that may come to nothing: `None` from `f` (no
+    /// such record, nothing changed, a refusal) leaves the file alone.
+    pub fn update_if<R>(f: impl FnOnce(&mut KnownHosts) -> Option<R>) -> Result<Option<R>> {
+        Self::locked_at(&Self::path()?, |known| {
+            let minted = known.mint_missing_ids();
+            let r = f(known);
+            (minted || r.is_some(), r)
+        })
+    }
+
     /// The record pinned to `fp_hex`. An empty fingerprint is not a key — it would match
     /// every not-yet-paired placeholder, and the first one is never the one meant.
     pub fn find_by_fp(&self, fp_hex: &str) -> Option<&KnownHost> {
@@ -484,21 +492,16 @@ impl KnownHosts {
         self.hosts.iter().find(|h| h.fp_hex == fp_hex)
     }
 
-    /// Load, hand the record pinned to `fp_hex` to `f`, and save when `f` says it changed.
+    /// Hand the record pinned to `fp_hex` to `f`, and save when `f` says it changed.
     /// No-op, and no disk write, for an empty or unstored fingerprint.
     fn update_by_fp(fp_hex: &str, f: impl FnOnce(&mut KnownHost) -> bool) {
         if fp_hex.is_empty() {
             return;
         }
-        let mut known = Self::load();
-        if known
-            .hosts
-            .iter_mut()
-            .find(|h| h.fp_hex == fp_hex)
-            .is_some_and(f)
-        {
-            let _ = known.save();
-        }
+        let _ = Self::update_if(|known| {
+            let host = known.hosts.iter_mut().find(|h| h.fp_hex == fp_hex);
+            host.is_some_and(f).then_some(())
+        });
     }
 
     /// Index of the record an `addr:port` lookup resolves to (so mutators avoid a second
@@ -772,8 +775,9 @@ impl KnownHosts {
     }
 }
 
-/// Load-upsert-save: the pin every trust decision (TOFU, PIN, delegated, headless) ends in.
-/// `mac` is the wake MAC(s) the caller learned; empty keeps the saved ones.
+/// The pin every trust decision (TOFU, PIN, delegated, headless) ends in, upserted under
+/// the store's lock. `mac` is the wake MAC(s) the caller learned; empty keeps the saved ones.
+/// A failed save is returned: the callers say "Paired" the moment this comes back.
 pub fn persist_host(
     name: &str,
     addr: &str,
@@ -782,29 +786,29 @@ pub fn persist_host(
     paired: bool,
     mac: &[String],
 ) -> Result<()> {
-    let mut known = KnownHosts::load();
     // `..Default::default()` so user-set fields arrive uncarried; a literal would
     // reset them on re-pair. `upsert_trusted`: this is the authorised decision.
-    known.upsert_trusted(KnownHost {
-        name: name.to_string(),
-        addr: addr.to_string(),
-        port,
-        fp_hex: fp_hex.to_string(),
-        paired,
-        mac: mac.to_vec(),
-        ..Default::default()
-    });
-    // Returned, not swallowed: this is the door every trust decision walks through, and the
-    // callers say "Paired" the moment it comes back. A read-only config dir or a sandbox
-    // denial used to be announced as success and was gone by the next launch.
-    known.save()
+    KnownHosts::update(|known| {
+        known.upsert_trusted(KnownHost {
+            name: name.to_string(),
+            addr: addr.to_string(),
+            port,
+            fp_hex: fp_hex.to_string(),
+            paired,
+            mac: mac.to_vec(),
+            ..Default::default()
+        })
+    })
 }
 
-/// Load, [`KnownHosts::add`], save.
+/// [`KnownHosts::add`] under the store's lock, saved unless it refuses the edit.
 pub fn add_host(edit: &HostEdit) -> Result<()> {
-    let mut known = KnownHosts::load();
-    known.add(edit)?;
-    known.save()
+    let mut added = Ok(AddOutcome::Unchanged);
+    KnownHosts::update_if(|known| {
+        added = known.add(edit);
+        added.is_ok().then_some(())
+    })?;
+    added.map(drop)
 }
 
 /// Record an advert should land on: the one its caller matched, by pin, or the placeholder
@@ -866,9 +870,9 @@ fn apply_advert(
 /// and keep `advert_addr` as a place [`probe_known`](super::probe_known) asks. No-op, and
 /// no disk write, when nothing changed — call it on every discovery tick.
 ///
-/// [`KnownHosts::read`], not [`KnownHosts::load`]: `punktfunk discover` is not an
-/// id-minter (see the race on [`KnownHosts::read`]). Takes the fields rather than a
-/// `DiscoveredHost` because core and the WinUI shell each have their own type.
+/// Mints no record ids: `punktfunk discover` calls this, and hands none out. Takes the
+/// fields rather than a `DiscoveredHost` because core and the WinUI shell each have their
+/// own type.
 pub fn learn_from_advert(
     fp_hex: &str,
     addr: &str,
@@ -878,13 +882,14 @@ pub fn learn_from_advert(
     os: &str,
     mgmt_port: Option<u16>,
 ) {
-    let mut known = KnownHosts::read();
-    let Some(h) = learn_target(&mut known, fp_hex, addr, port) else {
+    let Ok(path) = KnownHosts::path() else {
         return;
     };
-    if apply_advert(h, advert_addr, mac, os, mgmt_port) {
-        let _ = known.save();
-    }
+    let _ = KnownHosts::locked_at(&path, |known| {
+        let learned = learn_target(known, fp_hex, addr, port)
+            .is_some_and(|h| apply_advert(h, advert_addr, mac, os, mgmt_port));
+        (learned, ())
+    });
 }
 
 /// Re-point a saved host at the address it now answers at, matched by fingerprint, keeping

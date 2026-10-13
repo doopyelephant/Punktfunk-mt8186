@@ -265,17 +265,17 @@ pub fn headless_set_host(selector: &str) -> glib::ExitCode {
     let Some(sel) = parse_selector(selector) else {
         return fail(format!("no usable port in {selector:?}"));
     };
-    let mut known = KnownHosts::load();
-    let Some(h) = known.hosts.iter_mut().find(|h| sel.matches(h)) else {
-        return fail(format!("no saved host matches {selector:?}"));
-    };
-    h.apply_edit(&edit);
-    let label = h.name.clone();
-    match known.save() {
-        Ok(()) => {
+    let saved = KnownHosts::update_if(|known| {
+        let h = known.hosts.iter_mut().find(|h| sel.matches(h))?;
+        h.apply_edit(&edit);
+        Some(h.name.clone())
+    });
+    match saved {
+        Ok(Some(label)) => {
             println!("updated {label}");
             glib::ExitCode::SUCCESS
         }
+        Ok(None) => fail(format!("no saved host matches {selector:?}")),
         Err(e) => fail(format!("{e:#}")),
     }
 }
@@ -291,7 +291,7 @@ pub fn headless_forget_host(selector: &str) -> glib::ExitCode {
         eprintln!("forget-host: no usable port in {selector:?}");
         return glib::ExitCode::FAILURE;
     };
-    let mut known = KnownHosts::load();
+    let known = KnownHosts::load();
     if let Selector::Addr(addr, port) = &sel {
         let pinned: Vec<&KnownHost> = known
             .hosts
@@ -310,16 +310,20 @@ pub fn headless_forget_host(selector: &str) -> glib::ExitCode {
             return glib::ExitCode::FAILURE;
         }
     }
-    let hits: Vec<usize> = (0..known.hosts.len())
-        .filter(|&i| sel.matches(&known.hosts[i]))
-        .collect();
-    for &i in hits.iter().rev() {
-        if let Err(e) = pf_client_core::orchestrate::forget_host(&mut known, i) {
-            eprintln!("forget-host: {e:#}");
-            return glib::ExitCode::FAILURE;
+    // One record per locked edit, last match first, until none is left.
+    let last_match = |now: &KnownHosts| now.hosts.iter().rposition(|h| sel.matches(h));
+    let mut forgot = 0;
+    loop {
+        match pf_client_core::orchestrate::forget_host(last_match) {
+            Ok(Some(_)) => forgot += 1,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("forget-host: {e:#}");
+                return glib::ExitCode::FAILURE;
+            }
         }
     }
-    println!("forgot {}", hits.len());
+    println!("forgot {forgot}");
     glib::ExitCode::SUCCESS
 }
 

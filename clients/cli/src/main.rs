@@ -364,14 +364,13 @@ from the config directory for a true factory reset."
     /// and only here: this reference is an argument the user typed in their own terminal, so
     /// there is nobody else to confirm it with. The guessable-reference rule exists for URLs
     /// handed to us by someone else; that path is `open`, which does ask.
-    fn resolve(reference: &str) -> Result<(KnownHosts, usize), u8> {
-        let known = KnownHosts::load();
+    fn resolve_in(known: &KnownHosts, reference: &str) -> Result<usize, u8> {
         let link = DeepLink {
             host_ref: reference.to_string(),
             ..Default::default()
         };
-        match deeplink::resolve_host(&link, &known) {
-            HostResolution::Known(i) | HostResolution::Confirm(i) => Ok((known, i)),
+        match deeplink::resolve_host(&link, known) {
+            HostResolution::Known(i) | HostResolution::Confirm(i) => Ok(i),
             HostResolution::Ambiguous => {
                 eprintln!(
                     "more than one saved host is called \"{reference}\" — use its address or id"
@@ -389,6 +388,13 @@ from the config directory for a true factory reset."
                 Err(UNRESOLVED)
             }
         }
+    }
+
+    /// [`resolve_in`] the store as it loads now, handed back with the index.
+    fn resolve(reference: &str) -> Result<(KnownHosts, usize), u8> {
+        let known = KnownHosts::load();
+        let i = resolve_in(&known, reference)?;
+        Ok((known, i))
     }
 
     /// The host a verb acts on: the `<host-ref>` it was given, else the default host.
@@ -806,8 +812,12 @@ from the config directory for a true factory reset."
                     fp: Some(fp),
                     ..Default::default()
                 };
-                let mut known = KnownHosts::load();
-                let line = match known.add(&edit) {
+                let mut added = Ok(AddOutcome::Unchanged);
+                let saved = KnownHosts::update_if(|known| {
+                    added = known.add(&edit);
+                    matches!(&added, Ok(o) if *o != AddOutcome::Unchanged).then_some(())
+                });
+                let line = match added {
                     // Exits 0: a panel retrying step 1 of request access finds a correct state.
                     Ok(AddOutcome::Unchanged) => {
                         eprintln!("{addr}:{port} is already saved");
@@ -821,8 +831,8 @@ from the config directory for a true factory reset."
                         return UNRESOLVED;
                     }
                 };
-                match known.save() {
-                    Ok(()) => {
+                match saved {
+                    Ok(_) => {
                         println!("{line}");
                         OK
                     }
@@ -837,15 +847,19 @@ from the config directory for a true factory reset."
                     eprintln!("usage: punktfunk hosts forget <host-ref>");
                     return UNRESOLVED;
                 };
-                let (mut known, i) = match resolve(&reference) {
-                    Ok(v) => v,
-                    Err(code) => return code,
+                // Resolved in the store as it is under its lock; a refusal keeps its code.
+                let mut refused = OK;
+                let pick = |now: &KnownHosts| {
+                    resolve_in(now, &reference)
+                        .map_err(|code| refused = code)
+                        .ok()
                 };
-                match orchestrate::forget_host(&mut known, i) {
-                    Ok(gone) => {
+                match orchestrate::forget_host(pick) {
+                    Ok(Some(gone)) => {
                         println!("forgot {}", gone.name);
                         OK
                     }
+                    Ok(None) => refused,
                     Err(e) => {
                         eprintln!("saving: {e:#}");
                         CONNECT_FAILED
@@ -1058,25 +1072,34 @@ from the config directory for a true factory reset."
             })
     }
 
+    /// Write `pick` as the saved profile of record `id`, in the store as it is under its
+    /// lock: the host is asked for its list between the read and this write. `false`, with
+    /// the reason on stderr, when the save fails.
+    fn save_pick(id: &Option<String>, pick: Option<profiles::ProfilePick>) -> bool {
+        let saved = KnownHosts::update(|now| {
+            if let Some(h) = now.hosts.iter_mut().find(|h| h.id == *id) {
+                h.profile = pick;
+            }
+        });
+        saved
+            .inspect_err(|e| eprintln!("save hosts: {e:#}"))
+            .is_ok()
+    }
+
     /// `profiles <host-ref>` — who plays on the host, and which of them this device plays as.
     fn profiles_cmd(args: &[String]) -> u8 {
         let usage = "punktfunk profiles <host-ref> [--json] [--pick PROFILE | --clear]";
-        let (mut known, i) = match resolve_or_default(args, usage) {
+        let (known, i) = match resolve_or_default(args, usage) {
             Ok(v) => v,
             Err(code) => return code,
         };
+        let id = &known.hosts[i].id;
         if has(args, "--clear") {
-            known.hosts[i].profile = None;
-            return match known.save() {
-                Ok(()) => {
-                    println!("cleared");
-                    OK
-                }
-                Err(e) => {
-                    eprintln!("save hosts: {e:#}");
-                    CONNECT_FAILED
-                }
-            };
+            if !save_pick(id, None) {
+                return CONNECT_FAILED;
+            }
+            println!("cleared");
+            return OK;
         }
         let listed = match list_profiles(&known.hosts[i]) {
             Ok(Some(listed)) => listed,
@@ -1091,17 +1114,11 @@ from the config directory for a true factory reset."
                 eprintln!("{} has no profile called \"{wanted}\"", known.hosts[i].name);
                 return UNRESOLVED;
             };
-            known.hosts[i].profile = Some(p.pick());
-            return match known.save() {
-                Ok(()) => {
-                    println!("{}\t{}", p.id, p.display_name);
-                    OK
-                }
-                Err(e) => {
-                    eprintln!("save hosts: {e:#}");
-                    CONNECT_FAILED
-                }
-            };
+            if !save_pick(id, Some(p.pick())) {
+                return CONNECT_FAILED;
+            }
+            println!("{}\t{}", p.id, p.display_name);
+            return OK;
         }
         let picked = known.hosts[i].profile.as_ref().map(|p| p.id.as_str());
         if has(args, "--json") {
@@ -1618,9 +1635,7 @@ from the config directory for a true factory reset."
             eprintln!("cancelled");
             return OK;
         }
-        let mut known = KnownHosts::load();
-        known.hosts.clear();
-        if let Err(e) = known.save() {
+        if let Err(e) = KnownHosts::update(|known| known.hosts.clear()) {
             eprintln!("couldn't forget the saved hosts: {e:#}");
             return CONNECT_FAILED;
         }

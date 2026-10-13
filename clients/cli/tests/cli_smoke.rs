@@ -157,6 +157,30 @@ fn forgetting_a_host_clears_its_default_and_cached_catalog() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Eight `hosts add` at once all land. Each is its own process, so only the store's file
+/// lock keeps one's read, edit and save from running inside another's.
+#[test]
+fn hosts_added_by_eight_processes_at_once_all_land() {
+    let store = std::env::temp_dir().join(format!("pf-cli-lock-{}", std::process::id()));
+    std::fs::create_dir_all(&store).expect("scratch config dir");
+    let adds: Vec<_> = (1..=8)
+        .map(|n| {
+            Command::new(env!("CARGO_BIN_EXE_punktfunk"))
+                .args(["hosts", "add", &format!("10.0.0.{n}")])
+                .env("PUNKTFUNK_CONFIG_DIR", &store)
+                .spawn()
+                .expect("run punktfunk")
+        })
+        .collect();
+    for mut add in adds {
+        assert!(add.wait().expect("wait for punktfunk").success());
+    }
+    let saved = std::fs::read_to_string(store.join("client-known-hosts.json")).expect("the store");
+    assert_eq!(saved.matches("\"addr\"").count(), 8, "{saved}");
+
+    std::fs::remove_dir_all(&store).ok();
+}
+
 #[test]
 fn version_prints_the_crate_version() {
     let out = punktfunk(&["--version"]);

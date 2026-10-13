@@ -7,7 +7,7 @@ use super::card::os_icon_name;
 use super::model::{Preset, Status};
 use super::{Act, HostRef, HostsMsg};
 use crate::store::{Changed, Store};
-use crate::trust::{HostEdit, KnownHost, KnownHosts};
+use crate::trust::{HostEdit, KnownHost};
 use adw::prelude::*;
 use pf_client_core::host_actions::ActionInfo;
 use pf_client_core::orchestrate::HostTarget;
@@ -746,13 +746,11 @@ fn remove_host(ctx: &Ctx, nav: &adw::NavigationView, anchor: &adw::ButtonRow) {
         "Remove",
         move || {
             // `forget_host` saves the hosts file and clears a default pointing at the host.
-            let mut known = KnownHosts::read();
             let host = ctx.host.borrow().clone();
-            if let Some(i) = host.index(&known) {
-                if let Err(e) = pf_client_core::orchestrate::forget_host(&mut known, i) {
-                    ctx.toast(format!("Couldn't remove the host \u{2014} {e:#}"));
-                    return;
-                }
+            let gone = pf_client_core::orchestrate::forget_host(|known| host.index(known));
+            if let Err(e) = gone {
+                ctx.toast(format!("Couldn't remove the host \u{2014} {e:#}"));
+                return;
             }
             ctx.store.reload(Changed::Hosts);
             ctx.store.reload(Changed::Settings);
