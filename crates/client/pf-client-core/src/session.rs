@@ -11,9 +11,8 @@
 
 use crate::audio;
 use crate::video::{DecodedFrame, DecodedImage, Decoder};
-use punktfunk_core::client::{ConnectParams, FrameOrder, NativeClient};
+use punktfunk_core::client::{ConnectParams, Decoded, NativeClient};
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
-use punktfunk_core::reanchor::{GateVerdict, ReanchorGate};
 use punktfunk_core::session::Frame;
 use punktfunk_core::PunktfunkError;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -925,37 +924,6 @@ fn hand_on(
     }
 }
 
-/// One keyframe ask per 100 ms, shared by every recovery site in the pump.
-#[derive(Default)]
-struct KeyframeAsk {
-    last: Option<Instant>,
-}
-
-impl KeyframeAsk {
-    const EVERY: Duration = Duration::from_millis(100);
-
-    /// Take the ask window at `now`. False while an ask from the last 100 ms holds it.
-    fn claim(&mut self, now: Instant) -> bool {
-        if self
-            .last
-            .is_some_and(|t| now.duration_since(t) < Self::EVERY)
-        {
-            return false;
-        }
-        self.last = Some(now);
-        true
-    }
-
-    /// [`Self::claim`], then ask the host for a keyframe when the window was open.
-    fn ask(&mut self, now: Instant, connector: &NativeClient) -> bool {
-        let open = self.claim(now);
-        if open {
-            let _ = connector.request_keyframe();
-        }
-        open
-    }
-}
-
 /// The session thread: dial, open the decoder and the plane threads, run [`Pump`] until
 /// the session ends, then send exactly one terminal event.
 fn pump(
@@ -1049,21 +1017,14 @@ fn pump(
             }
             parsed
         });
-    // Seeded with the current drop count so the first `poll` is not a loss.
-    let gate = ReanchorGate::new(connector.frames_dropped());
     let mut p = Pump {
         in_flight: None,
         // This is what the host sent. `PUNKTFUNK_AU_FAULT` injects one level down, so
         // a faulted run's fixture is the clean bitstream and will not replay the damage.
         au_dump: crate::au_dump::AuDump::from_env(connector.codec),
-        gate_arms: gate.arms(),
-        gate,
-        arm_decode_order: 0,
-        kf: KeyframeAsk::default(),
         notices: WindowNotices::default(),
         window_start: Instant::now(),
         total_frames: 0,
-        newest_decoded_idx: None,
         dec_path: "",
         codec_fallback: None,
         not_ready: false,
@@ -1074,7 +1035,6 @@ fn pump(
         decoder,
         wants_decode: connector.wants_decode_latency(),
         marks_repeats: connector.host_caps2() & punktfunk_core::quic::HOST_CAP2_REPEAT_MARK != 0,
-        all_intra: connector.codec == punktfunk_core::quic::CODEC_PYROWAVE,
         advertised_codecs,
         connector,
         mic,
@@ -1104,22 +1064,9 @@ struct Pump {
     in_flight: Option<InFlight>,
     /// Fixture capture of every AU as it reaches `decode_frame` (`au_dump.rs`).
     au_dump: Option<crate::au_dump::AuDump>,
-    /// Freeze-until-reanchor. Armed on any loss signal, withholds concealed frames
-    /// until a clean re-anchor. Owns the no-output streak and overdue-freeze backstop.
-    gate: ReanchorGate,
-    /// `gate.arms()` when `arm_decode_order` was last stamped.
-    gate_arms: u64,
-    /// Decode-order watermark at the latest freeze arm. A frame at or below this
-    /// was decoded before the loss; its recovery SEI must not lift that freeze.
-    /// Re-stamped when `gate.arms()` moves, not on the overdue backstop (that
-    /// re-asks without re-arming — discarding an in-flight heal would be wrong).
-    arm_decode_order: u64,
-    kf: KeyframeAsk,
     notices: WindowNotices,
     window_start: Instant,
     total_frames: u64,
-    /// Newest frame index handed to the decoder — the staleness bar for late partials.
-    newest_decoded_idx: Option<u32>,
     /// What actually decoded the last frame — VAAPI can demote mid-session.
     dec_path: &'static str,
     /// Set when the ladder ran out of rungs. `Some` is the only way the pump ends
@@ -1137,8 +1084,6 @@ struct Pump {
     wants_decode: bool,
     /// Host marks a re-encoded hold (`USER_FLAG_REPEAT`); an older host never sets the bit.
     marks_repeats: bool,
-    /// PyroWave AUs decode independently, so a late one is still worth showing.
-    all_intra: bool,
     advertised_codecs: u8,
     connector: Arc<NativeClient>,
     mic: MicControl,
@@ -1150,8 +1095,8 @@ struct Pump {
 
 impl Pump {
     /// Pull, decode and hand on frames until the session ends. `Some` is the reason the
-    /// user reads. Each pass ends with the host-timing drain, the loss check and the
-    /// 1-second window, unless its AU was dropped before decode.
+    /// user reads. Each pass ends with the host-timing drain and the 1-second window,
+    /// unless its AU was dropped before decode. Loss recovery ticks in core's own pump.
     fn run(&mut self) -> Option<String> {
         loop {
             if self.stop.load(Ordering::SeqCst) {
@@ -1169,7 +1114,7 @@ impl Pump {
                 hand_on(p, &self.frame_tx, &self.connector, self.wants_decode);
             }
             // Otherwise 20 ms: audio has its own thread, so this only bounds stop-flag
-            // responsiveness and the per-iteration recovery check.
+            // responsiveness.
             let frame_wait = if self.in_flight.is_some() {
                 Duration::from_micros(500)
             } else {
@@ -1191,20 +1136,6 @@ impl Pump {
 
             // Drain per-AU 0xCF timings; the connector matches each to its frame for the overlay.
             while self.connector.next_host_timing(Duration::ZERO).is_ok() {}
-
-            // Loss recovery + overdue backstop through the shared gate. A drop-count
-            // climb arms the freeze (decoder conceals and returns Ok). Overdue freeze
-            // re-asks while holding: never resume to gray. 100 ms throttle; infinite GOP
-            // means the only recovery keyframe is one we request.
-            let dropped = self.connector.frames_dropped();
-            let now = Instant::now();
-            if self.gate.poll(dropped, now) && self.kf.ask(now, &self.connector) {
-                tracing::debug!(
-                    dropped,
-                    "requested keyframe (loss recovery / overdue re-anchor)"
-                );
-            }
-            self.connector.flush_frame_recovery();
 
             if self.window_start.elapsed() >= Duration::from_secs(1) {
                 self.tick_window();
@@ -1263,57 +1194,8 @@ impl Pump {
         });
     }
 
-    /// Order one AU against the frames already decoded. False drops it before decode:
-    /// a straggler a reference codec would rewind on, or a partial a newer frame beat.
-    fn admit(&mut self, frame: &Frame) -> bool {
-        // Host numbers frames consecutively, so a jump means a frame is missing
-        // and this AU references a picture we never decoded. Arm the freeze at
-        // the first such frame — ~120 ms before `frames_dropped` — so concealment
-        // never reaches the screen. The connector asks for the RFI.
-        match self.connector.observe_frame_index(frame.frame_index) {
-            // Credited arm: the reassembler books these lost frames into
-            // `frames_dropped` up to ~120 ms from now; the credit keeps that
-            // climb from re-freezing a stream the RFI anchor healed. A gap that finds
-            // the ask window open spends it on the RFI; later gaps do not hold it shut.
-            FrameOrder::Gap(gap) => {
-                let now = Instant::now();
-                self.gate.arm_expecting_drops(now, u64::from(gap));
-                self.kf.claim(now);
-                tracing::trace!(
-                    gap,
-                    "frame gap — RFI recovery, holding last frame until re-anchor"
-                );
-            }
-            // A whole AU behind one already decoded: decoding it now rewinds the
-            // DPB (H.264 reads it as a frame_num wrap, HEVC's RPS unmarks the
-            // newer picture). PyroWave AUs decode independently, so it keeps them.
-            FrameOrder::Straggler if !self.all_intra => {
-                tracing::trace!(
-                    index = frame.frame_index,
-                    "skipping a straggler AU that arrived behind a decoded one"
-                );
-                return false;
-            }
-            FrameOrder::InOrder | FrameOrder::Straggler => {}
-        }
-        // A partial that lost the race (a newer frame already decoded) is time
-        // travel — skip it. Completes keep the normal path.
-        if !frame.complete
-            && self
-                .newest_decoded_idx
-                .is_some_and(|n: u32| n.wrapping_sub(frame.frame_index) <= u32::MAX / 2)
-        {
-            return false;
-        }
-        self.newest_decoded_idx = Some(match self.newest_decoded_idx {
-            Some(n) if frame.frame_index.wrapping_sub(n) > u32::MAX / 2 => n,
-            _ => frame.frame_index,
-        });
-        true
-    }
-
     /// One AU off the wire: order it, decode it, then demote or ask for a keyframe as
-    /// the decoder says. The gate watermark is re-stamped before the decode.
+    /// the decoder says.
     fn on_frame(&mut self, frame: Frame) -> Pass {
         // Reassembly completion, stamped by the core session as the AU crossed
         // `poll_frame`. Stamping here at the pull would fold pre-decode queue
@@ -1324,7 +1206,12 @@ impl Pump {
         } else {
             now_ns()
         };
-        if !self.admit(&frame) {
+        // A straggler a reference codec rewinds on, or a partial a newer frame beat, is
+        // dropped before decode; a gap arms the freeze and core asks for the range.
+        if !self
+            .connector
+            .recovery_on_frame(&frame, self.decoder.decode_order())
+        {
             return Pass::Skip;
         }
         if let Some(d) = self.au_dump.as_mut() {
@@ -1332,27 +1219,14 @@ impl Pump {
                 self.au_dump = None;
             }
         }
-        // Re-stamp the arm watermark before this AU decodes, so it names the
-        // newest picture that existed when the freeze was armed. Arms above
-        // happened this iteration; sites below run after decode.
-        if self.gate.arms() != self.gate_arms {
-            self.gate_arms = self.gate.arms();
-            self.arm_decode_order = self.decoder.decode_order();
-        }
         match self
             .decoder
             .decode_frame(&frame.data, frame.flags, frame.complete)
         {
             Ok(Some(image)) => self.on_decoded(image, &frame, received_ns),
             // No output under one-in/one-out LOW_DELAY means wedged on missing
-            // references with no reassembler drop. The gate counts the streak
-            // and, once it trips, arms the freeze and asks for an IDR.
-            Ok(None) => {
-                let now = Instant::now();
-                if self.gate.on_no_output(now) && self.kf.ask(now, &self.connector) {
-                    tracing::debug!("requested keyframe (decoder produced no output)");
-                }
-            }
+            // references with no reassembler drop. Three in a row ask for an IDR.
+            Ok(None) => self.connector.recovery_on_no_output(),
             Err(e) => {
                 // Last rung gone for this codec. Feeding more AUs would freeze the
                 // screen forever. End; the terminal event carries the retry.
@@ -1362,10 +1236,7 @@ impl Pump {
                 }
                 // Survivable (loss until the next IDR/RFI) — keep feeding.
                 tracing::debug!(error = %e, "decode error (recovering)");
-                let now = Instant::now();
-                if self.gate.on_no_output(now) && self.kf.ask(now, &self.connector) {
-                    tracing::debug!("requested keyframe (decode error recovery)");
-                }
+                self.connector.recovery_on_no_output();
             }
         }
         self.after_decode()
@@ -1388,18 +1259,10 @@ impl Pump {
                 });
             }
         }
-        // Infinite GOP has no periodic keyframe, so a rebuilt/erroring decoder
-        // stays gray until we ask. Arm only when not already holding: this flag
-        // fires per damaged AU, and every `arm` zeroes recovery-mark counts.
-        // A genuine new loss still re-arms via a frame-index gap or drop climb.
+        // Infinite GOP has no periodic keyframe, so a rebuilt or erroring decoder
+        // stays gray until we ask.
         if self.decoder.take_keyframe_request() {
-            let now = Instant::now();
-            if !self.gate.is_holding() {
-                self.gate.arm(now);
-            }
-            if self.kf.ask(now, &self.connector) {
-                tracing::debug!("requested keyframe (decoder recovery)");
-            }
+            let _ = self.connector.request_keyframe();
         }
         Pass::Drain
     }
@@ -1407,30 +1270,6 @@ impl Pump {
     /// A decoded picture: settle the freeze gate, then hand the previous frame in flight
     /// on before this one is handed on or queued.
     fn on_decoded(&mut self, image: DecodedImage, frame: &Frame, received_ns: u64) {
-        // Decoder's own re-anchor first: a recovery-point SEI is the
-        // only clean point an intra-refresh session has. Pair by decode
-        // order — a DPB flush after a failed AU hands back pictures
-        // decoded before the loss, which arrive after the arm.
-        let local = match image.decode_order() {
-            Some(order) if order <= self.arm_decode_order => {
-                tracing::trace!(
-                    order,
-                    arm_decode_order = self.arm_decode_order,
-                    "discarding the local recovery of a frame decoded before the loss"
-                );
-                punktfunk_core::reanchor::LocalRecovery::NONE
-            }
-            _ => image.local_recovery(),
-        };
-        if self.gate.on_local_recovery(local) {
-            self.decoder.forgive_unclean();
-            tracing::debug!("re-anchored on the stream's own recovery point SEI — no IDR needed");
-        }
-        // Shared freeze gate, corroborated: a frame predicting from a picture
-        // this decoder concealed is held whatever the wire says, and refuses a
-        // host RECOVERY_ANCHOR. If that arms an unfrozen gate (a lift landed
-        // before the damaged chain drained), ask for the IDR now rather than
-        // at the 500 ms backstop.
         let evidence = image.anchor_evidence();
         if evidence == punktfunk_core::reanchor::AnchorEvidence::ReferencesDamaged
             && frame.flags & punktfunk_core::packet::USER_FLAG_RECOVERY_ANCHOR != 0
@@ -1440,26 +1279,22 @@ impl Pump {
                  had to conceal — holding for a real IDR"
             );
         }
-        let now = Instant::now();
-        let was_holding = self.gate.is_holding();
-        let present =
-            self.gate
-                .on_decoded_corroborated(frame.flags, image.is_keyframe(), evidence, now)
-                == GateVerdict::Present;
-        // A wave lift: the planner's damaged-chain marks are stale from here,
-        // or every later host anchor is refused until an IDR.
-        if was_holding && present && self.gate.lifted_by_marks() {
+        let shown = self.connector.recovery_on_decoded(Decoded {
+            flags: frame.flags,
+            keyframe: image.is_keyframe(),
+            evidence,
+            local: image.local_recovery(),
+            decode_order: image.decode_order(),
+        });
+        // A heal by intra refresh: the planner's damaged-chain marks are stale from
+        // here, or every later host anchor is refused until an IDR.
+        if shown.forgive_chain {
             self.decoder.forgive_unclean();
             tracing::debug!(
-                "re-anchored on intra refresh marks — forgetting the damaged reference chain"
+                "re-anchored on the stream's own recovery marks — forgetting the damaged chain"
             );
         }
-        if !present && !was_holding {
-            tracing::debug!(
-                "damaged reference chain reached an unfrozen gate — holding, requesting keyframe"
-            );
-            self.kf.ask(now, &self.connector);
-        }
+        let present = !shown.hold;
         self.total_frames += 1;
         self.dec_path = image.path_label();
         if self.total_frames == 1 {
@@ -2071,20 +1906,6 @@ mod tests {
             Some((48_000, BITS_24))
         );
         assert_eq!(resolve_audio_format(Some("44100"), AUDIO_FORMAT_OPUS), None);
-    }
-
-    /// Every recovery site shares one window: a claim inside 100 ms of the last is refused.
-    #[test]
-    fn keyframe_asks_share_one_hundred_millisecond_window() {
-        let t0 = Instant::now();
-        let mut kf = KeyframeAsk::default();
-        assert!(kf.claim(t0), "the first ask goes out");
-        assert!(!kf.claim(t0 + Duration::from_millis(99)));
-        assert!(kf.claim(t0 + Duration::from_millis(100)));
-        assert!(
-            !kf.claim(t0 + Duration::from_millis(150)),
-            "the window restarts at the last granted ask"
-        );
     }
 
     #[test]

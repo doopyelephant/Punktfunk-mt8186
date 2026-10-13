@@ -424,10 +424,6 @@ impl RecoveryDriver {
         self.rfi.observe(index, now)
     }
 
-    pub(crate) fn flush(&mut self, now: Instant) -> RecoveryAsk {
-        self.rfi.flush(now)
-    }
-
     pub(crate) fn anchored(&mut self, index: u32) {
         self.rfi.anchored(index);
     }

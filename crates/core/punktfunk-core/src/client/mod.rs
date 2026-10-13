@@ -876,15 +876,6 @@ impl NativeClient {
         order
     }
 
-    /// Send the lost range a throttled gap deferred, once its window opens. A pump
-    /// that wakes between frames calls this each tick so the ask does not wait for
-    /// the next arrival; [`observe_frame_index`](Self::observe_frame_index) sends it
-    /// there too.
-    pub fn flush_frame_recovery(&self) {
-        let ask = self.shared.recovery.lock().unwrap().flush(Instant::now());
-        send_recovery(&self.shared, ask);
-    }
-
     /// One AU before decode, in receive order. `false`: drop it — a straggler a reference
     /// decoder rewinds on, or a partial a newer frame beat. A gap arms the freeze and asks
     /// for the lost range from here. `decode_order` is the decoder's count so far, the
