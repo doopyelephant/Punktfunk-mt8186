@@ -13,6 +13,9 @@
 //! Vulkan leaves `pending_loss` armed so frame-build can re-pick or force an IDR.
 //! Do not harmonize them here. NVENC's range policy is
 //! [`super::nvenc_core::plan_range_recovery`].
+//!
+//! [`plan_frame`] ranks what those candidates ask of one frame, for every backend. It takes
+//! them resolved and owns only the wave between frames, so the rule above holds.
 
 pub struct SlotPlan {
     /// Slots with `wire >= loss_first`. Persist the distrust in the backend marker:
@@ -237,6 +240,153 @@ pub fn wave_cycle(rows: u32, fps: u32, max_cycle: u32, pinned: Option<u32>) -> u
         .min(max_cycle)
         .max(2);
     rows.div_ceil(rows.div_ceil(wanted)).max(2)
+}
+
+/// What a frame predicts from. `Anchor` and `Acked` both ship `recovery_anchor`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameRef {
+    Idr,
+    /// A trusted picture older than the loss: the answer to an RFI.
+    Anchor,
+    /// The newest picture the client confirmed ([`crate::codec::Encoder::set_reference_floor`]).
+    Acked,
+    /// The previous picture.
+    Chain,
+}
+
+/// What a loss with no anchor does to a wave in flight. The mechanism decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MidWave {
+    /// The sweep restarts at the top: the backend places each stripe and keeps the dirty
+    /// state itself (Vulkan Video).
+    Restart,
+    /// The sweep runs out and a fresh one queues behind it: the driver ignores a re-force
+    /// mid-sweep (NVENC) or tracks each reference's refreshed rows itself (iHD).
+    Queue,
+}
+
+/// How one backend recovers, as data: [`plan_frame`] never asks which backend it serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryPolicy {
+    /// Frames per wave ([`wave_cycle`]). `None` while the session cannot wave.
+    pub cycle: Option<u32>,
+    pub mid_wave: MidWave,
+    /// An anchor or a confirmed reference abandons a wave in flight. `false` where the driver
+    /// sweeps on once asked (NVENC): the wave keeps the frame, an anchor's tag rides it and a
+    /// confirmed reference waits for the close.
+    pub abandons: bool,
+}
+
+/// What asks for the next frame. The backend resolves each candidate against its own slot
+/// table, range or mirror; [`plan_frame`] ranks them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pending {
+    /// An IDR is owed: the first frame, a keyframe request, a rebuild.
+    pub idr: bool,
+    /// A loss has an anchor.
+    pub anchor: bool,
+    /// The encoder holds confirmed references and one is resident.
+    pub acked: bool,
+    /// A loss is armed and unanswered: the backend resolves it at frame-build (Vulkan Video).
+    /// A backend that answers at the report calls [`Recovery::lose`] there instead.
+    pub loss: bool,
+}
+
+/// The wave between two frames.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Recovery {
+    pub wave: Option<Wave>,
+    /// A loss landed inside the sweep: its close ships unmarked and stays dirty.
+    pub spoiled: bool,
+    /// A fresh wave starts on the frame after the close.
+    pub queued: bool,
+}
+
+impl Recovery {
+    /// A loss no anchor answers: start a wave, or do to the one in flight what [`MidWave`]
+    /// says. `spoils` is [`Wave::spoiled_by`], or `true` where the backend cannot tell.
+    /// `None`: the session cannot wave, and the caller keyframes.
+    pub fn lose(self, policy: &RecoveryPolicy, spoils: bool) -> Option<Recovery> {
+        let cycle = policy.cycle?;
+        Some(match (self.wave, policy.mid_wave) {
+            (Some(_), MidWave::Queue) => Recovery {
+                spoiled: self.spoiled || spoils,
+                queued: true,
+                ..self
+            },
+            _ => Recovery {
+                wave: Some(Wave::start(cycle)),
+                ..Recovery::default()
+            },
+        })
+    }
+}
+
+/// One frame's recovery, decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FramePlan {
+    pub refs: FrameRef,
+    /// This frame's place in a wave; `None` outside one.
+    pub wave: Option<Wave>,
+    pub mark: WaveMark,
+    /// The picture is part dirty: never an RFI anchor.
+    pub dirty: bool,
+    /// The state for the frame after this one.
+    pub next: Recovery,
+}
+
+/// Which request wins the next frame: an IDR, then a loss's anchor, then a confirmed
+/// reference, then the wave. An IDR drops every other ask and the wave with it. An anchor
+/// or a confirmed reference is clean on its own, so it abandons a wave in flight unless the
+/// driver sweeps on ([`RecoveryPolicy::abandons`]). An armed loss with no answer starts a
+/// wave, or takes the IDR where the session has none.
+pub fn plan_frame(state: Recovery, pending: Pending, policy: &RecoveryPolicy) -> FramePlan {
+    let clean = |refs| FramePlan {
+        refs,
+        wave: None,
+        mark: WaveMark::None,
+        dirty: false,
+        next: Recovery::default(),
+    };
+    if pending.idr {
+        return clean(FrameRef::Idr);
+    }
+    let lone = state.wave.is_none() || policy.abandons;
+    if pending.anchor && lone {
+        return clean(FrameRef::Anchor);
+    }
+    if pending.acked && lone {
+        return clean(FrameRef::Acked);
+    }
+    let state = match pending.loss.then(|| state.lose(policy, false)) {
+        Some(None) => return clean(FrameRef::Idr),
+        Some(Some(waving)) => waving,
+        None => state,
+    };
+    let Some(wave) = state.wave else {
+        return clean(FrameRef::Chain);
+    };
+    let mut next = Recovery {
+        wave: wave.next(),
+        ..state
+    };
+    if next.wave.is_none() {
+        next.spoiled = false;
+        if std::mem::take(&mut next.queued) {
+            next.wave = Some(Wave::start(wave.cycle));
+        }
+    }
+    FramePlan {
+        refs: if pending.anchor {
+            FrameRef::Anchor
+        } else {
+            FrameRef::Chain
+        },
+        wave: Some(wave),
+        mark: wave.mark(state.spoiled),
+        dirty: !wave.closes() || state.spoiled,
+        next,
+    }
 }
 
 /// `PUNKTFUNK_INTRA_REFRESH=0` keeps the IDR on every backend. The same knob at `1` opts the
