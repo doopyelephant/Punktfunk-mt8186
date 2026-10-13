@@ -25,10 +25,17 @@ pub(super) fn topology_action(client: Option<[u8; 32]>) -> crate::policy::Topolo
     let configured = crate::policy::prefs()
         .configured_effective()
         .map(|_| crate::effective_topology(client));
-    resolve_topology_action(
-        configured,
-        pf_host_config::env_on("PUNKTFUNK_NO_ISOLATE") == Some(true),
-    )
+    resolve_topology_action(configured, no_isolate())
+}
+
+/// What an unconfigured host applies. [`crate::effective_topology`] answers with it, so a
+/// readout names the topology the manager uses.
+pub(crate) fn unconfigured_topology() -> crate::policy::Topology {
+    resolve_topology_action(None, no_isolate())
+}
+
+fn no_isolate() -> bool {
+    pf_host_config::env_on("PUNKTFUNK_NO_ISOLATE") == Some(true)
 }
 
 /// Unconfigured host: `PUNKTFUNK_NO_ISOLATE` → `Extend`, else `Exclusive`.

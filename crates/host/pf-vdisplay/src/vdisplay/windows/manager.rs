@@ -48,6 +48,7 @@ pub use instance::claim_instance_eagerly;
 
 #[path = "manager/knobs.rs"]
 mod knobs;
+pub(crate) use knobs::unconfigured_topology;
 use knobs::{linger_for, topology_action};
 
 /// One live virtual monitor, owned by manager state (not by a session).
