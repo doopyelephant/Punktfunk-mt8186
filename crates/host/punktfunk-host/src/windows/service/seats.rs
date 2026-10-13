@@ -48,11 +48,15 @@ impl SeatsSlot {
             tracing::error!("seat supervisor thread did not start: {error}");
         }
         // Windows takes about a minute to answer the first role query after a restart. Asked
-        // here, the Seats dialog an operator opens after signing in is answered at once.
+        // here, the Seats dialog an operator opens after signing in is answered at once. First
+        // the firewall: a rule Windows added since must not open Remote Desktop to the network.
         let warm = backend.clone();
         let _ = std::thread::Builder::new()
             .name("seats-checks".into())
-            .spawn(move || drop(pf_seats::backend::PlatformBackend::seating(&warm)));
+            .spawn(move || {
+                warm.keep_rdp_local();
+                drop(pf_seats::backend::PlatformBackend::seating(&warm));
+            });
         SeatsSlot {
             stop,
             backend: Some(backend),

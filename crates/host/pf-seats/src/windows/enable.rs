@@ -32,6 +32,11 @@ const RDP_FROM_NETWORK: &str = "AllowRdpFromNetwork";
 const RDP_RULES_OPENED: &str = "RdpRulesOpened";
 /// The `Remote Desktop` firewall group by the resource id every Windows language shares.
 const RDP_RULE_GROUP: &str = "@FirewallAPI.dll,-28752";
+/// `Remote Desktop Services`, the Session Host role's group, and its two rules on the
+/// listener's port. The group's other rules manage the role and stay as they are.
+const RDS_RULE_GROUP: &str = "@FirewallAPI.dll,-28791";
+const RDS_LISTENER_RULES: &str =
+    "'RemoteDesktopServices-UserMode-In-TCP','RemoteDesktopServices-UserMode-In-UDP'";
 const LOOPBACK: &str = "127.0.0.0/8";
 /// The seats package, with the driver binary its INF lists, in `{app}\staging\pfvdisplay`.
 const PACKAGE: [&str; 3] = [
@@ -252,37 +257,56 @@ pub(super) fn rdp_from_network() -> bool {
 const FIREWALL_RULES: &str =
     r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules";
 
-/// The listener is on and a `Remote Desktop` rule lets any address reach it. Read from the
-/// registry: the dialog asks every time it opens, and PowerShell's firewall cmdlets take
-/// seconds, a minute after a restart.
+/// The listener is on and a firewall rule lets any address reach it.
 fn rdp_open_today() -> bool {
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let listening = hklm
+    let listening = RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(TERMINAL_SERVER_KEY, KEY_READ | KEY_WOW64_64KEY)
         .and_then(|key| key.get_value::<u32, _>(LISTENER_DENIED))
         .is_ok_and(|denied| denied == 0);
-    listening
-        && hklm
-            .open_subkey_with_flags(FIREWALL_RULES, KEY_READ | KEY_WOW64_64KEY)
-            .is_ok_and(|rules| {
-                let names: Vec<String> = rules
-                    .enum_values()
-                    .flatten()
-                    .map(|(name, _)| name)
-                    .collect();
-                names
-                    .iter()
-                    .filter_map(|name| rules.get_value::<String, _>(name).ok())
-                    .any(|rule| open_rdp_rule(&rule))
-            })
+    listening && rdp_rule_open()
 }
 
-/// An enabled inbound rule of the `Remote Desktop` group on the listener's port, with no
+/// A local firewall rule lets any address reach Remote Desktop. Read from the registry: the
+/// dialog asks every time it opens, and PowerShell's firewall cmdlets take seconds, a minute
+/// after a restart.
+fn rdp_rule_open() -> bool {
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(FIREWALL_RULES, KEY_READ | KEY_WOW64_64KEY)
+        .is_ok_and(|rules| {
+            let names: Vec<String> = rules
+                .enum_values()
+                .flatten()
+                .map(|(name, _)| name)
+                .collect();
+            names
+                .iter()
+                .filter_map(|name| rules.get_value::<String, _>(name).ok())
+                .any(|rule| open_rdp_rule(&rule))
+        })
+}
+
+/// Narrow Remote Desktop again where the operator keeps it on this PC and a rule is open to
+/// the network: the Session Host role and Windows updates add rules of their own.
+pub(super) fn keep_rdp_local() {
+    let narrowed = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(SEATS_KEY, KEY_READ | KEY_WOW64_64KEY)
+        .is_ok_and(|seats| seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok() == Some(0));
+    if narrowed && rdp_rule_open() {
+        match firewall_scope(LOOPBACK) {
+            Ok(()) => tracing::info!("remote desktop narrowed to this pc again"),
+            Err(cause) => tracing::warn!(%cause, "remote desktop not narrowed to this pc"),
+        }
+    }
+}
+
+/// An enabled inbound rule of either Remote Desktop group on the listener's port, with no
 /// remote address named: `RA4=`/`RA6=` fields are how a rule limits who may connect.
 fn open_rdp_rule(rule: &str) -> bool {
     let fields: Vec<&str> = rule.split('|').collect();
     let has = |field: &str| fields.iter().any(|f| f.eq_ignore_ascii_case(field));
-    has(&format!("EmbedCtxt={RDP_RULE_GROUP}"))
+    [RDP_RULE_GROUP, RDS_RULE_GROUP]
+        .iter()
+        .any(|group| has(&format!("EmbedCtxt={group}")))
         && has("Active=TRUE")
         && has("Dir=In")
         && has("LPort=3389")
@@ -553,10 +577,14 @@ fn deny_listener(deny: bool) -> std::io::Result<()> {
         .set_value(LISTENER_DENIED, &u32::from(deny))
 }
 
-/// Scope the `Remote Desktop` rule group to `remote`: an address range or `Any`.
+/// Scope the `Remote Desktop` rule group to `remote`: an address range or `Any`. The Session
+/// Host role's listener rules go first, where a machine has them: the last statement sets the
+/// exit code, and a lookup that finds no rule fails it.
 fn firewall_scope(remote: &str) -> Result<(), String> {
     let script = format!(
         "$ErrorActionPreference='Stop'; \
+         Get-NetFirewallRule -Name {RDS_LISTENER_RULES} -ErrorAction SilentlyContinue | \
+         Set-NetFirewallRule -RemoteAddress {remote}; \
          Set-NetFirewallRule -Group '{RDP_RULE_GROUP}' -RemoteAddress {remote}"
     );
     match run(POWERSHELL, &powershell_args(&script)) {
@@ -795,6 +823,11 @@ mod tests {
         assert!(open_rdp_rule(&rule("TRUE", "")));
         assert!(!open_rdp_rule(&rule("FALSE", "")));
         assert!(!open_rdp_rule(&rule("TRUE", "RA4=127.0.0.0/255.0.0.0|")));
+        // The Session Host role's rule opens the same port from its own group.
+        assert!(open_rdp_rule(
+            "v2.33|Action=Allow|Active=TRUE|Dir=In|Protocol=6|LPort=3389|Svc=termservice|\
+             Name=@FirewallAPI.dll,-28805|EmbedCtxt=@FirewallAPI.dll,-28791|"
+        ));
         // The shadow rule names no port, and the web-socket rules sit in another group.
         assert!(!open_rdp_rule(
             "v2.33|Action=Allow|Active=TRUE|Dir=In|Protocol=6|App=RdpSa.exe|\

@@ -143,6 +143,12 @@ impl WindowsBackend {
         self.supervisor.stop_all();
     }
 
+    /// Narrows Remote Desktop to this PC again where the operator chose that and a firewall
+    /// rule has opened it since. For the service's start.
+    pub fn keep_rdp_local(&self) {
+        enable::keep_rdp_local();
+    }
+
     fn ensure_runtime_prerequisites(&self) -> WinResult<()> {
         require_local_system()?;
         if !seats_enabled() {
