@@ -1,6 +1,6 @@
 ---
 title: Seats on Windows
-description: Let several people play on one Windows PC at once, each on a desktop of their own — what it needs, how to set it up, and what to do when a seat won't start.
+description: Let several people play on one Windows Server PC at once, each on a desktop of their own — what it needs, how to set it up from a fresh install, and what to do when a seat won't start.
 ---
 
 A seat gives a [profile](/docs/profiles) a Windows desktop of its own, so two to four people can
@@ -10,14 +10,28 @@ play on one PC at the same time, each with their own games, Steam and saves.
 
 | | |
 |---|---|
-| Windows | **Windows Server 2025** or newer. Windows 10 and 11 run one desktop at a time. |
+| Windows | **Windows Server 2025** or newer, installed with Desktop Experience. Windows 10 and 11 run one desktop at a time. |
+| Visual C++ runtime | The [Visual C++ Redistributable (x64)](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist). A fresh Windows Server lacks it, and setup doesn't start without it. |
+| Graphics card | One that encodes video, as for any host, with its driver installed. All seats share it. |
 | Remote Desktop | The **Remote Desktop Session Host** role with a licensing mode. **Set up Remote Desktop** below installs both. |
-| Licences | A Remote Desktop Services CAL per seat. Windows gives a 120-day grace period without one. |
-| Graphics card | One that encodes video, as for any host. All seats share it. |
-| Steam | Installed in its usual folder, `C:\Program Files (x86)\Steam`, if seats should play Steam games. |
+| Licences | A Remote Desktop Services CAL for every player: [Microsoft's rules](https://learn.microsoft.com/windows-server/remote/remote-desktop-services/rds-client-access-license). Windows runs 120 days without a licence server. After that, seats sign in only with CALs from [one](https://learn.microsoft.com/windows-server/remote/remote-desktop-services/rds-activate-license-server). |
+| Steam | Installed in its usual folder, `C:\Program Files (x86)\Steam`, and opened once. Seats get their sound from it, and their Steam games. |
 
 Each seat is a Windows account of its own, `pf_seat1` to `pf_seat4`, made and managed by punktfunk.
 Nobody signs in to those accounts by hand.
+
+## Prepare Windows Server
+
+A fresh Windows Server needs four things before the host goes on:
+
+1. Install your graphics card's driver. Until then Windows lists **Microsoft Basic Display
+   Adapter**, and seats find no graphics card.
+2. Install the Visual C++ Redistributable (x64).
+3. Set the network to **Private**. A fresh Server calls its network Public, and then no other
+   computer reaches the host or its console:
+   [No client can reach a Windows host](/docs/troubleshooting#windows-firewall).
+4. Install Steam, open it once and wait for its sign-in window. That first start installs the audio
+   drivers seats play sound through. Nobody has to sign in.
 
 ## Set up seats
 
@@ -77,6 +91,22 @@ that starts the PC's Steam and closes the other one.
 first and then one group per seat, each with the next move. A seat's own log is
 `C:\ProgramData\punktfunk\seats\hosts\<seat id>\host.log`, readable by Administrators.
 
+### Setup doesn't start, and Windows says VCRUNTIME140.dll was not found
+
+A fresh Windows Server lacks the Visual C++ runtime. Install the
+[Visual C++ Redistributable (x64)](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist),
+then run setup again.
+
+### The console doesn't open from another computer
+
+Windows marks the server's network Public, where the host's firewall rules don't apply.
+[Set it to Private](/docs/troubleshooting#windows-firewall).
+
+### No graphics card was found
+
+The card's driver isn't installed, so Windows runs it as **Microsoft Basic Display Adapter**.
+Install the driver from the card's maker.
+
 ### Remote Desktop Session Host isn't installed
 
 Press **Set up Remote Desktop** under **Profiles** → **Seats**. Installing **Remote Desktop
@@ -104,8 +134,8 @@ icon on the desktop or in the Start menu, or from punktfunk's library.
 
 ### A seat has no sound
 
-Seats play sound through Steam's streaming audio driver. Install Steam, then stop and start the
-seat.
+Steam's audio drivers aren't on this PC: Steam is missing, or was installed and never opened.
+Install Steam, open it once, then restart the PC.
 
 ### Seats stream without a picture
 

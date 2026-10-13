@@ -238,9 +238,9 @@ warns when our driver date isn't newer than `rdpidd.inf`'s, and on a client edit
 A seat usually has no sound card, so the host mints a render endpoint per seat by binding Valve's
 Remote Play streaming drivers. `SteamStreamingSpeakers.inf` and `SteamStreamingMicrophone.inf` must
 be bound to a device already, or sit in
-`%CommonProgramFiles(x86)%\Steam\drivers\Windows10\<x64|arm64>\`. Steam never has to run. Without
-them a seat streams video with no audio. Pad audio needs neither: it comes from the seat
-listener.
+`%CommonProgramFiles(x86)%\Steam\drivers\Windows10\<x64|arm64>\`. Steam's first start puts them
+there; its installer alone doesn't, and after that start Steam never has to run. Without them a
+seat streams video with no audio. Pad audio needs neither: it comes from the seat listener.
 
 ```
 powershell -File check-seat-audio.ps1
