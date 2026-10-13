@@ -1,0 +1,371 @@
+//! Recording [`VirtualDisplay`] for tests.
+//!
+//! A [`FakeDisplay`] plays a [`Script`] and logs a [`Call`] for every `&mut self` trait call,
+//! in order. `&self` getters answer from the script and are not logged. A dropped keepalive,
+//! a run topology restore and a closed session cast log too, so teardown order reads off the
+//! same list.
+//!
+//! Setters log and change nothing: only [`FakeDisplay::script`] changes an answer. Clones
+//! share one log and one script, so box one for the code under test and keep the other.
+//!
+//! Pin the contract with the tests below.
+
+use std::sync::{Arc, Mutex};
+
+use anyhow::Result;
+
+use crate::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
+
+/// One logged event of a [`FakeDisplay`]. The first group is the trait call of that name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Call {
+    Create(Mode),
+    SetSessionCastHandoff(bool),
+    SessionCastFor(String),
+    JoinCast(String, u32),
+    SetLaunchCommand(Option<String>),
+    SetGamescopeRoute(Option<crate::GamescopeRoute>),
+    SetSessionIsolation(Option<crate::SessionIsolation>),
+    SetClientIdentity(Option<[u8; 32]>),
+    SetJoinLive(bool),
+    SetQuitFlag,
+    SetClientHdr(Option<pf_frame::HdrMeta>),
+    SetHdr(bool),
+    SetHwCursor(bool),
+    ApplyPosition(i32, i32),
+    TakeTopologyRestore,
+    SetFirstInGroup(bool),
+    KeptDisplayAlive(u32),
+    ResizeKept(Option<String>, Mode),
+    /// The keepalive of the create that returned this node dropped.
+    KeepaliveDropped(u32),
+    /// The topology restore the create of this node prepared ran.
+    RestoreRan(u32),
+    /// The session cast with this node closed.
+    CastClosed(u32),
+    /// A test's own marker ([`FakeDisplay::log`]).
+    Note(String),
+}
+
+/// What a [`FakeDisplay`] answers. [`FakeDisplay::script`] edits it between calls.
+pub(crate) struct Script {
+    /// `create` fails with this message. `None` creates node 1, 2, … in order.
+    pub(crate) fail_create: Option<&'static str>,
+    /// Ownership a created output reports.
+    pub(crate) ownership: DisplayOwnership,
+    /// `poolable_now`. Nothing ties it to `ownership`, as on a real backend.
+    pub(crate) poolable: bool,
+    /// A successful create prepares a topology restore for `take_topology_restore`.
+    pub(crate) restore: bool,
+    /// `isolation_key`.
+    pub(crate) isolation: Option<String>,
+    /// `sole_instance`.
+    pub(crate) sole_instance: bool,
+    /// `kept_display_alive`.
+    pub(crate) alive: bool,
+    /// `can_resize_kept`.
+    pub(crate) can_resize: bool,
+    /// `resize_kept`.
+    pub(crate) resizes: bool,
+    /// A created output's `output_name`. With one, `session_cast_for` returns a cast on node
+    /// 1001, 1002, … in order.
+    pub(crate) output_name: Option<&'static str>,
+}
+
+struct Shared {
+    script: Script,
+    calls: Vec<Call>,
+    nodes: u32,
+    casts: u32,
+    restore: Option<Box<dyn FnOnce() + Send>>,
+}
+
+/// Logs its call when dropped: a keepalive or a cast, whose end a test orders.
+struct OnDrop(FakeDisplay, Call);
+
+impl Drop for OnDrop {
+    fn drop(&mut self) {
+        self.0.log(self.1.clone());
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FakeDisplay {
+    name: &'static str,
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl FakeDisplay {
+    /// A backend called `name` that creates owned, poolable, live displays and prepares no
+    /// topology restore.
+    pub(crate) fn new(name: &'static str) -> FakeDisplay {
+        FakeDisplay {
+            name,
+            shared: Arc::new(Mutex::new(Shared {
+                script: Script {
+                    fail_create: None,
+                    ownership: DisplayOwnership::Owned,
+                    poolable: true,
+                    restore: false,
+                    isolation: None,
+                    sole_instance: false,
+                    alive: true,
+                    can_resize: false,
+                    resizes: false,
+                    output_name: None,
+                },
+                calls: Vec::new(),
+                nodes: 0,
+                casts: 0,
+                restore: None,
+            })),
+        }
+    }
+
+    /// A clone as the boxed trait object the registry takes.
+    pub(crate) fn boxed(&self) -> Box<dyn VirtualDisplay> {
+        Box::new(self.clone())
+    }
+
+    pub(crate) fn script(&self, edit: impl FnOnce(&mut Script)) {
+        edit(&mut self.shared().script);
+    }
+
+    /// The log so far.
+    pub(crate) fn calls(&self) -> Vec<Call> {
+        self.shared().calls.clone()
+    }
+
+    /// The log so far, emptied: each step of a test asserts only its own calls.
+    pub(crate) fn take_calls(&self) -> Vec<Call> {
+        std::mem::take(&mut self.shared().calls)
+    }
+
+    /// Append to the log. A test's own marker is a [`Call::Note`], in order with the calls.
+    pub(crate) fn log(&self, call: Call) {
+        self.shared().calls.push(call);
+    }
+
+    fn shared(&self) -> std::sync::MutexGuard<'_, Shared> {
+        self.shared.lock().unwrap()
+    }
+
+    fn answer<T>(&self, read: impl FnOnce(&Script) -> T) -> T {
+        read(&self.shared().script)
+    }
+}
+
+impl VirtualDisplay for FakeDisplay {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
+        let mut s = self.shared();
+        s.calls.push(Call::Create(mode));
+        if let Some(why) = s.script.fail_create {
+            anyhow::bail!("{why}");
+        }
+        s.nodes += 1;
+        let node = s.nodes;
+        if s.script.restore {
+            let fake = self.clone();
+            s.restore = Some(Box::new(move || fake.log(Call::RestoreRan(node))));
+        }
+        let mut out = VirtualOutput::owned(
+            node,
+            Some((mode.width, mode.height, mode.refresh_hz)),
+            Box::new(OnDrop(self.clone(), Call::KeepaliveDropped(node))),
+        );
+        out.ownership = s.script.ownership;
+        #[cfg(target_os = "linux")]
+        {
+            out.output_name = s.script.output_name.map(str::to_string);
+        }
+        Ok(out)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_session_cast_handoff(&mut self, enabled: bool) {
+        self.log(Call::SetSessionCastHandoff(enabled));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn session_cast_for(&mut self, name: &str) -> Result<Option<crate::SessionCastParts>> {
+        let mut s = self.shared();
+        s.calls.push(Call::SessionCastFor(name.to_string()));
+        if s.script.output_name.is_none() {
+            return Ok(None);
+        }
+        s.casts += 1;
+        let node = 1000 + s.casts;
+        let closed = OnDrop(self.clone(), Call::CastClosed(node));
+        Ok(Some((node, None, Box::new(closed))))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn join_cast(&mut self, name: &str, node_id: u32) -> Result<Option<crate::SessionCastParts>> {
+        self.log(Call::JoinCast(name.to_string(), node_id));
+        Ok(None)
+    }
+
+    fn set_launch_command(&mut self, cmd: Option<String>) {
+        self.log(Call::SetLaunchCommand(cmd));
+    }
+
+    fn set_gamescope_route(&mut self, route: Option<crate::GamescopeRoute>) {
+        self.log(Call::SetGamescopeRoute(route));
+    }
+
+    fn set_session_isolation(&mut self, iso: Option<crate::SessionIsolation>) {
+        self.log(Call::SetSessionIsolation(iso));
+    }
+
+    fn isolation_key(&self) -> Option<String> {
+        self.answer(|s| s.isolation.clone())
+    }
+
+    fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
+        self.log(Call::SetClientIdentity(fingerprint));
+    }
+
+    fn set_join_live(&mut self, on: bool) {
+        self.log(Call::SetJoinLive(on));
+    }
+
+    fn set_quit_flag(&mut self, _quit: Arc<std::sync::atomic::AtomicBool>) {
+        self.log(Call::SetQuitFlag);
+    }
+
+    fn set_client_hdr(&mut self, hdr: Option<pf_frame::HdrMeta>) {
+        self.log(Call::SetClientHdr(hdr));
+    }
+
+    fn set_hdr(&mut self, on: bool) {
+        self.log(Call::SetHdr(on));
+    }
+
+    fn set_hw_cursor(&mut self, on: bool) {
+        self.log(Call::SetHwCursor(on));
+    }
+
+    fn apply_position(&mut self, x: i32, y: i32) {
+        self.log(Call::ApplyPosition(x, y));
+    }
+
+    fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        let mut s = self.shared();
+        s.calls.push(Call::TakeTopologyRestore);
+        s.restore.take()
+    }
+
+    fn set_first_in_group(&mut self, first: bool) {
+        self.log(Call::SetFirstInGroup(first));
+    }
+
+    fn poolable_now(&self) -> bool {
+        self.answer(|s| s.poolable)
+    }
+
+    fn sole_instance(&self) -> bool {
+        self.answer(|s| s.sole_instance)
+    }
+
+    fn kept_display_alive(&mut self, node_id: u32) -> bool {
+        self.log(Call::KeptDisplayAlive(node_id));
+        self.answer(|s| s.alive)
+    }
+
+    fn can_resize_kept(&self) -> bool {
+        self.answer(|s| s.can_resize)
+    }
+
+    fn resize_kept(&mut self, seat: Option<&str>, mode: Mode) -> bool {
+        self.log(Call::ResizeKept(seat.map(str::to_string), mode));
+        self.answer(|s| s.resizes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MODE: Mode = Mode {
+        width: 1920,
+        height: 1080,
+        refresh_hz: 60,
+    };
+
+    #[test]
+    fn a_fake_logs_each_call_in_order_and_plays_its_script() {
+        let fake = FakeDisplay::new("fake");
+        fake.script(|s| s.restore = true);
+        let mut vd = fake.boxed();
+        let out = vd.create(MODE).expect("scripted to succeed");
+        assert_eq!(
+            (vd.name(), out.node_id, out.ownership),
+            ("fake", 1, DisplayOwnership::Owned)
+        );
+        vd.take_topology_restore().expect("scripted to prepare one")();
+        assert!(vd.take_topology_restore().is_none(), "taken once");
+        drop(out);
+        fake.log(Call::Note("torn down".into()));
+        fake.script(|s| s.fail_create = Some("no output for you"));
+        let err = vd.create(MODE).err().expect("scripted to fail");
+        assert_eq!(err.to_string(), "no output for you");
+        assert_eq!(
+            fake.take_calls(),
+            [
+                Call::Create(MODE),
+                Call::TakeTopologyRestore,
+                Call::RestoreRan(1),
+                Call::TakeTopologyRestore,
+                Call::KeepaliveDropped(1),
+                Call::Note("torn down".into()),
+                Call::Create(MODE),
+            ]
+        );
+        assert!(fake.calls().is_empty(), "take_calls empties the log");
+    }
+
+    /// A setter `SessionParams::apply` forgot would leave a session on another one's value.
+    #[test]
+    fn session_params_reach_every_setter_once() {
+        let iso = crate::SessionIsolation {
+            id: "cafe0123".into(),
+            ei_relay: "/run/pf-ei".into(),
+            sink: None,
+            mic_source: None,
+            steam_home: None,
+        };
+        let params = crate::SessionParams {
+            client_fp: Some([7; 32]),
+            client_hdr: Some(pf_frame::HdrMeta::default()),
+            hdr: true,
+            hw_cursor: true,
+            join_live: true,
+            quit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            launch: Some("steam".into()),
+            route: Some(crate::GamescopeRoute::Spawn),
+            isolation: Some(iso.clone()),
+        };
+        let fake = FakeDisplay::new("fake");
+        params.apply(&mut *fake.boxed());
+        let calls = fake.take_calls();
+        let want = [
+            Call::SetClientIdentity(Some([7; 32])),
+            Call::SetJoinLive(true),
+            Call::SetClientHdr(Some(pf_frame::HdrMeta::default())),
+            Call::SetHdr(true),
+            Call::SetHwCursor(true),
+            Call::SetQuitFlag,
+            Call::SetLaunchCommand(Some("steam".into())),
+            Call::SetGamescopeRoute(Some(crate::GamescopeRoute::Spawn)),
+            Call::SetSessionIsolation(Some(iso)),
+        ];
+        assert_eq!(calls.len(), want.len(), "{calls:?}");
+        for call in want {
+            assert!(calls.contains(&call), "{call:?} missing from {calls:?}");
+        }
+    }
+}
