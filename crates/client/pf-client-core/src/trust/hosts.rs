@@ -5,8 +5,10 @@ use super::{config_dir, load_json_or_default, write_atomic};
 use crate::presets::{PresetsFile, StreamPreset};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
 /// One trusted host: pinned cert fingerprint, how trust was granted, last-reached address.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -168,6 +170,13 @@ impl KnownHost {
         self.prev_addrs.truncate(PREV_ADDRS_MAX);
         self.port = port;
         true
+    }
+
+    /// Drop the pin and keep the record: the next connect pairs again. Returns the
+    /// fingerprint it leaves, which the host's caches are keyed on.
+    pub fn unpair(&mut self) -> String {
+        self.paired = false;
+        std::mem::take(&mut self.fp_hex)
     }
 
     /// Pins that still exist, in card order, no duplicates. Dangling ids disappear —
@@ -337,6 +346,69 @@ impl HostEdit {
     }
 }
 
+/// The identity rule, in one place: whether two fingerprints name one host. `Some` when
+/// both sides have one, and then the address is not asked: both OS installs of a dual-boot
+/// box answer at one lease with a certificate each. `None` when a side has none — an empty
+/// fingerprint is not a key — and only then may a caller go by address. Hex case is not
+/// part of a pin.
+pub fn same_pin(a: &str, b: &str) -> Option<bool> {
+    (!a.is_empty() && !b.is_empty()).then(|| a.eq_ignore_ascii_case(b))
+}
+
+thread_local! {
+    /// Set while this thread holds the store lock. A second lock on the sidecar would wait
+    /// on the first for ever, so a nested edit runs under the outer one.
+    static LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The store's lock across processes, held for one read, apply, save. It sits on a sidecar
+/// file: a save renames a new file over the store, so a lock on the store would stay with
+/// the file that was replaced. Best effort: where it can't be taken, the edit still runs.
+/// The wait has no deadline; the OS frees the lock of a holder that dies.
+struct StoreLock {
+    file: Option<File>,
+    nested: bool,
+}
+
+impl StoreLock {
+    fn take(store: &Path) -> StoreLock {
+        let nested = LOCK_HELD.replace(true);
+        let file = if nested { None } else { Self::lock(store) };
+        StoreLock { file, nested }
+    }
+
+    /// The sidecar, locked. Opened read-only when it exists: a lock needs no write access,
+    /// and the file may be another user's (the Decky backend runs the CLI as root).
+    /// `File::lock` is 1.89, past the workspace `rust-version`; the toolchain pin is 1.96.
+    #[clippy::msrv = "1.89"]
+    fn lock(store: &Path) -> Option<File> {
+        let mut name = store.file_name()?.to_os_string();
+        name.push(".lock");
+        let path = store.with_file_name(name);
+        let create = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+        };
+        let file = File::open(&path).or_else(|_| create()).ok()?;
+        file.lock().ok()?;
+        Some(file)
+    }
+}
+
+impl Drop for StoreLock {
+    #[clippy::msrv = "1.89"]
+    fn drop(&mut self) {
+        // Windows frees a closed handle's lock late; unlock so the next writer is not kept.
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
+        LOCK_HELD.set(self.nested);
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct KnownHosts {
     pub hosts: Vec<KnownHost>,
@@ -347,21 +419,21 @@ impl KnownHosts {
         Ok(config_dir()?.join("client-known-hosts.json"))
     }
 
-    /// The store, minting ids on records that lack one. Written back here, not "on the
-    /// next save", so the id a caller sees is the one on disk. A read-only dir re-mints
-    /// in memory; no lookup is keyed by id yet.
+    /// The store, minting ids on records that lack one. The mint is a write, so it is
+    /// redone under the lock on the store as it is then: two processes minting from one
+    /// read would each save their own ids. A read-only dir re-mints in memory.
     pub fn load() -> KnownHosts {
         let mut k = Self::read();
-        if k.mint_missing_ids() {
-            let _ = k.save();
+        if !k.mint_missing_ids() {
+            return k;
         }
-        k
+        Self::update(|fresh| KnownHosts {
+            hosts: fresh.hosts.clone(),
+        })
+        .unwrap_or(k)
     }
 
-    /// The store as on disk — no mint, so no write.
-    ///
-    /// [`KnownHosts::load`]'s mint is a write: two processes against a pre-mint store each
-    /// mint a different id and race to save. A read-only consumer cannot take part in that.
+    /// The store as on disk — no mint, so no write and no lock.
     pub fn read() -> KnownHosts {
         Self::path()
             .map(|p| load_json_or_default(&p))
@@ -381,12 +453,13 @@ impl KnownHosts {
         minted
     }
 
-    pub fn save(&self) -> Result<()> {
-        let p = Self::path()?;
+    /// Only [`locked_at`](Self::locked_at) writes the store: a write outside the lock can
+    /// drop another process's edit.
+    fn save_at(&self, p: &Path) -> Result<()> {
         std::fs::create_dir_all(p.parent().unwrap())?;
         // Temp+rename: losing this file to a torn write costs the user every pairing.
-        write_atomic(&p, serde_json::to_string_pretty(self)?.as_bytes())?;
-        // Omarchy menu mirrors this store; save() is the one door every mutation walks.
+        write_atomic(p, serde_json::to_string_pretty(self)?.as_bytes())?;
+        // Omarchy menu mirrors this store; this is the one door every mutation walks.
         // No-op unless `--omarchy-menu on` — a scoped test HOME never has that.
         // `desktop` too: `trust` is portable, and a TV build has no omarchy_menu to call.
         #[cfg(all(desktop, target_os = "linux"))]
@@ -394,40 +467,55 @@ impl KnownHosts {
         Ok(())
     }
 
-    /// Re-read the store, apply `f`, save: a shell's edit, so another process's write in
-    /// between survives. Records that lack an id get one in the same write.
-    pub fn update<R>(f: impl FnOnce(&mut KnownHosts) -> R) -> Result<R> {
-        let mut known = Self::read();
-        known.mint_missing_ids();
-        let r = f(&mut known);
-        known.save()?;
+    /// One edit of the store at `path`, alone: under the lock, re-read, run `f`, and write
+    /// when it returns `true` beside its result. Another process's edit lands before or
+    /// after this one, never in between.
+    fn locked_at<R>(path: &Path, f: impl FnOnce(&mut KnownHosts) -> (bool, R)) -> Result<R> {
+        let _lock = StoreLock::take(path);
+        let mut known: KnownHosts = load_json_or_default(path);
+        let (write, r) = f(&mut known);
+        if write {
+            known.save_at(path)?;
+        }
         Ok(r)
     }
 
-    /// The record pinned to `fp_hex`. An empty fingerprint is not a key — it would match
-    /// every not-yet-paired placeholder, and the first one is never the one meant.
-    pub fn find_by_fp(&self, fp_hex: &str) -> Option<&KnownHost> {
-        if fp_hex.is_empty() {
-            return None;
-        }
-        self.hosts.iter().find(|h| h.fp_hex == fp_hex)
+    /// Re-read the store, apply `f`, save, all under the store's lock: an edit that keeps
+    /// what another process wrote. Records that lack an id get one in the same write.
+    pub fn update<R>(f: impl FnOnce(&mut KnownHosts) -> R) -> Result<R> {
+        Self::locked_at(&Self::path()?, |known| {
+            known.mint_missing_ids();
+            (true, f(known))
+        })
     }
 
-    /// Load, hand the record pinned to `fp_hex` to `f`, and save when `f` says it changed.
+    /// [`update`](Self::update) for an edit that may come to nothing: `None` from `f` (no
+    /// such record, nothing changed, a refusal) leaves the file alone.
+    pub fn update_if<R>(f: impl FnOnce(&mut KnownHosts) -> Option<R>) -> Result<Option<R>> {
+        Self::locked_at(&Self::path()?, |known| {
+            let minted = known.mint_missing_ids();
+            let r = f(known);
+            (minted || r.is_some(), r)
+        })
+    }
+
+    /// The record pinned to `fp_hex`, by [`same_pin`]: an empty fingerprint finds nothing.
+    pub fn find_by_fp(&self, fp_hex: &str) -> Option<&KnownHost> {
+        self.hosts
+            .iter()
+            .find(|h| same_pin(&h.fp_hex, fp_hex) == Some(true))
+    }
+
+    /// Hand the record pinned to `fp_hex` to `f`, and save when `f` says it changed.
     /// No-op, and no disk write, for an empty or unstored fingerprint.
     fn update_by_fp(fp_hex: &str, f: impl FnOnce(&mut KnownHost) -> bool) {
         if fp_hex.is_empty() {
             return;
         }
-        let mut known = Self::load();
-        if known
-            .hosts
-            .iter_mut()
-            .find(|h| h.fp_hex == fp_hex)
-            .is_some_and(f)
-        {
-            let _ = known.save();
-        }
+        let _ = Self::update_if(|known| {
+            let host = known.hosts.iter_mut().find(|h| h.fp_hex == fp_hex);
+            host.is_some_and(f).then_some(())
+        });
     }
 
     /// Index of the record an `addr:port` lookup resolves to (so mutators avoid a second
@@ -471,14 +559,14 @@ impl KnownHosts {
     /// fingerprint, which at a shared address is the other OS of a dual-boot box, with its
     /// own name, binding and clipboard. `Some("")` is a card saved without a pin: its
     /// placeholder only. `None` is a bare typed address: whatever it answers with
-    /// ([`KnownHosts::index_by_addr`]).
+    /// ([`KnownHosts::index_by_addr`]). Pins are compared by [`same_pin`].
     pub fn resolve_index(&self, fp_hex: Option<&str>, addr: &str, port: u16) -> Option<usize> {
         let Some(fp_hex) = fp_hex else {
             return self.index_by_addr(addr, port);
         };
-        (!fp_hex.is_empty())
-            .then(|| self.hosts.iter().position(|h| h.fp_hex == fp_hex))
-            .flatten()
+        self.hosts
+            .iter()
+            .position(|h| same_pin(&h.fp_hex, fp_hex) == Some(true))
             .or_else(|| self.placeholder_at(addr, port))
     }
 
@@ -701,8 +789,9 @@ impl KnownHosts {
     }
 }
 
-/// Load-upsert-save: the pin every trust decision (TOFU, PIN, delegated, headless) ends in.
-/// `mac` is the wake MAC(s) the caller learned; empty keeps the saved ones.
+/// The pin every trust decision (TOFU, PIN, delegated, headless) ends in, upserted under
+/// the store's lock. `mac` is the wake MAC(s) the caller learned; empty keeps the saved ones.
+/// A failed save is returned: the callers say "Paired" the moment this comes back.
 pub fn persist_host(
     name: &str,
     addr: &str,
@@ -711,29 +800,29 @@ pub fn persist_host(
     paired: bool,
     mac: &[String],
 ) -> Result<()> {
-    let mut known = KnownHosts::load();
     // `..Default::default()` so user-set fields arrive uncarried; a literal would
     // reset them on re-pair. `upsert_trusted`: this is the authorised decision.
-    known.upsert_trusted(KnownHost {
-        name: name.to_string(),
-        addr: addr.to_string(),
-        port,
-        fp_hex: fp_hex.to_string(),
-        paired,
-        mac: mac.to_vec(),
-        ..Default::default()
-    });
-    // Returned, not swallowed: this is the door every trust decision walks through, and the
-    // callers say "Paired" the moment it comes back. A read-only config dir or a sandbox
-    // denial used to be announced as success and was gone by the next launch.
-    known.save()
+    KnownHosts::update(|known| {
+        known.upsert_trusted(KnownHost {
+            name: name.to_string(),
+            addr: addr.to_string(),
+            port,
+            fp_hex: fp_hex.to_string(),
+            paired,
+            mac: mac.to_vec(),
+            ..Default::default()
+        })
+    })
 }
 
-/// Load, [`KnownHosts::add`], save.
+/// [`KnownHosts::add`] under the store's lock, saved unless it refuses the edit.
 pub fn add_host(edit: &HostEdit) -> Result<()> {
-    let mut known = KnownHosts::load();
-    known.add(edit)?;
-    known.save()
+    let mut added = Ok(AddOutcome::Unchanged);
+    KnownHosts::update_if(|known| {
+        added = known.add(edit);
+        added.is_ok().then_some(())
+    })?;
+    added.map(drop)
 }
 
 /// Record an advert should land on: the one its caller matched, by pin, or the placeholder
@@ -795,9 +884,9 @@ fn apply_advert(
 /// and keep `advert_addr` as a place [`probe_known`](super::probe_known) asks. No-op, and
 /// no disk write, when nothing changed — call it on every discovery tick.
 ///
-/// [`KnownHosts::read`], not [`KnownHosts::load`]: `punktfunk discover` is not an
-/// id-minter (see the race on [`KnownHosts::read`]). Takes the fields rather than a
-/// `DiscoveredHost` because core and the WinUI shell each have their own type.
+/// Mints no record ids: `punktfunk discover` calls this, and hands none out. Takes the
+/// fields rather than a `DiscoveredHost` because core and the WinUI shell each have their
+/// own type.
 pub fn learn_from_advert(
     fp_hex: &str,
     addr: &str,
@@ -807,13 +896,14 @@ pub fn learn_from_advert(
     os: &str,
     mgmt_port: Option<u16>,
 ) {
-    let mut known = KnownHosts::read();
-    let Some(h) = learn_target(&mut known, fp_hex, addr, port) else {
+    let Ok(path) = KnownHosts::path() else {
         return;
     };
-    if apply_advert(h, advert_addr, mac, os, mgmt_port) {
-        let _ = known.save();
-    }
+    let _ = KnownHosts::locked_at(&path, |known| {
+        let learned = learn_target(known, fp_hex, addr, port)
+            .is_some_and(|h| apply_advert(h, advert_addr, mac, os, mgmt_port));
+        (learned, ())
+    });
 }
 
 /// Re-point a saved host at the address it now answers at, matched by fingerprint, keeping
@@ -891,6 +981,98 @@ mod tests {
     /// 64-hex fingerprint of one repeated digit — readable and distinct per letter.
     fn fp(c: char) -> String {
         std::iter::repeat_n(c, 64).collect()
+    }
+
+    /// A store path in a scratch dir of its own; the dir exists, the file does not.
+    fn scratch_store(tag: &str) -> PathBuf {
+        crate::presets::tests::scratch_dir(tag).join("client-known-hosts.json")
+    }
+
+    fn named(name: &str) -> KnownHost {
+        KnownHost {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Two edits of one store never interleave. The first holds the lock while the second
+    /// starts; unlocked, the second would read an empty store and its save would drop the
+    /// first one's record.
+    #[test]
+    fn a_second_edit_waits_for_the_first_and_keeps_its_write() {
+        let _guard = crate::trust::store_health_lock();
+        let path = scratch_store("hosts-lock");
+        // A sidecar this user can only read, as when root made it, locks all the same.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let sidecar = path.with_file_name("client-known-hosts.json.lock");
+            std::fs::write(&sidecar, b"").unwrap();
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let (entered, first_is_in) = std::sync::mpsc::channel();
+        let first = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                KnownHosts::locked_at(&path, |k| {
+                    entered.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    k.hosts.push(named("first"));
+                    (true, ())
+                })
+                .unwrap();
+            }
+        });
+        first_is_in.recv().unwrap();
+        let seen = KnownHosts::locked_at(&path, |k| {
+            let seen = k.hosts.len();
+            k.hosts.push(named("second"));
+            (true, seen)
+        })
+        .unwrap();
+        first.join().unwrap();
+        assert_eq!(seen, 1, "the second edit read the first one's write");
+        let stored: KnownHosts = load_json_or_default(&path);
+        let names: Vec<&str> = stored.hosts.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["first", "second"]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// An edit made from inside another on one thread runs under the outer lock rather than
+    /// waiting on it, and `false` leaves the file as the inner edit wrote it.
+    #[test]
+    fn a_nested_edit_does_not_wait_on_its_own_lock() {
+        let _guard = crate::trust::store_health_lock();
+        let path = scratch_store("hosts-nested");
+        KnownHosts::locked_at(&path, |_| {
+            KnownHosts::locked_at(&path, |inner| (true, inner.hosts.push(named("inner")))).unwrap();
+            (false, ())
+        })
+        .unwrap();
+        let stored: KnownHosts = load_json_or_default(&path);
+        assert_eq!(stored.hosts.len(), 1);
+        // The thread no longer counts as holding the lock: a later edit takes it again.
+        assert!(!LOCK_HELD.get());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Unpairing takes the pin and `paired`, and hands the fingerprint back for the caches
+    /// keyed on it. The record, its id and what the user set on it stay.
+    #[test]
+    fn unpair_drops_the_pin_and_keeps_the_record() {
+        let mut h = KnownHost {
+            name: "Desk".into(),
+            fp_hex: fp('a'),
+            paired: true,
+            preset_id: Some("aaaaaaaaaaaa".into()),
+            ..Default::default()
+        };
+        let id = h.id.clone();
+        assert_eq!(h.unpair(), fp('a'));
+        assert!(h.fp_hex.is_empty() && !h.paired);
+        assert_eq!(h.name, "Desk");
+        assert_eq!(h.preset_id.as_deref(), Some("aaaaaaaaaaaa"));
+        assert_eq!(h.id, id);
     }
 
     /// WinUI known-hosts shape (no `last_used`) loads; same path so the two clients share it.
@@ -1437,6 +1619,39 @@ mod tests {
         assert!(learn_target(&mut k, "", "127.0.0.1", 9777).is_none());
         // Unknown host: write nothing.
         assert!(learn_target(&mut k, &fp('e'), "10.0.0.9", 9777).is_none());
+    }
+
+    /// The one pin rule: two fingerprints decide alone, whatever their hex case, and an empty
+    /// one decides nothing. With both OS installs of a dual-boot box saved at one address,
+    /// each lookup picks by fingerprint.
+    #[test]
+    fn two_pins_settle_identity_and_an_empty_one_settles_nothing() {
+        let (windows, linux) = (fp('a'), fp('b'));
+        assert_eq!(same_pin(&windows, &windows.to_uppercase()), Some(true));
+        assert_eq!(same_pin(&windows, &linux), Some(false));
+        assert_eq!(same_pin(&windows, ""), None);
+        assert_eq!(same_pin("", &linux), None);
+        assert_eq!(same_pin("", ""), None);
+
+        let at = |name: &str, fp_hex: &str| KnownHost {
+            name: name.into(),
+            addr: "192.168.1.9".into(),
+            fp_hex: fp_hex.into(),
+            ..Default::default()
+        };
+        let k = KnownHosts {
+            hosts: vec![at("Windows", &windows), at("Linux", &linux)],
+        };
+        let resolved = |fp_hex: &str| k.resolve(Some(fp_hex), "192.168.1.9", 9777).unwrap();
+        assert_eq!(resolved(&windows).name, "Windows");
+        assert_eq!(resolved(&linux.to_uppercase()).name, "Linux");
+        assert_eq!(
+            k.find_by_fp(&windows.to_uppercase()).unwrap().name,
+            "Windows"
+        );
+        assert!(k.find_by_fp("").is_none());
+        // A third certificate at that address is neither of them.
+        assert!(k.resolve(Some(&fp('c')), "192.168.1.9", 9777).is_none());
     }
 
     /// Both OS installs of a dual-boot box at one address: a pin resolves its own record or

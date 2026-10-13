@@ -108,6 +108,9 @@ punktfunk pair <host[:port]> — enrol this device with a host (PIN ceremony)
                 no PIN: wait (up to ~185 s) for somebody to approve this device
                 in the host's console or web UI. Pins the fingerprint saved for
                 the host (`hosts add --fp`) if there is one. Never streams
+  --fp HEX      with --request-access: the fingerprint the host must show.
+                Without it the one saved for this address is used — the newest
+                when the address names two hosts, as a dual-boot box does
   --name LABEL  the label the host files this device under
                 (default: this machine's name)
 
@@ -364,14 +367,13 @@ from the config directory for a true factory reset."
     /// and only here: this reference is an argument the user typed in their own terminal, so
     /// there is nobody else to confirm it with. The guessable-reference rule exists for URLs
     /// handed to us by someone else; that path is `open`, which does ask.
-    fn resolve(reference: &str) -> Result<(KnownHosts, usize), u8> {
-        let known = KnownHosts::load();
+    fn resolve_in(known: &KnownHosts, reference: &str) -> Result<usize, u8> {
         let link = DeepLink {
             host_ref: reference.to_string(),
             ..Default::default()
         };
-        match deeplink::resolve_host(&link, &known) {
-            HostResolution::Known(i) | HostResolution::Confirm(i) => Ok((known, i)),
+        match deeplink::resolve_host(&link, known) {
+            HostResolution::Known(i) | HostResolution::Confirm(i) => Ok(i),
             HostResolution::Ambiguous => {
                 eprintln!(
                     "more than one saved host is called \"{reference}\" — use its address or id"
@@ -389,6 +391,13 @@ from the config directory for a true factory reset."
                 Err(UNRESOLVED)
             }
         }
+    }
+
+    /// [`resolve_in`] the store as it loads now, handed back with the index.
+    fn resolve(reference: &str) -> Result<(KnownHosts, usize), u8> {
+        let known = KnownHosts::load();
+        let i = resolve_in(&known, reference)?;
+        Ok((known, i))
     }
 
     /// The host a verb acts on: the `<host-ref>` it was given, else the default host.
@@ -673,9 +682,28 @@ from the config directory for a true factory reset."
         )
     }
 
-    /// `pair --request-access`: wait for the host's operator, pinned to the fingerprint saved
-    /// for this host (`hosts add --fp`), else trusting the first one it presents.
+    /// The pin `pair --request-access` holds the host to: `--fp` when given, else the one
+    /// saved at this address, by [`KnownHosts::find_by_addr`] — the newest when the address
+    /// names two hosts, as a dual-boot box does. `None`: the first certificate shown is trusted.
+    fn access_pin(known: &KnownHosts, fp: Option<&str>, addr: &str, port: u16) -> Option<[u8; 32]> {
+        match fp {
+            Some(fp) => trust::parse_hex32(fp),
+            None => known
+                .find_by_addr(addr, port)
+                .and_then(|h| trust::parse_hex32(&h.fp_hex)),
+        }
+    }
+
+    /// `pair --request-access`: wait for the host's operator, pinned by [`access_pin`].
     fn request_access(args: &[String], addr: &str, port: u16) -> u8 {
+        let fp = value(args, "--fp");
+        if fp
+            .as_deref()
+            .is_some_and(|fp| trust::parse_hex32(fp).is_none())
+        {
+            eprintln!("--fp takes the host's 64-hex-digit fingerprint");
+            return UNRESOLVED;
+        }
         let identity = match trust::load_or_create_identity() {
             Ok(i) => i,
             Err(e) => {
@@ -684,11 +712,7 @@ from the config directory for a true factory reset."
             }
         };
         let name = value(args, "--name").unwrap_or_else(trust::device_name);
-        let pin = KnownHosts::load()
-            .hosts
-            .iter()
-            .find(|h| h.addr == addr && h.port == port)
-            .and_then(|h| trust::parse_hex32(&h.fp_hex));
+        let pin = access_pin(&KnownHosts::load(), fp.as_deref(), addr, port);
         eprintln!("waiting for {addr} to approve this device…");
         let paired = trust::request_access_to_host(addr, port, &identity, pin, &name, None);
         report_paired(
@@ -806,8 +830,12 @@ from the config directory for a true factory reset."
                     fp: Some(fp),
                     ..Default::default()
                 };
-                let mut known = KnownHosts::load();
-                let line = match known.add(&edit) {
+                let mut added = Ok(AddOutcome::Unchanged);
+                let saved = KnownHosts::update_if(|known| {
+                    added = known.add(&edit);
+                    matches!(&added, Ok(o) if *o != AddOutcome::Unchanged).then_some(())
+                });
+                let line = match added {
                     // Exits 0: a panel retrying step 1 of request access finds a correct state.
                     Ok(AddOutcome::Unchanged) => {
                         eprintln!("{addr}:{port} is already saved");
@@ -821,8 +849,8 @@ from the config directory for a true factory reset."
                         return UNRESOLVED;
                     }
                 };
-                match known.save() {
-                    Ok(()) => {
+                match saved {
+                    Ok(_) => {
                         println!("{line}");
                         OK
                     }
@@ -837,15 +865,19 @@ from the config directory for a true factory reset."
                     eprintln!("usage: punktfunk hosts forget <host-ref>");
                     return UNRESOLVED;
                 };
-                let (mut known, i) = match resolve(&reference) {
-                    Ok(v) => v,
-                    Err(code) => return code,
+                // Resolved in the store as it is under its lock; a refusal keeps its code.
+                let mut refused = OK;
+                let pick = |now: &KnownHosts| {
+                    resolve_in(now, &reference)
+                        .map_err(|code| refused = code)
+                        .ok()
                 };
-                match orchestrate::forget_host(&mut known, i) {
-                    Ok(gone) => {
+                match orchestrate::forget_host(pick) {
+                    Ok(Some(gone)) => {
                         println!("forgot {}", gone.name);
                         OK
                     }
+                    Ok(None) => refused,
                     Err(e) => {
                         eprintln!("saving: {e:#}");
                         CONNECT_FAILED
@@ -1058,25 +1090,34 @@ from the config directory for a true factory reset."
             })
     }
 
+    /// Write `pick` as the saved profile of record `id`, in the store as it is under its
+    /// lock: the host is asked for its list between the read and this write. `false`, with
+    /// the reason on stderr, when the save fails.
+    fn save_pick(id: &Option<String>, pick: Option<profiles::ProfilePick>) -> bool {
+        let saved = KnownHosts::update(|now| {
+            if let Some(h) = now.hosts.iter_mut().find(|h| h.id == *id) {
+                h.profile = pick;
+            }
+        });
+        saved
+            .inspect_err(|e| eprintln!("save hosts: {e:#}"))
+            .is_ok()
+    }
+
     /// `profiles <host-ref>` — who plays on the host, and which of them this device plays as.
     fn profiles_cmd(args: &[String]) -> u8 {
         let usage = "punktfunk profiles <host-ref> [--json] [--pick PROFILE | --clear]";
-        let (mut known, i) = match resolve_or_default(args, usage) {
+        let (known, i) = match resolve_or_default(args, usage) {
             Ok(v) => v,
             Err(code) => return code,
         };
+        let id = &known.hosts[i].id;
         if has(args, "--clear") {
-            known.hosts[i].profile = None;
-            return match known.save() {
-                Ok(()) => {
-                    println!("cleared");
-                    OK
-                }
-                Err(e) => {
-                    eprintln!("save hosts: {e:#}");
-                    CONNECT_FAILED
-                }
-            };
+            if !save_pick(id, None) {
+                return CONNECT_FAILED;
+            }
+            println!("cleared");
+            return OK;
         }
         let listed = match list_profiles(&known.hosts[i]) {
             Ok(Some(listed)) => listed,
@@ -1091,17 +1132,11 @@ from the config directory for a true factory reset."
                 eprintln!("{} has no profile called \"{wanted}\"", known.hosts[i].name);
                 return UNRESOLVED;
             };
-            known.hosts[i].profile = Some(p.pick());
-            return match known.save() {
-                Ok(()) => {
-                    println!("{}\t{}", p.id, p.display_name);
-                    OK
-                }
-                Err(e) => {
-                    eprintln!("save hosts: {e:#}");
-                    CONNECT_FAILED
-                }
-            };
+            if !save_pick(id, Some(p.pick())) {
+                return CONNECT_FAILED;
+            }
+            println!("{}\t{}", p.id, p.display_name);
+            return OK;
         }
         let picked = known.hosts[i].profile.as_ref().map(|p| p.id.as_str());
         if has(args, "--json") {
@@ -1618,9 +1653,7 @@ from the config directory for a true factory reset."
             eprintln!("cancelled");
             return OK;
         }
-        let mut known = KnownHosts::load();
-        known.hosts.clear();
-        if let Err(e) = known.save() {
+        if let Err(e) = KnownHosts::update(|known| known.hosts.clear()) {
             eprintln!("couldn't forget the saved hosts: {e:#}");
             return CONNECT_FAILED;
         }
@@ -1697,6 +1730,27 @@ from the config directory for a true factory reset."
                 match_saved(&known, &advert).is_some(),
                 "no pin: the address decides"
             );
+        }
+
+        /// Both OS installs of a dual-boot box saved at one address: `--fp` picks its own, a
+        /// bare address the newest, and a placeholder listed first never hides a pin.
+        #[test]
+        fn request_access_pins_by_fingerprint_at_a_shared_address() {
+            let (windows, linux) = ("aa".repeat(32), "bb".repeat(32));
+            let at = |fp: &str| KnownHost {
+                addr: "192.168.1.9".into(),
+                fp_hex: fp.into(),
+                ..Default::default()
+            };
+            let known = KnownHosts {
+                hosts: vec![at(""), at(&windows), at(&linux)],
+            };
+            let pin = |fp: Option<&str>| access_pin(&known, fp, "192.168.1.9", 9777);
+            assert_eq!(pin(Some(&windows)), trust::parse_hex32(&windows));
+            assert_eq!(pin(Some(&linux)), trust::parse_hex32(&linux));
+            assert_eq!(pin(None), trust::parse_hex32(&linux));
+            // Nothing saved there: the first certificate shown is trusted.
+            assert_eq!(access_pin(&known, None, "192.168.1.20", 9777), None);
         }
 
         fn argv(v: &[&str]) -> Vec<String> {

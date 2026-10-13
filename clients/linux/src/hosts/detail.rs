@@ -7,7 +7,7 @@ use super::card::os_icon_name;
 use super::model::{Preset, Status};
 use super::{Act, HostRef, HostsMsg};
 use crate::store::{Changed, Store};
-use crate::trust::{HostEdit, KnownHost, KnownHosts};
+use crate::trust::{HostEdit, KnownHost};
 use adw::prelude::*;
 use pf_client_core::host_actions::ActionInfo;
 use pf_client_core::orchestrate::HostTarget;
@@ -67,6 +67,22 @@ impl Ctx {
         });
         if let Err(e) = saved {
             self.toast(format!("Couldn't save the host \u{2014} {e:#}"));
+        }
+    }
+
+    /// After a forget or an unpair, which write the hosts file and may clear a default in
+    /// the settings: re-read both, or toast `failed` with the cause. `true` when it saved.
+    fn stored<T>(&self, saved: anyhow::Result<T>, failed: &str) -> bool {
+        match saved {
+            Ok(_) => {
+                self.store.reload(Changed::Hosts);
+                self.store.reload(Changed::Settings);
+                true
+            }
+            Err(e) => {
+                self.toast(format!("{failed} \u{2014} {e:#}"));
+                false
+            }
         }
     }
 }
@@ -724,13 +740,9 @@ fn forget_identity(ctx: &Ctx, anchor: &adw::ActionRow) {
          before it connects.",
         "Forget",
         move || {
-            let fp = ctx.current.borrow().fp_hex.clone();
-            ctx.edit(|h| {
-                h.fp_hex.clear();
-                h.paired = false;
-            });
-            pf_client_core::library_cache::forget(&fp);
-            pf_client_core::host_actions::invalidate(&fp);
+            let host = ctx.host.borrow().clone();
+            let unpaired = pf_client_core::orchestrate::unpair_host(|known| host.index(known));
+            ctx.stored(unpaired, "Couldn't save the host");
         },
     );
 }
@@ -745,18 +757,11 @@ fn remove_host(ctx: &Ctx, nav: &adw::NavigationView, anchor: &adw::ButtonRow) {
         "It has to be added and paired again to connect.",
         "Remove",
         move || {
-            // `forget_host` saves the hosts file and clears a default pointing at the host.
-            let mut known = KnownHosts::read();
             let host = ctx.host.borrow().clone();
-            if let Some(i) = host.index(&known) {
-                if let Err(e) = pf_client_core::orchestrate::forget_host(&mut known, i) {
-                    ctx.toast(format!("Couldn't remove the host \u{2014} {e:#}"));
-                    return;
-                }
+            let gone = pf_client_core::orchestrate::forget_host(|known| host.index(known));
+            if ctx.stored(gone, "Couldn't remove the host") {
+                nav.pop_to_tag("main");
             }
-            ctx.store.reload(Changed::Hosts);
-            ctx.store.reload(Changed::Settings);
-            nav.pop_to_tag("main");
         },
     );
 }

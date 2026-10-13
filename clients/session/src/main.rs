@@ -936,11 +936,10 @@ mod session_main {
                 return exit::CONNECT_FAILED;
             }
         };
-        // `--resolved-spec <path>`: the spawner already did the resolving, so this process
-        // performs ZERO store reads (design/client-architecture-split.md §5) — no Settings
-        // load, no known-hosts lookup, no preset resolution. Without it (a hand-run
-        // `--connect`, an old Decky script) the session resolves for itself through the SAME
-        // helper, so the two modes cannot drift.
+        // `--resolved-spec <path>`: the spawner resolved settings, preset and clipboard, so
+        // this process loads no Settings and no preset catalog. It still reads the saved-hosts
+        // store below, for the pin and the window's name. Without a spec (a hand-run
+        // `--connect`, an old Decky script) it resolves through the same helper.
         let spec = arg_value("--resolved-spec").map(std::path::PathBuf::from);
         // `--fp` names its own record; only a bare address falls back to what it answers with.
         let fp_arg = arg_value("--fp").map(|f| f.to_ascii_lowercase());

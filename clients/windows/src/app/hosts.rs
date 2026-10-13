@@ -1291,13 +1291,9 @@ fn forget_dialog(props: &HostsProps) -> Element {
         .on_closed(move |r: ContentDialogResult| {
             if r == ContentDialogResult::Primary
                 && let Some(who) = &pending
+                && let Err(e) = pf_client_core::orchestrate::forget_host(|known| who.index(known))
             {
-                let mut known = KnownHosts::load();
-                if let Some(i) = who.index(&known)
-                    && let Err(e) = pf_client_core::orchestrate::forget_host(&mut known, i)
-                {
-                    st.call(format!("Couldn't save — {e:#}"));
-                }
+                st.call(format!("Couldn't save — {e:#}"));
             }
             sf.call(None); // re-renders the page; the row is gone on the next load
         })

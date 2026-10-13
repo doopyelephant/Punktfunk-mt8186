@@ -185,7 +185,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        known.save().unwrap();
+        KnownHosts::update(|stored| stored.hosts = known.hosts.clone()).unwrap();
 
         let req = ConnectRequest {
             host: HostTarget::from(&known.hosts[0]),

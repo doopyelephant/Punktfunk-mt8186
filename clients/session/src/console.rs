@@ -981,53 +981,55 @@ impl ServiceState {
     /// A manual entry has no pin: it edits the placeholder at its address or files one. A
     /// record pinned there is another identity and keeps its name.
     fn save_host(&mut self, name: String, addr: String, port: u16) {
-        let mut known = trust::KnownHosts::load();
         let edit = trust::HostEdit {
             name: Some(name),
             addr: Some(addr),
             port: Some(port),
             ..Default::default()
         };
-        if let Err(e) = known.add(&edit) {
+        let mut added = Ok(trust::AddOutcome::Unchanged);
+        let saved = trust::KnownHosts::update_if(|known| {
+            added = known.add(&edit);
+            added.is_ok().then_some(())
+        });
+        if let Err(e) = added {
             tracing::warn!(error = %format!("{e:#}"), "typed host not saved");
             return;
         }
-        self.save_known(&known);
+        if let Err(e) = saved {
+            self.save_failed(&e);
+        }
         self.last_probe = Instant::now() - Duration::from_secs(60); // probe it now
     }
 
     /// Edited in place, never removed and re-added: the pin, the learned MACs, the pinned
     /// cards and the preset binding hang off this record. A blank name is no edit.
     fn update_host(&mut self, key: String, name: String, addr: String, port: u16) {
-        let mut known = trust::KnownHosts::load();
-        let Some(h) = index_for_key(&known, &key).and_then(|i| known.hosts.get_mut(i)) else {
-            tracing::warn!(%key, "edit for an unknown host — ignoring");
-            return;
-        };
-        h.apply_edit(&trust::HostEdit {
+        let edit = trust::HostEdit {
             name: Some(name),
             addr: Some(addr),
             port: Some(port),
             ..Default::default()
+        };
+        let found = self.edit_host(&key, "edit", |h| {
+            h.apply_edit(&edit);
+            true
         });
-        self.save_known(&known);
-        self.last_probe = Instant::now() - Duration::from_secs(60); // the address moved
+        if found {
+            self.last_probe = Instant::now() - Duration::from_secs(60); // the address moved
+        }
     }
 
     fn forget_host(&mut self, key: String) {
-        let mut known = trust::KnownHosts::load();
-        let Some(i) = index_for_key(&known, &key) else {
-            tracing::warn!(%key, "forget for an unknown host — ignoring");
-            return;
-        };
-        match orchestrate::forget_host(&mut known, i) {
-            Ok(gone) => {
+        match orchestrate::forget_host(|known| index_for_key(known, &key)) {
+            Ok(Some(gone)) => {
                 tracing::info!(name = %gone.name, addr = %gone.addr, "host forgotten")
             }
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
-                self.console.set_notice(format!("Couldn't save — {e:#}"));
+            Ok(None) => {
+                tracing::warn!(%key, "forget for an unknown host — ignoring");
+                return;
             }
+            Err(e) => self.save_failed(&e),
         }
         // It may still be advertising, in which case it comes straight back as a
         // DISCOVERED row — unsaved and unpaired, which is the honest state.
@@ -1035,26 +1037,11 @@ impl ServiceState {
     }
 
     fn unpair_host(&self, key: String) {
-        let mut known = trust::KnownHosts::load();
-        let Some(i) = index_for_key(&known, &key) else {
-            tracing::warn!(%key, "unpair for an unknown host — ignoring");
-            return;
-        };
-        let host = &mut known.hosts[i];
-        let fp = std::mem::take(&mut host.fp_hex);
-        host.paired = false;
-        let (id, name) = (host.id.clone(), host.name.clone());
-        self.save_known(&known);
-        // The catalog cache is keyed on the fingerprint just dropped; nothing reaches
-        // it again, so it goes now, as a forget's does.
-        pf_client_core::library_cache::forget(&fp);
-        // An unpaired host is no landing: the resolver skips it, and this stops a
-        // later re-pair inheriting the choice.
-        let mut settings = trust::Settings::load();
-        if start::clear_default(&mut settings, id.as_deref()) {
-            settings.save();
+        match orchestrate::unpair_host(|known| index_for_key(known, &key)) {
+            Ok(Some(host)) => tracing::info!(name = %host.name, "host unpaired"),
+            Ok(None) => tracing::warn!(%key, "unpair for an unknown host — ignoring"),
+            Err(e) => self.save_failed(&e),
         }
-        tracing::info!(%name, "host unpaired");
     }
 
     fn wake(&mut self, key: String, then_connect: bool) {
@@ -1089,18 +1076,14 @@ impl ServiceState {
         // Presentation only (design §5.2a): order = card order, appended at the
         // end; never touches `preset_id` (the default binding). Idempotent, so
         // a repeated press inside one refresh window can't double-pin.
-        let mut known = trust::KnownHosts::load();
-        let idx = index_for_key(&known, &key);
-        let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
-            tracing::warn!(%key, "pin toggle for an unknown host — ignoring");
-            return;
-        };
-        if pin && !h.pinned_presets.contains(&preset_id) {
-            h.pinned_presets.push(preset_id);
-        } else if !pin {
-            h.pinned_presets.retain(|id| *id != preset_id);
-        }
-        self.save_known(&known);
+        self.edit_host(&key, "pin toggle", |h| {
+            if pin && !h.pinned_presets.contains(&preset_id) {
+                h.pinned_presets.push(preset_id);
+            } else if !pin {
+                h.pinned_presets.retain(|id| *id != preset_id);
+            }
+            true
+        });
         // `run` refreshes the rows right after this drain, so the carousel and
         // the pin screen reflect the new card within the same service pass.
     }
@@ -1110,13 +1093,7 @@ impl ServiceState {
         // host, `game_presets` for one title. `SetPin` above is the presentation
         // half and never touches either; this never touches the pins. Same store
         // discipline, same refresh-after-drain.
-        let mut known = trust::KnownHosts::load();
-        let idx = index_for_key(&known, &key);
-        let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
-            tracing::warn!(%key, "preset bind for an unknown host — ignoring");
-            return;
-        };
-        let changed = match &game {
+        self.edit_host(&key, "preset bind", |h| match &game {
             Some(id) => {
                 let moved = h.preset_for_game(id) != preset_id.as_deref();
                 h.bind_game_preset(id, preset_id.as_deref());
@@ -1127,40 +1104,27 @@ impl ServiceState {
                 h.preset_id = preset_id;
                 moved
             }
-        };
-        if changed {
-            self.save_known(&known);
-        }
+        });
     }
 
     /// The profile this device plays as on a saved host (`KnownHost::profile`). Same store
     /// discipline as `set_pin`; the next rows carry it to the card.
     fn set_profile(&self, key: String, profile: Option<profiles::ProfilePick>) {
-        let mut known = trust::KnownHosts::load();
-        let idx = index_for_key(&known, &key);
-        let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
-            tracing::warn!(%key, "profile pick for an unknown host — ignoring");
-            return;
-        };
-        if h.profile != profile {
+        self.edit_host(&key, "profile pick", |h| {
+            let changed = h.profile != profile;
             h.profile = profile;
-            self.save_known(&known);
-        }
+            changed
+        });
     }
 
     fn set_clipboard(&self, key: String, on: bool) {
         // Per-host clipboard trust (`KnownHost::clipboard_sync`) — the host
         // menu's toggle. Same store discipline as `set_pin`.
-        let mut known = trust::KnownHosts::load();
-        let idx = index_for_key(&known, &key);
-        let Some(h) = idx.and_then(|i| known.hosts.get_mut(i)) else {
-            tracing::warn!(%key, "clipboard toggle for an unknown host — ignoring");
-            return;
-        };
-        if h.clipboard_sync != on {
+        self.edit_host(&key, "clipboard toggle", |h| {
+            let changed = h.clipboard_sync != on;
             h.clipboard_sync = on;
-            self.save_known(&known);
-        }
+            changed
+        });
     }
 
     /// One parallel reachability pass over every row. Advertising ones are NOT online by
@@ -1208,14 +1172,36 @@ impl ServiceState {
             .ok();
     }
 
-    /// Write the host store, and SAY so when it fails. The console is the only surface the
-    /// user has here — a warning in the log reaches nobody on a TV — and a dropped write
-    /// means the change they just made is not on disk.
-    fn save_known(&self, known: &trust::KnownHosts) {
-        if let Err(e) = known.save() {
-            tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
-            self.console.set_notice(format!("Couldn't save — {e:#}"));
+    /// Apply `f` to the record `key` names, in the store as it is under its lock, and save
+    /// when `f` says it changed. `what` names the edit in the log when the key matches no
+    /// record. `true` when it matched one.
+    fn edit_host(
+        &self,
+        key: &str,
+        what: &str,
+        f: impl FnOnce(&mut trust::KnownHost) -> bool,
+    ) -> bool {
+        let mut found = false;
+        let saved = trust::KnownHosts::update_if(|known| {
+            let Some(h) = index_for_key(known, key).and_then(|i| known.hosts.get_mut(i)) else {
+                tracing::warn!(%key, "{what} for an unknown host — ignoring");
+                return None;
+            };
+            found = true;
+            f(h).then_some(())
+        });
+        if let Err(e) = saved {
+            self.save_failed(&e);
         }
+        found
+    }
+
+    /// SAY so when a host-store write fails. The console is the only surface the user has
+    /// here — a warning in the log reaches nobody on a TV — and a dropped write means the
+    /// change they just made is not on disk.
+    fn save_failed(&self, e: &impl std::fmt::Display) {
+        tracing::warn!(error = %format!("{e:#}"), "saving known hosts");
+        self.console.set_notice(format!("Couldn't save — {e:#}"));
     }
 
     /// Keep every paired, reachable host's advertised actions and running title fresh (the

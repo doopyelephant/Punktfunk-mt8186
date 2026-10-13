@@ -1,6 +1,6 @@
 //! Reachability probes: whether a saved host answers as itself, and where.
 
-use super::{hex, rekey_addr, KnownHost};
+use super::{hex, rekey_addr, same_pin, KnownHost};
 use punktfunk_core::client::NativeClient;
 use std::time::Duration;
 
@@ -45,13 +45,10 @@ pub fn probe_one(addr: &str, port: u16, fp_hex: &str, timeout: std::time::Durati
 }
 
 /// Whether a probe's answer is the host that was asked for. `answered` is the fingerprint
-/// that replied, or `None` when nothing did; `want` is the record's pin, empty for one saved
-/// by address alone — that has nothing to compare, so any answer is the host it names.
+/// that replied, or `None` when nothing did; `want` is the record's pin, compared by
+/// [`same_pin`]. A record saved by address alone has none, so any answer is the host it names.
 fn answered_as_self(want: &str, answered: Option<[u8; 32]>) -> bool {
-    match answered {
-        None => false,
-        Some(fp) => want.is_empty() || hex(&fp).eq_ignore_ascii_case(want),
-    }
+    answered.is_some_and(|fp| same_pin(want, &hex(&fp)).unwrap_or(true))
 }
 
 /// Probe every saved host where it could be, in parallel: its address, then — only when

@@ -552,7 +552,7 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Every name `clear` takes, `pin` and `overrides` take too, and pin and clear undo each
@@ -995,7 +995,7 @@ mod tests {
         assert_eq!(applied.codec, "vvc-from-the-future");
     }
 
-    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    pub(crate) fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "pf-client-core-{tag}-{}",
             std::time::SystemTime::now()

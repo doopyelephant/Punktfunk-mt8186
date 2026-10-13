@@ -7,7 +7,7 @@
 //!
 //! The menu cannot generate rows (`provider` is a map baked into the shell),
 //! so rows are static. [`sync_if_enabled`] rewrites the block from the
-//! known-hosts store; `trust::KnownHosts::save` calls it.
+//! known-hosts store; every write of that store calls it.
 //!
 //! Opt-in: nothing is written until the preferences switch or
 //! `punktfunk-client --omarchy-menu on`. `off` removes only our block.
@@ -50,7 +50,7 @@ pub fn disable() -> Result<(), String> {
     write_rows(&p, None)
 }
 
-/// Quiet form `trust::KnownHosts::save` calls, if the operator opted in.
+/// Quiet form every known-hosts write calls, if the operator opted in.
 pub fn sync_if_enabled() {
     if !enabled() {
         return;
