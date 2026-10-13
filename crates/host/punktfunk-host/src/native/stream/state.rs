@@ -138,10 +138,10 @@ pub(super) struct StreamState {
 
     // ---- teardown order, which is field order: the status registration ends first, then
     // the send thread, then game policy, then capture, encoder, display ----
-    _watcher: Option<std::thread::JoinHandle<()>>,
+    pub(super) _watcher: Option<std::thread::JoinHandle<()>>,
     /// `Some(joined)` on the seat's own session, which follows the seat's mode.
     #[cfg(target_os = "linux")]
-    seat_join: Option<bool>,
+    pub(super) seat_join: Option<bool>,
     pub(super) live_session: crate::session_status::LiveSessionGuard,
     // ---- the send thread ----
     /// The one strong handle: a client's NACK reaches the send thread through a weak one,
