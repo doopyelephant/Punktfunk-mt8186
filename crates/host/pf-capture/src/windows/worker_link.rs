@@ -4,8 +4,8 @@
 //! [`Link`] keeps one request in flight and waits a bound for its reply. The worker is less
 //! privileged than this process: every reply is checked before use, a worker that answers
 //! late or with the wrong bytes is ended, and nothing it sends is waited on without a bound.
-//! A stream that stops being messages ends the channel; the next request then reads the
-//! worker as exited.
+//! A stream that stops being messages ends the channel, and a request that finds it ended
+//! ends a worker that still runs.
 //!
 //! Generic over the pipes and the process, so the tests stand in for a worker on every
 //! target; `wgc.rs` hands over the real ones. Evidence: `design/windows-wgc-capture.md`
@@ -108,8 +108,8 @@ impl<P: Peer, W: Write> Link<P, W> {
     }
 
     /// Send one request and wait `bound` for its reply. A hello is answered by a hello and is
-    /// unnumbered on both sides. A worker that does not answer, or answers with the wrong
-    /// bytes, is ended.
+    /// unnumbered on both sides. A worker that does not answer, answers with the wrong bytes,
+    /// or still runs once its reply channel ended, is ended.
     pub(crate) fn request<Q: Pod, R: Pod>(&self, op: u32, body: &Q, bound: Duration) -> Result<R> {
         let mut requests = lock(&self.requests);
         let Some((pipe, last)) = requests.as_mut() else {
@@ -142,8 +142,13 @@ impl<P: Peer, W: Write> Link<P, W> {
                     self.peer.kill();
                     bail!("capture worker did not answer {op:#x} within {bound:?}");
                 }
+                // The pump stopped: the pipe closed, or carried what is not a message.
                 Err(RecvTimeoutError::Disconnected) => {
-                    bail!("capture worker exited (code {:?})", self.peer.exit_code())
+                    let Some(code) = self.peer.exit_code() else {
+                        self.peer.kill();
+                        bail!("capture worker's reply channel ended before it answered {op:#x}");
+                    };
+                    bail!("capture worker exited (code {code})");
                 }
             }
         }
@@ -193,26 +198,36 @@ mod tests {
         }
     }
 
-    /// A worker process that counts how often it was ended.
+    /// A worker process that counts how often it was ended. It still runs unless `exited`
+    /// holds its code.
     #[derive(Default)]
-    struct Worker(AtomicU32);
+    struct Worker {
+        kills: AtomicU32,
+        exited: Option<u32>,
+    }
 
     impl Peer for Worker {
         fn kill(&self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
+            self.kills.fetch_add(1, Ordering::Relaxed);
         }
 
         fn exit_code(&self) -> Option<u32> {
-            None
+            self.exited
         }
     }
 
-    /// A link over `requests` as its request pipe, and the worker's end of its reply pipe.
-    fn link<W: Write>(requests: W) -> (Link<Worker, W>, Sender<Vec<u8>>) {
+    /// A link to `process` over `requests` as its request pipe, and the worker's end of its
+    /// reply pipe.
+    fn link_to<W: Write>(process: Worker, requests: W) -> (Link<Worker, W>, Sender<Vec<u8>>) {
         let (worker, rx) = channel();
         let buf = VecDeque::new();
-        let link = Link::open(Worker::default(), requests, Pipe { rx, buf }).unwrap();
+        let link = Link::open(process, requests, Pipe { rx, buf }).unwrap();
         (link, worker)
+    }
+
+    /// A link to a worker that runs.
+    fn link<W: Write>(requests: W) -> (Link<Worker, W>, Sender<Vec<u8>>) {
+        link_to(Worker::default(), requests)
     }
 
     fn hello() -> proto::Hello {
@@ -240,7 +255,7 @@ mod tests {
     }
 
     fn kills<W: Write>(link: &Link<Worker, W>) -> u32 {
-        link.peer().0.load(Ordering::Relaxed)
+        link.peer().kills.load(Ordering::Relaxed)
     }
 
     #[test]
@@ -276,7 +291,8 @@ mod tests {
     }
 
     /// Wrong magic, a body over `MAX_BODY`, and a worker that closes mid-frame: the pump
-    /// stops at the first, parses nothing behind it, and the request reads the worker as gone.
+    /// stops at the first and parses nothing behind it. The worker still runs, so the request
+    /// ends it and names the channel, not an exit.
     #[test]
     fn a_stream_that_is_not_messages_ends_the_channel() {
         let good = proto::encode(kind::HELLO, 0, &hello());
@@ -302,9 +318,25 @@ mod tests {
             worker.send(bytes).unwrap();
             let worker = (!closes).then_some(worker);
             let said = refusal(link.hello(AMPLE));
-            assert!(said.contains("capture worker exited"), "{what}: {said}");
+            let ended = "reply channel ended before it answered 0x1";
+            assert!(said.contains(ended), "{what}: {said}");
+            assert_eq!(kills(&link), 1, "{what}");
             drop(worker);
         }
+    }
+
+    /// A worker that exited is named as that, with its code, and is not ended again.
+    #[test]
+    fn a_worker_that_exited_is_reported_with_its_code() {
+        let exited = Worker {
+            exited: Some(3),
+            ..Worker::default()
+        };
+        let (link, worker) = link_to(exited, io::sink());
+        drop(worker);
+        let said = refusal(link.hello(AMPLE));
+        assert!(said.contains("capture worker exited (code 3)"), "{said}");
+        assert_eq!(kills(&link), 0);
     }
 
     #[test]
