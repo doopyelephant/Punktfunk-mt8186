@@ -100,6 +100,24 @@ pub fn exec_session() -> glib::ExitCode {
     glib::ExitCode::FAILURE
 }
 
+/// The saved record `--library` takes its pin and management port from: the one pinned to
+/// `--fp` when given, else the first pinned at the address. Both OS installs of a dual-boot
+/// box sit at one address, each with a pin and a management port of its own. A record is
+/// keyed by its STREAM port, so the address is matched without a port.
+fn library_record<'a>(
+    known: &'a KnownHosts,
+    fp: Option<&str>,
+    addr: &str,
+) -> Option<&'a KnownHost> {
+    match fp {
+        Some(fp) => known.find_by_fp(fp),
+        None => known
+            .hosts
+            .iter()
+            .find(|h| h.addr == addr && !h.fp_hex.is_empty()),
+    }
+}
+
 /// `--library host[:mgmt_port]` — fetch and print the host's game library over the real
 /// mTLS + pinned-fingerprint client, no GTK window. The pin comes from `--fp HEX` when given,
 /// else the saved record for that address. Without one this refuses: an absent pin is not a
@@ -122,15 +140,12 @@ pub fn headless_library(target: &str) -> glib::ExitCode {
             return glib::ExitCode::FAILURE;
         }
     };
-    // The saved record is keyed by its STREAM port, so it is resolved by address alone — a
-    // lookup on the mgmt port never matches, and `fetch_games` reads a `None` pin as "accept
-    // any certificate". A host we cannot pin is refused rather than fetched unpinned.
-    let known = crate::trust::KnownHosts::load();
-    let saved = known
-        .hosts
-        .iter()
-        .find(|h| h.addr == addr && !h.fp_hex.is_empty());
-    let Some(pin) = arg_value("--fp")
+    // `fetch_games` reads a `None` pin as "accept any certificate", so a host we cannot pin
+    // is refused rather than fetched unpinned.
+    let known = KnownHosts::load();
+    let fp = arg_value("--fp");
+    let saved = library_record(&known, fp.as_deref(), &addr);
+    let Some(pin) = fp
         .as_deref()
         .and_then(crate::trust::parse_hex32)
         .or_else(|| saved.and_then(|h| crate::trust::parse_hex32(&h.fp_hex)))
@@ -465,4 +480,52 @@ pub fn headless_host_command() -> Option<glib::ExitCode> {
         return Some(headless_apply_update());
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both OS installs of a dual-boot box saved at one address, each with its own pin and
+    /// management port.
+    fn dual_boot() -> (KnownHosts, String, String) {
+        let (windows, linux) = ("aa".repeat(32), "bb".repeat(32));
+        let at = |fp: &str, mgmt: u16| KnownHost {
+            addr: "192.168.1.9".into(),
+            fp_hex: fp.into(),
+            mgmt_port: Some(mgmt),
+            ..Default::default()
+        };
+        let known = KnownHosts {
+            hosts: vec![at(&windows, 47990), at(&linux, 47991)],
+        };
+        (known, windows, linux)
+    }
+
+    /// `--library --fp` reads the record its fingerprint names, not the sibling saved first.
+    #[test]
+    fn library_takes_the_record_its_fingerprint_names() {
+        let (known, windows, linux) = dual_boot();
+        let mgmt = |fp: Option<&str>| {
+            library_record(&known, fp, "192.168.1.9").map(KnownHost::effective_mgmt_port)
+        };
+        assert_eq!(mgmt(Some(&linux)), Some(47991));
+        assert_eq!(mgmt(Some(&windows.to_uppercase())), Some(47990));
+        assert_eq!(mgmt(None), Some(47990), "no --fp: the first pinned there");
+        // A fingerprint nobody is pinned to names no record, whatever the address holds.
+        assert_eq!(mgmt(Some(&"cc".repeat(32))), None);
+    }
+
+    /// A fingerprint selector names one of the two; their address names both, which is what
+    /// `--forget-host` refuses.
+    #[test]
+    fn a_fingerprint_selects_one_host_at_a_shared_address() {
+        let (known, _, linux) = dual_boot();
+        let hits = |s: &str| {
+            let sel = parse_selector(s).expect("a selector");
+            known.hosts.iter().filter(|h| sel.matches(h)).count()
+        };
+        assert_eq!(hits(&linux), 1);
+        assert_eq!(hits("192.168.1.9:9777"), 2);
+    }
 }
