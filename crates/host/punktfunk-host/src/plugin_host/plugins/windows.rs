@@ -726,6 +726,10 @@ const RUNNER_ACES_FILE: &str = "runner-aces.json";
 
 static RECHECK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The `(SID, path)` grants Windows refused this run.
+static REFUSED: std::sync::Mutex<std::collections::BTreeSet<(String, String)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 /// The next converge places every ACE again, not only the changed ones. The service asks at start:
 /// it runs as SYSTEM, which may edit a folder like `WindowsApps` that an admin's CLI may not.
 pub(super) fn recheck_next() {
@@ -833,8 +837,16 @@ pub(super) fn converge_runner_roots(
             if !recheck && old.paths.get(path) == Some(ace) {
                 continue;
             }
+            // A folder Windows won't let the service re-ACL stays wanted and unplaced, so every
+            // pass comes back here: one try and one line per run, more only on a recheck.
+            let refusal = (sid.clone(), path.clone());
+            let mut refused = REFUSED.lock().unwrap_or_else(|poison| poison.into_inner());
+            if !recheck && refused.contains(&refusal) {
+                continue;
+            }
             match grant_ace(&icacls_sid, std::path::Path::new(path), *ace) {
                 Ok(()) => {
+                    refused.remove(&refusal);
                     placed
                         .grantees
                         .entry(sid.clone())
@@ -842,7 +854,11 @@ pub(super) fn converge_runner_roots(
                         .paths
                         .insert(path.clone(), *ace);
                 }
-                Err(e) => tracing::warn!(%sid, %path, error = %e, "runner ACE not placed"),
+                Err(e) => {
+                    if refused.insert(refusal) {
+                        tracing::warn!(%sid, %path, error = %e, "runner ACE not placed");
+                    }
+                }
             }
         }
         let keys: Vec<&String> = if recheck {
