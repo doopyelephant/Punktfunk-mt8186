@@ -346,6 +346,15 @@ impl HostEdit {
     }
 }
 
+/// The identity rule, in one place: whether two fingerprints name one host. `Some` when
+/// both sides have one, and then the address is not asked: both OS installs of a dual-boot
+/// box answer at one lease with a certificate each. `None` when a side has none — an empty
+/// fingerprint is not a key — and only then may a caller go by address. Hex case is not
+/// part of a pin.
+pub fn same_pin(a: &str, b: &str) -> Option<bool> {
+    (!a.is_empty() && !b.is_empty()).then(|| a.eq_ignore_ascii_case(b))
+}
+
 thread_local! {
     /// Set while this thread holds the store lock. A second lock on the sidecar would wait
     /// on the first for ever, so a nested edit runs under the outer one.
@@ -490,13 +499,11 @@ impl KnownHosts {
         })
     }
 
-    /// The record pinned to `fp_hex`. An empty fingerprint is not a key — it would match
-    /// every not-yet-paired placeholder, and the first one is never the one meant.
+    /// The record pinned to `fp_hex`, by [`same_pin`]: an empty fingerprint finds nothing.
     pub fn find_by_fp(&self, fp_hex: &str) -> Option<&KnownHost> {
-        if fp_hex.is_empty() {
-            return None;
-        }
-        self.hosts.iter().find(|h| h.fp_hex == fp_hex)
+        self.hosts
+            .iter()
+            .find(|h| same_pin(&h.fp_hex, fp_hex) == Some(true))
     }
 
     /// Hand the record pinned to `fp_hex` to `f`, and save when `f` says it changed.
@@ -552,14 +559,14 @@ impl KnownHosts {
     /// fingerprint, which at a shared address is the other OS of a dual-boot box, with its
     /// own name, binding and clipboard. `Some("")` is a card saved without a pin: its
     /// placeholder only. `None` is a bare typed address: whatever it answers with
-    /// ([`KnownHosts::index_by_addr`]).
+    /// ([`KnownHosts::index_by_addr`]). Pins are compared by [`same_pin`].
     pub fn resolve_index(&self, fp_hex: Option<&str>, addr: &str, port: u16) -> Option<usize> {
         let Some(fp_hex) = fp_hex else {
             return self.index_by_addr(addr, port);
         };
-        (!fp_hex.is_empty())
-            .then(|| self.hosts.iter().position(|h| h.fp_hex == fp_hex))
-            .flatten()
+        self.hosts
+            .iter()
+            .position(|h| same_pin(&h.fp_hex, fp_hex) == Some(true))
             .or_else(|| self.placeholder_at(addr, port))
     }
 
@@ -1612,6 +1619,39 @@ mod tests {
         assert!(learn_target(&mut k, "", "127.0.0.1", 9777).is_none());
         // Unknown host: write nothing.
         assert!(learn_target(&mut k, &fp('e'), "10.0.0.9", 9777).is_none());
+    }
+
+    /// The one pin rule: two fingerprints decide alone, whatever their hex case, and an empty
+    /// one decides nothing. With both OS installs of a dual-boot box saved at one address,
+    /// each lookup picks by fingerprint.
+    #[test]
+    fn two_pins_settle_identity_and_an_empty_one_settles_nothing() {
+        let (windows, linux) = (fp('a'), fp('b'));
+        assert_eq!(same_pin(&windows, &windows.to_uppercase()), Some(true));
+        assert_eq!(same_pin(&windows, &linux), Some(false));
+        assert_eq!(same_pin(&windows, ""), None);
+        assert_eq!(same_pin("", &linux), None);
+        assert_eq!(same_pin("", ""), None);
+
+        let at = |name: &str, fp_hex: &str| KnownHost {
+            name: name.into(),
+            addr: "192.168.1.9".into(),
+            fp_hex: fp_hex.into(),
+            ..Default::default()
+        };
+        let k = KnownHosts {
+            hosts: vec![at("Windows", &windows), at("Linux", &linux)],
+        };
+        let resolved = |fp_hex: &str| k.resolve(Some(fp_hex), "192.168.1.9", 9777).unwrap();
+        assert_eq!(resolved(&windows).name, "Windows");
+        assert_eq!(resolved(&linux.to_uppercase()).name, "Linux");
+        assert_eq!(
+            k.find_by_fp(&windows.to_uppercase()).unwrap().name,
+            "Windows"
+        );
+        assert!(k.find_by_fp("").is_none());
+        // A third certificate at that address is neither of them.
+        assert!(k.resolve(Some(&fp('c')), "192.168.1.9", 9777).is_none());
     }
 
     /// Both OS installs of a dual-boot box at one address: a pin resolves its own record or

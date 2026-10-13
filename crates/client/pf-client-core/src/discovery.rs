@@ -2,6 +2,7 @@
 //! `discovery.rs`). A worker streams [`DiscoveryEvent`]; it exits when the
 //! receiver is dropped, polled so an empty LAN still stops.
 
+use crate::trust::same_pin;
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,15 +14,12 @@ const SERVICE_TYPE: &str = "_punktfunk._udp.local.";
 
 pub use punktfunk_core::discovery::DiscoveredHost;
 
-/// Is this advert that saved host? Two known fingerprints settle it on their own — falling
-/// back to the address there would let whoever inherits a sleeping host's DHCP lease be
-/// treated AS that host, and reads the other OS of a dual-boot box (one lease, one MAC, a
-/// certificate each) as the OS already saved, so it never reaches the discovered shelf.
+/// Is this advert that saved host? Two known fingerprints settle it ([`same_pin`]) — the
+/// address there would treat whoever inherits a sleeping host's DHCP lease AS that host, and
+/// read the other OS of a dual-boot box as the OS already saved, so it never reaches the
+/// discovered shelf. The address decides only when a side has no pin.
 pub fn same_host(k: &crate::trust::KnownHost, d: &DiscoveredHost) -> bool {
-    if !k.fp_hex.is_empty() && !d.fp_hex.is_empty() {
-        return k.fp_hex.eq_ignore_ascii_case(&d.fp_hex);
-    }
-    k.addr == d.addr && k.port == d.port
+    same_pin(&k.fp_hex, &d.fp_hex).unwrap_or(k.addr == d.addr && k.port == d.port)
 }
 
 pub enum DiscoveryEvent {
@@ -66,21 +64,20 @@ impl AdvertWatch {
     }
 
     /// Where the host advertised from since the last poll, if it did. A pinned host
-    /// (`fp` non-empty) is matched by its pin alone, an unpinned one by `addr:port`.
+    /// (`fp` non-empty) is matched by its pin alone ([`same_pin`]), so never by an advert
+    /// without one; an unpinned host by `addr:port`.
     ///
     /// Every fifth poll re-queries: `mdns-sd`'s backoff has doubled past a minute by the
     /// time a cold box finishes booting.
     pub fn poll(&mut self, fp: Option<&str>, addr: &str, port: u16) -> Option<(String, u16)> {
+        let fp = fp.unwrap_or_default();
         let mut seen = None;
         while let Ok(ev) = self.rx.try_recv() {
             let DiscoveryEvent::Resolved(h) = ev else {
                 continue;
             };
-            let matched = match fp.filter(|f| !f.is_empty()) {
-                Some(fp) => h.fp_hex == fp,
-                None => h.addr == addr && h.port == port,
-            };
-            if matched {
+            let here = fp.is_empty() && h.addr == addr && h.port == port;
+            if same_pin(fp, &h.fp_hex).unwrap_or(here) {
                 seen = Some((h.addr, h.port));
             }
         }
@@ -310,9 +307,10 @@ mod tests {
         tx.try_send(DiscoveryEvent::Resolved(fp_less.clone()))
             .unwrap();
         assert_eq!(w.poll(Some("bb"), "192.168.1.9", 9777), None);
+        // Hex case is not part of the pin.
         tx.try_send(DiscoveryEvent::Resolved(moved)).unwrap();
         assert_eq!(
-            w.poll(Some("bb"), "192.168.1.9", 9777),
+            w.poll(Some("BB"), "192.168.1.9", 9777),
             Some(("192.168.1.20".into(), 9777))
         );
         // A card saved without a pin has only its address to go on.
