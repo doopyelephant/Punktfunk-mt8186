@@ -405,6 +405,9 @@ pub fn pinned_cycle() -> Option<u32> {
 }
 
 #[cfg(test)]
+mod plan_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         ltr_acked_step, mark_slot, pick_acked, pick_anchor, plan_slot_recovery, wave_cycle, Wave,
