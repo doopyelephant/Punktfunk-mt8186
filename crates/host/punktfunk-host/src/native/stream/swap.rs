@@ -62,12 +62,6 @@ impl SwapReason {
     fn rereads_enc_src(self) -> bool {
         self != SwapReason::SessionSwitch && self != SwapReason::Bitrate
     }
-
-    /// The new encoder opened on an IDR, so the keyframe cooldown counts from now. A session
-    /// switch keeps the clock's last stamp.
-    fn arms_idr_clock(self) -> bool {
-        self != SwapReason::SessionSwitch
-    }
 }
 
 /// What a swap installs.
@@ -136,9 +130,8 @@ impl StreamState {
         if why.rereads_enc_src() {
             self.enc_src = enc_src_of(&self.frame);
         }
-        if why.arms_idr_clock() {
-            self.clock.last_forced_idr = Some(std::time::Instant::now());
-        }
+        // The new encoder opened on an IDR: the keyframe cooldown counts from it.
+        self.clock.last_forced_idr = Some(std::time::Instant::now());
     }
 
     /// The capture side of a built pipeline, then its encoder. A new capturer numbers its
@@ -509,7 +502,8 @@ mod tests {
     }
 
     /// What one swap site leaves behind. Everything not named here holds for every site: nothing
-    /// in flight, the watchdog fed, the wind-back the old encoder owed settled.
+    /// in flight, the watchdog fed, the wind-back the old encoder owed settled, the IDR clock
+    /// armed.
     struct Row {
         site: &'static str,
         why: SwapReason,
@@ -520,7 +514,6 @@ mod tests {
         ceiling_cleared: bool,
         retarget_forgotten: bool,
         enc_src_reread: bool,
-        idr_armed: bool,
         retired: Option<u64>,
     }
 
@@ -534,7 +527,6 @@ mod tests {
             ceiling_cleared: true,
             retarget_forgotten: true,
             enc_src_reread: false,
-            idr_armed: false,
             retired: None,
         },
         Row {
@@ -546,7 +538,6 @@ mod tests {
             ceiling_cleared: true,
             retarget_forgotten: true,
             enc_src_reread: true,
-            idr_armed: true,
             retired: Some(1),
         },
         Row {
@@ -558,7 +549,6 @@ mod tests {
             ceiling_cleared: true,
             retarget_forgotten: true,
             enc_src_reread: true,
-            idr_armed: true,
             retired: None,
         },
         Row {
@@ -570,7 +560,6 @@ mod tests {
             ceiling_cleared: false,
             retarget_forgotten: true,
             enc_src_reread: true,
-            idr_armed: true,
             retired: Some(1),
         },
         Row {
@@ -582,7 +571,6 @@ mod tests {
             ceiling_cleared: false,
             retarget_forgotten: false,
             enc_src_reread: true,
-            idr_armed: true,
             retired: None,
         },
         Row {
@@ -594,7 +582,6 @@ mod tests {
             ceiling_cleared: false,
             retarget_forgotten: true,
             enc_src_reread: true,
-            idr_armed: true,
             retired: Some(1),
         },
         Row {
@@ -606,7 +593,6 @@ mod tests {
             ceiling_cleared: true,
             retarget_forgotten: false,
             enc_src_reread: true,
-            idr_armed: true,
             retired: None,
         },
         Row {
@@ -618,7 +604,6 @@ mod tests {
             ceiling_cleared: false,
             retarget_forgotten: false,
             enc_src_reread: false,
-            idr_armed: true,
             retired: None,
         },
     ];
@@ -645,6 +630,7 @@ mod tests {
                 (false, false, false),
                 "{site}: escalation carried"
             );
+            assert!(st.clock.last_forced_idr.is_some(), "{site}: IDR clock");
             assert_eq!(st.epoch != 7, row.epoch_moved, "{site}: epoch");
             let (_, ceiling) = st.encoder_ceiling.lock().unwrap().resolve(50_000);
             assert_eq!(
@@ -661,11 +647,6 @@ mod tests {
                 st.enc_src == enc_src_of(&st.frame),
                 row.enc_src_reread,
                 "{site}: enc_src"
-            );
-            assert_eq!(
-                st.clock.last_forced_idr.is_some(),
-                row.idr_armed,
-                "{site}: IDR clock"
             );
             assert_eq!(
                 row.why.retires(old_gen, st.cur_display_gen),
