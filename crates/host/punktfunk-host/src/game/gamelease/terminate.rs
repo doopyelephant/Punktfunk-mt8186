@@ -68,7 +68,7 @@ pub(super) fn terminate_blocking(shared: &LeaseShared) {
                 crate::native::prewarm::spawn_run("game ended");
             }
         }
-        LeaseKind::Child | LeaseKind::Matched | LeaseKind::Reported => {
+        LeaseKind::Child | LeaseKind::Matched | LeaseKind::Reported | LeaseKind::Adopted => {
             // A claim that lands while the ladder runs starts the title afresh; the
             // record goes once the ladder is through, so no claim adopts a corpse.
             if let Some(p) = &shared.procs {
@@ -120,12 +120,16 @@ fn unix_term_ladder(shared: &LeaseShared) {
         // as leader (`OwnedChild::group_leader`) — never the host's group.
         unsafe { libc::kill(target, sig) == 0 }
     };
-    // Matcher hits plus `reported_proc` (the only member for Reported). Taken
+    // Matcher hits, `reported_proc` (the only member for Reported) and an adopted
+    // launch's tree (all there is for Adopted: no child handle to group-signal). Taken
     // once: a process that starts after this point belongs to a session that
     // claimed the title while the ladder ran, and must outlive it.
     let targets = {
         let mut procs = shared.find_procs(&scanner);
-        if let Some(p) = reported_proc(shared) {
+        for p in reported_proc(shared)
+            .into_iter()
+            .chain(shared.adopted_tree())
+        {
             if !procs.iter().any(|q| q.pid == p.pid) {
                 procs.push(p);
             }
@@ -180,7 +184,7 @@ fn unix_term_ladder(shared: &LeaseShared) {
 }
 
 /// WM_CLOSE, wait, then terminate. No `Child` on Windows; fold in
-/// [`LeaseShared::spawned`] or an empty spec has nothing to end.
+/// [`LeaseShared::spawned`] and an adopted launch's tree, or an empty spec has nothing to end.
 #[cfg(windows)]
 fn windows_term_ladder(shared: &LeaseShared) {
     let scanner = crate::procscan::Scanner::system();
@@ -199,6 +203,7 @@ fn windows_term_ladder(shared: &LeaseShared) {
         if let Some(p) = reported_proc(shared) {
             fold(p);
         }
+        shared.adopted_tree().into_iter().for_each(&mut fold);
         procs
     };
 
@@ -236,7 +241,8 @@ fn windows_term_ladder(shared: &LeaseShared) {
 }
 
 /// End pids a launch with no lease left adopted: the set it published to
-/// [`crate::launchreg`], and only that set. For
+/// [`crate::launchreg`] and what descends from it ([`crate::procscan::tree`]), nothing
+/// else. A shell the host started is in the set; the game is its child. For
 /// [`crate::session_settings::GameOnNewLaunch::End`] and [`super::end_detached`].
 /// No lease reports this exit. The emulator bindings go back in the caller:
 /// a new launch's prepare reverts them itself, after which a revert here
@@ -244,13 +250,12 @@ fn windows_term_ladder(shared: &LeaseShared) {
 ///
 /// Blocking, bounded by [`TERM_GRACE`].
 pub fn end_previous_launch(title: &str, procs: &[crate::procscan::ProcRef], why: &str) -> usize {
-    // Re-verify before every signal (rule 2): remembered pids recycle.
-    let live = || crate::procscan::alive(procs);
-
-    let first = live();
+    // Taken once, then re-verified before every signal (rule 2): remembered pids recycle.
+    let first = crate::procscan::tree(procs);
     if first.is_empty() {
         return 0;
     }
+    let live = || crate::procscan::alive(&first);
     tracing::info!(
         title,
         procs = first.len(),

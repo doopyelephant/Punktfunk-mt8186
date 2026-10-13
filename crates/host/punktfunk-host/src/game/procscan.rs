@@ -89,6 +89,20 @@ pub fn alive(procs: &[ProcRef]) -> Vec<ProcRef> {
     }
 }
 
+/// `procs` still alive, plus every live process descended from them, each pinned to its
+/// start (rule 2). What the host started is often a shell: the game is its child. A copy the
+/// player started descends from none of them, so rule 1 holds.
+pub fn tree(procs: &[ProcRef]) -> Vec<ProcRef> {
+    let mut out = alive(procs);
+    let roots: Vec<u32> = out.iter().map(|p| p.pid).collect();
+    for pid in with_descendants(&roots) {
+        if !roots.contains(&pid) {
+            out.extend(resolve(pid));
+        }
+    }
+    out
+}
+
 /// Diagnostics only: short names in `procs` order. Not part of [`ProcRef`],
 /// which is compared for equality.
 #[cfg_attr(target_os = "macos", allow(dead_code, reason = "no scan on macOS"))]

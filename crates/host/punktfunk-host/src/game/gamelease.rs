@@ -33,11 +33,11 @@ const START_GRACE: Duration = Duration::from_secs(300);
 const POLL: Duration = Duration::from_secs(1);
 /// 3 s unseen before exit. A launcher re-exec or mid-game restart is shorter.
 #[cfg_attr(target_os = "macos", allow(dead_code, reason = "no watcher on macOS"))]
-const EXIT_CONFIRM: Duration = Duration::from_secs(3);
+pub(crate) const EXIT_CONFIRM: Duration = Duration::from_secs(3);
 /// 5 s successful child exit = launcher hand-off, never the game. Matches
 /// Apollo's `auto_detach`.
 #[cfg_attr(target_os = "macos", allow(dead_code, reason = "no watcher on macOS"))]
-const SHIM_WINDOW: Duration = Duration::from_secs(5);
+pub(crate) const SHIM_WINDOW: Duration = Duration::from_secs(5);
 /// 10 s after SIGTERM / WM_CLOSE before SIGKILL. Enough to save.
 const TERM_GRACE: Duration = Duration::from_secs(10);
 /// Cap on [`crate::procscan::running_hint`] holding off an exit after every
@@ -88,8 +88,12 @@ pub enum LeaseKind {
     /// Launcher reports start/stop ([`crate::runstate`]); the host has no
     /// process of its own. Covers a title with nothing to scan (`playnite://`).
     Reported,
-    /// No detect signals, no owned child, no provider. Both lifetime
-    /// behaviours stay inert; the host logs once rather than guessing.
+    /// The processes an earlier session of this launch was seen as
+    /// ([`crate::launchreg::LiveProcs`]). A reconnect spawns nothing, so with no
+    /// other signal those are all this lease has of the game.
+    Adopted,
+    /// No detect signals, no owned child, no provider, nothing adopted. Both
+    /// lifetime behaviours stay inert; the host logs once rather than guessing.
     Untracked,
 }
 
@@ -100,6 +104,7 @@ impl LeaseKind {
             Self::Child => "child",
             Self::Matched => "matched",
             Self::Reported => "reported",
+            Self::Adopted => "adopted",
             Self::Untracked => "untracked",
         }
     }
@@ -224,6 +229,24 @@ impl LeaseShared {
         }
     }
 
+    /// What the record holds of this launch, still alive. Empty for an unrecorded one.
+    #[cfg(any(target_os = "linux", windows))]
+    fn recorded(&self) -> Vec<crate::procscan::ProcRef> {
+        self.procs.as_ref().map_or_else(Vec::new, |slot| {
+            crate::procscan::alive(&slot.lock().unwrap_or_else(|e| e.into_inner()))
+        })
+    }
+
+    /// All an [`LeaseKind::Adopted`] lease can end: [`Self::recorded`] and what descends
+    /// from it. Empty for every other kind, whose ladders find their own targets.
+    #[cfg(any(target_os = "linux", windows))]
+    pub(super) fn adopted_tree(&self) -> Vec<crate::procscan::ProcRef> {
+        if !matches!(self.kind, LeaseKind::Adopted) {
+            return Vec::new();
+        }
+        crate::procscan::tree(&self.recorded())
+    }
+
     /// Stop every client holding this title's cover: report `running` now, and wait for no
     /// window.
     ///
@@ -344,7 +367,8 @@ pub struct LeaseRequest {
     /// the filter. A reconnect inherits it from [`crate::launchreg`].
     pub launch_stamp: Option<f64>,
     /// Adopted pids, published so the launch record outlives this watcher
-    /// ([`crate::launchreg::LiveProcs`]). `None` if unrecorded.
+    /// ([`crate::launchreg::LiveProcs`]). `None` if unrecorded. A reconnect's slot already
+    /// holds the original launch's, and the lease watches them ([`LeaseKind::Adopted`]).
     pub procs: Option<crate::launchreg::LiveProcs>,
     /// Workspace the streamed head gave this launch, if any
     /// ([`crate::library::adopt_launch_workspace`]). Released with the lease.
@@ -453,6 +477,12 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
     // number never proceeds (procscan rule 2).
     let spawned = spawned.and_then(crate::procscan::resolve);
 
+    // A reconnect adopts the launch and spawns nothing: what the record holds is all
+    // this lease has of it. A fresh launch's slot is new, so this is `false` there.
+    let adopted = procs.as_ref().is_some_and(|slot| {
+        !crate::procscan::alive(&slot.lock().unwrap_or_else(|e| e.into_inner())).is_empty()
+    });
+
     // Launcher is Untracked before `child` is considered: a just-started
     // launcher leaves a live child that must not become a `Child` lease.
     let kind = if launcher {
@@ -468,6 +498,8 @@ pub fn open(req: LeaseRequest, on_exit: OnExit) -> GameLease {
         // Provider reports liveness: tracked. Kind is asked once; flipping
         // mid-flight would couple both lifetime behaviours to plugin uptime.
         LeaseKind::Reported
+    } else if adopted {
+        LeaseKind::Adopted
     } else {
         LeaseKind::Untracked
     };
@@ -862,7 +894,8 @@ struct Watcher {
     scanner: crate::procscan::Scanner,
 }
 
-/// Wait for the game to appear, then for its window, then for it to stay gone.
+/// Wait for the game to appear, then for its window, then for it to stay gone. An adopted
+/// launch has appeared already ([`Watcher::resume`]).
 #[cfg(any(target_os = "linux", windows))]
 fn watch(
     shared: Arc<LeaseShared>,
@@ -882,7 +915,11 @@ fn watch(
         procs,
         on_exit,
     };
-    if let Some(known) = w.wait_for_start() {
+    let known = match w.kind {
+        LeaseKind::Adopted => Some(w.resume()),
+        _ => w.wait_for_start(),
+    };
+    if let Some(known) = known {
         w.watch_exit(known, window);
     }
 }
@@ -893,16 +930,62 @@ impl Watcher {
         self.shared.cancel.load(Ordering::Relaxed)
     }
 
-    /// Concrete, non-empty pids only — never the spec (rule 1: a later re-scan would
-    /// adopt a copy the player started). Never cleared: last set is how the record
-    /// answers `Gone` instead of "no opinion".
+    /// What the record remembers of this launch: the scan's hits, its own process
+    /// ([`Self::own`]) and the pid its provider names. Concrete pids only, never the spec
+    /// (rule 1: a later re-scan would adopt a copy the player started). An empty set is
+    /// not written: the last one is how the record answers `Gone` instead of "no opinion".
     fn publish(&self, live: &[crate::procscan::ProcRef]) {
-        if live.is_empty() {
+        let Some(slot) = self.procs.as_ref() else {
             return;
+        };
+        let mut set = live.to_vec();
+        for p in self.own().into_iter().chain(reported_proc(&self.shared)) {
+            if !set.iter().any(|q| q.pid == p.pid) {
+                set.push(p);
+            }
         }
-        if let Some(slot) = self.procs.as_ref() {
-            *slot.lock().unwrap_or_else(|e| e.into_inner()) = live.to_vec();
+        if !set.is_empty() {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = set;
         }
+    }
+
+    /// The process this launch started, once it outlived [`SHIM_WINDOW`]. Before that it
+    /// may be a launcher handing off, and its exit would tell the record the game is gone.
+    fn own(&self) -> Option<crate::procscan::ProcRef> {
+        if self.spawned_at.elapsed() < SHIM_WINDOW {
+            return None;
+        }
+        let child = || self.child.as_ref().map(std::process::Child::id);
+        self.spawned
+            .or_else(|| child().and_then(crate::procscan::resolve))
+    }
+
+    /// The game is up: record what it was seen as, then say so on `/status`, the event
+    /// bus and the log.
+    fn started(&self, live: &[crate::procscan::ProcRef]) {
+        self.publish(live);
+        self.shared.was_running.store(true, Ordering::Relaxed);
+        self.mark_seen();
+        self.shared.set_state(GameState::Running);
+        crate::events::emit(crate::events::EventKind::GameRunning {
+            game: game_event_ref(&self.shared),
+        });
+        tracing::info!(
+            title = %self.shared.game.title,
+            kind = self.kind.as_str(),
+            procs = live.len(),
+            // Names, not just a count ([`crate::procscan::names`]).
+            names = ?crate::procscan::names(live),
+            "the launched game is running"
+        );
+    }
+
+    /// [`LeaseKind::Adopted`] has no phase 1: the session that started this launch saw it
+    /// run. Phase 2 watches what the record holds, and an empty set there is the exit.
+    fn resume(&self) -> Vec<crate::procscan::ProcRef> {
+        let known = self.shared.recorded();
+        self.started(&known);
+        known
     }
 
     /// Re-verified each time: `alive` checks (pid, start), so a recycled pid is gone.
@@ -1049,21 +1132,7 @@ impl Watcher {
             // gated by the shim window. The only way Reported leaves this phase.
             let said_running = self.reported().is_some_and(|l| l.running);
             if scan_settled || child_alive || said_running {
-                self.publish(&live);
-                self.shared.was_running.store(true, Ordering::Relaxed);
-                self.mark_seen();
-                self.shared.set_state(GameState::Running);
-                crate::events::emit(crate::events::EventKind::GameRunning {
-                    game: game_event_ref(&self.shared),
-                });
-                tracing::info!(
-                    title = %self.shared.game.title,
-                    kind = self.kind.as_str(),
-                    procs = live.len(),
-                    // Names, not just a count ([`crate::procscan::names`]).
-                    names = ?crate::procscan::names(&live),
-                    "the launched game is running"
-                );
+                self.started(&live);
                 return Some(live);
             }
             if Instant::now() >= start_deadline {
@@ -1148,6 +1217,8 @@ impl Watcher {
                 if !said.running {
                     return exited("its provider reported the game stopped", run);
                 }
+                // A provider may name the pid after its first report.
+                self.publish(&[]);
                 gone_since = None;
                 vetoed = false;
                 self.mark_seen();
@@ -1886,6 +1957,57 @@ mod tests {
         crate::runstate::forget(PROVIDER);
         let _ = victim.kill();
         let _ = victim.wait();
+    }
+
+    /// The pid a provider names goes on the record, so a reconnect that finds the
+    /// provider quiet still has the game to watch instead of opening untracked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reported_pid_is_recorded_for_the_session_that_comes_back() {
+        const ID: &str = "playnite:recorded-pid";
+        const PROVIDER: &str = "playnite-recorded-pid";
+
+        let launch_stamp = launch_clock();
+        let mut game = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn the game a plugin would point at");
+        crate::runstate::report(
+            PROVIDER,
+            [ID.to_string()].into_iter().collect(),
+            [(ID.to_string(), Some(game.id()))].into_iter().collect(),
+        );
+        let slot: crate::launchreg::LiveProcs = Arc::new(Mutex::new(Vec::new()));
+        let recorded = || slot.lock().unwrap().iter().any(|p| p.pid == game.id());
+        let open_again = || {
+            open(
+                LeaseRequest {
+                    launch_stamp,
+                    procs: Some(slot.clone()),
+                    ..req(ID, DetectSpec::default(), false)
+                },
+                Box::new(|| {}),
+            )
+        };
+
+        let first = open_again();
+        assert!(matches!(first.shared().kind(), LeaseKind::Reported));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !recorded() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(recorded(), "the record never learned the reported pid");
+        drop(first);
+
+        crate::runstate::forget(PROVIDER);
+        let second = open_again();
+        assert!(
+            matches!(second.shared().kind(), LeaseKind::Adopted),
+            "a quiet provider must not leave the running game untracked"
+        );
+        drop(second);
+        let _ = game.kill();
+        let _ = game.wait();
     }
 
     /// The one rule that separates the reporter's dead launch from a Proton
