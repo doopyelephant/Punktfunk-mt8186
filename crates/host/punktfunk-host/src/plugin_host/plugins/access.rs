@@ -1660,6 +1660,7 @@ mod tests {
 
     /// The grants file as the store's own writer leaves it: one plugin with every kind of row,
     /// one with no grant.
+    #[cfg(unix)]
     fn grants_file_sample() -> String {
         let f = fixture();
         let s = f.store();
