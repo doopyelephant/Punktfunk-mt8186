@@ -146,7 +146,7 @@ pub enum AppMsg {
     /// Preferences closed: re-read what the window itself follows.
     SettingsClosed,
     ToggleFullscreen,
-    /// The console child exited; `Some` carries why it ended badly.
+    /// The console child exited; `Some` is the banner for one that ended badly.
     ConsoleExited(Option<String>),
     /// Upload the client log ring to this paired host (`logring::send_to_host`); the
     /// outcome lands as a Toast either way. The mgmt port rides along when an advert has one.
@@ -592,8 +592,7 @@ impl SimpleComponent for AppModel {
                 self.flight.release();
                 // Quitting the console (B at its root) exits 0 and returns here silently.
                 if let Some(e) = err {
-                    self.hosts
-                        .emit(HostsMsg::ShowError(format!("Console UI ended — {e}")));
+                    self.hosts.emit(HostsMsg::ShowError(e));
                 }
                 self.hosts.emit(HostsMsg::Refresh);
             }

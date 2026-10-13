@@ -210,38 +210,15 @@ impl AppModel {
         if !self.flight.hold() {
             return;
         }
-        // The console owns the screen and the pads while it runs, so it takes the slot
-        // like a stream does. `wait_check_async` lands the exit on this main loop —
-        // no thread, no channel — and turns a non-zero exit into the error the
-        // banner shows, which is also how a session built without `ui` surfaces.
-        let mut argv = vec![
-            std::ffi::OsString::from(crate::app::spawn::session_binary()),
-            "--browse".into(),
-        ];
-        // Same knobs a stream uses — the session also fullscreens itself on the Deck
-        // and under gamescope regardless.
+        // The console owns the screen and the pads while it runs, so it takes the slot like
+        // a stream does. The session also fullscreens itself on the Deck and under gamescope.
         let settings = self.store.settings();
-        if settings.fullscreen_on_stream || settings.fullscreen_always() {
-            argv.push("--fullscreen".into());
-        }
+        let fullscreen = settings.fullscreen_on_stream || settings.fullscreen_always();
         drop(settings);
-        if until_no_pads {
-            argv.push("--until-no-controller".into());
-        }
-        let argv: Vec<&std::ffi::OsStr> = argv.iter().map(std::ffi::OsString::as_os_str).collect();
-        match gio::Subprocess::newv(&argv, gio::SubprocessFlags::NONE) {
-            Ok(child) => {
-                let sender = sender.clone();
-                child.wait_check_async(gio::Cancellable::NONE, move |res| {
-                    sender.input(AppMsg::ConsoleExited(res.err().map(|e| e.to_string())));
-                });
-            }
-            Err(e) => {
-                self.flight.release();
-                self.hosts.emit(HostsMsg::ShowError(format!(
-                    "Couldn't start the console UI — {e}"
-                )));
-            }
+        let out = sender.input_sender().clone();
+        if let Err(e) = spawn::spawn_console(out, fullscreen, until_no_pads) {
+            self.flight.release();
+            self.hosts.emit(HostsMsg::ShowError(e));
         }
     }
 

@@ -13,7 +13,7 @@
 
 use crate::app::AppMsg;
 use crate::hosts::ConnectRequest;
-use pf_client_core::orchestrate::{self, ConnectPlan, HostTarget, SessionEvent};
+use pf_client_core::orchestrate::{self, ConnectOutcome, ConnectPlan, HostTarget, SessionEvent};
 
 /// Spawn tunables beyond a plain connect.
 #[derive(Debug, Default)]
@@ -93,6 +93,35 @@ pub fn spawn_session(
             });
         }
     })
+}
+
+/// Spawns the console and posts [`AppMsg::ConsoleExited`] with what its exit shows. `Err` is
+/// the banner for a console that never started.
+pub fn spawn_console(
+    sender: relm4::Sender<AppMsg>,
+    fullscreen: bool,
+    until_no_pads: bool,
+) -> Result<(), String> {
+    let cmd = orchestrate::browse_command(fullscreen, until_no_pads);
+    let (mut error, mut ended) = (None::<orchestrate::SessionError>, None::<String>);
+    let on_event = move |ev: SessionEvent| match ev {
+        SessionEvent::Error(e) => error = Some(e),
+        SessionEvent::Ended(msg) => ended = Some(msg),
+        SessionEvent::Exited(code) => {
+            let outcome = ConnectOutcome::from_exit(code, error.take(), ended.take(), false);
+            let banner = outcome.console_banner("the client log");
+            let _ = sender.send(AppMsg::ConsoleExited(banner));
+        }
+        // This shell draws nothing for a ready or a stats line, and `spawn_child` saves the
+        // window size.
+        SessionEvent::Ready | SessionEvent::Window { .. } | SessionEvent::Stats(_) => {}
+    };
+    orchestrate::spawn_child(cmd, None, None, std::io::stderr(), on_event)
+        .map(drop)
+        .map_err(|e| {
+            tracing::error!(error = %e, "console did not launch");
+            orchestrate::CONSOLE_NOT_STARTED.to_string()
+        })
 }
 
 #[cfg(test)]

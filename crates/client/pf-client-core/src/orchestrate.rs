@@ -746,7 +746,8 @@ impl ConnectOutcome {
     }
 
     /// What a console exit shows on the host list. `None` after a quit or our own kill, else
-    /// the line the console ended on, or [`Self::died_banner`] when it said nothing.
+    /// the line the console ended on. One that said nothing shows how it went, in the shape of
+    /// [`Self::died_banner`]: no exit code means a signal killed it.
     pub fn console_banner(&self, log: &str) -> Option<String> {
         match self {
             ConnectOutcome::Ended(None) | ConnectOutcome::Cancelled => None,
@@ -754,7 +755,15 @@ impl ConnectOutcome {
             | ConnectOutcome::ConnectFailed(msg)
             | ConnectOutcome::Refused { msg, .. }
             | ConnectOutcome::Ended(Some(msg)) => Some(msg.clone()),
-            ConnectOutcome::RendererFailed { code } => Some(Self::died_banner(*code, log)),
+            ConnectOutcome::RendererFailed { code: -1 } => {
+                Some("The console was killed — out of memory, or stopped by the system".into())
+            }
+            ConnectOutcome::RendererFailed { code } => {
+                let how = Self::exit_phrase(*code);
+                Some(format!(
+                    "The console didn't start (punktfunk-session {how}). Check {log}."
+                ))
+            }
         }
     }
 
@@ -1132,6 +1141,10 @@ pub fn session_command(plan: &ConnectPlan) -> (Command, Option<std::path::PathBu
     cmd.args(args);
     (cmd, spec_path)
 }
+
+/// What a console that never spawned shows. [`ConnectOutcome::console_banner`] has the
+/// sentences for one that did.
+pub const CONSOLE_NOT_STARTED: &str = "The console didn't start. Check the client log.";
 
 /// The console command: `--browse` with the stdout contract on, so a shell reads its ready
 /// and its exit as it reads a stream's. `until_no_pads` hands the desk back once the last
@@ -1798,7 +1811,18 @@ mod tests {
                 O::ConnectFailed("no display".into()),
                 Some("no display".into()),
             ),
-            (O::RendererFailed { code: 4 }, Some(O::died_banner(4, log))),
+            (
+                O::RendererFailed { code: 4 },
+                Some(
+                    "The console didn't start (punktfunk-session exited with code 4). \
+                     Check the client log."
+                        .into(),
+                ),
+            ),
+            (
+                O::RendererFailed { code: -1 },
+                Some("The console was killed — out of memory, or stopped by the system".into()),
+            ),
         ] {
             assert_eq!(outcome.console_banner(log), want, "{outcome:?}");
         }
