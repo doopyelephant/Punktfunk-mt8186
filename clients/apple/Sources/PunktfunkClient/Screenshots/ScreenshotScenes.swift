@@ -4,6 +4,9 @@
 // live stream is faked (StreamView needs a real punktfunk/1 connection — see ShotStreamHero).
 
 #if DEBUG
+#if os(visionOS)
+import CoreVideo
+#endif
 import PunktfunkKit
 import SwiftUI
 
@@ -236,6 +239,12 @@ enum ShotScenes {
         })
         scenes.append(ShotScene(name: "25g-tv-customize-moved", orientation: .natural, colorScheme: .dark) {
             AnyView(ShotTVCustomizeMoved())
+        })
+        #endif
+        #if os(visionOS)
+        // The theater: the app's own immersive space, with the hero frame on its screen.
+        scenes.append(ShotScene(name: "30-vision-theater", orientation: .natural, colorScheme: .dark) {
+            AnyView(ShotTheater())
         })
         #endif
         return scenes
@@ -854,10 +863,11 @@ private struct ShotTrust: View {
 // MARK: - Stream hero
 
 /// The marketing hero: a stand-in streamed frame with the real glass HUD chip on top.
-/// StreamView can't render here (it needs a live punktfunk/1 connection), so the frame is
-/// synthetic — set `PUNKTFUNK_SHOT_HERO=/path/to/frame.png` to drop in a real captured frame.
+/// StreamView needs a live connection, so the frame is synthetic: set
+/// `PUNKTFUNK_SHOT_HERO=/path/to/frame.png` to drop in a real captured frame.
 /// The frame fills the display; the HUD stays inside the safe area. The status bar and home
-/// indicator hide, as they do for a live session.
+/// indicator hide, as they do for a live session. visionOS hangs the stream window's ornament
+/// below it.
 private struct ShotStreamHero: View {
     #if os(macOS)
     /// The App Store canvas's scale: a 1× monitor still shoots the 2× Mac.
@@ -881,8 +891,66 @@ private struct ShotStreamHero: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         #endif
+        #if os(visionOS)
+        .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
+            StreamOrnamentBar(inTheater: false, theater: {}, quickActions: {})
+        }
+        #endif
     }
 }
+
+#if os(visionOS)
+/// The theater as a session opens it: the real immersive space with the hero frame on its
+/// screen, and the stream window shrunk to its panel.
+private struct ShotTheater: View {
+    @Environment(\.openImmersiveSpace) private var openImmersiveSpace
+
+    var body: some View {
+        Color.black.ignoresSafeArea()
+            .overlay { InTheaterPlaceholder() }
+            .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
+                StreamOrnamentBar(inTheater: true, theater: {}, quickActions: {})
+            }
+            .task {
+                let renderers = TheaterStage.shared.debugEnter()
+                // Before the space opens: its scene joins `connectedScenes` too.
+                UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?
+                    .requestGeometryUpdate(.Vision(size: StreamViewController.theaterPanel))
+                guard case .opened = await openImmersiveSpace(id: TheaterStage.spaceID),
+                      let frame = Self.frame() else { return }
+                // Kept coming, as a stream's frames do: the screen takes its size from them.
+                while !Task.isCancelled {
+                    renderers.debugShow(frame)
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
+    }
+
+    /// The hero frame at 4K, in the kind of buffer a decoded stream frame arrives in.
+    @MainActor
+    private static func frame() -> CVPixelBuffer? {
+        let renderer = ImageRenderer(
+            content: ShotDesktopFrame(chip: false).frame(width: 1920, height: 1080))
+        renderer.scale = 2
+        guard let image = renderer.cgImage else { return nil }
+        var buffer: CVPixelBuffer?
+        CVPixelBufferCreate(
+            nil, image.width, image.height, kCVPixelFormatType_32BGRA,
+            [kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary] as CFDictionary, &buffer)
+        guard let buffer else { return nil }
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        CGContext(
+            data: CVPixelBufferGetBaseAddress(buffer), width: image.width, height: image.height,
+            bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+                | CGBitmapInfo.byteOrder32Little.rawValue)?
+            .draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return buffer
+    }
+}
+#endif
 
 /// A faithful copy of StreamHUDView's overlay (which needs a live PunktfunkConnection for the
 /// mode line), reusing the app's real `.glassBackground`. The mode line is the capturing
@@ -944,8 +1012,11 @@ private struct ShotHUD: View {
 
 /// A synthetic "streamed frame" — a synthwave scene that reads as game content without shipping
 /// any real art. Replaced wholesale when `PUNKTFUNK_SHOT_HERO` points at a real PNG. Fills the
-/// whole display, safe area included, like the real stream.
+/// whole display, safe area included, like the real stream. The "now playing" chip is glass,
+/// which only a live view draws: an offscreen render goes without.
 private struct ShotDesktopFrame: View {
+    var chip = true
+
     var body: some View {
         Group {
             if let image = Self.overrideImage {
@@ -1016,14 +1087,16 @@ private struct ShotDesktopFrame: View {
         }
         .overlay(alignment: .bottomLeading) {
             // A small "now playing" chip so the frame reads as live content, not a wallpaper.
-            HStack(spacing: 8) {
-                Image(systemName: "gamecontroller.fill")
-                Text("Streaming from Battlestation")
-                    .font(.geist(16, .semibold, relativeTo: .callout))
+            if chip {
+                HStack(spacing: 8) {
+                    Image(systemName: "gamecontroller.fill")
+                    Text("Streaming from Battlestation")
+                        .font(.geist(16, .semibold, relativeTo: .callout))
+                }
+                .padding(.horizontal, 14).padding(.vertical, 9)
+                .glassBackground(Capsule())
+                .padding(18)
             }
-            .padding(.horizontal, 14).padding(.vertical, 9)
-            .glassBackground(Capsule())
-            .padding(18)
         }
     }
 
