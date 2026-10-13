@@ -86,6 +86,8 @@ exclude = [
     # A Windows-only design spike: its ring states are the design it tested, not the shipped au
     # ring's, so it builds on its own and no CI leg compiles it.
     "tools/fence-ring-spike",
+    # libFuzzer targets: nightly and `cargo fuzz` only, run weekly by audit.yml.
+    "fuzz",
 ]
 
 # ndk 0.9.0 with a small maintained patch set: public `MediaCodec::as_ptr` for the missing
