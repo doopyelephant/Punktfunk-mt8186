@@ -9,8 +9,8 @@ use super::style::*;
 use super::{AppCtx, Screen, Svc, Target};
 use crate::trust::{self, KnownHosts};
 use pf_client_core::orchestrate::{
-    self, trust_route, wake_parked_line, CancelHandle, ConnectAttempt, ConnectOutcome, ExitRoute,
-    HostTarget, TrustRoute, WakeOutcome, WakeWait, FINGERPRINT_CHANGED, WAKE_PARKED_HINT,
+    self, trust_route, wake_parked_line, CancelHandle, ConnectAttempt, ExitRoute, HostTarget,
+    TrustRoute, WakeOutcome, WakeWait, FINGERPRINT_CHANGED, WAKE_PARKED_HINT,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -403,18 +403,9 @@ pub(crate) fn open_console(
             SpawnEvent::Stats(s) => *shared.stats.lock().unwrap() = Some(*s),
             SpawnEvent::Exited(outcome) => {
                 crate::shell_window::restore();
-                // Quit from the library (B / closing the window) or Disconnect returns
-                // silently; a failed start surfaces its error line, or the exit code when
-                // it died without producing one.
-                match outcome {
-                    ConnectOutcome::TrustRejected(msg)
-                    | ConnectOutcome::ConnectFailed(msg)
-                    | ConnectOutcome::Refused { msg, .. }
-                    | ConnectOutcome::Ended(Some(msg)) => st.call(msg),
-                    ConnectOutcome::RendererFailed { code } => {
-                        st.call(ConnectOutcome::died_banner(code, &crate::spawn::log_hint()))
-                    }
-                    ConnectOutcome::Ended(None) | ConnectOutcome::Cancelled => {}
+                // A quit from the library or Disconnect returns silently.
+                if let Some(msg) = outcome.console_banner(&crate::spawn::log_hint()) {
+                    st.call(msg);
                 }
                 ss.call(Screen::Hosts);
             }

@@ -745,6 +745,19 @@ impl ConnectOutcome {
         }
     }
 
+    /// What a console exit shows on the host list. `None` after a quit or our own kill, else
+    /// the line the console ended on, or [`Self::died_banner`] when it said nothing.
+    pub fn console_banner(&self, log: &str) -> Option<String> {
+        match self {
+            ConnectOutcome::Ended(None) | ConnectOutcome::Cancelled => None,
+            ConnectOutcome::TrustRejected(msg)
+            | ConnectOutcome::ConnectFailed(msg)
+            | ConnectOutcome::Refused { msg, .. }
+            | ConnectOutcome::Ended(Some(msg)) => Some(msg.clone()),
+            ConnectOutcome::RendererFailed { code } => Some(Self::died_banner(*code, log)),
+        }
+    }
+
     /// The banner for a session that died without a contract line: a missing runtime, a
     /// crash, or the wrong binary. `log` names where the cause is.
     pub fn died_banner(code: i32, log: &str) -> String {
@@ -1118,6 +1131,21 @@ pub fn session_command(plan: &ConnectPlan) -> (Command, Option<std::path::PathBu
     };
     cmd.args(args);
     (cmd, spec_path)
+}
+
+/// The console command: `--browse` with the stdout contract on, so a shell reads its ready
+/// and its exit as it reads a stream's. `until_no_pads` hands the desk back once the last
+/// controller is gone.
+pub fn browse_command(fullscreen: bool, until_no_pads: bool) -> Command {
+    let mut cmd = Command::new(session_binary());
+    cmd.args(["--browse", "--json-status"]);
+    if fullscreen {
+        cmd.arg("--fullscreen");
+    }
+    if until_no_pads {
+        cmd.arg("--until-no-controller");
+    }
+    cmd
 }
 
 /// Spawns the session for `plan` and supervises it. See [`spawn_child`].
@@ -1754,6 +1782,36 @@ mod tests {
         assert!(
             !O::RendererFailed { code: -1 }.warrants_wake(),
             "a system kill"
+        );
+    }
+
+    /// A console that quits says nothing. One that ends badly shows its own line, or where
+    /// the cause is when it had none.
+    #[test]
+    fn a_console_exit_shows_its_line_or_the_log() {
+        use ConnectOutcome as O;
+        let log = "the client log";
+        for (outcome, want) in [
+            (O::Ended(None), None),
+            (O::Cancelled, None),
+            (
+                O::ConnectFailed("no display".into()),
+                Some("no display".into()),
+            ),
+            (O::RendererFailed { code: 4 }, Some(O::died_banner(4, log))),
+        ] {
+            assert_eq!(outcome.console_banner(log), want, "{outcome:?}");
+        }
+        let args = |cmd: Command| -> Vec<String> {
+            cmd.get_args().map(|a| a.to_string_lossy().into()).collect()
+        };
+        assert_eq!(
+            args(browse_command(false, false)),
+            ["--browse", "--json-status"]
+        );
+        assert_eq!(
+            args(browse_command(true, true))[2..],
+            ["--fullscreen", "--until-no-controller"]
         );
     }
 
