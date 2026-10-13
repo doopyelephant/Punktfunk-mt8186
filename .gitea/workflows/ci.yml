@@ -264,6 +264,14 @@ jobs:
           python3 scripts/ci/check-crate-groups.py --self-test
           python3 scripts/ci/check-crate-groups.py
 
+      # mgmt is the host crate's HTTP layer: game, library and plugin_host never import it, and
+      # the two under game never import game. An import upward closes a module cycle. Pure
+      # text, no cargo.
+      - name: Host module layering gate
+        run: |
+          python3 scripts/ci/check-host-layers.py --self-test
+          python3 scripts/ci/check-host-layers.py
+
       # The plugin runner's unit replaces the home with a tmpfs, so a config file it reads and the
       # unit does not bind is ENOENT at runtime — which is how plugin-tokens.json shipped unbound
       # and no Linux plugin could start. Reads the names out of the SDK, not a second list.
