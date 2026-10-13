@@ -40,7 +40,8 @@ const TRUST_ATTEMPTS: u32 = 3;
 const TRUST_RETRY: Duration = Duration::from_secs(2);
 /// The role's install state, then licensing and a GPU as `0`/`1` flags, on the last line. A role
 /// the cmdlet can't read is `Unknown`, after the cmdlet's error. The licensing types 2 and 4 are
-/// Per Device and Per User; an adapter named `Microsoft …` is the basic or remote display driver.
+/// Per Device and Per User. A GPU sits on PCI and isn't `Microsoft …`, the basic display driver:
+/// punktfunk's own display (`ROOT\…`) and a seat's (`SWD\…`) don't count.
 const PROBE: &str = "$ProgressPreference='SilentlyContinue'; \
     $ErrorActionPreference='SilentlyContinue'; \
     $role = 'Unknown'; \
@@ -49,7 +50,7 @@ const PROBE: &str = "$ProgressPreference='SilentlyContinue'; \
     $mode = (Get-CimInstance -Namespace root/cimv2/TerminalServices \
     -ClassName Win32_TerminalServiceSetting).LicensingType; \
     $gpu = [bool](Get-CimInstance Win32_VideoController | \
-    Where-Object { $_.Name -notlike 'Microsoft *' }); \
+    Where-Object { $_.PNPDeviceID -like 'PCI\\*' -and $_.Name -notlike 'Microsoft *' }); \
     '{0} {1} {2}' -f $role, [int]($mode -in 2,4), [int]$gpu";
 
 /// The prerequisites for seats, one diagnostic each: info when met, an error with the next move
