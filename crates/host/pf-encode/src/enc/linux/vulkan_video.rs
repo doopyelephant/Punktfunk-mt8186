@@ -1357,7 +1357,7 @@ impl VulkanVideoEncoder {
             video_encode_av1: vk::TRUE,
         };
         if av1 {
-            av1_features.p_next = device_ci.p_next as *mut c_void;
+            av1_features.p_next = device_ci.p_next.cast_mut();
             device_ci.p_next = &av1_features as *const _ as *const c_void;
         }
         // Spec: must be enabled to chain the rgb profile.
@@ -1367,7 +1367,7 @@ impl VulkanVideoEncoder {
             video_encode_rgb_conversion: vk::TRUE,
         };
         if rgb_cfg.is_some() {
-            rgb_features.p_next = device_ci.p_next as *mut c_void;
+            rgb_features.p_next = device_ci.p_next.cast_mut();
             device_ci.p_next = &rgb_features as *const _ as *const c_void;
         }
         // Spec: the feature must be enabled before a session declares an intra refresh mode.
@@ -1377,7 +1377,7 @@ impl VulkanVideoEncoder {
             video_encode_intra_refresh: vk::TRUE,
         };
         if intra_refresh.is_some() {
-            ir_features.p_next = device_ci.p_next as *mut c_void;
+            ir_features.p_next = device_ci.p_next.cast_mut();
             device_ci.p_next = &ir_features as *const _ as *const c_void;
         }
         let device = instance

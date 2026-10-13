@@ -1171,14 +1171,14 @@ impl NvSession {
                 sei.push(nv::NV_ENC_SEI_PAYLOAD {
                     payloadSize: p.len() as u32,
                     payloadType: pf_frame::hdr::SEI_TYPE_MASTERING_DISPLAY_COLOUR_VOLUME,
-                    payload: p.as_ptr() as *mut u8,
+                    payload: p.as_ptr().cast_mut(),
                 });
             }
             if let Some(p) = cll_sei.as_ref() {
                 sei.push(nv::NV_ENC_SEI_PAYLOAD {
                     payloadSize: p.len() as u32,
                     payloadType: pf_frame::hdr::SEI_TYPE_CONTENT_LIGHT_LEVEL_INFO,
-                    payload: p.as_ptr() as *mut u8,
+                    payload: p.as_ptr().cast_mut(),
                 });
             }
         }

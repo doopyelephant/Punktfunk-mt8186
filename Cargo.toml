@@ -178,6 +178,15 @@ unsafe_op_in_unsafe_fn = "deny"
 # pf-inject/vendor/usbip-sim) stay out, deliberately — upstream code stays pristine.
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
+# `*const T as *mut T` reads like any other cast. `cast_mut()` names the one that can turn a
+# shared borrow into a write, so a grep finds every site.
+ptr_cast_constness = "deny"
+# `SAFETY:` on safe code reads as a proof and proves nothing.
+unnecessary_safety_doc = "deny"
+unnecessary_safety_comment = "deny"
+# Warn, which CI's `-D warnings` denies: a mapped view or an OS buffer is aligned by a rule the
+# compiler cannot see, and each such cast says which in an `#[expect(.., reason)]`.
+cast_ptr_alignment = "warn"
 
 # PROVENANCE has no lint and no sanitizer, so the rule lives here. A pointer into a C flexible
 # array is taken from the whole struct with `&raw const (*detail).DevicePath`, never from the

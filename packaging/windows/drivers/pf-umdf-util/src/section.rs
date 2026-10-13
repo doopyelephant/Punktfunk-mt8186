@@ -115,6 +115,10 @@ impl MappedView {
 
     /// Load one 4-aligned synchronization word with `order`.
     #[inline]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     pub fn load_u32(&self, off: usize, order: Ordering) -> u32 {
         let _access = self.lock_access();
         self.check(off, 4, 4);
@@ -125,6 +129,10 @@ impl MappedView {
 
     /// Atomic `u32` store at `off` (must be 4-aligned).
     #[inline]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     pub fn store_u32(&self, off: usize, v: u32, order: Ordering) {
         let _access = self.lock_access();
         self.check(off, 4, 4);
@@ -134,6 +142,10 @@ impl MappedView {
 
     /// Atomic `u64` load at `off` (must be 8-aligned).
     #[inline]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     pub fn load_u64(&self, off: usize, order: Ordering) -> u64 {
         let _access = self.lock_access();
         self.check(off, 8, 8);
@@ -158,6 +170,10 @@ impl MappedView {
     /// Relaxed `u16` load at `off` (must be 2-aligned): one instruction, so a peer's aligned
     /// store is seen whole — byte-wise reads can return a value neither side ever wrote.
     #[inline]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     pub fn read_u16(&self, off: usize) -> u16 {
         let _access = self.lock_access();
         self.check(off, 2, 2);
@@ -205,6 +221,10 @@ impl MappedView {
     /// (compare-exchange, Acquire/Release pairs). Bounds- and alignment-checked once; not under
     /// the local lock, so never mix it with the locked accessors on the same field.
     #[inline]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     pub fn atomic_u32(&self, off: usize) -> &AtomicU32 {
         self.check(off, 4, 4);
         // SAFETY: `check` proved the word is in the live mapping and 4-aligned; every bit
@@ -214,6 +234,10 @@ impl MappedView {
 
     /// [`Self::atomic_u32`] for an 8-aligned u64.
     #[inline]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     pub fn atomic_u64(&self, off: usize) -> &AtomicU64 {
         self.check(off, 8, 8);
         // SAFETY: as `atomic_u32`, with 8-byte size and alignment checked.

@@ -42,6 +42,10 @@ impl AuView {
         Self { base, len }
     }
 
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     fn word32(&self, off: usize) -> &AtomicU32 {
         assert!(off % 4 == 0 && off + 4 <= self.len);
         // SAFETY: an in-bounds, aligned word of the mapping `new`'s contract keeps alive; the
@@ -49,6 +53,10 @@ impl AuView {
         unsafe { &*self.base.add(off).cast::<AtomicU32>() }
     }
 
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     fn word64(&self, off: usize) -> &AtomicU64 {
         assert!(off % 8 == 0 && off + 8 <= self.len);
         // SAFETY: as `word32`, for an 8-aligned word.

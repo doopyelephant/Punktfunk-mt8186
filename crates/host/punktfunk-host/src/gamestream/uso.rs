@@ -64,14 +64,14 @@ fn send_one_uso(socket: &std::net::UdpSocket, buf: &[u8], seg_size: u16) -> std:
     let cmsghdr_align = |n: usize| (n + align_hdr - 1) & !(align_hdr - 1);
     let hdr = std::mem::size_of::<CMSGHDR>();
 
-    // 8-byte-aligned control buffer; 32 B holds one u32 cmsg (WSA_CMSG_SPACE(4) = 24 on x64).
-    #[repr(align(8))]
-    struct Aligned([u8; 32]);
-    let mut ctrl = Aligned([0u8; 32]);
+    // `u64` words keep the control buffer 8-aligned; 32 B holds one u32 cmsg
+    // (WSA_CMSG_SPACE(4) = 24 on x64).
+    let mut ctrl = [0u64; 4];
+    let ctrl = &raw mut ctrl;
 
     let mut data = WSABUF {
         len: buf.len() as u32,
-        buf: PSTR(buf.as_ptr() as *mut u8), // WSASendMsg only reads it
+        buf: PSTR(buf.as_ptr().cast_mut()), // WSASendMsg only reads it
     };
     let mut msg = WSAMSG {
         name: std::ptr::null_mut(),
@@ -80,7 +80,7 @@ fn send_one_uso(socket: &std::net::UdpSocket, buf: &[u8], seg_size: u16) -> std:
         dwBufferCount: 1,
         Control: WSABUF {
             len: 0,
-            buf: PSTR(ctrl.0.as_mut_ptr()),
+            buf: PSTR(ctrl.cast::<u8>()),
         },
         dwFlags: 0,
     };
@@ -93,7 +93,7 @@ fn send_one_uso(socket: &std::net::UdpSocket, buf: &[u8], seg_size: u16) -> std:
     // synchronous call (no OVERLAPPED); `data.buf` points into `buf`, which WSASendMsg only
     // reads for `buf.len()` bytes; `socket` is borrowed, so its handle stays open.
     unsafe {
-        let cmsg = ctrl.0.as_mut_ptr() as *mut CMSGHDR;
+        let cmsg = ctrl.cast::<CMSGHDR>();
         (*cmsg).cmsg_len = cmsg_len;
         (*cmsg).cmsg_level = IPPROTO_UDP.0;
         (*cmsg).cmsg_type = UDP_SEND_MSG_SIZE;
@@ -300,5 +300,23 @@ mod tests {
             !is_transient_io(&Error::from_raw_os_error(10013)),
             "WSAEACCES must stay fatal"
         );
+    }
+
+    /// A real `WSASendMsg` carrying the segment-size cmsg: one buffer arrives as two datagrams.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn uso_splits_one_buffer_into_segments_on_loopback() {
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.connect(rx.local_addr().unwrap()).unwrap();
+        let buf = [[1u8; 100], [2u8; 100]].concat();
+        send_one_uso(&tx, &buf, 100).unwrap();
+        let mut got = [0u8; 256];
+        for want in [1u8, 2] {
+            let n = rx.recv(&mut got).unwrap();
+            assert_eq!((n, got[0]), (100, want));
+        }
     }
 }

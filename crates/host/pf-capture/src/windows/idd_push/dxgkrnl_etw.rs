@@ -209,7 +209,7 @@ impl EtwWatch {
             (*props).MaximumBuffers = 4;
             (*props).FlushTimer = 1;
             (*props).LoggerNameOffset = base as u32;
-            StartTraceW(&mut session, PWSTR(name.as_ptr() as *mut _), props)
+            StartTraceW(&mut session, PWSTR(name.as_ptr().cast_mut()), props)
         };
         if rc != ERROR_SUCCESS {
             tracing::debug!(
@@ -239,7 +239,7 @@ impl EtwWatch {
         }
 
         let mut log = EVENT_TRACE_LOGFILEW {
-            LoggerName: PWSTR(name.as_ptr() as *mut _),
+            LoggerName: PWSTR(name.as_ptr().cast_mut()),
             ..Default::default()
         };
         // RAW_TIMESTAMP stops ProcessTrace converting `EVENT_HEADER.TimeStamp` to FILETIME, so

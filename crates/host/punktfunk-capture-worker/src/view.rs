@@ -48,6 +48,10 @@ impl View {
 }
 
 impl SectionView for View {
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     fn atomic_u32(&self, off: usize) -> &AtomicU32 {
         self.check(off, 4, 4);
         // SAFETY: `check` proved the word is inside the live mapping and 4-aligned; every bit
@@ -55,6 +59,10 @@ impl SectionView for View {
         unsafe { &*self.base.add(off).cast::<AtomicU32>() }
     }
 
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     fn atomic_u64(&self, off: usize) -> &AtomicU64 {
         self.check(off, 8, 8);
         // SAFETY: as `atomic_u32`, with 8-byte size and alignment checked.

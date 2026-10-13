@@ -251,7 +251,7 @@ impl GpuTimer {
             } else {
                 c"vkGetCalibratedTimestampsEXT"
             };
-            // SAFETY: both entry points share `PFN_vkGetCalibratedTimestampsKHR`'s signature.
+            // Both entry points share `PFN_vkGetCalibratedTimestampsKHR`'s signature.
             instance
                 .get_device_proc_addr(device.handle(), name.as_ptr())
                 .map(|f| std::mem::transmute::<_, vk::PFN_vkGetCalibratedTimestampsKHR>(f))
@@ -1748,7 +1748,7 @@ impl PyroWaveEncoder {
             Ok(())
         })();
         if let Err(e) = record_and_submit {
-            // SAFETY: every closure error arm is RECORDING/INVALID/EXECUTABLE — never PENDING
+            // Every closure error arm is RECORDING/INVALID/EXECUTABLE — never PENDING
             // (nothing was enqueued) — and the pool allows the reset. The reset discards any
             // cursor upload recorded here, so the slot forgets it had one.
             let _ = dev.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty());

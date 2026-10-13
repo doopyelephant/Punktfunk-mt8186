@@ -55,7 +55,7 @@ impl StreamState {
         }
         tracing::info!(from = self.compositor.id(), to = sw.compositor.id(), kind = ?sw.kind,
             "session switch — rebuilding backend in place");
-        // Only writer is not safety: `setenv` races every concurrent `getenv` in the process.
+        // Being the only writer proves nothing: `setenv` races every concurrent `getenv` in the process.
         if let Some(env) = sw.env {
             crate::vdisplay::apply_session_env(&crate::vdisplay::ActiveSession {
                 kind: sw.kind,

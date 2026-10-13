@@ -5,8 +5,6 @@
 //! vocabulary, the `VkDevice` handoff, the presenter's SPIR-V and PyroWave decode: the
 //! modules Android links directly. webOS, Apple and wasm never build it.
 
-// Every `unsafe` block and `unsafe impl` in this crate carries a `// SAFETY:` proof.
-
 // Decoder-input capture behind `PUNKTFUNK_DUMP_VIDEO`, written by the session pump.
 #[cfg(desktop)]
 pub mod au_dump;

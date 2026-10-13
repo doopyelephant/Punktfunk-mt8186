@@ -25,6 +25,10 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
+ptr_cast_constness = "deny"
+unnecessary_safety_doc = "deny"
+unnecessary_safety_comment = "deny"
+cast_ptr_alignment = "warn"
 
 [workspace.dependencies]
 # NOTE: the high-level `wdk` crate (0.4.1) used to be declared here and taken by five driver

@@ -161,9 +161,10 @@ mod windows {
     pub(super) fn link_facts_by_ip(ip: IpAddr) -> LinkFacts {
         let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
         let mut len: u32 = 16 * 1024;
-        let mut buf: Vec<u8> = Vec::new();
+        // `u64` words: the adapter structs are read in place and are 8-aligned.
+        let mut buf: Vec<u64> = Vec::new();
         for _ in 0..3 {
-            buf.resize(len as usize, 0);
+            buf.resize((len as usize).div_ceil(8), 0);
             // SAFETY: `buf` holds `len` bytes the call may fill; the list it writes is read
             // only while `buf` lives and only through pointers the call itself laid out.
             let rc = unsafe {
@@ -194,10 +195,10 @@ mod windows {
                     if !sa.is_null() {
                         let family = u32::from((*sa).sa_family);
                         let addr = if family == u32::from(AF_INET) {
-                            let v4 = &*sa.cast::<SOCKADDR_IN>();
+                            let v4 = sa.cast::<SOCKADDR_IN>().read_unaligned();
                             Some(IpAddr::from(v4.sin_addr.S_un.S_addr.to_ne_bytes()))
                         } else if family == u32::from(AF_INET6) {
-                            let v6 = &*sa.cast::<SOCKADDR_IN6>();
+                            let v6 = sa.cast::<SOCKADDR_IN6>().read_unaligned();
                             Some(IpAddr::from(v6.sin6_addr.u.Byte))
                         } else {
                             None
@@ -222,5 +223,17 @@ mod windows {
             adapter = unsafe { (*adapter).Next };
         }
         LinkFacts::default()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// The loopback adapter is always there: finding it walks the adapter list.
+    #[test]
+    fn the_loopback_address_names_an_adapter() {
+        let facts = link_facts(std::net::Ipv4Addr::LOCALHOST.into());
+        assert_eq!(facts.kind, crate::transport::IFACE_KIND_OTHER);
     }
 }

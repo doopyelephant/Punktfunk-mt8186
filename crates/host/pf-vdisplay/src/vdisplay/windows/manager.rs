@@ -198,10 +198,6 @@ enum ShrinkAction {
 /// One stage of [`VirtualDisplayManager::resolve_target_gdi`]'s ladder: poll for the target's GDI name until
 /// the 3 s ceiling. 50 ms sampling (latency plan P0.5) — a typical activation resolves on an early
 /// poll, so finer sampling shaves ~150 ms off every stage crossing.
-///
-/// Extracted because the ladder ran this loop three times verbatim, and the 2nd and 3rd copies
-/// documented themselves as "SAFETY: as the resolve loop above" — a pointer to a proof rather than
-/// a proof, which silently rots the moment the block it points at moves.
 fn poll_gdi_name(key: CcdTargetKey) -> Option<String> {
     for _ in 0..60 {
         thread::sleep(Duration::from_millis(50));

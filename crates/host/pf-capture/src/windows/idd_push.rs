@@ -146,6 +146,10 @@ impl MappedSection {
     }
 
     /// The 4-aligned word at `off`, as the atomic both sides treat it as.
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     fn word32(&self, off: usize) -> &AtomicU32 {
         assert!(
             off % 4 == 0 && off.checked_add(4).is_some_and(|end| end <= self.len),

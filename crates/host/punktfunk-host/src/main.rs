@@ -10,7 +10,6 @@
 //! OS. Pin: `design/`. Evidence: this crate's tests and `docs/adr/`.
 
 // Keep `unsafe fn` only where a caller can violate a contract (raw pointer / borrowed HANDLE).
-// Workspace lints already require `// SAFETY:` on every `unsafe` block.
 
 // Shim: audio backends live in `pf-audio`; keep `crate::audio::*` for this crate's callers.
 mod audio {
