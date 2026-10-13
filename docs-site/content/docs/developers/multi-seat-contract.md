@@ -103,7 +103,7 @@ them together.
 | `PUNKTFUNK_SEAT_ID` | 32 lowercase hexadecimal characters | Required with `PUNKTFUNK_SEAT_SESSION=1`. Missing or any other form: the host mints no audio devices. |
 | `PUNKTFUNK_SEAT_DISPLAY_SLOT` | `12`–`15` | The seat's connector. Not a number, out of range, or the marker absent: the host refuses every virtual-display session. |
 | `PUNKTFUNK_TRUST_DIR` | the box's config directory | The seat reads the box's pairing store, `profiles.json`, per-device display overlays and `seat-defaults.json` from here, read only, and follows their changes. A relative path is ignored. |
-| `PUNKTFUNK_PAIRING` | `refused` | Devices pair with the box. A knock is refused and no PIN window opens. |
+| `PUNKTFUNK_PAIRING` | `refused` | Devices pair with the box. A knock is refused and no PIN window opens. A seat host refuses pairing with or without it. |
 | `PUNKTFUNK_LIBRARY_DIR` | the box's config directory (Windows only) | The seat reads the box's library from here, read only: `library*.json`, `library-metadata/` and the plugin manifests and grants its entries launch through. Play stats stay in the seat's own directory. A relative path is ignored. |
 | `PUNKTFUNK_SEAT_STEAM` | the seat's own `steam.exe` (Windows only, when the box has Steam) | Steam runs once per IPC name per machine, so a seat starts Steam from here only, always with `-master_ipc_name_override pfseat<seat id>`. The supervisor copies the box's client into the seat account's profile at the seat's first start; until the file exists, the seat's Steam titles don't start. Unset or relative: no Steam on the seat. |
 

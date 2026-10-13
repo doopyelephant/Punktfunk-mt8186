@@ -128,7 +128,8 @@ impl HostRole {
 /// The role and whether pairing is refused, as [`resolve`] fixed them.
 static RESOLVED: std::sync::OnceLock<(HostRole, bool)> = std::sync::OnceLock::new();
 
-/// The role variables as they are now. `door_flag` is `serve --door`.
+/// The role variables as they are now. `door_flag` is `serve --door`. A seat host refuses
+/// pairing whatever `PUNKTFUNK_PAIRING` says.
 fn read(door_flag: bool) -> (HostRole, bool) {
     let var = |name: &str| std::env::var(name).ok();
     let role = HostRole::from_env_values(
@@ -138,7 +139,8 @@ fn read(door_flag: bool) -> (HostRole, bool) {
         var("PUNKTFUNK_DOOR").as_deref(),
         door_flag,
     );
-    (role, var("PUNKTFUNK_PAIRING").as_deref() == Some("refused"))
+    let refused = var("PUNKTFUNK_PAIRING").as_deref() == Some("refused");
+    (role, role.is_seat_host() || refused)
 }
 
 /// Fixes this process's role for the rest of its life. `serve` calls it once its arguments are
@@ -221,8 +223,9 @@ pub fn library_dir() -> std::path::PathBuf {
     box_library_dir().unwrap_or_else(crate::config_dir)
 }
 
-/// `PUNKTFUNK_PAIRING=refused`: devices pair with the box, never with this host. A knock is
-/// refused, a PIN window never opens. [`resolve`] fixes it with the role.
+/// Whether devices pair with the box and never with this host: every seat host, and any other
+/// host with `PUNKTFUNK_PAIRING=refused`. A knock is refused, a PIN window never opens.
+/// [`resolve`] fixes it with the role.
 pub fn pairing_refused() -> bool {
     current().1
 }
@@ -262,21 +265,21 @@ mod tests {
         ("-OH-P", "-----p-"),
         ("-OHD-", "----d--"),
         ("-OHDP", "----dp-"),
-        ("S----", "s-cr--e"),
+        ("S----", "s-cr-pe"),
         ("S---P", "s-cr-pe"),
-        ("S--D-", "s-cr--e"),
+        ("S--D-", "s-cr-pe"),
         ("S--DP", "s-cr-pe"),
-        ("S-H--", "s-cr--e"),
+        ("S-H--", "s-cr-pe"),
         ("S-H-P", "s-cr-pe"),
-        ("S-HD-", "s-cr--e"),
+        ("S-HD-", "s-cr-pe"),
         ("S-HDP", "s-cr-pe"),
-        ("SO---", "so----e"),
+        ("SO---", "so---pe"),
         ("SO--P", "so---pe"),
-        ("SO-D-", "so----e"),
+        ("SO-D-", "so---pe"),
         ("SO-DP", "so---pe"),
-        ("SOH--", "so-r--e"),
+        ("SOH--", "so-r-pe"),
         ("SOH-P", "so-r-pe"),
-        ("SOHD-", "so-r--e"),
+        ("SOHD-", "so-r-pe"),
         ("SOHDP", "so-r-pe"),
     ];
 
