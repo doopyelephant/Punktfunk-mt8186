@@ -75,7 +75,7 @@ fn wanted() -> Option<(bool, Source)> {
 fn owns_entry(role: HostRole) -> bool {
     match role {
         HostRole::Plain => true,
-        HostRole::Door | HostRole::Seat(_) | HostRole::DoorSeat(_) => false,
+        HostRole::Door | HostRole::Seat(_) => false,
     }
 }
 

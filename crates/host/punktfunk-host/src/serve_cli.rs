@@ -254,7 +254,7 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
 /// host shares the box's runner and must not bounce it.
 fn runner_token(role: HostRole) -> (bool, bool) {
     match role {
-        HostRole::Door | HostRole::DoorSeat(_) => (false, false),
+        HostRole::Door => (false, false),
         HostRole::Seat(_) => (true, !cfg!(windows)),
         HostRole::Plain => (true, true),
     }

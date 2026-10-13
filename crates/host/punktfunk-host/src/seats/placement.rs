@@ -79,7 +79,7 @@ pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Place
 /// A door never does. Any other host places only a profile with a ledger row of its own.
 fn plays_here(role: HostRole, own_row: bool) -> bool {
     match role {
-        HostRole::Seat(_) | HostRole::DoorSeat(_) => true,
+        HostRole::Seat(_) => true,
         HostRole::Door => false,
         HostRole::Plain => !own_row,
     }

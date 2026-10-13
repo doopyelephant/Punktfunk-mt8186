@@ -19,14 +19,12 @@
 pub enum HostRole {
     /// No marker: the console host.
     Plain,
-    /// `serve --door` or `PUNKTFUNK_DOOR=1`: it advertises, pairs, serves the console and places
-    /// every connect on a seat, and never streams itself.
+    /// `serve --door` or `PUNKTFUNK_DOOR=1`, on a host that is no seat's: it advertises, pairs,
+    /// serves the console and places every connect on a seat, and never streams itself.
     Door,
     /// `PUNKTFUNK_SEAT_SESSION=1`: a supervisor-managed seat owns this host, not the console.
+    /// It is never the door, whatever asks for one.
     Seat(SeatRole),
-    /// The door and the seat marker at once, which no supervisor starts. It answers as the door
-    /// where the door is asked for and as the seat where the seat is.
-    DoorSeat(SeatRole),
 }
 
 /// Whose seat a seat host serves.
@@ -47,20 +45,18 @@ pub enum SeatRole {
 
 impl HostRole {
     /// Every role, for a test that walks a policy over all of them.
-    pub const ALL: [HostRole; 8] = [
+    pub const ALL: [HostRole; 5] = [
         HostRole::Plain,
         HostRole::Door,
         HostRole::Seat(SeatRole::Contract),
         HostRole::Seat(SeatRole::Owner),
         HostRole::Seat(SeatRole::OwnerHeadless),
-        HostRole::DoorSeat(SeatRole::Contract),
-        HostRole::DoorSeat(SeatRole::Owner),
-        HostRole::DoorSeat(SeatRole::OwnerHeadless),
     ];
 
     /// The role these values name. Each is a variable's value, `None` when unset, and a marker
     /// is its exact value `1`. `door_flag` is `serve --door`. The owner and headless markers
-    /// mean nothing without the seat marker.
+    /// mean nothing without the seat marker, and the door means nothing with it: a host a
+    /// supervisor started on a seat is never the door.
     pub fn from_env_values(
         seat_session: Option<&str>,
         seat_owner: Option<&str>,
@@ -76,17 +72,16 @@ impl HostRole {
             (true, true, true) => Some(SeatRole::OwnerHeadless),
         };
         match (seat, door_flag || on(door)) {
-            (None, false) => HostRole::Plain,
+            (Some(seat), _) => HostRole::Seat(seat),
             (None, true) => HostRole::Door,
-            (Some(seat), false) => HostRole::Seat(seat),
-            (Some(seat), true) => HostRole::DoorSeat(seat),
+            (None, false) => HostRole::Plain,
         }
     }
 
     fn seat(self) -> Option<SeatRole> {
         match self {
             HostRole::Plain | HostRole::Door => None,
-            HostRole::Seat(seat) | HostRole::DoorSeat(seat) => Some(seat),
+            HostRole::Seat(seat) => Some(seat),
         }
     }
 
@@ -124,7 +119,7 @@ impl HostRole {
     /// Whether this host is the door.
     pub fn is_door(self) -> bool {
         match self {
-            HostRole::Door | HostRole::DoorSeat(_) => true,
+            HostRole::Door => true,
             HostRole::Plain | HostRole::Seat(_) => false,
         }
     }
@@ -269,20 +264,20 @@ mod tests {
         ("-OHDP", "----dp-"),
         ("S----", "s-cr--e"),
         ("S---P", "s-cr-pe"),
-        ("S--D-", "s-crd-e"),
-        ("S--DP", "s-crdpe"),
+        ("S--D-", "s-cr--e"),
+        ("S--DP", "s-cr-pe"),
         ("S-H--", "s-cr--e"),
         ("S-H-P", "s-cr-pe"),
-        ("S-HD-", "s-crd-e"),
-        ("S-HDP", "s-crdpe"),
+        ("S-HD-", "s-cr--e"),
+        ("S-HDP", "s-cr-pe"),
         ("SO---", "so----e"),
         ("SO--P", "so---pe"),
-        ("SO-D-", "so--d-e"),
-        ("SO-DP", "so--dpe"),
+        ("SO-D-", "so----e"),
+        ("SO-DP", "so---pe"),
         ("SOH--", "so-r--e"),
         ("SOH-P", "so-r-pe"),
-        ("SOHD-", "so-rd-e"),
-        ("SOHDP", "so-rdpe"),
+        ("SOHD-", "so-r--e"),
+        ("SOHDP", "so-r-pe"),
     ];
 
     /// Each role variable in [`TRUTH`]'s input order: its name, the value that sets its marker,

@@ -99,7 +99,7 @@ them together.
 
 | Variable | Value | Rule |
 |---|---|---|
-| `PUNKTFUNK_SEAT_SESSION` | `1` | Marks a seat host. Unset or any other value is the console host. |
+| `PUNKTFUNK_SEAT_SESSION` | `1` | Marks a seat host. Unset or any other value is the console host. A seat host is never the door: `--door` and `PUNKTFUNK_DOOR` are ignored on it. |
 | `PUNKTFUNK_SEAT_ID` | 32 lowercase hexadecimal characters | Required with `PUNKTFUNK_SEAT_SESSION=1`. Missing or any other form: the host mints no audio devices. |
 | `PUNKTFUNK_SEAT_DISPLAY_SLOT` | `12`–`15` | The seat's connector. Not a number, out of range, or the marker absent: the host refuses every virtual-display session. |
 | `PUNKTFUNK_TRUST_DIR` | the box's config directory | The seat reads the box's pairing store, `profiles.json`, per-device display overlays and `seat-defaults.json` from here, read only, and follows their changes. A relative path is ignored. |
@@ -395,7 +395,9 @@ is the door: `punktfunk-host serve --door` (or `PUNKTFUNK_DOOR=1`), run as the `
 `punktfunk-door.service` with `PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk`. It advertises, pairs,
 serves the management API and places every connect, and opens no display, capture, input or
 audio device. A connect is answered with a `Redirect` to a seat, or refused with
-`SEAT_UNAVAILABLE`: the door never streams. `GET /api/v1/host` reports `door: true`.
+`SEAT_UNAVAILABLE`: the door never streams. `GET /api/v1/host` reports `door: true`. A host
+started with `PUNKTFUNK_SEAT_SESSION=1` is a seat host and never the door, however the door is
+asked for.
 
 The box owner is a seat like any other. `adopt-owner <user>` adds a ledger row for an ordinary
 account that exists (uid 1000 up, never a seat's); deleting the row never removes the account or
