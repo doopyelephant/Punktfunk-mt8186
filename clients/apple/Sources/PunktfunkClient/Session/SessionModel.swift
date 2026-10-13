@@ -429,7 +429,7 @@ final class SessionModel: ObservableObject {
             #elseif os(visionOS)
                 return true // every Vision Pro display presents HDR
             #else
-                return UIScreen.main.potentialEDRHeadroom > 1.0
+                return NativeDisplay.screen.potentialEDRHeadroom > 1.0
             #endif
         }()
         Task.detached(priority: .userInitiated) {

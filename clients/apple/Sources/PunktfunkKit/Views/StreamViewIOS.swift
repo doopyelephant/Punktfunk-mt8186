@@ -175,6 +175,9 @@ public final class StreamViewController: StreamViewControllerBase {
         view.onLayout = { [weak self] in self?.layoutMetalLayer() }
         return view
     }()
+    /// This screen's native mode at the last layout pass, and the request a change of it queued.
+    private var lastNativeMode: (width: Int, height: Int, hz: Int)?
+    private var screenModeWork: DispatchWorkItem?
     #endif
     private var onExternal = false
     // `prefersPointerLocked` mirrors `wantsPointerLock`; SpringBoard grants or drops on its own
@@ -787,6 +790,9 @@ public final class StreamViewController: StreamViewControllerBase {
         #if os(iOS) || os(visionOS)
         // The theater's panel is not the picture's size, so Match window sits it out.
         if !onExternal, presenter.theater == nil { noteMatchWindowSize() }
+        #if os(iOS)
+        noteScreen()
+        #endif
         // The window back at screen size (a windowed scene re-maximised) can hold the lock again.
         let fills = windowFillsScreen
         if fills, !windowFilledScreen { requestPointerLock() }
@@ -953,6 +959,28 @@ public final class StreamViewController: StreamViewControllerBase {
         matchFollower?.setEnabled(follows)
         if follows { noteMatchWindowSize() } else { requestSurfaceMode() }
     }
+
+    /// The native mode of the screen this view is on.
+    private var nativeMode: (width: Int, height: Int, hz: Int) {
+        NativeDisplay.mode(on: view.window?.windowScene?.screen ?? NativeDisplay.screen)
+    }
+
+    /// The picture moved to another screen (a fold or unfold): a session streaming Native takes
+    /// that screen's mode. 0.4 s lets the hinge settle, so a flap costs the host no rebuild.
+    /// Match window follows the view's size on its own.
+    private func noteScreen() {
+        let native = nativeMode
+        defer { lastNativeMode = native }
+        guard let last = lastNativeMode, last != native else { return }
+        screenModeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.onExternal, self.connection?.settings.matchWindow == false
+            else { return }
+            self.requestSurfaceMode()
+        }
+        screenModeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
     #endif
 
     /// Match-window (C3): feed the follower the view's physical-pixel size (points × scale).
@@ -972,7 +1000,7 @@ public final class StreamViewController: StreamViewControllerBase {
         let settings = connection.settings
         #if os(iOS)
         let target = (onExternal ? ExternalDisplay.streamMode(settings) : nil)
-            ?? settings.streamMode(native: NativeDisplay.mode)
+            ?? settings.streamMode(native: nativeMode)
         #else
         let target = settings.streamMode(native: NativeDisplay.mode)
         #endif

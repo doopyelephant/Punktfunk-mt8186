@@ -233,9 +233,15 @@ final class SessionPresenter {
     private var pump: StreamPump?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
-    /// iOS: pushes `UIScreen.currentEDRHeadroom` twice a second. It follows brightness and posts
-    /// no change notification; the linear HDR shaders roll highlights onto it.
+    /// iOS: pushes `displayHeadroom` twice a second. It follows brightness and posts no change
+    /// notification; the linear HDR shaders roll highlights onto it.
     private var headroomTimer: Timer?
+    #if os(iOS)
+    /// The EDR headroom of the screen the app is on. Main thread.
+    private static var displayHeadroom: CGFloat {
+        MainActor.assumeIsolated { NativeDisplay.screen.currentEDRHeadroom }
+    }
+    #endif
     private var panel = PanelInfo(minHz: 0, maxHz: 0)
 
     /// The hosting screen's refresh range and granularity, from the view on start and every
@@ -383,9 +389,9 @@ final class SessionPresenter {
             }
             syncFrameRate(hz: connection.currentMode().refreshHz)
             #if os(iOS)
-            pipeline.setDisplayHeadroom(UIScreen.main.currentEDRHeadroom)
+            pipeline.setDisplayHeadroom(Self.displayHeadroom)
             let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-                self?.stage2?.setDisplayHeadroom(UIScreen.main.currentEDRHeadroom)
+                self?.stage2?.setDisplayHeadroom(Self.displayHeadroom)
             }
             RunLoop.main.add(timer, forMode: .common)
             headroomTimer = timer

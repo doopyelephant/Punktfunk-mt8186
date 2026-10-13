@@ -293,18 +293,13 @@ enum SettingsOptions {
     @MainActor
     static func nativeModes() -> [(name: String, w: Int, h: Int)] {
         var native: [(name: String, w: Int, h: Int)] = []
-        #if os(visionOS)
+        #if !os(macOS)
         let mode = NativeDisplay.mode
         native = [("This device", mode.width, mode.height)]
-        #elseif os(iOS) || os(tvOS)
-        let bounds = UIScreen.main.nativeBounds // portrait-oriented pixels (tvOS: the TV mode)
-        let nativeW = Int(max(bounds.width, bounds.height))
-        let nativeH = Int(min(bounds.width, bounds.height))
-        native = [("This device", nativeW, nativeH)]
         #if os(iOS)
         let safe = SafeDisplay.mode(
-            nativeWidth: nativeW, nativeHeight: nativeH,
-            sideInsetPoints: mainWindowSideInset(), scale: UIScreen.main.nativeScale)
+            nativeWidth: mode.width, nativeHeight: mode.height,
+            sideInsetPoints: mainWindowSideInset(), scale: NativeDisplay.screen.nativeScale)
         native.append(("This device (safe area)", safe.width, safe.height))
         #endif
         #else
@@ -360,11 +355,8 @@ enum SettingsOptions {
     /// A Mac lists the desktop clients' rates; a phone or tablet the few its panels run at.
     @MainActor
     static func refreshRates(including current: Int) -> [Int] {
-        #if os(visionOS)
+        #if !os(macOS)
         let maxHz = NativeDisplay.mode.hz
-        let ladder = [60, 120, 240]
-        #elseif os(iOS) || os(tvOS)
-        let maxHz = UIScreen.main.maximumFramesPerSecond
         let ladder = [60, 120, 240]
         #else
         let maxHz = NSScreen.main?.maximumFramesPerSecond ?? 60
