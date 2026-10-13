@@ -293,6 +293,11 @@ pub struct Settings {
     /// Show how to leave for a few seconds when a stream starts. Device-wide.
     #[serde(default = "default_true")]
     pub exit_hint: bool,
+    /// On, a stream holds this device's screen awake for as long as it runs. Off, only while
+    /// the player's input is recent ([`punktfunk_core::client::holds_screen_awake`]), so the
+    /// screen's own saver runs over a game left alone. Device-wide.
+    #[serde(default = "default_true")]
+    pub keep_awake: bool,
     /// Settings screens show their advanced rows. Device-wide; hiding a row keeps its value.
     #[serde(default)]
     pub show_advanced: bool,
@@ -651,6 +656,7 @@ impl Default for Settings {
             hud_placement: String::new(),
             stats_scale_pct: default_stats_scale_pct(),
             exit_hint: true,
+            keep_awake: true,
             show_advanced: false,
             fullscreen_on_stream: true,
             ui_palette: default_ui_palette(),
@@ -947,6 +953,10 @@ mod tests {
         assert_eq!(old.hud_corner(HudCorner::TopLeft), HudCorner::TopLeft);
         assert_eq!(old.stats_scale_pct, 100);
         assert!(old.exit_hint);
+        assert!(
+            old.keep_awake,
+            "a store from before the switch keeps the screen awake"
+        );
         assert!(!old.show_advanced);
 
         let placed: Settings =

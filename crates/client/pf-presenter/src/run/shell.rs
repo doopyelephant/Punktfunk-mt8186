@@ -185,6 +185,7 @@ impl Shell {
             mic_muted_at: None,
             ring_opener: None,
             ring_was_open: false,
+            screen_held: true,
             chord_rx,
             escape_rx,
             pump,
@@ -393,6 +394,26 @@ impl Shell {
                     }
                     punktfunk_core::client::audio_mute_notice(mask, self.audio_mute_at.elapsed())
                 });
+            // SDL holds the screen saver off for as long as the window lives. A stream whose
+            // player turned "Keep screen awake" off gives it back once their input goes quiet,
+            // so the desktop's own saver runs over a game left alone. No stream holds as before.
+            let hold = stream
+                .as_ref()
+                .and_then(|st| Some((st, st.connector.as_ref()?)))
+                .is_none_or(|(st, c)| {
+                    punktfunk_core::client::holds_screen_awake(st.params.keep_awake, c.input_idle())
+                });
+            if hold != self.screen_held {
+                self.screen_held = hold;
+                let set = if hold {
+                    self.sdl_video.disable_screen_saver()
+                } else {
+                    self.sdl_video.enable_screen_saver()
+                };
+                if let Err(e) = set {
+                    tracing::debug!(error = %e, hold, "screen saver hold not changed");
+                }
+            }
             let ring_facts = stream
                 .as_ref()
                 .filter(|st| st.connector.is_some())

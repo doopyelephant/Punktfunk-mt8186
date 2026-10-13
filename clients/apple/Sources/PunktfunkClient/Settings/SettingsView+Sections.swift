@@ -443,6 +443,13 @@ extension SettingsView {
                     "Host compositor", options: SettingsOptions.compositors,
                     selection: scoped(SettingsFields.compositor))
             }
+            // This device's screen, so never a preset's.
+            if !inPresetScope {
+                described("Off, a stream keeps the screen awake only while you play. Left alone "
+                    + "for five minutes, it lets this device's own sleep timer take over.") {
+                    Toggle("Keep screen awake", isOn: $keepAwake)
+                }
+            }
         }
     }
 
@@ -458,7 +465,7 @@ extension SettingsView {
             e.presentPriority == "smooth" && e.smoothBuffer != d.smoothBuffer,
             e.renderScale != d.renderScale, e.codec != d.codec,
             pyroWaveRate && e.pyrowaveBppX100 != d.pyrowaveBppX100, e.enable444 != d.enable444,
-            e.tenBitSdr != d.tenBitSdr, e.compositor != d.compositor,
+            e.tenBitSdr != d.tenBitSdr, e.compositor != d.compositor, !keepAwake,
         ]
         #if os(macOS)
         changed.append(e.vsync != d.vsync)

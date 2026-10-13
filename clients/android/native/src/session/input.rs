@@ -736,3 +736,26 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadMoti
         });
     })
 }
+
+/// `NativeBridge.nativeHoldsScreenAwake(handle, keepAwake)` — whether this stream holds the
+/// screen awake right now: always with the "Keep screen awake" setting on, else only while the
+/// player's input is recent.
+///
+/// Answered here because every input this client forwards goes through the session's
+/// `send_input`, which is the one clock for "recent"; the rule is
+/// [`punktfunk_core::client::holds_screen_awake`]. A `0` handle answers `true`: a screen that
+/// stays on is the safe answer when the session cannot be asked.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHoldsScreenAwake(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    keep_awake: jboolean,
+) -> jboolean {
+    jni_guard(true, || {
+        let Some(h) = SESSIONS.get(handle) else {
+            return true;
+        };
+        punktfunk_core::client::holds_screen_awake(keep_awake, h.client.input_idle())
+    })
+}

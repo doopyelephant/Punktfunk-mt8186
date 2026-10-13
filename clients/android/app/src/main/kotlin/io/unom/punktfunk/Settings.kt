@@ -257,6 +257,12 @@ data class Settings(
     /** Off, the host's rumble never reaches a pad or this phone's motor. Read once per session. */
     val padRumble: Boolean = true,
     /**
+     * On, a stream holds the screen awake for as long as it runs. Off, only while the player's
+     * input is recent ([NativeBridge.nativeHoldsScreenAwake]), so the device's own timeout runs
+     * over a game left alone. Read once per session.
+     */
+    val keepAwake: Boolean = true,
+    /**
      * Opt-in: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
      * phone's own vibration motor — for clip-on gamepads that ship without rumble motors, where
      * the phone body is the only actuator in the player's hands. Off by default; read once per

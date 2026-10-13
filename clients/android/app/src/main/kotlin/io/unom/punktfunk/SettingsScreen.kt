@@ -1001,6 +1001,7 @@ private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, con
             pyrowaveOn && s.pyrowaveBppX100() != d.pyrowaveBppX100(),
             s.tenBitSdr != d.tenBitSdr,
             s.lowLatencyMode != d.lowLatencyMode,
+            s.keepAwake != d.keepAwake,
             s.compositor != d.compositor,
         ),
         fields = setOf(
@@ -1086,6 +1087,16 @@ private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, con
             field = "low_latency_mode",
             onCheckedChange = { on -> update("low_latency_mode", s.copy(lowLatencyMode = on)) },
         )
+        // This device's screen, so never a preset's.
+        DeviceScopeOnly {
+            ToggleRow(
+                title = "Keep screen awake",
+                subtitle = "Off, a stream keeps the screen awake only while you play. Left alone " +
+                    "for five minutes, it lets this device's own screen timeout take over.",
+                checked = s.keepAwake,
+                onCheckedChange = { on -> update("keep_awake", s.copy(keepAwake = on)) },
+            )
+        }
         SettingDropdown(
             label = "Host compositor",
             options = COMPOSITOR_OPTIONS,

@@ -571,8 +571,16 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
              isn\u{2019}t available.",
         ),
     ]);
-    // Decoder and GPU are facts about THIS device's hardware — never per preset.
+    // Decoder, GPU and the screen saver are facts about THIS device — never per preset.
     if !preset_mode {
+        advanced.push(described_labeled(
+            "Keep screen awake",
+            setting_toggle(cx, scope, "keep_awake", s.keep_awake, |s, on| {
+                s.keep_awake = on
+            }),
+            "Off, a stream keeps the screen awake only while you play. Left alone for \
+             five minutes, it lets Windows\u{2019} own screen saver or sleep take over.",
+        ));
         advanced.push(described_labeled(
             "Video decoder",
             decoder_combo,
@@ -601,6 +609,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         s.compositor != d.compositor,
         stored_decoder != d.decoder,
         !s.adapter.is_empty(),
+        s.keep_awake != d.keep_awake,
     ];
     let overridden = [
         "smooth_buffer",

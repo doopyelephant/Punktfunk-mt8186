@@ -123,6 +123,9 @@ pub struct SessionParams {
     pub stats_scale: f32,
     /// Show how to leave when this stream starts.
     pub exit_hint: bool,
+    /// Hold the screen awake for the whole stream; off, only while the player's input is recent
+    /// ([`punktfunk_core::client::holds_screen_awake`]).
+    pub keep_awake: bool,
 }
 
 /// Host, pin, launch, and budget for one dial.
@@ -233,6 +236,7 @@ impl SessionParams {
             stats_corner: settings.hud_corner(crate::trust::HudCorner::TopLeft),
             stats_scale: punktfunk_core::hud::stats_scale(settings.stats_scale_pct),
             exit_hint: settings.exit_hint,
+            keep_awake: settings.keep_awake,
         }
     }
 

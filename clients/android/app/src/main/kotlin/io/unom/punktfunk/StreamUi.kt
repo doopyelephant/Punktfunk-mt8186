@@ -51,6 +51,12 @@ internal class StreamUi(
     var motionHint by mutableStateOf(false)
 
     /**
+     * The stream holds the screen awake ([NativeBridge.nativeHoldsScreenAwake]). The activity's
+     * window and a second screen's picture window both follow it.
+     */
+    var screenHeld by mutableStateOf(true)
+
+    /**
      * Whether this session has a controller — seeded from the router the moment it is built and
      * latched true by a pad that arrives later; it never goes back to false.
      */

@@ -650,6 +650,19 @@ final class SessionModel: ObservableObject {
         #endif
     }
 
+    /// Hold the screen awake or hand it back, as "Keep screen awake" and the player's input
+    /// say. Each second while streaming; `beginStreaming` holds it first.
+    private func holdScreen(_ conn: PunktfunkConnection) {
+        guard phase == .streaming else { return }
+        let keepAwake = UserDefaults.standard.object(forKey: DefaultsKey.keepAwake) as? Bool
+            ?? SettingDefault.keepAwake
+        if conn.holdsScreenAwake(keepAwake: keepAwake) {
+            displaySleepGuard.acquire()
+        } else {
+            displaySleepGuard.release()
+        }
+    }
+
     /// Show the exit hint at stream start, unless it is turned off.
     private func noteStreamStart() {
         if UserDefaults.standard.object(forKey: DefaultsKey.exitHint) as? Bool
@@ -1237,6 +1250,7 @@ final class SessionModel: ObservableObject {
                 // readout also walks the countdown and picks up mid-session grant edits.
                 self.updateAccessState()
                 guard let conn = self.connection else { return }
+                self.holdScreen(conn)
                 if let notice = conn.launchNotice, notice != self.notices.launchShown {
                     self.showLaunchNotice(notice)
                 }

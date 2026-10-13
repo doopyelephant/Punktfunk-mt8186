@@ -56,6 +56,7 @@ class SettingsRoundTripTest {
         smoothBuffer = 2,
         autoWakeEnabled = false,
         padRumble = false,
+        keepAwake = false,
         rumbleOnPhone = true,
         gyroOnPhone = true,
         dsCapture = false,

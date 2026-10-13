@@ -155,6 +155,7 @@ fn catalog_key(id: RowId) -> Option<&'static str> {
         RowId::Compositor => "compositor",
         RowId::Decoder => "decoder",
         RowId::LowLatency => "low_latency",
+        RowId::KeepAwake => "keep_awake",
         RowId::SecondScreen => "second_screen",
         RowId::Audio => "audio_channels",
         RowId::Mic => "mic_enabled",
@@ -1631,7 +1632,7 @@ fn every_row_has_exactly_one_tab() {
             seen.push(*id);
         }
     }
-    assert_eq!(seen.len(), 69, "{seen:?}");
+    assert_eq!(seen.len(), 70, "{seen:?}");
     assert!(
         !seen.contains(&RowId::AdvancedChanged),
         "built per tab, never listed"

@@ -24,7 +24,7 @@ it overrides shows either way.
 The advanced rows are **Advanced statistics**, **Statistics position**, **Statistics size**, **Exit
 hint**, **Reduce interface resolution**, **Smoothness buffer**, **Render scale**, **Video codec**,
 **Full chroma (4:4:4)**, **10-bit SDR**, **V-Sync**, **Follow variable refresh**, **Host
-compositor**, **Video decoder**, **GPU**, **Low-latency mode**, **Audio quality**, **Keep host audio playing**, **Echo cancellation**, **Forward controllers**,
+compositor**, **Video decoder**, **GPU**, **Low-latency mode**, **Keep screen awake**, **Audio quality**, **Keep host audio playing**, **Echo cancellation**, **Forward controllers**,
 **Use controller**, **Guide button**, **Hold Select for guide**, **Controller haptics**,
 **Controller speaker**, **Steam Controller 2 passthrough** and **DualSense over USB**.
 
@@ -58,6 +58,7 @@ Android. Most settings can differ per [preset](/docs/presets-and-links); the exc
 | **Host compositor** | Automatic | Which backend a Linux host uses for the virtual display. A host without it picks its own. | All |
 | **Video decoder**, **GPU** | Automatic | The decoder and graphics card this device uses. Change them only to debug; `PUNKTFUNK_DECODER` [overrides](/docs/configuration#client-side-native-clients) the decoder. | Linux, Windows. **GPU**: Windows, and Linux with more than one GPU. |
 | **Low-latency mode** | On | Asks the decoder and system for their low-latency paths. Turn it off if a device misbehaves. | Android |
+| **Keep screen awake** | On | Off, a stream keeps the screen awake only while you play: five minutes after your last key, touch or controller input, this device's own screen saver or sleep takes over. | Linux, Windows, Android, Apple |
 
 **Test network speed…** in a host card's menu measures the link — what it carries, then loss and
 jitter at half of that, a rate the link holds — and suggests a bitrate (Android: **Network speed

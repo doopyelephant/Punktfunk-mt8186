@@ -89,6 +89,9 @@ pub enum RowId {
     // so the typed struct stays shared; [`row_on`] keeps them off desktop.
     /// Slice-progressive decode plus DSCP. Android-only.
     LowLatency,
+    /// `trust::Settings::keep_awake`. Off, the stream holds the screen awake only while the
+    /// player's input is recent.
+    KeepAwake,
     /// A dual-screen handheld's lower panel carries the companion panel or the picture;
     /// off leaves a second screen to the system. Android-only.
     SecondScreen,
@@ -155,6 +158,7 @@ pub fn advanced(id: RowId) -> bool {
             | RowId::Compositor
             | RowId::Decoder
             | RowId::LowLatency
+            | RowId::KeepAwake
             | RowId::AudioFormat
             | RowId::KeepHostAudio
             | RowId::EchoCancel
@@ -369,6 +373,7 @@ impl RowId {
             }
             RowId::AutoWake => Extra::Flag(|s| s.auto_wake, |s| &mut s.auto_wake),
             RowId::ExitHint => Extra::Flag(|s| s.exit_hint, |s| &mut s.exit_hint),
+            RowId::KeepAwake => Extra::Flag(|s| s.keep_awake, |s| &mut s.keep_awake),
             RowId::ShowAdvanced => Extra::Flag(|s| s.show_advanced, |s| &mut s.show_advanced),
             RowId::LowLatency => Extra::Bool(device_keys::LOW_LATENCY, true),
             RowId::SecondScreen => Extra::Bool(device_keys::SECOND_SCREEN, true),
@@ -483,6 +488,7 @@ pub(super) const TABS: [(&str, &[RowId]); 7] = [
             RowId::Compositor,
             RowId::Decoder,
             RowId::LowLatency,
+            RowId::KeepAwake,
         ],
     ),
     (
@@ -796,6 +802,8 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::ReduceUiResolution => &[Android, WebOS],
         // A MediaCodec decoder flag; nothing else has the knob.
         RowId::LowLatency => &[Android],
+        // The clients whose streams read the switch before holding the screen awake.
+        RowId::KeepAwake => &[Desktop, Android, Apple],
         // Only Android has a second screen to use (a handheld's lower panel, a half-open fold).
         RowId::SecondScreen => &[Android],
         // The clients whose presenters place the picture through `video_fit`.
@@ -1054,7 +1062,7 @@ pub(super) fn row_icon(id: RowId) -> &'static str {
         RowId::VideoFit => "square",
         RowId::Compositor => "panel-right",
         RowId::Codec => "film",
-        RowId::Hdr => "sun",
+        RowId::Hdr | RowId::KeepAwake => "sun",
         RowId::PresentPriority | RowId::SmoothBuffer | RowId::LowLatency => "clock",
         RowId::Decoder | RowId::AudioRoute => "cpu",
         RowId::Chroma444 | RowId::TenBitSdr => "eye",
@@ -1480,6 +1488,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         ),
         RowId::AutoWake => (None, "Auto-wake on connect", extra()),
         RowId::LowLatency => (None, "Low-latency mode", extra()),
+        RowId::KeepAwake => (None, "Keep screen awake", extra()),
         RowId::SecondScreen => (None, "Second screen", extra()),
         RowId::PhoneRumble => (Some("This device"), "Rumble on this phone", extra()),
         RowId::PhoneGyro => (None, "Gyro from this phone", extra()),
@@ -1781,6 +1790,10 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
         RowId::LowLatency => {
             "Feeds the decoder slice by slice as frames arrive and marks the media sockets \
              for priority. Off if a decoder shows artefacts under it."
+        }
+        RowId::KeepAwake => {
+            "Off, a stream keeps the screen awake only while you play. Left alone for five \
+             minutes, it lets this device's own screen saver or sleep take over."
         }
         RowId::SecondScreen => {
             "A smaller second screen — a dual-screen handheld's lower panel, a foldable half \
@@ -2100,6 +2113,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             }
         }),
         RowId::LowLatency
+        | RowId::KeepAwake
         | RowId::Hdr
         | RowId::Chroma444
         | RowId::TenBitSdr

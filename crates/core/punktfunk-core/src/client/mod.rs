@@ -233,6 +233,10 @@ pub struct NativeClient {
     /// Newest entry [`NativeClient::latest_hdr_meta`] drained.
     hdr_meta_last: Mutex<Option<HdrMeta>>,
     input_tx: tokio::sync::mpsc::UnboundedSender<InputEvent>,
+    /// The connect, and the player's last input in ms after it
+    /// ([`InputEvent::is_activity`]). The connect counts as input: the player just asked.
+    born: Instant,
+    last_input_ms: AtomicU64,
     /// Bounded ([`MIC_QUEUE`]): pump sheds oldest-first; a full queue drops the fresh frame.
     /// Standing backlog is worse than a dropout.
     mic_tx: tokio::sync::mpsc::Sender<(u32, u64, Vec<u8>)>,
@@ -724,6 +728,8 @@ impl NativeClient {
             planes,
             hdr_meta_last: Mutex::new(None),
             input_tx,
+            born: Instant::now(),
+            last_input_ms: AtomicU64::new(0),
             mic_tx,
             rich_input_tx,
             pad_touch_tx,
@@ -1460,9 +1466,28 @@ impl NativeClient {
         Ok(t)
     }
 
+    /// How long since the player last did something, for [`holds_screen_awake`]. Every
+    /// platform's input leaves through this client's senders, so they are the one clock for
+    /// it: an event that [`InputEvent::is_activity`], a pad surface touched, a raw pad report
+    /// with a button held, a pen batch. Motion never counts: a pad on the sofa still reports.
+    pub fn input_idle(&self) -> Duration {
+        let last = Duration::from_millis(self.last_input_ms.load(Ordering::Relaxed));
+        self.born.elapsed().saturating_sub(last)
+    }
+
+    /// Restart [`Self::input_idle`]'s clock.
+    fn stamp_input(&self) {
+        let now = self.born.elapsed().as_millis() as u64;
+        self.last_input_ms.store(now, Ordering::Relaxed);
+    }
+
     /// Queue one event. The input task drops a class the live grants refuse; the host
-    /// enforces the same mask. A pad's arrival or removal restarts its SC2 filter.
+    /// enforces the same mask. A pad's arrival or removal restarts its SC2 filter. Player
+    /// input stamps [`Self::input_idle`]'s clock.
     pub fn send_input(&self, ev: &InputEvent) -> Result<()> {
+        if ev.is_activity() {
+            self.stamp_input();
+        }
         if matches!(
             ev.kind,
             InputKind::GamepadArrival | InputKind::GamepadRemove
@@ -1699,7 +1724,7 @@ impl NativeClient {
     /// Rich input (0xCC): touchpads, motion, a Steam Controller 2's raw reports. Best-effort.
     /// A raw report passes its pad's [`Sc2Gate`] first. Under controller mouse a pad's touchpads
     /// move the pointer instead, and a full-mouse pad keeps its gyro too, so it cannot aim the
-    /// neutral host pad.
+    /// neutral host pad. A touch or a held button stamps [`Self::input_idle`]'s clock.
     pub fn send_rich_input(&self, mut rich: RichInput) -> Result<()> {
         if let RichInput::HidReport { pad, len, data } = &mut rich {
             let n = usize::from(*len).min(data.len());
@@ -1709,6 +1734,16 @@ impl NativeClient {
                     return Ok(());
                 }
             }
+        }
+        if match &rich {
+            RichInput::Touchpad { active, .. } => *active,
+            RichInput::TouchpadEx { touch, .. } => *touch,
+            RichInput::HidReport { len, data, .. } => {
+                sc2::holds_button(&data[..usize::from(*len).min(data.len())])
+            }
+            _ => false,
+        } {
+            self.stamp_input();
         }
         let bit = 1u16.checked_shl(u32::from(rich.pad())).unwrap_or(0);
         let grants = self.access_grants();
@@ -1748,6 +1783,7 @@ impl NativeClient {
                 "pen batch must hold 1..=PEN_BATCH_MAX samples",
             ));
         }
+        self.stamp_input();
         let seq = self.pen_seq.fetch_add(1, Ordering::Relaxed);
         self.rich_input_tx
             .send(crate::quic::PenBatch::new(seq, samples).encode())
@@ -1793,6 +1829,19 @@ pub fn display_hdr_env_override() -> Option<HdrMeta> {
         max_cll: 0,
         max_fall: 0,
     })
+}
+
+/// How long a stream counts as played after the last input the player made. With "Keep
+/// screen awake" off, the client holds the screen for this long, then lets the device's own
+/// idle timer run. 300 s outlasts most cutscenes.
+pub const KEEP_AWAKE_INPUT: Duration = Duration::from_secs(300);
+
+/// Whether a stream holds this device's screen awake, `input_idle` since the player's last
+/// input ([`NativeClient::input_idle`]). Always, with the setting on. Off, only inside
+/// [`KEEP_AWAKE_INPUT`]: an OS does not count controller input as activity, so a plain
+/// "never" would blank a pad-only session mid-game.
+pub fn holds_screen_awake(keep_awake: bool, input_idle: Duration) -> bool {
+    keep_awake || input_idle < KEEP_AWAKE_INPUT
 }
 
 fn expires_in_secs(deadline_unix: Option<u64>, now_unix: u64) -> u32 {
@@ -2015,5 +2064,26 @@ mod mute_tests {
             Some("Muted by the host and on this device")
         );
         assert_eq!(audio_mute_notice(0, Duration::ZERO), None);
+    }
+}
+
+#[cfg(test)]
+mod keep_awake_tests {
+    use super::{holds_screen_awake, KEEP_AWAKE_INPUT};
+    use std::time::Duration;
+
+    /// Keep-awake on holds the screen whatever the player does. Off, a stream nobody has
+    /// touched for [`KEEP_AWAKE_INPUT`] lets the screen go; one being played keeps it.
+    #[test]
+    fn keep_awake_off_still_holds_the_screen_for_a_played_stream() {
+        let long = KEEP_AWAKE_INPUT + Duration::from_secs(1);
+        assert!(holds_screen_awake(true, Duration::ZERO));
+        assert!(holds_screen_awake(true, long));
+        assert!(holds_screen_awake(false, Duration::ZERO));
+        assert!(holds_screen_awake(
+            false,
+            KEEP_AWAKE_INPUT - Duration::from_secs(1)
+        ));
+        assert!(!holds_screen_awake(false, long));
     }
 }

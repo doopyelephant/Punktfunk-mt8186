@@ -136,8 +136,10 @@ pub fn display(b: &mut Build) {
     b.finish(p);
 }
 
-/// Decoder and GPU: facts about this device's hardware, never a preset's.
+/// Decoder, GPU and the screen's own saver: facts about this device, never a preset's.
 fn hardware(b: &mut Build, p: &mut PageB) {
+    let (awake, _) = Field::switch(&spec::KEEP_AWAKE, |s| s.keep_awake, |s, v| s.keep_awake = v);
+    b.put(p, None, awake);
     let row = b.choice(
         &spec::DECODER,
         &["Automatic", "Vulkan Video", "VAAPI", "Software"],

@@ -868,6 +868,17 @@ public final class PunktfunkConnection: @unchecked Sendable {
         }
     }
 
+    /// Whether this stream holds the screen awake right now: always with `keepAwake` (the
+    /// "Keep screen awake" setting) on, else only while the player's input is recent. The core
+    /// answers, since every input leaves through it. True once closed.
+    public func holdsScreenAwake(keepAwake: Bool) -> Bool {
+        return withLiveHandle(or: true) { h in
+            var hold = true
+            _ = punktfunk_connection_holds_screen_awake(h, keepAwake, &hold)
+            return hold
+        }
+    }
+
     /// Wire pads the host holds now, a bit per pad: declared or driven, not yet removed.
     public var livePads: UInt16 {
         return withLiveHandle(or: 0) { h in

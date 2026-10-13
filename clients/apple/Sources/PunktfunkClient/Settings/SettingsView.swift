@@ -42,6 +42,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.gamepadForwarding) var gamepadForwarding =
         SettingDefault.gamepadForwarding
     @AppStorage(DefaultsKey.padRumble) var padRumble = SettingDefault.padRumble
+    @AppStorage(DefaultsKey.keepAwake) var keepAwake = SettingDefault.keepAwake
     @AppStorage(DefaultsKey.systemButtons) var systemButtons = SettingDefault.systemButtons
     @AppStorage(DefaultsKey.guideGesture) var guideGesture = SettingDefault.guideGesture
     @AppStorage(DefaultsKey.bitrateKbps) var bitrateKbps = SettingDefault.bitrateKbps

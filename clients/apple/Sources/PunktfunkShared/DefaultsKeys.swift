@@ -312,6 +312,11 @@ public enum DefaultsKey {
     /// `GamepadFeedback` reads it per command, so a change lands mid-stream. A device
     /// preference, never part of a stream preset.
     public static let padRumble = "punktfunk.padRumble"
+    /// The cross-client `keep_awake` key. On (default), a stream holds the screen awake for as
+    /// long as it runs. Off, only while the player's input is recent
+    /// (`PunktfunkConnection.holdsScreenAwake`), so the device's own sleep timer runs over a
+    /// game left alone. Read each second mid-stream; never part of a stream preset.
+    public static let keepAwake = "punktfunk.keepAwake"
     /// iPhone: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
     /// device's own Taptic Engine — for phone-clip pads that ship without rumble motors, where
     /// the phone body is the only actuator in the player's hands. Off by default (opt-in); read
@@ -390,6 +395,7 @@ public enum SettingDefault {
     public static let pointerCapture = true
     // App preferences, read where they are used.
     public static let padRumble = true
+    public static let keepAwake = true
     public static let advancedStats = false
     public static let fullscreenAlways = false
     public static let uiPalette = "violet"

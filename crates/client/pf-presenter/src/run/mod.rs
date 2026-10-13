@@ -311,6 +311,8 @@ struct Shell {
     /// Ring pad ownership, edge-tracked: open masks the pads (a held trigger is released
     /// on the host) and polls them into menu events; close re-adopts them.
     ring_was_open: bool,
+    /// SDL's screen saver hold as last set. SDL holds it from start, so this begins `true`.
+    screen_held: bool,
     chord_rx: async_channel::Receiver<(u8, SelectChord)>,
     escape_rx: async_channel::Receiver<()>,
     pump: GamepadPump,

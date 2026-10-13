@@ -103,6 +103,7 @@ internal object SettingsFields {
         field("backgroundTimeoutMinutes", "background_timeout_minutes", IntKind,
             { it.backgroundTimeoutMinutes }, { s, v -> s.copy(backgroundTimeoutMinutes = v) }),
         field("padRumble", "pad_rumble", BoolKind, { it.padRumble }, { s, v -> s.copy(padRumble = v) }),
+        field("keepAwake", "keep_awake", BoolKind, { it.keepAwake }, { s, v -> s.copy(keepAwake = v) }),
         field("rumbleOnPhone", "android.rumble_on_phone", BoolKind, { it.rumbleOnPhone }, { s, v -> s.copy(rumbleOnPhone = v) },
             prefsKey = "rumble_on_phone"),
         field("gyroOnPhone", "android.gyro_on_phone", BoolKind, { it.gyroOnPhone }, { s, v -> s.copy(gyroOnPhone = v) },

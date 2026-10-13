@@ -596,6 +596,21 @@ pub struct InputEvent {
 }
 
 impl InputEvent {
+    /// Whether this is the player doing something, for the keep-awake rule. Every key,
+    /// button, pointer and touch event is. A stick or trigger is only past a quarter of its
+    /// travel: at rest they drift and jitter, and a pad left on the sofa is not play. A pad
+    /// being plugged in or pulled is not either.
+    pub fn is_activity(&self) -> bool {
+        match self.kind {
+            InputKind::GamepadAxis => match self.code {
+                gamepad::AXIS_LT | gamepad::AXIS_RT => self.x > 63,
+                _ => self.x.unsigned_abs() > 8192,
+            },
+            InputKind::GamepadArrival | InputKind::GamepadRemove => false,
+            _ => true,
+        }
+    }
+
     /// Serialize: [`INPUT_MAGIC`] + little-endian fields.
     pub fn encode(&self) -> [u8; INPUT_WIRE_LEN] {
         let mut b = [0u8; INPUT_WIRE_LEN];
@@ -791,6 +806,46 @@ mod tests {
             flags: 0,
         };
         assert_eq!(GamepadSnapshot::from_event(&axis), None);
+    }
+
+    /// A pad left on the sofa must not hold the screen awake: its sticks drift and its
+    /// triggers rest near zero. A press, a pushed stick or a pulled trigger is play.
+    #[test]
+    fn a_resting_pad_is_not_activity() {
+        let ev = |kind: InputKind, code: u32, x: i32| InputEvent {
+            kind,
+            _pad: [0; 3],
+            code,
+            x,
+            y: 0,
+            flags: 0,
+        };
+        for (code, x) in [
+            (gamepad::AXIS_LS_X, 900),
+            (gamepad::AXIS_RS_Y, -8192),
+            (gamepad::AXIS_LT, 12),
+            (gamepad::AXIS_RT, 63),
+        ] {
+            assert!(
+                !ev(InputKind::GamepadAxis, code, x).is_activity(),
+                "{code} {x}"
+            );
+        }
+        for (code, x) in [
+            (gamepad::AXIS_LS_X, 20_000),
+            (gamepad::AXIS_RS_Y, -8193),
+            (gamepad::AXIS_RT, 64),
+        ] {
+            assert!(
+                ev(InputKind::GamepadAxis, code, x).is_activity(),
+                "{code} {x}"
+            );
+        }
+        assert!(ev(InputKind::GamepadButton, gamepad::BTN_A, 1).is_activity());
+        assert!(ev(InputKind::KeyDown, 30, 0).is_activity());
+        assert!(ev(InputKind::MouseMove, 0, 3).is_activity());
+        assert!(!ev(InputKind::GamepadArrival, 1, 0).is_activity());
+        assert!(!ev(InputKind::GamepadRemove, 0, 0).is_activity());
     }
 
     #[test]
