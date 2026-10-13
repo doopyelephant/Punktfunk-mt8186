@@ -271,9 +271,9 @@ jobs:
     if: github.event_name != 'pull_request'
     timeout-minutes: 90
     env:
-      # The x64 installer's binaries link the C runtime statically: a fresh Windows Server has no
-      # Visual C++ runtime, and setup itself has to start there. arm64 keeps the runtime DLL:
-      # Opus builds against it, and two of its math imports have no static arm64 counterpart.
+      # Every binary the installer ships links the C runtime statically: a fresh Windows Server
+      # has no Visual C++ runtime, and setup itself has to start there. Opus still compiles
+      # against the runtime DLL; the linker serves its imports from the static library.
       RUSTFLAGS: ${{ matrix.rustflags }}
     # The arm64 leg must never hold back the x64 canary (and its update manifest) while it is
     # unproven on hardware; drop the override once a Snapdragon box has run it.
@@ -299,7 +299,9 @@ jobs:
             bun_ship_zip: bun-windows-aarch64.zip
             bun_ship_sha: a7a16b876a305fd1029c66dbd27007b4f6112ae896532f675878731a21e50cfd
             suffix: '_arm64'
-            rustflags: ''
+            # Nothing but Opus names lrintf or floor on arm64, and the linker only serves an
+            # import from a function already in the link.
+            rustflags: '-C target-feature=+crt-static -C link-arg=/INCLUDE:lrintf -C link-arg=/INCLUDE:floor'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
