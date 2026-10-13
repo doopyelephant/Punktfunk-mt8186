@@ -374,6 +374,24 @@ pub(crate) fn runner_sandbox_off() -> bool {
     plat::runner_sandbox_off()
 }
 
+/// Why the runner stopped at its last start instead of running a plugin unsandboxed, in its own
+/// words. It leaves `plugin-state/runner.refused` then and removes it at the next start that
+/// gets past its probe. The host can't repeat that probe: it runs outside the runner's unit.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn sandbox_refusal() -> Option<String> {
+    sandbox_refusal_in(&pf_paths::config_dir())
+}
+
+/// One line, no control characters, 300 at most: the runner's text ends up in the console.
+#[cfg(any(test, target_os = "linux", windows))]
+fn sandbox_refusal_in(config_dir: &std::path::Path) -> Option<String> {
+    let file = config_dir.join("plugin-state").join("runner.refused");
+    let text = std::fs::read_to_string(file).ok()?;
+    let line = text.lines().next().unwrap_or_default().trim();
+    let plain = |c: char| if c.is_control() { ' ' } else { c };
+    Some(line.chars().map(plain).take(300).collect())
+}
+
 /// [`enable`]/[`disable`], also `POST /store/runtime`. Windows: the SYSTEM service
 /// already clears the elevation bar the CLI checks.
 pub(crate) fn set_runtime_enabled(enabled: bool) -> Result<()> {
@@ -553,5 +571,30 @@ pub(crate) fn converge_runner_roots() {
         Ok(true) => tracing::info!(roots = roots.len(), "plugin runner roots updated"),
         Ok(false) => {}
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "plugin runner roots not updated"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_runners_refusal_reads_as_one_bounded_line() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(sandbox_refusal_in(dir.path()), None);
+        let state = dir.path().join("plugin-state");
+        std::fs::create_dir_all(&state).unwrap();
+        let long = "x".repeat(400);
+        std::fs::write(
+            state.join("runner.refused"),
+            format!("no user\tnamespaces\u{1b}[0m {long}\nsecond line\n"),
+        )
+        .unwrap();
+        let shown = sandbox_refusal_in(dir.path()).unwrap();
+        assert!(shown.starts_with("no user namespaces [0m xxx"), "{shown}");
+        assert_eq!(shown.chars().count(), 300);
+        // An empty file is still a refusal: the runner wrote it, whatever the reason was.
+        std::fs::write(state.join("runner.refused"), "").unwrap();
+        assert_eq!(sandbox_refusal_in(dir.path()), Some(String::new()));
     }
 }
