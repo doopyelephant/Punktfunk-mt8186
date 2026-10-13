@@ -29,7 +29,7 @@ use super::setup::{
 use super::surface_control::{Layer, PresentComplete};
 use super::vsync::{VsyncClock, VsyncShared};
 use super::{Backstops, DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP};
-use crate::input_stall::{InputStall, INPUT_STALL_PATIENCE};
+use crate::input_stall::{InputStall, RungFloor, INPUT_STALL_PATIENCE, SETTLED_FRAMES};
 use crate::sys::{now_monotonic_ns, sysprop};
 
 /// One decoded output buffer ready to release: its codec buffer index + the pts the codec echoed
@@ -109,6 +109,15 @@ fn backend_label(backend: Option<bool>) -> &'static str {
     }
 }
 
+/// Human label for a rung's low-latency keys, for the same log lines.
+fn keys_label(keys: Option<bool>) -> &'static str {
+    match keys {
+        Some(true) => "aggressive low-latency keys ON",
+        Some(false) => "aggressive low-latency keys OFF",
+        None => "no low-latency keys",
+    }
+}
+
 /// Put `codec` into async-notify mode, forwarding every codec callback onto `ev_tx`.
 ///
 /// Must run BEFORE `configure()`/`start()` so we're async from the first buffer, and once per
@@ -163,21 +172,30 @@ fn install_async_callbacks(codec: &mut MediaCodec, ev_tx: &mpsc::Sender<DecodeEv
     true
 }
 
-/// Failed runs in a row whose decoder never presented a frame before the loop gives up. Past
-/// this the device keeps refusing the codec, and further rebuilds would only churn it.
+/// Failed runs in a row, on one ladder rung, whose decoder never presented a frame before the
+/// loop gives up. Past this the device keeps refusing the codec, and further rebuilds would
+/// only churn it.
 const MAX_BARREN_REBUILDS: u32 = 3;
 
 /// How one [`run_codec`] ended.
 enum RunEnd {
     /// The session stopped video, or every bring-up rung refused the first codec.
     Stopped,
-    /// The codec died or stopped taking input. `presented`: this run showed a frame.
-    Failed { presented: bool },
+    /// The codec died or stopped taking input after showing `rendered` frames. `clean`: it was
+    /// fed nothing past a loss and reported no error. `lower`: the ladder rung below its own,
+    /// if there is one.
+    Failed {
+        rendered: u64,
+        clean: bool,
+        lower: Option<usize>,
+    },
 }
 
 /// The decode thread's body (see [`run`]): one [`run_codec`] per codec. A codec that dies or
 /// hangs mid-session is torn down and rebuilt on the same surface, so the session keeps its
-/// video instead of freezing until the user reconnects.
+/// video instead of freezing until the user reconnects. Codecs that keep failing on an unbroken
+/// stream, on a rung where none ever settled, move the rebuild down the bring-up ladder
+/// ([`RungFloor`]). The floor lasts for this surface: the next video start begins at rung 0.
 pub(super) fn run_async(
     client: Arc<NativeClient>,
     window: NativeWindow,
@@ -188,6 +206,7 @@ pub(super) fn run_async(
     boost_thread_priority();
     let mut rebuilt = false;
     let mut barren = 0u32;
+    let mut floor = RungFloor::default();
     // The failed codec's layer, still showing the last good frame until a rebuilt one presents.
     let mut stale: Option<Layer> = None;
     // Monotonic ns of the feeder's last loss gap (each one fires an RFI ask); 0 = none yet.
@@ -203,10 +222,23 @@ pub(super) fn run_async(
             rebuilt,
             &mut stale,
             &last_gap_ns,
+            floor.rung(),
         ) {
             RunEnd::Stopped => return,
-            RunEnd::Failed { presented } => {
-                barren = if presented { 0 } else { barren + 1 };
+            RunEnd::Failed {
+                rendered,
+                clean,
+                lower,
+            } => {
+                barren = if rendered > 0 { 0 } else { barren + 1 };
+                if floor.note_failed(rendered, clean, lower) {
+                    barren = 0; // the lower rung gets its own tries
+                    log::warn!(
+                        "decode: two decoders in a row failed on an unbroken stream within \
+                         {SETTLED_FRAMES} frames — the next one starts at rung {}",
+                        floor.rung()
+                    );
+                }
                 if barren >= MAX_BARREN_REBUILDS {
                     log::error!(
                         "decode: {barren} rebuilt decoders in a row showed no frame — giving up; \
@@ -226,8 +258,10 @@ pub(super) fn run_async(
                 }
                 log::warn!(
                     "decode: rebuilding the decoder in place (rebuild {rebuilds}, {after_gap} \
-                     within 5 s of a loss gap; last gap {})",
-                    gap_age_ms.map_or("none".to_string(), |ms| format!("{ms} ms ago"))
+                     within 5 s of a loss gap; last gap {}; it showed {rendered} frame(s) on {} \
+                     stream)",
+                    gap_age_ms.map_or("none".to_string(), |ms| format!("{ms} ms ago")),
+                    if clean { "an unbroken" } else { "a broken" }
                 );
                 rebuilt = true;
             }
@@ -246,7 +280,7 @@ pub(super) fn run_async(
 /// stale buffer index. `rebuilt`: a previous codec failed, so this one waits for a keyframe.
 /// `stale`: a failed run's layer, hidden at this run's first present; a failed run that
 /// presented leaves its own layer there. `last_gap_ns`: where the feeder stamps each loss gap,
-/// for the rebuild log.
+/// for the rebuild log. `floor`: the ladder rung bring-up starts at.
 #[allow(clippy::too_many_arguments)]
 fn run_codec(
     client: &Arc<NativeClient>,
@@ -257,12 +291,14 @@ fn run_codec(
     rebuilt: bool,
     stale: &mut Option<Layer>,
     last_gap_ns: &Arc<AtomicI64>,
+    floor: usize,
 ) -> RunEnd {
     let mode = client.mode();
     // The event channel: the callbacks + feeder push, this loop pulls. `Sender` is `Send`, so the
     // callback closures (each capturing a clone) satisfy the async-notify `Send` bound.
     let (ev_tx, ev_rx) = mpsc::channel::<DecodeEvent>();
-    let Some((codec, asc)) = bring_up(client, window, opts, &ev_tx, stats) else {
+    let Some((codec, asc, lower_rung)) = bring_up(client, window, opts, &ev_tx, stats, floor)
+    else {
         if !rebuilt {
             return RunEnd::Stopped;
         }
@@ -273,7 +309,11 @@ fn run_codec(
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        return RunEnd::Failed { presented: false };
+        return RunEnd::Failed {
+            rendered: 0,
+            clean: false,
+            lower: None,
+        };
     };
     // The forced TV mode switch (`is_tv` ⇒ ALWAYS strategy) is part of the experimental stack;
     // off, every form factor gets the original soft seamless hint. ASC votes the rate on its own
@@ -337,6 +377,7 @@ fn run_codec(
         // callback, and it keeps the event channel alive for those callbacks.
         present_tx: asc.as_ref().map(|_| ev_tx.clone()),
         decoded_size: opts.decoded_size.clone(),
+        lower_rung,
     };
     let mut state = State::new(asc, presenter, ReanchorGate::new(client.frames_dropped()));
     state.admit = admission(client.codec, &ctx.codec.name().unwrap_or_default());
@@ -516,6 +557,7 @@ fn teardown(
         discarded,
         fatal,
         wedged,
+        unclean,
         ..
     } = state;
     if let Some(mut p) = presenter {
@@ -525,6 +567,7 @@ fn teardown(
         a.release_all(); // drop every held image back to the reader pool before it goes away
     }
     drop(aux.vsync); // stop + join the choreographer thread; its channel sends are harmless after
+    let lower = ctx.lower_rung;
     let _ = ctx.codec.stop();
     // AMediaCodec_delete — after this no render callback can fire. The ASC reader + layer outlive
     // the codec, which rendered into the reader's window. `into_layer` then drops the reader; the
@@ -545,26 +588,26 @@ fn teardown(
             *stale = layer;
         }
         RunEnd::Failed {
-            presented: rendered > 0,
+            rendered,
+            clean: !unclean,
+            lower,
         }
     } else {
         RunEnd::Stopped
     }
 }
 
-/// Climb the decoder bring-up ladder ([`bring_up_rungs`]) until a codec starts. `None` ⇒ every
-/// rung refused, or the platform refused async mode — either way the session has no video.
+/// Climb the decoder bring-up ladder ([`bring_up_rungs`]) from `floor` until a codec starts,
+/// and return it with the rung below its own. `None` ⇒ every rung refused, or the platform
+/// refused async mode — either way the session has no video.
 ///
-/// `configure()` can succeed and `start()` still fail: start is where the codec negotiates
-/// buffers with its output consumer and allocates them, so a decoder that accepted the format
-/// can still refuse the surface it has to render into. A codec that failed `start` is in an error
-/// state and cannot be reconfigured, so each rung builds a fresh one. The rungs shed what a
-/// configure or start can choke on, most-suspect first:
+/// `configure()` can succeed and `start()` still fail: start is where the codec allocates its
+/// buffers from the output consumer. A codec that failed `start` cannot be reconfigured, so
+/// each rung builds a fresh one. A codec can also start and then hang a few frames in, every
+/// time; [`RungFloor`] raises `floor` for that. The rungs shed, most-suspect first:
 ///
 ///   1. The ASC reader's `COMPOSER_OVERLAY` usage — overlay + GPU-sampled + vendor-vdec in one
-///      allocation is what an old OMX-era gralloc refuses (see [`AscBackend::create`]'s `overlay`
-///      doc). Usage is the ONLY reader axis worth a rung: `READER_MAX_IMAGES` is not a start-time
-///      factor.
+///      allocation is what an old OMX-era gralloc refuses (see [`AscBackend::create`]).
 ///   2. The `AImageReader` entirely — an app-side BufferQueue consumer at all is the residual
 ///      suspect (a vendor OMX component keying on queues-to-composer).
 ///   3. The aggressive low-latency key set.
@@ -578,7 +621,8 @@ fn bring_up(
     opts: &DecodeOptions,
     ev_tx: &mpsc::Sender<DecodeEvent>,
     stats: &crate::stats::VideoStats,
-) -> Option<(MediaCodec, Option<AscBackend>)> {
+    floor: usize,
+) -> Option<(MediaCodec, Option<AscBackend>, Option<usize>)> {
     let mode = client.mode();
     let mime = codec_mime(client.codec);
     // Fetched ONCE, ahead of the ladder, so a retry rung never pays the wait again.
@@ -596,16 +640,14 @@ fn bring_up(
         );
     }
     let rungs = bring_up_rungs(asc_wanted, opts.low_latency_mode);
-    for (rung, &(backend, keys)) in rungs.iter().enumerate() {
-        if rung > 0 {
+    // The ladder is never empty; the sysprop can shorten it under a floor already raised.
+    let floor = floor.min(rungs.len() - 1);
+    for (rung, &(backend, keys)) in rungs.iter().enumerate().skip(floor) {
+        if rung > floor {
             log::warn!(
                 "decode: decoder refused that configuration — retrying through {} with {}",
                 backend_label(backend),
-                match keys {
-                    Some(true) => "aggressive low-latency keys ON",
-                    Some(false) => "aggressive low-latency keys OFF",
-                    None => "no low-latency keys",
-                }
+                keys_label(keys)
             );
         }
         let Some(mut codec) = create_codec(mime, opts.decoder_name.as_deref()) else {
@@ -615,7 +657,7 @@ fn bring_up(
         // The decoder's *actual* resolved name (Kotlin's pick, or the platform default when it
         // fell back) drives both the HUD label and which vendor low-latency keys apply.
         let codec_name = codec.name().unwrap_or_default();
-        if rung == 0 {
+        if rung == floor {
             stats.set_decoder(&codec_name, opts.ll_feature);
             log::info!(
                 "decode: codec mime = {mime}, decoder = {codec_name} (async, low-latency feature: {})",
@@ -668,15 +710,16 @@ fn bring_up(
             continue;
         }
         log::info!(
-            "decode: decoder started (async) at {}x{} through {} (rung {rung})",
+            "decode: decoder started (async) at {}x{} through {} with {} (rung {rung})",
             mode.width,
             mode.height,
             // `asc.as_ref().and(backend)`, not `backend`: an ASC rung whose backend failed to
             // CREATE fell back to the SurfaceView within the rung, and this line must report what
             // actually runs.
-            backend_label(asc.as_ref().and(backend))
+            backend_label(asc.as_ref().and(backend)),
+            keys_label(keys)
         );
-        return Some((codec, asc));
+        return Some((codec, asc, (rung + 1 < rungs.len()).then_some(rung + 1)));
     }
     // Every rung refused. Say so loudly and in the shape the next reporter can act on: the
     // session stays up (audio/input/library all still work), so without this line the only
@@ -742,6 +785,8 @@ struct Ctx {
     present_tx: Option<mpsc::Sender<DecodeEvent>>,
     /// The session's decoded-size cell, refreshed on each output-format change.
     decoded_size: Arc<AtomicU64>,
+    /// The bring-up ladder rung below this codec's, if there is one.
+    lower_rung: Option<usize>,
 }
 
 impl Ctx {
@@ -805,6 +850,11 @@ struct State {
     admit: Option<Admit>,
     /// AUs the rule kept off the codec. They owe output like fed ones ([`Backstops::poll`]).
     withheld: u64,
+    /// An AU was lost, here or on the wire, and no keyframe has been fed since.
+    loss_open: bool,
+    /// The codec was fed past a loss or reported an error: a failure after this may be the
+    /// stream's, not the configuration's ([`RungFloor`]).
+    unclean: bool,
 }
 
 /// [`AuAdmission`] and what the loop keeps beside it.
@@ -868,6 +918,8 @@ impl State {
             backstops: Backstops::new(),
             admit: None,
             withheld: 0,
+            loss_open: false,
+            unclean: false,
         }
     }
 
@@ -882,6 +934,7 @@ impl State {
                 if gap > 0 {
                     self.gate
                         .arm_expecting_drops(Instant::now(), u64::from(gap));
+                    self.loss_open = true;
                 }
                 if self.withhold(&f, gap, pass) {
                     return;
@@ -903,6 +956,7 @@ impl State {
                 if self.pending_aus.len() > FRAME_PARK_CAP {
                     self.pending_aus.pop_front(); // sustained overflow — drop oldest
                     pass.aus_dropped += 1;
+                    self.loss_open = true;
                     self.local_loss(pass);
                 }
             }
@@ -927,7 +981,10 @@ impl State {
             DecodeEvent::Error { fatal: true } => self.fatal = true,
             // A recoverable/transient codec error is a decode hiccup on a broken reference chain —
             // arm the freeze so the concealed output it recovers into is held off the screen.
-            DecodeEvent::Error { fatal: false } => self.gate.arm(Instant::now()),
+            DecodeEvent::Error { fatal: false } => {
+                self.gate.arm(Instant::now());
+                self.unclean = true;
+            }
             DecodeEvent::PresentComplete(pc) => pass.present_completes.push(pc),
         }
     }
@@ -991,6 +1048,7 @@ impl State {
     fn drop_admitted(&mut self, pass: &mut Pass) {
         self.gate.arm(Instant::now());
         pass.ask_keyframe = true;
+        self.loss_open = true;
         self.local_loss(pass);
     }
 
@@ -1173,6 +1231,11 @@ impl State {
                 }
                 continue;
             }
+            // A keyframe needs no reference. Anything else fed after a loss may name the lost AU.
+            if first && frame.flags & u32::from(FLAG_SOF) != 0 {
+                self.loss_open = false;
+            }
+            self.unclean |= self.loss_open;
             // `fed` counts ACCESS UNITS toward the HUD's fed/decoded balance — the closing piece
             // (or a whole AU) bumps it. The queued stamp marks the same instant (the AU is fully
             // in the codec's hands): the P3 decode split measures `codec` from here, so a
