@@ -14,10 +14,7 @@ const XBOX_APP_IDENTITY: &str = "Microsoft.GamingApp";
 const XBOX_APP_ID: &str = "Microsoft.Xbox.App";
 
 /// Recipe is resolved in [`launch_title`]; a missing one still yields a target here.
-pub(super) fn launch_target(
-    entry: GameEntry,
-    game: crate::gamelease::GameRef,
-) -> Option<LaunchTarget> {
+pub(super) fn launch_target(entry: GameEntry, game: GameRef) -> Option<LaunchTarget> {
     Some(LaunchTarget {
         game,
         launcher: entry.role == GameRole::Launcher,

@@ -31,10 +31,20 @@ pub use self::plat::*;
 #[cfg(not(windows))]
 use self::posix as plat;
 
+/// Display identity for a launched title.
+#[derive(Clone, Debug, Default)]
+pub struct GameRef {
+    /// Store-qualified id (`steam:570`). `None` = typed `apps.json` command.
+    pub id: Option<String>,
+    pub store: Option<String>,
+    /// Display title; never empty in the UI (falls back to id, then command).
+    pub title: String,
+}
+
 /// Library enumeration hits every store's on-disk metadata, so handshake
 /// resolves this once and threads it through the data plane.
 pub struct LaunchTarget {
-    pub game: crate::gamelease::GameRef,
+    pub game: GameRef,
     /// Launcher tile (design D4): no game-exit to detect; the lease stays untracked.
     /// See [`crate::gamelease::LeaseRequest::launcher`].
     pub launcher: bool,
@@ -56,7 +66,7 @@ pub struct LaunchTarget {
 #[cfg(not(windows))]
 pub fn big_picture_launch() -> Option<LaunchTarget> {
     Some(LaunchTarget {
-        game: crate::gamelease::GameRef {
+        game: GameRef {
             id: None,
             store: Some("steam".into()),
             title: "Steam Big Picture".into(),
@@ -85,7 +95,7 @@ pub fn game_mode_launch() -> Option<LaunchTarget> {
 /// session). Windows has no nest: `launch_title` resolves the process later.
 pub fn resolve_launch(id: &str) -> Option<LaunchTarget> {
     let entry = all_games().into_iter().find(|g| g.id == id)?;
-    let game = crate::gamelease::GameRef {
+    let game = GameRef {
         id: Some(entry.id.clone()),
         store: Some(entry.store.clone()),
         title: entry.title.clone(),

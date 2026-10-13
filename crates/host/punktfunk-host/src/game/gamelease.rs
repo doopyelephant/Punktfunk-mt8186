@@ -17,6 +17,7 @@
 //!    launch, and re-verify start time before signalling ([`crate::procscan`]).
 
 use crate::library::DetectSpec;
+pub use crate::library::GameRef;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -63,16 +64,6 @@ pub struct OwnedChild {
     /// non-leader shares the host's group — signal that pid only.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
     pub group_leader: bool,
-}
-
-/// Display identity for a launched title.
-#[derive(Clone, Debug, Default)]
-pub struct GameRef {
-    /// Store-qualified id (`steam:570`). `None` = typed `apps.json` command.
-    pub id: Option<String>,
-    pub store: Option<String>,
-    /// Display title; never empty in the UI (falls back to id, then command).
-    pub title: String,
 }
 
 #[derive(Clone, Debug)]
