@@ -1,11 +1,19 @@
 //! Every setting row the pages show, as data: the key it stores under and the label it carries.
-//! The pages take both from here, so a row cannot show a label this table does not hold.
+//! The pages take both from here, so a row cannot show a label this table does not hold, and
+//! the catalog test holds the table to `clients/shared/settings-catalog.json`. A row's page and
+//! tier are stated here for that test; its place is laid out by hand in its page.
 
 /// One row of a settings page.
 pub(super) struct Row {
     /// The stored key, and the name a preset pins it under.
     pub(super) key: &'static str,
     pub(super) label: &'static str,
+    /// The sidebar page it sits on, by its tag.
+    #[cfg(test)]
+    page: &'static str,
+    /// Whether it waits behind Show advanced.
+    #[cfg(test)]
+    advanced: bool,
 }
 
 macro_rules! rows {
@@ -13,7 +21,13 @@ macro_rules! rows {
         $(pub(super) const $name: Row = Row {
             key: $key,
             label: $label,
+            #[cfg(test)]
+            page: $page,
+            #[cfg(test)]
+            advanced: $advanced,
         };)*
+        #[cfg(test)]
+        const ROWS: &[Row] = &[$($name),*];
     };
 }
 
@@ -70,4 +84,96 @@ rows! {
     GUIDE_GESTURE: "guide_gesture", "Hold Select for guide", "controllers", true;
     PAD_HAPTICS: "pad_haptics", "Controller haptics", "controllers", true;
     PAD_SPEAKER: "pad_speaker", "Controller speaker", "controllers", true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catalog keys this client has no row for, and why.
+    const ABSENT: &[(&str, &str)] = &[
+        (
+            "background_keep_alive",
+            "a phone or TV app in the background",
+        ),
+        (
+            "background_timeout_minutes",
+            "a phone or TV app in the background",
+        ),
+        (
+            "gamepad_ui_enabled",
+            "this shell never opens the console on its own",
+        ),
+        (
+            "gamepad_ui_mode",
+            "this shell never opens the console on its own",
+        ),
+        ("follow_os_theme", "the console's own look"),
+        ("ui_palette", "the console's own look"),
+        ("reduce_motion", "the console's own look"),
+        ("reduce_ui_resolution", "a weak GPU's console"),
+        ("library_view", "the console's library"),
+        ("library_sections", "the console's library"),
+        ("host_sort", "this host list has one order"),
+        ("host_grouping", "this host list has one order"),
+        ("second_screen", "an Android handheld's second screen"),
+        ("low_latency", "a MediaCodec decoder flag"),
+        ("audio_route", "webOS's own audio plane"),
+        ("cursor_gestures", "a TV remote's missing second button"),
+        ("rumble_on_phone", "a phone's own hardware"),
+        ("gyro_on_phone", "a phone's own hardware"),
+        ("sc2_capture", "Apple only"),
+        ("ds_capture", "Android and webOS only"),
+    ];
+
+    /// Rows with no catalog entry: this device's own pickers.
+    const LOCAL: &[&str] = &["adapter", "speaker_device", "mic_device"];
+
+    /// Rows on a sidebar page the catalog does not name, with that page: Quick actions has
+    /// its own.
+    const OWN_PAGE: &[(&str, &str)] = &[("overlay_actions", "quick_actions")];
+
+    /// Each row that edits a shared setting carries the catalog's label, category and tier,
+    /// save a page [`OWN_PAGE`] names, and every catalog entry has a row here or a reason it
+    /// does not.
+    #[test]
+    fn rows_match_the_settings_catalog() {
+        let raw = include_str!("../../../../shared/settings-catalog.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("the catalog parses");
+        let entries = file["settings"].as_array().expect("settings");
+        for row in ROWS {
+            let Some(e) = entries.iter().find(|e| e["key"] == row.key) else {
+                assert!(
+                    LOCAL.contains(&row.key),
+                    "{} is not in the catalog",
+                    row.key
+                );
+                continue;
+            };
+            assert_eq!(row.label, e["label"].as_str().unwrap(), "{}", row.key);
+            let category = e["category"].as_str().unwrap();
+            assert_eq!(
+                row.page != category,
+                OWN_PAGE.contains(&(row.key, row.page)),
+                "{}: page {}, the catalog's {category}",
+                row.key,
+                row.page
+            );
+            assert_eq!(
+                row.advanced,
+                e["advanced"].as_bool().unwrap(),
+                "{}",
+                row.key
+            );
+        }
+        for e in entries {
+            let key = e["key"].as_str().unwrap();
+            let bound = ROWS.iter().any(|r| r.key == key);
+            let absent = ABSENT.iter().any(|(k, _)| *k == key);
+            assert!(
+                bound != absent,
+                "{key}: a row or a reason, not both or neither"
+            );
+        }
+    }
 }
