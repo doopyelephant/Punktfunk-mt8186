@@ -9,6 +9,7 @@
 //!
 //! Driver IOCTL and the per-monitor REMOVE key sit behind [`VdisplayDriver`].
 //! Topology, GDI/CCD glue, and generation-stamped leases are driver-neutral.
+//! The isolate ladder reaches the OS through [`CcdOps`].
 //! Evidence: `design/display-management.md`.
 
 use std::collections::BTreeMap;
@@ -32,10 +33,14 @@ use crate::driver::ControlDevice;
 use crate::lifecycle::{self, Acquire, Release};
 use pf_win_display::topology_churn::{self, Finished, Outcome};
 use pf_win_display::win_display::{
-    count_other_active, force_extend_topology, isolate_displays_ccd_checked, resolve_gdi_name,
-    restore_displays_ccd, set_active_mode, set_virtual_primary_ccd, wait_mode_settled,
-    wait_target_departed, CcdTargetKey, IsolateOutcome, SavedConfig,
+    count_other_active, force_extend_topology, resolve_gdi_name, restore_displays_ccd,
+    set_active_mode, set_virtual_primary_ccd, wait_mode_settled, wait_target_departed,
+    CcdTargetKey, IsolateOutcome, SavedConfig,
 };
+
+#[path = "manager/ccd.rs"]
+mod ccd;
+use ccd::{CcdOps, WinCcd};
 
 #[path = "manager/driver.rs"]
 mod driver;
@@ -220,11 +225,13 @@ const ISOLATE_HOLD: Duration = Duration::from_secs(3);
 
 /// Every CCD isolate in this file, as one topology transaction: descriptor-following holds for
 /// `hold`, and the generation moves only when the verification read saw a path switch off.
-/// `store` stores the isolate for the connected set (see [`isolate_displays_ccd_checked`]).
-/// Returns the pre-isolate snapshot (`None` when nothing was attempted) and the finished
-/// transaction. Tests fail the next N isolates through [`FAIL_NEXT_ISOLATES`], so an injected
-/// failure passes the same gates a real one does.
+/// `store` stores the isolate for the connected set (see
+/// [`CcdOps::isolate_displays_ccd_checked`]). Returns the pre-isolate snapshot (`None` when
+/// nothing was attempted) and the finished transaction. Tests fail the next N isolates
+/// through [`FAIL_NEXT_ISOLATES`], so an injected failure passes the same gates a real one
+/// does.
 fn isolate_txn(
+    ccd: &dyn CcdOps,
     reason: &'static str,
     keep: &[CcdTargetKey],
     hold: Duration,
@@ -245,7 +252,7 @@ fn isolate_txn(
         );
         None
     } else {
-        isolate_displays_ccd_checked(keep, store)
+        ccd.isolate_displays_ccd_checked(keep, store)
     };
     let finished =
         topology_churn::finish(txn, isolate_txn_outcome(isolated.as_ref().map(|(_, o)| *o)));
@@ -445,7 +452,7 @@ impl MgrInner {
     /// The exclusive watch's snapshot gates: the keep-set and how many non-managed displays
     /// are active. `None` mutates nothing this cycle: no exclusive isolate is live, or the
     /// display snapshot is unknown, which is not the same as stable.
-    fn exclusive_survivors(&self) -> Option<(Vec<CcdTargetKey>, u32)> {
+    fn exclusive_survivors(&self, ccd: &dyn CcdOps) -> Option<(Vec<CcdTargetKey>, u32)> {
         if self.group.ccd_saved.is_none() || !self.group.ccd_exclusive {
             return None;
         }
@@ -454,7 +461,7 @@ impl MgrInner {
             return None;
         }
         // Not FRESH: the actor's last query failed, or it never published.
-        let snap = pf_win_display::display_events::snapshot_or_query();
+        let snap = ccd.snapshot_or_query();
         if !snap.is_fresh() && snap.generation > 0 {
             tracing::debug!(
                 failures = snap.failures,
@@ -480,8 +487,8 @@ impl MgrInner {
     /// the stored layout when a display re-plugs itself, so storing the isolate ends that fight.
     /// Only a finished `Changed` bumps [`topology_reassert_gen`] and parks the re-lit display's
     /// devnode for the session; a change seen past the hold deadline finishes as unknown.
-    fn reassert_isolate(&mut self, keep: &[CcdTargetKey], hold: Duration) {
-        let (_, finished) = isolate_txn("exclusive-reassert", keep, hold, true);
+    fn reassert_isolate(&mut self, ccd: &dyn CcdOps, keep: &[CcdTargetKey], hold: Duration) {
+        let (_, finished) = isolate_txn(ccd, "exclusive-reassert", keep, hold, true);
         if finished.outcome != Outcome::Changed {
             return;
         }
@@ -493,11 +500,7 @@ impl MgrInner {
         if !crate::policy::prefs().standby_sink_neutralise() {
             return;
         }
-        let parked = pf_win_display::monitor_devnode::disable_connected_inactive(
-            keep,
-            &[],
-            finished.generation,
-        );
+        let parked = ccd.disable_connected_inactive(keep, &[], finished.generation);
         if !parked.is_empty() {
             tracing::info!(
                 parked = parked.len(),
@@ -549,6 +552,8 @@ struct DeviceSlot {
 
 pub struct VirtualDisplayManager {
     driver: Box<dyn VdisplayDriver>,
+    /// The OS display calls of the isolate ladder ([`WinCcd`] outside tests).
+    ccd: Box<dyn CcdOps>,
     /// Opened on first acquire; reopened after a gone-classified retire
     /// (see [`DeviceSlot`]). Shared via the `&'static` singleton.
     device: Mutex<DeviceSlot>,
@@ -597,6 +602,7 @@ pub fn topology_reassert_gen() -> u64 {
 pub(crate) fn init(driver: Box<dyn VdisplayDriver>) -> &'static VirtualDisplayManager {
     VDM.get_or_init(|| VirtualDisplayManager {
         driver,
+        ccd: Box::new(WinCcd),
         device: Mutex::new(DeviceSlot::default()),
         watchdog_s: AtomicU32::new(3),
         driver_proto: AtomicU32::new(0),
@@ -1128,9 +1134,9 @@ impl VirtualDisplayManager {
 
     /// Start the exclusive-topology re-assert watchdog (idempotent).
     ///
-    /// A verified [`isolate_displays_ccd_checked`] is not durable: until a re-assert stores it,
-    /// the CCD database still holds the user's layout for the connected set, and a re-resolution
-    /// (a display re-plugging itself) brings that back.
+    /// A verified isolate is not durable: until a re-assert stores it, the CCD database
+    /// still holds the user's layout for the connected set, and a re-resolution (a display
+    /// re-plugging itself) brings that back.
     ///
     /// Each cycle, at most every [`knobs::exclusive_reassert_ms`]: wait, `try_lock` the
     /// state, read the survivors, ask the [`ReassertBreaker`], act. A re-assert evicts via full
@@ -1157,7 +1163,7 @@ impl VirtualDisplayManager {
                     let Ok(mut inner) = self.state.try_lock() else {
                         continue;
                     };
-                    let Some((keep, survivors)) = inner.exclusive_survivors() else {
+                    let Some((keep, survivors)) = inner.exclusive_survivors(&*self.ccd) else {
                         continue;
                     };
                     match breaker.on_cycle(survivors, Instant::now()) {
@@ -1196,7 +1202,11 @@ impl VirtualDisplayManager {
                                  after the verified isolate (hybrid-GPU driver / display-poller \
                                  software restoring the saved layout?); re-asserting the isolate"
                             );
-                            inner.reassert_isolate(&keep, interval + Duration::from_secs(3));
+                            inner.reassert_isolate(
+                                &*self.ccd,
+                                &keep,
+                                interval + Duration::from_secs(3),
+                            );
                         }
                     }
                 }
@@ -1393,7 +1403,7 @@ impl VirtualDisplayManager {
                 if let Some(baseline) = baseline_active.as_deref()
                     && crate::policy::prefs().standby_sink_neutralise()
                 {
-                    neutralise_standby_sinks(inner, added_key, baseline, settle_start);
+                    neutralise_standby_sinks(&*self.ccd, inner, added_key, baseline, settle_start);
                 }
             }
             None => tracing::warn!(
@@ -1488,6 +1498,7 @@ impl VirtualDisplayManager {
                 // snapshot unless the first member's isolate failed — then adopt this one,
                 // or teardown cannot restore the physicals.
                 let (snap, _) = isolate_txn(
+                    &*self.ccd,
                     "sibling-isolate",
                     &inner.keep_with(added_key),
                     ISOLATE_HOLD,
@@ -1570,6 +1581,7 @@ impl VirtualDisplayManager {
         }
         // The PnP leases below are stamped with this transaction's generation.
         let (saved, finished) = isolate_txn(
+            &*self.ccd,
             "acquire-isolate",
             &inner.keep_with(added_key),
             ISOLATE_HOLD,
@@ -1852,7 +1864,7 @@ impl VirtualDisplayManager {
 
     /// Re-isolate after [`re_add`] put a new target in place of the old one,
     /// without recapturing the group restore snapshot. The old slot is already
-    /// gone from the map, so `inner.target_ids()` is surviving siblings.
+    /// gone from the map, so `inner.target_keys()` is surviving siblings.
     ///
     /// Call under the `state` lock — it commits a new CCD topology, so it must not interleave with
     /// another slot transition's commit. A *serialization* requirement, not a soundness one: every
@@ -1866,6 +1878,7 @@ impl VirtualDisplayManager {
                 // Grown-set semantics: isolate to the surviving siblings + the new target. The returned
                 // snapshot is DISCARDED — the group keeps the first member's (design §6.1).
                 let _ = isolate_txn(
+                    &*self.ccd,
                     "swap-isolate",
                     &inner.keep_with(new_target),
                     ISOLATE_HOLD,
@@ -1974,8 +1987,13 @@ impl VirtualDisplayManager {
                 // Re-issue isolate over the shrunk set. Snapshot discarded;
                 // the group keeps the first member's.
                 ShrinkAction::Reisolate => {
-                    let _ =
-                        isolate_txn("shrink-isolate", &inner.target_keys(), ISOLATE_HOLD, false);
+                    let _ = isolate_txn(
+                        &*self.ccd,
+                        "shrink-isolate",
+                        &inner.target_keys(),
+                        ISOLATE_HOLD,
+                        false,
+                    );
                 }
                 // Re-promote a survivor rather than leave primary on a target
                 // about to be REMOVEd. Save/restore the snapshot: the call
@@ -2352,6 +2370,7 @@ fn standby_baseline() -> Option<Vec<CcdTargetKey>> {
 /// window from `settle_start`, so force-EXTEND physicals are not still mid-activation.
 /// Extend leaves active panels untouched by construction.
 fn neutralise_standby_sinks(
+    ccd: &dyn CcdOps,
     inner: &mut MgrInner,
     added_key: CcdTargetKey,
     baseline_active: &[CcdTargetKey],
@@ -2360,7 +2379,7 @@ fn neutralise_standby_sinks(
     if let Some(rest) = Duration::from_millis(1500).checked_sub(settle_start.elapsed()) {
         thread::sleep(rest);
     }
-    for id in pf_win_display::monitor_devnode::disable_connected_inactive(
+    for id in ccd.disable_connected_inactive(
         &inner.keep_with(added_key),
         baseline_active,
         pf_win_display::topology_churn::generation(),
