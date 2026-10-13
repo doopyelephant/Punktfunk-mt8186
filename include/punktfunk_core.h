@@ -345,6 +345,15 @@
 // `PunktfunkStatus` code).
 #define PUNKTFUNK_CLIP_ERROR 6
 
+// [`punktfunk_connection_recovery_on_decoded`]'s `evidence`: the lane has no parser.
+#define PUNKTFUNK_ANCHOR_EVIDENCE_UNAVAILABLE 0
+
+// The picture predicts only from references that decoded clean.
+#define PUNKTFUNK_ANCHOR_EVIDENCE_CLEAN 1
+
+// The picture predicts from a concealed one: its anchor flag does not lift the freeze.
+#define PUNKTFUNK_ANCHOR_EVIDENCE_DAMAGED 2
+
 // Most findings one report carries; the rules can produce seven.
 #define PUNKTFUNK_HEALTH_FINDINGS_MAX 8
 
@@ -369,7 +378,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 51
+#define PUNKTFUNK_ABI_VERSION 52
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -3418,6 +3427,71 @@ PunktfunkStatus punktfunk_connection_request_keyframe(const PunktfunkConnection 
 PunktfunkStatus punktfunk_connection_request_rfi(const PunktfunkConnection *c,
                                                  uint32_t first_frame,
                                                  uint32_t last_frame);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Report one AU before decode, in receive order; a sliced AU once, on its first part. On a
+// gap the core arms the freeze and asks the host for the lost range. `out_admit` false:
+// drop the AU, a straggler a reference decoder rewinds on or a partial a newer frame beat.
+// `out_gap` is the frames lost ahead of it, the `gap` [`punktfunk_au_admission_note`]
+// takes. `complete` false is a partial delivery. `decode_order` is the decoder's count so
+// far, 0 where it numbers none.
+//
+// # Safety
+// `c` is a valid connection handle; the out pointers are writable or NULL.
+PunktfunkStatus punktfunk_connection_recovery_on_frame(const PunktfunkConnection *c,
+                                                       uint32_t index,
+                                                       bool complete,
+                                                       uint64_t decode_order,
+                                                       bool *out_admit,
+                                                       uint32_t *out_gap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Report one decoded picture. `out_hold` true: keep the last good picture on glass
+// instead of this one. `flags` are the AU's wire flags; `keyframe` is the decoder's own
+// IDR bit, false where it flags none; `evidence` is a `PUNKTFUNK_ANCHOR_EVIDENCE_*`;
+// `decode_order` is this picture's decode count from 1, 0 where the decoder numbers none.
+// `out_forgive` true: the freeze lifted on an intra-refresh heal, so a reference-chain
+// ledger forgets its damage marks. An unknown `evidence` returns
+// [`PunktfunkStatus::InvalidArg`].
+//
+// # Safety
+// `c` is a valid connection handle; the out pointers are writable or NULL.
+PunktfunkStatus punktfunk_connection_recovery_on_decoded(const PunktfunkConnection *c,
+                                                         uint32_t flags,
+                                                         bool keyframe,
+                                                         uint32_t evidence,
+                                                         uint64_t decode_order,
+                                                         bool *out_hold,
+                                                         bool *out_forgive);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// An AU produced no picture. Three in a row arm the freeze and ask for a keyframe.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_recovery_on_no_output(const PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// A loss the frame index cannot show, such as a wedged decoder: arms the freeze and asks
+// for a keyframe.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_recovery_lost(const PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The decoder is gone or parked (a restart, a background drain): drops the freeze.
+// Nothing asks until the next report, which starts a fresh one. Call it while draining
+// AUs undecoded: a freeze nothing reports to asks for a keyframe every half second.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_recovery_reset(const PunktfunkConnection *c);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

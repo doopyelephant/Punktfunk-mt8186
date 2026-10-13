@@ -117,6 +117,136 @@ pub unsafe extern "C" fn punktfunk_connection_request_rfi(
     })
 }
 
+/// [`punktfunk_connection_recovery_on_decoded`]'s `evidence`: the lane has no parser.
+pub const PUNKTFUNK_ANCHOR_EVIDENCE_UNAVAILABLE: u32 = 0;
+/// The picture predicts only from references that decoded clean.
+pub const PUNKTFUNK_ANCHOR_EVIDENCE_CLEAN: u32 = 1;
+/// The picture predicts from a concealed one: its anchor flag does not lift the freeze.
+pub const PUNKTFUNK_ANCHOR_EVIDENCE_DAMAGED: u32 = 2;
+
+/// Report one AU before decode, in receive order; a sliced AU once, on its first part. On a
+/// gap the core arms the freeze and asks the host for the lost range. `out_admit` false:
+/// drop the AU, a straggler a reference decoder rewinds on or a partial a newer frame beat.
+/// `out_gap` is the frames lost ahead of it, the `gap` [`punktfunk_au_admission_note`]
+/// takes. `complete` false is a partial delivery. `decode_order` is the decoder's count so
+/// far, 0 where it numbers none.
+///
+/// # Safety
+/// `c` is a valid connection handle; the out pointers are writable or NULL.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_recovery_on_frame(
+    c: *const PunktfunkConnection,
+    index: u32,
+    complete: bool,
+    decode_order: u64,
+    out_admit: *mut bool,
+    out_gap: *mut u32,
+) -> PunktfunkStatus {
+    with_conn!(c => {
+        let arrival = c.inner.recovery_on_au(index, complete, decode_order);
+        // SAFETY: caller out-params, each null or writable for one value.
+        unsafe {
+            put(out_admit, arrival.admit);
+            put(out_gap, arrival.gap);
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// Report one decoded picture. `out_hold` true: keep the last good picture on glass
+/// instead of this one. `flags` are the AU's wire flags; `keyframe` is the decoder's own
+/// IDR bit, false where it flags none; `evidence` is a `PUNKTFUNK_ANCHOR_EVIDENCE_*`;
+/// `decode_order` is this picture's decode count from 1, 0 where the decoder numbers none.
+/// `out_forgive` true: the freeze lifted on an intra-refresh heal, so a reference-chain
+/// ledger forgets its damage marks. An unknown `evidence` returns
+/// [`PunktfunkStatus::InvalidArg`].
+///
+/// # Safety
+/// `c` is a valid connection handle; the out pointers are writable or NULL.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_recovery_on_decoded(
+    c: *const PunktfunkConnection,
+    flags: u32,
+    keyframe: bool,
+    evidence: u32,
+    decode_order: u64,
+    out_hold: *mut bool,
+    out_forgive: *mut bool,
+) -> PunktfunkStatus {
+    use punktfunk_core::reanchor::{AnchorEvidence, LocalRecovery};
+    with_conn!(c => {
+        let evidence = match evidence {
+            PUNKTFUNK_ANCHOR_EVIDENCE_UNAVAILABLE => AnchorEvidence::Unavailable,
+            PUNKTFUNK_ANCHOR_EVIDENCE_CLEAN => AnchorEvidence::ReferencesClean,
+            PUNKTFUNK_ANCHOR_EVIDENCE_DAMAGED => AnchorEvidence::ReferencesDamaged,
+            _ => return PunktfunkStatus::InvalidArg,
+        };
+        let shown = c.inner.recovery_on_decoded(punktfunk_core::client::Decoded {
+            flags,
+            keyframe,
+            evidence,
+            local: LocalRecovery::NONE,
+            decode_order: (decode_order != 0).then_some(decode_order),
+        });
+        // SAFETY: caller out-params, each null or writable for one value.
+        unsafe {
+            put(out_hold, shown.hold);
+            put(out_forgive, shown.forgive_chain);
+        }
+        PunktfunkStatus::Ok
+    })
+}
+
+/// An AU produced no picture. Three in a row arm the freeze and ask for a keyframe.
+///
+/// # Safety
+/// `c` is a valid connection handle.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_recovery_on_no_output(
+    c: *const PunktfunkConnection,
+) -> PunktfunkStatus {
+    with_conn!(c => {
+        c.inner.recovery_on_no_output();
+        PunktfunkStatus::Ok
+    })
+}
+
+/// A loss the frame index cannot show, such as a wedged decoder: arms the freeze and asks
+/// for a keyframe.
+///
+/// # Safety
+/// `c` is a valid connection handle.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_recovery_lost(
+    c: *const PunktfunkConnection,
+) -> PunktfunkStatus {
+    with_conn!(c => {
+        c.inner.recovery_lost();
+        PunktfunkStatus::Ok
+    })
+}
+
+/// The decoder is gone or parked (a restart, a background drain): drops the freeze.
+/// Nothing asks until the next report, which starts a fresh one. Call it while draining
+/// AUs undecoded: a freeze nothing reports to asks for a keyframe every half second.
+///
+/// # Safety
+/// `c` is a valid connection handle.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_recovery_reset(
+    c: *const PunktfunkConnection,
+) -> PunktfunkStatus {
+    with_conn!(c => {
+        c.inner.recovery_reset();
+        PunktfunkStatus::Ok
+    })
+}
+
 /// Note each received `frame_index`. A forward gap fires throttled RFI; keyframe
 /// on `frames_dropped` is the backstop. `gap_out` (nullable) is whether a gap was seen.
 ///
@@ -737,5 +867,33 @@ mod tests {
             ]
         };
         assert!(statuses.iter().all(|s| *s == PunktfunkStatus::NullPointer));
+    }
+
+    /// A null connection is a status, and the out-params keep what the caller put there.
+    #[cfg(feature = "quic")]
+    #[test]
+    fn recovery_calls_report_a_null_connection() {
+        let null = std::ptr::null();
+        let (mut admit, mut gap, mut hold) = (true, 7u32, true);
+        // SAFETY: null handles are the documented reported-not-UB case; the outs are live.
+        let statuses = unsafe {
+            [
+                punktfunk_connection_recovery_on_frame(null, 1, true, 0, &mut admit, &mut gap),
+                punktfunk_connection_recovery_on_decoded(
+                    null,
+                    0,
+                    false,
+                    PUNKTFUNK_ANCHOR_EVIDENCE_UNAVAILABLE,
+                    0,
+                    &mut hold,
+                    std::ptr::null_mut(),
+                ),
+                punktfunk_connection_recovery_on_no_output(null),
+                punktfunk_connection_recovery_lost(null),
+                punktfunk_connection_recovery_reset(null),
+            ]
+        };
+        assert!(statuses.iter().all(|s| *s == PunktfunkStatus::NullPointer));
+        assert_eq!((admit, gap, hold), (true, 7, true));
     }
 }

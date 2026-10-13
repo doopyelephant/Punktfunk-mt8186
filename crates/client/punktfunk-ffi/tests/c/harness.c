@@ -70,6 +70,23 @@ int main(void) {
             return 1;
         }
     }
+    {
+        /* The recovery reports link from C; a null connection is a status and writes nothing. */
+        bool admit = true, hold = true;
+        uint32_t gap = 7;
+        if (punktfunk_connection_recovery_on_frame(NULL, 1, true, 0, &admit, &gap)
+                != PUNKTFUNK_STATUS_NULL_POINTER
+            || punktfunk_connection_recovery_on_decoded(
+                   NULL, 0, false, PUNKTFUNK_ANCHOR_EVIDENCE_UNAVAILABLE, 0, &hold, NULL)
+                != PUNKTFUNK_STATUS_NULL_POINTER
+            || punktfunk_connection_recovery_on_no_output(NULL) != PUNKTFUNK_STATUS_NULL_POINTER
+            || punktfunk_connection_recovery_lost(NULL) != PUNKTFUNK_STATUS_NULL_POINTER
+            || punktfunk_connection_recovery_reset(NULL) != PUNKTFUNK_STATUS_NULL_POINTER
+            || !admit || !hold || gap != 7) {
+            fprintf(stderr, "FAIL: recovery reports on a null connection\n");
+            return 1;
+        }
+    }
 #endif
 
     {
