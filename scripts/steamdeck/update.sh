@@ -6,11 +6,21 @@
 #   bash scripts/steamdeck/update.sh --pull    # `git pull` first (if the source is a git checkout)
 #
 # The branch the checkout follows is its channel: `stable` moves at each release, `main` is canary.
-# Switch with the guided installer's --channel, or `git switch <branch>` then --pull.
+# Switch with the guided installer's --channel, or `git switch <branch>` then --pull. This script
+# has no --channel of its own.
 #
 set -euo pipefail
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+SWITCH="  git -C $SRC fetch && git -C $SRC switch stable   # releases
+  git -C $SRC fetch && git -C $SRC switch main     # canary"
+# An ignored word would rebuild the same tree and report it as an update.
+case "$*" in
+    ""|--pull) ;;
+    *) die "update.sh takes --pull or nothing, not '$*'. Nothing was rebuilt.
+  To change channel, switch the branch, then run update.sh --pull:
+$SWITCH" ;;
+esac
 [ -d "$SRC/crates/host/punktfunk-host" ] || die "no punktfunk source at $SRC (set PUNKTFUNK_SRC)"
 WEB=0; [ -f "$HOME/.config/systemd/user/punktfunk-web.service" ] && WEB=1
 
@@ -18,8 +28,7 @@ if [ "${1:-}" = "--pull" ]; then
     [ -d "$SRC/.git" ] || die "$SRC is not a git checkout — rsync new source then run without --pull"
     git -C "$SRC" symbolic-ref -q HEAD >/dev/null \
         || die "$SRC isn't on a branch, so there is nothing to pull. Pick a channel, then re-run:
-  git -C $SRC fetch && git -C $SRC switch stable   # releases
-  git -C $SRC fetch && git -C $SRC switch main     # canary"
+$SWITCH"
     # A build regenerates these committed files (bun2nix). When main carries a stale copy, the
     # rebuild dirties it and the next pull that touches it aborts. Restoring derived paths is
     # lossless. Not `reset --hard`: this is the operator's own checkout.

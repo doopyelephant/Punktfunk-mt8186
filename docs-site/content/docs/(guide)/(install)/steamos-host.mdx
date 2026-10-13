@@ -97,7 +97,15 @@ bash ~/punktfunk/scripts/steamdeck/update.sh --pull
 
 Both rebuild on the device and keep your config and pairings. The checkout follows the `stable`
 branch, which moves to each release when it is announced. To follow `main`, the
-[canary channel](/docs/channels), install or re-run with `--channel canary`. More in
+[canary channel](/docs/channels), switch the branch and rebuild:
+
+```sh
+git -C ~/punktfunk fetch && git -C ~/punktfunk switch main
+bash ~/punktfunk/scripts/steamdeck/update.sh --pull
+```
+
+`switch stable` goes back. `update.sh` takes no `--channel`; that flag belongs to the
+[guided installer](/docs/install#guided-install-preview), which makes the same switch. More in
 [Updating](/docs/updating).
 
 ## Good to know
