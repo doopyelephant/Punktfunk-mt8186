@@ -386,6 +386,41 @@ impl Drop for SecurityAttributes {
     }
 }
 
+/// A job object whose last handle closing kills every process still in it. `extra` adds
+/// limits to `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; `JOB_OBJECT_LIMIT(0)` adds none.
+///
+/// Unnamed, default security. The handle is owned before the limits are set, so a failure
+/// there closes the job instead of leaking one that kills nothing.
+pub fn kill_on_close_job(
+    extra: windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT,
+) -> windows::core::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    // SAFETY: null attributes and a null name ask for a fresh unnamed job, default security.
+    let raw = unsafe { CreateJobObjectW(None, PCWSTR::null()) }?;
+    // SAFETY: the handle just created, owned nowhere else.
+    let job = unsafe { OwnedHandle::from_raw_handle(raw.0) };
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | extra;
+    // SAFETY: a live job; `info` is the type this class expects, passed with its own size,
+    // and the kernel copies it before the call returns.
+    unsafe {
+        SetInformationJobObject(
+            HANDLE(job.as_raw_handle()),
+            JobObjectExtendedLimitInformation,
+            (&raw const info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    }?;
+    Ok(job)
+}
+
 #[cfg(test)]
 mod security_attributes_tests {
     use super::SecurityAttributes;
@@ -401,5 +436,40 @@ mod security_attributes_tests {
         assert!(!attributes.bInheritHandle.as_bool());
         assert!(SecurityAttributes::new("not sddl").is_err());
         assert!(SecurityAttributes::new("D:P(A;;GA;;;SY)\0(A;;GA;;;WD)").is_err());
+    }
+
+    /// Closing the job's last handle ends a process assigned to it.
+    #[test]
+    fn closing_the_job_kills_what_is_in_it() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::JobObjects::{AssignProcessToJobObject, JOB_OBJECT_LIMIT};
+
+        let job = super::kill_on_close_job(JOB_OBJECT_LIMIT(0)).expect("a job");
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cmd");
+        // SAFETY: both handles are live and owned by this test for the call.
+        unsafe {
+            AssignProcessToJobObject(HANDLE(job.as_raw_handle()), HANDLE(child.as_raw_handle()))
+        }
+        .expect("assign");
+        assert!(
+            child.try_wait().expect("poll").is_none(),
+            "still waiting on stdin"
+        );
+        drop(job);
+        // The kill is asynchronous. Its exit code is the kernel's, so only the exit is asserted.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().expect("poll").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job's close left its process running"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

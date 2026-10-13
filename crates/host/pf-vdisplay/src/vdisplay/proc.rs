@@ -414,13 +414,11 @@ fn undecorate(name: &str) -> &str {
 /// `Child::kill`).
 #[cfg(windows)]
 mod tree {
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::{AsRawHandle, OwnedHandle};
     use std::process::Child;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, TerminateJobObject, JOB_OBJECT_LIMIT,
     };
 
     /// Nothing to arrange before spawn: job membership is assigned to the live process.
@@ -428,15 +426,12 @@ mod tree {
 
     /// Owns a Job object holding the spawned helper and everything it spawns. `None`
     /// when the job could not be set up (see the module doc: degrade, don't fail).
-    pub(super) struct Guard(Option<HANDLE>);
+    pub(super) struct Guard(Option<OwnedHandle>);
 
     impl Guard {
         /// Enroll `child` — and, transitively, its descendants — in a fresh kill-on-close job.
         pub(super) fn attach(child: &Child) -> Self {
-            // SAFETY: an unnamed job object with default security attributes; no pointer is passed
-            // and none is retained. The handle it yields is owned by the `Guard` constructed from
-            // it on the next line and closed exactly once, in that `Guard`'s `Drop`.
-            let job = match unsafe { CreateJobObjectW(None, None) } {
+            let job = match pf_paths_win::kill_on_close_job(JOB_OBJECT_LIMIT(0)) {
                 Ok(job) => job,
                 Err(e) => {
                     tracing::debug!(error = %e, "no job object for this helper — a hung one's \
@@ -444,7 +439,6 @@ mod tree {
                     return Self(None);
                 }
             };
-            // Owned from here on, so both fallible steps below can bail without leaking it.
             let guard = Self(Some(job));
             if let Err(e) = guard.enroll(child) {
                 tracing::debug!(error = %e, "could not enroll this helper in its job object — a \
@@ -454,27 +448,7 @@ mod tree {
         }
 
         fn enroll(&self, child: &Child) -> windows::core::Result<()> {
-            let Some(job) = self.0 else { return Ok(()) };
-            let info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-                BasicLimitInformation:
-                    windows::Win32::System::JobObjects::JOBOBJECT_BASIC_LIMIT_INFORMATION {
-                        LimitFlags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                        ..Default::default()
-                    },
-                ..Default::default()
-            };
-            // SAFETY: `job` is the live handle this `Guard` owns. The pointer is to a fully
-            // initialised local of exactly the type `JobObjectExtendedLimitInformation` selects,
-            // passed with that type's own size, and the kernel copies the limits out before
-            // returning — `info` is not retained past the call.
-            unsafe {
-                SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    std::ptr::from_ref(&info).cast(),
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )?;
-            }
+            let Some(job) = self.raw() else { return Ok(()) };
             // SAFETY: `job` is the live handle this `Guard` owns. `child` is borrowed for the call,
             // so the process handle it lends is open and stays open for the duration — `Child`
             // closes it only in its own `Drop`. The kernel duplicates what it needs; we keep
@@ -482,25 +456,17 @@ mod tree {
             unsafe { AssignProcessToJobObject(job, HANDLE(child.as_raw_handle())) }
         }
 
+        fn raw(&self) -> Option<HANDLE> {
+            self.0.as_ref().map(|job| HANDLE(job.as_raw_handle()))
+        }
+
         /// End every process still in the job. A no-op once they have all exited, so this
         /// is safe on the success path as well as the timeout one.
         pub(super) fn terminate(&self) {
-            let Some(job) = self.0 else { return };
-            // SAFETY: `job` is this `Guard`'s live, owned handle — it is closed only in `Drop`,
-            // which cannot have run while `&self` is borrowed. The exit code is arbitrary; nothing
-            // reads it, because a killed tree is reported to callers as the budget's `TimedOut`.
+            let Some(job) = self.raw() else { return };
+            // SAFETY: `job` is this `Guard`'s live, owned handle, open while `&self` is borrowed.
+            // The exit code is arbitrary: a killed tree reaches callers as the budget's `TimedOut`.
             let _ = unsafe { TerminateJobObject(job, 1) };
-        }
-    }
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            let Some(job) = self.0.take() else { return };
-            // SAFETY: `job` is the handle created in `attach` and owned solely by this `Guard`;
-            // `take` makes this the one and only close. Per the module doc this close is also the
-            // backstop kill — with KILL_ON_JOB_CLOSE set, dropping the last handle terminates
-            // whatever is still in the job, so no early return can leak the tree.
-            let _ = unsafe { CloseHandle(job) };
         }
     }
 }
