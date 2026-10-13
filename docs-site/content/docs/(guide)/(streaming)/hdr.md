@@ -75,6 +75,9 @@ monitor rule. SDR content inside it starts at **SDR brightness** (the Game Mode 
 203 nits). The client panel's volume, when the app sends it, becomes the head's mastering
 target. An older Hyprland that refuses those keys streams SDR until the host restarts.
 
+HDR needs Hyprland's colour management, which is on by default. With `render:cm_enabled = false`
+the session streams SDR.
+
 **Streaming a physical monitor** on Hyprland is HDR when that monitor is in HDR mode. Nothing
 to set on the host.
 

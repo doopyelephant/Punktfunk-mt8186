@@ -154,7 +154,7 @@ pub(crate) use pipewire::PortalCapturer;
 mod gbm_pool;
 // Direct `ext-image-copy-capture-v1` capture, with no portal and no PipeWire.
 mod wl_capture;
-pub(crate) use wl_capture::{output_is_hdr10, WlCapturer};
+pub(crate) use wl_capture::{hdr_capture_globals, output_is_hdr10, WlCapturer};
 // Negotiation POD builders and cursor-meta parser + CPU blits. Pure enough
 // to unit-test without a compositor.
 mod pw_cursor;
