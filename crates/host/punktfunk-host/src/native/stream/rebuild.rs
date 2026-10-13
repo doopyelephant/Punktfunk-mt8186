@@ -1,6 +1,7 @@
 //! Everything that swaps the pipeline under a running stream: a Gaming↔Desktop session switch,
 //! a client mode switch, the Windows topology re-assert, capture loss, and a source that changed
-//! size with no client Reconfigure. Each path ends in [`StreamState::adopt_pipeline`].
+//! size with no client Reconfigure. Each path builds the replacement and hands it to
+//! [`StreamState::swap_pipeline`].
 
 #[cfg(target_os = "linux")]
 use super::cursor::settle_portal_cursor;
@@ -11,6 +12,7 @@ use super::pipeline::{
     Pipeline,
 };
 use super::state::{announce_pipeline_gap, StreamState};
+use super::swap::{Next, SwapReason};
 use super::*;
 use crate::encode_recovery::{RebuildBudget, MAX_CAPTURE_REBUILDS, MAX_ENCODER_RESETS};
 use crate::native::bitrate::pyrowave_mode_kbps;
@@ -115,7 +117,7 @@ impl StreamState {
         match rebuilt {
             Ok((new_vd, pipe)) => {
                 let built = pipe.bitrate_kbps;
-                self.adopt_pipeline(pipe);
+                self.swap_pipeline(Next::Pipeline(pipe), SwapReason::SessionSwitch);
                 self.adopt_built_bitrate(built);
                 self.vd = new_vd;
                 self.compositor = sw.compositor;
@@ -190,10 +192,8 @@ impl StreamState {
                 self.clock.au_seq,
             ) {
                 Ok(next_pipe) => {
-                    let old_display_gen = self.cur_display_gen;
                     built_bitrate = next_pipe.bitrate_kbps;
-                    self.adopt_pipeline(next_pipe);
-                    self.retire_replaced_gen(old_display_gen);
+                    self.swap_pipeline(Next::Pipeline(next_pipe), SwapReason::ModeSwitch);
                     true
                 }
                 Err(e) => {
@@ -206,25 +206,10 @@ impl StreamState {
         if !rebuilt {
             return;
         }
-        // The pixel rate changed, so what the encoder can hold changed with it.
-        // The in-place Windows resize swaps the encoder without `adopt_pipeline`,
-        // so this covers both halves.
-        self.encoder_ceiling
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        // Covers the in-place Windows resize, which swaps the encoder without
-        // `adopt_pipeline`: the new one has been handed nothing yet.
-        self.retargeted = false;
-        self.fec.pending = None;
         self.adopt_built_bitrate(built_bitrate);
         self.cur_mode = new_mode;
         self.next = std::time::Instant::now();
-        self.enc_src = (self.frame.format, self.frame.width, self.frame.height);
         self.publish_delivered_mode(new_mode);
-        self.clock.inflight.clear();
-        self.clock.watchdog.on_au();
-        self.clock.last_forced_idr = Some(std::time::Instant::now());
         resize_trace.finish("pipeline_rebuilt");
         // Reconfigured clears baselines, not the straddling window or slow start.
         announce_pipeline_gap(
@@ -282,12 +267,10 @@ impl StreamState {
                 self.client_hdr,
                 self.clock.au_seq,
             ) {
+                // Same mode as before the bounce, so the built bitrate is the one
+                // already in force: nothing to adopt.
                 Ok(next_pipe) => {
-                    let old_display_gen = self.cur_display_gen;
-                    // Same mode as before the bounce, so the built bitrate is the one
-                    // already in force: nothing to adopt.
-                    self.adopt_pipeline(next_pipe);
-                    self.retire_replaced_gen(old_display_gen);
+                    self.swap_pipeline(Next::Pipeline(next_pipe), SwapReason::TopologyReassert)
                 }
                 Err(e) => {
                     return Err(e).context(
@@ -297,10 +280,6 @@ impl StreamState {
                 }
             }
         }
-        self.enc_src = (self.frame.format, self.frame.width, self.frame.height);
-        self.clock.inflight.clear();
-        self.clock.watchdog.on_au();
-        self.clock.last_forced_idr = Some(std::time::Instant::now());
         trace.finish("pipeline_rebuilt");
         announce_pipeline_gap(&self.gap_tx, trace.total_slot().load(Ordering::Relaxed));
         Ok(())
@@ -424,11 +403,8 @@ impl StreamState {
                 }
             }
         };
-        let old_display_gen = self.cur_display_gen;
         let built = pipe.bitrate_kbps;
-        self.adopt_pipeline(pipe);
-        self.retire_replaced_gen(old_display_gen);
-        self.enc_src = (self.frame.format, self.frame.width, self.frame.height);
+        self.swap_pipeline(Next::Pipeline(pipe), SwapReason::CaptureLost);
         #[cfg(target_os = "linux")]
         {
             self.no_overlay_means_off_output =
@@ -436,7 +412,6 @@ impl StreamState {
         }
         self.adopt_built_bitrate(built);
         self.enc.request_keyframe();
-        self.clock.last_forced_idr = Some(std::time::Instant::now());
         self.next = std::time::Instant::now();
         tracing::info!(
             compositor = self.compositor.id(),
@@ -551,11 +526,8 @@ impl StreamState {
                 self.frame.width, self.frame.height, self.frame.format
             )
         });
-        let new_enc = match opened {
-            Ok((e, reframe)) => {
-                self.adopt_reframe(reframe);
-                e
-            }
+        let (enc, reframe) = match opened {
+            Ok(opened) => opened,
             Err(e) => {
                 let Some(backoff) = self.clock.watchdog.spend(self.interval) else {
                     return Err(e).context("encoder reopen at the source's new mode");
@@ -574,22 +546,16 @@ impl StreamState {
             "the capture source changed mode mid-session with no client reconfigure — reopened \
              the encoder at the delivered size"
         );
-        self.enc = new_enc;
-        self.carry_pipelining();
-        self.enc_src = (self.frame.format, self.frame.width, self.frame.height);
-        // A ceiling learned from the encoder this one replaces: another geometry or format.
-        self.encoder_ceiling
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let next = Next::Encoder {
+            enc,
+            reframe,
+            resized: None,
+        };
+        self.swap_pipeline(next, SwapReason::SourceMode);
         // The delivered mode is the session's now: a rebuild or topology re-assert
         // reopens at it instead of forcing the display back to the client's ask.
         self.cur_mode = actual;
-        self.epoch = self.epoch.wrapping_add(1);
         self.adopt_built_bitrate(src_kbps);
-        self.clock.inflight.clear();
-        self.clock.watchdog.on_au();
-        self.clock.last_forced_idr = Some(std::time::Instant::now());
         self.live_mode.store(
             pack_mode(actual.width, actual.height, actual.refresh_hz),
             Ordering::Relaxed,

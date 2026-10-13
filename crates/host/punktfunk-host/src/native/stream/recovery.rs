@@ -4,6 +4,7 @@
 
 use super::pipeline::open_session_encoder;
 use super::state::{announce_pipeline_gap, StreamState};
+use super::swap::{Next, SwapReason};
 use super::*;
 
 impl StreamState {
@@ -142,7 +143,6 @@ impl StreamState {
             self.clock.au_seq,
         ) {
             Ok((new_enc, reframe)) => {
-                self.adopt_reframe(reframe);
                 let applied_kbps = new_enc
                     .applied_bitrate_bps()
                     .map(|b| (b / 1000) as u32)
@@ -155,15 +155,16 @@ impl StreamState {
                     requested_kbps = new_kbps,
                     "encoder rebuilt at new bitrate (adaptive bitrate)"
                 );
-                self.enc = new_enc;
-                self.carry_pipelining();
+                let next = Next::Encoder {
+                    enc: new_enc,
+                    reframe,
+                    resized: None,
+                };
+                self.swap_pipeline(next, SwapReason::Bitrate);
                 self.note_applied_rate(new_kbps, applied_kbps);
                 self.counters.note_bitrate(applied_kbps);
                 self.bitrate_kbps = applied_kbps;
                 self.live_bitrate.store(applied_kbps, Ordering::Relaxed);
-                self.clock.inflight.clear();
-                self.clock.watchdog.on_au();
-                self.clock.last_forced_idr = Some(std::time::Instant::now());
                 self.pipelining.behind_score = 0;
                 self.pipelining.depth_frames = 0;
                 self.pipelining.ahead_run = 0;

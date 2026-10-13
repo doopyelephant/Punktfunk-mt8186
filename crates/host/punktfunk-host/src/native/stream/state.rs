@@ -4,6 +4,7 @@
 //!
 //! - `rebuild.rs`: session switch, mode switch, topology re-assert, capture loss, source-mode
 //!   follow — everything that swaps the pipeline under the loop.
+//! - `swap.rs`: the swap itself, and what restarts with an encoder.
 //! - `recovery.rs`: FEC/bitrate re-derivation and the keyframe/RFI coalescing.
 //! - `encode.rs`: capture tick, submit, poll, stall watch, depth adaptation, pacing sleep.
 //! - `cursor.rs`: cursor forwarding, host composite, the seat-pointer park.
@@ -269,46 +270,6 @@ impl StreamState {
         self.enc_derive(self.fec.target.load(Ordering::Relaxed))
     }
 
-    /// Swap the built pipeline in and forget every owed AU and the last forwarded cursor shape:
-    /// a new capturer numbers its shapes from 1 again. The clipboard follows the new capture's
-    /// gamescope. The caller retires the old lease, re-arms the IDR clock, and re-reads
-    /// `enc_src` as its path requires.
-    pub(super) fn adopt_pipeline(&mut self, p: Pipeline) {
-        self.epoch = self.epoch.wrapping_add(1);
-        // A ceiling was learned from the encoder this one replaces. It survives
-        // a rebuild that opens on the same source; a different geometry or
-        // format is a different encoder, whose limits are unknown again.
-        if (p.frame.format, p.frame.width, p.frame.height)
-            != (self.frame.format, self.frame.width, self.frame.height)
-        {
-            self.encoder_ceiling
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-        }
-        self.retargeted = false;
-        self.fec.pending = None;
-        self.adopt_reframe(p.reframe);
-        self.capturer = p.capturer;
-        if let Some(fwd) = self.cursor_fwd.as_mut() {
-            *fwd = super::super::cursor_fwd::CursorForwarder::new();
-        }
-        self.enc = p.enc;
-        self.carry_pipelining();
-        self.frame = p.frame;
-        self.interval = p.interval;
-        self.cur_node_id = p.node_id;
-        self.cur_display_gen = p.display_gen;
-        #[cfg(target_os = "linux")]
-        {
-            publish_gamescope_xwayland(&self.gamescope_xwayland, p.lease.as_ref());
-            self.lease = p.lease;
-            self.restamp = p.panel_tick_ns.map(super::encode::SourceStamps::new);
-        }
-        self.clock.inflight.clear();
-        self.clock.watchdog.on_au();
-    }
-
     /// Close a frame whose tail never came, as the loop does at the next first chunk, before a
     /// replacement encoder opens at `au_seq`. Left to the loop, that close would land after the
     /// new encoder numbered its first AU, one behind the wire for the rest of the session.
@@ -321,31 +282,8 @@ impl StreamState {
         }
     }
 
-    /// A fresh encoder retrieves synchronously. The session's pipelined escalation carries onto
-    /// it, or the flags claim a mode the encoder is not in and escalation never fires again.
-    pub(super) fn carry_pipelining(&mut self) {
-        if self.pipelining.deescalating {
-            // The wind-back the old encoder owed: the new one is already there.
-            self.pipelining.deescalating = false;
-            self.pipelining.pipelined_active = false;
-            self.pipelining.pipeline_asked = false;
-        } else if self.pipelining.pipelined_active {
-            self.pipelining.pipelined_active = self.enc.set_pipelined(true);
-        } else {
-            // A refusal was the old encoder's; this one may say yes.
-            self.pipelining.pipeline_asked = false;
-        }
-    }
-
     pub(super) fn adopt_reframe(&self, reframe: punktfunk_core::video_fit::Reframe) {
         *self.frame_map.lock().unwrap_or_else(|e| e.into_inner()) = reframe;
-    }
-
-    /// Lease drop looks like a disconnect to keep-alive; retire or linger accumulates.
-    pub(super) fn retire_replaced_gen(&self, old: Option<u64>) {
-        if let Some(g) = old.filter(|g| self.cur_display_gen != Some(*g)) {
-            crate::vdisplay::registry::retire(g);
-        }
     }
 
     /// A rebuild re-resolved what it encodes. Noted for the summary's bitrate span: the
@@ -1341,7 +1279,7 @@ fn launch_verdict(
 /// Point the clipboard at the gamescope behind `lease`. A lease with no seat is the box's own
 /// gamescope, which the unscoped lookup finds; a non-gamescope session never reads this.
 #[cfg(target_os = "linux")]
-fn publish_gamescope_xwayland(
+pub(super) fn publish_gamescope_xwayland(
     xwayland: &pf_clipboard::GamescopeXwayland,
     lease: Option<&crate::capture::OutputLease>,
 ) {
