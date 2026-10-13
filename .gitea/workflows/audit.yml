@@ -5,6 +5,9 @@
 #                   ⚠ ALL SIX Rust lockfiles, each named with its own `--file`: a bare `cargo audit`
 #                   reads only the root one, which is how the drivers lock went unscanned for so
 #                   long despite already being in this job's `paths:` filter.
+#   * cargo-deny  → where each crate comes from, over the same six Rust workspaces (deny.toml): a
+#                   registry or git repository outside the allowlist fails. Duplicate versions
+#                   print as warnings.
 #   * bun audit   → each Bun-managed tree that ships or publishes: web (the mgmt console BFF —
 #                   login gate, session sealing, mgmt bearer token), sdk (@punktfunk/host),
 #                   plugin-kit (@punktfunk/plugin-kit).
@@ -59,6 +62,7 @@ on:
       - 'plugin-kit/bun.lock'
       - 'clients/decky/pnpm-lock.yaml'
       - 'about.toml'
+      - 'deny.toml'
       - 'compliance/vendored-components.md'
       - '.gitea/workflows/audit.yml'
   workflow_dispatch:
@@ -229,6 +233,41 @@ jobs:
           cargo about generate about.hbs --fail -o /dev/null
           cargo about generate -m packaging/windows/drivers/Cargo.toml -c about.toml about.hbs --fail -o /dev/null
           cargo about generate -m crates/host/pf-seat-keeper/Cargo.toml -c about.toml about.hbs --fail -o /dev/null
+
+  # Where each crate comes from, which no job above checks: a registry or git repository that
+  # deny.toml does not list fails.
+  cargo-deny:
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 30
+    env:
+      # Also in the cache keys below, so a bump reinstalls instead of finding the old binary.
+      CARGO_DENY_VERSION: 0.20.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /usr/local/cargo/bin
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-deny-${{ env.CARGO_DENY_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-deny-${{ env.CARGO_DENY_VERSION }}-
+      - name: cargo deny (bans, sources) over all six Rust workspaces
+        run: |
+          git config --global --add safe.directory "$PWD"
+          command -v cargo-deny >/dev/null 2>&1 || cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+          # `check bans sources`, never a bare `check`: advisories belong to cargo-audit and
+          # licenses to cargo-about.
+          for m in Cargo.toml \
+                   packaging/windows/drivers/Cargo.toml \
+                   packaging/windows/pf-vkhdr-layer/Cargo.toml \
+                   tools/win-input-matrix/Cargo.toml \
+                   tools/hid-descriptor-dump/Cargo.toml \
+                   crates/host/pf-seat-keeper/Cargo.toml; do
+            cargo deny --manifest-path "$m" --config deny.toml check bans sources
+          done
 
   # ── Miri ─────────────────────────────────────────────────────────────────────────────────────
   # WHAT THIS BUYS, precisely — one thing, and it is worth having:
