@@ -5,7 +5,12 @@ Punktfunk host unsafe census.
 Reproducible, compiler-free census of `unsafe` in the HOST-scope crates.
 Classifies by WHAT THE UNSAFE DOES (operations), not by block count.
 
-Usage:  python3 unsafe_census.py <repo-root> [--json]
+Usage:  python3 unsafe-census.py <repo-root> [--json | --baseline <path> | --write-baseline <path>]
+        python3 unsafe-census.py --self-test
+
+`--baseline` is the CI ratchet: per crate, the shipped non-FFI operation count must EQUAL the
+committed file. A rise fails; so does a baseline left above today's count, because that slack is
+where a later rise hides. `--write-baseline` regenerates the file.
 
 Method (and its error bars) are documented in the report; in short:
   0. Take the crate scope from `cargo metadata` (see host_roots), so a new crate is counted.
@@ -19,7 +24,7 @@ Method (and its error bars) are documented in the report; in short:
      unsafe OPERATIONS by regex, deduped by source span so nested blocks don't
      double count.
 """
-import os, re, sys, json, collections, subprocess
+import os, re, sys, json, argparse, collections, subprocess
 
 # ---------------------------------------------------------------- scope
 
@@ -434,6 +439,57 @@ def census_file(path, plat, feats):
             rec["forms"]["fenced_fn_body"] += 1
     return rec
 
+# ---------------------------------------------------------------- ratchet
+
+METRIC = "shipped_nonffi_unsafe_ops"
+
+def baseline_crates(recs):
+    """The baseline: per crate root, the unsafe operations that are neither an FFI call nor
+    inside `#[cfg(test)]`. A crate at zero is left out. The file carries no total: that would
+    be one line every count-changing PR edits, so any two of them would conflict."""
+    per = collections.Counter()
+    for r in recs:
+        for k, v in r["ops"].items():
+            if not k.startswith("ffi_call"):
+                per[r["crate_root"]] += v - r["test_ops"].get(k, 0)
+    return {k: per[k] for k in sorted(per) if per[k]}
+
+def baseline_diff(today, base):
+    """(crate, today, baseline) for each crate whose count differs."""
+    rows = [(c, today.get(c, 0), base.get(c, 0)) for c in sorted(set(today) | set(base))]
+    return [r for r in rows if r[1] != r[2]]
+
+def check_baseline(today, path):
+    with open(path, encoding="utf-8") as f:
+        rows = baseline_diff(today, json.load(f)["crates"])
+    if not rows:
+        print(f"unsafe-census: {sum(today.values())} shipped non-FFI unsafe ops, baseline matches")
+        return 0
+    print(f"{'crate':<40}{'today':>7}{'baseline':>10}{'delta':>7}")
+    for c, t, b in rows:
+        print(f"{c:<40}{t:>7}{b:>10}{t - b:>+7}")
+    for c, t, b in rows:
+        if t > b:
+            print(f"::error::non-FFI unsafe ops rose in {c} ({b} -> {t}). Remove the op, or if "
+                  "the rise is deliberate regenerate the baseline and say why in the PR.")
+        else:
+            print(f"::error::baseline stale for {c} ({b} -> {t}). Regenerate the baseline.")
+    print("regenerate: python3 scripts/unsafe-census.py . --write-baseline "
+          "scripts/ci/unsafe-census-baseline.json")
+    return 1
+
+def self_test():
+    assert baseline_diff({"a": 2}, {"a": 2}) == []
+    assert baseline_diff({"a": 3}, {"a": 2}) == [("a", 3, 2)]
+    assert baseline_diff({"a": 1}, {"a": 2}) == [("a", 1, 2)]
+    assert baseline_diff({"a": 2, "new": 1}, {"a": 2}) == [("new", 1, 0)]
+    assert baseline_diff({}, {"gone": 4}) == [("gone", 0, 4)]
+    recs = [{"crate_root": "a", "ops": {"ptr_deref": 3, "ffi_call": 5}, "test_ops": {"ptr_deref": 1}},
+            {"crate_root": "b", "ops": {"ffi_call": 2}, "test_ops": {}}]
+    assert baseline_crates(recs) == {"a": 2}
+    print("unsafe-census self-test ok")
+    return 0
+
 # ---------------------------------------------------------------- driver
 
 def walk_rs(root):
@@ -444,9 +500,17 @@ def walk_rs(root):
                 yield os.path.join(dirpath, f)
 
 def main():
-    repo = os.path.abspath(sys.argv[1])
-    as_json = "--json" in sys.argv
-    os.chdir(repo)
+    if sys.argv[1:] == ["--self-test"]:
+        return self_test()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("repo")
+    ap.add_argument("--json", action="store_true")
+    # Resolved here, before the chdir into the repo below.
+    ap.add_argument("--baseline", type=os.path.abspath, metavar="PATH")
+    ap.add_argument("--write-baseline", type=os.path.abspath, metavar="PATH")
+    args = ap.parse_args()
+    as_json = args.json
+    os.chdir(os.path.abspath(args.repo))
     allrecs = []
     for root in host_roots():
         if not os.path.isdir(root): continue
@@ -469,6 +533,13 @@ def main():
             rec = census_file(p, plat, feats)
             rec["crate_root"] = root
             allrecs.append(rec)
+    if args.write_baseline:
+        with open(args.write_baseline, "w", encoding="utf-8") as f:
+            json.dump({"metric": METRIC, "crates": baseline_crates(allrecs)}, f, indent=2)
+            f.write("\n")
+        return
+    if args.baseline:
+        return check_baseline(baseline_crates(allrecs), args.baseline)
     if as_json:
         for r in allrecs:
             r["forms"] = dict(r["forms"]); r["ops"] = dict(r["ops"]); r["test_ops"] = dict(r["test_ops"])
@@ -592,4 +663,4 @@ def main():
         print(f"{nf:>5}  {r['path']}\n         {det}")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

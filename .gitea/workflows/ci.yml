@@ -243,6 +243,14 @@ jobs:
       - name: Unsafe-hygiene grep gates
         run: sh scripts/ci/check-unsafe-hygiene.sh
 
+      # Per host crate, the unsafe operations that are not an FFI call must equal the committed
+      # baseline. A rise fails. So does a baseline above today's count: that slack hides the
+      # next rise.
+      - name: Unsafe-census ratchet
+        run: |
+          python3 scripts/unsafe-census.py --self-test
+          python3 scripts/unsafe-census.py . --baseline scripts/ci/unsafe-census-baseline.json
+
       # A crate a platform workflow compiles but its `paths:` filter omits merges with no build
       # on that platform. Reads the per-target graph from `cargo metadata`, not a second list.
       - name: Workflow path-filter gate
