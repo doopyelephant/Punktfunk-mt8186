@@ -7,7 +7,9 @@ in each `paths:` leg (push, pull_request) the workflow has. A leg with no `paths
 every change and needs nothing. A missing line means a change to that crate merges without
 the build that compiles it.
 
-Usage: python3 scripts/ci/check-workflow-paths.py [--self-test]
+packaging-lint compiles nothing: its `pull_request` paths must match every file it lints.
+
+Usage: python3 scripts/ci/check-workflow-paths.py [--self-test | --lanes]
 """
 import functools
 import json
@@ -54,6 +56,10 @@ BUILDS = [
 
 LEGS = ("push", "pull_request")
 
+# The lane lints these workflows with the specs, PKGBUILDs and shell; it re-runs when one changes.
+LINT_LANE = ".gitea/workflows/packaging-lint.yml"
+LINT_LANE_WORKFLOWS = ("deb", "rpm", "arch", "flatpak")
+
 
 def path_legs(text):
     """{leg: [glob, …]} for each `on:` leg that carries a `paths:` list (2-space YAML)."""
@@ -98,6 +104,22 @@ def uncovered(crate_dirs, globs):
     return sorted(d for d in miss if not any(d.startswith(m + "/") for m in miss))
 
 
+def unmatched(files, globs):
+    """Files no glob matches."""
+    res = [glob_re(g) for g in globs]
+    return sorted(f for f in files if not any(r.match(f) for r in res))
+
+
+def lane_files():
+    """Everything packaging-lint.yml lints or re-runs on."""
+    def run(*cmd):
+        return subprocess.check_output(cmd, cwd=ROOT, text=True).split()
+
+    return {LINT_LANE, *(f".gitea/workflows/{w}.yml" for w in LINT_LANE_WORKFLOWS),
+            *run("sh", "scripts/ci/lint-shell.sh", "--list"),
+            *run("git", "ls-files", "*.spec", "*PKGBUILD")}
+
+
 @functools.lru_cache(maxsize=None)
 def metadata(manifest, triple, features):
     cmd = ["cargo", "metadata", "--format-version", "1", "--locked",
@@ -119,7 +141,7 @@ def local_crate_dirs(meta, roots):
     }
 
 
-def check():
+def build_errors():
     errors = []
     for workflow, manifest, triple, roots, features in BUILDS:
         path = f".gitea/workflows/{workflow}.yml"
@@ -130,12 +152,25 @@ def check():
             for d in uncovered(dirs, legs.get(leg, ["**"])):
                 errors.append(f"::error file={path}::{leg} paths miss '{d}/**' "
                               f"(compiled for {triple})")
+    return errors
+
+
+def lane_errors():
+    with open(os.path.join(ROOT, LINT_LANE), encoding="utf-8") as f:
+        globs = path_legs(f.read()).get("pull_request", ["**"])
+    return [f"::error file={LINT_LANE}::pull_request paths miss '{m}'"
+            for m in unmatched(lane_files(), globs)]
+
+
+def check(lanes_only=False):
+    errors = lane_errors() if lanes_only else build_errors() + lane_errors()
     for e in errors:
         print(e)
     if errors:
         print(f"{len(errors)} missing path filter(s): add each line to that leg.", file=sys.stderr)
         return 1
-    print(f"check-workflow-paths: {len(BUILDS)} builds covered")
+    print("check-workflow-paths: packaging lane covered" if lanes_only
+          else f"check-workflow-paths: {len(BUILDS)} builds and the packaging lane covered")
     return 0
 
 
@@ -178,6 +213,10 @@ jobs:
     expect("no paths leg runs always", uncovered(dirs, ["**"]), [])
     expect("prefix is not a match", uncovered({"crates/ab"}, ["crates/a/**"]), ["crates/ab"])
     expect("one line per tree", uncovered(dirs, []), ["clients/cli", "crates/a", "crates/b"])
+    files = ["packaging/arch/PKGBUILD", "scripts/ci/x.sh", "scripts/pf-dm-helper"]
+    expect("lane misses a script", unmatched(files, ["packaging/**", "scripts/*.sh"]),
+           ["scripts/ci/x.sh", "scripts/pf-dm-helper"])
+    expect("lane covers a tree", unmatched(files, ["packaging/**", "scripts/**"]), [])
     if fails:
         return 1
     print("check-workflow-paths self-test ok")
@@ -187,8 +226,10 @@ jobs:
 def main(argv):
     if argv[1:] == ["--self-test"]:
         return self_test()
+    if argv[1:] == ["--lanes"]:
+        return check(lanes_only=True)
     if argv[1:]:
-        print("usage: check-workflow-paths.py [--self-test]", file=sys.stderr)
+        print("usage: check-workflow-paths.py [--self-test | --lanes]", file=sys.stderr)
         return 2
     return check()
 
