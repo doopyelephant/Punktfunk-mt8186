@@ -781,8 +781,7 @@ impl VirtualDisplayManager {
         quit: Option<Arc<AtomicBool>>,
     ) -> Result<VirtualOutput> {
         if let Some((own, console)) = pf_win_display::console_session_mismatch() {
-            let seat_session = std::env::var_os("PUNKTFUNK_SEAT_SESSION");
-            if super::identity::is_seat_session_marker(seat_session.as_deref()) {
+            if pf_paths::seat::role().is_seat_host() {
                 tracing::warn!(
                     own_session = own,
                     console_session = console,

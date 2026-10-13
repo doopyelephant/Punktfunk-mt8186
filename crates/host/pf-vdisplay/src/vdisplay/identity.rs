@@ -100,11 +100,6 @@ impl std::fmt::Display for WindowsSlotError {
 
 impl std::error::Error for WindowsSlotError {}
 
-/// Recognizes the seat-session diagnostic marker, not the slot reservation.
-pub(crate) fn is_seat_session_marker(value: Option<&OsStr>) -> bool {
-    value.and_then(OsStr::to_str) == Some("1")
-}
-
 /// Resolves the process role without reading environment or registry state.
 /// A seat override is valid only inside the reserved range and while the
 /// machine-level reservation is active.
@@ -494,14 +489,6 @@ mod tests {
 
     fn nothing_live() -> BTreeSet<u32> {
         BTreeSet::new()
-    }
-
-    #[test]
-    fn seat_session_marker_is_diagnostic_and_exact() {
-        assert!(is_seat_session_marker(Some(OsStr::new("1"))));
-        for value in [None, Some(OsStr::new("0")), Some(OsStr::new("true"))] {
-            assert!(!is_seat_session_marker(value));
-        }
     }
 
     #[test]

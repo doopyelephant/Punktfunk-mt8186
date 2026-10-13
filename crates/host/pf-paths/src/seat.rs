@@ -6,7 +6,8 @@
 //! the console host.
 //!
 //! `serve` fixes the role with [`resolve`]. Any other process reads the environment at each
-//! [`role`] call. `every_predicate_answers_its_truth_table_row` pins what each role answers.
+//! [`role`] call. No other crate reads a role variable.
+//! `every_predicate_answers_its_truth_table_row` pins what each role answers.
 //!
 //! The id is untrusted process input, so it is validated once here rather than
 //! at each use: it reaches a device-parameter marker and log lines.
