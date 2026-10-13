@@ -43,6 +43,8 @@ classify() {
                 scripts/ci/ensure-sccache.sh|scripts/ci/install-retrying-curl.sh|\
                 scripts/ci/check-installer-behavior.sh|scripts/ci/check-install-defaults.sh|\
                 scripts/ci/check-unsafe-hygiene.sh|\
+                scripts/unsafe-census.py|scripts/ci/unsafe-census-baseline.json|\
+                packaging/windows/drivers/*.rs|\
                 scripts/ci/check-workflow-paths.py|scripts/ci/cargo_graph.py|\
                 scripts/gen-third-party-notices.sh|scripts/gen-third-party-notices.py|\
                 about.toml|about.hbs|\
@@ -139,6 +141,13 @@ self_test() {
     check workspace-tool 'tools/loss-harness/src/main.rs' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check notice-generator 'scripts/gen-third-party-notices.py' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # The unsafe gates in the rust job read the driver workspace's sources too.
+    check driver-rust 'packaging/windows/drivers/pf-vdisplay/src/lib.rs' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check driver-script 'packaging/windows/drivers/deploy-dev.ps1' \
+        'rust=false rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check unsafe-census 'scripts/ci/unsafe-census-baseline.json' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check workflow-paths 'scripts/ci/cargo_graph.py' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'

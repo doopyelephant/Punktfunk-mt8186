@@ -5,6 +5,9 @@
 #                   ⚠ ALL SIX Rust lockfiles, each named with its own `--file`: a bare `cargo audit`
 #                   reads only the root one, which is how the drivers lock went unscanned for so
 #                   long despite already being in this job's `paths:` filter.
+#   * cargo-deny  → where each crate comes from, over the same six Rust workspaces (deny.toml): a
+#                   registry or git repository outside the allowlist fails. Duplicate versions
+#                   print as warnings.
 #   * bun audit   → each Bun-managed tree that ships or publishes: web (the mgmt console BFF —
 #                   login gate, session sealing, mgmt bearer token), sdk (@punktfunk/host),
 #                   plugin-kit (@punktfunk/plugin-kit).
@@ -17,13 +20,13 @@
 #   * cargo-about → license-allowlist gate over the host, driver and seat-keeper workspaces (about.toml `accepted`);
 #                   fails if any crate carries a license outside the allowlist. Android dependencies
 #                   are locked and checksum-verified by Gradle in android.yml.
-#   * miri        → NON-BLOCKING interpretation of the few FFI-free leaf crates, one of them
+#   * miri        → interpretation of the few FFI-free leaf crates, one of them
 #                   cross-compiled to MSVC layout. Not a supply-chain scan; it lives here because
 #                   audit.yml already has exactly the shape it needs (weekly cron,
 #                   workflow_dispatch, the rust-ci container, the same cache pattern) and because
 #                   ci.yml runs on every push against a fleet where 37 of 46 jobs contend for
 #                   ubuntu-24.04. See the `miri:` job below for what it does and does not buy.
-#   * c-abi-asan  → NON-BLOCKING ASAN+LSAN run of the C ABI harness (tests/c/run.sh under
+#   * c-abi-asan  → ASAN+LSAN run of the C ABI harness (tests/c/run.sh under
 #                   PF_SAN=address): both sides of the C ABI boundary instrumented at once, and
 #                   the only automated check on its Box::into_raw/from_raw leak contract. Same
 #                   here-not-ci.yml reasoning as miri — plus -Zbuild-std defeats sccache, so it
@@ -59,6 +62,7 @@ on:
       - 'plugin-kit/bun.lock'
       - 'clients/decky/pnpm-lock.yaml'
       - 'about.toml'
+      - 'deny.toml'
       - 'compliance/vendored-components.md'
       - '.gitea/workflows/audit.yml'
   workflow_dispatch:
@@ -230,6 +234,41 @@ jobs:
           cargo about generate -m packaging/windows/drivers/Cargo.toml -c about.toml about.hbs --fail -o /dev/null
           cargo about generate -m crates/host/pf-seat-keeper/Cargo.toml -c about.toml about.hbs --fail -o /dev/null
 
+  # Where each crate comes from, which no job above checks: a registry or git repository that
+  # deny.toml does not list fails.
+  cargo-deny:
+    runs-on: ubuntu-24.04
+    container:
+      image: 192.168.1.58:5010/punktfunk-rust-ci:latest
+    timeout-minutes: 30
+    env:
+      # Also in the cache keys below, so a bump reinstalls instead of finding the old binary.
+      CARGO_DENY_VERSION: 0.20.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /usr/local/cargo/bin
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+          key: cargo-deny-${{ env.CARGO_DENY_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-deny-${{ env.CARGO_DENY_VERSION }}-
+      - name: cargo deny (bans, sources) over all six Rust workspaces
+        run: |
+          git config --global --add safe.directory "$PWD"
+          command -v cargo-deny >/dev/null 2>&1 || cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+          # `check bans sources`, never a bare `check`: advisories belong to cargo-audit and
+          # licenses to cargo-about.
+          for m in Cargo.toml \
+                   packaging/windows/drivers/Cargo.toml \
+                   packaging/windows/pf-vkhdr-layer/Cargo.toml \
+                   tools/win-input-matrix/Cargo.toml \
+                   tools/hid-descriptor-dump/Cargo.toml \
+                   crates/host/pf-seat-keeper/Cargo.toml; do
+            cargo deny --manifest-path "$m" --config deny.toml check bans sources
+          done
+
   # ── Miri ─────────────────────────────────────────────────────────────────────────────────────
   # WHAT THIS BUYS, precisely — one thing, and it is worth having:
   #   It interprets `pf-driver-proto` CROSS-COMPILED TO `x86_64-pc-windows-msvc`, on a Linux
@@ -247,10 +286,10 @@ jobs:
   #   the unsafe *is* the foreign call, so there is nothing for an interpreter to execute. This
   #   job is a targeted instrument for three leaf surfaces, not a safety net.
   #
-  # NON-BLOCKING, deliberately, and via a step-level `||` — NOT job-level `continue-on-error`,
-  # which act_runner does not reliably honor (same reasoning as docs-site-audit above; a red job
-  # here would take the whole run red). Flip to blocking only after several weeks of green
-  # establish the nightly-drift rate.
+  # BLOCKING: a step that exits non-zero or reports no passing test fails the run. audit.yml is
+  # not a pull-request check, so a miss turns the weekly or main-push run red and gates no merge.
+  # The nightly is pinned by date. Prove a bump with a `workflow_dispatch` run on its branch
+  # before merging it.
   #
   # Do NOT add crates here because they merely compile under Miri. Add them because they contain
   # pure-Rust unsafe or a layout contract worth interpreting. Explicitly excluded:
@@ -367,7 +406,7 @@ jobs:
           cargo +"$MIRI_TOOLCHAIN" miri test \
             -p pf-driver-proto -p pf-host-config -p pf-gpu 2>&1 | tee /tmp/miri-native.log || ok=0
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/miri-native.log || ok=0
-          [ "$ok" = 1 ] || echo "::warning::miri (FFI-free leaf crates, native) did not pass — non-blocking; see punktfunk-planning design/rust-safety-programme.md §7"
+          [ "$ok" = 1 ] || { echo "::error::miri (FFI-free leaf crates, native) did not pass; see punktfunk-planning design/rust-safety-programme.md §7"; exit 1; }
 
       # THE step that justifies the job: pf-driver-proto at MSVC layout, on Linux, no Windows box.
       # Expected: 21 passed. If this one ever goes red, treat it as a layout-contract break
@@ -379,7 +418,7 @@ jobs:
           cargo +"$MIRI_TOOLCHAIN" miri test \
             -p pf-driver-proto --target x86_64-pc-windows-msvc 2>&1 | tee /tmp/miri-msvc.log || ok=0
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/miri-msvc.log || ok=0
-          [ "$ok" = 1 ] || echo "::warning::miri (pf-driver-proto @ MSVC layout) did not pass — non-blocking, but this is the layout oracle for every frame and IOCTL; see design/rust-safety-programme.md §7"
+          [ "$ok" = 1 ] || { echo "::error::miri (pf-driver-proto @ MSVC layout) did not pass: this is the layout oracle for every frame and IOCTL; see design/rust-safety-programme.md §7"; exit 1; }
 
       # fec-rs dispatches its GF(2^8) multiply through RUNTIME `is_x86_feature_detected!`. Under
       # Miri that detection reports the COMPILE-TIME target features, so WITHOUT these RUSTFLAGS
@@ -403,7 +442,7 @@ jobs:
           cargo +"$MIRI_TOOLCHAIN" miri test \
             -p punktfunk-core --lib -- fec::gf8 2>&1 | tee /tmp/miri-gf8.log || ok=0
           grep -qE 'test result: ok\. [1-9][0-9]* passed' /tmp/miri-gf8.log || ok=0
-          [ "$ok" = 1 ] || echo "::warning::miri (punktfunk-core fec::gf8, AVX2/SSSE3) did not pass — non-blocking; see design/rust-safety-programme.md §7"
+          [ "$ok" = 1 ] || { echo "::error::miri (punktfunk-core fec::gf8, AVX2/SSSE3) did not pass; see design/rust-safety-programme.md §7"; exit 1; }
 
   # ASAN + LSAN over the C ABI harness — §6.1 of design/rust-safety-programme.md, its rank-1
   # tooling item. crates/client/punktfunk-ffi/tests/c/run.sh already proves the staticlib links and
@@ -480,4 +519,4 @@ jobs:
           PF_SAN=address PF_SAN_TOOLCHAIN="$SAN_TOOLCHAIN" \
             bash crates/client/punktfunk-ffi/tests/c/run.sh 2>&1 | tee /tmp/asan-harness.log || ok=0
           grep -q 'PASS: 4 frames round-tripped byte-exact' /tmp/asan-harness.log || ok=0
-          [ "$ok" = 1 ] || echo "::warning::c-abi-asan did not pass — non-blocking on day one; see design/rust-safety-programme.md §6.1. An LSAN report here means the C ABI's into_raw/from_raw contract broke."
+          [ "$ok" = 1 ] || { echo "::error::c-abi-asan did not pass; see design/rust-safety-programme.md §6.1. An LSAN report here means the C ABI's into_raw/from_raw contract broke."; exit 1; }

@@ -1,0 +1,24 @@
+{
+  "metric": "shipped_nonffi_unsafe_ops",
+  "crates": {
+    "crates/codec/pf-libva": 16,
+    "crates/core/pf-dmabuf": 3,
+    "crates/core/punktfunk-core": 13,
+    "crates/host/pf-audio": 27,
+    "crates/host/pf-capture": 95,
+    "crates/host/pf-clipboard": 6,
+    "crates/host/pf-encode": 44,
+    "crates/host/pf-encode-core": 13,
+    "crates/host/pf-encode-win": 88,
+    "crates/host/pf-frame": 2,
+    "crates/host/pf-inject": 23,
+    "crates/host/pf-paths-win": 8,
+    "crates/host/pf-seats": 27,
+    "crates/host/pf-vdisplay": 14,
+    "crates/host/pf-win-display": 18,
+    "crates/host/pf-zerocopy": 51,
+    "crates/host/punktfunk-host": 74,
+    "crates/install/punktfunk-tray": 7,
+    "packaging/windows/drivers": 63
+  }
+}
