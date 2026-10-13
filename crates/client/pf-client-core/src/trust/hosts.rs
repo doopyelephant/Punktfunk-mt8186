@@ -5,8 +5,10 @@ use super::{config_dir, load_json_or_default, write_atomic};
 use crate::presets::{PresetsFile, StreamPreset};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
 /// One trusted host: pinned cert fingerprint, how trust was granted, last-reached address.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -337,6 +339,60 @@ impl HostEdit {
     }
 }
 
+thread_local! {
+    /// Set while this thread holds the store lock. A second lock on the sidecar would wait
+    /// on the first for ever, so a nested edit runs under the outer one.
+    static LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The store's lock across processes, held for one read, apply, save. It sits on a sidecar
+/// file: a save renames a new file over the store, so a lock on the store would stay with
+/// the file that was replaced. Best effort: where it can't be taken, the edit still runs.
+/// The wait has no deadline; the OS frees the lock of a holder that dies.
+struct StoreLock {
+    file: Option<File>,
+    nested: bool,
+}
+
+impl StoreLock {
+    fn take(store: &Path) -> StoreLock {
+        let nested = LOCK_HELD.replace(true);
+        let file = if nested { None } else { Self::lock(store) };
+        StoreLock { file, nested }
+    }
+
+    /// The sidecar, locked. Opened read-only when it exists: a lock needs no write access,
+    /// and the file may be another user's (the Decky backend runs the CLI as root).
+    /// `File::lock` is 1.89, past the workspace `rust-version`; the toolchain pin is 1.96.
+    #[clippy::msrv = "1.89"]
+    fn lock(store: &Path) -> Option<File> {
+        let mut name = store.file_name()?.to_os_string();
+        name.push(".lock");
+        let path = store.with_file_name(name);
+        let create = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+        };
+        let file = File::open(&path).or_else(|_| create()).ok()?;
+        file.lock().ok()?;
+        Some(file)
+    }
+}
+
+impl Drop for StoreLock {
+    #[clippy::msrv = "1.89"]
+    fn drop(&mut self) {
+        // Windows frees a closed handle's lock late; unlock so the next writer is not kept.
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
+        LOCK_HELD.set(self.nested);
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct KnownHosts {
     pub hosts: Vec<KnownHost>,
@@ -347,21 +403,21 @@ impl KnownHosts {
         Ok(config_dir()?.join("client-known-hosts.json"))
     }
 
-    /// The store, minting ids on records that lack one. Written back here, not "on the
-    /// next save", so the id a caller sees is the one on disk. A read-only dir re-mints
-    /// in memory; no lookup is keyed by id yet.
+    /// The store, minting ids on records that lack one. The mint is a write, so it is
+    /// redone under the lock on the store as it is then: two processes minting from one
+    /// read would each save their own ids. A read-only dir re-mints in memory.
     pub fn load() -> KnownHosts {
         let mut k = Self::read();
-        if k.mint_missing_ids() {
-            let _ = k.save();
+        if !k.mint_missing_ids() {
+            return k;
         }
-        k
+        Self::update(|fresh| KnownHosts {
+            hosts: fresh.hosts.clone(),
+        })
+        .unwrap_or(k)
     }
 
-    /// The store as on disk — no mint, so no write.
-    ///
-    /// [`KnownHosts::load`]'s mint is a write: two processes against a pre-mint store each
-    /// mint a different id and race to save. A read-only consumer cannot take part in that.
+    /// The store as on disk — no mint, so no write and no lock.
     pub fn read() -> KnownHosts {
         Self::path()
             .map(|p| load_json_or_default(&p))
@@ -382,11 +438,14 @@ impl KnownHosts {
     }
 
     pub fn save(&self) -> Result<()> {
-        let p = Self::path()?;
+        self.save_at(&Self::path()?)
+    }
+
+    fn save_at(&self, p: &Path) -> Result<()> {
         std::fs::create_dir_all(p.parent().unwrap())?;
         // Temp+rename: losing this file to a torn write costs the user every pairing.
-        write_atomic(&p, serde_json::to_string_pretty(self)?.as_bytes())?;
-        // Omarchy menu mirrors this store; save() is the one door every mutation walks.
+        write_atomic(p, serde_json::to_string_pretty(self)?.as_bytes())?;
+        // Omarchy menu mirrors this store; this is the one door every mutation walks.
         // No-op unless `--omarchy-menu on` — a scoped test HOME never has that.
         // `desktop` too: `trust` is portable, and a TV build has no omarchy_menu to call.
         #[cfg(all(desktop, target_os = "linux"))]
@@ -394,14 +453,26 @@ impl KnownHosts {
         Ok(())
     }
 
-    /// Re-read the store, apply `f`, save: a shell's edit, so another process's write in
-    /// between survives. Records that lack an id get one in the same write.
-    pub fn update<R>(f: impl FnOnce(&mut KnownHosts) -> R) -> Result<R> {
-        let mut known = Self::read();
-        known.mint_missing_ids();
-        let r = f(&mut known);
-        known.save()?;
+    /// One edit of the store at `path`, alone: under the lock, re-read, run `f`, and write
+    /// when it returns `true` beside its result. Another process's edit lands before or
+    /// after this one, never in between.
+    fn locked_at<R>(path: &Path, f: impl FnOnce(&mut KnownHosts) -> (bool, R)) -> Result<R> {
+        let _lock = StoreLock::take(path);
+        let mut known: KnownHosts = load_json_or_default(path);
+        let (write, r) = f(&mut known);
+        if write {
+            known.save_at(path)?;
+        }
         Ok(r)
+    }
+
+    /// Re-read the store, apply `f`, save, all under the store's lock: an edit that keeps
+    /// what another process wrote. Records that lack an id get one in the same write.
+    pub fn update<R>(f: impl FnOnce(&mut KnownHosts) -> R) -> Result<R> {
+        Self::locked_at(&Self::path()?, |known| {
+            known.mint_missing_ids();
+            (true, f(known))
+        })
     }
 
     /// The record pinned to `fp_hex`. An empty fingerprint is not a key — it would match
@@ -891,6 +962,79 @@ mod tests {
     /// 64-hex fingerprint of one repeated digit — readable and distinct per letter.
     fn fp(c: char) -> String {
         std::iter::repeat_n(c, 64).collect()
+    }
+
+    /// A store path in a scratch dir of its own; the dir exists, the file does not.
+    fn scratch_store(tag: &str) -> PathBuf {
+        crate::presets::tests::scratch_dir(tag).join("client-known-hosts.json")
+    }
+
+    fn named(name: &str) -> KnownHost {
+        KnownHost {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Two edits of one store never interleave. The first holds the lock while the second
+    /// starts; unlocked, the second would read an empty store and its save would drop the
+    /// first one's record.
+    #[test]
+    fn a_second_edit_waits_for_the_first_and_keeps_its_write() {
+        let _guard = crate::trust::store_health_lock();
+        let path = scratch_store("hosts-lock");
+        // A sidecar this user can only read, as when root made it, locks all the same.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let sidecar = path.with_file_name("client-known-hosts.json.lock");
+            std::fs::write(&sidecar, b"").unwrap();
+            std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let (entered, first_is_in) = std::sync::mpsc::channel();
+        let first = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                KnownHosts::locked_at(&path, |k| {
+                    entered.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    k.hosts.push(named("first"));
+                    (true, ())
+                })
+                .unwrap();
+            }
+        });
+        first_is_in.recv().unwrap();
+        let seen = KnownHosts::locked_at(&path, |k| {
+            let seen = k.hosts.len();
+            k.hosts.push(named("second"));
+            (true, seen)
+        })
+        .unwrap();
+        first.join().unwrap();
+        assert_eq!(seen, 1, "the second edit read the first one's write");
+        let stored: KnownHosts = load_json_or_default(&path);
+        let names: Vec<&str> = stored.hosts.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["first", "second"]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// An edit made from inside another on one thread runs under the outer lock rather than
+    /// waiting on it, and `false` leaves the file as the inner edit wrote it.
+    #[test]
+    fn a_nested_edit_does_not_wait_on_its_own_lock() {
+        let _guard = crate::trust::store_health_lock();
+        let path = scratch_store("hosts-nested");
+        KnownHosts::locked_at(&path, |_| {
+            KnownHosts::locked_at(&path, |inner| (true, inner.hosts.push(named("inner")))).unwrap();
+            (false, ())
+        })
+        .unwrap();
+        let stored: KnownHosts = load_json_or_default(&path);
+        assert_eq!(stored.hosts.len(), 1);
+        // The thread no longer counts as holding the lock: a later edit takes it again.
+        assert!(!LOCK_HELD.get());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// WinUI known-hosts shape (no `last_used`) loads; same path so the two clients share it.
