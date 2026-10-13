@@ -716,7 +716,7 @@ pub(super) async fn negotiate(
             },
         // `0` keeps the client's saved port: the standalone binary has no management API, and a
         // seat's answers on loopback only, so the box's stays the one its library comes from.
-        mgmt_port: if pf_paths::seat::is_seat_host() {
+        mgmt_port: if pf_paths::seat::role().is_seat_host() {
             0
         } else {
             crate::mgmt::effective_port()

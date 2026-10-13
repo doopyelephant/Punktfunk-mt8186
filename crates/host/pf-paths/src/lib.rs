@@ -212,7 +212,7 @@ pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        let mode = private_dir_mode(seat::is_door(), dir, &config_dir());
+        let mode = private_dir_mode(seat::role().is_door(), dir, &config_dir());
         let r = std::fs::DirBuilder::new()
             .recursive(true)
             .mode(mode)

@@ -582,7 +582,7 @@ pub(crate) async fn get_session_settings() -> Json<SessionSettingsState> {
 pub(crate) async fn set_session_settings(
     ApiJson(settings): ApiJson<crate::session_settings::SessionSettings>,
 ) -> Response {
-    if pf_paths::seat::follows_contract() {
+    if pf_paths::seat::role().follows_contract() {
         return api_error(
             StatusCode::CONFLICT,
             "A seat's session settings can't be changed here. Change the Seat defaults on the box.",

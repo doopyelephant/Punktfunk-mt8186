@@ -162,11 +162,6 @@ pub fn role() -> HostRole {
     current().0
 }
 
-/// [`HostRole::is_seat_host`] of this process.
-pub fn is_seat_host() -> bool {
-    role().is_seat_host()
-}
-
 /// 32 lowercase hexadecimal characters, so the id is safe as a device-parameter
 /// marker and in a log line. Any other value is a supervisor bug, not a seat.
 pub fn validate_seat_id(raw: &str) -> Result<&str, &'static str> {
@@ -236,21 +231,6 @@ pub fn pairing_refused() -> bool {
     current().1
 }
 
-/// [`HostRole::is_owner_seat`] of this process.
-pub fn is_owner_seat() -> bool {
-    role().is_owner_seat()
-}
-
-/// [`HostRole::follows_contract`] of this process.
-pub fn follows_contract() -> bool {
-    role().follows_contract()
-}
-
-/// [`HostRole::runs_seat_session`] of this process.
-pub fn runs_seat_session() -> bool {
-    role().runs_seat_session()
-}
-
 /// The seat supervisor's pad broker: a seat host asks here for the pads it cannot make itself.
 pub const PADS_SOCKET: &str = "/run/punktfunk/pads.sock";
 
@@ -258,11 +238,6 @@ pub const PADS_SOCKET: &str = "/run/punktfunk/pads.sock";
 /// binds it over `/dev/uinput`. Sysfs names it with `!` for each `/`.
 pub fn uinput_devname(account: &str) -> String {
     format!("punktfunk/uinput-{account}")
-}
-
-/// [`HostRole::is_door`] of this process.
-pub fn is_door() -> bool {
-    role().is_door()
 }
 
 #[cfg(test)]

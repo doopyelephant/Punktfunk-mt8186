@@ -46,7 +46,7 @@ pub(crate) struct Asker<'a> {
 pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Placement {
     // A seat host plays the profile it was asked for: resolving it already checked it is this
     // seat's, and a seat has no ledger to place anything in.
-    if pf_paths::seat::is_seat_host()
+    if pf_paths::seat::role().is_seat_host()
         || (!super::is_door() && ledger_seat(&profile.os_account).is_none())
     {
         return Placement::Here;

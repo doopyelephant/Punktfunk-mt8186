@@ -179,7 +179,7 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
     // The tray's bearer. A seat host has no tray and serves no summary. Not fatal: the tray
     // then shows the host as running without detail.
     #[cfg(target_os = "windows")]
-    let seat_host = pf_paths::seat::is_seat_host();
+    let seat_host = pf_paths::seat::role().is_seat_host();
     #[cfg(not(target_os = "windows"))]
     let seat_host = false;
     if !seat_host {
@@ -193,7 +193,7 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
     // on disk for a subsystem that is not running. Scope: `plugin_may_access`, not pairing/hooks.
     let runner = crate::plugins::runtime_status();
     // The plugin runner is the owner's: the door has none to hand a token to.
-    if runner.installed && !pf_paths::seat::is_door() {
+    if runner.installed && !pf_paths::seat::role().is_door() {
         // A Windows seat host shares the box's runner and must not bounce it.
         opts.restart_runner = !seat_host
             && !pf_paths::config_dir()
@@ -237,7 +237,7 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
         );
     }
     // The door places connects and streams nothing, and stock Moonlight has no redirect to follow.
-    let gamestream = pf_host_config::config().gamestream && !pf_paths::seat::is_door();
+    let gamestream = pf_host_config::config().gamestream && !pf_paths::seat::role().is_door();
     let native = native::NativeServe {
         webtransport_bind: pf_host_config::config()
             .webtransport

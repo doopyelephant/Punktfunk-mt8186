@@ -276,7 +276,7 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
 /// Windows seat starts only its own copy under its own IPC name ([`pf_seats::steam`]): any other
 /// Steam closes the one running in another session. `None` on a seat until that copy exists.
 fn steam_cmdline(uri: &str) -> Option<String> {
-    if !pf_paths::seat::is_seat_host() {
+    if !pf_paths::seat::role().is_seat_host() {
         return Some(match steam_exe() {
             Some(exe) => format!("\"{}\" \"{uri}\"", exe.display()),
             None => format!("explorer.exe \"{uri}\""),

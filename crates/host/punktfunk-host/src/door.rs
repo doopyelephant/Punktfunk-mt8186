@@ -73,7 +73,7 @@ mod linux {
     ];
 
     pub(super) fn change(on: bool) -> Result<Outcome, Refusal> {
-        if on == pf_paths::seat::is_door() {
+        if on == pf_paths::seat::role().is_door() {
             return Ok(Outcome::Already);
         }
         if !TEMPLATES.iter().any(|p| Path::new(p).exists()) {

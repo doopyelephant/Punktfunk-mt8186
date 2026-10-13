@@ -286,7 +286,7 @@ fn recv_frame(sock: &impl AsFd, buf: &mut [u8]) -> Result<(usize, Option<OwnedFd
 /// opens the node itself, as the box's host does.
 pub fn brokered(node: &Path) -> bool {
     asks_broker(
-        pf_paths::seat::is_seat_host(),
+        pf_paths::seat::role().is_seat_host(),
         writable(node) && !proxied(node),
     )
 }

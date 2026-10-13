@@ -1075,7 +1075,7 @@ pub fn prefs() -> &'static DisplayPolicyStore {
             .with_box_overlays(
                 pf_paths::seat::trust_dir().map(|dir| dir.join("display-settings.json")),
             )
-            .with_contract(pf_paths::seat::follows_contract())
+            .with_contract(pf_paths::seat::role().follows_contract())
     })
 }
 

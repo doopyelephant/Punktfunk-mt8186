@@ -278,7 +278,7 @@ pub(crate) async fn serve(
 
     // Held for the host lifetime — dropping `_advert` unregisters. Best-effort: a
     // discovery failure must not stop streaming (`--connect HOST:PORT` still works).
-    let _advert = if pf_paths::seat::is_seat_host() {
+    let _advert = if pf_paths::seat::role().is_seat_host() {
         tracing::info!("seat host: no mDNS advertisement — clients arrive through the box");
         None
     } else if !opts.mdns {
@@ -309,7 +309,7 @@ pub(crate) async fn serve(
 
     // The door places every connect and runs no session, so it opens no audio, input or display
     // and the senders below reach nobody.
-    let door = pf_paths::seat::is_door();
+    let door = pf_paths::seat::role().is_door();
     // A sinkless capturer handed session to session (`AudioCapSlot`, `park_audio_capture`).
     let audio_cap: AudioCapSlot = Arc::new(std::sync::Mutex::new(None));
     // Host-lifetime injector: one RemoteDesktop-portal grant. A CreateSession per session
@@ -338,7 +338,7 @@ pub(crate) async fn serve(
     // Failure logs once and leaves pads working without pad audio. A seat's pad endpoints come
     // from its listener's enumerator; the box-wide ones are the console host's.
     #[cfg(target_os = "windows")]
-    if !pf_paths::seat::is_seat_host() {
+    if !pf_paths::seat::role().is_seat_host() {
         crate::audio::pad_endpoint::provision_at_startup(true);
     }
     // Windows: mint "Punktfunk Speakers/Microphone" (Valve streaming drivers). Best-effort;
@@ -2374,7 +2374,7 @@ fn opens_game_mode(profile: &crate::profiles::Resolved) -> bool {
 #[cfg(target_os = "linux")]
 pub(crate) fn plays_seat_mode(profile: &crate::profiles::Resolved) -> bool {
     use crate::profiles::{OsAccount, SeatTier};
-    pf_paths::seat::runs_seat_session()
+    pf_paths::seat::role().runs_seat_session()
         && !matches!(
             profile.os_account,
             OsAccount::Seat {

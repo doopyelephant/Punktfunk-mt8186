@@ -63,7 +63,10 @@ pub fn apply() {
 
 /// The setting and where it came from, or `None` on a host that owns no entry.
 fn wanted() -> Option<(bool, Source)> {
-    if pf_paths::seat::is_seat_host() || pf_paths::seat::is_door() || !platform::installed() {
+    if pf_paths::seat::role().is_seat_host()
+        || pf_paths::seat::role().is_door()
+        || !platform::installed()
+    {
         return None;
     }
     let row = pf_host_config::snapshot().get(ID)?;

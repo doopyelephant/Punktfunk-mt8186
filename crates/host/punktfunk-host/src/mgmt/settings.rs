@@ -115,7 +115,7 @@ pub(crate) struct SeatsOn {
 }
 
 pub(crate) async fn seats_on() -> SeatsOn {
-    if pf_paths::seat::is_seat_host() {
+    if pf_paths::seat::role().is_seat_host() {
         return SeatsOn::default();
     }
     let full = tokio::task::spawn_blocking(|| crate::seats::snapshot().on)
