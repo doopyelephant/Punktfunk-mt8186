@@ -13,8 +13,6 @@
 //! `d3d11` is the Windows counterpart (D3D11VA shared-texture import). Decode
 //! chain there is Vulkan → D3D11VA → software.
 
-// Unsafe-proof program: every `unsafe {}` in this crate carries a `// SAFETY:` proof.
-
 // VULKAN CONTRACT. CREATE/ALLOCATE: this type owns the live device; CreateInfo
 // outlives the call; Drop destroys the handle. RECORD: into a buffer we own and
 // have begun. DESTROY: GPU must not still be using the object (fence / idle /

@@ -32,6 +32,9 @@ pub mod pairing;
 mod pen;
 #[cfg(feature = "gamestream")]
 mod rtsp;
+/// The RTSP text layer, apart so a fuzz target can include the file.
+#[cfg(feature = "gamestream")]
+mod rtsp_wire;
 #[cfg(feature = "gamestream")]
 mod serverinfo;
 #[cfg(feature = "gamestream")]

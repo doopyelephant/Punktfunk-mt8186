@@ -252,10 +252,21 @@ FFI_CALL = re.compile(
 # a fn-pointer call through a dlopen'd symbol table: (self.api.foo)(..) / (f.bar)(..)
 FNPTR_CALL = re.compile(r'\(\s*(?:self\s*\.\s*)?(?:\w+\s*\.\s*)+\w+\s*\)\s*\(')
 
+# A name this file binds to a `windows::core::Owned<T>`: `let h = Owned::new(..)`, a `h: Owned<T>`
+# field or a `h: &Owned<T>` parameter. `*h` on one is `Deref`, a safe call that copies the handle
+# out; the FFI call that takes it is the unsafe operation, and it is counted as one.
+OWNED_NAME = re.compile(
+    r'\blet\s+(?:mut\s+)?(\w+)\s*=\s*(?:unsafe\s*\{\s*)?(?:\w+\s*::\s*)*Owned\s*::\s*new\s*\('
+    r'|\b(\w+)\s*:\s*&?\s*(?:\w+\s*::\s*)*Owned\s*<')
+
+def owned_names(src):
+    return frozenset(a or b for a, b in OWNED_NAME.findall(src))
+
 class _DerefRx:
     """`*expr` in DEREF position (not multiplication, not a `*mut`/`*const` type)."""
     STAR = re.compile(r'\*')
-    def finditer(self, body):
+    OPERAND = re.compile(r'\*\s*(?:self\s*\.\s*)?(\w+)\b(?!\s*(?:\.|\(|\[|::))')
+    def finditer(self, body, owned=frozenset()):
         n = len(body)
         for m in self.STAR.finditer(body):
             i = m.start()
@@ -276,6 +287,9 @@ class _DerefRx:
             # what follows must start an expression
             if not re.match(r'\*\s*(?:\(|\*|[A-Za-z_])', body[i:i+6]):
                 continue
+            operand = self.OPERAND.match(body, i)
+            if operand and operand.group(1) in owned:
+                continue
             yield type('M', (), {'start': lambda s, i=i: i, 'end': lambda s, i=i: i+1})()
 
 DEREF_RX = _DerefRx()
@@ -284,12 +298,13 @@ DEREF_RX = _DerefRx()
 # one). `Option::as_ref` deeper inside a block is safe and must not be counted.
 PTR_AS_REF = re.compile(r'^\s*(?:&\s*)?[\w.]+\s*\.\s*as_(?:ref|mut)\s*\(\s*\)\s*$')
 
-def count_ops(body: str):
-    """Return Counter of unsafe operations in a region body (already noise-stripped)."""
+def count_ops(body: str, owned=frozenset()):
+    """Return Counter of unsafe operations in a region body (already noise-stripped). `owned`
+    is the file's `Owned<T>` names, whose `*name` is not a raw deref."""
     c = collections.Counter()
     spans = []
     def take(cat, rx):
-        for m in rx.finditer(body):
+        for m in (rx.finditer(body, owned) if rx is DEREF_RX else rx.finditer(body)):
             if any(s <= m.start() < e for s, e in spans): continue
             spans.append((m.start(), m.end()))
             c[cat] += 1
@@ -389,6 +404,7 @@ def census_file(path, plat, feats):
     if not UNSAFE_TOK.search(src):
         return rec
     covered = []  # spans of already-counted region bodies
+    owned = owned_names(src)
     for m in UNSAFE_TOK.finditer(src):
         i = m.end()
         rest = src[i:i+40]
@@ -417,7 +433,7 @@ def census_file(path, plat, feats):
                 continue
             covered.append((ob, end))
             body = src[ob+1:end-1]
-            ops = count_ops(body)
+            ops = count_ops(body, owned)
             rec["ops"].update(ops)
             if _is_test: rec["test_ops"].update(ops)
             rec["regions"].append({"line": src[:ob].count('\n')+1,
@@ -436,7 +452,7 @@ def census_file(path, plat, feats):
             keep = body
             for s, e in sorted(inner, reverse=True):
                 keep = keep[:s-ob-1] + " " * (e-s) + keep[e-ob-1:]
-            ops = count_ops(keep)
+            ops = count_ops(keep, owned)
             rec["ops"].update(ops)
             rec["forms"]["fenced_fn_body"] += 1
     return rec
@@ -489,6 +505,10 @@ def self_test():
     recs = [{"crate_root": "a", "ops": {"ptr_deref": 3, "ffi_call": 5}, "test_ops": {"ptr_deref": 1}},
             {"crate_root": "b", "ops": {"ffi_call": 2}, "test_ops": {}}]
     assert baseline_crates(recs) == {"a": 2}
+    owned = owned_names("let h = unsafe { Owned::new(raw) }; fn f(t: &Owned<HANDLE>) {}")
+    assert owned == {"h", "t"}
+    assert count_ops("Close(*h); Query(*t, *p);", owned)["ptr_deref"] == 1
+    assert count_ops("Close(*h); Query(*t, *p);")["ptr_deref"] == 3
     print("unsafe-census self-test ok")
     return 0
 

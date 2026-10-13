@@ -329,7 +329,7 @@ pub(crate) fn verify_authenticode(
         fdwRevocationChecks: WTD_REVOKE_NONE,
         dwUnionChoice: WTD_CHOICE_FILE,
         Anonymous: WINTRUST_DATA_0 {
-            pFile: &file_info as *const _ as *mut _,
+            pFile: (&raw const file_info).cast_mut(),
         },
         dwStateAction: WTD_STATEACTION_VERIFY,
         ..Default::default()

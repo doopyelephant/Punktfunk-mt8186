@@ -352,28 +352,9 @@ pub(super) fn wait_any(handles: &[HANDLE], ms: u32) -> Option<usize> {
 ///
 /// The host job permits breakaway for detached session-user launches and update
 /// installers. The web-console job does not permit children to outlive the
-/// service. Ownership starts before the first fallible configuration call.
+/// service.
 pub(super) fn make_job(limits: JOB_OBJECT_LIMIT) -> Result<OwnedHandle> {
-    // SAFETY: a null security descriptor and a null name are "unnamed, default security";
-    // the returned handle is checked by `?` and owned on the next line.
-    let job_raw = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.context("CreateJobObjectW")?;
-    // Own it immediately so any early return still closes it.
-    // SAFETY: `job_raw` is the handle just created, non-null, and not owned anywhere else.
-    let job = unsafe { OwnedHandle::from_raw_handle(job_raw.0) };
-    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | limits;
-    // SAFETY: `job` is the live job object above; `info` is a local of the type
-    // `JobObjectExtendedLimitInformation` expects, and the size argument is its `size_of`.
-    unsafe {
-        SetInformationJobObject(
-            HANDLE(job.as_raw_handle()),
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as *const c_void,
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-    }
-    .context("SetInformationJobObject")?;
-    Ok(job)
+    pf_paths_win::kill_on_close_job(limits).context("create the kill-on-close job")
 }
 
 pub(super) struct Child {

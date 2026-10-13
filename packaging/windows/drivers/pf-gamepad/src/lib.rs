@@ -1,21 +1,14 @@
-// punktfunk virtual DualSense / DualShock 4 / DualSense Edge — UMDF2 HID minidriver.
-//
-// A Rust port of the WDK `vhidmini2` UMDF2 sample, reconfigured to present a Sony DualSense
-// (VID 054C / PID 0CE6), DualShock 4 (device_type=1), DualSense Edge (device_type=2), Steam Deck
-// (device_type=3), Xbox Wireless Controller (device_type=4, VID 045E / PID 0B13), Xbox One S
-// (device_type=5, 045E / 02FD) or Xbox Elite Wireless Controller Series 2 (device_type=6,
-// 045E / 0B22) using the
-// report descriptors + feature blobs punktfunk already ships in `inject/`. Games see a genuine
-// HID PS controller; the host streams input in / reads output (rumble/lightbar/triggers) back.
-//
-// No WDF object contexts: this is a singleton virtual device, so per-device state lives in statics.
-// The host channel is the **sealed pad channel** (design/gamepad-channel-sealing.md, proto v2): the
-// whole handshake + all shared-memory access lives in `pf_umdf_util` (the audited unsafe layer), so
-// this crate's channel/HID/IOCTL logic is 100% SAFE Rust. The only `unsafe` here is the unavoidable
-// WDF setup FFI in DriverEntry/EvtDeviceAdd/the timer, each with a `// SAFETY:` proof.
+//! punktfunk virtual gamepad — UMDF2 HID minidriver, a port of the WDK `vhidmini2` sample.
+//!
+//! One driver presents the pad the host's `device_type` stamp names (the identities are the
+//! constants below), with the report descriptors and feature blobs the host's `inject/`
+//! ships. The host streams input in and reads output (rumble, lightbar, triggers) back.
+//!
+//! A singleton virtual device: no WDF object contexts, per-device state lives in statics.
+//! The host channel is the sealed pad channel (design/gamepad-channel-sealing.md); its unsafe
+//! surface lives in `pf_umdf_util`, so the only `unsafe` here is WDF setup FFI.
 
 #![allow(non_snake_case, non_upper_case_globals, clippy::missing_safety_doc)]
-// Every remaining `unsafe {}` (all WDF setup FFI) must carry a `// SAFETY:` proof.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};

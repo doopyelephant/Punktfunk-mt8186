@@ -295,6 +295,10 @@ fn account_comment(account: &str) -> WinResult<Option<String>> {
             "NetUserGetInfo returned a null buffer",
         ));
     }
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "NetAPI aligns the buffer for the level's struct"
+    )]
     // SAFETY: level 10 returned a USER_INFO_10 allocation that remains live until free below.
     let info = unsafe { &*buffer.cast::<USER_INFO_10>() };
     let comment = pwstr_to_string(info.usri10_comment);
@@ -485,6 +489,10 @@ fn local_groups(account: &str) -> WinResult<Vec<String>> {
                     "NetUserGetLocalGroups returned a null buffer",
                 ));
             }
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "NetAPI aligns the buffer for the level's struct"
+            )]
             // SAFETY: level 0 returned `entries` consecutive structures in the NetAPI allocation.
             let values = unsafe {
                 std::slice::from_raw_parts(

@@ -645,7 +645,7 @@ fn grant_system_full_control(subkey_path: &str) -> Result<()> {
     unsafe {
         SetEntriesInAclW(
             Some(&[ea]),
-            (!old_dacl.is_null()).then_some(old_dacl as *const ACL),
+            (!old_dacl.is_null()).then_some(old_dacl.cast_const()),
             &mut new_dacl,
         )
     }

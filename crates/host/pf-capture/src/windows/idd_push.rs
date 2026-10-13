@@ -12,20 +12,17 @@ use super::dxgi::WinCaptureTarget;
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use crate::cursor_witness::CursorWitness;
 use anyhow::{bail, Context, Result};
+use pf_paths_win::SecurityAttributes;
 use pf_win_display::open_wudfhost;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use windows::core::{w, PCWSTR};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    DuplicateHandle, LocalFree, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS,
-    DUPLICATE_SAME_ACCESS, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, POINT, WAIT_OBJECT_0,
+    DuplicateHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
+    HANDLE, INVALID_HANDLE_VALUE, POINT, WAIT_OBJECT_0,
 };
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 use windows::Win32::System::Memory::{
@@ -113,13 +110,13 @@ unsafe impl Send for MappedSection {}
 impl MappedSection {
     /// A pagefile-backed section of `len` bytes, mapped read/write. Windows hands its pages
     /// over zeroed. `sa` is its DACL; `None` takes the process default.
-    fn create(len: usize, sa: Option<&open::SharedObjectSa>, what: &str) -> Result<Self> {
+    fn create(len: usize, sa: Option<&SecurityAttributes>, what: &str) -> Result<Self> {
         let size = u32::try_from(len).with_context(|| format!("size the {what} section"))?;
         // SAFETY: `sa` outlives the call, and the handle it returns is new and owned from here.
         let handle = unsafe {
             let map = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
-                sa.map(open::SharedObjectSa::as_ptr),
+                sa.map(SecurityAttributes::as_ptr),
                 PAGE_READWRITE,
                 0,
                 size,
@@ -146,6 +143,10 @@ impl MappedSection {
     }
 
     /// The 4-aligned word at `off`, as the atomic both sides treat it as.
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the view is page-aligned and `off` is checked"
+    )]
     fn word32(&self, off: usize) -> &AtomicU32 {
         assert!(
             off % 4 == 0 && off.checked_add(4).is_some_and(|end| end <= self.len),

@@ -20,10 +20,7 @@ use windows::Win32::Security::{
     FreeSid, GetTokenInformation, TokenAppContainerSid, PSID, SECURITY_CAPABILITIES,
     SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_QUERY,
 };
-use windows::Win32::System::JobObjects::{
-    CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
+use windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT;
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
@@ -121,7 +118,9 @@ pub(crate) fn spawn(id: &str, network: bool, program: &Path, args: &[String]) ->
 
     // In the job from creation, so this helper dying at any point (a runner restart's Ctrl+C)
     // takes the plugin with it: an orphan would hold the runner's log open.
-    let job = kill_on_close_job()?;
+    // Its close kills every process in it, and this process holds the one handle.
+    let job = pf_paths_win::kill_on_close_job(JOB_OBJECT_LIMIT(0))
+        .context("create the kill-on-close job")?;
     let jobs = [HANDLE(job.as_raw_handle())];
     let mut bytes = 0usize;
     // SAFETY: the sizing call; it reports the bytes needed through `bytes` and fails by design.
@@ -254,27 +253,6 @@ pub(crate) fn pipe_client_package_sid(pipe: HANDLE) -> Option<String> {
         return None;
     }
     sid_string_borrowed(info.TokenAppContainer).ok()
-}
-
-/// A job whose close kills every process in it; this process holds the one handle.
-fn kill_on_close_job() -> Result<OwnedHandle> {
-    // SAFETY: unnamed, default security; the handle is owned on the next line.
-    let raw = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.context("CreateJobObjectW")?;
-    // SAFETY: the handle just created, owned nowhere else.
-    let job = unsafe { OwnedHandle::from_raw_handle(raw.0) };
-    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    // SAFETY: a live job; `info` is the type the class expects and the size is its own.
-    unsafe {
-        SetInformationJobObject(
-            HANDLE(job.as_raw_handle()),
-            JobObjectExtendedLimitInformation,
-            (&raw const info).cast(),
-            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-    }
-    .context("SetInformationJobObject")?;
-    Ok(job)
 }
 
 /// A SID this module must free, read as `S-1-…`.

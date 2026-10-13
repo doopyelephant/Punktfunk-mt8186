@@ -223,21 +223,22 @@ jobs:
       - name: Clippy (Windows host subsystem)
         # --release and --locked for the same reasons as the package job: reuse C:\t\release
         # instead of spawning a second dep tree, and resolve the graph that is committed.
-        # pf-encode-core, pf-encode-win, pf-inject, pf-audio, pf-win-display and display-disturb are
-        # here because no other workflow's -p list type-checks their Windows code or tests.
+        # pf-encode-core, pf-encode-win, pf-inject, pf-audio, pf-win-display, pf-clipboard, pf-frame
+        # and display-disturb are here because no other workflow's -p list type-checks their
+        # Windows code or tests.
         # The encode crates take nvenc,qsv and not pyrowave: this lane never builds the PyroWave
         # C++ tree, and the drivers lane already compiles that backend. Two runs, not eight:
         # every extra feature set re-checks the crates the runs share.
         run: |
           cargo clippy --release --locked -p punktfunk-host -p punktfunk-tray --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "host clippy" }
-          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p pf-seat-audio -p display-disturb --all-targets --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
+          cargo clippy --release --locked -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p pf-seat-audio -p pf-clipboard -p pf-frame -p display-disturb --all-targets --features nvenc,qsv --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "subsystem clippy" }
           # The seat keeper is its own workspace (IronRDP's lockfile); see its Cargo.toml.
           cargo clippy --release --locked --manifest-path crates/host/pf-seat-keeper/Cargo.toml --target x86_64-pc-windows-msvc -- -D warnings; if ($LASTEXITCODE) { throw "seat keeper clippy" }
 
       - name: Format check
         # Cheap, needs no compile, and the Linux lane cannot see these crates' Windows modules.
         run: |
-          cargo fmt -p punktfunk-host -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p pf-seat-audio -p punktfunk-tray -p punktfunk-capture-worker --check; if ($LASTEXITCODE) { throw "fmt" }
+          cargo fmt -p punktfunk-host -p pf-encode -p pf-encode-core -p pf-encode-win -p pf-encode-session -p pf-capture -p pf-vdisplay -p pf-win-display -p pf-inject -p pf-audio -p pf-seats -p pf-seat-audio -p pf-clipboard -p pf-frame -p punktfunk-tray -p punktfunk-capture-worker --check; if ($LASTEXITCODE) { throw "fmt" }
           cargo fmt --manifest-path crates/host/pf-seat-keeper/Cargo.toml --check; if ($LASTEXITCODE) { throw "seat keeper fmt" }
 
       - name: Test (subsystem crates, Windows)
@@ -263,6 +264,9 @@ jobs:
           cargo test --release --locked -p pf-inject --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-inject tests" }
           cargo test --release --locked -p pf-audio --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-audio tests" }
           cargo test --release --locked -p pf-encode-session --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-encode-session tests" }
+          # The D3D11 map guard on a WARP device, and a clipboard block the clipboard refuses.
+          cargo test --release --locked -p pf-frame --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-frame tests" }
+          cargo test --release --locked -p pf-clipboard --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-clipboard tests" }
 
   package:
     runs-on: windows-amd64

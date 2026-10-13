@@ -17,8 +17,6 @@
 //! A preference change applies to the **next session**. [`session_begin`] /
 //! [`active`] record which GPU a live session encodes on.
 
-// Unsafe-proof program: every `unsafe {}` in this leaf carries a `// SAFETY:` proof.
-
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

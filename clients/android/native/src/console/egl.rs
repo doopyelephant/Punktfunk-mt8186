@@ -334,7 +334,8 @@ impl EglSurface {
             Ok(())
         } else {
             // SAFETY: plain query.
-            Err(anyhow!("eglSwapBuffers: 0x{:x}", unsafe { eglGetError() }))
+            let code = unsafe { eglGetError() };
+            Err(anyhow!("eglSwapBuffers: 0x{code:x}"))
         }
     }
 

@@ -34,11 +34,7 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_ALWAYS, OPEN_EXISTING,
 };
-use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
+use windows::Win32::System::JobObjects::{AssignProcessToJobObject, JOB_OBJECT_LIMIT};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
@@ -52,23 +48,8 @@ pub(super) struct Job {
 
 impl Job {
     pub(super) fn new() -> WinResult<Self> {
-        // SAFETY: null attributes and name request a fresh unnamed job with default security.
-        let raw = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
-            .map_err(|error| io_error("job_create", "CreateJobObjectW failed", error))?;
-        // SAFETY: `raw` is newly returned and has no owner; transfer it exactly once.
-        let handle = unsafe { OwnedHandle::from_raw_handle(raw.0) };
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: handle is a live job and `limits` has the exact selected information type.
-        unsafe {
-            SetInformationJobObject(
-                HANDLE(handle.as_raw_handle()),
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_ref(&limits).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        }
-        .map_err(|error| io_error("job_create", "SetInformationJobObject failed", error))?;
+        let handle = pf_paths_win::kill_on_close_job(JOB_OBJECT_LIMIT(0))
+            .map_err(|error| io_error("job_create", "create the kill-on-close job", error))?;
         Ok(Self { handle })
     }
 

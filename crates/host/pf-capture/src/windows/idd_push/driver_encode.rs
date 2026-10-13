@@ -165,7 +165,7 @@ impl AuSection {
     /// `generation` is the DRIVER's word: `EncodeSession::new` stores its own over whatever
     /// is here, and `published_for_us` reads that. The host does not seed it.
     fn create(heap_bytes: u32, wire_seq_base: u32) -> Result<Self> {
-        let sa = open::SharedObjectSa::new()?;
+        let sa = open::shared_object_sa()?;
         let bytes = au::section_bytes(heap_bytes) as usize;
         let section = MappedSection::create(bytes, Some(&sa), "AU")?;
         let stamp =

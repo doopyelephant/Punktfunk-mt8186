@@ -69,6 +69,7 @@ bitflags = "2"
 x11rb = { version = "0.14", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+pf-paths-win = { path = "../pf-paths-win" }
 # Windows-only and gated here rather than unconditionally so the LINUX build does not drag its
 # closure in for nothing: `pf-gpu` for the render-adapter LUID (manager.rs). Every use site is
 # Windows-gated. `pf-encode` was gated here too, for an admission gate that reads the NVENC

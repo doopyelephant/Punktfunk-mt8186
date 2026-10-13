@@ -118,3 +118,10 @@ workspace. See `docs/agents/domain.md`.
 - `cargo test -p pf-console-ui` runs the console's tests on macOS; CPU raster, no GPU.
 - `PF_CONSOLE_DUMP=<dir> cargo test -p pf-console-ui --lib -- --ignored dump` writes every
   screen as a PNG.
+
+## Vulkan verification
+
+- `sh scripts/vk-validation-tests.sh` runs the ignored GPU tests of pf-zerocopy, pf-encode and
+  pf-vkdecode under the Khronos validation layer, on a box with a device and the layer
+  installed. It exits 1 on any validation error and prints each under its test. A test that
+  fails for the driver's own reasons does not change the exit code: compare those with `main`.

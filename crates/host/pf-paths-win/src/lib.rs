@@ -317,3 +317,159 @@ pub fn quarantine_planted_secret(path: &Path) -> bool {
     }
     true
 }
+
+/// A `SECURITY_ATTRIBUTES` parsed from SDDL, owning the descriptor it points at.
+///
+/// The conversion `LocalAlloc`s the descriptor and `Drop` frees it, so the attributes cannot
+/// outlive this value: [`as_ptr`](Self::as_ptr) only lends them. An object copies its
+/// descriptor when it is created, so dropping this once the create call has returned is
+/// sound. `bInheritHandle` is false. Moving is fine: the pointer targets the heap, not a field.
+pub struct SecurityAttributes {
+    attributes: windows::Win32::Security::SECURITY_ATTRIBUTES,
+    descriptor: windows::Win32::Security::PSECURITY_DESCRIPTOR,
+}
+
+impl SecurityAttributes {
+    /// `sddl` with a NUL in it is refused: the conversion would read it as ending there, and a
+    /// descriptor cut short is still a valid one.
+    pub fn new(sddl: &str) -> windows::core::Result<Self> {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::E_INVALIDARG;
+        use windows::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+        if sddl.contains('\0') {
+            return Err(E_INVALIDARG.into());
+        }
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: the `HSTRING` is NUL-terminated and outlives the call; `descriptor` is a
+        // live out-parameter, written only on success, with the one block `drop` frees.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &HSTRING::from(sddl),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )?;
+        }
+        Ok(Self {
+            attributes: SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor.0,
+                bInheritHandle: false.into(),
+            },
+            descriptor,
+        })
+    }
+
+    /// A create call's `lpSecurityAttributes`. Valid while `self` lives.
+    pub fn as_ptr(&self) -> *const windows::Win32::Security::SECURITY_ATTRIBUTES {
+        &self.attributes
+    }
+
+    /// The descriptor alone, for a call that takes one without the attributes around it.
+    pub fn descriptor(&self) -> windows::Win32::Security::PSECURITY_DESCRIPTOR {
+        self.descriptor
+    }
+}
+
+impl Drop for SecurityAttributes {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        // SAFETY: `descriptor` is the one block the conversion allocated; nothing else owns
+        // it, and `as_ptr` and `descriptor` only lend it for as long as `self` lives.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.descriptor.0)));
+        }
+    }
+}
+
+/// A job object whose last handle closing kills every process still in it. `extra` adds
+/// limits to `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; `JOB_OBJECT_LIMIT(0)` adds none.
+///
+/// Unnamed, default security. The handle is owned before the limits are set, so a failure
+/// there closes the job instead of leaking one that kills nothing.
+pub fn kill_on_close_job(
+    extra: windows::Win32::System::JobObjects::JOB_OBJECT_LIMIT,
+) -> windows::core::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    // SAFETY: null attributes and a null name ask for a fresh unnamed job, default security.
+    let raw = unsafe { CreateJobObjectW(None, PCWSTR::null()) }?;
+    // SAFETY: the handle just created, owned nowhere else.
+    let job = unsafe { OwnedHandle::from_raw_handle(raw.0) };
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | extra;
+    // SAFETY: a live job; `info` is the type this class expects, passed with its own size,
+    // and the kernel copies it before the call returns.
+    unsafe {
+        SetInformationJobObject(
+            HANDLE(job.as_raw_handle()),
+            JobObjectExtendedLimitInformation,
+            (&raw const info).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    }?;
+    Ok(job)
+}
+
+#[cfg(test)]
+mod security_attributes_tests {
+    use super::SecurityAttributes;
+
+    /// The attributes point at the descriptor the SDDL parsed to; bad SDDL is an error.
+    #[test]
+    fn sddl_parses_into_attributes_that_own_their_descriptor() {
+        let sa = SecurityAttributes::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)").expect("valid SDDL");
+        // SAFETY: `as_ptr` lends the attributes while `sa` lives.
+        let attributes = unsafe { &*sa.as_ptr() };
+        assert_eq!(attributes.lpSecurityDescriptor, sa.descriptor().0);
+        assert!(!sa.descriptor().0.is_null());
+        assert!(!attributes.bInheritHandle.as_bool());
+        assert!(SecurityAttributes::new("not sddl").is_err());
+        assert!(SecurityAttributes::new("D:P(A;;GA;;;SY)\0(A;;GA;;;WD)").is_err());
+    }
+
+    /// Closing the job's last handle ends a process assigned to it.
+    #[test]
+    fn closing_the_job_kills_what_is_in_it() {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::JobObjects::{AssignProcessToJobObject, JOB_OBJECT_LIMIT};
+
+        let job = super::kill_on_close_job(JOB_OBJECT_LIMIT(0)).expect("a job");
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cmd");
+        // SAFETY: both handles are live and owned by this test for the call.
+        unsafe {
+            AssignProcessToJobObject(HANDLE(job.as_raw_handle()), HANDLE(child.as_raw_handle()))
+        }
+        .expect("assign");
+        assert!(
+            child.try_wait().expect("poll").is_none(),
+            "still waiting on stdin"
+        );
+        drop(job);
+        // The kill is asynchronous. Its exit code is the kernel's, so only the exit is asserted.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().expect("poll").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job's close left its process running"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}

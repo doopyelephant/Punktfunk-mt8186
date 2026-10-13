@@ -1,67 +1,21 @@
 //! One-shot IDD-push construction: display depth, the WUDFHost duplication
 //! broker, and the cursor opt-in.
 //!
-//! Types that exist only here: [`SharedObjectSa`], shared with the AU section's
-//! own create. Steady-state capture (`try_consume`, pollers, `Capturer`) lives
-//! in `capturer`. A `#[path]` child sees the parent's private items through
-//! `use super::*`. Evidence: `design/idd-push-security.md`.
+//! [`shared_object_sa`] is here too, shared with the AU section's own create. Steady-state
+//! capture (`try_consume`, pollers, `Capturer`) lives in `capturer`. A `#[path]` child sees
+//! the parent's private items through `use super::*`. Evidence:
+//! `design/idd-push-security.md`.
 
 use super::*;
 
-/// `SECURITY_ATTRIBUTES` for the unnamed AU/cursor section and event objects: SDDL
-/// `D:P(A;;GA;;;SY)`, protected, `bInheritHandle: false`.
+/// `SECURITY_ATTRIBUTES` for the unnamed AU section and its event: SDDL
+/// `D:P(A;;GA;;;SY)`, protected, `bInheritHandle: false`. The cursor section takes the
+/// process default instead.
 ///
 /// The driver never opens by name; it receives duplicated handles (access travels
 /// with the handle). See `design/idd-push-security.md`.
-///
-/// RAII over the `LocalAlloc` descriptor. `sa.lpSecurityDescriptor` points at
-/// `psd`; [`as_ptr`](Self::as_ptr) only lends a borrow, so the attributes cannot
-/// outlive this value. Moving is fine — the pointer targets the heap, not a field.
-pub(super) struct SharedObjectSa {
-    sa: SECURITY_ATTRIBUTES,
-    psd: PSECURITY_DESCRIPTOR,
-}
-
-impl SharedObjectSa {
-    pub(super) fn new() -> Result<Self> {
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: the `w!()` literal is the SDDL source; the call writes its
-        // `LocalAlloc` descriptor into this live `psd`; `?` rejects failure
-        // before `psd` is read.
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:P(A;;GA;;;SY)"),
-                SDDL_REVISION_1,
-                &mut psd,
-                None,
-            )
-            .context("build SDDL for IDD-push shared objects")?;
-        }
-        Ok(Self {
-            sa: SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: psd.0,
-                bInheritHandle: false.into(),
-            },
-            psd,
-        })
-    }
-
-    /// Borrowed from this owner; the descriptor must outlive the create call.
-    pub(super) fn as_ptr(&self) -> *const SECURITY_ATTRIBUTES {
-        &self.sa
-    }
-}
-
-impl Drop for SharedObjectSa {
-    fn drop(&mut self) {
-        // SAFETY: `psd` is the descriptor this value's constructor allocated and
-        // nothing else owns it. `LocalFree` runs once (`Drop` once; `as_ptr` only
-        // lends a borrow of `sa`).
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(self.psd.0)));
-        }
-    }
+pub(super) fn shared_object_sa() -> Result<SecurityAttributes> {
+    SecurityAttributes::new("D:P(A;;GA;;;SY)").context("build SDDL for IDD-push shared objects")
 }
 
 impl IddPushCapturer {

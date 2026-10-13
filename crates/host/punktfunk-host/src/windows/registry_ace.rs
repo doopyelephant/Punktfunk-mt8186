@@ -82,7 +82,7 @@ fn edit(key: &str, sid: &str, mode: ACCESS_MODE) -> Result<()> {
     unsafe {
         SetEntriesInAclW(
             Some(&[entry]),
-            (!old_dacl.is_null()).then_some(old_dacl as *const ACL),
+            (!old_dacl.is_null()).then_some(old_dacl.cast_const()),
             &mut new_dacl,
         )
     }

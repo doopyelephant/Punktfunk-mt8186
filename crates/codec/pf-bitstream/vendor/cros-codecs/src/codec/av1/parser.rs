@@ -3873,6 +3873,9 @@ impl Parser {
         let mut sz: u64 = r.0.num_bits_left() as u64 / 8;
 
         let num_tiles = self.tile_rows * self.tile_cols;
+        if num_tiles == 0 {
+            return Err("Tile group with no frame header ahead of it".into());
+        }
         let start_bit_pos = r.0.position();
 
         if num_tiles > 1 {
@@ -3886,6 +3889,13 @@ impl Parser {
             let tile_bits = (self.tile_cols_log2 + self.tile_rows_log2) as usize;
             tg.tg_start = r.0.read_bits::<u32>(tile_bits)?;
             tg.tg_end = r.0.read_bits::<u32>(tile_bits)?;
+        }
+
+        if tg.tg_end < tg.tg_start || tg.tg_end >= num_tiles {
+            return Err(format!(
+                "Invalid tile group {}..={} of {num_tiles} tiles",
+                tg.tg_start, tg.tg_end
+            ));
         }
 
         r.byte_alignment()?;
@@ -3905,8 +3915,12 @@ impl Parser {
                 tile_size = u32::try_from(sz).unwrap();
             } else {
                 tile_size =
-                    r.0.read_le::<u32>(self.tile_size_bytes.try_into().unwrap())? + 1;
-                sz -= u64::from(tile_size + self.tile_size_bytes);
+                    r.0.read_le::<u32>(self.tile_size_bytes.try_into().unwrap())?
+                        .checked_add(1)
+                        .ok_or("Invalid tile_size_minus_1")?;
+                sz = sz
+                    .checked_sub(u64::from(tile_size) + u64::from(self.tile_size_bytes))
+                    .ok_or("Tile is larger than its tile group")?;
             }
 
             let tile = Tile {
@@ -3953,11 +3967,13 @@ impl Parser {
         }
 
         let frame_header_obu = self.parse_frame_header_obu(&obu)?;
+        let header_bytes = frame_header_obu.header_bytes;
+        let short = || String::from("Frame OBU is shorter than its frame header");
         let obu = Obu {
             header: obu.header,
             data: match obu.data {
-                Cow::Borrowed(d) => Cow::Borrowed(&d[frame_header_obu.header_bytes..]),
-                Cow::Owned(d) => Cow::Owned(d[frame_header_obu.header_bytes..].to_owned()),
+                Cow::Borrowed(d) => Cow::Borrowed(d.get(header_bytes..).ok_or_else(short)?),
+                Cow::Owned(d) => Cow::Owned(d.get(header_bytes..).ok_or_else(short)?.to_owned()),
             },
             bytes_used: obu.bytes_used,
         };
@@ -3984,7 +4000,6 @@ impl Parser {
                 .take()
                 .ok_or::<String>("Broken stream: no previous frame header to copy".into())?)
         } else {
-            self.seen_frame_header = true;
             let header = self.parse_uncompressed_frame_header(obu)?;
             if header.show_existing_frame {
                 self.last_frame_header = None;

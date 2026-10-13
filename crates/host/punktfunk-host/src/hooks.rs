@@ -665,7 +665,7 @@ pub(crate) fn running_as_system() -> bool {
     // TokenUserBuf); its `User.Sid` points into the same buffer, and both SIDs are valid for
     // this comparison.
     unsafe {
-        let tu = &*(buf.0.as_ptr() as *const TOKEN_USER);
+        let tu = &*(&raw const buf).cast::<TOKEN_USER>();
         // EqualSid maps BOOL(0) and a genuine failure both to Err; tell them apart via
         // GetLastError. Clear it first — a stale value would read as failure. Treating
         // EqualSid Err as "not SYSTEM" is fail-open.
@@ -1591,5 +1591,18 @@ mod tests {
             cmd_label("/usr/local/bin/notify.sh --token=SEKRIT-yy")
         );
         assert!(cmd_label("curl -H \"Authorization: Bearer t\" https://x/y").starts_with("curl #"));
+    }
+
+    /// The token read agrees with `whoami`, whichever account runs the tests.
+    #[cfg(windows)]
+    #[test]
+    fn running_as_system_agrees_with_whoami() {
+        let out = std::process::Command::new("whoami")
+            .output()
+            .expect("run whoami");
+        let name = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .to_ascii_lowercase();
+        assert_eq!(running_as_system(), name == r"nt authority\system");
     }
 }

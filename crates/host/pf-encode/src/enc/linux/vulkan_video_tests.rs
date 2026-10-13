@@ -460,8 +460,8 @@ fn run_wave_smoke(codec: Codec, ext: &str) {
     }
 }
 
-/// HEVC wave smoke. Run under `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`: the layers
-/// are the only check of the dirty-region bookkeeping, RADV ignores it.
+/// HEVC wave smoke. Run it through `scripts/vk-validation-tests.sh`: the validation layer is
+/// the only check of the dirty-region bookkeeping, which RADV ignores.
 #[test]
 #[ignore = "needs VK_KHR_video_encode_intra_refresh (RADV >= Mesa 25.3 on VCN hardware)"]
 fn vulkan_wave_smoke() {

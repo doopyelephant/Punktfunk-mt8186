@@ -10,8 +10,6 @@
 //! selected by `#[path]` so the session pump only names `crate::audio`. `keymap` stays
 //! Linux; the session path uses pf-presenter's SDL-scancode table.
 
-// Every `unsafe` block and `unsafe impl` in this crate carries a `// SAFETY:` proof.
-
 // The session pump's decoder-input capture, so `session` keeps naming `crate::au_dump`.
 #[cfg(desktop)]
 use pf_client_video::au_dump;

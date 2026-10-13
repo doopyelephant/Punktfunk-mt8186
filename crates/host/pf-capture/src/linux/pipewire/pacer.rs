@@ -52,8 +52,8 @@ impl RawTimer {
                 spa::sys::spa_loop_utils_methods,
                 update_timer,
                 self.source,
-                &value as *const _ as *mut _,
-                &interval as *const _ as *mut _,
+                (&raw const value).cast_mut(),
+                (&raw const interval).cast_mut(),
                 false
             );
         }

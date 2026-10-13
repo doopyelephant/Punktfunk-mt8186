@@ -294,5 +294,61 @@ in the future."
     `a_stream_that_states_no_bound_waits_for_a_full_dpb` in `pf-bitstream`.
     **Report upstream — not yet filed.**
 
+Deviations 26 to 31 were found by the `bitstream_plan` fuzz target (`fuzz/`), which runs
+this crate with overflow checks off, as it ships: 26, 28, 30 and 31 abort a release client.
+
+26. `src/codec/av1/parser.rs` — `parse_tile_group_obu`: refuse a tile group while the parser
+    counts no tiles, and one whose `tg_start..=tg_end` leaves the frame's tile count.
+    `tile_rows * tile_cols` is zero until a frame header has run `parse_tile_info`, so a tile
+    group ahead of any header computed `num_tiles - 1`, a debug underflow, and then divided
+    `tile_num` by a zero `tile_cols`: a division panic in release, from a sequence header and
+    a three-byte OBU. `tg_start` and `tg_end` are read `tile_cols_log2 + tile_rows_log2` bits
+    wide, which reaches past the tile count whenever it is not a power of two, and the loop
+    indexes `mi_row_starts` by the row it derives. 6.10.1 requires `tg_end >= tg_start` and
+    ends a frame's last group at `NumTiles - 1`. Regression test:
+    `a_tile_group_ahead_of_any_frame_header_is_an_error_not_a_panic` in `pf-bitstream`.
+    **Report upstream — not yet filed.**
+
+27. `src/codec/av1/parser.rs` — the tile loop of `parse_tile_group_obu`: `tile_size_minus_1 + 1`
+    and the running `sz` use checked arithmetic. A tile larger than what is left of its group
+    underflowed `sz`: a debug panic, and in release a wrap that the `skip_bits` behind it
+    turned into the error this now returns directly. No release crash, so no regression
+    test. **Report upstream — not yet filed.**
+
+28. `src/codec/h265/parser.rs` — `parse_vps`, `parse_sps`, `parse_pps` and
+    `parse_slice_header` take their payload with `get(hdr_len..)`. `NaluHeader::parse` reads
+    its two bytes from the stream cursor, not from the unit, so a unit cut to one byte ahead
+    of another start code still gets a header, its second byte out of that start code, and
+    `&data[2..]` on the one-byte unit panicked. That is a bounds check, so it fires in release
+    too, from nine bytes. `pf-bitstream`'s own SEI path already read `get(2..)`. Regression
+    test: `a_one_byte_unit_is_a_parse_error_not_a_panic` in `pf-bitstream`.
+    **Report upstream — not yet filed.**
+
+29. `src/codec/h265/parser.rs` — `parse_pps_range_extension`: the SAO offset scale bound is
+    `bit_depth_y.saturating_sub(10)`. Upstream wrote `max(0, bit_depth_y - 10)` on a `u8`,
+    which underflows before `max` sees it for every depth under ten: a debug panic, and in
+    release a bound of 254 or 255 on a field that must then be zero. No release crash, so no
+    regression test. **Report upstream — not yet filed.**
+
+30. `src/codec/h265/parser.rs` — `parse_sps_scc_extension`: the bound on
+    `num_palette_predictor_initializer_minus1` is computed in `u32`, and initializers for an
+    empty palette are refused. `palette_max_size + delta_palette_max_predictor_size - 1` in
+    `u8` wraps to 255 when both are zero; the count then reads up to 255 and the loop fills
+    `palette_predictor_initializer`, which is 128 deep: an index panic in release, from a
+    60-byte SPS. The two reads above it bound their sum at 128, so the checked form keeps
+    every index inside the array. Regression test:
+    `an_sps_with_palette_initializers_for_an_empty_palette_is_a_parse_error_not_a_panic` in
+    `pf-bitstream`. **Report upstream — not yet filed.**
+
+31. `src/codec/av1/parser.rs` — `parse_frame_header_obu` sets `seen_frame_header` once the
+    header has parsed, not before, and `parse_frame_obu` refuses a frame OBU shorter than
+    `header_bytes`. Set first, a header that failed to parse left the flag up with
+    `last_frame_header` still holding the last good frame's. Until a temporal delimiter
+    cleared it, every frame OBU came back as a copy of that header, and `parse_frame_obu`
+    sliced its own payload at the old header's length: a bounds panic in release when the new
+    OBU is the shorter one. Regression test:
+    `a_frame_obu_after_a_failed_header_is_parsed_on_its_own` in `pf-bitstream`.
+    **Report upstream — not yet filed.**
+
 Re-sync procedure: fetch the AOSP tree, re-apply this trim, diff `codec/` +
 `bitstream_utils.rs` (expect near-zero conflicts), update the commit pin above.
