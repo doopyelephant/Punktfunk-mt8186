@@ -223,9 +223,10 @@ fn resolve_target() -> Result<(wasapi::Device, String, bool)> {
     // park_defaults=false: the idle mic pump must not park the operator's
     // playback/recording defaults; only desktop-audio capture may.
     let mut wiring = audio_control::wire_now(false);
-    if wiring.mic_render.is_none() && !wiring.mic_withheld {
-        // Withheld: the Streaming Microphone exists and the plan gave it to
-        // loopback. Reinstalling the pair changes nothing and costs a 5 s settle.
+    // Withheld: the Streaming Microphone exists and the plan gave it to
+    // loopback. Reinstalling the pair changes nothing and costs a 5 s settle.
+    // Once per INF state: the pump reopens every minute while no mic exists.
+    if wiring.mic_render.is_none() && !wiring.mic_withheld && steam_pair_install_due() {
         tracing::info!("no usable virtual mic device present — attempting auto-install");
         if install_steam_audio_pair() {
             wiring = audio_control::wire_now(false);
@@ -240,11 +241,15 @@ fn resolve_target() -> Result<(wasapi::Device, String, bool)> {
                  substring> to force a target."
             );
         }
+        if matches!(pf_paths::seat::seat_id(), Ok(Some(_))) {
+            anyhow::bail!(
+                "no virtual mic on a seat: its Remote Desktop session lists no local audio device"
+            );
+        }
         anyhow::bail!(
-            "no virtual-mic render endpoint on this box. Install Steam (the host mints its own \
-             microphone endpoint from Steam's streaming drivers — Steam never needs to run), or \
-             install VB-Audio Virtual Cable, or set PUNKTFUNK_MIC_DEVICE=<friendly-name \
-             substring>."
+            "no virtual mic endpoint: install Steam and open it once (its first start installs \
+             the streaming drivers the host mints a microphone from), or install VB-Audio \
+             Virtual Cable, or set PUNKTFUNK_MIC_DEVICE=<friendly-name substring>"
         );
     };
     let minted = super::minted::minted_ids().mic_render.as_deref() == Some(ep.1.as_str());
@@ -274,10 +279,11 @@ pub fn install_steam_audio_pair() -> bool {
     mic || spk
 }
 
-/// The capture side's install latch: `None` until it tries, then whether the INFs existed.
+/// The install latch capture and the mic share: `None` until one tries, then whether the INFs
+/// existed.
 static TRIED_WITH_INFS: Mutex<Option<bool>> = Mutex::new(None);
 
-/// Whether desktop-audio capture may try [`install_steam_audio_pair`] now, marking the try.
+/// Whether [`install_steam_audio_pair`] may run now, marking the try.
 /// Once per INF state, not once per process: a try made while Steam was absent re-arms when
 /// the INFs appear. Those files are invisible to the endpoint-set fingerprint, so nothing
 /// else retries.
@@ -369,11 +375,7 @@ fn try_install_steam_audio(inf_name: &str) -> bool {
             true
         }
         Err(e) => {
-            tracing::info!(
-                inf = inf_name,
-                error = %e,
-                "Steam-audio device not auto-installed (Steam absent / not admin) — see install guidance"
-            );
+            tracing::info!(inf = inf_name, error = %e, "Steam streaming driver not installed");
             false
         }
     }

@@ -190,22 +190,38 @@ static PROVISIONING: AtomicBool = AtomicBool::new(false);
 static LAST_ATTEMPT: Mutex<Option<Instant>> = Mutex::new(None);
 /// Give-up counter for [`MAX_UNLATCHED_ATTEMPTS`], shared by the worker and the blocking path.
 static UNLATCHED_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+/// Steam's INFs were missing when the attempts ran out: their arrival re-arms minting.
+static GAVE_UP_WITHOUT_INFS: AtomicBool = AtomicBool::new(false);
 
 /// Count one finished-but-unlatched pass. The crossing attempt logs the give-up exactly once.
 fn record_unlatched_attempt() {
     let n = UNLATCHED_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
     if n == MAX_UNLATCHED_ATTEMPTS {
+        let infs = super::wasapi_mic::steam_infs_present();
+        GAVE_UP_WITHOUT_INFS.store(!infs, Ordering::SeqCst);
         tracing::warn!(
             attempts = n,
-            "minted-audio provisioning keeps failing — giving up for this host lifetime so \
-             retries stop broadcasting device changes at the whole box; the wiring plan keeps \
-             the name-based ladder, a service restart re-arms minting"
+            steam_drivers = infs,
+            "minted-audio provisioning keeps failing — pausing so retries stop broadcasting \
+             device changes at the whole box; the wiring plan keeps the name-based ladder, and \
+             Steam's drivers appearing or a service restart re-arms minting"
         );
     }
 }
 
+/// Out of attempts. Steam's first start lays its INFs down long after the host's: when they
+/// were missing at the give-up and exist now, the attempts start over.
 fn gave_up() -> bool {
-    UNLATCHED_ATTEMPTS.load(Ordering::SeqCst) >= MAX_UNLATCHED_ATTEMPTS
+    if UNLATCHED_ATTEMPTS.load(Ordering::SeqCst) < MAX_UNLATCHED_ATTEMPTS {
+        return false;
+    }
+    if GAVE_UP_WITHOUT_INFS.load(Ordering::SeqCst) && super::wasapi_mic::steam_infs_present() {
+        GAVE_UP_WITHOUT_INFS.store(false, Ordering::SeqCst);
+        UNLATCHED_ATTEMPTS.store(0, Ordering::SeqCst);
+        tracing::info!("Steam's streaming drivers appeared — minting audio endpoints again");
+        return false;
+    }
+    true
 }
 
 /// `PUNKTFUNK_NO_AUDIO_MINT=1`: keep the name-based ladder; `=0` mints as if unset.
@@ -714,7 +730,7 @@ pub fn discover_driver(needle: &str, inf_name: &str) -> Result<(String, String)>
     }
     bail!(
         "no installed devnode matches {needle:?} and Steam's driver directory has no \
-         {inf_name} — install Steam (it never needs to run)"
+         {inf_name} — install Steam and open it once"
     )
 }
 
