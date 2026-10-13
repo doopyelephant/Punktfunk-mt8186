@@ -683,7 +683,8 @@ fn on_remove_buffer(ud: &mut UserData, buf: usize) {
 }
 
 /// `param_changed`: a fixated Format pod sets the size, format and modifier every later
-/// buffer is read by, and drops the imports cached for the pool it replaces.
+/// buffer is read by, and drops the imports cached for the pool it replaces. Each pod is
+/// read on its own: what it leaves out is the default, not the format before.
 fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
     let Some(param) = param else { return };
     if id != pw::spa::param::ParamType::Format.as_raw() {
@@ -697,20 +698,20 @@ fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
     {
         return;
     }
-    // Parse once (`parse` takes `&mut self`) and report failure. On `Err`, `negotiated`
-    // stays false so the timeout looks like "no accepted format" — a malformed pod we
-    // accepted, not a format mismatch.
-    let parsed = ud.info.parse(param);
-    if let Err(e) = &parsed {
+    // A fresh struct per pod: the parser writes only the properties a pod carries, so one
+    // without `modifier` or `transferFunction` must not inherit the last format's. On `Err`
+    // the format before stays and `negotiated` is not set: a malformed first pod times out
+    // as "no accepted format", not as a format mismatch.
+    let mut info = VideoInfoRaw::default();
+    if let Err(e) = info.parse(param) {
         tracing::error!(
             error = %e,
             "pipewire: the negotiated Format pod does not parse — capture will time out \
              with no usable format"
         );
-    }
-    if parsed.is_err() {
         return;
     }
+    ud.info = info;
     ud.signals.negotiated.store(true, Ordering::Relaxed);
     // Renegotiation replaces the pool: cached per-buffer imports key on buffers
     // that no longer exist, and a recycled fd/inode must not resolve to a stale import.
@@ -1722,6 +1723,23 @@ mod callbacks {
         assert!(fixate(SPA_VIDEO_TRANSFER_SMPTE2084));
         assert!(!fixate(spa_sys::SPA_VIDEO_TRANSFER_BT709));
         assert_eq!(rig.ud.format, Some(PixelFormat::X2Bgr10));
+    }
+
+    /// PipeWire's fallback to memory buffers renegotiates with a pod that names neither a
+    /// modifier nor a transfer function. Neither carries over from the format before.
+    #[test]
+    fn a_pod_inherits_nothing_it_leaves_out() {
+        let mut rig = Rig::new();
+        let mut fixate = |modifier, transfer| {
+            let pod = format_pod(VideoFormat::xBGR_210LE, (2, 2), modifier, transfer);
+            let id = ParamType::Format.as_raw();
+            on_param_changed(&mut rig.ud, id, Pod::from_bytes(&pod));
+            let hdr = rig.ud.signals.hdr_negotiated.load(Relaxed);
+            (rig.ud.modifier, rig.ud.info.transfer_function(), hdr)
+        };
+        let pq = SPA_VIDEO_TRANSFER_SMPTE2084;
+        assert_eq!(fixate(Some(7), Some(pq)), (7, pq, true));
+        assert_eq!(fixate(None, None), (0, 0, false));
     }
 
     /// KWin's birth mode: buffers in the doomed size go straight back until the producer
