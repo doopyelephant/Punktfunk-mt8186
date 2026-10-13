@@ -71,7 +71,7 @@ impl StreamState {
                     enc_of.enc_kbps(bitrate_kbps) as u64 * 1000,
                     self.bit_depth,
                     self.client_hdr,
-                    self.au_seq,
+                    self.clock.au_seq,
                 ) {
                     Ok(e) => break Some(e),
                     Err(e) => {
@@ -171,7 +171,7 @@ impl StreamState {
                 |_, _| enc_of.enc_kbps(bitrate_kbps) as u64 * 1000,
                 self.bit_depth,
                 self.client_hdr,
-                self.au_seq,
+                self.clock.au_seq,
             ) {
                 Ok((e, reframe)) => {
                     self.adopt_reframe(reframe);

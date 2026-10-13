@@ -139,7 +139,7 @@ impl StreamState {
             |_, _| ed.enc_kbps(new_kbps) as u64 * 1000,
             self.bit_depth,
             self.client_hdr,
-            self.au_seq,
+            self.clock.au_seq,
         ) {
             Ok((new_enc, reframe)) => {
                 self.adopt_reframe(reframe);
@@ -161,9 +161,9 @@ impl StreamState {
                 self.counters.note_bitrate(applied_kbps);
                 self.bitrate_kbps = applied_kbps;
                 self.live_bitrate.store(applied_kbps, Ordering::Relaxed);
-                self.inflight.clear();
-                self.watchdog.on_au();
-                self.last_forced_idr = Some(std::time::Instant::now());
+                self.clock.inflight.clear();
+                self.clock.watchdog.on_au();
+                self.clock.last_forced_idr = Some(std::time::Instant::now());
                 self.behind_score = 0;
                 self.depth_frames = 0;
                 self.ahead_run = 0;
@@ -261,8 +261,8 @@ impl StreamState {
             // stamp would coalesce this IDR itself.
             self.enc.request_keyframe();
             self.counters.link.note_idr();
-            self.inflight.clear();
-            self.last_forced_idr = Some(std::time::Instant::now());
+            self.clock.inflight.clear();
+            self.clock.last_forced_idr = Some(std::time::Instant::now());
             announce_pipeline_gap(&self.gap_tx, outage_ms);
         }
         if self.capturer.take_reference_risk() {
@@ -341,10 +341,13 @@ impl StreamState {
             IDR_COOLDOWN_FULL
         };
         let now = std::time::Instant::now();
-        match self
-            .kf_gate
-            .decide(now, base, self.last_forced_idr, self.last_rfi, rfi_declined)
-        {
+        match self.kf_gate.decide(
+            now,
+            base,
+            self.clock.last_forced_idr,
+            self.last_rfi,
+            rfi_declined,
+        ) {
             KeyframeVerdict::Coalesced { cooldown, unhealed } => {
                 // In-flight IDR has not repaired the client yet — do not RFI-anchor over that damage.
                 self.enc.distrust_references();
@@ -378,7 +381,7 @@ impl StreamState {
                 }
                 self.enc.request_keyframe();
                 self.counters.link.note_idr();
-                self.last_forced_idr = Some(now);
+                self.clock.last_forced_idr = Some(now);
                 if unhealed == IDR_STORM {
                     tracing::warn!(
                         unhealed,

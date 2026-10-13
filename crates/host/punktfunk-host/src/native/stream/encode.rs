@@ -188,8 +188,8 @@ impl StreamState {
         run_parked_stage(
             &mut *self.capturer,
             &mut *self.enc,
-            &mut self.watchdog,
-            || self.inflight.clear(),
+            &mut self.clock.watchdog,
+            || self.clock.inflight.clear(),
         );
         let mut repeat = false;
         match cap_result {
@@ -341,7 +341,10 @@ impl StreamState {
             self.st_queue.push(queue_us);
         }
         let t_submit = std::time::Instant::now();
-        let wire_index = self.au_seq.wrapping_add(self.inflight.len() as u32);
+        let wire_index = self
+            .clock
+            .au_seq
+            .wrapping_add(self.clock.inflight.len() as u32);
         // An encoder the loop does not feed (the Windows driver) already holds `owed` access
         // units — waited for after a fresh frame, never on a repeat — and drains them at
         // depth 1; every other backend takes this tick's frame.
@@ -366,8 +369,8 @@ impl StreamState {
             }
         };
         if let Err(e) = submitted {
-            let backoff = on_submit_error(&mut self.watchdog, e, self.interval, || {
-                reset_stalled_encoder(&mut *self.enc, || self.inflight.clear())
+            let backoff = on_submit_error(&mut self.clock.watchdog, e, self.interval, || {
+                reset_stalled_encoder(&mut *self.enc, || self.clock.inflight.clear())
             })?;
             self.next = std::time::Instant::now() + backoff;
             std::thread::sleep(backoff);
@@ -388,7 +391,7 @@ impl StreamState {
             self.next + self.interval
         };
         for _ in 0..owed.unwrap_or(1) {
-            self.inflight.push_back((capture_ns, submit_ns));
+            self.clock.inflight.push_back((capture_ns, submit_ns));
         }
         let stamps = Stamps {
             queue_us,
@@ -401,7 +404,7 @@ impl StreamState {
         };
         let mut send_gone = false;
         let mut poll_err: Option<anyhow::Error> = None;
-        while self.inflight.len() >= depth {
+        while self.clock.inflight.len() >= depth {
             if self.streamed_wire && self.enc.supports_chunked_poll() {
                 match self.poll_chunked(&stamps, &mut resend_meta) {
                     Polled::Au => continue,
@@ -481,7 +484,7 @@ impl StreamState {
             },
             epoch: self.epoch,
             flags,
-            frame_index: self.au_seq,
+            frame_index: self.clock.au_seq,
             encode_us: d.encode_us,
             queue_us: d.queue_us,
             cap_us: st.cap_us,
@@ -507,17 +510,17 @@ impl StreamState {
                 Ok(None) => return Polled::Nothing,
                 Err(e) => return Polled::Failed(e),
             };
-            self.watchdog.on_au();
+            self.clock.watchdog.on_au();
             // A FIRST while the previous AU's LAST never came (the driver dropped its
             // tail, or a reset abandoned it): close that frame on the wire first, or
             // this AU is spliced onto a truncated prefix under its own flags.
-            if c.first && self.wire_frame_open {
-                if self.inflight.len() > 1 {
-                    self.inflight.pop_front();
+            if c.first && self.clock.wire_frame_open {
+                if self.clock.inflight.len() > 1 {
+                    self.clock.inflight.pop_front();
                 }
-                self.au_seq = self.au_seq.wrapping_add(1);
+                self.clock.au_seq = self.clock.au_seq.wrapping_add(1);
             }
-            self.wire_frame_open = !c.last;
+            self.clock.wire_frame_open = !c.last;
             if c.first {
                 first_chunk_us = t_wait.elapsed().as_micros() as u32;
                 let caps = self.enc.caps();
@@ -536,7 +539,7 @@ impl StreamState {
                 self.bringup.mark("first_au");
             }
             let last = c.last;
-            let inflight = *self.inflight.front().expect("inflight non-empty");
+            let inflight = *self.clock.inflight.front().expect("inflight non-empty");
             let wait_total_us = t_wait.elapsed().as_micros() as u32;
             let wait_us = if st.measure { wait_total_us } else { 0 };
             let meta = self.au_meta(st, inflight, c.pts_ns, flags, wait_us);
@@ -551,8 +554,8 @@ impl StreamState {
                 return Polled::SendGone;
             }
             if last {
-                self.inflight.pop_front();
-                self.au_seq = self.au_seq.wrapping_add(1);
+                self.clock.inflight.pop_front();
+                self.clock.au_seq = self.clock.au_seq.wrapping_add(1);
                 self.sent += 1;
                 if self.perf {
                     self.st_wait.push(wait_total_us);
@@ -589,8 +592,8 @@ impl StreamState {
             Ok(None) => return Polled::Nothing,
             Err(e) => return Polled::Failed(e),
         };
-        self.watchdog.on_au();
-        let inflight = self.inflight.pop_front().expect("inflight non-empty");
+        self.clock.watchdog.on_au();
+        let inflight = self.clock.inflight.pop_front().expect("inflight non-empty");
         let caps = self.enc.caps();
         let flags = au_flags(
             &caps,
@@ -612,7 +615,7 @@ impl StreamState {
         if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
             return Polled::SendGone;
         }
-        self.au_seq = self.au_seq.wrapping_add(1);
+        self.clock.au_seq = self.clock.au_seq.wrapping_add(1);
         self.sent += 1;
         Polled::Au
     }
@@ -636,21 +639,22 @@ impl StreamState {
     /// place, up to [`MAX_ENCODER_RESETS`] times.
     fn check_encode_stall(&mut self, depth: usize, poll_err: Option<anyhow::Error>) -> Result<()> {
         let stalled = self
+            .clock
             .watchdog
-            .stalled(self.inflight.len(), depth, self.interval);
+            .stalled(self.clock.inflight.len(), depth, self.interval);
         let why = match (&poll_err, stalled) {
             (Some(e), _) => format!("poll failed: {e:#}"),
             (None, Some(why)) => why,
             (None, None) => return Ok(()),
         };
-        let recovered = self.watchdog.recover(self.interval, || {
-            reset_stalled_encoder(&mut *self.enc, || self.inflight.clear())
+        let recovered = self.clock.watchdog.recover(self.interval, || {
+            reset_stalled_encoder(&mut *self.enc, || self.clock.inflight.clear())
         });
         if recovered.is_none() {
             return Err(poll_err.unwrap_or_else(|| anyhow!("{why}")))
                 .context("encoder stalled — in-place rebuild unavailable or exhausted");
         }
-        tracing::warn!(reset = self.watchdog.resets(), max = MAX_ENCODER_RESETS, %why,
+        tracing::warn!(reset = self.clock.watchdog.resets(), max = MAX_ENCODER_RESETS, %why,
             "encode stall detected — encoder rebuilt in place, forcing an IDR");
         Ok(())
     }
@@ -805,7 +809,7 @@ impl StreamState {
     /// return `None` on the first in-flight AU and strand the tail.
     pub(super) fn drain(&mut self) {
         self.enc.set_pipelined(false);
-        while let Some((cap_ns, sub_ns)) = self.inflight.pop_front() {
+        while let Some((cap_ns, sub_ns)) = self.clock.inflight.pop_front() {
             let Ok(Some(au)) = self.enc.poll() else { break };
             let flags = if au.keyframe {
                 (FLAG_PIC | FLAG_SOF) as u32
@@ -819,7 +823,7 @@ impl StreamState {
                     capture_ns: cap_ns,
                     epoch: self.epoch,
                     flags,
-                    frame_index: self.au_seq,
+                    frame_index: self.clock.au_seq,
                     encode_us,
                     queue_us: 0,
                     cap_us: 0,
@@ -833,7 +837,7 @@ impl StreamState {
             if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
                 break;
             }
-            self.au_seq = self.au_seq.wrapping_add(1);
+            self.clock.au_seq = self.clock.au_seq.wrapping_add(1);
             self.sent += 1;
         }
     }

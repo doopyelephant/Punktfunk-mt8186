@@ -108,7 +108,7 @@ impl StreamState {
                 8,
                 None,
                 self.client_hdr,
-                self.au_seq,
+                self.clock.au_seq,
             )?;
             Ok((new_vd, pipe))
         })();
@@ -187,7 +187,7 @@ impl StreamState {
                 None,
                 Some(resize_trace.as_ref()),
                 self.client_hdr,
-                self.au_seq,
+                self.clock.au_seq,
             ) {
                 Ok(next_pipe) => {
                     let old_display_gen = self.cur_display_gen;
@@ -222,9 +222,9 @@ impl StreamState {
         self.next = std::time::Instant::now();
         self.enc_src = (self.frame.format, self.frame.width, self.frame.height);
         self.publish_delivered_mode(new_mode);
-        self.inflight.clear();
-        self.watchdog.on_au();
-        self.last_forced_idr = Some(std::time::Instant::now());
+        self.clock.inflight.clear();
+        self.clock.watchdog.on_au();
+        self.clock.last_forced_idr = Some(std::time::Instant::now());
         resize_trace.finish("pipeline_rebuilt");
         // Reconfigured clears baselines, not the straddling window or slow start.
         announce_pipeline_gap(
@@ -280,7 +280,7 @@ impl StreamState {
                 None,
                 Some(trace.as_ref()),
                 self.client_hdr,
-                self.au_seq,
+                self.clock.au_seq,
             ) {
                 Ok(next_pipe) => {
                     let old_display_gen = self.cur_display_gen;
@@ -298,9 +298,9 @@ impl StreamState {
             }
         }
         self.enc_src = (self.frame.format, self.frame.width, self.frame.height);
-        self.inflight.clear();
-        self.watchdog.on_au();
-        self.last_forced_idr = Some(std::time::Instant::now());
+        self.clock.inflight.clear();
+        self.clock.watchdog.on_au();
+        self.clock.last_forced_idr = Some(std::time::Instant::now());
         trace.finish("pipeline_rebuilt");
         announce_pipeline_gap(&self.gap_tx, trace.total_slot().load(Ordering::Relaxed));
         Ok(())
@@ -373,7 +373,7 @@ impl StreamState {
                         enc_of,
                         self.plan,
                         self.client_hdr,
-                        self.au_seq,
+                        self.clock.au_seq,
                     ) {
                         Ok(p) => {
                             tracing::info!(
@@ -407,7 +407,7 @@ impl StreamState {
                     1,
                     None,
                     self.client_hdr,
-                    self.au_seq,
+                    self.clock.au_seq,
                 ) {
                     Ok(p) => break 'built p,
                     Err(e2) => {
@@ -436,7 +436,7 @@ impl StreamState {
         }
         self.adopt_built_bitrate(built);
         self.enc.request_keyframe();
-        self.last_forced_idr = Some(std::time::Instant::now());
+        self.clock.last_forced_idr = Some(std::time::Instant::now());
         self.next = std::time::Instant::now();
         tracing::info!(
             compositor = self.compositor.id(),
@@ -542,7 +542,7 @@ impl StreamState {
             |_, _| ed.enc_kbps(src_kbps) as u64 * 1000,
             self.bit_depth,
             self.client_hdr,
-            self.au_seq,
+            self.clock.au_seq,
         )
         .with_context(|| {
             format!(
@@ -557,10 +557,10 @@ impl StreamState {
                 e
             }
             Err(e) => {
-                let Some(backoff) = self.watchdog.spend(self.interval) else {
+                let Some(backoff) = self.clock.watchdog.spend(self.interval) else {
                     return Err(e).context("encoder reopen at the source's new mode");
                 };
-                tracing::warn!(error = %format!("{e:#}"), reset = self.watchdog.resets(),
+                tracing::warn!(error = %format!("{e:#}"), reset = self.clock.watchdog.resets(),
                     max = MAX_ENCODER_RESETS,
                     "reopening the encoder at the source's new mode failed — retrying");
                 self.next = std::time::Instant::now() + backoff;
@@ -587,9 +587,9 @@ impl StreamState {
         self.cur_mode = actual;
         self.epoch = self.epoch.wrapping_add(1);
         self.adopt_built_bitrate(src_kbps);
-        self.inflight.clear();
-        self.watchdog.on_au();
-        self.last_forced_idr = Some(std::time::Instant::now());
+        self.clock.inflight.clear();
+        self.clock.watchdog.on_au();
+        self.clock.last_forced_idr = Some(std::time::Instant::now());
         self.live_mode.store(
             pack_mode(actual.width, actual.height, actual.refresh_hz),
             Ordering::Relaxed,

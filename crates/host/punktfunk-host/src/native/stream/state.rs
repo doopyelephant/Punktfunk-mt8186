@@ -40,6 +40,18 @@ pub(super) enum Flow {
     Break,
 }
 
+/// What the wire is owed and when the encoder last answered.
+pub(super) struct AuClock {
+    /// Predicted as `au_seq + inflight.len()`. Encoder-internal counters desync on the first ABR rebuild.
+    pub(super) au_seq: u32,
+    /// A chunked AU's FIRST went out and its LAST has not: `au_seq` still names that frame.
+    pub(super) wire_frame_open: bool,
+    pub(super) inflight: Inflight,
+    pub(super) watchdog: crate::encode_recovery::EncoderWatchdog,
+    /// The last IDR the loop forced or opened on. The keyframe cooldown counts from it.
+    pub(super) last_forced_idr: Option<std::time::Instant>,
+}
+
 pub(super) struct StreamState {
     // ---- loop bookkeeping ----
     pub(super) deadline: std::time::Instant,
@@ -47,16 +59,11 @@ pub(super) struct StreamState {
     pub(super) sent: u64,
     /// Survives in-loop rebuilds: a rebuild must not reopen the overshoot.
     pub(super) pace: CaptureCredit,
-    /// Predicted as `au_seq + inflight.len()`. Encoder-internal counters desync on the first ABR rebuild.
-    pub(super) au_seq: u32,
-    /// A chunked AU's FIRST went out and its LAST has not: `au_seq` still names that frame.
-    pub(super) wire_frame_open: bool,
+    pub(super) clock: AuClock,
     pub(super) capture_rebuilds: u32,
     /// Topology re-assert generation this loop last saw. Only Windows IDD-push moves it.
     pub(super) seen_reassert_gen: u64,
-    pub(super) watchdog: crate::encode_recovery::EncoderWatchdog,
     pub(super) last_hdr_meta: Option<pf_frame::HdrMeta>,
-    pub(super) inflight: Inflight,
     /// NEW source frames / REPEATS / cursor REGENS since `diag_at`. Logged every 2 s under `PUNKTFUNK_PERF`.
     pub(super) diag_new: u64,
     pub(super) diag_repeat: u64,
@@ -71,7 +78,6 @@ pub(super) struct StreamState {
     /// Each host-composite outcome is logged once.
     #[cfg_attr(windows, allow(dead_code, reason = "Windows never composites"))]
     pub(super) composite_log: super::cursor::CompositeLog,
-    pub(super) last_forced_idr: Option<std::time::Instant>,
     /// Never re-anchors the IDR cooldown: sustained loss + RFI would swallow IDR pleas forever.
     pub(super) last_rfi: Option<std::time::Instant>,
     pub(super) loss_mode: super::recovery::LossMode,
@@ -287,19 +293,19 @@ impl StreamState {
             self.lease = p.lease;
             self.restamp = p.panel_tick_ns.map(super::encode::SourceStamps::new);
         }
-        self.inflight.clear();
-        self.watchdog.on_au();
+        self.clock.inflight.clear();
+        self.clock.watchdog.on_au();
     }
 
     /// Close a frame whose tail never came, as the loop does at the next first chunk, before a
     /// replacement encoder opens at `au_seq`. Left to the loop, that close would land after the
     /// new encoder numbered its first AU, one behind the wire for the rest of the session.
     pub(super) fn close_open_frame(&mut self) {
-        if std::mem::take(&mut self.wire_frame_open) {
-            if self.inflight.len() > 1 {
-                self.inflight.pop_front();
+        if std::mem::take(&mut self.clock.wire_frame_open) {
+            if self.clock.inflight.len() > 1 {
+                self.clock.inflight.pop_front();
             }
-            self.au_seq = self.au_seq.wrapping_add(1);
+            self.clock.au_seq = self.clock.au_seq.wrapping_add(1);
         }
     }
 
@@ -838,13 +844,17 @@ impl StreamState {
             next: now,
             sent: 0,
             pace: CaptureCredit::new(now),
-            au_seq: 0,
-            wire_frame_open: false,
+            clock: AuClock {
+                au_seq: 0,
+                wire_frame_open: false,
+                inflight: Inflight::new(),
+                watchdog: crate::encode_recovery::EncoderWatchdog::new(),
+                // The pipeline opened on an IDR: the cold-GOP keyframe asks coalesce into it.
+                last_forced_idr: Some(now),
+            },
             capture_rebuilds: 0,
             seen_reassert_gen: crate::windows::idd::topology_reassert_gen(),
-            watchdog: crate::encode_recovery::EncoderWatchdog::new(),
             last_hdr_meta: None,
-            inflight: Inflight::new(),
             diag_new: 0,
             diag_repeat: 0,
             diag_regen: 0,
@@ -856,8 +866,6 @@ impl StreamState {
             #[cfg(target_os = "linux")]
             next_park_at: now,
             composite_log: super::cursor::CompositeLog::default(),
-            // Pipeline opened on an IDR — start the clock so the cold-GOP keyframe storm coalesces.
-            last_forced_idr: Some(now),
             last_rfi: None,
             loss_mode: Default::default(),
             acked,
