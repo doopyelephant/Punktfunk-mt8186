@@ -198,14 +198,14 @@ enum AdapterCycle {
 /// `pnputil /restart-device` reloads a device in use. Failure paths re-enable so a half cycle
 /// cannot leave the adapter disabled. Best-effort, ~6 s inside the script.
 fn reload_vdisplay_adapter() -> AdapterCycle {
-    // `$pin` (prepended below) is the devnode this process last opened: a seats box has several
-    // same-named adapters, and the name match — only when nothing was ever opened — would cycle
-    // a sibling's live one. Live nodes first: `-First 1` can pick a phantom whose disable and
-    // restart both fail. `-ErrorAction Stop` inside `try`, since PnP Status reads `OK` after a
-    // refused disable. `$LASTEXITCODE=1` before pnputil so "never ran" ≠ 0 (3010 = needs reboot).
+    // `$pin` is the devnode this process last opened. Without one, a seat host (`$seat`) takes
+    // only its own session's node, and only while ours drives it; the name match is the console
+    // host's alone, since it would cycle the console's adapter from a seat. Live nodes first.
+    // `-ErrorAction Stop` inside `try`: Status reads `OK` after a refused disable. 3010 = reboot.
     const CYCLE_PS: &str = "$ErrorActionPreference='SilentlyContinue'; \
         $all = @(); if ($pin) { $all = @(Get-PnpDevice -InstanceId $pin | Where-Object { $_ }) }; \
-        if ($all.Count -eq 0) { $all = @(Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' }) }; \
+        if ($all.Count -eq 0 -and $seat) { $all = @(Get-PnpDevice -Class Display | Where-Object { $_.InstanceId -like ('SWD\\REMOTEDISPLAYENUM\\*' + $seat) -and $_.FriendlyName -match 'punktfunk Virtual Display' }) } \
+        elseif ($all.Count -eq 0) { $all = @(Get-PnpDevice -Class Display | Where-Object { $_.FriendlyName -match 'punktfunk Virtual Display' }) }; \
         if ($all.Count -eq 0) { Write-Output 'ABSENT'; exit }; \
         $live = @($all | Where-Object { $_.Present -or $_.Status -ne 'Unknown' } | Sort-Object { $_.Status -ne 'OK' }); \
         if ($live.Count -eq 0) { Write-Output ('REFUSED only phantom (not-present) adapter devnodes remain (' + $all.Count + ') - the device node itself is gone and no reload can revive it; reinstalling the host re-creates it'); exit }; \
@@ -230,7 +230,13 @@ fn reload_vdisplay_adapter() -> AdapterCycle {
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_default();
-    let script = format!("$pin='{}'; {CYCLE_PS}", pin.replace('\'', "''"));
+    let seat = seat_session()
+        .map(|own| format!("&SESSIONID_{own:04}"))
+        .unwrap_or_default();
+    let script = format!(
+        "$pin='{}'; $seat='{seat}'; {CYCLE_PS}",
+        pin.replace('\'', "''")
+    );
     // Bounded: this holds the RECOVERY mutex, so a wedged Disable-PnpDevice would stall the whole
     // recovery ladder. The script's own sleeps total ~6-8 s on the happy path.
     let mut cmd = std::process::Command::new(&ps);
@@ -556,6 +562,13 @@ fn instance_id_from_path(path: &str) -> Option<String> {
     Some(id.replace('#', "\\"))
 }
 
+/// This process's Windows session when it is a seat host, else `None`.
+fn seat_session() -> Option<u32> {
+    super::identity::is_seat_session_marker(std::env::var_os("PUNKTFUNK_SEAT_SESSION").as_deref())
+        .then(pf_win_display::own_session_id)
+        .flatten()
+}
+
 /// Whether this process drives the devnode `instance_id`. The remoting stack makes one seat
 /// devnode per RDP session (`SWD\REMOTEDISPLAYENUM\…&SESSIONID_0012`). A seat host drives only
 /// its own session's; any other host drives none of them.
@@ -596,11 +609,7 @@ fn probe_sync() -> Probe {
         }
     };
 
-    let seat_session = super::identity::is_seat_session_marker(
-        std::env::var_os("PUNKTFUNK_SEAT_SESSION").as_deref(),
-    )
-    .then(pf_win_display::own_session_id)
-    .flatten();
+    let seat_session = seat_session();
     // Every instance, not index 0: after an upgrade a Code-10 node can sit at 0 while the live
     // interface is later. The first `SPINT_ACTIVE` interface this process drives and opens wins.
     for index in 0..64u32 {
