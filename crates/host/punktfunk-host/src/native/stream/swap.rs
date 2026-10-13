@@ -97,10 +97,11 @@ impl StreamState {
         }
         // A ceiling was learned from the encoder this one replaces. It survives a swap that
         // opens on the same source.
-        let source_moved = match &next {
-            Next::Pipeline(p) => enc_src_of(&p.frame) != enc_src_of(&self.frame),
-            Next::Encoder { .. } => false,
+        let opens_on = match &next {
+            Next::Pipeline(p) => Some(&p.frame),
+            Next::Encoder { resized, .. } => resized.as_ref().map(|(frame, _)| frame),
         };
+        let source_moved = opens_on.is_some_and(|f| enc_src_of(f) != enc_src_of(&self.frame));
         if source_moved || why.new_geometry() {
             self.encoder_ceiling
                 .lock()
@@ -574,6 +575,17 @@ mod tests {
             source_moved_first: false,
             epoch_moved: true,
             ceiling_cleared: false,
+            retarget_forgotten: true,
+            enc_src_reread: true,
+            retired: None,
+        },
+        Row {
+            site: "topology re-assert in place, onto another frame",
+            why: SwapReason::TopologyReassert,
+            next: || encoder(Some(WIDE)),
+            source_moved_first: false,
+            epoch_moved: true,
+            ceiling_cleared: true,
             retarget_forgotten: true,
             enc_src_reread: true,
             retired: None,
