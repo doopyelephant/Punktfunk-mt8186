@@ -7,7 +7,7 @@ use super::*;
 /// A source exists when the host has a provisioned endpoint, or in a seat, when the session came
 /// in through the seat listener.
 pub(super) fn host_cap(asked: bool) -> bool {
-    if pf_paths::seat::is_seat_host() {
+    if pf_paths::seat::role().is_seat_host() {
         return asked
             && pf_host_config::row_bool("PUNKTFUNK_PAD_AUDIO")
             && crate::audio::seat_pad::available();
@@ -39,7 +39,7 @@ pub(in crate::native) fn spawn(
     if kinds & (KIND_BIT_HAPTICS | KIND_BIT_SPEAKER) == 0 {
         return None;
     }
-    if pf_paths::seat::is_seat_host() {
+    if pf_paths::seat::role().is_seat_host() {
         return spawn_seat(conn, pad, slot, kinds, stop);
     }
     let Some(ep) = crate::audio::pad_endpoint::endpoint_for(slot) else {

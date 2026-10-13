@@ -232,7 +232,7 @@ pub fn serve(
     #[cfg(target_os = "linux")]
     {
         // The door keeps no seat homes of its own: they are the owner's host's, and move there.
-        if pf_paths::seat::trust_dir().is_none() && !pf_paths::seat::is_door() {
+        if pf_paths::seat::trust_dir().is_none() && !pf_paths::seat::role().is_door() {
             let paired: Vec<(String, String)> = np
                 .list()
                 .into_iter()
@@ -244,8 +244,8 @@ pub fn serve(
     // A seat host is pairing-required whatever its flags say, and never advertises: clients reach
     // it through the box's `Redirect`, so only the box shows up as a host.
     let native = crate::native::NativeServe {
-        require_pairing: native.require_pairing || pf_paths::seat::is_seat_host(),
-        mdns: native.mdns && !pf_paths::seat::is_seat_host(),
+        require_pairing: native.require_pairing || pf_paths::seat::role().is_seat_host(),
+        mdns: native.mdns && !pf_paths::seat::role().is_seat_host(),
         ..native
     };
     let profiles = Arc::new(profiles);
@@ -258,7 +258,7 @@ pub fn serve(
         native_port = native.port,
         require_pairing = native.require_pairing,
         gamestream,
-        door = pf_paths::seat::is_door(),
+        door = pf_paths::seat::role().is_door(),
         "punktfunk host"
     );
     crate::net_health::log_addresses();
@@ -266,7 +266,7 @@ pub fn serve(
     // The door keeps the seats of recent players up and lets idle ones go, as the Windows service
     // does for its own.
     #[cfg(target_os = "linux")]
-    if pf_paths::seat::is_door() {
+    if pf_paths::seat::role().is_door() {
         crate::seats::lifecycle::run_door();
     }
     // Scan once (cached for `/local/summary`). Warn only when a clash is active;

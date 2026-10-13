@@ -7,6 +7,7 @@
 //! never undone. A seat or door host has no tray and leaves the entry alone.
 
 use pf_host_config::Source;
+use pf_paths::seat::HostRole;
 
 const ID: &str = "tray_autostart";
 const RECORD: &str = "tray-autostart";
@@ -63,11 +64,19 @@ pub fn apply() {
 
 /// The setting and where it came from, or `None` on a host that owns no entry.
 fn wanted() -> Option<(bool, Source)> {
-    if pf_paths::seat::is_seat_host() || pf_paths::seat::is_door() || !platform::installed() {
+    if !owns_entry(pf_paths::seat::role()) || !platform::installed() {
         return None;
     }
     let row = pf_host_config::snapshot().get(ID)?;
     Some((row.value.as_bool().unwrap_or(true), row.source))
+}
+
+/// The tray is the console host's. A seat or door host has none and leaves the entry alone.
+fn owns_entry(role: HostRole) -> bool {
+    match role {
+        HostRole::Plain => true,
+        HostRole::Door | HostRole::Seat(_) => false,
+    }
 }
 
 /// A failed write records nothing, so the next start tries again.
@@ -152,6 +161,14 @@ mod tests {
     use super::*;
     use Action::{Adopt, Keep, Write};
     use Source::{Default, Env, Store};
+
+    #[test]
+    fn a_seat_or_door_host_owns_no_entry() {
+        for role in HostRole::ALL {
+            let marked = role.is_seat_host() || role.is_door();
+            assert_eq!(owns_entry(role), !marked, "{role:?}");
+        }
+    }
 
     #[test]
     fn the_start_rule() {

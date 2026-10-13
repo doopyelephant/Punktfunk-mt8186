@@ -53,7 +53,7 @@ pub fn load_or_adopt(np: &crate::native_pairing::NativePairing) -> Result<Native
         }
     }
     // A seat's pairings are the box's, and no client pinned the seat before it had a key.
-    if !np.list().is_empty() && !pf_paths::seat::is_seat_host() {
+    if !np.list().is_empty() && !pf_paths::seat::role().is_seat_host() {
         tracing::warn!(
             "native identity minted while native clients are paired — \
              those that pinned the legacy RSA cert must re-pair"

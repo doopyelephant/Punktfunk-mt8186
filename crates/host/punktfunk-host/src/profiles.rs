@@ -357,7 +357,7 @@ impl Profiles {
                 read_only: true,
             }),
             seat,
-            owner_host: pf_paths::seat::is_owner_seat(),
+            owner_host: pf_paths::seat::role().is_owner_seat(),
         }
     }
 

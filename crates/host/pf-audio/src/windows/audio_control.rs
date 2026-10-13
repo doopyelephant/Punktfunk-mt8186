@@ -149,7 +149,7 @@ pub fn parked_previous_render() -> Option<String> {
 pub fn keep_default_devices() -> bool {
     pf_host_config::config().audio_output_mode.keeps_default()
         || crate::capture_policy::session_keeps_default()
-        || pf_paths::seat::is_seat_host()
+        || pf_paths::seat::role().is_seat_host()
 }
 
 /// One wiring pass: assignment, fingerprint of the same enumeration the plan consumed

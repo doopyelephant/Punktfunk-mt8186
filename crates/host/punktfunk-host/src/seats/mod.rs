@@ -130,7 +130,7 @@ pub(crate) fn row_in<'a>(
 
 /// Whether this host is the door.
 pub(crate) fn is_door() -> bool {
-    pf_paths::seat::is_door()
+    pf_paths::seat::role().is_door()
 }
 
 /// How long a snapshot answers for the box: a picker polls every 2 s.

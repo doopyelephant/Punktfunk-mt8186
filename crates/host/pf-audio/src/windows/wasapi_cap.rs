@@ -626,7 +626,7 @@ struct OpenPlan {
 /// without one tries the Steam pair, once per INF state, and re-plans.
 fn prepare_plan(mode: TargetMode) -> OpenPlan {
     let keep_default = audio_control::keep_default_devices();
-    let seat = pf_paths::seat::is_seat_host();
+    let seat = pf_paths::seat::role().is_seat_host();
     let (bind_plan, assert_plan) = binding(mode, keep_default, seat);
     let mut wired = audio_control::wire_now_full(assert_plan);
     if assert_plan && !audio_control::host_audio_requested() {
