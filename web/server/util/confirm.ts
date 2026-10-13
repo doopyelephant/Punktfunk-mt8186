@@ -3,9 +3,9 @@
 // The console's session cookie lives for 7 days, so on its own it must not be able to run new code
 // on the host, end the machine, move its identity, or admit a device (a paired device injects
 // input, so pairing IS code execution). Each such route re-verifies the password HERE (only the
-// BFF knows it), strips it, and never forwards it. The routes that import this module or
-// util/libraryConfirm.ts are the list; `seatProxy.test.ts` asserts each one is gated through a
-// seat too, or refused by the seat's host.
+// BFF knows it), strips it, and never forwards it. `GATES` in util/gates.ts is the list;
+// gates.test.ts asserts it names every route that imports this module or util/libraryConfirm.ts,
+// each gated through a seat too or refused by the seat's host.
 //
 // A catalog install from an already-trusted source is deliberately NOT gated: the operator made
 // that trust decision when they added the source, and re-prompting on every install would train

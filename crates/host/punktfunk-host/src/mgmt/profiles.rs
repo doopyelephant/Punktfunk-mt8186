@@ -1401,6 +1401,33 @@ mod tests {
         }
     }
 
+    /// The console asks for its password on some calls and relays the rest with the admin
+    /// bearer. A gated row with no seat handler in its table must be a path this proxy refuses.
+    #[test]
+    fn a_call_the_console_gates_only_on_the_box_never_passes_the_seat_proxy() {
+        let table = include_str!("../../../../../web/server/util/gates.ts");
+        let rows: Vec<Vec<&str>> = table
+            .split("gated(")
+            .skip(1)
+            .filter_map(|row| row.split_once(')'))
+            .map(|(args, _)| {
+                args.split(',')
+                    .map(|a| a.trim().trim_matches('"'))
+                    .filter(|a| !a.is_empty())
+                    .collect()
+            })
+            .collect();
+        let box_only: Vec<&str> = rows
+            .iter()
+            .filter(|args| args.len() == 2)
+            .map(|args| args[1])
+            .collect();
+        assert!(rows.len() > box_only.len() && !box_only.is_empty());
+        for pattern in box_only {
+            assert!(proxy_refuses(pattern), "{pattern}");
+        }
+    }
+
     #[test]
     fn a_windows_seat_reads_its_ledger_row() {
         let ready = seated(&snap(true, RuntimeState::Running, false), ID);

@@ -139,11 +139,11 @@ pub(super) fn disable() -> Result<()> {
     Ok(())
 }
 
-/// Shown while systemd keeps restarting a runner that dies at start — "switched off" would send
-/// the operator to a switch that is already on.
+/// Shown while systemd restarts a runner that dies at start, and once it has stopped for good
+/// on a box with no sandbox. "Switched off" would send the operator to a switch that is on.
 #[cfg(target_os = "linux")]
 const RUNNER_FAILING: &str =
-    "The plugin runner keeps failing to start. Troubleshooting → Plugins shows why.";
+    "The plugin runner isn't running. Troubleshooting → Plugins shows why.";
 
 #[cfg(target_os = "linux")]
 pub(super) fn runtime_status() -> RuntimeStatus {

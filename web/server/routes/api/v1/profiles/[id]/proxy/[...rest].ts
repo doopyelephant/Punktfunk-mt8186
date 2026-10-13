@@ -6,30 +6,14 @@
 // the seat's path (`event.context.seat`, read by `forwardJson`). Everything else relays as the
 // catch-all does. Both read the path as `seatCall` resolved it.
 import { createError, defineEventHandler, getRequestURL } from "h3";
+import { seatGate } from "../../../../../../util/gates";
 import { relayToMgmt } from "../../../../../../util/mgmt";
 import {
 	encodeRest,
-	type GatedRoute,
-	gatedRoute,
 	isUiCredential,
 	seatCall,
 	seatPath,
 } from "../../../../../../util/seatProxy";
-import hooksPut from "../../../hooks.put";
-import customPut from "../../../library/custom/[id].put";
-import customPost from "../../../library/custom.post";
-import providerPut from "../../../library/provider/[provider].put";
-import installPost from "../../../store/install.post";
-import sourcesPut from "../../../store/sources/[name].put";
-
-const GATES: Record<GatedRoute["route"], typeof hooksPut> = {
-	"hooks.put": hooksPut,
-	"store/install.post": installPost,
-	"store/sources/[name].put": sourcesPut,
-	"library/custom.post": customPost,
-	"library/custom/[id].put": customPut,
-	"library/provider/[provider].put": providerPut,
-};
 
 export default defineEventHandler((event) => {
 	const { pathname, search } = getRequestURL(event);
@@ -45,10 +29,10 @@ export default defineEventHandler((event) => {
 		});
 	}
 	event.context.seat = call.id;
-	const gate = gatedRoute(event.method, call.rest);
+	const gate = seatGate(event.method, call.rest);
 	if (gate) {
 		event.context.params = { ...event.context.params, ...gate.params };
-		return GATES[gate.route](event);
+		return gate.handler(event);
 	}
 	return relayToMgmt(
 		event,

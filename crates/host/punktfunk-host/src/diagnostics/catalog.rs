@@ -63,12 +63,49 @@ pub(crate) fn restart_pending() -> HostCheck {
     .with_param("settings", names.join(", "))
 }
 
-/// Plugins run in their own sandbox, or they do not run: a box that cannot build one says so
+/// The runner's own refusal, unless it runs again since. Its probe runs inside its unit, which
+/// can refuse what this process may do, so the file it leaves is the only way to hear of it.
+#[cfg(any(target_os = "linux", windows))]
+fn runner_refusal(status: &crate::plugins::RuntimeStatus) -> Option<String> {
+    if status.running {
+        return None;
+    }
+    crate::plugins::sandbox_refusal()
+}
+
+/// The runner stopped rather than run a plugin unsandboxed. `why` is its reason, `start` the
+/// command that starts it again on this platform.
+#[cfg(any(target_os = "linux", windows))]
+fn runner_stopped(id: &str, why: &str, start: &str) -> HostCheck {
+    let cause = if why.is_empty() {
+        String::new()
+    } else {
+        format!(": {why}")
+    };
+    HostCheck::problem(
+        id,
+        CheckStatus::Fail,
+        Severity::Critical,
+        "The plugin runner has stopped",
+        format!(
+            "It couldn't build a plugin sandbox when it started, so no plugin runs and the game \
+             library stays empty{cause}"
+        ),
+    )
+    .with_remedy(Remedy {
+        text: "Repair what it names, then start the plugin runner again.".into(),
+        command: Some(start.into()),
+        relogin_required: false,
+    })
+}
+
+/// Plugins run in their own sandbox, or the runner stops: a box that cannot build one says so
 /// here rather than quietly running third-party code with the operator's whole account.
 #[cfg(target_os = "linux")]
 fn plugin_sandbox() -> HostCheck {
     let id = ids::PLUGIN_SANDBOX;
-    if !crate::plugins::runtime_status().installed {
+    let status = crate::plugins::runtime_status();
+    if !status.installed {
         return HostCheck::inapplicable(id, "The plugin runner is not installed on this host.");
     }
     if crate::plugins::runner_sandbox_off() {
@@ -88,16 +125,23 @@ fn plugin_sandbox() -> HostCheck {
             relogin_required: false,
         });
     }
+    let start = "systemctl --user restart punktfunk-scripting";
     let (reason, fix) = match bwrap_probe() {
-        Ok(()) => return HostCheck::ok(id, "Each plugin runs in its own sandbox."),
+        Ok(()) => {
+            return match runner_refusal(&status) {
+                Some(why) => runner_stopped(id, &why, start),
+                None => HostCheck::ok(id, "Each plugin runs in its own sandbox."),
+            }
+        }
         Err(None) => (
             "bubblewrap (bwrap) is not installed".to_string(),
-            "Install bubblewrap (bwrap) with your package manager, then restart the plugin runner.",
+            "Install bubblewrap (bwrap) with your package manager, then start the plugin runner \
+             again.",
         ),
         Err(Some(why)) => (
             format!("bubblewrap refused the sandbox — {why}"),
-            "Allow unprivileged user namespaces and use bubblewrap 0.8 or newer, then restart \
-             the plugin runner.",
+            "Allow unprivileged user namespaces and use bubblewrap 0.8 or newer, then start the \
+             plugin runner again.",
         ),
     };
     HostCheck::problem(
@@ -105,11 +149,14 @@ fn plugin_sandbox() -> HostCheck {
         CheckStatus::Fail,
         Severity::Critical,
         "Plugins can't be sandboxed here",
-        format!("No plugin will start, so the game library stays empty: {reason}"),
+        format!(
+            "The plugin runner stops instead of running a plugin unsandboxed, so the game \
+             library stays empty: {reason}"
+        ),
     )
     .with_remedy(Remedy {
         text: fix.into(),
-        command: Some("systemctl --user restart punktfunk-scripting".into()),
+        command: Some(start.into()),
         relogin_required: false,
     })
 }
@@ -219,11 +266,13 @@ fn bwrap_probe() -> Result<(), Option<String>> {
     }))
 }
 
-/// Each Windows plugin runs in its own AppContainer, unless `host.env` turned that off.
+/// Each Windows plugin runs in its own AppContainer, unless `host.env` turned that off. A runner
+/// that can't build one stops, and its task ends cleanly: only the file it leaves says so.
 #[cfg(windows)]
 fn plugin_sandbox() -> HostCheck {
     let id = ids::PLUGIN_SANDBOX;
-    if !crate::plugins::runtime_status().installed {
+    let status = crate::plugins::runtime_status();
+    if !status.installed {
         return HostCheck::inapplicable(id, "The plugin runner is not installed on this host.");
     }
     if crate::plugins::runner_sandbox_off() {
@@ -242,7 +291,10 @@ fn plugin_sandbox() -> HostCheck {
             relogin_required: false,
         });
     }
-    HostCheck::ok(id, "Each plugin runs in its own AppContainer.")
+    match runner_refusal(&status) {
+        Some(why) => runner_stopped(id, &why, "Start-ScheduledTask -TaskName PunktfunkScripting"),
+        None => HostCheck::ok(id, "Each plugin runs in its own AppContainer."),
+    }
 }
 
 /// macOS has no plugin runner.

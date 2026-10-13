@@ -836,6 +836,9 @@ in
           ExecStartPre = "+${pkgs.coreutils}/bin/mkdir -p -m 0700 %h/.config/punktfunk/plugin-run %h/.config/punktfunk/plugin-state";
           Restart = "on-failure";
           RestartSec = 2;
+          # The runner's status for refusing to run a plugin without a sandbox (SANDBOX_REFUSED_EXIT,
+          # sdk/src/runner.ts). A restart would probe the same box again: the unit stays failed.
+          RestartPreventExitStatus = 78;
           # Deliver SIGTERM to the runner (it orchestrates the structural shutdown of its unit
           # fibers) and give it room to run their finalizers before the cgroup is reaped.
           KillMode = "mixed";

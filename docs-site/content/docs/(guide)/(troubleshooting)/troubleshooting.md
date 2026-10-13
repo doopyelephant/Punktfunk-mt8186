@@ -14,6 +14,7 @@ its **Health checks** catch most setup problems and give the command that fixes 
 - [pacman: database already registered](/docs/troubleshooting-startup#pacman-error-could-not-register-punktfunk-database-database-already-registered)
 - [The desktop won't start, or "GPU … not supported by EGL"](/docs/troubleshooting-startup#the-desktop-wont-start-or-gpu--not-supported-by-egl)
 - [The session fails right after editing host.env](/docs/troubleshooting-startup#the-session-fails-right-after-editing-hostenv)
+- [The game library is empty and the plugin runner has stopped](/docs/plugins#plugins-cant-be-sandboxed-here)
 - [Windows: the host or the web console won't start](/docs/troubleshooting-startup#windows-the-host-or-the-web-console-wont-start)
 - [Windows: the status icon is missing after an update](/docs/troubleshooting-startup#windows-the-status-icon-is-missing-after-an-update)
 

@@ -1632,23 +1632,76 @@ mod tests {
         )
     }
 
+    /// The file at `rel`, under this crate, holds `fresh`. `UPDATE_VECTORS=1` rewrites it first.
+    #[cfg(unix)]
+    fn assert_checked_in(rel: &str, fresh: &str) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        if std::env::var_os("UPDATE_VECTORS").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, fresh).unwrap();
+        }
+        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            on_disk == fresh,
+            "{} is stale: rerun with UPDATE_VECTORS=1",
+            path.display()
+        );
+    }
+
     /// The `/proc`, `/sys`, `/dev` and `/run` rules are Unix-only, so the file is too.
     #[cfg(unix)]
     #[test]
     fn path_refusal_vectors_are_checked_in() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/testdata/path-refusal-vectors.json"
+        assert_checked_in(
+            "testdata/path-refusal-vectors.json",
+            &path_refusal_vectors(),
         );
-        let fresh = path_refusal_vectors();
-        if std::env::var_os("UPDATE_VECTORS").is_some() {
-            std::fs::create_dir_all(Path::new(path).parent().unwrap()).unwrap();
-            std::fs::write(path, &fresh).unwrap();
-        }
-        let on_disk = std::fs::read_to_string(path).unwrap_or_default();
-        assert!(
-            on_disk == fresh,
-            "{path} is stale: rerun with UPDATE_VECTORS=1"
+    }
+
+    /// The grants file as the store's own writer leaves it: one plugin with every kind of row,
+    /// one with no grant.
+    #[cfg(unix)]
+    fn grants_file_sample() -> String {
+        let f = fixture();
+        let s = f.store();
+        let grant = |path: &str, write: bool, by: &str, forms: &[&str]| Grant {
+            path: path.into(),
+            write,
+            at: if by == "legacy" {
+                String::new()
+            } else {
+                "2026-01-01T00:00:00Z".into()
+            },
+            by: by.into(),
+            forms: forms.iter().map(|form| (*form).to_string()).collect(),
+        };
+        let demo = PluginAccess {
+            grants: vec![
+                grant("/mnt/roms", false, "console", &[]),
+                grant("/mnt/saves", true, BY_FORM, &["config", "game:steam:440"]),
+                grant("/mnt/old", false, "legacy", &[]),
+            ],
+            denied: vec!["/mnt/private".into()],
+            links: BTreeMap::from([("/home/u/Games".into(), "/mnt/roms/games".into())]),
+        };
+        let quiet = PluginAccess {
+            denied: vec!["/mnt/private".into()],
+            ..Default::default()
+        };
+        let map = BTreeMap::from([("demo".to_string(), demo), ("quiet".to_string(), quiet)]);
+        s.write_access(&map).unwrap();
+        std::fs::read_to_string(s.runner_dir.join(GRANTS_FILE)).unwrap()
+    }
+
+    /// The runner's `grantedRoots` parses this file strictly and grants nothing on a row it
+    /// can't read. The SDK's tests replay the checked-in copy.
+    #[cfg(unix)]
+    #[test]
+    fn the_grants_file_the_runner_reads_is_checked_in() {
+        let dir = crate::plugins::RUNNER_DATA_DIR;
+        assert_checked_in(
+            &format!("../../../sdk/test/host-config/{dir}/{GRANTS_FILE}"),
+            &grants_file_sample(),
         );
     }
 
