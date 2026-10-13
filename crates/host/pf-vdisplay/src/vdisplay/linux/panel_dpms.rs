@@ -254,7 +254,8 @@ impl Session {
     }
 
     fn connect() -> Result<Session, OpenFailure> {
-        let conn = Connection::connect_to_env().map_err(|e| OpenFailure::Connect(e.to_string()))?;
+        let conn =
+            crate::session::wayland_connect().map_err(|e| OpenFailure::Connect(e.to_string()))?;
         let queue = conn.new_event_queue();
         let qh = queue.handle();
         let _registry = conn.display().get_registry(&qh, ());

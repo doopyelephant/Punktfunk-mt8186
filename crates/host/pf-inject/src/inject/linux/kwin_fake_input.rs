@@ -265,8 +265,12 @@ const GEO_REFRESH: Duration = Duration::from_millis(500);
 
 impl KwinFakeInjector {
     pub fn open() -> Result<Self> {
-        let conn = Connection::connect_to_env()
-            .context("connect to KWin Wayland (is WAYLAND_DISPLAY set to the KWin socket?)")?;
+        let conn = match pf_host_config::session::wayland_stream() {
+            Some(Ok(stream)) => Connection::from_socket(stream),
+            Some(Err(_)) => Err(wayland_client::ConnectError::NoCompositor),
+            None => Connection::connect_to_env(),
+        }
+        .context("connect to KWin Wayland")?;
         let mut queue = conn.new_event_queue();
         let qh = queue.handle();
         let _registry = conn.display().get_registry(&qh, ());

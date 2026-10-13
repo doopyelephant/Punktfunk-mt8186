@@ -706,6 +706,8 @@ fn run_hook_process(
         // Own process group so timeout can kill the whole tree the shell spawned.
         .process_group(0);
     c.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    // A hook may open a window: it gets the live session's Wayland socket.
+    pf_host_config::session::export_to(&mut c);
     let mut child = match c.spawn() {
         Ok(ch) => ch,
         Err(e) => {
