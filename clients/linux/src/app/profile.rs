@@ -236,6 +236,9 @@ impl AppModel {
         redial: bool,
         sender: &ComponentSender<Self>,
     ) {
+        if self.busy {
+            return;
+        }
         let detail = row.seat.as_ref().and_then(|s| s.detail.as_deref());
         let dialog = adw::AlertDialog::new(
             Some(&profiles::waking_line(&row.display_name)),
