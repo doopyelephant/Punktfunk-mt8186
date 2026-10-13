@@ -38,7 +38,7 @@ sessions as they are.
 
 ### After a device disconnects [#keep-alive]
 
-- **Remove its screen**.
+- **Remove its screen**. A host does this until you choose otherwise.
 - **Keep for** a number of seconds (up to 24 hours). A reconnect inside the window drops straight
   back in.
 - **Keep until released**. The screen stays until you click **Release** on it in **Displays**, or
