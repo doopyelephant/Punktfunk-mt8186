@@ -169,7 +169,7 @@ fi
 cat > "$tmp/gate_c_baseline" <<'BASELINE'
 clients/linux/src/app/mod.rs:1
 clients/linux/src/app/spawn.rs:1
-clients/session/src/main.rs:4
+clients/session/src/main.rs:3
 crates/client/pf-console-ui/src/screens/settings/tests.rs:1
 crates/host/pf-encode-win/src/windows/nvenc_tests.rs:4
 crates/host/pf-encode/src/enc/linux/nvenc_cuda_tests.rs:2
