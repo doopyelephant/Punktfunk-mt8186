@@ -174,16 +174,16 @@ pub fn validate_seat_id(raw: &str) -> Result<&str, &'static str> {
 
 const SEAT_ID_LEN: usize = 32;
 
-/// This process's validated seat id, or `None` for the console host.
-/// The error is a rejected id, which callers surface rather than ignore.
+/// This process's validated seat id, or `None` on a host that is no seat's: the id belongs to
+/// the seat marker and is not read without it. The error is a missing or rejected id, which
+/// callers surface rather than ignore.
 pub fn seat_id() -> Result<Option<String>, &'static str> {
-    let Some(raw) = std::env::var_os("PUNKTFUNK_SEAT_ID") else {
-        // A seat without an id would mint audio devnodes the console host also matches.
-        if role().is_seat_host() {
-            return Err("PUNKTFUNK_SEAT_SESSION=1 without a PUNKTFUNK_SEAT_ID");
-        }
+    if !role().is_seat_host() {
         return Ok(None);
-    };
+    }
+    // A seat without an id would mint audio devnodes the console host also matches.
+    let raw = std::env::var_os("PUNKTFUNK_SEAT_ID")
+        .ok_or("PUNKTFUNK_SEAT_SESSION=1 without a PUNKTFUNK_SEAT_ID")?;
     let text = raw
         .to_str()
         .ok_or("PUNKTFUNK_SEAT_ID must be valid Unicode")?;
@@ -335,19 +335,36 @@ mod tests {
         });
     }
 
-    /// Bit 0 of `combination` is the flag; the rest is a base-3 digit per variable.
-    fn check(combination: usize) {
-        let flag = combination % 2 == 1;
-        let test = format!(
-            "{}::every_predicate_answers_its_truth_table_row",
-            module_path!().split_once("::").expect("crate::module").1
-        );
+    /// This test binary run again as `test` alone, with no seat-contract variable set.
+    fn child(test: &str) -> std::process::Command {
+        let module = module_path!().split_once("::").expect("crate::module").1;
         let mut child =
             std::process::Command::new(std::env::current_exe().expect("this test binary"));
         child
-            .args(["--exact", &test, "--nocapture"])
-            .env(CHILD, if flag { "flag" } else { "none" })
+            .args(["--exact", &format!("{module}::{test}"), "--nocapture"])
+            .env(CHILD, "none")
             .env_remove("PUNKTFUNK_SEAT_ID");
+        for (name, ..) in VARS {
+            child.env_remove(name);
+        }
+        child
+    }
+
+    /// What a child printed after each [`MARK`], to the end of that line.
+    fn printed(child: &mut std::process::Command) -> Vec<String> {
+        let out = child.output().expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let answers = stdout.split(MARK).skip(1);
+        answers
+            .map(|rest| rest.lines().next().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    /// Bit 0 of `combination` is the flag; the rest is a base-3 digit per variable.
+    fn check(combination: usize) {
+        let flag = combination % 2 == 1;
+        let mut child = child("every_predicate_answers_its_truth_table_row");
+        child.env(CHILD, if flag { "flag" } else { "none" });
         let mut digits = combination / 2;
         let mut set = [false; 5];
         for (at, (name, on, near_miss)) in VARS.iter().enumerate() {
@@ -370,19 +387,49 @@ mod tests {
             let row = TRUTH.iter().find(|(row, _)| *row == inputs);
             row.map(|(_, answers)| *answers)
         };
-        let out = child.output().expect("run the child");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let got: Vec<_> = stdout
-            .split(MARK)
-            .skip(1)
-            .map(|rest| rest.get(..7))
-            .collect();
         // Only `resolve` knows the flag.
+        let rows: Vec<&str> = [row(false), row(flag)].into_iter().flatten().collect();
         assert_eq!(
-            got,
-            [row(false), row(flag)],
+            printed(&mut child),
+            rows,
             "combination {combination}, markers {set:?}"
         );
+    }
+
+    /// Without the seat marker the id is not read at all. With it, a missing or malformed one
+    /// is an error.
+    #[test]
+    fn a_seat_id_counts_only_with_the_seat_marker() {
+        if std::env::var_os(CHILD).is_some() {
+            let answer = match seat_id() {
+                Ok(None) => "none",
+                Ok(Some(_)) => "some",
+                Err(_) => "error",
+            };
+            println!("{MARK}{answer}");
+            return;
+        }
+        let id = "0123456789abcdef0123456789abcdef";
+        // (seat marker, id) → what `seat_id` answers
+        let table = [
+            (None, None, "none"),
+            (None, Some(id), "none"),
+            (None, Some("seat 1"), "none"),
+            (Some("true"), Some(id), "none"),
+            (Some("1"), None, "error"),
+            (Some("1"), Some("seat 1"), "error"),
+            (Some("1"), Some(id), "some"),
+        ];
+        for (marker, id, answer) in table {
+            let mut child = child("a_seat_id_counts_only_with_the_seat_marker");
+            child.envs(marker.map(|value| ("PUNKTFUNK_SEAT_SESSION", value)));
+            child.envs(id.map(|value| ("PUNKTFUNK_SEAT_ID", value)));
+            assert_eq!(
+                printed(&mut child),
+                [answer],
+                "marker {marker:?}, id {id:?}"
+            );
+        }
     }
 
     /// A policy test walks [`HostRole::ALL`], so it holds each role the markers name, once.
