@@ -688,6 +688,10 @@ jobs:
           corepack prepare pnpm@9 --activate
           pnpm install --frozen-lockfile
           pnpm run test
+      # main.py's pure helpers against a stubbed `decky` module: argv shapes, exit codes, the
+      # Steam VDF editor. Stdlib only, Python 3.10 or newer; this image carries 3.11.
+      - name: Backend helpers
+        run: python3 scripts/test-backend.py
 
   # web/bun.nix and sdk/bun.nix are GENERATED from their bun.lock (bun2nix) and committed; the Nix
   # build fetches node_modules from nothing else. They regenerate only on a local `bun install` that
