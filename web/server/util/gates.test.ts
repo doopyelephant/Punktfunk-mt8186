@@ -2,10 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Glob } from "bun";
-import { GATES, routeFile, seatGate } from "./gates";
+import { GATES, routeFile, seatGate, UNDECIDED } from "./gates";
 
 const routes = join(import.meta.dir, "../routes/api/v1");
 const repo = join(import.meta.dir, "../../..");
+const gated = GATES.filter((r) => !r.open);
 
 describe("seatGate", () => {
 	test("names the box's gate for each call it guards", () => {
@@ -51,7 +52,7 @@ test("the rows are the route files that ask for the password", () => {
 			),
 		)
 		.map((file) => file.replace(/\.ts$/, ""));
-	expect(GATES.map(routeFile).sort()).toEqual(asking.sort());
+	expect(gated.map(routeFile).sort()).toEqual(asking.sort());
 });
 
 test("a seat call goes through the handler of its own row's file", async () => {
@@ -71,8 +72,31 @@ test("a row with no seat gate is a path the seat's host refuses", () => {
 	)?.[1];
 	expect(list, "proxy_refuses in mgmt/profiles.rs").toBeDefined();
 	const refused = [...(list ?? "").matchAll(/"([^"]+)"/g)].map((m) => m[1]);
-	const open = GATES.filter(
+	const relayed = gated.filter(
 		(r) => !r.seat && !refused.includes(r.pattern.split("/")[0]),
 	);
-	expect(open.map(routeFile)).toEqual([]);
+	expect(relayed.map(routeFile)).toEqual([]);
+});
+
+test("every mutating operation in api/openapi.json has one row", () => {
+	const spec: { paths: Record<string, Record<string, unknown>> } = JSON.parse(
+		readFileSync(join(repo, "api/openapi.json"), "utf8"),
+	);
+	const operations = Object.entries(spec.paths).flatMap(([path, item]) =>
+		["POST", "PUT", "PATCH", "DELETE"]
+			.filter((method) => method.toLowerCase() in item)
+			.map((method) => `${method} ${path.replace(/^\/api\/v1\//, "")}`),
+	);
+	const rows = GATES.map((r) => `${r.method} ${r.pattern}`);
+	expect(rows.filter((row, i) => rows.indexOf(row) !== i)).toEqual([]);
+	expect(operations.filter((op) => !rows.includes(op))).toEqual([]);
+	expect(rows.filter((row) => !operations.includes(row))).toEqual([]);
+
+	const undecided = GATES.filter((r) => r.open === UNDECIDED);
+	console.warn(
+		[
+			`password gate: ${undecided.length} mutating routes are open with no decision on record`,
+			...undecided.map((r) => `  ${r.method} ${r.pattern}`),
+		].join("\n"),
+	);
 });
