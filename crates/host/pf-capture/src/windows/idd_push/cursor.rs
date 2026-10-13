@@ -10,10 +10,10 @@
 
 use super::*;
 use pf_driver_proto::cursor::{
-    shape_extent, shape_rgba, CursorShm, ShapeRgba, CURSOR_MAGIC, CURSOR_SHAPE_BYTES,
-    CURSOR_SHAPE_OFFSET, CURSOR_SHM_SIZE,
+    shape_extent, shape_rgba, CursorShm, ShapeRgba, CURSOR_MAGIC, CURSOR_SHAPE_OFFSET,
+    CURSOR_SHM_SIZE,
 };
-use std::sync::atomic::AtomicU32;
+use std::mem::offset_of;
 
 /// Host end of one monitor's cursor channel. The mapping stays valid for the capturer's
 /// life.
@@ -45,44 +45,30 @@ impl From<ShapeRgba> for ConvertedShape {
     }
 }
 
+/// The header in words: it is all `u32`s and ends where the shape starts.
+const HEADER_WORDS: usize = size_of::<CursorShm>() / 4;
+const _: () = assert!(HEADER_WORDS * 4 == CURSOR_SHAPE_OFFSET);
+
+/// The header as of now, one atomic load per word. It can be torn against a publish; the
+/// caller's sequence check decides.
+fn header(section: &MappedSection) -> CursorShm {
+    let mut words = [0u32; HEADER_WORDS];
+    for (i, word) in words.iter_mut().enumerate() {
+        *word = section.word32(i * 4).load(Ordering::Relaxed);
+    }
+    bytemuck::cast(words)
+}
+
 impl CursorShared {
-    /// Create + initialize the section (zeroed, magic last, seq even/zero). The origin stays
-    /// 0: IddCx positions are monitor-relative, and a driver that still subtracts it must
-    /// subtract nothing. The returned handle is the section itself (owned by `self`); the
-    /// caller duplicates it into the WUDFHost.
+    /// Create the section: zeroed, so seq is 0 (even, nothing published), then the magic the
+    /// driver validates at adopt. The origin stays 0: IddCx positions are monitor-relative,
+    /// and a driver that still subtracts it must subtract nothing. `self` owns the section;
+    /// the caller duplicates its handle into the WUDFHost.
     pub(super) fn create() -> Result<CursorShared> {
-        // SAFETY: plain FFI. Unnamed pagefile-backed section, host-lifetime owned; the view is
-        // mapped once here and unmapped exactly once by `MappedSection::drop` (which unmaps before
-        // closing the mapping handle). No borrow into the view outlives the `MappedSection`: every
-        // access goes through `&self` accessors on the owner.
-        let section = unsafe {
-            let map = CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                None,
-                PAGE_READWRITE,
-                0,
-                CURSOR_SHM_SIZE as u32,
-                PCWSTR::null(),
-            )
-            .context("CreateFileMapping(cursor)")?;
-            let map = OwnedHandle::from_raw_handle(map.0 as _);
-            let view = MapViewOfFile(
-                HANDLE(map.as_raw_handle()),
-                FILE_MAP_ALL_ACCESS,
-                0,
-                0,
-                CURSOR_SHM_SIZE,
-            );
-            if view.Value.is_null() {
-                bail!("MapViewOfFile failed for the cursor section");
-            }
-            let shm = view.Value.cast::<CursorShm>();
-            std::ptr::write_bytes(view.Value.cast::<u8>(), 0, CURSOR_SHM_SIZE);
-            // Magic last: the driver validates it at adopt. Seq 0 is even = consistent.
-            std::sync::atomic::fence(Ordering::Release);
-            (*shm).magic = CURSOR_MAGIC;
-            MappedSection { handle: map, view }
-        };
+        let section = MappedSection::create(CURSOR_SHM_SIZE, None, "cursor")?;
+        section
+            .word32(offset_of!(CursorShm, magic))
+            .store(CURSOR_MAGIC, Ordering::Release);
         Ok(CursorShared {
             section,
             cached_id: 0,
@@ -95,24 +81,18 @@ impl CursorShared {
     }
 
     /// Tell the driver where this HDR desktop puts SDR white (1.0 = 80 nits) for its blend
-    /// onto an FP16 frame; `0` = SDR. One aligned word, read by the driver per publish.
+    /// onto an FP16 frame; `0` = SDR. One word, read by the driver per publish.
     pub(super) fn set_sdr_white_scale(&self, scale: f32) {
-        let shm = self.section.ptr::<CursorShm>();
-        // SAFETY: the view spans `CURSOR_SHM_SIZE` for `self`'s lifetime; the field is a
-        // 4-aligned u32 in the fixed layout, written whole.
-        unsafe {
-            std::ptr::addr_of_mut!((*shm).sdr_white_scale).write_volatile(scale.to_bits());
-        }
+        self.section
+            .word32(offset_of!(CursorShm, sdr_white_scale))
+            .store(scale.to_bits(), Ordering::Relaxed);
     }
 
     /// Seqlock-read the latest publish as a frame-relative [`pf_frame::CursorOverlay`].
     /// `None` until the first publish. Hidden pointer → `Some` with `visible: false` — the
     /// forwarder turns that into the client's relative-mode hint, as on Linux.
     pub(super) fn read(&mut self) -> Option<pf_frame::CursorOverlay> {
-        let shm = self.section.ptr::<CursorShm>();
-        // SAFETY: the view spans `CURSOR_SHM_SIZE` for `self`'s lifetime; `seq` is
-        // 4-aligned at offset 4 in the fixed layout.
-        let seq = unsafe { &*std::ptr::addr_of!((*shm).seq).cast::<AtomicU32>() };
+        let seq = self.section.word32(offset_of!(CursorShm, seq));
         for _ in 0..64 {
             let s1 = seq.load(Ordering::Acquire);
             if s1 == 0 {
@@ -122,22 +102,12 @@ impl CursorShared {
                 std::hint::spin_loop();
                 continue; // odd seq: writer mid-update
             }
-            // SAFETY: header is inside the mapped view; a torn read is discarded by the
-            // seq re-check below.
-            let hdr = unsafe { std::ptr::read_volatile(shm) };
+            let hdr = header(&self.section);
             if hdr.visible != 0 && hdr.shape_id != self.cached_id {
+                // `shape_extent` clamps `rows * pitch` to the shape region.
                 let (_, rows, pitch) = shape_extent(&hdr);
                 let mut raw = vec![0u8; rows * pitch];
-                // SAFETY: the shape region is `CURSOR_SHAPE_BYTES` from `CURSOR_SHAPE_OFFSET`
-                // in the mapped view; `shape_extent` clamps `rows * pitch` to it.
-                unsafe {
-                    debug_assert!(rows * pitch <= CURSOR_SHAPE_BYTES);
-                    std::ptr::copy_nonoverlapping(
-                        self.section.ptr::<u8>().add(CURSOR_SHAPE_OFFSET),
-                        raw.as_mut_ptr(),
-                        rows * pitch,
-                    );
-                }
+                self.section.read_bytes(CURSOR_SHAPE_OFFSET, &mut raw);
                 // Writer raced mid-shape (seq moved) — retry without caching. The fence is what
                 // keeps the payload reads above from being reordered after this check: an
                 // acquire LOAD only orders what follows it. Free on x86, load-load ordering on
@@ -181,5 +151,67 @@ impl CursorShared {
             });
         }
         None // writer wedged mid-seq; skip this tick
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pf_driver_proto::cursor::CURSOR_TYPE_ALPHA;
+
+    /// Stand in for the driver: the header and the shape's pixels, then `seq`.
+    fn publish(shared: &CursorShared, seq: u32, hdr: CursorShm, bgra: &[[u8; 4]]) {
+        let words: [u32; HEADER_WORDS] = bytemuck::cast(hdr);
+        for (i, word) in words.iter().enumerate().skip(2) {
+            shared.section.word32(i * 4).store(*word, Ordering::Relaxed);
+        }
+        for (i, px) in bgra.iter().enumerate() {
+            shared
+                .section
+                .word32(CURSOR_SHAPE_OFFSET + i * 4)
+                .store(u32::from_le_bytes(*px), Ordering::Relaxed);
+        }
+        shared
+            .section
+            .word32(offset_of!(CursorShm, seq))
+            .store(seq, Ordering::Release);
+    }
+
+    #[test]
+    fn a_publish_reads_back_and_a_writer_mid_update_does_not() {
+        let mut shared = CursorShared::create().expect("cursor section");
+        assert!(shared.read().is_none(), "nothing published yet");
+
+        let hdr = CursorShm {
+            visible: 1,
+            cursor_type: CURSOR_TYPE_ALPHA,
+            x: 5,
+            y: -7,
+            shape_id: 1,
+            width: 2,
+            height: 1,
+            pitch: 8,
+            hot_x: 1,
+            ..bytemuck::Zeroable::zeroed()
+        };
+        publish(&shared, 2, hdr, &[[1, 2, 3, 4], [5, 6, 7, 8]]);
+        let got = shared.read().expect("a published cursor");
+        assert_eq!((got.x, got.y, got.w, got.h, got.hot_x), (5, -7, 2, 1, 1));
+        assert!(got.visible);
+        // ALPHA shapes are BGRA in the section and RGBA on the way out.
+        assert_eq!(got.rgba[..], [3, 2, 1, 4, 7, 6, 5, 8]);
+
+        publish(&shared, 3, hdr, &[]);
+        assert!(shared.read().is_none(), "an odd seq is a writer mid-update");
+
+        publish(&shared, 4, CursorShm { visible: 0, ..hdr }, &[]);
+        assert!(!shared.read().expect("a hide is still a publish").visible);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn a_word_past_the_section_is_refused() {
+        let shared = CursorShared::create().expect("cursor section");
+        shared.section.word32(CURSOR_SHM_SIZE);
     }
 }

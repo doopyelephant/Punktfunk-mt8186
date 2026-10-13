@@ -11,6 +11,7 @@ use crate::au_reader::{AuReader, AuView, Taken};
 use crate::{DriverEndpoint, EncodeCtlSender, SetEncodeSender};
 use pf_driver_proto::encode::{self, au, EncodeCtlRequest, SetEncodeRequest};
 use pf_encode_win::{AuChunk, EncodedFrame, Encoder, EncoderCaps};
+use std::mem::offset_of;
 
 /// What the host asks the driver to open — the session plan as `SET_ENCODE` numbers it.
 #[derive(Clone, Copy, Debug)]
@@ -156,7 +157,6 @@ impl AuDump {
 struct AuSection {
     section: MappedSection,
     event: OwnedHandle,
-    bytes: usize,
 }
 
 impl AuSection {
@@ -165,59 +165,41 @@ impl AuSection {
     /// `generation` is the DRIVER's word: `EncodeSession::new` stores its own over whatever
     /// is here, and `published_for_us` reads that. The host does not seed it.
     fn create(heap_bytes: u32, wire_seq_base: u32) -> Result<Self> {
+        let sa = open::SharedObjectSa::new()?;
         let bytes = au::section_bytes(heap_bytes) as usize;
-        // SAFETY: as the ring's section in `open.rs`: every create is `?`-checked, `sa` lives
-        // across them, the view is `bytes` long and page-aligned, and the header write stays
-        // inside it with magic stored last, Release, so the driver sees a whole header.
-        unsafe {
-            let sa = open::SharedObjectSa::new()?;
-            let map = CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                Some(sa.as_ptr()),
-                PAGE_READWRITE,
-                0,
-                bytes as u32,
-                PCWSTR::null(),
-            )
-            .context("CreateFileMapping(AU section)")?;
-            let map = OwnedHandle::from_raw_handle(map.0 as _);
-            let view = MapViewOfFile(
-                HANDLE(map.as_raw_handle()),
-                FILE_MAP_ALL_ACCESS,
-                0,
-                0,
-                bytes,
-            );
-            if view.Value.is_null() {
-                bail!("MapViewOfFile failed for the AU section");
-            }
-            let section = MappedSection { handle: map, view };
-            let header = section.ptr::<au::AuHeader>();
-            std::ptr::write_bytes(header.cast::<u8>(), 0, bytes);
-            (*header).version = au::AU_VERSION;
-            (*header).heap_offset = au::HEAP_OFFSET as u32;
-            (*header).heap_bytes = heap_bytes;
-            (*header).slot_table_offset = au::SLOT_TABLE_OFFSET as u32;
-            (*header).slot_count = au::AU_SLOTS;
-            (*header).wire_seq_base = wire_seq_base;
+        let section = MappedSection::create(bytes, Some(&sa), "AU")?;
+        let stamp =
+            |field: usize, value: u32| section.word32(field).store(value, Ordering::Relaxed);
+        stamp(offset_of!(au::AuHeader, version), au::AU_VERSION);
+        stamp(
+            offset_of!(au::AuHeader, heap_offset),
+            au::HEAP_OFFSET as u32,
+        );
+        stamp(offset_of!(au::AuHeader, heap_bytes), heap_bytes);
+        stamp(
+            offset_of!(au::AuHeader, slot_table_offset),
+            au::SLOT_TABLE_OFFSET as u32,
+        );
+        stamp(offset_of!(au::AuHeader, slot_count), au::AU_SLOTS);
+        stamp(offset_of!(au::AuHeader, wire_seq_base), wire_seq_base);
+        // SAFETY: `sa` outlives the call, and the handle it returns is new and owned from here.
+        let event = unsafe {
             let event = CreateEventW(Some(sa.as_ptr()), false, false, PCWSTR::null())
                 .context("CreateEvent(AU section)")?;
-            let event = OwnedHandle::from_raw_handle(event.0 as _);
-            std::sync::atomic::fence(Ordering::Release);
-            (*(std::ptr::addr_of!((*header).magic) as *const AtomicU32))
-                .store(au::AU_MAGIC, Ordering::Release);
-            Ok(Self {
-                section,
-                event,
-                bytes,
-            })
-        }
+            OwnedHandle::from_raw_handle(event.0 as _)
+        };
+        // Magic last, Release, so the driver sees a whole header.
+        section
+            .word32(offset_of!(au::AuHeader, magic))
+            .store(au::AU_MAGIC, Ordering::Release);
+        Ok(Self { section, event })
     }
 
     fn view(&self) -> AuView {
-        // SAFETY: the mapping is `bytes` long and page-aligned, and outlives the view because
+        let (base, len) = self.section.raw();
+        // SAFETY: the view is `len` long and page-aligned, and outlives the reader because
         // the proxy owns both.
-        unsafe { AuView::new(self.section.ptr::<u8>(), self.bytes) }
+        unsafe { AuView::new(base, len) }
     }
 
     /// Wait for a publish, at most `timeout_ms`. The auto-reset event is the wakeup only; the
@@ -287,7 +269,7 @@ pub(crate) fn open_remote_encoder(
         _pad: 0,
         section: section_v,
         event: event_v,
-        section_bytes: section.bytes as u32,
+        section_bytes: section.section.len as u32,
         codec: params.codec,
         chroma: params.chroma,
         bit_depth: params.bit_depth,

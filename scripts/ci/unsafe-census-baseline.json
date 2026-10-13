@@ -5,7 +5,7 @@
     "crates/core/pf-dmabuf": 3,
     "crates/core/punktfunk-core": 13,
     "crates/host/pf-audio": 25,
-    "crates/host/pf-capture": 91,
+    "crates/host/pf-capture": 77,
     "crates/host/pf-clipboard": 6,
     "crates/host/pf-encode": 40,
     "crates/host/pf-encode-core": 13,
