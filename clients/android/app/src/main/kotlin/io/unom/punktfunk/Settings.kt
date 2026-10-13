@@ -257,6 +257,12 @@ data class Settings(
     /** Off, the host's rumble never reaches a pad or this phone's motor. Read once per session. */
     val padRumble: Boolean = true,
     /**
+     * On, a stream holds the screen awake for as long as it runs. Off, only while the player's
+     * input is recent ([NativeBridge.nativeHoldsScreenAwake]), so the device's own timeout runs
+     * over a game left alone. Read once per session.
+     */
+    val keepAwake: Boolean = true,
+    /**
      * Opt-in: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
      * phone's own vibration motor — for clip-on gamepads that ship without rumble motors, where
      * the phone body is the only actuator in the player's hands. Off by default; read once per
@@ -622,6 +628,22 @@ object RenderScale {
     /** Clamp a raw multiplier into [0.5, 4.0]; a missing / non-positive / NaN value → 1.0. */
     fun sanitize(raw: Double): Double = if (raw > 0.0) raw.coerceIn(0.5, 4.0) else 1.0
 
+    /**
+     * A typed percent as a multiplier, sanitized. A percent, because whole percents keep every
+     * client storing the same hundredths. Twin of core's `from_percent`.
+     */
+    fun fromPercent(percent: Int): Double = sanitize(percent / 100.0)
+
+    /** The whole percent a stored multiplier reads as. */
+    fun percent(scale: Double): Int = Math.round(sanitize(scale) * 100.0).toInt()
+
+    /**
+     * Which of [PRESETS] a stored multiplier is; null for a typed one. Compared in hundredths:
+     * the prefs keep a Float, so 0.67 reads back as 0.6700000167.
+     */
+    fun presetIndex(scale: Double): Int? =
+        PRESETS.indexOfFirst { kotlin.math.abs(it - scale) < 0.005 }.takeIf { it >= 0 }
+
     /** "Native (1×)" / "1.5×" / "2× · supersample" — the picker label. */
     fun label(scale: Double): String = when {
         scale == 1.0 -> "Native (1×)"
@@ -654,6 +676,9 @@ object RenderScale {
 
 /** (scale, label) for the render-scale picker. `1.0` = Native. */
 val RENDER_SCALE_OPTIONS = RenderScale.PRESETS.map { it to RenderScale.label(it) }
+
+/** Dropdown sentinel for "Custom…" in the render-scale picker: no multiplier is negative. */
+const val CUSTOM_RENDER_SCALE = -1.0
 
 /** [Settings.videoFit] values and labels, the desktop and console wording. */
 val VIDEO_FIT_OPTIONS = listOf("fit" to "Fit", "crop" to "Crop to fill", "stretch" to "Stretch to fill")

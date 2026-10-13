@@ -312,6 +312,11 @@ public enum DefaultsKey {
     /// `GamepadFeedback` reads it per command, so a change lands mid-stream. A device
     /// preference, never part of a stream preset.
     public static let padRumble = "punktfunk.padRumble"
+    /// The cross-client `keep_awake` key. On (default), a stream holds the screen awake for as
+    /// long as it runs. Off, only while the player's input is recent
+    /// (`PunktfunkConnection.holdsScreenAwake`), so the device's own sleep timer runs over a
+    /// game left alone. Read each second mid-stream; never part of a stream preset.
+    public static let keepAwake = "punktfunk.keepAwake"
     /// iPhone: ALSO play the rumble the host addresses to controller 1 (wire pad 0) on this
     /// device's own Taptic Engine — for phone-clip pads that ship without rumble motors, where
     /// the phone body is the only actuator in the player's hands. Off by default (opt-in); read
@@ -390,6 +395,7 @@ public enum SettingDefault {
     public static let pointerCapture = true
     // App preferences, read where they are used.
     public static let padRumble = true
+    public static let keepAwake = true
     public static let advancedStats = false
     public static let fullscreenAlways = false
     public static let uiPalette = "violet"
@@ -423,10 +429,11 @@ extension Notification.Name {
     /// Posted by `StatsVerbosity.requestCycle`. The stored default does not move.
     public static let punktfunkStatsCycled = Notification.Name("io.unom.punktfunk.stats-cycled")
 
-    /// Posted by the session view when the quick-action ring opens (`object` is a Bool `NSNumber`).
-    /// The Mac's stream layer releases a captured mouse for as long as it is up and takes capture
-    /// back on close: the ring's buttons are SwiftUI above the video, and a grabbed pointer can
-    /// never reach one. macOS only — the touch clients' fingers reach the ring either way.
+    /// Posted by the session view when the quick-action ring opens or closes (`object` is a Bool
+    /// `NSNumber`). The ring's buttons are SwiftUI above the video, and a grabbed pointer can
+    /// never reach one. So the Mac's stream layer releases a captured mouse for as long as the
+    /// ring is up, and the iPad's drops its pointer lock; both take it back on close. macOS and
+    /// iOS only: a finger reaches the ring either way.
     public static let punktfunkRingOpen = Notification.Name("io.unom.punktfunk.ring-open")
 
     /// Posted by InputCapture on ⌃⌥⇧O (`object` is the session's connection): on macOS while input

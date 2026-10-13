@@ -212,6 +212,36 @@ impl GamepadPref {
         }
     }
 
+    /// Whether this backend's pad has a Quick Access button. Wire `MISC1` presses it there;
+    /// on every other pad `MISC1` is another control (mute, Share, Capture) or nothing.
+    ///
+    /// Answers one backend; [`pad_has_quick_access`] answers for a particular pad. `Auto` is
+    /// `false`: a host that names no backend builds an Xbox 360 pad. Exhaustive so a new
+    /// backend must pick an answer.
+    pub const fn has_quick_access(self) -> bool {
+        match self {
+            GamepadPref::SteamDeck
+            | GamepadPref::SteamController2
+            | GamepadPref::SteamController2Puck
+            | GamepadPref::HoripadSteam => true,
+            GamepadPref::Auto
+            | GamepadPref::Xbox360
+            | GamepadPref::DualSense
+            | GamepadPref::XboxOne
+            | GamepadPref::DualShock4
+            | GamepadPref::SteamController
+            | GamepadPref::DualSenseEdge
+            | GamepadPref::SwitchPro
+            | GamepadPref::XboxElite
+            | GamepadPref::EightBitDoUltimate2
+            | GamepadPref::EightBitDoPro2
+            | GamepadPref::EightBitDoPro3
+            | GamepadPref::JoyConPair
+            | GamepadPref::Switch2Pro
+            | GamepadPref::Switch2GameCube => false,
+        }
+    }
+
     pub const fn to_u8(self) -> u8 {
         match self {
             GamepadPref::Auto => 0,
@@ -350,6 +380,22 @@ pub const fn pad_motion_reaches(
         resolved.has_motion()
     } else {
         declared.has_motion()
+    }
+}
+
+/// Whether one pad's device on the host has a Quick Access button
+/// ([`GamepadPref::has_quick_access`]). The arguments and the rule are
+/// [`pad_motion_reaches`]': the echo answers for a pad that declared the session default,
+/// the pad's own declaration for every other.
+pub const fn pad_has_quick_access(
+    declared: GamepadPref,
+    asked: GamepadPref,
+    resolved: GamepadPref,
+) -> bool {
+    if declared.to_u8() == asked.to_u8() {
+        resolved.has_quick_access()
+    } else {
+        declared.has_quick_access()
     }
 }
 
@@ -962,6 +1008,11 @@ mod tests {
                 row["has_motion"].as_bool().unwrap(),
                 "{row}"
             );
+            assert_eq!(
+                p.has_quick_access(),
+                row["quick_access"].as_bool().unwrap(),
+                "{row}"
+            );
             for alias in row["aliases"].as_array().unwrap() {
                 let alias = alias.as_str().unwrap();
                 assert_eq!(GamepadPref::from_name(alias), Some(p), "{alias}");
@@ -983,6 +1034,17 @@ mod tests {
         let kind = |v: &serde_json::Value| GamepadPref::from_name(v.as_str().unwrap()).unwrap();
         for row in file["motion_reaches"].as_array().expect("motion_reaches") {
             let got = pad_motion_reaches(
+                kind(&row["declared"]),
+                kind(&row["asked"]),
+                kind(&row["resolved"]),
+            );
+            assert_eq!(got, row["want"].as_bool().unwrap(), "{}", row["why"]);
+        }
+        for row in file["quick_access_pads"]
+            .as_array()
+            .expect("quick_access_pads")
+        {
+            let got = pad_has_quick_access(
                 kind(&row["declared"]),
                 kind(&row["asked"]),
                 kind(&row["resolved"]),

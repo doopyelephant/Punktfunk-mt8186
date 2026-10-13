@@ -401,6 +401,9 @@ struct Cx<'a> {
     /// Resolution sits on Custom… though the stored size is a listed one.
     custom_res: bool,
     set_custom_res: &'a AsyncSetState<bool>,
+    /// Render scale sits on Custom… though the stored scale is a listed stop.
+    custom_scale: bool,
+    set_custom_scale: &'a AsyncSetState<bool>,
 }
 
 impl Cx<'_> {
@@ -430,6 +433,8 @@ pub(crate) fn settings_page(
     set_edit: &AsyncSetState<bool>,
     custom_res: bool,
     set_custom_res: &AsyncSetState<bool>,
+    custom_scale: bool,
+    set_custom_scale: &AsyncSetState<bool>,
     rev: u64,
     set_rev: &AsyncSetState<u64>,
     set_status: &AsyncSetState<String>,
@@ -464,6 +469,8 @@ pub(crate) fn settings_page(
         preset_mode,
         custom_res,
         set_custom_res,
+        custom_scale,
+        set_custom_scale,
     };
     // The selected section's content, grouped exactly like the Apple client's categories
     // (SettingsCategory + SettingsView+Sections.swift). Each section builds only its own rows.

@@ -367,6 +367,17 @@ pub mod gamepad {
     /// Misc / capture — Deck `…`/quick-access, Share/Capture / GameStream `MISC`.
     pub const BTN_MISC1: u32 = 0x0020_0000;
 
+    /// What a synthetic Quick Access tap presses, in order. A pad with the button
+    /// ([`GamepadPref::has_quick_access`](crate::config::GamepadPref::has_quick_access)) takes
+    /// [`BTN_MISC1`]. Every other pad takes the chord Steam reads there: Guide held, then A.
+    pub const fn quick_access_presses(has_button: bool) -> &'static [u32] {
+        if has_button {
+            &[BTN_MISC1]
+        } else {
+            &[BTN_GUIDE, BTN_A]
+        }
+    }
+
     pub const AXIS_LS_X: u32 = 0;
     pub const AXIS_LS_Y: u32 = 1;
     pub const AXIS_RS_X: u32 = 2;
@@ -585,6 +596,21 @@ pub struct InputEvent {
 }
 
 impl InputEvent {
+    /// Whether this is the player doing something, for the keep-awake rule. Every key,
+    /// button, pointer and touch event is. A stick or trigger is only past a quarter of its
+    /// travel: at rest they drift and jitter, and a pad left on the sofa is not play. A pad
+    /// being plugged in or pulled is not either.
+    pub fn is_activity(&self) -> bool {
+        match self.kind {
+            InputKind::GamepadAxis => match self.code {
+                gamepad::AXIS_LT | gamepad::AXIS_RT => self.x > 63,
+                _ => self.x.unsigned_abs() > 8192,
+            },
+            InputKind::GamepadArrival | InputKind::GamepadRemove => false,
+            _ => true,
+        }
+    }
+
     /// Serialize: [`INPUT_MAGIC`] + little-endian fields.
     pub fn encode(&self) -> [u8; INPUT_WIRE_LEN] {
         let mut b = [0u8; INPUT_WIRE_LEN];
@@ -780,6 +806,46 @@ mod tests {
             flags: 0,
         };
         assert_eq!(GamepadSnapshot::from_event(&axis), None);
+    }
+
+    /// A pad left on the sofa must not hold the screen awake: its sticks drift and its
+    /// triggers rest near zero. A press, a pushed stick or a pulled trigger is play.
+    #[test]
+    fn a_resting_pad_is_not_activity() {
+        let ev = |kind: InputKind, code: u32, x: i32| InputEvent {
+            kind,
+            _pad: [0; 3],
+            code,
+            x,
+            y: 0,
+            flags: 0,
+        };
+        for (code, x) in [
+            (gamepad::AXIS_LS_X, 900),
+            (gamepad::AXIS_RS_Y, -8192),
+            (gamepad::AXIS_LT, 12),
+            (gamepad::AXIS_RT, 63),
+        ] {
+            assert!(
+                !ev(InputKind::GamepadAxis, code, x).is_activity(),
+                "{code} {x}"
+            );
+        }
+        for (code, x) in [
+            (gamepad::AXIS_LS_X, 20_000),
+            (gamepad::AXIS_RS_Y, -8193),
+            (gamepad::AXIS_RT, 64),
+        ] {
+            assert!(
+                ev(InputKind::GamepadAxis, code, x).is_activity(),
+                "{code} {x}"
+            );
+        }
+        assert!(ev(InputKind::GamepadButton, gamepad::BTN_A, 1).is_activity());
+        assert!(ev(InputKind::KeyDown, 30, 0).is_activity());
+        assert!(ev(InputKind::MouseMove, 0, 3).is_activity());
+        assert!(!ev(InputKind::GamepadArrival, 1, 0).is_activity());
+        assert!(!ev(InputKind::GamepadRemove, 0, 0).is_activity());
     }
 
     #[test]

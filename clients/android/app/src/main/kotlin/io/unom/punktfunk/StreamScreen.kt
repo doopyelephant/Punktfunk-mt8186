@@ -350,6 +350,16 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
 
     KeepAliveEffects(session, hostRecord, keepAliveSpan, { endAway(it) }, onSessionEnded)
 
+    // "Keep screen awake": asked every few seconds, since with the setting off the answer
+    // follows the player's input. With it on the answer never changes.
+    LaunchedEffect(handle) {
+        while (true) {
+            ui.screenHeld = NativeBridge.nativeHoldsScreenAwake(handle, initialSettings.keepAwake)
+            streamWindow.holdAwake(ui.screenHeld)
+            delay(5_000)
+        }
+    }
+
     // Auto-engage pointer capture at stream start (setting on + a mouse actually present).
     // Delayed a beat: the grab needs window focus and the capture view attached.
     LaunchedEffect(handle) {
@@ -832,11 +842,11 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             }
             companionDisplay?.let {
                 when (layout) {
-                    ScreenLayout.SWAPPED -> CompanionOnDisplay(it, pictureHz = streamHz) {
+                    ScreenLayout.SWAPPED -> CompanionOnDisplay(it, pictureHz = streamHz, lit = ui.screenHeld) {
                         picture(Modifier.fillMaxSize(), ::videoFrame, pictureSurface, true)
                     }
                     // The lower half keeps the panel's own rate: it is the touch screen under a game.
-                    ScreenLayout.SPANNED -> CompanionOnDisplay(it, pictureHz = 0) {
+                    ScreenLayout.SPANNED -> CompanionOnDisplay(it, pictureHz = 0, lit = ui.screenHeld) {
                         picture(Modifier.fillMaxSize(), ::lowerFrame, pictureSurface, false)
                     }
                     ScreenLayout.PANEL -> CompanionOnDisplay(it, content = companion)

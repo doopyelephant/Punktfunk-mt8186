@@ -615,18 +615,19 @@ final class SessionModel: ObservableObject {
     }
 
     /// Flip the user's mute. The in-stream surfaces (HUD button, Stream menu, ⌃⌥⇧A while
-    /// captured, the iOS mic disc) all land here.
+    /// captured, the iOS mic disc, the dial) all land here.
     func toggleMicMute() {
         setMicMuted(!micMuted)
     }
 
-    /// Set the user's mute directly (the badge's tap-to-unmute). Ignored when the session has no
-    /// microphone, so a stale surface can't leave a phantom "muted" badge over a session that was
-    /// never sending anything.
+    /// Set the user's mute, and say so for a moment in either direction. Ignored when the
+    /// session has no microphone, so a stale surface can't raise a "muted" notice over a
+    /// session that was never sending anything.
     func setMicMuted(_ muted: Bool) {
         guard micAvailable, micMuted != muted else { return }
         micMuted = muted
         applyMicMute()
+        flash(\.micMute, muted)
     }
 
     /// Show `value` in the notice at `slot` for `seconds`. Last one wins and its clock restarts:
@@ -647,6 +648,19 @@ final class SessionModel: ObservableObject {
         guard TouchInputMode.current(conn.settings) == .touch, !conn.hostSupportsTouch else { return }
         flash(\.touchFallback, true)
         #endif
+    }
+
+    /// Hold the screen awake or hand it back, as "Keep screen awake" and the player's input
+    /// say. Each second while streaming; `beginStreaming` holds it first.
+    private func holdScreen(_ conn: PunktfunkConnection) {
+        guard phase == .streaming else { return }
+        let keepAwake = UserDefaults.standard.object(forKey: DefaultsKey.keepAwake) as? Bool
+            ?? SettingDefault.keepAwake
+        if conn.holdsScreenAwake(keepAwake: keepAwake) {
+            displaySleepGuard.acquire()
+        } else {
+            displaySleepGuard.release()
+        }
     }
 
     /// Show the exit hint at stream start, unless it is turned off.
@@ -1236,6 +1250,7 @@ final class SessionModel: ObservableObject {
                 // readout also walks the countdown and picks up mid-session grant edits.
                 self.updateAccessState()
                 guard let conn = self.connection else { return }
+                self.holdScreen(conn)
                 if let notice = conn.launchNotice, notice != self.notices.launchShown {
                     self.showLaunchNotice(notice)
                 }

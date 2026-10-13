@@ -1001,6 +1001,7 @@
 	"display_arrange_hint": "Drag a streamed screen to place it.",
 	"display_stream_this": "Stream this monitor",
 	"display_stream_virtual": "Give each device its own screen",
+	"display_stream_this_hint": "A streamed monitor is what every device sees, instead of a screen of its own. Press again to undo.",
 	"common_done": "Done",
 	"common_on": "On",
 	"common_off": "Off",

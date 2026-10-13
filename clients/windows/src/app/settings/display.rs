@@ -204,20 +204,70 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
     let hz_combo = setting_combo(cx, scope, "refresh_hz", hz_names, hz_i, |s, i| {
         s.refresh_hz = REFRESH[i];
     });
-    let (scale_names, scale_i) = {
-        let names: Vec<String> = RENDER_SCALES
-            .iter()
-            .map(|&x| render_scale_label(x))
-            .collect();
-        let i = RENDER_SCALES
-            .iter()
-            .position(|&x| (x - s.render_scale).abs() < 1e-6)
-            .unwrap_or_else(|| RENDER_SCALES.iter().position(|&x| x == 1.0).unwrap());
-        (names, i)
+    // The stops, then Custom…, which shows a percent box. A scale that is no stop (typed
+    // here or on another client) is Custom whatever the flag says.
+    let scale_stop = punktfunk_core::render_scale::preset_index(s.render_scale);
+    let custom_scale_i = RENDER_SCALES.len();
+    let custom_scale = cx.custom_scale || scale_stop.is_none();
+    let scale_names: Vec<String> = RENDER_SCALES
+        .iter()
+        .map(|&x| render_scale_label(x))
+        .chain(["Custom\u{2026}".to_string()])
+        .collect();
+    let scale_i = match scale_stop {
+        Some(i) if !custom_scale => i,
+        _ => custom_scale_i,
     };
-    let scale_combo = setting_combo(cx, scope, "render_scale", scale_names, scale_i, |s, i| {
-        s.render_scale = RENDER_SCALES[i];
-    });
+    let scale_combo = {
+        let set_custom = cx.set_custom_scale.clone();
+        setting_combo(
+            cx,
+            scope,
+            "render_scale",
+            scale_names,
+            scale_i,
+            move |s, i| {
+                set_custom.call(i == custom_scale_i);
+                // Custom keeps the scale shown, for the box to start from.
+                if let Some(&stop) = RENDER_SCALES.get(i) {
+                    s.render_scale = stop;
+                }
+            },
+        )
+    };
+    let scale_control: Element = if custom_scale {
+        let (ctx, scope) = (ctx.clone(), scope.to_string());
+        let (set_rev, set_status) = (set_rev.clone(), set_status.clone());
+        let percent = punktfunk_core::render_scale::percent(s.render_scale);
+        vstack((
+            Element::from(scale_combo),
+            NumberBox::new(f64::from(percent))
+                .range(50.0, 400.0)
+                .header("Percent")
+                .width(120.0)
+                .on_value_changed(move |v: f64| {
+                    // A cleared box reports NaN: that is no scale, not Native.
+                    if v.is_nan() || v < 1.0 {
+                        return;
+                    }
+                    commit(
+                        &ctx,
+                        &scope,
+                        "render_scale",
+                        (rev, &set_rev),
+                        &set_status,
+                        |s| {
+                            let typed = v.clamp(1.0, 400.0) as u32;
+                            s.render_scale = punktfunk_core::render_scale::from_percent(typed);
+                        },
+                    );
+                }),
+        ))
+        .spacing(8.0)
+        .into()
+    } else {
+        scale_combo.into()
+    };
     let (comp_names, comp_i) = presets(COMPOSITORS, |v| *v == s.compositor);
     let comp_combo = setting_combo(cx, scope, "compositor", comp_names, comp_i, |s, i| {
         s.compositor = COMPOSITORS[i].0.to_string();
@@ -449,7 +499,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
             cx,
             "render_scale",
             "Render scale",
-            scale_combo,
+            scale_control,
             "Above native supersamples for sharpness; below renders lighter on the \
              host and the link. This device resamples the result to the window.",
         ),
@@ -521,8 +571,16 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
              isn\u{2019}t available.",
         ),
     ]);
-    // Decoder and GPU are facts about THIS device's hardware — never per preset.
+    // Decoder, GPU and the screen saver are facts about THIS device — never per preset.
     if !preset_mode {
+        advanced.push(described_labeled(
+            "Keep screen awake",
+            setting_toggle(cx, scope, "keep_awake", s.keep_awake, |s, on| {
+                s.keep_awake = on
+            }),
+            "Off, a stream keeps the screen awake only while you play. Left alone for \
+             five minutes, it lets Windows\u{2019} own screen saver or sleep take over.",
+        ));
         advanced.push(described_labeled(
             "Video decoder",
             decoder_combo,
@@ -551,6 +609,7 @@ pub(super) fn display_section(cx: &Cx) -> Vec<Element> {
         s.compositor != d.compositor,
         stored_decoder != d.decoder,
         !s.adapter.is_empty(),
+        s.keep_awake != d.keep_awake,
     ];
     let overridden = [
         "smooth_buffer",

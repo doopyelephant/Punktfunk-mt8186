@@ -302,11 +302,17 @@ struct Shell {
     /// Last audio-mute mask drawn and when it changed: a local mute's badge is timed off it.
     audio_mute_at: Instant,
     audio_mute_seen: u8,
+    /// The microphone's mute as last drawn, and when the player switched it in this stream.
+    /// `None` until they do: a stream starts unmuted and says nothing.
+    mic_muted_seen: bool,
+    mic_muted_at: Option<Instant>,
     /// The pad whose Select+A opened the ring; `None` for a keyboard, touch or closed ring.
     ring_opener: Option<u8>,
     /// Ring pad ownership, edge-tracked: open masks the pads (a held trigger is released
     /// on the host) and polls them into menu events; close re-adopts them.
     ring_was_open: bool,
+    /// SDL's screen saver hold as last set. SDL holds it from start, so this begins `true`.
+    screen_held: bool,
     chord_rx: async_channel::Receiver<(u8, SelectChord)>,
     escape_rx: async_channel::Receiver<()>,
     pump: GamepadPump,

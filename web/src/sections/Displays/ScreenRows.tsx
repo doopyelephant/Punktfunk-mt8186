@@ -1,6 +1,7 @@
 // **Screens** — the host's monitors and the screens streamed to devices, one list (D-C). The map
 // draws; the rows act. A monitor row carries its own settings (stream it, stays on); a streamed
-// row carries its state and **Release**, which has no other home.
+// row carries its state and **Release**, which has no other home. Streaming a monitor replaces
+// every device's own screen, so the card says that before the button is pressed.
 import { Monitor, MonitorPlay, Settings2 } from "lucide-react";
 import { motion } from "motion/react";
 import type { FC, ReactNode } from "react";
@@ -80,6 +81,11 @@ export const ScreenRows: FC<{
 				{envLocked && (
 					<p className="text-sm text-amber-600 dark:text-amber-500">
 						{m.display_monitor_env_locked()}
+					</p>
+				)}
+				{pinSupported && !envLocked && heads.some((mon) => mon.enabled) && (
+					<p className="text-xs text-muted-foreground">
+						{m.display_stream_this_hint()}
 					</p>
 				)}
 				{danglingPin && (

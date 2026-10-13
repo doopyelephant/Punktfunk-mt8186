@@ -39,8 +39,8 @@ pub enum Liveness {
     /// An adopted process is still the same live process (not a recycled pid).
     Running,
     Gone,
-    /// No adopted processes (game not up yet, or a Child handle that died
-    /// with its session), or no matcher (macOS). A reconnect inside
+    /// No adopted processes (game not up yet, or a launcher handed off to one
+    /// nothing recognizes), or no matcher (macOS). A reconnect inside
     /// [`IN_FLIGHT_WINDOW`] then skips a second copy and also skips
     /// game-exit detection.
     Unknown,

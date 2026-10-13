@@ -204,6 +204,18 @@ internal class StreamWindow(
     private var priorCutout: Int? = null
     private var priorOrientation: Int? = null
 
+    /**
+     * Hold the screen awake, or hand it back to the device's own timeout. [attach] holds it;
+     * the stream screen calls this as the keep-awake rule changes its answer.
+     */
+    fun holdAwake(hold: Boolean) {
+        if (hold) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
     /** Window state the stream wants from its first frame, before any peripheral exists. */
     fun attach() {
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)

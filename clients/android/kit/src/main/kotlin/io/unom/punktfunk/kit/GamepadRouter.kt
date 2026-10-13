@@ -297,19 +297,34 @@ class GamepadRouter(
 
     /**
      * A one-shot synthetic tap of a system button on the host's pad (pf-client-core's
-     * `GamepadService.tapButton`): down now, up [TAP_PRESS_MS] later, on the first forwarded
-     * slot's wire index — pad 0 when none is open, which is best-effort (the host pad may not
-     * exist). Deliberately past [slotButton]: this is the ring's own press, not the player's,
-     * so neither [ringOpen] nor the system-button policy may swallow it.
+     * `GamepadService.tapButton`), on the first forwarded slot's wire index — pad 0 when none
+     * is open, which is best-effort (the host pad may not exist). [Gamepad.BTN_MISC1] is the
+     * Quick Access action, pressed as that pad's host device reads it
+     * ([Gamepad.quickAccessPresses]). Deliberately past [slotButton]: this is the ring's own
+     * press, not the player's, so neither [ringOpen] nor the system-button policy may swallow it.
      */
     fun tapButton(bit: Int) {
         if (!forwarding) return
-        val pad = slots.values.minOfOrNull { it.index } ?: 0
-        NativeBridge.nativeSendGamepadButton(handle, bit, true, pad)
-        mainHandler.postDelayed(
-            { NativeBridge.nativeSendGamepadButton(handle, bit, false, pad) },
-            TAP_PRESS_MS,
-        )
+        val slot = slots.values.minByOrNull { it.index }
+        val pad = slot?.index ?: 0
+        val presses = if (bit == Gamepad.BTN_MISC1) {
+            // -1: no forwarded pad declared a kind, so the session default answers.
+            Gamepad.quickAccessPresses(
+                NativeBridge.nativePadHasQuickAccess(handle, slot?.declared ?: -1),
+            )
+        } else {
+            listOf(bit)
+        }
+        for ((b, down, afterMs) in tapEvents(presses)) {
+            if (afterMs == 0L) {
+                NativeBridge.nativeSendGamepadButton(handle, b, down, pad)
+            } else {
+                mainHandler.postDelayed(
+                    { NativeBridge.nativeSendGamepadButton(handle, b, down, pad) },
+                    afterMs,
+                )
+            }
+        }
     }
 
     private fun ringNavFor(bit: Int): RingNav? = when (bit) {
@@ -1047,6 +1062,19 @@ class GamepadRouter(
          */
         internal fun completesChord(wasHeld: Int, bit: Int, chord: Int): Boolean =
             wasHeld and bit == 0 && bit and chord != 0 && (wasHeld or bit) and chord == chord
+
+        /**
+         * A synthetic tap's wire events as (bit, down, after ms) — pf-client-core's
+         * `tap_events`: each press [TAP_PRESS_MS] after the one before, then every release
+         * together, last pressed first. Apart, because core folds per-transition sends into one
+         * state, and because a chord's first button has to be held before its second counts.
+         * A [android.os.Handler] runs equal delays in the order they were posted.
+         */
+        internal fun tapEvents(presses: List<Int>): List<Triple<Int, Boolean, Long>> {
+            val downs = presses.mapIndexed { i, bit -> Triple(bit, true, i * TAP_PRESS_MS) }
+            val up = presses.size * TAP_PRESS_MS
+            return downs + presses.reversed().map { Triple(it, false, up) }
+        }
 
         /**
          * Whether pressing [bit] on a pad holding [held] opens the quick-action ring: A, with

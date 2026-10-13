@@ -44,11 +44,17 @@ internal class StreamUi(
     /** Whether a capture is actually RUNNING, not merely wanted — from what nativeMicActive reports. */
     var micRunning by mutableStateOf(false)
 
-    /** Transient confirmation of a mic-chord toggle (null = nothing showing). */
+    /** Transient confirmation of a mic toggle, whichever control made it (null = nothing showing). */
     var micHint by mutableStateOf<String?>(null)
 
     /** A captured pad has a gyro this session's virtual controller cannot carry. Shown briefly. */
     var motionHint by mutableStateOf(false)
+
+    /**
+     * The stream holds the screen awake ([NativeBridge.nativeHoldsScreenAwake]). The activity's
+     * window and a second screen's picture window both follow it.
+     */
+    var screenHeld by mutableStateOf(true)
 
     /**
      * Whether this session has a controller — seeded from the router the moment it is built and
@@ -71,10 +77,14 @@ internal class StreamUi(
      */
     var audioMute by mutableIntStateOf(0)
 
-    /** The one place mute is toggled — Compose state + the native flag, always together. */
+    /**
+     * The one place mute is toggled: Compose state, the native flag and the hint that says so,
+     * always together. The chord and the dial both come through here.
+     */
     fun mute(muted: Boolean) {
         micMuted = muted
         NativeBridge.nativeSetMicMuted(handle, muted)
+        micHint = if (muted) "Microphone muted" else "Microphone live"
     }
 
     /** Same, for this device's speakers. Never reaches the host — see [NativeBridge.nativeSetStreamMuted]. */

@@ -373,3 +373,120 @@ where
         end();
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::gamelease::{GameRef, GameState, LeaseKind, EXIT_CONFIRM, SHIM_WINDOW};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A title with nothing to recognize it by: the pid the host starts is the only signal.
+    fn target(id: &str) -> LaunchTarget {
+        LaunchTarget {
+            game: GameRef {
+                id: Some(id.into()),
+                store: Some("custom".into()),
+                title: format!("Test Title {id}"),
+            },
+            launcher: false,
+            detect: crate::library::DetectSpec::default(),
+            command: None,
+            own_workspace: false,
+            on_window: crate::library::OnWindow::default(),
+        }
+    }
+
+    fn owner(fingerprint: &str) -> LaunchOwner {
+        LaunchOwner {
+            client: "test".into(),
+            fingerprint: Some(fingerprint.into()),
+            plane: Plane::Native,
+            preset: None,
+            profile: None,
+            pad: punktfunk_core::config::GamepadPref::default(),
+            pad_slots: None,
+        }
+    }
+
+    /// A reconnect adopts the running launch and spawns nothing, so its lease gets no pid
+    /// of its own. It still has to watch the process the first session started: quitting the
+    /// game must end the session that came back. The Windows pid-only shape, driven here.
+    #[test]
+    fn a_reconnect_still_ends_when_the_first_sessions_game_exits() {
+        let (fp, id) = ("fp-adopt-exit", "custom:adopt-exit");
+        let (target, owner) = (target(id), owner(fp));
+        let mut game = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn the fake game");
+
+        let claim =
+            crate::launchreg::claim(Some(fp), Some(id), false, crate::gamelease::launch_clock());
+        assert!(claim.must_spawn(), "the first session starts the title");
+        claim.launched();
+        let spawned = Spawned {
+            now: true,
+            pid: Some(game.id()),
+            ..Spawned::default()
+        };
+        let first = lease(
+            &target,
+            &owner,
+            claim.stamp(),
+            Some(&claim),
+            spawned,
+            LeaseExtras::default(),
+            Box::new(|| {}),
+        );
+        assert!(matches!(first.shared().kind(), LeaseKind::Child));
+        // Past the shim window the pid is the game, and the record learns it.
+        std::thread::sleep(SHIM_WINDOW + Duration::from_millis(1_500));
+        assert_eq!(first.shared().state(), GameState::Running);
+        drop(first);
+        drop(claim);
+
+        let claim =
+            crate::launchreg::claim(Some(fp), Some(id), false, crate::gamelease::launch_clock());
+        assert!(
+            !claim.must_spawn(),
+            "the reconnect adopts the running launch"
+        );
+        assert_eq!(claim.adopted(), Some(crate::launchreg::Liveness::Running));
+        let exits = Arc::new(AtomicUsize::new(0));
+        let seen = exits.clone();
+        let second = lease(
+            &target,
+            &owner,
+            claim.stamp(),
+            Some(&claim),
+            Spawned::default(),
+            LeaseExtras::default(),
+            Box::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert!(
+            matches!(second.shared().kind(), LeaseKind::Adopted),
+            "the lease of a reconnect must watch what the first session started"
+        );
+
+        // The player quits. Reaped here: a zombie keeps `/proc/<pid>` and looks alive.
+        let _ = game.kill();
+        let _ = game.wait();
+        let deadline = Instant::now() + EXIT_CONFIRM + Duration::from_secs(5);
+        while Instant::now() < deadline && exits.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            exits.load(Ordering::SeqCst),
+            1,
+            "quitting the game after a reconnect must end the session"
+        );
+        assert_eq!(second.shared().state(), GameState::Exited);
+        drop(second);
+        // The registry is process-wide: leave it as it was.
+        claim.abandon();
+    }
+}

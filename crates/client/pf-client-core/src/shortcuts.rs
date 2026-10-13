@@ -3,8 +3,8 @@
 //! Data only: the Linux and Windows clients and the console draw it in their own UI. Each
 //! list is what that client binds, so a row here moves with the binding it names
 //! (`pf-presenter`'s `chord_of`, [`crate::gamepad`]'s Select chords and escape chord, the
-//! Android client's key and touch handlers, the webOS client's remote and dial, the browser's
-//! `input.ts`).
+//! Android client's key and touch handlers, the Apple client's `macChords` and `padChords`,
+//! the webOS client's remote and dial, the browser's `input.ts`).
 
 /// A client family with its own bindings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,9 +12,11 @@ pub enum Client {
     /// The Vulkan session binary: Linux, Windows and Steam Deck.
     Desktop,
     Android,
-    /// Controller chords only. The Apple About screen lists the keyboard and remote rows, and
-    /// knows which device it runs on.
+    /// An iPhone, iPad or Apple TV. Its keys are a hardware keyboard's, so the caller lists
+    /// them only while one is attached. The Apple About screen lists the remote's rows.
     Apple,
+    /// A Mac: the iPad's chords, plus mouse capture, the mouse mode and fullscreen.
+    Mac,
     /// The LG TV client: Magic Remote colour keys, and its own dial and escape chord.
     WebOS,
     /// The browser page, with a keyboard, a mouse and a pad.
@@ -102,6 +104,38 @@ const ANDROID_KEYS: &[Item] = &[
     item("Ctrl+Alt+Shift+O", "Open the quick actions dial"),
 ];
 
+// Spelled out: the console's font has no ⌃ ⌥ ⌘ ⎋. The Apple About screen lists these rows
+// in symbols (`ShortcutsReference.swift`), and a test holds the two together.
+const MAC_KEYS: &[Item] = &[
+    item("Click", "Capture the mouse and keyboard for the stream"),
+    item(
+        "Control+Option+Shift+Q or Command+Esc",
+        "Release the mouse and keyboard back to this Mac",
+    ),
+    item("Control+Option+Shift+D", "Disconnect"),
+    item("Control+Option+Shift+S", "Cycle the statistics overlay"),
+    item("Control+Option+Shift+O", "Open the quick actions dial"),
+    item("Control+Option+Shift+M", "Switch the mouse mode"),
+    item("Control+Option+Shift+C", "Start or stop clipboard sharing"),
+    item(
+        "Control+Command+F",
+        "Toggle fullscreen (after Command+Esc, or with Capture system shortcuts off)",
+    ),
+    item("Control+Option+Shift+A", "Mute or unmute the microphone"),
+];
+
+const APPLE_KEYS: &[Item] = &[
+    item(
+        "Control+Option+Shift+Q or Command+Esc",
+        "Release the pointer back to this device",
+    ),
+    item("Control+Option+Shift+D", "Disconnect"),
+    item("Control+Option+Shift+S", "Cycle the statistics overlay"),
+    item("Control+Option+Shift+O", "Open the quick actions dial"),
+    item("Control+Option+Shift+C", "Start or stop clipboard sharing"),
+    item("Control+Option+Shift+A", "Mute or unmute the microphone"),
+];
+
 const DESKTOP_TOUCH: &[Item] = &[
     item("Three-finger tap", "Cycle the statistics overlay"),
     item("Two-finger twist", "Open the quick actions dial"),
@@ -163,12 +197,14 @@ const WEB_PAD: &[Item] = &[
 ];
 
 /// The groups a client shows, remote and keyboard first. `touchscreen` is false on a TV, which has no
-/// screen to touch.
+/// screen to touch. An Apple TV binds no keys either.
 pub fn groups(client: Client, touchscreen: bool) -> Vec<Group> {
     let (remote, keys, touch, pad): (&[Item], &[Item], &[Item], &[Item]) = match client {
         Client::Desktop => (&[], DESKTOP_KEYS, DESKTOP_TOUCH, DESKTOP_PAD),
         Client::Android => (&[], ANDROID_KEYS, ANDROID_TOUCH, ANDROID_PAD),
+        Client::Apple if touchscreen => (&[], APPLE_KEYS, &[], APPLE_PAD),
         Client::Apple => (&[], &[], &[], APPLE_PAD),
+        Client::Mac => (&[], MAC_KEYS, &[], APPLE_PAD),
         Client::WebOS => (WEBOS_REMOTE, &[], &[], WEBOS_PAD),
         Client::Web => (&[], WEB_KEYS, &[], WEB_PAD),
         Client::Tizen => (TIZEN_REMOTE, TIZEN_KEYS, &[], WEB_PAD),
@@ -207,10 +243,11 @@ pub fn groups(client: Client, touchscreen: bool) -> Vec<Group> {
 mod tests {
     use super::*;
 
-    const ALL: [Client; 6] = [
+    const ALL: [Client; 7] = [
         Client::Desktop,
         Client::Android,
         Client::Apple,
+        Client::Mac,
         Client::WebOS,
         Client::Web,
         Client::Tizen,
@@ -239,8 +276,68 @@ mod tests {
                 .flat_map(|g| g.items)
                 .any(|i| i.keys == "Select + X")
         };
-        assert!(has(Client::Desktop) && has(Client::Android) && has(Client::Apple));
+        assert!(has(Client::Desktop) && has(Client::Android));
+        assert!(has(Client::Apple) && has(Client::Mac));
         assert!(!has(Client::WebOS) && !has(Client::Web) && !has(Client::Tizen));
+    }
+
+    /// The Apple About screen's keyboard rows for one platform, symbols spelled out as the
+    /// lists here write them. Its file opens each platform's rows with `from` and ends the
+    /// keyboard group at the first `groups.append`.
+    fn about_rows(from: &str) -> Vec<(String, String)> {
+        const ABOUT: &str = include_str!(
+            "../../../../clients/apple/Sources/PunktfunkClient/Settings/ShortcutsReference.swift"
+        );
+        let spell = |s: &str| {
+            [
+                ("⌃", "Control+"),
+                ("⌥", "Option+"),
+                ("⇧", "Shift+"),
+                ("⌘", "Command+"),
+                ("⎋", "Esc"),
+            ]
+            .iter()
+            .fold(s.to_string(), |s, (symbol, word)| s.replace(symbol, word))
+        };
+        let block = ABOUT.split_once(from).expect("the platform's rows").1;
+        let block = block.split_once("groups.append").expect("the group").0;
+        block
+            .split(".init(keys: \"")
+            .skip(1)
+            .map(|row| {
+                let (keys, rest) = row.split_once("\", text: \"").expect("a row's text");
+                let text = rest.split_once("\")").expect("a row's end").0;
+                (spell(keys), spell(text))
+            })
+            .collect()
+    }
+
+    /// The console and the About screen name one set of bindings. A row added to either has
+    /// to reach the other, in the same order.
+    #[test]
+    fn the_apple_keys_are_the_rows_the_about_screen_lists() {
+        let ours = |items: &[Item]| -> Vec<(String, String)> {
+            items
+                .iter()
+                .map(|i| (i.keys.to_string(), i.text.to_string()))
+                .collect()
+        };
+        assert_eq!(ours(MAC_KEYS), about_rows("#if os(macOS)"));
+        assert_eq!(
+            ours(APPLE_KEYS),
+            about_rows("#elseif os(iOS) || os(visionOS)")
+        );
+    }
+
+    #[test]
+    fn an_apple_tv_lists_no_keys() {
+        let keys = |c, touchscreen| {
+            groups(c, touchscreen)
+                .iter()
+                .any(|g| g.kind == Kind::Keyboard)
+        };
+        assert!(keys(Client::Apple, true) && keys(Client::Mac, true));
+        assert!(!keys(Client::Apple, false));
     }
 
     #[test]

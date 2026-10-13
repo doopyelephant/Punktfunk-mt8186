@@ -48,6 +48,14 @@ object Gamepad {
     const val BTN_TOUCHPAD = 0x100000
     const val BTN_MISC1 = 0x200000
 
+    /**
+     * What a synthetic Quick Access tap presses, in order (punktfunk-core's
+     * `quick_access_presses`). A pad with the button takes [BTN_MISC1]. Every other pad takes
+     * the chord Steam reads there: Guide held, then A.
+     */
+    fun quickAccessPresses(hasButton: Boolean): List<Int> =
+        if (hasButton) listOf(BTN_MISC1) else listOf(BTN_GUIDE, BTN_A)
+
     // Axis ids — must equal `input.rs::gamepad::AXIS_*`.
     const val AXIS_LS_X = 0
     const val AXIS_LS_Y = 1

@@ -86,6 +86,16 @@ pub(crate) struct Filter {
     imu: ImuGate,
 }
 
+/// Whether an id-first state report has a button held, for the keep-awake rule. A raw pad's
+/// buttons ride no other event; its IMU fills every report, held or not.
+pub(crate) fn holds_button(r: &[u8]) -> bool {
+    matches!(
+        r.first(),
+        Some(&(ID_STATE | ID_STATE_BLE | ID_STATE_TIMESTAMP))
+    ) && r.len() >= 6
+        && r[2..6] != [0; 4]
+}
+
 impl Filter {
     /// Gate one id-first report in place. False for a report that stays off the wire: the host
     /// keeps its own Puck connect edges.
@@ -185,6 +195,19 @@ impl ImuGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A raw report is play only with a button held: the IMU fills every one.
+    #[test]
+    fn only_a_held_button_counts_as_play() {
+        let mut r = [0u8; 12];
+        r[0] = ID_STATE;
+        r[8] = 0x55;
+        assert!(!holds_button(&r));
+        r[3] = 1;
+        assert!(holds_button(&r));
+        assert!(!holds_button(&[ID_WIRELESS, 0, 1, 1, 1, 1]));
+        assert!(!holds_button(&[ID_STATE, 0, 1]));
+    }
 
     const OPEN: Sc2Gate = Sc2Gate {
         masked: false,

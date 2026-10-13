@@ -292,16 +292,16 @@ struct StreamBadgeStack: View {
                     label: model.notices.accessLevel.label, remainingSecs: model.notices.accessRemainingSecs)
                     .transition(Self.pop)
             }
-            // Up for as long as the mic is muted, at every stats tier (see MicMutedBadge).
-            if captureEnabled && model.micMuted {
-                MicMutedBadge { model.setMicMuted(false) }.transition(Self.pop)
+            // For a moment after each mute or unmute, at every stats tier (see MicNoticeBadge).
+            if captureEnabled, let muted = model.notices.micMute.value {
+                MicNoticeBadge(muted: muted).transition(Self.pop)
             }
             #endif
         }
         .padding(.bottom, 24)
         // The badges' visibility drivers, the stats tier included (the access chip rides it). A
         // badge whose driver is missing here pops in unanimated.
-        .animation(.easeOut(duration: 0.2), value: model.micMuted)
+        .animation(.easeOut(duration: 0.2), value: model.notices.micMute.value)
         .animation(.easeOut(duration: 0.2), value: model.notices.accessWarning.value)
         .animation(.easeOut(duration: 0.2), value: model.notices.launch.value)
         .animation(.easeOut(duration: 0.2), value: model.notices.accessLimited)
@@ -331,7 +331,7 @@ struct ExitHintBadge: View {
 /// meets a session whose virtual controller has no motion plane (an X-Box class pad has no gyro in
 /// its HID contract, so every sample would be decoded and dropped).
 ///
-/// Not a control, unlike `MicMutedBadge`: the fix is the Controller type setting, which is not
+/// Not a control: the fix is the Controller type setting, which is not
 /// reachable mid-stream on every platform, and changing it applies from the next session anyway.
 /// So this states the fact and names the setting, in the HUD's glass language, and gets out of the
 /// way — the alternative is what shipped before, which was a gyro that silently did nothing with
@@ -449,37 +449,33 @@ struct AccessWarningBadge: View {
 }
 
 #if !os(tvOS)
-/// The muted-microphone badge — the mute STATE, as opposed to the buttons that flip it. It rides
-/// over the stream whenever the mic is muted, INDEPENDENT of the stats overlay (which the user
-/// may have cycled off, and which the compact tier reduces to a stat line): "am I muted?" is not a
-/// statistic, and a mute you can't see is how people talk to nobody for a minute. Same glass
-/// language as the HUD, sized like the start-of-stream banner it shares the bottom edge with.
+/// The microphone notice: "Microphone muted" or "Microphone live", for a moment after the
+/// switch, whichever surface made it. It rides over the stream INDEPENDENT of the stats overlay
+/// (which the user may have cycled off), in the HUD's glass language, sized like the
+/// start-of-stream banner it shares the bottom edge with.
 ///
-/// It is also a control: tapping it unmutes. That is the guaranteed way back for a touch user who
-/// muted with the overlay off, and it costs the badge nothing (it is on screen either way).
-struct MicMutedBadge: View {
-    let onUnmute: () -> Void
+/// Not a standing badge and not a control. The state stays readable where it is flipped: the
+/// touch disc and the dial's slot both show it.
+struct MicNoticeBadge: View {
+    let muted: Bool
+
+    private var text: String { muted ? "Microphone muted" : "Microphone live" }
 
     var body: some View {
-        Button(action: onUnmute) {
-            HStack(spacing: 7) {
-                Image(systemName: "mic.slash.fill")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.red)
-                Text("Microphone muted")
-                    .font(.geist(12, .medium, relativeTo: .caption))
-                    .foregroundStyle(.white.opacity(0.9))
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            // interactive: the badge IS the tap target, so the glass reacts to press.
-            .glassBackground(Capsule(), interactive: true)
-            .contentShape(Capsule())
+        HStack(spacing: 7) {
+            Image(systemName: muted ? "mic.slash.fill" : "mic.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(muted ? .red : .green)
+            Text(text)
+                .font(.geist(12, .medium, relativeTo: .caption))
+                .foregroundStyle(.white.opacity(0.9))
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .glassBackground(Capsule())
         .environment(\.colorScheme, .dark) // reads over any frame, like the resize overlay
-        .accessibilityLabel("Microphone muted")
-        .accessibilityHint("Unmutes the microphone")
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(text)
     }
 }
 #endif

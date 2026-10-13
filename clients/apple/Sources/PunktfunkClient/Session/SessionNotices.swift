@@ -44,6 +44,9 @@ struct SessionNotices {
     var sc2Captured = Flash<Bool>()
     /// How to leave, from stream start, unless the player turned it off.
     var exitHint = Flash<Bool>()
+    /// The player just muted the microphone (`true`) or opened it again. Said after the switch
+    /// and then gone: a standing badge over the game is the host's language, not the player's.
+    var micMute = Flash<Bool>()
     /// The touch model is passthrough but this host drops contacts, so the trackpad model runs.
     var touchFallback = Flash<Bool>()
     /// "Access ends in 5 m", around the T−5 m / T−1 m marks the host also warns at.
@@ -70,6 +73,7 @@ struct SessionNotices {
         motionUnreachable.clear()
         sc2Captured.clear()
         exitHint.clear()
+        micMute.clear()
         touchFallback.clear()
         accessWarning.clear()
         launch.clear()

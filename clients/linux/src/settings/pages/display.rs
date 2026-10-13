@@ -74,21 +74,8 @@ pub fn display(b: &mut Build) {
             |s, i| s.smooth_buffer = i.min(SMOOTH_BUFFER_LABELS.len() as u32 - 1) as u8,
         ),
     );
-    let names: Vec<String> = RENDER_SCALES
-        .iter()
-        .map(|&s| render_scale_label(s))
-        .collect();
-    let row = b.choice(
-        &spec::RENDER_SCALE,
-        &names.iter().map(String::as_str).collect::<Vec<_>>(),
-    );
-    b.put(
-        &mut p,
-        None,
-        Field::choice(&spec::RENDER_SCALE, &row, index::render_scale, |s, i| {
-            s.render_scale = *at(&RENDER_SCALES, i)
-        }),
-    );
+    let scale = render_scale(b);
+    b.put(&mut p, None, scale);
     let codec = b.choice(&spec::CODEC, CODEC_LABELS);
     let (quality_field, show_quality) = pyrowave_quality_row(b);
     {
@@ -149,8 +136,10 @@ pub fn display(b: &mut Build) {
     b.finish(p);
 }
 
-/// Decoder and GPU: facts about this device's hardware, never a preset's.
+/// Decoder, GPU and the screen's own saver: facts about this device, never a preset's.
 fn hardware(b: &mut Build, p: &mut PageB) {
+    let (awake, _) = Field::switch(&spec::KEEP_AWAKE, |s| s.keep_awake, |s, v| s.keep_awake = v);
+    b.put(p, None, awake);
     let row = b.choice(
         &spec::DECODER,
         &["Automatic", "Vulkan Video", "VAAPI", "Software"],
@@ -309,6 +298,66 @@ fn resolution(b: &Build) -> Field {
     };
     Field::new(
         &spec::RESOLUTION,
+        &row,
+        widgets,
+        seed,
+        write,
+        || false,
+        watch,
+    )
+}
+
+/// Render scale and the typed Percent behind Custom: the stops, then Custom…. A stored scale
+/// that is no stop seeds Custom, with its percent in the row.
+fn render_scale(b: &Build) -> Field {
+    let names: Vec<String> = RENDER_SCALES
+        .iter()
+        .map(|&s| render_scale_label(s))
+        .chain(["Custom\u{2026}".to_string()])
+        .collect();
+    let choice = b.choice(
+        &spec::RENDER_SCALE,
+        &names.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    let percent = adw::SpinRow::with_range(50.0, 400.0, 1.0);
+    percent.set_title("Percent");
+    percent.set_visible(false);
+    {
+        let percent = percent.clone();
+        choice.connect_changed(move |i| percent.set_visible(i == index::CUSTOM_SCALE));
+    }
+    let widgets = vec![choice.widget().clone().upcast(), percent.clone().upcast()];
+    let row: adw::ActionRow = choice.widget().clone().downcast().expect("an action row");
+    let seed = {
+        let (choice, percent) = (choice.clone(), percent.clone());
+        move |s: &Settings| {
+            let at = index::render_scale(s);
+            percent.set_value(f64::from(punktfunk_core::render_scale::percent(
+                s.render_scale,
+            )));
+            percent.set_visible(at == index::CUSTOM_SCALE);
+            choice.set_selected(at);
+        }
+    };
+    let write = {
+        let (choice, percent) = (choice.clone(), percent.clone());
+        move |s: &mut Settings| {
+            s.render_scale = match RENDER_SCALES.get(choice.selected() as usize) {
+                Some(&stop) => stop,
+                None => punktfunk_core::render_scale::from_percent(percent.value() as u32),
+            };
+        }
+    };
+    let watch = {
+        let (choice, percent) = (choice.clone(), percent);
+        move |f: Rc<dyn Fn()>| {
+            let g = f.clone();
+            choice.connect_changed(move |_| g());
+            percent.connect_value_notify(move |_| f());
+        }
+    };
+    Field::new(
+        &spec::RENDER_SCALE,
         &row,
         widgets,
         seed,

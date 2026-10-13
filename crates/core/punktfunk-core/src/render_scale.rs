@@ -36,6 +36,23 @@ pub fn sanitize(raw: f64) -> f64 {
     raw.clamp(MIN_SCALE, MAX_SCALE)
 }
 
+/// A typed percent as a scale, [`sanitize`]d. A percent, because an on-screen digit pad
+/// has no decimal point, and whole percents keep every client storing the same hundredths.
+pub fn from_percent(percent: u32) -> f64 {
+    sanitize(f64::from(percent) / 100.0)
+}
+
+/// The whole percent a stored scale reads as.
+pub fn percent(scale: f64) -> u32 {
+    (sanitize(scale) * 100.0).round() as u32
+}
+
+/// Which of [`PRESETS`] a stored scale is; `None` for a typed one. Compared in hundredths: a
+/// client that stores a float reads `0.67` back as `0.6700000167`.
+pub fn preset_index(scale: f64) -> Option<usize> {
+    PRESETS.iter().position(|p| (p - scale).abs() < 0.005)
+}
+
 /// Scale a base size: keep aspect, even-floor, uniform-clamp so neither axis
 /// exceeds `max_dim`. Each axis floors at 320×200 (host rejects smaller).
 pub fn apply(base_w: u32, base_h: u32, scale: f64, max_dim: u32) -> (u32, u32) {
@@ -99,6 +116,20 @@ mod tests {
         }
         for row in file["sanitize"].as_array().expect("sanitize") {
             assert_eq!(sanitize(num(&row["raw"])), num(&row["want"]), "{row}");
+        }
+        for row in file["percent"].as_array().expect("percent") {
+            let typed = row["typed"].as_u64().unwrap() as u32;
+            let want = num(&row["want"]);
+            assert_eq!(from_percent(typed), want, "{row}");
+            assert_eq!(
+                u64::from(percent(want)),
+                row["reads"].as_u64().unwrap(),
+                "{row}"
+            );
+        }
+        for row in file["preset"].as_array().expect("preset") {
+            let index = row["index"].as_u64().map(|i| i as usize);
+            assert_eq!(preset_index(num(&row["scale"])), index, "{row}");
         }
         let cases = file["apply"].as_array().expect("apply");
         assert!(

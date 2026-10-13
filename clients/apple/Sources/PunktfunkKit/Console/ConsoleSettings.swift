@@ -136,6 +136,7 @@ public enum ConsoleSettings {
             "gamepad_forwarding", DefaultsKey.gamepadForwarding,
             SettingDefault.gamepadForwarding),
         .bool("pad_rumble", DefaultsKey.padRumble, SettingDefault.padRumble),
+        .bool("keep_awake", DefaultsKey.keepAwake, SettingDefault.keepAwake),
         .string("system_buttons", DefaultsKey.systemButtons, SettingDefault.systemButtons),
         .string("guide_gesture", DefaultsKey.guideGesture, SettingDefault.guideGesture),
         // The tier the stream reads: an install from before the tiers keeps its overlay off.

@@ -67,8 +67,9 @@ struct Drawn {
     access: Option<String>,
     /// Access toast; occupies the hint pill's slot while up.
     notice: Option<String>,
-    mic_muted: bool,
-    /// Standing mute badge: the sentence, or empty while the stream is audible.
+    /// The microphone's notice: muted, live, or none showing.
+    mic_notice: Option<bool>,
+    /// The speakers' mute badge: the sentence, or empty while none shows.
     audio_mute: String,
     /// UI scale in percent. Text is identical across monitors, so scale must live in the key.
     scale_pct: u16,
@@ -503,7 +504,7 @@ impl Overlay for SkiaOverlay {
             && ctx.hint.is_none()
             && ctx.access.is_none()
             && ctx.notice.is_none()
-            && !ctx.mic_muted
+            && ctx.mic_notice.is_none()
             && ctx.audio_mute.is_none()
             && banner_step == 0
             && resize_step == 0
@@ -527,7 +528,7 @@ impl Overlay for SkiaOverlay {
             hint: ctx.hint.map(str::to_owned),
             access: ctx.access.map(str::to_owned),
             notice: ctx.notice.map(str::to_owned),
-            mic_muted: ctx.mic_muted,
+            mic_notice: ctx.mic_notice,
             audio_mute: ctx.audio_mute.unwrap_or_default().to_owned(),
             scale_pct: (scale * 100.0).round() as u16,
             banner_step,
@@ -559,13 +560,14 @@ impl Overlay for SkiaOverlay {
             draw_osd_panel(canvas, font, stats, size, osd_scale, ctx.stats_corner);
         }
         // Top-right, stacked in a fixed order, and top-left while the stats panel holds the
-        // top right: never under the panel or the bottom pill, even at stats Off. The mute
-        // badges persist, because what they report does not go away on its own.
+        // top right: never under the panel or the bottom pill, even at stats Off. A host
+        // mute stands; the player's own switches say so for a moment and go.
         let left = want.stats.is_some() && ctx.stats_corner == HudCorner::TopRight;
         let mut row = 0;
-        if want.mic_muted {
+        if let Some(muted) = want.mic_notice {
             let at = (ctx.width, row, left);
-            corner_pill(canvas, font, "Microphone muted", true, at, scale);
+            let text = punktfunk_core::client::mic_mute_label(muted);
+            corner_pill(canvas, font, text, muted, at, scale);
             row += 1;
         }
         if !want.audio_mute.is_empty() {

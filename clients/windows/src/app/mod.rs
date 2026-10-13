@@ -347,6 +347,8 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
     // Resolution is on Custom… while the size typed there still matches a listed one. Root
     // state for the same reason.
     let (settings_custom_res, set_settings_custom_res) = cx.use_async_state(false);
+    // The same for Render scale: on Custom… while the stored scale is still a listed stop.
+    let (settings_custom_scale, set_settings_custom_scale) = cx.use_async_state(false);
     // Bumped when a settings edit changes what the page should SHOW without changing any state
     // it already reads — ANY edit through `settings::commit` (creating an override must surface
     // its marker as immediately as resetting one clears it), a reset, a preset colour change.
@@ -673,6 +675,8 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
             &set_settings_edit,
             settings_custom_res,
             &set_settings_custom_res,
+            settings_custom_scale,
+            &set_settings_custom_scale,
             settings_rev,
             &set_settings_rev,
             &set_status,

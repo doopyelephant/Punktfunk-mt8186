@@ -181,8 +181,11 @@ impl Shell {
             disconnect_rx,
             audio_mute_at: Instant::now(),
             audio_mute_seen: 0,
+            mic_muted_seen: false,
+            mic_muted_at: None,
             ring_opener: None,
             ring_was_open: false,
+            screen_held: true,
             chord_rx,
             escape_rx,
             pump,
@@ -369,6 +372,15 @@ impl Shell {
             // the pump knows whether an uplink exists, and a mirrored copy would go stale
             // at session end.
             let mic_muted = stream.as_ref().is_some_and(|st| st.handle.mic.muted());
+            // A switch inside a stream starts the notice's clock. A stream ending muted is
+            // not the player unmuting, so that edge clears it instead.
+            if mic_muted != self.mic_muted_seen {
+                self.mic_muted_seen = mic_muted;
+                self.mic_muted_at = stream.is_some().then(Instant::now);
+            }
+            let mic_notice = self
+                .mic_muted_at
+                .and_then(|at| punktfunk_core::client::mic_mute_notice(mic_muted, at.elapsed()));
             // The badge clears itself once a local mute has been read; the mask's own clock
             // lives here because only the frame loop knows when it last moved.
             let audio_mute = stream
@@ -382,6 +394,26 @@ impl Shell {
                     }
                     punktfunk_core::client::audio_mute_notice(mask, self.audio_mute_at.elapsed())
                 });
+            // SDL holds the screen saver off for as long as the window lives. A stream whose
+            // player turned "Keep screen awake" off gives it back once their input goes quiet,
+            // so the desktop's own saver runs over a game left alone. No stream holds as before.
+            let hold = stream
+                .as_ref()
+                .and_then(|st| Some((st, st.connector.as_ref()?)))
+                .is_none_or(|(st, c)| {
+                    punktfunk_core::client::holds_screen_awake(st.params.keep_awake, c.input_idle())
+                });
+            if hold != self.screen_held {
+                self.screen_held = hold;
+                let set = if hold {
+                    self.sdl_video.disable_screen_saver()
+                } else {
+                    self.sdl_video.enable_screen_saver()
+                };
+                if let Err(e) = set {
+                    tracing::debug!(error = %e, hold, "screen saver hold not changed");
+                }
+            }
             let ring_facts = stream
                 .as_ref()
                 .filter(|st| st.connector.is_some())
@@ -413,7 +445,7 @@ impl Shell {
                 hint,
                 access: access_chip.as_deref(),
                 notice: session_notice,
-                mic_muted,
+                mic_notice,
                 audio_mute,
                 resizing,
                 pad: pad.as_ref().map(|p| p.name.as_str()),

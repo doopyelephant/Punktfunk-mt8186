@@ -576,6 +576,17 @@ object NativeBridge {
     external fun nativeSetInvertScroll(handle: Long, invert: Boolean): Boolean
 
     /**
+     * Whether this stream holds the screen awake right now: always with [keepAwake] (the "Keep
+     * screen awake" setting) on, else only while the player's input is recent, so the device's
+     * own timeout runs over a game left alone.
+     *
+     * Answered natively, off `punktfunk_core::client::holds_screen_awake`: every input this
+     * client forwards passes through the session, which is the one clock for "recent". Poll it
+     * every few seconds. `true` when the session handle is dead.
+     */
+    external fun nativeHoldsScreenAwake(handle: Long, keepAwake: Boolean): Boolean
+
+    /**
      * One REAL touchscreen transition (the touch-passthrough input mode). [kind]: 0=down 1=move
      * 2=up. [id] distinguishes fingers and is reusable after up; coordinates are pixels on the
      * client's touch surface — the host rescales against [surfaceWidth]×[surfaceHeight] and
@@ -722,6 +733,17 @@ object NativeBridge {
      * suppress" is the safe answer whenever we cannot tell.
      */
     external fun nativePadMotionReaches(handle: Long, declaredPref: Int): Boolean
+
+    /**
+     * Whether the host's device for a pad that declared [declaredPref] has a Quick Access button,
+     * so a synthetic Quick Access tap presses [Gamepad.BTN_MISC1] there and Steam's chord
+     * everywhere else ([Gamepad.quickAccessPresses]). A negative [declaredPref] is a pad that
+     * never declared: the session default answers for it.
+     *
+     * Answered natively, off `punktfunk_core::config::pad_has_quick_access`, for the reason
+     * [nativePadMotionReaches] is. `false` when the session handle is dead.
+     */
+    external fun nativePadHasQuickAccess(handle: Long, declaredPref: Int): Boolean
 
     /**
      * The console's outline for a GamepadPref wire byte's pad family, as 24-unit SVG path data,

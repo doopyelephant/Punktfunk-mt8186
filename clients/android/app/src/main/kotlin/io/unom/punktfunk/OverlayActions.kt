@@ -34,7 +34,7 @@ sealed class SlotId {
     /** The host's guide button (Xbox / PS / Steam), as a synthetic pad tap. */
     object Guide : SlotId()
 
-    /** The host's quick-access button — `BTN_MISC1`, the Deck's `…`. */
+    /** The host's Quick Access: the Deck's `…` where the pad has it, Steam's chord elsewhere. */
     object Qam : SlotId()
 
     /** Controller mouse: the pad drives the host pointer instead of its virtual pad. */

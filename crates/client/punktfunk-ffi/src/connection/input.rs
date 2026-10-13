@@ -27,6 +27,25 @@ pub unsafe extern "C" fn punktfunk_connection_send_input(
     })
 }
 
+/// Whether this stream holds the screen awake right now. `keep_awake` is the "Keep screen
+/// awake" setting: on, always. Off, only while the player's input is recent, so the device's
+/// own idle timer runs over a game left alone. Poll every few seconds; `*out` is filled when
+/// non-NULL.
+///
+/// # Safety
+/// `c` is a valid connection handle; `out` is NULL or writable for one `bool`.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_holds_screen_awake(
+    c: *const PunktfunkConnection,
+    keep_awake: bool,
+    out: *mut bool,
+) -> PunktfunkStatus {
+    conn_out!(c, out => {
+        punktfunk_core::client::holds_screen_awake(keep_awake, c.inner.input_idle())
+    })
+}
+
 /// Send one Opus mic frame (48 kHz) as a QUIC datagram. The host decodes it into
 /// a virtual microphone. Non-blocking; `seq`/`pts_ns` are diagnostics only.
 /// Empty `opus_data`/`len` is DTX. Data is copied before return.

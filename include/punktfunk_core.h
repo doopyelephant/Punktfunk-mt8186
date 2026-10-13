@@ -369,7 +369,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 50
+#define PUNKTFUNK_ABI_VERSION 51
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -3034,6 +3034,19 @@ PunktfunkStatus punktfunk_connection_shard_payload(PunktfunkConnection *c, uint3
 // `c` is a valid connection handle; `ev` points to a readable `InputEvent`-sized allocation.
 PunktfunkStatus punktfunk_connection_send_input(PunktfunkConnection *c,
                                                 const PunktfunkInputEvent *ev);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Whether this stream holds the screen awake right now. `keep_awake` is the "Keep screen
+// awake" setting: on, always. Off, only while the player's input is recent, so the device's
+// own idle timer runs over a game left alone. Poll every few seconds; `*out` is filled when
+// non-NULL.
+//
+// # Safety
+// `c` is a valid connection handle; `out` is NULL or writable for one `bool`.
+PunktfunkStatus punktfunk_connection_holds_screen_awake(const PunktfunkConnection *c,
+                                                        bool keep_awake,
+                                                        bool *out);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

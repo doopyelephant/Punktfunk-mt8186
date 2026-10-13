@@ -24,7 +24,7 @@ it overrides shows either way.
 The advanced rows are **Advanced statistics**, **Statistics position**, **Statistics size**, **Exit
 hint**, **Reduce interface resolution**, **Smoothness buffer**, **Render scale**, **Video codec**,
 **Full chroma (4:4:4)**, **10-bit SDR**, **V-Sync**, **Follow variable refresh**, **Host
-compositor**, **Video decoder**, **GPU**, **Low-latency mode**, **Audio quality**, **Keep host audio playing**, **Echo cancellation**, **Forward controllers**,
+compositor**, **Video decoder**, **GPU**, **Low-latency mode**, **Keep screen awake**, **Audio quality**, **Keep host audio playing**, **Echo cancellation**, **Forward controllers**,
 **Use controller**, **Guide button**, **Hold Select for guide**, **Controller haptics**,
 **Controller speaker**, **Steam Controller 2 passthrough** and **DualSense over USB**.
 
@@ -43,7 +43,7 @@ Android. Most settings can differ per [preset](/docs/presets-and-links); the exc
 | **Match window** | Off | The stream follows the window's size; each resize renegotiates. Fullscreen uses the screen's own mode. | Linux, Windows, Mac, iPhone, iPad, console |
 | **Refresh rate** | Native | The stream's frame rate. | All. Apple TV sets it with **Stream mode**. |
 | **Bitrate** | Automatic | The whole budget on the wire: video, error correction and audio. **Automatic** starts at 20 Mbps, adapts to the link and never drops below 2 Mbps. A fixed rate holds for the session. | All. iPhone, iPad and Mac: **Automatic bitrate** plus a slider; elsewhere type any rate. |
-| **Render scale** | Native (1×) | The host renders at your resolution times this, 0.5× to 4×; your device scales the picture to the window. Above 1× is sharper and costs bandwidth. | All |
+| **Render scale** | Native (1×) | The host renders at your resolution times this, 0.5× to 4×: pick a stop, or type any percent from 50 to 400. Your device scales the picture to the window. Above 1× is sharper and costs bandwidth. | All |
 | **Picture fit** | Fit | When the stream's shape differs from the screen: **Fit** adds black bars, **Crop to fill** cuts the edges, **Stretch to fill** distorts. | All. On Android 9, **Crop to fill** squeezes instead. |
 | **Second screen** | On | A dual-screen handheld's lower panel, or a foldable half open, shows the companion panel — or the picture, with **Screens** ([dual-screen handhelds](/docs/input#dual-screen-handhelds)). Off keeps the stream on this screen and leaves the other to the system: for a phone on a TV. A preset can carry it. | Android |
 | **Video codec** | Automatic | Your pick when the host can encode it, otherwise HEVC, then AV1, then H.264. [PyroWave](/docs/pyrowave) is never picked automatically. | All. Apple and Android hide AV1 and PyroWave when the device can't decode them; the console marks them **(unsupported)**. |
@@ -58,6 +58,7 @@ Android. Most settings can differ per [preset](/docs/presets-and-links); the exc
 | **Host compositor** | Automatic | Which backend a Linux host uses for the virtual display. A host without it picks its own. | All |
 | **Video decoder**, **GPU** | Automatic | The decoder and graphics card this device uses. Change them only to debug; `PUNKTFUNK_DECODER` [overrides](/docs/configuration#client-side-native-clients) the decoder. | Linux, Windows. **GPU**: Windows, and Linux with more than one GPU. |
 | **Low-latency mode** | On | Asks the decoder and system for their low-latency paths. Turn it off if a device misbehaves. | Android |
+| **Keep screen awake** | On | Off, a stream keeps the screen awake only while you play: five minutes after your last key, touch or controller input, this device's own screen saver or sleep takes over. | Linux, Windows, Android, Apple |
 
 **Test network speed…** in a host card's menu measures the link — what it carries, then loss and
 jitter at half of that, a rate the link holds — and suggests a bitrate (Android: **Network speed

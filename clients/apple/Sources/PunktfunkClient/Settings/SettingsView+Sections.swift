@@ -443,6 +443,13 @@ extension SettingsView {
                     "Host compositor", options: SettingsOptions.compositors,
                     selection: scoped(SettingsFields.compositor))
             }
+            // This device's screen, so never a preset's.
+            if !inPresetScope {
+                described("Off, a stream keeps the screen awake only while you play. Left alone "
+                    + "for five minutes, it lets this device's own sleep timer take over.") {
+                    Toggle("Keep screen awake", isOn: $keepAwake)
+                }
+            }
         }
     }
 
@@ -458,7 +465,7 @@ extension SettingsView {
             e.presentPriority == "smooth" && e.smoothBuffer != d.smoothBuffer,
             e.renderScale != d.renderScale, e.codec != d.codec,
             pyroWaveRate && e.pyrowaveBppX100 != d.pyrowaveBppX100, e.enable444 != d.enable444,
-            e.tenBitSdr != d.tenBitSdr, e.compositor != d.compositor,
+            e.tenBitSdr != d.tenBitSdr, e.compositor != d.compositor, !keepAwake,
         ]
         #if os(macOS)
         changed.append(e.vsync != d.vsync)
@@ -484,14 +491,90 @@ extension SettingsView {
     /// Render-scale picker + the resulting host resolution. > 1 supersamples (sharper, at more
     /// bandwidth AND client decode); < 1 renders under native (lighter). The presenter resamples the
     /// decoded frame to this display, so the multiplier is where the sharpness/cost trade-off lives.
+    /// Any percent from 50 to 400 can be typed: "Custom…" shows the field, a TV has its own row.
     @ViewBuilder var renderScaleRow: some View {
+        #if os(tvOS)
+        described(renderScaleDescription, field: "render_scale") {
+            TVSelectionRow(
+                title: "Render scale", options: tvScaleOptions,
+                selection: scoped(SettingsFields.renderScale))
+        }
+        described("Any scale, typed as a percent from 50 to 400.", field: "render_scale") {
+            TVFieldRow(
+                label: "Custom scale",
+                value: RenderScale.presetIndex(effective.renderScale) == nil
+                    ? "\(RenderScale.percent(effective.renderScale)) %" : "",
+                placeholder: "Type a percent"
+            ) { typingScale = true }
+            .fullScreenCover(isPresented: $typingScale) {
+                TVTextEntry(title: "Render scale (percent)", text: "", keyboardType: .numberPad) {
+                    if let percent = Int($0), percent > 0 {
+                        scoped(SettingsFields.renderScale).wrappedValue =
+                            RenderScale.fromPercent(percent)
+                    }
+                    typingScale = false
+                }
+            }
+        }
+        #else
         described(renderScaleDescription, field: "render_scale") {
             settingPicker(
                 "Render scale",
-                options: RenderScale.presets.map { (label: RenderScale.label($0), tag: $0) },
-                selection: scoped(SettingsFields.renderScale))
+                options: RenderScale.presets.map { (label: RenderScale.label($0), tag: $0) }
+                    + [(label: "Custom…", tag: Self.customScaleTag)],
+                selection: renderScaleSelection)
         }
+        if isCustomScale {
+            TextField("Percent", value: customScalePercent, format: .number.grouping(.never))
+        }
+        #endif
     }
+
+    #if os(tvOS)
+    /// The stops, plus a typed scale that is none of them, so the row always reads what is stored.
+    private var tvScaleOptions: [(label: String, tag: Double)] {
+        var options = RenderScale.presets.map { (label: RenderScale.label($0), tag: $0) }
+        let stored = effective.renderScale
+        if RenderScale.presetIndex(stored) == nil {
+            options.append((label: RenderScale.label(stored) + " (custom)", tag: stored))
+        }
+        return options
+    }
+    #else
+    /// Sentinel tag for the picker's "Custom…" row: no multiplier is negative.
+    private static let customScaleTag = -1.0
+
+    /// True when the percent field should show: the picker is parked on "Custom…" (sticky), or
+    /// the stored multiplier is none of the stops (typed here, or on another client).
+    private var isCustomScale: Bool {
+        customScaleMode || RenderScale.presetIndex(effective.renderScale) == nil
+    }
+
+    /// The picker works in multiplier tags; the sentinel toggles `customScaleMode` and leaves the
+    /// stored value alone. A float-stored stop selects its exact tag.
+    private var renderScaleSelection: Binding<Double> {
+        let scale = scoped(SettingsFields.renderScale)
+        return Binding(
+            get: {
+                guard !isCustomScale, let i = RenderScale.presetIndex(scale.wrappedValue)
+                else { return Self.customScaleTag }
+                return RenderScale.presets[i]
+            },
+            set: { tag in
+                customScaleMode = tag == Self.customScaleTag
+                if tag != Self.customScaleTag { scale.wrappedValue = tag }
+            })
+    }
+
+    /// The typed percent, applied when the field commits (Return or focus loss), so a half-typed
+    /// number is never clamped under the thumb.
+    private var customScalePercent: Binding<Int> {
+        let scale = scoped(SettingsFields.renderScale)
+        return Binding(
+            get: { RenderScale.percent(scale.wrappedValue) },
+            set: { scale.wrappedValue = RenderScale.fromPercent($0) })
+    }
+    #endif
 
     /// Render scale explained, with the CONCRETE host resolution when it applies — the cost made
     /// legible. Only the explicit mode can show it (match-window derives the base from the live

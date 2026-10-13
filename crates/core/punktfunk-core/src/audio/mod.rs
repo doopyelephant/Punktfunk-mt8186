@@ -69,6 +69,22 @@ pub fn audio_mute_notice(mask: u8, since: Duration) -> Option<&'static str> {
     audio_mute_label(mask)
 }
 
+/// The microphone's notice, `since` the player last muted or opened it: `Some(muted)` for
+/// [`LOCAL_MUTE_NOTICE`], then `None`. The player's own switch says so long enough to read
+/// and then leaves the picture alone, as a local speaker mute does ([`audio_mute_notice`]).
+pub fn mic_mute_notice(muted: bool, since: Duration) -> Option<bool> {
+    (since < LOCAL_MUTE_NOTICE).then_some(muted)
+}
+
+/// What [`mic_mute_notice`] says on screen.
+pub const fn mic_mute_label(muted: bool) -> &'static str {
+    if muted {
+        "Microphone muted"
+    } else {
+        "Microphone live"
+    }
+}
+
 /// Opus-plane frame length in milliseconds, and the default. One datagram carries exactly one
 /// ([`crate::quic::encode_audio_datagram`]), so it is also the smallest shed unit.
 ///

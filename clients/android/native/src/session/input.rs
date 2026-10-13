@@ -510,6 +510,37 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMotionRe
     })
 }
 
+/// `NativeBridge.nativePadHasQuickAccess(handle, declaredPref)` — whether the host's device for a
+/// pad that declared `declaredPref` has a Quick Access button, so a synthetic Quick Access tap
+/// presses `MISC1` there and Steam's chord everywhere else. A negative `declaredPref` is a pad
+/// that never declared: the session default answers for it.
+///
+/// Answered here for the reason `nativePadMotionReaches` is:
+/// [`punktfunk_core::config::pad_has_quick_access`] carries the rule and its tests. A `0`
+/// handle answers `false`, which sends the chord: every pad Steam reads takes it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadHasQuickAccess(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    declared_pref: jint,
+) -> jboolean {
+    jni_guard(false, || {
+        let Some(h) = SESSIONS.get(handle) else {
+            return false;
+        };
+        let declared = u8::try_from(declared_pref).map_or(
+            h.client.requested_gamepad,
+            punktfunk_core::config::GamepadPref::from_u8,
+        );
+        punktfunk_core::config::pad_has_quick_access(
+            declared,
+            h.client.requested_gamepad,
+            h.client.resolved_gamepad,
+        )
+    })
+}
+
 /// `NativeBridge.nativeSendGamepadRemove(handle, pad)` — signal that wire pad index `pad` was
 /// unplugged so the host tears its virtual device down. `pad` (rides `flags`) is the only field; the
 /// core stamps the per-pad seq (in the snapshot seq space, so a reordered snapshot can't resurrect the
@@ -703,5 +734,28 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSendPadMoti
             gyro: [c(gyro_pitch), c(gyro_yaw), c(gyro_roll)],
             accel: [c(accel_x), c(accel_y), c(accel_z)],
         });
+    })
+}
+
+/// `NativeBridge.nativeHoldsScreenAwake(handle, keepAwake)` — whether this stream holds the
+/// screen awake right now: always with the "Keep screen awake" setting on, else only while the
+/// player's input is recent.
+///
+/// Answered here because every input this client forwards goes through the session's
+/// `send_input`, which is the one clock for "recent"; the rule is
+/// [`punktfunk_core::client::holds_screen_awake`]. A `0` handle answers `true`: a screen that
+/// stays on is the safe answer when the session cannot be asked.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeHoldsScreenAwake(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    keep_awake: jboolean,
+) -> jboolean {
+    jni_guard(true, || {
+        let Some(h) = SESSIONS.get(handle) else {
+            return true;
+        };
+        punktfunk_core::client::holds_screen_awake(keep_awake, h.client.input_idle())
     })
 }

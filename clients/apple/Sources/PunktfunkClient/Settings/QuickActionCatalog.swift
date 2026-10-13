@@ -34,7 +34,7 @@ let builtinGroups: [SlotGroup] = [
         .init(id: "send_text", label: "Send text", note: "Not on this device yet"),
         .init(id: "guide", label: "Guide button", note: "The host's Xbox / PS / Steam button"),
         .init(id: "qam", label: "Quick access menu",
-              note: "Only where the host's pad is Steam-shaped"),
+              note: "Where the host runs Steam"),
         .init(id: "pad_mouse", label: "Controller mouse",
               note: "Your controller moves the host's pointer"),
         .init(id: "pad_type", label: "Controller type",

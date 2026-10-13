@@ -1,5 +1,5 @@
 // Replays `clients/shared/gamepad-kind-vectors.json` against the Swift `GamepadType`: wire value,
-// names, motion plane and the per-pad motion answer. Core's `config::tests::gamepad_kind_vectors`
+// names, motion plane, Quick Access button and the per-pad answers. Core's `config::tests::gamepad_kind_vectors`
 // reads the same file, so a kind core adds and Swift lacks fails here.
 
 import Foundation
@@ -65,6 +65,7 @@ final class GamepadMotionReachTests: XCTestCase {
             let name = try XCTUnwrap(row["name"] as? String)
             XCTAssertEqual(pad.canonicalName, name)
             XCTAssertEqual(pad.hasMotion, row["has_motion"] as? Bool, name)
+            XCTAssertEqual(pad.hasQuickAccess, row["quick_access"] as? Bool, name)
             for alias in [name] + (row["aliases"] as? [String] ?? []) {
                 XCTAssertEqual(Pad(name: alias), pad, alias)
                 XCTAssertEqual(Pad(name: " \(alias.uppercased()) "), pad, alias)
@@ -86,6 +87,23 @@ final class GamepadMotionReachTests: XCTestCase {
             }
             XCTAssertEqual(
                 Pad.motionReaches(
+                    declared: try pad("declared"), asked: try pad("asked"),
+                    resolved: try pad("resolved")),
+                row["want"] as? Bool, why)
+        }
+    }
+
+    /// Which pad's host device has a Quick Access button, by the same three inputs.
+    func testQuickAccessIsAnsweredPerPadNotPerSession() throws {
+        let rows = try Self.rows("quick_access_pads")
+        XCTAssertGreaterThan(rows.count, 3)
+        for row in rows {
+            let why = row["why"] as? String ?? "?"
+            func pad(_ key: String) throws -> Pad {
+                try XCTUnwrap(Pad(name: row[key] as? String ?? ""), "\(why): \(key)")
+            }
+            XCTAssertEqual(
+                Pad.hasQuickAccess(
                     declared: try pad("declared"), asked: try pad("asked"),
                     resolved: try pad("resolved")),
                 row["want"] as? Bool, why)

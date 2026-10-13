@@ -31,10 +31,12 @@ use rows::*;
 const DETAIL_H: f64 = crate::widgets::FOOT_DETAIL_H;
 
 /// What the open typed field sets. A or Y opens it on Bitrate; Y on Resolution, for a width
-/// and then a height.
+/// and then a height; Y on Render scale, for a percent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Typing {
     Bitrate,
+    /// Render scale as a percent: the digit pad has no decimal point.
+    Scale,
     Width,
     /// The width typed a step earlier.
     Height(u32),
@@ -102,6 +104,12 @@ impl SettingsScreen {
                 ctx.write(|c| {
                     let ceiling_mbps = bitrate_ceiling_kbps(c.device.platform) / 1_000;
                     c.settings.bitrate_kbps = n.min(ceiling_mbps) * 1000;
+                    true
+                });
+            }
+            Typing::Scale => {
+                ctx.write(|c| {
+                    c.settings.render_scale = punktfunk_core::render_scale::from_percent(n);
                     true
                 });
             }
@@ -485,6 +493,7 @@ impl ScreenView for SettingsScreen {
         let (typing, text) = self.typing.as_ref()?;
         let label = match typing {
             Typing::Bitrate => "Bitrate in Mbps",
+            Typing::Scale => "Render scale in percent",
             Typing::Width => "Width in pixels",
             Typing::Height(_) => "Height in pixels",
         };
@@ -574,11 +583,12 @@ impl ScreenView for SettingsScreen {
         }
         let ids = self.row_ids(ctx);
         self.clamp_cursor(ids.len());
-        // Y opens the typed bitrate or size.
+        // Y opens the typed bitrate, size or scale.
         if ev == MenuEvent::Secondary {
             let typing = match ids.get(self.list.cursor) {
                 Some(RowId::Bitrate) => Typing::Bitrate,
                 Some(RowId::Resolution) => Typing::Width,
+                Some(RowId::RenderScale) => Typing::Scale,
                 _ => return None,
             };
             self.typing = Some((typing, String::new()));
@@ -654,6 +664,11 @@ impl ScreenView for SettingsScreen {
                 Hint::new(HintKey::Secondary, "Type a size"),
                 Hint::new(HintKey::Back, "Done"),
             ],
+            Some(RowId::RenderScale) => vec![
+                Hint::new(HintKey::Adjust, "Adjust"),
+                Hint::new(HintKey::Secondary, "Type a percent"),
+                Hint::new(HintKey::Back, "Done"),
+            ],
             Some(_) => vec![
                 Hint::new(HintKey::Adjust, "Adjust"),
                 Hint::new(HintKey::Confirm, "Change"),
@@ -683,6 +698,8 @@ impl ScreenView for SettingsScreen {
             let (row, value) = match typing {
                 Typing::Bitrate if text.is_empty() => (RowId::Bitrate, "Mbps".into()),
                 Typing::Bitrate => (RowId::Bitrate, format!("{text} Mbps")),
+                Typing::Scale if text.is_empty() => (RowId::RenderScale, "%".into()),
+                Typing::Scale => (RowId::RenderScale, format!("{text} %")),
                 Typing::Width if text.is_empty() => (RowId::Resolution, "Width".into()),
                 Typing::Width => (RowId::Resolution, format!("{text} × \u{2026}")),
                 Typing::Height(w) if text.is_empty() => {

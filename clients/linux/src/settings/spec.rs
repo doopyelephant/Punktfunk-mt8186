@@ -157,6 +157,8 @@ specs! {
     DECODER: "decoder", "Video decoder",
         "Automatic picks the best hardware decode, then software", Display, true, Device;
     ADAPTER: "adapter", "GPU", "Decodes and presents the stream", Display, true, Device;
+    KEEP_AWAKE: "keep_awake", "Keep screen awake",
+        "Off, a stream keeps the screen awake only while you play", Display, true, Device;
 
     TOUCH: "touch_mode", "Touch input", TOUCH_MODE_CAPTIONS[0], Input, false, Stream;
     MOUSE: "mouse_mode", "Mouse input", MOUSE_MODE_CAPTIONS[0], Input, false, Stream;

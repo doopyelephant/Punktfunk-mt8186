@@ -67,8 +67,9 @@ for Alt+Tab. **Ctrl+Space** reaches the host from Android 13 on.
 
 ### Muting your microphone
 
-The mute lasts for the current stream and stops only the sending, so unmuting is instant. While
-muted, a **Microphone muted** badge shows over the stream, with the stats overlay on or off.
+The mute lasts for the current stream and stops only the sending, so unmuting is instant. Each
+switch shows **Microphone muted** or **Microphone live** over the stream for a few seconds, with
+the stats overlay on or off.
 
 - Keyboard: the shortcut in the [table above](#keyboard-shortcuts).
 - Controller on Android: **Select + Y**, or a DualSense's own **Mute** button.
@@ -126,8 +127,9 @@ Two advanced settings control this: **Guide button** and **Hold Select for guide
 If Steam or the Xbox Game Bar on your own device also watches the guide button, both react; turn
 that off on your device. On macOS and iOS 27 and newer, add Punktfunk to **Home Button
 Overrides** in the system's game controller settings; while the system keeps the button, Punktfunk's
-**Controllers** settings link there. The dial's **Guide button** and **Quick access menu** buttons send
-one tap each; **Quick access menu** needs a host whose virtual pad is a Steam controller. On a
+**Controllers** settings link there. The dial's **Guide button** and **Quick access menu** buttons press
+the host's pad for you. **Quick access menu** needs Steam on the host: it presses the pad's own
+button where the virtual pad has one, and Guide with A on every other pad. On a
 Deck, the Punktfunk panel's **Host menus** buttons do the same ([Steam Deck](/docs/steam-deck)).
 
 ## Mouse modes

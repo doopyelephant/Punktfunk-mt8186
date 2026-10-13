@@ -89,6 +89,9 @@ pub enum RowId {
     // so the typed struct stays shared; [`row_on`] keeps them off desktop.
     /// Slice-progressive decode plus DSCP. Android-only.
     LowLatency,
+    /// `trust::Settings::keep_awake`. Off, the stream holds the screen awake only while the
+    /// player's input is recent.
+    KeepAwake,
     /// A dual-screen handheld's lower panel carries the companion panel or the picture;
     /// off leaves a second screen to the system. Android-only.
     SecondScreen,
@@ -155,6 +158,7 @@ pub fn advanced(id: RowId) -> bool {
             | RowId::Compositor
             | RowId::Decoder
             | RowId::LowLatency
+            | RowId::KeepAwake
             | RowId::AudioFormat
             | RowId::KeepHostAudio
             | RowId::EchoCancel
@@ -369,6 +373,7 @@ impl RowId {
             }
             RowId::AutoWake => Extra::Flag(|s| s.auto_wake, |s| &mut s.auto_wake),
             RowId::ExitHint => Extra::Flag(|s| s.exit_hint, |s| &mut s.exit_hint),
+            RowId::KeepAwake => Extra::Flag(|s| s.keep_awake, |s| &mut s.keep_awake),
             RowId::ShowAdvanced => Extra::Flag(|s| s.show_advanced, |s| &mut s.show_advanced),
             RowId::LowLatency => Extra::Bool(device_keys::LOW_LATENCY, true),
             RowId::SecondScreen => Extra::Bool(device_keys::SECOND_SCREEN, true),
@@ -483,6 +488,7 @@ pub(super) const TABS: [(&str, &[RowId]); 7] = [
             RowId::Compositor,
             RowId::Decoder,
             RowId::LowLatency,
+            RowId::KeepAwake,
         ],
     ),
     (
@@ -796,6 +802,8 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::ReduceUiResolution => &[Android, WebOS],
         // A MediaCodec decoder flag; nothing else has the knob.
         RowId::LowLatency => &[Android],
+        // The clients whose streams read the switch before holding the screen awake.
+        RowId::KeepAwake => &[Desktop, Android, Apple],
         // Only Android has a second screen to use (a handheld's lower panel, a half-open fold).
         RowId::SecondScreen => &[Android],
         // The clients whose presenters place the picture through `video_fit`.
@@ -1054,7 +1062,7 @@ pub(super) fn row_icon(id: RowId) -> &'static str {
         RowId::VideoFit => "square",
         RowId::Compositor => "panel-right",
         RowId::Codec => "film",
-        RowId::Hdr => "sun",
+        RowId::Hdr | RowId::KeepAwake => "sun",
         RowId::PresentPriority | RowId::SmoothBuffer | RowId::LowLatency => "clock",
         RowId::Decoder | RowId::AudioRoute => "cpu",
         RowId::Chroma444 | RowId::TenBitSdr => "eye",
@@ -1289,17 +1297,18 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
                 format!("{} Hz", s.refresh_hz)
             },
         ),
-        RowId::RenderScale => (
-            None,
-            "Render scale",
-            if s.render_scale == 1.0 {
+        RowId::RenderScale => {
+            // In hundredths, so a float-stored 0.67 does not read as 0.6700000167.
+            let x = f64::from(punktfunk_core::render_scale::percent(s.render_scale)) / 100.0;
+            let value = if x == 1.0 {
                 "Native".into()
-            } else if s.render_scale > 1.0 {
-                format!("{}× (supersample)", s.render_scale)
+            } else if x > 1.0 {
+                format!("{x}× (supersample)")
             } else {
-                format!("{}×", s.render_scale)
-            },
-        ),
+                format!("{x}×")
+            };
+            (None, "Render scale", value)
+        }
         RowId::VideoFit => (
             None,
             "Picture fit",
@@ -1479,6 +1488,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         ),
         RowId::AutoWake => (None, "Auto-wake on connect", extra()),
         RowId::LowLatency => (None, "Low-latency mode", extra()),
+        RowId::KeepAwake => (None, "Keep screen awake", extra()),
         RowId::SecondScreen => (None, "Second screen", extra()),
         RowId::PhoneRumble => (Some("This device"), "Rumble on this phone", extra()),
         RowId::PhoneGyro => (None, "Gyro from this phone", extra()),
@@ -1555,7 +1565,8 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
         RowId::Refresh => "Native follows the display this window is on.",
         RowId::RenderScale => {
             "The host renders larger or smaller than the stream mode and this window \
-             resamples — above 1× supersamples, below saves bandwidth."
+             resamples — above 1× supersamples, below saves bandwidth. Any percent from 50 \
+             to 400 can be typed."
         }
         RowId::VideoFit => {
             "When the stream's shape differs from this window. Fit shows the whole picture \
@@ -1780,6 +1791,10 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             "Feeds the decoder slice by slice as frames arrive and marks the media sockets \
              for priority. Off if a decoder shows artefacts under it."
         }
+        RowId::KeepAwake => {
+            "Off, a stream keeps the screen awake only while you play. Left alone for five \
+             minutes, it lets this device's own screen saver or sleep take over."
+        }
         RowId::SecondScreen => {
             "A smaller second screen — a dual-screen handheld's lower panel, a foldable half \
              open — shows the companion panel, or the picture with Screens. Off leaves it to \
@@ -1961,10 +1976,13 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, REFRESH.len(), delta, wrap).map(|i| s.refresh_hz = REFRESH[i])
         }
         RowId::RenderScale => {
-            // Writers store these literals; a hand-edited oddball snaps to the first step.
-            let cur = RENDER_SCALES.iter().position(|v| *v == s.render_scale);
-            step_option(cur, RENDER_SCALES.len(), delta, wrap)
-                .map(|i| s.render_scale = RENDER_SCALES[i])
+            // A typed scale sits between two stops: step to the one the thumb is heading for.
+            let stepped = match punktfunk_core::render_scale::preset_index(s.render_scale) {
+                cur @ Some(_) => step_option(cur, RENDER_SCALES.len(), delta, wrap),
+                None if delta < 0 => RENDER_SCALES.iter().rposition(|v| *v < s.render_scale),
+                None => RENDER_SCALES.iter().position(|v| *v > s.render_scale),
+            };
+            stepped.map(|i| s.render_scale = RENDER_SCALES[i])
         }
         RowId::VideoFit => {
             let cur = VIDEO_FITS
@@ -2095,6 +2113,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             }
         }),
         RowId::LowLatency
+        | RowId::KeepAwake
         | RowId::Hdr
         | RowId::Chroma444
         | RowId::TenBitSdr
