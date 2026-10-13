@@ -241,7 +241,7 @@ impl PlatformBackend for WindowsBackend {
         let mut checks = enable::checks();
         // A role waiting on a restart can't take a licensing mode yet; the restart row says so.
         if prepared.iter().any(|row| row.code == "restart") {
-            checks.retain(|check| check.code != "rds_licensing");
+            checks.retain(|check| check.code != "rds_licensing" && check.code != "restart");
         }
         let blocked = prepared
             .iter()
@@ -332,6 +332,9 @@ impl WindowsBackend {
                 .into_iter()
                 .filter(|check| check.code != "windows_server"),
         );
+        if server_edition() == Some(true) {
+            rows.extend(enable::licensing_row());
+        }
         rows.push(match termservice_running() {
             Ok(true) => Diagnostic::info("termservice", "Remote Desktop Services is running."),
             _ => Diagnostic::error(
