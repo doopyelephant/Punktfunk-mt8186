@@ -972,16 +972,10 @@ fn pump(
         Err(e) => {
             // No rung for this codec at all (no hardware HEVC, or pinned software on
             // an HEVC session). Same answer as the mid-stream case in `Pump::on_frame`.
-            let refusal = exhausted(&e, connector.codec, advertised_codecs);
-            // Audio / pad / clipboard / mic are built below, so this is vacuously
-            // joined. Drop in the same order as the pump's end path so a reconnect
-            // on this event finds the same world whichever refusal site produced it.
-            stop.store(true, Ordering::SeqCst);
-            mic.set_live(false);
+            let last = exhausted(&e, connector.codec, advertised_codecs)
+                .unwrap_or_else(|| SessionEvent::Ended(Some(format!("video decoder: {e}"))));
             drop(connector);
-            let _ = ev_tx.send_blocking(
-                refusal.unwrap_or_else(|| SessionEvent::Ended(Some(format!("video decoder: {e}")))),
-            );
+            end_session(&stop, &mic, None, &ev_tx, last);
             return;
         }
     };
@@ -1387,34 +1381,57 @@ impl Pump {
         self.window_start = Instant::now();
     }
 
-    /// Raise `stop`, join the plane threads, then send the terminal event: a reconnect
-    /// on it never finds two sessions' threads on one connector.
-    fn finish(self, end: Option<String>) {
+    /// Log the end, pick the terminal event, then [`end_session`]. The pump's fields,
+    /// the connector among them, drop after the event went out.
+    fn finish(mut self, end: Option<String>) {
         tracing::info!(
             total_frames = self.total_frames,
             reason = end.as_deref().unwrap_or("user"),
             "session ended"
         );
-        self.stop.store(true, Ordering::SeqCst);
-        // About to drop the uplink — stop claiming a mute surface, so an embedder still
-        // holding the handle cannot draw a muted mic that no longer exists.
-        self.mic.set_live(false);
-        if let Some(t) = self.planes.audio_thread {
-            let _ = t.join(); // exits within its 100 ms pull timeout once `stop` is set
-        }
-        if let Some(t) = self.planes.pad_audio_thread {
-            let _ = t.join(); // exits within its 10 ms pull timeout once `stop` is set
-        }
-        if let Some(t) = self.planes.clipboard_thread {
-            let _ = t.join(); // exits within its next_clip wait once `stop` is set
-        }
-        let last = match self.codec_fallback {
+        let last = match self.codec_fallback.take() {
             Some(ev) => ev,
             None if self.not_ready => SessionEvent::HostNotReady(end.unwrap_or_default()),
             None => SessionEvent::Ended(end),
         };
-        let _ = self.ev_tx.send_blocking(last);
+        end_session(
+            &self.stop,
+            &self.mic,
+            Some(&mut self.planes),
+            &self.ev_tx,
+            last,
+        );
     }
+}
+
+/// Raise `stop`, join the plane threads, then send exactly one terminal event: a reconnect
+/// on it never finds two sessions' threads on one connector. Before the planes exist (the
+/// decoder refused to open) there is nothing to join.
+fn end_session(
+    stop: &AtomicBool,
+    mic: &MicControl,
+    planes: Option<&mut PlaneThreads>,
+    ev_tx: &async_channel::Sender<SessionEvent>,
+    last: SessionEvent,
+) {
+    stop.store(true, Ordering::SeqCst);
+    // About to drop the uplink — stop claiming a mute surface, so an embedder still
+    // holding the handle cannot draw a muted mic that no longer exists.
+    mic.set_live(false);
+    // Each exits within its own pull timeout once `stop` is set.
+    if let Some(p) = planes {
+        for t in [
+            p.audio_thread.take(),
+            p.pad_audio_thread.take(),
+            p.clipboard_thread.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = t.join();
+        }
+    }
+    let _ = ev_tx.send_blocking(last);
 }
 
 /// The once-per-condition notices the pump checks each second. Pure: the pump reads the
