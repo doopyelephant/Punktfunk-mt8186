@@ -7,16 +7,13 @@
 use crate::AudioCapturer;
 use anyhow::{bail, Context, Result};
 use pf_driver_proto::seat_audio::{self as proto, RingHeader, FRAME_BYTES, RATE};
+use pf_paths_win::SecurityAttributes;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use windows::core::{HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, INVALID_HANDLE_VALUE};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::core::{HSTRING, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, FILE_MAP_WRITE,
     MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
@@ -83,7 +80,8 @@ impl SeatPadSource {
             bail!("pad slot {slot} is past the seat audio table");
         }
         let session = pf_win_display::own_session_id().context("read this host's session")?;
-        let ring_sa = SecurityAttributes::new(RING_SDDL)?;
+        let ring_sa =
+            SecurityAttributes::new(RING_SDDL).context("build a pad ring security descriptor")?;
         let name = HSTRING::from(proto::ring_name(session, slot));
         let size = u32::try_from(proto::SECTION_BYTES).context("size the pad ring")?;
         // SAFETY: a pagefile-backed section, named and scoped by `ring_sa`.
@@ -119,7 +117,8 @@ impl SeatPadSource {
             view,
         };
         source.publish(RingHeader::new(session, slot));
-        let owner_sa = SecurityAttributes::new(OWNER_SDDL)?;
+        let owner_sa =
+            SecurityAttributes::new(OWNER_SDDL).context("build a pad ring security descriptor")?;
         let owner = HSTRING::from(proto::owner_name(session, slot));
         // SAFETY: a named manual-reset event that only marks presence, scoped by `owner_sa`.
         source.owner = unsafe { CreateEventW(Some(owner_sa.as_ptr()), true, false, &owner) }
@@ -232,47 +231,5 @@ impl AudioCapturer for SeatPadCapturer {
 
     fn drain(&mut self) {
         self.read = self.source.write_pos();
-    }
-}
-
-/// A security descriptor built from SDDL, freed on drop.
-struct SecurityAttributes {
-    attributes: SECURITY_ATTRIBUTES,
-    descriptor: PSECURITY_DESCRIPTOR,
-}
-
-impl SecurityAttributes {
-    fn new(sddl: &str) -> Result<Self> {
-        let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        let text = HSTRING::from(sddl);
-        // SAFETY: parses a static SDDL string into a descriptor freed in `drop`.
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                PCWSTR(text.as_ptr()),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                None,
-            )
-        }
-        .context("build a pad ring security descriptor")?;
-        Ok(Self {
-            attributes: SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: descriptor.0,
-                bInheritHandle: false.into(),
-            },
-            descriptor,
-        })
-    }
-
-    fn as_ptr(&self) -> *const SECURITY_ATTRIBUTES {
-        &self.attributes
-    }
-}
-
-impl Drop for SecurityAttributes {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor came from LocalAlloc inside the SDDL conversion.
-        unsafe { LocalFree(Some(HLOCAL(self.descriptor.0))) };
     }
 }

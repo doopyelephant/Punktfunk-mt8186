@@ -11,19 +11,15 @@ use crate::steam;
 use crate::windows::accounts;
 use crate::windows::enable::run;
 use crate::windows::util::{io_error, wide, WinResult};
+use pf_paths_win::SecurityAttributes;
 use std::collections::HashSet;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use windows::core::{Interface as _, GUID, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{
-    ImpersonateLoggedOnUser, RevertToSelf, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Security::{ImpersonateLoggedOnUser, RevertToSelf};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile,
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
@@ -278,30 +274,13 @@ fn url_handler(sid: &str, exe: &str, ipc: &str) -> std::io::Result<()> {
 /// `HKEY_USERS\<path>`, made by SYSTEM with a protected DACL its subkeys inherit: SYSTEM and
 /// Administrators may change it, the user and packaged apps may only read it.
 fn create_read_only_key(path: &str, sid: &str) -> std::io::Result<()> {
-    let sddl = wide(
-        format!("D:P(A;OICI;KA;;;SY)(A;OICI;KA;;;BA)(A;OICI;KR;;;{sid})(A;OICI;KR;;;AC)"),
-        "registry DACL",
-    )
-    .map_err(|error| std::io::Error::other(error.message))?;
-    let path = wide(path, "registry path").map_err(|error| std::io::Error::other(error.message))?;
-    let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: the SDDL is NUL-terminated and `descriptor` is a live out-parameter.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl.as_ptr()),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            None,
-        )
-    }
+    let attributes = SecurityAttributes::new(&format!(
+        "D:P(A;OICI;KA;;;SY)(A;OICI;KA;;;BA)(A;OICI;KR;;;{sid})(A;OICI;KR;;;AC)"
+    ))
     .map_err(std::io::Error::other)?;
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor.0,
-        bInheritHandle: false.into(),
-    };
+    let path = wide(path, "registry path").map_err(|error| std::io::Error::other(error.message))?;
     let mut key = HKEY::default();
-    // SAFETY: `path` is NUL-terminated, `attributes` and its descriptor outlive the call, and
+    // SAFETY: `path` is NUL-terminated, `attributes` outlives the call, and
     // `key` is a live out-parameter.
     let created = unsafe {
         RegCreateKeyExW(
@@ -311,13 +290,11 @@ fn create_read_only_key(path: &str, sid: &str) -> std::io::Result<()> {
             PCWSTR::null(),
             REG_OPTION_NON_VOLATILE,
             RAW_ALL,
-            Some(&attributes),
+            Some(attributes.as_ptr()),
             &mut key,
             None,
         )
     };
-    // SAFETY: the descriptor came from the conversion above, released once with LocalFree.
-    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
     created.ok().map_err(std::io::Error::other)?;
     // SAFETY: the create succeeded, so `key` is an open handle this frame alone owns.
     let _ = unsafe { RegCloseKey(key) };

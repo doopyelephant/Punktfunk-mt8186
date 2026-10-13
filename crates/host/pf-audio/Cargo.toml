@@ -35,6 +35,7 @@ pf-inject = { path = "../pf-inject" }
 pf-paths = { path = "../pf-paths" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+pf-paths-win = { path = "../pf-paths-win" }
 # Config dir, owner-private writes, the seat marker and `pnputil /remove-device`.
 pf-paths = { path = "../pf-paths" }
 # The seat pad ring's names and layout, shared with `pf_seat_audio.dll` (seat_pad.rs).

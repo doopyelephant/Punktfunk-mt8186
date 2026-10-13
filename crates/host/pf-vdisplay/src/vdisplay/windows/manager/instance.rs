@@ -10,7 +10,8 @@
 //! as a sibling host versus a squat.
 
 use super::*;
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use pf_paths_win::SecurityAttributes;
+use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 
 /// Process-global held mutex (`None` until claimed). The serve path claims
 /// its console or fixed-seat scope before a session opens the backend.
@@ -54,21 +55,21 @@ fn acquire_single_instance(name: &str) -> Result<OwnedHandle> {
         "another punktfunk-host process already owns pf-vdisplay scope `{name}` — refusing to \
          touch that connector scope until the other process exits"
     );
-    // `Global\` is creatable by any SeCreateGlobalPrivilege holder (includes LocalService).
-    // Default DACL from the creating token lets a squatter deny SYSTEM and look like
-    // "another instance". Explicit DACL so lesser principals cannot open ours; check
-    // OWNER of an existing name so a squat is reported as a squat.
-    let sd = security_descriptor()?;
-    let sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd.0,
-        bInheritHandle: false.into(),
-    };
+    // `Global\` is creatable by any SeCreateGlobalPrivilege holder, LocalService included, and
+    // a squatter's default DACL can deny SYSTEM and pass for another instance. So ours is
+    // protected (`D:P`), full to SYSTEM and Administrators only, and an existing name's OWNER
+    // is checked below: a squat is reported as one.
+    let sa = SecurityAttributes::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)")
+        .context("build the pf-vdisplay single-instance security descriptor")?;
     let wide_name = windows::core::HSTRING::from(name);
-    // SAFETY: `wide_name`, `sa`, and its descriptor outlive the call. The checked handle has one
+    // SAFETY: `wide_name` and `sa` outlive the call. The checked handle has one
     // `OwnedHandle` owner, and `GetLastError` is read immediately after `CreateMutexW`.
     unsafe {
-        let h = match CreateMutexW(Some(&sa), false, windows::core::PCWSTR(wide_name.as_ptr())) {
+        let h = match CreateMutexW(
+            Some(sa.as_ptr()),
+            false,
+            windows::core::PCWSTR(wide_name.as_ptr()),
+        ) {
             Ok(h) => h,
             // ACCESS_DENIED cannot distinguish a live protected owner, a squat,
             // or a token that cannot create a Global object.
@@ -98,43 +99,6 @@ fn acquire_single_instance(name: &str) -> Result<OwnedHandle> {
             anyhow::bail!(in_use);
         }
         Ok(owned)
-    }
-}
-
-/// Protected DACL (`D:P`): Full to SYSTEM and BUILTIN\Administrators only.
-/// A LocalService plugin runner is neither, so it cannot open our object.
-fn security_descriptor() -> Result<LocalSd> {
-    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-    use windows::Win32::Security::Authorization::SDDL_REVISION_1;
-    let mut psd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: the SDDL literal is NUL-terminated (`w!`), and `psd` is a live out-param whose
-    // allocation is taken over by `LocalSd` below.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            w!("D:P(A;;GA;;;SY)(A;;GA;;;BA)"),
-            SDDL_REVISION_1,
-            &mut psd,
-            None,
-        )
-    }
-    .context("build the pf-vdisplay single-instance security descriptor")?;
-    Ok(LocalSd(psd.0))
-}
-
-struct LocalSd(*mut core::ffi::c_void);
-
-impl Drop for LocalSd {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: the pointer came from ConvertStringSecurityDescriptorToSecurityDescriptorW,
-            // which documents LocalFree as the matching deallocation.
-            unsafe {
-                let _ = windows::Win32::Foundation::LocalFree(Some(
-                    windows::Win32::Foundation::HLOCAL(self.0),
-                ));
-            }
-            self.0 = std::ptr::null_mut();
-        }
     }
 }
 

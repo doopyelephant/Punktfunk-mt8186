@@ -56,6 +56,7 @@ wayland-backend = "0.3"
 bitflags = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+pf-paths-win = { path = "../pf-paths-win" }
 # The `Encoder` contract the driver-encode proxy implements, and the D3D11 converters the
 # P010 self-test drives.
 pf-encode-win = { path = "../pf-encode-win" }

@@ -19,6 +19,7 @@ use crate::pad_shm_ring::SectionView;
 use crate::pad_slots::PadCreateFault;
 use anyhow::{anyhow, Context, Result};
 use pf_driver_proto::gamepad::{PadBootstrap, BOOT_MAGIC, GAMEPAD_PROTO_VERSION};
+use pf_paths_win::SecurityAttributes;
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{fence, AtomicU32, Ordering};
@@ -37,14 +38,10 @@ use windows::Win32::Devices::Properties::{
     DEVPROP_STORE_SYSTEM, DEVPROP_TYPE_BINARY, DEVPROP_TYPE_STRING_LIST, DEVPROP_TYPE_UINT32,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, LocalFree, SetLastError, DEVPROPKEY,
-    DUPLICATE_HANDLE_OPTIONS, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, E_FAIL, HANDLE, HLOCAL,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WIN32_ERROR,
+    CloseHandle, DuplicateHandle, GetLastError, SetLastError, DEVPROPKEY, DUPLICATE_HANDLE_OPTIONS,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, E_FAIL, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    WIN32_ERROR,
 };
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
     FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
@@ -68,56 +65,14 @@ pub(super) struct Shm {
     len: usize,
 }
 
-/// SDDL `SECURITY_ATTRIBUTES` plus the `LocalAlloc`'d descriptor it points at.
-/// Drop `LocalFree`s the descriptor. Must outlive every `CreateFileMappingW` that
-/// borrows `sa` — the section copies the DACL at create time, so free after return
-/// is safe. [`Shm::create_named`] builds one and reuses it across squat retries.
-struct SecAttr {
-    sa: SECURITY_ATTRIBUTES,
-    psd: PSECURITY_DESCRIPTOR,
-}
-
-impl Drop for SecAttr {
-    fn drop(&mut self) {
-        // SAFETY: `psd` is the descriptor `ConvertStringSecurityDescriptorToSecurityDescriptorW`
-        // allocated with `LocalAlloc`; matching `LocalFree`. Every `CreateFileMappingW` that
-        // borrowed `self.sa` has returned and copied the DACL into the section object.
-        unsafe {
-            let _ = LocalFree(Some(HLOCAL(self.psd.0)));
-        }
-    }
-}
-
-fn sddl_sa(sddl: PCWSTR) -> Result<SecAttr> {
-    let mut psd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: the SDDL literal is valid; `psd` receives a `LocalAlloc`'d descriptor that `SecAttr`'s
-    // `Drop` `LocalFree`s once the section create that borrows it has returned.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl,
-            SDDL_REVISION_1,
-            &mut psd,
-            None,
-        )?;
-    }
-    Ok(SecAttr {
-        sa: SECURITY_ATTRIBUTES {
-            nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: psd.0,
-            bInheritHandle: false.into(),
-        },
-        psd,
-    })
-}
-
 impl Shm {
     /// Unnamed `size`-byte section, mapped RW — the sealed DATA section.
     /// SDDL `D:P(A;;GA;;;SY)`: no name to open or squat; the driver gets a duplicated handle
     /// that carries this process's access without re-checking the DACL (`design/idd-push-security.md`).
     pub(super) fn create_unnamed(size: usize) -> Result<Shm> {
-        let sa = sddl_sa(w!("D:P(A;;GA;;;SY)"))?;
+        let sa = SecurityAttributes::new("D:P(A;;GA;;;SY)")?;
         // Unnamed: nothing to collide with, so the flag is always false.
-        Self::create_inner(&sa.sa, PCWSTR::null(), size)
+        Self::create_inner(&sa, PCWSTR::null(), size)
             .map(|(shm, _)| shm)
             .context("create unnamed gamepad DATA section")
     }
@@ -133,14 +88,14 @@ impl Shm {
     pub(super) fn create_named(name: &HSTRING, size: usize) -> Result<Shm> {
         // One descriptor for the squat-retry loop. `D:P` strips inherited ACEs so only
         // SYSTEM + LocalService are granted.
-        let sa = sddl_sa(w!("D:P(A;;GA;;;SY)(A;;GA;;;LS)"))?;
+        let sa = SecurityAttributes::new("D:P(A;;GA;;;SY)(A;;GA;;;LS)")?;
         for attempt in 0..5 {
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(50));
             }
             // SAFETY: clearing the thread error slot so ERROR_ALREADY_EXISTS below is unambiguous.
             unsafe { SetLastError(WIN32_ERROR(0)) };
-            let (shm, existed) = match Self::create_inner(&sa.sa, PCWSTR(name.as_ptr()), size) {
+            let (shm, existed) = match Self::create_inner(&sa, PCWSTR(name.as_ptr()), size) {
                 Ok(pair) => pair,
                 Err(e) => return Err(classify_named_create_failure(name, e)),
             };
@@ -162,14 +117,13 @@ impl Shm {
     /// `true` in the tuple means `CreateFileMappingW` OPENED an existing section rather than
     /// creating one — the caller decides what to do about it. Read here, immediately after the
     /// create, because the mapping call below can clobber the thread error slot.
-    fn create_inner(sa: &SECURITY_ATTRIBUTES, name: PCWSTR, size: usize) -> Result<(Shm, bool)> {
+    fn create_inner(sa: &SecurityAttributes, name: PCWSTR, size: usize) -> Result<(Shm, bool)> {
         // SAFETY: an anonymous (pagefile-backed) section of `size` bytes with the caller's SDDL; the
-        // descriptor behind `sa` outlives this call (owned by the caller's `SecAttr`, freed only once
-        // every create that borrows it has returned).
+        // descriptor behind `sa` outlives this call, and the section copies it.
         let map = unsafe {
             CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
-                Some(sa),
+                Some(sa.as_ptr()),
                 PAGE_READWRITE,
                 0,
                 size as u32,

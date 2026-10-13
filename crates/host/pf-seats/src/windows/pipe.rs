@@ -10,16 +10,13 @@
 use super::util::{io_error, wide, WinResult};
 use crate::backend::PlatformBackend;
 use crate::service::SeatService;
+use pf_paths_win::SecurityAttributes;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{LocalFree, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     FlushFileBuffers, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
 };
@@ -176,42 +173,11 @@ impl Drop for Permit {
     }
 }
 
-/// The pipe's DACL: SYSTEM and Administrators, inherited ACEs blocked.
-struct Descriptor(PSECURITY_DESCRIPTOR);
-
-impl Descriptor {
-    fn new() -> WinResult<Self> {
-        let mut descriptor = PSECURITY_DESCRIPTOR::default();
-        // SAFETY: the SDDL literal is NUL-terminated and `descriptor` is a live out-parameter.
-        unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                w!("D:P(A;;GA;;;SY)(A;;GA;;;BA)"),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                None,
-            )
-        }
-        .map_err(|error| io_error("seats_pipe", "build the pipe DACL", error))?;
-        Ok(Self(descriptor))
-    }
-}
-
-impl Drop for Descriptor {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor came from ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        // whose documented release is LocalFree, and this drop runs once.
-        let _ = unsafe { LocalFree(Some(HLOCAL(self.0 .0))) };
-    }
-}
-
 fn create_instance(name: &str, first: bool) -> WinResult<OwnedHandle> {
     let name_w = wide(name, "pipe name")?;
-    let descriptor = Descriptor::new()?;
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor.0 .0,
-        bInheritHandle: false.into(),
-    };
+    // SYSTEM and Administrators, inherited ACEs blocked.
+    let attributes = SecurityAttributes::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)")
+        .map_err(|error| io_error("seats_pipe", "build the pipe DACL", error))?;
     let open_mode = if first {
         PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE
     } else {
@@ -228,7 +194,7 @@ fn create_instance(name: &str, first: bool) -> WinResult<OwnedHandle> {
             BUFFER_BYTES,
             BUFFER_BYTES,
             0,
-            Some(&attributes),
+            Some(attributes.as_ptr()),
         )
     };
     if handle.is_invalid() {

@@ -3,12 +3,6 @@
 //! create time, and the descriptor is freed before this returns.
 
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{LocalFree, HLOCAL};
-use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
 /// SYSTEM and Administrators in full; LocalService — the runner, and the user half of a
 /// container's check — may open, read and write, as may the plugin's own package when it has
@@ -28,41 +22,16 @@ pub(crate) fn create_plugin_pipe(
     first: bool,
     package_sid: Option<&str>,
 ) -> std::io::Result<NamedPipeServer> {
-    let sddl: Vec<u16> = pipe_sddl(package_sid)
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut psd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: `sddl` is NUL-terminated and well-formed; `psd` receives a `LocalAlloc`'d
-    // descriptor, freed below once the create that borrows it has returned.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl.as_ptr()),
-            SDDL_REVISION_1,
-            &mut psd,
-            None,
-        )
+    let sa = pf_paths_win::SecurityAttributes::new(&pipe_sddl(package_sid))
         .map_err(std::io::Error::other)?;
-    }
-    let mut sa = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: psd.0,
-        bInheritHandle: false.into(),
-    };
-    // SAFETY: `sa` is a complete `SECURITY_ATTRIBUTES` whose descriptor is live until the
-    // `LocalFree` below, after the call has returned.
-    let created = unsafe {
+    // SAFETY: `sa` outlives the call, which copies the descriptor into the pipe and writes
+    // nothing through the pointer.
+    unsafe {
         ServerOptions::new()
             .first_pipe_instance(first)
             .reject_remote_clients(true)
-            .create_with_security_attributes_raw(name, (&mut sa as *mut SECURITY_ATTRIBUTES).cast())
-    };
-    // SAFETY: `psd` came from `ConvertStringSecurityDescriptorToSecurityDescriptorW`; the
-    // matching free, after its last borrower returned.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(psd.0)));
+            .create_with_security_attributes_raw(name, sa.as_ptr().cast_mut().cast())
     }
-    created
 }
 
 #[cfg(test)]
@@ -78,5 +47,14 @@ mod tests {
             super::pipe_sddl(Some("S-1-15-2-1-2-3")),
             "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;LS)(A;;FRFW;;;S-1-15-2-1-2-3)"
         );
+    }
+
+    /// A real instance under the descriptor: the first claims the name, and a second claim
+    /// on it is refused.
+    #[tokio::test]
+    async fn the_first_instance_claims_the_name() {
+        let name = format!(r"\\.\pipe\pf-plugin-pipe-test-{}", std::process::id());
+        let _first = super::create_plugin_pipe(&name, true, None).expect("create the pipe");
+        assert!(super::create_plugin_pipe(&name, true, None).is_err());
     }
 }

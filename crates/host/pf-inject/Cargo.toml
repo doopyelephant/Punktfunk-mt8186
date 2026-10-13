@@ -56,6 +56,7 @@ usbip-sim = { path = "vendor/usbip-sim" }
 rustix = { version = "1", features = ["net", "event", "fs"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+pf-paths-win = { path = "../pf-paths-win" }
 # The streamed-output desktop rect (CCD source rect) absolute input maps into — the same
 # resolver the cursor-readback poller uses, so inject and readback always agree. Also the
 # WUDFHost open + proof the gamepad-channel bootstrap shares with the IDD-push channel.

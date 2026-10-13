@@ -1595,6 +1595,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pf-paths-win"
+version = "0.43.1"
+dependencies = [
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "pf-seats"
 version = "0.43.1"
 dependencies = [
@@ -1602,6 +1610,7 @@ dependencies = [
  "hex",
  "pf-driver-proto",
  "pf-paths",
+ "pf-paths-win",
  "rand 0.10.3",
  "rustix",
  "rustls",

@@ -317,3 +317,89 @@ pub fn quarantine_planted_secret(path: &Path) -> bool {
     }
     true
 }
+
+/// A `SECURITY_ATTRIBUTES` parsed from SDDL, owning the descriptor it points at.
+///
+/// The conversion `LocalAlloc`s the descriptor and `Drop` frees it, so the attributes cannot
+/// outlive this value: [`as_ptr`](Self::as_ptr) only lends them. An object copies its
+/// descriptor when it is created, so dropping this once the create call has returned is
+/// sound. `bInheritHandle` is false. Moving is fine: the pointer targets the heap, not a field.
+pub struct SecurityAttributes {
+    attributes: windows::Win32::Security::SECURITY_ATTRIBUTES,
+    descriptor: windows::Win32::Security::PSECURITY_DESCRIPTOR,
+}
+
+impl SecurityAttributes {
+    /// `sddl` with a NUL in it is refused: the conversion would read it as ending there, and a
+    /// descriptor cut short is still a valid one.
+    pub fn new(sddl: &str) -> windows::core::Result<Self> {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::E_INVALIDARG;
+        use windows::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+        if sddl.contains('\0') {
+            return Err(E_INVALIDARG.into());
+        }
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: the `HSTRING` is NUL-terminated and outlives the call; `descriptor` is a
+        // live out-parameter, written only on success, with the one block `drop` frees.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                &HSTRING::from(sddl),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )?;
+        }
+        Ok(Self {
+            attributes: SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor.0,
+                bInheritHandle: false.into(),
+            },
+            descriptor,
+        })
+    }
+
+    /// A create call's `lpSecurityAttributes`. Valid while `self` lives.
+    pub fn as_ptr(&self) -> *const windows::Win32::Security::SECURITY_ATTRIBUTES {
+        &self.attributes
+    }
+
+    /// The descriptor alone, for a call that takes one without the attributes around it.
+    pub fn descriptor(&self) -> windows::Win32::Security::PSECURITY_DESCRIPTOR {
+        self.descriptor
+    }
+}
+
+impl Drop for SecurityAttributes {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        // SAFETY: `descriptor` is the one block the conversion allocated; nothing else owns
+        // it, and `as_ptr` and `descriptor` only lend it for as long as `self` lives.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.descriptor.0)));
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_attributes_tests {
+    use super::SecurityAttributes;
+
+    /// The attributes point at the descriptor the SDDL parsed to; bad SDDL is an error.
+    #[test]
+    fn sddl_parses_into_attributes_that_own_their_descriptor() {
+        let sa = SecurityAttributes::new("D:P(A;;GA;;;SY)(A;;GA;;;BA)").expect("valid SDDL");
+        // SAFETY: `as_ptr` lends the attributes while `sa` lives.
+        let attributes = unsafe { &*sa.as_ptr() };
+        assert_eq!(attributes.lpSecurityDescriptor, sa.descriptor().0);
+        assert!(!sa.descriptor().0.is_null());
+        assert!(!attributes.bInheritHandle.as_bool());
+        assert!(SecurityAttributes::new("not sddl").is_err());
+        assert!(SecurityAttributes::new("D:P(A;;GA;;;SY)\0(A;;GA;;;WD)").is_err());
+    }
+}

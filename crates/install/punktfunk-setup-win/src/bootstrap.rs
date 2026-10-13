@@ -162,33 +162,18 @@ fn elevated() -> bool {
 fn protected_dir(path: &Path) -> Result<(), String> {
     use windows::core::HSTRING;
     use windows::Win32::fileapi::CreateDirectoryW;
-    use windows::Win32::sddl::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
-    use windows::Win32::winbase::LocalFree;
-    use windows::Win32::{HANDLE, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
     const SDDL: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
-    let mut sd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: the SDDL string outlives the call; `sd` is the single LocalAlloc'd descriptor
-    // the conversion returns, handed to CreateDirectoryW by pointer and LocalFree'd after.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            &HSTRING::from(SDDL),
-            SDDL_REVISION_1 as u32,
-            &mut sd,
-            None,
-        )
-        .ok()
+    let attributes = pf_paths_win::SecurityAttributes::new(SDDL)
         .map_err(|e| format!("security descriptor: {e}"))?;
-        let attrs = SECURITY_ATTRIBUTES {
-            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd.0,
-            bInheritHandle: false.into(),
-        };
-        let created = CreateDirectoryW(&HSTRING::from(path.as_os_str()), Some(&attrs)).ok();
-        // HLOCAL is a HANDLE alias at this rev, so the alias cannot construct.
-        LocalFree(HANDLE(sd.0));
-        created.map_err(|e| format!("create {}: {e}", path.display()))
+    // SAFETY: `attributes` outlives the call. The cast is between two versions of the
+    // `windows` crate that declare the same C struct.
+    unsafe {
+        CreateDirectoryW(
+            &HSTRING::from(path.as_os_str()),
+            Some(attributes.as_ptr().cast()),
+        )
     }
+    .ok()
+    .map_err(|e| format!("create {}: {e}", path.display()))
 }
