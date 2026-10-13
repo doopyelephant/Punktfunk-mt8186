@@ -68,9 +68,9 @@ $PSNativeCommandUseErrorActionPreference = $false
 trap { Remove-SigningPfx; break }
 
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-# Everything built here links the C runtime statically, as -TargetDir's exes must: a fresh Windows
-# Server has no Visual C++ runtime, and setup itself has to start there.
-if (-not $env:RUSTFLAGS) { $env:RUSTFLAGS = '-C target-feature=+crt-static' }
+# An x64 build links the C runtime statically, as -TargetDir's exes must: a fresh Windows Server
+# has no Visual C++ runtime, and setup itself has to start there. arm64 keeps the runtime DLL.
+if ($Arch -eq 'x64' -and -not $env:RUSTFLAGS) { $env:RUSTFLAGS = '-C target-feature=+crt-static' }
 $triple = if ($Arch -eq 'arm64') { 'aarch64-pc-windows-msvc' } else { 'x86_64-pc-windows-msvc' }
 $archSuffix = if ($Arch -eq 'arm64') { '_arm64' } else { '' }
 $exe = Join-Path $TargetDir 'punktfunk-host.exe'
