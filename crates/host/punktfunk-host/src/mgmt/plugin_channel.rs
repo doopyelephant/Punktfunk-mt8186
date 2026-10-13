@@ -107,7 +107,8 @@ pub(crate) struct PagePath {
 /// The console's request to a plugin page, any method, under `/plugins/{id}/ui/`. Admin lane:
 /// the host adds the plugin's secret, so the console never holds it for a channel plugin.
 pub(crate) async fn proxy(Path(PagePath { id, rest }): Path<PagePath>, req: Request) -> Response {
-    let Some(cred) = super::plugins::ui_credential(&id).filter(|c| c.port == 0) else {
+    let Some(cred) = crate::plugin_host::registry::ui_credential(&id).filter(|c| c.port == 0)
+    else {
         return api_error(
             StatusCode::NOT_FOUND,
             "no live plugin UI channel with that id",
@@ -202,7 +203,7 @@ pub(crate) fn request_blocking(
     json: &str,
     timeout: Duration,
 ) -> Result<(u16, String), Unreached> {
-    let Some(cred) = super::plugins::ui_credential(id).filter(|c| c.port == 0) else {
+    let Some(cred) = crate::plugin_host::registry::ui_credential(id).filter(|c| c.port == 0) else {
         return Err(Unreached::NotAttached);
     };
     let call = async {

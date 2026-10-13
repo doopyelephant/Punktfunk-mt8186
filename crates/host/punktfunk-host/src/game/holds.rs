@@ -20,7 +20,7 @@ pub const HOLD_DEFAULT_MS: u32 = 30_000;
 /// Call on a blocking thread, only when this session spawns the game.
 pub fn launching(game: GameRefPayload) {
     let ev = crate::events::bus().emit(EventKind::GameLaunching { game });
-    let plugins = crate::mgmt::plugins::holders("game.launching");
+    let plugins = crate::plugin_host::registry::holders("game.launching");
     let hooks = crate::hooks::holding(&ev);
     if plugins.is_empty() && hooks.is_empty() {
         return;
@@ -45,7 +45,7 @@ pub fn launching(game: GameRefPayload) {
 
 /// One plugin's hold: `POST /__hold` with the event, 2xx means done. A plugin on the host's
 /// channel (port 0) is reached through it instead of a port.
-fn hold_plugin(p: &crate::mgmt::plugins::Holder, json: &str) {
+fn hold_plugin(p: &crate::plugin_host::registry::Holder, json: &str) {
     let timeout_ms = p.timeout.as_millis() as u64;
     if p.port == 0 {
         use crate::mgmt::plugin_channel::{request_blocking, Unreached};
@@ -152,7 +152,7 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(10));
             }
         });
-        let p = crate::mgmt::plugins::Holder {
+        let p = crate::plugin_host::registry::Holder {
             id: "slow".into(),
             port,
             secret: "s".repeat(16),
@@ -186,7 +186,7 @@ mod tests {
                 .unwrap();
             String::from_utf8(req).unwrap()
         });
-        let p = crate::mgmt::plugins::Holder {
+        let p = crate::plugin_host::registry::Holder {
             id: "fast".into(),
             port,
             secret: "a".repeat(16),
