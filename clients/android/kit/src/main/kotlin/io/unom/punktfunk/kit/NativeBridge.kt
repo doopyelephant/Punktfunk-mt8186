@@ -724,6 +724,17 @@ object NativeBridge {
     external fun nativePadMotionReaches(handle: Long, declaredPref: Int): Boolean
 
     /**
+     * Whether the host's device for a pad that declared [declaredPref] has a Quick Access button,
+     * so a synthetic Quick Access tap presses [Gamepad.BTN_MISC1] there and Steam's chord
+     * everywhere else ([Gamepad.quickAccessPresses]). A negative [declaredPref] is a pad that
+     * never declared: the session default answers for it.
+     *
+     * Answered natively, off `punktfunk_core::config::pad_has_quick_access`, for the reason
+     * [nativePadMotionReaches] is. `false` when the session handle is dead.
+     */
+    external fun nativePadHasQuickAccess(handle: Long, declaredPref: Int): Boolean
+
+    /**
      * The console's outline for a GamepadPref wire byte's pad family, as 24-unit SVG path data,
      * stroked at 1.5. Empty for Automatic, which keeps its generic gamepad icon.
      */

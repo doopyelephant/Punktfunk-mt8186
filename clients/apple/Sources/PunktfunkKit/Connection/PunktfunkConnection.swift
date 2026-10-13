@@ -523,6 +523,30 @@ public final class PunktfunkConnection: @unchecked Sendable {
         ) -> Bool {
             declared == asked ? resolved.hasMotion : declared.hasMotion
         }
+
+        /// Whether this backend's pad has a Quick Access button, which wire `misc1` presses.
+        /// On every other pad `misc1` is another control (mute, Share, Capture) or nothing.
+        /// Mirrors punktfunk-core's `GamepadPref::has_quick_access`. `.auto` is `false`: a host
+        /// that names no backend builds an Xbox 360 pad.
+        public var hasQuickAccess: Bool {
+            switch self {
+            case .steamDeck, .steamController2, .steamController2Puck, .horipadSteam:
+                return true
+            case .auto, .xbox360, .dualSense, .xboxOne, .dualShock4, .steamController,
+                 .dualSenseEdge, .switchPro, .xboxElite, .eightBitDoUltimate2, .eightBitDoPro2,
+                 .eightBitDoPro3, .joyConPair, .switch2Pro, .switch2GameCube:
+                return false
+            }
+        }
+
+        /// Whether ONE pad's device on the host has that button. The arguments and the rule are
+        /// `motionReaches`': the echo answers for a pad that declared the session default, the
+        /// pad's own declaration for every other. Mirrors core's `pad_has_quick_access`.
+        public static func hasQuickAccess(
+            declared: GamepadType, asked: GamepadType, resolved: GamepadType
+        ) -> Bool {
+            declared == asked ? resolved.hasQuickAccess : declared.hasQuickAccess
+        }
     }
 
     /// The virtual gamepad backend the host actually resolved (the Welcome's echo of the
@@ -540,6 +564,14 @@ public final class PunktfunkConnection: @unchecked Sendable {
     public func motionReaches(declared: GamepadType) -> Bool {
         GamepadType.motionReaches(
             declared: declared, asked: requestedGamepad, resolved: resolvedGamepad)
+    }
+
+    /// Whether the host's device for ONE pad has a Quick Access button, given the kind that pad
+    /// declared. A pad that never declared answers with the session default, so pass `nil`.
+    public func hasQuickAccess(declared: GamepadType?) -> Bool {
+        GamepadType.hasQuickAccess(
+            declared: declared ?? requestedGamepad, asked: requestedGamepad,
+            resolved: resolvedGamepad)
     }
 
     /// The compositor the host actually resolved for this session's virtual output (the

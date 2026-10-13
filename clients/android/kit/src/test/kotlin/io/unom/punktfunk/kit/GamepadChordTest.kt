@@ -157,6 +157,31 @@ class GamepadChordTest {
     }
 
     /**
+     * Steam reads Quick Access on a pad without the button as Guide held, then A. The tap keeps
+     * that order on the wire and lets go of A first. A pad with the button taps it.
+     */
+    @Test
+    fun `a quick access tap holds guide before it presses a`() {
+        val tap = GamepadRouter.TAP_PRESS_MS
+        assertEquals(
+            listOf(
+                Triple(Gamepad.BTN_GUIDE, true, 0L),
+                Triple(Gamepad.BTN_A, true, tap),
+                Triple(Gamepad.BTN_A, false, 2 * tap),
+                Triple(Gamepad.BTN_GUIDE, false, 2 * tap),
+            ),
+            GamepadRouter.tapEvents(Gamepad.quickAccessPresses(hasButton = false)),
+        )
+        assertEquals(
+            listOf(
+                Triple(Gamepad.BTN_MISC1, true, 0L),
+                Triple(Gamepad.BTN_MISC1, false, tap),
+            ),
+            GamepadRouter.tapEvents(Gamepad.quickAccessPresses(hasButton = true)),
+        )
+    }
+
+    /**
      * A pad's own mute button (a DualSense's) is a second trigger for the mic toggle, and
      * `slotButton` reads it through the SAME edge rule expressed as a one-button chord.
      *

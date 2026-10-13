@@ -510,6 +510,37 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadMotionRe
     })
 }
 
+/// `NativeBridge.nativePadHasQuickAccess(handle, declaredPref)` — whether the host's device for a
+/// pad that declared `declaredPref` has a Quick Access button, so a synthetic Quick Access tap
+/// presses `MISC1` there and Steam's chord everywhere else. A negative `declaredPref` is a pad
+/// that never declared: the session default answers for it.
+///
+/// Answered here for the reason `nativePadMotionReaches` is:
+/// [`punktfunk_core::config::pad_has_quick_access`] carries the rule and its tests. A `0`
+/// handle answers `false`, which sends the chord: every pad Steam reads takes it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePadHasQuickAccess(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+    declared_pref: jint,
+) -> jboolean {
+    jni_guard(false, || {
+        let Some(h) = SESSIONS.get(handle) else {
+            return false;
+        };
+        let declared = u8::try_from(declared_pref).map_or(
+            h.client.requested_gamepad,
+            punktfunk_core::config::GamepadPref::from_u8,
+        );
+        punktfunk_core::config::pad_has_quick_access(
+            declared,
+            h.client.requested_gamepad,
+            h.client.resolved_gamepad,
+        )
+    })
+}
+
 /// `NativeBridge.nativeSendGamepadRemove(handle, pad)` — signal that wire pad index `pad` was
 /// unplugged so the host tears its virtual device down. `pad` (rides `flags`) is the only field; the
 /// core stamps the per-pad seq (in the snapshot seq space, so a reordered snapshot can't resurrect the

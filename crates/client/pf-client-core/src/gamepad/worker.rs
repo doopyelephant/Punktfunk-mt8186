@@ -140,6 +140,18 @@ fn declared_kind(setting: GamepadPref, physical: GamepadPref) -> GamepadPref {
     }
 }
 
+/// A synthetic tap's wire events as `(bit, down, after)`: each press [`TAP_PRESS`] after
+/// the one before, then every release together, last pressed first. Apart, because core
+/// folds per-transition sends into one state, and because a chord's first button has to be
+/// held before its second counts.
+fn tap_events(presses: &[u32]) -> Vec<(u32, bool, Duration)> {
+    let downs = presses.iter().zip(0u32..);
+    let mut events: Vec<_> = downs.map(|(&b, i)| (b, true, TAP_PRESS * i)).collect();
+    let up = TAP_PRESS * presses.len() as u32;
+    events.extend(presses.iter().rev().map(|&b| (b, false, up)));
+    events
+}
+
 /// What SDL's HIDAPI driver calls the Deck's built-in controller.
 const DECK_NAME: &str = "Steam Deck";
 
@@ -408,8 +420,9 @@ pub(super) struct Worker {
     kind_override: GamepadPref,
     system_forward: bool,
     guide_gesture: bool,
-    /// Owed synthetic-tap releases `(pad, bit, due)` — down went out on receipt.
-    synthetic_ups: Vec<(u8, u32, Instant)>,
+    /// Owed synthetic presses and releases `(pad, bit, down, due)`, in send order. A tap's
+    /// first press went out on receipt ([`tap_events`]).
+    synthetic: Vec<(u8, u32, bool, Instant)>,
     /// bit0 = haptics, bit1 = speaker. `0` until declared: tier-A detection then never runs.
     pad_audio_prefs: u8,
     /// Off: wire rumble is drained and dropped.
@@ -1032,16 +1045,16 @@ impl Worker {
         }
     }
 
-    /// Hold threshold and owed tap releases. ~10 ms attached jitter at most.
+    /// Hold threshold and a tap's owed presses and releases. ~10 ms attached jitter at most.
     pub(super) fn gesture_poll(&mut self) {
         let Some(c) = self.attached.clone() else {
-            self.synthetic_ups.clear();
+            self.synthetic.clear();
             return;
         };
         let now = Instant::now();
-        self.synthetic_ups.retain(|&(pad, bit, due)| {
+        self.synthetic.retain(|&(pad, bit, down, due)| {
             if now >= due {
-                send(&c, InputKind::GamepadButton, bit, 0, pad);
+                send(&c, InputKind::GamepadButton, bit, down as i32, pad);
                 false
             } else {
                 true
@@ -1287,12 +1300,30 @@ impl Worker {
                     }
                 }
                 Ok(Ctl::TapButton(bit)) => {
-                    // Down on the first forwarded index (pad 0 if none). Up TAP_PRESS later.
+                    // On the first forwarded index (pad 0 if none). A synthetic `MISC1` is
+                    // the Quick Access action, pressed as that pad's host device reads it.
                     if let Some(c) = self.attached.clone() {
-                        let pad = self.slots.first().map_or(0, |s| s.index);
-                        send(&c, InputKind::GamepadButton, bit, 1, pad);
-                        self.synthetic_ups
-                            .push((pad, bit, Instant::now() + TAP_PRESS));
+                        let slot = self.slots.first();
+                        let pad = slot.map_or(0, |s| s.index);
+                        let presses: &[u32] = if bit == wire::BTN_MISC1 {
+                            wire::quick_access_presses(
+                                punktfunk_core::config::pad_has_quick_access(
+                                    slot.map_or(c.requested_gamepad, |s| s.declared),
+                                    c.requested_gamepad,
+                                    c.resolved_gamepad,
+                                ),
+                            )
+                        } else {
+                            &[bit]
+                        };
+                        let now = Instant::now();
+                        for (bit, down, after) in tap_events(presses) {
+                            if after.is_zero() {
+                                send(&c, InputKind::GamepadButton, bit, down as i32, pad);
+                            } else {
+                                self.synthetic.push((pad, bit, down, now + after));
+                            }
+                        }
                     }
                 }
                 Ok(Ctl::Mask(on)) => {
@@ -1830,7 +1861,7 @@ impl Worker {
             kind_override: GamepadPref::Auto,
             system_forward: true,
             guide_gesture: false,
-            synthetic_ups: Vec::new(),
+            synthetic: Vec::new(),
             pad_audio_prefs: 0,
             rumble: true,
             attached: None,
@@ -2022,6 +2053,28 @@ mod slot_tests {
         // In session the raw 28DE:1205 is there, so every Steam pad is a shadow.
         let raw = pad(DECK_NAME, GamepadPref::SteamDeck, false);
         assert_eq!(names(vec![shadow(), raw, ds()]), [DECK_NAME, "DualSense"]);
+    }
+
+    /// Steam reads Quick Access on a pad without the button as Guide held, then A. The tap
+    /// keeps that order on the wire and lets go of A first. A pad with the button taps it.
+    #[test]
+    fn a_quick_access_tap_holds_guide_before_it_presses_a() {
+        assert_eq!(
+            tap_events(wire::quick_access_presses(false)),
+            [
+                (wire::BTN_GUIDE, true, Duration::ZERO),
+                (wire::BTN_A, true, TAP_PRESS),
+                (wire::BTN_A, false, TAP_PRESS * 2),
+                (wire::BTN_GUIDE, false, TAP_PRESS * 2),
+            ]
+        );
+        assert_eq!(
+            tap_events(wire::quick_access_presses(true)),
+            [
+                (wire::BTN_MISC1, true, Duration::ZERO),
+                (wire::BTN_MISC1, false, TAP_PRESS),
+            ]
+        );
     }
 
     #[test]

@@ -43,7 +43,9 @@ pub enum RingCommand {
     /// A custom chord as key NAMES (`ctrl`, `shift`, `escape`); see `overlay_actions::key_vk`.
     Shortcut(Vec<String>),
     /// A synthetic tap of one system button on the host's pad — a `gamepad::wire::BTN_*` bit
-    /// (guide or `MISC1`), the same verb the session control socket exposes.
+    /// (guide or `MISC1`), the same verb the session control socket exposes. `MISC1` is the
+    /// Quick Access action: the embedder presses what that pad's host device reads as it
+    /// (`punktfunk_core::input::gamepad::quick_access_presses`).
     TapButton(u32),
     /// Step [`RingFacts::pad_mouse_target`] to the next controller-mouse mode: off, touchpad,
     /// full.

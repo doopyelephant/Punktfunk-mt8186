@@ -34,7 +34,7 @@ pub enum SlotId {
     SendText,
     /// The host's guide button (Xbox / PS / Steam), as a synthetic pad tap.
     Guide,
-    /// The host's quick-access button — `BTN_MISC1`, the Deck's `…`.
+    /// The host's Quick Access: the Deck's `…` where the pad has it, Steam's chord elsewhere.
     Qam,
     /// Controller mouse: the pad drives the host pointer instead of its virtual pad.
     PadMouse,
@@ -484,11 +484,7 @@ pub fn catalogue(cfg: &OverlayConfig, platform: RingPlatform) -> Vec<CatalogueGr
                     },
                 ),
                 e("guide", "Guide button", ""),
-                e(
-                    "qam",
-                    "Quick access menu",
-                    "Only where the host's pad is Steam-shaped",
-                ),
+                e("qam", "Quick access menu", "Where the host runs Steam"),
                 e("pad_mouse", "Controller mouse", ""),
                 e("pad_type", "Controller type", "For this stream"),
             ],

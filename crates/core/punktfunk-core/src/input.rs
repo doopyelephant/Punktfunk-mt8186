@@ -367,6 +367,17 @@ pub mod gamepad {
     /// Misc / capture — Deck `…`/quick-access, Share/Capture / GameStream `MISC`.
     pub const BTN_MISC1: u32 = 0x0020_0000;
 
+    /// What a synthetic Quick Access tap presses, in order. A pad with the button
+    /// ([`GamepadPref::has_quick_access`](crate::config::GamepadPref::has_quick_access)) takes
+    /// [`BTN_MISC1`]. Every other pad takes the chord Steam reads there: Guide held, then A.
+    pub const fn quick_access_presses(has_button: bool) -> &'static [u32] {
+        if has_button {
+            &[BTN_MISC1]
+        } else {
+            &[BTN_GUIDE, BTN_A]
+        }
+    }
+
     pub const AXIS_LS_X: u32 = 0;
     pub const AXIS_LS_Y: u32 = 1;
     pub const AXIS_RS_X: u32 = 2;

@@ -320,13 +320,14 @@ impl GamepadService {
     }
 
     /// [`Self::tap_guide`] for any system button — the quick-action ring's route, which
-    /// carries the bit its slot stands for.
+    /// carries the bit its slot stands for. `MISC1` stands for Quick Access ([`Self::tap_qam`]).
     pub fn tap_button(&self, bit: u32) {
         let _ = self.ctl.send(Ctl::TapButton(bit));
     }
 
-    /// Like [`Self::tap_guide`] for `MISC1` (Deck `…`). Harmless on pads that map or
-    /// drop the misc button.
+    /// The host's Quick Access: `MISC1` where that pad's host device has the button, else
+    /// Guide and then A, the chord Steam reads on every other pad
+    /// ([`wire::quick_access_presses`]). Synthetic only: a physical press is never rewritten.
     pub fn tap_qam(&self) {
         self.tap_button(wire::BTN_MISC1);
     }
