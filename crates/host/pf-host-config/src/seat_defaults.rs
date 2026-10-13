@@ -62,7 +62,7 @@ impl SeatDefaults {
 
 /// Writes the box's resolved defaults into `dir`. A seat host has none of its own to hand on.
 pub fn write(dir: &Path) -> std::io::Result<()> {
-    if pf_paths::seat::is_seat_host() {
+    if pf_paths::seat::role().is_seat_host() {
         return Ok(());
     }
     let body = serde_json::to_vec_pretty(&SeatDefaults::of(crate::config()).to_json())
@@ -78,7 +78,7 @@ static CACHE: Mutex<Option<Cached>> = Mutex::new(None);
 /// This seat's defaults, as the box last wrote them. `None` on any host that does not follow the
 /// contract, and while the box has written none: the seat then keeps its built-in defaults.
 pub fn current() -> Option<SeatDefaults> {
-    if !pf_paths::seat::follows_contract() {
+    if !pf_paths::seat::role().follows_contract() {
         return None;
     }
     read_cached(&pf_paths::seat::trust_dir()?.join(FILE))

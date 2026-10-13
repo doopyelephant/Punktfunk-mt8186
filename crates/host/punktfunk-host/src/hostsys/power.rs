@@ -101,7 +101,7 @@ impl Availability {
 /// What `verb` can do on this host. A seat host never does any of it: sleeping or restarting
 /// would take every other seat down, so the box's own host is the one executor.
 pub fn probe(verb: PowerVerb) -> Availability {
-    if pf_paths::seat::is_seat_host() {
+    if pf_paths::seat::role().is_seat_host() {
         return Availability::no("A seat can't sleep, restart or shut down the host.");
     }
     os_probe(verb)

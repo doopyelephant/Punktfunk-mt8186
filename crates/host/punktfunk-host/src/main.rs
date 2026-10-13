@@ -421,7 +421,7 @@ fn startup(args: &[String]) {
 
     // The door never opens a display: it has no monitors to anchor and no GPU to profile.
     #[cfg(target_os = "linux")]
-    if !management_cli && !pf_paths::seat::is_door() {
+    if !management_cli && !pf_paths::seat::role().is_door() {
         refresh_capture_monitor_anchor("startup");
     }
 
@@ -454,7 +454,7 @@ fn startup(args: &[String]) {
     // P2-cap driver profile only. Clock pin is per live client (`gpuclocks::session_pin`), not
     // host-lifetime, so idle clocks stay down. No-op off NVIDIA.
     #[cfg(target_os = "linux")]
-    if !pf_paths::seat::is_door()
+    if !pf_paths::seat::role().is_door()
         && matches!(
             args.first().map(String::as_str),
             Some("serve") | Some("punktfunk1-host")
@@ -484,8 +484,12 @@ fn real_main() -> Result<()> {
     }
 
     // Before `startup`: it skips the display and GPU work for the door.
-    if args.first().map(String::as_str) == Some("serve") && args.iter().any(|a| a == "--door") {
-        pf_paths::seat::set_door();
+    if args.first().map(String::as_str) == Some("serve") {
+        let door_flag = args.iter().any(|a| a == "--door");
+        pf_paths::seat::resolve(door_flag);
+        for (setting, reason) in pf_paths::seat::ignored(door_flag) {
+            tracing::warn!(setting, reason, "seat-contract setting ignored");
+        }
     }
     startup(&args);
 

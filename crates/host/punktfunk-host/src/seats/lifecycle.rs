@@ -113,7 +113,7 @@ pub(crate) fn keep_warm(sup: &dyn Supervisor) {
     let profiles = crate::profiles::Profiles::load_with(None, None).list();
     let ledger = sup.seats();
     let owner = ledger.iter().find(|s| s.owner);
-    let door = pf_paths::seat::is_door();
+    let door = pf_paths::seat::role().is_door();
     for row in warm_rows(&profiles, owner, door, now, wanted) {
         let Ok(id) = SeatId::parse(row) else { continue };
         let running = ledger

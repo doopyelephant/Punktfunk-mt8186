@@ -4,6 +4,7 @@
 
 use crate::{discovery, mgmt, native, webtransport};
 use anyhow::{bail, Result};
+use pf_paths::seat::HostRole;
 use std::net::SocketAddr;
 
 /// `serve`'s flags with the env fallbacks applied.
@@ -179,7 +180,7 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
     // The tray's bearer. A seat host has no tray and serves no summary. Not fatal: the tray
     // then shows the host as running without detail.
     #[cfg(target_os = "windows")]
-    let seat_host = pf_paths::seat::is_seat_host();
+    let seat_host = pf_paths::seat::role().is_seat_host();
     #[cfg(not(target_os = "windows"))]
     let seat_host = false;
     if !seat_host {
@@ -192,10 +193,9 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
     // Mint only if the runner is installed — otherwise a second admin-adjacent credential sits
     // on disk for a subsystem that is not running. Scope: `plugin_may_access`, not pairing/hooks.
     let runner = crate::plugins::runtime_status();
-    // The plugin runner is the owner's: the door has none to hand a token to.
-    if runner.installed && !pf_paths::seat::is_door() {
-        // A Windows seat host shares the box's runner and must not bounce it.
-        opts.restart_runner = !seat_host
+    let (mints, may_restart) = runner_token(pf_paths::seat::role());
+    if runner.installed && mints {
+        opts.restart_runner = may_restart
             && !pf_paths::config_dir()
                 .join(crate::mgmt_token::PLUGIN_FILE)
                 .exists();
@@ -237,7 +237,7 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
         );
     }
     // The door places connects and streams nothing, and stock Moonlight has no redirect to follow.
-    let gamestream = pf_host_config::config().gamestream && !pf_paths::seat::is_door();
+    let gamestream = pf_host_config::config().gamestream && !pf_paths::seat::role().is_door();
     let native = native::NativeServe {
         webtransport_bind: pf_host_config::config()
             .webtransport
@@ -249,10 +249,31 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
     Ok((opts, native, gamestream))
 }
 
+/// Whether this host mints the plugin runner's token, and whether a first mint restarts the
+/// runner. The runner is the owner's, so the door has none to hand a token to. A Windows seat
+/// host shares the box's runner and must not bounce it.
+fn runner_token(role: HostRole) -> (bool, bool) {
+    match role {
+        HostRole::Door => (false, false),
+        HostRole::Seat(_) => (true, !cfg!(windows)),
+        HostRole::Plain => (true, true),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::args;
+
+    #[test]
+    fn the_door_mints_no_runner_token_and_a_windows_seat_restarts_no_runner() {
+        for role in HostRole::ALL {
+            let (mints, may_restart) = runner_token(role);
+            assert_eq!(mints, !role.is_door(), "{role:?}");
+            let shares_the_runner = cfg!(windows) && role.is_seat_host();
+            assert!(!mints || may_restart != shares_the_runner, "{role:?}");
+        }
+    }
 
     /// A bad flag is refused rather than replaced by the default, and so is a browser plane
     /// that `--open` would leave reachable by any page.

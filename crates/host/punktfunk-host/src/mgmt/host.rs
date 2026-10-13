@@ -556,7 +556,7 @@ pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<Host
         // Same mask as GameStream/QUIC negotiation (`host_wire_caps`), not the compile-time list.
         // A door encodes nothing, so it names none and never probes the GPU.
         codecs: {
-            let caps = if pf_paths::seat::is_door() {
+            let caps = if pf_paths::seat::role().is_door() {
                 0
             } else {
                 crate::encode::host_wire_caps()
@@ -574,7 +574,7 @@ pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<Host
             .collect()
         },
         gamestream: st.gamestream_enabled,
-        door: pf_paths::seat::is_door(),
+        door: pf_paths::seat::role().is_door(),
         fingerprint: st.identity_fingerprint.map(hex::encode),
         ports: PortMap {
             mgmt: st.port,

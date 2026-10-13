@@ -663,6 +663,10 @@ mod stall_model;
 mod cursor_raster;
 #[cfg(target_os = "windows")]
 pub use idd_push::driver_encode::{open_driver_encoder, DriverEncodeOpenError, DriverEncodeParams};
+// The host's end of a capture worker's pipes. Generic over the pipes and the process, so its
+// tests stand in for a worker on every target.
+#[path = "windows/worker_link.rs"]
+mod worker_link;
 // A monitor the host did not create, captured and encoded by a capture worker.
 #[cfg(target_os = "windows")]
 #[path = "windows/wgc.rs"]

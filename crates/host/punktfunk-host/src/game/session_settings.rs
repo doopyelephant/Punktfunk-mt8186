@@ -189,7 +189,7 @@ pub fn store() -> &'static SessionSettingsStore {
 /// The settings in force. A contract seat has none of its own: the built-in defaults, with the
 /// box's choice of what a game's exit does to the stream (`seat_end_on_game_exit`).
 pub fn get() -> SessionSettings {
-    if pf_paths::seat::follows_contract() {
+    if pf_paths::seat::role().follows_contract() {
         return contract_settings(pf_host_config::seat_defaults::current());
     }
     store().get()
@@ -209,7 +209,7 @@ fn contract_settings(
 /// Both directions need a launch path and process visibility; macOS has neither.
 pub fn enforced() -> Vec<String> {
     // A contract seat has nothing to set: the box hands it the one choice it makes.
-    if pf_paths::seat::follows_contract() {
+    if pf_paths::seat::role().follows_contract() {
         return Vec::new();
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]

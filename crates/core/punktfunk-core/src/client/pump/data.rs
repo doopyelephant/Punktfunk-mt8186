@@ -222,6 +222,9 @@ impl DataPump {
             if let Some(fb) = resend {
                 self.shared.send_feedback(&fb);
             }
+            // The driver's clock: the drop climb, the overdue freeze and a deferred RFI.
+            let frames_dropped = self.shared.frames_dropped.load(Ordering::Relaxed);
+            self.recovery(super::super::RecoveryEvent::Tick { frames_dropped }, now);
             if self.shared.frames.expire_hold(now) {
                 tracing::debug!("nack expired: the frames after it go, and their gap asks");
             }
@@ -688,9 +691,14 @@ impl DataPump {
             if self.on_anchors || all_intra {
                 continue;
             }
-            let ask = self.shared.rfi.lock().unwrap().tail_short(idx, now);
-            super::super::send_recovery(&self.shared, ask);
+            self.recovery(super::super::RecoveryEvent::TailShort { index: idx }, now);
         }
+    }
+
+    /// Fold one of the pump's own events into the recovery driver and send what it asks.
+    fn recovery(&self, ev: super::super::RecoveryEvent, now: Instant) {
+        let ask = self.shared.recovery.lock().unwrap().step(ev, now).ask;
+        super::super::send_recovery(&self.shared, ask);
     }
 
     /// Ask for frame `idx`'s missing shards when the round trip fits a frame interval, and

@@ -22,6 +22,9 @@ pf-host-config = { path = "../pf-host-config" }
 # The host<->driver wire contract: control IOCTL structs and the v7 AU section. Every target:
 # the AU reader's pure half is unit-tested off Windows.
 pf-driver-proto = { path = "../pf-driver-proto" }
+# The capture worker's messages are Pod; pinned to pf-driver-proto's so the graph resolves one.
+# Every target: the worker link's tests stand in for the worker off Windows.
+bytemuck = "1.19"
 anyhow = "1"
 tracing = "0.1"
 
@@ -60,8 +63,6 @@ pf-paths-win = { path = "../pf-paths-win" }
 # The `Encoder` contract the driver-encode proxy implements, and the D3D11 converters the
 # P010 self-test drives.
 pf-encode-win = { path = "../pf-encode-win" }
-# The capture worker's messages are Pod; pinned to pf-driver-proto's so the graph resolves one.
-bytemuck = "1.19"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",

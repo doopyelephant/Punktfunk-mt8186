@@ -1,4 +1,5 @@
-//! Hung-decoder detection for the MediaCodec decode loop.
+//! Hung-decoder detection for the MediaCodec decode loop, and what repeated hangs cost the
+//! bring-up ladder.
 
 use std::time::{Duration, Instant};
 
@@ -74,10 +75,111 @@ impl NoOutput {
     }
 }
 
+/// Frames a decoder shows before its rung counts as working on this device.
+/// One second at 60 Hz, and more than a codec's output pool holds: a decoder its
+/// configuration hangs stops inside the pool.
+pub(crate) const SETTLED_FRAMES: u64 = 60;
+
+/// Clean, unsettled failures in a row before the ladder moves.
+const UNSETTLED_PER_RUNG: u32 = 2;
+
+/// The decoder bring-up ladder's first rung. A decoder can start cleanly and then hang a few
+/// frames in, every time: nothing was refused, so the ladder alone never moves past it.
+///
+/// The floor moves only on evidence a working decoder cannot produce: two decoders in a row,
+/// on a rung where none has settled, each failing on an unbroken stream. A rung that once
+/// showed [`SETTLED_FRAMES`] keeps its place whatever fails later, and a failure after a loss
+/// counts for nothing: loss hangs working decoders too.
+#[derive(Default)]
+pub(crate) struct RungFloor {
+    rung: usize,
+    unsettled: u32,
+    /// A decoder on this rung settled.
+    proven: bool,
+}
+
+impl RungFloor {
+    pub(crate) fn rung(&self) -> usize {
+        self.rung
+    }
+
+    /// A decoder failed after showing `rendered` frames. `clean`: it was fed nothing past a
+    /// loss and reported no error. `lower`: the rung below the one it ran on, if the ladder has
+    /// one. `true`: the floor moved there.
+    pub(crate) fn note_failed(&mut self, rendered: u64, clean: bool, lower: Option<usize>) -> bool {
+        self.proven |= rendered >= SETTLED_FRAMES;
+        if self.proven || !clean {
+            self.unsettled = 0;
+            return false;
+        }
+        self.unsettled += 1;
+        match lower {
+            Some(lower) if self.unsettled >= UNSETTLED_PER_RUNG => {
+                *self = RungFloor {
+                    rung: lower,
+                    ..RungFloor::default()
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{InputStall, NoOutput, INPUT_STALL_PATIENCE, NO_OUTPUT_PATIENCE};
+    use super::{
+        InputStall, NoOutput, RungFloor, INPUT_STALL_PATIENCE, NO_OUTPUT_PATIENCE, SETTLED_FRAMES,
+    };
     use std::time::{Duration, Instant};
+
+    /// A decoder that starts and then hangs on an unbroken stream, every time, walks the
+    /// ladder, and each rung gets its own two tries.
+    #[test]
+    fn two_clean_unsettled_failures_in_a_row_move_the_floor() {
+        let mut f = RungFloor::default();
+        assert!(!f.note_failed(10, true, Some(1)));
+        assert!(f.note_failed(9, true, Some(1)));
+        assert_eq!(f.rung(), 1);
+        assert!(!f.note_failed(0, true, Some(2)));
+        assert!(f.note_failed(0, true, Some(2)));
+        assert_eq!(f.rung(), 2);
+        // The last rung has nowhere to go.
+        assert!(!f.note_failed(0, true, None));
+        assert!(!f.note_failed(0, true, None));
+        assert_eq!(f.rung(), 2);
+    }
+
+    /// Loss hangs working decoders. A failure after one counts for nothing and breaks the row.
+    #[test]
+    fn a_failure_after_a_loss_never_moves_the_floor() {
+        let mut f = RungFloor::default();
+        for _ in 0..8 {
+            assert!(!f.note_failed(5, false, Some(1)));
+        }
+        assert!(!f.note_failed(5, true, Some(1)));
+        assert!(!f.note_failed(5, false, Some(1)));
+        assert!(!f.note_failed(5, true, Some(1)));
+        assert_eq!(f.rung(), 0);
+    }
+
+    /// A rung that showed a second of picture works on this device, whatever fails later.
+    #[test]
+    fn a_rung_that_settled_keeps_its_place() {
+        let mut f = RungFloor::default();
+        assert!(!f.note_failed(SETTLED_FRAMES, true, Some(1)));
+        for _ in 0..8 {
+            assert!(!f.note_failed(3, true, Some(1)));
+        }
+        assert_eq!(f.rung(), 0);
+        // A lower rung has to prove itself again.
+        let mut f = RungFloor::default();
+        assert!(!f.note_failed(3, true, Some(1)));
+        assert!(f.note_failed(3, true, Some(1)));
+        assert!(!f.note_failed(3, true, Some(2)));
+        assert!(f.note_failed(3, true, Some(2)));
+        assert_eq!(f.rung(), 2);
+    }
 
     /// A still host sends one frame after seconds of nothing. That frame must reach the screen:
     /// tripping on it arms the freeze and holds the very picture that carries the change.

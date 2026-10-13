@@ -564,7 +564,8 @@ fn instance_id_from_path(path: &str) -> Option<String> {
 
 /// This process's Windows session when it is a seat host, else `None`.
 fn seat_session() -> Option<u32> {
-    super::identity::is_seat_session_marker(std::env::var_os("PUNKTFUNK_SEAT_SESSION").as_deref())
+    pf_paths::seat::role()
+        .is_seat_host()
         .then(pf_win_display::own_session_id)
         .flatten()
 }

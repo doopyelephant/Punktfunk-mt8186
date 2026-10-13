@@ -374,6 +374,36 @@ impl SyncPoints {
     }
 }
 
+/// A stream's buffers, as the loop thread takes them and gives them back. The live capture
+/// passes its `*mut pw_stream`; the callback tests stand two lists in.
+pub(super) trait StreamBuffers {
+    /// The next arrival, or null when none is queued.
+    ///
+    /// # Safety
+    /// Loop thread, on a live stream.
+    unsafe fn dequeue(&self) -> *mut pw::sys::pw_buffer;
+
+    /// Queue `buf` for the producer.
+    ///
+    /// # Safety
+    /// Loop thread; `buf` is a live buffer of this stream that this side dequeued and holds.
+    unsafe fn queue(&self, buf: *mut pw::sys::pw_buffer);
+}
+
+impl StreamBuffers for *mut pw::sys::pw_stream {
+    unsafe fn dequeue(&self) -> *mut pw::sys::pw_buffer {
+        let stream = *self;
+        // SAFETY: the caller's contract is `pw_stream_dequeue_buffer`'s.
+        unsafe { pw::sys::pw_stream_dequeue_buffer(stream) }
+    }
+
+    unsafe fn queue(&self, buf: *mut pw::sys::pw_buffer) {
+        let stream = *self;
+        // SAFETY: the caller's contract is `pw_stream_queue_buffer`'s.
+        let _ = unsafe { pw::sys::pw_stream_queue_buffer(stream, buf) };
+    }
+}
+
 /// Hand `buf` back to the producer, its release point signalled first when the stream
 /// negotiated explicit sync: the producer waits on that point before it paints the buffer
 /// again, so a point never signalled parks one pool slot for good.
@@ -382,7 +412,7 @@ impl SyncPoints {
 /// Loop thread; `buf` is a live buffer of `stream` this side holds and touches no further.
 pub(super) unsafe fn hand_back(
     sync: Option<&SyncDevice>,
-    stream: *mut pw::sys::pw_stream,
+    stream: &dyn StreamBuffers,
     buf: *mut pw::sys::pw_buffer,
 ) {
     // SAFETY: `buf` is held (caller), so its `spa_buffer` is readable until the queue below.
@@ -402,8 +432,8 @@ pub(super) unsafe fn hand_back(
             }
         }
     }
-    // SAFETY: the caller's contract is `pw_stream_queue_buffer`'s.
-    let _ = unsafe { pw::sys::pw_stream_queue_buffer(stream, buf) };
+    // SAFETY: the caller's contract is `queue`'s.
+    unsafe { stream.queue(buf) };
 }
 
 /// Signal the release point of each pool buffer that never reached this side. Returns how

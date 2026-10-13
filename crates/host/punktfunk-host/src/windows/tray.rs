@@ -106,7 +106,7 @@ fn wanted() -> bool {
 /// control surface. On the console, two misses trigger [`ensure`]; one miss is
 /// the tray's own Exit racing the service shutdown.
 pub fn supervise() {
-    if crate::seat::is_seat_host() {
+    if crate::seat::role().is_seat_host() {
         tracing::debug!("seat host: status-tray supervision disabled");
         return;
     }
@@ -145,7 +145,7 @@ pub fn start() -> Result<(Option<u32>, &'static str)> {
     let Some(exe) = tray_exe() else {
         bail!("{TRAY_EXE} is not installed next to this executable");
     };
-    if !crate::seat::is_seat_host() && is_running() {
+    if !crate::seat::role().is_seat_host() && is_running() {
         return Ok((None, "already running"));
     }
     // Quoting preserves an operator-chosen install path that contains spaces.
@@ -177,14 +177,14 @@ pub fn start() -> Result<(Option<u32>, &'static str)> {
 /// remains present.
 pub fn stop() -> bool {
     let was_running = is_running();
-    if !was_running && !crate::seat::is_seat_host() {
+    if !was_running && !crate::seat::role().is_seat_host() {
         return false;
     }
     if let Some(exe) = tray_exe() {
         if let Ok(mut child) = std::process::Command::new(&exe).arg("--quit").spawn() {
             let _ = child.wait();
         }
-        if crate::seat::is_seat_host() {
+        if crate::seat::role().is_seat_host() {
             return true;
         }
         for _ in 0..8 {

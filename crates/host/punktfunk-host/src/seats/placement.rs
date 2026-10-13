@@ -9,6 +9,7 @@
 //! Shares the screen** is redirected to an occupied seat too; the seat host's admission joins it.
 
 use super::Occupant;
+use pf_paths::seat::HostRole;
 use pf_seats::{RuntimeState, Seat};
 use punktfunk_core::quic::v2::msg::Redirect;
 use punktfunk_core::reject::RejectReason;
@@ -44,11 +45,8 @@ pub(crate) struct Asker<'a> {
 /// the owner's desktop and a light seat on the owner's row, a full seat on its own. A profile no
 /// row serves, because the box has no owner row yet, is refused rather than played here.
 pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Placement {
-    // A seat host plays the profile it was asked for: resolving it already checked it is this
-    // seat's, and a seat has no ledger to place anything in.
-    if pf_paths::seat::is_seat_host()
-        || (!super::is_door() && ledger_seat(&profile.os_account).is_none())
-    {
+    let own_row = ledger_seat(&profile.os_account).is_some();
+    if plays_here(pf_paths::seat::role(), own_row) {
         return Placement::Here;
     }
     let snap = super::snapshot();
@@ -74,6 +72,17 @@ pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Place
         );
     }
     placed
+}
+
+/// Whether the host that was asked plays the profile itself. A seat host does: resolving the
+/// profile already checked it is this seat's, and a seat has no ledger to place anything in.
+/// A door never does. Any other host places only a profile with a ledger row of its own.
+fn plays_here(role: HostRole, own_row: bool) -> bool {
+    match role {
+        HostRole::Seat(_) => true,
+        HostRole::Door => false,
+        HostRole::Plain => !own_row,
+    }
 }
 
 /// Seat id → the device redirected to it and until when it holds it.
@@ -140,6 +149,20 @@ mod tests {
 
     const ME: &str = "aa11bb22cc33dd44ee55ff6600000000000000000000000000000000000000aa";
     const THEM: &str = "ff99ee88dd77cc66bb55aa4400000000000000000000000000000000000000ff";
+
+    #[test]
+    fn a_seat_host_plays_what_it_is_asked_and_a_door_places_it() {
+        for role in HostRole::ALL {
+            for own_row in [false, true] {
+                let asked = role.is_seat_host() || (!role.is_door() && !own_row);
+                assert_eq!(
+                    plays_here(role, own_row),
+                    asked,
+                    "{role:?}, own row {own_row}"
+                );
+            }
+        }
+    }
 
     fn seat(state: RuntimeState) -> Seat {
         serde_json::from_value(serde_json::json!({
