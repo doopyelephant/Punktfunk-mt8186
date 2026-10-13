@@ -85,8 +85,9 @@ pub unsafe extern "C" fn punktfunk_connection_request_mode(
     })
 }
 
-/// Request an IDR now. Infinite GOP has one opening IDR; throttle — a wedged
-/// decoder stays stuck for several frames, so per-frame requests flood control.
+/// The decoder needs an IDR; infinite GOP sends none unasked. With a decoder reporting
+/// through `punktfunk_connection_recovery_*` the core arms the freeze and sends one ask per
+/// 100 ms window. Before the first report, and after a reset, the ask goes at once: throttle.
 ///
 /// # Safety
 /// `c` is a valid connection handle.
@@ -247,50 +248,9 @@ pub unsafe extern "C" fn punktfunk_connection_recovery_reset(
     })
 }
 
-/// Note each received `frame_index`. A forward gap fires throttled RFI; keyframe
-/// on `frames_dropped` is the backstop. `gap_out` (nullable) is whether a gap was seen.
-///
-/// # Safety
-/// `c` is a valid connection handle; `gap_out` is writable or NULL.
-#[cfg(feature = "quic")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn punktfunk_connection_note_frame_index(
-    c: *const PunktfunkConnection,
-    frame_index: u32,
-    gap_out: *mut bool,
-) -> PunktfunkStatus {
-    with_conn!(c => {
-        let gap = c.inner.note_frame_index(frame_index);
-        // SAFETY: the caller passes `gap_out` null or writable for one value.
-        unsafe { put(gap_out, gap > 0) };
-        PunktfunkStatus::Ok
-    })
-}
-
-/// [`punktfunk_connection_note_frame_index`] with the gap width: writes how many
-/// frames this arrival revealed as missing (0 = contiguous/straggler). Pass the
-/// width to [`punktfunk_reanchor_gate_arm_expecting_drops`] so a later
-/// `frames_dropped` climb for the same loss cannot re-freeze a healed stream.
-///
-/// # Safety
-/// `c` is a valid connection handle; `gap_width_out` is writable or NULL.
-#[cfg(feature = "quic")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn punktfunk_connection_note_frame_index_ex(
-    c: *const PunktfunkConnection,
-    frame_index: u32,
-    gap_width_out: *mut u32,
-) -> PunktfunkStatus {
-    with_conn!(c => {
-        let gap = c.inner.note_frame_index(frame_index);
-        // SAFETY: the caller passes `gap_width_out` null or writable for one value.
-        unsafe { put(gap_width_out, gap) };
-        PunktfunkStatus::Ok
-    })
-}
-
-/// Unrecoverable reassembler drops. Poll and request a keyframe when it climbs —
-/// infinite GOP conceals missing refs with no decode error. Writes 0 on NULL.
+/// Unrecoverable reassembler drops. For a client that reports through
+/// `punktfunk_connection_recovery_*` the core watches it: a climb past a gap's credit
+/// freezes and asks for a keyframe. Writes 0 on NULL.
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is writable (NULL is skipped).
