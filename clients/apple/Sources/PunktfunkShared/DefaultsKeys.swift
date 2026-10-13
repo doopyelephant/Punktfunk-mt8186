@@ -423,10 +423,11 @@ extension Notification.Name {
     /// Posted by `StatsVerbosity.requestCycle`. The stored default does not move.
     public static let punktfunkStatsCycled = Notification.Name("io.unom.punktfunk.stats-cycled")
 
-    /// Posted by the session view when the quick-action ring opens (`object` is a Bool `NSNumber`).
-    /// The Mac's stream layer releases a captured mouse for as long as it is up and takes capture
-    /// back on close: the ring's buttons are SwiftUI above the video, and a grabbed pointer can
-    /// never reach one. macOS only — the touch clients' fingers reach the ring either way.
+    /// Posted by the session view when the quick-action ring opens or closes (`object` is a Bool
+    /// `NSNumber`). The ring's buttons are SwiftUI above the video, and a grabbed pointer can
+    /// never reach one. So the Mac's stream layer releases a captured mouse for as long as the
+    /// ring is up, and the iPad's drops its pointer lock; both take it back on close. macOS and
+    /// iOS only: a finger reaches the ring either way.
     public static let punktfunkRingOpen = Notification.Name("io.unom.punktfunk.ring-open")
 
     /// Posted by InputCapture on ⌃⌥⇧O (`object` is the session's connection): on macOS while input

@@ -184,6 +184,10 @@ public final class StreamViewController: StreamViewControllerBase {
 
     /// True while a re-ask holds `prefersPointerLocked` at false for `pointerLockEdgeHold`.
     private var pointerLockSuppressed = false
+    /// The quick-action ring is up, so the mouse is UIKit's: a locked pointer cannot click a
+    /// button above the video. Only the lock yields. The keyboard stays captured, or ⌃⌥⇧O
+    /// could not close the ring.
+    private var ringHoldsPointer = false
     /// Long enough for UIKit to push the false pass to the scene before the true one follows.
     private static let pointerLockEdgeHold: TimeInterval = 0.05
     /// When the last drop-triggered re-ask was scheduled. A grant SpringBoard revokes at once
@@ -275,15 +279,17 @@ public final class StreamViewController: StreamViewControllerBase {
         connection?.settings.pointerCapture ?? true
     }
 
-    /// Whether the pointer should be CAPTURED right now: iPad, capture engaged, and the user
-    /// hasn't opted into the absolute (desktop) pointer. The system additionally requires
-    /// full-screen + frontmost and may drop the lock (Slide Over/Stage Manager/backgrounding) —
-    /// syncPointerLock() handles the actual grant/drop and falls back to absolute when unlocked.
+    /// Whether the pointer should be CAPTURED right now: iPad, capture engaged, the quick-action
+    /// ring down, and the user hasn't opted into the absolute (desktop) pointer. The system
+    /// additionally requires full-screen + frontmost and may drop the lock (Slide Over/Stage
+    /// Manager/backgrounding) — syncPointerLock() handles the actual grant/drop and falls back
+    /// to absolute when unlocked.
     private var wantsPointerLock: Bool {
         // The trailing grant test is per-client access §7 — no pointer lock without the
         // POINTER bit (a Controller-only guest's trackpad stays a normal local pointer);
         // read live, so a mid-session re-grant lets the next resolve pass lock.
-        captured && pointerCaptureEnabled && UIDevice.current.userInterfaceIdiom == .pad
+        captured && !ringHoldsPointer && pointerCaptureEnabled
+            && UIDevice.current.userInterfaceIdiom == .pad
             && connection?.canSendPointer == true
     }
 
@@ -653,6 +659,22 @@ public final class StreamViewController: StreamViewControllerBase {
             guard let self,
                   self.view.window?.windowScene?.activationState == .foregroundActive else { return }
             self.setCaptured(false)
+        })
+        // The quick-action ring is SwiftUI above this layer. Unlock the pointer for as long as it
+        // is up, and take the lock back when it closes: the false→true edge is the ask. A close
+        // is honoured from any scene state, or a ring that outlived its scene's focus would
+        // leave the pointer unlocked for the rest of the session.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: .punktfunkRingOpen, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let open = (note.object as? NSNumber)?.boolValue == true
+            if open, self.view.window?.windowScene?.activationState != .foregroundActive { return }
+            guard self.ringHoldsPointer != open else { return }
+            self.ringHoldsPointer = open
+            self.setNeedsUpdateOfPrefersPointerLocked()
+            self.updatePointerLockChain()
+            self.syncPointerLock()
         })
         // The ring's Keyboard slot shows the soft keyboard, and hides it when it is up. iPhone's
         // keyboard has no dismiss key, and passthrough has no three-finger swipe. The slot names

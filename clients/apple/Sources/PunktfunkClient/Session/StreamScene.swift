@@ -160,10 +160,10 @@ struct StreamScene: View {
                 }
                 .onChange(of: ring.committed) { _, open in
                     model.setRingOpen(open)
-                    #if os(macOS)
-                    // The Mac's pointer is grabbed while streaming, so the stream layer hands it
-                    // back for as long as the ring is up (nothing else can click a button above
-                    // the video) and takes it again on close.
+                    #if os(macOS) || os(iOS)
+                    // The Mac's pointer is grabbed while streaming and an iPad's mouse is locked,
+                    // so the stream layer hands it back for as long as the ring is up (nothing
+                    // else can click a button above the video) and takes it again on close.
                     NotificationCenter.default.post(
                         name: .punktfunkRingOpen, object: NSNumber(value: open))
                     #endif
