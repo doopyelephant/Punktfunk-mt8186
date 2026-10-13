@@ -19,8 +19,8 @@ use std::str::FromStr;
 pub const LEDGER_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SEATS: usize = 4;
 pub const DISPLAY_SLOTS: [u8; MAX_SEATS] = [12, 13, 14, 15];
-/// The console host's own defaults. A seat on either could never run beside
-/// the console host.
+/// The console host's own defaults, which a test here holds equal to
+/// `pf_host_config::listen`. A seat on either could never run beside the console host.
 pub const RESERVED_PORTS: [u16; 2] = [CONSOLE_NATIVE_PORT, CONSOLE_MGMT_PORT];
 pub const CONSOLE_NATIVE_PORT: u16 = 9777;
 pub const CONSOLE_MGMT_PORT: u16 = 47990;
@@ -453,6 +453,9 @@ mod tests {
 
     #[test]
     fn console_host_and_control_ports_are_never_seat_ports() {
+        // This crate links the host's config in tests only, so both spell the two ports.
+        use pf_host_config::listen::{MGMT_PORT, NATIVE_PORT};
+        assert_eq!(RESERVED_PORTS, [NATIVE_PORT, MGMT_PORT]);
         let mut ledger = Ledger::new();
         let mut seat = ledger.allocate(request(1)).unwrap();
         for port in RESERVED_PORTS {

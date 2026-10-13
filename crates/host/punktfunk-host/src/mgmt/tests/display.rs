@@ -39,7 +39,7 @@ async fn host_info_reports_identity_and_ports() {
 async fn host_info_publishes_the_hosts_own_fingerprint() {
     let stats = test_stats();
     let state = test_state();
-    let app = crate::mgmt::app(
+    let app = from_loopback(crate::mgmt::app(
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
@@ -54,7 +54,7 @@ async fn host_info_publishes_the_hosts_own_fingerprint() {
         Some([0xab; 32]),
         false,
         false,
-    );
+    ));
     let (status, body) = send(&app, get_req("/api/v1/host")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["fingerprint"], "ab".repeat(32));

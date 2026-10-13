@@ -146,7 +146,8 @@ impl AuthLane {
 /// Paired client cert (mTLS, from anywhere) or a bearer token from a loopback peer.
 /// `/health` is always open; `/local/summary` takes the tray token from loopback, else the
 /// lanes below. Cert: [`cert_may_access`]. Bearer: full admin, confined to loopback because
-/// the listener binds all interfaces by default.
+/// the listener binds all interfaces by default. Loopback is the [`PeerAddr`] the transport
+/// stamped; a request that carries none is a 500 on every route.
 pub(crate) async fn require_auth(
     State(st): State<Arc<MgmtState>>,
     req: Request,
@@ -183,6 +184,20 @@ pub(crate) async fn require_auth(
         forward(req, next, AuthLane::Plugin).await
     }
 
+    // Position is a credential on two lanes below. Canonical: a dual-stack bind hands a local
+    // IPv4 caller over as ::ffff:127.0.0.1.
+    let Some(&PeerAddr(peer)) = req.extensions().get::<PeerAddr>() else {
+        tracing::error!(
+            path = req.uri().path(),
+            "management request has no peer address"
+        );
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request carries no peer address",
+        );
+    };
+    let from_loopback = peer.ip().to_canonical().is_loopback();
+
     if req.uri().path() == "/api/v1/health" {
         return forward(req, next, AuthLane::Public).await;
     }
@@ -204,15 +219,11 @@ pub(crate) async fn require_auth(
     // Tray status: the tray token from loopback. A loopback peer is nobody on a box with
     // several accounts, so position alone admits nothing. A host that minted no token (a
     // seat) serves no summary. Any other bearer falls through to its own lane: `ctl` holds
-    // the admin token, a plugin its own. No PeerAddr ⇒ test ⇒ loopback.
+    // the admin token, a plugin its own.
     if req.uri().path() == "/api/v1/local/summary" {
         let Some(expected) = st.tray_token.as_deref() else {
             return api_error(StatusCode::NOT_FOUND, "this host serves no local summary");
         };
-        let from_loopback = req
-            .extensions()
-            .get::<PeerAddr>()
-            .is_none_or(|a| a.0.ip().to_canonical().is_loopback());
         if from_loopback && bearer(&req).is_some_and(|t| token_eq(t, expected)) {
             return forward(req, next, AuthLane::Public).await;
         }
@@ -256,12 +267,7 @@ pub(crate) async fn require_auth(
         return forward_plugin(req, next, Some(PluginIdentity(id))).await;
     }
     // Full admin surface, so loopback only — the listener binds all interfaces so paired
-    // clients can browse the library. No PeerAddr ⇒ unit test ⇒ treat as loopback. Canonical:
-    // a dual-stack bind hands a local IPv4 caller over as ::ffff:127.0.0.1.
-    let from_loopback = req
-        .extensions()
-        .get::<PeerAddr>()
-        .is_none_or(|a| a.0.ip().to_canonical().is_loopback());
+    // clients can browse the library.
     if !from_loopback {
         return api_error(
             StatusCode::UNAUTHORIZED,

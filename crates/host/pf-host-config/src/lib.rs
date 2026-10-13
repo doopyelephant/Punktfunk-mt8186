@@ -12,6 +12,7 @@
 /// Keyboard LAYOUT from `localectl`, not a `PUNKTFUNK_*` knob. Shared so the
 /// injector and the gamescope backend do not depend on each other.
 pub mod layout;
+pub mod listen;
 pub mod os_release;
 pub mod registry;
 pub mod seat_defaults;

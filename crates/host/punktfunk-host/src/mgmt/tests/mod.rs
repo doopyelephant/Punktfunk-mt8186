@@ -106,6 +106,23 @@ fn test_app(state: Arc<AppState>, token: Option<&str>) -> Router {
 
 /// `box_library`: the app of a seat host reading the box's library, which refuses its writes.
 fn test_app_on(state: Arc<AppState>, token: Option<&str>, box_library: bool) -> Router {
+    from_loopback(unstamped_app(state, token, box_library))
+}
+
+/// What a transport does in front of the router: stamp the peer. Every `test_app*` sits behind
+/// this one, which names this machine unless the test named a peer itself.
+fn from_loopback(app: Router) -> Router {
+    app.layer(middleware::from_fn(|mut req: Request, next: Next| async {
+        if req.extensions().get::<PeerAddr>().is_none() {
+            let peer = PeerAddr("127.0.0.1:40000".parse().unwrap());
+            req.extensions_mut().insert(peer);
+        }
+        next.run(req).await
+    }))
+}
+
+/// [`test_app_on`] with no transport in front: nothing stamps a peer.
+fn unstamped_app(state: Arc<AppState>, token: Option<&str>, box_library: bool) -> Router {
     let stats = state.stats.clone();
     app(
         state,
@@ -130,7 +147,7 @@ fn test_app_on(state: Arc<AppState>, token: Option<&str>, box_library: bool) -> 
 /// A host that is serving browsers. Only the CORS lane differs, and it differs entirely.
 fn test_app_browser(state: Arc<AppState>) -> Router {
     let stats = state.stats.clone();
-    app(
+    from_loopback(app(
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
@@ -145,13 +162,13 @@ fn test_app_browser(state: Arc<AppState>) -> Router {
         None,
         true,
         false,
-    )
+    ))
 }
 
 fn test_app_native(state: Arc<AppState>, np: Arc<crate::native_pairing::NativePairing>) -> Router {
     // Paired-cert tests inject a fingerprint (cert branch wins); others use `send`'s bearer.
     let stats = state.stats.clone();
-    app(
+    from_loopback(app(
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
@@ -167,7 +184,7 @@ fn test_app_native(state: Arc<AppState>, np: Arc<crate::native_pairing::NativePa
         Some([0x5a; 32]),
         false,
         false,
-    )
+    ))
 }
 
 async fn send(app: &Router, mut req: axum::http::Request<Body>) -> (StatusCode, serde_json::Value) {
@@ -357,7 +374,7 @@ static EVENTS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 /// beside `demo` so ownership can be checked both ways. The requested dir must exist.
 fn test_app_access(state: Arc<AppState>, access_dir: &std::path::Path) -> Router {
     let stats = state.stats.clone();
-    app(
+    from_loopback(app(
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
@@ -375,5 +392,5 @@ fn test_app_access(state: Arc<AppState>, access_dir: &std::path::Path) -> Router
         None,
         false,
         false,
-    )
+    ))
 }

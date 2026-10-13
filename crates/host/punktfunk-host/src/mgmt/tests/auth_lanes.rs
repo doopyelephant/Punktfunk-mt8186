@@ -419,6 +419,28 @@ async fn bearer_admin_is_loopback_only() {
     );
 }
 
+/// Position is a credential, so a request no transport stamped is refused, never read as
+/// local: the admin bearer, the tray token and an open route alike.
+#[tokio::test]
+async fn a_request_with_no_peer_address_is_refused() {
+    let app = unstamped_app(test_state(), None, false);
+    for (path, bearer) in [
+        ("/api/v1/clients", "test-secret"),
+        ("/api/v1/local/summary", TRAY_TOKEN),
+        ("/api/v1/health", "test-secret"),
+    ] {
+        let (status, body) = send(&app, with_bearer(get_req(path), bearer)).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+        assert_eq!(body["error"], "request carries no peer address", "{path}");
+    }
+    let stamped = from_loopback(app);
+    assert_eq!(
+        send(&stamped, get_req("/api/v1/clients")).await.0,
+        StatusCode::OK,
+        "the bearer was good all along"
+    );
+}
+
 #[tokio::test]
 async fn health_is_open_and_versioned() {
     let app = test_app(test_state(), None);

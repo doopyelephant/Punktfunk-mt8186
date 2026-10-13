@@ -619,7 +619,7 @@ fn parse_punktfunk1(args: &[String]) -> Result<native::Punktfunk1Options> {
             .map_err(|_| anyhow::anyhow!("bad {flag} '{v}'"))
     }
     let mut opts = native::Punktfunk1Options {
-        port: 9777,
+        port: pf_host_config::listen::NATIVE_PORT,
         source: native::Punktfunk1Source::Synthetic,
         seconds: 30,
         frames: 300,

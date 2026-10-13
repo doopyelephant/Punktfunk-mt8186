@@ -49,7 +49,7 @@ async fn a_refreshed_plugin_token_takes_effect_live() {
         "demo".to_string(),
         "old-secret".to_string(),
     )]));
-    let app = app(
+    let app = from_loopback(app(
         state,
         Some("test-secret".to_string()),
         Some("plugin-secret".to_string()),
@@ -64,7 +64,7 @@ async fn a_refreshed_plugin_token_takes_effect_live() {
         None,
         false,
         false,
-    );
+    ));
     *tokens
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) =

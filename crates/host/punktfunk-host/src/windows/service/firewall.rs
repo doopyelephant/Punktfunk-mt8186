@@ -71,47 +71,11 @@ pub(crate) fn run_netsh(args: &[String]) -> bool {
     run_quiet("netsh", &borrowed)
 }
 
-/// A setting `serve` reads: `flag` in host.env's `PUNKTFUNK_HOST_CMD`, else the last `key=` line,
-/// the same order `parse_serve_args` applies.
-pub(super) fn serve_setting<'a>(host_env: &'a str, flag: &str, key: &str) -> Option<&'a str> {
-    let last = |name: &str| {
-        host_env
-            .lines()
-            .rev()
-            .filter_map(|l| l.trim().split_once('='))
-            .find(|(k, _)| k.trim() == name)
-            .map(|(_, v)| v.trim().trim_matches('"'))
-    };
-    let mut cmd = last("PUNKTFUNK_HOST_CMD").unwrap_or("").split_whitespace();
-    cmd.find(|w| *w == flag)
-        .and_then(|_| cmd.next())
-        .or_else(|| last(key))
-}
-
-/// The mgmt port `serve` binds, else 47990. A blank or bad value keeps 47990; the host treats
-/// blank as unset and refuses to start on a bad one.
-pub(super) fn mgmt_port(host_env: &str) -> u16 {
-    serve_setting(host_env, "--mgmt-bind", "PUNKTFUNK_MGMT_BIND")
-        .and_then(|v| v.parse::<std::net::SocketAddr>().ok())
-        .map_or(crate::mgmt::DEFAULT_PORT, |a| a.port())
-}
-
-/// The native QUIC port `serve` binds, else 9777, read the way [`mgmt_port`] reads its own.
-pub(super) fn native_port(host_env: &str) -> u16 {
-    serve_setting(host_env, "--native-port", "PUNKTFUNK_NATIVE_PORT")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(9777)
-}
-
 /// The UDP rule's ports: GameStream 47998-48010, native, each seat's native port (the box
 /// redirects a client to its seat there), mDNS 5353.
-fn udp_ports(host_env: &str) -> String {
+fn udp_ports(native_port: u16) -> String {
     let seats = pf_seats::model::DEFAULT_NATIVE_PORTS.map(|p| p.to_string());
-    format!(
-        "47998-48010,{},{},5353",
-        native_port(host_env),
-        seats.join(",")
-    )
+    format!("47998-48010,{native_port},{},5353", seats.join(","))
 }
 
 /// Inbound streaming + mgmt rules. Best-effort; never fails the install. Scoped by
@@ -135,8 +99,9 @@ pub(super) fn add_firewall_rules(allow_public: bool) {
     // Mgmt/library (LAN read-only, paired-cert) on the port host.env gives `serve`; `--mgmt-bind`
     // lands there first. GameStream 47984/47989/48010.
     let host_env = std::fs::read_to_string(host_env_path()).unwrap_or_default();
-    let tcp = format!("47984,47989,48010,{}", mgmt_port(&host_env));
-    let udp = udp_ports(&host_env);
+    let listen = pf_host_config::listen::ListenPlan::from_host_env(&host_env);
+    let tcp = format!("47984,47989,48010,{}", listen.mgmt.port());
+    let udp = udp_ports(listen.native_port);
     let rules = [("TCP", "TCP", tcp.as_str()), ("UDP", "UDP", udp.as_str())];
     for (suffix, proto, ports) in rules {
         let name = format!("Punktfunk {suffix}");
@@ -259,6 +224,7 @@ pub(super) fn warn_if_public_network() {
 #[cfg(test)]
 mod firewall_tests {
     use super::*;
+    use pf_host_config::listen::ListenPlan;
     use std::path::Path;
 
     /// Fixed-port rules carry both `program=` and `localport=`. Dropping `program=` still streams;
@@ -284,9 +250,10 @@ mod firewall_tests {
     /// A client redirected to its seat lands on the seat's own port.
     #[test]
     fn the_udp_rule_opens_every_seat_port() {
-        assert_eq!(udp_ports(""), "47998-48010,9777,9779,9780,9781,9782,5353");
+        let rule = |host_env: &str| udp_ports(ListenPlan::from_host_env(host_env).native_port);
+        assert_eq!(rule(""), "47998-48010,9777,9779,9780,9781,9782,5353");
         assert_eq!(
-            udp_ports("PUNKTFUNK_NATIVE_PORT=9800\n"),
+            rule("PUNKTFUNK_NATIVE_PORT=9800\n"),
             "47998-48010,9800,9779,9780,9781,9782,5353"
         );
     }
@@ -299,48 +266,10 @@ mod firewall_tests {
         assert!(args.contains(&"localport=47990".to_string()));
     }
 
-    /// A host moved off Sunshine's 47990 opens the port it binds; clients learn it in-band.
-    #[test]
-    fn the_mgmt_rule_follows_the_host_env_bind() {
-        assert_eq!(mgmt_port(""), 47990);
-        assert_eq!(mgmt_port("PUNKTFUNK_MGMT_BIND=0.0.0.0:47991\r\n"), 47991);
-        assert_eq!(mgmt_port("# PUNKTFUNK_MGMT_BIND=0.0.0.0:48123\n"), 47990);
-        assert_eq!(
-            mgmt_port("PUNKTFUNK_MGMT_BIND=0.0.0.0:47991\nPUNKTFUNK_MGMT_BIND=\n"),
-            47990
-        );
-        assert_eq!(mgmt_port("PUNKTFUNK_MGMT_BIND=\"[::]:48123\"\n"), 48123);
-        assert_eq!(mgmt_port("PUNKTFUNK_MGMT_BIND=nonsense\n"), 47990);
-        let cmd = "PUNKTFUNK_MGMT_BIND=0.0.0.0:47991\nPUNKTFUNK_HOST_CMD=serve --mgmt-bind 0.0.0.0:48123\n";
-        assert_eq!(
-            mgmt_port(cmd),
-            48123,
-            "the command line outranks the env line"
-        );
-    }
-
-    /// A native port moved in host.env or on the host command is the one the UDP rule opens.
-    #[test]
-    fn the_native_rule_follows_the_serve_port() {
-        assert_eq!(native_port(""), 9777);
-        assert_eq!(native_port("PUNKTFUNK_NATIVE_PORT=9800\r\n"), 9800);
-        assert_eq!(native_port("# PUNKTFUNK_NATIVE_PORT=9800\n"), 9777);
-        assert_eq!(native_port("PUNKTFUNK_NATIVE_PORT=\n"), 9777);
-        assert_eq!(
-            native_port(
-                "PUNKTFUNK_NATIVE_PORT=9800\nPUNKTFUNK_HOST_CMD=\"serve --native-port 9900\"\n"
-            ),
-            9900
-        );
-        assert_eq!(
-            native_port("PUNKTFUNK_NATIVE_PORT=9800\nPUNKTFUNK_HOST_CMD=serve --gamestream\n"),
-            9800
-        );
-    }
-
     /// `--mgmt-bind` writes the line the mgmt rule reads back, whatever host.env already holds.
     #[test]
     fn the_mgmt_bind_flag_lands_where_the_rule_reads() {
+        let mgmt_port = |host_env: &str| ListenPlan::from_host_env(host_env).mgmt.port();
         let set =
             |text: &str| mgmt_port(&with_env_line(text, "PUNKTFUNK_MGMT_BIND", "0.0.0.0:47991"));
         assert_eq!(set(""), 47991);
