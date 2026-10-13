@@ -857,8 +857,10 @@ fn replay_switch_under_restored_dm(dm: &str) {
     if std::path::Path::new(OS_SESSION_SELECT).exists() {
         // Helper self-pkexecs and rewrites DM config — DM-verb budget, on the stream thread.
         // `plasma` is what Steam's own switch sends; Bazzite's helper rejects `desktop`.
+        let mut select = Command::new(OS_SESSION_SELECT);
+        select.arg("plasma");
         match crate::proc::status_within(
-            Command::new(OS_SESSION_SELECT).arg("plasma"),
+            pf_host_config::session::export_to(&mut select),
             DM_VERB_BUDGET,
         ) {
             Ok(s) if s.success() => {

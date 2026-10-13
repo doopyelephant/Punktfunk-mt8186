@@ -14,9 +14,18 @@ final class SafeDisplayTests: XCTestCase {
         // per-side inset.
         XCTAssertEqual(
             SafeDisplay.sideInsetPoints(left: 59, right: 59, top: 0, isPhone: true), 59)
-        // Asymmetric (or mid-rotation) readings reduce to the larger — never under-inset.
+        // Unequal readings on both sides reduce to the larger — never under-inset.
         XCTAssertEqual(
-            SafeDisplay.sideInsetPoints(left: 0, right: 44, top: 0, isPhone: true), 44)
+            SafeDisplay.sideInsetPoints(left: 44, right: 59, top: 0, isPhone: true), 59)
+    }
+
+    func testAOneSidedInsetIsABarNotAHousing() {
+        // A foldable's cover screen: the side bar insets one edge by 84 pt, in either orientation,
+        // and its top inset is zero. Nothing there hides a full-screen stream.
+        XCTAssertEqual(
+            SafeDisplay.sideInsetPoints(left: 0, right: 84, top: 0, isPhone: true), 0)
+        XCTAssertEqual(
+            SafeDisplay.sideInsetPoints(left: 84, right: 0, top: 0, isPhone: true), 0)
     }
 
     func testPortraitFallsBackToTheHousingTopInset() {

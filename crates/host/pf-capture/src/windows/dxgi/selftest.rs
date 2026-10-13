@@ -151,9 +151,12 @@ pub fn hdr_p010_convert_bars_on_luid(
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             ..Default::default()
         };
+        // D3D11 reads `h` rows of `pitch` bytes through `pSysMem`.
+        let pitch = w * 8;
+        assert!(size_of_val(fp16.as_slice()) >= pitch as usize * h as usize);
         let init = D3D11_SUBRESOURCE_DATA {
             pSysMem: fp16.as_ptr() as *const c_void,
-            SysMemPitch: w * 8,
+            SysMemPitch: pitch,
             SysMemSlicePitch: 0,
         };
         let mut src_tex: Option<ID3D11Texture2D> = None;
@@ -335,9 +338,12 @@ pub fn hdr_p010_selftest_at(w: u32, h: u32, vendor: Option<u32>) -> Result<()> {
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
             ..Default::default()
         };
+        // D3D11 reads `H` rows of `pitch` bytes through `pSysMem`.
+        let pitch = W * 8; // 4 channels * 2 bytes
+        assert!(size_of_val(fp16.as_slice()) >= pitch as usize * H as usize);
         let init = D3D11_SUBRESOURCE_DATA {
             pSysMem: fp16.as_ptr() as *const c_void,
-            SysMemPitch: W * 8, // 4 channels * 2 bytes
+            SysMemPitch: pitch,
             SysMemSlicePitch: 0,
         };
         let mut src_tex: Option<ID3D11Texture2D> = None;

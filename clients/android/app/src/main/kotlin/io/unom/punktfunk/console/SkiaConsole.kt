@@ -1222,6 +1222,8 @@ internal class PadTestReading {
             KeyEvent.KEYCODE_BUTTON_MODE to "Guide",
             KeyEvent.KEYCODE_BUTTON_THUMBL to "LS",
             KeyEvent.KEYCODE_BUTTON_THUMBR to "RS",
+            KeyEvent.KEYCODE_BUTTON_C to "L4",
+            KeyEvent.KEYCODE_BUTTON_Z to "R4",
             KeyEvent.KEYCODE_DPAD_UP to "Up",
             KeyEvent.KEYCODE_DPAD_DOWN to "Down",
             KeyEvent.KEYCODE_DPAD_LEFT to "Left",

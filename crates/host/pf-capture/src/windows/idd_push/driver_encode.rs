@@ -86,12 +86,7 @@ fn nul_tag(name: &[u8; 32]) -> String {
 /// `pf_frame::HdrMeta` as the 28 bytes `SET_ENCODE` and `SET_HDR_META` carry: its `repr(C)`
 /// image, all zero for `None`.
 fn hdr_meta_bytes(meta: Option<pf_frame::HdrMeta>) -> [u8; 28] {
-    match meta {
-        // SAFETY: `HdrMeta` is `repr(C)`, 28 bytes of integers with no padding, so every byte
-        // of the image is initialised.
-        Some(m) => unsafe { std::mem::transmute::<pf_frame::HdrMeta, [u8; 28]>(m) },
-        None => [0; 28],
-    }
+    meta.map_or([0; 28], bytemuck::cast)
 }
 
 fn caps_from_wire(w: &encode::EncoderCapsWire) -> EncoderCaps {

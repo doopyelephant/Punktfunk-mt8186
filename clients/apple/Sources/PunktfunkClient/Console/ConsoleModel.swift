@@ -289,10 +289,8 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
     /// Pro's window is not a panel, and a TV's is standard, so none of them sends one.
     private static var screenSize: (Int, Int)? {
         #if os(iOS)
-        let bounds = UIScreen.main.nativeBounds
-        let long = Int(max(bounds.width, bounds.height))
-        let short = Int(min(bounds.width, bounds.height))
-        return (long, short)
+        let mode = NativeDisplay.mode
+        return (mode.width, mode.height)
         #else
         return nil
         #endif

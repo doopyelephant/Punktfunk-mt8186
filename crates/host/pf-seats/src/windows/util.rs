@@ -172,34 +172,43 @@ pub(super) fn port_open(port: u16) -> bool {
 /// The pids holding a UDP endpoint on `port`, IPv4 and IPv6. Empty when the
 /// tables can't be read.
 pub(super) fn udp_port_owners(port: u16) -> Vec<u32> {
+    use std::mem::{offset_of, size_of};
     use windows::Win32::NetworkManagement::IpHelper::{
-        MIB_UDP6ROW_OWNER_PID, MIB_UDPROW_OWNER_PID,
+        MIB_UDP6ROW_OWNER_PID as V6, MIB_UDPROW_OWNER_PID as V4,
     };
     // `ADDRESS_FAMILY` values; the WinSock feature isn't pulled in for two numbers.
     const AF_INET: u32 = 2;
     const AF_INET6: u32 = 23;
-    let v4 = udp_rows::<MIB_UDPROW_OWNER_PID>(AF_INET)
-        .into_iter()
-        .map(|r| (r.dwLocalPort, r.dwOwningPid));
-    let v6 = udp_rows::<MIB_UDP6ROW_OWNER_PID>(AF_INET6)
-        .into_iter()
-        .map(|r| (r.dwLocalPort, r.dwOwningPid));
+    let v4 = udp_rows(
+        AF_INET,
+        size_of::<V4>(),
+        offset_of!(V4, dwLocalPort),
+        offset_of!(V4, dwOwningPid),
+    );
+    let v6 = udp_rows(
+        AF_INET6,
+        size_of::<V6>(),
+        offset_of!(V6, dwLocalPort),
+        offset_of!(V6, dwOwningPid),
+    );
     // The port sits in the low 16 bits, in network byte order.
-    v4.chain(v6)
+    v4.into_iter()
+        .chain(v6)
         .filter(|(local, _)| u16::from_be(*local as u16) == port)
         .map(|(_, pid)| pid)
         .collect()
 }
 
-/// One `GetExtendedUdpTable(UDP_TABLE_OWNER_PID)` snapshot for `family`.
-fn udp_rows<Row: Copy>(family: u32) -> Vec<Row> {
+/// `(dwLocalPort, dwOwningPid)` of every row in one `GetExtendedUdpTable(UDP_TABLE_OWNER_PID)`
+/// snapshot for `family`. `row` is the row struct's size, `port` and `pid` those fields' offsets.
+fn udp_rows(family: u32, row: usize, port: usize, pid: usize) -> Vec<(u32, u32)> {
     use windows::Win32::NetworkManagement::IpHelper::{GetExtendedUdpTable, UDP_TABLE_OWNER_PID};
     const NO_ERROR: u32 = 0;
     const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
     let mut size = 0_u32;
     // The table grows between the sizing call and the read; three tries is plenty.
     for _ in 0..3 {
-        // u64 words: the table's `u32` count and rows need 4-byte alignment.
+        // u64 words: Windows writes the table's `u32` count and rows at 4-byte alignment.
         let mut buffer = vec![0_u64; (size as usize).div_ceil(8).max(1)];
         // SAFETY: `buffer` holds at least `size` writable bytes and outlives the call;
         // `size` is a live in/out parameter.
@@ -219,28 +228,49 @@ fn udp_rows<Row: Copy>(family: u32) -> Vec<Row> {
         if rc != NO_ERROR {
             return Vec::new();
         }
-        let bytes = buffer.len() * 8;
-        let base = buffer.as_ptr().cast::<u8>();
-        // SAFETY: the table starts with its `u32` row count.
-        let count = unsafe { base.cast::<u32>().read() } as usize;
-        let first = std::mem::size_of::<u32>();
-        let fits = count
-            .checked_mul(std::mem::size_of::<Row>())
-            .and_then(|rows| rows.checked_add(first))
-            .is_some_and(|end| end <= bytes);
-        if !fits {
-            return Vec::new();
-        }
-        // SAFETY: `count` rows of `Row` follow the count inside `buffer` (checked
-        // above), and every row field is a `u32`, so offset 4 is aligned for it.
-        let rows = unsafe { std::slice::from_raw_parts(base.add(first).cast::<Row>(), count) };
-        return rows.to_vec();
+        let bytes: Vec<u8> = buffer.iter().flat_map(|word| word.to_ne_bytes()).collect();
+        return table_rows(&bytes, row, port, pid);
     }
     Vec::new()
 }
 
+/// The rows of a UDP table image: a `u32` row count, then that many `row`-byte rows. Empty
+/// when the count claims more rows than `table` holds.
+fn table_rows(table: &[u8], row: usize, port: usize, pid: usize) -> Vec<(u32, u32)> {
+    let field = |bytes: &[u8], at: usize| {
+        let mut word = [0; 4];
+        word.copy_from_slice(&bytes[at..at + 4]);
+        u32::from_ne_bytes(word)
+    };
+    let Some((count, rows)) = table.split_first_chunk::<4>() else {
+        return Vec::new();
+    };
+    let count = u32::from_ne_bytes(*count) as usize;
+    let fits = count.checked_mul(row).is_some_and(|len| len <= rows.len());
+    if !fits {
+        return Vec::new();
+    }
+    rows.chunks_exact(row)
+        .take(count)
+        .map(|r| (field(r, port), field(r, pid)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_table_claiming_more_rows_than_it_holds_reads_as_empty() {
+        // Two 12-byte rows of (addr, port, pid).
+        let mut table = 2_u32.to_ne_bytes().to_vec();
+        for word in [1_u32, 0x50, 7, 2, 0x51, 9] {
+            table.extend(word.to_ne_bytes());
+        }
+        assert_eq!(super::table_rows(&table, 12, 4, 8), [(0x50, 7), (0x51, 9)]);
+        table[..4].copy_from_slice(&3_u32.to_ne_bytes());
+        assert!(super::table_rows(&table, 12, 4, 8).is_empty());
+        assert!(super::table_rows(&table[..3], 12, 4, 8).is_empty());
+    }
+
     #[test]
     fn a_bound_udp_port_names_this_process() {
         for addr in ["127.0.0.1:0", "[::1]:0"] {

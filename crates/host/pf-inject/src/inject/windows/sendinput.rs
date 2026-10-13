@@ -542,13 +542,12 @@ mod tests {
 
     /// The positional table must mirror Linux `vk_to_evdev` exactly — for the typing
     /// area the evdev code IS the set-1 scancode, so a divergence lands the same wire
-    /// VK on different physical keys on the two hosts. Keypad Enter and the IME keys are
-    /// where the two codes differ; both hosts must still know every one of them.
+    /// VK on different physical keys on the two hosts. Keypad Enter and the IME keys
+    /// are where the two codes differ; both hosts must still know every one of them.
     #[test]
     fn positional_table_mirrors_linux_vk_to_evdev() {
-        // (VK, set-1 scancode, evdev code). Keypad Enter is E0 1C here, KEY_KPENTER there.
-        let differs: &[(u16, u16, u16)] = &[
-            (0x6C, 0x1C, 96),
+        let differ: &[(u16, u16, u16)] = &[
+            (0x6C, 0x1C, 96), // keypad Enter: E0 1C here, KEY_KPENTER there
             (0x15, 0x72, 122),
             (0x19, 0x71, 123),
             (0x1C, 0x79, 92),
@@ -562,7 +561,7 @@ mod tests {
         let mut checked = 0;
         for vk in 0x01..=0xFEu16 {
             if let Some(scan) = positional_vk_to_scan(vk) {
-                let evdev = differs
+                let evdev = differ
                     .iter()
                     .find(|(k, _, _)| *k == vk)
                     .map(|&(_, s, e)| {

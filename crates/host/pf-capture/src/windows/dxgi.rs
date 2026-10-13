@@ -60,6 +60,15 @@ unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
 /// Call once from `main.rs` before the first DXGI factory. Lasts the process
 /// lifetime. [`hybrid_hook_hits`] reports whether DXGI actually calls it.
 /// Also sets per-monitor DPI awareness; on ARM64 that half is all that runs.
+///
+/// # Invariant
+///
+/// The patch rewrites 12 live bytes of `win32u.dll`. Nothing here checks either half:
+/// - No other thread is inside the export while its bytes change. Only DXGI calls it, so this
+///   must run before any thread creates a DXGI factory. The call order in the host's
+///   `startup` is the only enforcement.
+/// - The export's first 12 bytes are whole instructions and none is a branch target. A CFG or
+///   hot-patch stub there leaves a torn instruction stream.
 pub fn install_gpu_pref_hook() {
     use std::sync::Once;
     static HOOK: Once = Once::new();

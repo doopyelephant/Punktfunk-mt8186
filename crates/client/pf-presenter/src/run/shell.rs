@@ -28,6 +28,16 @@ impl Shell {
         // Wayland `app_id` (and X11 WM_CLASS) so compositors match io.unom.Punktfunk.desktop.
         // Without it SDL uses a generic identity and the session window gets the default icon.
         sdl3::hint::set("SDL_APP_ID", "io.unom.Punktfunk");
+        // SDL picks XWayland where the compositor lacks `wp_fifo_v1` (KWin before 6.4, Mutter
+        // before 48); the native lane and colour management need the Wayland surface. SDL
+        // refuses the hint when the environment names a driver. Gamescope keeps its own.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("WAYLAND_DISPLAY").is_some()
+            && !pf_client_core::gamescope::under_gamescope()
+            && sdl3::hint::set("SDL_VIDEO_DRIVER", "wayland")
+        {
+            tracing::info!("SDL kept on Wayland (WAYLAND_DISPLAY is set)");
+        }
         // `PUNKTFUNK_DRM_CARD=<n>` → SDL's KMSDRM device index. SDL takes the first card
         // it can open, often the wrong one on a multi-GPU box. Detecting "already mastered"
         // needs the ioctl that taking master is, so this stays an explicit operator choice.

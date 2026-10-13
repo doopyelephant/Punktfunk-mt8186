@@ -47,6 +47,12 @@ impl PadCreateFault {
         }
     }
 
+    /// Whether `err` is a devnode in another session, which its maker must remove. A fence
+    /// check that found no devnode to read is not: nothing is listed where none exists.
+    pub fn broke_fence(err: &anyhow::Error) -> bool {
+        create_fault(err) == Some(PadCreateFault::SessionFence)
+    }
+
     /// Remedy printed instead of the backend's default create-failure `hint`.
     pub fn hint(self) -> &'static str {
         match self {
@@ -454,6 +460,20 @@ mod tests {
             create_fault(&anyhow::Error::msg("SwDeviceCreate failed")),
             None
         );
+    }
+
+    /// The mouse keeper removes its devnode on a broken fence and retries. A devnode no
+    /// driver bound must not read as one, or the keeper re-creates it every minute.
+    #[test]
+    fn only_a_devnode_in_another_session_breaks_the_fence() {
+        let driverless = anyhow::Error::msg("no HID collection under the new devnode: problem 0xA");
+        assert!(!PadCreateFault::broke_fence(&driverless));
+        let contended = anyhow::Error::msg("exists").context(PadCreateFault::IndexOwnedElsewhere);
+        assert!(!PadCreateFault::broke_fence(&contended));
+        let elsewhere = anyhow::Error::msg("HID\\VID_5046 carries session 2, not 1")
+            .context(PadCreateFault::SessionFence)
+            .context("open the virtual mouse");
+        assert!(PadCreateFault::broke_fence(&elsewhere));
     }
 
     #[test]

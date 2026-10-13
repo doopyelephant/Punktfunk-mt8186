@@ -3,10 +3,11 @@
 //! [`detect_active_session`] names the compositor running for this uid.
 //! [`observe_session_instance`] bumps the session epoch when that compositor
 //! *instance* changes, so the registry cannot reuse a PipeWire node id from a
-//! dead desktop. [`apply_session_env`] writes the live session into the process
-//! env under [`super::ENV_LOCK`]; [`settle_desktop_portal`] pushes it into
-//! systemd `--user` / D-Bus activation so a mid-stream switch does not leave
-//! the portal talking to the old socket.
+//! dead desktop. [`apply_session_env`] stores the live session and writes its
+//! bus, runtime dir and desktop name into the process env under
+//! [`super::ENV_LOCK`]; [`settle_desktop_portal`] pushes it into systemd
+//! `--user` / D-Bus activation so a mid-stream switch does not leave the
+//! portal talking to the old socket.
 //!
 //! Evidence: `design/gamemode-and-dedicated-sessions.md`,
 //! `design/hyprland-support.md`.
@@ -156,28 +157,7 @@ pub enum ActiveKind {
     None,
 }
 
-/// Env that points a backend at the detected session. [`apply_session_env`] writes the first four
-/// into the process env; `hyprland_signature` / `sway_socket` are per-spawn (`Command::env`) because
-/// `hyprctl` / `swaymsg` are children we launch, not process-wide readers.
-#[derive(Clone, Debug, Default)]
-pub struct SessionEnv {
-    /// `WAYLAND_DISPLAY` of the live compositor. `None` for Gaming-attach / Mutter (PipeWire /
-    /// D-Bus; they never talk Wayland to us).
-    pub wayland_display: Option<String>,
-    /// Per-user runtime dir (PipeWire + session bus). Never a world-writable `/tmp`.
-    pub xdg_runtime_dir: String,
-    pub dbus_session_bus_address: String,
-    /// `XDG_CURRENT_DESKTOP` (KDE/GNOME/sway/Hyprland/gamescope). Drives portal/EIS routing;
-    /// xdph keys Hyprland-specific behavior off `Hyprland`.
-    pub xdg_current_desktop: Option<String>,
-    /// `HYPRLAND_INSTANCE_SIGNATURE` (`Some` only for [`ActiveKind::DesktopHyprland`]).
-    /// Handed to `hyprctl` per spawn ([`hypr_signature`]) so a systemd `--user` host need not
-    /// inherit the session env.
-    pub hyprland_signature: Option<String>,
-    /// `SWAYSOCK` (`Some` only for sway [`ActiveKind::DesktopWlroots`]). Same per-spawn handoff
-    /// as [`hypr_signature`]. `None` on river (wlroots, no sway IPC).
-    pub sway_socket: Option<String>,
-}
+pub use pf_host_config::session::SessionEnv;
 
 pub struct ActiveSession {
     pub kind: ActiveKind,
@@ -240,7 +220,7 @@ impl EnvProbe {
         crate::with_env_lock(|| EnvProbe {
             xdg_runtime_dir: v("XDG_RUNTIME_DIR"),
             dbus_session_bus_address: v("DBUS_SESSION_BUS_ADDRESS"),
-            wayland_display: v("WAYLAND_DISPLAY"),
+            wayland_display: pf_host_config::session::wayland_display(),
             hyprland_signature: v("HYPRLAND_INSTANCE_SIGNATURE"),
             swaysock: v("SWAYSOCK"),
         })
@@ -525,16 +505,18 @@ fn find_wayland_socket(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String
     })
 }
 
-/// Write the live session into the process env so backends that can only read
-/// `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` / `XDG_CURRENT_DESKTOP`
-/// (wayland-client, zbus, libpipewire, Mesa, [`settle_desktop_portal`]) open against it.
+/// Point the host at the live session. The session is stored for the Wayland backends
+/// ([`wayland_connect`]) and for children ([`pf_host_config::session::export_to`]).
+/// `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` / `XDG_CURRENT_DESKTOP` go into the process
+/// env: zbus, ashpd and libpipewire can only read them there.
 ///
 /// [`ENV_LOCK`] orders these writes against this crate's own readers. It does not make `setenv`
-/// sound — see its doc — so the list stays these four.
+/// sound — see its doc — so the list stays these three.
 #[cfg(target_os = "linux")]
 pub fn apply_session_env(active: &ActiveSession) {
     let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let e = &active.env;
+    pf_host_config::session::set(e.clone(), active.kind != ActiveKind::None);
     // SAFETY: PARTIAL, and deliberately not a proof. `_env_guard` holds [`ENV_LOCK`], which orders
     // this against every env reader and writer *inside pf-vdisplay*; streaming threads read cached
     // config, not the environment. Nothing else in the process takes that lock — not glibc, not
@@ -542,24 +524,32 @@ pub fn apply_session_env(active: &ActiveSession) {
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", &e.xdg_runtime_dir);
         std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &e.dbus_session_bus_address);
-        if let Some(w) = &e.wayland_display {
-            std::env::set_var("WAYLAND_DISPLAY", w);
-        }
         if let Some(d) = &e.xdg_current_desktop {
             std::env::set_var("XDG_CURRENT_DESKTOP", d);
         }
-        // Nothing live: leftover session vars keep `available()` true (stale
-        // `XDG_CURRENT_DESKTOP=GNOME` after a compositor crash). Clear them so the
+        // Nothing live: a leftover desktop name keeps `available()` true (stale
+        // `XDG_CURRENT_DESKTOP=GNOME` after a compositor crash). Clear it so the
         // handshake fails fast instead of routing into a dead session.
         if active.kind == ActiveKind::None {
             std::env::remove_var("XDG_CURRENT_DESKTOP");
-            std::env::remove_var("WAYLAND_DISPLAY");
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 pub fn apply_session_env(_active: &ActiveSession) {}
+
+/// A connection to the live compositor: the stored session's socket, or the environment's
+/// while nothing is stored (a host started inside its desktop, before the first connect).
+#[cfg(target_os = "linux")]
+pub(crate) fn wayland_connect() -> Result<wayland_client::Connection, wayland_client::ConnectError>
+{
+    use wayland_client::{ConnectError, Connection};
+    match pf_host_config::session::wayland_stream() {
+        Some(stream) => Connection::from_socket(stream.map_err(|_| ConnectError::NoCompositor)?),
+        None => Connection::connect_to_env(),
+    }
+}
 
 /// Operator session-recovery hook (`PUNKTFUNK_RECOVER_SESSION_CMD`) when a client connects with
 /// no live graphical session. Detached `sh -c`; one launch per minute so a retrying client cannot
@@ -575,14 +565,14 @@ pub fn try_recover_session() -> bool {
     if last.is_some_and(|t| t.elapsed() < DEBOUNCE) {
         return true;
     }
-    match std::process::Command::new("/bin/sh")
+    let mut recover = std::process::Command::new("/bin/sh");
+    recover
         .arg("-c")
         .arg(&cmd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::null());
+    match pf_host_config::session::export_to(&mut recover).spawn() {
         Ok(mut child) => {
             *last = Some(std::time::Instant::now());
             tracing::warn!(cmd = %cmd,
@@ -617,16 +607,17 @@ pub fn settle_desktop_portal(chosen: Compositor) {
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_RUNTIME_DIR",
     ];
+    // Both tools forward their own environment, so each gets the stored socket name.
+    let mut import = std::process::Command::new("systemctl");
+    import.args(["--user", "import-environment"]).args(VARS);
     let _ = crate::proc::status_within(
-        std::process::Command::new("systemctl")
-            .args(["--user", "import-environment"])
-            .args(VARS),
+        pf_host_config::session::export_to(&mut import),
         SYSTEMD_BUDGET,
     );
+    let mut activation = std::process::Command::new("dbus-update-activation-environment");
+    activation.arg("--systemd").args(VARS);
     let _ = crate::proc::status_within(
-        std::process::Command::new("dbus-update-activation-environment")
-            .arg("--systemd")
-            .args(VARS),
+        pf_host_config::session::export_to(&mut activation),
         SYSTEMD_BUDGET,
     );
     // KWin input rides the xdg RemoteDesktop portal, which keys the backend off its *startup*

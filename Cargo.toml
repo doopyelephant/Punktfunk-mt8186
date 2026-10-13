@@ -179,6 +179,10 @@ unsafe_op_in_unsafe_fn = "deny"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 
+# PROVENANCE has no lint and no sanitizer, so the rule lives here. A pointer into a C flexible
+# array is taken from the whole struct with `&raw const (*detail).DevicePath`, never from the
+# `[T; 1]` field's `as_ptr()`: that pointer may reach one element, and the callee reads the rest.
+
 [profile.release]
 opt-level = 3
 lto = "thin"

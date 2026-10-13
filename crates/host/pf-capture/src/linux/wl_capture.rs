@@ -24,7 +24,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm};
-use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, WEnum};
+use wayland_client::{ConnectError, Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 
 // One module per protocol XML: the scanner emits the same private helper names into each,
 // so two `generate_interfaces!` in one module collide. `icc` names an interface from
@@ -567,10 +567,19 @@ fn fetch_output_color(
 }
 
 /// Whether `output_name` is lit in HDR (BT.2020 PQ), by its `wp_color_management_v1`
+/// A connection to the live compositor: the stored session's socket, or the environment's
+/// while nothing is stored.
+fn wayland_connect() -> Result<Connection, ConnectError> {
+    match pf_host_config::session::wayland_stream() {
+        Some(stream) => Connection::from_socket(stream.map_err(|_| ConnectError::NoCompositor)?),
+        None => Connection::connect_to_env(),
+    }
+}
+
 /// description. `None`: no such output, or a compositor without colour management.
 pub(crate) fn output_is_hdr10(output_name: &str) -> Option<bool> {
     let (wake_r, _wake_w) = pipe().ok()?;
-    let conn = Connection::connect_to_env().ok()?;
+    let conn = wayland_connect().ok()?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
@@ -794,7 +803,7 @@ fn open(
     // One pipe for both waits below: the bounded constraints wait, and the frame loop's
     // "a buffer came back" wakeup.
     let (wake_r, wake_w) = pipe().context("wakeup pipe")?;
-    let conn = Connection::connect_to_env().context("wayland connect")?;
+    let conn = wayland_connect().context("wayland connect")?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());

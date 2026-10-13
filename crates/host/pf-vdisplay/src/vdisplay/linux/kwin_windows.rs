@@ -154,7 +154,7 @@ impl Dispatch<WlCallback, u32> for State {
 /// Every window KWin has, on every head. `None` when this is not a KWin session or the global is
 /// not granted; empty when KWin did not answer inside [`READ_BUDGET`], so the next read tries again.
 pub(crate) fn toplevels() -> Option<Vec<Toplevel>> {
-    let Ok(conn) = Connection::connect_to_env() else {
+    let Ok(conn) = crate::session::wayland_connect() else {
         return None;
     };
     let mut queue = conn.new_event_queue();

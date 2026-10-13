@@ -32,10 +32,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci"
 from cargo_graph import closure  # noqa: E402
 
 # The host scope is every local crate these binaries link on either OS with every feature on (no
-# dev-dependencies), plus the Windows drivers, which build in their own workspace.
-HOST_BINARIES = ["punktfunk-host", "punktfunk-encode-worker", "punktfunk-tray"]
+# dev-dependencies), plus the Windows drivers and the seat keeper, which build in their own
+# workspaces.
+HOST_BINARIES = ["punktfunk-host", "punktfunk-encode-worker", "punktfunk-capture-worker",
+                 "punktfunk-seats", "punktfunk-tray"]
 HOST_TRIPLES = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
-EXTRA_HOST_ROOTS = ["packaging/windows/drivers"]
+EXTRA_HOST_ROOTS = ["packaging/windows/drivers", "crates/host/pf-seat-keeper"]
 
 
 def host_roots():

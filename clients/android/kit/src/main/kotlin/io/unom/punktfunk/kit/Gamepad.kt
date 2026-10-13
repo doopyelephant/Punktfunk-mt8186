@@ -40,7 +40,7 @@ object Gamepad {
 
     // Extended bits (Moonlight `buttonFlags2 << 16` namespace — `input.rs::gamepad`): the four
     // back grips (Steam L4/L5/R4/R5 ≙ Elite P1–P4), touchpad click, and the misc/QAM button.
-    // Android's standard InputDevice path never produces these; the SC2 capture link does.
+    // The SC2 capture link sends all six; [buttonBit] finds the upper grip pair on a plain pad.
     const val BTN_PADDLE1 = 0x10000
     const val BTN_PADDLE2 = 0x20000
     const val BTN_PADDLE3 = 0x40000
@@ -352,28 +352,28 @@ object Gamepad {
         if (setting == PREF_AUTO) prefFor(firstPad()) else setting
 
     /**
-     * Gamepad `KEYCODE_*` → BTN_* bit, or 0 if not a gamepad button we forward. A/B/X/Y are
-     * positional (Xbox layout; Nintendo relabeling needs device-type detection, deferred).
-     * `KEYCODE_DPAD_*` are included but must only be routed here when the event is from a gamepad
-     * (a keyboard's arrow keys share these keycodes and belong to the VK path) — see MainActivity.
-     * L2/R2 are forwarded as the analog trigger axes, never as buttons.
+     * Gamepad `KEYCODE_*` → BTN_* bit, or 0 for a key this client doesn't forward. A/B/X/Y are
+     * positional (Xbox layout). `KEYCODE_DPAD_*` belong here only when the event is from a
+     * gamepad: a keyboard's arrows share them and take the VK path (see MainActivity). L2/R2 are
+     * forwarded as the analog trigger axes, never as buttons.
      *
-     * [BTN_TOUCHPAD] and [BTN_MISC1] have no Android keycode at all, so
-     * [PadButtons.GENERIC_SONY] BORROWS the last two rows of `Generic.kl`'s joystick block for
-     * them ([KEYCODE_BUTTON_15][KeyEvent.KEYCODE_BUTTON_15] / `_16`, evdev `BTN_BASE5`/`BTN_BASE6`)
-     * — see there. This table is global, so a device that genuinely presses one of those two
-     * emits the bit as well. That is the cost of the borrow, and it is why the borrow is at the
-     * TOP of the block rather than at `BUTTON_1`/`BUTTON_2`: those are a flight stick's trigger
-     * and thumb button, which any joystick-usage HID device reports, whereas reaching `BUTTON_15`
-     * takes a pad that declares fifteen. The residual case — a fifteen-button HOTAS whose button
-     * 16 also toggles the client's mic — is the one this leaves on the table; narrowing it
-     * further needs per-device knowledge the router does not have (see `GamepadRouter`).
+     * `BUTTON_C` and `BUTTON_Z` are the two slots the Android gamepad layout leaves empty, and
+     * where a handheld puts its back buttons (AYN: M1 on C, M2 on Z). They are the upper back
+     * grips, L4 and R4. A six-button pad's own C and Z land there too. Only a host pad with
+     * grips shows them: Steam Deck, DualSense Edge.
+     *
+     * [BTN_TOUCHPAD] and [BTN_MISC1] have no Android keycode, so [PadButtons.GENERIC_SONY]
+     * borrows `BUTTON_15`/`BUTTON_16` for them. This table is global: any device that presses
+     * one of those two emits the bit as well. They sit at the top of the joystick block because
+     * `BUTTON_1`/`BUTTON_2` are a flight stick's trigger and thumb button.
      */
     fun buttonBit(keyCode: Int): Int = when (keyCode) {
         KeyEvent.KEYCODE_BUTTON_A -> BTN_A
         KeyEvent.KEYCODE_BUTTON_B -> BTN_B
         KeyEvent.KEYCODE_BUTTON_X -> BTN_X
         KeyEvent.KEYCODE_BUTTON_Y -> BTN_Y
+        KeyEvent.KEYCODE_BUTTON_C -> BTN_PADDLE2 // L4
+        KeyEvent.KEYCODE_BUTTON_Z -> BTN_PADDLE1 // R4
         KeyEvent.KEYCODE_BUTTON_L1 -> BTN_LB
         KeyEvent.KEYCODE_BUTTON_R1 -> BTN_RB
         KeyEvent.KEYCODE_BUTTON_THUMBL -> BTN_LS_CLICK
