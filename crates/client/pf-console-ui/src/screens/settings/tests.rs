@@ -996,6 +996,81 @@ fn an_off_ladder_rate_steps_to_its_neighbour() {
     assert_eq!(ctx.settings.bitrate_kbps, 4_000);
 }
 
+/// A scale typed on another client sits between two stops, and steps to the nearer one in
+/// the direction pressed. A float-stored stop is still that stop.
+#[test]
+fn an_off_ladder_scale_steps_to_its_neighbour() {
+    let mut settings = Settings {
+        render_scale: 1.1,
+        ..Settings::default()
+    };
+    let library = crate::library::LibraryShared::default();
+    let mut ctx = Ctx::test(&mut settings, &library);
+    assert!(adjust(RowId::RenderScale, 1, false, &mut ctx));
+    assert_eq!(ctx.settings.render_scale, 1.25, "the stop above");
+    ctx.settings.render_scale = 1.1;
+    assert!(adjust(RowId::RenderScale, -1, false, &mut ctx));
+    assert_eq!(ctx.settings.render_scale, 1.0, "the stop below");
+    ctx.settings.render_scale = f64::from(0.67_f32);
+    assert!(adjust(RowId::RenderScale, 1, false, &mut ctx));
+    assert_eq!(
+        ctx.settings.render_scale, 0.75,
+        "0.67 as a float is still 0.67"
+    );
+}
+
+/// Y opens the typed percent; it is stored as a scale and kept inside 50 to 400.
+#[test]
+fn a_typed_scale_is_stored_and_clamped() {
+    // Render scale is an advanced row, and a save rebases on the store.
+    let mut settings = Settings {
+        show_advanced: true,
+        ..Settings::default()
+    };
+    let library = crate::library::LibraryShared::default();
+    // Snapshot, not the file store: this test saves.
+    let store = crate::store::SnapshotStore::new(settings.clone(), Vec::new());
+    let mut ctx = Ctx {
+        store: &store,
+        ..Ctx::test(&mut settings, &library)
+    };
+    let mut s = SettingsScreen::with_presets(Vec::new());
+    s.tab = tab_of(RowId::RenderScale);
+    let mut fx = Outbox::default();
+    let ids = s.row_ids(&ctx);
+    s.list.cursor = ids
+        .iter()
+        .position(|id| *id == RowId::RenderScale)
+        .expect("the render scale row");
+    s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+    assert!(s.editing(), "Y opens the field");
+    s.text_input("11.0"); // digits only: '.' is refused
+    assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
+    assert!(!s.editing(), "Return closes it");
+    assert_eq!(ctx.settings.render_scale, 1.1);
+    assert_eq!(
+        row_spec(RowId::RenderScale, &ctx, &[], &Default::default())
+            .value
+            .as_deref(),
+        Some("1.1× (supersample)"),
+        "and the row reads it back"
+    );
+
+    for (typed, want) in [("999", 4.0), ("7", 0.5)] {
+        s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+        s.text_input(typed);
+        assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
+        assert_eq!(ctx.settings.render_scale, want, "{typed} is clamped");
+    }
+
+    s.menu(MenuEvent::Secondary, &mut ctx, &mut fx);
+    assert!(s.edit_key(crate::input::Key::Return, &mut ctx));
+    assert_eq!(
+        ctx.settings.render_scale, 0.5,
+        "an empty field changes nothing"
+    );
+}
+
 /// A, OK or Y opens the typed rate; any rate up to the ceiling is stored.
 #[test]
 fn a_typed_bitrate_is_stored_and_clamped() {

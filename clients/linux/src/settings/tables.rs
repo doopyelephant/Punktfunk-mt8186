@@ -52,11 +52,13 @@ pub mod index {
         REFRESH.iter().position(|&r| r == s.refresh_hz).unwrap_or(0) as u32
     }
 
+    /// The Render scale row's Custom entry: after the stops.
+    pub const CUSTOM_SCALE: u32 = RENDER_SCALES.len() as u32;
+
+    /// A stop's entry, or Custom for a typed scale.
     pub fn render_scale(s: &Settings) -> u32 {
-        RENDER_SCALES
-            .iter()
-            .position(|&x| (x - s.render_scale).abs() < 1e-6)
-            .unwrap_or_else(|| RENDER_SCALES.iter().position(|&x| x == 1.0).unwrap()) as u32
+        punktfunk_core::render_scale::preset_index(s.render_scale)
+            .map_or(CUSTOM_SCALE, |i| i as u32)
     }
 
     pub fn codec(s: &Settings) -> u32 {
@@ -368,13 +370,15 @@ mod tests {
         assert!(!REFRESH.contains(&odd.refresh_hz));
         assert_eq!(index::refresh(&odd), 0);
 
-        // Render scale falls back to 1.0's rung, which is not index 0 — so "unmoved" cannot
-        // be spelled as "index 0" for this row.
+        // A scale that is no stop seeds Custom, past the last stop, so the typed value
+        // shows as typed. Native's stop is not index 0, so "unmoved" cannot be spelled as
+        // "index 0" for this row.
         let odd_scale = Settings {
             render_scale: 0.63,
             ..Default::default()
         };
-        let fallback = index::render_scale(&odd_scale);
-        assert!(RENDER_SCALES[fallback as usize] == 1.0 && fallback != 0);
+        assert_eq!(index::render_scale(&odd_scale), index::CUSTOM_SCALE);
+        let native = index::render_scale(&Settings::default());
+        assert!(RENDER_SCALES[native as usize] == 1.0 && native != 0);
     }
 }

@@ -1289,17 +1289,18 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
                 format!("{} Hz", s.refresh_hz)
             },
         ),
-        RowId::RenderScale => (
-            None,
-            "Render scale",
-            if s.render_scale == 1.0 {
+        RowId::RenderScale => {
+            // In hundredths, so a float-stored 0.67 does not read as 0.6700000167.
+            let x = f64::from(punktfunk_core::render_scale::percent(s.render_scale)) / 100.0;
+            let value = if x == 1.0 {
                 "Native".into()
-            } else if s.render_scale > 1.0 {
-                format!("{}× (supersample)", s.render_scale)
+            } else if x > 1.0 {
+                format!("{x}× (supersample)")
             } else {
-                format!("{}×", s.render_scale)
-            },
-        ),
+                format!("{x}×")
+            };
+            (None, "Render scale", value)
+        }
         RowId::VideoFit => (
             None,
             "Picture fit",
@@ -1555,7 +1556,8 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
         RowId::Refresh => "Native follows the display this window is on.",
         RowId::RenderScale => {
             "The host renders larger or smaller than the stream mode and this window \
-             resamples — above 1× supersamples, below saves bandwidth."
+             resamples — above 1× supersamples, below saves bandwidth. Any percent from 50 \
+             to 400 can be typed."
         }
         RowId::VideoFit => {
             "When the stream's shape differs from this window. Fit shows the whole picture \
@@ -1961,10 +1963,13 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
             step_option(cur, REFRESH.len(), delta, wrap).map(|i| s.refresh_hz = REFRESH[i])
         }
         RowId::RenderScale => {
-            // Writers store these literals; a hand-edited oddball snaps to the first step.
-            let cur = RENDER_SCALES.iter().position(|v| *v == s.render_scale);
-            step_option(cur, RENDER_SCALES.len(), delta, wrap)
-                .map(|i| s.render_scale = RENDER_SCALES[i])
+            // A typed scale sits between two stops: step to the one the thumb is heading for.
+            let stepped = match punktfunk_core::render_scale::preset_index(s.render_scale) {
+                cur @ Some(_) => step_option(cur, RENDER_SCALES.len(), delta, wrap),
+                None if delta < 0 => RENDER_SCALES.iter().rposition(|v| *v < s.render_scale),
+                None => RENDER_SCALES.iter().position(|v| *v > s.render_scale),
+            };
+            stepped.map(|i| s.render_scale = RENDER_SCALES[i])
         }
         RowId::VideoFit => {
             let cur = VIDEO_FITS

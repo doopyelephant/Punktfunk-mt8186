@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -77,6 +78,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -835,6 +837,7 @@ private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, con
     val families = remember(panel, panelSafe) { Resolutions.families(panel, panelSafe) }
     val showCustom = customPicked || s.isCustomResolution(families)
     var customBitratePicked by remember { mutableStateOf(false) }
+    var customScalePicked by remember { mutableStateOf(false) }
     SettingsGroup("Resolution") {
         // The family the dropdown lists. A chip writes that family's size nearest the current
         // height, so the dropdown always holds a row of the family it shows.
@@ -1015,16 +1018,26 @@ private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, con
                     "display latency — the cost shown is at the session's refresh rate.",
             ) { v -> update("smooth_buffer", s.copy(smoothBuffer = v)) }
         }
+        // Custom is read from the stored scale, like the bitrate above; the flag only keeps the
+        // field open between picking "Custom…" and typing a percent. A stop is matched in
+        // hundredths, so the stored Float still selects its exact Double key.
+        val scaleStop = RenderScale.presetIndex(s.renderScale)
+        val showCustomScale = customScalePicked || scaleStop == null
         SettingDropdown(
             label = "Render scale",
-            options = RENDER_SCALE_OPTIONS,
-            // Snap the stored value (a Float round-tripped to Double) to the nearest preset so the
-            // exact Double keys match.
-            selected = RenderScale.PRESETS.minByOrNull { kotlin.math.abs(it - s.renderScale) } ?: 1.0,
+            options = RENDER_SCALE_OPTIONS + (CUSTOM_RENDER_SCALE to
+                if (scaleStop == null) "Custom (${RenderScale.percent(s.renderScale)} %)" else "Custom…"),
+            selected = if (showCustomScale) CUSTOM_RENDER_SCALE else RenderScale.PRESETS[scaleStop],
             field = "render_scale",
             caption = "Above native is sharper but costs bandwidth and decode; below is " +
                 "lighter on the host.",
-        ) { scale -> update("render_scale", s.copy(renderScale = scale)) }
+        ) { scale ->
+            customScalePicked = scale == CUSTOM_RENDER_SCALE
+            if (scale != CUSTOM_RENDER_SCALE) update("render_scale", s.copy(renderScale = scale))
+        }
+        if (showCustomScale) {
+            RenderScaleField(s.renderScale) { scale -> update("render_scale", s.copy(renderScale = scale)) }
+        }
 
         // Only codecs this device can actually decode are offered — a preference the client never
         // advertises would be a dead setting (see [codecOptionsFor]).
@@ -1626,6 +1639,28 @@ private fun BitrateField(kbps: Int, onCommit: (Int) -> Unit) {
         singleLine = true,
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
         modifier = Modifier.fillMaxWidth().onFocusChanged { if (!it.isFocused) text = shown },
+    )
+}
+
+/** A render scale as a whole percent. Digits only; the scale is stored when the field loses
+ * focus or the keyboard's Done is pressed, so a half-typed "1" is never clamped to 50 under the
+ * thumb. Empty or `0` stores nothing. */
+@Composable
+private fun RenderScaleField(scale: Double, onCommit: (Double) -> Unit) {
+    val shown = RenderScale.percent(scale).toString()
+    var text by remember(shown) { mutableStateOf(shown) }
+    val commit = {
+        val percent = text.toIntOrNull() ?: 0
+        if (percent > 0) onCommit(RenderScale.fromPercent(percent)) else text = shown
+    }
+    OutlinedTextField(
+        value = text,
+        onValueChange = { raw -> text = raw.filter { it.isDigit() }.take(3) },
+        label = { Text("Render scale (percent, 50 to 400)") },
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+        keyboardActions = KeyboardActions(onDone = { commit() }),
+        modifier = Modifier.fillMaxWidth().onFocusChanged { if (!it.isFocused) commit() },
     )
 }
 

@@ -131,6 +131,8 @@ struct SettingsView: View {
     // preset doesn't snap it back off Custom. A stored non-preset value reads as custom even when
     // this is false (see `isCustomResolution`), so it survives relaunches without persisting.
     @State var customMode = false
+    // The same, for the Render scale picker's "Custom…" and its percent field.
+    @State var customScaleMode = false
     #endif
     #if os(tvOS)
     /// What the TV's pane shows: the Editing row's preset manager, or a category.
@@ -143,6 +145,8 @@ struct SettingsView: View {
     @State var typingBitrate = false
     /// The system keyboard is up for the Custom size row.
     @State var typingSize = false
+    /// The system keyboard is up for the Custom scale row.
+    @State var typingScale = false
     /// Focus on a sidebar row picks what the pane shows, as on a tab bar.
     @State private var tvPane: TVPane = .category(.general)
     @FocusState private var tvFocusedPane: TVPane?
