@@ -140,8 +140,9 @@ pub(super) fn seat_exe(account: &str) -> Option<PathBuf> {
 }
 
 /// The copy for `account`, signed in to `session`, when the box has Steam and the seat has none
-/// yet, then its launchers. The copy runs as that user: the profile is theirs, and SYSTEM writing
-/// into a folder its user controls could be steered elsewhere through a junction.
+/// yet, then its library list and its launchers. The files are written as that user: the profile
+/// is theirs, and SYSTEM writing into a folder its user controls could be steered elsewhere
+/// through a junction.
 pub(super) fn ensure_copy(session: u32, account: &str, seat_id: &str) {
     let (Some(src), Some(exe)) = (box_install(), seat_exe(account)) else {
         return;
@@ -149,9 +150,9 @@ pub(super) fn ensure_copy(session: u32, account: &str, seat_id: &str) {
     let Some(dst) = exe.parent().map(Path::to_path_buf) else {
         return;
     };
-    if exe.is_file() {
+    let copied = exe.is_file();
+    if copied {
         ensure_launchers(account, seat_id, &exe);
-        return;
     }
     if !claim(account) {
         return;
@@ -161,22 +162,23 @@ pub(super) fn ensure_copy(session: u32, account: &str, seat_id: &str) {
     let spawned = std::thread::Builder::new()
         .name("seat-steam-copy".into())
         .spawn(move || {
-            match as_user(session, |_| copy_with_library(&src, &dst)) {
+            match as_user(session, |_| prepare(&src, &dst)) {
+                Ok(Ok(())) if copied => {}
                 Ok(Ok(())) => {
                     tracing::info!(account = %owned, dst = %dst.display(), "seat steam copied");
                     ensure_launchers(&owned, &seat_id, &exe);
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!(account = %owned, %error, "seat steam copy did not complete")
+                    tracing::warn!(account = %owned, %error, "seat steam setup did not complete")
                 }
                 Err(error) => {
-                    tracing::warn!(account = %owned, %error, "seat steam copy did not complete")
+                    tracing::warn!(account = %owned, %error, "seat steam setup did not complete")
                 }
             }
             release(&owned);
         });
     if let Err(error) = spawned {
-        tracing::warn!(%error, "seat steam copy did not start");
+        tracing::warn!(%error, "seat steam setup did not start");
         release(account);
     }
 }
@@ -573,25 +575,38 @@ fn as_user<T>(session: u32, work: impl FnOnce(HANDLE) -> T) -> WinResult<T> {
     Ok(out)
 }
 
-/// The copy, then a library list that names the box's folders first and the copy last. Written
-/// once; Steam owns the files afterwards.
-fn copy_with_library(src: &Path, dst: &Path) -> std::io::Result<()> {
-    steam::copy_install(src, dst)?;
-    let mut folders = ["config", "steamapps"]
+/// The copy when the seat has none, then its library lists. A list that can't be written leaves
+/// the seat its own library only.
+fn prepare(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if !dst.join("steam.exe").is_file() {
+        steam::copy_install(src, dst)?;
+    }
+    if let Err(error) = list_libraries(src, dst) {
+        tracing::warn!(%error, "seat steam library list not written");
+    }
+    Ok(())
+}
+
+/// Names the box's library folders in both of the copy's lists, after the copy itself. Steam
+/// reads them at sign-in and writes them back, so a change made under a running Steam lasts
+/// only until that write.
+fn list_libraries(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut shared = ["config", "steamapps"]
         .into_iter()
         .find_map(|dir| std::fs::read_to_string(src.join(dir).join("libraryfolders.vdf")).ok())
         .map(|vdf| steam::library_paths(&vdf))
         .unwrap_or_default();
-    if folders.is_empty() {
-        folders.push(src.to_string_lossy().into_owned());
+    if shared.is_empty() {
+        shared.push(src.to_string_lossy().into_owned());
     }
-    folders.push(dst.to_string_lossy().into_owned());
-    let vdf = steam::library_folders_vdf(&folders);
+    let own = dst.to_string_lossy();
     for dir in ["config", "steamapps"] {
         let file = dst.join(dir).join("libraryfolders.vdf");
-        if !file.exists() {
+        let had = std::fs::read_to_string(&file).ok();
+        let list = steam::seat_library_list(had.as_deref(), &own, &shared);
+        if had.as_deref() != Some(list.as_str()) {
             std::fs::create_dir_all(dst.join(dir))?;
-            std::fs::write(file, &vdf)?;
+            std::fs::write(file, list)?;
         }
     }
     Ok(())

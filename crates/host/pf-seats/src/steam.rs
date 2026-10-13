@@ -3,7 +3,7 @@
 //! On Windows, Steam runs once per IPC name on a machine: a second start under the default name
 //! closes whoever runs it, in any session and from any folder. So each Windows seat gets a copy
 //! of the box's client in its own profile and starts it only under [`ipc_name`]; the box keeps
-//! the default. The games stay the box's: the copy lists the box's library folders first.
+//! the default. The games stay the box's: the copy lists the box's library folders after its own.
 
 use std::ffi::OsString;
 use std::io;
@@ -208,6 +208,31 @@ pub fn merge_library_folders(
     }
     out.push_str("}\n");
     Some(out)
+}
+
+/// A Windows seat copy's library list: `own`, the copy, then each folder of `shared` it lacks.
+/// Steam reads entry `0` as its own install whatever path stands there, so a folder listed there
+/// is lost. Steam's entries and fields stay as written. A list `own` doesn't lead is one Steam
+/// never wrote, and is rebuilt.
+pub fn seat_library_list(vdf: Option<&str>, own: &str, shared: &[String]) -> String {
+    let same = |a: &str, b: &str| {
+        a.trim_end_matches('\\')
+            .eq_ignore_ascii_case(b.trim_end_matches('\\'))
+    };
+    let listed = vdf.map(library_paths).unwrap_or_default();
+    if listed.first().is_some_and(|first| same(first, own)) {
+        let missing: Vec<String> = shared
+            .iter()
+            .filter(|path| !listed.iter().any(|have| same(have, path)))
+            .cloned()
+            .collect();
+        if let Some(merged) = vdf.and_then(|vdf| merge_library_folders(vdf, |_| false, &missing)) {
+            return merged;
+        }
+    }
+    let mut folders = vec![own.to_owned()];
+    folders.extend(shared.iter().filter(|path| !same(path, own)).cloned());
+    library_folders_vdf(&folders)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -531,6 +556,36 @@ mod tests {
             "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"/g\"\n\t}\n\
              \t\"1\"\n\t{\n\t\t\"path\"\t\t\"/home/s/.local/share/Steam\"\n\t}\n}\n"
         );
+    }
+
+    /// The copy leads its list whatever was there, and Steam's own fields survive.
+    #[test]
+    fn a_seat_copy_leads_its_library_list() {
+        let own = r"C:\Users\pf_seat1\Steam";
+        let shared = [
+            r"C:\Program Files (x86)\Steam".to_owned(),
+            r"E:\SteamLibrary".to_owned(),
+        ];
+        let fresh = library_folders_vdf(&[own.to_owned(), shared[0].clone(), shared[1].clone()]);
+        assert_eq!(seat_library_list(None, own, &shared), fresh);
+        // The order Steam discards: the box's folder at entry 0.
+        let led_by_box = library_folders_vdf(&[shared[0].clone(), own.to_owned()]);
+        assert_eq!(seat_library_list(Some(&led_by_box), own, &shared), fresh);
+        // What Steam wrote back after discarding it: the copy alone, with Steam's fields.
+        let steam_wrote = "\"libraryfolders\"\n{\n\
+            \t\"0\"\n\t{\n\t\t\"path\"\t\t\"C:\\\\Users\\\\pf_seat1\\\\Steam\"\n\
+            \t\t\"contentid\"\t\t\"5678596761891394462\"\n\
+            \t\t\"apps\"\n\t\t{\n\t\t\t\"228980\"\t\t\"0\"\n\t\t}\n\t}\n}\n";
+        let healed = seat_library_list(Some(steam_wrote), own, &shared);
+        assert_eq!(
+            library_paths(&healed),
+            [own, shared[0].as_str(), shared[1].as_str()]
+        );
+        assert!(healed.contains("5678596761891394462"));
+        assert_eq!(seat_library_list(Some(&healed), own, &shared), healed);
+        // Steam spells a folder its own way: the same folder is not listed twice.
+        let respelled = healed.replace("Program Files", "PROGRAM FILES");
+        assert_eq!(seat_library_list(Some(&respelled), own, &shared), respelled);
     }
 
     #[test]
