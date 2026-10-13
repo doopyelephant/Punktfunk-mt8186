@@ -28,6 +28,9 @@ pub mod nvenc_session;
 // the union of callers, and the VAAPI one is featureless on Linux.
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod rfi;
+// The LTR slot mirror AMF and QSV keep. Pure, so its tests run wherever `rfi` builds.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub mod ltr;
 pub mod smoke_pattern;
 // Shared loss-recovery env knobs. Defaults and API clamps stay per-backend.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
