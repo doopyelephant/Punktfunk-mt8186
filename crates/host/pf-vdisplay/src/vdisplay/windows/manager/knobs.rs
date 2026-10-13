@@ -2,23 +2,10 @@
 //! Readers of [`crate::policy`] plus legacy env fallbacks — no manager state.
 
 use crate::policy::Linger;
-use std::time::Duration;
 
-/// 10 s: an unconfigured host's linger when `PUNKTFUNK_MONITOR_LINGER_MS` is unset.
-const DEFAULT_LINGER_MS: u64 = 10_000;
-
-/// Linger for a monitor `client_fp` created
-/// ([`resolve_linger`](crate::policy::resolve_linger)). Unconfigured:
-/// `PUNKTFUNK_MONITOR_LINGER_MS`, else 10 s. A value that does not parse is unset, not zero.
+/// Linger for a monitor `client_fp` created.
 pub(super) fn linger_for(client_fp: Option<[u8; 32]>) -> Linger {
-    crate::policy::resolve_linger(
-        crate::policy::prefs().configured().as_ref(),
-        crate::policy::fp_hex(client_fp).as_deref(),
-        std::env::var("PUNKTFUNK_MONITOR_LINGER_MS")
-            .ok()
-            .and_then(|s| s.parse().ok()),
-        Linger::For(Duration::from_millis(DEFAULT_LINGER_MS)),
-    )
+    crate::policy::prefs().linger(crate::policy::fp_hex(client_fp).as_deref())
 }
 
 /// Exclusive-topology re-assert cadence. Default 2000 ms; `0` disables.

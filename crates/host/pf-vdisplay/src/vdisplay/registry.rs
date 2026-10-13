@@ -1619,17 +1619,10 @@ mod linux {
             .unwrap_or(0)
     }
 
-    /// Linger for the device that owns this display ([`policy::resolve_linger`]). A slot with
-    /// no recorded owner is shared or anonymous and follows the host. Unconfigured: teardown
-    /// at once, whatever `PUNKTFUNK_MONITOR_LINGER_MS` says.
+    /// Linger for the device that owns this display. A slot with no recorded owner is shared
+    /// or anonymous and follows the host.
     fn linger_for(identity_slot: Option<u32>) -> Linger {
-        let fp = crate::identity::slot_owner(identity_slot);
-        policy::resolve_linger(
-            policy::prefs().configured().as_ref(),
-            fp.as_deref(),
-            None,
-            Linger::Immediate,
-        )
+        policy::prefs().linger(crate::identity::slot_owner(identity_slot).as_deref())
     }
 
     /// Do not wrap `spawn` in `Once` and discard `Result`: a failed spawn
