@@ -8,8 +8,9 @@
 
 use super::*;
 
-/// `SECURITY_ATTRIBUTES` for the unnamed AU/cursor section and event objects: SDDL
-/// `D:P(A;;GA;;;SY)`, protected, `bInheritHandle: false`.
+/// `SECURITY_ATTRIBUTES` for the unnamed AU section and its event: SDDL
+/// `D:P(A;;GA;;;SY)`, protected, `bInheritHandle: false`. The cursor section takes the
+/// process default instead.
 ///
 /// The driver never opens by name; it receives duplicated handles (access travels
 /// with the handle). See `design/idd-push-security.md`.
