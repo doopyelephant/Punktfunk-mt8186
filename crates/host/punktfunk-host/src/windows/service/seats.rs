@@ -47,6 +47,12 @@ impl SeatsSlot {
         if let Err(error) = spawned {
             tracing::error!("seat supervisor thread did not start: {error}");
         }
+        // Windows takes about a minute to answer the first role query after a restart. Asked
+        // here, the Seats dialog an operator opens after signing in is answered at once.
+        let warm = backend.clone();
+        let _ = std::thread::Builder::new()
+            .name("seats-checks".into())
+            .spawn(move || drop(pf_seats::backend::PlatformBackend::seating(&warm)));
         SeatsSlot {
             stop,
             backend: Some(backend),

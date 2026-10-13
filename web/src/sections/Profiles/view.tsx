@@ -857,6 +857,9 @@ export const SeatsDialog: FC<{
 						</div>
 					</div>
 				)}
+				{!seating && (
+					<p className="text-sm text-muted-foreground">{m.common_loading()}</p>
+				)}
 				{checks.length > 0 && <CheckList checks={checks} />}
 				{needsRestart && onRestart && (
 					<Button
