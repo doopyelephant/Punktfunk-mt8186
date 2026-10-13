@@ -42,9 +42,8 @@ async fn the_plaintext_router_carries_one_route() {
     );
 }
 
-/// The tunnel's one catastrophic mistake would be a request with no `PeerAddr`: the gate reads
-/// that as loopback, and loopback is admin. Pinned from both sides — the same request straight
-/// into the router, with nothing stamped, IS admin.
+/// The tunnel stamps the QUIC peer, never loopback: loopback is admin. Pinned from both sides —
+/// the same request from this machine IS admin.
 #[tokio::test]
 async fn a_tunnelled_request_is_the_lan_peer_it_came_from() {
     use crate::webtransport::mgmt::{dispatch, Head};
@@ -72,7 +71,7 @@ async fn a_tunnelled_request_is_the_lan_peer_it_came_from() {
     assert_eq!(
         send(&app, get_req("/api/v1/clients")).await.0,
         StatusCode::OK,
-        "unstamped, the very same request is admin: that is the hole the stamp closes"
+        "from loopback, the very same request is admin"
     );
     assert_eq!(
         via(head("GET", "/api/v1/health", &[])).await,

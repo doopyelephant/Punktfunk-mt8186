@@ -7,7 +7,7 @@
 //!
 //! The same router *instance*, not a second `app()`: each one mints its own `DeviceAuth`, and a
 //! token earned over HTTPS would be refused here. Every request carries the QUIC peer as
-//! [`PeerAddr`], because the auth gate reads a request with none as loopback and loopback is
+//! [`PeerAddr`], because the auth gate refuses a request with none and reads loopback as
 //! admin; and a [`PeerCertFingerprint`] of `None`, never one a peer could name. A tunnelled
 //! request has exactly the authority a browser's `fetch` has: the public routes, the device
 //! exchange, and the paired-device lane behind a token it earned.
