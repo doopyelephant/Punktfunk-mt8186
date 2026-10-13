@@ -66,6 +66,23 @@ pub(super) struct Pipelining {
     pub(super) deescalate_backoff: std::time::Duration,
 }
 
+/// Adaptive FEC as the encode loop holds it: the control task proposes, and parity is applied
+/// behind the encoder rate it leaves room for.
+pub(super) struct FecState {
+    /// The control task's proposal.
+    pub(super) requested: Arc<AtomicU8>,
+    /// Applied FEC: what the packetizer and [`StreamState::enc_now`] run at.
+    pub(super) target: Arc<AtomicU8>,
+    /// `target` as this loop last published it.
+    pub(super) last: u8,
+    /// A proposal an asynchronous encoder was asked to make room for: the parity and the
+    /// encoder rate it implies, kbps. Parity waits for the encoder to settle.
+    pub(super) pending: Option<(u8, u32)>,
+    /// The proposal a hold was last logged for, so one the control task re-proposes every
+    /// window logs once.
+    pub(super) hold_logged: u8,
+}
+
 pub(super) struct StreamState {
     // ---- loop bookkeeping ----
     pub(super) deadline: std::time::Instant,
@@ -108,7 +125,7 @@ pub(super) struct StreamState {
     /// The Windows driver's pool drops, handed to the send thread's recorder sample.
     pub(super) driver_dropped: Arc<AtomicU64>,
     pub(super) pipelining: Pipelining,
-    pub(super) last_fec: u8,
+    pub(super) fec: FecState,
     /// EMA of real-frame arrivals. Negotiated refresh is the wrong deadline when the game is slower.
     pub(super) src_period_ns: Option<u64>,
     /// Longest host submit+poll chain observed this tick, independent of perf sampling.
@@ -203,23 +220,12 @@ pub(super) struct StreamState {
     pub(super) bringup: Arc<crate::bringup::Trace>,
     pub(super) resize_ms: Arc<AtomicU32>,
     pub(super) stats: Arc<StatsRecorder>,
-    /// Applied FEC: what the packetizer and [`Self::enc_now`] run at.
-    pub(super) fec_target: Arc<AtomicU8>,
-    /// Control task's proposal; applied only after the encoder takes its rate.
-    pub(super) fec_requested: Arc<AtomicU8>,
     pub(super) live_bitrate: Arc<AtomicU32>,
     pub(super) encoder_ceiling: Arc<std::sync::Mutex<EncoderCeiling>>,
     /// A rate was handed to this encoder after it opened, so a later read-back
     /// is about that retarget. What a pipeline opened at is the build's own
     /// business (`Pipeline::bitrate_kbps`), and is not re-litigated here.
     pub(super) retargeted: bool,
-    /// A FEC proposal an asynchronous encoder was asked to make room for: the
-    /// parity and the encoder rate it implies, kbps. Parity waits for the
-    /// encoder to settle.
-    pub(super) fec_pending: Option<(u8, u32)>,
-    /// The proposal a hold was last logged for, so a refusal the control task
-    /// re-proposes every window logs once.
-    pub(super) fec_hold_logged: u8,
     pub(super) cadence_degraded: Arc<AtomicBool>,
     pub(super) cadence_behind_score: Arc<AtomicU32>,
     pub(super) client_packets_received: Arc<AtomicU32>,
@@ -260,7 +266,7 @@ impl StreamState {
 
     /// [`Self::enc_derive`] at the FEC target in force now.
     pub(super) fn enc_now(&self) -> EncDerive {
-        self.enc_derive(self.fec_target.load(Ordering::Relaxed))
+        self.enc_derive(self.fec.target.load(Ordering::Relaxed))
     }
 
     /// Swap the built pipeline in and forget every owed AU and the last forwarded cursor shape:
@@ -281,7 +287,7 @@ impl StreamState {
                 .clear();
         }
         self.retargeted = false;
-        self.fec_pending = None;
+        self.fec.pending = None;
         self.adopt_reframe(p.reframe);
         self.capturer = p.capturer;
         if let Some(fwd) = self.cursor_fwd.as_mut() {
@@ -788,13 +794,9 @@ impl StreamState {
             bringup,
             resize_ms,
             stats,
-            fec_target: fec_target.clone(),
-            fec_requested: fec_requested.clone(),
             live_bitrate,
             encoder_ceiling,
             retargeted: false,
-            fec_pending: None,
-            fec_hold_logged: 0,
             cadence_degraded,
             cadence_behind_score,
             client_packets_received,
@@ -895,7 +897,13 @@ impl StreamState {
                 deescalate_not_before: None,
                 deescalate_backoff: super::encode::DEESCALATE_BACKOFF_START,
             },
-            last_fec: fec_target.load(Ordering::Relaxed),
+            fec: FecState {
+                last: fec_target.load(Ordering::Relaxed),
+                requested: fec_requested,
+                target: fec_target,
+                pending: None,
+                hold_logged: 0,
+            },
             src_period_ns: None,
             encode_chain_ns: 0,
             last_real_cap: None,

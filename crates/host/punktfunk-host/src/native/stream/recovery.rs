@@ -12,15 +12,15 @@ impl StreamState {
     /// A budget-identity codec, or a move that leaves the encoder rate where
     /// it is, publishes at once. A synchronous encoder publishes when it
     /// accepts; an asynchronous one is asked, and the parity waits in
-    /// `fec_pending` until the encoder has settled no higher than the rate the
+    /// `fec.pending` until the encoder has settled no higher than the rate the
     /// parity leaves room for. A newer proposal or a moved budget asks again. A
     /// refusal keeps the previous FEC and is logged once per proposal.
     pub(super) fn on_fec_moved(&mut self) {
-        let requested = self.fec_requested.load(Ordering::Acquire);
-        if let Some((fec, want)) = self.fec_pending.take() {
+        let requested = self.fec.requested.load(Ordering::Acquire);
+        if let Some((fec, want)) = self.fec.pending.take() {
             if fec == requested && want == self.enc_derive(fec).enc_kbps(self.bitrate_kbps) {
                 if !self.enc.retarget_settled() {
-                    self.fec_pending = Some((fec, want));
+                    self.fec.pending = Some((fec, want));
                     return;
                 }
                 let want_bps = u64::from(want) * 1000;
@@ -28,35 +28,35 @@ impl StreamState {
                 let moved = settle_fec(
                     applied,
                     want_bps,
-                    &self.fec_target,
-                    &self.fec_requested,
-                    &mut self.last_fec,
+                    &self.fec.target,
+                    &self.fec.requested,
+                    &mut self.fec.last,
                     requested,
                 );
                 self.note_fec_move(requested, want, moved);
                 return;
             }
         }
-        if requested == self.last_fec {
+        if requested == self.fec.last {
             return;
         }
-        let prev = self.enc_derive(self.last_fec).enc_kbps(self.bitrate_kbps);
+        let prev = self.enc_derive(self.fec.last).enc_kbps(self.bitrate_kbps);
         let want = self.enc_derive(requested).enc_kbps(self.bitrate_kbps);
         if self.budget_identity || want == prev {
-            publish_fec(&self.fec_target, &mut self.last_fec, requested);
+            publish_fec(&self.fec.target, &mut self.fec.last, requested);
             return;
         }
         match fec_retarget(
             self.enc.bitrate_retarget_is_synchronous(),
             |bps| self.enc.reconfigure_bitrate(bps),
             u64::from(want) * 1000,
-            &self.fec_target,
-            &self.fec_requested,
-            &mut self.last_fec,
+            &self.fec.target,
+            &self.fec.requested,
+            &mut self.fec.last,
             requested,
         ) {
             FecMove::Published => self.note_fec_move(requested, want, true),
-            FecMove::Pending => self.fec_pending = Some((requested, want)),
+            FecMove::Pending => self.fec.pending = Some((requested, want)),
             FecMove::Held => self.note_fec_move(requested, want, false),
         }
     }
@@ -65,17 +65,17 @@ impl StreamState {
     /// window is logged at warn once, then at debug.
     fn note_fec_move(&mut self, requested: u8, encoder_kbps: u32, moved: bool) {
         if moved {
-            self.fec_hold_logged = 0;
+            self.fec.hold_logged = 0;
             tracing::debug!(
                 fec_pct = requested,
                 encoder_kbps,
                 budget_kbps = self.bitrate_kbps,
                 "adaptive FEC moved — encoder rate re-derived within the wire budget"
             );
-        } else if std::mem::replace(&mut self.fec_hold_logged, requested) != requested {
+        } else if std::mem::replace(&mut self.fec.hold_logged, requested) != requested {
             tracing::warn!(
                 requested_fec_pct = requested,
-                applied_fec_pct = self.last_fec,
+                applied_fec_pct = self.fec.last,
                 "adaptive FEC held — encoder did not take the matching bitrate"
             );
         } else {
@@ -191,7 +191,7 @@ impl StreamState {
     fn settle_applied_rate(&mut self) {
         // A pending FEC ask is the encoder's answer to parity, not to the
         // budget: read against the applied FEC it would look like a clamp.
-        if !self.retargeted || self.fec_pending.is_some() {
+        if !self.retargeted || self.fec.pending.is_some() {
             return;
         }
         let ed = self.enc_now();
