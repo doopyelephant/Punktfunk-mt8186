@@ -42,10 +42,10 @@ impl SwapReason {
         matches!(self, SwapReason::ModeSwitch | SwapReason::SourceMode)
     }
 
-    /// The new encoder has been handed no rate yet. An encoder swapped alone keeps the
-    /// retarget state it had, except on a mode switch.
-    fn forgets_retarget(self, with_capture: bool) -> bool {
-        with_capture || self == SwapReason::ModeSwitch
+    /// The new encoder has been handed no rate and no FEC ask: `on_fec_moved` asks again. A
+    /// rate rebuild opened on the rate it was asked for, which its site then records.
+    fn forgets_retarget(self) -> bool {
+        self != SwapReason::Bitrate
     }
 
     /// The display generation to release once the new pipeline is up: the one it replaced.
@@ -97,9 +97,9 @@ impl StreamState {
         }
         // A ceiling was learned from the encoder this one replaces. It survives a swap that
         // opens on the same source.
-        let (with_capture, source_moved) = match &next {
-            Next::Pipeline(p) => (true, enc_src_of(&p.frame) != enc_src_of(&self.frame)),
-            Next::Encoder { .. } => (false, false),
+        let source_moved = match &next {
+            Next::Pipeline(p) => enc_src_of(&p.frame) != enc_src_of(&self.frame),
+            Next::Encoder { .. } => false,
         };
         if source_moved || why.new_geometry() {
             self.encoder_ceiling
@@ -107,7 +107,7 @@ impl StreamState {
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
         }
-        if why.forgets_retarget(with_capture) {
+        if why.forgets_retarget() {
             self.retargeted = false;
             self.fec.pending = None;
         }
@@ -574,7 +574,7 @@ mod tests {
             source_moved_first: false,
             epoch_moved: true,
             ceiling_cleared: false,
-            retarget_forgotten: false,
+            retarget_forgotten: true,
             enc_src_reread: true,
             retired: None,
         },
@@ -596,7 +596,7 @@ mod tests {
             source_moved_first: true,
             epoch_moved: true,
             ceiling_cleared: true,
-            retarget_forgotten: false,
+            retarget_forgotten: true,
             enc_src_reread: true,
             retired: None,
         },
