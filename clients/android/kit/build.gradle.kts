@@ -296,12 +296,23 @@ fun registerCheckJniImports(taskName: String, cargoTask: TaskProvider<Exec>) =
         )
     }
 
+// NativeBridge's `external fun` names and the Rust `Java_..._NativeBridge_*` exports are one set.
+// Text only: no NDK, so it also runs under -PskipRustBuild.
+val checkJniNames = tasks.register<Exec>("checkJniNames") {
+    group = "verification"
+    description = "verify NativeBridge's external funs and the Rust JNI exports match by name"
+    workingDir = repoRoot
+    commandLine("sh", File(repoRoot, "scripts/ci/check-android-jni-names.sh").absolutePath)
+}
+
 val cargoNdkDebug = registerCargoNdk("cargoNdkDebug", release = false)
 val cargoNdkRelease = registerCargoNdk("cargoNdkRelease", release = true)
 val checkJniImportsDebug = registerCheckJniImports("checkJniImportsDebug", cargoNdkDebug)
 val checkJniImportsRelease = registerCheckJniImports("checkJniImportsRelease", cargoNdkRelease)
 
 afterEvaluate {
+    tasks.named("preDebugBuild").configure { dependsOn(checkJniNames) }
+    tasks.named("preReleaseBuild").configure { dependsOn(checkJniNames) }
     // `-PskipRustBuild` skips the cargo-ndk native build — for JVM-only tasks (the Roborazzi
     // screenshot unit tests render Compose on the JVM and never load libpunktfunk_android.so), so
     // CI/local screenshot runs don't need the Rust toolchain or NDK. The native build stays wired
