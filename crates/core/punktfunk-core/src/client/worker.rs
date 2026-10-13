@@ -92,8 +92,9 @@ pub(crate) struct ClientShared {
     pub(crate) recent_rfis: Mutex<RecentRfis>,
     /// What each frame the pump skipped past still lacked, for the RFI line.
     pub(crate) short_frames: Mutex<ShortFrames>,
-    /// Loss asks: the decode side's gaps and the pump's short tails, one throttle.
-    pub(crate) rfi: Mutex<RfiRecovery>,
+    /// Loss recovery: the freeze gate, the asks and their one window, fed by the decode
+    /// side's reports and the pump's ticks.
+    pub(crate) recovery: Mutex<RecoveryDriver>,
     /// Per-pad render caps (bit0 haptics, bit1 speaker). OR'd into GamepadArrival flags
     /// (bits 8/9) toward a `HOST_CAP_PAD_AUDIO` host only.
     pub(crate) pad_audio_caps: [AtomicU8; crate::input::MAX_PADS],
@@ -158,7 +159,7 @@ impl ClientShared {
             quality_floor_kbps: AtomicU32::new(0),
             recent_rfis: Mutex::default(),
             short_frames: Mutex::default(),
-            rfi: Mutex::default(),
+            recovery: Mutex::default(),
             pad_audio_caps: std::array::from_fn(|_| AtomicU8::new(0)),
             pad_mouse: Default::default(),
             scroll_invert: AtomicBool::new(false),
@@ -205,7 +206,7 @@ impl ClientShared {
     /// ends its gap without an ask.
     pub(crate) fn decoder_took(&self, index: u32, flags: u32, whole: bool) {
         if flags & crate::packet::USER_FLAG_RECOVERY_ANCHOR != 0 {
-            self.rfi.lock().unwrap().anchored(index);
+            self.recovery.lock().unwrap().anchored(index);
         }
         if !whole {
             return;

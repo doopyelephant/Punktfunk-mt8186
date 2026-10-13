@@ -1,8 +1,11 @@
-//! Client-side loss asks (`RfiRecovery`: the decoder's gaps and the pump's short tails),
-//! the recent-RFI count, what the short frames an RFI names still lacked, and the numbering
-//! of the feedback datagram that carries asks and reports (`FeedbackOut`).
+//! Client-side loss recovery: [`RecoveryDriver`] folds what the decoder reports into the
+//! freeze gate, the RFI asks and one ask window; `RfiRecovery` (the decoder's gaps and the
+//! pump's short tails), the recent-RFI count, what the short frames an RFI names still
+//! lacked, and the numbering of the feedback datagram that carries asks and reports
+//! (`FeedbackOut`).
 
 use crate::quic::v2::dgram::Feedback;
+use crate::reanchor::{AnchorEvidence, GateVerdict, LocalRecovery, ReanchorGate};
 use std::time::{Duration, Instant};
 
 /// One RFI ask per window so a burst of gaps cannot storm the control stream.
@@ -50,7 +53,7 @@ pub enum FrameOrder {
 
 /// Recovery request for a forward gap. Keyframe when the span exceeds
 /// [`crate::packet::RFI_MAX_RANGE`]: no encoder still holds that reference.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryAsk {
     None,
     Rfi(u32, u32),
@@ -148,6 +151,19 @@ impl RfiRecovery {
         self.pending = None;
     }
 
+    /// No ask of either kind went out in the last [`RFI_THROTTLE`].
+    fn window_open(&self, now: Instant) -> bool {
+        self.last_req
+            .is_none_or(|t| now.duration_since(t) >= RFI_THROTTLE)
+    }
+
+    /// An IDR went out through the one window: it repairs the pending range and shuts the
+    /// window, so an RFI inside it waits instead of replacing the IDR ask's repeats.
+    fn keyframe_sent(&mut self, now: Instant) {
+        self.pending = None;
+        self.last_req = Some(now);
+    }
+
     /// The pending range as an ask once the throttle window is open, else `None`.
     pub(crate) fn flush(&mut self, now: Instant) -> RecoveryAsk {
         let throttled = self
@@ -163,6 +179,257 @@ impl RfiRecovery {
         } else {
             RecoveryAsk::Rfi(first, last)
         }
+    }
+}
+
+/// What the decoder reports for one picture
+/// ([`NativeClient::recovery_on_decoded`](super::NativeClient::recovery_on_decoded)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Decoded {
+    /// The AU's wire flags.
+    pub flags: u32,
+    /// The decoder's own IDR bit; `false` where it does not flag keys (`FLAG_SOF` covers it).
+    pub keyframe: bool,
+    /// Whether this picture predicts from a complete reference chain, on a lane that knows.
+    pub evidence: AnchorEvidence,
+    /// The lane's recovery-point SEI view; [`LocalRecovery::NONE`] without a parser.
+    pub local: LocalRecovery,
+    /// This picture's decode order, on a lane that numbers decodes. One at or below the
+    /// latest arm's watermark was decoded before the loss, so its SEI cannot lift it.
+    pub decode_order: Option<u64>,
+}
+
+/// What the embedder does with a decoded picture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Shown {
+    /// Keep the last good picture on glass instead of this one.
+    pub hold: bool,
+    /// The freeze lifted on an intra-refresh heal, which a reference-chain ledger cannot
+    /// see: forget the chain's damage marks.
+    pub forgive_chain: bool,
+}
+
+/// One observation for [`RecoveryDriver::step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryEvent {
+    /// One AU off the wire, before decode. `decode_order` is the decoder's count so far.
+    Arrived {
+        index: u32,
+        complete: bool,
+        decode_order: u64,
+    },
+    Decoded(Decoded),
+    /// An AU produced no picture.
+    NoOutput,
+    /// A loss with no index gap: a parked-AU overflow, a wedge.
+    Lost,
+    /// The decoder asks (a rebuild, a demotion, a damaged AU).
+    NeedKeyframe,
+    /// The pump saw `index`'s tail arrive short of what its parity rebuilds.
+    TailShort {
+        index: u32,
+    },
+    /// The pump's pass, with the reassembler's drop count.
+    Tick {
+        frames_dropped: u64,
+    },
+}
+
+/// What one [`RecoveryEvent`] asks of the embedder and the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoveryStep {
+    /// `Arrived`: feed the AU. `false` drops a straggler a reference decoder rewinds on, or
+    /// a partial a newer frame beat.
+    pub(crate) admit: bool,
+    /// The freeze is up after this event.
+    pub(crate) hold: bool,
+    pub(crate) forgive_chain: bool,
+    /// Performed by [`NativeClient`](super::NativeClient), never by an embedder.
+    pub(crate) ask: RecoveryAsk,
+}
+
+/// One place for the rules every client used to rebuild: the freeze gate, the RFI asks,
+/// the one ask window, the straggler and late-partial drops and the arm watermark.
+/// Pure: `now` is passed in. [`NativeClient`](super::NativeClient) holds it behind one
+/// lock, feeds the decoder's reports and the pump's ticks, and sends what it asks for.
+#[derive(Default)]
+pub(crate) struct RecoveryDriver {
+    /// `None` until an embedder reports through `recovery_on_*`. A client still driving
+    /// its own gate keeps the only one, so the tick cannot ask twice.
+    gate: Option<ReanchorGate>,
+    rfi: RfiRecovery,
+    /// Newest index handed to the decoder: a partial behind it is the stale past.
+    newest: Option<u32>,
+    /// Decode-order watermark at the latest arm, and the arm count it was stamped at.
+    arm_order: u64,
+    arms_seen: u64,
+    /// PyroWave: every AU stands alone, so a straggler still decodes.
+    all_intra: bool,
+}
+
+impl RecoveryDriver {
+    pub(crate) fn set_all_intra(&mut self, all_intra: bool) {
+        self.all_intra = all_intra;
+    }
+
+    /// The embedder reports through the driver from here on. Seeds the gate with the drop
+    /// count so the first tick is not a loss.
+    pub(crate) fn engage(&mut self, frames_dropped: u64) {
+        if self.gate.is_none() {
+            self.gate = Some(ReanchorGate::new(frames_dropped));
+        }
+    }
+
+    /// Fold one observation.
+    pub(crate) fn step(&mut self, ev: RecoveryEvent, now: Instant) -> RecoveryStep {
+        let mut admit = true;
+        let mut forgive_chain = false;
+        let mut want_keyframe = false;
+        let mut ask = RecoveryAsk::None;
+        match ev {
+            RecoveryEvent::Arrived {
+                index,
+                complete,
+                decode_order,
+            } => (admit, ask) = self.arrived(index, complete, decode_order, now),
+            RecoveryEvent::Decoded(d) => (forgive_chain, want_keyframe) = self.decoded(d, now),
+            RecoveryEvent::NoOutput => {
+                want_keyframe = self.gate.as_mut().is_some_and(|g| g.on_no_output(now));
+            }
+            RecoveryEvent::Lost => {
+                if let Some(g) = &mut self.gate {
+                    g.arm(now);
+                }
+                want_keyframe = true;
+            }
+            RecoveryEvent::NeedKeyframe => match &mut self.gate {
+                // The flag fires per damaged AU; a new loss re-arms by gap or climb.
+                Some(g) => {
+                    if !g.is_holding() {
+                        g.arm(now);
+                    }
+                    want_keyframe = true;
+                }
+                // A client on its own gate asks as it always has: at once.
+                None => {
+                    self.rfi.keyframe_requested();
+                    ask = RecoveryAsk::Keyframe;
+                }
+            },
+            RecoveryEvent::TailShort { index } => ask = self.rfi.tail_short(index, now),
+            RecoveryEvent::Tick { frames_dropped } => {
+                want_keyframe = self
+                    .gate
+                    .as_mut()
+                    .is_some_and(|g| g.poll(frames_dropped, now));
+            }
+        }
+        if want_keyframe {
+            ask = self.keyframe(now);
+        }
+        // The pending range goes after the keyframe decision, never before it.
+        if ask == RecoveryAsk::None && matches!(ev, RecoveryEvent::Tick { .. }) {
+            ask = self.rfi.flush(now);
+        }
+        RecoveryStep {
+            admit,
+            hold: self.gate.as_ref().is_some_and(ReanchorGate::is_holding),
+            forgive_chain,
+            ask,
+        }
+    }
+
+    /// One AU before decode: `(admit, ask)`. A gap asks for the range and arms with credit;
+    /// a straggler a reference decoder rewinds on, or a partial behind the newest decoded
+    /// frame, is not admitted. An admitted AU stamps the watermark when the gate re-armed.
+    fn arrived(
+        &mut self,
+        index: u32,
+        complete: bool,
+        decode_order: u64,
+        now: Instant,
+    ) -> (bool, RecoveryAsk) {
+        let (order, ask) = self.rfi.observe(index, now);
+        let mut admit = true;
+        match order {
+            // Credited: the reassembler books these frames ~120 ms from now.
+            FrameOrder::Gap(gap) => {
+                if let Some(g) = &mut self.gate {
+                    g.arm_expecting_drops(now, u64::from(gap));
+                }
+            }
+            FrameOrder::Straggler if !self.all_intra => admit = false,
+            FrameOrder::InOrder | FrameOrder::Straggler => {}
+        }
+        if admit
+            && !complete
+            && self
+                .newest
+                .is_some_and(|n| n.wrapping_sub(index) <= u32::MAX / 2)
+        {
+            admit = false;
+        }
+        if admit {
+            self.newest = Some(match self.newest {
+                Some(n) if index.wrapping_sub(n) > u32::MAX / 2 => n,
+                _ => index,
+            });
+            // Stamped before this AU decodes: the newest picture at the arm.
+            if let Some(g) = &self.gate {
+                if g.arms() != self.arms_seen {
+                    self.arms_seen = g.arms();
+                    self.arm_order = decode_order;
+                }
+            }
+        }
+        (admit, ask)
+    }
+
+    /// One decoded picture: `(forgive_chain, want_keyframe)`. A recovery SEI on a picture
+    /// decoded before the arm cannot lift; a damaged chain that reaches an open gate holds
+    /// and asks now, not at the backstop.
+    fn decoded(&mut self, d: Decoded, now: Instant) -> (bool, bool) {
+        let Some(g) = &mut self.gate else {
+            return (false, false);
+        };
+        let local = if d.decode_order.is_some_and(|o| o <= self.arm_order) {
+            LocalRecovery::NONE
+        } else {
+            d.local
+        };
+        let mut forgive = g.on_local_recovery(local);
+        let was = g.is_holding();
+        let present =
+            g.on_decoded_corroborated(d.flags, d.keyframe, d.evidence, now) == GateVerdict::Present;
+        forgive |= was && present && g.lifted_by_marks();
+        let want_keyframe = !present && !was;
+        if want_keyframe {
+            tracing::debug!("damaged reference chain reached an open gate — holding");
+        }
+        (forgive, want_keyframe)
+    }
+
+    /// A keyframe through the one window. Shut: dropped, and the backstop re-asks.
+    fn keyframe(&mut self, now: Instant) -> RecoveryAsk {
+        if !self.rfi.window_open(now) {
+            return RecoveryAsk::None;
+        }
+        self.rfi.keyframe_sent(now);
+        RecoveryAsk::Keyframe
+    }
+
+    // Until 22 moves Android and the C ABI onto `step`: the RFI side alone.
+
+    pub(crate) fn observe(&mut self, index: u32, now: Instant) -> (FrameOrder, RecoveryAsk) {
+        self.rfi.observe(index, now)
+    }
+
+    pub(crate) fn flush(&mut self, now: Instant) -> RecoveryAsk {
+        self.rfi.flush(now)
+    }
+
+    pub(crate) fn anchored(&mut self, index: u32) {
+        self.rfi.anchored(index);
     }
 }
 
@@ -938,5 +1205,349 @@ mod feedback_out_tests {
             let link = out.link(1_000 * n).expect("a new rate");
             assert_eq!(fields(link), level, "a link change");
         }
+    }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::{
+        Decoded, FrameOrder, RecoveryAsk, RecoveryDriver, RecoveryEvent as E, RecoveryStep,
+    };
+    use crate::packet::{FLAG_SOF, USER_FLAG_RECOVERY_ANCHOR, USER_FLAG_RECOVERY_POINT};
+    use crate::reanchor::{AnchorEvidence, LocalRecovery};
+    use std::time::{Duration, Instant};
+
+    const CLEAN: AnchorEvidence = AnchorEvidence::Unavailable;
+    const DAMAGED: AnchorEvidence = AnchorEvidence::ReferencesDamaged;
+    const NONE: RecoveryAsk = RecoveryAsk::None;
+    const KEYFRAME: RecoveryAsk = RecoveryAsk::Keyframe;
+
+    fn au(index: u32) -> E {
+        E::Arrived {
+            index,
+            complete: true,
+            decode_order: 0,
+        }
+    }
+
+    fn decoded(flags: u32, evidence: AnchorEvidence) -> E {
+        E::Decoded(Decoded {
+            flags,
+            keyframe: false,
+            evidence,
+            local: LocalRecovery::NONE,
+            decode_order: None,
+        })
+    }
+
+    fn want(admit: bool, hold: bool, forgive_chain: bool, ask: RecoveryAsk) -> RecoveryStep {
+        RecoveryStep {
+            admit,
+            hold,
+            forgive_chain,
+            ask,
+        }
+    }
+
+    /// Replay `rows` (ms from a start, event, expected step) against one engaged driver.
+    fn replay(rows: &[(u64, E, RecoveryStep)]) {
+        let t0 = Instant::now();
+        let mut d = RecoveryDriver::default();
+        d.engage(0);
+        for (i, (ms, ev, expect)) in rows.iter().enumerate() {
+            let got = d.step(*ev, t0 + Duration::from_millis(*ms));
+            assert_eq!(got, *expect, "row {i}: {ev:?} at {ms} ms");
+        }
+    }
+
+    #[test]
+    fn a_fast_anchor_is_not_refrozen_by_the_same_losss_drop_climb() {
+        replay(&[
+            (0, au(100), want(true, false, false, NONE)),
+            (
+                0,
+                au(102),
+                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
+            ),
+            (
+                60,
+                decoded(USER_FLAG_RECOVERY_ANCHOR, CLEAN),
+                want(true, false, false, NONE),
+            ),
+            (
+                120,
+                E::Tick { frames_dropped: 1 },
+                want(true, false, false, NONE),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn an_anchor_the_decoder_refutes_holds_until_the_original_backstop() {
+        replay(&[
+            (0, au(100), want(true, false, false, NONE)),
+            (
+                0,
+                au(102),
+                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
+            ),
+            (
+                60,
+                decoded(USER_FLAG_RECOVERY_ANCHOR, DAMAGED),
+                want(true, true, false, NONE),
+            ),
+            (
+                120,
+                E::Tick { frames_dropped: 1 },
+                want(true, true, false, NONE),
+            ),
+            (
+                499,
+                E::Tick { frames_dropped: 1 },
+                want(true, true, false, NONE),
+            ),
+            (
+                500,
+                E::Tick { frames_dropped: 1 },
+                want(true, true, false, KEYFRAME),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_damaged_chain_on_an_open_gate_holds_and_asks_at_once() {
+        replay(&[
+            (0, au(100), want(true, false, false, NONE)),
+            (0, decoded(0, DAMAGED), want(true, true, false, KEYFRAME)),
+        ]);
+    }
+
+    #[test]
+    fn a_damaged_chain_inside_the_window_waits_for_the_backstop() {
+        replay(&[
+            (0, au(100), want(true, false, false, NONE)),
+            (
+                0,
+                au(102),
+                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
+            ),
+            (
+                60,
+                decoded(USER_FLAG_RECOVERY_ANCHOR, CLEAN),
+                want(true, false, false, NONE),
+            ),
+            (70, decoded(0, DAMAGED), want(true, true, false, NONE)),
+            (
+                569,
+                E::Tick { frames_dropped: 1 },
+                want(true, true, false, NONE),
+            ),
+            (
+                570,
+                E::Tick { frames_dropped: 1 },
+                want(true, true, false, KEYFRAME),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_wave_lift_forgives_the_chain_and_suspends_damage_for_one_frame() {
+        replay(&[
+            (0, au(100), want(true, false, false, NONE)),
+            (
+                0,
+                au(102),
+                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
+            ),
+            (
+                50,
+                decoded(USER_FLAG_RECOVERY_POINT, CLEAN),
+                want(true, true, false, NONE),
+            ),
+            (
+                80,
+                decoded(USER_FLAG_RECOVERY_POINT, CLEAN),
+                want(true, false, true, NONE),
+            ),
+            (
+                90,
+                decoded(USER_FLAG_RECOVERY_ANCHOR, DAMAGED),
+                want(true, false, false, NONE),
+            ),
+            (100, decoded(0, DAMAGED), want(true, true, false, KEYFRAME)),
+        ]);
+    }
+
+    #[test]
+    fn a_straggler_is_dropped_and_a_swallowed_gap_goes_when_the_window_opens() {
+        replay(&[
+            (0, au(100), want(true, false, false, NONE)),
+            (
+                0,
+                au(102),
+                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
+            ),
+            (10, au(101), want(false, true, false, NONE)),
+            (30, au(104), want(true, true, false, NONE)),
+            (
+                100,
+                au(105),
+                want(true, true, false, RecoveryAsk::Rfi(103, 103)),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_keyframe_on_the_tick_drops_the_pending_range() {
+        replay(&[
+            (0, au(100), want(true, false, false, NONE)),
+            (
+                0,
+                au(102),
+                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
+            ),
+            (30, au(104), want(true, true, false, NONE)),
+            (
+                100,
+                E::Tick { frames_dropped: 5 },
+                want(true, true, false, KEYFRAME),
+            ),
+            (
+                101,
+                E::Tick { frames_dropped: 5 },
+                want(true, true, false, NONE),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_no_output_streak_inside_the_window_is_re_asked_by_its_own_backstop() {
+        replay(&[
+            (0, au(100), want(true, false, false, NONE)),
+            (
+                0,
+                au(102),
+                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
+            ),
+            (10, E::NoOutput, want(true, true, false, NONE)),
+            (20, E::NoOutput, want(true, true, false, NONE)),
+            (30, E::NoOutput, want(true, true, false, NONE)),
+            (
+                120,
+                E::Tick { frames_dropped: 1 },
+                want(true, true, false, NONE),
+            ),
+            (
+                529,
+                E::Tick { frames_dropped: 1 },
+                want(true, true, false, NONE),
+            ),
+            (
+                530,
+                E::Tick { frames_dropped: 1 },
+                want(true, true, false, KEYFRAME),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn an_engaged_keyframe_ask_shuts_the_window_for_the_next_gap() {
+        replay(&[
+            (0, au(100), want(true, false, false, NONE)),
+            (0, E::NeedKeyframe, want(true, true, false, KEYFRAME)),
+            (1, au(102), want(true, true, false, NONE)),
+            (
+                100,
+                E::Tick { frames_dropped: 0 },
+                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_lost_au_arms_and_asks_and_the_idr_lifts() {
+        replay(&[
+            (0, au(100), want(true, false, false, NONE)),
+            (0, E::Lost, want(true, true, false, KEYFRAME)),
+            (
+                50,
+                decoded(u32::from(FLAG_SOF), CLEAN),
+                want(true, false, false, NONE),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_client_on_its_own_gate_asks_at_once_and_never_holds() {
+        let t0 = Instant::now();
+        let mut d = RecoveryDriver::default();
+        assert_eq!(d.observe(100, t0), (FrameOrder::InOrder, NONE));
+        assert_eq!(
+            d.step(E::NeedKeyframe, t0),
+            want(true, false, false, KEYFRAME)
+        );
+        assert_eq!(
+            d.observe(102, t0 + Duration::from_millis(1)),
+            (FrameOrder::Gap(1), RecoveryAsk::Rfi(101, 101))
+        );
+        assert_eq!(
+            d.step(E::Tick { frames_dropped: 3 }, t0 + Duration::from_secs(1)),
+            want(true, false, false, NONE)
+        );
+    }
+
+    #[test]
+    fn a_stale_partial_is_dropped_and_a_pyrowave_straggler_is_kept() {
+        let t0 = Instant::now();
+        let mut d = RecoveryDriver::default();
+        d.set_all_intra(true);
+        d.engage(0);
+        let part = |index| E::Arrived {
+            index,
+            complete: false,
+            decode_order: 0,
+        };
+        assert!(d.step(au(100), t0).admit);
+        assert!(d.step(part(101), t0).admit);
+        assert!(
+            !d.step(part(101), t0).admit,
+            "a repeat partial is the stale past"
+        );
+        assert!(
+            d.step(au(101), t0).admit,
+            "a PyroWave straggler still decodes"
+        );
+    }
+
+    #[test]
+    fn a_recovery_point_decoded_before_the_arm_cannot_lift() {
+        let t0 = Instant::now();
+        let mut d = RecoveryDriver::default();
+        d.engage(0);
+        let at = |index, decode_order| E::Arrived {
+            index,
+            complete: true,
+            decode_order,
+        };
+        let point = |decode_order| {
+            E::Decoded(Decoded {
+                flags: 0,
+                keyframe: false,
+                evidence: CLEAN,
+                local: LocalRecovery {
+                    sei_here: true,
+                    is_recovery_point: true,
+                },
+                decode_order: Some(decode_order),
+            })
+        };
+        d.step(at(100, 0), t0);
+        assert!(
+            d.step(at(102, 5), t0).hold,
+            "the gap arms; the watermark is 5"
+        );
+        // A DPB flush hands back a picture decoded before the loss: its SEI is ignored.
+        assert_eq!(d.step(point(5), t0), want(true, true, false, NONE));
+        assert_eq!(d.step(point(6), t0), want(true, false, true, NONE));
     }
 }

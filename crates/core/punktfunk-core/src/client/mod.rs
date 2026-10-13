@@ -70,8 +70,8 @@ use self::frame_channel::{DecodeLatAcc, FrameChannel, FramePop};
 use self::planes::{PlaneRx, RawRumble};
 use self::probe::ProbeState;
 use self::pump::run_pump;
-pub use self::recovery::FrameOrder;
-use self::recovery::{RecentRfis, RecoveryAsk, RfiRecovery, ShortFrames};
+pub use self::recovery::{Decoded, FrameOrder, Shown};
+use self::recovery::{RecentRfis, RecoveryAsk, RecoveryDriver, RecoveryEvent, ShortFrames};
 pub use self::sc2::{Sc2Gate, SC2_GATE_CHORDS, SC2_GATE_MASKED, SC2_GATE_SYSTEM_LOCAL};
 use self::worker::{ClientShared, WorkerArgs};
 
@@ -439,23 +439,14 @@ fn send_rfi(shared: &ClientShared, first_frame: u32, last_frame: u32) -> Result<
     Ok(())
 }
 
-/// Send an IDR ask and drop the lost range an RFI still owes; the IDR repairs it.
-fn send_keyframe(shared: &ClientShared) -> Result<()> {
-    shared.ask_keyframe();
-    shared.rfi.lock().unwrap().keyframe_requested();
-    Ok(())
-}
-
-/// Fire a recovery ask. Call with the `rfi` lock released.
+/// Fire a recovery ask. Call with the `recovery` lock released: the driver already dropped
+/// the range a keyframe repairs.
 fn send_recovery(shared: &ClientShared, ask: RecoveryAsk) {
     match ask {
         RecoveryAsk::Rfi(first, last) => {
             let _ = send_rfi(shared, first, last);
         }
-        // Wider than RFI_MAX_RANGE: RFI cannot repair it; resync on a keyframe.
-        RecoveryAsk::Keyframe => {
-            let _ = send_keyframe(shared);
-        }
+        RecoveryAsk::Keyframe => shared.ask_keyframe(),
         RecoveryAsk::None => {}
     }
 }
@@ -722,6 +713,11 @@ impl NativeClient {
         };
         let welcome = negotiated.welcome;
         *shared.mode.lock().unwrap() = welcome.mode;
+        shared
+            .recovery
+            .lock()
+            .unwrap()
+            .set_all_intra(welcome.codec == crate::quic::CODEC_PYROWAVE);
         let hud = Arc::new(crate::hud::Stats::new(shared.clock_offset.clone()));
         Ok(NativeClient {
             shared,
@@ -839,11 +835,12 @@ impl NativeClient {
             .map_err(|_| PunktfunkError::Closed)
     }
 
-    /// Fire-and-forget IDR. Throttle: decode stays wedged until it lands, so per-frame
-    /// requests flood the control stream. Drops the lost range an RFI still owes; the
-    /// IDR repairs it.
+    /// The decoder needs an IDR: a rebuild, a demotion, a damaged AU. Arms the freeze if it
+    /// is down and asks through the one 100 ms window, so no caller floods the control
+    /// stream. Drops the lost range an RFI still owes; the IDR repairs it.
     pub fn request_keyframe(&self) -> Result<()> {
-        send_keyframe(&self.shared)
+        self.recovery_step(RecoveryEvent::NeedKeyframe, false);
+        Ok(())
     }
 
     /// Recover `[first_frame, last_frame]` by RFI instead of a full IDR. Capable hosts emit a
@@ -871,7 +868,7 @@ impl NativeClient {
         // Update under the lock; fire the request after releasing it.
         let (order, ask) = self
             .shared
-            .rfi
+            .recovery
             .lock()
             .unwrap()
             .observe(frame_index, Instant::now());
@@ -884,8 +881,56 @@ impl NativeClient {
     /// the next arrival; [`observe_frame_index`](Self::observe_frame_index) sends it
     /// there too.
     pub fn flush_frame_recovery(&self) {
-        let ask = self.shared.rfi.lock().unwrap().flush(Instant::now());
+        let ask = self.shared.recovery.lock().unwrap().flush(Instant::now());
         send_recovery(&self.shared, ask);
+    }
+
+    /// One AU before decode, in receive order. `false`: drop it — a straggler a reference
+    /// decoder rewinds on, or a partial a newer frame beat. A gap arms the freeze and asks
+    /// for the lost range from here. `decode_order` is the decoder's count so far, the
+    /// watermark a recovery SEI is paired against.
+    pub fn recovery_on_frame(&self, frame: &Frame, decode_order: u64) -> bool {
+        let arrived = RecoveryEvent::Arrived {
+            index: frame.frame_index,
+            complete: frame.complete,
+            decode_order,
+        };
+        self.recovery_step(arrived, true).admit
+    }
+
+    /// One decoded picture: whether to show it, and whether the lift came from an
+    /// intra-refresh heal the decoder's reference ledger cannot see.
+    pub fn recovery_on_decoded(&self, decoded: Decoded) -> Shown {
+        let step = self.recovery_step(RecoveryEvent::Decoded(decoded), true);
+        Shown {
+            hold: step.hold,
+            forgive_chain: step.forgive_chain,
+        }
+    }
+
+    /// One AU produced no picture: a wedged decoder with no reassembler drop. Three in a
+    /// row arm the freeze and ask for an IDR.
+    pub fn recovery_on_no_output(&self) {
+        self.recovery_step(RecoveryEvent::NoOutput, true);
+    }
+
+    /// A loss the index gap cannot see (a parked AU overflowed, a wedge): arm and ask.
+    pub fn recovery_lost(&self) {
+        self.recovery_step(RecoveryEvent::Lost, true);
+    }
+
+    /// Fold one event under the lock and send what it asks for. An embedder's `report`
+    /// makes the driver's gate live from the first one; the pump's tick then asks for it.
+    fn recovery_step(&self, ev: RecoveryEvent, report: bool) -> recovery::RecoveryStep {
+        let step = {
+            let mut r = self.shared.recovery.lock().unwrap();
+            if report {
+                r.engage(self.shared.frames_dropped.load(Ordering::Relaxed));
+            }
+            r.step(ev, Instant::now())
+        };
+        send_recovery(&self.shared, step.ask);
+        step
     }
 
     /// [`observe_frame_index`](Self::observe_frame_index) as the gap width, `0` when none.
