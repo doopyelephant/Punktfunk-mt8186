@@ -115,7 +115,7 @@ The drivers carry a separate self-signed certificate (`CN=punktfunk-driver`, SHA
   10 MB. Only Administrators can read them, so use an elevated PowerShell or the console's
   **Troubleshooting** page. `RUST_LOG=debug` in `host.env` adds detail.
 - **Seats for several people.** A seat per person needs **Windows Server** and a Remote Desktop
-  Services CAL for every player. Windows 11 runs one desktop at a
+  Services CAL for every player. [Windows 11](/docs/windows-seats#windows-11) runs one desktop at a
   time. See [Seats on Windows](/docs/windows-seats).
 - **Two processes.** Task Manager shows two `punktfunk-host.exe`: the service and the worker it
   starts in your session. Ending the worker only makes the service start another; stop the host

@@ -6,11 +6,13 @@ description: Let several people play on one Windows Server PC at once, each on a
 A seat gives a [profile](/docs/profiles) a Windows desktop of its own, so two to four people can
 play on one PC at the same time, each with their own games, Steam and saves.
 
+Seats need **Windows Server**. [Windows 11](#windows-11) runs one desktop at a time.
+
 ## What you need
 
 | | |
 |---|---|
-| Windows | **Windows Server 2025** or newer, installed with Desktop Experience. Windows 10 and 11 run one desktop at a time. |
+| Windows | **Windows Server 2025** or newer, installed with Desktop Experience. |
 | Visual C++ runtime | The [Visual C++ Redistributable (x64)](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist). A fresh Windows Server lacks it, and setup doesn't start without it. |
 | Graphics card | One that encodes video, as for any host, with its driver installed. All seats share it. |
 | Remote Desktop | The **Remote Desktop Session Host** role with a licensing mode. **Set up Remote Desktop** below installs both. |
@@ -84,6 +86,21 @@ games. Seats install nothing twice: their Steam lists the PC's game folders firs
 
 Don't pin `steam.exe` from `C:\Program Files (x86)\Steam` on a seat, or start it from File Explorer:
 that starts the PC's Steam and closes the other one.
+
+## Windows 11
+
+Windows 11 runs one desktop at a time, so everyone there plays on the owner's: under **Add
+profile**, pick **Shares Alex's desktop**, with your name. Turning seats on answers `Seats need
+Windows Server — this is a desktop edition of Windows.`
+
+The limit is Microsoft's. The [licence terms](https://www.microsoft.com/en-us/useterms) Windows 11
+comes with license it "for use by one person at a time" and don't allow anyone to "work around any
+technical restrictions or limitations in the software".
+
+Tools that lift the limit exist, TermWrap and other Remote Desktop wrappers among them. Using one
+breaks those terms. punktfunk doesn't include, install or recommend one. On a PC that has one,
+seats turn on with this warning and without support: `A Remote Desktop wrapper lets this desktop
+edition of Windows run seats. Only Windows Server is supported.`
 
 ## Troubleshooting
 
