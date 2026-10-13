@@ -5,6 +5,7 @@
 //! `plugin-access-pending.json` holds requests a plugin posted that await a decision. Both are
 //! written tmp+rename and re-read on every operation, so a CLI write is never stale here. A
 //! grants file that can't be read is never replaced: every write and listing fails, naming it.
+//! Each read-modify-write holds `plugin-access.lock`, so the service and the CLI lose no update.
 //!
 //! The runner binds these roots (read-only unless `write`); a plugin can ask, never grant —
 //! every request is validated against the real filesystem before it is stored. On Linux the
@@ -114,6 +115,8 @@ pub struct Mutation<T> {
 
 const GRANTS_FILE: &str = "plugin-grants.json";
 const PENDING_FILE: &str = "plugin-access-pending.json";
+/// Beside the pending file. Empty: only its lock matters ([`AccessStore::exclusive`]).
+const LOCK_FILE: &str = "plugin-access.lock";
 const MAX_PATH: usize = 4096;
 
 /// The v1 entry was a bare path list; those grants were read-write in the runner, so on
@@ -539,6 +542,36 @@ impl AccessStore {
         }
     }
 
+    /// One read-modify-write, alone: this store's mutex, then an exclusive lock on a sidecar
+    /// file, which every store on this directory takes — the service's, a CLI `plugins
+    /// grant`'s. Held until the pair drops; the OS frees it when a holder dies.
+    #[allow(
+        clippy::incompatible_msrv,
+        reason = "`File::lock` is 1.89; rust-toolchain.toml pins 1.96"
+    )]
+    fn exclusive(&self) -> io::Result<(std::sync::MutexGuard<'_, ()>, std::fs::File)> {
+        let guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let path = self.config_dir.join(LOCK_FILE);
+        let open = || {
+            std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+        };
+        let file = match open() {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                pf_paths::create_private_dir(&self.config_dir)?;
+                open()
+            }
+            opened => opened,
+        };
+        let file = file
+            .and_then(|f| f.lock().map(|()| f))
+            .map_err(|e| io::Error::other(format!("lock {}: {e}", path.display())))?;
+        Ok((guard, file))
+    }
+
     /// The grants file, fresh — a `plugins grant` from another process must be seen. No file
     /// is no grants. One that can't be read or parsed is an error naming it, so a caller that
     /// writes stops before it replaces the file.
@@ -606,7 +639,7 @@ impl AccessStore {
         paths: &[(String, bool)],
         reason: Option<String>,
     ) -> io::Result<Mutation<Vec<RequestOutcome>>> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.exclusive()?;
         let mut access = self.load_access()?;
         let mut pending_all = self.load_pending();
         let declared: Vec<(PathBuf, bool)> = crate::plugins::manifest::for_provider(id)
@@ -788,7 +821,7 @@ impl AccessStore {
         core: Option<&str>,
         saves: bool,
     ) -> io::Result<Mutation<RequestOutcome>> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.exclusive()?;
         let access = self.load_access()?;
         let mut pending_all = self.load_pending();
         let canon = path.to_string_lossy().into_owned();
@@ -888,7 +921,7 @@ impl AccessStore {
         decision: Decision,
         by: &str,
     ) -> io::Result<Mutation<PluginAccessSnapshot>> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.exclusive()?;
         let stored_path = resolve_stored(path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1134,7 +1167,7 @@ impl AccessStore {
         form: &str,
         keep: &[String],
     ) -> io::Result<Mutation<Vec<Grant>>> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.exclusive()?;
         let kept: Vec<String> = keep.iter().flat_map(|p| grant_keys(Path::new(p))).collect();
         let mut access = self.load_access()?;
         let Some(entry) = access.get_mut(id) else {
@@ -1178,7 +1211,7 @@ impl AccessStore {
         by: &str,
         form: Option<&str>,
     ) -> io::Result<Vec<Grant>> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.exclusive()?;
         if !dir.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1247,7 +1280,7 @@ impl AccessStore {
     /// Remove a grant by its stored absolute spelling — no canonicalize, so an unplugged
     /// drive's grant still comes off. A no-op revoke writes nothing.
     pub fn revoke(&self, id: &str, path: &Path) -> io::Result<Vec<Grant>> {
-        let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.exclusive()?;
         let stored = resolve_stored(&path.to_string_lossy()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1967,6 +2000,24 @@ mod tests {
         assert!(s.grants_for("demo").is_empty());
         assert!(!s.may_write("demo", &roms));
         assert!(s.runner_roots(&BTreeMap::new()).is_empty());
+    }
+
+    /// Each store has a mutex of its own, as each process does; the file lock is what they
+    /// share. Eight granting at once into a directory none has made yet lose no grant.
+    #[test]
+    fn stores_on_one_directory_lose_no_grant() {
+        let f = fixture();
+        let root = f.store_dir.join("fresh");
+        let dirs: Vec<PathBuf> = (0..8).map(|i| f.dir(&format!("grants/g{i}"))).collect();
+        std::thread::scope(|scope| {
+            for dir in &dirs {
+                let store = AccessStore::open_with(root.clone(), f.policy.clone());
+                scope.spawn(move || store.grant("demo", dir, false, "cli").map(drop).unwrap());
+            }
+        });
+        let store = AccessStore::open_with(root.clone(), f.policy.clone());
+        assert_eq!(store.grants_for("demo").len(), dirs.len());
+        assert!(root.join(LOCK_FILE).is_file());
     }
 
     #[test]
