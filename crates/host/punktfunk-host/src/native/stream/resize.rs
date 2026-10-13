@@ -3,6 +3,7 @@
 
 use super::pipeline::{display_mode_for, open_session_encoder, pacing_hz};
 use super::state::StreamState;
+use super::swap::{Next, SwapReason};
 use super::*;
 
 impl StreamState {
@@ -71,7 +72,7 @@ impl StreamState {
                     enc_of.enc_kbps(bitrate_kbps) as u64 * 1000,
                     self.bit_depth,
                     self.client_hdr,
-                    self.au_seq,
+                    self.clock.au_seq,
                 ) {
                     Ok(e) => break Some(e),
                     Err(e) => {
@@ -154,14 +155,11 @@ impl StreamState {
             new_frame
         };
         trace.mark("first_new_frame");
-        let new_enc = match pre_opened {
-            Some(e) => {
-                self.adopt_reframe(punktfunk_core::video_fit::Reframe::full((
-                    new_frame.width,
-                    new_frame.height,
-                )));
-                e
-            }
+        let (enc, reframe) = match pre_opened {
+            Some(e) => (
+                e,
+                punktfunk_core::video_fit::Reframe::full((new_frame.width, new_frame.height)),
+            ),
             None => match open_session_encoder(
                 &self.plan,
                 &*self.capturer,
@@ -171,12 +169,9 @@ impl StreamState {
                 |_, _| enc_of.enc_kbps(bitrate_kbps) as u64 * 1000,
                 self.bit_depth,
                 self.client_hdr,
-                self.au_seq,
+                self.clock.au_seq,
             ) {
-                Ok((e, reframe)) => {
-                    self.adopt_reframe(reframe);
-                    e
-                }
+                Ok(opened) => opened,
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"),
                         "resize: encoder open failed after the in-place mode set - full rebuild");
@@ -184,11 +179,18 @@ impl StreamState {
                 }
             },
         };
-        self.enc = new_enc;
-        self.carry_pipelining();
-        self.frame = new_frame;
-        self.epoch = self.epoch.wrapping_add(1);
-        self.interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
+        let interval = std::time::Duration::from_secs_f64(1.0 / effective_hz.max(1) as f64);
+        let why = if recover_ring {
+            SwapReason::TopologyReassert
+        } else {
+            SwapReason::ModeSwitch
+        };
+        let next = Next::Encoder {
+            enc,
+            reframe,
+            resized: Some((new_frame, interval)),
+        };
+        self.swap_pipeline(next, why);
         trace.mark("encoder_open");
         true
     }

@@ -4,6 +4,7 @@
 //!
 //! - `rebuild.rs`: session switch, mode switch, topology re-assert, capture loss, source-mode
 //!   follow — everything that swaps the pipeline under the loop.
+//! - `swap.rs`: the swap itself, and what restarts with an encoder.
 //! - `recovery.rs`: FEC/bitrate re-derivation and the keyframe/RFI coalescing.
 //! - `encode.rs`: capture tick, submit, poll, stall watch, depth adaptation, pacing sleep.
 //! - `cursor.rs`: cursor forwarding, host composite, the seat-pointer park.
@@ -40,6 +41,49 @@ pub(super) enum Flow {
     Break,
 }
 
+/// What the wire is owed and when the encoder last answered.
+pub(super) struct AuClock {
+    /// Predicted as `au_seq + inflight.len()`. Encoder-internal counters desync on the first ABR rebuild.
+    pub(super) au_seq: u32,
+    /// A chunked AU's FIRST went out and its LAST has not: `au_seq` still names that frame.
+    pub(super) wire_frame_open: bool,
+    pub(super) inflight: Inflight,
+    pub(super) watchdog: crate::encode_recovery::EncoderWatchdog,
+    /// The last IDR the loop forced or opened on. The keyframe cooldown counts from it.
+    pub(super) last_forced_idr: Option<std::time::Instant>,
+}
+
+/// The escalation ladder `adapt_depth` climbs when encode cannot hold cadence: capturer depth
+/// first, then the encoder's pipelined retrieve, wound back after a clean run.
+pub(super) struct Pipelining {
+    pub(super) cur_depth: usize,
+    pub(super) behind_score: u32,
+    pub(super) depth_frames: u64,
+    pub(super) pipeline_asked: bool,
+    pub(super) pipelined_active: bool,
+    pub(super) deescalating: bool,
+    pub(super) ahead_run: u32,
+    pub(super) deescalate_not_before: Option<std::time::Instant>,
+    pub(super) deescalate_backoff: std::time::Duration,
+}
+
+/// Adaptive FEC as the encode loop holds it: the control task proposes, and parity is applied
+/// behind the encoder rate it leaves room for.
+pub(super) struct FecState {
+    /// The control task's proposal.
+    pub(super) requested: Arc<AtomicU8>,
+    /// Applied FEC: what the packetizer and [`StreamState::enc_now`] run at.
+    pub(super) target: Arc<AtomicU8>,
+    /// `target` as this loop last published it.
+    pub(super) last: u8,
+    /// A proposal an asynchronous encoder was asked to make room for: the parity and the
+    /// encoder rate it implies, kbps. Parity waits for the encoder to settle.
+    pub(super) pending: Option<(u8, u32)>,
+    /// The proposal a hold was last logged for, so one the control task re-proposes every
+    /// window logs once.
+    pub(super) hold_logged: u8,
+}
+
 pub(super) struct StreamState {
     // ---- loop bookkeeping ----
     pub(super) deadline: std::time::Instant,
@@ -47,16 +91,11 @@ pub(super) struct StreamState {
     pub(super) sent: u64,
     /// Survives in-loop rebuilds: a rebuild must not reopen the overshoot.
     pub(super) pace: CaptureCredit,
-    /// Predicted as `au_seq + inflight.len()`. Encoder-internal counters desync on the first ABR rebuild.
-    pub(super) au_seq: u32,
-    /// A chunked AU's FIRST went out and its LAST has not: `au_seq` still names that frame.
-    pub(super) wire_frame_open: bool,
+    pub(super) clock: AuClock,
     pub(super) capture_rebuilds: u32,
     /// Topology re-assert generation this loop last saw. Only Windows IDD-push moves it.
     pub(super) seen_reassert_gen: u64,
-    pub(super) watchdog: crate::encode_recovery::EncoderWatchdog,
     pub(super) last_hdr_meta: Option<pf_frame::HdrMeta>,
-    pub(super) inflight: Inflight,
     /// NEW source frames / REPEATS / cursor REGENS since `diag_at`. Logged every 2 s under `PUNKTFUNK_PERF`.
     pub(super) diag_new: u64,
     pub(super) diag_repeat: u64,
@@ -71,7 +110,6 @@ pub(super) struct StreamState {
     /// Each host-composite outcome is logged once.
     #[cfg_attr(windows, allow(dead_code, reason = "Windows never composites"))]
     pub(super) composite_log: super::cursor::CompositeLog,
-    pub(super) last_forced_idr: Option<std::time::Instant>,
     /// Never re-anchors the IDR cooldown: sustained loss + RFI would swallow IDR pleas forever.
     pub(super) last_rfi: Option<std::time::Instant>,
     pub(super) loss_mode: super::recovery::LossMode,
@@ -87,10 +125,8 @@ pub(super) struct StreamState {
     pub(super) st_queue: Vec<u32>,
     /// The Windows driver's pool drops, handed to the send thread's recorder sample.
     pub(super) driver_dropped: Arc<AtomicU64>,
-    pub(super) cur_depth: usize,
-    pub(super) behind_score: u32,
-    pub(super) last_fec: u8,
-    pub(super) depth_frames: u64,
+    pub(super) pipelining: Pipelining,
+    pub(super) fec: FecState,
     /// EMA of real-frame arrivals. Negotiated refresh is the wrong deadline when the game is slower.
     pub(super) src_period_ns: Option<u64>,
     /// Longest host submit+poll chain observed this tick, independent of perf sampling.
@@ -99,19 +135,13 @@ pub(super) struct StreamState {
     pub(super) was_degraded: bool,
     pub(super) last_cadence_log: Option<std::time::Instant>,
     pub(super) cadence_flips_suppressed: u32,
-    pub(super) pipeline_asked: bool,
-    pub(super) pipelined_active: bool,
-    pub(super) deescalating: bool,
-    pub(super) ahead_run: u32,
-    pub(super) deescalate_not_before: Option<std::time::Instant>,
-    pub(super) deescalate_backoff: std::time::Duration,
 
     // ---- teardown order, which is field order: the status registration ends first, then
     // the send thread, then game policy, then capture, encoder, display ----
-    _watcher: Option<std::thread::JoinHandle<()>>,
+    pub(super) _watcher: Option<std::thread::JoinHandle<()>>,
     /// `Some(joined)` on the seat's own session, which follows the seat's mode.
     #[cfg(target_os = "linux")]
-    seat_join: Option<bool>,
+    pub(super) seat_join: Option<bool>,
     pub(super) live_session: crate::session_status::LiveSessionGuard,
     // ---- the send thread ----
     /// The one strong handle: a client's NACK reaches the send thread through a weak one,
@@ -134,7 +164,8 @@ pub(super) struct StreamState {
     pub(super) cur_node_id: u32,
     pub(super) cur_display_gen: Option<u64>,
     /// The `punktfunk/2` stream epoch every AU from now on carries. It moves whenever the
-    /// pipeline or the mode under it changes, so a client drops what was encoded before.
+    /// pipeline or the mode under it changes, so a client drops what was encoded before. A
+    /// rate rebuild keeps it: the same picture at the same mode.
     pub(super) epoch: u8,
     /// The live output's metadata for a capture-only rebuild (`on_capture_lost`).
     #[cfg(target_os = "linux")]
@@ -191,23 +222,12 @@ pub(super) struct StreamState {
     pub(super) bringup: Arc<crate::bringup::Trace>,
     pub(super) resize_ms: Arc<AtomicU32>,
     pub(super) stats: Arc<StatsRecorder>,
-    /// Applied FEC: what the packetizer and [`Self::enc_now`] run at.
-    pub(super) fec_target: Arc<AtomicU8>,
-    /// Control task's proposal; applied only after the encoder takes its rate.
-    pub(super) fec_requested: Arc<AtomicU8>,
     pub(super) live_bitrate: Arc<AtomicU32>,
     pub(super) encoder_ceiling: Arc<std::sync::Mutex<EncoderCeiling>>,
     /// A rate was handed to this encoder after it opened, so a later read-back
     /// is about that retarget. What a pipeline opened at is the build's own
     /// business (`Pipeline::bitrate_kbps`), and is not re-litigated here.
     pub(super) retargeted: bool,
-    /// A FEC proposal an asynchronous encoder was asked to make room for: the
-    /// parity and the encoder rate it implies, kbps. Parity waits for the
-    /// encoder to settle.
-    pub(super) fec_pending: Option<(u8, u32)>,
-    /// The proposal a hold was last logged for, so a refusal the control task
-    /// re-proposes every window logs once.
-    pub(super) fec_hold_logged: u8,
     pub(super) cadence_degraded: Arc<AtomicBool>,
     pub(super) cadence_behind_score: Arc<AtomicU32>,
     pub(super) client_packets_received: Arc<AtomicU32>,
@@ -248,86 +268,23 @@ impl StreamState {
 
     /// [`Self::enc_derive`] at the FEC target in force now.
     pub(super) fn enc_now(&self) -> EncDerive {
-        self.enc_derive(self.fec_target.load(Ordering::Relaxed))
-    }
-
-    /// Swap the built pipeline in and forget every owed AU and the last forwarded cursor shape:
-    /// a new capturer numbers its shapes from 1 again. The clipboard follows the new capture's
-    /// gamescope. The caller retires the old lease, re-arms the IDR clock, and re-reads
-    /// `enc_src` as its path requires.
-    pub(super) fn adopt_pipeline(&mut self, p: Pipeline) {
-        self.epoch = self.epoch.wrapping_add(1);
-        // A ceiling was learned from the encoder this one replaces. It survives
-        // a rebuild that opens on the same source; a different geometry or
-        // format is a different encoder, whose limits are unknown again.
-        if (p.frame.format, p.frame.width, p.frame.height)
-            != (self.frame.format, self.frame.width, self.frame.height)
-        {
-            self.encoder_ceiling
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-        }
-        self.retargeted = false;
-        self.fec_pending = None;
-        self.adopt_reframe(p.reframe);
-        self.capturer = p.capturer;
-        if let Some(fwd) = self.cursor_fwd.as_mut() {
-            *fwd = super::super::cursor_fwd::CursorForwarder::new();
-        }
-        self.enc = p.enc;
-        self.carry_pipelining();
-        self.frame = p.frame;
-        self.interval = p.interval;
-        self.cur_node_id = p.node_id;
-        self.cur_display_gen = p.display_gen;
-        #[cfg(target_os = "linux")]
-        {
-            publish_gamescope_xwayland(&self.gamescope_xwayland, p.lease.as_ref());
-            self.lease = p.lease;
-            self.restamp = p.panel_tick_ns.map(super::encode::SourceStamps::new);
-        }
-        self.inflight.clear();
-        self.watchdog.on_au();
+        self.enc_derive(self.fec.target.load(Ordering::Relaxed))
     }
 
     /// Close a frame whose tail never came, as the loop does at the next first chunk, before a
     /// replacement encoder opens at `au_seq`. Left to the loop, that close would land after the
     /// new encoder numbered its first AU, one behind the wire for the rest of the session.
     pub(super) fn close_open_frame(&mut self) {
-        if std::mem::take(&mut self.wire_frame_open) {
-            if self.inflight.len() > 1 {
-                self.inflight.pop_front();
+        if std::mem::take(&mut self.clock.wire_frame_open) {
+            if self.clock.inflight.len() > 1 {
+                self.clock.inflight.pop_front();
             }
-            self.au_seq = self.au_seq.wrapping_add(1);
-        }
-    }
-
-    /// A fresh encoder retrieves synchronously. The session's pipelined escalation carries onto
-    /// it, or the flags claim a mode the encoder is not in and escalation never fires again.
-    pub(super) fn carry_pipelining(&mut self) {
-        if self.deescalating {
-            // The wind-back the old encoder owed: the new one is already there.
-            self.deescalating = false;
-            self.pipelined_active = false;
-            self.pipeline_asked = false;
-        } else if self.pipelined_active {
-            self.pipelined_active = self.enc.set_pipelined(true);
-        } else {
-            // A refusal was the old encoder's; this one may say yes.
-            self.pipeline_asked = false;
+            self.clock.au_seq = self.clock.au_seq.wrapping_add(1);
         }
     }
 
     pub(super) fn adopt_reframe(&self, reframe: punktfunk_core::video_fit::Reframe) {
         *self.frame_map.lock().unwrap_or_else(|e| e.into_inner()) = reframe;
-    }
-
-    /// Lease drop looks like a disconnect to keep-alive; retire or linger accumulates.
-    pub(super) fn retire_replaced_gen(&self, old: Option<u64>) {
-        if let Some(g) = old.filter(|g| self.cur_display_gen != Some(*g)) {
-            crate::vdisplay::registry::retire(g);
-        }
     }
 
     /// A rebuild re-resolved what it encodes. Noted for the summary's bitrate span: the
@@ -776,13 +733,9 @@ impl StreamState {
             bringup,
             resize_ms,
             stats,
-            fec_target: fec_target.clone(),
-            fec_requested: fec_requested.clone(),
             live_bitrate,
             encoder_ceiling,
             retargeted: false,
-            fec_pending: None,
-            fec_hold_logged: 0,
             cadence_degraded,
             cadence_behind_score,
             client_packets_received,
@@ -838,13 +791,17 @@ impl StreamState {
             next: now,
             sent: 0,
             pace: CaptureCredit::new(now),
-            au_seq: 0,
-            wire_frame_open: false,
+            clock: AuClock {
+                au_seq: 0,
+                wire_frame_open: false,
+                inflight: Inflight::new(),
+                watchdog: crate::encode_recovery::EncoderWatchdog::new(),
+                // The pipeline opened on an IDR: the cold-GOP keyframe asks coalesce into it.
+                last_forced_idr: Some(now),
+            },
             capture_rebuilds: 0,
             seen_reassert_gen: crate::windows::idd::topology_reassert_gen(),
-            watchdog: crate::encode_recovery::EncoderWatchdog::new(),
             last_hdr_meta: None,
-            inflight: Inflight::new(),
             diag_new: 0,
             diag_repeat: 0,
             diag_regen: 0,
@@ -856,8 +813,6 @@ impl StreamState {
             #[cfg(target_os = "linux")]
             next_park_at: now,
             composite_log: super::cursor::CompositeLog::default(),
-            // Pipeline opened on an IDR — start the clock so the cold-GOP keyframe storm coalesces.
-            last_forced_idr: Some(now),
             last_rfi: None,
             loss_mode: Default::default(),
             acked,
@@ -870,22 +825,30 @@ impl StreamState {
             st_wait: Vec::new(),
             st_queue: Vec::new(),
             driver_dropped,
-            cur_depth: 1,
-            behind_score: 0,
-            last_fec: fec_target.load(Ordering::Relaxed),
-            depth_frames: 0,
+            pipelining: Pipelining {
+                cur_depth: 1,
+                behind_score: 0,
+                depth_frames: 0,
+                pipeline_asked: false,
+                pipelined_active: false,
+                deescalating: false,
+                ahead_run: 0,
+                deescalate_not_before: None,
+                deescalate_backoff: super::encode::DEESCALATE_BACKOFF_START,
+            },
+            fec: FecState {
+                last: fec_target.load(Ordering::Relaxed),
+                requested: fec_requested,
+                target: fec_target,
+                pending: None,
+                hold_logged: 0,
+            },
             src_period_ns: None,
             encode_chain_ns: 0,
             last_real_cap: None,
             was_degraded: false,
             last_cadence_log: None,
             cadence_flips_suppressed: 0,
-            pipeline_asked: false,
-            pipelined_active: false,
-            deescalating: false,
-            ahead_run: 0,
-            deescalate_not_before: None,
-            deescalate_backoff: super::encode::DEESCALATE_BACKOFF_START,
             live_session,
             _watcher: None,
             #[cfg(target_os = "linux")]
@@ -1317,7 +1280,7 @@ fn launch_verdict(
 /// Point the clipboard at the gamescope behind `lease`. A lease with no seat is the box's own
 /// gamescope, which the unscoped lookup finds; a non-gamescope session never reads this.
 #[cfg(target_os = "linux")]
-fn publish_gamescope_xwayland(
+pub(super) fn publish_gamescope_xwayland(
     xwayland: &pf_clipboard::GamescopeXwayland,
     lease: Option<&crate::capture::OutputLease>,
 ) {

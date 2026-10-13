@@ -25,6 +25,7 @@ mod resize;
 mod send;
 mod session_watch;
 mod state;
+mod swap;
 mod synth_abr;
 pub(super) use self::pipeline::{prepare_display, PrepHandle, PreparedDisplay};
 // `control.rs` bounds its spacing exemption by the same step length.
