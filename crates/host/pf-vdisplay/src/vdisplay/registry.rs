@@ -1619,20 +1619,17 @@ mod linux {
             .unwrap_or(0)
     }
 
-    /// Linger from console `keep_alive`, for the device that owns this display.
-    ///
-    /// A per-device overlay is the reason this takes a slot rather than reading the host
-    /// policy flat: the TV keeps its screen forever while the tablet's goes at once, and
-    /// teardown is where that difference has to land (§6.1). A slot with no recorded owner
-    /// is shared or anonymous and follows the host, which is the right answer.
-    ///
-    /// Absent config is still `Immediate` — an unconfigured host tears down on disconnect.
+    /// Linger for the device that owns this display ([`policy::resolve_linger`]). A slot with
+    /// no recorded owner is shared or anonymous and follows the host. Unconfigured: teardown
+    /// at once, whatever `PUNKTFUNK_MONITOR_LINGER_MS` says.
     fn linger_for(identity_slot: Option<u32>) -> Linger {
         let fp = crate::identity::slot_owner(identity_slot);
-        policy::prefs()
-            .configured()
-            .map(|p| p.effective_for(fp.as_deref()).keep_alive.linger())
-            .unwrap_or(Linger::Immediate)
+        policy::resolve_linger(
+            policy::prefs().configured().as_ref(),
+            fp.as_deref(),
+            None,
+            Linger::Immediate,
+        )
     }
 
     /// Do not wrap `spawn` in `Once` and discard `Result`: a failed spawn
