@@ -302,7 +302,7 @@ pub type DualSenseEdgeManager = UhidManager<DsEdgeLinuxProto>;
 mod tests {
     use super::*;
     use punktfunk_core::quic::HidOutput;
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::AsFd;
     use std::time::{Duration, Instant};
 
     fn find_nodes(name: &str) -> Vec<(String, String)> {
@@ -331,10 +331,8 @@ mod tests {
         let mut bits = [0u8; 8];
         // EVIOCGBIT(0, 8) event-type bitmap.
         let req: libc::c_ulong = (2 << 30) | (8 << 16) | (0x45 << 8) | 0x20;
-        // SAFETY: EVIOCGBIT(0) copies at most 8 bytes (EV_MAX/8 < 8) into the live `bits` buffer
-        // behind the valid evdev fd `f`; the kernel never writes past the ioctl's size argument.
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req as _, bits.as_mut_ptr()) };
-        rc >= 0 && (bits[0x15 / 8] >> (0x15 % 8)) & 1 == 1
+        let read = crate::uapi::ioctl_with(f.as_fd(), req, &mut bits);
+        read.is_ok() && (bits[0x15 / 8] >> (0x15 % 8)) & 1 == 1
     }
 
     /// Play FF_RUMBLE on `node` (SDL evdev haptic). Hold the fd: close erases the effect and stops rumble.
@@ -354,12 +352,7 @@ mod tests {
         eff[18..20].copy_from_slice(&weak.to_ne_bytes());
         // EVIOCSFF = _IOW('E', 0x80, struct ff_effect)
         let req: libc::c_ulong = (1 << 30) | (48 << 16) | (0x45 << 8) | 0x80;
-        // SAFETY: EVIOCSFF reads/writes the 48-byte ff_effect behind the valid fd `f`; `eff` is
-        // exactly sizeof(struct ff_effect) and outlives the synchronous call.
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), req as _, eff.as_mut_ptr()) };
-        if rc < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        crate::uapi::ioctl_with(f.as_fd(), req, &mut eff)?;
         let id = i16::from_ne_bytes([eff[2], eff[3]]);
         // struct input_event (24 B on 64-bit): timeval 16, type u16, code u16, value s32.
         let mut ev = [0u8; 24];

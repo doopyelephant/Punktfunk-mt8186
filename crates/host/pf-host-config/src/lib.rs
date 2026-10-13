@@ -16,6 +16,7 @@ pub mod listen;
 pub mod os_release;
 pub mod registry;
 pub mod seat_defaults;
+pub mod session;
 mod store;
 
 pub use store::{

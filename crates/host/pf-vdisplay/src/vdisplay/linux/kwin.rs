@@ -687,8 +687,11 @@ fn kscreen_ok(args: &[String]) -> bool {
 /// waits on the compositor, so a slow KWin yields a kill on a request that already
 /// landed; treating `None` as failure costs a monitor its refresh on the restore path.
 pub(crate) fn kscreen_verdict(args: &[String]) -> Option<bool> {
+    // kscreen-doctor is a Wayland client: it gets the live session's socket.
+    let mut doctor = std::process::Command::new("kscreen-doctor");
+    doctor.args(args);
     match crate::proc::status_within(
-        std::process::Command::new("kscreen-doctor").args(args),
+        pf_host_config::session::export_to(&mut doctor),
         KSCREEN_BUDGET,
     ) {
         Ok(status) => Some(status.success()),
@@ -698,8 +701,10 @@ pub(crate) fn kscreen_verdict(args: &[String]) -> Option<bool> {
 }
 
 fn kscreen_json_bytes() -> Option<Vec<u8>> {
+    let mut doctor = std::process::Command::new("kscreen-doctor");
+    doctor.arg("-j");
     crate::proc::output_within(
-        std::process::Command::new("kscreen-doctor").arg("-j"),
+        pf_host_config::session::export_to(&mut doctor),
         KSCREEN_BUDGET,
     )
     .ok()
@@ -1629,8 +1634,7 @@ mod capability_hint_tests {
 /// Readiness probe: connect, roundtrip the registry, confirm `zkde_screencast` is
 /// advertised. `Ok(())` = ready; `Err` = not ready / no global yet.
 pub fn probe() -> Result<()> {
-    let conn = Connection::connect_to_env()
-        .context("connect to KWin Wayland (is WAYLAND_DISPLAY set to the KWin socket?)")?;
+    let conn = crate::session::wayland_connect().context("connect to KWin Wayland")?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
@@ -1670,8 +1674,7 @@ fn run_existing(
     // The opener started its clock a moment ago; work before `await_created` comes
     // out of the same 20 s (this path has two barriers — see [`CREATE_BUDGET`]).
     let started = Instant::now();
-    let conn = Connection::connect_to_env()
-        .context("connect to KWin Wayland (is WAYLAND_DISPLAY set to the KWin socket?)")?;
+    let conn = crate::session::wayland_connect().context("connect to KWin Wayland")?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
@@ -1763,8 +1766,7 @@ fn run(
     // Same clock as the mirror path: one barrier here, but the create wait is
     // bounded against the opener either way (see [`CREATE_BUDGET`]).
     let started = Instant::now();
-    let conn = Connection::connect_to_env()
-        .context("connect to KWin Wayland (is WAYLAND_DISPLAY set to the KWin socket?)")?;
+    let conn = crate::session::wayland_connect().context("connect to KWin Wayland")?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
