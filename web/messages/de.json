@@ -917,6 +917,7 @@
 	"display_arrange_hint": "Ziehe einen gestreamten Bildschirm an seinen Platz.",
 	"display_stream_this": "Diesen Monitor streamen",
 	"display_stream_virtual": "Jedem Gerät einen eigenen Bildschirm",
+	"display_stream_this_hint": "Ein gestreamter Monitor wird jedem Gerät gezeigt, statt eines eigenen Bildschirms. Erneut drücken macht das rückgängig.",
 	"common_done": "Fertig",
 	"common_on": "An",
 	"common_off": "Aus",
