@@ -22,8 +22,8 @@
 use super::audio_control;
 use super::devnode_api::{
     bind_driver, create_media_devnode, devnode_inf_path, devnode_multi_sz_prop, instance_id,
-    media_class_devs, pv_blob, pv_bytes, pv_clsid, pv_guid, pv_lpwstr, pv_string,
-    read_devparam_dword, wide, write_devparam_dword, DevInfoSet,
+    media_class_devs, pv_bytes, pv_guid, pv_string, read_devparam_dword, wide,
+    write_devparam_dword, BorrowedVariant, DevInfoSet,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashSet;
@@ -288,11 +288,6 @@ pub fn endpoint_guid_part(endpoint_id: &str) -> Result<&str> {
         .ok_or_else(|| anyhow!("unrecognised endpoint id shape: {endpoint_id}"))
 }
 
-// `windows 0.62` Drop for PROPVARIANT is PropVariantClear. These variants
-// borrow Rust-owned memory (Vec<u16>, &GUID, &'static [u8]); a drop would
-// CoTaskMemFree it. ManuallyDrop: never clear borrows. GetValue-owned
-// variants clear on drop.
-
 fn devnode_pad_index(set: &DevInfoSet, did: &SP_DEVINFO_DATA) -> Option<u32> {
     read_devparam_dword(set, did, PAD_INDEX_VALUE)
 }
@@ -485,23 +480,17 @@ fn stamp_served(store: &IPropertyStore, s: &Stamp) -> bool {
 fn set_store_value(store: &IPropertyStore, s: &Stamp) -> Result<()> {
     match &s.value {
         StampValue::Str(v) => {
-            let buf = wide(v);
-            let pv = pv_lpwstr(&buf);
-            // SAFETY: the variant borrows `buf`, which outlives the call; SetValue copies.
-            unsafe { store.SetValue(&s.key, &*pv) }.context(s.label)?;
+            let text = HSTRING::from(*v);
+            store_value(store, s, &BorrowedVariant::lpwstr(&text))
         }
-        StampValue::Container(g) => {
-            let pv = pv_clsid(g);
-            // SAFETY: the variant borrows `*g`, which outlives the call; SetValue copies.
-            unsafe { store.SetValue(&s.key, &*pv) }.context(s.label)?;
-        }
-        StampValue::Format(wfx) => {
-            let pv = pv_blob(&wfx[..]);
-            // SAFETY: the variant borrows the static format bytes; SetValue copies.
-            unsafe { store.SetValue(&s.key, &*pv) }.context(s.label)?;
-        }
+        StampValue::Container(g) => store_value(store, s, &BorrowedVariant::clsid(g)),
+        StampValue::Format(wfx) => store_value(store, s, &BorrowedVariant::blob(&wfx[..])),
     }
-    Ok(())
+}
+
+fn store_value(store: &IPropertyStore, s: &Stamp, pv: &BorrowedVariant<'_>) -> Result<()> {
+    // SAFETY: a valid key, and a variant whose payload outlives the call; SetValue copies it.
+    unsafe { store.SetValue(&s.key, &**pv) }.context(s.label)
 }
 
 fn stamp_endpoint(endpoint_id: &str, pad_index: u8) -> Result<()> {

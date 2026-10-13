@@ -5,12 +5,14 @@
 //! `pad_endpoint`, `minted`, `audio_probe` and `devnode_cleanup` all reach for it, and only one
 //! of them provisions pads — which is why it is not in a file named for that.
 //!
-//! Every `pv_*` constructor returns a [`ManuallyDrop`]: the caller hands the variant to a
-//! property store that takes the payload, so dropping it here would free bytes the store
-//! still points at.
+//! A [`BorrowedVariant`] points at bytes Rust owns: it cannot outlive them, and it never
+//! clears, since `PropVariantClear` would hand them to `CoTaskMemFree`. A variant a property
+//! store returns owns its payload and clears on drop.
 
 use anyhow::{anyhow, Context, Result};
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use windows::core::{w, Owned, GUID, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiCreateDevRegKeyW, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW,
@@ -31,7 +33,7 @@ use windows::Win32::System::Com::BLOB;
 use windows::Win32::System::Registry::{
     RegQueryValueExW, RegSetValueExW, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_VALUE_TYPE,
 };
-use windows::Win32::System::Variant::{VT_BLOB, VT_CLSID, VT_LPWSTR};
+use windows::Win32::System::Variant::{VARENUM, VT_BLOB, VT_CLSID, VT_LPWSTR};
 
 /// An owned NUL-terminated UTF-16 buffer, for a property value that borrows or copies the
 /// bytes. A read-only `PCWSTR` argument takes an `HSTRING` instead.
@@ -39,58 +41,71 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// `VT_LPWSTR` borrowing `w`, which must outlive it and stay NUL-terminated.
-pub fn pv_lpwstr(w: &[u16]) -> ManuallyDrop<PROPVARIANT> {
-    ManuallyDrop::new(PROPVARIANT {
-        Anonymous: PROPVARIANT_0 {
-            Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
-                vt: VT_LPWSTR,
-                wReserved1: 0,
-                wReserved2: 0,
-                wReserved3: 0,
-                Anonymous: PROPVARIANT_0_0_0 {
-                    pwszVal: PWSTR(w.as_ptr().cast_mut()),
-                },
-            }),
-        },
-    })
+/// A `PROPVARIANT` whose payload is borrowed for `'a`. Derefs to the variant a property
+/// store's `SetValue` copies from.
+pub struct BorrowedVariant<'a> {
+    pv: ManuallyDrop<PROPVARIANT>,
+    _payload: PhantomData<&'a ()>,
 }
 
-/// `VT_CLSID` borrowing `g`, which must outlive it.
-pub fn pv_clsid(g: &GUID) -> ManuallyDrop<PROPVARIANT> {
-    ManuallyDrop::new(PROPVARIANT {
-        Anonymous: PROPVARIANT_0 {
-            Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
-                vt: VT_CLSID,
-                wReserved1: 0,
-                wReserved2: 0,
-                wReserved3: 0,
-                Anonymous: PROPVARIANT_0_0_0 {
-                    puuid: std::ptr::from_ref(g).cast_mut(),
+impl<'a> BorrowedVariant<'a> {
+    fn new(vt: VARENUM, value: PROPVARIANT_0_0_0) -> Self {
+        Self {
+            pv: ManuallyDrop::new(PROPVARIANT {
+                Anonymous: PROPVARIANT_0 {
+                    Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
+                        vt,
+                        wReserved1: 0,
+                        wReserved2: 0,
+                        wReserved3: 0,
+                        Anonymous: value,
+                    }),
                 },
             }),
-        },
-    })
+            _payload: PhantomData,
+        }
+    }
+
+    /// `VT_LPWSTR`. An `HSTRING` because its buffer always ends in a NUL.
+    pub fn lpwstr(s: &'a HSTRING) -> Self {
+        Self::new(
+            VT_LPWSTR,
+            PROPVARIANT_0_0_0 {
+                pwszVal: PWSTR(s.as_ptr().cast_mut()),
+            },
+        )
+    }
+
+    /// `VT_CLSID`.
+    pub fn clsid(g: &'a GUID) -> Self {
+        Self::new(
+            VT_CLSID,
+            PROPVARIANT_0_0_0 {
+                puuid: std::ptr::from_ref(g).cast_mut(),
+            },
+        )
+    }
+
+    /// `VT_BLOB`.
+    pub fn blob(b: &'a [u8]) -> Self {
+        Self::new(
+            VT_BLOB,
+            PROPVARIANT_0_0_0 {
+                blob: BLOB {
+                    cbSize: b.len() as u32,
+                    pBlobData: b.as_ptr().cast_mut(),
+                },
+            },
+        )
+    }
 }
 
-/// `VT_BLOB` borrowing `b`, which must outlive it.
-pub fn pv_blob(b: &[u8]) -> ManuallyDrop<PROPVARIANT> {
-    ManuallyDrop::new(PROPVARIANT {
-        Anonymous: PROPVARIANT_0 {
-            Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
-                vt: VT_BLOB,
-                wReserved1: 0,
-                wReserved2: 0,
-                wReserved3: 0,
-                Anonymous: PROPVARIANT_0_0_0 {
-                    blob: BLOB {
-                        cbSize: b.len() as u32,
-                        pBlobData: b.as_ptr().cast_mut(),
-                    },
-                },
-            }),
-        },
-    })
+impl Deref for BorrowedVariant<'_> {
+    type Target = PROPVARIANT;
+
+    fn deref(&self) -> &PROPVARIANT {
+        &self.pv
+    }
 }
 
 pub fn pv_string(pv: &PROPVARIANT) -> Option<String> {
@@ -412,5 +427,31 @@ pub fn bind_driver(hwid: &str, inf: &str) -> Result<()> {
         Err(e) => {
             Err(anyhow!(e)).with_context(|| format!("UpdateDriverForPlugAndPlayDevices({inf})"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each borrowed variant reads back through its own type's accessor and no other, and
+    /// dropping one leaves the bytes it pointed at alone.
+    #[test]
+    fn borrowed_variants_round_trip() {
+        let text = HSTRING::from("Wireless Controller");
+        {
+            let pv = BorrowedVariant::lpwstr(&text);
+            assert_eq!(pv_string(&pv).as_deref(), Some("Wireless Controller"));
+            assert_eq!(pv_guid(&pv), None);
+        }
+        assert_eq!(text.to_string(), "Wireless Controller");
+
+        let g = GUID::from_u128(0x5046_4453_0000_0000_0000_0000_0000_0003);
+        assert_eq!(pv_guid(&BorrowedVariant::clsid(&g)), Some(g));
+
+        let bytes = [1u8, 2, 3];
+        let pv = BorrowedVariant::blob(&bytes);
+        assert_eq!(pv_bytes(&pv).as_deref(), Some(&bytes[..]));
+        assert_eq!(pv_string(&pv), None);
     }
 }
