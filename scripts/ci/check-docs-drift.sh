@@ -12,11 +12,12 @@
 #      (docs describing a removed knob is drift a reader pays for). Historical records —
 #      docs/releases/, CHANGELOG.md — don't count as existence: a knob that lives only in old
 #      release notes is gone.
-#   3. Ratchet: the count of PUNKTFUNK_* env vars in code that the docs never mention must not
-#      grow. 300+ internal/debug knobs are deliberately undocumented today, so this can't be a
-#      hard list — but a NEW knob must either be documented in docs-site (configuration.md or
-#      the page owning its feature) or the baseline below raised in the same commit, making
-#      "undocumented" a decision instead of an accident. Shrink the gap? Lower the baseline.
+#   3. Ratchet: no NEW PUNKTFUNK_* env var may appear in code without a docs mention. 150 or so
+#      internal/debug knobs are deliberately undocumented today, so this can't be a hard list —
+#      but a NEW knob must either be documented in docs-site (configuration.md or the page
+#      owning its feature) or join the baseline below in the same commit, making "undocumented"
+#      a decision instead of an accident. A baseline line whose knob left the code or got
+#      documented only prints a note; the C header names in cbindgen.toml are not knobs.
 #   4. Every command the host-cli.md tables list must still exist as a string literal in
 #      crates/host/punktfunk-host (same "docs describing removed things" class as gate 2).
 #   5. data/platforms.json (the single source for install/port facts that docs, the website
@@ -40,7 +41,8 @@
 # Textual gates, so textual limits: gate 2/3 match token spelling, not env reads — a var name in
 # a code comment counts as "exists", and a quoted constant that isn't an env var counts toward
 # the ratchet. Both err toward false calm on removal and a one-line baseline bump on addition,
-# which is the cheap side to be wrong on.
+# which is the cheap side to be wrong on. cbindgen.toml is the one source of such constants
+# the gate leaves out by path.
 
 set -u
 LC_ALL=C
@@ -72,11 +74,12 @@ done < "$tmp/docs-vars"
 
 # ---------------------------------------------------------------- gate 3: undocumented ratchet
 # Quoted occurrences only: env reads are quoted string literals; bare identifiers are
-# Rust constants / C symbols, not knobs. The committed baseline enumerates today's undocumented
-# set so a violation names exactly the new knob.
+# Rust constants / C symbols, not knobs. cbindgen.toml quotes every name it gives the C header
+# (PUNKTFUNK_FEATURE_*, the ABI constants); no process reads those from its environment.
+# The committed baseline enumerates today's undocumented set so a violation names the new knob.
 baseline=scripts/ci/docs-undocumented-env-baseline.txt
 sort -u "$baseline" > "$tmp/baseline"   # re-sort under our LC_ALL=C, whatever locale wrote it
-git grep -ohE '"PUNKTFUNK_[A-Z0-9_]+"' -- ':!docs-site' ':!*.md' | tr -d '"' | sort -u > "$tmp/code-vars"
+git grep -ohE '"PUNKTFUNK_[A-Z0-9_]+"' -- ':!docs-site' ':!*.md' ':!*cbindgen.toml' | tr -d '"' | sort -u > "$tmp/code-vars"
 comm -23 "$tmp/code-vars" "$tmp/docs-vars" > "$tmp/undocumented"
 comm -23 "$tmp/undocumented" "$tmp/baseline" > "$tmp/new-undocumented"
 if [ -s "$tmp/new-undocumented" ]; then
@@ -87,7 +90,7 @@ if [ -s "$tmp/new-undocumented" ]; then
 fi
 comm -13 "$tmp/undocumented" "$tmp/baseline" > "$tmp/stale-baseline"
 if [ -s "$tmp/stale-baseline" ]; then
-    echo "baseline entries no longer undocumented (removed or now documented) — prune them from $baseline:"
+    echo "note: baseline entries no longer undocumented (removed or now documented) — prune them from $baseline when convenient:"
     sed 's/^/  /' "$tmp/stale-baseline"
 fi
 
