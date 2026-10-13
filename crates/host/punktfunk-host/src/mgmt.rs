@@ -65,7 +65,7 @@ mod webtransport;
 /// Sunshine's web UI is also 47990, so a Sunshine fork and a GameStream-off
 /// host collide here. Move it via [`publish_endpoint`] / `PUNKTFUNK_MGMT_BIND`;
 /// consumers read the bound port rather than assuming this constant.
-pub const DEFAULT_PORT: u16 = 47990;
+pub const DEFAULT_PORT: u16 = pf_host_config::listen::MGMT_PORT;
 
 /// Filename [`publish_endpoint`] writes next to `mgmt-token`.
 const ENDPOINT_FILE: &str = "mgmt-endpoint";

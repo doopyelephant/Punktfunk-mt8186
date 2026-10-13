@@ -22,7 +22,7 @@ pub(crate) struct ServeArgs {
 /// Pairing is required unless `--open`. A bad flag or env value is an error.
 pub(crate) fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
     let mut mgmt_bind = None;
-    let mut native_port: u16 = 9777;
+    let mut native_port = None;
 
     let mut open = false;
     let mut gamestream = false;
@@ -34,8 +34,6 @@ pub(crate) fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
     let mut webtransport_host = "::".to_string();
     let mut webtransport_bind_explicit = false;
     let mut no_mdns = false;
-    // Explicit `--native-port` outranks `PUNKTFUNK_NATIVE_PORT` after the loop.
-    let mut native_port_explicit = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -56,10 +54,11 @@ pub(crate) fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
             // No-op: the native plane always runs.
             "--native" => {}
             "--native-port" => {
-                native_port = next()?
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("bad --native-port (want a port number)"))?;
-                native_port_explicit = true;
+                native_port = Some(
+                    next()?
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("bad --native-port (want a port number)"))?,
+                );
             }
             // Video rides the native port. Accepted so an older service unit still starts.
             "--data-port" => {
@@ -91,29 +90,20 @@ pub(crate) fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
         }
         i += 1;
     }
-    // Default all-interfaces so paired clients browse over mTLS. Admin stays loopback in
-    // `require_auth`. Packaged units ship a fixed ExecStart — `host.env` is the upgrade-safe pin;
-    // CLI wins as the more explicit of the two.
-    let mgmt_bind = match mgmt_bind {
-        Some(bind) => bind,
-        None => match pf_host_config::config().mgmt_bind.as_deref() {
-            Some(s) => s
-                .parse()
-                .map_err(|_| anyhow::anyhow!("bad PUNKTFUNK_MGMT_BIND '{s}' (want IP:PORT)"))?,
-            None => SocketAddr::from(([0, 0, 0, 0], mgmt::DEFAULT_PORT)),
-        },
-    };
-    // A bad value is fatal — serving 9777 while host.env says otherwise reads as
-    // "I moved the port and the client still cannot reach me".
-    if !native_port_explicit {
-        if let Some(s) = pf_host_config::config().native_port.as_deref() {
-            native_port = s
-                .parse()
-                .map_err(|_| anyhow::anyhow!("bad PUNKTFUNK_NATIVE_PORT '{s}' (want a port)"))?;
-        }
-    }
+    // Management defaults to every interface; admin stays loopback in `require_auth`. Packaged
+    // units ship a fixed ExecStart, so `host.env` is the upgrade-safe pin, and a flag outranks
+    // it. A bad env value is fatal: serving the default while host.env says otherwise reads as
+    // "I moved the port and the client still can't reach me".
+    let cfg = pf_host_config::config();
+    let listen = pf_host_config::listen::ListenPlan::resolve(
+        mgmt_bind,
+        native_port,
+        cfg.mgmt_bind.as_deref(),
+        cfg.native_port.as_deref(),
+    )?;
+    let mgmt_bind = listen.mgmt;
     let native = native::NativeServe {
-        port: native_port,
+        port: listen.native_port,
         require_pairing: !open,
         // Real bound port, not the default, so mDNS clients follow a moved mgmt port.
         mgmt_port: mgmt_bind.port(),
