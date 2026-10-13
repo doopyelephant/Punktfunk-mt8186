@@ -1,6 +1,6 @@
 // `/api/v1/profiles/<id>/proxy/<rest>` reaches a seat's own host through the box. The box forwards
 // it with the admin bearer, so the routes that ask for the console password on the box's own host
-// ask on the seat's too: `gatedRoute` names the one that guards `rest`.
+// ask on the seat's too: `seatGate` in gates.ts names the one that guards `rest`.
 import { normalizePath } from "./paths";
 
 /** A profile id as the host accepts one: ASCII letters and digits, at most 64. */
@@ -38,57 +38,4 @@ export function seatPath(id: string, tail: string): string {
 /** A plugin UI's credential never reaches a browser, from a seat's host either. */
 export function isUiCredential(rest: string): boolean {
 	return /^plugins\/[^/]+\/ui-credential$/i.test(rest);
-}
-
-/** The files under `routes/api/v1/` whose password gate a seat call goes through (`GATES`). */
-export const GATED_ROUTES = [
-	"hooks.put",
-	"store/install.post",
-	"store/sources/[name].put",
-	"library/custom.post",
-	"library/custom/[id].put",
-	"library/provider/[provider].put",
-] as const;
-
-/**
- * First segments a seat's host never relays: `proxy_refuses` in
- * `crates/host/punktfunk-host/src/mgmt/profiles.rs`. A gated route under one needs no `GATES` entry.
- */
-export const HOST_REFUSED: readonly string[] = [
-	"native",
-	"pair",
-	"profiles",
-	"update",
-	"actions",
-	"clients",
-];
-
-/** The file under `routes/api/v1/` that gates a call, and the route params it reads. */
-export interface GatedRoute {
-	route: (typeof GATED_ROUTES)[number];
-	params: Record<string, string>;
-}
-
-/** The box's own password-gated route that guards `method` `rest`, if any. */
-export function gatedRoute(method: string, rest: string): GatedRoute | null {
-	const [a, b, c, ...more] = rest.split("/");
-	const verb = method.toUpperCase();
-	if (more.length > 0) return null;
-	if (verb === "PUT" && a === "hooks" && !b)
-		return { route: "hooks.put", params: {} };
-	if (verb === "POST" && a === "store" && b === "install" && !c)
-		return { route: "store/install.post", params: {} };
-	if (verb === "PUT" && a === "store" && b === "sources" && c)
-		return { route: "store/sources/[name].put", params: { name: c } };
-	if (a !== "library") return null;
-	if (verb === "POST" && b === "custom" && !c)
-		return { route: "library/custom.post", params: {} };
-	if (verb === "PUT" && b === "custom" && c)
-		return { route: "library/custom/[id].put", params: { id: c } };
-	if (verb === "PUT" && b === "provider" && c)
-		return {
-			route: "library/provider/[provider].put",
-			params: { provider: c },
-		};
-	return null;
 }
