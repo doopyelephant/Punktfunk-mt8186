@@ -317,6 +317,19 @@ impl LibraryShared {
         self.0.lock().unwrap().req.clone()
     }
 
+    /// [`Self::begin`] for a producer's test, which plays the shell.
+    #[doc(hidden)]
+    pub fn begin_for_test(&self, req: &RequestKey) {
+        self.begin(req);
+    }
+
+    /// The phase and titles a shelf would draw now, for a producer's test.
+    #[doc(hidden)]
+    pub fn shelf_for_test(&self) -> (LibraryPhase, Vec<LibraryGame>) {
+        let s = self.snapshot();
+        (s.phase, s.games)
+    }
+
     /// `req`'s phase; dropped for any other fetch.
     pub fn set_phase(&self, req: &RequestKey, phase: LibraryPhase) {
         let mut s = self.0.lock().unwrap();

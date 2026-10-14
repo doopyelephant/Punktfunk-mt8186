@@ -1,6 +1,7 @@
 use super::*;
 use pf_client_core::presets::{PresetsFile, StreamPreset};
 use pf_console_ui::model::pinned_key;
+use std::net::TcpListener;
 
 /// A fingerprint of one repeated digit: readable, and distinct per digit.
 fn fp(c: char) -> String {
@@ -380,4 +381,171 @@ fn the_shared_host_row_vectors_agree() {
             assert_eq!(pin, want["pin"].as_str(), "{at} pin");
         }
     }
+}
+
+const LOOPBACK: &str = "127.0.0.1";
+
+/// A service over `library`, with an identity of its own, so its workers dial for real.
+fn service(library: &LibraryShared) -> ServiceState {
+    ServiceState {
+        console: ConsoleShared::default(),
+        library: library.clone(),
+        bus: pf_console_ui::ConsoleBus::default(),
+        identity: punktfunk_core::quic::endpoint::generate_identity().expect("identity"),
+        seed: None,
+        discovered: HashMap::new(),
+        probed: Arc::default(),
+        probe_inflight: Arc::default(),
+        last_probe: Instant::now(),
+        wake_cancel: None,
+        pair_gen: Arc::default(),
+        rescan: None,
+        stores: Stores::default(),
+        learn_due: false,
+    }
+}
+
+const TITLE: &str = "steam:1";
+
+/// `req`'s shelf, as the shell opens it: one title, which its host reports up.
+fn open_shelf(library: &LibraryShared, req: &RequestKey) {
+    library.begin_for_test(req);
+    let title = LibraryGame {
+        id: TITLE.into(),
+        title: "One".into(),
+        store: "steam".into(),
+        launcher: false,
+        icon: String::new(),
+        platform: None,
+        developer: None,
+        year: None,
+        genres: Vec::new(),
+        stats: None,
+        running: false,
+        endable: false,
+        install: None,
+    };
+    library.set_games(req, vec![title]);
+    library.set_running(&[library::RunningGame {
+        app_id: Some(TITLE.into()),
+        title: "One".into(),
+        state: "running".into(),
+        awaiting_window: false,
+        session_id: None,
+        endable: false,
+    }]);
+}
+
+/// What a test compares: the phase, and each title's Resume badge.
+fn shelf(library: &LibraryShared) -> (LibraryPhase, Vec<(String, bool)>) {
+    let (phase, games) = library.shelf_for_test();
+    (
+        phase,
+        games.into_iter().map(|g| (g.id, g.running)).collect(),
+    )
+}
+
+/// Close each connection the worker opens until it ends: every request fails, as against a
+/// host that dropped off the network.
+fn hang_up(host: TcpListener, worker: Worker) {
+    let worker = worker.expect("the worker starts");
+    host.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !worker.is_finished() {
+        assert!(Instant::now() < deadline, "the worker never gave up");
+        match host.accept() {
+            Ok((conn, _)) => drop(conn),
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    worker.join().unwrap();
+}
+
+/// Starts one worker against host A: the service, A's management port, A's fetch.
+type Start = fn(&ServiceState, u16, &RequestKey) -> Worker;
+
+/// Whether the worker `start` spawns writes the shelf once host A fails to answer. The player
+/// is on A's shelf when it starts; with `moved` they open B's, the same title up, before A
+/// gives up.
+fn writes_shelf(moved: bool, start: Start) -> bool {
+    let library = LibraryShared::default();
+    let svc = service(&library);
+    let a = RequestKey {
+        host: fp('a'),
+        epoch: 1,
+    };
+    open_shelf(&library, &a);
+    // Listening, so the worker connects and waits for a handshake until `hang_up`.
+    let host = TcpListener::bind((LOOPBACK, 0)).unwrap();
+    let port = host.local_addr().unwrap().port();
+    let worker = start(&svc, port, &a);
+    if moved {
+        let b = RequestKey {
+            host: fp('b'),
+            epoch: 2,
+        };
+        open_shelf(&library, &b);
+    }
+    let before = shelf(&library);
+    hang_up(host, worker);
+    shelf(&library) != before
+}
+
+/// The worker writes the shelf it was started for, and nothing once the player opened another.
+fn lands_only_on_its_own_shelf(start: Start) {
+    assert!(
+        writes_shelf(false, start),
+        "its own shelf kept its old state"
+    );
+    assert!(
+        !writes_shelf(true, start),
+        "another host's shelf took its answer"
+    );
+}
+
+/// A `/status` read writes the badges of the shelf it was asked for, and nothing once the
+/// player has opened another host's.
+#[test]
+fn a_running_refresh_a_newer_fetch_outlived_writes_nothing() {
+    lands_only_on_its_own_shelf(|svc, port, _| svc.refresh_running(LOOPBACK.into(), port, fp('a')));
+}
+
+/// The re-read after ending a game, likewise.
+#[test]
+fn an_end_game_a_newer_fetch_outlived_writes_nothing() {
+    lands_only_on_its_own_shelf(|svc, port, _| {
+        svc.end_game(LOOPBACK.into(), port, fp('a'), TITLE.into(), "One".into())
+    });
+}
+
+/// The re-read after an install change, likewise.
+#[test]
+fn an_install_change_a_newer_fetch_outlived_writes_nothing() {
+    lands_only_on_its_own_shelf(|svc, port, _| {
+        svc.change_install(
+            LOOPBACK.into(),
+            port,
+            fp('a'),
+            TITLE.into(),
+            "One".into(),
+            library::InstallAction::Install,
+        )
+    });
+}
+
+/// A library fetch that fails shows its error on its own shelf, and leaves another host's
+/// alone.
+#[test]
+fn a_library_fetch_a_newer_fetch_outlived_writes_nothing() {
+    lands_only_on_its_own_shelf(|svc, port, a| {
+        spawn_fetch(
+            svc.library.clone(),
+            LOOPBACK.into(),
+            port,
+            svc.identity.clone(),
+            fp('a'),
+            Vec::new(),
+            a.clone(),
+        )
+    });
 }
