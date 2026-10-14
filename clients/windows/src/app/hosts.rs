@@ -1,6 +1,7 @@
 //! The hosts page: saved (trusted/paired) hosts and live mDNS discovery as tap-to-connect
 //! tiles in a responsive grid, with a per-host "…" menu (connect / speed test / edit /
 //! forget) and a manual connect entry — the same card layout as the Linux and Apple clients.
+//! The saved tiles follow the device's host sort and grouping (`host_order`).
 
 use super::connect::{initiate, initiate_waking, open_console};
 use super::library::open_library;
@@ -10,6 +11,7 @@ use super::style::*;
 use super::{saved, Screen, Svc, Target};
 use crate::trust::{HostEdit, KnownHosts, Settings};
 use pf_client_core::discovery::DiscoveredHost;
+use pf_client_core::host_order::{self, Arrangeable};
 use pf_client_core::orchestrate::HostTarget;
 use pf_client_core::profiles::ProfilePick;
 use std::collections::HashMap;
@@ -66,7 +68,7 @@ const MENU_DEFAULT_SET: &str = "Default host \u{2713}";
 /// Whether the console (gamepad) UI is available in this build: the session binary ships
 /// its Skia `ui` feature on x64 only (no skia prebuilts for aarch64 yet) — the entry
 /// points compile everywhere but only show where `--browse` can actually run.
-const CONSOLE_UI_AVAILABLE: bool = cfg!(target_arch = "x86_64");
+pub(crate) const CONSOLE_UI_AVAILABLE: bool = cfg!(target_arch = "x86_64");
 
 /// Tile-grid metrics: minimum tile width before dropping a column, and the gap between tiles.
 const TILE_MIN_WIDTH: f64 = 320.0;
@@ -121,9 +123,6 @@ pub(crate) struct HostsProps {
     /// Online here, and a sleeping one whose advert has not aged out yet reads Offline.
     pub(crate) probed: HashMap<String, bool>,
     pub(crate) status: String,
-    /// Connected-controller count (root state, mirrored from the gamepad service) — a
-    /// pad plus a paired host surfaces the "Open console UI" hint card.
-    pub(crate) pads: usize,
     pub(crate) forget: Option<HostRef>,
     pub(crate) rename: Option<HostRef>,
     /// Whether the "Add host" modal is open. Root state (like `forget`/`rename`), not the page's
@@ -153,7 +152,6 @@ impl PartialEq for HostsProps {
             && self.hosts == other.hosts
             && self.probed == other.probed
             && self.status == other.status
-            && self.pads == other.pads
             && self.forget == other.forget
             && self.rename == other.rename
             && self.show_add == other.show_add
@@ -572,6 +570,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
         set: props.set_hover.clone(),
     };
     let known = KnownHosts::load();
+    let settings = Settings::load();
 
     // Responsive column count from the live window width (re-renders on resize): as many
     // TILE_MIN_WIDTH columns as fit the page's content width, at least one.
@@ -580,7 +579,7 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
     let cols = (((content_w + TILE_GAP) / (TILE_MIN_WIDTH + TILE_GAP)).floor() as usize).max(1);
     let mut body: Vec<Element> = Vec::new();
 
-    body.push(header(&props.svc, &props.set_show_add));
+    body.push(header(props, &settings, known.hosts.len()));
 
     // Connect errors, editor refusals and host-action outcomes share this line. Each message
     // is a whole sentence, so the bar carries no title of its own.
@@ -596,9 +595,8 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
 
     // Saved (trusted/paired) hosts — reachable even when mDNS isn't. A saved host that answers
     // the probe shows as Online (and any advert for it is deduped out of the discovery section).
+    // The tiles come in the order and bands the device's host sort asks for.
     if !known.hosts.is_empty() {
-        body.push(section("SAVED HOSTS"));
-        let mut tiles: Vec<Element> = Vec::new();
         // One catalog read per render, shared by every tile's menu and chip.
         let presets: Vec<(String, String, Option<String>)> =
             pf_client_core::presets::PresetsFile::load()
@@ -606,12 +604,28 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
                 .into_iter()
                 .map(|p| (p.id, p.name, p.accent))
                 .collect();
-        // …and one settings read, for the checkmark on whichever tile the pointer names.
-        let settings_default = Settings::load().default_host;
-        for k in &known.hosts {
-            tiles.extend(saved_tiles(props, k, &hover, &presets, &settings_default));
+        let mut cards: Vec<SavedCard> = known
+            .hosts
+            .iter()
+            .flat_map(|k| saved_cards(props, k, &presets))
+            .collect();
+        host_order::arrange(&mut cards, &settings);
+        let grouping = host_order::grouping(&settings);
+        let mut bands: Vec<(Option<String>, Vec<Element>)> = Vec::new();
+        for c in &cards {
+            let title = host_order::group_of(c, grouping);
+            let tile = saved_tile(props, c, &hover, &presets, &settings.default_host);
+            match bands.last_mut() {
+                Some((t, tiles)) if *t == title => tiles.push(tile),
+                _ => bands.push((title, vec![tile])),
+            }
         }
-        body.push(tile_grid(tiles, cols, TILE_GAP));
+        for (title, tiles) in bands {
+            body.push(section(
+                &title.map_or_else(|| "SAVED HOSTS".into(), |t| t.to_uppercase()),
+            ));
+            body.push(tile_grid(tiles, cols, TILE_GAP));
+        }
     }
 
     body.push(section("ON THIS NETWORK"));
@@ -629,8 +643,9 @@ pub(crate) fn hosts_page(props: &HostsProps, cx: &mut RenderCx) -> Element {
 }
 
 /// The page header: the title block and the page actions — ONE labelled primary (Add host,
-/// in accent), the rest icon-only with tooltips.
-fn header(svc: &Svc, set_show_add: &AsyncSetState<bool>) -> Element {
+/// in accent), the rest icon-only with tooltips. Sort and group shows from two saved hosts.
+fn header(props: &HostsProps, settings: &Settings, saved: usize) -> Element {
+    let (svc, set_show_add) = (&props.svc, &props.set_show_add);
     let (ctx, set_screen, set_status) = (&svc.ctx, &svc.set_screen, &svc.set_status);
     let icon_btn = |label: &str, mark: &str| {
         button("")
@@ -673,6 +688,9 @@ fn header(svc: &Svc, set_show_add: &AsyncSetState<bool>) -> Element {
                     })
                     .into(),
             );
+            if saved > 1 {
+                actions.push(arrange_button(props, settings).into());
+            }
             // The couch UI's front door, beside the other page actions. Absent on ARM64,
             // where the session binary ships without its Skia console.
             if CONSOLE_UI_AVAILABLE {
@@ -683,7 +701,7 @@ fn header(svc: &Svc, set_show_add: &AsyncSetState<bool>) -> Element {
                     )
                     .on_click({
                         let (c, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
-                        move || open_console(&c, &ss, &st)
+                        move || open_console(&c, &ss, &st, false)
                     })
                     .into(),
                 );
@@ -721,27 +739,94 @@ fn header(svc: &Svc, set_show_add: &AsyncSetState<bool>) -> Element {
     .into()
 }
 
-/// A saved host's primary tile, then its pinned host+preset tiles in pin order.
-fn saved_tiles(
+/// The header's Sort and Group menu over the device's `host_sort` and `host_grouping` keys,
+/// the order the GTK shell and the console show. The flyout reports the clicked leaf's text,
+/// so each label maps back to its key and value, and the one in force carries a check.
+fn arrange_button(props: &HostsProps, settings: &Settings) -> Button {
+    let mut table: Vec<(String, &'static str, &'static str)> = Vec::new();
+    let mut items = Vec::new();
+    for (title, key, current, values) in [
+        (
+            "Sort",
+            host_order::HOST_SORT_KEY,
+            host_order::sort(settings),
+            &host_order::HOST_SORTS,
+        ),
+        (
+            "Group",
+            host_order::HOST_GROUPING_KEY,
+            host_order::grouping(settings),
+            &host_order::HOST_GROUPINGS,
+        ),
+    ] {
+        let mut leaves = Vec::new();
+        for (value, label) in values {
+            let text = if *value == current {
+                format!("{label} \u{2713}")
+            } else {
+                label.to_string()
+            };
+            table.push((text.clone(), key, value));
+            leaves.push(menu_item(text));
+        }
+        items.push(menu_sub_item(title, leaves));
+    }
+    let (hosts_rev, set_hosts_rev) = (props.hosts_rev, props.set_hosts_rev.clone());
+    button("")
+        .icon(lucide::icon("arrow-up-down"))
+        .tooltip("Sort and group")
+        .automation_name("Sort and group")
+        .menu_flyout(items)
+        .on_item_clicked(move |item: String| {
+            let Some((_, key, value)) = table.iter().find(|(label, ..)| *label == item) else {
+                return;
+            };
+            // Whole-file writer: rebase on the store before mutating, or a setting
+            // another surface just wrote is reverted.
+            let mut settings = Settings::load();
+            settings.extra.insert((*key).into(), (*value).into());
+            settings.save();
+            set_hosts_rev.call(hosts_rev + 1);
+        })
+}
+
+/// One saved-host tile as the order sees it: a host's primary tile or a pinned one.
+struct SavedCard<'a> {
+    host: &'a pf_client_core::trust::KnownHost,
+    online: bool,
+    /// A pinned tile's preset `(id, name, accent)`; `None` on the primary.
+    pinned: Option<&'a (String, String, Option<String>)>,
+    /// What a plain click connects with: the pinned preset, else the host's binding.
+    preset: Option<&'a str>,
+}
+
+impl Arrangeable for SavedCard<'_> {
+    fn name(&self) -> &str {
+        &self.host.name
+    }
+    fn online(&self) -> bool {
+        self.online
+    }
+    fn last_used(&self) -> Option<u64> {
+        self.host.last_used
+    }
+    fn preset_name(&self) -> Option<&str> {
+        self.preset
+    }
+}
+
+/// A saved host's cards: its primary, then its pinned host+preset tiles in pin order (design
+/// §5.2a). A pin whose preset is gone has none. On the way the record learns what its advert
+/// knows, and the host's own actions are kept warm.
+fn saved_cards<'a>(
     props: &HostsProps,
-    k: &pf_client_core::trust::KnownHost,
-    hover: &Hover,
-    presets: &[(String, String, Option<String>)],
-    settings_default: &Option<String>,
-) -> Vec<Element> {
-    let (ctx, set_screen, set_status) =
-        (&props.svc.ctx, &props.svc.set_screen, &props.svc.set_status);
+    k: &'a pf_client_core::trust::KnownHost,
+    presets: &'a [(String, String, Option<String>)],
+) -> Vec<SavedCard<'a>> {
     let hosts = props.hosts.as_slice();
-    let mut tiles: Vec<Element> = Vec::new();
-    let target = Target {
-        host: HostTarget::from(k),
-        ..Target::default()
-    };
-    // Online = the last probe sweep reached it, and nothing else. An advert is NOT
-    // presence: it is a cache entry with a 75-minute TTL that a suspending host sends no
-    // goodbye for, so counting it kept a sleeping machine's pip green — and every wake
-    // gate below reads `!online`, which is how Wake-on-LAN stayed silent for exactly the
-    // host it was meant to wake.
+    // Online = the last probe sweep reached it, and nothing else. An advert is a cache entry
+    // with a 75-minute TTL that a suspending host sends no goodbye for: counting it would keep
+    // a sleeping machine's pip green, and every wake gate reads `!online`.
     let online = props.probed.get(&k.card_key()).copied().unwrap_or(false);
     // Everything the advert teaches: wake MAC(s), OS chain (so the mark survives going
     // offline), management port, and its address as a place the probe sweep asks —
@@ -760,7 +845,6 @@ fn saved_tiles(
             a.mgmt_port,
         );
     }
-    let can_wake = !online && !k.mac.is_empty();
     // What this host last said it lets this device do to it. Kept warm here — on the
     // list's own refresh, gated by the cache's TTL — so the menu is BUILT from a
     // settled answer: rows that appeared while a menu was open would land under a
@@ -768,12 +852,47 @@ fn saved_tiles(
     if k.paired && online {
         pf_client_core::host_actions::refresh(
             &k.addr,
-            target
-                .host
-                .mgmt_port
+            k.mgmt_port
                 .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT),
             &k.fp_hex,
         );
+    }
+    let preset = |id: &String| presets.iter().find(|(pid, ..)| pid == id);
+    let mut cards = vec![SavedCard {
+        host: k,
+        online,
+        pinned: None,
+        preset: k.preset_id.as_ref().and_then(preset).map(|p| p.1.as_str()),
+    }];
+    for p in k.pinned_presets.iter().filter_map(preset) {
+        cards.push(SavedCard {
+            host: k,
+            online,
+            pinned: Some(p),
+            preset: Some(&p.1),
+        });
+    }
+    cards
+}
+
+/// A saved card's tile: the host's primary tile, or a pinned one through [`pinned_tile`].
+fn saved_tile(
+    props: &HostsProps,
+    c: &SavedCard,
+    hover: &Hover,
+    presets: &[(String, String, Option<String>)],
+    settings_default: &Option<String>,
+) -> Element {
+    let (ctx, set_screen, set_status) =
+        (&props.svc.ctx, &props.svc.set_screen, &props.svc.set_status);
+    let (k, online) = (c.host, c.online);
+    let target = Target {
+        host: HostTarget::from(k),
+        ..Target::default()
+    };
+    let can_wake = !online && !k.mac.is_empty();
+    if let Some(preset) = c.pinned {
+        return pinned_tile(props, k, hover, online, can_wake, &target, preset);
     }
     let menu = saved_menu(
         props,
@@ -785,8 +904,7 @@ fn saved_tiles(
         settings_default,
     );
     let (ctx2, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
-    let pinned_base = target.clone();
-    tiles.push(host_tile(
+    host_tile(
         &k.fp_hex,
         hover,
         &k.name,
@@ -816,27 +934,7 @@ fn saved_tiles(
                 initiate(&ctx2, target.clone(), &ss, &st);
             }
         })),
-    ));
-
-    // …then this host's pinned host+preset tiles, in pin order (design §5.2a). They read
-    // the host's live record, and a pin whose preset is gone does not render. A pinned
-    // tile is a shortcut: its menu starts it (the library opens with its preset), copies
-    // its link or unpins it. Everything that configures the host stays on the primary.
-    for id in &k.pinned_presets {
-        let Some(preset) = presets.iter().find(|(pid, ..)| pid == id) else {
-            continue;
-        };
-        tiles.push(pinned_tile(
-            props,
-            k,
-            hover,
-            online,
-            can_wake,
-            &pinned_base,
-            preset,
-        ));
-    }
-    tiles
+    )
 }
 
 /// What a row of a saved host's "…" menu does. The flyout reports only the clicked row's text,

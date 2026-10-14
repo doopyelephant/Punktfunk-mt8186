@@ -58,6 +58,7 @@ mod tests {
         let named = [
             "arrow-left",
             "arrow-right",
+            "arrow-up-down",
             "chart-column",
             "check",
             "circle-help",

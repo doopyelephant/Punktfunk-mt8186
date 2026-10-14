@@ -64,7 +64,8 @@ use crate::trust::{KnownHosts, Settings};
 use hosts::HostsProps;
 use pf_client_core::discovery::{self, DiscoveredHost, DiscoveryEvent};
 use pf_client_core::gamepad::GamepadService;
-use pf_client_core::orchestrate::HostTarget;
+use pf_client_core::orchestrate::{self, HostTarget};
+use pf_client_core::settings::GamepadUi;
 use pf_client_core::start;
 use speed::{SpeedProps, SpeedState};
 use std::collections::HashMap;
@@ -396,8 +397,8 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
         }
     });
     // Connected-controller count, mirrored from the gamepad service by a poll thread
-    // (thread-driven state must be root state — see the module docs). Drives the hosts
-    // page's "Open console UI" hint; the compare in `call` makes the steady state free.
+    // (thread-driven state must be root state — see the module docs). The compare in `call`
+    // makes the steady state free.
     let (pads, set_pads) = cx.use_async_state(0usize);
     cx.use_effect((), {
         let (gp, set_pads) = (ctx.gamepad.clone(), set_pads.clone());
@@ -409,6 +410,38 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                     set_pads.call(gp.pads().len());
                 })
                 .ok();
+        }
+    });
+    // Controller-optimized UI, on each change of the count. While a connect, a stream, the
+    // console or a who-plays question holds the shell, the console waits for the next first pad.
+    let pads_before = cx.use_ref(0usize);
+    cx.use_effect(pads, {
+        let (ctx, ss, st, before) = (
+            ctx.clone(),
+            set_screen.clone(),
+            set_status.clone(),
+            pads_before.clone(),
+        );
+        let busy = picker.is_some()
+            || seat.is_some()
+            || matches!(
+                screen,
+                Screen::Stream
+                    | Screen::Connecting
+                    | Screen::Waking
+                    | Screen::RequestAccess
+                    | Screen::Pair
+                    | Screen::SpeedTest
+            );
+        move || {
+            let prev = before.replace(pads);
+            if hosts::CONSOLE_UI_AVAILABLE
+                && !busy
+                && !ctx.shared.session.lock().unwrap().is_running()
+                && orchestrate::console_opens(Settings::load().gamepad_ui(), prev, pads)
+            {
+                connect::open_console(&ctx, &ss, &st, true);
+            }
         }
     });
     // Saved-host reachability, keyed by `fp_hex`, refreshed by the probe sweep below. Root state
@@ -433,6 +466,11 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                 return;
             }
             let settings = svc.ctx.settings.lock().unwrap().clone();
+            // On Always the console is home, and it follows Start in itself.
+            if hosts::CONSOLE_UI_AVAILABLE && settings.gamepad_ui() == GamepadUi::Always {
+                connect::open_console(&svc.ctx, &svc.set_screen, &svc.set_status, false);
+                return;
+            }
             let known = pf_client_core::trust::KnownHosts::load();
             let (default, source) = start::default_host_with_source(&settings, &known);
             tracing::info!(
@@ -642,7 +680,6 @@ fn root(cx: &mut RenderCx, ctx: &Arc<AppCtx>) -> Element {
                 hosts,
                 probed,
                 status,
-                pads,
                 forget,
                 rename,
                 show_add,
