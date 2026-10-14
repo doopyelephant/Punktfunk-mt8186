@@ -94,6 +94,13 @@ fn note(what: &str) -> Call {
     Call::Note(what.into())
 }
 
+/// A gamescope bare spawn: a compositor of its own.
+fn spawning(name: &'static str) -> FakeDisplay {
+    let fake = FakeDisplay::new(name);
+    fake.script(|s| s.ownership = DisplayOwnership::Spawned);
+    fake
+}
+
 /// A backend whose every create prepares a topology restore.
 fn restoring(name: &'static str) -> FakeDisplay {
     let fake = FakeDisplay::new(name);
@@ -327,7 +334,7 @@ fn a_linger_window_ends_in_a_teardown() {
 #[test]
 fn a_session_claims_its_parked_display() {
     in_child("a_session_claims_its_parked_display", &[], || {
-        let fake = FakeDisplay::new("gamescope");
+        let fake = spawning("gamescope");
         fake.script(|s| s.isolation = Some("cafe0123".into()));
         log_events(&fake);
         assert!(registry::park(&mut fake.boxed(), MODE).expect("park"));
@@ -359,7 +366,7 @@ fn a_session_claims_its_parked_display() {
 fn a_kept_display_takes_the_new_mode_or_is_retired_for_a_spawn() {
     let name = "a_kept_display_takes_the_new_mode_or_is_retired_for_a_spawn";
     in_child(name, &[], || {
-        let fake = FakeDisplay::new("gamescope");
+        let fake = spawning("gamescope");
         fake.script(|s| {
             s.sole_instance = true;
             s.can_resize = true;
@@ -402,12 +409,11 @@ fn a_kept_display_takes_the_new_mode_or_is_retired_for_a_spawn() {
 fn a_display_the_registry_does_not_own_passes_through() {
     let name = "a_display_the_registry_does_not_own_passes_through";
     in_child(name, &[], || {
-        let spawn = FakeDisplay::new("gamescope");
+        let spawn = spawning("gamescope");
         assert!(registry::park(&mut spawn.boxed(), MODE).expect("park"));
 
         let managed = FakeDisplay::new("gamescope");
         managed.script(|s| {
-            s.poolable = false;
             s.ownership = DisplayOwnership::SessionManaged;
             s.restore = true;
         });
@@ -415,7 +421,7 @@ fn a_display_the_registry_does_not_own_passes_through() {
         let mut want = created(true, MODE);
         want.pop();
         assert_eq!(managed.take_calls(), want);
-        assert!(out.pool_gen.is_none() && out.ownership != DisplayOwnership::Owned);
+        assert!(out.pool_gen.is_none() && !out.ownership.pooled());
         assert_eq!(pool(), [("gamescope", lifecycle::State::Pinned)]);
         drop(out);
         assert_eq!(managed.take_calls(), [Call::KeepaliveDropped(1)]);
@@ -483,7 +489,11 @@ fn only_a_gamescope_teardown_rearms_the_hdr_offer() {
         use pf_frame::hdr::{hdr_capture_failed, note_hdr_capture_failed, HdrSource};
         for (backend, rearmed) in [("kwin", false), ("gamescope", true)] {
             note_hdr_capture_failed(HdrSource::VirtualOutput);
-            let fake = FakeDisplay::new(backend);
+            let fake = if rearmed {
+                spawning(backend)
+            } else {
+                FakeDisplay::new(backend)
+            };
             drop(acquire(&fake, MODE, false));
             assert_eq!(fake.calls().last(), Some(&Call::KeepaliveDropped(1)));
             let offered = !hdr_capture_failed(HdrSource::VirtualOutput);
@@ -500,6 +510,7 @@ fn only_a_gamescope_teardown_rearms_the_hdr_offer() {
 fn each_gamescope_display_is_a_group_of_its_own() {
     in_child("each_gamescope_display_is_a_group_of_its_own", &[], || {
         let fake = restoring("gamescope");
+        fake.script(|s| s.ownership = DisplayOwnership::Spawned);
         let first = acquire(&fake, MODE, false);
         fake.take_calls();
         let second = acquire(&fake, MODE, false);
@@ -526,7 +537,7 @@ fn a_new_session_epoch_ends_a_kept_desktop_display_but_not_gamescope() {
     let name = "a_new_session_epoch_ends_a_kept_desktop_display_but_not_gamescope";
     in_child(name, KEPT, || {
         let desk = FakeDisplay::new("kwin");
-        let game = FakeDisplay::new("gamescope");
+        let game = spawning("gamescope");
         drop(acquire(&desk, MODE, false));
         drop(acquire(&game, MODE, false));
         game.take_calls();
@@ -553,8 +564,8 @@ fn a_seat_in_game_mode_keeps_only_its_own_gamescope() {
     let name = "a_seat_in_game_mode_keeps_only_its_own_gamescope";
     in_child(name, KEPT, || {
         registry::set_seat_game_mode(true);
-        let own = FakeDisplay::new("gamescope");
-        let light = FakeDisplay::new("gamescope");
+        let own = spawning("gamescope");
+        let light = spawning("gamescope");
         light.script(|s| s.isolation = Some("ab12cd34".into()));
         let desk = FakeDisplay::new("kwin");
         for fake in [&own, &light, &desk] {

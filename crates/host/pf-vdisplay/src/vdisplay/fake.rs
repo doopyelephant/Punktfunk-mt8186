@@ -53,10 +53,8 @@ pub(crate) enum Call {
 pub(crate) struct Script {
     /// `create` fails with this message. `None` creates node 1, 2, … in order.
     pub(crate) fail_create: Option<&'static str>,
-    /// Ownership a created output reports.
+    /// Ownership `ownership` answers and a created output reports.
     pub(crate) ownership: DisplayOwnership,
-    /// `poolable_now`. Nothing ties it to `ownership`, as on a real backend.
-    pub(crate) poolable: bool,
     /// A successful create prepares a topology restore for `take_topology_restore`.
     pub(crate) restore: bool,
     /// `undo` of exactly this fails; every other undo succeeds.
@@ -109,7 +107,6 @@ impl FakeDisplay {
                 script: Script {
                     fail_create: None,
                     ownership: DisplayOwnership::Owned,
-                    poolable: true,
                     restore: false,
                     fail_undo: None,
                     isolation: None,
@@ -277,8 +274,8 @@ impl VirtualDisplay for FakeDisplay {
         self.log(Call::SetFirstInGroup(first));
     }
 
-    fn poolable_now(&self) -> bool {
-        self.answer(|s| s.poolable)
+    fn ownership(&self) -> DisplayOwnership {
+        self.answer(|s| s.ownership)
     }
 
     fn sole_instance(&self) -> bool {

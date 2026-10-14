@@ -10,20 +10,32 @@
 
 use super::*;
 
-/// Who may pool or tear this output down. The registry keep-alives only [`Self::Owned`];
-/// [`Self::External`] and [`Self::SessionManaged`] pass through because their lifecycle lives
-/// elsewhere (gamescope attach / session-plus). See `design/gamemode-and-dedicated-sessions.md`.
+/// Who owns the session an output lives in, and so who may pool or tear it down. The registry
+/// keep-alives [`Self::Owned`] and [`Self::Spawned`]; [`Self::External`] and
+/// [`Self::SessionManaged`] pass through because their lifecycle lives elsewhere (gamescope
+/// attach / session-plus). See `design/gamemode-and-dedicated-sessions.md`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DisplayOwnership {
-    /// Registry may pool, linger, pin, and tear down (KWin, Mutter, wlroots, gamescope bare spawn,
-    /// Windows). Default: a silent backend is owned.
+    /// An output on the desktop's compositor (KWin, Mutter, wlroots, Hyprland, Windows). Displays
+    /// of one backend share a group and its restore, and die with the desktop's session epoch.
+    /// Default: a silent backend is owned.
     #[default]
     Owned,
+    /// A compositor spawned for this display alone (gamescope bare spawn). Pooled like
+    /// [`Self::Owned`], but a group of its own, alive while its child is, and ended with it.
+    Spawned,
     /// Mirrored foreign display: no keep-alive, topology, or reuse (gamescope attach).
     External,
     /// Gamescope-module session (`gamescope-session-plus` / SteamOS). Registry pass-through;
     /// restore stays in the gamescope module.
     SessionManaged,
+}
+
+impl DisplayOwnership {
+    /// The registry keeps it alive between sessions.
+    pub fn pooled(self) -> bool {
+        matches!(self, Self::Owned | Self::Spawned)
+    }
 }
 
 /// Isolation identity for an independent gamescope bare-spawn (`design/gamescope-multiuser.md`).
@@ -368,17 +380,14 @@ pub trait VirtualDisplay: Send {
     /// sole-monitor config would disable the first virtual. Registry sets this before `create`.
     /// Default no-op: KWin sees siblings by output name.
     fn set_first_in_group(&mut self, _first: bool) {}
-    /// Whether the current request's [`create`](Self::create) yields a poolable
-    /// ([`DisplayOwnership::Owned`]) display. Registry consults this *before* reuse lookup so a
-    /// gamescope managed/attach acquire cannot reuse a kept bare-spawn (same backend name).
-    /// Gamescope: `false` for `Managed`/`Attach`, `true` for `Spawn` and for no route (`create`'s
-    /// `None` arm is bare spawn, including operator-pinned `PUNKTFUNK_COMPOSITOR`). Mirror: always
-    /// `false`. See `design/gamemode-and-dedicated-sessions.md`.
-    ///
-    /// Default `true` is a default, not a fact: it must agree with the ownership `create` reports,
-    /// and nothing enforces that.
-    fn poolable_now(&self) -> bool {
-        true
+    /// Who owns the session the current request's [`create`](Self::create) yields. The registry
+    /// asks *before* reuse lookup, so a gamescope managed/attach acquire never reuses a kept bare
+    /// spawn (same backend name), and before create, for the group the display joins. It asserts
+    /// in debug builds that `create` agrees on [`pooled`](DisplayOwnership::pooled). Gamescope:
+    /// `Spawned` for `Spawn` and for no route (`create`'s `None` arm is bare spawn). Mirror:
+    /// `External`. See `design/gamemode-and-dedicated-sessions.md`.
+    fn ownership(&self) -> DisplayOwnership {
+        DisplayOwnership::Owned
     }
     /// Did this acquire start the nested launch command itself, as the compositor's primary
     /// child? `false` after a keep-alive reuse — nothing was spawned, so the session must launch

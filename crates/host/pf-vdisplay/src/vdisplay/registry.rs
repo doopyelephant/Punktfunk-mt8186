@@ -318,7 +318,7 @@ mod pool {
     use super::DisplayInfo;
     use crate::lifecycle;
     use crate::policy::{Layout, Linger};
-    use crate::Mode;
+    use crate::{DisplayOwnership, Mode};
 
     /// One pooled display. The backend keepalive lives here so the compositor
     /// output (and its PipeWire `node_id`) outlives the session.
@@ -352,6 +352,9 @@ mod pool {
         /// ([`crate::topology_journal`]). A hand-off appends, so the group keeps every
         /// member's; they run, newest first, when the last member drops.
         pub(super) undo_seqs: Vec<u64>,
+        /// Who owns its session: `Owned` (an output on the desktop's compositor) or
+        /// `Spawned` (a compositor of its own), the two the pool keeps.
+        pub(super) ownership: DisplayOwnership,
         /// Isolation identity at create (`design/gamescope-multiuser.md`). Reuse
         /// requires an exact match (EIS path + Pulse sinks baked into env).
         /// `None` = not isolated.
@@ -382,12 +385,12 @@ mod pool {
         pub(super) parked: bool,
     }
 
-    /// Gamescope is the only virtual output that offers HDR. Its teardown ends the compositor
-    /// a failed offer latched against, so the next spawn tries HDR again.
+    /// A spawned compositor is the only virtual output that offers HDR. Its teardown ends the
+    /// compositor a failed offer latched against, so the next spawn tries HDR again.
     impl Drop for Entry {
         fn drop(&mut self) {
             #[cfg(target_os = "linux")]
-            if self.backend == "gamescope" {
+            if self.ownership == DisplayOwnership::Spawned {
                 pf_frame::hdr::clear_virtual_output_hdr_latch();
             }
         }
@@ -512,18 +515,24 @@ mod pool {
                 && e.mode == mode
                 && e.isolation == *isolation
                 && e.hdr == hdr
-                && epoch_matches(e.backend, e.epoch, cur_epoch)
+                && epoch_matches(e.ownership, e.epoch, cur_epoch)
                 && e.join_name.as_ref().is_some_and(|n| n.get().is_some())
         })
     }
 
-    /// Display group: one per desktop compositor backend. Each gamescope spawn
-    /// is its own group — never auto-rowed or restore-grouped with another.
-    pub(super) fn group_key(backend: &str, generation: u64) -> String {
-        if backend == "gamescope" {
-            format!("gamescope#{generation}")
+    /// Display group: one per desktop compositor backend. A spawned compositor is a group of
+    /// its own — never auto-rowed or restore-grouped with another.
+    pub(super) fn group_key(backend: &str, ownership: DisplayOwnership, generation: u64) -> String {
+        if ownership == DisplayOwnership::Spawned {
+            format!("{backend}#{generation}")
         } else {
             backend.to_string()
+        }
+    }
+
+    impl Entry {
+        pub(super) fn group(&self) -> String {
+            group_key(self.backend, self.ownership, self.generation)
         }
     }
 
@@ -535,31 +544,24 @@ mod pool {
     ///
     /// Lifecycle is ignored: a lingering/pinned entry still occupies desktop
     /// space. Only first-in-group adds a liveness term (live sessions, not outputs).
-    pub(super) fn in_group(
-        e_backend: &str,
-        e_gen: u64,
-        backend: &str,
-        generation: u64,
-        supersedes: Option<u64>,
-    ) -> bool {
-        Some(e_gen) != supersedes && group_key(e_backend, e_gen) == group_key(backend, generation)
+    pub(super) fn in_group(e: &Entry, group: &str, supersedes: Option<u64>) -> bool {
+        Some(e.generation) != supersedes && e.group() == group
     }
 
     /// Move a departing display's topology restore onto a same-[group](in_group)
     /// sibling, or return it if the group is empty so the caller runs it
     /// before dropping the keepalive (the compositor must not see zero outputs).
     ///
-    /// Both `backend` and `generation` identify the departing display: keyed on
-    /// backend alone, a gamescope restore floated onto another client's spawn.
+    /// `group` is the departing display's [`Entry::group`]: keyed on backend alone, a
+    /// spawned compositor's restore floated onto another client's spawn.
     pub(super) fn hand_off_restore(
         remaining: &mut [Entry],
-        backend: &'static str,
-        generation: u64,
+        group: &str,
         restore: Option<Restore>,
     ) -> Option<Restore> {
         let action = restore?;
         // At most one restore per group, so any surviving sibling has `None`.
-        match heir(remaining, backend, generation) {
+        match heir(remaining, group) {
             Some(sibling) => {
                 sibling.topology_restore = Some(action);
                 None
@@ -570,29 +572,18 @@ mod pool {
 
     /// The member that inherits what a departing display held: any sibling of its
     /// [group](in_group) still in `remaining`, or none when the group is empty.
-    fn heir<'a>(
-        remaining: &'a mut [Entry],
-        backend: &'static str,
-        generation: u64,
-    ) -> Option<&'a mut Entry> {
-        remaining
-            .iter_mut()
-            .find(|e| in_group(e.backend, e.generation, backend, generation, None))
+    fn heir<'a>(remaining: &'a mut [Entry], group: &str) -> Option<&'a mut Entry> {
+        remaining.iter_mut().find(|e| in_group(e, group, None))
     }
 
     /// Move a departing display's journal seqs onto a same-[group](in_group) sibling, or
     /// return them if the group is empty so the caller runs them before dropping the
     /// keepalive. Appends, unlike [`hand_off_restore`]: every member's undo survives.
-    pub(super) fn hand_off_undo(
-        remaining: &mut [Entry],
-        backend: &'static str,
-        generation: u64,
-        seqs: Vec<u64>,
-    ) -> Vec<u64> {
+    pub(super) fn hand_off_undo(remaining: &mut [Entry], group: &str, seqs: Vec<u64>) -> Vec<u64> {
         if seqs.is_empty() {
             return seqs;
         }
-        match heir(remaining, backend, generation) {
+        match heir(remaining, group) {
             Some(sibling) => {
                 sibling.undo_seqs.extend(seqs);
                 Vec::new()
@@ -603,10 +594,14 @@ mod pool {
 
     /// Whether this entry's session epoch still matches for reuse/expiry.
     /// Epoch tracks the desktop compositor; a stale-epoch kept output is a
-    /// corpse. Gamescope is exempt: its node lives with its child, unrelated
+    /// corpse. A spawned compositor is exempt: its node lives with its child, unrelated
     /// to the desktop compositor. Liveness is `kept_display_alive` + `mark_failed`.
-    pub(super) fn epoch_matches(backend: &str, entry_epoch: u64, cur_epoch: u64) -> bool {
-        backend == "gamescope" || entry_epoch == cur_epoch
+    pub(super) fn epoch_matches(
+        ownership: DisplayOwnership,
+        entry_epoch: u64,
+        cur_epoch: u64,
+    ) -> bool {
+        ownership == DisplayOwnership::Spawned || entry_epoch == cur_epoch
     }
 
     /// Keys a kept display must match for an acquire to take it, beside its lifecycle and
@@ -629,7 +624,7 @@ mod pool {
             && e.isolation == *isolation
             && e.hw_cursor == hw_cursor
             && e.hdr == hdr
-            && epoch_matches(e.backend, e.epoch, cur_epoch)
+            && epoch_matches(e.ownership, e.epoch, cur_epoch)
     }
 
     /// What an acquire does with the kept display it picked.
@@ -706,20 +701,13 @@ mod pool {
         while i < entries.len() {
             if pred(&mut entries[i]) {
                 let mut e = entries.remove(i);
-                let (backend, generation) = (e.backend, e.generation);
-                if let Some(r) =
-                    hand_off_restore(entries, backend, generation, e.topology_restore.take())
-                {
+                let group = e.group();
+                if let Some(r) = hand_off_restore(entries, &group, e.topology_restore.take()) {
                     out.restores.push(r);
                 }
-                let seqs = hand_off_undo(
-                    entries,
-                    backend,
-                    generation,
-                    std::mem::take(&mut e.undo_seqs),
-                );
+                let seqs = hand_off_undo(entries, &group, std::mem::take(&mut e.undo_seqs));
                 if !seqs.is_empty() {
-                    out.undos.push((backend, seqs));
+                    out.undos.push((e.backend, seqs));
                 }
                 out.entries.push(e);
             } else {
@@ -730,11 +718,11 @@ mod pool {
     }
 
     /// Take entries past their linger deadline, and kept (non-Active) desktop displays whose
-    /// epoch is stale: the compositor was replaced, so the node id is a corpse. Gamescope is
-    /// exempt (`epoch_matches`); Active stays for its session's rebuild.
+    /// epoch is stale: the compositor was replaced, so the node id is a corpse. A spawned
+    /// compositor is exempt (`epoch_matches`); Active stays for its session's rebuild.
     pub(super) fn take_expired(entries: &mut Vec<Entry>, now: Instant, cur_epoch: u64) -> Drained {
         drain_where(entries, |e| {
-            let dead_epoch = !epoch_matches(e.backend, e.epoch, cur_epoch)
+            let dead_epoch = !epoch_matches(e.ownership, e.epoch, cur_epoch)
                 && !matches!(e.life, lifecycle::State::Active { .. });
             e.life.poll_expiry(now) || dead_epoch
         })
@@ -751,16 +739,18 @@ mod pool {
         }
     }
 
-    /// A seat's own Game Mode display, which a release keeps like a parked one: its gamescope
-    /// while the seat is in Game Mode. A light seat's is isolated and keeps the console's rules.
+    /// A seat's own Game Mode display, which a release keeps like a parked one: its spawned
+    /// gamescope while the seat is in Game Mode. A light seat's is isolated and keeps the
+    /// console's rules.
     pub(super) fn is_seat_game_mode(e: &Entry, seat_game_mode: bool) -> bool {
-        seat_game_mode && e.backend == "gamescope" && e.isolation.is_none()
+        seat_game_mode && e.ownership == DisplayOwnership::Spawned && e.isolation.is_none()
     }
 
     /// Flattened live/kept row so group/layout math runs outside the pool lock.
     pub(super) struct Row {
         pub(super) generation: u64,
         pub(super) backend: &'static str,
+        pub(super) ownership: DisplayOwnership,
         pub(super) mode: Mode,
         pub(super) identity_slot: Option<u32>,
         pub(super) state: &'static str,
@@ -815,7 +805,7 @@ mod pool {
 
         let mut keys: Vec<String> = rows
             .iter()
-            .map(|r| group_key(r.backend, r.generation))
+            .map(|r| group_key(r.backend, r.ownership, r.generation))
             .collect();
         keys.sort();
         keys.dedup();
@@ -825,7 +815,7 @@ mod pool {
             let mut idx: Vec<usize> = rows
                 .iter()
                 .enumerate()
-                .filter(|(_, row)| &group_key(row.backend, row.generation) == key)
+                .filter(|(_, row)| &group_key(row.backend, row.ownership, row.generation) == key)
                 .map(|(i, _)| i)
                 .collect();
             idx.sort_by_key(|&i| rows[i].generation);
@@ -888,6 +878,7 @@ mod pool {
                 identity_slot: None,
                 topology_restore: restore,
                 undo_seqs: Vec::new(),
+                ownership: DisplayOwnership::Owned,
                 isolation: None,
                 seat: None,
                 pid: None,
@@ -897,6 +888,12 @@ mod pool {
                 hdr: false,
                 parked: false,
             }
+        }
+
+        /// A compositor of its own, as a gamescope bare spawn reports.
+        fn spawned(mut e: Entry) -> Entry {
+            e.ownership = DisplayOwnership::Spawned;
+            e
         }
 
         fn flag_restore(flag: &Arc<AtomicBool>) -> Restore {
@@ -916,7 +913,7 @@ mod pool {
         fn ids_into(known: &mut BTreeMap<String, u32>, next: &mut u32, rows: &[Row]) {
             let mut keys: Vec<String> = rows
                 .iter()
-                .map(|r| group_key(r.backend, r.generation))
+                .map(|r| group_key(r.backend, r.ownership, r.generation))
                 .collect();
             keys.sort();
             keys.dedup();
@@ -929,7 +926,7 @@ mod pool {
             use pf_frame::hdr::{hdr_capture_failed, note_hdr_capture_failed, HdrSource};
             note_hdr_capture_failed(HdrSource::VirtualOutput);
             note_hdr_capture_failed(HdrSource::PortalMonitor);
-            drop(test_entry("gamescope", 1, None));
+            drop(spawned(test_entry("gamescope", 1, None)));
             assert!(!hdr_capture_failed(HdrSource::VirtualOutput));
             assert!(hdr_capture_failed(HdrSource::PortalMonitor));
         }
@@ -953,10 +950,10 @@ mod pool {
         /// Only the seat's own gamescope, and only while the seat is in Game Mode.
         #[test]
         fn a_seats_game_mode_display_is_its_unisolated_gamescope() {
-            let own = test_entry("gamescope", 1, None);
+            let own = spawned(test_entry("gamescope", 1, None));
             assert!(is_seat_game_mode(&own, true));
             assert!(!is_seat_game_mode(&own, false));
-            let mut light = test_entry("gamescope", 2, None);
+            let mut light = spawned(test_entry("gamescope", 2, None));
             light.isolation = Some("ab12cd34".into());
             assert!(!is_seat_game_mode(&light, true));
             assert!(!is_seat_game_mode(&test_entry("kwin", 3, None), true));
@@ -1013,13 +1010,13 @@ mod pool {
             ];
 
             let mut e1 = pool.remove(0);
-            let out = hand_off_restore(&mut pool, "kwin", 1, e1.topology_restore.take());
+            let out = hand_off_restore(&mut pool, "kwin", e1.topology_restore.take());
             assert!(out.is_none(), "transferred, not run");
             assert!(!ran.load(Ordering::SeqCst));
             assert!(pool[0].topology_restore.is_some());
 
             let mut e2 = pool.remove(0);
-            let out = hand_off_restore(&mut pool, "kwin", 2, e2.topology_restore.take());
+            let out = hand_off_restore(&mut pool, "kwin", e2.topology_restore.take());
             let action = out.expect("group empty → run the restore");
             assert!(!ran.load(Ordering::SeqCst), "not run yet");
             action();
@@ -1031,7 +1028,7 @@ mod pool {
             let ran = Arc::new(AtomicBool::new(false));
             let mut pool = vec![test_entry("kwin", 1, Some(flag_restore(&ran)))];
             let mut e = pool.remove(0);
-            let action = hand_off_restore(&mut pool, "kwin", 1, e.topology_restore.take())
+            let action = hand_off_restore(&mut pool, "kwin", e.topology_restore.take())
                 .expect("last (only) member → run");
             action();
             assert!(ran.load(Ordering::SeqCst));
@@ -1046,10 +1043,10 @@ mod pool {
                 test_entry("kwin", 2, Some(flag_restore(&ran))),
             ];
             let mut e1 = pool.remove(0);
-            assert!(hand_off_restore(&mut pool, "kwin", 1, e1.topology_restore.take()).is_none());
+            assert!(hand_off_restore(&mut pool, "kwin", e1.topology_restore.take()).is_none());
             assert!(pool[0].topology_restore.is_some());
             let mut e2 = pool.remove(0);
-            hand_off_restore(&mut pool, "kwin", 2, e2.topology_restore.take())
+            hand_off_restore(&mut pool, "kwin", e2.topology_restore.take())
                 .expect("last member → run")();
             assert!(ran.load(Ordering::SeqCst));
         }
@@ -1060,17 +1057,17 @@ mod pool {
         fn journal_seqs_float_to_a_sibling_and_every_members_survive() {
             let mut pool = vec![test_entry("wlroots", 2, None)];
             pool[0].undo_seqs = vec![3];
-            assert!(hand_off_undo(&mut pool, "wlroots", 1, vec![1, 2]).is_empty());
+            assert!(hand_off_undo(&mut pool, "wlroots", vec![1, 2]).is_empty());
             assert_eq!(pool[0].undo_seqs, [3, 1, 2]);
             let mut last = pool.pop().expect("the heir");
             assert_eq!(
-                hand_off_undo(&mut pool, "wlroots", 2, std::mem::take(&mut last.undo_seqs)),
+                hand_off_undo(&mut pool, "wlroots", std::mem::take(&mut last.undo_seqs)),
                 [3, 1, 2],
                 "group empty: the caller runs them"
             );
-            assert!(hand_off_undo(&mut pool, "wlroots", 2, Vec::new()).is_empty());
+            assert!(hand_off_undo(&mut pool, "wlroots", Vec::new()).is_empty());
             let mut other = vec![test_entry("kwin", 5, None)];
-            assert_eq!(hand_off_undo(&mut other, "wlroots", 1, vec![9]), [9]);
+            assert_eq!(hand_off_undo(&mut other, "wlroots", vec![9]), [9]);
             assert!(other[0].undo_seqs.is_empty(), "never across backends");
         }
 
@@ -1078,7 +1075,7 @@ mod pool {
         fn restore_never_floats_across_backends() {
             let ran = Arc::new(AtomicBool::new(false));
             let mut pool = vec![test_entry("mutter", 2, None)];
-            let out = hand_off_restore(&mut pool, "kwin", 1, Some(flag_restore(&ran)));
+            let out = hand_off_restore(&mut pool, "kwin", Some(flag_restore(&ran)));
             assert!(out.is_some(), "no same-backend sibling → return to run");
             assert!(
                 pool[0].topology_restore.is_none(),
@@ -1318,26 +1315,31 @@ mod pool {
         #[test]
         fn restore_never_floats_between_gamescope_spawns() {
             let ran = Arc::new(AtomicBool::new(false));
-            let mut pool = vec![test_entry("gamescope", 2, None)];
-            let out = hand_off_restore(&mut pool, "gamescope", 1, Some(flag_restore(&ran)));
+            let mut pool = vec![spawned(test_entry("gamescope", 2, None))];
+            let first = group_key("gamescope", DisplayOwnership::Spawned, 1);
+            let out = hand_off_restore(&mut pool, &first, Some(flag_restore(&ran)));
             assert!(out.is_some(), "another client's spawn is not a sibling");
             assert!(pool[0].topology_restore.is_none());
         }
 
         #[test]
         fn group_membership_splits_spawns_and_excludes_the_superseded() {
-            assert!(in_group("kwin", 1, "kwin", 2, None));
-            assert!(!in_group("mutter", 1, "kwin", 2, None));
-            assert!(!in_group("gamescope", 1, "gamescope", 2, None));
-            assert!(in_group("gamescope", 7, "gamescope", 7, None));
-            assert!(!in_group("kwin", 1, "kwin", 2, Some(1)));
-            assert!(in_group("kwin", 3, "kwin", 2, Some(1)));
+            let desk = |b, g| test_entry(b, g, None);
+            let spawn = |g| spawned(test_entry("gamescope", g, None));
+            let spawn_group = |g| group_key("gamescope", DisplayOwnership::Spawned, g);
+            assert!(in_group(&desk("kwin", 1), "kwin", None));
+            assert!(!in_group(&desk("mutter", 1), "kwin", None));
+            assert!(!in_group(&spawn(1), &spawn_group(2), None));
+            assert!(in_group(&spawn(7), &spawn_group(7), None));
+            assert!(!in_group(&desk("kwin", 1), "kwin", Some(1)));
+            assert!(in_group(&desk("kwin", 3), "kwin", Some(1)));
         }
 
         fn row(generation: u64, backend: &'static str, w: u32, slot: Option<u32>) -> Row {
             Row {
                 generation,
                 backend,
+                ownership: DisplayOwnership::Owned,
                 mode: Mode {
                     width: w,
                     height: 1080,
@@ -1347,6 +1349,13 @@ mod pool {
                 state: "active",
                 expires_in_ms: None,
                 sessions: 1,
+            }
+        }
+
+        fn spawned_row(generation: u64, backend: &'static str, w: u32) -> Row {
+            Row {
+                ownership: DisplayOwnership::Spawned,
+                ..row(generation, backend, w, None)
             }
         }
 
@@ -1387,7 +1396,10 @@ mod pool {
             let before = assemble_displays(desktop, &Layout::default(), "extend", &known);
             let kwin_group = before[0].group;
 
-            let both = vec![row(1, "kwin", 1920, None), row(3, "gamescope", 1280, None)];
+            let both = vec![
+                row(1, "kwin", 1920, None),
+                spawned_row(3, "gamescope", 1280),
+            ];
             ids_into(&mut known, &mut next, &both);
             let after = assemble_displays(both, &Layout::default(), "extend", &known);
             let kwin_after = after.iter().find(|d| d.backend == "kwin").unwrap();
@@ -1435,8 +1447,8 @@ mod pool {
         #[test]
         fn gamescope_spawns_are_separate_groups() {
             let rows = vec![
-                row(1, "gamescope", 1920, None),
-                row(2, "gamescope", 1280, None),
+                spawned_row(1, "gamescope", 1920),
+                spawned_row(2, "gamescope", 1280),
             ];
             let ids = ids_for(&rows);
             let out = assemble_displays(rows, &Layout::default(), "extend", &ids);
@@ -1491,7 +1503,7 @@ mod pool {
             e4.life = lifecycle::State::Active { refs: 1 };
             e4.epoch = 4;
             es.push(e4);
-            let mut e5 = test_entry("gamescope", 5, None);
+            let mut e5 = spawned(test_entry("gamescope", 5, None));
             e5.life = lifecycle::State::Pinned;
             e5.epoch = 1;
             es.push(e5);
@@ -1850,18 +1862,19 @@ mod linux {
             release_kept(Some(g), "evicted (max_displays reached)");
         }
 
-        // Stamp generation before group questions: a gamescope spawn's group
+        // Stamp generation before group questions: a spawned compositor's group
         // IS its generation. A burned stamp on failed create is fine (opaque,
         // monotonic, never an index).
         let generation = r.generation.fetch_add(1, Ordering::Relaxed);
+        let ownership = vd.ownership();
+        let group = group_key(backend, ownership, generation);
 
         // First-in-group excludes `supersedes` (still Active); kept leftovers have no session
         // to clobber.
         let first_in_group = {
             let es = r.entries.lock().unwrap();
             !es.iter().any(|e| {
-                in_group(e.backend, e.generation, backend, generation, supersedes)
-                    && matches!(e.life, lifecycle::State::Active { .. })
+                in_group(e, &group, supersedes) && matches!(e.life, lifecycle::State::Active { .. })
             })
         };
         vd.set_first_in_group(first_in_group);
@@ -1874,11 +1887,12 @@ mod linux {
         vd.set_session_cast_handoff(false);
         let real = real?;
 
-        // Pool only `Owned` with no portal fd on the output. Pass through
+        // Pool only `Owned` and `Spawned` with no portal fd on the output. Pass through
         // `External`/`SessionManaged` (gamescope owns those; pooling wedges on
         // a stale node) and `remote_fd = Some` (a portal fd cannot be reopened).
         // Hyprland and sway leave the fd off so this arm pools the named head.
-        if real.ownership != crate::DisplayOwnership::Owned || real.remote_fd.is_some() {
+        debug_assert_eq!(real.ownership.pooled(), ownership.pooled(), "{backend}");
+        if !real.ownership.pooled() || real.remote_fd.is_some() {
             tracing::debug!(
                 backend,
                 ownership = ?real.ownership,
@@ -1908,7 +1922,7 @@ mod linux {
     ) -> Option<VirtualOutput> {
         // Gamescope managed/attach shares the `"gamescope"` name with a bare spawn and must
         // not reuse it.
-        if !vd.poolable_now() {
+        if !vd.ownership().pooled() {
             return None;
         }
         let backend = vd.name();
@@ -2110,6 +2124,7 @@ mod linux {
             identity_slot,
             topology_restore,
             undo_seqs,
+            ownership: real.ownership,
             isolation,
             seat: real.seat.clone(),
             pid: real.pid,
@@ -2122,6 +2137,7 @@ mod linux {
 
         // Position then push under the same lock (I/O-free). Apply is below,
         // outside the lock.
+        let group = entry.group();
         let position = {
             use crate::layout::Member;
             let layout_policy = policy::prefs()
@@ -2133,7 +2149,7 @@ mod linux {
             // the predecessor and walks one width right on every mode switch.
             let existing: Vec<(u64, Member)> = es
                 .iter()
-                .filter(|e| in_group(e.backend, e.generation, backend, generation, supersedes))
+                .filter(|e| in_group(e, &group, supersedes))
                 .map(|e| {
                     (
                         e.generation,
@@ -2286,9 +2302,9 @@ mod linux {
             match es[idx].life.release(Instant::now(), linger) {
                 Release::Teardown => {
                     let mut e = es.remove(idx);
-                    let (backend, g) = (e.backend, e.generation);
-                    let restore = hand_off_restore(&mut es, backend, g, e.topology_restore.take());
-                    undo = hand_off_undo(&mut es, backend, g, std::mem::take(&mut e.undo_seqs));
+                    let group = e.group();
+                    let restore = hand_off_restore(&mut es, &group, e.topology_restore.take());
+                    undo = hand_off_undo(&mut es, &group, std::mem::take(&mut e.undo_seqs));
                     (Some(e), restore)
                 }
                 // No live hold: do nothing. Do not treat this as Teardown — a
@@ -2369,6 +2385,7 @@ mod linux {
                     Some(Row {
                         generation: e.generation,
                         backend: e.backend,
+                        ownership: e.ownership,
                         mode: e.mode,
                         identity_slot: e.identity_slot,
                         state: e.life.label(),
@@ -2388,7 +2405,7 @@ mod linux {
         // group must never renumber an existing one under the console.
         let mut keys: Vec<String> = rows
             .iter()
-            .map(|r| group_key(r.backend, r.generation))
+            .map(|r| group_key(r.backend, r.ownership, r.generation))
             .collect();
         keys.sort();
         keys.dedup();
@@ -2465,7 +2482,7 @@ mod linux {
         let released = {
             let mut es = r.entries.lock().unwrap();
             drain_where(&mut es, |e| {
-                e.backend == "gamescope" && e.isolation.is_none() && e.life.force_release()
+                is_seat_game_mode(e, true) && e.life.force_release()
             })
         };
         released.finish("the seat switched to its desktop")
@@ -2496,9 +2513,9 @@ mod linux {
                 return;
             }
             let mut e = es.remove(idx);
-            let (backend, g) = (e.backend, e.generation);
-            let restore = hand_off_restore(&mut es, backend, g, e.topology_restore.take());
-            let undo = hand_off_undo(&mut es, backend, g, std::mem::take(&mut e.undo_seqs));
+            let group = e.group();
+            let restore = hand_off_restore(&mut es, &group, e.topology_restore.take());
+            let undo = hand_off_undo(&mut es, &group, std::mem::take(&mut e.undo_seqs));
             (e, restore, undo)
         };
         if let Some(rst) = restore {

@@ -196,10 +196,15 @@ impl VirtualDisplay for GamescopeDisplay {
         adopt(undo)
     }
 
-    fn poolable_now(&self) -> bool {
+    fn ownership(&self) -> DisplayOwnership {
         // Must agree with what `create` does with the same route — not [`crate::launch_is_nested`],
-        // which is `false` for `None`. `None` falls through to bare spawn, so it is poolable.
-        matches!(self.route, None | Some(crate::GamescopeRoute::Spawn))
+        // which is `false` for `None`. `None` falls through to bare spawn. A managed route that
+        // degrades to attach reports `External`; neither is pooled.
+        match self.route {
+            Some(crate::GamescopeRoute::Managed { .. }) => DisplayOwnership::SessionManaged,
+            Some(crate::GamescopeRoute::Attach { .. }) => DisplayOwnership::External,
+            Some(crate::GamescopeRoute::Spawn) | None => DisplayOwnership::Spawned,
+        }
     }
 
     fn nested_launch_started(&self) -> bool {
@@ -207,9 +212,9 @@ impl VirtualDisplay for GamescopeDisplay {
     }
 
     fn sole_instance(&self) -> bool {
-        // Bare spawn only; managed/attach do not own the socket name. Same route test as
-        // `poolable_now` — a second spawn is what breaks the `gamescope-N` lock and Steam.
-        self.poolable_now()
+        // Bare spawn only; managed/attach do not own the socket name. A second spawn is what
+        // breaks the `gamescope-N` lock and Steam.
+        self.ownership() == DisplayOwnership::Spawned
     }
 
     fn kept_display_alive(&mut self, node_id: u32) -> bool {
@@ -219,8 +224,8 @@ impl VirtualDisplay for GamescopeDisplay {
     }
 
     fn can_resize_kept(&self) -> bool {
-        // Same route test as `poolable_now`: only a spawn of ours owns the seat whose atom we set.
-        self.poolable_now() && gamescope_can_resize_output()
+        // Only a spawn of ours owns the seat whose atom we set.
+        self.ownership() == DisplayOwnership::Spawned && gamescope_can_resize_output()
     }
 
     fn resize_kept(&mut self, seat: Option<&str>, mode: Mode) -> bool {
@@ -378,6 +383,7 @@ impl GamescopeDisplay {
             Some((mode.width, mode.height, mode.refresh_hz)),
             Box::new(proc),
         );
+        out.ownership = DisplayOwnership::Spawned;
         // From the same log `wait_for_node` just read. `None` only if gamescope changed the line;
         // every discovery then falls back to unscoped, which is what it did before seats.
         out.seat = wayland_name_from_log(&log);

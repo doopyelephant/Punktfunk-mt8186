@@ -80,10 +80,10 @@ impl VirtualDisplay for MirrorDisplay {
         self.last_cursor_mode
     }
 
-    fn poolable_now(&self) -> bool {
-        // Asked before `create` can declare `External`. Default `true` would claim
+    fn ownership(&self) -> DisplayOwnership {
+        // Asked before `create` can declare `External`. The default `Owned` would claim
         // a head we did not make and must not pool.
-        false
+        DisplayOwnership::External
     }
 
     fn create(&mut self, _mode: Mode) -> Result<VirtualOutput> {
@@ -347,11 +347,11 @@ mod tests {
         assert!(names_ours_conclusively(Compositor::Windows));
     }
 
-    /// `poolable_now` is asked before `create` reports ownership; both must say External.
+    /// `ownership` is asked before `create` reports it; both must say External.
     #[test]
     fn a_mirrored_head_is_never_registry_poolable() {
         let vd = MirrorDisplay::new(Compositor::Kwin, "DP-2".into()).unwrap();
-        assert!(!vd.poolable_now());
+        assert_eq!(vd.ownership(), DisplayOwnership::External);
     }
 
     /// Enabled but modeless would negotiate a 0x0 stream.
