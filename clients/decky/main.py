@@ -868,17 +868,24 @@ class Plugin:
         decky.logger.warning("pairing failed (rc=%s): %s", rc, detail)
         return {"ok": False, "error": _cli_error(rc, err), "detail": detail}
 
-    async def request_access(self, addr: str, port: int, name: str = "Steam Deck") -> dict:
-        """No-PIN pairing (``punktfunk pair <addr:port> --request-access --name LABEL``).
+    async def request_access(
+        self, addr: str, port: int, name: str = "Steam Deck", fp: str = ""
+    ) -> dict:
+        """No-PIN pairing (``punktfunk pair <addr:port> --request-access --name LABEL --fp HEX``).
 
-        Waits up to ~185 s for the host's operator to approve this Deck, pinned to the
-        fingerprint ``trust_host`` saved. Never streams. Same result shape as ``pair``; on
-        failure ``detail`` is the CLI's sentence for the user. A client too old for the flag
-        asks for a PIN instead, which comes back ``client-outdated``."""
-        rc, out, err = await _run_cli(
-            ["pair", f"{addr}:{int(port)}", "--request-access", "--name", name],
-            timeout=200.0,
-        )
+        Waits up to ~185 s for the host's operator to approve this Deck, pinned to ``fp``, the
+        fingerprint the host advertised and ``trust_host`` saved. Without it the CLI takes the
+        newest record at the address, which at a dual-boot box can be the other OS. Never
+        streams. Same result shape as ``pair``; on failure ``detail`` is the CLI's sentence for
+        the user. A client too old for the flag asks for a PIN instead, which comes back
+        ``client-outdated``."""
+        fp = str(fp).strip()
+        if fp and not re.fullmatch(r"[0-9a-fA-F]{64}", fp):
+            return {"ok": False, "error": "unresolved", "detail": "bad host fingerprint"}
+        args = ["pair", f"{addr}:{int(port)}", "--request-access", "--name", name]
+        if fp:
+            args += ["--fp", fp]
+        rc, out, err = await _run_cli(args, timeout=200.0)
         if rc == 0:
             fp = ""
             for token in out.split():

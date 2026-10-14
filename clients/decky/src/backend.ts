@@ -185,12 +185,14 @@ export const pair = callable<
   PairResult
 >("pair");
 /**
- * No-PIN pairing: wait (up to ~185 s) for the host's operator to approve this Deck, pinned to the
- * fingerprint `trustHost` saved. Never streams. On failure `detail` is a sentence for the user.
+ * No-PIN pairing: wait (up to ~185 s) for the host's operator to approve this Deck, pinned to
+ * `fp`, the advertised fingerprint `trustHost` saved. The address alone names both OS installs of
+ * a dual-boot box. Never streams. On failure `detail` is a sentence for the user.
  */
-export const requestAccess = callable<[addr: string, port: number, name: string], PairResult>(
-  "request_access",
-);
+export const requestAccess = callable<
+  [addr: string, port: number, name: string, fp: string],
+  PairResult
+>("request_access");
 /**
  * Step 1 of request access: save the host with its ADVERTISED fingerprint, pinned but unpaired.
  * The launch that follows pins the same fingerprint, which is the only thing standing between a

@@ -441,6 +441,22 @@ final class LibraryClientTests: XCTestCase {
         XCTAssertEqual(MgmtTarget.make(host: paired, identity: identity).failure, .keychain)
     }
 
+    func testARefusedWakeReadsAsTheHostsSentence() {
+        func woken(_ code: Int) -> String {
+            do {
+                try LibraryClient.expectWoken(HTTPResponse(status: code, headers: [:], body: Data()))
+                return "ok"
+            } catch {
+                return LibraryClient.wakeFailedLine("Kid", error)
+            }
+        }
+        XCTAssertEqual(woken(200), "ok")
+        XCTAssertEqual(woken(202), "ok")
+        XCTAssertEqual(woken(403), "This device isn't allowed to start another profile's seat.")
+        XCTAssertEqual(woken(401), "Couldn't wake Kid's desk. Try again in a moment.")
+        XCTAssertEqual(woken(500), "Couldn't wake Kid's desk. Try again in a moment.")
+    }
+
     func testExpectOKFoldsTheCertificateRefusals() {
         func status(_ code: Int, _ ok: Set<Int> = [200]) -> String {
             let response = HTTPResponse(status: code, headers: [:], body: Data())

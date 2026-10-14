@@ -238,6 +238,18 @@ pub fn waking_line(display_name: &str) -> String {
     format!("Getting {display_name}'s desk ready…")
 }
 
+/// The host's refusal of another profile's seat (403), in its own words.
+pub const WAKE_REFUSED: &str = "This device isn't allowed to start another profile's seat.";
+
+/// The line a failed [`wake`] ends a seat wait with: the refusal as its own sentence, any
+/// other failure under the desk it was for.
+pub fn wake_failed(display_name: &str, e: &crate::library::LibraryError) -> String {
+    match e {
+        crate::library::LibraryError::Http(403) => WAKE_REFUSED.to_string(),
+        e => format!("Couldn't wake {display_name}'s desk \u{2014} {e}"),
+    }
+}
+
 /// `GET /api/v1/profiles/enumerate`. `Ok(None)` when the box has no profiles (404).
 #[cfg(desktop)]
 pub fn fetch_enumerate(
@@ -264,7 +276,7 @@ pub fn fetch_enumerate(
 }
 
 /// `POST /api/v1/profiles/{id}/wake`: starts a stopped seat and answers with its row, which
-/// says `starting` until the seat is up.
+/// says `starting` until the seat is up. A refusal is `Http(403)` ([`wake_error`]).
 #[cfg(desktop)]
 pub fn wake(
     addr: &str,
@@ -273,15 +285,25 @@ pub fn wake(
     pin: Option<[u8; 32]>,
     id: &str,
 ) -> Result<ListedProfile, crate::library::LibraryError> {
-    use crate::library::{agent, base_url, classify, LibraryError};
+    use crate::library::{agent, base_url, LibraryError};
     let agent = agent(identity, pin)?;
     let url = format!("{}/api/v1/profiles/{id}/wake", base_url(addr, mgmt_port));
-    let mut resp = agent.post(&url).send_empty().map_err(classify)?;
+    let mut resp = agent.post(&url).send_empty().map_err(wake_error)?;
     let body = resp
         .body_mut()
         .read_to_string()
         .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))?;
     serde_json::from_str(&body).map_err(|e| LibraryError::Unreachable(format!("bad JSON: {e}")))
+}
+
+/// [`classify`](crate::library::classify) for a wake. The cert lane answers an unpaired device
+/// 401, so a 403 is the host refusing this device the profile's seat, not "pair first".
+#[cfg(desktop)]
+fn wake_error(e: ureq::Error) -> crate::library::LibraryError {
+    match e {
+        ureq::Error::StatusCode(403) => crate::library::LibraryError::Http(403),
+        e => crate::library::classify(e),
+    }
 }
 
 /// [`fetch_enumerate`] cut off at `budget`; blocks the calling thread. `None`: the read failed
@@ -336,7 +358,7 @@ pub fn watch_seat(
         match wake(addr, mgmt_port, identity, pin, &row.id) {
             Ok(woken) => row = woken,
             Err(e) => {
-                each(Err(format!("Couldn't wake {name}'s desk \u{2014} {e}")));
+                each(Err(wake_failed(name, &e)));
                 return;
             }
         }
@@ -397,6 +419,28 @@ mod tests {
             SeatGate::Refuse("Seats are off.".into())
         );
         assert_eq!(waking_line("Kid"), "Getting Kid's desk ready…");
+    }
+
+    /// A wake the host refuses (403) reads as its sentence; an unpaired device (401) and any
+    /// other failure keep the desk's frame.
+    #[test]
+    fn a_refused_wake_reads_as_the_hosts_sentence() {
+        use crate::library::LibraryError;
+        assert_eq!(
+            wake_failed("Kid", &LibraryError::Http(403)),
+            "This device isn't allowed to start another profile's seat."
+        );
+        assert_eq!(
+            wake_failed("Kid", &LibraryError::Http(500)),
+            "Couldn't wake Kid's desk \u{2014} the host refused it (500)"
+        );
+        #[cfg(desktop)]
+        {
+            let refused = wake_error(ureq::Error::StatusCode(403));
+            assert!(matches!(refused, LibraryError::Http(403)), "{refused:?}");
+            let unpaired = wake_error(ureq::Error::StatusCode(401));
+            assert!(matches!(unpaired, LibraryError::NotPaired), "{unpaired:?}");
+        }
     }
 
     #[derive(Deserialize)]

@@ -1000,12 +1000,11 @@ pub fn emit(line: SessionLine) {
 /// renderer's — and only on a real change, so a session that never resizes
 /// never touches the file.
 pub fn persist_window_size(w: u32, h: u32) {
-    let mut s = Settings::load();
-    if (s.last_window_w, s.last_window_h) != (w, h) {
-        s.last_window_w = w;
-        s.last_window_h = h;
-        s.save();
-    }
+    Settings::update(|s| {
+        let changed = (s.last_window_w, s.last_window_h) != (w, h);
+        (s.last_window_w, s.last_window_h) = (w, h);
+        changed
+    });
 }
 
 /// Forget the record `pick` names in the store as it is under the lock, and save. Once
@@ -1045,10 +1044,7 @@ pub fn unpair_host(
 fn drop_keyed(fp_hex: &str, id: Option<&str>) {
     crate::library_cache::forget(fp_hex);
     crate::host_actions::invalidate(fp_hex);
-    let mut settings = Settings::load();
-    if crate::start::clear_default(&mut settings, id) {
-        settings.save();
-    }
+    Settings::update(|settings| crate::start::clear_default(settings, id));
 }
 
 /// Session binary: installed next to this executable, else `$PATH` (a dev run

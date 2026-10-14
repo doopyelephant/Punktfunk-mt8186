@@ -51,17 +51,11 @@ enum ProfileFetch {
 }
 
 extension ProfileFetch {
-    /// Start profile `id`'s stopped seat on `host`. false: the host didn't take the call.
-    static func wake(_ host: StoredHost, mgmt: UInt16? = nil, id: String) async -> Bool {
-        guard case .success(let target) = MgmtTarget.make(host: host, port: mgmt) else {
-            return false
-        }
-        do {
-            try await LibraryClient.wakeProfile(id: id, on: target)
-            return true
-        } catch {
-            return false
-        }
+    /// Start profile `id`'s stopped seat on `host`. Throws what stopped it, for
+    /// `LibraryClient.wakeFailedLine`; an unpaired host fails without a request.
+    static func wake(_ host: StoredHost, mgmt: UInt16? = nil, id: String) async throws {
+        let target = try MgmtTarget.make(host: host, port: mgmt).get()
+        try await LibraryClient.wakeProfile(id: id, on: target)
     }
 }
 

@@ -73,13 +73,15 @@ internal fun SkiaConsole.changeInstall(c: JSONObject) {
  * [LibraryClient.fetchAcrossWake], then the running set and the posters — each poster
  * fetched over the same mTLS client and pushed as bytes. The list and phase go up under the
  * command's `req`; a refetch this shell starts reuses the last one, and only for its host.
+ * A wake takes the MACs of the record the pin names, else of the placeholder at `addr` and
+ * `port`, the stream port ([io.unom.punktfunk.kit.security.KnownHostStore.resolve]).
  * Main thread only.
  */
 internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
     val app = appContext ?: return
     val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
     val id = identity
-    val kh = knownHostStore.getByFp(fp)
+    val kh = knownHostStore.resolve(fp, addr, c.optInt("port"))
     if (refreshOnly) {
         // Silent path — no notice, but the failed load still gets its retry.
         if (id == null) { identities.blockedMessage(); return }

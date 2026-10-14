@@ -356,22 +356,24 @@ pub fn same_pin(a: &str, b: &str) -> Option<bool> {
 }
 
 thread_local! {
-    /// Set while this thread holds the store lock. A second lock on the sidecar would wait
-    /// on the first for ever, so a nested edit runs under the outer one.
+    /// Set while this thread holds a store lock. A second lock on the sidecar would wait on
+    /// the first for ever, so a nested edit runs under the outer one. One flag for every
+    /// store: a thread holding one lock takes no other, so two processes never wait in a ring.
     static LOCK_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The store's lock across processes, held for one read, apply, save. It sits on a sidecar
-/// file: a save renames a new file over the store, so a lock on the store would stay with
-/// the file that was replaced. Best effort: where it can't be taken, the edit still runs.
-/// The wait has no deadline; the OS frees the lock of a holder that dies.
-struct StoreLock {
+/// A store's lock across processes, held for one read, apply, save: the saved hosts and the
+/// settings file each have one. It sits on a sidecar file: a save renames a new file over the
+/// store, so a lock on the store would stay with the file that was replaced. Best effort:
+/// where it can't be taken, the edit still runs. The wait has no deadline; the OS frees the
+/// lock of a holder that dies.
+pub(crate) struct StoreLock {
     file: Option<File>,
     nested: bool,
 }
 
 impl StoreLock {
-    fn take(store: &Path) -> StoreLock {
+    pub(crate) fn take(store: &Path) -> StoreLock {
         let nested = LOCK_HELD.replace(true);
         let file = if nested { None } else { Self::lock(store) };
         StoreLock { file, nested }
@@ -610,10 +612,12 @@ impl KnownHosts {
         }
     }
 
-    /// Insert or refresh an entry, keyed by fingerprint. `paired` only ever upgrades
-    /// (a later TOFU connect must not demote a PIN-paired host).
+    /// Insert or refresh an entry, keyed by fingerprint ([`same_pin`]): an entry without one
+    /// is always a new record, never the first placeholder saved anywhere. `paired` only ever
+    /// upgrades (a later TOFU connect must not demote a PIN-paired host).
     pub fn upsert(&mut self, entry: KnownHost) {
-        if let Some(h) = self.hosts.iter_mut().find(|h| h.fp_hex == entry.fp_hex) {
+        let same = |h: &&mut KnownHost| same_pin(&h.fp_hex, &entry.fp_hex) == Some(true);
+        if let Some(h) = self.hosts.iter_mut().find(same) {
             // A label the user chose is theirs. A name that is empty, or is just the address,
             // is one the caller synthesised for want of anything better — re-pairing used to
             // replace "Desk" with "192.168.1.50".
@@ -746,7 +750,11 @@ impl KnownHosts {
         if retired.is_empty() {
             return;
         }
-        let Some(h) = self.hosts.iter_mut().find(|h| h.fp_hex == fp_hex) else {
+        let Some(h) = self
+            .hosts
+            .iter_mut()
+            .find(|h| same_pin(&h.fp_hex, &fp_hex) == Some(true))
+        else {
             return;
         };
         for old in retired {
@@ -1258,6 +1266,40 @@ mod tests {
         assert_eq!(k.hosts[0].preset_for_game("halo"), Some("dddddddddddd"));
         k.hosts[0].bind_game_preset("halo", None);
         assert!(k.hosts[0].game_presets.is_empty());
+    }
+
+    /// An entry without a pin lands beside the placeholders already saved, never over the
+    /// first of them; a pin in another hex case refreshes its record.
+    #[test]
+    fn upsert_never_keys_on_an_empty_pin() {
+        let at = |name: &str, addr: &str, fp_hex: &str| KnownHost {
+            name: name.into(),
+            addr: addr.into(),
+            port: 9777,
+            fp_hex: fp_hex.into(),
+            ..Default::default()
+        };
+        let mut k = KnownHosts {
+            hosts: vec![
+                at("Attic", "10.0.0.9", ""),
+                at("Desk", "10.0.0.2", &fp('a')),
+            ],
+        };
+        k.upsert(at("Den", "10.0.0.3", ""));
+        k.upsert(at("Desk", "10.0.0.4", &fp('A')));
+        let rows: Vec<(&str, &str)> = k
+            .hosts
+            .iter()
+            .map(|h| (h.name.as_str(), h.addr.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("Attic", "10.0.0.9"),
+                ("Desk", "10.0.0.4"),
+                ("Den", "10.0.0.3")
+            ]
+        );
     }
 
     /// A store written before `mgmt_port` loads, resolves to 47990, then takes and
