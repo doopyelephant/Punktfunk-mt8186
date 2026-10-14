@@ -18,6 +18,7 @@ use anyhow::Result;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 
+pub(crate) use crate::video_caps::resolve_decoder_pref;
 #[cfg(target_os = "linux")]
 pub(crate) use crate::video_caps::VENDOR_INTEL;
 /// The capability and advertisement gates live in `video_caps`; call sites keep `video::` paths.
@@ -29,7 +30,6 @@ pub use crate::video_caps::{
     usable_decode_ops, video_caps_for, wire_codec_name, LastRungVerdict, NativeRung, RungEvidence,
     RungLoss, V4l2Summary, AMD_VULKAN_HDR_DRIVER_FLOOR,
 };
-pub(crate) use crate::video_caps::{native_vulkan_gate, resolve_decoder_pref};
 #[cfg(target_os = "linux")]
 pub use crate::video_caps::{vaapi_av1_decodable, vaapi_hevc_decodable};
 pub use crate::video_color::{csc_rows, ColorDesc};
@@ -611,7 +611,7 @@ pub(crate) const VIDEO_CODEC_OP_DECODE_AV1: u32 = 0x0000_0004;
 ///
 /// Returned together: splitting them admits HEVC on an H.264-only family
 /// (`vkCreateVideoSessionKHR` for an unsupported op is UB, not an error).
-/// Presence here is "pf-vkdecode has a decoder", not auto admission ([`native_vulkan_gate`]).
+/// Presence here is "pf-vkdecode has a decoder", not auto admission ([`native_vulkan_usable`]).
 pub(crate) fn native_codec(wire: u8) -> Option<(NativeCodec, u32)> {
     match wire {
         punktfunk_core::quic::CODEC_H264 => Some((NativeCodec::H264, VIDEO_CODEC_OP_DECODE_H264)),
