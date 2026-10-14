@@ -12,6 +12,7 @@ import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
@@ -110,7 +111,8 @@ class JniHostNative(private val context: Context) : HostNative {
 
 /**
  * Dial, pin, wake and presence for both shells: the touch home, the touch shelf, the speed test
- * and the console all reach a host through one of these. [store] is where trust lands.
+ * and the console all reach a host through one of these. [store] is where trust lands; the host
+ * facts the console's rows show are kept here too.
  *
  * Plain Kotlin and thread-safe: a shell calls the suspending dial from its own main-thread
  * scope, so the cancel check and the session hand-over run on that thread, and the blocking
@@ -324,6 +326,18 @@ class HostServices(val store: KnownHostStore, private val native: HostNative) {
             return Swept(next, changed, moved)
         }
     }
+
+    // ---- host facts ---------------------------------------------------------------------------
+
+    /** What each paired host last said this device may do TO it, by fingerprint. */
+    val hostActions = ConcurrentHashMap<String, List<HostActions.Action>>()
+
+    /** The title each paired host has up, by fingerprint; `""` for none. */
+    val nowPlaying = ConcurrentHashMap<String, String>()
+
+    /** When [hostActions] and [nowPlaying] were last asked, by fingerprint: their TTLs run from here. */
+    val hostActionsAt = ConcurrentHashMap<String, Long>()
+    val nowPlayingAt = ConcurrentHashMap<String, Long>()
 
     private companion object {
         const val TAG = "punktfunk"

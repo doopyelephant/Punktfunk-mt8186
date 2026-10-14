@@ -219,7 +219,7 @@ fun SkiaConsoleShell(
         // The input test takes the pad; the menu forgets what was held when it starts or ends.
         var testing = false
         fun followTest() {
-            if ((SkiaConsole.padTest != null) == testing) return
+            if (SkiaConsole.padTesting() == testing) return
             testing = !testing
             padState.reset()
             padState.push(handle)
@@ -232,11 +232,7 @@ fun SkiaConsoleShell(
             val fromPad = Gamepad.eventFromPad(ev)
             if (fromPad) {
                 followTest()
-                SkiaConsole.padTest?.let { test ->
-                    test.key(Gamepad.padKeyCode(ev), down)
-                    SkiaConsole.pushPadTest()
-                    return@probe true
-                }
+                if (SkiaConsole.padTestKey(Gamepad.padKeyCode(ev), down)) return@probe true
                 // The CORRECTED keycode: a pad Android has no key layout for delivers its buttons
                 // under other buttons' names, so read raw this console answered ✕ with whatever
                 // sat in BUTTON_A's scancode slot. Same resolution the stream uses — the console
@@ -334,11 +330,7 @@ fun SkiaConsoleShell(
                 return@probe false
             }
             followTest()
-            SkiaConsole.padTest?.let { test ->
-                test.motion(ev)
-                SkiaConsole.pushPadTest()
-                return@probe true
-            }
+            if (SkiaConsole.padTestMotion(ev)) return@probe true
             val lx = ev.getAxisValue(MotionEvent.AXIS_X)
             val ly = ev.getAxisValue(MotionEvent.AXIS_Y)
             val hx = ev.getAxisValue(MotionEvent.AXIS_HAT_X)
