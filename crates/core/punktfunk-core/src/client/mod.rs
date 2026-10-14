@@ -41,6 +41,8 @@ mod pump;
 mod recovery;
 mod resume;
 /// cbindgen:ignore
+pub mod sc1_ble;
+/// cbindgen:ignore
 pub mod sc2;
 use crate::rumble;
 mod worker;

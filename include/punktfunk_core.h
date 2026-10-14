@@ -320,6 +320,11 @@
 // values still writes the device.
 #define PUNKTFUNK_RUMBLE_QUIRK_DEDUP_JITTER 1
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Bytes of state [`punktfunk_sc1_ble_input`] keeps per pad.
+#define PUNKTFUNK_SC1_BLE_STATE_LEN 160
+#endif
+
 // [`PunktfunkClipEvent::kind`]: host announced clipboard content
 // (`transfer_id` = offer `seq`; `data`/`len` = `\n`-separated `"<mime>\t<size_hint>"`).
 // Fetch lazily on local paste via [`punktfunk_connection_clipboard_fetch`].
@@ -3130,6 +3135,43 @@ uintptr_t punktfunk_sc2_identity_request(bool puck, uint32_t index, uint8_t *out
 // # Safety
 // `out` points to `cap` writable bytes.
 uintptr_t punktfunk_sc1_identity_request(uint32_t index, uint8_t *out, uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// One segment of a 2015 Steam Controller's Bluetooth input, `[0x03, header, 18 bytes]`. True
+// when it completed a state message: `out` then holds the 64-byte wired frame to forward.
+// `state` is [`PUNKTFUNK_SC1_BLE_STATE_LEN`] bytes, zeroed once per link and kept.
+//
+// # Safety
+// `state` points to that many writable bytes, `segment` to `len` readable ones, `out` to 64
+// writable ones.
+bool punktfunk_sc1_ble_input(uint8_t *state, const uint8_t *segment, uintptr_t len, uint8_t *out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// A wired feature frame for a 2015 Steam Controller, report id 0 first, as the 20-byte
+// segments its Bluetooth link takes, back to back in `out`. Returns the bytes written; 0 when
+// `cap` is short.
+//
+// # Safety
+// `frame` points to `len` readable bytes, `out` to `cap` writable ones.
+uintptr_t punktfunk_sc1_ble_segments(const uint8_t *frame,
+                                     uintptr_t len,
+                                     uint8_t *out,
+                                     uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The segments read back for one 2015 Steam Controller feature query, back to back and in
+// order. Once the last one is in, the reply goes to `out`, report id 0 first, and this returns
+// its length; 0 before then or when `cap` is short.
+//
+// # Safety
+// `segments` points to `len` readable bytes, `out` to `cap` writable ones.
+uintptr_t punktfunk_sc1_ble_reply(const uint8_t *segments,
+                                  uintptr_t len,
+                                  uint8_t *out,
+                                  uintptr_t cap);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
