@@ -906,6 +906,9 @@ fn open(
     // names the allocatable modifiers. One importer, one worker process.
     let raw_lane = policy.nvenc_raw_dmabuf && signals.health.ladder().nvenc_raw_ok();
     let mut importer = if needs_cuda_import(policy) {
+        if signals.health.ladder().off(pf_zerocopy::Lane::Gpu) {
+            bail!("this output's GPU import is off after repeated failures");
+        }
         let importer = pf_zerocopy::Importer::new_for_capture().map_err(|e| {
             anyhow!("this session's encoder needs the GPU importer, which did not start: {e:#}")
         })?;
@@ -1118,8 +1121,16 @@ impl Opened {
             let imported = imp.import(kind, &plane, w, h, self.fourcc, modifier);
             self.free.put(idx);
             return match imported {
-                Ok(buf) => Ok(FramePayload::Cuda(buf)),
-                Err(e) => bail!("GPU import of the captured dmabuf failed: {e:#}"),
+                Ok(buf) => {
+                    let imported = pf_zerocopy::Evidence::Imported(pf_zerocopy::Lane::Gpu);
+                    signals.health.note(&[imported]);
+                    Ok(FramePayload::Cuda(buf))
+                }
+                Err(e) => {
+                    // A strike per lost capture: the rebuild allocates the same buffers.
+                    signals.health.note_gpu_import_lost();
+                    bail!("GPU import of the captured dmabuf failed: {e:#}")
+                }
             };
         }
         // The frame owns and closes the dup; the pool keeps its own fd.

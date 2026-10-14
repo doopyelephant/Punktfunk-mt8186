@@ -106,7 +106,7 @@ pub(in crate::linux) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPla
     let raw_off = i.ladder.off(Lane::Raw);
     let gpu_off = i.ladder.off(Lane::Gpu);
     // Skip under raw passthrough (payloads only NVENC consumes) and once the GPU lane is off
-    // (worker-death crash-loop; compositor that rejects our modifiers would re-pay 10 s).
+    // (an import that keeps failing loops; compositor that rejects our modifiers re-pays 10 s).
     // HDR through this importer is LINEAR, so it avoids the 8-bit de-tile blit. Exclude
     // it when the encoder cannot take packed 10-bit CUDA (a build without `nvenc`).
     let build_importer =
@@ -484,7 +484,7 @@ pub(in crate::linux) fn gpu_import(
             }
             let (next, strike) = import_failure(modifier.is_some(), dead, state.fail_streak);
             if strike {
-                signals.health.note_gpu_import_death();
+                signals.health.note_gpu_import_lost();
             }
             match next {
                 ImportFailure::RetireImporter => {
@@ -522,7 +522,8 @@ enum ImportFailure {
 
 /// A failed CUDA import's verdict, and whether the GPU lane takes a strike. `streak` counts
 /// the stream's consecutive tiled failures, this one included. A tiled stream is lost after
-/// [`IMPORT_FAIL_POISON`], or at once when the worker died.
+/// [`IMPORT_FAIL_POISON`], or at once when the worker died. A dead worker strikes on each
+/// failure, failing tiled imports once per stream: the rebuild offers the same modifiers.
 fn import_failure(tiled: bool, dead: bool, streak: u32) -> (ImportFailure, bool) {
     let next = if !tiled {
         ImportFailure::RetireImporter
@@ -531,7 +532,7 @@ fn import_failure(tiled: bool, dead: bool, streak: u32) -> (ImportFailure, bool)
     } else {
         ImportFailure::DropFrame
     };
-    (next, dead)
+    (next, dead || (tiled && streak == IMPORT_FAIL_POISON))
 }
 
 #[cfg(test)]
@@ -1165,7 +1166,10 @@ mod tests {
 mod ladder_rows {
     use super::super::capturer::{convicted_lane, TimeoutOffer, TimeoutVerdict};
     use super::tests::{nvenc, vaapi_native_nv12};
-    use super::{negotiation_plan, resolved_capture_arm, CaptureArm, NegotiationInputs};
+    use super::{
+        import_failure, negotiation_plan, resolved_capture_arm, CaptureArm, ImportFailure,
+        NegotiationInputs,
+    };
     use pf_zerocopy::{step, Evidence, Lane, Refusal};
 
     /// What a capture sees: evidence for the ladder, or a first-frame expiry it judges first.
@@ -1173,6 +1177,8 @@ mod ladder_rows {
     enum Seen {
         Ev(Evidence),
         Expiry(TimeoutOffer, TimeoutVerdict),
+        /// A failed CUDA import: tiled, worker dead, the stream's tiled streak.
+        Failed(bool, bool, u32),
     }
 
     /// The rung a build takes after `seen`, and whether it offers the producer's planar formats.
@@ -1183,6 +1189,10 @@ mod ladder_rows {
                 Some(lane) => step(l, Evidence::OfferTimedOut(lane)),
                 None => l,
             },
+            Seen::Failed(tiled, dead, streak) => match import_failure(tiled, dead, streak) {
+                (_, true) => step(l, Evidence::ImportFailed(Lane::Gpu)),
+                (_, false) => l,
+            },
         });
         let p = negotiation_plan(NegotiationInputs { ladder, ..base });
         let have_importer = p.build_importer;
@@ -1190,12 +1200,33 @@ mod ladder_rows {
         (arm, p.prefer_native_nv12 || p.prefer_native_p010)
     }
 
+    /// A dead worker strikes on each failure; tiled imports on a live one strike once per stream,
+    /// when the stream is lost; a LINEAR failure retires the importer.
+    #[test]
+    fn a_lost_import_stream_strikes_the_gpu_lane_once() {
+        use ImportFailure::{DropFrame, LoseStream, RetireImporter};
+        let rows = [
+            ((false, false, 0), (RetireImporter, false)),
+            ((false, true, 0), (RetireImporter, true)),
+            ((true, false, 1), (DropFrame, false)),
+            ((true, false, 2), (DropFrame, false)),
+            ((true, false, 3), (LoseStream, true)),
+            ((true, false, 4), (LoseStream, false)),
+            ((true, true, 1), (LoseStream, true)),
+            ((true, true, 3), (LoseStream, true)),
+        ];
+        for ((tiled, dead, streak), want) in rows {
+            let got = import_failure(tiled, dead, streak);
+            assert_eq!(got, want, "tiled={tiled} dead={dead} streak={streak}");
+        }
+    }
+
     /// One row per fix in this ladder's history, then a lane that recovers and one that does not.
     #[test]
     fn the_ladder_rows() {
         use CaptureArm::{Cpu, CudaImport, DmabufPassthrough, DmabufToEncoder};
         use Evidence::{ImportFailed, Imported, OfferTaken, Refused};
-        use Seen::{Ev, Expiry};
+        use Seen::{Ev, Expiry, Failed};
         use TimeoutOffer::{GpuDmabuf, Hdr, RawDmabuf};
         use TimeoutVerdict::{Conclusive, Provisional};
         let vaapi = NegotiationInputs {
@@ -1206,6 +1237,12 @@ mod ladder_rows {
             nvenc_raw: true,
             ..nvenc()
         };
+        // One capture whose tiled imports never succeed on a live worker.
+        let lost_stream = [
+            Failed(true, false, 1),
+            Failed(true, false, 2),
+            Failed(true, false, 3),
+        ];
         type Row = (
             &'static str,
             NegotiationInputs,
@@ -1266,6 +1303,12 @@ mod ladder_rows {
                 vaapi_native_nv12(),
                 vec![Ev(Refused(Refusal::Planar))],
                 (DmabufPassthrough, false),
+            ),
+            (
+                "0d888d788: tiled imports that keep failing end on the CPU, not in a loop",
+                nvenc(),
+                lost_stream.repeat(3),
+                (Cpu, false),
             ),
             (
                 "a GPU lane that fails once recovers",

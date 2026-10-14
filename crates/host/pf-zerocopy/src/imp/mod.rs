@@ -318,12 +318,12 @@ impl ZeroCopyHealth {
         self.ladder().raw_state()
     }
 
-    pub fn note_gpu_import_death(&self) {
+    pub fn note_gpu_import_lost(&self) {
         let (before, after) = self.note(&[Evidence::ImportFailed(Lane::Gpu)]);
         if !before.import_off(Lane::Gpu) && after.import_off(Lane::Gpu) {
             tracing::error!(
                 streak = ladder::GPU_IMPORT_BUDGET,
-                "zero-copy GPU import disabled for this capture after repeated worker deaths"
+                "zero-copy GPU import disabled for this capture after repeated lost imports"
             );
         }
     }
@@ -552,12 +552,12 @@ mod tests {
     fn gpu_lane_latches_are_scoped_to_one_identity() {
         let failing = zero_copy_health(0x1001);
         let healthy = zero_copy_health(0x1002);
-        failing.note_gpu_import_death();
+        failing.note_gpu_import_lost();
         failing.note(&[Evidence::Imported(Lane::Gpu)]);
-        failing.note_gpu_import_death();
-        failing.note_gpu_import_death();
+        failing.note_gpu_import_lost();
+        failing.note_gpu_import_lost();
         assert!(!failing.ladder().off(Lane::Gpu));
-        failing.note_gpu_import_death();
+        failing.note_gpu_import_lost();
         assert!(failing.ladder().off(Lane::Gpu));
         assert!(!healthy.ladder().off(Lane::Gpu));
         let refused = zero_copy_health(0x1003);

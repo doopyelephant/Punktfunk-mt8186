@@ -40,7 +40,8 @@ pub enum Refusal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Evidence {
     Imported(Lane),
-    /// The encoder refused a LINEAR raw dmabuf, or the import worker died.
+    /// Raw: the encoder refused a LINEAR dmabuf. GPU: a stream lost its import, the
+    /// worker dead or its tiled imports failing.
     ImportFailed(Lane),
     /// The first frame arrived on this lane's offer.
     OfferTaken(Lane),
@@ -255,7 +256,7 @@ mod tests {
                 Ladder::default(),
             ),
             (
-                "the GPU lane takes three worker deaths",
+                "the GPU lane takes three lost imports",
                 vec![ImportFailed(Gpu); 3],
                 with(|l| l.gpu.import = Rung::Off),
             ),
