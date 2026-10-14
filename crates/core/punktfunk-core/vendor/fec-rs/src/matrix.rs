@@ -24,6 +24,7 @@ impl Matrix {
         m
     }
 
+    #[cfg(test)]
     pub fn vandermonde(rows: usize, cols: usize) -> Self {
         let mut m = Self::new(rows, cols);
         for r in 0..rows {
@@ -62,6 +63,7 @@ impl Matrix {
         m
     }
 
+    #[cfg(test)]
     pub fn multiply(&self, rhs: &Matrix) -> Self {
         assert_eq!(
             self.col_count, rhs.row_count,
