@@ -1007,9 +1007,9 @@ fn profile_supported(video: &ID3D11VideoDevice, profile: DxvaProfile) -> Result<
 /// Build the session if none, or rebuild when shape moved.
 ///
 /// Shape is the SPS, never the negotiated format. Decoder, pool, slot map, and
-/// profile all derive from it ([`StreamShape`]). A partial rebuild hands out
-/// missing indices or the wrong sample width. `CapacityMismatch` forces the
-/// DPB-depth leg of the same rule.
+/// profile all derive from it ([`StreamShape`]). `CapacityMismatch` forces the
+/// DPB-depth leg of the same rule. The old pool drops before the new one is
+/// allocated: a 4K pool is ~100 MB of VRAM.
 fn ensure_session<'a>(
     slot: &'a mut Option<Session>,
     device: &ID3D11Device,
@@ -1017,24 +1017,18 @@ fn ensure_session<'a>(
     codec: Codec,
     shape: StreamShape,
 ) -> Result<&'a mut Session> {
-    let matches = slot.as_ref().is_some_and(|s| s.shape == shape);
-    if !matches {
-        if let Some(old) = slot.as_ref() {
-            // Log the old profile: an in-band 8-bit → 10-bit flip is a rebuild
-            // that also changes it.
-            tracing::info!(
-                was = ?old.shape,
-                was_profile = old.profile.name,
-                now = ?shape,
-                "stream renegotiated — rebuilding the native D3D11VA decode session"
-            );
-        }
-        // Drop first so the old pool's VRAM is free. A 4K pool is ~100 MB; holding
-        // two while allocating is how a rebuild fails on a small card.
-        *slot = None;
-        *slot = Some(Session::build(device, video_device, codec, shape)?);
-    }
-    Ok(slot.as_mut().expect("built or already matching"))
+    // Log the old profile: an in-band 8-bit → 10-bit flip is a rebuild that also
+    // changes it.
+    let retire = |old: Session| {
+        tracing::info!(
+            was = ?old.shape,
+            was_profile = old.profile.name,
+            now = ?shape,
+            "stream renegotiated — rebuilding the native D3D11VA decode session"
+        );
+    };
+    let build = || Session::build(device, video_device, codec, shape);
+    crate::video_types::ensure_session(slot, shape, |s| s.shape, retire, build)
 }
 
 impl Session {

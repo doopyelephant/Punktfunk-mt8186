@@ -2,24 +2,23 @@
 //! [`native_rung_admitted`] decide which rung `auto` may put first; the codec, 10-bit,
 //! 4:4:4, HDR and multi-slice gates decide what is advertised, and
 //! [`last_rung_verdict`] picks the retry when the last rung has no decoder.
-//! `video` re-exports every item, so call sites keep `video::` paths; the ladder that
-//! acts on these answers stays there. Evidence: tests in this file.
+//! `video` re-exports every item, so call sites keep `video::` paths; the order that
+//! acts on these answers is `video_ladder`. Evidence: tests in this file.
 
 use crate::video::{
     native_codec, VulkanDecodeDevice, VIDEO_CODEC_OP_DECODE_AV1, VIDEO_CODEC_OP_DECODE_H265,
 };
+use crate::video_ladder::Os;
 
 /// May `auto` enter the VAAPI rung with this presenter? The selected device
 /// must import dma-bufs and must not be NVIDIA. The `native-vaapi` pin bypasses
 /// this gate; `None` preserves non-presenter callers.
-#[cfg(target_os = "linux")]
 pub(crate) fn vaapi_auto_ok(vk: Option<&VulkanDecodeDevice>) -> bool {
     vk.is_none_or(|v| v.dmabuf_import && v.vendor_id != crate::video_vk::VENDOR_NVIDIA)
 }
 
 /// May a V4L2 picture reach this presenter? Its buffers are dma-bufs, so the
 /// selected device must import them. `None` preserves non-presenter callers.
-#[cfg(target_os = "linux")]
 pub(crate) fn v4l2_auto_ok(vk: Option<&VulkanDecodeDevice>) -> bool {
     vk.is_none_or(|v| v.dmabuf_import)
 }
@@ -44,9 +43,8 @@ fn v4l2_summary(vk: Option<&VulkanDecodeDevice>) -> V4l2Summary {
     V4l2Summary::default()
 }
 
-/// One decode rung, named so evidence and admission can talk without a
-/// per-platform [`Backend`](crate::video::Backend) variant. The CPU rung is in the
-/// table only ([`native_evidence`]).
+/// One decode rung, named so evidence, admission and the ladder share one
+/// vocabulary on every OS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeRung {
     /// pf-vkdecode on the presenter's device (`video_vk_native`).
@@ -62,15 +60,25 @@ pub enum NativeRung {
 }
 
 impl NativeRung {
+    /// The rung's two spellings: [`Self::name`], then [`Self::label`].
+    fn names(self) -> (&'static str, &'static str) {
+        match self {
+            NativeRung::Vulkan => ("native-vulkan", "native Vulkan Video"),
+            NativeRung::D3d11va => ("native-d3d11va", "native D3D11VA"),
+            NativeRung::Vaapi => ("native-vaapi", "native VAAPI"),
+            NativeRung::V4l2 => ("native-v4l2", "native V4L2"),
+            NativeRung::Software => ("software", "software"),
+        }
+    }
+
     /// Log / `PUNKTFUNK_DECODER` name — the same strings as the `stats:` decode-path tag.
     pub fn name(self) -> &'static str {
-        match self {
-            NativeRung::Vulkan => "native-vulkan",
-            NativeRung::D3d11va => "native-d3d11va",
-            NativeRung::Vaapi => "native-vaapi",
-            NativeRung::V4l2 => "native-v4l2",
-            NativeRung::Software => "software",
-        }
+        self.names().0
+    }
+
+    /// The rung as the demotion log lines name it.
+    pub(crate) fn label(self) -> &'static str {
+        self.names().1
     }
 }
 
@@ -169,8 +177,14 @@ pub(crate) fn native_vulkan_gate(
     let Some((_, codec_op)) = native_codec(wire) else {
         return false;
     };
-    let chosen = matches!(choice, "native-vulkan" | "auto" | "" | "hardware");
+    let chosen = choice == "native-vulkan" || is_auto(choice);
     chosen && video_decode && decode_video_caps & codec_op != 0
+}
+
+/// Does this preference leave the rung to the ladder? `hardware` and the empty
+/// string read as `auto`.
+pub(crate) fn is_auto(choice: &str) -> bool {
+    matches!(choice, "auto" | "" | "hardware")
 }
 
 /// Human name of a `quic::CODEC_*` bit. `?` for an unknown bit — it must not print as a known codec.
@@ -276,7 +290,12 @@ pub(crate) const VENDOR_INTEL: u32 = 0x8086;
 /// Intel's Mesa driver decodes H.264 and HEVC bit-exact with libavcodec but not AV1,
 /// so Linux Intel keeps AV1 off Vulkan; its AV1 goes through the VAAPI rung.
 pub fn usable_decode_ops(vendor_id: u32, advertised: u32) -> u32 {
-    if cfg!(target_os = "linux") && vendor_id == VENDOR_INTEL {
+    usable_decode_ops_on(Os::HOST, vendor_id, advertised)
+}
+
+/// [`usable_decode_ops`] for a named OS: the order table states the Linux rule on any host.
+pub(crate) fn usable_decode_ops_on(os: Os, vendor_id: u32, advertised: u32) -> u32 {
+    if os == Os::Linux && vendor_id == VENDOR_INTEL {
         advertised & !VIDEO_CODEC_OP_DECODE_AV1
     } else {
         advertised

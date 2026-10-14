@@ -1,7 +1,8 @@
 //! Video decode: reassembled access units → frames for the presenter.
 //!
-//! Ladder: Vulkan Video, D3D11VA/VAAPI, then openh264 or rav1d. [`Decoder::new`]
-//! orders rungs by platform and GPU vendor. [`native_evidence`] records which
+//! Ladder: Vulkan Video, D3D11VA/VAAPI, then openh264 or rav1d. The order per
+//! platform and GPU vendor is `video_ladder`; [`Decoder::new`] walks it and a rung
+//! that keeps failing demotes along it. [`native_evidence`] records which
 //! pairs have hardware validation; [`native_rung_admitted`] yields an unverified
 //! rung only to a verified rung usable on the same device. `PUNKTFUNK_DECODER`
 //! pins skip that rule and still fall through after init failure.
@@ -30,10 +31,10 @@ pub use crate::video_caps::{
 };
 pub(crate) use crate::video_caps::{native_vulkan_gate, resolve_decoder_pref};
 #[cfg(target_os = "linux")]
-use crate::video_caps::{v4l2_auto_ok, vaapi_auto_ok};
-#[cfg(target_os = "linux")]
 pub use crate::video_caps::{vaapi_av1_decodable, vaapi_hevc_decodable};
 pub use crate::video_color::{csc_rows, ColorDesc};
+use crate::video_ladder::{demotions, ladder, Note, Os, Step};
+use crate::video_rung::Rung;
 /// Re-export so SESSION (and its tests) can name the refusal by type.
 /// The module stays private, like every other backend.
 pub use crate::video_software::NoSoftwareRung;
@@ -133,39 +134,40 @@ pub struct NativeReleaseToken {
     pub presented: bool,
 }
 
-/// Sends [`NativeReleaseToken`] once on drop. The presenter holds the frame
-/// until its sampling fence is waited, so drop means the GPU is done. A dead
-/// channel (backend demoted or rebuilt) is ignored.
-pub struct NativeReleaseGuard {
-    tx: std::sync::mpsc::Sender<NativeReleaseToken>,
-    token: Option<NativeReleaseToken>,
+/// Hands a shipped picture's token back to its rung, once, on drop. The presenter
+/// holds the frame until its sampling fence is waited, so drop means the GPU is done
+/// reading. A dead channel is a rung demoted or rebuilt, and is ignored.
+pub struct ReleaseGuard<T: Copy> {
+    tx: std::sync::mpsc::Sender<T>,
+    token: T,
 }
 
-impl NativeReleaseGuard {
-    pub(crate) fn new(
-        tx: std::sync::mpsc::Sender<NativeReleaseToken>,
-        token: NativeReleaseToken,
-    ) -> Self {
-        Self {
-            tx,
-            token: Some(token),
-        }
+impl<T: Copy> ReleaseGuard<T> {
+    pub(crate) fn new(tx: std::sync::mpsc::Sender<T>, token: T) -> Self {
+        Self { tx, token }
     }
 
+    /// The token this guard hands back.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn token(&self) -> T {
+        self.token
+    }
+}
+
+impl<T: Copy> Drop for ReleaseGuard<T> {
+    fn drop(&mut self) {
+        let _ = self.tx.send(self.token);
+    }
+}
+
+/// The Vulkan rung's guard: its token also says whether the picture was presented.
+pub type NativeReleaseGuard = ReleaseGuard<NativeReleaseToken>;
+
+impl ReleaseGuard<NativeReleaseToken> {
     /// Sampling submit, including the frame's `value + 1` timeline signal, was enqueued.
     /// The decoder then waits that write-back.
     pub fn mark_presented(&mut self) {
-        if let Some(token) = &mut self.token {
-            token.presented = true;
-        }
-    }
-}
-
-impl Drop for NativeReleaseGuard {
-    fn drop(&mut self) {
-        if let Some(token) = self.token.take() {
-            let _ = self.tx.send(token);
-        }
+        self.token.presented = true;
     }
 }
 
@@ -516,63 +518,53 @@ pub struct DrmFrameGuard(
     pub(crate) FrameGuard,
 );
 
-/// The rung's own hold behind a [`DrmFrameGuard`]; opaque to the presenter.
+/// The rung's own hold behind a [`DrmFrameGuard`]; opaque to the presenter. The
+/// token goes back first, then the fds close.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub(crate) enum FrameGuard {
-    Va(crate::video_vaapi_native::VaFrameGuard),
-    V4l2(crate::video_v4l2::V4l2FrameGuard),
+    /// One fd per OBJECT, not per plane: planes share objects, and closing a shared
+    /// fd twice would close an unrelated file.
+    Va(
+        ReleaseGuard<crate::video_vaapi_native::VaRelease>,
+        Vec<std::os::fd::OwnedFd>,
+    ),
+    /// The pool's fds, shared: they stay open past a pool rebuild, so an imported
+    /// frame never dangles.
+    V4l2(
+        ReleaseGuard<crate::video_v4l2::Release>,
+        std::sync::Arc<Vec<std::os::fd::OwnedFd>>,
+    ),
 }
 
-enum Backend {
-    /// pf-vkdecode on the presenter's device. Auto's top rung; pinnable as
-    /// `native-vulkan`. Codec is chosen once at construction. Boxed: the decoder is large.
-    NativeVulkan(Box<NativeVulkanDecoder>),
-    /// Native VAAPI (`pf-vaapi`). Pinnable as `native-vaapi`; `auto` reaches it
-    /// in vendor order. Unverified ([`native_evidence`]), so `auto` yields to
-    /// proven Vulkan ([`native_rung_admitted`]). Boxed: two planners + pools.
-    #[cfg(target_os = "linux")]
-    NativeVaapi(Box<crate::video_vaapi_native::NativeVaapiDecoder>),
-    /// A V4L2 decoder node (`video_v4l2`), stateful or stateless: the hardware
-    /// rung where neither Vulkan Video nor VA-API exists. Pinnable as `native-v4l2`.
-    #[cfg(target_os = "linux")]
-    NativeV4l2(Box<crate::video_v4l2::NativeV4l2Decoder>),
-    /// Native D3D11VA (`pf-dxvadec`): plans into the shareable-RGBA hand-off ring.
-    /// Pinnable as `native-d3d11va`; `auto` reaches it. Boxed: two planners + session.
-    #[cfg(windows)]
-    NativeD3d11va(Box<crate::video_d3d11_native::NativeD3d11Decoder>),
-    /// PyroWave compute on the presenter's device. No demotion rung: nothing else
-    /// decodes it. Boxed: pinned create-info + plane ring.
-    #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-    PyroWave(Box<crate::video_pyrowave::PyroWaveDecoder>),
-    /// CPU rung (openh264 / rav1d). Last in every ladder, so it never demotes.
-    /// The only rung that can fail to exist for a codec: see [`last_rung_verdict`].
-    Software(SoftwareDecoder),
-}
-
-/// New-rung frames handed on before a demoted Vulkan rung's pools may go, and their floor
-/// age: the same displacement PyroWave waits for its retired rings (depth-2 channel).
+/// New-rung frames handed on before a demoted Vulkan rung's pools may go. The release
+/// tokens do not cover this: the presenter re-samples its last picture on a redraw
+/// until a new one displaces it, and the depth-2 pump channel can still hold an old
+/// one. Eight new frames displace them all.
 const RETIRE_HANDOVERS: u32 = 8;
+/// Floor age for the same wait. Frames keep flowing while `present` is stalled on an
+/// occluded swapchain, and would count the eight off with the old picture still up.
 const RETIRE_MIN_AGE: std::time::Duration = std::time::Duration::from_millis(250);
 
 pub struct Decoder {
-    backend: Backend,
+    /// The rung decoding now ([`Rung`]).
+    rung: Box<dyn Rung>,
     /// A native Vulkan rung demoted away, with the new rung's handovers since and when.
     /// The presenter can re-sample its last picture until a new one displaces it, so its
     /// pools outlive the swap ([`RETIRE_HANDOVERS`]).
-    retiring: Option<(Box<NativeVulkanDecoder>, u32, std::time::Instant)>,
+    retiring: Option<(Box<dyn Rung>, u32, std::time::Instant)>,
     /// Negotiated `quic::CODEC_*` bit. Every rung map and the software refusal
     /// key on it, so a demotion rebuilds for the same codec.
     wire_codec: u8,
     /// Consecutive hardware decode errors. One transient (a missing reference after loss) must not demote.
-    vaapi_fails: u32,
+    fails: u32,
     /// When the current error streak started. Count alone is not enough: a
     /// startup loss burst fails 3+ AUs in milliseconds, before the first-error
     /// IDR (~100–300 ms RTT) can rescue the hardware decoder.
     first_fail: Option<std::time::Instant>,
     /// Needs a fresh IDR (after an error or demotion). The pump drains it; the GOP has no periodic keyframe.
     want_keyframe: bool,
-    /// This backend has delivered at least one frame. A never-delivered rung is
+    /// This rung has delivered at least one frame. A never-delivered rung is
     /// one the session never had; its streak must not cost the rung below. Reset on swap.
     delivered: bool,
     /// Presenter's device: a demotion rebuild reads every device fact from here.
@@ -580,32 +572,14 @@ pub struct Decoder {
     vk: Option<VulkanDecodeDevice>,
     /// Negotiated picture shape for a mid-stream native rebuild ([`StreamFormat`]).
     stream: StreamFormat,
-    /// Hardware rungs this session has run ([`RUNG_BIT_NATIVE_VULKAN`],
-    /// [`RUNG_BIT_NATIVE_PLATFORM`]). The two native rungs sit in opposite vendor
-    /// order; without this they could bounce the session. An entered rung is never re-entered.
-    entered_rungs: u8,
-}
-
-/// Native Vulkan ran this session — see [`Decoder::entered_rungs`].
-const RUNG_BIT_NATIVE_VULKAN: u8 = 1 << 0;
-/// Native platform rung (VAAPI on Linux, D3D11VA on Windows) ran this session.
-const RUNG_BIT_NATIVE_PLATFORM: u8 = 1 << 1;
-
-/// [`Decoder::entered_rungs`] bit this backend claims. 0 for rungs that cannot
-/// be a demotion target twice (software is terminal; PyroWave never demotes).
-fn rung_bit(backend: &Backend) -> u8 {
-    match backend {
-        Backend::NativeVulkan(_) => RUNG_BIT_NATIVE_VULKAN,
-        #[cfg(target_os = "linux")]
-        Backend::NativeVaapi(_) => RUNG_BIT_NATIVE_PLATFORM,
-        #[cfg(windows)]
-        Backend::NativeD3d11va(_) => RUNG_BIT_NATIVE_PLATFORM,
-        _ => 0,
-    }
+    /// The ladder rungs this session has run, oldest first. [`demotions`] never names
+    /// one again: the two native rungs demote onto each other and could otherwise
+    /// bounce the session.
+    ran: Vec<NativeRung>,
 }
 
 /// Consecutive decode errors before hardware demotion. A lone transient re-requests an IDR and stays.
-const VAAPI_DEMOTE_AFTER: u32 = 3;
+const HW_DEMOTE_AFTER: u32 = 3;
 
 /// Minimum streak age before demotion. Every error re-requests an IDR; a
 /// successful decode resets the streak. 1 s lets that IDR arrive; a loss burst
@@ -679,14 +653,19 @@ fn build_rung(
     wire: u8,
     stream: StreamFormat,
     vk: Option<&VulkanDecodeDevice>,
-) -> Result<Backend> {
-    let (decoder, backend) = match rung {
+) -> Result<Box<dyn Rung>> {
+    #[cfg(test)]
+    {
+        if let Some(scripted) = crate::video_ladder::tests::scripted(rung) {
+            return scripted;
+        }
+    }
+    let built: Box<dyn Rung> = match rung {
         NativeRung::Vulkan => {
             let vk = vk.context("no presenter device")?;
             let (codec, _) =
                 native_codec(wire).context("no Vulkan Video decoder for this codec")?;
-            let d = NativeVulkanDecoder::new(vk, codec, stream)?;
-            (rung.name(), Backend::NativeVulkan(Box::new(d)))
+            Box::new(NativeVulkanDecoder::new(vk, codec, stream)?)
         }
         #[cfg(windows)]
         NativeRung::D3d11va => {
@@ -700,30 +679,28 @@ fn build_rung(
                 stream,
                 v.adapter_luid,
                 v.d3d11_hdr10,
-            )?
-            .with_planar(v.d3d11_nv12, v.d3d11_p010);
-            (d.name(), Backend::NativeD3d11va(Box::new(d)))
+            )?;
+            Box::new(d.with_planar(v.d3d11_nv12, v.d3d11_p010))
         }
         #[cfg(target_os = "linux")]
         NativeRung::Vaapi => {
             let codec = native_vaapi_codec(wire).context("no VAAPI decoder for this codec")?;
-            let d = NativeVaapiDecoder::new_for_presenter(codec, stream, vk.map(|v| v.vendor_id))?;
-            (d.name(), Backend::NativeVaapi(Box::new(d)))
+            let vendor = vk.map(|v| v.vendor_id);
+            Box::new(NativeVaapiDecoder::new_for_presenter(
+                codec, stream, vendor,
+            )?)
         }
         #[cfg(target_os = "linux")]
-        NativeRung::V4l2 => {
-            let d = crate::video_v4l2::NativeV4l2Decoder::new(wire, stream)?;
-            (d.name(), Backend::NativeV4l2(Box::new(d)))
-        }
+        NativeRung::V4l2 => Box::new(crate::video_v4l2::NativeV4l2Decoder::new(wire, stream)?),
         other => bail!("{} is not a hardware rung on this OS", other.name()),
     };
     tracing::info!(
         codec = wire_codec_name(wire),
-        decoder,
+        decoder = built.name(),
         "{} hardware decode active",
         rung.name()
     );
-    Ok(backend)
+    Ok(built)
 }
 
 /// Log what `PUNKTFUNK_AU_FAULT` will do, including when the answer is nothing.
@@ -755,34 +732,11 @@ fn report_au_fault_env(native_rung: bool) {
 /// Name the landed rung and whether its evidence meets the automatic-priority bar.
 /// `info` if verified, `warn` if not, with [`native_evidence`] verbatim.
 /// The `stats:` decode-path tag names the rung but not its provenance.
-fn log_rung(backend: &Backend, wire: u8) {
-    let (rung, evidence) = match backend {
-        Backend::NativeVulkan(_) => (
-            NativeRung::Vulkan.name(),
-            Some(native_evidence(NativeRung::Vulkan, wire)),
-        ),
-        #[cfg(windows)]
-        Backend::NativeD3d11va(_) => (
-            NativeRung::D3d11va.name(),
-            Some(native_evidence(NativeRung::D3d11va, wire)),
-        ),
-        #[cfg(target_os = "linux")]
-        Backend::NativeVaapi(_) => (
-            NativeRung::Vaapi.name(),
-            Some(native_evidence(NativeRung::Vaapi, wire)),
-        ),
-        #[cfg(target_os = "linux")]
-        Backend::NativeV4l2(_) => (
-            NativeRung::V4l2.name(),
-            Some(native_evidence(NativeRung::V4l2, wire)),
-        ),
-        Backend::Software(_) => (
-            NativeRung::Software.name(),
-            Some(native_evidence(NativeRung::Software, wire)),
-        ),
+fn log_rung(active: &dyn Rung, wire: u8) {
+    let (rung, evidence) = match active.id() {
+        Some(id) => (id.name(), Some(native_evidence(id, wire))),
         // PyroWave is not in the evidence table: its own codec and decoder, nothing above or below it.
-        #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-        Backend::PyroWave(_) => ("pyrowave", None),
+        None => (active.name(), None),
     };
     let codec = wire_codec_name(wire);
     match evidence {
@@ -805,19 +759,53 @@ fn log_rung(backend: &Backend, wire: u8) {
     }
 }
 
+/// Say why the walk passes a rung over, when it gets there.
+fn log_note(note: Note, wire: u8, vk: Option<&VulkanDecodeDevice>) {
+    let codec = wire_codec_name(wire);
+    match note {
+        // The gate is an AND of three; name all three. `video_decode=true`
+        // beside "refused" is unreadable without the family's advertised ops.
+        Note::VulkanPinRefused => tracing::warn!(
+            codec,
+            video_decode = vk.is_some_and(|v| v.video_decode),
+            decode_video_caps = format_args!("0x{:X}", vk.map_or(0, |v| v.decode_video_caps)),
+            codec_op_needed = format_args!("0x{:X}", native_codec(wire).map_or(0, |(_, op)| op)),
+            device = vk.map_or("", |v| v.device_name.as_str()),
+            "PUNKTFUNK_DECODER=native-vulkan refused (needs an H.264, HEVC or AV1 \
+             session and a presenter device whose decode family advertises that \
+             codec) — standard ladder"
+        ),
+        Note::VaapiYields => tracing::info!(
+            codec,
+            evidence = native_evidence(NativeRung::Vaapi, wire).note,
+            "native VAAPI is this device's first hardware rung, but it has decoded \
+             nothing on any hardware and the rung below it — native Vulkan Video — \
+             has, for this codec, on this device: taking Vulkan first \
+             (PUNKTFUNK_DECODER=native-vaapi runs it anyway)"
+        ),
+        Note::VaapiGated => tracing::info!(
+            "native VAAPI outside the presenter's automatic safety gate (pin overrides)"
+        ),
+        // A stored "software" preference otherwise skips hardware in silence.
+        Note::SoftwareOnly => tracing::info!(
+            "software decode by preference (Settings decoder / PUNKTFUNK_DECODER) — \
+             hardware decode not attempted"
+        ),
+    }
+}
+
 impl Decoder {
     /// The active rung is native Vulkan. It can still demote later.
     pub fn on_native_vulkan(&self) -> bool {
-        matches!(self.backend, Backend::NativeVulkan(_))
+        self.rung.id() == Some(NativeRung::Vulkan)
     }
 
     /// Build the decode ladder. `wire` is the Welcome `quic::CODEC_*`; `pref` is
     /// Settings (`hardware` reads as auto); `vk` is the presenter's device.
     /// `PUNKTFUNK_DECODER` wins, then the setting; both default to auto.
     ///
-    /// Auto order is [`VulkanDecodeDevice::prefer_vulkan_first`], then
-    /// [`native_rung_admitted`]: an unproven rung does not go first when the rung
-    /// below it is proven and usable. `stream` is the construction-time shape probe.
+    /// The order is `video_ladder::ladder`'s; the CPU rung follows it. `stream` is
+    /// the construction-time shape probe.
     pub fn new(
         wire: u8,
         pref: &str,
@@ -837,17 +825,17 @@ impl Decoder {
                  same hardware path"
             );
         }
-        let done = |backend: Backend| {
-            // One exit every backend leaves through, so a session that never
+        let done = |rung: Box<dyn Rung>| {
+            // One exit every rung leaves through, so a session that never
             // reaches the native constructor still reports `PUNKTFUNK_AU_FAULT`.
-            report_au_fault_env(matches!(backend, Backend::NativeVulkan(_)));
-            log_rung(&backend, wire);
+            report_au_fault_env(rung.id() == Some(NativeRung::Vulkan));
+            log_rung(rung.as_ref(), wire);
             Ok(Decoder {
-                entered_rungs: rung_bit(&backend),
+                ran: rung.id().into_iter().collect(),
                 retiring: None,
-                backend,
+                rung,
                 wire_codec: wire,
-                vaapi_fails: 0,
+                fails: 0,
                 first_fail: None,
                 want_keyframe: false,
                 delivered: false,
@@ -855,253 +843,59 @@ impl Decoder {
                 stream,
             })
         };
-        // A pin's failure warns: it must not be quieter than auto's, which only informs.
-        let pinned = |rung: NativeRung| match build_rung(rung, wire, stream, vk) {
-            Ok(backend) => Some(backend),
-            Err(e) => {
-                tracing::warn!(reason = %format!("{e:#}"),
-                    "{} init failed — demoting to the standard ladder", rung.name());
-                None
-            }
-        };
-        let auto = |rung: NativeRung| match build_rung(rung, wire, stream, vk) {
-            Ok(backend) => Some(backend),
-            Err(e) => {
-                tracing::info!(reason = %format!("{e:#}"),
-                    "{} unavailable — continuing down the ladder", rung.name());
-                None
-            }
-        };
-        let codec_name = wire_codec_name(wire);
-        // Pins first: a pin skips vendor order. Refusal or init failure logs and
-        // continues as `auto`.
-        let mut choice = choice;
-        #[cfg(windows)]
-        if choice == crate::video_d3d11_native::DECODER_PIN {
-            if let Some(b) = pinned(NativeRung::D3d11va) {
-                return done(b);
-            }
-            choice = "auto".to_string();
-        }
-        // Native VAAPI pin. Unverified; the pin is how a lab run reaches it when Vulkan is first.
-        #[cfg(target_os = "linux")]
-        if choice == crate::video_vaapi_native::DECODER_PIN {
-            if let Some(b) = pinned(NativeRung::Vaapi) {
-                return done(b);
-            }
-            choice = "auto".to_string();
-        }
-        #[cfg(target_os = "linux")]
-        if choice == crate::video_v4l2::DECODER_PIN {
-            if let Some(b) = pinned(NativeRung::V4l2) {
-                return done(b);
-            }
-            choice = "auto".to_string();
-        }
-        let mut native_tried = false;
-        if choice == "native-vulkan" {
-            if native_vulkan_gate(
-                &choice,
-                wire,
-                vk.is_some_and(|v| v.video_decode),
-                vk.map_or(0, |v| v.decode_video_caps),
-            ) {
-                native_tried = true;
-                if let Some(b) = pinned(NativeRung::Vulkan) {
-                    return done(b);
+        for step in ladder(Os::HOST, &choice, wire, vk) {
+            let rung = match step {
+                Step::Try(rung) | Step::Pin(rung) => rung,
+                Step::Note(note) => {
+                    log_note(note, wire, vk);
+                    continue;
                 }
-            } else {
-                // The gate is an AND of three; name all three. `video_decode=true`
-                // beside "refused" is unreadable without the family's advertised ops.
-                tracing::warn!(
-                    codec = codec_name,
-                    video_decode = vk.is_some_and(|v| v.video_decode),
-                    decode_video_caps =
-                        format_args!("0x{:X}", vk.map_or(0, |v| v.decode_video_caps)),
-                    codec_op_needed =
-                        format_args!("0x{:X}", native_codec(wire).map_or(0, |(_, op)| op)),
-                    device = vk.map_or("", |v| v.device_name.as_str()),
-                    "PUNKTFUNK_DECODER=native-vulkan refused (needs an H.264, HEVC or AV1 \
-                     session and a presenter device whose decode family advertises that \
-                     codec) — standard ladder"
-                );
-            }
-            choice = "auto".to_string();
-        }
-        // Linux VAAPI rung, once: Intel/unknown take it before Vulkan, everyone
-        // else after — NVIDIA and non-importing presenters never (`vaapi_auto_ok`).
-        #[cfg(target_os = "linux")]
-        let vaapi_rung = || {
-            if !vaapi_auto_ok(vk) {
-                tracing::info!(
-                    "native VAAPI outside the presenter's automatic safety gate (pin overrides)"
-                );
-                return None;
-            }
-            auto(NativeRung::Vaapi)
-        };
-        // Linux `auto`: VAAPI first unless Vulkan Video is the established
-        // answer (NVIDIA: no usable VAAPI; VanGogh: VAAPI chroma-fringes).
-        // Mesa exposes decode queues by default, which would move every AMD/Intel box onto Vulkan-on-Mesa.
-        #[cfg(target_os = "linux")]
-        let mut vaapi_tried = false;
-        #[cfg(target_os = "linux")]
-        if matches!(choice.as_str(), "auto" | "" | "hardware")
-            && !vk
-                .filter(|v| v.video_decode)
-                .is_some_and(|v| v.prefer_vulkan_first())
-        {
-            // Intel/unknown order: the rung below VAAPI is native Vulkan. If this
-            // device can run that proven rung, VAAPI does not go first ([`native_rung_admitted`]).
-            let below = native_vulkan_usable(
-                wire,
-                vk.is_some_and(|v| v.video_decode),
-                vk.map_or(0, |v| v.decode_video_caps),
-            )
-            .then_some(NativeRung::Vulkan);
-            if native_rung_admitted(NativeRung::Vaapi, wire, below) {
-                vaapi_tried = true;
-                if let Some(b) = vaapi_rung() {
-                    return done(b);
+            };
+            match build_rung(rung, wire, stream, vk) {
+                Ok(built) => return done(built),
+                // A pin's failure warns: it must not be quieter than auto's, which only informs.
+                Err(e) if matches!(step, Step::Pin(_)) => {
+                    tracing::warn!(reason = %format!("{e:#}"),
+                        "{} init failed — demoting to the standard ladder", rung.name());
                 }
-            } else {
-                tracing::info!(
-                    codec = codec_name,
-                    evidence = native_evidence(NativeRung::Vaapi, wire).note,
-                    "native VAAPI is this device's first hardware rung, but it has decoded \
-                     nothing on any hardware and the rung below it — native Vulkan Video — \
-                     has, for this codec, on this device: taking Vulkan first \
-                     (PUNKTFUNK_DECODER=native-vaapi runs it anyway)"
-                );
+                Err(e) => {
+                    tracing::info!(reason = %format!("{e:#}"),
+                        "{} unavailable — continuing down the ladder", rung.name());
+                }
             }
-        }
-        // Windows `auto`: D3D11VA first unless Vulkan Video is the established
-        // answer (NVIDIA/AMD). Intel advertises Vulkan Video, so the cap gate
-        // alone does not keep it off that rung; DXVA is the path Windows players exercise.
-        // A DXVA frame reaches the screen only through the presenter's win32 import.
-        #[cfg(windows)]
-        let d3d11_rung = || {
-            if vk.is_some_and(|v| v.d3d11_import) {
-                auto(NativeRung::D3d11va)
-            } else {
-                None
-            }
-        };
-        #[cfg(windows)]
-        let mut d3d11_tried = false;
-        #[cfg(windows)]
-        if matches!(choice.as_str(), "auto" | "" | "hardware")
-            && !vk
-                .filter(|v| v.video_decode)
-                .is_some_and(|v| v.prefer_vulkan_first())
-            // Intel/unknown: `below` is `None` on purpose. Under DXVA AV1 the
-            // next rung is CPU, not proven Vulkan. H.264/H.265 are verified, so they admit.
-            && native_rung_admitted(NativeRung::D3d11va, wire, None)
-        {
-            d3d11_tried = true;
-            if let Some(b) = d3d11_rung() {
-                return done(b);
-            }
-        }
-        // Vulkan rung. `auto` reaches it from one place; [`native_vulkan_gate`]
-        // is the whole admission. `native_tried` skips a repeat of the pin above.
-        if !native_tried
-            && native_vulkan_gate(
-                &choice,
-                wire,
-                vk.is_some_and(|v| v.video_decode),
-                vk.map_or(0, |v| v.decode_video_caps),
-            )
-        {
-            if let Some(b) = auto(NativeRung::Vulkan) {
-                return done(b);
-            }
-        }
-        // VAAPI after Vulkan when that rung was not already tried.
-        // `vaapi_auto_ok` may skip it to the final software attempt.
-        #[cfg(target_os = "linux")]
-        if choice != "software" && !vaapi_tried {
-            if let Some(b) = vaapi_rung() {
-                return done(b);
-            }
-        }
-        // V4L2 last: it is the rung of devices that have neither of the above.
-        #[cfg(target_os = "linux")]
-        if choice != "software" && v4l2_auto_ok(vk) {
-            if let Some(b) = auto(NativeRung::V4l2) {
-                return done(b);
-            }
-        }
-        // D3D11VA fallback when Vulkan is missing or failed. `d3d11_tried` skips the Intel/unknown first try.
-        #[cfg(windows)]
-        if choice != "software" && !d3d11_tried {
-            if let Some(b) = d3d11_rung() {
-                return done(b);
-            }
-        }
-        if choice == "software" {
-            // Log why hardware was not attempted: a stored "software" pref otherwise silently skips it.
-            tracing::info!(
-                "software decode by preference (Settings decoder / PUNKTFUNK_DECODER) — \
-                 hardware decode not attempted"
-            );
         }
         // `?` can carry `NoSoftwareRung` (HEVC with no hardware). Stays typed to the pump ([`last_rung_verdict`]).
-        done(Backend::Software(SoftwareDecoder::new(wire)?))
+        done(Box::new(SoftwareDecoder::new(wire)?))
     }
 
     /// Wait for a Vulkan-Video GPU decode (timeline). `false` declines the
     /// sample: not this backend, timeout, missing ledger pair, or stale generation.
     pub fn wait_hw_decoded(&mut self, timeline_sem: u64, value: u64, timeout_ns: u64) -> bool {
-        match &mut self.backend {
-            Backend::NativeVulkan(d) => d.wait_timeline(timeline_sem, value, timeout_ns),
-            _ => false,
-        }
+        self.rung.wait_timeline(timeline_sem, value, timeout_ns)
     }
 
     /// Whether a Vulkan-Video decode is complete now, without waiting. `true` off that
     /// backend: nothing is pending there.
     pub fn hw_decoded_now(&mut self, timeline_sem: u64, value: u64) -> bool {
-        match &mut self.backend {
-            Backend::NativeVulkan(d) => d.timeline_done(timeline_sem, value),
-            _ => true,
-        }
+        self.rung.timeline_done(timeline_sem, value)
     }
 
     /// The decode wait is also the media clock boost (Intel on i915): the pump waits
     /// it at once instead of one AU behind.
     pub fn hw_wait_boosted(&self) -> bool {
-        match &self.backend {
-            Backend::NativeVulkan(d) => d.boosted(),
-            _ => false,
-        }
+        self.rung.boosted()
     }
 
     /// Decode-integrity counters, or `None` where the backend cannot answer
     /// (CPU, PyroWave). `None` is "cannot see corruption"; `Some(default)` is "looked and saw none".
     pub fn decode_health(&self) -> Option<DecodeHealth> {
-        match &self.backend {
-            Backend::NativeVulkan(d) => Some(d.health()),
-            // DXVA sees concealment and refusals via the planner. No per-picture
-            // status query, so `status_queries` is false and `failed` stays 0.
-            #[cfg(windows)]
-            Backend::NativeD3d11va(d) => Some(d.health()),
-            // Same as DXVA: libva has no per-picture decode-status query.
-            #[cfg(target_os = "linux")]
-            Backend::NativeVaapi(d) => Some(d.health()),
-            #[cfg(target_os = "linux")]
-            Backend::NativeV4l2(d) => Some(d.health()),
-            _ => None,
-        }
+        self.rung.health()
     }
 
     /// Newest planned decode-order ordinal — the freeze watermark
     /// ([`NativeVkFrame::decode_order`]). 0 on lanes with no bitstream parser (and no local recovery).
     pub fn decode_order(&self) -> u64 {
-        match &self.backend {
-            Backend::NativeVulkan(d) => d.decode_order(),
-            _ => 0,
-        }
+        self.rung.decode_order()
     }
 
     /// Open a PyroWave decoder: compute on the presenter's device.
@@ -1118,7 +912,7 @@ impl Decoder {
         // Never the native rung — see [`report_au_fault_env`].
         report_au_fault_env(false);
         Ok(Decoder {
-            backend: Backend::PyroWave(Box::new(crate::video_pyrowave::PyroWaveDecoder::new(
+            rung: Box::new(crate::video_pyrowave::PyroWaveDecoder::new(
                 vk,
                 width,
                 height,
@@ -1126,9 +920,9 @@ impl Decoder {
                 chroma444,
                 color,
                 hdr16,
-            )?)),
+            )?),
             wire_codec: punktfunk_core::quic::CODEC_PYROWAVE,
-            vaapi_fails: 0,
+            fails: 0,
             first_fail: None,
             want_keyframe: false,
             delivered: false,
@@ -1136,7 +930,7 @@ impl Decoder {
             // fields stay well-formed and unused.
             vk: None,
             stream: StreamFormat::SDR_420_8,
-            entered_rungs: 0,
+            ran: Vec::new(),
             retiring: None,
         })
     }
@@ -1147,14 +941,15 @@ impl Decoder {
         std::mem::take(&mut self.want_keyframe)
     }
 
-    /// Swap the backend in and reset the old one's health. One place so a call
-    /// site cannot forget [`Self::entered_rungs`] and loop the ladder.
-    fn install(&mut self, backend: Backend) {
-        self.entered_rungs |= rung_bit(&backend);
-        if let Backend::NativeVulkan(old) = std::mem::replace(&mut self.backend, backend) {
+    /// Swap the rung in and reset the old one's health. One place so a call
+    /// site cannot forget [`Self::ran`] and loop the ladder.
+    fn install(&mut self, rung: Box<dyn Rung>) {
+        self.ran.extend(rung.id());
+        let old = std::mem::replace(&mut self.rung, rung);
+        if old.id() == Some(NativeRung::Vulkan) {
             self.retiring = Some((old, 0, std::time::Instant::now()));
         }
-        self.vaapi_fails = 0;
+        self.fails = 0;
         self.first_fail = None;
         self.delivered = false;
     }
@@ -1163,10 +958,10 @@ impl Decoder {
     /// False when it could not be built: the ladder tries the next one.
     fn demote_into(&mut self, e: &anyhow::Error, from: &str, rung: NativeRung) -> bool {
         match build_rung(rung, self.wire_codec, self.stream, self.vk.as_ref()) {
-            Ok(backend) => {
-                tracing::warn!(error = %format!("{e:#}"), fails = self.vaapi_fails, from,
+            Ok(built) => {
+                tracing::warn!(error = %format!("{e:#}"), fails = self.fails, from,
                     "hardware decode failing repeatedly — demoting to {}", rung.name());
-                self.install(backend);
+                self.install(built);
                 true
             }
             Err(why) => {
@@ -1177,28 +972,16 @@ impl Decoder {
         }
     }
 
-    /// Running rung is the platform native (VAAPI / D3D11VA). The demotion
-    /// that goes sideways into native Vulkan fires only from here.
-    fn is_native_platform_rung(&self) -> bool {
-        #[cfg(target_os = "linux")]
-        let it = matches!(self.backend, Backend::NativeVaapi(_));
-        #[cfg(windows)]
-        let it = matches!(self.backend, Backend::NativeD3d11va(_));
-        #[cfg(not(any(target_os = "linux", windows)))]
-        let it = false;
-        it
-    }
-
     /// Demote to software when the presenter cannot display hardware frames.
     /// Decode still succeeds in that state, so the error streak never fires
     /// and without this the stream stays black. No-op when already software.
     pub fn force_software(&mut self) -> Result<()> {
-        if matches!(self.backend, Backend::Software(_)) {
+        if self.rung.id() == Some(NativeRung::Software) {
             return Ok(());
         }
         tracing::warn!("presenter can't display hardware frames — demoting to software decode");
         // Same typed refusal as every software construction: HEVC has nothing below, so the pump reconnects.
-        self.install(Backend::Software(SoftwareDecoder::new(self.wire_codec)?));
+        self.install(Box::new(SoftwareDecoder::new(self.wire_codec)?));
         self.want_keyframe = true;
         Ok(())
     }
@@ -1208,16 +991,7 @@ impl Decoder {
     /// host anchor that descends from the wave is refuted until an IDR. Lanes without a
     /// planner have nothing to forget.
     pub fn forgive_unclean(&mut self) {
-        match &mut self.backend {
-            Backend::NativeVulkan(n) => n.forgive_unclean(),
-            #[cfg(target_os = "linux")]
-            Backend::NativeVaapi(v) => v.forgive_unclean(),
-            #[cfg(target_os = "linux")]
-            Backend::NativeV4l2(d) => d.forgive_unclean(),
-            #[cfg(windows)]
-            Backend::NativeD3d11va(d) => d.forgive_unclean(),
-            _ => {}
-        }
+        self.rung.forgive_unclean();
     }
 
     /// Feed one access unit (hosts are one-in/one-out). Hardware errors
@@ -1249,69 +1023,33 @@ impl Decoder {
     fn decode_frame_inner(
         &mut self,
         au: &[u8],
-        // Only the PyroWave backend reads the flags; without that feature the param is unused.
-        #[cfg_attr(
-            not(all(any(target_os = "linux", windows), feature = "pyrowave")),
-            allow(unused_variables)
-        )]
         user_flags: u32,
         complete: bool,
     ) -> Result<Option<DecodedImage>> {
-        // Native rungs: stream damage is not a decoder fault. Concealment is `Ok(None)`
+        let result = self.rung.decode(au, user_flags, complete);
+        // PyroWave and the CPU rung have nothing below them: their error is the pump's.
+        let Some(from) = self.rung.id().filter(|r| *r != NativeRung::Software) else {
+            return result;
+        };
+        // Hardware rungs: stream damage is not a decoder fault. Concealment is `Ok(None)`
         // plus the recovery request, which decides whether the `Ok` below may clear the
         // demotion streak. A driver `RESULT_STATUS` Failed stays an `Err`.
-        let (result, concealed) = match &mut self.backend {
-            Backend::NativeVulkan(n) => (
-                n.decode(au).map(|f| f.map(DecodedImage::NativeVk)),
-                n.take_recovery_request(),
-            ),
-            #[cfg(target_os = "linux")]
-            Backend::NativeVaapi(v) => (
-                v.decode(au).map(|f| f.map(DecodedImage::NativeDmabuf)),
-                v.take_recovery_request(),
-            ),
-            #[cfg(target_os = "linux")]
-            Backend::NativeV4l2(d) => (d.decode(au), d.take_recovery_request()),
-            #[cfg(windows)]
-            Backend::NativeD3d11va(d) => (
-                d.decode(au).map(|f| f.map(DecodedImage::D3d11)),
-                d.take_recovery_request(),
-            ),
-            // Nothing else decodes PyroWave: propagate the error; the pump renegotiates the codec.
-            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-            Backend::PyroWave(p) => {
-                let aligned = user_flags & punktfunk_core::packet::USER_FLAG_CHUNK_ALIGNED != 0;
-                return Ok(p
-                    .decode_frame(au, aligned, complete)?
-                    .map(DecodedImage::PyroWave));
-            }
-            Backend::Software(s) => return Ok(s.decode(au)?.map(DecodedImage::Cpu)),
-        };
+        let concealed = self.rung.take_recovery_request();
         debug_assert!(complete, "partial AUs are pyrowave-only");
         self.want_keyframe |= concealed;
         match result {
             Ok(f) => {
                 // Only an answer that proves the rung works may clear the streak.
                 if clears_demotion_streak(f.is_some(), concealed) {
-                    self.vaapi_fails = 0;
+                    self.fails = 0;
                     self.first_fail = None;
                 }
                 self.delivered |= f.is_some();
                 Ok(f)
             }
             Err(e) => {
-                let which = match self.backend {
-                    Backend::NativeVulkan(_) => "native Vulkan Video",
-                    #[cfg(windows)]
-                    Backend::NativeD3d11va(_) => "native D3D11VA",
-                    #[cfg(target_os = "linux")]
-                    Backend::NativeVaapi(_) => "native VAAPI",
-                    #[cfg(target_os = "linux")]
-                    Backend::NativeV4l2(_) => "native V4L2",
-                    // PyroWave returns above and software never reaches here.
-                    _ => "hardware",
-                };
-                self.vaapi_fails += 1;
+                let which = from.label();
+                self.fails += 1;
                 self.want_keyframe = true;
                 let first = *self.first_fail.get_or_insert_with(std::time::Instant::now);
                 // A device that cannot host the codec refuses every AU the same way;
@@ -1321,48 +1059,21 @@ impl Decoder {
                         .is_some_and(pf_vkdecode::VkDecodeError::is_device_fact)
                 });
                 if device_fact
-                    || (self.vaapi_fails >= VAAPI_DEMOTE_AFTER
-                        && first.elapsed() >= HW_DEMOTE_MIN_STREAK)
+                    || (self.fails >= HW_DEMOTE_AFTER && first.elapsed() >= HW_DEMOTE_MIN_STREAK)
                 {
-                    // A never-delivered native rung is a decoder the session never
-                    // had; it must not cost the rung below. `entered_rungs` keeps
-                    // the walk monotone (native rungs sit in opposite vendor order).
-                    // `vaapi_auto_ok` bars the same rung on NVIDIA and on
-                    // presenters that cannot import its dmabufs.
-                    #[cfg(target_os = "linux")]
-                    if self.entered_rungs & RUNG_BIT_NATIVE_PLATFORM == 0
-                        && vaapi_auto_ok(self.vk.as_ref())
-                        && self.demote_into(&e, which, NativeRung::Vaapi)
-                    {
-                        return Ok(None);
+                    // A never-delivered hardware rung is a decoder the session never
+                    // had; it must not cost the rung below.
+                    let (vk, ran) = (self.vk.as_ref(), &self.ran);
+                    for rung in demotions(Os::HOST, self.wire_codec, vk, from, ran) {
+                        if self.demote_into(&e, which, rung) {
+                            return Ok(None);
+                        }
                     }
-                    #[cfg(windows)]
-                    if self.entered_rungs & RUNG_BIT_NATIVE_PLATFORM == 0
-                        && self.vk.as_ref().is_some_and(|v| v.d3d11_import)
-                        && self.demote_into(&e, which, NativeRung::D3d11va)
-                    {
-                        return Ok(None);
-                    }
-                    // Failing platform native on Intel/unknown has Vulkan below it.
-                    // Only fires from a native platform rung.
-                    if self.entered_rungs & RUNG_BIT_NATIVE_VULKAN == 0
-                        && self.is_native_platform_rung()
-                        && self.vk.as_ref().is_some_and(|v| {
-                            native_vulkan_usable(
-                                self.wire_codec,
-                                v.video_decode,
-                                v.decode_video_caps,
-                            )
-                        })
-                        && self.demote_into(&e, which, NativeRung::Vulkan)
-                    {
-                        return Ok(None);
-                    }
-                    tracing::warn!(error = %format!("{e:#}"), fails = self.vaapi_fails,
+                    tracing::warn!(error = %format!("{e:#}"), fails = self.fails,
                         "{which} decode failing repeatedly — demoting to software");
                     // Ladder bottom. H.264/AV1 always builds; HEVC `?` carries
                     // `NoSoftwareRung` to the pump, which reconnects without HEVC.
-                    self.install(Backend::Software(SoftwareDecoder::new(self.wire_codec)?));
+                    self.install(Box::new(SoftwareDecoder::new(self.wire_codec)?));
                 } else {
                     tracing::debug!(backend = which, error = %e,
                         "decode error — requesting keyframe, keeping hardware decode");
@@ -1444,7 +1155,7 @@ mod tests {
             }
         }
         assert!(
-            fails >= VAAPI_DEMOTE_AFTER,
+            fails >= HW_DEMOTE_AFTER,
             "three driver errors interleaved with concealment must still reach the \
              demotion threshold — they got to {fails}"
         );
@@ -1460,10 +1171,10 @@ mod tests {
                 fails = 0;
             }
         }
-        assert!(fails >= VAAPI_DEMOTE_AFTER);
+        assert!(fails >= HW_DEMOTE_AFTER);
 
         // Counterfactual: answering skipped AUs as clean `Ok(None)` zeroes the
-        // streak and `VAAPI_DEMOTE_AFTER` is unreachable. That is the AV1
+        // streak and `HW_DEMOTE_AFTER` is unreachable. That is the AV1
         // film-grain-without-profile path in `NativeVulkanDecoder::new`.
         let mut fails = 0u32;
         for errored in [true, false, false, true, false, false, true, false, false] {
@@ -1474,7 +1185,7 @@ mod tests {
             }
         }
         assert!(
-            fails < VAAPI_DEMOTE_AFTER,
+            fails < HW_DEMOTE_AFTER,
             "a recovery wait answered as a CLEAN AU zeroes the streak once per frame \
              — which is why it must not be answered that way; it got to {fails}"
         );

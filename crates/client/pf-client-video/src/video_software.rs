@@ -143,7 +143,7 @@ struct H264Software {
     decoder: openh264::decoder::Decoder,
     /// Colour, IDR, crop from the shared planner. Does not drive openh264 —
     /// a refused plan drops metadata for that AU, never the picture.
-    /// Boxed: the planner DPB dwarfs the other `Backend` variants (pointer-sized).
+    /// Boxed: the planner DPB dwarfs the AV1 variant beside it.
     planner: Box<H264Planner>,
     /// Recovery-point SEI, same fold as the Vulkan rung. Intra-refresh never
     /// emits an IDR; without this the pump's post-loss freeze waits 500 ms

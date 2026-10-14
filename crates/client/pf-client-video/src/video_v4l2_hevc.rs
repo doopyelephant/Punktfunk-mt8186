@@ -48,11 +48,11 @@ use crate::video::DmabufFrame;
 use crate::video::DmabufPlane;
 use crate::video::DrmFrameGuard;
 use crate::video::FrameGuard;
+use crate::video::ReleaseGuard;
 use crate::video_color::ColorDesc;
 use crate::video_types::display_of;
 use crate::video_v4l2::Facts;
 use crate::video_v4l2::Release;
-use crate::video_v4l2::V4l2FrameGuard;
 use crate::video_v4l2::DECODER_PIN;
 use crate::video_v4l2::DRM_FORMAT_MOD_LINEAR;
 
@@ -351,15 +351,17 @@ impl<D: OpenedStateless> StatelessHevc<D> {
             sync_fds: Vec::new(),
             pool_key: (u64::from(s.pool) << 48) | u64::from(picture.buffer),
             path: DECODER_PIN,
-            guard: DrmFrameGuard(FrameGuard::V4l2(V4l2FrameGuard {
-                _fds: exports,
-                tx: self.release_tx.clone(),
-                release: Release {
-                    pool: s.pool,
-                    generation: 0,
-                    index: picture.buffer,
-                },
-            })),
+            guard: DrmFrameGuard(FrameGuard::V4l2(
+                ReleaseGuard::new(
+                    self.release_tx.clone(),
+                    Release {
+                        pool: s.pool,
+                        generation: 0,
+                        index: picture.buffer,
+                    },
+                ),
+                exports,
+            )),
         }))
     }
 }

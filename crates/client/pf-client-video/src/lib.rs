@@ -13,6 +13,12 @@ pub mod au_dump;
 mod video;
 #[cfg(desktop)]
 pub use video::*;
+// The decode order, once: the walk `Decoder::new` makes and where a failing rung demotes.
+#[cfg(desktop)]
+mod video_ladder;
+// The contract a rung answers to the ladder, and each decoder's answer.
+#[cfg(desktop)]
+mod video_rung;
 // What this client can decode and advertise: rung evidence, admission and the Hello gates.
 // `video` re-exports every item.
 #[cfg(desktop)]

@@ -176,10 +176,62 @@ pub(crate) fn next_pool_generation() -> u32 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The session for `shape`: the live one while its shape holds, else a new one.
+/// `retire` takes the old session before `build` runs. Two pools at once is how a
+/// rebuild fails on a small card, and a session rebuilt in part hands out surfaces
+/// its pool does not have. A failed build leaves no session.
+pub(crate) fn ensure_session<S, K: PartialEq>(
+    slot: &mut Option<S>,
+    shape: K,
+    shape_of: impl Fn(&S) -> K,
+    retire: impl FnOnce(S),
+    build: impl FnOnce() -> anyhow::Result<S>,
+) -> anyhow::Result<&mut S> {
+    if slot.as_ref().is_some_and(|s| shape_of(s) == shape) {
+        return Ok(slot.as_mut().expect("just matched"));
+    }
+    if let Some(old) = slot.take() {
+        retire(old);
+    }
+    Ok(slot.insert(build()?))
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use pf_bitstream::h264::DisplayCrop;
+
+    /// A session is kept while its shape holds. On a new shape the old one is retired
+    /// before the new one is built, and a failed build leaves none.
+    #[test]
+    fn a_session_is_retired_before_its_replacement_is_built() {
+        let log = std::cell::RefCell::new(Vec::new());
+        let ensure = |slot: &mut Option<(u32, u32)>, shape: u32, id: u32, ok: bool| {
+            ensure_session(
+                slot,
+                shape,
+                |s| s.0,
+                |old| log.borrow_mut().push(format!("retire {}", old.1)),
+                || {
+                    log.borrow_mut().push(format!("build {id}"));
+                    anyhow::ensure!(ok, "refused");
+                    Ok((shape, id))
+                },
+            )
+            .map(|s| s.1)
+            .ok()
+        };
+        let mut slot = None;
+        assert_eq!(ensure(&mut slot, 1080, 1, true), Some(1));
+        assert_eq!(ensure(&mut slot, 1080, 2, true), Some(1), "same shape");
+        assert_eq!(ensure(&mut slot, 2160, 3, true), Some(3));
+        assert_eq!(ensure(&mut slot, 720, 4, false), None);
+        assert_eq!(slot, None, "a failed build leaves no session");
+        assert_eq!(
+            *log.borrow(),
+            ["build 1", "retire 1", "build 3", "retire 3", "build 4"]
+        );
+    }
 
     #[test]
     fn only_a_planned_au_is_a_verdict() {
