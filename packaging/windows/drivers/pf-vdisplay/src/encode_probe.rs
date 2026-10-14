@@ -326,6 +326,8 @@ fn spec(req: &EncodeProbeRequest, w: u32, h: u32) -> Result<OpenSpec, Fail> {
         } else {
             ChromaFormat::Yuv420
         },
+        // No client: the single-slice shape every decoder takes.
+        slices: 1,
     })
 }
 

@@ -600,6 +600,7 @@ pub fn open_driver_encoder(
         hdr,
         hdr_meta: capturer.hdr_meta().map(|m| client_hdr.unwrap_or(m)),
         sdr_fp16: !hdr && capturer.composes_sdr_fp16(),
+        slices: plan.slices,
         wire_chunk_bytes: plan.wire_chunk.unwrap_or(0) as u32,
         backends: [backend, fallback, 0, 0],
         wire_seq_base,

@@ -30,6 +30,8 @@ pub struct DriverEncodeParams {
     /// The display composes FP16 for this SDR stream (SDR wide colour):
     /// [`encode::SET_ENCODE_FLAG_SDR_FP16`].
     pub sdr_fp16: bool,
+    /// H.264/HEVC slices per frame the client takes: [`SetEncodeRequest::slices`].
+    pub slices: u32,
     /// Slice-chunk target; `0` = whole access units.
     pub wire_chunk_bytes: u32,
     /// Ordered preference, 0-terminated: 1 NVENC, 2 AMF, 3 QSV, 4 PyroWave.
@@ -287,7 +289,7 @@ pub(crate) fn open_remote_encoder(
         } else {
             0
         },
-        _pad_tail: 0,
+        slices: params.slices,
         // The host process carries `host.env`, so its environment is the knob source; the
         // driver reads these instead of WUDFHost's own (machine) environment.
         knobs: pf_encode_win::knobs::dev_override::from_env(),
