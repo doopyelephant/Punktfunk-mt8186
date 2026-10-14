@@ -20,7 +20,7 @@ use crate::model::SeatId;
 use rustix::fs::{AtFlags, Mode, OFlags};
 use std::collections::HashSet;
 use std::io::Write as _;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
@@ -165,27 +165,44 @@ fn check_owned(path: &Path, forbidden: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The shared games library: group `punktfunk`, setgid, with a default ACL so a file one seat
-/// creates is writable by the others.
+/// The shared games library: group `punktfunk-games`, setgid, with a default ACL so a file one
+/// seat creates is writable by the others. Every seat writes in it, so each folder is opened
+/// through the one above it without following a link, and changed through its own handle;
+/// `setfacl` gets each as `/proc/<pid>/fd/<n>`, which names that folder whatever its path holds.
 pub(super) fn ensure_games(state: &Path, gid: u32) -> Result<(), BackendError> {
-    let games = games_dir(state);
-    let steamapps = games.join("steamapps");
-    let mut dirs = vec![games, steamapps.clone()];
+    let io = |what: &str, e| io_err("games_dir", what, e);
+    let top = safe_open::dir(state).map_err(|e| io("open the state directory", e))?;
+    let games = dir_in(&top, "games").map_err(|e| io("open games", e))?;
+    let steamapps = dir_in(&games, "steamapps").map_err(|e| io("open games/steamapps", e))?;
+    let mut dirs = Vec::new();
     for name in ["common", "compatdata", "shadercache", "downloading"] {
-        dirs.push(steamapps.join(name));
+        dirs.push(dir_in(&steamapps, name).map_err(|e| io(&format!("open {name}"), e))?);
     }
+    dirs.extend([games, steamapps]);
     for dir in &dirs {
-        let io = |what: &str, e| io_err("games_dir", &format!("{what} {}", dir.display()), e);
-        std::fs::create_dir_all(dir).map_err(|e| io("create", e))?;
-        std::os::unix::fs::chown(dir, Some(0), Some(gid)).map_err(|e| io("own", e))?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2775))
-            .map_err(|e| io("set the mode of", e))?;
+        std::os::unix::fs::fchown(dir, Some(0), Some(gid)).map_err(|e| io("own a folder", e))?;
+        rustix::fs::fchmod(dir, Mode::from_raw_mode(0o2775 as _))
+            .map_err(|e| io("set the mode of a folder", e.into()))?;
     }
     let group = super::accounts::GAMES_GROUP;
+    let pid = std::process::id();
     let mut args = vec!["-m".to_owned(), format!("g:{group}:rwX,d:g:{group}:rwX")];
-    args.extend(dirs.iter().map(|d| d.to_string_lossy().into_owned()));
+    args.extend(
+        dirs.iter()
+            .map(|d| format!("/proc/{pid}/fd/{}", d.as_raw_fd())),
+    );
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     run("setfacl_failed", "setfacl", &args).map(drop)
+}
+
+/// `name` in `at`, created if absent, as a handle; a link there is refused.
+fn dir_in(at: &OwnedFd, name: &str) -> std::io::Result<OwnedFd> {
+    match rustix::fs::mkdirat(at, name, Mode::from_raw_mode(0o2775 as _)) {
+        Ok(()) => {}
+        Err(e) if e == rustix::io::Errno::EXIST => {}
+        Err(e) => return Err(e.into()),
+    }
+    safe_open::dir_at(at, name)?.ok_or_else(|| std::io::ErrorKind::NotFound.into())
 }
 
 /// Re-applies the ACL mask below the games folder. A file one seat creates with mode 0644 or 0755
