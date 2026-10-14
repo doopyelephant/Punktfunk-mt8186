@@ -294,3 +294,400 @@ fn release(bit: u32, gates: &Gates, pad: &mut PadRoute, now: Instant) -> Vec<Act
     out.push(Action::Rearm);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{GUIDE_HOLD, TAP_PRESS};
+    use super::*;
+    use std::time::Duration;
+    use wire::{
+        BTN_A as A, BTN_BACK as SELECT, BTN_GUIDE as GUIDE, BTN_LB as LB, BTN_MISC1 as QAM,
+        BTN_RB as RB, BTN_START as START, BTN_X as X, BTN_Y as Y,
+    };
+    use Action::{Escape, Forward, Readopt, Rearm};
+
+    fn host() -> Gates {
+        Gates::default()
+    }
+    fn masked() -> Gates {
+        Gates {
+            masked: true,
+            ..host()
+        }
+    }
+    fn local() -> Gates {
+        Gates {
+            system_forward: false,
+            ..host()
+        }
+    }
+    fn chords() -> Gates {
+        Gates {
+            chords_live: true,
+            ..host()
+        }
+    }
+    fn gesture() -> Gates {
+        Gates {
+            guide_gesture: true,
+            ..host()
+        }
+    }
+
+    fn down(bit: u32) -> PadInput {
+        PadInput::Button { bit, down: true }
+    }
+    fn up(bit: u32) -> PadInput {
+        PadInput::Button { bit, down: false }
+    }
+    fn click(down: bool) -> PadInput {
+        PadInput::Click { surface: 1, down }
+    }
+    fn on(bit: u32) -> Action {
+        Action::Wire { bit, down: true }
+    }
+    fn off(bit: u32) -> Action {
+        Action::Wire { bit, down: false }
+    }
+
+    /// One step on one forwarded pad, as the worker takes it.
+    enum Step {
+        /// A `Ctl` moves the gates.
+        Set(Gates),
+        /// A transition, and what [`route`] makes of it.
+        In(PadInput, Vec<Action>),
+        /// The worker's flush (mask on, or [`Action::Flush`]): the button releases it sends.
+        Release(Vec<(u32, bool)>),
+        /// The worker re-reads the pad: bits down, Guide down, and whether sticks are re-sent.
+        Adopt(Vec<u32>, bool, bool),
+        /// Time passes and the gesture's poll runs.
+        Wait(Duration, Vec<(u32, bool)>),
+    }
+    use Step::{Adopt, In, Release, Set, Wait};
+
+    fn walk(name: &str, steps: Vec<Step>) {
+        let mut now = Instant::now();
+        let mut gates = host();
+        let mut pad = PadRoute::default();
+        for (i, step) in steps.into_iter().enumerate() {
+            match step {
+                Set(g) => gates = g,
+                In(input, want) => {
+                    let got = route(input, &gates, &mut pad, now);
+                    assert_eq!(got, want, "{name}, step {i}: {input:?}");
+                }
+                Release(want) => assert_eq!(pad.release(), want, "{name}, step {i}: flush"),
+                Adopt(down, guide, want) => {
+                    let got = pad.adopt(down, guide, gates.system_forward);
+                    assert_eq!(got, want, "{name}, step {i}: adopt");
+                }
+                Wait(d, want) => {
+                    now += d;
+                    let mut got = Vec::new();
+                    pad.gesture.poll(now, &mut got);
+                    assert_eq!(got, want, "{name}, step {i}: poll");
+                }
+            }
+        }
+    }
+
+    /// Every route a forwarded pad's input takes, plus one row per fix that moved one.
+    #[test]
+    fn every_route_of_a_forwarded_pad() {
+        let chord = Action::Chord;
+        let rows: Vec<(&str, Vec<Step>)> =
+            vec![
+            (
+                "a button goes out and checks the escape chord",
+                vec![In(down(A), vec![on(A), Escape]), In(up(A), vec![off(A), Rearm])],
+            ),
+            (
+                "a stick, touch or motion sample goes out",
+                vec![In(PadInput::Analog, vec![Forward])],
+            ),
+            (
+                "a Steam trackpad click is a touch surface",
+                vec![
+                    In(click(true), vec![Action::Click { surface: 1, down: true }]),
+                    In(click(false), vec![Action::Click { surface: 1, down: false }]),
+                ],
+            ),
+            (
+                "forwarded Guide and Quick Access are buttons",
+                vec![
+                    In(down(GUIDE), vec![on(GUIDE), Escape]),
+                    In(down(QAM), vec![on(QAM), Escape]),
+                    In(up(QAM), vec![off(QAM), Rearm]),
+                    In(up(GUIDE), vec![off(GUIDE), Rearm]),
+                ],
+            ),
+            (
+                "a local Quick Access stays with the shell",
+                vec![Set(local()), In(down(QAM), vec![]), In(up(QAM), vec![])],
+            ),
+            (
+                "the ring without the mask leaves the host its input",
+                vec![
+                    Set(Gates {
+                        ring_nav: true,
+                        ..host()
+                    }),
+                    In(down(A), vec![on(A), Escape]),
+                    In(PadInput::Analog, vec![Forward]),
+                ],
+            ),
+            (
+                "under the ring the host sees nothing",
+                vec![
+                    Set(Gates {
+                        ring_nav: true,
+                        ..masked()
+                    }),
+                    In(down(A), vec![]),
+                    In(PadInput::Analog, vec![]),
+                ],
+            ),
+            (
+                "8fe3637a3: a released capture masks the pads, then adopts what is held",
+                vec![
+                    In(down(A), vec![on(A), Escape]),
+                    Set(masked()),
+                    Release(vec![(A, false)]),
+                    In(up(A), vec![]),
+                    In(down(GUIDE), vec![]),
+                    In(PadInput::Analog, vec![]),
+                    In(click(true), vec![]),
+                    Set(host()),
+                    Adopt(vec![X], false, true),
+                    In(up(X), vec![off(X), Rearm]),
+                ],
+            ),
+            (
+                "bb43ccda7: the escape hold outlives the mask it raises",
+                vec![
+                    Set(gesture()),
+                    In(down(LB), vec![on(LB), Escape]),
+                    In(down(RB), vec![on(RB), Escape]),
+                    In(down(START), vec![on(START), Escape]),
+                    In(down(SELECT), vec![on(SELECT), Escape]),
+                    Set(Gates {
+                        masked: true,
+                        ..gesture()
+                    }),
+                    Release(vec![(LB, false), (RB, false), (START, false), (SELECT, false)]),
+                    // No `Rearm` from a masked release: the disconnect poll reads the pads.
+                    In(up(SELECT), vec![]),
+                ],
+            ),
+            (
+                "b42b33132: a local Guide holds its pad off the wire until it lifts",
+                vec![
+                    Set(local()),
+                    In(down(A), vec![on(A), Escape]),
+                    In(down(GUIDE), vec![Action::Flush]),
+                    Release(vec![(A, false)]),
+                    In(up(A), vec![]),
+                    In(down(X), vec![]),
+                    In(PadInput::Analog, vec![]),
+                    In(click(true), vec![]),
+                    In(up(GUIDE), vec![Readopt]),
+                    Adopt(vec![X, QAM], false, true),
+                    Release(vec![(X, false)]),
+                ],
+            ),
+            (
+                "b42b33132: a mask lifting under a held local Guide leaves the pad with the shell",
+                vec![
+                    Set(local()),
+                    In(down(GUIDE), vec![Action::Flush]),
+                    Release(vec![]),
+                    Adopt(vec![A], true, false),
+                    In(PadInput::Analog, vec![]),
+                    In(up(GUIDE), vec![Readopt]),
+                    Adopt(vec![], false, true),
+                    In(PadInput::Analog, vec![Forward]),
+                ],
+            ),
+            (
+                "51adfbb8e: Select then A opens the ring without the guide gesture",
+                vec![
+                    Set(chords()),
+                    In(down(SELECT), vec![on(SELECT), Escape]),
+                    In(down(A), vec![chord(SelectChord::Ring)]),
+                    In(up(A), vec![]),
+                    In(up(SELECT), vec![off(SELECT), Rearm]),
+                ],
+            ),
+            (
+                "51adfbb8e: the ring's flush lifts the Select and forgets the withheld A",
+                vec![
+                    Set(chords()),
+                    In(down(SELECT), vec![on(SELECT), Escape]),
+                    In(down(A), vec![chord(SelectChord::Ring)]),
+                    Set(Gates {
+                        masked: true,
+                        ring_nav: true,
+                        ..chords()
+                    }),
+                    Release(vec![(SELECT, false), (A, false)]),
+                    In(up(A), vec![]),
+                    In(up(SELECT), vec![]),
+                    Set(chords()),
+                    Adopt(vec![], false, true),
+                    In(down(A), vec![on(A), Escape]),
+                    In(up(A), vec![off(A), Rearm]),
+                ],
+            ),
+            (
+                "with the gesture, a pending Select goes with the Ring chord",
+                vec![
+                    Set(Gates {
+                        guide_gesture: true,
+                        ..chords()
+                    }),
+                    In(down(SELECT), vec![Escape]),
+                    In(down(A), vec![chord(SelectChord::Ring)]),
+                    In(up(A), vec![]),
+                    In(up(SELECT), vec![Rearm]),
+                ],
+            ),
+            (
+                "Select then X steps the stats and still presses X",
+                vec![
+                    Set(chords()),
+                    In(down(SELECT), vec![on(SELECT), Escape]),
+                    In(down(X), vec![chord(SelectChord::Stats), on(X), Escape]),
+                    In(up(X), vec![off(X), Rearm]),
+                ],
+            ),
+            (
+                "a05b711ac: with nothing listening, Select then A is the game's",
+                vec![
+                    In(down(SELECT), vec![on(SELECT), Escape]),
+                    In(down(A), vec![on(A), Escape]),
+                ],
+            ),
+            (
+                "a Select tap goes out on release, its lift later",
+                vec![
+                    Set(gesture()),
+                    In(down(SELECT), vec![Escape]),
+                    Wait(TAP_PRESS, vec![]),
+                    In(up(SELECT), vec![on(SELECT), Rearm]),
+                    Wait(TAP_PRESS, vec![(SELECT, false)]),
+                ],
+            ),
+            (
+                "a held Select is the host's Guide, and A then belongs to it",
+                vec![
+                    Set(Gates {
+                        guide_gesture: true,
+                        ..chords()
+                    }),
+                    In(down(SELECT), vec![Escape]),
+                    Wait(GUIDE_HOLD, vec![(GUIDE, true)]),
+                    In(down(A), vec![on(A), Escape]),
+                    In(up(A), vec![off(A), Rearm]),
+                    In(up(SELECT), vec![off(GUIDE), Rearm]),
+                ],
+            ),
+            (
+                "a press while Select is pending makes the Select real first",
+                vec![
+                    Set(gesture()),
+                    In(down(SELECT), vec![Escape]),
+                    In(down(Y), vec![on(SELECT), on(Y), Escape]),
+                    In(up(SELECT), vec![off(SELECT), Rearm]),
+                ],
+            ),
+            (
+                "a flush lifts the gesture's synthetic Guide",
+                vec![
+                    Set(gesture()),
+                    In(down(SELECT), vec![Escape]),
+                    Wait(GUIDE_HOLD, vec![(GUIDE, true)]),
+                    Set(Gates {
+                        masked: true,
+                        ..gesture()
+                    }),
+                    Release(vec![(GUIDE, false), (SELECT, false)]),
+                    In(up(SELECT), vec![]),
+                ],
+            ),
+        ];
+        for (name, steps) in rows {
+            walk(name, steps);
+        }
+    }
+
+    /// Every combination of the asks: the route, what menu navigation reads, and whether a
+    /// forwarded pad's press reaches the host.
+    #[test]
+    fn the_asks_read_as_one_route() {
+        use InputRoute::*;
+        use MenuReads::*;
+        // (session, menu_mode, masked, ring_nav)
+        let rows = [
+            ((false, false, false, false), Closed, Nothing),
+            ((false, false, false, true), Closed, Nothing),
+            ((false, false, true, false), Closed, Nothing),
+            ((false, false, true, true), Closed, Nothing),
+            ((false, true, false, false), Menu, MenuPads),
+            ((false, true, true, false), MenuHeld, Nothing),
+            ((false, true, false, true), MenuHeld, Nothing),
+            ((false, true, true, true), MenuHeld, Nothing),
+            ((true, false, false, false), Host, Nothing),
+            ((true, true, false, false), Host, Nothing),
+            ((true, false, true, false), Masked, Nothing),
+            ((true, true, true, false), Masked, Nothing),
+            ((true, false, true, true), Ring, Slots),
+            ((true, true, true, true), Ring, Slots),
+            ((true, false, false, true), HostAndRing, Slots),
+            ((true, true, false, true), HostAndRing, Slots),
+        ];
+        for ((session, menu_mode, masked, ring_nav), want, reads) in rows {
+            let gates = Gates {
+                menu_mode,
+                masked,
+                ring_nav,
+                ..host()
+            };
+            let at = (session, menu_mode, masked, ring_nav);
+            assert_eq!(gates.input_route(session), want, "{at:?}");
+            assert_eq!(want.menu_reads(), reads, "{at:?}");
+            if session {
+                let pad = &mut PadRoute::default();
+                let sent = !route(down(A), &gates, pad, Instant::now()).is_empty();
+                assert_eq!(sent, matches!(want, Host | HostAndRing), "{at:?}");
+            }
+        }
+    }
+
+    /// a05b711ac: a raw Steam Controller runs the mask, system buttons and chord itself.
+    #[test]
+    fn a_raw_steam_controller_reads_the_same_asks() {
+        let none = Sc2Gate::default();
+        assert_eq!(host().sc2(), none);
+        assert_eq!(
+            masked().sc2(),
+            Sc2Gate {
+                masked: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            local().sc2(),
+            Sc2Gate {
+                system_local: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            chords().sc2(),
+            Sc2Gate {
+                chords: true,
+                ..none
+            }
+        );
+    }
+}
