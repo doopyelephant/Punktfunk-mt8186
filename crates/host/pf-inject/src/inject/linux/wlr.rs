@@ -226,8 +226,8 @@ impl WlrootsInjector {
             .roundtrip(&mut globals)
             .context("Wayland output-name roundtrip")?;
 
-        let want = crate::stream_target();
-        let bound = globals.resolve(&want);
+        let aim = crate::aim();
+        let bound = globals.resolve(&aim.target);
         let pointer = pointer_mgr.create_virtual_pointer_with_output(
             Some(&seat),
             bound.map(|o| &o.proxy),
@@ -278,7 +278,7 @@ impl WlrootsInjector {
 
         tracing::info!(
             outputs = globals.outputs.len(),
-            want = ?want.name,
+            want = ?aim.target.name,
             bound = ?bound_name,
             "wlroots virtual input ready (pointer + keyboard)"
         );
@@ -288,7 +288,7 @@ impl WlrootsInjector {
             globals,
             pointer,
             bound_output,
-            lookup_gen: crate::aim_gen(),
+            lookup_gen: aim.generation,
             plan: Plan::default(),
             keyboard,
             xkb_state,
@@ -306,18 +306,19 @@ impl WlrootsInjector {
     /// Match by name, never by size: `MouseMoveAbs` extent is the client's
     /// letterboxed content rect, not the streamed mode. A head created since the
     /// last read takes two roundtrips, one to bind it and one for its name; they
-    /// run once per aim generation, not per motion.
+    /// run once per aim generation, not per motion. The head and its generation
+    /// come from one read of the aim.
     fn retarget(&mut self) {
-        let want = crate::stream_target();
-        if self.globals.lacks(&want) && self.lookup_gen != crate::aim_gen() {
-            self.lookup_gen = crate::aim_gen();
+        let aim = crate::aim();
+        if self.globals.lacks(&aim.target) && self.lookup_gen != aim.generation {
+            self.lookup_gen = aim.generation;
             for _ in 0..2 {
                 if self.queue.roundtrip(&mut self.globals).is_err() {
                     break;
                 }
             }
         }
-        let target = self.globals.resolve(&want);
+        let target = self.globals.resolve(&aim.target);
         let to = target.map(|o| o.global);
         if to == self.bound_output {
             return;

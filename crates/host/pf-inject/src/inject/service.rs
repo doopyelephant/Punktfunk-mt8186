@@ -159,7 +159,7 @@ fn injector_service_thread(
     pin: Option<std::path::PathBuf>,
 ) {
     let mut slot = InjectorSlot::default();
-    let mut warped_gen = crate::aim_gen();
+    let mut warped_gen = crate::aim().generation;
     while let Some(batch) = slot.next_batch(&rx) {
         // Read the published backend from its `RwLock`, not `getenv`: `setenv` on connect raced
         // this hot path. A pin never follows; its target can only die.
@@ -186,20 +186,21 @@ fn injector_service_thread(
             Ok(opened)
         });
         if slot.injector.is_some() {
+            let aim = crate::aim();
             slot.inject_batch(warp_onto_stream_head(
                 coalesce(batch),
-                crate::aim_gen(),
+                aim.generation,
                 &mut warped_gen,
-                crate::stream_extent(),
+                aim.target.extent,
             ));
         }
     }
     tracing::debug!("injector service stopped (host shutting down)");
 }
 
-/// Centre of the streamed head: a sample at half of `extent`, which is the head's own mode when
-/// [`crate::stream_extent`] knows it — libei resolves its region by that size — and `2×2`
-/// otherwise, since every other backend normalizes the position and takes any extent.
+/// Centre of the streamed head: a sample at half of `extent`, which is the head's own mode once
+/// [`crate::set_stream_extent`] published it — libei resolves its region by that size — and
+/// `2×2` otherwise, since every other backend normalizes the position and takes any extent.
 fn head_centre(extent: Option<(u16, u16)>) -> InputEvent {
     let (w, h) = extent.filter(|(w, h)| *w > 1 && *h > 1).unwrap_or((2, 2));
     InputEvent {
@@ -215,8 +216,8 @@ fn head_centre(extent: Option<(u16, u16)>) -> InputEvent {
 /// Start a session's first pointer motion on the streamed head. The host pointer sits wherever
 /// the operator left it — on an extended desktop that is another monitor, and a relative delta
 /// has no way to cross onto the streamed one. Absolute motion already lands there and only
-/// clears the debt. One warp per capture bring-up ([`crate::aim_gen`]), and only once the client
-/// actually moves, so an idle session never takes the operator's pointer.
+/// clears the debt. One warp per capture bring-up ([`crate::AimState::generation`]), and only
+/// once the client actually moves, so an idle session never takes the operator's pointer.
 fn warp_onto_stream_head(
     events: Vec<InputEvent>,
     aim: u64,
