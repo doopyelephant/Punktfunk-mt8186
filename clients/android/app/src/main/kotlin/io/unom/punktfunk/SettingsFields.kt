@@ -15,7 +15,7 @@ internal object SettingsFields {
 
     /** The console's stored spellings, by wire byte; `xboxelite` is a console-only row. */
     val GAMEPAD_NAMES = io.unom.punktfunk.kit.Gamepad.PREFS.map { it.name } + "xboxelite"
-    val COMPOSITOR_NAMES = listOf("auto", "kwin", "wlroots", "mutter", "gamescope", "hyprland")
+    val COMPOSITOR_NAMES = listOf("auto", "kwin", "wlroots", "mutter", "gamescope", "hyprland", "windows", "niri")
 
     val ALL: List<Field<*>> = listOf(
         field("width", "width", IntKind, { it.width }, { s, v -> s.copy(width = v) },

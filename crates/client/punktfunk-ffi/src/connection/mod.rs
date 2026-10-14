@@ -439,6 +439,8 @@ pub const PUNKTFUNK_COMPOSITOR_GAMESCOPE: u32 = 4;
 pub const PUNKTFUNK_COMPOSITOR_HYPRLAND: u32 = 5;
 /// A Windows host's virtual display. Only ever resolved, never requested.
 pub const PUNKTFUNK_COMPOSITOR_WINDOWS: u32 = 6;
+/// niri (the biri fork, which adds virtual outputs).
+pub const PUNKTFUNK_COMPOSITOR_NIRI: u32 = 7;
 
 /// Gamepad-backend preference for [`punktfunk_connect_ex2`]: which virtual pad
 /// the host creates. Precedence: client choice > `PUNKTFUNK_GAMEPAD` env > X-Box 360.

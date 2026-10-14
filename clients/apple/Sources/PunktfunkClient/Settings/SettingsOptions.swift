@@ -16,6 +16,7 @@ enum SettingsOptions {
         ("KWin (KDE Plasma)", 1),
         ("Mutter (GNOME)", 3),
         ("Hyprland", 5),
+        ("niri", 7),
         ("wlroots (Sway / River)", 2),
         ("gamescope", 4),
     ]
