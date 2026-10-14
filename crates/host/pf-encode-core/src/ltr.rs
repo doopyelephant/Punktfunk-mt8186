@@ -9,6 +9,13 @@ use crate::{rfi, Acked};
 /// re-reference the newest mark before it.
 pub const NUM_LTR_SLOTS: usize = 2;
 
+/// AMF and QSV have no wave: a loss the mirror cannot anchor is the caller's keyframe.
+const NO_WAVE: rfi::RecoveryPolicy = rfi::RecoveryPolicy {
+    cycle: None,
+    mid_wave: rfi::MidWave::Queue,
+    abandons: true,
+};
+
 /// One frame's LTR action, decided before the surface is built.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LtrStep {
@@ -53,12 +60,12 @@ impl LtrMirror {
         self.next = (slot + 1) % NUM_LTR_SLOTS;
     }
 
-    /// This frame's mark and force. An IDR empties the mirror and drops a queued force. A
-    /// queued force resolves now: an untrusted slot ships a plain P with no recovery anchor,
-    /// because that tag lifts the client's post-loss freeze. With `drop_unforced` the force
-    /// leaves only its own slot trusted (AMF's force discards the rest); without, the other
-    /// marks stay trusted (QSV rejects them for this frame only). A force takes the frame's
-    /// mark, which would overwrite it.
+    /// This frame's mark and force, ranked by [`rfi::plan_frame`]. An IDR empties the mirror
+    /// and drops a queued force. A queued force resolves now: an untrusted slot ships a plain P
+    /// with no recovery anchor, because that tag lifts the client's post-loss freeze. With
+    /// `drop_unforced` the force leaves only its own slot trusted (AMF's force discards the
+    /// rest); without, the other marks stay trusted (QSV rejects them for this frame only). A
+    /// force takes the frame's mark, which would overwrite it.
     ///
     /// Under a `floor` each frame forces the newest confirmed slot ([`rfi::ltr_acked_step`]).
     /// With `keep` the driver keeps the other slot and the frame marks only a free one;
@@ -76,23 +83,39 @@ impl LtrMirror {
         if forced {
             *self = Self::default();
         }
+        let queued = self.pending_force.take().filter(|&s| self.trusted(s));
+        let pending = rfi::Pending {
+            idr: forced,
+            anchor: queued.is_some(),
+            acked: floor.is_some_and(|f| {
+                rfi::ltr_acked_step(&self.trusted_view(), &f, cur_idx, self.next)
+                    .1
+                    .is_some()
+            }),
+            loss: false,
+        };
+        let refs = rfi::plan_frame(rfi::Recovery::default(), pending, &NO_WAVE).refs;
         let mut step = LtrStep::default();
-        if let Some(slot) = self.pending_force.take().filter(|&s| self.trusted(s)) {
-            step.force = self.slots[slot].map(|w| (slot, w));
-            if drop_unforced {
-                for (s, tainted) in self.tainted.iter_mut().enumerate() {
-                    *tainted |= s != slot;
+        match (refs, queued, floor) {
+            (rfi::FrameRef::Anchor, Some(slot), _) => {
+                step.force = self.slots[slot].map(|w| (slot, w));
+                if drop_unforced {
+                    for (s, tainted) in self.tainted.iter_mut().enumerate() {
+                        *tainted |= s != slot;
+                    }
                 }
             }
-        }
-        if let Some(floor) = floor.filter(|_| step.force.is_none() && !forced) {
-            return self.step_acked(&floor, cur_idx, keep);
-        }
-        if step.force.is_none() && (forced || cur_idx % interval == 0) {
-            let trusted: [bool; NUM_LTR_SLOTS] = std::array::from_fn(|s| self.trusted(s));
-            let slot = rfi::mark_slot(&trusted, self.next);
-            self.mark(slot, cur_idx);
-            step.mark_slot = Some(slot);
+            // A floor with no confirmed slot resident still places the frame's mark.
+            (rfi::FrameRef::Acked | rfi::FrameRef::Chain, _, Some(floor)) => {
+                return self.step_acked(&floor, cur_idx, keep);
+            }
+            _ if forced || cur_idx % interval == 0 => {
+                let trusted: [bool; NUM_LTR_SLOTS] = std::array::from_fn(|s| self.trusted(s));
+                let slot = rfi::mark_slot(&trusted, self.next);
+                self.mark(slot, cur_idx);
+                step.mark_slot = Some(slot);
+            }
+            _ => {}
         }
         step
     }
@@ -296,13 +319,6 @@ mod tests {
         );
         assert_eq!(m.distrust(), 0);
     }
-
-    /// AMF and QSV have no wave: a loss the mirror cannot anchor is the caller's keyframe.
-    const NO_WAVE: rfi::RecoveryPolicy = rfi::RecoveryPolicy {
-        cycle: None,
-        mid_wave: rfi::MidWave::Queue,
-        abandons: true,
-    };
 
     /// The mirror's own order, checked frame by frame against [`rfi::plan_frame`] fed the
     /// candidates the mirror holds. Events: `f` a frame, `k` a forced IDR, `a` the newest

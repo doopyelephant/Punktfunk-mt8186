@@ -15,7 +15,9 @@
 //! Evidence: `design/media-foundation-encoder.md`.
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
-use crate::retrieve::{poll_budget_ms, AuQueue};
+use crate::parameter_sets::parameter_set_prefix;
+use crate::retrieve::AuQueue;
+use crate::stall::{poll_budget_ms, Rebuild, Stall};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::mem::ManuallyDrop;
@@ -350,47 +352,6 @@ fn input_type(cfg: &EncodeConfig) -> Result<IMFMediaType> {
     }
 }
 
-/// H.264 SPS/PPS or HEVC VPS/SPS/PPS.
-fn is_parameter_set(codec: Codec, nal: u8) -> bool {
-    match codec {
-        Codec::H264 => matches!(nal, 7 | 8),
-        _ => matches!(nal, 32..=34),
-    }
-}
-
-/// The AU's VPS/SPS/PPS run, or `None` when it carries none. An access-unit delimiter or
-/// SEI ahead of the run is skipped rather than treated as its absence — that is the shape
-/// Qualcomm's MFT emits, and it publishes the sequence header late and HEVC in-band only,
-/// so an IDR without one is undecodable unless we prepend the cached run ourselves.
-fn parameter_set_prefix(codec: Codec, au: &[u8]) -> Option<&[u8]> {
-    let mut run: Option<usize> = None;
-    let mut i = 2;
-    while i + 1 < au.len() {
-        if au[i - 2..i + 1] != [0, 0, 1] {
-            i += 1;
-            continue;
-        }
-        // `i` indexes the start code's last byte; the 4-byte form owns the zero before it.
-        let header = i + 1;
-        let code_start = if i >= 3 && au[i - 3] == 0 {
-            i - 3
-        } else {
-            i - 2
-        };
-        let nal = match codec {
-            Codec::H264 => au[header] & 0x1f,
-            _ => (au[header] >> 1) & 0x3f,
-        };
-        match (is_parameter_set(codec, nal), run) {
-            (true, None) => run = Some(code_start),
-            (false, Some(start)) => return Some(&au[start..code_start]),
-            _ => {}
-        }
-        i = header + 1;
-    }
-    run.map(|start| &au[start..])
-}
-
 /// One submitted frame, awaiting its AU. The MFT emits in submit order (B-frames are off),
 /// so this pairs by position — MF puts no wire index on the output sample.
 struct PendingMeta {
@@ -619,8 +580,8 @@ pub struct MfEncoder {
     /// The MFT answered `IsSupported(AVEncVideoForceKeyFrame)`. `false` buys a periodic
     /// GOP instead, because a stream with neither cannot recover from loss at all.
     force_idr_ok: bool,
-    /// Resets with no AU since. At 2, drop `inner` instead of re-messaging a dead MFT.
-    resets_without_output: u32,
+    /// Stall recovery since the last AU, cleared in `poll`.
+    stall: Stall,
 }
 
 // SAFETY: COM interfaces are not auto-`Send`. Every call on this encoder runs on the one thread
@@ -676,7 +637,7 @@ impl MfEncoder {
             bound_device: 0,
             force_kf: false,
             force_idr_ok: false,
-            resets_without_output: 0,
+            stall: Stall::Clear,
         })
     }
 
@@ -1019,7 +980,7 @@ impl Encoder for MfEncoder {
         };
         let au = inner.shared.q.take_ready(poll_budget_ms(self.fps))?;
         if au.is_some() {
-            self.resets_without_output = 0;
+            self.stall = Stall::Clear;
         }
         Ok(au)
     }
@@ -1030,17 +991,17 @@ impl Encoder for MfEncoder {
         self.inner.as_ref().map(|i| i.shared.q.raw())
     }
 
-    /// Stall recovery: flush and restart streaming in place. A second reset with no AU
-    /// since drops the MFT so the next submit activates a fresh one.
+    /// Stall recovery: flush and restart streaming in place, or drop the MFT when
+    /// [`Stall::reset`] says reopen, so the next submit activates a fresh one.
     fn reset(&mut self) -> bool {
         self.force_kf = true;
-        self.resets_without_output = self.resets_without_output.saturating_add(1);
+        let (stall, rebuild) = self.stall.reset();
+        self.stall = stall;
         let Some(inner) = self.inner.as_mut() else {
             return true;
         };
-        if self.resets_without_output >= 2 {
+        if rebuild == Rebuild::Reopen {
             tracing::warn!(
-                resets = self.resets_without_output,
                 "Media Foundation stall persisted across an in-place restart — dropping the MFT, \
                  reopening lazily (next submit)"
             );
@@ -1195,55 +1156,6 @@ mod tests {
         assert!(!probe_can_encode(Codec::Av1, None));
     }
 
-    #[test]
-    fn nal_classification_matches_the_two_codecs() {
-        assert!(is_parameter_set(Codec::H264, 8));
-        assert!(!is_parameter_set(Codec::H264, 5));
-        assert!(is_parameter_set(Codec::H265, 34));
-        assert!(!is_parameter_set(Codec::H265, 19));
-    }
-
-    /// The cached prefix must end exactly at the first slice NAL, start-code included.
-    #[test]
-    fn parameter_set_prefix_cuts_at_the_first_slice() {
-        // SPS (0x67) + PPS (0x68) + IDR slice (0x65).
-        let au = [
-            0, 0, 0, 1, 0x67, 0xAA, //
-            0, 0, 0, 1, 0x68, 0xBB, //
-            0, 0, 0, 1, 0x65, 0xCC,
-        ];
-        let prefix = parameter_set_prefix(Codec::H264, &au).expect("SPS-led AU has a prefix");
-        assert_eq!(prefix, &au[..12]);
-        // An AU that opens with the slice has no prefix to cache.
-        assert!(parameter_set_prefix(Codec::H264, &au[12..]).is_none());
-        // Parameter sets with no slice after them are all prefix.
-        assert_eq!(
-            parameter_set_prefix(Codec::H264, &au[..12]).expect("all parameter sets"),
-            &au[..12]
-        );
-    }
-
-    /// An MFT that opens the AU with a delimiter still gets its header cached. That is
-    /// the Qualcomm shape, and requiring the run to come first defeated it entirely.
-    #[test]
-    fn parameter_set_prefix_skips_a_leading_delimiter() {
-        // AUD (0x09) + SPS (0x67) + PPS (0x68) + IDR slice (0x65).
-        let au = [
-            0, 0, 0, 1, 0x09, 0x10, //
-            0, 0, 0, 1, 0x67, 0xAA, //
-            0, 0, 0, 1, 0x68, 0xBB, //
-            0, 0, 0, 1, 0x65, 0xCC,
-        ];
-        let prefix =
-            parameter_set_prefix(Codec::H264, &au).expect("delimiter-led AU still has a prefix");
-        assert_eq!(prefix, &au[6..18]);
-        // SEI-led, parameter sets running to the end of the AU.
-        assert_eq!(
-            parameter_set_prefix(Codec::H264, &au[..18]).expect("delimiter then parameter sets"),
-            &au[6..18]
-        );
-    }
-
     /// The adapter the device sits on, as `MFT_ENUM_ADAPTER_LUID` wants it.
     fn adapter_luid_of(device: &ID3D11Device) -> Option<LUID> {
         use windows::Win32::Graphics::Dxgi::IDXGIDevice;
@@ -1390,6 +1302,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a hardware Media Foundation encoder"]
     fn mf_encode_live_smoke() {
         let Some(aus) = drive_live(Codec::H264, 30, |_, _| {}) else {
             return;
@@ -1399,6 +1312,7 @@ mod tests {
 
     /// The first IDR's SPS carries BT.709 limited range, the capture's own colour.
     #[test]
+    #[ignore = "needs a hardware Media Foundation encoder"]
     fn mf_live_colour_description() {
         use pf_bitstream::h264::ColourDescription;
         let bt709 = ColourDescription {
@@ -1427,6 +1341,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a hardware Media Foundation encoder"]
     fn mf_live_hevc() {
         let Some(aus) = drive_live(Codec::H265, 30, |_, _| {}) else {
             return;
@@ -1436,6 +1351,7 @@ mod tests {
 
     /// Mid-stream `reconfigure_bitrate` must accept and must not emit a keyframe.
     #[test]
+    #[ignore = "needs a hardware Media Foundation encoder"]
     fn mf_live_bitrate_retarget() {
         let mut accepted = false;
         let Some(aus) = drive_live(Codec::H264, 60, |enc, i| {
@@ -1456,6 +1372,7 @@ mod tests {
     /// `request_keyframe` must produce an IDR where it was asked for — the one device
     /// question that decides whether loss recovery works at all (design §6, Q1).
     #[test]
+    #[ignore = "needs a hardware Media Foundation encoder"]
     fn mf_live_force_idr() {
         let Some(aus) = drive_live(Codec::H264, 60, |enc, i| {
             if i == 30 {

@@ -15,7 +15,8 @@
 use super::policy::{intra_refresh_period, intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::ltr::{LtrMirror, LtrStep, NUM_LTR_SLOTS};
-use crate::retrieve::{poll_budget_ms, AuQueue, RetrieveThread};
+use crate::retrieve::{AuQueue, RetrieveThread};
+use crate::stall::{poll_budget_ms, Rebuild, Stall};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::collections::VecDeque;
@@ -1076,9 +1077,8 @@ pub struct AmfEncoder {
     /// in flight before it reuses an input texture. `None` = never told, so the ring copy stays.
     /// See [`AmfEncoder::in_place`].
     input_ring_depth: Option<usize>,
-    /// Resets with no AU since (cleared in `poll`). At 2, escalate past in-place re-Init: that
-    /// reuses the same context and cannot clear a dead VCN session. Drop `inner` instead.
-    resets_without_output: u32,
+    /// Stall recovery since the last AU, cleared in `poll`.
+    stall: Stall,
 }
 
 // SAFETY: raw AMF pointers are not auto-`Send`. AMF objects have no thread affinity, and every
@@ -1158,7 +1158,7 @@ impl AmfEncoder {
             #[cfg(test)]
             fail_submit_at: None,
             input_ring_depth: None,
-            resets_without_output: 0,
+            stall: Stall::Clear,
         })
     }
 
@@ -1972,7 +1972,7 @@ impl Encoder for AmfEncoder {
         };
         let au = inner.retrieve.q.take_ready(poll_budget_ms(self.fps))?;
         if au.is_some() {
-            self.resets_without_output = 0;
+            self.stall = Stall::Clear;
         }
         Ok(au)
     }
@@ -1999,20 +1999,19 @@ impl Encoder for AmfEncoder {
         );
     }
 
-    /// Stall recovery: Flush + Terminate + re-Init on the same context. Fail → drop `inner` so
-    /// the next submit rebuilds lazily. Owed AUs forfeited; next frame is a forced IDR.
-    /// In-place re-Init cannot clear a dead VCN session; at 2 no-output resets, tear the context down.
+    /// Stall recovery: Flush + Terminate + re-Init on the same context, or the context torn
+    /// down when [`Stall::reset`] says reopen. Fail → drop `inner` so the next submit
+    /// rebuilds lazily. Owed AUs forfeited; next frame is a forced IDR.
     fn reset(&mut self) -> bool {
         self.force_kf = true;
-        self.resets_without_output = self.resets_without_output.saturating_add(1);
+        let (stall, rebuild) = self.stall.reset();
+        self.stall = stall;
         // Taken so the rebuild can borrow `self` beside it; put back only once it is live again.
         let Some(mut inner) = self.inner.take() else {
             return true; // next submit rebuilds lazily
         };
-        // Second no-output reset: the fault is the context.
-        if self.resets_without_output >= 2 {
+        if rebuild == Rebuild::Reopen {
             tracing::warn!(
-                resets = self.resets_without_output,
                 "AMF stall persisted across in-place re-Init — full context teardown, reopening a \
                  fresh context (next submit)"
             );
