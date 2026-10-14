@@ -30,7 +30,8 @@ import Foundation
 /// frame is fixed to the portrait device (+x right edge, +y top, +z out of the screen); the
 /// controller frame keeps +z (the screen always faces the player) and rotates x/y so they
 /// mean "player's right" and "player's up". Derived, like the wire scale constants — pinned
-/// by `DeviceGyroRemapTests`, correctable in one place if on-glass says otherwise.
+/// by `DeviceGyroVectorTests` (the table Android's `DeviceGyro.remap` runs too), correctable
+/// in one place if on-glass says otherwise.
 /// File-scope rather than nested so the sample thread can use it without actor isolation, and
 /// outside the iOS gate so its table runs under `swift test`.
 enum DeviceGyroRemap {
