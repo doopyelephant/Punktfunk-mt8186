@@ -23,10 +23,12 @@ pub(crate) fn install_crash_handler() {
 }
 
 /// Before DXGI: virtual-display setup creates a factory. Hybrid-GPU boxes otherwise reparent
-/// the virtual output off the capture GPU (ACCESS_LOST). Idempotent Once.
+/// the virtual output off the capture GPU (ACCESS_LOST). `startup` is the one caller.
 pub(crate) fn preflight(management_cli: bool) {
     if !management_cli {
-        crate::capture::dxgi::install_gpu_pref_hook();
+        // SAFETY: `startup` runs this before any subcommand, and nothing earlier in `real_main`
+        // creates a DXGI factory.
+        unsafe { crate::capture::dxgi::install_gpu_pref_hook() };
     }
 }
 
