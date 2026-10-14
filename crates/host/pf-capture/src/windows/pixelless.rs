@@ -11,13 +11,13 @@
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat, Provenance};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// When a pixel-less capturer has a delivery for the loop. `G` is the geometry the loop
 /// sizes the encoder from.
 pub(crate) struct DeliveryGate<G> {
-    /// The pool counter at the last delivery.
-    seq: u64,
+    /// The encoder's open time and pool counter at the last delivery.
+    source: Option<(Instant, u64)>,
     /// The geometry last delivered. A change must reach the loop even over a desktop composing
     /// nothing: it rebuilds the encoder off the frame.
     delivered: Option<G>,
@@ -26,24 +26,26 @@ pub(crate) struct DeliveryGate<G> {
 impl<G: PartialEq> DeliveryGate<G> {
     pub(crate) fn new() -> Self {
         Self {
-            seq: 0,
+            source: None,
             delivered: None,
         }
     }
 
-    /// Whether this tick delivers. `source_seq` is the encoder's pool counter, the only source
-    /// clock this side has, and `None` until the encoder opens: the loop needs a frame to open
-    /// it. A re-opened encoder's fresh section reads 0 until the pool takes a frame, which is
-    /// no news.
-    pub(crate) fn admit(&mut self, source_seq: Option<u64>, geometry: G) -> bool {
-        let seq = source_seq.unwrap_or(0);
-        if source_seq.is_some()
-            && (seq == 0 || seq == self.seq)
-            && self.delivered.as_ref() == Some(&geometry)
-        {
+    /// Whether this tick delivers. `source` is the encoder's open time and pool counter, the
+    /// only source clock this side has, and `None` until the encoder opens: the loop needs a
+    /// frame to open it. A count is news against its own encoder's last delivery: a re-opened
+    /// encoder's first frame may carry the number its predecessor delivered last. A fresh
+    /// section reads 0 until the pool takes a frame, which is no news.
+    pub(crate) fn admit(&mut self, source: Option<(Instant, u64)>, geometry: G) -> bool {
+        let news = match source {
+            Some((_, 0)) => false,
+            Some(_) => source != self.source,
+            None => true,
+        };
+        if !news && self.delivered.as_ref() == Some(&geometry) {
             return false;
         }
-        self.seq = seq;
+        self.source = source;
         self.delivered = Some(geometry);
         true
     }
@@ -75,26 +77,32 @@ mod tests {
     const HD: (u32, u32) = (1920, 1080);
     const QHD: (u32, u32) = (2560, 1440);
 
-    /// One gate through a session: the pool counter and geometry of each tick, and whether
-    /// the tick delivers.
+    /// One gate through a session: the encoder and pool counter and the geometry of each tick,
+    /// and whether the tick delivers. `a`, `b`, `c` and `d` are four encoder opens.
     #[test]
     fn a_tick_delivers_only_news() {
+        let a = Instant::now();
+        let [b, c, d] = [1, 2, 3].map(|s| a + std::time::Duration::from_secs(s));
         let ticks = [
             (None, HD, true, "the loop needs a frame to open the encoder"),
             (None, HD, true, "and needs one until it is open"),
-            (Some(0), HD, false, "a fresh section is no news"),
-            (Some(1), HD, true, "the pool took a frame"),
-            (Some(1), HD, false, "the desktop composed nothing"),
-            (Some(2), HD, true, "the pool took another"),
-            (Some(2), QHD, true, "a new size over a still desktop"),
-            (Some(2), QHD, false, "delivered once"),
-            (Some(0), HD, true, "a new size ahead of the re-opened pool"),
-            (Some(0), HD, false, "whose fresh section is no news either"),
-            (Some(1), HD, true, "until it takes a frame"),
+            (Some((a, 0)), HD, false, "a fresh section is no news"),
+            (Some((a, 1)), HD, true, "the pool took a frame"),
+            (Some((a, 1)), HD, false, "the desktop composed nothing"),
+            (Some((a, 2)), HD, true, "the pool took another"),
+            (Some((a, 2)), QHD, true, "a new size over a still desktop"),
+            (Some((a, 2)), QHD, false, "delivered once"),
+            (Some((b, 0)), HD, true, "a new size over a fresh section"),
+            (Some((b, 0)), HD, false, "its fresh section is no news"),
+            (Some((b, 1)), HD, true, "until it takes a frame"),
+            (Some((c, 1)), HD, true, "same size re-open, b's last number"),
+            (Some((c, 1)), HD, false, "delivered once"),
+            (Some((d, 0)), HD, false, "its fresh section is no news"),
+            (Some((d, 1)), HD, true, "news against its own encoder"),
         ];
         let mut gate = DeliveryGate::new();
-        for (i, (seq, geometry, delivers, why)) in ticks.into_iter().enumerate() {
-            assert_eq!(gate.admit(seq, geometry), delivers, "tick {i}: {why}");
+        for (i, (source, geometry, delivers, why)) in ticks.into_iter().enumerate() {
+            assert_eq!(gate.admit(source, geometry), delivers, "tick {i}: {why}");
         }
     }
 

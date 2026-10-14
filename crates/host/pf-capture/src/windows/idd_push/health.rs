@@ -52,7 +52,8 @@ impl IddPushCapturer {
                 self.cursor.gap_px()
             },
             recreating: self.recovering_since.is_some(),
-            secure_desktop: self.cursor_model.secure(),
+            // The OS's verdict, not the cursor model's: UAC holds the ladder in every session.
+            secure_desktop: pf_win_display::secure_desktop(),
             topology_held: pf_win_display::topology_churn::held(),
             encoder: self.encoder,
         };

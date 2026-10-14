@@ -244,7 +244,8 @@ jobs:
       - name: Test (subsystem crates, Windows)
         # The crates whose Windows test binaries link against nothing this runner lacks —
         # settled empirically when the package job's equivalents were added. The host and
-        # pf-encode(-win) stay clippy-only: nvidia-video-codec-sdk cannot link on MSVC.
+        # pf-encode stay clippy-only: nvidia-video-codec-sdk cannot link on MSVC. pf-encode-win
+        # runs featureless, so no encoder SDK is in its graph.
         #
         # pf-win-display joins them for the same reason as pf-capture: its manifest is
         # punktfunk-core (default-features off), pf-paths, tracing and windows — no encoder in
@@ -264,6 +265,8 @@ jobs:
           cargo test --release --locked -p pf-inject --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-inject tests" }
           cargo test --release --locked -p pf-audio --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-audio tests" }
           cargo test --release --locked -p pf-encode-session --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-encode-session tests" }
+          # The AMF and Media Foundation tests that need a GPU are `#[ignore]`d with their reason.
+          cargo test --release --locked -p pf-encode-win --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-encode-win tests" }
           # The D3D11 map guard on a WARP device, and a clipboard block the clipboard refuses.
           cargo test --release --locked -p pf-frame --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-frame tests" }
           cargo test --release --locked -p pf-clipboard --target x86_64-pc-windows-msvc; if ($LASTEXITCODE) { throw "pf-clipboard tests" }

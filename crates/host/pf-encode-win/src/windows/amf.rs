@@ -1025,14 +1025,32 @@ struct Inner {
     /// The copy targets, made by the first submit that copies ([`input_ring`]): a caller
     /// encoding in place never pays for them. Empty until then.
     ring: Vec<ID3D11Texture2D>,
+    /// Last, so the textures it holds outlive Terminate.
+    live: Live,
+}
+
+/// What one `Init` of the component owns and the next `Init` derives again.
+/// [`AmfEncoder::apply_static_props`] builds it, and an in-place re-Init replaces it whole, so a
+/// field added here cannot outlive its `Init`.
+struct Live {
+    /// Submits on this `Init`. The next ring slot is `next % RING`, and 0 is the forced IDR.
     next: usize,
     /// A reference to every texture AMF may still be reading, newest last, capped at [`RING`].
     /// The AMF docs do not say whether `CreateSurfaceFromDX11Native` AddRefs the texture it
     /// wraps, so this keeps it alive; in-flight is never more than `RING`, so the last `RING`
-    /// entries always cover whatever the hardware is on. Emptied only after Terminate.
+    /// entries always cover whatever the hardware is on. Dropped only after Terminate.
     held: VecDeque<ID3D11Texture2D>,
-    /// Last `*InHDRMetadata` pushed to this component — re-push on change or rebuild.
+    /// Last `*InHDRMetadata` pushed to this `Init`; pushed again on a change.
     hdr_pushed: Option<pf_frame::HdrMeta>,
+    /// Driver accepted intra-refresh — gates [`EncoderCaps::intra_refresh`].
+    ir_active: bool,
+    /// Driver accepted LTR. Mutually exclusive with intra-refresh; LTR wins.
+    ltr_active: bool,
+    /// The driver keeps the slots a force leaves out (`LTRMode` 1): a mark awaiting the
+    /// client's confirmation survives the forces before it.
+    ltr_keep: bool,
+    /// The long-term slots this `Init` marked.
+    ltr: LtrMirror,
 }
 
 pub struct AmfEncoder {
@@ -1057,14 +1075,6 @@ pub struct AmfEncoder {
     force_kf: bool,
     /// Static HDR mastering metadata; pushed as `*InHDRMetadata` when it changes.
     hdr_meta: Option<pf_frame::HdrMeta>,
-    /// Driver accepted intra-refresh — gates [`EncoderCaps::intra_refresh`].
-    ir_active: bool,
-    /// Driver accepted LTR at open. Mutually exclusive with intra-refresh; LTR wins.
-    ltr_active: bool,
-    /// The driver keeps the slots a force leaves out (`LTRMode` 1): a mark awaiting the
-    /// client's confirmation survives the forces before it.
-    ltr_keep: bool,
-    ltr: LtrMirror,
     ltr_mark_interval: i64,
     /// The newest frame the client confirmed, while the host holds confirmed references.
     reference_floor: Option<crate::Acked>,
@@ -1148,10 +1158,6 @@ impl AmfEncoder {
             frame_idx: 0,
             force_kf: false,
             hdr_meta: None,
-            ir_active: false,
-            ltr_active: false,
-            ltr_keep: false,
-            ltr: LtrMirror::default(),
             ltr_mark_interval: ltr_mark_interval(fps),
             reference_floor: None,
             ltr_test_force_at: ltr_test_force_at(),
@@ -1175,9 +1181,9 @@ impl AmfEncoder {
     }
 
     /// Static encoder config, before `Init` and again on `reset()` re-`Init` (Terminate does not
-    /// keep properties on every driver). Returns `(ir_active, ltr_active, ltr_keep)` as
-    /// requested AND accepted. The first two are mutually exclusive — see [`Self::ltr_wanted`].
-    fn apply_static_props(&self, comp: &Component) -> Result<(bool, bool, bool)> {
+    /// keep properties on every driver). Returns the [`Live`] state of the `Init` that follows,
+    /// with the intra-refresh and LTR the driver accepted: never both — see [`Self::ltr_wanted`].
+    fn apply_static_props(&self, comp: &Component) -> Result<Live> {
         let p = &self.props;
         // Usage first: it fully configures the parameter set; everything after is an override.
         comp.set_prop(
@@ -1377,7 +1383,15 @@ impl AmfEncoder {
             comp.set_prop(p.in_transfer, AmfVariant::from_i64(TRANSFER_LINEAR), false)?;
             comp.set_prop(p.in_primaries, AmfVariant::from_i64(PRIMARIES_BT709), false)?;
         }
-        Ok((ir_active, ltr_active, ltr_keep))
+        Ok(Live {
+            next: 0,
+            held: VecDeque::new(),
+            hdr_pushed: None,
+            ir_active,
+            ltr_active,
+            ltr_keep,
+            ltr: LtrMirror::default(),
+        })
     }
 
     /// Build or rebuild the AMF context + component on the capturer's device.
@@ -1412,20 +1426,13 @@ impl AmfEncoder {
         let r = unsafe { ctx.init_dx11(Some(device)) };
         amf_ok(r, "AMF InitDX11 (capturer device)")?;
         let mut comp = lib.create_component(&ctx, self.props.component)?;
-        let (ir_active, ltr_active, ltr_keep) = self.apply_static_props(&comp)?;
+        let live = self.apply_static_props(&comp)?;
         let blocking = set_query_timeout(&comp, self.props.query_timeout);
         let (fmt, _) = input_formats(self.input).context("AMF input format")?;
         amf_ok(
             comp.init(fmt, self.width as i32, self.height as i32),
             "AMF encoder Init",
         )?;
-        self.ir_active = ir_active;
-        // Rebuilt component has no reference history; drop prior LTR marks.
-        self.ltr_active = ltr_active;
-        self.ltr_keep = ltr_keep;
-        if ltr_active {
-            self.ltr = LtrMirror::default();
-        }
 
         // Bump after successful Init so a failed bring-up never counts.
         let context_no = AMF_CONTEXTS_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1437,8 +1444,8 @@ impl AmfEncoder {
             height = self.height,
             fps = self.fps,
             ring = ?self.input,
-            ltr = ltr_active,
-            intra_refresh = ir_active,
+            ltr = live.ltr_active,
+            intra_refresh = live.ir_active,
             runtime = %format_args!(
                 "{}.{}.{}",
                 (lib.version >> 48) & 0xffff,
@@ -1467,9 +1474,7 @@ impl AmfEncoder {
             device: device.clone(),
             dctx,
             ring: Vec::new(),
-            next: 0,
-            held: VecDeque::new(),
-            hdr_pushed: None,
+            live,
         });
         Ok(())
     }
@@ -1673,13 +1678,12 @@ impl AmfEncoder {
         );
         self.ensure_inner(&frame.device)?;
         let cur_idx = self.frame_idx;
-        // First submit on a component must be a forced IDR. Use the ring counter, not
+        // An `Init`'s first submit must be a forced IDR. Use its own count, not
         // `frame_idx == 0`: `submit_indexed` pins wire indexes that are non-zero after a rebuild.
-        let opening = self.inner.as_ref().is_none_or(|i| i.next == 0);
+        let opening = self.inner.as_ref().is_none_or(|i| i.live.next == 0);
         let mut forced = std::mem::take(&mut self.force_kf) || opening;
         let pts_100ns = self.frame_idx * 10_000_000 / self.fps.max(1) as i64;
         self.frame_idx += 1;
-        // LTR decisions before borrowing `inner`: the test hook re-enters `&mut self`, and
         // `&'static` name copies let the surface block set props without re-borrowing
         // `self.props`.
         let ltr_names = self
@@ -1687,7 +1691,9 @@ impl AmfEncoder {
             .ltr
             .as_ref()
             .map(|l| (l.mark_ltr_index, l.force_ltr_bitfield));
-        if self.ltr_active && !forced && self.ltr_test_force_at == Some(cur_idx) {
+        // The test hook re-enters `&mut self`, so it runs before `inner` is borrowed.
+        let ltr_active = self.inner.as_ref().is_some_and(|i| i.live.ltr_active);
+        if ltr_active && !forced && self.ltr_test_force_at == Some(cur_idx) {
             // Spike hook: self-trigger the real invalidate path without a live client.
             let triggered = self.invalidate_ref_frames(cur_idx, cur_idx);
             tracing::info!(
@@ -1696,15 +1702,18 @@ impl AmfEncoder {
                 "AMF LTR test hook fired invalidate_ref_frames"
             );
         }
+        let in_place = self.in_place();
+        let inner = self.inner.as_mut().expect("ensure_inner succeeded");
+        let live = &mut inner.live;
         // An RFI force leaves only its own slot trusted, in either `LTRMode`.
         let LtrStep {
             mark_slot,
             force,
             acked,
-        } = if self.ltr_active {
+        } = if live.ltr_active {
             let interval = self.ltr_mark_interval;
-            let (floor, keep) = (self.reference_floor, self.ltr_keep);
-            self.ltr.step(forced, cur_idx, interval, floor, keep, true)
+            let (floor, keep) = (self.reference_floor, live.ltr_keep);
+            live.ltr.step(forced, cur_idx, interval, floor, keep, true)
         } else {
             LtrStep::default()
         };
@@ -1714,11 +1723,9 @@ impl AmfEncoder {
         if self.fail_submit_at == Some(cur_idx) {
             bail!("test hook: frame {cur_idx} refused after the LTR decision");
         }
-        let in_place = self.in_place();
-        let inner = self.inner.as_mut().expect("ensure_inner succeeded");
         // Re-push HDR metadata on change or rebuild. Best-effort: reject leaves the 0xCE datagram.
         if let Some(name) = self.props.hdr_metadata {
-            if self.hdr && inner.hdr_pushed != self.hdr_meta {
+            if self.hdr && live.hdr_pushed != self.hdr_meta {
                 if let Some(m) = self.hdr_meta {
                     match push_hdr_metadata(&inner.ctx, &inner.comp, name, &m) {
                         Ok(()) => tracing::debug!(
@@ -1730,7 +1737,7 @@ impl AmfEncoder {
                         ),
                     }
                 }
-                inner.hdr_pushed = self.hdr_meta;
+                live.hdr_pushed = self.hdr_meta;
             }
         }
         // Bound in-flight below RING before reuse: AMF keeps reading a slot until its AU is
@@ -1742,8 +1749,8 @@ impl AmfEncoder {
             .retrieve
             .q
             .wait_until(INPUT_DRAIN_BUDGET, "AMF output", |o| o.pending.len() < cap)?;
-        let slot = inner.next % RING;
-        inner.next += 1;
+        let slot = live.next % RING;
+        live.next += 1;
         // The texture the hardware will read: the caller's own when it declared a depth deep
         // enough to leave it alone, else our copy of it.
         let source = if in_place.is_some() {
@@ -1763,10 +1770,10 @@ impl AmfEncoder {
             };
             inner.ring[slot].clone()
         };
-        // Kept alive until its AU is out (see `Inner::held`).
-        inner.held.push_back(source.clone());
-        while inner.held.len() > RING {
-            inner.held.pop_front();
+        // Kept alive until its AU is out (see `Live::held`).
+        live.held.push_back(source.clone());
+        while live.held.len() > RING {
+            live.held.pop_front();
         }
         // SAFETY: `source` is on the context's device (`ensure_inner` rebinds on a device
         // change) and `held` keeps it until RING newer submits or Terminate; in-flight never
@@ -1814,7 +1821,7 @@ impl AmfEncoder {
                         "AMF LTR mark rejected"
                     );
                     // The mirror must not claim a slot the hardware never marked.
-                    self.ltr.slots[slot] = None;
+                    live.ltr.slots[slot] = None;
                 }
             }
             if let Some(slot) = force_slot {
@@ -1905,13 +1912,14 @@ impl Encoder for AmfEncoder {
 
     /// Force the next submit to re-reference the newest LTR marked before `[first, last]`
     /// ([`LtrMirror::invalidate`]); that AU ships `recovery_anchor`. `true` = usable pre-loss
-    /// LTR (caller must not also IDR); `false` = fall back to keyframe.
+    /// LTR (caller must not also IDR); `false` = fall back to keyframe, as with no component.
     fn invalidate_ref_frames(&mut self, first: i64, last: i64) -> bool {
         // No live LTR or a nonsense range → caller IDRs.
-        if !self.ltr_active || first < 0 || first > last {
+        let ltr = self.inner.as_mut().map(|i| &mut i.live);
+        let Some(live) = ltr.filter(|l| l.ltr_active && first >= 0 && first <= last) else {
             return false;
-        }
-        match self.ltr.invalidate(first, self.reference_floor.as_ref()) {
+        };
+        match live.ltr.invalidate(first, self.reference_floor.as_ref()) {
             Some((slot, ltr_frame)) => {
                 tracing::info!(
                     first,
@@ -1940,7 +1948,7 @@ impl Encoder for AmfEncoder {
     /// Withdraw anchor trust from every live LTR and drop a queued force
     /// ([`LtrMirror::distrust`]); the trait docs carry the why.
     fn distrust_references(&mut self) {
-        let live = self.ltr.distrust();
+        let live = self.inner.as_mut().map_or(0, |i| i.live.ltr.distrust());
         if live > 0 {
             tracing::debug!(
                 live,
@@ -1950,12 +1958,14 @@ impl Encoder for AmfEncoder {
         }
     }
 
+    /// What the live `Init` accepted; no LTR and no intra-refresh without a component.
     fn caps(&self) -> EncoderCaps {
+        let live = self.inner.as_ref().map(|i| &i.live);
         EncoderCaps {
             blends_cursor: false,
-            supports_rfi: self.ltr_active,
+            supports_rfi: live.is_some_and(|l| l.ltr_active),
             chroma_444: false,
-            intra_refresh: self.ir_active,
+            intra_refresh: live.is_some_and(|l| l.ir_active),
             // AMF emits no recovery-point SEI; host keeps the IDR path.
             intra_refresh_recovery: false,
             intra_refresh_period: 0,
@@ -2001,8 +2011,9 @@ impl Encoder for AmfEncoder {
     }
 
     /// Stall recovery: Flush + Terminate + re-Init on the same context, or the context torn
-    /// down when [`Stall::reset`] says reopen. Fail → drop `inner` so the next submit
-    /// rebuilds lazily. Owed AUs forfeited; next frame is a forced IDR.
+    /// down when [`Stall::reset`] says reopen. A re-Init replaces [`Live`] and the retrieve
+    /// thread whole. Fail → drop `inner` so the next submit rebuilds lazily. Owed AUs
+    /// forfeited; next frame is a forced IDR.
     fn reset(&mut self) -> bool {
         self.force_kf = true;
         let (stall, rebuild) = self.stall.reset();
@@ -2018,16 +2029,11 @@ impl Encoder for AmfEncoder {
             );
             drop(inner);
             self.bound_device = 0;
-            self.ir_active = false;
-            self.ltr_active = false;
             return true;
         }
         // Stop and join before Terminate: the retrieve thread is inside `QueryOutput` on this
         // very component, and a re-Init under it would run against a terminated one.
         inner.retrieve.thread.stop_and_join();
-        inner.retrieve.q.reset(); // owed AUs forfeited; rebuilt stream restarts at IDR
-        inner.next = 0; // the rebuilt component's first frame is `opening` again
-        inner.hdr_pushed = None; // re-Init'd component needs HDR metadata again
 
         // The format the frames arrive in, as at the open: re-Init'd as NV12, a BGRA session
         // takes every surface and never returns an access unit.
@@ -2039,25 +2045,21 @@ impl Encoder for AmfEncoder {
                 // Legal on a wedge; results ignored.
                 comp.flush();
                 comp.terminate();
-                // VCN may read an input surface until Terminate returns; only then can they go.
-                inner.held.clear();
                 match (self.apply_static_props(comp), fmt) {
-                    (Ok((ir, ltr, keep)), Some(fmt)) => {
-                        self.ir_active = ir;
-                        // Re-Init voids reference history; drop prior LTR marks.
-                        self.ltr_active = ltr;
-                        self.ltr_keep = keep;
-                        self.ltr = LtrMirror::default();
+                    (Ok(live), Some(fmt)) => {
                         blocking = set_query_timeout(comp, self.props.query_timeout);
-                        comp.init(fmt, self.width as i32, self.height as i32) == sys::AMF_OK
+                        let init = comp.init(fmt, self.width as i32, self.height as i32);
+                        (init == sys::AMF_OK).then_some(live)
                     }
-                    _ => false,
+                    _ => None,
                 }
             }
             // Unreachable once joined; a failed rebuild tears the context down.
-            None => false,
+            None => None,
         };
-        if rebuilt {
+        if let Some(live) = rebuilt {
+            // After Terminate, so VCN reads none of the old `Init`'s textures any more.
+            inner.live = live;
             // The component is live again, so it needs its retrieve thread back. Without one no
             // AU would ever be taken off it and the rebuild would read as a second wedge.
             match Retrieve::start(Arc::clone(&inner.comp), &self.props, blocking) {
@@ -2078,8 +2080,6 @@ impl Encoder for AmfEncoder {
                 }
             }
         } else {
-            self.ir_active = false;
-            self.ltr_active = false;
             tracing::warn!("AMF in-place re-Init failed — full context teardown, reopening lazily");
             drop(inner);
             self.bound_device = 0;

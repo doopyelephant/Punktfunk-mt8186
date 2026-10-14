@@ -780,17 +780,17 @@ fn amf_refused_submit_forces_idr_live() {
             refused + 1
         );
     }
+    let inner = enc.inner.as_ref().expect("the component is open");
+    let slots = inner.live.ltr.slots;
     if ltr {
         assert!(
-            !enc.ltr.slots.contains(&Some(refused_mark as i64)),
-            "mirror claims a mark the hardware never made: {:?}",
-            enc.ltr.slots
+            !slots.contains(&Some(refused_mark as i64)),
+            "mirror claims a mark the hardware never made: {slots:?}"
         );
     }
     eprintln!(
-        "live AMF refused-submit: {} AUs, ltr={ltr}, mirror {:?}",
-        aus.len(),
-        enc.ltr.slots
+        "live AMF refused-submit: {} AUs, ltr={ltr}, mirror {slots:?}",
+        aus.len()
     );
 }
 
@@ -826,7 +826,8 @@ fn amf_ltr_anchor_soak() {
     );
     println!(
         "amf_ltr_anchor_soak: LTR mark interval {} keep {}",
-        enc.ltr_mark_interval, enc.ltr_keep
+        enc.ltr_mark_interval,
+        enc.inner.as_ref().is_some_and(|i| i.live.ltr_keep)
     );
     let (w, h) = (soak.w, soak.h);
     soak.run("amf", &mut enc, |i| {

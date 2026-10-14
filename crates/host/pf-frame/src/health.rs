@@ -69,6 +69,8 @@ pub struct EncoderTelemetry {
     /// The last access unit's publish time (`last_au_qpc`); the encoder's open time before the
     /// first one, so an encoder that never produces still reads as silent from a known instant.
     pub last_au: Instant,
+    /// When this encoder opened. Another value is another encoder, and its counters are its own.
+    pub opened_at: Instant,
     /// Access units published so far — an encoder episode's proof clock.
     pub published_total: u64,
     /// Encode threads the driver abandoned after a wedge.
@@ -436,6 +438,7 @@ mod tests {
         let now = wedged_at + th.stall_floor + S;
         let t = EncoderTelemetry {
             last_au: wedged_at,
+            opened_at: start,
             published_total: 600,
             detached: 0,
             source_seq: 600,
