@@ -218,8 +218,9 @@ def tree_errors():
     for channel, (covers, sources) in CHANNELS.items():
         grants, where, listed = [], {}, []
         for patterns, reader, names in sources:
-            files = sorted(os.path.relpath(f, ROOT) for p in patterns
-                           for f in glob.glob(os.path.join(ROOT, p)))
+            # Pattern order: the channel's own recipe comes first and takes a missing grant.
+            files = [os.path.relpath(f, ROOT) for p in patterns
+                     for f in sorted(glob.glob(os.path.join(ROOT, p)))]
             if not files:
                 errors.append((patterns[0], f"{channel} has no recipe to read"))
             listed += files
