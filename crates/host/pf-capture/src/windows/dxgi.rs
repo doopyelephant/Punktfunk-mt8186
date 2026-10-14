@@ -63,12 +63,11 @@ unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
 ///
 /// # Invariant
 ///
-/// The patch rewrites 12 live bytes of `win32u.dll`. Nothing here checks either half:
-/// - No other thread is inside the export while its bytes change. Only DXGI calls it, so this
-///   must run before any thread creates a DXGI factory. The call order in the host's
-///   `startup` is the only enforcement.
-/// - The export's first 12 bytes are whole instructions and none is a branch target. A CFG or
-///   hot-patch stub there leaves a torn instruction stream.
+/// The patch rewrites 12 live bytes of `win32u.dll`, and only over the syscall stub
+/// ([`is_syscall_stub`]): any other head is refused and the export left as found. Nothing
+/// here checks the other half. No other thread is inside the export while its bytes change:
+/// only DXGI calls it, so this must run before any thread creates a DXGI factory. The call
+/// order in the host's `startup` is the only enforcement.
 pub fn install_gpu_pref_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| {
@@ -113,9 +112,11 @@ fn set_dpi_awareness() {
 }
 
 /// Overwrite the head of `win32u!NtGdiDdDDIGetCachedHybridQueryValue` with a jump to
-/// [`hybrid_query_hook`], and say in the log whether the bytes landed.
+/// [`hybrid_query_hook`], and say in the log whether the bytes landed. A head that is not the
+/// syscall stub is not written to.
 #[cfg(target_arch = "x86_64")]
 fn patch_hybrid_query() {
+    use crate::win32u_stub::{is_syscall_stub, jump_to, PATCH_LEN};
     use windows::core::s;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
     use windows::Win32::System::Memory::{
@@ -138,23 +139,15 @@ fn patch_hybrid_query() {
         );
         return;
     };
-    let target = target as usize as *mut u8;
-    // x64 absolute jump: `mov rax, imm64; jmp rax` (12 bytes). No trampoline —
-    // we never call the original, so no relocation / length-disassembler.
-    let hook = hybrid_query_hook as *const () as usize;
-    let mut patch = [0u8; 12];
-    patch[0] = 0x48;
-    patch[1] = 0xB8; // mov rax, imm64
-    patch[2..10].copy_from_slice(&hook.to_le_bytes());
-    patch[10] = 0xFF;
-    patch[11] = 0xE0; // jmp rax
+    let stub = target as usize as *mut [u8; PATCH_LEN];
+    let patch = jump_to(hybrid_query_hook as *const () as usize);
     let mut old = PAGE_PROTECTION_FLAGS(0);
     // SAFETY: `old` is a live out-param. The call changes page protection only, and fails on
     // a range that is not committed memory of this process instead of touching it.
     let writable = unsafe {
         VirtualProtect(
-            target as *const c_void,
-            12,
+            stub as *const c_void,
+            PATCH_LEN,
             PAGE_EXECUTE_READWRITE,
             &mut old,
         )
@@ -163,23 +156,38 @@ fn patch_hybrid_query() {
         tracing::warn!("GPU-pref hook: VirtualProtect failed — skipping");
         return;
     }
-    // SAFETY: `VirtualProtect` just made these 12 bytes of the mapped image writable, so they
-    // are committed and in bounds. `patch` is a 12-byte local, which cannot overlap an image.
-    // No thread executes these bytes: only DXGI calls the export, and this runs before any
-    // DXGI factory exists (the invariant on `install_gpu_pref_hook`).
-    unsafe { std::ptr::copy_nonoverlapping(patch.as_ptr(), target, 12) };
+    // SAFETY: `VirtualProtect` took these 12 bytes, so they are committed, and readable and
+    // writable until the call below hands their protection back. Both reads run before it.
+    // A byte array has no alignment and no invalid value.
+    let read = || unsafe { stub.read() };
+    let found = read();
+    // A head that is not the stub is left alone: its instructions may end mid-patch, or
+    // another module's jump may live there.
+    let readback = is_syscall_stub(&found).then(|| {
+        // SAFETY: writable as above. `found` is the syscall stub: it is entered at its first
+        // byte only and its one branch lands past these 12, so every entry runs the whole
+        // jump. No thread executes them now: only DXGI calls the export, and this runs before
+        // any DXGI factory exists (the invariant on `install_gpu_pref_hook`).
+        unsafe { stub.write(patch) };
+        // A write the OS rejected silently reads back as the stub.
+        read()
+    });
     let mut restore = PAGE_PROTECTION_FLAGS(0);
     // SAFETY: the same 12 bytes, back to the protection they had; `restore` is a live out-param.
-    let _ = unsafe { VirtualProtect(target as *const c_void, 12, old, &mut restore) };
+    let _ = unsafe { VirtualProtect(stub as *const c_void, PATCH_LEN, old, &mut restore) };
+    let Some(readback) = readback else {
+        tracing::warn!(
+            found = %format!("{found:02x?}"),
+            "GPU-pref hook: the export does not start with the win32u syscall stub — skipping \
+             (on a hybrid-GPU box DXGI may reparent the virtual display off the pinned render \
+             adapter → TEX_FAIL rebinds)"
+        );
+        return;
+    };
     // Patch is on the main thread; DXGI calls the export from the encode worker,
     // possibly another core with a stale i-cache that would still run the original.
     // SAFETY: this process's pseudo-handle, and the 12 bytes just written, still mapped.
-    let _ = unsafe { FlushInstructionCache(GetCurrentProcess(), target as *const c_void, 12) };
-    // CFG / hotpatch / a short stub can reject the write silently. Read it back.
-    let mut readback = [0u8; 12];
-    // SAFETY: the same 12 mapped bytes, readable as image code under the protection restored
-    // above. `readback` is a 12-byte local, which cannot overlap an image.
-    unsafe { std::ptr::copy_nonoverlapping(target, readback.as_mut_ptr(), 12) };
+    let _ = unsafe { FlushInstructionCache(GetCurrentProcess(), stub as *const c_void, PATCH_LEN) };
     if readback == patch {
         tracing::info!(
             "GPU-pref hook installed + verified (win32u hybrid-query -> UNSPECIFIED): DXGI \

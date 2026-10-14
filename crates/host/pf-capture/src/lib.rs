@@ -647,6 +647,10 @@ pub mod dxgi;
 #[cfg(target_os = "windows")]
 #[path = "windows/idd_push.rs"]
 mod idd_push;
+// What the win32u GPU-preference patch writes, and the one head it may write over. Pure
+// byte tables, so the test runs on every target.
+#[path = "windows/win32u_stub.rs"]
+mod win32u_stub;
 // The AU section's reader half. Pure over a mapped view, so its tests run on every target.
 #[path = "windows/au_reader.rs"]
 mod au_reader;
