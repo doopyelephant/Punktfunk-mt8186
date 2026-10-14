@@ -39,7 +39,6 @@ let
     types
     optional
     optionals
-    optionalString
     literalExpression
     concatStringsSep
     mapAttrsToList
@@ -572,23 +571,18 @@ in
       # pre-0.29 best-effort no-op behaviour, a pacing cost only).
       security.rtkit.enable = mkDefault true;
 
+      # The unit is the package's own (scripts/punktfunk-host.service); this is its NixOS drop-in.
+      systemd.packages = [ cfg.host.package ];
       systemd.user.services.punktfunk-host = {
-        description = "punktfunk GameStream + punktfunk/1 streaming host";
-        documentation = [ "https://git.unom.io/unom/punktfunk" ];
         # Keep root (and every other system user) from starting a second host that steals the
         # fixed ports from the desktop user's — see `userScope`.
         unitConfig.ConditionUser = userScope;
-        # Stands down while the box's owner row runs this user's host in its own headless session
-        # (the door). Mirrors scripts/punktfunk-host.service.
-        unitConfig.ConditionPathExists = mkIf cfg.seats.enable "!/run/punktfunk-seat-%u";
-        # Soft ordering: the host listens immediately and only touches the compositor per session.
-        after = [ "pipewire.service" ] ++ optional cfg.host.desktopSession "graphical-session.target";
-        wants = [ "pipewire.service" ];
         # `graphical-session.target` is IN ADDITION to `default.target`, never instead of it: the
         # host still comes up at login before the graphical session is ready — it listens without
         # touching the compositor and only opens one per client connect, so an early start costs
         # nothing. `partOf` is the half that matters, taking the host down with the session so the
         # next one gets a fresh compositor connection (see `desktopSession`).
+        after = optional cfg.host.desktopSession "graphical-session.target";
         partOf = optional cfg.host.desktopSession "graphical-session.target";
         wantedBy =
           optional cfg.host.autoStart "default.target"
@@ -621,34 +615,34 @@ in
         # exists. `config.security.wrapperDir` rather than a hard-coded /run/wrappers/bin so an
         # operator who has moved it is still correct.
         #
-        # NixOS renders `Environment=` before `EnvironmentFile=`, so `settings`/`environmentFile`
-        # can still override this (or set it to `off` to force the in-process encoder) — the same
-        # "an operator's own override still wins" posture as PUNKTFUNK_GAMESCOPE_BIN above.
+        # An `EnvironmentFile=` value beats `Environment=`, so `settings`/`environmentFile` can
+        # still override this (`off` forces the in-process encoder).
         environment.PUNKTFUNK_ENCODE_WORKER = "${config.security.wrapperDir}/punktfunk-encode-worker";
         # Where our Vulkan WSI layer's manifest lives. The host defaults to the FHS path every
         # distro package uses, which no NixOS box has — here the layer travels inside the gamescope
         # derivation, so point at it. Without this a game nested under the compositor gets no HDR10
         # swapchain at all: that layer is the only route to one, and the host falls back to
         # disabling the system layer, which is HDR-less by construction.
-        #
-        # Same override posture as PUNKTFUNK_GAMESCOPE_BIN: `Environment=` renders before
-        # `EnvironmentFile=`, so an operator's `settings` still wins.
+        # An operator's `settings` still wins, as above.
         environment.PUNKTFUNK_GAMESCOPE_WSI_LAYER_DIR = mkIf cfg.host.gamescopeHdr
           "${cfg.host.gamescopePackage}/lib/punktfunk/vulkan/implicit_layer.d";
         serviceConfig = {
           # The store path DIRECTLY — not a capability wrapper. /proc/<pid>/exe then resolves to the
           # very path packages.nix substituted into io.unom.Punktfunk.Host.desktop's Exec=, which is
-          # what lets KWin identify the host and grant it the screencast/fake-input protocols (see
-          # the note above the firewall block).
-          ExecStart =
-            "${cfg.host.package}/bin/punktfunk-host serve" + optionalString cfg.host.gamestream " --gamestream";
-          Restart = "on-failure";
-          RestartSec = 2;
-          EnvironmentFile =
-            (optional (cfg.host.settings != { }) "${hostSettingsFile}")
-            ++ (optional (cfg.host.environmentFile != null) "-${toString cfg.host.environmentFile}")
-            # Last, so the owner row's ports and the box's identity win. Absent unless the door is on.
-            ++ (optional cfg.seats.enable "-/run/punktfunk/seats/%u.env");
+          # what lets KWin identify the host (see the note above the firewall block). The empty
+          # entry clears the packaged ExecStart.
+          ExecStart = mkIf cfg.host.gamestream [
+            ""
+            "${cfg.host.package}/bin/punktfunk-host serve --gamestream"
+          ];
+          # `settings` and `environmentFile` stand in for host.env, which NixOS does not read. The
+          # empty entry clears the packaged list; the seat env stays last, so the owner row wins.
+          EnvironmentFile = [
+            ""
+          ]
+          ++ (optional (cfg.host.settings != { }) "${hostSettingsFile}")
+          ++ (optional (cfg.host.environmentFile != null) "-${toString cfg.host.environmentFile}")
+          ++ [ "-/run/punktfunk/seats/%u.env" ];
         };
         # No PUNKTFUNK_GAMESCOPE_HDR here: the host defaults it on, and the capability probe on
         # the resolved binary keeps a build-less box SDR. `gamescopeHdr` only controls whether

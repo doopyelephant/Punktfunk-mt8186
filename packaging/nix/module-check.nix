@@ -135,6 +135,7 @@ let
       enable = true;
       openFirewall = true;
       gamescopeHdr = false;
+      settings.RUST_LOG = "info";
     };
     services.punktfunk.seats.enable = true;
   };
@@ -512,19 +513,27 @@ let
       } seats.networking.firewall.allowedUDPPortRanges;
     }
     {
-      # The owner's own host and console stand down while the door serves the box's ports.
-      name = "seats make the user host and console stand down for the door";
+      # The packaged list starts with host.env, which NixOS does not read. The owner row's env
+      # comes after `settings`, so its ports and the box's identity win.
+      name = "the host reads settings, never host.env, and the seat env last";
       ok =
-        has seats "punktfunk-host" "ConditionPathExists=!/run/punktfunk-seat-%u\n"
-        && has seats "punktfunk-host" "EnvironmentFile=-/run/punktfunk/seats/%u.env\n"
-        && has seats "punktfunk-web" "ConditionPathExists=!/run/punktfunk-web-door\n";
+        let
+          files = seats.systemd.user.services.punktfunk-host.serviceConfig.EnvironmentFile;
+        in
+        lib.head files == ""
+        && lib.length files == 3
+        && lib.hasInfix "punktfunk-host.env" (lib.elemAt files 1)
+        && lib.last files == "-/run/punktfunk/seats/%u.env";
+    }
+    {
+      # The owner's console stands down while the door serves the box's ports.
+      name = "seats make the user console stand down for the door";
+      ok = has seats "punktfunk-web" "ConditionPathExists=!/run/punktfunk-web-door\n";
     }
     {
       name = "a host without seats keeps its user units and ports as they were";
       ok =
-        !(has appliance "punktfunk-host" "/run/punktfunk-seat")
-        && !(has appliance "punktfunk-host" "/run/punktfunk/seats")
-        && !(has appliance "punktfunk-web" "punktfunk-web-door")
+        !(has appliance "punktfunk-web" "punktfunk-web-door")
         && appliance.networking.firewall.allowedUDPPortRanges == [ ]
         && !(desktop.systemd.services ? punktfunk-door)
         && !(desktop.users.groups ? punktfunk-update);

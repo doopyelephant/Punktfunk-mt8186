@@ -181,6 +181,12 @@ in
         # stays on async-io; ship it in the host's $out so the tray .desktop below resolves it.
         install -Dm0755 ${punktfunk-tray}/bin/punktfunk-tray "$out/bin/punktfunk-tray"
 
+        # The user unit every channel ships, run from the store path itself: KWin identifies the
+        # host by that path. The NixOS module adds its own settings as a drop-in.
+        install -Dm0644 scripts/punktfunk-host.service "$out/lib/systemd/user/punktfunk-host.service"
+        substituteInPlace "$out/lib/systemd/user/punktfunk-host.service" \
+          --replace-fail "%h/punktfunk/target/release/punktfunk-host" "$out/bin/punktfunk-host"
+
         # udev: /dev/uinput + /dev/uhid (virtual gamepads) + the vhci sysfs perms for the virtual Deck.
         install -Dm0644 scripts/60-punktfunk.rules "$out/lib/udev/rules.d/60-punktfunk.rules"
         # WirePlumber: hold a DualSense's sound card open + keep it off the graph clock.
