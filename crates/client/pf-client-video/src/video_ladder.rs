@@ -153,26 +153,24 @@ pub(crate) fn ladder(os: Os, choice: &str, wire: u8, vk: Option<&VulkanDecodeDev
     steps
 }
 
-/// The hardware rungs a failing `from` may demote onto, in order; the CPU rung
-/// follows. Read off the `auto` walk whatever the session's preference was. A rung
-/// in `ran` is never entered again, so the two native rungs cannot bounce the
-/// session; V4L2 is never a target; Vulkan is entered from the platform rung only.
+/// The hardware rungs a failing rung may demote onto, in order; the CPU rung
+/// follows. The platform rung, then Vulkan, each where the `auto` walk offers it
+/// whatever the session's preference was. `ran` holds the failing rung and every
+/// one before it; none is entered again, so the two cannot bounce the session.
+/// V4L2 is never a target.
 pub(crate) fn demotions(
     os: Os,
     wire: u8,
     vk: Option<&VulkanDecodeDevice>,
-    from: NativeRung,
     ran: &[NativeRung],
 ) -> Vec<NativeRung> {
-    ladder(os, "auto", wire, vk)
+    let offered: Vec<NativeRung> = ladder(os, "auto", wire, vk)
         .into_iter()
         .filter_map(Step::rung)
-        .filter(|rung| !ran.contains(rung))
-        .filter(|rung| match rung {
-            NativeRung::V4l2 => false,
-            NativeRung::Vulkan => from == os.platform_rung(),
-            _ => true,
-        })
+        .collect();
+    [os.platform_rung(), NativeRung::Vulkan]
+        .into_iter()
+        .filter(|rung| offered.contains(rung) && !ran.contains(rung))
         .collect()
 }
 
@@ -198,12 +196,11 @@ pub(crate) mod tests {
     /// Video advertises (`all`, `h26x` without AV1, `none`); whether the presenter
     /// imports the platform rung's pictures (dma-buf, D3D11 texture); wire codec;
     /// stored preference (`empty` is `""`). Then the rungs tried in order, and for
-    /// each hardware rung the session can land on, the rungs it demotes through.
-    /// Every demotion has one hardware target at most: if that does not build, the
-    /// CPU rung is next.
+    /// each hardware rung the session can land on, the rungs it demotes through. A
+    /// target that does not build passes the session to the next rung of its chain.
     const ORDER: &str = "
         os      gpu    vulkan import codec pref           | tries                            | a failing rung demotes through
-        linux   nvidia all    yes    h264  auto           | vulkan v4l2 software             | vulkan>software v4l2>software
+        linux   nvidia all    yes    h264  auto           | vulkan v4l2 software             | vulkan>software v4l2>vulkan>software
         linux   amd    all    yes    h264  auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
         linux   amd    all    yes    hevc  auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
         linux   amd    h26x   yes    av1   auto           | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
@@ -220,7 +217,7 @@ pub(crate) mod tests {
         linux   amd    all    yes    h264  software       | software                         | -
         linux   amd    all    yes    h264  native-vulkan  | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
         linux   intel  all    yes    av1   native-vulkan  | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
-        linux   nvidia all    yes    h264  native-vaapi   | vaapi vulkan v4l2 software       | vaapi>vulkan>software vulkan>software v4l2>software
+        linux   nvidia all    yes    h264  native-vaapi   | vaapi vulkan v4l2 software       | vaapi>vulkan>software vulkan>software v4l2>vulkan>software
         linux   amd    all    yes    h264  native-vaapi   | vaapi vulkan v4l2 software       | vaapi>vulkan>software vulkan>vaapi>software v4l2>vaapi>vulkan>software
         linux   intel  all    yes    av1   native-vaapi   | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
         linux   amd    all    yes    h264  native-v4l2    | v4l2 vulkan vaapi software       | v4l2>vaapi>vulkan>software vulkan>vaapi>software vaapi>vulkan>software
@@ -469,9 +466,8 @@ pub(crate) mod tests {
             let mut chains = Vec::new();
             for step in 0..tried.len() {
                 let chain = demotes(row, step, false);
-                // A target that does not build leaves only the CPU rung.
-                let refused = demotes(row, step, true);
-                assert_eq!(refused[..], chain[..chain.len().min(2)], "{}", row.label());
+                // A target that does not build passes the session to the next one.
+                assert_eq!(demotes(row, step, true), chain, "{}", row.label());
                 chains.push(cell(&chain, ">"));
             }
             assert_eq!(chains_cell(&chains), row.demotes, "{}", row.label());
@@ -492,13 +488,12 @@ pub(crate) mod tests {
             for rung in &tried {
                 // The rungs run so far are the chain itself.
                 let mut chain = vec![*rung];
-                loop {
-                    let from = *chain.last().expect("the landed rung");
-                    let targets = demotions(os, wire, vk.as_ref(), from, &chain);
-                    assert!(targets.len() <= 1, "{}: {targets:?}", row.label());
-                    let Some(next) = targets.first() else { break };
-                    chain.push(*next);
+                while let Some(&next) = demotions(os, wire, vk.as_ref(), &chain).first() {
+                    chain.push(next);
                 }
+                // A target that does not build passes the session to the next one.
+                let refused = demotions(os, wire, vk.as_ref(), &[*rung]);
+                assert_eq!(refused, chain[1..], "{}", row.label());
                 chains.push(cell(&chain, ">"));
             }
             assert_eq!(chains_cell(&chains), row.demotes, "{}", row.label());

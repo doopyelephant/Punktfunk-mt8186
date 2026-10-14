@@ -1064,7 +1064,7 @@ impl Decoder {
                     // A never-delivered hardware rung is a decoder the session never
                     // had; it must not cost the rung below.
                     let (vk, ran) = (self.vk.as_ref(), &self.ran);
-                    for rung in demotions(Os::HOST, self.wire_codec, vk, from, ran) {
+                    for rung in demotions(Os::HOST, self.wire_codec, vk, ran) {
                         if self.demote_into(&e, which, rung) {
                             return Ok(None);
                         }
