@@ -356,11 +356,10 @@ pub trait VirtualDisplay: Send {
     /// origin `(0, 0)`. Default no-op (only KWin positions). Best-effort: failure keeps compositor
     /// default. See `design/display-management.md`.
     fn apply_position(&mut self, _x: i32, _y: i32) {}
-    /// Topology restore this [`create`](Self::create) prepared (re-enable heads an `exclusive` /
-    /// `primary` change disabled). Registry lifts it into the group so it runs once, when the
-    /// last display in the group tears down — a sibling exclusive session must not have physicals
-    /// re-enabled under it. Called after `create`; the backend must not also run it. Default `None`
-    /// (Mutter `APPLY_TEMPORARY` auto-reverts). See `design/display-management.md`.
+    /// Topology restore this [`create`](Self::create) prepared, for the one backend that does not
+    /// journal it (gamescope's darken hold). Registry lifts it into the group so it runs once,
+    /// when the last display in the group tears down. Called after `create`; the backend must not
+    /// also run it. Default `None`.
     fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         None
     }
@@ -430,28 +429,6 @@ pub trait VirtualDisplay: Send {
     }
 }
 
-/// Keep the first topology restore this backend instance captured; later `None` (or a subset) must
-/// not overwrite it.
-///
-/// One instance serves every attempt of the host pipeline retry loop, so `create` runs against this
-/// slot repeatedly. Attempt 1 disables heads and prepares the restore; attempts 2..n correctly
-/// find nothing left and prepare `None`. Overwriting would drop attempt 1's closure, and Drop
-/// would have nothing to re-enable.
-///
-/// First-wins is also the right *set*: attempt 1 saw every lit head; later attempts see a subset.
-///
-/// Registry-drained backends (KWin, pooled — [`VirtualDisplay::take_topology_restore`] empties the
-/// slot) arrive with `None` held and are unaffected. Pass-through backends (Hyprland, wlroots;
-/// portal fd, never taken) need this.
-pub(crate) fn stash_topology_restore(
-    slot: &mut Option<Box<dyn FnOnce() + Send>>,
-    prepared: Option<Box<dyn FnOnce() + Send>>,
-) {
-    if slot.is_none() {
-        *slot = prepared;
-    }
-}
-
 /// Whether [`crate::policy::Topology`] for `client_fp` darkens the desk here. `primary` logs
 /// and answers `false`: Wayland has no primary output, only a focused one, and the streamed
 /// head already holds focus.
@@ -468,104 +445,5 @@ pub(crate) fn exclusive_wanted(tag: &str, client_fp: Option<[u8; 32]>) -> bool {
             false
         }
         Topology::Exclusive => true,
-    }
-}
-
-/// Apply [`crate::policy::Topology`] where the only desk change is disabling heads and the
-/// restore is still a closure (Hyprland). `disable(ours)` returns the heads it turned off; a
-/// restore of exactly those lands in `slot` through [`stash_topology_restore`]. The last step of
-/// `create`: nothing fails after it, so no path disables heads and then unwinds past the
-/// hand-off. wlroots journals instead ([`crate::topology_journal`]).
-pub(crate) fn apply_exclusive(
-    tag: &str,
-    client_fp: Option<[u8; 32]>,
-    ours: &str,
-    slot: &mut Option<Box<dyn FnOnce() + Send>>,
-    disable: fn(&str) -> Vec<String>,
-    restore: fn(&[String]),
-) {
-    if !exclusive_wanted(tag, client_fp) {
-        return;
-    }
-    let disabled = disable(ours);
-    let prepared = (!disabled.is_empty())
-        .then(|| Box::new(move || restore(&disabled)) as Box<dyn FnOnce() + Send>);
-    stash_topology_restore(slot, prepared);
-}
-
-#[cfg(test)]
-mod topology_restore_tests {
-    use super::stash_topology_restore;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
-    fn counting(hits: &Arc<AtomicUsize>) -> Option<Box<dyn FnOnce() + Send>> {
-        let hits = Arc::clone(hits);
-        Some(Box::new(move || {
-            hits.fetch_add(1, Ordering::SeqCst);
-        }))
-    }
-
-    /// Retry loop: eight `create`s on one instance; only the first prepared a restore; Drop is
-    /// the only runner. The slot must still hold it.
-    #[test]
-    fn eight_failed_attempts_do_not_strand_the_restore() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let mut slot: Option<Box<dyn FnOnce() + Send>> = None;
-
-        // Attempt 1: heads were on; restore prepared.
-        stash_topology_restore(&mut slot, counting(&hits));
-        // Attempts 2..8 prepare `None` (nothing left to disable). Must not drop attempt 1.
-        for _ in 0..7 {
-            stash_topology_restore(&mut slot, None);
-        }
-
-        let restore = slot.expect("the retry loop stranded the restore — the desk stays dark");
-        restore();
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            1,
-            "the restore must run exactly once, on the failure unwind"
-        );
-    }
-
-    /// A later prepared restore never displaces the first (attempt 1 saw the full lit set).
-    #[test]
-    fn a_later_restore_never_displaces_the_first() {
-        let first = Arc::new(AtomicUsize::new(0));
-        let second = Arc::new(AtomicUsize::new(0));
-        let mut slot: Option<Box<dyn FnOnce() + Send>> = None;
-
-        stash_topology_restore(&mut slot, counting(&first));
-        stash_topology_restore(&mut slot, counting(&second));
-
-        slot.expect("a restore should be held")();
-        assert_eq!(first.load(Ordering::SeqCst), 1, "the first must be kept");
-        assert_eq!(
-            second.load(Ordering::SeqCst),
-            0,
-            "the second must be dropped"
-        );
-    }
-
-    /// A drained slot (KWin / registry take) still accepts a later restore.
-    #[test]
-    fn an_empty_slot_still_accepts_a_restore() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let mut slot: Option<Box<dyn FnOnce() + Send>> = None;
-
-        stash_topology_restore(&mut slot, counting(&hits));
-        let _drained = slot.take(); // registry lifted it into the group
-        assert!(slot.is_none());
-        stash_topology_restore(&mut slot, counting(&hits));
-        assert!(slot.is_some(), "a drained slot must be refillable");
-    }
-
-    /// Empty + `None` stays empty: an extend session must not grow a restore.
-    #[test]
-    fn nothing_prepared_leaves_the_slot_empty() {
-        let mut slot: Option<Box<dyn FnOnce() + Send>> = None;
-        stash_topology_restore(&mut slot, None);
-        assert!(slot.is_none());
     }
 }
