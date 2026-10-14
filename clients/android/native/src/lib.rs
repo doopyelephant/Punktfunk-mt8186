@@ -26,6 +26,9 @@ use jni::EnvUnowned;
 
 #[cfg(target_os = "android")]
 mod adpf;
+// The ASC presenter's apply margin, `test`-gated like `input_stall` so its replay runs off-device.
+#[cfg(any(target_os = "android", test))]
+mod apply_margin;
 #[cfg(target_os = "android")]
 mod audio;
 // `decode`'s AU intake rules, `test`-gated like `input_stall` so their table runs off-device.
