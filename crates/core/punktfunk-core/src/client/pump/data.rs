@@ -4,13 +4,13 @@
 //! Dedicated user-interactive thread. Newest-frame drop on embedder lag.
 //! [`FLAG_PROBE`] filler never enters the decoder. The ABR window is
 //! assembled by [`crate::abr::Driver`]: [`abr_feed`] feeds it events and
-//! sends what it asks for.
+//! sends what it asks for. [`recovery_asks`] asks for what a short frame lost.
 
 use super::super::*;
 use super::*;
-use crate::quic::v2::dgram::NACK_SHORT;
 
 mod abr_feed;
+mod recovery_asks;
 
 /// Data-plane pump on a blocking thread. `try_send` drops the newest frame
 /// when the embedder lags. [`FLAG_PROBE`] filler goes to the probe accumulator,
@@ -226,75 +226,6 @@ impl DataPump {
         }
         // Wake a consumer blocked in `next_frame` with Closed, not a timeout.
         self.shared.frames.close();
-    }
-
-    /// Ask for recovery the moment a frame's last shard lands short of what its parity can
-    /// rebuild, a frame interval before the next frame shows the gap, so the host's next
-    /// encode is the anchor. A frame at most [`NACK_SHORT`] shards past its parity, on a
-    /// round trip inside a frame interval, asks for its missing shards instead, and the
-    /// frames after it wait for them. One that completed meanwhile asks nothing. The decode
-    /// side's gap still arms the freeze. An all-intra frame references nothing, so it asks
-    /// only for its shards: the next frame is its recovery. A stream nobody decodes yet
-    /// starts on an IDR and asks nothing.
-    fn ask_for_short_tails(&mut self) {
-        let tails: Vec<u32> = self.session.take_short_tails().collect();
-        if tails.is_empty() || !self.shared.frames.consumer_seen() {
-            return;
-        }
-        let all_intra = self.negotiated_codec == crate::quic::CODEC_PYROWAVE;
-        let now = Instant::now();
-        for idx in tails {
-            if !self.session.frame_in_flight(idx) {
-                continue;
-            }
-            if let Some((missing, recovery)) = self.session.missing_beyond_parity(idx) {
-                self.shared
-                    .short_frames
-                    .lock()
-                    .unwrap()
-                    .note(idx, missing, recovery);
-                if missing <= NACK_SHORT && self.ask_nack(idx, now) {
-                    continue;
-                }
-            }
-            if self.on_anchors || all_intra {
-                continue;
-            }
-            self.recovery(super::super::RecoveryEvent::TailShort { index: idx }, now);
-        }
-    }
-
-    /// Fold one of the pump's own events into the recovery driver and send what it asks.
-    fn recovery(&self, ev: super::super::RecoveryEvent, now: Instant) {
-        let ask = self.shared.recovery.lock().unwrap().step(ev, now).ask;
-        super::super::send_recovery(&self.shared, ask);
-    }
-
-    /// Ask for frame `idx`'s missing shards when the round trip fits a frame interval, and
-    /// hold the frames after it `rtt + frame interval`: the resend waits out the frame the
-    /// host is pacing, then the round trip. Past two intervals an RFI costs less. `false`
-    /// when it asked nothing.
-    fn ask_nack(&mut self, idx: u32, now: Instant) -> bool {
-        use crate::quic::v2::dgram::{Nack, NACK_MAX};
-        let rtt = Duration::from_micros(u64::from(self.shared.rtt_us.load(Ordering::Relaxed)));
-        let period = Duration::from_micros(1_000_000 / u64::from(self.refresh_hz.max(1)));
-        if !self.nack || rtt.is_zero() || rtt > period {
-            return false;
-        }
-        let Some(nack) = self
-            .session
-            .missing_shards(idx, NACK_MAX)
-            .and_then(|s| Nack::new(idx, &s))
-        else {
-            return false;
-        };
-        if !self.shared.frames.hold(idx, now + rtt + period) {
-            return false;
-        }
-        tracing::debug!(frame = idx, rtt_us = rtt.as_micros() as u64, "nack asked");
-        self.shared.ask_nack(nack);
-        self.session.note_nack(false);
-        true
     }
 
     /// One polled frame. Probe filler is skipped, a frame with no decoder
