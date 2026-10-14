@@ -56,6 +56,14 @@ fn shelf_strip() -> Id {
 fn shelf_cover(i: usize) -> Id {
     Id::new("library-cover", i)
 }
+/// The first node of line `i` in the scroll; one past the last line is the foot's pad.
+fn line_id(i: usize) -> Id {
+    Id::new("library-line", i)
+}
+/// The grid's rows from `row` on, as one virtual list.
+fn rows_id(row: usize) -> Id {
+    Id::new("library-rows", row)
+}
 /// Air between grid rows: a card's text and the plate's outset.
 const ROW_GAP: f64 = 22.0;
 /// A heading over the grid: its line and the air to row 0.
@@ -902,7 +910,7 @@ impl LibraryScreen {
         // The lines run on to the screen's foot and blur under the band there.
         let clip = canvas.local_clip_bounds().unwrap_or(rect);
         let foot = clip.bottom.max(rect.bottom);
-        let g = self.field_geom(ui, rect, foot, k, &lines, &bands);
+        let g = self.field_geom(ui, rect, foot, k);
         let FieldGeom {
             shape,
             cw,
@@ -916,28 +924,18 @@ impl LibraryScreen {
             shelf: geo,
             avail,
             view_h,
+            pad,
             ..
         } = g;
-        let (item_top, item_h) = g.item_span(self.zone, self.cursor, &lines, &bands);
-        // Scroll only as far as it takes to show the item and a breath round it, above the
-        // band; a line taller than the view shows its top. Never centred: on a phone that
-        // walked the first row up over the host's verbs.
-        let breath = REVEAL_AIR * k;
-        let grid = Id::new(GRID, 0);
-        let mut want = f64::from(self.grid.borrow().offset(grid));
-        if item_top + item_h + breath > want + g.usable {
-            want = item_top + item_h + breath - g.usable;
-        }
-        if item_top - breath < want {
-            want = item_top - breath;
-        }
-        let want = want.clamp(0.0, (g.content_h - view_h).max(0.0));
         let snap = std::mem::take(&mut self.snap_scroll);
         self.follow |= snap;
+        let land = snap || ui.reduce_motion;
         let applied = self.applied();
-        self.bar
-            .step(fonts, k, avail, true, applied, dt, snap || ui.reduce_motion);
-        self.follow_scroll(want, snap || ui.reduce_motion, dt);
+        self.bar.step(fonts, k, avail, true, applied, dt, land);
+        // Where the scroll stood before this frame's glide: the reveal starts from there.
+        let grid = Id::new(GRID, 0);
+        let stood = f64::from(self.grid.borrow().offset(grid));
+        self.grid.get_mut().tick(dt as f32);
 
         // The recoil moves the drawing on its axis, never the cells a pointer hits.
         let bump = self.bump.pos * k;
@@ -1034,67 +1032,73 @@ impl LibraryScreen {
                 },
             )
             .width(grid_w as f32)
+            .id(rows_id(from))
         };
         let top = |label| heading(label, heading_h * 0.56).size(grid_w as f32, heading_h as f32);
-        let mut root = El::scroll(grid, Axis::Vertical).style(|s| {
-            s.align_items = Some(taffy::AlignItems::START);
-            s.padding.left = taffy::LengthPercentage::length((ui.edge(k) + air) as f32);
-            s.padding.top = taffy::LengthPercentage::length(pad_top);
-        });
-        for &line in &lines {
-            root = match line {
-                Line::Bar => root
-                    .child(
-                        this.bar
-                            .el(ui, fonts, k, avail, true, applied, focus_pill, &pill_seen),
-                    )
-                    .child(El::column().size(avail as f32, (BAR_AIR * k) as f32)),
-                Line::Chips => {
-                    root.child(this.chips_el(ui, ctx.hosts, ctx.profiles, fonts, avail, k, hits))
-                }
-                Line::Band(b) => {
-                    root.child(this.band_el(ui, &bands[b], b, fonts, avail, (cw, ch), k, hits))
-                }
-                Line::Grid => match (geo, &shelf_cards) {
-                    (Some(g), Some(cards)) => {
-                        root.child(this.shelf_el(ui, g, cards, fonts, avail, k))
-                    }
-                    _ => {
-                        let air = El::column().size(grid_w as f32, gap_y as f32);
-                        match split_row {
-                            Some(split) => root
-                                .child(top("Launchers"))
-                                .child(rows(0, split))
-                                .child(
-                                    heading("Games", gap_y + heading_h * 0.56)
-                                        .size(grid_w as f32, (gap_y + heading_h) as f32),
-                                )
-                                .child(rows(split, shape.rows())),
-                            // Among the tab's rows, the grid is named like the rest.
-                            None if sectioned => {
-                                root.child(top("Games")).child(rows(0, shape.rows()))
-                            }
-                            None => root
-                                .child(El::column().size(grid_w as f32, heading_h as f32))
-                                .child(rows(0, shape.rows())),
-                        }
-                        .child(air)
-                    }
-                },
-                Line::State => root.child(this.state_el(
-                    ui,
-                    fonts,
-                    avail,
-                    g.block_h(Line::State, &bands),
-                    k,
-                    t,
-                    hits,
-                )),
-            };
-        }
-        root = root.child(El::column().size(avail as f32, g.pad as f32));
+        // The field's line: the shelf, or the grid's rows under their headings.
+        let field = |id| match (geo, &shelf_cards) {
+            (Some(g), Some(cards)) => vec![this.shelf_el(ui, g, cards, fonts, avail, k).id(id)],
+            _ => {
+                let mut els = match split_row {
+                    Some(split) => vec![
+                        top("Launchers").id(id),
+                        rows(0, split),
+                        heading("Games", gap_y + heading_h * 0.56)
+                            .size(grid_w as f32, (gap_y + heading_h) as f32),
+                        rows(split, shape.rows()),
+                    ],
+                    // Among the tab's rows, the grid is named like the rest.
+                    None if sectioned => vec![top("Games").id(id), rows(0, shape.rows())],
+                    None => vec![
+                        El::column().size(grid_w as f32, heading_h as f32).id(id),
+                        rows(0, shape.rows()),
+                    ],
+                };
+                els.push(El::column().size(grid_w as f32, gap_y as f32));
+                els
+            }
+        };
+        // Each line's first node carries its id: the reveal reads the lines off the layout.
+        let build = || {
+            let mut root = El::scroll(grid, Axis::Vertical).style(|s| {
+                s.align_items = Some(taffy::AlignItems::START);
+                s.padding.left = taffy::LengthPercentage::length((ui.edge(k) + air) as f32);
+                s.padding.top = taffy::LengthPercentage::length(pad_top);
+            });
+            for (i, &line) in lines.iter().enumerate() {
+                let id = line_id(i);
+                root = match line {
+                    Line::Bar => root
+                        .child(
+                            (this.bar)
+                                .el(ui, fonts, k, avail, true, applied, focus_pill, &pill_seen)
+                                .id(id),
+                        )
+                        .child(El::column().size(avail as f32, (BAR_AIR * k) as f32)),
+                    Line::Chips => root.child(
+                        this.chips_el(ui, ctx.hosts, ctx.profiles, fonts, avail, k, hits)
+                            .id(id),
+                    ),
+                    Line::Band(b) => root.child(
+                        this.band_el(ui, &bands[b], b, fonts, avail, (cw, ch), k, hits)
+                            .id(id),
+                    ),
+                    Line::Grid => root.children(field(id)),
+                    Line::State => root.child(
+                        this.state_el(ui, fonts, avail, g.state_h, k, t, hits)
+                            .id(id),
+                    ),
+                };
+            }
+            let foot = El::column().size(avail as f32, pad as f32);
+            root.child(foot.id(line_id(lines.len())))
+        };
         let mut tree = this.grid.borrow_mut();
-        let frame = tree.layout(root, viewport);
+        let mut frame = tree.layout(build(), viewport);
+        // A landing moved the scroll this frame: lay out again for the rows now in view.
+        if this.follow_reveal(&mut tree, &frame, &lines, &g, stood, land) {
+            frame = tree.layout(build(), viewport);
+        }
         // The chips line and each band keep their focused item in view, centred; the
         // screen's scroll keeps the line.
         let sideways = match this.zone {
@@ -1107,7 +1111,7 @@ impl LibraryScreen {
         if let Some((line, item)) = sideways {
             if let (Some(r), Some((view, max))) = (frame.rect(item), frame.scroll(line)) {
                 let want = (r.center_x() - view.center_x()).clamp(0.0, max);
-                tree.follow(line, want, snap || ui.reduce_motion);
+                tree.follow(line, want, land);
             }
         }
         let field = match geo {
@@ -1133,17 +1137,10 @@ impl LibraryScreen {
         self.record_frame(painted.take(), shelf_cards.as_deref(), hits.take(), &bands);
     }
 
-    /// This frame's field metrics in `rect`, the lines running on to `foot`. Navigation
-    /// reads last-drawn columns, so a resize re-seats the cursor's column.
-    fn field_geom(
-        &mut self,
-        ui: &Frame,
-        rect: Rect,
-        foot: f32,
-        k: f64,
-        lines: &[Line],
-        bands: &[Band],
-    ) -> FieldGeom {
+    /// This frame's field metrics in `rect`, the lines running on to `foot`: the sizes the
+    /// tree is built from. Navigation reads last-drawn columns, so a resize re-seats the
+    /// cursor's column.
+    fn field_geom(&mut self, ui: &Frame, rect: Rect, foot: f32, k: f64) -> FieldGeom {
         let shelf = self.view_mode == LibraryView::Shelf && !self.embedded;
         let avail = f64::from(rect.width()) - 2.0 * ui.edge(k);
         let tray = if self.band_shown() {
@@ -1169,8 +1166,7 @@ impl LibraryScreen {
         } else {
             GRID_HEADING
         } * k;
-        let mut g = FieldGeom {
-            k,
+        FieldGeom {
             shape,
             cw,
             ch,
@@ -1181,23 +1177,77 @@ impl LibraryScreen {
             heading_h,
             split_row: (shape.split > 0).then(|| shape.split_row()),
             shelf: shelf.then(|| self.shelf_geo(usable, avail, k)),
-            sectioned: self.sectioned(),
             avail,
             usable,
             view_h: f64::from(foot - rect.top),
-            tops: Vec::with_capacity(lines.len()),
-            content_h: 0.0,
-            pad: 0.0,
-        };
-        for &l in lines {
-            g.tops.push(g.content_h);
-            let h = g.block_h(l, bands);
-            g.content_h += h;
+            // Matching bottom inset: the last row clears the band.
+            pad: heading_h + (f64::from(foot) - band_top),
+            state_h: if self.sectioned() {
+                STATE_H * k
+            } else {
+                usable
+            },
+            breath: REVEAL_AIR * k,
         }
-        // Matching bottom inset: the last row clears the band.
-        g.pad = heading_h + (f64::from(foot) - band_top);
-        g.content_h += g.pad;
-        g
+    }
+
+    /// While the list follows focus, take the field's scroll from where it `stood` to the
+    /// reveal of the focused item as `frame` laid it out. The tree glides there and parks
+    /// under a finger ([`Tree::follow`]); a pan lets go until a move asks again. True when
+    /// the scroll landed elsewhere this frame.
+    #[allow(clippy::too_many_arguments)]
+    fn follow_reveal(
+        &self,
+        tree: &mut Tree,
+        frame: &crate::el::Frame<'_>,
+        lines: &[Line],
+        g: &FieldGeom,
+        stood: f64,
+        land: bool,
+    ) -> bool {
+        if !self.follow {
+            return false;
+        }
+        let grid = Id::new(GRID, 0);
+        let laid = tree.offset(grid);
+        let (top, h) = self.focus_span(frame, lines, g);
+        let max = frame.scroll(grid).map_or(0.0, |s| f64::from(s.1));
+        let want = reveal(stood, top, h, g.usable, g.breath).clamp(0.0, max);
+        tree.follow(grid, want as f32, land);
+        tree.offset(grid) != laid
+    }
+
+    /// The focused item's `(top, height)` in the scroll's content, as `frame` laid it out:
+    /// a grid row (its heading too on row 0), else its whole line, up to the next line's
+    /// first node. A row not built yet sits where its virtual list puts it. An item on no
+    /// line is at the top.
+    fn focus_span(
+        &self,
+        frame: &crate::el::Frame<'_>,
+        lines: &[Line],
+        g: &FieldGeom,
+    ) -> (f64, f64) {
+        let top = |id| frame.rect(id).map(|r| f64::from(r.top));
+        let Some(i) = lines.iter().position(|&l| l == games::line_of(self.zone)) else {
+            return (0.0, 0.0);
+        };
+        let (Some(origin), Some(line), Some(next)) =
+            (top(line_id(0)), top(line_id(i)), top(line_id(i + 1)))
+        else {
+            return (0.0, 0.0);
+        };
+        if self.zone == Zone::Grid && g.shelf.is_none() {
+            let (row, _) = g.shape.cell_of(self.cursor.max(0) as usize);
+            let from = g.split_row.filter(|s| row >= *s).unwrap_or(0);
+            if let Some(rows) = top(rows_id(from)) {
+                let row_top = rows + (row - from) as f64 * (g.card_h + g.gap_y);
+                return match row {
+                    0 => (line - origin, row_top + g.card_h - line),
+                    _ => (row_top - origin, g.card_h),
+                };
+            }
+        }
+        (line - origin, next - line)
     }
 
     /// The plate's rect and the focused item's, as last painted, for a test to compare.
@@ -1208,17 +1258,6 @@ impl LibraryScreen {
         let field = grid_cell(self.cursor.max(0) as usize);
         let item = tree.rect(games::zone_id(self.zone, field))?;
         Some((plate, item))
-    }
-
-    /// Follow focus to `want` while the list follows focus: a pan lets go until a move asks
-    /// again. The tree glides there and parks under a finger ([`Tree::follow`]).
-    fn follow_scroll(&mut self, want: f64, snap: bool, dt: f64) {
-        let grid = Id::new(GRID, 0);
-        let tree = self.grid.get_mut();
-        tree.tick(dt as f32);
-        if self.follow {
-            tree.follow(grid, want as f32, snap);
-        }
     }
 
     /// Hit rects are the cells as laid out; covers drawn this frame stay warm.
@@ -1849,10 +1888,10 @@ impl ScreenView for LibraryScreen {
     }
 }
 
-/// The field's metrics this frame, px: the grid's cells and rows, the shelf when it shows,
-/// and each line's top in the one scroll.
+/// The field's metrics this frame, px: the sizes its tree is built from. Where a line or a
+/// row lands is the layout's to say ([`LibraryScreen::focus_span`]).
+#[derive(Clone, Copy)]
 struct FieldGeom {
-    k: f64,
     shape: GridShape,
     /// A grid cell, and the card under it with its caption.
     cw: f64,
@@ -1865,65 +1904,31 @@ struct FieldGeom {
     /// The games section's first row when the launchers hold rows of their own.
     split_row: Option<usize>,
     shelf: Option<ShelfGeo>,
-    sectioned: bool,
     /// Width inside the edges, height above the band, height to the screen's foot.
     avail: f64,
     usable: f64,
     view_h: f64,
-    /// Each line's top in `lines` order; the scroll's height, bottom inset `pad` included.
-    tops: Vec<f64>,
-    content_h: f64,
+    /// The scroll's bottom inset.
     pad: f64,
+    /// The state card's block: its own height among the tab's rows, else the view.
+    state_h: f64,
+    /// The air a reveal keeps round the focused item.
+    breath: f64,
 }
 
-impl FieldGeom {
-    /// Grid row `row`'s top. The top inset is always on: it is also the air row 0 needs.
-    fn row_top(&self, row: usize) -> f64 {
-        let section_gap = match self.split_row {
-            Some(s) if row >= s => self.heading_h,
-            _ => 0.0,
-        };
-        row as f64 * (self.card_h + self.gap_y) + self.heading_h + section_gap
+/// Where a scroll standing at `stood` goes to show an item at `top`, `h` tall, with `breath`
+/// round it, in a view `usable` tall: only as far as it takes, and a line taller than the
+/// view shows its top. Never centred: on a phone that walked the first row up over the
+/// host's verbs.
+fn reveal(stood: f64, top: f64, h: f64, usable: f64, breath: f64) -> f64 {
+    let mut want = stood;
+    if top + h + breath > want + usable {
+        want = top + h + breath - usable;
     }
-
-    fn block_h(&self, line: Line, bands: &[Band]) -> f64 {
-        let k = self.k;
-        match line {
-            Line::Bar => (bar::BAR_H + BAR_AIR) * k,
-            Line::Chips => LibraryScreen::chips_h(k),
-            Line::Band(b) => LibraryScreen::band_h(&bands[b], self.ch, k),
-            Line::Grid => match self.shelf {
-                Some(g) => g.block,
-                None => {
-                    self.row_top(self.shape.rows().saturating_sub(1)) + self.card_h + self.gap_y
-                }
-            },
-            Line::State if self.sectioned => STATE_H * k,
-            Line::State => self.usable,
-        }
+    if top - breath < want {
+        want = top - breath;
     }
-
-    /// The focused item's `(top, height)`: a grid row (its heading too on row 0), or a
-    /// whole line.
-    fn item_span(&self, zone: Zone, cursor: i32, lines: &[Line], bands: &[Band]) -> (f64, f64) {
-        let top_of = |l: Line| {
-            lines
-                .iter()
-                .position(|&x| x == l)
-                .map_or(0.0, |i| self.tops[i])
-        };
-        let (focus_row, _) = self.shape.cell_of(cursor.max(0) as usize);
-        match (zone, self.shelf) {
-            (Zone::Grid, None) if focus_row > 0 => {
-                (top_of(Line::Grid) + self.row_top(focus_row), self.card_h)
-            }
-            (Zone::Grid, None) => (top_of(Line::Grid), self.row_top(0) + self.card_h),
-            (z, _) => {
-                let line = games::line_of(z);
-                (top_of(line), self.block_h(line, bands))
-            }
-        }
-    }
+    want
 }
 
 /// The shelf's metrics this frame, px: cover size, heading, and the whole block.

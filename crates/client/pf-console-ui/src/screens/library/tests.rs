@@ -894,6 +894,36 @@ fn a_long_grid_draws_only_the_rows_in_view() {
     assert!(drawn.len() < 40, "{drawn:?}");
 }
 
+/// Under Reduce Motion a jump lands at once, and the row it lands on is drawn in that frame:
+/// the reveal reads the layout, and a landing lays the field out again.
+#[test]
+fn a_landing_jump_draws_its_row_in_the_same_frame() {
+    let (mut s, library, mut settings) = long_grid();
+    let ui = crate::theme::Frame {
+        reduce_motion: true,
+        ..Default::default()
+    };
+    let fonts = crate::theme::build_fonts().unwrap();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
+    let rect = Rect::from_xywh(0.0, 0.0, 1280.0, 800.0);
+    let mut frame = |s: &mut LibraryScreen| {
+        let mut ctx = Ctx {
+            ui: &ui,
+            ..Ctx::test(&mut settings, &library)
+        };
+        s.render(surface.canvas(), rect, 1.0, 1.0 / 60.0, &fonts, &mut ctx);
+    };
+    for _ in 0..30 {
+        frame(&mut s);
+    }
+    assert!(s.geom[200].is_empty(), "the last row starts out of view");
+    s.cursor = 200;
+    s.seat_grid_col();
+    frame(&mut s);
+    assert!(!s.geom[200].is_empty(), "drawn in the frame it lands");
+    assert!(s.geom[0].is_empty(), "and the top is left behind");
+}
+
 /// A finger drags the grid one to one and a flick carries on; the pad's next move
 /// brings the focus row back into view.
 #[test]
