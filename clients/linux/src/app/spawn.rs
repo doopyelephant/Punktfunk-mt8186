@@ -13,20 +13,11 @@
 
 use crate::app::AppMsg;
 use crate::hosts::ConnectRequest;
-use pf_client_core::orchestrate::{self, ConnectPlan, HostTarget, SessionEvent};
+use pf_client_core::orchestrate::{self, ConnectOutcome, ConnectPlan, HostTarget, SessionEvent};
 
 /// Spawn tunables beyond a plain connect.
 #[derive(Debug, Default)]
 pub struct SpawnOpts {
-    /// Handshake budget override (`--connect-timeout`) — the request-access flow passes
-    /// ~185 s because the host PARKS the connection until the operator approves.
-    pub connect_timeout_secs: Option<u64>,
-    /// Persist the host as *paired* once the child reports ready (request-access: the
-    /// operator's approval IS the pairing). Plain TOFU persists unpaired.
-    pub persist_paired: bool,
-    /// A cancel handle to arm (request-access's waiting dialog): killing the child is
-    /// the only abort a parked connect has.
-    pub cancel: Option<CancelHandle>,
     /// The picker's verdict, which replaces the saved pick on the plan: `Some(None)` sends no
     /// profile, `None` leaves the saved pick in force.
     pub profile: Option<Option<String>>,
@@ -42,10 +33,7 @@ pub use orchestrate::{session_binary, CancelHandle};
 /// uses, so the two cannot disagree.
 ///
 /// Resolving is not optional: `orchestrate::spawn_session` writes `plan.settings` into the
-/// child's `--resolved-spec`, and a session running from a spec reads NO stores. This used to
-/// build the plan with `..Settings::default()`, on the theory that only the argv read it —
-/// which meant every stream since the arch-split ran at the DEFAULTS: the host's fallback
-/// bitrate (20 Mbps), the native resolution, `auto` codec, stereo, and no preset.
+/// child's `--resolved-spec`, and a session running from a spec reads NO stores.
 fn plan_for(req: &ConnectRequest, fp_hex: &str, tofu: bool, opts: &SpawnOpts) -> ConnectPlan {
     let mut plan = ConnectPlan::for_target(
         HostTarget {
@@ -62,7 +50,6 @@ fn plan_for(req: &ConnectRequest, fp_hex: &str, tofu: bool, opts: &SpawnOpts) ->
     // wake stays off (it becomes real when the GTK connect path moves onto
     // `ConnectOrchestrator`, arch-split C0).
     plan.wake = false;
-    plan.connect_timeout_secs = opts.connect_timeout_secs;
     plan.tofu = tofu;
     if let Some(profile) = &opts.profile {
         plan.profile = profile.clone();
@@ -70,14 +57,12 @@ fn plan_for(req: &ConnectRequest, fp_hex: &str, tofu: bool, opts: &SpawnOpts) ->
     plan
 }
 
-/// Spawns the session with `fp_hex` pinned and translates its lifecycle into
-/// [`AppMsg`]s. A ready event carries the request's cancel handle so the main loop
-/// rejects approval that was queued while Cancel ran.
+/// Spawns the session with `fp_hex` pinned and translates its lifecycle into [`AppMsg`]s.
 ///
-/// `tofu` persists an advertised fingerprint only after ready proves the host owns it.
-/// The plan supplies all effective settings, including preset fullscreen policy.
+/// `tofu` marks the plan's pin as an advertised one. The plan supplies all effective
+/// settings, including preset fullscreen policy.
 ///
-/// The caller takes `busy`; [`AppMsg::SessionExited`] releases it. `Ok` is the child's
+/// The caller takes the slot; [`AppMsg::SessionExited`] frees it. `Ok` is the child's
 /// handle; `Err` reports a spawn failure before supervision starts.
 pub fn spawn_session(
     sender: relm4::Sender<AppMsg>,
@@ -87,17 +72,12 @@ pub fn spawn_session(
     opts: SpawnOpts,
 ) -> Result<CancelHandle, String> {
     let plan = plan_for(&req, &fp_hex, tofu, &opts);
-    let persist_paired = opts.persist_paired;
-    let cancel = opts.cancel.clone();
     let (mut error, mut ended) = (None::<orchestrate::SessionError>, None::<String>);
-    orchestrate::spawn_session(&plan, opts.cancel, move |ev| match ev {
+    orchestrate::spawn_session(&plan, None, move |ev| match ev {
         SessionEvent::Ready => {
             let _ = sender.send(AppMsg::SessionReady {
                 req: req.clone(),
                 fp_hex: fp_hex.clone(),
-                tofu,
-                persist_paired,
-                cancel: cancel.clone(),
             });
         }
         SessionEvent::Error(e) => error = Some(e),
@@ -110,10 +90,38 @@ pub fn spawn_session(
                 code,
                 error: error.take(),
                 ended: ended.take(),
-                tofu,
             });
         }
     })
+}
+
+/// Spawns the console and posts [`AppMsg::ConsoleExited`] with what its exit shows. `Err` is
+/// the banner for a console that never started.
+pub fn spawn_console(
+    sender: relm4::Sender<AppMsg>,
+    fullscreen: bool,
+    until_no_pads: bool,
+) -> Result<(), String> {
+    let cmd = orchestrate::browse_command(fullscreen, until_no_pads);
+    let (mut error, mut ended) = (None::<orchestrate::SessionError>, None::<String>);
+    let on_event = move |ev: SessionEvent| match ev {
+        SessionEvent::Error(e) => error = Some(e),
+        SessionEvent::Ended(msg) => ended = Some(msg),
+        SessionEvent::Exited(code) => {
+            let outcome = ConnectOutcome::from_exit(code, error.take(), ended.take(), false);
+            let banner = outcome.console_banner("the client log");
+            let _ = sender.send(AppMsg::ConsoleExited(banner));
+        }
+        // This shell draws nothing for a ready or a stats line, and `spawn_child` saves the
+        // window size.
+        SessionEvent::Ready | SessionEvent::Window { .. } | SessionEvent::Stats(_) => {}
+    };
+    orchestrate::spawn_child(cmd, None, None, std::io::stderr(), on_event)
+        .map(drop)
+        .map_err(|e| {
+            tracing::error!(error = %e, "console did not launch");
+            orchestrate::CONSOLE_NOT_STARTED.to_string()
+        })
 }
 
 #[cfg(test)]

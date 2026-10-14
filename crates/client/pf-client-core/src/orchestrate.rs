@@ -168,6 +168,54 @@ pub fn exit_route(
     }
 }
 
+/// One connect, from a dial-first wake to its session's exit: the facts [`exit_route`]
+/// reads, kept in one place so a shell holds this and tracks none of them itself. Our own
+/// kill is on the session's [`CancelHandle`] and reaches [`ConnectAttempt::on_exit`] inside
+/// the outcome.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConnectAttempt {
+    /// The host a dial-first wake went out to, until a session is ready or exits.
+    wake: Option<HostTarget>,
+    /// The dial pins an advertised fingerprint, which a ready session proves.
+    tofu: bool,
+    /// The profile the dial names, unless the dial is already the retry.
+    retry_profile: Option<String>,
+}
+
+impl ConnectAttempt {
+    /// A dial-first wake went out to `host`: only its failed dial falls into wake-and-wait.
+    pub fn arm_wake(&mut self, host: &HostTarget) {
+        self.wake = Some(host.clone());
+    }
+
+    /// A session is about to dial. `tofu`: it pins an advertised fingerprint. `profile` is
+    /// the one it names. `redial` marks the one retry after a `PROFILE_UNKNOWN` refusal.
+    pub fn dial(&mut self, tofu: bool, profile: Option<&str>, redial: bool) {
+        self.tofu = tofu;
+        self.retry_profile = profile.filter(|_| !redial).map(str::to_string);
+    }
+
+    /// The session is streaming, so the host answered and no later exit is the asleep case.
+    /// `true`: the dial trusted its pin on first use, and the caller saves it now.
+    pub fn on_ready(&mut self) -> bool {
+        self.wake = None;
+        self.tofu
+    }
+
+    /// The session that dialed `host` is gone: where its exit leads. Every exit ends the
+    /// attempt. An armed wake counts only for the host it went out to, matched by pin, or by
+    /// address when either side has none.
+    pub fn on_exit(&mut self, host: &HostTarget, outcome: &ConnectOutcome, log: &str) -> ExitRoute {
+        let was = std::mem::take(self);
+        let wake_armed = was.wake.is_some_and(|w| match (w.pin(), host.pin()) {
+            (Some(a), Some(b)) => a == b,
+            _ => w.addr == host.addr && w.port == host.port,
+        });
+        let retry = was.retry_profile.as_deref();
+        exit_route(outcome, was.tofu, retry, wake_armed, log)
+    }
+}
+
 /// Save the pin a ready session proved: request access saves it `paired`, a TOFU dial
 /// unpaired. The target's MACs ride along, so a host first reached by TOFU keeps Wake-on-LAN.
 pub fn persist_on_ready(target: &HostTarget, fp: &str, paired: bool) -> anyhow::Result<()> {
@@ -697,6 +745,28 @@ impl ConnectOutcome {
         }
     }
 
+    /// What a console exit shows on the host list. `None` after a quit or our own kill, else
+    /// the line the console ended on. One that said nothing shows how it went, in the shape of
+    /// [`Self::died_banner`]: no exit code means a signal killed it.
+    pub fn console_banner(&self, log: &str) -> Option<String> {
+        match self {
+            ConnectOutcome::Ended(None) | ConnectOutcome::Cancelled => None,
+            ConnectOutcome::TrustRejected(msg)
+            | ConnectOutcome::ConnectFailed(msg)
+            | ConnectOutcome::Refused { msg, .. }
+            | ConnectOutcome::Ended(Some(msg)) => Some(msg.clone()),
+            ConnectOutcome::RendererFailed { code: -1 } => {
+                Some("The console was killed — out of memory, or stopped by the system".into())
+            }
+            ConnectOutcome::RendererFailed { code } => {
+                let how = Self::exit_phrase(*code);
+                Some(format!(
+                    "The console didn't start (punktfunk-session {how}). Check {log}."
+                ))
+            }
+        }
+    }
+
     /// The banner for a session that died without a contract line: a missing runtime, a
     /// crash, or the wrong binary. `log` names where the cause is.
     pub fn died_banner(code: i32, log: &str) -> String {
@@ -1072,6 +1142,25 @@ pub fn session_command(plan: &ConnectPlan) -> (Command, Option<std::path::PathBu
     (cmd, spec_path)
 }
 
+/// What a console that never spawned shows. [`ConnectOutcome::console_banner`] has the
+/// sentences for one that did.
+pub const CONSOLE_NOT_STARTED: &str = "The console didn't start. Check the client log.";
+
+/// The console command: `--browse` with the stdout contract on, so a shell reads its ready
+/// and its exit as it reads a stream's. `until_no_pads` hands the desk back once the last
+/// controller is gone.
+pub fn browse_command(fullscreen: bool, until_no_pads: bool) -> Command {
+    let mut cmd = Command::new(session_binary());
+    cmd.args(["--browse", "--json-status"]);
+    if fullscreen {
+        cmd.arg("--fullscreen");
+    }
+    if until_no_pads {
+        cmd.arg("--until-no-controller");
+    }
+    cmd
+}
+
 /// Spawns the session for `plan` and supervises it. See [`spawn_child`].
 pub fn spawn_session(
     plan: &ConnectPlan,
@@ -1314,6 +1403,74 @@ mod tests {
             O::died_banner(1, "C:\\logs\\client.log"),
             "The session didn't start (punktfunk-session exited with code 1). Check C:\\logs\\client.log."
         );
+    }
+
+    /// An armed wake counts for the host it went out to, until a session answers or any
+    /// session exits. What a dial named is read at its own exit and at no later one.
+    #[test]
+    fn a_connect_attempt_reads_its_own_exit() {
+        use punktfunk_core::reject::RejectReason as R;
+        use ExitRoute::*;
+        let at = |fp: &str, addr: &str| HostTarget {
+            addr: addr.into(),
+            port: 9777,
+            fp_hex: Some(fp.into()),
+            ..Default::default()
+        };
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        let (desk, typed) = (at(&a, "10.0.0.2"), at("", "10.0.0.2"));
+        let failed = ConnectOutcome::ConnectFailed("gone".into());
+        let banner = Banner("Couldn't connect — gone".into());
+        for (armed, ready, exiting, want) in [
+            (Some(&desk), false, at(&a, "10.0.0.2"), Wake),
+            (Some(&desk), false, at(&a, "10.0.0.9"), Wake), // its pin, on a new lease
+            (Some(&desk), false, at(&b, "10.0.0.2"), banner.clone()), // another host there
+            (Some(&desk), false, at("", "10.0.0.2"), Wake), // one side has no pin: the address
+            (Some(&typed), false, at(&a, "10.0.0.2"), Wake),
+            (Some(&desk), false, at("", "10.0.0.9"), banner.clone()),
+            (Some(&desk), true, at(&a, "10.0.0.2"), banner.clone()), // it answered
+            (None, false, at(&a, "10.0.0.2"), banner.clone()),
+        ] {
+            let mut attempt = ConnectAttempt::default();
+            if let Some(host) = armed {
+                attempt.arm_wake(host);
+            }
+            attempt.dial(false, None, false);
+            if ready {
+                assert!(!attempt.on_ready());
+            }
+            let got = attempt.on_exit(&exiting, &failed, "the client log");
+            assert_eq!(got, want, "armed {armed:?}, ready {ready}, {exiting:?}");
+            // The wake is spent on any exit, another host's included.
+            assert_eq!(attempt, ConnectAttempt::default());
+        }
+
+        let refused = ConnectOutcome::Refused {
+            msg: "no".into(),
+            reason: R::ProfileUnknown,
+        };
+        let rejected = ConnectOutcome::TrustRejected("pin".into());
+        let again = RedialProfile {
+            id: "kid".into(),
+            msg: "no".into(),
+        };
+        let (changed, forget) = (
+            Repair(FINGERPRINT_CHANGED.into()),
+            ForgetProfileThen("no".into()),
+        );
+        for (tofu, profile, redial, outcome, want) in [
+            (true, None, false, &rejected, Repair("pin".into())),
+            (false, None, false, &rejected, changed),
+            (false, Some("kid"), false, &refused, again),
+            (false, Some("kid"), true, &refused, forget),
+        ] {
+            let mut attempt = ConnectAttempt::default();
+            attempt.dial(tofu, profile, redial);
+            assert_eq!(attempt.on_ready(), tofu);
+            let got = attempt.on_exit(&desk, outcome, "the client log");
+            assert_eq!(got, want, "tofu {tofu}, {profile:?}, redial {redial}");
+            assert_eq!(attempt, ConnectAttempt::default());
+        }
     }
 
     /// Packet at 0 and every 6 s, presence each second, 90 s of budget, park (not
@@ -1638,6 +1795,47 @@ mod tests {
         assert!(
             !O::RendererFailed { code: -1 }.warrants_wake(),
             "a system kill"
+        );
+    }
+
+    /// A console that quits says nothing. One that ends badly shows its own line, or where
+    /// the cause is when it had none.
+    #[test]
+    fn a_console_exit_shows_its_line_or_the_log() {
+        use ConnectOutcome as O;
+        let log = "the client log";
+        for (outcome, want) in [
+            (O::Ended(None), None),
+            (O::Cancelled, None),
+            (
+                O::ConnectFailed("no display".into()),
+                Some("no display".into()),
+            ),
+            (
+                O::RendererFailed { code: 4 },
+                Some(
+                    "The console didn't start (punktfunk-session exited with code 4). \
+                     Check the client log."
+                        .into(),
+                ),
+            ),
+            (
+                O::RendererFailed { code: -1 },
+                Some("The console was killed — out of memory, or stopped by the system".into()),
+            ),
+        ] {
+            assert_eq!(outcome.console_banner(log), want, "{outcome:?}");
+        }
+        let args = |cmd: Command| -> Vec<String> {
+            cmd.get_args().map(|a| a.to_string_lossy().into()).collect()
+        };
+        assert_eq!(
+            args(browse_command(false, false)),
+            ["--browse", "--json-status"]
+        );
+        assert_eq!(
+            args(browse_command(true, true))[2..],
+            ["--fullscreen", "--until-no-controller"]
         );
     }
 

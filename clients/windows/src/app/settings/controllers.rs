@@ -1,7 +1,7 @@
 //! Controllers: the pad inventory, forwarding and the emulated pad.
 
 use super::{
-    advanced_group, described_labeled, described_overridable, group, presets, setting_combo,
+    advanced_group, described_labeled, described_overridable, group, presets, rows, setting_combo,
     setting_toggle, Cx,
 };
 use crate::trust::Settings;
@@ -195,8 +195,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
             }),
             Some(described_overridable(
                 cx,
-                "gamepad",
-                "Controller type",
+                &rows::GAMEPAD,
                 pad_combo,
                 "The virtual pad created on the host. Automatic matches your controller \
                  \u{2014} a DualSense keeps adaptive triggers, lightbar, touchpad and \
@@ -205,7 +204,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
             // This device's motors, so defaults scope only, like Controller haptics.
             (!preset_mode).then(|| {
                 described_labeled(
-                    "Controller rumble",
+                    rows::PAD_RUMBLE.label,
                     pad_rumble_toggle,
                     "Off, controllers don't vibrate from the stream or in the menus, whatever the game sends.",
                 )
@@ -223,8 +222,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
         // (a "Work" preset can decline what "Game" forwards).
         described_overridable(
             cx,
-            "gamepad_forwarding",
-            "Forward controllers",
+            &rows::FORWARDING,
             pad_forward_toggle,
             "Sends controllers connected to this PC to the host. Turn it off when your \
              controller already reaches the host another way \u{2014} USB passthrough \
@@ -237,7 +235,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
     // only. Apple forwards ONE pad as player 1; this client forwards each as its own player.
     if !preset_mode {
         advanced.push(described_labeled(
-            "Use controller",
+            rows::FORWARD_PAD.label,
             forward_combo,
             "Every connected controller is forwarded, each as its own player. Pick one to \
              force single-player \u{2014} only it reaches the host.",
@@ -246,8 +244,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
     advanced.extend([
         described_overridable(
             cx,
-            "system_buttons",
-            "Guide button",
+            &rows::SYSTEM_BUTTONS,
             sysbtn_combo,
             "Where the guide (Xbox/PS) and quick-access presses go while streaming. \
              Automatic sends them to the host \u{2014} except on devices whose own overlay \
@@ -256,8 +253,7 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
         ),
         described_overridable(
             cx,
-            "guide_gesture",
-            "Hold Select for guide",
+            &rows::GUIDE_GESTURE,
             gesture_combo,
             "Hold Select on its own to press the host's guide button \u{2014} keep holding \
              for a Gaming-Mode host's quick-access menu. A Select tap still goes through, \
@@ -267,13 +263,13 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
     ]);
     if !preset_mode {
         advanced.push(described_labeled(
-            "Controller haptics",
+            rows::PAD_HAPTICS.label,
             pad_haptics_toggle,
             "Play a DualSense's voice-coil haptics on the pad itself, while controllers are \
              forwarded.",
         ));
         advanced.push(described_labeled(
-            "Controller speaker",
+            rows::PAD_SPEAKER.label,
             pad_speaker_toggle,
             "Play the audio a game sends to the pad's own speaker on the pad, not through \
              this PC.",

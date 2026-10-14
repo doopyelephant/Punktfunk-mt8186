@@ -95,9 +95,9 @@ impl AppModel {
             .ok();
     }
 
-    /// The speed-test page. The test is a connect, so it holds `busy` until it ends.
+    /// The speed-test page. The test is a connect, so it holds the slot until it ends.
     pub(super) fn speed_test(&mut self, req: ConnectRequest, sender: &ComponentSender<AppModel>) {
-        if std::mem::replace(&mut self.busy, true) {
+        if !self.flight.hold() {
             return;
         }
         let sender = sender.clone();

@@ -57,21 +57,16 @@ pub(crate) fn spawn_session(
 }
 
 /// Spawn the session binary in `--browse` mode: the console home, in the session window —
-/// launches run as streams in that same window. The same stdout contract as a connect
-/// (`--json-status`): `ready` when the console window presents, `error` on a failed start,
-/// EOF on quit.
+/// launches run as streams in that same window. The same stdout contract as a connect:
+/// `ready` when the console window presents, `error` on a failed start, EOF on quit.
 pub(crate) fn spawn_browse(
     fullscreen: bool,
     slot: CancelHandle,
     on_event: impl FnMut(SpawnEvent) + Send + 'static,
 ) -> Result<(), String> {
-    let mut cmd = Command::new(orchestrate::session_binary());
-    cmd.arg("--browse");
-    cmd.arg("--json-status");
-    if fullscreen {
-        cmd.arg("--fullscreen");
-    }
+    let cmd = orchestrate::browse_command(fullscreen, false);
     spawn(cmd, None, "console", slot, on_event)
+        .map_err(|_| orchestrate::CONSOLE_NOT_STARTED.to_string())
 }
 
 /// Hand the shell window's position to the child (`--window-pos`) so the session window

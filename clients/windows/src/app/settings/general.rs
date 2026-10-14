@@ -1,7 +1,7 @@
 //! General: session and statistics, plus the device-wide rows a preset never carries.
 
 use super::{
-    advanced_group, described_labeled, described_overridable, group, presets, setting_combo,
+    advanced_group, described_labeled, described_overridable, group, presets, rows, setting_combo,
     setting_toggle, Cx,
 };
 use crate::trust::{KnownHosts, Settings};
@@ -89,8 +89,7 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
         Some("Session"),
         vec![described_overridable(
             cx,
-            "fullscreen_on_stream",
-            "Start streams fullscreen",
+            &rows::FULLSCREEN_ON_STREAM,
             fullscreen_toggle,
             "Go fullscreen when a session starts; F11 or Alt+Enter switches back \
                  live.",
@@ -100,7 +99,7 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
         // it stays global in v1 (design §3, tier H/G).
         .chain((!preset_mode).then(|| {
             described_labeled(
-                "Auto-wake on connect",
+                rows::AUTO_WAKE.label,
                 auto_wake_toggle,
                 "Connecting to a saved host that\u{2019}s offline sends Wake-on-LAN and \
                  waits for it to boot. Turn off if hosts behind a VPN look offline when \
@@ -108,15 +107,15 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
             )
         }))
         .chain(
-            (!preset_mode).then(|| described_labeled("Start in", start_in_combo, &start_in_help())),
+            (!preset_mode)
+                .then(|| described_labeled(rows::START_IN.label, start_in_combo, &start_in_help())),
         )
         .collect(),
         None,
     );
     let mut stats_rows = vec![described_overridable(
         cx,
-        "stats_verbosity",
-        "Statistics overlay",
+        &rows::STATS,
         hud_combo,
         "Live session stats in a corner overlay \u{2014} Compact is a one-line pill, \
          Detailed adds the stage breakdown. Ctrl+Alt+Shift+S cycles the tiers any time.",
@@ -132,7 +131,7 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
     out.extend(group(
         None,
         vec![described_labeled(
-            "Show advanced",
+            rows::SHOW_ADVANCED.label,
             show_toggle,
             "Adds the settings most players never need to change.",
         )],
@@ -175,23 +174,23 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
             cx,
             vec![
                 described_labeled(
-                    "Advanced statistics",
+                    rows::ADVANCED_STATS.label,
                     advanced_toggle,
                     "Off shows the figures Moonlight's overlay also shows. On shows capture \
                      to glass as p50/p95 and every stage between.",
                 ),
                 described_labeled(
-                    "Statistics position",
+                    rows::STATS_POSITION.label,
                     corner_combo,
                     "The corner the statistics overlay sits in.",
                 ),
                 described_labeled(
-                    "Statistics size",
+                    rows::STATS_SIZE.label,
                     size_combo,
                     "The overlay's size, on top of your display's scaling.",
                 ),
                 described_labeled(
-                    "Exit hint",
+                    rows::EXIT_HINT.label,
                     hint_toggle,
                     "Shows how to leave for a few seconds when a stream starts.",
                 ),

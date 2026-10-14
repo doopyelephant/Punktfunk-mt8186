@@ -18,6 +18,7 @@ mod display;
 mod general;
 mod input;
 mod preset_sheet;
+mod rows;
 
 pub(crate) use preset_sheet::hex_color;
 
@@ -221,17 +222,17 @@ fn committer<T: 'static>(
 }
 
 /// One field a preset can override: [`described_labeled`] plus, while the preset in scope
-/// overrides `field`, the Overridden marker whose Reset is the only way back to inheriting.
-/// Captions sit below their control, as on every Windows Settings page and the Apple client.
-/// A control's edit pins `field` ([`commit`]); WinUI raises no change event on a no-op
-/// re-selection, so "not overridden" needs the Reset.
+/// overrides the row's key, the Overridden marker whose Reset is the only way back to
+/// inheriting. Captions sit below their control, as on every Windows Settings page and the
+/// Apple client. A control's edit pins the key ([`commit`]); WinUI raises no change event on
+/// a no-op re-selection, so "not overridden" needs the Reset.
 fn described_overridable(
     cx: &Cx,
-    field: &'static str,
-    label: &str,
+    row: &rows::Row,
     control: impl Into<Element>,
     caption: &str,
 ) -> Element {
+    let (field, label) = (row.key, row.label);
     if !cx.overrides(field) {
         return described_labeled(label, control, caption);
     }
