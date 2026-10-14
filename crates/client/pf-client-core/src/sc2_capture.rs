@@ -6,6 +6,7 @@
 //! buttons, sticks and triggers. Core's send path gates each report
 //! ([`NativeClient::set_sc2_gate`]), as it does for the Apple and Android captures.
 
+use punktfunk_core::client::sc1_ble;
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::GamepadPref;
 use punktfunk_core::quic::{RichInput, HID_RAW_FEATURE, HID_RAW_OUTPUT, HID_REPORT_MAX};
@@ -51,10 +52,12 @@ pub(crate) enum Model {
     Triton { puck: bool },
     /// The 2015 pad on a cable or its dongle. Its reports and feature frames carry no id.
     Classic,
+    /// The 2015 pad on Bluetooth: segments both ways, which core turns into wired frames.
+    ClassicBle,
 }
 
 /// The capture a slot gets: the pad in hand and the kind declared to the host are the same
-/// Steam Controller. A 2015 pad on Bluetooth frames its reports for the radio and stays typed.
+/// Steam Controller.
 pub(crate) fn raw_model(pref: GamepadPref, declared: GamepadPref, pid: u16) -> Option<Model> {
     match (pref, declared) {
         (p, d) if is_sc2(p) && is_sc2(d) => Some(Model::Triton {
@@ -64,6 +67,11 @@ pub(crate) fn raw_model(pref: GamepadPref, declared: GamepadPref, pid: u16) -> O
             if matches!(pid, 0x1102 | 0x1142) =>
         {
             Some(Model::Classic)
+        }
+        (GamepadPref::SteamController, GamepadPref::SteamController)
+            if matches!(pid, 0x1105 | 0x1106) =>
+        {
+            Some(Model::ClassicBle)
         }
         _ => None,
     }
@@ -181,6 +189,7 @@ impl Dev {
                 (self.send_feature(&frame), 50)
             }
             Model::Classic => (self.send_classic_feature(request), 10),
+            Model::ClassicBle => return self.exchange_ble(request),
         };
         if sent < 0 {
             return None;
@@ -196,6 +205,46 @@ impl Dev {
             }
         }
         None
+    }
+
+    /// [`Self::exchange`] for a 2015 pad on Bluetooth: the reply comes one segment per GET.
+    /// Windows and macOS hand the report id back twice, so a segment starts one byte in there
+    /// (SDL `GetFeatureReport`).
+    fn exchange_ble(&self, request: &[u8]) -> Option<Vec<u8>> {
+        if self.send_ble_feature(request) < 0 {
+            return None;
+        }
+        let skip = usize::from(cfg!(any(target_os = "windows", target_os = "macos")));
+        let mut read = Vec::new();
+        let mut reply = [0u8; 73];
+        for _ in 0..12 {
+            let mut buf = [0u8; sc1_ble::SEGMENT + 1];
+            buf[0] = 0x03;
+            // SAFETY: `self.0` is open and used only on this thread; `buf` is writable.
+            let n = unsafe {
+                hid::SDL_hid_get_feature_report(self.0, buf.as_mut_ptr(), sc1_ble::SEGMENT + skip)
+            };
+            if n <= skip as i32 {
+                continue;
+            }
+            read.extend_from_slice(&buf[skip..skip + sc1_ble::SEGMENT]);
+            if let Some(len) = sc1_ble::classic_ble_reply(&read, &mut reply) {
+                return (reply.get(1) == request.get(1)).then(|| reply[..len].to_vec());
+            }
+        }
+        None
+    }
+
+    /// A wired feature frame to a 2015 pad on Bluetooth, as its segments.
+    fn send_ble_feature(&self, frame: &[u8]) -> i32 {
+        let mut sent = -1;
+        for seg in sc1_ble::classic_ble_segments(frame) {
+            sent = self.send_feature(&seg);
+            if sent < 0 {
+                break;
+            }
+        }
+        sent
     }
 
     fn send_feature(&self, r: &[u8]) -> i32 {
@@ -244,7 +293,7 @@ fn send_identity(dev: &Dev, client: &NativeClient, pad: u8, serial: String, mode
     use punktfunk_core::client::sc2;
     let requests: Vec<&[u8]> = match model {
         Model::Triton { puck } => sc2::identity_requests(puck).collect(),
-        Model::Classic => sc2::classic_identity_requests().collect(),
+        Model::Classic | Model::ClassicBle => sc2::classic_identity_requests().collect(),
     };
     let answered: Vec<(&[u8], Vec<u8>)> = requests
         .into_iter()
@@ -279,12 +328,15 @@ fn send_identity(dev: &Dev, client: &NativeClient, pad: u8, serial: String, mode
 
 fn run(dev: Dev, rx: &Receiver<Cmd>, client: &NativeClient, pad: u8, model: Model) {
     let mut buf = [0u8; HID_REPORT_MAX];
+    let mut ble = [0u8; sc1_ble::CLASSIC_BLE_STATE];
     loop {
         loop {
             match rx.try_recv() {
                 Ok(Cmd::Write(kind, data)) => {
                     let sent = match (model, kind) {
                         (Model::Classic, HID_RAW_FEATURE) => dev.send_classic_feature(&data),
+                        (Model::ClassicBle, HID_RAW_FEATURE) => dev.send_ble_feature(&data),
+                        (Model::ClassicBle, _) => 0,
                         _ => dev.write(kind, &data),
                     };
                     if sent < 0 {
@@ -306,7 +358,16 @@ fn run(dev: Dev, rx: &Receiver<Cmd>, client: &NativeClient, pad: u8, model: Mode
             tracing::info!(pad, "steam controller hid node closed");
             return;
         }
-        if n > 0 {
+        if n > 0 && model == Model::ClassicBle {
+            let mut frame = [0u8; HID_REPORT_MAX];
+            if sc1_ble::classic_ble_input(&mut ble, &buf[..n as usize], &mut frame) {
+                let _ = client.send_rich_input(RichInput::HidReport {
+                    pad,
+                    len: HID_REPORT_MAX as u8,
+                    data: frame,
+                });
+            }
+        } else if n > 0 {
             let _ = client.send_rich_input(RichInput::HidReport {
                 pad,
                 len: n as u8,
@@ -342,7 +403,7 @@ mod tests {
     }
 
     /// A raw capture needs the pad in hand and the declared kind to be the same Steam
-    /// Controller. The 2015 pad qualifies on its cable and its dongle, not on Bluetooth.
+    /// Controller.
     #[test]
     fn raw_capture_follows_the_pad_and_the_declared_kind() {
         use GamepadPref as P;
@@ -361,10 +422,12 @@ mod tests {
                 Some(Model::Classic)
             );
         }
-        assert_eq!(
-            raw_model(P::SteamController, P::SteamController, 0x1106),
-            None
-        );
+        for pid in [0x1105, 0x1106] {
+            assert_eq!(
+                raw_model(P::SteamController, P::SteamController, pid),
+                Some(Model::ClassicBle)
+            );
+        }
         assert_eq!(
             raw_model(P::SteamController, P::Xbox360, 0x1102),
             None,
