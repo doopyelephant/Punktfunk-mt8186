@@ -5,6 +5,7 @@
 //! only the tiny [`PadBootstrap`] mailbox stays named. `Pod` + `offset_of!` asserts pin the
 //! historical `OFF_*` / `view.add(N)` layout. Layout only; the sections are host-created.
 
+use crate::pad_kind::Clock;
 use alloc::string::String;
 use bytemuck::{Pod, Zeroable};
 
@@ -75,7 +76,8 @@ pub const GAMEPAD_PROTO_VERSION: u32 = 3;
 /// Behaviour revision the driver stamps into [`PadShm::driver_rev`]. The protocol version
 /// only moves when the layout breaks, so a driver with old behaviour still attaches; the host
 /// compares this instead and flags an older driver. Bump it with any driver change a game or
-/// the host depends on. `1`: devnode-index serials, Deck packet numbers, refused unknown ids.
+/// the host depends on; a [`crate::pad_kind::PAD_KINDS`] change fails a test until it moves.
+/// `1`: devnode-index serials, Deck packet numbers, refused unknown ids.
 /// `2`: Share on the Series Xbox pad. `3`: the Switch Pro identity. `4`: the 8BitDo and
 /// HORIPAD identities. `5`: the Joy-Con halves. `6`: the 2015 Steam Controller.
 pub const GAMEPAD_DRIVER_REV: u32 = 6;
@@ -500,18 +502,12 @@ pub const fn with_proof<const N: usize>(rdesc: &[u8]) -> [u8; N] {
 /// held input released and pressed again.
 pub const REPORT_PERIOD_US: u64 = 4_000;
 
-/// The input-report period the driver serves `device_type` at (the Triton serves changes).
-///
-/// The Pro Controller pushes `0x30` every 8 ms over Bluetooth and 15 ms over USB, three IMU
-/// samples each; a Joy-Con every 15 ms. Both sit inside `hid-nintendo`'s 8–17 ms window, and SDL
-/// measures the sample spacing from the stream.
+/// The input-report period the driver serves `device_type` at (the Triton serves changes):
+/// its [`crate::pad_kind`] row's, else [`REPORT_PERIOD_US`].
 pub const fn report_period_us(device_type: u8) -> u64 {
-    match device_type {
-        DEVTYPE_SWITCH_PRO => 8_000,
-        DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => 15_000,
-        // SDL's fixed step for this pad over Bluetooth; it carries no clock to correct it.
-        DEVTYPE_8BITDO_ULTIMATE2 => 8_333,
-        _ => REPORT_PERIOD_US,
+    match crate::pad_kind::pad_kind(device_type) {
+        Some(kind) => kind.period_us,
+        None => REPORT_PERIOD_US,
     }
 }
 
@@ -543,16 +539,19 @@ pub fn serve_due(now_us: u64, due_us: u64, period_us: u64) -> Option<u64> {
 /// at its client's rate and the driver serves at the hardware's, so the driver owns every
 /// clock. A Switch Pro `0x30` or `0x21` carries an 8-bit timer (byte 1). `serial` is this
 /// report's index, `elapsed_us` the time since the first report; every field wraps as hardware
-/// does. The Joy-Con halves carry the Pro's timer. Returns `false`, and leaves the report
-/// alone, for an identity that has no such fields.
+/// does. The row's [`Clock`] names the fields. Returns `false`, and leaves the report alone, for
+/// an identity that has no such fields.
 pub fn stamp_report_clock(
     device_type: u8,
     report: &mut [u8; 64],
     serial: u32,
     elapsed_us: u64,
 ) -> bool {
-    match device_type {
-        DEVTYPE_DUALSENSE | DEVTYPE_DUALSENSE_EDGE => {
+    let Some(kind) = crate::pad_kind::pad_kind(device_type) else {
+        return false;
+    };
+    match kind.clock {
+        Clock::DualSense => {
             report[7] = serial as u8;
             report[12..16].copy_from_slice(&serial.to_le_bytes());
             // 1/3 µs ticks (hid-playstation's DIV_ROUND_CLOSEST(delta, 3)).
@@ -562,7 +561,7 @@ pub fn stamp_report_clock(
             report[49..53].copy_from_slice(&((ticks + 5_900) as u32).to_le_bytes());
             true
         }
-        DEVTYPE_DUALSHOCK4 => {
+        Clock::DualShock4 => {
             // The counter is the top six bits; the low two are PS and touchpad click.
             report[7] = (report[7] & 0x03) | (((serial as u8) & 0x3F) << 2);
             // 16/3 µs ticks, mirrored into the one touch frame's own timestamp byte.
@@ -571,26 +570,26 @@ pub fn stamp_report_clock(
             report[34] = ts as u8;
             true
         }
-        DEVTYPE_STEAMDECK | DEVTYPE_STEAMCONTROLLER => {
+        Clock::PacketNumber => {
             report[4..8].copy_from_slice(&serial.to_le_bytes());
             true
         }
         // A `0x81` handshake ack has no timer; its byte 1 is the echoed command.
-        DEVTYPE_SWITCH_PRO | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT if report[0] != 0x81 => {
+        Clock::SwitchTimer if report[0] != 0x81 => {
             report[1] = serial as u8;
             true
         }
-        // The µs IMU clock the Pro models declare in feature `0x06`.
-        DEVTYPE_8BITDO_PRO2 | DEVTYPE_8BITDO_PRO3 => {
+        // The µs IMU clock the 8BitDo Pro models declare in feature `0x06`.
+        Clock::Micros32 => {
             report[27..31].copy_from_slice(&(elapsed_us as u32).to_le_bytes());
             true
         }
         // A u16 µs clock SDL reads and then replaces with its own fixed step.
-        DEVTYPE_HORIPAD_STEAM => {
+        Clock::Micros16 => {
             report[10..12].copy_from_slice(&(elapsed_us as u16).to_le_bytes());
             true
         }
-        _ => false,
+        Clock::SwitchTimer | Clock::None => false,
     }
 }
 
@@ -681,25 +680,10 @@ pub fn devtype_from_hwids(ids: &str) -> Option<u8> {
 /// USB VID/PID the driver reports in each identity's HID attributes. SDL, Steam and Windows
 /// key their stock mappings off them. `None` for a `device_type` this build does not know.
 pub const fn identity_vid_pid(device_type: u8) -> Option<(u16, u16)> {
-    Some(match device_type {
-        DEVTYPE_DUALSENSE => (0x054C, 0x0CE6),
-        DEVTYPE_DUALSHOCK4 => (0x054C, 0x09CC),
-        DEVTYPE_DUALSENSE_EDGE => (0x054C, 0x0DF2),
-        DEVTYPE_STEAMDECK => (0x28DE, 0x1205),
-        DEVTYPE_XBOX => (0x045E, 0x0B13),
-        DEVTYPE_XBOX_ONE_S => (0x045E, 0x02FD),
-        DEVTYPE_XBOX_ELITE => (0x045E, 0x0B22),
-        DEVTYPE_TRITON => (0x28DE, 0x1302),
-        DEVTYPE_SWITCH_PRO => (0x057E, 0x2009),
-        DEVTYPE_8BITDO_ULTIMATE2 => (0x2DC8, 0x6012),
-        DEVTYPE_8BITDO_PRO2 => (0x2DC8, 0x6003),
-        DEVTYPE_8BITDO_PRO3 => (0x2DC8, 0x6009),
-        DEVTYPE_HORIPAD_STEAM => (0x0F0D, 0x01AB),
-        DEVTYPE_JOYCON_LEFT => (0x057E, 0x2006),
-        DEVTYPE_JOYCON_RIGHT => (0x057E, 0x2007),
-        DEVTYPE_STEAMCONTROLLER => (0x28DE, 0x1102),
-        _ => return None,
-    })
+    match crate::pad_kind::pad_kind(device_type) {
+        Some(kind) => Some((kind.vid, kind.pid)),
+        None => None,
+    }
 }
 
 /// NTSTATUS the driver fails `EvtDeviceAdd` with when no `pf_*` hardware id names the pad
@@ -781,13 +765,12 @@ mod tests {
         assert_eq!(a[8..], held[8..], "controls stay the host's");
     }
 
-    /// SDL and Steam merge two pads that report one serial. Every identity at every host pad
-    /// index (`MAX_PADS` = 16) must be distinct; a DualSense in slot n+1 once matched an Edge in
-    /// slot n.
+    /// SDL and Steam merge two pads that report one serial, so every kind at every host pad
+    /// index (`MAX_PADS` = 16) needs its own.
     #[test]
     fn no_two_pads_share_a_serial() {
         let mut seen = std::collections::HashMap::new();
-        for devtype in DEVTYPE_DUALSENSE..=DEVTYPE_STEAMCONTROLLER {
+        for devtype in crate::pad_kind::PAD_KINDS.iter().map(|k| k.devtype) {
             for index in 0..16u8 {
                 let serial = pad_serial(devtype, index);
                 if let Some(prev) = seen.insert(serial.clone(), (devtype, index)) {

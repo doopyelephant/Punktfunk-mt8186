@@ -198,7 +198,7 @@ ManufacturerString ="Punktfunk"
 ClassName          ="HID device"
 Disk_Description   ="Punktfunk Gamepad Installation Disk"
 ; One per hardware id — these are what Device Manager shows. Keep them aligned with the product
-; strings the driver serves per device_type (src/lib.rs `on_get_string`).
+; strings the driver serves per device_type (`pf_driver_proto::pad_kind`).
 DeviceDesc         ="Punktfunk Virtual DualSense"
 DeviceDescDS4      ="Punktfunk Virtual DualShock 4"
 DeviceDescEdge     ="Punktfunk Virtual DualSense Edge"
