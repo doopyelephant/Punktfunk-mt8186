@@ -73,11 +73,10 @@ impl StreamState {
             gate: PresentGate::default(),
             cadence: CadenceProbe::new(),
             mode_period_ns: 1_000_000_000 / u64::from(native_refresh_hz.max(1)),
-            margin_ns: 0,
+            slots: Default::default(),
             busy_on: crate::vk::BusyOn::Fence,
             last_displayed_ns: 0,
             last_shown_pts_ns: 0,
-            last_slot_ns: 0,
             busy_retry: false,
             newest_turn: 0,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]

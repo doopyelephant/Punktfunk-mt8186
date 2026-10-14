@@ -48,6 +48,9 @@ mod scroll_routing;
 // Pure swapchain bookkeeping: built (and tested) on every platform, used by `vk`.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 mod swapchain_state;
+// Pure slot pick for the smoothness drain: built (and tested) on every platform.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+mod slot_pick;
 // Pure gesture logic with no SDL or Vulkan dependency: built (and tested) on every platform.
 pub mod touch;
 #[cfg(any(target_os = "linux", windows))]

@@ -153,13 +153,9 @@ impl Shell {
             self.stats_verbosity,
         );
         st.win.start = Instant::now();
-        // Adaptive slot margin: start at 0 — a fixed lead is display tax — and
-        // widen one step per window whose measured latch misses demand it.
-        // One-way per stream.
-        if st.store.is_smoothing() && st.win.misses > 2 && st.margin_ns < MARGIN_MAX_NS {
-            st.margin_ns = (st.margin_ns + MARGIN_STEP_NS).min(MARGIN_MAX_NS);
+        if st.store.is_smoothing() && st.slots.widen(st.win.misses) {
             tracing::info!(
-                margin_us = st.margin_ns / 1000,
+                margin_us = st.slots.margin_ns() / 1000,
                 misses = st.win.misses,
                 "smoothness slot margin widened (measured latch misses)"
             );
@@ -223,7 +219,7 @@ impl Shell {
                 period_us = st.clock.period_ns() / 1000,
                 // The output's own vblank spacing where a waiter measures it; 0 elsewhere.
                 refresh_us = self.presenter.measured_refresh_ns().unwrap_or(0) / 1000,
-                margin_us = st.margin_ns / 1000,
+                margin_us = st.slots.margin_ns() / 1000,
                 // Cadence loop's current hold and the jitter it is sized from,
                 // plus frames whose due time had already passed when they arrived.
                 // Cumulative/instantaneous, not window sums like the counters above.
@@ -274,7 +270,7 @@ impl StreamState {
             // the lead we already applied. Store evictions happen whenever
             // the stream out-runs the panel and say nothing about the latch.
             if self.store.is_smoothing()
-                && s.displayed_ns.saturating_sub(s.submitted_ns) > period + self.margin_ns
+                && s.displayed_ns.saturating_sub(s.submitted_ns) > period + self.slots.margin_ns()
             {
                 self.win.misses += 1;
             }
@@ -371,24 +367,12 @@ impl StreamState {
                 // there is no grid to aim at and the due time is the target.
                 self.store.take(|p| p.due_ns <= now_ns as i64)
             } else {
-                // The first latch still reachable from here, given the submit lead. A
-                // frame due before it cannot be shown sooner by waiting; one due after
-                // it would land a slot early (`next_slot_after` is monotone).
-                let slot = self
-                    .clock
-                    .next_slot_after(now_ns.saturating_add(self.margin_ns));
-                // One present per slot. Two frames due before the same slot were
-                // presented back to back, and MAILBOX showed one of them for nothing
-                // while the next slot went empty: the 0/2-step pairs in the ledger.
-                if slot == self.last_slot_ns {
-                    None
-                } else {
-                    let taken = self.store.take(|p| p.due_ns < slot as i64);
-                    if taken.is_some() {
-                        self.last_slot_ns = slot;
-                    }
-                    taken
-                }
+                let (clock, store) = (&self.clock, &mut self.store);
+                self.slots.pick(
+                    now_ns,
+                    |after| clock.next_slot_after(after),
+                    |slot| store.take(|p| p.due_ns < slot as i64),
+                )
             }
         } else {
             // Arrival-driven; a paced store (measured VRR) holds the newest for its due time.
@@ -821,7 +805,7 @@ impl StreamState {
         // is the next one still reachable (one period minus submit lead). Before the
         // first on-glass stamp there is no grid; `next_slot_after` answers "one period
         // from now" — mirror that or opening frames wait a refresh they never owed.
-        let lead_ns = self.clock.period_ns() as i64 + self.margin_ns as i64;
+        let lead_ns = self.clock.period_ns() as i64 + self.slots.margin_ns() as i64;
         let wake_ns = if self.pacer.free_running() {
             p.due_ns
         } else if self.clock.anchor_ns() == 0 {
@@ -864,8 +848,7 @@ impl StreamState {
         }
         self.cadence.reset();
         self.pacer.reset();
-        // The slot margin was sized by the old panel's misses.
-        self.margin_ns = 0;
+        self.slots.reset_margin();
         self.win.misses = 0;
         tracing::info!(
             refresh_hz = hz,

@@ -25,7 +25,6 @@ use crate::overlay::{
 };
 use crate::present_pace::{
     off_grid_ns, Cadence, CadenceProbe, FrameStore, LatchClock, PresentGate, SourcePacer,
-    MARGIN_MAX_NS, MARGIN_STEP_NS,
 };
 use crate::touch::{Abs, Act};
 use crate::vk::{FrameInput, Presented, Presenter};
@@ -404,9 +403,8 @@ struct StreamState {
     /// Display mode's refresh period — the vblank grid presents quantize to when VRR is
     /// off. Not the learned period (see the probe's call site).
     mode_period_ns: u64,
-    /// Smoothness slot-pick margin: starts 0 (a fixed lead is display tax), widens
-    /// +500 µs per >2-miss window toward 2.5 ms.
-    margin_ns: u64,
+    /// Smoothing: one present per latch slot, aimed a measured margin ahead.
+    slots: crate::slot_pick::SlotPick,
     /// What the held frame waits on. The fence paces the loop itself (the presenter waits
     /// it for a millisecond per pass), so the pass turns straight around and drains the
     /// channel first: a newer frame replaces the held one instead of queuing behind it.
@@ -414,9 +412,6 @@ struct StreamState {
     last_displayed_ns: u64,
     /// Source stamp of the frame last seen on glass, for the spacing-error ledger.
     last_shown_pts_ns: u64,
-    /// Smoothing: the latch slot the last vended frame was aimed at. One present per
-    /// slot; a second frame due before the same slot waits for the next.
-    last_slot_ns: u64,
     /// The presenter handed the frame back (no swapchain image yet): wake in 1 ms.
     busy_retry: bool,
     /// Present turn of the newest wavelet frame taken in.
