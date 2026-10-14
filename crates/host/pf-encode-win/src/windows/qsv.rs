@@ -18,6 +18,7 @@ use super::policy::{intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::ltr::{LtrMirror, LtrStep, NUM_LTR_SLOTS};
 use crate::retrieve::{poll_budget_ms, AuQueue, RetrieveThread};
+use crate::stall::{Rebuild, Stall};
 use anyhow::{anyhow, bail, Context, Result};
 use libvpl_sys as vpl;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
@@ -902,8 +903,8 @@ pub struct QsvEncoder {
     /// Refuse this frame after the LTR decision, as a failed surface fetch would.
     #[cfg(test)]
     fail_submit_at: Option<i64>,
-    /// Resets with no AU since. At 2, drop `inner` instead of Close+Init on a dead session.
-    resets_without_output: u32,
+    /// Stall recovery since the last AU, cleared in `poll`.
+    stall: Stall,
 }
 
 // SAFETY: raw VPL handles are not auto-`Send`, and none is thread-affine. Every call on this
@@ -977,7 +978,7 @@ impl QsvEncoder {
             ltr_test_force_at: ltr_test_force_at(),
             #[cfg(test)]
             fail_submit_at: None,
-            resets_without_output: 0,
+            stall: Stall::Clear,
         })
     }
 
@@ -1734,7 +1735,7 @@ impl Encoder for QsvEncoder {
         };
         let au = inner.retrieve.q.take_ready(poll_budget_ms(self.fps))?;
         if au.is_some() {
-            self.resets_without_output = 0;
+            self.stall = Stall::Clear;
         }
         Ok(au)
     }
@@ -1760,16 +1761,17 @@ impl Encoder for QsvEncoder {
         );
     }
 
-    /// Stall recovery: Close+Init in place. A second reset with no AU drops the whole session.
+    /// Stall recovery: Close+Init in place, or the whole session dropped when [`Stall::reset`]
+    /// says reopen.
     fn reset(&mut self) -> bool {
         self.force_kf = true;
-        self.resets_without_output = self.resets_without_output.saturating_add(1);
+        let (stall, rebuild) = self.stall.reset();
+        self.stall = stall;
         if self.inner.is_none() {
             return true;
         }
-        if self.resets_without_output >= 2 {
+        if rebuild == Rebuild::Reopen {
             tracing::warn!(
-                resets = self.resets_without_output,
                 "QSV stall persisted across in-place re-Init — full session teardown, reopening \
                  lazily (next submit)"
             );

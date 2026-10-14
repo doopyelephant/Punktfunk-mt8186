@@ -16,6 +16,7 @@
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::retrieve::{poll_budget_ms, AuQueue};
+use crate::stall::{Rebuild, Stall};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::mem::ManuallyDrop;
@@ -619,8 +620,8 @@ pub struct MfEncoder {
     /// The MFT answered `IsSupported(AVEncVideoForceKeyFrame)`. `false` buys a periodic
     /// GOP instead, because a stream with neither cannot recover from loss at all.
     force_idr_ok: bool,
-    /// Resets with no AU since. At 2, drop `inner` instead of re-messaging a dead MFT.
-    resets_without_output: u32,
+    /// Stall recovery since the last AU, cleared in `poll`.
+    stall: Stall,
 }
 
 // SAFETY: COM interfaces are not auto-`Send`. Every call on this encoder runs on the one thread
@@ -676,7 +677,7 @@ impl MfEncoder {
             bound_device: 0,
             force_kf: false,
             force_idr_ok: false,
-            resets_without_output: 0,
+            stall: Stall::Clear,
         })
     }
 
@@ -1019,7 +1020,7 @@ impl Encoder for MfEncoder {
         };
         let au = inner.shared.q.take_ready(poll_budget_ms(self.fps))?;
         if au.is_some() {
-            self.resets_without_output = 0;
+            self.stall = Stall::Clear;
         }
         Ok(au)
     }
@@ -1030,17 +1031,17 @@ impl Encoder for MfEncoder {
         self.inner.as_ref().map(|i| i.shared.q.raw())
     }
 
-    /// Stall recovery: flush and restart streaming in place. A second reset with no AU
-    /// since drops the MFT so the next submit activates a fresh one.
+    /// Stall recovery: flush and restart streaming in place, or drop the MFT when
+    /// [`Stall::reset`] says reopen, so the next submit activates a fresh one.
     fn reset(&mut self) -> bool {
         self.force_kf = true;
-        self.resets_without_output = self.resets_without_output.saturating_add(1);
+        let (stall, rebuild) = self.stall.reset();
+        self.stall = stall;
         let Some(inner) = self.inner.as_mut() else {
             return true;
         };
-        if self.resets_without_output >= 2 {
+        if rebuild == Rebuild::Reopen {
             tracing::warn!(
-                resets = self.resets_without_output,
                 "Media Foundation stall persisted across an in-place restart — dropping the MFT, \
                  reopening lazily (next submit)"
             );
