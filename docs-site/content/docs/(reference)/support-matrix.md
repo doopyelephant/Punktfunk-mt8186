@@ -35,7 +35,7 @@ Each session gets its own display at the client's resolution and refresh rate �
 | gamescope (SteamOS · Bazzite) | ✅ ³ | ⚠️ ⁴ | ✅ |
 | sway · scroll | ✅ ⁵ | ✅ | ⚠️ ⁶ |
 | Hyprland | ✅ | ✅ | ⚠️ ⁶ |
-| niri (biri) | ✅ ⁷ | ✅ | ❓ ⁸ |
+| niri (biri) | ✅ ⁷ | ✅ | ✅ ⁸ |
 | Cinnamon (Mint · LMDE) | ❌ ⁹ | ❌ | ❌ |
 | River, dwl, COSMIC, others | ❌ ¹⁰ | ❌ | ❌ |
 
@@ -53,7 +53,7 @@ Each session gets its own display at the client's resolution and refresh rate �
    "which output?".
 7. Needs [biri](/docs/niri#get-biri), a niri fork that adds virtual outputs. Stock niri can stream
    only a monitor you pin. Driven over niri's IPC.
-8. Not run on a box with no monitor attached.
+8. Run with every monitor switched off in niri; not yet on a box with none plugged in.
 9. Cinnamon's compositor has no virtual-output API. A Mint or LMDE box can still stream games
    through a headless gamescope — see [Requirements](/docs/requirements#cinnamon-linux-mint-and-lmde).
 10. No host backend. River is detected and takes input, but has no video path.
@@ -378,15 +378,15 @@ know is not offered, and the session goes ahead without it — see
 
 ## Where it has been run
 
-Development and testing run on Linux hosts under KWin, Mutter, gamescope, wlroots and Hyprland on
-NVIDIA and AMD GPUs, and on Windows hosts on NVIDIA, AMD and Intel, with the macOS, Linux, Windows
+Development and testing run on Linux hosts under KWin, Mutter, gamescope, wlroots, Hyprland and niri
+(biri) on NVIDIA and AMD GPUs, and on Windows hosts on NVIDIA, AMD and Intel, with the macOS, Linux, Windows
 and Android clients and stock Moonlight. HDR on gamescope has been run end to end on Bazzite and
 SteamOS.
 
 ## What is not verified
 
 - **scroll as a host** — detected and driven like sway, not yet run on real hardware.
-- **niri (biri) as a host** — not yet run on real hardware.
+- **niri (biri) on AMD and Intel** — run on NVIDIA only.
 - **gamescope headless capture on the proprietary NVIDIA driver** — plausible, not well trodden,
   and no probe would catch it failing.
 - **Touch input from a Windows client** — the same code as Linux, not run on a Windows touchscreen.
