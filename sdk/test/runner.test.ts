@@ -695,9 +695,12 @@ describe("supervision", () => {
 		expect(read("scripts/punktfunk-scripting.service")).toContain(
 			`\nRestartPreventExitStatus=${SANDBOX_REFUSED_EXIT}\n`,
 		);
-		expect(read("packaging/nix/nixos-module.nix")).toContain(
-			`RestartPreventExitStatus = ${SANDBOX_REFUSED_EXIT};`,
+		// NixOS runs that same unit: the scripting package installs it, and the module's drop-in
+		// leaves the status alone.
+		expect(read("packaging/nix/packages.nix")).toContain(
+			"install -Dm0644 scripts/punktfunk-scripting.service",
 		);
+		expect(read("packaging/nix/nixos-module.nix")).not.toContain("RestartPreventExitStatus");
 		expect(read("scripts/windows/scripting-run.cmd")).toContain(
 			`if %ERRORLEVEL% EQU ${SANDBOX_REFUSED_EXIT} exit /b 0`,
 		);
