@@ -2,6 +2,9 @@ package io.unom.punktfunk
 
 import android.content.Context
 import android.util.Log
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.ConnectRequest
 import io.unom.punktfunk.kit.NativeBridge
@@ -73,10 +76,10 @@ object SessionFactory {
 /**
  * The one session this process owns, and the one dial allowed to be in flight.
  *
- * Process-wide (null = not streaming), published by the composition that owns the stream.
- * `launchMode` is `standard`, so a `punktfunk://` link arrives as a second activity instance that
- * knows nothing about the first; static state is what crosses that gap, and the process dying
- * resets it.
+ * [owner] holds the session for the process: an activity recreated mid-stream attaches to it
+ * again, and the process dying ends it. `launchMode` is `standard`, so a `punktfunk://` link
+ * arrives as a second activity instance that knows nothing about the first; static state is what
+ * crosses that gap.
  *
  * It also gates [connectToHost]. The console's native shell and its event pump outlive the screen
  * that raised them, so a `Launch` behind a live stream still reaches the dial: the host admits it
@@ -87,8 +90,10 @@ object SessionGate {
     /** The host a live stream is on. */
     data class Live(val hostId: String?)
 
-    @Volatile
-    var live: Live? = null
+    val owner = SessionOwner(::close)
+
+    /** Null when not streaming. Read off the main thread by [take]. */
+    val live: Live? get() = owner.session?.let { Live(it.hostId) }
 
     private val dialing = AtomicBoolean(false)
 
@@ -110,6 +115,40 @@ object SessionGate {
     /** Block until every queued close finished, bounded. Off the main thread. */
     fun awaitClosed() {
         runCatching { closer.submit {}.get(2, TimeUnit.SECONDS) }
+    }
+}
+
+/**
+ * The open session, held outside any composition. It ends on [end] alone: the player ends it, the
+ * host closes it, or the process dies with it. A stream screen [attach]es while it shows the
+ * session and [detach]es when its composition goes; the last screen off an ended session closes
+ * the handle, after its planes stopped. With no screen on it, [end] closes at once. Main thread.
+ */
+class SessionOwner(private val close: (Long) -> Unit) {
+    /** Null when not streaming. Compose state: the shells follow it. */
+    var session by mutableStateOf<ActiveSession?>(null)
+        private set
+
+    // One entry per screen on a handle: a second activity instance can show the same one.
+    private val screens = mutableListOf<Long>()
+
+    fun open(session: ActiveSession) {
+        this.session = session
+    }
+
+    fun attach(handle: Long) {
+        screens += handle
+    }
+
+    fun detach(handle: Long) {
+        screens -= handle
+        if (session?.handle != handle && handle !in screens) close(handle)
+    }
+
+    fun end(handle: Long) {
+        if (session?.handle != handle) return
+        session = null
+        if (handle !in screens) close(handle)
     }
 }
 

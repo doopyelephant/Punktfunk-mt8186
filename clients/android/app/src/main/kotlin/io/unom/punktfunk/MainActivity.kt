@@ -302,8 +302,8 @@ class MainActivity : ComponentActivity() {
         // — the streaming one gets backgrounded, and backgrounding ends a session — so the refusal
         // has to happen HERE, before this instance is resumed, not inside the composition (which
         // only ever sees the rare `onNewIntent` case). Finishing now leaves the streaming task in
-        // front, untouched.
-        val link = deepLinkFrom(intent)
+        // front, untouched. A recreated activity already handled its intent: it carries no link.
+        val link = if (savedInstanceState == null) deepLinkFrom(intent) else null
         val live = SessionGate.live
         if (live != null && link != null) {
             // Pointing at the host already being streamed is the one exception, and its right
