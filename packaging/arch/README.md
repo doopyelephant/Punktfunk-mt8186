@@ -143,8 +143,8 @@ neither auto-enabled. The commands are on the
 ## Files
 - `PKGBUILD` — split package: `punktfunk-host` + `punktfunk-client` + `punktfunk-seats` (builds the
   working tree via `PF_SRCDIR`, or a git tag for AUR). `punktfunk-seats` is the root supervisor
-  behind profile seats: a host `optdepends`, installed under `/usr/libexec/punktfunk`, never enabled.
-  It also carries the door's units, root helper and polkit rule.
+  behind profile seats: a host dependency at its own version, installed under `/usr/libexec/punktfunk`,
+  never enabled. It also carries the door's units, root helper and polkit rule.
 - `punktfunk-host.install` / `punktfunk-client.install` — pacman scriptlets (capabilities + first-run
   hint, incl. the ufw/firewalld enable command for whichever is present). The host's calls the
   shared `../linux/post-install.sh` (groups, udev, sysctl, firewall notes) that the RPM `%post` and

@@ -141,9 +141,9 @@ Recommends:     punktfunk-web
 # harmless where a `--with scripting`-less build didn't produce it. Its systemd --user unit ships
 # disabled — the runner is inert until you add scripts/plugins.
 Recommends:     punktfunk-scripting
-# One user, session and host per profile (a root supervisor). Weak: it ships nothing on, so a box
-# that never makes a second profile loses nothing by skipping it.
-Recommends:     punktfunk-seats
+# Profile seats and Reachable without logging in (a root supervisor, shipped off). Pinned: the host
+# and the supervisor speak one socket protocol, so they move together.
+Requires:       punktfunk-seats%{?_isa} = %{version}-%{release}
 
 %description
 punktfunk is a Linux-first, low-latency desktop and game streaming host. It speaks
@@ -174,10 +174,9 @@ virtual output at exactly this client's resolution and refresh rate — no scali
 %if %{with host}
 %package seats
 Summary:        punktfunk seat supervisor (a user, a session and a host per profile)
-# The supervisor and the host it starts per seat speak one socket protocol, so they move together.
-Requires:       %{name}%{?_isa} = %{version}-%{release}
 # What the supervisor and the door helper run: useradd/groupadd/usermod, runuser and setpriv,
-# setfacl, loginctl/systemctl, pkill in seat-session.
+# setfacl, loginctl/systemctl, pkill in seat-session. The host requires this package at its own
+# version, so the two move together without a loop back.
 Requires:       shadow-utils
 Requires:       util-linux
 Requires:       acl

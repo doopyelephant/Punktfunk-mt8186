@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the punktfunk-seats .deb: the root supervisor that runs a user, a logind session and a
 # host per profile seat, and the door's units and root helper (reachable without logging in).
-# The host .deb Recommends it. Installed, never enabled: the console turns seats and the door on.
+# The host .deb depends on it. Installed, never enabled: the console turns seats and the door on.
 #
 # The binary is built beside the host in the same cargo pass (deb.yml), on the Ubuntu 24.04 image,
 # so one package serves 24.04 through 26.04. Without a prebuilt binary the script builds it.
@@ -75,10 +75,10 @@ SHDEPS="$(cd "$SHLIB_TMP" && dpkg-shlibdeps -O --ignore-missing-info "$ROOTDIR/$
 rm -rf "$SHLIB_TMP"
 [ -n "$SHDEPS" ] || { echo "dpkg-shlibdeps produced no deps — is dpkg-dev installed?" >&2; exit 1; }
 
-# The host is pinned: the supervisor and the host it starts per seat speak one socket protocol.
-# The rest is what the supervisor and the door helper run: useradd/groupadd/usermod, runuser and
-# setpriv, setfacl, loginctl/systemctl, pkill.
-DEPENDS="$SHDEPS, punktfunk-host (= $VERSION), passwd, util-linux, acl, systemd, procps"
+# What the supervisor and the door helper run: useradd/groupadd/usermod, runuser and setpriv,
+# setfacl, loginctl/systemctl, pkill. The host depends on this package at its own version, so the
+# two move together without a loop back.
+DEPENDS="$SHDEPS, passwd, util-linux, acl, systemd, procps"
 
 INSTALLED_KB="$(du -k -s "$STAGE" | cut -f1)"
 

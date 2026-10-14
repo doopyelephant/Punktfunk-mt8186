@@ -169,8 +169,11 @@ package_punktfunk-host() {
   # pacman file conflict the moment both land on one box (found exactly that way).
   # punktfunk-gamescope: HDR, the real mode and the cursor in every gamescope session. A depend,
   # not an optdepend: pacman has no weak deps, and apt/dnf pull it as a Recommends.
+  # punktfunk-seats: profile seats and Reachable without logging in, shipped off. Pinned, as on
+  # apt and dnf: the host and the supervisor speak one socket protocol.
   depends=('pipewire' 'wireplumber' 'libei'
-           'mesa' 'libglvnd' 'libxkbcommon' 'wayland' 'punktfunk-icons' 'punktfunk-gamescope')
+           'mesa' 'libglvnd' 'libxkbcommon' 'wayland' 'punktfunk-icons' 'punktfunk-gamescope'
+           "punktfunk-seats=${pkgver}-${pkgrel}")
   optdepends=('rtkit: data-plane thread priority without a relogin (else the shipped LimitNICE drop-in applies from next login)'
               'pipewire-pulse: PulseAudio-API audio from games/apps (real `pulseaudio` also works)'
               'nvidia-utils: NVENC hardware encode + GPU EGL/CUDA zero-copy (REQUIRED to encode on NVIDIA)'
@@ -187,8 +190,7 @@ package_punktfunk-host() {
               'xdg-desktop-portal-kde: portal for the headless KDE session helper'
               'xdg-desktop-portal-wlr: portal for the headless Sway session helper'
               'punktfunk-web: browser management console (device pairing + status)'
-              'punktfunk-scripting: plugin/script runner for host automation (bun)'
-              'punktfunk-seats: a user, a session and a host per profile (root supervisor, ships disabled)')
+              'punktfunk-scripting: plugin/script runner for host automation (bun)')
   install=punktfunk-host.install
   # User-editable config: the headless game-mode drop-in (see below) — don't clobber local edits.
   backup=('etc/gamescope-session-plus/sessions.d/steam')
@@ -422,10 +424,10 @@ package_punktfunk-client() {
 
 package_punktfunk-seats() {
   pkgdesc="punktfunk seat supervisor and door — a user, a logind session and a host per profile (root daemon, ships disabled)"
-  # The host is pinned: the supervisor and the host it starts per seat speak one socket protocol.
-  # The rest is what the supervisor and the door helper run: useradd/groupadd/usermod, runuser and
-  # setpriv, setfacl, loginctl/systemctl, pkill.
-  depends=("punktfunk-host=${pkgver}-${pkgrel}" 'shadow' 'util-linux' 'acl' 'systemd' 'procps-ng')
+  # What the supervisor and the door helper run: useradd/groupadd/usermod, runuser and setpriv,
+  # setfacl, loginctl/systemctl, pkill. The host depends on this package at its own version; a
+  # depend back would be a cycle pacman warns about.
+  depends=('shadow' 'util-linux' 'acl' 'systemd' 'procps-ng')
   install=punktfunk-seats.install
   local R; R="$(_repo)"; local T="$srcdir/target/release"
 

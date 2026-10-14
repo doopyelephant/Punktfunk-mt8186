@@ -1,8 +1,9 @@
 #!/bin/sh
-# Restart the running punktfunk user services of every user after a package update.
-# try-restart leaves a stopped or opted-out service stopped. Under the in-console updater
-# this does nothing: the host restarts all three itself once punktfunk-update.service returns.
-# Always exits 0 — a restart must never fail the package transaction.
+# Restart the running punktfunk services after a package update. try-restart leaves a stopped or
+# opted-out service stopped. Under the in-console updater the host restarts its own three once
+# punktfunk-update.service returns. Always exits 0 — a restart must never fail the transaction.
+# The door's units: the seats package can restart them before the host it runs is unpacked.
+systemctl --no-block try-restart punktfunk-door.service punktfunk-web-door.service 2>/dev/null
 [ "$(systemctl show -P ActiveState punktfunk-update.service 2>/dev/null)" = activating ] && exit 0
 loginctl list-users --no-legend 2>/dev/null | while read -r _ user _; do
     systemctl --user -M "$user@" daemon-reload 2>/dev/null || continue
