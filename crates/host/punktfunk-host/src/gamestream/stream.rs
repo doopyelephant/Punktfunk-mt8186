@@ -150,12 +150,12 @@ pub fn start(
             // This plane's session in the registry the management API acts on: it is what
             // gives the console a session id, and with it a per-session stop and keyframe
             // instead of only the host-wide one. `stop` is read by the loop below.
-            let stop = Arc::new(AtomicBool::new(false));
+            let lifecycle = crate::lifecycle::Lifecycle::with_quit(life.quit.clone());
+            let stop = lifecycle.stop_flag().clone();
             let live = LiveTelemetry {
                 bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(cfg.bitrate_kbps)),
                 capture_health: Arc::new(std::sync::Mutex::new(None)),
             };
-            let end_reason = Arc::new(std::sync::atomic::AtomicU8::new(0));
             // The control loop bumps these without a session handle, so they are cleared
             // here rather than made fresh: the summary must not carry the last session's input.
             counters.reset();
@@ -166,10 +166,9 @@ pub fn start(
                     )),
                     bitrate_kbps: live.bitrate_kbps.clone(),
                     codec: cfg.codec,
-                    stop: stop.clone(),
-                    // Already this plane's "the end was deliberate" flag, so an operator stop
+                    // Shares this plane's "the end was deliberate" flag, so an operator stop
                     // reads here exactly as `/cancel` does.
-                    quit: life.quit.clone(),
+                    life: lifecycle.clone(),
                     force_idr: force_idr.clone(),
                     // The 12-hex prefix native uses, so one device reads the same on both planes
                     // — and unpairing it mid-stream finds this session too.
@@ -195,7 +194,6 @@ pub fn start(
                     },
                     bit_depth: if cfg.hdr { 10 } else { 8 },
                     chroma: crate::encode::ChromaFormat::Yuv420,
-                    end_reason: end_reason.clone(),
                     counters: counters.clone(),
                     // The launch owner's address: what the console pairs with a native
                     // session sharing the same client.
@@ -225,13 +223,12 @@ pub fn start(
                 Ok(()) => crate::events::DisconnectReason::Quit,
                 Err(_) => crate::events::DisconnectReason::Error,
             };
-            // Why `session.ended` says it ended. First writer wins, so an operator stop (which
-            // latches `stopped_by_operator` before it raises the flag) keeps its reason.
-            match &result {
+            // Why `session.ended` says it ended. The first reason wins, so an operator stop
+            // keeps its own.
+            lifecycle.end(match &result {
                 Ok(()) => crate::events::SessionEndReason::HostEnded,
                 Err(_) => crate::events::SessionEndReason::HostError,
-            }
-            .latch(&end_reason);
+            });
             if let Err(e) = result {
                 tracing::error!(error = %format!("{e:#}"), "video stream failed");
             }

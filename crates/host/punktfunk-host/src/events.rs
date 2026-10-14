@@ -172,11 +172,13 @@ impl SessionEndReason {
         })
     }
 
-    /// First writer wins. The path that knows why latches before teardown reaches the
-    /// generic one, so a game exit is never overwritten by the close that follows it.
-    pub fn latch(self, slot: &std::sync::atomic::AtomicU8) {
-        use std::sync::atomic::Ordering;
-        let _ = slot.compare_exchange(0, self as u8, Ordering::SeqCst, Ordering::Relaxed);
+    /// Whether the end was meant: the display skips its keep-alive linger and the game
+    /// lease opens no reconnect window.
+    pub fn deliberate(self) -> bool {
+        matches!(
+            self,
+            Self::Local | Self::GameExited | Self::StoppedByOperator
+        )
     }
 }
 
@@ -864,20 +866,6 @@ mod tests {
         // 0 is "nothing latched" and 7 is a byte no one writes; neither is an end.
         assert_eq!(SessionEndReason::from_u8(0), None);
         assert_eq!(SessionEndReason::from_u8(7), None);
-    }
-
-    /// First write wins, which is what keeps a game exit from becoming the `Lost` the
-    /// local close that follows it would otherwise latch.
-    #[test]
-    fn the_first_latched_reason_is_the_one_reported() {
-        let slot = std::sync::atomic::AtomicU8::new(0);
-        SessionEndReason::GameExited.latch(&slot);
-        SessionEndReason::Lost.latch(&slot);
-        SessionEndReason::HostEnded.latch(&slot);
-        assert_eq!(
-            SessionEndReason::from_u8(slot.load(std::sync::atomic::Ordering::SeqCst)),
-            Some(SessionEndReason::GameExited)
-        );
     }
 
     /// A paired device's id in the snapshots below.

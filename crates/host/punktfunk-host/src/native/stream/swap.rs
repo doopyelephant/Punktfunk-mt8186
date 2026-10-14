@@ -203,7 +203,7 @@ mod tests {
     use crate::capture::{CapturedFrame, Capturer, SyntheticCapturer};
     use crate::native::bitrate::EncoderCeiling;
     use punktfunk_core::quic::AckReason;
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8};
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -319,7 +319,8 @@ mod tests {
             refresh_hz: 60,
         };
         let now = Instant::now();
-        let quit = Arc::new(AtomicBool::new(false));
+        let life = crate::lifecycle::Lifecycle::new();
+        let quit = life.quit_flag().clone();
         let live = frame(SMALL);
         let mut ceiling = EncoderCeiling::new();
         ceiling.note_applied(50_000, 30_000);
@@ -442,9 +443,7 @@ mod tests {
                 max_slices: 1,
                 reframe_to: None,
             },
-            stop: Default::default(),
-            quit: quit.clone(),
-            end_reason: Default::default(),
+            life: life.clone(),
             counters: Default::default(),
             conn,
             negotiated: mode,

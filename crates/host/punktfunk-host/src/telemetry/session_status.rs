@@ -29,6 +29,7 @@ use crate::encode::{ChromaFormat, Codec};
 use crate::events::{
     AudioEgress, BitrateSpan, GyroCadence, InputCounts, Plane, SessionEndReason, SessionSummary,
 };
+use crate::lifecycle::Lifecycle;
 use punktfunk_core::quic::GrantClass;
 
 mod abr_share;
@@ -65,11 +66,8 @@ struct LiveSession {
     /// Encoder target, kbps. Same Arc the ABR path writes.
     bitrate_kbps: Arc<AtomicU32>,
     codec: Codec,
-    /// Teardown flag.
-    stop: Arc<AtomicBool>,
-    /// Deliberate-stop flag ([`stop_all_quit`]). Distinct from `stop`: intended
-    /// teardown skips display keep-alive linger and trips end-game-on-session-end.
-    quit: Arc<AtomicBool>,
+    /// The session's flags and end reason: the operator stops and the summary go through it.
+    life: Lifecycle,
     /// One-shot force-keyframe ([`force_idr_all`]). The encode loop drains it
     /// alongside a client decode-recovery request.
     force_idr: Arc<AtomicBool>,
@@ -99,9 +97,6 @@ struct LiveSession {
     /// 8 or 10, and the encoder's chroma. Fixed for the session.
     bit_depth: u8,
     chroma: ChromaFormat,
-    /// [`SessionEndReason`] as `u8`, latched by whichever path knows. 0 = the video
-    /// loop never reached its clean tail, which is [`SessionEndReason::HostError`].
-    end_reason: Arc<AtomicU8>,
     /// What the video loop counted, stored once at its tail ([`record_tally`]).
     /// `None` on a loop that bailed before it.
     tally: Option<SessionTally>,
@@ -561,9 +556,8 @@ fn summary(s: &LiveSession) -> SessionSummary {
         frames_dropped: s.tally.and_then(|t| t.frames_dropped),
         bringup_ms: s.ttff_ms.load(Ordering::Relaxed),
         path_mtu: s.tally.map(|t| t.path_mtu),
-        // Nothing latched means the loop never reached its tail, which is a fault.
-        ended: SessionEndReason::from_u8(s.end_reason.load(Ordering::SeqCst))
-            .unwrap_or(SessionEndReason::HostError),
+        // No reason means the loop never reached its tail, which is a fault.
+        ended: s.life.reason().unwrap_or(SessionEndReason::HostError),
     }
 }
 
@@ -575,10 +569,9 @@ pub struct Registration {
     /// Encoder target, kbps. Same Arc the ABR path writes.
     pub bitrate_kbps: Arc<AtomicU32>,
     pub codec: Codec,
-    /// Teardown flag.
-    pub stop: Arc<AtomicBool>,
-    /// Deliberate-stop flag ([`stop_all_quit`]). Distinct from `stop`.
-    pub quit: Arc<AtomicBool>,
+    /// The session's flags and end reason, shared with every path that may end it: the
+    /// connection watcher, the game-exit close, an operator stop, the loop's own tail.
+    pub life: Lifecycle,
     /// One-shot force-keyframe ([`force_idr_all`]).
     pub force_idr: Arc<AtomicBool>,
     /// Client label: 12-hex cert-fingerprint prefix, or peer IP if anonymous.
@@ -603,9 +596,6 @@ pub struct Registration {
     /// 8 or 10, and the encoder's chroma. Both fixed for the session.
     pub bit_depth: u8,
     pub chroma: ChromaFormat,
-    /// [`SessionEndReason`] latch, shared with the paths that know why: the connection
-    /// watcher, the game-exit close, an operator stop, and the loop's own clean tail.
-    pub end_reason: Arc<AtomicU8>,
     /// The session's shared counter block, already being bumped by its side threads.
     pub counters: Arc<SessionCounters>,
     /// Client address. `None` only where there is no connection (tests).
@@ -619,8 +609,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         mode,
         bitrate_kbps,
         codec,
-        stop,
-        quit,
+        life,
         force_idr,
         client,
         client_name,
@@ -634,7 +623,6 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         controls,
         bit_depth,
         chroma,
-        end_reason,
         counters,
         peer,
     } = reg;
@@ -644,8 +632,7 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         mode,
         bitrate_kbps,
         codec,
-        stop,
-        quit,
+        life,
         force_idr,
         client,
         client_name,
@@ -661,7 +648,6 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
         started_unix: crate::clock::unix_secs(),
         bit_depth,
         chroma,
-        end_reason,
         tally: None,
         counters,
         peer: peer.map(|ip| ip.to_canonical()),
@@ -832,9 +818,7 @@ pub fn stop_by_fingerprint(fp_hex: &str) -> usize {
     let mut n = 0;
     for s in registry().iter() {
         if s.client.len() == 12 && fp_hex.starts_with(s.client.as_str()) {
-            SessionEndReason::StoppedByOperator.latch(&s.end_reason);
-            s.quit.store(true, Ordering::SeqCst);
-            s.stop.store(true, Ordering::SeqCst);
+            s.life.end(SessionEndReason::StoppedByOperator);
             n += 1;
         }
     }
@@ -864,27 +848,19 @@ pub fn owns_live_session(fp_hex: &str) -> bool {
 
 /// Tear down every live native session deliberately (mgmt `DELETE /session`).
 ///
-/// Sets `quit` before `stop` so teardown matches a client's own Stop: the
-/// display skips keep-alive linger and end-game-on-session-end sees intent.
-/// The summary says `stopped_by_operator`; the client only ever sees `host_ended`.
+/// A deliberate end, like a client's own Stop: the display skips keep-alive linger and
+/// end-game-on-session-end sees intent. The summary says `stopped_by_operator`; the
+/// client only ever sees `host_ended`.
 pub fn stop_all_quit() {
     for s in registry().iter() {
-        SessionEndReason::StoppedByOperator.latch(&s.end_reason);
-        s.quit.store(true, Ordering::SeqCst);
-        s.stop.store(true, Ordering::SeqCst);
+        s.life.end(SessionEndReason::StoppedByOperator);
     }
 }
 
 /// Tear down ONE live native session deliberately (`DELETE /session/{id}`).
-/// `false` = no such session. Same `quit`-before-`stop` order and same
-/// `stopped_by_operator` summary as [`stop_all_quit`].
+/// `false` = no such session. The same end as [`stop_all_quit`].
 pub fn stop_quit(id: u64) -> bool {
-    with_session(id, |s| {
-        SessionEndReason::StoppedByOperator.latch(&s.end_reason);
-        s.quit.store(true, Ordering::SeqCst);
-        s.stop.store(true, Ordering::SeqCst);
-    })
-    .is_some()
+    with_session(id, |s| s.life.end(SessionEndReason::StoppedByOperator)).is_some()
 }
 
 /// Force a keyframe on ONE live native session (`POST /session/{id}/idr`).
@@ -960,11 +936,9 @@ pub(crate) mod tests {
     #[test]
     fn a_compat_session_is_stoppable_by_its_own_id() {
         let _registry = registry_lock();
-        let stop = Arc::new(AtomicBool::new(false));
-        let quit = Arc::new(AtomicBool::new(false));
+        let life = Lifecycle::new();
         let _guard = register(Registration {
-            stop: stop.clone(),
-            quit: quit.clone(),
+            life: life.clone(),
             client_name: Some("Living Room TV".into()),
             plane: crate::events::Plane::Gamestream,
             hdr: true,
@@ -977,12 +951,9 @@ pub(crate) mod tests {
             .expect("the compat session is listed like a native one");
         assert_eq!(row.client_name.as_deref(), Some("Living Room TV"));
         assert!(stop_quit(row.id), "its id addresses it");
+        assert!(life.stopping(), "the stream loop is told to end");
         assert!(
-            stop.load(Ordering::SeqCst),
-            "the stream loop is told to end"
-        );
-        assert!(
-            quit.load(Ordering::SeqCst),
+            life.quit_flag().load(Ordering::SeqCst),
             "and that the end was deliberate"
         );
         assert!(!stop_quit(u64::MAX), "an id nothing holds stops nothing");
@@ -996,8 +967,7 @@ pub(crate) mod tests {
                 mode: Arc::new(AtomicU64::new(0)),
                 bitrate_kbps: Arc::new(AtomicU32::new(20_000)),
                 codec: Codec::H265,
-                stop: Arc::new(AtomicBool::new(false)),
-                quit: Arc::new(AtomicBool::new(false)),
+                life: Lifecycle::new(),
                 force_idr: Arc::new(AtomicBool::new(false)),
                 client: client.into(),
                 client_name: None,
@@ -1011,36 +981,31 @@ pub(crate) mod tests {
                 controls: SessionControls::open(),
                 bit_depth: 8,
                 chroma: ChromaFormat::Yuv420,
-                end_reason: Arc::new(AtomicU8::new(0)),
                 counters: Arc::new(SessionCounters::default()),
                 peer: None,
             }
         }
     }
 
-    fn fake_session(client: &str) -> (LiveSessionGuard, Arc<AtomicBool>, Arc<AtomicBool>) {
-        fake_session_with_reason(
+    fn fake_session(client: &str) -> (LiveSessionGuard, Lifecycle) {
+        fake_session_with(
             client,
-            Arc::new(AtomicU8::new(0)),
+            Lifecycle::new(),
             Arc::new(SessionCounters::default()),
         )
     }
 
-    fn fake_session_with_reason(
+    fn fake_session_with(
         client: &str,
-        end_reason: Arc<AtomicU8>,
+        life: Lifecycle,
         counters: Arc<SessionCounters>,
-    ) -> (LiveSessionGuard, Arc<AtomicBool>, Arc<AtomicBool>) {
-        let stop = Arc::new(AtomicBool::new(false));
-        let quit = Arc::new(AtomicBool::new(false));
+    ) -> (LiveSessionGuard, Lifecycle) {
         let guard = register(Registration {
-            stop: stop.clone(),
-            quit: quit.clone(),
-            end_reason,
+            life: life.clone(),
             counters,
             ..Registration::fake(client)
         });
-        (guard, stop, quit)
+        (guard, life)
     }
 
     /// A panic under the registry lock costs the next caller nothing: a new session
@@ -1053,11 +1018,11 @@ pub(crate) mod tests {
             panic!("poison the registry");
         })
         .join();
-        let (guard, stop, quit) = fake_session("aabbccddeeff");
+        let (guard, life) = fake_session("aabbccddeeff");
         assert!(count() >= 1);
         assert!(force_idr(guard.id), "the per-id routes find it");
         stop_all_quit();
-        assert!(stop.load(Ordering::SeqCst) && quit.load(Ordering::SeqCst));
+        assert!(life.stopping() && life.quit_flag().load(Ordering::SeqCst));
     }
 
     pub(super) fn fake_joiner(client: &str, join: bool) -> (LiveSessionGuard, SessionControls) {
@@ -1152,22 +1117,22 @@ pub(crate) mod tests {
     fn stop_by_fingerprint_revokes_exactly_the_unpaired_client() {
         let _registry = registry_lock();
         let fp = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-        let (_g1, stop1, quit1) = fake_session(&fp[..12]);
-        let (_g2, stop2, _q2) = fake_session("112233445566"); // a different paired client
-        let (_g3, stop3, _q3) = fake_session("192.168.1.50"); // anonymous: IP label, never matches
+        let (_g1, l1) = fake_session(&fp[..12]);
+        let (_g2, l2) = fake_session("112233445566"); // a different paired client
+        let (_g3, l3) = fake_session("192.168.1.50"); // anonymous: IP label, never matches
 
         assert_eq!(stop_by_fingerprint(fp), 1);
-        assert!(stop1.load(Ordering::SeqCst) && quit1.load(Ordering::SeqCst));
-        assert!(!stop2.load(Ordering::SeqCst));
-        assert!(!stop3.load(Ordering::SeqCst));
+        assert!(l1.stopping() && l1.quit_flag().load(Ordering::SeqCst));
+        assert!(!l2.stopping());
+        assert!(!l3.stopping());
     }
 
     /// Each registered session carries its own pad feed, so a Controllers stream
     /// opened on one id can never draw another session's input.
     #[tokio::test]
     async fn each_session_holds_its_own_pad_feed() {
-        let (a, _s, _q) = fake_session("aaaaaaaaaaaa");
-        let (b, _s2, _q2) = fake_session("bbbbbbbbbbbb");
+        let (a, _) = fake_session("aaaaaaaaaaaa");
+        let (b, _) = fake_session("bbbbbbbbbbbb");
         let feed_a = controls(a.id).expect("A is live").pads;
         let feed_b = controls(b.id).expect("B is live").pads;
         assert!(!Arc::ptr_eq(&feed_a, &feed_b));
@@ -1232,10 +1197,9 @@ pub(crate) mod tests {
     #[test]
     fn a_finished_session_lands_in_the_ring_with_its_numbers() {
         let _registry = registry_lock();
-        let reason = Arc::new(AtomicU8::new(0));
+        let life = Lifecycle::new();
         let counters = Arc::new(SessionCounters::default());
-        let (guard, _stop, _quit) =
-            fake_session_with_reason("192.0.2.9", reason.clone(), counters.clone());
+        let (guard, _) = fake_session_with("192.0.2.9", life.clone(), counters.clone());
         let id = guard.id;
         // What the side threads bump while the session runs, each through its own note.
         counters.input_events.fetch_add(7457, Ordering::Relaxed);
@@ -1258,7 +1222,7 @@ pub(crate) mod tests {
                 path_mtu: 1369,
             },
         );
-        SessionEndReason::StoppedByOperator.latch(&reason);
+        life.end(SessionEndReason::StoppedByOperator);
         drop(guard);
 
         // By id: other tests in this binary drop their own sessions into the same ring.
@@ -1299,7 +1263,7 @@ pub(crate) mod tests {
     #[test]
     fn a_session_that_never_finished_reports_a_host_error() {
         let _registry = registry_lock();
-        let (guard, _stop, _quit) = fake_session("192.0.2.10");
+        let (guard, _) = fake_session("192.0.2.10");
         let id = guard.id;
         drop(guard);
 
