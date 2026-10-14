@@ -6,7 +6,7 @@
 
 use crate::collate::{collate, worth_browsing, GroupBy, GroupKey, SortKey};
 use crate::library::{initials, LibraryGame};
-use crate::theme::{accent, art_sampling, fg, fill, stroke, Fonts, PanelStroke, W};
+use crate::theme::{art_sampling, fill, stroke, Fonts, Frame, PanelStroke, W};
 use skia_safe::{Canvas, Color4f, Image, Matrix, Point, RRect, Rect, TileMode};
 use std::collections::HashMap;
 
@@ -63,8 +63,10 @@ pub(crate) fn collections(games: &[LibraryGame], sort: SortKey) -> Vec<Collectio
 
 /// Collection `c` in `rect`, its deck drawn from the posters `art` holds for `games`.
 /// The focus plate is the tile's focus mark, so the tile draws no halo of its own.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_tile(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     c: &Collection,
     games: &[LibraryGame],
@@ -74,9 +76,10 @@ pub(crate) fn paint_tile(
 ) {
     crate::theme::panel(
         canvas,
+        ui,
         rect,
         TILE_CORNER as f32,
-        Some(accent(0.16)),
+        Some(ui.accent(0.16)),
         PanelStroke::Edge,
         k as f32,
     );
@@ -113,32 +116,32 @@ pub(crate) fn paint_tile(
         canvas.concat(&fan_matrix(front, n, fk));
         match have.get(n) {
             Some(img) => {
-                plate(canvas, rr, fk);
+                plate(canvas, ui, rr, fk);
                 draw_cover(canvas, img, front, rr);
                 // Recede toward the ground (`shade` tracks the palette). A colour
                 // filter would cost a `save_layer` per cover — the deck must not.
                 if n > 0 {
-                    canvas.draw_rrect(rr, &fill(crate::theme::shade(0.14 * n as f32)));
+                    canvas.draw_rrect(rr, &fill(ui.shade(0.14 * n as f32)));
                 }
                 // Plate under, ink hairline on top: an edge on both palettes.
                 // Stronger rim on back cards; they need the separation more.
                 canvas.draw_rrect(
                     rr.with_inset((hair / 2.0, hair / 2.0)),
-                    &stroke(fg(if n == 0 { 0.18 } else { 0.28 }), hair),
+                    &stroke(ui.fg(if n == 0 { 0.18 } else { 0.28 }), hair),
                 );
             }
             // Front slot with no art: finished monogram, not a gap. Art-less ROMs stay this.
             None if n == 0 => {
-                plate(canvas, rr, fk);
-                draw_monogram(canvas, fonts, &c.label, front, rr, hair);
+                plate(canvas, ui, rr, fk);
+                draw_monogram(canvas, ui, fonts, &c.label, front, rr, hair);
             }
             // Empty silhouette, no plate (nothing to cast a shadow). Keeps deck depth
             // so the tile does not change shape as posters arrive.
             None => {
-                canvas.draw_rrect(rr, &fill(crate::theme::shade(0.10)));
+                canvas.draw_rrect(rr, &fill(ui.shade(0.10)));
                 canvas.draw_rrect(
                     rr.with_inset((hair / 2.0, hair / 2.0)),
-                    &stroke(fg(0.12), hair),
+                    &stroke(ui.fg(0.12), hair),
                 );
             }
         }
@@ -160,7 +163,7 @@ pub(crate) fn paint_tile(
         sub_base,
         W::Regular,
         13.0 * k,
-        fg(0.55),
+        ui.fg(0.55),
         max_w,
     );
     fonts.draw_clipped(
@@ -170,7 +173,7 @@ pub(crate) fn paint_tile(
         sub_base - 22.0 * k,
         W::Bold,
         23.0 * k,
-        fg(1.0),
+        ui.fg(1.0),
         max_w,
     );
     // Platform vs store, so two "Steam" buckets stay distinct. Top-right, the
@@ -191,7 +194,7 @@ pub(crate) fn paint_tile(
         kind_y,
         W::SemiBold,
         11.0 * k,
-        fg(0.45),
+        ui.fg(0.45),
     );
 }
 
@@ -210,9 +213,9 @@ fn fan_matrix(front: Rect, n: usize, k: f64) -> Matrix {
 }
 
 /// Contact shadow under one card. Drawn, not sampled from the cover.
-fn plate(canvas: &Canvas, rr: RRect, k: f64) {
+fn plate(canvas: &Canvas, ui: &Frame, rr: RRect, k: f64) {
     // Black is weight on a dark field and dirt on a pale one.
-    let alpha = crate::theme::shadow(PLATE_ALPHA);
+    let alpha = ui.shadow(PLATE_ALPHA);
     canvas.draw_rrect(
         rr.with_outset(((PLATE_OUTSET * k) as f32, (PLATE_OUTSET * k) as f32))
             .with_offset(((PLATE_DX * k) as f32, (PLATE_DY * k) as f32)),
@@ -253,13 +256,21 @@ fn draw_cover(canvas: &Canvas, img: &Image, front: Rect, rr: RRect) {
 }
 
 /// Front card when the group has no art: initials on an accent-tinted face.
-fn draw_monogram(canvas: &Canvas, fonts: &Fonts, label: &str, front: Rect, rr: RRect, hair: f32) {
-    // Accent-tinted face, not a fixed near-black: `fg()` is itself near-black on
+fn draw_monogram(
+    canvas: &Canvas,
+    ui: &Frame,
+    fonts: &Fonts,
+    label: &str,
+    front: Rect,
+    rr: RRect,
+    hair: f32,
+) {
+    // Accent-tinted face, not a fixed near-black: the foreground is itself near-black on
     // pale palettes, so a dark face and a dark glyph vanish into each other.
-    canvas.draw_rrect(rr, &fill(accent(0.20)));
+    canvas.draw_rrect(rr, &fill(ui.accent(0.20)));
     canvas.draw_rrect(
         rr.with_inset((hair / 2.0, hair / 2.0)),
-        &stroke(accent(0.5), hair),
+        &stroke(ui.accent(0.5), hair),
     );
     let mono = initials(label);
     // Sized off the card, not `k`: deck cards are smaller than a shelf poster.
@@ -273,7 +284,7 @@ fn draw_monogram(canvas: &Canvas, fonts: &Fonts, label: &str, front: Rect, rr: R
             front.center_y() + (size * 0.36) as f32,
         ),
         &font,
-        &fill(fg(0.85)),
+        &fill(ui.fg(0.85)),
     );
 }
 
@@ -415,22 +426,21 @@ mod tests {
 
     /// Initials of a group with no art must read on every palette, not just the dark one.
     ///
-    /// A hardcoded near-black face under `fg()` vanishes on pale palettes, where
-    /// `fg()` is itself near-black.
+    /// A hardcoded near-black face under the foreground vanishes on pale palettes, where
+    /// the foreground is itself near-black.
     #[test]
     fn the_monogram_reads_on_every_palette() {
         for p in &crate::palette::PALETTES {
-            crate::theme::set_ink(crate::theme::Ink::of(p));
+            let ui = &Frame::new(crate::theme::Ink::of(p), false, false, 0.0);
             let ground = Color4f::new(p.ground.0 as f32, p.ground.1 as f32, p.ground.2 as f32, 1.0);
             // Tile accent over the field, then the badge face, then the glyph. Glass
             // between the first two is omitted: it pushes the backdrop away from the
             // ink at both poles, so this is the harder case.
-            let panel = over(accent(0.16), ground);
-            let face = over(accent(0.20), panel);
-            let glyph = over(fg(0.85), face);
+            let panel = over(ui.accent(0.16), ground);
+            let face = over(ui.accent(0.20), panel);
+            let glyph = over(ui.fg(0.85), face);
             let c = contrast(glyph, face);
             assert!(c > 3.0, "the monogram is unreadable on {}: {c:.2}:1", p.id);
         }
-        crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
     }
 }

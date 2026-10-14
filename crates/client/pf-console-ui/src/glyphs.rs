@@ -10,7 +10,7 @@
 
 use crate::icons::{self, Icon};
 use crate::platform::Platform;
-use crate::theme::{fg, fill, stroke, Fonts, GLYPH_STROKE, HAIRLINE, W};
+use crate::theme::{fill, stroke, Fonts, Frame, GLYPH_STROKE, HAIRLINE, W};
 use punktfunk_core::config::GamepadPref;
 use skia_safe::{Canvas, Color4f, PathBuilder, Point, RRect, Rect};
 
@@ -122,6 +122,7 @@ pub fn pad_mark(canvas: &Canvas, icon: Icon, x: f64, cy: f64, w: f64, k: f64, in
 /// the accent means "fine".
 pub fn battery_pip(
     canvas: &Canvas,
+    ui: &Frame,
     x: f64,
     cy: f64,
     w: f64,
@@ -131,11 +132,11 @@ pub fn battery_pip(
     let h = w * 0.5;
     let cell = Rect::from_xywh(x as f32, (cy - h / 2.0) as f32, (w * 0.86) as f32, h as f32);
     let ink = if b.charging {
-        crate::theme::accent(1.0)
+        ui.accent(1.0)
     } else if b.percent < 20 {
         skia_safe::Color4f::new(0.93, 0.31, 0.28, 1.0)
     } else {
-        crate::theme::fg(0.7)
+        ui.fg(0.7)
     };
     let outline = stroke(ink, (HAIRLINE * k) as f32);
     let r = (2.0 * k) as f32;
@@ -219,8 +220,10 @@ pub struct HintBar {
 }
 
 /// Anchored at its bottom-left.
+#[allow(clippy::too_many_arguments)]
 pub fn hint_bar(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     hints: &[Hint],
     style: GlyphStyle,
@@ -267,10 +270,11 @@ pub fn hint_bar(
     let corner = (h / 2.0 / k) as f32;
     canvas.draw_rrect(
         RRect::new_rect_xy(rect, (h / 2.0) as f32, (h / 2.0) as f32),
-        &fill(crate::theme::shade(0.30)),
+        &fill(ui.shade(0.30)),
     );
     crate::theme::panel(
         canvas,
+        ui,
         rect,
         corner,
         None,
@@ -292,7 +296,7 @@ pub fn hint_bar(
                 h as f32,
             ),
         ));
-        draw_glyph(canvas, fonts, hint.key, style, pen, cy, k);
+        draw_glyph(canvas, ui, fonts, hint.key, style, pen, cy, k);
         pen += gw + gap_glyph;
         // +0.36 em ≈ half Geist cap-height (0.72 em), centering on the badge.
         fonts.draw(
@@ -302,7 +306,7 @@ pub fn hint_bar(
             cy + LABEL_SIZE * k * 0.36,
             W::SemiBold,
             LABEL_SIZE * k,
-            fg(0.85),
+            ui.fg(0.85),
         );
         pen += lw + gap_hint;
     }
@@ -411,8 +415,10 @@ fn face_letter(face: Face, style: GlyphStyle) -> &'static str {
 }
 
 /// One glyph, left edge at `x`, vertically centered on `cy`.
+#[allow(clippy::too_many_arguments)]
 fn draw_glyph(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     key: HintKey,
     style: GlyphStyle,
@@ -427,11 +433,15 @@ fn draw_glyph(
         Resolved::Badge(face) => {
             let r = BADGE_D * k / 2.0;
             let center = Point::new((x + r) as f32, cy as f32);
-            canvas.draw_circle(center, r as f32, &fill(fg(0.10)));
-            canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (HAIRLINE * k) as f32));
+            canvas.draw_circle(center, r as f32, &fill(ui.fg(0.10)));
+            canvas.draw_circle(
+                center,
+                r as f32,
+                &stroke(ui.fg(0.32), (HAIRLINE * k) as f32),
+            );
             if style == GlyphStyle::Shapes {
                 let (r, w) = ((5.2 * k) as f32, (1.8 * k) as f32);
-                draw_ps_shape(canvas, face, center, r, w, fg(0.92));
+                draw_ps_shape(canvas, face, center, r, w, ui.fg(0.92));
             } else {
                 let letter = face_letter(face, style);
                 let size = 12.0 * k;
@@ -443,15 +453,19 @@ fn draw_glyph(
                     cy + size * 0.36,
                     W::SemiBold,
                     size,
-                    fg(0.92),
+                    ui.fg(0.92),
                 );
             }
         }
         Resolved::Ok => {
             let r = BADGE_D * k / 2.0;
             let center = Point::new((x + r) as f32, cy as f32);
-            canvas.draw_circle(center, r as f32, &fill(fg(0.10)));
-            canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (HAIRLINE * k) as f32));
+            canvas.draw_circle(center, r as f32, &fill(ui.fg(0.10)));
+            canvas.draw_circle(
+                center,
+                r as f32,
+                &stroke(ui.fg(0.32), (HAIRLINE * k) as f32),
+            );
             let size = 9.5 * k;
             let w = fonts.measure("OK", W::SemiBold, size) as f64;
             fonts.draw(
@@ -461,14 +475,18 @@ fn draw_glyph(
                 cy + size * 0.36,
                 W::SemiBold,
                 size,
-                fg(0.92),
+                ui.fg(0.92),
             );
         }
         Resolved::BackArrow => {
             let r = BADGE_D * k / 2.0;
             let center = Point::new((x + r) as f32, cy as f32);
-            canvas.draw_circle(center, r as f32, &fill(fg(0.10)));
-            canvas.draw_circle(center, r as f32, &stroke(fg(0.32), (HAIRLINE * k) as f32));
+            canvas.draw_circle(center, r as f32, &fill(ui.fg(0.10)));
+            canvas.draw_circle(
+                center,
+                r as f32,
+                &stroke(ui.fg(0.32), (HAIRLINE * k) as f32),
+            );
             // 12.5 dp sits inside the 22 dp badge.
             crate::icons::draw_icon(
                 canvas,
@@ -477,7 +495,7 @@ fn draw_glyph(
                 center.y,
                 (12.5 * k) as f32,
                 k as f32,
-                fg(0.92),
+                ui.fg(0.92),
             );
         }
         Resolved::Shoulders => {
@@ -488,12 +506,12 @@ fn draw_glyph(
                 let rect = Rect::from_xywh(pen as f32, (cy - h / 2.0) as f32, w as f32, h as f32);
                 canvas.draw_rrect(
                     RRect::new_rect_xy(rect, (4.0 * k) as f32, (4.0 * k) as f32),
-                    &fill(fg(0.10)),
+                    &fill(ui.fg(0.10)),
                 );
                 // Same hairline as the keycaps so every container shares one edge.
                 canvas.draw_rrect(
                     RRect::new_rect_xy(rect, (4.0 * k) as f32, (4.0 * k) as f32),
-                    &stroke(fg(0.28), (HAIRLINE * k) as f32),
+                    &stroke(ui.fg(0.28), (HAIRLINE * k) as f32),
                 );
                 let size = 10.0 * k;
                 let tw = fonts.measure(label, W::SemiBold, size) as f64;
@@ -504,7 +522,7 @@ fn draw_glyph(
                     cy + size * 0.36,
                     W::SemiBold,
                     size,
-                    fg(0.92),
+                    ui.fg(0.92),
                 );
                 pen += w + 3.0 * k;
             }
@@ -524,7 +542,7 @@ fn draw_glyph(
                 cy as f32,
                 (BADGE_D * k) as f32,
                 k as f32,
-                fg(0.92),
+                ui.fg(0.92),
             );
         }
         Resolved::Adjust => {
@@ -538,7 +556,7 @@ fn draw_glyph(
                 cyf,
                 b,
                 k as f32,
-                fg(0.92),
+                ui.fg(0.92),
             );
             crate::icons::draw_icon(
                 canvas,
@@ -547,7 +565,7 @@ fn draw_glyph(
                 cyf,
                 b,
                 k as f32,
-                fg(0.92),
+                ui.fg(0.92),
             );
         }
         Resolved::Key(text) => {
@@ -556,11 +574,11 @@ fn draw_glyph(
             let rect = Rect::from_xywh(x as f32, (cy - h / 2.0) as f32, w as f32, h as f32);
             canvas.draw_rrect(
                 RRect::new_rect_xy(rect, (5.0 * k) as f32, (5.0 * k) as f32),
-                &fill(fg(0.10)),
+                &fill(ui.fg(0.10)),
             );
             canvas.draw_rrect(
                 RRect::new_rect_xy(rect, (5.0 * k) as f32, (5.0 * k) as f32),
-                &stroke(fg(0.28), (HAIRLINE * k) as f32),
+                &stroke(ui.fg(0.28), (HAIRLINE * k) as f32),
             );
             let size = 11.0 * k;
             let tw = fonts.measure(text, W::SemiBold, size) as f64;
@@ -571,7 +589,7 @@ fn draw_glyph(
                 cy + size * 0.36,
                 W::SemiBold,
                 size,
-                fg(0.92),
+                ui.fg(0.92),
             );
         }
     }
@@ -686,8 +704,10 @@ pub fn chord_width(fonts: &Fonts, chord: &'static str, style: GlyphStyle, k: f64
 }
 
 /// A chord's badges in a row, left edge at `x`, centred on `cy`.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_chord(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     chord: &'static str,
     style: GlyphStyle,
@@ -700,12 +720,16 @@ pub fn draw_chord(
     for piece in pieces(chord, style) {
         let w = piece_width(fonts, &piece, style, k);
         match piece {
-            Piece::Glyph(key) => draw_glyph(canvas, fonts, key, style, pen, cy, k),
+            Piece::Glyph(key) => draw_glyph(canvas, ui, fonts, key, style, pen, cy, k),
             Piece::Colour(colour) => {
                 let r = BADGE_D * k / 2.0;
                 let center = Point::new((pen + r) as f32, cy as f32);
                 canvas.draw_circle(center, r as f32, &fill(colour));
-                canvas.draw_circle(center, r as f32, &stroke(fg(0.25), (HAIRLINE * k) as f32));
+                canvas.draw_circle(
+                    center,
+                    r as f32,
+                    &stroke(ui.fg(0.25), (HAIRLINE * k) as f32),
+                );
             }
             Piece::Word(word) => {
                 let size = WORD_SIZE * k;
@@ -716,7 +740,7 @@ pub fn draw_chord(
                     cy + size * 0.36,
                     W::Regular,
                     size,
-                    fg(0.5),
+                    ui.fg(0.5),
                 );
             }
         }

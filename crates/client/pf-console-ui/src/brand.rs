@@ -11,11 +11,11 @@
 //! antiphase on an axis into the screen — swelling toward and away from the viewer with a small
 //! diagonal sway — and settle exactly onto the resting lens, which fades and scales in over the
 //! tail. The caller owns the clock: pass [`intro_progress`] of the seconds since the mark first
-//! showed, or `1.0` for the resting mark. Honours [`crate::theme::reduce_motion`].
+//! showed, or `1.0` for the resting mark. Honours the frame's Reduce Motion.
 
 use skia_safe::{gradient, Canvas, ClipOp, Color4f, Path, Point, TileMode};
 
-use crate::theme::{accent, fg, fill, reduce_motion};
+use crate::theme::{fill, Frame};
 
 /// How long the entrance takes. [`draw`] at `intro >= 1.0` is the resting mark.
 pub const INTRO_SECS: f32 = 1.3;
@@ -57,23 +57,26 @@ fn orbit(a: f32, sign: f32) -> (f32, f32, f32) {
 }
 
 /// Accent moved `t` of the way toward the foreground — the light disc and the lens.
-fn toward_fg(t: f32) -> Color4f {
-    let (a, g) = (accent(1.0), fg(1.0));
+fn toward_fg(ui: &Frame, t: f32) -> Color4f {
+    let (a, g) = (ui.accent(1.0), ui.fg(1.0));
     let mix = |a: f32, b: f32| a + (b - a) * t;
     Color4f::new(mix(a.r, g.r), mix(a.g, g.g), mix(a.b, g.b), 1.0)
 }
 
 /// Draws the mark with its box's top-left corner at `(x, y)` and side `side`. `intro` is the
 /// entrance's progress (`1.0` = at rest, see [`intro_progress`]).
-pub fn draw(canvas: &Canvas, x: f32, y: f32, side: f32, intro: f32) {
-    let intro = if reduce_motion() { 1.0 } else { intro };
+pub fn draw(canvas: &Canvas, ui: &Frame, x: f32, y: f32, side: f32, intro: f32) {
+    let intro = if ui.reduce_motion { 1.0 } else { intro };
     let r = side / 3.0;
     let light = (x + r, y + 2.0 * r);
     let deep = (x + 2.0 * r, y + r);
     let a = ease_out_quint(intro) * std::f32::consts::TAU;
-    let mut paint = fill(accent(1.0));
+    let mut paint = fill(ui.accent(1.0));
     paint.set_anti_alias(true);
-    for (centre, sign, colour) in [(light, 1.0, toward_fg(0.4)), (deep, -1.0, accent(1.0))] {
+    for (centre, sign, colour) in [
+        (light, 1.0, toward_fg(ui, 0.4)),
+        (deep, -1.0, ui.accent(1.0)),
+    ] {
         let (dx, dy, scale) = orbit(a, sign);
         paint.set_color4f(colour, None);
         canvas.draw_circle(
@@ -97,9 +100,9 @@ pub fn draw(canvas: &Canvas, x: f32, y: f32, side: f32, intro: f32) {
     canvas.scale((grow, grow));
     canvas.translate((-cx, -cy));
     canvas.clip_path(&Path::circle(rim, r, None), ClipOp::Intersect, true);
-    let mut from = toward_fg(0.68);
+    let mut from = toward_fg(ui, 0.68);
     from.a = 0.0;
-    let mut to = fg(1.0);
+    let mut to = ui.fg(1.0);
     to.a = lens;
     let mut glow = fill(to);
     glow.set_anti_alias(true);

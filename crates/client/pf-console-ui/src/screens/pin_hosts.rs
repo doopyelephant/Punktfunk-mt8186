@@ -9,7 +9,7 @@ use crate::glyphs::{Hint, HintKey};
 use crate::model::ConsoleCmd;
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, ScreenView};
-use crate::theme::{fg, Fonts, W};
+use crate::theme::{Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec, FOOT_DETAIL_H};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
@@ -123,6 +123,7 @@ impl ScreenView for PinHostsScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let indices = host_indices(ctx);
         let cx = f64::from(rect.left) + f64::from(rect.width()) / 2.0;
         if indices.is_empty() {
@@ -131,7 +132,7 @@ impl ScreenView for PinHostsScreen {
                 "No saved hosts yet — pair with a host first, then pin this preset to it.",
                 W::Regular,
                 14.0 * k,
-                fg(0.55),
+                ui.fg(0.55),
                 cx,
                 f64::from(rect.top) + f64::from(rect.height()) / 2.0,
                 f64::from(rect.width()) * 0.7,
@@ -166,7 +167,7 @@ impl ScreenView for PinHostsScreen {
             })
             .collect();
         self.list
-            .render(canvas, list_rect, &rows, fonts, k, dt, true);
+            .render(canvas, ui, list_rect, &rows, fonts, k, dt, true);
     }
 
     /// The explainer under the list, once there is a list.

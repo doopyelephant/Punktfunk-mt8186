@@ -22,7 +22,7 @@ use crate::pointer::Pointer;
 use crate::screens::card_menu::CardMenu;
 use crate::screens::profiles::{paired_hosts, ProfileBook, ProfilesScreen};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen, ScreenView};
-use crate::theme::{fg, Fonts, PanelStroke, W};
+use crate::theme::{Fonts, Frame, PanelStroke, W};
 use crate::widgets::{button, button_w, ListMsg, MenuList, RowSpec};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::profiles::ProfilePick;
@@ -671,6 +671,7 @@ impl LibraryScreen {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn chips_el<'a>(
         &'a self,
+        ui: &'a Frame,
         hosts: &'a [HostRow],
         book: &ProfileBook,
         fonts: &'a Fonts,
@@ -690,7 +691,7 @@ impl LibraryScreen {
             |x: f64, w: f64| Rect::from_xywh(air + x as f32, air + top as f32, w as f32, h as f32);
         let pill = El::paint(move |canvas, r| {
             hits.borrow_mut().push((Zone::Chip(0), r));
-            draw_host_pill(canvas, fonts, &label, face.as_ref(), r, k);
+            draw_host_pill(canvas, ui, fonts, &label, face.as_ref(), r, k);
         })
         .id(chip_id(0))
         .focusable((h / 2.0) as f32)
@@ -699,7 +700,7 @@ impl LibraryScreen {
         let mut x = pill_w + 10.0 * k;
         let customize = El::paint(move |canvas, r| {
             hits.borrow_mut().push((Zone::Chip(1), r));
-            button(canvas, fonts, "Customize", r, k);
+            button(canvas, ui, fonts, "Customize", r, k);
         })
         .id(chip_id(1))
         .focusable((h / 2.0) as f32)
@@ -725,6 +726,7 @@ impl LibraryScreen {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn band_el<'a>(
         &'a self,
+        ui: &'a Frame,
         band: &'a Band,
         b: usize,
         fonts: &'a Fonts,
@@ -736,7 +738,7 @@ impl LibraryScreen {
         let label = band.section.label();
         let heading = El::paint(move |canvas, r| {
             let base = f64::from(r.top) + HEADING_H * 0.62 * k;
-            card::heading(canvas, fonts, label, f64::from(r.left), base, k);
+            card::heading(canvas, ui, fonts, label, f64::from(r.left), base, k);
         })
         .place(Rect::from_xywh(
             0.0,
@@ -763,13 +765,13 @@ impl LibraryScreen {
                 El::paint(move |canvas, slot| {
                     hits.borrow_mut().push((z, slot));
                     match it {
-                        Item::Desktop(h) => card::desk_tile(canvas, fonts, h, slot, k),
+                        Item::Desktop(h) => card::desk_tile(canvas, ui, fonts, h, slot, k),
                         Item::Game(g) => {
-                            self.band_card(canvas, fonts, band.section, *g, slot, ch, k, z)
+                            self.band_card(canvas, ui, fonts, band.section, *g, slot, ch, k, z)
                         }
                         Item::Collection(c) => {
                             let c = &self.collections[*c];
-                            paint_tile(canvas, fonts, c, &self.games, &self.art, slot, k)
+                            paint_tile(canvas, ui, fonts, c, &self.games, &self.art, slot, k)
                         }
                     }
                 })
@@ -799,6 +801,7 @@ impl LibraryScreen {
     fn band_card(
         &self,
         canvas: &Canvas,
+        ui: &Frame,
         fonts: &Fonts,
         section: Section,
         i: usize,
@@ -823,7 +826,7 @@ impl LibraryScreen {
             caption: caption.as_deref(),
             focused: self.zone == z && !self.quiet,
         };
-        card.paint(canvas, fonts, slot, ch, k, 1.0);
+        card.paint(canvas, ui, fonts, slot, ch, k, 1.0);
     }
 }
 
@@ -831,6 +834,7 @@ impl LibraryScreen {
 /// it opens a choice.
 fn draw_host_pill(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     label: &str,
     face: Option<&Option<ProfilePick>>,
@@ -838,13 +842,21 @@ fn draw_host_pill(
     k: f64,
 ) {
     let corner = (f64::from(r.height()) / 2.0 / k) as f32;
-    crate::theme::panel(canvas, r, corner, None, PanelStroke::Plain(0.08), k as f32);
+    crate::theme::panel(
+        canvas,
+        ui,
+        r,
+        corner,
+        None,
+        PanelStroke::Plain(0.08),
+        k as f32,
+    );
     let cy = f64::from(r.center_y());
     let mut x = f64::from(r.left) + PILL_PAD * k;
     if let Some(pick) = face {
         let rad = PILL_FACE * k;
         let cx = (x + rad) as f32;
-        super::super::profiles::draw_pick(canvas, fonts, pick.as_ref(), cx, cy as f32, rad);
+        super::super::profiles::draw_pick(canvas, ui, fonts, pick.as_ref(), cx, cy as f32, rad);
         x += (2.0 * PILL_FACE + 8.0) * k;
     }
     let size = PILL_TEXT * k;
@@ -855,7 +867,7 @@ fn draw_host_pill(
         cy + size * 0.36,
         W::SemiBold,
         size,
-        fg(0.95),
+        ui.fg(0.95),
     );
     let chevron = Icon(pf_client_core::lucide::CHEVRON_DOWN);
     let cx = (f64::from(r.right) - (PILL_PAD + 7.0) * k) as f32;
@@ -866,7 +878,7 @@ fn draw_host_pill(
         cy as f32,
         (14.0 * k) as f32,
         k as f32,
-        fg(0.7),
+        ui.fg(0.7),
     );
 }
 
@@ -1010,6 +1022,7 @@ impl ScreenView for CustomizeScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let foot = (crate::widgets::FOOT_DETAIL_H * k) as f32;
         let list = Rect::from_ltrb(rect.left, rect.top, rect.right, rect.bottom - foot);
         let rows: Vec<RowSpec> = crate::library::sections(&ctx.settings.library_sections)
@@ -1019,7 +1032,8 @@ impl ScreenView for CustomizeScreen {
                 RowSpec::toggle(s.label(), *on).with_handle(self.held && i == self.list.cursor)
             })
             .collect();
-        self.list.render(canvas, list, &rows, fonts, k, dt, true);
+        self.list
+            .render(canvas, ui, list, &rows, fonts, k, dt, true);
     }
 
     fn foot(&self, _ctx: &Ctx) -> Option<std::borrow::Cow<'static, str>> {

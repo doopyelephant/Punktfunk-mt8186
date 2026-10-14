@@ -647,7 +647,7 @@ fn waiting_shelf() -> LibraryScreen {
 #[test]
 fn a_shelf_is_hidden_until_its_entrance_begins_not_settled() {
     let mut s = waiting_shelf();
-    s.arm_entrance(10.0);
+    s.arm_entrance(10.0, false);
     assert!(!s.entrance_armed, "armed with nothing to show");
     for steps in 0..s.len() {
         let at = s.entrance_at(steps, 10.0);
@@ -657,10 +657,10 @@ fn a_shelf_is_hidden_until_its_entrance_begins_not_settled() {
             "card {steps} was drawn before the entrance began"
         );
     }
-    s.arm_entrance(10.39);
+    s.arm_entrance(10.39, false);
     assert!(!s.entrance_armed, "the deadline is 400 ms");
 
-    s.arm_entrance(10.4);
+    s.arm_entrance(10.4, false);
     assert!(s.entrance_armed);
     assert_eq!(s.entrance_at(0, 10.4).fade, 0.0, "the shelf flashed");
 
@@ -671,11 +671,11 @@ fn a_shelf_is_hidden_until_its_entrance_begins_not_settled() {
 #[test]
 fn decoded_art_arms_the_entrance_without_waiting_out_the_deadline() {
     let mut s = waiting_shelf();
-    s.arm_entrance(4.0);
+    s.arm_entrance(4.0, false);
     assert!(!s.entrance_armed);
     let mut surface = skia_safe::surfaces::raster_n32_premul((2, 2)).expect("2×2 raster");
     s.art.insert("g1".into(), surface.image_snapshot());
-    s.arm_entrance(4.05);
+    s.arm_entrance(4.05, false);
     assert!(s.entrance_armed, "a decoded poster is the whole point");
 }
 
@@ -683,15 +683,14 @@ fn decoded_art_arms_the_entrance_without_waiting_out_the_deadline() {
 #[test]
 fn a_coverless_card_reads_on_every_palette() {
     for p in &crate::palette::PALETTES {
-        crate::theme::set_ink(crate::theme::Ink::of(p));
+        let ui = &crate::theme::Frame::new(crate::theme::Ink::of(p), false, false, 0.0);
         for launcher in [false, true] {
-            let face = placeholder_face(launcher);
+            let face = placeholder_face(ui, launcher);
             assert_eq!(face.a, 1.0, "{} face is translucent", p.id);
-            let c = contrast(over(fg(0.85), face), face);
+            let c = contrast(over(ui.fg(0.85), face), face);
             assert!(c > 3.0, "the monogram is unreadable on {}: {c:.2}:1", p.id);
         }
     }
-    crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
 }
 
 /// Stamp after draw. Arrival-order LRU drops the neighbourhood the cursor is in.
@@ -1452,6 +1451,7 @@ fn many_hosts_wait_behind_one_host_pill() {
 /// line overflow, and a follow to the end brings the last one into view.
 #[test]
 fn a_wide_band_scrolls_its_focused_item_into_view() {
+    let ui = &crate::theme::Frame::default();
     let (s, _library) = live_shelf();
     let fonts = crate::theme::build_fonts().unwrap();
     let band = games::Band {
@@ -1462,15 +1462,15 @@ fn a_wide_band_scrolls_its_focused_item_into_view() {
     let mut tree = crate::el::Tree::new();
     let view = Rect::from_xywh(0.0, 0.0, 400.0, 400.0);
     let row = games::band_id(0);
-    let el = s.band_el(&band, 0, &fonts, 400.0, (150.0, 200.0), 1.0, &hits);
+    let el = s.band_el(ui, &band, 0, &fonts, 400.0, (150.0, 200.0), 1.0, &hits);
     let frame = tree.layout(el, view);
     let (_, max) = frame.scroll(row).expect("the band's row is a scroll");
     assert!(max > 0.0, "six covers overflow a 400 px line: {max}");
     tree.follow(row, max, true);
-    let el = s.band_el(&band, 0, &fonts, 400.0, (150.0, 200.0), 1.0, &hits);
+    let el = s.band_el(ui, &band, 0, &fonts, 400.0, (150.0, 200.0), 1.0, &hits);
     let frame = tree.layout(el, view);
     let mut surface = skia_safe::surfaces::raster_n32_premul((400, 400)).unwrap();
-    tree.paint(surface.canvas(), frame);
+    tree.paint(surface.canvas(), ui, frame);
     let last = tree
         .rect(games::band_item_id(0, 5))
         .expect("the last item is placed");

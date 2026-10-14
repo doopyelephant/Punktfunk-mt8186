@@ -450,12 +450,14 @@ impl SettingsScreen {
         fonts: &Fonts,
         ctx: &Ctx,
     ) {
+        let ui = ctx.ui;
         let list_rect = self.list_rect(rect, k);
-        let col = column(list_rect, k);
+        let col = column(ui, list_rect, k);
         let inner = f64::from(col.left) + 16.0 * k;
         let labels: Vec<&str> = TABS.iter().map(|(name, _)| *name).collect();
         self.strip.render(
             canvas,
+            ui,
             Rect::from_ltrb(rect.left, rect.top, rect.right, list_rect.top),
             &labels,
             self.tab,
@@ -475,6 +477,7 @@ impl SettingsScreen {
         }
         .paint(
             canvas,
+            ui,
             fonts,
             Rect::from_ltrb(rect.left, list_rect.bottom, rect.right, rect.bottom),
             (inner, f64::from(col.right)),
@@ -687,6 +690,7 @@ impl ScreenView for SettingsScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         self.keyboard.seat(self.typing.is_some(), ctx.device, dt);
         self.sync_presets(ctx);
         let list_rect = self.list_rect(rect, k);
@@ -719,6 +723,7 @@ impl ScreenView for SettingsScreen {
         self.list.lift = self.keyboard.lift(rect, k);
         self.list.render(
             canvas,
+            ui,
             list_rect,
             &rows,
             fonts,
@@ -727,7 +732,7 @@ impl ScreenView for SettingsScreen {
             // No row focus ring while the tray or the strip holds it.
             self.typing.is_none() && !self.strip_focus,
         );
-        self.keyboard.render(canvas, fonts, rect, k);
+        self.keyboard.render(canvas, ui, fonts, rect, k);
     }
 
     fn title(&self) -> String {

@@ -8,7 +8,7 @@ use crate::anim::{approach, entrances, springs, Entrance, EntranceAt, Spring};
 use crate::anim::{BUMP_C, BUMP_K, BUMP_V};
 use crate::el::{Axis, El, Id, Tree};
 use crate::pointer::{Pointer, PointerKind};
-use crate::theme::{accent, edge, fg, fill, stroke, Fonts, PanelStroke, W};
+use crate::theme::{fill, stroke, Fonts, Frame, PanelStroke, W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, PathBuilder, RRect, Rect};
 use std::cell::RefCell;
@@ -210,7 +210,7 @@ pub enum Toward {
 /// its content side to full on its `toward` side. No tint, as Glur has none: text reads on
 /// the blur. Draw it after what scrolls under, before the text; trays stacked edge to edge
 /// ramp on from each other without a seam.
-pub fn tray(canvas: &Canvas, rect: Rect, toward: Toward, k: f64) {
+pub fn tray(canvas: &Canvas, ui: &Frame, rect: Rect, toward: Toward, k: f64) {
     if rect.height() < 1.0 {
         return;
     }
@@ -226,7 +226,7 @@ pub fn tray(canvas: &Canvas, rect: Rect, toward: Toward, k: f64) {
         sigma,
         over,
     };
-    crate::blur::backdrop(canvas, rect, band);
+    crate::blur::backdrop(canvas, ui, rect, band);
 }
 /// The band at a screen's foot, on the shell's bottom tray: a focused title with its
 /// provenance, or one detail line led by a mark. A screen reaches the tray in by the
@@ -257,12 +257,13 @@ impl Foot<'_> {
     pub fn paint(
         &self,
         canvas: &Canvas,
+        ui: &Frame,
         fonts: &Fonts,
         band: Rect,
         (left, right): (f64, f64),
         k: f64,
     ) {
-        use crate::theme::{fg, W};
+        use crate::theme::W;
         if self.deep {
             let clip = canvas.local_clip_bounds().unwrap_or(band);
             let back = Rect::from_ltrb(
@@ -272,7 +273,7 @@ impl Foot<'_> {
                 clip.bottom.max(band.bottom),
             );
             let deep = band.top + (FOOT_TITLE_H * 0.45 * k) as f32;
-            let colors = [crate::theme::shade(0.0), crate::theme::shade(0.42)];
+            let colors = [ui.shade(0.0), ui.shade(0.42)];
             let mut scrim = crate::theme::shaded();
             scrim.set_shader(skia_safe::gradient::shaders::linear_gradient(
                 (
@@ -292,16 +293,25 @@ impl Foot<'_> {
             canvas.draw_rect(back, &scrim);
         }
         let cx = f64::from(band.center_x());
-        let max_w = f64::from(band.width()) - 2.0 * edge(k);
+        let max_w = f64::from(band.width()) - 2.0 * ui.edge(k);
         if let Some(title) = self.title {
             let (w, size) = (W::Bold, 25.0 * k);
             let tw = f64::from(fonts.measure(title, w, size)).min(max_w);
             let base = f64::from(band.top) + 32.0 * k;
-            fonts.draw_clipped(canvas, title, cx - tw / 2.0, base, w, size, fg(1.0), max_w);
+            fonts.draw_clipped(
+                canvas,
+                title,
+                cx - tw / 2.0,
+                base,
+                w,
+                size,
+                ui.fg(1.0),
+                max_w,
+            );
         }
         let base = f64::from(band.top) + 53.0 * k;
         if let Some(note) = self.note {
-            let x = f64::from(band.left) + edge(k);
+            let x = f64::from(band.left) + ui.edge(k);
             fonts.draw_clipped(
                 canvas,
                 note,
@@ -309,7 +319,7 @@ impl Foot<'_> {
                 base,
                 W::Regular,
                 11.0 * k,
-                fg(0.55),
+                ui.fg(0.55),
                 max_w / 3.0,
             );
         }
@@ -323,14 +333,14 @@ impl Foot<'_> {
                 base,
                 W::SemiBold,
                 size,
-                fg(0.55),
+                ui.fg(0.55),
             );
         }
         if let Some(detail) = self.detail.filter(|d| !d.is_empty()) {
             let top = f64::from(band.top) + 6.0 * k;
             let mark = self.mark.and_then(crate::icons::by_name);
             let lead = if mark.is_some() { 22.0 * k } else { 0.0 };
-            let ink = fg(0.55);
+            let ink = ui.fg(0.55);
             fonts.leading(
                 canvas,
                 detail,
@@ -359,21 +369,21 @@ const BLURB_GAP: f64 = 20.0;
 
 /// The form column in `rect`: at most [`ROW_MAX_W`] wide, centred, never nearer the
 /// screen's edge than the shared margin.
-pub fn column(rect: Rect, k: f64) -> Rect {
-    let w = (ROW_MAX_W * k).min(f64::from(rect.width()) - 2.0 * edge(k)) as f32;
+pub fn column(ui: &Frame, rect: Rect, k: f64) -> Rect {
+    let w = (ROW_MAX_W * k).min(f64::from(rect.width()) - 2.0 * ui.edge(k)) as f32;
     Rect::from_xywh(rect.center_x() - w / 2.0, rect.top, w, rect.height())
 }
 
 /// A form's blurb at the top of `rect`, on the column. Returns what is left below it for
 /// the rows, however many lines it took.
-pub fn blurb(canvas: &Canvas, fonts: &Fonts, text: &str, rect: Rect, k: f64) -> Rect {
-    let col = column(rect, k);
+pub fn blurb(canvas: &Canvas, ui: &Frame, fonts: &Fonts, text: &str, rect: Rect, k: f64) -> Rect {
+    let col = column(ui, rect, k);
     let (x, y, w) = (
         f64::from(col.left),
         f64::from(rect.top) + 2.0 * k,
         f64::from(col.width()),
     );
-    let h = fonts.leading(canvas, text, W::Regular, 13.0 * k, fg(0.55), x, y, w);
+    let h = fonts.leading(canvas, text, W::Regular, 13.0 * k, ui.fg(0.55), x, y, w);
     let top = y + h + BLURB_GAP * k;
     Rect::from_ltrb(
         rect.left,
@@ -472,6 +482,7 @@ pub fn bleed_view(canvas: &Canvas, rect: Rect) -> Rect {
 /// crisp top; pinned text past it sits on the field, never on a row.
 pub fn soft_scroll(
     canvas: &Canvas,
+    ui: &Frame,
     view: Rect,
     rect: Rect,
     (offset, max): (f32, f32),
@@ -491,7 +502,7 @@ pub fn soft_scroll(
     }
     paint();
     if edged {
-        soft_edges(canvas, view, rect, soft, (above, below), k);
+        soft_edges(canvas, ui, view, rect, soft, (above, below), k);
     }
 }
 
@@ -499,7 +510,15 @@ pub fn soft_scroll(
 /// past the top and the bottom, 0–1, so a list resting on its first row keeps a crisp top.
 /// Rows fade toward an edge and what is left blurs, as a scroll view's edge does on Apple's
 /// systems; pinned text past the list sits on the field, never on a row.
-fn soft_edges(canvas: &Canvas, view: Rect, rect: Rect, depth: f32, strength: (f32, f32), k: f64) {
+fn soft_edges(
+    canvas: &Canvas,
+    ui: &Frame,
+    view: Rect,
+    rect: Rect,
+    depth: f32,
+    strength: (f32, f32),
+    k: f64,
+) {
     use skia_safe::{gradient, BlendMode, Color4f, Point, TileMode};
     let (top, bottom) = strength;
     let alpha = |a: f32| Color4f::new(0.0, 0.0, 0.0, a);
@@ -534,7 +553,7 @@ fn soft_edges(canvas: &Canvas, view: Rect, rect: Rect, depth: f32, strength: (f3
             sigma: sigma * top,
             over: 0.0,
         };
-        crate::blur::backdrop(canvas, band, b);
+        crate::blur::backdrop(canvas, ui, band, b);
     }
     if bottom > 0.0 {
         let band = Rect::from_ltrb(l, rect.bottom - depth, r, view.bottom);
@@ -545,7 +564,7 @@ fn soft_edges(canvas: &Canvas, view: Rect, rect: Rect, depth: f32, strength: (f3
             sigma: sigma * bottom,
             over: 0.0,
         };
-        crate::blur::backdrop(canvas, band, b);
+        crate::blur::backdrop(canvas, ui, band, b);
     }
 }
 
@@ -802,6 +821,7 @@ impl MenuList {
     pub fn render(
         &mut self,
         canvas: &Canvas,
+        ui: &Frame,
         rect: Rect,
         rows: &[RowSpec],
         fonts: &Fonts,
@@ -809,12 +829,12 @@ impl MenuList {
         dt: f64,
         active: bool,
     ) {
-        self.advance(rows, dt, active);
+        self.advance(ui, rows, dt, active);
         self.lifted = self
             .lift
             .and(rows.iter().position(|r| r.caret).or(self.lifted))
             .filter(|i| *i < rows.len());
-        let scroll_settled = self.paint_rows(canvas, rect, rows, fonts, k, dt, active);
+        let scroll_settled = self.paint_rows(canvas, ui, rect, rows, fonts, k, dt, active);
         self.record_geometry(rows, k, dot_gutter(rows, k));
         self.settled = self.settled(rows, active, scroll_settled);
     }
@@ -822,13 +842,18 @@ impl MenuList {
     /// One frame of the entrance, focus, knob, bump and slip springs, then the values
     /// as drawn. A pending snap drops every row's history; a pending step arms the slip
     /// only when the focused row's value really changed.
-    fn advance(&mut self, rows: &[RowSpec], dt: f64, active: bool) {
-        let reduce = crate::theme::reduce_motion();
+    fn advance(&mut self, ui: &Frame, rows: &[RowSpec], dt: f64, active: bool) {
+        let reduce = ui.reduce_motion;
         // Own clock: `render` gets `dt` but never the shell's `t`.
         self.age += dt;
         if !self.entrance_armed {
             self.entrance_armed = true;
-            self.entrance = Some(Entrance::new(entrances::ROWS, self.cursor, self.age));
+            self.entrance = Some(Entrance::new(
+                entrances::ROWS,
+                self.cursor,
+                self.age,
+                reduce,
+            ));
         }
         if self.entrance.is_some_and(|e| e.done(self.age)) {
             self.entrance = None;
@@ -932,6 +957,7 @@ impl MenuList {
     fn paint_rows(
         &mut self,
         canvas: &Canvas,
+        ui: &Frame,
         rect: Rect,
         rows: &[RowSpec],
         fonts: &Fonts,
@@ -942,7 +968,7 @@ impl MenuList {
         // Rows are cells in a scroll column, `ROW_GAP` apart, a header band above a
         // sectioned row. Each cell's painter draws the row as it always has.
         let list = Id::new(LIST, 0);
-        let col = column(rect, k);
+        let col = column(ui, rect, k);
         let row_w = f64::from(col.width());
         let dot_gutter = dot_gutter(rows, k);
         let snap = std::mem::take(&mut self.snap);
@@ -982,7 +1008,7 @@ impl MenuList {
             .children(rows.iter().enumerate().map(|(i, row)| {
                 let cell = El::paint(move |canvas, cell| {
                     if this.lifted != Some(i) {
-                        this.paint_row(canvas, fonts, i, row, cell, k, dot_gutter);
+                        this.paint_row(canvas, ui, fonts, i, row, cell, k, dot_gutter);
                     }
                 })
                 .id(row_id(i))
@@ -1004,16 +1030,16 @@ impl MenuList {
             .rect(row_id(this.cursor))
             .map_or(0.0, |r| (r.center_y() - rect.center_y()).clamp(0.0, max));
         if this.follow {
-            tree.follow(list, target, snap);
+            tree.follow(list, target, snap || ui.reduce_motion);
         }
         let scroll_settled = !tree.moving(list) && !tree.following(list);
         tree.set_focus(active.then(|| row_id(this.cursor)));
         if bleed {
-            tree.paint_focus(canvas, frame, k as f32, dt, false);
+            tree.paint_focus(canvas, ui, frame, k as f32, dt, false);
         } else {
             let scrolled = (tree.offset(list), max);
-            soft_scroll(canvas, view, rect, scrolled, k, || {
-                tree.paint_focus(canvas, frame, k as f32, dt, false);
+            soft_scroll(canvas, ui, view, rect, scrolled, k, || {
+                tree.paint_focus(canvas, ui, frame, k as f32, dt, false);
             });
         }
         // The lifted row travels from its cell, or from the slot if scrolled out of view.
@@ -1021,7 +1047,7 @@ impl MenuList {
             let from = tree.rect(row_id(i)).map_or(slot, |r| r.top);
             let top = from + (slot - from) * t as f32;
             let cell = Rect::from_xywh(col.left, top, row_w as f32, (ROW_H * k) as f32);
-            this.paint_row(canvas, fonts, i, &rows[i], cell, k, dot_gutter);
+            this.paint_row(canvas, ui, fonts, i, &rows[i], cell, k, dot_gutter);
         }
         drop(tree);
         scroll_settled
@@ -1080,6 +1106,7 @@ impl MenuList {
     fn paint_row(
         &self,
         canvas: &Canvas,
+        ui: &Frame,
         fonts: &Fonts,
         i: usize,
         row: &RowSpec,
@@ -1105,7 +1132,7 @@ impl MenuList {
                 top - HEADER_RISE * k,
                 W::SemiBold,
                 12.0 * k,
-                fg(0.45),
+                ui.fg(0.45),
             );
         }
         let cy = top + ROW_H * k / 2.0;
@@ -1120,11 +1147,11 @@ impl MenuList {
         let r = Rect::from_xywh(x0 as f32, top as f32, row_w as f32, (ROW_H * k) as f32);
         // The field being typed into keeps its accent; focus is the plate behind the row.
         let (stroke, tint) = if row.caret {
-            (PanelStroke::Brand(0.7), Some(accent(0.30)))
+            (PanelStroke::Brand(0.7), Some(ui.accent(0.30)))
         } else {
             (PanelStroke::Plain(0.08), None)
         };
-        crate::theme::panel(canvas, r, 14.0, tint, stroke, k as f32);
+        crate::theme::panel(canvas, ui, r, 14.0, tint, stroke, k as f32);
 
         // A note under the label lifts the label; the two share the row's height. The value
         // stays on the row's centre line with the switch and the chevrons — lifted with the
@@ -1135,9 +1162,9 @@ impl MenuList {
         } else {
             centred
         };
-        let label_x = paint_leading(canvas, row, x0 + 16.0 * k, cy, k);
+        let label_x = paint_leading(canvas, ui, row, x0 + 16.0 * k, cy, k);
         // Trailing buttons take the row's right end; the value field ends before them.
-        let row_w = row_w - paint_buttons(canvas, row, r, cy, f, k);
+        let row_w = row_w - paint_buttons(canvas, ui, row, r, cy, f, k);
         // The dot marks the row's value, so it reads as part of that group: outboard of
         // the value, inboard of the buttons. The gutter is reserved on every row, or one
         // marked row pulls its own value in past its neighbours'.
@@ -1145,7 +1172,7 @@ impl MenuList {
             canvas.draw_circle(
                 ((x0 + row_w - 12.0 * k) as f32, cy as f32),
                 (4.0 * k) as f32,
-                &fill(accent(1.0)),
+                &fill(ui.accent(1.0)),
             );
         }
         let row_w = row_w - dot_gutter;
@@ -1157,7 +1184,7 @@ impl MenuList {
                 cy + 14.0 * k,
                 W::Regular,
                 11.5 * k,
-                fg(0.5),
+                ui.fg(0.5),
                 row_w * 0.6,
             );
         }
@@ -1169,7 +1196,7 @@ impl MenuList {
             baseline,
             W::SemiBold,
             16.0 * k,
-            row_tone(row, fg(1.0), fg(off)),
+            row_tone(row, ui.fg(1.0), ui.fg(off)),
         );
         let fr = RowFrame {
             r,
@@ -1183,8 +1210,8 @@ impl MenuList {
         };
         if row.value.is_some() {
             match row.control {
-                Control::Toggle(_) => self.paint_switch(canvas, i, row, &fr),
-                _ => self.paint_value(canvas, fonts, i, row, &fr),
+                Control::Toggle(_) => self.paint_switch(canvas, ui, i, row, &fr),
+                _ => self.paint_value(canvas, ui, fonts, i, row, &fr),
             }
         }
         if fading {
@@ -1195,7 +1222,7 @@ impl MenuList {
 
     /// The switch: a 36×20 track at the value field's right end, the knob eased across
     /// it, accent when on.
-    fn paint_switch(&self, canvas: &Canvas, i: usize, row: &RowSpec, fr: &RowFrame) {
+    fn paint_switch(&self, canvas: &Canvas, ui: &Frame, i: usize, row: &RowSpec, fr: &RowFrame) {
         let RowFrame {
             x0,
             w: row_w,
@@ -1213,9 +1240,9 @@ impl MenuList {
         );
         let on_alpha = if row.enabled { 1.0 } else { 0.35 };
         let track_color = skia_safe::Color4f::new(
-            accent(1.0).r * knob as f32 + fg(0.25).r * (1.0 - knob as f32),
-            accent(1.0).g * knob as f32 + fg(0.25).g * (1.0 - knob as f32),
-            accent(1.0).b * knob as f32 + fg(0.25).b * (1.0 - knob as f32),
+            ui.accent(1.0).r * knob as f32 + ui.fg(0.25).r * (1.0 - knob as f32),
+            ui.accent(1.0).g * knob as f32 + ui.fg(0.25).g * (1.0 - knob as f32),
+            ui.accent(1.0).b * knob as f32 + ui.fg(0.25).b * (1.0 - knob as f32),
             (0.25 + 0.75 * knob as f32) * on_alpha,
         );
         canvas.draw_rrect(
@@ -1232,7 +1259,15 @@ impl MenuList {
 
     /// The value field: slider track, the right-aligned readout with its slip crossfade,
     /// the caret and the chevrons.
-    fn paint_value(&self, canvas: &Canvas, fonts: &Fonts, i: usize, row: &RowSpec, fr: &RowFrame) {
+    fn paint_value(
+        &self,
+        canvas: &Canvas,
+        ui: &Frame,
+        fonts: &Fonts,
+        i: usize,
+        row: &RowSpec,
+        fr: &RowFrame,
+    ) {
         let RowFrame {
             r,
             x0,
@@ -1247,11 +1282,11 @@ impl MenuList {
         let vcolor = if row.danger {
             crate::theme::ERROR
         } else if row.value_dim || !row.enabled {
-            fg(0.35)
+            ui.fg(0.35)
         } else if f > 0.5 {
-            fg(1.0)
+            ui.fg(1.0)
         } else {
-            fg(0.6 + 0.4 * f as f32)
+            ui.fg(0.6 + 0.4 * f as f32)
         };
         let chevron_w = if row.adjustable { 18.0 * k } else { 0.0 };
         let caret_w = if row.caret { 8.0 * k } else { 0.0 };
@@ -1266,13 +1301,17 @@ impl MenuList {
             let track = track_rect(r, row, k, dot_gutter);
             canvas.draw_rrect(
                 RRect::new_rect_xy(track, th as f32 / 2.0, th as f32 / 2.0),
-                &fill(fg(0.18)),
+                &fill(ui.fg(0.18)),
             );
             let filled =
                 Rect::from_xywh(track.left, track.top, track.width() * frac, track.height());
             canvas.draw_rrect(
                 RRect::new_rect_xy(filled, th as f32 / 2.0, th as f32 / 2.0),
-                &fill(if row.enabled { accent(1.0) } else { fg(0.35) }),
+                &fill(if row.enabled {
+                    ui.accent(1.0)
+                } else {
+                    ui.fg(0.35)
+                }),
             );
         }
         // Each string right-aligns on its own measured width against a
@@ -1348,14 +1387,22 @@ impl MenuList {
                     (2.0 * k) as f32,
                     (18.0 * k) as f32,
                 ),
-                &fill(accent(1.0)),
+                &fill(ui.accent(1.0)),
             );
         }
         if row.adjustable && f > 0.01 {
             let alpha = 0.6 * f as f32;
             // After, outside the field clip: a moving value passes under the chevrons.
-            chevron(canvas, place(&shown) - 11.0 * k, cy, 4.0 * k, true, alpha);
-            chevron(canvas, x0 + row_w - 16.0 * k, cy, 4.0 * k, false, alpha);
+            chevron(
+                canvas,
+                ui,
+                place(&shown) - 11.0 * k,
+                cy,
+                4.0 * k,
+                true,
+                alpha,
+            );
+            chevron(canvas, ui, x0 + row_w - 16.0 * k, cy, 4.0 * k, false, alpha);
         }
     }
 }
@@ -1387,7 +1434,14 @@ fn row_tone(row: &RowSpec, on: skia_safe::Color4f, off: skia_safe::Color4f) -> s
 }
 
 /// Leading marks, a Lucide icon then the drag grip, from `label_x`; returns where the label starts.
-fn paint_leading(canvas: &Canvas, row: &RowSpec, mut label_x: f64, cy: f64, k: f64) -> f64 {
+fn paint_leading(
+    canvas: &Canvas,
+    ui: &Frame,
+    row: &RowSpec,
+    mut label_x: f64,
+    cy: f64,
+    k: f64,
+) -> f64 {
     if let Some(icon) = row.icon.and_then(crate::icons::by_name) {
         crate::icons::draw_icon(
             canvas,
@@ -1396,16 +1450,16 @@ fn paint_leading(canvas: &Canvas, row: &RowSpec, mut label_x: f64, cy: f64, k: f
             cy as f32,
             (20.0 * k) as f32,
             k as f32,
-            row_tone(row, fg(0.85), fg(0.4)),
+            row_tone(row, ui.fg(0.85), ui.fg(0.4)),
         );
         label_x += 32.0 * k;
     }
     if row.handle {
         if let Some(grip) = crate::icons::by_name("grip-vertical") {
             let grip_tone = if row.held {
-                accent(1.0)
+                ui.accent(1.0)
             } else {
-                row_tone(row, fg(0.7), fg(0.3))
+                row_tone(row, ui.fg(0.7), ui.fg(0.3))
             };
             crate::icons::draw_icon(
                 canvas,
@@ -1423,25 +1477,37 @@ fn paint_leading(canvas: &Canvas, row: &RowSpec, mut label_x: f64, cy: f64, k: f
 }
 
 /// Round icon buttons at the row's right end; returns the width they take.
-fn paint_buttons(canvas: &Canvas, row: &RowSpec, r: Rect, cy: f64, f: f64, k: f64) -> f64 {
+fn paint_buttons(
+    canvas: &Canvas,
+    ui: &Frame,
+    row: &RowSpec,
+    r: Rect,
+    cy: f64,
+    f: f64,
+    k: f64,
+) -> f64 {
     let buttons_w = row.buttons.len() as f64 * BUTTON_PITCH * k;
     for (j, (name, b)) in row.buttons.iter().zip(button_rects(r, row, k)).enumerate() {
         let (cx, d) = (f64::from(b.center_x()), BUTTON_D * k);
         let lit = row.button == Some(j) && f > 0.5;
         if lit {
-            canvas.draw_circle((cx as f32, cy as f32), (d / 2.0) as f32, &fill(accent(1.0)));
+            canvas.draw_circle(
+                (cx as f32, cy as f32),
+                (d / 2.0) as f32,
+                &fill(ui.accent(1.0)),
+            );
         } else {
             canvas.draw_circle(
                 (cx as f32, cy as f32),
                 (d / 2.0) as f32,
-                &fill(fg(0.04 + 0.06 * f as f32)),
+                &fill(ui.fg(0.04 + 0.06 * f as f32)),
             );
         }
         if let Some(icon) = crate::icons::by_name(name) {
             let icon_tone = if lit {
-                crate::theme::on_accent()
+                ui.on_accent()
             } else {
-                row_tone(row, fg(0.9), fg(0.45))
+                row_tone(row, ui.fg(0.9), ui.fg(0.45))
             };
             crate::icons::draw_icon(
                 canvas,
@@ -1472,9 +1538,9 @@ fn truncate_head(fonts: &Fonts, text: &str, w: W, size: f64, max_w: f64) -> Stri
     "…".into()
 }
 
-fn chevron(canvas: &Canvas, x: f64, cy: f64, r: f64, left: bool, alpha: f32) {
+fn chevron(canvas: &Canvas, ui: &Frame, x: f64, cy: f64, r: f64, left: bool, alpha: f32) {
     let dir = if left { -1.0 } else { 1.0 };
-    let mut p = stroke(fg(alpha), (1.8 * r / 4.0) as f32);
+    let mut p = stroke(ui.fg(alpha), (1.8 * r / 4.0) as f32);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
     let mut path = PathBuilder::new();
     path.move_to(((x - dir * r / 2.0) as f32, (cy - r) as f32));
@@ -1582,6 +1648,7 @@ mod tests {
     /// list's rect, where no soft edge reaches it.
     #[test]
     fn a_lifted_caret_row_leaves_its_cell_for_the_slot() {
+        let ui = &crate::theme::Frame::default();
         let fonts = crate::theme::build_fonts().unwrap();
         let (w, h) = (900, 600);
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
@@ -1597,6 +1664,7 @@ mod tests {
                 surface.canvas().clear(clear);
                 list.render(
                     surface.canvas(),
+                    ui,
                     rect,
                     &rows,
                     &fonts,
@@ -1627,6 +1695,7 @@ mod tests {
     /// slip spring for the list: ungated alpha blanks the whole value column.
     #[test]
     fn stepping_one_value_leaves_the_other_rows_alone() {
+        let ui = &crate::theme::Frame::default();
         let fonts = crate::theme::build_fonts().unwrap();
         let (w, h) = (900, 600);
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
@@ -1638,7 +1707,7 @@ mod tests {
         // Settle first: entrance, scroll, and focus travel on their own; the claim is nothing else moves.
         for _ in 0..240 {
             surface.canvas().clear(clear);
-            list.render(surface.canvas(), rect, &before, &fonts, 1.0, dt, true);
+            list.render(surface.canvas(), ui, rect, &before, &fonts, 1.0, dt, true);
         }
         let bands: Vec<Band> = (1..before.len())
             .map(|i| {
@@ -1658,7 +1727,7 @@ mod tests {
         let probed = value_rows(&["Native", "Automatic", "20 Mbps", "Native", "On", "Off"]);
         for _ in 0..240 {
             surface.canvas().clear(clear);
-            probe.render(surface.canvas(), rect, &probed, &fonts, 1.0, dt, true);
+            probe.render(surface.canvas(), ui, rect, &probed, &fonts, 1.0, dt, true);
         }
         let probe_px = read_back(&mut surface, w, h);
         let (_, px_x, px_y) = bands[2];
@@ -1682,7 +1751,7 @@ mod tests {
         let mut armed = false;
         for frame in 0..12 {
             surface.canvas().clear(clear);
-            list.render(surface.canvas(), rect, &after, &fonts, 1.0, dt, true);
+            list.render(surface.canvas(), ui, rect, &after, &fonts, 1.0, dt, true);
             armed |= list.slip_prev.is_some();
             let px = read_back(&mut surface, w, h);
             for (i, bx, by) in &bands {
@@ -1701,10 +1770,7 @@ mod tests {
     /// is fixed once settled, so any change there is escaped text.
     #[test]
     fn a_stepped_value_stays_inside_its_field() {
-        // This one needs motion, and `reduce_motion` is a thread-local: a harness that gives every
-        // test its own thread hides that, a single-threaded one (wasm) hands over whatever the
-        // last shell render left. Say what this test needs rather than inherit it.
-        crate::theme::set_reduce_motion(false);
+        let ui = &crate::theme::Frame::default();
         let fonts = crate::theme::build_fonts().unwrap();
         let (w, h) = (900, 600);
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
@@ -1715,7 +1781,7 @@ mod tests {
         let wide = value_row("PyroWave (wired LAN)");
         for _ in 0..240 {
             surface.canvas().clear(clear);
-            list.render(surface.canvas(), rect, &wide, &fonts, 1.0, dt, true);
+            list.render(surface.canvas(), ui, rect, &wide, &fonts, 1.0, dt, true);
         }
         let r = list.row_rect(0).expect("the row is on screen");
         // Field right edge as `render` computes it (16 dp gutter + 18 dp chevrons, k = 1). Two px of clip slack.
@@ -1729,7 +1795,7 @@ mod tests {
         let mut armed = false;
         for frame in 0..16 {
             surface.canvas().clear(clear);
-            list.render(surface.canvas(), rect, &narrow, &fonts, 1.0, dt, true);
+            list.render(surface.canvas(), ui, rect, &narrow, &fonts, 1.0, dt, true);
             armed |= list.slip_prev.is_some();
             let px = read_back(&mut surface, w, h);
             assert_eq!(
@@ -1745,7 +1811,12 @@ mod tests {
     /// picks them by index; the lit one is accent-filled. A handle shifts the label.
     #[test]
     fn trailing_buttons_are_hit_in_order_and_light_when_focused() {
-        crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
+        let ui = &crate::theme::Frame::new(
+            crate::theme::Ink::of(crate::palette::palette("violet")),
+            false,
+            false,
+            0.0,
+        );
         let fonts = crate::theme::build_fonts().unwrap();
         let (w, h) = (900, 400);
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
@@ -1761,7 +1832,16 @@ mod tests {
             surface
                 .canvas()
                 .clear(skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0));
-            list.render(surface.canvas(), rect, &rows, &fonts, 1.0, 1.0 / 60.0, true);
+            list.render(
+                surface.canvas(),
+                ui,
+                rect,
+                &rows,
+                &fonts,
+                1.0,
+                1.0 / 60.0,
+                true,
+            );
         }
         let r0 = list.row_rect(0).unwrap();
         let pencil = list.buttons_geom[0][0];
@@ -1800,7 +1880,12 @@ mod tests {
     /// in the row band over the track counts as on it.
     #[test]
     fn slider_tracks_are_seekable_by_the_pointer() {
-        crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
+        let ui = &crate::theme::Frame::new(
+            crate::theme::Ink::of(crate::palette::palette("violet")),
+            false,
+            false,
+            0.0,
+        );
         let fonts = crate::theme::build_fonts().unwrap();
         let (w, h) = (900, 300);
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
@@ -1808,7 +1893,16 @@ mod tests {
         let rows = vec![RowSpec::slider("Bitrate", "40 Mb/s", 0.5)];
         let mut list = MenuList::new();
         for _ in 0..30 {
-            list.render(surface.canvas(), rect, &rows, &fonts, 1.0, 1.0 / 60.0, true);
+            list.render(
+                surface.canvas(),
+                ui,
+                rect,
+                &rows,
+                &fonts,
+                1.0,
+                1.0 / 60.0,
+                true,
+            );
         }
         let track = list.tracks_geom[0];
         assert!(track.width() > 100.0);
@@ -1831,7 +1925,12 @@ mod tests {
     /// beside the label without leaving the row.
     #[test]
     fn toggle_and_slider_rows_draw_their_controls() {
-        crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("violet")));
+        let ui = &crate::theme::Frame::new(
+            crate::theme::Ink::of(crate::palette::palette("violet")),
+            false,
+            false,
+            0.0,
+        );
         let fonts = crate::theme::build_fonts().unwrap();
         let (w, h) = (900, 600);
         let mut surface = skia_safe::surfaces::raster_n32_premul((w, h)).unwrap();
@@ -1852,6 +1951,7 @@ mod tests {
             surface.canvas().clear(clear);
             list.render(
                 surface.canvas(),
+                ui,
                 rect,
                 &rows(false, 0.25),
                 &fonts,
@@ -1888,6 +1988,7 @@ mod tests {
             surface.canvas().clear(clear);
             list.render(
                 surface.canvas(),
+                ui,
                 rect,
                 &rows(true, 0.75),
                 &fonts,
@@ -1937,13 +2038,14 @@ mod tests {
     /// identity. A slip that never returns leaves the value permanently offset.
     #[test]
     fn value_slip_arms_on_a_real_step_and_settles_to_identity() {
+        let ui = &crate::theme::Frame::default();
         let fonts = crate::theme::build_fonts().unwrap();
         let mut surface = skia_safe::surfaces::raster_n32_premul((900, 600)).unwrap();
         let rect = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
         let dt = 1.0 / 60.0;
         let mut list = MenuList::new();
         let mut frame = |list: &mut MenuList, rows: &[RowSpec]| {
-            list.render(surface.canvas(), rect, rows, &fonts, 1.0, dt, true);
+            list.render(surface.canvas(), ui, rect, rows, &fonts, 1.0, dt, true);
         };
 
         frame(&mut list, &value_row("10 Mbps"));
@@ -1981,10 +2083,14 @@ mod tests {
         let mut surface = skia_safe::surfaces::raster_n32_premul((900, 600)).unwrap();
         let rect = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
         let dt = 1.0 / 60.0;
-        crate::theme::set_reduce_motion(true);
+        let ui = &crate::theme::Frame {
+            reduce_motion: true,
+            ..Default::default()
+        };
         let mut list = MenuList::new();
         list.render(
             surface.canvas(),
+            ui,
             rect,
             &value_row("10 Mbps"),
             &fonts,
@@ -1995,6 +2101,7 @@ mod tests {
         list.menu(MenuEvent::Move(MenuDir::Right), 1);
         list.render(
             surface.canvas(),
+            ui,
             rect,
             &value_row("20 Mbps"),
             &fonts,
@@ -2011,6 +2118,7 @@ mod tests {
         ));
         list.render(
             surface.canvas(),
+            ui,
             rect,
             &value_row("20 Mbps"),
             &fonts,
@@ -2021,13 +2129,13 @@ mod tests {
         assert_eq!(list.bump.pos, 0.0, "recoil travel suppressed");
         // Focus still arrives: reduced motion is not unfocused.
         assert_eq!(list.focus[0], 1.0);
-        crate::theme::set_reduce_motion(false);
     }
 
     /// Mount entrance arms once, retires when done, and is not replayed by a
     /// tab switch (re-fanning on every L1/R1 would flicker a skim).
     #[test]
     fn menu_list_entrance_plays_once_and_retires() {
+        let ui = &crate::theme::Frame::default();
         let fonts = crate::theme::build_fonts().unwrap();
         let mut surface = skia_safe::surfaces::raster_n32_premul((900, 600)).unwrap();
         let rect = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
@@ -2037,16 +2145,16 @@ mod tests {
             .collect();
         let mut list = MenuList::new();
 
-        list.render(surface.canvas(), rect, &rows, &fonts, 1.0, dt, true);
+        list.render(surface.canvas(), ui, rect, &rows, &fonts, 1.0, dt, true);
         assert!(list.entrance.is_some(), "armed on the first frame");
 
         for _ in 0..90 {
-            list.render(surface.canvas(), rect, &rows, &fonts, 1.0, dt, true);
+            list.render(surface.canvas(), ui, rect, &rows, &fonts, 1.0, dt, true);
         }
         assert!(list.entrance.is_none(), "retired once it played out");
 
         list.jump_to(3);
-        list.render(surface.canvas(), rect, &rows, &fonts, 1.0, dt, true);
+        list.render(surface.canvas(), ui, rect, &rows, &fonts, 1.0, dt, true);
         assert!(list.entrance.is_none(), "a tab switch must not replay it");
     }
 

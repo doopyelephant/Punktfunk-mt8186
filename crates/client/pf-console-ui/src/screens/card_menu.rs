@@ -17,7 +17,7 @@ use crate::pointer::Pointer;
 use crate::screens::profiles::ProfileBook;
 use crate::screens::{Ctx, Device, Outbox, Screen, ScreenView};
 use crate::store::SettingsStore;
-use crate::theme::{edge, fg, Fonts, W};
+use crate::theme::{Fonts, Frame, W};
 use crate::widgets::{blurb, ListMsg, MenuList, RowSpec, TabStrip, TAB_STRIP_H};
 use pf_client_core::console::OverlayAction;
 use pf_client_core::library::InstallAction;
@@ -949,9 +949,10 @@ impl ScreenView for CardMenu {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
-        let mut list_rect = blurb(canvas, fonts, &self.blurb(), rect, k);
+        let ui = ctx.ui;
+        let mut list_rect = blurb(canvas, ui, fonts, &self.blurb(), rect, k);
         if let (Subject::Game { game, cover, .. }, Mode::Details) = (&self.subject, self.mode) {
-            list_rect = title_card(canvas, fonts, game, cover.as_ref(), rect, k);
+            list_rect = title_card(canvas, ui, fonts, game, cover.as_ref(), rect, k);
         }
         let sections = if self.tabbed() {
             self.sections(ctx.store)
@@ -988,14 +989,14 @@ impl ScreenView for CardMenu {
             .collect();
         let active = !self.strip_focus;
         self.list
-            .render(canvas, list_rect, &rows, fonts, k, dt, active);
+            .render(canvas, ui, list_rect, &rows, fonts, k, dt, active);
         if !sections.is_empty() {
             // The tabs on the screen's margin, under the title, as Settings' sections sit.
             let bottom = strip_top + strip_h as f32;
             let r = Rect::from_ltrb(rect.left, strip_top, rect.right, bottom);
             let (tab, focused) = (self.tab, self.strip_focus);
             self.strip
-                .render(canvas, r, &sections, tab, focused, fonts, k, dt);
+                .render(canvas, ui, r, &sections, tab, focused, fonts, k, dt);
         }
     }
 
@@ -1007,13 +1008,14 @@ impl ScreenView for CardMenu {
 /// A poster's card: the cover at the left, the facts beside it. Returns where its verbs go.
 fn title_card(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     game: &LibraryGame,
     cover: Option<&Image>,
     rect: Rect,
     k: f64,
 ) -> Rect {
-    let pad = edge(k);
+    let pad = ui.edge(k);
     let ch = (f64::from(rect.height()) - 24.0 * k).min(420.0 * k);
     let cw = ch * 2.0 / 3.0;
     let art = Rect::from_xywh(
@@ -1033,18 +1035,18 @@ fn title_card(
                 Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
                 art,
                 crate::theme::art_sampling(),
-                &crate::theme::fill(fg(1.0)),
+                &crate::theme::fill(ui.fg(1.0)),
             );
         }
         None => {
-            super::library::art::draw_poster_placeholder(canvas, fonts, Some(game), art, k, 1.0)
+            super::library::art::draw_poster_placeholder(canvas, ui, fonts, Some(game), art, k, 1.0)
         }
     }
     canvas.restore();
     let x = f64::from(art.right) + 28.0 * k;
     let w = f64::from(rect.right) - x - pad;
     let mut y = f64::from(art.top) + 26.0 * k;
-    fonts.draw_clipped(canvas, &game.title, x, y, W::Bold, 26.0 * k, fg(1.0), w);
+    fonts.draw_clipped(canvas, &game.title, x, y, W::Bold, 26.0 * k, ui.fg(1.0), w);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -1065,7 +1067,7 @@ fn title_card(
     ];
     for line in facts.into_iter().flatten().filter(|l| !l.is_empty()) {
         y += 24.0 * k;
-        fonts.draw_clipped(canvas, &line, x, y, W::Regular, 15.0 * k, fg(0.7), w);
+        fonts.draw_clipped(canvas, &line, x, y, W::Regular, 15.0 * k, ui.fg(0.7), w);
     }
     Rect::from_ltrb(
         (x - 24.0 * k) as f32,

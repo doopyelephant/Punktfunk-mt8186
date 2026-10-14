@@ -5,7 +5,7 @@ use crate::glyphs::{hint_bar, GlyphStyle};
 use crate::library::LibraryShared;
 use crate::model::HostRow;
 use crate::screens::{Bg, Ctx, Screen};
-use crate::theme::{edge, fg, Fonts, PanelStroke, EDGE_INSET, W};
+use crate::theme::{Fonts, Frame, PanelStroke, EDGE_INSET, W};
 use crate::widgets::{text_tab, tray, Toward};
 use pf_client_core::menu_nav::PadInfo;
 use pf_client_core::trust;
@@ -59,7 +59,6 @@ impl Shell {
         pad_pref: Option<punktfunk_core::config::GamepadPref>,
         pads: &[PadInfo],
     ) {
-        crate::el::begin_frame();
         let now = Instant::now();
         let dt = self
             .last_frame
@@ -78,18 +77,16 @@ impl Shell {
         self.sync();
         self.tick_touch();
         self.tick_ok();
-        // Publish ink before any draw. Widgets read `theme::set_ink`; skipping this
-        // paints the previous palette's text on the new field.
-        crate::theme::set_ink(self.backdrop.ink);
-        // Same publish-once contract as ink. Also a local: `LayerEnv` mut-borrows
-        // `settings`, so the transition arms cannot read the field.
+        // Everything this frame draws reads the frame built here. A local too: `LayerEnv`
+        // mut-borrows `settings`, so the transition arms cannot read the field.
         let reduce = self.reduce_motion();
-        crate::theme::set_reduce_motion(reduce);
-        crate::theme::set_reduced_ui(crate::screens::settings::rows::reduce_ui_res(
+        let reduced_ui = crate::screens::settings::rows::reduce_ui_res(
             &self.settings,
             self.device.platform,
             self.device.fallback_ui,
-        ));
+        );
+        let side = f64::from(viewport.insets.left);
+        self.ui = self.ui.next(self.backdrop.ink, reduce, reduced_ui, side);
         self.pads = pads.to_vec();
         self.glyphs = glyph_style(self.input_source, pad_pref, self.device.platform);
         if let Some(Screen::InputTest(test)) = self.stack.last_mut() {
@@ -115,7 +112,6 @@ impl Shell {
             full_h - f64::from(ins.top) - f64::from(ins.bottom),
         );
         self.last_insets = (ins.left, ins.top);
-        crate::theme::set_side_inset(f64::from(ins.left));
         self.last_full = (full_w as f32, full_h as f32);
         self.last_k = k;
         let t = self.t();
@@ -166,7 +162,7 @@ impl Shell {
                     k,
                 )
             });
-            (w - 2.0 * edge(k) - chip_w - 12.0 * k).max(w * 0.35)
+            (w - 2.0 * self.ui.edge(k) - chip_w - 12.0 * k).max(w * 0.35)
         };
         let games_ok = self.games_host().is_some();
         let (tab, strip_focus) = (self.tab, self.strip_focus);
@@ -193,6 +189,7 @@ impl Shell {
             device: &self.device,
             t,
             profiles: &self.profiles,
+            ui: &self.ui,
             glyphs: self.glyphs,
             show_hints,
             cheap: false,
@@ -296,12 +293,13 @@ impl Shell {
             let mark_w = 15.0 * k;
             let battery = self.pads.first().and_then(|p| p.battery);
             let bw = chip_width(fonts, chip, battery.is_some(), k);
-            let bx = w - edge(k) - bw;
+            let bx = w - self.ui.edge(k) - bw;
             // Centred on the tabs' line.
             let top = (STRIP_TOP + STRIP_H / 2.0) * k - bh / 2.0;
             let rect = Rect::from_xywh(bx as f32, top as f32, bw as f32, bh as f32);
             crate::theme::panel(
                 canvas,
+                &self.ui,
                 rect,
                 (bh / 2.0 / k) as f32,
                 None,
@@ -314,7 +312,8 @@ impl Shell {
                 Some(pad_pref.unwrap_or_default()),
                 self.device.platform,
             );
-            crate::glyphs::pad_mark(canvas, mark, bx + pad_x, cy, mark_w, k, fg(0.7));
+            let ink = self.ui.fg(0.7);
+            crate::glyphs::pad_mark(canvas, mark, bx + pad_x, cy, mark_w, k, ink);
             fonts.draw(
                 canvas,
                 chip,
@@ -322,11 +321,12 @@ impl Shell {
                 cy + size * 0.36,
                 W::Medium,
                 size,
-                fg(0.7),
+                ink,
             );
             if let Some(b) = battery {
                 crate::glyphs::battery_pip(
                     canvas,
+                    &self.ui,
                     bx + pad_x + mark_w + gap + tw + gap,
                     cy,
                     22.0 * k,
@@ -433,6 +433,7 @@ struct LayerEnv<'a> {
     device: &'a crate::screens::Device,
     t: f64,
     profiles: &'a crate::screens::profiles::ProfileBook,
+    ui: &'a Frame,
     glyphs: GlyphStyle,
     show_hints: bool,
     /// Reduced UI resolution, as the last painted screen's settings say.
@@ -483,7 +484,7 @@ impl LayerEnv<'_> {
         }
         // A list's own soft edges copy the surface, which has none of this layer: they
         // would blur the field behind it over the rows. Off for the transition.
-        crate::blur::set_in_layer(layered);
+        self.ui.in_layer.set(layered);
         // Pinned chrome records over the whole canvas, past the safe area, so a band's
         // scrim reaches the glass. Read before the slide moves the clip.
         let edges = canvas
@@ -508,12 +509,15 @@ impl LayerEnv<'_> {
             device: self.device,
             t: self.t,
             profiles: self.profiles,
+            ui: self.ui,
         };
         // With focus on the tabs, a root's plate fades out. A root's target count says if
         // focus can enter.
-        crate::el::set_dormant(self.strip_focus && band == Band::Strip);
+        self.ui
+            .el
+            .set_dormant(self.strip_focus && band == Band::Strip);
         let (mut pinned, mut pinned_pic) = ((0.0, 0.0), None);
-        let targets = crate::el::census(|| {
+        let targets = self.ui.el.census(|| {
             screen
                 .view_mut()
                 .render(canvas, self.content, self.k, self.dt, self.fonts, &mut ctx);
@@ -528,7 +532,7 @@ impl LayerEnv<'_> {
                 pinned_pic = rec.finish_recording_as_picture(None);
             }
         });
-        crate::el::set_dormant(false);
+        self.ui.el.set_dormant(false);
         if band == Band::Strip {
             self.root_targets = Some(targets);
         }
@@ -544,7 +548,7 @@ impl LayerEnv<'_> {
             Vec::new()
         };
         canvas.restore();
-        crate::blur::set_in_layer(false);
+        self.ui.in_layer.set(false);
         Chrome {
             alpha,
             band,
@@ -566,10 +570,10 @@ impl LayerEnv<'_> {
         let edges = canvas.local_clip_bounds().unwrap_or(content);
         let (into_top, into_bottom) = tray_reach(layers);
         let top = Rect::from_ltrb(edges.left, edges.top, edges.right, content.top + into_top);
-        tray(canvas, top, Toward::Top, k);
+        tray(canvas, self.ui, top, Toward::Top, k);
         let foot = content.bottom - into_bottom;
         let bottom = Rect::from_ltrb(edges.left, foot, edges.right, edges.bottom);
-        tray(canvas, bottom, Toward::Bottom, k);
+        tray(canvas, self.ui, bottom, Toward::Bottom, k);
         for c in layers {
             let Some(pic) = &c.pinned_pic else {
                 continue;
@@ -596,14 +600,14 @@ impl LayerEnv<'_> {
             };
             if open_at(canvas, c.alpha) {
                 let k = self.k;
-                let (x, top) = (edge(k), 18.0 * k);
+                let (x, top) = (self.ui.edge(k), 18.0 * k);
                 let size = 30.0 * k;
                 self.fonts.heading(
                     canvas,
                     title,
                     W::Bold,
                     size,
-                    fg(1.0),
+                    self.ui.fg(1.0),
                     x,
                     top,
                     self.title_max_w,
@@ -615,8 +619,9 @@ impl LayerEnv<'_> {
         for c in layers.iter().filter(|c| !c.hints.is_empty()) {
             if open_at(canvas, c.alpha) {
                 let (k, glyphs) = (self.k, self.glyphs);
-                let (x, bottom) = (edge(k) - HINT_PAD * k, self.h - 18.0 * k);
-                rects = hint_bar(canvas, self.fonts, &c.hints, glyphs, x, bottom, k).rects;
+                let (x, bottom) = (self.ui.edge(k) - HINT_PAD * k, self.h - 18.0 * k);
+                let bar = hint_bar(canvas, self.ui, self.fonts, &c.hints, glyphs, x, bottom, k);
+                rects = bar.rects;
                 canvas.restore();
             }
         }
@@ -629,15 +634,15 @@ impl LayerEnv<'_> {
         let k = self.k;
         let (size, pad, gap) = (20.0 * k, 10.0 * k, 4.0 * k);
         let (h, top) = (STRIP_H * k, STRIP_TOP * k);
-        let mut x = edge(k) - pad;
+        let mut x = self.ui.edge(k) - pad;
         let mut row = El::column();
         for tab in TABS {
             let w = f64::from(self.fonts.measure(tab.name(), W::Bold, size)) + 2.0 * pad;
             let r = Rect::from_xywh(x as f32, top as f32, w as f32, h as f32);
             let ink = match (tab != Tab::Games || self.games_ok, tab == self.tab) {
-                (false, _) => fg(0.28),
-                (true, true) => fg(1.0),
-                (true, false) => fg(0.6),
+                (false, _) => self.ui.fg(0.28),
+                (true, true) => self.ui.fg(1.0),
+                (true, false) => self.ui.fg(0.6),
             };
             let fonts = self.fonts;
             row = row.child(
@@ -656,7 +661,7 @@ impl LayerEnv<'_> {
         self.strip
             .set_focus(self.strip_focus.then(|| pill_id(self.tab)));
         self.strip
-            .paint_focus(canvas, frame, k as f32, self.dt, self.cheap);
+            .paint_focus(canvas, self.ui, frame, k as f32, self.dt, self.cheap);
     }
 }
 

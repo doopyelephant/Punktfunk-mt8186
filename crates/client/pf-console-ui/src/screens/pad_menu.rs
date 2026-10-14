@@ -143,8 +143,9 @@ impl ScreenView for PadMenuScreen {
         k: f64,
         dt: f64,
         fonts: &Fonts,
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let rows: Vec<RowSpec> = self
             .rows
             .iter()
@@ -154,7 +155,8 @@ impl ScreenView for PadMenuScreen {
                 ..RowSpec::default()
             })
             .collect();
-        self.list.render(canvas, rect, &rows, fonts, k, dt, true);
+        self.list
+            .render(canvas, ui, rect, &rows, fonts, k, dt, true);
     }
 
     /// What the focused row does.

@@ -10,7 +10,7 @@ use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, LicenseSection};
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, ScreenView};
-use crate::theme::{edge, fg, Fonts, W};
+use crate::theme::{Fonts, W};
 use crate::widgets::{bleed_view, soft_scroll, Flick};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
@@ -196,11 +196,12 @@ impl ScreenView for LicensesScreen {
         k: f64,
         dt: f64,
         fonts: &Fonts,
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let (left, right) = (
-            f64::from(rect.left) + edge(k),
-            f64::from(rect.right) - edge(k),
+            f64::from(rect.left) + ui.edge(k),
+            f64::from(rect.right) - ui.edge(k),
         );
         let width = (right - left) as f32;
         let key = (width, k, self.host.is_some());
@@ -210,6 +211,7 @@ impl ScreenView for LicensesScreen {
         }
         self.flick.view_h = f64::from(rect.height());
         self.flick.step = Style::Body.line_height(k);
+        self.flick.reduced = ui.reduce_motion;
         self.flick.tick(dt);
 
         // With the trays on, the text runs on under the title and the legend and they blur
@@ -233,13 +235,21 @@ impl ScreenView for LicensesScreen {
                 let (size, w, alpha) = line.style.look();
                 let lh = line.style.line_height(k);
                 let baseline = y + lh * 0.72;
-                fonts.draw(canvas, &line.text, left, baseline, w, size * k, fg(alpha));
+                fonts.draw(
+                    canvas,
+                    &line.text,
+                    left,
+                    baseline,
+                    w,
+                    size * k,
+                    ui.fg(alpha),
+                );
             }
         };
         if crate::blur::active() {
             paint();
         } else {
-            soft_scroll(canvas, view, view, self.flick.scrolled(), k, paint);
+            soft_scroll(canvas, ui, view, view, self.flick.scrolled(), k, paint);
         }
     }
 }

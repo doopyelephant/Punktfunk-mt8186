@@ -550,9 +550,13 @@ impl Overlay for SkiaOverlay {
         // Size the face per drawer, don't scale the canvas: Skia hints at the
         // requested size. A magnified 14 px bitmap is mush.
         let font = self.font.as_ref().expect("init ran");
+        // The stream's chrome draws in the look the console last drew; a plain connect in
+        // the default one.
+        let fallback = crate::theme::Frame::default();
+        let ui = self.shell.as_ref().map_or(&fallback, |s| &s.ui);
         // Scrim under OSD/hint so those stay legible.
         if let Some(phase) = resize_phase {
-            draw_resize_scrim(canvas, font, ctx.width, ctx.height, phase, scale);
+            draw_resize_scrim(canvas, ui, font, ctx.width, ctx.height, phase, scale);
         }
         if let Some(stats) = &want.stats {
             let osd_scale = scale * ctx.stats_scale.clamp(0.5, 4.0);
@@ -605,7 +609,7 @@ impl Overlay for SkiaOverlay {
             let dt = ring_dt(&mut self.ring_drawn_at);
             if let Some(fonts) = self.fonts.as_ref() {
                 self.ring
-                    .render(canvas, ctx.width, ctx.height, scale, fonts, dt);
+                    .render(canvas, ui, ctx.width, ctx.height, scale, fonts, dt);
                 self.ring_k = f64::from(scale);
             }
         }
@@ -925,6 +929,7 @@ fn corner_pill(
 /// in-between frame instead.
 fn draw_resize_scrim(
     canvas: &Canvas,
+    ui: &crate::theme::Frame,
     base_font: &Font,
     width: u32,
     height: u32,
@@ -939,7 +944,7 @@ fn draw_resize_scrim(
     );
     let (cx, cy) = (f64::from(width) / 2.0, f64::from(height) / 2.0);
     let r = (f64::from(width.min(height)) * 0.045).clamp(16.0, 44.0);
-    crate::theme::spinner(canvas, cx, cy - r, r, phase);
+    crate::theme::spinner(canvas, ui, cx, cy - r, r, phase);
     let (_, metrics) = font.metrics();
     let label = "Resizing\u{2026}";
     let tw = font.measure_str(label, None).0;

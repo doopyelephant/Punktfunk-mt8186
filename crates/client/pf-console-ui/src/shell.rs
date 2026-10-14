@@ -165,10 +165,10 @@ pub(crate) enum ToastMark {
 }
 
 impl ToastKind {
-    pub(crate) fn look(self) -> (Color4f, ToastMark) {
+    pub(crate) fn look(self, ui: &crate::theme::Frame) -> (Color4f, ToastMark) {
         match self {
-            ToastKind::Info => (crate::theme::fg(0.55), ToastMark::Dot),
-            ToastKind::Success => (crate::theme::accent(1.0), ToastMark::Check),
+            ToastKind::Info => (ui.fg(0.55), ToastMark::Dot),
+            ToastKind::Success => (ui.accent(1.0), ToastMark::Check),
             // Fixed RGB: `moss` accent is green, `ember` is orange — either
             // would paint a failure in the "this is fine" colour.
             ToastKind::Error => (Color4f::new(0.93, 0.31, 0.28, 1.0), ToastMark::Bang),
@@ -375,6 +375,9 @@ pub(crate) struct Shell {
     last_frame: Option<Instant>,
     /// Last menu, pointer, key or text input — the idle clock ([`crate::console::IDLE_AFTER`]).
     last_input: Instant,
+    /// The last frame's ink, motion and inset: what the next frame follows on from, what
+    /// input between frames reads, and what a host's chrome over a stream draws in.
+    pub(crate) ui: crate::theme::Frame,
     /// Test-only `(t, step)`: clock reads `t` and each frame adds `step`.
     /// The aurora phase *is* the clock; wall time never agrees across dumps.
     #[cfg(test)]
@@ -470,6 +473,7 @@ impl Shell {
             t0: Instant::now(),
             last_frame: None,
             last_input: Instant::now(),
+            ui: crate::theme::Frame::default(),
             #[cfg(test)]
             fake_clock: None,
         })
@@ -607,6 +611,7 @@ impl Shell {
             device: &self.device,
             t,
             profiles: &self.profiles,
+            ui: &self.ui,
         };
         (ctx, self.stack.last_mut().expect("non-empty stack"))
     }
@@ -1030,7 +1035,7 @@ impl Shell {
         self.games_key = games_key;
         // The saved generation, so a list published meanwhile is still taken on the next sync.
         (self.hosts, self.hosts_gen) = hosts;
-        crate::el::forget_handoff();
+        self.ui.el.forget_handoff();
     }
 
     /// Warm-up only: every shelf drawn or parked shows the stand-in cover, entrance over.

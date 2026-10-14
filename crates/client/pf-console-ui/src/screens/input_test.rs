@@ -12,7 +12,7 @@ use crate::model::PadTestState;
 use crate::pad_art::{self, PadArt, Part};
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, ScreenView};
-use crate::theme::{accent, card_face, fg, fill, on_accent, over, shaded, stroke, Fonts, W};
+use crate::theme::{fill, over, shaded, stroke, Fonts, Frame, W};
 use crate::widgets::blurb;
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use punktfunk_core::config::GamepadPref;
@@ -93,10 +93,12 @@ impl ScreenView for InputTestScreen {
         k: f64,
         _dt: f64,
         fonts: &Fonts,
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let below = blurb(
             canvas,
+            ui,
             fonts,
             "Every button and stick on the controller shows here. Hold B to finish.",
             rect,
@@ -119,7 +121,7 @@ impl ScreenView for InputTestScreen {
         let (w, h) = (f64::from(art.w) * scale, f64::from(art.h) * scale);
         let x = f64::from(rect.center_x()) - w / 2.0;
         let top = f64::from(below.top) + gap;
-        draw_pad(canvas, fonts, drawing, &self.state, x, top, scale, k);
+        draw_pad(canvas, ui, fonts, drawing, &self.state, x, top, scale, k);
         let last = match &self.last {
             Some(input) => format!("Last input \u{2014} {input}"),
             None => "Press a button or move a stick".into(),
@@ -128,7 +130,15 @@ impl ScreenView for InputTestScreen {
         let tw = f64::from(fonts.measure(&last, W::Regular, size));
         let y = top + h + gap + line * 0.5;
         let cx = f64::from(rect.center_x());
-        fonts.draw(canvas, &last, cx - tw / 2.0, y, W::Regular, size, fg(0.6));
+        fonts.draw(
+            canvas,
+            &last,
+            cx - tw / 2.0,
+            y,
+            W::Regular,
+            size,
+            ui.fg(0.6),
+        );
     }
 
     fn title(&self) -> String {
@@ -209,6 +219,7 @@ const TRAVEL: f32 = 0.42;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_pad(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     drawing: &Drawing,
     state: &PadTestState,
@@ -220,17 +231,17 @@ pub(crate) fn draw_pad(
     let s = scale as f32;
     // One screen pixel, in millimetres.
     let px = k as f32 / s;
-    let base = card_face(0.12);
-    let tone = |share: f32| over(fg(share), base);
+    let base = ui.card_face(0.12);
+    let tone = |share: f32| over(ui.fg(share), base);
     let black = |share: f32| over(Color4f::new(0.0, 0.0, 0.0, share), base);
     let rim = |color: Color4f, width: f32| {
         let mut p = stroke(color, width * px);
         p.set_stroke_join(PaintJoin::Round);
         p
     };
-    let ink = |on: bool| if on { on_accent() } else { tone(0.75) };
+    let ink = |on: bool| if on { ui.on_accent() } else { tone(0.75) };
     let glow = || {
-        let mut p = fill(accent(0.9));
+        let mut p = fill(ui.accent(0.9));
         p.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 1.5 * px, None));
         p
     };
@@ -270,8 +281,8 @@ pub(crate) fn draw_pad(
                 if on {
                     canvas.draw_path(path, &glow());
                 }
-                canvas.draw_path(path, &fill(if on { accent(1.0) } else { tone(0.14) }));
-                canvas.draw_path(path, &rim(if on { accent(1.0) } else { tone(0.3) }, 1.0));
+                canvas.draw_path(path, &fill(if on { ui.accent(1.0) } else { tone(0.14) }));
+                canvas.draw_path(path, &rim(if on { ui.accent(1.0) } else { tone(0.3) }, 1.0));
             }
             (Part::Trigger(id, _), Some(path)) => {
                 let pull = if state.held(id) {
@@ -286,10 +297,14 @@ pub(crate) fn draw_pad(
                     canvas.save();
                     canvas.clip_path(path, None, true);
                     let lit = Rect::from_ltrb(b.left, b.top, b.right, b.top + b.height() * pull);
-                    canvas.draw_rect(lit, &fill(accent(1.0)));
+                    canvas.draw_rect(lit, &fill(ui.accent(1.0)));
                     canvas.restore();
                 }
-                let edge = if pull > 0.0 { accent(1.0) } else { tone(0.3) };
+                let edge = if pull > 0.0 {
+                    ui.accent(1.0)
+                } else {
+                    tone(0.3)
+                };
                 canvas.draw_path(path, &rim(edge, 1.0));
             }
             (&Part::Stick { id, cx, cy, r, pad }, _) => {
@@ -297,7 +312,7 @@ pub(crate) fn draw_pad(
                 let (dx, dy) = state.tilt(id);
                 let travel = r * if pad { 0.8 } else { TRAVEL };
                 let well = if on && pad {
-                    over(accent(0.4), base)
+                    over(ui.accent(0.4), base)
                 } else {
                     black(0.32)
                 };
@@ -306,19 +321,19 @@ pub(crate) fn draw_pad(
                 let cap = Point::new(cx + dx * travel, cy + dy * travel);
                 if pad {
                     if dx != 0.0 || dy != 0.0 {
-                        canvas.draw_circle(cap, r * 0.16, &fill(accent(1.0)));
+                        canvas.draw_circle(cap, r * 0.16, &fill(ui.accent(1.0)));
                     }
                     continue;
                 }
                 if on {
                     canvas.draw_circle(cap, r * CAP, &glow());
                 }
-                let face = if on { accent(1.0) } else { tone(0.24) };
+                let face = if on { ui.accent(1.0) } else { tone(0.24) };
                 canvas.draw_circle(cap, r * CAP, &fill(face));
-                let edge = if on { accent(1.0) } else { tone(0.45) };
+                let edge = if on { ui.accent(1.0) } else { tone(0.45) };
                 canvas.draw_circle(cap, r * CAP, &rim(edge, 1.0));
                 // The cap's dish.
-                let dish = if on { on_accent() } else { tone(0.12) };
+                let dish = if on { ui.on_accent() } else { tone(0.12) };
                 canvas.draw_circle(cap, r * CAP * 0.58, &rim(dish, 1.0));
             }
             (Part::Glyph { on, w, .. }, Some(path)) => {
@@ -458,6 +473,7 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_pad_test() {
+        let ui = &crate::theme::Frame::default();
         let dir = std::env::var("PF_CONSOLE_DUMP").expect("set PF_CONSOLE_DUMP");
         let fonts = crate::theme::build_fonts().unwrap();
         let s = state(
@@ -479,7 +495,7 @@ mod tests {
             surface
                 .canvas()
                 .clear(skia_safe::Color::from_rgb(18, 20, 28));
-            draw_pad(surface.canvas(), &fonts, &d, &s, 20.0, 20.0, scale, 1.0);
+            draw_pad(surface.canvas(), ui, &fonts, &d, &s, 20.0, 20.0, scale, 1.0);
             let png = surface
                 .image_snapshot()
                 .encode(None, skia_safe::EncodedImageFormat::PNG, 100)

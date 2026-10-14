@@ -2,7 +2,7 @@
 
 use crate::el::{El, Id, Tree};
 use crate::pointer::Pointer;
-use crate::theme::{edge, fg, Fonts, PanelStroke, W};
+use crate::theme::{Fonts, Frame, PanelStroke, W};
 use skia_safe::{Canvas, Rect};
 
 /// Strip band height, including air under the pills before the first row.
@@ -34,16 +34,24 @@ pub(crate) const BUTTON_PAD: f64 = 18.0;
 pub(crate) const BUTTON_H: f64 = 38.0;
 
 /// The console's button: a glass pill with its label. The plate behind it is focus.
-pub(crate) fn button(canvas: &Canvas, fonts: &Fonts, label: &str, r: Rect, k: f64) {
+pub(crate) fn button(canvas: &Canvas, ui: &Frame, fonts: &Fonts, label: &str, r: Rect, k: f64) {
     let corner = (f64::from(r.height()) / 2.0 / k) as f32;
-    crate::theme::panel(canvas, r, corner, None, PanelStroke::Plain(0.08), k as f32);
+    crate::theme::panel(
+        canvas,
+        ui,
+        r,
+        corner,
+        None,
+        PanelStroke::Plain(0.08),
+        k as f32,
+    );
     let size = BUTTON_TEXT * k;
     let tw = f64::from(fonts.measure(label, W::SemiBold, size));
     let (x, y) = (
         f64::from(r.center_x()) - tw / 2.0,
         f64::from(r.center_y()) + size * 0.36,
     );
-    fonts.draw(canvas, label, x, y, W::SemiBold, size, fg(0.95));
+    fonts.draw(canvas, label, x, y, W::SemiBold, size, ui.fg(0.95));
 }
 
 /// A button's width for `label`, device px.
@@ -119,12 +127,13 @@ impl TabStrip {
         p.press().then(|| p.pick(&self.pills)).flatten()
     }
 
-    /// Draw the tabs on the leading edge of `rect`'s top band, the text on [`edge`].
+    /// Draw the tabs on the leading edge of `rect`'s top band, the text on [`Frame::edge`].
     /// `focused` is D-pad focus (no-shoulder remote): the plate stands behind the current tab.
     #[allow(clippy::too_many_arguments)] // same render signature as MenuList
     pub fn render(
         &mut self,
         canvas: &Canvas,
+        ui: &Frame,
         rect: Rect,
         labels: &[&str],
         selected: usize,
@@ -142,7 +151,7 @@ impl TabStrip {
         // two pieces of chrome. Clamp, not a branch: full inset, then centred, then
         // flush-left (overflow spends on the unread right).
         let slack = f64::from(rect.width()) - total;
-        let mut x = f64::from(rect.left) + (edge(k) - pad).min((slack / 2.0).max(0.0));
+        let mut x = f64::from(rect.left) + (ui.edge(k) - pad).min((slack / 2.0).max(0.0));
         let top = f64::from(rect.top) + TAB_PILL_TOP * k;
         let sel = selected.min(labels.len() - 1);
         self.pills.clear();
@@ -152,7 +161,7 @@ impl TabStrip {
             let hit = rect.height().max((pill_h + 4.0 * k) as f32);
             self.pills
                 .push(Rect::from_xywh(x as f32, rect.top, widths[i] as f32, hit));
-            let ink = fg(if i == sel { 1.0 } else { 0.6 });
+            let ink = ui.fg(if i == sel { 1.0 } else { 0.6 });
             let r = Rect::from_xywh(
                 x as f32 - rect.left,
                 top as f32 - rect.top,
@@ -169,7 +178,8 @@ impl TabStrip {
         }
         let frame = self.tree.layout(row, rect);
         self.tree.set_focus(focused.then(|| tab_id(sel)));
-        self.tree.paint_focus(canvas, frame, k as f32, dt, false);
+        self.tree
+            .paint_focus(canvas, ui, frame, k as f32, dt, false);
     }
 }
 
@@ -190,13 +200,24 @@ mod tests {
     /// Focused, a burst of section changes leaves the plate on the selected tab.
     #[test]
     fn the_plate_lands_on_the_selected_tab() {
+        let ui = &crate::theme::Frame::default();
         let fonts = crate::theme::build_fonts().unwrap();
         let mut surface = skia_safe::surfaces::raster_n32_premul((900, 120)).unwrap();
         let rect = Rect::from_xywh(0.0, 0.0, 900.0, TAB_STRIP_H as f32);
         let mut strip = TabStrip::new();
         let dt = 1.0 / 60.0;
         for sel in (0..=5).chain([5; 240]) {
-            strip.render(surface.canvas(), rect, &TABS, sel, true, &fonts, 1.0, dt);
+            strip.render(
+                surface.canvas(),
+                ui,
+                rect,
+                &TABS,
+                sel,
+                true,
+                &fonts,
+                1.0,
+                dt,
+            );
         }
         let pill = strip.pill(5).expect("the selected tab was drawn");
         let (plate, _) = strip
@@ -209,11 +230,12 @@ mod tests {
         );
     }
 
-    /// Same column as the heading ([`edge`]); a shrinking window gives it
+    /// Same column as the heading ([`Frame::edge`]); a shrinking window gives it
     /// up as inset, then centred, then flush. Ordering, not three pixel x's,
     /// so a renamed tab does not break the pin.
     #[test]
     fn tab_strip_stands_on_the_edge_inset_and_gives_it_up_in_order() {
+        let ui = &crate::theme::Frame::default();
         let fonts = crate::theme::build_fonts().unwrap();
         let mut surface = skia_safe::surfaces::raster_n32_premul((1400, 160)).unwrap();
         let dt = 1.0 / 60.0;
@@ -221,7 +243,7 @@ mod tests {
         let mut run = |w: f32, k: f64| {
             let rect = Rect::from_xywh(0.0, 0.0, w, (TAB_STRIP_H * k) as f32);
             let mut strip = TabStrip::new();
-            strip.render(surface.canvas(), rect, &TABS, 0, false, &fonts, k, dt);
+            strip.render(surface.canvas(), ui, rect, &TABS, 0, false, &fonts, k, dt);
             let first = strip.pill(0).expect("the first section was drawn");
             let text = f64::from(first.left) + PILL_PAD_X * k;
             let last = strip
@@ -234,9 +256,9 @@ mod tests {
         for k in [0.75, 1.0, 2.0] {
             let (rect, _, right, left) = run(1400.0, k);
             assert!(
-                (left - (f64::from(rect.left) + edge(k))).abs() < 0.5,
+                (left - (f64::from(rect.left) + ui.edge(k))).abs() < 0.5,
                 "k={k}: strip starts at {left}, not on the {} column",
-                edge(k)
+                ui.edge(k)
             );
             assert!(
                 right <= f64::from(rect.right),

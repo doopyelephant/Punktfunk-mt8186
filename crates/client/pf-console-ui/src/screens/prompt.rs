@@ -126,16 +126,18 @@ impl ScreenView for PromptScreen {
         k: f64,
         dt: f64,
         fonts: &Fonts,
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let rows: Vec<RowSpec> = (self.prompt.choices.iter())
             .map(|label| RowSpec {
                 label: label.clone(),
                 ..RowSpec::default()
             })
             .collect();
-        let rest = blurb(canvas, fonts, &self.prompt.message, rect, k);
-        self.list.render(canvas, rest, &rows, fonts, k, dt, true);
+        let rest = blurb(canvas, ui, fonts, &self.prompt.message, rect, k);
+        self.list
+            .render(canvas, ui, rest, &rows, fonts, k, dt, true);
     }
 
     fn press(&mut self) {

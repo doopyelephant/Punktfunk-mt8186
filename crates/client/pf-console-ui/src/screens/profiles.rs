@@ -15,7 +15,7 @@ use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow, ProfilesAnswer};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, ProfileAsk, Screen, ScreenView, Seated};
-use crate::theme::{accent, edge, fg, fill, Fonts, PanelStroke, W};
+use crate::theme::{fill, Fonts, Frame, PanelStroke, W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::profiles::{initials, ListedProfile, ProfilePick};
 use skia_safe::{Canvas, Color4f, RRect, Rect};
@@ -471,21 +471,28 @@ impl ProfilesScreen {
     }
 
     /// The hosts line, centred while it fits; it scrolls to keep the focused host in view.
-    fn hosts_el<'a>(&self, hosts: &[&'a HostRow], fonts: &'a Fonts, width: f64, k: f64) -> El<'a> {
+    fn hosts_el<'a>(
+        &self,
+        ui: &'a Frame,
+        hosts: &[&'a HostRow],
+        fonts: &'a Fonts,
+        width: f64,
+        k: f64,
+    ) -> El<'a> {
         let size = HOST_TEXT * k;
         let gap = 10.0 * k;
         let widths: Vec<f64> = (hosts.iter())
             .map(|h| f64::from(fonts.measure(&h.name, W::Bold, size)) + 2.0 * HOST_PAD * k)
             .collect();
         let run = widths.iter().sum::<f64>() + gap * widths.len().saturating_sub(1) as f64;
-        let margin = edge(k);
+        let margin = ui.edge(k);
         let mut x = ((width - run) / 2.0).max(margin);
         let air = (32.0 * k) as f32;
         let h = HOST_H * k;
         let mut row = El::column();
         for (i, (&host, w)) in hosts.iter().zip(widths).enumerate() {
             let shown = host.key == self.ask.key;
-            let ink = fg(if shown { 1.0 } else { 0.6 });
+            let ink = ui.fg(if shown { 1.0 } else { 0.6 });
             let name = host.name.as_str();
             row = row.child(
                 El::paint(move |canvas, r| {
@@ -620,6 +627,7 @@ impl ScreenView for ProfilesScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let width = f64::from(rect.width());
         let hosts: Vec<&HostRow> = match self.mode {
             Mode::Games => paired_hosts(ctx.hosts).collect(),
@@ -630,21 +638,30 @@ impl ScreenView for ProfilesScreen {
         let mut root = El::column();
         let mut top = 0.0;
         if !hosts.is_empty() {
-            root = root.child(self.hosts_el(&hosts, fonts, width, k));
+            root = root.child(self.hosts_el(ui, &hosts, fonts, width, k));
             top += (HOST_H + HOST_AIR) * k;
         }
         // The line sits centred over the circles it speaks for.
         if let Some(line) = self.line() {
-            let (size, max_w) = (15.0 * k, width - 2.0 * edge(k));
+            let (size, max_w) = (15.0 * k, width - 2.0 * ui.edge(k));
             let tw = f64::from(fonts.measure(&line, W::Regular, size)).min(max_w);
             let x = f64::from(rect.center_x()) - tw / 2.0;
             let baseline = f64::from(rect.top) + top + 20.0 * k;
-            fonts.draw_clipped(canvas, &line, x, baseline, W::Regular, size, fg(0.7), max_w);
+            fonts.draw_clipped(
+                canvas,
+                &line,
+                x,
+                baseline,
+                W::Regular,
+                size,
+                ui.fg(0.7),
+                max_w,
+            );
             top += 32.0 * k;
         }
         if self.waiting() {
             let cy = f64::from(rect.top) + top + 60.0 * k;
-            crate::theme::spinner(canvas, f64::from(rect.center_x()), cy, 14.0 * k, ctx.t);
+            crate::theme::spinner(canvas, ui, f64::from(rect.center_x()), cy, 14.0 * k, ctx.t);
         }
         let switch = self.mode == Mode::Connect && !self.faces().is_empty();
         let foot = if switch { (REMEMBER_H + 24.0) * k } else { 0.0 };
@@ -655,7 +672,7 @@ impl ScreenView for ProfilesScreen {
         // How much of the circles' room they fill: the switch sits right under them.
         let mut used = 0.0;
         if cells > 0 {
-            let avail = width - 2.0 * edge(k);
+            let avail = width - 2.0 * ui.edge(k);
             let gap = CELL_GAP * k;
             let cols = (((avail + gap) / (CELL_W * k + gap)).floor() as usize).clamp(1, cells);
             let cw = ((avail - gap * (cols - 1) as f64) / cols as f64).min(CELL_W * k);
@@ -685,6 +702,7 @@ impl ScreenView for ProfilesScreen {
                                     match p {
                                         Some(p) => draw_face(
                                             canvas,
+                                            ui,
                                             fonts,
                                             &p.display_name,
                                             p.accent.as_deref(),
@@ -692,11 +710,11 @@ impl ScreenView for ProfilesScreen {
                                             cy,
                                             r,
                                         ),
-                                        None => draw_ask(canvas, fonts, cx, cy, r),
+                                        None => draw_ask(canvas, ui, fonts, cx, cy, r),
                                     }
                                     if chosen {
                                         let ring = (3.0 * k) as f32;
-                                        let mut paint = crate::theme::stroke(fg(0.9), ring);
+                                        let mut paint = crate::theme::stroke(ui.fg(0.9), ring);
                                         paint.set_anti_alias(true);
                                         canvas.draw_circle((cx, cy), r as f32 + ring * 2.0, &paint);
                                     }
@@ -707,8 +725,10 @@ impl ScreenView for ProfilesScreen {
                             )
                             .child(
                                 El::paint(move |canvas, cell| match p {
-                                    Some(p) => draw_caption(canvas, fonts, p, cell, k),
-                                    None => draw_label(canvas, fonts, "Ask every time", cell, k),
+                                    Some(p) => draw_caption(canvas, ui, fonts, p, cell, k),
+                                    None => {
+                                        draw_label(canvas, ui, fonts, "Ask every time", cell, k)
+                                    }
                                 })
                                 .size(cw as f32, (52.0 * k) as f32),
                             )
@@ -742,7 +762,7 @@ impl ScreenView for ProfilesScreen {
                 (REMEMBER_H * k) as f32,
             );
             root = root.child(
-                El::paint(move |canvas, r| draw_remember(canvas, fonts, on, r, k))
+                El::paint(move |canvas, r| draw_remember(canvas, ui, fonts, on, r, k))
                     .id(remember_id())
                     .focusable((REMEMBER_H * k / 2.0) as f32)
                     .place(r),
@@ -755,7 +775,7 @@ impl ScreenView for ProfilesScreen {
                 tree.follow(
                     grid,
                     (r.center_y() - view.center_y()).clamp(0.0, max),
-                    false,
+                    ui.reduce_motion,
                 );
             }
         }
@@ -764,7 +784,7 @@ impl ScreenView for ProfilesScreen {
                 tree.follow(
                     hosts_id(),
                     (r.center_x() - view.center_x()).clamp(0.0, max),
-                    false,
+                    ui.reduce_motion,
                 );
             }
         }
@@ -774,7 +794,7 @@ impl ScreenView for ProfilesScreen {
             ctx.device.platform,
             ctx.device.fallback_ui,
         );
-        tree.paint_focus(canvas, frame, k as f32, dt, cheap);
+        tree.paint_focus(canvas, ui, frame, k as f32, dt, cheap);
         let targets = (0..hosts.len())
             .map(Focus::Host)
             .chain((0..cells).map(Focus::Face))
@@ -787,41 +807,49 @@ impl ScreenView for ProfilesScreen {
 }
 
 /// The name under a circle, and its one line where it has one (`ListedProfile::note`).
-fn draw_caption(canvas: &Canvas, fonts: &Fonts, p: &ListedProfile, cell: Rect, k: f64) {
-    draw_label(canvas, fonts, &p.display_name, cell, k);
+fn draw_caption(canvas: &Canvas, ui: &Frame, fonts: &Fonts, p: &ListedProfile, cell: Rect, k: f64) {
+    draw_label(canvas, ui, fonts, &p.display_name, cell, k);
     if let Some(note) = p.note() {
         let w = f64::from(cell.width());
         let size = 14.0 * k;
         let tw = f64::from(fonts.measure(&note, W::Regular, size)).min(w);
         let x = f64::from(cell.center_x()) - tw / 2.0;
         let base = f64::from(cell.top) + 42.0 * k;
-        fonts.draw_clipped(canvas, &note, x, base, W::Regular, size, fg(0.6), w);
+        fonts.draw_clipped(canvas, &note, x, base, W::Regular, size, ui.fg(0.6), w);
     }
 }
 
 /// A circle's name, bold and centred at the top of `cell`.
-fn draw_label(canvas: &Canvas, fonts: &Fonts, text: &str, cell: Rect, k: f64) {
+fn draw_label(canvas: &Canvas, ui: &Frame, fonts: &Fonts, text: &str, cell: Rect, k: f64) {
     let w = f64::from(cell.width());
     let size = 19.0 * k;
     let tw = f64::from(fonts.measure(text, W::Bold, size)).min(w);
     let x = f64::from(cell.center_x()) - tw / 2.0;
     let base = f64::from(cell.top) + 20.0 * k;
-    fonts.draw_clipped(canvas, text, x, base, W::Bold, size, fg(1.0), w);
+    fonts.draw_clipped(canvas, text, x, base, W::Bold, size, ui.fg(1.0), w);
 }
 
 /// Ask every time's circle: a question mark on the field.
-fn draw_ask(canvas: &Canvas, fonts: &Fonts, cx: f32, cy: f32, r: f64) {
-    canvas.draw_circle((cx, cy), r as f32, &fill(fg(0.1)));
+fn draw_ask(canvas: &Canvas, ui: &Frame, fonts: &Fonts, cx: f32, cy: f32, r: f64) {
+    canvas.draw_circle((cx, cy), r as f32, &fill(ui.fg(0.1)));
     let size = r * 0.78;
     let tw = f64::from(fonts.measure("?", W::Bold, size));
     let (x, y) = (f64::from(cx) - tw / 2.0, f64::from(cy) + size * 0.36);
-    fonts.draw(canvas, "?", x, y, W::Bold, size, fg(0.9));
+    fonts.draw(canvas, "?", x, y, W::Bold, size, ui.fg(0.9));
 }
 
 /// The Remember pill: its label, then a switch.
-fn draw_remember(canvas: &Canvas, fonts: &Fonts, on: bool, r: Rect, k: f64) {
+fn draw_remember(canvas: &Canvas, ui: &Frame, fonts: &Fonts, on: bool, r: Rect, k: f64) {
     let corner = (f64::from(r.height()) / 2.0 / k) as f32;
-    crate::theme::panel(canvas, r, corner, None, PanelStroke::Plain(0.08), k as f32);
+    crate::theme::panel(
+        canvas,
+        ui,
+        r,
+        corner,
+        None,
+        PanelStroke::Plain(0.08),
+        k as f32,
+    );
     let size = 15.0 * k;
     let (x, cy) = (f64::from(r.left) + 20.0 * k, f64::from(r.center_y()));
     fonts.draw(
@@ -831,7 +859,7 @@ fn draw_remember(canvas: &Canvas, fonts: &Fonts, on: bool, r: Rect, k: f64) {
         cy + size * 0.36,
         W::SemiBold,
         size,
-        fg(0.95),
+        ui.fg(0.95),
     );
     let (tw, th) = (36.0 * k, 20.0 * k);
     let track = Rect::from_xywh(
@@ -840,7 +868,7 @@ fn draw_remember(canvas: &Canvas, fonts: &Fonts, on: bool, r: Rect, k: f64) {
         tw as f32,
         th as f32,
     );
-    let ink = if on { accent(1.0) } else { fg(0.25) };
+    let ink = if on { ui.accent(1.0) } else { ui.fg(0.25) };
     let half = (th / 2.0) as f32;
     canvas.draw_rrect(RRect::new_rect_xy(track, half, half), &fill(ink));
     let kx = f64::from(track.left) + th / 2.0 + if on { tw - th } else { 0.0 };
@@ -853,7 +881,7 @@ fn draw_remember(canvas: &Canvas, fonts: &Fonts, on: bool, r: Rect, k: f64) {
 }
 
 /// `#RRGGBB`, else the palette's accent.
-fn accent_of(hex: Option<&str>) -> Color4f {
+fn accent_of(ui: &Frame, hex: Option<&str>) -> Color4f {
     let v = hex
         .and_then(|a| a.strip_prefix('#'))
         .filter(|h| h.len() == 6)
@@ -865,13 +893,15 @@ fn accent_of(hex: Option<&str>) -> Color4f {
             (v & 0xff) as f32 / 255.0,
             1.0,
         ),
-        None => crate::theme::accent(1.0),
+        None => ui.accent(1.0),
     }
 }
 
 /// A profile's face: its initials on its accent, in a circle of radius `r` at `cx, cy`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_face(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     name: &str,
     accent: Option<&str>,
@@ -879,7 +909,7 @@ pub(crate) fn draw_face(
     cy: f32,
     r: f64,
 ) {
-    let bg = accent_of(accent);
+    let bg = accent_of(ui, accent);
     canvas.draw_circle((cx, cy), r as f32, &fill(bg));
     let luma = crate::theme::luma((f64::from(bg.r), f64::from(bg.g), f64::from(bg.b)));
     let ink = if luma > 0.6 {
@@ -909,6 +939,7 @@ pub(crate) fn draw_face(
 /// A remembered pick, small: its face on the palette's accent; `None` is Ask every time.
 pub(crate) fn draw_pick(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     pick: Option<&ProfilePick>,
     cx: f32,
@@ -916,8 +947,8 @@ pub(crate) fn draw_pick(
     r: f64,
 ) {
     match pick {
-        Some(p) => draw_face(canvas, fonts, &p.display_name, None, cx, cy, r),
-        None => draw_ask(canvas, fonts, cx, cy, r),
+        Some(p) => draw_face(canvas, ui, fonts, &p.display_name, None, cx, cy, r),
+        None => draw_ask(canvas, ui, fonts, cx, cy, r),
     }
 }
 

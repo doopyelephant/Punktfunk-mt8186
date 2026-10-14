@@ -11,7 +11,7 @@ use crate::glyphs::{Hint, HintKey};
 use crate::pointer::{Pointer, PointerKind};
 use crate::ring::{EditEvent, Ring, LABEL_H};
 use crate::screens::{Ctx, Outbox, Screen, ScreenView};
-use crate::theme::{card_face, edge, fg, fill, focus_halo, stroke, Fonts};
+use crate::theme::{fill, focus_halo, stroke, Fonts};
 use crate::widgets::{ListMsg, MenuList, RowSpec, ROW_MAX_W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::overlay_actions::{
@@ -453,6 +453,7 @@ impl ScreenView for RingEditorScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         if ctx.settings.overlay_actions != self.blob {
             let b = ctx.settings.overlay_actions.clone();
             self.adopt(&b, ctx.device.platform);
@@ -461,6 +462,7 @@ impl ScreenView for RingEditorScreen {
         let kf = k as f32;
         crate::widgets::blurb(
             canvas,
+            ui,
             fonts,
             "Point the stick at a button; A changes it. Y lifts a button and A drops it on \
              another to swap; with a pointer, click or drag.",
@@ -483,7 +485,7 @@ impl ScreenView for RingEditorScreen {
         };
         let rk = kf * fit;
         let stage_x = if side {
-            rect.left + (edge(k)) as f32
+            rect.left + (ui.edge(k)) as f32
         } else {
             rect.center_x() - stage_w / 2.0
         };
@@ -495,11 +497,11 @@ impl ScreenView for RingEditorScreen {
         );
         self.stage = stage;
         let rr = RRect::new_rect_xy(stage, CORNER as f32 * kf, CORNER as f32 * kf);
-        canvas.draw_rrect(rr, &fill(card_face(0.20)));
-        canvas.draw_rrect(rr, &stroke(fg(0.14), kf));
+        canvas.draw_rrect(rr, &fill(ui.card_face(0.20)));
+        canvas.draw_rrect(rr, &stroke(ui.fg(0.14), kf));
         if self.focus == Focus::Ring && self.picker.is_none() {
             // Corner in design units: `focus_halo` scales it. A pre-scaled corner double-scales.
-            focus_halo(canvas, stage, CORNER as f32, kf, 1.0);
+            focus_halo(canvas, ui, stage, CORNER as f32, kf, 1.0);
         }
 
         self.ring.recentre(
@@ -510,6 +512,7 @@ impl ScreenView for RingEditorScreen {
         canvas.clip_rrect(rr, None, None);
         self.ring.render(
             canvas,
+            ui,
             rect.right.max(1.0) as u32,
             rect.bottom.max(1.0) as u32,
             rk,
@@ -532,6 +535,7 @@ impl ScreenView for RingEditorScreen {
         let rows = self.rows();
         self.list.render(
             canvas,
+            ui,
             list_rect,
             &rows,
             fonts,
@@ -557,7 +561,7 @@ impl ScreenView for RingEditorScreen {
             );
             canvas.draw_rrect(
                 RRect::new_rect_xy(card, 16.0 * kf, 16.0 * kf),
-                &stroke(fg(0.18), kf),
+                &stroke(ui.fg(0.18), kf),
             );
             let inner = Rect::from_ltrb(
                 card.left + 8.0 * kf,
@@ -568,7 +572,8 @@ impl ScreenView for RingEditorScreen {
             let specs: Vec<RowSpec> = pk.rows.iter().map(|(_, r)| r.clone()).collect();
             canvas.save();
             canvas.clip_rect(inner, None, None);
-            pk.list.render(canvas, inner, &specs, fonts, k, dt, true);
+            pk.list
+                .render(canvas, ui, inner, &specs, fonts, k, dt, true);
             canvas.restore();
             pk.rect = card;
         }

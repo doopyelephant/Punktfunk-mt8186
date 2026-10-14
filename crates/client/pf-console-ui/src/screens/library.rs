@@ -28,7 +28,7 @@ use crate::library::{store_label, LibraryGame, LibraryPhase, LibraryShared, Libr
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{ConnectIntent, Ctx, Outbox, ScreenView};
-use crate::theme::{art_sampling, edge, fg, fill, stroke, Fonts, W};
+use crate::theme::{art_sampling, fill, stroke, Fonts, Frame, W};
 use crate::widgets::{button, button_w, BUTTON_H};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Image, RRect, Rect, M44};
@@ -80,7 +80,7 @@ const STATE_H: f64 = 190.0;
 /// Air a scroll keeps round the focused item, design units.
 const REVEAL_AIR: f64 = 20.0;
 /// Spinner for list-in-flight and the 400 ms art wait; nothing draws until entrance frame 1.
-fn draw_loading(canvas: &Canvas, rect: Rect, k: f64, fonts: &Fonts, t: f64) {
+fn draw_loading(canvas: &Canvas, ui: &Frame, rect: Rect, k: f64, fonts: &Fonts, t: f64) {
     let w = f64::from(rect.width());
     let cx = f64::from(rect.left) + w / 2.0;
     let cy = f64::from(rect.top) + f64::from(rect.height()) / 2.0;
@@ -90,12 +90,12 @@ fn draw_loading(canvas: &Canvas, rect: Rect, k: f64, fonts: &Fonts, t: f64) {
         "Loading library…",
         W::Regular,
         14.0 * k,
-        fg(0.55),
+        ui.fg(0.55),
         cx,
         cy + 26.0 * k,
         w * 0.8,
     );
-    crate::theme::spinner(canvas, cx, cy - 26.0 * k, 22.0 * k, t);
+    crate::theme::spinner(canvas, ui, cx, cy - 26.0 * k, 22.0 * k, t);
 }
 
 /// Write `library_sort` only. Screens re-read it each frame; assigning the field reverts.
@@ -282,7 +282,7 @@ impl LibraryScreen {
     }
 
     /// Arm once neighbourhood posters exist, or after 400 ms (art-less libraries still enter).
-    fn arm_entrance(&mut self, t: f64) {
+    fn arm_entrance(&mut self, t: f64, reduced: bool) {
         if self.entrance_armed || !matches!(self.phase, LibraryPhase::Ready) {
             return;
         }
@@ -303,7 +303,7 @@ impl LibraryScreen {
             } else {
                 entrances::GRID
             };
-            self.entrance = Some(Entrance::new(spec, cursor, t));
+            self.entrance = Some(Entrance::new(spec, cursor, t, reduced));
         }
     }
 
@@ -352,8 +352,8 @@ impl LibraryScreen {
     }
 
     /// Columns that fit `rect` at `k`. Per-frame: a stale count puts cursor and layout on different grids.
-    fn grid_cols(&self, rect: Rect, k: f64) -> usize {
-        let avail = f64::from(rect.width()) - 2.0 * edge(k);
+    fn grid_cols(&self, ui: &Frame, rect: Rect, k: f64) -> usize {
+        let avail = f64::from(rect.width()) - 2.0 * ui.edge(k);
         let pitch = (GRID_W + GRID_GAP) * k;
         // Last column has no trailing gap. As many as fit: the grid spans any width.
         (((avail + GRID_GAP * k) / pitch).floor() as i64).max(2) as usize
@@ -801,6 +801,7 @@ impl LibraryScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         // Published before the sync that reads it: the poster cache is sized against the
         // scale its covers will be drawn at, and a decode is not something this can redo.
         self.art_k = k;
@@ -814,12 +815,12 @@ impl LibraryScreen {
         self.bump.step(0.0, BUMP_K, BUMP_C, dt);
         self.bump.settle(0.0, 0.3, 4.0);
         // Twin in `home.rs`: haptic survives, travel does not.
-        if crate::theme::reduce_motion() {
+        if ui.reduce_motion {
             self.bump = Spring::rest(0.0);
         }
         let ready = matches!(self.phase, LibraryPhase::Ready);
         if ready {
-            self.arm_entrance(ctx.t);
+            self.arm_entrance(ctx.t, ctx.ui.reduce_motion);
             if self.entrance.is_some_and(|e| e.done(ctx.t)) {
                 self.entrance = None;
             }
@@ -831,7 +832,7 @@ impl LibraryScreen {
         if waiting {
             // Clear geom: `pointer` reads it a frame late.
             self.geom.clear();
-            draw_loading(canvas, rect, k, fonts, ctx.t);
+            draw_loading(canvas, ui, rect, k, fonts, ctx.t);
             return;
         }
         self.draw_field(canvas, rect, k, dt, fonts, ctx);
@@ -894,13 +895,14 @@ impl LibraryScreen {
         fonts: &Fonts,
         ctx: &Ctx,
     ) {
+        let ui = ctx.ui;
         let t = ctx.t;
         let (bands, lines) = self.place_zone(ctx);
         let sectioned = self.sectioned();
         // The lines run on to the screen's foot and blur under the band there.
         let clip = canvas.local_clip_bounds().unwrap_or(rect);
         let foot = clip.bottom.max(rect.bottom);
-        let g = self.field_geom(rect, foot, k, &lines, &bands);
+        let g = self.field_geom(ui, rect, foot, k, &lines, &bands);
         let FieldGeom {
             shape,
             cw,
@@ -933,8 +935,9 @@ impl LibraryScreen {
         let snap = std::mem::take(&mut self.snap_scroll);
         self.follow |= snap;
         let applied = self.applied();
-        self.bar.step(fonts, k, avail, true, applied, dt, snap);
-        self.follow_scroll(want, snap, dt);
+        self.bar
+            .step(fonts, k, avail, true, applied, dt, snap || ui.reduce_motion);
+        self.follow_scroll(want, snap || ui.reduce_motion, dt);
 
         // The recoil moves the drawing on its axis, never the cells a pointer hits.
         let bump = self.bump.pos * k;
@@ -980,7 +983,7 @@ impl LibraryScreen {
                     f64::from(band.left) + bump_x,
                     f64::from(band.top) + down + bump_y,
                 );
-                card::heading(canvas, fonts, label, x, y, k);
+                card::heading(canvas, ui, fonts, label, x, y, k);
             })
         };
         let cell = move |i: usize, row: usize, col: usize| {
@@ -1008,7 +1011,7 @@ impl LibraryScreen {
                     caption: caption.as_deref(),
                     focused: focused && !this.quiet,
                 };
-                card.paint(canvas, fonts, slot, ch, k, ent.fade as f32);
+                card.paint(canvas, ui, fonts, slot, ch, k, ent.fade as f32);
                 canvas.restore();
             })
             .id(grid_cell(i))
@@ -1035,7 +1038,7 @@ impl LibraryScreen {
         let top = |label| heading(label, heading_h * 0.56).size(grid_w as f32, heading_h as f32);
         let mut root = El::scroll(grid, Axis::Vertical).style(|s| {
             s.align_items = Some(taffy::AlignItems::START);
-            s.padding.left = taffy::LengthPercentage::length((edge(k) + air) as f32);
+            s.padding.left = taffy::LengthPercentage::length((ui.edge(k) + air) as f32);
             s.padding.top = taffy::LengthPercentage::length(pad_top);
         });
         for &line in &lines {
@@ -1043,17 +1046,19 @@ impl LibraryScreen {
                 Line::Bar => root
                     .child(
                         this.bar
-                            .el(fonts, k, avail, true, applied, focus_pill, &pill_seen),
+                            .el(ui, fonts, k, avail, true, applied, focus_pill, &pill_seen),
                     )
                     .child(El::column().size(avail as f32, (BAR_AIR * k) as f32)),
                 Line::Chips => {
-                    root.child(this.chips_el(ctx.hosts, ctx.profiles, fonts, avail, k, hits))
+                    root.child(this.chips_el(ui, ctx.hosts, ctx.profiles, fonts, avail, k, hits))
                 }
                 Line::Band(b) => {
-                    root.child(this.band_el(&bands[b], b, fonts, avail, (cw, ch), k, hits))
+                    root.child(this.band_el(ui, &bands[b], b, fonts, avail, (cw, ch), k, hits))
                 }
                 Line::Grid => match (geo, &shelf_cards) {
-                    (Some(g), Some(cards)) => root.child(this.shelf_el(g, cards, fonts, avail, k)),
+                    (Some(g), Some(cards)) => {
+                        root.child(this.shelf_el(ui, g, cards, fonts, avail, k))
+                    }
                     _ => {
                         let air = El::column().size(grid_w as f32, gap_y as f32);
                         match split_row {
@@ -1077,6 +1082,7 @@ impl LibraryScreen {
                     }
                 },
                 Line::State => root.child(this.state_el(
+                    ui,
                     fonts,
                     avail,
                     g.block_h(Line::State, &bands),
@@ -1101,7 +1107,7 @@ impl LibraryScreen {
         if let Some((line, item)) = sideways {
             if let (Some(r), Some((view, max))) = (frame.rect(item), frame.scroll(line)) {
                 let want = (r.center_x() - view.center_x()).clamp(0.0, max);
-                tree.follow(line, want, snap);
+                tree.follow(line, want, snap || ui.reduce_motion);
             }
         }
         let field = match geo {
@@ -1115,11 +1121,11 @@ impl LibraryScreen {
             ctx.device.fallback_ui,
         );
         if bleed {
-            tree.paint_focus(canvas, frame, k as f32, dt, cheap);
+            tree.paint_focus(canvas, ui, frame, k as f32, dt, cheap);
         } else {
             let scrolled = (tree.offset(grid), frame.scroll(grid).map_or(0.0, |s| s.1));
-            crate::widgets::soft_scroll(canvas, viewport, viewport, scrolled, k, || {
-                tree.paint_focus(canvas, frame, k as f32, dt, cheap);
+            crate::widgets::soft_scroll(canvas, ui, viewport, viewport, scrolled, k, || {
+                tree.paint_focus(canvas, ui, frame, k as f32, dt, cheap);
             });
         }
         drop(tree);
@@ -1131,6 +1137,7 @@ impl LibraryScreen {
     /// reads last-drawn columns, so a resize re-seats the cursor's column.
     fn field_geom(
         &mut self,
+        ui: &Frame,
         rect: Rect,
         foot: f32,
         k: f64,
@@ -1138,7 +1145,7 @@ impl LibraryScreen {
         bands: &[Band],
     ) -> FieldGeom {
         let shelf = self.view_mode == LibraryView::Shelf && !self.embedded;
-        let avail = f64::from(rect.width()) - 2.0 * edge(k);
+        let avail = f64::from(rect.width()) - 2.0 * ui.edge(k);
         let tray = if self.band_shown() {
             crate::widgets::FOOT_TITLE_H * k
         } else {
@@ -1146,7 +1153,7 @@ impl LibraryScreen {
         };
         let band_top = f64::from(rect.bottom) - tray;
         let usable = band_top - f64::from(rect.top);
-        let cols = self.grid_cols(rect, k);
+        let cols = self.grid_cols(ui, rect, k);
         if self.grid_cols_last != Some(cols) {
             self.grid_cols_last = Some(cols);
             self.seat_grid_col();
@@ -1276,6 +1283,7 @@ impl LibraryScreen {
         fonts: &Fonts,
         ctx: &Ctx,
     ) {
+        let ui = ctx.ui;
         if !self.band_shown() {
             return;
         }
@@ -1290,6 +1298,7 @@ impl LibraryScreen {
         }
         .paint(
             canvas,
+            ui,
             fonts,
             Rect::from_ltrb(rect.left, rect.bottom - h, rect.right, rect.bottom),
             (0.0, 0.0),
@@ -1405,6 +1414,7 @@ impl LibraryScreen {
     /// the plate stands behind it and a press dips it.
     fn shelf_el<'a>(
         &'a self,
+        ui: &'a Frame,
         g: ShelfGeo,
         cards: &'a [ShelfCard],
         fonts: &'a Fonts,
@@ -1431,10 +1441,18 @@ impl LibraryScreen {
                     true => f64::from(r.center_x()) - tw / 2.0,
                     false => f64::from(r.left),
                 };
-                card::heading(canvas, fonts, label, x, f64::from(r.top) + g.head * 0.7, k);
+                card::heading(
+                    canvas,
+                    ui,
+                    fonts,
+                    label,
+                    x,
+                    f64::from(r.top) + g.head * 0.7,
+                    k,
+                );
             }
             for c in cards.iter().filter(|c| c.i != focus) {
-                self.paint_shelf_cover(canvas, fonts, c, (r.left, r.top), k);
+                self.paint_shelf_cover(canvas, ui, fonts, c, (r.left, r.top), k);
             }
         })
         .id(shelf_strip())
@@ -1444,7 +1462,14 @@ impl LibraryScreen {
             let b = c.bounds;
             el = el.child(
                 El::paint(move |canvas, r| {
-                    self.paint_shelf_cover(canvas, fonts, c, (r.left - b.left, r.top - b.top), k);
+                    self.paint_shelf_cover(
+                        canvas,
+                        ui,
+                        fonts,
+                        c,
+                        (r.left - b.left, r.top - b.top),
+                        k,
+                    );
                 })
                 .id(shelf_cover(focus))
                 .focusable((SHELF_CORNER * k) as f32)
@@ -1458,6 +1483,7 @@ impl LibraryScreen {
     fn paint_shelf_cover(
         &self,
         canvas: &Canvas,
+        ui: &Frame,
         fonts: &Fonts,
         c: &ShelfCard,
         origin: (f32, f32),
@@ -1475,7 +1501,10 @@ impl LibraryScreen {
         // trip on a tiled GPU, every frame for every neighbour. A placeholder is flat pieces
         // that must recede as one, so it alone keeps a layer.
         let recede = (c.prox > 0.001).then(|| {
-            skia_safe::color_filters::matrix_row_major(&crate::theme::recede_matrix(c.prox), None)
+            skia_safe::color_filters::matrix_row_major(
+                &crate::theme::recede_matrix(ui, c.prox),
+                None,
+            )
         });
         let art = self.art.get(&game.id);
         let layered = art.is_none() && (c.fade < 0.999 || recede.is_some());
@@ -1494,7 +1523,7 @@ impl LibraryScreen {
         match art {
             Some(img) => {
                 let src = card::crop(img, crect);
-                let mut p = fill(fg(1.0));
+                let mut p = fill(ui.fg(1.0));
                 p.set_alpha_f(alpha);
                 p.set_color_filter(recede);
                 canvas.draw_image_rect_with_sampling_options(
@@ -1505,17 +1534,17 @@ impl LibraryScreen {
                     &p,
                 );
             }
-            None => draw_poster_placeholder(canvas, fonts, Some(game), crect, k, 1.0),
+            None => draw_poster_placeholder(canvas, ui, fonts, Some(game), crect, k, 1.0),
         }
         // The cover's alpha, so a neighbour's badges fade with it.
-        card::store_badge(canvas, fonts, game, crect, k, true, alpha);
+        card::store_badge(canvas, ui, fonts, game, crect, k, true, alpha);
         if game.running {
             card::running_badge(canvas, fonts, crect, k, alpha);
         }
         let hair = (k as f32).max(1.0);
         canvas.draw_rrect(
             rr.with_inset((hair / 2.0, hair / 2.0)),
-            &stroke(fg(0.12 * alpha), hair),
+            &stroke(ui.fg(0.12 * alpha), hair),
         );
         if layered {
             canvas.restore();
@@ -1528,6 +1557,7 @@ impl LibraryScreen {
     #[allow(clippy::too_many_arguments)]
     fn state_el<'a>(
         &'a self,
+        ui: &'a Frame,
         fonts: &'a Fonts,
         width: f64,
         h: f64,
@@ -1569,16 +1599,25 @@ impl LibraryScreen {
             let top = f64::from(r.top) + y0;
             let max_w = (600.0 * k).min(width * 0.85);
             if loading {
-                crate::theme::spinner(canvas, cx, top + 14.0 * k, 16.0 * k, t);
+                crate::theme::spinner(canvas, ui, cx, top + 14.0 * k, 16.0 * k, t);
             } else {
-                fonts.centered(canvas, &title, W::Bold, 22.0 * k, fg(1.0), cx, top, max_w);
+                fonts.centered(
+                    canvas,
+                    &title,
+                    W::Bold,
+                    22.0 * k,
+                    ui.fg(1.0),
+                    cx,
+                    top,
+                    max_w,
+                );
             }
             fonts.centered(
                 canvas,
                 &body,
                 W::Regular,
                 14.0 * k,
-                fg(0.6),
+                ui.fg(0.6),
                 cx,
                 top + 36.0 * k,
                 max_w,
@@ -1597,7 +1636,7 @@ impl LibraryScreen {
             el = el.child(
                 El::paint(move |canvas, r| {
                     hits.borrow_mut().push((Zone::State, r));
-                    button(canvas, fonts, label, r, k);
+                    button(canvas, ui, fonts, label, r, k);
                 })
                 .id(games::state_id())
                 .focusable((button_h / 2.0) as f32)
@@ -1806,7 +1845,7 @@ impl ScreenView for LibraryScreen {
         ctx: &mut Ctx,
     ) {
         self.draw(canvas, rect, k, dt, fonts, ctx);
-        crate::el::claim(usize::from(self.has_titles()));
+        ctx.ui.el.claim(usize::from(self.has_titles()));
     }
 }
 

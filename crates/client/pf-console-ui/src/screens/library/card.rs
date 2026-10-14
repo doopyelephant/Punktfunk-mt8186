@@ -9,7 +9,7 @@
 use super::art::draw_poster_placeholder;
 use crate::library::{store_label, LibraryGame, DESKTOP_ID};
 use crate::model::HostRow;
-use crate::theme::{accent, art_sampling, fg, fill, on_accent, Fonts, PanelStroke, W};
+use crate::theme::{art_sampling, fill, Fonts, Frame, PanelStroke, W};
 use skia_safe::{Canvas, Color4f, Image, Matrix, RRect, Rect, TileMode};
 
 /// Poster corner, design units.
@@ -40,9 +40,11 @@ pub(super) struct Card<'a> {
 impl Card<'_> {
     /// The card in `r`: the poster `ch` px tall, the text under it. `alpha` is the entrance
     /// fade, carried by every piece's paint.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn paint(
         &self,
         canvas: &Canvas,
+        ui: &Frame,
         fonts: &Fonts,
         r: Rect,
         ch: f64,
@@ -50,8 +52,8 @@ impl Card<'_> {
         alpha: f32,
     ) {
         let cover = Rect::from_xywh(r.left, r.top, r.width(), ch as f32);
-        paint_cover(canvas, fonts, self.game, self.art, cover, k, alpha);
-        store_badge(canvas, fonts, self.game, cover, k, false, alpha);
+        paint_cover(canvas, ui, fonts, self.game, self.art, cover, k, alpha);
+        store_badge(canvas, ui, fonts, self.game, cover, k, false, alpha);
         if self.game.running {
             running_badge(canvas, fonts, cover, k, alpha);
         } else if let Some(b) = self.game.install.as_ref().and_then(|f| {
@@ -60,7 +62,7 @@ impl Card<'_> {
             files_badge(canvas, fonts, cover, k, alpha, &b);
         }
         let ink = |a: f32| {
-            let c = fg(a);
+            let c = ui.fg(a);
             Color4f::new(c.r, c.g, c.b, c.a * alpha)
         };
         let (x, w) = (f64::from(r.left), f64::from(r.width()));
@@ -132,8 +134,10 @@ pub(super) fn two_lines(fonts: &Fonts, text: &str, size: f64, max_w: f64) -> (St
 }
 
 /// A poster cropped to fill `cell`, or the placeholder. `alpha` is the poster's own.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn paint_cover(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     game: &LibraryGame,
     art: Option<&Image>,
@@ -146,7 +150,7 @@ pub(super) fn paint_cover(
     let Some(img) = art else {
         canvas.save();
         canvas.clip_rrect(rr, None, true);
-        draw_poster_placeholder(canvas, fonts, Some(game), cell, k, alpha);
+        draw_poster_placeholder(canvas, ui, fonts, Some(game), cell, k, alpha);
         canvas.restore();
         return;
     };
@@ -184,8 +188,10 @@ pub(super) fn crop(img: &Image, cell: Rect) -> Rect {
 /// The store's name in `cover`'s top-left. A launcher's is the accent; any other is a dark
 /// wash with white ink, since it sits on cover art the palette has no say over. `big` is
 /// the shelf's size; `alpha` is the cover's, so the badge never arrives ahead of it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn store_badge(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     game: &LibraryGame,
     cover: Rect,
@@ -203,7 +209,7 @@ pub(super) fn store_badge(
     let (bw, bh, inset) = (tw + 14.0 * k * s, 19.0 * k * s, 7.0 * k * s);
     let (x, y) = (f64::from(cover.left) + inset, f64::from(cover.top) + inset);
     let (face, ink) = if game.launcher {
-        (accent(1.0), on_accent())
+        (ui.accent(1.0), ui.on_accent())
     } else {
         (
             Color4f::new(0.0, 0.0, 0.0, 0.58),
@@ -311,28 +317,32 @@ fn faded(c: Color4f, alpha: f32) -> Color4f {
 
 /// A host's desk in the Desktops row: OS mark and presence up top, name and what OK does
 /// below — "Resume <title>" in green when the host has a game up.
-pub(super) fn desk_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, r: Rect, k: f64) {
-    crate::theme::panel(canvas, r, 14.0, None, PanelStroke::Plain(0.10), k as f32);
+pub(super) fn desk_tile(canvas: &Canvas, ui: &Frame, fonts: &Fonts, h: &HostRow, r: Rect, k: f64) {
+    crate::theme::panel(
+        canvas,
+        ui,
+        r,
+        14.0,
+        None,
+        PanelStroke::Plain(0.10),
+        k as f32,
+    );
     let pad = 16.0 * k;
     let (l, t) = (f64::from(r.left) + pad, f64::from(r.top) + pad);
     let side = 26.0 * k;
     let mark = Rect::from_xywh(l as f32, t as f32, side as f32, side as f32);
     match crate::os_marks::os_mark(&h.os, mark) {
         Some(path) => {
-            canvas.draw_path(&path, &fill(fg(0.92)));
+            canvas.draw_path(&path, &fill(ui.fg(0.92)));
         }
         None => {
             if let Some(icon) = crate::icons::by_name(crate::library::DESKTOP_ICON) {
                 let (cx, cy) = (mark.center_x(), mark.center_y());
-                crate::icons::draw_icon(canvas, icon, cx, cy, side as f32, k as f32, fg(0.92));
+                crate::icons::draw_icon(canvas, icon, cx, cy, side as f32, k as f32, ui.fg(0.92));
             }
         }
     }
-    let dot = if h.online {
-        crate::theme::live()
-    } else {
-        fg(0.28)
-    };
+    let dot = if h.online { ui.live() } else { ui.fg(0.28) };
     let rd = 4.0 * k;
     let at = (
         (f64::from(r.right) - pad - rd) as f32,
@@ -342,18 +352,43 @@ pub(super) fn desk_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, r: Rect, k:
     let w = f64::from(r.width()) - 2.0 * pad;
     let status_base = f64::from(r.bottom) - pad - 2.0 * k;
     let (line, ink) = if h.running.is_empty() {
-        ("Desktop".to_string(), fg(0.62))
+        ("Desktop".to_string(), ui.fg(0.62))
     } else {
-        (format!("Resume {}", h.running), crate::theme::live())
+        (format!("Resume {}", h.running), ui.live())
     };
     fonts.draw_clipped(canvas, &line, l, status_base, W::Medium, 13.5 * k, ink, w);
     let name_base = status_base - 21.0 * k;
-    fonts.draw_clipped(canvas, &h.name, l, name_base, W::Bold, 17.0 * k, fg(1.0), w);
+    fonts.draw_clipped(
+        canvas,
+        &h.name,
+        l,
+        name_base,
+        W::Bold,
+        17.0 * k,
+        ui.fg(1.0),
+        w,
+    );
 }
 
 /// A section's name over its row: semibold, in the secondary ink.
-pub(super) fn heading(canvas: &Canvas, fonts: &Fonts, label: &str, x: f64, baseline: f64, k: f64) {
-    fonts.draw(canvas, label, x, baseline, W::SemiBold, 14.0 * k, fg(0.62));
+pub(super) fn heading(
+    canvas: &Canvas,
+    ui: &Frame,
+    fonts: &Fonts,
+    label: &str,
+    x: f64,
+    baseline: f64,
+    k: f64,
+) {
+    fonts.draw(
+        canvas,
+        label,
+        x,
+        baseline,
+        W::SemiBold,
+        14.0 * k,
+        ui.fg(0.62),
+    );
 }
 
 /// The one line of text a band draws, centred in `max_w`, ellipsized.

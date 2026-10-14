@@ -247,14 +247,14 @@ pub struct Entrance {
 }
 
 impl Entrance {
-    /// Arm at `t0`. Callers pass the cursor as `anchor` so a restored selection
-    /// assembles around the eye, not from a corner.
-    pub fn new(spec: EntranceSpec, anchor: usize, t0: f64) -> Entrance {
+    /// Arm at `t0`, under the frame's Reduce Motion. Callers pass the cursor as `anchor`
+    /// so a restored selection assembles around the eye, not from a corner.
+    pub fn new(spec: EntranceSpec, anchor: usize, t0: f64, reduced: bool) -> Entrance {
         Entrance {
             spec,
             anchor,
             t0,
-            reduced: crate::theme::reduce_motion(),
+            reduced,
         }
     }
 
@@ -347,7 +347,7 @@ mod tests {
     /// its window can be further displaced than one that has already landed.
     #[test]
     fn entrance_envelope() {
-        let e = Entrance::new(entrances::CARDS, 5, 0.0);
+        let e = Entrance::new(entrances::CARDS, 5, 0.0, false);
 
         for t in [0.05, 0.2, 0.4, 0.7, 1.1] {
             let anchor = e.at(5, t).fade;
@@ -389,7 +389,7 @@ mod tests {
         // Measured against the fade, not `window`: an item is perceptually done a
         // third of the way through the window, so `window` flatters the stagger.
         let separation = |spec: EntranceSpec| {
-            let e = Entrance::new(spec, 5, 0.0);
+            let e = Entrance::new(spec, 5, 0.0, false);
             let t_mid = 0.5 * FADE_SHARE * spec.window;
             e.at(5, t_mid).fade - e.at(6, t_mid).fade
         };
@@ -431,9 +431,7 @@ mod tests {
     /// must still play as a staggerless crossfade.
     #[test]
     fn entrance_under_reduced_motion_is_a_staggerless_crossfade() {
-        crate::theme::set_reduce_motion(true);
-        let e = Entrance::new(entrances::CARDS, 5, 0.0);
-        crate::theme::set_reduce_motion(false);
+        let e = Entrance::new(entrances::CARDS, 5, 0.0, true);
         for t in [0.0, 0.1, 0.3, 0.6] {
             let a = e.at(5, t);
             assert_eq!(a.travel, 1.0, "nothing travels");

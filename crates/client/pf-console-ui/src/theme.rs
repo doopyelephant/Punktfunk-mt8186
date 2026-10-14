@@ -3,9 +3,9 @@
 //!
 //! Skia's `Paint` defaults anti-alias off. [`fill`], [`stroke`], [`shaded`],
 //! and [`layer`] are the only constructors; the shell test fails a stray
-//! `Paint::new` outside this file. [`Ink`] is per-frame palette state,
-//! published on a thread-local by [`crate::shell::Shell::render`]. Form
-//! screens share the aurora mesh at `calm = 1`. No static backdrop here.
+//! `Paint::new` outside this file. [`Ink`] is per-frame palette state, carried
+//! with the frame's other state in the [`Frame`] the shell builds and hands down.
+//! Form screens share the aurora mesh at `calm = 1`. No static backdrop here.
 //!
 //! Recede evidence: `recede_matrix_is_identity_at_the_focus` and neighbours.
 
@@ -151,16 +151,6 @@ pub const GLYPH_STROKE: f64 = 1.5;
 /// Unscaled it reads thinner than every other edge on HiDPI.
 pub const HAIRLINE: f64 = 1.2;
 
-/// Green text for what is live (online, playing) on glass: pastel under white ink, deep
-/// under dark ink.
-pub fn live() -> Color4f {
-    if ink().scrim.r > 0.5 {
-        Color4f::new(0.06, 0.50, 0.18, 1.0)
-    } else {
-        Color4f::new(0.64, 0.95, 0.60, 1.0)
-    }
-}
-
 /// Palette-derived fg, accent, glass, and scrim. Pale fields need dark text;
 /// a brand-violet wash on a copper field clashes.
 #[derive(Clone, Copy)]
@@ -173,7 +163,7 @@ pub struct Ink {
     glass: Color4f,
     #[allow(dead_code)]
     glass_low: Color4f,
-    /// A coverless card's face at tint 0 and at tint 1 ([`card_face`]).
+    /// A coverless card's face at tint 0 and at tint 1 ([`Frame::card_face`]).
     face: [Color4f; 2],
     /// Drop shadow strength against a dark field's.
     shadow: f32,
@@ -289,86 +279,111 @@ impl Ink {
     }
 }
 
-thread_local! {
-    /// Per-frame ink. Thread-local: one render thread owns the shell. Set by
-    /// [`crate::shell::Shell::render`].
-    static INK: std::cell::Cell<Ink> = const { std::cell::Cell::new(DARK_INK) };
-
-    /// Per-frame `trust::Settings::reduce_motion`. Same thread-local as [`INK`].
-    /// Set by [`crate::shell::Shell::render`].
-    static REDUCE_MOTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static REDUCED_UI: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// What one frame draws with: the palette's ink, whether motion and the interface are reduced,
+/// the safe area's left inset, and the element layer's focus ledger. The shell builds one a
+/// frame with [`Frame::next`] and hands it down in [`crate::screens::Ctx`]; whatever draws
+/// takes it as `ui`. A host drawing the kit on its own makes one with [`Frame::new`].
+pub struct Frame {
+    pub ink: Ink,
+    /// Travel suppressed this frame. Callers keep the state change and drop the glide.
+    /// Never used to skip a haptic: the pulse replaces the motion.
+    pub reduce_motion: bool,
+    /// The reduced interface: a TV-class GPU. Passes that read back what is already drawn
+    /// (a backdrop blur) break a tiled GPU's render pass and are skipped.
+    pub reduced_ui: bool,
+    /// The safe area's left inset, px ([`Frame::edge`]).
+    pub side_inset: f64,
+    /// The shell is painting a screen into a transition layer. A copy of the surface cannot
+    /// see that layer, so a band drawn inside it would blur the field behind.
+    pub(crate) in_layer: Cell<bool>,
+    pub el: crate::el::Ledger,
 }
 
-/// Publish the reduced interface for this frame, as with [`set_ink`].
-pub fn set_reduced_ui(on: bool) {
-    REDUCED_UI.with(|r| r.set(on));
+impl Default for Frame {
+    /// The dark look, at full motion, with no inset.
+    fn default() -> Frame {
+        Frame::new(DARK_INK, false, false, 0.0)
+    }
 }
 
-/// The reduced interface is on this frame: a TV-class GPU. Passes that read back what is
-/// already drawn (a backdrop blur) break a tiled GPU's render pass and are skipped.
-pub fn reduced_ui() -> bool {
-    REDUCED_UI.with(std::cell::Cell::get)
-}
+impl Frame {
+    pub fn new(ink: Ink, reduce_motion: bool, reduced_ui: bool, side_inset: f64) -> Frame {
+        Frame {
+            ink,
+            reduce_motion,
+            reduced_ui,
+            side_inset,
+            in_layer: Cell::new(false),
+            el: crate::el::Ledger::default(),
+        }
+    }
 
-pub fn set_ink(ink: Ink) {
-    INK.with(|i| i.set(ink));
-}
+    /// The frame after this one. Only the focus a plate gave up here carries over.
+    pub fn next(&self, ink: Ink, reduce_motion: bool, reduced_ui: bool, side_inset: f64) -> Frame {
+        Frame {
+            el: self.el.next(),
+            ..Frame::new(ink, reduce_motion, reduced_ui, side_inset)
+        }
+    }
 
-pub fn ink() -> Ink {
-    INK.with(std::cell::Cell::get)
-}
+    pub fn fg(&self, alpha: f32) -> Color4f {
+        let c = self.ink.fg;
+        Color4f::new(c.r, c.g, c.b, alpha)
+    }
 
-pub fn set_reduce_motion(on: bool) {
-    REDUCE_MOTION.with(|r| r.set(on));
-}
+    pub fn accent(&self, alpha: f32) -> Color4f {
+        let c = self.ink.accent;
+        Color4f::new(c.r, c.g, c.b, alpha)
+    }
 
-/// Travel suppressed this frame. Callers keep the state change and drop the glide.
-/// Never used to skip a haptic: the pulse replaces the motion.
-pub fn reduce_motion() -> bool {
-    REDUCE_MOTION.with(std::cell::Cell::get)
-}
+    /// Text wash. `alpha` is dark-field strength; multiplied by [`Ink::scrim`].a so a
+    /// pale field does not bleach.
+    pub fn shade(&self, alpha: f32) -> Color4f {
+        let s = self.ink.scrim;
+        Color4f::new(s.r, s.g, s.b, alpha * s.a)
+    }
 
-pub fn fg(alpha: f32) -> Color4f {
-    let c = ink().fg;
-    Color4f::new(c.r, c.g, c.b, alpha)
-}
+    /// Opaque coverless-card face, `tint` of the way along the ink's face ramp. Coverflow
+    /// sides overlap, so glass would show the neighbour. Face and [`Frame::fg`] move opposite
+    /// ways with the palette; a fixed near-black face under pale `fg` fails contrast.
+    pub fn card_face(&self, tint: f32) -> Color4f {
+        let [a, b] = self.ink.face;
+        let mix = |x: f32, y: f32| x + (y - x) * tint;
+        Color4f::new(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b), 1.0)
+    }
 
-pub fn accent(alpha: f32) -> Color4f {
-    let c = ink().accent;
-    Color4f::new(c.r, c.g, c.b, alpha)
-}
+    /// A drop shadow's alpha: `alpha` is dark-field strength, softened on brighter fields.
+    pub fn shadow(&self, alpha: f32) -> f32 {
+        alpha * self.ink.shadow
+    }
 
-/// Text wash. `alpha` is dark-field strength; multiplied by [`Ink::scrim`].a so a
-/// pale field does not bleach.
-pub fn shade(alpha: f32) -> Color4f {
-    let s = ink().scrim;
-    Color4f::new(s.r, s.g, s.b, alpha * s.a)
-}
+    /// Black or white on the accent, by luminance not `light`: an accent is picked
+    /// against the glass, not the field.
+    pub fn on_accent(&self) -> Color4f {
+        let a = self.ink.accent;
+        let luma = 0.2126 * a.r + 0.7152 * a.g + 0.0722 * a.b;
+        if luma > 0.55 {
+            Color4f::new(0.0, 0.0, 0.0, 1.0)
+        } else {
+            Color4f::new(1.0, 1.0, 1.0, 1.0)
+        }
+    }
 
-/// Opaque coverless-card face, `tint` of the way along the ink's face ramp. Coverflow
-/// sides overlap, so glass would show the neighbour. Face and [`fg`] move opposite ways
-/// with the palette; a fixed near-black face under pale `fg` fails contrast.
-pub fn card_face(tint: f32) -> Color4f {
-    let [a, b] = ink().face;
-    let mix = |x: f32, y: f32| x + (y - x) * tint;
-    Color4f::new(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b), 1.0)
-}
+    /// Green text for what is live (online, playing) on glass: pastel under white ink, deep
+    /// under dark ink.
+    pub fn live(&self) -> Color4f {
+        if self.ink.scrim.r > 0.5 {
+            Color4f::new(0.06, 0.50, 0.18, 1.0)
+        } else {
+            Color4f::new(0.64, 0.95, 0.60, 1.0)
+        }
+    }
 
-/// A drop shadow's alpha: `alpha` is dark-field strength, softened on brighter fields.
-pub fn shadow(alpha: f32) -> f32 {
-    alpha * ink().shadow
-}
-
-/// Black or white on the accent, by luminance not `light`: an accent is picked
-/// against the glass, not the field.
-pub fn on_accent() -> Color4f {
-    let a = ink().accent;
-    let luma = 0.2126 * a.r + 0.7152 * a.g + 0.0722 * a.b;
-    if luma > 0.55 {
-        Color4f::new(0.0, 0.0, 0.0, 1.0)
-    } else {
-        Color4f::new(1.0, 1.0, 1.0, 1.0)
+    /// The margin every screen shares, px from the layout's edge: [`EDGE_INSET`] from the
+    /// screen's edge, of which a safe-area inset gives its share, and never under
+    /// [`EDGE_AIR`] past the safe area.
+    pub fn edge(&self, k: f64) -> f64 {
+        (EDGE_INSET * k - self.side_inset).max(EDGE_AIR * k)
     }
 }
 
@@ -389,6 +404,7 @@ pub enum PanelStroke {
 /// one-pixel floor.
 pub fn panel(
     canvas: &Canvas,
+    ui: &Frame,
     rect: Rect,
     corner: f32,
     tint: Option<Color4f>,
@@ -403,13 +419,13 @@ pub fn panel(
     let mut sp = shaded_stroke(k.max(1.0));
     match stroke {
         PanelStroke::Plain(alpha) => {
-            sp.set_color4f(fg(alpha), None);
+            sp.set_color4f(ui.fg(alpha), None);
         }
         PanelStroke::Brand(alpha) => {
-            sp.set_color4f(accent(alpha), None);
+            sp.set_color4f(ui.accent(alpha), None);
         }
         PanelStroke::Edge | PanelStroke::EdgeDashed => {
-            sp.set_color4f(fg(0.22), None);
+            sp.set_color4f(ui.fg(0.22), None);
             if matches!(stroke, PanelStroke::EdgeDashed) {
                 sp.set_path_effect(PathEffect::dash(&[6.0 * k, 5.0 * k], 0.0));
             }
@@ -421,11 +437,11 @@ pub fn panel(
 /// 4×5 row-major colour matrix: neighbours lose saturation and brightness with
 /// `d` (0 = focused, 1 = fully receded). Rec. 709 sat mix, then lerp toward the
 /// ground: `out = (1 − b)·sat_mix(c) + ground·b`.
-pub fn recede_matrix(d: f64) -> [f32; 20] {
+pub fn recede_matrix(ui: &Frame, d: f64) -> [f32; 20] {
     let d = d.clamp(0.0, 1.0);
     let sat = (1.0 - RECEDE_SATURATION * d) as f32;
     // Toward the ground, not darker. A darkened tile on a pale field gains contrast.
-    let toward_light = ink().scrim.r > 0.5;
+    let toward_light = ui.ink.scrim.r > 0.5;
     // Fraction of the way to the ground, not a level offset. An additive
     // darken clips a dark placeholder to #000; a lerp cannot clip at either pole.
     let b = (RECEDE_BRIGHTNESS * d) as f32;
@@ -468,23 +484,23 @@ const RECEDE_BRIGHTNESS: f64 = 0.20;
 
 /// The accent hairline round a focused card, with no glass: a poster under it keeps its
 /// brightness. `corner` and the line are design units, the line one pixel at least.
-pub fn focus_ring(canvas: &Canvas, rect: Rect, corner: f32, k: f32) {
+pub fn focus_ring(canvas: &Canvas, ui: &Frame, rect: Rect, corner: f32, k: f32) {
     let rr = RRect::new_rect_xy(rect, corner * k, corner * k);
-    canvas.draw_rrect(rr, &stroke(accent(0.9), k.max(1.0)));
+    canvas.draw_rrect(rr, &stroke(ui.accent(0.9), k.max(1.0)));
 }
 
 /// [`focus_halo`] growth past the card, design units. Applied to both rect and corner radius.
 const HALO_OUTSET: f32 = 4.0;
 
 /// Accent glow under the focused card. Drawn behind [`drop_shadow`].
-pub fn focus_halo(canvas: &Canvas, rect: Rect, corner: f32, k: f32, f: f32) {
+pub fn focus_halo(canvas: &Canvas, ui: &Frame, rect: Rect, corner: f32, k: f32, f: f32) {
     if f <= 0.01 {
         return;
     }
     // Pale accents are dark, so a blurred accent on a pale field is a smudge.
     // Mix halfway to the scrim (white) to keep the hue; 0.24 vs 0.20 so the
     // lightened mark still registers.
-    let (a, s) = (ink().accent, ink().scrim);
+    let (a, s) = (ui.ink.accent, ui.ink.scrim);
     let (c, alpha) = if s.r > 0.5 {
         let mix = |x: f32, y: f32| x + (y - x) * 0.5;
         (
@@ -517,8 +533,8 @@ pub fn focus_halo(canvas: &Canvas, rect: Rect, corner: f32, k: f32, f: f32) {
 }
 
 /// A soft shadow falling below `rect`, drawn only outside it: glass shows what lies under.
-pub fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alpha: f32) {
-    let mut p = fill(Color4f::new(0.0, 0.0, 0.0, shadow(alpha)));
+pub fn drop_shadow(canvas: &Canvas, ui: &Frame, rect: Rect, corner: f32, k: f32, alpha: f32) {
+    let mut p = fill(Color4f::new(0.0, 0.0, 0.0, ui.shadow(alpha)));
     p.set_mask_filter(MaskFilter::blur(
         skia_safe::BlurStyle::Normal,
         10.0 * k,
@@ -533,9 +549,9 @@ pub fn drop_shadow(canvas: &Canvas, rect: Rect, corner: f32, k: f32, alpha: f32)
 }
 
 /// Loading spinner. `t` is the shell clock.
-pub fn spinner(canvas: &Canvas, cx: f64, cy: f64, r: f64, t: f64) {
+pub fn spinner(canvas: &Canvas, ui: &Frame, cx: f64, cy: f64, r: f64, t: f64) {
     let start = (t * 300.0) % 360.0;
-    let mut paint = stroke(fg(0.85), (r / 5.0) as f32);
+    let mut paint = stroke(ui.fg(0.85), (r / 5.0) as f32);
     paint.set_stroke_cap(skia_safe::PaintCap::Round);
     canvas.draw_arc(
         Rect::from_xywh(
@@ -556,22 +572,6 @@ pub const EDGE_INSET: f64 = 40.0;
 /// Least air between the safe area and content, design units. A notch or a rounded
 /// corner is not a margin.
 const EDGE_AIR: f64 = 20.0;
-
-thread_local! {
-    /// The safe area's left inset this frame, px. Set by [`crate::shell::Shell::render`].
-    static SIDE_INSET: Cell<f64> = const { Cell::new(0.0) };
-}
-
-pub fn set_side_inset(px: f64) {
-    SIDE_INSET.with(|s| s.set(px));
-}
-
-/// The margin every screen shares, px from the layout's edge: [`EDGE_INSET`] from the
-/// screen's edge, of which a safe-area inset gives its share, and never under
-/// [`EDGE_AIR`] past the safe area.
-pub fn edge(k: f64) -> f64 {
-    (EDGE_INSET * k - SIDE_INSET.with(Cell::get)).max(EDGE_AIR * k)
-}
 
 /// Geist weights, matching the Apple client's `.geist(size, weight)`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1036,7 +1036,7 @@ mod tests {
     /// tint at d=0 is invisible on glass and wrong in every screenshot.
     #[test]
     fn recede_matrix_is_identity_at_the_focus() {
-        let m = recede_matrix(0.0);
+        let m = recede_matrix(&Frame::default(), 0.0);
         for c in [
             [1.0, 0.2, 0.4, 1.0],
             [0.0, 0.0, 0.0, 1.0],
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[test]
     fn recede_matrix_drains_colour_and_light_but_never_alpha() {
-        let m = recede_matrix(1.0);
+        let m = recede_matrix(&Frame::default(), 1.0);
         let c = [0.9f32, 0.2, 0.15, 1.0]; // high chroma: spread drain is the assertion
         let out = apply(&m, c);
         let spread = |v: [f32; 4]| v[0].max(v[1]).max(v[2]) - v[0].min(v[1]).min(v[2]);
@@ -1073,13 +1073,14 @@ mod tests {
         let lum = |v: [f32; 4]| 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
         let card = [0.55f32, 0.55, 0.6, 1.0];
 
-        set_ink(Ink::of(crate::palette::palette("violet")));
-        assert!(ink().scrim.r < 0.5, "violet is a dark field");
-        let dark_side = apply(&recede_matrix(1.0), card);
+        let ui = |id| Frame::new(Ink::of(crate::palette::palette(id)), false, false, 0.0);
+        let violet = ui("violet");
+        assert!(violet.ink.scrim.r < 0.5, "violet is a dark field");
+        let dark_side = apply(&recede_matrix(&violet, 1.0), card);
 
-        set_ink(Ink::of(crate::palette::palette("sky")));
-        assert!(ink().scrim.r > 0.5, "mint is a pale field");
-        let pale_side = apply(&recede_matrix(1.0), card);
+        let sky = ui("sky");
+        assert!(sky.ink.scrim.r > 0.5, "mint is a pale field");
+        let pale_side = apply(&recede_matrix(&sky, 1.0), card);
 
         assert!(
             lum(dark_side) < lum(card),
@@ -1093,8 +1094,6 @@ mod tests {
         let spread = |v: [f32; 4]| v[0].max(v[1]).max(v[2]) - v[0].min(v[1]).min(v[2]);
         assert!(spread(dark_side) < spread(card));
         assert!(spread(pale_side) < spread(card));
-
-        set_ink(DARK_INK);
     }
 
     /// Recede must not clamp. The other tests are relative and never feed a dark
@@ -1103,9 +1102,9 @@ mod tests {
     fn a_dark_card_face_survives_a_full_recede() {
         // Coverless card at the quieter placeholder tint: the darkest face the shelf has.
         for p in crate::palette::PALETTES.iter().filter(|p| !p.light) {
-            set_ink(Ink::of(p));
-            let f = card_face(0.20);
-            let out = apply(&recede_matrix(1.0), [f.r, f.g, f.b, 1.0]);
+            let ui = Frame::new(Ink::of(p), false, false, 0.0);
+            let f = ui.card_face(0.20);
+            let out = apply(&recede_matrix(&ui, 1.0), [f.r, f.g, f.b, 1.0]);
             for c in &out[..3] {
                 assert!(
                     *c > 0.05,
@@ -1114,7 +1113,6 @@ mod tests {
                 );
             }
         }
-        set_ink(DARK_INK);
     }
 
     /// A panel is a hairline round a bare field: nothing fills it, the edge draws.
@@ -1123,7 +1121,16 @@ mod tests {
         let mut surface = skia_safe::surfaces::raster_n32_premul((300, 200)).unwrap();
         let rect = Rect::from_xywh(20.0, 20.0, 260.0, 160.0);
         surface.canvas().clear(skia_safe::Color::BLACK);
-        panel(surface.canvas(), rect, 22.0, None, PanelStroke::Edge, 1.5);
+        let ui = Frame::default();
+        panel(
+            surface.canvas(),
+            &ui,
+            rect,
+            22.0,
+            None,
+            PanelStroke::Edge,
+            1.5,
+        );
         let px = surface.peek_pixels().unwrap();
         assert_eq!(
             px.get_color((150, 100)),

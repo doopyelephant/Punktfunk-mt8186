@@ -1690,9 +1690,10 @@ fn the_rescan_tile_probes_and_never_connects() {
 #[test]
 fn toast_kinds_are_visually_distinct() {
     use crate::shell::{ToastKind, ToastMark};
-    let (info_c, info_m) = ToastKind::Info.look();
-    let (ok_c, ok_m) = ToastKind::Success.look();
-    let (err_c, err_m) = ToastKind::Error.look();
+    let ui = &crate::theme::Frame::default();
+    let (info_c, info_m) = ToastKind::Info.look(ui);
+    let (ok_c, ok_m) = ToastKind::Success.look(ui);
+    let (err_c, err_m) = ToastKind::Error.look(ui);
     assert_eq!(info_m, ToastMark::Dot);
     assert_eq!(ok_m, ToastMark::Check);
     assert_eq!(err_m, ToastMark::Bang);
@@ -1701,9 +1702,10 @@ fn toast_kinds_are_visually_distinct() {
     assert_ne!(rgb(ok_c), rgb(err_c));
 
     // Green-accented palette: Success follows it, Error must not.
-    crate::theme::set_ink(crate::theme::Ink::of(crate::palette::palette("jade")));
-    let (ok_jade, _) = ToastKind::Success.look();
-    let (err_jade, _) = ToastKind::Error.look();
+    let jade = crate::theme::Ink::of(crate::palette::palette("jade"));
+    let ui = &crate::theme::Frame::new(jade, false, false, 0.0);
+    let (ok_jade, _) = ToastKind::Success.look(ui);
+    let (err_jade, _) = ToastKind::Error.look(ui);
     assert_ne!(
         rgb(ok_jade),
         rgb(ok_c),
@@ -2654,10 +2656,9 @@ fn a_pinned_plate_lands_in_device_space_under_an_inset() {
     s.fake_clock = Some((100.0, 1.0 / 60.0));
     let mut run = |s: &mut Shell, frames: usize| {
         for _ in 0..frames {
-            crate::el::DRAWN.with(|d| d.borrow_mut().clear());
             s.render_in(surface.canvas(), &viewport, &fonts, None, None, &[]);
         }
-        let drawn = crate::el::DRAWN.with(|d| d.borrow().clone());
+        let drawn = s.ui.el.drawn.borrow().clone();
         assert_eq!(drawn.len(), 1, "one plate at rest: {drawn:?}");
         drawn[0]
     };

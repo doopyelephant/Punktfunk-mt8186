@@ -8,7 +8,7 @@ use crate::icons::{self, Icon};
 use crate::pointer::Pointer;
 use crate::screens::licenses::wrap;
 use crate::screens::{Ctx, Outbox, ScreenView};
-use crate::theme::{edge, fg, panel, stroke, Fonts, PanelStroke, HAIRLINE, W};
+use crate::theme::{panel, stroke, Fonts, Frame, PanelStroke, HAIRLINE, W};
 use crate::widgets::{bleed_view, soft_scroll, Flick};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use pf_client_core::shortcuts::{self, Client, Kind};
@@ -189,13 +189,21 @@ impl ControlsScreen {
         self.flick.step = LINE_H * k;
     }
 
-    fn draw_card(&self, canvas: &Canvas, fonts: &Fonts, card: &Card, rect: Rect, k: f64) {
+    fn draw_card(
+        &self,
+        canvas: &Canvas,
+        ui: &Frame,
+        fonts: &Fonts,
+        card: &Card,
+        rect: Rect,
+        k: f64,
+    ) {
         let (x0, top, w) = (
             f64::from(rect.left),
             f64::from(rect.top),
             f64::from(rect.width()),
         );
-        panel(canvas, rect, CORNER, None, PanelStroke::Edge, k as f32);
+        panel(canvas, ui, rect, CORNER, None, PanelStroke::Edge, k as f32);
         let (lx, rx) = (x0 + PAD * k, x0 + w - PAD * k);
         let hcy = top + HEAD_H * k / 2.0;
         icons::draw_icon(
@@ -205,7 +213,7 @@ impl ControlsScreen {
             hcy as f32,
             (24.0 * k) as f32,
             k as f32,
-            fg(0.9),
+            ui.fg(0.9),
         );
         let tx = lx + 38.0 * k;
         let tw = fonts.draw(
@@ -215,7 +223,7 @@ impl ControlsScreen {
             hcy + 18.0 * k * 0.36,
             W::SemiBold,
             18.0 * k,
-            fg(0.95),
+            ui.fg(0.95),
         );
         if let Some(note) = card.note {
             let nx = tx + f64::from(tw) + 14.0 * k;
@@ -226,16 +234,16 @@ impl ControlsScreen {
                 hcy + 14.0 * k * 0.36,
                 W::Regular,
                 14.0 * k,
-                fg(0.5),
+                ui.fg(0.5),
                 rx - nx,
             );
         }
-        rule(canvas, lx, rx, top + HEAD_H * k, 0.12, k);
+        rule(canvas, ui, lx, rx, top + HEAD_H * k, 0.12, k);
         let badge_h = glyphs::chord_height(k);
         for (i, row) in card.rows.iter().enumerate() {
             let rt = top + row.top;
             if i > 0 {
-                rule(canvas, lx, rx, rt, 0.07, k);
+                rule(canvas, ui, lx, rx, rt, 0.07, k);
             }
             let text_h = row.lines.len() as f64 * LINE_H * k;
             let (cy, tx, mut by) = if card.stacked {
@@ -249,9 +257,9 @@ impl ControlsScreen {
                     rt + (row.h - text_h) / 2.0 + LINE_H * k * 0.72,
                 )
             };
-            glyphs::draw_chord(canvas, fonts, row.keys, card.style, lx, cy, k);
+            glyphs::draw_chord(canvas, ui, fonts, row.keys, card.style, lx, cy, k);
             for line in &row.lines {
-                fonts.draw(canvas, line, tx, by, W::Regular, TEXT_SIZE * k, fg(0.85));
+                fonts.draw(canvas, line, tx, by, W::Regular, TEXT_SIZE * k, ui.fg(0.85));
                 by += LINE_H * k;
             }
         }
@@ -259,11 +267,11 @@ impl ControlsScreen {
 }
 
 /// A hairline across the card at `y`.
-fn rule(canvas: &Canvas, x1: f64, x2: f64, y: f64, alpha: f32, k: f64) {
+fn rule(canvas: &Canvas, ui: &Frame, x1: f64, x2: f64, y: f64, alpha: f32, k: f64) {
     canvas.draw_line(
         (x1 as f32, y as f32),
         (x2 as f32, y as f32),
-        &stroke(fg(alpha), (HAIRLINE * k) as f32),
+        &stroke(ui.fg(alpha), (HAIRLINE * k) as f32),
     );
 }
 
@@ -303,9 +311,10 @@ impl ScreenView for ControlsScreen {
         k: f64,
         dt: f64,
         fonts: &Fonts,
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
     ) {
-        let w = (f64::from(rect.width()) - 2.0 * edge(k)).min(MAX_W * k);
+        let ui = ctx.ui;
+        let w = (f64::from(rect.width()) - 2.0 * ui.edge(k)).min(MAX_W * k);
         let x0 = f64::from(rect.center_x()) - w / 2.0;
         let key = (w as f32, k);
         if self.laid != Some(key) {
@@ -313,6 +322,7 @@ impl ScreenView for ControlsScreen {
             self.laid = Some(key);
         }
         self.flick.view_h = f64::from(rect.height());
+        self.flick.reduced = ui.reduce_motion;
         self.flick.tick(dt);
 
         // With the trays on, the page runs on under the title and the legend and they blur
@@ -327,21 +337,21 @@ impl ScreenView for ControlsScreen {
                 top + TEXT_SIZE * k,
                 W::Regular,
                 TEXT_SIZE * k,
-                fg(0.66),
+                ui.fg(0.66),
             );
             for card in &self.cards {
                 let ct = top + card.top;
                 let on_page = card.h > 0.0;
                 if on_page && ct < f64::from(view.bottom) && ct + card.h > f64::from(view.top) {
                     let rect = Rect::from_xywh(x0 as f32, ct as f32, w as f32, card.h as f32);
-                    self.draw_card(canvas, fonts, card, rect, k);
+                    self.draw_card(canvas, ui, fonts, card, rect, k);
                 }
             }
         };
         if crate::blur::active() {
             paint();
         } else {
-            soft_scroll(canvas, view, view, self.flick.scrolled(), k, paint);
+            soft_scroll(canvas, ui, view, view, self.flick.scrolled(), k, paint);
         }
     }
 }

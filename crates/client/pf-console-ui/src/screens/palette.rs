@@ -11,7 +11,7 @@ use crate::icons::{by_name, draw_icon};
 use crate::palette::{Palette, PALETTES, VIOLET_FIELD};
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Ctx, Outbox, ScreenView};
-use crate::theme::{edge, fill, stroke, Fonts, W};
+use crate::theme::{fill, stroke, Fonts, W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, ClipOp, Color4f, Point, RRect, Rect, TileMode};
 
@@ -149,8 +149,9 @@ impl ScreenView for PaletteScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let grid = Id::new(GRID, 0);
-        let avail = f64::from(rect.width()) - 2.0 * edge(k);
+        let avail = f64::from(rect.width()) - 2.0 * ui.edge(k);
         let gap = CARD_GAP * k;
         // At least two across, shrinking the card on a phone rather than stacking one column.
         let cols = (((avail + gap) / (CARD_W * k + gap)).floor() as usize).max(2);
@@ -207,7 +208,7 @@ impl ScreenView for PaletteScreen {
         let target = frame
             .rect(card_id(self.cursor))
             .map_or(0.0, |r| (r.center_y() - rect.center_y()).clamp(0.0, max));
-        tree.follow(grid, target, false);
+        tree.follow(grid, target, ui.reduce_motion);
         tree.set_focus(Some(card_id(self.cursor)));
         let cheap = super::settings::rows::reduce_ui_res(
             ctx.settings,
@@ -216,11 +217,11 @@ impl ScreenView for PaletteScreen {
         );
         if view == rect {
             let scrolled = (tree.offset(grid), max);
-            crate::widgets::soft_scroll(canvas, rect, rect, scrolled, k, || {
-                tree.paint_focus(canvas, frame, k as f32, dt, cheap);
+            crate::widgets::soft_scroll(canvas, ui, rect, rect, scrolled, k, || {
+                tree.paint_focus(canvas, ui, frame, k as f32, dt, cheap);
             });
         } else {
-            tree.paint_focus(canvas, frame, k as f32, dt, cheap);
+            tree.paint_focus(canvas, ui, frame, k as f32, dt, cheap);
         }
         self.geom = (0..PALETTES.len())
             .map(|i| tree.rect(card_id(i)).unwrap_or_else(Rect::new_empty))

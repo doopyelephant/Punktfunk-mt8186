@@ -258,8 +258,10 @@ impl ScreenView for AddHostScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let below = blurb(
             canvas,
+            ui,
             fonts,
             "Hosts on this network appear automatically — add one by address for everything else.",
             rect,
@@ -278,6 +280,7 @@ impl ScreenView for AddHostScreen {
         self.list.lift = self.keyboard.lift(rect, k);
         self.list.render(
             canvas,
+            ui,
             list_rect,
             &rows,
             fonts,
@@ -285,7 +288,7 @@ impl ScreenView for AddHostScreen {
             dt,
             self.editing.is_none(),
         );
-        self.keyboard.render(canvas, fonts, rect, k);
+        self.keyboard.render(canvas, ui, fonts, rect, k);
     }
 
     fn press(&mut self) {
@@ -314,9 +317,14 @@ mod tests {
         let fonts = crate::theme::build_fonts().unwrap();
         let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
         let rect = Rect::from_wh(1280.0, 800.0);
+        let mut ui = crate::theme::Frame::default();
         let mut frame = |s: &mut AddHostScreen, c: &mut Ctx| {
-            crate::el::begin_frame();
-            s.render(surface.canvas(), rect, 1.0, 1.0 / 60.0, &fonts, c);
+            ui = ui.next(ui.ink, false, false, 0.0);
+            let mut c = Ctx {
+                ui: &ui,
+                ..Ctx::test(c.settings, c.library)
+            };
+            s.render(surface.canvas(), rect, 1.0, 1.0 / 60.0, &fonts, &mut c);
         };
         for _ in 0..30 {
             frame(&mut s, &mut c);

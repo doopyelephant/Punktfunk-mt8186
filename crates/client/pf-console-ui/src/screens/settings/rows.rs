@@ -972,6 +972,7 @@ pub fn changed(ids: &[RowId], ctx: &Ctx) -> Vec<RowId> {
         device: ctx.device,
         t: ctx.t,
         profiles: ctx.profiles,
+        ui: ctx.ui,
     };
     ids.iter()
         .copied()
@@ -1037,6 +1038,7 @@ pub fn row_spec(
             device: ctx.device,
             t: ctx.t,
             profiles: ctx.profiles,
+            ui: ctx.ui,
         };
         let value = row_spec_base(id, &under, presets).value.unwrap_or_default();
         spec.dot = true;

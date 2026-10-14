@@ -13,47 +13,15 @@
 //!
 //! Focus is the tree's too: a node marked [`El::focusable`] is a target, a [`Group`] is a
 //! container, and [`Tree::move_focus`] answers a direction from last frame's rects.
-//! [`census`] tells the shell whether a surface has any target at all.
+//! [`Ledger::census`] tells the shell whether a surface has any target at all; the ledger
+//! rides the frame's [`crate::theme::Frame`].
 
 mod focus;
 mod layout;
 
-pub(crate) use focus::forget_handoff;
-#[cfg(test)]
-pub(crate) use focus::DRAWN;
-pub use focus::{begin_frame, Group, Plate};
+pub use focus::{Group, Ledger, Plate};
 pub use layout::{Frame, Tree};
 
-thread_local! {
-    /// Focus is on the shell's tab strip, not in the layer painting now: its trees step
-    /// their plates without drawing them, so one plate shows. Set by the shell per layer.
-    static DORMANT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Focus targets placed inside the running [`census`]; `None` outside one.
-    static CENSUS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-pub fn set_dormant(on: bool) {
-    DORMANT.with(|d| d.set(on));
-}
-
-fn dormant() -> bool {
-    DORMANT.with(std::cell::Cell::get)
-}
-
-/// Runs `paint` and answers how many focus targets it placed. A tree counts its own;
-/// focus drawn outside a tree [`claim`]s it. Zero is a surface focus cannot enter.
-pub fn census(paint: impl FnOnce()) -> usize {
-    let outer = CENSUS.with(|c| c.replace(Some(0)));
-    paint();
-    let n = CENSUS.with(|c| c.replace(outer)).unwrap_or(0);
-    claim(n);
-    n
-}
-
-/// `n` more focus targets for the running [`census`]; nothing outside one.
-pub fn claim(n: usize) {
-    CENSUS.with(|c| c.set(c.get().map(|m| m + n)));
-}
 use skia_safe::{Canvas, Rect};
 pub use taffy::Style;
 use taffy::{Dimension, FlexDirection, LengthPercentage, Overflow, Point, Size};

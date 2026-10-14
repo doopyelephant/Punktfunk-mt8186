@@ -12,7 +12,7 @@ use crate::collate::SortKey;
 use crate::el::{El, Id};
 use crate::icons::{self, Icon};
 use crate::library::LibraryView;
-use crate::theme::{accent, fg, on_accent, Fonts, PanelStroke, W};
+use crate::theme::{Fonts, Frame, PanelStroke, W};
 use skia_safe::Rect;
 
 /// Row height, design units: a pill and its air.
@@ -126,7 +126,7 @@ pub(crate) struct Bar {
 
 impl Bar {
     /// Chase each group's capsule toward its applied pill, `applied[g]` in row order.
-    /// `snap` seats it.
+    /// `snap` seats it: a caller under reduced motion passes it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn step(
         &mut self,
@@ -139,7 +139,6 @@ impl Bar {
         snap: bool,
     ) {
         let l = layout(fonts, k, width, views);
-        let snap = snap || crate::theme::reduce_motion();
         for (g, cap) in self
             .caps
             .iter_mut()
@@ -167,6 +166,7 @@ impl Bar {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn el<'a>(
         &'a self,
+        ui: &'a Frame,
         fonts: &'a Fonts,
         k: f64,
         width: f64,
@@ -184,7 +184,7 @@ impl Bar {
             for &(x, mark) in &marks {
                 let cx = r.left + (x + MARK / 2.0 * k) as f32;
                 let size = (MARK * k) as f32;
-                icons::draw_icon(canvas, mark, cx, cy, size, k as f32, fg(0.5));
+                icons::draw_icon(canvas, mark, cx, cy, size, k as f32, ui.fg(0.5));
             }
             for [left, right] in self.caps.iter().flatten() {
                 let pill = Rect::from_xywh(
@@ -194,9 +194,10 @@ impl Bar {
                     (PILL_H * k) as f32,
                 );
                 let corner = (PILL_H / 2.0) as f32;
-                let tint = Some(accent(0.85));
+                let tint = Some(ui.accent(0.85));
                 crate::theme::panel(
                     canvas,
+                    ui,
                     pill,
                     corner,
                     tint,
@@ -209,9 +210,9 @@ impl Bar {
         let mut row = El::column().size(width as f32, h).child(under);
         for (i, (pill, r)) in Pill::all(views).into_iter().zip(l.pills).enumerate() {
             let ink = match (applied.contains(&i), focus == Some(i)) {
-                (true, _) => on_accent(),
-                (false, true) => fg(1.0),
-                (false, false) => fg(0.62),
+                (true, _) => ui.on_accent(),
+                (false, true) => ui.fg(1.0),
+                (false, false) => ui.fg(0.62),
             };
             let label = pill.label();
             row = row.child(

@@ -11,9 +11,11 @@
 //! out. Under Reduce Motion it jumps and fades. Pinned by `el::tests`.
 
 use crate::anim::{Spring, SpringSpec};
-use crate::theme::{accent, fg, fill, stroke};
+use crate::theme::{fill, stroke, Frame};
 use pf_client_core::menu_nav::MenuDir;
 use skia_safe::{gradient, BlurStyle, Canvas, Color4f, MaskFilter, Point, RRect, Rect, TileMode};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A focus container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,17 +99,8 @@ const BULGE: f64 = 0.6;
 /// Fade time constant, seconds: out with no target or while dormant, in on the way back.
 const FADE_TAU: f64 = 0.06;
 
-thread_local! {
-    /// The last plate to give up focus, for a plate in another tree to glide on from.
-    static HANDOFF: std::cell::Cell<Option<Handoff>> = const { std::cell::Cell::new(None) };
-    /// Surface frames begun ([`begin_frame`]); a handoff keeps for its frame and the next.
-    static FRAME: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static NEXT_PLATE: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-    /// Every plate drawn, device px, in draw order. Tests drain it.
-    #[cfg(test)]
-    pub(crate) static DRAWN: std::cell::RefCell<Vec<Rect>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+/// A plate's name in a [`Handoff`]: unique across trees, never 0.
+static NEXT_PLATE: AtomicU64 = AtomicU64::new(1);
 
 /// Where a plate stood when it gave up focus: device px, so any tree can read it.
 #[derive(Clone, Copy)]
@@ -119,47 +112,87 @@ struct Handoff {
     taken: bool,
 }
 
-/// One frame of the whole surface is starting. Called once per shell render.
-pub fn begin_frame() {
-    FRAME.with(|f| f.set(f.get() + 1));
+/// The element layer's share of a [`Frame`]: whether focus sleeps in the layer painting now,
+/// the running census of focus targets, and the plate handed from one tree to another.
+#[derive(Default)]
+pub struct Ledger {
+    /// Focus is on the shell's tab strip, not in the layer painting now: its trees step
+    /// their plates without drawing them, so one plate shows. Set by the shell per layer.
+    dormant: Cell<bool>,
+    /// Focus targets placed inside the running [`Ledger::census`]; `None` outside one.
+    census: Cell<Option<usize>>,
+    /// The last plate to give up focus, for a plate in another tree to glide on from.
+    handoff: Cell<Option<Handoff>>,
+    /// Frames since the first; a handoff keeps for its frame and the next.
+    frame: u64,
+    /// Every plate drawn this frame, device px, in draw order.
+    #[cfg(test)]
+    pub(crate) drawn: std::cell::RefCell<Vec<Rect>>,
 }
 
-/// `owner`'s plate just gave up focus at `rect`, device px.
-pub(crate) fn offer(owner: u64, rect: Rect, corner: f32) {
-    let frame = FRAME.with(std::cell::Cell::get);
-    HANDOFF.with(|h| {
-        h.set(Some(Handoff {
+impl Ledger {
+    /// The next frame's: the handoff carries over, the rest starts again.
+    pub(crate) fn next(&self) -> Ledger {
+        Ledger {
+            handoff: Cell::new(self.handoff.get()),
+            frame: self.frame + 1,
+            ..Ledger::default()
+        }
+    }
+
+    pub fn set_dormant(&self, on: bool) {
+        self.dormant.set(on);
+    }
+
+    pub(crate) fn dormant(&self) -> bool {
+        self.dormant.get()
+    }
+
+    /// Runs `paint` and answers how many focus targets it placed. A tree counts its own;
+    /// focus drawn outside a tree [`Ledger::claim`]s it. Zero is a surface focus cannot enter.
+    pub fn census(&self, paint: impl FnOnce()) -> usize {
+        let outer = self.census.replace(Some(0));
+        paint();
+        let n = self.census.replace(outer).unwrap_or(0);
+        self.claim(n);
+        n
+    }
+
+    /// `n` more focus targets for the running [`Ledger::census`]; nothing outside one.
+    pub fn claim(&self, n: usize) {
+        self.census.set(self.census.get().map(|m| m + n));
+    }
+
+    /// `owner`'s plate just gave up focus at `rect`, device px.
+    pub(crate) fn offer(&self, owner: u64, rect: Rect, corner: f32) {
+        self.handoff.set(Some(Handoff {
             owner,
             rect,
             corner,
-            frame,
+            frame: self.frame,
             taken: false,
         }));
-    });
-}
+    }
 
-/// The rect another plate left this frame or the last, once: a plate that takes it glides
-/// on from there, and the one that left hides.
-pub(crate) fn take(taker: u64) -> Option<(Rect, f32)> {
-    let frame = FRAME.with(std::cell::Cell::get);
-    HANDOFF.with(|h| {
-        let mut o = h
-            .get()
-            .filter(|o| o.owner != taker && !o.taken && frame <= o.frame + 1)?;
+    /// The rect another plate left this frame or the last, once: a plate that takes it
+    /// glides on from there, and the one that left hides.
+    pub(crate) fn take(&self, taker: u64) -> Option<(Rect, f32)> {
+        let mut o = (self.handoff.get())
+            .filter(|o| o.owner != taker && !o.taken && self.frame <= o.frame + 1)?;
         o.taken = true;
-        h.set(Some(o));
+        self.handoff.set(Some(o));
         Some((o.rect, o.corner))
-    })
-}
+    }
 
-/// Drop any rect a plate left: nothing drawn since should glide from it.
-pub(crate) fn forget_handoff() {
-    HANDOFF.with(|h| h.set(None));
-}
+    /// Drop any rect a plate left: nothing drawn since should glide from it.
+    pub(crate) fn forget_handoff(&self) {
+        self.handoff.set(None);
+    }
 
-/// Another plate took up where `owner`'s left off.
-pub(crate) fn taken_from(owner: u64) -> bool {
-    HANDOFF.with(|h| h.get().is_some_and(|o| o.owner == owner && o.taken))
+    /// Another plate took up where `owner`'s left off.
+    pub(crate) fn taken_from(&self, owner: u64) -> bool {
+        (self.handoff.get()).is_some_and(|o| o.owner == owner && o.taken)
+    }
 }
 
 /// Sprung rect behind the focused node. It springs in its scroll's content space, so it
@@ -199,15 +232,18 @@ pub struct Plate {
     /// This plate's name in a [`Handoff`]; 0 until first asked.
     id: u64,
     /// Focus arrived with nothing on screen: this frame the plate waits, unseen, for a plate
-    /// leaving another tree ([`take`]); `fresh` if it had never been drawn.
+    /// leaving another tree ([`Ledger::take`]); `fresh` if it had never been drawn.
     waiting: bool,
     fresh: bool,
+    /// Reduce Motion as of the last frame that stepped the plate: a press reads it.
+    reduced: bool,
 }
 
 impl Plate {
     /// Chase `target`, `id`'s content rect in the scroll `space` shifted by `shift` this
     /// frame, by `dt` seconds. Dormant, it fades out on the way; a plate that had faded
     /// out starts over on its target instead of gliding in from where it vanished.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn step(
         &mut self,
         id: super::Id,
@@ -216,6 +252,7 @@ impl Plate {
         dt: f64,
         space: Option<super::Id>,
         shift: (f32, f32),
+        ui: &Frame,
     ) {
         // A new scroll: carry the plate over where it stands on screen.
         if let Some(e) = self.edges.as_mut().filter(|_| space != self.space) {
@@ -238,8 +275,9 @@ impl Plate {
             f64::from(target.bottom),
             f64::from(corner),
         ];
-        let reduced = crate::theme::reduce_motion();
-        let live = !super::dormant();
+        let reduced = ui.reduce_motion;
+        self.reduced = reduced;
+        let live = !ui.el.dormant();
         if self.to != Some(id) {
             self.armed = true;
             let (dx, dy) = (
@@ -286,7 +324,8 @@ impl Plate {
 
     /// No target this frame: the plate glides on to its last goal and fades out, riding
     /// its scroll at `shift` while that scroll is drawn.
-    pub(crate) fn lose(&mut self, dt: f64, shift: Option<(f32, f32)>) {
+    pub(crate) fn lose(&mut self, dt: f64, shift: Option<(f32, f32)>, ui: &Frame) {
+        self.reduced = ui.reduce_motion;
         if let Some(s) = shift {
             self.shift = s;
         }
@@ -297,7 +336,7 @@ impl Plate {
     /// This plate's name in a handoff.
     pub(crate) fn id(&mut self) -> u64 {
         if self.id == 0 {
-            self.id = NEXT_PLATE.with(|n| n.replace(n.get() + 1));
+            self.id = NEXT_PLATE.fetch_add(1, Ordering::Relaxed);
         }
         self.id
     }
@@ -418,7 +457,7 @@ impl Plate {
     /// OK went down on the focused node: the plate dips and springs back. Reduce Motion
     /// keeps it still; the release acts either way.
     pub(crate) fn press(&mut self) {
-        if !crate::theme::reduce_motion() {
+        if !self.reduced {
             self.press = Some(Spring::rest(crate::anim::PRESS_SCALE));
         }
     }
@@ -454,38 +493,36 @@ impl Plate {
 
     /// A lifted glass plate with a brighter rim; the rim glows as the plate squashes on
     /// arrival. `k` scales the outset; `cheap` skips the blurred shadow.
-    pub(crate) fn draw(&self, canvas: &Canvas, k: f32, cheap: bool) {
+    pub(crate) fn draw(&self, canvas: &Canvas, k: f32, cheap: bool, ui: &Frame) {
         let Some((r, corner)) = self.rect().filter(|_| self.visible()) else {
             return;
         };
         #[cfg(test)]
-        DRAWN.with(|d| {
+        {
             let m = canvas.local_to_device_as_3x3();
-            d.borrow_mut().push(m.map_rect(r).0);
-        });
+            ui.el.drawn.borrow_mut().push(m.map_rect(r).0);
+        }
         let alpha = self.shown as f32;
         let out = OUTSET * k;
         let rr = RRect::new_rect_xy(r.with_outset((out, out)), corner + out, corner + out);
         if !cheap {
-            let mut shadow = fill(Color4f::new(
-                0.0,
-                0.0,
-                0.0,
-                alpha * crate::theme::shadow(0.4),
-            ));
+            let mut shadow = fill(Color4f::new(0.0, 0.0, 0.0, alpha * ui.shadow(0.4)));
             shadow.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 12.0 * k, None));
             canvas.draw_rrect(rr.with_offset((0.0, 10.0 * k)), &shadow);
         }
-        canvas.draw_rrect(rr, &fill(fg(0.12 * alpha)));
-        canvas.draw_rrect(rr, &fill(accent(0.10 * alpha)));
+        canvas.draw_rrect(rr, &fill(ui.fg(0.12 * alpha)));
+        canvas.draw_rrect(rr, &fill(ui.accent(0.10 * alpha)));
         let squash = self.edges.as_ref().map_or(0.0, |e| {
             let rx = shape(e[0].pos, e[2].pos, self.size[0].pos, None).2;
             let ry = shape(e[1].pos, e[3].pos, self.size[1].pos, None).2;
             (1.0 - rx.min(ry)).max(0.0)
         });
         let pulse = (squash / SQUASH_MAX * 0.35).min(0.35) as f32;
-        let rim = [fg((0.62 + pulse) * alpha), fg((0.14 + pulse / 2.0) * alpha)];
-        let mut p = stroke(fg(1.0), 1.5 * k);
+        let rim = [
+            ui.fg((0.62 + pulse) * alpha),
+            ui.fg((0.14 + pulse / 2.0) * alpha),
+        ];
+        let mut p = stroke(ui.fg(1.0), 1.5 * k);
         p.set_shader(linear(rr.rect(), &rim, None));
         canvas.draw_rrect(rr, &p);
     }
@@ -557,10 +594,11 @@ mod tests {
     /// OK down dips the plate around its centre, and the spring brings it back whole.
     #[test]
     fn a_press_dips_the_plate_and_it_springs_back() {
+        let ui = Frame::default();
         let mut p = Plate::default();
         let id = super::super::Id::new("t", 0);
         let r = Rect::from_xywh(0.0, 0.0, 100.0, 50.0);
-        let frame = |p: &mut Plate| p.step(id, r, 8.0, 1.0 / 60.0, None, (0.0, 0.0));
+        let frame = |p: &mut Plate| p.step(id, r, 8.0, 1.0 / 60.0, None, (0.0, 0.0), &ui);
         frame(&mut p);
         p.press();
         frame(&mut p);
@@ -579,15 +617,16 @@ mod tests {
     /// saturates inside the caps, and it rests on its target's rect exactly.
     #[test]
     fn the_plate_stretches_then_squashes_in_one_motion() {
+        let ui = Frame::default();
         let (a, b) = (super::super::Id::new("t", 0), super::super::Id::new("t", 1));
         for dist in [120.0_f32, 1000.0] {
             let mut p = Plate::default();
             let from = Rect::from_xywh(0.0, 0.0, 100.0, 60.0);
             let to = from.with_offset((dist, 0.0));
-            p.step(a, from, 8.0, 1.0 / 60.0, None, (0.0, 0.0));
+            p.step(a, from, 8.0, 1.0 / 60.0, None, (0.0, 0.0), &ui);
             let (mut widest, mut narrowest, mut ahead) = (0.0f32, f32::MAX, false);
             for _ in 0..120 {
-                p.step(b, to, 8.0, 1.0 / 60.0, None, (0.0, 0.0));
+                p.step(b, to, 8.0, 1.0 / 60.0, None, (0.0, 0.0), &ui);
                 let (r, _) = p.rect().unwrap();
                 let w = r.width() / 100.0;
                 widest = widest.max(w);
@@ -612,13 +651,14 @@ mod tests {
     /// the long axis's pace, not after it. Main tabs down to Settings' sections is this hop.
     #[test]
     fn a_mostly_sideways_hop_runs_straight() {
+        let ui = Frame::default();
         let (a, b) = (super::super::Id::new("t", 0), super::super::Id::new("t", 1));
         let mut p = Plate::default();
         let from = Rect::from_xywh(460.0, 40.0, 140.0, 50.0);
         let to = Rect::from_xywh(40.0, 120.0, 100.0, 40.0);
-        p.step(a, from, 8.0, 1.0 / 60.0, None, (0.0, 0.0));
+        p.step(a, from, 8.0, 1.0 / 60.0, None, (0.0, 0.0), &ui);
         for _ in 0..8 {
-            p.step(b, to, 8.0, 1.0 / 60.0, None, (0.0, 0.0));
+            p.step(b, to, 8.0, 1.0 / 60.0, None, (0.0, 0.0), &ui);
             let (r, _) = p.rect().unwrap();
             let x = (from.left - r.left) / (from.left - to.left);
             let y = (r.center_y() - from.center_y()) / (to.center_y() - from.center_y());
@@ -632,6 +672,7 @@ mod tests {
     /// A plate seeded from another tree is arriving until it lands, and only then clips.
     #[test]
     fn a_handed_over_plate_arrives_then_lands() {
+        let ui = Frame::default();
         let id = super::super::Id::new("t", 0);
         let mut p = Plate::default();
         p.seed(
@@ -643,11 +684,11 @@ mod tests {
         assert!(p.arriving());
         let to = Rect::from_xywh(0.0, 20.0, 200.0, 90.0);
         for _ in 0..3 {
-            p.step(id, to, 12.0, 1.0 / 60.0, None, (0.0, 0.0));
+            p.step(id, to, 12.0, 1.0 / 60.0, None, (0.0, 0.0), &ui);
         }
         assert!(p.arriving(), "still in flight");
         for _ in 0..120 {
-            p.step(id, to, 12.0, 1.0 / 60.0, None, (0.0, 0.0));
+            p.step(id, to, 12.0, 1.0 / 60.0, None, (0.0, 0.0), &ui);
         }
         assert!(!p.arriving());
         assert_eq!(p.rect().unwrap().0, to);
