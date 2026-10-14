@@ -211,14 +211,14 @@ object DeepLinks {
     /**
      * The self-emitted form for a saved host: id first (address-independent), with the address and
      * pin alongside so the link degrades to a confirmation sheet instead of a dead click when the
-     * record is gone.
+     * record is gone. The desktop tile is no title: its link is the host's.
      */
     fun forHost(host: KnownHost, launch: String? = null, preset: String? = null) = DeepLink(
         route = LinkRoute.CONNECT,
         hostRef = host.id,
         fp = host.fpHex.ifEmpty { null },
         host = host.address to host.port,
-        launch = launch,
+        launch = launch?.takeUnless { it == io.unom.punktfunk.kit.library.GameEntry.DESKTOP_ID },
         preset = preset,
     )
 

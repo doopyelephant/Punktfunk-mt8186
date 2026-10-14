@@ -294,7 +294,8 @@ impl DeepLink {
     }
 
     /// Id first (address-independent). Address and pin so a missing record degrades
-    /// to a confirmation sheet, not an unresolvable click.
+    /// to a confirmation sheet, not an unresolvable click. The desktop tile is no title:
+    /// its link is the host's.
     pub fn for_host(host: &KnownHost, launch: Option<&str>, preset: Option<&str>) -> DeepLink {
         DeepLink {
             route: Route::Connect,
@@ -303,7 +304,9 @@ impl DeepLink {
             }),
             fp: (!host.fp_hex.is_empty()).then(|| host.fp_hex.clone()),
             host: Some((host.addr.clone(), host.port)),
-            launch: launch.map(str::to_string),
+            launch: launch
+                .filter(|id| *id != crate::library::DESKTOP_ID)
+                .map(str::to_string),
             preset: preset.map(str::to_string),
             as_profile: None,
             name: None,
@@ -814,6 +817,11 @@ mod tests {
             "the store's record, wherever the screen last saw it"
         );
         assert!(is_link_arg("PF://connect/Desk") && !is_link_arg("--pf://"));
+
+        // The desktop tile's NUL id would make the link unparseable: its link is the host's.
+        let desktop = DeepLink::for_host(&h, Some(crate::library::DESKTOP_ID), None);
+        assert_eq!(desktop.launch, None);
+        assert!(parse(&desktop.to_url()).is_ok());
 
         // Pre-migration record with no id still emits a resolvable `addr:port`.
         let mut plain = h.clone();

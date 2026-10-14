@@ -349,20 +349,30 @@ fun LibraryScreen(
         if (autoStream && ready != null) launch(ready, GameEntry.desktop())
     }
 
-    // "Copy link" for one TITLE — the self-emitted form a host card already hands out (design/
-    // client-deep-links.md §4/§5), plus this game's `launch=` id, so pasting the URL into Playnite
-    // or a Stream Deck macro boots straight into it. A shelf opened from a PINNED card copies that
-    // card's preset with it, because that combination is the thing being copied.
-    fun copyLink(game: GameEntry) {
+    // One TITLE's link handed out (design/client-deep-links.md §4/§5): the host card's form plus
+    // this game's `launch=` id, so Playnite, a frontend or a home-screen tap boots straight into
+    // it. A shelf opened from a PINNED card carries that card's preset: that combination is the
+    // thing handed out. Every answer is a toast: this screen has no notice banner or status line.
+    fun linkAction(game: GameEntry, action: LinkAction) {
         val url = DeepLinks.forHost(host, launch = game.id, preset = pinnedPresetId).toUrl()
-        // A toast either way here: this screen renders neither the touch home's notice banner nor
-        // the console's status line, and both of its presentations are full-bleed over artwork.
-        linkCopyMessage(putLinkOnClipboard(context, url))?.let {
-            Toast.makeText(context, it, Toast.LENGTH_SHORT).show()
+        val name = if (game.isDesktop) host.name else game.title
+        val say = { text: String -> Toast.makeText(context, text, Toast.LENGTH_SHORT).show() }
+        when (action) {
+            LinkAction.Copy -> linkCopyMessage(putLinkOnClipboard(context, url))?.let(say)
+            LinkAction.LauncherFile -> (context as? MainActivity)?.saveLauncherFile(name, url, say)
+            LinkAction.HomeScreen -> {
+                val identity = (state as? LibState.Ready)?.identity
+                val key = shortcutId(host.id, game.id.takeUnless { game.isDesktop }, pinnedPresetId)
+                scope.launch {
+                    withContext(Dispatchers.IO) {
+                        pinTitleShortcut(context, identity, host, game.art.posterCandidates, url, name, key)
+                    }?.let(say)
+                }
+            }
         }
     }
 
-    // Lambdas, NOT `::launch` / `::copyLink`: two callable references to the same local function
+    // Lambdas, NOT `::launch` / `::linkAction`: two callable references to the same local function
     // compare EQUAL however different the frame they captured, so a skipped recomposition would
     // leave the child calling a closure over stale settings. SettingsScreen documents the same
     // trap at `scopePreset()`, having been bitten by it.
@@ -466,7 +476,7 @@ fun LibraryScreen(
         onBack = onBack,
         onReload = { reloadKey++ },
         onLaunch = { identity, game -> launch(identity, game) },
-        onCopyLink = { game -> copyLink(game) },
+        onLink = { game, action -> linkAction(game, action) },
         onEndGame = { game -> endAsk = game },
         onFiles = { game, action ->
             if (action == InstallAction.Remove) removeAsk = game else changeInstall(game, action)
@@ -590,7 +600,7 @@ private fun TouchLibrary(
     onBack: () -> Unit,
     onReload: () -> Unit,
     onLaunch: (ClientIdentity, GameEntry) -> Unit,
-    onCopyLink: (GameEntry) -> Unit,
+    onLink: (GameEntry, LinkAction) -> Unit,
     /** Ask to end a title this device launched; the caller confirms. */
     onEndGame: (GameEntry) -> Unit = {},
     /** Install, pause, resume or remove a title's download; the caller confirms a removal. */
@@ -662,7 +672,7 @@ private fun TouchLibrary(
                     games = state.ordered,
                     loader = state.loader,
                     onLaunch = { game -> onLaunch(state.identity, game) },
-                    onCopyLink = onCopyLink,
+                    onLink = onLink,
                     onEndGame = onEndGame,
                     running = state.running,
                     downloads = state.downloads,
@@ -703,7 +713,7 @@ internal fun TouchGrid(
     games: List<GameEntry>,
     loader: ImageLoader,
     onLaunch: (GameEntry) -> Unit,
-    onCopyLink: (GameEntry) -> Unit,
+    onLink: (GameEntry, LinkAction) -> Unit,
     onEndGame: (GameEntry) -> Unit = {},
     /**
      * Which titles the host already has up, keyed by library id — so a tile the player can return
@@ -754,7 +764,7 @@ internal fun TouchGrid(
             if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Launchers") }
             items(launchers, key = { "launcher-${it.id}" }) {
                 TouchPoster(
-                    it, loader, onLaunch, onCopyLink, running[it.id] != null,
+                    it, loader, onLaunch, onLink, running[it.id] != null,
                     endable = running[it.id]?.endable == true, onEndGame = onEndGame,
                     download = downloads[it.id], grants = grants, onFiles = onFiles,
                 )
@@ -764,7 +774,7 @@ internal fun TouchGrid(
             if (both) item(span = { GridItemSpan(maxLineSpan) }) { TouchGroupHeading("Games") }
             items(titles, key = { "game-${it.id}" }) {
                 TouchPoster(
-                    it, loader, onLaunch, onCopyLink, running[it.id] != null,
+                    it, loader, onLaunch, onLink, running[it.id] != null,
                     endable = running[it.id]?.endable == true, onEndGame = onEndGame,
                     download = downloads[it.id], grants = grants, onFiles = onFiles,
                 )
@@ -816,7 +826,7 @@ private fun TouchPoster(
     game: GameEntry,
     loader: ImageLoader,
     onLaunch: (GameEntry) -> Unit,
-    onCopyLink: (GameEntry) -> Unit,
+    onLink: (GameEntry, LinkAction) -> Unit,
     /** Already up on the host, so tapping resumes rather than starts. */
     running: Boolean = false,
     /** Up, and this device launched it: the long press offers End game. */
@@ -828,6 +838,8 @@ private fun TouchPoster(
     onFiles: (GameEntry, InstallAction) -> Unit = { _, _ -> },
 ) {
     var menu by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val canPin = remember { canPinShortcuts(context) }
     val files = InstallAction.forTitle(game.install, download, grants)
     val badge = TileBadge.forTitle(game.install, download)
     val shape = MaterialTheme.shapes.medium
@@ -906,7 +918,23 @@ private fun TouchPoster(
                 text = { Text("Copy link") },
                 onClick = {
                     menu = false
-                    onCopyLink(game)
+                    onLink(game, LinkAction.Copy)
+                },
+            )
+            if (canPin) {
+                DropdownMenuItem(
+                    text = { Text("Add to home screen") },
+                    onClick = {
+                        menu = false
+                        onLink(game, LinkAction.HomeScreen)
+                    },
+                )
+            }
+            DropdownMenuItem(
+                text = { Text("Save launcher file\u2026") },
+                onClick = {
+                    menu = false
+                    onLink(game, LinkAction.LauncherFile)
                 },
             )
             if (files != null) {

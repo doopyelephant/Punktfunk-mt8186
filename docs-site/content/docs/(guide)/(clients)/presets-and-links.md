@@ -122,11 +122,29 @@ Android and the console a game in the library has one too, with its `launch=`. A
 carries its preset, except on Windows. A copied link carries the
 record id, `host=` and, once pinned, `fp=`, so it survives an address change or a reinstall.
 
-**Create shortcut…** (Linux, Windows) writes a launcher:
+**Create shortcut…** (Linux, Windows) and **Add to home screen** (Android) make a launcher:
 
 - **Linux**: a desktop entry in `~/.local/share/applications/`, from the host page or a game's
   details. Under Flatpak the app shows the URL for you to place yourself.
 - **Windows**: a `.lnk` on your Desktop that runs `punktfunk-client.exe` with the URL.
+- **Android**: a home-screen shortcut with the game's cover, from a game's long-press menu or its
+  **Details…** card in the controller interface. Android TV launchers don't take shortcuts.
+
+## Starting a game from a frontend
+
+On Android, a game frontend that lists a folder of files can start a game through a `.punktfunk`
+launcher file.
+
+1. On a game, choose **Save launcher file…** (long-press it in the library, or its **Details…**
+   card in the controller interface). Save it into the folder the frontend scans.
+2. Have the frontend open `.punktfunk` files with this activity and the file's URI:
+
+   ```text
+   am start -n io.unom.punktfunk/io.unom.punktfunk.MainActivity -a android.intent.action.VIEW -d <file URI>
+   ```
+
+A launcher file is the game's link on one line, as **Copy link** gives it, so a text editor can
+make one too. The rules above apply: a link to a host you haven't paired shows a notice.
 
 From a script, use the [`punktfunk` command](/docs/clients#scripting-the-punktfunk-cli):
 

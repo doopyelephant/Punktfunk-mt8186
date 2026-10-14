@@ -669,7 +669,7 @@ internal fun TouchLibraryScene() {
                     Icon(Icons.Filled.Refresh, contentDescription = "Reload")
                 }
             }
-            TouchGrid(games, loader, onLaunch = {}, onCopyLink = {}, modifier = Modifier.weight(1f))
+            TouchGrid(games, loader, onLaunch = {}, onLink = { _, _ -> }, modifier = Modifier.weight(1f))
         }
     }
 }

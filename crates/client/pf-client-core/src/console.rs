@@ -38,6 +38,16 @@ pub enum OverlayAction {
     /// SDL owns the clipboard and lives on the run-loop thread, so this
     /// cannot ride the console command bus.
     CopyText(String),
+    /// Pin a home-screen shortcut that opens `url`, labelled `title`. Android only.
+    PinShortcut {
+        url: String,
+        title: String,
+    },
+    /// Save `url` as a launcher file a frontend opens, named after `title`. Android only.
+    SaveLauncherFile {
+        url: String,
+        title: String,
+    },
 }
 
 /// A touchscreen contact is always `Primary`; Back lives on glass, not a
