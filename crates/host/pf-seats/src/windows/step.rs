@@ -358,7 +358,7 @@ pub(crate) struct State {
     stage: Stage,
     status: RuntimeStatus,
     session: Option<u32>,
-    /// The first start's outcome, which `start` waits for.
+    /// The latest outcome: the first start waits for one, a repeated start answers it.
     answer: Option<Result<(), BackendError>>,
     stop: Option<Stop>,
     gate: Gate,
@@ -397,8 +397,8 @@ impl State {
         self.session
     }
 
-    /// The first start's outcome. It stays unset through a failed gate that gets another
-    /// session, and when the start runs out of time.
+    /// The latest outcome: `Ok` once the host serves, the fault of a cycle that failed, or
+    /// the start's timeout. A failed gate that gets another session leaves it as it was.
     pub(crate) fn answer(&self) -> Option<&Result<(), BackendError>> {
         self.answer.as_ref()
     }
@@ -445,6 +445,7 @@ impl State {
             Observation::StartTimedOut => {
                 self.stop = Some(Stop::TimedOut(self.stage));
                 self.status = RuntimeStatus::failed(self.stage.timed_out());
+                self.answer = Some(Err(self.start_timeout()));
                 Vec::new()
             }
             Observation::Failed(_) if self.finished() => vec![Action::Finish],
@@ -586,7 +587,7 @@ impl State {
             )
         } else if probe.ready {
             self.status = RuntimeStatus::running();
-            self.answer.get_or_insert(Ok(()));
+            self.answer = Some(Ok(()));
             self.restart.started(now);
             self.host_restart.started(now);
             self.phase = Phase::Running;
@@ -692,7 +693,7 @@ impl State {
         }
         let retry = !stopping && (gate_retry || !fault.code.permanent());
         let mut actions = Vec::new();
-        // The first answer reaches the caller; later failures have only the log.
+        // The first start's caller logs the first outcome; the log has every later one.
         if !stopping && (self.answer.is_some() || gate_retry) {
             actions.push(Action::Report {
                 error: fault.error.clone(),
@@ -701,7 +702,7 @@ impl State {
         }
         if !gate_retry {
             self.status = RuntimeStatus::failed(fault.plain());
-            self.answer.get_or_insert(Err(fault.error));
+            self.answer = Some(Err(fault.error));
         }
         if retry {
             self.phase = Phase::Resting {
@@ -1324,11 +1325,7 @@ mod tests {
                 then.push(Action::Finish);
             }
             assert_eq!(bench.see(NOTHING), then, "{at:?} {code}");
-            let answer = match answered {
-                true => Ok(()),
-                false => Err((code, MESSAGE)),
-            };
-            assert_eq!(bench.answer(), Some(answer), "{at:?} {code}");
+            assert_eq!(bench.answer(), Some(Err((code, MESSAGE))), "{at:?} {code}");
             assert_eq!(bench.state.finished(), !retry, "{at:?} {code}");
         }
     }
@@ -1369,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn the_first_answer_stays_when_a_later_cycle_serves() {
+    fn a_later_cycle_that_serves_replaces_the_answer() {
         let mut bench = bench(At::SigningIn);
         assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
         assert_eq!(bench.see(NOTHING), []);
@@ -1382,14 +1379,12 @@ mod tests {
             assert_eq!(bench.see(probe), actions);
         }
         assert_eq!(*bench.state.status(), RuntimeStatus::running());
-        let now = bench
-            .answer()
-            .map(|answer| answer.map_err(|(code, _)| code));
-        assert_eq!(now, Some(Err("rdp_keeper_exited")));
+        assert_eq!(bench.answer(), Some(Ok(())));
     }
 
     #[test]
     fn a_stop_in_every_phase_ends_stopped() {
+        const LOST: (&str, &str) = ("rdp_keeper_exited", "RDP keeper process exited with code 5");
         let check = vec![Action::Announce(Stage::Display, 1), Action::StartGate];
         let end = [Action::EndCycle, Action::Finish];
         // Phase, what the worker still does, and what the start is answered. The two phases
@@ -1411,8 +1406,8 @@ mod tests {
             (At::Readying, end.to_vec(), Err(STOPPED_READYING)),
             (At::Running, end.to_vec(), Ok(())),
             (At::HostDown, end.to_vec(), Ok(())),
-            (At::Ending, vec![Action::Finish], Ok(())),
-            (At::Resting, vec![Action::Finish], Ok(())),
+            (At::Ending, vec![Action::Finish], Err(LOST)),
+            (At::Resting, vec![Action::Finish], Err(LOST)),
         ];
         for (at, actions, answer) in rows {
             let mut bench = bench(at);
@@ -1471,7 +1466,7 @@ mod tests {
         assert_eq!(bench.see(READY), [Action::EndCycle]);
         assert_eq!(bench.ending(), Some(STOPPED_READYING));
         assert_eq!(bench.run_out(), [Action::Finish]);
-        assert_eq!(bench.answer(), Some(Ok(())));
+        assert_eq!(bench.answer(), Some(Err(STOPPED_READYING)));
     }
 
     #[test]
@@ -1507,8 +1502,9 @@ mod tests {
                 bench.asks(Observation::StartTimedOut);
                 let why = format!("The seat didn't start in time. It stopped while {stage}.");
                 assert_eq!(*bench.state.status(), shows(RuntimeState::Failed, &why));
-                // The caller answers the timeout itself; the state keeps no answer for it.
-                assert_eq!(bench.answer(), None, "{at:?}");
+                // A second start before the worker leaves answers the timeout too.
+                let timed_out = Err(("start_timeout", message.as_str()));
+                assert_eq!(bench.answer(), Some(timed_out), "{at:?}");
                 if !stop_first {
                     bench.asks(Observation::Stop);
                 }
