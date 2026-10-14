@@ -378,7 +378,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 53
+#define PUNKTFUNK_ABI_VERSION 54
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -3121,6 +3121,15 @@ PunktfunkStatus punktfunk_connection_set_sc2_gate(PunktfunkConnection *c,
 // # Safety
 // `out` points to `cap` writable bytes.
 uintptr_t punktfunk_sc2_identity_request(bool puck, uint32_t index, uint8_t *out, uintptr_t cap);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`punktfunk_sc2_identity_request`] for a 2015 Steam Controller: the `index`-th query, report
+// id 0 first. Returns its length; 0 past the last one or when `cap` is short.
+//
+// # Safety
+// `out` points to `cap` writable bytes.
+uintptr_t punktfunk_sc1_identity_request(uint32_t index, uint8_t *out, uintptr_t cap);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

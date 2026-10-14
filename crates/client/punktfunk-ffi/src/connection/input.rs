@@ -211,6 +211,30 @@ pub unsafe extern "C" fn punktfunk_sc2_identity_request(
     req.len()
 }
 
+/// [`punktfunk_sc2_identity_request`] for a 2015 Steam Controller: the `index`-th query, report
+/// id 0 first. Returns its length; 0 past the last one or when `cap` is short.
+///
+/// # Safety
+/// `out` points to `cap` writable bytes.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_sc1_identity_request(
+    index: u32,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    let Some(req) = punktfunk_core::client::sc2::classic_identity_requests().nth(index as usize)
+    else {
+        return 0;
+    };
+    if out.is_null() || cap < req.len() {
+        return 0;
+    }
+    // SAFETY: the caller grants `cap` writable bytes at `out`; `req` fits.
+    unsafe { std::ptr::copy_nonoverlapping(req.as_ptr(), out, req.len()) };
+    req.len()
+}
+
 /// Tell the host who the Steam Controller 2 on `pad` is, before its arrival: `serial` is its USB
 /// serial (UTF-8, NUL-terminated), `replies` the `(request, reply)` pairs packed as
 /// `[len][request][len][reply]…`, each part at most 64 bytes. `slot` is a Puck pad's slot (its USB
