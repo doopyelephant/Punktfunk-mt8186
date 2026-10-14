@@ -75,10 +75,22 @@ impl NoOutput {
     }
 }
 
-/// Frames a decoder shows before its rung counts as working on this device.
-/// One second at 60 Hz, and more than a codec's output pool holds: a decoder its
-/// configuration hangs stops inside the pool.
-pub(crate) const SETTLED_FRAMES: u64 = 60;
+/// Frames a decoder shows before its rung counts as working on this device. Five seconds
+/// at 60 Hz: a configuration that stops its decoder does so within a few dozen frames,
+/// the pool's worth; one that ran five seconds works.
+pub(crate) const SETTLED_FRAMES: u64 = 300;
+
+/// The rung a decoder's replacement starts at once this one started and then failed, over
+/// the ladder's present backends (`None` = no reader). A started decoder proved its reader's
+/// allocation, so a hang on a reader rung sheds the reader itself; a reader-free rung sheds
+/// its keys. `reader`: the failed decoder rendered into a reader. `None` at the ladder's end.
+pub(crate) fn rung_after_failure(
+    backends: &[Option<bool>],
+    rung: usize,
+    reader: bool,
+) -> Option<usize> {
+    (rung + 1..backends.len()).find(|&i| !reader || backends[i].is_none())
+}
 
 /// Clean, unsettled failures in a row before the ladder moves.
 const UNSETTLED_PER_RUNG: u32 = 2;
@@ -129,9 +141,26 @@ impl RungFloor {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputStall, NoOutput, RungFloor, INPUT_STALL_PATIENCE, NO_OUTPUT_PATIENCE, SETTLED_FRAMES,
+        rung_after_failure, InputStall, NoOutput, RungFloor, INPUT_STALL_PATIENCE,
+        NO_OUTPUT_PATIENCE, SETTLED_FRAMES,
     };
     use std::time::{Duration, Instant};
+
+    /// The full ladder: overlay reader, GPU-composited reader, then three reader-free rungs.
+    /// A hang skips the second reader; the overlay bit only matters at start.
+    #[test]
+    fn a_hung_decoder_sheds_the_reader_then_the_keys() {
+        let backends = [Some(true), Some(false), None, None, None];
+        assert_eq!(rung_after_failure(&backends, 0, true), Some(2));
+        assert_eq!(rung_after_failure(&backends, 1, true), Some(2));
+        // The reader failed to create, so the decoder already ran on the SurfaceView.
+        assert_eq!(rung_after_failure(&backends, 1, false), Some(2));
+        assert_eq!(rung_after_failure(&backends, 2, false), Some(3));
+        assert_eq!(rung_after_failure(&backends, 4, false), None);
+        // No reader wanted at all: plain descent.
+        assert_eq!(rung_after_failure(&[None, None, None], 0, false), Some(1));
+        assert_eq!(rung_after_failure(&[None], 0, false), None);
+    }
 
     /// A decoder that starts and then hangs on an unbroken stream, every time, walks the
     /// ladder, and each rung gets its own two tries.

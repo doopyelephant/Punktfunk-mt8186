@@ -30,7 +30,9 @@ use super::surface_control::{Layer, PresentComplete};
 use super::vsync::{VsyncClock, VsyncShared};
 use super::{Backstops, DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP};
 use crate::au_intake::{hand_on, Delivery, Intake};
-use crate::input_stall::{InputStall, RungFloor, INPUT_STALL_PATIENCE, SETTLED_FRAMES};
+use crate::input_stall::{
+    rung_after_failure, InputStall, RungFloor, INPUT_STALL_PATIENCE, SETTLED_FRAMES,
+};
 use crate::sys::{now_monotonic_ns, sysprop};
 
 /// One decoded output buffer ready to release: its codec buffer index + the pts the codec echoed
@@ -181,8 +183,8 @@ enum RunEnd {
     /// The session stopped video, or every bring-up rung refused the first codec.
     Stopped,
     /// The codec died or stopped taking input after showing `rendered` frames. `clean`: it was
-    /// fed nothing past a loss and reported no error. `lower`: the ladder rung below its own,
-    /// if there is one.
+    /// fed nothing past a loss and reported no error. `lower`: the ladder rung its replacement
+    /// starts at ([`rung_after_failure`]), if there is one.
     Failed {
         rendered: u64,
         clean: bool,
@@ -600,8 +602,9 @@ fn teardown(
 }
 
 /// Climb the decoder bring-up ladder ([`bring_up_rungs`]) from `floor` until a codec starts,
-/// and return it with the rung below its own. `None` ⇒ every rung refused, or the platform
-/// refused async mode — either way the session has no video.
+/// and return it with the rung its replacement starts at should it fail
+/// ([`rung_after_failure`]). `None` ⇒ every rung refused, or the platform refused async mode —
+/// either way the session has no video.
 ///
 /// `configure()` can succeed and `start()` still fail: start is where the codec allocates its
 /// buffers from the output consumer. A codec that failed `start` cannot be reconfigured, so
@@ -721,7 +724,9 @@ fn bring_up(
             backend_label(asc.as_ref().and(backend)),
             keys_label(keys)
         );
-        return Some((codec, asc, (rung + 1 < rungs.len()).then_some(rung + 1)));
+        let backends: Vec<Option<bool>> = rungs.iter().map(|r| r.0).collect();
+        let next = rung_after_failure(&backends, rung, asc.is_some());
+        return Some((codec, asc, next));
     }
     // Every rung refused. Say so loudly and in the shape the next reporter can act on: the
     // session stays up (audio/input/library all still work), so without this line the only
@@ -787,7 +792,7 @@ struct Ctx {
     present_tx: Option<mpsc::Sender<DecodeEvent>>,
     /// The session's decoded-size cell, refreshed on each output-format change.
     decoded_size: Arc<AtomicU64>,
-    /// The bring-up ladder rung below this codec's, if there is one.
+    /// The bring-up ladder rung this codec's replacement starts at, if there is one.
     lower_rung: Option<usize>,
 }
 
