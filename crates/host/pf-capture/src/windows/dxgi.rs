@@ -17,16 +17,6 @@ pub use selftest::{hdr_p010_convert_bars_on_luid, hdr_p010_selftest_at};
 
 #[cfg(target_arch = "x86_64")]
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Hits on the hooked `NtGdiDdDDIGetCachedHybridQueryValue`. Patch-readback in
-/// [`install_gpu_pref_hook`] only proves the bytes landed; `0` here means DXGI
-/// never reached the export on this build (always on ARM64, where no patch exists).
-static HYBRID_HOOK_HITS: AtomicU64 = AtomicU64::new(0);
-
-pub fn hybrid_hook_hits() -> u64 {
-    HYBRID_HOOK_HITS.load(Ordering::Relaxed)
-}
 
 // Declared here so we skip the Win32_System_Diagnostics_Debug feature for one call.
 // DXGI runs the hooked export on the encode worker, possibly another core;
@@ -41,7 +31,6 @@ unsafe extern "system" {
 /// export in full, so there is no trampoline back to the original.
 #[cfg(target_arch = "x86_64")]
 unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
-    HYBRID_HOOK_HITS.fetch_add(1, Ordering::Relaxed);
     if gpu_preference.is_null() {
         return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
     }
@@ -57,9 +46,8 @@ unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
 /// preferred render GPU and ignores `SET_RENDER_ADAPTER`, so the driver's
 /// swap-chain lands on an adapter its encoder cannot open.
 ///
-/// Lasts the process lifetime; a later call does nothing. [`hybrid_hook_hits`] reports
-/// whether DXGI actually calls it. Also sets per-monitor DPI awareness; on ARM64 that half is
-/// all that runs.
+/// Lasts the process lifetime; a later call does nothing. Also sets per-monitor DPI
+/// awareness; on ARM64 that half is all that runs.
 ///
 /// # Safety
 ///
@@ -197,8 +185,7 @@ unsafe fn patch_hybrid_query() {
     if readback == patch {
         tracing::info!(
             "GPU-pref hook installed + verified (win32u hybrid-query -> UNSPECIFIED): DXGI \
-             output reparenting disabled. Whether DXGI actually CALLS it shows up as \
-             hybrid_hook_hits on the IDD-push open line."
+             output reparenting disabled"
         );
     } else {
         tracing::error!(
