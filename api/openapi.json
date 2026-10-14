@@ -14190,6 +14190,18 @@
           }
         }
       },
+      "Phase": {
+        "type": "string",
+        "description": "Where a session is. It only moves forward; `/status` reports it per row.",
+        "enum": [
+          "admitted",
+          "negotiating",
+          "bring_up",
+          "streaming",
+          "ending",
+          "done"
+        ]
+      },
       "Plane": {
         "type": "string",
         "description": "Origin plane. Every plane must emit; filtering is the consumer's job.",
@@ -15794,6 +15806,7 @@
         "description": "One live session as the Dashboard lists it: who, where, since when, and the state\nthe per-session routes change.",
         "required": [
           "plane",
+          "phase",
           "client",
           "mode",
           "hdr",
@@ -15862,6 +15875,10 @@
               "minimum": 0
             },
             "description": "OS pad slots this session holds, lowest first. Slot `n` is player `n + 1` to a\nlocal co-op game. Empty while the session has no controller."
+          },
+          "phase": {
+            "$ref": "#/components/schemas/Phase",
+            "description": "Where the session is. `streaming` for most of its life; `ending` once a stop, a\ngame exit or the client's close has been seen and the row is about to go."
           },
           "plane": {
             "$ref": "#/components/schemas/Plane"

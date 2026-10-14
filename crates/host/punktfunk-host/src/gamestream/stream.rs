@@ -151,6 +151,7 @@ pub fn start(
             // gives the console a session id, and with it a per-session stop and keyframe
             // instead of only the host-wide one. `stop` is read by the loop below.
             let lifecycle = crate::lifecycle::Lifecycle::with_quit(life.quit.clone());
+            lifecycle.enter(crate::lifecycle::Phase::Streaming);
             let stop = lifecycle.stop_flag().clone();
             let live = LiveTelemetry {
                 bitrate_kbps: Arc::new(std::sync::atomic::AtomicU32::new(cfg.bitrate_kbps)),

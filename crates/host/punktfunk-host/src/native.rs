@@ -1139,6 +1139,7 @@ pub(crate) async fn run_admitted(
     // guard that reads them, so they bump a shared block rather than hand a figure over.
     let counters = Arc::new(crate::session_status::SessionCounters::default());
     spawn_end_watch(conn.clone(), life.clone());
+    life.enter(crate::lifecycle::Phase::Negotiating);
 
     // Before the handshake resolves the compositor: a handshake that fails still hands back.
     let gamescope_hold = GamescopeHold::new();
@@ -1178,6 +1179,7 @@ pub(crate) async fn run_admitted(
     .await
     .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
     let (ctrl_send, ctrl_recv) = (send, recv);
+    life.enter(crate::lifecycle::Phase::BringUp);
     tracing::info!(
         client_kind = client_link.kind,
         client_mbps = client_link.mbps,
@@ -2489,6 +2491,7 @@ async fn teardown(
              already-owned until it returns"
         );
     }
+    life.enter(crate::lifecycle::Phase::Done);
 }
 
 /// Integer Hz from `1/effective_hz` (exact). Differs from the request when e.g. KWin caps at 60.

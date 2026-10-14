@@ -421,6 +421,8 @@ impl GrantDrops {
 pub struct SessionSnapshot {
     /// Same id the per-session routes and `session.started` carry.
     pub id: u64,
+    /// Where the session is; `streaming` for most of its life.
+    pub phase: crate::lifecycle::Phase,
     /// Client label: 12-hex cert-fingerprint prefix, or peer IP if anonymous.
     pub client: String,
     pub hdr: bool,
@@ -777,6 +779,7 @@ pub fn snapshot() -> Vec<SessionSnapshot> {
             let (width, height, fps) = unpack_mode(s.mode.load(Ordering::Relaxed));
             SessionSnapshot {
                 id: s.id,
+                phase: s.life.phase(),
                 client: s.client.clone(),
                 hdr: s.hdr,
                 join: s.join,

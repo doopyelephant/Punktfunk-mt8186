@@ -887,6 +887,7 @@ impl StreamState {
         // Concurrent sessions interleave in one log; this stamps every line below with
         // the id `/status` reports. Sync body, so the guard never straddles an await.
         let _session_span = tracing::info_span!("session", id = self.live_session.id).entered();
+        self.life.enter(crate::lifecycle::Phase::Streaming);
         self.spawn_session_watcher();
         let result = self.tick_loop();
         self.finish(result.is_ok());
@@ -928,6 +929,7 @@ impl StreamState {
     /// registry gets this session's totals, and the reason is latched. Only a panic skips
     /// it, which the summary reads as `host_error`.
     fn finish(mut self, clean: bool) {
+        self.life.enter(crate::lifecycle::Phase::Ending);
         if clean {
             self.drain();
         }

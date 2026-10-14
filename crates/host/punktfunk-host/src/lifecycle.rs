@@ -1,14 +1,47 @@
-//! One session's life: whether it is ending, and why.
+//! One session's life: where it is, whether it is ending, and why.
 //!
 //! Every thread and task of a session holds a clone. [`Lifecycle::end`] is the one writer:
-//! it latches the reason, marks a deliberate end and raises `stop`. A reader that only
-//! polls a flag takes [`Lifecycle::stop_flag`] or [`Lifecycle::quit_flag`]: the display
-//! lease, the game lease, admission, the side threads.
+//! it latches the reason, marks a deliberate end, raises `stop` and moves the phase to
+//! [`Phase::Ending`]. A reader that only polls a flag takes [`Lifecycle::stop_flag`] or
+//! [`Lifecycle::quit_flag`]: the display lease, the game lease, admission, the side threads.
 
+use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use utoipa::ToSchema;
 
 use crate::events::SessionEndReason;
+
+/// Where a session is. It only moves forward; `/status` reports it per row.
+#[derive(Serialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum Phase {
+    /// Past the slot and the trust record; nothing built yet.
+    Admitted = 0,
+    /// The handshake runs; the display prep thread may already be building.
+    Negotiating = 1,
+    /// Side threads, data plane, display, pipeline, launch, send thread, registry entry.
+    BringUp = 2,
+    /// The tick loop.
+    Streaming = 3,
+    /// `end` was called or the loop left: drain, joins, tally.
+    Ending = 4,
+    /// The connection is closed and the side threads joined.
+    Done = 5,
+}
+
+impl Phase {
+    /// In order; the discriminant is the index, which is what `enter` stores.
+    pub const ALL: [Phase; 6] = [
+        Phase::Admitted,
+        Phase::Negotiating,
+        Phase::BringUp,
+        Phase::Streaming,
+        Phase::Ending,
+        Phase::Done,
+    ];
+}
 
 /// The flags every thread of a session reads, and the one place that writes them.
 #[derive(Clone, Debug)]
@@ -19,6 +52,7 @@ pub struct Lifecycle {
     quit: Arc<AtomicBool>,
     /// [`SessionEndReason`] as `u8`; 0 until `end`. The first writer wins.
     reason: Arc<AtomicU8>,
+    phase: Arc<AtomicU8>,
 }
 
 impl Default for Lifecycle {
@@ -39,6 +73,7 @@ impl Lifecycle {
             stop: Arc::new(AtomicBool::new(false)),
             quit,
             reason: Arc::new(AtomicU8::new(0)),
+            phase: Arc::new(AtomicU8::new(Phase::Admitted as u8)),
         }
     }
 
@@ -53,6 +88,16 @@ impl Lifecycle {
             self.quit.store(true, Ordering::SeqCst);
         }
         self.stop.store(true, Ordering::SeqCst);
+        self.enter(Phase::Ending);
+    }
+
+    /// Move forward to `phase`. A later phase already reached stays.
+    pub fn enter(&self, phase: Phase) {
+        self.phase.fetch_max(phase as u8, Ordering::SeqCst);
+    }
+
+    pub fn phase(&self) -> Phase {
+        Phase::ALL[self.phase.load(Ordering::SeqCst) as usize]
     }
 
     pub fn stopping(&self) -> bool {
@@ -77,6 +122,8 @@ impl Lifecycle {
 mod tests {
     use super::*;
 
+    const PHASES: [Phase; 6] = Phase::ALL;
+
     const REASONS: [SessionEndReason; 6] = [
         SessionEndReason::Local,
         SessionEndReason::GameExited,
@@ -85,6 +132,33 @@ mod tests {
         SessionEndReason::Lost,
         SessionEndReason::StoppedByOperator,
     ];
+
+    /// Whatever phase a session is in, `end` stops it, records why, and leaves it at
+    /// `Ending` or later.
+    #[test]
+    fn every_phase_can_end() {
+        for phase in PHASES {
+            let life = Lifecycle::new();
+            life.enter(phase);
+            assert_eq!(life.phase(), phase);
+            life.end(SessionEndReason::Lost);
+            assert!(life.stopping(), "{phase:?}");
+            assert_eq!(life.reason(), Some(SessionEndReason::Lost), "{phase:?}");
+            assert_eq!(life.phase(), phase.max(Phase::Ending), "{phase:?}");
+        }
+    }
+
+    /// Phases never go backwards: a late `BringUp` after `Streaming` is a no-op.
+    #[test]
+    fn phases_only_move_forward() {
+        let life = Lifecycle::new();
+        life.enter(Phase::Streaming);
+        life.enter(Phase::BringUp);
+        assert_eq!(life.phase(), Phase::Streaming);
+        life.enter(Phase::Done);
+        life.end(SessionEndReason::HostEnded);
+        assert_eq!(life.phase(), Phase::Done);
+    }
 
     /// The first reason is the one the summary reports; a later `end` still raises the flags.
     #[test]
