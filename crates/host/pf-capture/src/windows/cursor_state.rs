@@ -160,11 +160,6 @@ impl CursorModel {
         self.draws != Draws::Desktop
     }
 
-    /// The secure desktop is up, as far as this model tracks it: only under [`Self::declared`].
-    pub(crate) fn secure(&self) -> bool {
-        self.secure
-    }
-
     fn channel(&self) -> bool {
         matches!(
             self.draws,
@@ -407,19 +402,8 @@ mod tests {
 
         // No channel: the declare is an earlier session's, and stays as it was found.
         let (mut pinned, _) = CursorModel::open(EXCLUDED_NO_CHANNEL);
-        pinned.step(Secure(true));
-        assert!(pinned.secure());
+        assert_eq!(pinned.step(Secure(true)), StandDown);
         assert_eq!(pinned.close(), None);
-    }
-
-    #[test]
-    fn the_secure_desktop_is_tracked_only_under_a_declared_cursor() {
-        let (mut plain, _) = CursorModel::open(PLAIN);
-        plain.step(Secure(true));
-        assert!(!plain.secure());
-        let (mut client, _) = CursorModel::open(CLIENT);
-        client.step(Secure(true));
-        assert!(client.secure());
     }
 
     #[test]
