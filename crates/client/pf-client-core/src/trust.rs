@@ -27,6 +27,7 @@ pub use crate::settings::{
     effective_settings, resolve_preset, HudCorner, MouseMode, PresentPriority, Settings,
     StatsVerbosity, TouchMode,
 };
+pub(crate) use hosts::StoreLock;
 pub use hosts::{
     add_host, learn_from_advert, learn_mgmt_port_by_fp, persist_host, rekey_addr, same_pin,
     touch_last_used, AddOutcome, FieldError, HostEdit, HostField, KnownHost, KnownHosts,

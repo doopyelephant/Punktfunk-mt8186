@@ -205,6 +205,26 @@ captured.clear()
 got = asyncio.run(main.Plugin().library("   "))
 check("library: an empty ref is refused the same way", "args" not in captured and got["ok"] is False)
 
+# ---- Plugin.request_access: the advertised fingerprint pins the request -------------------
+#
+# Both OS installs of a dual-boot box answer at one address. Without `--fp` the CLI takes the
+# newest record there, which can be the other OS.
+desk = "ab" * 32
+captured.clear()
+asyncio.run(main.Plugin().request_access("192.168.1.9", 9777, "Steam Deck", desk))
+check(
+    "request access: argv pins the advertised fingerprint",
+    captured.get("args")
+    == ["pair", "192.168.1.9:9777", "--request-access", "--name", "Steam Deck", "--fp", desk],
+)
+captured.clear()
+asyncio.run(main.Plugin().request_access("192.168.1.9", 9777, "Steam Deck"))
+check("request access: no fingerprint, no --fp", "--fp" not in captured.get("args", []))
+captured.clear()
+got = asyncio.run(main.Plugin().request_access("192.168.1.9", 9777, "Steam Deck", "--exec"))
+check("request access: a flag-shaped fingerprint never reaches the CLI", "args" not in captured)
+check("request access: ...and is reported as unresolved", got["error"] == "unresolved")
+
 # ---- game_art: the inputs that become a URL and a file name are validated ----------------
 #
 # `appid` and `icon_hash` come from Steam's overview through the frontend; a bad one must fail

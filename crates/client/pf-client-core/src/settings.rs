@@ -2,11 +2,11 @@
 //! resolver every front-end and the session go through. `trust` re-exports all of it.
 
 use crate::presets::{PresetsFile, Resolution, StreamPreset};
-use crate::trust::{config_dir, load_json_or_default, write_atomic, KnownHosts};
+use crate::trust::{config_dir, load_json_or_default, write_atomic, KnownHosts, StoreLock};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Overlay tier and corner. Live in the core so every client formats with the same enums.
 pub use punktfunk_core::hud::{HudCorner, StatsVerbosity};
@@ -699,13 +699,43 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    /// Fire-and-forget (a failed write must never take a stream down), but temp+rename:
-    /// five whole-file writers, and a torn file loads as `Default` — silent reset.
+    /// Re-read the file, apply `f`, and save when it returns `true`, all under the file's
+    /// [`StoreLock`]: an edit that keeps what another process wrote. Returns the settings as
+    /// edited. Fire-and-forget like [`save`](Self::save).
+    pub fn update(f: impl FnOnce(&mut Settings) -> bool) -> Settings {
+        match Self::path() {
+            Ok(p) => Self::update_at(&p, f),
+            Err(_) => {
+                let mut s = Settings::default();
+                f(&mut s);
+                s
+            }
+        }
+    }
+
+    fn update_at(path: &Path, f: impl FnOnce(&mut Settings) -> bool) -> Settings {
+        let _lock = StoreLock::take(path);
+        let mut s: Settings = load_json_or_default(path);
+        if f(&mut s) {
+            s.save_at(path);
+        }
+        s
+    }
+
+    /// Write this snapshot whole, under the file's lock. A snapshot read earlier drops what
+    /// another process saved since: an edit goes through [`update`](Self::update).
     pub fn save(&self) {
         let Ok(p) = Self::path() else { return };
+        let _lock = StoreLock::take(&p);
+        self.save_at(&p);
+    }
+
+    /// Fire-and-forget (a failed write must never take a stream down), but temp+rename: a
+    /// torn file loads as `Default`, a silent reset.
+    fn save_at(&self, p: &Path) {
         let _ = std::fs::create_dir_all(p.parent().unwrap());
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = write_atomic(&p, s.as_bytes());
+            let _ = write_atomic(p, s.as_bytes());
         }
     }
 }
@@ -784,6 +814,44 @@ pub fn resolve_preset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two edits of the file never interleave: the second waits for the first, reads its
+    /// write, and keeps it. `false` leaves the file alone.
+    #[test]
+    fn a_second_settings_edit_waits_for_the_first_and_keeps_its_write() {
+        let _guard = crate::trust::store_health_lock();
+        let path = crate::presets::tests::scratch_dir("settings-lock").join("settings.json");
+        let (entered, first_is_in) = std::sync::mpsc::channel();
+        let first = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                Settings::update_at(&path, |s| {
+                    entered.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    s.last_window_w = 1280;
+                    true
+                });
+            }
+        });
+        first_is_in.recv().unwrap();
+        let seen = Settings::update_at(&path, |s| {
+            s.last_window_h = 720;
+            true
+        });
+        first.join().unwrap();
+        assert_eq!(
+            seen.last_window_w, 1280,
+            "the second edit read the first one's write"
+        );
+        let untouched = Settings::update_at(&path, |s| {
+            s.last_window_w = 1;
+            false
+        });
+        assert_eq!(untouched.last_window_w, 1);
+        let stored: Settings = load_json_or_default(&path);
+        assert_eq!((stored.last_window_w, stored.last_window_h), (1280, 720));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 
     /// A pre-touch-mode store loads as `trackpad`; names round-trip through the enum.
     #[test]

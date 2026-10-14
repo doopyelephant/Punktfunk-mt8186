@@ -19,6 +19,7 @@ pub mod gbm;
 // Shared worker rails (SEQPACKET ± `SCM_RIGHTS`, pinned-exe spawn, reaping).
 // Message body is generic; `proto` is this worker's vocabulary only.
 pub mod ipc;
+mod ladder;
 pub mod proto;
 #[cfg(test)]
 mod tiled_pattern;
@@ -27,10 +28,9 @@ pub mod vkslot;
 pub mod vulkan;
 pub mod worker;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-
 pub use cuda::DeviceBuffer;
 pub use egl::{DmabufPlane, EglImporter};
+pub use ladder::{step, Evidence, Ladder, Lane, Refusal};
 pub use proto::{ConvertOut, ConvertSrc, CursorRect, ImportKind};
 
 /// `(st_dev, st_ino)` of an open fd. Stable across dups and `SCM_RIGHTS` re-numbering; a
@@ -242,122 +242,36 @@ impl Importer {
     }
 }
 
-/// One compositor crash costs one rebuild; three consecutive worker deaths disable
-/// the GPU importer for that capture identity.
-const GPU_IMPORT_DEATH_LATCH: u32 = 3;
-
-/// Below the encoder rebuild budget, so this fires before that session ends.
-const RAW_DMABUF_FAILURE_LATCH: u32 = 3;
-
-/// 2 = one retry. Each failed negotiation is a ~10 s stall; a larger budget
-/// is paid in dead air. Same capture identity accumulates, so a compositor
-/// that never accepts latches on the second try.
-const RAW_DMABUF_NEGOTIATION_LATCH: u32 = 2;
-
-/// Raw-dmabuf passthrough off-switch: two causes, two lifetimes.
-///
-/// Import failures stay sticky — a driver that will not import this
-/// compositor's dmabuf fails identically on every retry. Negotiation
-/// timeouts get [`RAW_DMABUF_NEGOTIATION_LATCH`] retries. Both are keyed
-/// to a capture identity; a new node id is a different question.
-///
-/// Atomics: [`note_import_ok`](Self::note_import_ok) is on the per-frame
-/// import path.
-#[derive(Debug)]
-pub struct RawDmabufLatch {
-    import_streak: AtomicU32,
-    import_latched: AtomicBool,
-    negotiation_streak: AtomicU32,
-    negotiation_latched: AtomicBool,
-}
-
-impl RawDmabufLatch {
-    pub const fn new() -> Self {
-        RawDmabufLatch {
-            import_streak: AtomicU32::new(0),
-            import_latched: AtomicBool::new(false),
-            negotiation_streak: AtomicU32::new(0),
-            negotiation_latched: AtomicBool::new(false),
-        }
-    }
-
-    pub fn disabled(&self) -> bool {
-        self.import_latched.load(Ordering::Relaxed)
-            || self.negotiation_latched.load(Ordering::Relaxed)
-    }
-
-    pub fn note_import_failure(&self) -> Option<u32> {
-        let streak = self.import_streak.fetch_add(1, Ordering::Relaxed) + 1;
-        (streak >= RAW_DMABUF_FAILURE_LATCH && !self.import_latched.swap(true, Ordering::Relaxed))
-            .then_some(streak)
-    }
-
-    /// Reset the failure streak. Does not clear a sticky verdict: after fallback,
-    /// this identity has no dmabuf import left to succeed.
-    pub fn note_import_ok(&self) {
-        self.import_streak.store(0, Ordering::Relaxed);
-    }
-
-    pub fn note_negotiation_timeout(&self) -> Option<u32> {
-        let streak = self.negotiation_streak.fetch_add(1, Ordering::Relaxed) + 1;
-        (streak >= RAW_DMABUF_NEGOTIATION_LATCH
-            && !self.negotiation_latched.swap(true, Ordering::Relaxed))
-        .then_some(streak)
-    }
-
-    /// A success spends none of the consecutive-failure retry budget.
-    pub fn note_negotiation_ok(&self) {
-        self.negotiation_streak.store(0, Ordering::Relaxed);
-    }
-
-    /// Which cause holds it off, for the session-open line.
-    pub fn state(&self) -> &'static str {
-        match (
-            self.import_latched.load(Ordering::Relaxed),
-            self.negotiation_latched.load(Ordering::Relaxed),
-        ) {
-            (true, true) => "latched: encoder-import + negotiation",
-            (true, false) => "latched: encoder-import failures",
-            (false, true) => "latched: negotiation timeouts",
-            (false, false) => "live",
-        }
-    }
-}
-
-impl Default for RawDmabufLatch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug, Default)]
-struct ZeroCopyHealthState {
-    raw: RawDmabufLatch,
-    gpu_death_streak: AtomicU32,
-    gpu_disabled: AtomicBool,
-    gpu_negotiation_failed: AtomicBool,
-    passthrough_tiled_refused: AtomicBool,
-    hdr_tiled_refused: AtomicBool,
-    planar_refused: AtomicBool,
-}
-
-/// Failure memory for one capture identity. Clones share only that source's verdicts;
-/// concurrent sessions on another node cannot clear or poison them.
+/// Failure memory for one capture identity: one [`Ladder`] behind a lock. Clones share only that
+/// source's verdicts; concurrent sessions on another node cannot clear or poison them.
 #[derive(Clone, Debug)]
-pub struct ZeroCopyHealth(std::sync::Arc<ZeroCopyHealthState>);
+pub struct ZeroCopyHealth(std::sync::Arc<std::sync::Mutex<Ladder>>);
 
 impl ZeroCopyHealth {
+    /// This identity's ladder as of now.
+    pub fn ladder(&self) -> Ladder {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Apply `evidence` in order; the ladder before and after.
+    pub fn note(&self, evidence: &[Evidence]) -> (Ladder, Ladder) {
+        let mut ladder = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let before = *ladder;
+        *ladder = evidence.iter().fold(before, |l, e| step(l, *e));
+        (before, *ladder)
+    }
+
     pub fn raw_disabled(&self) -> bool {
-        self.0.raw.disabled()
+        self.ladder().off(Lane::Raw)
     }
 
     /// Record an encoder import failure. Tiled refuses immediately; LINEAR keeps the
     /// three-failure budget. `true` asks the owning capture to rebuild on its safe offer.
     pub fn note_raw_import_failure(&self, modifier: u64, reason: &str) -> bool {
         if modifier != 0 {
-            let first = self.refuse_passthrough_tiled();
-            self.0.hdr_tiled_refused.store(true, Ordering::Relaxed);
-            if first {
+            let tiled = [Refusal::Tiled, Refusal::HdrTiled].map(Evidence::Refused);
+            let (before, _) = self.note(&tiled);
+            if !before.refused(Refusal::Tiled) {
                 tracing::error!(
                     reason,
                     "tiled raw-dmabuf import rejected for this capture — rebuilding on LINEAR"
@@ -365,7 +279,8 @@ impl ZeroCopyHealth {
             }
             return true;
         }
-        let latched = self.0.raw.note_import_failure().is_some();
+        let (before, after) = self.note(&[Evidence::ImportFailed(Lane::Raw)]);
+        let latched = !before.import_off(Lane::Raw) && after.import_off(Lane::Raw);
         if latched {
             tracing::error!(
                 reason,
@@ -375,87 +290,56 @@ impl ZeroCopyHealth {
         latched
     }
 
+    /// Per frame on the encoder: clears the failure streak, never a spent lane.
     pub fn note_raw_import_ok(&self) {
-        self.0.raw.note_import_ok();
+        self.note(&[Evidence::Imported(Lane::Raw)]);
     }
 
-    pub fn note_raw_negotiation_failed(&self) {
-        match self.0.raw.note_negotiation_timeout() {
-            Some(streak) => tracing::warn!(
-                streak,
+    /// A full first-frame wait on `lane`'s offer ended with no format.
+    pub fn note_offer_timed_out(&self, lane: Lane) {
+        let (before, after) = self.note(&[Evidence::OfferTimedOut(lane)]);
+        let latched = !before.offer_off(lane) && after.offer_off(lane);
+        match (lane, latched) {
+            (Lane::Raw, true) => tracing::warn!(
+                streak = ladder::RAW_OFFER_BUDGET,
                 "zero-copy raw-dmabuf passthrough disabled for this capture after repeated negotiation timeouts"
             ),
-            None => tracing::warn!(
+            (Lane::Raw, false) => tracing::warn!(
                 "the compositor did not accept the raw-dmabuf offer — retrying once"
             ),
+            (Lane::Gpu, true) => tracing::warn!(
+                "zero-copy EGL-to-CUDA dmabuf offer disabled for this capture after a negotiation timeout"
+            ),
+            (Lane::Gpu, false) => {}
         }
-    }
-
-    pub fn note_raw_negotiation_ok(&self) {
-        self.0.raw.note_negotiation_ok();
     }
 
     pub fn raw_state(&self) -> &'static str {
-        self.0.raw.state()
+        self.ladder().raw_state()
     }
 
-    pub fn note_gpu_import_death(&self) {
-        let streak = self.0.gpu_death_streak.fetch_add(1, Ordering::Relaxed) + 1;
-        if streak >= GPU_IMPORT_DEATH_LATCH && !self.0.gpu_disabled.swap(true, Ordering::Relaxed) {
+    pub fn note_gpu_import_lost(&self) {
+        let (before, after) = self.note(&[Evidence::ImportFailed(Lane::Gpu)]);
+        if !before.import_off(Lane::Gpu) && after.import_off(Lane::Gpu) {
             tracing::error!(
-                streak,
-                "zero-copy GPU import disabled for this capture after repeated worker deaths"
+                streak = ladder::GPU_IMPORT_BUDGET,
+                "zero-copy GPU import disabled for this capture after repeated lost imports"
             );
         }
-    }
-
-    pub fn note_gpu_import_ok(&self) {
-        self.0.gpu_death_streak.store(0, Ordering::Relaxed);
-    }
-
-    pub fn gpu_import_disabled(&self) -> bool {
-        self.0.gpu_disabled.load(Ordering::Relaxed)
-    }
-
-    pub fn note_gpu_negotiation_failed(&self) {
-        if !self.0.gpu_negotiation_failed.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                "zero-copy EGL-to-CUDA dmabuf offer disabled for this capture after a negotiation timeout"
-            );
-        }
-    }
-
-    pub fn gpu_negotiation_disabled(&self) -> bool {
-        self.0.gpu_negotiation_failed.load(Ordering::Relaxed)
     }
 
     pub fn passthrough_tiled_refused(&self) -> bool {
-        self.0.passthrough_tiled_refused.load(Ordering::Relaxed)
-    }
-
-    pub fn refuse_passthrough_tiled(&self) -> bool {
-        !self
-            .0
-            .passthrough_tiled_refused
-            .swap(true, Ordering::Relaxed)
+        self.ladder().refused(Refusal::Tiled)
     }
 
     pub fn hdr_tiled_refused(&self) -> bool {
-        self.0.hdr_tiled_refused.load(Ordering::Relaxed)
+        self.ladder().refused(Refusal::HdrTiled)
     }
 
-    pub fn refuse_hdr_tiled(&self) -> bool {
-        !self.0.hdr_tiled_refused.swap(true, Ordering::Relaxed)
-    }
-
-    /// The producer's NV12/P010 offer is withdrawn: the CPU de-pad reads one packed plane,
-    /// so a planar frame the raw passthrough declines has no lane at all.
-    pub fn planar_refused(&self) -> bool {
-        self.0.planar_refused.load(Ordering::Relaxed)
-    }
-
-    pub fn refuse_planar(&self) {
-        self.0.planar_refused.store(true, Ordering::Relaxed);
+    /// Withdraw an offer for this identity. `true` on the first refusal.
+    pub fn refuse(&self, refusal: Refusal) -> bool {
+        let (before, _) = self.note(&[Evidence::Refused(refusal)]);
+        !before.refused(refusal)
     }
 }
 
@@ -475,7 +359,7 @@ pub fn zero_copy_health(identity: u64) -> ZeroCopyHealth {
         registry.push_back(entry);
         return health;
     }
-    let health = ZeroCopyHealth(std::sync::Arc::new(ZeroCopyHealthState::default()));
+    let health = ZeroCopyHealth(std::sync::Arc::default());
     registry.push_back((identity, health.clone()));
     while registry.len() > CAP {
         registry.pop_front();
@@ -665,71 +549,27 @@ mod tests {
     }
 
     #[test]
-    fn gpu_import_death_latch_is_scoped_to_one_identity() {
+    fn gpu_lane_latches_are_scoped_to_one_identity() {
         let failing = zero_copy_health(0x1001);
         let healthy = zero_copy_health(0x1002);
-        failing.note_gpu_import_death();
-        failing.note_gpu_import_ok();
-        failing.note_gpu_import_death();
-        failing.note_gpu_import_death();
-        assert!(!failing.gpu_import_disabled());
-        failing.note_gpu_import_death();
-        assert!(failing.gpu_import_disabled());
-        assert!(!healthy.gpu_import_disabled());
-    }
-
-    #[test]
-    fn import_failures_latch_and_stay_latched() {
-        let l = RawDmabufLatch::new();
-        assert!(!l.disabled());
-        assert_eq!(l.note_import_failure(), None);
-        assert_eq!(l.note_import_failure(), None);
-        assert!(!l.disabled(), "must not latch before the streak completes");
-        assert_eq!(l.note_import_failure(), Some(3));
-        assert!(l.disabled());
-        // First crossing only, so the error line cannot repeat per frame.
-        assert_eq!(l.note_import_failure(), None);
-        // Success resets the streak, not the latch: after CPU fallback there
-        // are no dmabuf imports left to succeed.
-        l.note_import_ok();
-        assert!(l.disabled());
-    }
-
-    #[test]
-    fn a_success_breaks_the_import_streak() {
-        let l = RawDmabufLatch::new();
-        l.note_import_failure();
-        l.note_import_failure();
-        l.note_import_ok();
-        assert_eq!(l.note_import_failure(), None, "streak restarted at 1");
-        assert_eq!(l.note_import_failure(), None);
-        assert!(!l.disabled());
-        assert_eq!(l.note_import_failure(), Some(3));
-    }
-
-    #[test]
-    fn a_negotiation_timeout_is_retried_before_it_latches() {
-        let l = RawDmabufLatch::new();
-        assert_eq!(l.note_negotiation_timeout(), None, "first one retries");
+        failing.note_gpu_import_lost();
+        failing.note(&[Evidence::Imported(Lane::Gpu)]);
+        failing.note_gpu_import_lost();
+        failing.note_gpu_import_lost();
+        assert!(!failing.ladder().off(Lane::Gpu));
+        failing.note_gpu_import_lost();
+        assert!(failing.ladder().off(Lane::Gpu));
+        assert!(!healthy.ladder().off(Lane::Gpu));
+        let refused = zero_copy_health(0x1003);
+        refused.note_offer_timed_out(Lane::Gpu);
         assert!(
-            !l.disabled(),
-            "the next capture build must still be allowed to try dmabuf"
+            refused.ladder().off(Lane::Gpu),
+            "one GPU offer timeout is enough"
         );
-        assert_eq!(l.note_negotiation_timeout(), Some(2));
-        assert!(l.disabled());
-        assert_eq!(l.note_negotiation_timeout(), None, "reports once");
+        assert!(!refused.raw_disabled(), "the raw lane has its own offer");
     }
 
-    #[test]
-    fn a_negotiated_capture_credits_the_retry_budget() {
-        let l = RawDmabufLatch::new();
-        for _ in 0..10 {
-            assert_eq!(l.note_negotiation_timeout(), None);
-            l.note_negotiation_ok();
-        }
-        assert!(!l.disabled());
-    }
-
+    /// `true` once, at the crossing, so the rebuild and its error line cannot repeat per frame.
     #[test]
     fn raw_latches_are_sticky_per_identity_and_independent() {
         let failing = zero_copy_health(0x2001);
@@ -738,6 +578,8 @@ mod tests {
         assert!(!failing.note_raw_import_failure(0, "one"));
         assert!(!failing.note_raw_import_failure(0, "two"));
         assert!(failing.note_raw_import_failure(0, "three"));
+        assert!(!failing.note_raw_import_failure(0, "four"));
+        failing.note_raw_import_ok();
         assert!(same.raw_disabled(), "the same identity keeps its verdict");
         assert!(!other.raw_disabled(), "another identity stays independent");
     }
@@ -760,19 +602,11 @@ mod tests {
     #[test]
     fn planar_refusal_is_sticky_per_identity() {
         let health = zero_copy_health(0x2a01);
-        health.refuse_planar();
-        assert!(zero_copy_health(0x2a01).planar_refused());
-        assert!(!zero_copy_health(0x2a02).planar_refused());
+        assert!(health.refuse(Refusal::Planar));
+        assert!(!health.refuse(Refusal::Planar), "once");
+        assert!(zero_copy_health(0x2a01).ladder().refused(Refusal::Planar));
+        assert!(!zero_copy_health(0x2a02).ladder().refused(Refusal::Planar));
         assert!(!health.raw_disabled(), "packed passthrough stays available");
-    }
-
-    #[test]
-    fn gpu_negotiation_failure_is_scoped_to_one_identity() {
-        let failing = zero_copy_health(0x2901);
-        let healthy = zero_copy_health(0x2902);
-        failing.note_gpu_negotiation_failed();
-        assert!(failing.gpu_negotiation_disabled());
-        assert!(!healthy.gpu_negotiation_disabled());
     }
 
     #[test]
@@ -781,7 +615,7 @@ mod tests {
         let healthy = zero_copy_health(0x3002);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                for _ in 0..RAW_DMABUF_FAILURE_LATCH {
+                for _ in 0..ladder::RAW_IMPORT_BUDGET {
                     failing.note_raw_import_failure(0, "probe");
                 }
             });
@@ -793,25 +627,5 @@ mod tests {
         });
         assert!(failing.raw_disabled());
         assert!(!healthy.raw_disabled());
-    }
-
-    /// Session-open line names the cause: "never offered" vs "failed earlier"
-    /// are different bugs.
-    #[test]
-    fn latch_state_names_the_cause() {
-        let l = RawDmabufLatch::new();
-        assert_eq!(l.state(), "live");
-        l.note_negotiation_timeout();
-        l.note_negotiation_timeout();
-        assert_eq!(l.state(), "latched: negotiation timeouts");
-        let l = RawDmabufLatch::new();
-        for _ in 0..RAW_DMABUF_FAILURE_LATCH {
-            l.note_import_failure();
-        }
-        assert_eq!(l.state(), "latched: encoder-import failures");
-        for _ in 0..RAW_DMABUF_NEGOTIATION_LATCH {
-            l.note_negotiation_timeout();
-        }
-        assert_eq!(l.state(), "latched: encoder-import + negotiation");
     }
 }

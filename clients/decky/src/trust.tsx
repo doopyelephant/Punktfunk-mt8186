@@ -92,7 +92,7 @@ export const TrustSheet: FC<{
         body: `Approve this Deck in ${h.name}’s console`,
         duration: 10_000,
       });
-      const res = await requestAccess(h.addr, h.port, "Steam Deck");
+      const res = await requestAccess(h.addr, h.port, "Steam Deck", h.advertisedFp);
       if (!res.ok) {
         setError(
           res.error === "client-outdated"
