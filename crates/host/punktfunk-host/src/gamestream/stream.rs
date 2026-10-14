@@ -86,7 +86,8 @@ struct LiveTelemetry {
 
 /// Spawn the video stream thread (idempotent via `running`). Stops when `running` clears.
 /// `force_idr` is set by the control stream on a client recovery request; `video_cap` holds
-/// the persistent capturer the thread borrows for the stream's duration.
+/// the persistent capturer the thread borrows for the stream's duration. The thread is
+/// tracked on `media`, for `/resume` and the next PLAY to wait on.
 #[allow(clippy::too_many_arguments)]
 pub fn start(
     cfg: StreamConfig,
@@ -102,15 +103,13 @@ pub fn start(
     video_cap: CapturerSlot,
     stats: Arc<crate::stats_recorder::StatsRecorder>,
     on_lost: super::OnSessionLost,
-    // Last act of this thread — `/resume` waits on this counter (`AppState::media_exited`).
-    media_exited: Arc<std::sync::atomic::AtomicU64>,
+    media: &crate::host::MediaThreads,
     // Input tallies the control loop bumps; this thread clears them and hands them to the
     // registry, which is what `session.ended` reports.
     counters: Arc<crate::session_status::SessionCounters>,
     life: GameLifetime,
 ) {
-    let exited = media_exited.clone();
-    if std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("punktfunk-video".into())
         .spawn(move || {
             pf_frame::thread_qos::boost_thread_priority(true);
@@ -244,14 +243,9 @@ pub fn start(
                 reason,
             });
             tracing::info!("video stream stopped");
-            // After capturer re-pool, lease, marker, events — `/resume` may start successors.
-            media_exited.fetch_add(1, Ordering::SeqCst);
-        })
-        .is_err()
-    {
-        // Never started, so it will not count its exit: count it here, or every later
-        // launch waits out its deadline for this thread.
-        exited.fetch_add(1, Ordering::SeqCst);
+        }) {
+        Ok(thread) => media.track(thread),
+        Err(e) => tracing::warn!(error = %e, "video thread did not start"),
     }
 }
 
