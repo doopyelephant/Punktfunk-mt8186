@@ -53,6 +53,9 @@ on:
       - 'crates/codec/pyrowave-sys/**'
       - 'crates/core/**'
       - 'packaging/flatpak/**'
+      - 'packaging/linux/io.unom.Punktfunk.Console.desktop'
+      - 'packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg'
+      - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/ci/pf-version.sh'
       # Both halves of this job's correctness, not of the bundle's content: a change to either
