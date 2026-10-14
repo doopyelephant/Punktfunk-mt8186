@@ -8,13 +8,14 @@
 
 use pf_client_core::console::OverlayAction;
 use pf_console_ui::bridge::{
-    self, CreateOptions, EntryJson, Event, MenuCode, Pads, PadsJson, PresetJson, Published,
+    self, CreateOptions, EntryJson, Event, GamesPush, MenuCode, Pads, PadsJson, PhasePush,
+    PresetJson, Published,
 };
 use pf_console_ui::console::FrameCost;
 use pf_console_ui::{
-    Console, ConsoleEntry, ConsoleHandles, HostRow, InputSource, Insets, LibraryGame, LibraryPhase,
-    LicenseSection, PadTestState, PairPhase, Platform, ProfilesAnswer, Prompt, SnapshotStore,
-    SpeedPhase, Viewport, WakeStatus,
+    Console, ConsoleEntry, ConsoleHandles, HostRow, InputSource, Insets, LicenseSection,
+    PadTestState, PairStatus, Platform, ProfilesAnswer, Prompt, SnapshotStore, SpeedPhase,
+    Viewport, WakeStatus,
 };
 use skia_safe::gpu::{self, mtl, DirectContext, SurfaceOrigin};
 use skia_safe::ColorType;
@@ -42,9 +43,10 @@ pub struct PunktfunkInsets {
 
 /// `[HostRow]` — the home carousel.
 pub const PUNKTFUNK_CONSOLE_PUSH_HOSTS: u8 = 0;
-/// `"Idle"`, `"Busy"`, `{"Failed": "why"}` or `{"Paired": {"key": "…"}}`.
+/// `{"req": …, "phase": "Busy" | {"Failed": "why"} | {"Paired": {"key": "…"}}}`, `req` the
+/// `Pair` or `RequestAccess` command's.
 pub const PUNKTFUNK_CONSOLE_PUSH_PAIR: u8 = 1;
-/// `WakeStatus`, or `null` to clear.
+/// `WakeStatus` under the `Wake`'s `req`, or `null` when the wake ended.
 pub const PUNKTFUNK_CONSOLE_PUSH_WAKE: u8 = 2;
 /// A JSON string: a one-shot toast.
 pub const PUNKTFUNK_CONSOLE_PUSH_NOTICE: u8 = 3;
@@ -52,11 +54,12 @@ pub const PUNKTFUNK_CONSOLE_PUSH_NOTICE: u8 = 3;
 pub const PUNKTFUNK_CONSOLE_PUSH_SPEED: u8 = 4;
 /// Any JSON: a library fetch is starting for the shelf on screen.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_BEGIN: u8 = 5;
-/// `"Loading"`, `"Empty"`, `"Ready"` or `{"Error": {"title", "body", "can_retry"}}`.
+/// `{"req": …, "phase": "Loading" | "Empty" | "Ready" | {"Error": {"title", "body",
+/// "can_retry"}}}`, `req` the `FetchLibrary`'s.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_PHASE: u8 = 6;
-/// `[LibraryGame]` — the fetched catalog.
+/// `{"req": …, "games": [LibraryGame]}` — the fetched catalog for that `FetchLibrary`.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_GAMES: u8 = 7;
-/// `[LibraryGame]` — the cached catalog, shown while the fetch runs.
+/// `{"req": …, "games": [LibraryGame]}` — the cached catalog, shown while the fetch runs.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_CACHED: u8 = 8;
 /// `[{"app_id": "steam:570", "state": "running"}]` — the host's running games.
 pub const PUNKTFUNK_CONSOLE_PUSH_LIBRARY_RUNNING: u8 = 9;
@@ -571,7 +574,7 @@ pub unsafe extern "C" fn punktfunk_console_push(
             PUNKTFUNK_CONSOLE_PUSH_HOSTS => {
                 json::<Vec<HostRow>>(text).map(|v| console.set_hosts(v))
             }
-            PUNKTFUNK_CONSOLE_PUSH_PAIR => json::<PairPhase>(text).map(|v| console.set_pair(v)),
+            PUNKTFUNK_CONSOLE_PUSH_PAIR => json::<PairStatus>(text).map(|v| console.set_pair(v)),
             PUNKTFUNK_CONSOLE_PUSH_WAKE => {
                 json::<Option<WakeStatus>>(text).map(|v| console.set_wake(v))
             }
@@ -587,13 +590,13 @@ pub unsafe extern "C" fn punktfunk_console_push(
                 Some(())
             }
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_PHASE => {
-                json::<LibraryPhase>(text).map(|v| library.set_phase(v))
+                json::<PhasePush>(text).map(|v| library.set_phase(&v.req, v.phase))
             }
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_GAMES => {
-                json::<Vec<LibraryGame>>(text).map(|v| library.set_games(v))
+                json::<GamesPush>(text).map(|v| library.set_games(&v.req, v.games))
             }
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_CACHED => {
-                json::<Vec<LibraryGame>>(text).map(|v| library.set_games_cached(v))
+                json::<GamesPush>(text).map(|v| library.set_games_cached(&v.req, v.games))
             }
             PUNKTFUNK_CONSOLE_PUSH_LIBRARY_RUNNING => {
                 json::<Vec<pf_client_core::library::RunningGame>>(text)

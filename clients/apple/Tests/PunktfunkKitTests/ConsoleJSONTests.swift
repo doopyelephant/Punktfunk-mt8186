@@ -146,7 +146,9 @@ final class ConsoleJSONTests: XCTestCase {
              {"id": "steam:2", "store": "steam", "title": "Never", "art": {}}]
             """#
         let games = try JSONDecoder().decode([GameEntry].self, from: Data(wire.utf8))
-        let out = try rows(ConsoleJSON.libraryGames(games))
+        let push = ConsoleJSON.libraryGames(ConsoleJSON.unasked, games)
+        let doc = try JSONSerialization.jsonObject(with: Data(push.utf8)) as? [String: Any]
+        let out = try XCTUnwrap(doc?["games"] as? [[String: Any]])
         let stats = try XCTUnwrap(out.first?["stats"] as? [String: Any])
         XCTAssertEqual(stats["last_played_unix_ms"] as? UInt64, 1_757_160_000_000)
         XCTAssertEqual(stats["play_time_ms"] as? UInt64, 5_400_000)
@@ -209,11 +211,17 @@ final class ConsoleJSONTests: XCTestCase {
     }
 
     /// `clients/shared/console-bridge-vectors.json`: the models this client writes match its
-    /// samples, and the menu and phase codes match its table. `Phase` stops at reconnecting:
-    /// this client never reports a profile the host refused.
+    /// samples, each answer under its command sample's `req`, and the menu and phase codes
+    /// match its table. `Phase` stops at reconnecting: this client never reports a profile the
+    /// host refused.
     func testBridgeShapesMatchTheSharedVectors() throws {
         let doc = try sharedVectors("console-bridge-vectors.json")
         let models = try XCTUnwrap(doc["models"] as? [String: [Any]])
+        let commands = try XCTUnwrap(doc["commands"] as? [Any])
+        func req(_ command: String) throws -> Any {
+            let body = commands.lazy.compactMap { ($0 as? [String: Any])?[command] }.first
+            return try XCTUnwrap((body as? [String: Any])?["req"], "\(command) carries a req")
+        }
         // Every key written is in the sample with its value; one left out is one Rust defaults.
         func within(_ got: Any, _ want: Any) -> Bool {
             if let g = got as? [String: Any], let w = want as? [String: Any] {
@@ -232,19 +240,24 @@ final class ConsoleJSONTests: XCTestCase {
             XCTAssertTrue(same, "\(model)[\(i)] wrote \(written)")
         }
 
-        try check("PairPhase", 0, ConsoleJSON.pairIdle)
-        try check("PairPhase", 1, ConsoleJSON.pairBusy)
-        try check("PairPhase", 2, ConsoleJSON.pairFailed("Wrong PIN."))
-        try check("PairPhase", 3, ConsoleJSON.pairPaired(key: "ab12"))
+        let pair = try req("Pair")
+        try check("PairStatus", 1, ConsoleJSON.pairBusy(pair))
+        try check("PairStatus", 2, ConsoleJSON.pairFailed(pair, "Wrong PIN."))
+        try check("PairStatus", 3, ConsoleJSON.pairPaired(pair, key: "ab12"))
         try check(
             "WakeStatus", 0,
             ConsoleJSON.wake(
-                key: "ab12", name: "Desk", seconds: 12, timedOut: false, online: true,
-                thenConnect: true))
+                req: try req("Wake"), key: "ab12", name: "Desk", seconds: 12, timedOut: false,
+                online: true, thenConnect: true))
+        let fetch = try req("FetchLibrary")
+        try check("PhasePush", 2, ConsoleJSON.libraryPhase(fetch, "Ready"))
         try check(
-            "LibraryPhase", 3,
+            "PhasePush", 3,
             ConsoleJSON.libraryError(
-                title: "Not paired", body: "Pair this device first.", canRetry: false))
+                fetch, title: "Not paired", body: "Pair this device first.", canRetry: false))
+        let wire = #"{"id": "steam:570", "store": "steam", "title": "Dota 2", "art": {}}"#
+        let dota = try JSONDecoder().decode(GameEntry.self, from: Data(wire.utf8))
+        try check("GamesPush", 0, ConsoleJSON.libraryGames(fetch, [dota]))
         let downloads = [
             HostDownload(
                 appID: "steam:570", state: "downloading", doneBytes: 1_048_576,
