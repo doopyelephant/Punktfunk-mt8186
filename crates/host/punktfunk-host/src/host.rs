@@ -42,6 +42,48 @@ impl Host {
     }
 }
 
+/// The compat plane's media threads, by handle. PLAY tracks what it starts; a wait reaps the
+/// finished and says how many still run. A panic finishes a handle as a return does.
+#[cfg(feature = "gamestream")]
+#[derive(Default)]
+pub struct MediaThreads(std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>);
+
+#[cfg(feature = "gamestream")]
+impl MediaThreads {
+    pub fn track(&self, thread: std::thread::JoinHandle<()>) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(thread);
+    }
+
+    /// Wait up to `grace` for every tracked thread, polling every 20 ms. Returns how many
+    /// still run; those stay tracked for the next wait.
+    pub async fn wait_idle(&self, grace: std::time::Duration) -> usize {
+        let deadline = std::time::Instant::now() + grace;
+        loop {
+            let live = self.reap();
+            if live == 0 || std::time::Instant::now() >= deadline {
+                return live;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Join the finished threads; the count left running.
+    fn reap(&self) -> usize {
+        let mut threads = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (done, live): (Vec<_>, Vec<_>) = std::mem::take(&mut *threads)
+            .into_iter()
+            .partition(|t| t.is_finished());
+        for thread in done {
+            let _ = thread.join();
+        }
+        *threads = live;
+        threads.len()
+    }
+}
+
 /// Host-lifetime state the planes and the management API share. The Moonlight plane's own
 /// slice is [`AppState::gs`], absent from a native-only build.
 #[cfg_attr(not(feature = "gamestream"), allow(dead_code, reason = "compat plane"))]
@@ -62,13 +104,11 @@ pub struct AppState {
     pub quit: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Audio thread running, and its keep-running flag.
     pub audio_streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Bumped by each media thread as the last thing it does on exit, after teardown.
-    /// `/resume` waits on this so the old capturer-pool and lease teardown finish before
-    /// the successor starts.
-    pub media_exited: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Bumped as each media thread is started; less [`Self::media_exited`], the threads still
-    /// alive, which the flags cannot say once `end_session` has lowered them.
-    pub media_started: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The media threads PLAY started. `/resume` and the next PLAY wait on them, so the old
+    /// capturer-pool and lease teardown finish before a successor starts; the flags cannot
+    /// say once `end_session` has lowered them.
+    #[cfg(feature = "gamestream")]
+    pub media: MediaThreads,
     /// Client IDR / reference-frame invalidation request. Video thread forces a keyframe and clears it.
     pub force_idr: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Client 0x0301 lost-frame range. Video thread drains it into `Encoder::invalidate_ref_frames`,
@@ -117,8 +157,8 @@ impl AppState {
             rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
             loss_stats: std::sync::Arc::new(crate::gamestream::GsLossStats::default()),
             counters: Arc::new(crate::session_status::SessionCounters::default()),
-            media_exited: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            media_started: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "gamestream")]
+            media: MediaThreads::default(),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stats,
             access: std::sync::OnceLock::new(),

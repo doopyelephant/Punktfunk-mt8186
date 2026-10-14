@@ -1,6 +1,7 @@
-//! Which access units the MediaCodec loop feeds: the AV1 receiver rule ([`AuAdmission`]) and
-//! the wait for a keyframe on a rebuilt decoder. No codec and no clock: the loop reports each
-//! delivery and its own drops, and feeds what comes back. The freeze and every ask are core's.
+//! Which access units the MediaCodec loop feeds: the feeder's drop of what core refuses
+//! ([`hand_on`]), the AV1 receiver rule ([`AuAdmission`]) and the wait for a keyframe on a
+//! rebuilt decoder. No codec and no clock: the loop reports each delivery and its own drops,
+//! and feeds what comes back. The freeze and every ask are core's.
 
 use punktfunk_core::packet::FLAG_SOF;
 use punktfunk_core::reanchor::{AuAdmission, DecoderClass, Resume};
@@ -20,6 +21,20 @@ pub(crate) struct Verdict {
     pub(crate) feed: bool,
     /// Ask for a keyframe. Core throttles.
     pub(crate) ask_keyframe: bool,
+}
+
+/// Whether the feeder hands one delivery to the loop. `admit` is core's verdict on a whole AU
+/// or a first part, `None` on a later part: parts repeat their AU's index and follow the first
+/// part. `refused` holds the last refused index.
+pub(crate) fn hand_on(refused: &mut Option<u32>, index: u32, admit: Option<bool>) -> bool {
+    match admit {
+        Some(true) => true,
+        Some(false) => {
+            *refused = Some(index);
+            false
+        }
+        None => *refused != Some(index),
+    }
 }
 
 /// [`AuAdmission`] and what the loop keeps beside it.
@@ -136,7 +151,7 @@ impl Intake {
 
 #[cfg(test)]
 mod tests {
-    use super::{Delivery, Intake, Verdict};
+    use super::{hand_on, Delivery, Intake, Verdict};
     use punktfunk_core::packet::{FLAG_SOF, USER_FLAG_RECOVERY_ANCHOR, USER_FLAG_RECOVERY_POINT};
     use punktfunk_core::reanchor::DecoderClass::{self, Lenient, Strict};
 
@@ -314,6 +329,26 @@ mod tests {
                 assert_eq!(got, want, "{name}: step {i}");
             }
             assert_eq!(intake.withheld(), withheld, "{name}: withheld");
+        }
+    }
+
+    #[test]
+    fn the_feeder_drops_what_core_refuses() {
+        // (index, core's verdict or `None` for a later part, handed on)
+        const STEPS: &[(u32, Option<bool>, bool)] = &[
+            (5, Some(true), true),
+            (5, None, true),
+            (3, Some(false), false),
+            (3, None, false),
+            (3, None, false),
+            (6, Some(true), true),
+            (3, None, false),
+            (6, None, true),
+            (7, None, true),
+        ];
+        let mut refused = None;
+        for (i, &(index, admit, want)) in STEPS.iter().enumerate() {
+            assert_eq!(hand_on(&mut refused, index, admit), want, "step {i}");
         }
     }
 }

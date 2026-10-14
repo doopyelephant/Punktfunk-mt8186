@@ -601,10 +601,14 @@ async fn stop_overdue(stop: &AtomicBool) {
 /// `mode_conflict = reject` close code. Distinct from transport failure (`RejectReason::Busy`).
 const REJECT_BUSY_CODE: u32 = punktfunk_core::reject::REJECT_BUSY_CLOSE_CODE;
 
-/// Close with the typed reject code before the session task returns `Err`. A bare drop
-/// closes with code 0, which the client cannot tell from transport trouble.
-/// Ends the session when the console removes the profile it plays as.
-fn spawn_profile_watch(conn: link::SessionLink, profile: String) {
+/// Ends the session as an operator stop when the console removes the profile it plays as.
+/// The end is written before the refuse, or the connection watcher would read the host's
+/// own close back as `lost`.
+fn spawn_profile_watch(
+    conn: link::SessionLink,
+    profile: String,
+    life: crate::lifecycle::Lifecycle,
+) {
     let mut removed = crate::profiles::removed();
     tokio::spawn(async move {
         loop {
@@ -618,6 +622,7 @@ fn spawn_profile_watch(conn: link::SessionLink, profile: String) {
             }
         }
         tracing::info!(%profile, "profile removed — closing its session");
+        life.end(crate::events::SessionEndReason::StoppedByOperator);
         let reason = punktfunk_core::reject::RejectReason::SeatUnavailable;
         conn.refuse(
             reason.close_code(),
@@ -627,6 +632,8 @@ fn spawn_profile_watch(conn: link::SessionLink, profile: String) {
     });
 }
 
+/// Close with the typed reject code before the session task returns `Err`. A bare drop
+/// closes with code 0, which the client cannot tell from transport trouble.
 async fn close_rejected(conn: &link::SessionLink, reason: punktfunk_core::reject::RejectReason) {
     conn.refuse(reason.close_code(), &reason.to_string()).await;
 }
@@ -1114,7 +1121,6 @@ pub(crate) async fn run_admitted(
     {
         return Ok(served);
     }
-    spawn_profile_watch(conn.clone(), resolved.id.clone());
     let profile_ref = crate::events::ProfileRef {
         id: resolved.id.clone(),
         display_name: resolved.display_name.clone(),
@@ -1130,17 +1136,17 @@ pub(crate) async fn run_admitted(
     // Mid-stream resize counterpart; latest accepted Reconfigure wins.
     let resize_ms: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 
-    // Created before handshake so Welcome-time display prep aborts if the client vanishes.
-    let stop = Arc::new(AtomicBool::new(false));
-    // Set before `stop` on `QUIT_CODE` so the display lease skips the keep-alive linger.
-    let quit = Arc::new(AtomicBool::new(false));
-    // Why the session ended, for its summary. Latched first-writer-wins, so the host's own
-    // close (game exit, clean finish) beats the `Other` this watcher would read it back as.
-    let end_reason = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    // Born before the handshake, so a Welcome-time display prep aborts if the client vanishes.
+    // `stop` and `quit` are the raw flags the handshake, the prep and the side threads poll.
+    let life = crate::lifecycle::Lifecycle::new();
+    let stop = life.stop_flag().clone();
+    let quit = life.quit_flag().clone();
     // Session totals for the summary. The input, audio and encode paths all outlive the
     // guard that reads them, so they bump a shared block rather than hand a figure over.
     let counters = Arc::new(crate::session_status::SessionCounters::default());
-    spawn_end_watch(conn.clone(), stop.clone(), quit.clone(), end_reason.clone());
+    spawn_end_watch(conn.clone(), life.clone());
+    spawn_profile_watch(conn.clone(), resolved.id.clone(), life.clone());
+    life.enter(crate::lifecycle::Phase::Negotiating);
 
     // Before the handshake resolves the compositor: a handshake that fails still hands back.
     let gamescope_hold = GamescopeHold::new();
@@ -1180,6 +1186,7 @@ pub(crate) async fn run_admitted(
     .await
     .map_err(|_| anyhow!("handshake timed out after {HANDSHAKE_TIMEOUT:?}"))??;
     let (ctrl_send, ctrl_recv) = (send, recv);
+    life.enter(crate::lifecycle::Phase::BringUp);
     tracing::info!(
         client_kind = client_link.kind,
         client_mbps = client_link.mbps,
@@ -1566,9 +1573,7 @@ pub(crate) async fn run_admitted(
             session,
             mode: hello.mode,
             seconds: opts.seconds,
-            stop: stop.clone(),
-            quit,
-            end_reason,
+            life: life.clone(),
             counters,
             ends: stream_ends,
             shared,
@@ -1681,7 +1686,7 @@ pub(crate) async fn run_admitted(
     }
     .await;
 
-    teardown(&stop, &conn, &result, audio_handle, input_handle).await;
+    teardown(&life, &conn, &result, audio_handle, input_handle).await;
     // After teardown: the last hold out hands the TV's gaming session back.
     drop(gamescope_hold);
     result.map(|()| Served::Session)
@@ -1937,7 +1942,7 @@ fn run_source(
             common.codec,
             common.mode,
             common.bitrate_kbps,
-            &common.stop,
+            common.life.stop_flag(),
             &common.ends.probe_rx,
             &common.ends.probe_result_tx,
             &common.shared.fec_target,
@@ -1946,7 +1951,7 @@ fn run_source(
         Punktfunk1Source::Synthetic => synthetic_stream(
             &mut common.session,
             frames,
-            &common.stop,
+            common.life.stop_flag(),
             &common.ends,
             &common.shared.fec_target,
             common.timing_conn.as_ref(),
@@ -2048,27 +2053,19 @@ async fn admit(
     })
 }
 
-/// Stop the session when its connection closes, and latch why for the summary. First writer
-/// wins, so the host's own close (game exit, clean finish) beats the `Lost` this would read it
-/// back as.
-fn spawn_end_watch(
-    conn: link::SessionLink,
-    stop: Arc<AtomicBool>,
-    quit: Arc<AtomicBool>,
-    end_reason: Arc<AtomicU8>,
-) {
+/// End the session when its connection closes. The first reason wins, so the host's own
+/// close (game exit, clean finish) beats the `Lost` this would read it back as.
+fn spawn_end_watch(conn: link::SessionLink, life: crate::lifecycle::Lifecycle) {
     tokio::spawn(async move {
         let reason = conn.closed().await;
-        if reason.closed_with(QUIT_CODE) {
-            quit.store(true, Ordering::SeqCst);
-            crate::events::SessionEndReason::Local.latch(&end_reason);
+        // The client's own rule: anything that is not its quit code is the link going away.
+        // A close this host made reads as `Lost` here too, which is why the paths that make
+        // one end the session before they call it.
+        life.end(if reason.closed_with(QUIT_CODE) {
+            crate::events::SessionEndReason::Local
         } else {
-            // The client's own rule: anything that is not our close code is the link
-            // going away. A close this host made reads as `Other` here too, which is
-            // why the paths that make one latch before they call it.
-            crate::events::SessionEndReason::Lost.latch(&end_reason);
-        }
-        stop.store(true, Ordering::SeqCst);
+            crate::events::SessionEndReason::Lost
+        });
     });
 }
 
@@ -2460,17 +2457,23 @@ fn bind_data_plane(data_plane: DataPlane, bringup: &crate::bringup::Trace) -> Re
     }
 }
 
-/// Every exit: stop audio, close the connection, join the side threads. The close ends the
-/// datagram task and with it the input thread. The join is bounded: a stuck side thread must not
-/// hold the permit or the admission entry.
+/// Every exit: end the session, close the connection, join the side threads. The close ends
+/// the datagram task and with it the input thread. The join is bounded: a stuck side thread
+/// must not hold the permit or the admission entry.
 async fn teardown(
-    stop: &AtomicBool,
+    life: &crate::lifecycle::Lifecycle,
     conn: &link::SessionLink,
     result: &Result<()>,
     audio_handle: Option<std::thread::JoinHandle<()>>,
     input_handle: std::thread::JoinHandle<()>,
 ) {
-    stop.store(true, Ordering::SeqCst);
+    // A loop that reached its tail has said why already; this names the ends that have no
+    // tail: a bring-up that failed, a source with no loop of its own.
+    life.end(if result.is_ok() {
+        crate::events::SessionEndReason::HostEnded
+    } else {
+        crate::events::SessionEndReason::HostError
+    });
     conn.close(
         if result.is_ok() { 0u32 } else { 1u32 },
         if result.is_ok() { b"done" } else { b"error" },
@@ -2495,6 +2498,7 @@ async fn teardown(
              already-owned until it returns"
         );
     }
+    life.enter(crate::lifecycle::Phase::Done);
 }
 
 /// Integer Hz from `1/effective_hz` (exact). Differs from the request when e.g. KWin caps at 60.

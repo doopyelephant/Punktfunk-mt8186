@@ -433,9 +433,9 @@ impl StreamState {
             }
         }
         if send_gone {
-            // The send thread ended. With the loop stopping or the link closed that is the
-            // session ending; otherwise it died on an error it logged, which is not a clean end.
-            if !self.stop.load(Ordering::SeqCst) && self.conn.close_reason().is_none() {
+            // The send thread ended, or stopped taking while the loop was leaving: the session
+            // ending. Otherwise it died on an error it logged, which is not a clean end.
+            if !self.leaving() {
                 anyhow::bail!("video send thread stopped");
             }
             return Ok(Flow::Break);
@@ -550,7 +550,7 @@ impl StreamState {
                 last,
                 meta,
             };
-            if self.frame_tx.send(SendMsg::Chunk(msg)).is_err() {
+            if !self.send.send(SendMsg::Chunk(msg), || self.leaving()) {
                 return Polled::SendGone;
             }
             if last {
@@ -612,7 +612,7 @@ impl StreamState {
             data: au.data,
         };
         self.bringup.mark("first_au");
-        if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
+        if !self.send.send(SendMsg::Frame(msg), || self.leaving()) {
             return Polled::SendGone;
         }
         self.clock.au_seq = self.clock.au_seq.wrapping_add(1);
@@ -633,6 +633,11 @@ impl StreamState {
                 ));
             *resend_meta = false;
         }
+    }
+
+    /// A stop or the link's close: the loop is leaving, so a hand-off waits for neither.
+    fn leaving(&self) -> bool {
+        self.life.stopping() || self.conn.close_reason().is_some()
     }
 
     /// A poll failure, or owed frames with no AU for the stall window: rebuild the encoder in
@@ -807,6 +812,9 @@ impl StreamState {
     /// return `None` on the first in-flight AU and strand the tail.
     pub(super) fn drain(&mut self) {
         self.enc.set_pipelined(false);
+        // A stopped session still ships what it encoded; only a sender that stopped taking
+        // ends the drain early.
+        let give_up_at = std::time::Instant::now() + super::send::SEND_JOIN_GRACE;
         while let Some((cap_ns, sub_ns)) = self.clock.inflight.pop_front() {
             let Ok(Some(au)) = self.enc.poll() else { break };
             let flags = if au.keyframe {
@@ -832,7 +840,9 @@ impl StreamState {
                     driver: None,
                 },
             };
-            if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
+            if !self.send.send(SendMsg::Frame(msg), || {
+                std::time::Instant::now() >= give_up_at
+            }) {
                 break;
             }
             self.clock.au_seq = self.clock.au_seq.wrapping_add(1);
