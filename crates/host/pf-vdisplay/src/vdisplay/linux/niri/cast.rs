@@ -3,7 +3,8 @@
 //! niri serves the ScreenCast half of Mutter's API (the `xdp-gnome-screencast` feature, on by
 //! default) but not RemoteDesktop, so the session stands alone: `CreateSession({})` →
 //! `RecordMonitor(output)` → `Start` → `PipeWireStreamAdded`. The node lives on the user's
-//! PipeWire daemon, so there is no remote fd to carry.
+//! PipeWire daemon, so there is no remote fd to carry. `hw_cursor` asks for the pointer as
+//! metadata; otherwise niri paints it into the frames.
 
 use anyhow::{anyhow, bail, Context, Result};
 use ashpd::zbus;

@@ -194,7 +194,6 @@ struct PendingCast {
 }
 
 pub struct NiriDisplay {
-    hw_cursor: bool,
     /// The registry splits the output's lifetime from the session's cast around `create`.
     handoff_cast: bool,
     pending_cast: Option<PendingCast>,
@@ -207,7 +206,6 @@ pub struct NiriDisplay {
 impl NiriDisplay {
     pub fn new() -> Result<Self> {
         Ok(NiriDisplay {
-            hw_cursor: false,
             handoff_cast: false,
             pending_cast: None,
             join_live: false,
@@ -221,12 +219,10 @@ impl VirtualDisplay for NiriDisplay {
         "niri"
     }
 
-    fn set_hw_cursor(&mut self, on: bool) {
-        self.hw_cursor = on;
-    }
-
-    fn hw_cursor(&self) -> bool {
-        self.hw_cursor
+    /// The pointer is always niri's own, painted into the frames: direct capture has no cursor
+    /// metadata to give, so the cast matches it and the host composites nothing.
+    fn last_portal_cursor_mode(&self) -> Option<crate::PortalCursorMode> {
+        Some(crate::PortalCursorMode::Embedded)
     }
 
     fn set_join_live(&mut self, on: bool) {
@@ -239,7 +235,7 @@ impl VirtualDisplay for NiriDisplay {
 
     /// A second cast of the owner's output; the owner's keeps running.
     fn join_cast(&mut self, name: &str, _node_id: u32) -> Result<Option<SessionCastParts>> {
-        let (node_id, keepalive) = cast::start(name, self.hw_cursor)?;
+        let (node_id, keepalive) = cast::start(name, false)?;
         Ok(Some((node_id, None, keepalive)))
     }
 
@@ -258,7 +254,7 @@ impl VirtualDisplay for NiriDisplay {
                 return Ok(Some((pending.node_id, None, pending.keepalive)));
             }
         }
-        let (node_id, keepalive) = cast::start(name, self.hw_cursor)?;
+        let (node_id, keepalive) = cast::start(name, false)?;
         Ok(Some((node_id, None, keepalive)))
     }
 
@@ -295,7 +291,7 @@ impl VirtualDisplay for NiriDisplay {
             );
         }
         focus_output(&name);
-        let (node_id, cast) = cast::start(&name, self.hw_cursor)?;
+        let (node_id, cast) = cast::start(&name, false)?;
         tracing::info!(
             output = %name, node_id, w = width, h = height, mhz,
             "niri virtual output ready"
