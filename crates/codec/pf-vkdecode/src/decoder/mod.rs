@@ -58,6 +58,7 @@ pub struct DecodedVkFrame {
     /// and a renegotiation can change format mid-stream. [`crate::plane_formats`]
     /// maps this to [`Self::plane_views`].
     pub format: vk::Format,
+    /// A decode binding. It cannot be sampled: use [`Self::plane_views`].
     pub view: vk::ImageView,
     /// Presenter sampler views; formats from [`crate::plane_formats`] on
     /// [`Self::format`].
