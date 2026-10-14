@@ -6,7 +6,8 @@
 //! `vhci_hcd` through [`super::usbip::attach_device`].
 //!
 //! Descriptors and the `0x83`/`0xAE` feature contract live in
-//! [`super::steam_proto`]. Callers degrade to UHID on failure.
+//! [`super::steam_proto`]. Only interface 2 takes input reports from the pad; the
+//! mouse and keyboard stay silent. Callers degrade to UHID on failure.
 
 use super::steam_proto::{
     deck_serial, feature_reply, neutral_deck_report, neutral_sc_report, parse_steam_output,
@@ -15,6 +16,7 @@ use super::steam_proto::{
 };
 use super::triton_proto::Sc2Identity;
 use super::usbip::{attach_device, boxed, ep, hid_class_descriptor, UsbipAttachment};
+use super::usbip_relay::{one_report, Hello, Output, Outputs, Served, UsbKind};
 use anyhow::Result;
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -25,6 +27,8 @@ use usbip_sim::{
 pub(crate) const STEAM_VENDOR: u16 = 0x28DE;
 pub(crate) const STEAMDECK_PRODUCT: u16 = 0x1205;
 pub(crate) const STEAMCTRL_PRODUCT: u16 = 0x1102;
+/// The controller interface: the only one that takes input reports.
+const CONTROLLER: u8 = 2;
 
 fn ctrl_rdesc(model: SteamModel) -> &'static [u8] {
     match model {
@@ -39,7 +43,7 @@ fn ctrl_rdesc(model: SteamModel) -> &'static [u8] {
 struct ControllerHandler {
     model: SteamModel,
     report: Arc<Mutex<[u8; 64]>>,
-    feedback: Arc<Mutex<SteamFeedback>>,
+    out: Outputs,
     /// Last SET_REPORT, command byte first; the next GET_REPORT answers it.
     last_set: Vec<u8>,
     serial: String,
@@ -80,20 +84,7 @@ impl UsbInterfaceHandler for ControllerHandler {
                 (0xA1, 0x01) => self.feature_get().to_vec(),
                 (0x21, 0x09) => {
                     self.last_set = req.to_vec();
-                    let mut fb = self.feedback.lock().unwrap_or_else(|e| e.into_inner());
-                    match self.model {
-                        SteamModel::Deck => {
-                            // `parse_steam_output` expects `[report-id(0), cmd, …]`; EP0 OUT
-                            // data is `[cmd, …]`.
-                            let mut framed = Vec::with_capacity(req.len() + 1);
-                            framed.push(0);
-                            framed.extend_from_slice(req);
-                            if let Some(r) = parse_steam_output(&framed).rumble {
-                                fb.rumble = Some(r);
-                            }
-                        }
-                        SteamModel::Controller => fb.forward_sc_set(req),
-                    }
+                    self.out.report(CONTROLLER, Some(setup.value), req);
                     vec![]
                 }
                 (0x21, 0x0A) | (0x21, 0x0B) => vec![], // SET_IDLE / SET_PROTOCOL
@@ -140,13 +131,13 @@ impl UsbInterfaceHandler for IdleHidHandler {
     }
 }
 
-/// Three-interface Deck or Steam Controller; `report`/`feedback` are shared with
-/// [`SteamUsbip`]. A captured Steam Controller's `identity` gives the pad its own serial.
+/// Three-interface Deck or Steam Controller streaming `report`; Steam's writes go to `out`.
+/// A captured Steam Controller's `identity` gives the pad its own serial.
 fn build_device(
     index: u8,
     model: SteamModel,
     report: &Arc<Mutex<[u8; 64]>>,
-    feedback: &Arc<Mutex<SteamFeedback>>,
+    out: Outputs,
     identity: Option<&Arc<Sc2Identity>>,
 ) -> UsbDevice {
     let (product, name, canned) = match model {
@@ -195,7 +186,7 @@ fn build_device(
         boxed(ControllerHandler {
             model,
             report: report.clone(),
-            feedback: feedback.clone(),
+            out,
             last_set: vec![],
             serial,
             identity: identity.cloned(),
@@ -203,11 +194,54 @@ fn build_device(
     )
 }
 
+/// The server's half: the device, and the pad's 64-byte reports into interface 2 only.
+pub(crate) fn served(
+    index: u8,
+    model: SteamModel,
+    identity: Option<Arc<Sc2Identity>>,
+    out: Outputs,
+) -> Served {
+    let rest = match model {
+        SteamModel::Deck => neutral_deck_report(),
+        SteamModel::Controller => neutral_sc_report(),
+    };
+    let report = Arc::new(Mutex::new(rest));
+    Served {
+        device: build_device(index, model, &report, out, identity.as_ref()),
+        input: one_report(report, CONTROLLER, None),
+    }
+}
+
+/// What Steam wrote, parsed: the Deck's rumble; a Steam Controller's writes for its pad.
+fn feedback(model: SteamModel, outputs: Vec<Output>) -> SteamFeedback {
+    let mut fb = SteamFeedback::default();
+    for output in outputs {
+        let Output::Report {
+            iface: CONTROLLER,
+            set: Some(_),
+            data,
+        } = output
+        else {
+            continue;
+        };
+        match model {
+            SteamModel::Deck => {
+                // `parse_steam_output` expects `[report-id(0), cmd, …]`; EP0 OUT data is `[cmd, …]`.
+                let framed = [&[0][..], &data].concat();
+                if let Some(r) = parse_steam_output(&framed).rumble {
+                    fb.rumble = Some(r);
+                }
+            }
+            SteamModel::Controller => fb.forward_sc_set(&data),
+        }
+    }
+    fb
+}
+
 /// Virtual Deck or Steam Controller on `vhci_hcd`. Drop detaches the port and stops the server.
 pub struct SteamUsbip {
-    report: Arc<Mutex<[u8; 64]>>,
-    feedback: Arc<Mutex<SteamFeedback>>,
-    _attach: UsbipAttachment,
+    model: SteamModel,
+    attach: UsbipAttachment,
     enc: super::steam_proto::DeckEncoder,
 }
 
@@ -227,20 +261,20 @@ impl SteamUsbip {
         model: SteamModel,
         identity: Option<Arc<Sc2Identity>>,
     ) -> Result<SteamUsbip> {
-        let (rest, label) = match model {
-            SteamModel::Deck => (neutral_deck_report(), "Steam Deck"),
-            SteamModel::Controller => (neutral_sc_report(), "Steam Controller"),
+        let (kind, label) = match model {
+            SteamModel::Deck => (UsbKind::SteamDeck, "Steam Deck"),
+            SteamModel::Controller => (UsbKind::SteamController, "Steam Controller"),
         };
-        let report = Arc::new(Mutex::new(rest));
-        let feedback = Arc::new(Mutex::new(SteamFeedback::default()));
-        let attach = attach_device(
-            || build_device(index, model, &report, &feedback, identity.as_ref()),
-            &format!("virtual {label} {index}"),
-        )?;
+        let hello = Hello {
+            kind,
+            index,
+            slot: 0,
+            identity: identity.map(|i| i.blob()).unwrap_or_default(),
+        };
+        let attach = attach_device(hello, None, &format!("virtual {label} {index}"))?;
         Ok(SteamUsbip {
-            report,
-            feedback,
-            _attach: attach,
+            model,
+            attach,
             enc: Default::default(),
         })
     }
@@ -253,14 +287,16 @@ impl SteamUsbip {
 
     /// The frame the controller interface streams from now on.
     pub fn write_report(&mut self, r: [u8; 64]) {
-        *self.report.lock().unwrap_or_else(|e| e.into_inner()) = r;
+        self.attach.input(CONTROLLER, &r);
     }
 
     pub fn service(&mut self) -> SteamFeedback {
-        self.feedback
-            .lock()
-            .map(|mut f| std::mem::take(&mut *f))
-            .unwrap_or_default()
+        feedback(self.model, self.attach.outputs())
+    }
+
+    /// `false` once the device is gone under the pad.
+    pub fn alive(&self) -> bool {
+        self.attach.alive()
     }
 }
 
@@ -277,12 +313,13 @@ mod tests {
     use std::os::fd::AsFd;
     use std::time::{Duration, Instant};
 
+    use crate::usbip_relay::{drain, test_relay};
+
     /// A seat's vhci port binds only listed devices.
     #[test]
     fn both_pads_are_listed_devices() {
-        let report = Arc::new(Mutex::new(neutral_deck_report()));
         for model in [SteamModel::Deck, SteamModel::Controller] {
-            let dev = build_device(0, model, &report, &Arc::default(), None);
+            let dev = served(0, model, None, test_relay().0).device;
             assert!(crate::usbip::EMULATED.contains(&(dev.vendor_id, dev.product_id)));
         }
     }
@@ -315,9 +352,8 @@ mod tests {
     /// query dance from its canned table.
     #[test]
     fn a_steam_controller_forwards_writes_and_answers_queries() {
-        let report = Arc::new(Mutex::new(neutral_sc_report()));
-        let feedback = Arc::new(Mutex::new(SteamFeedback::default()));
-        let dev = build_device(1, SteamModel::Controller, &report, &feedback, None);
+        let (out, pad) = test_relay();
+        let dev = served(1, SteamModel::Controller, None, out).device;
         assert_eq!((dev.vendor_id, dev.product_id), (0x28DE, 0x1102));
         assert_eq!(dev.interfaces.len(), 3);
 
@@ -326,7 +362,7 @@ mod tests {
         assert_eq!(&serial[3..15], sc_serial(1).as_bytes());
         exchange(&dev, &[0x8E, 0x00]);
         exchange(&dev, &[0x8F, 7, 1, 0x10, 0x27, 0, 0, 1, 0, 0xAA]);
-        let fb = std::mem::take(&mut *feedback.lock().unwrap());
+        let fb = feedback(SteamModel::Controller, drain(&pad));
         assert_eq!(fb.raw, [vec![0, 0x8F, 7, 1, 0x10, 0x27, 0, 0, 1, 0]]);
         assert_eq!(fb.rumble, None);
 
@@ -352,14 +388,7 @@ mod tests {
             replies: vec![(vec![0x00, 0xAE, 0x15, 0x01], reply)],
             slot: 0,
         });
-        let report = Arc::new(Mutex::new(neutral_sc_report()));
-        let dev = build_device(
-            0,
-            SteamModel::Controller,
-            &report,
-            &Arc::default(),
-            Some(&identity),
-        );
+        let dev = served(0, SteamModel::Controller, Some(identity), test_relay().0).device;
         assert_eq!(
             exchange(&dev, &[0xAE, 0x15, 0x01])[..5],
             [0xAE, 0x03, 0x01, b'F', b'X']

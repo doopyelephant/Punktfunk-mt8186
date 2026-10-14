@@ -211,11 +211,11 @@ impl TritonProto {
 }
 
 impl TritonTransport {
-    /// `false` once a uhid pad's relay to the seat supervisor ended.
+    /// `false` once a uhid pad's relay to the seat supervisor ended, or a usbip pad's server.
     fn alive(&self) -> bool {
         match self {
             TritonTransport::Uhid(pad) => pad.dev.alive(),
-            _ => true,
+            TritonTransport::Usbip(pad) => pad.alive(),
         }
     }
 }

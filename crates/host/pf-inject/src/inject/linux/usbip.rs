@@ -1,21 +1,30 @@
 //! USB/IP attach on in-tree `vhci_hcd`, shared by every usbip pad.
 //!
-//! [`usbip_sim`] emulates the device on a dedicated server thread and the local host
-//! imports it. Attach is in-process: the host preconnects and accepts only that TCP
-//! 4-tuple before handing the socket to `vhci_hcd`. `PUNKTFUNK_USBIP_ATTACH=cli` is an
-//! unauthenticated debug override. Callers degrade to UHID on failure.
+//! [`usbip_sim`] serves the device on a dedicated server thread, fed over the pad's relay
+//! ([`crate::usbip_relay`]), and the local host imports it. Attach is in-process: the host
+//! preconnects and accepts only that TCP 4-tuple before handing the socket to `vhci_hcd`. A
+//! seat host can't write `attach`; the supervisor's pad server serves its device instead and
+//! the seat keeps only the relay. `PUNKTFUNK_USBIP_ATTACH=cli` is an unauthenticated debug
+//! override. Callers degrade to UHID on failure.
 
+use crate::usbip_relay::{
+    served, Hello, Incoming, Output, Outputs, Served, MAX_IDENTITY, MAX_MESSAGE,
+};
 use anyhow::{bail, Context, Result};
-use std::collections::HashSet;
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use rustix::net::SendFlags;
+use std::collections::{HashSet, VecDeque};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Shutdown, TcpStream};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use usbip_sim::{UsbDevice, UsbEndpoint, UsbInterfaceHandler, UsbIpServer};
+use usbip_sim::{UsbEndpoint, UsbInterfaceHandler, UsbIpServer};
 
 /// One device per server, so the usbip default bus id is enough.
 const BUS_ID: &str = "0-0-0";
@@ -91,7 +100,13 @@ enum ServerEndpoint {
 }
 
 impl ServerThread {
-    fn spawn(endpoint: ServerEndpoint, dev: UsbDevice, label: &str) -> Result<ServerThread> {
+    /// Serves `served` until the host's connection, or the pad's `relay`, ends.
+    fn spawn(
+        endpoint: ServerEndpoint,
+        served: Served,
+        relay: UnixDatagram,
+        label: &str,
+    ) -> Result<ServerThread> {
         let stop = Arc::new(tokio::sync::Notify::new());
         let stop_t = stop.clone();
         let label = label.to_string();
@@ -108,18 +123,20 @@ impl ServerThread {
                         return;
                     }
                 };
-                rt.block_on(run_server(
-                    endpoint,
-                    Arc::new(UsbIpServer::new_simulated(vec![dev])),
-                    stop_t,
-                    label,
-                ));
+                rt.block_on(run_server(endpoint, served, relay, stop_t, label));
             })
             .context("spawn usbip server thread")?;
         Ok(ServerThread {
             stop,
             join: Some(join),
         })
+    }
+
+    /// Blocks until the server ends on its own.
+    fn wait(mut self) {
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
     }
 }
 
@@ -133,14 +150,22 @@ impl Drop for ServerThread {
 }
 
 /// One USB/IP socket. In-process hands a pre-accepted 4-tuple; CLI hands a one-shot listener.
+/// Ends when the host's connection or the pad's relay does.
 async fn run_server(
     endpoint: ServerEndpoint,
-    server: Arc<UsbIpServer>,
+    served: Served,
+    relay: UnixDatagram,
     stop: Arc<tokio::sync::Notify>,
     label: String,
 ) {
+    let server = Arc::new(UsbIpServer::new_simulated(vec![served.device]));
+    let pad = pump_relay(relay, served.input);
+    tokio::pin!(pad);
     let mut sock = match endpoint {
-        ServerEndpoint::Connected(sock) => match tokio::net::TcpStream::from_std(sock) {
+        ServerEndpoint::Connected(sock) => match sock
+            .set_nonblocking(true)
+            .and_then(|()| tokio::net::TcpStream::from_std(sock))
+        {
             Ok(sock) => sock,
             Err(e) => {
                 tracing::error!(error = %e, "usbip TcpStream::from_std failed");
@@ -157,6 +182,7 @@ async fn run_server(
             };
             tokio::select! {
                 _ = stop.notified() => return,
+                _ = &mut pad => return,
                 result = listener.accept() => match result {
                     Ok((sock, _)) => sock,
                     Err(e) => {
@@ -170,7 +196,9 @@ async fn run_server(
     // URB replies interleave with SUBMITs; Nagle + delayed ACK stalls that round trip.
     sock.set_nodelay(true).ok();
     let trace = super::usbip_trace::trace_prefix(&label);
+    let conn_label = label.clone();
     let conn = tokio::spawn(async move {
+        let label = conn_label;
         let sink = trace.and_then(|prefix| match super::usbip_trace::open_trace(&prefix) {
             Ok(s) => {
                 tracing::info!(prefix, "usbip byte trace armed");
@@ -202,56 +230,223 @@ async fn run_server(
     tokio::select! {
         _ = stop.notified() => {}
         _ = conn => {}
+        _ = &mut pad => tracing::debug!(label, "usbip pad hung up"),
     }
 }
 
-/// Drop detaches the `vhci_hcd` port first so the kernel tears the device down
-/// before the socket and server go. A seat's port is the supervisor's to detach.
+/// Feeds the pad's messages to its device until the pad hangs up. What does not decode is
+/// dropped.
+async fn pump_relay(relay: UnixDatagram, mut input: Box<dyn FnMut(Incoming<'_>) + Send>) {
+    let Ok(relay) = relay
+        .set_nonblocking(true)
+        .and_then(|()| tokio::io::unix::AsyncFd::new(relay))
+    else {
+        return;
+    };
+    let mut buf = vec![0u8; MAX_IDENTITY + 8];
+    loop {
+        let Ok(mut ready) = relay.readable().await else {
+            return;
+        };
+        match ready.try_io(|inner| inner.get_ref().recv(&mut buf)) {
+            Ok(Ok(0)) | Ok(Err(_)) => return,
+            Ok(Ok(n)) => match Incoming::decode(&buf[..n]) {
+                Some(message) => input(message),
+                None => tracing::debug!(n, "usbip relay: dropped what the pad sent"),
+            },
+            Err(_would_block) => {}
+        }
+    }
+}
+
+/// Outputs a pad keeps between two drains; past it the oldest go.
+const MAX_PENDING_OUTPUTS: usize = 256;
+/// How long an in-process import waits for its server.
+const IMPORT_WAIT: Duration = Duration::from_secs(1);
+/// How long a seat's pad server waits for the supervisor's [`Hello`].
+const HELLO_WAIT: Duration = Duration::from_secs(5);
+
+/// A pad's device on its `vhci_hcd` port, and the pad's end of the relay to its server.
+/// Drop detaches the port first so the kernel tears the device down before the socket and
+/// server go. A seat's port goes with its pad server, which ends when the relay closes.
 pub(crate) struct UsbipAttachment {
     vhci_port: u16,
-    /// Holds the fd handed to `vhci_hcd`. CLI attach is `None` — the CLI already passed its fd.
+    /// Holds the fd handed to `vhci_hcd`. CLI attach and a seat's pad hold none.
     _client_sock: Option<TcpStream>,
-    _server: ServerThread,
+    _server: Option<ServerThread>,
     brokered: bool,
+    relay: UnixDatagram,
+    pending: Arc<Mutex<VecDeque<Output>>>,
+    alive: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl UsbipAttachment {
+    /// Starts the thread that reads `relay`: outputs queue for [`outputs`](Self::outputs),
+    /// audio goes straight to `audio`, so neither waits for the input loop.
+    fn linked(
+        vhci_port: u16,
+        client_sock: Option<TcpStream>,
+        server: Option<ServerThread>,
+        brokered: bool,
+        relay: UnixDatagram,
+        audio: Option<SyncSender<Vec<f32>>>,
+    ) -> Result<UsbipAttachment> {
+        let pending: Arc<Mutex<VecDeque<Output>>> = Arc::default();
+        let alive = Arc::new(AtomicBool::new(true));
+        let reader = {
+            let relay = relay.try_clone().context("clone the pad relay")?;
+            let (pending, alive) = (pending.clone(), alive.clone());
+            std::thread::Builder::new()
+                .name("pf-usbip-pad".into())
+                .spawn(move || {
+                    read_outputs(&relay, &pending, audio.as_ref());
+                    alive.store(false, Ordering::Relaxed);
+                })
+                .context("spawn the usbip pad reader")?
+        };
+        Ok(UsbipAttachment {
+            vhci_port,
+            _client_sock: client_sock,
+            _server: server,
+            brokered,
+            relay,
+            pending,
+            alive,
+            reader: Some(reader),
+        })
+    }
+
+    /// The input report interface `iface` serves from now on. Never blocks: a full relay
+    /// drops it, and the next frame or heartbeat sends the state again.
+    pub(crate) fn input(&self, iface: u8, report: &[u8]) {
+        self.send(&Incoming::Input { iface, report });
+    }
+
+    pub(crate) fn send(&self, message: &Incoming<'_>) {
+        let _ = rustix::net::send(
+            &self.relay,
+            &message.encode(),
+            SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
+        );
+    }
+
+    /// What the host wrote since the last call, oldest first.
+    pub(crate) fn outputs(&self) -> Vec<Output> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.drain(..).collect()
+    }
+
+    /// `false` once the server is gone: the kernel dropped the device, or a seat's pad server
+    /// ended. The pad manager then makes the pad again.
+    pub(crate) fn alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    /// An attachment that is only a relay, for tests of what a pad sends its server.
+    #[cfg(test)]
+    pub(crate) fn for_test(relay: UnixDatagram) -> UsbipAttachment {
+        UsbipAttachment::linked(0, None, None, true, relay, None).unwrap()
+    }
+}
+
+/// The pad's side of the relay, until the server hangs up.
+fn read_outputs(
+    relay: &UnixDatagram,
+    pending: &Mutex<VecDeque<Output>>,
+    audio: Option<&SyncSender<Vec<f32>>>,
+) {
+    let mut buf = vec![0u8; MAX_MESSAGE];
+    let mut dropped = 0u64;
+    loop {
+        let n = match relay.recv(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        match Output::decode(&buf[..n]) {
+            Some(Output::Audio(pcm)) => {
+                let Some(tx) = audio else { continue };
+                let samples: Vec<f32> = pcm
+                    .chunks_exact(2)
+                    .map(|s| f32::from(i16::from_le_bytes([s[0], s[1]])) / 32768.0)
+                    .collect();
+                // Drop rather than block: a stalled streamer must not stall the relay.
+                if !samples.is_empty() && tx.try_send(samples).is_err() {
+                    dropped += 1;
+                    if dropped.is_power_of_two() {
+                        tracing::debug!(
+                            dropped,
+                            "pad usb audio queue full — dropping (streamer behind?)"
+                        );
+                    }
+                }
+            }
+            Some(report) => {
+                let mut q = pending.lock().unwrap_or_else(|e| e.into_inner());
+                if q.len() >= MAX_PENDING_OUTPUTS {
+                    q.pop_front();
+                }
+                q.push_back(report);
+            }
+            None => tracing::debug!(n, "usbip relay: dropped what the server sent"),
+        }
+    }
 }
 
 impl Drop for UsbipAttachment {
     fn drop(&mut self) {
-        if self.brokered {
-            if let Err(e) = crate::pad_broker::detach(self.vhci_port) {
-                tracing::debug!(port = self.vhci_port, error = %format!("{e:#}"), "seat vhci detach");
-            }
-            return;
-        }
         // The kernel frees a port when its connection dies, and another pad can hold it by now:
         // detach only while it still carries our socket. A CLI attach has no fd to compare.
-        if let Some(sock) = &self._client_sock {
-            if !vhci_port_holds(self.vhci_port, sock.as_raw_fd()) {
+        if !self.brokered {
+            let ours = self
+                ._client_sock
+                .as_ref()
+                .is_none_or(|sock| vhci_port_holds(self.vhci_port, sock.as_raw_fd()));
+            if !ours {
                 tracing::debug!(
                     port = self.vhci_port,
                     "vhci port no longer ours — not detaching"
                 );
-                return;
+            } else if let Err(e) = vhci_detach(self.vhci_port) {
+                tracing::debug!(port = self.vhci_port, error = %e, "vhci detach failed (device may already be gone)");
             }
         }
-        if let Err(e) = vhci_detach(self.vhci_port) {
-            tracing::debug!(port = self.vhci_port, error = %e, "vhci detach failed (device may already be gone)");
+        let _ = self.relay.shutdown(Shutdown::Both);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
         }
     }
 }
 
-/// In-process attach. `PUNKTFUNK_USBIP_ATTACH=cli` selects the unauthenticated CLI fallback.
-pub(crate) fn attach_device(build: impl Fn() -> UsbDevice, label: &str) -> Result<UsbipAttachment> {
+/// Attach `hello`'s device. A seat host has the supervisor serve it; `audio` takes a pad's
+/// isochronous OUT. `PUNKTFUNK_USBIP_ATTACH=cli` selects the unauthenticated CLI fallback.
+pub(crate) fn attach_device(
+    hello: Hello,
+    audio: Option<SyncSender<Vec<f32>>>,
+    label: &str,
+) -> Result<UsbipAttachment> {
     ensure_modules();
-    if vhci_base().is_none() {
+    let Some(base) = vhci_base() else {
         bail!("vhci_hcd unavailable (no /sys/devices/platform/vhci_hcd*/status) — is it loaded?");
+    };
+    if crate::pad_broker::brokered(&base.join("attach")) {
+        let (relay, port) =
+            crate::pad_broker::serve(&hello).context("serve through the seat pad broker")?;
+        tracing::info!(
+            label,
+            vhci_port = port,
+            "attached via usbip (served by the seat supervisor)"
+        );
+        return UsbipAttachment::linked(port, None, None, true, UnixDatagram::from(relay), audio);
     }
     let mode = std::env::var("PUNKTFUNK_USBIP_ATTACH").ok();
     if mode.as_deref() == Some("cli") {
         tracing::warn!("using the explicitly requested unauthenticated usbip CLI fallback");
-        return attach_via_cli(build(), label);
+        return attach_via_cli(&hello, audio, label);
     }
-    attach_in_process(build(), label)
+    attach_in_process(&hello, audio, label)
 }
 
 fn accept_expected_client(
@@ -267,7 +462,9 @@ fn accept_expected_client(
     }
 }
 
-fn attach_in_process(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
+/// A connected loopback `(client, server)`; `vhci_hcd` takes the client. Connect first, then
+/// accept that 4-tuple: a racer can hit the port, it cannot own our tuple.
+pub fn loopback_pair() -> Result<(TcpStream, TcpStream)> {
     // Port 0: do not contend USBIP_TCP_PORT with another pad.
     let listener =
         std::net::TcpListener::bind(("127.0.0.1", 0)).context("bind loopback usbip server")?;
@@ -275,54 +472,70 @@ fn attach_in_process(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
         .local_addr()
         .context("usbip server local_addr")?
         .port();
-    // Connect first, then accept that 4-tuple. A racer can hit the port; it cannot own our tuple.
-    let mut sock = connect_loopback(port).context("connect to usbip server")?;
+    let sock = connect_loopback(port).context("connect to usbip server")?;
     let expected = sock.local_addr().context("usbip client local_addr")?;
-    let server_sock = accept_expected_client(&listener, expected)?;
-    server_sock
-        .set_nonblocking(true)
-        .context("usbip server socket set_nonblocking")?;
-    let server = ServerThread::spawn(ServerEndpoint::Connected(server_sock), dev, label)?;
-    let (devid, speed) = import_handshake(&mut sock).context("usbip import handshake")?;
+    let server = accept_expected_client(&listener, expected)?;
+    Ok((sock, server))
+}
 
-    // Kernel vhci rx/tx honour SO_RCVTIMEO/SO_SNDTIMEO; handshake timeouts would idle-kill the device.
-    sock.set_read_timeout(None).ok();
-    sock.set_write_timeout(None).ok();
-    // A seat that can't write `attach` has the supervisor attach the socket for it.
-    let attach = vhci_base()
-        .context("vhci_hcd sysfs not present")?
-        .join("attach");
-    let brokered = crate::pad_broker::brokered(&attach);
-    let vhci_port = if brokered {
-        crate::pad_broker::attach(sock.as_fd(), devid, speed)
-            .context("attach through the seat pad broker")?
-    } else {
-        let port = vhci_find_free_port(speed).context("find a free vhci port")?;
-        vhci_attach(port, sock.as_raw_fd(), devid, speed).context("write vhci_hcd attach")?;
-        port
-    };
-
+fn attach_in_process(
+    hello: &Hello,
+    audio: Option<SyncSender<Vec<f32>>>,
+    label: &str,
+) -> Result<UsbipAttachment> {
+    let (mut sock, server_sock) = loopback_pair()?;
+    let (relay, pad) = crate::pad_broker::relay_pair()?;
+    let device = served(hello, Outputs::new(&relay)?)?;
+    let server = ServerThread::spawn(ServerEndpoint::Connected(server_sock), device, relay, label)?;
+    let (devid, speed) =
+        import_handshake(&mut sock, IMPORT_WAIT).context("usbip import handshake")?;
+    let vhci_port = vhci_find_free_port(speed).context("find a free vhci port")?;
+    vhci_attach(vhci_port, sock.as_raw_fd(), devid, speed).context("write vhci_hcd attach")?;
     tracing::info!(
         label,
         vhci_port,
         "attached via usbip (in-process — Steam Input recognizes it)"
     );
-    Ok(UsbipAttachment {
+    UsbipAttachment::linked(
         vhci_port,
-        _client_sock: Some(sock),
-        _server: server,
-        brokered,
-    })
+        Some(sock),
+        Some(server),
+        false,
+        UnixDatagram::from(pad),
+        audio,
+    )
+}
+
+/// A seat's pad server: reads the [`Hello`] the supervisor put first on `relay`, then serves
+/// that device on `sock` until the host or the pad hangs up.
+pub fn serve(sock: TcpStream, relay: UnixDatagram) -> Result<()> {
+    relay
+        .set_read_timeout(Some(HELLO_WAIT))
+        .context("time the pad's hello")?;
+    let mut buf = vec![0u8; MAX_IDENTITY + 8];
+    let n = relay.recv(&mut buf).context("read the pad's hello")?;
+    relay.set_read_timeout(None).context("untime the relay")?;
+    let hello = Hello::decode(&buf[..n]).context("not a pad hello")?;
+    let label = format!("seat {} {}", hello.kind.label(), hello.index);
+    let device = served(&hello, Outputs::new(&relay)?)?;
+    ServerThread::spawn(ServerEndpoint::Connected(sock), device, relay, &label)?.wait();
+    Ok(())
 }
 
 /// CLI attach: listen on [`USBIP_TCP_PORT`], recover the vhci port by diffing sysfs status.
-fn attach_via_cli(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
+fn attach_via_cli(
+    hello: &Hello,
+    audio: Option<SyncSender<Vec<f32>>>,
+    label: &str,
+) -> Result<UsbipAttachment> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", USBIP_TCP_PORT))
         .with_context(|| format!("bind usbip default port {USBIP_TCP_PORT} for CLI attach"))?;
     listener
         .set_nonblocking(true)
         .context("usbip listener set_nonblocking")?;
-    let server = ServerThread::spawn(ServerEndpoint::Listener(listener), dev, label)?;
+    let (relay, pad) = crate::pad_broker::relay_pair()?;
+    let device = served(hello, Outputs::new(&relay)?)?;
+    let server = ServerThread::spawn(ServerEndpoint::Listener(listener), device, relay, label)?;
 
     let before = vhci_used_ports();
     usbip_attach_cli().context("usbip CLI attach")?;
@@ -334,12 +547,14 @@ fn attach_via_cli(dev: UsbDevice, label: &str) -> Result<UsbipAttachment> {
         vhci_port,
         "attached via usbip (CLI — Steam Input recognizes it)"
     );
-    Ok(UsbipAttachment {
+    UsbipAttachment::linked(
         vhci_port,
-        _client_sock: None,
-        _server: server,
-        brokered: false,
-    })
+        None,
+        Some(server),
+        false,
+        UnixDatagram::from(pad),
+        audio,
+    )
 }
 
 // ---- USB/IP import handshake (we are the usbip client until the fd is handed to the kernel) ----
@@ -371,10 +586,10 @@ fn connect_loopback(port: u16) -> Result<TcpStream> {
 
 /// `OP_REQ_IMPORT` for [`BUS_ID`]. Consume the full 320-byte reply so the kernel's
 /// first `USBIP_CMD_SUBMIT` sees a clean socket. Returns `(bus_num<<16 | dev_num, speed)`.
-fn import_handshake(sock: &mut TcpStream) -> Result<(u32, u32)> {
-    // 1 s cap so a wedged handshake cannot head-block the input thread.
-    sock.set_read_timeout(Some(Duration::from_secs(1))).ok();
-    sock.set_write_timeout(Some(Duration::from_secs(1))).ok();
+/// `wait` caps each step, so a wedged server cannot head-block the caller.
+pub fn import_handshake(sock: &mut TcpStream, wait: Duration) -> Result<(u32, u32)> {
+    sock.set_read_timeout(Some(wait)).ok();
+    sock.set_write_timeout(Some(wait)).ok();
 
     let mut req = Vec::with_capacity(40);
     req.extend_from_slice(&USBIP_VERSION.to_be_bytes());
@@ -402,6 +617,9 @@ fn import_handshake(sock: &mut TcpStream) -> Result<(u32, u32)> {
     let bus_num = be(288);
     let dev_num = be(292);
     let speed = be(296);
+    // Kernel vhci rx/tx honour SO_RCVTIMEO/SO_SNDTIMEO; handshake timeouts would idle-kill the device.
+    sock.set_read_timeout(None).ok();
+    sock.set_write_timeout(None).ok();
     Ok(((bus_num << 16) | dev_num, speed))
 }
 
@@ -625,6 +843,45 @@ mod tests {
         assert_eq!(ss, Some(8));
     }
 
+    /// The pad's reader turns a server's S16 into `f32`, and drops rather than blocks when
+    /// the streamer stalls.
+    #[test]
+    fn audio_reaches_the_streamer_as_f32_and_a_stall_drops_it() {
+        let (server, pad) = crate::pad_broker::relay_pair().unwrap();
+        let pad = UnixDatagram::from(pad);
+        let mut raw = Vec::new();
+        for s in [i16::MAX, 0, 0, i16::MIN, 0, 0, 0, 0] {
+            raw.extend_from_slice(&s.to_le_bytes());
+        }
+        for _ in 0..8 {
+            server.send(&Output::Audio(raw.clone()).encode()).unwrap();
+        }
+        server
+            .send(
+                &Output::Report {
+                    iface: 3,
+                    set: None,
+                    data: vec![2],
+                }
+                .encode(),
+            )
+            .unwrap();
+        drop(server);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(1);
+        let pending = Mutex::default();
+        read_outputs(&pad, &pending, Some(&tx));
+        let pcm = rx.try_recv().expect("one decoded chunk");
+        assert!(rx.try_recv().is_err(), "the rest were dropped");
+        assert_eq!(pcm.len(), 8, "2 frames x 4 channels");
+        assert!(
+            (pcm[0] - 0.999_97).abs() < 1e-4,
+            "ch0 full scale: {}",
+            pcm[0]
+        );
+        assert_eq!(pcm[3], -1.0, "ch3 full scale negative");
+        assert_eq!(pending.into_inner().unwrap().len(), 1, "the report queued");
+    }
+
     #[test]
     fn in_process_import_accepts_only_its_own_tcp_tuple() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -642,9 +899,16 @@ mod tests {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
+        // The pad's end stays open: a relay that hangs up ends the server too.
+        let (relay, _pad) = crate::pad_broker::relay_pair().unwrap();
+        let served = Served {
+            device: usbip_sim::UsbDevice::new(0),
+            input: Box::new(|_| {}),
+        };
         let server = ServerThread::spawn(
             ServerEndpoint::Listener(listener),
-            UsbDevice::new(0),
+            served,
+            relay,
             "test pad",
         )
         .expect("spawn the emulation server");

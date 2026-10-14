@@ -226,12 +226,11 @@ impl Switch2State {
     pub fn report(&self, seq: u8, clock_us: u32) -> [u8; REPORT_LEN] {
         let mut r = [0u8; REPORT_LEN];
         r[0] = INPUT_REPORT_ID;
-        r[1] = seq;
         r[2] = 0x20;
         r[5..9].copy_from_slice(&self.buttons);
         r[11..14].copy_from_slice(&pack12(self.sticks[0], self.sticks[1]));
         r[14..17].copy_from_slice(&pack12(self.sticks[2], self.sticks[3]));
-        r[0x2B..0x2F].copy_from_slice(&clock_us.to_le_bytes());
+        stamp(&mut r, seq, clock_us);
         for (i, v) in self.accel.iter().enumerate() {
             r[0x31 + 2 * i..0x33 + 2 * i].copy_from_slice(&v.to_le_bytes());
         }
@@ -241,6 +240,12 @@ impl Switch2State {
         r[61..63].copy_from_slice(&self.triggers);
         r
     }
+}
+
+/// Puts a poll's sequence byte (byte 1) and µs sensor clock (`0x2B`) into input report `0x05`.
+pub fn stamp(report: &mut [u8; REPORT_LEN], seq: u8, clock_us: u32) {
+    report[1] = seq;
+    report[0x2B..0x2F].copy_from_slice(&clock_us.to_le_bytes());
 }
 
 /// Wire i16 (+ = right/up) → 12-bit raw around the flash calibration's centre.

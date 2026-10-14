@@ -269,11 +269,12 @@ fn open_transport(idx: u8) -> Result<DeckTransport> {
 pub struct SteamProto;
 
 impl DeckTransport {
-    /// `false` once a uhid pad's relay to the seat supervisor ended.
+    /// `false` once a uhid pad's relay to the seat supervisor ended, or a usbip pad's server.
     fn alive(&self) -> bool {
         match self {
             DeckTransport::Uhid(pad) => pad.dev.alive(),
-            _ => true,
+            DeckTransport::Usbip(pad) => pad.alive(),
+            DeckTransport::Gadget(_) => true,
         }
     }
 }
@@ -411,11 +412,11 @@ impl Default for ScProto {
 impl PadProto for ScProto {
     type Pad = ScTransport;
 
-    /// `false` once a uhid pad's relay to the seat supervisor ended.
+    /// `false` once a uhid pad's relay to the seat supervisor ended, or a usbip pad's server.
     fn alive(&self, pad: &ScTransport) -> bool {
         match pad {
             ScTransport::Uhid(pad) => pad.dev.alive(),
-            ScTransport::Usbip { .. } => true,
+            ScTransport::Usbip { pad, .. } => pad.alive(),
         }
     }
     type State = ScState;
