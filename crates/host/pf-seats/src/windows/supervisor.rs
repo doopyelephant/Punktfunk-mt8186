@@ -12,6 +12,7 @@
 use crate::bootstrap::RdpBootstrap;
 use crate::model::{RuntimeStatus, Seat};
 use crate::persistence::SecretRoot;
+use crate::seat_step::{Code, Fault};
 use crate::windows::accounts::AccountManager;
 use crate::windows::process::{self, ChildProcess, Job};
 use crate::windows::rdp;
@@ -152,31 +153,6 @@ impl Step {
         }
         text + "…"
     }
-}
-
-/// The sentence the console shows for a seat that didn't start, on its card and in Doctor. The
-/// log keeps the code and the operator's message.
-fn plain(error: &crate::backend::BackendError) -> String {
-    let code = error.code.as_str();
-    let text = match code {
-        "wts_timeout" | "rdp_keeper_exited" => {
-            "Windows didn't sign in to the seat's account. Remote Desktop may be off or out of licences."
-        }
-        _ if code.starts_with("quality_") => {
-            "The seat's screen didn't start. The graphics card or the seat display driver failed its check."
-        }
-        "host_ready_timeout" | "host_exited" => {
-            "punktfunk didn't start on the seat. The seat's log has the cause."
-        }
-        "port_in_use" => "Another program holds the seat's port. Restart the PC, then try again.",
-        "seats_off" => "Seats are off. Turn them on under Profiles → Seats.",
-        "termservice_stopped" => "Remote Desktop Services isn't running. Restart the PC.",
-        "seat_display_driver" => {
-            "The seat display driver isn't installed. Turn seats off and on again under Profiles → Seats."
-        }
-        _ => return error.message.clone(),
-    };
-    text.into()
 }
 
 impl Supervisor {
@@ -454,30 +430,32 @@ fn run_worker(
         match result {
             Ok(()) => break,
             Err(error) => {
+                let fault = Fault::from(error);
                 let stopping = runtime.stop.load(Ordering::Acquire);
-                if error.code == "quality_failed" {
+                let gate_failed = fault.code == Code::QualityFailed;
+                if gate_failed {
                     gate_failures += 1;
                 }
                 // A failed gate retries in a fresh session; the start waits for those.
-                let gate_retry = error.code == "quality_failed" && gate_failures < QUALITY_SESSIONS;
-                let retry = !stopping && (gate_retry || !permanent_failure(&error));
+                let gate_retry = gate_failed && gate_failures < QUALITY_SESSIONS;
+                let retry = !stopping && (gate_retry || !fault.code.permanent());
                 // The first answer reaches the caller; later failures have only this log.
                 let answered = runtime.status().initial.is_some();
                 if !stopping && (answered || gate_retry) {
                     tracing::warn!(
                         seat = %seat.id,
-                        code = %error.code,
+                        code = %fault.error.code,
                         retry,
                         "seat did not start: {}",
-                        error.message
+                        fault.error.message
                     );
                 }
                 runtime.update(|snapshot| {
                     if !gate_retry {
-                        snapshot.status = RuntimeStatus::failed(plain(&error));
+                        snapshot.status = RuntimeStatus::failed(fault.plain());
                     }
                     if snapshot.initial.is_none() && !gate_retry {
-                        snapshot.initial = Some(Err(error.clone()));
+                        snapshot.initial = Some(Err(fault.error.clone()));
                     }
                     snapshot.session_id = None;
                     snapshot.keeper_pid = None;
@@ -845,21 +823,4 @@ fn sleep_stoppable_with_keeper(
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(true)
-}
-
-fn permanent_failure(error: &crate::backend::BackendError) -> bool {
-    error.code.starts_with("quality_")
-        || matches!(
-            error.code.as_str(),
-            "account_not_owned"
-                | "account_is_administrator"
-                | "account_policy"
-                | "credential_missing"
-                | "credential_invalid"
-                | "credential_verify"
-                | "host_missing"
-                | "rdp_pin_missing"
-                | "rdp_pin_invalid"
-                | "local_system_required"
-        )
 }
