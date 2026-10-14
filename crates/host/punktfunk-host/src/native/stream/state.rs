@@ -16,7 +16,7 @@
 use super::cursor::composite_plan;
 #[cfg(target_os = "linux")]
 use super::cursor::settle_portal_cursor;
-use super::pipeline::{build_pipeline_with_retry, resolve_plan, Pipeline};
+use super::pipeline::{build_pipeline_with_retry, resolve_plan, BuildRequest, Pipeline};
 use super::*;
 use crate::native::bitrate::{pyrowave_mode_kbps, EncDerive, EncoderCeiling};
 use crate::session_status::pack_mode;
@@ -263,6 +263,25 @@ impl StreamState {
     /// [`Self::enc_derive`] at the FEC target in force now.
     pub(super) fn enc_now(&self) -> EncDerive {
         self.enc_derive(self.fec.target.load(Ordering::Relaxed))
+    }
+
+    /// A rebuild's [`BuildRequest`] at `mode` and `bitrate_kbps`: this session's plan, depth
+    /// and HDR metadata, the derivation in force now, and the loop's wire index.
+    pub(super) fn build_request(
+        &self,
+        mode: punktfunk_core::Mode,
+        bitrate_kbps: u32,
+    ) -> BuildRequest {
+        BuildRequest {
+            mode,
+            bitrate_kbps,
+            bitrate_auto: self.bitrate_auto,
+            bit_depth: self.bit_depth,
+            enc_of: self.enc_now(),
+            plan: self.plan,
+            client_hdr: self.client_hdr,
+            wire_seq_base: self.clock.au_seq,
+        }
     }
 
     /// Close a frame whose tail never came, as the loop does at the next first chunk, before a
@@ -548,21 +567,24 @@ impl StreamState {
                     (mode.width, mode.height),
                     &stop,
                 )?;
-                let pipe = build_pipeline_with_retry(
-                    &mut vd,
+                let req = BuildRequest {
                     mode,
                     bitrate_kbps,
                     bitrate_auto,
                     bit_depth,
-                    enc_derive(fec_target.load(Ordering::Relaxed)),
+                    enc_of: enc_derive(fec_target.load(Ordering::Relaxed)),
                     plan,
+                    client_hdr,
+                    wire_seq_base: 0,
+                };
+                let pipe = build_pipeline_with_retry(
+                    &mut vd,
+                    &req,
                     &quit,
                     &stop,
                     None,
                     8,
                     Some(bringup.as_ref()),
-                    client_hdr,
-                    0,
                 )?;
                 (vd, pipe)
             }
@@ -1293,6 +1315,19 @@ pub(super) fn publish_gamescope_xwayland(
     });
 }
 
+/// The session registry's client label, on every plane: the 12-hex prefix of the device's
+/// certificate fingerprint, else its address, so one device reads the same on both planes and
+/// unpairing it finds its sessions. Empty with neither.
+pub(crate) fn session_client_label(
+    fingerprint_hex: Option<&str>,
+    peer: Option<std::net::IpAddr>,
+) -> String {
+    fingerprint_hex
+        .map(|fp| fp[..12.min(fp.len())].to_string())
+        .or_else(|| peer.map(|ip| ip.to_string()))
+        .unwrap_or_default()
+}
+
 /// Announce a host-local rebuild gap so the client does not score a straddling window as congestion.
 pub(super) fn announce_pipeline_gap(gap: &tokio::sync::mpsc::UnboundedSender<u32>, gap_ms: u32) {
     if gap_ms == 0 {
@@ -1343,6 +1378,19 @@ fn window_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Native passes the connection's fingerprint and address; GameStream the paired
+    /// certificate's fingerprint, if read, and the launch owner's address, if bound.
+    #[test]
+    fn both_planes_label_a_client_alike() {
+        let fp = "0123456789abcdef".repeat(4);
+        let ip = std::net::IpAddr::from([192, 168, 1, 21]);
+        assert_eq!(session_client_label(Some(&fp), Some(ip)), "0123456789ab");
+        assert_eq!(session_client_label(None, Some(ip)), "192.168.1.21");
+        assert_eq!(session_client_label(Some(&fp), None), "0123456789ab");
+        assert_eq!(session_client_label(Some("abc"), None), "abc");
+        assert_eq!(session_client_label(None, None), "");
+    }
 
     #[test]
     fn adopting_a_rebuilt_rate_tells_the_client() {
