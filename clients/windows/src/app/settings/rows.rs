@@ -36,6 +36,8 @@ rows! {
     FULLSCREEN_ON_STREAM: "fullscreen_on_stream", "Start streams fullscreen", "general", false;
     AUTO_WAKE: "auto_wake", "Auto-wake on connect", "general", false;
     START_IN: "start_in", "Start in", "general", false;
+    GAMEPAD_UI: "gamepad_ui_enabled", "Controller-optimized UI", "general", false;
+    GAMEPAD_UI_MODE: "gamepad_ui_mode", "Show it", "general", false;
     STATS: "stats_verbosity", "Statistics overlay", "general", false;
     SHOW_ADVANCED: "show_advanced", "Show advanced", "general", false;
     ADVANCED_STATS: "advanced_stats", "Advanced statistics", "general", true;
@@ -99,14 +101,6 @@ mod tests {
         (
             "background_timeout_minutes",
             "a phone or TV app in the background",
-        ),
-        (
-            "gamepad_ui_enabled",
-            "this shell never opens the console on its own",
-        ),
-        (
-            "gamepad_ui_mode",
-            "this shell never opens the console on its own",
         ),
         ("follow_os_theme", "the console's own look"),
         ("ui_palette", "the console's own look"),

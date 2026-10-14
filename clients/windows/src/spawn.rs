@@ -59,12 +59,14 @@ pub(crate) fn spawn_session(
 /// Spawn the session binary in `--browse` mode: the console home, in the session window —
 /// launches run as streams in that same window. The same stdout contract as a connect:
 /// `ready` when the console window presents, `error` on a failed start, EOF on quit.
+/// `until_no_pads` quits it once the last controller is gone.
 pub(crate) fn spawn_browse(
     fullscreen: bool,
+    until_no_pads: bool,
     slot: CancelHandle,
     on_event: impl FnMut(SpawnEvent) + Send + 'static,
 ) -> Result<(), String> {
-    let cmd = orchestrate::browse_command(fullscreen, false);
+    let cmd = orchestrate::browse_command(fullscreen, until_no_pads);
     spawn(cmd, None, "console", slot, on_event)
         .map_err(|_| orchestrate::CONSOLE_NOT_STARTED.to_string())
 }

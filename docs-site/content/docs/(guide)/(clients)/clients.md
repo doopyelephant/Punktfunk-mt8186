@@ -62,7 +62,8 @@ connects.
 
 A WinUI 3 app for x64 and Arm64 with hardware decode (Vulkan Video or D3D11VA), HDR, WASAPI audio
 and SDL3 controllers. **Punktfunk Console** in the Start menu is the controller interface for a TV or
-HTPC, on x64; the Arm64 build has no console yet.
+HTPC, on x64; the Arm64 build has no console yet. **Controller-optimized UI** opens it when a
+controller connects.
 
 ## Android app (phone + Android TV)
 

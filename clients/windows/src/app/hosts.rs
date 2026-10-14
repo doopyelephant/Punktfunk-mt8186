@@ -66,7 +66,7 @@ const MENU_DEFAULT_SET: &str = "Default host \u{2713}";
 /// Whether the console (gamepad) UI is available in this build: the session binary ships
 /// its Skia `ui` feature on x64 only (no skia prebuilts for aarch64 yet) — the entry
 /// points compile everywhere but only show where `--browse` can actually run.
-const CONSOLE_UI_AVAILABLE: bool = cfg!(target_arch = "x86_64");
+pub(crate) const CONSOLE_UI_AVAILABLE: bool = cfg!(target_arch = "x86_64");
 
 /// Tile-grid metrics: minimum tile width before dropping a column, and the gap between tiles.
 const TILE_MIN_WIDTH: f64 = 320.0;
@@ -121,9 +121,6 @@ pub(crate) struct HostsProps {
     /// Online here, and a sleeping one whose advert has not aged out yet reads Offline.
     pub(crate) probed: HashMap<String, bool>,
     pub(crate) status: String,
-    /// Connected-controller count (root state, mirrored from the gamepad service) — a
-    /// pad plus a paired host surfaces the "Open console UI" hint card.
-    pub(crate) pads: usize,
     pub(crate) forget: Option<HostRef>,
     pub(crate) rename: Option<HostRef>,
     /// Whether the "Add host" modal is open. Root state (like `forget`/`rename`), not the page's
@@ -153,7 +150,6 @@ impl PartialEq for HostsProps {
             && self.hosts == other.hosts
             && self.probed == other.probed
             && self.status == other.status
-            && self.pads == other.pads
             && self.forget == other.forget
             && self.rename == other.rename
             && self.show_add == other.show_add
@@ -683,7 +679,7 @@ fn header(svc: &Svc, set_show_add: &AsyncSetState<bool>) -> Element {
                     )
                     .on_click({
                         let (c, ss, st) = (ctx.clone(), set_screen.clone(), set_status.clone());
-                        move || open_console(&c, &ss, &st)
+                        move || open_console(&c, &ss, &st, false)
                     })
                     .into(),
                 );
