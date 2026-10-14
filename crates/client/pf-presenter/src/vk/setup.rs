@@ -1181,7 +1181,7 @@ impl Presenter {
             overlay_pipe,
             scale,
             direct,
-            direct_last: None,
+            cpu_direct: None,
             retired_hw: None,
             #[cfg(windows)]
             retained_slot: None,
@@ -1209,13 +1209,10 @@ impl Presenter {
             cmd_buf,
             staging: None,
             video: None,
-            submitted: false,
-            acquired: None,
+            state: crate::swapchain_state::SwapchainState::new(),
             present_timer,
             present_id2,
             timing,
-            timing_armed: false,
-            timing_asked: false,
             #[cfg(windows)]
             vblank_timer,
             #[cfg(windows)]
@@ -1266,12 +1263,9 @@ impl Presenter {
             vaapi_sync: Default::default(),
             #[cfg(target_os = "linux")]
             native_keys: Vec::new(),
-            native_pq: false,
             #[cfg(target_os = "linux")]
             native_flip: crate::wl_native::flip_mode().then(std::time::Instant::now),
             overlay_blocks_native: false,
-            native_last: false,
-            suspended: false,
         };
         p.recreate_swapchain(window)?;
         Ok(p)

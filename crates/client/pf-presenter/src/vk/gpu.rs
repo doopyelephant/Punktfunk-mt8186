@@ -12,9 +12,9 @@ impl Presenter {
         // SAFETY: per the Vulkan contract above - the Vulkan handles used here are owned by this
         // type and live for the call, and every builder struct is a local that outlives it.
         unsafe {
-            if self.submitted {
+            if self.state.submitted {
                 self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-                self.submitted = false;
+                self.state.submitted = false;
             }
         }
         Ok(())

@@ -137,19 +137,29 @@ struct HwCtxWin {
     imports: crate::d3d11::ImportCache,
 }
 
-/// Hardware frame held until the in-flight fence proves GPU reads are done.
+/// Hardware frame held until the in-flight fence proves GPU reads are done. Dropping one
+/// releases its decoder slot; none owns a Vulkan object.
 enum Retired {
     #[cfg(target_os = "linux")]
-    Dmabuf(HwFrame),
-    /// Decoder-owned image + views: destroy nothing; drop after the fence to return the slot.
+    Dmabuf(#[allow(dead_code, reason = "held for its drop")] HwFrame),
     NativeVk(NativeVkFrame),
     /// The frame holds its plane ring: a `Redraw` samples planes that are still there.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-    Pyro(pf_client_core::video_pyrowave::PyroWavePlanarFrame),
+    Pyro(
+        #[allow(dead_code, reason = "held for its drop")]
+        pf_client_core::video_pyrowave::PyroWavePlanarFrame,
+    ),
 }
 
-/// Which planes the direct pass sampled last, and how. A `Redraw` replays this: the
-/// descriptor set still points at those planes and the frame behind them is still held.
+/// The retired frame and what the direct pass drew from it, which a `Redraw` replays
+/// while the frame is held.
+struct Held {
+    frame: Retired,
+    direct: Option<DirectLast>,
+}
+
+/// Which planes the direct pass sampled, and how. A `Redraw` replays this: the descriptor
+/// set still points at those planes, and the frame or the CPU planes behind them are held.
 #[derive(Clone, Copy)]
 struct DirectLast {
     src: DirectSrc,
@@ -161,14 +171,11 @@ struct DirectLast {
 
 #[derive(Clone, Copy, PartialEq)]
 enum DirectSrc {
-    /// `retired_hw` holds the `NativeVk` frame.
     Native,
-    /// `retired_hw` holds the `Dmabuf` frame.
     #[cfg(target_os = "linux")]
     Dmabuf,
     /// The software rung's plane images, which persist.
     Cpu,
-    /// `retired_hw` holds the wavelet frame.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     Pyro,
 }
@@ -256,12 +263,12 @@ pub struct Presenter {
     scale: crate::scale::ScalePass,
     /// CSC straight into the swapchain image; rebuilt with the overlay pipe on an HDR flip.
     direct: crate::csc::DirectPass,
-    /// What the last real frame drew through the direct pass, so a `Redraw` can sample it
-    /// again from the retired frame. `None`: the last frame went through the video image.
-    direct_last: Option<DirectLast>,
+    /// What the last real frame drew direct from the CPU planes, so a `Redraw` can sample
+    /// them again. `None`: it was another lane's, or went through the video image.
+    cpu_direct: Option<DirectLast>,
     /// In-flight hardware frame; released after the next fence wait. A `Redraw` keeps it:
     /// the direct path samples it again, so it lives until the next real frame's fence.
-    retired_hw: Option<Retired>,
+    retired_hw: Option<Held>,
     /// D3D11 lane: the slot last composited and its picture size, which `Redraw` blits
     /// again. The import cache owns the objects; a newer picture in that slot (six
     /// decodes later) is not a visual error.
@@ -307,12 +314,8 @@ pub struct Presenter {
     cmd_buf: vk::CommandBuffer,
     staging: Option<Staging>,
     video: Option<VideoImage>,
-    /// Submit fence has work pending. Wait before recording; also what makes the single
-    /// staging buffer safe to overwrite.
-    submitted: bool,
-    /// Swapchain image acquired and not yet submitted: the non-blocking probe's, or one an
-    /// error left behind. Its `acquire_sem` signal is pending until a batch waits it.
-    acquired: Option<u32>,
+    /// Who owns the window, the submit in flight, the held image, the stamp asks.
+    state: crate::swapchain_state::SwapchainState,
     /// On-glass timing from present-wait, either generation. `None` without it; the run
     /// loop then keeps its submit-time display stamp (or the vblank waiter's estimate).
     present_timer: Option<present_timing::PresentTimer>,
@@ -322,10 +325,6 @@ pub struct Presenter {
     /// `VK_EXT_present_timing`: the engine stamps each present itself, and the waiter
     /// reads the stamp in place of its own wake time.
     timing: Option<std::sync::Arc<timing_ext::Engine>>,
-    /// The live swapchain was created for those stamps and its result queue is sized.
-    timing_armed: bool,
-    /// The last present asked for a stamp.
-    timing_asked: bool,
     /// The output's vblank as the glass clock where present-wait is missing (AMD on
     /// Windows). Estimated stamps, `glass=est`.
     #[cfg(windows)]
@@ -384,8 +383,6 @@ pub struct Presenter {
     /// Pool slots offered to the lane, so a rebuilt pool's old ones can go.
     #[cfg(target_os = "linux")]
     native_keys: Vec<u64>,
-    /// The lane's last frame was PQ, shown through the compositor's colour management.
-    native_pq: bool,
     /// `flip` diagnostic: when it started; the lane owns even periods, the swapchain odd.
     #[cfg(target_os = "linux")]
     native_flip: Option<std::time::Instant>,
@@ -393,13 +390,6 @@ pub struct Presenter {
     /// Linux lane reads it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     overlay_blocks_native: bool,
-    /// The last frame shown went through the native lane, not the swapchain.
-    native_last: bool,
-    /// The swapchain and its Vulkan surface are torn down while the lane owns the window. A
-    /// Vulkan swapchain opts the window's surface into explicit sync, and a buffer committed
-    /// without its sync points is a fatal protocol error. The next non-redraw frame through
-    /// [`Presenter::present`] builds both again.
-    suspended: bool,
 }
 
 /// What the native lane did with a Vulkan Video or PyroWave picture.
@@ -473,9 +463,7 @@ impl Presenter {
     pub(crate) fn drop_video(&mut self) {
         // A lost device reads nothing more, so a failed wait still lets go.
         self.quiesce_own().ok();
-        if let Some(f) = self.retired_hw.take() {
-            f.destroy(&self.device);
-        }
+        self.retired_hw = None;
         // The ended decoder's pool: cached imports pin its memory, and only a later
         // hardware frame would retire them.
         #[cfg(target_os = "linux")]
@@ -486,7 +474,7 @@ impl Presenter {
         if let Some(hw) = self.hw_win.as_mut() {
             hw.imports.destroy_all(&self.device);
         }
-        self.direct_last = None;
+        self.cpu_direct = None;
         if let Some(v) = self.video.take() {
             v.destroy(&self.device);
         }
@@ -500,7 +488,14 @@ impl Presenter {
     /// the display stamp. The run loop then defers e2e/display windows to
     /// [`Presenter::take_presented_samples`].
     pub(crate) fn present_timing_active(&self) -> bool {
-        self.glass_active() || self.native_last
+        self.state.stamps_active(self.clocks())
+    }
+
+    fn clocks(&self) -> crate::swapchain_state::Clocks {
+        crate::swapchain_state::Clocks {
+            waiter: self.present_timer.is_some(),
+            vblank: self.vblank_active(),
+        }
     }
 
     /// A glass clock follows the swapchain's presents: present-wait, or the vblank waiter.
@@ -522,7 +517,7 @@ impl Presenter {
     /// The display stamps are the vblank waiter's estimate. Good for the grid and the
     /// ledger; not for counting undisplayed presents, which it confirms a vblank late.
     pub(crate) fn glass_estimated(&self) -> bool {
-        self.present_timer.is_none() && self.vblank_active() && !self.native_last
+        self.state.stamps_estimated(self.clocks())
     }
 
     /// The output's own vblank spacing, where a vblank waiter measures it.
@@ -543,26 +538,18 @@ impl Presenter {
     /// refresh, 0 where the engine cannot tell.
     pub(crate) fn engine_refresh(&self) -> Option<(u64, u64)> {
         use std::sync::atomic::Ordering;
-        let r = &self.timing.as_ref().filter(|_| self.timing_armed)?.refresh;
+        let r = &self
+            .timing
+            .as_ref()
+            .filter(|_| self.state.timing_armed)?
+            .refresh;
         let cycle = r.duration_ns.load(Ordering::Relaxed);
         (cycle > 0).then(|| (cycle, r.interval_ns.load(Ordering::Relaxed)))
     }
 
-    /// Where the display stamp comes from, for the ledger: `timing` (the engine's own
-    /// stamps), `wait` (present-wait), `est` (the vblank waiter), `feedback` (the native
-    /// lane), `none`.
+    /// Where the display stamp comes from, for the ledger.
     pub(crate) fn glass_source(&self) -> &'static str {
-        if self.native_last {
-            "feedback"
-        } else if self.timing_armed {
-            "timing"
-        } else if self.present_timer.is_some() {
-            "wait"
-        } else if self.vblank_active() {
-            "est"
-        } else {
-            "none"
-        }
+        self.state.stamp_source(self.clocks())
     }
 
     /// The window changed display: the vblank waiter follows it. No-op elsewhere.
@@ -586,7 +573,7 @@ impl Presenter {
         use crate::wl_native::{Outcome, SlotState};
         self.poll_native_releases();
         let view = (self.extent.width, self.extent.height);
-        let suspended = self.suspended;
+        let suspended = self.state.suspended();
         if self.flip_holds_swapchain() {
             return Outcome::Declined(d);
         }
@@ -647,8 +634,7 @@ impl Presenter {
             return Outcome::Dropped;
         };
         if lane.commit_vaapi(d, meta, pts_ns, decoded_ns, point) {
-            self.native_last = true;
-            self.native_pq = pq;
+            self.state.native_shown(pq);
             Outcome::Shown
         } else {
             if let Some(t) = self.vaapi_sync.get_mut(&key) {
@@ -728,7 +714,7 @@ impl Presenter {
     fn suspend_swapchain(&mut self) -> anyhow::Result<()> {
         use anyhow::Context as _;
         self.quiesce_own()?;
-        self.acquired = None;
+        self.state.acquired = None;
         {
             let _q = self.queue_lock.guard();
             // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
@@ -739,24 +725,17 @@ impl Presenter {
             t.drain();
         }
         self.last_presented = None;
-        // The queue wait above is the GPU idle its contract asks for.
-        self.overlay_pipe.destroy_targets(&self.device);
         // SAFETY: our fence, the queue and the present waiter are drained above, so nothing
-        // still names these objects; destroying a null swapchain or surface is a no-op.
+        // still names the targets, the swapchain or the surface.
         unsafe {
-            for s in self.render_sems.drain(..) {
-                self.device.destroy_semaphore(s, None);
-            }
-            self.swap_d.destroy_swapchain(self.swapchain, None);
+            self.destroy_targets(self.swapchain);
             self.surface_i.destroy_surface(self.surface, None);
         }
         self.swapchain = vk::SwapchainKHR::null();
         self.surface = vk::SurfaceKHR::null();
         self.images.clear();
-        if let Some(f) = self.retired_hw.take() {
-            f.destroy(&self.device); // queue drained above: its reads are done
-        }
-        self.suspended = true;
+        self.retired_hw = None; // queue drained above: its reads are done
+        self.state.suspend();
         if let Some(lane) = self.native.as_mut() {
             lane.take_window();
         }
@@ -781,7 +760,7 @@ impl Presenter {
         let surface = unsafe { window.vulkan_create_surface(self.instance.handle()) }
             .map_err(|e| anyhow::anyhow!("SDL_Vulkan_CreateSurface: {e}"))?;
         self.surface = surface;
-        self.suspended = false;
+        self.state.resume();
         self.overlay_hide_native();
         tracing::info!("native scanout: the swapchain takes the window back");
         self.recreate_swapchain(window)
@@ -1058,13 +1037,13 @@ impl Presenter {
         let Some(slot) = ring.free_slot(|k| lane.slot_state(k) == SlotState::Free) else {
             // Every buffer on screen or still importing: skip the frame, or let the swapchain
             // draw it while the lane is not in charge yet.
-            return if self.suspended {
+            return if self.state.suspended() {
                 RingSlot::Drop
             } else {
                 RingSlot::Decline
             };
         };
-        if !self.suspended {
+        if !self.state.suspended() {
             if let Err(e) = self.suspend_swapchain() {
                 tracing::warn!(error = %format!("{e:#}"), "native scanout: swapchain suspend failed");
                 return RingSlot::Decline;
@@ -1093,8 +1072,7 @@ impl Presenter {
         let hold = Box::new(ring.hold(slot));
         let key = ring.key(slot);
         if lane.commit(key, color, self.hdr_meta, hold, pts_ns, decoded_ns, point) {
-            self.native_last = true;
-            self.native_pq = color.is_pq();
+            self.state.native_shown(color.is_pq());
             true
         } else {
             ring.uncommit(slot);
@@ -1142,7 +1120,7 @@ impl Presenter {
             || !lane.overlay_supported()
             || fourcc.is_none()
             || self.overlay_refused == Some(shape);
-        if self.overlay_blocks_native || !self.native_last {
+        if self.overlay_blocks_native || !self.state.native_last() {
             lane.overlay_hide();
             self.overlay_shown = None;
             return;
@@ -1285,7 +1263,7 @@ impl Presenter {
                 swapchain: sc,
                 present_id: id,
                 done,
-                stamped: std::mem::take(&mut self.timing_asked),
+                stamped: std::mem::take(&mut self.state.timing_asked),
                 pts_ns,
                 decoded_ns,
                 submitted_ns: now_ns,
@@ -1339,7 +1317,7 @@ impl Presenter {
     /// window's buffer, else the swapchain mode, which can differ from the request when the
     /// surface does not offer it.
     pub(crate) fn present_mode_name(&self) -> &'static str {
-        if self.native_last {
+        if self.state.native_last() {
             return "native";
         }
         match self.present_mode {
@@ -1661,14 +1639,12 @@ impl Drop for Presenter {
                 let _q = self.queue_lock.guard();
                 // A held image's semaphore signal must not outlive the semaphore. The
                 // `queue_lock` held here is `retire_acquire_sem`'s contract.
-                if self.acquired.take().is_some() {
+                if self.state.acquired.take().is_some() {
                     self.retire_acquire_sem().ok();
                 }
                 self.device.device_wait_idle().ok();
             }
-            if let Some(f) = self.retired_hw.take() {
-                f.destroy(&self.device); // GPU idle above — reads are done
-            }
+            self.retired_hw = None; // GPU idle above — reads are done
             #[cfg(windows)]
             if let Some(hw) = self.hw_win.as_mut() {
                 hw.imports.destroy_all(&self.device); // GPU idle above
