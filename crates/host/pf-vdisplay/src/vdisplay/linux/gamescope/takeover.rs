@@ -807,11 +807,15 @@ pub(super) fn honor_session_select_switch(adopted_dm: Option<String>) {
         "gamescope: in-stream session-select detected — handing the box's own game mode back and \
          following the desktop session the user selected"
     );
-    // Mask first, while the unit list still exists — this path discards that list.
+    // Mask first, while the unit list still exists — this path discards that list. The record
+    // is rewritten, not deleted: forced SCREEN_* may still be owed.
     lift_autologin_mask();
-    takeover().stopped_autologin.clear();
-    clear_takeover();
-    takeover().managed = None;
+    {
+        let mut t = takeover();
+        t.stopped_autologin.clear();
+        t.managed = None;
+        persist_takeover_held(&t);
+    }
     stop_session(SESSION_UNIT); // switch already killed Steam — clear the unit
                                 // A switch is not a disconnect; skip this and "Return to Gaming Mode" starts a sleep.
     if remove_idle_dropin() {
