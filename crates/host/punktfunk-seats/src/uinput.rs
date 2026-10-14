@@ -860,16 +860,22 @@ fn up(account: &str, uid: u32) {
     }
 }
 
-/// `account`'s CUSE device, its node handed to `uid`, `0600`.
+/// `account`'s CUSE device, its node handed to `uid`, `0600`. An earlier device of that name
+/// still there after two seconds fails it: the kernel refuses a twin name, and the `chown` would
+/// land on the old node.
 fn make(account: &str, uid: u32) -> io::Result<File> {
     let devname = pf_paths::seat::uinput_devname(account);
-    // One that just ended lingers until systemd drops its stored copy; a twin name is refused.
+    // One that just ended lingers until systemd drops its stored copy.
     let sysfs = Path::new("/sys/class/cuse").join(devname.replace('/', "!"));
     for _ in 0..20 {
         if !sysfs.exists() {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if sysfs.exists() {
+        let still = format!("an earlier /dev/{devname} is still there");
+        return Err(io::Error::new(ErrorKind::AlreadyExists, still));
     }
     let chan = std::fs::OpenOptions::new()
         .read(true)

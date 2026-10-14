@@ -7,6 +7,7 @@
 
 use super::{accounts, session};
 use crate::ipc::{Diagnostic, DiagnosticLevel};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 /// What the supervisor stamps on a seat's pad: `punktfunk-seat:<account>/<index>`.
@@ -29,7 +30,8 @@ pub fn rule_installed() -> bool {
 }
 
 /// The doctor's rows for seat pads: the fence rule, the broker's socket, and `/dev/cuse`, which
-/// a seat's uinput proxy is made through.
+/// a seat's uinput proxy is made through and which must be root's alone: whoever opens it can
+/// serve a seat's node first.
 pub fn diagnostics() -> Vec<Diagnostic> {
     let row = |ok: bool, code: &str, good: &str, bad: &str| Diagnostic {
         level: if ok {
@@ -56,14 +58,28 @@ pub fn diagnostics() -> Vec<Diagnostic> {
             "The pad broker isn't listening, so a seat gets no controller. Restart \
              punktfunk-seats.",
         ),
-        row(
-            Path::new("/dev/cuse").exists(),
-            "uinput_proxy",
-            "/dev/cuse is present for the seats' uinput proxy",
-            "/dev/cuse is missing, so a seat's Steam can't make the controller games read. Load \
-             the cuse kernel module.",
-        ),
+        match std::fs::metadata("/dev/cuse") {
+            Err(_) => row(
+                false,
+                "uinput_proxy",
+                "",
+                "/dev/cuse is missing, so a seat's Steam can't make the controller games read. \
+                 Load the cuse kernel module.",
+            ),
+            Ok(meta) => row(
+                root_only(meta.uid(), meta.gid(), meta.mode()),
+                "uinput_proxy",
+                "/dev/cuse is present for the seats' uinput proxy, and root's alone",
+                "/dev/cuse opens to other users, so one of them could serve a seat's \
+                 controllers. Make it root's alone, mode 0600.",
+            ),
+        },
     ]
+}
+
+/// Whether a node with this owner, group and mode opens for root alone.
+fn root_only(uid: u32, gid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o007 == 0 && (gid == 0 || mode & 0o070 == 0)
 }
 
 /// The udev program. Never fails: udev takes the lines it gets. A seat's uinput proxy names
@@ -242,6 +258,21 @@ mod tests {
         assert!(!fenced(&user("Bob"), &env), "a person with no row");
         std::fs::write(&env, "").unwrap();
         assert!(fenced(&user("Bob"), &env), "the owner's row");
+    }
+
+    #[test]
+    fn only_a_root_only_cuse_node_passes_the_doctor() {
+        let cases = [
+            ((0, 0, 0o020600), true, "root 0600"),
+            ((0, 0, 0o020660), true, "group root"),
+            ((0, 5, 0o020600), true, "another group, no group bits"),
+            ((0, 5, 0o020660), false, "another group may open it"),
+            ((0, 0, 0o020666), false, "everyone may open it"),
+            ((1000, 0, 0o020600), false, "a user's"),
+        ];
+        for ((uid, gid, mode), only, what) in cases {
+            assert_eq!(root_only(uid, gid, mode), only, "{what}");
+        }
     }
 
     #[test]
