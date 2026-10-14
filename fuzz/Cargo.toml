@@ -14,7 +14,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 anyhow = "1"
-punktfunk-core = { path = "../crates/core/punktfunk-core" }
+# `quic` for the audio decoders, which sit behind it with libopus.
+punktfunk-core = { path = "../crates/core/punktfunk-core", features = ["quic"] }
 # `test-vectors` for the access-unit splitters the crate's own tests feed the planners with.
 pf-bitstream = { path = "../crates/codec/pf-bitstream", features = ["test-vectors"] }
 
@@ -47,6 +48,27 @@ bench = false
 [[bin]]
 name = "rtsp"
 path = "fuzz_targets/rtsp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audio_plane"
+path = "fuzz_targets/audio_plane.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cursor_shape"
+path = "fuzz_targets/cursor_shape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reassembler"
+path = "fuzz_targets/reassembler.rs"
 test = false
 doc = false
 bench = false
