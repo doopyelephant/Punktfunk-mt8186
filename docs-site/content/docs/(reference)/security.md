@@ -108,6 +108,23 @@ password vault.
 The Linux host runs in your desktop session as your own account, not root, so a compromise is
 scoped to that user.
 
+### Linux seats share your games
+
+**Reachable without logging in** runs the box's host as the `punktfunk` system user, and a root
+service, `punktfunk-seats`, gives each profile with an [own desktop](/docs/profiles#on-linux) a
+Linux user and host of its own. The service keeps its state in `/var/lib/punktfunk-seats`, which
+only root can change.
+
+- **Controllers.** The service builds a seat's controllers from its own tables, and their device
+  nodes belong to that seat alone. A seat's input can't type or move a pointer on the box.
+- **Stopping.** When a seat stops, everything its user runs ends, and its controllers go with it.
+- **The owner.** Only the account that turned on **Reachable without logging in** is hosted as
+  the box's owner. To hand that to another account, turn it off, then on from that account.
+- **Games.** Every seat writes the shared games folder, `/var/lib/punktfunk-seats/games`. With
+  **Seats update your games** on, the default, every seat also updates and installs into your own
+  Steam libraries. So a seat can change game files that you and the other seats run. Turn
+  **Seats update your games** off to keep your libraries read-only to seats.
+
 ## Plugins run code on your host
 
 Installing a [plugin](/docs/plugins) is a trust decision, like installing any program. What limits
@@ -144,6 +161,8 @@ it:
 - **Stay on a trusted network** — LAN or VPN. Never port-forward the host.
 - **Leave GameStream off** unless a Moonlight client needs it ([above](#gamestream--moonlight-compatibility-is-the-weak-crypto-path)).
 - **Install plugins you trust**, Verified ones first.
+- **Give seats to people you'd trust with your games**, or turn **Seats update your games** off
+  ([above](#linux-seats-share-your-games)).
 - **Review paired devices** under **Devices** in the web console; remove any you don't recognize.
 - **Keep the host updated** — security fixes ship as patch releases.
 - **On a portable host**, stop the service on untrusted networks.
