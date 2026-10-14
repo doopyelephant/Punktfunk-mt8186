@@ -726,7 +726,8 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: 192.168.1.58:5010/punktfunk-rust-ci:latest
-    timeout-minutes: 45
+    # Six targets at five minutes each, after a build that now carries the QUIC stack.
+    timeout-minutes: 60
     env:
       # The miri and c-abi-asan pin: one nightly date to bump for all three.
       FUZZ_TOOLCHAIN: nightly-2026-08-10
@@ -783,6 +784,11 @@ jobs:
           }
           fuzz core_wire
           fuzz rtsp
+          fuzz cursor_shape
+          fuzz reassembler -max_len=65536
+          # The C behind the audio decoders (libopus) instrumented too: cargo-fuzz sets the
+          # Rust side only, and the C objects resolve `__asan_*` against the runtime rustc links.
+          (export CC=clang CFLAGS=-fsanitize=address; fuzz audio_plane)
           fuzz bitstream_plan -max_len=16384 \
             -seed_inputs=$V/h264/test_data/64x64-I-P-B-P.h264,$V/h264/test_data/64x64-I-P-B-P-high.h264,$V/h265/test_data/64x64-I-P-B-P.h265,$V/av1/test_data/test-25fps.ivf.av1
 

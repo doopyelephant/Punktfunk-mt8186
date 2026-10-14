@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Punktfunk host unsafe census.
+Punktfunk unsafe census.
 
-Reproducible, compiler-free census of `unsafe` in the HOST-scope crates.
+Reproducible, compiler-free census of `unsafe` in every crate a shipped binary links.
 Classifies by WHAT THE UNSAFE DOES (operations), not by block count.
 
 Usage:  python3 unsafe-census.py <repo-root> [--json | --baseline <path> | --write-baseline <path>]
@@ -13,7 +13,7 @@ committed file. A rise fails; so does a baseline left above today's count, becau
 where a later rise hides. `--write-baseline` regenerates the file.
 
 Method (and its error bars) are documented in the report; in short:
-  0. Take the crate scope from `cargo metadata` (see host_roots), so a new crate is counted.
+  0. Take the crate scope from `cargo metadata` (see scope_roots), so a new crate is counted.
   1. Strip line/block comments and string/char literals (a hand-rolled scanner).
   2. Resolve each crate's module tree from lib.rs/main.rs, propagating `#[cfg(..)]`
      from `mod x;` declarations down to files, so cfg attribution is structural
@@ -31,28 +31,33 @@ import os, re, sys, json, argparse, collections, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci"))
 from cargo_graph import closure  # noqa: E402
 
-# The host scope is every local crate these binaries link on either OS with every feature on (no
-# dev-dependencies), plus the Windows drivers and the seat keeper, which build in their own
-# workspaces.
-HOST_BINARIES = ["punktfunk-host", "punktfunk-encode-worker", "punktfunk-capture-worker",
-                 "punktfunk-seats", "punktfunk-tray"]
-HOST_TRIPLES = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
-EXTRA_HOST_ROOTS = ["packaging/windows/drivers", "crates/host/pf-seat-keeper"]
+# The scope is every local crate these shipped binaries link on any target with every feature
+# on (no dev-dependencies), plus the cdylibs Windows loads into other processes and the crates
+# that build in their own workspaces. `cargo metadata` resolves a target it cannot build for,
+# so the Apple and Android closures need no installed toolchain.
+SHIPPED = ["punktfunk-host", "punktfunk-encode-worker", "punktfunk-capture-worker",
+           "punktfunk-seats", "punktfunk-tray", "pf-seat-audio",
+           "punktfunk-cli", "punktfunk-client-linux", "punktfunk-client-windows",
+           "punktfunk-client-android", "punktfunk-client-apple", "punktfunk-ffi"]
+TRIPLES = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin",
+           "aarch64-apple-ios", "aarch64-linux-android"]
+EXTRA_ROOTS = ["packaging/windows/drivers", "packaging/windows/pf-vkhdr-layer",
+               "crates/host/pf-seat-keeper"]
 
 
-def host_roots():
-    """Crate directories in the host scope, relative to the repo root (the cwd)."""
+def scope_roots():
+    """Crate directories in scope, relative to the repo root (the cwd)."""
     dirs = set()
-    for triple in HOST_TRIPLES:
+    for triple in TRIPLES:
         meta = json.loads(subprocess.check_output(
             ["cargo", "metadata", "--format-version", "1", "--locked", "--all-features",
              "--filter-platform", triple], text=True))
-        ids = closure(meta, HOST_BINARIES, dev=False)
+        ids = closure(meta, SHIPPED, dev=False)
         dirs |= {os.path.relpath(os.path.dirname(p["manifest_path"])).replace(os.sep, "/")
                  for p in meta["packages"] if p["id"] in ids and p["source"] is None}
     # A crate vendored inside another crate's directory is walked with its parent.
     nested = {d for d in dirs if any(d.startswith(o + "/") for o in dirs)}
-    return sorted(dirs - nested) + EXTRA_HOST_ROOTS
+    return sorted(dirs - nested) + EXTRA_ROOTS
 
 EXCLUDE_DIR_PARTS = {"target", ".claude", "node_modules", ".git"}
 
@@ -534,7 +539,7 @@ def main():
     as_json = args.json
     os.chdir(os.path.abspath(args.repo))
     allrecs = []
-    for root in host_roots():
+    for root in scope_roots():
         if not os.path.isdir(root): continue
         # crate entry points (a dir may hold several crates, e.g. packaging/windows/drivers)
         entries = []
@@ -548,8 +553,12 @@ def main():
         for p in walk_rs(root):
             plat, feats = modmap.get(p, (None, frozenset()))
             if p not in modmap:
-                # not reached from a crate root: tests/, build.rs, examples/ — mark by path
+                # not reached from a crate root. Integration tests, examples, benches and build
+                # scripts never ship; anything else is a module the walk missed — mark by path.
                 low = p.replace(os.sep, '/')
+                if ('/tests/' in low or '/examples/' in low or '/benches/' in low
+                        or low.endswith('/build.rs')):
+                    continue
                 if '/windows' in low or '_windows' in low: plat = 'windows'
                 elif '/linux' in low or '_linux' in low: plat = 'linux'
             rec = census_file(p, plat, feats)

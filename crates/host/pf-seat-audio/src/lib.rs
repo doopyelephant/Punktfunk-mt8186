@@ -7,7 +7,8 @@
 //! failure hands back the stock enumerator, so the seat keeps Remote Audio.
 //!
 //! Code here runs inside Windows' audio services and other people's processes: nothing may
-//! panic across a COM boundary, and nothing on the engine's real-time path may block.
+//! panic across a COM boundary, nothing on the engine's real-time path may block, and no `Drop`
+//! joins a thread — at process exit the thread is already gone and `join` panics.
 #![cfg(windows)]
 
 mod endpoint;

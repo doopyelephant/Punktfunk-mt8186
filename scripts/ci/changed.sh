@@ -46,6 +46,7 @@ classify() {
                 clients/android/kit/src/main/kotlin/io/unom/punktfunk/kit/NativeBridge.kt|\
                 scripts/unsafe-census.py|scripts/ci/unsafe-census-baseline.json|\
                 packaging/windows/drivers/*.rs|packaging/windows/drivers/*/*.inx|\
+                clients/windows/*.rs|packaging/windows/pf-vkhdr-layer/*.rs|\
                 scripts/ci/check-workflow-paths.py|scripts/ci/cargo_graph.py|\
                 scripts/gen-third-party-notices.sh|scripts/gen-third-party-notices.py|\
                 about.toml|about.hbs|\
@@ -148,6 +149,11 @@ self_test() {
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     # The unsafe gates in the rust job read the driver workspace's sources too.
     check driver-rust 'packaging/windows/drivers/pf-vdisplay/src/lib.rs' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # And the Windows client's and the Vulkan layer's: the census counts both.
+    check client-windows-rust 'clients/windows/src/main.rs' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    check vkhdr-rust 'packaging/windows/pf-vkhdr-layer/src/lib.rs' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     # A driver INF names the hardware ids a Rust table holds, so an INF-only change runs rust.
     check driver-inf 'packaging/windows/drivers/pf-vdisplay/pf_vdisplay.inx' \

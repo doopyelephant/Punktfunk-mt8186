@@ -248,9 +248,9 @@ jobs:
       - name: Android JNI name gate
         run: sh scripts/ci/check-android-jni-names.sh
 
-      # Per host crate, the unsafe operations that are not an FFI call must equal the committed
-      # baseline. A rise fails. So does a baseline above today's count: that slack hides the
-      # next rise.
+      # Per crate a shipped binary links, the unsafe operations that are not an FFI call must
+      # equal the committed baseline. A rise fails. So does a baseline above today's count: that
+      # slack hides the next rise.
       - name: Unsafe-census ratchet
         run: |
           python3 scripts/unsafe-census.py --self-test
