@@ -10,6 +10,7 @@
 
 pub(crate) mod cast;
 pub(crate) mod desktop;
+mod events;
 pub(crate) mod ipc;
 
 use super::{Mode, SessionCastParts, VirtualDisplay, VirtualOutput};
@@ -313,6 +314,7 @@ impl VirtualDisplay for NiriDisplay {
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         probe()?;
         reclaim_leftovers_once();
+        events::ensure_running();
         // A create whose handoff never completed still owns its cast.
         self.pending_cast = None;
         let name = ipc::create_virtual_output(
