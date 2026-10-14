@@ -356,22 +356,24 @@ pub fn same_pin(a: &str, b: &str) -> Option<bool> {
 }
 
 thread_local! {
-    /// Set while this thread holds the store lock. A second lock on the sidecar would wait
-    /// on the first for ever, so a nested edit runs under the outer one.
+    /// Set while this thread holds a store lock. A second lock on the sidecar would wait on
+    /// the first for ever, so a nested edit runs under the outer one. One flag for every
+    /// store: a thread holding one lock takes no other, so two processes never wait in a ring.
     static LOCK_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The store's lock across processes, held for one read, apply, save. It sits on a sidecar
-/// file: a save renames a new file over the store, so a lock on the store would stay with
-/// the file that was replaced. Best effort: where it can't be taken, the edit still runs.
-/// The wait has no deadline; the OS frees the lock of a holder that dies.
-struct StoreLock {
+/// A store's lock across processes, held for one read, apply, save: the saved hosts and the
+/// settings file each have one. It sits on a sidecar file: a save renames a new file over the
+/// store, so a lock on the store would stay with the file that was replaced. Best effort:
+/// where it can't be taken, the edit still runs. The wait has no deadline; the OS frees the
+/// lock of a holder that dies.
+pub(crate) struct StoreLock {
     file: Option<File>,
     nested: bool,
 }
 
 impl StoreLock {
-    fn take(store: &Path) -> StoreLock {
+    pub(crate) fn take(store: &Path) -> StoreLock {
         let nested = LOCK_HELD.replace(true);
         let file = if nested { None } else { Self::lock(store) };
         StoreLock { file, nested }
