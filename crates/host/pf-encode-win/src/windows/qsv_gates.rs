@@ -459,6 +459,7 @@ fn survey_one(
 /// answers RGB with a 4:4:4 stream, or copies instead of reading in place, fails here. The
 /// decoded levels are the rig's (`qsv-levels.py`).
 #[test]
+#[ignore = "needs an Intel GPU with QSV"]
 fn qsv_live_bgra_reads_in_place_as_bt709_420() {
     let Some(device) = intel_device() else {
         eprintln!("skipping: no Intel adapter");
@@ -488,6 +489,7 @@ fn qsv_live_bgra_reads_in_place_as_bt709_420() {
 /// 10-bit SDR: the video processor's BT.709 P010 encodes HEVC Main10 signalled BT.709, not
 /// the BT.2020 PQ an HDR P010 carries.
 #[test]
+#[ignore = "needs an Intel GPU with QSV"]
 fn qsv_live_p010_sdr_signals_bt709() {
     let Some(device) = intel_device() else {
         eprintln!("skipping: no Intel adapter");

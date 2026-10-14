@@ -1390,6 +1390,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a hardware Media Foundation encoder"]
     fn mf_encode_live_smoke() {
         let Some(aus) = drive_live(Codec::H264, 30, |_, _| {}) else {
             return;
@@ -1399,6 +1400,7 @@ mod tests {
 
     /// The first IDR's SPS carries BT.709 limited range, the capture's own colour.
     #[test]
+    #[ignore = "needs a hardware Media Foundation encoder"]
     fn mf_live_colour_description() {
         use pf_bitstream::h264::ColourDescription;
         let bt709 = ColourDescription {
@@ -1427,6 +1429,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a hardware Media Foundation encoder"]
     fn mf_live_hevc() {
         let Some(aus) = drive_live(Codec::H265, 30, |_, _| {}) else {
             return;
@@ -1436,6 +1439,7 @@ mod tests {
 
     /// Mid-stream `reconfigure_bitrate` must accept and must not emit a keyframe.
     #[test]
+    #[ignore = "needs a hardware Media Foundation encoder"]
     fn mf_live_bitrate_retarget() {
         let mut accepted = false;
         let Some(aus) = drive_live(Codec::H264, 60, |enc, i| {
@@ -1456,6 +1460,7 @@ mod tests {
     /// `request_keyframe` must produce an IDR where it was asked for — the one device
     /// question that decides whether loss recovery works at all (design §6, Q1).
     #[test]
+    #[ignore = "needs a hardware Media Foundation encoder"]
     fn mf_live_force_idr() {
         let Some(aus) = drive_live(Codec::H264, 60, |enc, i| {
             if i == 30 {

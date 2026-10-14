@@ -2384,6 +2384,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_encode_live_smoke() {
         let Some(aus) = drive_live(Codec::H264, false, 30, |_, _| {}) else {
             return;
@@ -2392,6 +2393,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_hevc() {
         let Some(aus) = drive_live(Codec::H265, false, 30, |_, _| {}) else {
             return;
@@ -2400,6 +2402,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_hevc10_hdr() {
         let Some(aus) = drive_live(Codec::H265, true, 30, |_, _| {}) else {
             return;
@@ -2409,6 +2412,7 @@ mod tests {
 
     /// AV1 output is an OBU stream, not Annex-B.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_av1_10bit() {
         let Some(aus) = drive_live(Codec::Av1, true, 30, |_, _| {}) else {
             return;
@@ -2425,6 +2429,7 @@ mod tests {
     /// Compares the two reads rather than demanding LTR, so a GPU that genuinely declines still
     /// passes; the printed values say which happened.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_caps_do_not_change_at_the_first_submit_live() {
         let (mut at_open, mut later) = (None, None);
         let Some(_) = drive_live(Codec::H264, false, 4, |enc, i| {
@@ -2447,6 +2452,7 @@ mod tests {
 
     /// Mid-stream invalidate must emit a `recovery_anchor` P-frame, not an IDR.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_ltr_rfi() {
         let mut rfi_answered = false;
         let Some(aus) = drive_live(Codec::H264, false, 60, |enc, i| {
@@ -2479,6 +2485,7 @@ mod tests {
 
     /// A loss covering every live LTR mark must decline (IDR fallback); no recovery_anchor AU.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_ltr_rfi_taint_sweep_declines() {
         let mut rfi_answered = None;
         let Some(aus) = drive_live(Codec::H264, false, 60, |enc, i| {
@@ -2509,6 +2516,7 @@ mod tests {
     /// frame is an IDR, which resets both. Refuses one mark frame and one recovery frame; the
     /// mirror checks skip when the driver declines LTR.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_refused_submit_forces_idr() {
         let mut ltr = false;
         let mut refused = (0u32, 0u32);
@@ -2567,6 +2575,7 @@ mod tests {
 
     /// Mid-stream `reconfigure_bitrate` must accept and must not emit a keyframe.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_bitrate_retarget() {
         let mut accepted = false;
         let Some(aus) = drive_live(Codec::H264, false, 60, |enc, i| {
@@ -2588,6 +2597,7 @@ mod tests {
     /// 1920×1088 pool surface whose chroma plane sits at a different row offset
     /// than the source. Dumps `%TEMP%\pf_qsv_1080_bars.h265` for off-box decode.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_p010_1080_colorbars_dump() {
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
         use windows::Win32::Graphics::Direct3D11::{
