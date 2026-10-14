@@ -225,15 +225,22 @@ impl PicturePool {
                 held: 0,
             });
             let picture = pool.pictures.len() - 1;
+            let decode_usage = plan.picture_usage
+                & (vk::ImageUsageFlags::VIDEO_DECODE_DST_KHR
+                    | vk::ImageUsageFlags::VIDEO_DECODE_DPB_KHR);
             // SAFETY: `image` was created with `layers` layers, `layer` is in
             // range, and plane formats are caps-resolved for MUTABLE_FORMAT.
             unsafe {
+                // The picture view is a decode binding: left sampled it would need a Y'CbCr
+                // conversion. The plane views are what the presenter samples, and the
+                // single-plane formats have no decode-output feature.
                 pool.pictures[picture].view = create_view(
                     &pool.device,
                     image,
                     caps.output_format,
                     vk::ImageAspectFlags::COLOR,
                     layer,
+                    decode_usage,
                 )?;
                 pool.pictures[picture].plane_views[0] = create_view(
                     &pool.device,
@@ -241,6 +248,7 @@ impl PicturePool {
                     caps.plane_view_formats[0],
                     vk::ImageAspectFlags::PLANE_0,
                     layer,
+                    vk::ImageUsageFlags::SAMPLED,
                 )?;
                 pool.pictures[picture].plane_views[1] = create_view(
                     &pool.device,
@@ -248,6 +256,7 @@ impl PicturePool {
                     caps.plane_view_formats[1],
                     vk::ImageAspectFlags::PLANE_1,
                     layer,
+                    vk::ImageUsageFlags::SAMPLED,
                 )?;
             }
             let mut type_info = vk::SemaphoreTypeCreateInfo::default()
@@ -374,6 +383,7 @@ impl DpbPool {
                     caps.dpb_format,
                     vk::ImageAspectFlags::COLOR,
                     layer,
+                    plan.dpb_usage,
                 )?
             };
             pool.dpb_views.push(view);
@@ -481,24 +491,29 @@ unsafe fn create_video_image(
     Ok((image, memory))
 }
 
-/// Single-layer 2D view (`base_array_layer = layer`, identity swizzle).
+/// Single-layer 2D view (`base_array_layer = layer`, identity swizzle) usable for `usage`
+/// only. A view inherits the image's whole usage unless narrowed, and then must carry
+/// every format feature of it.
 ///
 /// # Safety
 ///
-/// `image` is live on `device` with `layer` in range; `format`/`aspect` are
-/// compatible with the image's creation (same format for COLOR, plane-compatible
-/// under MUTABLE_FORMAT for the plane aspects).
+/// `image` is live on `device` with `layer` in range and `usage` inside its usage;
+/// `format`/`aspect` are compatible with the image's creation (same format for
+/// COLOR, plane-compatible under MUTABLE_FORMAT for the plane aspects).
 unsafe fn create_view(
     device: &ash::Device,
     image: vk::Image,
     format: vk::Format,
     aspect: vk::ImageAspectFlags,
     layer: u32,
+    usage: vk::ImageUsageFlags,
 ) -> Result<vk::ImageView, vk::Result> {
+    let mut view_usage = vk::ImageViewUsageCreateInfo::default().usage(usage);
     let ci = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(format)
+        .push_next(&mut view_usage)
         .subresource_range(vk::ImageSubresourceRange {
             aspect_mask: aspect,
             base_mip_level: 0,

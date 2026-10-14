@@ -32,7 +32,7 @@ use anyhow::{bail, Context, Result};
 use ash::vk;
 use ash::vk::Handle as _;
 use pf_frame::{CapturedFrame, FramePayload};
-use pf_zerocopy::vkdev::MappedMemory;
+use pf_zerocopy::vkdev::{MappedMemory, VkBufferAlloc, VkImageAlloc};
 use pyrowave_sys as pw;
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd};
@@ -94,7 +94,8 @@ fn node_pci_address(path: &std::path::Path) -> Option<(u32, u32, u32, u32)> {
 }
 
 /// Features pyrowave.h requires (shaderInt16, storageBuffer8BitAccess, timeline
-/// semaphores, subgroup size control). shaderFloat16 is optional. Checked after
+/// semaphores, subgroup size control) plus storageBuffer16BitAccess, which its shaders use
+/// for 16-bit buffer members and the header omits. shaderFloat16 is optional. Checked after
 /// selection: folding this into the pick can land on a GPU that cannot import the
 /// capturer's buffers and trip the process-wide raw-dmabuf latch. A hard `bail!`
 /// is latch-free and the session layer renegotiates.
@@ -102,14 +103,20 @@ fn node_pci_address(path: &std::path::Path) -> Option<(u32, u32, u32, u32)> {
 /// # Safety
 /// `instance` must be live; issues only physical-device feature queries.
 unsafe fn missing_features(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Vec<&'static str> {
+    let mut have11 = vk::PhysicalDeviceVulkan11Features::default();
     let mut have12 = vk::PhysicalDeviceVulkan12Features::default();
     let mut have13 = vk::PhysicalDeviceVulkan13Features::default();
     let mut have2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut have11)
         .push_next(&mut have12)
         .push_next(&mut have13);
     instance.get_physical_device_features2(pd, &mut have2);
     [
         (have2.features.shader_int16 == vk::TRUE, "shaderInt16"),
+        (
+            have11.storage_buffer16_bit_access == vk::TRUE,
+            "storageBuffer16BitAccess",
+        ),
         (
             have12.storage_buffer8_bit_access == vk::TRUE,
             "storageBuffer8BitAccess",
@@ -188,6 +195,7 @@ struct DeviceHold {
     // `as_ptr()` is move-stable like the Boxes.
     _dev_exts: Vec<*const c_char>,
     _feat2: Box<vk::PhysicalDeviceFeatures2<'static>>,
+    _v11: Box<vk::PhysicalDeviceVulkan11Features<'static>>,
     _v12: Box<vk::PhysicalDeviceVulkan12Features<'static>>,
     _v13: Box<vk::PhysicalDeviceVulkan13Features<'static>>,
     device_ci: Box<vk::DeviceCreateInfo<'static>>,
@@ -368,16 +376,12 @@ struct Slot {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     csc_set: vk::DescriptorSet,
-    y_img: vk::Image,
-    y_mem: vk::DeviceMemory,
-    y_view: vk::ImageView,
-    uv_img: vk::Image,
-    uv_mem: vk::DeviceMemory,
-    uv_view: vk::ImageView,
+    y: VkImageAlloc,
+    uv: VkImageAlloc,
     cursor: CursorPlane,
     /// CPU-input staging, lazily (re)created on format change.
-    cpu_img: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Format)>,
-    cpu_stage: Option<(vk::Buffer, vk::DeviceMemory, u64)>,
+    cpu_img: Option<(VkImageAlloc, vk::Format)>,
+    cpu_stage: Option<(VkBufferAlloc, u64)>,
 }
 
 impl Slot {
@@ -388,12 +392,8 @@ impl Slot {
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             csc_set: vk::DescriptorSet::null(),
-            y_img: vk::Image::null(),
-            y_mem: vk::DeviceMemory::null(),
-            y_view: vk::ImageView::null(),
-            uv_img: vk::Image::null(),
-            uv_mem: vk::DeviceMemory::null(),
-            uv_view: vk::ImageView::null(),
+            y: VkImageAlloc::default(),
+            uv: VkImageAlloc::default(),
             cursor: CursorPlane::default(),
             cpu_img: None,
             cpu_stage: None,
@@ -425,6 +425,8 @@ struct InFlight {
 pub struct PyroWaveEncoder {
     _entry: ash::Entry,
     instance: ash::Instance,
+    /// The physical device `device` was created on.
+    pd: vk::PhysicalDevice,
     device: ash::Device,
     ext_fd: ash::khr::external_memory_fd::Device,
     queue: vk::Queue,
@@ -820,6 +822,7 @@ impl PyroWaveEncoder {
                 ash::ext::image_drm_format_modifier::NAME.as_ptr(),
             ],
             _feat2: Box::new(vk::PhysicalDeviceFeatures2::default()),
+            _v11: Box::new(vk::PhysicalDeviceVulkan11Features::default()),
             _v12: Box::new(vk::PhysicalDeviceVulkan12Features::default()),
             _v13: Box::new(vk::PhysicalDeviceVulkan13Features::default()),
             device_ci: Box::new(vk::DeviceCreateInfo::default()),
@@ -890,6 +893,7 @@ impl PyroWaveEncoder {
             instance.get_physical_device_features2(pd, &mut have2);
 
             hold._feat2.features.shader_int16 = vk::TRUE;
+            hold._v11.storage_buffer16_bit_access = vk::TRUE;
             hold._v12.storage_buffer8_bit_access = vk::TRUE;
             hold._v12.timeline_semaphore = vk::TRUE;
             hold._v12.shader_float16 = have12.shader_float16;
@@ -899,7 +903,8 @@ impl PyroWaveEncoder {
             hold._v13.compute_full_subgroups = vk::TRUE;
             hold._v13.synchronization2 = vk::TRUE;
             hold._v13.maintenance4 = have13.maintenance4;
-            hold._feat2.p_next = &mut *hold._v12 as *mut _ as *mut std::ffi::c_void;
+            hold._feat2.p_next = &mut *hold._v11 as *mut _ as *mut std::ffi::c_void;
+            hold._v11.p_next = &mut *hold._v12 as *mut _ as *mut std::ffi::c_void;
             hold._v12.p_next = &mut *hold._v13 as *mut _ as *mut std::ffi::c_void;
 
             // Fresh-import acquire names FOREIGN as src when advertised, else
@@ -1075,6 +1080,7 @@ impl PyroWaveEncoder {
         let mut me = Self {
             _entry: entry,
             instance,
+            pd,
             device,
             ext_fd,
             queue,
@@ -1245,7 +1251,7 @@ impl PyroWaveEncoder {
         // One complete `Slot` per iteration; a mid-loop failure leaves earlier slots formed
         // and the rest null — `Drop` handles VK_NULL_HANDLE.
         for i in 0..SLOTS {
-            let (y_img, y_mem, y_view) = make_plain_image(
+            me.slots[i].y = make_plain_image(
                 &device,
                 &me.mem_props,
                 y_fmt,
@@ -1253,10 +1259,7 @@ impl PyroWaveEncoder {
                 h,
                 vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
             )?;
-            me.slots[i].y_img = y_img;
-            me.slots[i].y_mem = y_mem;
-            me.slots[i].y_view = y_view;
-            let (uv_img, uv_mem, uv_view) = make_plain_image(
+            me.slots[i].uv = make_plain_image(
                 &device,
                 &me.mem_props,
                 uv_fmt,
@@ -1264,9 +1267,6 @@ impl PyroWaveEncoder {
                 ch,
                 vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
             )?;
-            me.slots[i].uv_img = uv_img;
-            me.slots[i].uv_mem = uv_mem;
-            me.slots[i].uv_view = uv_view;
             me.slots[i].cursor = CursorPlane::new(&device, &me.mem_props)?;
             let csc_set = device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
@@ -1277,14 +1277,14 @@ impl PyroWaveEncoder {
             // Bindings 1–3 are fixed for the slot's life; only binding 0 is rewritten per
             // frame — that is why each slot needs its own set.
             let yi = [vk::DescriptorImageInfo::default()
-                .image_view(y_view)
+                .image_view(me.slots[i].y.view)
                 .image_layout(vk::ImageLayout::GENERAL)];
             let uvi = [vk::DescriptorImageInfo::default()
-                .image_view(uv_view)
+                .image_view(me.slots[i].uv.view)
                 .image_layout(vk::ImageLayout::GENERAL)];
             let curi = [vk::DescriptorImageInfo::default()
                 .sampler(me.sampler)
-                .image_view(me.slots[i].cursor.view)
+                .image_view(me.slots[i].cursor.img.view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             device.update_descriptor_sets(
                 &[
@@ -1322,15 +1322,15 @@ impl PyroWaveEncoder {
         // Driver-reported slot size (not an estimate). CPU staging is excluded: lazy, software
         // capture only.
         let slot_bytes: u64 = [
-            me.slots[0].y_img,
-            me.slots[0].uv_img,
-            me.slots[0].cursor.img,
+            me.slots[0].y.image,
+            me.slots[0].uv.image,
+            me.slots[0].cursor.img.image,
         ]
         .iter()
         .map(|&i| device.get_image_memory_requirements(i).size)
         .sum::<u64>()
             + device
-                .get_buffer_memory_requirements(me.slots[0].cursor.stage)
+                .get_buffer_memory_requirements(me.slots[0].cursor.stage.buffer)
                 .size;
 
         let props = me.instance.get_physical_device_properties(pd);
@@ -1364,7 +1364,16 @@ impl PyroWaveEncoder {
             &self.device,
             key,
             (cw, ch),
-            || match import_rgb_dmabuf(&self.device, &self.ext_fd, &self.mem_props, d, cw, ch) {
+            || match import_rgb_dmabuf(
+                &self.instance,
+                self.pd,
+                &self.device,
+                &self.ext_fd,
+                &self.mem_props,
+                d,
+                cw,
+                ch,
+            ) {
                 Ok(t) => {
                     d.health.note_raw_import_ok();
                     Ok(t)
@@ -1392,13 +1401,11 @@ impl PyroWaveEncoder {
         let (w, h) = (self.width, self.height);
         // Widen before the multiply: `w * h * 4` wraps in u32 once `w * h > 2^30`.
         let need = w as u64 * h as u64 * 4;
-        if self.slots[slot].cpu_img.map(|(_, _, _, f)| f) != Some(fmt) {
-            if let Some((i, m, v, _)) = self.slots[slot].cpu_img.take() {
-                dev.destroy_image_view(v, None);
-                dev.destroy_image(i, None);
-                dev.free_memory(m, None);
+        if self.slots[slot].cpu_img.map(|(_, f)| f) != Some(fmt) {
+            if let Some((old, _)) = self.slots[slot].cpu_img.take() {
+                old.destroy(&dev);
             }
-            let (i, m, v) = make_plain_image(
+            let img = make_plain_image(
                 &dev,
                 &self.mem_props,
                 fmt,
@@ -1406,30 +1413,29 @@ impl PyroWaveEncoder {
                 h,
                 vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
             )?;
-            self.slots[slot].cpu_img = Some((i, m, v, fmt));
+            self.slots[slot].cpu_img = Some((img, fmt));
         }
         if self.slots[slot]
             .cpu_stage
-            .map(|(_, _, s)| s < need)
+            .map(|(_, s)| s < need)
             .unwrap_or(true)
         {
-            if let Some((b, m, _)) = self.slots[slot].cpu_stage.take() {
-                dev.destroy_buffer(b, None);
-                dev.free_memory(m, None);
+            if let Some((old, _)) = self.slots[slot].cpu_stage.take() {
+                old.destroy(&dev);
             }
-            let (buf, mem) = make_host_buffer(
+            let buf = make_host_buffer(
                 &dev,
                 &self.mem_props,
                 need,
                 vk::BufferUsageFlags::TRANSFER_SRC,
             )?;
-            self.slots[slot].cpu_stage = Some((buf, mem, need));
+            self.slots[slot].cpu_stage = Some((buf, need));
         }
-        let (_, m, _) = self.slots[slot].cpu_stage.unwrap();
+        let (stage, _) = self.slots[slot].cpu_stage.unwrap();
         let n = bytes.len().min(need as usize);
         // The slot's staging memory: host-visible, at least `need` bytes, mapped only here.
-        MappedMemory::map(&dev, m, n)?.copy_from_slice(&bytes[..n]);
-        Ok(self.slots[slot].cpu_img.unwrap().2)
+        MappedMemory::map(&dev, stage.memory, n)?.copy_from_slice(&bytes[..n]);
+        Ok(self.slots[slot].cpu_img.unwrap().0.view)
     }
 
     /// Record and submit ingest, CSC and encode. The in-flight entry owns any raw
@@ -1514,8 +1520,8 @@ impl PyroWaveEncoder {
                     };
                     self.cpu_expand = scratch;
                     let view = view?;
-                    let (img, ..) = self.slots[slot].cpu_img.unwrap();
-                    let (stage, ..) = self.slots[slot].cpu_stage.unwrap();
+                    let img = self.slots[slot].cpu_img.unwrap().0.image;
+                    let stage = self.slots[slot].cpu_stage.unwrap().0.buffer;
                     let to_dst = vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::NONE)
                         .src_access_mask(vk::AccessFlags2::NONE)
@@ -1568,7 +1574,7 @@ impl PyroWaveEncoder {
 
             // y/uv → GENERAL for CSC storage writes. This slot's previous frame was retired
             // before `submit` chose it (the execution barrier pyrowave asks for).
-            let (y_img, uv_img) = (self.slots[slot].y_img, self.slots[slot].uv_img);
+            let (y_img, uv_img) = (self.slots[slot].y.image, self.slots[slot].uv.image);
             let to_general = |img| {
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::NONE)
@@ -2055,22 +2061,15 @@ impl Drop for PyroWaveEncoder {
             self.import_cache.clear(&self.device);
             // Failed open leaves a partial prefix; `vkDestroy*(VK_NULL_HANDLE)` is a no-op.
             for sl in std::mem::take(&mut self.slots) {
-                if let Some((i, m, v, _)) = sl.cpu_img {
-                    self.device.destroy_image_view(v, None);
-                    self.device.destroy_image(i, None);
-                    self.device.free_memory(m, None);
+                if let Some((img, _)) = sl.cpu_img {
+                    img.destroy(&self.device);
                 }
-                if let Some((b, m, _)) = sl.cpu_stage {
-                    self.device.destroy_buffer(b, None);
-                    self.device.free_memory(m, None);
+                if let Some((stage, _)) = sl.cpu_stage {
+                    stage.destroy(&self.device);
                 }
                 self.device.destroy_fence(sl.fence, None);
-                self.device.destroy_image_view(sl.y_view, None);
-                self.device.destroy_image(sl.y_img, None);
-                self.device.free_memory(sl.y_mem, None);
-                self.device.destroy_image_view(sl.uv_view, None);
-                self.device.destroy_image(sl.uv_img, None);
-                self.device.free_memory(sl.uv_mem, None);
+                sl.y.destroy(&self.device);
+                sl.uv.destroy(&self.device);
                 sl.cursor.destroy(&self.device);
             }
             if let Some(t) = self.gpu_timer.take() {

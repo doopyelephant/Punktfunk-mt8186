@@ -1,9 +1,9 @@
 //! Vulkan helpers the LINEAR bridge ([`super::vulkan`]), the NVENC slot blend
 //! ([`super::vkslot`]) and pf-encode's Vulkan encoders share: the NVIDIA compute device CUDA
-//! runs on, the memory-type pick, a memory map held as a borrow, and the explicit-modifier
-//! dmabuf import.
+//! runs on, the memory-type pick, a memory map held as a borrow, image and buffer owners that
+//! carry their memory, and the explicit-modifier dmabuf import.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use ash::vk;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -25,6 +25,7 @@ pub(crate) struct NvComputeDevice {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
     pub device: ash::Device,
+    pub phys: vk::PhysicalDevice,
     /// The first compute family; compute implies transfer.
     pub queue_family: u32,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
@@ -61,6 +62,7 @@ impl NvComputeDevice {
                 entry,
                 instance,
                 device: o.device,
+                phys: o.phys,
                 queue_family: o.queue_family,
                 mem_props: o.mem_props,
                 modifier_import: o.modifier_import,
@@ -78,6 +80,7 @@ impl NvComputeDevice {
 
 struct Opened {
     device: ash::Device,
+    phys: vk::PhysicalDevice,
     queue_family: u32,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     modifier_import: bool,
@@ -169,6 +172,7 @@ fn open_on(
                 Ok(device) => {
                     return Ok(Opened {
                         device,
+                        phys,
                         queue_family,
                         mem_props,
                         modifier_import,
@@ -313,6 +317,64 @@ impl Drop for MappedMemory<'_> {
     }
 }
 
+/// An image, the dedicated memory bound to it, and a view of it (null when it has none).
+/// No `Drop`: the owner destroys it once the GPU is idle and before the device, so a field
+/// left out of its teardown leaks and never dangles.
+#[derive(Clone, Copy, Default)]
+pub struct VkImageAlloc {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+}
+
+impl VkImageAlloc {
+    /// Destroy the view, then the image, then free the memory. Null handles are skipped.
+    ///
+    /// # Safety
+    /// The handles belong to `device`, nothing queued still uses them, and `self` is not
+    /// destroyed twice.
+    pub unsafe fn destroy(self, device: &ash::Device) {
+        // SAFETY: caller contract; each handle is destroyed once, dependents first.
+        unsafe {
+            if self.view != vk::ImageView::null() {
+                device.destroy_image_view(self.view, None);
+            }
+            if self.image != vk::Image::null() {
+                device.destroy_image(self.image, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                device.free_memory(self.memory, None);
+            }
+        }
+    }
+}
+
+/// A buffer and the dedicated memory bound to it. Owned like [`VkImageAlloc`].
+#[derive(Clone, Copy, Default)]
+pub struct VkBufferAlloc {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+}
+
+impl VkBufferAlloc {
+    /// Destroy the buffer, then free the memory (which unmaps a persistent mapping). Null
+    /// handles are skipped.
+    ///
+    /// # Safety
+    /// As [`VkImageAlloc::destroy`].
+    pub unsafe fn destroy(self, device: &ash::Device) {
+        // SAFETY: caller contract; each handle is destroyed once, the buffer first.
+        unsafe {
+            if self.buffer != vk::Buffer::null() {
+                device.destroy_buffer(self.buffer, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                device.free_memory(self.memory, None);
+            }
+        }
+    }
+}
+
 /// A dmabuf to import as a `TYPE_2D` image with an explicit DRM modifier layout.
 pub struct DmabufImage<'a> {
     /// Borrowed: the import takes a dup of it.
@@ -324,30 +386,133 @@ pub struct DmabufImage<'a> {
     /// One `(offset, row_pitch)` layout per memory plane of `format`.
     pub planes: &'a [vk::SubresourceLayout],
     pub usage: vk::ImageUsageFlags,
-    /// `PREINITIALIZED` when the first acquire barrier transitions from it; else `UNDEFINED`.
-    pub initial_layout: vk::ImageLayout,
+}
+
+/// The memory-plane count `pd` lists for `modifier` on `format`; `None` when it lists none.
+///
+/// # Safety
+/// `instance`/`pd` must be live and paired.
+unsafe fn modifier_plane_count(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    format: vk::Format,
+    modifier: u64,
+) -> Option<u32> {
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut props = Vec::new();
+    // SAFETY: caller contract; the count query fills `list`, `props` is sized to it before
+    // the second query writes through `p_drm_format_modifier_properties`.
+    unsafe {
+        let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+        instance.get_physical_device_format_properties2(pd, format, &mut fp2);
+        props.resize(
+            list.drm_format_modifier_count as usize,
+            vk::DrmFormatModifierPropertiesEXT::default(),
+        );
+        list.p_drm_format_modifier_properties = props.as_mut_ptr();
+        let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
+        instance.get_physical_device_format_properties2(pd, format, &mut fp2);
+    }
+    props.truncate(list.drm_format_modifier_count as usize);
+    props
+        .iter()
+        .find(|p| p.drm_format_modifier == modifier)
+        .map(|p| p.drm_format_modifier_plane_count)
+}
+
+/// Whether `pd` accepts a dmabuf import of `fmt` tiled as `modifier` with `usage`, under the
+/// video profiles in `profile_list` when given. IMPORTABLE on the external properties is the
+/// whole answer.
+///
+/// # Safety
+/// `instance`/`pd` must be live and paired; `profile_list` must be fully wired.
+pub unsafe fn modifier_importable(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    fmt: vk::Format,
+    modifier: u64,
+    usage: vk::ImageUsageFlags,
+    profile_list: Option<&vk::VideoProfileListInfoKHR>,
+) -> bool {
+    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+        .drm_format_modifier(modifier)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    // A copy: chaining the caller's list would leave its `p_next` on this frame's structs.
+    let mut plist = profile_list.map(|l| vk::VideoProfileListInfoKHR {
+        profile_count: l.profile_count,
+        p_profiles: l.p_profiles,
+        ..Default::default()
+    });
+    let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
+        .format(fmt)
+        .ty(vk::ImageType::TYPE_2D)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(usage)
+        .flags(vk::ImageCreateFlags::empty())
+        .push_next(&mut modifier_info)
+        .push_next(&mut external);
+    if let Some(plist) = plist.as_mut() {
+        info = info.push_next(plist);
+    }
+    let mut ext_props = vk::ExternalImageFormatProperties::default();
+    let mut props = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
+    // SAFETY: caller contract; every struct in the chain is a local outliving the query.
+    let queried =
+        unsafe { instance.get_physical_device_image_format_properties2(pd, &info, &mut props) };
+    queried.is_ok()
+        && ext_props
+            .external_memory_properties
+            .external_memory_features
+            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
 }
 
 /// Import `src` as an image bound to its own dedicated memory. The memory type comes from the
 /// fd's properties intersected with the image's requirements, or the requirements alone when
 /// the driver reports no fd types. `profile_list` chains a video profile into the image.
 ///
+/// The modifier, its plane count and the usage are checked against `pd` first: `vkCreateImage`
+/// with a layout the format does not list is invalid usage, not a clean failure.
+///
 /// The import takes a dup of `src.fd`: Vulkan owns the dup only once memory allocation
 /// succeeds, and `vkFreeMemory` then closes it. On failure every handle this call created is
-/// destroyed, and the caller's fd stays theirs. The caller destroys the image, then frees the
-/// memory.
+/// destroyed, and the caller's fd stays theirs. The returned alloc has no view; the caller
+/// destroys it.
 ///
 /// # Safety
 /// `device` and `ext_fd` belong to the live device `mem_props` describes, with
-/// `VK_EXT_external_memory_dma_buf` and `VK_EXT_image_drm_format_modifier` enabled.
+/// `VK_EXT_external_memory_dma_buf` and `VK_EXT_image_drm_format_modifier` enabled;
+/// `instance`/`pd` are the instance and physical device it was created on.
 pub unsafe fn import_dmabuf_image(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
     device: &ash::Device,
     ext_fd: &ash::khr::external_memory_fd::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     src: &DmabufImage,
     profile_list: Option<&mut vk::VideoProfileListInfoKHR>,
-) -> Result<(vk::Image, vk::DeviceMemory)> {
+) -> Result<VkImageAlloc> {
     use std::os::fd::{AsRawFd, IntoRawFd};
+    // SAFETY: caller contract for `instance`/`pd`; the queries read locals and `profile_list`.
+    let supported = unsafe {
+        modifier_plane_count(instance, pd, src.format, src.modifier)
+            == Some(src.planes.len() as u32)
+            && modifier_importable(
+                instance,
+                pd,
+                src.format,
+                src.modifier,
+                src.usage,
+                profile_list.as_deref(),
+            )
+    };
+    ensure!(
+        supported,
+        "import dmabuf image: modifier {:#x} unsupported for {:?}",
+        src.modifier,
+        src.format
+    );
     let dup = src.fd.try_clone_to_owned().context("dup dmabuf fd")?;
     let mut drm = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
         .drm_format_modifier(src.modifier)
@@ -368,7 +533,8 @@ pub unsafe fn import_dmabuf_image(
         .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
         .usage(src.usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(src.initial_layout)
+        // External memory starts UNDEFINED; the first acquire barrier names that layout.
+        .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut ext)
         .push_next(&mut drm);
     if let Some(pl) = profile_list {
@@ -420,12 +586,16 @@ pub unsafe fn import_dmabuf_image(
                 return Err(e).context("import dmabuf memory (image)"); // `dup` closes once
             }
         };
+        let alloc = VkImageAlloc {
+            image,
+            memory,
+            view: vk::ImageView::null(),
+        };
         if let Err(e) = device.bind_image_memory(image, memory, 0) {
-            device.destroy_image(image, None);
-            device.free_memory(memory, None); // closes the imported fd
+            alloc.destroy(device); // frees the memory, which closes the imported fd
             return Err(e).context("bind dmabuf image");
         }
-        Ok((image, memory))
+        Ok(alloc)
     }
 }
 

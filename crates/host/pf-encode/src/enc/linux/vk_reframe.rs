@@ -7,6 +7,7 @@
 use crate::vk_util::{color_range, make_plain_image};
 use anyhow::Result;
 use ash::vk;
+use pf_zerocopy::vkdev::VkImageAlloc;
 
 // Source `reframe.comp`; regenerate with `glslangValidator -V reframe.comp -o reframe.spv`.
 const REFRAME_SPV: &[u8] = include_bytes!("reframe.spv");
@@ -14,14 +15,12 @@ const REFRAME_SPV: &[u8] = include_bytes!("reframe.spv");
 const PUSH_BYTES: usize = 40;
 const FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
-type Plain = (vk::Image, vk::DeviceMemory, vk::ImageView);
-
 #[derive(Default)]
 struct Slot {
     /// `out_w × crop_h`: the x pass.
-    tmp: Plain,
+    tmp: VkImageAlloc,
     /// `out_w × out_h`: the y pass, the CSC's source.
-    dst: Plain,
+    dst: VkImageAlloc,
     set_x: vk::DescriptorSet,
     set_y: vk::DescriptorSet,
 }
@@ -178,8 +177,8 @@ impl Reframe {
                 .image_view(view)
                 .image_layout(vk::ImageLayout::GENERAL)]
         };
-        let (src_x, out_x, cur) = (sampled(src), storage(s.tmp.2), sampled(cursor));
-        let (src_y, out_y) = (sampled(s.tmp.2), storage(s.dst.2));
+        let (src_x, out_x, cur) = (sampled(src), storage(s.tmp.view), sampled(cursor));
+        let (src_y, out_y) = (sampled(s.tmp.view), storage(s.dst.view));
         fn write<'a>(
             set: vk::DescriptorSet,
             binding: u32,
@@ -230,8 +229,8 @@ impl Reframe {
         device.cmd_pipeline_barrier2(
             cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&[
-                barrier(s.tmp.0, undefined, general, none, write_access),
-                barrier(s.dst.0, undefined, general, none, write_access),
+                barrier(s.tmp.image, undefined, general, none, write_access),
+                barrier(s.dst.image, undefined, general, none, write_access),
             ]),
         );
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipe);
@@ -282,7 +281,7 @@ impl Reframe {
         device.cmd_pipeline_barrier2(
             cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&[barrier(
-                s.tmp.0,
+                s.tmp.image,
                 general,
                 read,
                 write_access,
@@ -301,24 +300,21 @@ impl Reframe {
         device.cmd_pipeline_barrier2(
             cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&[barrier(
-                s.dst.0,
+                s.dst.image,
                 general,
                 read,
                 write_access,
                 read_access,
             )]),
         );
-        s.dst.2
+        s.dst.view
     }
 
     /// Release everything. The device must be idle for this stage; null handles are skipped.
     pub(super) unsafe fn destroy(&mut self, device: &ash::Device) {
         for s in self.slots.drain(..) {
-            for (img, mem, view) in [s.tmp, s.dst] {
-                device.destroy_image_view(view, None);
-                device.destroy_image(img, None);
-                device.free_memory(mem, None);
-            }
+            s.tmp.destroy(device);
+            s.dst.destroy(device);
         }
         device.destroy_descriptor_pool(self.pool, None);
         device.destroy_pipeline(self.pipe, None);

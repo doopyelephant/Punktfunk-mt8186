@@ -177,16 +177,16 @@ fn slot_vram_cost_stays_bounded() {
         // SAFETY: plain memory-requirement queries on images this encoder owns.
         let per_slot: u64 = unsafe {
             [
-                enc.slots[0].y_img,
-                enc.slots[0].uv_img,
-                enc.slots[0].cursor.img,
+                enc.slots[0].y.image,
+                enc.slots[0].uv.image,
+                enc.slots[0].cursor.img.image,
             ]
             .iter()
             .map(|&i| enc.device.get_image_memory_requirements(i).size)
             .sum::<u64>()
                 + enc
                     .device
-                    .get_buffer_memory_requirements(enc.slots[0].cursor.stage)
+                    .get_buffer_memory_requirements(enc.slots[0].cursor.stage.buffer)
                     .size
         };
         assert!(per_slot > 0, "{name}: a slot must own real memory");
@@ -236,7 +236,7 @@ fn pyrowave_refuses_a_frame_that_is_not_the_mode() {
 
 /// A failed dmabuf import must leak neither the dup'd fd nor the VkImage. Drives
 /// `import_rgb_dmabuf` directly so deliberate failures cannot trip the raw-dmabuf latch.
-/// Garbage modifier fails at `create_image`; LINEAR memfd fails at `allocate_memory`.
+/// A garbage modifier is refused before `create_image`; LINEAR memfd fails at `allocate_memory`.
 #[test]
 #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
 fn import_failure_leaks_no_fds() {
@@ -259,19 +259,30 @@ fn import_failure_leaks_no_fds() {
             rebuild: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     };
+    let import = |d: &pf_frame::DmabufFrame| {
+        // SAFETY: live instance/device/ext_fd/mem_props owned by `enc`; the frame is locally owned.
+        unsafe {
+            import_rgb_dmabuf(
+                &enc.instance,
+                enc.pd,
+                &enc.device,
+                &enc.ext_fd,
+                &enc.mem_props,
+                d,
+                64,
+                64,
+            )
+        }
+    };
     let fd_count = || std::fs::read_dir("/proc/self/fd").expect("procfs").count();
     // Warm lazily-opened driver/loader descriptors before the baseline.
     for modifier in [u64::MAX - 1, 0] {
-        let d = memfd_frame(modifier);
-        // SAFETY: live device/ext_fd/mem_props owned by `enc`; the frame is locally owned.
-        let _ = unsafe { import_rgb_dmabuf(&enc.device, &enc.ext_fd, &enc.mem_props, &d, 64, 64) };
+        let _ = import(&memfd_frame(modifier));
     }
     let baseline = fd_count();
     for i in 0..32 {
         let modifier = if i % 2 == 0 { u64::MAX - 1 } else { 0 };
-        let d = memfd_frame(modifier);
-        // SAFETY: live device/ext_fd/mem_props owned by `enc`; the frame is locally owned.
-        let r = unsafe { import_rgb_dmabuf(&enc.device, &enc.ext_fd, &enc.mem_props, &d, 64, 64) };
+        let r = import(&memfd_frame(modifier));
         assert!(
             r.is_err(),
             "a memfd/garbage-modifier import must fail (iteration {i})"

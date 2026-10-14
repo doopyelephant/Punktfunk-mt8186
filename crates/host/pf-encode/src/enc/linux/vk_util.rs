@@ -14,6 +14,7 @@
 use anyhow::Result;
 use ash::vk;
 use pf_frame::PixelFormat;
+use pf_zerocopy::vkdev::{VkBufferAlloc, VkImageAlloc};
 
 /// Set when this process, not the operator, put `video-encode` into `ANV_DEBUG`.
 static ANV_ENCODE_OURS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -362,17 +363,7 @@ pub(crate) fn reject_dmabuf(d: &pf_frame::DmabufFrame, reason: &str) {
 struct CachedImport {
     key: (u64, u64),
     extent: (u32, u32),
-    img: vk::Image,
-    mem: vk::DeviceMemory,
-    view: vk::ImageView,
-}
-
-impl CachedImport {
-    unsafe fn destroy(self, dev: &ash::Device) {
-        dev.destroy_image_view(self.view, None);
-        dev.destroy_image(self.img, None);
-        dev.free_memory(self.mem, None);
-    }
+    alloc: VkImageAlloc,
 }
 
 /// Dmabuf imports reused while the same buffer recurs, least recently used first. Keyed by
@@ -401,7 +392,7 @@ impl ImportCache {
         dev: &ash::Device,
         key: (u64, u64),
         extent: (u32, u32),
-        import: impl FnOnce() -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
+        import: impl FnOnce() -> Result<VkImageAlloc>,
         in_flight: impl Fn((u64, u64)) -> bool,
         keep: usize,
     ) -> Result<(vk::Image, vk::ImageView, bool)> {
@@ -409,57 +400,56 @@ impl ImportCache {
             // Most recently used last: eviction takes the front.
             let e = self.entries.remove(pos);
             if e.extent == extent {
-                let hit = (e.img, e.view, false);
+                let hit = (e.alloc.image, e.alloc.view, false);
                 self.entries.push(e);
                 return Ok(hit);
             }
             let _ = dev.device_wait_idle();
-            e.destroy(dev);
+            e.alloc.destroy(dev);
         }
         let t0 = std::time::Instant::now();
-        let (img, mem, view) = import()?;
+        let alloc = import()?;
         // The frames in flight are the last ones submitted: their imports are the newest.
         while self.entries.len() > keep {
             let e = self.entries.remove(0);
             if in_flight(e.key) {
                 let _ = dev.device_wait_idle();
             }
-            e.destroy(dev);
+            e.alloc.destroy(dev);
         }
-        self.entries.push(CachedImport {
-            key,
-            extent,
-            img,
-            mem,
-            view,
-        });
+        self.entries.push(CachedImport { key, extent, alloc });
         // Trace: a producer ring deeper than `keep` misses every frame.
         tracing::trace!(
             resident = self.entries.len(),
             miss_us = t0.elapsed().as_micros() as u64,
             "imported a new dmabuf buffer"
         );
-        Ok((img, view, true))
+        Ok((alloc.image, alloc.view, true))
     }
 
     /// Destroy every entry. The device must be idle.
     pub(crate) unsafe fn clear(&mut self, dev: &ash::Device) {
         for e in self.entries.drain(..) {
-            e.destroy(dev);
+            e.alloc.destroy(dev);
         }
     }
 }
 
-/// Caller destroys all three returned handles.
+/// Caller destroys the returned alloc.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn import_rgb_dmabuf(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
     device: &ash::Device,
     ext_fd: &ash::khr::external_memory_fd::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     d: &pf_frame::DmabufFrame,
     cw: u32,
     ch: u32,
-) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+) -> Result<VkImageAlloc> {
     import_rgb_dmabuf_as(
+        instance,
+        pd,
         device,
         ext_fd,
         mem_props,
@@ -476,6 +466,8 @@ pub(crate) unsafe fn import_rgb_dmabuf(
 /// from plane-1, else shared-stride contiguous planes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn import_rgb_dmabuf_as(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
     device: &ash::Device,
     ext_fd: &ash::khr::external_memory_fd::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -484,7 +476,7 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
     ch: u32,
     usage: vk::ImageUsageFlags,
     profile_list: Option<&mut vk::VideoProfileListInfoKHR>,
-) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+) -> Result<VkImageAlloc> {
     use anyhow::Context;
     use std::os::fd::AsFd;
     let fmt = pf_zerocopy::drm::vk_format(d.fourcc)
@@ -512,7 +504,9 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
             .offset(d.offset as u64)
             .row_pitch(d.stride as u64)]
     };
-    let (img, mem) = pf_zerocopy::vkdev::import_dmabuf_image(
+    let mut alloc = pf_zerocopy::vkdev::import_dmabuf_image(
+        instance,
+        pd,
         device,
         ext_fd,
         mem_props,
@@ -524,19 +518,17 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
             modifier: d.modifier,
             planes: &planes,
             usage,
-            initial_layout: vk::ImageLayout::UNDEFINED,
         },
         profile_list,
     )?;
-    let view = match make_view(device, img, fmt, 0) {
+    alloc.view = match make_view(device, alloc.image, fmt, 0) {
         Ok(v) => v,
         Err(e) => {
-            device.destroy_image(img, None);
-            device.free_memory(mem, None);
+            alloc.destroy(device);
             return Err(e);
         }
     };
-    Ok((img, mem, view))
+    Ok(alloc)
 }
 
 /// On failure every handle this call created is destroyed, so callers can `?`.
@@ -545,7 +537,7 @@ pub(crate) unsafe fn make_host_buffer(
     mp: &vk::PhysicalDeviceMemoryProperties,
     size: u64,
     usage: vk::BufferUsageFlags,
-) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+) -> Result<VkBufferAlloc> {
     let buf = device.create_buffer(
         &vk::BufferCreateInfo::default().size(size).usage(usage),
         None,
@@ -566,12 +558,15 @@ pub(crate) unsafe fn make_host_buffer(
             return Err(e);
         }
     };
+    let alloc = VkBufferAlloc {
+        buffer: buf,
+        memory: mem,
+    };
     if let Err(e) = device.bind_buffer_memory(buf, mem, 0) {
-        device.destroy_buffer(buf, None);
-        device.free_memory(mem, None);
+        alloc.destroy(device);
         return Err(e.into());
     }
-    Ok((buf, mem))
+    Ok(alloc)
 }
 
 pub(crate) unsafe fn make_plain_image(
@@ -581,7 +576,7 @@ pub(crate) unsafe fn make_plain_image(
     w: u32,
     h: u32,
     usage: vk::ImageUsageFlags,
-) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+) -> Result<VkImageAlloc> {
     let img = device.create_image(
         &vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -600,7 +595,7 @@ pub(crate) unsafe fn make_plain_image(
         None,
     )?;
     let req = device.get_image_memory_requirements(img);
-    // Unwind: callers only ever see the completed triple.
+    // Unwind: callers only ever see the completed alloc.
     let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
     let mem = match find_mem(mp, req.memory_type_bits, local).and_then(|ti| {
         Ok(device.allocate_memory(
@@ -616,16 +611,22 @@ pub(crate) unsafe fn make_plain_image(
             return Err(e);
         }
     };
+    let mut alloc = VkImageAlloc {
+        image: img,
+        memory: mem,
+        view: vk::ImageView::null(),
+    };
     if let Err(e) = device.bind_image_memory(img, mem, 0) {
-        device.destroy_image(img, None);
-        device.free_memory(mem, None);
+        alloc.destroy(device);
         return Err(e.into());
     }
     match make_view(device, img, fmt, 0) {
-        Ok(view) => Ok((img, mem, view)),
+        Ok(view) => {
+            alloc.view = view;
+            Ok(alloc)
+        }
         Err(e) => {
-            device.destroy_image(img, None);
-            device.free_memory(mem, None);
+            alloc.destroy(device);
             Err(e)
         }
     }

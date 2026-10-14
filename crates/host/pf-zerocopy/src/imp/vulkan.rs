@@ -14,21 +14,19 @@
 //! for a stream). Init/import failure disables the importer; CPU mmap takes over.
 
 use super::cuda::{self, DeviceBuffer};
-use super::vkdev;
+use super::vkdev::{self, VkBufferAlloc};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
 use std::collections::HashMap;
 
 struct SrcBuf {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
+    buf: VkBufferAlloc,
     size: u64,
 }
 
 /// Exportable destination, CUDA-mapped; rebuilt when the resolution grows.
 struct DstBuf {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
+    buf: VkBufferAlloc,
     size: u64,
     /// CUDA mapping; owns the exported OPAQUE_FD.
     cuda: cuda::ExternalDmabuf,
@@ -78,6 +76,8 @@ mod convert;
 pub struct VkBridge {
     _entry: ash::Entry,
     instance: ash::Instance,
+    /// The physical device `device` was created on.
+    phys: vk::PhysicalDevice,
     device: ash::Device,
     ext_fd: ash::khr::external_memory_fd::Device,
     queue: vk::Queue,
@@ -139,7 +139,7 @@ impl VkBridge {
             ),
             None => {}
         }
-        let (instance, device, qf) = (nv.instance, nv.device, nv.queue_family);
+        let (instance, device, qf, phys) = (nv.instance, nv.device, nv.queue_family, nv.phys);
         // SAFETY: `instance` and `device` are the live handles just opened; ash cannot check
         // create infos, so every one below is a local that outlives its synchronous call.
         unsafe {
@@ -150,6 +150,7 @@ impl VkBridge {
             let mut me = VkBridge {
                 _entry: nv.entry,
                 instance,
+                phys,
                 device,
                 ext_fd,
                 queue,
@@ -269,20 +270,13 @@ impl VkBridge {
                     return Err(anyhow!("import dmabuf memory: {e}"));
                 }
             };
+            let buf = VkBufferAlloc { buffer, memory };
             if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
                 // `memory` owns the imported fd — freeing it releases the fd too.
-                self.device.free_memory(memory, None);
-                self.device.destroy_buffer(buffer, None);
+                buf.destroy(&self.device);
                 return Err(e).context("bind import memory");
             }
-            self.src_cache.insert(
-                fd,
-                SrcBuf {
-                    buffer,
-                    memory,
-                    size,
-                },
-            );
+            self.src_cache.insert(fd, SrcBuf { buf, size });
             Ok(())
         }
     }
@@ -341,9 +335,9 @@ impl VkBridge {
                     return Err(e).context("allocate exportable memory");
                 }
             };
+            let buf = VkBufferAlloc { buffer, memory };
             if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
-                self.device.free_memory(memory, None);
-                self.device.destroy_buffer(buffer, None);
+                buf.destroy(&self.device);
                 return Err(e).context("bind export memory");
             }
             let opaque_fd = match self.ext_fd.get_memory_fd(
@@ -354,8 +348,7 @@ impl VkBridge {
                 // A fresh descriptor this call alone owns.
                 Ok(f) => <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(f),
                 Err(e) => {
-                    self.device.free_memory(memory, None);
-                    self.device.destroy_buffer(buffer, None);
+                    buf.destroy(&self.device);
                     return Err(e).context("vkGetMemoryFdKHR");
                 }
             };
@@ -364,19 +357,16 @@ impl VkBridge {
             let cuda = match cuda::ExternalDmabuf::import_owned_fd(opaque_fd, reqs.size) {
                 Ok(c) => c,
                 Err(e) => {
-                    self.device.free_memory(memory, None);
-                    self.device.destroy_buffer(buffer, None);
+                    buf.destroy(&self.device);
                     return Err(e).context("cuImportExternalMemory(OPAQUE_FD from Vulkan)");
                 }
             };
             if let Some(old) = self.dst.take() {
-                self.device.destroy_buffer(old.buffer, None);
-                self.device.free_memory(old.memory, None);
+                old.buf.destroy(&self.device);
             }
             tracing::info!(size, "Vulkan→CUDA exportable staging buffer ready");
             self.dst = Some(DstBuf {
-                buffer,
-                memory,
+                buf,
                 size: reqs.size,
                 cuda,
             });
@@ -547,7 +537,7 @@ impl VkBridge {
             }
             let (src_buffer, src_size) = {
                 let s = &self.src_cache[&fd];
-                (s.buffer, s.size)
+                (s.buf.buffer, s.size)
             };
             // This frame's chunk metadata, not the cached import, decides how far the shader reads.
             anyhow::ensure!(src_size >= span, "dmabuf smaller than frame span");
@@ -555,7 +545,7 @@ impl VkBridge {
             self.ensure_csc()?;
             let (dst_buffer, dst_cuda_ptr) = {
                 let d = self.dst.as_ref().unwrap();
-                (d.buffer, d.cuda.ptr)
+                (d.buf.buffer, d.cuda.ptr)
             };
             let csc = self.csc.as_ref().unwrap();
 
@@ -638,7 +628,7 @@ impl VkBridge {
                 .queue_submit(self.queue, &[submit], self.fence)
                 .context("queue submit")?;
             // TIMEOUT/DEVICE_LOST must not `?` out with work still running: `cmd`/`fence` are
-            // reused every frame, and `ensure_dst` later destroys `dst.buffer` assuming none.
+            // reused every frame, and `ensure_dst` later destroys `dst.buf` assuming none.
             // Drain and reset before propagating.
             if let Err(e) = self
                 .device
@@ -668,13 +658,12 @@ impl VkBridge {
     /// serve a stale buffer for a reused number, or leak one entry per recycled pool buffer.
     pub fn forget_fd(&mut self, fd: i32) {
         if let Some(s) = self.src_cache.remove(&fd) {
-            // SAFETY: `s.buffer`/`s.memory` were created by `import_src` and are owned by the
-            // removed cache entry, so each is destroyed once. A planar copy reads them on the
+            // SAFETY: `s.buf` was created by `import_src` and is owned by the removed cache
+            // entry, so it is destroyed once. A planar copy reads them on the
             // GPU after `convert` returns, so the device idles first; this is the owning thread.
             unsafe {
                 let _ = self.device.device_wait_idle();
-                self.device.destroy_buffer(s.buffer, None);
-                self.device.free_memory(s.memory, None);
+                s.buf.destroy(&self.device);
             }
         }
     }
@@ -705,7 +694,7 @@ impl VkBridge {
             }
             let (src_buffer, src_size) = {
                 let s = &self.src_cache[&fd];
-                (s.buffer, s.size)
+                (s.buf.buffer, s.size)
             };
             // Per frame, not per import: cached size can be smaller than this chunk's span.
             // Clamping the Vulkan copy would let the CUDA de-stride read past `dst`.
@@ -722,7 +711,7 @@ impl VkBridge {
                 .context("begin cmd")?;
             let region = vk::BufferCopy::default().size(span);
             self.device
-                .cmd_copy_buffer(self.cmd, src_buffer, dst.buffer, &[region]);
+                .cmd_copy_buffer(self.cmd, src_buffer, dst.buf.buffer, &[region]);
             self.device
                 .end_command_buffer(self.cmd)
                 .context("end cmd")?;
@@ -732,7 +721,7 @@ impl VkBridge {
                 .queue_submit(self.queue, &[submit], self.fence)
                 .context("queue submit")?;
             // TIMEOUT/DEVICE_LOST must not `?` out with work still running: `cmd`/`fence` are
-            // reused every frame, and `ensure_dst` later destroys `dst.buffer` assuming none.
+            // reused every frame, and `ensure_dst` later destroys `dst.buf` assuming none.
             // Drain and reset before propagating.
             if let Err(e) = self
                 .device
@@ -763,12 +752,10 @@ impl Drop for VkBridge {
         unsafe {
             let _ = self.device.device_wait_idle();
             for (_, s) in self.src_cache.drain() {
-                self.device.destroy_buffer(s.buffer, None);
-                self.device.free_memory(s.memory, None);
+                s.buf.destroy(&self.device);
             }
             if let Some(d) = self.dst.take() {
-                self.device.destroy_buffer(d.buffer, None);
-                self.device.free_memory(d.memory, None);
+                d.buf.destroy(&self.device);
             }
             if let Some(mut c) = self.conv.take() {
                 c.destroy(&self.device, self.cmd_pool);
