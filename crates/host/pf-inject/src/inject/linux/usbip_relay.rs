@@ -269,6 +269,27 @@ pub struct Served {
     pub input: Box<dyn FnMut(Incoming<'_>) + Send>,
 }
 
+/// The feed of a device that serves one `N`-byte report on interface `iface`: an input for
+/// it, `N` bytes long and led by `id` when the table numbers its reports, replaces `slot`.
+/// Anything else is dropped.
+pub(crate) fn one_report<const N: usize>(
+    slot: Arc<std::sync::Mutex<[u8; N]>>,
+    iface: u8,
+    id: Option<u8>,
+) -> Box<dyn FnMut(Incoming<'_>) + Send> {
+    Box::new(move |message| {
+        let Incoming::Input { iface: to, report } = message else {
+            return;
+        };
+        let Ok(report) = <[u8; N]>::try_from(report) else {
+            return;
+        };
+        if to == iface && id.is_none_or(|id| report[0] == id) {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = report;
+        }
+    })
+}
+
 /// Builds `hello`'s device from this crate's tables, sending what the host writes to `out`.
 pub fn served(hello: &Hello, out: Outputs) -> Result<Served> {
     use crate::steam_proto::SteamModel;

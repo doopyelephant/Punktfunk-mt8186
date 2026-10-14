@@ -15,14 +15,13 @@ use super::switch2_proto::{
     REPORT_INTERVAL_MS, REPORT_LEN, VENDOR,
 };
 use super::usbip::{attach_device, boxed, ep, hid_class_descriptor, UsbipAttachment};
-use super::usbip_relay::{Hello, Incoming, Output, Outputs, Served, UsbKind};
+use super::usbip_relay::{one_report, Hello, Output, Outputs, Served, UsbKind};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
-use parking_lot::Mutex;
 use punktfunk_core::quic::{HidOutput, RichInput};
 use std::any::Any;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use usbip_sim::{
     Direction, SetupPacket, UsbDevice, UsbEndpoint, UsbInterface, UsbInterfaceHandler, UsbSpeed,
@@ -85,7 +84,7 @@ impl UsbInterfaceHandler for HidHandler {
         if let Direction::In = ep.direction() {
             self.seq = self.seq.wrapping_add(1);
             let clock = self.epoch.elapsed().as_micros() as u32;
-            let mut r = *self.report.lock();
+            let mut r = *self.report.lock().unwrap_or_else(|e| e.into_inner());
             stamp(&mut r, self.seq, clock);
             Ok(r.to_vec())
         } else {
@@ -197,22 +196,9 @@ fn build_device(
 /// The server's half: the device, and the pad's report `0x05` into interface 0 only.
 pub(crate) fn served(model: Model, index: u8, out: Outputs) -> Served {
     let report = Arc::new(Mutex::new(Switch2State::neutral().report(0, 0)));
-    let device = build_device(model, index, &report, out);
     Served {
-        device,
-        input: Box::new(move |message| {
-            if let Incoming::Input {
-                iface: HID,
-                report: r,
-            } = message
-            {
-                if let Ok(r) = <[u8; REPORT_LEN]>::try_from(r) {
-                    if r[0] == INPUT_REPORT_ID {
-                        *report.lock() = r;
-                    }
-                }
-            }
-        }),
+        device: build_device(model, index, &report, out),
+        input: one_report(report, HID, Some(INPUT_REPORT_ID)),
     }
 }
 

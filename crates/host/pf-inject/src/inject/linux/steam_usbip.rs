@@ -16,7 +16,7 @@ use super::steam_proto::{
 };
 use super::triton_proto::Sc2Identity;
 use super::usbip::{attach_device, boxed, ep, hid_class_descriptor, UsbipAttachment};
-use super::usbip_relay::{Hello, Incoming, Output, Outputs, Served, UsbKind};
+use super::usbip_relay::{one_report, Hello, Output, Outputs, Served, UsbKind};
 use anyhow::Result;
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -206,20 +206,9 @@ pub(crate) fn served(
         SteamModel::Controller => neutral_sc_report(),
     };
     let report = Arc::new(Mutex::new(rest));
-    let device = build_device(index, model, &report, out, identity.as_ref());
     Served {
-        device,
-        input: Box::new(move |message| {
-            if let Incoming::Input {
-                iface: CONTROLLER,
-                report: r,
-            } = message
-            {
-                if let Ok(r) = <[u8; 64]>::try_from(r) {
-                    *report.lock().unwrap_or_else(|e| e.into_inner()) = r;
-                }
-            }
-        }),
+        device: build_device(index, model, &report, out, identity.as_ref()),
+        input: one_report(report, CONTROLLER, None),
     }
 }
 

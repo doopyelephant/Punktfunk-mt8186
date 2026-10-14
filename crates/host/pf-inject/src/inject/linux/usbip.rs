@@ -123,14 +123,7 @@ impl ServerThread {
                         return;
                     }
                 };
-                rt.block_on(run_server(
-                    endpoint,
-                    Arc::new(UsbIpServer::new_simulated(vec![served.device])),
-                    served.input,
-                    relay,
-                    stop_t,
-                    label,
-                ));
+                rt.block_on(run_server(endpoint, served, relay, stop_t, label));
             })
             .context("spawn usbip server thread")?;
         Ok(ServerThread {
@@ -160,13 +153,13 @@ impl Drop for ServerThread {
 /// Ends when the host's connection or the pad's relay does.
 async fn run_server(
     endpoint: ServerEndpoint,
-    server: Arc<UsbIpServer>,
-    input: Box<dyn FnMut(Incoming<'_>) + Send>,
+    served: Served,
     relay: UnixDatagram,
     stop: Arc<tokio::sync::Notify>,
     label: String,
 ) {
-    let pad = pump_relay(relay, input);
+    let server = Arc::new(UsbIpServer::new_simulated(vec![served.device]));
+    let pad = pump_relay(relay, served.input);
     tokio::pin!(pad);
     let mut sock = match endpoint {
         ServerEndpoint::Connected(sock) => match sock

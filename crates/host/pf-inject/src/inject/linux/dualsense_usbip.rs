@@ -19,7 +19,7 @@ use super::dualsense_proto::{
     DUALSENSE_RDESC,
 };
 use super::usbip::{attach_device, boxed, ep, hid_class_descriptor, UsbipAttachment};
-use super::usbip_relay::{Hello, Incoming, Output, Outputs, Served, UsbKind};
+use super::usbip_relay::{one_report, Hello, Output, Outputs, Served, UsbKind};
 use anyhow::Result;
 use std::any::Any;
 use std::sync::mpsc::{sync_channel, Receiver};
@@ -460,22 +460,9 @@ fn build_device(
 /// The server's half: the device, and the pad's report `0x01` into interface 3 only.
 pub(crate) fn served(index: u8, out: Outputs) -> Served {
     let report = Arc::new(Mutex::new([0u8; DS_INPUT_REPORT_LEN]));
-    let device = build_device(index, &report, out);
     Served {
-        device,
-        input: Box::new(move |message| {
-            if let Incoming::Input {
-                iface: HID,
-                report: r,
-            } = message
-            {
-                if let Ok(r) = <[u8; DS_INPUT_REPORT_LEN]>::try_from(r) {
-                    if r[0] == INPUT_REPORT_ID {
-                        *report.lock().unwrap_or_else(|e| e.into_inner()) = r;
-                    }
-                }
-            }
-        }),
+        device: build_device(index, &report, out),
+        input: one_report(report, HID, Some(INPUT_REPORT_ID)),
     }
 }
 
