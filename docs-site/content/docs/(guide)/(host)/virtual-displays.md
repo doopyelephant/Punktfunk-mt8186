@@ -58,18 +58,20 @@ On gamescope the game keeps running as long as its screen does.
 - **Turn off**: the stream is the only screen until streaming ends.
 - **Automatic**: **Turn off**, or **Stay on** when `PUNKTFUNK_COMPOSITOR` pins a compositor.
 
-| | KWin | GNOME | Sway · Hyprland | Windows |
+| | KWin | GNOME | Sway · Hyprland · niri | Windows |
 |---|---|---|---|---|
 | Stay on | ✅ | ✅ | ✅ | ✅ |
 | Stay on, stream is main | ✅ | ✅ | acts as Stay on | ✅ |
 | Turn off | ✅ | ✅ | ✅ | ✅ |
 
-- **Sway and Hyprland** have no main screen. The host focuses the streamed screen at session start
+- **Sway, Hyprland and niri** have no main screen. The host focuses the streamed screen at session start
   and before each library launch; a window that opens later follows whatever has focus then.
 - **Hyprland** turns monitors back on with `hyprctl reload` when the screen is removed. That
   re-reads your config: changes made with `hyprctl keyword` are lost, and `exec =` lines run again.
-- **KWin, Sway and Hyprland** can keep chosen monitors lit under **Turn off**: set each to **Stay
-  on** on its row in **Screens**.
+- **niri** switches monitors off and on over its IPC when the screen is created and removed. If the
+  host dies first, its next start lights them again.
+- **KWin, Sway, Hyprland and niri** can keep chosen monitors lit under **Turn off**: set each to
+  **Stay on** on its row in **Screens**.
 - Punktfunk never turns off a screen it created, so a second device never goes dark.
 
 ### A second device connects
@@ -107,7 +109,7 @@ host** or an answer for this device only:
 - **Your monitors while streaming** (Linux hosts);
 - **Largest screen this device gets**, such as `2560x1440@60`. The device is told the smaller mode
   when it asks for more;
-- **Scale its screen at** (GNOME hosts): the starting scale, until you change the scale in the
+- **Scale its screen at** (GNOME and niri hosts): the starting scale, until you change the scale in the
   desktop. On KDE, set the scale in System Settings while the device streams; KDE keeps it for
   that device.
 
@@ -123,7 +125,8 @@ its own screen.
   apply.
 - The resolution is the monitor's; the client scales the picture.
 - Absolute mouse and pen input lands on that monitor.
-- Works on KWin, GNOME, Sway, Hyprland and gamescope Game Mode, with no chooser dialog. A nested or
+- Works on KWin, GNOME, Sway, Hyprland, niri (stock niri too) and gamescope Game Mode, with no
+  chooser dialog. A nested or
   headless gamescope has no monitor to list.
 - On Windows the pointer is part of the picture, and Windows permission prompts and the lock
   screen are not: the stream keeps showing the desktop behind a prompt, while your input goes to
@@ -219,6 +222,7 @@ Set scaling once while streaming and each device gets it back on the next connec
 | **Windows** | Set scaling in Settings while streaming; Windows remembers it per device. |
 | **KDE Plasma** | Set it in System Settings while streaming; KWin reapplies it per device. |
 | **GNOME** | Set it in Settings while streaming; the host saves it per device and reapplies it. |
+| **niri** | Pick **Scale its screen at** in the device's **Display settings…**; the screen starts at it. |
 | **Sway** | Not supported; set the scale in your sway config. |
 
 ## Troubleshooting

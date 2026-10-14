@@ -79,7 +79,7 @@ It opens the streaming ports on Public networks; the console's ports keep their 
 - [Black screen, but the client connects](/docs/troubleshooting-stream#black-screen--no-picture-but-the-client-connects)
 - [Black screen with sound (Windows)](/docs/troubleshooting-stream#black-screen-with-sound-windows)
 - [Capture fails: "Session creation inhibited" (GNOME)](/docs/troubleshooting-stream#capture-fails-session-creation-inhibited-gnome)
-- [Games open on a physical monitor, not on the stream (Hyprland, sway)](/docs/troubleshooting-stream#games-from-my-library-open-on-a-physical-monitor-not-on-the-stream-hyprland--sway)
+- [Games open on a physical monitor, not on the stream (Hyprland, sway, niri)](/docs/troubleshooting-stream#games-from-my-library-open-on-a-physical-monitor-not-on-the-stream-hyprland--sway--niri)
 - [Game Mode: black screen, or stuck at the box's resolution](/docs/troubleshooting-stream#game-mode-black-screen-on-connect-or-the-stream-is-stuck-at-the-boxs-resolution)
 - [The picture freezes for a moment, over and over (Windows)](/docs/troubleshooting-stream#the-picture-freezes-for-a-moment-over-and-over-windows)
 - [Stutter, drops, or high latency](/docs/troubleshooting-stream#stutter-drops-or-high-latency)

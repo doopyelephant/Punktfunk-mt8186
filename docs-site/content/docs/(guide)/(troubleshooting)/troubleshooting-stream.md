@@ -23,7 +23,7 @@ The host can't capture this session. Check:
 A locked GNOME session blocks capture. Turn the lock off:
 [GNOME → Do not lock the session](/docs/gnome#do-not-lock-the-session).
 
-### Games from my library open on a physical monitor, not on the stream (Hyprland / sway)
+### Games from my library open on a physical monitor, not on the stream (Hyprland / sway / niri)
 
 A new window opens on the focused monitor, and something took focus from the stream: a click on a
 physical monitor, or a launcher (Steam Big Picture, Heroic) that opens the game window later.

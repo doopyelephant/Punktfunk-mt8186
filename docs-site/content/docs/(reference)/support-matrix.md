@@ -35,8 +35,9 @@ Each session gets its own display at the client's resolution and refresh rate �
 | gamescope (SteamOS · Bazzite) | ✅ ³ | ⚠️ ⁴ | ✅ |
 | sway · scroll | ✅ ⁵ | ✅ | ⚠️ ⁶ |
 | Hyprland | ✅ | ✅ | ⚠️ ⁶ |
-| Cinnamon (Mint · LMDE) | ❌ ⁷ | ❌ | ❌ |
-| River, dwl, COSMIC, niri, others | ❌ ⁸ | ❌ | ❌ |
+| niri (biri) | ✅ ⁷ | ✅ | ❓ ⁸ |
+| Cinnamon (Mint · LMDE) | ❌ ⁹ | ❌ | ❌ |
+| River, dwl, COSMIC, others | ❌ ¹⁰ | ❌ | ❌ |
 
 1. Punktfunk's own display driver. Needs Windows 11 22H2 (build 22621); the installer refuses
    anything older. Each paired client gets its own monitor identity carrying its screen's HDR
@@ -50,9 +51,12 @@ Each session gets its own display at the client's resolution and refresh rate �
    hardware yet. See [Sway](/docs/sway).
 6. The host writes the portal's output-chooser config, so a box with nobody at it can answer
    "which output?".
-7. Cinnamon's compositor has no virtual-output API. A Mint or LMDE box can still stream games
+7. Needs [biri](/docs/niri#get-biri), a niri fork that adds virtual outputs. Stock niri can stream
+   only a monitor you pin. Driven over niri's IPC.
+8. Not run on a box with no monitor attached.
+9. Cinnamon's compositor has no virtual-output API. A Mint or LMDE box can still stream games
    through a headless gamescope — see [Requirements](/docs/requirements#cinnamon-linux-mint-and-lmde).
-8. No host backend. River is detected and takes input, but has no video path.
+10. No host backend. River is detected and takes input, but has no video path.
 
 ### Input, cursor and HDR
 
@@ -64,6 +68,7 @@ Each session gets its own display at the client's resolution and refresh rate �
 | gamescope | libei (gamescope's own) | none | ⚠️ ⁸ | ⚠️ ⁹ |
 | sway · scroll | wlroots virtual pointer + keyboard | none | ❌ ¹⁰ | ❌ ⁵ |
 | Hyprland | wlroots virtual pointer + keyboard | none | ❌ ¹⁰ | ❌ ⁵ |
+| niri (biri) | wlroots virtual pointer + keyboard | none | ❌ ¹² | ❌ ⁵ |
 
 1. The host must run in the signed-in console session, not session 0; the installed service
    starts it there. Over SSH you land in session 0 — see [Windows host](/docs/windows-host).
@@ -86,6 +91,7 @@ Each session gets its own display at the client's resolution and refresh rate �
 11. Mouse and keyboard reach Windows as a USB-style HID device, so games that refuse injected input
     take them. Text, touch and pen use `SendInput` and synthetic pointers. A seat host, and a point
     off the primary monitor, use `SendInput` too.
+12. The host doesn't carry niri's pointer separately, so it is always part of the video.
 
 ### Version floors worth knowing
 
@@ -97,6 +103,8 @@ Each session gets its own display at the client's resolution and refresh rate �
 - **sway 1.8** — removes headless outputs again on teardown.
 - **Hyprland** — no version gate. With `ecosystem.enforce_permissions` on (0.49+, off by default),
   grant the host `screencopy` — see [Hyprland](/docs/hyprland).
+- **biri built 2026-09-04 or later** — stock niri has no virtual outputs, and older biri builds
+  crash niri when an `off` virtual output is removed. See [niri](/docs/niri#get-biri).
 - **gamescope 3.16.22** — below it, headless capture deadlocks against PipeWire 1.6 and newer.
   **3.16.23** — below it, the Steam overlay never reaches the stream. The host warns but doesn't
   refuse.
@@ -332,8 +340,8 @@ Either side can be the reason one of these didn't happen:
   the client. Only the Apple app greys **Share Clipboard** out when the host hasn't offered it.
 - **Pen input** — the host offers it only with a usable `/dev/uinput` (Linux) or Windows 10 1809+.
   Without it, clients turn pen into touch.
-- **Committed text (IME)** — the Windows host and the wlroots backend (sway, scroll, Hyprland) type
-  any text. KDE, GNOME and gamescope fall back to key presses, which can't express every character.
+- **Committed text (IME)** — the Windows host and the wlroots backend (sway, scroll, Hyprland, niri)
+  type any text. KDE, GNOME and gamescope fall back to key presses, which can't express every character.
 - **Client-drawn cursor** — needs the client in desktop mouse mode and a host that carries the
   cursor separately ([table](#input-cursor-and-hdr)). Then the host stops drawing the pointer into
   the video.
@@ -378,6 +386,7 @@ SteamOS.
 ## What is not verified
 
 - **scroll as a host** — detected and driven like sway, not yet run on real hardware.
+- **niri (biri) as a host** — not yet run on real hardware.
 - **gamescope headless capture on the proprietary NVIDIA driver** — plausible, not well trodden,
   and no probe would catch it failing.
 - **Touch input from a Windows client** — the same code as Linux, not run on a Windows touchscreen.

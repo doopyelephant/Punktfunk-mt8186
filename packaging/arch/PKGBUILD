@@ -183,6 +183,7 @@ package_punktfunk-host() {
               # naming it, so a Hyprland box could install the host and find capture unavailable.
               'hyprland: stream a Hyprland desktop (headless-output backend) — Omarchy ships this'
               'xdg-desktop-portal-hyprland: ScreenCast portal for the Hyprland backend (REQUIRED to capture on Hyprland)'
+              'biri-git: niri host (virtual outputs)'
               'xdg-desktop-portal-kde: portal for the headless KDE session helper'
               'xdg-desktop-portal-wlr: portal for the headless Sway session helper'
               'punktfunk-web: browser management console (device pairing + status)'

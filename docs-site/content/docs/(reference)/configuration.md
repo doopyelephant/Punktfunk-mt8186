@@ -139,7 +139,7 @@ Desktop) and rewrites them on every connect.
 
 | Variable | Values | What it does |
 |---|---|---|
-| `PUNKTFUNK_COMPOSITOR` | `kwin` · `mutter` · `gamescope` · `wlroots` · `hyprland` (also `kde`, `plasma`, `gnome`, `sway`, `wlr`, `river`, `hypr`) | Pins the virtual-display backend and turns session following off, so a Game Mode ↔ Desktop switch ends the stream. For single-purpose appliances only. |
+| `PUNKTFUNK_COMPOSITOR` | `kwin` · `mutter` · `gamescope` · `wlroots` · `hyprland` · `niri` (also `kde`, `plasma`, `gnome`, `sway`, `wlr`, `river`, `hypr`, `biri`) | Pins the virtual-display backend and turns session following off, so a Game Mode ↔ Desktop switch ends the stream. For single-purpose appliances only. |
 | `PUNKTFUNK_INPUT_BACKEND` | `libei` · `kwin` · `gamescope` · `wlr` | Pins input injection. Detected with the compositor; an unknown value is ignored. |
 | `PUNKTFUNK_VIDEO_SOURCE` | `virtual` (default) · `portal` | Moonlight sessions only: `portal` streams an existing monitor, which the GNOME 50+ HDR mirror needs — see [HDR](/docs/hdr#linux--gnome). |
 | `PUNKTFUNK_CAPTURE_MONITOR` | connector name, e.g. `DP-2`; on Windows the display name, e.g. `\\.\DISPLAY1` | Linux and Windows: stream this physical monitor instead of a virtual display, overriding the console. `punktfunk-host list-monitors` lists the names; one that matches nothing fails the session. See [Virtual displays](/docs/virtual-displays#stream-a-real-monitor-instead). |
