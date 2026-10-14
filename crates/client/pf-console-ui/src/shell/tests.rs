@@ -494,21 +494,24 @@ fn down_from_a_card_lands_on_its_games_and_launches_there() {
     s.sync();
     assert!(fetched(&bus).is_empty(), "asked once");
 
-    library.set_games(vec![crate::library::LibraryGame {
-        id: "steam:570".into(),
-        title: "Dota 2".into(),
-        store: "steam".into(),
-        launcher: false,
-        icon: String::new(),
-        platform: None,
-        developer: None,
-        year: None,
-        genres: Vec::new(),
-        stats: None,
-        running: false,
-        endable: false,
-        install: None,
-    }]);
+    library.set_games(
+        &library.req(),
+        vec![crate::library::LibraryGame {
+            id: "steam:570".into(),
+            title: "Dota 2".into(),
+            store: "steam".into(),
+            launcher: false,
+            icon: String::new(),
+            platform: None,
+            developer: None,
+            year: None,
+            genres: Vec::new(),
+            stats: None,
+            running: false,
+            endable: false,
+            install: None,
+        }],
+    );
     frame(&mut s);
     let below = |s: &Shell| matches!(s.stack.last(), Some(Screen::Home(h)) if h.shelf().is_some());
     s.handle_menu(MenuEvent::Move(MenuDir::Down));
@@ -532,25 +535,55 @@ fn down_from_a_card_lands_on_its_games_and_launches_there() {
 #[test]
 fn a_fetch_clears_the_previous_hosts_list() {
     let (mut s, _console, library) = shell(vec![Screen::Home(HomeScreen::new())]);
-    library.set_games(vec![crate::library::LibraryGame {
-        id: "steam:570".into(),
-        title: "Dota 2".into(),
-        store: "steam".into(),
-        launcher: false,
-        icon: String::new(),
-        platform: None,
-        developer: None,
-        year: None,
-        genres: Vec::new(),
-        stats: None,
-        running: false,
-        endable: false,
-        install: None,
-    }]);
+    library.set_games(
+        &library.req(),
+        vec![crate::library::LibraryGame {
+            id: "steam:570".into(),
+            title: "Dota 2".into(),
+            store: "steam".into(),
+            launcher: false,
+            icon: String::new(),
+            platform: None,
+            developer: None,
+            year: None,
+            genres: Vec::new(),
+            stats: None,
+            running: false,
+            endable: false,
+            install: None,
+        }],
+    );
     s.sync();
     let snap = library.snapshot();
     assert!(matches!(snap.phase, crate::library::LibraryPhase::Loading));
     assert!(snap.games.is_empty());
+}
+
+/// The Games root opens its fetch on the model as it sends it: an answer that comes straight
+/// back lands, and nothing later in the press moves the model off that fetch.
+#[test]
+fn a_games_root_fetch_is_open_before_it_goes_out() {
+    let players = crate::screens::players::PlayersScreen::new();
+    let (mut s, _console, library) = shell(vec![Screen::Players(players)]);
+    s.handle_menu(MenuEvent::JumpBack);
+    let req = (s.bus.drain().into_iter())
+        .find_map(|c| match c {
+            ConsoleCmd::FetchLibrary { req, .. } => Some(req),
+            _ => None,
+        })
+        .expect("the Games root fetches its host's games");
+    assert_eq!(
+        library.req(),
+        req,
+        "the model is on the fetch that went out"
+    );
+    library.set_games(&req, Vec::new());
+    finish_motion(&mut s);
+    frame(&mut s);
+    assert!(matches!(
+        library.snapshot().phase,
+        crate::library::LibraryPhase::Empty
+    ));
 }
 
 /// A woken host connects once, though the service clears its status only at its next
@@ -560,6 +593,7 @@ fn a_woken_host_connects_once() {
     let host = hosts().remove(0);
     let (mut s, console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     console.set_wake(Some(crate::model::WakeStatus {
+        req: Default::default(),
         key: host.key.clone(),
         name: host.name.clone(),
         seconds: 12,
@@ -576,8 +610,8 @@ fn a_woken_host_connects_once() {
     assert_eq!(launches, 1);
 }
 
-/// A pairing result belongs to the host the PIN went to: another host's Pair screen on
-/// top neither shows it nor closes on it.
+/// A pairing result belongs to the Pair screen that sent its request: another host's Pair
+/// screen on top neither shows it nor closes on it.
 #[test]
 fn a_pairing_result_stays_with_its_own_host() {
     let rows = hosts();
@@ -586,15 +620,26 @@ fn a_pairing_result_stays_with_its_own_host() {
         Screen::Home(HomeScreen::new()),
         Screen::Pair(crate::screens::pair::PairScreen::new(&b, "deck")),
     ]);
-    s.pairing = Some((a.addr.clone(), a.port));
-    console.set_pair(PairPhase::Paired { key: a.key.clone() });
+    let paired = |req, key: &str| PairStatus {
+        req,
+        phase: PairPhase::Paired { key: key.into() },
+    };
+    let to_a = crate::model::RequestKey::new(&format!("{}:{}", a.addr, a.port));
+    console.set_pair(paired(to_a, &a.key));
     s.sync();
     assert!(
         matches!(s.stack.last(), Some(Screen::Pair(_))),
         "B's screen stays"
     );
-    s.pairing = Some((b.addr.clone(), b.port));
-    console.set_pair(PairPhase::Paired { key: b.key.clone() });
+    // Request access is B's first row.
+    s.handle_menu(MenuEvent::Confirm);
+    let asked = (s.bus.drain().into_iter())
+        .find_map(|c| match c {
+            ConsoleCmd::RequestAccess { req, .. } => Some(req),
+            _ => None,
+        })
+        .expect("B's screen sent its request");
+    console.set_pair(paired(asked, &b.key));
     s.sync();
     assert!(
         !matches!(s.stack.last(), Some(Screen::Pair(_))),
@@ -635,21 +680,24 @@ fn a_pinned_cards_library_launches_with_its_preset() {
         _ => panic!("Games on a pinned card opens its shelf"),
     }
 
-    library.set_games(vec![crate::library::LibraryGame {
-        id: "steam:570".into(),
-        title: "Dota 2".into(),
-        store: "steam".into(),
-        launcher: false,
-        icon: String::new(),
-        platform: None,
-        developer: None,
-        year: None,
-        genres: Vec::new(),
-        stats: None,
-        running: false,
-        endable: false,
-        install: None,
-    }]);
+    library.set_games(
+        &library.req(),
+        vec![crate::library::LibraryGame {
+            id: "steam:570".into(),
+            title: "Dota 2".into(),
+            store: "steam".into(),
+            launcher: false,
+            icon: String::new(),
+            platform: None,
+            developer: None,
+            year: None,
+            genres: Vec::new(),
+            stats: None,
+            running: false,
+            endable: false,
+            install: None,
+        }],
+    );
     // Down past the Desktops band, which arrives focused and launches nothing.
     s.handle_menu(MenuEvent::Move(MenuDir::Down));
     s.handle_menu(MenuEvent::Confirm);
@@ -673,21 +721,24 @@ fn a_primary_tiles_library_leaves_the_preset_to_the_binding() {
     s.sync();
     s.handle_menu(MenuEvent::JumpForward); // Games, on the focused host's shelf
     finish_motion(&mut s);
-    library.set_games(vec![crate::library::LibraryGame {
-        id: "steam:570".into(),
-        title: "Dota 2".into(),
-        store: "steam".into(),
-        launcher: false,
-        icon: String::new(),
-        platform: None,
-        developer: None,
-        year: None,
-        genres: Vec::new(),
-        stats: None,
-        running: false,
-        endable: false,
-        install: None,
-    }]);
+    library.set_games(
+        &library.req(),
+        vec![crate::library::LibraryGame {
+            id: "steam:570".into(),
+            title: "Dota 2".into(),
+            store: "steam".into(),
+            launcher: false,
+            icon: String::new(),
+            platform: None,
+            developer: None,
+            year: None,
+            genres: Vec::new(),
+            stats: None,
+            running: false,
+            endable: false,
+            install: None,
+        }],
+    );
     s.handle_menu(MenuEvent::Confirm);
     assert!(matches!(
         s.take_action(),
@@ -727,6 +778,7 @@ fn a_on_a_takeover_leaves_the_screen_under_it_still() {
     let (mut s, console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.strip_focus = true;
     console.set_wake(Some(WakeStatus {
+        req: Default::default(),
         key: host.key.clone(),
         name: host.name.clone(),
         seconds: 30,
@@ -1020,8 +1072,8 @@ fn a_search_and_its_empty_result_raster() {
         Screen::Home(HomeScreen::new()),
         Screen::Search(search),
     ]);
-    library.set_games(Vec::new());
-    library.set_phase(crate::library::LibraryPhase::Ready);
+    library.set_games(&library.req(), Vec::new());
+    library.set_phase(&library.req(), crate::library::LibraryPhase::Ready);
     let mut frame = |s: &mut Shell| s.render(surface.canvas(), 1280, 800, &fonts, None, None, &[]);
     for _ in 0..3 {
         frame(&mut s);
@@ -1541,14 +1593,17 @@ fn mixed_library(library: &LibraryShared) {
             install: None,
         }
     };
-    library.set_games(vec![
-        g("l1", "Steam Big Picture", "steam", None, true),
-        g("s1", "Dota 2", "steam", None, false),
-        g("s2", "Half-Life", "steam", None, false),
-        g("p1", "Demon's Souls", "custom", Some("PS3"), false),
-        g("p2", "The Last of Us", "custom", Some("PS3"), false),
-        g("n1", "Super Metroid", "custom", Some("SNES"), false),
-    ]);
+    library.set_games(
+        &library.req(),
+        vec![
+            g("l1", "Steam Big Picture", "steam", None, true),
+            g("s1", "Dota 2", "steam", None, false),
+            g("s2", "Half-Life", "steam", None, false),
+            g("p1", "Demon's Souls", "custom", Some("PS3"), false),
+            g("p2", "The Last of Us", "custom", Some("PS3"), false),
+            g("n1", "Super Metroid", "custom", Some("SNES"), false),
+        ],
+    );
 }
 
 /// OK on a Collections tile opens that platform's shelf; Back returns to the tab.
@@ -2342,7 +2397,7 @@ fn dump_phone_home() {
             install: None,
         })
         .collect();
-    library.set_games(games);
+    library.set_games(&library.req(), games);
     dump(&mut s, 60, "p2-home-games");
     s.handle_menu(MenuEvent::Move(MenuDir::Down));
     dump(&mut s, 60, "p3-home-down");

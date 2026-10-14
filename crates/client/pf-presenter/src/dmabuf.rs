@@ -142,9 +142,10 @@ fn crop_scale(width: u32, height: u32, coded_width: u32, coded_height: u32) -> [
     ]
 }
 
-/// Frame bound to its cached plane images. GPU reads outlive submit: park until
-/// the fence signals, then [`HwFrame::destroy`] (drops the decoder surface guard;
-/// the images stay in [`ImportCache`]).
+/// Frame bound to its cached plane images. It owns no Vulkan object: the images are
+/// [`ImportCache`]'s and the semaphores [`SyncImport`]'s. Dropping it hands the decoder
+/// surface back, so a frame dropped before its submit leaks nothing; a submitted one is
+/// parked until its fence proves the GPU's reads done.
 pub struct HwFrame {
     pub luma_view: vk::ImageView,
     pub chroma_view: vk::ImageView,
@@ -189,12 +190,6 @@ impl HwFrame {
     /// The decoder pool this frame's surface belongs to.
     pub fn generation(&self) -> u64 {
         self.generation
-    }
-
-    /// Release the decoder surface. The plane images belong to the cache, so
-    /// nothing Vulkan is destroyed here. Only after the frame's fence signaled.
-    pub fn destroy(self, _device: &ash::Device) {
-        // `_guard` drops after the GPU reads: the VAAPI surface stays mapped until here.
     }
 }
 

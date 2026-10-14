@@ -87,6 +87,10 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
     var fetching: Task<Void, Never>?
     /// Bumped by each list fetch. A running-titles answer from before it is another host's.
     var fetchSerial = 0
+    /// The last `FetchLibrary`'s host and `req`: that shelf's list and phase go up under it.
+    var fetchReq: (fp: String, req: Any) = ("", ConsoleJSON.unasked)
+    /// The console's `Wake` in flight: the row it woke and its `req`.
+    var wakeReq: (key: String, req: Any)?
     /// The posters of the last list fetch; a new fetch cancels it.
     var artTask: Task<Void, Never>?
     /// Titles the current list fetch already has a poster for.

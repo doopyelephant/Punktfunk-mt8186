@@ -871,13 +871,13 @@ impl KeyframeGate {
 
 /// ±10 % of [`FLUSH_COOLDOWN`]: a software cooldown is the most periodic thing in the system.
 fn matches_client_flush_cadence(period: std::time::Duration) -> bool {
-    let flush = punktfunk_core::client::FLUSH_COOLDOWN;
+    let flush = punktfunk_core::reanchor::FLUSH_COOLDOWN;
     period.abs_diff(flush) < flush / 10
 }
 
 /// ±10 % of [`NO_VIDEO_RETRY`]. Opposite fault from flush cadence; only the delivery count tells which.
 fn matches_client_no_video_cadence(period: std::time::Duration) -> bool {
-    let no_video = punktfunk_core::client::NO_VIDEO_RETRY;
+    let no_video = punktfunk_core::reanchor::NO_VIDEO_RETRY;
     period.abs_diff(no_video) < no_video / 10
 }
 
@@ -1019,7 +1019,7 @@ mod tests {
     /// test derives its cases from `FLUSH_COOLDOWN` instead of hardcoding two seconds.
     #[test]
     fn a_recovery_cadence_on_the_clients_cooldown_is_not_blamed_on_the_display() {
-        let flush = punktfunk_core::client::FLUSH_COOLDOWN;
+        let flush = punktfunk_core::reanchor::FLUSH_COOLDOWN;
         assert!(matches_client_flush_cadence(flush), "the field reading");
         assert!(matches_client_flush_cadence(flush + flush / 20));
         assert!(matches_client_flush_cadence(flush - flush / 20));
@@ -1211,8 +1211,8 @@ mod tests {
 
     #[test]
     fn the_two_client_cooldowns_are_distinguishable_and_both_excluded_from_display_blame() {
-        let flush = punktfunk_core::client::FLUSH_COOLDOWN;
-        let no_video = punktfunk_core::client::NO_VIDEO_RETRY;
+        let flush = punktfunk_core::reanchor::FLUSH_COOLDOWN;
+        let no_video = punktfunk_core::reanchor::NO_VIDEO_RETRY;
         assert_ne!(
             flush, no_video,
             "identical cooldowns make the host's verdict a coin flip"

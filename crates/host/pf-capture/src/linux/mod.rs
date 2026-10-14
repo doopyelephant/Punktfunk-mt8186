@@ -140,6 +140,30 @@ impl CaptureSignals {
             importer_in_process: Arc::new(AtomicBool::new(false)),
         }
     }
+
+    /// A dmabuf frame this capture publishes. The hold is not optional: capture never publishes
+    /// a buffer the producer may rewrite while the encoder reads it.
+    fn held_dmabuf(
+        &self,
+        fd: std::os::fd::OwnedFd,
+        fourcc: u32,
+        modifier: u64,
+        (offset, stride): (u32, u32),
+        plane1: Option<(u32, u32)>,
+        hold: pf_frame::FrameHold,
+    ) -> pf_frame::DmabufFrame {
+        pf_frame::DmabufFrame {
+            fd,
+            fourcc,
+            modifier,
+            plane1,
+            offset,
+            stride,
+            hold: Some(hold),
+            health: self.health.clone(),
+            rebuild: self.broken.clone(),
+        }
+    }
 }
 
 // ScreenCast/RemoteDesktop handshake + GNOME colour-mode probe. Async,

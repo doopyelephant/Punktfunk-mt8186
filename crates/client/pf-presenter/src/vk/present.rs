@@ -18,11 +18,14 @@
 
 use super::gpu::*;
 use super::present_timing::SLICE_NS;
-use super::{BusyOn, DirectLast, DirectSrc, FrameInput, Presented, Presenter, Retired, VideoImage};
+use super::{
+    BusyOn, DirectLast, DirectSrc, FrameInput, Held, Presented, Presenter, Retired, VideoImage,
+};
 use crate::csc::csc_rows;
 #[cfg(target_os = "linux")]
 use crate::dmabuf::{self, HwFrame};
 use crate::overlay::OverlayFrame;
+use crate::swapchain_state::Entry;
 use anyhow::{Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
@@ -226,15 +229,12 @@ impl Presenter {
         if self.extent.width == 0 || self.extent.height == 0 {
             return Ok(Presented::Shown); // minimized: not Stale (Stale recreates)
         }
-        // While the native lane owns the window a swapchain redraw would paint over the
-        // picture (and has no swapchain to paint into); a real frame takes the window back.
-        if self.native_last || self.suspended {
-            if matches!(input, FrameInput::Redraw) {
-                return Ok(Presented::Shown);
-            }
-            self.native_last = false;
-            #[cfg(target_os = "linux")]
-            if self.suspended {
+        match self.state.enter(matches!(input, FrameInput::Redraw)) {
+            Entry::Draw => {}
+            Entry::Skip => return Ok(Presented::Shown),
+            // Only the Linux lane takes the window.
+            Entry::Resume => {
+                #[cfg(target_os = "linux")]
                 self.resume_swapchain(window)?;
             }
         }
@@ -245,15 +245,16 @@ impl Presenter {
         self.follow_hdr(window, &input)?;
         let redraw = matches!(input, FrameInput::Redraw);
         // Import before acquire: a rejected import must not consume the acquire semaphore.
+        // An error before `park` drops `lane` unsubmitted, which releases its decoder slot.
         let lane = self.import(input)?;
         self.wait_fence()?;
         // Acquire before `retire`: an out-of-date swapchain drops this frame, and the next
         // `Redraw` must still replay the last one.
         let Some(index) = self.acquire()? else {
-            // Acquire failed: GPU never saw the import; destroy it here.
+            // The GPU never saw the import: its VAAPI surface goes back before the recreate.
             #[cfg(target_os = "linux")]
             if let Lane::Dmabuf(f) = lane {
-                f.destroy(&self.device);
+                drop(f);
             }
             self.recreate_swapchain(window)?;
             return Ok(Presented::Stale);
@@ -290,7 +291,7 @@ impl Presenter {
         // SAFETY: `cmd_buf` holds the recording ended above, `fence` was reset by
         // `wait_fence`, and `acquire` took image `index` on `acquire_sem`.
         unsafe { self.submit(&lane, &plan, native_wait)? };
-        self.park(lane);
+        self.park(lane, plan.last.filter(|_| plan.direct.is_some()));
         // SAFETY: the submit above signals `render_sems[index]`.
         unsafe { self.queue_present(window, index, redraw) }
     }
@@ -311,7 +312,7 @@ impl Presenter {
         if !nonblocking {
             return Ok(ControlFlow::Continue(input));
         }
-        if self.submitted {
+        if self.state.submitted {
             // SAFETY: `fence` is owned here; a bounded wait is always legal.
             match unsafe { self.device.wait_for_fences(&[self.fence], true, 1_000_000) } {
                 Ok(()) => {}
@@ -321,7 +322,7 @@ impl Presenter {
                 Err(e) => return Err(e).context("vkWaitForFences"),
             }
         }
-        if self.acquired.is_none() {
+        if self.state.acquired.is_none() {
             // The non-blocking probe runs only without a present waiter: no swapchain lock.
             // SAFETY: `swapchain`/`acquire_sem` are owned. No image is held, so every wait
             // on `acquire_sem` is complete: a present's by its fence (checked above), a
@@ -334,7 +335,7 @@ impl Presenter {
                     vk::Fence::null(),
                 )
             } {
-                Ok((index, _)) => self.acquired = Some(index),
+                Ok((index, _)) => self.state.acquired = Some(index),
                 Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
                     return Ok(ControlFlow::Break(Presented::Busy(input, BusyOn::Acquire)));
                 }
@@ -386,9 +387,9 @@ impl Presenter {
         // SAFETY: `fence` is owned here. `submitted` means the last `queue_submit`
         // named it; wait idles that submit, then reset is legal.
         unsafe {
-            if self.submitted {
+            if self.state.submitted {
                 self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-                self.submitted = false;
+                self.state.submitted = false;
             }
             self.device.reset_fences(&[self.fence])?;
         }
@@ -402,7 +403,7 @@ impl Presenter {
     /// it for the next present, or for `recreate_swapchain` to retire.
     fn acquire(&mut self) -> Result<Option<u32>> {
         let started = std::time::Instant::now();
-        let acquired = match self.acquired {
+        let acquired = match self.state.acquired {
             Some(index) => Ok((index, false)),
             None => {
                 // With a present waiter, each call holds the swapchain for one bounded slice.
@@ -436,7 +437,7 @@ impl Presenter {
             | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => return Ok(None),
             Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
         };
-        self.acquired = Some(index);
+        self.state.acquired = Some(index);
         self.last_acquire_us = started.elapsed().as_micros() as u32;
         Ok(Some(index))
     }
@@ -446,9 +447,7 @@ impl Presenter {
     /// frame, whose fence covers the redraw's reads too.
     fn retire(&mut self, lane: &Lane) {
         if !matches!(lane, Lane::Redraw) {
-            if let Some(old) = self.retired_hw.take() {
-                old.destroy(&self.device);
-            }
+            self.retired_hw = None;
         }
         // Nothing is in flight past the fence wait: imports of a superseded ring
         // generation can go now.
@@ -500,7 +499,8 @@ impl Presenter {
     /// blit exactly. Both shader paths draw through the overlay's framebuffers, so those
     /// must exist. Direct CSC into the swapchain image takes the whole picture at an exact
     /// scale, from a lane that samples on this device; everything else takes the video
-    /// image. A real frame records what it drew direct for the next `Redraw`.
+    /// image. A real frame from the CPU planes records what it drew direct for the next
+    /// `Redraw`; a hardware frame carries that into `park`.
     fn plan(&mut self, lane: &Lane, index: u32) -> Result<FramePlan> {
         let redraw = matches!(lane, Lane::Redraw);
         #[cfg(windows)]
@@ -563,7 +563,7 @@ impl Presenter {
             _ => None,
         };
         if !redraw {
-            self.direct_last = last.filter(|_| direct.is_some());
+            self.cpu_direct = last.filter(|l| direct.is_some() && l.src == DirectSrc::Cpu);
         }
         if let (Some((_, w, h)), Some(p)) = (source, placement) {
             // A D3D11 RGB ring slot is imported TRANSFER_SRC only, so a fractional scale of it
@@ -592,18 +592,15 @@ impl Presenter {
     }
 
     /// The planes this frame's CSC samples and how. A `Redraw` replays the last direct
-    /// frame's while the frame behind them is still held. `None`: a D3D11 slot, or nothing
-    /// to replay.
+    /// frame's: the held frame's own, or the CPU planes' while they exist. `None`: a D3D11
+    /// slot, or nothing to replay.
     fn sampled_planes(&self, lane: &Lane) -> Option<DirectLast> {
         match lane {
-            Lane::Redraw => self.direct_last.filter(|l| match l.src {
-                DirectSrc::Native => matches!(self.retired_hw, Some(Retired::NativeVk(_))),
-                #[cfg(target_os = "linux")]
-                DirectSrc::Dmabuf => matches!(self.retired_hw, Some(Retired::Dmabuf(_))),
-                DirectSrc::Cpu => self.cpu_planes.is_some(),
-                #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-                DirectSrc::Pyro => matches!(self.retired_hw, Some(Retired::Pyro(_))),
-            }),
+            Lane::Redraw => self
+                .retired_hw
+                .as_ref()
+                .and_then(|h| h.direct)
+                .or(self.cpu_direct.filter(|_| self.cpu_planes.is_some())),
             // Depth/packing from the picture format (can change mid-stream): 8-bit math
             // over P010 decodes and displays the wrong range. `uv_scale` is picture/coded
             // so a taller decode pool does not show.
@@ -892,7 +889,11 @@ impl Presenter {
         unsafe {
             match l.src {
                 DirectSrc::Native => {
-                    if let Some(Retired::NativeVk(f)) = &self.retired_hw {
+                    if let Some(Held {
+                        frame: Retired::NativeVk(f),
+                        ..
+                    }) = &self.retired_hw
+                    {
                         self.record_native(f, plan);
                     }
                 }
@@ -1251,8 +1252,7 @@ impl Presenter {
         if let Lane::Pyro(f) = lane {
             self.queue_lock.end_present_turn(f.turn);
         }
-        self.submitted = true;
-        self.acquired = None;
+        self.state.on_submit();
         // A real frame from any other lane ends the D3D11 picture; `Redraw` keeps it.
         #[cfg(windows)]
         {
@@ -1261,14 +1261,15 @@ impl Presenter {
         Ok(())
     }
 
-    /// Park the submitted hardware frame until the fence proves its reads done (next
-    /// present's wait, or Drop). A D3D11 slot stays in the import cache. A `Redraw` keeps
-    /// the parked frame: it read it again. Only after a submit that succeeded.
-    fn park(&mut self, lane: Lane) {
+    /// Park the submitted hardware frame, with what the direct pass drew from it, until
+    /// the fence proves its reads done (next present's wait, or Drop). A D3D11 slot stays
+    /// in the import cache. A `Redraw` keeps the parked frame: it read it again. Only
+    /// after a submit that succeeded.
+    fn park(&mut self, lane: Lane, direct: Option<DirectLast>) {
         if matches!(lane, Lane::Redraw) {
             return;
         }
-        self.retired_hw = match lane {
+        let frame = match lane {
             #[cfg(target_os = "linux")]
             Lane::Dmabuf(f) => Some(Retired::Dmabuf(f)),
             // Submit enqueued `value + 1` — `mark_presented` so the decoder waits
@@ -1282,6 +1283,7 @@ impl Presenter {
             Lane::Pyro(f) => Some(Retired::Pyro(f)),
             _ => None,
         };
+        self.retired_hw = frame.map(|frame| Held { frame, direct });
     }
 
     /// Present image `index` under the next present id, asking for a timing stamp while the
@@ -1308,7 +1310,7 @@ impl Presenter {
         let ask = self
             .timing
             .as_ref()
-            .filter(|t| self.timing_armed && t.may_ask());
+            .filter(|t| self.state.timing_armed && t.may_ask());
         let timing_info = ask.map_or_else(
             || super::timing_ext::TimingInfo::stamps(0, 0),
             |t| t.request(),
@@ -1359,7 +1361,7 @@ impl Presenter {
                 if self.glass_active() {
                     self.last_presented = Some((self.swapchain, self.next_present_id));
                 }
-                self.timing_asked = asked;
+                self.state.timing_asked = asked;
                 if let Some(t) = self.timing.as_ref().filter(|_| asked) {
                     t.note_asked();
                 }
@@ -1370,7 +1372,7 @@ impl Presenter {
             Err(super::timing_ext::QUEUE_FULL) => {
                 tracing::warn!("present stamp queue full; presenting without stamps");
                 self.timing = None;
-                self.timing_armed = false;
+                self.state.timing_armed = false;
                 self.recreate_swapchain(window)?;
                 Ok(Presented::Stale)
             }

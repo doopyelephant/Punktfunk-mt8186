@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::fake::{Call, FakeDisplay};
+use crate::topology_journal::{Head, Undo};
 use crate::{registry, DisplayOwnership};
 
 const MODE: Mode = Mode {
@@ -161,22 +162,38 @@ fn a_group_hands_its_restore_to_the_member_that_outlives_it() {
     });
 }
 
-/// Two members that each disabled heads: both restores have run once the group is empty.
+/// Two members that each disabled heads: both undos run, newest first, once the group is
+/// empty, and before the last output goes.
 #[test]
-#[ignore = "known gap: the hand-off overwrites the restore its heir already holds"]
-fn a_group_runs_every_restore_its_members_prepared() {
-    let name = "a_group_runs_every_restore_its_members_prepared";
+fn a_group_runs_every_undo_its_members_journaled() {
+    let name = "a_group_runs_every_undo_its_members_journaled";
     in_child(name, &[], || {
-        let fake = restoring("kwin");
+        let heads = |name: &str| Undo::EnableHeads {
+            heads: vec![Head {
+                name: name.into(),
+                mode: None,
+            }],
+        };
+        let fake = FakeDisplay::new("kwin");
+        fake.serve_by_name();
+        fake.script(|s| s.undo = Some(heads("DP-1")));
         let first = acquire(&fake, MODE, false);
         // A head was lit again in between, so this create disables one too.
+        fake.script(|s| s.undo = Some(heads("HDMI-A-1")));
         let second = acquire(&fake, MODE, false);
+        fake.take_calls();
+
         drop(second);
+        assert_eq!(fake.take_calls(), [Call::KeepaliveDropped(2)]);
         drop(first);
-        let calls = fake.take_calls();
-        for restore in [Call::RestoreRan(1), Call::RestoreRan(2)] {
-            assert!(calls.contains(&restore), "no {restore:?} in {calls:?}");
-        }
+        assert_eq!(
+            fake.take_calls(),
+            [
+                Call::Undo(heads("HDMI-A-1")),
+                Call::Undo(heads("DP-1")),
+                Call::KeepaliveDropped(1)
+            ]
+        );
     });
 }
 

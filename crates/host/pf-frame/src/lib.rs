@@ -447,6 +447,9 @@ pub struct DmabufFrame {
 pub enum FramePayload {
     /// Tightly-packed CPU pixels in `format`, `width*height*bytes_per_pixel` (no row padding).
     Cpu(Vec<u8>),
+    /// No pixels: the encoder already holds the picture (the IDD driver, or a capture worker).
+    /// The loop asks it what access units it owes instead of submitting the frame.
+    Pixelless,
     /// Pitched BGRA on the shared CUDA context. Dmabuf already imported into this owned buffer.
     #[cfg(target_os = "linux")]
     Cuda(pf_zerocopy::DeviceBuffer),

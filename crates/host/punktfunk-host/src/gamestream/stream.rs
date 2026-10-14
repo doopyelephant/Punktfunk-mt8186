@@ -15,7 +15,12 @@ use crate::capture::{self, Capturer, FastSyntheticCapturer};
 use crate::encode::{self, Codec};
 use crate::encode_recovery::{
     on_submit_error, reset_stalled_encoder, run_parked_stage, EncoderWatchdog, RebuildBudget,
-    MAX_CAPTURE_REBUILDS, MAX_ENCODER_RESETS,
+    MAX_ENCODER_RESETS,
+};
+use crate::native::pipeline::{
+    count_capture_loss, encoder_bps_for_budget, follow_source_mode, open_session_encoder,
+    rebuild_after_capture_loss, session_client_label, CaptureLossRebuild, SourceFollow,
+    WireFraming,
 };
 use anyhow::{Context, Result};
 use std::net::UdpSocket;
@@ -37,8 +42,8 @@ pub struct StreamConfig {
     /// Client asked for HDR (`dynamicRangeMode != 0`) and the host can deliver it.
     /// Encoder picks Main10 from the captured (P010) format. Always `false` on SDR hosts.
     pub hdr: bool,
-    /// Client's `x-nv-video[0].videoEncoderSlicesPerFrame`. Hardware TV decoders wedge on
-    /// multi-slice AUs they did not request. Absent ⇒ 1.
+    /// Client's `x-nv-video[0].videoEncoderSlicesPerFrame`, the session's slice count. Hardware
+    /// TV decoders wedge on multi-slice AUs they did not request. Absent ⇒ 1.
     pub slices: u32,
     /// Client echoed `SS_ENC_VIDEO`; shards are AES-128-GCM-sealed under the `/launch` rikey.
     /// Only true when the host advertised the bit (`gs_video_encryption_offered`).
@@ -170,14 +175,7 @@ pub fn start(
                     // reads here exactly as `/cancel` does.
                     life: lifecycle.clone(),
                     force_idr: force_idr.clone(),
-                    // The 12-hex prefix native uses, so one device reads the same on both planes
-                    // — and unpairing it mid-stream finds this session too.
-                    client: life
-                        .fingerprint
-                        .as_deref()
-                        .map(|fp| fp[..12.min(fp.len())].to_string())
-                        .or_else(|| life.owner_ip.map(|ip| ip.to_string()))
-                        .unwrap_or_default(),
+                    client: session_client_label(life.fingerprint.as_deref(), life.owner_ip),
                     client_name: (!client_label.is_empty()).then(|| client_label.clone()),
                     plane: crate::events::Plane::Gamestream,
                     hdr: cfg.hdr,
@@ -432,29 +430,41 @@ fn run(
         // The output the stream captures now, for a re-attach after a loss that leaves it up.
         #[cfg(target_os = "linux")]
         let attached = std::cell::RefCell::new((compositor, gamescope_route.clone(), lease));
-        // A handed-back keepalive re-attaches to its output first: on KWin every create is a new
-        // virtual output, and a burst of them wedges the compositor. Otherwise re-detect the live
+        // A handed-back keepalive re-attaches to its output: on KWin every create is a new
+        // virtual output, and a burst of them wedges the compositor. `None` re-detects the live
         // compositor so a Desktop↔Game switch is followed. WxH is locked at ANNOUNCE.
         let rebuild = |keepalive: Option<Box<dyn Send>>| {
-            #[cfg(target_os = "linux")]
             if let Some(keepalive) = keepalive {
-                let (c, route, lease) = attached.borrow().clone();
-                if let Some(lease) = lease {
-                    match gs_capture_output(lease.into_output(keepalive), &cfg, c, route.as_ref()) {
+                #[cfg(target_os = "linux")]
+                {
+                    let (c, route, lease) = attached.borrow().clone();
+                    let lease = lease.context("no output to re-attach to")?;
+                    return match gs_capture_output(
+                        lease.into_output(keepalive),
+                        &cfg,
+                        c,
+                        route.as_ref(),
+                    ) {
                         Ok(capturer) => {
                             tracing::info!(
-                                "gamestream: capture loss — re-attached to the live output, no new \
-                                 display"
+                                "gamestream: capture loss — re-attached to the live output, no \
+                                 new display"
                             );
-                            return Ok((capturer, gs_cursor_blend(c, route.as_ref(), &cfg)));
+                            Ok((capturer, gs_cursor_blend(c, route.as_ref(), &cfg)))
                         }
-                        Err(e) => tracing::warn!(error = %format!("{e:#}"),
-                            "gamestream: re-attach to the live output failed — creating another"),
-                    }
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"),
+                                "gamestream: re-attach to the live output failed — creating another");
+                            Err(e)
+                        }
+                    };
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    drop(keepalive);
+                    anyhow::bail!("no output to re-attach to");
                 }
             }
-            #[cfg(not(target_os = "linux"))]
-            let _ = keepalive;
             let s = open_gs_virtual_source(cfg, app, target.as_ref(), &life.quit, false)?;
             let blend = gs_cursor_blend(s.compositor, s.route.as_ref(), &cfg);
             #[cfg(target_os = "linux")]
@@ -669,46 +679,37 @@ fn resolve_gs_app(app: Option<&super::apps::AppEntry>) -> Option<crate::library:
     })
 }
 
-/// Cursor-as-metadata only where the encoder composites `frame.cursor` and the compositor
-/// cannot embed the pointer itself. Gamescope carries no metadata cursor either way. Shared by
-/// `set_hw_cursor`, the pooled mirror and [`gs_cursor_blend`] so they cannot drift.
+/// Cursor-as-metadata where the encoder draws the pointer and the compositor is not gamescope,
+/// which carries no metadata cursor either way. Shared by `set_hw_cursor` and the pooled
+/// mirror.
 fn host_composites_metadata_cursor(
     compositor: crate::vdisplay::Compositor,
     cfg: &StreamConfig,
 ) -> bool {
-    compositor != crate::vdisplay::Compositor::Gamescope
-        && !crate::session_plan::compositor_embeds_pointer(compositor)
-        && blend_capable_metadata_cursor(cfg)
+    compositor != crate::vdisplay::Compositor::Gamescope && gs_cursor_blend(compositor, None, cfg)
 }
 
-/// The encoder draws the pointer: a metadata cursor the compositor cannot embed, or gamescope's
-/// XFixes pointer when its node carries none. One rule for the plan, the reader and `stream_body`.
+/// [`cursor_blend_for`](crate::session_plan::cursor_blend_for) at this plane's shape: no
+/// cursor channel, depth 10 only with HDR.
 fn gs_cursor_blend(
     compositor: crate::vdisplay::Compositor,
     route: Option<&crate::vdisplay::GamescopeRoute>,
     cfg: &StreamConfig,
 ) -> bool {
-    host_composites_metadata_cursor(compositor, cfg)
-        || crate::session_plan::gamescope_cursor_for(
-            compositor == crate::vdisplay::Compositor::Gamescope,
-            route,
-        )
+    crate::session_plan::cursor_blend_for(
+        false,
+        compositor,
+        cfg.codec,
+        if cfg.hdr { 10 } else { 8 },
+        cfg.hdr,
+        route,
+    )
 }
 
-/// Cursor-as-metadata only where this session's encode backend composites `frame.cursor`.
-/// The answer when no compositor is known; [`host_composites_metadata_cursor`] adds the
-/// compositor. GameStream has no cursor channel.
+/// Cursor-as-metadata where this session's encode backend composites `frame.cursor`: the
+/// answer when no compositor is known.
 fn blend_capable_metadata_cursor(cfg: &StreamConfig) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
-        crate::encode::cursor_blend_capable(cfg.codec, cuda_planned, cfg.hdr, cfg.hdr)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = cfg;
-        false
-    }
+    crate::session_plan::encoder_blends_cursor(cfg.codec, if cfg.hdr { 10 } else { 8 }, cfg.hdr)
 }
 
 /// An opened virtual source.
@@ -839,8 +840,10 @@ fn gs_capture_output(
     Ok(capturer)
 }
 
-/// Shared [`SessionPlan`](crate::session_plan::SessionPlan) at this plane's shape: 4:2:0,
-/// depth 10 only with HDR, no cursor-forward (GameStream has no client cursor channel).
+/// Shared [`SessionPlan`](crate::session_plan::SessionPlan) at this plane's shape: 4:2:0 (stock
+/// Moonlight cannot decode 4:4:4), depth 10 only with HDR, no cursor-forward (GameStream has no
+/// client cursor channel), and exactly the slices the client asked for: a TV decoder wedges on
+/// more.
 fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_plan::SessionPlan {
     crate::session_plan::SessionPlan::resolve(
         if cfg.hdr { 10 } else { 8 },
@@ -849,15 +852,13 @@ fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_pla
         cfg.codec,
         cursor_blend,
         false,
-        cfg.slices > 1,
+        cfg.slices,
     )
 }
 
-/// The session's encoder for `frame` — at the client's size when a larger head is mirrored
-/// (`session_plan::open_encoder_fitted`) — bounded by the capturer's ring depth. An IDD-push
-/// source has no pixels to submit — the driver encodes — so it gets the driver's encoder, which
-/// then owes access units through `ready_aus`; its wire domain continues at `wire_seq_base` (the
-/// loop's `au_seq`).
+/// [`open_session_encoder`] for `frame` at the client's negotiated size, rate and depth. An
+/// IDD-push source gets the driver's encoder, which then owes access units through
+/// `ready_aus`; its wire domain continues at `wire_seq_base` (the loop's `au_seq`).
 fn gs_open_encoder(
     plan: &crate::session_plan::SessionPlan,
     capturer: &dyn Capturer,
@@ -866,40 +867,17 @@ fn gs_open_encoder(
     enc_bps: u64,
     wire_seq_base: u32,
 ) -> Result<Box<dyn encode::Encoder>> {
-    let mut enc = if plan.capture.encodes_remotely() {
-        crate::windows::idd::open_driver_encoder(
-            plan,
-            capturer,
-            (frame.width, frame.height),
-            cfg.fps,
-            enc_bps,
-            gs_bit_depth(frame.format),
-            None,
-            wire_seq_base,
-        )?
-    } else {
-        crate::session_plan::open_encoder_fitted(frame, (cfg.width, cfg.height), None, |w, h| {
-            encode::open_video(
-                cfg.codec,
-                frame.format,
-                w,
-                h,
-                cfg.fps,
-                enc_bps,
-                frame.is_cuda(),
-                gs_bit_depth(frame.format),
-                cfg.hdr,
-                // Stock Moonlight cannot decode 4:4:4.
-                encode::ChromaFormat::Yuv420,
-                plan.cursor_blend,
-                cfg.slices,
-            )
-        })?
-        .0
-    };
-    // Without this, an in-place backend bounds itself by an env cap and the capturer rotates
-    // a texture out from under a live encode — torn frames, never an error.
-    enc.set_input_ring_depth(capturer.pipeline_depth().max(1));
+    let (enc, _) = open_session_encoder(
+        plan,
+        capturer,
+        frame,
+        (cfg.width, cfg.height),
+        cfg.fps,
+        |_, _| enc_bps,
+        gs_bit_depth(frame.format),
+        None,
+        wire_seq_base,
+    )?;
     Ok(enc)
 }
 
@@ -1253,9 +1231,41 @@ impl GsEncoder {
     }
 }
 
-/// Re-opens the virtual source on capture loss: the new capturer and its `cursor_blend`. Takes
-/// the old capturer's keepalive when the loss left its display up.
+/// Re-opens the virtual source on capture loss: the new capturer and its `cursor_blend`. With
+/// the old capturer's keepalive it only re-attaches to the output the loss left up.
 type GsRebuild<'a> = &'a dyn Fn(Option<Box<dyn Send>>) -> Result<(Box<dyn Capturer>, bool)>;
+
+/// GameStream's side of [`rebuild_after_capture_loss`]: the loop's re-open closure, judged on
+/// the compositor live at the loss.
+struct GsLossRebuild<'a> {
+    rebuild: GsRebuild<'a>,
+    running: &'a AtomicBool,
+    live: Option<crate::vdisplay::Compositor>,
+}
+
+impl CaptureLossRebuild for GsLossRebuild<'_> {
+    type Built = (Box<dyn Capturer>, bool);
+
+    fn plane(&self) -> crate::events::Plane {
+        crate::events::Plane::Gamestream
+    }
+
+    fn reattach(&mut self, keepalive: Box<dyn Send>) -> Option<Self::Built> {
+        (self.rebuild)(Some(keepalive)).ok()
+    }
+
+    fn build(&mut self) -> Result<Self::Built> {
+        (self.rebuild)(None)
+    }
+
+    fn ending(&self) -> bool {
+        !self.running.load(Ordering::SeqCst)
+    }
+
+    fn budget_compositor(&self) -> Option<crate::vdisplay::Compositor> {
+        self.live
+    }
+}
 
 /// Encode loop over a borrowed capturer. Send is a dedicated thread so a send spike cannot
 /// stall capture/encode.
@@ -1575,6 +1585,7 @@ impl GsLoop<'_> {
             crate::send_pacing::wait_next_tick(
                 &mut **self.capturer,
                 &mut *self.video.enc,
+                &self.frame,
                 &mut self.cap_credit,
                 &mut self.next_frame,
                 tick.fresh.then_some(tick.start),
@@ -1644,46 +1655,32 @@ impl GsLoop<'_> {
         }))
     }
 
-    /// Rebuild a lost source in place — send, packetizer, socket and RTP survive — and reopen
-    /// the encoder on its first frame. `Err` with no rebuild to run, once
-    /// [`MAX_CAPTURE_REBUILDS`] are spent, or when no source comes up within the budget.
+    /// Rebuild a lost source in place ([`rebuild_after_capture_loss`]) — send, packetizer,
+    /// socket and RTP survive — and reopen the encoder on its first frame. `Err` with no
+    /// rebuild to run, once [`count_capture_loss`] has spent the rebuilds, or when no source
+    /// comes up within the budget.
     fn rebuild_source(&mut self, e: anyhow::Error) -> Result<()> {
         let Some(rebuild) = self.rebuild else {
             return Err(e).context("capture frame");
         };
-        self.rebuilds += 1;
-        if self.rebuilds > MAX_CAPTURE_REBUILDS {
-            return Err(e).context("capture lost — rebuild attempts exhausted");
-        }
-        tracing::warn!(error = %format!("{e:#}"), rebuild = self.rebuilds,
-            "gamestream: capture lost — rebuilding source in place (following a session switch)");
+        let keepalive = count_capture_loss(
+            crate::events::Plane::Gamestream,
+            &mut self.rebuilds,
+            e,
+            &mut **self.capturer,
+        )?;
         // The budget follows the session live at the loss; `detect_active_session`
         // answers `none` off Linux, where gamescope does not exist.
         let budget = RebuildBudget::start();
-        let live =
-            crate::vdisplay::compositor_for_kind(crate::vdisplay::detect_active_session().kind);
-        // The import side broke under a live display: re-attach instead of creating one.
-        let mut keepalive = e
-            .downcast_ref::<pf_capture::DisplayStillAlive>()
-            .and_then(|_| self.capturer.take_keepalive());
-        let new_cap = loop {
-            let _probe = budget.probe_scope();
-            match rebuild(keepalive.take()) {
-                Ok((c, blend)) => {
-                    self.plan = gs_session_plan(&self.cfg, blend);
-                    break c;
-                }
-                Err(e2) => {
-                    if !self.running.load(Ordering::SeqCst) || budget.expired(live) {
-                        return Err(e2)
-                            .context("capture lost — no source within the rebuild budget");
-                    }
-                    tracing::warn!(error = %format!("{e2:#}"),
-                        "gamestream: source not up yet — retrying");
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-            }
+        let mut loss = GsLossRebuild {
+            rebuild,
+            running: self.running,
+            live: crate::vdisplay::compositor_for_kind(
+                crate::vdisplay::detect_active_session().kind,
+            ),
         };
+        let (new_cap, blend) = rebuild_after_capture_loss(&mut loss, keepalive, &budget)?;
+        self.plan = gs_session_plan(&self.cfg, blend);
         *self.capturer = new_cap;
         self.capturer.set_active(true);
         self.frame = self
@@ -1708,18 +1705,24 @@ impl GsLoop<'_> {
         )
     }
 
-    /// The source changed size or format with nothing negotiating it. The encoder cannot follow
-    /// a resolution change in place, so it reopens at the delivered size; GameStream has no
-    /// mid-stream mode message, so the client is not told. `false` when a failed reopen spent
-    /// this tick backing off.
+    /// [`follow_source_mode`]: the encoder cannot follow a resolution change in place, so it
+    /// reopens at the delivered size. GameStream has no mid-stream mode message, so the client
+    /// is not told. `false` when a failed reopen spent this tick backing off.
     fn follow_source_mode(&mut self) -> Result<bool> {
         let from = self.video.src;
         let to = (self.frame.format, self.frame.width, self.frame.height);
-        if from == to {
-            return Ok(true);
-        }
-        match self.reopen_encoder() {
-            Ok(()) => {
+        let followed = follow_source_mode(
+            self,
+            from,
+            to,
+            self.frame_interval,
+            Self::reopen_encoder,
+            |lp| (&mut lp.video.watchdog, &mut lp.next_frame),
+        )?;
+        match followed {
+            SourceFollow::Unchanged => Ok(true),
+            SourceFollow::BackedOff => Ok(false),
+            SourceFollow::Reopened(()) => {
                 tracing::info!(
                     from = %format!("{}x{} {:?}", from.1, from.2, from.0),
                     to = %format!("{}x{} {:?}", to.1, to.2, to.0),
@@ -1729,17 +1732,6 @@ impl GsLoop<'_> {
                      may not follow — see the note at this guard)"
                 );
                 Ok(true)
-            }
-            Err(e) => {
-                // First failed open is a settling driver; spend the shared reset budget.
-                let Some(backoff) = self.video.watchdog.spend(self.frame_interval) else {
-                    return Err(e).context("reopen encoder at the source's new mode");
-                };
-                tracing::warn!(error = %format!("{e:#}"), reset = self.video.watchdog.resets(),
-                    max = MAX_ENCODER_RESETS,
-                    "gamestream: reopening the encoder at the source's new mode failed — retrying");
-                self.back_off(backoff);
-                Ok(false)
             }
         }
     }
@@ -1755,15 +1747,15 @@ impl GsLoop<'_> {
     fn encode_and_send(&mut self, tick: &GsTick) -> Result<GsFlow> {
         self.request_keyframes();
         self.apply_hdr_meta();
-        // An encoder the loop does not feed (the Windows driver) already holds the access units
-        // it owes — waited for after a fresh frame, never on a repeat; every other backend
-        // takes this tick's frame.
+        // A pixel-less frame's encoder (the Windows driver) already holds the access units it
+        // owes — waited for after a fresh frame, never on a repeat; every other backend takes
+        // this tick's frame.
         let au_wait = if tick.fresh {
             tick.start + self.frame_interval
         } else {
             tick.start
         };
-        let owed = self.video.enc.ready_aus(au_wait);
+        let owed = crate::send_pacing::owed_aus(&self.frame, &mut *self.video.enc, au_wait);
         let submitted = match owed {
             Some(_) => Ok(()),
             None => {
@@ -2078,14 +2070,16 @@ impl GsLoop<'_> {
     }
 }
 
-/// Encoder rate under the client's wire budget: 32 B framing per `packetSize + 16 − 32`
-/// payload bytes plus FEC parity. No audio reservation (Moonlight bitrate is video-only).
-/// Floor 500 kbps: a degenerate ask still streams.
+/// [`encoder_bps_for_budget`] under the client's wire budget, `packetSize + 16 − 32` payload
+/// bytes a packet. No audio reservation: Moonlight's bitrate is video-only.
 fn gs_encoder_bps(bitrate_kbps: u32, fec_pct: u8, packet_size: usize) -> u64 {
-    let pps = (packet_size + 16).saturating_sub(32).max(1) as u64;
-    let blocksize = pps + 32;
-    let video = bitrate_kbps as u64 * 1000 * pps * 100 / (blocksize * (100 + fec_pct as u64));
-    video.max(500_000)
+    encoder_bps_for_budget(
+        bitrate_kbps,
+        0,
+        fec_pct,
+        (packet_size + 16).saturating_sub(32),
+        WireFraming::Moonlight,
+    )
 }
 
 /// `PUNKTFUNK_GAMESTREAM_ADAPT` off pins the GameStream plane's loss adaptation off — FEC
@@ -2306,6 +2300,33 @@ mod tests {
                 .expect("sender must return spent batches to the pool");
         }
         assert_eq!(spread.lock().unwrap().len(), 3, "per-frame spread recorded");
+    }
+
+    fn cfg(slices: u32, hdr: bool) -> StreamConfig {
+        StreamConfig {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            packet_size: 1392,
+            bitrate_kbps: 20_000,
+            codec: Codec::H265,
+            min_fec: 0,
+            hdr,
+            slices,
+            encrypt_video: false,
+        }
+    }
+
+    /// The plan the shared encoder open reads: 4:2:0 at the client's own slice count.
+    #[test]
+    fn the_plan_keeps_the_clients_slice_count() {
+        for slices in [1, 2, 4] {
+            let plan = gs_session_plan(&cfg(slices, false), false);
+            assert_eq!(plan.slices, slices);
+            assert_eq!(plan.chroma, encode::ChromaFormat::Yuv420);
+            assert_eq!(plan.bit_depth, 8);
+        }
+        assert_eq!(gs_session_plan(&cfg(1, true), false).bit_depth, 10);
     }
 
     /// Framing (32 B per 1376 B payload) and FEC parity fit inside the configured wire budget.

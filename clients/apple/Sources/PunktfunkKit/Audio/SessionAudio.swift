@@ -32,7 +32,9 @@ private final class ScratchBuffer {
     deinit { ptr.deallocate() }
 }
 
-public final class SessionAudio {
+// Shared by main, `engineQueue`, `sessionQueue` and the drain thread: `stateLock` guards the
+// engine handles, and the rebuild bookkeeping is main-actor.
+public final class SessionAudio: @unchecked Sendable {
     private let connection: PunktfunkConnection
     private let flag = StopFlag()
     private let drainDone = DispatchSemaphore(value: 0)
@@ -123,11 +125,11 @@ public final class SessionAudio {
     /// may act on. Guarded by `stateLock` (set on `engineQueue`, read on the main queue).
     private var enginesAttempted = false
     /// A rebuild is already on the main queue — one device switch produces a burst of triggers
-    /// and they must collapse into one restart. Main-thread confined.
-    private var rebuildQueued = false
+    /// and they must collapse into one restart.
+    @MainActor private var rebuildQueued = false
     /// Debounce/floor for the next rebuild, with an escalating floor when rebuilds chain (each
-    /// retriggered by its predecessor — see `RebuildBackoff`). Main-thread confined.
-    private var rebuildBackoff = RebuildBackoff()
+    /// retriggered by its predecessor — see `RebuildBackoff`).
+    @MainActor private var rebuildBackoff = RebuildBackoff()
     #if os(macOS)
     /// Latches a voice-processing start failure per input device, so a rebuild never re-attempts
     /// a topology that deterministically fails — the retry is what turned one failure into a
@@ -177,6 +179,7 @@ public final class SessionAudio {
     /// A/V sync: it is the only thing that tells the audio plane where the picture actually is, and
     /// without it the ring keeps today's free-running behaviour. Omit it for a playback-only or
     /// stage-1 session, where no such figure is measured.
+    @MainActor
     public func start(
         speakerUID: String, micUID: String, micChannel: Int, micEnabled: Bool, echoCancel: Bool,
         videoLatency: LatencyMeter? = nil
@@ -640,7 +643,7 @@ public final class SessionAudio {
     /// (`RebuildBackoff`).
     ///
     /// `micEnabled` only decides whether the mic-bearing session observers are worth installing.
-    /// Main thread.
+    @MainActor
     private func installDeviceChangeRecovery(micEnabled: Bool) {
         stateLock.lock()
         let already = deviceWatcher != nil
@@ -675,6 +678,7 @@ public final class SessionAudio {
     /// question — is playback still where it should be — but they answer it differently: an engine
     /// that told us it stopped is definitive, while the default device moving might not concern us
     /// at all.
+    @MainActor
     private func hardwareMoved(_ reason: AudioDeviceWatcher.Reason, posted: AnyObject?) {
         guard !flag.isStopped else { return }
         switch reason {
@@ -745,7 +749,8 @@ public final class SessionAudio {
     /// Coalesce: one device switch produces a burst — the old device leaving, the default moving,
     /// the new device settling, and each engine we own posting its own change — and one rebuild
     /// serves all of it. The floor between rebuilds keeps a device that renegotiates in a loop
-    /// from spinning the session. Main thread.
+    /// from spinning the session.
+    @MainActor
     private func scheduleEngineRebuild(reason: String) {
         guard !rebuildQueued else { return }
         rebuildQueued = true
@@ -771,6 +776,7 @@ public final class SessionAudio {
     /// for seconds, and the main thread is where macOS captures and sends the stream's input.
     /// A trigger arriving while the work is in flight schedules a fresh rebuild rather than
     /// being swallowed; `engineQueue` is serial, so the two never interleave.
+    @MainActor
     private func rebuildFire(attempt: Int) {
         rebuildQueued = false
         guard !flag.isStopped else { return }
@@ -817,6 +823,7 @@ public final class SessionAudio {
     /// (0.3 s, 0.6 s, 1.2 s): a failed rebuild leaves no engine to post the next notification,
     /// so this ladder — and, on macOS, the HAL listener — is all that stands between a mistimed
     /// switch and a silent session.
+    @MainActor
     private func rebuildFailed(attempt: Int) {
         guard !flag.isStopped else { return }
         guard attempt < Self.rebuildAttempts else {
@@ -844,6 +851,7 @@ public final class SessionAudio {
     /// it should be on (a pinned one that came back). Somebody changing the default while we are
     /// pinned to a named speaker is none of our business, and rebuilding for it would cost an
     /// audible gap for nothing. Main queue (the listener block is registered against it).
+    @MainActor
     private func defaultOutputChanged() {
         guard !flag.isStopped, let config = startConfig else { return }
         stateLock.lock()
@@ -949,6 +957,7 @@ public final class SessionAudio {
     /// full reconfigure — either path stops room audio leaving the device, which is the
     /// privacy-relevant part. Main thread; the engine work runs on `engineQueue`, where an unmute's
     /// start can block on a Bluetooth mic, and where it can't race a rebuild's teardown.
+    @MainActor
     public func setMicMuted(_ muted: Bool) {
         stateLock.lock()
         micMuted = muted

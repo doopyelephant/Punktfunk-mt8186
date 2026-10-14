@@ -205,12 +205,14 @@ pub struct JitterPolicy {
 }
 
 impl JitterPolicy {
-    /// `channels` is 2/6/8 at [`SAMPLE_RATE_HZ`]. Hi-res uses [`new_at_rate`](Self::new_at_rate).
-    pub fn new(tuning: JitterTuning, channels: u8) -> JitterPolicy {
+    /// `channels` is 2/6/8 at [`SAMPLE_RATE_HZ`].
+    #[cfg(test)]
+    pub(crate) fn new(tuning: JitterTuning, channels: u8) -> JitterPolicy {
         Self::new_at_rate(tuning, channels, SAMPLE_RATE_HZ)
     }
 
-    /// As [`new`](Self::new), at an explicitly negotiated `rate_hz`.
+    /// At the negotiated `rate_hz` and the default frame. Clients build one through
+    /// [`AudioPlayout::jitter`], which sets the frame too.
     ///
     /// Conversions multiply first and divide last, so 44 100 / 48 000 / 88 200 / 96 000 / 176 400
     /// are exact. The tell that a change has broken it: [`depth_ms`](Self::depth_ms)`(target)`
@@ -219,7 +221,7 @@ impl JitterPolicy {
     ///
     /// A `rate_hz` or `channels` of zero is clamped to 1: this type is built from wire values on
     /// a path that must not panic in a realtime callback.
-    pub fn new_at_rate(tuning: JitterTuning, channels: u8, rate_hz: u32) -> JitterPolicy {
+    pub(crate) fn new_at_rate(tuning: JitterTuning, channels: u8, rate_hz: u32) -> JitterPolicy {
         let rate_hz = rate_hz.max(1);
         let channels = channels.max(1);
         JitterPolicy {
@@ -252,9 +254,8 @@ impl JitterPolicy {
     /// Frame length in microseconds.
     ///
     /// The floor under the effective target (quantum plus one frame) and the smooth shed (drop
-    /// exactly one frame) are denominated in frames. Default [`FRAME_MS`] is the Opus frame;
-    /// `audio_frame_us` is known only after `Welcome`.
-    pub fn set_frame_us(&mut self, frame_us: u32) {
+    /// exactly one frame) are denominated in frames. Default [`FRAME_MS`] is the Opus frame.
+    pub(crate) fn set_frame_us(&mut self, frame_us: u32) {
         self.frame_us = frame_us.max(1);
     }
 

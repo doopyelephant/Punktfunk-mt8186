@@ -377,10 +377,12 @@ enum Source<'a> {
     Dmabuf(&'a DmabufFrame),
 }
 
-/// Clone the producer hold only for a raw dmabuf submission.
+/// The hold that keeps the captured buffer unrecycled until its AU is retrieved: a stream-ordered
+/// copy or fused pass may still read it after `submit` returns.
 fn source_hold(frame: &CapturedFrame) -> Option<pf_frame::FrameHold> {
     match &frame.payload {
         FramePayload::Dmabuf(d) => d.hold.clone(),
+        FramePayload::Cuda(b) => Some(b.hold()),
         _ => None,
     }
 }
@@ -573,11 +575,11 @@ impl NvencCudaEncoder {
         hdr: bool,
         chroma: ChromaFormat,
         cursor_blend: bool,
-        max_slices: u32,
+        slices: u32,
     ) -> Result<Self> {
         // Fail here, not as an opaque session error on the first frame.
         let api = try_api().map_err(|e| anyhow!("NVENC (Linux direct) unavailable: {e}"))?;
-        let mut s = NvSession::new(api, codec, width, height, fps, bitrate_bps, max_slices);
+        let mut s = NvSession::new(api, codec, width, height, fps, bitrate_bps, slices);
         // Provisional until the first frame names the real input (`ensure_session` sets both).
         s.bit_depth = bit_depth;
         // HEVC-only; confirmed against frame layout + GPU at init.
@@ -1294,8 +1296,9 @@ impl NvencCudaEncoder {
     }
 
     /// CPU pixels into a reused pitched device buffer: BGRA-order 32-bit as is, RGBA-order
-    /// swizzled, 24-bit repacked, NV12 as two planes. Synchronous, so the buffer is free
-    /// again on return.
+    /// swizzled, 24-bit repacked, NV12 as two planes. Synchronous on this thread's copy stream,
+    /// behind the previous frame's queued slot copy out of the same buffer, so the reuse never
+    /// overwrites a copy in flight. Moving either copy to another stream breaks that.
     fn upload_cpu(
         &mut self,
         captured: &CapturedFrame,
@@ -1683,7 +1686,9 @@ impl Encoder for NvencCudaEncoder {
 
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
-            blends_cursor: true,
+            // Any payload blends while the Vulkan slot device is up; before the first frame
+            // tries it, it is expected up (`cursor_blend_capable` predicts the same).
+            blends_cursor: !self.cursor_tried || self.vk_blend.is_some(),
             supports_rfi: self.s.rfi_supported,
             chroma_444: self.s.chroma_444,
             intra_refresh: false,

@@ -17,16 +17,6 @@ pub use selftest::{hdr_p010_convert_bars_on_luid, hdr_p010_selftest_at};
 
 #[cfg(target_arch = "x86_64")]
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Hits on the hooked `NtGdiDdDDIGetCachedHybridQueryValue`. Patch-readback in
-/// [`install_gpu_pref_hook`] only proves the bytes landed; `0` here means DXGI
-/// never reached the export on this build (always on ARM64, where no patch exists).
-static HYBRID_HOOK_HITS: AtomicU64 = AtomicU64::new(0);
-
-pub fn hybrid_hook_hits() -> u64 {
-    HYBRID_HOOK_HITS.load(Ordering::Relaxed)
-}
 
 // Declared here so we skip the Win32_System_Diagnostics_Debug feature for one call.
 // DXGI runs the hooked export on the encode worker, possibly another core;
@@ -41,7 +31,6 @@ unsafe extern "system" {
 /// export in full, so there is no trampoline back to the original.
 #[cfg(target_arch = "x86_64")]
 unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
-    HYBRID_HOOK_HITS.fetch_add(1, Ordering::Relaxed);
     if gpu_preference.is_null() {
         return 0xC000_000Du32 as i32; // STATUS_INVALID_PARAMETER
     }
@@ -57,18 +46,16 @@ unsafe extern "system" fn hybrid_query_hook(gpu_preference: *mut u32) -> i32 {
 /// preferred render GPU and ignores `SET_RENDER_ADAPTER`, so the driver's
 /// swap-chain lands on an adapter its encoder cannot open.
 ///
-/// Call once from `main.rs` before the first DXGI factory. Lasts the process
-/// lifetime. [`hybrid_hook_hits`] reports whether DXGI actually calls it.
-/// Also sets per-monitor DPI awareness; on ARM64 that half is all that runs.
+/// Lasts the process lifetime; a later call does nothing. Also sets per-monitor DPI
+/// awareness; on ARM64 that half is all that runs.
 ///
-/// # Invariant
+/// # Safety
 ///
-/// The patch rewrites 12 live bytes of `win32u.dll`, and only over the syscall stub
-/// ([`is_syscall_stub`]): any other head is refused and the export left as found. Nothing
-/// here checks the other half. No other thread is inside the export while its bytes change:
-/// only DXGI calls it, so this must run before any thread creates a DXGI factory. The call
-/// order in the host's `startup` is the only enforcement.
-pub fn install_gpu_pref_hook() {
+/// Call before any thread creates a DXGI factory. The patch rewrites 12 live bytes of
+/// `win32u.dll` that only DXGI executes, so no thread may be inside them while they change.
+/// The patch itself writes only over the syscall stub ([`is_syscall_stub`]); any other head
+/// is refused and the export left as found.
+pub unsafe fn install_gpu_pref_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| {
         set_dpi_awareness();
@@ -77,7 +64,10 @@ pub fn install_gpu_pref_hook() {
         #[cfg(not(target_arch = "x86_64"))]
         tracing::info!("GPU-pref hook: x86-64 only, skipped on this architecture");
         #[cfg(target_arch = "x86_64")]
-        patch_hybrid_query();
+        {
+            // SAFETY: this fn's contract: no DXGI factory exists yet.
+            unsafe { patch_hybrid_query() };
+        }
     });
 }
 
@@ -114,8 +104,12 @@ fn set_dpi_awareness() {
 /// Overwrite the head of `win32u!NtGdiDdDDIGetCachedHybridQueryValue` with a jump to
 /// [`hybrid_query_hook`], and say in the log whether the bytes landed. A head that is not the
 /// syscall stub is not written to.
+///
+/// # Safety
+///
+/// No DXGI factory exists yet: [`install_gpu_pref_hook`]'s contract.
 #[cfg(target_arch = "x86_64")]
-fn patch_hybrid_query() {
+unsafe fn patch_hybrid_query() {
     use crate::win32u_stub::{is_syscall_stub, jump_to, PATCH_LEN};
     use windows::core::s;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
@@ -166,8 +160,8 @@ fn patch_hybrid_query() {
     let readback = is_syscall_stub(&found).then(|| {
         // SAFETY: writable as above. `found` is the syscall stub: it is entered at its first
         // byte only and its one branch lands past these 12, so every entry runs the whole
-        // jump. No thread executes them now: only DXGI calls the export, and this runs before
-        // any DXGI factory exists (the invariant on `install_gpu_pref_hook`).
+        // jump. No thread executes them now: only DXGI calls the export, and no DXGI factory
+        // exists yet (this fn's contract).
         unsafe { stub.write(patch) };
         // A write the OS rejected silently reads back as the stub.
         read()
@@ -191,8 +185,7 @@ fn patch_hybrid_query() {
     if readback == patch {
         tracing::info!(
             "GPU-pref hook installed + verified (win32u hybrid-query -> UNSPECIFIED): DXGI \
-             output reparenting disabled. Whether DXGI actually CALLS it shows up as \
-             hybrid_hook_hits on the IDD-push open line."
+             output reparenting disabled"
         );
     } else {
         tracing::error!(

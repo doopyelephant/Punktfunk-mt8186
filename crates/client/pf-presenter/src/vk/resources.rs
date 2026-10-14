@@ -1,29 +1,10 @@
-//! Video-image / staging-buffer rebuild and retired-frame destruction.
+//! Video-image, CPU-plane and staging-buffer rebuilds.
 
 use super::gpu::image_with_memory;
-use super::{CpuPlanes, Presenter, Retired, Staging, VideoImage};
+use super::{CpuPlanes, Presenter, Staging, VideoImage};
 use anyhow::{Context as _, Result};
 use ash::vk;
 use pf_client_core::video::CpuPlanarFrame;
-
-impl Retired {
-    pub(super) fn destroy(self, device: &ash::Device) {
-        // Only the dmabuf lane owns Vulkan objects here; D3D11 imports retire in their cache.
-        #[cfg(not(target_os = "linux"))]
-        let _ = device;
-        match self {
-            #[cfg(target_os = "linux")]
-            Retired::Dmabuf(f) => f.destroy(device),
-            // Image and plane views belong to the decoder's pools — nothing
-            // of ours to destroy. Drop sends the release token; the caller
-            // reaches here only after the sampling fence (GPU reads done).
-            Retired::NativeVk(frame) => drop(frame),
-            // The planes go with the frame's hold, or stay with the decoder.
-            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-            Retired::Pyro(frame) => drop(frame),
-        }
-    }
-}
 
 /// Each plane starts on a 16-byte boundary so `bufferOffset` is a multiple
 /// of 4 at any picture size — a 1-byte-per-texel odd width would otherwise

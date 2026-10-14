@@ -24,6 +24,9 @@ private val artPool = Executors.newFixedThreadPool(3) { r -> Thread(r, "pf-conso
 /** The library fetch in flight (its generation; a newer one supersedes it). */
 private val fetchGen = AtomicLong(0)
 
+/** The last `FetchLibrary`'s host and `req`. A refetch this shell starts answers under it. */
+private var libraryReq: Pair<String, JSONObject>? = null
+
 /** End a title this device launched, say how it went, then re-read what the host runs. */
 internal fun SkiaConsole.endGame(c: JSONObject) {
     val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
@@ -68,7 +71,9 @@ internal fun SkiaConsole.changeInstall(c: JSONObject) {
 /**
  * The library pipeline (the desktop's `spawn_fetch`): cached shelf first, then
  * [LibraryClient.fetchAcrossWake], then the running set and the posters — each poster
- * fetched over the same mTLS client and pushed as bytes.
+ * fetched over the same mTLS client and pushed as bytes. The list and phase go up under the
+ * command's `req`; a refetch this shell starts reuses the last one, and only for its host.
+ * Main thread only.
  */
 internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
     val app = appContext ?: return
@@ -100,17 +105,20 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
         }
         return
     }
+    val req = c.optJSONObject("req")?.also { libraryReq = fp to it }
+        ?: libraryReq?.takeIf { it.first == fp }?.second
+        ?: return // the console has moved off this host: no shelf to refill
     val gen = fetchGen.incrementAndGet()
     NativeBridge.nativeConsoleLibraryBegin(handle)
     if (id == null) {
-        NativeBridge.nativeConsoleLibraryPhase(handle, ConsoleJson.libraryError("Couldn't load the library", identities.blockedMessage(), true))
+        NativeBridge.nativeConsoleLibraryPhase(handle, ConsoleJson.libraryError(req, "Couldn't load the library", identities.blockedMessage(), true))
         return
     }
     val cache = LibraryCache.standard(app.cacheDir)
     val cacheKey = LibraryCache.keyFor(kh, fp)
     ioPool.execute {
         val cached = cache.load(cacheKey)?.games?.takeIf { it.isNotEmpty() }
-        if (cached != null) main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryGames(handle, ConsoleJson.libraryGames(cached), true) }
+        if (cached != null) main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryGames(handle, ConsoleJson.libraryGames(req, cached), true) }
         val result = LibraryClient.fetchAcrossWake(
             addr, mgmt, id.certPem, id.privateKeyPem, fp,
             macs = kh?.mac.orEmpty(),
@@ -126,7 +134,7 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
                 val up = LibraryClient.fetchRunning(addr, mgmt, id.certPem, id.privateKeyPem, fp)
                 main.post {
                     if (gen != fetchGen.get()) return@post
-                    NativeBridge.nativeConsoleLibraryGames(handle, ConsoleJson.libraryGames(games), false)
+                    NativeBridge.nativeConsoleLibraryGames(handle, ConsoleJson.libraryGames(req, games), false)
                     NativeBridge.nativeConsoleLibraryStale(handle, 0)
                     NativeBridge.nativeConsoleLibraryRunning(handle, ConsoleJson.runningGames(up))
                 }
@@ -137,7 +145,7 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
                 main.post {
                     if (gen != fetchGen.get()) return@post
                     if (cached != null) NativeBridge.nativeConsoleLibraryStale(handle, 2)
-                    else NativeBridge.nativeConsoleLibraryPhase(handle, ConsoleJson.libraryError("Not paired", r.message, false))
+                    else NativeBridge.nativeConsoleLibraryPhase(handle, ConsoleJson.libraryError(req, "Not paired", r.message, false))
                 }
             }
             is LibraryResult.Error -> {
@@ -145,7 +153,7 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
                 main.post {
                     if (gen != fetchGen.get()) return@post
                     if (cached != null) NativeBridge.nativeConsoleLibraryStale(handle, 2)
-                    else NativeBridge.nativeConsoleLibraryPhase(handle, ConsoleJson.libraryError("Couldn't load the library", r.message, true))
+                    else NativeBridge.nativeConsoleLibraryPhase(handle, ConsoleJson.libraryError(req, "Couldn't load the library", r.message, true))
                 }
             }
             null -> {}

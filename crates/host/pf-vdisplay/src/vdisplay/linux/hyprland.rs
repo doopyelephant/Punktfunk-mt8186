@@ -3,8 +3,8 @@
 //!
 //! Distinct from [`super::wlroots`]: Hyprland names headless outputs explicitly
 //! (`hyprctl output create headless PF-<pid>-<n>`), so there is no before/after
-//! diff. The creator pid in the name is what [`reclaim_leftovers_once`] uses to
-//! drop leftovers whose owner is gone.
+//! diff, and the output is journaled ([`crate::topology_journal`]) before it exists.
+//! The heads `exclusive` disables are journaled before the first goes dark.
 //!
 //! A monitor rule sets the client's exact mode ([`set_monitor_rule`]). xdph is
 //! steered at that output through a custom picker ([`crate::portal_picker`]).
@@ -20,6 +20,7 @@
 use super::{DisplayOwnership, Mode, SessionCastParts, VirtualDisplay, VirtualOutput};
 use crate::monitors::DISABLE_BUDGET;
 use crate::portal_cast::StopGuard;
+use crate::topology_journal::{self as journal, Head, Undo};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::io::BufRead;
@@ -79,10 +80,9 @@ pub(crate) const SELECTOR: crate::portal_cast::Selector = crate::portal_cast::Se
 /// diff race.
 static OUTPUT_SEQ: AtomicU32 = AtomicU32::new(0);
 
-/// `PF-<pid>-<n>`. The pid is not decoration: `OutputGuard::drop` is the only
-/// unplug, so a SIGKILLed host leaves heads behind. A bare `PF-<n>` restarts
-/// at `PF-1` and collides; the pid lets [`reclaim_leftovers_once`] drop only
-/// leftovers whose owner is gone. niri mints its outputs from the same counter.
+/// `PF-<pid>-<n>`. A bare `PF-<n>` restarts at `PF-1` and collides with a
+/// second host's output, or a dead one's the journal has not taken back yet.
+/// niri mints its outputs from the same counter.
 pub(crate) fn next_output_name() -> String {
     format!(
         "PF-{}-{}",
@@ -102,15 +102,6 @@ pub(crate) fn is_managed_output(name: &str) -> bool {
             .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Owner pid for `PF-<pid>-<n>` only. `None` for legacy `PF-<n>` — no owner,
-/// so reclaim must not guess.
-pub(crate) fn output_owner_pid(name: &str) -> Option<u32> {
-    let rest = name.strip_prefix("PF-")?;
-    let (pid, seq) = rest.split_once('-')?;
-    seq.parse::<u32>().ok()?;
-    pid.parse::<u32>().ok()
-}
-
 /// One named headless output per [`create`](VirtualDisplay::create). Stateless
 /// besides the fields below.
 pub struct HyprlandDisplay {
@@ -127,12 +118,12 @@ pub struct HyprlandDisplay {
     /// What the portal actually gave the last successful `create`. How the host
     /// learns a cursor overlay is never coming.
     last_cursor_mode: Option<crate::portal_cursor::Mode>,
-    /// Topology restore from the first `create` (re-enable heads `exclusive`
-    /// disabled). First-wins: this instance serves the pipeline retry loop and
-    /// only attempt 1 finds heads to disable. The registry lifts this after a
-    /// pooled `create`, so Drop is only the retry-loop backstop. Exclusive
-    /// physicals stay dark for the linger window and re-light on real teardown.
-    pending_restore: Option<Box<dyn FnOnce() + Send>>,
+    /// Journal seqs of the heads `exclusive` disabled, across every `create` of this
+    /// instance: one instance serves the host retry loop, and only attempt 1 finds heads
+    /// to disable. The registry takes them after a pooled `create` and runs them when the
+    /// group empties, so the heads stay dark for the linger window; [`Drop`] runs what a
+    /// create that never reached the pool left.
+    pending_undo: Vec<u64>,
     /// Output the last successful `create` minted. A mid-stream resize replaces
     /// the head (create-before-drop); the next `create` carries its workspace
     /// over ([`adopt_active_workspace`]). Unset on failure so a half-created
@@ -159,11 +150,8 @@ impl Drop for HyprlandDisplay {
         if let Some(pending) = self.pending_cast.take() {
             stop_cast(&pending.name);
         }
-        // Retry-loop backstop: the registry takes a pooled restore, so this is
-        // only a create that never reached acquire.
-        if let Some(restore) = self.pending_restore.take() {
-            restore();
-        }
+        let seqs = std::mem::take(&mut self.pending_undo);
+        journal::apply(&seqs, self);
     }
 }
 
@@ -173,7 +161,7 @@ impl HyprlandDisplay {
             client_fp: None,
             hw_cursor: false,
             last_cursor_mode: None,
-            pending_restore: None,
+            pending_undo: Vec::new(),
             prev_output: None,
             pending_cast: None,
             handoff_cast: false,
@@ -308,8 +296,32 @@ impl VirtualDisplay for HyprlandDisplay {
         self.last_cursor_mode
     }
 
-    fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
-        self.pending_restore.take()
+    fn take_undo_seqs(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pending_undo)
+    }
+
+    fn heads(&self) -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+        list_monitors()
+    }
+
+    /// Heads come back through `hyprctl reload`, run only when one is dark. The output goes
+    /// only if this Hyprland named it: another instance may have reused the name.
+    fn undo(&mut self, undo: &Undo) -> Result<()> {
+        match undo {
+            Undo::EnableHeads { heads } => restore_heads(heads),
+            Undo::RemoveOutput { name, instance } => {
+                if journal::foreign_output("hyprland", name, instance, &hypr_instance()) {
+                    return Ok(());
+                }
+                if monitor(name, true)?.is_none() {
+                    return Ok(());
+                }
+                evacuate_workspace(name);
+                hyprctl_dispatch(&["output", "remove", name])
+                    .with_context(|| format!("hyprctl output remove {name}"))
+            }
+            Undo::Takeover { .. } => bail!("no undo in hyprland for {undo:?}"),
+        }
     }
 
     fn set_session_cast_handoff(&mut self, enabled: bool) {
@@ -322,17 +334,29 @@ impl VirtualDisplay for HyprlandDisplay {
 
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         preflight_once();
-        reclaim_leftovers_once();
         if let Some(pending) = self.pending_cast.take() {
             stop_cast(&pending.name);
         }
 
         let name = next_output_name();
-        hyprctl_dispatch(&["output", "create", "headless", &name]).with_context(|| {
-            format!("hyprctl output create headless {name} (is hyprctl reachable?)")
-        })?;
+        let seq = journal::push(
+            "hyprland",
+            Undo::RemoveOutput {
+                name: name.clone(),
+                instance: hypr_instance(),
+            },
+        );
+        if let Err(e) = hyprctl_dispatch(&["output", "create", "headless", &name]) {
+            journal::done(seq);
+            return Err(e).with_context(|| {
+                format!("hyprctl output create headless {name} (is hyprctl reachable?)")
+            });
+        }
         // Own from here so any later error (or drop) removes it.
-        let output = OutputGuard(name.clone());
+        let output = OutputGuard {
+            name: name.clone(),
+            seq,
+        };
         wait_monitor_ready(&name, Duration::from_secs(5))
             .with_context(|| format!("waiting for headless output {name} to appear"))?;
 
@@ -367,15 +391,10 @@ impl VirtualDisplay for HyprlandDisplay {
             hdr = colour.is_some(),
             "hyprland headless output ready"
         );
-        // Last, so no failure path unwinds past the restore hand-off.
-        crate::backend::apply_exclusive(
-            "hyprland",
-            self.client_fp,
-            &name,
-            &mut self.pending_restore,
-            disable_other_heads,
-            restore_heads,
-        );
+        // Last: nothing fails after this, so no path darkens heads and then unwinds.
+        if crate::backend::exclusive_wanted("hyprland", self.client_fp) {
+            disable_other_heads(&name, &mut self.pending_undo);
+        }
         // Hyprland gives each replacement an empty workspace. Carry the active
         // workspace only after every fallible setup step has completed.
         if let Some(prev) = self.replace_output(&name) {
@@ -611,55 +630,6 @@ fn is_window_event(line: &str) -> bool {
 /// watcher is on the socket — then the caller must not trust a frozen value.
 pub(crate) fn window_gen() -> Option<u64> {
     (WINDOW_WATCHERS.load(Ordering::Relaxed) > 0).then(|| WINDOW_GEN.load(Ordering::Relaxed))
-}
-
-/// Remove `PF-<pid>-<n>` outputs whose owner pid is gone, once per process
-/// before we create our first.
-///
-/// [`OutputGuard::drop`] is the only unplug, so a SIGKILLed host leaves heads
-/// in the compositor for the session's life. Keyed on the owner pid so a
-/// second live host (or this process) cannot have its output pulled. `Once`
-/// puts the sweep strictly before this process owns anything. A dead host's
-/// `exclusive` session also left the real heads disabled; they come back too.
-fn reclaim_leftovers_once() {
-    static RECLAIMED: Once = Once::new();
-    RECLAIMED.call_once(|| {
-        let Ok(names) = monitor_names() else { return };
-        let mut removed = false;
-        for name in &names {
-            let name = name.clone();
-            let Some(pid) = output_owner_pid(&name) else {
-                // Not ours, or legacy `PF-<n>` with no owner — a still-running
-                // older host may be streaming it.
-                if is_managed_output(&name) {
-                    tracing::debug!(output = %name, "a managed headless output with no owner pid in \
-                         its name (an older host build) — left alone");
-                }
-                continue;
-            };
-            if pid == std::process::id() || std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                continue;
-            }
-            match hyprctl_dispatch(&["output", "remove", &name]) {
-                Ok(()) => {
-                    removed = true;
-                    tracing::info!(output = %name, owner_pid = pid, "removed a headless \
-                         output left behind by a host that is no longer running")
-                }
-                Err(e) => tracing::warn!(output = %name, owner_pid = pid, error = %format!("{e:#}"),
-                    "leftover headless output not removed"),
-            }
-        }
-        if removed {
-            let dark: Vec<String> = names
-                .into_iter()
-                .filter(|n| matches!(head_is_enabled(n), Ok(Some(false))))
-                .collect();
-            if !dark.is_empty() {
-                restore_heads(&dark);
-            }
-        }
-    });
 }
 
 /// Point Hyprland's focus at the head we are about to stream.
@@ -1102,9 +1072,10 @@ fn lua_workspace_focus_expr(ws: &str) -> String {
 }
 
 /// Disable the heads an `exclusive` session darkens ([`crate::monitors::disable_for_exclusive`]),
-/// returning the ones [`restore_heads`] re-enables. `managed` is [`is_managed_output`], so a
+/// with the plan journaled onto `pending` before the first goes dark: a planned head that
+/// refused is lit, so its undo is a no-op. `managed` is [`is_managed_output`], so a
 /// concurrent session is never blacked out; `keep_monitors` stays lit.
-fn disable_other_heads(ours: &str) -> Vec<String> {
+fn disable_other_heads(ours: &str, pending: &mut Vec<u64>) {
     let keep = crate::policy::prefs().get().keep_monitors;
     crate::monitors::disable_for_exclusive(
         "hyprland",
@@ -1113,9 +1084,14 @@ fn disable_other_heads(ours: &str) -> Vec<String> {
         &keep,
         disable_head,
         focus_output,
-        // Not journaled: the restore closure still covers Hyprland.
-        |_| {},
-    )
+        |plan| pending.push(journal::push_heads("hyprland", plan)),
+    );
+}
+
+/// The Hyprland `hyprctl` talks to, as its instance signature: what a journal entry records
+/// as its `instance`. Empty when none is known, which an undo reads as "not this one".
+fn hypr_instance() -> String {
+    crate::session::hypr_signature().unwrap_or_default()
 }
 
 /// Disable one head, both config eras, confirming by read-back.
@@ -1181,7 +1157,7 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
     Ok(monitor(name, true)?.map(|m| !m.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false)))
 }
 
-/// Re-enable the heads an `exclusive` session disabled. Run **before** that
+/// Re-enable the heads an `exclusive` session disabled. Runs **before** that
 /// member's output is removed, so Hyprland never sees zero enabled outputs.
 ///
 /// `hyprctl reload` is the only thing that re-enables a disabled head. Re-
@@ -1192,54 +1168,37 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
 /// A reload drops every runtime `hyprctl keyword`/`eval` override, including
 /// our streamed-output rule (harmless — teardown removes the output next) and
 /// any the operator set by hand; a hyprlang config re-runs `exec =` lines
-/// (`exec-once` does not). Runs only when we actually disabled something.
-fn restore_heads(disabled: &[String]) {
-    if let Err(e) = hyprctl_dispatch(&["reload"]) {
-        tracing::error!(
-            ?disabled, error = %format!("{e:#}"),
-            "hyprland: `hyprctl reload` failed — the heads this session disabled are still dark. \
-             Re-run `hyprctl reload` by hand to get them back."
-        );
-        return;
-    }
-    // `reload` answers `ok` for "config parsed", not "the head came back" (a
-    // head the operator's own config disables stays disabled). Read it back.
-    let deadline = Instant::now() + DISABLE_BUDGET;
-    let still_dark = loop {
-        let dark: Vec<&String> = disabled
-            .iter()
-            .filter(|n| matches!(head_is_enabled(n), Ok(Some(false))))
-            .collect();
-        if dark.is_empty() || Instant::now() >= deadline {
-            break dark;
+/// (`exec-once` does not). So it runs only when one of `heads` is dark. `reload`
+/// answers `ok` for "config parsed", not "the head came back": the journal reads
+/// the heads back, and one the operator's own config disables stays dark there.
+fn restore_heads(heads: &[Head]) -> Result<()> {
+    for Head { name, .. } in heads {
+        if head_is_enabled(name)? == Some(false) {
+            return hyprctl_dispatch(&["reload"]).context("hyprctl reload");
         }
-        thread::sleep(Duration::from_millis(50));
-    };
-    if still_dark.is_empty() {
-        tracing::info!(
-            ?disabled,
-            "hyprland: re-enabled the heads `topology: exclusive` disabled"
-        );
-    } else {
-        tracing::warn!(
-            ?disabled, ?still_dark,
-            "hyprland: `hyprctl reload` ran but these heads are still disabled — the operator's own \
-             config may disable them, otherwise they need a manual `hyprctl reload`"
-        );
     }
+    Ok(())
 }
 
-struct OutputGuard(String);
+/// The headless output of one `create`, removed on drop. `seq` is its journal entry: the
+/// remove settles it, and a refused one leaves it for the next host's reclaim.
+struct OutputGuard {
+    name: String,
+    seq: u64,
+}
 
 impl Drop for OutputGuard {
     fn drop(&mut self) {
         // Close first: removing a head xdph is still capturing wedges its loop.
-        stop_cast(&self.0);
-        evacuate_workspace(&self.0);
-        match hyprctl_dispatch(&["output", "remove", &self.0]) {
-            Ok(_) => tracing::info!(output = %self.0, "hyprland headless output removed"),
+        stop_cast(&self.name);
+        evacuate_workspace(&self.name);
+        match hyprctl_dispatch(&["output", "remove", &self.name]) {
+            Ok(_) => {
+                journal::done(self.seq);
+                tracing::info!(output = %self.name, "hyprland headless output removed")
+            }
             Err(e) => {
-                tracing::warn!(output = %self.0, error = %format!("{e:#}"), "output remove failed")
+                tracing::warn!(output = %self.name, error = %format!("{e:#}"), "output remove failed")
             }
         }
     }
@@ -1401,19 +1360,6 @@ fn wait_monitor_ready(name: &str, timeout: Duration) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(50));
     }
-}
-
-/// Every monitor name, disabled included (`-j monitors all`). A leftover from
-/// a dead host may have ended up disabled; [`reclaim_leftovers_once`] must see it.
-fn monitor_names() -> Result<Vec<String>> {
-    Ok(hyprctl_json(&["monitors", "all"])?
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default())
 }
 
 fn monitor_exists(name: &str) -> Result<bool> {
@@ -1884,25 +1830,37 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// The name carries the creating host's pid, which is what makes a leftover
-    /// attributable. A reclaim that could not tell whose it was would have to
-    /// remove a live sibling's or nothing at all.
+    /// A dead host's output is removed only from the Hyprland that named it. With no match
+    /// the entry is settled and nothing runs: no `hyprctl` here, and none is needed.
     #[test]
-    fn a_name_carries_its_owner_pid_and_only_ours_does() {
-        let mine = next_output_name();
-        assert_eq!(output_owner_pid(&mine), Some(std::process::id()));
-        assert!(is_managed_output(&mine));
+    fn an_output_of_another_hyprland_instance_is_left_alone() {
+        let mut vd = HyprlandDisplay::new().expect("stateless");
+        for instance in ["0123456789abcdef_1700000000_123456", ""] {
+            let undo = Undo::RemoveOutput {
+                name: "PF-4242-1".into(),
+                instance: instance.into(),
+            };
+            assert!(vd.undo(&undo).is_ok(), "{instance:?}");
+        }
+        assert!(
+            vd.take_undo_seqs().is_empty(),
+            "nothing journaled by an undo"
+        );
+    }
 
-        // Legacy `PF-<n>`: recognisably managed, but no owner — report, never
-        // reclaim on a guess.
+    /// The name carries the creating host's pid, so a second host's names never
+    /// collide with ours. Legacy `PF-<n>` is still managed.
+    #[test]
+    fn a_name_carries_its_owner_pid_and_only_ours_is_managed() {
+        let mine = next_output_name();
+        assert!(mine.starts_with(&format!("PF-{}-", std::process::id())));
+        assert!(is_managed_output(&mine));
         assert!(is_managed_output("PF-1"));
-        assert_eq!(output_owner_pid("PF-1"), None);
 
         // A user's own monitor that happens to start with the prefix, and the
         // connectors every wlr-family compositor mints.
         for theirs in ["PF-office", "PF-", "PF-12-abc", "HEADLESS-1", "DP-1", ""] {
             assert!(!is_managed_output(theirs), "{theirs:?} is not ours");
-            assert_eq!(output_owner_pid(theirs), None, "{theirs:?} has no owner");
         }
     }
 

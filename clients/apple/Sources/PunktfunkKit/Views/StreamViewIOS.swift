@@ -1080,7 +1080,7 @@ public final class StreamViewController: StreamViewControllerBase {
     }
     #endif
 
-    deinit {
+    isolated deinit {
         observers.forEach(NotificationCenter.default.removeObserver(_:))
         presenter.stop() // invalidate the display link + stop the pipeline if stop() was missed
     }

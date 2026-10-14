@@ -17,7 +17,8 @@
 use super::policy::{intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::ltr::{LtrMirror, LtrStep, NUM_LTR_SLOTS};
-use crate::retrieve::{poll_budget_ms, AuQueue, RetrieveThread};
+use crate::retrieve::{AuQueue, RetrieveThread};
+use crate::stall::{poll_budget_ms, Rebuild, Stall};
 use anyhow::{anyhow, bail, Context, Result};
 use libvpl_sys as vpl;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
@@ -902,8 +903,8 @@ pub struct QsvEncoder {
     /// Refuse this frame after the LTR decision, as a failed surface fetch would.
     #[cfg(test)]
     fail_submit_at: Option<i64>,
-    /// Resets with no AU since. At 2, drop `inner` instead of Close+Init on a dead session.
-    resets_without_output: u32,
+    /// Stall recovery since the last AU, cleared in `poll`.
+    stall: Stall,
 }
 
 // SAFETY: raw VPL handles are not auto-`Send`, and none is thread-affine. Every call on this
@@ -977,7 +978,7 @@ impl QsvEncoder {
             ltr_test_force_at: ltr_test_force_at(),
             #[cfg(test)]
             fail_submit_at: None,
-            resets_without_output: 0,
+            stall: Stall::Clear,
         })
     }
 
@@ -1231,6 +1232,7 @@ impl QsvEncoder {
             FramePayload::Cpu(_) => {
                 bail!("native QSV is D3D11-only; got a CPU frame (video processor lost?)")
             }
+            FramePayload::Pixelless => bail!("native QSV is D3D11-only; got a pixel-less frame"),
         };
         anyhow::ensure!(
             captured.format == self.input,
@@ -1734,7 +1736,7 @@ impl Encoder for QsvEncoder {
         };
         let au = inner.retrieve.q.take_ready(poll_budget_ms(self.fps))?;
         if au.is_some() {
-            self.resets_without_output = 0;
+            self.stall = Stall::Clear;
         }
         Ok(au)
     }
@@ -1760,16 +1762,17 @@ impl Encoder for QsvEncoder {
         );
     }
 
-    /// Stall recovery: Close+Init in place. A second reset with no AU drops the whole session.
+    /// Stall recovery: Close+Init in place, or the whole session dropped when [`Stall::reset`]
+    /// says reopen.
     fn reset(&mut self) -> bool {
         self.force_kf = true;
-        self.resets_without_output = self.resets_without_output.saturating_add(1);
+        let (stall, rebuild) = self.stall.reset();
+        self.stall = stall;
         if self.inner.is_none() {
             return true;
         }
-        if self.resets_without_output >= 2 {
+        if rebuild == Rebuild::Reopen {
             tracing::warn!(
-                resets = self.resets_without_output,
                 "QSV stall persisted across in-place re-Init — full session teardown, reopening \
                  lazily (next submit)"
             );
@@ -2384,6 +2387,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_encode_live_smoke() {
         let Some(aus) = drive_live(Codec::H264, false, 30, |_, _| {}) else {
             return;
@@ -2392,6 +2396,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_hevc() {
         let Some(aus) = drive_live(Codec::H265, false, 30, |_, _| {}) else {
             return;
@@ -2400,6 +2405,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_hevc10_hdr() {
         let Some(aus) = drive_live(Codec::H265, true, 30, |_, _| {}) else {
             return;
@@ -2409,6 +2415,7 @@ mod tests {
 
     /// AV1 output is an OBU stream, not Annex-B.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_av1_10bit() {
         let Some(aus) = drive_live(Codec::Av1, true, 30, |_, _| {}) else {
             return;
@@ -2425,6 +2432,7 @@ mod tests {
     /// Compares the two reads rather than demanding LTR, so a GPU that genuinely declines still
     /// passes; the printed values say which happened.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_caps_do_not_change_at_the_first_submit_live() {
         let (mut at_open, mut later) = (None, None);
         let Some(_) = drive_live(Codec::H264, false, 4, |enc, i| {
@@ -2447,6 +2455,7 @@ mod tests {
 
     /// Mid-stream invalidate must emit a `recovery_anchor` P-frame, not an IDR.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_ltr_rfi() {
         let mut rfi_answered = false;
         let Some(aus) = drive_live(Codec::H264, false, 60, |enc, i| {
@@ -2479,6 +2488,7 @@ mod tests {
 
     /// A loss covering every live LTR mark must decline (IDR fallback); no recovery_anchor AU.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_ltr_rfi_taint_sweep_declines() {
         let mut rfi_answered = None;
         let Some(aus) = drive_live(Codec::H264, false, 60, |enc, i| {
@@ -2509,6 +2519,7 @@ mod tests {
     /// frame is an IDR, which resets both. Refuses one mark frame and one recovery frame; the
     /// mirror checks skip when the driver declines LTR.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_refused_submit_forces_idr() {
         let mut ltr = false;
         let mut refused = (0u32, 0u32);
@@ -2567,6 +2578,7 @@ mod tests {
 
     /// Mid-stream `reconfigure_bitrate` must accept and must not emit a keyframe.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_bitrate_retarget() {
         let mut accepted = false;
         let Some(aus) = drive_live(Codec::H264, false, 60, |enc, i| {
@@ -2588,6 +2600,7 @@ mod tests {
     /// 1920×1088 pool surface whose chroma plane sits at a different row offset
     /// than the source. Dumps `%TEMP%\pf_qsv_1080_bars.h265` for off-box decode.
     #[test]
+    #[ignore = "needs an Intel GPU with QSV"]
     fn qsv_live_p010_1080_colorbars_dump() {
         use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
         use windows::Win32::Graphics::Direct3D11::{

@@ -145,6 +145,14 @@ impl VulkanToday {
     }
 }
 
+/// Whether loss event `e` spoils `w` with `next` pictures encoded: VAAPI's `spoiled_by`, its
+/// start `index` pictures back.
+fn spoils(w: Wave, next: u64, e: u8) -> bool {
+    let next = next as i64;
+    let lost = if e == b'l' { 0 } else { next - 1 };
+    w.spoiled_by(Some(next - i64::from(w.index)), next, lost)
+}
+
 fn refs(idr: bool, anchor: bool, acked: bool) -> FrameRef {
     if idr {
         FrameRef::Idr
@@ -197,7 +205,7 @@ impl Model for VulkanPlanned {
 }
 
 /// `vaapi_native.rs`: `invalidate_ref_frames` and `submit`. `anchor` holds what the slot
-/// would be tagged as.
+/// would be tagged as. As in [`NvencToday`], `l` loses the first picture and `a` the newest.
 struct VaapiToday {
     wave_enabled: Option<u32>,
     force_kf: bool,
@@ -222,8 +230,8 @@ impl Model for VaapiToday {
                     return None;
                 }
                 if let Some(cycle) = self.wave_enabled.filter(|_| self.next_wire > 0) {
-                    if self.wave.is_some() {
-                        self.wave_spoiled = true;
+                    if let Some(w) = self.wave {
+                        self.wave_spoiled |= spoils(w, self.next_wire, e);
                         self.wave_queued = true;
                         return None;
                     }
@@ -285,8 +293,8 @@ impl VaapiToday {
     }
 }
 
-/// VAAPI through the planner: a loss resolves at the report, every mid-wave loss spoils, and
-/// the session cannot wave before its first picture.
+/// VAAPI through the planner: a loss resolves at the report, a loss inside the sweep spoils,
+/// and the session cannot wave before its first picture.
 struct VaapiPlanned {
     cycle: Option<u32>,
     state: Recovery,
@@ -316,7 +324,14 @@ impl Model for VaapiPlanned {
                 self.empty |= e == b'l';
                 self.anchor = !self.empty;
                 if !self.anchor {
-                    self.state = self.state.lose(&self.policy(), true).unwrap_or(self.state);
+                    let spoils = self
+                        .state
+                        .wave
+                        .is_some_and(|w| spoils(w, self.next_wire, e));
+                    self.state = self
+                        .state
+                        .lose(&self.policy(), spoils)
+                        .unwrap_or(self.state);
                 }
             }
             _ => {
@@ -420,7 +435,7 @@ impl NvencToday {
         let idr = forced || opening;
         let ltr_force = self.floor && !idr && wave.is_none();
         Au {
-            refs: refs(idr, anchor, ltr_force),
+            refs: refs(idr, anchor && wave.is_none(), ltr_force),
             wave,
             mark,
             // There is no per-picture bit: `wave_span` covers a spoiled close from the queued
@@ -585,13 +600,13 @@ const VAAPI: &[Row] = &[
     ("flfffff", "I S w w C .", "a loss with none: a wave"),
     (
         "flfflfffffff",
-        "I S w w x S w w C .",
-        "a loss mid-wave spoils it, queues one",
+        "I S w w C S w w C .",
+        "a loss before the sweep queues a wave",
     ),
     (
         "fllfffffffff",
-        "I S w w x S w w C .",
-        "a second loss spoils a wave not yet started",
+        "I S w w C S w w C .",
+        "a wave not yet started is never spoiled",
     ),
     ("falfffff", "I S w w C .", "a later loss drops the anchor"),
     ("flffaff", "I S w A .", "an anchor abandons the wave"),
@@ -632,8 +647,8 @@ pub(crate) const NVENC: &[Row] = &[
     ),
     (
         "falfffff",
-        "I AS w w C .",
-        "an armed anchor rides the wave start",
+        "I S w w C .",
+        "a declined loss leaves the wave start untagged",
     ),
     ("flffakff", "I S w I .", "an IDR drops wave and queue"),
     ("fakff", "I I .", "an IDR outranks the anchor"),

@@ -194,14 +194,14 @@ pub(super) fn run_service() -> Result<()> {
     result
 }
 
-/// 0.5 s more per exit in a row, up to 5 s. Only a console switch or a restart the host asked
-/// for clears the count, which also arms the rollback at three.
+/// 0.5 s more per exit in a row, up to 5 s. A run of a minute, a console switch or a restart
+/// the host asked for clears the count, which also arms the rollback at three.
 const HOST_BACKOFF: Backoff = Backoff::new(
     Curve::Linear {
         step: Duration::from_millis(500),
         steps: 10,
     },
-    Reset::Never,
+    Reset::AfterRun(Duration::from_secs(60)),
 );
 
 /// Supervises the ordinary host in the active console session and the web console

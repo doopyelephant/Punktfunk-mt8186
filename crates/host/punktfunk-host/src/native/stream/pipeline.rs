@@ -46,9 +46,46 @@ pub(in crate::native) type PrepHandle = (
     std::thread::JoinHandle<Result<()>>,
 );
 
+/// What every pipeline build of one session asks for. A rebuild moves a field or two: the
+/// mode, the rate, the wire index its encoder continues at.
+#[derive(Clone, Copy)]
+pub(super) struct BuildRequest {
+    pub(super) mode: punktfunk_core::Mode,
+    /// The wire budget; the encoder opens at what `enc_of` derives from it.
+    pub(super) bitrate_kbps: u32,
+    pub(super) bitrate_auto: bool,
+    pub(super) bit_depth: u8,
+    pub(super) enc_of: EncDerive,
+    pub(super) plan: crate::session_plan::SessionPlan,
+    pub(super) client_hdr: Option<pf_frame::HdrMeta>,
+    /// The loop's `au_seq`: a driver encoder's wire index continues there.
+    pub(super) wire_seq_base: u32,
+}
+
+/// The session a Welcome-time [`prepare_display`] builds for, as the handshake settled it.
+pub(in crate::native) struct DisplayPrep {
+    pub(in crate::native) compositor: crate::vdisplay::Compositor,
+    pub(in crate::native) mode: punktfunk_core::Mode,
+    pub(in crate::native) client_identity: Option<[u8; 32]>,
+    pub(in crate::native) client_hdr: Option<pf_frame::HdrMeta>,
+    pub(in crate::native) cursor_forward: bool,
+    pub(in crate::native) multi_slice: bool,
+    pub(in crate::native) bitrate_kbps: u32,
+    pub(in crate::native) bitrate_auto: bool,
+    pub(in crate::native) bit_depth: u8,
+    pub(in crate::native) hdr: bool,
+    pub(in crate::native) enc_of: EncDerive,
+    pub(in crate::native) chroma: crate::encode::ChromaFormat,
+    pub(in crate::native) codec: crate::encode::Codec,
+    pub(in crate::native) pyrowave_bpp: f64,
+    pub(in crate::native) shard_payload: u16,
+    /// A joiner's view and fit; `Some` for a session `mode_conflict: join` admitted.
+    pub(in crate::native) reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
+}
+
 /// A virtual-display session's plan on `compositor`, `pyrowave_bpp` the session's. Bring-up
 /// and the Welcome-time prep both resolve here, so a prepared pipeline is built from the plan
-/// its session runs.
+/// its session runs. `multi_slice` names no count, so it takes the host's default.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_plan(
     bit_depth: u8,
@@ -78,7 +115,11 @@ pub(super) fn resolve_plan(
             route,
         ),
         cursor_forward,
-        multi_slice,
+        if multi_slice {
+            crate::session_plan::DEFAULT_SLICES
+        } else {
+            1
+        },
     );
     // After resolve: a self-painting gamescope node would otherwise get a second XFixes pointer.
     plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(
@@ -99,30 +140,31 @@ pub(super) fn resolve_plan(
 }
 
 /// Build display + pipeline at Welcome time, with the plan and display request bring-up would
-/// use. `reframe_to` is `Some` for a session `mode_conflict: join` admitted. Windows-only by
-/// policy (`handshake.rs` never spawns it elsewhere), not by construction.
-#[allow(clippy::too_many_arguments)]
+/// use. Windows-only by policy (`handshake.rs` never spawns it elsewhere), not by construction.
 pub(in crate::native) fn prepare_display(
-    compositor: crate::vdisplay::Compositor,
-    mode: punktfunk_core::Mode,
-    client_identity: Option<[u8; 32]>,
-    client_hdr: Option<pf_frame::HdrMeta>,
-    cursor_forward: bool,
-    multi_slice: bool,
-    bitrate_kbps: u32,
-    bitrate_auto: bool,
-    bit_depth: u8,
-    hdr: bool,
-    enc_of: EncDerive,
-    chroma: crate::encode::ChromaFormat,
-    codec: crate::encode::Codec,
-    pyrowave_bpp: f64,
-    shard_payload: u16,
-    reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
+    prep: DisplayPrep,
     quit: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     trace: &crate::bringup::Trace,
 ) -> Result<PreparedDisplay> {
+    let DisplayPrep {
+        compositor,
+        mode,
+        client_identity,
+        client_hdr,
+        cursor_forward,
+        multi_slice,
+        bitrate_kbps,
+        bitrate_auto,
+        bit_depth,
+        hdr,
+        enc_of,
+        chroma,
+        codec,
+        pyrowave_bpp,
+        shard_payload,
+        reframe_to,
+    } = prep;
     let join_live = reframe_to.is_some();
     let plan = resolve_plan(
         bit_depth,
@@ -163,23 +205,46 @@ pub(in crate::native) fn prepare_display(
         (mode.width, mode.height),
         stop,
     )?;
-    let pipeline = build_pipeline_with_retry(
-        &mut vd,
+    let req = BuildRequest {
         mode,
         bitrate_kbps,
         bitrate_auto,
         bit_depth,
         enc_of,
         plan,
-        quit,
-        stop,
-        None,
-        8,
-        Some(trace),
         client_hdr,
-        0,
-    )?;
+        wire_seq_base: 0,
+    };
+    let pipeline = build_pipeline_with_retry(&mut vd, &req, quit, stop, None, 8, Some(trace))?;
     Ok(PreparedDisplay { vd, pipeline })
+}
+
+/// Run [`prepare_display`] on the thread that becomes the stream thread once Start delivers its
+/// [`SessionContext`]. A dropped sender (handshake abort, punch failure) drops what was built,
+/// which hands the monitor to keep-alive like a normal session end. `None` when the thread
+/// does not spawn: bring-up then builds inline. Compiled on every host; only Windows calls it.
+pub(in crate::native) fn spawn_display_prep(
+    prep: DisplayPrep,
+    quit: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    trace: Arc<crate::bringup::Trace>,
+) -> Option<PrepHandle> {
+    let (ctx_tx, ctx_rx) = std::sync::mpsc::sync_channel::<SessionContext>(1);
+    std::thread::Builder::new()
+        .name("punktfunk1-stream".into())
+        .spawn(move || -> Result<()> {
+            let prepared = prepare_display(prep, &quit, &stop, &trace);
+            let Ok(ctx) = ctx_rx.recv() else {
+                return Ok(());
+            };
+            virtual_stream(ctx, Some(prepared?))
+        })
+        .map(|handle| (ctx_tx, handle))
+        .map_err(|e| {
+            tracing::warn!(error = %e,
+                "display-prep thread spawn failed — falling back to inline bring-up")
+        })
+        .ok()
 }
 
 /// A first attempt's first-frame budget; later attempts wait the capturer's own default.
@@ -190,27 +255,22 @@ const FIRST_ATTEMPT_FRAME_BUDGET: std::time::Duration = std::time::Duration::fro
 /// attempt drops its capturer so the next create is clean. `supersedes` is the lease this
 /// build replaces (create-before-drop): without it the registry counts the old lease as a live
 /// sibling and the new display extends the group instead of heading it.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn build_pipeline_with_retry(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
-    mode: punktfunk_core::Mode,
-    bitrate_kbps: u32,
-    bitrate_auto: bool,
-    bit_depth: u8,
-    enc_of: EncDerive,
-    plan: crate::session_plan::SessionPlan,
+    req: &BuildRequest,
     quit: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     supersedes: Option<u64>,
     max_attempts: u32,
     trace: Option<&crate::bringup::Trace>,
-    client_hdr: Option<pf_frame::HdrMeta>,
-    wire_seq_base: u32,
 ) -> Result<Pipeline> {
     // IDD-push: hold one lease across attempts so a failed capturer drop does not Lingering-preempt.
-    let _retry_hold = if matches!(plan.capture, crate::session_plan::CaptureBackend::IddPush) {
+    let _retry_hold = if matches!(
+        req.plan.capture,
+        crate::session_plan::CaptureBackend::IddPush
+    ) {
         Some(
-            vd.create(display_mode_for(mode, vd.name()))
+            vd.create(display_mode_for(req.mode, vd.name()))
                 .context("acquire virtual output for the session (retry-hold lease)")?,
         )
     } else {
@@ -226,21 +286,7 @@ pub(super) fn build_pipeline_with_retry(
             );
         }
         let first_frame_budget = (attempt == 1).then_some(FIRST_ATTEMPT_FRAME_BUDGET);
-        match build_pipeline(
-            vd,
-            mode,
-            bitrate_kbps,
-            bitrate_auto,
-            bit_depth,
-            enc_of,
-            plan,
-            quit,
-            supersedes,
-            first_frame_budget,
-            trace,
-            client_hdr,
-            wire_seq_base,
-        ) {
+        match build_pipeline(vd, req, quit, supersedes, first_frame_budget, trace) {
             Ok(pipe) => {
                 if attempt > 1 {
                     tracing::info!(attempt, "pipeline up after retry");
@@ -378,13 +424,50 @@ pub(super) fn pacing_hz(session_hz: u32, achieved_hz: u32) -> u32 {
     achieved_hz.min(session_hz).max(1)
 }
 
+/// What [`open_session_encoder`] asks [`crate::encode::open_video`] for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VideoOpen {
+    codec: crate::encode::Codec,
+    format: pf_frame::PixelFormat,
+    width: u32,
+    height: u32,
+    hz: u32,
+    bitrate_bps: u64,
+    cuda: bool,
+    bit_depth: u8,
+    hdr: bool,
+    chroma: crate::encode::ChromaFormat,
+    cursor_blend: bool,
+    slices: u32,
+}
+
+impl VideoOpen {
+    fn open(self) -> Result<Box<dyn crate::encode::Encoder>> {
+        crate::encode::open_video(
+            self.codec,
+            self.format,
+            self.width,
+            self.height,
+            self.hz,
+            self.bitrate_bps,
+            self.cuda,
+            self.bit_depth,
+            self.hdr,
+            self.chroma,
+            self.cursor_blend,
+            self.slices,
+        )
+    }
+}
+
 /// Open the session's encoder for `frame` — framed for a joiner, or at the client's `negotiated`
 /// size when a larger head is mirrored (`session_plan::open_encoder_fitted`) — with the plan's
-/// chunking and the capturer's ring depth applied, and return the framing it encodes. `bitrate_bps` is asked
-/// for that size. An IDD-push source gets the driver's encoder instead, its wire-index domain
-/// continuing at `wire_seq_base` (the loop's `au_seq`).
+/// chunking, slice ceiling and the capturer's ring depth applied, and return the framing it
+/// encodes. `bitrate_bps` is asked for that size. An IDD-push source gets the driver's encoder
+/// instead, its wire-index domain continuing at `wire_seq_base` (the loop's `au_seq`). Both
+/// stream loops open here: GameStream's plan carries the client's own slice count.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn open_session_encoder(
+pub(crate) fn open_session_encoder(
     plan: &crate::session_plan::SessionPlan,
     capturer: &dyn crate::capture::Capturer,
     frame: &crate::capture::CapturedFrame,
@@ -394,6 +477,37 @@ pub(super) fn open_session_encoder(
     bit_depth: u8,
     client_hdr: Option<pf_frame::HdrMeta>,
     wire_seq_base: u32,
+) -> Result<(
+    Box<dyn crate::encode::Encoder>,
+    punktfunk_core::video_fit::Reframe,
+)> {
+    open_session_encoder_with(
+        plan,
+        capturer,
+        frame,
+        negotiated,
+        hz,
+        bitrate_bps,
+        bit_depth,
+        client_hdr,
+        wire_seq_base,
+        VideoOpen::open,
+    )
+}
+
+/// [`open_session_encoder`] through `open_video`, which a test replaces.
+#[allow(clippy::too_many_arguments)]
+fn open_session_encoder_with(
+    plan: &crate::session_plan::SessionPlan,
+    capturer: &dyn crate::capture::Capturer,
+    frame: &crate::capture::CapturedFrame,
+    negotiated: (u32, u32),
+    hz: u32,
+    bitrate_bps: impl Fn(u32, u32) -> u64,
+    bit_depth: u8,
+    client_hdr: Option<pf_frame::HdrMeta>,
+    wire_seq_base: u32,
+    mut open_video: impl FnMut(VideoOpen) -> Result<Box<dyn crate::encode::Encoder>>,
 ) -> Result<(
     Box<dyn crate::encode::Encoder>,
     punktfunk_core::video_fit::Reframe,
@@ -421,20 +535,20 @@ pub(super) fn open_session_encoder(
         negotiated,
         plan.reframe_to,
         |width, height| {
-            crate::encode::open_video(
-                plan.codec,
-                frame.format,
+            open_video(VideoOpen {
+                codec: plan.codec,
+                format: frame.format,
                 width,
                 height,
                 hz,
-                bitrate_bps(width, height),
-                frame.is_cuda(),
+                bitrate_bps: bitrate_bps(width, height),
+                cuda: frame.is_cuda(),
                 bit_depth,
-                plan.hdr,
-                plan.chroma,
-                plan.cursor_blend,
-                plan.max_slices,
-            )
+                hdr: plan.hdr,
+                chroma: plan.chroma,
+                cursor_blend: plan.cursor_blend,
+                slices: plan.slices,
+            })
         },
     )?;
     if let Some(c) = plan.wire_chunk {
@@ -444,97 +558,64 @@ pub(super) fn open_session_encoder(
     Ok((enc, framed))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Acquire a display at `req`'s mode and attach capture and an encoder to it.
 pub(super) fn build_pipeline(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
-    mode: punktfunk_core::Mode,
-    bitrate_kbps: u32,
-    bitrate_auto: bool,
-    bit_depth: u8,
-    enc_of: EncDerive,
-    plan: crate::session_plan::SessionPlan,
+    req: &BuildRequest,
     quit: &Arc<AtomicBool>,
     supersedes: Option<u64>,
     first_frame_budget: Option<std::time::Duration>,
     trace: Option<&crate::bringup::Trace>,
-    client_hdr: Option<pf_frame::HdrMeta>,
-    wire_seq_base: u32,
 ) -> Result<Pipeline> {
-    let display_mode = display_mode_for(mode, vd.name());
+    let display_mode = display_mode_for(req.mode, vd.name());
     let vout = crate::vdisplay::registry::acquire(vd, display_mode, quit.clone(), supersedes)
         .context("create virtual output")?;
     if let Some(t) = trace {
         t.mark("display_acquired");
     }
-    attach_pipeline(
-        vd,
-        vout,
-        mode,
-        display_mode,
-        bitrate_kbps,
-        bitrate_auto,
-        bit_depth,
-        enc_of,
-        plan,
-        first_frame_budget,
-        trace,
-        client_hdr,
-        wire_seq_base,
-    )
+    attach_pipeline(vd, vout, req, display_mode, first_frame_budget, trace)
 }
 
 /// A capture-only rebuild: the output the session already holds, a new capture and encoder
 /// on it. `keepalive` is what the old capturer handed back; it moves into the new one, or
 /// drops with the error and releases the output like any failed build.
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
 pub(super) fn reattach_pipeline(
     vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
     lease: OutputLease,
     keepalive: Box<dyn Send>,
-    mode: punktfunk_core::Mode,
-    bitrate_kbps: u32,
-    bitrate_auto: bool,
-    bit_depth: u8,
-    enc_of: EncDerive,
-    plan: crate::session_plan::SessionPlan,
-    client_hdr: Option<pf_frame::HdrMeta>,
-    wire_seq_base: u32,
+    req: &BuildRequest,
 ) -> Result<Pipeline> {
+    let display_mode = display_mode_for(req.mode, vd.name());
     attach_pipeline(
         vd,
         lease.into_output(keepalive),
+        req,
+        display_mode,
+        Some(FIRST_ATTEMPT_FRAME_BUDGET),
+        None,
+    )
+}
+
+/// Capture + encoder on an acquired output. Consumes `vout`: the capturer owns its keepalive.
+fn attach_pipeline(
+    vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
+    vout: crate::vdisplay::VirtualOutput,
+    req: &BuildRequest,
+    display_mode: punktfunk_core::Mode,
+    first_frame_budget: Option<std::time::Duration>,
+    trace: Option<&crate::bringup::Trace>,
+) -> Result<Pipeline> {
+    let BuildRequest {
         mode,
-        display_mode_for(mode, vd.name()),
         bitrate_kbps,
         bitrate_auto,
         bit_depth,
         enc_of,
         plan,
-        Some(FIRST_ATTEMPT_FRAME_BUDGET),
-        None,
         client_hdr,
         wire_seq_base,
-    )
-}
-
-/// Capture + encoder on an acquired output. Consumes `vout`: the capturer owns its keepalive.
-#[allow(clippy::too_many_arguments)]
-fn attach_pipeline(
-    vd: &mut Box<dyn crate::vdisplay::VirtualDisplay>,
-    vout: crate::vdisplay::VirtualOutput,
-    mode: punktfunk_core::Mode,
-    display_mode: punktfunk_core::Mode,
-    bitrate_kbps: u32,
-    bitrate_auto: bool,
-    bit_depth: u8,
-    enc_of: EncDerive,
-    plan: crate::session_plan::SessionPlan,
-    first_frame_budget: Option<std::time::Duration>,
-    trace: Option<&crate::bringup::Trace>,
-    client_hdr: Option<pf_frame::HdrMeta>,
-    wire_seq_base: u32,
-) -> Result<Pipeline> {
+    } = *req;
     #[cfg(target_os = "linux")]
     let reused_gen = vout.reused_gen;
     #[cfg(target_os = "linux")]
@@ -692,6 +773,103 @@ fn attach_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::Capturer;
+
+    /// Encodes nothing.
+    struct NullEnc;
+
+    impl crate::encode::Encoder for NullEnc {
+        fn submit(&mut self, _frame: &crate::capture::CapturedFrame) -> Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> Result<Option<crate::encode::EncodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn plan(
+        chroma: crate::encode::ChromaFormat,
+        hdr: bool,
+        slices: u32,
+    ) -> crate::session_plan::SessionPlan {
+        crate::session_plan::SessionPlan {
+            capture: crate::session_plan::CaptureBackend::Portal,
+            topology: crate::session_plan::SessionTopology::SingleProcess,
+            encoder: crate::session_plan::EncoderBackend::Software,
+            bit_depth: if hdr { 10 } else { 8 },
+            hdr,
+            chroma,
+            codec: crate::encode::Codec::H265,
+            wire_chunk: None,
+            pyrowave_bpp: 0.0,
+            cursor_blend: true,
+            cursor_forward: false,
+            gamescope_cursor: false,
+            sdr10_native: false,
+            slices,
+            reframe_to: None,
+        }
+    }
+
+    /// Native opens a 4:4:4 HDR session at its own depth and a rate per encoded size;
+    /// GameStream a 4:2:0 one at the client's slice count, the frame's depth and one rate.
+    #[test]
+    fn both_loops_open_the_encoder_their_plan_names() {
+        let mut cap = crate::capture::SyntheticCapturer::new(64, 32, 60);
+        let frame = cap.next_frame().expect("a synthetic frame");
+        let want =
+            |plan: &crate::session_plan::SessionPlan, hz, bitrate_bps, bit_depth| VideoOpen {
+                codec: plan.codec,
+                format: frame.format,
+                width: 64,
+                height: 32,
+                hz,
+                bitrate_bps,
+                cuda: false,
+                bit_depth,
+                hdr: plan.hdr,
+                chroma: plan.chroma,
+                cursor_blend: true,
+                slices: plan.slices,
+            };
+        let open = |plan: &crate::session_plan::SessionPlan,
+                    hz,
+                    bitrate_bps: fn(u32, u32) -> u64,
+                    bit_depth| {
+            let mut asked = Vec::new();
+            let (_, reframe) = open_session_encoder_with(
+                plan,
+                &cap,
+                &frame,
+                (64, 32),
+                hz,
+                bitrate_bps,
+                bit_depth,
+                None,
+                1,
+                |v| {
+                    asked.push(v);
+                    Ok(Box::new(NullEnc))
+                },
+            )
+            .expect("an encoder");
+            assert!(reframe.is_full());
+            asked
+        };
+        let native = plan(
+            crate::encode::ChromaFormat::Yuv444,
+            true,
+            crate::session_plan::DEFAULT_SLICES,
+        );
+        let asked = open(&native, 120, |w, h| u64::from(w * h), 10);
+        assert_eq!(asked, [want(&native, 120, 64 * 32, 10)]);
+        let gamestream = plan(crate::encode::ChromaFormat::Yuv420, false, 4);
+        let asked = open(&gamestream, 60, |_, _| 16_287_878, 8);
+        assert_eq!(asked, [want(&gamestream, 60, 16_287_878, 8)]);
+    }
 
     #[test]
     fn pacing_never_exceeds_the_session_rate_or_the_display() {

@@ -88,7 +88,8 @@ pub use library::{
 };
 pub use model::{
     ConsoleBus, ConsoleCmd, ConsoleShared, HostAction, HostRow, LicenseSection, OtherDevice,
-    PadTestState, PairPhase, PresetChip, ProfilesAnswer, SpeedPhase, SpeedStatus, WakeStatus,
+    PadTestState, PairPhase, PairStatus, PresetChip, ProfilesAnswer, RequestKey, SpeedPhase,
+    SpeedStatus, WakeStatus,
 };
 pub use platform::Platform;
 pub use ring::Ring;

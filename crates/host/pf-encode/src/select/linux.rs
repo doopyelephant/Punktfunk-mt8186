@@ -268,7 +268,7 @@ fn open_nvenc(p: &OpenParams) -> Result<Box<dyn Encoder>> {
             p.hdr,
             p.chroma,
             p.cursor_blend,
-            p.max_slices,
+            p.slices,
         )?) as Box<dyn Encoder>)
     }
     #[cfg(not(feature = "nvenc"))]
@@ -364,10 +364,11 @@ pub fn linux_hdr_cuda_ok() -> bool {
 /// before capture opens: blend-capable backends take cursor-as-metadata; else
 /// the compositor must embed the pointer.
 ///
-/// `cuda_planned` is the caller's CUDA-payload prediction; `ten_bit` the
-/// negotiated depth and `hdr` the colour verdict. A CPU payload is uploaded, and
-/// never blended. The AMD/Intel arm asks [`amd_intel_opens_vulkan`], the rule the
-/// open takes, so the prediction names the encoder the session gets.
+/// `cuda_planned` is the caller's CUDA-payload prediction, which picks the backend;
+/// `ten_bit` the negotiated depth and `hdr` the colour verdict. NVENC blends any
+/// payload while its Vulkan slot device is up, the rule its `caps()` states; the slot
+/// device is predicted up. The AMD/Intel arm asks [`amd_intel_opens_vulkan`], the rule
+/// the open takes, so the prediction names the encoder the session gets.
 pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool, hdr: bool) -> bool {
     // Negotiated PyroWave is selected before the pref; its CSC composites the cursor.
     if codec == Codec::PyroWave {
@@ -398,7 +399,7 @@ pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool, hdr
             false
         }
     };
-    cursor_blend_capable_for(backend, cuda_planned, direct_nvenc, vulkan_csc)
+    cursor_blend_capable_for(backend, direct_nvenc, vulkan_csc)
 }
 
 /// The depth the AMD/Intel arm asks Vulkan Video for, or `None` when it goes straight to VAAPI.
@@ -424,15 +425,14 @@ fn amd_intel_opens_vulkan(codec: Codec, ten_bit: bool, hdr: bool) -> bool {
 /// `direct_nvenc` / `vulkan_csc` are the blend-capable arms, already gated.
 fn cursor_blend_capable_for(
     backend: Option<LinuxBackend>,
-    cuda_planned: bool,
     direct_nvenc: bool,
     vulkan_csc: bool,
 ) -> bool {
     match backend {
         Some(LinuxBackend::Pyrowave) => true,
-        // Direct-SDK only (VkSlotBlend), and only a CUDA payload: an uploaded
-        // CPU frame arrives after the blend point.
-        Some(LinuxBackend::Nvenc) => cuda_planned && direct_nvenc,
+        // Direct-SDK only (VkSlotBlend). A CUDA buffer and an uploaded CPU frame land in
+        // the same slot, and the blend runs on the slot.
+        Some(LinuxBackend::Nvenc) => direct_nvenc,
         // Compute-CSC blends at either depth. Cursor sessions stay off native-NV12
         // / RGB-direct, so CSC eligibility (already carrying depth) is the answer.
         Some(LinuxBackend::AmdIntel) | Some(LinuxBackend::Vulkan) => vulkan_csc,
@@ -853,30 +853,24 @@ mod tests {
     #[test]
     fn cursor_blend_capability_mirrors_the_dispatch() {
         use LinuxBackend::*;
-        assert!(cursor_blend_capable_for(
-            Some(Pyrowave),
-            false,
-            false,
-            false
-        ));
-        assert!(cursor_blend_capable_for(Some(Nvenc), true, true, false));
+        assert!(cursor_blend_capable_for(Some(Pyrowave), false, false));
         assert!(
-            !cursor_blend_capable_for(Some(Nvenc), false, true, false),
-            "a CPU payload is uploaded, past the blend point"
+            cursor_blend_capable_for(Some(Nvenc), true, false),
+            "a CUDA buffer or an uploaded CPU frame: both reach the slot blend"
         );
         assert!(
-            !cursor_blend_capable_for(Some(Nvenc), true, false, false),
+            !cursor_blend_capable_for(Some(Nvenc), false, false),
             "a build without the `nvenc` feature has no NVENC at all"
         );
-        assert!(cursor_blend_capable_for(Some(AmdIntel), false, false, true));
+        assert!(cursor_blend_capable_for(Some(AmdIntel), false, true));
         assert!(
-            !cursor_blend_capable_for(Some(AmdIntel), false, false, false),
+            !cursor_blend_capable_for(Some(AmdIntel), false, false),
             "no eligible Vulkan CSC arm (H.264, PUNKTFUNK_VULKAN_ENCODE=0, unsupported \
              device) resolves to native VAAPI, which cannot blend"
         );
-        assert!(cursor_blend_capable_for(Some(Vulkan), false, false, true));
-        assert!(!cursor_blend_capable_for(Some(Software), false, true, true));
-        assert!(!cursor_blend_capable_for(None, false, true, true));
+        assert!(cursor_blend_capable_for(Some(Vulkan), false, true));
+        assert!(!cursor_blend_capable_for(Some(Software), true, true));
+        assert!(!cursor_blend_capable_for(None, true, true));
     }
 
     #[cfg(feature = "vulkan-encode")]
@@ -958,7 +952,7 @@ mod tests {
             hdr: false,
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
-            max_slices: 4,
+            slices: 4,
         };
         let (enc, label) =
             open_video_backend_linux("software", &sw).expect("software arm must open GPU-free");
@@ -993,7 +987,7 @@ mod tests {
             hdr: false,
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
-            max_slices: 4,
+            slices: 4,
         };
         match open_video_backend_linux("vulkan", &hevc) {
             Ok((_, label)) => assert!(matches!(label, "vulkan" | "vaapi-native"), "{label}"),
@@ -1020,7 +1014,7 @@ mod tests {
             hdr: false,
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
-            max_slices: 32,
+            slices: 4,
         };
         let (enc, backend) = open_video_backend_linux("auto", &p).expect("open");
         assert_eq!(backend, "vaapi-native");

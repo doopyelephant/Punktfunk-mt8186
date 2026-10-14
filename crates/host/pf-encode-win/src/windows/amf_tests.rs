@@ -61,19 +61,10 @@ fn amd_d3d11_device() -> Option<ID3D11Device> {
     }
 }
 
-/// Live [`Encoder`] smoke per codec: submit/poll, native `reset()`, second batch, flush-drain.
-/// Asserts Annex-B (or AV1 OBU), IDR at start and after reset, FIFO pts. Skips without AMD.
-/// The driver answers SET_ENCODE — where the host latches these caps for the session — before
-/// any frame is submitted, so what `caps()` says at that moment must be what the encoder
-/// negotiated. LTR and intra-refresh are decided in `ensure_inner`, which used to run only at
-/// the first submit: the host therefore latched `supports_rfi: false` and never sent a
-/// reference-frame invalidation, costing a full IDR per lost frame.
-///
-/// Hardware-independent: it compares the two reads rather than demanding LTR, so a GPU that
-/// genuinely declines still passes (and the printed values say which happened).
 /// A skipped frame repeats the reference; under the one-frame VBV that is the picture
 /// freezing on a scene cut, so the open must leave the switch off whatever the usage set.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_frame_skip_is_off_after_open_live() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     if let Err(e) = try_factory() {
@@ -116,7 +107,11 @@ fn amf_frame_skip_is_off_after_open_live() {
     );
 }
 
+/// The host latches the caps once, at SET_ENCODE, before any frame: what `caps()` says after
+/// the open must be what the encoder negotiated, or every loss costs a full IDR. Compares the
+/// two reads rather than demanding LTR, so a GPU that declines it still passes.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_caps_do_not_change_at_the_first_submit_live() {
     if let Err(e) = try_factory() {
         eprintln!("skipping: AMF runtime unavailable ({e})");
@@ -179,6 +174,7 @@ fn amf_caps_do_not_change_at_the_first_submit_live() {
 /// input. A session that flushed must encode again, and every AU on both sides of the
 /// flush must carry the pts of the frame it encodes.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_encodes_again_after_a_flush_live() {
     if let Err(e) = try_factory() {
         eprintln!("skipping: AMF runtime unavailable ({e})");
@@ -262,6 +258,7 @@ fn amf_encodes_again_after_a_flush_live() {
 /// the caller's own texture in place, which is how the driver's pool submits. Skips
 /// without AMD.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_bgra_encode_live_smoke() {
     use crate::smoke_d3d11::bgra_texture;
     use crate::smoke_pattern::scroll_pattern;
@@ -363,6 +360,7 @@ fn amf_bgra_encode_live_smoke() {
 /// reset. HEVC must take it; an AV1 that declines is the driver's P010 fallback, so it
 /// is reported and skipped. Skips without AMD.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_fp16_hdr_encode_live() {
     use windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA;
     if let Err(e) = try_factory() {
@@ -489,6 +487,7 @@ fn amf_fp16_hdr_encode_live() {
 /// An open encoder with nothing to encode costs no CPU: its retrieve thread parks in
 /// `QueryOutput` or samples it, never spins on it. Skips without AMD.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_idle_encoder_does_not_spin_live() {
     use windows::Win32::Foundation::FILETIME;
     use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
@@ -562,7 +561,10 @@ fn amf_idle_encoder_does_not_spin_live() {
     }
 }
 
+/// Live [`Encoder`] smoke per codec: submit/poll, native `reset()`, second batch, flush-drain.
+/// Asserts Annex-B (or AV1 OBU), IDR at start and after reset, FIFO pts.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_encode_live_smoke() {
     if let Err(e) = try_factory() {
         eprintln!("skipping: AMF runtime unavailable ({e})");
@@ -683,6 +685,7 @@ fn amf_encode_live_smoke() {
 /// next frame is an IDR, which resets both. Refuses one mark frame and one recovery frame.
 /// Skips without AMD; the mirror checks skip when the driver declines LTR.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_refused_submit_forces_idr_live() {
     if let Err(e) = try_factory() {
         eprintln!("skipping: AMF runtime unavailable ({e})");
@@ -834,6 +837,7 @@ fn amf_ltr_anchor_soak() {
 /// Live `applied_bitrate_bps`: None before lazy open, open rate after submit, new rate after
 /// retarget. Skips without AMD.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_applied_bitrate_readback_live() {
     if let Err(e) = try_factory() {
         eprintln!("skipping: AMF runtime unavailable ({e})");
@@ -899,6 +903,7 @@ fn amf_applied_bitrate_readback_live() {
 /// Live: a rate no VCN takes opens at the encoder's ceiling, and so does a retarget.
 /// Skips without AMD.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_rate_over_ceiling_live() {
     if let Err(e) = try_factory() {
         eprintln!("skipping: AMF runtime unavailable ({e})");
@@ -941,6 +946,7 @@ fn amf_rate_over_ceiling_live() {
 
 /// Live probe: AVC and HEVC must be true on any VCN; AV1 is hardware truth (RDNA3+).
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_native_probe_live() {
     if let Err(e) = try_factory() {
         eprintln!("skipping: AMF runtime unavailable ({e})");
@@ -960,6 +966,7 @@ fn amf_native_probe_live() {
 /// Live HDR: P010 HEVC Main10 must encode. Mastering/CLL prefix SEI (payload 137/144) is
 /// soft-reported — VCN generations differ.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_hdr_encode_live_smoke() {
     use windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE;
     if let Err(e) = try_factory() {
@@ -1067,6 +1074,7 @@ fn amf_hdr_encode_live_smoke() {
 /// SPS VUI signals BT.709, not BT.2020 PQ. Same P010 ring as the HDR path; only the colour
 /// differs.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_sdr10_encode_live_smoke() {
     use windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE;
     if let Err(e) = try_factory() {
@@ -1179,6 +1187,7 @@ fn amf_sdr10_encode_live_smoke() {
 /// on RGB→P010 is NVIDIA-only, so prove AMD writes plausible luma. Mid-grey in → studio Y near
 /// 504 (10-bit); a failed render is black (0) or clipped.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn videoconverter_bgra_to_p010_bt709_live() {
     use crate::convert::VideoConverter;
     use pf_frame::d3d11_map::MappedSubresource;
@@ -1266,6 +1275,7 @@ fn videoconverter_bgra_to_p010_bt709_live() {
 
 /// Live intra-refresh property on a scratch component (does not mutate process env).
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_intra_refresh_property_live() {
     if let Err(e) = try_factory() {
         eprintln!("skipping: AMF runtime unavailable ({e})");
@@ -1303,6 +1313,7 @@ fn amf_intra_refresh_property_live() {
 /// Burst faster than the encoder drains (no poll between submits). `submit` must drain into
 /// `ready` instead of erroring. Asserts IDR-first FIFO across the ready→pending boundary.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_backpressure_burst_live() {
     if let Err(e) = try_factory() {
         eprintln!("skipping: AMF runtime unavailable ({e})");
@@ -1382,6 +1393,7 @@ fn amf_backpressure_burst_live() {
 /// FFI smoke: load, version-gate, CreateContext + HEVC CreateComponent. A layout error in
 /// the mirror crashes; pass/skip is the assertion.
 #[test]
+#[ignore = "needs an AMD GPU with AMF"]
 fn amf_factory_probe_smoke() {
     let lib = match try_factory() {
         Ok(l) => l,

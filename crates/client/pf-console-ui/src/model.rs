@@ -1,11 +1,34 @@
 //! Shared console snapshot and command bus, sibling of [`crate::library::LibraryShared`].
 //! Service threads (discovery, probing, pairing, waking, persistence) write snapshots;
 //! the shell reads them per frame by generation stamp. Anything that touches the
-//! network or disk rides a [`ConsoleCmd`] — the overlay never blocks.
+//! network or disk rides a [`ConsoleCmd`] — the overlay never blocks. A result that answers
+//! a command carries that command's [`RequestKey`].
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// The request a shared result answers: the host it went to and an epoch no other request
+/// shares. A producer copies `req` from the command onto each result; the console drops a
+/// result whose key is not the one it waits on. Epoch 0 is no request: work a producer
+/// started on its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestKey {
+    /// The host's fingerprint, or `addr:port` for a pairing.
+    pub host: String,
+    pub epoch: u64,
+}
+
+impl RequestKey {
+    pub(crate) fn new(host: &str) -> RequestKey {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        RequestKey {
+            host: host.to_string(),
+            epoch: NEXT.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
 
 /// Resolved catalog entry. The service thread opens the presets file; the shell never
 /// does.
@@ -157,10 +180,20 @@ pub enum PairPhase {
     },
 }
 
+/// A pairing phase and the `Pair` or `RequestAccess` it answers. Only the Pair screen that
+/// sent `req` shows it.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+pub struct PairStatus {
+    pub req: RequestKey,
+    pub phase: PairPhase,
+}
+
 /// A wake-and-wait in progress (one at a time). The service thread re-sends magic
 /// packets and probes; the shell renders the card and acts on `online`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WakeStatus {
+    /// The `Wake` this answers. See [`ConsoleShared::set_wake`].
+    pub req: RequestKey,
     pub key: String,
     pub name: String,
     /// Seconds since the wake started.
@@ -254,7 +287,7 @@ pub struct FindingRow {
 struct ConsoleState {
     hosts: Vec<HostRow>,
     hosts_gen: u64,
-    pair: PairPhase,
+    pair: PairStatus,
     wake: Option<WakeStatus>,
     speed: Option<SpeedStatus>,
     /// One-shot toast. The shell `take`s it on the next sync — unlike [`PairPhase`]
@@ -354,16 +387,40 @@ impl ConsoleShared {
         self.0.lock().unwrap().licenses.clone()
     }
 
-    pub fn set_pair(&self, phase: PairPhase) {
-        self.0.lock().unwrap().pair = phase;
+    pub fn set_pair(&self, status: PairStatus) {
+        self.0.lock().unwrap().pair = status;
     }
 
-    pub(crate) fn pair(&self) -> PairPhase {
+    pub(crate) fn pair(&self) -> PairStatus {
         self.0.lock().unwrap().pair.clone()
     }
 
+    /// The shell has shown `req`'s answer. A newer ceremony's phase stays.
+    pub(crate) fn settle_pair(&self, req: &RequestKey) {
+        let mut s = self.0.lock().unwrap();
+        if s.pair.req == *req {
+            s.pair.phase = PairPhase::Idle;
+        }
+    }
+
+    /// A producer's wake status, or `None` when its wake ended. A status lands on its own
+    /// request's card, or with no card up only at epoch 0, so a cancelled wake's late tick
+    /// cannot reopen a card the player closed.
     pub fn set_wake(&self, wake: Option<WakeStatus>) {
-        self.0.lock().unwrap().wake = wake;
+        let mut s = self.0.lock().unwrap();
+        let lands = match (&s.wake, &wake) {
+            (_, None) => true,
+            (Some(card), Some(w)) => card.req == w.req,
+            (None, Some(w)) => w.req.epoch == 0,
+        };
+        if lands {
+            s.wake = wake;
+        }
+    }
+
+    /// The shell's own card: raised as it sends a `Wake`, dropped on Back or once online.
+    pub(crate) fn put_wake(&self, card: Option<WakeStatus>) {
+        self.0.lock().unwrap().wake = card;
     }
 
     pub(crate) fn wake(&self) -> Option<WakeStatus> {
@@ -432,10 +489,12 @@ impl ConsoleShared {
 /// render path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConsoleCmd {
+    /// Answered on [`crate::LibraryShared`] under `req`.
     FetchLibrary {
         addr: String,
         mgmt: u16,
         fp_hex: String,
+        req: RequestKey,
     },
     /// Re-read running titles (`GET /api/v1/status`) without touching the catalog.
     /// Not [`Self::FetchLibrary`]: that sets `Loading` and would replace the shelf
@@ -445,12 +504,14 @@ pub enum ConsoleCmd {
         mgmt: u16,
         fp_hex: String,
     },
-    /// SPAKE2 PIN ceremony; on success persist the pin and refresh hosts.
+    /// SPAKE2 PIN ceremony; on success persist the pin and refresh hosts. Each phase is a
+    /// [`PairStatus`] under `req`.
     Pair {
         addr: String,
         port: u16,
         pin: String,
         device_name: String,
+        req: RequestKey,
     },
     /// No-PIN pairing: wait for the host's operator to approve this device, pinned to the
     /// advertised `fp_hex`. Reports like [`Self::Pair`]: Busy, then Paired or Failed. Never streams.
@@ -459,6 +520,7 @@ pub enum ConsoleCmd {
         port: u16,
         fp_hex: String,
         device_name: String,
+        req: RequestKey,
     },
     /// Upload the log ring to this paired host's management API. Same transport as
     /// [`Self::FetchLibrary`]; the result is a notice toast. For platforms whose own
@@ -502,11 +564,13 @@ pub enum ConsoleCmd {
     ForgetHost {
         key: String,
     },
+    /// Each status is a [`WakeStatus`] under `req`.
     Wake {
         key: String,
         then_connect: bool,
+        req: RequestKey,
     },
-    /// Stop the wake loop and clear its status.
+    /// Stop the wake loop. The shell has closed the card already.
     CancelWake,
     Probe,
     /// Pin or unpin a preset card on a saved host (`KnownHost::pinned_presets`).
@@ -631,6 +695,27 @@ pub enum ConsoleCmd {
     },
 }
 
+impl ConsoleCmd {
+    /// `host`'s catalog, under a fresh key.
+    pub(crate) fn fetch_library(host: &HostRow) -> ConsoleCmd {
+        ConsoleCmd::FetchLibrary {
+            addr: host.addr.clone(),
+            mgmt: host.mgmt_port,
+            fp_hex: host.fp_hex.clone(),
+            req: RequestKey::new(&host.fp_hex),
+        }
+    }
+
+    /// Wake the host on row `key`, under a fresh key.
+    pub(crate) fn wake(key: &str, then_connect: bool) -> ConsoleCmd {
+        ConsoleCmd::Wake {
+            key: key.to_string(),
+            then_connect,
+            req: RequestKey::new(key),
+        }
+    }
+}
+
 /// Overlay→binary command queue. Same locking as the shared models. Drain cadence
 /// is not latency-critical: every effect arrives via a model snapshot.
 #[derive(Clone, Default)]
@@ -693,6 +778,41 @@ mod tests {
             ..row
         }]);
         assert_eq!(shared.hosts_gen(), g1 + 1);
+    }
+
+    /// A status lands on its own request's card. Once the card is closed a late tick stays
+    /// out; only a producer's own wake (epoch 0) opens one.
+    #[test]
+    fn a_wake_status_lands_only_on_its_own_card() {
+        let shared = ConsoleShared::default();
+        let at = |req: &RequestKey, seconds| WakeStatus {
+            req: req.clone(),
+            key: "aa".into(),
+            name: "Tower".into(),
+            seconds,
+            timed_out: false,
+            online: false,
+            then_connect: false,
+        };
+        let (mine, gone) = (RequestKey::new("aa"), RequestKey::new("aa"));
+        shared.put_wake(Some(at(&mine, 0)));
+        shared.set_wake(Some(at(&gone, 9)));
+        assert_eq!(
+            shared.wake().map(|w| w.seconds),
+            Some(0),
+            "another wake's tick"
+        );
+        shared.set_wake(Some(at(&mine, 2)));
+        assert_eq!(shared.wake().map(|w| w.seconds), Some(2));
+        shared.put_wake(None);
+        shared.set_wake(Some(at(&mine, 3)));
+        assert_eq!(shared.wake(), None, "a closed card stays closed");
+        shared.set_wake(Some(at(&RequestKey::default(), 1)));
+        assert_eq!(
+            shared.wake().map(|w| w.seconds),
+            Some(1),
+            "the producer's own wake"
+        );
     }
 
     #[test]

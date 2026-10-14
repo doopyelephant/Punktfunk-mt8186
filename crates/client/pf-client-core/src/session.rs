@@ -1597,11 +1597,18 @@ fn spawn_audio(
         frame_us,
         "negotiated audio format"
     );
-    let player = audio::AudioPlayer::spawn(audio::PlaybackFormat {
-        channels: channels as u32,
-        rate_hz,
-        frame_us,
-    })
+    let playout = punktfunk_core::audio::AudioPlayout {
+        tuning: audio::TUNING,
+        format: fmt,
+    };
+    let player = audio::AudioPlayer::spawn(
+        audio::PlaybackFormat {
+            channels: channels as u32,
+            rate_hz,
+            frame_us,
+        },
+        playout.jitter(),
+    )
     .map_err(|e| tracing::warn!(error = %e, "audio disabled"))
     .ok()?;
     // A/V sync. This thread holds the packet's host capture `pts_ns`, the ring
@@ -1640,21 +1647,16 @@ fn spawn_audio(
                 }
                 player.push(buf);
             };
-            let mut gaps = punktfunk_core::audio::AudioGapTracker::new_at_frame_us(frame_us);
+            let mut gaps = playout.gaps();
             // Last decoded frame per channel: the PLC unit, 0 until something decodes.
             let mut frame_samples = 0usize;
-            let mut av = punktfunk_core::audio::AvSync::new_at_rate(channels, rate_hz);
-            av.set_frame_us(frame_us);
+            let mut av = playout.sync();
             if !av_sync_enabled {
                 tracing::info!("A/V sync disabled by PUNKTFUNK_NO_AV_SYNC");
             }
             // Drought concealment. A seq gap is concealed when a later packet
             // arrives; when the wire goes quiet nothing arrives to reveal it.
-            // Told this plane's real frame so the fuse is spent at this session's pace.
-            let mut drought = punktfunk_core::audio::DroughtConceal::new_at_frame_us(
-                audio::TUNING.plc_max_ms(),
-                frame_us,
-            );
+            let mut drought = playout.drought();
             let mut last_packet = std::time::Instant::now();
             // Playback vitals ~every 10 s on wall clock, plus a one-shot quantum
             // line the first time the callback has published one.

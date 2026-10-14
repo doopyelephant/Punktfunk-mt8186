@@ -14,7 +14,7 @@ mod events;
 pub(crate) mod ipc;
 
 use super::{Mode, SessionCastParts, VirtualDisplay, VirtualOutput};
-use crate::hyprland::{is_managed_output, next_output_name, output_owner_pid};
+use crate::hyprland::{is_managed_output, next_output_name};
 use crate::topology_journal::{self as journal, Undo};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -128,6 +128,13 @@ pub(crate) fn focus_output(name: &str) {
     if let Err(e) = ipc::action(json!({ "FocusMonitor": { "output": name } })) {
         tracing::warn!(output = %name, error = %format!("{e:#}"), "niri: output not focused");
     }
+}
+
+/// Owner pid for `PF-<pid>-<n>`; `None` for any other name, so reclaim never guesses.
+fn output_owner_pid(name: &str) -> Option<u32> {
+    let (pid, seq) = name.strip_prefix("PF-")?.split_once('-')?;
+    seq.parse::<u32>().ok()?;
+    pid.parse().ok()
 }
 
 /// Remove `PF-<pid>-<n>` outputs whose host is gone. Once per process: a SIGKILLed host's

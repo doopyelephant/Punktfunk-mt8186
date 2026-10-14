@@ -713,50 +713,10 @@ impl Presenter {
         // SAFETY: dlopens libvulkan; no instance exists yet.
         let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
 
-        let app_name = CString::new("punktfunk-session").unwrap();
-        // 1.3: Video decode and PyroWave both need it. The instance version caps
-        // what the device can report; `SharedDevice::api_version` is this same constant.
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(&app_name)
-            .api_version(super::INSTANCE_API_VERSION);
-        // HDR10 needs `VK_EXT_swapchain_colorspace` at instance level, not device.
-        let mut instance_extensions: Vec<String> = instance_extensions.to_vec();
-        let inst_available =
-            // SAFETY: read-only loader query; no instance yet; result by value.
-            unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
-        let has_colorspace_ext = inst_available
-            .iter()
-            .any(|e| e.extension_name_as_c_str() == Ok(c"VK_EXT_swapchain_colorspace"));
-        if has_colorspace_ext {
-            instance_extensions.push("VK_EXT_swapchain_colorspace".into());
-        }
-        // Per-surface queries (present-wait2, exclusive fullscreen) go through
-        // `VK_KHR_get_surface_capabilities2`.
-        let has_caps2_ext = inst_available
-            .iter()
-            .any(|e| e.extension_name_as_c_str() == Ok(ash::khr::get_surface_capabilities2::NAME));
-        if has_caps2_ext {
-            instance_extensions.push("VK_KHR_get_surface_capabilities2".into());
-        }
+        let (instance, instance_extensions, has_colorspace_ext, has_caps2_ext) =
+            create_instance(&entry, instance_extensions)?;
         #[cfg(windows)]
         let want_fse = fullscreen_exclusive_opt_in();
-        let ext_cstrings: Vec<CString> = instance_extensions
-            .iter()
-            .map(|e| CString::new(e.as_str()).unwrap())
-            .collect();
-        // `c_char`, not `i8`: `char` is signed on x86_64 and unsigned on aarch64, so
-        // `*const i8` compiles on the desktop and fails to match ash on ARM.
-        let ext_ptrs: Vec<*const c_char> = ext_cstrings.iter().map(|e| e.as_ptr()).collect();
-        // SAFETY: CREATE — `app_info` and `ext_ptrs` outlive the call; we own the instance.
-        let instance = unsafe {
-            entry.create_instance(
-                &vk::InstanceCreateInfo::default()
-                    .application_info(&app_info)
-                    .enabled_extension_names(&ext_ptrs),
-                None,
-            )
-        }
-        .context("vkCreateInstance")?;
         let surface_i = ash::khr::surface::Instance::new(&entry, &instance);
 
         // SAFETY: CREATE — `instance` is live; SDL returns a surface we own and later destroy.
@@ -785,117 +745,9 @@ impl Presenter {
             fse_ok: caps.fse_ok && want_fse && pref.fullscreen,
             ..caps
         };
-        let dev_exts: Vec<*const c_char> = caps.dev_exts().iter().map(|n| n.as_ptr()).collect();
-        let mut en_flr = fifo_latest_ready::Features {
-            present_mode_fifo_latest_ready: vk::TRUE,
-            ..Default::default()
-        };
-        let mut en_pid = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
-        let mut en_pwait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
-
-        let mut en_f11 = vk::PhysicalDeviceVulkan11Features::default()
-            .sampler_ycbcr_conversion(caps.sampler_ycbcr);
-        let mut en_f12 = vk::PhysicalDeviceVulkan12Features::default()
-            .timeline_semaphore(caps.timeline_semaphore)
-            .storage_buffer8_bit_access(caps.pyrowave_ok)
-            .shader_float16(caps.pyrowave_ok && caps.shader_float16);
-        let mut en_f13 = vk::PhysicalDeviceVulkan13Features::default()
-            .synchronization2(caps.synchronization2)
-            .subgroup_size_control(caps.pyrowave_ok)
-            .compute_full_subgroups(caps.pyrowave_ok);
-        let mut en_f2 = vk::PhysicalDeviceFeatures2::default()
-            .push_next(&mut en_f11)
-            .push_next(&mut en_f12)
-            .push_next(&mut en_f13);
-        if caps.present_wait_ok {
-            en_f2 = en_f2.push_next(&mut en_pid).push_next(&mut en_pwait);
-        }
-        if caps.flr_ok {
-            // Hand-rolled struct: splice onto the pNext list head by hand.
-            en_flr.p_next = en_f2.p_next;
-            en_f2.p_next = (&mut en_flr) as *mut _ as *mut std::ffi::c_void;
-        }
-        let mut en_wait2 = present_wait2::Flag::wait_feature(vk::TRUE);
-        let mut en_id2 = present_wait2::Flag::id_feature(vk::TRUE);
-        if caps.use_wait2 {
-            // Hand-rolled structs again: id2 → wait2 → the rest of the chain.
-            en_wait2.p_next = en_f2.p_next;
-            en_id2.p_next = (&mut en_wait2) as *mut _ as *mut std::ffi::c_void;
-            en_f2.p_next = (&mut en_id2) as *mut _ as *mut std::ffi::c_void;
-        }
-        let mut en_timing = timing_ext::Features::new(vk::TRUE);
-        if caps.timing_stages != 0 {
-            en_timing.p_next = en_f2.p_next;
-            en_f2.p_next = (&mut en_timing) as *mut _ as *mut std::ffi::c_void;
-        }
-        en_f2.features.shader_int16 = vk::Bool32::from(caps.pyrowave_ok);
-
-        let priorities = [1.0f32];
-        let mut queue_info = vec![vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(qfi)
-            .queue_priorities(&priorities)];
-        if caps.video_ok && caps.decode_qf != qfi {
-            queue_info.push(
-                vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(caps.decode_qf)
-                    .queue_priorities(&priorities),
-            );
-        }
-        // SAFETY: CREATE — `queue_info`, `dev_exts`, and `en_f2` outlive the call; we own the device.
-        let device = unsafe {
-            instance.create_device(
-                pdev,
-                &vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&queue_info)
-                    .enabled_extension_names(&dev_exts)
-                    .push_next(&mut en_f2),
-                None,
-            )
-        }
-        .context("vkCreateDevice")?;
+        let (device, queue_families) = create_device(&instance, pdev, qfi, &caps)?;
         let swap_d = ash::khr::swapchain::Device::new(&instance, &device);
-        use super::present_timing::{PresentTimer, Waiter};
-        // SAFETY: the device was created with the extension and calibrated timestamps.
-        let timing = (caps.timing_stages != 0)
-            .then(|| unsafe { timing_ext::Engine::load(&instance, &device, caps.timing_stages) })
-            .flatten()
-            .map(std::sync::Arc::new);
-        let present_timer = if caps.present_wait_ok {
-            let wait_d = ash::khr::present_wait::Device::new(&instance, &device);
-            Some(PresentTimer::spawn(
-                Waiter::V1(wait_d),
-                device.clone(),
-                None,
-            ))
-        } else if caps.use_wait2 {
-            // SAFETY: a name lookup on the live device; `None` if the driver has no such entry.
-            let raw = unsafe {
-                instance.get_device_proc_addr(device.handle(), present_wait2::WAIT_FN.as_ptr())
-            };
-            raw.map(|f| {
-                // SAFETY: the registry declares `vkWaitForPresent2KHR` with this signature.
-                let wait = unsafe {
-                    std::mem::transmute::<unsafe extern "system" fn(), present_wait2::WaitFn>(f)
-                };
-                let waiter = Waiter::V2 {
-                    device: device.handle(),
-                    wait,
-                };
-                PresentTimer::spawn(waiter, device.clone(), timing.clone())
-            })
-        } else {
-            None
-        };
-        // The swapchain and every present opt into the successors only with a live waiter.
-        let present_id2 = caps.use_wait2 && present_timer.is_some();
-        // The engine's stamps are read by that waiter.
-        let timing = timing.filter(|_| present_id2);
-        tracing::info!(
-            present_wait = caps.present_wait_ok,
-            present_wait2 = present_id2,
-            engine_stamps = timing.is_some(),
-            "on-glass present timing (VK_KHR_present_wait / present_wait2)"
-        );
+        let (timing, present_timer, present_id2) = present_timing(&instance, &device, &caps);
         // No present-wait in use: the output's vblank stands in for the ledger and the VRR
         // verdict; the ledger says `glass=est`.
         #[cfg(windows)]
@@ -936,32 +788,9 @@ impl Presenter {
         // SAFETY: `device` is live; queue 0 of `qfi` was requested at create.
         let queue = unsafe { device.get_device_queue(qfi, 0) };
         #[cfg(target_os = "linux")]
-        let hw = if caps.hw_capable {
-            let sync = caps
-                .sync_fd_ext
-                .then(|| crate::dmabuf::SyncImport::new(&instance, pdev, &device))
-                .flatten();
-            tracing::info!(
-                semaphore = sync.is_some(),
-                "dmabuf decode sync (a decode fence the sampling submit waits; \
-                 `false` polls the fence on the presenter thread)"
-            );
-            // SAFETY: live, paired handles; the extension and feature are checked alongside.
-            let timelines = (caps.sync_fd_ext && caps.timeline_semaphore)
-                .then(|| unsafe {
-                    super::sync_timeline::TimelineMaker::new(&instance, pdev, &device)
-                })
-                .flatten();
-            Some(HwCtx {
-                ext_mem_fd: ash::khr::external_memory_fd::Device::new(&instance, &device),
-                modifier_cache: Default::default(),
-                imports: Default::default(),
-                sync,
-                timelines,
-            })
-        } else {
-            None
-        };
+        let hw = caps
+            .hw_capable
+            .then(|| hw_ctx(&instance, pdev, &device, &caps));
         #[cfg(windows)]
         let hw_win = caps.win_capable.then(|| HwCtxWin {
             ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
@@ -972,110 +801,28 @@ impl Presenter {
         // renders through it. Gating on the pyrowave probe would hide software frames.
         let csc_planar = CscPass::new_planar(&device, super::VIDEO_FORMAT)?;
 
-        // Export the selected device facts when any consumer needs the handles —
-        // on Linux always: the presenter has a selected device and every consumer
-        // gates individual lanes on the booleans. Extension lists must match
-        // creation: the pyrowave decoder replays them into its pinned create-info.
-        // One `queue_lock` per device (decode + Skia + presenter; see its docs).
+        // Export the selected device facts when any consumer needs the handles; on Linux
+        // always, since every consumer gates its lane on the booleans. One `queue_lock` per
+        // device (decode + Skia + presenter; see its docs).
         let queue_lock = std::sync::Arc::new(pf_client_core::video::QueueLock::new());
         queue_lock.take_turns();
         #[cfg(windows)]
         let export_worthy = caps.video_ok || caps.win_capable || caps.pyrowave_ok;
         #[cfg(target_os = "linux")]
         let export_worthy = true;
-        let video_export = if export_worthy {
-            let mut device_extensions: Vec<CString> =
-                vec![CString::from(ash::khr::swapchain::NAME)];
-            #[cfg(target_os = "linux")]
-            if caps.hw_capable {
-                device_extensions
-                    .extend(dmabuf::DEVICE_EXTENSIONS.iter().map(|n| CString::from(*n)));
-            }
-            #[cfg(windows)]
-            if caps.win_capable {
-                device_extensions.extend(
-                    crate::d3d11::DEVICE_EXTENSIONS
-                        .iter()
-                        .map(|n| CString::from(*n)),
-                );
-            }
-            if caps.has_hdr_metadata {
-                device_extensions.push(CString::from(ash::ext::hdr_metadata::NAME));
-            }
-            device_extensions.extend(caps.video_ext_names.iter().map(|n| CString::from(*n)));
-            let decode_ops = pf_client_core::video::usable_decode_ops(
-                caps.dev_props.vendor_id,
-                caps.decode_caps.as_raw(),
-            );
-            Some(pf_client_core::video::VulkanDecodeDevice {
-                get_instance_proc_addr: entry.static_fn().get_instance_proc_addr as usize,
-                instance: instance.handle().as_raw() as usize,
-                physical_device: pdev.as_raw() as usize,
-                device: device.handle().as_raw() as usize,
-                vendor_id: caps.dev_props.vendor_id,
-                device_name: caps
-                    .dev_props
-                    .device_name_as_c_str()
-                    .map(|c| c.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                graphics_qf: qfi,
-                decode_qf: caps.decode_qf,
-                decode_video_caps: decode_ops,
-                instance_extensions: instance_extensions
-                    .iter()
-                    .map(|e| CString::new(e.as_str()).unwrap())
-                    .collect(),
-                device_extensions,
-                f_sampler_ycbcr: caps.sampler_ycbcr,
-                f_timeline_semaphore: caps.timeline_semaphore,
-                f_synchronization2: caps.synchronization2,
-                f_shader_int16: caps.pyrowave_ok,
-                f_storage_buffer8: caps.pyrowave_ok,
-                f_subgroup_size_control: caps.pyrowave_ok,
-                f_compute_full_subgroups: caps.pyrowave_ok,
-                f_shader_float16: caps.pyrowave_ok && caps.shader_float16,
-                api_version: caps.dev_props.api_version,
-                queue_families: queue_info.iter().map(|q| q.queue_family_index).collect(),
-                pyrowave_decode: caps.pyrowave_ok,
-                video_decode: caps.video_ok,
-                #[cfg(windows)]
-                d3d11_import: caps.win_capable,
-                #[cfg(not(windows))]
-                d3d11_import: false,
-                #[cfg(target_os = "linux")]
-                dmabuf_import: caps.hw_capable,
-                #[cfg(not(target_os = "linux"))]
-                dmabuf_import: false,
-                #[cfg(target_os = "linux")]
-                vaapi_av1_decode: caps.hw_capable
-                    && pf_client_core::video::vaapi_av1_decodable(
-                        caps.dev_props.vendor_id,
-                        caps.video_ok
-                            && decode_ops & vk::VideoCodecOperationFlagsKHR::DECODE_AV1.as_raw()
-                                != 0,
-                    ),
-                #[cfg(not(target_os = "linux"))]
-                vaapi_av1_decode: false,
-                #[cfg(target_os = "linux")]
-                vaapi_hevc_decode: caps.hw_capable
-                    && pf_client_core::video::vaapi_hevc_decodable(
-                        caps.dev_props.vendor_id,
-                        caps.video_ok
-                            && decode_ops & vk::VideoCodecOperationFlagsKHR::DECODE_H265.as_raw()
-                                != 0,
-                    ),
-                #[cfg(not(target_os = "linux"))]
-                vaapi_hevc_decode: false,
-                // HDR10 surface facts arrive with `pick_formats` below.
-                d3d11_hdr10: false,
-                d3d11_nv12: false,
-                d3d11_p010: false,
-                adapter_luid: caps.adapter_luid,
-                queue_lock: queue_lock.clone(),
-            })
-        } else {
-            None
-        };
+        let video_export = export_worthy.then(|| {
+            decode_export(
+                &entry,
+                &instance,
+                pdev,
+                &device,
+                &caps,
+                qfi,
+                queue_families,
+                &instance_extensions,
+                queue_lock.clone(),
+            )
+        });
         #[cfg(windows)]
         let mut video_export = video_export;
 
@@ -1113,49 +860,8 @@ impl Presenter {
             csc_planar.pipeline_layout,
         )?;
 
-        // SAFETY: CREATE — CreateInfo is a local; the pool is owned by the Presenter being built.
-        let cmd_pool = unsafe {
-            device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                    .queue_family_index(qfi),
-                None,
-            )
-        }?;
-        // SAFETY: ALLOCATE — the pool is ours and empty; we take the single primary buffer.
-        let cmd_buf = unsafe {
-            device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }?[0];
-        let acquire_sem =
-            // SAFETY: CREATE — CreateInfo is a local; the handle is stored on the Presenter.
-            unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
-        let mut timeline_type = vk::SemaphoreTypeCreateInfo::default()
-            .semaphore_type(vk::SemaphoreType::TIMELINE)
-            .initial_value(0);
-        // Null without the timeline feature: the waiter then keeps latch whole.
-        let done_sem = if caps.timeline_semaphore {
-            // SAFETY: CREATE — CreateInfo chains a local; the handle is stored on the Presenter.
-            unsafe {
-                device.create_semaphore(
-                    &vk::SemaphoreCreateInfo::default().push_next(&mut timeline_type),
-                    None,
-                )
-            }?
-        } else {
-            vk::Semaphore::null()
-        };
-        // SAFETY: CREATE — CreateInfo is a local; SIGNALED so the first wait is a no-op.
-        let fence = unsafe {
-            device.create_fence(
-                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )
-        }?;
+        let (cmd_pool, cmd_buf, acquire_sem, done_sem, fence) =
+            frame_sync(&device, qfi, caps.timeline_semaphore)?;
 
         #[cfg(target_os = "linux")]
         let native_timelines = hw.as_ref().is_some_and(|h| h.timelines.is_some());
@@ -1181,7 +887,7 @@ impl Presenter {
             overlay_pipe,
             scale,
             direct,
-            direct_last: None,
+            cpu_direct: None,
             retired_hw: None,
             #[cfg(windows)]
             retained_slot: None,
@@ -1209,13 +915,10 @@ impl Presenter {
             cmd_buf,
             staging: None,
             video: None,
-            submitted: false,
-            acquired: None,
+            state: crate::swapchain_state::SwapchainState::new(),
             present_timer,
             present_id2,
             timing,
-            timing_armed: false,
-            timing_asked: false,
             #[cfg(windows)]
             vblank_timer,
             #[cfg(windows)]
@@ -1266,16 +969,396 @@ impl Presenter {
             vaapi_sync: Default::default(),
             #[cfg(target_os = "linux")]
             native_keys: Vec::new(),
-            native_pq: false,
             #[cfg(target_os = "linux")]
             native_flip: crate::wl_native::flip_mode().then(std::time::Instant::now),
             overlay_blocks_native: false,
-            native_last: false,
-            suspended: false,
         };
         p.recreate_swapchain(window)?;
         Ok(p)
     }
+}
+
+/// The instance with SDL's extensions, plus the colorspace and per-surface query
+/// extensions where the loader has them. Returns the enabled list and those two answers.
+fn create_instance(
+    entry: &ash::Entry,
+    instance_extensions: &[String],
+) -> Result<(ash::Instance, Vec<String>, bool, bool)> {
+    let app_name = CString::new("punktfunk-session").unwrap();
+    // 1.3: Video decode and PyroWave both need it. The instance version caps
+    // what the device can report; `SharedDevice::api_version` is this same constant.
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(&app_name)
+        .api_version(super::INSTANCE_API_VERSION);
+    // HDR10 needs `VK_EXT_swapchain_colorspace` at instance level, not device.
+    let mut instance_extensions: Vec<String> = instance_extensions.to_vec();
+    let inst_available =
+        // SAFETY: read-only loader query; no instance yet; result by value.
+        unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+    let has_colorspace_ext = inst_available
+        .iter()
+        .any(|e| e.extension_name_as_c_str() == Ok(c"VK_EXT_swapchain_colorspace"));
+    if has_colorspace_ext {
+        instance_extensions.push("VK_EXT_swapchain_colorspace".into());
+    }
+    // Per-surface queries (present-wait2, exclusive fullscreen) go through
+    // `VK_KHR_get_surface_capabilities2`.
+    let has_caps2_ext = inst_available
+        .iter()
+        .any(|e| e.extension_name_as_c_str() == Ok(ash::khr::get_surface_capabilities2::NAME));
+    if has_caps2_ext {
+        instance_extensions.push("VK_KHR_get_surface_capabilities2".into());
+    }
+    let ext_cstrings: Vec<CString> = instance_extensions
+        .iter()
+        .map(|e| CString::new(e.as_str()).unwrap())
+        .collect();
+    // `c_char`, not `i8`: `char` is signed on x86_64 and unsigned on aarch64, so
+    // `*const i8` compiles on the desktop and fails to match ash on ARM.
+    let ext_ptrs: Vec<*const c_char> = ext_cstrings.iter().map(|e| e.as_ptr()).collect();
+    // SAFETY: CREATE — `app_info` and `ext_ptrs` outlive the call; we own the instance.
+    let instance = unsafe {
+        entry.create_instance(
+            &vk::InstanceCreateInfo::default()
+                .application_info(&app_info)
+                .enabled_extension_names(&ext_ptrs),
+            None,
+        )
+    }
+    .context("vkCreateInstance")?;
+    Ok((
+        instance,
+        instance_extensions,
+        has_colorspace_ext,
+        has_caps2_ext,
+    ))
+}
+
+/// The logical device with what `caps` enables: extensions, the feature chain, and a
+/// decode queue where it is another family. Returns the queue families it asked for.
+fn create_device(
+    instance: &ash::Instance,
+    pdev: vk::PhysicalDevice,
+    qfi: u32,
+    caps: &DeviceCaps,
+) -> Result<(ash::Device, Vec<u32>)> {
+    let dev_exts: Vec<*const c_char> = caps.dev_exts().iter().map(|n| n.as_ptr()).collect();
+    let mut en_flr = fifo_latest_ready::Features {
+        present_mode_fifo_latest_ready: vk::TRUE,
+        ..Default::default()
+    };
+    let mut en_pid = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+    let mut en_pwait = vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+
+    let mut en_f11 =
+        vk::PhysicalDeviceVulkan11Features::default().sampler_ycbcr_conversion(caps.sampler_ycbcr);
+    let mut en_f12 = vk::PhysicalDeviceVulkan12Features::default()
+        .timeline_semaphore(caps.timeline_semaphore)
+        .storage_buffer8_bit_access(caps.pyrowave_ok)
+        .shader_float16(caps.pyrowave_ok && caps.shader_float16);
+    let mut en_f13 = vk::PhysicalDeviceVulkan13Features::default()
+        .synchronization2(caps.synchronization2)
+        .subgroup_size_control(caps.pyrowave_ok)
+        .compute_full_subgroups(caps.pyrowave_ok);
+    let mut en_f2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut en_f11)
+        .push_next(&mut en_f12)
+        .push_next(&mut en_f13);
+    if caps.present_wait_ok {
+        en_f2 = en_f2.push_next(&mut en_pid).push_next(&mut en_pwait);
+    }
+    if caps.flr_ok {
+        // Hand-rolled struct: splice onto the pNext list head by hand.
+        en_flr.p_next = en_f2.p_next;
+        en_f2.p_next = (&mut en_flr) as *mut _ as *mut std::ffi::c_void;
+    }
+    let mut en_wait2 = present_wait2::Flag::wait_feature(vk::TRUE);
+    let mut en_id2 = present_wait2::Flag::id_feature(vk::TRUE);
+    if caps.use_wait2 {
+        // Hand-rolled structs again: id2 → wait2 → the rest of the chain.
+        en_wait2.p_next = en_f2.p_next;
+        en_id2.p_next = (&mut en_wait2) as *mut _ as *mut std::ffi::c_void;
+        en_f2.p_next = (&mut en_id2) as *mut _ as *mut std::ffi::c_void;
+    }
+    let mut en_timing = timing_ext::Features::new(vk::TRUE);
+    if caps.timing_stages != 0 {
+        en_timing.p_next = en_f2.p_next;
+        en_f2.p_next = (&mut en_timing) as *mut _ as *mut std::ffi::c_void;
+    }
+    en_f2.features.shader_int16 = vk::Bool32::from(caps.pyrowave_ok);
+
+    let priorities = [1.0f32];
+    let mut queue_info = vec![vk::DeviceQueueCreateInfo::default()
+        .queue_family_index(qfi)
+        .queue_priorities(&priorities)];
+    if caps.video_ok && caps.decode_qf != qfi {
+        queue_info.push(
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(caps.decode_qf)
+                .queue_priorities(&priorities),
+        );
+    }
+    // SAFETY: CREATE — `queue_info`, `dev_exts`, and `en_f2` outlive the call; we own the device.
+    let device = unsafe {
+        instance.create_device(
+            pdev,
+            &vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queue_info)
+                .enabled_extension_names(&dev_exts)
+                .push_next(&mut en_f2),
+            None,
+        )
+    }
+    .context("vkCreateDevice")?;
+    let families = queue_info.iter().map(|q| q.queue_family_index).collect();
+    Ok((device, families))
+}
+
+/// The present-wait waiter of the generation `caps` picked, and the engine's own stamps
+/// where that waiter reads them. Returns (stamps, waiter, present-id2 in use).
+fn present_timing(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    caps: &DeviceCaps,
+) -> (
+    Option<std::sync::Arc<timing_ext::Engine>>,
+    Option<super::present_timing::PresentTimer>,
+    bool,
+) {
+    use super::present_timing::{PresentTimer, Waiter};
+    // SAFETY: the device was created with the extension and calibrated timestamps.
+    let timing = (caps.timing_stages != 0)
+        .then(|| unsafe { timing_ext::Engine::load(instance, device, caps.timing_stages) })
+        .flatten()
+        .map(std::sync::Arc::new);
+    let present_timer = if caps.present_wait_ok {
+        let wait_d = ash::khr::present_wait::Device::new(instance, device);
+        Some(PresentTimer::spawn(
+            Waiter::V1(wait_d),
+            device.clone(),
+            None,
+        ))
+    } else if caps.use_wait2 {
+        // SAFETY: a name lookup on the live device; `None` if the driver has no such entry.
+        let raw = unsafe {
+            instance.get_device_proc_addr(device.handle(), present_wait2::WAIT_FN.as_ptr())
+        };
+        raw.map(|f| {
+            // SAFETY: the registry declares `vkWaitForPresent2KHR` with this signature.
+            let wait = unsafe {
+                std::mem::transmute::<unsafe extern "system" fn(), present_wait2::WaitFn>(f)
+            };
+            let waiter = Waiter::V2 {
+                device: device.handle(),
+                wait,
+            };
+            PresentTimer::spawn(waiter, device.clone(), timing.clone())
+        })
+    } else {
+        None
+    };
+    // The swapchain and every present opt into the successors only with a live waiter.
+    let present_id2 = caps.use_wait2 && present_timer.is_some();
+    // The engine's stamps are read by that waiter.
+    let timing = timing.filter(|_| present_id2);
+    tracing::info!(
+        present_wait = caps.present_wait_ok,
+        present_wait2 = present_id2,
+        engine_stamps = timing.is_some(),
+        "on-glass present timing (VK_KHR_present_wait / present_wait2)"
+    );
+    (timing, present_timer, present_id2)
+}
+
+/// Dmabuf import on a device with all four import extensions: the decode fence as a
+/// semaphore where it can be one, and exportable timelines for the native lane.
+#[cfg(target_os = "linux")]
+fn hw_ctx(
+    instance: &ash::Instance,
+    pdev: vk::PhysicalDevice,
+    device: &ash::Device,
+    caps: &DeviceCaps,
+) -> HwCtx {
+    let sync = caps
+        .sync_fd_ext
+        .then(|| crate::dmabuf::SyncImport::new(instance, pdev, device))
+        .flatten();
+    tracing::info!(
+        semaphore = sync.is_some(),
+        "dmabuf decode sync (a decode fence the sampling submit waits; \
+         `false` polls the fence on the presenter thread)"
+    );
+    // SAFETY: live, paired handles; the extension and feature are checked alongside.
+    let timelines = (caps.sync_fd_ext && caps.timeline_semaphore)
+        .then(|| unsafe { super::sync_timeline::TimelineMaker::new(instance, pdev, device) })
+        .flatten();
+    HwCtx {
+        ext_mem_fd: ash::khr::external_memory_fd::Device::new(instance, device),
+        modifier_cache: Default::default(),
+        imports: Default::default(),
+        sync,
+        timelines,
+    }
+}
+
+/// The selected device's facts and handles for the decode lanes. Extension lists match
+/// creation: the pyrowave decoder replays them into its pinned create-info.
+#[allow(clippy::too_many_arguments)]
+fn decode_export(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+    pdev: vk::PhysicalDevice,
+    device: &ash::Device,
+    caps: &DeviceCaps,
+    qfi: u32,
+    queue_families: Vec<u32>,
+    instance_extensions: &[String],
+    queue_lock: std::sync::Arc<pf_client_core::video::QueueLock>,
+) -> pf_client_core::video::VulkanDecodeDevice {
+    let mut device_extensions: Vec<CString> = vec![CString::from(ash::khr::swapchain::NAME)];
+    #[cfg(target_os = "linux")]
+    if caps.hw_capable {
+        device_extensions.extend(dmabuf::DEVICE_EXTENSIONS.iter().map(|n| CString::from(*n)));
+    }
+    #[cfg(windows)]
+    if caps.win_capable {
+        device_extensions.extend(
+            crate::d3d11::DEVICE_EXTENSIONS
+                .iter()
+                .map(|n| CString::from(*n)),
+        );
+    }
+    if caps.has_hdr_metadata {
+        device_extensions.push(CString::from(ash::ext::hdr_metadata::NAME));
+    }
+    device_extensions.extend(caps.video_ext_names.iter().map(|n| CString::from(*n)));
+    let decode_ops = pf_client_core::video::usable_decode_ops(
+        caps.dev_props.vendor_id,
+        caps.decode_caps.as_raw(),
+    );
+    pf_client_core::video::VulkanDecodeDevice {
+        get_instance_proc_addr: entry.static_fn().get_instance_proc_addr as usize,
+        instance: instance.handle().as_raw() as usize,
+        physical_device: pdev.as_raw() as usize,
+        device: device.handle().as_raw() as usize,
+        vendor_id: caps.dev_props.vendor_id,
+        device_name: caps
+            .dev_props
+            .device_name_as_c_str()
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        graphics_qf: qfi,
+        decode_qf: caps.decode_qf,
+        decode_video_caps: decode_ops,
+        instance_extensions: instance_extensions
+            .iter()
+            .map(|e| CString::new(e.as_str()).unwrap())
+            .collect(),
+        device_extensions,
+        f_sampler_ycbcr: caps.sampler_ycbcr,
+        f_timeline_semaphore: caps.timeline_semaphore,
+        f_synchronization2: caps.synchronization2,
+        f_shader_int16: caps.pyrowave_ok,
+        f_storage_buffer8: caps.pyrowave_ok,
+        f_subgroup_size_control: caps.pyrowave_ok,
+        f_compute_full_subgroups: caps.pyrowave_ok,
+        f_shader_float16: caps.pyrowave_ok && caps.shader_float16,
+        api_version: caps.dev_props.api_version,
+        queue_families,
+        pyrowave_decode: caps.pyrowave_ok,
+        video_decode: caps.video_ok,
+        #[cfg(windows)]
+        d3d11_import: caps.win_capable,
+        #[cfg(not(windows))]
+        d3d11_import: false,
+        #[cfg(target_os = "linux")]
+        dmabuf_import: caps.hw_capable,
+        #[cfg(not(target_os = "linux"))]
+        dmabuf_import: false,
+        #[cfg(target_os = "linux")]
+        vaapi_av1_decode: caps.hw_capable
+            && pf_client_core::video::vaapi_av1_decodable(
+                caps.dev_props.vendor_id,
+                caps.video_ok
+                    && decode_ops & vk::VideoCodecOperationFlagsKHR::DECODE_AV1.as_raw() != 0,
+            ),
+        #[cfg(not(target_os = "linux"))]
+        vaapi_av1_decode: false,
+        #[cfg(target_os = "linux")]
+        vaapi_hevc_decode: caps.hw_capable
+            && pf_client_core::video::vaapi_hevc_decodable(
+                caps.dev_props.vendor_id,
+                caps.video_ok
+                    && decode_ops & vk::VideoCodecOperationFlagsKHR::DECODE_H265.as_raw() != 0,
+            ),
+        #[cfg(not(target_os = "linux"))]
+        vaapi_hevc_decode: false,
+        // `Presenter::new` sets the HDR10 surface facts after `pick_formats`.
+        d3d11_hdr10: false,
+        d3d11_nv12: false,
+        d3d11_p010: false,
+        adapter_luid: caps.adapter_luid,
+        queue_lock,
+    }
+}
+
+/// The one command buffer, the acquire semaphore, the `done_sem` timeline (null without
+/// `timeline`), and the submit fence.
+fn frame_sync(
+    device: &ash::Device,
+    qfi: u32,
+    timeline: bool,
+) -> Result<(
+    vk::CommandPool,
+    vk::CommandBuffer,
+    vk::Semaphore,
+    vk::Semaphore,
+    vk::Fence,
+)> {
+    // SAFETY: CREATE — CreateInfo is a local; the pool is owned by the Presenter being built.
+    let cmd_pool = unsafe {
+        device.create_command_pool(
+            &vk::CommandPoolCreateInfo::default()
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+                .queue_family_index(qfi),
+            None,
+        )
+    }?;
+    // SAFETY: ALLOCATE — the pool is ours and empty; we take the single primary buffer.
+    let cmd_buf = unsafe {
+        device.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(cmd_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1),
+        )
+    }?[0];
+    let acquire_sem =
+        // SAFETY: CREATE — CreateInfo is a local; the handle is stored on the Presenter.
+        unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
+    let mut timeline_type = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+    // Null without the timeline feature: the waiter then keeps latch whole.
+    let done_sem = if timeline {
+        // SAFETY: CREATE — CreateInfo chains a local; the handle is stored on the Presenter.
+        unsafe {
+            device.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut timeline_type),
+                None,
+            )
+        }?
+    } else {
+        vk::Semaphore::null()
+    };
+    // SAFETY: CREATE — CreateInfo is a local; SIGNALED so the first wait is a no-op.
+    let fence = unsafe {
+        device.create_fence(
+            &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+            None,
+        )
+    }?;
+    Ok((cmd_pool, cmd_buf, acquire_sem, done_sem, fence))
 }
 
 /// Every physical device's Vulkan Video decode capability

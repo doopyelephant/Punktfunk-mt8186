@@ -5,7 +5,9 @@ import io.unom.punktfunk.console.SkiaConsole
 import io.unom.punktfunk.kit.ListedProfile
 import io.unom.punktfunk.kit.Seat
 import io.unom.punktfunk.kit.SeatState
+import io.unom.punktfunk.kit.library.Artwork
 import io.unom.punktfunk.kit.library.Download
+import io.unom.punktfunk.kit.library.GameEntry
 import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
@@ -35,6 +37,13 @@ class ConsoleBridgeVectorTest {
     private fun sample(model: String, i: Int = 0): Any =
         vectors.getJSONObject("models").getJSONArray(model).get(i)
 
+    /** The `req` the console sent on [command]'s sample: what this shell copies onto its answers. */
+    private fun req(command: String): JSONObject {
+        val cmds = vectors.getJSONArray("commands")
+        return (0 until cmds.length()).firstNotNullOf { cmds.optJSONObject(it)?.optJSONObject(command) }
+            .getJSONObject("req")
+    }
+
     /** One JSON value, whatever the key order or number spelling. */
     private fun same(a: Any?, b: Any?): Boolean = when {
         a is JSONObject && b is JSONObject -> a.length() == b.length() &&
@@ -60,15 +69,18 @@ class ConsoleBridgeVectorTest {
         assertTrue(SkiaConsole.ignoredCommands.none { it in SkiaConsole.commands })
     }
 
+    /** Each answer carries its command's `req` from the vectors, verbatim. */
     @Test
     fun pairAndWakeWriteTheSamples() {
-        assertWrites("PairPhase", 0, ConsoleJson.pairIdle())
-        assertWrites("PairPhase", 1, ConsoleJson.pairBusy())
-        assertWrites("PairPhase", 2, ConsoleJson.pairFailed("Wrong PIN."))
-        assertWrites("PairPhase", 3, ConsoleJson.pairPaired("ab12"))
+        val pair = req("Pair")
+        assertWrites("PairStatus", 1, ConsoleJson.pairBusy(pair))
+        assertWrites("PairStatus", 2, ConsoleJson.pairFailed(pair, "Wrong PIN."))
+        assertWrites("PairStatus", 3, ConsoleJson.pairPaired(pair, "ab12"))
         assertWrites(
             "WakeStatus", 0,
-            ConsoleJson.wakeStatus("ab12", "Desk", 12, timedOut = false, online = true, thenConnect = true),
+            ConsoleJson.wakeStatus(
+                req("Wake"), "ab12", "Desk", 12, timedOut = false, online = true, thenConnect = true,
+            ),
         )
     }
 
@@ -99,10 +111,13 @@ class ConsoleBridgeVectorTest {
         assertWrites("ProfilesAnswer", 2, ConsoleJson.profilesAnswer(ProfilesAnswer.Failed("Couldn't load the profiles.")))
     }
 
-    /** Only the error phase: `nativeConsoleLibraryBegin` stands in for a bare `Loading`. */
+    /** The catalog and the error phase: `nativeConsoleLibraryBegin` stands in for a bare `Loading`. */
     @Test
     fun libraryPushesWriteTheSamples() {
-        assertWrites("LibraryPhase", 3, ConsoleJson.libraryError("Not paired", "Pair this device first.", false))
+        val fetch = req("FetchLibrary")
+        assertWrites("PhasePush", 3, ConsoleJson.libraryError(fetch, "Not paired", "Pair this device first.", false))
+        val dota = GameEntry("steam:570", "steam", "Dota 2", Artwork(null, null, null))
+        assertWrites("GamesPush", 0, ConsoleJson.libraryGames(fetch, listOf(dota)))
         val downloads = listOf(
             Download(
                 "steam:570", "downloading", doneBytes = 1_048_576, totalBytes = 4_194_304,

@@ -134,14 +134,16 @@ pub struct AvSyncObservation {
 }
 
 impl AvSync {
-    /// `channels` is 2/6/8 at [`SAMPLE_RATE_HZ`]. Hi-res uses [`new_at_rate`](Self::new_at_rate).
-    pub fn new(channels: u8) -> AvSync {
+    /// `channels` is 2/6/8 at [`SAMPLE_RATE_HZ`].
+    #[cfg(test)]
+    pub(crate) fn new(channels: u8) -> AvSync {
         Self::new_at_rate(channels, SAMPLE_RATE_HZ)
     }
 
-    /// As [`new`](Self::new), at an explicitly negotiated `rate_hz`. Multiply-before-divide so
-    /// the 44.1 kHz family is representable and the proposed depth is in the ring's units.
-    pub fn new_at_rate(channels: u8, rate_hz: u32) -> AvSync {
+    /// At the negotiated `rate_hz` and the default frame; clients build one through
+    /// [`AudioPlayout::sync`]. Multiply-before-divide so the 44.1 kHz family is representable
+    /// and the proposed depth is in the ring's units.
+    pub(crate) fn new_at_rate(channels: u8, rate_hz: u32) -> AvSync {
         AvSync {
             rate_hz: rate_hz.max(1),
             channels: channels.max(1),
@@ -156,7 +158,7 @@ impl AvSync {
 
     /// The negotiated frame, one per [`Self::observe`] call. Default [`FRAME_MS`]; a lossless
     /// plane sends 1–4 ms frames, and the weights are in audio time, not calls.
-    pub fn set_frame_us(&mut self, frame_us: u32) {
+    pub(crate) fn set_frame_us(&mut self, frame_us: u32) {
         self.frame_us = frame_us.max(1);
     }
 

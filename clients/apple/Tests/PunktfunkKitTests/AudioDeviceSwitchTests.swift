@@ -50,6 +50,7 @@ final class AudioDeviceSwitchTests: XCTestCase {
         return false
     }
 
+    @MainActor
     func testPlaybackFollowsAnOutputDeviceChange() throws {
         guard let portStr = ProcessInfo.processInfo.environment["PUNKTFUNK_LOOPBACK_PORT"],
               let port = UInt16(portStr)

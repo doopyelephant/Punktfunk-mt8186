@@ -1,9 +1,9 @@
 //! The client's mode, moved by the host's `StreamConfig` at the first frame of the epoch it names.
 //! A `Reconfigured` ack says a switch was accepted; the config says what each epoch delivers.
 
+use super::{PumpEvent, PumpTx};
 use crate::config::Mode;
 use crate::quic::v2::msg::StreamConfig;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 #[derive(Debug, Default)]
@@ -34,12 +34,12 @@ impl ModeAnchor {
     }
 }
 
-/// Point the mode slot at `mode`. A change bumps `mode_gen`, which resets mode-scoped ABR state.
-pub(crate) fn apply(slot: &Mutex<Mode>, mode_gen: &AtomicU32, mode: Mode) {
-    let mut m = slot.lock().unwrap();
+/// Point the mode slot at `mode`. A change tells the pump, which resets mode-scoped ABR state.
+pub(super) fn apply(slot: &Mutex<Mode>, events: &PumpTx, mode: Mode) {
+    let mut m = slot.lock().unwrap_or_else(|e| e.into_inner());
     if *m != mode {
         *m = mode;
-        mode_gen.fetch_add(1, Ordering::Relaxed);
+        let _ = events.send(PumpEvent::Mode(mode));
         tracing::info!(?mode, "host delivered mode switch");
     }
 }
@@ -83,13 +83,16 @@ mod tests {
     }
 
     #[test]
-    fn applying_the_same_mode_leaves_mode_gen_alone() {
+    fn applying_the_same_mode_tells_the_pump_nothing() {
         let slot = Mutex::new(cfg(0, 1280).mode);
-        let mode_gen = AtomicU32::new(0);
-        apply(&slot, &mode_gen, cfg(0, 1280).mode);
-        assert_eq!(mode_gen.load(Ordering::Relaxed), 0);
-        apply(&slot, &mode_gen, cfg(0, 1920).mode);
-        assert_eq!(mode_gen.load(Ordering::Relaxed), 1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        apply(&slot, &tx, cfg(0, 1280).mode);
+        assert_eq!(rx.try_iter().count(), 0);
+        apply(&slot, &tx, cfg(0, 1920).mode);
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
+            [PumpEvent::Mode(cfg(0, 1920).mode)]
+        );
         assert_eq!(slot.lock().unwrap().width, 1920);
     }
 }

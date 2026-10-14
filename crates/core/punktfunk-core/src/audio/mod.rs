@@ -97,6 +97,45 @@ pub const FRAME_MS: u32 = 5;
 /// Opus-plane sample rate, and the protocol default. Lossless negotiates via [`pcm`].
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 
+/// One client's playout: its de-jitter tuning and the session's resolved format.
+///
+/// Every policy that counts in frames is built here, so none runs at the [`FRAME_MS`] default
+/// by omission. A client builds this once per session; each policy is built on the thread
+/// that owns it.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioPlayout {
+    pub tuning: JitterTuning,
+    pub format: plane::PlaneFormat,
+}
+
+impl AudioPlayout {
+    /// The ring's de-jitter policy, for the device callback.
+    pub fn jitter(&self) -> JitterPolicy {
+        let f = &self.format;
+        let mut p = JitterPolicy::new_at_rate(self.tuning, f.channels, f.rate_hz);
+        p.set_frame_us(f.frame_us);
+        p
+    }
+
+    /// A/V sync, in the ring's samples.
+    pub fn sync(&self) -> AvSync {
+        let f = &self.format;
+        let mut s = AvSync::new_at_rate(f.channels, f.rate_hz);
+        s.set_frame_us(f.frame_us);
+        s
+    }
+
+    /// Sequence-gap concealment, capped at [`MAX_CONCEAL_MS`] of this frame.
+    pub fn gaps(&self) -> AudioGapTracker {
+        AudioGapTracker::new_at_frame_us(self.format.frame_us)
+    }
+
+    /// Drought concealment, bounded by the tuning's PLC budget.
+    pub fn drought(&self) -> DroughtConceal {
+        DroughtConceal::new_at_frame_us(self.tuning.plc_max_ms(), self.format.frame_us)
+    }
+}
+
 // ---- ms ⇄ interleaved-sample conversion ---------------------------------------------------
 // Multiply first, divide last. `per_ms = rate_hz / 1000 * channels` truncates 44 100 Hz to 44
 // samples/ms and puts every depth 2.3 % low. 48/96 kHz only look exact because they divide.
@@ -136,5 +175,41 @@ fn samples_to_ms(rate_hz: u32, channels: u8, samples: usize) -> u32 {
         u32::MAX
     } else {
         ms as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every policy runs at the plane's frame, not the 5 ms Opus default.
+    #[test]
+    fn every_policy_takes_the_planes_frame() {
+        let format = plane::PlaneFormat {
+            codec: crate::quic::AUDIO_CODEC_PCM,
+            rate_hz: 96_000,
+            bits: 24,
+            channels: 2,
+            frame_us: 2_000,
+            layout: 0,
+        };
+        let playout = AudioPlayout {
+            tuning: JitterTuning::PIPEWIRE,
+            format,
+        };
+        let mut gaps = playout.gaps();
+        gaps.missing_before(0);
+        assert_eq!(gaps.missing_before(100), 25, "50 ms of 2 ms frames");
+        let mut drought = playout.drought();
+        assert!(drought.conceal(Duration::from_millis(10), 0));
+        assert_eq!(drought.total_ms(), 2);
+        // The other two keep their frame private: each differs from one left at the default.
+        let state = |p: &dyn std::fmt::Debug| format!("{p:?}");
+        let jitter_at_default = JitterPolicy::new_at_rate(JitterTuning::PIPEWIRE, 2, 96_000);
+        assert_ne!(state(&playout.jitter()), state(&jitter_at_default));
+        assert_ne!(
+            state(&playout.sync()),
+            state(&AvSync::new_at_rate(2, 96_000))
+        );
     }
 }

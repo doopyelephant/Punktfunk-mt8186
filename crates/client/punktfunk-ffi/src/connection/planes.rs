@@ -37,7 +37,7 @@ impl AudioPcmState {
         let run = punktfunk_core::audio::max_conceal_packets(fmt.frame_us) as usize;
         self.pcm = vec![0f32; (1 + run) * fmt.max_frame_samples().max(1)];
         // Cap the tracker at this same run. A larger cap would silently truncate frames.
-        self.gaps.set_frame_us(fmt.frame_us);
+        self.gaps = punktfunk_core::audio::AudioGapTracker::new_at_frame_us(fmt.frame_us);
     }
 
     /// Decode one packet into `pcm`. Missing seqs are concealed first, then the

@@ -319,9 +319,9 @@ pub trait Encoder: Send {
     }
     /// Access units a backend that encodes without [`submit`](Self::submit)
     /// already holds for [`poll_chunk`](Self::poll_chunk), waiting until
-    /// `deadline` for the first. The loop owes one wire index per AU counted
-    /// and drains them at once. `None` (default): the backend encodes what
-    /// `submit` hands it, so the loop submits this tick's frame instead.
+    /// `deadline` for the first. The loop asks only for a pixel-less frame, owes
+    /// one wire index per AU counted and drains them at once. `None` (default):
+    /// the backend encodes what `submit` hands it, so the loop submits the frame.
     fn ready_aus(&mut self, _deadline: std::time::Instant) -> Option<usize> {
         None
     }
@@ -468,7 +468,7 @@ pub const SPLIT_DISABLE: u32 = 15;
 
 /// NVENC split-frame mode for a session. Shared by the Windows and Linux
 /// direct-SDK backends. Precedence:
-/// 0. `max_slices` ≤ 1 → DISABLE. Split-frame encode emits one slice per
+/// 0. `client_slices` ≤ 1 → DISABLE. Split-frame encode emits one slice per
 ///    engine, which a client that never asked for multi-slice cannot take.
 /// 1. `PUNKTFUNK_SPLIT_ENCODE` = `0`/`disable` | `1`/`auto` (AUTO_FORCED) |
 ///    `2` | `3` — operator override, always wins. `2`/`3` clamp to the GPU's
@@ -493,11 +493,11 @@ pub fn resolve_split_mode(
     bit_depth: u8,
     pixel_rate: u64,
     engines: u32,
-    max_slices: u32,
+    client_slices: u32,
 ) -> u32 {
     let hw_max = max_forced_split_mode(engines);
     let mode = match crate::knobs::get().split_encode {
-        _ if max_slices <= 1 => SPLIT_DISABLE,
+        _ if client_slices <= 1 => SPLIT_DISABLE,
         1 => SPLIT_DISABLE,
         2 => SPLIT_AUTO_FORCED,
         4 => clamp_to_engines(SPLIT_THREE_FORCED, hw_max, engines),

@@ -121,19 +121,25 @@ pub struct SessionPlan {
     /// wide colour), so a 10-bit SDR session takes real 10-bit pixels under BT.709 instead of
     /// widening an 8-bit capture. Set only via [`sdr10_native_for`]; `false` everywhere else.
     pub sdr10_native: bool,
-    /// Encoder slice-count ceiling from [`VIDEO_CAP_MULTI_SLICE`](punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE):
-    /// 32 when the bit is set (backend default; no client-side cap), 1 when not
-    /// (single-slice frames for TV-SoC decoders). Applied to every encoder this
-    /// plan opens so slicing cannot change shape across a rebuild.
-    pub max_slices: u32,
+    /// H.264/HEVC slices per frame the client takes: GameStream's `videoEncoderSlicesPerFrame`,
+    /// [`DEFAULT_SLICES`] toward a native
+    /// [`VIDEO_CAP_MULTI_SLICE`](punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE) client, else 1
+    /// (TV-SoC decoders wedge on multi-slice frames). Applied to every encoder this plan opens
+    /// so slicing cannot change shape across a rebuild.
+    pub slices: u32,
     /// A joiner's own view and fit: the encoder frames the owner's picture for it. `None`
     /// streams the source as captured, or a mirrored head fitted to the negotiated size.
     pub reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
 }
 
+/// Slices per frame toward a client that takes multi-slice frames but names no count: the
+/// native handshake carries one bit. GameStream names its own.
+pub const DEFAULT_SLICES: u32 = 4;
+
 impl SessionPlan {
     /// `hdr` is the handshake verdict, not derived from depth: 10-bit SDR exists. PyroWave's
     /// bits per pixel start at the host's; a caller that knows the client's sets them.
+    /// `slices` is the client's count, [`Self::slices`].
     #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         bit_depth: u8,
@@ -142,7 +148,7 @@ impl SessionPlan {
         codec: crate::encode::Codec,
         cursor_blend: bool,
         cursor_forward: bool,
-        multi_slice: bool,
+        slices: u32,
     ) -> Self {
         let capture = CaptureBackend::resolve();
         SessionPlan {
@@ -160,7 +166,7 @@ impl SessionPlan {
             // Callers that know the compositor overwrite these; default off for everyone else.
             gamescope_cursor: false,
             sdr10_native: false,
-            max_slices: if multi_slice { 32 } else { 1 },
+            slices,
             reframe_to: None,
         }
     }
@@ -290,8 +296,23 @@ pub(crate) fn cursor_blend_for(
         if compositor_embeds_pointer(compositor) {
             return false;
         }
+        encoder_blends_cursor(codec, bit_depth, hdr)
+    }
+}
+
+/// The encode backend this session plans composites `frame.cursor`: the blend term of
+/// [`cursor_blend_for`], for a caller that knows no compositor yet. Never off Linux.
+#[cfg(any(target_os = "linux", feature = "gamestream"))]
+pub(crate) fn encoder_blends_cursor(codec: crate::encode::Codec, bit_depth: u8, hdr: bool) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (codec, bit_depth, hdr);
+        false
+    }
+    #[cfg(target_os = "linux")]
+    {
         // Same CUDA-payload prediction as `handshake::cursor_forward`: NVIDIA plus
-        // the zero-copy switch. Only a CUDA payload reaches the blend.
+        // the zero-copy switch. It picks the backend.
         let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
         crate::encode::cursor_blend_capable(codec, cuda_planned, bit_depth == 10, hdr)
     }
@@ -301,6 +322,7 @@ pub(crate) fn cursor_blend_for(
 /// `Embedded`, KWin `POINTER_EMBEDDED`). Mutter cannot: a virtual stream drops its
 /// software cursor whenever a physical head holds a hardware one, and cursor-only
 /// motion schedules no re-record (mutter#4939). Gamescope has its own arm.
+#[cfg(target_os = "linux")]
 pub(crate) fn compositor_embeds_pointer(compositor: pf_vdisplay::Compositor) -> bool {
     use pf_vdisplay::Compositor;
     matches!(
@@ -460,19 +482,21 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use pf_vdisplay::Compositor;
 
+    /// The plan keeps the client's count: a GameStream ask above the native default survives.
     #[test]
-    fn resolve_limits_single_slice_clients() {
-        let plan = SessionPlan::resolve(
-            8,
-            false,
-            ChromaFormat::Yuv420,
-            Codec::H264,
-            false,
-            false,
-            false,
-        );
-
-        assert_eq!(plan.max_slices, 1);
+    fn resolve_keeps_the_client_slice_count() {
+        for slices in [1, DEFAULT_SLICES, 8] {
+            let plan = SessionPlan::resolve(
+                8,
+                false,
+                ChromaFormat::Yuv420,
+                Codec::H264,
+                false,
+                false,
+                slices,
+            );
+            assert_eq!(plan.slices, slices);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -513,6 +537,34 @@ mod tests {
         }
         assert!(!compositor_embeds_pointer(Compositor::Mutter));
         assert!(!compositor_embeds_pointer(Compositor::Gamescope));
+    }
+
+    /// Native passes its cursor channel and its own depth; GameStream no channel and depth 10
+    /// only with HDR. Without a channel the rule is the compositor's arm, then the encoder's.
+    #[cfg(any(target_os = "linux", feature = "gamestream"))]
+    #[test]
+    fn the_blend_rule_takes_both_loops_arguments() {
+        use pf_vdisplay::Compositor;
+        let linux = cfg!(target_os = "linux");
+        for c in [Compositor::Kwin, Compositor::Mutter, Compositor::Gamescope] {
+            let gamescope = c == Compositor::Gamescope;
+            for hdr in [false, true] {
+                let gs_depth = if hdr { 10 } else { 8 };
+                let gamestream = cursor_blend_for(false, c, Codec::H265, gs_depth, hdr, None);
+                let encoder_arm =
+                    c == Compositor::Mutter && encoder_blends_cursor(Codec::H265, gs_depth, hdr);
+                let want = linux
+                    && if gamescope {
+                        gamescope_cursor_for(true, None)
+                    } else {
+                        encoder_arm
+                    };
+                assert_eq!(gamestream, want, "{c:?} hdr={hdr}");
+                let native = cursor_blend_for(true, c, Codec::H265, 10, hdr, None);
+                let want = linux && (!gamescope || gamescope_cursor_for(true, None));
+                assert_eq!(native, want, "{c:?} hdr={hdr}");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -50,9 +50,9 @@ impl<G: PartialEq> DeliveryGate<G> {
 }
 
 /// The `seq`th delivery of a pixel-less capturer, stamped now. No pixels cross the boundary:
-/// the loop sees `Encoder::ready_aus` answer `Some` and owes wire indexes instead of
-/// submitting this frame. The encoder stamps each access unit with the frame's own present
-/// time, so this side reports the sequence only.
+/// the loop sees [`FramePayload::Pixelless`] and owes wire indexes for what `Encoder::ready_aus`
+/// counts instead of submitting this frame. The encoder stamps each access unit with the
+/// frame's own present time, so this side reports the sequence only.
 pub(crate) fn frame(seq: u64, width: u32, height: u32, format: PixelFormat) -> CapturedFrame {
     CapturedFrame {
         provenance: Provenance::source(seq, 0),
@@ -63,7 +63,7 @@ pub(crate) fn frame(seq: u64, width: u32, height: u32, format: PixelFormat) -> C
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0),
         format,
-        payload: FramePayload::Cpu(Vec::new()),
+        payload: FramePayload::Pixelless,
         cursor: None,
     }
 }
@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn a_delivery_carries_no_pixels() {
         let f = frame(3, 1920, 1080, PixelFormat::Nv12);
-        assert!(matches!(&f.payload, FramePayload::Cpu(px) if px.is_empty()));
+        assert!(matches!(f.payload, FramePayload::Pixelless));
         assert_eq!(f.provenance, Provenance::source(3, 0));
         assert_eq!(
             (f.width, f.height, f.format),

@@ -478,19 +478,17 @@ pub fn capture_virtual_output(
             crate::vdisplay::driver::send_cursor_forward(&control, &req)
         }) as pf_capture::CursorForwardSender
     });
-    pf_capture::open_idd_push(
-        target,
-        pref,
-        want.hdr,
-        want.ten_bit_sdr,
-        want.chroma_444,
-        want.pyrowave,
-        keep,
+    let opts = pf_capture::IddPushOpts {
+        want_hdr: want.hdr,
+        ten_bit_sdr: want.ten_bit_sdr,
+        want_444: want.chroma_444,
+        pyrowave: want.pyrowave,
         cursor_sender,
         cursor_forward,
-        want.hw_cursor,
-    )
-    .map_err(|(e, _keep)| e.context("IDD-push capture open (no fallback)"))
+        forwards_to_client: want.hw_cursor,
+    };
+    pf_capture::open_idd_push(target, pref, keep, opts)
+        .map_err(|(e, _keep)| e.context("IDD-push capture open (no fallback)"))
 }
 
 /// Capture a monitor this session does not own: start a capture worker as the signed-in user
@@ -600,6 +598,7 @@ pub fn open_driver_encoder(
         hdr,
         hdr_meta: capturer.hdr_meta().map(|m| client_hdr.unwrap_or(m)),
         sdr_fp16: !hdr && capturer.composes_sdr_fp16(),
+        slices: plan.slices,
         wire_chunk_bytes: plan.wire_chunk.unwrap_or(0) as u32,
         backends: [backend, fallback, 0, 0],
         wire_seq_base,

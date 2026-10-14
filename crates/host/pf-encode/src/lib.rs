@@ -158,9 +158,9 @@ pub fn open_video(
     chroma: ChromaFormat,
     // Backends whose fast path can't blend (Vulkan EFC) key off `cursor_blend`.
     cursor_blend: bool,
-    // Client decoder slice ceiling. 1 = single-slice (some TVs wedge on
-    // multi-slice AUs); 32 = no client limit. `PUNKTFUNK_NVENC_SLICES` overrides.
-    max_slices: u32,
+    // H.264/HEVC slices per frame the client takes. 1 = single-slice (some TVs wedge on
+    // multi-slice AUs). Only NVENC slices; `PUNKTFUNK_NVENC_SLICES` overrides.
+    slices: u32,
 ) -> Result<Box<dyn Encoder>> {
     let (inner, backend) = open_video_backend(OpenParams {
         codec,
@@ -174,7 +174,7 @@ pub fn open_video(
         hdr,
         chroma,
         cursor_blend,
-        max_slices,
+        slices,
     })?;
     // Open-time fallback (Vulkan→VAAPI) and gamescope (no embedded cursor) still
     // reach here. `open_video` cannot re-plan capture, so a warning is all it does.
@@ -332,7 +332,7 @@ struct OpenParams {
     hdr: bool,
     chroma: ChromaFormat,
     cursor_blend: bool,
-    max_slices: u32,
+    slices: u32,
 }
 
 /// Open the platform encoder. The display label is the branch that opened

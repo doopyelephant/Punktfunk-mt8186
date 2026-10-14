@@ -7,7 +7,7 @@
 //! host with no advert is PIN-only.
 
 use crate::glyphs::{Hint, HintKey};
-use crate::model::{ConsoleCmd, HostRow, PairPhase};
+use crate::model::{ConsoleCmd, HostRow, PairPhase, RequestKey};
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, ScreenView, TextEntry};
 use crate::theme::{fg, Fonts, ERROR, W};
@@ -47,6 +47,8 @@ pub(crate) struct PairScreen {
     /// The busy pairing is a request access, waiting on the host's operator.
     requesting: bool,
     error: Option<String>,
+    /// The ceremony this screen last sent. Another one's phase is not shown here.
+    req: Option<RequestKey>,
 }
 
 impl PairScreen {
@@ -64,6 +66,7 @@ impl PairScreen {
             busy: false,
             requesting: false,
             error: None,
+            req: None,
         }
     }
 
@@ -88,9 +91,16 @@ impl PairScreen {
         &self.host_name
     }
 
-    /// The address and port its PIN goes to.
-    pub(crate) fn target(&self) -> (&str, u16) {
-        (&self.addr, self.port)
+    /// This screen sent `req`: its phases are this screen's to show.
+    pub(crate) fn sent(&self, req: &RequestKey) -> bool {
+        self.req.as_ref() == Some(req)
+    }
+
+    /// A fresh key for a ceremony with this host, kept as the one this screen waits on.
+    fn ask(&mut self) -> RequestKey {
+        let req = RequestKey::new(&format!("{}:{}", self.addr, self.port));
+        self.req = Some(req.clone());
+        req
     }
 
     /// Paired is popped by the shell, not this screen.
@@ -160,6 +170,7 @@ impl PairScreen {
                             port: self.port,
                             fp_hex: self.fp_hex.clone(),
                             device_name: self.device_name(ctx),
+                            req: self.ask(),
                         });
                     }
                     Some(Role::Pin) => self.editing = Some(Field::Pin),
@@ -173,6 +184,7 @@ impl PairScreen {
                             port: self.port,
                             pin: self.pin.trim().to_string(),
                             device_name: self.device_name(ctx),
+                            req: self.ask(),
                         });
                     }
                     _ => {

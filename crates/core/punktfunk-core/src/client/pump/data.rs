@@ -3,13 +3,14 @@
 //!
 //! Dedicated user-interactive thread. Newest-frame drop on embedder lag.
 //! [`FLAG_PROBE`] filler never enters the decoder. The ABR window is
-//! assembled by [`crate::abr::Driver`]: this file feeds it events and sends
-//! what it asks for.
+//! assembled by [`crate::abr::Driver`]: [`abr_feed`] feeds it events and
+//! sends what it asks for. [`recovery_asks`] asks for what a short frame lost.
 
 use super::super::*;
 use super::*;
-use crate::abr::{Action, DriverConfig, ProbeReport};
-use crate::quic::v2::dgram::NACK_SHORT;
+
+mod abr_feed;
+mod recovery_asks;
 
 /// Data-plane pump on a blocking thread. `try_send` drops the newest frame
 /// when the embedder lags. [`FLAG_PROBE`] filler goes to the probe accumulator,
@@ -18,20 +19,14 @@ pub(super) struct DataPump {
     pub(super) session: Session,
     pub(super) shared: Arc<ClientShared>,
     pub(super) ctrl_tx: tokio::sync::mpsc::Sender<CtrlRequest>,
-    pub(super) clock_gen: Arc<AtomicU32>,
+    /// The control task's [`PumpEvent`]s, drained once per iteration ([`drain_events`]).
+    pub(super) events: std::sync::mpsc::Receiver<PumpEvent>,
+    /// The pump's own end of that channel: a frame that opens a configured epoch moves the
+    /// mode through it, as the control task does.
+    pub(super) events_tx: PumpTx,
     /// Host encode-stage window ([`super::super::frame_channel::EncodeLatAcc`]);
     /// fed by the datagram task, not the overlay's lossy `host_timing_tx`.
     pub(super) encode_lat: Arc<Mutex<super::super::frame_channel::EncodeLatAcc>>,
-    /// Control-task mode-switch generation. A change resets mode-scoped ABR
-    /// state ([`crate::abr::Driver::on_mode_switch`]).
-    pub(super) mode_gen: Arc<AtomicU32>,
-    /// Host `BitrateChanged` acks, drained in arrival order. A queue so a
-    /// corrective short retarget cannot be clobbered by a full resolve ack
-    /// in the same window (host-cap learning needs two consecutive shorts).
-    pub(super) bitrate_ack: Arc<Mutex<AckQueue>>,
-    /// Host pipeline-rebuild gap in ms ([`crate::quic::PipelineGap`]); `0` =
-    /// none. Drained each iteration — see [`take_pipeline_gap`].
-    pub(super) pipeline_gap: Arc<AtomicU32>,
     /// Embedder-requested rate. `0` = Automatic (the only case ABR arms).
     pub(super) bitrate_kbps: u32,
     /// Rate the host actually configured (Welcome echo; old host echoes 0).
@@ -65,11 +60,6 @@ pub(super) struct DataPump {
     pub(super) on_anchors: bool,
 }
 
-/// Closed windows held for an embedder that has not read them. Forty-eight
-/// seconds at the report cadence: enough that a client polling once a second
-/// never loses one, small enough that one which never polls costs nothing.
-pub(crate) const ABR_TRAJECTORY_WINDOWS: usize = 64;
-
 /// What one pump run carries from iteration to iteration.
 struct PumpLoop {
     abr: crate::abr::Driver,
@@ -89,8 +79,6 @@ struct PumpLoop {
     /// That keyframe has not arrived: the decoder holds none of the pictures the frames
     /// before it reference, and a hardware decoder fed one can die.
     awaiting_idr: bool,
-    seen_clock_gen: u32,
-    seen_mode_gen: u32,
     /// Epoch of the last frame handed on; a new one may move the mode ([`super::anchor`]).
     last_epoch: Option<u8>,
     /// When the socket's drop count was last read.
@@ -196,8 +184,6 @@ impl DataPump {
             last_index: None,
             unconsumed_aus: 0,
             awaiting_idr: false,
-            seen_clock_gen: self.clock_gen.load(Ordering::Relaxed),
-            seen_mode_gen: self.mode_gen.load(Ordering::Relaxed),
             last_epoch: None,
             sock_read: Instant::now(),
             host_link: Default::default(),
@@ -242,492 +228,6 @@ impl DataPump {
         self.shared.frames.close();
     }
 
-    /// The session's ABR driver, with the three environment overrides read
-    /// once. Automatic is a session with no embedder rate and a host that
-    /// echoed one: PyroWave's adapts between its floor and the host's pin.
-    /// An explicit-rate PyroWave session runs at the pin, which the bring-up
-    /// ramp may lower once; no controller runs for it.
-    fn driver(&self, session_start: Instant) -> crate::abr::Driver {
-        let automatic = self.bitrate_kbps == 0;
-        let pyrowave = self.negotiated_codec == crate::quic::CODEC_PYROWAVE;
-        let pin_kbps = (pyrowave && !automatic)
-            .then_some(self.resolved_bitrate_kbps)
-            .filter(|&pin| pin > 0);
-        let mut driver = crate::abr::Driver::new(
-            DriverConfig {
-                start_kbps: if automatic {
-                    self.resolved_bitrate_kbps
-                } else {
-                    0
-                },
-                ceiling_cap_kbps: env_u32("PUNKTFUNK_ABR_MAX_MBPS")
-                    .map(|m| m.saturating_mul(1_000)),
-                stream_cap_kbps: self.stream_cap_kbps,
-                refresh_hz: self.refresh_hz,
-                codec: self.negotiated_codec,
-                bit_depth: self.bit_depth,
-                chroma_format: self.chroma_format,
-                audio_reserved_kbps: self.audio_reserved_kbps,
-                marks_repeats: self.marks_repeats,
-                probe: std::env::var("PUNKTFUNK_ABR_PROBE").map_or(true, |v| v != "0"),
-                probe_target_kbps: env_u32("PUNKTFUNK_ABR_PROBE_KBPS"),
-                ramp: self.serves_ramp,
-                probe_only: self.shared.probe_only(),
-                pin_kbps,
-                floor_kbps: self.pyrowave_floor_kbps.filter(|_| automatic),
-            },
-            session_start,
-        );
-        driver.set_ports(
-            self.shared.host_link.lock().unwrap().facts(),
-            *self.shared.client_link.lock().unwrap(),
-        );
-        driver
-    }
-
-    /// Everything the driver hears before this iteration's tick, in the
-    /// order it hears it. Returns whether a probe burst is in flight.
-    fn feed_driver(&mut self, lp: &mut PumpLoop, clock_offset_ns: i64) -> bool {
-        // Re-sync invalidates the staleness run under the old offset.
-        let clock_gen = self.clock_gen.load(Ordering::Relaxed);
-        if clock_gen != lp.seen_clock_gen {
-            lp.seen_clock_gen = clock_gen;
-            // Every OWD reading shifted with the offset; the old floor is
-            // meaningless. A stale offset that WAS the elevation is fixed here.
-            lp.standing_lat.rebase();
-            if lp.jump.rebase() {
-                tracing::info!("clock re-sync applied — clock-based jump-to-live re-armed");
-            }
-        }
-        // Drain here, not at the report tick, so the in-flight window
-        // (the one the rebuild corrupted) is the one we can still drop.
-        if let Some(gap_ms) = take_pipeline_gap(&self.pipeline_gap) {
-            lp.abr.on_pipeline_gap(gap_ms);
-        }
-        // Mirror drop/FEC counters every iteration, not only on a
-        // produced frame — a total-loss drought completes no AU.
-        let st = self.session.stats();
-        lp.abr.on_stats(&st);
-        lp.abr.on_loss_positions(self.session.take_loss_positions());
-        let host = *self.shared.host_link.lock().unwrap();
-        if host != lp.host_link {
-            lp.host_link = host;
-            lp.abr
-                .set_ports(host.facts(), *self.shared.client_link.lock().unwrap());
-        }
-        // One syscall per sample: often enough for a window, rare enough for the hot loop. The
-        // receiver's drops are the kernel socket's, where the OS keeps a figure, and the demux
-        // queue's.
-        if lp.sock_read.elapsed() >= Duration::from_millis(100) {
-            lp.sock_read = Instant::now();
-            let kernel = self
-                .shared
-                .data_sock
-                .lock()
-                .unwrap()
-                .as_ref()
-                .and_then(crate::transport::sockstat::socket_drops);
-            let demux = self
-                .shared
-                .demux
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map_or(0, |s| s.media_dropped.load(Ordering::Relaxed));
-            lp.abr.on_sock_drops(kernel.unwrap_or(0) + demux);
-        }
-        // One delay sample per frame that opened since the last iteration,
-        // whether or not it ever completed. Same offset and same sign test
-        // as a completed AU's; without an offset there is no delay to read,
-        // but the samples are still drained.
-        for raw_ns in self.session.take_shard_delays() {
-            let owd_ns = i128::from(raw_ns) + i128::from(clock_offset_ns);
-            if clock_offset_ns != 0 && owd_ns > 0 {
-                lp.abr.on_shard_owd(owd_ns);
-            }
-        }
-        lp.watch_ingress(&st);
-        self.shared
-            .frames_dropped
-            .store(st.frames_dropped, Ordering::Relaxed);
-        self.shared
-            .fec_recovered
-            .store(st.fec_recovered_shards, Ordering::Relaxed);
-        let (probe_active, probe_duration_ms, probe_report) = self.mirror_probe(&st);
-        lp.abr
-            .on_probe_active(probe_active, probe_duration_ms, Instant::now());
-        if let Some(r) = probe_report {
-            lp.abr.on_probe_result(r, Instant::now());
-        }
-        let mg = self.mode_gen.load(Ordering::Relaxed);
-        if mg != lp.seen_mode_gen {
-            lp.seen_mode_gen = mg;
-            let m = *self.shared.mode.lock().unwrap();
-            lp.abr.on_mode_switch(m.width, m.height, m.refresh_hz);
-            self.shared
-                .feedback
-                .lock()
-                .unwrap()
-                .set_refresh(m.refresh_hz);
-        }
-        for (acked, why) in self.bitrate_ack.lock().unwrap().drain(..) {
-            lp.abr.on_ack(acked, why);
-        }
-        // Drain even when the controller is off, so the accumulators
-        // stay bounded and no count leaks into a later window.
-        let dec = std::mem::take(&mut *self.shared.decode_lat.lock().unwrap());
-        lp.abr.on_decode_latency(dec.sum_us, dec.count);
-        let enc = std::mem::take(&mut *self.encode_lat.lock().unwrap());
-        lp.abr.on_encode_latency(enc.sum_us, enc.count);
-        lp.abr
-            .on_keyframe_asks(self.shared.recovery_kf.swap(0, Ordering::Relaxed));
-        probe_active
-    }
-
-    /// Copy the session's probe counters into the shared [`ProbeState`].
-    /// Returns `(active, duration_ms, report)`; the report stands while the
-    /// state says done.
-    fn mirror_probe(&mut self, st: &crate::stats::Stats) -> (bool, u32, Option<ProbeReport>) {
-        let mut p = self.shared.probe.lock().unwrap();
-        if p.active && !p.done {
-            // An embedder speed test is armed on its first mirror
-            // tick, which can miss packets a fast link returned in
-            // the meantime. The pump's own probes arrive armed.
-            let arming = p.base_bytes.is_none();
-            if arming {
-                self.session.reset_probe_arrivals();
-            }
-            p.rx_packets_now = st.probe_packets_received;
-            p.rx_bytes_now = st.probe_bytes_received;
-            (p.first_arrival_ns, p.last_arrival_ns) = if arming {
-                (0, 0)
-            } else {
-                (st.probe_first_arrival_ns, st.probe_last_arrival_ns)
-            };
-            // The snapshot predates the arm's reset; its gaps belong to the burst before.
-            if !arming {
-                p.gap_buckets = st.probe_gap_buckets;
-                p.reorders = st.probe_reorders;
-            }
-            p.base_packets.get_or_insert(st.probe_packets_received);
-            p.base_bytes.get_or_insert(st.probe_bytes_received);
-        } else if p.done && p.ramp {
-            // The host's report rides the control stream and the
-            // filler rides the data plane, so it can arrive while the
-            // bottleneck queue is still handing us the step. Keep
-            // counting: the ramp reads the drain, not the send window.
-            p.refresh_delivered(st);
-        }
-        let report = p.done.then(|| ProbeReport {
-            delivered_bytes: p.delivered_bytes,
-            delivered_packets: p.delivered_packets,
-            window_ms: p.throughput_window_ms(p.delivered_packets),
-            host_duration_ms: p.host_duration_ms,
-            client_interval_ms: p.client_interval_ms,
-            client_interval_us: p.client_interval_us,
-            host_bytes_sent: p.host_goodput_bytes,
-            wire_packets_sent: p.host_wire_packets,
-            send_dropped: p.host_send_dropped,
-        });
-        (p.active && !p.done, p.duration_ms, report)
-    }
-
-    /// Send what the tick asked for. Returns the rate this window asked
-    /// for, recorded beside the window it came out of.
-    fn dispatch(&mut self, abr: &mut crate::abr::Driver, actions: Vec<Action>) -> Option<u32> {
-        let mut request_kbps = None;
-        for action in actions {
-            match action {
-                Action::Report {
-                    loss_ppm,
-                    packets_received,
-                    head,
-                    mid,
-                    tail,
-                    sock_drops,
-                } => {
-                    let report = crate::quic::v2::dgram::Feedback {
-                        loss_ppm,
-                        packets_received,
-                        head,
-                        mid,
-                        tail,
-                        sock_drops,
-                        ..Default::default()
-                    };
-                    let fb = self.shared.feedback.lock().unwrap().window(report);
-                    self.shared.send_feedback(&fb);
-                }
-                Action::Shape(shape) => {
-                    let wake = shape == crate::abr::Shape::Wake as u8;
-                    self.shared.wake_shape.store(wake, Ordering::Relaxed);
-                    self.shared.feedback.lock().unwrap().shape(shape);
-                }
-                Action::LinkRate(kbps) => {
-                    *self.shared.link.lock().unwrap() = abr.link();
-                    let fb = self.shared.feedback.lock().unwrap().link(kbps);
-                    if let Some(fb) = fb {
-                        self.shared.send_feedback(&fb);
-                    }
-                }
-                Action::SetBitrate(kbps) => {
-                    request_kbps = Some(kbps);
-                    if self
-                        .ctrl_tx
-                        .try_send(CtrlRequest::SetBitrate(kbps))
-                        .is_err()
-                    {
-                        // Never reached the control task. Three of these
-                        // retire the controller as "the host never acked".
-                        abr.on_request_dropped(kbps);
-                    }
-                }
-                Action::Keyframe => self.shared.ask_keyframe(),
-                Action::Probe {
-                    target_kbps,
-                    duration_ms,
-                    ramp,
-                } => {
-                    // One ProbeState and no correlation id: an embedder
-                    // speed test in flight keeps it, and ours is dropped.
-                    let mut p = self.shared.probe.lock().unwrap();
-                    if p.active && !p.done {
-                        drop(p);
-                        abr.on_probe_dropped();
-                        continue;
-                    }
-                    // Armed before the request leaves: a fast link hands
-                    // back the first packets before the next mirror tick.
-                    self.session.reset_probe_arrivals();
-                    let armed = self.session.stats();
-                    *p = ProbeState {
-                        active: true,
-                        duration_ms,
-                        ramp,
-                        base_packets: Some(armed.probe_packets_received),
-                        base_bytes: Some(armed.probe_bytes_received),
-                        ..Default::default()
-                    };
-                    drop(p);
-                    if self
-                        .ctrl_tx
-                        .try_send(CtrlRequest::Probe(ProbeRequest {
-                            target_kbps,
-                            duration_ms,
-                        }))
-                        .is_err()
-                    {
-                        self.shared.probe.lock().unwrap().active = false; // ctrl queue full — skip
-                        abr.on_probe_dropped();
-                    }
-                }
-                Action::AbandonProbe => self.shared.probe.lock().unwrap().active = false,
-            }
-        }
-        request_kbps
-    }
-
-    /// The report window closed: publish it for the embedder, then run the
-    /// standing-latency ladder and the per-window logs.
-    fn close_window(
-        &mut self,
-        lp: &mut PumpLoop,
-        window: crate::abr::ClosedWindow,
-        request_kbps: Option<u32>,
-    ) {
-        if !window.discarded {
-            self.shared
-                .draining
-                .store(window.sample.sock_drops > 0, Ordering::Relaxed);
-        }
-        let abr = &lp.abr;
-        // Published at the first window, not the moment the ramp
-        // stopped: the rate it opened at is the one the host acked,
-        // and that ack is still in flight while the ramp finishes.
-        if let Some(outcome) = abr.ramp_outcome() {
-            let mut slot = self
-                .shared
-                .abr_ramp
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if slot.is_none() {
-                *slot = Some(crate::abr::RampRecord {
-                    steps: abr.ramp_steps().to_vec(),
-                    outcome,
-                    opening_kbps: abr.target_kbps(),
-                });
-            }
-        }
-        {
-            let mut q = self
-                .shared
-                .abr_windows
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if q.len() == ABR_TRAJECTORY_WINDOWS {
-                q.pop_front();
-            }
-            q.push_back(crate::abr::WindowRecord {
-                t_ms: window
-                    .sample
-                    .now
-                    .duration_since(lp.session_start)
-                    .as_millis() as u64,
-                // The rate the window ran at: the ask has not been
-                // acked yet, so it is not this window's rate.
-                rate_kbps: abr.target_kbps(),
-                request_kbps,
-                sample: window.sample,
-                discarded: window.discarded,
-                reason: abr.reason(),
-            });
-        }
-        // No-op clock flush suspected a wall-clock step: re-sync
-        // once. The 60 s periodic covers everything else.
-        if lp.jump.take_resync() {
-            let _ = self.ctrl_tx.try_send(CtrlRequest::ClockResync);
-        }
-        // Standing-latency window close. Escalation: re-sync (stale
-        // offset), then bleed (flush+keyframe), then disarm (path
-        // latency changed).
-        match lp.standing_lat.on_window(window.loss_free) {
-            StandingLatAction::None => {}
-            StandingLatAction::Resync { above_ms } => {
-                tracing::info!(
-                    above_ms,
-                    "standing latency above the session floor with zero loss — \
-                     requesting a clock re-sync first (a stale offset reads exactly \
-                     like this)"
-                );
-                let _ = self.ctrl_tx.try_send(CtrlRequest::ClockResync);
-            }
-            // Shares the jump-to-live cooldown. An unexecuted bleed re-arms
-            // as the detector's run rebuilds.
-            StandingLatAction::Bleed { above_ms } => {
-                if lp.jump.claim_flush(Instant::now()) {
-                    // Not a jump-to-live: that is ABR SEVERE (immediate
-                    // ×0.7). Bleed fires after ~6 clean windows with a
-                    // sub-25 ms elevation the controller already scores as fine.
-                    let (flushed, dropped) = self.shed_backlog();
-                    lp.standing_lat.bled();
-                    tracing::warn!(
-                        above_ms,
-                        flushed_datagrams = flushed,
-                        dropped_frames = dropped,
-                        "standing latency survived a clock re-sync — bled the local \
-                         backlog (flush + keyframe)"
-                    );
-                }
-            }
-            StandingLatAction::Disarm { above_ms } => {
-                tracing::warn!(
-                    above_ms,
-                    "standing latency persists after a re-sync and every bleed — not \
-                     local, not clock; the path latency changed. Leaving it be \
-                     (reconnect re-baselines)"
-                );
-            }
-        }
-        // The overlay names why Automatic sits low; the cut
-        // stands until the host grants a climb.
-        self.shared.rate_cut.store(
-            lp.abr
-                .last_cut()
-                .and_then(crate::hud::RateCut::of_reason)
-                .map_or(0, |c| c as u8),
-            Ordering::Relaxed,
-        );
-        self.shared
-            .quality_floor_kbps
-            .store(lp.abr.quality_floor().unwrap_or(0), Ordering::Relaxed);
-        if let Some(perf) = lp.perf.as_mut() {
-            if let Some(p) = self.session.take_pump_perf() {
-                let per_pkt_ns = |ns: u64| ns.checked_div(p.packets).unwrap_or(0);
-                tracing::info!(
-                    recv_ms = p.recv_ns / 1_000_000,
-                    decrypt_ms = p.decrypt_ns / 1_000_000,
-                    reasm_ms = p.reasm_ns / 1_000_000,
-                    packets = p.packets,
-                    batches = p.batches,
-                    pkts_per_batch = p.packets.checked_div(p.batches).unwrap_or(0),
-                    decrypt_ns_pkt = per_pkt_ns(p.decrypt_ns),
-                    reasm_ns_pkt = per_pkt_ns(p.reasm_ns),
-                    "pump stage split (window)"
-                );
-            }
-            perf.log_and_clear();
-        }
-    }
-
-    /// Ask for recovery the moment a frame's last shard lands short of what its parity can
-    /// rebuild, a frame interval before the next frame shows the gap, so the host's next
-    /// encode is the anchor. A frame at most [`NACK_SHORT`] shards past its parity, on a
-    /// round trip inside a frame interval, asks for its missing shards instead, and the
-    /// frames after it wait for them. One that completed meanwhile asks nothing. The decode
-    /// side's gap still arms the freeze. An all-intra frame references nothing, so it asks
-    /// only for its shards: the next frame is its recovery. A stream nobody decodes yet
-    /// starts on an IDR and asks nothing.
-    fn ask_for_short_tails(&mut self) {
-        let tails: Vec<u32> = self.session.take_short_tails().collect();
-        if tails.is_empty() || !self.shared.frames.consumer_seen() {
-            return;
-        }
-        let all_intra = self.negotiated_codec == crate::quic::CODEC_PYROWAVE;
-        let now = Instant::now();
-        for idx in tails {
-            if !self.session.frame_in_flight(idx) {
-                continue;
-            }
-            if let Some((missing, recovery)) = self.session.missing_beyond_parity(idx) {
-                self.shared
-                    .short_frames
-                    .lock()
-                    .unwrap()
-                    .note(idx, missing, recovery);
-                if missing <= NACK_SHORT && self.ask_nack(idx, now) {
-                    continue;
-                }
-            }
-            if self.on_anchors || all_intra {
-                continue;
-            }
-            self.recovery(super::super::RecoveryEvent::TailShort { index: idx }, now);
-        }
-    }
-
-    /// Fold one of the pump's own events into the recovery driver and send what it asks.
-    fn recovery(&self, ev: super::super::RecoveryEvent, now: Instant) {
-        let ask = self.shared.recovery.lock().unwrap().step(ev, now).ask;
-        super::super::send_recovery(&self.shared, ask);
-    }
-
-    /// Ask for frame `idx`'s missing shards when the round trip fits a frame interval, and
-    /// hold the frames after it `rtt + frame interval`: the resend waits out the frame the
-    /// host is pacing, then the round trip. Past two intervals an RFI costs less. `false`
-    /// when it asked nothing.
-    fn ask_nack(&mut self, idx: u32, now: Instant) -> bool {
-        use crate::quic::v2::dgram::{Nack, NACK_MAX};
-        let rtt = Duration::from_micros(u64::from(self.shared.rtt_us.load(Ordering::Relaxed)));
-        let period = Duration::from_micros(1_000_000 / u64::from(self.refresh_hz.max(1)));
-        if !self.nack || rtt.is_zero() || rtt > period {
-            return false;
-        }
-        let Some(nack) = self
-            .session
-            .missing_shards(idx, NACK_MAX)
-            .and_then(|s| Nack::new(idx, &s))
-        else {
-            return false;
-        };
-        if !self.shared.frames.hold(idx, now + rtt + period) {
-            return false;
-        }
-        tracing::debug!(frame = idx, rtt_us = rtt.as_micros() as u64, "nack asked");
-        self.shared.ask_nack(nack);
-        self.session.note_nack(false);
-        true
-    }
-
     /// One polled frame. Probe filler is skipped, a frame with no decoder
     /// yet is held or dropped, a stale backlog jumps to live, the rest queue.
     fn on_frame(
@@ -747,9 +247,14 @@ impl DataPump {
             .on_frame(frame.frame_index, frame.flags);
         if lp.last_epoch != Some(frame.epoch) {
             lp.last_epoch = Some(frame.epoch);
-            let delivered = self.shared.anchor.lock().unwrap().frame(frame.epoch);
+            let delivered = self
+                .shared
+                .anchor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .frame(frame.epoch);
             if let Some(mode) = delivered {
-                super::anchor::apply(&self.shared.mode, &self.mode_gen, mode);
+                super::anchor::apply(&self.shared.mode, &self.events_tx, mode);
             }
         }
         // The decoder's RFI for this gap reads what the skipped frame lacks now.
@@ -887,42 +392,9 @@ impl DataPump {
     }
 }
 
-/// A positive `u32` from the environment. Unset, zero or garbage is `None`.
-fn env_u32(key: &str) -> Option<u32> {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|&v| v > 0)
-}
-
-/// Drain the host's pending pipeline gap. `Some(gap_ms)` = the in-flight
-/// report window must be discarded. Swap-to-zero so one announcement
-/// cannot keep poisoning later windows.
-fn take_pipeline_gap(slot: &AtomicU32) -> Option<u32> {
-    match slot.swap(0, Ordering::Relaxed) {
-        0 => None,
-        gap_ms => Some(gap_ms),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_pipeline_gap_is_taken_exactly_once() {
-        let slot = AtomicU32::new(0);
-        assert_eq!(
-            take_pipeline_gap(&slot),
-            None,
-            "an idle session announces nothing"
-        );
-        slot.store(401, Ordering::Relaxed);
-        assert_eq!(take_pipeline_gap(&slot), Some(401));
-        // Drain bounds discard to one window. Silence would look like
-        // a clean link to host adaptive FEC.
-        assert_eq!(take_pipeline_gap(&slot), None);
-    }
 
     /// The loopback sessions' config, for either end.
     fn loopback_config(role: crate::config::Role) -> crate::config::Config {
@@ -976,15 +448,14 @@ mod tests {
         let _ = shared.feedback_tx.set(Box::new(move |fb| {
             let _ = fb_tx.send(*fb);
         }));
+        let (events_tx, events) = std::sync::mpsc::channel();
         let pump = DataPump {
             session,
             shared,
             ctrl_tx,
-            clock_gen: Arc::new(AtomicU32::new(0)),
+            events,
+            events_tx,
             encode_lat: Arc::new(Mutex::new(Default::default())),
-            mode_gen: Arc::new(AtomicU32::new(0)),
-            bitrate_ack: Arc::new(Mutex::new(AckQueue::new())),
-            pipeline_gap: Arc::new(AtomicU32::new(0)),
             bitrate_kbps: 20_000,
             resolved_bitrate_kbps: 20_000,
             negotiated_codec: codec,
@@ -1301,7 +772,7 @@ mod tests {
     }
 
     /// Host-rebuild repair, end to end: a real [`PipelineGap`] on a real
-    /// control stream, the control task parks it, the pump discards the
+    /// control stream, the control task sends it on, the pump discards the
     /// window it landed in.
     ///
     /// Assertions watch the window's report — the discarded window's
@@ -1323,15 +794,21 @@ mod tests {
             .expect("open the stream with a message the client ignores");
         let (ctrl_send, ctrl_recv) = accept_ctrl.await.unwrap();
 
-        let pipeline_gap = Arc::new(AtomicU32::new(0));
-        // Hold the sender so the task does not exit on a closed channel.
-        let (_task_ctrl_tx, task_ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(8);
-        let (planes, _planes_rx) = crate::client::planes::channels();
         let mode = crate::config::Mode {
             width: 1920,
             height: 1080,
             refresh_hz: 60,
         };
+        // Explicit bitrate (not Automatic): keep the controller and the
+        // startup probe out. The probe would discard a window of its own.
+        let pump_shared = Arc::new(ClientShared::new(mode));
+        let (_host_tp, session) = idle_client_session(crate::quic::wall_clock_ns());
+        let (pump, _pump_ctrl_rx, fb_rx) =
+            test_pump(session, pump_shared.clone(), crate::quic::CODEC_HEVC);
+
+        // Hold the sender so the task does not exit on a closed channel.
+        let (_task_ctrl_tx, task_ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(8);
+        let (planes, _planes_rx) = crate::client::planes::channels();
         tokio::spawn(
             super::super::control_task::ControlTask {
                 ctrl_rx: task_ctrl_rx,
@@ -1339,25 +816,14 @@ mod tests {
                 ctrl_recv: CtlRecv::new(ctrl_recv),
                 clock_rtt_ns: None, // no connect handshake ⇒ no re-sync batches to interleave
                 shared: Arc::new(ClientShared::new(mode)),
-                bitrate_ack: Arc::new(Mutex::new(AckQueue::new())),
-                pipeline_gap: pipeline_gap.clone(),
-                clock_gen: Arc::new(AtomicU32::new(0)),
+                events: pump.events_tx.clone(),
                 clip_event_tx: planes.clip_event,
                 cursor_shape_tx: planes.cursor_shape,
-                mode_gen: Arc::new(AtomicU32::new(0)),
                 access_tx: planes.access,
                 hidout_tx: planes.datagram.hidout,
             }
             .run(),
         );
-
-        // Explicit bitrate (not Automatic): keep the controller and the
-        // startup probe out. The probe would discard a window of its own.
-        let pump_shared = Arc::new(ClientShared::new(mode));
-        let (_host_tp, session) = idle_client_session(crate::quic::wall_clock_ns());
-        let (mut pump, _pump_ctrl_rx, fb_rx) =
-            test_pump(session, pump_shared.clone(), crate::quic::CODEC_HEVC);
-        pump.pipeline_gap = pipeline_gap.clone();
         let started = Instant::now();
         let pump_thread = std::thread::spawn(move || pump.run());
 
@@ -1376,14 +842,9 @@ mod tests {
             fb_rx.try_iter().all(|fb| fb.window == 0),
             "the window the host's rebuild landed in must be discarded, not reported"
         );
-        assert_eq!(
-            pipeline_gap.load(Ordering::Relaxed),
-            0,
-            "and the announcement must be drained, so it can't discard a second window"
-        );
 
-        // Next window must report. A wedged pump would fail here rather
-        // than pass the discard assert above.
+        // Next window must report: the gap discards one window, not a second. A wedged
+        // pump would fail here rather than pass the discard assert above.
         let reported = tokio::task::spawn_blocking(move || {
             let deadline = Instant::now() + Duration::from_millis(1_500);
             loop {

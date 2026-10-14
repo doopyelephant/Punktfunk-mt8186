@@ -43,7 +43,8 @@ pub mod video_csc_spv;
 #[cfg(desktop)]
 mod video_software;
 // Native VAAPI: pf-vaapi plans into dlopen'd libva, DRM-PRIME dmabufs for the presenter.
-// Only VAAPI rung; `auto` reaches it when vendor order puts VAAPI first, or pin `PUNKTFUNK_DECODER=native-vaapi`. Evidence: `video`.
+// Only VAAPI rung. It is `verified: false`, so `auto` never tries it before a usable Vulkan rung;
+// pin `PUNKTFUNK_DECODER=native-vaapi` to run it first. Evidence: `video`.
 #[cfg(all(desktop, target_os = "linux"))]
 pub mod video_vaapi_native;
 // V4L2 decode: the hardware rung of SoCs with no Vulkan Video and no VA-API. `auto` reaches it after both; pin `PUNKTFUNK_DECODER=native-v4l2`.

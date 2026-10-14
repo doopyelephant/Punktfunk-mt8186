@@ -18,6 +18,7 @@ use anyhow::Result;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 
+pub(crate) use crate::video_caps::resolve_decoder_pref;
 #[cfg(target_os = "linux")]
 pub(crate) use crate::video_caps::VENDOR_INTEL;
 /// The capability and advertisement gates live in `video_caps`; call sites keep `video::` paths.
@@ -29,7 +30,6 @@ pub use crate::video_caps::{
     usable_decode_ops, video_caps_for, wire_codec_name, LastRungVerdict, NativeRung, RungEvidence,
     RungLoss, V4l2Summary, AMD_VULKAN_HDR_DRIVER_FLOOR,
 };
-pub(crate) use crate::video_caps::{native_vulkan_gate, resolve_decoder_pref};
 #[cfg(target_os = "linux")]
 pub use crate::video_caps::{vaapi_av1_decodable, vaapi_hevc_decodable};
 pub use crate::video_color::{csc_rows, ColorDesc};
@@ -611,7 +611,7 @@ pub(crate) const VIDEO_CODEC_OP_DECODE_AV1: u32 = 0x0000_0004;
 ///
 /// Returned together: splitting them admits HEVC on an H.264-only family
 /// (`vkCreateVideoSessionKHR` for an unsupported op is UB, not an error).
-/// Presence here is "pf-vkdecode has a decoder", not auto admission ([`native_vulkan_gate`]).
+/// Presence here is "pf-vkdecode has a decoder", not auto admission ([`native_vulkan_usable`]).
 pub(crate) fn native_codec(wire: u8) -> Option<(NativeCodec, u32)> {
     match wire {
         punktfunk_core::quic::CODEC_H264 => Some((NativeCodec::H264, VIDEO_CODEC_OP_DECODE_H264)),
@@ -760,7 +760,7 @@ fn log_rung(active: &dyn Rung, wire: u8) {
 }
 
 /// Say why the walk passes a rung over, when it gets there.
-fn log_note(note: Note, wire: u8, vk: Option<&VulkanDecodeDevice>) {
+fn log_note(note: Note, choice: &str, wire: u8, vk: Option<&VulkanDecodeDevice>) {
     let codec = wire_codec_name(wire);
     match note {
         // The gate is an AND of three; name all three. `video_decode=true`
@@ -790,6 +790,11 @@ fn log_note(note: Note, wire: u8, vk: Option<&VulkanDecodeDevice>) {
         Note::SoftwareOnly => tracing::info!(
             "software decode by preference (Settings decoder / PUNKTFUNK_DECODER) — \
              hardware decode not attempted"
+        ),
+        // A typo would otherwise decode as `auto` in silence.
+        Note::UnknownPreference => tracing::warn!(
+            preference = choice,
+            "unknown decoder preference read as auto"
         ),
     }
 }
@@ -847,7 +852,7 @@ impl Decoder {
             let rung = match step {
                 Step::Try(rung) | Step::Pin(rung) => rung,
                 Step::Note(note) => {
-                    log_note(note, wire, vk);
+                    log_note(note, &choice, wire, vk);
                     continue;
                 }
             };
@@ -1064,7 +1069,7 @@ impl Decoder {
                     // A never-delivered hardware rung is a decoder the session never
                     // had; it must not cost the rung below.
                     let (vk, ran) = (self.vk.as_ref(), &self.ran);
-                    for rung in demotions(Os::HOST, self.wire_codec, vk, from, ran) {
+                    for rung in demotions(Os::HOST, self.wire_codec, vk, ran) {
                         if self.demote_into(&e, which, rung) {
                             return Ok(None);
                         }

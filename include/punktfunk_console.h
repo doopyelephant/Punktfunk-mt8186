@@ -15,10 +15,11 @@
 // `[HostRow]` — the home carousel.
 #define PUNKTFUNK_CONSOLE_PUSH_HOSTS 0
 
-// `"Idle"`, `"Busy"`, `{"Failed": "why"}` or `{"Paired": {"key": "…"}}`.
+// `{"req": …, "phase": "Busy" | {"Failed": "why"} | {"Paired": {"key": "…"}}}`, `req` the
+// `Pair` or `RequestAccess` command's.
 #define PUNKTFUNK_CONSOLE_PUSH_PAIR 1
 
-// `WakeStatus`, or `null` to clear.
+// `WakeStatus` under the `Wake`'s `req`, or `null` when the wake ended.
 #define PUNKTFUNK_CONSOLE_PUSH_WAKE 2
 
 // A JSON string: a one-shot toast.
@@ -30,13 +31,14 @@
 // Any JSON: a library fetch is starting for the shelf on screen.
 #define PUNKTFUNK_CONSOLE_PUSH_LIBRARY_BEGIN 5
 
-// `"Loading"`, `"Empty"`, `"Ready"` or `{"Error": {"title", "body", "can_retry"}}`.
+// `{"req": …, "phase": "Loading" | "Empty" | "Ready" | {"Error": {"title", "body",
+// "can_retry"}}}`, `req` the `FetchLibrary`'s.
 #define PUNKTFUNK_CONSOLE_PUSH_LIBRARY_PHASE 6
 
-// `[LibraryGame]` — the fetched catalog.
+// `{"req": …, "games": [LibraryGame]}` — the fetched catalog for that `FetchLibrary`.
 #define PUNKTFUNK_CONSOLE_PUSH_LIBRARY_GAMES 7
 
-// `[LibraryGame]` — the cached catalog, shown while the fetch runs.
+// `{"req": …, "games": [LibraryGame]}` — the cached catalog, shown while the fetch runs.
 #define PUNKTFUNK_CONSOLE_PUSH_LIBRARY_CACHED 8
 
 // `[{"app_id": "steam:570", "state": "running"}]` — the host's running games.

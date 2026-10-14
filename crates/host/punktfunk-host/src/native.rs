@@ -72,6 +72,8 @@ mod control;
 mod cursor_fwd;
 
 mod stream;
+#[cfg(feature = "gamestream")]
+pub(crate) use stream::shared as pipeline;
 use stream::{
     reconfig_allowed, software_stream, synthetic_abr_stream, synthetic_stream, virtual_stream,
     SessionContext, StreamCommon, SynthAbrContext,
@@ -1529,11 +1531,11 @@ pub(crate) async fn run_admitted(
     // Linux `PUNKTFUNK_PIN_CLOCKS`: refcounted vendor clock floor while any session streams.
     #[cfg(target_os = "linux")]
     let _clock_pin = crate::gpuclocks::session_pin();
-    // Stats label: device-fingerprint prefix, else peer IP (anonymous, `--open`).
-    let client_label = conn
-        .peer_fingerprint()
-        .map(|fp| hex::encode(fp)[..12].to_string())
-        .unwrap_or_else(|| conn.remote_address().ip().to_string());
+    // Registry and stats label; an anonymous `--open` client is labelled by its address.
+    let client_label = stream::session_client_label(
+        conn.peer_fingerprint().map(hex::encode).as_deref(),
+        Some(conn.remote_address().ip()),
+    );
     let launch_owner = crate::session_launch::LaunchOwner {
         client: client_label.clone(),
         fingerprint: conn.peer_fingerprint().map(hex::encode),

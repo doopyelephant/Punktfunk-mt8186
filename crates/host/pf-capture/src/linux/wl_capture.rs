@@ -16,7 +16,7 @@
 use super::gbm_pool::{render_node_for, GbmPool};
 use super::{CaptureSignals, FrameSlot};
 use anyhow::{anyhow, bail, Context, Result};
-use pf_frame::{CapturedFrame, DmabufFrame, FramePayload, HdrMeta, PixelFormat};
+use pf_frame::{CapturedFrame, FramePayload, HdrMeta, PixelFormat};
 use pf_zerocopy::drm;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1133,17 +1133,14 @@ impl Opened {
             list: self.free.clone(),
             idx,
         });
-        Ok(FramePayload::Dmabuf(DmabufFrame {
+        Ok(FramePayload::Dmabuf(signals.held_dmabuf(
             fd,
-            fourcc: self.fourcc,
+            self.fourcc,
             modifier,
-            offset: bo.offset,
-            stride: bo.stride,
-            plane1: None,
-            hold: Some(hold),
-            health: signals.health.clone(),
-            rebuild: signals.broken.clone(),
-        }))
+            (bo.offset, bo.stride),
+            None,
+            hold,
+        )))
     }
 }
 

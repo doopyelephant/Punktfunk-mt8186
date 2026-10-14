@@ -17,21 +17,12 @@ pub(super) struct ControlTask {
     /// The cells this task writes as the host reports them: mode, probe, live bitrate, clock
     /// offset, access, mute, pad slots, launch verdict. Access lands before `access_tx` fires.
     pub(super) shared: Arc<ClientShared>,
-    /// Latest host `BitrateChanged` ack with its reason; the pump ABR drains it on the
-    /// report tick.
-    pub(super) bitrate_ack: Arc<Mutex<AckQueue>>,
-    /// Last host pipeline gap in ms ([`crate::quic::PipelineGap`]); `0` = none.
-    /// Pump drains it and discards the in-flight report window — a host-local
-    /// rebuild is not congestion. Atomic because the pump only ever swaps it.
-    pub(super) pipeline_gap: Arc<AtomicU32>,
-    pub(super) clock_gen: Arc<AtomicU32>,
+    /// To the data pump: re-syncs, bitrate acks, pipeline gaps and mode switches.
+    pub(super) events: PumpTx,
     /// ClipState/ClipOffer share the fetch-data event plane.
     pub(super) clip_event_tx: std::sync::mpsc::SyncSender<ClipEventCore>,
     /// Host [`CursorShape`] → [`NativeClient::next_cursor_shape`].
     pub(super) cursor_shape_tx: crate::client::planes::ShapeSender,
-    /// Bumped on every ACCEPTED mode switch (`clock_gen` pattern). The pump
-    /// resets bitrate-controller state that belonged to the old mode.
-    pub(super) mode_gen: Arc<AtomicU32>,
     /// Access updates → [`NativeClient::next_access_update`]. try_send: a
     /// lagging embedder drops the oldest; the two live slots already hold truth.
     pub(super) access_tx: std::sync::mpsc::SyncSender<crate::quic::AccessUpdate>,
@@ -47,12 +38,9 @@ impl ControlTask {
             mut ctrl_recv,
             clock_rtt_ns,
             shared,
-            bitrate_ack,
-            pipeline_gap,
-            clock_gen,
+            events,
             clip_event_tx,
             cursor_shape_tx,
-            mode_gen,
             access_tx,
             hidout_tx,
         } = self;
@@ -132,9 +120,9 @@ impl ControlTask {
                     let Ok((ty, body)) = frame else { break }; // stream closed
                     if let Ok(ack) = decode::<Reconfigured>(ty, &body) {
                         // An anchored host says what it delivers in a `StreamConfig` instead.
-                        if ack.accepted && !anchor.lock().unwrap().on {
-                            *mode_slot.lock().unwrap() = ack.mode;
-                            mode_gen.fetch_add(1, Ordering::Relaxed);
+                        if ack.accepted && !anchor.lock().unwrap_or_else(|e| e.into_inner()).on {
+                            *mode_slot.lock().unwrap_or_else(|e| e.into_inner()) = ack.mode;
+                            let _ = events.send(PumpEvent::Mode(ack.mode));
                         }
                         if ack.accepted {
                             tracing::info!(mode = ?ack.mode, "host accepted mode switch");
@@ -152,9 +140,9 @@ impl ControlTask {
                                 "host's link facts"
                             );
                         }
-                        let delivered = anchor.lock().unwrap().config(cfg);
+                        let delivered = anchor.lock().unwrap_or_else(|e| e.into_inner()).config(cfg);
                         if let Some(mode) = delivered {
-                            super::anchor::apply(mode_slot, &mode_gen, mode);
+                            super::anchor::apply(mode_slot, &events, mode);
                         }
                     } else if let Ok(result) = decode::<ProbeResult>(ty, &body) {
                         let mut p = probe.lock().unwrap();
@@ -195,7 +183,7 @@ impl ControlTask {
                             "speed-test probe result"
                         );
                     } else if let Ok(ack) = decode::<BitrateChanged>(ty, &body) {
-                        // Host clamp is authoritative. Park it for the pump
+                        // Host clamp is authoritative. On to the pump's
                         // controller; any ack also means this host renegotiates.
                         tracing::info!(
                             kbps = ack.bitrate_kbps,
@@ -206,21 +194,16 @@ impl ControlTask {
                         if ack.bitrate_kbps > 0 {
                             live_bitrate.store(ack.bitrate_kbps, Ordering::Relaxed);
                         }
-                        bitrate_ack
-                            .lock()
-                            .unwrap()
-                            .push_back((ack.bitrate_kbps, ack.reason));
+                        let _ = events.send(PumpEvent::BitrateAck(ack.bitrate_kbps, ack.reason));
                     } else if let Ok(gap) = decode::<crate::quic::PipelineGap>(ty, &body) {
-                        // Host rebuilt capture+encoder; park for the pump to discard
-                        // the in-flight report window (not congestion). Latest-wins.
-                        // Floor at 1: 0 means nothing pending, so a rounded-down
-                        // gap must not silently disarm the discard.
+                        // Host rebuilt capture+encoder: the pump discards the in-flight
+                        // report window (not congestion).
                         tracing::info!(
                             gap_ms = gap.gap_ms,
                             "host rebuilt its capture/encode pipeline — discarding the report \
                              window in flight"
                         );
-                        pipeline_gap.store(gap.gap_ms.max(1), Ordering::Relaxed);
+                        let _ = events.send(PumpEvent::PipelineGap(gap.gap_ms));
                     } else if let Ok(echo) = decode::<ClockEcho>(ty, &body) {
                         match resync.on_echo(&echo, wall_clock_ns()) {
                             ResyncStep::MoreRounds => {
@@ -259,7 +242,7 @@ impl ControlTask {
                                         "mid-stream clock re-sync applied"
                                     );
                                     clock_offset.store(offset_ns, Ordering::Relaxed);
-                                    clock_gen.fetch_add(1, Ordering::Relaxed);
+                                    let _ = events.send(PumpEvent::ClockResynced);
                                 }
                             }
                             ResyncStep::Idle => {}
