@@ -880,4 +880,87 @@ mod tests {
         );
         assert_eq!(find_steam_source(&users[..2]), None);
     }
+
+    /// A link where the box's avatar folder should be is refused, and nothing behind it is
+    /// copied into a seat's trust copy.
+    #[test]
+    fn a_linked_profiles_directory_is_not_followed() {
+        let temp = tempfile::tempdir().unwrap();
+        let (box_dir, state) = (temp.path().join("box"), temp.path().join("state"));
+        let secret = temp.path().join("secret");
+        for dir in [&box_dir, &state, &secret] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::fs::write(secret.join("shadow.png"), "root only").unwrap();
+        std::os::unix::fs::symlink(&secret, box_dir.join("profiles")).unwrap();
+        let gid = own_gid(&box_dir);
+        let error = refresh_trust(&box_dir, &state, &id(), Reader::group(gid)).unwrap_err();
+        assert_eq!(error.code, "trust_copy");
+        assert!(!trust_dir(&state, &id())
+            .join("profiles/shadow.png")
+            .exists());
+    }
+
+    /// A FIFO the door puts among its files doesn't stall the supervisor: one in the avatar
+    /// folder is skipped, one at a file the copy reads fails the refresh at once.
+    #[test]
+    fn a_fifo_in_the_box_does_not_block_the_copy() {
+        use super::super::safe_open::tests::{fifo, within};
+        let temp = tempfile::tempdir().unwrap();
+        let (box_dir, state) = (temp.path().join("box"), temp.path().join("state"));
+        std::fs::create_dir_all(box_dir.join("profiles")).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(box_dir.join("profiles.json"), "{}").unwrap();
+        fifo(&box_dir.join("profiles/p1.png"));
+        let gid = own_gid(&box_dir);
+        let refresh = || {
+            let (b, s) = (box_dir.clone(), state.clone());
+            within(move || refresh_trust(&b, &s, &id(), Reader::group(gid)).is_ok())
+        };
+        assert_eq!(refresh(), Some(true), "an avatar FIFO is skipped");
+        fifo(&box_dir.join("seat-defaults.json"));
+        assert_eq!(refresh(), Some(false), "a box file FIFO fails the refresh");
+    }
+
+    /// A FIFO for the seat host's certificate answers at once and leaves no copy; a real one is
+    /// copied for root alone.
+    #[test]
+    fn a_fifo_for_the_host_certificate_does_not_block() {
+        use super::super::safe_open::tests::{fifo, within};
+        let temp = tempfile::tempdir().unwrap();
+        let (home, pin) = (temp.path().join("home"), temp.path().join("pin"));
+        let config = home.join(".config/punktfunk");
+        std::fs::create_dir_all(&config).unwrap();
+        fifo(&config.join("native-cert.pem"));
+        let (h, p) = (home.clone(), pin.clone());
+        let copied = within(move || copy_pin(&h, &p).is_ok()).expect("blocked on the FIFO");
+        assert!(!copied);
+        assert!(!pin.join("native-cert.pem").exists());
+        std::fs::remove_file(config.join("native-cert.pem")).unwrap();
+        std::fs::write(config.join("native-cert.pem"), "pem").unwrap();
+        copy_pin(&home, &pin).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(pin.join("native-cert.pem")).unwrap(),
+            "pem"
+        );
+        assert_eq!(mode(&pin.join("native-cert.pem")), 0o600);
+    }
+
+    /// The supervisor refuses a ledger root another uid owns or may write. Giving a directory
+    /// away needs root, so elsewhere this checks nothing.
+    #[test]
+    fn a_ledger_root_with_another_owner_is_refused() {
+        if !rustix::process::geteuid().is_root() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = ledger_root(temp.path());
+        ensure_layout(temp.path()).unwrap();
+        std::os::unix::fs::chown(&root, Some(1000), None).unwrap();
+        assert!(ensure_layout(temp.path()).is_err(), "owned by another uid");
+        std::os::unix::fs::chown(&root, Some(0), None).unwrap();
+        ensure_layout(temp.path()).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_layout(temp.path()).is_err(), "writable by others");
+    }
 }

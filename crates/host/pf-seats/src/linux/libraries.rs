@@ -899,4 +899,30 @@ mod tests {
             "\"libraryfolders\"\n{\n}\n"
         );
     }
+
+    /// A FIFO for a seat's library list or the box's Seat defaults answers at once.
+    #[test]
+    fn a_fifo_in_a_tree_root_reads_does_not_block() {
+        use super::super::safe_open::tests::{fifo, within};
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(steam_file(&home, "steamapps").parent().unwrap()).unwrap();
+        fifo(&steam_file(&home, "steamapps"));
+        let seat = me(temp.path());
+        let h = home.clone();
+        let merge = |_: &str| Some("changed".to_owned());
+        let merged = within(move || merge_list(&h, "steamapps", &seat, merge).is_ok());
+        assert_eq!(
+            merged,
+            Some(false),
+            "a library list FIFO is refused at once"
+        );
+        fifo(&temp.path().join(DEFAULTS));
+        let b = temp.path().to_path_buf();
+        assert_eq!(
+            within(move || writable(&b)),
+            Some(true),
+            "unreadable reads as writable"
+        );
+    }
 }

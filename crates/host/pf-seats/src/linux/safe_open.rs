@@ -100,3 +100,48 @@ pub(super) fn walk(at: OwnedFd, names: &[&str]) -> std::io::Result<Option<OwnedF
     }
     Ok(Some(at))
 }
+
+#[cfg(test)]
+pub(super) mod tests {
+    use super::*;
+
+    /// A FIFO at `path`: opening it to read blocks until a writer comes.
+    pub(in crate::linux) fn fifo(path: &Path) {
+        let made = std::process::Command::new("mkfifo").arg(path).status();
+        assert!(made.unwrap().success(), "mkfifo {}", path.display());
+    }
+
+    /// What `f` returns, or `None` while it is still blocked after two seconds.
+    pub(in crate::linux) fn within<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2)).ok()
+    }
+
+    /// Only a plain file with one link within the cap is read; a link, a FIFO, a second link or
+    /// an oversized file is refused at once, and an absent one is `None`.
+    #[test]
+    fn only_a_plain_file_within_the_cap_is_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        std::fs::write(dir.join("plain"), "ok").unwrap();
+        std::os::unix::fs::symlink(dir.join("plain"), dir.join("link")).unwrap();
+        std::fs::write(dir.join("twice"), "x").unwrap();
+        std::fs::hard_link(dir.join("twice"), dir.join("twice-2")).unwrap();
+        fifo(&dir.join("fifo"));
+        let at = |name: &'static str, max: u64| {
+            let dir = dir.clone();
+            within(move || read(&dir.join(name), max).map(|f| f.map(|(b, _)| b))).expect("blocked")
+        };
+        assert_eq!(at("plain", 2).unwrap(), Some(b"ok".to_vec()));
+        assert!(at("plain", 1).is_err());
+        assert!(at("link", 2).is_err());
+        assert!(at("twice", 2).is_err());
+        assert!(at("fifo", 2).is_err());
+        assert_eq!(at("absent", 2).unwrap(), None);
+    }
+}

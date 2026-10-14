@@ -157,4 +157,20 @@ State=closing
         let physical_is_own: Vec<_> = all.iter().filter(|s| s.id == "16").cloned().collect();
         assert!(!at_the_desk(&physical_is_own, "owner", Some("16")));
     }
+
+    /// A FIFO for the runner's session file answers at once. The file lives under `/run`, so
+    /// where that can't be written this checks nothing.
+    #[test]
+    fn a_fifo_for_the_session_file_does_not_block() {
+        use super::super::safe_open::tests::{fifo, within};
+        let account = format!("pftest{}", std::process::id());
+        let dir = super::super::session::runtime_dir(&account);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        fifo(&dir.join("session"));
+        let found = within(move || own_session(&account));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found, Some(None), "blocked on the session file");
+    }
 }
