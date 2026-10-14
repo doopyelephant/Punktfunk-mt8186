@@ -22,6 +22,7 @@ pub use crate::menu_nav::{MenuDir, MenuEvent, MenuPulse, PadBattery, PadInfo};
 use punktfunk_core::client::NativeClient;
 use punktfunk_core::config::GamepadPref;
 use punktfunk_core::input::gamepad as wire;
+pub use select_gesture::SelectChord;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -30,15 +31,6 @@ use worker::{run, Worker};
 
 /// 1500 ms is long enough to be deliberate over a leave-fullscreen press.
 const DISCONNECT_HOLD: Duration = Duration::from_millis(1500);
-
-/// Hold Select alone this long for a synthetic host Guide
-/// ([`SelectGesture`](select_gesture::SelectGesture)). The physical Guide never reaches
-/// the host cleanly where the local shell owns it.
-const GUIDE_HOLD: Duration = Duration::from_millis(350);
-
-/// Delay between a held-back Select tap's press and its scheduled release. Core folds
-/// per-transition sends into one `GamepadState`; down+up in one window vanish.
-const TAP_PRESS: Duration = Duration::from_millis(50);
 
 /// The Deck's HIDAPI driver on/off. It sends `ID_CLEAR_DIGITAL_MAPPINGS` +
 /// `TRACKPAD_NONE` at *enumeration* and feeds the lizard-mode watchdog, so the
@@ -101,19 +93,6 @@ enum Ctl {
     RingNav(bool),
     /// Whether anything is listening for a Select chord ([`GamepadService::set_chords_live`]).
     ChordsLive(bool),
-}
-
-/// What a Select+button chord on a forwarded pad asks the client for.
-///
-/// [`Ring`](Self::Ring) withholds the press it takes, because A is the dial's own confirm. That
-/// is why the client says whether anything is listening ([`GamepadService::set_chords_live`]):
-/// a chord nothing receives would eat a face button the game was owed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SelectChord {
-    /// Select+A — open the quick-action dial. The A press is withheld.
-    Ring,
-    /// Select+X — step the stats overlay's tier. Both presses still reach the game.
-    Stats,
 }
 
 #[derive(Clone)]
@@ -307,7 +286,7 @@ impl GamepadService {
 
     /// `forward_raw` gates physical Guide/QAM onto the wire (off = local shell; on a
     /// Gaming-Mode host, forwarding opens both overlays). `gesture` arms hold-Select
-    /// ([`GUIDE_HOLD`]) so the host Guide stays reachable.
+    /// ([`GUIDE_HOLD`](select_gesture::GUIDE_HOLD)) so the host Guide stays reachable.
     pub fn set_system_buttons(&self, forward_raw: bool, gesture: bool) {
         let _ = self.ctl.send(Ctl::SystemButtons {
             forward_raw,
@@ -315,8 +294,8 @@ impl GamepadService {
         });
     }
 
-    /// Synthetic host Guide: down now, up [`TAP_PRESS`] later, on the first forwarded
-    /// slot (pad 0 if none). No-op with no session.
+    /// Synthetic host Guide: down now, up [`TAP_PRESS`](select_gesture::TAP_PRESS) later, on
+    /// the first forwarded slot (pad 0 if none). No-op with no session.
     pub fn tap_guide(&self) {
         self.tap_button(wire::BTN_GUIDE);
     }

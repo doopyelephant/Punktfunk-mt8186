@@ -5,7 +5,8 @@
 
 use super::ds5::Ds5Feedback;
 use super::route::{route, Action, Gates, MenuReads, PadInput, PadRoute};
-use super::{is_steam_deck, set_valve_hidapi, Ctl, SelectChord, DISCONNECT_HOLD, TAP_PRESS};
+use super::select_gesture::TAP_PRESS;
+use super::{is_steam_deck, set_valve_hidapi, Ctl, SelectChord, DISCONNECT_HOLD};
 use crate::menu_nav::{
     ring_sector, MenuEvent, MenuNav, MenuPulse, MenuSample, PadBattery, PadInfo,
 };

@@ -5,8 +5,7 @@
 //! No SDL type: the worker maps SDL events to [`PadInput`] and re-reads the pad when an action
 //! asks it to. The table test below pins every route.
 
-use super::select_gesture::{select_chord, SelectGesture};
-use super::SelectChord;
+use super::select_gesture::{select_chord, SelectChord, SelectGesture};
 use punktfunk_core::client::Sc2Gate;
 use punktfunk_core::input::gamepad as wire;
 use std::time::Instant;
@@ -297,7 +296,7 @@ fn release(bit: u32, gates: &Gates, pad: &mut PadRoute, now: Instant) -> Vec<Act
 
 #[cfg(test)]
 mod tests {
-    use super::super::{GUIDE_HOLD, TAP_PRESS};
+    use super::super::select_gesture::{GUIDE_HOLD, TAP_PRESS};
     use super::*;
     use std::time::Duration;
     use wire::{
