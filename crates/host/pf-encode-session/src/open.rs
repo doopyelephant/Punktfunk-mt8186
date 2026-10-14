@@ -192,13 +192,13 @@ pub struct OpenSpec {
     pub chroma: ChromaFormat,
 }
 
-/// The wire codec numbering (1 H264, 2 HEVC, 3 AV1, 4 PyroWave).
+/// A [`wire::codec`] id as the backends name the codec.
 pub fn codec_from_wire(codec: u32) -> Option<Codec> {
     Some(match codec {
-        1 => Codec::H264,
-        2 => Codec::H265,
-        3 => Codec::Av1,
-        4 => Codec::PyroWave,
+        wire::codec::H264 => Codec::H264,
+        wire::codec::HEVC => Codec::H265,
+        wire::codec::AV1 => Codec::Av1,
+        wire::codec::PYROWAVE => Codec::PyroWave,
         _ => return None,
     })
 }
