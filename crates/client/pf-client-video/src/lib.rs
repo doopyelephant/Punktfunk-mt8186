@@ -13,7 +13,7 @@ pub mod au_dump;
 mod video;
 #[cfg(desktop)]
 pub use video::*;
-// The decode order as one table, and the test that walks it.
+// The decode order, once: the walk `Decoder::new` makes and where a failing rung demotes.
 #[cfg(desktop)]
 mod video_ladder;
 // The contract a rung answers to the ladder, and each decoder's answer.

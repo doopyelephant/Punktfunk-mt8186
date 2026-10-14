@@ -2,24 +2,23 @@
 //! [`native_rung_admitted`] decide which rung `auto` may put first; the codec, 10-bit,
 //! 4:4:4, HDR and multi-slice gates decide what is advertised, and
 //! [`last_rung_verdict`] picks the retry when the last rung has no decoder.
-//! `video` re-exports every item, so call sites keep `video::` paths; the ladder that
-//! acts on these answers stays there. Evidence: tests in this file.
+//! `video` re-exports every item, so call sites keep `video::` paths; the order that
+//! acts on these answers is `video_ladder`. Evidence: tests in this file.
 
 use crate::video::{
     native_codec, VulkanDecodeDevice, VIDEO_CODEC_OP_DECODE_AV1, VIDEO_CODEC_OP_DECODE_H265,
 };
+use crate::video_ladder::Os;
 
 /// May `auto` enter the VAAPI rung with this presenter? The selected device
 /// must import dma-bufs and must not be NVIDIA. The `native-vaapi` pin bypasses
 /// this gate; `None` preserves non-presenter callers.
-#[cfg(target_os = "linux")]
 pub(crate) fn vaapi_auto_ok(vk: Option<&VulkanDecodeDevice>) -> bool {
     vk.is_none_or(|v| v.dmabuf_import && v.vendor_id != crate::video_vk::VENDOR_NVIDIA)
 }
 
 /// May a V4L2 picture reach this presenter? Its buffers are dma-bufs, so the
 /// selected device must import them. `None` preserves non-presenter callers.
-#[cfg(target_os = "linux")]
 pub(crate) fn v4l2_auto_ok(vk: Option<&VulkanDecodeDevice>) -> bool {
     vk.is_none_or(|v| v.dmabuf_import)
 }
@@ -178,8 +177,14 @@ pub(crate) fn native_vulkan_gate(
     let Some((_, codec_op)) = native_codec(wire) else {
         return false;
     };
-    let chosen = matches!(choice, "native-vulkan" | "auto" | "" | "hardware");
+    let chosen = choice == "native-vulkan" || is_auto(choice);
     chosen && video_decode && decode_video_caps & codec_op != 0
+}
+
+/// Does this preference leave the rung to the ladder? `hardware` and the empty
+/// string read as `auto`.
+pub(crate) fn is_auto(choice: &str) -> bool {
+    matches!(choice, "auto" | "" | "hardware")
 }
 
 /// Human name of a `quic::CODEC_*` bit. `?` for an unknown bit — it must not print as a known codec.
@@ -285,7 +290,12 @@ pub(crate) const VENDOR_INTEL: u32 = 0x8086;
 /// Intel's Mesa driver decodes H.264 and HEVC bit-exact with libavcodec but not AV1,
 /// so Linux Intel keeps AV1 off Vulkan; its AV1 goes through the VAAPI rung.
 pub fn usable_decode_ops(vendor_id: u32, advertised: u32) -> u32 {
-    if cfg!(target_os = "linux") && vendor_id == VENDOR_INTEL {
+    usable_decode_ops_on(Os::HOST, vendor_id, advertised)
+}
+
+/// [`usable_decode_ops`] for a named OS: the order table states the Linux rule on any host.
+pub(crate) fn usable_decode_ops_on(os: Os, vendor_id: u32, advertised: u32) -> u32 {
+    if os == Os::Linux && vendor_id == VENDOR_INTEL {
         advertised & !VIDEO_CODEC_OP_DECODE_AV1
     } else {
         advertised
