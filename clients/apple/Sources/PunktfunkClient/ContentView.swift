@@ -170,21 +170,18 @@ struct ContentView: View {
     /// also fires for Control Center / app-switcher peeks, where the disconnect timer must not start.
     @Environment(\.scenePhase) private var scenePhase
 
-    /// While the console fronts the app and no stream is up, the console draws every screen:
-    /// connect, wake, pairing, the approval wait, a failed dial, its launch hold. The app's own
-    /// alerts and sheets would be a second interface over it — and on a TV, a focus trap the pad
-    /// cannot reach. Once the stream shows, the app owns the screen again, trust card included.
-    private var consoleOwnsScreen: Bool {
-        gamepadUIActive
-            && (model.phase == .idle || model.phase == .connecting || consoleHoldsStream)
-    }
-
-    /// The console's launch hold covers the stream it dialled. A trust card is the stream
-    /// view's, so the hold gives way to it.
-    private var consoleHoldsStream: Bool {
-        guard model.consoleHold else { return false }
-        if case .awaitingTrust = model.phase { return false }
-        return true
+    /// Who draws the window, this app or the console, and what each hand-off shows.
+    private var owner: ScreenOwner {
+        #if os(macOS)
+        let fullscreen = isFullscreen
+        #else
+        let fullscreen = false
+        #endif
+        return ScreenOwner.resolve(
+            console: gamepadUIActive, phase: model.phase, live: model.connection != nil,
+            consoleHold: model.consoleHold, error: model.errorMessage != nil,
+            fullscreen: fullscreen, appDrivenFullscreen: appDrivenFullscreen,
+            fullscreenAlways: fullscreenAlways)
     }
 
     /// A console that could not be built hands the screen back to this app's own UI.
@@ -270,8 +267,9 @@ struct ContentView: View {
             }
             #if os(iOS)
             // A phone holds landscape under both; `home` shows the console.
-            .onChange(of: gamepadUIActive && (model.connection == nil || consoleHoldsStream),
-                      initial: true) { _, shown in LandscapeLock.console = shown }
+            .onChange(of: owner.showsConsole, initial: true) { _, shown in
+                LandscapeLock.console = shown
+            }
             .onChange(of: model.connection != nil, initial: true) { _, up in
                 LandscapeLock.streaming = up
             }
@@ -302,7 +300,7 @@ struct ContentView: View {
                 sessionView
             }
             // The console stays mounted over the stream while its launch hold is up.
-            if model.connection == nil || consoleHoldsStream {
+            if owner.showsHome {
                 home
             }
         }
@@ -574,14 +572,14 @@ struct ContentView: View {
 
     private var deepLinkNoticePresented: Binding<Bool> {
         Binding(
-            get: { deepLinkNotice != nil && !consoleOwnsScreen },
+            get: { deepLinkNotice != nil && !owner.consoleOwnsScreen },
             set: { if !$0 { deepLinkNotice = nil } })
     }
 
     /// Down while the console is up: it asks the same question in a way a pad can answer.
     private var deepLinkConfirmPresented: Binding<Bool> {
         Binding(
-            get: { deepLinkConfirm != nil && !consoleOwnsScreen },
+            get: { deepLinkConfirm != nil && !owner.consoleOwnsScreen },
             set: { if !$0 { deepLinkConfirm = nil } })
     }
 
@@ -645,7 +643,7 @@ struct ContentView: View {
     private var touchPairingTarget: Binding<StoredHost?> {
         #if os(macOS)
         Binding(
-            get: { consoleOwnsScreen ? nil : pairingTarget },
+            get: { owner.consoleOwnsScreen ? nil : pairingTarget },
             set: { pairingBinding.wrappedValue = $0 })
         #else
         Binding(
@@ -667,32 +665,19 @@ struct ContentView: View {
 
     private var approvalChoicePresented: Binding<Bool> {
         Binding(
-            get: { approvalChoice != nil && !consoleOwnsScreen },
+            get: { approvalChoice != nil && !owner.consoleOwnsScreen },
             set: { if !$0 { approvalChoice = nil } })
     }
 
     private var awaitingApprovalPresented: Binding<Bool> {
         Binding(
-            get: { awaitingApproval != nil && !consoleOwnsScreen },
+            get: { awaitingApproval != nil && !owner.consoleOwnsScreen },
             set: { if !$0 { awaitingApproval = nil } })
-    }
-
-    /// Whether the "Connection failed" alert is ready to be shown at all (see the macOS
-    /// deferral below).
-    private var connectionErrorReady: Bool {
-        guard model.errorMessage != nil else { return false }
-        #if os(macOS)
-        // Hold the alert while a fullscreen we drove is still leaving: a sheet on a fullscreen
-        // window makes AppKit drop `-toggleFullScreen:` and strands it there. Under Always, or in
-        // a fullscreen the user chose, nothing leaves, so holding it would swallow the error.
-        if appDrivenFullscreen && isFullscreen && !fullscreenAlways { return false }
-        #endif
-        return true
     }
 
     private var connectionErrorPresented: Binding<Bool> {
         Binding(
-            get: { connectionErrorReady && !consoleOwnsScreen },
+            get: { owner.showsError },
             set: { if !$0 { model.errorMessage = nil } })
     }
 
@@ -836,13 +821,13 @@ struct ContentView: View {
             // Never while the console owns the screen: disabling its view would stop the very
             // input it draws the connect card for.
             .disabled(
-                !consoleOwnsScreen
+                !owner.consoleOwnsScreen
                     && (connectingOverlayName != nil || waker.waking != nil
                         || model.launchHold != nil))
             #endif
             .overlay {
                 // The console draws its own dial, wake wait and launch hold.
-                if !consoleOwnsScreen {
+                if !owner.consoleOwnsScreen {
                     ConnectOverlay(
                         connectingHostName: connectingOverlayName,
                         waker: waker,
@@ -995,7 +980,7 @@ struct ContentView: View {
         return ZStack {
             StreamScene(
                 model: model, ring: ring,
-                captureEnabled: pendingFingerprint == nil && !consoleHoldsStream,
+                captureEnabled: owner.streamTakesInput,
                 statsVerbosity: statsVerbosity, showTouchExit: $showTouchExit)
                 // Blur the live stream during the trust prompt (heavy) and during a resize (lighter
                 // — the deliberate "hold on" while the host rebuilds its pipeline and the decoder

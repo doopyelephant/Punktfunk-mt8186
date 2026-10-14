@@ -106,15 +106,7 @@ private let demoLaunchHold: TimeInterval = 3
 
 @MainActor
 final class SessionModel: ObservableObject {
-    enum Phase: Equatable {
-        case idle
-        case connecting
-        /// Connected to an unpinned host: the stream is live (and pumping — the opening
-        /// IDR must not be missed) but input/cursor capture wait for the user to confirm
-        /// the observed fingerprint.
-        case awaitingTrust(fingerprint: Data)
-        case streaming
-    }
+    typealias Phase = SessionPhase
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var connection: PunktfunkConnection? {
