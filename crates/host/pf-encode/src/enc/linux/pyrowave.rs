@@ -94,7 +94,8 @@ fn node_pci_address(path: &std::path::Path) -> Option<(u32, u32, u32, u32)> {
 }
 
 /// Features pyrowave.h requires (shaderInt16, storageBuffer8BitAccess, timeline
-/// semaphores, subgroup size control). shaderFloat16 is optional. Checked after
+/// semaphores, subgroup size control) plus storageBuffer16BitAccess, which its shaders use
+/// for 16-bit buffer members and the header omits. shaderFloat16 is optional. Checked after
 /// selection: folding this into the pick can land on a GPU that cannot import the
 /// capturer's buffers and trip the process-wide raw-dmabuf latch. A hard `bail!`
 /// is latch-free and the session layer renegotiates.
@@ -102,14 +103,20 @@ fn node_pci_address(path: &std::path::Path) -> Option<(u32, u32, u32, u32)> {
 /// # Safety
 /// `instance` must be live; issues only physical-device feature queries.
 unsafe fn missing_features(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Vec<&'static str> {
+    let mut have11 = vk::PhysicalDeviceVulkan11Features::default();
     let mut have12 = vk::PhysicalDeviceVulkan12Features::default();
     let mut have13 = vk::PhysicalDeviceVulkan13Features::default();
     let mut have2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut have11)
         .push_next(&mut have12)
         .push_next(&mut have13);
     instance.get_physical_device_features2(pd, &mut have2);
     [
         (have2.features.shader_int16 == vk::TRUE, "shaderInt16"),
+        (
+            have11.storage_buffer16_bit_access == vk::TRUE,
+            "storageBuffer16BitAccess",
+        ),
         (
             have12.storage_buffer8_bit_access == vk::TRUE,
             "storageBuffer8BitAccess",
@@ -188,6 +195,7 @@ struct DeviceHold {
     // `as_ptr()` is move-stable like the Boxes.
     _dev_exts: Vec<*const c_char>,
     _feat2: Box<vk::PhysicalDeviceFeatures2<'static>>,
+    _v11: Box<vk::PhysicalDeviceVulkan11Features<'static>>,
     _v12: Box<vk::PhysicalDeviceVulkan12Features<'static>>,
     _v13: Box<vk::PhysicalDeviceVulkan13Features<'static>>,
     device_ci: Box<vk::DeviceCreateInfo<'static>>,
@@ -820,6 +828,7 @@ impl PyroWaveEncoder {
                 ash::ext::image_drm_format_modifier::NAME.as_ptr(),
             ],
             _feat2: Box::new(vk::PhysicalDeviceFeatures2::default()),
+            _v11: Box::new(vk::PhysicalDeviceVulkan11Features::default()),
             _v12: Box::new(vk::PhysicalDeviceVulkan12Features::default()),
             _v13: Box::new(vk::PhysicalDeviceVulkan13Features::default()),
             device_ci: Box::new(vk::DeviceCreateInfo::default()),
@@ -890,6 +899,7 @@ impl PyroWaveEncoder {
             instance.get_physical_device_features2(pd, &mut have2);
 
             hold._feat2.features.shader_int16 = vk::TRUE;
+            hold._v11.storage_buffer16_bit_access = vk::TRUE;
             hold._v12.storage_buffer8_bit_access = vk::TRUE;
             hold._v12.timeline_semaphore = vk::TRUE;
             hold._v12.shader_float16 = have12.shader_float16;
@@ -899,7 +909,8 @@ impl PyroWaveEncoder {
             hold._v13.compute_full_subgroups = vk::TRUE;
             hold._v13.synchronization2 = vk::TRUE;
             hold._v13.maintenance4 = have13.maintenance4;
-            hold._feat2.p_next = &mut *hold._v12 as *mut _ as *mut std::ffi::c_void;
+            hold._feat2.p_next = &mut *hold._v11 as *mut _ as *mut std::ffi::c_void;
+            hold._v11.p_next = &mut *hold._v12 as *mut _ as *mut std::ffi::c_void;
             hold._v12.p_next = &mut *hold._v13 as *mut _ as *mut std::ffi::c_void;
 
             // Fresh-import acquire names FOREIGN as src when advertised, else
