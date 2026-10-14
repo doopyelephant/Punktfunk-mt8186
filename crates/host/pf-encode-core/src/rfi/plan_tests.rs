@@ -420,7 +420,7 @@ impl NvencToday {
         let idr = forced || opening;
         let ltr_force = self.floor && !idr && wave.is_none();
         Au {
-            refs: refs(idr, anchor, ltr_force),
+            refs: refs(idr, anchor && wave.is_none(), ltr_force),
             wave,
             mark,
             // There is no per-picture bit: `wave_span` covers a spoiled close from the queued
@@ -632,8 +632,8 @@ pub(crate) const NVENC: &[Row] = &[
     ),
     (
         "falfffff",
-        "I AS w w C .",
-        "an armed anchor rides the wave start",
+        "I S w w C .",
+        "a declined loss leaves the wave start untagged",
     ),
     ("flffakff", "I S w I .", "an IDR drops wave and queue"),
     ("fakff", "I I .", "an IDR outranks the anchor"),

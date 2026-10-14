@@ -298,7 +298,8 @@ impl Soak {
 /// queued behind it must be exact; `PF_WAVE_IDR=1` forces an IDR into every wave, which
 /// flushes it. `PF_WAVE_ANCHOR=1` answers each loss with an RFI anchor instead (leave
 /// `PUNKTFUNK_NVENC_IR_ALWAYS` unset), and only it takes another lag or `PF_WAVE_CODEC=av1`:
-/// NVENC AV1 never waves.
+/// NVENC AV1 never waves. `PF_WAVE_DECLINE=1`, also with that knob unset, follows each anchor
+/// with a loss too old to anchor: the wave answers it, and its start carries no anchor.
 #[cfg(all(any(test, feature = "test-support"), feature = "nvenc"))]
 pub struct WaveSoak {
     pub w: u32,
@@ -313,6 +314,7 @@ pub struct WaveSoak {
     spoil: bool,
     idr: bool,
     anchor: bool,
+    decline: bool,
 }
 
 #[cfg(all(any(test, feature = "test-support"), feature = "nvenc"))]
@@ -351,19 +353,25 @@ impl WaveSoak {
             spoil: on("PF_WAVE_SPOIL"),
             idr: on("PF_WAVE_IDR"),
             anchor: on("PF_WAVE_ANCHOR"),
+            decline: on("PF_WAVE_DECLINE"),
         };
         assert!(
             soak.lag >= 1 && (soak.lag == 2 || soak.anchor),
             "PF_WAVE_LAG=1.. with PF_WAVE_ANCHOR=1"
         );
         assert_ne!(
-            soak.anchor,
+            soak.anchor || soak.decline,
             on("PUNKTFUNK_NVENC_IR_ALWAYS"),
-            "PUNKTFUNK_NVENC_IR_ALWAYS=1 makes every ask a wave; PF_WAVE_ANCHOR=1 wants anchors"
+            "PUNKTFUNK_NVENC_IR_ALWAYS=1 makes every ask a wave; PF_WAVE_ANCHOR=1 and \
+             PF_WAVE_DECLINE=1 want anchors"
         );
         assert!(
-            !(soak.anchor && (soak.spoil || soak.idr)),
-            "PF_WAVE_ANCHOR runs alone"
+            [soak.anchor, soak.decline, soak.spoil || soak.idr]
+                .iter()
+                .filter(|&&on| on)
+                .count()
+                <= 1,
+            "PF_WAVE_ANCHOR and PF_WAVE_DECLINE run alone"
         );
         assert!(
             soak.codec != crate::Codec::Av1 || soak.anchor,
@@ -391,34 +399,47 @@ impl WaveSoak {
             spoil,
             idr,
             anchor,
+            decline,
             ..
         } = *self;
-        assert!(
-            enc.caps().supports_rfi,
-            "{name}: the GPU invalidates references"
-        );
         let cycle = session(enc).wave_cycle() as usize;
         assert!(cycle >= 2 || anchor, "the wave is on");
         assert!(
             cycle > 3 || !spoil,
             "the spoiling loss lands inside the sweep"
         );
-        // Wave k starts at lag + 1 + k * period; its lost frame is `lag` before that. A
-        // spoiled wave is followed by the queued one, so its period holds two cycles.
+        // Wave k starts at base + k * period. Its lost frame is `lag` before the start, a
+        // declined one a DPB before it and after the opening IDR. A spoiled wave is followed by
+        // the queued one, so its period holds two cycles.
         let period = if spoil {
             2 * cycle + gap
         } else {
             cycle.max(lag) + gap
         };
-        let base = lag + 1;
+        let base = if decline {
+            crate::nvenc_core::RFI_DPB as usize + 1
+        } else {
+            lag + 1
+        };
         let last = base + waves * period;
         let (mut m, mut aus) = (WaveMarks::default(), Vec::new());
         for i in 0..=last {
             match (i >= base && (i - base) / period < waves).then(|| (i - base) % period) {
                 Some(0) => {
+                    // The CUDA session reads its caps on the first frame.
+                    assert!(
+                        enc.caps().supports_rfi,
+                        "{name}: the GPU invalidates references"
+                    );
                     let l = (i - lag) as i64;
                     assert!(enc.invalidate_ref_frames(l, l), "the ask is answered");
                     m.lost.push(i - lag);
+                    if decline {
+                        assert!(session(enc).pending_anchor, "an anchor first");
+                        let d = i - crate::nvenc_core::RFI_DPB as usize;
+                        assert!(enc.invalidate_ref_frames(d as i64, d as i64), "then a wave");
+                        m.lost.push(d);
+                    }
                     let s = session(enc);
                     if anchor {
                         assert!(s.pending_anchor && s.wave.is_none(), "an anchor");
