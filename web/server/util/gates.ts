@@ -1,16 +1,32 @@
 // The console's password gate, as one table: every mutating call on the management API, and
 // whether a session alone may make it. A gated row's file under `routes/api/v1/` asks for the
-// console password before it forwards; `seat` is that file's handler when the same call can
+// console password before it forwards, on every call or on those its `when` names; a refused
+// row's file answers and never forwards. `seat` is that file's handler when the same call can
 // arrive for a seat's host through `/api/v1/profiles/<id>/proxy/`, where the box holds the bearer.
-// gates.test.ts fails on an operation in api/openapi.json with no row, and pins the gated rows to
-// the route files and to the paths a seat's host refuses.
+// gates.test.ts fails on an operation in api/openapi.json with no row or no decision, and pins
+// the rows to the route files and to the paths a seat's host refuses.
 import type { EventHandler } from "h3";
+import adoptPost from "../routes/api/v1/emulators/[id]/adopt.post";
+import removePost, {
+	when as purges,
+} from "../routes/api/v1/emulators/[id]/remove.post";
+import exportPost from "../routes/api/v1/emulators/[id]/saves/export.post";
+import importPost from "../routes/api/v1/emulators/[id]/saves/import.post";
 import hooksPut from "../routes/api/v1/hooks.put";
+import settingsPatch, {
+	when as touchesPlane,
+} from "../routes/api/v1/host/settings.patch";
 import customPut from "../routes/api/v1/library/custom/[id].put";
 import customPost from "../routes/api/v1/library/custom.post";
 import providerPut from "../routes/api/v1/library/provider/[provider].put";
+import { when as widens } from "../routes/api/v1/native/clients/[fingerprint].patch";
+import decidePost, {
+	when as allows,
+} from "../routes/api/v1/plugin-access/[plugin]/decide.post";
+import pluginPut from "../routes/api/v1/plugins/[id].put";
 import installPost from "../routes/api/v1/store/install.post";
 import sourcesPut from "../routes/api/v1/store/sources/[name].put";
+import type { When } from "./confirm";
 
 type Method = "POST" | "PUT" | "PATCH" | "DELETE";
 
@@ -18,9 +34,13 @@ export interface Route {
 	method: Method;
 	/** The path after `/api/v1/`, spelled as `api/openapi.json` spells it. */
 	pattern: string;
-	/** Why a session alone may make the call. Absent on a gated row. */
+	/** Why a session alone may make the call. Absent on a gated or refused row. */
 	open?: string;
-	/** A gated row's handler for a seat call. Absent when the seat's host refuses the path. */
+	/** The console answers the call itself and never forwards it. */
+	refused?: true;
+	/** A gated row asks only on the calls this names; absent, it asks on every call. */
+	when?: When;
+	/** The row's handler for a seat call. Absent when the seat's host refuses the path. */
 	seat?: EventHandler;
 }
 
@@ -34,14 +54,21 @@ const gated = (
 	seat,
 });
 
+/** `route`, asking only on the calls `when` names. */
+const onlyWhen = (when: When, route: Route): Route => ({ ...route, when });
+
+const refused = (
+	method: Method,
+	pattern: string,
+	seat: EventHandler,
+): Route => ({ method, pattern, refused: true, seat });
+
 const open = (method: Method, pattern: string, reason: string): Route => ({
 	method,
 	pattern,
 	open: reason,
 });
 
-/** Open today with no decision on record. The test prints these rows; none is gated meanwhile. */
-export const UNDECIDED = "undecided";
 const NARROWS = "only narrows what the host trusts or runs";
 const STEERS = "steers a session, seat or display that already exists";
 const WITHIN =
@@ -52,6 +79,13 @@ const RECORD = "diagnostics: re-reads, records or drops a record";
 const REFETCH = "stops or removes a download: saves stay";
 const REFRESH = "re-reads a source the host already trusts";
 const PUBLIC = "open on the host too: a device proving its pairing";
+const VERIFIED = "fetched from its own release channel and verified";
+const RUNS_NONE = "hands files to an installed emulator; runs no new program";
+const LAUNCHES = "what every launch of that emulator already does";
+const DOWNLOADS = "an installed plugin downloads its own title";
+const INSTALLED =
+	"starts only installed plugins: each install was the decision";
+const ADMITS_NONE = "makes a seat but admits no device; removing one is gated";
 
 export const GATES: readonly Route[] = [
 	gated("POST", "actions/{id}"),
@@ -71,22 +105,22 @@ export const GATES: readonly Route[] = [
 	open("DELETE", "display/presets/{id}", SETTING),
 	open("POST", "display/release", STEERS),
 	open("PUT", "display/settings", SETTING),
-	open("POST", "emulators/{id}/adopt", UNDECIDED),
-	open("POST", "emulators/{id}/content", UNDECIDED),
-	open("POST", "emulators/{id}/install", UNDECIDED),
-	open("POST", "emulators/{id}/prepare", UNDECIDED),
-	open("POST", "emulators/{id}/remove", UNDECIDED),
-	open("POST", "emulators/{id}/saves/export", UNDECIDED),
-	open("POST", "emulators/{id}/saves/import", UNDECIDED),
+	gated("POST", "emulators/{id}/adopt", adoptPost),
+	open("POST", "emulators/{id}/content", RUNS_NONE),
+	open("POST", "emulators/{id}/install", VERIFIED),
+	open("POST", "emulators/{id}/prepare", LAUNCHES),
+	onlyWhen(purges, gated("POST", "emulators/{id}/remove", removePost)),
+	gated("POST", "emulators/{id}/saves/export", exportPost),
+	gated("POST", "emulators/{id}/saves/import", importPost),
 	open("POST", "game/end", STEERS),
 	open("PUT", "gpus/preference", SETTING),
 	gated("PUT", "hooks", hooksPut),
-	open("PATCH", "host/settings", UNDECIDED),
+	onlyWhen(touchesPlane, gated("PATCH", "host/settings", settingsPatch)),
 	gated("POST", "library/custom", customPost),
 	gated("PUT", "library/custom/{id}", customPut),
 	open("DELETE", "library/custom/{id}", NARROWS),
 	open("PUT", "library/hidden/{id}", SETTING),
-	open("POST", "library/install/{id}", UNDECIDED),
+	open("POST", "library/install/{id}", DOWNLOADS),
 	open("DELETE", "library/install/{id}", REFETCH),
 	open("POST", "library/install/{id}/cancel", REFETCH),
 	open("POST", "library/install/{id}/pause", REFETCH),
@@ -100,7 +134,7 @@ export const GATES: readonly Route[] = [
 	open("PUT", "library/provider/{provider}/running", REPORT),
 	open("PUT", "library/scanners/{id}", SETTING),
 	open("DELETE", "native/clients", NARROWS),
-	open("PATCH", "native/clients/{fingerprint}", UNDECIDED),
+	onlyWhen(widens, gated("PATCH", "native/clients/{fingerprint}")),
 	open("DELETE", "native/clients/{fingerprint}", NARROWS),
 	open("DELETE", "native/pair", NARROWS),
 	gated("POST", "native/pair/arm"),
@@ -108,15 +142,15 @@ export const GATES: readonly Route[] = [
 	open("POST", "native/pending/{id}/deny", NARROWS),
 	gated("POST", "pair/pin"),
 	open("POST", "plugin-access/requests", REPORT),
-	open("POST", "plugin-access/{plugin}/decide", UNDECIDED),
+	onlyWhen(allows, gated("POST", "plugin-access/{plugin}/decide", decidePost)),
 	open("POST", "plugin-access/{plugin}/release", NARROWS),
 	open("POST", "plugins/logs", REPORT),
-	open("PUT", "plugins/{id}", UNDECIDED),
+	refused("PUT", "plugins/{id}", pluginPut),
 	open("DELETE", "plugins/{id}", NARROWS),
-	open("POST", "profiles", UNDECIDED),
+	open("POST", "profiles", ADMITS_NONE),
 	open("PUT", "profiles/default", SETTING),
 	gated("PUT", "profiles/door"),
-	open("PUT", "profiles/seating", UNDECIDED),
+	gated("PUT", "profiles/seating"),
 	open("PUT", "profiles/{id}", SETTING),
 	gated("DELETE", "profiles/{id}"),
 	open("PUT", "profiles/{id}/avatar", SETTING),
@@ -138,7 +172,7 @@ export const GATES: readonly Route[] = [
 	open("DELETE", "stats/recordings/{id}", RECORD),
 	gated("POST", "store/install", installPost),
 	open("POST", "store/refresh", REFRESH),
-	open("POST", "store/runtime", UNDECIDED),
+	open("POST", "store/runtime", INSTALLED),
 	gated("PUT", "store/sources/{name}", sourcesPut),
 	open("DELETE", "store/sources/{name}", NARROWS),
 	open("POST", "store/uninstall", NARROWS),

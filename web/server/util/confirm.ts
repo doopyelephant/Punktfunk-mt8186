@@ -14,7 +14,13 @@
 //
 // Wrong attempts share the login throttle's per-peer budget, so none of these can be used as a
 // password oracle, and a lockout covers all of them at once.
-import { createError, type H3Event, setResponseHeader } from "h3";
+import {
+	createError,
+	getRouterParams,
+	type H3Event,
+	readBody,
+	setResponseHeader,
+} from "h3";
 import { authConfigured, peerAddress, verifyUiPassword } from "./auth";
 import {
 	recordLoginFailure,
@@ -56,4 +62,32 @@ export async function confirmPassword(
 		});
 	}
 	recordLoginSuccess(ip);
+}
+
+/** What a conditional gate reads: the call's JSON body and its route params. */
+export interface Call {
+	body: Record<string, unknown>;
+	params: Record<string, string>;
+}
+
+/** Whether a call needs the password. A gated row without one always does. */
+export type When = (call: Call) => boolean | Promise<boolean>;
+
+/**
+ * The call's JSON body, after `confirmPassword` when `when` holds for it. A body that is not an
+ * object reads as `{}`. The caller rebuilds what it forwards from the body `when` read.
+ *
+ * Async because the verify is: the caller must `await` this, or a gated call runs unchecked.
+ */
+export async function confirmWhen<T extends object>(
+	event: H3Event,
+	when: When,
+): Promise<Partial<T> & { password?: unknown }> {
+	const raw: unknown = await readBody(event);
+	const body = (
+		raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}
+	) as Record<string, unknown>;
+	if (await when({ body, params: getRouterParams(event) }))
+		await confirmPassword(event, body.password);
+	return body as Partial<T>;
 }
