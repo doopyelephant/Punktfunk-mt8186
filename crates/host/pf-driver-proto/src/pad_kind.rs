@@ -398,6 +398,7 @@ pub fn served_kind(devtype: u8) -> &'static PadKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gamepad::HWID_DEVTYPES;
     use crate::rdesc::{report_lens, FEATURE, INPUT};
 
     /// The `pub const DEVTYPE_*: u8 = N;` lines of `gamepad.rs`, as `(name, value)`.
@@ -538,6 +539,63 @@ mod tests {
             if kind.family == Family::Switch {
                 assert_eq!(kind.neutral, switch::neutral_report(dt));
             }
+        }
+    }
+
+    /// `(install section, hardware id)` for every model line of `pf_gamepad.inx`, the id
+    /// lowercase with any `root\` prefix dropped.
+    fn inf_model_ids() -> Vec<(String, String)> {
+        let inf = include_str!("../../../../packaging/windows/drivers/pf-gamepad/pf_gamepad.inx");
+        let ids: Vec<(String, String)> = inf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with(';'))
+            .filter_map(|l| l.split_once('=')?.1.split_once(','))
+            .filter(|(section, _)| section.trim().starts_with("pfGamepad"))
+            .flat_map(|(section, ids)| {
+                ids.split(',').map(move |id| {
+                    let id = id.trim().to_ascii_lowercase();
+                    let id = id.strip_prefix("root\\").unwrap_or(&id).to_owned();
+                    (section.trim().to_owned(), id)
+                })
+            })
+            .collect();
+        assert!(
+            ids.len() >= PAD_KINDS.len(),
+            "parsed {} model ids out of pf_gamepad.inx; the [Models] shape changed",
+            ids.len()
+        );
+        ids
+    }
+
+    /// Every kind binds: its devtype has a hardware-id token and every token a model line, or
+    /// PnP binds inbox `input.inf` and the pad never starts. Every model line names a kind, or
+    /// the driver refuses the devnode it binds.
+    #[test]
+    fn every_kind_has_an_inf_model_line() {
+        let inf = inf_model_ids();
+        for kind in &PAD_KINDS {
+            assert!(
+                HWID_DEVTYPES.iter().any(|&(_, dt)| dt == kind.devtype),
+                "devtype {} has no token in HWID_DEVTYPES",
+                kind.devtype
+            );
+        }
+        for (token, devtype) in HWID_DEVTYPES {
+            assert!(
+                pad_kind(devtype).is_some(),
+                "{token} names devtype {devtype}, no row"
+            );
+            assert!(
+                inf.iter().any(|(_, id)| id == token),
+                "{token} has no model line in pf_gamepad.inx"
+            );
+        }
+        for (section, id) in &inf {
+            assert!(
+                HWID_DEVTYPES.iter().any(|(token, _)| token == id),
+                "pf_gamepad.inx binds {id} ({section}), which names no pad kind"
+            );
         }
     }
 
