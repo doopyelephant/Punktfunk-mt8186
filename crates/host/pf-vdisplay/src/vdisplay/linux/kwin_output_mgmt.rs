@@ -129,9 +129,6 @@ pub(crate) struct TopologyOutcome {
     /// UUID of our resolved virtual output — survives a mode-switch supersede (the
     /// shared name does not) — for later [`set_position`] / restore addressing.
     pub our_uuid: Option<String>,
-    /// Outputs we disabled, each `(name, "WxH@Hz")`, so teardown restores the exact
-    /// mode. Empty for `Primary`, or when nothing else was enabled.
-    pub disabled: Vec<(String, String)>,
     /// `true` if we bound management, resolved our output, and applied (or tried to).
     /// `false` ⇒ compositor missed the budget or our output never appeared; caller
     /// falls back to `kscreen-doctor`.
@@ -705,18 +702,19 @@ fn caught_up(sess: Option<&mut Session>, deadline: Instant) -> Option<&mut Sessi
 
 /// Place the streamed output (name starts with `our_prefix`, current size
 /// `our_w`×`our_h`) in the desktop: primary unless `Extend`, and for `Exclusive`
-/// every other enabled output goes dark. Runs on `sess` from [`watch`]; a miss
-/// leaves `handled = false` for the `kscreen-doctor` path.
+/// every other enabled output goes dark, `journal` getting each `(name, "WxH@Hz")`
+/// before the apply sends the disable. Runs on `sess` from [`watch`]; a miss
+/// leaves `handled = false` for the `kscreen-doctor` path and journals nothing.
 pub(crate) fn apply_topology(
     sess: Option<&mut Session>,
     our_prefix: &str,
     our_w: u32,
     our_h: u32,
     kind: TopologyKind,
+    mut journal: impl FnMut(&[(String, String)]),
 ) -> TopologyOutcome {
     let miss = || TopologyOutcome {
         our_uuid: None,
-        disabled: Vec::new(),
         handled: false,
     };
     let deadline = Instant::now() + OP_BUDGET;
@@ -852,16 +850,18 @@ pub(crate) fn apply_topology(
     for (proxy, _, _) in &to_disable {
         config.enable(proxy, 0);
     }
-    let applied = sess.apply(&config, deadline);
-    config.destroy();
-
-    // Report every output we asked to disable so teardown restores them. Re-enabling
-    // a still-on head is a no-op; dropping the list here would leave a physical dark
-    // if KWin processed the disable but the `applied` ack missed the budget.
+    // Journal every output we ask to disable, whatever the ack says: re-enabling a lit head
+    // is a no-op, and a disable KWin processed after the budget would otherwise stay dark.
     let disabled: Vec<(String, String)> = to_disable
         .into_iter()
         .map(|(_, name, spec)| (name, spec))
         .collect();
+    if kind == TopologyKind::Exclusive {
+        journal(&disabled);
+    }
+    let applied = sess.apply(&config, deadline);
+    config.destroy();
+
     if applied {
         // Read priority back; do not echo the request. One sync drains KWin's post-apply
         // `priority` events. Primary means ours holds the lowest priority among enabled
@@ -913,7 +913,6 @@ pub(crate) fn apply_topology(
     // global / unresolved output took the `handled = false` early returns above.
     TopologyOutcome {
         our_uuid,
-        disabled,
         handled: true,
     }
 }

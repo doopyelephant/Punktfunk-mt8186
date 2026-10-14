@@ -486,6 +486,10 @@ fn backend(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
 /// this host has no backend for, or one that does not open now.
 #[cfg(target_os = "linux")]
 pub(crate) fn backend_by_id(id: &str) -> Option<Box<dyn VirtualDisplay>> {
+    #[cfg(test)]
+    if let Some(fake) = crate::fake::served(id) {
+        return Some(fake);
+    }
     let compositor = Compositor::all().into_iter().find(|c| c.id() == id)?;
     match backend(compositor) {
         Ok(b) => Some(b),

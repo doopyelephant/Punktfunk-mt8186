@@ -7,7 +7,8 @@
 //!
 //! Setters log and change nothing: only [`FakeDisplay::script`] changes an answer. Clones
 //! share one log and one script, so box one for the code under test and keep the other.
-//! `take_undo_seqs` answers empty and is not logged: it would only pad every acquire.
+//! `take_undo_seqs` answers the seqs its creates journaled and is not logged: it would only pad
+//! every acquire.
 //!
 //! [`in_child`] runs a test body in a child of the test binary, for code on process globals.
 //!
@@ -59,8 +60,12 @@ pub(crate) struct Script {
     pub(crate) ownership: DisplayOwnership,
     /// A successful create prepares a topology restore for `take_topology_restore`.
     pub(crate) restore: bool,
+    /// A successful create journals this for `take_undo_seqs` (Linux, where the journal is).
+    pub(crate) undo: Option<crate::topology_journal::Undo>,
     /// `undo` of exactly this fails; every other undo succeeds.
     pub(crate) fail_undo: Option<crate::topology_journal::Undo>,
+    /// `heads`.
+    pub(crate) heads: Vec<crate::monitors::PhysicalMonitor>,
     /// `isolation_key`.
     pub(crate) isolation: Option<String>,
     /// `sole_instance`.
@@ -82,6 +87,16 @@ struct Shared {
     nodes: u32,
     casts: u32,
     restore: Option<Box<dyn FnOnce() + Send>>,
+    undo_seqs: Vec<u64>,
+}
+
+/// The fakes [`crate::backend_by_id`] answers by name ([`FakeDisplay::serve_by_name`]).
+static SERVED: Mutex<Vec<FakeDisplay>> = Mutex::new(Vec::new());
+
+/// A clone of the fake served as `id`, as [`crate::backend_by_id`] returns a backend.
+pub(crate) fn served(id: &str) -> Option<Box<dyn VirtualDisplay>> {
+    let served = SERVED.lock().unwrap();
+    served.iter().find(|f| f.name == id).map(FakeDisplay::boxed)
 }
 
 /// Logs its call when dropped: a keepalive or a cast, whose end a test orders.
@@ -110,7 +125,9 @@ impl FakeDisplay {
                     fail_create: None,
                     ownership: DisplayOwnership::Owned,
                     restore: false,
+                    undo: None,
                     fail_undo: None,
+                    heads: Vec::new(),
                     isolation: None,
                     sole_instance: false,
                     alive: true,
@@ -122,8 +139,15 @@ impl FakeDisplay {
                 nodes: 0,
                 casts: 0,
                 restore: None,
+                undo_seqs: Vec::new(),
             })),
         }
+    }
+
+    /// Have [`crate::backend_by_id`] answer this fake for its name in this process, so the
+    /// registry's teardown undo reaches it.
+    pub(crate) fn serve_by_name(&self) {
+        SERVED.lock().unwrap().push(self.clone());
     }
 
     /// A clone as the boxed trait object the registry takes.
@@ -175,6 +199,11 @@ impl VirtualDisplay for FakeDisplay {
         if s.script.restore {
             let fake = self.clone();
             s.restore = Some(Box::new(move || fake.log(Call::RestoreRan(node))));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(undo) = s.script.undo.clone() {
+            let seq = crate::topology_journal::push(self.name, undo);
+            s.undo_seqs.push(seq);
         }
         let mut out = VirtualOutput::owned(
             node,
@@ -263,6 +292,10 @@ impl VirtualDisplay for FakeDisplay {
         s.restore.take()
     }
 
+    fn take_undo_seqs(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.shared().undo_seqs)
+    }
+
     fn undo(&mut self, undo: &crate::topology_journal::Undo) -> Result<()> {
         let mut s = self.shared();
         s.calls.push(Call::Undo(undo.clone()));
@@ -270,6 +303,10 @@ impl VirtualDisplay for FakeDisplay {
             anyhow::bail!("scripted to fail");
         }
         Ok(())
+    }
+
+    fn heads(&self) -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+        Ok(self.answer(|s| s.heads.clone()))
     }
 
     fn set_first_in_group(&mut self, first: bool) {
