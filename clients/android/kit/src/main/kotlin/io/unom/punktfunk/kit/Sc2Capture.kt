@@ -11,7 +11,7 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * The captured Steam Controllers of one transport link ([Sc2UsbLink] / [Sc2BleLink]) — a
  * cable or Bluetooth link carries one pad, a dongle one per slot interface — and one of two
- * consumers. A 2015 pad ([Sc1Device], USB only) takes the same path, its state parsed into the
+ * consumers. A 2015 pad ([Sc1Device]) takes the same path, its state parsed into the
  * Steam Controller 2's layout and its raw reports mirrored by the host as a `28DE:1102`:
  *
  * **Stream mode** (`router != null`, owned by StreamScreen):
@@ -50,8 +50,13 @@ class Sc2Capture(
     private val ble = Sc2BleLink(context, { report, len -> onReport(report, len, BLE_IFACE) }, ::onLinkClosed)
     @Volatile private var activeLink: Int = LINK_NONE
 
-    /** True when the USB link carries a 2015 pad ([Sc1Device]) rather than a Steam Controller 2. */
-    @Volatile private var classic = false
+    /** True when the live link carries a 2015 pad ([Sc1Device]) rather than a Steam Controller 2. */
+    private val classic: Boolean
+        get() = when (activeLink) {
+            LINK_USB -> usb.isClassic
+            LINK_BLE -> ble.isClassic
+            else -> false
+        }
 
     /** True when the USB link is a dongle — the only transport whose wireless-status
      *  reports are authoritative. A WIRED pad also emits them, truthfully reporting "no radio
@@ -120,7 +125,6 @@ class Sc2Capture(
         val ok = usb.start(dev)
         if (ok) {
             activeLink = LINK_USB
-            classic = usb.isClassic
             dongleLink = dev.productId != if (classic) Sc1Device.PID_WIRED else Sc2Device.PID_WIRED
             reporting = true
             onActiveChanged?.invoke(true)
@@ -195,7 +199,6 @@ class Sc2Capture(
         }
         activeLink = LINK_NONE
         dongleLink = false
-        classic = false
         reporting = false
         releaseAll()
         if (wasActive) onActiveChanged?.invoke(false)
@@ -394,7 +397,6 @@ class Sc2Capture(
         if (activeLink == LINK_USB) {
             activeLink = LINK_NONE
             dongleLink = false
-            classic = false
             usb.stop()
         }
         onActiveChanged?.invoke(false)
