@@ -45,7 +45,8 @@ public enum TouchInputMode: String, CaseIterable, Sendable {
 
 /// Gesture/ballistics tuning. Distances are in points where they gate gestures; the
 /// relative ballistics work in PHYSICAL pixels (point deltas × screen scale) so the
-/// acceleration curve matches the Android client's pixel-based constants 1:1.
+/// acceleration curve matches the Android client's pixel-based constants 1:1, which
+/// `TouchVectorTests` checks against `clients/shared/touch-vectors.json`.
 enum TouchTuning {
     /// Movement under this (pt) still counts as a tap, not a drag.
     static let tapSlop: CGFloat = 8
