@@ -639,6 +639,24 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc2Identity
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `NativeBridge.nativeSc1IdentityRequest(index): ByteArray?` — the `index`th feature query a
+/// 2015 Steam Controller's identity is read with; null past the last.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc1IdentityRequest<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    index: jint,
+) -> JByteArray<'local> {
+    env.with_env(|env| -> jni::errors::Result<JByteArray<'local>> {
+        let nth = usize::try_from(index).ok();
+        match nth.and_then(|i| punktfunk_core::client::sc2::classic_identity_requests().nth(i)) {
+            Some(request) => env.byte_array_from_slice(request),
+            None => Ok(JByteArray::default()),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// `NativeBridge.nativeSendPadIdentity(handle, pad, slot, serial, replies)` — a captured Steam
 /// Controller 2's identity for wire pad `pad`: its Puck slot (0 off a Puck), its USB serial (empty
 /// when unknown) and its replies to the identity queries, packed `[len][request][len][reply]…`.

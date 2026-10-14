@@ -767,6 +767,10 @@ object NativeBridge {
      *  last. [puck] adds the dongle's own queries. */
     external fun nativeSc2IdentityRequest(puck: Boolean, index: Int): ByteArray?
 
+    /** The [index]th feature query a 2015 Steam Controller's identity is read with, report id 0
+     *  first; null past the last. */
+    external fun nativeSc1IdentityRequest(index: Int): ByteArray?
+
     /** A captured Steam Controller 2's identity for wire pad [pad]: its Puck [slot] (0 off a
      *  Puck), its USB serial and its replies, packed `[len][request][len][reply]…`. The host
      *  builds the virtual pad from it. */

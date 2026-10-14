@@ -579,12 +579,21 @@ private fun sc2Extras(activity: MainActivity?): List<ConsoleJson.ExtraPad> {
     val onBle = dev == null && probe.pairedBleAddress() != null
     val captured = activity.sc2MenuActive
     if (dev == null && !onBle && !captured) return emptyList()
-    val puck = dev != null && dev.productId != Sc2Device.PID_WIRED
+    val classic = dev != null && dev.productId in io.unom.punktfunk.kit.Sc1Device.USB_PIDS
+    val puck = !classic && dev != null && dev.productId != Sc2Device.PID_WIRED
     return listOf(
         ConsoleJson.ExtraPad(
-            name = if (puck) "Steam Controller 2 Puck" else "Steam Controller 2",
+            name = when {
+                classic -> "Steam Controller"
+                puck -> "Steam Controller 2 Puck"
+                else -> "Steam Controller 2"
+            },
             key = "$SC2_PAD_KEY${dev?.vendorId ?: 0}:${dev?.productId ?: 0}",
-            pref = if (puck) Gamepad.PREF_STEAMCONTROLLER2_PUCK else Gamepad.PREF_STEAMCONTROLLER2,
+            pref = when {
+                classic -> Gamepad.PREF_STEAMCONTROLLER
+                puck -> Gamepad.PREF_STEAMCONTROLLER2_PUCK
+                else -> Gamepad.PREF_STEAMCONTROLLER2
+            },
             detail = dev?.let { "%04X:%04X · usb".format(it.vendorId, it.productId) }
                 ?: if (onBle) "bluetooth" else "captured",
             forwarded = captured,
