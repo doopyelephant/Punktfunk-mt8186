@@ -208,7 +208,7 @@ fn watch() {
 /// Veto the desktop's idle suspend and blanking through the Inhibit portal until the
 /// last session ends. False when no backend takes `Suspend`: GTK's without a GNOME
 /// session refuses it. The connection is private, so the portal drops the inhibit
-/// if this process dies, and ashpd's shared one never binds to this runtime.
+/// when the hold ends or this process dies.
 #[cfg(target_os = "linux")]
 fn hold_desktop_inhibit() -> bool {
     use ashpd::desktop::inhibit::{InhibitFlags, InhibitOptions, InhibitProxy};
@@ -221,7 +221,7 @@ fn hold_desktop_inhibit() -> bool {
     // One `block_on` for the whole hold keeps the connection's reader pumped.
     rt.block_on(async {
         let take = async {
-            let conn = ashpd::zbus::Connection::session().await?;
+            let conn = pf_portal::session_bus().await?;
             InhibitProxy::with_connection(conn)
                 .await?
                 .inhibit(

@@ -48,9 +48,8 @@ pub fn pipewire_reachable() -> bool {
     if std::env::var_os("PIPEWIRE_REMOTE").is_some() {
         return true;
     }
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|dir| std::path::Path::new(&dir).join("pipewire-0").exists())
-        .unwrap_or(false)
+    pf_host_config::session::runtime_dir()
+        .is_some_and(|dir| std::path::Path::new(&dir).join("pipewire-0").exists())
 }
 
 /// Colon-separated display MAC of pad `pad` (a DualSense Edge when `edge`).

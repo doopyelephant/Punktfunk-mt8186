@@ -42,9 +42,11 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 const DRAIN_CAP: u64 = 16 * 1024 * 1024;
 
 /// Stdout/stderr stay as the caller configured them (inherited by default). Use
-/// [`output_within`] when the output is read.
+/// [`output_within`] when the output is read. The child gets the stored session
+/// ([`pf_host_config::session::export_to`]).
 pub(crate) fn status_within(cmd: &mut Command, budget: Duration) -> Result<ExitStatus> {
     tree::prepare(cmd);
+    pf_host_config::session::export_to(cmd);
     let mut child = cmd.spawn()?;
     let tree = tree::Guard::attach(&child);
     let deadline = Instant::now() + budget;
@@ -69,9 +71,11 @@ pub(crate) fn status_within(cmd: &mut Command, budget: Duration) -> Result<ExitS
 /// Both pipes are drained **concurrently with the wait**. Reading them only after exit
 /// deadlocks on any helper that fills the pipe: Linux pipes hold 64 KiB, a chatty helper
 /// blocks in `write()`, never exits, and is killed at the budget with its output discarded.
-/// `pw-dump` on a populated graph clears 64 KiB routinely.
+/// `pw-dump` on a populated graph clears 64 KiB routinely. The child gets the stored
+/// session, as in [`status_within`].
 pub(crate) fn output_within(cmd: &mut Command, budget: Duration) -> Result<Output> {
     tree::prepare(cmd);
+    pf_host_config::session::export_to(cmd);
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

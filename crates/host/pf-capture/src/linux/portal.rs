@@ -65,7 +65,7 @@ pub fn gnome_hdr_monitor_active() -> bool {
             .build()
             .context("build tokio runtime")?;
         rt.block_on(async {
-            let conn = zbus::Connection::session().await.context("session bus")?;
+            let conn = pf_portal::session_bus().await.context("session bus")?;
             let reply = conn
                 .call_method(
                     Some("org.gnome.Mutter.DisplayConfig"),
@@ -134,9 +134,8 @@ pub(super) fn portal_thread(
     want_metadata_cursor: bool,
     anchored: bool,
 ) {
-    // Shared, never dropped (`pf_portal`): a per-session runtime took
-    // ashpd's process-global D-Bus connection down with it, and every later
-    // handshake in the process hung.
+    // Shared, never dropped (`pf_portal`): the cast's bus connection reads on it until the
+    // cast closes.
     let rt = match pf_portal::portal_runtime() {
         Ok(rt) => rt,
         Err(e) => {
@@ -164,7 +163,10 @@ async fn screencast(
     quit_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<()> {
     use ashpd::desktop::screencast::Screencast;
-    let proxy = within(deadline, Screencast::new())
+    let bus = within(deadline, pf_portal::session_bus())
+        .await
+        .context("connect the session bus")?;
+    let proxy = within(deadline, Screencast::with_connection(bus))
         .await
         .context("connect ScreenCast portal")?;
     let session = within(deadline, proxy.create_session(Default::default()))
@@ -202,10 +204,14 @@ async fn remote_desktop(
     use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
     use ashpd::desktop::screencast::Screencast;
     use ashpd::desktop::PersistMode;
-    let remote = within(deadline, RemoteDesktop::new())
+    // One connection for both: the portal ties the session to the bus name that made it.
+    let bus = within(deadline, pf_portal::session_bus())
+        .await
+        .context("connect the session bus")?;
+    let remote = within(deadline, RemoteDesktop::with_connection(bus.clone()))
         .await
         .context("connect RemoteDesktop portal")?;
-    let screencast = within(deadline, Screencast::new())
+    let screencast = within(deadline, Screencast::with_connection(bus))
         .await
         .context("connect ScreenCast portal")?;
     let session = within(deadline, remote.create_session(Default::default()))

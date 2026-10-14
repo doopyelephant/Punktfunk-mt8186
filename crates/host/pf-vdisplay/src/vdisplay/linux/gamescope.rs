@@ -1262,10 +1262,9 @@ fn stop_session(unit_name: &str) {
 /// `$XDG_RUNTIME_DIR`, never world-writable `/tmp`: a second local user must not plant a rogue
 /// EIS path. Reader also rejects a symlink.
 pub fn ei_socket_file() -> std::path::PathBuf {
-    // The path itself is the shared `pf_paths::gamescope_ei_socket_file` contract (also read by the
-    // libei injector). Compute it under the session env lock so a concurrent session handshake's
-    // `apply_session_env` XDG_RUNTIME_DIR retarget can't race this producer-side read.
-    crate::with_env_lock(pf_paths::gamescope_ei_socket_file)
+    // The shared `pf_paths::gamescope_ei_socket_file` contract: the libei injector reads it
+    // from the same stored session.
+    pf_paths::gamescope_ei_socket_file(pf_host_config::session::runtime_dir().as_deref())
 }
 
 #[cfg(test)]

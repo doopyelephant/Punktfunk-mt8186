@@ -46,7 +46,7 @@ enum Cmd {
 impl MutterClipboard {
     /// Errors when Mutter is not running; the caller maps that to `BACKEND_UNAVAILABLE`.
     pub async fn open() -> Result<(MutterClipboard, mpsc::UnboundedReceiver<ClipEvent>)> {
-        let conn = zbus::Connection::session()
+        let conn = pf_portal::session_bus()
             .await
             .context("session D-Bus (Mutter clipboard)")?;
         let rd = zbus::Proxy::new(&conn, RD_BUS, RD_PATH, RD_IFACE)
@@ -355,7 +355,7 @@ mod live {
 
     impl Helper {
         async fn open() -> Result<Helper> {
-            let conn = zbus::Connection::session().await?;
+            let conn = pf_portal::session_bus().await?;
             let rd = zbus::Proxy::new(&conn, RD_BUS, RD_PATH, RD_IFACE).await?;
             let path: OwnedObjectPath = rd.call("CreateSession", &()).await?;
             let session = zbus::Proxy::new(&conn, RD_BUS, path, SESSION_IFACE).await?;

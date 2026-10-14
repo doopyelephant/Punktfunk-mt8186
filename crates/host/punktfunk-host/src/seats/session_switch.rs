@@ -91,7 +91,7 @@ pub(crate) fn spawn() {
         has_desktop: has_desktop(),
     };
     tokio::spawn(async move {
-        let built = zbus::connection::Builder::session()
+        let built = pf_portal::session_bus_builder()
             .and_then(|b| b.name(NAME))
             .and_then(|b| b.serve_at(OBJECT, service));
         match built {

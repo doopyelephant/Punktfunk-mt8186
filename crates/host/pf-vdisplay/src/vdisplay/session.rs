@@ -1,12 +1,11 @@
-//! Live graphical-session detection, session epoch, and process-env retargeting.
+//! Live graphical-session detection, session epoch, and session retargeting.
 //!
 //! [`detect_active_session`] names the compositor running for this uid.
 //! [`observe_session_instance`] bumps the session epoch when that compositor
 //! *instance* changes, so the registry cannot reuse a PipeWire node id from a
-//! dead desktop. [`apply_session_env`] stores the live session and writes its
-//! bus, runtime dir and desktop name into the process env under
-//! [`super::ENV_LOCK`]; [`settle_desktop_portal`] pushes it into systemd
-//! `--user` / D-Bus activation so a mid-stream switch does not leave the
+//! dead desktop. [`apply_session_env`] stores the live session; the host never
+//! writes it into its own environment. [`settle_desktop_portal`] pushes it into
+//! systemd `--user` / D-Bus activation so a mid-stream switch does not leave the
 //! portal talking to the old socket.
 //!
 //! Evidence: `design/gamemode-and-dedicated-sessions.md`,
@@ -507,35 +506,13 @@ fn find_wayland_socket(env: &EnvProbe, runtime: &str, uid: u32) -> Option<String
     })
 }
 
-/// Point the host at the live session. The session is stored for the Wayland backends
-/// ([`wayland_connect`]) and for children ([`pf_host_config::session::export_to`]).
-/// `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS` / `XDG_CURRENT_DESKTOP` go into the process
-/// env: zbus, ashpd and libpipewire can only read them there.
-///
-/// [`ENV_LOCK`] orders these writes against this crate's own readers. It does not make `setenv`
-/// sound — see its doc — so the list stays these three.
+/// Point the host at the live session: store it ([`pf_host_config::session::set`]). Every
+/// reader of the four session variables, the bus, PipeWire and each child
+/// ([`pf_host_config::session::export_to`]) takes them from there. Nothing live stores no
+/// desktop name, so a stale `GNOME` after a compositor crash cannot route into a dead session.
 #[cfg(target_os = "linux")]
 pub fn apply_session_env(active: &ActiveSession) {
-    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let e = &active.env;
-    pf_host_config::session::set(e.clone(), active.kind != ActiveKind::None);
-    // SAFETY: PARTIAL, and deliberately not a proof. `_env_guard` holds [`ENV_LOCK`], which orders
-    // this against every env reader and writer *inside pf-vdisplay*; streaming threads read cached
-    // config, not the environment. Nothing else in the process takes that lock — not glibc, not
-    // zbus, not wayland-client, not Mesa — so each write is still a race with a concurrent `getenv`.
-    unsafe {
-        std::env::set_var("XDG_RUNTIME_DIR", &e.xdg_runtime_dir);
-        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &e.dbus_session_bus_address);
-        if let Some(d) = &e.xdg_current_desktop {
-            std::env::set_var("XDG_CURRENT_DESKTOP", d);
-        }
-        // Nothing live: a leftover desktop name keeps `available()` true (stale
-        // `XDG_CURRENT_DESKTOP=GNOME` after a compositor crash). Clear it so the
-        // handshake fails fast instead of routing into a dead session.
-        if active.kind == ActiveKind::None {
-            std::env::remove_var("XDG_CURRENT_DESKTOP");
-        }
-    }
+    pf_host_config::session::set(active.env.clone(), active.kind != ActiveKind::None);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -609,19 +586,14 @@ pub fn settle_desktop_portal(chosen: Compositor) {
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_RUNTIME_DIR",
     ];
-    // Both tools forward their own environment, so each gets the stored socket name.
+    // Both tools forward these from their own environment, which `status_within` fills from
+    // the stored session.
     let mut import = std::process::Command::new("systemctl");
     import.args(["--user", "import-environment"]).args(VARS);
-    let _ = crate::proc::status_within(
-        pf_host_config::session::export_to(&mut import),
-        SYSTEMD_BUDGET,
-    );
+    let _ = crate::proc::status_within(&mut import, SYSTEMD_BUDGET);
     let mut activation = std::process::Command::new("dbus-update-activation-environment");
     activation.arg("--systemd").args(VARS);
-    let _ = crate::proc::status_within(
-        pf_host_config::session::export_to(&mut activation),
-        SYSTEMD_BUDGET,
-    );
+    let _ = crate::proc::status_within(&mut activation, SYSTEMD_BUDGET);
     // KWin input rides the xdg RemoteDesktop portal, which keys the backend off its *startup*
     // `XDG_CURRENT_DESKTOP`. Restart, then wait 600 ms for it to re-read before the injector reopens.
     // Plasma 6 names the KDE backend `plasma-xdg-desktop-portal-kde`; older builds drop the prefix.

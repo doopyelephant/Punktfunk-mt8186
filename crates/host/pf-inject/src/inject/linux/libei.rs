@@ -78,8 +78,8 @@ impl InputInjector for LibeiInjector {
 }
 
 fn worker(rx: UnboundedReceiver<InputEvent>, source: EiSource) {
-    // Shared, never dropped: a per-worker runtime took ashpd's process-global
-    // D-Bus connection down with it, and the next session's portal open hung.
+    // Shared, never dropped (`pf_portal`): the session's bus connection reads on it until
+    // the session closes.
     let rt = match pf_portal::portal_runtime() {
         Ok(rt) => rt,
         Err(e) => {
@@ -169,10 +169,9 @@ async fn session_main(mut rx: UnboundedReceiver<InputEvent>, source: EiSource) {
     keepalive.close().await;
 }
 
-/// What holds the EIS server's session open, and how it ends. The portal session
-/// lives on ashpd's process-global connection, which outlives this worker, so only
-/// `Session.Close` ends it; Mutter's rides a private connection that ends with the
-/// value; the relayed socket has nothing to close.
+/// What holds the EIS server's session open, and how it ends. The portal session and
+/// Mutter's each ride a private connection that ends with the value; the portal one is
+/// closed with `Session.Close` first. The relayed socket has nothing to close.
 enum Keepalive {
     Portal(ashpd::desktop::Session<RemoteDesktop>),
     Mutter(Box<dyn Send>),
@@ -263,7 +262,10 @@ async fn connect_portal() -> Result<(
     ashpd::desktop::Session<RemoteDesktop>,
     std::os::fd::OwnedFd,
 )> {
-    let rd = RemoteDesktop::new()
+    let bus = pf_portal::session_bus()
+        .await
+        .map_err(|e| anyhow!("connect session D-Bus (RemoteDesktop portal): {e}"))?;
+    let rd = RemoteDesktop::with_connection(bus)
         .await
         .map_err(|e| anyhow!("open RemoteDesktop portal (is xdg-desktop-portal-kde/gnome running and XDG_CURRENT_DESKTOP set?): {e}"))?;
     let session = rd
@@ -302,7 +304,7 @@ async fn connect_portal() -> Result<(
 /// tears the Mutter session down and closes EIS.
 async fn connect_mutter() -> Result<(Box<dyn Send>, zbus::Proxy<'static>, std::os::fd::OwnedFd)> {
     use zbus::zvariant::{OwnedObjectPath, Value};
-    let conn = zbus::Connection::session()
+    let conn = pf_portal::session_bus()
         .await
         .map_err(|e| anyhow!("connect session D-Bus (Mutter RemoteDesktop): {e}"))?;
     let rd = zbus::Proxy::new(
@@ -378,7 +380,7 @@ async fn connect_socket_file(file: &std::path::Path) -> Result<(UnixStream, Opti
                 let full = if name.starts_with('/') {
                     std::path::PathBuf::from(name)
                 } else {
-                    let runtime = std::env::var("XDG_RUNTIME_DIR").map_err(|_| {
+                    let runtime = pf_host_config::session::runtime_dir().ok_or_else(|| {
                         anyhow!("XDG_RUNTIME_DIR unset (needed to resolve EIS socket '{name}')")
                     })?;
                     std::path::Path::new(&runtime).join(name)

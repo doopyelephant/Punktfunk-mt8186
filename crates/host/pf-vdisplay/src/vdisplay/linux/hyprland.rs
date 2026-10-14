@@ -217,22 +217,13 @@ impl HyprlandDisplay {
 }
 
 /// Usable when a live Hyprland instance for our uid is reachable: inherited
-/// `HYPRLAND_INSTANCE_SIGNATURE`, or a socket under `$XDG_RUNTIME_DIR/hypr/`
+/// `HYPRLAND_INSTANCE_SIGNATURE`, or a socket under the session's runtime dir `hypr/`
 /// (the systemd `--user` host has no env import). Cheap — safe on enumeration.
-///
-/// Both env reads take [`crate::with_env_lock`] in one scope so the pair is one
-/// consistent view. The lock is not reentrant; `read_dir` runs outside it.
 pub fn is_available() -> bool {
-    let (sig, runtime) = crate::with_env_lock(|| {
-        (
-            std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE"),
-            std::env::var_os("XDG_RUNTIME_DIR"),
-        )
-    });
-    if sig.is_some() {
+    if crate::with_env_lock(|| std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")).is_some() {
         return true;
     }
-    let dir = match runtime {
+    let dir = match pf_host_config::session::runtime_dir() {
         Some(d) => std::path::PathBuf::from(d).join("hypr"),
         None => return false,
     };
@@ -571,7 +562,7 @@ impl Drop for ReloadWatcher {
 /// different compositors.
 fn event_socket_path() -> Option<std::path::PathBuf> {
     let sig = crate::session::hypr_signature()?;
-    let runtime = crate::with_env_lock(|| std::env::var_os("XDG_RUNTIME_DIR"))
+    let runtime = pf_host_config::session::runtime_dir()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::path::PathBuf::from(format!("/run/user/{}", crate::proc::current_uid()))

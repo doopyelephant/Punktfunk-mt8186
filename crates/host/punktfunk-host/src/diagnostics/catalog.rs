@@ -627,7 +627,9 @@ fn omarchy_updates() -> HostCheck {
 /// Hyprland and Omarchy have no owning-crate probe, so these two rows shell out. Other catalog
 /// checks must not grow a third.
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program).args(args).output().ok()?;
+    let out = pf_host_config::session::export_to(Command::new(program).args(args))
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
