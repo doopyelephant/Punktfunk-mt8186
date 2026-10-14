@@ -427,7 +427,7 @@ pub(super) struct Worker {
     menu_open: Vec<(u32, sdl3::gamepad::Gamepad)>,
     /// Menu pad that last had a button or stick engaged — the one a detent pulse belongs in.
     menu_last: Option<u32>,
-    /// A forwarded slot just opened: menu navigation adopts until it has reported.
+    /// A forwarded slot or a menu pad just opened: menu navigation adopts until it has reported.
     menu_settle: MenuSettle,
     /// Menu pad power, `(id, level)`. Cached: [`publish`](Self::publish) runs on every hotplug.
     battery: Option<(u32, PadBattery)>,
@@ -595,7 +595,8 @@ impl Worker {
         };
         let before = self.menu_open.len();
         self.menu_open.retain(|(id, _)| want.contains(id));
-        let mut changed = self.menu_open.len() != before;
+        let changed = self.menu_open.len() != before;
+        let mut opened = false;
         for id in want {
             if self.menu_open.iter().any(|(open, _)| *open == id) {
                 continue;
@@ -603,13 +604,16 @@ impl Worker {
             match self.subsystem.open(sdl3::joystick::JoystickId::new(id)) {
                 Ok(pad) => {
                     self.menu_open.push((id, pad));
-                    changed = true;
+                    opened = true;
                 }
                 Err(e) => tracing::warn!(id, error = %e, "gamepad open failed"),
             }
         }
-        if changed {
-            // Hot-plug under the launcher: adopt held state instead of firing it. No sensors.
+        // Hot-plug under the launcher adopts held state instead of firing it. A pad just opened
+        // reads every button up until it reports, so it adopts through the settle. No sensors.
+        if opened {
+            self.menu_settle.start(Instant::now());
+        } else if changed {
             self.menu_nav.reset();
         }
     }

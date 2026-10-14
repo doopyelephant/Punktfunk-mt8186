@@ -119,7 +119,8 @@ impl Gates {
 const MENU_SETTLE: Duration = Duration::from_millis(50);
 
 /// Menu navigation adopts what is held, instead of firing it, for [`MENU_SETTLE`] after a
-/// forwarded pad opens. A button held across attach would otherwise read up, then down.
+/// forwarded slot or a menu pad opens. A button held across attach, or while a pad is plugged in
+/// under the launcher, would otherwise read up, then down.
 #[derive(Default)]
 pub(super) struct MenuSettle {
     until: Option<Instant>,
