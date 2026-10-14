@@ -601,10 +601,14 @@ async fn stop_overdue(stop: &AtomicBool) {
 /// `mode_conflict = reject` close code. Distinct from transport failure (`RejectReason::Busy`).
 const REJECT_BUSY_CODE: u32 = punktfunk_core::reject::REJECT_BUSY_CLOSE_CODE;
 
-/// Close with the typed reject code before the session task returns `Err`. A bare drop
-/// closes with code 0, which the client cannot tell from transport trouble.
-/// Ends the session when the console removes the profile it plays as.
-fn spawn_profile_watch(conn: link::SessionLink, profile: String) {
+/// Ends the session as an operator stop when the console removes the profile it plays as.
+/// The end is written before the refuse, or the connection watcher would read the host's
+/// own close back as `lost`.
+fn spawn_profile_watch(
+    conn: link::SessionLink,
+    profile: String,
+    life: crate::lifecycle::Lifecycle,
+) {
     let mut removed = crate::profiles::removed();
     tokio::spawn(async move {
         loop {
@@ -618,6 +622,7 @@ fn spawn_profile_watch(conn: link::SessionLink, profile: String) {
             }
         }
         tracing::info!(%profile, "profile removed — closing its session");
+        life.end(crate::events::SessionEndReason::StoppedByOperator);
         let reason = punktfunk_core::reject::RejectReason::SeatUnavailable;
         conn.refuse(
             reason.close_code(),
@@ -627,6 +632,8 @@ fn spawn_profile_watch(conn: link::SessionLink, profile: String) {
     });
 }
 
+/// Close with the typed reject code before the session task returns `Err`. A bare drop
+/// closes with code 0, which the client cannot tell from transport trouble.
 async fn close_rejected(conn: &link::SessionLink, reason: punktfunk_core::reject::RejectReason) {
     conn.refuse(reason.close_code(), &reason.to_string()).await;
 }
@@ -1114,7 +1121,6 @@ pub(crate) async fn run_admitted(
     {
         return Ok(served);
     }
-    spawn_profile_watch(conn.clone(), resolved.id.clone());
     let profile_ref = crate::events::ProfileRef {
         id: resolved.id.clone(),
         display_name: resolved.display_name.clone(),
@@ -1139,6 +1145,7 @@ pub(crate) async fn run_admitted(
     // guard that reads them, so they bump a shared block rather than hand a figure over.
     let counters = Arc::new(crate::session_status::SessionCounters::default());
     spawn_end_watch(conn.clone(), life.clone());
+    spawn_profile_watch(conn.clone(), resolved.id.clone(), life.clone());
     life.enter(crate::lifecycle::Phase::Negotiating);
 
     // Before the handshake resolves the compositor: a handshake that fails still hands back.
