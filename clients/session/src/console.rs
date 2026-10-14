@@ -22,7 +22,8 @@ use pf_client_core::orchestrate::{
 use pf_client_core::{discovery, library, profiles, start, trust, wol};
 use pf_console_ui::{
     ConsoleCmd, ConsoleEntry, ConsoleHandles, ConsoleOptions, ConsoleShared, HostRow, LibraryGame,
-    LibraryPhase, LibraryShared, PairPhase, ProfilesAnswer, SkiaOverlay, SpeedPhase, WakeStatus,
+    LibraryPhase, LibraryShared, PairPhase, PairStatus, ProfilesAnswer, RequestKey, SkiaOverlay,
+    SpeedPhase, WakeStatus,
 };
 use pf_presenter::overlay::OverlayAction;
 use pf_presenter::ActionOutcome;
@@ -525,9 +526,12 @@ impl ServiceState {
 
     fn handle(&mut self, cmd: ConsoleCmd) {
         match cmd {
-            ConsoleCmd::FetchLibrary { addr, mgmt, fp_hex } => {
-                self.fetch_library(addr, mgmt, fp_hex)
-            }
+            ConsoleCmd::FetchLibrary {
+                addr,
+                mgmt,
+                fp_hex,
+                req,
+            } => self.fetch_library(addr, mgmt, fp_hex, req),
             ConsoleCmd::RefreshRunning { addr, mgmt, fp_hex } => {
                 self.refresh_running(addr, mgmt, fp_hex)
             }
@@ -582,19 +586,31 @@ impl ServiceState {
                 port,
                 pin,
                 device_name,
-            } => self.run_pairing(addr, port, trust::pair_error_message, move |a, p, id| {
-                trust::pair_with_host(a, p, id, &pin, &device_name)
-            }),
+                req,
+            } => self.run_pairing(
+                addr,
+                port,
+                req,
+                trust::pair_error_message,
+                move |a, p, id| trust::pair_with_host(a, p, id, &pin, &device_name),
+            ),
             ConsoleCmd::RequestAccess {
                 addr,
                 port,
                 fp_hex,
                 device_name,
+                req,
             } => {
                 let pin = trust::parse_hex32(&fp_hex);
-                self.run_pairing(addr, port, trust::access_error_message, move |a, p, id| {
-                    trust::request_access_to_host(a, p, id, pin, &device_name, None)
-                })
+                self.run_pairing(
+                    addr,
+                    port,
+                    req,
+                    trust::access_error_message,
+                    move |a, p, id| {
+                        trust::request_access_to_host(a, p, id, pin, &device_name, None)
+                    },
+                )
             }
             ConsoleCmd::SaveHost { name, addr, port } => self.save_host(name, addr, port),
             ConsoleCmd::UpdateHost {
@@ -605,12 +621,17 @@ impl ServiceState {
             } => self.update_host(key, name, addr, port),
             ConsoleCmd::ForgetHost { key } => self.forget_host(key),
             ConsoleCmd::UnpairHost { key } => self.unpair_host(key),
-            ConsoleCmd::Wake { key, then_connect } => self.wake(key, then_connect),
+            ConsoleCmd::Wake {
+                key,
+                then_connect,
+                req,
+            } => self.wake(key, then_connect, req),
+            // The shell closed the card as it sent this; a `Wake` behind it in the same drain
+            // has already raised the next one.
             ConsoleCmd::CancelWake => {
                 if let Some(c) = self.wake_cancel.take() {
                     c.store(true, Ordering::SeqCst);
                 }
-                self.console.set_wake(None);
             }
             ConsoleCmd::Probe => {
                 self.last_probe = Instant::now() - Duration::from_secs(60);
@@ -670,7 +691,7 @@ impl ServiceState {
         }
     }
 
-    fn fetch_library(&self, addr: String, mgmt: u16, fp_hex: String) {
+    fn fetch_library(&self, addr: String, mgmt: u16, fp_hex: String, req: RequestKey) {
         // Opening a library is the earliest signal that somebody intends to play, so
         // the box is woken HERE, not at connect time. Empty with auto-wake off or no
         // MAC on record: the fetch then asks once instead of retrying across a boot.
@@ -691,9 +712,9 @@ impl ServiceState {
             addr,
             mgmt,
             self.identity.clone(),
-            fp_hex.clone(),
-            trust::parse_hex32(&fp_hex),
+            fp_hex,
             macs,
+            req,
         );
     }
 
@@ -918,11 +939,13 @@ impl ServiceState {
     }
 
     /// Run one pairing (`ask`: the PIN ceremony or a request access) on its own thread and
-    /// report it as Busy, then Paired or Failed. A later pairing makes this answer stale.
+    /// report it under `req` as Busy, then Paired or Failed. A later pairing makes this
+    /// answer stale.
     fn run_pairing(
         &self,
         addr: String,
         port: u16,
+        req: RequestKey,
         wording: fn(&punktfunk_core::PunktfunkError) -> String,
         ask: impl FnOnce(&str, u16, &(String, String)) -> Result<[u8; 32], punktfunk_core::PunktfunkError>
             + Send
@@ -937,8 +960,14 @@ impl ServiceState {
             .filter(|r| r.addr == addr && r.port == port)
             .map(|r| (r.fp_hex, r.name))
             .collect();
-        self.console.set_pair(PairPhase::Busy);
         let console = self.console.clone();
+        let say = move |phase| {
+            console.set_pair(PairStatus {
+                req: req.clone(),
+                phase,
+            })
+        };
+        say(PairPhase::Busy);
         let identity = self.identity.clone();
         let generation = self.pair_gen.fetch_add(1, Ordering::SeqCst) + 1;
         let pair_gen = self.pair_gen.clone();
@@ -959,9 +988,9 @@ impl ServiceState {
                             return;
                         }
                         match saved {
-                            Ok(()) => console.set_pair(PairPhase::Paired { key: fp_hex }),
+                            Ok(()) => say(PairPhase::Paired { key: fp_hex }),
                             // Not "Paired": the pin is gone by the next launch.
-                            Err(e) => console.set_pair(PairPhase::Failed(format!(
+                            Err(e) => say(PairPhase::Failed(format!(
                                 "Paired, but couldn't save — {e:#}"
                             ))),
                         }
@@ -970,7 +999,7 @@ impl ServiceState {
                         // Cause-specific wording (wrong PIN vs not-armed vs unreachable
                         // vs a typed host rejection) — shared with every other surface.
                         if current() {
-                            console.set_pair(PairPhase::Failed(wording(&e)));
+                            say(PairPhase::Failed(wording(&e)));
                         }
                     }
                 }
@@ -1044,7 +1073,7 @@ impl ServiceState {
         }
     }
 
-    fn wake(&mut self, key: String, then_connect: bool) {
+    fn wake(&mut self, key: String, then_connect: bool, req: RequestKey) {
         if let Some(c) = self.wake_cancel.take() {
             c.store(true, Ordering::SeqCst);
         }
@@ -1058,6 +1087,7 @@ impl ServiceState {
         if macs.is_empty() {
             // Nothing to send: end the takeover the shell opened for this wake.
             self.console.set_wake(Some(WakeStatus {
+                req,
                 key: row.key,
                 name: row.name,
                 seconds: 0,
@@ -1069,7 +1099,7 @@ impl ServiceState {
         }
         let cancel = Arc::new(AtomicBool::new(false));
         self.wake_cancel = Some(cancel.clone());
-        spawn_wake(self.console.clone(), row, macs, then_connect, cancel);
+        spawn_wake(self.console.clone(), row, macs, then_connect, req, cancel);
     }
 
     fn set_pin(&self, key: String, preset_id: String, pin: bool) {
@@ -1387,27 +1417,29 @@ impl ServiceState {
 }
 
 /// The wake-and-wait loop (one per wake): [`orchestrate::wake_by_probe`], the cadence every
-/// shell shares. The thread owns the model's wake status; the shell reads
+/// shell shares. The thread reports each tick under `req`; the shell reads
 /// `online`/`timed_out` and acts.
 fn spawn_wake(
     console: ConsoleShared,
     row: HostRow,
     macs: Vec<String>,
     then_connect: bool,
+    req: RequestKey,
     cancel: Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
         .name("punktfunk-wake".into())
         .spawn(move || {
             orchestrate::wake_by_probe(&row.addr, row.port, &row.fp_hex, &macs, |tick| {
-                // A cancelled thread writes NOTHING: the card it would clear may already have
-                // been replaced by the next host's, and `CancelWake` cleared the slot itself.
+                // A cancelled thread stops; a tick already in flight lands on no card, as the
+                // shell closed this wake's before it sent `CancelWake`.
                 if cancel.load(Ordering::SeqCst) {
                     return false;
                 }
                 // Awake → the shell connects and cancels; timed out → the card waits for Try
                 // Again / Cancel. Either ends this thread; a retry spawns a fresh one.
                 console.set_wake(Some(WakeStatus {
+                    req: req.clone(),
                     key: row.key.clone(),
                     name: row.name.clone(),
                     seconds: tick.seconds as u32,
@@ -1464,24 +1496,21 @@ fn spawn_fetch(
     mgmt: u16,
     identity: (String, String),
     fp_hex: String,
-    pin: Option<[u8; 32]>,
     macs: Vec<String>,
+    req: RequestKey,
 ) {
-    // `begin_fetch`, not `set_phase(Loading)`: it also advances the model's fetch epoch, which
-    // is how a shelf pushed a moment ago knows the titles it is about to see are its own rather
-    // than the previous host's. A cached catalog can land within a millisecond of this, so there
-    // is no phase transition for anyone to observe.
+    // Drops what an older fetch left; the list and phase land only under `req`.
     shared.begin_fetch();
-    let epoch = shared.fetch_epoch();
+    let pin = trust::parse_hex32(&fp_hex);
     std::thread::Builder::new()
         .name("punktfunk-library".into())
         .spawn(move || {
             // This worker retries for up to 90 s and cannot be cancelled, so the player can
             // be two hosts further on by the time it answers. Every write below asks first
             // whether this fetch still owns the model.
-            let mine = || shared.fetch_epoch() == epoch;
+            let mine = || shared.fetch_epoch() == req.epoch;
             if let Ok(path) = std::env::var("PUNKTFUNK_FAKE_LIBRARY") {
-                load_fake(&shared, &path);
+                load_fake(&shared, &req, &path);
                 return;
             }
             // Whatever we already know about this host, on screen before a single packet goes
@@ -1490,7 +1519,7 @@ fn spawn_fetch(
             let mut cached_games = None;
             if let Some(cached) = pf_client_core::library_cache::load(&fp_hex) {
                 if !cached.games.is_empty() && mine() {
-                    shared.set_games_cached(to_model(&cached.games));
+                    shared.set_games_cached(&req, to_model(&cached.games));
                     cached_games = Some(cached.games);
                 }
             }
@@ -1554,7 +1583,7 @@ fn spawn_fetch(
                             (cached, false)
                         }
                         None => {
-                            shared.set_phase(LibraryPhase::Error {
+                            shared.set_phase(&req, LibraryPhase::Error {
                                 title: "Couldn't load the library".into(),
                                 body: e.to_string(),
                                 can_retry: true,
@@ -1575,7 +1604,7 @@ fn spawn_fetch(
                 .filter(|(_, candidates)| !candidates.is_empty())
                 .collect();
             if live {
-                shared.set_games(to_model(&games));
+                shared.set_games(&req, to_model(&games));
                 // Remembered AFTER it is on screen: the disk write is not on the path to a shelf.
                 pf_client_core::library_cache::store(&fp_hex, &games);
                 // What the host has up right now, so a title the player can return to says so.
@@ -1631,7 +1660,7 @@ fn to_model(games: &[library::GameEntry]) -> Vec<LibraryGame> {
 }
 
 /// Dev hook: entries from a JSON file; portrait paths starting with `/` load from disk.
-fn load_fake(shared: &LibraryShared, path: &str) {
+fn load_fake(shared: &LibraryShared, req: &RequestKey, path: &str) {
     let games: Vec<library::GameEntry> = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -1643,5 +1672,5 @@ fn load_fake(shared: &LibraryShared, path: &str) {
             }
         }
     }
-    shared.set_games(to_model(&games));
+    shared.set_games(req, to_model(&games));
 }
