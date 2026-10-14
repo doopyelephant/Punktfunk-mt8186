@@ -719,131 +719,22 @@ in
     })
 
     # --- plugin/script runner ------------------------------------------------------------------
-    # Installs the runner + defines its opt-in `systemd --user` unit (mirrors the deb/rpm
-    # punktfunk-scripting subpackage). NOT auto-started unless `scripting.autoStart` is set.
+    # The deb/rpm punktfunk-scripting subpackage: the runner and its `systemd --user` unit, with the
+    # unit's own sandbox. Started unless `scripting.autoStart` is off.
     (mkIf cfg.scripting.enable {
       environment.systemPackages = [
         cfg.scripting.package
         pkgs.bubblewrap
       ];
 
+      # The unit is the package's own (scripts/punktfunk-scripting.service); this is its drop-in.
+      systemd.packages = [ cfg.scripting.package ];
       systemd.user.services.punktfunk-scripting = {
-        description = "punktfunk plugin/script runner";
-        documentation = [ "https://git.unom.io/unom/punktfunk" ];
         # Same scoping as the host: a root-side runner would talk to the wrong session's mgmt API.
         unitConfig.ConditionUser = userScope;
-        # Plugins talk to the host's loopback mgmt API; order after it (soft — the runner backs off
-        # and retries per unit, so this is ordering only, not a hard requirement).
-        after = [ "punktfunk-host.service" ];
         wantedBy = optional cfg.scripting.autoStart "default.target";
         # Each plugin runs inside its own `bwrap` sandbox, built by the runner.
         path = [ pkgs.bubblewrap ];
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = "${cfg.scripting.package}/bin/punktfunk-scripting";
-          # `+` runs outside the namespace: the plugin-run and plugin-state binds need both
-          # directories, and inside the read-only home nothing can create them.
-          ExecStartPre = "+${pkgs.coreutils}/bin/mkdir -p -m 0700 %h/.config/punktfunk/plugin-run %h/.config/punktfunk/plugin-state";
-          Restart = "on-failure";
-          RestartSec = 2;
-          # The runner's status for refusing to run a plugin without a sandbox (SANDBOX_REFUSED_EXIT,
-          # sdk/src/runner.ts). A restart would probe the same box again: the unit stays failed.
-          RestartPreventExitStatus = 78;
-          # Deliver SIGTERM to the runner (it orchestrates the structural shutdown of its unit
-          # fibers) and give it room to run their finalizers before the cgroup is reaped.
-          KillMode = "mixed";
-          KillSignal = "SIGTERM";
-          TimeoutStopSec = 30;
-
-          # Unit-level hardening, the same scripts/punktfunk-scripting.service gives the deb/rpm
-          # installs — keep the two in step, module-check.nix asserts each directive. It confines
-          # the supervisor and the operator's loose scripts, not a PLUGIN: those get their own
-          # bwrap sandbox, because a mount namespace on a same-uid unit is no boundary.
-          NoNewPrivileges = true;
-          # PrivateTmp deliberately OFF (field report 2026-08-03, the VirtualHere plugin). A
-          # plugin's whole job is integrating with things already running on this box, and on Linux
-          # those talk over /tmp: VirtualHere's client IPC is the FIFO pair /tmp/vhclient +
-          # /tmp/vhclient_response, X11 is /tmp/.X11-unix. A private /tmp hides all of it — the
-          # plugin launches the vendor binary fine and then cannot reach the daemon behind it,
-          # which presents as an error no amount of config fixes.
-          PrivateTmp = false;
-          ProtectSystem = "strict";
-          # The plugin token's privilege split, made real by the filesystem: a plugin holds a
-          # capability-limited token, so the runner must not reach the full-admin `mgmt-token` or
-          # the identity key beside it. Same uid as the operator means file modes cannot say that;
-          # an empty home plus an explicit allow-list can. Mirrors the Windows runner's ACL, which
-          # grants LocalService the scoped token and the TLS pin and nothing else.
-          #
-          # InaccessiblePaths is belt and braces: wherever the home tmpfs does not land, or a
-          # drop-in removes ProtectHome, the denylist is what still stands.
-          #
-          # ⚠ All of these are MOUNT-NAMESPACE options, and for a *user* unit that needs
-          # unprivileged user namespaces. On a kernel/config that restricts those they fail the
-          # unit rather than degrading — drop them via
-          #   systemctl --user edit punktfunk-scripting
-          # which is also where a loose script that must reach elsewhere gets `ReadWritePaths=`
-          # (outside the home) or `BindReadOnlyPaths=` (inside it). Plugins get folder grants.
-          ProtectHome = "tmpfs";
-          InaccessiblePaths = [
-            "-%h/.config/punktfunk/mgmt-token"
-            "-%h/.config/punktfunk/key.pem"
-            "-%h/.config/punktfunk/native-key.pem"
-          ];
-          # Writable: the installed packages (the runner refreshes their shared SDK with
-          # `bun install` on every start) and the one directory a plugin may persist into. `%t` is
-          # $XDG_RUNTIME_DIR, which ProtectHome empties too — the host publishes its live-stream
-          # marker there, and the session bus and compositor sockets live there.
-          BindPaths = [
-            "-%h/.config/punktfunk/plugins"
-            "-%h/.config/punktfunk/plugin-state"
-            # bun's package cache ($BUN_INSTALL). Only the SDK refresh writes here, and it fails
-            # soft — but soft means plugins keep an old SDK across host upgrades.
-            "-%h/.bun"
-            "%t"
-          ];
-          # Read-only. The punktfunk entries are the runner's credentials and its inputs: the
-          # scoped token, the TLS pin (native-cert.pem after the identity split, cert.pem before
-          # it), the port the host really bound, the operator's loose scripts, and the drop box
-          # another local account fills.
-          #
-          # What the plugins read in the home — manifest paths and folder grants — the host writes
-          # into ~/.config/systemd/user/punktfunk-scripting.service.d/50-plugin-roots.conf.
-          #
-          # The punktfunk-scripting entries cover the SteamOS layout, which builds the runner under
-          # the home and points ExecStart at it. Every path but plugin-run is `-`: ExecStartPre
-          # creates that one.
-          BindReadOnlyPaths = [
-            "-%h/.config/punktfunk/plugin-token"
-            # Per-plugin tokens and grants. A directory bind keeps the host's atomic replacements
-            # visible; a file bind would pin the deleted inode.
-            "%h/.config/punktfunk/plugin-run"
-            "-%h/.config/punktfunk/native-cert.pem"
-            "-%h/.config/punktfunk/cert.pem"
-            "-%h/.config/punktfunk/mgmt-endpoint"
-            "-%h/.config/punktfunk/scripts"
-            "-%h/.config/punktfunk/ingest"
-            "-%h/.local/bin/punktfunk-scripting"
-            "-%h/.local/lib/punktfunk-scripting"
-            "-%h/.local/share/punktfunk-scripting"
-          ];
-          # Puts back the write bit ProtectSystem=strict takes away from the real /tmp above.
-          ReadWritePaths = [ "/tmp" ];
-          # Free for a JS runtime that only talks HTTP and reads files. Absent on purpose:
-          # MemoryDenyWriteExecute (bun JITs), PrivateDevices (VirtualHere forwards USB), and
-          # ProtectKernelTunables, which refuses bwrap a fresh /proc; the sandbox binds /proc/sys ro.
-          ProtectControlGroups = true;
-          # Exactly the namespaces each plugin's bwrap sandbox is built from; `true` starts no plugin.
-          RestrictNamespaces = "user mnt pid net ipc uts cgroup";
-          SystemCallArchitectures = "native";
-          CapabilityBoundingSet = "";
-          # AF_NETLINK brings up a sandbox's loopback; its seccomp filter keeps it from the plugin.
-          RestrictAddressFamilies = [
-            "AF_UNIX"
-            "AF_INET"
-            "AF_INET6"
-            "AF_NETLINK"
-          ];
-        };
       };
     })
 

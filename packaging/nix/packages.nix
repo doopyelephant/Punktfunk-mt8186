@@ -61,6 +61,7 @@
   nodejs,
   makeWrapper,
   stdenvNoCC,
+  coreutils,
   # bun2nix (github:nix-community/bun2nix, pinned in flake.nix): `.fetchBunDeps` turns a generated
   # `bun.nix` into bun's global install cache, and `.hook` runs an offline `bun install` off it.
   bun2nix,
@@ -508,7 +509,7 @@ in
   # Effect), which discovers ~/.config/punktfunk/{scripts,plugins} and supervises each unit as an
   # Effect fiber. It runs on `bun` (it import()s the operator's `.ts` plugin files, which only bun
   # can do). Mirrors the Debian punktfunk-scripting .deb / the RPM's `--with scripting` subpackage,
-  # which the host package Recommends — the NixOS module wires the opt-in systemd --user unit.
+  # which the host package Recommends. Its systemd --user unit ships here too.
   #
   # Unlike the deb/rpm we don't `bun build` into a bundle + vendor bun; we still bundle (one
   # self-contained JS, effect inlined) but the launcher execs `pkgs.bun` from the store.
@@ -554,6 +555,12 @@ in
       # Launcher: run the bundle on bun from the store (mirrors the deb/rpm /usr/bin/punktfunk-scripting).
       makeWrapper ${bun}/bin/bun $out/bin/punktfunk-scripting \
         --add-flags "$out/share/punktfunk-scripting/runner-cli.js"
+      # The user unit every channel ships, sandbox included. NixOS has no /bin/mkdir.
+      install -Dm0644 scripts/punktfunk-scripting.service \
+        $out/lib/systemd/user/punktfunk-scripting.service
+      substituteInPlace $out/lib/systemd/user/punktfunk-scripting.service \
+        --replace-fail /usr/bin/punktfunk-scripting $out/bin/punktfunk-scripting \
+        --replace-fail =+/bin/mkdir =+${coreutils}/bin/mkdir
       runHook postInstall
     '';
 

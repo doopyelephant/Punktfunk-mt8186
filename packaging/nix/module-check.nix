@@ -287,58 +287,19 @@ let
         && has appliance "punktfunk-web" "PUNKTFUNK_UI_BIND=0.0.0.0";
     }
 
-    # --- the three divergences from the shipped units, as regression guards --------------------
-    # Each of these was ONCE wrong here while right in scripts/*.service. Assert the decision, so a
-    # future edit cannot quietly drift back.
+    # --- the packaged units and the runner's drop-in --------------------------------------------
     {
-      # Unit hardening for the supervisor and the operator's own scripts. What confines a PLUGIN
-      # is its own bwrap sandbox — these directives are a mount namespace, which does not hold
-      # against a process of the same uid.
-      name = "the plugin runner is hardened like the deb/rpm unit";
+      # The module's units are drop-ins: without the packages there is no unit to extend.
+      name = "the host, console and runner units come from their packages";
       ok =
-        has appliance "punktfunk-scripting" "NoNewPrivileges=true"
-        && has appliance "punktfunk-scripting" "ProtectSystem=strict"
-        && has appliance "punktfunk-scripting" "ReadWritePaths=/tmp"
-        && has appliance "punktfunk-scripting" "RestrictAddressFamilies=AF_UNIX"
-        # bwrap needs netlink and a fresh /proc; the sandbox takes both back from the plugin.
-        && !(has appliance "punktfunk-scripting" "ProtectKernelTunables=true")
-        && has appliance "punktfunk-scripting" "AF_NETLINK"
-        && has appliance "punktfunk-scripting" "ProtectControlGroups=true"
-        && has appliance "punktfunk-scripting" "RestrictNamespaces=user mnt pid net ipc uts cgroup"
-        && has appliance "punktfunk-scripting" "SystemCallArchitectures=native"
-        && has appliance "punktfunk-scripting" "CapabilityBoundingSet=";
-    }
-    {
-      # `ReadWritePaths=%h` re-opened the whole home, so the runner read `mgmt-token` and `key.pem`
-      # beside the scoped token it is supposed to be limited to — the privilege split the docs
-      # promise did not hold on Linux. The home is a tmpfs now and the binds are the allow-list.
-      name = "the plugin runner cannot read the host's admin token or identity key";
-      ok =
-        has appliance "punktfunk-scripting" "ProtectHome=tmpfs"
-        && !(has appliance "punktfunk-scripting" "ReadWritePaths=%h")
-        && has appliance "punktfunk-scripting" "InaccessiblePaths=-%h/.config/punktfunk/mgmt-token"
-        && has appliance "punktfunk-scripting" "InaccessiblePaths=-%h/.config/punktfunk/key.pem";
-    }
-    {
-      # Everything ProtectHome=tmpfs takes away that the runner itself needs. Drop one of these and
-      # the runner comes up unable to authenticate or persist. Library roots are not listed here:
-      # the host binds them through its 50-plugin-roots.conf drop-in.
-      name = "the plugin runner keeps the paths it needs through the empty home";
-      ok =
-        has appliance "punktfunk-scripting" "BindPaths=-%h/.config/punktfunk/plugins"
-        && has appliance "punktfunk-scripting" "BindPaths=-%h/.config/punktfunk/plugin-state"
-        # $XDG_RUNTIME_DIR: the host's live-stream marker, the session bus, compositor sockets.
-        && has appliance "punktfunk-scripting" "BindPaths=%t"
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/plugin-token"
-        # A directory bind keeps atomic replacements visible; ExecStartPre makes it exist.
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=%h/.config/punktfunk/plugin-run"
-        && has appliance "punktfunk-scripting" "bin/mkdir -p -m 0700 %h/.config/punktfunk/plugin-run %h/.config/punktfunk/plugin-state"
-        # The TLS pin is native-cert.pem after the identity split, cert.pem before it.
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/native-cert.pem"
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/cert.pem"
-        # Without this a moved listener leaves every plugin dialling 47990 forever.
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/mgmt-endpoint"
-        && has appliance "punktfunk-scripting" "BindReadOnlyPaths=-%h/.config/punktfunk/scripts";
+        let
+          p = appliance.services.punktfunk;
+        in
+        lib.all (pkg: lib.elem pkg appliance.systemd.packages) [
+          p.host.package
+          p.web.package
+          p.scripting.package
+        ];
     }
     {
       # Without bwrap on its PATH the runner starts no plugin at all, and the library is empty.
@@ -346,18 +307,6 @@ let
       ok = builtins.any (p: lib.hasInfix "bubblewrap" (toString p)) (
         appliance.systemd.user.services.punktfunk-scripting.path or [ ]
       );
-    }
-    {
-      # 78 is the runner refusing to run a plugin unsandboxed. Restarting it every two seconds
-      # would probe the same box and fill the journal; the unit has to stay failed.
-      name = "the plugin runner stays stopped after it refuses a box with no sandbox";
-      ok = has appliance "punktfunk-scripting" "RestartPreventExitStatus=78";
-    }
-    {
-      # PrivateTmp is OFF on purpose (the VirtualHere field report: a private /tmp hides
-      # /tmp/vhclient and /tmp/.X11-unix, so a plugin cannot reach the daemon it integrates with).
-      name = "the plugin runner keeps the real /tmp";
-      ok = has appliance "punktfunk-scripting" "PrivateTmp=false";
     }
     {
       # Since the library scanners became plugins, a runner that is off means an EMPTY LIBRARY and
