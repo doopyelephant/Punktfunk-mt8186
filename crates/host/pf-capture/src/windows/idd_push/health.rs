@@ -46,13 +46,13 @@ impl IddPushCapturer {
             // With an IddCx hardware cursor declared — the client draws it or the driver
             // composites it — DWM composes nothing for pointer travel and the input canary can
             // never be answered: neither is evidence of a changed desktop.
-            cursor_gap_px: if self.cursor_shared.is_some() || self.composite_cursor {
+            cursor_gap_px: if self.cursor_model.declared() {
                 0
             } else {
                 self.cursor.gap_px()
             },
             recreating: self.recovering_since.is_some(),
-            secure_desktop: self.secure_active,
+            secure_desktop: self.cursor_model.secure(),
             topology_held: pf_win_display::topology_churn::held(),
             encoder: self.encoder,
         };

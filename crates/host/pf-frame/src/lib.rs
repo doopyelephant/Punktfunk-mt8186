@@ -407,7 +407,7 @@ pub struct CapturedFrame {
 /// Keeps a producer's buffer behind a zero-copy frame out of the producer's pool.
 ///
 /// A dmabuf fd stops the BO from being freed, not from being re-rendered into. Capture
-/// attaches this to every raw-passthrough frame (pool depth permitting) and requeues
+/// attaches this to every raw-passthrough frame it publishes and requeues
 /// only when the last clone drops. An async reader (Vulkan encoder ring) clones it into
 /// the slot and drops it on the slot fence so stability covers the read window. A
 /// consumer that finishes while the frame is alive needs no extra clone.
@@ -420,9 +420,8 @@ pub type FrameHold = std::sync::Arc<dyn std::any::Any + Send + Sync>;
 /// travels in one fd: Y at `offset`, interleaved UV at `plane1` when the producer
 /// reported it, else at `offset + stride * frame_height` with the shared `stride`.
 ///
-/// Owns a *dup* of the PipeWire fd so encode can import after capture returns. Content
-/// stability across the read window is [`hold`](Self::hold); `None` falls back to pool
-/// depth outrunning import+encode.
+/// Owns a *dup* of the buffer's fd so encode can import after capture returns. Content
+/// stability across the read window is [`hold`](Self::hold).
 #[cfg(target_os = "linux")]
 pub struct DmabufFrame {
     pub fd: std::os::fd::OwnedFd,
@@ -435,7 +434,9 @@ pub struct DmabufFrame {
     pub plane1: Option<(u32, u32)>,
     pub offset: u32,
     pub stride: u32,
-    /// Deferred-requeue hold; `None` when the pool could not spare a buffer (`PUNKTFUNK_ZEROCOPY_HOLD=0`).
+    /// Deferred-requeue hold. Every frame a capturer builds carries one: a pool that cannot
+    /// spare a buffer publishes no dmabuf frame. `None` is a frame an encoder built for
+    /// itself, a probe or a worker's copy of a host frame, with no producer to hold off.
     pub hold: Option<FrameHold>,
     /// Failure state for this producer identity; encoder imports update its scoped latch.
     pub health: pf_zerocopy::ZeroCopyHealth,

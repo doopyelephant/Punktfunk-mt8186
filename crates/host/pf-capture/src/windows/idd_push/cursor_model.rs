@@ -1,88 +1,122 @@
-//! Which pointer the client gets, and who draws it.
+//! Runs [`crate::cursor_state`] against the driver and the two shape sources.
 //!
-//! The GDI poller ([`cursor_poll`]) is the full-fidelity source; the driver's
-//! hardware-cursor section ([`cursor`]) is the fallback, latched once taken
-//! because the two serial namespaces must not interleave. This file also hands
-//! that section to the driver at open, and stands the IddCx declare down for
-//! the secure desktop, where a declared hardware cursor would block the OS
-//! software-cursor path UAC and Winlogon render through.
+//! The model decides which source the client's shape is read from, and what the
+//! driver's forward flag is across the secure desktop, a client's ask and a
+//! monitor re-arrival. This file owns the sources (the GDI poller in
+//! [`cursor_poll`], the driver's section in [`cursor`]), the IOCTLs and the log
+//! line for each decision. It also hands the section to the driver at open.
+//! The model's table test is the contract; nothing here decides.
 
 use super::*;
+use crate::cursor_state::{Action, Event, Source};
 
 impl IddPushCapturer {
     /// Overlay source for [`Capturer::cursor`] and the shape the client draws.
-    ///
-    /// A live poller wins even while it still reports `None`. Shm is only for a
-    /// dead/missing poller, then latched: the two serial namespaces must not interleave.
     pub(super) fn live_cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
-        if !self.cursor_shm_latched {
-            if let Some(p) = &self.cursor_poll {
-                if p.alive() {
-                    return p.read();
+        let alive = self.cursor_poll.as_ref().is_some_and(|p| p.alive());
+        match self.cursor_model.source(alive) {
+            Source::Poller => self.cursor_poll.as_ref().and_then(|p| p.read()),
+            Source::Section { first } => {
+                if first {
+                    tracing::warn!(
+                        target_id = self.target_id,
+                        "cursor: the GDI shape poller is not running — degrading to the driver's \
+                         hardware-cursor shm section for the rest of the session (alpha-only \
+                         shapes: monochrome/masked cursors will look wrong)"
+                    );
                 }
+                self.cursor_shared.as_mut().and_then(|c| c.read())
             }
-            // About to read shm — latch so a revived poller cannot recross serials.
-            if self.cursor_shared.is_some() {
-                self.cursor_shm_latched = true;
-                tracing::warn!(
-                    target_id = self.target_id,
-                    "cursor: the GDI shape poller is not running — degrading to the driver's \
-                     hardware-cursor shm section for the rest of the session (alpha-only shapes: \
-                     monochrome/masked cursors will look wrong)"
-                );
-            }
+            Source::None => None,
         }
-        self.cursor_shared.as_mut().and_then(|c| c.read())
     }
 
-    /// The forward flag the driver should hold now: down while the secure desktop is up, down
-    /// while the driver composites, up while the client draws.
-    pub(super) fn driver_forward(&self) -> bool {
-        !self.secure_active && !self.composite_cursor
-    }
-
-    /// UAC/Winlogon use the software-cursor path; a declared IddCx hardware cursor
-    /// blocks it. Stand the declare down on the secure edge; on dismissal restore the
-    /// model the session runs, which may be the driver compositing.
+    /// Feed the model the secure desktop's state. UAC and Winlogon render through the OS
+    /// software cursor, which a declared hardware cursor blocks.
     /// Must run every tick, including while frames are stalled.
     pub(super) fn poll_secure_desktop(&mut self) {
-        let Some(fwd) = self.cursor_forward.as_ref() else {
-            return;
-        };
-        // Channel session, or forced-composite on a reused monitor that may still
-        // run an earlier worker. A clean target has no poller — no guard.
-        if self.cursor_shared.is_none() && !self.composite_forced {
+        // Nothing to stand down: no sender, or no declare on this target.
+        if self.cursor_forward.is_none() || !self.cursor_model.declared() {
             return;
         }
-        let secure = pf_win_display::secure_desktop();
-        if secure == self.secure_active {
-            return;
-        }
-        self.secure_active = secure;
-        if secure {
-            tracing::info!(
-                target_id = self.target_id,
-                "secure desktop (UAC/Winlogon) active — standing the IddCx hardware-cursor \
-                 declare down so the OS software-cursor path can render it"
-            );
-            if let Err(e) = fwd(false) {
-                tracing::warn!(
-                    "secure-desktop cursor-forward stand-down failed (secure content may stay \
-                     invisible this session): {e:#}"
+        self.cursor_event(Event::Secure(pf_win_display::secure_desktop()));
+    }
+
+    /// Step the model, send the driver what it decided, and say so in the log.
+    pub(super) fn cursor_event(&mut self, event: Event) {
+        let action = self.cursor_model.step(event);
+        let composite = self.cursor_model.composite();
+        let forward = self.cursor_forward.as_ref();
+        match action {
+            Action::Nothing => {}
+            Action::StandDown => {
+                tracing::info!(
+                    target_id = self.target_id,
+                    "secure desktop (UAC/Winlogon) active — standing the IddCx hardware-cursor \
+                     declare down so the OS software-cursor path can render it"
                 );
+                if let Some(Err(e)) = forward.map(|fwd| fwd(false)) {
+                    tracing::warn!(
+                        "secure-desktop cursor-forward stand-down failed (secure content may stay \
+                         invisible this session): {e:#}"
+                    );
+                }
             }
-        } else {
-            tracing::info!(
-                target_id = self.target_id,
-                "secure desktop dismissed — restoring the cursor render model"
-            );
-            // Only the session that runs the cursor channel. Forced-composite never
-            // wanted the declare; leaving desired-state off stops per-assign re-declares.
-            if self.cursor_shared.is_some() {
-                if let Err(e) = fwd(self.driver_forward()) {
+            Action::Restore(flag) => {
+                tracing::info!(
+                    target_id = self.target_id,
+                    "secure desktop dismissed — restoring the cursor render model"
+                );
+                if let Some(Err(e)) = forward.zip(flag).map(|(fwd, on)| fwd(on)) {
                     tracing::warn!(
                         "secure-desktop cursor-forward re-enable failed (client-drawn cursor \
                          may double with a composited one): {e:#}"
+                    );
+                }
+            }
+            Action::Flip(on) => {
+                tracing::info!(
+                    composite,
+                    "cursor render model: the driver composites {}",
+                    if composite {
+                        "ON (capture model — blending the pointer into what it encodes)"
+                    } else {
+                        "OFF (client draws locally)"
+                    }
+                );
+                if let Some(Err(e)) = forward.map(|fwd| fwd(on)) {
+                    tracing::warn!(
+                        composite,
+                        error = %format!("{e:#}"),
+                        "cursor render model: the driver did not take the flip"
+                    );
+                }
+            }
+            Action::Redeliver(on) => {
+                let (Some(cs), Some(send)) =
+                    (self.cursor_shared.as_ref(), self.cursor_sender.as_ref())
+                else {
+                    return;
+                };
+                tracing::info!(
+                    target_id = self.target_id,
+                    composite,
+                    "cursor channel: re-delivering after the monitor re-arrival"
+                );
+                if !deliver_cursor_channel(&self.broker, self.target_id, cs, send) {
+                    tracing::warn!(
+                        target_id = self.target_id,
+                        "cursor channel re-delivery failed after the re-arrival — a flip to the \
+                         capture model will have no shape to blend"
+                    );
+                    return;
+                }
+                // Delivery starts the worker declared.
+                if let Some(Err(e)) = forward.map(|fwd| fwd(on)) {
+                    tracing::warn!(
+                        composite,
+                        error = %format!("{e:#}"),
+                        "cursor render model not re-applied after the re-arrival"
                     );
                 }
             }
