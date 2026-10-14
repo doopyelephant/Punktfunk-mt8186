@@ -37,6 +37,8 @@ pub mod ltr;
     any(test, feature = "test-support")
 ))]
 pub mod fake;
+// The parameter-set run at the head of an H.264 or HEVC AU. Pure.
+pub mod parameter_sets;
 pub mod smoke_pattern;
 // How long AMF, QSV and Media Foundation wait for an AU, and how far a reset escalates.
 pub mod stall;
