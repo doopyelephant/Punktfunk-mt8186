@@ -19,6 +19,32 @@ pub(crate) struct ServeArgs {
     webtransport: bool,
 }
 
+/// The port flags `role` binds by. A seat host's are its row's, which the supervisor names in
+/// the environment: a flag on the unit's command line, as a Steam Deck install writes, would keep
+/// the box's ports from the door.
+fn contract_ports(
+    role: HostRole,
+    mgmt: Option<SocketAddr>,
+    native: Option<u16>,
+) -> (Option<SocketAddr>, Option<u16>) {
+    if !role.is_seat_host() {
+        return (mgmt, native);
+    }
+    for (setting, set) in [
+        ("--mgmt-bind", mgmt.is_some()),
+        ("--native-port", native.is_some()),
+    ] {
+        if set {
+            tracing::warn!(
+                setting,
+                reason = "a seat host listens on its row's ports",
+                "seat-contract setting ignored"
+            );
+        }
+    }
+    (None, None)
+}
+
 /// Native plane + management API always run. `--gamestream` is trusted-LAN only.
 /// Pairing is required unless `--open`. A bad flag or env value is an error.
 pub(crate) fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
@@ -96,6 +122,7 @@ pub(crate) fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
     // it. A bad env value is fatal: serving the default while host.env says otherwise reads as
     // "I moved the port and the client still can't reach me".
     let cfg = pf_host_config::config();
+    let (mgmt_bind, native_port) = contract_ports(pf_paths::seat::role(), mgmt_bind, native_port);
     let listen = pf_host_config::listen::ListenPlan::resolve(
         mgmt_bind,
         native_port,
@@ -272,6 +299,21 @@ mod tests {
             assert_eq!(mints, !role.is_door(), "{role:?}");
             let shares_the_runner = cfg!(windows) && role.is_seat_host();
             assert!(!mints || may_restart != shares_the_runner, "{role:?}");
+        }
+    }
+
+    /// Only a seat host drops its port flags: its row's environment names the ports.
+    #[test]
+    fn a_seat_host_listens_on_its_rows_ports_whatever_its_flags_say() {
+        let mgmt: SocketAddr = "0.0.0.0:47990".parse().unwrap();
+        for role in HostRole::ALL {
+            let kept = contract_ports(role, Some(mgmt), Some(9777));
+            let want = if role.is_seat_host() {
+                (None, None)
+            } else {
+                (Some(mgmt), Some(9777))
+            };
+            assert_eq!(kept, want, "{role:?}");
         }
     }
 
