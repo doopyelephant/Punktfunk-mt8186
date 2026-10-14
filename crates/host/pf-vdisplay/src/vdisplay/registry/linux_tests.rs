@@ -2,13 +2,10 @@
 //!
 //! The pool, its linger timer and the policy store are process globals, and the linger
 //! comes from the environment. Every test therefore runs its body in a child of this test
-//! binary ([`in_child`]): an unconfigured host with an empty config dir.
+//! binary ([`in_child`]): an unconfigured host with an empty scratch home.
 //!
 //! A test asserts the backend calls in order, read off the fake's log, and the pooled
 //! display's `lifecycle::State`.
-
-use std::path::Path;
-use std::process::Command;
 
 use super::*;
 use crate::fake::{Call, FakeDisplay};
@@ -25,47 +22,12 @@ const SMALL: Mode = Mode {
     refresh_hz: 60,
 };
 
-/// Set on the child only: the scratch dir that is its config dir.
-const CHILD_DIR: &str = "PF_REGISTRY_TEST_DIR";
 /// For a child whose released displays must stay kept for the length of the test.
 const KEPT: &[(&str, &str)] = &[("PUNKTFUNK_MONITOR_LINGER_MS", "60000")];
 
-/// Run `body` in a child of this test binary and pass when it does. `test` is the
-/// calling test's name. The child is an unconfigured host: an empty config dir and
-/// no inherited `PUNKTFUNK_*`, then `env`.
+/// [`crate::fake::in_child`] for this module.
 fn in_child(test: &str, env: &[(&str, &str)], body: fn()) {
-    if let Some(dir) = std::env::var_os(CHILD_DIR) {
-        body();
-        // The body's last act. A filter that matched no test would exit 0 without it.
-        std::fs::write(Path::new(&dir).join("ran"), "").expect("mark the run");
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("pf-registry-{test}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    let module = module_path!().split_once("::").expect("crate::module").1;
-    let mut child = Command::new(std::env::current_exe().expect("this test binary"));
-    let test = format!("{module}::{test}");
-    child.args(["--exact", &test, "--include-ignored", "--nocapture"]);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("PUNKTFUNK_") {
-            child.env_remove(key);
-        }
-    }
-    let child = child
-        .env(CHILD_DIR, &dir)
-        .env("PUNKTFUNK_CONFIG_DIR", &dir)
-        .envs(env.iter().copied())
-        .output()
-        .expect("run the child");
-    let ran = dir.join("ran").exists();
-    std::fs::remove_dir_all(&dir).ok();
-    assert!(
-        child.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&child.stdout),
-        String::from_utf8_lossy(&child.stderr)
-    );
-    assert!(ran, "the child ran no test");
+    crate::fake::in_child(module_path!(), test, env, body)
 }
 
 fn acquire(fake: &FakeDisplay, mode: Mode, quit_now: bool) -> VirtualOutput {
@@ -92,6 +54,13 @@ fn log_events(fake: &FakeDisplay) {
 
 fn note(what: &str) -> Call {
     Call::Note(what.into())
+}
+
+/// A gamescope bare spawn: a compositor of its own.
+fn spawning(name: &'static str) -> FakeDisplay {
+    let fake = FakeDisplay::new(name);
+    fake.script(|s| s.ownership = DisplayOwnership::Spawned);
+    fake
 }
 
 /// A backend whose every create prepares a topology restore.
@@ -327,7 +296,7 @@ fn a_linger_window_ends_in_a_teardown() {
 #[test]
 fn a_session_claims_its_parked_display() {
     in_child("a_session_claims_its_parked_display", &[], || {
-        let fake = FakeDisplay::new("gamescope");
+        let fake = spawning("gamescope");
         fake.script(|s| s.isolation = Some("cafe0123".into()));
         log_events(&fake);
         assert!(registry::park(&mut fake.boxed(), MODE).expect("park"));
@@ -359,7 +328,7 @@ fn a_session_claims_its_parked_display() {
 fn a_kept_display_takes_the_new_mode_or_is_retired_for_a_spawn() {
     let name = "a_kept_display_takes_the_new_mode_or_is_retired_for_a_spawn";
     in_child(name, &[], || {
-        let fake = FakeDisplay::new("gamescope");
+        let fake = spawning("gamescope");
         fake.script(|s| {
             s.sole_instance = true;
             s.can_resize = true;
@@ -402,12 +371,11 @@ fn a_kept_display_takes_the_new_mode_or_is_retired_for_a_spawn() {
 fn a_display_the_registry_does_not_own_passes_through() {
     let name = "a_display_the_registry_does_not_own_passes_through";
     in_child(name, &[], || {
-        let spawn = FakeDisplay::new("gamescope");
+        let spawn = spawning("gamescope");
         assert!(registry::park(&mut spawn.boxed(), MODE).expect("park"));
 
         let managed = FakeDisplay::new("gamescope");
         managed.script(|s| {
-            s.poolable = false;
             s.ownership = DisplayOwnership::SessionManaged;
             s.restore = true;
         });
@@ -415,7 +383,7 @@ fn a_display_the_registry_does_not_own_passes_through() {
         let mut want = created(true, MODE);
         want.pop();
         assert_eq!(managed.take_calls(), want);
-        assert!(out.pool_gen.is_none() && out.ownership != DisplayOwnership::Owned);
+        assert!(out.pool_gen.is_none() && !out.ownership.pooled());
         assert_eq!(pool(), [("gamescope", lifecycle::State::Pinned)]);
         drop(out);
         assert_eq!(managed.take_calls(), [Call::KeepaliveDropped(1)]);
@@ -483,7 +451,11 @@ fn only_a_gamescope_teardown_rearms_the_hdr_offer() {
         use pf_frame::hdr::{hdr_capture_failed, note_hdr_capture_failed, HdrSource};
         for (backend, rearmed) in [("kwin", false), ("gamescope", true)] {
             note_hdr_capture_failed(HdrSource::VirtualOutput);
-            let fake = FakeDisplay::new(backend);
+            let fake = if rearmed {
+                spawning(backend)
+            } else {
+                FakeDisplay::new(backend)
+            };
             drop(acquire(&fake, MODE, false));
             assert_eq!(fake.calls().last(), Some(&Call::KeepaliveDropped(1)));
             let offered = !hdr_capture_failed(HdrSource::VirtualOutput);
@@ -500,6 +472,7 @@ fn only_a_gamescope_teardown_rearms_the_hdr_offer() {
 fn each_gamescope_display_is_a_group_of_its_own() {
     in_child("each_gamescope_display_is_a_group_of_its_own", &[], || {
         let fake = restoring("gamescope");
+        fake.script(|s| s.ownership = DisplayOwnership::Spawned);
         let first = acquire(&fake, MODE, false);
         fake.take_calls();
         let second = acquire(&fake, MODE, false);
@@ -526,7 +499,7 @@ fn a_new_session_epoch_ends_a_kept_desktop_display_but_not_gamescope() {
     let name = "a_new_session_epoch_ends_a_kept_desktop_display_but_not_gamescope";
     in_child(name, KEPT, || {
         let desk = FakeDisplay::new("kwin");
-        let game = FakeDisplay::new("gamescope");
+        let game = spawning("gamescope");
         drop(acquire(&desk, MODE, false));
         drop(acquire(&game, MODE, false));
         game.take_calls();
@@ -553,8 +526,8 @@ fn a_seat_in_game_mode_keeps_only_its_own_gamescope() {
     let name = "a_seat_in_game_mode_keeps_only_its_own_gamescope";
     in_child(name, KEPT, || {
         registry::set_seat_game_mode(true);
-        let own = FakeDisplay::new("gamescope");
-        let light = FakeDisplay::new("gamescope");
+        let own = spawning("gamescope");
+        let light = spawning("gamescope");
         light.script(|s| s.isolation = Some("ab12cd34".into()));
         let desk = FakeDisplay::new("kwin");
         for fake in [&own, &light, &desk] {
