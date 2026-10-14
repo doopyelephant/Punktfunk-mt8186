@@ -680,9 +680,9 @@ in
     })
 
     # --- web console ---------------------------------------------------------------------------
-    # The declarative equivalent of the punktfunk-web .deb / RPM subpackage: the two systemd --user
-    # units (the console + its first-run password generator) plus the firewall opener, all auto-wired
-    # to the host's per-user mgmt token + identity cert (no env editing on a packaged install).
+    # The declarative equivalent of the punktfunk-web .deb / RPM subpackage: its two systemd --user
+    # units (the console + its pre-start), auto-wired to the host's per-user mgmt token + identity
+    # cert, plus the firewall opener.
     (mkIf cfg.web.enable {
       environment.systemPackages = [ cfg.web.package ];
 
@@ -698,107 +698,23 @@ in
         ];
       };
 
-      # Console pre-start: generate the login password once, in the user's config dir, surface it to
-      # the --user journal, THEN block until the host has written the mgmt token + identity cert.
-      # Being Type=oneshot, this is the readiness gate punktfunk-web's `after` already implies but
-      # cannot enforce on its own (the host is Type=simple). Mirrors
-      # scripts/punktfunk-web-init.service — keep both in step.
-      systemd.user.services.punktfunk-web-init = {
-        description = "punktfunk web console pre-start (login password; waits for the host)";
-        documentation = [ "https://git.unom.io/unom/punktfunk" ];
-        # NO ConditionPathExists on web-password: that skipped this unit from the second boot
-        # onward, which is precisely when the host-readiness wait must still run. web-init.sh is
-        # idempotent instead (it writes the password only when absent, and returns without sleeping
-        # once the host's files exist). ConditionUser is TRIGGERING (`|`), so at least one must hold
-        # — same shape as punktfunk-web below.
-        unitConfig = {
-          ConditionUser = userScope;
-        };
-        path = [ pkgs.coreutils ];
-        serviceConfig = {
-          Type = "oneshot";
-          # Not remain-after-exit: an active oneshot is never re-run, so a console restart in a
-          # live session skipped the host-readiness gate. Mirrors scripts/punktfunk-web-init.service.
-          RemainAfterExit = false;
-          ExecStart = "${cfg.web.package}/share/punktfunk-web/web-init.sh";
-        };
-      };
-
-      # The console itself: Nitro SSR on bun, HTTPS on 47992 with the host's identity cert, proxying
-      # the host's loopback mgmt API with the bearer token injected server-side. mgmt-token is
-      # REQUIRED (the host's `serve` writes it) — a console with no token cannot reach the mgmt API
-      # at all, so failing closed beats a login page that 401s on every call. punktfunk-web-init
-      # waits for it, so this no longer fails on a fresh install's first start; if it is somehow
-      # still absent the unit fails and Restart retries. web-password is optional ('-'). Mirrors
-      # scripts/punktfunk-web.service.
+      # The units are the package's own (scripts/punktfunk-web{,-init}.service); these are their
+      # NixOS drop-ins. Same scoping as the host: root's instance would take 47992 from the real one.
+      systemd.packages = [ cfg.web.package ];
+      systemd.user.services.punktfunk-web-init.unitConfig.ConditionUser = userScope;
       systemd.user.services.punktfunk-web = {
-        description = "punktfunk management web console";
-        documentation = [ "https://git.unom.io/unom/punktfunk" ];
-        # Same scoping as the host: root's instance would take 47992 from the real one.
         unitConfig.ConditionUser = userScope;
-        # punktfunk-web-init is the readiness gate (Type=oneshot, so ordering after it genuinely
-        # waits). `punktfunk-host.service` alone is NOT one — the host is Type=simple, so systemd
-        # calls it started the instant it is spawned, seconds before it writes the mgmt token and
-        # its identity cert. Keep web-init in BOTH lists: the ordering is what makes it a gate.
-        after = [
-          "punktfunk-web-init.service"
-          "punktfunk-host.service"
-        ];
-        # wants, not requires: if the pre-start unit itself fails, still try — the Restart backstop
-        # below recovers, where a hard dependency would leave the console down.
-        wants = [ "punktfunk-web-init.service" ];
         wantedBy = optional cfg.web.autoStart "default.target";
-        # Backstop for whatever the gate cannot cover (web-init timed out; the host restarted and
-        # re-minted its identity under a running console; someone deleted a file). Retry
-        # INDEFINITELY: the EnvironmentFile below is mandatory on purpose, so the unit genuinely
-        # fails while the token is missing — and systemd's default rate limit (5 starts / 10 s)
-        # against `RestartSec = 2` gives up permanently after ~10 s. A console that hit a missing
-        # file then stayed dead until someone restarted it by hand. The shipped unit
-        # (scripts/punktfunk-web.service) has carried this since that defect was found; it was
-        # missed in the port, while the comment below went on promising the behaviour it removes.
-        unitConfig.StartLimitIntervalSec = 0;
-        # Stands down while the door's own console serves this port. Mirrors
-        # scripts/punktfunk-web.service.
-        unitConfig.ConditionPathExists = mkIf cfg.seats.enable "!/run/punktfunk-web-door";
-        environment = {
-          # PUNKTFUNK_MGMT_URL is deliberately absent: the host publishes the port it actually bound
-          # to ~/.config/punktfunk/mgmt-endpoint (mgmt::publish_endpoint), sourced below, and the
-          # server falls back to https://127.0.0.1:47990 on its own when that file does not exist.
-          # Hardcoding it here would have to out-rank the file, which is a directive-ordering
-          # question in the generated unit — so we simply do not create the conflict.
-          PORT = "47992";
-          # Where both listeners bind (`web.bind`).
-          PUNKTFUNK_UI_BIND = cfg.web.bind;
-          # Serve HTTPS with the host's own identity cert (the anchor native clients already pin) and
-          # mark the session cookie Secure. The host's `serve` writes these PEMs.
-          #
-          # These name the LEGACY pair; the server prefers the native sibling
-          # (native-cert.pem/native-key.pem) when it exists, because a generated unit cannot express
-          # "this file, else that one" any more than the hand-written one can. The choice is made in
-          # web/nitro-entry/tls-paths.mjs — keep this in step with scripts/punktfunk-web.service.
-          PUNKTFUNK_UI_TLS_CERT = "%h/.config/punktfunk/cert.pem";
-          PUNKTFUNK_UI_TLS_KEY = "%h/.config/punktfunk/key.pem";
-          PUNKTFUNK_UI_SECURE = "1";
-        };
-        serviceConfig = {
-          Type = "simple";
-          EnvironmentFile = [
-            "%h/.config/punktfunk/mgmt-token"
-            # Generated by the web-init unit, then rewritten by the console itself as
-            # PUNKTFUNK_UI_PASSWORD_HASH on the first sign-in. Optional ('-') either way.
-            "-%h/.config/punktfunk/web-password"
-            # The host's effective mgmt URL — see the `environment` note above. Optional: absent on
-            # a host predating mgmt::publish_endpoint, and the server default covers that.
-            "-%h/.config/punktfunk/mgmt-endpoint"
-          ];
-          ExecStart = "${cfg.web.package}/bin/punktfunk-web-server";
-          # `always`, not `on-failure`: a console that exits 0 has still stopped serving, and
-          # `on-failure` would leave it down. An explicit `systemctl --user stop` is still honoured
-          # (Restart= never fights that). Matches scripts/punktfunk-web.service and the Windows
-          # web-run.cmd, both of which relaunch bun on ANY exit.
-          Restart = "always";
-          RestartSec = 2;
-        };
+        # Where both listeners bind (`web.bind`).
+        environment.PUNKTFUNK_UI_BIND = cfg.web.bind;
+        # The packaged list starts with host.env, where web-init.sh writes a PUNKTFUNK_UI_BIND that
+        # would beat `web.bind`. The empty entry clears the list; the rest is the packaged order.
+        serviceConfig.EnvironmentFile = [
+          ""
+          "%h/.config/punktfunk/mgmt-token"
+          "-%h/.config/punktfunk/web-password"
+          "-%h/.config/punktfunk/mgmt-endpoint"
+        ];
       };
     })
 

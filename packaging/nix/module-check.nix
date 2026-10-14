@@ -186,18 +186,10 @@ let
         let
           scoped = name: has desktop name "ConditionUser=|alice";
         in
-        scoped "punktfunk-host" && scoped "punktfunk-web" && scoped "punktfunk-scripting";
-    }
-    {
-      # web-init is the console's readiness gate (it blocks until the host has written the mgmt
-      # token + identity cert), so it has to RUN on every start — not just the first. The
-      # `ConditionPathExists=!…/web-password` it used to carry skipped it from the second boot
-      # onward, which is exactly when the wait still matters; web-init.sh is idempotent instead.
-      # Keep the user scope: root's instance has no business generating the operator's password.
-      name = "web-init is user-scoped and NOT self-skipped by the password file";
-      ok =
-        has desktop "punktfunk-web-init" "ConditionUser=|alice"
-        && !(has desktop "punktfunk-web-init" "ConditionPathExists=");
+        scoped "punktfunk-host"
+        && scoped "punktfunk-web"
+        && scoped "punktfunk-web-init"
+        && scoped "punktfunk-scripting";
     }
     {
       # With no host.users to name, still keep SYSTEM users (root) out, while leaving the module
@@ -281,22 +273,23 @@ let
         && lib.elem 47993 appliance.networking.firewall.allowedTCPPorts;
     }
 
+    {
+      # web-init.sh writes a PUNKTFUNK_UI_BIND into host.env; read, it would beat `web.bind`. The
+      # token stays mandatory: a console without it fails closed.
+      name = "the console binds where web.bind says, never host.env";
+      ok =
+        let
+          files = appliance.systemd.user.services.punktfunk-web.serviceConfig.EnvironmentFile;
+        in
+        lib.head files == ""
+        && !(lib.any (lib.hasInfix "host.env") files)
+        && lib.elem "%h/.config/punktfunk/mgmt-token" files
+        && has appliance "punktfunk-web" "PUNKTFUNK_UI_BIND=0.0.0.0";
+    }
+
     # --- the three divergences from the shipped units, as regression guards --------------------
     # Each of these was ONCE wrong here while right in scripts/*.service. Assert the decision, so a
     # future edit cannot quietly drift back.
-    {
-      # Without this, systemd's default 5-starts-per-10s against RestartSec=2 gives up permanently
-      # after ~10 s — the exact window before the host's first `serve` writes the mgmt token.
-      name = "web console retries indefinitely while the host writes its mgmt token";
-      ok = has appliance "punktfunk-web" "StartLimitIntervalSec=0";
-    }
-    {
-      # A console that exits 0 has still stopped serving.
-      name = "web console restarts on ANY exit, not just failure";
-      ok =
-        has appliance "punktfunk-web" "Restart=always"
-        && !(has appliance "punktfunk-web" "Restart=on-failure");
-    }
     {
       # Unit hardening for the supervisor and the operator's own scripts. What confines a PLUGIN
       # is its own bwrap sandbox — these directives are a mount namespace, which does not hold
@@ -526,15 +519,9 @@ let
         && lib.last files == "-/run/punktfunk/seats/%u.env";
     }
     {
-      # The owner's console stands down while the door serves the box's ports.
-      name = "seats make the user console stand down for the door";
-      ok = has seats "punktfunk-web" "ConditionPathExists=!/run/punktfunk-web-door\n";
-    }
-    {
-      name = "a host without seats keeps its user units and ports as they were";
+      name = "a host without seats keeps its ports and units as they were";
       ok =
-        !(has appliance "punktfunk-web" "punktfunk-web-door")
-        && appliance.networking.firewall.allowedUDPPortRanges == [ ]
+        appliance.networking.firewall.allowedUDPPortRanges == [ ]
         && !(desktop.systemd.services ? punktfunk-door)
         && !(desktop.users.groups ? punktfunk-update);
     }

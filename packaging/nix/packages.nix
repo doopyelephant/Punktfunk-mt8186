@@ -401,7 +401,7 @@ in
   #
   # Unlike apt/dnf — which have no bun in their repos and so VENDOR a bun binary into the package —
   # Nix has `pkgs.bun`, so the launcher just execs it from the store (no vendored runtime). The
-  # systemd `--user` units + firewall wiring live in the NixOS module, pointed at this store path.
+  # systemd `--user` units ship here; the NixOS module adds its drop-ins and the firewall.
   punktfunk-web = stdenvNoCC.mkDerivation {
     pname = "punktfunk-web";
     inherit src version;
@@ -478,6 +478,15 @@ in
       cp -R web/.output/public $out/share/punktfunk-web/.output/public
       install -Dm0755 scripts/web-init.sh $out/share/punktfunk-web/web-init.sh
       install -Dm0644 web/web.env.example $out/share/punktfunk-web/web.env.example
+
+      # The user units every channel ships, pointed at this store path.
+      install -Dm0644 scripts/punktfunk-web.service $out/lib/systemd/user/punktfunk-web.service
+      install -Dm0644 scripts/punktfunk-web-init.service \
+        $out/lib/systemd/user/punktfunk-web-init.service
+      substituteInPlace $out/lib/systemd/user/punktfunk-web.service \
+        --replace-fail /usr/bin/punktfunk-web-server $out/bin/punktfunk-web-server
+      substituteInPlace $out/lib/systemd/user/punktfunk-web-init.service \
+        --replace-fail /usr/share/punktfunk-web $out/share/punktfunk-web
 
       # PATH-stable launcher: run the SSR bundle on bun from the store (mirrors the deb/rpm
       # /usr/bin/punktfunk-web-server, minus the vendored-bun indirection).
