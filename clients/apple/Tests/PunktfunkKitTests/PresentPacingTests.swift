@@ -337,6 +337,7 @@ final class PresentPacingTests: XCTestCase {
         XCTAssertEqual(SessionPresenter.pacing(for: .decoded, codec: .pyrowave), .deadline)
     }
 
+    @MainActor
     func testDecodedPacingRequiresAVideoLayer() {
         XCTAssertNil(Stage2Pipeline(endToEndMeter: nil, pacing: .decoded))
     }

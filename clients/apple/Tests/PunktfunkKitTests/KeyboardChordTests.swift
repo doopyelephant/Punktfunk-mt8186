@@ -37,6 +37,7 @@ final class KeyboardChordTests: XCTestCase {
 
     /// Each platform's chord table holds exactly the ⌃⌥⇧ letters `ShortcutsCatalog` lists for it,
     /// read from source because the app target is not importable.
+    @MainActor
     func testChordTablesMatchTheShortcutsReference() throws {
         let url = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent() // PunktfunkKitTests

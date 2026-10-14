@@ -134,6 +134,7 @@ enum PresentPriority: Equatable {
     }
 }
 
+@MainActor
 final class SessionPresenter {
     /// Map a presenter choice and codec to its execution path.
     ///
@@ -141,7 +142,7 @@ final class SessionPresenter {
     /// Stage-3 and stage-4 map directly to glass and deadline pacing; stage-2 is arrival for every
     /// codec. Glass gating waits for the previous frame's on-glass callback, about a refresh per
     /// frame.
-    static func pacing(for choice: PresenterChoice, codec: VideoCodec) -> PresentPacing {
+    nonisolated static func pacing(for choice: PresenterChoice, codec: VideoCodec) -> PresentPacing {
         if choice == .decoded { return codec == .pyrowave ? .deadline : .decoded }
         if choice == .stage4 { return .deadline }
         if choice == .stage3 { return .glass }
@@ -150,7 +151,7 @@ final class SessionPresenter {
 
     /// The decoded sink is zero-buffer and validated for biplanar 4:2:0. Preserve deadline Metal
     /// for Smoothness and 4:4:4 rather than ignoring intent or risking an unsupported video plane.
-    static func effectivePacing(
+    nonisolated static func effectivePacing(
         _ selected: PresentPacing, priority: PresentPriority, videoLayerCompatible: Bool = true
     ) -> PresentPacing {
         if selected == .decoded, priority != .latency || !videoLayerCompatible { return .deadline }
@@ -172,7 +173,7 @@ final class SessionPresenter {
     /// display-link target: on arrival, a 120 fps stream on a ProMotion panel loses about a tenth
     /// to a fifth of its frames, PyroWave included. Smoothness and the other presenters keep their
     /// own pacing mechanisms.
-    static func adaptiveSlotPaced(
+    nonisolated static func adaptiveSlotPaced(
         adaptiveSync: Bool, priority: PresentPriority, pacing: PresentPacing
     ) -> Bool {
         adaptiveSync && priority == .latency && pacing == .arrival
@@ -182,7 +183,7 @@ final class SessionPresenter {
     /// `PUNKTFUNK_GATE_DEPTH` (1…3) still overrides on iOS/tvOS so the standing-queue ladder
     /// stays reproducible on-device; macOS is pinned to 1, env ignored — a deeper gate only builds
     /// a standing queue (see above). Internal (not private) for unit tests.
-    static func gateDepth(env: String?) -> Int {
+    nonisolated static func gateDepth(env: String?) -> Int {
         #if os(macOS)
         return 1
         #else
@@ -195,7 +196,7 @@ final class SessionPresenter {
     /// keep a 120 ceiling (mandatory, or ProMotion caps the link at 60) with a 24/30 Hz VRR
     /// floor. macOS spans 24…`hz` with VRR on and fixes min = max at `hz` with it off.
     /// Internal (not private) for unit tests.
-    static func frameRateRange(hz: Float, allowVRR: Bool) -> CAFrameRateRange {
+    nonisolated static func frameRateRange(hz: Float, allowVRR: Bool) -> CAFrameRateRange {
         #if os(macOS)
         let minimum = allowVRR ? min(hz, 24) : hz
         return CAFrameRateRange(minimum: minimum, maximum: hz, preferred: hz)
@@ -212,10 +213,8 @@ final class SessionPresenter {
     /// notification; the linear HDR shaders roll highlights onto it.
     private var headroomTimer: Timer?
     #if os(iOS)
-    /// The EDR headroom of the screen the app is on. Main thread.
-    private static var displayHeadroom: CGFloat {
-        MainActor.assumeIsolated { NativeDisplay.screen.currentEDRHeadroom }
-    }
+    /// The EDR headroom of the screen the app is on.
+    private static var displayHeadroom: CGFloat { NativeDisplay.screen.currentEDRHeadroom }
     #endif
     private var panel = PanelInfo(minHz: 0, maxHz: 0)
 
@@ -331,9 +330,7 @@ final class SessionPresenter {
                vsyncPaced: vsyncPaced,
                adaptiveSlotPaced: adaptiveSlotPaced) {
             pipeline.onPresentWedged = { [weak self] in
-                // The presenter lives on main; the hop only carries the reference back there.
-                nonisolated(unsafe) let presenter = self
-                DispatchQueue.main.async { presenter?.rebuildPresentation() }
+                DispatchQueue.main.async { self?.rebuildPresentation() }
             }
             let metal = pipeline.layer
             // Metal pacing overlays the idle video layer. The decoded path leaves the backing
@@ -361,7 +358,7 @@ final class SessionPresenter {
             #if os(iOS)
             pipeline.setDisplayHeadroom(Self.displayHeadroom)
             let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-                self?.stage2?.setDisplayHeadroom(Self.displayHeadroom)
+                MainActor.assumeIsolated { self?.stage2?.setDisplayHeadroom(Self.displayHeadroom) }
             }
             RunLoop.main.add(timer, forMode: .common)
             headroomTimer = timer
@@ -435,7 +432,7 @@ final class SessionPresenter {
     /// No-op before a connection starts and for stage-1 beyond the harmless timing update.
     /// The system scaler's closest match to `fit`, for the AVSampleBufferDisplayLayer paths
     /// (stage 1, tvOS's decoded plane). It does not snap like the placement does.
-    static func gravity(_ fit: VideoFit) -> AVLayerVideoGravity {
+    nonisolated static func gravity(_ fit: VideoFit) -> AVLayerVideoGravity {
         switch fit {
         case .fit: return .resizeAspect
         case .crop: return .resizeAspectFill
@@ -582,7 +579,7 @@ final class SessionPresenter {
         connection = nil
     }
 
-    deinit {
+    isolated deinit {
         // The owning view's stop() normally ran already; this covers a missed teardown so the
         // display link can't keep ticking a deallocated pipeline.
         stage2Link?.invalidate()
