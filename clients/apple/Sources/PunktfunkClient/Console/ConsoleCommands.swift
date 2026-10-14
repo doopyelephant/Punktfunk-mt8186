@@ -14,86 +14,84 @@ extension ConsoleModel {
         else { return }
         for cmd in cmds {
             // A unit variant arrives as a bare string, one with fields as `{"Name": {…}}`.
-            if let name = cmd as? String {
-                switch name {
-                case "CancelWake":
-                    wakeReq = nil
-                    waker.cancel()
-                case "Probe": Task { await store.refreshReachability(discovery: discovery) }
-                case "LoadLicenses": pushLicenses()
-                default: break
-                }
-                continue
-            }
-            guard let cmd = cmd as? [String: Any], let (name, body) = cmd.first else { continue }
-            run(name, body as? [String: Any] ?? [:])
+            let fields = cmd as? [String: Any]
+            guard let name = cmd as? String ?? fields?.keys.first,
+                let command = ConsoleBridge.Command(rawValue: name)
+            else { continue }
+            run(command, fields?[name] as? [String: Any] ?? [:])
         }
     }
 
-    private func run(_ name: String, _ a: [String: Any]) {
-        switch name {
-        case "FetchLibrary":
+    /// No `default`: a command the console gains is a compile error here until it is handled.
+    private func run(_ command: ConsoleBridge.Command, _ a: [String: Any]) {
+        switch command {
+        case .cancelWake:
+            wakeReq = nil
+            waker.cancel()
+        case .probe: Task { await store.refreshReachability(discovery: discovery) }
+        case .loadLicenses: pushLicenses()
+        case .fetchLibrary:
             fetchReq = (a["fp_hex"] as? String ?? "", a["req"] ?? ConsoleJSON.unasked)
             fetchLibrary(
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "", refreshOnly: false)
-        case "RefreshRunning":
+        case .refreshRunning:
             fetchLibrary(
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "", refreshOnly: true)
-        case "Pair":
+        case .pair:
             pair(
                 addr: a["addr"] as? String ?? "", port: port(a["port"]),
                 pin: a["pin"] as? String ?? "", deviceName: a["device_name"] as? String ?? "",
                 req: a["req"] ?? ConsoleJSON.unasked)
-        case "RequestAccess":
+        case .requestAccess:
             requestAccess(
                 addr: a["addr"] as? String ?? "", port: port(a["port"]),
                 fpHex: a["fp_hex"] as? String ?? "",
                 deviceName: a["device_name"] as? String ?? "", req: a["req"] ?? ConsoleJSON.unasked)
-        case "SendLogs":
+        case .sendLogs:
             sendLogs(fp: a["fp_hex"] as? String ?? "", addr: a["addr"] as? String ?? "")
-        case "SaveHost":
+        case .saveHost:
             saveHost(
                 name: a["name"] as? String ?? "", addr: a["addr"] as? String ?? "",
                 port: port(a["port"]))
-        case "UpdateHost":
+        case .updateHost:
             updateHost(
                 key: a["key"] as? String ?? "", name: a["name"] as? String ?? "",
                 addr: a["addr"] as? String ?? "", port: port(a["port"]))
-        case "ForgetHost":
+        case .forgetHost:
             if let host = host(key: a["key"] as? String ?? "") { store.remove(host) }
-        case "SavePreset":
+        case .savePreset:
             savePreset(
                 id: a["id"] as? String ?? "", name: a["name"] as? String ?? "",
                 overrides: a["overrides"] as? [String: Any] ?? [:])
-        case "DeletePreset":
+        case .deletePreset:
             presets.delete(a["id"] as? String ?? "")
-        case "UnpairHost":
+        case .unpairHost:
             if let host = host(key: a["key"] as? String ?? "") { store.forgetIdentity(host) }
-        case "Wake":
+        case .wake:
             let key = a["key"] as? String ?? ""
             wakeReq = (key, a["req"] ?? ConsoleJSON.unasked)
             wake(key: key, thenConnect: a["then_connect"] as? Bool ?? false)
-        case "SetPin":
+        case .setPin:
             if let host = host(key: a["key"] as? String ?? ""),
                 let preset = a["preset_id"] as? String
             {
                 store.setPinned(host.id, presetID: preset, pinned: a["pin"] as? Bool ?? false)
             }
-        case "BindPreset":
+        case .bindPreset:
             bindPreset(
                 key: a["key"] as? String ?? "", game: a["game"] as? String,
                 preset: a["preset_id"] as? String)
-        case "FetchProfiles":
+        case .fetchProfiles:
             fetchProfiles(
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "")
-        case "WakeProfile":
+        case .wakeProfile:
             wakeProfile(
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "", id: a["id"] as? String ?? "")
-        case "SetProfile":
+        case .setProfile:
             if let host = host(key: a["key"] as? String ?? "") {
                 let pick = a["profile"] as? [String: Any]
                 store.setProfile(
@@ -104,38 +102,36 @@ extension ConsoleModel {
                             remember: pick?["remember"] as? Bool ?? false)
                     })
             }
-        case "SetClipboard":
+        case .setClipboard:
             if var host = host(key: a["key"] as? String ?? "") {
                 host.clipboardSync = a["on"] as? Bool ?? false
                 store.update(host)
             }
-        case "EndGame":
+        case .endGame:
             endGame(
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "", appID: a["app_id"] as? String ?? "",
                 title: a["title"] as? String ?? "")
-        case "Install":
+        case .install:
             guard let action = InstallAction(rawValue: a["action"] as? String ?? "") else { return }
             changeInstall(
                 addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "", appID: a["app_id"] as? String ?? "",
                 title: a["title"] as? String ?? "", action: action)
-        case "HostAction":
+        case .hostAction:
             hostAction(
                 fp: a["fp_hex"] as? String ?? "", id: a["action_id"] as? String ?? "",
                 label: a["label"] as? String ?? "")
-        case "PadAction":
+        case .padAction:
             padAction(a["action"] as? String ?? "", key: a["pad_key"] as? String ?? "")
-        case "PadTest":
+        case .padTest:
             padTest(a["on"] as? Bool ?? false)
-        case "PromptAnswer":
+        case .promptAnswer:
             answerPrompt(id: a["id"] as? String ?? "", choice: a["choice"] as? Int)
-        case "SpeedTest":
+        case .speedTest:
             speedTest(
                 key: a["key"] as? String ?? "", addr: a["addr"] as? String ?? "",
                 port: port(a["port"]), fp: a["fp_hex"] as? String ?? "")
-        default:
-            break
         }
     }
 
