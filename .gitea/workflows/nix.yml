@@ -63,7 +63,8 @@
 # ⚠ pull_request is deliberately present. flatpak.yml shipped with push-only triggers and manifest
 # breakage reached main invisibly for weeks — do not "simplify" this workflow by dropping it.
 # ⚠ The two path lists are duplicated on purpose: a YAML anchor would be tidier, but Gitea's
-# workflow parser is not a place to bet on anchor support. Keep them in step by hand.
+# workflow parser is not a place to bet on anchor support. scripts/ci/check-workflow-paths.py
+# fails when they differ, or when a file packaging/nix or flake.nix names is not in them.
 name: nix
 
 # Per event, so a main push cannot cancel the nightly publish mid-build.

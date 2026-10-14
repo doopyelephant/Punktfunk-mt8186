@@ -3,7 +3,8 @@
 # surfaces on the canary. Nothing is built here: syntax, shellcheck, rpmspec, makepkg
 # --printsrcinfo, the payload checker's self-test, each channel's policy against its matrix and
 # the Steam Deck rebuild check on a stub box. scripts/ci/check-workflow-paths.py fails CI when
-# the paths below stop covering what the lane lints.
+# the paths below stop covering what the lane lints, and holds every workflow's path lists to
+# the files its package recipes name.
 name: packaging-lint
 
 on:
@@ -11,11 +12,8 @@ on:
     paths:
       - 'packaging/**'
       - 'scripts/**'
-      - '.gitea/workflows/packaging-lint.yml'
-      - '.gitea/workflows/deb.yml'
-      - '.gitea/workflows/rpm.yml'
-      - '.gitea/workflows/arch.yml'
-      - '.gitea/workflows/flatpak.yml'
+      - 'flake.nix'
+      - '.gitea/workflows/**'
   workflow_dispatch:
 
 jobs:
@@ -57,7 +55,7 @@ jobs:
       - name: Steam Deck rebuild check
         run: bash scripts/ci/check-steamdeck-rebuild.sh
 
-      - name: Trigger paths cover the lane
+      - name: Workflow path lists
         run: python3 scripts/ci/check-workflow-paths.py --lanes
 
   rpmspec:
