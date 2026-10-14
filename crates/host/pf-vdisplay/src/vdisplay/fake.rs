@@ -7,6 +7,7 @@
 //!
 //! Setters log and change nothing: only [`FakeDisplay::script`] changes an answer. Clones
 //! share one log and one script, so box one for the code under test and keep the other.
+//! `take_undo_seqs` answers empty and is not logged: it would only pad every acquire.
 //!
 //! Pin the contract with the tests below.
 
@@ -34,6 +35,7 @@ pub(crate) enum Call {
     SetHwCursor(bool),
     ApplyPosition(i32, i32),
     TakeTopologyRestore,
+    Undo(crate::topology_journal::Undo),
     SetFirstInGroup(bool),
     KeptDisplayAlive(u32),
     ResizeKept(Option<String>, Mode),
@@ -57,6 +59,8 @@ pub(crate) struct Script {
     pub(crate) poolable: bool,
     /// A successful create prepares a topology restore for `take_topology_restore`.
     pub(crate) restore: bool,
+    /// `undo` of exactly this fails; every other undo succeeds.
+    pub(crate) fail_undo: Option<crate::topology_journal::Undo>,
     /// `isolation_key`.
     pub(crate) isolation: Option<String>,
     /// `sole_instance`.
@@ -107,6 +111,7 @@ impl FakeDisplay {
                     ownership: DisplayOwnership::Owned,
                     poolable: true,
                     restore: false,
+                    fail_undo: None,
                     isolation: None,
                     sole_instance: false,
                     alive: true,
@@ -257,6 +262,15 @@ impl VirtualDisplay for FakeDisplay {
         let mut s = self.shared();
         s.calls.push(Call::TakeTopologyRestore);
         s.restore.take()
+    }
+
+    fn undo(&mut self, undo: &crate::topology_journal::Undo) -> Result<()> {
+        let mut s = self.shared();
+        s.calls.push(Call::Undo(undo.clone()));
+        if s.script.fail_undo.as_ref() == Some(undo) {
+            anyhow::bail!("scripted to fail");
+        }
+        Ok(())
     }
 
     fn set_first_in_group(&mut self, first: bool) {

@@ -348,6 +348,10 @@ mod pool {
         /// disabled. At most one entry per group holds it; teardown hands it to
         /// a sibling, and it runs only when the last member drops.
         pub(super) topology_restore: Option<Restore>,
+        /// Journal seqs of the undos this display's create pushed
+        /// ([`crate::topology_journal`]). A hand-off appends, so the group keeps every
+        /// member's; they run, newest first, when the last member drops.
+        pub(super) undo_seqs: Vec<u64>,
         /// Isolation identity at create (`design/gamescope-multiuser.md`). Reuse
         /// requires an exact match (EIS path + Pulse sinks baked into env).
         /// `None` = not isolated.
@@ -555,15 +559,45 @@ mod pool {
     ) -> Option<Restore> {
         let action = restore?;
         // At most one restore per group, so any surviving sibling has `None`.
-        match remaining
-            .iter_mut()
-            .find(|e| in_group(e.backend, e.generation, backend, generation, None))
-        {
+        match heir(remaining, backend, generation) {
             Some(sibling) => {
                 sibling.topology_restore = Some(action);
                 None
             }
             None => Some(action), // group empty: caller runs it now
+        }
+    }
+
+    /// The member that inherits what a departing display held: any sibling of its
+    /// [group](in_group) still in `remaining`, or none when the group is empty.
+    fn heir<'a>(
+        remaining: &'a mut [Entry],
+        backend: &'static str,
+        generation: u64,
+    ) -> Option<&'a mut Entry> {
+        remaining
+            .iter_mut()
+            .find(|e| in_group(e.backend, e.generation, backend, generation, None))
+    }
+
+    /// Move a departing display's journal seqs onto a same-[group](in_group) sibling, or
+    /// return them if the group is empty so the caller runs them before dropping the
+    /// keepalive. Appends, unlike [`hand_off_restore`]: every member's undo survives.
+    pub(super) fn hand_off_undo(
+        remaining: &mut [Entry],
+        backend: &'static str,
+        generation: u64,
+        seqs: Vec<u64>,
+    ) -> Vec<u64> {
+        if seqs.is_empty() {
+            return seqs;
+        }
+        match heir(remaining, backend, generation) {
+            Some(sibling) => {
+                sibling.undo_seqs.extend(seqs);
+                Vec::new()
+            }
+            None => seqs,
         }
     }
 
@@ -652,6 +686,8 @@ mod pool {
     pub(super) struct Drained {
         pub(super) entries: Vec<Entry>,
         pub(super) restores: Vec<Restore>,
+        /// Each emptied group's journal seqs, by backend.
+        pub(super) undos: Vec<(&'static str, Vec<u64>)>,
     }
 
     /// Remove every entry `pred` selects. Each removal [hands its restore
@@ -664,6 +700,7 @@ mod pool {
         let mut out = Drained {
             entries: Vec::new(),
             restores: Vec::new(),
+            undos: Vec::new(),
         };
         let mut i = 0;
         while i < entries.len() {
@@ -674,6 +711,15 @@ mod pool {
                     hand_off_restore(entries, backend, generation, e.topology_restore.take())
                 {
                     out.restores.push(r);
+                }
+                let seqs = hand_off_undo(
+                    entries,
+                    backend,
+                    generation,
+                    std::mem::take(&mut e.undo_seqs),
+                );
+                if !seqs.is_empty() {
+                    out.undos.push((backend, seqs));
                 }
                 out.entries.push(e);
             } else {
@@ -841,6 +887,7 @@ mod pool {
                 backend,
                 identity_slot: None,
                 topology_restore: restore,
+                undo_seqs: Vec::new(),
                 isolation: None,
                 seat: None,
                 pid: None,
@@ -1005,6 +1052,26 @@ mod pool {
             hand_off_restore(&mut pool, "kwin", 2, e2.topology_restore.take())
                 .expect("last member → run")();
             assert!(ran.load(Ordering::SeqCst));
+        }
+
+        /// Journal seqs float like a restore, but every member's survive the hand-off: a group
+        /// in which two creates each disabled heads re-enables both sets at the end.
+        #[test]
+        fn journal_seqs_float_to_a_sibling_and_every_members_survive() {
+            let mut pool = vec![test_entry("wlroots", 2, None)];
+            pool[0].undo_seqs = vec![3];
+            assert!(hand_off_undo(&mut pool, "wlroots", 1, vec![1, 2]).is_empty());
+            assert_eq!(pool[0].undo_seqs, [3, 1, 2]);
+            let mut last = pool.pop().expect("the heir");
+            assert_eq!(
+                hand_off_undo(&mut pool, "wlroots", 2, std::mem::take(&mut last.undo_seqs)),
+                [3, 1, 2],
+                "group empty: the caller runs them"
+            );
+            assert!(hand_off_undo(&mut pool, "wlroots", 2, Vec::new()).is_empty());
+            let mut other = vec![test_entry("kwin", 5, None)];
+            assert_eq!(hand_off_undo(&mut other, "wlroots", 1, vec![9]), [9]);
+            assert!(other[0].undo_seqs.is_empty(), "never across backends");
         }
 
         #[test]
@@ -1449,9 +1516,10 @@ mod linux {
 
     use super::pool::{
         assemble_displays, assign_group_ids, budget_count, drain_where, group_key,
-        hand_off_restore, in_group, is_seat_game_mode, join_target, kept_to_evict, kept_to_retire,
-        kept_verdict, park_mode_for, position_for_new, release_linger, reuse_keys_match, slot_key,
-        slot_state, take_expired, Drained, Entry, Held, Kept, Row, Slot,
+        hand_off_restore, hand_off_undo, in_group, is_seat_game_mode, join_target, kept_to_evict,
+        kept_to_retire, kept_verdict, park_mode_for, position_for_new, release_linger,
+        reuse_keys_match, slot_key, slot_state, take_expired, Drained, Entry, Held, Kept, Row,
+        Slot,
     };
     use super::DisplayInfo;
     use crate::lifecycle::{self, Release};
@@ -1658,6 +1726,9 @@ mod linux {
             for restore in self.restores {
                 restore();
             }
+            for (backend, seqs) in &self.undos {
+                run_undo(backend, seqs);
+            }
             let n = self.entries.len();
             for e in self.entries {
                 tracing::info!(backend = e.backend, "virtual display: {why}");
@@ -1665,6 +1736,23 @@ mod linux {
             }
             emit_released(n);
             n
+        }
+    }
+
+    /// Run an emptied group's journaled undos through a fresh backend of its kind, before its
+    /// output drops. No backend to open (the compositor is gone) leaves them in the journal
+    /// for a later reclaim.
+    fn run_undo(backend: &'static str, seqs: &[u64]) {
+        if seqs.is_empty() {
+            return;
+        }
+        match crate::backend_by_id(backend) {
+            Some(mut b) => crate::topology_journal::apply(seqs, &mut *b),
+            None => tracing::warn!(
+                backend,
+                ?seqs,
+                "topology undo deferred — no backend to run it; the journal keeps it"
+            ),
         }
     }
 
@@ -2006,6 +2094,7 @@ mod linux {
         // Group restore: run once when the last member drops, not at this
         // session's teardown. `None` for non-exclusive / non-first / auto-revert.
         let topology_restore = vd.take_topology_restore();
+        let undo_seqs = vd.take_undo_seqs();
         let mut life = lifecycle::State::default();
         life.acquire(); // Idle → Active{refs:1} (Acquire::Create)
         let entry = Entry {
@@ -2020,6 +2109,7 @@ mod linux {
             backend,
             identity_slot,
             topology_restore,
+            undo_seqs,
             isolation,
             seat: real.seat.clone(),
             pid: real.pid,
@@ -2178,6 +2268,7 @@ mod linux {
     /// Torn-down keepalive drops after the lock is released.
     fn release(generation: u64, force_immediate: bool) {
         let Some(r) = REG.get() else { return };
+        let mut undo = Vec::new();
         let (torn_down, restore) = {
             let mut es = r.entries.lock().unwrap();
             let Some(idx) = es.iter().position(|e| e.generation == generation) else {
@@ -2197,6 +2288,7 @@ mod linux {
                     let mut e = es.remove(idx);
                     let (backend, g) = (e.backend, e.generation);
                     let restore = hand_off_restore(&mut es, backend, g, e.topology_restore.take());
+                    undo = hand_off_undo(&mut es, backend, g, std::mem::take(&mut e.undo_seqs));
                     (Some(e), restore)
                 }
                 // No live hold: do nothing. Do not treat this as Teardown — a
@@ -2235,6 +2327,9 @@ mod linux {
         // Restore physicals (group emptied) before dropping the output, outside the lock.
         if let Some(restore) = restore {
             restore();
+        }
+        if let Some(e) = &torn_down {
+            run_undo(e.backend, &undo);
         }
         if let Some(e) = torn_down {
             if force_immediate {
@@ -2391,7 +2486,7 @@ mod linux {
     /// outside the lock. Idempotent (already gone → no-op).
     pub(super) fn mark_failed(generation: u64) {
         let Some(r) = REG.get() else { return };
-        let (torn, restore) = {
+        let (torn, restore, undo) = {
             let mut es = r.entries.lock().unwrap();
             let Some(idx) = es.iter().position(|e| e.generation == generation) else {
                 return; // already gone — the subsequent stale-generation lease drop no-ops too
@@ -2403,11 +2498,13 @@ mod linux {
             let mut e = es.remove(idx);
             let (backend, g) = (e.backend, e.generation);
             let restore = hand_off_restore(&mut es, backend, g, e.topology_restore.take());
-            (e, restore)
+            let undo = hand_off_undo(&mut es, backend, g, std::mem::take(&mut e.undo_seqs));
+            (e, restore, undo)
         };
         if let Some(rst) = restore {
             rst(); // outside the lock, before the keepalive drops
         }
+        run_undo(torn.backend, &undo);
         tracing::warn!(
             backend = torn.backend,
             "virtual display: reused kept display was dead on first frame — torn down (A2 mark_failed)"

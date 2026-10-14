@@ -599,6 +599,17 @@ pub fn restore_takeover_on_startup() {
 #[cfg(not(target_os = "linux"))]
 pub fn restore_takeover_on_startup() {}
 
+/// Take back the desk changes a dead host journaled ([`crate::topology_journal`]). Call at
+/// `serve` startup beside [`restore_takeover_on_startup`], and when a compositor instance
+/// appears. No-op with nothing journaled.
+#[cfg(target_os = "linux")]
+pub fn reclaim_topology_journal() {
+    crate::topology_journal::reclaim(&crate::backend_by_id);
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn reclaim_topology_journal() {}
+
 /// Warn once at startup when this box will need managed takeover but the user
 /// is not in the `punktfunk` group the helper gates on — the one prerequisite
 /// that fails silently mid-stream. Gated so a box that never attempts takeover

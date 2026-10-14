@@ -48,9 +48,14 @@ pub use backend::SessionCastParts;
 pub use backend::{
     DisplayOwnership, SessionIsolation, SessionParams, VirtualDisplay, VirtualOutput,
 };
+/// What a backend changed on the desk, journaled before the step so teardown — or the next
+/// host, after a crash — takes it back ([`VirtualDisplay::undo`]).
+#[path = "vdisplay/topology_journal.rs"]
+pub(crate) mod topology_journal;
 /// Negotiated ScreenCast cursor mode of a portal-backed output
 /// ([`VirtualDisplay::last_portal_cursor_mode`]). The verdict is the caller's.
 pub use portal_cursor::Mode as PortalCursorMode;
+pub use topology_journal::Undo;
 
 /// A [`VirtualDisplay`] that records its calls and plays a script, for tests.
 #[cfg(test)]
@@ -84,10 +89,10 @@ pub use toplevels::{
 pub(crate) mod routing;
 pub use routing::{
     cancel_pending_tv_restore, input_backend_id, managed_session_available,
-    preflight_takeover_privilege, release_autologin_mask, resolve_gamescope_route,
-    restore_managed_session, restore_takeover_now, restore_takeover_on_startup,
-    start_restore_worker, takeover_privilege_verdict, wants_dedicated_game_session, GamescopeRoute,
-    TakeoverInapplicable, TakeoverVerdict,
+    preflight_takeover_privilege, reclaim_topology_journal, release_autologin_mask,
+    resolve_gamescope_route, restore_managed_session, restore_takeover_now,
+    restore_takeover_on_startup, start_restore_worker, takeover_privilege_verdict,
+    wants_dedicated_game_session, GamescopeRoute, TakeoverInapplicable, TakeoverVerdict,
 };
 #[cfg(target_os = "linux")]
 pub use routing::{
@@ -435,16 +440,7 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     }
     #[cfg(target_os = "linux")]
     {
-        match compositor {
-            Compositor::Kwin => Ok(Box::new(kwin::KwinDisplay::new()?)),
-            Compositor::Gamescope => Ok(Box::new(gamescope::GamescopeDisplay::new()?)),
-            Compositor::Mutter => Ok(Box::new(mutter::MutterDisplay::new()?)),
-            Compositor::Wlroots => Ok(Box::new(wlroots::WlrootsDisplay::new()?)),
-            Compositor::Hyprland => Ok(Box::new(hyprland::HyprlandDisplay::new()?)),
-            Compositor::Windows => {
-                anyhow::bail!("the Windows virtual display needs a Windows host")
-            }
-        }
+        backend(compositor)
     }
     #[cfg(target_os = "windows")]
     if let Some(connector) = capture_monitor() {
@@ -477,6 +473,35 @@ pub fn open(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
     {
         let _ = compositor;
         anyhow::bail!("virtual displays require Linux or Windows")
+    }
+}
+
+/// The virtual-display backend of `compositor` itself, pin or no pin.
+#[cfg(target_os = "linux")]
+fn backend(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
+    match compositor {
+        Compositor::Kwin => Ok(Box::new(kwin::KwinDisplay::new()?)),
+        Compositor::Gamescope => Ok(Box::new(gamescope::GamescopeDisplay::new()?)),
+        Compositor::Mutter => Ok(Box::new(mutter::MutterDisplay::new()?)),
+        Compositor::Wlroots => Ok(Box::new(wlroots::WlrootsDisplay::new()?)),
+        Compositor::Hyprland => Ok(Box::new(hyprland::HyprlandDisplay::new()?)),
+        Compositor::Windows => {
+            anyhow::bail!("the Windows virtual display needs a Windows host")
+        }
+    }
+}
+
+/// [`backend`] by its [`Compositor::id`], for a journal entry that names one. `None` for a name
+/// this host has no backend for, or one that does not open now.
+#[cfg(target_os = "linux")]
+pub(crate) fn backend_by_id(id: &str) -> Option<Box<dyn VirtualDisplay>> {
+    let compositor = Compositor::all().into_iter().find(|c| c.id() == id)?;
+    match backend(compositor) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::debug!(id, error = %format!("{e:#}"), "backend not opened for an undo");
+            None
+        }
     }
 }
 

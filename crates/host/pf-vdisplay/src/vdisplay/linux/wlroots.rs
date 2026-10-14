@@ -13,6 +13,8 @@
 //!    ([`restore_chooser_on_shutdown`]); the portal restarts on each change.
 //! 4. Teardown is ordered: drop closes the ScreenCast session and waits for the portal
 //!    to confirm, then `swaymsg output <NAME> unplug` (sway ≥1.8). See [`Keepalive`].
+//! 5. The output, and the heads `exclusive` disables, are journaled before the step
+//!    ([`crate::topology_journal`]): a host that dies leaves them for the next one.
 //!
 //! Requirements: `SWAYSOCK` inherited or discovered per child ([`swaymsg_command`]),
 //! portal env via `scripts/headless/prepare-session.sh`, ScreenCast routed to xdpw
@@ -21,6 +23,7 @@
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
 use crate::monitors::DISABLE_BUDGET;
 use crate::portal_cast::StopGuard;
+use crate::topology_journal::{self as journal, Head, Undo};
 use anyhow::{anyhow, bail, Context, Result};
 use std::os::fd::OwnedFd;
 use std::process::Command;
@@ -89,13 +92,11 @@ pub struct WlrootsDisplay {
     /// Last portal-negotiated cursor mode. The host must read this rather than infer
     /// overlay absence from `hw_cursor`.
     last_cursor_mode: Option<crate::portal_cursor::Mode>,
-    /// Restore for heads the last `create` disabled (`exclusive`). Written only through
-    /// [`stash_topology_restore`](crate::backend::stash_topology_restore) — first-wins:
-    /// one instance serves the host retry loop and only attempt 1 finds heads to disable.
-    ///
-    /// The registry takes it after a pooled `create` and runs it when the group empties.
-    /// [`Drop`] is the backstop for a create that never reached the pool.
-    pending_restore: Option<Box<dyn FnOnce() + Send>>,
+    /// Journal seqs of the heads `exclusive` disabled, across every `create` of this instance:
+    /// one instance serves the host retry loop, and only attempt 1 finds heads to disable.
+    /// The registry takes them after a pooled `create` and runs them when the group empties;
+    /// [`Drop`] runs what a create that never reached the pool left.
+    pending_undo: Vec<u64>,
     /// ScreenCast from the `create` that just ran, until
     /// [`session_cast_for`](VirtualDisplay::session_cast_for) hands it to the session. The
     /// pooled output never holds the portal fd.
@@ -117,9 +118,8 @@ struct PendingCast {
 
 impl Drop for WlrootsDisplay {
     fn drop(&mut self) {
-        if let Some(restore) = self.pending_restore.take() {
-            restore();
-        }
+        let seqs = std::mem::take(&mut self.pending_undo);
+        journal::apply(&seqs, self);
     }
 }
 
@@ -129,7 +129,7 @@ impl WlrootsDisplay {
             client_fp: None,
             hw_cursor: false,
             last_cursor_mode: None,
-            pending_restore: None,
+            pending_undo: Vec::new(),
             pending_cast: None,
             handoff_cast: false,
             join_live: false,
@@ -177,8 +177,38 @@ impl VirtualDisplay for WlrootsDisplay {
         self.last_cursor_mode
     }
 
-    fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
-        self.pending_restore.take()
+    fn take_undo_seqs(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pending_undo)
+    }
+
+    /// Heads come back through `enable`. The output goes only if this sway named it: another
+    /// instance's `HEADLESS-N` may be the box's only screen.
+    fn undo(&mut self, undo: &Undo) -> Result<()> {
+        match undo {
+            Undo::EnableHeads { heads } => {
+                let names: Vec<String> = heads.iter().map(|h| h.name.clone()).collect();
+                let dark = restore_heads(&names);
+                if dark.is_empty() {
+                    return Ok(());
+                }
+                bail!(
+                    "{} still inactive; `swaymsg output <name> enable` puts it back",
+                    dark.join(", ")
+                )
+            }
+            Undo::RemoveOutput { name, instance } => {
+                if instance.is_empty() || *instance != sway_instance() {
+                    tracing::info!(
+                        output = %name,
+                        "wlroots: a dead host's headless output belongs to another sway — left alone"
+                    );
+                    return Ok(());
+                }
+                swaymsg(&["output", name, "unplug"])
+                    .map(|_| ())
+                    .with_context(|| format!("swaymsg output {name} unplug"))
+            }
+        }
     }
 
     fn set_session_cast_handoff(&mut self, enabled: bool) {
@@ -232,7 +262,18 @@ impl VirtualDisplay for WlrootsDisplay {
                 .context("swaymsg create_output (sway needs the headless backend loaded)")?;
             // Own it from here so error unwind unplugs it; the output is usually already listed.
             match wait_new_output(&before, Duration::from_secs(5)) {
-                Ok(name) => OutputGuard(name),
+                Ok(name) => {
+                    // Journaled the moment sway names it: the one step that cannot be written
+                    // ahead of itself.
+                    let seq = journal::push(
+                        "wlroots",
+                        Undo::RemoveOutput {
+                            name: name.clone(),
+                            instance: sway_instance(),
+                        },
+                    );
+                    OutputGuard { name, seq }
+                }
                 Err(e) => {
                     // create_output succeeded; an unidentified HEADLESS-* would stay in the layout.
                     unplug_strays(&before);
@@ -240,7 +281,7 @@ impl VirtualDisplay for WlrootsDisplay {
                 }
             }
         };
-        let name = output.0.clone();
+        let name = output.name.clone();
 
         // Client mode is also the refresh clock; without it the output produces no frames.
         let m = format!(
@@ -269,15 +310,10 @@ impl VirtualDisplay for WlrootsDisplay {
             cursor = cursor_mode.name(),
             "sway headless output ready"
         );
-        // Last: no failure path unwinds past the restore hand-off.
-        crate::backend::apply_exclusive(
-            "wlroots",
-            self.client_fp,
-            &name,
-            &mut self.pending_restore,
-            disable_other_heads,
-            restore_heads,
-        );
+        // Last: nothing fails after this, so no path darkens heads and then unwinds.
+        if crate::backend::exclusive_wanted("wlroots", self.client_fp) {
+            disable_other_heads(&name, &mut self.pending_undo);
+        }
         // The registry pools the output and hands the cast to the session; a direct
         // caller keeps both.
         let (remote_fd, keepalive): (Option<OwnedFd>, Box<dyn Send>) = if self.handoff_cast {
@@ -577,12 +613,11 @@ fn workspace_argv(n: &str) -> [&str; 3] {
 }
 
 /// Disable the heads an `exclusive` session darkens ([`crate::monitors::disable_for_exclusive`]),
-/// returning the ones [`restore_heads`] re-enables. `keep_monitors` stays lit.
-///
-/// `managed` is [`is_managed_output`], so a concurrent session's output is never blacked out.
-/// The prefix is blunt: sway's own bootstrap `HEADLESS-1` is spared too. Leaving a headless
-/// box's only screen lit is the cheaper failure.
-fn disable_other_heads(ours: &str) -> Vec<String> {
+/// with the plan journaled onto `pending` before the first goes dark: a planned head that
+/// refused is lit, so its undo is a no-op. `keep_monitors` stays lit. `managed` is
+/// [`is_managed_output`], so a concurrent session's output is never blacked out; the prefix is
+/// blunt and spares sway's own bootstrap `HEADLESS-1` too — a headless box's only screen.
+fn disable_other_heads(ours: &str, pending: &mut Vec<u64>) {
     let keep = crate::policy::prefs().get().keep_monitors;
     crate::monitors::disable_for_exclusive(
         "wlroots",
@@ -591,7 +626,23 @@ fn disable_other_heads(ours: &str) -> Vec<String> {
         &keep,
         disable_head,
         focus_output,
-    )
+        |plan| {
+            let heads = plan
+                .iter()
+                .map(|n| Head {
+                    name: n.clone(),
+                    mode: None,
+                })
+                .collect();
+            pending.push(journal::push("wlroots", Undo::EnableHeads { heads }));
+        },
+    );
+}
+
+/// The sway `swaymsg` talks to, as its socket path: what a journal entry records as its
+/// `instance`. Empty when none is known, which an undo reads as "not this one".
+fn sway_instance() -> String {
+    crate::session::sway_socket().unwrap_or_default()
 }
 
 /// `swaymsg output <name> disable`, then read back. A bad command already fails
@@ -671,11 +722,11 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
     Ok(None)
 }
 
-/// Re-enable heads `exclusive` disabled. The registry runs this when the group's
-/// last member tears down, and **before** that member's output is unplugged — sway
-/// must not see zero enabled outputs. `enable` is the inverse of `disable`
-/// (Hyprland needs `hyprctl reload`). A miss logs the hand command.
-fn restore_heads(disabled: &[String]) {
+/// Re-enable heads `exclusive` disabled, **before** the output they made way for is unplugged:
+/// sway must not see zero enabled outputs. `enable` is the inverse of `disable` (Hyprland needs
+/// `hyprctl reload`). Returns the heads still inactive, each logged with the hand command.
+fn restore_heads(disabled: &[String]) -> Vec<String> {
+    let mut dark = Vec::new();
     for name in disabled {
         match swaymsg(&enable_argv(name)) {
             Ok(_) => {
@@ -687,24 +738,39 @@ fn restore_heads(disabled: &[String]) {
                         "wlroots: `output enable` was accepted but the output is still inactive — \
                          re-enable it by hand with `swaymsg output {name} enable`"
                     );
+                    dark.push(name.clone());
                 }
             }
-            Err(e) => tracing::error!(
-                output = %name, error = %format!("{e:#}"),
-                "wlroots: could not re-enable this output — it is still dark. Run \
-                 `swaymsg output {name} enable` by hand."
-            ),
+            Err(e) => {
+                tracing::error!(
+                    output = %name, error = %format!("{e:#}"),
+                    "wlroots: could not re-enable this output — it is still dark. Run \
+                     `swaymsg output {name} enable` by hand."
+                );
+                dark.push(name.clone());
+            }
         }
     }
+    dark
 }
 
-struct OutputGuard(String);
+/// The headless output of one `create`, unplugged on drop. `seq` is its journal entry: the
+/// unplug settles it, and a refused one leaves it for the next host's reclaim.
+struct OutputGuard {
+    name: String,
+    seq: u64,
+}
 
 impl Drop for OutputGuard {
     fn drop(&mut self) {
-        match swaymsg(&["output", &self.0, "unplug"]) {
-            Ok(_) => tracing::info!(output = %self.0, "sway headless output unplugged"),
-            Err(e) => tracing::warn!(output = %self.0, error = %format!("{e:#}"), "unplug failed"),
+        match swaymsg(&["output", &self.name, "unplug"]) {
+            Ok(_) => {
+                journal::done(self.seq);
+                tracing::info!(output = %self.name, "sway headless output unplugged");
+            }
+            Err(e) => {
+                tracing::warn!(output = %self.name, error = %format!("{e:#}"), "unplug failed")
+            }
         }
     }
 }
@@ -1176,5 +1242,26 @@ mod tests {
     fn exclusive_on_a_headless_box_disables_nothing() {
         let ours = "HEADLESS-1";
         assert!(crate::monitors::heads_to_darken(&[head(ours, true)], ours, &[]).is_empty());
+    }
+
+    /// A dead host's output is unplugged only on the sway that named it. With no match the
+    /// entry is settled and nothing runs: no `swaymsg` here, and none is needed.
+    #[test]
+    fn an_output_of_another_sway_instance_is_left_alone() {
+        let mut vd = WlrootsDisplay::new().expect("stateless");
+        let other = Undo::RemoveOutput {
+            name: "HEADLESS-1".into(),
+            instance: "/run/user/1000/sway-ipc.1000.1.sock".into(),
+        };
+        assert!(vd.undo(&other).is_ok());
+        let unknown = Undo::RemoveOutput {
+            name: "HEADLESS-1".into(),
+            instance: String::new(),
+        };
+        assert!(vd.undo(&unknown).is_ok());
+        assert!(
+            vd.take_undo_seqs().is_empty(),
+            "nothing journaled by an undo"
+        );
     }
 }

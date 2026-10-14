@@ -1122,6 +1122,8 @@ fn disable_other_heads(ours: &str) -> Vec<String> {
         &keep,
         disable_head,
         focus_output,
+        // Not journaled: the restore closure still covers Hyprland.
+        |_| {},
     )
 }
 

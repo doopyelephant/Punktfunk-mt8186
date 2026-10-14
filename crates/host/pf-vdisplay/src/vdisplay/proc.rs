@@ -224,11 +224,34 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| stat_alive(&stat))
 }
 
-/// The parent of `pid`, from `/proc/<pid>/stat`. `None` once it is gone.
+/// The parent of `pid` (`stat` field 4). `None` once it is gone.
 #[cfg(target_os = "linux")]
 pub(crate) fn ppid(pid: u32) -> Option<u32> {
+    stat_field(pid, 4)
+}
+
+/// When `pid` started, in clock ticks since boot (`stat` field 22). With the pid it names one
+/// process: a recycled pid starts at another tick.
+#[cfg(target_os = "linux")]
+pub(crate) fn start_ticks(pid: u32) -> Option<u64> {
+    stat_field(pid, 22)
+}
+
+/// Field `n` of `/proc/<pid>/stat`, 1-based as `proc(5)` numbers them, parsed. `None` once the
+/// process is gone or the field does not parse.
+#[cfg(target_os = "linux")]
+fn stat_field<T: std::str::FromStr>(pid: u32, n: usize) -> Option<T> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat_fields(&stat)?.nth(1)?.parse().ok()
+    // `stat_fields` starts at field 3, the state letter.
+    stat_fields(&stat)?.nth(n - 3)?.parse().ok()
+}
+
+/// This boot's `/proc/sys/kernel/random/boot_id`, trimmed. Empty when unreadable.
+#[cfg(target_os = "linux")]
+pub(crate) fn boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// The `/proc/<pid>/stat` fields after `comm`, from the state letter on. `comm` is
