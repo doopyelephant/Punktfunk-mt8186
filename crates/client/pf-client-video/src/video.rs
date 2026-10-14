@@ -760,7 +760,7 @@ fn log_rung(active: &dyn Rung, wire: u8) {
 }
 
 /// Say why the walk passes a rung over, when it gets there.
-fn log_note(note: Note, wire: u8, vk: Option<&VulkanDecodeDevice>) {
+fn log_note(note: Note, choice: &str, wire: u8, vk: Option<&VulkanDecodeDevice>) {
     let codec = wire_codec_name(wire);
     match note {
         // The gate is an AND of three; name all three. `video_decode=true`
@@ -790,6 +790,11 @@ fn log_note(note: Note, wire: u8, vk: Option<&VulkanDecodeDevice>) {
         Note::SoftwareOnly => tracing::info!(
             "software decode by preference (Settings decoder / PUNKTFUNK_DECODER) — \
              hardware decode not attempted"
+        ),
+        // A typo would otherwise decode as `auto` in silence.
+        Note::UnknownPreference => tracing::warn!(
+            preference = choice,
+            "unknown decoder preference read as auto"
         ),
     }
 }
@@ -847,7 +852,7 @@ impl Decoder {
             let rung = match step {
                 Step::Try(rung) | Step::Pin(rung) => rung,
                 Step::Note(note) => {
-                    log_note(note, wire, vk);
+                    log_note(note, &choice, wire, vk);
                     continue;
                 }
             };

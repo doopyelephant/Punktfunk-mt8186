@@ -11,7 +11,7 @@
 //! walks a real `Decoder` with no decoder behind it.
 
 use crate::video::{native_rung_admitted, native_vulkan_usable, NativeRung, VulkanDecodeDevice};
-use crate::video_caps::{v4l2_auto_ok, vaapi_auto_ok};
+use crate::video_caps::{is_auto, v4l2_auto_ok, vaapi_auto_ok};
 
 /// The OS a ladder is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +78,8 @@ pub(crate) enum Note {
     VaapiGated,
     /// A `software` preference: no hardware rung is tried.
     SoftwareOnly,
+    /// A value that is no pin, `auto` or `software` here: it reads as `auto`.
+    UnknownPreference,
 }
 
 /// The steps `Decoder::new` walks for `choice`, the resolved preference.
@@ -99,6 +101,7 @@ pub(crate) fn ladder(os: Os, choice: &str, wire: u8, vk: Option<&VulkanDecodeDev
     match pin {
         Some(NativeRung::Vulkan) if !usable => steps.push(Step::Note(Note::VulkanPinRefused)),
         Some(rung) => steps.push(Step::Pin(rung)),
+        None if !is_auto(choice) => steps.push(Step::Note(Note::UnknownPreference)),
         None => {}
     }
     // A pin is its rung's one try: the walk after it never names that rung.
@@ -538,6 +541,10 @@ pub(crate) mod tests {
         assert_eq!(
             walk("windows nvidia all yes h264 software"),
             [Step::Note(Note::SoftwareOnly)]
+        );
+        assert_eq!(
+            walk("linux amd all yes h264 something-else")[0],
+            Step::Note(Note::UnknownPreference)
         );
     }
 }
