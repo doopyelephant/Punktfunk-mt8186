@@ -10,6 +10,7 @@
 use crate::deeplink::{DeepLink, HostResolution, Route};
 use crate::presets::{PresetsFile, Resolution, StreamPreset};
 use crate::session::{Dial, Probes, SessionParams};
+use crate::settings::GamepadUi;
 use crate::trust::{KnownHost, KnownHosts, Settings};
 use serde::{Deserialize, Serialize};
 use std::process::{Child, Command, Stdio};
@@ -1161,6 +1162,13 @@ pub fn browse_command(fullscreen: bool, until_no_pads: bool) -> Command {
     cmd
 }
 
+/// Whether Controller-optimized UI opens the console on this poll: on the first controller
+/// and never on a later one, so a console the player quit stays closed until every
+/// controller has gone and one comes back. Always opens it once, at launch.
+pub fn console_opens(ui: GamepadUi, prev: usize, now: usize) -> bool {
+    ui == GamepadUi::WithController && prev == 0 && now > 0
+}
+
 /// Spawns the session for `plan` and supervises it. See [`spawn_child`].
 pub fn spawn_session(
     plan: &ConnectPlan,
@@ -1837,6 +1845,16 @@ mod tests {
             args(browse_command(true, true))[2..],
             ["--fullscreen", "--until-no-controller"]
         );
+    }
+
+    #[test]
+    fn the_console_opens_on_the_first_controller_only() {
+        assert!(console_opens(GamepadUi::WithController, 0, 1));
+        assert!(!console_opens(GamepadUi::WithController, 1, 2));
+        assert!(!console_opens(GamepadUi::WithController, 2, 1));
+        assert!(!console_opens(GamepadUi::WithController, 1, 0));
+        assert!(!console_opens(GamepadUi::Off, 0, 1));
+        assert!(!console_opens(GamepadUi::Always, 0, 1));
     }
 
     #[test]
