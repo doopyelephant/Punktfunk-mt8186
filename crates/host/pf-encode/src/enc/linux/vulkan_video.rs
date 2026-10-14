@@ -21,7 +21,9 @@ use super::vk_util::{
     imported_release_barrier, make_host_buffer, make_plain_image, make_view, normalize_cpu_rgb,
     pixel_to_vk, reject_dmabuf, ImportCache,
 };
-use crate::rfi::Wave;
+use crate::rfi::{
+    plan_frame, FramePlan, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, Wave,
+};
 use crate::{Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, ensure, Context, Result};
 use ash::vk;
@@ -1990,6 +1992,24 @@ impl VulkanVideoEncoder {
         Ok(self.frames[slot].cpu_img.unwrap().0.view)
     }
 
+    /// How this session recovers. It places each stripe and owns the dirty state, so a loss
+    /// mid-wave restarts the sweep and an anchor or a confirmed reference abandons it.
+    fn recovery_policy(&self) -> RecoveryPolicy {
+        RecoveryPolicy {
+            // RADV's stripe unit is the 64-px CTB row for HEVC and AV1.
+            cycle: self.intra_refresh.map(|ir| {
+                crate::rfi::wave_cycle(
+                    self.height.div_ceil(64),
+                    self.fps,
+                    ir.max_cycle,
+                    crate::rfi::pinned_cycle(),
+                )
+            }),
+            mid_wave: MidWave::Restart,
+            abandons: true,
+        }
+    }
+
     /// Record CSC + encode (+ RFI) into ring `slot` and submit without waiting. Fence is polled
     /// later (`read_slot`). `slot` must be free (prior submission already read back).
     unsafe fn record_submit(
@@ -2014,71 +2034,51 @@ impl VulkanVideoEncoder {
         let nv12_view = self.frames[slot].nv12.view;
         let direct_planes = self.frames[slot].direct_planes;
 
-        // Pending rate retarget stays pending through recording: record fns declare the
-        // session's current state at begin-coding and install via ENCODE_RATE_CONTROL; bookkeeping
-        // promotes after. Promoting here made begin name a rate the session had not installed
-        // after `reset()` (`rc_installed` survives; session keeps the old rate) — VUID-08254.
-        let mut is_idr = self.first_frame || self.force_kf;
-        let mut ref_slot = self.prev_slot;
-        let mut recovery = false;
-        // A confirmed reference: anchor-tagged, but not error-resilient, since the client
-        // decoded it and holds its CDFs.
-        let mut acked = false;
-        if let Some(lf) = self.pending_loss.take() {
-            if !is_idr {
-                // Taint sweep already ran in `invalidate_ref_frames`; re-pick against the table now.
-                let refs = trusted_refs(&self.slot_wire);
-                match crate::rfi::pick_recovery(&refs, lf, self.reference_floor.as_ref()) {
-                    Some((s, _)) => {
-                        ref_slot = s;
-                        recovery = true;
-                        tracing::debug!(
-                            loss_first = lf,
-                            anchor_slot = s,
-                            anchor_wire = self.slot_wire[s],
-                            "vulkan-encode: emitting clean recovery-anchor P-frame (references a known-good frame older than the loss, no IDR)"
-                        );
-                    }
-                    None => match self.intra_refresh {
-                        // A wave in flight restarts: the client re-armed at this loss and
-                        // counts marks from there, so only a fresh start + close lift it.
-                        Some(ir) => {
-                            // RADV's stripe unit is the 64-px CTB row for HEVC and AV1.
-                            let cycle = crate::rfi::wave_cycle(
-                                self.height.div_ceil(64),
-                                self.fps,
-                                ir.max_cycle,
-                                crate::rfi::pinned_cycle(),
-                            );
-                            self.wave = Some(Wave::start(cycle));
-                            tracing::debug!(
-                                loss_first = lf,
-                                cycle,
-                                "vulkan-encode: no resident reference older than the loss — \
-                                 starting an intra refresh wave instead of an IDR"
-                            );
-                        }
-                        None => {
-                            is_idr = true;
-                            tracing::debug!(loss_first = lf, "vulkan-encode: no resident reference older than the loss — forcing IDR");
-                        }
-                    },
-                }
-            }
-        } else if let Some(confirmed) = self.reference_floor.filter(|_| !is_idr) {
-            // The link loses packets: the newest frame the client confirmed. None resident
-            // keeps the chain.
-            let refs = trusted_refs(&self.slot_wire);
-            if let Some((s, _)) = crate::rfi::pick_acked(&refs, &confirmed) {
-                ref_slot = s;
-                acked = true;
-            }
+        // A pending rate stays pending through recording: begin-coding declares the rate the
+        // session has installed, and bookkeeping promotes the new one after (VUID-08254).
+
+        // An armed loss resolves here, against the slot table as it stands: the taint sweep
+        // ran at the report. A confirmed reference is looked up only when no loss is armed.
+        let armed = self.pending_loss.take();
+        let floor = self.reference_floor;
+        let refs = match (armed, floor) {
+            (None, None) => Vec::new(),
+            _ => trusted_refs(&self.slot_wire),
+        };
+        let anchor = armed.and_then(|lf| crate::rfi::pick_recovery(&refs, lf, floor.as_ref()));
+        let confirmed = floor
+            .filter(|_| armed.is_none())
+            .and_then(|c| crate::rfi::pick_acked(&refs, &c));
+        let pending = Pending {
+            idr: self.first_frame || self.force_kf,
+            anchor: anchor.is_some(),
+            acked: confirmed.is_some(),
+            loss: armed.is_some(),
+        };
+        let state = Recovery {
+            wave: self.wave,
+            ..Recovery::default()
+        };
+        let plan = plan_frame(state, pending, &self.recovery_policy());
+        let is_idr = plan.refs == FrameRef::Idr;
+        // `recovery` is error-resilient; a confirmed reference is anchor-tagged only, since
+        // the client decoded it and holds its CDFs.
+        let recovery = plan.refs == FrameRef::Anchor;
+        let ref_slot = match (plan.refs, anchor, confirmed) {
+            (FrameRef::Anchor, Some((s, _)), _) | (FrameRef::Acked, _, Some((s, _))) => s,
+            _ => self.prev_slot,
+        };
+        if let Some(loss_first) = armed {
+            tracing::debug!(
+                loss_first,
+                refs = ?plan.refs,
+                wave = ?plan.wave,
+                ref_slot,
+                "vulkan-encode: armed loss resolved at frame-build"
+            );
         }
-        // An IDR or an anchor P is clean on its own; a wave under way is abandoned. Both are
-        // legal successors: neither references a picture with dirty regions.
-        if is_idr || recovery || acked {
-            self.wave = None;
-        }
+        // The record paths read this frame's wave; bookkeeping advances it.
+        self.wave = plan.wave;
         let poc: i32 = if is_idr { 0 } else { self.poc };
         let mut setup_idx = (self.enc_count % DPB_SLOTS as u64) as usize;
         if !is_idr && setup_idx == ref_slot {
@@ -2087,28 +2087,12 @@ impl VulkanVideoEncoder {
 
         if self.spec.native_nv12 {
             self.record_submit_native(slot, frame, is_idr, recovery, ref_slot, setup_idx, poc)?;
-            self.post_submit_bookkeeping(
-                slot,
-                frame.pts_ns,
-                wire,
-                is_idr,
-                recovery || acked,
-                setup_idx,
-                poc,
-            );
+            self.post_submit_bookkeeping(slot, frame.pts_ns, wire, plan, setup_idx, poc);
             return Ok(());
         }
         if self.rgb.is_some() {
             self.record_submit_rgb(slot, frame, is_idr, recovery, ref_slot, setup_idx, poc)?;
-            self.post_submit_bookkeeping(
-                slot,
-                frame.pts_ns,
-                wire,
-                is_idr,
-                recovery || acked,
-                setup_idx,
-                poc,
-            );
+            self.post_submit_bookkeeping(slot, frame.pts_ns, wire, plan, setup_idx, poc);
             return Ok(());
         }
 
@@ -2487,8 +2471,7 @@ impl VulkanVideoEncoder {
                 .wait_dst_stage_mask(&wait_stages)],
             fence,
         )?;
-        let anchor = recovery || acked;
-        self.post_submit_bookkeeping(slot, frame.pts_ns, wire, is_idr, anchor, setup_idx, poc);
+        self.post_submit_bookkeeping(slot, frame.pts_ns, wire, plan, setup_idx, poc);
         Ok(())
     }
 
@@ -2915,42 +2898,39 @@ impl VulkanVideoEncoder {
         Ok(())
     }
 
-    /// Stash metadata `read_slot` needs once the fence signals, then advance DPB/GOP bookkeeping.
+    /// Stash metadata `read_slot` needs once the fence signals, then advance DPB/GOP
+    /// bookkeeping and the wave to what `plan` leaves for the next frame.
     fn post_submit_bookkeeping(
         &mut self,
         slot: usize,
         pts_ns: u64,
         wire: i64,
-        is_idr: bool,
-        recovery: bool,
+        plan: FramePlan,
         setup_idx: usize,
         poc: i32,
     ) {
+        let is_idr = plan.refs == FrameRef::Idr;
         self.frames[slot].pts_ns = pts_ns;
         self.frames[slot].keyframe = is_idr;
-        self.frames[slot].recovery_anchor = recovery;
+        self.frames[slot].recovery_anchor = matches!(plan.refs, FrameRef::Anchor | FrameRef::Acked);
         // The wave's start and close are the client's two marks. Every wave picture but the
         // close is part dirty, so it never becomes an RFI anchor: `slot_wire` stays -1.
-        let wave = self.wave;
-        self.frames[slot].recovery_point = wave.is_some_and(Wave::marks);
-        self.frames[slot].recovery_close = wave.is_some_and(Wave::closes);
+        self.frames[slot].recovery_point = plan.mark.point();
+        self.frames[slot].recovery_close = plan.mark.close();
         if is_idr {
             self.slot_wire.iter_mut().for_each(|s| *s = -1);
             self.slot_poc.iter_mut().for_each(|s| *s = -1);
         }
-        let dirty = wave.is_some_and(|w| !w.closes());
-        self.slot_wire[setup_idx] = if dirty { -1 } else { wire };
+        self.slot_wire[setup_idx] = if plan.dirty { -1 } else { wire };
         self.slot_poc[setup_idx] = poc;
-        if let Some(w) = wave {
-            self.wave = w.next();
-            if self.wave.is_none() {
-                tracing::debug!(
-                    cycle = w.cycle,
-                    wire,
-                    "vulkan-encode: intra refresh wave closed"
-                );
-            }
+        if let Some(w) = plan.wave.filter(|w| w.closes()) {
+            tracing::debug!(
+                cycle = w.cycle,
+                wire,
+                "vulkan-encode: intra refresh wave closed"
+            );
         }
+        self.wave = plan.next.wave;
         self.prev_slot = setup_idx;
         self.poc = poc + 1;
         self.enc_count += 1;
@@ -3717,7 +3697,13 @@ impl VulkanVideoEncoder {
             }
             _ => (None, None),
         };
-        self.record_submit(slot, frame, wire)?;
+        // A frame's plan is spent only once it is submitted: a failed record hands the armed
+        // loss and the wave back, so the retry plans the same frame.
+        let unspent = (self.pending_loss, self.wave);
+        if let Err(e) = self.record_submit(slot, frame, wire) {
+            (self.pending_loss, self.wave) = unspent;
+            return Err(e);
+        }
         self.in_flight.push_back(slot);
         Ok(())
     }

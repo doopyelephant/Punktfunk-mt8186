@@ -647,6 +647,10 @@ pub mod dxgi;
 #[cfg(target_os = "windows")]
 #[path = "windows/idd_push.rs"]
 mod idd_push;
+// What the win32u GPU-preference patch writes, and the one head it may write over. Pure
+// byte tables, so the test runs on every target.
+#[path = "windows/win32u_stub.rs"]
+mod win32u_stub;
 // The AU section's reader half. Pure over a mapped view, so its tests run on every target.
 #[path = "windows/au_reader.rs"]
 mod au_reader;
@@ -654,6 +658,13 @@ mod au_reader;
 // same reason: the rule that decides whether a silent desktop resets gets tests on every target.
 #[path = "windows/cursor_witness.rs"]
 mod cursor_witness;
+// The IDD-push cursor render model: who draws the pointer and what the driver is told. Pure,
+// so its table of past cursor defects runs on every target.
+#[path = "windows/cursor_state.rs"]
+mod cursor_state;
+// The delivery gate and the frame shape of the two capturers that hand over no pixels. Pure.
+#[path = "windows/pixelless.rs"]
+mod pixelless;
 // The IDD-push stall model: holes in DWM delivery and their verdicts. Pure over `Instant`s,
 // so its tests run on every target; `idd_push/stall.rs` writes the report.
 #[path = "windows/stall_model.rs"]
@@ -806,9 +817,31 @@ pub fn direct_hdr_globals() -> bool {
     linux::hdr_capture_globals()
 }
 
-/// Windows IDD direct-push capturer on a pf-vdisplay target. `sender` delivers
-/// the sealed frame channel. On failure `keepalive` is handed back so the
-/// caller can retire the display.
+/// What an IDD-push capturer opens for. Named fields: four adjacent bools transpose silently,
+/// and a transposed pair composes the wrong depth or runs the wrong cursor model.
+#[cfg(target_os = "windows")]
+pub struct IddPushOpts {
+    /// The handshake advertised HDR, not merely 10-bit. Off pins advanced colour off, so an
+    /// SDR client never gets in-band PQ.
+    pub want_hdr: bool,
+    /// 10-bit SDR: composed in SDR wide colour where Windows allows it, else the driver's
+    /// encoder widens BGRA itself. Never set with `want_hdr`.
+    pub ten_bit_sdr: bool,
+    /// Full-chroma 4:4:4.
+    pub want_444: bool,
+    /// A wavelet session.
+    pub pyrowave: bool,
+    /// `Some` opts the session into the cursor channel: the capturer creates the cursor
+    /// section and the driver declares the hardware cursor. `None` keeps DWM's pointer.
+    pub cursor_sender: Option<CursorChannelSender>,
+    pub cursor_forward: Option<CursorForwardSender>,
+    /// The session negotiated a pointer the client draws (`HOST_CAP_CURSOR`). Off, the
+    /// pointer reaches the wire only through the driver pool's blend.
+    pub forwards_to_client: bool,
+}
+
+/// Windows IDD direct-push capturer on a pf-vdisplay target. On failure `keepalive` is handed
+/// back so the caller can retire the display.
 #[cfg(target_os = "windows")]
 #[allow(clippy::too_many_arguments)]
 pub fn open_idd_push(
@@ -823,17 +856,15 @@ pub fn open_idd_push(
     cursor_forward: Option<CursorForwardSender>,
     forwards_to_client: bool,
 ) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
-    idd_push::IddPushCapturer::open(
-        target,
-        preferred,
+    let opts = IddPushOpts {
         want_hdr,
         ten_bit_sdr,
         want_444,
         pyrowave,
-        keepalive,
         cursor_sender,
         cursor_forward,
         forwards_to_client,
-    )
-    .map(|c| Box::new(c) as Box<dyn Capturer>)
+    };
+    idd_push::IddPushCapturer::open(target, preferred, keepalive, opts)
+        .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
