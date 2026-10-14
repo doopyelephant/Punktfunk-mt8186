@@ -1,5 +1,6 @@
 //! The stored session against a real socket. Its own process: the store is process-global.
-#![cfg(unix)]
+//! Not under Miri, which has no Unix sockets.
+#![cfg(all(unix, not(miri)))]
 
 use pf_host_config::session::{self, SessionEnv};
 use std::ffi::OsStr;
