@@ -901,12 +901,10 @@ fn open(
     }
 
     // NVENC's raw lane converts the held dmabuf into its slot in one pass, as libva and
-    // PyroWave import it themselves. Once this identity's raw latch or tiled refusal trips,
-    // NVENC takes CUDA from the EGL/CUDA import instead. The importer is built before the
-    // pool either way: it names the allocatable modifiers. One importer, one worker process.
-    let raw_lane = policy.nvenc_raw_dmabuf
-        && !signals.health.raw_disabled()
-        && !signals.health.passthrough_tiled_refused();
+    // PyroWave import it themselves. Once this identity's ladder closes it, NVENC takes CUDA
+    // from the EGL/CUDA import instead. The importer is built before the pool either way: it
+    // names the allocatable modifiers. One importer, one worker process.
+    let raw_lane = policy.nvenc_raw_dmabuf && signals.health.ladder().nvenc_raw_ok();
     let mut importer = if needs_cuda_import(policy) {
         let importer = pf_zerocopy::Importer::new_for_capture().map_err(|e| {
             anyhow!("this session's encoder needs the GPU importer, which did not start: {e:#}")

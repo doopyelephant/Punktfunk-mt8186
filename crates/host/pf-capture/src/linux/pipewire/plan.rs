@@ -2,7 +2,7 @@
 //! threads grade alike. Pure except [`gpu_import`].
 
 use crate::PixelFormat;
-use pf_zerocopy::ImportKind;
+use pf_zerocopy::{Evidence, ImportKind, Lane, Refusal};
 use std::sync::atomic::Ordering;
 
 /// Facts the zero-copy decision needs, sampled at one instant so the decision is a pure
@@ -19,15 +19,9 @@ pub(in crate::linux) struct NegotiationInputs {
     pub backend_is_vaapi: bool,
     pub pyrowave_session: bool,
     pub native_nv12_session: bool,
-    /// Scoped raw-passthrough latch.
-    pub raw_dmabuf_import_disabled: bool,
-    /// Repeated import-worker deaths.
-    pub gpu_import_disabled: bool,
-    /// Previous EGL→CUDA dmabuf-only offer timed out (compositor accepts none of the modifiers).
-    pub gpu_dmabuf_negotiation_failed: bool,
+    /// What this capture identity has learned: lanes off, offers refused.
+    pub ladder: pf_zerocopy::Ladder,
     pub native_nv12_env_on: bool,
-    /// A planar frame this capture could not pass through (`ZeroCopyHealth::planar_refused`).
-    pub planar_refused: bool,
     /// Encoder can ingest packed 10-bit PQ CUDA. Only direct-SDK NVENC can.
     pub hdr_cuda_ok: bool,
     /// `PUNKTFUNK_NV12`: the CUDA import emits NV12 (tiled blit or LINEAR compute CSC).
@@ -103,28 +97,26 @@ pub(in crate::linux) struct NegotiationPlan {
 /// 2. 4:4:4 never prefers producer NV12 or P010 (must not subsample).
 /// 3. Producer-native planar only on a `native_nv12_session` under a raw lane (VAAPI's
 ///    passthrough or NVENC's): NV12 at 8 bits, P010 for HDR and for a producer's own 10-bit
-///    SDR. The CUDA importer expects packed RGB, so a tripped raw latch withdraws the planar
-///    offer, and so does a planar frame the passthrough declined (`planar_refused`).
-/// 4. Raw passthrough is off once its latch has fired.
+///    SDR. The CUDA importer expects packed RGB, so a raw lane gone off withdraws the planar
+///    offer, and so does a planar frame the passthrough declined ([`Refusal::Planar`]).
+/// 4. Raw passthrough is off once the ladder turns the raw lane off.
 pub(in crate::linux) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPlan {
     // Consumer imports raw dmabufs: VAAPI (libva + GPU CSC) or PyroWave (its Vulkan device).
     let raw_passthrough = i.backend_is_vaapi || i.pyrowave_session;
-    // Skip under raw passthrough (payloads only NVENC consumes) and both GPU latches
+    let raw_off = i.ladder.off(Lane::Raw);
+    let gpu_off = i.ladder.off(Lane::Gpu);
+    // Skip under raw passthrough (payloads only NVENC consumes) and once the GPU lane is off
     // (worker-death crash-loop; compositor that rejects our modifiers would re-pay 10 s).
     // HDR through this importer is LINEAR, so it avoids the 8-bit de-tile blit. Exclude
     // it when the encoder cannot take packed 10-bit CUDA (a build without `nvenc`).
-    let build_importer = i.zerocopy
-        && !raw_passthrough
-        && !i.gpu_import_disabled
-        && !i.gpu_dmabuf_negotiation_failed
-        && (!i.want_hdr || i.hdr_cuda_ok);
-    let vaapi_passthrough =
-        i.zerocopy && !i.force_shm && raw_passthrough && !i.raw_dmabuf_import_disabled;
-    let nvenc_raw = build_importer && i.nvenc_raw && !i.force_shm && !i.raw_dmabuf_import_disabled;
+    let build_importer =
+        i.zerocopy && !raw_passthrough && !gpu_off && (!i.want_hdr || i.hdr_cuda_ok);
+    let vaapi_passthrough = i.zerocopy && !i.force_shm && raw_passthrough && !raw_off;
+    let nvenc_raw = build_importer && i.nvenc_raw && !i.force_shm && i.ladder.nvenc_raw_ok();
     // NVENC's raw lane copies a producer NV12 or P010 into its slot.
     let planar_lane = (i.backend_is_vaapi && vaapi_passthrough) || nvenc_raw;
     let native_planar = i.native_nv12_env_on
-        && !i.planar_refused
+        && !i.ladder.refused(Refusal::Planar)
         && i.native_nv12_session
         && planar_lane
         && !i.pyrowave_session
@@ -143,15 +135,12 @@ pub(in crate::linux) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPla
         prefer_native_nv12,
         prefer_native_p010,
         force_shm: i.force_shm,
-        raw_dmabuf_latched: i.zerocopy
-            && !i.force_shm
-            && raw_passthrough
-            && i.raw_dmabuf_import_disabled,
-        // Every `build_importer` term except the two latches, then either latch.
+        raw_dmabuf_latched: i.zerocopy && !i.force_shm && raw_passthrough && raw_off,
+        // Every `build_importer` term except the GPU lane, then that lane off.
         gpu_import_latched: i.zerocopy
             && !raw_passthrough
             && (!i.want_hdr || i.hdr_cuda_ok)
-            && (i.gpu_import_disabled || i.gpu_dmabuf_negotiation_failed),
+            && gpu_off,
     }
 }
 
@@ -424,9 +413,7 @@ fn import_kind(
 }
 
 /// One dmabuf → CUDA import: tiled through EGL, LINEAR through the Vulkan bridge, NV12 or
-/// YUV444 where the policy asks. Failures are graded here so both threads act alike: a tiled
-/// failure drops the frame and poisons the stream after [`IMPORT_FAIL_POISON`] (or at once
-/// when the worker died); a LINEAR failure retires the importer.
+/// YUV444 where the policy asks. [`import_failure`] grades a failure, so both threads act alike.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::linux) fn gpu_import(
     importer: &mut pf_zerocopy::Importer,
@@ -446,7 +433,7 @@ pub(in crate::linux) fn gpu_import(
     let ten_bit = fmt.is_rgb10();
     // The raw lane let go of a tiled 10-bit stream. Rebuild it on the LINEAR offer.
     if ten_bit && modifier.is_some() {
-        if signals.health.refuse_hdr_tiled() {
+        if signals.health.refuse(Refusal::HdrTiled) {
             tracing::warn!(
                 "tiled 10-bit dmabuf reached the CUDA import — capture rebuilds on LINEAR"
             );
@@ -472,7 +459,7 @@ pub(in crate::linux) fn gpu_import(
     match imported {
         Ok(devbuf) => {
             state.fail_streak = 0;
-            signals.health.note_gpu_import_ok();
+            signals.health.note(&[Evidence::Imported(Lane::Gpu)]);
             static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
             if ONCE.swap(false, Ordering::Relaxed) {
                 tracing::info!(
@@ -492,27 +479,59 @@ pub(in crate::linux) fn gpu_import(
         }
         Err(e) => {
             let dead = importer.dead();
-            if dead {
+            if modifier.is_some() {
+                state.fail_streak += 1;
+            }
+            let (next, strike) = import_failure(modifier.is_some(), dead, state.fail_streak);
+            if strike {
                 signals.health.note_gpu_import_death();
             }
-            if modifier.is_none() {
-                tracing::warn!(error = %format!("{e:#}"),
-                    "LINEAR dmabuf GPU import failed — falling back to the CPU copy path");
-                return ImportOutcome::ImporterLost;
+            match next {
+                ImportFailure::RetireImporter => {
+                    tracing::warn!(error = %format!("{e:#}"),
+                        "LINEAR dmabuf GPU import failed — falling back to the CPU copy path");
+                    ImportOutcome::ImporterLost
+                }
+                ImportFailure::LoseStream => {
+                    tracing::error!(error = %format!("{e:#}"), dead,
+                        "tiled GPU import lost — failing this capture for rebuild");
+                    signals.broken.store(true, Ordering::Relaxed);
+                    ImportOutcome::Dropped
+                }
+                ImportFailure::DropFrame => {
+                    tracing::warn!(error = %format!("{e:#}"),
+                        streak = state.fail_streak,
+                        "tiled dmabuf GPU import failed — frame dropped");
+                    ImportOutcome::Dropped
+                }
             }
-            state.fail_streak += 1;
-            if dead || state.fail_streak >= IMPORT_FAIL_POISON {
-                tracing::error!(error = %format!("{e:#}"), dead,
-                    "tiled GPU import lost — failing this capture for rebuild");
-                signals.broken.store(true, Ordering::Relaxed);
-            } else {
-                tracing::warn!(error = %format!("{e:#}"),
-                    streak = state.fail_streak,
-                    "tiled dmabuf GPU import failed — frame dropped");
-            }
-            ImportOutcome::Dropped
         }
     }
+}
+
+/// What a failed CUDA import does to its stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportFailure {
+    /// LINEAR: the importer retires and the stream continues on the CPU path.
+    RetireImporter,
+    /// A tiled frame is dropped; the next one may import.
+    DropFrame,
+    /// The worker died, or tiled imports keep failing: the stream rebuilds.
+    LoseStream,
+}
+
+/// A failed CUDA import's verdict, and whether the GPU lane takes a strike. `streak` counts
+/// the stream's consecutive tiled failures, this one included. A tiled stream is lost after
+/// [`IMPORT_FAIL_POISON`], or at once when the worker died.
+fn import_failure(tiled: bool, dead: bool, streak: u32) -> (ImportFailure, bool) {
+    let next = if !tiled {
+        ImportFailure::RetireImporter
+    } else if dead || streak >= IMPORT_FAIL_POISON {
+        ImportFailure::LoseStream
+    } else {
+        ImportFailure::DropFrame
+    };
+    (next, dead)
 }
 
 #[cfg(test)]
@@ -523,6 +542,12 @@ mod tests {
         CaptureArm, ConsumerKind, ImportPolicy, NegotiationInputs, PassthroughFallback,
         PassthroughFallbackAction, PassthroughFallbacks,
     };
+    use pf_zerocopy::{step, Evidence, Ladder, Lane, Refusal};
+
+    /// More of `e` than any budget takes: that cause, spent.
+    fn spent(e: Evidence) -> Ladder {
+        [e; 8].iter().fold(Ladder::default(), |l, e| step(l, *e))
+    }
 
     /// A 10-bit SDR session drops NV12 for packed RGB (NVENC widens 8-bit to 10-bit only from
     /// packed RGB); an 8-bit session keeps whatever `PUNKTFUNK_NV12` configured.
@@ -547,7 +572,7 @@ mod tests {
         assert!(negotiation_plan(nvenc()).build_importer && !negotiation_plan(nvenc()).nvenc_raw);
         assert!(
             !negotiation_plan(NegotiationInputs {
-                raw_dmabuf_import_disabled: true,
+                ladder: spent(Evidence::ImportFailed(Lane::Raw)),
                 ..raw
             })
             .nvenc_raw,
@@ -605,7 +630,7 @@ mod tests {
     }
 
     /// A healthy NVENC session: zero-copy on, no latches, SDR 4:2:0, non-VAAPI backend.
-    fn nvenc() -> NegotiationInputs {
+    pub(super) fn nvenc() -> NegotiationInputs {
         NegotiationInputs {
             zerocopy: true,
             force_shm: false,
@@ -615,11 +640,8 @@ mod tests {
             backend_is_vaapi: false,
             pyrowave_session: false,
             native_nv12_session: false,
-            raw_dmabuf_import_disabled: false,
-            gpu_import_disabled: false,
-            gpu_dmabuf_negotiation_failed: false,
+            ladder: Ladder::default(),
             native_nv12_env_on: true,
-            planar_refused: false,
             hdr_cuda_ok: true,
             nv12_env_on: true,
             nvenc_raw: false,
@@ -627,7 +649,7 @@ mod tests {
     }
 
     /// A gamescope-style VAAPI session that CAN take producer-native NV12.
-    fn vaapi_native_nv12() -> NegotiationInputs {
+    pub(super) fn vaapi_native_nv12() -> NegotiationInputs {
         NegotiationInputs {
             backend_is_vaapi: true,
             native_nv12_session: true,
@@ -749,7 +771,7 @@ mod tests {
         );
         for want_hdr in [false, true] {
             let p = negotiation_plan(NegotiationInputs {
-                planar_refused: true,
+                ladder: spent(Evidence::Refused(Refusal::Planar)),
                 want_hdr,
                 ..vaapi_native_nv12()
             });
@@ -777,7 +799,7 @@ mod tests {
                 "HDR raw latch",
                 NegotiationInputs {
                     want_hdr: true,
-                    raw_dmabuf_import_disabled: true,
+                    ladder: spent(Evidence::ImportFailed(Lane::Raw)),
                     ..nvenc_native
                 },
             ),
@@ -791,7 +813,7 @@ mod tests {
             (
                 "raw latch",
                 NegotiationInputs {
-                    raw_dmabuf_import_disabled: true,
+                    ladder: spent(Evidence::ImportFailed(Lane::Raw)),
                     ..nvenc_native
                 },
             ),
@@ -825,7 +847,7 @@ mod tests {
 
         // Passthrough (and the pyrowave-modifier extension) is off once the raw-dmabuf latch fires.
         let p = negotiation_plan(NegotiationInputs {
-            raw_dmabuf_import_disabled: true,
+            ladder: spent(Evidence::ImportFailed(Lane::Raw)),
             ..vaapi_native_nv12()
         });
         assert!(!p.vaapi_passthrough, "latched ⇒ no raw passthrough");
@@ -846,7 +868,7 @@ mod tests {
             assert!(negotiation_plan(base).vaapi_passthrough);
             assert!(
                 !negotiation_plan(NegotiationInputs {
-                    raw_dmabuf_import_disabled: true,
+                    ladder: spent(Evidence::ImportFailed(Lane::Raw)),
                     ..base
                 })
                 .vaapi_passthrough
@@ -859,13 +881,13 @@ mod tests {
     #[test]
     fn gpu_dmabuf_negotiation_latch_gates_only_the_importer() {
         let p = negotiation_plan(NegotiationInputs {
-            gpu_dmabuf_negotiation_failed: true,
+            ladder: spent(Evidence::OfferTimedOut(Lane::Gpu)),
             ..nvenc()
         });
         assert!(!p.build_importer, "latched offer must not be re-made");
         assert!(p.gpu_import_latched, "the downgrade must be diagnosable");
         let p = negotiation_plan(NegotiationInputs {
-            gpu_dmabuf_negotiation_failed: true,
+            ladder: spent(Evidence::OfferTimedOut(Lane::Gpu)),
             ..vaapi_native_nv12()
         });
         assert!(
@@ -926,7 +948,7 @@ mod tests {
     #[test]
     fn the_gpu_import_death_latch_skips_the_importer() {
         let p = negotiation_plan(NegotiationInputs {
-            gpu_import_disabled: true,
+            ladder: spent(Evidence::ImportFailed(Lane::Gpu)),
             ..nvenc()
         });
         assert!(!p.build_importer);
@@ -934,7 +956,7 @@ mod tests {
         // HDR takes the same importer (LINEAR/Vulkan-bridge), so the latch costs it zero-copy.
         assert!(
             negotiation_plan(NegotiationInputs {
-                gpu_import_disabled: true,
+                ladder: spent(Evidence::ImportFailed(Lane::Gpu)),
                 want_hdr: true,
                 ..nvenc()
             })
@@ -943,7 +965,7 @@ mod tests {
         // Not reported for a raw passthrough that would never have built an importer.
         assert!(
             !negotiation_plan(NegotiationInputs {
-                gpu_import_disabled: true,
+                ladder: spent(Evidence::ImportFailed(Lane::Gpu)),
                 ..vaapi_native_nv12()
             })
             .gpu_import_latched
@@ -1135,5 +1157,149 @@ mod tests {
             assert_eq!(linear, want, "{reason:?} on LINEAR");
             assert_eq!(planar, want_planar, "{reason:?} on planar LINEAR");
         }
+    }
+}
+
+/// The ladder as the plan sees it: the evidence a capture gathers, then the rung it builds.
+#[cfg(test)]
+mod ladder_rows {
+    use super::super::capturer::{convicted_lane, TimeoutOffer, TimeoutVerdict};
+    use super::tests::{nvenc, vaapi_native_nv12};
+    use super::{negotiation_plan, resolved_capture_arm, CaptureArm, NegotiationInputs};
+    use pf_zerocopy::{step, Evidence, Lane, Refusal};
+
+    /// What a capture sees: evidence for the ladder, or a first-frame expiry it judges first.
+    #[derive(Clone, Copy)]
+    enum Seen {
+        Ev(Evidence),
+        Expiry(TimeoutOffer, TimeoutVerdict),
+    }
+
+    /// The rung a build takes after `seen`, and whether it offers the producer's planar formats.
+    fn rung_after(base: NegotiationInputs, seen: &[Seen]) -> (CaptureArm, bool) {
+        let ladder = seen.iter().fold(base.ladder, |l, s| match *s {
+            Seen::Ev(e) => step(l, e),
+            Seen::Expiry(offer, verdict) => match convicted_lane(offer, verdict) {
+                Some(lane) => step(l, Evidence::OfferTimedOut(lane)),
+                None => l,
+            },
+        });
+        let p = negotiation_plan(NegotiationInputs { ladder, ..base });
+        let have_importer = p.build_importer;
+        let arm = resolved_capture_arm(&p, have_importer, p.want_dmabuf(have_importer, &[0]));
+        (arm, p.prefer_native_nv12 || p.prefer_native_p010)
+    }
+
+    /// One row per fix in this ladder's history, then a lane that recovers and one that does not.
+    #[test]
+    fn the_ladder_rows() {
+        use CaptureArm::{Cpu, CudaImport, DmabufPassthrough, DmabufToEncoder};
+        use Evidence::{ImportFailed, Imported, OfferTaken, Refused};
+        use Seen::{Ev, Expiry};
+        use TimeoutOffer::{GpuDmabuf, Hdr, RawDmabuf};
+        use TimeoutVerdict::{Conclusive, Provisional};
+        let vaapi = NegotiationInputs {
+            backend_is_vaapi: true,
+            ..nvenc()
+        };
+        let nvenc_raw = NegotiationInputs {
+            nvenc_raw: true,
+            ..nvenc()
+        };
+        type Row = (
+            &'static str,
+            NegotiationInputs,
+            Vec<Seen>,
+            (CaptureArm, bool),
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "b815e00a8: one raw offer timeout retries the offer",
+                vaapi,
+                vec![Expiry(RawDmabuf, Conclusive)],
+                (DmabufPassthrough, false),
+            ),
+            (
+                "b815e00a8: the second one goes to the CPU",
+                vaapi,
+                vec![Expiry(RawDmabuf, Conclusive); 2],
+                (Cpu, false),
+            ),
+            (
+                "b815e00a8: a taken offer credits the retry",
+                vaapi,
+                [Expiry(RawDmabuf, Conclusive), Ev(OfferTaken(Lane::Raw))].repeat(5),
+                (DmabufPassthrough, false),
+            ),
+            (
+                "022ede651: a short first attempt convicts no raw offer",
+                vaapi,
+                vec![Expiry(RawDmabuf, Provisional); 5],
+                (DmabufPassthrough, false),
+            ),
+            (
+                "022ede651: nor a GPU offer",
+                nvenc(),
+                vec![Expiry(GpuDmabuf, Provisional); 5],
+                (CudaImport, false),
+            ),
+            (
+                "one full GPU offer timeout goes to the CPU",
+                nvenc(),
+                vec![Expiry(GpuDmabuf, Conclusive)],
+                (Cpu, false),
+            ),
+            (
+                "an HDR expiry is the HDR latch's, not a lane's",
+                nvenc(),
+                vec![Expiry(Hdr, Conclusive); 3],
+                (CudaImport, false),
+            ),
+            (
+                "71bd171ac: a tiled refusal moves NVENC off its raw lane",
+                nvenc_raw,
+                vec![Ev(Refused(Refusal::Tiled))],
+                (CudaImport, false),
+            ),
+            (
+                "d1797bc4f: a planar failure keeps the passthrough on packed RGB",
+                vaapi_native_nv12(),
+                vec![Ev(Refused(Refusal::Planar))],
+                (DmabufPassthrough, false),
+            ),
+            (
+                "a GPU lane that fails once recovers",
+                nvenc_raw,
+                vec![
+                    Ev(ImportFailed(Lane::Gpu)),
+                    Ev(Imported(Lane::Gpu)),
+                    Ev(ImportFailed(Lane::Gpu)),
+                    Ev(ImportFailed(Lane::Gpu)),
+                ],
+                (DmabufToEncoder, false),
+            ),
+            (
+                "a raw lane that fails for good",
+                vaapi_native_nv12(),
+                vec![
+                    Ev(ImportFailed(Lane::Raw)),
+                    Ev(ImportFailed(Lane::Raw)),
+                    Ev(ImportFailed(Lane::Raw)),
+                    Ev(Imported(Lane::Raw)),
+                    Ev(OfferTaken(Lane::Raw)),
+                ],
+                (Cpu, false),
+            ),
+        ];
+        for (why, base, seen, want) in rows {
+            assert_eq!(rung_after(base, &seen), want, "{why}");
+        }
+        // The rows start from the best rung: what each fix demotes from.
+        assert_eq!(
+            rung_after(vaapi_native_nv12(), &[]),
+            (DmabufPassthrough, true)
+        );
+        assert_eq!(rung_after(nvenc_raw, &[]), (DmabufToEncoder, false));
+        assert_eq!(rung_after(nvenc(), &[]), (CudaImport, false));
     }
 }

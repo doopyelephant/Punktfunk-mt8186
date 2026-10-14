@@ -351,17 +351,12 @@ fn spawn_pipewire(
         backend_is_vaapi: policy.backend_is_vaapi,
         pyrowave_session: policy.pyrowave_session,
         native_nv12_session: policy.native_nv12_session,
-        raw_dmabuf_import_disabled: signals.health.raw_disabled(),
-        gpu_import_disabled: signals.health.gpu_import_disabled(),
-        gpu_dmabuf_negotiation_failed: signals.health.gpu_negotiation_disabled(),
+        ladder: signals.health.ladder(),
         // Default ON; `=0` (any falsy spelling, shared parser) restores packed RGB.
         native_nv12_env_on: pf_host_config::env_on("PUNKTFUNK_PIPEWIRE_NV12").unwrap_or(true),
-        planar_refused: signals.health.planar_refused(),
         hdr_cuda_ok: policy.hdr_cuda_ok,
         nv12_env_on: pf_zerocopy::nv12_enabled(),
-        // A tiled refusal keeps NVENC on the CUDA import, as on the direct path: the raw lane
-        // would be offered the same tiled modifiers again.
-        nvenc_raw: policy.nvenc_raw_dmabuf && !signals.health.passthrough_tiled_refused(),
+        nvenc_raw: policy.nvenc_raw_dmabuf,
     });
     let vaapi_dmabuf = plan.vaapi_passthrough;
     let import_policy = plan.import_policy;
@@ -399,9 +394,13 @@ fn spawn_pipewire(
     })
 }
 
+/// A full first-frame wait: long enough for a cold gamescope's first frame. A compositor that
+/// never fixates a format sends no other signal, so only this expiry convicts an offer.
+const FIRST_FRAME_BUDGET: Duration = Duration::from_secs(10);
+
 impl Capturer for PortalCapturer {
     fn next_frame(&mut self) -> Result<CapturedFrame> {
-        self.frame_within(Duration::from_secs(10), TimeoutVerdict::Conclusive)
+        self.frame_within(FIRST_FRAME_BUDGET, TimeoutVerdict::Conclusive)
     }
 
     fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
@@ -548,7 +547,7 @@ impl Capturer for PortalCapturer {
 /// schedule moved on, not that the compositor refused. Only a full-length
 /// wait may latch — a gamescope cold start needs that extra window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TimeoutVerdict {
+pub(super) enum TimeoutVerdict {
     Conclusive,
     Provisional,
 }
@@ -557,7 +556,7 @@ enum TimeoutVerdict {
 /// is testable. A negotiated format clears every offer; forced
 /// `PUNKTFUNK_ZEROCOPY=1` keeps both dmabuf arms erroring (operator asked).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TimeoutOffer {
+pub(super) enum TimeoutOffer {
     /// Format negotiated; compositor produced no buffers.
     NoBuffers,
     Hdr,
@@ -593,6 +592,19 @@ fn timeout_convicts(offer: TimeoutOffer, verdict: TimeoutVerdict) -> bool {
             offer,
             TimeoutOffer::Hdr | TimeoutOffer::RawDmabuf | TimeoutOffer::GpuDmabuf
         )
+}
+
+/// The zero-copy lane an expiry costs a strike. HDR has its own latch, per `HdrSource`.
+pub(super) fn convicted_lane(
+    offer: TimeoutOffer,
+    verdict: TimeoutVerdict,
+) -> Option<pf_zerocopy::Lane> {
+    let lane = match offer {
+        TimeoutOffer::RawDmabuf => pf_zerocopy::Lane::Raw,
+        TimeoutOffer::GpuDmabuf => pf_zerocopy::Lane::Gpu,
+        _ => return None,
+    };
+    timeout_convicts(offer, verdict).then_some(lane)
 }
 
 impl PortalCapturer {
@@ -715,12 +727,13 @@ impl PortalCapturer {
     fn note_negotiation_confirmed(&mut self) {
         if (self.vaapi_dmabuf || self.raw_for_encoder) && !self.negotiation_confirmed {
             self.negotiation_confirmed = true;
-            self.signals.health.note_raw_negotiation_ok();
+            let taken = pf_zerocopy::Evidence::OfferTaken(pf_zerocopy::Lane::Raw);
+            self.signals.health.note(&[taken]);
         }
     }
 
-    /// Budget expired or the thread ended. Latch the sticky downgrade only
-    /// when the expiry convicts the offer ([`timeout_convicts`]).
+    /// Budget expired or the thread ended. A lane takes a strike only when the
+    /// expiry convicts its offer ([`convicted_lane`]).
     fn next_frame_timed_out(
         &self,
         err: RecvTimeoutError,
@@ -738,6 +751,9 @@ impl PortalCapturer {
                     pf_zerocopy::zerocopy_forced(),
                 );
                 let convicted = timeout_convicts(offer, verdict);
+                if let Some(lane) = convicted_lane(offer, verdict) {
+                    self.signals.health.note_offer_timed_out(lane);
+                }
                 // Provisional names the suspect but does not latch; the
                 // full-length retry's timeout does.
                 let sentence = if convicted {
@@ -772,45 +788,28 @@ impl PortalCapturer {
                             }
                         ))
                     }
-                    TimeoutOffer::RawDmabuf => {
-                        // Latch is scoped to raw-passthrough. Feeding
-                        // `pf_zerocopy::enabled()` dropped every later
-                        // session (NVENC EGL→CUDA included) to CPU capture.
+                    TimeoutOffer::RawDmabuf => Err(anyhow!(
+                        "no PipeWire frame within {within}s (node {}): the compositor never \
+                         accepted the dmabuf-only offer (raw-dmabuf passthrough){}",
+                        self.node_id,
                         if convicted {
-                            self.signals.health.note_raw_negotiation_failed();
+                            " — downgrading THIS path to CPU capture for the rest of the \
+                             process; the pipeline rebuild will renegotiate without dmabuf"
+                        } else {
+                            sentence
                         }
-                        Err(anyhow!(
-                            "no PipeWire frame within {within}s (node {}): the compositor never \
-                             accepted the dmabuf-only offer (raw-dmabuf passthrough){}",
-                            self.node_id,
-                            if convicted {
-                                " — downgrading THIS path to CPU capture for the rest of the \
-                                 process; the pipeline rebuild will renegotiate without dmabuf"
-                            } else {
-                                sentence
-                            }
-                        ))
-                    }
-                    TimeoutOffer::GpuDmabuf => {
-                        // One full-length timeout is conclusive: a compositor
-                        // that allocates none of the importer's modifiers
-                        // refuses them identically on every retry. Forced
-                        // `PUNKTFUNK_ZEROCOPY=1` keeps erroring (same as raw).
+                    )),
+                    TimeoutOffer::GpuDmabuf => Err(anyhow!(
+                        "no PipeWire frame within {within}s (node {}): the compositor never \
+                         accepted the dmabuf-only offer (EGL→CUDA GPU import){}",
+                        self.node_id,
                         if convicted {
-                            self.signals.health.note_gpu_negotiation_failed();
+                            " — downgrading THIS offer to the CPU path for the rest of the \
+                             process; the pipeline rebuild will renegotiate without dmabuf"
+                        } else {
+                            sentence
                         }
-                        Err(anyhow!(
-                            "no PipeWire frame within {within}s (node {}): the compositor never \
-                             accepted the dmabuf-only offer (EGL→CUDA GPU import){}",
-                            self.node_id,
-                            if convicted {
-                                " — downgrading THIS offer to the CPU path for the rest of the \
-                                 process; the pipeline rebuild will renegotiate without dmabuf"
-                            } else {
-                                sentence
-                            }
-                        ))
-                    }
+                    )),
                     TimeoutOffer::NoFormat => Err(anyhow!(
                         "no PipeWire frame within {within}s (node {}): format negotiation never \
                          completed — the compositor offered no format this consumer accepts \
