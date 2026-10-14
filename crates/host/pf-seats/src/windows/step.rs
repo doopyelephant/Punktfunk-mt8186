@@ -58,10 +58,6 @@ pub(crate) enum Code {
     Quality,
     HostReadyTimeout,
     HostExited,
-    PortInUse,
-    SeatsOff,
-    TermserviceStopped,
-    SeatDisplayDriver,
     AccountNotOwned,
     AccountIsAdministrator,
     AccountPolicy,
@@ -83,10 +79,6 @@ impl Code {
             "quality_failed" => Self::QualityFailed,
             "host_ready_timeout" => Self::HostReadyTimeout,
             "host_exited" => Self::HostExited,
-            "port_in_use" => Self::PortInUse,
-            "seats_off" => Self::SeatsOff,
-            "termservice_stopped" => Self::TermserviceStopped,
-            "seat_display_driver" => Self::SeatDisplayDriver,
             "account_not_owned" => Self::AccountNotOwned,
             "account_is_administrator" => Self::AccountIsAdministrator,
             "account_policy" => Self::AccountPolicy,
@@ -122,10 +114,6 @@ impl Code {
             | Self::KeeperExited
             | Self::HostReadyTimeout
             | Self::HostExited
-            | Self::PortInUse
-            | Self::SeatsOff
-            | Self::TermserviceStopped
-            | Self::SeatDisplayDriver
             | Self::Other => false,
         }
     }
@@ -160,14 +148,6 @@ impl Fault {
             }
             Code::HostReadyTimeout | Code::HostExited => {
                 "punktfunk didn't start on the seat. The seat's log has the cause."
-            }
-            Code::PortInUse => {
-                "Another program holds the seat's port. Restart the PC, then try again."
-            }
-            Code::SeatsOff => "Seats are off. Turn them on under Profiles → Seats.",
-            Code::TermserviceStopped => "Remote Desktop Services isn't running. Restart the PC.",
-            Code::SeatDisplayDriver => {
-                "The seat display driver isn't installed. Turn seats off and on again under Profiles → Seats."
             }
             Code::AccountNotOwned
             | Code::AccountIsAdministrator
@@ -762,22 +742,10 @@ mod tests {
         ("quality_anything_else", true, SCREEN),
         ("host_ready_timeout", false, HOST),
         ("host_exited", false, HOST),
-        (
-            "port_in_use",
-            false,
-            "Another program holds the seat's port.",
-        ),
-        ("seats_off", false, "Seats are off."),
-        (
-            "termservice_stopped",
-            false,
-            "Remote Desktop Services isn't running.",
-        ),
-        (
-            "seat_display_driver",
-            false,
-            "The seat display driver isn't installed.",
-        ),
+        ("port_in_use", false, MESSAGE),
+        ("seats_off", false, MESSAGE),
+        ("termservice_stopped", false, MESSAGE),
+        ("seat_display_driver", false, MESSAGE),
         ("account_not_owned", true, MESSAGE),
         ("account_is_administrator", true, MESSAGE),
         ("account_policy", true, MESSAGE),
