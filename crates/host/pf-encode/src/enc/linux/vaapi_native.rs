@@ -426,6 +426,9 @@ impl Encoder for NativeVaapiEncoder {
                 "a CUDA frame reached the VAAPI encoder — that payload is NVENC-only; unset \
                  PUNKTFUNK_ZEROCOPY or do not pin PUNKTFUNK_ENCODER=vaapi-native on an NVIDIA host"
             ),
+            FramePayload::Pixelless => {
+                bail!("the VAAPI encoder needs pixels; got a pixel-less frame")
+            }
         };
         // The link loses packets: the newest picture the client confirmed, as an anchor.
         // None resident keeps the chain.

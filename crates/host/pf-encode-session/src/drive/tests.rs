@@ -204,7 +204,7 @@ impl FrameSource for ScriptedPool<'_> {
             height: 16,
             pts_ns,
             format: PixelFormat::Bgrx,
-            payload: FramePayload::Cpu(Vec::new()),
+            payload: FramePayload::Pixelless,
             cursor: None,
             provenance: Default::default(),
         })

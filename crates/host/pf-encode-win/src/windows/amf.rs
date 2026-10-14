@@ -1661,6 +1661,7 @@ impl AmfEncoder {
             FramePayload::Cpu(_) => {
                 bail!("native AMF is D3D11-only; got a CPU frame (video processor lost?)")
             }
+            FramePayload::Pixelless => bail!("native AMF is D3D11-only; got a pixel-less frame"),
         };
         // Mid-session format fallback: CopySubresourceRegion across format groups is UB. No readback.
         anyhow::ensure!(

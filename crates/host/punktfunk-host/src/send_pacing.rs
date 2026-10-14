@@ -572,15 +572,30 @@ fn keepalive_wait(interval: Duration, src_period_ns: Option<u64>) -> Duration {
     }
 }
 
+/// The access units `enc` owes for a pixel-less `frame`, waited for until `deadline`. `None`
+/// for a frame with pixels, and from an encoder that owes none: the loop submits the frame.
+pub(crate) fn owed_aus(
+    frame: &crate::capture::CapturedFrame,
+    enc: &mut dyn crate::encode::Encoder,
+    deadline: Instant,
+) -> Option<usize> {
+    match frame.payload {
+        pf_frame::FramePayload::Pixelless => enc.ready_aus(deadline),
+        _ => None,
+    }
+}
+
 /// Wait for the next tick: the capturer's arrival under the credit pacer, the next access
-/// unit of an encoder that publishes its own, or the fixed-interval sleep to `next`.
+/// unit an encoder owes for the pixel-less `frame`, or the fixed-interval sleep to `next`.
 ///
 /// `fresh` is a new frame's capture instant. A repeat (`None`) spends no credit and holds no
 /// slot: the real frame after it goes out on arrival. An arrival or an AU restarts the grid
 /// at `next`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn wait_next_tick(
     capturer: &mut dyn crate::capture::Capturer,
     enc: &mut dyn crate::encode::Encoder,
+    frame: &crate::capture::CapturedFrame,
     credit: &mut CaptureCredit,
     next: &mut Instant,
     fresh: Option<Instant>,
@@ -603,7 +618,7 @@ pub(crate) fn wait_next_tick(
             }
         }
         capturer.wait_arrival(*next + keepalive_wait(interval, src_period_ns));
-    } else if enc.ready_aus(*next).is_none() {
+    } else if owed_aus(frame, enc, *next).is_none() {
         return sleep_to_grid(next);
     }
     // On its own phase the grid would hold a finished frame for up to a period.
@@ -662,6 +677,70 @@ pub(crate) fn percentile(v: &mut [u32], q: f64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answers every ask with `owes`; `asks` counts them.
+    struct Owes {
+        owes: Option<usize>,
+        asks: u32,
+    }
+
+    impl crate::encode::Encoder for Owes {
+        fn submit(&mut self, _frame: &crate::capture::CapturedFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<crate::encode::EncodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn ready_aus(&mut self, _deadline: Instant) -> Option<usize> {
+            self.asks += 1;
+            self.owes
+        }
+    }
+
+    /// The payload decides whether the loop asks; the encoder decides what is owed.
+    #[test]
+    fn only_a_pixel_less_frame_asks_what_is_owed() {
+        use pf_frame::FramePayload::{Cpu, Pixelless};
+        let rows = [
+            (Pixelless, Some(2), Some(2), "the driver's access units"),
+            (
+                Pixelless,
+                None,
+                None,
+                "an encoder that owes none takes the frame",
+            ),
+            (
+                Cpu(vec![0; 64]),
+                None,
+                None,
+                "a frame with pixels is submitted",
+            ),
+            (
+                Cpu(vec![0; 64]),
+                Some(2),
+                None,
+                "whatever the encoder holds",
+            ),
+        ];
+        for (payload, owes, want, why) in rows {
+            let asks = u32::from(matches!(payload, Pixelless));
+            let frame = crate::capture::CapturedFrame {
+                width: 4,
+                height: 4,
+                pts_ns: 0,
+                format: crate::capture::PixelFormat::Bgrx,
+                payload,
+                cursor: None,
+                provenance: Default::default(),
+            };
+            let mut enc = Owes { owes, asks: 0 };
+            assert_eq!(owed_aus(&frame, &mut enc, Instant::now()), want, "{why}");
+            assert_eq!(enc.asks, asks, "{why}");
+        }
+    }
 
     fn packets(n: usize, len: usize) -> Vec<Vec<u8>> {
         (0..n).map(|_| vec![0u8; len]).collect()

@@ -907,6 +907,9 @@ impl Encoder for MfEncoder {
             FramePayload::Cpu(_) => {
                 bail!("Media Foundation is D3D11-only; got a CPU frame (video processor lost?)")
             }
+            FramePayload::Pixelless => {
+                bail!("Media Foundation is D3D11-only; got a pixel-less frame")
+            }
         };
         anyhow::ensure!(
             captured.format == PixelFormat::Nv12,

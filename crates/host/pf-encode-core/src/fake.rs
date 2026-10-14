@@ -177,7 +177,7 @@ mod tests {
             height: 16,
             pts_ns: 0,
             format: PixelFormat::Bgrx,
-            payload: FramePayload::Cpu(Vec::new()),
+            payload: FramePayload::Pixelless,
             cursor: None,
             provenance: Default::default(),
         };
