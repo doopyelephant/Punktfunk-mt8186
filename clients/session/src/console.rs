@@ -440,6 +440,8 @@ impl Service {
                     wake_cancel: None,
                     pair_gen: Arc::new(AtomicU64::new(0)),
                     rescan: None,
+                    stores: Stores::default(),
+                    learn_due: true,
                 }
                 .run(stop_w)
             })
@@ -475,49 +477,70 @@ struct ServiceState {
     pair_gen: Arc<AtomicU64>,
     /// Forces the mDNS browse to re-query. Installed by `run`; `None` before it starts.
     rescan: Option<discovery::Rescan>,
+    stores: Stores,
+    /// The adverts or the saved hosts moved since each saved host last learned from its advert.
+    learn_due: bool,
+}
+
+/// The saved hosts and the preset catalog as last read. Each is read again only when its file
+/// changed, so a rebuild with nothing new costs two `stat`s and no lock.
+#[derive(Default)]
+struct Stores {
+    known: trust::KnownHosts,
+    known_seen: trust::FileStamp,
+    catalog: pf_client_core::presets::PresetsFile,
+    catalog_seen: trust::FileStamp,
+}
+
+impl Stores {
+    /// `true` when the saved hosts were read again.
+    fn refresh(&mut self) -> bool {
+        if let Some(c) =
+            pf_client_core::presets::PresetsFile::load_if_changed(&mut self.catalog_seen)
+        {
+            self.catalog = c;
+        }
+        let Some(k) = trust::KnownHosts::load_if_changed(&mut self.known_seen) else {
+            return false;
+        };
+        self.known = k;
+        true
+    }
+
+    /// Read both again at the next `refresh`. A command writes the store, and its write can
+    /// carry the timestamp of the read before it.
+    fn forget(&mut self) {
+        self.known_seen = trust::FileStamp::default();
+        self.catalog_seen = trust::FileStamp::default();
+    }
 }
 
 impl ServiceState {
     fn run(mut self, stop: Arc<AtomicBool>) {
         let (discovery_rx, rescan) = discovery::browse();
         self.rescan = Some(rescan);
-        // `rows()` re-parses the host store AND the preset catalog, so rebuilding it every
-        // 100 ms read both files ten times a second for a list that changes on events. Rebuilt
-        // when something could have moved it, with a floor so anything unmarked still lands.
+        // The rows hold probe results and cached host state that change with no event, so they
+        // are rebuilt on a floor as well as when something could have moved them. The stores
+        // under them are read again only when a file changed.
         let mut dirty = true;
         let mut last_rows = Instant::now() - Duration::from_secs(1);
         while !stop.load(Ordering::SeqCst) {
             // mDNS churn.
             while let Ok(ev) = discovery_rx.try_recv() {
                 dirty = true;
-                match ev {
-                    discovery::DiscoveryEvent::Resolved(host) => {
-                        self.discovered.insert(host.fullname.clone(), host);
-                    }
-                    discovery::DiscoveryEvent::Removed { fullname } => {
-                        self.discovered.remove(&fullname);
-                    }
-                }
+                self.on_discovery(ev);
             }
 
             // Shell commands (plus the binary's own seeded initial fetch).
             for cmd in self.bus.drain() {
                 dirty = true;
                 self.handle(cmd);
+                self.stores.forget();
             }
 
             let probe_due = self.last_probe.elapsed() >= Duration::from_secs(10);
             if dirty || probe_due || last_rows.elapsed() >= Duration::from_millis(500) {
-                let rows = self.rows();
-                // The 10 s reachability sweep — saved hosts that don't advertise (routed /
-                // multicast-filtered networks) still get honest presence pips. It reuses this
-                // tick's list rather than building two more of its own.
-                if probe_due {
-                    self.last_probe = Instant::now();
-                    self.sweep(&rows);
-                    self.refresh_host_state(&rows);
-                }
-                self.console.set_hosts(rows);
+                self.publish_rows(probe_due);
                 last_rows = Instant::now();
                 dirty = false;
             }
@@ -526,6 +549,35 @@ impl ServiceState {
         if let Some(c) = &self.wake_cancel {
             c.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// An advert came or went: the list moves, and each saved host may learn from it.
+    fn on_discovery(&mut self, ev: discovery::DiscoveryEvent) {
+        self.learn_due = true;
+        match ev {
+            discovery::DiscoveryEvent::Resolved(host) => {
+                self.discovered.insert(host.fullname.clone(), host);
+            }
+            discovery::DiscoveryEvent::Removed { fullname } => {
+                self.discovered.remove(&fullname);
+            }
+        }
+    }
+
+    /// Rebuild the list for the shell, and on a due tick run the 10 s reachability sweep —
+    /// saved hosts that don't advertise (routed / multicast-filtered networks) still get honest
+    /// presence pips. The sweep reuses this tick's list rather than building two more.
+    fn publish_rows(&mut self, probe_due: bool) {
+        let rows = self.rows();
+        if std::mem::take(&mut self.learn_due) {
+            self.learn_from_adverts();
+        }
+        if probe_due {
+            self.last_probe = Instant::now();
+            self.sweep(&rows);
+            self.refresh_host_state(&rows);
+        }
+        self.console.set_hosts(rows);
     }
 
     fn handle(&mut self, cmd: ConsoleCmd) {
@@ -942,7 +994,7 @@ impl ServiceState {
     /// report it under `req` as Busy, then Paired or Failed. A later pairing makes this
     /// answer stale.
     fn run_pairing(
-        &self,
+        &mut self,
         addr: String,
         port: u16,
         req: RequestKey,
@@ -1247,18 +1299,40 @@ impl ServiceState {
         }
     }
 
-    /// The console home's rows, from the stores as they are on disk now.
-    fn rows(&self) -> Vec<HostRow> {
-        let known = trust::KnownHosts::load();
-        let catalog = pf_client_core::presets::PresetsFile::load();
+    /// The console home's rows, from the stores as the last `refresh` left them.
+    fn rows(&mut self) -> Vec<HostRow> {
+        self.learn_due |= self.stores.refresh();
         let probed = self.probed.lock().unwrap();
         build_rows(
-            &known,
-            &catalog,
+            &self.stores.known,
+            &self.stores.catalog,
             &self.discovered,
             &probed,
             self.seed.as_ref(),
         )
+    }
+
+    /// What each saved host's advert teaches it, while the advert is visible: mgmt port, OS
+    /// chain, wake MAC (a Deck in Gaming Mode runs only this console and the Decky panel),
+    /// and an address the sweep asks; the card moves only once its pin answers there.
+    fn learn_from_adverts(&self) {
+        for h in &self.stores.known.hosts {
+            let advert = self
+                .discovered
+                .values()
+                .find(|d| discovery::same_host(h, d));
+            if let Some(a) = advert {
+                trust::learn_from_advert(
+                    &h.fp_hex,
+                    &h.addr,
+                    h.port,
+                    &a.addr,
+                    &a.mac,
+                    &a.os,
+                    a.mgmt_port,
+                );
+            }
+        }
     }
 }
 
@@ -1292,20 +1366,6 @@ fn build_rows(
             };
             let advert = discovered.values().find(|d| discovery::same_host(h, d));
             let online = probed.get(&key).copied().unwrap_or(false);
-            // Everything the advert teaches, while it is visible: mgmt port, OS chain, wake
-            // MAC (a Deck in Gaming Mode runs only this console and the Decky panel), and an
-            // address the sweep asks; the card moves only once its pin answers there.
-            if let Some(a) = advert {
-                pf_client_core::trust::learn_from_advert(
-                    &h.fp_hex,
-                    &h.addr,
-                    h.port,
-                    &a.addr,
-                    &a.mac,
-                    &a.os,
-                    a.mgmt_port,
-                );
-            }
             let row = HostRow {
                 key: key.clone(),
                 id: h.id.clone(),

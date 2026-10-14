@@ -411,6 +411,29 @@ impl Drop for StoreLock {
     }
 }
 
+/// Size and modification time of a store's files: whether a re-read could find anything new.
+/// A save renames a new file over the old one, so equal stamps mean no save landed between
+/// them. A missing file is a stamp of its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileStamp(Vec<Option<(u64, Option<std::time::SystemTime>)>>);
+
+impl FileStamp {
+    /// Take `paths`' stamp into `self`; `true` when it differs from the one held. A fresh
+    /// `FileStamp::default()` matches no file, so its first call is always `true`.
+    pub(crate) fn moved(&mut self, paths: &[&Path]) -> bool {
+        let now = FileStamp(
+            paths
+                .iter()
+                .map(|p| {
+                    let meta = std::fs::metadata(p).ok()?;
+                    Some((meta.len(), meta.modified().ok()))
+                })
+                .collect(),
+        );
+        std::mem::replace(self, now) != *self
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct KnownHosts {
     pub hosts: Vec<KnownHost>,
@@ -419,6 +442,13 @@ pub struct KnownHosts {
 impl KnownHosts {
     fn path() -> Result<PathBuf> {
         Ok(config_dir()?.join("client-known-hosts.json"))
+    }
+
+    /// [`load`](Self::load), or `None` while the file is as `seen` recorded it. The stamp is
+    /// taken before the read, so a save in between shows on the next call.
+    pub fn load_if_changed(seen: &mut FileStamp) -> Option<KnownHosts> {
+        let path = Self::path().ok()?;
+        seen.moved(&[&path]).then(Self::load)
     }
 
     /// The store, minting ids on records that lack one. The mint is a write, so it is
@@ -1061,6 +1091,24 @@ mod tests {
         assert_eq!(stored.hosts.len(), 1);
         // The thread no longer counts as holding the lock: a later edit takes it again.
         assert!(!LOCK_HELD.get());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A re-read is owed on the first look and after a save, and not otherwise.
+    #[test]
+    fn a_stamp_moves_with_the_file_and_not_without_it() {
+        let _guard = crate::trust::store_health_lock();
+        let path = scratch_store("hosts-stamp");
+        let mut seen = FileStamp::default();
+        assert!(seen.moved(&[&path]), "the first look reads, file or none");
+        assert!(!seen.moved(&[&path]), "a file that stays missing");
+        KnownHosts::locked_at(&path, |k| (true, k.hosts.push(named("one")))).unwrap();
+        assert!(seen.moved(&[&path]), "the file appeared");
+        assert!(!seen.moved(&[&path]));
+        KnownHosts::locked_at(&path, |k| (true, k.hosts.push(named("two")))).unwrap();
+        assert!(seen.moved(&[&path]), "a save that grew the file");
+        std::fs::remove_file(&path).unwrap();
+        assert!(seen.moved(&[&path]), "the file went");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
