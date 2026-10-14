@@ -22,6 +22,9 @@
 pub(crate) mod csc;
 #[cfg(any(target_os = "linux", windows))]
 pub mod cursor;
+// Pure cursor decisions: built (and tested) on every platform, used by `run`.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+mod cursor_model;
 #[cfg(windows)]
 pub(crate) mod d3d11;
 #[cfg(target_os = "linux")]
@@ -42,6 +45,12 @@ pub(crate) mod scale;
 pub mod scroll;
 #[cfg(any(target_os = "linux", windows))]
 mod scroll_routing;
+// Pure swapchain bookkeeping: built (and tested) on every platform, used by `vk`.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+mod swapchain_state;
+// Pure slot pick for the smoothness drain: built (and tested) on every platform.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+mod slot_pick;
 // Pure gesture logic with no SDL or Vulkan dependency: built (and tested) on every platform.
 pub mod touch;
 #[cfg(any(target_os = "linux", windows))]

@@ -29,7 +29,7 @@ impl Presenter {
     pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
         // The native lane owns the window: no surface to size. The next frame through the
         // swapchain path makes both again at the size recorded here.
-        if self.suspended {
+        if self.state.suspended() {
             let (width, height) = window.size_in_pixels();
             self.extent = vk::Extent2D { width, height };
             return Ok(());
@@ -75,11 +75,11 @@ impl Presenter {
         {
             let _q = self.queue_lock.guard();
             // An image acquired ahead of a present belongs to the swapchain that goes now.
-            if self.acquired.is_some() {
+            if self.state.acquired.is_some() {
                 // SAFETY: `queue_lock` is held above.
                 unsafe { self.retire_acquire_sem() }
                     .context("vkQueueSubmit (discard the acquired image)")?;
-                self.acquired = None;
+                self.state.acquired = None;
             }
             // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
             unsafe { self.device.queue_wait_idle(self.queue) }
@@ -148,24 +148,14 @@ impl Presenter {
         if let Some(f) = &self.fse {
             f.acquire(swapchain);
         }
-        // Quiesce covered our cmd bufs, queue drain the presentation-engine
-        // semaphore waits, present-timer drain the last waiter — nothing
-        // still names these objects.
-        self.overlay_pipe.destroy_targets(&self.device);
-        // SAFETY: quiesce, `queue_wait_idle`, and present-timer drain above;
-        // GPU idle on these semaphores and `old`.
-        unsafe {
-            for s in self.render_sems.drain(..) {
-                self.device.destroy_semaphore(s, None);
-            }
-            if old != vk::SwapchainKHR::null() {
-                self.swap_d.destroy_swapchain(old, None);
-            }
-        }
+        // SAFETY: quiesce covered our cmd bufs, the queue drain the presentation-engine
+        // semaphore waits, the present-timer drain the last waiter: nothing still names
+        // the targets, the semaphores or `old`.
+        unsafe { self.destroy_targets(old) };
         self.swapchain = swapchain;
         // SAFETY: `swapchain` was created above; the waiter is drained, so this thread is
         // its only user.
-        self.timing_armed = self
+        self.state.timing_armed = self
             .timing
             .as_ref()
             .is_some_and(|t| unsafe { t.arm(swapchain) });
@@ -200,11 +190,28 @@ impl Presenter {
         Ok(())
     }
 
+    /// The overlay targets, the render semaphores and `swapchain` (null is a no-op).
+    ///
+    /// # Safety
+    /// Nothing in flight names them: our fence, the queue and the present waiter are drained.
+    pub(super) unsafe fn destroy_targets(&mut self, swapchain: vk::SwapchainKHR) {
+        self.overlay_pipe.destroy_targets(&self.device);
+        // SAFETY: the caller's contract.
+        unsafe {
+            for s in self.render_sems.drain(..) {
+                self.device.destroy_semaphore(s, None);
+            }
+            if swapchain != vk::SwapchainKHR::null() {
+                self.swap_d.destroy_swapchain(swapchain, None);
+            }
+        }
+    }
+
     /// Swapchain is HDR10/PQ, or the native lane hands PQ to the compositor with a PQ
     /// description; not a PQ stream tone-mapped onto SDR by us. User-facing "HDR"
     /// indicators should report this, not stream signalling.
     pub fn hdr_active(&self) -> bool {
-        self.hdr_active || (self.native_last && self.native_pq)
+        self.hdr_active || self.state.native_pq()
     }
 
     /// The swapchain holds 10 bits a channel (SDR or HDR10): an overlay drawn in 8 would band.
@@ -325,7 +332,10 @@ impl Presenter {
             self.csc_planar.pipeline_layout,
         )?;
         std::mem::replace(&mut self.direct, new_direct).destroy(&self.device);
-        self.direct_last = None;
+        self.cpu_direct = None;
+        if let Some(h) = self.retired_hw.as_mut() {
+            h.direct = None;
+        }
         self.format = target;
         self.hdr_active = on;
         match self.recreate_swapchain(window) {

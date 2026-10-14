@@ -19,10 +19,6 @@ use std::collections::VecDeque;
 /// 100 ms: an occluded or wedged present is lost; the gate force-opens.
 const STALE_REOPEN_NS: u64 = 100_000_000;
 
-/// Slot-pick margin: 0.5 ms step, 2.5 ms cap. Starts at 0 — a fixed lead is display tax.
-pub(crate) const MARGIN_STEP_NS: u64 = 500_000;
-pub(crate) const MARGIN_MAX_NS: u64 = 2_500_000;
-
 /// Newest-wins (`capacity == 0`: `submit` replaces, `take` clears) or smoothing FIFO
 /// (`capacity 1..=3`: held until due, drop-oldest overflow). The due time's cushion is
 /// the headroom, so an empty store is the steady state and starvation reads as
