@@ -377,10 +377,12 @@ enum Source<'a> {
     Dmabuf(&'a DmabufFrame),
 }
 
-/// Clone the producer hold only for a raw dmabuf submission.
+/// The hold that keeps the captured buffer unrecycled until its AU is retrieved: a stream-ordered
+/// copy or fused pass may still read it after `submit` returns.
 fn source_hold(frame: &CapturedFrame) -> Option<pf_frame::FrameHold> {
     match &frame.payload {
         FramePayload::Dmabuf(d) => d.hold.clone(),
+        FramePayload::Cuda(b) => Some(b.hold()),
         _ => None,
     }
 }

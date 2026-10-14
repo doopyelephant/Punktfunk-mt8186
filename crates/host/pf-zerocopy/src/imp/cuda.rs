@@ -294,9 +294,9 @@ unsafe fn copy_blocking(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
     }
 }
 
-/// Enqueue `copy` with no CPU wait. Stream-ordered consumers only: the source buffer must not
-/// be dropped until downstream stream work (the encode) finishes. A pooled one is recycled on
-/// drop, and the next capture writes over it while this copy may still read.
+/// Enqueue `copy` with no CPU wait. Stream-ordered consumers only: the source buffer, or a
+/// [`DeviceBuffer::hold`] of it, lives until downstream stream work (the encode) finishes. A
+/// pooled one recycles on its last drop, and the next capture writes over it.
 unsafe fn copy_async(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
     // SAFETY: caller: context current and `copy` describes live in-bounds memory that stays valid
     // until the stream work completes.
@@ -550,8 +550,8 @@ impl BufferPool {
         self.height
     }
 
-    /// Recycled if free, else freshly allocated. Returns to this pool on drop, under
-    /// [`DeviceBuffer`]'s rule for unsynced copies. NV12: Y and its paired UV.
+    /// Recycled if free, else freshly allocated. Returns to this pool when the buffer and
+    /// every [`DeviceBuffer::hold`] of it have dropped. NV12: Y and its paired UV.
     pub fn get(&self) -> Result<DeviceBuffer> {
         let reuse = {
             let mut g = self.inner.lock().unwrap();
@@ -571,8 +571,7 @@ impl BufferPool {
             width: self.width,
             height: self.height,
             planes: Planes::new(self.layout, uv.map(|uv| (uv, self.uv_pitch))),
-            pool: Some(self.inner.clone()),
-            remote_release: None,
+            backing: Backing::new(ptr, uv, Owner::Pool(self.inner.clone())),
         })
     }
 }
@@ -599,19 +598,73 @@ impl Planes {
 }
 
 /// Pitched device buffer for one captured frame. Filled from the EGL-mapped dmabuf so the dmabuf
-/// can return to the compositor immediately. Pooled buffers recycle on drop; others free.
+/// can return to the compositor immediately.
 ///
-/// Drop cannot tell whether a copy still reads the buffer. Whoever issues a `sync: false` copy
-/// out of it keeps it alive until that copy ran: the safety contract of each copy function.
+/// The allocation is freed, recycled or released when the buffer and every [`hold`](Self::hold)
+/// have dropped. Drop cannot tell whether a copy still reads it: whoever issues a `sync: false`
+/// copy out of it keeps a hold until that copy ran, the safety contract of each copy function.
 pub struct DeviceBuffer {
     pub ptr: CUdeviceptr,
     pub pitch: usize,
     pub width: u32,
     pub height: u32,
     planes: Planes,
-    pool: Option<Arc<Mutex<PoolInner>>>,
-    /// IPC import: drop runs this once (owner recycles). Must not free or pool-recycle locally.
-    remote_release: Option<Box<dyn FnOnce() + Send>>,
+    backing: Arc<Backing>,
+}
+
+/// Where a [`DeviceBuffer`]'s allocation goes on the last drop of the buffer and its holds.
+enum Owner {
+    /// Standalone: freed here.
+    Alloc,
+    Pool(Arc<Mutex<PoolInner>>),
+    /// IPC import: the release runs once and the owning process recycles. Never freed here.
+    Remote(Mutex<Option<Box<dyn FnOnce() + Send>>>),
+}
+
+/// The allocation behind a [`DeviceBuffer`], shared with its holds.
+struct Backing {
+    ptr: CUdeviceptr,
+    /// NV12 chroma, its own allocation.
+    uv: Option<CUdeviceptr>,
+    owner: Owner,
+}
+
+impl Backing {
+    fn new(ptr: CUdeviceptr, uv: Option<CUdeviceptr>, owner: Owner) -> Arc<Backing> {
+        Arc::new(Backing { ptr, uv, owner })
+    }
+}
+
+impl Drop for Backing {
+    fn drop(&mut self) {
+        match &mut self.owner {
+            Owner::Remote(release) => {
+                let release = release.get_mut().unwrap_or_else(|e| e.into_inner());
+                if let Some(release) = release.take() {
+                    release();
+                }
+            }
+            _ if self.ptr == 0 => {}
+            Owner::Pool(pool) => {
+                // The next `get` overwrites it. Y and UV go back together so `get` can pop them as a unit.
+                let mut g = pool.lock().unwrap();
+                g.free.push(self.ptr);
+                g.free_uv.extend(self.uv);
+            }
+            Owner::Alloc => {
+                bind_shared_ctx();
+                // SAFETY: the last owner of a standalone allocation: `self.ptr` and its chroma
+                // each came from `cuMemAllocPitch_v2`, freed once (`ptr == 0` skipped above).
+                // Context is set current first: drop may run on the encode thread, where it isn't.
+                unsafe {
+                    let _ = cuMemFree_v2(self.ptr);
+                    if let Some(uv_ptr) = self.uv {
+                        let _ = cuMemFree_v2(uv_ptr);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl DeviceBuffer {
@@ -624,9 +677,14 @@ impl DeviceBuffer {
             width,
             height,
             planes: Planes::new(layout, uv),
-            pool: None,
-            remote_release: None,
+            backing: Backing::new(ptr, uv.map(|(uv, _)| uv), Owner::Alloc),
         })
+    }
+
+    /// Keeps the allocation from being recycled, released or freed while it lives, whether or not
+    /// this buffer has dropped. A reader of a `sync: false` copy holds one until the copy ran.
+    pub fn hold(&self) -> Arc<dyn std::any::Any + Send + Sync> {
+        self.backing.clone()
     }
 
     pub fn layout(&self) -> PlaneLayout {
@@ -701,39 +759,11 @@ impl DeviceBuffer {
                 (None, true) => Planes::Yuv444,
                 (None, false) => Planes::Packed32,
             },
-            pool: None,
-            remote_release: Some(release),
-        }
-    }
-}
-
-impl Drop for DeviceBuffer {
-    fn drop(&mut self) {
-        if let Some(release) = self.remote_release.take() {
-            release();
-            return;
-        }
-        if self.ptr == 0 {
-            return;
-        }
-        if let Some(pool) = &self.pool {
-            // The next `get` overwrites it. Y and UV go back together so `get` can pop them as a unit.
-            let mut g = pool.lock().unwrap();
-            g.free.push(self.ptr);
-            if let Some((uv_ptr, _)) = self.uv() {
-                g.free_uv.push(uv_ptr);
-            }
-        } else {
-            bind_shared_ctx();
-            // SAFETY: un-pooled: this buffer exclusively owns `self.ptr` and its chroma, each from
-            // `cuMemAllocPitch_v2`, freed once (`ptr == 0` skipped above). Context is set current
-            // first: drop may run on the encode thread, where it isn't.
-            unsafe {
-                let _ = cuMemFree_v2(self.ptr);
-                if let Some((uv_ptr, _)) = self.uv() {
-                    let _ = cuMemFree_v2(uv_ptr);
-                }
-            }
+            backing: Backing::new(
+                ptr,
+                uv.map(|(uv, _)| uv),
+                Owner::Remote(Mutex::new(Some(release))),
+            ),
         }
     }
 }
@@ -848,8 +878,8 @@ pub unsafe fn copy_surface_to_surface(
 ///
 /// # Safety
 /// The context is current, `src` describes a live allocation, `dst_ptr` is a live allocation of
-/// `src.height` rows of `dst_pitch` ≥ `src.width * 4` bytes, and with `sync: false` `src` is not
-/// dropped until downstream stream work completes.
+/// `src.height` rows of `dst_pitch` ≥ `src.width * 4` bytes, and with `sync: false` `src` or a
+/// [`DeviceBuffer::hold`] of it lives until downstream stream work completes.
 pub unsafe fn copy_device_to_device(
     src: &DeviceBuffer,
     dst_ptr: CUdeviceptr,
@@ -888,8 +918,8 @@ fn device_copy(
 ///
 /// # Safety
 /// The context is current, `src` describes a live allocation, each `dsts` plane is live with
-/// the rows its layout's plane table gives it at that pitch, and with `sync: false` `src` is
-/// not dropped until downstream stream work completes.
+/// the rows its layout's plane table gives it at that pitch, and with `sync: false` `src` or a
+/// [`DeviceBuffer::hold`] of it lives until downstream stream work completes.
 unsafe fn copy_planes_to_device(
     src: &DeviceBuffer,
     dsts: &[(CUdeviceptr, usize)],
@@ -921,7 +951,8 @@ unsafe fn copy_planes_to_device(
 /// # Safety
 /// The context is current, `src` describes a live allocation, `y_dst`/`uv_dst` are live planes
 /// at `y_pitch`/`uv_pitch` holding [`PlaneLayout::Nv12`]'s rows for `src`, and with
-/// `sync: false` `src` is not dropped until downstream stream work completes.
+/// `sync: false` `src` or a [`DeviceBuffer::hold`] of it lives until downstream stream work
+/// completes.
 pub unsafe fn copy_nv12_to_device(
     src: &DeviceBuffer,
     y_dst: CUdeviceptr,
@@ -940,8 +971,8 @@ pub unsafe fn copy_nv12_to_device(
 ///
 /// # Safety
 /// The context is current, `src` describes a live stacked allocation, each `dsts` plane is live
-/// with `src.height` rows of its pitch ≥ `src.width`, and with `sync: false` `src` is not
-/// dropped until downstream stream work completes.
+/// with `src.height` rows of its pitch ≥ `src.width`, and with `sync: false` `src` or a
+/// [`DeviceBuffer::hold`] of it lives until downstream stream work completes.
 pub unsafe fn copy_yuv444_to_device(
     src: &DeviceBuffer,
     dsts: [(CUdeviceptr, usize); 3],
@@ -1200,7 +1231,50 @@ pub unsafe fn copy_pitched_nv12_to_buffer(
 
 #[cfg(test)]
 mod tests {
-    use super::PlaneLayout;
+    use super::{DeviceBuffer, PlaneLayout, PoolInner};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// A pooled buffer recycles, and an imported one releases, only once its last hold drops.
+    /// Fake pointers: the pool is drained before it drops, so nothing reaches `cuMemFree`.
+    #[test]
+    fn the_last_hold_recycles_the_buffer() {
+        let fake = |owner| DeviceBuffer {
+            ptr: 0x1000,
+            pitch: 64,
+            width: 16,
+            height: 16,
+            planes: super::Planes::Nv12(0x2000, 64),
+            backing: super::Backing::new(0x1000, Some(0x2000), owner),
+        };
+        let pool = Arc::new(Mutex::new(PoolInner {
+            free: vec![],
+            free_uv: vec![],
+        }));
+        let buf = fake(super::Owner::Pool(pool.clone()));
+        let hold = buf.hold();
+        drop(buf);
+        assert!(pool.lock().unwrap().free.is_empty());
+        drop(hold);
+        let mut g = pool.lock().unwrap();
+        assert_eq!(
+            (&g.free[..], &g.free_uv[..]),
+            (&[0x1000][..], &[0x2000][..])
+        );
+        g.free.clear();
+        g.free_uv.clear();
+
+        let released = Arc::new(AtomicBool::new(false));
+        let flag = released.clone();
+        let release: Box<dyn FnOnce() + Send> =
+            Box::new(move || flag.store(true, Ordering::SeqCst));
+        let buf = fake(super::Owner::Remote(Mutex::new(Some(release))));
+        let hold = buf.hold();
+        drop(buf);
+        assert!(!released.load(Ordering::SeqCst));
+        drop(hold);
+        assert!(released.load(Ordering::SeqCst));
+    }
 
     /// An odd height keeps its last chroma row, and one stacked allocation covers every plane.
     #[test]
