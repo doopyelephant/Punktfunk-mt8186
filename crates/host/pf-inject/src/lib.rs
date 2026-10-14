@@ -16,10 +16,8 @@ use punktfunk_core::input::{InputEvent, InputKind};
 
 #[path = "inject/keymap.rs"]
 mod keymap;
-#[cfg(target_os = "linux")]
-pub(crate) use keymap::gs_button_to_evdev;
 pub use keymap::KEY_FLAG_SEMANTIC_VK;
-// Linux injectors always call this; Windows only the SendInput mirror test. Keep the re-export.
+// The Linux plan maps keys through this; the SendInput mirror test pins its table to it.
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub use keymap::vk_to_evdev;
 
@@ -175,9 +173,6 @@ pub(crate) fn bump_aim_gen() {
 pub(crate) fn aim_gen() -> u64 {
     AIM_GEN.load(std::sync::atomic::Ordering::Relaxed)
 }
-
-#[cfg(target_os = "linux")]
-pub(crate) use plan::ABS_EDGE;
 
 /// Streamed head's mode, published beside the aim at capture bring-up.
 static STREAM_EXTENT: std::sync::RwLock<Option<(u16, u16)>> = std::sync::RwLock::new(None);

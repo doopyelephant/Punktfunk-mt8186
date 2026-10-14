@@ -14,9 +14,9 @@
 //! no keymap to upload and no modifier mask to serialize — modifier keys arrive as
 //! normal key events.
 
-use super::{gs_button_to_evdev, vk_to_evdev, InputInjector};
+use super::InputInjector;
 use crate::head_pick::{self, HeadFacts, StreamTarget};
-use crate::held::HeldInput;
+use crate::plan::{Abs, Op, Plan};
 use crate::scroll::{mutter_axis_calls, ScrollBackend, ScrollMapper, ScrollOp};
 use crate::AbsoluteAnchor;
 use anyhow::{anyhow, Result};
@@ -469,10 +469,9 @@ struct EiState {
     injected: u64,
     /// [`InputKind`]s already logged once (first of each kind).
     seen_kinds: u32,
-    /// Presses the compositor saw and has not seen released, as their wire codes (keys as
-    /// the truncated VK). Released at session end ([`EiState::release_all`]): a vanished
-    /// client must not leave a latched key or Mutter's implicit grab.
-    held: HeldInput,
+    /// What this connection's devices hold. Released at session end ([`EiState::release_all`]):
+    /// a vanished client must not leave a latched key or Mutter's implicit grab.
+    plan: Plan,
     /// Touch id currently driving the absolute pointer ([`EiState::degrade_touch`]).
     /// `None` between touches.
     degraded_touch: Option<u32>,
@@ -582,7 +581,7 @@ impl EiState {
             sequence: 0,
             injected: 0,
             seen_kinds: 0,
-            held: HeldInput::default(),
+            plan: Plan::default(),
             degraded_touch: None,
             output_hint: None,
             gamescope: false,
@@ -614,13 +613,13 @@ impl EiState {
         }
     }
 
-    /// Synthesize wire-level releases through [`EiState::inject`] so the
-    /// compositor sees key-up / button-up / touch-up before devices disappear.
+    /// Send the plan's releases so the compositor sees key-up / button-up / touch-up before
+    /// devices disappear.
     fn release_all(&mut self, ctx: &ei::Context) {
-        // A degraded touch's left button is in `held`. Clear the primary-finger latch too, or
+        // A degraded touch's left button is in the plan. Clear the primary-finger latch too, or
         // the next session's first TouchDown reads as a second finger and is ignored.
         self.degraded_touch = None;
-        let ups = self.held.release();
+        let ups = self.plan.release();
         // A scroll gesture still open ends cancelled, or its kinetic tail
         // outlives the session.
         let scroll_ops = self.scroll.cancel_all();
@@ -631,8 +630,8 @@ impl EiState {
             held = ups.len(),
             "libei: releasing input still held at session end"
         );
-        for up in &ups {
-            self.inject(up, ctx);
+        for op in ups {
+            self.send(op, ctx, 0, true);
         }
         self.exec_scroll(scroll_ops, ctx);
     }
@@ -785,25 +784,60 @@ impl EiState {
             self.degrade_touch(ev, ctx);
             return;
         }
-        let Some(cap) = capability_for(ev.kind) else {
-            return;
-        };
         self.injected += 1;
         let n = self.injected;
         let bit = kind_bit(ev.kind);
         let first = self.seen_kinds & bit == 0;
         self.seen_kinds |= bit;
         let loud = first || n <= 5 || n % 600 == 0;
-        if self.mutter_axis.is_some() && cap == DeviceCapability::Scroll {
+        if matches!(ev.kind, InputKind::MouseScroll | InputKind::Scroll) {
+            self.inject_scroll(ev, ctx, n, loud);
+        } else if let Some(op) = self.plan.step(ev) {
+            self.send(op, ctx, n, loud);
+        }
+    }
+
+    /// Legacy and normalized scroll share the mapper, through Mutter's session call or on the
+    /// EIS scroll device. The plan carries ei's framing rules: a Begin-cancel gets its own
+    /// frame and a stop never shares one with a nonzero delta.
+    fn inject_scroll(&mut self, ev: &InputEvent, ctx: &ei::Context, n: u64, loud: bool) {
+        if self.mutter_axis.is_some() {
             let ops = self.scroll.plan(ev);
             self.exec_scroll(ops, ctx);
             return;
         }
-        let Some(idx) = self.device_for(cap) else {
-            self.drop_without_device(ev, cap, n, loud);
+        let Some(idx) = self.device_for(DeviceCapability::Scroll) else {
+            self.drop_without_device(DeviceCapability::Scroll, n, loud);
             return;
         };
-        let emitted = self.emit(idx, ev);
+        let dev = self.devices[idx].device.device().clone();
+        self.ensure_emulating(idx, &dev);
+        if let Some(s) = self.devices[idx].device.interface::<ei::Scroll>() {
+            exec_scroll_ops(&s, &dev, self.last_serial, self.scroll.plan(ev));
+        }
+        self.flush(ctx, loud);
+        if loud {
+            tracing::debug!(n, kind = ?ev.kind, idx, "libei: emitted");
+        }
+    }
+
+    /// Emit `op` on the first resumed device with its capability, sampled by `loud`.
+    fn send(&mut self, op: Op, ctx: &ei::Context, n: u64, loud: bool) {
+        let Some(cap) = capability_for(&op) else {
+            return;
+        };
+        let Some(idx) = self.device_for(cap) else {
+            self.drop_without_device(cap, n, loud);
+            return;
+        };
+        let emitted = self.emit(idx, op);
+        self.flush(ctx, loud);
+        if loud {
+            tracing::debug!(n, ?op, idx, emitted, "libei: emitted");
+        }
+    }
+
+    fn flush(&self, ctx: &ei::Context, loud: bool) {
         if let Err(e) = ctx.flush() {
             // Dead EIS fails flush on every event (mouse-move = 100s/s); same
             // `loud` sampler as the sibling warns.
@@ -811,28 +845,21 @@ impl EiState {
                 tracing::warn!(error = %e, "libei: ctx.flush failed");
             }
         }
-        if loud {
-            tracing::debug!(n, kind = ?ev.kind, idx, emitted, "libei: emitted");
-        }
     }
 
     /// Report an event no resumed device can take, sampled by `loud`. Touch also warns once:
     /// the portal may grant a touchscreen that EIS never creates.
-    fn drop_without_device(&self, ev: &InputEvent, cap: DeviceCapability, n: u64, loud: bool) {
+    fn drop_without_device(&self, cap: DeviceCapability, n: u64, loud: bool) {
         if loud {
             tracing::warn!(
                 n,
-                kind = ?ev.kind,
                 ?cap,
                 devices = self.devices.len(),
                 resumed = self.devices.iter().filter(|d| d.resumed).count(),
                 "libei: dropped event — no resumed device exposes this capability"
             );
         }
-        if matches!(
-            ev.kind,
-            InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp
-        ) {
+        if cap == DeviceCapability::Touch {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -846,130 +873,93 @@ impl EiState {
     }
 
     /// [`abs_point`] with this session's stream target and output hint.
-    fn map_abs(&self, regions: &[reis::event::Region], ev: &InputEvent) -> Option<(f32, f32)> {
-        abs_point(regions, &crate::stream_target(), self.output_hint, ev)
+    fn map_abs(&self, regions: &[reis::event::Region], abs: &Abs) -> (f32, f32) {
+        abs_point(regions, &crate::stream_target(), self.output_hint, abs)
     }
 
-    /// Emit `ev` on device `idx` in its own frame, and note what the compositor now holds.
-    /// `false` when nothing was framed: the device lacks the interface, the code has no
-    /// mapping, or the scroll plan framed itself.
-    fn emit(&mut self, idx: usize, ev: &InputEvent) -> bool {
+    /// Emit `op` on device `idx` in its own frame. `false` when the device lacks the interface.
+    fn emit(&mut self, idx: usize, op: Op) -> bool {
         let dev = self.devices[idx].device.device().clone();
         self.ensure_emulating(idx, &dev);
 
         let mut emitted = true;
         let slot = &self.devices[idx].device;
-        match ev.kind {
-            InputKind::MouseMove => match slot.interface::<ei::Pointer>() {
-                Some(p) => p.motion_relative(ev.x as f32, ev.y as f32),
+        match op {
+            Op::Motion { dx, dy } => match slot.interface::<ei::Pointer>() {
+                Some(p) => p.motion_relative(dx as f32, dy as f32),
                 None => emitted = false,
             },
-            InputKind::MouseMoveAbs => match slot.interface::<ei::PointerAbsolute>() {
-                Some(p) => match self.map_abs(slot.regions(), ev) {
-                    Some((x, y)) => p.motion_absolute(x, y),
-                    None => emitted = false,
-                },
-                None => emitted = false,
-            },
-            InputKind::MouseButtonDown | InputKind::MouseButtonUp => {
-                match (slot.interface::<ei::Button>(), gs_button_to_evdev(ev.code)) {
-                    (Some(b), Some(btn)) => {
-                        let st = if ev.kind == InputKind::MouseButtonDown {
-                            ei::button::ButtonState::Press
-                        } else {
-                            ei::button::ButtonState::Released
-                        };
-                        b.button(btn, st);
-                    }
-                    _ => emitted = false,
-                }
-            }
-            // Legacy and normalized scroll share the mapper. The plan carries
-            // ei's framing rules: a Begin-cancel gets its own frame and a stop
-            // never shares one with a nonzero delta.
-            InputKind::MouseScroll | InputKind::Scroll => match slot.interface::<ei::Scroll>() {
-                Some(s) => {
-                    exec_scroll_ops(&s, &dev, self.last_serial, self.scroll.plan(ev));
-                    emitted = false; // plan Frame ops did the framing
+            Op::Absolute(abs) => match slot.interface::<ei::PointerAbsolute>() {
+                Some(p) => {
+                    let (x, y) = self.map_abs(slot.regions(), &abs);
+                    p.motion_absolute(x, y);
                 }
                 None => emitted = false,
             },
-            InputKind::KeyDown | InputKind::KeyUp => {
-                match (slot.interface::<ei::Keyboard>(), vk_to_evdev(ev.code as u8)) {
-                    (Some(k), Some(evdev)) => {
-                        let st = if ev.kind == InputKind::KeyDown {
-                            ei::keyboard::KeyState::Press
-                        } else {
-                            ei::keyboard::KeyState::Released
-                        };
-                        k.key(evdev as u32, st);
-                    }
-                    _ => {
-                        emitted = false;
-                        tracing::debug!(vk = ev.code, "libei: unmapped VK keycode — dropped");
-                    }
+            Op::Button { evdev, down } => match slot.interface::<ei::Button>() {
+                Some(b) => {
+                    let st = if down {
+                        ei::button::ButtonState::Press
+                    } else {
+                        ei::button::ButtonState::Released
+                    };
+                    b.button(evdev, st);
                 }
-            }
-            // `code` is the touch id. One event = one frame (ei_touchscreen
-            // forbids down/motion/up sharing a frame).
-            InputKind::TouchDown | InputKind::TouchMove => {
+                None => emitted = false,
+            },
+            Op::Key { evdev, down, .. } => match slot.interface::<ei::Keyboard>() {
+                Some(k) => {
+                    let st = if down {
+                        ei::keyboard::KeyState::Press
+                    } else {
+                        ei::keyboard::KeyState::Released
+                    };
+                    k.key(evdev.into(), st);
+                }
+                None => emitted = false,
+            },
+            // One event = one frame: ei_touchscreen forbids down/motion/up sharing one.
+            Op::TouchDown { id, at } | Op::TouchMove { id, at } => {
                 match slot.interface::<ei::Touchscreen>() {
-                    Some(t) => match self.map_abs(slot.regions(), ev) {
-                        Some((x, y)) if ev.kind == InputKind::TouchDown => t.down(ev.code, x, y),
-                        Some((x, y)) => t.motion(ev.code, x, y),
-                        None => emitted = false,
-                    },
+                    Some(t) => {
+                        let (x, y) = self.map_abs(slot.regions(), &at);
+                        if matches!(op, Op::TouchDown { .. }) {
+                            t.down(id, x, y);
+                        } else {
+                            t.motion(id, x, y);
+                        }
+                    }
                     None => emitted = false,
                 }
             }
-            InputKind::TouchUp => match slot.interface::<ei::Touchscreen>() {
-                Some(t) => t.up(ev.code),
+            Op::TouchUp { id } => match slot.interface::<ei::Touchscreen>() {
+                Some(t) => t.up(id),
                 None => emitted = false,
             },
-            InputKind::GamepadState
-            | InputKind::GamepadButton
-            | InputKind::GamepadAxis
-            | InputKind::GamepadRemove
-            | InputKind::GamepadArrival
-            | InputKind::TextInput => emitted = false,
+            Op::Text(_) => emitted = false,
         }
 
         if emitted {
-            // Hold the injected code, not the raw wire code: `vk_to_evdev` truncates to u8,
-            // so 0x41 and 0x141 press the same key and either KeyUp must release it.
-            let code = match ev.kind {
-                InputKind::KeyDown | InputKind::KeyUp => ev.code & 0xff,
-                _ => ev.code,
-            };
-            self.held.note(&InputEvent { code, ..*ev });
             dev.frame(self.last_serial, crate::monotonic_us());
         }
         emitted
     }
 }
 
-/// The EI capability `kind` needs. `None` for gamepads, which take the uinput path, and for
-/// committed text: keycodes go against the server's keymap, and `HOST_CAP_TEXT_INPUT` is
-/// not advertised on this backend.
-fn capability_for(kind: InputKind) -> Option<DeviceCapability> {
-    Some(match kind {
-        InputKind::MouseMove => DeviceCapability::Pointer,
-        InputKind::MouseMoveAbs => DeviceCapability::PointerAbsolute,
-        InputKind::MouseButtonDown | InputKind::MouseButtonUp => DeviceCapability::Button,
-        InputKind::MouseScroll | InputKind::Scroll => DeviceCapability::Scroll,
-        InputKind::KeyDown | InputKind::KeyUp => DeviceCapability::Keyboard,
-        InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => DeviceCapability::Touch,
-        InputKind::GamepadState
-        | InputKind::GamepadButton
-        | InputKind::GamepadAxis
-        | InputKind::GamepadRemove
-        | InputKind::GamepadArrival
-        | InputKind::TextInput => return None,
+/// The EI capability `op` needs. `None` for committed text: keycodes go against the server's
+/// keymap, and `HOST_CAP_TEXT_INPUT` is not advertised on this backend.
+fn capability_for(op: &Op) -> Option<DeviceCapability> {
+    Some(match op {
+        Op::Motion { .. } => DeviceCapability::Pointer,
+        Op::Absolute(_) => DeviceCapability::PointerAbsolute,
+        Op::Button { .. } => DeviceCapability::Button,
+        Op::Key { .. } => DeviceCapability::Keyboard,
+        Op::TouchDown { .. } | Op::TouchMove { .. } | Op::TouchUp { .. } => DeviceCapability::Touch,
+        Op::Text(_) => return None,
     })
 }
 
-/// Where an absolute sample (pointer or touch) lands in compositor space. `x`/`y` are client
-/// pixels and `flags` packs the client surface w/h; `None` for a zero-sized surface.
+/// Where an absolute sample (pointer or touch) lands in compositor space.
 ///
 /// The normalized position maps into the region [`head_pick::pick`] names, else the first
 /// region: EI must name one. [`sane_region`] rejects gamescope's INT32_MAX "raw" region,
@@ -980,23 +970,19 @@ fn abs_point(
     regions: &[reis::event::Region],
     target: &StreamTarget,
     hint: Option<(u32, u32)>,
-    ev: &InputEvent,
-) -> Option<(f32, f32)> {
-    let (w, h) = ((ev.flags >> 16) & 0xffff, ev.flags & 0xffff);
-    if w == 0 || h == 0 {
-        return None;
-    }
-    let nx = (ev.x as f32 / w as f32).clamp(0.0, crate::ABS_EDGE);
-    let ny = (ev.y as f32 / h as f32).clamp(0.0, crate::ABS_EDGE);
+    abs: &Abs,
+) -> (f32, f32) {
+    let (nx, ny) = abs.normalized();
+    let (nx, ny) = (nx as f32, ny as f32);
     let heads = region_facts(regions);
     let anchor = target.anchor.as_ref();
     if let Some(a) = anchor.filter(|a| !head_pick::anchor_matches(&heads, a)) {
         warn_anchor_miss(a, regions);
     }
-    let picked = head_pick::pick(&heads, target, Some((w, h)))
+    let picked = head_pick::pick(&heads, target, Some((abs.w, abs.h)))
         .map(|i| &regions[i])
         .or_else(|| regions.first());
-    Some(match picked.filter(|r| sane_region(r)) {
+    match picked.filter(|r| sane_region(r)) {
         Some(region) => {
             note_abs_region(region, anchor);
             (
@@ -1006,9 +992,9 @@ fn abs_point(
         }
         None => match hint {
             Some((ow, oh)) => (nx * ow as f32, ny * oh as f32),
-            None => (ev.x as f32, ev.y as f32),
+            None => (abs.x as f32, abs.y as f32),
         },
-    })
+    }
 }
 
 #[cfg(test)]
@@ -1027,38 +1013,31 @@ mod tests {
     }
 
     /// Pointer and touch share one ladder: the picked region, else the output hint, else
-    /// raw client pixels. A zero-sized surface maps nowhere.
+    /// raw client pixels.
     #[test]
     fn an_absolute_sample_maps_into_the_region_then_the_hint_then_raw_pixels() {
-        let ev = InputEvent {
-            kind: InputKind::TouchDown,
-            _pad: [0; 3],
-            code: 0,
+        let abs = Abs {
             x: 960,
             y: 540,
-            flags: (1920 << 16) | 1080,
+            w: 1920,
+            h: 1080,
         };
         let none = StreamTarget::default();
         let head = [region(1920, 0, 3840, 2160, None)];
-        assert_eq!(abs_point(&head, &none, None, &ev), Some((3840.0, 1080.0)));
+        assert_eq!(abs_point(&head, &none, None, &abs), (3840.0, 1080.0));
         // No region matches: EI must name one, so the first takes it.
         let unmatched = [
             region(0, 0, 1000, 1000, None),
             region(1000, 0, 640, 200, None),
         ];
-        assert_eq!(
-            abs_point(&unmatched, &none, None, &ev),
-            Some((500.0, 500.0))
-        );
+        assert_eq!(abs_point(&unmatched, &none, None, &abs), (500.0, 500.0));
         // gamescope's "raw" sentinel is no region to normalize into.
         let raw = [region(0, 0, i32::MAX as u32, i32::MAX as u32, None)];
         assert_eq!(
-            abs_point(&raw, &none, Some((1280, 800)), &ev),
-            Some((640.0, 400.0))
+            abs_point(&raw, &none, Some((1280, 800)), &abs),
+            (640.0, 400.0)
         );
-        assert_eq!(abs_point(&raw, &none, None, &ev), Some((960.0, 540.0)));
-        let zero = InputEvent { flags: 0, ..ev };
-        assert_eq!(abs_point(&head, &none, None, &zero), None);
+        assert_eq!(abs_point(&raw, &none, None, &abs), (960.0, 540.0));
     }
 
     /// An empty anchor is the same as none — callers may build one unconditionally.
