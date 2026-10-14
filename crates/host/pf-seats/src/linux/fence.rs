@@ -5,7 +5,7 @@
 //! is the binary's to map, by the port the supervisor recorded. A seat's uinput proxy carries
 //! its account in its name.
 
-use super::accounts;
+use super::{accounts, session};
 use crate::ipc::{Diagnostic, DiagnosticLevel};
 use std::path::Path;
 
@@ -86,14 +86,21 @@ pub fn run() {
     }
 }
 
-/// The rule's lines for `account`, when it names a user other than root.
+/// The rule's lines for `account`, when it is a seat's user or the owner's row's. Any other
+/// stamp, root's included, maps to nobody.
 pub fn print_for(account: &str) {
     let Ok(Some(user)) = accounts::lookup(account) else {
         return;
     };
-    if user.uid != 0 {
+    if user.uid != 0 && fenced(&user, &session::env_path(account)) {
         print!("{}", lines(account, user.uid));
     }
+}
+
+/// Whether `user` has a ledger row: a seat's marker, or `unit_env`, the environment the
+/// supervisor writes for a row and that only the owner's row has without the marker.
+fn fenced(user: &accounts::Passwd, unit_env: &Path) -> bool {
+    accounts::is_seat(user) || unit_env.exists()
 }
 
 /// What the rule reads: the user, its uid and the seat name the node goes on.
@@ -219,6 +226,22 @@ mod tests {
         std::fs::write(hid.join("uevent"), "HID_PHYS=usb-0000:00:14.0-1/input0\n").unwrap();
         assert_eq!(seat_of_sysfs(&input.join("event5")), None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stamp maps only to a seat's account or the owner's row's; a person's account the
+    /// supervisor wrote nothing for is nobody's.
+    #[test]
+    fn only_a_seat_or_the_owners_row_is_fenced() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = temp.path().join("bob.env");
+        let user = |gecos: &str| {
+            accounts::parse_passwd(&format!("bob:x:1000:1000:{gecos}:/home/bob:/bin/sh")).unwrap()
+        };
+        let seat = user("punktfunk-seat=0123456789abcdef0123456789abcdef");
+        assert!(fenced(&seat, &env), "a seat's account");
+        assert!(!fenced(&user("Bob"), &env), "a person with no row");
+        std::fs::write(&env, "").unwrap();
+        assert!(fenced(&user("Bob"), &env), "the owner's row");
     }
 
     #[test]
