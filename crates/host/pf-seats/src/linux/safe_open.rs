@@ -1,8 +1,10 @@
 //! How root reads a file in a tree another uid can write: the box's, a seat's home, the owner's.
 //!
-//! The last step is always `O_NOFOLLOW`, so a link is refused. Only a regular file with one link
-//! and within its size cap is read. A directory inside such a tree is opened the same way, one
-//! component at a time ([`dir_at`]); a path is followed only up to a directory root owns.
+//! The last step is always `O_NOFOLLOW | O_NONBLOCK`, so a link is refused and a FIFO or device
+//! answers at once instead of stalling the supervisor. Only a regular file with one link and
+//! within its size cap is read. A directory inside such a tree is opened the same way, one
+//! component at a time ([`dir_at`], [`walk`]); a path is followed only up to a directory root
+//! owns.
 
 use rustix::fs::{Mode, OFlags};
 use std::io::Read as _;
@@ -22,7 +24,7 @@ pub(super) fn dir_at(at: impl AsFd, name: &str) -> std::io::Result<Option<OwnedF
 }
 
 fn open_at(at: impl AsFd, name: &str, extra: OFlags) -> std::io::Result<Option<OwnedFd>> {
-    let flags = extra | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let flags = extra | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     match rustix::fs::openat(at, name, flags, Mode::empty()) {
         Ok(fd) => Ok(Some(fd)),
         Err(e) if e == rustix::io::Errno::NOENT => Ok(None),
@@ -36,7 +38,7 @@ pub(super) fn file_at(
     name: &str,
     max: u64,
 ) -> std::io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
-    let Some(fd) = open_at(at, name, OFlags::empty())? else {
+    let Some(fd) = open_at(at, name, OFlags::NOCTTY)? else {
         return Ok(None);
     };
     let file = std::fs::File::from(fd);
@@ -85,4 +87,16 @@ pub(super) fn read(path: &Path, max: u64) -> std::io::Result<Option<(Vec<u8>, st
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// `names` below `at`, one directory at a time, none of them a link. `None` when one is absent.
+pub(super) fn walk(at: OwnedFd, names: &[&str]) -> std::io::Result<Option<OwnedFd>> {
+    let mut at = at;
+    for name in names {
+        match dir_at(&at, name)? {
+            Some(next) => at = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(at))
 }

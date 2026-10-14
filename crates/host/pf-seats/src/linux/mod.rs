@@ -595,15 +595,20 @@ impl PlatformBackend for LinuxBackend {
         Ok(state.runtime())
     }
 
-    /// `~/.config/punktfunk` of the seat's account: the `PUNKTFUNK_CONFIG_DIR` a seat host gets,
-    /// and the default the owner's own host keeps.
+    /// A root-owned copy of the certificate the seat's host serves from `~/.config/punktfunk`,
+    /// for the service to pin. That home is an account's root doesn't own, so the copy is taken
+    /// through directory handles and never waits on what is there ([`shared::copy_pin`]).
     fn host_config_dir(&self, seat: &Seat) -> Option<PathBuf> {
         let passwd = if seat.owner {
             accounts::require_owner(&seat.account)
         } else {
             accounts::require(seat)
         };
-        Some(passwd.ok()?.home.join(".config/punktfunk"))
+        let dir = shared::pin_dir(&self.inner.state, &seat.id);
+        if let Err(error) = shared::copy_pin(&passwd.ok()?.home, &dir) {
+            tracing::debug!(seat = %seat.id, %error, "seat host's certificate not read");
+        }
+        Some(dir)
     }
 
     fn doctor(&self, ledger: &Ledger) -> Result<Vec<Diagnostic>, BackendError> {

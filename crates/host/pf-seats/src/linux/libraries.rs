@@ -24,7 +24,7 @@ use crate::backend::BackendError;
 use crate::model::SeatId;
 use crate::steam;
 use std::collections::HashSet;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -474,53 +474,37 @@ pub(super) fn register(state: &Path, id: &SeatId, seat: &Passwd, libraries: &[Li
 }
 
 /// Rewrites `.local/share/Steam/<dir>/libraryfolders.vdf` under `home` through `merge`. Root
-/// writes in a tree the seat user owns, so no link on the way is followed, and the new file is
-/// the seat's. An absent file stays absent: Steam writes its own on first run.
+/// writes in a tree the seat user owns, so it goes through [`safe_open`]: no link on the way is
+/// followed, a FIFO there doesn't block, and the new file is the seat's. An absent file stays
+/// absent: Steam writes its own on first run.
 pub(super) fn merge_list(
     home: &Path,
     dir: &str,
     seat: &Passwd,
     merge: impl Fn(&str) -> Option<String>,
 ) -> std::io::Result<()> {
-    use rustix::fs::{Mode, OFlags};
-    let open = |at: &OwnedFd, name: &str, flags: OFlags| {
-        let flags = flags | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        match rustix::fs::openat(at, name, flags, Mode::empty()) {
-            Ok(fd) => Ok(Some(fd)),
-            Err(e) if e == rustix::io::Errno::NOENT => Ok(None),
-            Err(e) => Err(std::io::Error::from(e)),
-        }
+    let path = [".local", "share", "Steam", dir];
+    let Some(at) = safe_open::walk(safe_open::dir(home)?, &path)? else {
+        return Ok(());
     };
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let mut at = rustix::fs::open(home, flags, Mode::empty())?;
-    for name in [".local", "share", "Steam", dir] {
-        match open(&at, name, OFlags::DIRECTORY)? {
-            Some(next) => at = next,
-            None => return Ok(()),
-        }
-    }
-    match open(&at, LIST, OFlags::empty())? {
-        Some(file) => rewrite(&at, std::fs::File::from(file), seat, merge),
+    match safe_open::read_at(&at, LIST, MAX_LIST_BYTES)? {
+        Some((bytes, meta)) => rewrite(&at, &bytes, &meta, seat, merge),
         None => Ok(()),
     }
 }
 
 fn rewrite(
     dir: &OwnedFd,
-    mut file: std::fs::File,
+    bytes: &[u8],
+    meta: &std::fs::Metadata,
     seat: &Passwd,
     merge: impl Fn(&str) -> Option<String>,
 ) -> std::io::Result<()> {
     use rustix::fs::{AtFlags, Mode, OFlags};
     let invalid =
         |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_owned());
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.nlink() > 1 || meta.len() > MAX_LIST_BYTES {
-        return Err(invalid("not a plain single-link file within the size cap"));
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    let merged = merge(&text).ok_or_else(|| invalid("not a steam library list"))?;
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid("not text"))?;
+    let merged = merge(text).ok_or_else(|| invalid("not a steam library list"))?;
     if merged == text {
         return Ok(());
     }

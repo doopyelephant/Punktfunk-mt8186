@@ -272,6 +272,32 @@ fn stamp(st: &rustix::fs::Stat) -> Stamp {
     )
 }
 
+/// Where the supervisor keeps its copy of a seat host's certificate.
+pub(super) fn pin_dir(state: &Path, id: &SeatId) -> PathBuf {
+    seat_dir(state, id).join("pin")
+}
+
+/// Copies the certificate the host in `home` serves into `dst`, root's alone, or removes the copy
+/// while the host has none. `home` is a seat user's or the owner's, so it goes through
+/// [`safe_open`].
+pub(super) fn copy_pin(home: &Path, dst: &Path) -> std::io::Result<()> {
+    const CERT: &str = "native-cert.pem";
+    let config = safe_open::walk(safe_open::dir(home)?, &[".config", "punktfunk"])?;
+    let found = match config {
+        Some(at) => safe_open::read_at(at, CERT, 64 * 1024)?,
+        None => None,
+    };
+    let Some((bytes, _)) = found else {
+        return match std::fs::remove_file(dst.join(CERT)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    };
+    let text = String::from_utf8(bytes).map_err(|_| std::io::ErrorKind::InvalidData)?;
+    make_dir(dst, 0o700)?;
+    super::session::write_if_changed(&dst.join(CERT), &text, 0o600).map(drop)
+}
+
 /// Who reads a trust copy. A seat user reads through the group, `root:gid 0640`. The owner's own
 /// account may have a shared primary group, so it reads as the file's owner, `uid:gid 0600`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

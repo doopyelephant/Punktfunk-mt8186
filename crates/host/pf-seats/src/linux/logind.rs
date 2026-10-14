@@ -72,10 +72,12 @@ pub(super) fn at_the_desk(sessions: &[LoginSession], account: &str, own: Option<
     })
 }
 
-/// The id the seat's runner recorded for its own session, when it has one.
+/// The id the seat's runner recorded for its own session, when it has one. The runner's
+/// directory is the seat user's, so the file is opened without following or blocking.
 pub(super) fn own_session(account: &str) -> Option<String> {
-    let text =
-        std::fs::read_to_string(super::session::runtime_dir(account).join("session")).ok()?;
+    let path = super::session::runtime_dir(account).join("session");
+    let (bytes, _) = super::safe_open::read(&path, 64).ok()??;
+    let text = String::from_utf8(bytes).ok()?;
     let id = text.trim();
     (!id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric())).then(|| id.to_owned())
 }
