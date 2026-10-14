@@ -217,8 +217,8 @@ impl ShapeCache {
 
     /// Rasterise `cursor` on a handle change only; a hidden cursor keeps the cached shape, and
     /// an animated one publishes frame 0. Handle identity cannot see a re-render: Windows
-    /// rebuilds system cursors when the scale under the pointer changes but keeps the shared
-    /// handle for the session (arrow is 0x10003 throughout), so the extent is re-read every
+    /// rebuilds the shared system cursors behind the same handle (the arrow is 0x10003 all
+    /// session) when the pointer size changes, so the extent is re-read every
     /// [`CursorPoller::EXTENT_PROBE`] and a move drops the cache.
     fn refresh(
         &mut self,
