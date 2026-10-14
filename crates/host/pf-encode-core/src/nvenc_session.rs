@@ -170,13 +170,27 @@ struct AsyncRetrieve {
 
 impl AsyncRetrieve {
     /// Close the job channel so the thread finishes queued jobs against the live session, join
-    /// it, and drop completions nobody absorbed.
-    fn stop(mut self) {
+    /// it, and drop completions nobody absorbed. With a `limit`, first wait that long for the
+    /// thread to leave its loop: it owns the done sender, so `Disconnected` is that moment.
+    /// `false` = still inside the driver; dropping the handle detaches the thread.
+    fn stop(mut self, limit: Option<Duration>) -> bool {
         drop(self.work_tx.take());
+        if let Some(limit) = limit {
+            let deadline = Instant::now() + limit;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.done_rx.recv_timeout(left) {
+                    Ok(_) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => return false,
+                }
+            }
+        }
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
         while self.done_rx.try_recv().is_ok() {}
+        true
     }
 }
 
@@ -1724,11 +1738,34 @@ impl NvSession {
 
     /// First half of a teardown: join the retrieve thread (it finishes queued jobs against the
     /// still-live session), then unmap every in-flight input. The session stays open for the
-    /// backend to unregister its inputs. Idempotent.
+    /// backend to unregister its inputs. Idempotent. The join is untimed: for a retrieve loop
+    /// that bounds its own waits (Windows completion events).
     pub fn stop(&mut self) {
         if let Some(rt) = self.async_rt.take() {
-            rt.stop();
+            rt.stop(None);
         }
+        self.unmap_pending();
+    }
+
+    /// [`Self::stop`] for a retrieve loop that blocks in the driver with no timeout of its own
+    /// (Linux: `nvEncLockBitstream` returns only when the driver completes or fails the
+    /// encode). `false` = the thread did not leave the lock within `limit`. It still holds the
+    /// session and a pool bitstream, so nothing is unmapped or destroyed: the session is
+    /// forgotten as it stands, and its handle, its pool and the thread leak. The backend
+    /// leaks the inputs it registered with them.
+    pub fn stop_within(&mut self, limit: Duration) -> bool {
+        if let Some(rt) = self.async_rt.take() {
+            if !rt.stop(Some(limit)) {
+                self.live = Live::default();
+                return false;
+            }
+        }
+        self.unmap_pending();
+        true
+    }
+
+    /// Unmap every in-flight input. The session is live and no retrieve thread runs.
+    fn unmap_pending(&mut self) {
         let (api, enc) = (self.api, self.encoder);
         for p in &mut self.pending {
             let map = std::mem::replace(&mut p.map, std::ptr::null_mut());
@@ -2101,6 +2138,40 @@ mod recovery_tests {
             [None, None],
             "no slot holds a picture that was never queued"
         );
+    }
+
+    /// A retrieve loop that takes a job and never answers: the blocking lock on a wedged driver.
+    fn stuck(_: usize, jobs: mpsc::Receiver<RetrieveJob>, _done: mpsc::Sender<RetrieveDone>) {
+        let _job = jobs.recv();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    fn answers(_: usize, jobs: mpsc::Receiver<RetrieveJob>, done: mpsc::Sender<RetrieveDone>) {
+        for job in jobs {
+            let result = Ok((Vec::new(), false));
+            let _ = done.send(RetrieveDone { bs: job.bs, result });
+        }
+    }
+
+    /// A stuck retrieve thread costs the stop its limit, not the encode thread: the session
+    /// is forgotten undestroyed. A thread that answers is joined and the session stays open.
+    #[test]
+    fn a_stuck_retrieve_thread_is_left_behind() {
+        let mut s = stub_session(Codec::H265, 128);
+        s.start_retrieve("pf-test-stuck", stuck).expect("spawn");
+        encode(&mut s).expect("queued behind the stuck lock");
+        let t0 = Instant::now();
+        assert!(!s.stop_within(Duration::from_millis(50)));
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        assert!(s.handle().is_null() && s.pending().is_empty() && !s.retrieving());
+
+        let mut s = stub_session(Codec::H265, 128);
+        s.start_retrieve("pf-test-answers", answers).expect("spawn");
+        encode(&mut s).expect("queued");
+        assert!(s.stop_within(Duration::from_secs(5)));
+        assert!(!s.handle().is_null() && !s.retrieving());
     }
 
     /// `close` drops what the session owned and keeps what the next open needs: the wire
