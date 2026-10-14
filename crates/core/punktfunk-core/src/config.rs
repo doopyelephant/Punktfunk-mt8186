@@ -61,6 +61,8 @@ pub enum CompositorPref {
     Hyprland,
     /// The Windows virtual display, that host's only backend. A Welcome echo, never a choice.
     Windows,
+    /// niri with virtual outputs (the biri fork today).
+    Niri,
 }
 
 impl CompositorPref {
@@ -73,6 +75,7 @@ impl CompositorPref {
             CompositorPref::Gamescope => 4,
             CompositorPref::Hyprland => 5,
             CompositorPref::Windows => 6,
+            CompositorPref::Niri => 7,
         }
     }
 
@@ -85,6 +88,7 @@ impl CompositorPref {
             4 => CompositorPref::Gamescope,
             5 => CompositorPref::Hyprland,
             6 => CompositorPref::Windows,
+            7 => CompositorPref::Niri,
             _ => CompositorPref::Auto,
         }
     }
@@ -99,6 +103,7 @@ impl CompositorPref {
             "gamescope" => CompositorPref::Gamescope,
             "hyprland" => CompositorPref::Hyprland,
             "windows" => CompositorPref::Windows,
+            "niri" | "biri" => CompositorPref::Niri,
             _ => return None,
         })
     }
@@ -112,6 +117,7 @@ impl CompositorPref {
             CompositorPref::Gamescope => "gamescope",
             CompositorPref::Hyprland => "hyprland",
             CompositorPref::Windows => "windows",
+            CompositorPref::Niri => "niri",
         }
     }
 }
@@ -806,6 +812,7 @@ mod tests {
             CompositorPref::Gamescope,
             CompositorPref::Hyprland,
             CompositorPref::Windows,
+            CompositorPref::Niri,
         ] {
             assert_eq!(CompositorPref::from_u8(p.to_u8()), p);
             assert_eq!(CompositorPref::from_name(p.as_str()), Some(p));
@@ -815,6 +822,11 @@ mod tests {
             CompositorPref::from_name("sway"),
             Some(CompositorPref::Wlroots)
         );
+        assert_eq!(
+            CompositorPref::from_name("biri"),
+            Some(CompositorPref::Niri)
+        );
+        assert_eq!(CompositorPref::from_u8(7), CompositorPref::Niri);
         assert_eq!(CompositorPref::from_name("nope"), None);
         // Unknown wire byte degrades to Auto.
         assert_eq!(CompositorPref::from_u8(200), CompositorPref::Auto);

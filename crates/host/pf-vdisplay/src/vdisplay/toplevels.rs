@@ -69,6 +69,7 @@ pub fn list_toplevels(compositor: Compositor, output: &str) -> Vec<Toplevel> {
         | Compositor::Kwin
         | Compositor::Mutter
         | Compositor::Gamescope
+        | Compositor::Niri
         | Compositor::Windows => {
             tracing::info!(
                 compositor = compositor.id(), output = %output,
@@ -94,7 +95,7 @@ pub fn list_all_toplevels(compositor: Compositor) -> Option<Vec<Toplevel>> {
         Compositor::Wlroots => Some(wlroots::toplevels(None)),
         Compositor::Kwin => kwin_windows::toplevels(),
         Compositor::Mutter => gnome_windows::toplevels(),
-        Compositor::Gamescope | Compositor::Windows => None,
+        Compositor::Gamescope | Compositor::Niri | Compositor::Windows => None,
     }
 }
 
@@ -104,9 +105,11 @@ pub fn places_windows(compositor: Compositor) -> bool {
     match compositor {
         Compositor::Hyprland | Compositor::Wlroots => true,
         // No `_` arm; same backends as [`window_action`].
-        Compositor::Kwin | Compositor::Mutter | Compositor::Gamescope | Compositor::Windows => {
-            false
-        }
+        Compositor::Kwin
+        | Compositor::Mutter
+        | Compositor::Gamescope
+        | Compositor::Niri
+        | Compositor::Windows => false,
     }
 }
 
@@ -124,7 +127,11 @@ pub fn move_toplevel_to_output(
         Compositor::Wlroots => wlroots::move_to_output(id, output),
         // No `_` arm. KWin/Mutter/gamescope/Windows never list, so nothing
         // here has an id to move.
-        Compositor::Kwin | Compositor::Mutter | Compositor::Gamescope | Compositor::Windows => {
+        Compositor::Kwin
+        | Compositor::Mutter
+        | Compositor::Gamescope
+        | Compositor::Niri
+        | Compositor::Windows => {
             anyhow::bail!("{} cannot move a window", compositor.id())
         }
     }
@@ -154,7 +161,11 @@ pub fn window_action(
         Compositor::Wlroots => wlroots::window_action(verb, id),
         // No `_` arm. Unreachable while the backends above are the only ones
         // that list, and a compile error the day another one does.
-        Compositor::Kwin | Compositor::Mutter | Compositor::Gamescope | Compositor::Windows => {
+        Compositor::Kwin
+        | Compositor::Mutter
+        | Compositor::Gamescope
+        | Compositor::Niri
+        | Compositor::Windows => {
             anyhow::bail!("{} cannot act on a window", compositor.id())
         }
     }
@@ -171,6 +182,7 @@ pub fn toplevels_token(compositor: Compositor) -> Option<u64> {
         | Compositor::Kwin
         | Compositor::Mutter
         | Compositor::Gamescope
+        | Compositor::Niri
         | Compositor::Windows => None,
     }
 }

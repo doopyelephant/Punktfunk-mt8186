@@ -82,8 +82,8 @@ static OUTPUT_SEQ: AtomicU32 = AtomicU32::new(0);
 /// `PF-<pid>-<n>`. The pid is not decoration: `OutputGuard::drop` is the only
 /// unplug, so a SIGKILLed host leaves heads behind. A bare `PF-<n>` restarts
 /// at `PF-1` and collides; the pid lets [`reclaim_leftovers_once`] drop only
-/// leftovers whose owner is gone.
-fn next_output_name() -> String {
+/// leftovers whose owner is gone. niri mints its outputs from the same counter.
+pub(crate) fn next_output_name() -> String {
     format!(
         "PF-{}-{}",
         std::process::id(),
@@ -104,7 +104,7 @@ pub(crate) fn is_managed_output(name: &str) -> bool {
 
 /// Owner pid for `PF-<pid>-<n>` only. `None` for legacy `PF-<n>` — no owner,
 /// so reclaim must not guess.
-fn output_owner_pid(name: &str) -> Option<u32> {
+pub(crate) fn output_owner_pid(name: &str) -> Option<u32> {
     let rest = name.strip_prefix("PF-")?;
     let (pid, seq) = rest.split_once('-')?;
     seq.parse::<u32>().ok()?;

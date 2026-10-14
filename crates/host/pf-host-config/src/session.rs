@@ -27,6 +27,8 @@ pub struct SessionEnv {
     pub hyprland_signature: Option<String>,
     /// `SWAYSOCK` (`Some` only on sway). Same per-spawn handoff. `None` on river.
     pub sway_socket: Option<String>,
+    /// `NIRI_SOCKET` (`Some` only on niri). The niri backend connects to it in process.
+    pub niri_socket: Option<String>,
 }
 
 impl SessionEnv {

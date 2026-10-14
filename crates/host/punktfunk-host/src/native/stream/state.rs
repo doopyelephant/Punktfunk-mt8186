@@ -1316,12 +1316,14 @@ fn window_source(
         use crate::gamelease::WindowSource;
         use crate::vdisplay::Compositor;
         match compositor {
-            Compositor::Hyprland | Compositor::Wlroots | Compositor::Kwin | Compositor::Mutter => {
-                Some(WindowSource::Toplevels {
-                    compositor,
-                    stage: head.map(|head| crate::gamelease::WindowStage { head, on_window }),
-                })
-            }
+            Compositor::Hyprland
+            | Compositor::Wlroots
+            | Compositor::Niri
+            | Compositor::Kwin
+            | Compositor::Mutter => Some(WindowSource::Toplevels {
+                compositor,
+                stage: head.map(|head| crate::gamelease::WindowStage { head, on_window }),
+            }),
             Compositor::Gamescope => {
                 steam_appid.map(|appid| WindowSource::Gamescope { seat, appid })
             }

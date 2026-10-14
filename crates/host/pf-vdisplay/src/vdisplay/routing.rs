@@ -154,7 +154,8 @@ pub fn input_backend_id(chosen: Compositor) -> &'static str {
         Compositor::Mutter => "libei",
         // Hyprland still speaks `zwlr_virtual_pointer_v1` + `zwp_virtual_keyboard_v1`
         // — same wlr injector as sway/river.
-        Compositor::Wlroots | Compositor::Hyprland => "wlr",
+        // niri serves both too, on stock builds and biri alike.
+        Compositor::Wlroots | Compositor::Hyprland | Compositor::Niri => "wlr",
         // pf-inject ignores the id off Linux; Windows has one injector.
         Compositor::Windows => "windows",
     }
@@ -326,6 +327,7 @@ pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
         | Compositor::Kwin
         | Compositor::Mutter
         | Compositor::Gamescope
+        | Compositor::Niri
         | Compositor::Windows => false,
     }
 }
@@ -364,9 +366,11 @@ impl WorkspaceClaim {
             Compositor::Hyprland => hyprland::focus_workspace(self.restore),
             Compositor::Wlroots => wlroots::focus_workspace(self.restore),
             // No `_` arm: only a backend that claims can release.
-            Compositor::Kwin | Compositor::Mutter | Compositor::Gamescope | Compositor::Windows => {
-                return
-            }
+            Compositor::Kwin
+            | Compositor::Mutter
+            | Compositor::Gamescope
+            | Compositor::Niri
+            | Compositor::Windows => return,
         };
         match done {
             Ok(()) => tracing::info!(
@@ -445,6 +449,7 @@ pub fn claim_workspace(
         | Compositor::Kwin
         | Compositor::Mutter
         | Compositor::Gamescope
+        | Compositor::Niri
         | Compositor::Windows => {
             tracing::info!(
                 compositor = compositor.id(), output = %name,
@@ -779,6 +784,7 @@ mod tests {
         // Hyprland shares sway's wlr virtual-input protocols — same injector on purpose.
         assert_eq!(input_backend_id(Compositor::Wlroots), "wlr");
         assert_eq!(input_backend_id(Compositor::Hyprland), "wlr");
+        assert_eq!(input_backend_id(Compositor::Niri), "wlr");
         assert_eq!(input_backend_id(Compositor::Windows), "windows");
     }
 

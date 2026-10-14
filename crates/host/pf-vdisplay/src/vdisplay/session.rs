@@ -141,6 +141,7 @@ pub(crate) fn is_desktop_kind(kind: ActiveKind) -> bool {
             | ActiveKind::DesktopGnome
             | ActiveKind::DesktopWlroots
             | ActiveKind::DesktopHyprland
+            | ActiveKind::DesktopNiri
     )
 }
 
@@ -155,6 +156,8 @@ pub enum ActiveKind {
     /// Distinct from [`DesktopWlroots`](ActiveKind::DesktopWlroots): own `hyprctl` IPC + xdph
     /// portal, though it shares the wlr virtual-input path.
     DesktopHyprland,
+    /// niri or its biri fork: JSON IPC on `$NIRI_SOCKET`, wlr virtual input.
+    DesktopNiri,
     None,
 }
 
@@ -192,6 +195,7 @@ pub fn compositor_for_kind(kind: ActiveKind) -> Option<Compositor> {
         ActiveKind::DesktopGnome => Some(Compositor::Mutter),
         ActiveKind::DesktopWlroots => Some(Compositor::Wlroots),
         ActiveKind::DesktopHyprland => Some(Compositor::Hyprland),
+        ActiveKind::DesktopNiri => Some(Compositor::Niri),
         ActiveKind::None => None,
     }
 }
@@ -209,6 +213,7 @@ struct EnvProbe {
     wayland_display: Option<String>,
     hyprland_signature: Option<String>,
     swaysock: Option<String>,
+    niri_socket: Option<String>,
 }
 
 impl EnvProbe {
@@ -224,6 +229,7 @@ impl EnvProbe {
             wayland_display: pf_host_config::session::wayland_display(),
             hyprland_signature: v("HYPRLAND_INSTANCE_SIGNATURE"),
             swaysock: v("SWAYSOCK"),
+            niri_socket: v("NIRI_SOCKET"),
         })
     }
 }
@@ -284,6 +290,8 @@ pub fn detect_active_session() -> ActiveSession {
             "Hyprland" | "hyprland" => (ActiveKind::DesktopHyprland, 4),
             // scroll is a sway fork: same IPC, `scrollmsg`, `scroll-ipc.*` socket.
             "sway" | "river" | "scroll" => (ActiveKind::DesktopWlroots, 4),
+            // biri is the niri fork with virtual outputs; `biri-altinstall` keeps its own name.
+            "niri" | "biri" => (ActiveKind::DesktopNiri, 4),
             _ => continue,
         };
         // Lowest pid among same-priority hits, so `/proc` order cannot flap `winning_pid`
@@ -297,9 +305,10 @@ pub fn detect_active_session() -> ActiveSession {
     }
 
     let wayland_display = match kind {
-        ActiveKind::DesktopKde | ActiveKind::DesktopWlroots | ActiveKind::DesktopHyprland => {
-            find_wayland_socket(&env, &xdg_runtime_dir, uid)
-        }
+        ActiveKind::DesktopKde
+        | ActiveKind::DesktopWlroots
+        | ActiveKind::DesktopHyprland
+        | ActiveKind::DesktopNiri => find_wayland_socket(&env, &xdg_runtime_dir, uid),
         _ => None,
     };
     let xdg_current_desktop = match kind {
@@ -309,6 +318,7 @@ pub fn detect_active_session() -> ActiveSession {
         ActiveKind::DesktopWlroots => Some("sway".to_string()),
         // Real desktop name so portal routing (`[Hyprland]`) and xdph's own checks fire.
         ActiveKind::DesktopHyprland => Some("Hyprland".to_string()),
+        ActiveKind::DesktopNiri => Some("niri".to_string()),
         ActiveKind::Gaming => Some("gamescope".to_string()),
         ActiveKind::None => None,
     };
@@ -320,6 +330,14 @@ pub fn detect_active_session() -> ActiveSession {
         ActiveKind::DesktopWlroots => find_sway_socket(&env, &xdg_runtime_dir, uid, winning_pid),
         _ => None,
     };
+    let niri_socket = match kind {
+        ActiveKind::DesktopNiri => find_niri_socket(&env, &xdg_runtime_dir, uid, winning_pid),
+        _ => None,
+    };
+    // A `niri msg` child shares the compositor's name; the socket names the compositor itself.
+    if let Some(pid) = niri_socket.as_deref().and_then(niri_socket_pid) {
+        winning_pid = Some(pid);
+    }
     ActiveSession {
         kind,
         env: SessionEnv {
@@ -329,6 +347,7 @@ pub fn detect_active_session() -> ActiveSession {
             xdg_current_desktop,
             hyprland_signature,
             sway_socket,
+            niri_socket,
         },
         compositor_pid: winning_pid,
     }
@@ -398,6 +417,60 @@ fn find_sway_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -
         (prefixes.iter().any(|p| name.starts_with(p)) && name.ends_with(".sock"))
             .then(|| path.to_string_lossy().into_owned())
     })
+}
+
+/// niri names its IPC socket `niri.<wayland-display>.<pid>.sock` (biri too).
+#[cfg(target_os = "linux")]
+fn is_niri_socket_name(name: &str) -> bool {
+    name.starts_with("niri.") && name.ends_with(".sock")
+}
+
+/// Compositor pid from a niri socket path, `None` for any other name.
+#[cfg(target_os = "linux")]
+fn niri_socket_pid(path: &str) -> Option<u32> {
+    let name = std::path::Path::new(path).file_name()?.to_str()?;
+    if !is_niri_socket_name(name) {
+        return None;
+    }
+    name.trim_end_matches(".sock")
+        .rsplit('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Live niri IPC socket for this uid: the inherited `NIRI_SOCKET` if it still exists, else
+/// the one `pid` opened, else the newest owned `niri.*.sock`.
+#[cfg(target_os = "linux")]
+fn find_niri_socket(env: &EnvProbe, runtime: &str, uid: u32, pid: Option<u32>) -> Option<String> {
+    if let Some(s) = &env.niri_socket {
+        if std::path::Path::new(s).exists() {
+            return Some(s.clone());
+        }
+    }
+    let dir = std::path::Path::new(runtime);
+    if let Some(pid) = pid {
+        let suffix = format!(".{pid}.sock");
+        let exact = std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            (is_niri_socket_name(&name) && name.ends_with(&suffix))
+                .then(|| e.path().to_string_lossy().into_owned())
+        });
+        if exact.is_some() {
+            return exact;
+        }
+    }
+    newest_owned(dir, uid, |name, _, path| {
+        is_niri_socket_name(name).then(|| path.to_string_lossy().into_owned())
+    })
+}
+
+/// `NIRI_SOCKET` for the niri backend, resolved per call like [`sway_socket`].
+#[cfg(target_os = "linux")]
+pub(crate) fn niri_socket() -> Option<String> {
+    let probe = EnvProbe::sample();
+    let runtime = default_runtime_dir(&probe);
+    find_niri_socket(&probe, &runtime, crate::proc::current_uid(), None)
 }
 
 /// `HYPRLAND_INSTANCE_SIGNATURE` for a `hyprctl` child, resolved at spawn.

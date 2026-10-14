@@ -767,13 +767,13 @@ mod tests {
 
     #[test]
     fn reconfig_allowed_gates_gamescope_and_per_client_mode() {
-        use crate::vdisplay::Compositor::{Gamescope, Hyprland, Kwin, Mutter, Wlroots};
+        use crate::vdisplay::Compositor::{Gamescope, Hyprland, Kwin, Mutter, Niri, Wlroots};
         assert!(!reconfig_allowed(Some(Gamescope), false, false));
         assert!(!reconfig_allowed(Some(Gamescope), true, false));
         assert!(!reconfig_allowed(Some(Kwin), true, false));
         assert!(!reconfig_allowed(Some(Mutter), true, false));
         assert!(!reconfig_allowed(None, true, false));
-        for c in [Kwin, Mutter, Wlroots, Hyprland] {
+        for c in [Kwin, Mutter, Wlroots, Hyprland, Niri] {
             assert!(
                 reconfig_allowed(Some(c), false, false),
                 "{c:?} should allow live reconfigure"
@@ -784,8 +784,8 @@ mod tests {
 
     #[test]
     fn reconfig_allowed_rejects_a_monitor_mirror_on_every_backend() {
-        use crate::vdisplay::Compositor::{Hyprland, Kwin, Mutter, Wlroots};
-        for c in [Kwin, Mutter, Wlroots, Hyprland] {
+        use crate::vdisplay::Compositor::{Hyprland, Kwin, Mutter, Niri, Wlroots};
+        for c in [Kwin, Mutter, Wlroots, Hyprland, Niri] {
             assert!(
                 reconfig_allowed(Some(c), false, false),
                 "{c:?} without a pin should still allow live reconfigure"
