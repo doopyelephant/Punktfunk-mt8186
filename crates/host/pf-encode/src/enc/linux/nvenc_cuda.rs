@@ -269,8 +269,9 @@ fn chroma_plane(captured: &CapturedFrame, d: &DmabufFrame) -> Option<(u32, u32)>
     })
 }
 
-/// Retrieve thread: blocking-lock, copy, unlock, send. Exits when the job channel closes —
-/// teardown drops the sender and joins before destroy, so `enc`/`bs` outlive uses here.
+/// Retrieve thread: blocking-lock, copy, unlock, send. Exits when the job channel closes.
+/// Teardown drops the sender and joins before destroy, or leaks the session with a thread it
+/// cannot join, so `enc`/`bs` outlive uses here.
 fn retrieve_loop(
     enc: usize,
     work_rx: mpsc::Receiver<RetrieveJob>,
@@ -289,8 +290,8 @@ fn retrieve_loop(
         jobs += 1;
         let t0 = std::time::Instant::now();
         // SAFETY: `job.bs` is a pool bitstream a prior `encode_picture` targeted; teardown
-        // joins this thread first. Secondary-thread lock/unlock while the encode thread
-        // submits is the NVENC guide's threading model.
+        // joins this thread before it destroys either, or destroys neither. Secondary-thread
+        // lock/unlock while the encode thread submits is the NVENC guide's threading model.
         let result = unsafe { lock_copy(api(), enc, job.bs) };
         if sample {
             if let Ok((data, _)) = &result {
@@ -539,12 +540,19 @@ pub struct NvencCudaEncoder {
     io_stream: *mut *mut c_void,
     /// Stream-ordered submit armed (sync retrieve). Per-frame gate also requires `pending` empty.
     stream_ordered: bool,
+    /// A teardown left the retrieve thread in the driver ([`Self::abandon`]): this encoder
+    /// opens no further session.
+    dead: bool,
 }
+
+/// How long a teardown waits for the retrieve thread. On a live driver each queued lock
+/// returns within a frame; `wait_below` gives a stalled one the same five seconds.
+const RETRIEVE_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 // SAFETY: the session's NVENC handles, `cu_ctx`, and the raw pointers in `ring` are `!Send`.
 // The encoder is moved onto the host encode thread once; `submit`/`poll`/`RFI`/`Drop` run
-// there. The retrieve thread (when armed) only lock/unlocks bitstreams and is joined in
-// `teardown` before destroy. The ownership-transfer move has no NVENC/CUDA call in flight.
+// there. The retrieve thread (when armed) only lock/unlocks bitstreams; `teardown` joins it
+// before destroy, or leaks the session with it. The move has no NVENC/CUDA call in flight.
 unsafe impl Send for NvencCudaEncoder {}
 
 impl NvencCudaEncoder {
@@ -603,6 +611,7 @@ impl NvencCudaEncoder {
             want_sync: false,
             io_stream: ptr::null_mut(),
             stream_ordered: false,
+            dead: false,
         })
     }
 
@@ -675,17 +684,35 @@ impl NvencCudaEncoder {
         std::mem::forget(sem);
     }
 
+    /// The retrieve thread is stuck in the driver and the session went with it
+    /// ([`NvSession::stop_within`]). The wedged encode may still read its registered input,
+    /// so the ring and the Vulkan slots behind it are leaked too, and no session opens again.
+    fn abandon(&mut self) {
+        tracing::error!(
+            limit_s = RETRIEVE_STOP_LIMIT.as_secs(),
+            "NVENC retrieve thread stuck in the bitstream lock — session abandoned, its \
+             inputs and the thread leaked"
+        );
+        std::mem::forget(std::mem::take(&mut self.ring));
+        std::mem::forget(self.vk_blend.take());
+        self.dead = true;
+    }
+
     /// Stop retrieval, drain the copy stream, unmap pending inputs, then release source holds
-    /// and session resources.
-    unsafe fn teardown(&mut self) {
+    /// and session resources. `false` = the retrieve thread is stuck in the driver and the
+    /// encoder is dead ([`Self::abandon`]).
+    unsafe fn teardown(&mut self) -> bool {
         if self.s.handle().is_null() {
-            return;
+            return !self.dead;
         }
         // An encode queued behind a fused-pass wait still reads the inputs the session unmaps.
         self.release_convert_sem();
         // Join the retrieve thread, then unmap. An in-flight lock returns in ≤ a frame; after
         // join no other thread can touch the session destroyed below.
-        self.s.stop();
+        if !self.s.stop_within(RETRIEVE_STOP_LIMIT) {
+            self.abandon();
+            return false;
+        }
         for slot in &self.ring {
             let _ = (api().unregister_resource)(self.s.handle(), slot.reg);
         }
@@ -725,6 +752,7 @@ impl NvencCudaEncoder {
             // Slot memory + CUDA mapping. Device stays up (`cursor_tried` is one-shot).
             vk.free_slots();
         }
+        true
     }
 
     /// One-shot open-failure diagnosis. Retries on a fresh CUDA context:
@@ -776,6 +804,10 @@ impl NvencCudaEncoder {
 
     /// Opens the lazy session and input ring after the first frame fixes their format.
     fn init_session(&mut self) -> Result<()> {
+        ensure!(
+            !self.dead,
+            "NVENC session abandoned: its retrieve thread is stuck in the driver"
+        );
         // SAFETY: NVENC calls go through `api()` (gated in `open`). `target` names the shared
         // CUDA context, live for the process, and the session is closed (`ensure_session` tore
         // it down). `enc` is the session just opened, as `build_ring` and `bind_io_streams`
@@ -1720,9 +1752,12 @@ impl Encoder for NvencCudaEncoder {
         self.s.poll_chunk()
     }
 
+    /// `false` when the retrieve thread is stuck in the driver: no rebuild in place.
     fn reset(&mut self) -> bool {
         // SAFETY: encode thread, between submit/poll. `teardown` no-ops a closed session.
-        unsafe { self.teardown() };
+        if !unsafe { self.teardown() } {
+            return false;
+        }
         self.s.force_kf = true;
         true
     }

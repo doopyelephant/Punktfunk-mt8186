@@ -4,7 +4,8 @@
 //! frame (default down 6, so motion vectors point up into rows a sweep already refreshed);
 //! `PF_WAVE_NOISE=1` adds per-pixel noise that scrolls with the content, which starves the
 //! encoder the way game content does. Test-only callers; the drivers below build only for
-//! tests or the `test-support` feature, and the D3D11 frames live in `pf-encode-win`.
+//! tests or the `test-support` feature, and the D3D11 frames live in `pf-encode-win`. The
+//! proxies' method guard sits here too.
 
 /// BGRA, `w * h * 4` bytes, at `frame` frames of motion.
 pub fn scroll_pattern(w: usize, h: usize, frame: usize) -> Vec<u8> {
@@ -565,7 +566,7 @@ pub fn reconfigure_no_idr(
 }
 
 /// Fail unless the `impl` block at `marker` in `impl_src` writes every [`crate::Encoder`]
-/// method. A wrapper that leaves one to the trait default silently disables it for every
+/// method. A proxy that leaves one to the trait default silently disables it for every
 /// session it holds. Source-text parse: an item ends at its first column-0 `}` and a method
 /// name sits on a line starting `fn `. `find` takes the first occurrence, so the real item
 /// must precede any quote of its marker.

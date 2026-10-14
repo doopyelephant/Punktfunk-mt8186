@@ -86,5 +86,9 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+# The driver proxy's method guard is a pf-encode-core test helper.
+pf-encode-win = { path = "../pf-encode-win", features = ["test-support"] }
+
 [lints]
 workspace = true

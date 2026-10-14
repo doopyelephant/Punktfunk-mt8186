@@ -403,10 +403,8 @@ pub trait Encoder: Send {
     /// even at `delay=0`.
     ///
     /// Production encode loops do not call this: they exit after the transport
-    /// is gone, so flushed AUs have nowhere to go, and this is the one trait
-    /// method that can block on a wedged encoder (Linux direct-NVENC's
-    /// retrieve-thread join is untimed — `enc/linux/nvenc_cuda.rs`). Used by
-    /// `spike` and the `#[ignore]`d hardware smoke tests.
+    /// is gone, so flushed AUs have nowhere to go. Used by `spike` and the
+    /// `#[ignore]`d hardware smoke tests.
     fn flush(&mut self) -> Result<()>;
 }
 
