@@ -39,7 +39,6 @@ let
     types
     optional
     optionals
-    optionalString
     literalExpression
     concatStringsSep
     mapAttrsToList
@@ -572,23 +571,18 @@ in
       # pre-0.29 best-effort no-op behaviour, a pacing cost only).
       security.rtkit.enable = mkDefault true;
 
+      # The unit is the package's own (scripts/punktfunk-host.service); this is its NixOS drop-in.
+      systemd.packages = [ cfg.host.package ];
       systemd.user.services.punktfunk-host = {
-        description = "punktfunk GameStream + punktfunk/1 streaming host";
-        documentation = [ "https://git.unom.io/unom/punktfunk" ];
         # Keep root (and every other system user) from starting a second host that steals the
         # fixed ports from the desktop user's — see `userScope`.
         unitConfig.ConditionUser = userScope;
-        # Stands down while the box's owner row runs this user's host in its own headless session
-        # (the door). Mirrors scripts/punktfunk-host.service.
-        unitConfig.ConditionPathExists = mkIf cfg.seats.enable "!/run/punktfunk-seat-%u";
-        # Soft ordering: the host listens immediately and only touches the compositor per session.
-        after = [ "pipewire.service" ] ++ optional cfg.host.desktopSession "graphical-session.target";
-        wants = [ "pipewire.service" ];
         # `graphical-session.target` is IN ADDITION to `default.target`, never instead of it: the
         # host still comes up at login before the graphical session is ready — it listens without
         # touching the compositor and only opens one per client connect, so an early start costs
         # nothing. `partOf` is the half that matters, taking the host down with the session so the
         # next one gets a fresh compositor connection (see `desktopSession`).
+        after = optional cfg.host.desktopSession "graphical-session.target";
         partOf = optional cfg.host.desktopSession "graphical-session.target";
         wantedBy =
           optional cfg.host.autoStart "default.target"
@@ -621,34 +615,34 @@ in
         # exists. `config.security.wrapperDir` rather than a hard-coded /run/wrappers/bin so an
         # operator who has moved it is still correct.
         #
-        # NixOS renders `Environment=` before `EnvironmentFile=`, so `settings`/`environmentFile`
-        # can still override this (or set it to `off` to force the in-process encoder) — the same
-        # "an operator's own override still wins" posture as PUNKTFUNK_GAMESCOPE_BIN above.
+        # An `EnvironmentFile=` value beats `Environment=`, so `settings`/`environmentFile` can
+        # still override this (`off` forces the in-process encoder).
         environment.PUNKTFUNK_ENCODE_WORKER = "${config.security.wrapperDir}/punktfunk-encode-worker";
         # Where our Vulkan WSI layer's manifest lives. The host defaults to the FHS path every
         # distro package uses, which no NixOS box has — here the layer travels inside the gamescope
         # derivation, so point at it. Without this a game nested under the compositor gets no HDR10
         # swapchain at all: that layer is the only route to one, and the host falls back to
         # disabling the system layer, which is HDR-less by construction.
-        #
-        # Same override posture as PUNKTFUNK_GAMESCOPE_BIN: `Environment=` renders before
-        # `EnvironmentFile=`, so an operator's `settings` still wins.
+        # An operator's `settings` still wins, as above.
         environment.PUNKTFUNK_GAMESCOPE_WSI_LAYER_DIR = mkIf cfg.host.gamescopeHdr
           "${cfg.host.gamescopePackage}/lib/punktfunk/vulkan/implicit_layer.d";
         serviceConfig = {
           # The store path DIRECTLY — not a capability wrapper. /proc/<pid>/exe then resolves to the
           # very path packages.nix substituted into io.unom.Punktfunk.Host.desktop's Exec=, which is
-          # what lets KWin identify the host and grant it the screencast/fake-input protocols (see
-          # the note above the firewall block).
-          ExecStart =
-            "${cfg.host.package}/bin/punktfunk-host serve" + optionalString cfg.host.gamestream " --gamestream";
-          Restart = "on-failure";
-          RestartSec = 2;
-          EnvironmentFile =
-            (optional (cfg.host.settings != { }) "${hostSettingsFile}")
-            ++ (optional (cfg.host.environmentFile != null) "-${toString cfg.host.environmentFile}")
-            # Last, so the owner row's ports and the box's identity win. Absent unless the door is on.
-            ++ (optional cfg.seats.enable "-/run/punktfunk/seats/%u.env");
+          # what lets KWin identify the host (see the note above the firewall block). The empty
+          # entry clears the packaged ExecStart.
+          ExecStart = mkIf cfg.host.gamestream [
+            ""
+            "${cfg.host.package}/bin/punktfunk-host serve --gamestream"
+          ];
+          # `settings` and `environmentFile` stand in for host.env, which NixOS does not read. The
+          # empty entry clears the packaged list; the seat env stays last, so the owner row wins.
+          EnvironmentFile = [
+            ""
+          ]
+          ++ (optional (cfg.host.settings != { }) "${hostSettingsFile}")
+          ++ (optional (cfg.host.environmentFile != null) "-${toString cfg.host.environmentFile}")
+          ++ [ "-/run/punktfunk/seats/%u.env" ];
         };
         # No PUNKTFUNK_GAMESCOPE_HDR here: the host defaults it on, and the capability probe on
         # the resolved binary keeps a build-less box SDR. `gamescopeHdr` only controls whether
@@ -686,9 +680,9 @@ in
     })
 
     # --- web console ---------------------------------------------------------------------------
-    # The declarative equivalent of the punktfunk-web .deb / RPM subpackage: the two systemd --user
-    # units (the console + its first-run password generator) plus the firewall opener, all auto-wired
-    # to the host's per-user mgmt token + identity cert (no env editing on a packaged install).
+    # The declarative equivalent of the punktfunk-web .deb / RPM subpackage: its two systemd --user
+    # units (the console + its pre-start), auto-wired to the host's per-user mgmt token + identity
+    # cert, plus the firewall opener.
     (mkIf cfg.web.enable {
       environment.systemPackages = [ cfg.web.package ];
 
@@ -704,236 +698,43 @@ in
         ];
       };
 
-      # Console pre-start: generate the login password once, in the user's config dir, surface it to
-      # the --user journal, THEN block until the host has written the mgmt token + identity cert.
-      # Being Type=oneshot, this is the readiness gate punktfunk-web's `after` already implies but
-      # cannot enforce on its own (the host is Type=simple). Mirrors
-      # scripts/punktfunk-web-init.service — keep both in step.
-      systemd.user.services.punktfunk-web-init = {
-        description = "punktfunk web console pre-start (login password; waits for the host)";
-        documentation = [ "https://git.unom.io/unom/punktfunk" ];
-        # NO ConditionPathExists on web-password: that skipped this unit from the second boot
-        # onward, which is precisely when the host-readiness wait must still run. web-init.sh is
-        # idempotent instead (it writes the password only when absent, and returns without sleeping
-        # once the host's files exist). ConditionUser is TRIGGERING (`|`), so at least one must hold
-        # — same shape as punktfunk-web below.
-        unitConfig = {
-          ConditionUser = userScope;
-        };
-        path = [ pkgs.coreutils ];
-        serviceConfig = {
-          Type = "oneshot";
-          # Not remain-after-exit: an active oneshot is never re-run, so a console restart in a
-          # live session skipped the host-readiness gate. Mirrors scripts/punktfunk-web-init.service.
-          RemainAfterExit = false;
-          ExecStart = "${cfg.web.package}/share/punktfunk-web/web-init.sh";
-        };
-      };
-
-      # The console itself: Nitro SSR on bun, HTTPS on 47992 with the host's identity cert, proxying
-      # the host's loopback mgmt API with the bearer token injected server-side. mgmt-token is
-      # REQUIRED (the host's `serve` writes it) — a console with no token cannot reach the mgmt API
-      # at all, so failing closed beats a login page that 401s on every call. punktfunk-web-init
-      # waits for it, so this no longer fails on a fresh install's first start; if it is somehow
-      # still absent the unit fails and Restart retries. web-password is optional ('-'). Mirrors
-      # scripts/punktfunk-web.service.
+      # The units are the package's own (scripts/punktfunk-web{,-init}.service); these are their
+      # NixOS drop-ins. Same scoping as the host: root's instance would take 47992 from the real one.
+      systemd.packages = [ cfg.web.package ];
+      systemd.user.services.punktfunk-web-init.unitConfig.ConditionUser = userScope;
       systemd.user.services.punktfunk-web = {
-        description = "punktfunk management web console";
-        documentation = [ "https://git.unom.io/unom/punktfunk" ];
-        # Same scoping as the host: root's instance would take 47992 from the real one.
         unitConfig.ConditionUser = userScope;
-        # punktfunk-web-init is the readiness gate (Type=oneshot, so ordering after it genuinely
-        # waits). `punktfunk-host.service` alone is NOT one — the host is Type=simple, so systemd
-        # calls it started the instant it is spawned, seconds before it writes the mgmt token and
-        # its identity cert. Keep web-init in BOTH lists: the ordering is what makes it a gate.
-        after = [
-          "punktfunk-web-init.service"
-          "punktfunk-host.service"
-        ];
-        # wants, not requires: if the pre-start unit itself fails, still try — the Restart backstop
-        # below recovers, where a hard dependency would leave the console down.
-        wants = [ "punktfunk-web-init.service" ];
         wantedBy = optional cfg.web.autoStart "default.target";
-        # Backstop for whatever the gate cannot cover (web-init timed out; the host restarted and
-        # re-minted its identity under a running console; someone deleted a file). Retry
-        # INDEFINITELY: the EnvironmentFile below is mandatory on purpose, so the unit genuinely
-        # fails while the token is missing — and systemd's default rate limit (5 starts / 10 s)
-        # against `RestartSec = 2` gives up permanently after ~10 s. A console that hit a missing
-        # file then stayed dead until someone restarted it by hand. The shipped unit
-        # (scripts/punktfunk-web.service) has carried this since that defect was found; it was
-        # missed in the port, while the comment below went on promising the behaviour it removes.
-        unitConfig.StartLimitIntervalSec = 0;
-        # Stands down while the door's own console serves this port. Mirrors
-        # scripts/punktfunk-web.service.
-        unitConfig.ConditionPathExists = mkIf cfg.seats.enable "!/run/punktfunk-web-door";
-        environment = {
-          # PUNKTFUNK_MGMT_URL is deliberately absent: the host publishes the port it actually bound
-          # to ~/.config/punktfunk/mgmt-endpoint (mgmt::publish_endpoint), sourced below, and the
-          # server falls back to https://127.0.0.1:47990 on its own when that file does not exist.
-          # Hardcoding it here would have to out-rank the file, which is a directive-ordering
-          # question in the generated unit — so we simply do not create the conflict.
-          PORT = "47992";
-          # Where both listeners bind (`web.bind`).
-          PUNKTFUNK_UI_BIND = cfg.web.bind;
-          # Serve HTTPS with the host's own identity cert (the anchor native clients already pin) and
-          # mark the session cookie Secure. The host's `serve` writes these PEMs.
-          #
-          # These name the LEGACY pair; the server prefers the native sibling
-          # (native-cert.pem/native-key.pem) when it exists, because a generated unit cannot express
-          # "this file, else that one" any more than the hand-written one can. The choice is made in
-          # web/nitro-entry/tls-paths.mjs — keep this in step with scripts/punktfunk-web.service.
-          PUNKTFUNK_UI_TLS_CERT = "%h/.config/punktfunk/cert.pem";
-          PUNKTFUNK_UI_TLS_KEY = "%h/.config/punktfunk/key.pem";
-          PUNKTFUNK_UI_SECURE = "1";
-        };
-        serviceConfig = {
-          Type = "simple";
-          EnvironmentFile = [
-            "%h/.config/punktfunk/mgmt-token"
-            # Generated by the web-init unit, then rewritten by the console itself as
-            # PUNKTFUNK_UI_PASSWORD_HASH on the first sign-in. Optional ('-') either way.
-            "-%h/.config/punktfunk/web-password"
-            # The host's effective mgmt URL — see the `environment` note above. Optional: absent on
-            # a host predating mgmt::publish_endpoint, and the server default covers that.
-            "-%h/.config/punktfunk/mgmt-endpoint"
-          ];
-          ExecStart = "${cfg.web.package}/bin/punktfunk-web-server";
-          # `always`, not `on-failure`: a console that exits 0 has still stopped serving, and
-          # `on-failure` would leave it down. An explicit `systemctl --user stop` is still honoured
-          # (Restart= never fights that). Matches scripts/punktfunk-web.service and the Windows
-          # web-run.cmd, both of which relaunch bun on ANY exit.
-          Restart = "always";
-          RestartSec = 2;
-        };
+        # Where both listeners bind (`web.bind`).
+        environment.PUNKTFUNK_UI_BIND = cfg.web.bind;
+        # The packaged list starts with host.env, where web-init.sh writes a PUNKTFUNK_UI_BIND that
+        # would beat `web.bind`. The empty entry clears the list; the rest is the packaged order.
+        serviceConfig.EnvironmentFile = [
+          ""
+          "%h/.config/punktfunk/mgmt-token"
+          "-%h/.config/punktfunk/web-password"
+          "-%h/.config/punktfunk/mgmt-endpoint"
+        ];
       };
     })
 
     # --- plugin/script runner ------------------------------------------------------------------
-    # Installs the runner + defines its opt-in `systemd --user` unit (mirrors the deb/rpm
-    # punktfunk-scripting subpackage). NOT auto-started unless `scripting.autoStart` is set.
+    # The deb/rpm punktfunk-scripting subpackage: the runner and its `systemd --user` unit, with the
+    # unit's own sandbox. Started unless `scripting.autoStart` is off.
     (mkIf cfg.scripting.enable {
       environment.systemPackages = [
         cfg.scripting.package
         pkgs.bubblewrap
       ];
 
+      # The unit is the package's own (scripts/punktfunk-scripting.service); this is its drop-in.
+      systemd.packages = [ cfg.scripting.package ];
       systemd.user.services.punktfunk-scripting = {
-        description = "punktfunk plugin/script runner";
-        documentation = [ "https://git.unom.io/unom/punktfunk" ];
         # Same scoping as the host: a root-side runner would talk to the wrong session's mgmt API.
         unitConfig.ConditionUser = userScope;
-        # Plugins talk to the host's loopback mgmt API; order after it (soft — the runner backs off
-        # and retries per unit, so this is ordering only, not a hard requirement).
-        after = [ "punktfunk-host.service" ];
         wantedBy = optional cfg.scripting.autoStart "default.target";
         # Each plugin runs inside its own `bwrap` sandbox, built by the runner.
         path = [ pkgs.bubblewrap ];
-        serviceConfig = {
-          Type = "simple";
-          ExecStart = "${cfg.scripting.package}/bin/punktfunk-scripting";
-          # `+` runs outside the namespace: the plugin-run and plugin-state binds need both
-          # directories, and inside the read-only home nothing can create them.
-          ExecStartPre = "+${pkgs.coreutils}/bin/mkdir -p -m 0700 %h/.config/punktfunk/plugin-run %h/.config/punktfunk/plugin-state";
-          Restart = "on-failure";
-          RestartSec = 2;
-          # The runner's status for refusing to run a plugin without a sandbox (SANDBOX_REFUSED_EXIT,
-          # sdk/src/runner.ts). A restart would probe the same box again: the unit stays failed.
-          RestartPreventExitStatus = 78;
-          # Deliver SIGTERM to the runner (it orchestrates the structural shutdown of its unit
-          # fibers) and give it room to run their finalizers before the cgroup is reaped.
-          KillMode = "mixed";
-          KillSignal = "SIGTERM";
-          TimeoutStopSec = 30;
-
-          # Unit-level hardening, the same scripts/punktfunk-scripting.service gives the deb/rpm
-          # installs — keep the two in step, module-check.nix asserts each directive. It confines
-          # the supervisor and the operator's loose scripts, not a PLUGIN: those get their own
-          # bwrap sandbox, because a mount namespace on a same-uid unit is no boundary.
-          NoNewPrivileges = true;
-          # PrivateTmp deliberately OFF (field report 2026-08-03, the VirtualHere plugin). A
-          # plugin's whole job is integrating with things already running on this box, and on Linux
-          # those talk over /tmp: VirtualHere's client IPC is the FIFO pair /tmp/vhclient +
-          # /tmp/vhclient_response, X11 is /tmp/.X11-unix. A private /tmp hides all of it — the
-          # plugin launches the vendor binary fine and then cannot reach the daemon behind it,
-          # which presents as an error no amount of config fixes.
-          PrivateTmp = false;
-          ProtectSystem = "strict";
-          # The plugin token's privilege split, made real by the filesystem: a plugin holds a
-          # capability-limited token, so the runner must not reach the full-admin `mgmt-token` or
-          # the identity key beside it. Same uid as the operator means file modes cannot say that;
-          # an empty home plus an explicit allow-list can. Mirrors the Windows runner's ACL, which
-          # grants LocalService the scoped token and the TLS pin and nothing else.
-          #
-          # InaccessiblePaths is belt and braces: wherever the home tmpfs does not land, or a
-          # drop-in removes ProtectHome, the denylist is what still stands.
-          #
-          # ⚠ All of these are MOUNT-NAMESPACE options, and for a *user* unit that needs
-          # unprivileged user namespaces. On a kernel/config that restricts those they fail the
-          # unit rather than degrading — drop them via
-          #   systemctl --user edit punktfunk-scripting
-          # which is also where a loose script that must reach elsewhere gets `ReadWritePaths=`
-          # (outside the home) or `BindReadOnlyPaths=` (inside it). Plugins get folder grants.
-          ProtectHome = "tmpfs";
-          InaccessiblePaths = [
-            "-%h/.config/punktfunk/mgmt-token"
-            "-%h/.config/punktfunk/key.pem"
-            "-%h/.config/punktfunk/native-key.pem"
-          ];
-          # Writable: the installed packages (the runner refreshes their shared SDK with
-          # `bun install` on every start) and the one directory a plugin may persist into. `%t` is
-          # $XDG_RUNTIME_DIR, which ProtectHome empties too — the host publishes its live-stream
-          # marker there, and the session bus and compositor sockets live there.
-          BindPaths = [
-            "-%h/.config/punktfunk/plugins"
-            "-%h/.config/punktfunk/plugin-state"
-            # bun's package cache ($BUN_INSTALL). Only the SDK refresh writes here, and it fails
-            # soft — but soft means plugins keep an old SDK across host upgrades.
-            "-%h/.bun"
-            "%t"
-          ];
-          # Read-only. The punktfunk entries are the runner's credentials and its inputs: the
-          # scoped token, the TLS pin (native-cert.pem after the identity split, cert.pem before
-          # it), the port the host really bound, the operator's loose scripts, and the drop box
-          # another local account fills.
-          #
-          # What the plugins read in the home — manifest paths and folder grants — the host writes
-          # into ~/.config/systemd/user/punktfunk-scripting.service.d/50-plugin-roots.conf.
-          #
-          # The punktfunk-scripting entries cover the SteamOS layout, which builds the runner under
-          # the home and points ExecStart at it. Every path but plugin-run is `-`: ExecStartPre
-          # creates that one.
-          BindReadOnlyPaths = [
-            "-%h/.config/punktfunk/plugin-token"
-            # Per-plugin tokens and grants. A directory bind keeps the host's atomic replacements
-            # visible; a file bind would pin the deleted inode.
-            "%h/.config/punktfunk/plugin-run"
-            "-%h/.config/punktfunk/native-cert.pem"
-            "-%h/.config/punktfunk/cert.pem"
-            "-%h/.config/punktfunk/mgmt-endpoint"
-            "-%h/.config/punktfunk/scripts"
-            "-%h/.config/punktfunk/ingest"
-            "-%h/.local/bin/punktfunk-scripting"
-            "-%h/.local/lib/punktfunk-scripting"
-            "-%h/.local/share/punktfunk-scripting"
-          ];
-          # Puts back the write bit ProtectSystem=strict takes away from the real /tmp above.
-          ReadWritePaths = [ "/tmp" ];
-          # Free for a JS runtime that only talks HTTP and reads files. Absent on purpose:
-          # MemoryDenyWriteExecute (bun JITs), PrivateDevices (VirtualHere forwards USB), and
-          # ProtectKernelTunables, which refuses bwrap a fresh /proc; the sandbox binds /proc/sys ro.
-          ProtectControlGroups = true;
-          # Exactly the namespaces each plugin's bwrap sandbox is built from; `true` starts no plugin.
-          RestrictNamespaces = "user mnt pid net ipc uts cgroup";
-          SystemCallArchitectures = "native";
-          CapabilityBoundingSet = "";
-          # AF_NETLINK brings up a sandbox's loopback; its seccomp filter keeps it from the plugin.
-          RestrictAddressFamilies = [
-            "AF_UNIX"
-            "AF_INET"
-            "AF_INET6"
-            "AF_NETLINK"
-          ];
-        };
       };
     })
 

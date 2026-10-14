@@ -4,9 +4,9 @@
 # `nix build .#punktfunk-web` was broken for 553 commits before anyone noticed (see the bun-nix job
 # in ci.yml for that story).
 #
-# Three tiers, because a full `nix flake check` builds the whole Rust workspace with crane and would
-# run for an hour on every push — so the two cheap tiers gate every PR and the expensive one runs
-# only where its cost buys something (a published cache):
+# Four tiers, because a full `nix flake check` builds the whole Rust workspace with crane and would
+# run for an hour on every push — so the two cheap tiers gate every PR and the expensive ones run
+# only where their cost buys something (a VM boot, a published cache):
 #
 #   * eval  — `nix flake check --no-build`: instantiates every package, app, check and devShell
 #             without building them. Catches the failures that actually happen to this flake — a
@@ -33,6 +33,9 @@
 #             covers what the ci.yml drift gate cannot, e.g. a tarball the registry no longer
 #             serves, or the codegen going quietly message-less (see packages.nix's inlang note).
 #
+#   * vm    — `checks.<system>.nixos-vm` boots the module with the real packages and checks the
+#             user units run. It builds the host, so it runs on labelled pull requests only.
+#
 #   * cache — builds the Rust packages + gamescope, publishes every punktfunk store path to
 #             https://nix.unom.io, then moves a channel branch to the published commit:
 #               `v*` tag                     → nix-stable
@@ -49,9 +52,9 @@
 #             Only OUR paths are published — see the step for why that is both correct and the
 #             difference between ~300 MB and several GB per publish.
 #
-# The Rust packages and punktfunk-gamescope are still not built on PRs: they are the expensive ones
-# and their inputs are already gated by the `rust` job in ci.yml. Build them on a PR by hand on a
-# Nix box, or with the `build-rust` / `build-gamescope` dispatch inputs below.
+# On a PR only the vm tier builds a Rust package (the host); the client and punktfunk-gamescope are
+# the expensive ones and their inputs are already gated by the `rust` job in ci.yml. Build them on a
+# PR by hand on a Nix box, or with the `build-rust` / `build-gamescope` dispatch inputs below.
 #
 # ⚠ punktfunk-gamescope matters more than it looks: `host.gamescopeHdr` DEFAULTS TRUE, so it is on
 # the critical path of every `services.punktfunk.host.enable = true` build. It patches whatever
@@ -98,7 +101,11 @@ on:
       - "scripts/headless/**"
       - "scripts/host.env.example"
       - "scripts/punktfunk-host-desktop-session.conf"
+      - "scripts/punktfunk-host.service"
       - "scripts/web-init.sh"
+      - "scripts/punktfunk-web.service"
+      - "scripts/punktfunk-web-init.service"
+      - "scripts/punktfunk-scripting.service"
       - "web/web.env.example"
       - "api/openapi.json"
       - "**/bun.lock"
@@ -129,7 +136,11 @@ on:
       - "scripts/headless/**"
       - "scripts/host.env.example"
       - "scripts/punktfunk-host-desktop-session.conf"
+      - "scripts/punktfunk-host.service"
       - "scripts/web-init.sh"
+      - "scripts/punktfunk-web.service"
+      - "scripts/punktfunk-web-init.service"
+      - "scripts/punktfunk-scripting.service"
       - "web/web.env.example"
       - "api/openapi.json"
       - "**/bun.lock"
@@ -295,6 +306,15 @@ jobs:
           grep -q 'Bun\.serve' "$web/share/punktfunk-web/.output/server/index.mjs" \
             || { echo "installed console is not a bun bundle" >&2; exit 1; }
           echo "bun packages OK: $web  $scripting"
+
+      # The module booted in a VM with the real packages (packaging/nix/vm-test.nix). It builds the
+      # host, so on a pull request only, which means the `ci:nix-rust` label. `kvm` is declared
+      # even without /dev/kvm in the container: qemu then falls back to TCG, slower but the same test.
+      - name: Boot the NixOS module in a VM
+        if: ${{ github.event_name == 'pull_request' }}
+        run: |
+          "$NIX" build --print-build-logs --option extra-system-features "kvm nixos-test" \
+            .#checks.x86_64-linux.nixos-vm
 
       # ── binary cache (v* tags, nightly, dispatch on main) ─────────────────────────────────────
       #

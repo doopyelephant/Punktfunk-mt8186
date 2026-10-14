@@ -61,6 +61,7 @@
   nodejs,
   makeWrapper,
   stdenvNoCC,
+  coreutils,
   # bun2nix (github:nix-community/bun2nix, pinned in flake.nix): `.fetchBunDeps` turns a generated
   # `bun.nix` into bun's global install cache, and `.hook` runs an offline `bun install` off it.
   bun2nix,
@@ -180,6 +181,12 @@ in
         # The status tray, built in its own derivation (see the punktfunk-tray note above) so its zbus
         # stays on async-io; ship it in the host's $out so the tray .desktop below resolves it.
         install -Dm0755 ${punktfunk-tray}/bin/punktfunk-tray "$out/bin/punktfunk-tray"
+
+        # The user unit every channel ships, run from the store path itself: KWin identifies the
+        # host by that path. The NixOS module adds its own settings as a drop-in.
+        install -Dm0644 scripts/punktfunk-host.service "$out/lib/systemd/user/punktfunk-host.service"
+        substituteInPlace "$out/lib/systemd/user/punktfunk-host.service" \
+          --replace-fail "%h/punktfunk/target/release/punktfunk-host" "$out/bin/punktfunk-host"
 
         # udev: /dev/uinput + /dev/uhid (virtual gamepads) + the vhci sysfs perms for the virtual Deck.
         install -Dm0644 scripts/60-punktfunk.rules "$out/lib/udev/rules.d/60-punktfunk.rules"
@@ -395,7 +402,7 @@ in
   #
   # Unlike apt/dnf — which have no bun in their repos and so VENDOR a bun binary into the package —
   # Nix has `pkgs.bun`, so the launcher just execs it from the store (no vendored runtime). The
-  # systemd `--user` units + firewall wiring live in the NixOS module, pointed at this store path.
+  # systemd `--user` units ship here; the NixOS module adds its drop-ins and the firewall.
   punktfunk-web = stdenvNoCC.mkDerivation {
     pname = "punktfunk-web";
     inherit src version;
@@ -473,6 +480,15 @@ in
       install -Dm0755 scripts/web-init.sh $out/share/punktfunk-web/web-init.sh
       install -Dm0644 web/web.env.example $out/share/punktfunk-web/web.env.example
 
+      # The user units every channel ships, pointed at this store path.
+      install -Dm0644 scripts/punktfunk-web.service $out/lib/systemd/user/punktfunk-web.service
+      install -Dm0644 scripts/punktfunk-web-init.service \
+        $out/lib/systemd/user/punktfunk-web-init.service
+      substituteInPlace $out/lib/systemd/user/punktfunk-web.service \
+        --replace-fail /usr/bin/punktfunk-web-server $out/bin/punktfunk-web-server
+      substituteInPlace $out/lib/systemd/user/punktfunk-web-init.service \
+        --replace-fail /usr/share/punktfunk-web $out/share/punktfunk-web
+
       # PATH-stable launcher: run the SSR bundle on bun from the store (mirrors the deb/rpm
       # /usr/bin/punktfunk-web-server, minus the vendored-bun indirection).
       makeWrapper ${bun}/bin/bun $out/bin/punktfunk-web-server \
@@ -493,7 +509,7 @@ in
   # Effect), which discovers ~/.config/punktfunk/{scripts,plugins} and supervises each unit as an
   # Effect fiber. It runs on `bun` (it import()s the operator's `.ts` plugin files, which only bun
   # can do). Mirrors the Debian punktfunk-scripting .deb / the RPM's `--with scripting` subpackage,
-  # which the host package Recommends — the NixOS module wires the opt-in systemd --user unit.
+  # which the host package Recommends. Its systemd --user unit ships here too.
   #
   # Unlike the deb/rpm we don't `bun build` into a bundle + vendor bun; we still bundle (one
   # self-contained JS, effect inlined) but the launcher execs `pkgs.bun` from the store.
@@ -539,6 +555,12 @@ in
       # Launcher: run the bundle on bun from the store (mirrors the deb/rpm /usr/bin/punktfunk-scripting).
       makeWrapper ${bun}/bin/bun $out/bin/punktfunk-scripting \
         --add-flags "$out/share/punktfunk-scripting/runner-cli.js"
+      # The user unit every channel ships, sandbox included. NixOS has no /bin/mkdir.
+      install -Dm0644 scripts/punktfunk-scripting.service \
+        $out/lib/systemd/user/punktfunk-scripting.service
+      substituteInPlace $out/lib/systemd/user/punktfunk-scripting.service \
+        --replace-fail /usr/bin/punktfunk-scripting $out/bin/punktfunk-scripting \
+        --replace-fail =+/bin/mkdir =+${coreutils}/bin/mkdir
       runHook postInstall
     '';
 
