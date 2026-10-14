@@ -11,7 +11,7 @@
 pub(crate) mod cast;
 pub(crate) mod ipc;
 
-use super::{Mode, VirtualDisplay, VirtualOutput};
+use super::{Mode, SessionCastParts, VirtualDisplay, VirtualOutput};
 use crate::hyprland::{is_managed_output, next_output_name, output_owner_pid};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -179,19 +179,40 @@ impl Drop for OutputGuard {
     }
 }
 
-/// A session's output. Field order is drop order: the cast stops before its output goes.
+/// A standalone output with its cast. Field order is drop order: the cast stops first.
 struct OutputKeepalive {
     _cast: Box<dyn Send>,
     _output: OutputGuard,
 }
 
+/// The cast `create` started, parked until the registry's `session_cast_for` takes it, so a
+/// pooled output never holds a session's cast.
+struct PendingCast {
+    name: String,
+    node_id: u32,
+    keepalive: Box<dyn Send>,
+}
+
 pub struct NiriDisplay {
     hw_cursor: bool,
+    /// The registry splits the output's lifetime from the session's cast around `create`.
+    handoff_cast: bool,
+    pending_cast: Option<PendingCast>,
+    /// `mode_conflict: join`: the registry shares a live output and casts it for this session.
+    join_live: bool,
+    /// The last `create`'s output, for `apply_position`.
+    last_output: Option<String>,
 }
 
 impl NiriDisplay {
     pub fn new() -> Result<Self> {
-        Ok(NiriDisplay { hw_cursor: false })
+        Ok(NiriDisplay {
+            hw_cursor: false,
+            handoff_cast: false,
+            pending_cast: None,
+            join_live: false,
+            last_output: None,
+        })
     }
 }
 
@@ -208,9 +229,55 @@ impl VirtualDisplay for NiriDisplay {
         self.hw_cursor
     }
 
+    fn set_join_live(&mut self, on: bool) {
+        self.join_live = on;
+    }
+
+    fn join_live(&self) -> bool {
+        self.join_live
+    }
+
+    /// A second cast of the owner's output; the owner's keeps running.
+    fn join_cast(&mut self, name: &str, _node_id: u32) -> Result<Option<SessionCastParts>> {
+        let (node_id, keepalive) = cast::start(name, self.hw_cursor)?;
+        Ok(Some((node_id, None, keepalive)))
+    }
+
+    /// A keep-alive reconnect recasts the kept output by name, for the same identity only.
+    fn accepts_kept(&self, identity_slot: Option<u32>, output_name: Option<&str>) -> bool {
+        output_name.is_some() && identity_slot == self.last_identity_slot()
+    }
+
+    fn set_session_cast_handoff(&mut self, enabled: bool) {
+        self.handoff_cast = enabled;
+    }
+
+    fn session_cast_for(&mut self, name: &str) -> Result<Option<SessionCastParts>> {
+        if let Some(pending) = self.pending_cast.take() {
+            if pending.name == name {
+                return Ok(Some((pending.node_id, None, pending.keepalive)));
+            }
+        }
+        let (node_id, keepalive) = cast::start(name, self.hw_cursor)?;
+        Ok(Some((node_id, None, keepalive)))
+    }
+
+    /// Where the console's arrangement puts this output, in niri's logical space.
+    fn apply_position(&mut self, x: i32, y: i32) {
+        let Some(name) = self.last_output.as_deref() else {
+            return;
+        };
+        let at = json!({ "Position": { "position": { "Specific": { "x": x, "y": y } } } });
+        if let Err(e) = ipc::output_action(name, at) {
+            tracing::warn!(output = %name, x, y, error = %format!("{e:#}"), "niri: output not positioned");
+        }
+    }
+
     fn create(&mut self, mode: Mode) -> Result<VirtualOutput> {
         probe()?;
         reclaim_leftovers_once();
+        // A create whose handoff never completed still owns its cast.
+        self.pending_cast = None;
         let name = ipc::create_virtual_output(
             &next_output_name(),
             mode.width,
@@ -233,15 +300,22 @@ impl VirtualDisplay for NiriDisplay {
             output = %name, node_id, w = width, h = height, mhz,
             "niri virtual output ready"
         );
-        let keepalive = OutputKeepalive {
-            _cast: cast,
-            _output: output,
+        let keepalive: Box<dyn Send> = if self.handoff_cast {
+            self.pending_cast = Some(PendingCast {
+                name: name.clone(),
+                node_id,
+                keepalive: cast,
+            });
+            Box::new(output)
+        } else {
+            Box::new(OutputKeepalive {
+                _cast: cast,
+                _output: output,
+            })
         };
-        let mut out = VirtualOutput::owned(
-            node_id,
-            Some((width, height, mode.refresh_hz)),
-            Box::new(keepalive),
-        );
+        self.last_output = Some(name.clone());
+        let mut out =
+            VirtualOutput::owned(node_id, Some((width, height, mode.refresh_hz)), keepalive);
         // Extend topology: input and direct capture find the output by its `wl_output` name.
         out.output_name = Some(name);
         Ok(out)
