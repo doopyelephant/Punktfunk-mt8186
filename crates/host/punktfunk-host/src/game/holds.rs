@@ -6,21 +6,16 @@
 //! participant is logged and the launch goes ahead.
 
 use crate::events::{EventKind, GameRefPayload};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// The stages a plugin or hook may hold.
-pub const STAGES: &[&str] = &["game.launching"];
-
-/// The longest a plugin may hold. Clients cover a launch for 120 s.
-pub const HOLD_MAX_MS: u32 = 120_000;
-/// A plugin's deadline when it names none.
-pub const HOLD_DEFAULT_MS: u32 = 30_000;
+// `crate::hooks` checks a hook's stage against the same list.
+pub use crate::plugin_host::registry::STAGES;
 
 /// Emit `game.launching` and block until every participant answered or ran out of time.
 /// Call on a blocking thread, only when this session spawns the game.
 pub fn launching(game: GameRefPayload) {
     let ev = crate::events::bus().emit(EventKind::GameLaunching { game });
-    let plugins = crate::mgmt::plugins::holders("game.launching");
+    let plugins = crate::plugin_host::registry::holders("game.launching");
     let hooks = crate::hooks::holding(&ev);
     if plugins.is_empty() && hooks.is_empty() {
         return;
@@ -45,10 +40,10 @@ pub fn launching(game: GameRefPayload) {
 
 /// One plugin's hold: `POST /__hold` with the event, 2xx means done. A plugin on the host's
 /// channel (port 0) is reached through it instead of a port.
-fn hold_plugin(p: &crate::mgmt::plugins::Holder, json: &str) {
+fn hold_plugin(p: &crate::plugin_host::registry::Holder, json: &str) {
     let timeout_ms = p.timeout.as_millis() as u64;
     if p.port == 0 {
-        use crate::mgmt::plugin_channel::{request_blocking, Unreached};
+        use crate::plugin_host::channel::{request_blocking, Unreached};
         match request_blocking(&p.id, "/__hold", json, p.timeout) {
             Ok((200..=299, _)) => tracing::debug!(plugin = %p.id, "plugin released the launch"),
             Ok((status, _)) => tracing::warn!(
@@ -96,20 +91,12 @@ fn hold_plugin(p: &crate::mgmt::plugins::Holder, json: &str) {
     }
 }
 
-/// A hold's deadline from a registration: default when absent, `None` when out of range.
-pub fn deadline(ms: Option<u32>) -> Option<Duration> {
-    match ms.unwrap_or(HOLD_DEFAULT_MS) {
-        0 => None,
-        ms if ms > HOLD_MAX_MS => None,
-        ms => Some(Duration::from_millis(u64::from(ms))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::HostEvent;
     use std::io::{Read, Write};
+    use std::time::Duration;
 
     /// The event a plugin receives, for tests that fake one.
     fn launching_event(title: &str) -> HostEvent {
@@ -133,14 +120,6 @@ mod tests {
     }
 
     #[test]
-    fn a_deadline_defaults_and_refuses_the_out_of_range() {
-        assert_eq!(deadline(None), Some(Duration::from_secs(30)));
-        assert_eq!(deadline(Some(0)), None);
-        assert_eq!(deadline(Some(HOLD_MAX_MS + 1)), None);
-        assert_eq!(deadline(Some(500)), Some(Duration::from_millis(500)));
-    }
-
-    #[test]
     fn a_plugin_that_never_answers_holds_only_to_its_deadline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -152,7 +131,7 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(10));
             }
         });
-        let p = crate::mgmt::plugins::Holder {
+        let p = crate::plugin_host::registry::Holder {
             id: "slow".into(),
             port,
             secret: "s".repeat(16),
@@ -186,7 +165,7 @@ mod tests {
                 .unwrap();
             String::from_utf8(req).unwrap()
         });
-        let p = crate::mgmt::plugins::Holder {
+        let p = crate::plugin_host::registry::Holder {
             id: "fast".into(),
             port,
             secret: "a".repeat(16),

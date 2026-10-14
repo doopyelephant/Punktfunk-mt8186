@@ -68,16 +68,12 @@ pub(super) fn strip_users_read_once() {
         if !entry.path().is_dir() || name == "ingest" {
             continue;
         }
-        let mut cmd = Command::new(icacls_path());
-        cmd.arg(entry.path()).args(["/remove:g", USERS_SID]);
+        let mut args = vec!["/remove:g", USERS_SID];
         if name != "emulators" {
-            cmd.arg("/T");
+            args.push("/T");
         }
-        let _ = cmd
-            .args(["/C", "/Q"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        args.extend(["/C", "/Q"]);
+        icacls(&entry.path(), &args);
     }
     if let Err(e) = std::fs::write(&marker, b"") {
         tracing::warn!(path = %marker.display(), error = %e, "users-read strip marker not written");
@@ -130,7 +126,8 @@ pub(super) fn converge_runner_acls(status: &RuntimeStatus) {
 
 /// Grant LocalService read on runner inputs. The data directory uses an inheritable ACE so atomic
 /// grant-file replacements stay readable; protected credential rewrites reapply a direct ACE.
-/// The ingest inbox opens to `BUILTIN\Users` and is closed to seat accounts.
+/// The ingest inbox opens to `BUILTIN\Users` and is closed to seat accounts. Warnings stay ASCII:
+/// `plugins enable` prints them on a console whose codepage drops an em dash.
 fn grant_runner_secret_reads() {
     let cfg = pf_paths::config_dir();
     for name in RUNNER_INPUT_DIRS {
@@ -139,7 +136,7 @@ fn grant_runner_secret_reads() {
             continue;
         }
         if let Err(e) = grant_runner_data_dir(&dir) {
-            eprintln!("warning: {e:#}");
+            tracing::warn!(error = %format!("{e:#}"), "runner data directory grant failed");
         }
     }
     for name in RUNNER_SECRET_FILES {
@@ -154,9 +151,9 @@ fn grant_runner_secret_reads() {
             continue;
         }
         if let Err(e) = grant_runner_secret_read(&path) {
-            eprintln!(
-                "warning: {e:#} - the plugin runner may fail to authenticate to the management \
-                 API"
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "runner secret grant failed - the plugin runner may not authenticate"
             );
         }
     }
@@ -167,18 +164,14 @@ fn grant_runner_secret_reads() {
         if !create_runner_dir(&dir) {
             continue;
         }
-        let ok = Command::new(icacls_path())
-            .arg(&dir)
-            .args(["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(RX,WA)")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+        let ok = icacls(
+            &dir,
+            &["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(RX,WA)")],
+        );
         if !ok {
-            eprintln!(
-                "warning: could not grant LocalService read on {} - the runner may fail to \
-                 import plugins/scripts from it",
-                dir.display()
+            tracing::warn!(
+                dir = %dir.display(),
+                "LocalService read not granted - the runner may not import plugins or scripts"
             );
         }
     }
@@ -187,18 +180,14 @@ fn grant_runner_secret_reads() {
         if !create_runner_dir(&dir) {
             continue;
         }
-        let ok = Command::new(icacls_path())
-            .arg(&dir)
-            .args(["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(M)")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+        let ok = icacls(
+            &dir,
+            &["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(M)")],
+        );
         if !ok {
-            eprintln!(
-                "warning: could not grant LocalService write on {} - state-writing plugins \
-                 (config/cache) may fail to persist",
-                dir.display()
+            tracing::warn!(
+                dir = %dir.display(),
+                "LocalService write not granted - plugins may not persist their state"
             );
         }
     }
@@ -207,18 +196,11 @@ fn grant_runner_secret_reads() {
         if !create_runner_dir(&dir) {
             continue;
         }
-        let ok = Command::new(icacls_path())
-            .arg(&dir)
-            .args(["/grant:r", &format!("{USERS_SID}:(OI)(CI)(M)")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+        let ok = icacls(&dir, &["/grant:r", &format!("{USERS_SID}:(OI)(CI)(M)")]);
         if !ok {
-            eprintln!(
-                "warning: could not open the ingest inbox {} for writes - a plugin fed by an \
-                 interactive-user app (e.g. playnite) may see no data",
-                dir.display()
+            tracing::warn!(
+                dir = %dir.display(),
+                "ingest inbox not opened for writes - a plugin fed by a desktop app may see no data"
             );
         }
     }
@@ -227,18 +209,14 @@ fn grant_runner_secret_reads() {
     // dirs: bun opens the entry script with FILE_WRITE_ATTRIBUTES, and the
     // install tree only carries Users:(RX). WA cannot change content.
     if let Some(dir) = runner_bundle_dir() {
-        let ok = Command::new(icacls_path())
-            .arg(&dir)
-            .args(["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(RX,WA)")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+        let ok = icacls(
+            &dir,
+            &["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(RX,WA)")],
+        );
         if !ok {
-            eprintln!(
-                "warning: could not grant LocalService read on {} - the plugin runner will not \
-                 start (bun exits EPERM on its own entry script)",
-                dir.display()
+            tracing::warn!(
+                dir = %dir.display(),
+                "LocalService read not granted on the runner bundle - the plugin runner will not start"
             );
         }
     }
@@ -269,13 +247,7 @@ pub(super) fn deny_seats() {
         if listed.is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(&ace)) {
             continue;
         }
-        let ok = Command::new(icacls_path())
-            .arg(&path)
-            .args(["/deny", &format!("*{sid}:{inherit}({rights})")])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+        let ok = icacls(&path, &["/deny", &format!("*{sid}:{inherit}({rights})")]);
         if !ok {
             tracing::warn!(path = %path.display(), "still open to seat accounts");
         }
@@ -293,13 +265,10 @@ pub(super) fn grant_runner_credential(path: &std::path::Path) -> Result<()> {
 }
 
 pub(super) fn grant_runner_data_dir(dir: &std::path::Path) -> Result<()> {
-    let ok = Command::new(icacls_path())
-        .arg(dir)
-        .args(["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(RX)")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let ok = icacls(
+        dir,
+        &["/grant:r", &format!("{LOCAL_SERVICE_SID}:(OI)(CI)(RX)")],
+    );
     if !ok {
         bail!("grant LocalService read on {}", dir.display());
     }
@@ -307,13 +276,7 @@ pub(super) fn grant_runner_data_dir(dir: &std::path::Path) -> Result<()> {
 }
 
 fn grant_runner_secret_read(path: &std::path::Path) -> Result<()> {
-    let ok = Command::new(icacls_path())
-        .arg(path)
-        .args(["/grant:r", &format!("{LOCAL_SERVICE_SID}:(R)")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let ok = icacls(path, &["/grant:r", &format!("{LOCAL_SERVICE_SID}:(R)")]);
     if !ok {
         bail!("grant LocalService read on {}", path.display());
     }
@@ -329,7 +292,7 @@ fn create_runner_dir(dir: &std::path::Path) -> bool {
     match pf_paths::create_private_dir(dir) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("warning: {} not created: {e}", dir.display());
+            tracing::warn!(dir = %dir.display(), error = %e, "runner directory not created");
             false
         }
     }
@@ -354,12 +317,7 @@ fn revoke_runner_secret_reads() {
         if !path.exists() {
             continue;
         }
-        let _ = Command::new(icacls_path())
-            .arg(&path)
-            .args(["/remove:g", LOCAL_SERVICE_SID])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        icacls(&path, &["/remove:g", LOCAL_SERVICE_SID]);
     }
     // Ingest was granted to Users, not LocalService. Removing that ACE leaves
     // SYSTEM/Administrators alone: nothing drops into the inbox until `enable`. The seats deny
@@ -370,31 +328,30 @@ fn revoke_runner_secret_reads() {
         if !path.exists() {
             continue;
         }
-        let mut icacls = Command::new(icacls_path());
-        icacls.arg(&path).args(["/remove:g", USERS_SID]);
+        let mut args = vec!["/remove:g", USERS_SID];
         if let Some(seats) = &seats {
-            icacls.args(["/remove:d", seats]);
+            args.extend(["/remove:d", seats.as_str()]);
         }
-        let _ = icacls
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        icacls(&path, &args);
     }
     // Bundle dir is not under `cfg`. Removing the ACE leaves inherited
     // Users:(RX) from Program Files — read-only, not inaccessible.
     if let Some(dir) = runner_bundle_dir().filter(|d| d.exists()) {
-        let _ = Command::new(icacls_path())
-            .arg(&dir)
-            .args(["/remove:g", LOCAL_SERVICE_SID])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        icacls(&dir, &["/remove:g", LOCAL_SERVICE_SID]);
     }
 }
 
 /// System32 `icacls`, not PATH — same planted-binary rule as [`powershell_path`].
 pub(super) fn icacls_path() -> String {
     crate::install::sys32("icacls.exe")
+}
+
+/// `icacls <path> <args>` with its output dropped. `true` when it ran and reported success.
+fn icacls(path: &std::path::Path, args: &[&str]) -> bool {
+    let path = path.to_string_lossy();
+    let mut all = vec![path.as_ref()];
+    all.extend_from_slice(args);
+    crate::install::run_quiet("icacls", &all)
 }
 
 /// System32 powershell, not PATH. CreateProcess searches the launching EXE's

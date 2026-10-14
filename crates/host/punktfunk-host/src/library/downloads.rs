@@ -560,7 +560,7 @@ pub enum Refusal {
 
 /// Ask `provider` to do `action` on `app`. Blocking.
 pub fn call(provider: &str, app: &str, external_id: &str, action: Action) -> Result<(), Refusal> {
-    let Some(cred) = crate::mgmt::plugins::installer(provider) else {
+    let Some(cred) = crate::plugin_host::registry::installer(provider) else {
         return Err(Refusal::NotServed);
     };
     // No proxy: the secret must never leave loopback. No redirects, as for holds.
@@ -578,7 +578,7 @@ pub fn call(provider: &str, app: &str, external_id: &str, action: Action) -> Res
     });
     // A plugin on the host's channel (port 0) is reached through it instead of a port.
     let (status, text) = if cred.port == 0 {
-        crate::mgmt::plugin_channel::request_blocking(
+        crate::plugin_host::channel::request_blocking(
             provider,
             "/__install",
             &body.to_string(),

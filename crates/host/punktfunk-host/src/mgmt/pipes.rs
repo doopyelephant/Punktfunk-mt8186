@@ -5,10 +5,11 @@
 //! whose token carries that package is the plugin, and the connection says so to the router.
 //! Any other client — the runner with the sandbox off — still speaks with a bearer.
 //!
-//! The set follows `plugin-run/plugin-tokens.json`. A store job rewrites it and calls
-//! [`changed`]; a CLI `plugins add` only rewrites it, so the set is re-read on a tick as well.
+//! The set follows `plugin-run/plugin-tokens.json`. A store job rewrites it and notifies
+//! [`TOKENS_CHANGED`]; a CLI `plugins add` only rewrites it, so the set is re-read on a tick as well.
 
 use crate::https::{serve_conn, PeerAddr, PeerCertFingerprint, PipePlugin};
+use crate::plugin_host::TOKENS_CHANGED;
 use crate::windows::app_container::{package_sid, pipe_client_package_sid};
 use crate::windows::plugin_pipe::create_plugin_pipe;
 use axum::Router;
@@ -18,7 +19,7 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use windows::Win32::Foundation::HANDLE;
 
@@ -31,13 +32,6 @@ const MAX_CONNS_PER_PIPE: usize = 32;
 /// What the router sees as the peer: a pipe is local, and the auth gate reads loopback.
 const PIPE_PEER: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
-
-static CHANGED: Notify = Notify::const_new();
-
-/// A store job rewrote the token file: reconcile the pipe set now, not at the next tick.
-pub(crate) fn changed() {
-    CHANGED.notify_one();
-}
 
 /// The pipe a plugin with manifest id `id` dials. The SDK derives the same name.
 pub(crate) fn pipe_name(id: &str) -> String {
@@ -64,7 +58,7 @@ pub(crate) async fn serve(app: Router, tokens: crate::mgmt::PluginTokens, config
             }
             servers.insert(id.clone(), tokio::spawn(serve_one(app.clone(), id)));
         }
-        let _ = tokio::time::timeout(RECONCILE_EVERY, CHANGED.notified()).await;
+        let _ = tokio::time::timeout(RECONCILE_EVERY, TOKENS_CHANGED.notified()).await;
     }
 }
 

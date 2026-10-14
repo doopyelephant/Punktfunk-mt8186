@@ -410,7 +410,7 @@ pub(crate) async fn refresh_catalog() -> Response {
 )]
 pub(crate) async fn list_installed() -> Response {
     // Lease registry is in-memory; read it here, not inside `spawn_blocking`.
-    let live: Vec<String> = super::plugins::live_plugin_ids();
+    let live: Vec<String> = crate::plugin_host::registry::live_plugin_ids();
     match blocking("plugin store", move || build_installed(&live)).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => e,

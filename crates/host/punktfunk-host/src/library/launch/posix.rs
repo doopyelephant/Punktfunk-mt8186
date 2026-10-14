@@ -11,10 +11,7 @@ pub(super) const LAUNCHER_UI_STORES: &[&str] =
 pub(super) const LAUNCHER_UI_STORES: &[&str] = &[];
 
 /// No command ⇒ nothing to launch; same `None` as an unknown id.
-pub(super) fn launch_target(
-    entry: GameEntry,
-    game: crate::gamelease::GameRef,
-) -> Option<LaunchTarget> {
+pub(super) fn launch_target(entry: GameEntry, game: GameRef) -> Option<LaunchTarget> {
     let command = exec_recipe(&entry)
         .map(|r| r.shell_command())
         .or_else(|| entry.launch.as_ref().and_then(command_for))?;

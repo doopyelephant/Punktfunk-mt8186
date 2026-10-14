@@ -17,11 +17,15 @@
 //!    launch, and re-verify start time before signalling ([`crate::procscan`]).
 
 use crate::library::DetectSpec;
+pub use crate::library::GameRef;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+mod exit;
 mod terminate;
+#[cfg(any(target_os = "linux", windows))]
+use exit::{Presence, Sighting, Verdict};
 pub use terminate::{end_others_for_new_launch, end_previous_launch, terminate};
 
 /// 300 s cold-start budget. A Steam boot plus first-run shader compile can take
@@ -63,16 +67,6 @@ pub struct OwnedChild {
     /// non-leader shares the host's group — signal that pid only.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
     pub group_leader: bool,
-}
-
-/// Display identity for a launched title.
-#[derive(Clone, Debug, Default)]
-pub struct GameRef {
-    /// Store-qualified id (`steam:570`). `None` = typed `apps.json` command.
-    pub id: Option<String>,
-    pub store: Option<String>,
-    /// Display title; never empty in the UI (falls back to id, then command).
-    pub title: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1147,11 +1141,33 @@ impl Watcher {
         }
     }
 
-    /// Phase 2: wait for the window, then for the game to stay gone across
-    /// [`EXIT_CONFIRM`]. The window watch shares this poll: a game that never shows
-    /// one must still be exit-watched. `known` holds the last-seen pids: `alive` is
-    /// one query each, and a full `find` runs only when they all vanish, which is also
-    /// how a re-exec into a new pid is noticed.
+    /// Reap what this launch started. `true` when it left this poll and no signal names
+    /// anything else as the game: past start, that process going away is the game.
+    fn own_left(&mut self) -> bool {
+        if !matches!(self.kind, LeaseKind::Child) {
+            return false;
+        }
+        let unnamed = self.shared.spec.is_empty();
+        // `Err` is ECHILD: the End-game ladder reaped it first. Gone all the same.
+        if let Some(Ok(Some(_)) | Err(_)) = self.child.as_mut().map(|c| c.try_wait()) {
+            self.child = None;
+            self.shared.forget_child();
+            if unnamed {
+                return true;
+            }
+        }
+        if self.spawned.is_some() && !self.spawned_up() {
+            self.spawned = None;
+            return unnamed;
+        }
+        false
+    }
+
+    /// Phase 2: each poll gathers a [`Sighting`] and carries out [`Presence::step`]'s verdict.
+    /// The window watch shares this poll: a game that never shows one must still be
+    /// exit-watched. `known` holds the last-seen pids: `alive` is one query each, and a full
+    /// `find` runs only when they all vanish, which is also how a re-exec into a new pid is
+    /// noticed.
     fn watch_exit(
         mut self,
         mut known: Vec<crate::procscan::ProcRef>,
@@ -1162,10 +1178,8 @@ impl Watcher {
             .credit
             .take()
             .map(|id| RunClock::since(id, self.shared.profile_id(), Instant::now()));
-        let mut gone_since: Option<Instant> = None;
-        let mut vetoed = false;
+        let mut presence = Presence::Up;
         let shared = self.shared.clone();
-        let exited = |why: &str, run| finish(&shared, &self.on_exit, why, run);
         loop {
             if self.cancelled() {
                 // The session left; the game may live on unwatched.
@@ -1175,83 +1189,63 @@ impl Watcher {
                 reap_later(self.child.take());
                 return;
             }
-            if matches!(self.kind, LeaseKind::Child) {
-                // `Err` is ECHILD: the End-game ladder reaped it first. Gone all the same.
-                if let Some(Ok(Some(_)) | Err(_)) = self.child.as_mut().map(|c| c.try_wait()) {
-                    self.child = None;
-                    shared.forget_child();
-                    if shared.spec.is_empty() {
-                        return exited("the launched process exited", run);
-                    }
-                }
-                // Past start, a spawned pid going away is the game if nothing else
-                // identifies it.
-                if self.spawned.is_some() && !self.spawned_up() {
-                    self.spawned = None;
-                    if shared.spec.is_empty() {
-                        return exited("the launched process exited", run);
-                    }
-                }
-            }
-            let child_alive = matches!(self.kind, LeaseKind::Child)
-                && (self.child.is_some() || self.spawned.is_some());
-            let live = match self.scanner.alive(&known) {
-                still if still.is_empty() => shared.find_procs(&self.scanner),
-                still => still,
-            };
-            if let Some(w) = stage.as_mut() {
-                if w.poll(&shared, &live) {
-                    stage = None;
-                }
-            }
-            if !live.is_empty() || child_alive {
-                self.publish(&live);
-                known = live;
-                gone_since = None;
-                vetoed = false;
-                self.mark_seen();
-            } else if let Some(said) = self.reported() {
-                // Provider report is decisive both ways; `running_hint` may only delay.
-                // A live report may hold a scan-invisible game; it dies at
-                // [`crate::runstate::REPORT_TTL`], then the scan path resumes.
-                if !said.running {
-                    return exited("its provider reported the game stopped", run);
-                }
-                // A provider may name the pid after its first report.
-                self.publish(&[]);
-                gone_since = None;
-                vetoed = false;
-                self.mark_seen();
+            let mut live = Vec::new();
+            let seen = if self.own_left() {
+                Sighting::OwnLeft
             } else {
-                // Continuous absence. Not reset by the veto — that is the bound.
-                let gone_for = gone_since.get_or_insert_with(Instant::now).elapsed();
-                if gone_for >= EXIT_CONFIRM {
-                    // Outside-scan veto only; never a reason to call it running
-                    // (`procscan::running_hint`).
-                    let hint_running = crate::procscan::running_hint(&shared.spec) == Some(true);
-                    if exit_confirmed(gone_for, hint_running) {
-                        if hint_running {
-                            // Hint still set after VETO_LIMIT: stale, not early.
-                            tracing::warn!(
-                                title = %shared.game.title,
-                                gone_for_s = gone_for.as_secs(),
-                                "its launcher still reports the game running, but nothing of \
-                                 it has been on the box for {}s — treating that as a stale \
-                                 flag and ending the session",
-                                VETO_LIMIT.as_secs()
-                            );
-                        }
-                        return exited("the game exited", run);
+                let child_alive = matches!(self.kind, LeaseKind::Child)
+                    && (self.child.is_some() || self.spawned.is_some());
+                live = match self.scanner.alive(&known) {
+                    still if still.is_empty() => shared.find_procs(&self.scanner),
+                    still => still,
+                };
+                if let Some(w) = stage.as_mut() {
+                    if w.poll(&shared, &live) {
+                        stage = None;
                     }
-                    if !vetoed {
-                        vetoed = true;
-                        tracing::info!(
+                }
+                if !live.is_empty() || child_alive {
+                    Sighting::Alive
+                } else {
+                    // A live report may hold a scan-invisible game; it dies at
+                    // [`crate::runstate::REPORT_TTL`], then the scan path resumes.
+                    Sighting::Unseen {
+                        said_running: self.reported().map(|said| said.running),
+                    }
+                }
+            };
+            // Outside-scan veto only; never a reason to call it running.
+            let flag = || crate::procscan::running_hint(&shared.spec) == Some(true);
+            match presence.step(seen, Instant::now(), flag) {
+                Verdict::Running => {
+                    self.publish(&live);
+                    known = live;
+                    self.mark_seen();
+                }
+                Verdict::Held => {
+                    // A provider may name the pid after its first report.
+                    self.publish(&[]);
+                    self.mark_seen();
+                }
+                Verdict::Waiting => {}
+                Verdict::Vetoed => tracing::info!(
+                    title = %shared.game.title,
+                    veto_limit_s = VETO_LIMIT.as_secs(),
+                    "no game processes found, but its launcher still reports it \
+                     running — holding off on ending the session"
+                ),
+                Verdict::Exited { why, stale_for } => {
+                    if let Some(gone_for) = stale_for {
+                        tracing::warn!(
                             title = %shared.game.title,
-                            veto_limit_s = VETO_LIMIT.as_secs(),
-                            "no game processes found, but its launcher still reports it \
-                             running — holding off on ending the session"
+                            gone_for_s = gone_for.as_secs(),
+                            "its launcher still reports the game running, but nothing of \
+                             it has been on the box for {}s — treating that as a stale \
+                             flag and ending the session",
+                            VETO_LIMIT.as_secs()
                         );
                     }
+                    return finish(&shared, &self.on_exit, why, run);
                 }
             }
             if let Some(run) = run.as_mut() {
@@ -1260,13 +1254,6 @@ impl Watcher {
             std::thread::sleep(POLL);
         }
     }
-}
-
-/// Exited: gone ≥ [`EXIT_CONFIRM`], and either unopposed or gone ≥
-/// [`VETO_LIMIT`] despite [`crate::procscan::running_hint`].
-#[cfg(any(target_os = "linux", windows))]
-fn exit_confirmed(gone_for: Duration, hint_running: bool) -> bool {
-    gone_for >= EXIT_CONFIRM && (!hint_running || gone_for >= VETO_LIMIT)
 }
 
 /// Play-time clock for one run, credited to a library id and the launching profile.
@@ -1822,26 +1809,6 @@ mod tests {
         pending_snapshot()
             .iter()
             .any(|(s, _)| s.game.id.as_deref() == Some(id))
-    }
-
-    /// `running_hint` may delay an exit; it must not delay it forever.
-    #[cfg(any(target_os = "linux", windows))]
-    #[test]
-    fn the_launcher_veto_expires_instead_of_pinning_a_session_open() {
-        let brief = EXIT_CONFIRM / 2;
-        let confirmed = EXIT_CONFIRM + Duration::from_secs(1);
-        let long = VETO_LIMIT + Duration::from_secs(1);
-
-        // Inside EXIT_CONFIRM: a process swap is still plausible.
-        assert!(!exit_confirmed(brief, false));
-        assert!(!exit_confirmed(brief, true));
-        assert!(exit_confirmed(confirmed, false));
-        // Hint still set: that is what the veto is for.
-        assert!(!exit_confirmed(confirmed, true));
-        // Past VETO_LIMIT the hint is stale.
-        assert!(exit_confirmed(long, true));
-        assert!(exit_confirmed(long, false));
-        // Also pins VETO_LIMIT > EXIT_CONFIRM.
     }
 
     #[test]

@@ -16,6 +16,7 @@
 
 use crate::host::AppState;
 use crate::https::serve_https_with_plain;
+use crate::plugin_host::PluginTokens;
 use anyhow::{Context, Result};
 use axum::extract::Request;
 use axum::http::StatusCode;
@@ -44,10 +45,10 @@ mod host;
 mod library;
 mod native;
 #[cfg(windows)]
-pub(crate) mod pipes;
+mod pipes;
 mod plugin_access;
-pub(crate) mod plugin_channel;
-pub(crate) mod plugins;
+mod plugin_channel;
+mod plugins;
 mod profiles;
 mod session;
 mod settings;
@@ -197,8 +198,6 @@ pub(crate) struct MgmtState {
     identity_fingerprint: Option<[u8; 32]>,
 }
 
-pub(crate) type PluginTokens = Arc<RwLock<std::collections::BTreeMap<String, String>>>;
-
 /// `native` is the shared punktfunk/1 pairing handle when the unified host
 /// runs the native QUIC server.
 pub async fn run(
@@ -217,7 +216,7 @@ pub async fn run(
     // Close a leftover apply-intent from the previous boot (`update/jobs.rs`).
     // Once per process, before serving.
     crate::update::reconcile_at_boot();
-    plugin_channel::remember_runtime();
+    crate::plugin_host::channel::remember_runtime();
     settings::write_seat_defaults();
     // The tray has no supervisor — HKLM `Run` is a sign-in trigger — so
     // `StopTrays` and a crash leave no icon until the next logon.
