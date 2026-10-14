@@ -291,7 +291,7 @@ pub(crate) fn cursor_blend_for(
             return false;
         }
         // Same CUDA-payload prediction as `handshake::cursor_forward`: NVIDIA plus
-        // the zero-copy switch. Only a CUDA payload reaches the blend.
+        // the zero-copy switch. It picks the backend.
         let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
         crate::encode::cursor_blend_capable(codec, cuda_planned, bit_depth == 10, hdr)
     }

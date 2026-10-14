@@ -1683,7 +1683,9 @@ impl Encoder for NvencCudaEncoder {
 
     fn caps(&self) -> EncoderCaps {
         EncoderCaps {
-            blends_cursor: true,
+            // Any payload blends while the Vulkan slot device is up; before the first frame
+            // tries it, it is expected up (`cursor_blend_capable` predicts the same).
+            blends_cursor: !self.cursor_tried || self.vk_blend.is_some(),
             supports_rfi: self.s.rfi_supported,
             chroma_444: self.s.chroma_444,
             intra_refresh: false,

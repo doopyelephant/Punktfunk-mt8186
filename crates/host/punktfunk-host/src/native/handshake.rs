@@ -256,7 +256,7 @@ pub(super) fn cursor_forward(
     }
     #[cfg(target_os = "linux")]
     {
-        // Same CUDA prediction `SessionPlan` makes: NVENC blends a CUDA payload only.
+        // Same CUDA prediction `SessionPlan` makes; it picks the backend.
         let cuda_planned = !crate::encode::linux_zero_copy_is_vaapi() && crate::zerocopy::enabled();
         let _ = joined;
         compositor.is_some_and(|c| c != crate::vdisplay::Compositor::Gamescope)
