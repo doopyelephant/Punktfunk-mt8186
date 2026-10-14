@@ -218,8 +218,9 @@ impl VulkanDecodeDevice {
     /// Should `auto` try Vulkan Video before VAAPI / D3D11VA on this device?
     ///
     /// NVIDIA and AMD: yes. NVIDIA has no usable VAAPI; VanGogh VAAPI chroma-fringes.
-    /// This orders attempts only: later admission may skip the platform rung
-    /// (NVIDIA VAAPI is barred from auto). Intel/unknown try the platform rung first.
+    /// Elsewhere the platform rung gets the first turn. D3D11VA keeps it. VAAPI is
+    /// `verified: false`, so it never precedes a usable Vulkan rung, and on Linux this
+    /// decides only whether that yield is logged.
     pub fn prefer_vulkan_first(&self) -> bool {
         self.vendor_id == VENDOR_NVIDIA || self.vendor_id == VENDOR_AMD
     }

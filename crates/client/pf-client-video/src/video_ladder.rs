@@ -10,9 +10,7 @@
 //! the ladder sees them. `build_rung` asks `tests::scripted` first, so the test
 //! walks a real `Decoder` with no decoder behind it.
 
-use crate::video::{
-    native_rung_admitted, native_vulkan_gate, native_vulkan_usable, NativeRung, VulkanDecodeDevice,
-};
+use crate::video::{native_rung_admitted, native_vulkan_usable, NativeRung, VulkanDecodeDevice};
 use crate::video_caps::{is_auto, v4l2_auto_ok, vaapi_auto_ok};
 
 /// The OS a ladder is for.
@@ -80,62 +78,62 @@ pub(crate) enum Note {
     VaapiGated,
     /// A `software` preference: no hardware rung is tried.
     SoftwareOnly,
+    /// A value that is no pin, `auto` or `software` here: it reads as `auto`.
+    UnknownPreference,
 }
 
 /// The steps `Decoder::new` walks for `choice`, the resolved preference.
 ///
-/// A pin goes first, and a refused pin walks on as `auto`. `auto` puts Vulkan Video
-/// first on NVIDIA and AMD and the platform rung first elsewhere, unless that rung
-/// is unproven and a proven Vulkan rung can run ([`native_rung_admitted`]). The
-/// platform rung and V4L2 need a presenter that imports their pictures. A value
-/// that is neither a pin nor `auto` reaches those two, and never Vulkan.
+/// A pin goes first, and a refused pin walks on as `auto` without it. Any value but
+/// a pin and `software` reads as `auto`. `auto` puts Vulkan Video first on NVIDIA and
+/// AMD and the platform rung first elsewhere, unless that rung is unproven and a
+/// proven Vulkan rung can run ([`native_rung_admitted`]). The platform rung and V4L2
+/// need a presenter that imports their pictures.
 pub(crate) fn ladder(os: Os, choice: &str, wire: u8, vk: Option<&VulkanDecodeDevice>) -> Vec<Step> {
     if choice == "software" {
         return vec![Step::Note(Note::SoftwareOnly)];
     }
     let video_decode = vk.is_some_and(|v| v.video_decode);
     let caps = vk.map_or(0, |v| v.decode_video_caps);
+    let usable = native_vulkan_usable(wire, video_decode, caps);
     let mut steps = Vec::new();
     let pin = os.pins().iter().copied().find(|r| r.name() == choice);
     match pin {
-        Some(NativeRung::Vulkan) if !native_vulkan_gate(choice, wire, video_decode, caps) => {
-            steps.push(Step::Note(Note::VulkanPinRefused));
-        }
+        Some(NativeRung::Vulkan) if !usable => steps.push(Step::Note(Note::VulkanPinRefused)),
         Some(rung) => steps.push(Step::Pin(rung)),
+        None if !is_auto(choice) => steps.push(Step::Note(Note::UnknownPreference)),
         None => {}
     }
-    let walk = if pin.is_some() { "auto" } else { choice };
-    // The pin was Vulkan's one try.
-    let vulkan = (pin != Some(NativeRung::Vulkan)
-        && native_vulkan_gate(walk, wire, video_decode, caps))
-    .then_some(Step::Try(NativeRung::Vulkan));
-    let platform_turn = is_auto(walk)
-        && !vk
-            .filter(|v| v.video_decode)
-            .is_some_and(|v| v.prefer_vulkan_first());
+    // A pin is its rung's one try: the walk after it never names that rung.
+    let open = |rung| pin != Some(rung);
+    let vulkan = (open(NativeRung::Vulkan) && usable).then_some(Step::Try(NativeRung::Vulkan));
+    let platform_turn = !vk
+        .filter(|v| v.video_decode)
+        .is_some_and(|v| v.prefer_vulkan_first());
     match os {
         Os::Linux => {
             // Vulkan sits under VAAPI only where this device runs it.
-            let below =
-                native_vulkan_usable(wire, video_decode, caps).then_some(NativeRung::Vulkan);
+            let below = usable.then_some(NativeRung::Vulkan);
             let leads = platform_turn && native_rung_admitted(NativeRung::Vaapi, wire, below);
-            if platform_turn && !leads {
+            let vaapi = open(NativeRung::Vaapi).then(|| {
+                if vaapi_auto_ok(vk) {
+                    Step::Try(NativeRung::Vaapi)
+                } else {
+                    Step::Note(Note::VaapiGated)
+                }
+            });
+            if platform_turn && !leads && vaapi.is_some() {
                 steps.push(Step::Note(Note::VaapiYields));
             }
-            let vaapi = if vaapi_auto_ok(vk) {
-                Step::Try(NativeRung::Vaapi)
-            } else {
-                Step::Note(Note::VaapiGated)
-            };
             if leads {
-                steps.push(vaapi);
+                steps.extend(vaapi);
                 steps.extend(vulkan);
             } else {
                 steps.extend(vulkan);
-                steps.push(vaapi);
+                steps.extend(vaapi);
             }
             // V4L2 last: the rung of devices that have neither of the above.
-            if v4l2_auto_ok(vk) {
+            if open(NativeRung::V4l2) && v4l2_auto_ok(vk) {
                 steps.push(Step::Try(NativeRung::V4l2));
             }
         }
@@ -144,8 +142,7 @@ pub(crate) fn ladder(os: Os, choice: &str, wire: u8, vk: Option<&VulkanDecodeDev
             // that rung. No rung is named below D3D11VA: it is admitted whatever its evidence.
             let leads = platform_turn && native_rung_admitted(NativeRung::D3d11va, wire, None);
             // A DXVA frame reaches the screen only through the presenter's win32 import.
-            let d3d11 = vk
-                .is_some_and(|v| v.d3d11_import)
+            let d3d11 = (open(NativeRung::D3d11va) && vk.is_some_and(|v| v.d3d11_import))
                 .then_some(Step::Try(NativeRung::D3d11va));
             if leads {
                 steps.extend(d3d11);
@@ -159,26 +156,24 @@ pub(crate) fn ladder(os: Os, choice: &str, wire: u8, vk: Option<&VulkanDecodeDev
     steps
 }
 
-/// The hardware rungs a failing `from` may demote onto, in order; the CPU rung
-/// follows. Read off the `auto` walk whatever the session's preference was. A rung
-/// in `ran` is never entered again, so the two native rungs cannot bounce the
-/// session; V4L2 is never a target; Vulkan is entered from the platform rung only.
+/// The hardware rungs a failing rung may demote onto, in order; the CPU rung
+/// follows. The platform rung, then Vulkan, each where the `auto` walk offers it
+/// whatever the session's preference was. `ran` holds the failing rung and every
+/// one before it; none is entered again, so the two cannot bounce the session.
+/// V4L2 is never a target.
 pub(crate) fn demotions(
     os: Os,
     wire: u8,
     vk: Option<&VulkanDecodeDevice>,
-    from: NativeRung,
     ran: &[NativeRung],
 ) -> Vec<NativeRung> {
-    ladder(os, "auto", wire, vk)
+    let offered: Vec<NativeRung> = ladder(os, "auto", wire, vk)
         .into_iter()
         .filter_map(Step::rung)
-        .filter(|rung| !ran.contains(rung))
-        .filter(|rung| match rung {
-            NativeRung::V4l2 => false,
-            NativeRung::Vulkan => from == os.platform_rung(),
-            _ => true,
-        })
+        .collect();
+    [os.platform_rung(), NativeRung::Vulkan]
+        .into_iter()
+        .filter(|rung| offered.contains(rung) && !ran.contains(rung))
         .collect()
 }
 
@@ -204,12 +199,11 @@ pub(crate) mod tests {
     /// Video advertises (`all`, `h26x` without AV1, `none`); whether the presenter
     /// imports the platform rung's pictures (dma-buf, D3D11 texture); wire codec;
     /// stored preference (`empty` is `""`). Then the rungs tried in order, and for
-    /// each hardware rung the session can land on, the rungs it demotes through.
-    /// Every demotion has one hardware target at most: if that does not build, the
-    /// CPU rung is next.
+    /// each hardware rung the session can land on, the rungs it demotes through. A
+    /// target that does not build passes the session to the next rung of its chain.
     const ORDER: &str = "
         os      gpu    vulkan import codec pref           | tries                            | a failing rung demotes through
-        linux   nvidia all    yes    h264  auto           | vulkan v4l2 software             | vulkan>software v4l2>software
+        linux   nvidia all    yes    h264  auto           | vulkan v4l2 software             | vulkan>software v4l2>vulkan>software
         linux   amd    all    yes    h264  auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
         linux   amd    all    yes    hevc  auto           | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
         linux   amd    h26x   yes    av1   auto           | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
@@ -226,12 +220,12 @@ pub(crate) mod tests {
         linux   amd    all    yes    h264  software       | software                         | -
         linux   amd    all    yes    h264  native-vulkan  | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
         linux   intel  all    yes    av1   native-vulkan  | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
-        linux   nvidia all    yes    h264  native-vaapi   | vaapi vulkan v4l2 software       | vaapi>vulkan>software vulkan>software v4l2>software
-        linux   amd    all    yes    h264  native-vaapi   | vaapi vulkan vaapi v4l2 software | vaapi>vulkan>software vulkan>vaapi>software v4l2>vaapi>vulkan>software
-        linux   intel  all    yes    av1   native-vaapi   | vaapi vaapi v4l2 software        | vaapi>software v4l2>vaapi>software
-        linux   amd    all    yes    h264  native-v4l2    | v4l2 vulkan vaapi v4l2 software  | v4l2>vaapi>vulkan>software vulkan>vaapi>software vaapi>vulkan>software
-        linux   amd    all    yes    h264  something-else | vaapi v4l2 software              | vaapi>vulkan>software v4l2>vaapi>vulkan>software
-        linux   amd    all    yes    h264  native-d3d11va | vaapi v4l2 software              | vaapi>vulkan>software v4l2>vaapi>vulkan>software
+        linux   nvidia all    yes    h264  native-vaapi   | vaapi vulkan v4l2 software       | vaapi>vulkan>software vulkan>software v4l2>vulkan>software
+        linux   amd    all    yes    h264  native-vaapi   | vaapi vulkan v4l2 software       | vaapi>vulkan>software vulkan>vaapi>software v4l2>vaapi>vulkan>software
+        linux   intel  all    yes    av1   native-vaapi   | vaapi v4l2 software              | vaapi>software v4l2>vaapi>software
+        linux   amd    all    yes    h264  native-v4l2    | v4l2 vulkan vaapi software       | v4l2>vaapi>vulkan>software vulkan>vaapi>software vaapi>vulkan>software
+        linux   amd    all    yes    h264  something-else | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
+        linux   amd    all    yes    h264  native-d3d11va | vulkan vaapi v4l2 software       | vulkan>vaapi>software vaapi>vulkan>software v4l2>vaapi>vulkan>software
         windows nvidia all    yes    h264  auto           | vulkan d3d11va software          | vulkan>d3d11va>software d3d11va>vulkan>software
         windows amd    all    yes    h264  auto           | vulkan d3d11va software          | vulkan>d3d11va>software d3d11va>vulkan>software
         windows amd    h26x   yes    av1   auto           | d3d11va software                 | d3d11va>software
@@ -246,11 +240,11 @@ pub(crate) mod tests {
         windows nvidia all    yes    h264  software       | software                         | -
         windows intel  all    yes    h264  native-vulkan  | vulkan d3d11va software          | vulkan>d3d11va>software d3d11va>vulkan>software
         windows amd    h26x   yes    av1   native-vulkan  | d3d11va software                 | d3d11va>software
-        windows nvidia all    yes    h264  native-d3d11va | d3d11va vulkan d3d11va software  | d3d11va>vulkan>software vulkan>d3d11va>software
-        windows intel  all    yes    h264  native-d3d11va | d3d11va d3d11va vulkan software  | d3d11va>vulkan>software vulkan>d3d11va>software
+        windows nvidia all    yes    h264  native-d3d11va | d3d11va vulkan software          | d3d11va>vulkan>software vulkan>d3d11va>software
+        windows intel  all    yes    h264  native-d3d11va | d3d11va vulkan software          | d3d11va>vulkan>software vulkan>d3d11va>software
         windows nvidia all    no     h264  native-d3d11va | d3d11va vulkan software          | d3d11va>vulkan>software vulkan>software
-        windows nvidia all    yes    h264  something-else | d3d11va software                 | d3d11va>vulkan>software
-        windows nvidia all    yes    h264  native-vaapi   | d3d11va software                 | d3d11va>vulkan>software
+        windows nvidia all    yes    h264  something-else | vulkan d3d11va software          | vulkan>d3d11va>software d3d11va>vulkan>software
+        windows nvidia all    yes    h264  native-vaapi   | vulkan d3d11va software          | vulkan>d3d11va>software d3d11va>vulkan>software
     ";
 
     struct Row {
@@ -473,14 +467,10 @@ pub(crate) mod tests {
             assert_eq!(cell(&tried, " "), row.tries, "{}", row.label());
 
             let mut chains = Vec::new();
-            for (step, rung) in tried.iter().enumerate() {
-                if tried[..step].contains(rung) {
-                    continue;
-                }
+            for step in 0..tried.len() {
                 let chain = demotes(row, step, false);
-                // A target that does not build leaves only the CPU rung.
-                let refused = demotes(row, step, true);
-                assert_eq!(refused[..], chain[..chain.len().min(2)], "{}", row.label());
+                // A target that does not build passes the session to the next one.
+                assert_eq!(demotes(row, step, true), chain, "{}", row.label());
                 chains.push(cell(&chain, ">"));
             }
             assert_eq!(chains_cell(&chains), row.demotes, "{}", row.label());
@@ -498,26 +488,23 @@ pub(crate) mod tests {
             assert_eq!(cell(&tried, " "), row.tries, "{}", row.label());
 
             let mut chains = Vec::new();
-            for (step, rung) in tried.iter().enumerate() {
-                if tried[..step].contains(rung) {
-                    continue;
-                }
+            for rung in &tried {
                 // The rungs run so far are the chain itself.
                 let mut chain = vec![*rung];
-                loop {
-                    let from = *chain.last().expect("the landed rung");
-                    let targets = demotions(os, wire, vk.as_ref(), from, &chain);
-                    assert!(targets.len() <= 1, "{}: {targets:?}", row.label());
-                    let Some(next) = targets.first() else { break };
-                    chain.push(*next);
+                while let Some(&next) = demotions(os, wire, vk.as_ref(), &chain).first() {
+                    chain.push(next);
                 }
+                // A target that does not build passes the session to the next one.
+                let refused = demotions(os, wire, vk.as_ref(), &[*rung]);
+                assert_eq!(refused, chain[1..], "{}", row.label());
                 chains.push(cell(&chain, ">"));
             }
             assert_eq!(chains_cell(&chains), row.demotes, "{}", row.label());
         }
     }
 
-    /// A pin goes first and warns; a rung the walk passes over is said in its turn.
+    /// A pin goes first, warns, and is its rung's one try; a rung the walk passes over
+    /// is said in its turn.
     #[test]
     fn the_walk_says_what_it_passes_over() {
         use NativeRung::{D3d11va, V4l2, Vaapi, Vulkan};
@@ -544,16 +531,20 @@ pub(crate) mod tests {
             [Step::Note(Note::VulkanPinRefused), Try(Vaapi), Try(V4l2)]
         );
         assert_eq!(
-            walk("linux amd all yes h264 native-vaapi"),
-            [Pin(Vaapi), Try(Vulkan), Try(Vaapi), Try(V4l2)]
+            walk("linux intel all yes h264 native-vaapi"),
+            [Pin(Vaapi), Try(Vulkan), Try(V4l2)]
         );
         assert_eq!(
             walk("windows intel all yes h264 native-d3d11va"),
-            [Pin(D3d11va), Try(D3d11va), Try(Vulkan)]
+            [Pin(D3d11va), Try(Vulkan)]
         );
         assert_eq!(
             walk("windows nvidia all yes h264 software"),
             [Step::Note(Note::SoftwareOnly)]
+        );
+        assert_eq!(
+            walk("linux amd all yes h264 something-else")[0],
+            Step::Note(Note::UnknownPreference)
         );
     }
 }
