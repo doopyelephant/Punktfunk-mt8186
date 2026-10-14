@@ -65,10 +65,15 @@ impl PartialEq for ReedSolomon {
 }
 
 impl ReedSolomon {
+    /// Systematic generator: identity over the data rows, Cauchy parity rows below.
+    /// Built directly, O(k·n). Inverting a Vandermonde top would only reproduce the
+    /// identity (`V_top · V_top⁻¹ = I`) at O(k³) — milliseconds per call at k ≈ 200,
+    /// paid whenever a caller's block shape changes.
     fn build_matrix(data_shards: usize, total_shards: usize) -> Matrix {
-        let vandermonde = Matrix::vandermonde(total_shards, data_shards);
-        let top = vandermonde.sub_matrix(0, 0, data_shards, data_shards);
-        let mut result = vandermonde.multiply(&top.invert().unwrap());
+        let mut result = Matrix::new(total_shards, data_shards);
+        for i in 0..data_shards {
+            result.data[i * data_shards + i] = 1;
+        }
 
         let parity_shards = total_shards - data_shards;
         let mut inverse = vec![0u8; 256];
@@ -881,6 +886,29 @@ mod tests {
         assert_eq!(rs.data_shard_count(), 4);
         assert_eq!(rs.parity_shard_count(), 2);
         assert_eq!(rs.total_shard_count(), 6);
+    }
+
+    #[test]
+    fn build_matrix_matches_the_vandermonde_derivation() {
+        for (k, m) in [
+            (1, 1),
+            (4, 2),
+            (19, 4),
+            (154, 31),
+            (155, 31),
+            (180, 67),
+            (212, 43),
+        ] {
+            let vandermonde = Matrix::vandermonde(k + m, k);
+            let top = vandermonde.sub_matrix(0, 0, k, k);
+            let mut expected = vandermonde.multiply(&top.invert().unwrap());
+            let rs = ReedSolomon::new(k, m).unwrap();
+            for row in k..k + m {
+                let r = row * k;
+                expected.data[r..r + k].copy_from_slice(&rs.matrix.data[r..r + k]);
+            }
+            assert!(expected == rs.matrix, "k={k} m={m}");
+        }
     }
 
     #[test]
