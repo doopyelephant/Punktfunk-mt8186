@@ -8,21 +8,53 @@
 //! The model's table test is the contract; nothing here decides.
 
 use super::*;
+use crate::cursor_raster::with_section_shape;
 use crate::cursor_state::{Action, Event, Source};
+use cursor::SECTION_SERIAL_TAG;
 
 impl IddPushCapturer {
-    /// Overlay source for [`Capturer::cursor`] and the shape the client draws.
+    /// Overlay source for [`Capturer::cursor`] and the shape the client draws: the poller's
+    /// position and visibility with the section's OS-rendered shape when it holds one of the
+    /// cursor's class ([`with_section_shape`]); the section alone once the poller is gone.
     pub(super) fn live_cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
         let alive = self.cursor_poll.as_ref().is_some_and(|p| p.alive());
         match self.cursor_model.source(alive) {
-            Source::Poller => self.cursor_poll.as_ref().and_then(|p| p.read()),
+            Source::Poller => {
+                let (polled, class) = self.cursor_poll.as_ref().and_then(|p| p.read())?;
+                let section = self.cursor_shared.as_mut().and_then(|c| {
+                    let overlay = c.read()?;
+                    Some((overlay, c.shape_class()?))
+                });
+                let out = with_section_shape(polled, class, section);
+                let from_section = out.serial & SECTION_SERIAL_TAG != 0;
+                if out.w != 0 && self.shape_from_section != Some(from_section) {
+                    match self.shape_from_section {
+                        None if from_section => tracing::info!(
+                            target_id = self.target_id,
+                            w = out.w,
+                            h = out.h,
+                            "cursor: the client draws the OS-rendered shape from the driver's \
+                             section"
+                        ),
+                        _ => tracing::debug!(
+                            target_id = self.target_id,
+                            from_section,
+                            w = out.w,
+                            h = out.h,
+                            "cursor: shape source changed with the cursor's class"
+                        ),
+                    }
+                    self.shape_from_section = Some(from_section);
+                }
+                Some(out)
+            }
             Source::Section { first } => {
                 if first {
                     tracing::warn!(
                         target_id = self.target_id,
                         "cursor: the GDI shape poller is not running — degrading to the driver's \
-                         hardware-cursor shm section for the rest of the session (alpha-only \
-                         shapes: monochrome/masked cursors will look wrong)"
+                         hardware-cursor shm section for the rest of the session (a masked \
+                         cursor the section did not receive keeps the last shape)"
                     );
                 }
                 self.cursor_shared.as_mut().and_then(|c| c.read())

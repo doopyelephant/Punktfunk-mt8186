@@ -196,8 +196,8 @@ impl IddPushCapturer {
                  blend has no shape source either"
             );
         }
-        // IddCx cannot deliver masked/monochrome (`cursor_poll.rs`), so the GDI poller is the
-        // client's shape source under any declare.
+        // Under any declare the GDI poller is the pointer's position and visibility, and the
+        // shape for a cursor the section holds none of (`cursor_model.rs`).
         let cursor_poll = cursor_model.declared().then(|| {
             let rect = pf_win_display::win_display::source_desktop_rect(ccd).unwrap_or((
                 0,
@@ -292,6 +292,7 @@ impl IddPushCapturer {
                 .flatten(),
             cursor_shared,
             cursor_poll,
+            shape_from_section: None,
             cursor_forward,
             cursor_sender,
             cursor_model,

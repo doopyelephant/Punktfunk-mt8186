@@ -1,13 +1,12 @@
-//! GDI cursor poller: the Windows cursor-SHAPE source for the cursor-forward
-//! channel. Off-thread `GetCursorInfo` + `HCURSOR` rasterise, published as
-//! [`pf_frame::CursorOverlay`].
+//! GDI cursor poller: the Windows pointer's position and visibility, and the shape the
+//! client draws when the driver's section has none for it. Off-thread `GetCursorInfo`
+//! + `HCURSOR` rasterise, published as [`pf_frame::CursorOverlay`].
 //!
-//! IddCx hardware-cursor query (`CursorShm`) is alpha-only: `IDDCX_CURSOR_SHAPE_TYPE`
-//! has no monochrome, the OS pre-converts mono to masked-color, and MASKED_COLOR
-//! delivery is dead on modern builds. The driver still declares XOR FULL so DWM
-//! excludes every cursor type from the IDD frame; this poller is the shape that
-//! then gets forwarded or host-composited. DXGI `GetFramePointerShape` is not
-//! used: `PointerPosition.Visible` goes stale under injected input, and it burns
+//! The shape here is the 96-DPI bitmap `GetIconInfo` hands a per-monitor-aware process,
+//! whatever the display's scale; the section holds the one Windows draws, and
+//! `cursor_model.rs` prefers it for a cursor of the same class. The driver declares XOR
+//! FULL so DWM excludes every cursor type from the IDD frame. DXGI `GetFramePointerShape`
+//! is not used: `PointerPosition.Visible` goes stale under injected input, and it burns
 //! one of four duplication slots.
 //!
 //! The host runs as SYSTEM inside the interactive session on `winsta0\default`
@@ -17,7 +16,7 @@
 
 use super::*;
 use crate::cursor_raster::{
-    alpha_is_empty, compose_overlay, masked_color_to_rgba, mono_planes_to_rgba, Shape,
+    alpha_is_empty, compose_overlay, masked_color_to_rgba, mono_planes_to_rgba, Shape, ShapeClass,
 };
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
@@ -38,10 +37,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const CURSOR_SHOWING: u32 = 0x1;
 const CURSOR_SUPPRESSED: u32 = 0x2;
 
+/// One poll: the overlay and the class of its shape (`None` before a shape was seen).
+type Polled = (pf_frame::CursorOverlay, Option<ShapeClass>);
+
 /// Off-thread GDI cursor poller. User32/gdi32 stay off the capture/encode thread;
 /// the capture tick is one uncontended mutex read plus an `Arc` clone.
 pub(super) struct CursorPoller {
-    slot: Arc<Mutex<Option<pf_frame::CursorOverlay>>>,
+    slot: Arc<Mutex<Option<Polled>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -75,7 +77,7 @@ impl CursorPoller {
         ccd: pf_win_display::win_display::CcdTargetKey,
         rect: (i32, i32, i32, i32),
     ) -> Self {
-        let slot: Arc<Mutex<Option<pf_frame::CursorOverlay>>> = Arc::new(Mutex::new(None));
+        let slot: Arc<Mutex<Option<Polled>>> = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let (slot_t, stop_t) = (slot.clone(), stop.clone());
         let thread = std::thread::Builder::new()
@@ -88,8 +90,8 @@ impl CursorPoller {
         Self { slot, stop, thread }
     }
 
-    /// Latest overlay; `None` until the first successful rasterise.
-    pub(super) fn read(&self) -> Option<pf_frame::CursorOverlay> {
+    /// Latest poll; `None` until the first publish.
+    pub(super) fn read(&self) -> Option<Polled> {
         self.slot.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
@@ -111,7 +113,7 @@ impl Drop for CursorPoller {
 fn run(
     ccd: pf_win_display::win_display::CcdTargetKey,
     mut rect: (i32, i32, i32, i32),
-    slot: &Mutex<Option<pf_frame::CursorOverlay>>,
+    slot: &Mutex<Option<Polled>>,
     stop: &AtomicBool,
 ) {
     // Physical pixels on this thread: `rect` is CCD (always physical), and a virtualized
@@ -184,7 +186,8 @@ fn run(
         let shown = showing && ci.hCursor.0 as isize != 0;
         let pos = (ci.ptScreenPos.x - rect.0, ci.ptScreenPos.y - rect.1);
         let overlay = compose_overlay(pos, rect, shown, cache.shape.as_ref());
-        *slot.lock().unwrap_or_else(|p| p.into_inner()) = overlay;
+        let class = cache.shape.as_ref().map(|s| s.class);
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = overlay.map(|o| (o, class));
     }
 }
 
@@ -214,8 +217,8 @@ impl ShapeCache {
 
     /// Rasterise `cursor` on a handle change only; a hidden cursor keeps the cached shape, and
     /// an animated one publishes frame 0. Handle identity cannot see a re-render: Windows
-    /// rebuilds system cursors when the scale under the pointer changes but keeps the shared
-    /// handle for the session (arrow is 0x10003 throughout), so the extent is re-read every
+    /// rebuilds the shared system cursors behind the same handle (the arrow is 0x10003 all
+    /// session) when the pointer size changes, so the extent is re-read every
     /// [`CursorPoller::EXTENT_PROBE`] and a move drops the cache.
     fn refresh(
         &mut self,
@@ -251,25 +254,21 @@ impl ShapeCache {
             return;
         }
         match rasterize(cursor) {
-            Some((rgba, w, h, hot_x, hot_y)) => {
+            Some(mut shape) => {
                 self.serial += 1;
-                self.shape = Some(Shape {
-                    rgba: std::sync::Arc::new(rgba),
-                    w,
-                    h,
-                    hot_x,
-                    hot_y,
-                    serial: self.serial,
-                });
+                shape.serial = self.serial;
                 self.cached = handle;
                 self.failed = 0;
                 if !self.logged_live {
                     self.logged_live = true;
                     tracing::info!(
                         target = %ccd,
-                        "cursor poller live — GDI shape source publishing (serial 1: {w}x{h})"
+                        "cursor poller live — GDI shape source publishing (serial 1: {}x{})",
+                        shape.w,
+                        shape.h
                     );
                 }
+                self.shape = Some(shape);
             }
             // The owning app may have destroyed the cursor mid-read; keep the previous
             // shape and don't hammer this handle again until it changes.
@@ -338,9 +337,9 @@ impl Drop for DesktopBinding {
     }
 }
 
-/// Rasterise `hcursor` to straight-alpha RGBA. `None` on any failure (caller
+/// Rasterise `hcursor` to a [`Shape`] with serial 0. `None` on any failure (caller
 /// keeps the previous shape).
-fn rasterize(hcursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> RasterOut {
+fn rasterize(hcursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> Option<Shape> {
     // CopyIcon first: the owner can destroy its HCURSOR between GetCursorInfo
     // and the reads below; the copy is ours.
 
@@ -361,14 +360,16 @@ fn rasterize(hcursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR) -> Raste
         let _ = DeleteObject(ii.hbmMask.into());
         let _ = DestroyIcon(icon);
     }
-    out.map(|(rgba, w, h)| {
-        let hot_x = ii.xHotspot.min(w.saturating_sub(1));
-        let hot_y = ii.yHotspot.min(h.saturating_sub(1));
-        (rgba, w, h, hot_x, hot_y)
+    out.map(|(rgba, w, h, class)| Shape {
+        rgba: std::sync::Arc::new(rgba),
+        w,
+        h,
+        hot_x: ii.xHotspot.min(w.saturating_sub(1)),
+        hot_y: ii.yHotspot.min(h.saturating_sub(1)),
+        serial: 0,
+        class,
     })
 }
-
-type RasterOut = Option<(Vec<u8>, u32, u32, u32, u32)>;
 
 /// Bitmap extent of `hcursor` — the `(w, h)` [`convert`] would derive, no pixel
 /// read. A re-render keeps the handle; `None` is "no verdict" (keep the cache).
@@ -431,7 +432,9 @@ fn bitmap_extent(hbm: HBITMAP) -> Option<(u32, u32)> {
 /// - monochrome (`hbmColor` null): `hbmMask` is double height — AND over XOR.
 ///   (0,0) black, (0,1) white, (1,0) transparent, (1,1) invert. Invert is
 ///   unrepresentable in straight alpha, so it draws as the driver's translucent gray.
-fn convert(ii: &ICONINFO) -> Option<(Vec<u8>, u32, u32)> {
+///
+/// Both mask families are [`ShapeClass::Masked`], as the OS delivers them to the driver.
+fn convert(ii: &ICONINFO) -> Option<(Vec<u8>, u32, u32, ShapeClass)> {
     // SAFETY: GetDC(None) yields the screen DC, released below on every path; it is only used
     // as the GetDIBits reference DC.
     let dc = unsafe { GetDC(None) };
@@ -440,14 +443,16 @@ fn convert(ii: &ICONINFO) -> Option<(Vec<u8>, u32, u32)> {
             let color = read_bitmap_32(dc, ii.hbmColor)?;
             let (w, h) = (color.w as u32, color.h as u32);
             let mut rgba = bgra_to_rgba(&color.bgra);
+            let mut class = ShapeClass::Alpha;
             if alpha_is_empty(&rgba) {
                 let mask = read_bitmap_32(dc, ii.hbmMask)?;
                 if mask.w != color.w || mask.h < color.h {
                     return None;
                 }
                 rgba = masked_color_to_rgba(&rgba, &mask.bgra, w as usize, h as usize);
+                class = ShapeClass::Masked;
             }
-            Some((rgba, w, h))
+            Some((rgba, w, h, class))
         } else {
             let mask = read_bitmap_32(dc, ii.hbmMask)?;
             if mask.h < 2 || mask.h % 2 != 0 {
@@ -456,7 +461,7 @@ fn convert(ii: &ICONINFO) -> Option<(Vec<u8>, u32, u32)> {
             let (w, h) = (mask.w as usize, (mask.h / 2) as usize);
             let (and_plane, xor_plane) = mask.bgra.split_at(h * w * 4);
             let rgba = mono_planes_to_rgba(and_plane, xor_plane, w, h);
-            Some((rgba, w as u32, h as u32))
+            Some((rgba, w as u32, h as u32, ShapeClass::Masked))
         }
     })();
     // SAFETY: releasing the screen DC obtained above, exactly once.
