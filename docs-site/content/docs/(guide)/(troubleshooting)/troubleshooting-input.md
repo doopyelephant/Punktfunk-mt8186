@@ -83,7 +83,9 @@ it.
 The trackpads don't move the pointer while Steam is closed. That's normal while the pad is captured.
 
 A 2015 Steam Controller takes the same steps on either host. A Windows host whose gamepad driver
-is older than the host gives it an Xbox 360 pad until the driver is reinstalled.
+is older than the host gives it an Xbox 360 pad until the driver is reinstalled. On Bluetooth it
+needs Valve's Bluetooth firmware, which Steam installs over its cable; pair it in your device's
+Bluetooth settings by holding Y while you press the Steam button.
 
 ## Clipboard
 
