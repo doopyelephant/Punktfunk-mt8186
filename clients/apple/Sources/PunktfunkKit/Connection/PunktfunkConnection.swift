@@ -2058,6 +2058,19 @@ public final class PunktfunkConnection: @unchecked Sendable {
         }
     }
 
+    /// `sc2IdentityRequests` for a 2015 Steam Controller, report id 0 first.
+    public static func sc1IdentityRequests() -> [[UInt8]] {
+        var out: [[UInt8]] = []
+        var buf = [UInt8](repeating: 0, count: 64)
+        while true {
+            let n = buf.withUnsafeMutableBufferPointer { p in
+                punktfunk_sc1_identity_request(UInt32(out.count), p.baseAddress, UInt(p.count))
+            }
+            guard n > 0 else { return out }
+            out.append(Array(buf[..<Int(n)]))
+        }
+    }
+
     /// Tell the host who the Steam Controller 2 on `pad` is, before its arrival
     /// (`punktfunk_connection_send_pad_identity`): its virtual pad then answers Steam as this one.
     public func sendPadIdentity(pad: UInt8, _ identity: PadIdentity) {
