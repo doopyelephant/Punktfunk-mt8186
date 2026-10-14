@@ -393,10 +393,6 @@ impl WaveSoak {
             anchor,
             ..
         } = *self;
-        assert!(
-            enc.caps().supports_rfi,
-            "{name}: the GPU invalidates references"
-        );
         let cycle = session(enc).wave_cycle() as usize;
         assert!(cycle >= 2 || anchor, "the wave is on");
         assert!(
@@ -416,6 +412,11 @@ impl WaveSoak {
         for i in 0..=last {
             match (i >= base && (i - base) / period < waves).then(|| (i - base) % period) {
                 Some(0) => {
+                    // The CUDA session reads its caps on the first frame.
+                    assert!(
+                        enc.caps().supports_rfi,
+                        "{name}: the GPU invalidates references"
+                    );
                     let l = (i - lag) as i64;
                     assert!(enc.invalidate_ref_frames(l, l), "the ask is answered");
                     m.lost.push(i - lag);
