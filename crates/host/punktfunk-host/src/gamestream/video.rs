@@ -217,11 +217,14 @@ impl VideoPacketizer {
                 let seq = block_seq_base + i as u32;
                 let mut buf = self.take_buf(off + blocksize);
                 let shard = &mut buf[off..];
+                // SOF/EOF bound each FEC block, as Sunshine sends them. moonlight-common-c
+                // rejects a data packet whose `streamPacketIndex` skips ahead unless it is SOF,
+                // and the previous block's parity takes indices, so every block must open with SOF.
                 let mut flags = FLAG_PIC;
-                if global == 0 {
+                if i == 0 {
                     flags |= FLAG_SOF;
                 }
-                if global == total_data - 1 {
+                if i == k - 1 {
                     flags |= FLAG_EOF;
                 }
                 shard[16..20].copy_from_slice(&(seq << 8).to_le_bytes()); // streamPacketIndex
@@ -486,6 +489,38 @@ mod tests {
         let n_blocks = total.div_ceil(255).clamp(1, 4);
         let last_block = ((pkts.last().unwrap()[27]) >> 6) & 0x3;
         assert_eq!(last_block as usize, n_blocks - 1);
+    }
+
+    /// moonlight-common-c's depacketizer drops a frame as corrupt when a data packet's
+    /// `streamPacketIndex` is not the previous data packet's + 1, unless that packet is SOF.
+    /// Parity sits between blocks in the index space, so each block must open with SOF.
+    #[test]
+    fn every_fec_block_opens_with_sof_across_parity_gaps() {
+        let mut pk = VideoPacketizer::new(1392, 20, 2);
+        let au = vec![0u8; 300 * 1376];
+        let pkts = pk.packetize(&au, FrameType::Idr, 0, None);
+        let mut last_data_index: Option<u32> = None;
+        let mut blocks = std::collections::BTreeSet::new();
+        for p in &pkts {
+            let fec_info = u32::from_le_bytes(p[28..32].try_into().unwrap());
+            let (k, fec_index) = (fec_info >> 22, (fec_info >> 12) & 0x3ff);
+            if fec_index >= k {
+                continue; // parity never reaches the depacketizer
+            }
+            blocks.insert((p[27] >> 4) & 0x3);
+            let index = u32::from_le_bytes(p[16..20].try_into().unwrap()) >> 8;
+            if let Some(prev) = last_data_index {
+                assert!(
+                    index == prev + 1 || p[24] & FLAG_SOF != 0,
+                    "data packet {index} after {prev} without SOF is a corrupt frame to the client"
+                );
+            }
+            last_data_index = Some(index);
+        }
+        assert!(
+            blocks.len() > 1,
+            "the frame must span FEC blocks to exercise the gap"
+        );
     }
 
     #[test]
