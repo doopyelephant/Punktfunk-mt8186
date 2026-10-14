@@ -880,11 +880,11 @@ fn open(
     };
 
     let source = source_mgr.create_source(&output, &qh, ());
-    // `options = 0`: no `paint_cursors`. The pointer rides the host's own cursor plane
-    // (`CaptureSignals::cursor_live`), same as every other Linux source.
+    // `paint_cursors`: nothing on this path feeds the host's cursor plane
+    // (`CaptureSignals::cursor_live`), so the compositor draws the pointer into the frames.
     let session = capture_mgr.create_session(
         &source,
-        icc::ext_image_copy_capture_manager_v1::Options::empty(),
+        icc::ext_image_copy_capture_manager_v1::Options::PaintCursors,
         &qh,
         (),
     );

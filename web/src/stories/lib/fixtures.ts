@@ -49,6 +49,7 @@ export const compositors: AvailableCompositor[] = [
 	{ id: "kwin", label: "KWin (Plasma)", available: true, default: true },
 	{ id: "gamescope", label: "gamescope", available: true, default: false },
 	{ id: "mutter", label: "Mutter (GNOME)", available: false, default: false },
+	{ id: "niri", label: "niri", available: false, default: false },
 	{ id: "wlroots", label: "Sway / wlroots", available: false, default: false },
 ];
 

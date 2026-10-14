@@ -154,7 +154,8 @@ pub fn input_backend_id(chosen: Compositor) -> &'static str {
         Compositor::Mutter => "libei",
         // Hyprland still speaks `zwlr_virtual_pointer_v1` + `zwp_virtual_keyboard_v1`
         // — same wlr injector as sway/river.
-        Compositor::Wlroots | Compositor::Hyprland => "wlr",
+        // niri serves both too, on stock builds and biri alike.
+        Compositor::Wlroots | Compositor::Hyprland | Compositor::Niri => "wlr",
         // pf-inject ignores the id off Linux; Windows has one injector.
         Compositor::Windows => "windows",
     }
@@ -319,6 +320,11 @@ pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
             wlroots::focus_output(name);
             true
         }
+        // niri mints its outputs from Hyprland's counter.
+        Compositor::Niri if hyprland::is_managed_output(name) => {
+            niri::focus_output(name);
+            true
+        }
         // No `_` arm: a new backend must decide here. Silent "no focus" only
         // shows up as a game on the wrong screen.
         Compositor::Hyprland
@@ -326,6 +332,7 @@ pub fn focus_streamed_output(compositor: Compositor, name: &str) -> bool {
         | Compositor::Kwin
         | Compositor::Mutter
         | Compositor::Gamescope
+        | Compositor::Niri
         | Compositor::Windows => false,
     }
 }
@@ -363,6 +370,7 @@ impl WorkspaceClaim {
         let done = match self.compositor {
             Compositor::Hyprland => hyprland::focus_workspace(self.restore),
             Compositor::Wlroots => wlroots::focus_workspace(self.restore),
+            Compositor::Niri => niri::desktop::focus_workspace(self.restore),
             // No `_` arm: only a backend that claims can release.
             Compositor::Kwin | Compositor::Mutter | Compositor::Gamescope | Compositor::Windows => {
                 return
@@ -436,6 +444,9 @@ pub fn claim_workspace(
         Compositor::Wlroots if wlroots::is_managed_output(name) => {
             wlroots::claim_workspace(name, want)
         }
+        Compositor::Niri if hyprland::is_managed_output(name) => {
+            niri::desktop::claim_workspace(name, want)
+        }
         // No `_` arm: a new backend must decide here. KWin is a later step (its
         // workspaces are a D-Bus script away); Mutter/GNOME has no per-output
         // workspace to aim at; gamescope already gives the game the whole
@@ -445,6 +456,7 @@ pub fn claim_workspace(
         | Compositor::Kwin
         | Compositor::Mutter
         | Compositor::Gamescope
+        | Compositor::Niri
         | Compositor::Windows => {
             tracing::info!(
                 compositor = compositor.id(), output = %name,
@@ -779,6 +791,7 @@ mod tests {
         // Hyprland shares sway's wlr virtual-input protocols — same injector on purpose.
         assert_eq!(input_backend_id(Compositor::Wlroots), "wlr");
         assert_eq!(input_backend_id(Compositor::Hyprland), "wlr");
+        assert_eq!(input_backend_id(Compositor::Niri), "wlr");
         assert_eq!(input_backend_id(Compositor::Windows), "windows");
     }
 
@@ -837,6 +850,14 @@ mod tests {
             restore: 1,
         };
         assert!(switched.needs_restore());
+    }
+
+    /// A physical connector is not ours to focus or to switch, whatever the compositor.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_physical_connector_is_never_focused_or_claimed_on_niri() {
+        assert!(!focus_streamed_output(Compositor::Niri, "DP-1"));
+        assert!(claim_workspace(Compositor::Niri, "DP-1", None).is_none());
     }
 
     /// Sample must not move when `PUNKTFUNK_GAMESCOPE_NODE` is written afterwards.

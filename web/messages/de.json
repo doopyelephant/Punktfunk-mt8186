@@ -511,6 +511,7 @@
 	"diag_pad_audio_title": "Controller-Lautsprecher",
 	"diag_pad_driver_title": "Treiber für virtuelle Controller",
 	"diag_encoder_sharing_title": "Geteilter Video-Encoder",
+	"diag_niri_virtual_outputs_title": "Virtuelle Anzeigen unter niri",
 	"logs_title": "Logs",
 	"logs_sources_label": "Quellen",
 	"logs_sources_none": "Keine Quelle ausgewählt — wähle oben mindestens eine aus.",

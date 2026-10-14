@@ -108,7 +108,7 @@ The table shows the Linux values. On Windows, **Encoder** takes `auto` · `nvenc
 | **Display refresh multiple** | Runs the virtual display at a multiple of the stream rate, so a frame that just misses the desktop's next paint still shows. The stream stays at its own rate. `0` lets the host pick: 2× on Windows for streams up to 500 Hz, otherwise off. `1` turns it off. A game with V-Sync on renders at the display's rate unless something caps it. |
 | **Cursor capture** | A troubleshooting knob: which cursor mode the host asks the screen-cast portal for. `auto` settles on one the portal offers. |
 | **Vulkan encoding** | AMD and Intel: HEVC and AV1 through Vulkan Video, which recovers from loss without a full keyframe. Off uses VAAPI. |
-| **Direct capture** | wlroots and Hyprland: capture the output directly instead of through the portal, on GPU sessions. A failure falls back to the portal. |
+| **Direct capture** | wlroots, Hyprland and niri: capture the output directly instead of through the screen cast, on GPU sessions. A failure falls back to the screen cast. |
 | **On-demand capture** | GNOME 49+: the virtual monitor paints once per streamed frame instead of on a timer. |
 | **KWin capture pacing** | KWin 6.7+: keep KWin's own recording throttle. |
 | **PyroWave quality** | The most bits per pixel a [PyroWave](/docs/pyrowave) session uses when the client sends no quality of its own; a client's **PyroWave quality** takes its place. With the client's bitrate on **Automatic** the session adapts between 0.5 and this value; a fixed client bitrate runs at it. |
@@ -139,7 +139,7 @@ Desktop) and rewrites them on every connect.
 
 | Variable | Values | What it does |
 |---|---|---|
-| `PUNKTFUNK_COMPOSITOR` | `kwin` · `mutter` · `gamescope` · `wlroots` · `hyprland` (also `kde`, `plasma`, `gnome`, `sway`, `wlr`, `river`, `hypr`) | Pins the virtual-display backend and turns session following off, so a Game Mode ↔ Desktop switch ends the stream. For single-purpose appliances only. |
+| `PUNKTFUNK_COMPOSITOR` | `kwin` · `mutter` · `gamescope` · `wlroots` · `hyprland` · `niri` (also `kde`, `plasma`, `gnome`, `sway`, `wlr`, `river`, `hypr`, `biri`) | Pins the virtual-display backend and turns session following off, so a Game Mode ↔ Desktop switch ends the stream. For single-purpose appliances only. |
 | `PUNKTFUNK_INPUT_BACKEND` | `libei` · `kwin` · `gamescope` · `wlr` | Pins input injection. Detected with the compositor; an unknown value is ignored. |
 | `PUNKTFUNK_VIDEO_SOURCE` | `virtual` (default) · `portal` | Moonlight sessions only: `portal` streams an existing monitor, which the GNOME 50+ HDR mirror needs — see [HDR](/docs/hdr#linux--gnome). |
 | `PUNKTFUNK_CAPTURE_MONITOR` | connector name, e.g. `DP-2`; on Windows the display name, e.g. `\\.\DISPLAY1` | Linux and Windows: stream this physical monitor instead of a virtual display, overriding the console. `punktfunk-host list-monitors` lists the names; one that matches nothing fails the session. See [Virtual displays](/docs/virtual-displays#stream-a-real-monitor-instead). |

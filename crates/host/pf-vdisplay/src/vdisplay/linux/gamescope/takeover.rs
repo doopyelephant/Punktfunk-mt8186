@@ -605,6 +605,7 @@ fn switch_ends_mask_window(kind: crate::ActiveKind) -> bool {
             | ActiveKind::DesktopGnome
             | ActiveKind::DesktopWlroots
             | ActiveKind::DesktopHyprland
+            | ActiveKind::DesktopNiri
     )
 }
 
@@ -1542,6 +1543,7 @@ fn do_restore_tv_session(verify: bool) {
                     | ActiveKind::DesktopGnome
                     | ActiveKind::DesktopWlroots
                     | ActiveKind::DesktopHyprland
+                    | ActiveKind::DesktopNiri
             ) {
                 if remove_steamos_dropin() {
                     systemctl_user(&["daemon-reload"]);
@@ -1639,6 +1641,7 @@ fn do_restore_tv_session(verify: bool) {
             | ActiveKind::DesktopGnome
             | ActiveKind::DesktopWlroots
             | ActiveKind::DesktopHyprland
+            | ActiveKind::DesktopNiri
     ) {
         tracing::info!(
             "gamescope: a desktop session is active — not restoring the TV gaming session"
@@ -2369,6 +2372,7 @@ mod tests {
             ActiveKind::DesktopGnome,
             ActiveKind::DesktopWlroots,
             ActiveKind::DesktopHyprland,
+            ActiveKind::DesktopNiri,
         ] {
             assert!(switch_ends_mask_window(kind), "{kind:?}");
         }

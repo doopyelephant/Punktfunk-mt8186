@@ -160,6 +160,11 @@ impl MirrorDisplay {
                 self.hw_cursor,
             )?,
             #[cfg(target_os = "linux")]
+            #[cfg(target_os = "linux")]
+            Compositor::Niri => {
+                crate::niri::stream_existing_output(&target.connector, self.hw_cursor)?
+            }
+            #[cfg(target_os = "linux")]
             Compositor::Hyprland => crate::portal_cast::stream_existing_output(
                 &crate::hyprland::SELECTOR,
                 &target.connector,
@@ -244,8 +249,8 @@ fn check_mirrorable(target: &monitors::PhysicalMonitor, compositor: Compositor) 
 /// streams our own virtual display. A new `Compositor` must fail to compile here.
 fn names_ours_conclusively(compositor: Compositor) -> bool {
     match compositor {
-        // `Virtual-punktfunk-<id>` and `PF-N` are minted only by us.
-        Compositor::Kwin | Compositor::Hyprland => true,
+        // `Virtual-punktfunk-<id>` and `PF-N` / `PF-<pid>-<n>` are minted only by us.
+        Compositor::Kwin | Compositor::Hyprland | Compositor::Niri => true,
         // Sway's `HEADLESS-N` includes its own; Mutter has no distinguishing name;
         // gamescope only reports the real DRM head. A hint at most.
         Compositor::Wlroots | Compositor::Mutter | Compositor::Gamescope => false,
@@ -341,6 +346,7 @@ mod tests {
     fn the_conclusive_naming_table_is_pinned_per_backend() {
         assert!(names_ours_conclusively(Compositor::Kwin));
         assert!(names_ours_conclusively(Compositor::Hyprland));
+        assert!(names_ours_conclusively(Compositor::Niri));
         assert!(!names_ours_conclusively(Compositor::Wlroots));
         assert!(!names_ours_conclusively(Compositor::Mutter));
         assert!(!names_ours_conclusively(Compositor::Gamescope));

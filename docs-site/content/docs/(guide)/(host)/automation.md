@@ -196,7 +196,7 @@ esac
 
 ### A launch on its own workspace
 
-On Hyprland and sway, a library launch opens on an empty workspace of the streamed screen instead
+On Hyprland, sway and niri, a library launch opens on an empty workspace of the streamed screen instead
 of on top of your desk, and the host switches back when the game ends. A reconnect returns to that
 game's workspace. KWin, GNOME, gamescope and Windows open it where the screen already is.
 

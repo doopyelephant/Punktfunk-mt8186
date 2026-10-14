@@ -311,8 +311,10 @@ pub fn default_backend() -> Backend {
         }
         if c.eq_ignore_ascii_case("wlroots")
             || c.eq_ignore_ascii_case("sway")
-            // Hyprland kept the wlr virtual-input protocols; same backend as sway/river.
+            // Hyprland and niri serve the wlr virtual-input protocols; same backend as sway/river.
             || c.eq_ignore_ascii_case("hyprland")
+            || c.eq_ignore_ascii_case("niri")
+            || c.eq_ignore_ascii_case("biri")
         {
             return Backend::WlrVirtual;
         }
@@ -322,6 +324,9 @@ pub fn default_backend() -> Backend {
     let d = desktop.to_ascii_uppercase();
     if d.contains("KDE") {
         Backend::KwinFakeInput
+    } else if d.contains("NIRI") {
+        // Before GNOME: niri may advertise `niri:GNOME`, and serves no libei.
+        Backend::WlrVirtual
     } else if d.contains("GNOME") {
         Backend::Libei
     } else {

@@ -61,6 +61,9 @@ pub fn list_toplevels(compositor: Compositor, output: &str) -> Vec<Toplevel> {
         Compositor::Wlroots if wlroots::is_managed_output(output) => {
             wlroots::toplevels(Some(output))
         }
+        Compositor::Niri if hyprland::is_managed_output(output) => {
+            niri::desktop::toplevels(Some(output))
+        }
         // No `_` arm: a new backend must decide here. KWin and GNOME list
         // windows but name no head; gamescope nests one app; Windows has no
         // compositor to ask.
@@ -69,6 +72,7 @@ pub fn list_toplevels(compositor: Compositor, output: &str) -> Vec<Toplevel> {
         | Compositor::Kwin
         | Compositor::Mutter
         | Compositor::Gamescope
+        | Compositor::Niri
         | Compositor::Windows => {
             tracing::info!(
                 compositor = compositor.id(), output = %output,
@@ -94,6 +98,7 @@ pub fn list_all_toplevels(compositor: Compositor) -> Option<Vec<Toplevel>> {
         Compositor::Wlroots => Some(wlroots::toplevels(None)),
         Compositor::Kwin => kwin_windows::toplevels(),
         Compositor::Mutter => gnome_windows::toplevels(),
+        Compositor::Niri => Some(niri::desktop::toplevels(None)),
         Compositor::Gamescope | Compositor::Windows => None,
     }
 }
@@ -102,7 +107,7 @@ pub fn list_all_toplevels(compositor: Compositor) -> Option<Vec<Toplevel>> {
 /// ([`move_toplevel_to_output`], [`window_action`])?
 pub fn places_windows(compositor: Compositor) -> bool {
     match compositor {
-        Compositor::Hyprland | Compositor::Wlroots => true,
+        Compositor::Hyprland | Compositor::Wlroots | Compositor::Niri => true,
         // No `_` arm; same backends as [`window_action`].
         Compositor::Kwin | Compositor::Mutter | Compositor::Gamescope | Compositor::Windows => {
             false
@@ -122,6 +127,7 @@ pub fn move_toplevel_to_output(
     match compositor {
         Compositor::Hyprland => hyprland::move_to_output(id, output),
         Compositor::Wlroots => wlroots::move_to_output(id, output),
+        Compositor::Niri => niri::desktop::move_to_output(id, output),
         // No `_` arm. KWin/Mutter/gamescope/Windows never list, so nothing
         // here has an id to move.
         Compositor::Kwin | Compositor::Mutter | Compositor::Gamescope | Compositor::Windows => {
@@ -152,6 +158,7 @@ pub fn window_action(
     match compositor {
         Compositor::Hyprland => hyprland::window_action(verb, id),
         Compositor::Wlroots => wlroots::window_action(verb, id),
+        Compositor::Niri => niri::desktop::window_action(verb, id),
         // No `_` arm. Unreachable while the backends above are the only ones
         // that list, and a compile error the day another one does.
         Compositor::Kwin | Compositor::Mutter | Compositor::Gamescope | Compositor::Windows => {
@@ -165,6 +172,7 @@ pub fn window_action(
 pub fn toplevels_token(compositor: Compositor) -> Option<u64> {
     match compositor {
         Compositor::Hyprland => hyprland::window_gen(),
+        Compositor::Niri => niri::desktop::window_gen(),
         // No `_` arm. sway has an IPC subscribe, but the host runs no reader on
         // it; the rest have no list to watch.
         Compositor::Wlroots

@@ -120,6 +120,8 @@ pub fn list(compositor: Compositor) -> Result<Vec<PhysicalMonitor>> {
         Compositor::Wlroots => crate::wlroots::list_monitors(),
         #[cfg(target_os = "linux")]
         Compositor::Hyprland => crate::hyprland::list_monitors(),
+        #[cfg(target_os = "linux")]
+        Compositor::Niri => crate::niri::list_monitors(),
         // Game Mode gamescope is DRM master and has a real connector; nested
         // ones this crate spawns are headless. Empty list, not an error, for those.
         #[cfg(target_os = "linux")]

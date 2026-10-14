@@ -7,7 +7,7 @@
 //! EIS socket).
 //!
 //! Each arm self-gates: KDE in-process `org_kde_kwin_dpms` then `kscreen-doctor`; sway /
-//! Hyprland via native IPC; DRM CRTCs when no compositor holds master. GNOME cannot be
+//! Hyprland / niri via native IPC; DRM CRTCs when no compositor holds master. GNOME cannot be
 //! served (Mutter exposes no client DPMS and holds DRM master); [`darken`] logs that at
 //! `warn!`.
 //!
@@ -375,6 +375,8 @@ enum Darkened {
     Sway(Vec<String>),
     /// Hyprland: `hyprctl dispatch dpms off <name>`. Same per-name discipline as [`Darkened::Sway`].
     Hyprland(Vec<String>),
+    /// niri: `PowerOffMonitors`, which has no per-output form. Re-light is `PowerOnMonitors`.
+    Niri,
     /// [`crate::drm_dpms`] hold: open `/dev/dri/cardN` fds. Re-light is `drop`;
     /// the kernel restores the console on last close. Nothing to replay.
     Drm(crate::drm_dpms::DrmDarken),
@@ -443,9 +445,9 @@ pub fn release_stream_darken() {
 }
 
 /// Non-KDE desktops, preference order. Each self-gates on its IPC
-/// (`SWAYSOCK` / `HYPRLAND_INSTANCE_SIGNATURE`). Heads are addressed by
-/// name so re-light never wakes a sibling session's output. GNOME is
-/// absent on purpose — see the module docs.
+/// (`SWAYSOCK` / `HYPRLAND_INSTANCE_SIGNATURE` / niri's socket). Heads are
+/// addressed by name so re-light never wakes a sibling session's output; niri
+/// has no per-output DPMS. GNOME is absent on purpose — see the module docs.
 fn non_kde_desktop_darken() -> Option<Darkened> {
     let sway = crate::wlroots::dpms_other_heads(false);
     if !sway.is_empty() {
@@ -462,6 +464,10 @@ fn non_kde_desktop_darken() -> Option<Darkened> {
             "hyprland: desktop monitors off for the exclusive gamescope stream"
         );
         return Some(Darkened::Hyprland(hypr));
+    }
+    if crate::niri::is_available() && crate::niri::desktop::power_off_others() {
+        tracing::info!("niri: desktop monitors off for the exclusive gamescope stream");
+        return Some(Darkened::Niri);
     }
     None
 }
@@ -603,6 +609,14 @@ fn relight(d: Darkened) {
                 tracing::info!(outputs = ?back, "hyprland: desktop monitors back on");
             }
         }
+        Darkened::Niri => match crate::niri::desktop::power_on_all() {
+            Ok(()) => tracing::info!("niri: desktop monitors back on"),
+            Err(e) => tracing::error!(
+                error = %format!("{e:#}"),
+                "niri: the desktop monitors did not re-light — they stay dark until local input \
+                 or `niri msg action power-on-monitors`"
+            ),
+        },
         // Hold is the open fds: `drop` closes them and the kernel restores the
         // console. No ioctl to refuse — no "did not re-light" line of its own.
         Darkened::Drm(d) => {

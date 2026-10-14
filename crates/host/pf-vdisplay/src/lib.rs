@@ -116,6 +116,9 @@ pub enum Compositor {
     /// [`Wlroots`]: it kept the wlr client protocols after dropping wlroots, so
     /// virtual-input is shared but IPC and portal are not. `design/hyprland-support.md`.
     Hyprland,
+    /// niri — `CreateVirtualOutput` over its JSON IPC socket. Only a niri that serves that
+    /// request can host (the biri fork today); `design/niri-support.md`.
+    Niri,
     /// The pf-vdisplay IddCx driver — a Windows host's only backend. Never in [`Compositor::all`].
     Windows,
 }
@@ -137,19 +140,22 @@ impl Compositor {
     pub fn honours_keep_monitors(self) -> bool {
         matches!(
             self,
-            Compositor::Kwin | Compositor::Hyprland | Compositor::Wlroots
+            Compositor::Kwin | Compositor::Hyprland | Compositor::Wlroots | Compositor::Niri
         )
     }
 
     /// Puts a launch on a workspace of its own (`claim_workspace`).
     pub fn places_launch_workspace(self) -> bool {
-        matches!(self, Compositor::Hyprland | Compositor::Wlroots)
+        matches!(
+            self,
+            Compositor::Hyprland | Compositor::Wlroots | Compositor::Niri
+        )
     }
 
-    /// Starts a device's screen at its own scale. Mutter only: KWin and Windows remember each
-    /// device's scale themselves.
+    /// Starts a device's screen at its own scale. Mutter and niri: KWin and Windows remember
+    /// each device's scale themselves.
     pub fn applies_device_scale(self) -> bool {
-        matches!(self, Compositor::Mutter)
+        matches!(self, Compositor::Mutter | Compositor::Niri)
     }
 
     pub fn label(self) -> &'static str {
@@ -159,6 +165,7 @@ impl Compositor {
             Compositor::Mutter => "Mutter / GNOME",
             Compositor::Gamescope => "gamescope",
             Compositor::Hyprland => "Hyprland",
+            Compositor::Niri => "niri",
             Compositor::Windows => "Windows virtual display",
         }
     }
@@ -171,6 +178,7 @@ impl Compositor {
             Compositor::Mutter => P::Mutter,
             Compositor::Gamescope => P::Gamescope,
             Compositor::Hyprland => P::Hyprland,
+            Compositor::Niri => P::Niri,
             Compositor::Windows => P::Windows,
         }
     }
@@ -186,18 +194,20 @@ impl Compositor {
             P::Mutter => Compositor::Mutter,
             P::Gamescope => Compositor::Gamescope,
             P::Hyprland => Compositor::Hyprland,
+            P::Niri => Compositor::Niri,
             P::Windows => Compositor::Windows,
         })
     }
 
     /// Every Linux backend, in stable UI/enumeration order.
-    pub fn all() -> [Compositor; 5] {
+    pub fn all() -> [Compositor; 6] {
         [
             Compositor::Kwin,
             Compositor::Gamescope,
             Compositor::Mutter,
             Compositor::Wlroots,
             Compositor::Hyprland,
+            Compositor::Niri,
         ]
     }
 }
@@ -234,6 +244,7 @@ pub fn available() -> Vec<Compositor> {
                         Compositor::Mutter => mutter::is_available(),
                         Compositor::Wlroots => wlroots::is_available(),
                         Compositor::Hyprland => hyprland::is_available(),
+                        Compositor::Niri => niri::is_available(),
                         Compositor::Windows => false,
                     }
             })
@@ -252,6 +263,8 @@ fn compositor_from_pin(v: &str) -> Option<Compositor> {
         "kwin" | "kde" | "plasma" => Compositor::Kwin,
         // `hyprland` is its own backend; `wlroots`/`sway`/`wlr` stay wlroots-proper.
         "hyprland" | "hypr" => Compositor::Hyprland,
+        // biri is the niri fork with virtual outputs; one backend serves both.
+        "niri" | "biri" => Compositor::Niri,
         "wlroots" | "sway" | "wlr" | "river" => Compositor::Wlroots,
         "mutter" | "gnome" => Compositor::Mutter,
         "gamescope" => Compositor::Gamescope,
@@ -309,7 +322,7 @@ pub fn detect() -> Result<Compositor> {
 /// There is no working desktop value; name the gamescope route instead.
 #[cfg(target_os = "linux")]
 fn unknown_pin_error(v: &str) -> anyhow::Error {
-    const ACCEPTED: &str = "kwin|wlroots|hyprland|mutter|gamescope";
+    const ACCEPTED: &str = "kwin|wlroots|hyprland|mutter|gamescope|niri";
     if matches!(
         v.trim().to_ascii_lowercase().as_str(),
         "cinnamon" | "muffin"
@@ -339,6 +352,9 @@ fn compositor_from_xdg(desktop: &str) -> Result<Compositor> {
              host.env for a headless gamescope per connect. See \
              https://docs.punktfunk.unom.io/docs/debian#cinnamon-linux-mint-and-lmde"
         )
+    } else if desktop.contains("NIRI") {
+        // Before GNOME: a niri session may advertise `niri:GNOME`.
+        Ok(Compositor::Niri)
     } else if desktop.contains("KDE") {
         Ok(Compositor::Kwin)
     } else if desktop.contains("GNOME") {
@@ -476,6 +492,7 @@ fn backend(compositor: Compositor) -> Result<Box<dyn VirtualDisplay>> {
         Compositor::Mutter => Ok(Box::new(mutter::MutterDisplay::new()?)),
         Compositor::Wlroots => Ok(Box::new(wlroots::WlrootsDisplay::new()?)),
         Compositor::Hyprland => Ok(Box::new(hyprland::HyprlandDisplay::new()?)),
+        Compositor::Niri => Ok(Box::new(niri::NiriDisplay::new()?)),
         Compositor::Windows => {
             anyhow::bail!("the Windows virtual display needs a Windows host")
         }
@@ -521,6 +538,8 @@ pub fn probe(compositor: Compositor) -> Result<()> {
             Compositor::Kwin => kwin::probe(),
             // `hyprctl` must reach the compositor, plus the permission-system warning.
             Compositor::Hyprland => hyprland::probe(),
+            // The IPC socket must answer, and the answer says whether this niri has virtual outputs.
+            Compositor::Niri => niri::probe(),
             // Spawn / D-Bus / output-on-demand: nothing to pre-check beyond "Linux".
             Compositor::Gamescope | Compositor::Mutter | Compositor::Wlroots => Ok(()),
             Compositor::Windows => {
@@ -886,6 +905,12 @@ mod portal_cast;
 #[path = "vdisplay/linux/hyprland.rs"]
 mod hyprland;
 
+#[cfg(target_os = "linux")]
+#[path = "vdisplay/linux/niri/mod.rs"]
+mod niri;
+#[cfg(target_os = "linux")]
+pub use niri::NoVirtualOutputs;
+
 /// Bounded dispatch loop shared by the in-process Wayland protocol clients.
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/wl_pump.rs"]
@@ -985,6 +1010,8 @@ mod tests {
         );
         assert_eq!(compositor_from_xdg("SWAY").unwrap(), Compositor::Wlroots);
         assert_eq!(compositor_from_xdg("SCROLL").unwrap(), Compositor::Wlroots);
+        assert_eq!(compositor_from_xdg("NIRI").unwrap(), Compositor::Niri);
+        assert_eq!(compositor_from_xdg("NIRI:GNOME").unwrap(), Compositor::Niri);
     }
 
     /// Muffin has no virtual-output API: there is no `PUNKTFUNK_COMPOSITOR`
@@ -1017,7 +1044,7 @@ mod tests {
         }
         let typo = unknown_pin_error("kwim").to_string();
         assert!(
-            typo.contains("kwin|wlroots|hyprland|mutter|gamescope"),
+            typo.contains("kwin|wlroots|hyprland|mutter|gamescope|niri"),
             "{typo}"
         );
         assert!(!typo.contains("Muffin"), "{typo}");
@@ -1054,8 +1081,21 @@ mod tests {
             compositor_for_kind(ActiveKind::DesktopHyprland),
             Some(Compositor::Hyprland)
         );
+        assert_eq!(
+            compositor_for_kind(ActiveKind::DesktopNiri),
+            Some(Compositor::Niri)
+        );
         // No live session → no backend; the caller maps this to handshake error / fallback.
         assert_eq!(compositor_for_kind(ActiveKind::None), None);
+    }
+
+    /// The console greys out a setting no backend here can honour; niri honours these three.
+    #[test]
+    fn niri_claims_the_desktop_integration_it_implements() {
+        let niri = Compositor::Niri;
+        assert!(niri.honours_keep_monitors());
+        assert!(niri.places_launch_workspace());
+        assert!(niri.applies_device_scale());
     }
 
     /// Spawn-vs-attach for [`gamescope_hdr_available`] /

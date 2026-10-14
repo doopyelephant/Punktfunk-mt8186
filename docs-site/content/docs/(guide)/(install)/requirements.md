@@ -48,6 +48,7 @@ starts per client. On a box that boots to no session, set `PUNKTFUNK_COMPOSITOR=
 | [GNOME](/docs/gnome) | GNOME 48 |
 | [Sway](/docs/sway), scroll | sway 1.8 |
 | [Hyprland](/docs/hyprland) | Any version, with `xdg-desktop-portal-hyprland` installed |
+| [niri](/docs/niri) | The [biri](/docs/niri#get-biri) fork, built 2026-09-04 or later; stock niri can't host |
 | [Omarchy](/docs/omarchy) | Omarchy 4.0 |
 | [gamescope](/docs/gamescope) | 3.16.22; 3.16.23 for the Steam overlay; HDR needs `punktfunk-gamescope` |
 | Cinnamon | Can't host ([above](#cinnamon-linux-mint-and-lmde)) |

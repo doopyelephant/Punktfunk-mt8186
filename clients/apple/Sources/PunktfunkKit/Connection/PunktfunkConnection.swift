@@ -334,6 +334,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         case hyprland = 5
         /// A Windows host's only backend. The host reports it; a client never requests it.
         case windows = 6
+        case niri = 7
 
         /// Loose name parsing for env/dev hooks: the same names as the host's
         /// `CompositorPref::from_name`.
@@ -346,6 +347,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
             case "gamescope": self = .gamescope
             case "hyprland": self = .hyprland
             case "windows": self = .windows
+            case "niri", "biri": self = .niri
             default: return nil
             }
         }
@@ -360,6 +362,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
             case .gamescope: return "gamescope"
             case .hyprland: return "hyprland"
             case .windows: return "windows"
+            case .niri: return "niri"
             }
         }
     }

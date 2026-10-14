@@ -29,6 +29,7 @@ pub(crate) fn register_all(reg: &Diagnostics) {
     reg.register(uinput_access);
     reg.register(server_conflict);
     reg.register(hyprland_permissions);
+    reg.register(niri_virtual_outputs);
     reg.register(omarchy_updates);
     reg.register(vdisplay_driver);
     reg.register(pad_audio);
@@ -605,6 +606,79 @@ fn hyprland_permissions() -> HostCheck {
     })
 }
 
+/// Where to get biri, the niri fork that creates virtual outputs.
+const BIRI_DOCS: &str = "https://docs.punktfunk.unom.io/docs/niri#get-biri";
+
+/// Only a niri that creates virtual outputs (biri) can give each stream its own display.
+fn niri_virtual_outputs() -> HostCheck {
+    use crate::vdisplay::Compositor;
+    if !matches!(crate::vdisplay::detect(), Ok(Compositor::Niri)) {
+        return HostCheck::inapplicable(
+            ids::NIRI_VIRTUAL_OUTPUTS,
+            "This machine is not running a niri session, so niri's virtual outputs do not apply.",
+        );
+    }
+    niri_verdict(
+        crate::vdisplay::probe(Compositor::Niri),
+        crate::vdisplay::capture_monitor().is_some(),
+    )
+}
+
+/// `probe` is the niri capability probe's answer. A pinned monitor still streams on stock niri,
+/// so the pin softens the verdict from a failure to a warning.
+fn niri_verdict(probe: anyhow::Result<()>, monitor_pinned: bool) -> HostCheck {
+    let id = ids::NIRI_VIRTUAL_OUTPUTS;
+    let Err(e) = probe else {
+        return HostCheck::ok(id, "niri can create a virtual display for each stream.");
+    };
+    #[cfg(target_os = "linux")]
+    let stock = e
+        .downcast_ref::<crate::vdisplay::NoVirtualOutputs>()
+        .is_some();
+    #[cfg(not(target_os = "linux"))]
+    let stock = false;
+    if !stock {
+        return HostCheck::problem(
+            id,
+            CheckStatus::Warn,
+            Severity::Warning,
+            "niri didn't answer the virtual display check",
+            format!("Until niri answers, a stream may get no display of its own. ({e:#})"),
+        )
+        .with_param("error", format!("{e:#}"));
+    }
+    let (status, severity, impact) = if monitor_pinned {
+        (
+            CheckStatus::Warn,
+            Severity::Warning,
+            "The monitor pinned in the console still streams. Without the pin, every connect \
+             fails: this niri can't create a display for the stream.",
+        )
+    } else {
+        (
+            CheckStatus::Fail,
+            Severity::Critical,
+            "Every connect fails: this niri can't create a display for the stream. Pinning a \
+             physical monitor in the console streams that monitor instead.",
+        )
+    };
+    HostCheck::problem(
+        id,
+        status,
+        severity,
+        "This niri can't create virtual displays",
+        impact,
+    )
+    .with_remedy(Remedy {
+        text: format!(
+            "Install biri, the niri fork that adds virtual outputs: the AUR package `biri-git` \
+             replaces `niri` on Arch. Log in again, then restart the host. See {BIRI_DOCS}"
+        ),
+        command: None,
+        relogin_required: true,
+    })
+}
+
 /// Omarchy has no console apply button; updates are `omarchy update`. This row exists so the
 /// diagnostics page says so instead of looking like the button is missing.
 fn omarchy_updates() -> HostCheck {
@@ -1038,6 +1112,34 @@ mod tests {
             .map(|l| l.trim_end_matches(',').trim_matches('"'))
             .collect();
         assert_eq!(runner, SANDBOX_BASE_ARGV);
+    }
+
+    /// Stock niri fails loudly, unless a pinned monitor keeps the host streaming. Either way the
+    /// remedy names the package and the page.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stock_niri_fails_unless_a_monitor_is_pinned() {
+        for (pinned, status, severity) in [
+            (false, CheckStatus::Fail, Severity::Critical),
+            (true, CheckStatus::Warn, Severity::Warning),
+        ] {
+            let stock = anyhow::Error::new(crate::vdisplay::NoVirtualOutputs);
+            let check = niri_verdict(Err(stock), pinned);
+            assert_eq!((check.status, check.severity), (status, severity));
+            let remedy = check.remedy.expect("a stock niri row carries a remedy");
+            assert!(remedy.text.contains("biri-git") && remedy.text.contains(BIRI_DOCS));
+            assert!(!check.impact.is_empty());
+        }
+    }
+
+    #[test]
+    fn niri_that_answers_is_ok_and_one_that_does_not_only_warns() {
+        let ok = niri_verdict(Ok(()), false);
+        assert_eq!(ok.status, CheckStatus::Ok);
+
+        let silent = niri_verdict(Err(anyhow::anyhow!("no socket")), false);
+        assert_eq!(silent.status, CheckStatus::Warn);
+        assert!(!silent.impact.is_empty());
     }
 
     /// This machine may not reach every arm; a `NotWritable` row is still Fail+Warning and

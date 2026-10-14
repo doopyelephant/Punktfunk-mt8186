@@ -73,6 +73,7 @@ const COMPOSITORS: &[(&str, &str)] = &[
     ("kwin", "KWin"),
     ("mutter", "Mutter (GNOME)"),
     ("hyprland", "Hyprland"),
+    ("niri", "niri"),
     ("wlroots", "wlroots (Sway/River)"),
     ("gamescope", "gamescope"),
 ];

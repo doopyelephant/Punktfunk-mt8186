@@ -327,7 +327,7 @@ pub(crate) fn compositor_embeds_pointer(compositor: pf_vdisplay::Compositor) -> 
     use pf_vdisplay::Compositor;
     matches!(
         compositor,
-        Compositor::Kwin | Compositor::Wlroots | Compositor::Hyprland
+        Compositor::Kwin | Compositor::Wlroots | Compositor::Hyprland | Compositor::Niri
     )
 }
 
@@ -525,7 +525,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn embedding_compositor_skips_the_blend_without_a_channel() {
-        for c in [Compositor::Kwin, Compositor::Wlroots, Compositor::Hyprland] {
+        for c in [
+            Compositor::Kwin,
+            Compositor::Wlroots,
+            Compositor::Hyprland,
+            Compositor::Niri,
+        ] {
             assert!(compositor_embeds_pointer(c));
             assert!(!cursor_blend_for(false, c, Codec::Av1, 8, false, None));
             assert!(!cursor_blend_for(false, c, Codec::H265, 10, false, None));

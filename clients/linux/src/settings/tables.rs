@@ -202,7 +202,15 @@ pub const SYSTEM_BUTTON_LABELS: &[&str] = &["Automatic", "Send to host", "This d
 /// only where the raw guide press can't reach the host (Gaming Mode here).
 pub const GUIDE_GESTURES: &[&str] = &["auto", "on", "off"];
 pub const GUIDE_GESTURE_LABELS: &[&str] = &["Automatic", "On", "Off"];
-pub const COMPOSITORS: &[&str] = &["auto", "kwin", "mutter", "hyprland", "wlroots", "gamescope"];
+pub const COMPOSITORS: &[&str] = &[
+    "auto",
+    "kwin",
+    "mutter",
+    "hyprland",
+    "niri",
+    "wlroots",
+    "gamescope",
+];
 /// Codec setting values (persisted) paired with their display labels below. PyroWave is
 /// preference-only by design (`Settings::preferred_codec`) — the ladder falls back to
 /// HEVC when either side can't do it.

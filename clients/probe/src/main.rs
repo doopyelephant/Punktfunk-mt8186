@@ -79,7 +79,7 @@ struct Args {
     pair: Option<String>,
     /// `--name LABEL` — how the host labels this client when pairing.
     name: String,
-    /// `--compositor NAME` — request a host compositor backend (auto|kwin|wlroots|mutter|gamescope|hyprland).
+    /// `--compositor NAME` — request a host compositor backend (auto|kwin|wlroots|mutter|gamescope|hyprland|niri).
     compositor: CompositorPref,
     /// `--gamepad NAME` — request a host virtual-pad backend (auto|xbox360|dualsense).
     gamepad: GamepadPref,
@@ -256,7 +256,7 @@ fn parse_argv(argv: Vec<String>) -> Args {
         Some(s) => match CompositorPref::from_name(s) {
             Some(c) => c,
             None => {
-                eprintln!("--compositor takes auto, kwin, mutter, hyprland, wlroots or gamescope");
+                eprintln!("--compositor: auto, kwin, mutter, hyprland, niri, wlroots or gamescope");
                 std::process::exit(2);
             }
         },

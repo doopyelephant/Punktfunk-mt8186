@@ -77,7 +77,10 @@ async fn compositors_lists_all_backends_with_flags() {
     #[cfg(target_os = "linux")]
     {
         let ids: Vec<&str> = arr.iter().map(|c| c["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["kwin", "gamescope", "mutter", "wlroots", "hyprland"]);
+        assert_eq!(
+            ids,
+            ["kwin", "gamescope", "mutter", "wlroots", "hyprland", "niri"]
+        );
     }
     for c in arr {
         assert!(c["available"].is_boolean());

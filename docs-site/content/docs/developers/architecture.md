@@ -9,11 +9,11 @@ must keep. The user-level version is [How it works](/docs/how-it-works).
 ## A frame, host to glass
 
 1. **Mode.** The client's Hello names `WxH@Hz`. The `pf-vdisplay` crate creates a virtual output at
-   that mode through the compositor's backend (KWin, Mutter, Hyprland, wlroots, gamescope) or, on
+   that mode through the compositor's backend (KWin, Mutter, Hyprland, niri, wlroots, gamescope) or, on
    Windows, through the IddCx driver of the same name.
 2. **Capture.** On Linux, `pf-capture` takes dmabufs straight from the compositor over
    `ext-image-copy-capture-v1` where it can, and otherwise over PipeWire (the ScreenCast portal, or
-   KWin's own screencast). `pf-zerocopy` imports them into CUDA or Vulkan without a CPU copy.
+   KWin's or niri's own screencast). `pf-zerocopy` imports them into CUDA or Vulkan without a CPU copy.
 3. **Encode.** On Linux, `pf-encode` opens one backend: NVENC, Vulkan Video, VAAPI, PyroWave or
    software openh264 (`PUNKTFUNK_ENCODER` pins one). On Windows the driver encodes inside
    WUDFHost with `pf-encode-win` (NVENC, AMF, QSV, Media Foundation, PyroWave) and hands access

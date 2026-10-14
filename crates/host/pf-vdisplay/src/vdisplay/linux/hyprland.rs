@@ -82,7 +82,8 @@ static OUTPUT_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// `PF-<pid>-<n>`. A bare `PF-<n>` restarts at `PF-1` and collides with a
 /// second host's output, or a dead one's the journal has not taken back yet.
-fn next_output_name() -> String {
+/// niri mints its outputs from the same counter.
+pub(crate) fn next_output_name() -> String {
     format!(
         "PF-{}-{}",
         std::process::id(),

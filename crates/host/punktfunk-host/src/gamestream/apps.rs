@@ -39,6 +39,7 @@ fn parse_compositor(s: &str) -> Option<crate::vdisplay::Compositor> {
         "mutter" | "gnome" => Some(Mutter),
         "gamescope" => Some(Gamescope),
         "hyprland" => Some(Hyprland),
+        "niri" | "biri" => Some(Niri),
         "wlroots" | "sway" | "river" => Some(Wlroots),
         _ => None,
     }

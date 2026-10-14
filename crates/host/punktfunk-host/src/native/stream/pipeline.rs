@@ -385,6 +385,8 @@ pub(super) fn is_permanent_build_error(chain: &str) -> bool {
         // A pinned monitor the host does not have. Retrying holds the client on a
         // black screen for the whole backoff before saying so.
         "no monitor named",
+        // Stock niri stays without virtual outputs until its owner installs biri.
+        "this niri has no virtual outputs",
     ];
     let lower = chain.to_ascii_lowercase();
     PERMANENT.iter().any(|p| lower.contains(p))
@@ -939,6 +941,17 @@ mod tests {
             "create virtual output: no monitor named \"HDMI-A-3\" — this host has: HDMI-A-1"
         ));
         assert!(!is_permanent_build_error("open NVENC: device busy"));
+    }
+
+    /// Stock niri does not grow virtual outputs between attempts. Reads the real error's chain.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stock_niri_is_permanent() {
+        let chain = format!(
+            "{:#}",
+            anyhow::Error::new(pf_vdisplay::NoVirtualOutputs).context("create virtual output")
+        );
+        assert!(is_permanent_build_error(&chain), "{chain}");
     }
 
     #[cfg(target_os = "windows")]
