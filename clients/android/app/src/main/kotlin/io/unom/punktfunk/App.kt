@@ -191,6 +191,10 @@ fun App(forceGamepadUi: Boolean = false) {
         }
         onDispose {}
     }
+    // Orientation has the same one owner, for the same reason. A hinge across the stream lets
+    // go, so a clamshell half-folded on a table stands upright and takes the tabletop split.
+    val hinge = rememberFoldHinge()
+    HoldLandscape("shell", if (session != null) hinge == null else gamepadUi)
 
     // A link may not preempt a live session. MainActivity.onCreate refuses one that arrives as a
     // second instance; this is the rare in-instance case (a caller that set FLAG_ACTIVITY_SINGLE_TOP,
@@ -255,7 +259,7 @@ fun App(forceGamepadUi: Boolean = false) {
         // Read once: `touchLibrary` is a `var`, so it does not smart-cast through the branch.
         val library = touchLibrary
         when {
-            active != null -> StreamScreen(active) { reason ->
+            active != null -> StreamScreen(active, hinge) { reason ->
                 // A game launched from a library exiting is a normal finish, and the player is
                 // almost certainly after the next title — so send them back to that library rather
                 // than all the way out to host selection. The console shell's own screen state does
