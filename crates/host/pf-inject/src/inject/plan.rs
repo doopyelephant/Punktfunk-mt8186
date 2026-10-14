@@ -487,4 +487,40 @@ mod tests {
         );
         assert!(plan.release().is_empty());
     }
+
+    /// GameStream control and native input each keep a `HeldInput` of their own and send its
+    /// ups through the injector when a session ends. Those ups are ordinary events here: fed the
+    /// same stream, they leave the plan holding nothing, whatever order they arrive in.
+    #[test]
+    fn the_ups_a_session_owes_drain_the_plan() {
+        let stream = [
+            down(VK_LSHIFT),
+            down(VK_SHIFT),
+            down(VK_A),
+            down(0x100 | VK_A),
+            ev(InputKind::MouseButtonDown, 1),
+            at(InputKind::TouchDown, 7, (0, 0), (100, 50)),
+        ];
+        let mut session = HeldInput::default();
+        for e in &stream {
+            session.note(e);
+        }
+        let owed = session.release();
+        assert!(session.is_empty());
+        for order in [owed.clone(), owed.into_iter().rev().collect()] {
+            let mut plan = Plan::default();
+            run(&mut plan, &stream);
+            let lifted = sorted(run(&mut plan, &order));
+            assert_eq!(
+                lifted,
+                sorted(vec![
+                    key(KEY_LEFTSHIFT, false),
+                    key(KEY_A, false),
+                    button(BTN_LEFT, false),
+                    Op::TouchUp { id: 7 },
+                ])
+            );
+            assert!(plan.release().is_empty(), "the plan holds nothing after");
+        }
+    }
 }
