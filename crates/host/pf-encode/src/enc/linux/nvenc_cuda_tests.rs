@@ -511,26 +511,13 @@ fn nvenc_cuda_reframe_crops_and_scales() {
         (W, H),
         "the session runs at the reframed size"
     );
-    let path = std::env::temp_dir().join("nvenc-reframe.h265");
-    std::fs::write(&path, &stream).expect("write the stream");
-    let Ok(out) = std::process::Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(&path)
-        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
-        .output()
-    else {
+    let Some(rgb) = decode_first_rgb(&stream, "nvenc-reframe.h265", W, H) else {
         println!("no ffmpeg — skipping the picture check");
         return;
     };
-    assert_eq!(
-        out.stdout.len(),
-        (W * H * 3) as usize,
-        "decoded size: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
     let at = |x: u32, y: u32| {
         let i = ((y * W + x) * 3) as usize;
-        [out.stdout[i], out.stdout[i + 1], out.stdout[i + 2]]
+        [rgb[i], rgb[i + 1], rgb[i + 2]]
     };
     let near = |got: [u8; 3], want: [u8; 3], what: &str| {
         assert!(
@@ -549,6 +536,105 @@ fn nvenc_cuda_reframe_crops_and_scales() {
         at(W * 3 / 4, H - 3),
         [235, 235, 235],
         "bottom edge has no green",
+    );
+}
+
+/// The first picture of an HEVC `stream` as `w`x`h` RGB24, through ffmpeg. `None` without ffmpeg.
+fn decode_first_rgb(stream: &[u8], name: &str, w: u32, h: u32) -> Option<Vec<u8>> {
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, stream).expect("write the stream");
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+        .output()
+        .ok()?;
+    assert_eq!(
+        out.stdout.len(),
+        (w * h * 3) as usize,
+        "decoded size: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(out.stdout)
+}
+
+/// Hardware: an uploaded CPU frame takes the cursor blend, as a CUDA buffer does. The decoded
+/// picture holds the white pointer on the grey frame, and `caps()` reports the blend.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver and ffmpeg — run on the RTX box (.21)"]
+fn nvenc_cuda_cpu_frame_blends_the_cursor() {
+    const W: u32 = 256;
+    const H: u32 = 144;
+    pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+    let mut enc = NvencCudaEncoder::open(
+        Codec::H265,
+        PixelFormat::Bgrx,
+        W,
+        H,
+        60,
+        8_000_000,
+        false,
+        8,
+        false,
+        ChromaFormat::Yuv420,
+        true,
+        4,
+    )
+    .expect("open NVENC CUDA session");
+    let cursor = pf_frame::CursorOverlay {
+        x: 64,
+        y: 40,
+        w: 32,
+        h: 32,
+        rgba: std::sync::Arc::new(vec![0xFF; 32 * 32 * 4]),
+        serial: 1,
+        hot_x: 0,
+        hot_y: 0,
+        visible: true,
+    };
+    let mut stream = Vec::new();
+    for i in 0..4u32 {
+        let frame = CapturedFrame {
+            provenance: Default::default(),
+            width: W,
+            height: H,
+            pts_ns: u64::from(i) * 16_666_667,
+            format: PixelFormat::Bgrx,
+            payload: FramePayload::Cpu([40u8, 40, 40, 255].repeat((W * H) as usize)),
+            cursor: Some(cursor.clone()),
+        };
+        enc.submit_indexed(&frame, i).expect("submit");
+        while let Some(au) = enc.poll().expect("poll") {
+            stream.extend_from_slice(&au.data);
+        }
+    }
+    enc.flush().expect("flush");
+    while let Some(au) = enc.poll().expect("poll") {
+        stream.extend_from_slice(&au.data);
+    }
+    assert!(
+        enc.caps().blends_cursor,
+        "the slot device came up, so the session blends"
+    );
+    let Some(rgb) = decode_first_rgb(&stream, "nvenc-cpu-cursor.h265", W, H) else {
+        println!("no ffmpeg — skipping the picture check");
+        return;
+    };
+    let red = |x: u32, y: u32| rgb[((y * W + x) * 3) as usize];
+    assert!(
+        red(80, 56) > 200,
+        "the pointer is in the picture: {}",
+        red(80, 56)
+    );
+    assert!(
+        red(200, 120) < 80,
+        "the frame around it is untouched: {}",
+        red(200, 120)
+    );
+    println!(
+        "nvenc_cuda CPU-frame cursor blend: pointer {}, frame {}",
+        red(80, 56),
+        red(200, 120)
     );
 }
 
