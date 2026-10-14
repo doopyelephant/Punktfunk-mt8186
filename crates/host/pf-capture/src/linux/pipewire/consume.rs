@@ -501,17 +501,18 @@ fn second_plane(
 enum Held {
     /// Published as a held dmabuf: the frame ends here.
     Published,
-    /// No hold was free while this pool can hold: dropped and counted in `held_drops`.
+    /// No hold was free while this pool can hold, so the census counts fewer buffers than the
+    /// pool has: dropped and counted in `held_drops`.
     Dropped,
     /// This pool can never hold: the caller's fallback takes the frame.
     NoHold,
 }
 
 /// Publish `dup` as a held dmabuf, so the producer cannot rewrite a buffer the encoder still
-/// reads. A shortage is not a broken frame: every hold is with the encoder and the next
-/// arrival takes the one that comes back, so the frame drops. A CPU copy on this thread would
-/// starve the requeues that end the shortage, and a tiled rebuild asks KWin for a new output
-/// each time. Only a pool that can never hold falls through, or nothing would stream.
+/// reads. The hold cap is the pool census, so a shortage means the census is wrong, not that
+/// every hold is with the encoder: the frame drops, the guard for that count. A CPU copy here
+/// would starve the requeues, and a tiled rebuild asks KWin for a new output each time. Only a
+/// pool that can never hold falls through, or nothing would stream.
 fn publish_held(
     ud: &mut UserData,
     a: &mut Arrival,

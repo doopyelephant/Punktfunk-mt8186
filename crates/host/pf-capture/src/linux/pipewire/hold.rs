@@ -9,9 +9,10 @@ use std::sync::atomic::Ordering;
 impl UserData {
     /// Withhold this buffer from the producer until the returned hold drops.
     /// `None` requeues at `.process` return — the producer may then rewrite the dmabuf while
-    /// encode still reads it, so no lane publishes a raw frame under `None`: a transient
-    /// shortage drops the arrival, a pool that can never hold (`holds_possible` false) takes
-    /// the lane's own fallback.
+    /// encode still reads it, so no lane publishes a raw frame under `None`. The cap is the pool
+    /// census: a shortage means the census counts fewer buffers than the pool has, and drops
+    /// the arrival. A pool that can never hold (`holds_possible` false) takes the lane's own
+    /// fallback.
     /// No queued frame is given up for an arrival: the oldest render out is the next to
     /// finish, and a producer behind a full GPU queue would never see one through.
     /// A buffer the book already lists was re-sent by the producer: no hold, and the capture is
