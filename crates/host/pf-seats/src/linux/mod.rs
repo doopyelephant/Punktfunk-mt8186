@@ -22,6 +22,7 @@ pub mod fence;
 mod libraries;
 mod logind;
 mod migrate;
+mod safe_open;
 mod session;
 mod shared;
 pub mod socket;

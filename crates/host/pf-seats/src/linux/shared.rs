@@ -14,17 +14,17 @@
 
 use super::accounts::Passwd;
 use super::session::PRIVATE_DIRS;
-use super::{err, run};
+use super::{err, run, safe_open};
 use crate::backend::BackendError;
 use crate::model::SeatId;
-use rustix::fs::OFlags;
+use rustix::fs::{AtFlags, Mode, OFlags};
 use std::collections::HashSet;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 /// Box files a seat host reads; any may not exist yet. Never the box's identity: a seat host
 /// mints its own, and clients reach it through the pin the box's `Redirect` carries.
@@ -43,7 +43,7 @@ const RETIRED: [&str; 2] = ["native-cert.pem", "native-key.pem"];
 const AVATARS: &str = "profiles";
 
 /// A trust file larger than this is not ours.
-const MAX_TRUST_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const MAX_TRUST_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Steam top-level entries a seat does not inherit: the owner's account, library and logs.
 const CLONE_SKIP: &[&str] = &["config", "userdata", "appcache", "steamapps", "logs"];
@@ -236,40 +236,23 @@ pub(super) fn remove_seat_dirs(state: &Path, id: &SeatId) -> Result<(), BackendE
     Ok(())
 }
 
-/// Whether the copy at `dst` is stale: absent, or a different size or modification time. Copies
-/// keep the source's mtime, so an unchanged file compares equal.
-fn needs_copy(src: (SystemTime, u64), dst: Option<(SystemTime, u64)>) -> bool {
+/// Whether a copy is stale: absent, or a different size or modification time. Copies keep the
+/// source's mtime, so an unchanged file compares equal.
+fn needs_copy(src: Stamp, dst: Option<Stamp>) -> bool {
     dst != Some(src)
 }
 
-/// Opens `path` as a regular file with one link, never through a symlink. `None` when absent.
-pub(super) fn open_regular(
-    path: &Path,
-) -> std::io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(OFlags::NOFOLLOW.bits() as i32)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.nlink() > 1 || meta.len() > MAX_TRUST_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "{} is not a plain single-link file within the size cap",
-                path.display()
-            ),
-        ));
-    }
-    Ok(Some((file, meta)))
-}
+/// Modification time in seconds and nanoseconds, then size.
+type Stamp = (i64, i64, u64);
 
-fn stamp(meta: &std::fs::Metadata) -> std::io::Result<(SystemTime, u64)> {
-    Ok((meta.modified()?, meta.len()))
+// The field types differ by target: a cast that is a no-op on one is needed on another.
+#[allow(clippy::unnecessary_cast)]
+fn stamp(st: &rustix::fs::Stat) -> Stamp {
+    (
+        st.st_mtime as i64,
+        st.st_mtime_nsec as i64,
+        st.st_size as u64,
+    )
 }
 
 /// Who reads a trust copy. A seat user reads through the group, `root:gid 0640`. The owner's own
@@ -309,44 +292,57 @@ impl Reader {
     }
 }
 
-/// Copies `src` to `dst` for `reader` when it differs, and removes `dst` when `src` is gone.
-/// Returns whether `dst` changed.
-fn sync_file(src: &Path, dst: &Path, reader: Reader) -> std::io::Result<bool> {
-    let Some((mut file, meta)) = open_regular(src)? else {
-        return match std::fs::remove_file(dst) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e),
-        };
+/// Removes `name` from `dir`; `true` when there was one.
+fn unlink(dir: &OwnedFd, name: &str) -> std::io::Result<bool> {
+    match rustix::fs::unlinkat(dir, name, AtFlags::empty()) {
+        Ok(()) => Ok(true),
+        Err(e) if e == rustix::io::Errno::NOENT => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Copies `name` from the box's `src` into `dst` for `reader` when it differs, and removes it from
+/// `dst` when the box has none. Returns whether `dst` changed. Both are directory handles, so no
+/// link on either side is followed, whoever owns the directory.
+fn sync_file(
+    src: Option<&OwnedFd>,
+    dst: &OwnedFd,
+    name: &str,
+    reader: Reader,
+) -> std::io::Result<bool> {
+    let found = match src {
+        Some(src) => safe_open::read_at(src, name, MAX_TRUST_BYTES)?,
+        None => None,
     };
-    let wanted = stamp(&meta)?;
-    let current = std::fs::symlink_metadata(dst)
+    let Some((bytes, meta)) = found else {
+        return unlink(dst, name);
+    };
+    let wanted = (meta.mtime(), meta.mtime_nsec(), meta.size());
+    let current = rustix::fs::statat(dst, name, AtFlags::SYMLINK_NOFOLLOW)
         .ok()
-        .and_then(|m| stamp(&m).ok());
+        .map(|st| stamp(&st));
     if !needs_copy(wanted, current) {
         return Ok(false);
     }
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    file.read_to_end(&mut bytes)?;
-    let temp = dst.with_extension("tmp");
-    let _ = std::fs::remove_file(&temp);
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(reader.file_mode())
-        .open(&temp)?;
+    let temp = format!("{name}.tmp");
+    unlink(dst, &temp)?;
+    let create =
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mode = Mode::from_raw_mode(reader.file_mode() as _);
+    let mut out = std::fs::File::from(rustix::fs::openat(dst, temp.as_str(), create, mode)?);
     out.write_all(&bytes)?;
     out.set_permissions(std::fs::Permissions::from_mode(reader.file_mode()))?;
     std::os::unix::fs::fchown(&out, reader.uid, Some(reader.gid))?;
-    out.set_modified(wanted.0)?;
+    out.set_modified(meta.modified()?)?;
     drop(out);
-    std::fs::rename(temp, dst)?;
+    rustix::fs::renameat(dst, temp.as_str(), dst, name)?;
     Ok(true)
 }
 
 /// Brings the seat's trust copy level with the box's files in `box_dir`, without the box's
 /// identity: a game on the seat could otherwise answer as the box. Returns whether anything
-/// changed.
+/// changed. The door owns `box_dir` and the owner owns their own copy, so both are read and
+/// written through directory handles.
 pub(super) fn refresh_trust(
     box_dir: &Path,
     state: &Path,
@@ -358,56 +354,75 @@ pub(super) fn refresh_trust(
     make_dir(&dst, reader.dir_mode()).map_err(|e| io("create the trust copy", e))?;
     std::os::unix::fs::chown(&dst, reader.uid, Some(reader.gid))
         .map_err(|e| io("own the trust copy", e))?;
+    let dst = safe_open::dir(&dst).map_err(|e| io("open the trust copy", e))?;
+    let src = match safe_open::dir(box_dir) {
+        Ok(src) => Some(src),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(io("open the box directory", e)),
+    };
     let mut changed = false;
     for name in RETIRED {
-        match std::fs::remove_file(dst.join(name)) {
-            Ok(()) => changed = true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io(&format!("remove the old {name}"), e)),
-        }
+        changed |= unlink(&dst, name).map_err(|e| io(&format!("remove the old {name}"), e))?;
     }
     for name in TRUST_FILES {
-        changed |= sync_file(&box_dir.join(name), &dst.join(name), reader)
+        changed |= sync_file(src.as_ref(), &dst, name, reader)
             .map_err(|e| io(&format!("copy {name}"), e))?;
     }
-    changed |= sync_avatars(&box_dir.join(AVATARS), &dst.join(AVATARS), reader)
-        .map_err(|e| io("copy the avatars", e))?;
+    changed |= sync_avatars(src.as_ref(), &dst, reader).map_err(|e| io("copy the avatars", e))?;
     Ok(changed)
 }
 
-/// Mirrors the flat avatar directory: copies each file, drops copies whose source is gone.
-fn sync_avatars(src: &Path, dst: &Path, reader: Reader) -> std::io::Result<bool> {
+/// The names in `dir`, without `.` and `..`; a name that is not UTF-8 is left out.
+fn names(dir: &OwnedFd) -> std::io::Result<Vec<String>> {
+    let mut out = Vec::new();
+    for entry in rustix::fs::Dir::read_from(dir)? {
+        if let Ok(name) = entry?.file_name().to_str()
+            && !matches!(name, "." | "..")
+        {
+            out.push(name.to_owned());
+        }
+    }
+    Ok(out)
+}
+
+/// Mirrors the box's flat avatar directory into `dst`: copies each file, drops copies whose
+/// source is gone. A link where the directory should be is refused.
+fn sync_avatars(src: Option<&OwnedFd>, dst: &OwnedFd, reader: Reader) -> std::io::Result<bool> {
+    let src = match src {
+        Some(src) => safe_open::dir_at(src, AVATARS)?,
+        None => None,
+    };
+    if src.is_some() {
+        let mode = Mode::from_raw_mode(reader.dir_mode() as _);
+        match rustix::fs::mkdirat(dst, AVATARS, mode) {
+            Ok(()) => {}
+            Err(e) if e == rustix::io::Errno::EXIST => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let Some(copies) = safe_open::dir_at(dst, AVATARS)? else {
+        return Ok(false);
+    };
     let mut wanted = HashSet::new();
     let mut changed = false;
-    if src.is_dir() {
-        make_dir(dst, reader.dir_mode())?;
-        std::os::unix::fs::chown(dst, reader.uid, Some(reader.gid))?;
-        for entry in std::fs::read_dir(src)? {
-            let name = entry?.file_name();
-            let Some(text) = name.to_str().filter(|n| safe_name(n)) else {
-                continue;
-            };
+    if let Some(src) = &src {
+        rustix::fs::fchmod(&copies, Mode::from_raw_mode(reader.dir_mode() as _))?;
+        std::os::unix::fs::fchown(&copies, reader.uid, Some(reader.gid))?;
+        for name in names(src)?.into_iter().filter(|n| safe_name(n)) {
             // A link or oversized entry is skipped, not copied and not fatal.
-            if let Ok(did) = sync_file(&src.join(text), &dst.join(text), reader) {
+            if let Ok(did) = sync_file(Some(src), &copies, &name, reader) {
                 changed |= did;
-                wanted.insert(text.to_owned());
+                wanted.insert(name);
             }
         }
     }
-    if let Ok(entries) = std::fs::read_dir(dst) {
-        for entry in entries.flatten() {
-            let keep = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|n| wanted.contains(n));
-            if !keep {
-                let _ = std::fs::remove_file(entry.path());
-                changed = true;
-            }
+    for name in names(&copies)? {
+        if !wanted.contains(&name) {
+            changed |= unlink(&copies, &name)?;
         }
     }
-    if !src.is_dir() {
-        let _ = std::fs::remove_dir(dst);
+    if src.is_none() {
+        let _ = rustix::fs::unlinkat(dst, AVATARS, AtFlags::REMOVEDIR);
     }
     Ok(changed)
 }
@@ -562,14 +577,11 @@ mod tests {
 
     #[test]
     fn a_copy_is_made_only_for_a_missing_or_different_file() {
-        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
-        assert!(needs_copy((t, 5), None));
-        assert!(needs_copy((t, 5), Some((t, 6))));
-        assert!(needs_copy(
-            (t, 5),
-            Some((t + std::time::Duration::from_secs(1), 5))
-        ));
-        assert!(!needs_copy((t, 5), Some((t, 5))));
+        assert!(needs_copy((10, 0, 5), None));
+        assert!(needs_copy((10, 0, 5), Some((10, 0, 6))));
+        assert!(needs_copy((10, 0, 5), Some((11, 0, 5))));
+        assert!(needs_copy((10, 0, 5), Some((10, 1, 5))));
+        assert!(!needs_copy((10, 0, 5), Some((10, 0, 5))));
     }
 
     #[test]

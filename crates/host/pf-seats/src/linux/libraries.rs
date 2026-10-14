@@ -19,7 +19,7 @@
 
 use super::accounts::Passwd;
 use super::shared::{self, make_dir};
-use super::{err, run};
+use super::{err, run, safe_open};
 use crate::backend::BackendError;
 use crate::model::SeatId;
 use crate::steam;
@@ -225,10 +225,11 @@ fn spots(steamapps: &Path) -> Vec<Spot> {
 /// wrote none or the file is unreadable.
 fn writable(box_dir: &Path) -> bool {
     let read = || -> std::io::Result<Option<bool>> {
-        let Some((file, _)) = shared::open_regular(&box_dir.join(DEFAULTS))? else {
+        let path = box_dir.join(DEFAULTS);
+        let Some((bytes, _)) = safe_open::read(&path, shared::MAX_TRUST_BYTES)? else {
             return Ok(None);
         };
-        let defaults: serde_json::Value = serde_json::from_reader(file)?;
+        let defaults: serde_json::Value = serde_json::from_slice(&bytes)?;
         Ok(defaults["library_writable"].as_bool())
     };
     read()
@@ -275,12 +276,8 @@ pub(super) fn share(
         return None;
     };
     let list = steam_root.join("steamapps").join(LIST);
-    let vdf = match shared::open_regular(&list) {
-        Ok(Some((mut file, _))) => {
-            let mut text = String::new();
-            file.read_to_string(&mut text).ok()?;
-            text
-        }
+    let vdf = match safe_open::read(&list, MAX_LIST_BYTES) {
+        Ok(Some((bytes, _))) => String::from_utf8(bytes).ok()?,
         Ok(None) => return None,
         Err(error) => {
             tracing::warn!(%error, "owner's steam library list unreadable");
