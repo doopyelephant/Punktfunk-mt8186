@@ -3,7 +3,6 @@ package io.unom.punktfunk
 import android.app.GameManager
 import android.app.GameState
 import android.content.Context
-import android.content.pm.ActivityInfo
 import android.hardware.display.DisplayManager
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -92,8 +91,7 @@ internal fun Display.streamPanelFps(hz: Int, size: Pair<Int, Int>? = null): Int 
 /**
  * Everything a stream does to the activity's WINDOW, and how to put it back: the wake and Wi-Fi
  * locks, the Wi-Fi link log, the panel's refresh pin, HDMI ALLM, the Game Mode state, the
- * soft-keyboard and cutout modes, the landscape lock, unbuffered input dispatch and the
- * render-rate vote.
+ * soft-keyboard and cutout modes, unbuffered input dispatch and the render-rate vote.
  *
  * It is one object because it is one obligation — every field below is a prior value captured on the
  * way in, and [detach] is the only thing that ever restores one. Held in [StreamScreen]'s session
@@ -202,7 +200,6 @@ internal class StreamWindow(
 
     private var priorSoftInput = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_UNSPECIFIED
     private var priorCutout: Int? = null
-    private var priorOrientation: Int? = null
 
     /**
      * Hold the screen awake, or hand it back to the device's own timeout. [attach] holds it;
@@ -264,20 +261,6 @@ internal class StreamWindow(
                         WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
                 }
             }
-        }
-        // Lock to landscape while streaming — the host streams a landscape desktop, so pin the
-        // device there (either direction is fine) and stop it rotating to portrait mid-session. The
-        // activity declares configChanges=orientation, so this re-lays out the surface in place
-        // without recreating the activity (no stream restart). On TV it is a harmless no-op.
-        //
-        // COMPACT devices only (sw < 600 dp): on tablets/foldables/desktop windows the lock is a
-        // large-display anti-pattern (Play flags it; Android 16+ ignores it there outright), and the
-        // stream doesn't need it — the aspect-ratio letterbox renders correctly in any orientation,
-        // the lock is purely a phone-ergonomics choice.
-        val compactDevice = context.resources.configuration.smallestScreenWidthDp < 600
-        priorOrientation = activity?.requestedOrientation
-        if (compactDevice) {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         }
     }
 
@@ -347,8 +330,5 @@ internal class StreamWindow(
         }
         wifiLocks.forEach { runCatching { if (it.isHeld) it.release() } }
         mainHandler.removeCallbacks(pollWifiLink)
-        // Release the landscape lock so the rest of the app follows the device/system again.
-        activity?.requestedOrientation =
-            priorOrientation ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
     }
 }

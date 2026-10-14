@@ -42,6 +42,7 @@ public final class ExternalDisplay {
     func connect(_ scene: UIWindowScene) {
         self.scene = scene
         NotificationCenter.default.post(name: Self.didChange, object: nil)
+        LandscapeLock.refresh()
     }
 
     func disconnect(_ scene: UIWindowScene) {
@@ -49,6 +50,7 @@ public final class ExternalDisplay {
         window = nil
         self.scene = nil
         NotificationCenter.default.post(name: Self.didChange, object: nil)
+        LandscapeLock.refresh()
     }
 
     /// Fill the monitor with `view`, on top of any other. The window is never key: input stays

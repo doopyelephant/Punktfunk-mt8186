@@ -6,6 +6,7 @@ import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbManager
 import android.os.Build
@@ -215,6 +216,19 @@ class MainActivity : ComponentActivity() {
     var openRing: (() -> Unit)? = null
 
     private val isTv by lazy { isTvDevice(this) }
+
+    /** Who holds the window in landscape ([HoldLandscape]). With none, the device decides. */
+    private val landscapeHolders = mutableSetOf<String>()
+
+    fun holdLandscape(holder: String, hold: Boolean) {
+        if (hold) landscapeHolders += holder else landscapeHolders -= holder
+        val want = if (landscapeHolders.isEmpty()) {
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
+        if (requestedOrientation != want) requestedOrientation = want
+    }
 
     /**
      * TV remote-as-pointer for the active session (StreamScreen builds it on TV devices only):

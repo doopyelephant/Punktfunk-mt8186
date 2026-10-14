@@ -147,5 +147,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         }
         return config
     }
+
+    func application(
+        _ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?
+    ) -> UIInterfaceOrientationMask {
+        LandscapeLock.mask(for: window)
+    }
 }
 #endif

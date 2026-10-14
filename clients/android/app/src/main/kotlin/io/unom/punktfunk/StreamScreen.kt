@@ -61,6 +61,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -90,7 +91,12 @@ import kotlinx.coroutines.withContext
  * the connect that produced this handle.
  */
 @Composable
-fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> Unit) {
+fun StreamScreen(
+    session: ActiveSession,
+    /** The hinge across the window ([rememberFoldHinge]), or null. */
+    hinge: IntRect?,
+    onSessionEnded: (SessionEndReason) -> Unit,
+) {
     val handle = session.handle
     val initialSettings = session.settings
     val context = LocalContext.current
@@ -229,7 +235,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     // The Second screen setting (off: a phone on a TV) keeps the pair from forming at all; a
     // half-open fold then still takes the pad alone, as before the panel existed.
     val secondScreen = initialSettings.secondScreen
-    val fold = rememberFoldHinge()?.let { foldSplit(it, rootSize) }
+    val fold = hinge?.let { foldSplit(it, rootSize) }
     val hingeCompanion = secondScreen && fold?.carriesCompanion(rootSize.height) == true
     val companionDisplay = rememberCompanionDisplay().takeIf { secondScreen && !hingeCompanion }
     val companionUp = hingeCompanion || companionDisplay != null
@@ -288,7 +294,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
     SessionWatchEffect(handle, initialAccess, ui, peripherals, onSessionEnded)
 
     // Everything this stream does to the window — wake/Wi-Fi locks, the refresh pin, ALLM, the
-    // cutout and soft-keyboard modes, the landscape lock — and the prior values it puts back.
+    // cutout and soft-keyboard modes — and the prior values it puts back.
     val streamWindow = remember(handle) {
         StreamWindow(activity, context, composeView, lowLatencyMode, isTv, streamHz, streamSize)
     }

@@ -1,6 +1,5 @@
 package io.unom.punktfunk
 
-import android.content.pm.ActivityInfo
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -56,7 +55,6 @@ import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChangedIgnoreConsumed
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.semantics.contentDescription
@@ -684,23 +682,17 @@ internal fun PadLayoutEditor(pad: PadConfig, onChange: (PadConfig) -> Unit, onBa
         onDismissRequest = onBack,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
-        val activity = LocalContext.current as? MainActivity
         val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
         // The stage is the stream's canvas, not a settings pane: system bars hidden the way the
-        // stream hides them — on the editor's own window, so the activity's bars come back by
-        // themselves — and the stream's phone-only landscape lock (tablets stay free, which is
-        // also what keeps the upright layout editable where it can actually occur).
+        // stream hides them, on the editor's own window so the activity's bars come back by
+        // themselves. Phones hold landscape as the stream does; tablets keep the upright layout.
         DisposableEffect(Unit) {
             val bars = dialogWindow?.let { WindowCompat.getInsetsController(it, it.decorView) }
             bars?.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             bars?.hide(WindowInsetsCompat.Type.systemBars())
-            val prior = activity?.requestedOrientation
-            val compact = (activity?.resources?.configuration?.smallestScreenWidthDp ?: 600) < 600
-            if (compact) activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            onDispose {
-                activity?.requestedOrientation = prior ?: ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-            }
+            onDispose {}
         }
+        HoldLandscape("pad-editor", true)
         PadLayoutStage(pad, onChange, onBack)
     }
 }
