@@ -32,7 +32,7 @@ use wtransport::{Endpoint, Identity, ServerConfig};
 
 /// Default listen port. Distinct from the native plane's 9777: this one speaks HTTP/3, and a
 /// browser and a native client can be connected at the same time.
-pub const DEFAULT_PORT: u16 = 9778;
+pub const DEFAULT_PORT: u16 = pf_host_config::listen::BROWSER_PORT;
 
 /// Certificate lifetime. The spec's ceiling is two weeks and it is a hard refusal, so 13 days
 /// leaves a day of margin for a client whose clock runs fast.

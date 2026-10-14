@@ -11,6 +11,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 pub const NATIVE_PORT: u16 = 9777;
 /// The management API's port, beside the GameStream block (47984…48010).
 pub const MGMT_PORT: u16 = 47990;
+/// The browser plane's port: WebTransport over UDP, beside the native plane's.
+pub const BROWSER_PORT: u16 = 9778;
 
 const MGMT_BIND_ENV: &str = "PUNKTFUNK_MGMT_BIND";
 const NATIVE_PORT_ENV: &str = "PUNKTFUNK_NATIVE_PORT";
