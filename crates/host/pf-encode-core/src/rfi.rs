@@ -405,7 +405,7 @@ pub fn pinned_cycle() -> Option<u32> {
 }
 
 #[cfg(test)]
-mod plan_tests;
+pub(crate) mod plan_tests;
 
 #[cfg(test)]
 mod tests {

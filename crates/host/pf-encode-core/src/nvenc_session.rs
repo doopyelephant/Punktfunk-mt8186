@@ -1844,3 +1844,172 @@ mod ladder_tests {
         assert!(live.borrow().is_empty(), "the held session was destroyed");
     }
 }
+
+/// The session's own arbitration (`invalidate_ref_frames`, `encode`, the long-term step) on a
+/// driver that accepts every call, held to the NVENC table and model in `rfi::plan_tests`.
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::rfi::plan_tests::{check, nvenc, sweep, Au, Model, NVENC, NVENC_NO_WAVE};
+    use crate::rfi::FrameRef;
+    use crate::Acked;
+
+    macro_rules! accept {
+        ($($name:ident($($arg:ty),*);)*) => {$(
+            unsafe extern "C" fn $name($(_: $arg),*) -> nv::NVENCSTATUS {
+                nv::NVENCSTATUS::NV_ENC_SUCCESS
+            }
+        )*};
+    }
+    accept! {
+        open(*mut nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, *mut *mut c_void);
+        init(*mut c_void, *mut nv::NV_ENC_INITIALIZE_PARAMS);
+        reconfigure(*mut c_void, *mut nv::NV_ENC_RECONFIGURE_PARAMS);
+        destroy(*mut c_void);
+        caps(*mut c_void, nv::GUID, *mut nv::NV_ENC_CAPS_PARAM, *mut core::ffi::c_int);
+        guid_count(*mut c_void, *mut u32);
+        guids(*mut c_void, *mut nv::GUID, u32, *mut u32);
+        preset(
+            *mut c_void, nv::GUID, nv::GUID, nv::NV_ENC_TUNING_INFO, *mut nv::NV_ENC_PRESET_CONFIG
+        );
+        create_bitstream(*mut c_void, *mut nv::NV_ENC_CREATE_BITSTREAM_BUFFER);
+        release(*mut c_void, *mut c_void);
+        lock(*mut c_void, *mut nv::NV_ENC_LOCK_BITSTREAM);
+        register(*mut c_void, *mut nv::NV_ENC_REGISTER_RESOURCE);
+        map(*mut c_void, *mut nv::NV_ENC_MAP_INPUT_RESOURCE);
+        picture(*mut c_void, *mut nv::NV_ENC_PIC_PARAMS);
+        invalidate(*mut c_void, u64);
+    }
+    #[cfg(windows)]
+    accept! { event(*mut c_void, *mut nv::NV_ENC_EVENT_PARAMS); }
+    #[cfg(target_os = "linux")]
+    accept! { streams(*mut c_void, *mut c_void, *mut c_void); }
+
+    static API: EncodeApi = EncodeApi {
+        open_encode_session_ex: open,
+        initialize_encoder: init,
+        reconfigure_encoder: reconfigure,
+        destroy_encoder: destroy,
+        get_encode_caps: caps,
+        get_encode_guid_count: guid_count,
+        get_encode_guids: guids,
+        get_encode_preset_config_ex: preset,
+        create_bitstream_buffer: create_bitstream,
+        destroy_bitstream_buffer: release,
+        lock_bitstream: lock,
+        unlock_bitstream: release,
+        register_resource: register,
+        unregister_resource: release,
+        map_input_resource: map,
+        unmap_input_resource: release,
+        encode_picture: picture,
+        #[cfg(windows)]
+        register_async_event: event,
+        #[cfg(windows)]
+        unregister_async_event: event,
+        invalidate_ref_frames: invalidate,
+        #[cfg(target_os = "linux")]
+        set_io_cuda_streams: streams,
+    };
+
+    /// A session open on the stub driver. `height` in 32-px rows is the wave's cycle at 60 fps.
+    fn stub_session(codec: Codec, height: u32) -> NvSession {
+        let mut s = NvSession::new(&API, codec, 128, height, 60, 1_000_000, 1);
+        s.encoder = std::ptr::NonNull::dangling().as_ptr();
+        s.bitstreams = vec![std::ptr::null_mut(); POOL];
+        s.rfi_supported = true;
+        s.ltr_frames = 2;
+        s
+    }
+
+    /// Encode one frame and return what it was queued as.
+    fn encode(s: &mut NvSession) -> Result<&PendingEncode> {
+        let input = EncodeInput {
+            reg: std::ptr::null_mut(),
+            pitch: 0,
+            event: std::ptr::null_mut(),
+            pts_ns: 0,
+            hold: None,
+        };
+        // SAFETY: the session is open on the stub driver, which reads none of its arguments.
+        unsafe { s.encode(input) }?;
+        Ok(s.pending.back().expect("the frame is queued"))
+    }
+
+    /// The real session behind the table's events. The range plan and the client's
+    /// confirmations are the event, as in the model: `a` arms the anchor, `+` keeps a
+    /// confirmed picture resident.
+    struct Session {
+        s: NvSession,
+        floor: bool,
+    }
+
+    impl Model for Session {
+        fn event(&mut self, e: u8) -> Option<Au> {
+            let s = &mut self.s;
+            match e {
+                b'k' => s.force_kf = true,
+                b'+' | b'-' => self.floor = e == b'+',
+                // No session before the first frame: the caller keyframes.
+                b'a' | b'l' if s.frame_idx == 0 => {}
+                b'l' => {
+                    s.invalidate_ref_frames(0, 0);
+                }
+                b'a' if s.wave.is_some() => {
+                    s.invalidate_ref_frames(s.frame_idx - 1, s.frame_idx - 1);
+                }
+                b'a' => s.pending_anchor = true,
+                _ => return Some(self.frame()),
+            }
+            None
+        }
+    }
+
+    impl Session {
+        fn frame(&mut self) -> Au {
+            let s = &mut self.s;
+            let last = s.frame_idx - 1;
+            s.reference_floor = self.floor.then_some(Acked {
+                last,
+                mask: u16::MAX,
+            });
+            if self.floor {
+                s.ltr_slots = vec![Some(last), None];
+            }
+            let (forced, armed, before) = (s.force_kf, s.pending_anchor, s.wave);
+            let p = encode(s).expect("the stub driver accepts every picture");
+            let wave = before.filter(|_| !forced);
+            Au {
+                refs: match (p.idr_hint, p.anchor, armed) {
+                    (true, ..) => FrameRef::Idr,
+                    (_, true, true) => FrameRef::Anchor,
+                    (_, true, false) => FrameRef::Acked,
+                    _ => FrameRef::Chain,
+                },
+                wave,
+                mark: p.mark,
+                // There is no per-picture bit; a close is clean when it carries its mark.
+                dirty: wave.is_some_and(|w| !w.closes() || p.mark != WaveMark::Close),
+            }
+        }
+    }
+
+    /// Model and session at one cycle: the height in 32-px rows, or AV1 for no wave.
+    fn pair(cycle: Option<u32>) -> (impl Model, Session) {
+        let s = match cycle {
+            Some(rows) => stub_session(Codec::H265, rows * 32),
+            None => stub_session(Codec::Av1, 128),
+        };
+        assert_eq!(s.wave_cycle(), cycle.unwrap_or(0));
+        (nvenc(cycle).0, Session { s, floor: false })
+    }
+
+    #[test]
+    fn the_session_follows_the_nvenc_table() {
+        check(NVENC, || pair(Some(4)));
+        check(NVENC_NO_WAVE, || pair(None));
+        for cycle in [None, Some(2), Some(3)] {
+            sweep(|| pair(cycle));
+        }
+    }
+}
