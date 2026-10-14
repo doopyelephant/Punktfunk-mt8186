@@ -653,6 +653,12 @@ fn build_rung(
     stream: StreamFormat,
     vk: Option<&VulkanDecodeDevice>,
 ) -> Result<Box<dyn Rung>> {
+    #[cfg(test)]
+    {
+        if let Some(scripted) = crate::video_ladder::tests::scripted(rung) {
+            return scripted;
+        }
+    }
     let built: Box<dyn Rung> = match rung {
         NativeRung::Vulkan => {
             let vk = vk.context("no presenter device")?;
