@@ -162,10 +162,40 @@ const DECK_NAME: &str = "Steam Deck";
 /// controller is listed once: the raw 28DE:1205 when a session has it, else one Steam pad.
 /// A Steam Controller is listed raw too: its SDL drivers stay on while the Deck's is off.
 fn fold_deck_shadows(list: &mut Vec<PadInfo>) {
-    let mut stand_in = !list
-        .iter()
-        .any(|p| !p.steam_virtual && p.pref == GamepadPref::SteamDeck);
+    let mut stand_in = !list.iter().any(raw_deck);
     list.retain(|p| !p.steam_virtual || std::mem::take(&mut stand_in));
+}
+
+/// The Deck's built-in controller listed raw (`28DE:1205`: SDL's in-session driver, or the
+/// kernel's while Steam is not running), not Steam Input's pad for it.
+fn raw_deck(p: &PadInfo) -> bool {
+    !p.steam_virtual && p.pref == GamepadPref::SteamDeck
+}
+
+/// What menu mode opens of `ids`. While a Steam Input pad is listed in `order`, the first one
+/// stands in for the raw Deck controller: after a session the raw pad stays listed until its
+/// removal arrives, and opening it clears lizard mode. With Steam not running, it opens.
+fn menu_pads(ids: Vec<u32>, order: &[u32], info: impl Fn(u32) -> Option<PadInfo>) -> Vec<u32> {
+    let steam = |p: &PadInfo| p.steam_virtual && p.pref == GamepadPref::SteamDeck;
+    let Some(stand_in) = order
+        .iter()
+        .copied()
+        .find(|&id| info(id).is_some_and(|p| steam(&p)))
+    else {
+        return ids;
+    };
+    let mut out = Vec::new();
+    for id in ids {
+        let id = if info(id).is_some_and(|p| raw_deck(&p)) {
+            stand_in
+        } else {
+            id
+        };
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// Lowest free wire index, or `None` when every slot is taken. Lowest-free keeps indices
@@ -538,10 +568,13 @@ impl Worker {
     /// What menu mode holds open: the pin, else every pad, Steam Input's virtual ones too.
     /// Navigation folds them into one sample, so a shadow beside its real pad costs nothing,
     /// and idle a Deck's built-in controls exist only as a virtual pad. Console navigation is
-    /// local, so a user who turned wire forwarding off still drives the launcher.
+    /// local, so a user who turned wire forwarding off still drives the launcher. Steam's pad
+    /// stands in for the raw Deck controller while both are listed ([`menu_pads`]).
     fn menu_ids(&self) -> Vec<u32> {
-        self.pinned_id()
-            .map_or_else(|| self.order.clone(), |id| vec![id])
+        let ids = self
+            .pinned_id()
+            .map_or_else(|| self.order.clone(), |id| vec![id]);
+        menu_pads(ids, &self.order, |id| self.pad_info(id))
     }
 
     /// The one place that opens (= grabs) hardware: forwarded slots in a session, else the
@@ -1234,8 +1267,9 @@ impl Worker {
                     self.close_all_slots();
                     self.attached = None;
                     self.reset_chord();
-                    self.sync_open();
+                    // Driver off before the menu pads reopen: no slot is left to outlive it.
                     set_valve_hidapi(false);
+                    self.sync_open();
                     if self.gates.menu_mode {
                         // Adopt still-held buttons so the escape chord cannot ghost-fire the menu.
                         self.menu_nav.reset();
@@ -2102,6 +2136,62 @@ mod slot_tests {
         assert_eq!(p[0], 0);
         assert_eq!(&p[4..10], &raw);
         assert_eq!(Ds5Feedback::audio_haptics_packet(), [0u8; 47]);
+    }
+}
+
+#[cfg(test)]
+mod menu_pad_tests {
+    use super::*;
+
+    fn pad(pref: GamepadPref, steam_virtual: bool) -> PadInfo {
+        PadInfo {
+            name: String::new(),
+            key: String::new(),
+            pref,
+            steam_virtual,
+            battery: None,
+            detail: String::new(),
+            forwarded: true,
+            rumble: false,
+        }
+    }
+
+    /// 1 = the raw Deck controller, 2 = Steam Input's pad for it, 3 = a DualSense.
+    fn info(id: u32) -> Option<PadInfo> {
+        match id {
+            1 => Some(pad(GamepadPref::SteamDeck, false)),
+            2 => Some(pad(GamepadPref::SteamDeck, true)),
+            3 => Some(pad(GamepadPref::DualSense, false)),
+            _ => None,
+        }
+    }
+
+    /// Menu mode opens Steam's pad, not the raw one, while both are listed: after a session the
+    /// raw pad stays in `order` until its removal arrives.
+    #[test]
+    fn steams_pad_stands_in_for_the_raw_deck_pad_while_both_are_listed() {
+        // (ids, order) → what opens
+        let rows: [(&[u32], &[u32], &[u32]); 4] = [
+            (&[1, 2, 3], &[1, 2, 3], &[2, 3]),
+            (&[3, 2, 1], &[3, 2, 1], &[3, 2]),
+            // Steam not running: the kernel's raw pad is the Deck's only pad, and it opens.
+            (&[1, 3], &[1, 3], &[1, 3]),
+            (&[1], &[1, 3], &[1]),
+        ];
+        for (ids, order, want) in rows {
+            assert_eq!(
+                menu_pads(ids.to_vec(), order, info),
+                want,
+                "{ids:?} of {order:?}"
+            );
+        }
+    }
+
+    /// A pin on the raw pad opens Steam's pad while it is listed, so the launcher keeps a pad.
+    #[test]
+    fn a_pin_on_the_raw_deck_pad_opens_steams_pad_while_it_is_listed() {
+        assert_eq!(menu_pads(vec![1], &[1, 2, 3], info), [2]);
+        assert_eq!(menu_pads(vec![1], &[3, 1], info), [1]);
     }
 }
 
