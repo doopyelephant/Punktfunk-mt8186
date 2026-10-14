@@ -7,13 +7,16 @@
 //! the device's FF plane back as [`FfNotice`](crate::uinput_abi::FfNotice)s. No kernel fd ever
 //! crosses: a passed uinput fd can destroy its pad and create any device.
 //!
-//! A USB/IP pad stays the seat's own usbip server. The seat runs the import handshake and sends
-//! the connected socket with [`attach`]; the supervisor picks the vhci port and writes `attach`.
+//! A USB/IP pad is served by the supervisor too ([`serve`]): its pad server runs the device
+//! from this crate's tables, and the seat gets only a relay for input reports
+//! ([`crate::usbip_relay`]). A seat never answers a control transfer, so it never picks a
+//! descriptor. `Attach` and `Detach`, which handed over a seat-served socket, are refused.
 //! Design: `design/seat-pad-broker.md`.
 
 use crate::gamepad::{build_pad, PadIdentity};
 use crate::uhid_abi::{Identity, UhidDevice};
 use crate::uinput_abi::{UinputDevice, INPUT_EVENT_LEN};
+use crate::usbip_relay::{Hello, UsbKind, MAX_IDENTITY};
 use anyhow::{anyhow, bail, Context, Result};
 use rustix::event::{poll, PollFd, PollFlags};
 use rustix::net::{
@@ -149,20 +152,37 @@ const VERSION: u8 = 2;
 const OP_CREATE: u8 = 1;
 const OP_ATTACH: u8 = 2;
 const OP_DETACH: u8 = 3;
+const OP_SERVE: u8 = 4;
 /// A request, whole: magic, version, op, ten bytes of payload.
 pub const REQUEST_LEN: usize = 16;
-/// An answer, whole: version, status, the port for `Attached`.
+/// An answer, whole: version, status, the port for `Attached` and `Served`.
 const REPLY_LEN: usize = 4;
-/// The supervisor answers at once; a seat that waits longer has no supervisor.
-const TIMEOUT: Duration = Duration::from_secs(5);
+/// The supervisor answers within this; a seat that waits longer has no supervisor. A served
+/// pad's answer waits for its pad server to start.
+const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What a seat may ask. `Create`'s `index` is the seat's pad slot, part of the pad's marker;
-/// `Attach` carries the connected usbip socket beside it.
+/// What a seat may ask. `Create`'s `index` is the seat's pad slot, part of the pad's marker.
+/// `Serve`'s identity blob follows the request on the stream. `Attach` and `Detach` are what
+/// a seat served its own USB device with; the supervisor refuses both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
-    Create { kind: PadKind, index: u8 },
-    Attach { devid: u32, speed: u32 },
-    Detach { port: u16 },
+    Create {
+        kind: PadKind,
+        index: u8,
+    },
+    Attach {
+        devid: u32,
+        speed: u32,
+    },
+    Detach {
+        port: u16,
+    },
+    Serve {
+        kind: UsbKind,
+        index: u8,
+        slot: u8,
+        identity_len: u16,
+    },
 }
 
 impl Request {
@@ -185,6 +205,18 @@ impl Request {
                 out[5] = OP_DETACH;
                 out[6..8].copy_from_slice(&port.to_le_bytes());
             }
+            Request::Serve {
+                kind,
+                index,
+                slot,
+                identity_len,
+            } => {
+                out[5] = OP_SERVE;
+                out[6] = kind as u8;
+                out[7] = index;
+                out[8] = slot;
+                out[9..11].copy_from_slice(&identity_len.to_le_bytes());
+            }
         }
         out
     }
@@ -206,6 +238,18 @@ impl Request {
             OP_DETACH => Request::Detach {
                 port: u16::from_le_bytes([b[6], b[7]]),
             },
+            OP_SERVE => {
+                let identity_len = u16::from_le_bytes([b[9], b[10]]);
+                if usize::from(identity_len) > MAX_IDENTITY || b[8] > 3 {
+                    return None;
+                }
+                Request::Serve {
+                    kind: UsbKind::from_wire(b[6])?,
+                    index: b[7],
+                    slot: b[8],
+                    identity_len,
+                }
+            }
             _ => return None,
         })
     }
@@ -227,6 +271,8 @@ pub enum Status {
     /// The port rides along.
     Attached = 5,
     Detached = 6,
+    /// The port and the relay's seat end ride along.
+    Served = 7,
 }
 
 impl Status {
@@ -239,6 +285,7 @@ impl Status {
             4 => Status::Failed,
             5 => Status::Attached,
             6 => Status::Detached,
+            7 => Status::Served,
             _ => return None,
         })
     }
@@ -314,7 +361,7 @@ pub fn writable(node: &Path) -> bool {
 
 /// Ask the supervisor for `kind` at `index`: the seat's end of its relay.
 pub fn request(kind: PadKind, index: u8) -> Result<OwnedFd> {
-    let (status, _, relay) = ask(Request::Create { kind, index }, None)?;
+    let (status, _, relay) = ask(&Request::Create { kind, index }.encode(), None)?;
     match status {
         Status::Created => relay.ok_or_else(|| anyhow!("the pad broker answered without a relay")),
         Status::UnknownKind => bail!("the seat pad broker does not know the {} pad", kind.label()),
@@ -326,24 +373,30 @@ pub fn request(kind: PadKind, index: u8) -> Result<OwnedFd> {
     }
 }
 
-/// Hand the supervisor `sock`, a usbip connection past its import handshake, to attach as
-/// `devid` at `speed`. The vhci port it took.
-pub fn attach(sock: BorrowedFd<'_>, devid: u32, speed: u32) -> Result<u16> {
-    let (status, port, _) = ask(Request::Attach { devid, speed }, Some(sock))?;
+/// Ask the supervisor to serve `hello`'s USB device: the seat's end of its relay, and the
+/// vhci port the device sits on.
+pub fn serve(hello: &Hello) -> Result<(OwnedFd, u16)> {
+    let identity_len = u16::try_from(hello.identity.len())
+        .ok()
+        .filter(|n| usize::from(*n) <= MAX_IDENTITY)
+        .ok_or_else(|| anyhow!("identity of {} bytes", hello.identity.len()))?;
+    let request = Request::Serve {
+        kind: hello.kind,
+        index: hello.index,
+        slot: hello.slot.min(3),
+        identity_len,
+    };
+    let (status, port, relay) = ask(&[&request.encode()[..], &hello.identity].concat(), None)?;
+    let label = hello.kind.label();
     match status {
-        Status::Attached => Ok(port),
+        Status::Served => Ok((
+            relay.ok_or_else(|| anyhow!("the pad broker answered without a relay"))?,
+            port,
+        )),
+        Status::UnknownKind => bail!("the seat pad broker does not serve the {label}"),
         Status::Failed => {
-            bail!("the seat pad broker could not attach the device (its log says why)")
+            bail!("the seat pad broker could not serve the {label} (its log says why)")
         }
-        other => bail!("{}", other.refusal()),
-    }
-}
-
-/// Detach `port`, one this seat attached.
-pub fn detach(port: u16) -> Result<()> {
-    let (status, _, _) = ask(Request::Detach { port }, None)?;
-    match status {
-        Status::Detached => Ok(()),
         other => bail!("{}", other.refusal()),
     }
 }
@@ -359,13 +412,13 @@ impl Status {
 }
 
 /// One request, one answer: `(status, port, relay)`.
-fn ask(request: Request, pass: Option<BorrowedFd<'_>>) -> Result<(Status, u16, Option<OwnedFd>)> {
+fn ask(request: &[u8], pass: Option<BorrowedFd<'_>>) -> Result<(Status, u16, Option<OwnedFd>)> {
     let stream = UnixStream::connect(SOCKET).with_context(|| {
         format!("connect to the seat pad broker at {SOCKET} (is punktfunk-seats running?)")
     })?;
     let _ = stream.set_read_timeout(Some(TIMEOUT));
     let _ = stream.set_write_timeout(Some(TIMEOUT));
-    send_frame(&stream, &request.encode(), pass).context("send the pad request")?;
+    send_frame(&stream, request, pass).context("send the pad request")?;
     recv_reply(&stream).context("read the pad broker's answer")
 }
 
@@ -393,8 +446,18 @@ pub fn read_request(stream: &UnixStream) -> Result<(Request, Option<OwnedFd>)> {
     Ok((request, fd))
 }
 
-/// Answer `status` on `stream`: the seat's end of its relay for `Created`, the port for
-/// `Attached`.
+/// The identity blob a `Serve` request said follows it, read whole off `stream`.
+pub fn read_identity(stream: &UnixStream, len: u16) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut blob = vec![0u8; usize::from(len)];
+    (&*stream)
+        .read_exact(&mut blob)
+        .context("read the pad's identity")?;
+    Ok(blob)
+}
+
+/// Answer `status` on `stream`: the seat's end of its relay for `Created` and `Served`, the
+/// port for `Attached` and `Served`.
 pub fn reply(
     stream: &UnixStream,
     status: Status,
@@ -503,29 +566,39 @@ pub fn forget(name: &str) {
     notify(&format!("FDSTOREREMOVE=1\nFDNAME={name}/r"), None);
 }
 
-/// A seat's attached USB socket's name in the fd store, `usb/<port>/<recorded>`: `recorded` is
-/// the number `attach` took, which the port map and vhci's `status` keep after a restart.
+/// A served USB socket's name in the fd store, `served/<port>/<recorded>`: `recorded` is the
+/// number `attach` took, which the port map and vhci's `status` keep after a restart.
 fn usb_store_name(port: u16, recorded: RawFd) -> String {
-    format!("usb/{port}/{recorded}")
+    format!("served/{port}/{recorded}")
 }
 
-/// What a stored USB socket's name says: `(port, recorded)`.
-fn parse_usb_store_name(name: &str) -> Option<(u16, RawFd)> {
-    let (port, recorded) = name.strip_prefix("usb/")?.split_once('/')?;
-    Some((port.parse().ok()?, recorded.parse().ok()?))
+/// What a stored USB socket's name says: `(port, recorded, served)`. `usb/<port>/<recorded>` is
+/// a socket an older supervisor attached for a seat that served its own device.
+fn parse_usb_store_name(name: &str) -> Option<(u16, RawFd, bool)> {
+    let (served, rest) = match name.split_once('/')? {
+        ("served", rest) => (true, rest),
+        ("usb", rest) => (false, rest),
+        _ => return None,
+    };
+    let (port, recorded) = rest.split_once('/')?;
+    Some((port.parse().ok()?, recorded.parse().ok()?, served))
 }
 
-/// Parks a seat's attached USB socket in systemd's fd store, so a restarted supervisor
-/// watches it again ([`kept`]).
+/// Parks a served USB socket in systemd's fd store, so a restarted supervisor watches it
+/// again ([`kept`]).
 pub fn keep_usb(port: u16, recorded: RawFd, sock: BorrowedFd<'_>) {
     let name = usb_store_name(port, recorded);
     notify(&format!("FDSTORE=1\nFDNAME={name}"), Some(sock));
 }
 
-/// Takes a USB socket out of the store: its connection ended.
+/// Takes a USB socket out of the store, under either name: its connection ended.
 pub fn forget_usb(port: u16, recorded: RawFd) {
-    let name = usb_store_name(port, recorded);
-    notify(&format!("FDSTOREREMOVE=1\nFDNAME={name}"), None);
+    for name in [
+        usb_store_name(port, recorded),
+        format!("usb/{port}/{recorded}"),
+    ] {
+        notify(&format!("FDSTOREREMOVE=1\nFDNAME={name}"), None);
+    }
 }
 
 /// Parks `fd` in systemd's fd store under `name`, which is neither a pad's nor a USB socket's
@@ -587,8 +660,10 @@ pub struct KeptPad {
 #[derive(Default)]
 pub struct Kept {
     pub pads: Vec<KeptPad>,
-    /// Each attached USB socket as `(port, recorded, socket)`.
+    /// Each served USB socket as `(port, recorded, socket)`.
     pub usb: Vec<(u16, RawFd, OwnedFd)>,
+    /// Each USB socket an older supervisor attached for a seat that served its own device.
+    pub unserved: Vec<(u16, RawFd, OwnedFd)>,
     /// Every other fd, by the name [`keep_fd`] gave it.
     pub other: Vec<(String, OwnedFd)>,
 }
@@ -607,15 +682,15 @@ pub fn kept() -> Kept {
     let names = env("LISTEN_FDNAMES");
     let mut names = names.split(':');
     let (mut kernels, mut relays) = (HashMap::new(), HashMap::new());
-    let (mut usb, mut other) = (Vec::new(), Vec::new());
+    let (mut usb, mut unserved, mut other) = (Vec::new(), Vec::new(), Vec::new());
     for raw in LISTEN_FDS_START..LISTEN_FDS_START + count {
         // SAFETY: systemd passes fds 3 through 3 + LISTEN_FDS - 1 to the process LISTEN_PID
         // names, this one. Nothing else here owns them, and `TAKEN` adopts each once.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let _ = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC);
         let name = names.next().unwrap_or("");
-        if let Some((port, recorded)) = parse_usb_store_name(name) {
-            usb.push((port, recorded, fd));
+        if let Some((port, recorded, served)) = parse_usb_store_name(name) {
+            if served { &mut usb } else { &mut unserved }.push((port, recorded, fd));
             continue;
         }
         match name
@@ -656,6 +731,7 @@ pub fn kept() -> Kept {
     Kept {
         pads: out,
         usb,
+        unserved,
         other,
     }
 }
@@ -748,9 +824,31 @@ mod tests {
                 speed: 3,
             },
             Request::Detach { port: 9 },
+            Request::Serve {
+                kind: UsbKind::SteamController2Puck,
+                index: 4,
+                slot: 3,
+                identity_len: MAX_IDENTITY as u16,
+            },
         ] {
             assert_eq!(Request::decode(&r.encode()), Some(r));
         }
+        let serve = Request::Serve {
+            kind: UsbKind::DualSense,
+            index: 0,
+            slot: 0,
+            identity_len: 0,
+        }
+        .encode();
+        let mut unknown = serve;
+        unknown[6] = 99;
+        assert_eq!(Request::decode(&unknown), None, "a kind no table serves");
+        let mut huge = serve;
+        huge[9..11].copy_from_slice(&(MAX_IDENTITY as u16 + 1).to_le_bytes());
+        assert_eq!(Request::decode(&huge), None, "an identity past the cap");
+        let mut slot = serve;
+        slot[8] = 4;
+        assert_eq!(Request::decode(&slot), None, "a Puck has four slots");
         let mut wrong_kind = r.encode();
         wrong_kind[6] = 200;
         assert_eq!(Request::decode(&wrong_kind), None);
@@ -807,15 +905,18 @@ mod tests {
         );
     }
 
-    /// A kept USB socket's name carries the port and the number its map row records.
+    /// A kept USB socket's name carries the port and the number its map row records, and
+    /// whether the supervisor served it or an older seat did.
     #[test]
     fn a_usb_store_name_round_trips() {
         let name = usb_store_name(9, 17);
         assert!(!name.contains(':'), "systemd's LISTEN_FDNAMES separator");
-        assert_eq!(parse_usb_store_name(&name), Some((9, 17)));
+        assert_eq!(parse_usb_store_name(&name), Some((9, 17, true)));
+        assert_eq!(parse_usb_store_name("usb/9/17"), Some((9, 17, false)));
         assert_eq!(parse_store_name(&name), None, "not a pad");
         assert_eq!(parse_usb_store_name("pad/1-0/10/0/x/k"), None);
         assert_eq!(parse_usb_store_name("usb/9/x"), None);
+        assert_eq!(parse_usb_store_name("served/9"), None);
     }
 
     /// An `Attach` crosses with its socket; the answer carries the port.

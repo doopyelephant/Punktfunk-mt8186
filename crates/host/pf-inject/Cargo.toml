@@ -96,5 +96,10 @@ windows = { version = "0.62", features = [
 # Reads `crates/core/punktfunk-core/testdata/gamepad-button-vectors.json`.
 serde_json = "1"
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Walks the pad tables' report descriptors: a seat may never send a report the kernel makes a
+# keyboard or pointer of.
+hidreport = { version = "0.6", default-features = false }
+
 [lints]
 workspace = true

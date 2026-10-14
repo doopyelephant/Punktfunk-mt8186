@@ -8,8 +8,8 @@
 //! `0x00E3`. HID report length is the 273-byte [`DUALSENSE_RDESC`], not the 289
 //! hardware advertises; `hid-playstation` binds the shorter one.
 //!
-//! Audio OUT is converted to `f32` and published once per pad via [`take_audio_rx`].
-//! Queue overflow drops rather than blocking a URB reply (that stalls the kernel ISO
+//! Audio OUT crosses the relay as S16 and reaches the pad as `f32`, published once per pad
+//! via [`take_audio_rx`]. Neither side blocks a URB reply on it (that stalls the kernel ISO
 //! ring). The vendored USB/IP server serializes URBs, so HID polls may wait behind
 //! audio; concurrency needs seqnum-keyed out-of-order completions.
 
@@ -19,15 +19,21 @@ use super::dualsense_proto::{
     DUALSENSE_RDESC,
 };
 use super::usbip::{attach_device, boxed, ep, hid_class_descriptor, UsbipAttachment};
+use super::usbip_relay::{Hello, Incoming, Output, Outputs, Served, UsbKind};
 use anyhow::Result;
 use std::any::Any;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use usbip_sim::{
     Direction, IsoPacket, SetupPacket, UsbAltSetting, UsbDevice, UsbEndpoint, UsbInterface,
     UsbInterfaceHandler, Version,
 };
+
+/// The HID interface: the only one that takes input reports.
+const HID: u8 = 3;
+/// The one input report the pad sends.
+const INPUT_REPORT_ID: u8 = 0x01;
 
 /// ch0/1 headphone L/R (ch1 is also the internal mono speaker); ch2/ch3 haptic coils.
 /// Same layout as `pad_sink` / `split_quad`.
@@ -55,7 +61,7 @@ const AUDIO_OUT_MPS: u16 = 392;
 const AUDIO_IN_MPS: u16 = 196;
 
 /// Decoded chunks queued before drop. Consumer wakes every 5 ms, each chunk ~1 ms;
-/// drop rather than block the URB reply (that stalls the kernel ISO ring).
+/// the pad's relay reader drops rather than blocks.
 const AUDIO_QUEUE_DEPTH: usize = 256;
 
 /// Audio receivers for live usbip pads, indexed by wire pad.
@@ -193,13 +199,11 @@ impl UsbInterfaceHandler for AudioControlHandler {
 }
 
 /// Interface 1 Audio Streaming OUT. Each isochronous packet is one service interval of
-/// the game's haptic/speaker quad.
+/// the game's haptic/speaker quad; a URB's packets go to the pad as one [`Output::Audio`].
 #[derive(Debug)]
 struct SpeakerStreamHandler {
-    tx: SyncSender<Vec<f32>>,
+    out: Outputs,
     current_alt: u8,
-    /// Queue-full drops; logged on powers of two so a stall cannot flood the log.
-    dropped: u64,
 }
 
 impl UsbInterfaceHandler for SpeakerStreamHandler {
@@ -225,25 +229,12 @@ impl UsbInterfaceHandler for SpeakerStreamHandler {
         _ep: UsbEndpoint,
         packets: &[IsoPacket<'_>],
     ) -> std::io::Result<Vec<Vec<u8>>> {
-        let total: usize = packets.iter().map(|p| p.data.len()).sum();
-        if total >= 2 {
-            let mut pcm = Vec::with_capacity(total / 2);
-            for p in packets {
-                // Truncated frame: `chunks_exact` drops a trailing odd byte.
-                for s in p.data.chunks_exact(2) {
-                    pcm.push(i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0);
-                }
-            }
-            if !pcm.is_empty() && self.tx.try_send(pcm).is_err() {
-                self.dropped += 1;
-                if self.dropped.is_power_of_two() {
-                    tracing::debug!(
-                        dropped = self.dropped,
-                        "pad usb audio queue full — dropping (streamer behind?)"
-                    );
-                }
-            }
+        let mut pcm = Vec::with_capacity(packets.iter().map(|p| p.data.len()).sum());
+        for p in packets {
+            // A truncated frame's trailing odd byte would shift every later sample.
+            pcm.extend_from_slice(&p.data[..p.data.len() & !1]);
         }
+        self.out.audio(pcm);
         // OUT: empty replies; the caller fills actual_length.
         Ok(vec![Vec::new(); packets.len()])
     }
@@ -283,23 +274,13 @@ impl UsbInterfaceHandler for MicStreamHandler {
 
 /// Interface 3 HID. Same codec as [`super::dualsense::DualSensePad`]: input `0x01`,
 /// output `0x02`, feature `0x05`/`0x09`/`0x20` (`hid-playstation` init; without them no
-/// input devices appear).
+/// input devices appear). Every output goes to the pad as written.
+#[derive(Debug)]
 struct HidHandler {
     report: Arc<Mutex<[u8; DS_INPUT_REPORT_LEN]>>,
-    feedback: Arc<Mutex<DsFeedback>>,
+    out: Outputs,
     pad: u8,
     current_alt: u8,
-}
-
-// Hand-written: `DsFeedback` is not `Debug` (it holds `HidOutput`s); the trait only
-// wants a name for tracing.
-impl std::fmt::Debug for HidHandler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HidHandler")
-            .field("pad", &self.pad)
-            .field("current_alt", &self.current_alt)
-            .finish()
-    }
 }
 
 impl UsbInterfaceHandler for HidHandler {
@@ -331,10 +312,10 @@ impl UsbInterfaceHandler for HidHandler {
                         _ => Vec::new(),
                     }
                 }
-                // HID SET_REPORT: known writers use interrupt OUT, but parse here too so a
+                // HID SET_REPORT: known writers use interrupt OUT, but pass it on too so a
                 // control-pipe writer is not dropped.
                 (0x21, 0x09) => {
-                    self.absorb_output(req);
+                    self.out.report(HID, Some(setup.value), req);
                     Vec::new()
                 }
                 (0x21, 0x0A) | (0x21, 0x0B) => Vec::new(),
@@ -348,7 +329,7 @@ impl UsbInterfaceHandler for HidHandler {
                 .map(|g| g.to_vec())
                 .unwrap_or_else(|_| vec![0u8; DS_INPUT_REPORT_LEN])),
             Direction::Out => {
-                self.absorb_output(req);
+                self.out.report(HID, None, req);
                 Ok(Vec::new())
             }
         }
@@ -359,19 +340,25 @@ impl UsbInterfaceHandler for HidHandler {
     }
 }
 
-impl HidHandler {
-    /// Merge one HID output into pending feedback. Writers may split rumble and LEDs
-    /// across reports; `service` drains on its own cadence.
-    fn absorb_output(&mut self, data: &[u8]) {
+/// The host's HID outputs merged into feedback for wire pad `pad`. Writers may split rumble
+/// and LEDs across reports.
+fn feedback(pad: u8, outputs: Vec<Output>) -> DsFeedback {
+    let mut merged = DsFeedback::default();
+    for output in outputs {
+        let Output::Report {
+            iface: HID, data, ..
+        } = output
+        else {
+            continue;
+        };
         let mut fb = DsFeedback::default();
-        parse_ds_output(self.pad, data, &mut fb);
-        if let Ok(mut g) = self.feedback.lock() {
-            if fb.rumble.is_some() {
-                g.rumble = fb.rumble;
-            }
-            g.hidout.extend(fb.hidout);
+        parse_ds_output(pad, &data, &mut fb);
+        if fb.rumble.is_some() {
+            merged.rumble = fb.rumble;
         }
+        merged.hidout.extend(fb.hidout);
     }
+    merged
 }
 
 /// Assemble the 4-interface composite. `index` is the wire pad; it does not appear in
@@ -379,8 +366,7 @@ impl HidHandler {
 fn build_device(
     index: u8,
     report: &Arc<Mutex<[u8; DS_INPUT_REPORT_LEN]>>,
-    feedback: &Arc<Mutex<DsFeedback>>,
-    audio_tx: &SyncSender<Vec<f32>>,
+    out: Outputs,
 ) -> UsbDevice {
     let (ep_extra, ep_trailer) = audio_endpoint_extras();
 
@@ -417,9 +403,8 @@ fn build_device(
             None,
             vec![],
             boxed(SpeakerStreamHandler {
-                tx: audio_tx.clone(),
+                out: out.clone(),
                 current_alt: 0,
-                dropped: 0,
             }),
         )
         .with_alt_settings(vec![UsbAltSetting {
@@ -465,11 +450,33 @@ fn build_device(
             ],
             boxed(HidHandler {
                 report: report.clone(),
-                feedback: feedback.clone(),
+                out,
                 pad: index,
                 current_alt: 0,
             }),
         )
+}
+
+/// The server's half: the device, and the pad's report `0x01` into interface 3 only.
+pub(crate) fn served(index: u8, out: Outputs) -> Served {
+    let report = Arc::new(Mutex::new([0u8; DS_INPUT_REPORT_LEN]));
+    let device = build_device(index, &report, out);
+    Served {
+        device,
+        input: Box::new(move |message| {
+            if let Incoming::Input {
+                iface: HID,
+                report: r,
+            } = message
+            {
+                if let Ok(r) = <[u8; DS_INPUT_REPORT_LEN]>::try_from(r) {
+                    if r[0] == INPUT_REPORT_ID {
+                        *report.lock().unwrap_or_else(|e| e.into_inner()) = r;
+                    }
+                }
+            }
+        }),
+    }
 }
 
 /// Virtual DualSense over USB/IP, with its own UAC sound card.
@@ -477,11 +484,9 @@ fn build_device(
 /// Drop detaches the `vhci_hcd` port (pad and ALSA card go together) and withdraws the
 /// audio receiver.
 pub struct DualSenseUsbip {
-    report: Arc<Mutex<[u8; DS_INPUT_REPORT_LEN]>>,
-    feedback: Arc<Mutex<DsFeedback>>,
     pad: u8,
     enc: DsEncoder,
-    _attach: UsbipAttachment,
+    attach: UsbipAttachment,
 }
 
 impl DualSenseUsbip {
@@ -489,16 +494,17 @@ impl DualSenseUsbip {
     /// when `vhci_hcd` is missing or sysfs `attach` is not writable — see
     /// [`super::usbip::attach_device`].
     pub fn open(index: u8) -> Result<DualSenseUsbip> {
-        let report = Arc::new(Mutex::new([0u8; DS_INPUT_REPORT_LEN]));
-        let feedback = Arc::new(Mutex::new(DsFeedback::default()));
         let (tx, rx) = sync_channel::<Vec<f32>>(AUDIO_QUEUE_DEPTH);
         // Pads already up, so the bind wait below judges this pad's own device.
         let before: Vec<_> = vhci_dualsenses().map(|t| t.sysfs_path).collect();
 
-        let attach = attach_device(
-            || build_device(index, &report, &feedback, &tx),
-            &format!("virtual DualSense {index}"),
-        )?;
+        let hello = Hello {
+            kind: UsbKind::DualSense,
+            index,
+            slot: 0,
+            identity: Vec::new(),
+        };
+        let attach = attach_device(hello, Some(tx), &format!("virtual DualSense {index}"))?;
 
         // `vhci_hcd` accepts the socket immediately and enumerates later. A bad URB or
         // descriptor then appears and vanishes. Return `Ok` only after a HID driver binds;
@@ -516,31 +522,28 @@ impl DualSenseUsbip {
              and GE finds a real ALSA card)"
         );
         Ok(DualSenseUsbip {
-            report,
-            feedback,
             pad: index,
             enc: DsEncoder::default(),
-            _attach: attach,
+            attach,
         })
     }
 
     /// Serialize `st` as report `0x01` for the next interrupt-IN poll.
     pub fn write_state(&mut self, st: &DsState) {
         let r = self.enc.encode(st);
-        if let Ok(mut g) = self.report.lock() {
-            *g = r;
-        }
+        self.attach.input(HID, &r);
     }
 
     /// Drain HID feedback written since the last call.
     pub fn service(&mut self) -> DsFeedback {
-        let fb = self
-            .feedback
-            .lock()
-            .map(|mut f| std::mem::take(&mut *f))
-            .unwrap_or_default();
+        let fb = feedback(self.pad, self.attach.outputs());
         self.enc.observe(&fb.hidout);
         fb
+    }
+
+    /// `false` once the device is gone under the pad.
+    pub fn alive(&self) -> bool {
+        self.attach.alive()
     }
 }
 
@@ -696,6 +699,7 @@ pub fn usbip_preferred() -> bool {
 mod tests {
     use super::*;
     use crate::dualsense_proto::serialize_state;
+    use crate::usbip_relay::{drain, test_relay};
 
     /// Byte length of the configuration descriptor `UsbDevice::handle_urb` would emit.
     /// [`config_descriptor_matches_hardware`] pins it to hardware `wTotalLength`.
@@ -769,62 +773,39 @@ mod tests {
         assert!(AUDIO_OUT_MPS as usize >= 48 * bytes_per_frame);
     }
 
+    /// A URB's packets reach the pad as one S16 run, each packet cut to whole samples.
     #[test]
-    fn iso_out_decodes_s16_quad_to_f32() {
-        let (tx, rx) = sync_channel::<Vec<f32>>(4);
+    fn iso_out_reaches_the_pad_as_s16() {
+        let (out, pad) = test_relay();
         let mut h = SpeakerStreamHandler {
-            tx,
+            out,
             current_alt: 1,
-            dropped: 0,
         };
-        // Two frames: full-scale positive on ch0, full-scale negative on ch3.
-        let mut raw = Vec::new();
-        for s in [i16::MAX, 0, 0, i16::MIN, 0, 0, 0, 0] {
-            raw.extend_from_slice(&s.to_le_bytes());
-        }
-        let packets = [IsoPacket {
-            data: &raw,
-            requested_len: raw.len(),
-        }];
-        let intf = probe_interface();
+        let first = [1u8, 0, 2, 0, 9];
+        let second = [3u8, 0];
+        let packets = [
+            IsoPacket {
+                data: &first,
+                requested_len: first.len(),
+            },
+            IsoPacket {
+                data: &second,
+                requested_len: second.len(),
+            },
+        ];
         let replies = h
-            .handle_iso_urb(&intf, ep(EP_AUDIO_OUT, 0x09, AUDIO_OUT_MPS, 4), &packets)
+            .handle_iso_urb(
+                &probe_interface(),
+                ep(EP_AUDIO_OUT, 0x09, AUDIO_OUT_MPS, 4),
+                &packets,
+            )
             .expect("iso urb");
-        assert_eq!(replies.len(), 1, "one reply per packet");
-        assert!(replies[0].is_empty(), "OUT packets carry no reply payload");
-
-        let pcm = rx.try_recv().expect("decoded chunk");
-        assert_eq!(pcm.len(), 8, "2 frames x 4 channels");
-        assert!(
-            (pcm[0] - 0.999_97).abs() < 1e-4,
-            "ch0 full scale: {}",
-            pcm[0]
+        assert_eq!(
+            replies,
+            [Vec::<u8>::new(), Vec::new()],
+            "OUT packets carry no reply"
         );
-        assert_eq!(pcm[3], -1.0, "ch3 full scale negative");
-        assert_eq!(pcm[4], 0.0);
-    }
-
-    #[test]
-    fn iso_out_drops_rather_than_blocking_when_the_streamer_stalls() {
-        let (tx, _rx) = sync_channel::<Vec<f32>>(1);
-        let mut h = SpeakerStreamHandler {
-            tx,
-            current_alt: 1,
-            dropped: 0,
-        };
-        let raw = vec![0u8; 8 * PAD_AUDIO_CHANNELS * 2];
-        let packets = [IsoPacket {
-            data: &raw,
-            requested_len: raw.len(),
-        }];
-        let intf = probe_interface();
-        for _ in 0..8 {
-            let replies = h
-                .handle_iso_urb(&intf, ep(EP_AUDIO_OUT, 0x09, AUDIO_OUT_MPS, 4), &packets)
-                .expect("iso urb");
-            assert_eq!(replies.len(), 1);
-        }
-        assert!(h.dropped > 0, "a full queue must register drops");
+        assert_eq!(drain(&pad), [Output::Audio(vec![1, 0, 2, 0, 3, 0])]);
     }
 
     /// `snd-usb-audio` arms alt 1 with `SET_INTERFACE` and returns to alt 0 to stop.
@@ -879,7 +860,7 @@ mod tests {
         };
         let mk = |pad| HidHandler {
             report: Arc::new(Mutex::new([0u8; DS_INPUT_REPORT_LEN])),
-            feedback: Arc::new(Mutex::new(DsFeedback::default())),
+            out: test_relay().0,
             pad,
             current_alt: 0,
         };
@@ -893,10 +874,10 @@ mod tests {
 
     #[test]
     fn interrupt_out_report_becomes_feedback() {
-        let feedback = Arc::new(Mutex::new(DsFeedback::default()));
+        let (out, pad) = test_relay();
         let mut h = HidHandler {
             report: Arc::new(Mutex::new([0u8; DS_INPUT_REPORT_LEN])),
-            feedback: feedback.clone(),
+            out,
             pad: 0,
             current_alt: 0,
         };
@@ -920,8 +901,7 @@ mod tests {
             &out,
         )
         .expect("interrupt out");
-        let got = feedback.lock().unwrap().rumble;
-        assert_eq!(got, Some((0x4000, 0x8000)));
+        assert_eq!(feedback(0, drain(&pad)).rumble, Some((0x4000, 0x8000)));
     }
 
     #[test]
@@ -929,7 +909,7 @@ mod tests {
         let report = Arc::new(Mutex::new([0u8; DS_INPUT_REPORT_LEN]));
         let mut h = HidHandler {
             report: report.clone(),
-            feedback: Arc::new(Mutex::new(DsFeedback::default())),
+            out: test_relay().0,
             pad: 0,
             current_alt: 0,
         };
@@ -959,9 +939,7 @@ mod tests {
     /// A seat's vhci port binds only listed devices.
     #[test]
     fn the_dualsense_is_a_listed_device() {
-        let report = Arc::new(Mutex::new([0u8; DS_INPUT_REPORT_LEN]));
-        let (tx, _rx) = sync_channel::<Vec<f32>>(1);
-        let dev = build_device(0, &report, &Arc::default(), &tx);
+        let dev = served(0, test_relay().0).device;
         assert!(crate::usbip::EMULATED.contains(&(dev.vendor_id, dev.product_id)));
     }
 

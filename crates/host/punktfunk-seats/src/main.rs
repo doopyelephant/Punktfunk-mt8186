@@ -1,10 +1,11 @@
 //! `punktfunk-seats`: the Linux seat supervisor and the operator's client for it.
 //!
 //! `serve` is the root daemon (`punktfunk-seats.service`). The other verbs send one request to
-//! its socket, as the box host does, and print the answer. The pad broker, [`pads`], and each
-//! seat's `/dev/uinput`, [`uinput`], are the daemon's too; they live here rather than in
-//! `pf-seats` because they link `pf-inject`, whose dependencies the Windows seat keeper's own
-//! workspace cannot resolve beside IronRDP.
+//! its socket, as the box host does, and print the answer; `serve-usb` is the pad server the
+//! daemon starts for a seat's USB device. The pad broker, [`pads`], and each seat's
+//! `/dev/uinput`, [`uinput`], are the daemon's too; they live here rather than in `pf-seats`
+//! because they link `pf-inject`, whose dependencies the Windows seat keeper's own workspace
+//! cannot resolve beside IronRDP.
 
 #![forbid(unsafe_code)]
 
@@ -49,7 +50,8 @@ mod linux {
         \x20 doctor                      what a seat needs and what is missing\n\
         \x20 seating                     whether seats are on\n\
         \x20 fence                       udev's IMPORT{program}: whose a seat's pad is\n\
-        \x20 ungate                      open the vhci gate and the box's hidraw (ExecStopPost)\n";
+        \x20 ungate                      open the vhci gate and the box's hidraw (ExecStopPost)\n\
+        \x20 serve-usb                   a seat's USB pad server, which the supervisor starts\n";
 
     pub fn main() -> ExitCode {
         match run(std::env::args().skip(1).collect()) {
@@ -96,6 +98,10 @@ mod linux {
                 crate::vhci::ungate();
                 pads::unbind();
                 return Ok(());
+            }
+            "serve-usb" => {
+                pf_seats::logging::to_stderr();
+                return pads::serve_usb_device();
             }
             "list" => Command::List,
             "create" => {

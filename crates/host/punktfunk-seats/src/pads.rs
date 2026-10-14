@@ -4,19 +4,26 @@
 //! The socket file is world-connectable; the gate is `SO_PEERCRED`: a peer whose uid is not a
 //! running seat's (the owner's row included) is closed unanswered. A seat holds at most
 //! [`MAX_PER_SEAT`] pads and [`vhci::MAX_PER_SEAT`] USB devices; past that the answer is
-//! `capacity`. A pad lives as long as its relay thread, a USB device as long as its connection:
+//! `capacity`. A USB device is served by a pad server of its own, in a scope of its own
+//! ([`serve_usb`]), so no byte of its descriptors comes from the seat and a supervisor restart
+//! leaves it running. A pad lives as long as its relay, a USB device as long as its pad server:
 //! the seat hanging up, or its host dying, ends both. A relayed pad and an attached USB socket
-//! also sit in systemd's fd store, so a supervisor restart picks them up again ([`resume`]).
+//! sit in systemd's fd store, so a supervisor restart picks them up again ([`resume`]).
 
 use crate::vhci;
+use anyhow::Context as _;
 use pf_inject::pad_broker::{self, BrokeredPad, PadKind, Request, Status};
+use pf_inject::usbip;
+use pf_inject::usbip_relay::Hello;
 use pf_seats::linux::{socket, LinuxBackend};
 use pf_seats::SeatService;
 use std::collections::HashMap;
+use std::net::TcpStream;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::Path;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -25,32 +32,53 @@ pub const SOCKET_PATH: &str = pf_paths::seat::PADS_SOCKET;
 pub const MAX_PER_SEAT: usize = 8;
 /// A seat sends its request at once; one that doesn't is not a seat host.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a new pad server has to answer the import: `systemd-run` and an exec first.
+const PAD_SERVER_WAIT: Duration = Duration::from_secs(5);
 /// One file per relayed pad, `<account> <index> <kind>`, for `punktfunk-seats list`.
 const RELAYED: &str = "/run/punktfunk/pads/relayed";
 
 /// Pads held per account, for the life of their relays.
 static HELD: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Mutex::default);
+/// Pad servers per account, from the request to the device's end.
+static SERVED: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Mutex::default);
 
-/// One of an account's pad slots, given back on drop.
-struct Slot(String);
+/// One of an account's slots in `held`, given back on drop.
+struct Slot {
+    held: &'static Mutex<HashMap<String, usize>>,
+    account: String,
+}
 
 impl Slot {
-    fn take(account: &str) -> Option<Slot> {
-        admit(&mut HELD.lock().unwrap_or_else(|e| e.into_inner()), account)
-            .then(|| Slot(account.to_owned()))
+    fn take(
+        held: &'static Mutex<HashMap<String, usize>>,
+        account: &str,
+        cap: usize,
+    ) -> Option<Slot> {
+        admit(
+            &mut held.lock().unwrap_or_else(|e| e.into_inner()),
+            account,
+            cap,
+        )
+        .then(|| Slot {
+            held,
+            account: account.to_owned(),
+        })
     }
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        release(&mut HELD.lock().unwrap_or_else(|e| e.into_inner()), &self.0);
+        release(
+            &mut self.held.lock().unwrap_or_else(|e| e.into_inner()),
+            &self.account,
+        );
     }
 }
 
-/// Counts one more pad for `account`; `false` at the cap.
-fn admit(held: &mut HashMap<String, usize>, account: &str) -> bool {
+/// Counts one more for `account`; `false` at `cap`.
+fn admit(held: &mut HashMap<String, usize>, account: &str, cap: usize) -> bool {
     let count = held.entry(account.to_owned()).or_insert(0);
-    if *count >= MAX_PER_SEAT {
+    if *count >= cap {
         return false;
     }
     *count += 1;
@@ -67,17 +95,25 @@ fn release(held: &mut HashMap<String, usize>, account: &str) {
 }
 
 /// Relays again every pad systemd kept across a supervisor restart, and watches again every
-/// USB socket. The other kept fds are the caller's. First thing at start: until then the kept
-/// fds would leak into a child.
+/// served USB socket. A USB device an older supervisor attached for a seat that served it
+/// itself is detached. The other kept fds are the caller's. First thing at start: until then
+/// the kept fds would leak into a child.
 pub fn resume() -> Vec<(String, OwnedFd)> {
     let _ = std::fs::remove_dir_all(RELAYED);
     let pad_broker::Kept {
         pads,
         usb: sockets,
+        unserved,
         other,
     } = pad_broker::kept();
+    for (port, recorded, sock) in unserved {
+        tracing::warn!(port, "seat USB device the seat served itself, detached");
+        vhci::drop_unserved(port, recorded);
+        pad_broker::forget_usb(port, recorded);
+        drop(sock);
+    }
     for kept in pads {
-        let Some(slot) = Slot::take(&kept.account) else {
+        let Some(slot) = Slot::take(&HELD, &kept.account, MAX_PER_SEAT) else {
             pad_broker::forget(&kept.name);
             continue;
         };
@@ -253,16 +289,34 @@ fn handle(service: &SeatService<LinuxBackend>, stream: UnixStream) {
     };
     match request {
         Request::Create { kind, index } => create(stream, &account, kind, index),
-        Request::Attach { devid, speed } => attach(stream, &account, fd, devid, speed),
-        Request::Detach { port } => {
-            let status = match vhci::detach(&account, port) {
-                Ok(()) => Status::Detached,
-                Err(error) => {
-                    tracing::warn!(error = %format!("{error:#}"), account, port, "seat vhci detach refused");
-                    Status::Failed
-                }
-            };
-            answer(&stream, &account, status);
+        Request::Serve {
+            kind,
+            index,
+            slot,
+            identity_len,
+        } => match pad_broker::read_identity(&stream, identity_len) {
+            Ok(identity) => {
+                let hello = Hello {
+                    kind,
+                    index,
+                    slot,
+                    identity,
+                };
+                serve_usb(stream, &account, &hello);
+            }
+            Err(error) => {
+                tracing::debug!(error = %format!("{error:#}"), account, "pads socket request");
+            }
+        },
+        // A seat host from before served USB pads hands over a device it serves itself, with
+        // descriptors it chose. Its socket closes unattached; the host falls back to uhid.
+        Request::Attach { .. } | Request::Detach { .. } => {
+            drop(fd);
+            tracing::warn!(
+                account,
+                "seat host predates served USB pads: its own USB device was refused"
+            );
+            answer(&stream, &account, Status::Refused);
         }
     }
 }
@@ -275,7 +329,7 @@ fn answer(stream: &UnixStream, account: &str, status: Status) {
 
 /// A uinput or uhid pad, relayed until the seat hangs up.
 fn create(stream: UnixStream, account: &str, kind: PadKind, index: u8) {
-    let Some(_slot) = Slot::take(account) else {
+    let Some(_slot) = Slot::take(&HELD, account, MAX_PER_SEAT) else {
         tracing::warn!(
             account,
             cap = MAX_PER_SEAT,
@@ -313,39 +367,99 @@ fn create(stream: UnixStream, account: &str, kind: PadKind, index: u8) {
     run_relay(&name, account, kind, index, pad, ours);
 }
 
-/// The seat's usbip socket on a vhci port, held until its connection ends.
-fn attach(stream: UnixStream, account: &str, sock: Option<OwnedFd>, devid: u32, speed: u32) {
-    let Some(sock) = sock else {
-        tracing::warn!(account, "seat asked to attach without a socket");
-        answer(&stream, account, Status::Failed);
+/// A seat's USB device, served by a pad server of its own: the device, its descriptors and
+/// every control transfer come from pf-inject's tables, and the seat gets only the relay.
+/// Held until the kernel's connection ends.
+fn serve_usb(stream: UnixStream, account: &str, hello: &Hello) {
+    let label = hello.kind.label();
+    let Some(_slot) = Slot::take(&SERVED, account, vhci::MAX_PER_SEAT) else {
+        tracing::warn!(
+            account,
+            cap = vhci::MAX_PER_SEAT,
+            "seat asked for one USB device too many"
+        );
+        answer(&stream, account, Status::Capacity);
         return;
     };
-    let port = match vhci::attach(account, sock.as_fd(), devid, speed) {
-        Ok(Some(port)) => port,
-        Ok(None) => {
-            tracing::warn!(
-                account,
-                cap = vhci::MAX_PER_SEAT,
-                "seat asked for one USB device too many"
-            );
-            answer(&stream, account, Status::Capacity);
-            return;
-        }
+    if let Err(error) = hello.identity() {
+        tracing::warn!(error = %format!("{error:#}"), account, pad = label, "seat USB pad identity refused");
+        answer(&stream, account, Status::Failed);
+        return;
+    }
+    let (mut client, relay, mut server) = match start_pad_server(account, hello) {
+        Ok(started) => started,
         Err(error) => {
-            tracing::warn!(error = %format!("{error:#}"), account, "seat USB device not attached");
+            tracing::warn!(error = %format!("{error:#}"), account, pad = label, "seat USB pad server not started");
             answer(&stream, account, Status::Failed);
             return;
         }
     };
-    if let Err(error) = pad_broker::reply(&stream, Status::Attached, port, None) {
-        tracing::warn!(error = %format!("{error:#}"), account, port, "seat USB attach not answered");
+    let attached = usbip::import_handshake(&mut client, PAD_SERVER_WAIT)
+        .and_then(|(devid, speed)| vhci::attach(account, client.as_fd(), devid, speed));
+    let port = match attached {
+        Ok(Some(port)) => port,
+        failed => {
+            let status = match failed {
+                Ok(_) => Status::Capacity,
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), account, pad = label, "seat USB device not attached");
+                    Status::Failed
+                }
+            };
+            answer(&stream, account, status);
+            let _ = server.kill();
+            let _ = server.wait();
+            return;
+        }
+    };
+    if let Err(error) = pad_broker::reply(&stream, Status::Served, port, Some(relay.as_fd())) {
+        tracing::warn!(error = %format!("{error:#}"), account, port, "seat USB device not handed over");
     }
-    drop(stream);
-    tracing::info!(account, port, "seat USB device attached");
-    let recorded = sock.as_raw_fd();
-    pad_broker::keep_usb(port, recorded, sock.as_fd());
-    vhci::watch(port, recorded, sock);
+    drop((stream, relay));
+    tracing::info!(account, port, pad = label, "seat USB device served");
+    let recorded = client.as_raw_fd();
+    pad_broker::keep_usb(port, recorded, client.as_fd());
+    vhci::watch(port, recorded, OwnedFd::from(client));
+    // The pad server ends with the connection; reap it.
+    let _ = server.wait();
     tracing::info!(account, port, "seat USB device gone");
+}
+
+/// Starts `hello`'s pad server in a transient scope, so a supervisor restart leaves it running:
+/// `(the socket vhci_hcd takes, the relay's seat end, the server)`. The server reads `hello`
+/// first off its relay end, which the seat never sees.
+fn start_pad_server(account: &str, hello: &Hello) -> anyhow::Result<(TcpStream, OwnedFd, Child)> {
+    let (client, served) = usbip::loopback_pair()?;
+    let (theirs, seat) = pad_broker::relay_pair()?;
+    let seat = UnixDatagram::from(seat);
+    seat.send(&hello.encode())
+        .context("hand the pad server its hello")?;
+    let seat = OwnedFd::from(seat);
+    let port = served.local_addr().context("pad server address")?.port();
+    let exe = std::env::current_exe().context("find this binary")?;
+    let server = Command::new("systemd-run")
+        .args(["--scope", "--quiet", "--collect"])
+        .arg(format!("--unit=punktfunk-seat-usb-{account}-{port}"))
+        .arg("--")
+        .arg(exe)
+        .arg("serve-usb")
+        .stdin(Stdio::from(OwnedFd::from(served)))
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .spawn()
+        .context("start systemd-run")?;
+    Ok((client, seat, server))
+}
+
+/// `serve-usb`: a seat's pad server, as [`start_pad_server`] starts it. Stdin is the socket
+/// `vhci_hcd` talks to, stdout the pad's relay; it serves until either hangs up.
+pub fn serve_usb_device() -> Result<(), String> {
+    let take = |fd: std::os::fd::BorrowedFd<'_>, what: &str| {
+        fd.try_clone_to_owned()
+            .map_err(|e| format!("take the {what}: {e}"))
+    };
+    let sock = take(std::io::stdin().as_fd(), "host's socket")?;
+    let relay = take(std::io::stdout().as_fd(), "pad's relay")?;
+    usbip::serve(TcpStream::from(sock), UnixDatagram::from(relay)).map_err(|e| format!("{e:#}"))
 }
 
 #[cfg(test)]
@@ -356,15 +470,15 @@ mod tests {
     fn a_seat_holds_at_most_the_cap_and_gets_slots_back() {
         let mut held = HashMap::new();
         for _ in 0..MAX_PER_SEAT {
-            assert!(admit(&mut held, "pf-seat-1"));
+            assert!(admit(&mut held, "pf-seat-1", MAX_PER_SEAT));
         }
-        assert!(!admit(&mut held, "pf-seat-1"), "one too many");
+        assert!(!admit(&mut held, "pf-seat-1", MAX_PER_SEAT), "one too many");
         assert!(
-            admit(&mut held, "pf-seat-2"),
+            admit(&mut held, "pf-seat-2", MAX_PER_SEAT),
             "another seat has its own cap"
         );
         release(&mut held, "pf-seat-1");
-        assert!(admit(&mut held, "pf-seat-1"));
+        assert!(admit(&mut held, "pf-seat-1", MAX_PER_SEAT));
         for _ in 0..=MAX_PER_SEAT {
             release(&mut held, "pf-seat-1");
         }

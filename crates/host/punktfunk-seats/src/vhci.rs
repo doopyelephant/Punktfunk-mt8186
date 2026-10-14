@@ -1,13 +1,13 @@
-//! A seat's USB/IP pads (`design/seat-pad-broker.md` §1.2). The seat runs its own usbip server
-//! and import handshake; the supervisor attaches the connected socket to a vhci port, records
+//! A seat's USB/IP pads (`design/seat-pad-broker.md` §1.2). A pad server the supervisor starts
+//! serves the device; the supervisor attaches its connected socket to a vhci port, records
 //! whose the port is, and udev's fence ([`fence`]) maps every node under it to that seat.
 //!
-//! [`MAP`] holds one file per port a seat attached: `<account> <sockfd>`, the socket number
-//! `attach` took, as vhci's `status` shows it. A row whose port is free or holds another socket
-//! is stale. While the supervisor runs, a new vhci interface starts unauthorized: the fence
+//! [`MAP`] holds one file per seat's port: `<account> <sockfd>`, the socket number `attach`
+//! took, as vhci's `status` shows it. A row whose port is free or holds another socket is
+//! stale. While the supervisor runs, a new vhci interface starts unauthorized: the fence
 //! authorizes a seat's only when [`interface_allowed`] takes what the kernel parsed.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use pf_inject::usbip;
 use rustix::event::{poll, PollFd, PollFlags};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -113,22 +113,15 @@ pub fn watch(port: u16, recorded: RawFd, sock: OwnedFd) {
     pf_inject::pad_broker::forget_usb(port, recorded);
 }
 
-/// Detach `port` for `account`, while it still holds the socket its row names. A port no seat
-/// attached, or another seat's, is refused.
-pub fn detach(account: &str, port: u16) -> Result<()> {
+/// Detaches `port` while it still holds socket `recorded`: a device an older supervisor
+/// attached for a seat that served it itself. Its row goes at the next prune.
+pub fn drop_unserved(port: u16, recorded: RawFd) {
     let _held = lock();
-    let dir = Path::new(MAP);
-    let Some((owner, fd)) = read_row(dir, port) else {
-        bail!("port {port} is not a seat's");
-    };
-    if owner != account {
-        bail!("port {port} is another seat's");
+    if usbip::vhci_port_holds(port, recorded)
+        && let Err(error) = usbip::vhci_detach(port)
+    {
+        tracing::warn!(error = %format!("{error:#}"), port, "seat USB device not detached");
     }
-    let _ = std::fs::remove_file(dir.join(port.to_string()));
-    if usbip::vhci_port_holds(port, fd) {
-        usbip::vhci_detach(port)?;
-    }
-    Ok(())
 }
 
 /// udev's program for a device under a vhci hub; `false` when `devpath` is not one. Prints the
@@ -293,6 +286,36 @@ fn held_in(dir: &Path, account: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every device a seat's pad server serves passes the gate, interface by interface.
+    #[test]
+    fn every_served_device_passes_the_gate() {
+        use pf_inject::usbip_relay::{served, Hello, Outputs, UsbKind};
+        let (relay, _pad) = pf_inject::pad_broker::relay_pair().unwrap();
+        for kind in UsbKind::ALL {
+            let hello = Hello {
+                kind,
+                index: 0,
+                slot: 0,
+                identity: Vec::new(),
+            };
+            let dev = served(&hello, Outputs::new(&relay).unwrap())
+                .unwrap()
+                .device;
+            for (n, i) in dev.interfaces.iter().enumerate() {
+                assert!(
+                    interface_allowed(
+                        dev.vendor_id,
+                        dev.product_id,
+                        i.interface_class,
+                        i.interface_subclass,
+                        i.interface_protocol
+                    ),
+                    "{kind:?} interface {n}"
+                );
+            }
+        }
+    }
 
     /// The gate: a listed device, and an interface class no NIC or disk driver takes.
     #[test]

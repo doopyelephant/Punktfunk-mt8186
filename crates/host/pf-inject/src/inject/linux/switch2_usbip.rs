@@ -6,15 +6,16 @@
 //! Switch Pro identity without `vhci_hcd` ([`available`]). The codec is
 //! [`super::switch2_proto`]; attach is [`super::usbip::attach_device`].
 //!
-//! Each interrupt-IN poll serves the latest state with a fresh sequence byte and µs clock.
+//! Each interrupt-IN poll serves the latest report with a fresh sequence byte and µs clock.
 //! bInterval 4 on an absolute deadline paces the polls at the 250 Hz SDL calibrates its sensor
 //! clock against; relative sleeps drift to about 5 ms and SDL then misreads the gyro scale.
 
 use super::switch2_proto::{
-    bulk_reply, parse_rumble, rdesc, serial, Command, Model, Switch2State, REPORT_INTERVAL_MS,
-    VENDOR,
+    bulk_reply, parse_rumble, rdesc, serial, stamp, Command, Model, Switch2State, INPUT_REPORT_ID,
+    REPORT_INTERVAL_MS, REPORT_LEN, VENDOR,
 };
 use super::usbip::{attach_device, boxed, ep, hid_class_descriptor, UsbipAttachment};
+use super::usbip_relay::{Hello, Incoming, Output, Outputs, Served, UsbKind};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -27,6 +28,11 @@ use usbip_sim::{
     Direction, SetupPacket, UsbDevice, UsbEndpoint, UsbInterface, UsbInterfaceHandler, UsbSpeed,
     Version,
 };
+
+/// The HID interface: the only one that takes input reports.
+const HID: u8 = 0;
+/// The vendor interface's bulk command channel.
+const BULK: u8 = 1;
 
 /// Whether this host can attach a USB/IP device at all. The Switch 2 pads' only gate.
 pub fn available() -> bool {
@@ -45,19 +51,11 @@ pub struct Switch2Feedback {
 #[derive(Debug)]
 struct HidHandler {
     model: Model,
-    /// Shared with [`Switch2Usbip::write_state`].
-    state: Arc<Mutex<Switch2State>>,
-    feedback: Arc<Mutex<Switch2Feedback>>,
+    /// The pad's latest report, stamped per poll.
+    report: Arc<Mutex<[u8; REPORT_LEN]>>,
+    out: Outputs,
     seq: u8,
     epoch: Instant,
-}
-
-impl HidHandler {
-    fn rumble(&self, report: &[u8]) {
-        if let Some(r) = parse_rumble(self.model, report) {
-            self.feedback.lock().rumble = Some(r);
-        }
-    }
 }
 
 impl UsbInterfaceHandler for HidHandler {
@@ -77,14 +75,8 @@ impl UsbInterfaceHandler for HidHandler {
         if ep.is_ep0() {
             return Ok(match (setup.request_type, setup.request) {
                 (0x81, 0x06) if (setup.value >> 8) == 0x22 => rdesc(self.model).to_vec(),
-                // SET_REPORT (output): EP0 payload may omit the id.
                 (0x21, 0x09) => {
-                    let id = (setup.value & 0xFF) as u8;
-                    if req.first() == Some(&id) {
-                        self.rumble(req);
-                    } else {
-                        self.rumble(&[&[id][..], req].concat());
-                    }
+                    self.out.report(HID, Some(setup.value), req);
                     vec![]
                 }
                 _ => vec![], // SET_IDLE / SET_PROTOCOL
@@ -93,9 +85,11 @@ impl UsbInterfaceHandler for HidHandler {
         if let Direction::In = ep.direction() {
             self.seq = self.seq.wrapping_add(1);
             let clock = self.epoch.elapsed().as_micros() as u32;
-            Ok(self.state.lock().report(self.seq, clock).to_vec())
+            let mut r = *self.report.lock();
+            stamp(&mut r, self.seq, clock);
+            Ok(r.to_vec())
         } else {
-            self.rumble(req);
+            self.out.report(HID, None, req);
             Ok(vec![])
         }
     }
@@ -110,7 +104,7 @@ impl UsbInterfaceHandler for HidHandler {
 struct BulkHandler {
     model: Model,
     index: u8,
-    feedback: Arc<Mutex<Switch2Feedback>>,
+    out: Outputs,
     pending: VecDeque<u8>,
 }
 
@@ -135,14 +129,12 @@ impl UsbInterfaceHandler for BulkHandler {
             let n = (len as usize).min(64).min(self.pending.len());
             return Ok(self.pending.drain(..n).collect());
         }
-        if let Some((reply, what)) = bulk_reply(self.model, self.index, req) {
+        if let Some((reply, _)) = bulk_reply(self.model, self.index, req) {
             // A reply the host never read is stale once it sends the next command.
             self.pending.clear();
             self.pending.extend(reply);
-            if let Command::PlayerLeds(bits) = what {
-                self.feedback.lock().leds = Some(bits);
-            }
         }
+        self.out.report(BULK, None, req);
         Ok(vec![])
     }
 
@@ -154,8 +146,8 @@ impl UsbInterfaceHandler for BulkHandler {
 fn build_device(
     model: Model,
     index: u8,
-    state: &Arc<Mutex<Switch2State>>,
-    feedback: &Arc<Mutex<Switch2Feedback>>,
+    report: &Arc<Mutex<[u8; REPORT_LEN]>>,
+    out: Outputs,
 ) -> UsbDevice {
     let mut dev = UsbDevice::new(0);
     dev.vendor_id = VENDOR;
@@ -181,8 +173,8 @@ fn build_device(
         ],
         boxed(HidHandler {
             model,
-            state: state.clone(),
-            feedback: feedback.clone(),
+            report: report.clone(),
+            out: out.clone(),
             seq: 0,
             epoch: Instant::now(),
         }),
@@ -196,41 +188,98 @@ fn build_device(
         boxed(BulkHandler {
             model,
             index,
-            feedback: feedback.clone(),
+            out,
             pending: VecDeque::new(),
         }),
     )
 }
 
+/// The server's half: the device, and the pad's report `0x05` into interface 0 only.
+pub(crate) fn served(model: Model, index: u8, out: Outputs) -> Served {
+    let report = Arc::new(Mutex::new(Switch2State::neutral().report(0, 0)));
+    let device = build_device(model, index, &report, out);
+    Served {
+        device,
+        input: Box::new(move |message| {
+            if let Incoming::Input {
+                iface: HID,
+                report: r,
+            } = message
+            {
+                if let Ok(r) = <[u8; REPORT_LEN]>::try_from(r) {
+                    if r[0] == INPUT_REPORT_ID {
+                        *report.lock() = r;
+                    }
+                }
+            }
+        }),
+    }
+}
+
+/// What the host wrote, parsed: the last rumble, the last player lights.
+fn feedback(model: Model, index: u8, outputs: Vec<Output>) -> Switch2Feedback {
+    let mut fb = Switch2Feedback::default();
+    for output in outputs {
+        let Output::Report { iface, set, data } = output else {
+            continue;
+        };
+        match (iface, set) {
+            // SET_REPORT (output): the EP0 payload may omit the id.
+            (HID, Some(value)) => {
+                let id = (value & 0xFF) as u8;
+                let framed = if data.first() == Some(&id) {
+                    data
+                } else {
+                    [&[id][..], &data].concat()
+                };
+                fb.rumble = parse_rumble(model, &framed).or(fb.rumble);
+            }
+            (HID, None) => fb.rumble = parse_rumble(model, &data).or(fb.rumble),
+            (BULK, None) => {
+                if let Some((_, Command::PlayerLeds(bits))) = bulk_reply(model, index, &data) {
+                    fb.leds = Some(bits);
+                }
+            }
+            _ => {}
+        }
+    }
+    fb
+}
+
 /// One attached pad. Drop detaches the `vhci_hcd` port and stops the emulation server.
 pub struct Switch2Usbip {
-    state: Arc<Mutex<Switch2State>>,
-    feedback: Arc<Mutex<Switch2Feedback>>,
-    _attach: UsbipAttachment,
+    model: Model,
+    index: u8,
+    attach: UsbipAttachment,
 }
 
 impl Switch2Usbip {
     pub fn open(model: Model, index: u8) -> Result<Switch2Usbip> {
-        let state = Arc::new(Mutex::new(Switch2State::neutral()));
-        let feedback = Arc::new(Mutex::new(Switch2Feedback::default()));
-        let attach = attach_device(
-            || build_device(model, index, &state, &feedback),
-            &format!("virtual {} {index}", model.name()),
-        )?;
+        let kind = match model {
+            Model::Pro => UsbKind::Switch2Pro,
+            Model::GameCube => UsbKind::Switch2GameCube,
+        };
+        let hello = Hello {
+            kind,
+            index,
+            slot: 0,
+            identity: Vec::new(),
+        };
+        let attach = attach_device(hello, None, &format!("virtual {} {index}", model.name()))?;
         Ok(Switch2Usbip {
-            state,
-            feedback,
-            _attach: attach,
+            model,
+            index,
+            attach,
         })
     }
 
     /// The next interrupt-IN poll serves `st`.
     pub fn write_state(&self, st: &Switch2State) {
-        *self.state.lock() = *st;
+        self.attach.input(HID, &st.report(0, 0));
     }
 
     pub fn service(&self) -> Switch2Feedback {
-        std::mem::take(&mut *self.feedback.lock())
+        feedback(self.model, self.index, self.attach.outputs())
     }
 }
 
@@ -245,6 +294,11 @@ impl PadProto for Switch2Proto {
     const LABEL: &'static str = "Switch 2";
     const DEVICE: &'static str = "Switch 2 controller";
     const CREATE_HINT: &'static str = " (load vhci_hcd: modprobe vhci_hcd)";
+
+    /// `false` once the pad's server is gone.
+    fn alive(&self, pad: &Switch2Usbip) -> bool {
+        pad.attach.alive()
+    }
 
     fn open(&mut self, idx: u8) -> Result<Switch2Usbip> {
         let pad = Switch2Usbip::open(self.model, idx)?;
@@ -301,9 +355,7 @@ mod tests {
     /// at 4 ms.
     #[test]
     fn device_has_the_layout_sdl_claims() {
-        let state = Arc::new(Mutex::new(Switch2State::neutral()));
-        let feedback = Arc::new(Mutex::new(Switch2Feedback::default()));
-        let dev = build_device(Model::Pro, 2, &state, &feedback);
+        let dev = served(Model::Pro, 2, crate::usbip_relay::test_relay().0).device;
         assert_eq!((dev.vendor_id, dev.product_id), (0x057E, 0x2069));
         assert_eq!(dev.interfaces.len(), 2);
         let eps = |i: usize| -> Vec<(u8, u8, u8)> {
@@ -322,10 +374,8 @@ mod tests {
     /// A seat's vhci port binds only listed devices.
     #[test]
     fn every_model_is_a_listed_device() {
-        let state = Arc::new(Mutex::new(Switch2State::neutral()));
-        let feedback = Arc::new(Mutex::new(Switch2Feedback::default()));
         for model in [Model::Pro, Model::GameCube] {
-            let dev = build_device(model, 0, &state, &feedback);
+            let dev = served(model, 0, crate::usbip_relay::test_relay().0).device;
             assert!(crate::usbip::EMULATED.contains(&(dev.vendor_id, dev.product_id)));
         }
     }

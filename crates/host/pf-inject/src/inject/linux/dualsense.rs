@@ -169,11 +169,11 @@ impl Default for DsLinuxProto {
 }
 
 impl DsTransport {
-    /// `false` once a uhid pad's relay to the seat supervisor ended.
+    /// `false` once a uhid pad's relay to the seat supervisor ended, or a usbip pad's server.
     fn alive(&self) -> bool {
         match self {
             DsTransport::Uhid(pad) => pad.dev.alive(),
-            DsTransport::Usbip(_) => true,
+            DsTransport::Usbip(pad) => pad.alive(),
         }
     }
 }

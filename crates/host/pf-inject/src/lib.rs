@@ -942,6 +942,11 @@ mod uinput_abi;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/usbip.rs"]
 pub mod usbip;
+/// The relay between a USB/IP pad and its server, and the devices a server builds from this
+/// crate's tables: the one place a seat's USB device is defined.
+#[cfg(target_os = "linux")]
+#[path = "inject/linux/usbip_relay.rs"]
+pub mod usbip_relay;
 /// Byte-level tracing of the USB/IP socket (`PUNKTFUNK_USBIP_TRACE`). A framing bug in that
 /// stream is only visible as damage the kernel notices later, so the wire itself has to be
 /// recoverable.
