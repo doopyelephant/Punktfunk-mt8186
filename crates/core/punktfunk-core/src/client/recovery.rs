@@ -39,10 +39,9 @@ pub(crate) fn ahead_of(a: u32, b: u32) -> bool {
     a != b && a.wrapping_sub(b) < u32::MAX / 2
 }
 
-/// Where one AU's `frame_index` falls in receive order, from
-/// [`NativeClient::observe_frame_index`](super::NativeClient::observe_frame_index).
+/// Where one AU's `frame_index` falls in receive order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameOrder {
+pub(crate) enum FrameOrder {
     /// The first index seen, or the expected next one.
     InOrder,
     /// A forward jump over this many lost frames.

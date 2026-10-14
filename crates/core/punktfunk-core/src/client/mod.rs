@@ -70,8 +70,10 @@ use self::frame_channel::{DecodeLatAcc, FrameChannel, FramePop};
 use self::planes::{PlaneRx, RawRumble};
 use self::probe::ProbeState;
 use self::pump::run_pump;
-pub use self::recovery::{Arrival, Decoded, FrameOrder, Shown};
-use self::recovery::{RecentRfis, RecoveryAsk, RecoveryDriver, RecoveryEvent, ShortFrames};
+pub use self::recovery::{Arrival, Decoded, Shown};
+use self::recovery::{
+    FrameOrder, RecentRfis, RecoveryAsk, RecoveryDriver, RecoveryEvent, ShortFrames,
+};
 pub use self::sc2::{Sc2Gate, SC2_GATE_CHORDS, SC2_GATE_MASKED, SC2_GATE_SYSTEM_LOCAL};
 use self::worker::{ClientShared, WorkerArgs};
 
@@ -853,18 +855,13 @@ impl NativeClient {
         send_rfi(&self.shared, first_frame, last_frame)
     }
 
-    /// Feed each received AU's `frame_index` (receive order). A forward gap fires a throttled
-    /// [`request_rfi`](Self::request_rfi) for `[first_missing, frame_index-1]`, less frames the
-    /// pump already asked for when their tail arrived short. Call every frame;
-    /// [`frames_dropped`](Self::frames_dropped) + [`request_keyframe`](Self::request_keyframe)
-    /// stays the backstop when the recovery frame is lost.
-    ///
-    /// Reports a gap even when the RFI was throttled, so a freeze can re-arm and pre-credit
-    /// the later `frames_dropped` climb ([`crate::reanchor::ReanchorGate::arm_expecting_drops`]).
-    /// Without the credit a fast LTR-RFI lift is re-frozen by the stale climb. A
-    /// [`FrameOrder::Straggler`] sits behind a frame already seen; feeding it to a reference
-    /// decoder rewinds the DPB.
-    pub fn observe_frame_index(&self, frame_index: u32) -> FrameOrder {
+    /// For a lane that keeps no freeze (an all-intra decoder, a recorder): feed each received
+    /// AU's `frame_index` in receive order. A forward gap fires a throttled
+    /// [`request_rfi`](Self::request_rfi) for the lost range, less frames the pump asked for
+    /// at their tail, and returns its width; `0` in order and for a straggler. It never arms
+    /// the freeze, so the pump's tick asks for nothing on this lane. A decoder that holds a
+    /// picture reports through [`recovery_on_frame`](Self::recovery_on_frame) instead.
+    pub fn note_frame_index(&self, frame_index: u32) -> u32 {
         // Update under the lock; fire the request after releasing it.
         let (order, ask) = self
             .shared
@@ -873,7 +870,10 @@ impl NativeClient {
             .unwrap()
             .observe(frame_index, Instant::now());
         send_recovery(&self.shared, ask);
-        order
+        match order {
+            FrameOrder::Gap(gap) => gap,
+            FrameOrder::InOrder | FrameOrder::Straggler => 0,
+        }
     }
 
     /// One AU before decode, in receive order. `false`: drop it — a straggler a reference
@@ -953,14 +953,6 @@ impl NativeClient {
         };
         send_recovery(&self.shared, step.ask);
         step
-    }
-
-    /// [`observe_frame_index`](Self::observe_frame_index) as the gap width, `0` when none.
-    pub fn note_frame_index(&self, frame_index: u32) -> u32 {
-        match self.observe_frame_index(frame_index) {
-            FrameOrder::Gap(gap) => gap,
-            FrameOrder::InOrder | FrameOrder::Straggler => 0,
-        }
     }
 
     /// Unrecoverable AUs (FEC failed). Poll and [`request_keyframe`](Self::request_keyframe)
