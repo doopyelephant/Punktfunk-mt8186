@@ -730,8 +730,8 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
     let min_fec = parse_u("x-nv-vqos[0].fec.minRequiredFecPackets")
         .unwrap_or(2)
         .min(16) as u8;
-    // Slice count: 1 for hardware decoders, 4 for software. Honor as the
-    // encoder ceiling — multi-slice AUs wedge TV SoCs that asked for 1.
+    // Slice count: 1 for hardware decoders, 4 for software. Encoded as asked —
+    // multi-slice AUs wedge TV SoCs that asked for 1.
     // Absent or out of range (pre-auth) → 1.
     let slices = parse_u("x-nv-video[0].videoEncoderSlicesPerFrame")
         .filter(|n| (1..=32).contains(n))

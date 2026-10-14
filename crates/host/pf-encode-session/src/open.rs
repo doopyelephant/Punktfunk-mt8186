@@ -80,6 +80,7 @@ pub fn hdr_meta(bytes: &[u8; 28]) -> Option<HdrMeta> {
 /// The request's `open` spec for backend `backend` of its list. The input comes from
 /// [`InputKind::choose`], so a 4:4:4 session gets an input that carries it (or a backend whose
 /// own caps already say 4:2:0) — never a P010 pick under a reply promising full chroma.
+/// The slice count passes through as the client asked.
 pub fn spec_for(req: &SetEncodeRequest, backend: u32, knob: Knob<'_>) -> Result<OpenSpec, Fail> {
     let (hdr, chroma444) = (req.hdr == 1, req.chroma == 1);
     // 10-bit SDR (depth 10, HDR off) picks a BT.709 P010 input on AMF; `choose` ignores it elsewhere.
@@ -114,6 +115,7 @@ pub fn spec_for(req: &SetEncodeRequest, backend: u32, knob: Knob<'_>) -> Result<
         } else {
             ChromaFormat::Yuv420
         },
+        slices: req.slices,
     })
 }
 
@@ -190,6 +192,9 @@ pub struct OpenSpec {
     pub bitrate_bps: u64,
     pub bit_depth: u8,
     pub chroma: ChromaFormat,
+    /// H.264/HEVC slices per frame the client takes; `0` and `1` are single-slice. Only NVENC
+    /// slices.
+    pub slices: u32,
 }
 
 /// The wire codec numbering (1 H264, 2 HEVC, 3 AV1, 4 PyroWave).
@@ -230,7 +235,16 @@ pub fn open_backend(
     let opened: anyhow::Result<Box<dyn Encoder>> = match spec.backend {
         #[cfg(feature = "nvenc")]
         backend::NVENC => pf_encode_win::nvenc::NvencD3d11Encoder::open(
-            spec.codec, format, w, h, fps, bps, depth, chroma, 1, luid,
+            spec.codec,
+            format,
+            w,
+            h,
+            fps,
+            bps,
+            depth,
+            chroma,
+            spec.slices,
+            luid,
         )
         .and_then(|mut e| {
             // The drive loop parks on handles, so the session opens async and hands its
@@ -303,4 +317,28 @@ pub fn qpc_frequency() -> u64 {
 
 pub fn qpc_to_ns(qpc: u64, hz: u64) -> u64 {
     (u128::from(qpc) * 1_000_000_000 / u128::from(hz)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::Zeroable;
+
+    /// The request's slice count reaches the spec the backend opens with.
+    #[test]
+    fn the_spec_takes_the_request_slices() {
+        for slices in [0, 1, 8] {
+            let req = SetEncodeRequest {
+                codec: wire::codec::HEVC,
+                bit_depth: 8,
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                slices,
+                ..SetEncodeRequest::zeroed()
+            };
+            let spec = spec_for(&req, backend::NVENC, &|_| None).expect("an NVENC spec");
+            assert_eq!(spec.slices, slices);
+        }
+    }
 }

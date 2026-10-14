@@ -322,9 +322,9 @@ impl NvencD3d11Encoder {
         bitrate_bps: u64,
         bit_depth: u8,
         chroma: ChromaFormat,
-        // Client-decoder slice ceiling (`VIDEO_CAP_MULTI_SLICE` / GameStream slices-per-frame).
-        // 1 = single-slice — the safe shape toward decoders that never asked (some SoCs wedge).
-        max_slices: u32,
+        // Slices per frame the client takes. 1 = single-slice — the safe shape toward decoders
+        // that never asked (some SoCs wedge). `PUNKTFUNK_NVENC_SLICES` overrides it.
+        slices: u32,
         // Selected render adapter (`None` = OS default). Only the probe/cache keys read it;
         // the session device comes from the first submitted frame.
         adapter_luid: Option<LUID>,
@@ -334,7 +334,7 @@ impl NvencD3d11Encoder {
         let api = try_api().map_err(|e| anyhow!("NVENC unavailable: {e}"))?;
         // 4:4:4 is HEVC-only; the GPU-support gate is in the caps probe.
         let want_444 = chroma.is_444() && codec == Codec::H265;
-        let mut s = NvSession::new(api, codec, width, height, fps, bitrate_bps, max_slices);
+        let mut s = NvSession::new(api, codec, width, height, fps, bitrate_bps, slices);
         s.buffer_fmt = buffer_format(format);
         s.bit_depth = bit_depth;
         // Effective from the open, not from the first frame: callers read `caps()` to

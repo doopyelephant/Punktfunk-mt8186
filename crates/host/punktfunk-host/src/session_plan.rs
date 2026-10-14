@@ -121,19 +121,25 @@ pub struct SessionPlan {
     /// wide colour), so a 10-bit SDR session takes real 10-bit pixels under BT.709 instead of
     /// widening an 8-bit capture. Set only via [`sdr10_native_for`]; `false` everywhere else.
     pub sdr10_native: bool,
-    /// Encoder slice-count ceiling from [`VIDEO_CAP_MULTI_SLICE`](punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE):
-    /// 32 when the bit is set (backend default; no client-side cap), 1 when not
-    /// (single-slice frames for TV-SoC decoders). Applied to every encoder this
-    /// plan opens so slicing cannot change shape across a rebuild.
-    pub max_slices: u32,
+    /// H.264/HEVC slices per frame the client takes: GameStream's `videoEncoderSlicesPerFrame`,
+    /// [`DEFAULT_SLICES`] toward a native
+    /// [`VIDEO_CAP_MULTI_SLICE`](punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE) client, else 1
+    /// (TV-SoC decoders wedge on multi-slice frames). Applied to every encoder this plan opens
+    /// so slicing cannot change shape across a rebuild.
+    pub slices: u32,
     /// A joiner's own view and fit: the encoder frames the owner's picture for it. `None`
     /// streams the source as captured, or a mirrored head fitted to the negotiated size.
     pub reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
 }
 
+/// Slices per frame toward a client that takes multi-slice frames but names no count: the
+/// native handshake carries one bit. GameStream names its own.
+pub const DEFAULT_SLICES: u32 = 4;
+
 impl SessionPlan {
     /// `hdr` is the handshake verdict, not derived from depth: 10-bit SDR exists. PyroWave's
     /// bits per pixel start at the host's; a caller that knows the client's sets them.
+    /// `slices` is the client's count, [`Self::slices`].
     #[allow(clippy::too_many_arguments)]
     pub fn resolve(
         bit_depth: u8,
@@ -142,7 +148,7 @@ impl SessionPlan {
         codec: crate::encode::Codec,
         cursor_blend: bool,
         cursor_forward: bool,
-        multi_slice: bool,
+        slices: u32,
     ) -> Self {
         let capture = CaptureBackend::resolve();
         SessionPlan {
@@ -160,7 +166,7 @@ impl SessionPlan {
             // Callers that know the compositor overwrite these; default off for everyone else.
             gamescope_cursor: false,
             sdr10_native: false,
-            max_slices: if multi_slice { 32 } else { 1 },
+            slices,
             reframe_to: None,
         }
     }
@@ -460,19 +466,21 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use pf_vdisplay::Compositor;
 
+    /// The plan keeps the client's count: a GameStream ask above the native default survives.
     #[test]
-    fn resolve_limits_single_slice_clients() {
-        let plan = SessionPlan::resolve(
-            8,
-            false,
-            ChromaFormat::Yuv420,
-            Codec::H264,
-            false,
-            false,
-            false,
-        );
-
-        assert_eq!(plan.max_slices, 1);
+    fn resolve_keeps_the_client_slice_count() {
+        for slices in [1, DEFAULT_SLICES, 8] {
+            let plan = SessionPlan::resolve(
+                8,
+                false,
+                ChromaFormat::Yuv420,
+                Codec::H264,
+                false,
+                false,
+                slices,
+            );
+            assert_eq!(plan.slices, slices);
+        }
     }
 
     #[cfg(target_os = "linux")]

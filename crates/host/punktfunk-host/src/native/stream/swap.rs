@@ -442,7 +442,7 @@ mod tests {
                 cursor_forward: false,
                 gamescope_cursor: false,
                 sdr10_native: false,
-                max_slices: 1,
+                slices: 1,
                 reframe_to: None,
             },
             life: life.clone(),

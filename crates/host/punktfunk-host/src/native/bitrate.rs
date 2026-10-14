@@ -602,7 +602,7 @@ mod tests {
             Codec::PyroWave,
             false,
             false,
-            true,
+            crate::session_plan::DEFAULT_SLICES,
         );
         plan.pyrowave_bpp = session_pyrowave_bpp(100);
         let uhd = punktfunk_core::config::Mode {
@@ -736,7 +736,7 @@ mod tests {
             Codec::PyroWave,
             false,
             false,
-            true,
+            crate::session_plan::DEFAULT_SLICES,
         );
         plan.pyrowave_bpp = host;
         let at = |running| pyrowave_mode_kbps(running, &fhd, &plan);

@@ -573,11 +573,11 @@ impl NvencCudaEncoder {
         hdr: bool,
         chroma: ChromaFormat,
         cursor_blend: bool,
-        max_slices: u32,
+        slices: u32,
     ) -> Result<Self> {
         // Fail here, not as an opaque session error on the first frame.
         let api = try_api().map_err(|e| anyhow!("NVENC (Linux direct) unavailable: {e}"))?;
-        let mut s = NvSession::new(api, codec, width, height, fps, bitrate_bps, max_slices);
+        let mut s = NvSession::new(api, codec, width, height, fps, bitrate_bps, slices);
         // Provisional until the first frame names the real input (`ensure_session` sets both).
         s.bit_depth = bit_depth;
         // HEVC-only; confirmed against frame layout + GPU at init.

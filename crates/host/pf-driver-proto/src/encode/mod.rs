@@ -110,8 +110,9 @@ pub struct SetEncodeRequest {
     pub backends: [u32; 4],
     /// `SET_ENCODE_FLAG_*` bits; unknown bits are ignored.
     pub flags: u32,
-    /// Pads the prefix to its 8-byte alignment (Pod forbids implicit tail padding).
-    pub _pad_tail: u32,
+    /// H.264/HEVC slices per frame the client takes. A host that leaves it zero gets
+    /// single-slice, which is also all a driver older than the field encodes.
+    pub slices: u32,
     /// Encoder knobs from the host's `host.env`. Prefix-compatible after
     /// [`SET_ENCODE_REQUEST_LEGACY_SIZE`]: an old host sends none and the driver zero-fills,
     /// which is every backend's default; an old driver reads the prefix and ignores them.
@@ -776,7 +777,7 @@ mod tests {
 
         println!(
             "SetEncodeRequest {} bytes: target_id@{} section@{} event@{} hdr_meta@{} \
-             backends@{} flags@{}",
+             backends@{} flags@{} slices@{}",
             size_of::<SetEncodeRequest>(),
             offset_of!(SetEncodeRequest, target_id),
             offset_of!(SetEncodeRequest, section),
@@ -784,6 +785,7 @@ mod tests {
             offset_of!(SetEncodeRequest, hdr_meta),
             offset_of!(SetEncodeRequest, backends),
             offset_of!(SetEncodeRequest, flags),
+            offset_of!(SetEncodeRequest, slices),
         );
         assert_eq!(size_of::<SetEncodeRequest>(), 144);
         assert_eq!(
@@ -796,6 +798,8 @@ mod tests {
         assert_eq!(offset_of!(SetEncodeRequest, hdr_meta), 60);
         assert_eq!(offset_of!(SetEncodeRequest, backends), 96);
         assert_eq!(offset_of!(SetEncodeRequest, flags), 112);
+        // The old tail pad: a host that predates `slices` sends zero here.
+        assert_eq!(offset_of!(SetEncodeRequest, slices), 116);
         // The HDR blob is exactly `pf_frame::HdrMeta`, which the driver copies through untouched.
         assert_eq!(size_of::<[u8; 28]>(), 28);
     }

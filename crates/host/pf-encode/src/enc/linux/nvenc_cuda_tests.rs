@@ -2343,7 +2343,7 @@ fn nvenc_cuda_chunked_poll_end_to_end() {
     assert!(!au.data.is_empty());
 }
 
-/// Hardware: client `max_slices=1` must encode single-slice with chunked poll disarmed.
+/// Hardware: client `slices=1` must encode single-slice with chunked poll disarmed.
 /// No env knobs. `--test-threads=1`.
 #[test]
 #[ignore = "requires an NVIDIA GPU + driver — run manually on the RTX box (.21)"]
