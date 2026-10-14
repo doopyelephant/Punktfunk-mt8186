@@ -95,6 +95,25 @@ enum LaunchedEntry {
     }
 }
 
+/// The values the views read for one session, each documented on its `SessionModel` property.
+/// `disconnect` assigns a fresh one, so the next session starts with no hold, hint or mute.
+struct SessionUI {
+    var phase: SessionPhase = .idle
+    var launchHold: LaunchHoldTarget?
+    var launchWindowWait = false
+    var launchDownload: HostDownload?
+    var streamedGame: RunningGame?
+    var hudLines: [PunktfunkConnection.HudLine] = []
+    var notices = SessionNotices()
+    var resizing = false
+    var mouseCaptured = false
+    var micMuted = false
+    var virtualPadShown = false
+    var clipboardEnabled = false
+    var isBackgrounded = false
+    var backgroundDeadline: Date?
+}
+
 /// How long the launch hold waits on a title the host still calls `launching`, or `running` without
 /// its window (a cold Steam boot with shader work runs to minutes), and on one the host never lists
 /// at all (the launch did not resolve; the host logs it and streams on).
@@ -108,7 +127,10 @@ private let demoLaunchHold: TimeInterval = 3
 final class SessionModel: ObservableObject {
     typealias Phase = SessionPhase
 
-    @Published private(set) var phase: Phase = .idle
+    /// What the views show for this session, one field per property below. `disconnect`
+    /// resets it whole.
+    @Published private var ui = SessionUI()
+    private(set) var phase: Phase { get { ui.phase } set { ui.phase = newValue } }
     @Published private(set) var connection: PunktfunkConnection? {
         didSet {
             #if os(macOS)
@@ -141,14 +163,14 @@ final class SessionModel: ObservableObject {
     /// Raised at `connect`, not at first frame: the shelf is still on screen at the tap, which is
     /// the only moment the cover has somewhere to fly FROM, and holding from there means one
     /// unbroken screen from the tap to the game rather than a stream of the launcher in between.
-    @Published private(set) var launchHold: LaunchHoldTarget?
+    private(set) var launchHold: LaunchHoldTarget? { get { ui.launchHold } set { ui.launchHold = newValue } }
     /// The console's own launch hold is up, as the console reports it: the console stays over
     /// the stream it dialled, and the stream takes no input, until the console lets go.
     @Published var consoleHold = false
     /// The launched game is up and the host is waiting for its window.
-    @Published private(set) var launchWindowWait = false
+    private(set) var launchWindowWait: Bool { get { ui.launchWindowWait } set { ui.launchWindowWait = newValue } }
     /// The launched title's files, while the host fetches them before it opens the stream.
-    @Published private(set) var launchDownload: HostDownload?
+    private(set) var launchDownload: HostDownload? { get { ui.launchDownload } set { ui.launchDownload = newValue } }
     private var launchWatch: Task<Void, Never>?
     /// Counts launches, so each hold is a view of its own — see `LaunchHoldTarget.seq`.
     private var launchSeq = 0
@@ -187,10 +209,10 @@ final class SessionModel: ObservableObject {
     @Published var errorMessage: String?
     /// The stats overlay's lines for the live tier and vocabulary: formatted by the core each
     /// second and on every tier change (`renderHud`).
-    @Published private(set) var hudLines: [PunktfunkConnection.HudLine] = []
+    private(set) var hudLines: [PunktfunkConnection.HudLine] { get { ui.hudLines } set { ui.hudLines = newValue } }
     /// Mirrors StreamView's capture state (it owns the input capture; this drives the
     /// HUD's "click to capture" / "⌘⎋ releases" hint).
-    @Published var mouseCaptured = false
+    var mouseCaptured: Bool { get { ui.mouseCaptured } set { ui.mouseCaptured = newValue } }
     /// The USER's in-stream mic mute (the HUD button, the Stream menu's ⌃⌥⇧A, the captured-state
     /// chord, the iOS mic disc) — session state, deliberately NOT persisted: a mute is for the
     /// people in the room right now, so every new session starts live if the mic is on at all.
@@ -198,15 +220,15 @@ final class SessionModel: ObservableObject {
     /// `applyMicMute` composes them — a user mute survives a trip through the background, and the
     /// background's privacy mute never clears the user's choice. Local and instant: it gates
     /// capture on this device, nothing is sent to the host.
-    @Published private(set) var micMuted = false
-    /// The stream's hints, notices and access chip. Reset whole in `disconnect`.
-    @Published private(set) var notices = SessionNotices()
+    private(set) var micMuted: Bool { get { ui.micMuted } set { ui.micMuted = newValue } }
+    /// The stream's hints, notices and access chip.
+    private(set) var notices: SessionNotices { get { ui.notices } set { ui.notices = newValue } }
     /// Resize overlay (design/midstream-resolution-resize.md — client resize UX): true from the
     /// instant a Match-window resize starts steering toward a new size until a frame at that size
     /// decodes (or a safety timeout). Drives the blur+spinner so the unavoidable host-rebuild delay
     /// reads as a deliberate, acknowledged transition instead of a stutter. Pure state lives in
     /// `ResizeIndicator`; this mirrors its `active` for SwiftUI.
-    @Published private(set) var resizing = false
+    private(set) var resizing: Bool { get { ui.resizing } set { ui.resizing = newValue } }
     /// START = follower steering (main actor), END = a new-mode IDR's coded dims (decode pump,
     /// hopped to main), TIMEOUT = safety net for a rejected/capped switch that never yields a
     /// differently-sized frame. Ticked from the 1 Hz stats timer.
@@ -267,7 +289,7 @@ final class SessionModel: ObservableObject {
     /// ring's `pad` slot, per session. While up it holds one wire pad, so the host sees one
     /// controller arrive and, on hide, one leave (§9). Never toggled by the ring's own open and
     /// close (§8 trap 4).
-    @Published private(set) var virtualPadShown = false
+    private(set) var virtualPadShown: Bool { get { ui.virtualPadShown } set { ui.virtualPadShown = newValue } }
     var virtualPad: VirtualPadWire? { resources.part() }
 
     /// Whether the pad's input can reach the host at all: the forwarding setting and the
@@ -300,7 +322,7 @@ final class SessionModel: ObservableObject {
     #endif
     /// Whether clipboard sync is live (host-acked `ClipState.enabled`) — drives the Stream menu
     /// item's title and the settings footnote. Always false on tvOS, which has no pasteboard.
-    @Published private(set) var clipboardEnabled = false
+    private(set) var clipboardEnabled: Bool { get { ui.clipboardEnabled } set { ui.clipboardEnabled = newValue } }
     /// The host's last `ClipState.reason` (`CLIP_REASON_*`) — why an enable was refused
     /// (backend unavailable / policy disabled / …); 0 = OK.
 
@@ -316,10 +338,10 @@ final class SessionModel: ObservableObject {
     /// True while a streaming session is running in the background under the opt-in keep-alive
     /// (audio plays, video dropped, timeout armed). Drives the Live Activity's stage/countdown (M3)
     /// and is cleared on foreground or teardown. iOS/iPadOS only in practice.
-    @Published private(set) var isBackgrounded = false
+    private(set) var isBackgrounded: Bool { get { ui.isBackgrounded } set { ui.isBackgrounded = newValue } }
     /// When the backgrounded keep-alive will auto-disconnect (nil unless backgrounded) — drives the
     /// Live Activity countdown. Set alongside the background timer.
-    @Published private(set) var backgroundDeadline: Date?
+    private(set) var backgroundDeadline: Date? { get { ui.backgroundDeadline } set { ui.backgroundDeadline = newValue } }
 
     /// Holds off display sleep (and, on macOS, the screen saver) for the life of a session —
     /// nothing about watching a stream looks like user activity to the OS, least of all a
@@ -798,9 +820,10 @@ final class SessionModel: ObservableObject {
         disconnect()
     }
 
-    /// Tear the session down. `deliberate` (the default) means a user-initiated quit — signal
-    /// `disconnectQuit()` so the host skips the keep-alive linger; `sessionEnded()` (a host-ended /
-    /// dropped session) passes `false` to leave the linger intact.
+    /// Tear the session down: stop what it started, then reset `ui` whole. `deliberate` (the
+    /// default) means a user-initiated quit — signal `disconnectQuit()` so the host skips the
+    /// keep-alive linger; `sessionEnded()` (a host-ended / dropped session) passes `false` to
+    /// leave the linger intact.
     func disconnect(deliberate: Bool = true) {
         if connection != nil {
             let line = "disconnect \(activeHost?.displayName ?? "-") deliberate=\(deliberate) phase=\(phase)"
@@ -809,13 +832,6 @@ final class SessionModel: ObservableObject {
         // What this host has up is about to change, so the cards must ask again rather than wait
         // out the cache's TTL naming the game the user just left.
         if let host = activeHost { NowPlayingStore.shared.invalidate(host) }
-        isBackgrounded = false
-        backgroundDeadline = nil
-        // The mic mute is per-session and never persisted: the next stream starts live (if the
-        // mic is enabled), rather than silently carrying a mute nobody remembers making.
-        micMuted = false
-        virtualPadShown = false
-        clipboardEnabled = false
         let conn = connection
         #if os(macOS)
         let closing = Self.closing
@@ -830,33 +846,27 @@ final class SessionModel: ObservableObject {
             closing.leave()
             #endif
         }
-        // Every hint, notice and access latch is per-session. After the captures: the SC2
-        // capture's `.released` edge never lands once it is deallocated, so the reset drops
-        // its badge, and no pending clear fires into the next stream.
-        notices.cancelTimers()
-        notices = SessionNotices()
-        connection = nil
-        activeHost = nil
         // A user-ended stream that STARTED on a shelf goes back to it — the same rule a game
         // exit follows, because "I'm done with this game" arrives both ways. Gated on having
         // actually streamed, so a refused or cancelled dial still ends where it was raised
-        // from. `sessionEnded` has already set this for the paths it owns; it disconnects
-        // non-deliberately, so the two can never both fire.
+        // from. `sessionEnded` sets it for the paths it owns, and disconnects non-deliberately.
         if deliberate, phase == .streaming, let shelf = launchedShelf {
             returnToLibrary = shelf
         }
-        streamedGame = nil
+        // After the captures: the SC2 capture's `.released` edge never lands once it is
+        // deallocated, so the reset drops its badge, and no pending clear fires into the next.
+        notices.cancelTimers()
+        ui = SessionUI()
+        launchWatch?.cancel()
+        launchWatch = nil
+        connection = nil
+        activeHost = nil
         // Read by `sessionEnded` BEFORE it calls us, so clearing here can't rob it of the answer.
         launchedTitleID = nil
         launchedShelf = nil
-        revealStream()
-        phase = .idle
-        hudLines = []
         // Drop the previous session's grant too — the shared box outlives the session, and a new
         // link may never come up (a non-deadline rung has none at all).
         PresentLinkInfo.shared.clear()
-        mouseCaptured = false
-        resizing = false
         resizeIndicator = ResizeIndicator() // no stale target/timer into the next session
     }
 
@@ -930,7 +940,7 @@ final class SessionModel: ObservableObject {
 
     /// The game this device launched that this stream plays (`RunningGame.streamedHere`): the
     /// ring's End game. Read from `/status` when the stream starts and when the ring opens.
-    @Published private(set) var streamedGame: RunningGame?
+    private(set) var streamedGame: RunningGame? { get { ui.streamedGame } set { ui.streamedGame = newValue } }
 
     /// Ask the host what this stream plays. Best-effort: a failed read keeps the last answer.
     func refreshStreamedGame() {
