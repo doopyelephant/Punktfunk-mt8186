@@ -16,8 +16,9 @@
 
 #![allow(clippy::all, dead_code, non_camel_case_types, non_snake_case, unused)]
 
-use super::{gs_button_to_evdev, vk_to_evdev, InputEvent, InputInjector};
+use super::{InputEvent, InputInjector};
 use crate::head_pick::{self, HeadFacts};
+use crate::plan::{Abs, Op, Plan};
 use crate::scroll::{ScrollBackend, ScrollMapper, ScrollOp};
 use anyhow::{Context, Result};
 use punktfunk_core::input::InputKind;
@@ -257,7 +258,7 @@ pub struct KwinFakeInjector {
     /// Normalized-scroll lowering onto the bare `axis` click channel.
     scroll: ScrollMapper,
     /// What this device holds, released before it goes ([`Drop`]).
-    held: crate::held::HeldInput,
+    plan: Plan,
 }
 
 /// Cap geometry roundtrips at 2 Hz. A roundtrip on every mouse-move would stall the control path.
@@ -300,7 +301,7 @@ impl KwinFakeInjector {
             fake,
             last_refresh: None,
             scroll: ScrollMapper::new(ScrollBackend::Kwin),
-            held: crate::held::HeldInput::default(),
+            plan: Plan::default(),
         };
         injector.refresh_geometry();
         tracing::info!(
@@ -333,23 +334,56 @@ impl KwinFakeInjector {
         }
     }
 
-    /// Logical rectangle for a normalized client position: the [`head_pick::pick`]ed head,
-    /// else `w×h` pixels at the origin (correct at scale 1).
-    fn logical_target(&self, phys_w: i32, phys_h: i32) -> (f64, f64, f64, f64) {
+    /// Where `abs` lands in logical compositor space: its fraction of the [`head_pick::pick`]ed
+    /// head, else of `w×h` pixels at the origin (correct at scale 1).
+    fn place(&mut self, abs: &Abs) -> (f64, f64) {
+        self.refresh_geometry();
         let heads: Vec<HeadFacts> = self
             .state
             .outputs
             .iter()
             .filter_map(|o| o.geo.facts())
             .collect();
-        let event_wh = Some((phys_w as u32, phys_h as u32));
-        match head_pick::pick(&heads, &crate::stream_target(), event_wh) {
-            Some(i) => {
-                let h = heads[i];
-                let (x, y) = (f64::from(h.x), f64::from(h.y));
-                (x, y, f64::from(h.logical_w), f64::from(h.logical_h))
+        let (lx, ly, lw, lh) =
+            match head_pick::pick(&heads, &crate::stream_target(), Some((abs.w, abs.h))) {
+                Some(i) => {
+                    let h = heads[i];
+                    let (x, y) = (f64::from(h.x), f64::from(h.y));
+                    (x, y, f64::from(h.logical_w), f64::from(h.logical_h))
+                }
+                None => (0.0, 0.0, f64::from(abs.w), f64::from(abs.h)),
+            };
+        let (nx, ny) = abs.normalized();
+        (lx + nx * lw, ly + ny * lh)
+    }
+
+    /// Emit one planned op. Keys are evdev codes; KWin owns the keymap and modifier state, so
+    /// there is no modifiers request. A touch is one frame per event.
+    fn emit(&mut self, op: Op) {
+        match op {
+            Op::Motion { dx, dy } => self.fake.pointer_motion(dx.into(), dy.into()),
+            Op::Absolute(abs) => {
+                let (x, y) = self.place(&abs);
+                self.fake.pointer_motion_absolute(x, y);
             }
-            None => (0.0, 0.0, phys_w as f64, phys_h as f64),
+            Op::Button { evdev, down } => self.fake.button(evdev, down.into()),
+            Op::Key { evdev, down, .. } => self.fake.keyboard_key(evdev.into(), down.into()),
+            Op::TouchDown { id, at } => {
+                let (x, y) = self.place(&at);
+                self.fake.touch_down(id, x, y);
+                self.fake.touch_frame();
+            }
+            Op::TouchMove { id, at } => {
+                let (x, y) = self.place(&at);
+                self.fake.touch_motion(id, x, y);
+                self.fake.touch_frame();
+            }
+            Op::TouchUp { id } => {
+                self.fake.touch_up(id);
+                self.fake.touch_frame();
+            }
+            // Host-layout keycodes only; this backend does not advertise HOST_CAP_TEXT_INPUT.
+            Op::Text(_) => {}
         }
     }
 
@@ -373,81 +407,22 @@ impl Drop for KwinFakeInjector {
     /// Release what the device still holds before it goes; a key or button KWin keeps
     /// pressed for a client that vanished is a stuck one.
     fn drop(&mut self) {
-        for up in self.held.release() {
-            let _ = self.inject(&up);
+        for op in self.plan.release() {
+            self.emit(op);
         }
+        let _ = self.queue.dispatch_pending(&mut self.state);
+        let _ = self.conn.flush();
     }
 }
 
 impl InputInjector for KwinFakeInjector {
     fn inject(&mut self, event: &InputEvent) -> Result<()> {
-        self.held.note(event);
-        match event.kind {
-            InputKind::MouseMove => {
-                self.fake.pointer_motion(event.x as f64, event.y as f64);
-            }
-            InputKind::MouseMoveAbs => {
-                let w = ((event.flags >> 16) & 0xffff) as i32;
-                let h = (event.flags & 0xffff) as i32;
-                if w > 0 && h > 0 {
-                    self.refresh_geometry();
-                    let (lx, ly, lw, lh) = self.logical_target(w, h);
-                    let nx = (event.x as f64 / w as f64).clamp(0.0, f64::from(crate::ABS_EDGE));
-                    let ny = (event.y as f64 / h as f64).clamp(0.0, f64::from(crate::ABS_EDGE));
-                    self.fake
-                        .pointer_motion_absolute(lx + nx * lw, ly + ny * lh);
-                }
-            }
-            InputKind::MouseButtonDown | InputKind::MouseButtonUp => {
-                if let Some(btn) = gs_button_to_evdev(event.code) {
-                    let st = u32::from(event.kind == InputKind::MouseButtonDown);
-                    self.fake.button(btn, st);
-                }
-            }
-            // Legacy and normalized scroll lower through the shared mapper onto
-            // the bare axis; the plan carries click-priced units and the
-            // Wayland vertical sign already applied.
-            InputKind::MouseScroll | InputKind::Scroll => self.inject_scroll(event),
-            InputKind::KeyDown | InputKind::KeyUp => {
-                // Evdev code; KWin owns the keymap and modifier state — no modifiers request.
-                if let Some(evdev) = vk_to_evdev(event.code as u8) {
-                    let st = u32::from(event.kind == InputKind::KeyDown);
-                    self.fake.keyboard_key(evdev as u32, st);
-                } else {
-                    tracing::debug!(vk = event.code, "unmapped VK keycode — dropped");
-                }
-            }
-            // `code` is the touch id; w×h packed in `flags` (same abs map as MouseMoveAbs). One frame per event.
-            InputKind::TouchDown | InputKind::TouchMove => {
-                let w = ((event.flags >> 16) & 0xffff) as i32;
-                let h = (event.flags & 0xffff) as i32;
-                if w > 0 && h > 0 {
-                    self.refresh_geometry();
-                    let (lx, ly, lw, lh) = self.logical_target(w, h);
-                    let nx = (event.x as f64 / w as f64).clamp(0.0, f64::from(crate::ABS_EDGE));
-                    let ny = (event.y as f64 / h as f64).clamp(0.0, f64::from(crate::ABS_EDGE));
-                    let x = lx + nx * lw;
-                    let y = ly + ny * lh;
-                    if event.kind == InputKind::TouchDown {
-                        self.fake.touch_down(event.code, x, y);
-                    } else {
-                        self.fake.touch_motion(event.code, x, y);
-                    }
-                    self.fake.touch_frame();
-                }
-            }
-            InputKind::TouchUp => {
-                self.fake.touch_up(event.code);
-                self.fake.touch_frame();
-            }
-            // Host-layout keycodes only; this backend does not advertise HOST_CAP_TEXT_INPUT.
-            InputKind::TextInput => {}
-            // Gamepads go through uinput, not the compositor.
-            InputKind::GamepadState
-            | InputKind::GamepadButton
-            | InputKind::GamepadAxis
-            | InputKind::GamepadRemove
-            | InputKind::GamepadArrival => {}
+        if matches!(event.kind, InputKind::MouseScroll | InputKind::Scroll) {
+            // Legacy and normalized scroll lower through the shared mapper onto the bare axis;
+            // the plan carries click-priced units and the Wayland vertical sign already applied.
+            self.inject_scroll(event);
+        } else if let Some(op) = self.plan.step(event) {
+            self.emit(op);
         }
         self.queue
             .dispatch_pending(&mut self.state)
