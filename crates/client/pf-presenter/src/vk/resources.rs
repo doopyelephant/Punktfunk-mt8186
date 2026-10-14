@@ -93,12 +93,16 @@ impl Presenter {
         Ok(offsets)
     }
 
+    /// Replace the CPU plane images at `width`×`height`. The redraw replay goes with the
+    /// old views it samples: the planar set names them until the next CPU frame binds, and
+    /// that frame's plan records the replay again.
     fn rebuild_cpu_planes(&mut self, width: u32, height: u32) -> Result<()> {
         // Old images are only referenced by our command buffers.
         self.quiesce_own()?;
         if let Some(p) = self.cpu_planes.take() {
             p.destroy(&self.device);
         }
+        self.cpu_direct = None;
         let (cw, ch) = CpuPlanarFrame::chroma_dims(width, height);
         let dims = [(width, height), (cw, ch), (cw, ch)];
         // Build into the owning value, not loose arrays: three fallible planes,
