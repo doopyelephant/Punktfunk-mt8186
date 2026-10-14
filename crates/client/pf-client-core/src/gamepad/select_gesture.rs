@@ -1,8 +1,29 @@
 //! Hold-Select→Guide and the Select chords: pure state over button transitions and a clock.
 
-use super::{SelectChord, GUIDE_HOLD, TAP_PRESS};
 use punktfunk_core::input::gamepad as wire;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Hold Select alone this long for a synthetic host Guide ([`SelectGesture`]). The physical
+/// Guide never reaches the host cleanly where the local shell owns it.
+pub(super) const GUIDE_HOLD: Duration = Duration::from_millis(350);
+
+/// Delay between a held-back Select tap's press and its scheduled release. Core folds
+/// per-transition sends into one `GamepadState`; down+up in one window vanish.
+pub(super) const TAP_PRESS: Duration = Duration::from_millis(50);
+
+/// What a Select+button chord on a forwarded pad asks the client for.
+///
+/// [`Ring`](Self::Ring) withholds the press it takes, because A is the dial's own confirm. That
+/// is why the client says whether anything is listening
+/// ([`GamepadService::set_chords_live`](super::GamepadService::set_chords_live)): a chord
+/// nothing receives would eat a face button the game was owed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectChord {
+    /// Select+A — open the quick-action dial. The A press is withheld.
+    Ring,
+    /// Select+X — step the stats overlay's tier. Both presses still reach the game.
+    Stats,
+}
 
 /// What a button pressed with Select already held asks for, whether or not the guide gesture
 /// is on. Select-first only: A is the ring's own confirm, and X is a face button a game wants.

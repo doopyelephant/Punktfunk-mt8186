@@ -4,8 +4,9 @@
 //! from the caller's loop.
 
 use super::ds5::Ds5Feedback;
-use super::select_gesture::{select_chord, SelectGesture};
-use super::{is_steam_deck, set_valve_hidapi, Ctl, SelectChord, DISCONNECT_HOLD, TAP_PRESS};
+use super::route::{route, Action, Gates, MenuReads, MenuSettle, PadInput, PadRoute};
+use super::select_gesture::TAP_PRESS;
+use super::{is_steam_deck, set_valve_hidapi, Ctl, SelectChord, DISCONNECT_HOLD};
 use crate::menu_nav::{
     ring_sector, MenuEvent, MenuNav, MenuPulse, MenuSample, PadBattery, PadInfo,
 };
@@ -161,10 +162,40 @@ const DECK_NAME: &str = "Steam Deck";
 /// controller is listed once: the raw 28DE:1205 when a session has it, else one Steam pad.
 /// A Steam Controller is listed raw too: its SDL drivers stay on while the Deck's is off.
 fn fold_deck_shadows(list: &mut Vec<PadInfo>) {
-    let mut stand_in = !list
-        .iter()
-        .any(|p| !p.steam_virtual && p.pref == GamepadPref::SteamDeck);
+    let mut stand_in = !list.iter().any(raw_deck);
     list.retain(|p| !p.steam_virtual || std::mem::take(&mut stand_in));
+}
+
+/// The Deck's built-in controller listed raw (`28DE:1205`: SDL's in-session driver, or the
+/// kernel's while Steam is not running), not Steam Input's pad for it.
+fn raw_deck(p: &PadInfo) -> bool {
+    !p.steam_virtual && p.pref == GamepadPref::SteamDeck
+}
+
+/// What menu mode opens of `ids`. While a Steam Input pad is listed in `order`, the first one
+/// stands in for the raw Deck controller: after a session the raw pad stays listed until its
+/// removal arrives, and opening it clears lizard mode. With Steam not running, it opens.
+fn menu_pads(ids: Vec<u32>, order: &[u32], info: impl Fn(u32) -> Option<PadInfo>) -> Vec<u32> {
+    let steam = |p: &PadInfo| p.steam_virtual && p.pref == GamepadPref::SteamDeck;
+    let Some(stand_in) = order
+        .iter()
+        .copied()
+        .find(|&id| info(id).is_some_and(|p| steam(&p)))
+    else {
+        return ids;
+    };
+    let mut out = Vec::new();
+    for id in ids {
+        let id = if info(id).is_some_and(|p| raw_deck(&p)) {
+            stand_in
+        } else {
+            id
+        };
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// Lowest free wire index, or `None` when every slot is taken. Lowest-free keeps indices
@@ -322,15 +353,10 @@ struct Slot {
     /// Kind declared in [`InputKind::GamepadArrival`] — the host's pretence, not `pref`.
     declared: GamepadPref,
     last_axis: [i32; 6],
-    held_buttons: Vec<u32>,
+    /// Held buttons, the Select chord and gesture, a local Guide: where this pad's input goes.
+    route: PadRoute,
     /// Host-believed contacts `(surface, finger)`; lifted on close. 0 = legacy pad, 1/2 = Steam.
     held_touches: std::collections::HashSet<(u8, u8)>,
-    /// The button a Select chord took while Select was pending: neither press went out, so
-    /// the release must not either.
-    swallow_btn: Option<u32>,
-    /// Guide is down and stays local. It is the local shell's chord key (Steam: Guide+A
-    /// opens the QAM), so the rest of this pad stays off the wire until it lifts.
-    guide_local: bool,
     /// Per Steam surface (0 = left, 1 = right): last wire coords + finger-down. Clicks have no
     /// position, so the click forward reuses the live contact.
     surface_last: [(i16, i16, bool); 2],
@@ -341,7 +367,6 @@ struct Slot {
     sent_motion: bool,
     /// Log-once: this path runs at the pad's sensor rate.
     motion_unreachable_logged: bool,
-    gesture: SelectGesture,
     /// bit0 = haptics, bit1 = speaker. Nonzero only for tier-A; bit0 also suppresses wire rumble
     /// while haptics frames arrive.
     audio_caps: u8,
@@ -369,16 +394,13 @@ impl Slot {
             pref,
             declared,
             last_axis: [i32::MIN; 6],
-            held_buttons: Vec::new(),
+            route: PadRoute::default(),
             held_touches: std::collections::HashSet::new(),
-            swallow_btn: None,
-            guide_local: false,
             surface_last: [(0, 0, false); 2],
             held_clicks: [false; 2],
             last_accel: [0; 3],
             sent_motion: false,
             motion_unreachable_logged: false,
-            gesture: SelectGesture::default(),
             audio_caps: 0,
             rumble_suppressed_logged: false,
             coils_muted: false,
@@ -405,6 +427,8 @@ pub(super) struct Worker {
     menu_open: Vec<(u32, sdl3::gamepad::Gamepad)>,
     /// Menu pad that last had a button or stick engaged — the one a detent pulse belongs in.
     menu_last: Option<u32>,
+    /// A forwarded slot just opened: menu navigation adopts until it has reported.
+    menu_settle: MenuSettle,
     /// Menu pad power, `(id, level)`. Cached: [`publish`](Self::publish) runs on every hotplug.
     battery: Option<(u32, PadBattery)>,
     battery_at: Option<Instant>,
@@ -414,13 +438,10 @@ pub(super) struct Worker {
     pinned: Option<String>,
     /// Off: [`Self::forwarded_ids`] is empty so a session opens no slot (hidraw stays free).
     forwarding: bool,
-    /// Whether a Select chord has anywhere to go. Off until the client says so, because a
-    /// chord swallows the button pressed with Select.
-    chords_live: bool,
+    /// Menu mode, the mask, the ring and the button policy: where input goes ([`route`]).
+    gates: Gates,
     /// Applied at open to the kind DECLARED to the host, never to [`Slot::pref`].
     kind_override: GamepadPref,
-    system_forward: bool,
-    guide_gesture: bool,
     /// Owed synthetic presses and releases `(pad, bit, down, due)`, in send order. A tap's
     /// first press went out on receipt ([`tap_events`]).
     synthetic: Vec<(u8, u32, bool, Instant)>,
@@ -435,14 +456,9 @@ pub(super) struct Worker {
     chord_armed: bool,
     chord_since: Option<Instant>,
     disconnect_fired: bool,
-    menu_mode: bool,
     menu_nav: MenuNav,
     menu_tx: async_channel::Sender<MenuEvent>,
     chord_tx: async_channel::Sender<(u8, SelectChord)>,
-    /// Overlay owns input: pads held neutral, slots still OPEN.
-    masked: bool,
-    /// In-stream ring: first slot → [`MenuEvent`]s even while masked.
-    ring_nav: bool,
 }
 
 /// The attached session and the open slot SDL's `which` names. Takes the two fields,
@@ -552,14 +568,18 @@ impl Worker {
     /// What menu mode holds open: the pin, else every pad, Steam Input's virtual ones too.
     /// Navigation folds them into one sample, so a shadow beside its real pad costs nothing,
     /// and idle a Deck's built-in controls exist only as a virtual pad. Console navigation is
-    /// local, so a user who turned wire forwarding off still drives the launcher.
+    /// local, so a user who turned wire forwarding off still drives the launcher. Steam's pad
+    /// stands in for the raw Deck controller while both are listed ([`menu_pads`]).
     fn menu_ids(&self) -> Vec<u32> {
-        self.pinned_id()
-            .map_or_else(|| self.order.clone(), |id| vec![id])
+        let ids = self
+            .pinned_id()
+            .map_or_else(|| self.order.clone(), |id| vec![id]);
+        menu_pads(ids, &self.order, |id| self.pad_info(id))
     }
 
-    /// The one place that opens (= grabs) hardware. Dropping a handle is `SDL_CloseGamepad`;
-    /// on a Deck the firmware watchdog then restores lizard mode.
+    /// The one place that opens (= grabs) hardware: forwarded slots in a session, else the
+    /// menu pads while menu mode or the ring wants them. Dropping a handle is
+    /// `SDL_CloseGamepad`; on a Deck the firmware watchdog then restores lizard mode.
     fn sync_open(&mut self) {
         if self.attached.is_some() {
             self.menu_open.clear();
@@ -568,7 +588,7 @@ impl Worker {
             return;
         }
         self.close_all_slots();
-        let want = if self.menu_mode {
+        let want = if self.gates.input_route(false).opens_menu_pads() {
             self.menu_ids()
         } else {
             Vec::new()
@@ -692,7 +712,7 @@ impl Worker {
                     // After the arrival, so the host builds the as-is pad before raw reports.
                     if let Some(model) = raw {
                         slot.sc2 = slot.pad.path().and_then(|path| {
-                            c.set_sc2_gate(index, self.sc2_gate());
+                            c.set_sc2_gate(index, self.gates.sc2());
                             crate::sc2_capture::Sc2Capture::open(
                                 &path,
                                 c.clone(),
@@ -753,6 +773,7 @@ impl Worker {
                     "gamepad forwarding (slot opened)"
                 );
                 self.slots.push(slot);
+                self.menu_settle.start(Instant::now());
             }
             Err(e) => tracing::warn!(id, error = %e, "gamepad open failed"),
         }
@@ -841,18 +862,9 @@ impl Worker {
         }
     }
 
-    /// The typed plane's mask and system-button routing, for raw SC2 reports.
-    fn sc2_gate(&self) -> punktfunk_core::client::Sc2Gate {
-        punktfunk_core::client::Sc2Gate {
-            masked: self.masked,
-            system_local: !self.system_forward,
-            chords: self.chords_live,
-        }
-    }
-
     fn push_sc2_gate(&self) {
         let Some(c) = &self.attached else { return };
-        let gate = self.sc2_gate();
+        let gate = self.gates.sc2();
         for slot in self.slots.iter().filter(|s| s.sc2.is_some()) {
             c.set_sc2_gate(slot.index, gate);
         }
@@ -870,6 +882,16 @@ impl Worker {
         }
     }
 
+    /// The ring or a launch hold. Before attach it reads the menu pads, so they open even
+    /// outside menu mode.
+    fn set_ring_nav(&mut self, on: bool) {
+        self.gates.ring_nav = on;
+        self.menu_nav.reset();
+        if self.attached.is_none() {
+            self.sync_open();
+        }
+    }
+
     /// After hotplug or pin change. A pad holding the escape chord may have just unplugged.
     fn refresh_active(&mut self) {
         self.sync_open();
@@ -880,18 +902,8 @@ impl Worker {
     /// Zero host-held state. Wire events only — safe against an already-removed pad.
     fn flush_slot(c: &NativeClient, slot: &mut Slot) {
         let pad = slot.index;
-        // Gesture first: synthetic Guide is not in `held_buttons`; a pending Select was never sent.
-        let mut due = Vec::new();
-        slot.gesture.flush(&mut due);
-        // A chord's pending button-up is host-held state too. Its own `ButtonUp` is what
-        // clears it, and masking the pad is exactly what stops that arriving — so it would
-        // survive and eat the release of the NEXT real press, leaving that button down.
-        slot.swallow_btn = None;
-        for (b, down) in due {
+        for (b, down) in slot.route.release() {
             send(c, InputKind::GamepadButton, b, down as i32, pad);
-        }
-        for b in slot.held_buttons.drain(..) {
-            send(c, InputKind::GamepadButton, b, 0, pad);
         }
         for (id, v) in slot.last_axis.iter_mut().enumerate() {
             if *v != 0 && *v != i32::MIN {
@@ -953,15 +965,14 @@ impl Worker {
     fn readopt_held(&mut self) {
         let attached = self.attached.clone();
         for slot in &mut self.slots {
-            Self::readopt_slot(slot, attached.as_deref(), self.system_forward);
+            Self::readopt_slot(slot, attached.as_deref(), self.gates.system_forward);
         }
         self.rearm_escape();
     }
 
-    /// The pad is ours again: adopt buttons into `held_buttons` without a wire press (an A
-    /// that picked a QAM row must not fire in the game). Axes are re-sent: the flush
-    /// zeroed them and SDL only speaks on change, so a still-held stick would stay dead
-    /// host-side. A local Guide still down keeps the pad with the shell.
+    /// The pad is ours again: [`PadRoute::adopt`] takes what is down now, without a wire
+    /// press. Axes are re-sent: the flush zeroed them and SDL only speaks on change, so a
+    /// still-held stick would stay dead host-side. A local Guide still down keeps the pad.
     fn readopt_slot(slot: &mut Slot, c: Option<&NativeClient>, system_forward: bool) {
         use sdl3::gamepad::{Axis, Button};
         const BUTTONS: [Button; 21] = [
@@ -995,25 +1006,15 @@ impl Worker {
             Axis::TriggerLeft,
             Axis::TriggerRight,
         ];
-        slot.held_buttons.clear();
-        slot.guide_local = !system_forward && slot.pad.button(Button::Guide);
-        if slot.guide_local {
+        // A trackpad click forwards as a surface, and its release never clears a bit.
+        let down: Vec<u32> = BUTTONS
+            .into_iter()
+            .filter(|&b| Self::steam_click_surface(slot, b).is_none() && slot.pad.button(b))
+            .filter_map(button_bit)
+            .collect();
+        let guide = slot.pad.button(Button::Guide);
+        if !slot.route.adopt(down, guide, system_forward) {
             return;
-        }
-        for b in BUTTONS {
-            let Some(bit) = button_bit(b) else {
-                continue;
-            };
-            if !system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
-                continue;
-            }
-            // A trackpad click forwards as a surface, and its release never clears a bit.
-            if Self::steam_click_surface(slot, b).is_some() {
-                continue;
-            }
-            if slot.pad.button(b) {
-                slot.held_buttons.push(bit);
-            }
         }
         let Some(c) = c else {
             return;
@@ -1064,12 +1065,12 @@ impl Worker {
                 true
             }
         });
-        if !self.guide_gesture {
+        if !self.gates.guide_gesture {
             return;
         }
         for slot in &mut self.slots {
             let mut due = Vec::new();
-            slot.gesture.poll(now, &mut due);
+            slot.route.gesture.poll(now, &mut due);
             for (b, down) in due {
                 send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
             }
@@ -1266,9 +1267,10 @@ impl Worker {
                     self.close_all_slots();
                     self.attached = None;
                     self.reset_chord();
-                    self.sync_open();
+                    // Driver off before the menu pads reopen: no slot is left to outlive it.
                     set_valve_hidapi(false);
-                    if self.menu_mode {
+                    self.sync_open();
+                    if self.gates.menu_mode {
                         // Adopt still-held buttons so the escape chord cannot ghost-fire the menu.
                         self.menu_nav.reset();
                     }
@@ -1279,24 +1281,24 @@ impl Worker {
                 }
                 Ok(Ctl::KindOverride(pref)) => self.set_kind_override(pref),
                 Ok(Ctl::ChordsLive(on)) => {
-                    self.chords_live = on;
+                    self.gates.chords_live = on;
                     self.push_sc2_gate();
                 }
                 Ok(Ctl::SystemButtons {
                     forward_raw,
                     gesture,
                 }) => {
-                    self.system_forward = forward_raw;
+                    self.gates.system_forward = forward_raw;
                     self.push_sc2_gate();
-                    if self.guide_gesture == gesture {
+                    if self.gates.guide_gesture == gesture {
                         continue;
                     }
-                    self.guide_gesture = gesture;
+                    self.gates.guide_gesture = gesture;
                     // Mid-session flip can strand a synthetic Guide or owed tap; lift now.
                     if let Some(c) = self.attached.clone() {
                         for slot in &mut self.slots {
                             let mut due = Vec::new();
-                            slot.gesture.flush(&mut due);
+                            slot.route.gesture.flush(&mut due);
                             for (b, down) in due {
                                 send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
                             }
@@ -1331,10 +1333,10 @@ impl Worker {
                     }
                 }
                 Ok(Ctl::Mask(on)) => {
-                    if self.masked == on {
+                    if self.gates.masked == on {
                         continue;
                     }
-                    self.masked = on;
+                    self.gates.masked = on;
                     self.push_sc2_gate();
                     if on {
                         // Neutral now, slots stay open — the host must not see an unplug.
@@ -1371,16 +1373,13 @@ impl Worker {
                 Ok(Ctl::PadAudioPrefs(bits)) => self.pad_audio_prefs = bits & 0x03,
                 Ok(Ctl::Rumble(on)) => self.rumble = on,
                 Ok(Ctl::MenuMode(on)) => {
-                    self.menu_mode = on;
+                    self.gates.menu_mode = on;
                     if on {
                         self.menu_nav.reset();
                     }
                     self.sync_open();
                 }
-                Ok(Ctl::RingNav(on)) => {
-                    self.ring_nav = on;
-                    self.menu_nav.reset();
-                }
+                Ok(Ctl::RingNav(on)) => self.set_ring_nav(on),
                 Ok(Ctl::MenuRumble(pulse)) => {
                     if self.attached.is_none() {
                         // The pad that last acted, not the newest: with two on the console the
@@ -1406,28 +1405,10 @@ impl Worker {
         }
     }
 
+    /// Hotplug always counts, or the slot table goes stale. Every input transition goes
+    /// through [`route`].
     pub(super) fn handle_event(&mut self, event: sdl3::event::Event) {
         use sdl3::event::Event;
-        use sdl3::gamepad::Button;
-        // The overlay owns the pads, or a held local Guide owns this one: drop input
-        // transitions (flushed neutral when either began). Add/remove still count, or
-        // the slot table goes stale. Guide itself passes: its release ends the hold.
-        if let Some(which) = input_pad(&event) {
-            let guide = matches!(
-                event,
-                Event::GamepadButtonDown {
-                    button: Button::Guide,
-                    ..
-                } | Event::GamepadButtonUp {
-                    button: Button::Guide,
-                    ..
-                }
-            );
-            let held = self.slots.iter().any(|s| s.id == which && s.guide_local);
-            if self.masked || (held && !guide) {
-                return;
-            }
-        }
         match event {
             Event::GamepadAdded { which, .. } => {
                 let which = which.raw();
@@ -1453,25 +1434,77 @@ impl Worker {
                     self.refresh_active();
                 }
             }
-            Event::GamepadButtonDown { which, button, .. } => {
-                self.on_button_down(which.raw(), button)
+            _ => self.on_input(&event),
+        }
+    }
+
+    /// One transition on a forwarded pad: [`route`] decides, this performs. The escape
+    /// chord is checked last, once the slot borrow has ended.
+    fn on_input(&mut self, event: &sdl3::event::Event) {
+        let Some(which) = input_pad(event) else {
+            return;
+        };
+        let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
+            return;
+        };
+        let Some(input) = Self::pad_input(slot, event) else {
+            return;
+        };
+        let mut escape = None;
+        for action in route(input, &self.gates, &mut slot.route, Instant::now()) {
+            match action {
+                Action::Wire { bit, down } => {
+                    send(&c, InputKind::GamepadButton, bit, down as i32, slot.index)
+                }
+                Action::Click { surface, down } => Self::forward_click(&c, slot, surface, down),
+                Action::Forward => Self::forward(&c, slot, event),
+                Action::Flush => Self::flush_slot(&c, slot),
+                Action::Readopt => Self::readopt_slot(slot, Some(&*c), self.gates.system_forward),
+                Action::Chord(chord) => {
+                    let _ = self.chord_tx.try_send((slot.index, chord));
+                }
+                Action::Escape | Action::Rearm => escape = Some(action),
             }
-            Event::GamepadButtonUp { which, button, .. } => self.on_button_up(which.raw(), button),
-            Event::GamepadAxisMotion {
-                which, axis, value, ..
-            } => {
-                let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which.raw())
-                else {
-                    return;
-                };
+        }
+        match escape {
+            Some(Action::Escape) => self.maybe_fire_escape(),
+            Some(Action::Rearm) => self.rearm_escape(),
+            _ => {}
+        }
+    }
+
+    /// A button as a wire bit, or a Steam pad's trackpad click. `None` for a button with no
+    /// wire bit.
+    fn pad_input(slot: &Slot, event: &sdl3::event::Event) -> Option<PadInput> {
+        use sdl3::event::Event;
+        let button = |button, down| match Self::steam_click_surface(slot, button) {
+            Some(surface) => Some(PadInput::Click { surface, down }),
+            None => button_bit(button).map(|bit| PadInput::Button { bit, down }),
+        };
+        match *event {
+            Event::GamepadButtonDown { button: b, .. } => button(b, true),
+            Event::GamepadButtonUp { button: b, .. } => button(b, false),
+            Event::GamepadAxisMotion { .. }
+            | Event::GamepadTouchpadDown { .. }
+            | Event::GamepadTouchpadMotion { .. }
+            | Event::GamepadTouchpadUp { .. }
+            | Event::GamepadSensorUpdated { .. } => Some(PadInput::Analog),
+            _ => None,
+        }
+    }
+
+    /// An analog sample [`route`] let through: an axis on change, touch and motion as is.
+    fn forward(c: &NativeClient, slot: &mut Slot, event: &sdl3::event::Event) {
+        use sdl3::event::Event;
+        match *event {
+            Event::GamepadAxisMotion { axis, value, .. } => {
                 let (id, v) = axis_value(axis, value);
                 if slot.last_axis[id as usize] != v {
                     slot.last_axis[id as usize] = v;
-                    send(&c, InputKind::GamepadAxis, id, v, slot.index);
+                    send(c, InputKind::GamepadAxis, id, v, slot.index);
                 }
             }
             Event::GamepadTouchpadDown {
-                which,
                 touchpad,
                 finger,
                 x,
@@ -1479,143 +1512,32 @@ impl Worker {
                 ..
             }
             | Event::GamepadTouchpadMotion {
-                which,
                 touchpad,
                 finger,
                 x,
                 y,
                 ..
-            } => {
-                if let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which.raw())
-                {
-                    Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, true);
-                }
-            }
+            } => Self::forward_touch(c, slot, touchpad as u32, finger as u8, x, y, true),
             Event::GamepadTouchpadUp {
-                which,
                 touchpad,
                 finger,
                 x,
                 y,
                 ..
-            } => {
-                if let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which.raw())
-                {
-                    Self::forward_touch(&c, slot, touchpad as u32, finger as u8, x, y, false);
-                }
+            } => Self::forward_touch(c, slot, touchpad as u32, finger as u8, x, y, false),
+            Event::GamepadSensorUpdated { sensor, data, .. } => {
+                Self::forward_motion(c, slot, sensor, data)
             }
-            Event::GamepadSensorUpdated {
-                which,
-                sensor,
-                data,
-                ..
-            } => self.on_sensor(which.raw(), sensor, data),
             _ => {}
         }
     }
 
-    /// Steam pad click, Select chord, guide gesture, then the wire press. The escape
-    /// chord is checked last, once the slot borrow has ended.
-    fn on_button_down(&mut self, which: u32, button: sdl3::gamepad::Button) {
-        let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
-            return;
-        };
-        if let Some(surface) = Self::steam_click_surface(slot, button) {
-            Self::forward_click(&c, slot, surface, true);
-            return;
-        }
-        if let Some(bit) = button_bit(button) {
-            if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
-                // Neutral for the hold, as under the mask: what is pressed with Guide is
-                // the shell's chord, and one already held must not stay down host-side.
-                if bit == wire::BTN_GUIDE {
-                    slot.guide_local = true;
-                    Self::flush_slot(&c, slot);
-                }
-                return;
-            }
-            // Claimed only where the client can act on it: the ring withholds the press
-            // it takes, and eating a face button nothing receives is worse than the
-            // chord not working.
-            let chord = self
-                .chords_live
-                .then(|| select_chord(&slot.held_buttons, bit, slot.gesture.as_guide))
-                .flatten();
-            if let Some(chord) = chord {
-                let _ = self.chord_tx.try_send((slot.index, chord));
-                // A is the ring's own confirm, so the host must not also see it — a
-                // pending Select goes with it, and one already on the wire is lifted by
-                // the ring's mask flush. Stats changes nothing on the host, so that
-                // press carries on to the game, as it does on the Apple clients.
-                if chord == SelectChord::Ring {
-                    slot.gesture.swallow_for_ring();
-                    slot.swallow_btn = Some(bit);
-                    slot.held_buttons.push(bit);
-                    return;
-                }
-            }
-            let mut due = Vec::new();
-            let held_back = if !self.guide_gesture {
-                false
-            } else if bit == wire::BTN_BACK {
-                let alone = slot.held_buttons.is_empty();
-                slot.gesture.on_select_down(Instant::now(), alone, &mut due)
-            } else {
-                slot.gesture.on_other_down(&mut due);
-                false
-            };
-            for (b, down) in due {
-                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
-            }
-            // Chord bookkeeping sees the physical press even when the gesture holds it back.
-            slot.held_buttons.push(bit);
-            if !held_back {
-                send(&c, InputKind::GamepadButton, bit, 1, slot.index);
-            }
-            self.maybe_fire_escape();
-        }
-    }
-
-    fn on_button_up(&mut self, which: u32, button: sdl3::gamepad::Button) {
-        let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
-            return;
-        };
-        if let Some(surface) = Self::steam_click_surface(slot, button) {
-            Self::forward_click(&c, slot, surface, false);
-            return;
-        }
-        if let Some(bit) = button_bit(button) {
-            // The host never saw this Guide go down: its lift only hands the pad back.
-            if bit == wire::BTN_GUIDE && slot.guide_local {
-                Self::readopt_slot(slot, Some(&*c), self.system_forward);
-                return;
-            }
-            if !self.system_forward && matches!(bit, wire::BTN_GUIDE | wire::BTN_MISC1) {
-                return;
-            }
-            slot.held_buttons.retain(|&b| b != bit);
-            if slot.swallow_btn == Some(bit) {
-                slot.swallow_btn = None;
-                return;
-            }
-            let mut due = Vec::new();
-            let owned = self.guide_gesture
-                && bit == wire::BTN_BACK
-                && slot.gesture.on_select_up(Instant::now(), &mut due);
-            for (b, down) in due {
-                send(&c, InputKind::GamepadButton, b, down as i32, slot.index);
-            }
-            if !owned {
-                send(&c, InputKind::GamepadButton, bit, 0, slot.index);
-            }
-            self.rearm_escape();
-        }
-    }
-
-    fn on_sensor(&mut self, which: u32, sensor: sdl3::sensor::SensorType, data: [f32; 3]) {
-        let Some((c, slot)) = attached_slot(&self.attached, &mut self.slots, which) else {
-            return;
-        };
+    fn forward_motion(
+        c: &NativeClient,
+        slot: &mut Slot,
+        sensor: sdl3::sensor::SensorType,
+        data: [f32; 3],
+    ) {
         use sdl3::sensor::SensorType;
         match sensor {
             SensorType::Accelerometer => {
@@ -1659,16 +1581,15 @@ impl Worker {
         }
     }
 
+    /// The ring reads every forwarded pad: it opens from whichever pad pressed Select+A, which
+    /// is not always slot 0. A masked menu reads none, so one stick never scrolls Steam's UI
+    /// and ours.
     pub(super) fn menu_poll(&mut self) {
-        // Ring: every forwarded pad (masked off the wire) — the ring opens from whichever pad
-        // pressed Select+A, which is not always slot 0. Else skip if overlay-masked so the
-        // same stick cannot scroll Steam's UI and ours.
-        let pads: Vec<(u32, &sdl3::gamepad::Gamepad)> = if self.ring_nav {
-            self.slots.iter().map(|s| (s.id, &s.pad)).collect()
-        } else if !self.menu_mode || self.attached.is_some() || self.masked {
-            return;
-        } else {
-            self.menu_open.iter().map(|(id, p)| (*id, p)).collect()
+        let reads = self.gates.input_route(self.attached.is_some()).menu_reads();
+        let pads: Vec<(u32, &sdl3::gamepad::Gamepad)> = match reads {
+            MenuReads::Slots => self.slots.iter().map(|s| (s.id, &s.pad)).collect(),
+            MenuReads::MenuPads => self.menu_open.iter().map(|(id, p)| (*id, p)).collect(),
+            MenuReads::Nothing => return,
         };
         if pads.is_empty() {
             return;
@@ -1679,8 +1600,12 @@ impl Worker {
             self.menu_last = Some(pads[i].0);
         }
         let merged = merge_samples(&samples);
+        let now = Instant::now();
+        if self.menu_settle.adopting(now) {
+            self.menu_nav.reset();
+        }
         let mut out = Vec::new();
-        self.menu_nav.poll(&merged, Instant::now(), &mut out);
+        self.menu_nav.poll(&merged, now, &mut out);
         for e in out {
             let _ = self.menu_tx.try_send(e);
         }
@@ -1856,15 +1781,14 @@ impl Worker {
             slots: Vec::new(),
             menu_open: Vec::new(),
             menu_last: None,
+            menu_settle: MenuSettle::default(),
             battery: None,
             battery_at: None,
             order: Vec::new(),
             pinned: None,
             forwarding: true,
-            chords_live: false,
+            gates: Gates::default(),
             kind_override: GamepadPref::Auto,
-            system_forward: true,
-            guide_gesture: false,
             synthetic: Vec::new(),
             pad_audio_prefs: 0,
             rumble: true,
@@ -1874,12 +1798,9 @@ impl Worker {
             chord_armed: false,
             chord_since: None,
             disconnect_fired: false,
-            menu_mode: false,
             menu_nav: MenuNav::new(),
             menu_tx,
             chord_tx,
-            masked: false,
-            ring_nav: false,
         }
     }
 }
@@ -1919,11 +1840,8 @@ pub(super) fn run(
 
         // Wait, don't sleep+poll. 10 ms attached/menu bounds chord-hold and haptic
         // jitter (DISCONNECT_HOLD is 1500 ms). Idle wakes at 30 ms for hotplug + ctl.
-        let timeout = Duration::from_millis(if w.attached.is_some() || w.menu_mode {
-            10
-        } else {
-            30
-        });
+        let menu = w.gates.input_route(false).opens_menu_pads();
+        let timeout = Duration::from_millis(if w.attached.is_some() || menu { 10 } else { 30 });
         if let Some(event) = pump.wait_event_timeout(timeout) {
             w.handle_event(event);
             while let Some(event) = pump.poll_event() {
@@ -2218,6 +2136,62 @@ mod slot_tests {
         assert_eq!(p[0], 0);
         assert_eq!(&p[4..10], &raw);
         assert_eq!(Ds5Feedback::audio_haptics_packet(), [0u8; 47]);
+    }
+}
+
+#[cfg(test)]
+mod menu_pad_tests {
+    use super::*;
+
+    fn pad(pref: GamepadPref, steam_virtual: bool) -> PadInfo {
+        PadInfo {
+            name: String::new(),
+            key: String::new(),
+            pref,
+            steam_virtual,
+            battery: None,
+            detail: String::new(),
+            forwarded: true,
+            rumble: false,
+        }
+    }
+
+    /// 1 = the raw Deck controller, 2 = Steam Input's pad for it, 3 = a DualSense.
+    fn info(id: u32) -> Option<PadInfo> {
+        match id {
+            1 => Some(pad(GamepadPref::SteamDeck, false)),
+            2 => Some(pad(GamepadPref::SteamDeck, true)),
+            3 => Some(pad(GamepadPref::DualSense, false)),
+            _ => None,
+        }
+    }
+
+    /// Menu mode opens Steam's pad, not the raw one, while both are listed: after a session the
+    /// raw pad stays in `order` until its removal arrives.
+    #[test]
+    fn steams_pad_stands_in_for_the_raw_deck_pad_while_both_are_listed() {
+        // (ids, order) → what opens
+        let rows: [(&[u32], &[u32], &[u32]); 4] = [
+            (&[1, 2, 3], &[1, 2, 3], &[2, 3]),
+            (&[3, 2, 1], &[3, 2, 1], &[3, 2]),
+            // Steam not running: the kernel's raw pad is the Deck's only pad, and it opens.
+            (&[1, 3], &[1, 3], &[1, 3]),
+            (&[1], &[1, 3], &[1]),
+        ];
+        for (ids, order, want) in rows {
+            assert_eq!(
+                menu_pads(ids.to_vec(), order, info),
+                want,
+                "{ids:?} of {order:?}"
+            );
+        }
+    }
+
+    /// A pin on the raw pad opens Steam's pad while it is listed, so the launcher keeps a pad.
+    #[test]
+    fn a_pin_on_the_raw_deck_pad_opens_steams_pad_while_it_is_listed() {
+        assert_eq!(menu_pads(vec![1], &[1, 2, 3], info), [2]);
+        assert_eq!(menu_pads(vec![1], &[3, 1], info), [1]);
     }
 }
 
