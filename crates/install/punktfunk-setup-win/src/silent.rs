@@ -16,8 +16,8 @@ use punktfunk_setup::platform::windows::{silent, sys};
 use punktfunk_setup::seam::Env;
 use punktfunk_setup::ui::{Plain, Reporter};
 
+use crate::live::{DemoSeams, LiveSeams, RealSeams};
 use crate::real::Seams;
-use crate::wizard::{DemoSeams, LiveSeams, RealSeams};
 
 pub fn main(inno: &InnoArgs, preset: WinPreset, seams: &Seams, dry: bool) -> ExitCode {
     let log = inno

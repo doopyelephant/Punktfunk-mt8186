@@ -12,6 +12,8 @@ pub mod bootstrap;
 #[cfg(windows)]
 pub mod brand;
 #[cfg(windows)]
+pub mod live;
+#[cfg(windows)]
 pub mod real;
 #[cfg(windows)]
 pub mod silent;
