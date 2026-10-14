@@ -354,15 +354,24 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   daemon ends them until the seat restarts. The seat host's own pads still go through the
   broker, and a seat host offers no pen. It needs `/dev/cuse`, which the `cuse` module autoloads
   on first open; `doctor` reports it.
-- **USB pads.** A USB/IP pad (the virtual Deck, the SC2, the Switch 2) stays the seat host's own
-  usbip server. A seat that can't write vhci's `attach` runs the import handshake and sends the
-  connected socket with an `Attach`; the daemon picks the vhci port, records it in `/run/punktfunk/pads/vhci/<port>` and
-  writes `attach`, four ports per seat. The fence maps every node under that port to the seat.
-  While the daemon runs, a new vhci interface starts unauthorized and the fence authorizes it
-  on its `add`. A seat's binds only when its device is one the host emulates
+- **USB pads.** A seat's USB/IP pad (the virtual Deck, the Steam Controllers, the DualSense, the
+  Switch 2) is served by the daemon, never by the seat. A seat that can't write vhci's `attach`
+  sends a `Serve` with the pad kind, and the client pad's identity for a Steam Controller. The
+  daemon starts a pad server, `punktfunk-seats serve-usb`, in a transient scope of its own, so a
+  restart of the daemon leaves it running. The pad server answers every descriptor and control
+  transfer from `pf-inject`'s tables. The daemon picks the vhci port, records it in
+  `/run/punktfunk/pads/vhci/<port>` and writes `attach`, four ports per seat. The seat gets one end
+  of a relay and sends only input reports, by interface. A kind takes only the report ids its
+  table lists: the Deck's mouse and keyboard interfaces and the SC2's mouse and keyboard reports
+  bind but never fire, the uhid SC2 included. An identity's serial passes as 1–16 letters and
+  digits. The seat closing its relay ends the pad server and the device. An `Attach` from an
+  older seat host is refused, and that host falls back to uhid pads; a socket an older daemon
+  attached for a seat is detached at the next start. The fence maps every node under the port
+  to the seat. While the daemon runs, a new vhci interface starts unauthorized and the fence
+  authorizes it on its `add`. A seat's binds only when its device is one the host emulates
   (`usbip::EMULATED` in `pf-inject`) and the interface, as the kernel parsed it, is HID, audio,
   CDC-ACM or vendor-specific; anyone else's always. The attached socket waits in the fd store
-  too, so a restarted daemon still drops the port's row when the seat hangs up.
+  too, so a restarted daemon still drops the port's row when the device goes.
 - **Game Mode.** The seat host keeps the seat's mode, `desktop` or `game`, in `seat-session` in
   its config directory, and starts in the one it ran last. It owns
   `com.steampowered.SteamOSManager1` on the seat's session bus and serves `SessionManagement1`,
