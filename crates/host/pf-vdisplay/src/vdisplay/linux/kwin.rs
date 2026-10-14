@@ -163,18 +163,8 @@ impl KwinDisplay {
             }
         };
         let mut seqs = Vec::new();
-        let mut journal_plan = |plan: &[(String, String)]| {
-            let heads: Vec<Head> = union_restore(plan.to_vec(), pre_enabled)
-                .into_iter()
-                .map(|(name, mode)| Head {
-                    name,
-                    mode: (!mode.is_empty()).then_some(mode),
-                })
-                .collect();
-            if !heads.is_empty() {
-                seqs.push(journal::push("kwin", Undo::EnableHeads { heads }));
-            }
-        };
+        let mut journal_plan =
+            |plan: &[(String, String)]| seqs.extend(journal_heads(plan, pre_enabled));
         // In-process Wayland; immune to a wedged kscreen-doctor.
         let outcome = crate::kwin_output_mgmt::apply_topology(
             mgmt,
@@ -515,13 +505,32 @@ fn reenable_stranded(pre_enabled: Vec<(String, String)>) {
         return;
     }
     reenable_pass(&pre_enabled, "immediate", false);
+    reenable_later(pre_enabled, "delayed", false);
+}
+
+/// [`reenable_pass`] once more after [`STRAND_RECHECK_DELAY`], off this thread: KWin applies a
+/// stored setup on its own time, not ours. One shot, never a loop.
+fn reenable_later(expected: Vec<(String, String)>, wave: &'static str, abort_if_managed: bool) {
     std::thread::Builder::new()
         .name("punktfunk-kwin-reenable".into())
         .spawn(move || {
             std::thread::sleep(STRAND_RECHECK_DELAY);
-            reenable_pass(&pre_enabled, "delayed", false);
+            reenable_pass(&expected, wave, abort_if_managed);
         })
         .ok();
+}
+
+/// Journal the `exclusive` restore list ([`union_restore`] of `plan` and `pre_enabled`), each
+/// head at the mode KWin puts back, before the disable. `None` when there is nothing to restore.
+fn journal_heads(plan: &[(String, String)], pre_enabled: &[(String, String)]) -> Option<u64> {
+    let heads: Vec<Head> = union_restore(plan.to_vec(), pre_enabled)
+        .into_iter()
+        .map(|(name, mode)| Head {
+            name,
+            mode: (!mode.is_empty()).then_some(mode),
+        })
+        .collect();
+    (!heads.is_empty()).then(|| journal::push("kwin", Undo::EnableHeads { heads }))
 }
 
 /// One pass: re-enable `expected ∩ now-disabled`. `abort_if_managed` is post-teardown:
@@ -576,14 +585,7 @@ fn restore_heads(heads: &[(String, String)]) {
     if !crate::kwin_output_mgmt::reenable_outputs(heads) {
         reenable_outputs_kscreen(heads);
     }
-    let verify = heads.to_vec();
-    std::thread::Builder::new()
-        .name("punktfunk-kwin-restore-verify".into())
-        .spawn(move || {
-            std::thread::sleep(STRAND_RECHECK_DELAY);
-            reenable_pass(&verify, "post-teardown", true);
-        })
-        .ok();
+    reenable_later(heads.to_vec(), "post-teardown", true);
 }
 
 /// Re-enable outputs `exclusive` disabled, via `kscreen-doctor` — fallback when

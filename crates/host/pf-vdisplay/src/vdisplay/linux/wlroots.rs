@@ -189,16 +189,9 @@ impl VirtualDisplay for WlrootsDisplay {
     /// instance's `HEADLESS-N` may be the box's only screen.
     fn undo(&mut self, undo: &Undo) -> Result<()> {
         match undo {
-            Undo::EnableHeads { heads } => {
-                let names: Vec<String> = heads.iter().map(|h| h.name.clone()).collect();
-                restore_heads(&names)
-            }
+            Undo::EnableHeads { heads } => restore_heads(heads),
             Undo::RemoveOutput { name, instance } => {
-                if instance.is_empty() || *instance != sway_instance() {
-                    tracing::info!(
-                        output = %name,
-                        "wlroots: a dead host's headless output belongs to another sway — left alone"
-                    );
+                if journal::foreign_output("wlroots", name, instance, &sway_instance()) {
                     return Ok(());
                 }
                 swaymsg(&["output", name, "unplug"])
@@ -624,16 +617,7 @@ fn disable_other_heads(ours: &str, pending: &mut Vec<u64>) {
         &keep,
         disable_head,
         focus_output,
-        |plan| {
-            let heads = plan
-                .iter()
-                .map(|n| Head {
-                    name: n.clone(),
-                    mode: None,
-                })
-                .collect();
-            pending.push(journal::push("wlroots", Undo::EnableHeads { heads }));
-        },
+        |plan| pending.push(journal::push_heads("wlroots", plan)),
     );
 }
 
@@ -723,9 +707,9 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
 /// Re-enable heads `exclusive` disabled, **before** the output they made way for is unplugged:
 /// sway must not see zero enabled outputs. `enable` is the inverse of `disable` (Hyprland needs
 /// `hyprctl reload`). Every head is tried; the journal reads them back.
-fn restore_heads(heads: &[String]) -> Result<()> {
+fn restore_heads(heads: &[Head]) -> Result<()> {
     let mut refused = Vec::new();
-    for name in heads {
+    for Head { name, .. } in heads {
         if let Err(e) = swaymsg(&enable_argv(name)) {
             refused.push(format!("{name} ({e:#})"));
         }

@@ -307,16 +307,9 @@ impl VirtualDisplay for HyprlandDisplay {
     /// only if this Hyprland named it: another instance may have reused the name.
     fn undo(&mut self, undo: &Undo) -> Result<()> {
         match undo {
-            Undo::EnableHeads { heads } => {
-                let names: Vec<String> = heads.iter().map(|h| h.name.clone()).collect();
-                restore_heads(&names)
-            }
+            Undo::EnableHeads { heads } => restore_heads(heads),
             Undo::RemoveOutput { name, instance } => {
-                if instance.is_empty() || *instance != hypr_instance() {
-                    tracing::info!(
-                        output = %name,
-                        "hyprland: a dead host's headless output belongs to another Hyprland — left alone"
-                    );
+                if journal::foreign_output("hyprland", name, instance, &hypr_instance()) {
                     return Ok(());
                 }
                 if monitor(name, true)?.is_none() {
@@ -1090,16 +1083,7 @@ fn disable_other_heads(ours: &str, pending: &mut Vec<u64>) {
         &keep,
         disable_head,
         focus_output,
-        |plan| {
-            let heads = plan
-                .iter()
-                .map(|n| Head {
-                    name: n.clone(),
-                    mode: None,
-                })
-                .collect();
-            pending.push(journal::push("hyprland", Undo::EnableHeads { heads }));
-        },
+        |plan| pending.push(journal::push_heads("hyprland", plan)),
     );
 }
 
@@ -1186,8 +1170,8 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
 /// (`exec-once` does not). So it runs only when one of `heads` is dark. `reload`
 /// answers `ok` for "config parsed", not "the head came back": the journal reads
 /// the heads back, and one the operator's own config disables stays dark there.
-fn restore_heads(heads: &[String]) -> Result<()> {
-    for name in heads {
+fn restore_heads(heads: &[Head]) -> Result<()> {
+    for Head { name, .. } in heads {
         if head_is_enabled(name)? == Some(false) {
             return hyprctl_dispatch(&["reload"]).context("hyprctl reload");
         }

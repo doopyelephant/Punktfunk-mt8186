@@ -64,6 +64,35 @@ pub(crate) use linux::crash;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{apply, done, push, reclaim};
 
+/// Journal re-enabling the heads `names` (the plan an `exclusive` create is about to darken)
+/// for `backend`. Names only: sway and Hyprland keep a disabled head's mode themselves.
+#[cfg(target_os = "linux")]
+pub(crate) fn push_heads(backend: &'static str, names: &[String]) -> u64 {
+    let heads = names
+        .iter()
+        .map(|name| Head {
+            name: name.clone(),
+            mode: None,
+        })
+        .collect();
+    push(backend, Undo::EnableHeads { heads })
+}
+
+/// A dead host's output whose `instance` is not the `live` one (empty: none known) belongs to
+/// another compositor instance, which may have given the name to another output. Logged and
+/// left alone.
+#[cfg(target_os = "linux")]
+pub(crate) fn foreign_output(tag: &str, name: &str, instance: &str, live: &str) -> bool {
+    let foreign = instance.is_empty() || instance != live;
+    if foreign {
+        tracing::info!(
+            output = %name,
+            "{tag}: a dead host's headless output belongs to another compositor instance — left alone"
+        );
+    }
+    foreign
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::Undo;
