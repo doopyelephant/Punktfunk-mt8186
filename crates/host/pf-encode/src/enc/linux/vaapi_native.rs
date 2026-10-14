@@ -516,7 +516,8 @@ impl Encoder for NativeVaapiEncoder {
 
     /// The slot plan on the session's trusted slots, in the host's wire domain:
     /// taint what the loss touched, anchor the next picture on the newest older
-    /// one. `false` when nothing older survives — the caller keyframes.
+    /// one. With none, a wave answers. `false` when the session cannot wave either —
+    /// the caller keyframes.
     fn invalidate_ref_frames(&mut self, first: i64, last: i64) -> bool {
         if first < 0 || last < first {
             return false;
@@ -535,11 +536,16 @@ impl Encoder for NativeVaapiEncoder {
         if self.anchor.is_some() {
             return true;
         }
-        // No anchor, but a wave heals without one. The client re-armed at this loss, so one
-        // in flight runs out unmarked and a fresh one, whose start and close it counts,
-        // starts behind it.
+        // A wave in flight sweeps away a loss before its start; one inside the sweep spoils
+        // its close. The start is `index` pictures back: a skipped wire index only moves it
+        // earlier, which spoils more, never less.
+        let next_ts = session.next_wire() + self.wire_offset;
+        let spoils = self
+            .recovery
+            .wave
+            .is_some_and(|w| w.spoiled_by(Some(next_ts - i64::from(w.index)), next_ts, last));
         let policy = recovery_policy(session, &self.params);
-        if let Some(next) = self.recovery.lose(&policy, true) {
+        if let Some(next) = self.recovery.lose(&policy, spoils) {
             tracing::debug!(
                 first,
                 last,
