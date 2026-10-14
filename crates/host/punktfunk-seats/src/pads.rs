@@ -44,27 +44,40 @@ const RELAYED: &str = "/run/punktfunk/pads/relayed";
 static HELD: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Mutex::default);
 /// Pad servers per account, from the request to the device's end.
 static SERVED: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Mutex::default);
+/// Connections per peer uid, from accept until their request is read.
+static PENDING: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Mutex::default);
+/// Unread connections one uid may hold: a seat host sends its request at once.
+const PENDING_PER_UID: usize = 4;
+/// Unread connections from every uid together, each a thread of the unit's own task limit.
+const PENDING_TOTAL: usize = 16;
 
-/// One of an account's slots in `held`, given back on drop.
+/// One of a key's slots in `held`, an account's or a peer uid's, given back on drop.
 struct Slot {
     held: &'static Mutex<HashMap<String, usize>>,
-    account: String,
+    key: String,
 }
 
 impl Slot {
-    fn take(
-        held: &'static Mutex<HashMap<String, usize>>,
-        account: &str,
-        cap: usize,
-    ) -> Option<Slot> {
+    fn take(held: &'static Mutex<HashMap<String, usize>>, key: &str, cap: usize) -> Option<Slot> {
         admit(
             &mut held.lock().unwrap_or_else(|e| e.into_inner()),
-            account,
+            key,
             cap,
         )
         .then(|| Slot {
             held,
-            account: account.to_owned(),
+            key: key.to_owned(),
+        })
+    }
+
+    /// A slot for one unread connection from `uid`, within [`PENDING_PER_UID`] and
+    /// [`PENDING_TOTAL`].
+    fn pending(uid: u32) -> Option<Slot> {
+        let key = uid.to_string();
+        let admitted = admit_pending(&mut PENDING.lock().unwrap_or_else(|e| e.into_inner()), &key);
+        admitted.then_some(Slot {
+            held: &PENDING,
+            key,
         })
     }
 }
@@ -73,9 +86,14 @@ impl Drop for Slot {
     fn drop(&mut self) {
         release(
             &mut self.held.lock().unwrap_or_else(|e| e.into_inner()),
-            &self.account,
+            &self.key,
         );
     }
+}
+
+/// Counts one more unread connection from `uid`; `false` at its cap or the total.
+fn admit_pending(pending: &mut HashMap<String, usize>, uid: &str) -> bool {
+    pending.values().sum::<usize>() < PENDING_TOTAL && admit(pending, uid, PENDING_PER_UID)
 }
 
 /// Counts one more for `account`; `false` at `cap`.
@@ -304,7 +322,8 @@ pub fn refresh_hidraw() {
     }
 }
 
-/// Serves `listener` until the process ends: one thread per pad, for the pad's life.
+/// Serves `listener` until the process ends: one thread per pad, for the pad's life. A
+/// connection past its uid's share of unread ones ([`Slot::pending`]) closes unanswered.
 pub fn serve(listener: UnixListener, service: Arc<SeatService<LinuxBackend>>) {
     for stream in listener.incoming() {
         let stream = match stream {
@@ -314,24 +333,29 @@ pub fn serve(listener: UnixListener, service: Arc<SeatService<LinuxBackend>>) {
                 continue;
             }
         };
+        let uid = match socket::peer_uid(&stream) {
+            Ok(uid) => uid,
+            Err(error) => {
+                tracing::warn!(%error, "pads socket peer credentials");
+                continue;
+            }
+        };
+        let Some(pending) = Slot::pending(uid) else {
+            tracing::debug!(uid, "pads socket busy: connection closed");
+            continue;
+        };
         let service = Arc::clone(&service);
         let spawned = std::thread::Builder::new()
             .name("seat-pad".into())
-            .spawn(move || handle(&service, stream));
+            .spawn(move || handle(&service, stream, uid, pending));
         if let Err(error) = spawned {
             tracing::warn!(%error, "pads socket thread did not start");
         }
     }
 }
 
-fn handle(service: &SeatService<LinuxBackend>, stream: UnixStream) {
-    let uid = match socket::peer_uid(&stream) {
-        Ok(uid) => uid,
-        Err(error) => {
-            tracing::warn!(%error, "pads socket peer credentials");
-            return;
-        }
-    };
+/// Answers `uid`'s request. `pending` is given back once the request is read.
+fn handle(service: &SeatService<LinuxBackend>, stream: UnixStream, uid: u32, pending: Slot) {
     let Some(account) = service.backend().running_account(uid) else {
         tracing::warn!(uid, "pads socket refused a peer that is no running seat");
         return;
@@ -346,26 +370,33 @@ fn handle(service: &SeatService<LinuxBackend>, stream: UnixStream) {
         }
     };
     match request {
-        Request::Create { kind, index } => create(stream, &account, kind, index),
+        Request::Create { kind, index } => {
+            drop(pending);
+            create(stream, &account, kind, index);
+        }
         Request::Serve {
             kind,
             index,
             slot,
             identity_len,
-        } => match pad_broker::read_identity(&stream, identity_len) {
-            Ok(identity) => {
-                let hello = Hello {
-                    kind,
-                    index,
-                    slot,
-                    identity,
-                };
-                serve_usb(stream, &account, &hello);
+        } => {
+            let identity = pad_broker::read_identity(&stream, identity_len);
+            drop(pending);
+            match identity {
+                Ok(identity) => {
+                    let hello = Hello {
+                        kind,
+                        index,
+                        slot,
+                        identity,
+                    };
+                    serve_usb(stream, &account, &hello);
+                }
+                Err(error) => {
+                    tracing::debug!(error = %format!("{error:#}"), account, "pads socket request");
+                }
             }
-            Err(error) => {
-                tracing::debug!(error = %format!("{error:#}"), account, "pads socket request");
-            }
-        },
+        }
         // A seat host from before served USB pads hands over a device it serves itself, with
         // descriptors it chose. Its socket closes unattached; the host falls back to uhid.
         Request::Attach { .. } | Request::Detach { .. } => {
@@ -557,6 +588,24 @@ mod tests {
             !held.contains_key("pf-seat-1"),
             "a seat with no pads is forgotten"
         );
+    }
+
+    /// Unread connections: four per uid, sixteen in all, and a slot back once one is read.
+    #[test]
+    fn unread_connections_are_capped_per_uid_and_in_all() {
+        let mut pending = HashMap::new();
+        for _ in 0..PENDING_PER_UID {
+            assert!(admit_pending(&mut pending, "1000"));
+        }
+        assert!(!admit_pending(&mut pending, "1000"), "one uid's cap");
+        for uid in 1..PENDING_TOTAL / PENDING_PER_UID {
+            for _ in 0..PENDING_PER_UID {
+                assert!(admit_pending(&mut pending, &format!("200{uid}")));
+            }
+        }
+        assert!(!admit_pending(&mut pending, "3000"), "the total");
+        release(&mut pending, "1000");
+        assert!(admit_pending(&mut pending, "3000"));
     }
 
     /// A stop shuts down that seat's relays and USB sockets and no other seat's: the relay and
