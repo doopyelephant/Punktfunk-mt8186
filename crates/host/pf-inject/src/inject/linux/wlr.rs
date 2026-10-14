@@ -7,8 +7,9 @@
 //! A miss binds no output (whole-layout mapping). First-advertised is the
 //! operator's physical display, never the session head.
 
-use super::{gs_button_to_evdev, vk_to_evdev, InputEvent, InputInjector};
+use super::{InputEvent, InputInjector};
 use crate::head_pick::{self, HeadFacts, StreamTarget};
+use crate::plan::{Op, Plan};
 use crate::scroll::{AxisSource, ScrollBackend, ScrollMapper, ScrollOp};
 use anyhow::{bail, Context, Result};
 use punktfunk_core::input::InputKind;
@@ -167,13 +168,11 @@ pub struct WlrootsInjector {
     bound_output: Option<u32>,
     /// Aim generation [`Self::retarget`] last read the socket for an unbound name.
     lookup_gen: u64,
-    /// Buttons held on `pointer`. Released before destroy; the compositor will not.
-    pressed: Vec<u32>,
+    /// What `pointer` and `keyboard` hold. Released before either goes; the compositor will not.
+    plan: Plan,
     keyboard: ZwpVirtualKeyboardV1,
-    /// Keys held on `keyboard` (evdev). Only a transition reaches `xkb_state`: it counts
-    /// presses per key, and this injector outlives the session, so an unmatched down
-    /// would pin its modifier for the host's lifetime.
-    held_keys: Vec<u16>,
+    /// Fed only a key's toggles: it counts presses per key, and this injector outlives the
+    /// session, so an unmatched down would pin its modifier for the host's lifetime.
     xkb_state: xkb::State,
     _keymap_file: std::fs::File, // compositor mmaps this memfd; drop would unmap it
     text: Option<TextKeyboard>,
@@ -290,9 +289,8 @@ impl WlrootsInjector {
             pointer,
             bound_output,
             lookup_gen: crate::aim_gen(),
-            pressed: Vec::new(),
+            plan: Plan::default(),
             keyboard,
-            held_keys: Vec::new(),
             xkb_state,
             _keymap_file: file,
             text: None,
@@ -333,12 +331,7 @@ impl WlrootsInjector {
             return;
         };
         // Release first; destroy mid-press leaves a stuck host button.
-        if !self.pressed.is_empty() {
-            let t = self.now_ms();
-            for btn in std::mem::take(&mut self.pressed) {
-                self.pointer
-                    .button(t, btn, wl_pointer::ButtonState::Released);
-            }
+        if self.release_buttons(self.now_ms()) {
             self.pointer.frame();
         }
         self.pointer.destroy();
@@ -381,6 +374,61 @@ impl WlrootsInjector {
     /// Wire `time`: `CLOCK_MONOTONIC` ms, wrapping like the compositor's own stamps.
     fn now_ms(&self) -> u32 {
         (crate::monotonic_us() / 1_000) as u32
+    }
+
+    /// Release every button `pointer` holds, unframed. `true` when there was one.
+    fn release_buttons(&mut self, t: u32) -> bool {
+        let mut any = false;
+        for op in self.plan.lift(false, true) {
+            if let Op::Button { evdev, .. } = op {
+                self.pointer
+                    .button(t, evdev, wl_pointer::ButtonState::Released);
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// Emit one planned op. Only absolute motion depends on the bound output.
+    fn emit(&mut self, t: u32, op: Op) -> Result<()> {
+        match op {
+            Op::Motion { dx, dy } => {
+                self.pointer.motion(t, dx.into(), dy.into());
+                self.pointer.frame();
+            }
+            Op::Absolute(abs) => {
+                self.retarget();
+                let t = self.now_ms(); // `retarget` may have consumed time releasing buttons
+                let (x, y) = abs.in_extent();
+                self.pointer.motion_absolute(t, x, y, abs.w, abs.h);
+                self.pointer.frame();
+            }
+            Op::Button { evdev, down } => {
+                let st = if down {
+                    wl_pointer::ButtonState::Pressed
+                } else {
+                    wl_pointer::ButtonState::Released
+                };
+                self.pointer.button(t, evdev, st);
+                self.pointer.frame();
+            }
+            Op::Key {
+                evdev,
+                down,
+                toggles,
+            } => {
+                self.keyboard.key(t, evdev.into(), down.into());
+                if toggles {
+                    self.xkb_state
+                        .update_key(xkb_keycode(evdev), key_direction(down));
+                }
+                self.send_modifiers();
+            }
+            Op::Text(cp) => self.type_text(cp)?,
+            // No virtual-touch protocol here; touch is libei only.
+            Op::TouchDown { .. } | Op::TouchMove { .. } | Op::TouchUp { .. } => {}
+        }
+        Ok(())
     }
 
     /// One Unicode scalar on the text device. Controls are dropped; Enter/Backspace/Tab
@@ -488,16 +536,21 @@ impl Drop for WlrootsInjector {
     /// default), and an open gesture's axis interaction outlives the pointer's destroy.
     fn drop(&mut self) {
         let t = self.now_ms();
-        for evdev in std::mem::take(&mut self.held_keys) {
-            self.keyboard.key(t, evdev as u32, 0);
-            self.xkb_state
-                .update_key(xkb_keycode(evdev), key_direction(false));
+        // One up per evdev key: a key that does not toggle is already up.
+        for op in self.plan.lift(true, false) {
+            if let Op::Key {
+                evdev,
+                toggles: true,
+                ..
+            } = op
+            {
+                self.keyboard.key(t, evdev.into(), 0);
+                self.xkb_state
+                    .update_key(xkb_keycode(evdev), key_direction(false));
+            }
         }
         self.send_modifiers();
-        for btn in std::mem::take(&mut self.pressed) {
-            self.pointer
-                .button(t, btn, wl_pointer::ButtonState::Released);
-        }
+        self.release_buttons(t);
         let ops = self.scroll.cancel_all();
         self.emit_scroll_ops(t, ops);
         self.pointer.frame();
@@ -508,70 +561,13 @@ impl Drop for WlrootsInjector {
 impl InputInjector for WlrootsInjector {
     fn inject(&mut self, event: &InputEvent) -> Result<()> {
         let t = self.now_ms();
-        match event.kind {
-            InputKind::MouseMove => {
-                self.pointer.motion(t, event.x as f64, event.y as f64);
-                self.pointer.frame();
-            }
-            InputKind::MouseMoveAbs => {
-                let w = (event.flags >> 16) & 0xffff;
-                let h = event.flags & 0xffff;
-                if w > 0 && h > 0 {
-                    // Absolute motion maps onto the bound output; only this arm depends on it.
-                    self.retarget();
-                    let t = self.now_ms(); // `retarget` may have consumed time releasing buttons
-                                           // `x == w` would map onto the edge, which a neighbouring head owns.
-                    let x = event.x.clamp(0, w as i32 - 1) as u32;
-                    let y = event.y.clamp(0, h as i32 - 1) as u32;
-                    self.pointer.motion_absolute(t, x, y, w, h);
-                    self.pointer.frame();
-                }
-            }
-            InputKind::MouseButtonDown | InputKind::MouseButtonUp => {
-                if let Some(btn) = gs_button_to_evdev(event.code) {
-                    let st = if event.kind == InputKind::MouseButtonDown {
-                        if !self.pressed.contains(&btn) {
-                            self.pressed.push(btn);
-                        }
-                        wl_pointer::ButtonState::Pressed
-                    } else {
-                        self.pressed.retain(|&b| b != btn);
-                        wl_pointer::ButtonState::Released
-                    };
-                    self.pointer.button(t, btn, st);
-                    self.pointer.frame();
-                }
-            }
-            // Legacy and normalized scroll lower through the shared mapper;
-            // its Frame ops draw the frame boundaries (a stop never shares one
-            // with a delta).
-            InputKind::MouseScroll | InputKind::Scroll => {
-                let ops = self.scroll.plan(event);
-                self.emit_scroll_ops(t, ops);
-            }
-            InputKind::KeyDown | InputKind::KeyUp => {
-                let down = event.kind == InputKind::KeyDown;
-                if let Some(evdev) = vk_to_evdev(event.code as u8) {
-                    self.keyboard.key(t, evdev as u32, if down { 1 } else { 0 });
-                    if note_key(&mut self.held_keys, evdev, down) {
-                        self.xkb_state
-                            .update_key(xkb_keycode(evdev), key_direction(down));
-                    }
-                    self.send_modifiers();
-                } else {
-                    tracing::debug!(vk = event.code, "unmapped VK keycode — dropped");
-                }
-            }
-            InputKind::TextInput => {
-                self.type_text(event.code)?;
-            }
-            InputKind::GamepadState
-            | InputKind::GamepadButton
-            | InputKind::GamepadAxis
-            | InputKind::GamepadRemove
-            | InputKind::GamepadArrival => {}
-            // No virtual-touch protocol here; touch is libei only.
-            InputKind::TouchDown | InputKind::TouchMove | InputKind::TouchUp => {}
+        if matches!(event.kind, InputKind::MouseScroll | InputKind::Scroll) {
+            // Legacy and normalized scroll lower through the shared mapper; its Frame ops draw
+            // the frame boundaries (a stop never shares one with a delta).
+            let ops = self.scroll.plan(event);
+            self.emit_scroll_ops(t, ops);
+        } else if let Some(op) = self.plan.step(event) {
+            self.emit(t, op)?;
         }
         self.pump()
     }
@@ -589,19 +585,6 @@ impl InputInjector for WlrootsInjector {
         self.emit_scroll_ops(t, ops);
         self.pump()
     }
-}
-
-/// Record a key on the held set; `true` when it is a transition. A down for a held key is a
-/// repeat (or the up was lost to the client OS); an up for a key not held is stale. Neither
-/// may reach `xkb_state`, whose per-key press count only unwinds with matching ups.
-fn note_key(held: &mut Vec<u16>, evdev: u16, down: bool) -> bool {
-    let was_held = held.contains(&evdev);
-    if down && !was_held {
-        held.push(evdev);
-    } else if !down {
-        held.retain(|&k| k != evdev);
-    }
-    down != was_held
 }
 
 fn xkb_keycode(evdev: u16) -> xkb::Keycode {
@@ -667,28 +650,13 @@ mod tests {
     use super::*;
 
     const KEY_LEFTMETA: u16 = 125;
-    const KEY_A: u16 = 30;
+    const VK_LWIN: u32 = 0x5B;
 
-    /// A repeated down and a stale up are not transitions; the one up after repeats is.
+    /// The trap the plan's gate exists for: xkb counts presses per key, so two Super downs and
+    /// one up leave Super depressed for good. Fed only the plan's toggles, the same stream
+    /// clears it.
     #[test]
-    fn repeats_and_stale_ups_are_not_transitions() {
-        let mut held = Vec::new();
-        assert!(note_key(&mut held, KEY_LEFTMETA, true));
-        assert!(!note_key(&mut held, KEY_LEFTMETA, true), "auto-repeat");
-        assert!(!note_key(&mut held, KEY_LEFTMETA, true));
-        assert!(note_key(&mut held, KEY_A, true));
-        assert!(note_key(&mut held, KEY_LEFTMETA, false));
-        assert!(
-            !note_key(&mut held, KEY_LEFTMETA, false),
-            "session-end release after a real up"
-        );
-        assert_eq!(held, [KEY_A]);
-    }
-
-    /// The trap the gate exists for: xkb counts presses per key, so two Super downs and one up
-    /// leave Super depressed for good. Gated on transitions, the same stream clears it.
-    #[test]
-    fn xkb_counts_presses_so_only_transitions_may_feed_it() {
+    fn xkb_counts_presses_so_only_toggles_may_feed_it() {
         let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let Some(keymap) = xkb::Keymap::new_from_names(
             &ctx,
@@ -702,17 +670,27 @@ mod tests {
             eprintln!("no xkb data on this box — skipped");
             return;
         };
-        let stream = [
-            (KEY_LEFTMETA, true),
-            (KEY_LEFTMETA, true),
-            (KEY_LEFTMETA, false),
-        ];
+        let stream = [true, true, false];
         let depressed = |gate: bool| {
             let mut st = xkb::State::new(&keymap);
-            let mut held = Vec::new();
-            for (k, down) in stream {
-                if !gate || note_key(&mut held, k, down) {
-                    st.update_key(xkb_keycode(k), key_direction(down));
+            let mut plan = Plan::default();
+            for down in stream {
+                let kind = if down {
+                    InputKind::KeyDown
+                } else {
+                    InputKind::KeyUp
+                };
+                let ev = InputEvent {
+                    kind,
+                    _pad: [0; 3],
+                    code: VK_LWIN,
+                    x: 0,
+                    y: 0,
+                    flags: 0,
+                };
+                let toggles = matches!(plan.step(&ev), Some(Op::Key { toggles: true, .. }));
+                if !gate || toggles {
+                    st.update_key(xkb_keycode(KEY_LEFTMETA), key_direction(down));
                 }
             }
             st.serialize_mods(xkb::STATE_MODS_DEPRESSED)
