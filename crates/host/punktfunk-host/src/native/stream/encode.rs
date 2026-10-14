@@ -550,7 +550,7 @@ impl StreamState {
                 last,
                 meta,
             };
-            if self.frame_tx.send(SendMsg::Chunk(msg)).is_err() {
+            if !self.send.send(SendMsg::Chunk(msg)) {
                 return Polled::SendGone;
             }
             if last {
@@ -612,7 +612,7 @@ impl StreamState {
             data: au.data,
         };
         self.bringup.mark("first_au");
-        if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
+        if !self.send.send(SendMsg::Frame(msg)) {
             return Polled::SendGone;
         }
         self.clock.au_seq = self.clock.au_seq.wrapping_add(1);
@@ -832,7 +832,7 @@ impl StreamState {
                     driver: None,
                 },
             };
-            if self.frame_tx.send(SendMsg::Frame(msg)).is_err() {
+            if !self.send.send(SendMsg::Frame(msg)) {
                 break;
             }
             self.clock.au_seq = self.clock.au_seq.wrapping_add(1);

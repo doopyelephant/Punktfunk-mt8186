@@ -395,8 +395,10 @@ mod tests {
             live_session: crate::session_status::register(
                 crate::session_status::Registration::fake("swap-test"),
             ),
-            frame_tx: Arc::new(frame_tx),
-            send_thread: std::thread::spawn(|| {}),
+            send: super::super::send::SendThread::new(
+                Arc::new(frame_tx),
+                std::thread::spawn(|| {}),
+            ),
             send_spread_us: Default::default(),
             wire_rekeys: Default::default(),
             live_mode: Arc::new(AtomicU64::new(0)),
@@ -505,6 +507,30 @@ mod tests {
             _endpoints: (server, client),
             _rt: rt,
         }
+    }
+
+    /// A `?` out of the loop reaches the same finish as the clean tail: the session is ended
+    /// as `host_error`, and its summary carries the tally.
+    #[test]
+    fn an_error_exit_finishes_like_a_clean_one() {
+        use crate::events::SessionEndReason;
+        let Fake {
+            st,
+            _client,
+            _endpoints,
+            _rt,
+        } = fake();
+        let id = st.live_session.id;
+        let life = st.life.clone();
+        st.finish(false);
+        assert!(life.stopping());
+        assert_eq!(life.reason(), Some(SessionEndReason::HostError));
+        let mine = crate::session_status::recent()
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("the finished session is summarised");
+        assert_eq!(mine.ended, SessionEndReason::HostError);
+        assert_eq!(mine.frames_sent, Some(0));
     }
 
     /// What one swap site leaves behind. Everything not named here holds for every site: nothing

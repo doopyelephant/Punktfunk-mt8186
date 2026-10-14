@@ -136,18 +136,14 @@ pub(super) struct StreamState {
     pub(super) last_cadence_log: Option<std::time::Instant>,
     pub(super) cadence_flips_suppressed: u32,
 
-    // ---- teardown order, which is field order: the status registration ends first, then
-    // the send thread, then game policy, then capture, encoder, display ----
+    // ---- teardown order, which is field order: the send thread first, so the summary the
+    // registration emits holds its last counters; then game policy, capture, encoder, display ----
     pub(super) _watcher: Option<std::thread::JoinHandle<()>>,
     /// `Some(joined)` on the seat's own session, which follows the seat's mode.
     #[cfg(target_os = "linux")]
     pub(super) seat_join: Option<bool>,
+    pub(super) send: super::send::SendThread,
     pub(super) live_session: crate::session_status::LiveSessionGuard,
-    // ---- the send thread ----
-    /// The one strong handle: a client's NACK reaches the send thread through a weak one,
-    /// so dropping this still ends the thread.
-    pub(super) frame_tx: Arc<std::sync::mpsc::SyncSender<SendMsg>>,
-    pub(super) send_thread: std::thread::JoinHandle<()>,
     pub(super) send_spread_us: Arc<AtomicU32>,
     pub(super) wire_rekeys: Arc<AtomicU32>,
     pub(super) live_mode: Arc<AtomicU64>,
@@ -751,8 +747,7 @@ impl StreamState {
             reconfig_result_tx,
             retarget_tx,
             gap_tx,
-            frame_tx,
-            send_thread,
+            send: super::send::SendThread::new(frame_tx, send_thread),
             send_spread_us,
             wire_rekeys,
             live_mode,
@@ -927,14 +922,13 @@ impl StreamState {
     /// Both ends reach this: the clean tail and a `?` out of the loop. A clean loop drains
     /// the encoder (an errored one is not polled); then the send thread is joined, the
     /// registry gets this session's totals, and the reason is latched. Only a panic skips
-    /// it, which the summary reads as `host_error`.
-    fn finish(mut self, clean: bool) {
+    /// it, which the summary reads as `host_error`; the send thread's own drop joins it then.
+    pub(super) fn finish(mut self, clean: bool) {
         self.life.enter(crate::lifecycle::Phase::Ending);
         if clean {
             self.drain();
         }
-        drop(self.frame_tx);
-        let _ = self.send_thread.join();
+        self.send.join();
         // Source against wire: `source_seq` is what DWM composed into the driver's pool,
         // `dropped` what the pool refused. A source under the refresh rate is the desktop.
         let src = self.capturer.health();
