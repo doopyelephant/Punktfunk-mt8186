@@ -18,20 +18,14 @@ pub(super) struct DataPump {
     pub(super) session: Session,
     pub(super) shared: Arc<ClientShared>,
     pub(super) ctrl_tx: tokio::sync::mpsc::Sender<CtrlRequest>,
-    pub(super) clock_gen: Arc<AtomicU32>,
+    /// The control task's [`PumpEvent`]s, drained once per iteration ([`drain_events`]).
+    pub(super) events: std::sync::mpsc::Receiver<PumpEvent>,
+    /// The pump's own end of that channel: a frame that opens a configured epoch moves the
+    /// mode through it, as the control task does.
+    pub(super) events_tx: PumpTx,
     /// Host encode-stage window ([`super::super::frame_channel::EncodeLatAcc`]);
     /// fed by the datagram task, not the overlay's lossy `host_timing_tx`.
     pub(super) encode_lat: Arc<Mutex<super::super::frame_channel::EncodeLatAcc>>,
-    /// Control-task mode-switch generation. A change resets mode-scoped ABR
-    /// state ([`crate::abr::Driver::on_mode_switch`]).
-    pub(super) mode_gen: Arc<AtomicU32>,
-    /// Host `BitrateChanged` acks, drained in arrival order. A queue so a
-    /// corrective short retarget cannot be clobbered by a full resolve ack
-    /// in the same window (host-cap learning needs two consecutive shorts).
-    pub(super) bitrate_ack: Arc<Mutex<AckQueue>>,
-    /// Host pipeline-rebuild gap in ms ([`crate::quic::PipelineGap`]); `0` =
-    /// none. Drained each iteration — see [`take_pipeline_gap`].
-    pub(super) pipeline_gap: Arc<AtomicU32>,
     /// Embedder-requested rate. `0` = Automatic (the only case ABR arms).
     pub(super) bitrate_kbps: u32,
     /// Rate the host actually configured (Welcome echo; old host echoes 0).
@@ -89,8 +83,6 @@ struct PumpLoop {
     /// That keyframe has not arrived: the decoder holds none of the pictures the frames
     /// before it reference, and a hardware decoder fed one can die.
     awaiting_idr: bool,
-    seen_clock_gen: u32,
-    seen_mode_gen: u32,
     /// Epoch of the last frame handed on; a new one may move the mode ([`super::anchor`]).
     last_epoch: Option<u8>,
     /// When the socket's drop count was last read.
@@ -196,8 +188,6 @@ impl DataPump {
             last_index: None,
             unconsumed_aus: 0,
             awaiting_idr: false,
-            seen_clock_gen: self.clock_gen.load(Ordering::Relaxed),
-            seen_mode_gen: self.mode_gen.load(Ordering::Relaxed),
             last_epoch: None,
             sock_read: Instant::now(),
             host_link: Default::default(),
@@ -285,13 +275,13 @@ impl DataPump {
         driver
     }
 
-    /// Everything the driver hears before this iteration's tick, in the
-    /// order it hears it. Returns whether a probe burst is in flight.
+    /// Everything the driver hears before this iteration's tick, in the order it hears it.
+    /// The control task's events are drained once, at the top. Returns whether a probe burst
+    /// is in flight.
     fn feed_driver(&mut self, lp: &mut PumpLoop, clock_offset_ns: i64) -> bool {
+        let events = drain_events(&self.events);
         // Re-sync invalidates the staleness run under the old offset.
-        let clock_gen = self.clock_gen.load(Ordering::Relaxed);
-        if clock_gen != lp.seen_clock_gen {
-            lp.seen_clock_gen = clock_gen;
+        if events.resynced {
             // Every OWD reading shifted with the offset; the old floor is
             // meaningless. A stale offset that WAS the elevation is fixed here.
             lp.standing_lat.rebase();
@@ -301,7 +291,7 @@ impl DataPump {
         }
         // Drain here, not at the report tick, so the in-flight window
         // (the one the rebuild corrupted) is the one we can still drop.
-        if let Some(gap_ms) = take_pipeline_gap(&self.pipeline_gap) {
+        if let Some(gap_ms) = events.gap_ms {
             lp.abr.on_pipeline_gap(gap_ms);
         }
         // Mirror drop/FEC counters every iteration, not only on a
@@ -359,18 +349,15 @@ impl DataPump {
         if let Some(r) = probe_report {
             lp.abr.on_probe_result(r, Instant::now());
         }
-        let mg = self.mode_gen.load(Ordering::Relaxed);
-        if mg != lp.seen_mode_gen {
-            lp.seen_mode_gen = mg;
-            let m = *self.shared.mode.lock().unwrap();
+        if let Some(m) = events.mode {
             lp.abr.on_mode_switch(m.width, m.height, m.refresh_hz);
             self.shared
                 .feedback
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .set_refresh(m.refresh_hz);
         }
-        for (acked, why) in self.bitrate_ack.lock().unwrap().drain(..) {
+        for (acked, why) in events.acks {
             lp.abr.on_ack(acked, why);
         }
         // Drain even when the controller is off, so the accumulators
@@ -747,9 +734,14 @@ impl DataPump {
             .on_frame(frame.frame_index, frame.flags);
         if lp.last_epoch != Some(frame.epoch) {
             lp.last_epoch = Some(frame.epoch);
-            let delivered = self.shared.anchor.lock().unwrap().frame(frame.epoch);
+            let delivered = self
+                .shared
+                .anchor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .frame(frame.epoch);
             if let Some(mode) = delivered {
-                super::anchor::apply(&self.shared.mode, &self.mode_gen, mode);
+                super::anchor::apply(&self.shared.mode, &self.events_tx, mode);
             }
         }
         // The decoder's RFI for this gap reads what the skipped frame lacks now.
@@ -895,14 +887,31 @@ fn env_u32(key: &str) -> Option<u32> {
         .filter(|&v| v > 0)
 }
 
-/// Drain the host's pending pipeline gap. `Some(gap_ms)` = the in-flight
-/// report window must be discarded. Swap-to-zero so one announcement
-/// cannot keep poisoning later windows.
-fn take_pipeline_gap(slot: &AtomicU32) -> Option<u32> {
-    match slot.swap(0, Ordering::Relaxed) {
-        0 => None,
-        gap_ms => Some(gap_ms),
+/// The control task's events since the last iteration, folded the way the pump applies them.
+#[derive(Debug, Default, PartialEq)]
+struct Drained {
+    /// One re-sync re-bases the latency floors however many landed.
+    resynced: bool,
+    /// The newest gap: one discard per window.
+    gap_ms: Option<u32>,
+    /// The newest mode, applied once.
+    mode: Option<crate::config::Mode>,
+    /// Every ack in arrival order: host-cap learning needs two consecutive short acks in one
+    /// window, so a full resolve ack must not clobber a corrective short one.
+    acks: Vec<(u32, Option<crate::quic::AckReason>)>,
+}
+
+fn drain_events(rx: &std::sync::mpsc::Receiver<PumpEvent>) -> Drained {
+    let mut d = Drained::default();
+    for ev in rx.try_iter() {
+        match ev {
+            PumpEvent::ClockResynced => d.resynced = true,
+            PumpEvent::BitrateAck(kbps, why) => d.acks.push((kbps, why)),
+            PumpEvent::PipelineGap(ms) => d.gap_ms = Some(ms),
+            PumpEvent::Mode(m) => d.mode = Some(m),
+        }
     }
+    d
 }
 
 #[cfg(test)]
@@ -910,18 +919,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_pipeline_gap_is_taken_exactly_once() {
-        let slot = AtomicU32::new(0);
-        assert_eq!(
-            take_pipeline_gap(&slot),
-            None,
-            "an idle session announces nothing"
-        );
-        slot.store(401, Ordering::Relaxed);
-        assert_eq!(take_pipeline_gap(&slot), Some(401));
-        // Drain bounds discard to one window. Silence would look like
-        // a clean link to host adaptive FEC.
-        assert_eq!(take_pipeline_gap(&slot), None);
+    fn events_fold_to_what_the_pump_applies_once() {
+        let mode = |width| crate::config::Mode {
+            width,
+            height: 720,
+            refresh_hz: 60,
+        };
+        let short = Some(crate::quic::AckReason::EncoderLimit);
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert_eq!(drain_events(&rx), Drained::default(), "an idle session");
+        for ev in [
+            PumpEvent::PipelineGap(401),
+            PumpEvent::BitrateAck(8_000, short),
+            PumpEvent::Mode(mode(1280)),
+            PumpEvent::ClockResynced,
+            PumpEvent::BitrateAck(20_000, None),
+            PumpEvent::ClockResynced,
+            PumpEvent::Mode(mode(1920)),
+            PumpEvent::PipelineGap(120),
+        ] {
+            tx.send(ev).unwrap();
+        }
+        let want = Drained {
+            resynced: true,
+            gap_ms: Some(120),
+            mode: Some(mode(1920)),
+            acks: vec![(8_000, short), (20_000, None)],
+        };
+        assert_eq!(drain_events(&rx), want);
+        // Taken once: the gap discards one window, not every later one.
+        assert_eq!(drain_events(&rx), Drained::default());
     }
 
     /// The loopback sessions' config, for either end.
@@ -976,15 +1003,14 @@ mod tests {
         let _ = shared.feedback_tx.set(Box::new(move |fb| {
             let _ = fb_tx.send(*fb);
         }));
+        let (events_tx, events) = std::sync::mpsc::channel();
         let pump = DataPump {
             session,
             shared,
             ctrl_tx,
-            clock_gen: Arc::new(AtomicU32::new(0)),
+            events,
+            events_tx,
             encode_lat: Arc::new(Mutex::new(Default::default())),
-            mode_gen: Arc::new(AtomicU32::new(0)),
-            bitrate_ack: Arc::new(Mutex::new(AckQueue::new())),
-            pipeline_gap: Arc::new(AtomicU32::new(0)),
             bitrate_kbps: 20_000,
             resolved_bitrate_kbps: 20_000,
             negotiated_codec: codec,
@@ -1301,7 +1327,7 @@ mod tests {
     }
 
     /// Host-rebuild repair, end to end: a real [`PipelineGap`] on a real
-    /// control stream, the control task parks it, the pump discards the
+    /// control stream, the control task sends it on, the pump discards the
     /// window it landed in.
     ///
     /// Assertions watch the window's report — the discarded window's
@@ -1323,15 +1349,21 @@ mod tests {
             .expect("open the stream with a message the client ignores");
         let (ctrl_send, ctrl_recv) = accept_ctrl.await.unwrap();
 
-        let pipeline_gap = Arc::new(AtomicU32::new(0));
-        // Hold the sender so the task does not exit on a closed channel.
-        let (_task_ctrl_tx, task_ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(8);
-        let (planes, _planes_rx) = crate::client::planes::channels();
         let mode = crate::config::Mode {
             width: 1920,
             height: 1080,
             refresh_hz: 60,
         };
+        // Explicit bitrate (not Automatic): keep the controller and the
+        // startup probe out. The probe would discard a window of its own.
+        let pump_shared = Arc::new(ClientShared::new(mode));
+        let (_host_tp, session) = idle_client_session(crate::quic::wall_clock_ns());
+        let (pump, _pump_ctrl_rx, fb_rx) =
+            test_pump(session, pump_shared.clone(), crate::quic::CODEC_HEVC);
+
+        // Hold the sender so the task does not exit on a closed channel.
+        let (_task_ctrl_tx, task_ctrl_rx) = tokio::sync::mpsc::channel::<CtrlRequest>(8);
+        let (planes, _planes_rx) = crate::client::planes::channels();
         tokio::spawn(
             super::super::control_task::ControlTask {
                 ctrl_rx: task_ctrl_rx,
@@ -1339,25 +1371,14 @@ mod tests {
                 ctrl_recv: CtlRecv::new(ctrl_recv),
                 clock_rtt_ns: None, // no connect handshake ⇒ no re-sync batches to interleave
                 shared: Arc::new(ClientShared::new(mode)),
-                bitrate_ack: Arc::new(Mutex::new(AckQueue::new())),
-                pipeline_gap: pipeline_gap.clone(),
-                clock_gen: Arc::new(AtomicU32::new(0)),
+                events: pump.events_tx.clone(),
                 clip_event_tx: planes.clip_event,
                 cursor_shape_tx: planes.cursor_shape,
-                mode_gen: Arc::new(AtomicU32::new(0)),
                 access_tx: planes.access,
                 hidout_tx: planes.datagram.hidout,
             }
             .run(),
         );
-
-        // Explicit bitrate (not Automatic): keep the controller and the
-        // startup probe out. The probe would discard a window of its own.
-        let pump_shared = Arc::new(ClientShared::new(mode));
-        let (_host_tp, session) = idle_client_session(crate::quic::wall_clock_ns());
-        let (mut pump, _pump_ctrl_rx, fb_rx) =
-            test_pump(session, pump_shared.clone(), crate::quic::CODEC_HEVC);
-        pump.pipeline_gap = pipeline_gap.clone();
         let started = Instant::now();
         let pump_thread = std::thread::spawn(move || pump.run());
 
@@ -1376,14 +1397,9 @@ mod tests {
             fb_rx.try_iter().all(|fb| fb.window == 0),
             "the window the host's rebuild landed in must be discarded, not reported"
         );
-        assert_eq!(
-            pipeline_gap.load(Ordering::Relaxed),
-            0,
-            "and the announcement must be drained, so it can't discard a second window"
-        );
 
-        // Next window must report. A wedged pump would fail here rather
-        // than pass the discard assert above.
+        // Next window must report: the gap discards one window, not a second. A wedged
+        // pump would fail here rather than pass the discard assert above.
         let reported = tokio::task::spawn_blocking(move || {
             let deadline = Instant::now() + Duration::from_millis(1_500);
             loop {

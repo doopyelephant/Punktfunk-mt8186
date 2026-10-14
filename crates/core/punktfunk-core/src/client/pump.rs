@@ -23,9 +23,22 @@ mod handshake;
 mod input_task;
 mod rx_gap;
 
-/// Host bitrate acks the control task parked for the pump, each with the
-/// reason it carried (`None` from a host that does not name its limits).
-type AckQueue = std::collections::VecDeque<(u32, Option<crate::quic::AckReason>)>;
+/// What the control task tells the data pump, in arrival order. The pump drains the channel
+/// once per iteration ([`data::drain_events`]).
+#[derive(Debug, PartialEq)]
+enum PumpEvent {
+    /// A mid-stream clock re-sync moved [`ClientShared::clock_offset`].
+    ClockResynced,
+    /// A host `BitrateChanged`, with its reason (`None` from a host that does not name its
+    /// limits).
+    BitrateAck(u32, Option<crate::quic::AckReason>),
+    /// The host rebuilt its pipeline (gap in ms): the report window in flight is discarded.
+    PipelineGap(u32),
+    /// The host now delivers this mode.
+    Mode(crate::config::Mode),
+}
+
+type PumpTx = std::sync::mpsc::Sender<PumpEvent>;
 
 /// The control stream's write half.
 pub(super) type CtlSend = quinn::SendStream;
@@ -202,8 +215,6 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         access_deadline_from(wall_clock_ns(), welcome.expires_in_secs),
         Ordering::Relaxed,
     );
-    // Bumped when a re-sync batch is applied; the pump resets staleness and re-arms jump-to-live.
-    let clock_gen = Arc::new(AtomicU32::new(0));
     // Normalized scroll only toward HOST_CAP2_SCROLL; an older host gets each
     // event converted once at the outbound seam instead.
     let normalized_scroll = welcome.host_caps2 & crate::quic::HOST_CAP2_SCROLL != 0;
@@ -270,19 +281,12 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         }
     });
 
-    // BitrateChanged queue, drained in order. Not latest-wins: host-cap learning
-    // needs two consecutive short acks in the same 750 ms window.
-    let bitrate_ack: Arc<Mutex<AckQueue>> = Arc::new(Mutex::new(AckQueue::new()));
-    // Host `PipelineGap` length. A local rebuild starves a window without the
-    // link failing; drain and discard the in-flight report or ABR sees congestion.
-    let pipeline_gap = Arc::new(AtomicU32::new(0));
     // ABR encode signal ([`EncodeLatAcc`]): datagram task samples 0xCF; pump drains a window mean.
     let encode_lat = Arc::new(Mutex::new(super::frame_channel::EncodeLatAcc::default()));
-    // Bumped on an accepted mode switch (`clock_gen` pattern). Pump resets host cap and encode baseline.
-    let mode_gen = Arc::new(AtomicU32::new(0));
+    let (events_tx, events) = std::sync::mpsc::channel();
 
-    // Handshake stream stays open ([`control_task`]). When `mode_gen` moves, the
-    // data pump re-sizes ABR encode thresholds for the new refresh.
+    // Handshake stream stays open ([`control_task`]); what it hears for the pump arrives as
+    // [`PumpEvent`]s.
     tokio::spawn(
         control_task::ControlTask {
             ctrl_rx,
@@ -290,12 +294,9 @@ pub(super) async fn run_pump(args: WorkerArgs) {
             ctrl_recv,
             clock_rtt_ns,
             shared: shared.clone(),
-            bitrate_ack: bitrate_ack.clone(),
-            pipeline_gap: pipeline_gap.clone(),
-            clock_gen: clock_gen.clone(),
+            events: events_tx.clone(),
             clip_event_tx: planes.clip_event.clone(),
             cursor_shape_tx: planes.cursor_shape,
-            mode_gen: mode_gen.clone(),
             access_tx: planes.access,
             hidout_tx: planes.datagram.hidout.clone(),
         }
@@ -350,11 +351,9 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         session,
         shared: shared.clone(),
         ctrl_tx,
-        clock_gen,
+        events,
+        events_tx,
         encode_lat,
-        mode_gen,
-        bitrate_ack,
-        pipeline_gap,
         bitrate_kbps,
         resolved_bitrate_kbps,
         negotiated_codec,

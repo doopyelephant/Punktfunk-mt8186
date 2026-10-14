@@ -117,7 +117,7 @@ pub(crate) enum StandingLatAction {
     None,
     /// Mid-stream clock re-sync first: a stale offset from a stepped wall clock
     /// produces this signature. An applied re-sync re-bases the floor via the
-    /// pump's `clock_gen` watch.
+    /// pump's re-sync event.
     Resync {
         above_ms: i64,
     },
@@ -211,7 +211,7 @@ impl StandingLatency {
         self.window_min_ns = None;
     }
 
-    /// Applied mid-stream re-sync (pump `clock_gen` watch): OWDs shifted, so
+    /// Applied mid-stream re-sync (the pump's re-sync event): OWDs shifted, so
     /// discard floor and elevation. Bleed budget survives (it caps keyframes
     /// per session).
     pub(crate) fn rebase(&mut self) {
