@@ -1247,173 +1247,186 @@ impl ServiceState {
         }
     }
 
-    /// The console home's rows: saved hosts in store order, each followed by its pinned
-    /// preset cards (design §5.2a), then discovered-but-unsaved ones by name, then a
-    /// still-uncovered `--browse` seed. `home::arrange` applies the player's sort; the Apple
-    /// and Android producers send the same order (`clients/shared/host-row-vectors.json`).
+    /// The console home's rows, from the stores as they are on disk now.
     fn rows(&self) -> Vec<HostRow> {
         let known = trust::KnownHosts::load();
         let catalog = pf_client_core::presets::PresetsFile::load();
         let probed = self.probed.lock().unwrap();
-        let chip = |p: &pf_client_core::presets::StreamPreset| pf_console_ui::PresetChip {
-            id: p.id.clone(),
-            name: p.name.clone(),
-            accent: p.accent.clone(),
-            // Only the speed test reads this: a preset that PINS bitrate is the layer its
-            // host streams at, so the console must not offer to write the global instead.
-            bitrate_kbps: p.overrides.bitrate_kbps,
-        };
-        let mut rows: Vec<HostRow> = known
-            .hosts
-            .iter()
-            .flat_map(|h| {
-                let key = if h.fp_hex.is_empty() {
-                    format!("{}:{}", h.addr, h.port)
-                } else {
-                    h.fp_hex.clone()
-                };
-                let advert = self
-                    .discovered
-                    .values()
-                    .find(|d| discovery::same_host(h, d));
-                let online = probed.get(&key).copied().unwrap_or(false);
-                // Everything the advert teaches, while it is visible: mgmt port, OS chain, wake
-                // MAC (a Deck in Gaming Mode runs only this console and the Decky panel), and an
-                // address the sweep asks; the card moves only once its pin answers there.
-                if let Some(a) = advert {
-                    pf_client_core::trust::learn_from_advert(
-                        &h.fp_hex,
-                        &h.addr,
-                        h.port,
-                        &a.addr,
-                        &a.mac,
-                        &a.os,
-                        a.mgmt_port,
-                    );
-                }
-                let row = HostRow {
-                    key: key.clone(),
-                    id: h.id.clone(),
-                    name: host_display_name(&h.name, &h.addr),
-                    addr: h.addr.clone(),
-                    port: h.port,
-                    fp_hex: h.fp_hex.clone(),
-                    paired: h.paired,
-                    saved: true,
-                    online,
-                    // Live advert first, then what we saved from an earlier one, then 47990 —
-                    // the same three rungs `os` uses just below. Reading the advert ALONE is why
-                    // a host on a moved mgmt port lost its library the moment mDNS went quiet.
-                    mgmt_port: advert
-                        .and_then(|d| d.mgmt_port)
-                        .or(h.mgmt_port)
-                        .unwrap_or(library::DEFAULT_MGMT_PORT),
-                    can_wake: !online && !h.mac.is_empty(),
-                    clipboard_sync: h.clipboard_sync,
-                    last_used: h.last_used,
-                    os: advert
-                        .filter(|d| !d.os.is_empty())
-                        .map(|d| d.os.clone())
-                        .unwrap_or_else(|| h.os.clone()),
-                    // Whatever this host last told us it lets this device do to it. Empty
-                    // until the first refresh answers, and empty forever for a host that has
-                    // no such route or a device without the grant — the menu simply has no
-                    // power rows then.
-                    actions: pf_client_core::host_actions::cached(&h.fp_hex)
-                        .into_iter()
-                        .map(|a| pf_console_ui::HostAction {
-                            label: a.label().to_string(),
-                            id: a.id,
-                            danger: a.danger,
-                            available: a.available,
-                            unavailable_reason: a.unavailable_reason.unwrap_or_default(),
-                        })
-                        .collect(),
-                    pin: None,
-                    bound_preset: h
-                        .preset_id
-                        .as_deref()
-                        .and_then(|id| catalog.find_by_id(id))
-                        .map(chip),
-                    // What this host last said it has up, from the same TTL'd cache the
-                    // actions come from. Empty until the first refresh answers — and for
-                    // an unpaired host, which has nothing to authenticate the ask with.
-                    running: library::now_playing(&h.fp_hex),
-                    // Ids straight through, dangling ones included: the bind screen only
-                    // compares, and a deleted preset falls back at resolve, not here.
-                    game_presets: h.game_presets.clone(),
-                    profile: h.profile.clone(),
-                };
-                // A pinned card shares the primary tile's live state; its own key lets
-                // cursor-follow and the wake path address the card itself.
-                let pins = h
-                    .resolved_pins(&catalog)
-                    .into_iter()
-                    .map(|p| HostRow {
-                        key: pf_console_ui::model::pinned_key(&key, &p.id),
-                        pin: Some(chip(p)),
-                        bound_preset: None,
-                        ..row.clone()
-                    })
-                    .collect::<Vec<_>>();
-                std::iter::once(row).chain(pins)
-            })
-            .collect();
-
-        let mut extra: Vec<HostRow> = self
-            .discovered
-            .values()
-            .filter(|d| !known.hosts.iter().any(|h| discovery::same_host(h, d)))
-            .map(|d| {
-                let key = if d.fp_hex.is_empty() {
-                    format!("{}:{}", d.addr, d.port)
-                } else {
-                    d.fp_hex.clone()
-                };
-                let online = probed.get(&key).copied().unwrap_or(false);
-                HostRow {
-                    key,
-                    // Discovered, not saved: no store record, so no id to point at.
-                    id: None,
-                    name: host_display_name(&d.name, &d.addr),
-                    addr: d.addr.clone(),
-                    port: d.port,
-                    fp_hex: d.fp_hex.clone(),
-                    paired: false,
-                    saved: false,
-                    // The probe, as for saved rows: an advert outlives a host that went to sleep.
-                    online,
-                    mgmt_port: d.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
-                    can_wake: false,
-                    clipboard_sync: false,
-                    last_used: None,
-                    os: d.os.clone(),
-                    // Discovered but unsaved: not paired, so there is nothing it would let us
-                    // do, and no identity to ask what it is running.
-                    actions: Vec::new(),
-                    pin: None,
-                    bound_preset: None,
-                    running: String::new(),
-                    game_presets: Default::default(),
-                    profile: None,
-                }
-            })
-            .collect();
-        extra.sort_by_key(|h| h.name.to_lowercase());
-        rows.extend(extra);
-
-        if let Some(seed) = &self.seed {
-            if !rows
-                .iter()
-                .any(|r| r.addr == seed.addr && r.port == seed.port)
-            {
-                let mut seed = seed.clone();
-                seed.online = probed.get(&seed.key).copied().unwrap_or(false);
-                rows.push(seed);
-            }
-        }
-        rows
+        build_rows(
+            &known,
+            &catalog,
+            &self.discovered,
+            &probed,
+            self.seed.as_ref(),
+        )
     }
+}
+
+/// The console home's rows: saved hosts in store order, each followed by its pinned
+/// preset cards (design §5.2a), then discovered-but-unsaved ones by name, then a
+/// still-uncovered `--browse` seed. `home::arrange` applies the player's sort; the Apple
+/// and Android producers send the same order (`clients/shared/host-row-vectors.json`).
+fn build_rows(
+    known: &trust::KnownHosts,
+    catalog: &pf_client_core::presets::PresetsFile,
+    discovered: &HashMap<String, discovery::DiscoveredHost>,
+    probed: &HashMap<String, bool>,
+    seed: Option<&HostRow>,
+) -> Vec<HostRow> {
+    let chip = |p: &pf_client_core::presets::StreamPreset| pf_console_ui::PresetChip {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        accent: p.accent.clone(),
+        // Only the speed test reads this: a preset that PINS bitrate is the layer its
+        // host streams at, so the console must not offer to write the global instead.
+        bitrate_kbps: p.overrides.bitrate_kbps,
+    };
+    let mut rows: Vec<HostRow> = known
+        .hosts
+        .iter()
+        .flat_map(|h| {
+            let key = if h.fp_hex.is_empty() {
+                format!("{}:{}", h.addr, h.port)
+            } else {
+                h.fp_hex.clone()
+            };
+            let advert = discovered.values().find(|d| discovery::same_host(h, d));
+            let online = probed.get(&key).copied().unwrap_or(false);
+            // Everything the advert teaches, while it is visible: mgmt port, OS chain, wake
+            // MAC (a Deck in Gaming Mode runs only this console and the Decky panel), and an
+            // address the sweep asks; the card moves only once its pin answers there.
+            if let Some(a) = advert {
+                pf_client_core::trust::learn_from_advert(
+                    &h.fp_hex,
+                    &h.addr,
+                    h.port,
+                    &a.addr,
+                    &a.mac,
+                    &a.os,
+                    a.mgmt_port,
+                );
+            }
+            let row = HostRow {
+                key: key.clone(),
+                id: h.id.clone(),
+                name: host_display_name(&h.name, &h.addr),
+                addr: h.addr.clone(),
+                port: h.port,
+                fp_hex: h.fp_hex.clone(),
+                paired: h.paired,
+                saved: true,
+                online,
+                // Live advert first, then what we saved from an earlier one, then 47990 —
+                // the same three rungs `os` uses just below. Reading the advert ALONE is why
+                // a host on a moved mgmt port lost its library the moment mDNS went quiet.
+                mgmt_port: advert
+                    .and_then(|d| d.mgmt_port)
+                    .or(h.mgmt_port)
+                    .unwrap_or(library::DEFAULT_MGMT_PORT),
+                can_wake: !online && !h.mac.is_empty(),
+                clipboard_sync: h.clipboard_sync,
+                last_used: h.last_used,
+                os: advert
+                    .filter(|d| !d.os.is_empty())
+                    .map(|d| d.os.clone())
+                    .unwrap_or_else(|| h.os.clone()),
+                // Whatever this host last told us it lets this device do to it. Empty
+                // until the first refresh answers, and empty forever for a host that has
+                // no such route or a device without the grant — the menu simply has no
+                // power rows then.
+                actions: pf_client_core::host_actions::cached(&h.fp_hex)
+                    .into_iter()
+                    .map(|a| pf_console_ui::HostAction {
+                        label: a.label().to_string(),
+                        id: a.id,
+                        danger: a.danger,
+                        available: a.available,
+                        unavailable_reason: a.unavailable_reason.unwrap_or_default(),
+                    })
+                    .collect(),
+                pin: None,
+                bound_preset: h
+                    .preset_id
+                    .as_deref()
+                    .and_then(|id| catalog.find_by_id(id))
+                    .map(chip),
+                // What this host last said it has up, from the same TTL'd cache the
+                // actions come from. Empty until the first refresh answers — and for
+                // an unpaired host, which has nothing to authenticate the ask with.
+                running: library::now_playing(&h.fp_hex),
+                // Ids straight through, dangling ones included: the bind screen only
+                // compares, and a deleted preset falls back at resolve, not here.
+                game_presets: h.game_presets.clone(),
+                profile: h.profile.clone(),
+            };
+            // A pinned card shares the primary tile's live state; its own key lets
+            // cursor-follow and the wake path address the card itself.
+            let pins = h
+                .resolved_pins(catalog)
+                .into_iter()
+                .map(|p| HostRow {
+                    key: pf_console_ui::model::pinned_key(&key, &p.id),
+                    pin: Some(chip(p)),
+                    bound_preset: None,
+                    ..row.clone()
+                })
+                .collect::<Vec<_>>();
+            std::iter::once(row).chain(pins)
+        })
+        .collect();
+
+    let mut extra: Vec<HostRow> = discovered
+        .values()
+        .filter(|d| !known.hosts.iter().any(|h| discovery::same_host(h, d)))
+        .map(|d| {
+            let key = if d.fp_hex.is_empty() {
+                format!("{}:{}", d.addr, d.port)
+            } else {
+                d.fp_hex.clone()
+            };
+            let online = probed.get(&key).copied().unwrap_or(false);
+            HostRow {
+                key,
+                // Discovered, not saved: no store record, so no id to point at.
+                id: None,
+                name: host_display_name(&d.name, &d.addr),
+                addr: d.addr.clone(),
+                port: d.port,
+                fp_hex: d.fp_hex.clone(),
+                paired: false,
+                saved: false,
+                // The probe, as for saved rows: an advert outlives a host that went to sleep.
+                online,
+                mgmt_port: d.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
+                can_wake: false,
+                clipboard_sync: false,
+                last_used: None,
+                os: d.os.clone(),
+                // Discovered but unsaved: not paired, so there is nothing it would let us
+                // do, and no identity to ask what it is running.
+                actions: Vec::new(),
+                pin: None,
+                bound_preset: None,
+                running: String::new(),
+                game_presets: Default::default(),
+                profile: None,
+            }
+        })
+        .collect();
+    extra.sort_by_key(|h| h.name.to_lowercase());
+    rows.extend(extra);
+
+    if let Some(seed) = seed {
+        if !rows
+            .iter()
+            .any(|r| r.addr == seed.addr && r.port == seed.port)
+        {
+            let mut seed = seed.clone();
+            seed.online = probed.get(&seed.key).copied().unwrap_or(false);
+            rows.push(seed);
+        }
+    }
+    rows
 }
 
 /// The wake-and-wait loop (one per wake): [`orchestrate::wake_by_probe`], the cadence every
