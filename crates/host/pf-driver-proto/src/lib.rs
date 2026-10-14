@@ -12,7 +12,7 @@
 //!
 //! GUID and LUID travel as integers; each side converts to its own `windows` / bindgen types.
 //! `Pod` + `offset_of!` asserts make a one-sided layout edit a compile error.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
@@ -129,3 +129,7 @@ mod tests {
 
 // Seat pad audio: the ring between a seat's audio endpoint enumerator and its host.
 pub mod seat_audio;
+
+// Shared-memory sections: the only module in this crate that may use `unsafe`.
+#[allow(unsafe_code)]
+pub mod section;
