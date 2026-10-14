@@ -824,14 +824,15 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
         "gamescope: relaunching the box game-mode session at the client's resolution"
     );
     // Manager keeps these for the rest of the login; restore owes [`unset_forced_session_screen_env`].
+    // Recorded before they are set: they outlive the process.
     takeover().forced_screen_env = true;
+    persist_takeover();
     systemctl_user(&[
         "set-environment",
         &format!("SCREEN_WIDTH={}", mode.width),
         &format!("SCREEN_HEIGHT={}", mode.height),
         &format!("CUSTOM_REFRESH_RATES={}", mode.refresh_hz.max(1)),
     ]);
-    persist_takeover(); // takeover lock not held; these SCREEN_* outlive the process
     let mut bound = match write_gamescope_bin_wrapper()
         .and_then(|w| write_session_plus_dropin(&w, mode, hdr, WsiPlan::resolve()))
     {
