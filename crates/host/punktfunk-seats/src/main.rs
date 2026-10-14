@@ -190,7 +190,7 @@ mod linux {
 
     /// Runs the supervisor: autostart seats first, then the socket until the process is stopped.
     /// Seats are units of their own, so stopping the supervisor leaves them running. Each seat's
-    /// uinput proxy comes and goes with its unit.
+    /// uinput proxy comes and goes with its unit, and its pads go when it stops.
     fn serve(socket_path: &std::path::Path, steam_source: Option<PathBuf>) -> Result<(), String> {
         pf_seats::logging::to_stderr();
         // Adopts systemd's kept fds close-on-exec before anything here can spawn a child.
@@ -198,7 +198,12 @@ mod linux {
         let state = PathBuf::from(pf_seats::linux::STATE_DIR);
         let backend = LinuxBackend::open(pf_paths::config_dir(), state, steam_source)
             .map_err(|e| format!("open the seat backend: {e}"))?
-            .on_unit(Box::new(crate::uinput::hook));
+            .on_unit(Box::new(|account, uid| {
+                crate::uinput::hook(account, uid);
+                if uid.is_none() {
+                    pads::revoke(account);
+                }
+            }));
         let service = Arc::new(
             backend
                 .open_service()

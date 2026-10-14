@@ -8,7 +8,8 @@
 //! ([`serve_usb`]), so no byte of its descriptors comes from the seat and a supervisor restart
 //! leaves it running. A pad lives as long as its relay, a USB device as long as its pad server:
 //! the seat hanging up, or its host dying, ends both. A relayed pad and an attached USB socket
-//! sit in systemd's fd store, so a supervisor restart picks them up again ([`resume`]).
+//! sit in systemd's fd store, so a supervisor restart picks them up again ([`resume`]). A seat's
+//! stop takes both back ([`revoke`]).
 
 use crate::vhci;
 use anyhow::Context as _;
@@ -17,14 +18,16 @@ use pf_inject::usbip;
 use pf_inject::usbip_relay::Hello;
 use pf_seats::linux::{socket, LinuxBackend};
 use pf_seats::SeatService;
+use rustix::net::Shutdown;
 use std::collections::HashMap;
 use std::net::TcpStream;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 pub const SOCKET_PATH: &str = pf_paths::seat::PADS_SOCKET;
@@ -94,6 +97,52 @@ fn release(held: &mut HashMap<String, usize>, account: &str) {
     }
 }
 
+/// A copy of every relay and USB socket a seat holds, with its account, by [`Hold`] id.
+static HOLDS: LazyLock<Mutex<HashMap<u64, (String, OwnedFd)>>> = LazyLock::new(Mutex::default);
+static NEXT_HOLD: AtomicU64 = AtomicU64::new(0);
+
+fn holds() -> MutexGuard<'static, HashMap<u64, (String, OwnedFd)>> {
+    HOLDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One socket `account` holds, listed for [`revoke`] until dropped.
+struct Hold(u64);
+
+impl Hold {
+    fn new(account: &str, sock: BorrowedFd<'_>) -> std::io::Result<Hold> {
+        let copy = sock.try_clone_to_owned()?;
+        let id = NEXT_HOLD.fetch_add(1, Ordering::Relaxed);
+        holds().insert(id, (account.to_owned(), copy));
+        Ok(Hold(id))
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        holds().remove(&self.0);
+    }
+}
+
+/// Takes back what `account` holds once its seat stopped: each relay and USB socket is shut
+/// down, so its relay reads the seat hanging up and drops the pad, and `vhci_hcd` drops the USB
+/// device, whose pad server then exits. A process that outlived the seat keeps none of them.
+pub fn revoke(account: &str) {
+    let held = holds();
+    let mine: Vec<&OwnedFd> = held
+        .values()
+        .filter(|(holder, _)| holder == account)
+        .map(|(_, sock)| sock)
+        .collect();
+    for sock in &mine {
+        if let Err(error) = rustix::net::shutdown(sock, Shutdown::Both) {
+            tracing::debug!(%error, account, "seat socket not shut down");
+        }
+    }
+    if !mine.is_empty() {
+        tracing::info!(account, sockets = mine.len(), "seat's pads taken back");
+    }
+}
+
 /// Relays again every pad systemd kept across a supervisor restart, and watches again every
 /// served USB socket. A USB device an older supervisor attached for a seat that served it
 /// itself is detached. The other kept fds are the caller's. First thing at start: until then
@@ -145,7 +194,7 @@ pub fn resume() -> Vec<(String, OwnedFd)> {
         let spawned = std::thread::Builder::new()
             .name("seat-usb".into())
             .spawn(move || {
-                vhci::watch(port, recorded, sock);
+                watch_usb(port, recorded, sock);
                 tracing::info!(port, "seat USB device gone");
             });
         if let Err(error) = spawned {
@@ -155,7 +204,8 @@ pub fn resume() -> Vec<(String, OwnedFd)> {
     other
 }
 
-/// Relays `pad` until its seat hangs up, listed for `list` and in systemd's fd store meanwhile.
+/// Relays `pad` until its seat hangs up or stops ([`revoke`]), listed for `list` and in
+/// systemd's fd store meanwhile. A pad a stop couldn't take back is dropped at once.
 fn run_relay(
     name: &str,
     account: &str,
@@ -164,6 +214,14 @@ fn run_relay(
     pad: BrokeredPad,
     relay: UnixDatagram,
 ) {
+    let _hold = match Hold::new(account, relay.as_fd()) {
+        Ok(hold) => hold,
+        Err(error) => {
+            tracing::warn!(%error, account, pad = kind.label(), "seat pad not revocable, dropped");
+            pad_broker::forget(name);
+            return;
+        }
+    };
     let record =
         pad_broker::parse_store_name(name).map(|(serial, ..)| Path::new(RELAYED).join(serial));
     if let Some(record) = &record {
@@ -419,10 +477,23 @@ fn serve_usb(stream: UnixStream, account: &str, hello: &Hello) {
     tracing::info!(account, port, pad = label, "seat USB device served");
     let recorded = client.as_raw_fd();
     pad_broker::keep_usb(port, recorded, client.as_fd());
-    vhci::watch(port, recorded, OwnedFd::from(client));
+    watch_usb(port, recorded, OwnedFd::from(client));
     // The pad server ends with the connection; reap it.
     let _ = server.wait();
     tracing::info!(account, port, "seat USB device gone");
+}
+
+/// Watches a seat's USB socket until its connection ends, held for its port's seat
+/// ([`revoke`]). A socket no seat's row names, or one that can't be held, is shut down at once.
+fn watch_usb(port: u16, recorded: RawFd, sock: OwnedFd) {
+    let held = vhci::account_at(port)
+        .ok_or_else(|| std::io::Error::other("no seat's row names the port"))
+        .and_then(|account| Hold::new(&account, sock.as_fd()));
+    if let Err(error) = &held {
+        tracing::warn!(%error, port, "seat USB device not revocable, detached");
+        let _ = rustix::net::shutdown(&sock, Shutdown::Both);
+    }
+    vhci::watch(port, recorded, sock);
 }
 
 /// Starts `hello`'s pad server in a transient scope, so a supervisor restart leaves it running:
@@ -486,6 +557,38 @@ mod tests {
             !held.contains_key("pf-seat-1"),
             "a seat with no pads is forgotten"
         );
+    }
+
+    /// A stop shuts down that seat's relays and USB sockets and no other seat's: the relay and
+    /// the seat read a hang-up, and so does the pad server. A dropped hold leaves the list.
+    #[test]
+    fn a_stop_takes_back_only_that_seats_sockets() {
+        use std::io::{ErrorKind, Read as _};
+        let (relay, seat) = pad_broker::relay_pair().unwrap();
+        let (usb, mut server) = usbip::loopback_pair().unwrap();
+        let (other, _other_seat) = pad_broker::relay_pair().unwrap();
+        let held = [
+            Hold::new("pf-test-stop", relay.as_fd()).unwrap(),
+            Hold::new("pf-test-stop", usb.as_fd()).unwrap(),
+            Hold::new("pf-test-other", other.as_fd()).unwrap(),
+        ];
+        revoke("pf-test-stop");
+        assert_eq!(relay.recv(&mut [0; 8]).unwrap(), 0, "the relay");
+        assert_eq!(
+            UnixDatagram::from(seat).recv(&mut [0; 8]).unwrap(),
+            0,
+            "the seat"
+        );
+        assert_eq!(server.read(&mut [0; 8]).unwrap(), 0, "the pad server");
+        other.set_nonblocking(true).unwrap();
+        let kept = other.recv(&mut [0; 8]).unwrap_err().kind();
+        assert_eq!(kept, ErrorKind::WouldBlock, "another seat keeps its pad");
+        drop(held);
+        let left = holds()
+            .values()
+            .filter(|(a, _)| a.starts_with("pf-test-"))
+            .count();
+        assert_eq!(left, 0);
     }
 
     #[test]

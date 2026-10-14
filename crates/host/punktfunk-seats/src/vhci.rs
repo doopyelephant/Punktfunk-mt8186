@@ -113,6 +113,11 @@ pub fn watch(port: u16, recorded: RawFd, sock: OwnedFd) {
     pf_inject::pad_broker::forget_usb(port, recorded);
 }
 
+/// The seat whose row names `port`.
+pub fn account_at(port: u16) -> Option<String> {
+    read_row(Path::new(MAP), port).map(|(account, _)| account)
+}
+
 /// Detaches `port` while it still holds socket `recorded`: a device an older supervisor
 /// attached for a seat that served it itself. Its row goes at the next prune.
 pub fn drop_unserved(port: u16, recorded: RawFd) {

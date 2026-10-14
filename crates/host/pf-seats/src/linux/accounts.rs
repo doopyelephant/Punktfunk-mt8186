@@ -261,8 +261,9 @@ pub(super) fn delete(seat: &Seat) -> Result<(), BackendError> {
     }
 }
 
-/// Ends everything the user still runs, before its account is deleted or rehomed. Its user
-/// manager outlives the seat's unit by seconds, and `userdel` or `usermod` refuse a busy user.
+/// Ends everything the user still runs: at its seat's stop, and before its account is deleted or
+/// rehomed. Its user manager outlives the seat's unit by seconds, and `userdel` or `usermod`
+/// refuse a busy user.
 pub(super) fn quiesce(account: &str) -> Result<(), BackendError> {
     let present = || run("loginctl_failed", "loginctl", &["show-user", account]).is_ok();
     if present() {
