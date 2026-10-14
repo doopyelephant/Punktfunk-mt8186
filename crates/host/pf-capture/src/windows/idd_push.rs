@@ -14,10 +14,11 @@ use crate::cursor_state::CursorModel;
 use crate::cursor_witness::CursorWitness;
 use crate::pixelless::DeliveryGate;
 use anyhow::{bail, Context, Result};
+use pf_driver_proto::section::SectionView;
 use pf_paths_win::SecurityAttributes;
 use pf_win_display::open_wudfhost;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows::core::PCWSTR;
@@ -100,11 +101,13 @@ pub(super) fn flow_watch() -> bool {
 /// each checks its range and reads or writes an atomic. Every accessor panics out of range.
 struct MappedSection {
     handle: OwnedHandle,
-    view: MEMORY_MAPPED_VIEW_ADDRESS,
-    len: usize,
+    /// What `Drop` unmaps.
+    base: MEMORY_MAPPED_VIEW_ADDRESS,
+    /// Copied out only by [`Self::share`]; its `'static` ends with `Drop`.
+    view: SectionView<'static>,
 }
 
-// SAFETY: `!Send` only through the view pointer. The mapping is process-wide, so its one
+// SAFETY: `!Send` only through the view pointers. The mapping is process-wide, so its one
 // owner may use, unmap and close it from any thread; the driver's concurrent writes arrive
 // through the section's atomics. Not `Sync`.
 unsafe impl Send for MappedSection {}
@@ -128,7 +131,7 @@ impl MappedSection {
             OwnedHandle::from_raw_handle(map.0 as _)
         };
         // SAFETY: a live section handle of `len` bytes; a refused map returns null.
-        let view = unsafe {
+        let base = unsafe {
             MapViewOfFile(
                 HANDLE(handle.as_raw_handle()),
                 FILE_MAP_ALL_ACCESS,
@@ -137,54 +140,47 @@ impl MappedSection {
                 len,
             )
         };
-        if view.Value.is_null() {
+        if base.Value.is_null() {
             return Err(windows::core::Error::from_thread())
                 .with_context(|| format!("map the {what} section"));
         }
-        Ok(Self { handle, view, len })
+        // SAFETY: `base` is a new page-aligned read/write mapping of `len` bytes. Only `Drop`
+        // unmaps it, after the last access, and no Rust reference points into it.
+        let view = unsafe { SectionView::from_raw(base.Value.cast(), len) };
+        Ok(Self { handle, base, view })
+    }
+
+    /// Bytes mapped.
+    fn len(&self) -> usize {
+        self.view.len()
     }
 
     /// The 4-aligned word at `off`, as the atomic both sides treat it as.
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "the view is page-aligned and `off` is checked"
-    )]
     fn word32(&self, off: usize) -> &AtomicU32 {
-        assert!(
-            off % 4 == 0 && off.checked_add(4).is_some_and(|end| end <= self.len),
-            "section word {off} out of bounds"
-        );
-        // SAFETY: an aligned word inside the live, page-aligned view; any bits are a `u32`.
-        unsafe { &*self.view.Value.cast::<u8>().add(off).cast::<AtomicU32>() }
+        self.view.atomic_u32(off)
     }
 
     /// Copy `dst.len()` bytes out from `off`. The driver may be writing them: the caller's
     /// sequence check decides whether the copy is whole.
     fn read_bytes(&self, off: usize, dst: &mut [u8]) {
-        assert!(
-            off.checked_add(dst.len())
-                .is_some_and(|end| end <= self.len),
-            "section range {off}+{} out of bounds",
-            dst.len()
-        );
-        for (i, byte) in dst.iter_mut().enumerate() {
-            // SAFETY: a byte inside the live view, read as the atomic it is.
-            let shared = unsafe { &*self.view.Value.cast::<AtomicU8>().add(off + i) };
-            *byte = shared.load(Ordering::Relaxed);
-        }
+        self.view.read_bytes(off, dst);
     }
 
-    /// Base and length, for a reader that checks its own offsets against them.
-    fn raw(&self) -> (*mut u8, usize) {
-        (self.view.Value.cast(), self.len)
+    /// The view itself, for a reader that lives beside this section in one owner.
+    ///
+    /// # Safety
+    /// The copy, and every reference taken through it, must be gone before `self` drops.
+    // unsafe-fn-no-op-ok: the contract is the mapping's lifetime, checked by every accessor.
+    unsafe fn share(&self) -> SectionView<'static> {
+        self.view
     }
 }
 
 impl Drop for MappedSection {
     fn drop(&mut self) {
-        // SAFETY: `view` is the live `MapViewOfFile` mapping; unmap before `handle` closes.
+        // SAFETY: `base` is the live `MapViewOfFile` mapping; unmap before `handle` closes.
         unsafe {
-            let _ = UnmapViewOfFile(self.view);
+            let _ = UnmapViewOfFile(self.base);
         }
     }
 }

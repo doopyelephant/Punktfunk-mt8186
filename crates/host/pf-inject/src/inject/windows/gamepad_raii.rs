@@ -160,8 +160,8 @@ impl Shm {
 
     /// The mapping, stable for this `Shm`'s lifetime (`MapViewOfFile` pins the address).
     pub(super) fn view(&self) -> SectionView<'_> {
-        // SAFETY: `MapViewOfFile` mapped `len` RW bytes at `view`; `Drop` unmaps them only after
-        // this borrow ends. The shared bytes are only reached through the view's raw accessors.
+        // SAFETY: `MapViewOfFile` mapped `len` RW bytes at `view`, page-aligned; `Drop` unmaps
+        // them only after this borrow ends. The shared bytes are only reached through the view.
         unsafe { SectionView::from_raw(self.view.Value.cast(), self.len) }
     }
 

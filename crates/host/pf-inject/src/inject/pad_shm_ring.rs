@@ -6,8 +6,8 @@
 //! itself, its sealed delivery and the devnode live in `windows/`.
 
 use pf_driver_proto::gamepad::PadShm;
-use std::marker::PhantomData;
-use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+use pf_driver_proto::section;
+use std::sync::atomic::{fence, Ordering};
 
 /// Byte size of [`PadShm`]. Offsets and magic come from the same struct so a layout change
 /// is a compile error; the driver maps that type too.
@@ -37,82 +37,44 @@ pub(crate) const INPUT_SLOT: usize = 64;
 /// Bounds-checked view of a mapped section, borrowed from whatever keeps it mapped.
 /// Words the driver also writes go through aligned atomics; report bodies are plain copies,
 /// ordered by the sequence word or seqlock around them. Every accessor panics out of range.
+/// The raw accesses are [`section::SectionView`]'s; this names the ones the pad channel uses.
 #[derive(Clone, Copy)]
-pub(crate) struct SectionView<'a> {
-    base: *mut u8,
-    len: usize,
-    _mapping: PhantomData<&'a [u8]>,
-}
+pub(crate) struct SectionView<'a>(section::SectionView<'a>);
 
 impl<'a> SectionView<'a> {
     /// # Safety
-    /// `base..base + len` stays mapped and writable for `'a`, and no Rust reference overlaps it.
-    // unsafe-fn-no-op-ok: the contract is the mapping's lifetime, checked by every accessor.
+    /// As [`section::SectionView::from_raw`]: `base` is 8-aligned and `base..base + len` stays
+    /// mapped and writable for `'a`, with no Rust reference over it.
     pub(crate) unsafe fn from_raw(base: *mut u8, len: usize) -> SectionView<'a> {
-        SectionView {
-            base,
-            len,
-            _mapping: PhantomData,
-        }
+        // SAFETY: the caller's contract is the inner constructor's.
+        SectionView(unsafe { section::SectionView::from_raw(base, len) })
     }
 
     /// A test buffer standing in for a section.
     #[cfg(test)]
-    fn over(buf: &'a mut [u32]) -> SectionView<'a> {
-        SectionView {
-            base: buf.as_mut_ptr().cast(),
-            len: std::mem::size_of_val(buf),
-            _mapping: PhantomData,
-        }
-    }
-
-    /// `len` bytes at `off`, asserted inside the view.
-    fn range(&self, off: usize, len: usize) -> *mut u8 {
-        let end = off.checked_add(len);
-        assert!(
-            end.is_some_and(|e| e <= self.len),
-            "section range {off}+{len} out of bounds"
-        );
-        self.base.wrapping_add(off)
-    }
-
-    /// The atomic word at `off`, asserted in bounds and aligned.
-    fn word<T>(&self, off: usize) -> *const T {
-        let p = self.range(off, size_of::<T>());
-        assert!(
-            p as usize % align_of::<T>() == 0,
-            "section word {off} misaligned"
-        );
-        p.cast()
+    fn over(buf: &'a mut [u64]) -> SectionView<'a> {
+        SectionView(section::SectionView::over(buf))
     }
 
     pub(crate) fn load_u32(&self, off: usize, order: Ordering) -> u32 {
-        // SAFETY: `word` proved an aligned word inside the live mapping; both sides touch it
-        // only atomically.
-        unsafe { (*self.word::<AtomicU32>(off)).load(order) }
+        self.0.atomic_u32(off).load(order)
     }
 
     pub(crate) fn store_u32(&self, off: usize, value: u32, order: Ordering) {
-        // SAFETY: as `load_u32`.
-        unsafe { (*self.word::<AtomicU32>(off)).store(value, order) }
+        self.0.atomic_u32(off).store(value, order);
     }
 
     pub(crate) fn store_u64(&self, off: usize, value: u64, order: Ordering) {
-        // SAFETY: as `load_u32`, for an 8-aligned word.
-        unsafe { (*self.word::<AtomicU64>(off)).store(value, order) }
+        self.0.atomic_u64(off).store(value, order);
     }
 
+    /// One plain copy; the seqlock or sequence word around it orders the driver's read.
     pub(crate) fn write_bytes(&self, off: usize, src: &[u8]) {
-        let dst = self.range(off, src.len());
-        // SAFETY: `range` proved `dst` inside the live mapping, which no Rust reference
-        // overlaps; `src` is a separate allocation.
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) }
+        self.0.copy_from_slice(off, src);
     }
 
     pub(crate) fn read_bytes(&self, off: usize, dst: &mut [u8]) {
-        let src = self.range(off, dst.len());
-        // SAFETY: as `write_bytes`, copying the other way.
-        unsafe { std::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) }
+        self.0.copy_to_slice(off, dst);
     }
 }
 
@@ -270,18 +232,18 @@ impl OutputDrain {
 mod tests {
     use super::*;
 
-    fn section() -> Vec<u32> {
-        vec![0u32; SHM_SIZE / 4]
+    fn section() -> Vec<u64> {
+        vec![0u64; SHM_SIZE / 8]
     }
 
     /// v2.1 dual write: legacy slot + seq, then ring slot (8-slot math, no length echo), then head.
-    fn publish(buf: &mut [u32], bytes: &[u8]) {
+    fn publish(buf: &mut [u64], bytes: &[u8]) {
         ring_publish(buf, bytes, OUT_RING_LEN, false);
     }
 
     /// v2.1 dual write with `OUT_FEATURE_BIT` ORed into the slot length — the tag `drain_tagged`
     /// must strip and surface as `feature`.
-    fn publish_tagged(buf: &mut [u32], bytes: &[u8]) {
+    fn publish_tagged(buf: &mut [u64], bytes: &[u8]) {
         legacy_publish(buf, bytes);
         let head = read32(buf, OFF_RING_HEAD);
         let slot = OFF_OUT_RING + (head % OUT_RING_LEN) as usize * OUT_SLOT_SIZE;
@@ -290,23 +252,21 @@ mod tests {
             slot,
             bytes.len() as u32 | pf_driver_proto::triton::OUT_FEATURE_BIT,
         );
-        let b = bytes_mut(buf);
-        b[slot + 4..slot + 4 + bytes.len()].copy_from_slice(bytes);
+        write_bytes(buf, slot + 4, bytes);
         write32(buf, OFF_RING_HEAD, head.wrapping_add(1));
     }
 
     /// v2.2 dual write: long-ring slot math, `out_ring_len` echo stamped before the head bump.
-    fn v22_publish(buf: &mut [u32], bytes: &[u8]) {
+    fn v22_publish(buf: &mut [u64], bytes: &[u8]) {
         ring_publish(buf, bytes, OUT_RING_LEN_V22, true);
     }
 
-    fn ring_publish(buf: &mut [u32], bytes: &[u8], len: u32, echo: bool) {
+    fn ring_publish(buf: &mut [u64], bytes: &[u8], len: u32, echo: bool) {
         legacy_publish(buf, bytes);
         let head = read32(buf, OFF_RING_HEAD);
         let slot = OFF_OUT_RING + (head % len) as usize * OUT_SLOT_SIZE;
         write32(buf, slot, bytes.len() as u32);
-        let b = bytes_mut(buf);
-        b[slot + 4..slot + 4 + bytes.len()].copy_from_slice(bytes);
+        write_bytes(buf, slot + 4, bytes);
         if echo {
             write32(buf, OFF_OUT_RING_LEN, len);
         }
@@ -314,27 +274,16 @@ mod tests {
     }
 
     /// Pre-ring driver: latest-report slot + seq only.
-    fn legacy_publish(buf: &mut [u32], bytes: &[u8]) {
-        let b = bytes_mut(buf);
-        b[OFF_OUTPUT..OFF_OUTPUT + bytes.len()].copy_from_slice(bytes);
+    fn legacy_publish(buf: &mut [u64], bytes: &[u8]) {
+        write_bytes(buf, OFF_OUTPUT, bytes);
         let seq = read32(buf, OFF_OUT_SEQ).wrapping_add(1);
         write32(buf, OFF_OUT_SEQ, seq);
-    }
-
-    /// Byte view of the source slice's allocation, including short test buffers.
-    fn bytes_mut(buf: &mut [u32]) -> &mut [u8] {
-        let byte_len = buf
-            .len()
-            .checked_mul(size_of::<u32>())
-            .expect("u32 slice byte length overflow");
-        // SAFETY: `byte_len` is exactly the source slice's allocation range; u8 needs less alignment.
-        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), byte_len) }
     }
 
     #[test]
     #[should_panic(expected = "out of bounds")]
     fn section_view_refuses_a_range_past_its_end() {
-        let mut buf = [0u32; 2];
+        let mut buf = [0u64; 1];
         SectionView::over(&mut buf).write_bytes(4, &[0; 8]);
     }
 
@@ -346,24 +295,28 @@ mod tests {
         publish_input(SectionView::over(&mut buf), &mut generation, &[0xAB; 80]);
         assert_eq!(generation, 2);
         assert_eq!(read32(&mut buf, OFF_OUT_SEQ), 0);
-        assert_eq!(bytes_mut(&mut buf)[OFF_INPUT + 63], 0xAB);
+        assert_eq!(read_bytes(&mut buf, OFF_INPUT + 63, 1), [0xAB]);
     }
 
-    #[test]
-    fn byte_view_stays_within_the_source_slice() {
-        let mut buf = [0u32; 2];
-        assert_eq!(bytes_mut(&mut buf).len(), 2 * size_of::<u32>());
+    fn read32(buf: &mut [u64], off: usize) -> u32 {
+        SectionView::over(buf).load_u32(off, Ordering::Relaxed)
     }
 
-    fn read32(buf: &mut [u32], off: usize) -> u32 {
-        u32::from_ne_bytes(bytes_mut(buf)[off..off + 4].try_into().unwrap())
+    fn write32(buf: &mut [u64], off: usize, v: u32) {
+        SectionView::over(buf).store_u32(off, v, Ordering::Relaxed);
     }
 
-    fn write32(buf: &mut [u32], off: usize, v: u32) {
-        bytes_mut(buf)[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+    fn read_bytes(buf: &mut [u64], off: usize, len: usize) -> Vec<u8> {
+        let mut out = vec![0; len];
+        SectionView::over(buf).read_bytes(off, &mut out);
+        out
     }
 
-    fn collect(d: &mut OutputDrain, buf: &mut [u32]) -> (Vec<Vec<u8>>, bool) {
+    fn write_bytes(buf: &mut [u64], off: usize, bytes: &[u8]) {
+        SectionView::over(buf).write_bytes(off, bytes);
+    }
+
+    fn collect(d: &mut OutputDrain, buf: &mut [u64]) -> (Vec<Vec<u8>>, bool) {
         let mut got = Vec::new();
         let resync = d.drain_tagged(SectionView::over(buf), |b, _| got.push(b.to_vec()));
         (got, resync)
@@ -374,9 +327,8 @@ mod tests {
     fn stamp_writes_every_field_the_driver_reads() {
         let mut buf = section();
         stamp(SectionView::over(&mut buf), 7, 3, 2, &[0x42, 0x01]);
-        let b = bytes_mut(&mut buf);
-        assert_eq!(b[OFF_DEVTYPE], 7);
-        assert_eq!(&b[OFF_INPUT..OFF_INPUT + 2], &[0x42, 0x01]);
+        assert_eq!(read_bytes(&mut buf, OFF_DEVTYPE, 1), [7]);
+        assert_eq!(read_bytes(&mut buf, OFF_INPUT, 2), [0x42, 0x01]);
         assert_eq!(read32(&mut buf, OFF_PAD_INDEX), 3);
         assert_eq!(read32(&mut buf, OFF_OUT_RING_VER), 2);
         assert_eq!(read32(&mut buf, 0), SHM_MAGIC);

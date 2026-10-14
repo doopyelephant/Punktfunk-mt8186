@@ -12,6 +12,7 @@
 
 use pf_driver_proto::encode::au::{self, AuHeader, AuSlot};
 use pf_driver_proto::encode::FrameToken;
+use pf_driver_proto::section::SectionView;
 use std::mem::offset_of;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -20,47 +21,30 @@ const STATE: usize = offset_of!(AuSlot, state);
 /// `(distance ahead of next_wire_seq, rank inside the access unit, heap distance)`.
 type OrderKey = (u32, u8, u32);
 
-/// One mapped v7 section: `len` bytes at `base`, alive for the view's lifetime. Header and
-/// slot words are only ever touched through aligned atomics, because the driver writes the
-/// same bytes; the heap is read plainly, on a slot this side holds READING.
-pub(crate) struct AuView {
-    base: *mut u8,
-    len: usize,
+/// One mapped v7 section, alive for the view's lifetime. Header and slot words are only ever
+/// touched through aligned atomics, because the driver writes the same bytes; the heap is read
+/// plainly, on a slot this side holds READING.
+pub(crate) struct AuView<'a> {
+    mem: SectionView<'a>,
 }
 
 // SAFETY: a raw pointer only. The owning reader moves between the prep and stream threads
 // with no concurrent access on this side; the driver's writes arrive through the atomics.
-unsafe impl Send for AuView {}
+unsafe impl Send for AuView<'_> {}
 
-impl AuView {
-    /// # Safety
-    /// `base` must be 8-aligned and point at `len >= au::HEAP_OFFSET` readable, writable
-    /// bytes that outlive the view.
-    // unsafe-fn-no-op-ok: the contract is the mapping's lifetime, checked by every accessor.
-    pub(crate) unsafe fn new(base: *mut u8, len: usize) -> Self {
-        assert!(len >= au::HEAP_OFFSET && base as usize % 8 == 0);
-        Self { base, len }
+impl<'a> AuView<'a> {
+    /// Panics when `mem` is shorter than the fixed layout, which every header read needs.
+    pub(crate) fn new(mem: SectionView<'a>) -> Self {
+        assert!(mem.len() >= au::HEAP_OFFSET);
+        Self { mem }
     }
 
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "the view is page-aligned and `off` is checked"
-    )]
     fn word32(&self, off: usize) -> &AtomicU32 {
-        assert!(off % 4 == 0 && off + 4 <= self.len);
-        // SAFETY: an in-bounds, aligned word of the mapping `new`'s contract keeps alive; the
-        // atomic view is the only access either side makes to header and slot words.
-        unsafe { &*self.base.add(off).cast::<AtomicU32>() }
+        self.mem.atomic_u32(off)
     }
 
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "the view is page-aligned and `off` is checked"
-    )]
     fn word64(&self, off: usize) -> &AtomicU64 {
-        assert!(off % 8 == 0 && off + 8 <= self.len);
-        // SAFETY: as `word32`, for an 8-aligned word.
-        unsafe { &*self.base.add(off).cast::<AtomicU64>() }
+        self.mem.atomic_u64(off)
     }
 
     /// Whole header as of now, one atomic load per field. `latest` is the publish handshake
@@ -132,14 +116,14 @@ impl AuView {
         let inside = off >= heap_off
             && off
                 .checked_add(len)
-                .is_some_and(|end| end <= heap_off + heap_len && end <= self.len);
+                .is_some_and(|end| end <= heap_off + heap_len && end <= self.mem.len());
         if !inside {
             return false;
         }
         into.clear();
-        // SAFETY: the range is inside the live mapping, and the slot naming it is READING, so
-        // the driver does not write it while this copy runs.
-        into.extend_from_slice(unsafe { std::slice::from_raw_parts(self.base.add(off), len) });
+        into.resize(len, 0);
+        // The slot naming this range is READING, so the driver does not write it meanwhile.
+        self.mem.copy_to_slice(off, into);
         true
     }
 }
@@ -186,8 +170,8 @@ impl std::error::Error for AuFault {}
 /// end (the heap is a bump allocator that wraps). A slot behind `next_wire_seq`, or a chunk of
 /// an access unit whose FIRST was never taken, is freed unread: after a `RESET` the domain
 /// restarts where the host says, and a superseded encoder's leftovers must not reach the wire.
-pub(crate) struct AuReader {
-    view: AuView,
+pub(crate) struct AuReader<'a> {
+    view: AuView<'a>,
     /// The `wire_seq` the next access unit carries; `SET_ENCODE` and `RESET` set it.
     next_wire_seq: u32,
     /// The access unit still owing its LAST chunk: `(wire_seq, end offset of the last chunk)`.
@@ -201,8 +185,8 @@ pub(crate) struct AuReader {
     pub(crate) gaps: u64,
 }
 
-impl AuReader {
-    pub(crate) fn new(view: AuView, wire_seq_base: u32) -> Self {
+impl<'a> AuReader<'a> {
+    pub(crate) fn new(view: AuView<'a>, wire_seq_base: u32) -> Self {
         Self {
             view,
             next_wire_seq: wire_seq_base,
@@ -214,7 +198,7 @@ impl AuReader {
         }
     }
 
-    pub(crate) fn view(&self) -> &AuView {
+    pub(crate) fn view(&self) -> &AuView<'a> {
         &self.view
     }
 
@@ -401,8 +385,8 @@ impl AuReader {
 pub(crate) mod producer {
     use super::*;
 
-    pub(crate) struct Producer {
-        view: AuView,
+    pub(crate) struct Producer<'a> {
+        view: AuView<'a>,
         generation: u32,
         heap_off: u32,
         heap_len: u32,
@@ -410,13 +394,12 @@ pub(crate) mod producer {
         publishes: u32,
     }
 
-    impl Producer {
-        /// Stamp a fresh header at `base` the way the host does (magic last) and take the
+    impl<'a> Producer<'a> {
+        /// Stamp a fresh header into `mem` the way the host does (magic last) and take the
         /// driver's side of it: `generation`.
-        pub(crate) fn init(base: *mut u8, len: usize, generation: u32, wire_seq_base: u32) -> Self {
-            // SAFETY: the caller hands an 8-aligned buffer of `len` bytes alive for the test.
-            let view = unsafe { AuView::new(base, len) };
-            let heap_len = (len - au::HEAP_OFFSET) as u32 & !(au::HEAP_GRANULE - 1);
+        pub(crate) fn init(mem: SectionView<'a>, generation: u32, wire_seq_base: u32) -> Self {
+            let view = AuView::new(mem);
+            let heap_len = (mem.len() - au::HEAP_OFFSET) as u32 & !(au::HEAP_GRANULE - 1);
             let store = |f: usize, v: u32| view.word32(f).store(v, Ordering::Relaxed);
             store(offset_of!(AuHeader, version), au::AU_VERSION);
             store(offset_of!(AuHeader, heap_offset), au::HEAP_OFFSET as u32);
@@ -459,15 +442,9 @@ pub(crate) mod producer {
             }
             let off = self.heap_off + self.bump;
             self.bump += len;
-            // SAFETY: `off..off+len` is inside the heap and no slot names it (the bump only
-            // wraps past sixteen live chunks in these tests).
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    data.as_ptr(),
-                    self.view.base.add(off as usize),
-                    data.len(),
-                );
-            }
+            // `off..off+len` is inside the heap and no slot names it (the bump only wraps past
+            // sixteen live chunks in these tests).
+            self.view.mem.copy_from_slice(off as usize, data);
             let w = |f: usize, v: u32| self.view.slot32(i, f).store(v, Ordering::Relaxed);
             w(offset_of!(AuSlot, offset), off);
             w(offset_of!(AuSlot, len), len);
@@ -538,14 +515,8 @@ mod tests {
         vec![0u64; au::section_bytes(au::HEAP_MIN_BYTES) as usize / 8]
     }
 
-    fn base(buf: &mut [u64]) -> (*mut u8, usize) {
-        (buf.as_mut_ptr().cast::<u8>(), buf.len() * 8)
-    }
-
-    fn reader(buf: &mut [u64], wire_seq_base: u32) -> AuReader {
-        let (p, len) = base(buf);
-        // SAFETY: `buf` outlives every reader the test builds on it.
-        AuReader::new(unsafe { AuView::new(p, len) }, wire_seq_base)
+    fn reader(mem: SectionView<'_>, wire_seq_base: u32) -> AuReader<'_> {
+        AuReader::new(AuView::new(mem), wire_seq_base)
     }
 
     const WHOLE: u32 = au::AU_FIRST | au::AU_LAST;
@@ -553,9 +524,9 @@ mod tests {
     #[test]
     fn takes_access_units_in_wire_order_and_frees_the_slots() {
         let mut buf = section();
-        let (p, len) = base(&mut buf);
-        let mut prod = Producer::init(p, len, 9, 100);
-        let mut rd = reader(&mut buf, 100);
+        let mem = SectionView::over(&mut buf);
+        let mut prod = Producer::init(mem, 9, 100);
+        let mut rd = reader(mem, 100);
         assert!(rd.view().header().magic == au::AU_MAGIC && rd.take_next().unwrap().is_none());
         // Published out of slot order: 102 lands before 101 in the table.
         prod.publish(b"c", 102, 3, 30, WHOLE | au::AU_KEYFRAME);
@@ -598,9 +569,9 @@ mod tests {
     #[test]
     fn chunks_of_one_access_unit_keep_heap_order_across_a_wrap() {
         let mut buf = section();
-        let (p, len) = base(&mut buf);
-        let mut prod = Producer::init(p, len, 1, 0);
-        let mut rd = reader(&mut buf, 0);
+        let mem = SectionView::over(&mut buf);
+        let mut prod = Producer::init(mem, 1, 0);
+        let mut rd = reader(mem, 0);
         // Leave the heap 4 bytes short of full so the third chunk wraps to its start.
         let heap = rd.view().header().heap_bytes as usize;
         let big = vec![0xEEu8; heap - 64 * 1024 - 4];
@@ -632,9 +603,9 @@ mod tests {
     #[test]
     fn an_access_unit_on_the_same_source_frame_is_a_repeat() {
         let mut buf = section();
-        let (p, len) = base(&mut buf);
-        let mut prod = Producer::init(p, len, 1, 0);
-        let mut rd = reader(&mut buf, 0);
+        let mem = SectionView::over(&mut buf);
+        let mut prod = Producer::init(mem, 1, 0);
+        let mut rd = reader(mem, 0);
         prod.publish(b"new", 0, 7, 0, au::AU_FIRST);
         prod.publish(b"tail", 0, 7, 0, au::AU_LAST);
         prod.publish(b"again", 1, 7, 0, WHOLE);
@@ -649,9 +620,9 @@ mod tests {
     #[test]
     fn a_publish_from_another_generation_is_not_consumed() {
         let mut buf = section();
-        let (p, len) = base(&mut buf);
-        let mut prod = Producer::init(p, len, 5, 0);
-        let mut rd = reader(&mut buf, 0);
+        let mem = SectionView::over(&mut buf);
+        let mut prod = Producer::init(mem, 5, 0);
+        let mut rd = reader(mem, 0);
         let slot = prod.publish(b"x", 0, 0, 0, WHOLE);
         prod.stamp_latest(4, slot as u8);
         assert_eq!(rd.ready_aus(), 0);
@@ -668,9 +639,9 @@ mod tests {
     #[test]
     fn wire_seq_continues_across_a_rebase_and_stale_slots_are_freed() {
         let mut buf = section();
-        let (p, len) = base(&mut buf);
-        let mut prod = Producer::init(p, len, 2, 100);
-        let mut rd = reader(&mut buf, 100);
+        let mem = SectionView::over(&mut buf);
+        let mut prod = Producer::init(mem, 2, 100);
+        let mut rd = reader(mem, 100);
         for seq in 100..106 {
             prod.publish(b"p", seq, seq, 0, WHOLE);
             assert_eq!(rd.take_next().unwrap().unwrap().wire_seq, seq);
@@ -693,9 +664,9 @@ mod tests {
     #[test]
     fn a_slot_outside_the_heap_is_a_fault() {
         let mut buf = section();
-        let (p, len) = base(&mut buf);
-        let mut prod = Producer::init(p, len, 1, 0);
-        let mut rd = reader(&mut buf, 0);
+        let mem = SectionView::over(&mut buf);
+        let mut prod = Producer::init(mem, 1, 0);
+        let mut rd = reader(mem, 0);
         let i = prod.publish(b"ok", 0, 0, 0, WHOLE);
         rd.view()
             .slot32(i, offset_of!(AuSlot, len))

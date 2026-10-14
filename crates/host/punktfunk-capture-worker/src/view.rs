@@ -1,8 +1,9 @@
 //! The worker's mapping of the host's AU section, as the session's writer reaches it.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
+use pf_driver_proto::section;
 use pf_encode_session::section::SectionView;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
@@ -11,11 +12,13 @@ use windows::Win32::System::Memory::{
 
 /// `len` bytes of the section, mapped read/write until drop.
 pub struct View {
+    /// What `Drop` unmaps.
     base: *mut u8,
-    len: usize,
+    /// Never copied out of this field, so its `'static` ends with `Drop`.
+    bytes: section::SectionView<'static>,
 }
 
-// SAFETY: the pointer names a mapping this value owns for its whole life, and every access goes
+// SAFETY: the pointers name a mapping this value owns for its whole life, and every access goes
 // through atomics or the single-writer heap copy, so moving it between threads moves nothing
 // thread-bound.
 unsafe impl Send for View {}
@@ -30,59 +33,32 @@ impl View {
         // SAFETY: `MapViewOfFile` validates the handle against this process's table and fails
         // rather than faults on anything that is not a mappable section.
         let view = unsafe { MapViewOfFile(handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, len) };
-        (!view.Value.is_null()).then(|| Self {
-            base: view.Value.cast(),
-            len,
-        })
-    }
-
-    /// `off..off + n` is inside the view and `align`-aligned. The base is page-aligned, so
-    /// field alignment is offset alignment.
-    fn check(&self, off: usize, n: usize, align: usize) {
-        assert!(
-            off % align == 0 && off.checked_add(n).is_some_and(|end| end <= self.len),
-            "AU section access out of bounds (off={off}, n={n}, len={})",
-            self.len
-        );
+        if view.Value.is_null() {
+            return None;
+        }
+        let base = view.Value.cast::<u8>();
+        // SAFETY: `base` is a new page-aligned read/write mapping of `len` bytes. Only `Drop`
+        // unmaps it, after the last access, and no Rust reference points into it.
+        let bytes = unsafe { section::SectionView::from_raw(base, len) };
+        Some(Self { base, bytes })
     }
 }
 
 impl SectionView for View {
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "the view is page-aligned and `off` is checked"
-    )]
     fn atomic_u32(&self, off: usize) -> &AtomicU32 {
-        self.check(off, 4, 4);
-        // SAFETY: `check` proved the word is inside the live mapping and 4-aligned; every bit
-        // pattern is a valid u32.
-        unsafe { &*self.base.add(off).cast::<AtomicU32>() }
+        self.bytes.atomic_u32(off)
     }
 
-    #[expect(
-        clippy::cast_ptr_alignment,
-        reason = "the view is page-aligned and `off` is checked"
-    )]
     fn atomic_u64(&self, off: usize) -> &AtomicU64 {
-        self.check(off, 8, 8);
-        // SAFETY: as `atomic_u32`, with 8-byte size and alignment checked.
-        unsafe { &*self.base.add(off).cast::<AtomicU64>() }
+        self.bytes.atomic_u64(off)
     }
 
     fn read_bytes(&self, off: usize, dst: &mut [u8]) {
-        self.check(off, dst.len(), 1);
-        for (i, byte) in dst.iter_mut().enumerate() {
-            // SAFETY: `check` proved the byte is inside the live mapping. The host may write it
-            // meanwhile, so it is read as the atomic it is.
-            *byte = unsafe { &*self.base.add(off + i).cast::<AtomicU8>() }.load(Ordering::Relaxed);
-        }
+        self.bytes.read_bytes(off, dst);
     }
 
     fn copy_from_slice(&self, off: usize, src: &[u8]) {
-        self.check(off, src.len(), 1);
-        // SAFETY: `check` proved the range is inside the live mapping; the writer's protocol
-        // keeps every reader off it until the publishing store.
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(off), src.len()) }
+        self.bytes.copy_from_slice(off, src);
     }
 }
 

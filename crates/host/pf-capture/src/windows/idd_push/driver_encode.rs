@@ -195,11 +195,11 @@ impl AuSection {
         Ok(Self { section, event })
     }
 
-    fn view(&self) -> AuView {
-        let (base, len) = self.section.raw();
-        // SAFETY: the view is `len` long and page-aligned, and outlives the reader because
-        // the proxy owns both.
-        unsafe { AuView::new(base, len) }
+    /// The reader's window on this section. The proxy owns both and drops the reader first.
+    fn view(&self) -> AuView<'static> {
+        // SAFETY: the reader and every reference it takes die before this section unmaps,
+        // because the proxy declares `reader` ahead of `section`.
+        AuView::new(unsafe { self.section.share() })
     }
 
     /// Wait for a publish, at most `timeout_ms`. The auto-reset event is the wakeup only; the
@@ -269,7 +269,7 @@ pub(crate) fn open_remote_encoder(
         _pad: 0,
         section: section_v,
         event: event_v,
-        section_bytes: section.section.len as u32,
+        section_bytes: section.section.len() as u32,
         codec: params.codec,
         chroma: params.chroma,
         bit_depth: params.bit_depth,
@@ -388,7 +388,7 @@ fn driver_split(t: &Taken) -> Option<pf_frame::health::DriverSplit> {
 /// access units it owes wire indexes for. Every control call is one synchronous
 /// `ENCODE_CTL`; `set_hdr_meta` only on a change, since the loop repeats it every tick.
 pub struct EncoderProxy {
-    reader: AuReader,
+    reader: AuReader<'static>,
     section: AuSection,
     target_id: u32,
     ctl: EncodeCtlSender,
