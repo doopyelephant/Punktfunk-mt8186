@@ -21,20 +21,20 @@ pub mod seat;
 #[cfg(not(windows))]
 pub mod tray_autostart;
 
-/// `$XDG_RUNTIME_DIR/punktfunk-gamescope-ei` (per-user 0700), or `/tmp/…`
-/// when the runtime dir is unset. `pf-vdisplay` writes it under the session
-/// env lock; `pf-inject` reads it after that env is applied.
+/// `<runtime>/punktfunk-gamescope-ei` (per-user 0700), or `/tmp/…` when there is
+/// none. `runtime` is the live session's (`pf_host_config::session::runtime_dir`):
+/// `pf-vdisplay` writes the file and `pf-inject` reads it, so both name the same one.
 #[cfg(target_os = "linux")]
-pub fn gamescope_ei_socket_file() -> PathBuf {
-    gamescope_ei_relay("punktfunk-gamescope-ei")
+pub fn gamescope_ei_socket_file(runtime: Option<&str>) -> PathBuf {
+    gamescope_ei_relay(runtime, "punktfunk-gamescope-ei")
 }
 
-/// `$XDG_RUNTIME_DIR/punktfunk-gamescope-{id}-ei`. Isolated bare-spawn
+/// `<runtime>/punktfunk-gamescope-{id}-ei`. Isolated bare-spawn
 /// sessions (`design/gamescope-multiuser.md`) must not overwrite each
 /// other's relay; `id` is `pf-vdisplay`'s `SessionIsolation`.
 #[cfg(target_os = "linux")]
-pub fn gamescope_ei_socket_file_for(id: &str) -> PathBuf {
-    gamescope_ei_relay(&format!("punktfunk-gamescope-{id}-ei"))
+pub fn gamescope_ei_socket_file_for(runtime: Option<&str>, id: &str) -> PathBuf {
+    gamescope_ei_relay(runtime, &format!("punktfunk-gamescope-{id}-ei"))
 }
 
 /// What a seat device directory is called. [`gamescope_seat_dev_dir`] writes the
@@ -43,14 +43,14 @@ pub fn gamescope_ei_socket_file_for(id: &str) -> PathBuf {
 const SEAT_DEV_PREFIX: &str = "punktfunk-gamescope-";
 const SEAT_DEV_SUFFIX: &str = "-dev";
 
-/// `$XDG_RUNTIME_DIR/punktfunk-gamescope-{id}-dev` — the device nodes a sandboxed
+/// `<runtime>/punktfunk-gamescope-{id}-dev` — the device nodes a sandboxed
 /// seat may open. `hostdev/` is where its sandbox mounts the real `/dev`, so the
 /// links under `input/` and `hidraw/` resolve there and nowhere on this side.
 /// `pf-vdisplay` builds the sandbox, `pf-inject` writes the links; path only, the
 /// caller creates it 0700 ([`create_private_dir`]).
 #[cfg(target_os = "linux")]
-pub fn gamescope_seat_dev_dir(id: &str) -> PathBuf {
-    gamescope_ei_relay(&format!("{SEAT_DEV_PREFIX}{id}{SEAT_DEV_SUFFIX}"))
+pub fn gamescope_seat_dev_dir(runtime: Option<&str>, id: &str) -> PathBuf {
+    gamescope_ei_relay(runtime, &format!("{SEAT_DEV_PREFIX}{id}{SEAT_DEV_SUFFIX}"))
 }
 
 /// Is this one of our seat device directories? The name is the whole test: another
@@ -65,8 +65,8 @@ pub fn is_gamescope_seat_dev_dir(path: &std::path::Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn gamescope_ei_relay(name: &str) -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
+fn gamescope_ei_relay(runtime: Option<&str>, name: &str) -> PathBuf {
+    match runtime.filter(|s| !s.is_empty()) {
         Some(rt) => PathBuf::from(rt).join(name),
         None => PathBuf::from("/tmp").join(name),
     }
@@ -668,17 +668,26 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn per_session_ei_relay_shares_the_global_files_directory() {
-        let global = gamescope_ei_socket_file();
-        let per = gamescope_ei_socket_file_for("cafe0123");
+        let rt = Some("/run/user/1000");
+        let global = gamescope_ei_socket_file(rt);
+        assert_eq!(
+            global.parent(),
+            Some(std::path::Path::new("/run/user/1000"))
+        );
+        assert_eq!(
+            gamescope_ei_socket_file(None).parent(),
+            Some(std::path::Path::new("/tmp"))
+        );
+        let per = gamescope_ei_socket_file_for(rt, "cafe0123");
         assert_eq!(per.parent(), global.parent());
         assert_eq!(
             per.file_name().unwrap().to_str().unwrap(),
             "punktfunk-gamescope-cafe0123-ei"
         );
         // The device directory is that seat's alone, beside its relay.
-        let dev = gamescope_seat_dev_dir("cafe0123");
+        let dev = gamescope_seat_dev_dir(rt, "cafe0123");
         assert_eq!(dev.parent(), global.parent());
-        assert_ne!(dev, gamescope_seat_dev_dir("dead0001"));
+        assert_ne!(dev, gamescope_seat_dev_dir(rt, "dead0001"));
         // What we write is what we recognise, or a prune reaches somebody else's directory.
         assert!(is_gamescope_seat_dev_dir(&dev));
         assert!(!is_gamescope_seat_dev_dir(&per), "the relay is not a seat");

@@ -69,13 +69,17 @@ pub(in crate::linux) fn pipewire_thread(
         }
     });
     let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
-    // Portal source: fd to a sandboxed PipeWire remote. KWin virtual-output: no fd, default daemon.
+    // Portal source: fd to a sandboxed PipeWire remote. A virtual output: no fd, the live
+    // session's daemon, by its socket when a session is stored.
     let core = match fd {
         Some(fd) => context
             .connect_fd_rc(fd, None)
             .context("pw connect_fd (portal remote)")?,
         None => context
-            .connect_rc(None)
+            .connect_rc(
+                pf_host_config::session::pipewire_remote()
+                    .map(|socket| pw::properties::properties! { *pw::keys::REMOTE_NAME => socket }),
+            )
             .context("pw connect (default daemon)")?,
     };
     // Lazy driver (PipeWire ≥ 1.2.7 "headless server" scheduling): the producer paints only

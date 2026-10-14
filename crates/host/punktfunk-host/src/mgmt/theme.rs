@@ -51,10 +51,8 @@ pub(crate) async fn get_host_theme() -> Json<HostTheme> {
     Json(read().await)
 }
 
-/// Awaited on the host's own runtime, never on one built for the call. ashpd keeps one
-/// session D-Bus connection per process and zbus pumps it from whichever runtime made it;
-/// a runtime dropped after this read took that connection down with it, and every later
-/// portal call in the process timed out. The await holds no worker while the portal thinks.
+/// Awaited on the host's own runtime, on a bus connection of its own that closes with the
+/// read. The await holds no worker while the portal thinks.
 #[cfg(target_os = "linux")]
 async fn read() -> HostTheme {
     // A desktop running no portal must not stall the request. Anything slower than this is
@@ -63,7 +61,10 @@ async fn read() -> HostTheme {
     // worth bounding.
     const BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
     match tokio::time::timeout(BUDGET, async {
-        let Ok(settings) = ashpd::desktop::settings::Settings::new().await else {
+        let Ok(bus) = pf_portal::session_bus().await else {
+            return HostTheme::default();
+        };
+        let Ok(settings) = ashpd::desktop::settings::Settings::with_connection(bus).await else {
             return HostTheme::default();
         };
         // 0 = no preference, 1 = dark, 2 = light (`org.freedesktop.appearance`).

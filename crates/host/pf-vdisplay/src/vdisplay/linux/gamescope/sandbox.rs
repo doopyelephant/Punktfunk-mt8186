@@ -65,7 +65,10 @@ pub(crate) fn plan(iso: Option<&crate::SessionIsolation>, has_seat_home: bool) -
     match bwrap_bin() {
         Some(bwrap) => Plan::On {
             bwrap,
-            dev: pf_paths::gamescope_seat_dev_dir(&iso.id),
+            dev: pf_paths::gamescope_seat_dev_dir(
+                pf_host_config::session::runtime_dir().as_deref(),
+                &iso.id,
+            ),
         },
         None => Plan::NoBwrap,
     }

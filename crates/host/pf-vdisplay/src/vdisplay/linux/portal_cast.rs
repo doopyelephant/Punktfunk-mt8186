@@ -152,8 +152,8 @@ fn portal_thread(
     use ashpd::desktop::PersistMode;
     use ashpd::enumflags2::BitFlags;
 
-    // Shared, never dropped ([`pf_portal`]): a per-cast runtime kills
-    // ashpd's process-global cached connection and every later handshake hangs.
+    // Shared, never dropped ([`pf_portal`]): the cast's bus connection reads on it until the
+    // cast closes.
     let rt = match pf_portal::portal_runtime() {
         Ok(rt) => rt,
         Err(e) => {
@@ -166,8 +166,10 @@ fn portal_thread(
     rt.block_on(async move {
         let result: Result<()> = async {
             let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
-            // An orphaned cached connection hangs here, before any handshake call.
-            let proxy = within(deadline, Screencast::new())
+            let bus = within(deadline, pf_portal::session_bus())
+                .await
+                .context("connect the session bus")?;
+            let proxy = within(deadline, Screencast::with_connection(bus))
                 .await
                 .with_context(|| format!("connect ScreenCast portal (is {portal} running?)"))?;
             let session = within(deadline, proxy.create_session(Default::default()))

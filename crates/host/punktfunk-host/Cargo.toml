@@ -243,6 +243,8 @@ libc = "0.2"
 ashpd = { version = "0.13", features = ["screencast", "remote_desktop", "settings", "inhibit"] }
 # A seat serves steamos-manager's session switch on its own bus (`seats/session_switch.rs`).
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+# `session_bus`: every session-bus connection goes to the address the host detected.
+pf-portal = { path = "../pf-portal" }
 # (ashpd 0.13 drives the one-time portal handshake on tokio; the unconditional `tokio = "full"`
 # in [dependencies] already covers that — this block used to re-declare a strict subset of it.)
 # NOTE: the Wayland stack (wayland-client / -protocols{,-wlr,-misc} / -scanner / -backend),

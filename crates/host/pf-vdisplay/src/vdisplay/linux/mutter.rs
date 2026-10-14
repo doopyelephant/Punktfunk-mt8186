@@ -100,24 +100,17 @@ impl MutterDisplay {
     }
 }
 
-/// Cheap env check that the host is in a GNOME session. Fallback only:
+/// Cheap check that the host is in a GNOME session. Fallback only:
 /// [`crate::available`] treats a live `gnome-shell` `/proc` scan as
 /// authority, because a host launched from systemd/TTY/ssh never
-/// inherited this var.
+/// inherited a desktop name.
 ///
-/// Only `XDG_CURRENT_DESKTOP`: [`crate::apply_session_env`] writes and
-/// scrubs that key. Sniffing `DESKTOP_SESSION` / `XDG_SESSION_DESKTOP`
-/// would revive a stale `gnome` after a shell crash and route the next
-/// client into a dead session.
-///
-/// The read takes [`crate::with_env_lock`]: this runs on a management
-/// worker concurrently with `apply_session_env`'s `set_var`/`remove_var`,
-/// and a glibc `getenv` racing that is the `environ` realloc race
-/// ENV_LOCK exists for. Read-then-drop; the lock is not reentrant.
+/// Only the stored session's desktop name, which no live session clears.
+/// Sniffing `DESKTOP_SESSION` / `XDG_SESSION_DESKTOP` would revive a stale
+/// `gnome` after a shell crash and route the next client into a dead session.
 pub fn is_available() -> bool {
-    crate::with_env_lock(|| std::env::var("XDG_CURRENT_DESKTOP"))
-        .map(|d| d.to_ascii_uppercase().contains("GNOME"))
-        .unwrap_or(false)
+    pf_host_config::session::current_desktop()
+        .is_some_and(|d| d.to_ascii_uppercase().contains("GNOME"))
 }
 
 impl VirtualDisplay for MutterDisplay {
@@ -657,7 +650,7 @@ async fn connect_monitor(connector: &str, hw_cursor: bool) -> Result<MutterSessi
 /// session anchored to it. Returns the connection because it IS the
 /// sessions' lifetime — drop it and Mutter tears them down.
 async fn open_rd_sc() -> Result<(zbus::Connection, zbus::Proxy<'static>, zbus::Proxy<'static>)> {
-    let conn = zbus::Connection::session()
+    let conn = pf_portal::session_bus()
         .await
         .context("connect session D-Bus")?;
 
@@ -862,7 +855,7 @@ type ApplyLogical = (i32, i32, f64, u32, bool, Vec<ApplyMon>);
 /// DisplayConfig proxy on its own session-bus connection, independent of
 /// the RemoteDesktop/ScreenCast connection so it can outlive them.
 async fn display_config() -> Result<zbus::Proxy<'static>> {
-    let conn = zbus::Connection::session()
+    let conn = pf_portal::session_bus()
         .await
         .context("connect session D-Bus (DisplayConfig)")?;
     zbus::Proxy::new(

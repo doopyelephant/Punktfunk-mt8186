@@ -690,10 +690,7 @@ pub(crate) fn kscreen_verdict(args: &[String]) -> Option<bool> {
     // kscreen-doctor is a Wayland client: it gets the live session's socket.
     let mut doctor = std::process::Command::new("kscreen-doctor");
     doctor.args(args);
-    match crate::proc::status_within(
-        pf_host_config::session::export_to(&mut doctor),
-        KSCREEN_BUDGET,
-    ) {
+    match crate::proc::status_within(&mut doctor, KSCREEN_BUDGET) {
         Ok(status) => Some(status.success()),
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => None,
         Err(_) => Some(false),
@@ -703,12 +700,9 @@ pub(crate) fn kscreen_verdict(args: &[String]) -> Option<bool> {
 fn kscreen_json_bytes() -> Option<Vec<u8>> {
     let mut doctor = std::process::Command::new("kscreen-doctor");
     doctor.arg("-j");
-    crate::proc::output_within(
-        pf_host_config::session::export_to(&mut doctor),
-        KSCREEN_BUDGET,
-    )
-    .ok()
-    .map(|o| o.stdout)
+    crate::proc::output_within(&mut doctor, KSCREEN_BUDGET)
+        .ok()
+        .map(|o| o.stdout)
 }
 
 fn kscreen_json() -> Option<serde_json::Value> {

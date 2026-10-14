@@ -404,7 +404,6 @@ pub(super) fn hand_launch_to_steam_when_up(
             tracing::info!(%uri, steam_up = up, "gamescope: handing the launch to the nested Steam");
             let mut forward = Command::new("steam");
             forward.arg(&uri).stdout(Stdio::null()).stderr(Stdio::null());
-            pf_host_config::session::export_to(&mut forward);
             if let Some(home) = &steam_home {
                 forward.envs(seat::env(home));
             }

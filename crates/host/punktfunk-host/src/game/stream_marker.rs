@@ -115,10 +115,11 @@ mod imp {
         }
     }
 
-    /// `$XDG_RUNTIME_DIR/punktfunk/`. Per-user tmpfs, gone on logout, so a reboot
-    /// cannot leave a live marker. `/tmp` only when the runtime dir is unset.
+    /// `$XDG_RUNTIME_DIR/punktfunk/` of the live session, where its scripts look. Per-user
+    /// tmpfs, gone on logout, so a reboot cannot leave a live marker. `/tmp` only when no
+    /// runtime dir is known.
     fn dir() -> PathBuf {
-        let base = std::env::var_os("XDG_RUNTIME_DIR")
+        let base = pf_host_config::session::runtime_dir()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         base.join("punktfunk")

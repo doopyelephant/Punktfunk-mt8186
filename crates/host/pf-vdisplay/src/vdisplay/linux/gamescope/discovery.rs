@@ -412,10 +412,7 @@ fn best_node(nodes: &[DumpNode], scope: Scope<'_>) -> Option<u32> {
 /// [`Scope::rank`] of the listener's pid, then the newest mtime.
 /// Returns the bare name — the injector resolves it the same way libei resolves `LIBEI_SOCKET`.
 pub(super) fn find_gamescope_eis_socket(scope: Scope<'_>) -> Option<String> {
-    // `set_var` of `XDG_RUNTIME_DIR` races glibc getenv (UB; see crate `lib.rs`). The lock is
-    // not reentrant — take the read here, not in a caller. `point_injector_at_eis` holds nothing;
-    // `ei_socket_file()` takes and releases the same lock separately.
-    let runtime = crate::with_env_lock(|| std::env::var("XDG_RUNTIME_DIR").ok())?;
+    let runtime = pf_host_config::session::runtime_dir()?;
     let mut live: Vec<(u8, std::time::SystemTime, String)> = Vec::new();
     for entry in std::fs::read_dir(&runtime).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();

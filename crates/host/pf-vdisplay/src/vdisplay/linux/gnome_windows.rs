@@ -10,7 +10,6 @@
 //! list, and a launch hold ends when the game's process starts.
 
 use crate::toplevels::Toplevel;
-use ashpd::zbus;
 use std::path::PathBuf;
 use std::sync::Once;
 use std::time::Duration;
@@ -37,7 +36,7 @@ pub(crate) fn toplevels() -> Option<Vec<Toplevel>> {
         .ok()?;
     rt.block_on(async {
         let read = async {
-            let conn = zbus::Connection::session().await.ok()?;
+            let conn = pf_portal::session_bus().await.ok()?;
             let running = conn
                 .call_method(
                     Some("org.freedesktop.DBus"),
@@ -127,7 +126,7 @@ fn install() {
 /// `org.gnome.Shell.Extensions.EnableExtension`, the call `gnome-extensions enable` makes.
 async fn enable() -> Option<bool> {
     let call = async {
-        let conn = zbus::Connection::session().await.ok()?;
+        let conn = pf_portal::session_bus().await.ok()?;
         let reply = conn
             .call_method(
                 Some("org.gnome.Shell.Extensions"),

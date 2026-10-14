@@ -32,6 +32,8 @@ image = { version = "0.25", default-features = false, features = ["png", "bmp", 
 # `org.freedesktop.portal.Clipboard`, which needs an interactive grant a headless host can't
 # answer. Reusing ashpd's zbus re-export keeps one zbus version across the workspace.
 ashpd = "0.13"
+# `session_bus`: the live session's bus, by the address the host detected.
+pf-portal = { path = "../pf-portal" }
 futures-util = "0.3"
 # Raw fd plumbing on the paste pipes: `pipe2(O_CLOEXEC)` + `poll` on the data-control receive
 # side, `fcntl` un-nonblocking on Mutter's transfer fd.
