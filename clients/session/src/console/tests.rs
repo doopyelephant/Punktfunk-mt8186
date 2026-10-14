@@ -275,3 +275,109 @@ fn a_row_key_finds_its_record() {
     assert_eq!(index_for_key(&known, "10.0.0.3:9777"), None);
     assert_eq!(index_for_key(&known, &fp('c')), None);
 }
+
+/// The rows every client builds from its saved and discovered hosts, from the vector file the
+/// Apple and Android producers replay: store order, pins, advert fallbacks, a dual-boot
+/// neighbour.
+#[test]
+fn the_shared_host_row_vectors_agree() {
+    let raw = include_str!("../../../shared/host-row-vectors.json");
+    let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+    let cases = file["cases"].as_array().expect("cases");
+    assert!(!cases.is_empty());
+    let text = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap().to_string();
+    let texts = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect()
+    };
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let catalog = PresetsFile {
+            presets: texts(&case["presets"])
+                .into_iter()
+                .map(|id| StreamPreset {
+                    id: id.clone(),
+                    ..StreamPreset::new(id)
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let hosts = case["saved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| trust::KnownHost {
+                id: Some(text(h, "id")),
+                mac: texts(&h["mac"]),
+                os: text(h, "os"),
+                mgmt_port: h["mgmt_port"].as_u64().map(|p| p as u16),
+                last_used: h["last_used"].as_u64(),
+                pinned_presets: texts(&h["pins"]),
+                ..saved(&text(h, "name"), &text(h, "addr"), &text(h, "fp"))
+            })
+            .collect();
+        let adverts = case["discovered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| discovery::DiscoveredHost {
+                port: d["port"].as_u64().unwrap() as u16,
+                mgmt_port: d["mgmt_port"].as_u64().map(|p| p as u16),
+                os: text(d, "os"),
+                ..advert(&text(d, "name"), &text(d, "addr"), &text(d, "fp"))
+            })
+            .collect();
+        // The vector lists the saved records that answer by id; every advert is up, as it is
+        // when the sweep reaches the host it found. The sweep keys its answers by row key.
+        let reachable = texts(&case["online"]);
+        let key_of = |fp: &str, addr: &str| -> String {
+            if fp.is_empty() {
+                format!("{addr}:9777")
+            } else {
+                fp.to_string()
+            }
+        };
+        let mut up: Vec<String> = case["saved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|h| reachable.contains(&text(h, "id")))
+            .map(|h| key_of(&text(h, "fp"), &text(h, "addr")))
+            .collect();
+        up.extend(
+            case["discovered"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| key_of(&text(d, "fp"), &text(d, "addr"))),
+        );
+        let up: Vec<&str> = up.iter().map(String::as_str).collect();
+        let got = rows_of(hosts, &catalog, adverts, &up, None);
+
+        let want = case["rows"].as_array().unwrap();
+        assert_eq!(got.len(), want.len(), "{name} row count");
+        for (i, (got, want)) in got.iter().zip(want).enumerate() {
+            let at = format!("{name} row {i}");
+            assert_eq!(got.key, want["key"].as_str().unwrap(), "{at} key");
+            assert_eq!(got.saved, want["saved"].as_bool().unwrap(), "{at} saved");
+            assert_eq!(got.online, want["online"].as_bool().unwrap(), "{at} online");
+            assert_eq!(
+                got.can_wake,
+                want["can_wake"].as_bool().unwrap(),
+                "{at} can_wake"
+            );
+            assert_eq!(
+                u64::from(got.mgmt_port),
+                want["mgmt_port"].as_u64().unwrap(),
+                "{at} mgmt"
+            );
+            assert_eq!(got.os, want["os"].as_str().unwrap(), "{at} os");
+            assert_eq!(got.last_used, want["last_used"].as_u64(), "{at} last_used");
+            let pin = got.pin.as_ref().map(|p| p.id.as_str());
+            assert_eq!(pin, want["pin"].as_str(), "{at} pin");
+        }
+    }
+}
