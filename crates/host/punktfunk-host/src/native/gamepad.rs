@@ -130,12 +130,14 @@ fn degrade_if_no_uhid(chosen: GamepadPref) -> GamepadPref {
             | GamepadPref::HoripadSteam
             | GamepadPref::JoyConPair
     );
-    // A Steam Controller 2 attaches over usbip first; UHID is only its fallback.
-    let sc2_on_usbip = matches!(
+    // A Steam Controller attaches over usbip first; UHID is only its fallback.
+    let on_usbip = matches!(
         chosen,
-        GamepadPref::SteamController2 | GamepadPref::SteamController2Puck
+        GamepadPref::SteamController
+            | GamepadPref::SteamController2
+            | GamepadPref::SteamController2Puck
     ) && crate::inject::switch2_usbip::available();
-    if needs_uhid && !sc2_on_usbip && !uhid_reachable() {
+    if needs_uhid && !on_usbip && !uhid_reachable() {
         tracing::warn!(
             wanted = chosen.as_str(),
             "/dev/uhid not writable — falling back to the X-Box 360 pad"

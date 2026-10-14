@@ -37,6 +37,15 @@ pub const ATTRIB_STR_UNIT_SERIAL: u8 = 0x01;
 /// Host rumble: `steam_haptic_rumble` `[0xEB, 9, …]`. Classic SC pad pulses use `0x8F`.
 pub const ID_TRIGGER_RUMBLE_CMD: u8 = 0xEB;
 pub const ID_TRIGGER_HAPTIC_PULSE: u8 = 0x8F;
+pub const ID_TURN_OFF_CONTROLLER: u8 = 0x9F;
+pub const ID_PLAY_AUDIO: u8 = 0xB6;
+pub const ID_SET_AUDIO_MAPPING: u8 = 0xC1;
+pub const ID_RESET_IMU: u8 = 0xCE;
+/// `ID_SET_SETTINGS_VALUES` entries that pick what a trackpad does in the pad's own firmware.
+pub const SETTING_LEFT_TRACKPAD_MODE: u8 = 7;
+pub const SETTING_RIGHT_TRACKPAD_MODE: u8 = 8;
+/// Trackpad mode: the firmware emulates nothing, the pad only reports.
+pub const TRACKPAD_NONE: u16 = 7;
 pub const ID_CONTROLLER_STATE: u8 = 0x01;
 pub const ID_CONTROLLER_DECK_STATE: u8 = 0x09;
 /// Deck state header length byte: 64, as a real Deck sends. SDL drops any other value.
@@ -307,7 +316,7 @@ impl SteamState {
                     self.rpad_y = flip_y(y);
                 }
             }
-            // HidReport is Triton passthrough, not Deck/SC state.
+            // A raw report is never typed state: [`ScState`] mirrors it, the Deck has none.
             RichInput::HidReport { .. } => {}
         }
     }
@@ -452,10 +461,10 @@ pub fn sc_from_gamepad(
 }
 
 /// `ID_CONTROLLER_STATE` into the unnumbered 64-byte frame
-/// `steam_do_input_event` parses. 24-bit buttons at 8..11, **u8** triggers
-/// at 11/12 (Deck uses u16 at 44/46), joystick/left-pad multiplex at 16..20
-/// (`10.3` touched → left-pad coords), right pad at 20..24. Accel/gyro at
-/// 28..39 is hidraw-only. Kernel negates both Y axes.
+/// `steam_do_input_event` parses (SDL `ValveControllerStatePacket_t`). 24-bit buttons at
+/// 8..11, **u8** triggers at 11/12 and again in 15 bits at 24/26 as a wired pad sends them,
+/// joystick/left-pad multiplex at 16..20 (`10.3` touched → left-pad coords), right pad at
+/// 20..24, accel/gyro at 28..39. Kernel negates both Y axes.
 pub fn serialize_sc_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: u32) {
     r.fill(0);
     r[0] = 0x01;
@@ -486,13 +495,127 @@ pub fn serialize_sc_state(r: &mut [u8; STEAM_REPORT_LEN], st: &SteamState, seq: 
     r[18..20].copy_from_slice(&y.to_le_bytes());
     r[20..22].copy_from_slice(&st.rpad_x.to_le_bytes());
     r[22..24].copy_from_slice(&st.rpad_y.to_le_bytes());
-    // 28..39 IMU for hidraw; kernel maps none (no SC sensors evdev).
+    r[24..26].copy_from_slice(&st.lt.to_le_bytes());
+    r[26..28].copy_from_slice(&st.rt.to_le_bytes());
+    // IMU: Steam reads it raw; `hid-steam` maps it only where it gives the pad a sensors evdev.
     r[28..30].copy_from_slice(&st.accel[0].to_le_bytes());
     r[30..32].copy_from_slice(&st.accel[1].to_le_bytes());
     r[32..34].copy_from_slice(&st.accel[2].to_le_bytes());
     r[34..36].copy_from_slice(&st.gyro[0].to_le_bytes());
     r[36..38].copy_from_slice(&st.gyro[1].to_le_bytes());
     r[38..40].copy_from_slice(&st.gyro[2].to_le_bytes());
+}
+
+/// How long a mirrored pad's client may say nothing before the pad reads neutral. A live
+/// client refreshes the typed state every 100 ms, whatever the pad itself is doing.
+pub const RAW_STALE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A classic Steam Controller's state. A client that captured the physical pad sends its
+/// reports ([`RichInput::HidReport`]) and the host mirrors them as-is; a client that sends none
+/// drives the typed fields. Mirroring is sticky: typed frames ride alongside the raw feed.
+#[derive(Clone, Copy)]
+pub struct ScState {
+    pub typed: SteamState,
+    /// The pad's last state report; `None` until the first.
+    raw: Option<[u8; STEAM_REPORT_LEN]>,
+    /// When the client last sent anything for this pad: a report or a typed frame.
+    heard: Option<std::time::Instant>,
+}
+
+impl ScState {
+    pub fn neutral() -> ScState {
+        ScState {
+            typed: SteamState::neutral(),
+            raw: None,
+            heard: None,
+        }
+    }
+
+    /// Whether the physical pad's own reports drive this state.
+    pub fn mirrors(&self) -> bool {
+        self.raw.is_some()
+    }
+
+    /// A typed frame arrived: the fallback state, and proof the client is alive.
+    pub fn typed_frame(&mut self, typed: SteamState, now: std::time::Instant) {
+        self.typed = typed;
+        self.heard = Some(now);
+    }
+
+    /// A raw state report becomes the state; every other rich event feeds the typed fields.
+    /// A dongle pad's status frames are dropped: this pad is a wired one, with no battery.
+    pub fn apply_rich(&mut self, rich: RichInput, now: std::time::Instant) {
+        match rich {
+            RichInput::HidReport { len, data, .. } => {
+                let len = (len as usize).min(STEAM_REPORT_LEN);
+                if data[..len].starts_with(&[0x01, 0x00, ID_CONTROLLER_STATE]) {
+                    let mut raw = [0; STEAM_REPORT_LEN];
+                    raw[..len].copy_from_slice(&data[..len]);
+                    self.raw = Some(raw);
+                    self.heard = Some(now);
+                }
+            }
+            typed => self.typed.apply_rich(typed),
+        }
+    }
+
+    /// The frame to present. A mirrored pad's own report, as long as its client was heard
+    /// within [`RAW_STALE`]: a pad at rest may send nothing, a stalled client must not hold a
+    /// stick. Otherwise the typed state, neutral for a mirrored pad, under the next `seq`.
+    pub fn report(&self, seq: &mut u32, now: std::time::Instant) -> [u8; STEAM_REPORT_LEN] {
+        let alive = self
+            .heard
+            .is_some_and(|at| now.duration_since(at) < RAW_STALE);
+        let typed = match self.raw {
+            Some(raw) if alive => return raw,
+            Some(_) => SteamState::neutral(),
+            None => self.typed,
+        };
+        *seq = seq.wrapping_add(1);
+        let mut r = [0u8; STEAM_REPORT_LEN];
+        serialize_sc_state(&mut r, &typed, *seq);
+        r
+    }
+
+    /// A different pad took the slot: its reports, or its typed plane, start clean.
+    pub fn clear_rich(&mut self) {
+        self.raw = None;
+        self.typed.clear_rich();
+    }
+}
+
+/// Whether a feature SET from the host's stack goes on to the physical Steam Controller:
+/// settings, haptics, the jingles, power-off and the IMU reset. Everything else stays on the
+/// virtual pad: lizard mode is the client's to hold, and calibration, pairing and firmware
+/// commands need replies the host cannot relay.
+pub fn sc_forwards_to_pad(cmd: u8) -> bool {
+    matches!(
+        cmd,
+        ID_SET_SETTINGS_VALUES
+            | ID_TRIGGER_HAPTIC_PULSE
+            | ID_TURN_OFF_CONTROLLER
+            | ID_PLAY_AUDIO
+            | ID_SET_AUDIO_MAPPING
+            | ID_RESET_IMU
+    )
+}
+
+/// Keep the firmware's trackpad mouse off in a settings write, `[cmd, len, (setting, u16)…]`.
+/// A host app that closes the pad writes the mouse mode back, which would move the client's
+/// pointer.
+pub fn sc_hold_trackpads(set: &mut [u8]) {
+    if set.first() != Some(&ID_SET_SETTINGS_VALUES) {
+        return;
+    }
+    let end = set.len().min(2 + set.get(1).copied().unwrap_or(0) as usize);
+    for entry in set[2.min(end)..end].chunks_exact_mut(3) {
+        if matches!(
+            entry[0],
+            SETTING_LEFT_TRACKPAD_MODE | SETTING_RIGHT_TRACKPAD_MODE
+        ) {
+            entry[1..].copy_from_slice(&TRACKPAD_NONE.to_le_bytes());
+        }
+    }
 }
 
 /// Wire u8 `0..=255` → Deck u16 `0..=32767`. `v * 128` tops out at 32640
@@ -521,12 +644,39 @@ pub fn serial_reply(serial: &str) -> [u8; STEAM_REPORT_LEN] {
     buf
 }
 
-/// Rumble on the 0xCA plane. Classic SC trackpad pulses (`0x8F`) are not
-/// parsed here.
+/// What the host's stack wrote to a virtual pad since the last service pass.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct SteamFeedback {
-    /// `(low, high)` = left/strong, right/weak.
+    /// `(low, high)` = left/strong, right/weak, for the 0xCA plane. Deck `0xEB` only.
     pub rumble: Option<(u16, u16)>,
+    /// Feature SETs for the physical pad, report id first ([`sc_forwards_to_pad`]). Classic
+    /// Steam Controller only: its haptics are `0x8F` pulses, which only the pad can play.
+    pub raw: Vec<Vec<u8>>,
+}
+
+impl SteamFeedback {
+    /// Queue a classic Steam Controller's feature SET (`[cmd, len, payload…]`) for the physical
+    /// pad, if it is one that goes there, cut to its payload: the wire carries 64 bytes, id
+    /// included. Newest wins past 32: these are level-styled commands.
+    pub fn forward_sc_set(&mut self, set: &[u8]) {
+        let Some(&cmd) = set.first() else { return };
+        if !sc_forwards_to_pad(cmd) {
+            tracing::debug!(
+                cmd = format_args!("{cmd:#04x}"),
+                "steam controller feature write kept on the virtual pad"
+            );
+            return;
+        }
+        let set = &set[..set.len().min(2 + usize::from(*set.get(1).unwrap_or(&0)))];
+        let mut framed = Vec::with_capacity(set.len() + 1);
+        framed.push(0);
+        framed.extend_from_slice(set);
+        sc_hold_trackpads(&mut framed[1..]);
+        if self.raw.len() >= 32 {
+            self.raw.remove(0);
+        }
+        self.raw.push(framed);
+    }
 }
 
 /// FEATURE `SET_REPORT` `[0x00, cmd, len, …]`. `0xEB` (`steam_haptic_rumble`)
@@ -588,6 +738,57 @@ pub fn neutral_deck_report() -> [u8; STEAM_REPORT_LEN] {
 /// stops Steam re-probing (gamepad-evdev churn). Raw 64-byte EP0 payload (command id first, no
 /// report-id prefix), unlike [`serial_reply`], which carries the UHID report-id the kernel strips.
 pub use pf_driver_proto::deck::feature_reply;
+
+/// Controller interface of a wired Steam Controller (interface 2 of `28DE:1102`, mouse and
+/// keyboard on 0 and 1 as on the Deck): one vendor collection, 64-byte input, output and
+/// feature reports. `hid-steam` and Steam read the bytes raw, so only the report set matters.
+#[rustfmt::skip]
+pub const RDESC_SC_CTRL: &[u8] = &[
+    0x06,0x00,0xff,0x09,0x01,0xa1,0x01,0x15,0x00,0x26,0xff,0x00,0x75,0x08,0x95,0x40,
+    0x09,0x01,0x81,0x02,0x95,0x40,0x09,0x01,0x91,0x02,0x95,0x40,0x09,0x01,0xb1,0x02,0xc0];
+
+/// Unit serial of virtual Steam Controller `index`. `FVPF` marks it virtual, as on the Deck.
+pub fn sc_serial(index: u8) -> String {
+    format!("FVPF1102{index:04X}")
+}
+
+/// A Steam Controller at rest, as real-USB transports stream it before the first state.
+pub fn neutral_sc_report() -> [u8; STEAM_REPORT_LEN] {
+    let mut r = [0u8; STEAM_REPORT_LEN];
+    serialize_sc_state(&mut r, &SteamState::neutral(), 0);
+    r
+}
+
+/// Firmware build time of a virtual Steam Controller with no captured identity (2024-07-30).
+/// Later than any firmware Valve shipped for the pad, so Steam offers no update.
+const SC_FW_BUILD_TIME: u32 = 0x66A8_C000;
+
+/// GET_FEATURE reply of a wired Steam Controller to the latched SET `last_set` (command byte
+/// first): `0x83` answers these stand-in attributes, everything else as the Deck does
+/// ([`feature_reply`]). A captured pad's own replies come first, where the client sent them.
+pub fn sc_feature_reply(last_set: &[u8], serial: &str) -> [u8; STEAM_REPORT_LEN] {
+    if last_set.first() != Some(&ID_GET_ATTRIBUTES_VALUES) {
+        return feature_reply(last_set, serial);
+    }
+    // (attribute id, u32 LE), ids per SDL's controller_constants.h.
+    let attrs: [(u8, u32); 6] = [
+        (0x00, 0),                // ATTRIB_UNIQUE_ID
+        (0x01, 0x1102),           // ATTRIB_PRODUCT_ID
+        (0x02, 0x03),             // ATTRIB_CAPABILITIES
+        (0x0A, 0x55D2_926D),      // ATTRIB_BOOTLOADER_BUILD_TIME (2015-08-18)
+        (0x04, SC_FW_BUILD_TIME), // ATTRIB_FIRMWARE_BUILD_TIME
+        (0x09, 0x0A),             // ATTRIB_BOARD_REVISION
+    ];
+    let mut r = [0u8; STEAM_REPORT_LEN];
+    r[0] = ID_GET_ATTRIBUTES_VALUES;
+    r[1] = (attrs.len() * 5) as u8;
+    for (slot, (id, value)) in attrs.into_iter().enumerate() {
+        let o = 2 + slot * 5;
+        r[o] = id;
+        r[o + 1..o + 5].copy_from_slice(&value.to_le_bytes());
+    }
+    r
+}
 
 #[cfg(test)]
 mod tests {
@@ -872,6 +1073,7 @@ mod tests {
         assert_eq!(r[10] & 0x40, 0x40); // joystick clicked = 10.6
         assert_eq!(r[11], 255); // left trigger u8
         assert_eq!(r[12], 0); // right trigger u8
+        assert_eq!(&r[24..28], &[0xFF, 0x7F, 0, 0]); // and again, 15 bits each
         assert_eq!(&r[16..18], &1000i16.to_le_bytes()); // joystick X (lpad untouched)
         assert_eq!(&r[18..20], &(-2000i16).to_le_bytes());
         assert_eq!(&r[20..22], &3000i16.to_le_bytes()); // right pad X
@@ -922,5 +1124,88 @@ mod tests {
         let mut d = vec![0u8; 12];
         d[1] = ID_SET_SETTINGS_VALUES; // a settings write — no rumble
         assert_eq!(parse_steam_output(&d).rumble, None);
+    }
+
+    fn raw_report(first: &[u8]) -> RichInput {
+        let mut data = [0u8; punktfunk_core::quic::HID_REPORT_MAX];
+        data[..first.len()].copy_from_slice(first);
+        RichInput::HidReport {
+            pad: 0,
+            len: 64,
+            data,
+        }
+    }
+
+    /// The pad's own report goes out untouched and leaves the synth sequence alone. A pad that
+    /// goes quiet with a button held keeps it while its client's typed refresh arrives; a
+    /// client that says nothing reads neutral.
+    #[test]
+    fn sc_state_mirrors_raw_reports_while_its_client_is_heard() {
+        let t0 = std::time::Instant::now();
+        let mut st = ScState::neutral();
+        let mut seq = 7;
+        assert_eq!(st.report(&mut seq, t0)[..4], [0x01, 0x00, 0x01, 0x3C]);
+        assert_eq!(seq, 8, "typed frames take the next sequence");
+
+        st.apply_rich(raw_report(&[0x01, 0x00, 0x04, 0x0B]), t0);
+        assert!(!st.mirrors(), "a status frame is not state");
+        let frame = [0x01, 0x00, 0x01, 0x3C, 0x2A, 0, 0, 0, 0x80];
+        st.apply_rich(raw_report(&frame), t0);
+        assert!(st.mirrors());
+        let refreshed = t0 + RAW_STALE * 3;
+        st.typed_frame(sc_from_gamepad(gs::BTN_B, 0, 0, 0, 0, 0, 0), refreshed);
+        let r = st.report(&mut seq, refreshed + RAW_STALE / 2);
+        assert_eq!((&r[..9], seq), (&frame[..], 8));
+
+        let stalled = st.report(&mut seq, refreshed + RAW_STALE);
+        assert_eq!(
+            stalled[8..11],
+            [0, 0, 0],
+            "a stalled client holds no button"
+        );
+        assert_eq!(seq, 9);
+
+        st.clear_rich();
+        assert!(!st.mirrors());
+    }
+
+    /// Settings and haptics reach the physical pad; lizard mode, calibration and firmware
+    /// commands do not, and a settings write cannot turn the trackpad mouse back on.
+    #[test]
+    fn sc_feature_sets_are_filtered_for_the_physical_pad() {
+        for cmd in [0x87, 0x8F, 0x9F, 0xB6, 0xC1, 0xCE] {
+            assert!(sc_forwards_to_pad(cmd), "{cmd:#04x}");
+        }
+        for cmd in [0x81, 0x85, 0x86, 0x8E, 0x90, 0xA7, 0xA9, 0xAD, 0xB3, 0xBF] {
+            assert!(!sc_forwards_to_pad(cmd), "{cmd:#04x}");
+        }
+
+        let mut fb = SteamFeedback::default();
+        fb.forward_sc_set(&[ID_LOAD_DEFAULT_SETTINGS, 0]);
+        assert!(fb.raw.is_empty());
+        // Right trackpad → absolute mouse (0), IMU mode 0x18, left trackpad → none.
+        fb.forward_sc_set(&[0x87, 9, 8, 0, 0, 0x30, 0x18, 0, 7, 7, 0, 0xEE]);
+        assert_eq!(
+            fb.raw,
+            [vec![0, 0x87, 9, 8, 7, 0, 0x30, 0x18, 0, 7, 7, 0]],
+            "id-first, mouse mode rewritten, cut at the payload length"
+        );
+        // A length that runs past the frame must not panic.
+        fb.forward_sc_set(&[0x87, 0xFF, 8, 0]);
+        fb.forward_sc_set(&[0x87]);
+        assert_eq!(fb.raw.len(), 3);
+    }
+
+    #[test]
+    fn sc_feature_reply_answers_attributes_and_the_serial() {
+        let serial = sc_serial(3);
+        assert_eq!(serial, "FVPF11020003");
+        let r = sc_feature_reply(&[0x83], &serial);
+        assert_eq!(r[..2], [0x83, 30]);
+        assert_eq!(r[7..12], [0x01, 0x02, 0x11, 0, 0], "product id 0x1102");
+        let r = sc_feature_reply(&[0xAE, 0x15, 0x01], &serial);
+        assert_eq!(r[..3], [0xAE, 12, 0x01]);
+        assert_eq!(&r[3..15], serial.as_bytes());
+        assert_eq!(neutral_sc_report()[..4], [0x01, 0x00, 0x01, 0x3C]);
     }
 }

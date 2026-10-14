@@ -185,7 +185,7 @@ impl PadBackends {
     }
 
     /// A Triton device is live: its USB OUT is 1 kHz, so haptics poll at 1 ms.
-    pub(super) fn sc2_active(&self) -> bool {
+    pub(super) fn steam_haptics_live(&self) -> bool {
         self.steamctrl2.is_some()
     }
 

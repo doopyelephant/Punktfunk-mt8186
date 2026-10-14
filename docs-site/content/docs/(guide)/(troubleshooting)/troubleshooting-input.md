@@ -82,6 +82,9 @@ it.
 
 The trackpads don't move the pointer while Steam is closed. That's normal while the pad is captured.
 
+A 2015 Steam Controller attaches to a Linux host the same way, so the `attached via usbip` step
+applies to it too. A Windows host gives it an Xbox 360 pad instead.
+
 ## Clipboard
 
 ### Copy and paste between host and client does nothing
