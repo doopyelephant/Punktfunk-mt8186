@@ -21,7 +21,9 @@ use super::nvenc_core::{
 };
 use super::nvenc_status;
 use super::{max_forced_split_mode, resolve_split_mode, AuChunk, Codec, EncodedFrame};
-use crate::rfi::{Wave, WaveMark};
+use crate::rfi::{
+    plan_frame, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, Wave, WaveMark,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
 use std::collections::VecDeque;
@@ -572,35 +574,49 @@ impl NvSession {
         session_wave_cycle(self.codec, self.height, self.fps)
     }
 
-    /// A real loss with no clean anchor: a wave heals without one. The client re-armed at
-    /// this loss, so a wave under way queues a fresh start and close behind it; its own
-    /// close still lifts unless a lost frame sits inside its sweep. Nonsense and a range
-    /// past the head stay the caller's keyframe.
+    /// How this session recovers. The driver owns the sweep: it ignores a re-force mid-sweep,
+    /// so a loss there queues a fresh wave, and nothing abandons the one in flight.
+    fn policy(&self) -> RecoveryPolicy {
+        RecoveryPolicy {
+            cycle: Some(self.wave_cycle()).filter(|&c| c != 0),
+            mid_wave: MidWave::Queue,
+            abandons: false,
+        }
+    }
+
+    /// The wave as [`plan_frame`] reads it. `wave_spoiled` outlives a spoiled close until the
+    /// next start frame, which reads it for the span, so only a started wave is spoiled.
+    fn recovery(&self) -> Recovery {
+        Recovery {
+            wave: self.wave,
+            spoiled: self.wave_spoiled && self.wave.is_some_and(|w| w.index > 0),
+            queued: self.wave_queued,
+        }
+    }
+
+    /// A real loss with no clean anchor: a wave heals without one ([`Recovery::lose`]). Its
+    /// close still lifts unless a lost frame sits inside its sweep. Nonsense, a range past
+    /// the head and a session that cannot wave stay the caller's keyframe.
     fn start_wave(&mut self, first: i64, last: i64) -> bool {
-        let cycle = self.wave_cycle();
-        if cycle == 0 || first < 0 || first > last || first >= self.frame_idx {
+        if first < 0 || first > last || first >= self.frame_idx {
             return false;
         }
-        if let Some(w) = self.wave {
-            // The driver ignores a re-force mid-sweep: this one runs out, the next queues.
-            let span_start = self.wave_span.map(|(start, _)| start);
-            self.wave_spoiled |= w.spoiled_by(span_start, self.frame_idx, last);
-            self.wave_queued = true;
-            tracing::debug!(
-                first,
-                last,
-                spoiled = self.wave_spoiled,
-                "nvenc RFI: loss mid-wave — wave queued behind it"
-            );
-            return true;
-        }
-        self.wave = Some(Wave::start(cycle));
+        let span_start = self.wave_span.map(|(start, _)| start);
+        let spoils = self
+            .wave
+            .is_some_and(|w| w.spoiled_by(span_start, self.frame_idx, last));
+        let Some(next) = self.recovery().lose(&self.policy(), spoils) else {
+            return false;
+        };
         tracing::debug!(
             first,
             last,
-            cycle,
+            mid_wave = self.wave.is_some(),
+            spoiled = next.spoiled,
             "nvenc RFI: no clean anchor — intra refresh wave"
         );
+        (self.wave, self.wave_queued) = (next.wave, next.queued);
+        self.wave_spoiled |= next.spoiled;
         true
     }
 
@@ -1101,47 +1117,46 @@ impl NvSession {
 
         let pts = self.frame_idx as u64;
         self.frame_idx += 1;
-        let flags = if std::mem::take(&mut self.force_kf) {
+        let ts = pts as i64;
+        let forced = std::mem::take(&mut self.force_kf);
+        let ltr = self.ltr_peek(ts);
+        // The opening frame is an IDR the driver emits unasked: only a forced one is planned
+        // as an IDR, which drops the anchor and flushes the wave, queue and all.
+        let pending = Pending {
+            idr: forced,
+            anchor: std::mem::take(&mut self.pending_anchor),
+            acked: !opening && ltr.is_some_and(|(_, force)| force.is_some()),
+            loss: false,
+        };
+        let plan = plan_frame(self.recovery(), pending, &self.policy());
+        let flags = if forced {
             // The IDR flushes the DPB: every later reference is clean again.
             self.distrusted = false;
+            self.wave_span = self.wave_span.map(|(s, close)| (s, close.min(ts)));
             nv::NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_FORCEIDR as u32
                 | nv::NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS as u32
         } else {
             0
         };
-        // The first frame after invalidation. A simultaneous forced IDR is itself the re-anchor.
-        let anchor = std::mem::take(&mut self.pending_anchor) && flags == 0;
-        // An IDR flushes the wave, queue and all, and every picture from it on is clean; a
-        // wave's start frame asks for the sweep.
-        if flags != 0 {
-            self.wave = None;
-            self.wave_spoiled = false;
-            self.wave_queued = false;
-            self.wave_span = self.wave_span.map(|(s, close)| (s, close.min(pts as i64)));
+        // The first frame after invalidation, or one that references a confirmed picture.
+        let anchor = matches!(plan.refs, FrameRef::Anchor | FrameRef::Acked);
+        let (wave, mark) = (plan.wave, plan.mark);
+        if let Some(w) = wave.filter(|w| w.index == 0) {
+            // A wave after a spoiled one keeps the spoiled pictures dirty too.
+            let start = match self.wave_span {
+                Some((s, _)) if self.wave_spoiled => s,
+                _ => ts,
+            };
+            self.wave_span = Some((start, ts + i64::from(w.cycle) - 1));
         }
-        let wave = self.wave;
-        let mark = wave.map_or(WaveMark::None, |w| w.mark(self.wave_spoiled));
-        if let Some(w) = wave {
-            let ts = pts as i64;
-            if w.index == 0 {
-                // A wave after a spoiled one keeps the spoiled pictures dirty too.
-                let start = match self.wave_span {
-                    Some((s, _)) if self.wave_spoiled => s,
-                    _ => ts,
-                };
-                self.wave_span = Some((start, ts + i64::from(w.cycle) - 1));
-                self.wave_spoiled = false;
-            }
-            self.wave = w.next();
-            if self.wave.is_none() && std::mem::take(&mut self.wave_queued) {
-                self.wave = Some(Wave::start(w.cycle));
-            }
-        }
+        (self.wave, self.wave_queued) = (plan.next.wave, plan.next.queued);
+        self.wave_spoiled = plan.next.spoiled || (plan.dirty && wave.is_some_and(Wave::closes));
         // P-only + infinite GOP: IDRs are forced, or the opening frame NVENC emits as one.
         // Chunked poll flags early chunks from this before the driver reports `pictureType`.
-        let idr = flags != 0 || opening;
-        let ltr = self.ltr_step(pts as i64, idr, wave.is_some());
-        let anchor = anchor || ltr.is_some_and(|(_, force)| force.is_some());
+        let idr = forced || opening;
+        // The long-term step sits out an IDR, which empties the slots, and a wave.
+        let ltr = ltr.filter(|_| !idr && wave.is_none());
+        self.ltr_mark(ts, idr, ltr);
         let mut pic = nv::NV_ENC_PIC_PARAMS {
             version: nv::NV_ENC_PIC_PARAMS_VER,
             inputWidth: self.width,
@@ -1282,22 +1297,34 @@ impl NvSession {
         })
     }
 
-    /// This frame's long-term step while the host holds confirmed references: mark it into a
-    /// slot and force the newest one the client confirmed ([`crate::rfi::ltr_acked_step`]).
-    /// `None` without a floor, on an IDR (which empties the slots) and during a wave.
-    fn ltr_step(&mut self, ts: i64, idr: bool, wave: bool) -> Option<LtrStep> {
+    /// The long-term step frame `ts` would take while the host holds confirmed references:
+    /// the slot it marks and the newest confirmed one it forces
+    /// ([`crate::rfi::ltr_acked_step`]). `None` without a floor or without long-term slots.
+    fn ltr_peek(&mut self, ts: i64) -> Option<LtrStep> {
         let n = self.ltr_frames as usize;
-        if self.ltr_slots.len() != n || idr {
+        if self.ltr_slots.len() != n {
             self.ltr_slots = vec![None; n];
             self.ltr_next = 0;
         }
-        let acked = self.reference_floor.filter(|_| n > 0 && !idr && !wave)?;
-        let (mark, force) = crate::rfi::ltr_acked_step(&self.ltr_slots, &acked, ts, self.ltr_next);
-        if let Some(m) = mark {
-            self.ltr_slots[m] = Some(ts);
-            self.ltr_next = (m + 1) % n;
+        let acked = self.reference_floor.filter(|_| n > 0)?;
+        Some(crate::rfi::ltr_acked_step(
+            &self.ltr_slots,
+            &acked,
+            ts,
+            self.ltr_next,
+        ))
+    }
+
+    /// Record frame `ts` in the slot table: an IDR empties it, a step's mark fills its slot.
+    fn ltr_mark(&mut self, ts: i64, idr: bool, step: Option<LtrStep>) {
+        if idr {
+            self.ltr_slots.fill(None);
+            self.ltr_next = 0;
         }
-        Some((mark, force))
+        if let Some((Some(m), _)) = step {
+            self.ltr_slots[m] = Some(ts);
+            self.ltr_next = (m + 1) % self.ltr_slots.len();
+        }
     }
 
     /// Unmap one retired input.
@@ -1851,7 +1878,6 @@ mod ladder_tests {
 mod recovery_tests {
     use super::*;
     use crate::rfi::plan_tests::{check, nvenc, sweep, Au, Model, NVENC, NVENC_NO_WAVE};
-    use crate::rfi::FrameRef;
     use crate::Acked;
 
     macro_rules! accept {
