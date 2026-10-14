@@ -17,6 +17,7 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 use crate::backend::BackendError;
+use crate::backoff::{Backoff, Curve, Reset};
 use crate::model::{RuntimeState, RuntimeStatus};
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,14 @@ const HOST_READY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const START_TIMEOUT: Duration = Duration::from_secs(180);
 const FIRST_RESTART_DELAY: Duration = Duration::from_secs(1);
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
+/// The wait before a seat's next cycle, and before its host starts again in one.
+const RESTART: Backoff = Backoff::new(
+    Curve::Doubling {
+        first: FIRST_RESTART_DELAY,
+        cap: MAX_RESTART_DELAY,
+    },
+    Reset::Never,
+);
 
 /// How long the worker sleeps between two looks of one kind.
 const SESSION_POLL: Duration = Duration::from_millis(250);
@@ -352,10 +361,10 @@ pub(crate) struct State {
     answer: Option<Result<(), BackendError>>,
     stop: Option<Stop>,
     gate: Gate,
-    /// The wait before the next cycle. It doubles and never shrinks.
-    cycle_delay: Duration,
-    /// The wait before the host starts again. It doubles within a cycle.
-    host_delay: Duration,
+    /// Failed cycles, for the wait before the next one.
+    restart: Backoff,
+    /// Host exits in this cycle, for the wait before the host starts again.
+    host_restart: Backoff,
 }
 
 impl State {
@@ -369,8 +378,8 @@ impl State {
             answer: None,
             stop: None,
             gate: Gate::Owed { failures: 0 },
-            cycle_delay: FIRST_RESTART_DELAY,
-            host_delay: FIRST_RESTART_DELAY,
+            restart: RESTART,
+            host_restart: RESTART,
         }
     }
 
@@ -463,7 +472,7 @@ impl State {
             }
             Phase::Readying { ref mut since } => {
                 let late = since.over(now, HOST_READY_TIMEOUT);
-                self.readying(probe, late)
+                self.readying(probe, late, now)
             }
             Phase::Running => self.running(probe, now),
             Phase::HostDown { until } => self.host_down(probe, until, now),
@@ -486,7 +495,7 @@ impl State {
         } else if until.is_some_and(|until| now < until) {
             vec![Action::Wait(DELAY_POLL)]
         } else {
-            self.host_delay = FIRST_RESTART_DELAY;
+            self.host_restart.reset();
             self.phase = Phase::SigningIn {
                 since: Since::default(),
             };
@@ -552,7 +561,7 @@ impl State {
     }
 
     /// A stop, a lost keeper, a host that exited, the ports, then the limit.
-    fn readying(&mut self, probe: Probe, late: bool) -> Vec<Action> {
+    fn readying(&mut self, probe: Probe, late: bool, now: Instant) -> Vec<Action> {
         if self.stopping() {
             self.fail(
                 "seat_stopping",
@@ -571,6 +580,8 @@ impl State {
         } else if probe.ready {
             self.status = RuntimeStatus::running();
             self.answer.get_or_insert(Ok(()));
+            self.restart.started(now);
+            self.host_restart.started(now);
             self.phase = Phase::Running;
             Vec::new()
         } else if late {
@@ -600,8 +611,7 @@ impl State {
                 format!("RDP keeper process exited with code {code}"),
             )
         } else if let Some(code) = probe.host {
-            let delay = self.host_delay;
-            self.host_delay = doubled(delay);
+            let delay = self.host_restart.failed(now);
             self.status = starting(format!(
                 "punktfunk stopped on the seat. Restarting it in {} s…",
                 delay.as_secs()
@@ -688,9 +698,8 @@ impl State {
         }
         if retry {
             self.phase = Phase::Resting {
-                until: Some(now + self.cycle_delay),
+                until: Some(now + self.restart.failed(now)),
             };
-            self.cycle_delay = doubled(self.cycle_delay);
         } else {
             actions.extend(self.finish());
         }
@@ -723,10 +732,6 @@ fn starting(detail: String) -> RuntimeStatus {
         state: RuntimeState::Starting,
         detail: Some(detail),
     }
-}
-
-fn doubled(delay: Duration) -> Duration {
-    delay.saturating_mul(2).min(MAX_RESTART_DELAY)
 }
 
 #[cfg(test)]
@@ -1197,6 +1202,17 @@ mod tests {
         }
         assert_eq!(bench.answer(), Some(Ok(())));
         assert_eq!(bench.state.session(), Some(7));
+    }
+
+    #[test]
+    fn both_delays_are_told_when_the_host_comes_up() {
+        let mut bench = bench(At::Readying);
+        let up = bench.later(Duration::from_secs(3)).now;
+        assert_eq!(bench.see(READY), []);
+        let mut told = RESTART;
+        told.started(up);
+        assert_eq!(bench.state.restart, told);
+        assert_eq!(bench.state.host_restart, told);
     }
 
     #[test]

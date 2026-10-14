@@ -10,6 +10,7 @@
 #![cfg_attr(not(windows), forbid(unsafe_code))]
 
 pub mod backend;
+pub mod backoff;
 #[cfg(any(windows, test))]
 pub mod bootstrap;
 pub mod ipc;

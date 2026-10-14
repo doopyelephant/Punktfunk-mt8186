@@ -4,6 +4,7 @@
 //! Evidence: design/windows-web-console-lifecycle.md.
 
 use super::*;
+use pf_seats::backoff::{Backoff, Curve, Reset};
 
 pub(super) fn web_log_path() -> PathBuf {
     let dir = pf_paths::config_dir().join("logs");
@@ -15,6 +16,15 @@ pub(super) fn web_log_path() -> PathBuf {
 pub(super) const WEB_GOOD_RUN: Duration = Duration::from_secs(60);
 
 pub(super) const WEB_MAX_BACKOFF_MS: u64 = 60_000;
+
+/// 0.5 s, doubling to [`WEB_MAX_BACKOFF_MS`]. A run of [`WEB_GOOD_RUN`] clears the count.
+const WEB_BACKOFF: Backoff = Backoff::new(
+    Curve::Doubling {
+        first: Duration::from_millis(500),
+        cap: Duration::from_millis(WEB_MAX_BACKOFF_MS),
+    },
+    Reset::AfterRun(WEB_GOOD_RUN),
+);
 
 /// Console payload under the directory this exe runs from.
 pub(super) struct WebConfig {
@@ -31,8 +41,8 @@ pub(super) struct WebSlot {
     /// Kill-on-close, no breakaway. Created at first spawn; drop reaps bun and its children.
     job: Option<OwnedHandle>,
     spawned_at: Instant,
-    /// Consecutive short-lived runs; spawn failures count. Drives the backoff.
-    fast_exits: u32,
+    /// Short-lived runs in a row; spawn failures count. A run of [`WEB_GOOD_RUN`] clears it.
+    backoff: Backoff,
     next_spawn: Instant,
     /// Grace for `web-password` after the hard-gate files exist. Starting without it is safe:
     /// the console fail-closes until a password exists.
@@ -82,7 +92,7 @@ impl WebSlot {
             child: None,
             job: None,
             spawned_at: now,
-            fast_exits: 0,
+            backoff: WEB_BACKOFF,
             next_spawn: now,
             password_deadline: None,
             logged_wait: false,
@@ -190,7 +200,7 @@ impl WebSlot {
                 Ok(j) => self.job = Some(j),
                 Err(e) => {
                     tracing::error!("create web console job object: {e:#}");
-                    self.schedule_retry();
+                    self.schedule_retry(Instant::now());
                     return;
                 }
             }
@@ -203,13 +213,14 @@ impl WebSlot {
                     "web console launched (https://<host-ip>:47992)"
                 );
                 self.spawned_at = Instant::now();
+                self.backoff.started(self.spawned_at);
                 self.password_deadline = None;
                 self.logged_wait = false;
                 self.child = Some(child);
             }
             Err(e) => {
                 tracing::error!("web console did not launch: {e:#}");
-                self.schedule_retry();
+                self.schedule_retry(Instant::now());
             }
         }
     }
@@ -222,11 +233,9 @@ impl WebSlot {
         // SAFETY: `child.process` is the live OwnedHandle of the just-signalled process (owned
         // until `child` drops at the end of this fn); `code` is a live local out-param.
         let _ = unsafe { GetExitCodeProcess(HANDLE(child.process.as_raw_handle()), &mut code) };
-        let uptime = self.spawned_at.elapsed();
-        if uptime >= WEB_GOOD_RUN {
-            self.fast_exits = 0;
-        }
-        self.schedule_retry();
+        let now = Instant::now();
+        let uptime = now.saturating_duration_since(self.spawned_at);
+        self.schedule_retry(now);
         tracing::warn!(
             pid = child.pid,
             exit_code = format!("{code:#x}"),
@@ -236,10 +245,9 @@ impl WebSlot {
         );
     }
 
-    fn schedule_retry(&mut self) {
-        self.fast_exits = self.fast_exits.saturating_add(1);
-        let backoff_ms = (500u64 << (self.fast_exits - 1).min(7)).min(WEB_MAX_BACKOFF_MS);
-        self.next_spawn = Instant::now() + Duration::from_millis(backoff_ms);
+    /// Count a run that ended at `now`, or a spawn that failed, and set the next attempt.
+    fn schedule_retry(&mut self, now: Instant) {
+        self.next_spawn = now + self.backoff.failed(now);
     }
 }
 
