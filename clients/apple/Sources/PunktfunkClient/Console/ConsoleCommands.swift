@@ -33,7 +33,7 @@ extension ConsoleModel {
         case .fetchLibrary:
             fetchReq = (a["fp_hex"] as? String ?? "", a["req"] ?? ConsoleJSON.unasked)
             fetchLibrary(
-                addr: a["addr"] as? String ?? "", mgmt: port(a["mgmt"]),
+                addr: a["addr"] as? String ?? "", port: port(a["port"]), mgmt: port(a["mgmt"]),
                 fp: a["fp_hex"] as? String ?? "", refreshOnly: false)
         case .refreshRunning:
             fetchLibrary(
@@ -242,8 +242,15 @@ extension ConsoleModel {
     /// runs, then what the host answers; a sleeping host is woken when auto-wake is on.
     /// `refreshOnly` asks about running titles alone. The list and phase go up under the last
     /// `FetchLibrary`'s `req`; a refetch this model starts reuses it, and only for its host.
-    func fetchLibrary(addr: String, mgmt: UInt16, fp: String, refreshOnly: Bool) {
-        guard let host = host(fp: fp, addr: addr, port: 0) else { return }
+    /// The host is the record `fp` pins, else the unpinned one at `addr:port` (the stream port):
+    /// never one pinned to another fingerprint, the other OS of a dual-boot box.
+    func fetchLibrary(
+        addr: String, port: UInt16 = 0, mgmt: UInt16, fp: String, refreshOnly: Bool
+    ) {
+        let placeholder = store.hosts.first {
+            $0.pinnedSHA256 == nil && $0.address == addr && $0.port == port
+        }
+        guard let host = host(fp: fp, addr: "", port: 0) ?? placeholder else { return }
         // The console has moved off this host: no shelf to refill.
         if !refreshOnly, fetchReq.fp != fp { return }
         if !refreshOnly { fetchSerial += 1 }

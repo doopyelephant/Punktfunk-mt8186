@@ -532,10 +532,11 @@ impl ServiceState {
         match cmd {
             ConsoleCmd::FetchLibrary {
                 addr,
+                port,
                 mgmt,
                 fp_hex,
                 req,
-            } => self.fetch_library(addr, mgmt, fp_hex, req),
+            } => self.fetch_library(addr, port, mgmt, fp_hex, req),
             ConsoleCmd::RefreshRunning { addr, mgmt, fp_hex } => {
                 self.refresh_running(addr, mgmt, fp_hex)
             }
@@ -695,19 +696,14 @@ impl ServiceState {
         }
     }
 
-    fn fetch_library(&self, addr: String, mgmt: u16, fp_hex: String, req: RequestKey) {
-        // Opening a library is the earliest signal that somebody intends to play, so
-        // the box is woken HERE, not at connect time. Empty with auto-wake off or no
-        // MAC on record: the fetch then asks once instead of retrying across a boot.
+    fn fetch_library(&self, addr: String, port: u16, mgmt: u16, fp_hex: String, req: RequestKey) {
+        // Opening a library is the earliest signal that somebody intends to play, so the box
+        // is woken HERE, not at connect time, with the MACs of the record the pin names, else
+        // of the placeholder at `addr:port`. Empty with auto-wake off or no MAC on record: the
+        // fetch then asks once instead of retrying across a boot.
         let known = trust::KnownHosts::load();
         let macs = known
-            .find_by_fp(&fp_hex)
-            .or_else(|| {
-                known
-                    .hosts
-                    .iter()
-                    .find(|h| h.fp_hex.is_empty() && h.addr == addr)
-            })
+            .resolve(Some(&fp_hex), &addr, port)
             .filter(|_| trust::Settings::load().auto_wake)
             .map(|h| h.mac.clone())
             .unwrap_or_default();

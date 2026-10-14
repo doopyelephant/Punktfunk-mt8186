@@ -489,9 +489,11 @@ impl ConsoleShared {
 /// render path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConsoleCmd {
-    /// Answered on [`crate::LibraryShared`] under `req`.
+    /// Answered on [`crate::LibraryShared`] under `req`. `port` is the stream port: a wake
+    /// takes its MACs from the record pinned to `fp_hex`, else the placeholder at `addr:port`.
     FetchLibrary {
         addr: String,
+        port: u16,
         mgmt: u16,
         fp_hex: String,
         req: RequestKey,
@@ -700,6 +702,7 @@ impl ConsoleCmd {
     pub(crate) fn fetch_library(host: &HostRow) -> ConsoleCmd {
         ConsoleCmd::FetchLibrary {
             addr: host.addr.clone(),
+            port: host.port,
             mgmt: host.mgmt_port,
             fp_hex: host.fp_hex.clone(),
             req: RequestKey::new(&host.fp_hex),
@@ -743,6 +746,31 @@ mod tests {
             online: false,
             ..HostRow::fixture("aa", "Tower")
         }
+    }
+
+    /// A library fetch names its host by pin and by `addr:port`, the stream port, not the
+    /// management one: a wake resolves the record by both.
+    #[test]
+    fn a_library_fetch_carries_the_stream_port() {
+        let host = HostRow {
+            port: 9800,
+            mgmt_port: 47991,
+            ..tower()
+        };
+        let ConsoleCmd::FetchLibrary {
+            addr,
+            port,
+            mgmt,
+            fp_hex,
+            ..
+        } = ConsoleCmd::fetch_library(&host)
+        else {
+            panic!("fetch_library builds a FetchLibrary");
+        };
+        assert_eq!(
+            (addr.as_str(), port, mgmt, fp_hex.as_str()),
+            ("10.0.0.2", 9800, 47991, "aa")
+        );
     }
 
     #[test]
