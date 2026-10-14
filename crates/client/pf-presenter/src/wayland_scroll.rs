@@ -6,13 +6,13 @@
 //! The retained window context outlives the borrowed display and all proxies.
 
 use crate::scroll::{NativeAxisSource, WaylandScrollFrame};
+use crate::wl_side::{release_registry, SdlWayland};
 use anyhow::Context;
 use punktfunk_core::input::InputEvent;
 use sdl3::video::WindowContext;
 use std::collections::HashMap;
 use std::sync::Arc;
-use wayland_backend::client::Backend;
-use wayland_client::globals::{registry_queue_init, GlobalList, GlobalListContents};
+use wayland_client::globals::{GlobalList, GlobalListContents};
 use wayland_client::protocol::{wl_pointer, wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 
@@ -76,33 +76,13 @@ impl WaylandScroll {
         if window.subsystem().current_video_driver() != "wayland" {
             return Ok(None);
         }
-        // SAFETY: the live window owns both pointers; neither pointer transfers ownership.
-        let (display, surface) = unsafe {
-            let props = sdl3::sys::video::SDL_GetWindowProperties(window.raw());
-            (
-                sdl3::sys::properties::SDL_GetPointerProperty(
-                    props,
-                    sdl3::sys::video::SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER,
-                    std::ptr::null_mut(),
-                ),
-                sdl3::sys::properties::SDL_GetPointerProperty(
-                    props,
-                    sdl3::sys::video::SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER,
-                    std::ptr::null_mut(),
-                ),
-            )
-        };
-        if display.is_null() || surface.is_null() {
+        let Some(sdl) = SdlWayland::of(window) else {
             return Ok(None);
-        }
-        // SAFETY: window.context() is retained until after the foreign backend is dropped.
-        let backend = unsafe { Backend::from_foreign_display(display.cast()) };
-        let conn = Connection::from_backend(backend);
-        let (globals, queue) =
-            registry_queue_init::<WlState>(&conn).context("initialize scroll registry")?;
-        // SAFETY: surface is SDL's live wl_surface proxy on this display.
+        };
+        let (conn, globals, queue) = sdl.connect::<WlState>("initialize scroll registry")?;
+        // SAFETY: the surface is SDL's live wl_surface proxy on this display.
         let surface_id = unsafe {
-            (wayland_sys::client::wayland_client_handle().wl_proxy_get_id)(surface.cast())
+            (wayland_sys::client::wayland_client_handle().wl_proxy_get_id)(sdl.surface.cast())
         };
         let mut capture = Self {
             conn,
@@ -170,12 +150,7 @@ impl Drop for WaylandScroll {
             seat.release_pointer();
             seat.seat.release();
         }
-        if let Some(globals) = self.globals.take() {
-            let id = globals.registry().id();
-            globals.destroy();
-            let _ = self.conn.backend().destroy_object(&id);
-        }
-        let _ = self.conn.flush();
+        release_registry(&mut self.globals, &self.conn);
     }
 }
 
