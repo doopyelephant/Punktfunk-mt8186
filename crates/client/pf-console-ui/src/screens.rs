@@ -34,6 +34,7 @@ use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::Pointer;
 use crate::theme::Fonts;
 use crate::widgets::{Entry, Keyboard, ROW_H};
+use pf_client_core::console::OverlayAction;
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use pf_client_core::{menu_nav::PadInfo, trust};
 use skia_safe::{Canvas, Rect};
@@ -363,6 +364,8 @@ pub(crate) struct Outbox {
     pub toast: Option<String>,
     /// Clipboard text. Rides the run loop, not the command bus: SDL owns the clipboard.
     pub copy: Option<String>,
+    /// Another device-local effect for the embedder: a home-screen shortcut, a launcher file.
+    pub action: Option<OverlayAction>,
     /// Switch to this tab (a pad shortcut).
     pub tab: Option<crate::shell::Tab>,
     /// Browse games: focus the games under the Hosts row.

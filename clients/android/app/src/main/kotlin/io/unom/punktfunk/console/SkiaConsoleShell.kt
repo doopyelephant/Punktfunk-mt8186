@@ -103,6 +103,9 @@ fun SkiaConsoleShell(
                 @Suppress("DEPRECATION")
                 consoleView?.announceForAccessibility(text)
             },
+            onSaveLauncherFile = { title, url ->
+                activity?.saveLauncherFile(title, url) { SkiaConsole.notice(it) }
+            },
         )
         onDispose { SkiaConsole.detach() }
     }

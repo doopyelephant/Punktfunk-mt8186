@@ -30,7 +30,9 @@ import io.unom.punktfunk.connectToHost
 import io.unom.punktfunk.deviceName
 import io.unom.punktfunk.effectiveFor
 import io.unom.punktfunk.matches
+import io.unom.punktfunk.pinTitleShortcut
 import io.unom.punktfunk.runSpeedTest
+import io.unom.punktfunk.shortcutId
 import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.ProfilePick
@@ -42,6 +44,9 @@ import io.unom.punktfunk.kit.discovery.Presence
 import io.unom.punktfunk.kit.discovery.PresenceTracker
 import io.unom.punktfunk.kit.discovery.WakeLoop
 import io.unom.punktfunk.kit.library.LibraryCache
+import io.unom.punktfunk.kit.link.DeepLinkResult
+import io.unom.punktfunk.kit.link.DeepLinks
+import io.unom.punktfunk.kit.link.HostResolution
 import io.unom.punktfunk.kit.link.StartScreen
 import io.unom.punktfunk.kit.link.host
 import io.unom.punktfunk.kit.library.LibraryClient
@@ -157,6 +162,9 @@ object SkiaConsole {
 
     /** The console's focus, in words, whenever it changes — the shell speaks it to TalkBack. */
     private var onAnnounce: ((String) -> Unit)? = null
+
+    /** "Save launcher file" (title, url): the activity owns the save dialog. */
+    private var onSaveLauncherFile: ((String, String) -> Unit)? = null
 
     /** The connect in flight, if any — cancelable through `OverlayAction::CancelConnect`. */
     private class Dial(val cancelled: AtomicBoolean = AtomicBoolean(false))
@@ -419,6 +427,7 @@ object SkiaConsole {
         onPadAction: (String, String) -> Unit,
         onPulse: (String) -> Unit,
         onAnnounce: (String) -> Unit,
+        onSaveLauncherFile: (String, String) -> Unit,
     ) {
         this.onConnected = onConnected
         this.onSettingsChange = onSettingsChange
@@ -426,6 +435,7 @@ object SkiaConsole {
         this.onPadAction = onPadAction
         this.onPulse = onPulse
         this.onAnnounce = onAnnounce
+        this.onSaveLauncherFile = onSaveLauncherFile
         resumeDiscovery()
         // The touch UI may have paired/forgotten/edited hosts or presets while we were away.
         pushHosts()
@@ -443,6 +453,7 @@ object SkiaConsole {
         onPadAction = null
         onPulse = null
         onAnnounce = null
+        onSaveLauncherFile = null
     }
 
     /** The touch UI (or a link) changed settings: the console reads the new snapshot next. */
@@ -715,7 +726,32 @@ object SkiaConsole {
                     val cm = appContext?.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                     cm?.setPrimaryClip(ClipData.newPlainText("punktfunk", text))
                 }
+                action.optJSONObject("PinShortcut")?.let(::pinShortcut)
+                action.optJSONObject("SaveLauncherFile")?.let { a ->
+                    onSaveLauncherFile?.invoke(a.optString("title"), a.optString("url"))
+                }
             }
+        }
+    }
+
+    /**
+     * `OverlayAction::PinShortcut`: the title's link as a home-screen shortcut. The record and
+     * the cached shelf the link names give the shortcut its key and its poster.
+     */
+    private fun pinShortcut(a: JSONObject) {
+        val app = appContext ?: return
+        val url = a.optString("url")
+        val title = a.optString("title")
+        val link = (DeepLinks.parse(url) as? DeepLinkResult.Parsed)?.link ?: return
+        val host = (DeepLinks.resolveHost(link, knownHostStore.all()) as? HostResolution.Record)?.host ?: return
+        val me = identity
+        ioPool.execute {
+            val posters = link.launch?.let { id ->
+                LibraryCache.standard(app.cacheDir).load(LibraryCache.keyFor(host, host.fpHex))
+                    ?.games?.firstOrNull { it.id == id }?.art?.posterCandidates
+            }.orEmpty()
+            val key = shortcutId(host.id, link.launch, link.preset)
+            pinTitleShortcut(app, me, host, posters, url, title, key)?.let { main.post { notice(it) } }
         }
     }
 

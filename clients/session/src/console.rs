@@ -303,6 +303,10 @@ pub fn run(target: Option<&str>) -> u8 {
                 // This console is drawn OVER the session's stream, so the hold coming down is
                 // the shell's own business and the picture is already behind it.
                 OverlayAction::ShowStream => ActionOutcome::Handled,
+                // The console offers these on Android only.
+                OverlayAction::PinShortcut { .. } | OverlayAction::SaveLauncherFile { .. } => {
+                    ActionOutcome::Handled
+                }
                 OverlayAction::Quit => ActionOutcome::Quit,
             }
         },

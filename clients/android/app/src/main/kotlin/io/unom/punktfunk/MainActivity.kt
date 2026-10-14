@@ -2,6 +2,7 @@ package io.unom.punktfunk
 
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -22,6 +23,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.systemBars
@@ -301,12 +303,13 @@ class MainActivity : ComponentActivity() {
         // has to happen HERE, before this instance is resumed, not inside the composition (which
         // only ever sees the rare `onNewIntent` case). Finishing now leaves the streaming task in
         // front, untouched.
+        val link = deepLinkFrom(intent)
         val live = SessionGate.live
-        if (live != null && deepLinkFrom(intent) != null) {
+        if (live != null && link != null) {
             // Pointing at the host already being streamed is the one exception, and its right
             // answer is to do nothing: the intent has already brought the app forward, which is
             // what "focus it" means here.
-            if (!targetsHost(intent, live)) {
+            if (!targetsHost(link, live)) {
                 Toast.makeText(
                     this,
                     "Already streaming — end this session first.",
@@ -316,7 +319,7 @@ class MainActivity : ComponentActivity() {
             finish()
             return
         }
-        pendingDeepLink = deepLinkFrom(intent)
+        pendingDeepLink = link
         resolveHighRefreshMode()
         setConsoleHighRefreshRate(true) // the console UI wants max refresh; streaming manages its own
         // Dark, transparent system bars regardless of the system theme — our UI is always dark, so
@@ -392,11 +395,43 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * The `punktfunk://` URL of a VIEW intent, or null. Only VIEW: the launcher's MAIN intent
-     * carries no data, and nothing else may inject a URL into the router.
+     * The link of a VIEW intent, or null: a `punktfunk://` URL, or the launcher file a frontend
+     * hands over as `content://` (read now, while its grant holds). Only VIEW: the launcher's MAIN
+     * intent carries no data, and nothing else may inject a URL into the router.
      */
-    private fun deepLinkFrom(intent: Intent?): String? =
-        intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data?.toString()
+    private fun deepLinkFrom(intent: Intent?): String? {
+        val data = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.data ?: return null
+        if (data.scheme != ContentResolver.SCHEME_CONTENT) return data.toString()
+        return linkFromLauncherFile(this, data) ?: run {
+            Toast.makeText(this, "Couldn't read a Punktfunk link from that file.", Toast.LENGTH_LONG)
+                .show()
+            null
+        }
+    }
+
+    /** The link and the report-back of a "Save launcher file" waiting on the system's save dialog. */
+    private var launcherFileSave: Pair<String, (String) -> Unit>? = null
+    private val launcherFilePicker =
+        registerForActivityResult(ActivityResultContracts.CreateDocument(LAUNCHER_FILE_MIME)) { uri ->
+            val (url, report) = launcherFileSave ?: return@registerForActivityResult
+            launcherFileSave = null
+            if (uri == null) return@registerForActivityResult // the user backed out
+            report(
+                if (writeLauncherFile(this, uri, url)) "Launcher file saved." else "Couldn't save the launcher file.",
+            )
+        }
+
+    /**
+     * "Save launcher file", for both shells: the system's save dialog, then [url] written as a
+     * `.punktfunk` file a frontend lists and opens. [report] gets the line to show.
+     */
+    fun saveLauncherFile(title: String, url: String, report: (String) -> Unit) {
+        launcherFileSave = url to report
+        runCatching { launcherFilePicker.launch(launcherFileName(title)) }.onFailure {
+            launcherFileSave = null
+            report("Couldn't open a save dialog on this device.")
+        }
+    }
 
     // Discovery and its Wi-Fi locks follow the app on screen, whichever shell subscribed.
     override fun onStart() {
@@ -950,9 +985,8 @@ class MainActivity : ComponentActivity() {
         else -> KeyEvent.isGamepadButton(kc)
     }
 
-    /** Does [intent]'s link resolve to the host [live] is already streaming? */
-    private fun targetsHost(intent: Intent?, live: SessionGate.Live): Boolean {
-        val url = deepLinkFrom(intent) ?: return false
+    /** Does [url] resolve to the host [live] is already streaming? */
+    private fun targetsHost(url: String, live: SessionGate.Live): Boolean {
         val parsed = DeepLinks.parse(url) as? DeepLinkResult.Parsed ?: return false
         val target = DeepLinks.resolveHost(parsed.link, KnownHostStore(this).all())
         return target is HostResolution.Record && target.host.id == live.hostId
