@@ -32,8 +32,8 @@ fi
 # The HDR gamescope companion chases OS libraries the same way. Probe it only when host.env pins
 # it (build-gamescope.sh wires that line only while the binary works) — a break here would not
 # just lose HDR, it would break gamescope session SPAWNING via the stale absolute override, so it
-# rebuilds with the same urgency as the host binary.
-GS_BIN="$(sed -n 's/^PUNKTFUNK_GAMESCOPE_BIN=//p' "$HOME/.config/punktfunk/host.env" 2>/dev/null | head -1)"
+# rebuilds with the same urgency as the host binary. No host.env pins nothing.
+GS_BIN="$(sed -n 's/^PUNKTFUNK_GAMESCOPE_BIN=//p' "$HOME/.config/punktfunk/host.env" 2>/dev/null | head -1 || true)"
 if [ -n "$GS_BIN" ]; then
     if [ ! -x "$GS_BIN" ] || ldd "$GS_BIN" 2>/dev/null | grep -q "not found"; then
         echo "punktfunk-gamescope no longer loads after a SteamOS update — rebuilding it" >&2
