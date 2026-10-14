@@ -708,15 +708,21 @@ impl Presenter {
     }
 
     /// Hand the window to the native lane: drain our work and tear down the swapchain and its
-    /// Vulkan surface, which takes the surface's explicit-sync object with them. Nothing of
-    /// the swapchain path's is in flight after the queue drain below.
+    /// Vulkan surface, which takes the surface's explicit-sync object with them. A held image
+    /// is retired first, as in `recreate_swapchain`, so the acquire after resume finds
+    /// `acquire_sem` unsignalled. Nothing of the swapchain path's is in flight after the drain.
     #[cfg(target_os = "linux")]
     fn suspend_swapchain(&mut self) -> anyhow::Result<()> {
         use anyhow::Context as _;
         self.quiesce_own()?;
-        self.state.acquired = None;
         {
             let _q = self.queue_lock.guard();
+            if self.state.acquired.is_some() {
+                // SAFETY: `queue_lock` is held above.
+                unsafe { self.retire_acquire_sem() }
+                    .context("vkQueueSubmit (discard the acquired image)")?;
+                self.state.acquired = None;
+            }
             // SAFETY: `queue` is owned here; `queue_lock` is held so no concurrent submit.
             unsafe { self.device.queue_wait_idle(self.queue) }
                 .context("vkQueueWaitIdle (swapchain suspend)")?;
