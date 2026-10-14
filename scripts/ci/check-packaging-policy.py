@@ -1,22 +1,37 @@
 #!/usr/bin/env python3
-"""Every packaging channel states the same file capabilities, before anything is built.
+"""Every packaging channel states the same capabilities and groups, before anything is built.
 
-packaging/linux/capabilities.txt is the matrix. Each channel grants capabilities in its own
-recipe (a deb postinst, an rpm `%caps`, a pacman scriptlet, a NixOS wrapper, the Steam Deck
-installer, the sysext builders). This reads each recipe and fails when a channel grants what the
-matrix does not, or omits what it does. A grant it cannot attribute to a known binary fails too.
-scripts/ci/assert-cap-matrix.sh checks the host and worker rows on the built package.
+packaging/linux/capabilities.txt is the capability matrix. Each channel grants capabilities in
+its own recipe (a deb postinst, an rpm `%caps`, a pacman scriptlet, a NixOS wrapper, the Steam
+Deck installer, the sysext builders). This reads each recipe and fails when a channel grants what
+the matrix does not, or omits what it does. A grant it cannot attribute to a known binary fails
+too. scripts/ci/assert-cap-matrix.sh checks the host and worker rows on the built package.
+
+packaging/linux/punktfunk.sysusers is the group matrix. The deb, rpm, Arch and Steam Deck
+recipes must install it, NixOS must declare the same groups, and no script or rule may create,
+join or name a group it lacks.
 
 Usage: python3 scripts/ci/check-packaging-policy.py [--self-test]
 """
 import glob
 import os
 import re
+import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MATRIX = "packaging/linux/capabilities.txt"
 GATE = "scripts/ci/assert-cap-matrix.sh"
+SYSUSERS = "packaging/linux/punktfunk.sysusers"
+NIX_MODULE = "packaging/nix/nixos-module.nix"
+# Recipes that install the sysusers file, by the text they must hold.
+GROUP_RECIPES = ["packaging/debian/build-deb.sh", "packaging/debian/build-client-deb.sh",
+                 "packaging/rpm/punktfunk.spec", "packaging/arch/PKGBUILD",
+                 "scripts/steamdeck/lib.sh"]
+# Created on first use by door-helper and the seat supervisor, so no package ships them.
+RUNTIME_GROUPS = {"punktfunk-games"}
+# Groups the distribution provides.
+DISTRO_GROUPS = {"input", "root"}
 HOST = "punktfunk-host"
 WORKER = "punktfunk-encode-worker"
 GAMESCOPE = "punktfunk-gamescope"
@@ -110,23 +125,20 @@ def expected(matrix, binary, channel):
 
 
 def compare(matrix, channel, grants, covers=None):
-    """Errors for one channel's [(binary, caps)] against the matrix rows it covers."""
-    errors = [f"{channel} grants {caps} to {binary}, which {MATRIX} has no row for"
+    """[(binary, error)] for one channel's [(binary, caps)] against the matrix rows it covers."""
+    errors = [(binary, f"{channel} grants {caps} to {binary}, which {MATRIX} has no row for")
               for binary, caps in grants if binary not in matrix]
     for binary in covers or matrix:
         got = {caps for b, caps in grants if b == binary} or {"-"}
         want = expected(matrix, binary, channel)
         if got != {want}:
-            errors.append(f"{channel} grants {binary} {' and '.join(sorted(got))}; "
-                          f"{MATRIX} says {want}")
+            errors.append((binary, f"{channel} grants {binary} {' and '.join(sorted(got))}; "
+                                   f"{MATRIX} says {want}"))
     return errors
 
 
-def gate_grants(text):
-    """The gate's constants as the host and worker rows the matrix must hold."""
-    const = {m.group(1): m.group(2)
-             for m in re.finditer(r"^(HOST_REL|WORKER_REL|WANT_WORKER_CAPS)='([^']*)'", text, re.M)}
-    return const
+# The gate's constants: the host and worker rows the matrix must hold.
+GATE_CONST = re.compile(r"^(HOST_REL|WORKER_REL|WANT_WORKER_CAPS)='([^']*)'", re.M)
 
 
 def gate_errors(matrix, const):
@@ -143,30 +155,82 @@ def gate_errors(matrix, const):
 
 
 def read(path):
-    with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+    with open(os.path.join(ROOT, path), encoding="utf-8", errors="replace") as f:
         return f.read()
+
+
+SYSUSERS_GROUP = re.compile(r"^g\s+(\S+)", re.M)
+NIX_GROUP = re.compile(r"\busers\.groups\.([\w-]+)")
+
+
+# The commands that name a group, and whether a runtime group may be named there. A rule or a
+# polkit test needs the group to exist already; a script that creates or joins one may be first.
+GROUP_NAMES = [
+    (re.compile(r"\bgroupadd(?:\s+-{1,2}[\w-]+)*\s+([A-Za-z_][\w-]*)"), True),
+    (re.compile(r"\busermod\s+-aG\s+([A-Za-z_][\w-]*)"), True),
+    (re.compile(r"^\s*(?:if\s+)?ensure_group\s+([\w-]+)", re.M), False),
+    (re.compile(r'\bGROUP:?="([^"]+)"'), False),
+    (re.compile(r"\bchgrp\s+([A-Za-z_][\w-]*)"), False),
+    (re.compile(r'isInGroup\("([^"]+)"\)'), False),
+]
+
+
+def group_errors(sysusers, nix_groups, texts):
+    """[(path, error)] for the groups the sysusers file declares against what the channels create
+    and name. `texts` is {path: recipe, script or rule text}."""
+    declared = set(SYSUSERS_GROUP.findall(sysusers))
+    nix = nix_groups - DISTRO_GROUPS
+    errors = [(NIX_MODULE, f"{SYSUSERS} declares group {g}; the NixOS module does not")
+              for g in sorted(declared - nix)]
+    errors += [(NIX_MODULE, f"the NixOS module declares group {g}; {SYSUSERS} does not")
+               for g in sorted(nix - declared)]
+    for path, text in texts.items():
+        text = strip_comments(text)
+        for pattern, runtime_ok in GROUP_NAMES:
+            allowed = declared | DISTRO_GROUPS | (RUNTIME_GROUPS if runtime_ok else set())
+            errors += [(path, f"names group {g}, which no channel creates ({SYSUSERS})")
+                       for g in pattern.findall(text) if g not in allowed]
+    return errors
+
+
+def tracked(*dirs):
+    """{path: text} of the tracked files under `dirs`, less Markdown and Python."""
+    names = subprocess.check_output(["git", "ls-files", "--", *dirs], cwd=ROOT, text=True)
+    return {p: read(p) for p in names.split("\n") if p and not p.endswith((".md", ".py"))}
+
+
+def tree_group_errors():
+    installs = os.path.basename(SYSUSERS)
+    errors = [(path, f"does not install {installs}")
+              for path in GROUP_RECIPES if installs not in strip_comments(read(path))]
+    nix = set(NIX_GROUP.findall(strip_comments(read(NIX_MODULE))))
+    return errors + group_errors(read(SYSUSERS), nix, tracked("packaging", "scripts"))
 
 
 def tree_errors():
     matrix = read_matrix(read(MATRIX))
-    const = gate_grants(read(GATE))
+    const = dict(GATE_CONST.findall(read(GATE)))
     variables = {"WANT_WORKER_CAPS": caps_norm(const.get("WANT_WORKER_CAPS", ""))}
     errors = [(GATE, e) for e in gate_errors(matrix, const)]
     channels = {c for _, chans in matrix.values() if chans for c in chans}
     errors += [(MATRIX, f"channel {c} is not one of {sorted(CHANNELS)}")
                for c in sorted(channels - CHANNELS.keys())]
     for channel, (covers, sources) in CHANNELS.items():
-        grants = []
+        grants, where, listed = [], {}, []
         for patterns, reader, names in sources:
-            files = sorted(f for p in patterns
+            files = sorted(os.path.relpath(f, ROOT) for p in patterns
                            for f in glob.glob(os.path.join(ROOT, p)))
             if not files:
                 errors.append((patterns[0], f"{channel} has no recipe to read"))
+            listed += files
             for f in files:
-                with open(f, encoding="utf-8") as fh:
-                    grants += reader(fh.read(), {**variables, **names})
-        errors += [(patterns[0], e) for e in compare(matrix, channel, grants, covers)]
-    return errors
+                found = reader(read(f), {**variables, **names})
+                grants += found
+                where.update({binary: f for binary, _ in found})
+        first = listed[0] if listed else sources[0][0][0]
+        errors += [(where.get(binary, first), e)
+                   for binary, e in compare(matrix, channel, grants, covers)]
+    return errors + tree_group_errors()
 
 
 def check():
@@ -174,10 +238,10 @@ def check():
     for path, message in errors:
         print(f"::error file={path}::{message}")
     if errors:
-        print(f"{len(errors)} packaging policy mismatch(es): make the channel and {MATRIX} agree.",
+        print(f"{len(errors)} packaging policy mismatch(es): make the channel and its matrix agree.",
               file=sys.stderr)
         return 1
-    print(f"check-packaging-policy: {len(CHANNELS)} channels match {MATRIX}")
+    print(f"check-packaging-policy: {len(CHANNELS)} channels match {MATRIX} and {SYSUSERS}")
     return 0
 
 
@@ -241,8 +305,26 @@ sudo setcap cap_sys_nice=ep ${WORKER}
     expect("gate caps drift", len(gate_errors(matrix, {**const, "WANT_WORKER_CAPS": eip})), 1)
     expect("gate path drift", len(gate_errors(matrix, {**const, "HOST_REL": "usr/bin/x"})), 1)
     expect("matrix host capped", len(gate_errors(read_matrix(f"{HOST} {ep}\n{WORKER} {ep}\n"), const)), 1)
-    expect("gate reader", gate_grants("HOST_REL='usr/bin/punktfunk-host'\nWANT_WORKER_CAPS='x'\n"),
-           {"HOST_REL": "usr/bin/punktfunk-host", "WANT_WORKER_CAPS": "x"})
+    expect("gate reader", GATE_CONST.findall("HOST_REL='usr/bin/punktfunk-host'\nWANT_WORKER_CAPS='x'\n"),
+           [("HOST_REL", "usr/bin/punktfunk-host"), ("WANT_WORKER_CAPS", "x")])
+
+    users = "# c\ng punktfunk -\ng punktfunk-update -\n"
+    expect("sysusers", SYSUSERS_GROUP.findall(users), ["punktfunk", "punktfunk-update"])
+    expect("nix groups", NIX_GROUP.findall("users.groups.input = { };\nusers.groups.punktfunk = { };\n"),
+           ["input", "punktfunk"])
+    nix_ok = {"input", "punktfunk", "punktfunk-update"}
+    texts = {"a.sh": "getent group x || groupadd --system punktfunk\n# groupadd old\n"
+                     "groupadd punktfunk-games\nif ensure_group punktfunk; then\n"
+                     'usermod -aG input "$USER"\nusermod -aG punktfunk-games u\n',
+             "a.rules": 'GROUP="input"\nRUN+="chgrp punktfunk /x"\n# GROUP="old"\n'}
+    expect("groups agree", group_errors(users, nix_ok, texts), [])
+    expect("nix lacks a group", len(group_errors(users, nix_ok - {"punktfunk-update"}, {})), 1)
+    expect("nix adds a group", len(group_errors(users, nix_ok | {"extra"}, {})), 1)
+    for name, text in (("groupadd", "groupadd --system x\n"), ("ensure_group", "ensure_group x\n"),
+                       ("usermod", 'sudo usermod -aG x "$USER"\n'), ("udev GROUP", 'GROUP="plugdev"\n'),
+                       ("chgrp", "chgrp x /sys/a\n"), ("polkit", 'subject.isInGroup("x")\n'),
+                       ("a rule needs the group to exist", 'GROUP="punktfunk-games"\n')):
+        expect(f"unlisted group: {name}", len(group_errors(users, nix_ok, {"b": text})), 1)
     if fails:
         return 1
     print("check-packaging-policy self-test ok")

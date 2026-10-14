@@ -28,7 +28,8 @@ not here.
 The package workflows build on main and tags only. A pull request that touches `packaging/` or
 `scripts/` runs `packaging-lint.yml` instead: `bash -n` and shellcheck over the shell, `rpmspec
 --parse` on each spec, `makepkg --printsrcinfo` on each PKGBUILD, and each channel's file
-capabilities against [`linux/capabilities.txt`](linux/capabilities.txt). It builds nothing.
+capabilities and groups against [`linux/capabilities.txt`](linux/capabilities.txt) and
+[`linux/punktfunk.sysusers`](linux/punktfunk.sysusers). It builds nothing.
 
 ## Why the host is not a Flatpak
 

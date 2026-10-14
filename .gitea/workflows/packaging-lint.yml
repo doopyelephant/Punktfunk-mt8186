@@ -45,7 +45,7 @@ jobs:
       - name: Payload checker self-test
         run: bash scripts/ci/assert-payload-parity.sh --self-test
 
-      # Each channel's file capabilities against packaging/linux/capabilities.txt.
+      # Each channel's file capabilities and groups against capabilities.txt and punktfunk.sysusers.
       - name: Packaging policy matrices
         run: |
           python3 scripts/ci/check-packaging-policy.py --self-test
