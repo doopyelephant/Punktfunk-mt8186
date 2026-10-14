@@ -64,7 +64,7 @@ impl PinGate {
     }
 
     pub fn submit(&self, pin: String, label: Option<String>, target: &CeremonyId) -> SubmitOutcome {
-        let mut waiters = self.waiters.lock().unwrap();
+        let mut waiters = self.waiters.lock().unwrap_or_else(|e| e.into_inner());
         if waiters.is_empty() {
             return SubmitOutcome::NoWaiter;
         }
@@ -92,12 +92,22 @@ impl PinGate {
     }
 
     pub fn awaiting_pin(&self) -> bool {
-        !self.waiters.lock().unwrap().is_empty()
+        !self
+            .waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// Identities the console lists so the operator addresses a named ceremony.
     pub fn pending(&self) -> Vec<CeremonyId> {
-        let mut v: Vec<CeremonyId> = self.waiters.lock().unwrap().keys().cloned().collect();
+        let mut v: Vec<CeremonyId> = self
+            .waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         v.sort_by(|a, b| {
             (&a.uniqueid, &a.fingerprint, a.peer_ip).cmp(&(&b.uniqueid, &b.fingerprint, b.peer_ip))
         });
@@ -106,7 +116,7 @@ impl PinGate {
 
     async fn take(&self, timeout: Duration, id: &CeremonyId) -> Option<PinSubmission> {
         {
-            let mut w = self.waiters.lock().unwrap();
+            let mut w = self.waiters.lock().unwrap_or_else(|e| e.into_inner());
             if w.len() >= MAX_PARKED_WAITERS
                 || w.keys().filter(|k| k.peer_ip == id.peer_ip).count() >= MAX_PARKED_PER_IP
             {
@@ -140,7 +150,11 @@ impl PinGate {
         }
         impl Drop for WaiterGuard<'_> {
             fn drop(&mut self) {
-                self.gate.waiters.lock().unwrap().remove(self.id);
+                self.gate
+                    .waiters
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(self.id);
             }
         }
         let _guard = WaiterGuard { gate: self, id };
@@ -263,7 +277,7 @@ impl Pairing {
             .ok_or_else(|| anyhow!("no PIN submitted within 120s"))?;
         let aes_key = crypto::pin_key(&salt, &pin);
 
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, s| s.started.elapsed() < SESSION_TTL);
         map.insert(
             uniqueid.to_string(),
@@ -300,7 +314,7 @@ impl Pairing {
         hexv: &str,
         peer_ip: std::net::IpAddr,
     ) -> Result<String> {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let s = session_of(&mut map, uniqueid, peer_ip)?;
         let enc = hex::decode(hexv).context("clientchallenge hex")?;
         let client_challenge = crypto::ecb_decrypt(&s.aes_key, &enc);
@@ -329,7 +343,7 @@ impl Pairing {
         hexv: &str,
         peer_ip: std::net::IpAddr,
     ) -> Result<String> {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let s = session_of(&mut map, uniqueid, peer_ip)?;
         let enc = hex::decode(hexv).context("serverchallengeresp hex")?;
         let client_hash = crypto::ecb_decrypt(&s.aes_key, &enc);
@@ -354,7 +368,7 @@ impl Pairing {
     /// Drop `uniqueid`'s unfinished ceremony, only for the address that opened it. Returns
     /// whether one was dropped.
     pub fn abandon(&self, uniqueid: &str, peer_ip: std::net::IpAddr) -> bool {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         session_of(&mut map, uniqueid, peer_ip).is_ok() && map.remove(uniqueid).is_some()
     }
 
@@ -365,7 +379,7 @@ impl Pairing {
         paired_store: &Mutex<Vec<Vec<u8>>>,
         peer_ip: std::net::IpAddr,
     ) -> Result<String> {
-        let mut map = self.sessions.lock().unwrap();
+        let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let s = session_of(&mut map, uniqueid, peer_ip)?;
         let data = hex::decode(hexv).context("clientpairingsecret hex")?;
         if data.len() < 16 {
@@ -383,7 +397,7 @@ impl Pairing {
         map.remove(uniqueid);
         if hash_ok && sig_ok {
             {
-                let mut store = paired_store.lock().unwrap();
+                let mut store = paired_store.lock().unwrap_or_else(|e| e.into_inner());
                 if !store.iter().any(|der| der == &client_cert_der) {
                     store.push(client_cert_der.clone());
                     super::save_paired(&store);
@@ -464,6 +478,23 @@ mod tests {
 
     fn cid(tag: &str) -> CeremonyId {
         cid_at(tag, "127.0.0.1".parse().unwrap())
+    }
+
+    #[test]
+    fn a_poisoned_waiter_map_still_answers() {
+        let gate = Arc::new(PinGate::new());
+        let held = gate.clone();
+        let _ = std::thread::spawn(move || {
+            let _waiters = held.waiters.lock().unwrap();
+            panic!("poison the waiter map");
+        })
+        .join();
+        assert!(!gate.awaiting_pin());
+        assert!(gate.pending().is_empty());
+        assert_eq!(
+            gate.submit("1234".into(), None, &cid("dev-p")),
+            SubmitOutcome::NoWaiter
+        );
     }
 
     #[tokio::test]

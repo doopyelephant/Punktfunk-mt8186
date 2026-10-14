@@ -2,7 +2,8 @@
 """A domain module of punktfunk-host never names a module above it.
 
 `mgmt` is the HTTP layer: it calls `game`, `library` and `plugin_host`, and none of them calls it.
-`game` sits above the other two the same way. main.rs re-exports some submodules flat
+`game` sits above the other two the same way, and `library` above `plugin_host`: the CLI and
+the store route hand `plugin_host` the function that deletes a provider's titles. main.rs re-exports some submodules flat
 (`use game::{gamelease, …}`), so a denied module is denied under those names too. Comment lines
 are skipped: a doc link is not an import.
 
@@ -19,7 +20,7 @@ SRC = os.path.join(ROOT, "crates", "host", "punktfunk-host", "src")
 DENY = {
     "game": ["mgmt"],
     "library": ["mgmt", "game"],
-    "plugin_host": ["mgmt", "game"],
+    "plugin_host": ["mgmt", "game", "library"],
 }
 
 
@@ -69,12 +70,13 @@ def self_test():
     main_rs = "mod game;\nuse game::{\n    gamelease, holds,\n};\nmod mgmt;\n"
     assert aliases(main_rs, "game") == {"game", "gamelease", "holds"}, aliases(main_rs, "game")
     assert aliases(main_rs, "mgmt") == {"mgmt"}
-    deny = aliases(main_rs, "game") | {"mgmt"}
+    deny = aliases(main_rs, "game") | {"mgmt", "library"}
     for src, want in [
         ("use crate::mgmt::plugins;", {"mgmt"}),
         ("let g = crate::gamelease::GameRef::default();", {"gamelease"}),
         ("use crate::{\n    events,\n    mgmt::shared,\n};", {"mgmt"}),
         ("use super::super::mgmt;", {"mgmt"}),
+        ("crate::library::delete_provider(&id);", {"library"}),
         ("/// See [`crate::mgmt::store`].\n    // crate::holds::STAGES", set()),
         ("use crate::mgmt_token::TRAY_FILE;\ncrate::webtransport::mgmt::serve();", set()),
     ]:

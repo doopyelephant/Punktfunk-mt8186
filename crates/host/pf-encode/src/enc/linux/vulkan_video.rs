@@ -287,6 +287,366 @@ impl ProfileStack {
     }
 }
 
+/// The producer-native planar source line: sizes, and the firmware padding the driver adds.
+fn log_native_nv12_source(native_fmt: PixelFormat, (rw, rh): (u32, u32), (w, h): (u32, u32)) {
+    tracing::info!(
+        native_nv12 = "active(direct-import)",
+        format = ?native_fmt,
+        source_width = rw,
+        source_height = rh,
+        fw_padding_width = w - rw,
+        fw_padding_height = h - rh,
+        "vulkan-encode: producer-native planar encode source (true-size headers: the \
+         driver aligns the bitstream SPS itself and the firmware edge-extends the \
+         padding — the source is never read past its extent)"
+    );
+}
+
+/// The RGB-direct verdict line: active in which form, or why not.
+fn log_rgb_direct_source(
+    rgb_probe: &Result<(u32, u32), &'static str>,
+    want_rgb: bool,
+    rgb_cfg: &Option<RgbDirect>,
+) {
+    tracing::info!(
+        rgb_direct = match (rgb_probe, want_rgb, rgb_cfg) {
+            (
+                _,
+                _,
+                Some(RgbDirect {
+                    true_extent: true, ..
+                }),
+            ) =>
+                "active(true-extent: unaligned mode, direct import with the true-size \
+                 source codedExtent — RADV firmware padding covers the alignment rows; \
+                 PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT=0 restores the padded copy)",
+            (_, _, Some(RgbDirect { padded: false, .. })) => "active",
+            (_, _, Some(RgbDirect { padded: true, .. })) =>
+                "active(padded-copy: mode is not 64x16-aligned — staging blit + edge \
+                 duplication instead of the direct import)",
+            (Ok(_), false, None) => match rgb_request() {
+                Some(false) => "available(off: PUNKTFUNK_VULKAN_RGB_DIRECT=0)",
+                _ =>
+                    "available(off: this session composites the pointer, which EFC \
+                     cannot — a cursor channel or a compositor that embeds it restores \
+                     RGB-direct; =1 does not)",
+            },
+            (Err(e), _, None) => e,
+            (Ok(_), true, None) => unreachable!("rgb gate and cfg disagree"),
+        },
+        "vulkan-encode: EFC RGB-direct encode source (design/vulkan-rgb-direct-encode.md)"
+    );
+}
+
+/// What the encode queue reports for a profile, copied out of the chained query structs so no
+/// borrow of them outlives the query.
+struct EncodeCaps {
+    std_hdr: vk::ExtensionProperties,
+    min_bs_align: u64,
+    max_quality_levels: u32,
+    rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR,
+    /// `u64::MAX` when the driver reports no limit.
+    hw_max_bitrate: u64,
+    av1_superblock128: bool,
+    av1_max_level: vk::native::StdVideoAV1Level,
+    intra_refresh: Option<IntraRefreshCaps>,
+}
+
+/// Query `profile`'s encode capabilities on `pd` and log the intra-refresh verdict.
+///
+/// # Safety
+/// `instance`, `vq_inst` and `pd` are live and paired, and `profile` is wired
+/// ([`ProfileStack::wire`]).
+unsafe fn query_encode_caps(
+    instance: &ash::Instance,
+    vq_inst: &ash::khr::video_queue::Instance,
+    pd: vk::PhysicalDevice,
+    profile: &vk::VideoProfileInfoKHR,
+    av1: bool,
+    dev_ext_props: &[vk::ExtensionProperties],
+) -> Result<EncodeCaps> {
+    use super::vk_av1_encode as av1b;
+    use super::vk_intra_refresh as vir;
+    let ir_advertised = crate::vk_util::ext_advertised(dev_ext_props, vir::EXTENSION_NAME);
+
+    let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
+    let mut av1_caps: av1b::VideoEncodeAV1CapabilitiesKHR = std::mem::zeroed();
+    av1_caps.s_type = av1b::stype(av1b::ST_CAPABILITIES);
+    let mut ir_caps: vir::VideoEncodeIntraRefreshCapabilitiesKHR = std::mem::zeroed();
+    ir_caps.s_type = vir::stype(vir::ST_CAPABILITIES);
+    let mut enc_caps = vk::VideoEncodeCapabilitiesKHR::default();
+    let mut caps = vk::VideoCapabilitiesKHR::default().push_next(&mut enc_caps);
+    if av1 {
+        av1_caps.p_next = caps.p_next;
+        caps.p_next = &mut av1_caps as *mut _ as *mut c_void;
+    } else {
+        caps = caps.push_next(&mut h265_caps);
+    }
+    // Only chained when advertised: the layers reject a struct from an absent extension.
+    if ir_advertised {
+        ir_caps.p_next = caps.p_next;
+        caps.p_next = &mut ir_caps as *mut _ as *mut c_void;
+    }
+    let r = (vq_inst.fp().get_physical_device_video_capabilities_khr)(pd, profile, &mut caps);
+    if r != vk::Result::SUCCESS {
+        bail!("get_physical_device_video_capabilities: {r:?}");
+    }
+    let ir_feature = ir_advertised && {
+        let mut f = vir::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR {
+            s_type: vir::stype(vir::ST_PHYSICAL_DEVICE_FEATURES),
+            p_next: std::ptr::null_mut(),
+            video_encode_intra_refresh: vk::FALSE,
+        };
+        let mut f2 = vk::PhysicalDeviceFeatures2 {
+            p_next: &mut f as *mut _ as *mut c_void,
+            ..Default::default()
+        };
+        instance.get_physical_device_features2(pd, &mut f2);
+        f.video_encode_intra_refresh == vk::TRUE
+    };
+    let intra_refresh = intra_refresh_caps(ir_advertised, ir_feature, &ir_caps);
+    tracing::info!(
+        intra_refresh = match &intra_refresh {
+            Ok(c) => format!("available(row-based, max cycle {} frames)", c.max_cycle),
+            Err(e) => (*e).to_string(),
+        },
+        "vulkan-encode: VK_KHR_video_encode_intra_refresh (design/vulkan-intra-refresh.md)"
+    );
+    let intra_refresh = intra_refresh.ok();
+    // Copy needed caps now: `caps` holds `&mut` borrows of the chained structs.
+    let std_hdr = caps.std_header_version;
+    let min_bs_align = caps.min_bitstream_buffer_size_alignment.max(1);
+    let max_quality_levels = enc_caps.max_quality_levels;
+    let rate_control_modes = enc_caps.rate_control_modes;
+    let hw_max_bitrate = match enc_caps.max_bitrate {
+        0 => u64::MAX, // not filled in — treat as unbounded
+        n => n,
+    };
+    let av1_superblock128 = av1 && (av1_caps.superblock_sizes & av1b::SUPERBLOCK_SIZE_128 != 0);
+    Ok(EncodeCaps {
+        std_hdr,
+        min_bs_align,
+        max_quality_levels,
+        rate_control_modes,
+        hw_max_bitrate,
+        av1_superblock128,
+        av1_max_level: av1_caps.max_level,
+        intra_refresh,
+    })
+}
+
+/// The logical device and the extension loaders every later call goes through.
+struct EncodeDevice {
+    device: ash::Device,
+    encode_queue: vk::Queue,
+    compute_queue: vk::Queue,
+    ext_fd: ash::khr::external_memory_fd::Device,
+    vq_dev: ash::khr::video_queue::Device,
+    venc_dev: ash::khr::video_encode_queue::Device,
+}
+
+/// Create the device with the extensions and features this session's codec, RGB-direct source,
+/// intra refresh and foreign queue family call for.
+///
+/// # Safety
+/// `instance` and `pd` are live and paired; `encode_family` and `compute_family` are queue
+/// families of `pd`.
+unsafe fn create_encode_device(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    encode_family: u32,
+    compute_family: u32,
+    av1: bool,
+    rgb: bool,
+    intra_refresh: bool,
+    foreign_ok: bool,
+) -> Result<EncodeDevice> {
+    use super::vk_av1_encode as av1b;
+    use super::vk_intra_refresh as vir;
+    use super::vk_valve_rgb as vrgb;
+    // AV1 extension name is raw — ash 0.38 lacks it.
+    let mut dev_exts = vec![
+        ash::khr::video_queue::NAME.as_ptr(),
+        ash::khr::video_encode_queue::NAME.as_ptr(),
+        if av1 {
+            av1b::EXTENSION_NAME.as_ptr()
+        } else {
+            ash::khr::video_encode_h265::NAME.as_ptr()
+        },
+        ash::khr::external_memory_fd::NAME.as_ptr(),
+        ash::ext::external_memory_dma_buf::NAME.as_ptr(),
+        ash::ext::image_drm_format_modifier::NAME.as_ptr(),
+    ];
+    if rgb {
+        dev_exts.push(vrgb::EXTENSION_NAME.as_ptr());
+    }
+    if intra_refresh {
+        dev_exts.push(vir::EXTENSION_NAME.as_ptr());
+    }
+    if foreign_ok {
+        dev_exts.push(ash::ext::queue_family_foreign::NAME.as_ptr());
+    }
+    let prio = [1.0f32];
+    let mut qcis = vec![vk::DeviceQueueCreateInfo::default()
+        .queue_family_index(encode_family)
+        .queue_priorities(&prio)];
+    if compute_family != encode_family {
+        qcis.push(
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(compute_family)
+                .queue_priorities(&prio),
+        );
+    }
+    let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+    let mut device_ci = vk::DeviceCreateInfo::default()
+        .queue_create_infos(&qcis)
+        .enabled_extension_names(&dev_exts)
+        .push_next(&mut sync2);
+    // Spec: `videoEncodeAV1` must be enabled for any ENCODE_AV1 use. Vendored struct
+    // (ash 0.38 predates it), chained raw like the profile.
+    let mut av1_features = av1b::PhysicalDeviceVideoEncodeAV1FeaturesKHR {
+        s_type: av1b::stype(av1b::ST_PHYSICAL_DEVICE_FEATURES),
+        p_next: std::ptr::null_mut(),
+        video_encode_av1: vk::TRUE,
+    };
+    if av1 {
+        av1_features.p_next = device_ci.p_next.cast_mut();
+        device_ci.p_next = &av1_features as *const _ as *const c_void;
+    }
+    // Spec: must be enabled to chain the rgb profile.
+    let mut rgb_features = vrgb::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE {
+        s_type: vrgb::stype(vrgb::ST_PHYSICAL_DEVICE_FEATURES),
+        p_next: std::ptr::null_mut(),
+        video_encode_rgb_conversion: vk::TRUE,
+    };
+    if rgb {
+        rgb_features.p_next = device_ci.p_next.cast_mut();
+        device_ci.p_next = &rgb_features as *const _ as *const c_void;
+    }
+    // Spec: the feature must be enabled before a session declares an intra refresh mode.
+    let mut ir_features = vir::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR {
+        s_type: vir::stype(vir::ST_PHYSICAL_DEVICE_FEATURES),
+        p_next: std::ptr::null_mut(),
+        video_encode_intra_refresh: vk::TRUE,
+    };
+    if intra_refresh {
+        ir_features.p_next = device_ci.p_next.cast_mut();
+        device_ci.p_next = &ir_features as *const _ as *const c_void;
+    }
+    let device = instance
+        .create_device(pd, &device_ci, None)
+        .context("create device")?;
+    let encode_queue = device.get_device_queue(encode_family, 0);
+    let compute_queue = device.get_device_queue(compute_family, 0);
+    let ext_fd = ash::khr::external_memory_fd::Device::new(instance, &device);
+    let vq_dev = ash::khr::video_queue::Device::new(instance, &device);
+    let venc_dev = ash::khr::video_encode_queue::Device::new(instance, &device);
+    Ok(EncodeDevice {
+        device,
+        encode_queue,
+        compute_queue,
+        ext_fd,
+        vq_dev,
+        venc_dev,
+    })
+}
+
+/// Allocate and bind the memory `session` asks for. Each allocation lands in `owned` before the
+/// bind, so an early return leaves it to the caller's teardown.
+///
+/// # Safety
+/// `device` and `vq_dev` are the live device `mem_props` describes, and `session` was created on
+/// them and has no memory bound.
+unsafe fn bind_session_memory(
+    device: &ash::Device,
+    vq_dev: &ash::khr::video_queue::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    session: vk::VideoSessionKHR,
+    owned: &mut Vec<vk::DeviceMemory>,
+) -> Result<()> {
+    let get_mem = vq_dev.fp().get_video_session_memory_requirements_khr;
+    let mut n = 0u32;
+    let _ = get_mem(device.handle(), session, &mut n, std::ptr::null_mut());
+    let mut reqs = vec![vk::VideoSessionMemoryRequirementsKHR::default(); n as usize];
+    let _ = get_mem(device.handle(), session, &mut n, reqs.as_mut_ptr());
+    let mut binds = Vec::new();
+    for rq in &reqs {
+        let mr = rq.memory_requirements;
+        let ti = find_mem_preferring(
+            mem_props,
+            mr.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        let m = device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(mr.size)
+                .memory_type_index(ti),
+            None,
+        )?;
+        owned.push(m);
+        binds.push(
+            vk::BindVideoSessionMemoryInfoKHR::default()
+                .memory_bind_index(rq.memory_bind_index)
+                .memory(m)
+                .memory_offset(0)
+                .memory_size(mr.size),
+        );
+    }
+    let r = (vq_dev.fp().bind_video_session_memory_khr)(
+        device.handle(),
+        session,
+        binds.len() as u32,
+        binds.as_ptr(),
+    );
+    if r != vk::Result::SUCCESS {
+        bail!("bind_video_session_memory: {r:?}");
+    }
+    Ok(())
+}
+
+/// Build the RGB to YUV compute pipeline. Each handle is mirrored into `guard` as it is created;
+/// the shader module is destroyed once the pipeline holds it.
+///
+/// # Safety
+/// `device` is the live device `guard` tears down.
+unsafe fn build_csc_pipeline(
+    device: &ash::Device,
+    guard: &mut VkTeardown,
+    ten_bit: bool,
+    is_hdr: bool,
+) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline)> {
+    // 8-bit is 709; 10-bit splits by colour — BT.2020 PQ for HDR, BT.709 for SDR-10.
+    let spv = ash::util::read_spv(&mut std::io::Cursor::new(match (ten_bit, is_hdr) {
+        (true, true) => CSC10_SPV,
+        (true, false) => CSC10_709_SPV,
+        (false, _) => CSC_SPV,
+    }))?;
+    let shader =
+        device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)?;
+    guard.shader = shader;
+    let (csc_dsl, csc_layout) = csc_layout(device)?;
+    guard.csc_dsl = csc_dsl;
+    guard.csc_layout = csc_layout;
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(shader)
+        .name(c"main");
+    let csc_pipe = device
+        .create_compute_pipelines(
+            vk::PipelineCache::null(),
+            &[vk::ComputePipelineCreateInfo::default()
+                .layout(csc_layout)
+                .stage(stage)],
+            None,
+        )
+        .map_err(|(_, e)| e)?[0];
+    guard.csc_pipe = csc_pipe;
+    device.destroy_shader_module(shader, None);
+    // Shader is gone — null the guard so a later failure doesn't unwind it again.
+    guard.shader = vk::ShaderModule::null();
+    Ok((csc_dsl, csc_layout, csc_pipe))
+}
+
 /// First physical device with a `VIDEO_ENCODE` queue family advertising `codec_op` (llvmpipe
 /// advertises none) whose driver [`super::vk_util::encode_trusted`] accepts. Shared by
 /// [`VulkanVideoEncoder::open_inner`] and [`probe_encode_caps`].
@@ -426,18 +786,7 @@ unsafe fn one_plane_modifiers(
     pd: vk::PhysicalDevice,
     fmt: vk::Format,
 ) -> Vec<u64> {
-    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
-    let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
-    instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
-    let mut props = vec![
-        vk::DrmFormatModifierPropertiesEXT::default();
-        list.drm_format_modifier_count as usize
-    ];
-    list.p_drm_format_modifier_properties = props.as_mut_ptr();
-    let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
-    instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
-    props.truncate(list.drm_format_modifier_count as usize);
-    props
+    pf_zerocopy::vkdev::format_modifiers(instance, pd, fmt)
         .into_iter()
         // Capture hands one fd/offset/stride.
         .filter(|p| p.drm_format_modifier_plane_count == 1)
@@ -1135,46 +1484,9 @@ impl VulkanVideoEncoder {
             _ => None,
         };
         if native_nv12 {
-            tracing::info!(
-                native_nv12 = "active(direct-import)",
-                format = ?native_fmt,
-                source_width = rw,
-                source_height = rh,
-                fw_padding_width = w - rw,
-                fw_padding_height = h - rh,
-                "vulkan-encode: producer-native planar encode source (true-size headers: the \
-                 driver aligns the bitstream SPS itself and the firmware edge-extends the \
-                 padding — the source is never read past its extent)"
-            );
+            log_native_nv12_source(native_fmt, (rw, rh), (w, h));
         } else {
-            tracing::info!(
-                rgb_direct = match (&rgb_probe, want_rgb, &rgb_cfg) {
-                    (
-                        _,
-                        _,
-                        Some(RgbDirect {
-                            true_extent: true, ..
-                        }),
-                    ) =>
-                        "active(true-extent: unaligned mode, direct import with the true-size \
-                         source codedExtent — RADV firmware padding covers the alignment rows; \
-                         PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT=0 restores the padded copy)",
-                    (_, _, Some(RgbDirect { padded: false, .. })) => "active",
-                    (_, _, Some(RgbDirect { padded: true, .. })) =>
-                        "active(padded-copy: mode is not 64x16-aligned — staging blit + edge \
-                         duplication instead of the direct import)",
-                    (Ok(_), false, None) => match rgb_request() {
-                        Some(false) => "available(off: PUNKTFUNK_VULKAN_RGB_DIRECT=0)",
-                        _ =>
-                            "available(off: this session composites the pointer, which EFC \
-                             cannot — a cursor channel or a compositor that embeds it restores \
-                             RGB-direct; =1 does not)",
-                    },
-                    (Err(e), _, None) => e,
-                    (Ok(_), true, None) => unreachable!("rgb gate and cfg disagree"),
-                },
-                "vulkan-encode: EFC RGB-direct encode source (design/vulkan-rgb-direct-encode.md)"
-            );
+            log_rgb_direct_source(&rgb_probe, want_rgb, &rgb_cfg);
         }
 
         // Encode profile, from the same constructor every later image profile uses. A device
@@ -1188,62 +1500,16 @@ impl VulkanVideoEncoder {
         let dev_ext_props = instance
             .enumerate_device_extension_properties(pd)
             .unwrap_or_default();
-        let ir_advertised = crate::vk_util::ext_advertised(&dev_ext_props, vir::EXTENSION_NAME);
-
-        let mut h265_caps = vk::VideoEncodeH265CapabilitiesKHR::default();
-        let mut av1_caps: av1b::VideoEncodeAV1CapabilitiesKHR = std::mem::zeroed();
-        av1_caps.s_type = av1b::stype(av1b::ST_CAPABILITIES);
-        let mut ir_caps: vir::VideoEncodeIntraRefreshCapabilitiesKHR = std::mem::zeroed();
-        ir_caps.s_type = vir::stype(vir::ST_CAPABILITIES);
-        let mut enc_caps = vk::VideoEncodeCapabilitiesKHR::default();
-        let mut caps = vk::VideoCapabilitiesKHR::default().push_next(&mut enc_caps);
-        if av1 {
-            av1_caps.p_next = caps.p_next;
-            caps.p_next = &mut av1_caps as *mut _ as *mut c_void;
-        } else {
-            caps = caps.push_next(&mut h265_caps);
-        }
-        // Only chained when advertised: the layers reject a struct from an absent extension.
-        if ir_advertised {
-            ir_caps.p_next = caps.p_next;
-            caps.p_next = &mut ir_caps as *mut _ as *mut c_void;
-        }
-        let r = (vq_inst.fp().get_physical_device_video_capabilities_khr)(pd, &profile, &mut caps);
-        if r != vk::Result::SUCCESS {
-            bail!("get_physical_device_video_capabilities: {r:?}");
-        }
-        let ir_feature = ir_advertised && {
-            let mut f = vir::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR {
-                s_type: vir::stype(vir::ST_PHYSICAL_DEVICE_FEATURES),
-                p_next: std::ptr::null_mut(),
-                video_encode_intra_refresh: vk::FALSE,
-            };
-            let mut f2 = vk::PhysicalDeviceFeatures2 {
-                p_next: &mut f as *mut _ as *mut c_void,
-                ..Default::default()
-            };
-            instance.get_physical_device_features2(pd, &mut f2);
-            f.video_encode_intra_refresh == vk::TRUE
-        };
-        let intra_refresh = intra_refresh_caps(ir_advertised, ir_feature, &ir_caps);
-        tracing::info!(
-            intra_refresh = match &intra_refresh {
-                Ok(c) => format!("available(row-based, max cycle {} frames)", c.max_cycle),
-                Err(e) => (*e).to_string(),
-            },
-            "vulkan-encode: VK_KHR_video_encode_intra_refresh (design/vulkan-intra-refresh.md)"
-        );
-        let intra_refresh = intra_refresh.ok();
-        // Copy needed caps now: `caps` holds `&mut` borrows of the chained structs.
-        let std_hdr = caps.std_header_version;
-        let min_bs_align = caps.min_bitstream_buffer_size_alignment.max(1);
-        let max_quality_levels = enc_caps.max_quality_levels;
-        let rate_control_modes = enc_caps.rate_control_modes;
-        let hw_max_bitrate = match enc_caps.max_bitrate {
-            0 => u64::MAX, // not filled in — treat as unbounded
-            n => n,
-        };
-        let av1_superblock128 = av1 && (av1_caps.superblock_sizes & av1b::SUPERBLOCK_SIZE_128 != 0);
+        let EncodeCaps {
+            std_hdr,
+            min_bs_align,
+            max_quality_levels,
+            rate_control_modes,
+            hw_max_bitrate,
+            av1_superblock128,
+            av1_max_level,
+            intra_refresh,
+        } = query_encode_caps(&instance, &vq_inst, pd, &profile, av1, &dev_ext_props)?;
         // Spec: valid levels are 0..maxQualityLevels, ordered fastest→best (`maxQualityLevels >= 1`).
         let quality_level = quality_request().min(max_quality_levels.saturating_sub(1));
         tracing::info!(
@@ -1271,84 +1537,23 @@ impl VulkanVideoEncoder {
             );
             vk::QUEUE_FAMILY_EXTERNAL
         };
-        // AV1 extension name is raw — ash 0.38 lacks it.
-        let mut dev_exts = vec![
-            ash::khr::video_queue::NAME.as_ptr(),
-            ash::khr::video_encode_queue::NAME.as_ptr(),
-            if av1 {
-                av1b::EXTENSION_NAME.as_ptr()
-            } else {
-                ash::khr::video_encode_h265::NAME.as_ptr()
-            },
-            ash::khr::external_memory_fd::NAME.as_ptr(),
-            ash::ext::external_memory_dma_buf::NAME.as_ptr(),
-            ash::ext::image_drm_format_modifier::NAME.as_ptr(),
-        ];
-        if rgb_cfg.is_some() {
-            dev_exts.push(vrgb::EXTENSION_NAME.as_ptr());
-        }
-        if intra_refresh.is_some() {
-            dev_exts.push(vir::EXTENSION_NAME.as_ptr());
-        }
-        if foreign_ok {
-            dev_exts.push(ash::ext::queue_family_foreign::NAME.as_ptr());
-        }
-        let prio = [1.0f32];
-        let mut qcis = vec![vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(encode_family)
-            .queue_priorities(&prio)];
-        if compute_family != encode_family {
-            qcis.push(
-                vk::DeviceQueueCreateInfo::default()
-                    .queue_family_index(compute_family)
-                    .queue_priorities(&prio),
-            );
-        }
-        let mut sync2 =
-            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-        let mut device_ci = vk::DeviceCreateInfo::default()
-            .queue_create_infos(&qcis)
-            .enabled_extension_names(&dev_exts)
-            .push_next(&mut sync2);
-        // Spec: `videoEncodeAV1` must be enabled for any ENCODE_AV1 use. Vendored struct
-        // (ash 0.38 predates it), chained raw like the profile.
-        let mut av1_features = av1b::PhysicalDeviceVideoEncodeAV1FeaturesKHR {
-            s_type: av1b::stype(av1b::ST_PHYSICAL_DEVICE_FEATURES),
-            p_next: std::ptr::null_mut(),
-            video_encode_av1: vk::TRUE,
-        };
-        if av1 {
-            av1_features.p_next = device_ci.p_next.cast_mut();
-            device_ci.p_next = &av1_features as *const _ as *const c_void;
-        }
-        // Spec: must be enabled to chain the rgb profile.
-        let mut rgb_features = vrgb::PhysicalDeviceVideoEncodeRgbConversionFeaturesVALVE {
-            s_type: vrgb::stype(vrgb::ST_PHYSICAL_DEVICE_FEATURES),
-            p_next: std::ptr::null_mut(),
-            video_encode_rgb_conversion: vk::TRUE,
-        };
-        if rgb_cfg.is_some() {
-            rgb_features.p_next = device_ci.p_next.cast_mut();
-            device_ci.p_next = &rgb_features as *const _ as *const c_void;
-        }
-        // Spec: the feature must be enabled before a session declares an intra refresh mode.
-        let mut ir_features = vir::PhysicalDeviceVideoEncodeIntraRefreshFeaturesKHR {
-            s_type: vir::stype(vir::ST_PHYSICAL_DEVICE_FEATURES),
-            p_next: std::ptr::null_mut(),
-            video_encode_intra_refresh: vk::TRUE,
-        };
-        if intra_refresh.is_some() {
-            ir_features.p_next = device_ci.p_next.cast_mut();
-            device_ci.p_next = &ir_features as *const _ as *const c_void;
-        }
-        let device = instance
-            .create_device(pd, &device_ci, None)
-            .context("create device")?;
-        let encode_queue = device.get_device_queue(encode_family, 0);
-        let compute_queue = device.get_device_queue(compute_family, 0);
-        let ext_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
-        let vq_dev = ash::khr::video_queue::Device::new(&instance, &device);
-        let venc_dev = ash::khr::video_encode_queue::Device::new(&instance, &device);
+        let EncodeDevice {
+            device,
+            encode_queue,
+            compute_queue,
+            ext_fd,
+            vq_dev,
+            venc_dev,
+        } = create_encode_device(
+            &instance,
+            pd,
+            encode_family,
+            compute_family,
+            av1,
+            rgb_cfg.is_some(),
+            intra_refresh.is_some(),
+            foreign_ok,
+        )?;
         guard.device = Some(device.clone());
         guard.vq_dev = Some(vq_dev.clone());
 
@@ -1357,7 +1562,7 @@ impl VulkanVideoEncoder {
             s_type: av1b::stype(av1b::ST_SESSION_CREATE_INFO),
             p_next: std::ptr::null(),
             use_max_level: vk::TRUE,
-            max_level: av1_caps.max_level,
+            max_level: av1_max_level,
         };
         // RGB-direct: picture format is captured RGB; chained create-info selects EFC conversion.
         // DPB stays NV12 (reconstruction is YUV). Built unconditionally; chained only when active.
@@ -1415,43 +1620,13 @@ impl VulkanVideoEncoder {
             bail!("create_video_session: {r:?}");
         }
         guard.session = session;
-        let get_mem = vq_dev.fp().get_video_session_memory_requirements_khr;
-        let mut n = 0u32;
-        let _ = get_mem(device.handle(), session, &mut n, std::ptr::null_mut());
-        let mut reqs = vec![vk::VideoSessionMemoryRequirementsKHR::default(); n as usize];
-        let _ = get_mem(device.handle(), session, &mut n, reqs.as_mut_ptr());
-        let mut binds = Vec::new();
-        for rq in &reqs {
-            let mr = rq.memory_requirements;
-            let ti = find_mem_preferring(
-                &mem_props,
-                mr.memory_type_bits,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )?;
-            let m = device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(mr.size)
-                    .memory_type_index(ti),
-                None,
-            )?;
-            guard.session_mem.push(m);
-            binds.push(
-                vk::BindVideoSessionMemoryInfoKHR::default()
-                    .memory_bind_index(rq.memory_bind_index)
-                    .memory(m)
-                    .memory_offset(0)
-                    .memory_size(mr.size),
-            );
-        }
-        let r = (vq_dev.fp().bind_video_session_memory_khr)(
-            device.handle(),
+        bind_session_memory(
+            &device,
+            &vq_dev,
+            &mem_props,
             session,
-            binds.len() as u32,
-            binds.as_ptr(),
-        );
-        if r != vk::Result::SUCCESS {
-            bail!("bind_video_session_memory: {r:?}");
-        }
+            &mut guard.session_mem,
+        )?;
 
         // Native NV12 (and AV1+RGB true-extent) author TRUE-SIZE headers: RADV programs firmware
         // padding from matching `codedExtent`. AV1 forbids sequence header (`flags-10324`) or
@@ -1472,7 +1647,7 @@ impl VulkanVideoEncoder {
                 hdr_h,
                 rw,
                 rh,
-                av1_caps.max_level,
+                av1_max_level,
                 av1_superblock128,
                 quality_level,
                 ten_bit,
@@ -1532,35 +1707,8 @@ impl VulkanVideoEncoder {
             None,
         )?;
         guard.sampler = sampler;
-        // 8-bit is 709; 10-bit splits by colour — BT.2020 PQ for HDR, BT.709 for SDR-10.
-        let spv = ash::util::read_spv(&mut std::io::Cursor::new(match (ten_bit, is_hdr) {
-            (true, true) => CSC10_SPV,
-            (true, false) => CSC10_709_SPV,
-            (false, _) => CSC_SPV,
-        }))?;
-        let shader =
-            device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&spv), None)?;
-        guard.shader = shader;
-        let (csc_dsl, csc_layout) = csc_layout(&device)?;
-        guard.csc_dsl = csc_dsl;
-        guard.csc_layout = csc_layout;
-        let stage = vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(shader)
-            .name(c"main");
-        let csc_pipe = device
-            .create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::default()
-                    .layout(csc_layout)
-                    .stage(stage)],
-                None,
-            )
-            .map_err(|(_, e)| e)?[0];
-        guard.csc_pipe = csc_pipe;
-        device.destroy_shader_module(shader, None);
-        // Shader is gone — null the guard so a later failure doesn't unwind it again.
-        guard.shader = vk::ShaderModule::null();
+        let (csc_dsl, csc_layout, csc_pipe) =
+            build_csc_pipeline(&device, &mut guard, ten_bit, is_hdr)?;
         let nframes = ring_depth();
         let pool_sizes = [
             vk::DescriptorPoolSize::default()

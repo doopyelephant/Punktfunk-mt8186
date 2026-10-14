@@ -388,16 +388,15 @@ pub struct DmabufImage<'a> {
     pub usage: vk::ImageUsageFlags,
 }
 
-/// The memory-plane count `pd` lists for `modifier` on `format`; `None` when it lists none.
+/// Every DRM modifier `pd` lists for `format`, in driver order.
 ///
 /// # Safety
 /// `instance`/`pd` must be live and paired.
-unsafe fn modifier_plane_count(
+pub unsafe fn format_modifiers(
     instance: &ash::Instance,
     pd: vk::PhysicalDevice,
     format: vk::Format,
-    modifier: u64,
-) -> Option<u32> {
+) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
     let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
     let mut props = Vec::new();
     // SAFETY: caller contract; the count query fills `list`, `props` is sized to it before
@@ -415,6 +414,20 @@ unsafe fn modifier_plane_count(
     }
     props.truncate(list.drm_format_modifier_count as usize);
     props
+}
+
+/// The memory-plane count `pd` lists for `modifier` on `format`; `None` when it lists none.
+///
+/// # Safety
+/// `instance`/`pd` must be live and paired.
+unsafe fn modifier_plane_count(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    format: vk::Format,
+    modifier: u64,
+) -> Option<u32> {
+    // SAFETY: caller contract.
+    unsafe { format_modifiers(instance, pd, format) }
         .iter()
         .find(|p| p.drm_format_modifier == modifier)
         .map(|p| p.drm_format_modifier_plane_count)

@@ -2,7 +2,7 @@
 //! icon both take file paths: the lens highlight, the four "funk" letters in each colour
 //! scheme, and `punktfunk.ico`. The rasters are rendered by `scripts/gen-setup-brand.sh`
 //! from the website's exact path data — regenerate and commit when the brand changes. The
-//! mark's two circles are drawn live as ellipses (`wizard::lockup`) so they can orbit.
+//! mark's two circles are drawn live as ellipses (`wizard::welcome::lockup`) so they can orbit.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

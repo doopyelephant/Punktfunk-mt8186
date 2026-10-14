@@ -520,7 +520,7 @@ fn real_main() -> Result<()> {
         }
         Some("ctl") => ctl::main(&args[1..]),
         Some("settings") => settings_cli(&args[1..]),
-        Some("plugins") => plugins::main(&args[1..]),
+        Some("plugins") => plugins::main(&args[1..], library::delete_provider),
         Some("openapi") => {
             print!("{}", mgmt::openapi_json());
             Ok(())

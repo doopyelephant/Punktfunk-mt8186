@@ -153,17 +153,8 @@ pub(crate) fn sampled_capture_modifiers(fourcc: u32) -> Vec<u64> {
         let pd = select_physical_device(&instance).ok().map(|p| p.pd);
         let mods = pd
             .map(|pd| {
-                let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
-                let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
-                instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
-                let n = list.drm_format_modifier_count as usize;
-                let mut props = vec![vk::DrmFormatModifierPropertiesEXT::default(); n];
-                list.p_drm_format_modifier_properties = props.as_mut_ptr();
-                let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
-                instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
-                props.truncate(list.drm_format_modifier_count as usize);
                 let mut out: Vec<u64> = Vec::new();
-                for p in props {
+                for p in pf_zerocopy::vkdev::format_modifiers(&instance, pd, fmt) {
                     if !p
                         .drm_format_modifier_tiling_features
                         .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)

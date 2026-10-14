@@ -529,7 +529,7 @@ pub fn selected_gpu() -> Option<SelectedGpu> {
     } else {
         PickSource::Auto
     };
-    if linux_nvidia_present()
+    if nvidia_present()
         && let Some(i) = gpus.iter().position(|g| g.vendor_id == VENDOR_NVIDIA)
     {
         return Some(SelectedGpu {
@@ -590,10 +590,10 @@ pub fn linux_render_node() -> PathBuf {
     render_node_env().unwrap_or_else(|| PathBuf::from("/dev/dri/renderD128"))
 }
 
-/// Same device-node check as `encode::nvidia_present`, duplicated rather
-/// than widening that private fn.
+/// NVIDIA is present when its device nodes exist; no CUDA context is
+/// created, which would allocate GPU state on every maybe-NVIDIA host.
 #[cfg(target_os = "linux")]
-fn linux_nvidia_present() -> bool {
+pub fn nvidia_present() -> bool {
     std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/nvidia0").exists()
 }
 

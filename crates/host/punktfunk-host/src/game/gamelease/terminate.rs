@@ -8,9 +8,7 @@ use super::OwnedChild;
 use super::{report_exit, LeaseKind, LeaseShared, POLL, TERM_GRACE};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Polite then kill, on a detached thread: callers are teardown/`Drop` and
 /// must not block. Idempotent.
@@ -158,13 +156,11 @@ fn unix_term_ladder(shared: &LeaseShared) {
         grace_s = TERM_GRACE.as_secs(),
         "asked the game to close"
     );
-    let deadline = Instant::now() + TERM_GRACE;
-    while Instant::now() < deadline {
-        std::thread::sleep(POLL);
-        if scanner.alive(&targets).is_empty() && child_gone() {
-            tracing::info!(title = %shared.game.title, "the game closed when asked");
-            return;
-        }
+    if closed_within(TERM_GRACE, || {
+        scanner.alive(&targets).is_empty() && child_gone()
+    }) {
+        tracing::info!(title = %shared.game.title, "the game closed when asked");
+        return;
     }
     let killed = signal_all(libc::SIGKILL);
     tracing::warn!(
@@ -222,13 +218,9 @@ fn windows_term_ladder(shared: &LeaseShared) {
         grace_s = TERM_GRACE.as_secs(),
         "asked the game to close"
     );
-    let deadline = Instant::now() + TERM_GRACE;
-    while Instant::now() < deadline {
-        std::thread::sleep(POLL);
-        if scanner.alive(&targets).is_empty() {
-            tracing::info!(title = %shared.game.title, "the game closed when asked");
-            return;
-        }
+    if closed_within(TERM_GRACE, || scanner.alive(&targets).is_empty()) {
+        tracing::info!(title = %shared.game.title, "the game closed when asked");
+        return;
     }
     // Fresh (pid, creation) before kill: Windows recycles pids quickly.
     let killed = signal(&scanner.alive(&targets), Force::Kill);
@@ -263,13 +255,9 @@ pub fn end_previous_launch(title: &str, procs: &[crate::procscan::ProcRef], why:
         "ending a game this host launched earlier"
     );
     signal(&first, Force::Polite);
-    let deadline = Instant::now() + TERM_GRACE;
-    while Instant::now() < deadline {
-        std::thread::sleep(POLL);
-        if live().is_empty() {
-            tracing::info!(title, "the game closed when asked");
-            return first.len();
-        }
+    if closed_within(TERM_GRACE, || live().is_empty()) {
+        tracing::info!(title, "the game closed when asked");
+        return first.len();
     }
     let remaining = live();
     tracing::warn!(
@@ -280,6 +268,19 @@ pub fn end_previous_launch(title: &str, procs: &[crate::procscan::ProcRef], why:
     );
     signal(&remaining, Force::Kill);
     first.len()
+}
+
+/// Polls `closed` every [`POLL`] until it holds or `grace` runs out; whether it held. The first
+/// look comes after one poll, so a game just asked to close is given time to start.
+fn closed_within(grace: Duration, mut closed: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        std::thread::sleep(POLL);
+        if closed() {
+            return true;
+        }
+    }
+    false
 }
 
 /// How hard [`signal`] asks a game to go.
@@ -341,5 +342,30 @@ pub fn end_others_for_new_launch(fingerprint: Option<&str>, game_id: Option<&str
             &other.procs,
             "the player launched a different title",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_close_inside_the_grace_stops_the_wait() {
+        let mut looks = 0;
+        assert!(closed_within(Duration::from_secs(60), || {
+            looks += 1;
+            looks == 2
+        }));
+        assert_eq!(looks, 2);
+    }
+
+    #[test]
+    fn a_game_still_open_at_the_deadline_reads_as_not_closed() {
+        let mut looks = 0;
+        assert!(!closed_within(Duration::from_millis(1), || {
+            looks += 1;
+            false
+        }));
+        assert_eq!(looks, 1);
     }
 }

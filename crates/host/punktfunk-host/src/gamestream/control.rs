@@ -264,7 +264,7 @@ impl rusty_enet::Socket for OwnerFilteredSocket {
                 Ok(Some((addr, received))) => {
                     // Decide before rusty_enet allocates per-peer reassembly. No live
                     // launch → drop; launch with a known owner IP → keep only that IP.
-                    let launch = *self.state.launch.lock().unwrap();
+                    let launch = *self.state.launch.lock().unwrap_or_else(|e| e.into_inner());
                     match launch.map(|s| s.peer_ip) {
                         None => continue,
                         Some(Some(ip)) if ip != addr.ip() => continue,
@@ -359,7 +359,7 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
                                 // ends the session, so a refused peer is `disconnect_now` (no
                                 // `Disconnect` event, slot freed this tick) — leaving it
                                 // untracked would pin 32 MiB and one of four slots forever.
-                                let launch = *state.launch.lock().unwrap();
+                                let launch = *state.launch.lock().unwrap_or_else(|e| e.into_inner());
                                 let from = p.address().map(|a| a.ip());
                                 if accept_connect(launch, from) {
                                     tracing::info!("control: client connected");
@@ -447,7 +447,11 @@ fn spawn(state: Arc<AppState>) -> Result<Running> {
 /// Each 2 ms tick: resolve on a new owner, fold a console edit (watch poll), and cut the
 /// session the tick the deadline passes. Events read the mask this leaves.
 fn tick_access(access: &mut Option<SessionAccess>, state: &AppState) {
-    let owner_fp = state.launch.lock().unwrap().and_then(|s| s.owner_fp);
+    let owner_fp = state
+        .launch
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .and_then(|s| s.owner_fp);
     let Some(fp) = owner_fp else {
         *access = None;
         return;
@@ -583,7 +587,11 @@ impl ControlPeer {
             self.pads.pump_rumble(|_, _, _, _, _| {});
             return;
         };
-        let key = state.launch.lock().unwrap().map(|s| s.gcm_key);
+        let key = state
+            .launch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|s| s.gcm_key);
         let Some(key) = key else {
             return;
         };
@@ -591,7 +599,7 @@ impl ControlPeer {
         let mut out: Vec<Vec<u8>> = Vec::new();
         // HDR-mode (0x010e / `IDX_HDR_MODE`) follows the frames the video thread encodes,
         // off again when they turn SDR. Stock Moonlight switches the TV only on this cue.
-        let encoded_hdr = *state.gs.video_hdr.lock().unwrap();
+        let encoded_hdr = *state.gs.video_hdr.lock().unwrap_or_else(|e| e.into_inner());
         if encoded_hdr != self.hdr_signalled {
             let meta = encoded_hdr.or(self.hdr_signalled).unwrap_or_default();
             let pt = hdr_mode_plaintext(encoded_hdr.is_some(), &meta);
@@ -650,7 +658,12 @@ fn on_receive(
     inj_tx: &Sender<InputEvent>,
     grants: u32,
 ) {
-    let Some(key) = state.launch.lock().unwrap().map(|s| s.gcm_key) else {
+    let Some(key) = state
+        .launch
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(|s| s.gcm_key)
+    else {
         return; // control traffic before /launch — no key yet
     };
     // Encrypted control packets begin with u16 LE encType = 0x0001 and an 8-byte header.
@@ -691,7 +704,7 @@ fn on_receive(
             if let Some((first, last)) = decode_rfi_range(&pt) {
                 // Merged with a range the video thread has not drained yet: each lost frame
                 // must stay invalid. Too wide a merge becomes a keyframe there.
-                let mut slot = state.rfi_range.lock().unwrap();
+                let mut slot = state.rfi_range.lock().unwrap_or_else(|e| e.into_inner());
                 *slot = Some(match *slot {
                     Some((pf, pl)) => (pf.min(first), pl.max(last)),
                     None => (first, last),

@@ -85,7 +85,7 @@ fn peer_grants(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) -> 
 /// Resume/cancel: true if there is no session, fingerprints match, or either side is unknown.
 /// Unknown fingerprints fail open so a same-client control is never locked out.
 fn peer_may_control_session(peer: &Option<Extension<PeerCertFingerprint>>, st: &AppState) -> bool {
-    match st.launch.lock().unwrap().as_ref() {
+    match st.launch.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         None => true,
         Some(session) => match (session.owner_fp, peer_fp(peer)) {
             (Some(owner), Some(caller)) => owner == caller,
@@ -181,7 +181,10 @@ async fn h_serverinfo(
     let paired = https && peer_is_paired(&peer, &st);
     // Owner-only `currentgame`: Moonlight uses it to show Resume/Quit.
     let current_game = if paired {
-        owner_current_game(&st.launch.lock().unwrap(), peer_fp(&peer))
+        owner_current_game(
+            &st.launch.lock().unwrap_or_else(|e| e.into_inner()),
+            peer_fp(&peer),
+        )
     } else {
         0
     };
@@ -303,7 +306,7 @@ async fn launch_under(
             // Mint ping before RTSP SETUP. Media planes use it to tell this client's first
             // datagram from others at the same address.
             st.mint_av_ping();
-            *st.launch.lock().unwrap() = Some(session);
+            *st.launch.lock().unwrap_or_else(|e| e.into_inner()) = Some(session);
             tracing::info!(
                 w = session.width,
                 h = session.height,
@@ -354,7 +357,7 @@ async fn h_resume(
     // Teardown during the wait can clear `launch`. ANNOUNCE re-negotiates audio — ignore
     // surroundAudioInfo here.
     {
-        let mut launch = st.launch.lock().unwrap();
+        let mut launch = st.launch.lock().unwrap_or_else(|e| e.into_inner());
         let Some(session) = launch.as_mut() else {
             return xml(error_xml(NO_SESSION));
         };

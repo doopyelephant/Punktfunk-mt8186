@@ -281,7 +281,11 @@ pub(crate) fn spawn_install(plan: Plan, plugin_tokens: PluginTokens) -> Result<S
     Ok(id)
 }
 
-pub(crate) fn spawn_uninstall(pkg: String, plugin_tokens: PluginTokens) -> Result<String> {
+pub(crate) fn spawn_uninstall(
+    pkg: String,
+    plugin_tokens: PluginTokens,
+    delete_titles: crate::plugin_host::DeleteTitles,
+) -> Result<String> {
     if super::valid_installed_pkg(&pkg).is_err() {
         bail!("not an installable plugin package name");
     }
@@ -290,7 +294,7 @@ pub(crate) fn spawn_uninstall(pkg: String, plugin_tokens: PluginTokens) -> Resul
     std::thread::Builder::new()
         .name("pf-store-uninstall".into())
         .spawn(move || {
-            let result = run_uninstall(&job_id, &pkg, &plugin_tokens);
+            let result = run_uninstall(&job_id, &pkg, &plugin_tokens, delete_titles);
             finish(&job_id, result);
             crate::events::emit(crate::events::EventKind::StoreChanged);
         })
@@ -438,7 +442,12 @@ fn run_install(id: &str, plan: Plan, plugin_tokens: &PluginTokens) -> Result<()>
     Ok(())
 }
 
-fn run_uninstall(id: &str, pkg: &str, plugin_tokens: &PluginTokens) -> Result<()> {
+fn run_uninstall(
+    id: &str,
+    pkg: &str,
+    plugin_tokens: &PluginTokens,
+    delete_titles: crate::plugin_host::DeleteTitles,
+) -> Result<()> {
     let dir = super::plugins_dir();
     // Its titles leave with it: nothing would launch an exec tile of a removed plugin.
     let provider = crate::plugins::manifest::id_of_package(pkg);
@@ -455,7 +464,7 @@ fn run_uninstall(id: &str, pkg: &str, plugin_tokens: &PluginTokens) -> Result<()
     set_phase(id, "recording");
     manifest::forget(&dir, pkg).context("update install provenance")?;
     if let Some(provider) = provider {
-        match crate::library::delete_provider(&provider) {
+        match delete_titles(&provider) {
             Ok(n) if n > 0 => log_line(id, format!("removed {n} library titles of {provider}")),
             Ok(_) => {}
             Err(e) => log_line(
