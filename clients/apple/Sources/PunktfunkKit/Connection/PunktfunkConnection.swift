@@ -1067,7 +1067,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         opts.client_caps = clientCaps
         opts.video_fit = videoFit
         opts.timeout_ms = timeoutMs
-        handle = host.withCString { cs in
+        let dialed = host.withCString { cs in
             withOptionalCString(identity?.certPEM) { cert in
                 withOptionalCString(identity?.keyPEM) { key in
                     withOptionalCString(launchID) { launch in
@@ -1103,81 +1103,83 @@ public final class PunktfunkConnection: @unchecked Sendable {
                 }
             }
         }
-        guard handle != nil else {
+        guard let opened = dialed else {
             if let rejection = HostRejection(status: connectStatus) {
                 throw PunktfunkClientError.rejected(rejection)
             }
             throw PunktfunkClientError.connectFailed
         }
+        // Nothing else holds `self` yet, so the reads below take the local, without a lock.
+        handle = opened
         // Scroll inversion lives at the core's outbound seam — seeded once from the session
         // settings; a live change goes through `setInvertScroll`, not a per-event reseed.
-        _ = punktfunk_connection_set_invert_scroll(handle, settings.invertScroll)
+        _ = punktfunk_connection_set_invert_scroll(opened, settings.invertScroll)
         hostFingerprint = Data(observed)
         var w: UInt32 = 0, h: UInt32 = 0, hz: UInt32 = 0
-        _ = punktfunk_connection_mode(handle, &w, &h, &hz)
+        _ = punktfunk_connection_mode(opened, &w, &h, &hz)
         self.width = w
         self.height = h
         self.refreshHz = hz
         var gp: UInt32 = 0
-        _ = punktfunk_connection_gamepad(handle, &gp)
+        _ = punktfunk_connection_gamepad(opened, &gp)
         resolvedGamepad = GamepadType(rawValue: gp) ?? .auto
         // What we asked for, straight off the parameter — the echo above only speaks for a pad
         // that declared this same kind (see `motionReaches(declared:)`).
         requestedGamepad = gamepad
         var comp: UInt32 = 0
-        _ = punktfunk_connection_compositor(handle, &comp)
+        _ = punktfunk_connection_compositor(opened, &comp)
         resolvedCompositor = Compositor(rawValue: comp) ?? .auto
         var br: UInt32 = 0
-        _ = punktfunk_connection_bitrate(handle, &br)
+        _ = punktfunk_connection_bitrate(opened, &br)
         resolvedBitrateKbps = br
         var prim: UInt8 = 1, trc: UInt8 = 1, mtx: UInt8 = 1, fullRange: UInt8 = 0, depth: UInt8 = 8
-        _ = punktfunk_connection_color_info(handle, &prim, &trc, &mtx, &fullRange, &depth)
+        _ = punktfunk_connection_color_info(opened, &prim, &trc, &mtx, &fullRange, &depth)
         colorPrimaries = prim
         colorTransfer = trc
         colorMatrix = mtx
         colorFullRange = fullRange != 0
         bitDepth = depth
         var cf: UInt8 = 1
-        _ = punktfunk_connection_chroma_format(handle, &cf)
+        _ = punktfunk_connection_chroma_format(opened, &cf)
         chromaFormat = cf
         var ac: UInt8 = 2
-        _ = punktfunk_connection_audio_channels(handle, &ac)
+        _ = punktfunk_connection_audio_channels(opened, &ac)
         resolvedAudioChannels = ac
         // The format the host RESOLVED, which may be below what `audioRateHz`/`audioBits` asked
         // for — the five-condition gate declines to Opus 48 kHz rather than failing the connect.
         // The defaults survive a status the accessors never fill (an older core), which is the
         // right answer: every session such a core can run IS 48 kHz/16-bit.
         var rate: UInt32 = 48_000
-        _ = punktfunk_connection_audio_sample_rate(handle, &rate)
+        _ = punktfunk_connection_audio_sample_rate(opened, &rate)
         resolvedAudioRateHz = rate
         var bits: UInt8 = 16
-        _ = punktfunk_connection_audio_bits(handle, &bits)
+        _ = punktfunk_connection_audio_bits(opened, &bits)
         resolvedAudioBits = bits
         // `0` is the accessor's "the host stated nothing" — an older host, or an Opus session that
         // never needed to say. Both mean the protocol's default frame, so map it here rather than
         // letting a zero reach the ring, where it would be a zero-length shed unit.
         var frameUs: UInt16 = 0
-        _ = punktfunk_connection_audio_frame_us(handle, &frameUs)
+        _ = punktfunk_connection_audio_frame_us(opened, &frameUs)
         resolvedAudioFrameUs = frameUs == 0
             ? UInt16(PUNKTFUNK_AUDIO_FRAME_MS * 1000)
             : frameUs
         var codec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
-        _ = punktfunk_connection_codec(handle, &codec)
+        _ = punktfunk_connection_codec(opened, &codec)
         resolvedCodec = codec
         var shard: UInt32 = 1408
-        _ = punktfunk_connection_shard_payload(handle, &shard)
+        _ = punktfunk_connection_shard_payload(opened, &shard)
         shardPayload = shard
         var caps: UInt8 = 0
-        _ = punktfunk_connection_host_caps(handle, &caps)
+        _ = punktfunk_connection_host_caps(opened, &caps)
         hostCaps = caps
         var caps2: UInt8 = 0
-        _ = punktfunk_connection_host_caps2(handle, &caps2)
+        _ = punktfunk_connection_host_caps2(opened, &caps2)
         hostCaps2 = caps2
         // Where this host serves its game library, straight from the session's Welcome. 0 = the
         // host advertised none (older host / no management API), and the caller keeps whatever it
         // already had. This is the answer that does NOT require an mDNS advert to have been seen.
         var mgmt: UInt16 = 0
-        _ = punktfunk_connection_mgmt_port(handle, &mgmt)
+        _ = punktfunk_connection_mgmt_port(opened, &mgmt)
         hostMgmtPort = mgmt
     }
 
@@ -2317,9 +2319,6 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Read it before tearing the connection down: once `close()` has been requested this reports
     /// `.none`, which is the safe direction (the caller falls back to its normal handling).
     public var sessionEndReason: SessionEndReason {
-        // Held ACROSS the call, not just for the snapshot: these two read from the main actor
-        // with no plane lock of their own, so a `liveHandle()` snapshot could be freed by a
-        // concurrent close between the check and the call.
         return withLiveHandle(or: .none) { h in
             var out: UInt8 = 0
             guard punktfunk_connection_end_reason(h, &out) == statusOK else { return .none }
@@ -2377,40 +2376,41 @@ public final class PunktfunkConnection: @unchecked Sendable {
 
     deinit { close() }
 
-    /// Snapshot the handle unless close is pending (callers hold their plane lock).
-    private func liveHandle() -> OpaquePointer? {
+    /// Run `body` on the live handle, or return `fallback` once close is pending. The only read
+    /// of `handle` outside `close()`, which takes every lock before it frees it, so the handle
+    /// outlives the call. `abiLock` is the default; a plane poll holds its own plane lock instead,
+    /// so a blocking poll holds up no send.
+    private func withLiveHandle<T>(
+        holding plane: NSLock? = nil, or fallback: T, _ body: (OpaquePointer) -> T
+    ) -> T {
+        guard let plane else {
+            abiLock.lock()
+            defer { abiLock.unlock() }
+            guard let h = handle, !closeRequested else { return fallback }
+            return body(h)
+        }
+        plane.lock()
+        defer { plane.unlock() }
         abiLock.lock()
-        defer { abiLock.unlock() }
-        return closeRequested ? nil : handle
-    }
-
-    /// Run `body` on the live handle with `abiLock` held across it, so close() can't free the
-    /// handle mid-call. `fallback` once close is pending.
-    private func withLiveHandle<T>(or fallback: T, _ body: (OpaquePointer) -> T) -> T {
-        abiLock.lock()
-        defer { abiLock.unlock() }
-        guard let h = handle, !closeRequested else { return fallback }
+        let live = closeRequested ? nil : handle
+        abiLock.unlock()
+        guard let h = live else { return fallback }
         return body(h)
     }
 
-    /// One plane poll with its plane `lock` held across the C call: OK decodes the out-param,
-    /// no frame is nil, and a closed session throws.
+    /// One plane poll with its plane `lock` held across the C call and the decode: OK decodes
+    /// the out-param, no frame is nil, and a closed session throws.
     private func poll<T>(
         _ lock: NSLock, _ call: (OpaquePointer) -> Int32, decode: () -> T?
     ) throws -> T? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let h = liveHandle() else { throw PunktfunkClientError.closed }
-        let rc = call(h)
-        switch rc {
-        case statusOK:
-            return decode()
-        case statusNoFrame:
-            return nil
-        case statusClosed:
-            throw PunktfunkClientError.closed
-        default:
-            throw PunktfunkClientError.status(rc)
-        }
+        try withLiveHandle(holding: lock, or: .failure(.closed)) { h -> Result<T?, PunktfunkClientError> in
+            let rc = call(h)
+            switch rc {
+            case statusOK: return .success(decode())
+            case statusNoFrame: return .success(nil)
+            case statusClosed: return .failure(.closed)
+            default: return .failure(.status(rc))
+            }
+        }.get()
     }
 }
