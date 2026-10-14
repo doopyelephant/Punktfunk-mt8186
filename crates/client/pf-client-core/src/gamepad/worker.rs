@@ -114,7 +114,8 @@ fn pref_for_type(t: sdl3::gamepad::GamepadType) -> GamepadPref {
 fn pref_for_ids(vid: u16, pid: u16) -> Option<GamepadPref> {
     match (vid, pid) {
         (0x28DE, 0x1205) => Some(GamepadPref::SteamDeck),
-        (0x28DE, 0x1102 | 0x1142) => Some(GamepadPref::SteamController),
+        // The 2015 controller: cable, dongle, and Bluetooth under either firmware's id.
+        (0x28DE, 0x1102 | 0x1142 | 0x1105 | 0x1106) => Some(GamepadPref::SteamController),
         (0x054C, 0x0DF2) => Some(GamepadPref::DualSenseEdge),
         // Elite Series 1, Series 2 USB, Bluetooth and BLE.
         (0x045E, 0x02E3 | 0x0B00 | 0x0B05 | 0x0B22) => Some(GamepadPref::XboxElite),
@@ -347,7 +348,7 @@ struct Slot {
     rumble_suppressed_logged: bool,
     /// A wire rumble went out since the coils were last armed; SDL's rumble bits mute them.
     coils_muted: bool,
-    /// Raw passthrough for a Steam Controller 2 declared as one.
+    /// Raw passthrough for a Steam Controller declared as itself, either generation.
     sc2: Option<crate::sc2_capture::Sc2Capture>,
     /// The host sent raw writes, so its `0x80` reports own the motors and wire rumble is skipped.
     raw_rumble: bool,
@@ -649,10 +650,13 @@ impl Worker {
         match self.subsystem.open(sdl3::joystick::JoystickId::new(id)) {
             Ok(pad) => {
                 let mut slot = Slot::new(id, index, pref, declared, pad);
-                let raw_sc2 =
-                    crate::sc2_capture::is_sc2(pref) && crate::sc2_capture::is_sc2(declared);
-                // A raw SC2's IMU mode is Steam's to set, through the raw plane.
-                if !raw_sc2 {
+                let raw = crate::sc2_capture::raw_model(
+                    pref,
+                    declared,
+                    slot.pad.product_id().unwrap_or(0),
+                );
+                // A raw Steam Controller's IMU mode is Steam's to set, through the raw plane.
+                if raw.is_none() {
                     Self::set_slot_sensors(&mut slot, true);
                 }
                 let (audio_caps, bluetooth) = self.pad_audio_caps_for(id, &slot.pad);
@@ -686,7 +690,7 @@ impl Worker {
                     };
                     c.set_rumble_quirks(index as u16, quirks);
                     // After the arrival, so the host builds the as-is pad before raw reports.
-                    if raw_sc2 {
+                    if let Some(model) = raw {
                         slot.sc2 = slot.pad.path().and_then(|path| {
                             c.set_sc2_gate(index, self.sc2_gate());
                             crate::sc2_capture::Sc2Capture::open(
@@ -694,7 +698,7 @@ impl Worker {
                                 c.clone(),
                                 index,
                                 slot.pad.serial_number(),
-                                pref == GamepadPref::SteamController2Puck,
+                                model,
                             )
                         });
                     }
@@ -1944,7 +1948,9 @@ mod pref_for_ids_tests {
     fn named_pads_declare_their_own_kind() {
         use GamepadPref as P;
         assert_eq!(pref_for_ids(0x28DE, 0x1205), Some(P::SteamDeck));
-        assert_eq!(pref_for_ids(0x28DE, 0x1142), Some(P::SteamController));
+        for classic in [0x1102, 0x1142, 0x1105, 0x1106] {
+            assert_eq!(pref_for_ids(0x28DE, classic), Some(P::SteamController));
+        }
         assert_eq!(pref_for_ids(0x28DE, 0x1302), Some(P::SteamController2));
         assert_eq!(pref_for_ids(0x054C, 0x0DF2), Some(P::DualSenseEdge));
         for elite in [0x02E3, 0x0B00, 0x0B05, 0x0B22] {

@@ -767,6 +767,25 @@ object NativeBridge {
      *  last. [puck] adds the dongle's own queries. */
     external fun nativeSc2IdentityRequest(puck: Boolean, index: Int): ByteArray?
 
+    /** The [index]th feature query a 2015 Steam Controller's identity is read with, report id 0
+     *  first; null past the last. */
+    external fun nativeSc1IdentityRequest(index: Int): ByteArray?
+
+    /** A fresh state for one 2015 Steam Controller's Bluetooth input, for [nativeSc1BleInput]. */
+    external fun nativeSc1BleState(): ByteArray
+
+    /** One segment of a 2015 Steam Controller's Bluetooth input, `[0x03, header, 18 bytes]`: the
+     *  64-byte wired frame when it completed a state message, else null. [state] changes in place. */
+    external fun nativeSc1BleInput(state: ByteArray, segment: ByteArray): ByteArray?
+
+    /** A wired feature frame for a 2015 Steam Controller, report id 0 first, as its Bluetooth
+     *  segments back to back. */
+    external fun nativeSc1BleSegments(frame: ByteArray): ByteArray
+
+    /** The segments read back for one 2015 Steam Controller feature query, in order: the reply,
+     *  report id 0 first, once the last is in, else null. */
+    external fun nativeSc1BleReply(segments: ByteArray): ByteArray?
+
     /** A captured Steam Controller 2's identity for wire pad [pad]: its Puck [slot] (0 off a
      *  Puck), its USB serial and its replies, packed `[len][request][len][reply]…`. The host
      *  builds the virtual pad from it. */

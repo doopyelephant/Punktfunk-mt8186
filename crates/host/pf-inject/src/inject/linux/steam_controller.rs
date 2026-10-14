@@ -14,13 +14,14 @@
 //! answer `err = 0` or the kernel stalls ~5 s per command.
 
 use super::steam_proto::{
-    btn, parse_steam_output, sc_from_gamepad, serial_reply, serialize_deck_state,
-    serialize_sc_state, SteamModel, SteamState, STEAMDECK_RDESC, STEAM_REPORT_LEN, STEAM_VENDOR,
+    btn, parse_steam_output, sc_merge_frame, serial_reply, serialize_deck_state,
+    serialize_sc_state, ScState, SteamFeedback, SteamModel, SteamState, STEAMDECK_RDESC,
+    STEAM_REPORT_LEN, STEAM_VENDOR,
 };
 use crate::uhid_abi::{UhidDevice, UhidEvent};
 use crate::uhid_manager::{PadFeedback, PadProto, UhidManager};
 use anyhow::Result;
-use punktfunk_core::quic::RichInput;
+use punktfunk_core::quic::{HidOutput, RichInput, HID_RAW_FEATURE};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -140,21 +141,26 @@ impl SteamDeckPad {
         buttons
     }
 
-    /// Non-blocking. Answer GET_REPORT with the serial; `poll` acks SET_REPORT. Parse `0xEB`
-    /// rumble from SET_REPORT or OUTPUT.
-    pub fn service(&mut self) -> Option<(u16, u16)> {
-        let mut rumble = None;
+    /// Non-blocking. Answer GET_REPORT with the serial; `poll` acks SET_REPORT. A Deck's `0xEB`
+    /// write is rumble; a Steam Controller's writes go back for the physical pad.
+    pub fn service(&mut self) -> SteamFeedback {
+        let mut fb = SteamFeedback::default();
+        let model = self.model;
         self.dev.poll(|dev, ev| match ev {
-            UhidEvent::Output(data) | UhidEvent::SetReport(data) => {
-                if let Some(r) = parse_steam_output(data).rumble {
-                    rumble = Some(r);
+            UhidEvent::Output(data) | UhidEvent::SetReport(data) => match model {
+                SteamModel::Deck => {
+                    if let Some(r) = parse_steam_output(data).rumble {
+                        fb.rumble = Some(r);
+                    }
                 }
-            }
+                // `data` leads with report id 0.
+                SteamModel::Controller => fb.forward_sc_set(data.get(1..).unwrap_or_default()),
+            },
             UhidEvent::GetReport { id, .. } => {
                 let _ = dev.reply_get_report(id, Some(&serial_reply("PUNKTFUNK01")));
             }
         });
-        rumble
+        fb
     }
 }
 
@@ -163,7 +169,7 @@ impl SteamDeckPad {
 pub enum DeckTransport {
     Uhid(SteamDeckPad),
     Gadget(crate::steam_gadget::SteamDeckGadget),
-    Usbip(crate::steam_usbip::SteamDeckUsbip),
+    Usbip(crate::steam_usbip::SteamUsbip),
 }
 
 impl DeckTransport {
@@ -178,7 +184,7 @@ impl DeckTransport {
     }
     fn service(&mut self) -> Option<(u16, u16)> {
         match self {
-            DeckTransport::Uhid(p) => p.service(),
+            DeckTransport::Uhid(p) => p.service().rumble,
             DeckTransport::Gadget(g) => g.service().rumble,
             DeckTransport::Usbip(u) => u.service().rumble,
         }
@@ -239,7 +245,7 @@ fn open_transport(idx: u8) -> Result<DeckTransport> {
         }
     }
     if steam_usbip::usbip_preferred() {
-        match steam_usbip::SteamDeckUsbip::open(idx) {
+        match steam_usbip::SteamUsbip::open(idx) {
             Ok(u) => return Ok(DeckTransport::Usbip(u)),
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "usbip Deck unavailable — falling back to UHID")
@@ -325,13 +331,70 @@ impl PadProto for SteamProto {
 /// Session Steam Deck pads (`PUNKTFUNK_GAMEPAD=steamdeck`).
 pub type SteamControllerManager = UhidManager<SteamProto>;
 
-/// Classic Steam Controller [`PadProto`]. `hid-steam` under wired-SC identity `28DE:1102`
-/// (`ID_CONTROLLER_STATE`). UHID only: usbip/gadget present the Deck's 3-interface USB
-/// layout, which Steam Input will not promote as an SC.
+/// A classic Steam Controller's transport: usbip (`vhci_hcd`), a USB device Steam adopts, else
+/// UHID, which only `hid-steam` reads (`Interface: -1`).
+pub enum ScTransport {
+    Usbip {
+        pad: crate::steam_usbip::SteamUsbip,
+        /// Sequence of the typed frames; a mirrored report carries the pad's own.
+        seq: u32,
+    },
+    Uhid(SteamDeckPad),
+}
+
+impl ScTransport {
+    /// usbip as the pad its client captured ([`crate::triton_proto::identity_for`]), else UHID.
+    fn open(idx: u8) -> Result<ScTransport> {
+        use crate::steam_usbip;
+        if steam_usbip::usbip_preferred() {
+            let identity = crate::triton_proto::identity_for(idx);
+            match steam_usbip::SteamUsbip::open_controller(idx, identity) {
+                Ok(pad) => {
+                    tracing::info!(index = idx, "virtual Steam Controller created (usbip)");
+                    return Ok(ScTransport::Usbip { pad, seq: 0 });
+                }
+                Err(e) => tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "usbip Steam Controller unavailable — falling back to UHID"
+                ),
+            }
+        }
+        let p = SteamDeckPad::open_model(idx, SteamModel::Controller)?;
+        tracing::warn!(
+            index = idx,
+            "virtual Steam Controller created as UHID hid-steam — Steam WON'T list it (no USB \
+             interface). Load vhci_hcd (usbip) so the pad arrives as a real USB device: `sudo \
+             modprobe vhci_hcd`, and ensure it loads at boot."
+        );
+        Ok(ScTransport::Uhid(p))
+    }
+
+    fn write_state(&mut self, st: &ScState) {
+        let now = Instant::now();
+        match self {
+            ScTransport::Usbip { pad, seq } => pad.write_report(st.report(seq, now)),
+            ScTransport::Uhid(p) => {
+                let _ = p.dev.write_input(&st.report(&mut p.seq, now));
+            }
+        }
+    }
+
+    /// The host stack's feature SETs for the physical pad, report id first.
+    fn service(&mut self) -> Vec<Vec<u8>> {
+        match self {
+            ScTransport::Usbip { pad, .. } => pad.service().raw,
+            ScTransport::Uhid(p) => p.service().raw,
+        }
+    }
+}
+
+/// Classic Steam Controller [`PadProto`]: wired identity `28DE:1102` (`ID_CONTROLLER_STATE`)
+/// over [`ScTransport`]. A client that captured the physical pad sends its reports and gets
+/// Steam's feature writes back ([`ScState`]); any other client drives the typed mapping.
 ///
-/// One stick + two pads + two grips ([`sc_from_gamepad`]/[`serialize_sc_state`]):
-/// wire right stick drives the right pad; left-pad contact shadows the left stick;
-/// PADDLE1/2 land on the two grips (3/4 fold via remap). No FF, no sensors evdev.
+/// Typed: one stick + two pads + two grips ([`sc_from_gamepad`]/[`serialize_sc_state`]).
+/// Wire right stick drives the right pad; left-pad contact shadows the left stick;
+/// PADDLE1/2 land on the two grips (3/4 fold via remap). No FF: the pad has no motors.
 pub struct ScProto {
     /// Fold for wire paddles beyond the SC's two grips (PADDLE3/4).
     remap: crate::steam_remap::RemapConfig,
@@ -346,81 +409,56 @@ impl Default for ScProto {
 }
 
 impl PadProto for ScProto {
-    type Pad = SteamDeckPad;
+    type Pad = ScTransport;
 
-    fn alive(&self, pad: &SteamDeckPad) -> bool {
-        pad.dev.alive()
+    /// `false` once a uhid pad's relay to the seat supervisor ended.
+    fn alive(&self, pad: &ScTransport) -> bool {
+        match pad {
+            ScTransport::Uhid(pad) => pad.dev.alive(),
+            ScTransport::Usbip { .. } => true,
+        }
     }
-    type State = SteamState;
+    type State = ScState;
     const LABEL: &'static str = "Steam Controller";
     const DEVICE: &'static str = "Steam Controller";
     const CREATE_HINT: &'static str = "";
 
-    fn open(&mut self, idx: u8) -> Result<SteamDeckPad> {
-        let p = SteamDeckPad::open_model(idx, SteamModel::Controller)?;
-        tracing::info!(
-            index = idx,
-            "virtual Steam Controller created (UHID hid-steam)"
-        );
-        Ok(p)
+    fn open(&mut self, idx: u8) -> Result<ScTransport> {
+        ScTransport::open(idx)
     }
 
-    /// PADDLE1/2 map natively in [`sc_from_gamepad`]. Mask them out of the fold so 3/4 cannot
-    /// double-fire the same grips.
-    fn merge_frame(
-        &self,
-        prev: &SteamState,
-        f: &punktfunk_core::input::GamepadFrame,
-    ) -> SteamState {
-        use punktfunk_core::input::gamepad as gs;
-        let native = f.buttons & (gs::BTN_PADDLE1 | gs::BTN_PADDLE2);
-        let folded = crate::steam_remap::fold_paddles(
-            f.buttons & !(gs::BTN_PADDLE1 | gs::BTN_PADDLE2),
-            self.remap.paddles,
-        );
-        let mut s = sc_from_gamepad(
-            folded | native,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        s.lpad_x = prev.lpad_x;
-        s.lpad_y = prev.lpad_y;
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s.buttons |= prev.buttons & btn::LPAD_TOUCH;
-        s.lpad_click = prev.lpad_click;
-        // Right pad is the wire right stick; a rich contact (TouchpadEx surface 2) overrides only while the stick is centered.
-        if f.rs_x == 0 && f.rs_y == 0 {
-            s.rpad_x = prev.rpad_x;
-            s.rpad_y = prev.rpad_y;
-            s.buttons |= prev.buttons & btn::RPAD_TOUCH;
-            s.rpad_click = prev.rpad_click;
-        }
-        s
+    /// Typed frames keep arriving beside a mirrored pad's reports: they update the fallback
+    /// and show the client is alive.
+    fn merge_frame(&self, prev: &ScState, f: &punktfunk_core::input::GamepadFrame) -> ScState {
+        let mut next = *prev;
+        let typed = sc_merge_frame(&prev.typed, f, self.remap.paddles);
+        next.typed_frame(typed, Instant::now());
+        next
     }
 
-    fn apply_rich(&self, st: &mut SteamState, rich: RichInput) {
-        st.apply_rich(rich);
+    fn apply_rich(&self, st: &mut ScState, rich: RichInput) {
+        st.apply_rich(rich, Instant::now());
     }
 
-    fn write_state(&self, pad: &mut SteamDeckPad, st: &SteamState) {
-        let _ = pad.write_state(st);
+    fn write_state(&self, pad: &mut ScTransport, st: &ScState) {
+        pad.write_state(st);
     }
 
-    /// Serial GET_REPORT + settings SET_REPORT. No FF device; rumble only from hidraw `0xEB`.
-    fn service(&self, pad: &mut SteamDeckPad, _idx: u8) -> PadFeedback {
-        let rumble = pad.service();
+    /// Serial GET_REPORT, and the stack's feature SETs back to the physical pad on 0xCD. The pad
+    /// has no motors: its haptics are among those writes.
+    fn service(&self, pad: &mut ScTransport, idx: u8) -> PadFeedback {
+        let hidout = pad
+            .service()
+            .into_iter()
+            .map(|data| HidOutput::HidRaw {
+                pad: idx,
+                kind: HID_RAW_FEATURE,
+                data,
+            })
+            .collect();
         PadFeedback {
-            // No trigger motors on this protocol — see `PadFeedback::rumble`.
-            rumble: rumble.map(|(low, high)| (low, high, 0, 0)),
-            hidout: Vec::new(),
-            // `Some` iff hidraw `0xEB` this poll. Arms abandoned-rumble force-off; hidraw never surfaces a stop.
-            rumble_drove: Some(rumble.is_some()),
-            resync: false,
+            hidout,
+            ..PadFeedback::default()
         }
     }
 }
@@ -431,6 +469,7 @@ pub type SteamCtrlManager = UhidManager<ScProto>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::steam_proto::sc_from_gamepad;
     use crate::test_sysfs::{input_devices, wait_input_gone};
 
     fn find_node(name: &str) -> Option<String> {
@@ -533,7 +572,11 @@ mod tests {
     }
 
     /// Classic-SC `28DE:1102`: bind with no mode-entry pulse; BTN_A and right-stick land
-    /// on ABS_RX (right pad).
+    /// on ABS_RX (right pad), and the kernel's own settings write comes back for the
+    /// physical pad while its lizard-mode commands do not.
+    ///
+    /// The pad is serviced from its own thread: `hid-steam` writes those settings inside an
+    /// evdev open and holds the opener 5 s per unanswered one.
     #[test]
     #[ignore = "creates a real /dev/uhid device; needs hid-steam + the input group"]
     fn sc_backend_binds_and_input_flows() {
@@ -543,30 +586,92 @@ mod tests {
         let mut pad = SteamDeckPad::open_model(0, SteamModel::Controller)
             .expect("open SC pad (/dev/uhid + input group?)");
         let st = sc_from_gamepad(gs::BTN_A | gs::BTN_PADDLE1, 0, 0, 9000, 0, 0, 0);
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(900) {
-            let _ = pad.service();
-            pad.write_state(&st).expect("write_state");
-            let settled = find_node("Steam Controller")
-                .is_some_and(|n| key_is_down(&n, BTN_A) && abs_value(&n, ABS_RX) == Some(9000));
-            if settled {
-                break;
+        let stop = AtomicBool::new(false);
+        let (seen, forwarded) = std::thread::scope(|s| {
+            let serviced = s.spawn(|| {
+                let mut forwarded = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    forwarded.extend(pad.service().raw);
+                    pad.write_state(&st).expect("write_state");
+                    std::thread::sleep(Duration::from_millis(4));
+                }
+                forwarded
+            });
+            let start = Instant::now();
+            let mut seen = (false, None);
+            while seen != (true, Some(9000)) && start.elapsed() < Duration::from_millis(1500) {
+                if let Some(n) = find_node("Steam Controller") {
+                    seen = (key_is_down(&n, BTN_A), abs_value(&n, ABS_RX));
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            std::thread::sleep(Duration::from_millis(4));
-        }
+            stop.store(true, Ordering::Relaxed);
+            (seen, serviced.join().expect("service thread"))
+        });
         assert!(
-            input_devices().contains("Steam Controller"),
-            "SC gamepad evdev not created"
-        );
-        let node = find_node("Steam Controller").expect("SC evdev node");
-        assert!(
-            key_is_down(&node, BTN_A),
+            seen.0,
             "BTN_A not down — SC serialize failed (no mode gate should apply)"
         );
         assert_eq!(
-            abs_value(&node, ABS_RX),
+            seen.1,
             Some(9000),
             "wire right stick did not land on the right pad (ABS_RX)"
         );
+        assert!(
+            forwarded.iter().any(|f| f.starts_with(&[0, 0x87])),
+            "the kernel's settings write never came back: {forwarded:02x?}"
+        );
+        assert!(
+            forwarded
+                .iter()
+                .all(|f| !matches!(f[1], 0x81 | 0x85 | 0x8E)),
+            "a lizard-mode command reached the physical pad: {forwarded:02x?}"
+        );
+    }
+
+    /// Holds a Steam Controller live for `PF_PAD_HOLD_SECS` (default 3) so Steam or an SDL
+    /// probe can adopt it: A beats every 400 ms over a steady 100 °/s pitch, and each feature
+    /// write the host's stack sends for the physical pad is echoed to stdout.
+    #[test]
+    #[ignore = "attaches a real vhci_hcd device; needs root"]
+    fn steam_controller_holds_for_a_probe() {
+        use punktfunk_core::input::{gamepad as gs, GamepadEvent, GamepadFrame};
+        let secs = std::env::var("PF_PAD_HOLD_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let mut m = SteamCtrlManager::new();
+        m.handle(&GamepadEvent::Arrival {
+            index: 5,
+            kind: 0,
+            capabilities: 0,
+            audio_caps: 0,
+        });
+        assert_eq!(m.live_pads(), 1, "the pad must attach");
+        println!("Steam Controller up for {secs}s");
+        let (start, mut last, mut beat) = (Instant::now(), Instant::now(), 0u32);
+        while start.elapsed() < Duration::from_secs(secs) {
+            if last.elapsed() >= Duration::from_millis(400) {
+                last = Instant::now();
+                beat += 1;
+                m.handle(&GamepadEvent::State(GamepadFrame {
+                    index: 5,
+                    active_mask: 1 << 5,
+                    buttons: if beat % 2 == 0 { gs::BTN_A } else { 0 },
+                    ..Default::default()
+                }));
+            }
+            m.apply_rich(RichInput::Motion {
+                pad: 5,
+                gyro: [(100 * gs::MOTION_GYRO_LSB_PER_DEG_S) as i16, 0, 0],
+                accel: [0, gs::MOTION_ACCEL_LSB_PER_G as i16, 0],
+            });
+            m.pump(
+                |_, _, _, _, _| {},
+                |out| println!("for the pad: {out:02x?}"),
+            );
+            m.heartbeat(Duration::from_millis(8));
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 }

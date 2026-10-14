@@ -824,6 +824,11 @@ pub mod steam_controller;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller2.rs"]
 pub mod steam_controller2;
+/// Virtual 2015 Steam Controller (`28DE:1102`) via UMDF + shm (device-type 15): raw mirror of
+/// a client-captured pad, typed fallback, Steam's feature writes back to the client.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/steam_controller_windows.rs"]
+pub mod steam_controller_windows;
 /// Virtual Steam Deck via UMDF + shm (device-type 3). Steam Input promotes it because of
 /// the `&MI_02` hardware-id synthesis.
 #[cfg(target_os = "windows")]

@@ -2058,6 +2058,63 @@ public final class PunktfunkConnection: @unchecked Sendable {
         }
     }
 
+    /// A fresh state for one 2015 Steam Controller's Bluetooth input (`sc1BleInput`).
+    static func sc1BleState() -> [UInt8] {
+        [UInt8](repeating: 0, count: Int(PUNKTFUNK_SC1_BLE_STATE_LEN))
+    }
+
+    /// One segment of a 2015 Steam Controller's Bluetooth input, `[0x03, header, 18 bytes]`: the
+    /// 64-byte wired frame when it completed a state message (core's `classic_ble_input`).
+    static func sc1BleInput(state: inout [UInt8], segment: [UInt8]) -> [UInt8]? {
+        guard state.count == Int(PUNKTFUNK_SC1_BLE_STATE_LEN) else { return nil }
+        var out = [UInt8](repeating: 0, count: 64)
+        let done = state.withUnsafeMutableBufferPointer { st in
+            segment.withUnsafeBufferPointer { seg in
+                out.withUnsafeMutableBufferPointer { o in
+                    punktfunk_sc1_ble_input(st.baseAddress, seg.baseAddress, UInt(seg.count), o.baseAddress)
+                }
+            }
+        }
+        return done ? out : nil
+    }
+
+    /// A wired feature frame for a 2015 Steam Controller, report id 0 first, as its 20-byte
+    /// Bluetooth segments.
+    static func sc1BleSegments(frame: [UInt8]) -> [[UInt8]] {
+        var out = [UInt8](repeating: 0, count: 80)
+        let n = frame.withUnsafeBufferPointer { f in
+            out.withUnsafeMutableBufferPointer { o in
+                punktfunk_sc1_ble_segments(f.baseAddress, UInt(f.count), o.baseAddress, UInt(o.count))
+            }
+        }
+        return stride(from: 0, to: Int(n), by: 20).map { Array(out[$0 ..< $0 + 20]) }
+    }
+
+    /// The segments read back for one 2015 Steam Controller feature query, in order: the reply,
+    /// report id 0 first, once the last is in.
+    static func sc1BleReply(segments: [UInt8]) -> [UInt8]? {
+        var out = [UInt8](repeating: 0, count: 73)
+        let n = segments.withUnsafeBufferPointer { s in
+            out.withUnsafeMutableBufferPointer { o in
+                punktfunk_sc1_ble_reply(s.baseAddress, UInt(s.count), o.baseAddress, UInt(o.count))
+            }
+        }
+        return n > 0 ? Array(out[..<Int(n)]) : nil
+    }
+
+    /// `sc2IdentityRequests` for a 2015 Steam Controller, report id 0 first.
+    public static func sc1IdentityRequests() -> [[UInt8]] {
+        var out: [[UInt8]] = []
+        var buf = [UInt8](repeating: 0, count: 64)
+        while true {
+            let n = buf.withUnsafeMutableBufferPointer { p in
+                punktfunk_sc1_identity_request(UInt32(out.count), p.baseAddress, UInt(p.count))
+            }
+            guard n > 0 else { return out }
+            out.append(Array(buf[..<Int(n)]))
+        }
+    }
+
     /// Tell the host who the Steam Controller 2 on `pad` is, before its arrival
     /// (`punktfunk_connection_send_pad_identity`): its virtual pad then answers Steam as this one.
     public func sendPadIdentity(pad: UInt8, _ identity: PadIdentity) {

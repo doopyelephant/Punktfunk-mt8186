@@ -24,10 +24,14 @@ const USBIP_TCP_PORT: u16 = 3240;
 
 /// Every `idVendor:idProduct` a usbip pad here presents: the only devices a seat's vhci port
 /// binds drivers for. Each builder's test checks its device is listed.
-pub const EMULATED: [(u16, u16); 6] = [
+pub const EMULATED: [(u16, u16); 7] = [
     (
         crate::steam_usbip::STEAM_VENDOR,
         crate::steam_usbip::STEAMDECK_PRODUCT,
+    ),
+    (
+        crate::steam_usbip::STEAM_VENDOR,
+        crate::steam_usbip::STEAMCTRL_PRODUCT,
     ),
     (
         crate::triton_usbip::TRITON_VENDOR,

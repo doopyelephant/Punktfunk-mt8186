@@ -443,7 +443,8 @@ class MainActivity : ComponentActivity() {
         if (forceAsk) sc2PermissionAsked = false
         val usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
         sc2UsbAttached = usbManager.deviceList.values.any {
-            it.vendorId == Sc2Device.VID_VALVE && it.productId in Sc2Device.USB_PIDS
+            it.vendorId == Sc2Device.VID_VALVE &&
+                (it.productId in Sc2Device.USB_PIDS || it.productId in io.unom.punktfunk.kit.Sc1Device.USB_PIDS)
         }
         if (streamHandle != 0L) return // StreamScreen owns the pad while streaming
         if (sc2Menu?.isActive == true) return
