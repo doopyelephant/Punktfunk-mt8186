@@ -1563,9 +1563,10 @@ impl NativeClient {
         self.input_tx.send(*ev).map_err(|_| PunktfunkError::Closed)
     }
 
-    /// Tell the host who the Steam Controller 2 on `id.pad` is, before its arrival: the host's
+    /// Tell the host who the Steam Controller on `id.pad` is, before its arrival: the host's
     /// virtual pad then answers Steam with this serial and these replies
-    /// ([`sc2::identity_requests`] lists what to read). An older host skips the frame.
+    /// ([`sc2::identity_requests`] lists what to read, [`sc2::classic_identity_requests`] for
+    /// the 2015 pad). An older host skips the frame.
     pub fn send_pad_identity(&self, id: crate::quic::PadIdentity) -> Result<()> {
         if id.serial.len() > crate::quic::PAD_IDENTITY_SERIAL_MAX
             || id.replies.len() > crate::quic::PAD_IDENTITY_REPLIES_MAX
@@ -1578,8 +1579,9 @@ impl NativeClient {
             .map_err(|_| PunktfunkError::Closed)
     }
 
-    /// How a Steam Controller 2's raw reports on wire pad `pad` are gated: the client's overlay,
-    /// its system-button policy and its ring chord. Latest wins; an index past 15 is ignored.
+    /// How a Steam Controller's raw reports on wire pad `pad` are gated, either generation: the
+    /// client's overlay, its system-button policy and its ring chord. Latest wins; an index
+    /// past 15 is ignored.
     pub fn set_sc2_gate(&self, pad: u8, gate: Sc2Gate) {
         if let Some(f) = self.sc2.lock().unwrap().get_mut(usize::from(pad)) {
             f.gate = gate;
