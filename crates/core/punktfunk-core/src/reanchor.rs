@@ -36,6 +36,21 @@ pub const NO_OUTPUT_KEYFRAME_STREAK: u32 = 3;
 /// recovery-IDR round-trip on a live link and short enough that a stalled host still recovers.
 pub const REANCHOR_FREEZE_MAX: Duration = Duration::from_millis(500);
 
+/// Minimum spacing between the client's jump-to-live events. A bottleneck that rebuilds the
+/// queue instantly then degrades to a periodic skip instead of a keyframe storm.
+///
+/// Public: the host recovery-cadence detector compares against this constant, not
+/// a copy. Each jump asks for a keyframe at exactly this period forever; that
+/// perfect 2 s cadence is this cooldown, not a physical display disturbance.
+pub const FLUSH_COOLDOWN: Duration = Duration::from_secs(2);
+
+/// Keyframe re-ask spacing while no video has arrived — the opposite of
+/// [`FLUSH_COOLDOWN`] (nothing vs too much). Public and 2600 ms (not 2000) so
+/// the host recovery-cadence detector can tell the two faults apart; embedders
+/// own this timer and must use this constant. The delivery count in each feedback
+/// window settles it.
+pub const NO_VIDEO_RETRY: Duration = Duration::from_millis(2600);
+
 /// Intra-refresh [`USER_FLAG_RECOVERY_POINT`]s since the latest loss before the freeze lifts
 /// without an IDR, on a host that marks both ends of a wave alike. Two, not one: the first
 /// boundary after a loss may be the close of a wave that began before it. A host that sets

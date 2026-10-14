@@ -217,8 +217,13 @@ pub struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// Failure (no render endpoint) is survivable — the caller streams video-only.
-    pub fn spawn(fmt: PlaybackFormat) -> Result<AudioPlayer> {
+    /// Failure (no render endpoint) is survivable — the caller streams video-only. `policy` is
+    /// the session's ([`punktfunk_core::audio::AudioPlayout::jitter`]); the render thread owns
+    /// it from here.
+    pub fn spawn(
+        fmt: PlaybackFormat,
+        policy: punktfunk_core::audio::JitterPolicy,
+    ) -> Result<AudioPlayer> {
         // 64 chunks of slack — 320 ms at Opus 5 ms, 128 ms at lossless 2 ms. A chunk COUNT,
         // not scaled to the negotiated frame, matching core's `AUDIO_QUEUE`.
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
@@ -234,9 +239,9 @@ impl AudioPlayer {
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) =
-                    render_thread(pcm_rx, recycle_tx, stop_t, ready_tx, fmt, sync_t, vitals_t)
-                {
+                if let Err(e) = render_thread(
+                    pcm_rx, recycle_tx, stop_t, ready_tx, fmt, policy, sync_t, vitals_t,
+                ) {
                     tracing::warn!(error = %format!("{e:#}"), "audio playback thread ended");
                 }
             })
@@ -333,12 +338,14 @@ enum Played {
 /// goes away (a Bluetooth disconnect, a USB DAC pulled, an exclusive-mode grab) or when the
 /// default output moves. The ring and its policy carry over. Only the first open answers
 /// [`AudioPlayer::spawn`]; a failure there means the session streams video-only.
+#[allow(clippy::too_many_arguments)] // one call site, `AudioPlayer::spawn`
 fn render_thread(
     pcm_rx: Receiver<Vec<f32>>,
     recycle_tx: SyncSender<Vec<f32>>,
     stop: Arc<AtomicBool>,
     ready: SyncSender<Result<Option<u32>>>,
     fmt: PlaybackFormat,
+    mut policy: punktfunk_core::audio::JitterPolicy,
     sync: Arc<punktfunk_core::audio::AudioSyncCell>,
     vitals: Arc<crate::audio_vitals::PlaybackVitals>,
 ) -> Result<()> {
@@ -353,10 +360,6 @@ fn render_thread(
     crate::audio_rt::boost_and_log("wasapi-render");
     let channels = fmt.channels.clamp(1, 8) as u8;
     let mut ring: VecDeque<f32> = VecDeque::new();
-    // Resolved rate + frame_us: defaults would shed 2.5 frames at a time at 96 kHz.
-    let mut policy =
-        punktfunk_core::audio::JitterPolicy::new_at_rate(TUNING, channels, fmt.rate_hz);
-    policy.set_frame_us(fmt.frame_us);
     let mut ready = Some(ready);
     let mut failures: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
