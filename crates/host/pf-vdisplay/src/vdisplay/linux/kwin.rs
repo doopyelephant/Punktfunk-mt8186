@@ -13,6 +13,7 @@
 
 use super::{Mode, VirtualDisplay, VirtualOutput};
 use crate::proc::StopFlag;
+use crate::topology_journal::{self as journal, Head, Undo};
 use crate::wl_pump::{pump_until, sync_barrier, Pumped, SyncDone};
 use anyhow::{anyhow, bail, Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -85,10 +86,10 @@ pub struct KwinDisplay {
     /// `kde_output_device_v2` UUID of the last `create`, when in-process topology handled it.
     /// Stable across a supersede (unlike the shared name); preferred over `last_name`.
     our_uuid: Option<String>,
-    /// Restore closure for outputs `exclusive` disabled, pending [`take_topology_restore`].
-    /// Run when the display group's last member drops, not this session. [`Drop`] is the
-    /// backstop if the registry never took it.
-    pending_restore: Option<Box<dyn FnOnce() + Send>>,
+    /// Journal seqs of the heads `exclusive` disabled, across every `create` of this instance.
+    /// The registry takes them after a pooled `create` and runs them when the group empties;
+    /// [`Drop`] runs what a create that never reached the pool left.
+    pending_undo: Vec<u64>,
     /// Cursor-channel session: METADATA at creation; otherwise EMBEDDED.
     hw_cursor: bool,
     /// `mode_conflict: join` admitted this session.
@@ -99,11 +100,8 @@ pub struct KwinDisplay {
 
 impl Drop for KwinDisplay {
     fn drop(&mut self) {
-        // Backstop: the registry normally takes this right after `create`. Run it here if
-        // not, so a physical is never left dark.
-        if let Some(restore) = self.pending_restore.take() {
-            restore();
-        }
+        let seqs = std::mem::take(&mut self.pending_undo);
+        journal::apply(&seqs, self);
     }
 }
 
@@ -115,13 +113,13 @@ impl KwinDisplay {
     /// Apply topology for the just-created output `our_prefix` (size `dims`). Prefers
     /// in-process `kde_output_management_v2`; falls back to `kscreen-doctor` if the global
     /// is absent or the compositor misses its budget. Records UUID or kscreen address for
-    /// [`apply_position`](VirtualDisplay::apply_position). Returns disabled outputs
-    /// (`(name, "WxH@Hz")`) for group teardown; `Extend`/`Auto` disable nothing.
+    /// [`apply_position`](VirtualDisplay::apply_position). `Exclusive` journals the heads it
+    /// darkens onto `pending_undo` before the disable; the other topologies darken nothing.
     ///
     /// `pre_enabled` is the non-managed outputs lit before create ([`enabled_physicals`]).
     /// KWin may apply a stored setup for the new monitor set that already has physicals
     /// disabled — so a post-create enumerate can miss them. The snapshot is the only
-    /// unpolluted read: `Exclusive` unions it into restore; other topologies
+    /// unpolluted read: `Exclusive` journals it with the plan; other topologies
     /// [`reenable_stranded`]. `mgmt` is this create's [`crate::kwin_output_mgmt::watch`].
     fn apply_topology(
         &mut self,
@@ -130,7 +128,7 @@ impl KwinDisplay {
         our_prefix: &str,
         dims: (u32, u32),
         pre_enabled: &[(String, String)],
-    ) -> Vec<(String, String)> {
+    ) {
         use crate::kwin_output_mgmt::TopologyKind;
         use crate::policy::Topology;
         // Per device: `set_client_identity` runs before `create`, so this display knows
@@ -149,6 +147,7 @@ impl KwinDisplay {
                     dims.0,
                     dims.1,
                     TopologyKind::Extend,
+                    |_| {},
                 );
                 if outcome.handled {
                     self.our_uuid = outcome.our_uuid;
@@ -160,36 +159,53 @@ impl KwinDisplay {
                 // These topologies promise physicals stay lit; undo KWin switching them off
                 // in reaction to our output appearing.
                 reenable_stranded(pre_enabled.to_vec());
-                return Vec::new();
+                return;
+            }
+        };
+        let mut seqs = Vec::new();
+        let mut journal_plan = |plan: &[(String, String)]| {
+            let heads: Vec<Head> = union_restore(plan.to_vec(), pre_enabled)
+                .into_iter()
+                .map(|(name, mode)| Head {
+                    name,
+                    mode: (!mode.is_empty()).then_some(mode),
+                })
+                .collect();
+            if !heads.is_empty() {
+                seqs.push(journal::push("kwin", Undo::EnableHeads { heads }));
             }
         };
         // In-process Wayland; immune to a wedged kscreen-doctor.
-        let outcome =
-            crate::kwin_output_mgmt::apply_topology(mgmt, our_prefix, dims.0, dims.1, kind);
+        let outcome = crate::kwin_output_mgmt::apply_topology(
+            mgmt,
+            our_prefix,
+            dims.0,
+            dims.1,
+            kind,
+            &mut journal_plan,
+        );
         if outcome.handled {
             self.our_uuid = outcome.our_uuid;
             if kind == TopologyKind::Primary {
-                // `Primary` keeps physicals enabled — undo stored-config disable as Extend
-                // does. Nothing to restore at teardown.
+                // `Primary` keeps physicals enabled — undo stored-config disable as Extend does.
                 reenable_stranded(pre_enabled.to_vec());
-                return outcome.disabled;
             }
-            return union_restore(outcome.disabled, pre_enabled);
-        }
-        tracing::info!(
-            "KWin topology: kde_output_management unavailable — kscreen-doctor fallback"
-        );
-        let addr = resolve_kscreen_addr(name, dims.0, dims.1);
-        self.last_name = Some(addr.clone());
-        match topology {
-            Topology::Exclusive => union_restore(apply_virtual_primary(&addr), pre_enabled),
-            Topology::Primary => {
-                apply_virtual_primary_only(&addr);
-                reenable_stranded(pre_enabled.to_vec());
-                Vec::new()
+        } else {
+            tracing::info!(
+                "KWin topology: kde_output_management unavailable — kscreen-doctor fallback"
+            );
+            let addr = resolve_kscreen_addr(name, dims.0, dims.1);
+            self.last_name = Some(addr.clone());
+            match topology {
+                Topology::Exclusive => apply_virtual_primary(&addr, &mut journal_plan),
+                Topology::Primary => {
+                    apply_virtual_primary_only(&addr);
+                    reenable_stranded(pre_enabled.to_vec());
+                }
+                Topology::Extend | Topology::Auto => {}
             }
-            Topology::Extend | Topology::Auto => Vec::new(),
         }
+        self.pending_undo.extend(seqs);
     }
 }
 
@@ -210,8 +226,30 @@ impl VirtualDisplay for KwinDisplay {
         self.last_slot
     }
 
-    fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
-        self.pending_restore.take()
+    fn take_undo_seqs(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pending_undo)
+    }
+
+    /// Heads come back at their journaled mode and are read back. KWin journals no output:
+    /// ours goes with the Wayland connection that made it.
+    // A dead host's entry runs too, though KWin re-lit the heads when that host's output went:
+    // a head turned off since comes back on. A mark on the entry would skip it.
+    fn undo(&mut self, undo: &Undo) -> Result<()> {
+        let Undo::EnableHeads { heads } = undo else {
+            bail!("KWin journals no {undo:?}");
+        };
+        let heads: Vec<(String, String)> = heads
+            .iter()
+            .map(|h| (h.name.clone(), h.mode.clone().unwrap_or_default()))
+            .collect();
+        let dark = restore_heads(&heads)?;
+        if dark.is_empty() {
+            return Ok(());
+        }
+        bail!(
+            "{} still disabled; `kscreen-doctor output.<name>.enable` puts it back",
+            dark.join(", ")
+        )
     }
 
     fn set_hw_cursor(&mut self, on: bool) {
@@ -437,37 +475,7 @@ impl VirtualDisplay for KwinDisplay {
             let (dims, exact) = verify_or_reassert(mgmt.as_mut(), &our_prefix, width, height);
             (dims, exact, mode.refresh_hz)
         };
-        let disabled =
-            self.apply_topology(mgmt.as_mut(), &name, &our_prefix, final_dims, &pre_enabled);
-        // Stash restore on the group, not this session's keepalive: a per-session
-        // keepalive would re-enable physicals when the FIRST exclusive member drops
-        // under a still-live sibling. Empty ⇒ nothing to restore.
-        let prepared = (!disabled.is_empty()).then(|| {
-            let disabled = disabled.clone();
-            // In-process first; kscreen-doctor if the compositor misses its budget.
-            // Both must return honest verdicts — a fallback that acks unchecked
-            // re-introduces silent success.
-            Box::new(move || {
-                if !crate::kwin_output_mgmt::reenable_outputs(&disabled) {
-                    reenable_outputs_kscreen(&disabled);
-                }
-                // This ran under the with-us monitor set (before reclaim). Reclaim
-                // flips KWin to the without-us set, whose stored setup can disable
-                // physicals again. One delayed re-assert after reclaim persists as
-                // a user-applied config. One shot, never a loop.
-                let verify = disabled.clone();
-                std::thread::Builder::new()
-                    .name("punktfunk-kwin-restore-verify".into())
-                    .spawn(move || {
-                        std::thread::sleep(STRAND_RECHECK_DELAY);
-                        reenable_pass(&verify, "post-teardown", true);
-                    })
-                    .ok();
-            }) as Box<dyn FnOnce() + Send>
-        });
-        // Keep the first restore. The registry drains this after every `create`, but
-        // a retry-loop create must not overwrite a held restore.
-        crate::backend::stash_topology_restore(&mut self.pending_restore, prepared);
+        self.apply_topology(mgmt.as_mut(), &name, &our_prefix, final_dims, &pre_enabled);
         let mut out = VirtualOutput::owned(
             node_id,
             Some((final_dims.0, final_dims.1, achieved_hz)),
@@ -560,6 +568,31 @@ fn union_restore(
         }
     }
     disabled
+}
+
+/// Re-enable `heads` (`(name, "WxH@Hz")`) in-process, `kscreen-doctor` if the compositor
+/// misses its budget, then read back: the names still disabled. A head KWin no longer lists is
+/// not dark. This runs under the monitor set with our output; when it goes, KWin applies the
+/// setup stored for the set without it, which can disable the heads again, so one delayed
+/// pass re-asserts them. One shot, never a loop.
+fn restore_heads(heads: &[(String, String)]) -> Result<Vec<String>> {
+    if !crate::kwin_output_mgmt::reenable_outputs(heads) {
+        reenable_outputs_kscreen(heads);
+    }
+    let verify = heads.to_vec();
+    std::thread::Builder::new()
+        .name("punktfunk-kwin-restore-verify".into())
+        .spawn(move || {
+            std::thread::sleep(STRAND_RECHECK_DELAY);
+            reenable_pass(&verify, "post-teardown", true);
+        })
+        .ok();
+    let now = crate::kwin_output_mgmt::list_monitors().context("read KWin's outputs back")?;
+    Ok(heads
+        .iter()
+        .filter(|(name, _)| now.iter().any(|m| &m.connector == name && !m.enabled))
+        .map(|(name, _)| name.clone())
+        .collect())
 }
 
 /// Re-enable outputs `exclusive` disabled, via `kscreen-doctor` — fallback when
@@ -1205,9 +1238,9 @@ fn a_managed_output_is_primary() -> bool {
 }
 
 /// Set our output primary and disable bootstrap/physicals so the managed group is the
-/// sole desktop. `ours` is the resolved kscreen address. Returns disabled outputs for
-/// teardown restore. On failure, streaming continues rather than failing the session.
-fn apply_virtual_primary(ours: &str) -> Vec<(String, String)> {
+/// sole desktop. `ours` is the resolved kscreen address. `journal` gets the outputs to
+/// disable before the disable. On failure, streaming continues rather than failing the session.
+fn apply_virtual_primary(ours: &str, mut journal: impl FnMut(&[(String, String)])) {
     let kscreen = |args: &[String]| kscreen_ok(args);
     // First-slot-wins: only grab primary if no managed member has it, so a second
     // exclusive session joins as a secondary instead of stealing the shell.
@@ -1238,23 +1271,22 @@ fn apply_virtual_primary(ours: &str) -> Vec<(String, String)> {
     if sole {
         args.push(format!("output.{ours}.position.0,0"));
     }
+    journal(&others);
     if args.is_empty() {
-        return others;
+        return;
     }
     if kscreen(&args) {
         tracing::info!(also_disabled = ?others, "KWin: streamed output set as the sole desktop");
     } else {
-        // Report the request, not success: the outputs may still be enabled. Return
-        // them for restore anyway — re-enabling a never-disabled output is a no-op,
-        // and dropping them here would strand a physical if the disable landed and
-        // only the ack was lost to the budget.
+        // Report the request, not success: the outputs may still be enabled. They stay
+        // journaled: re-enabling a lit output is a no-op, and a disable that landed with
+        // its ack lost to the budget would otherwise strand a physical.
         tracing::warn!(
             attempted_disable = ?others,
             "KWin: could not disable the other outputs for the exclusive topology (kscreen-doctor \
              failed or hit its budget) — the streamed output is not the sole desktop"
         );
     }
-    others
 }
 
 /// Make the streamed output primary but keep other outputs enabled. Nothing to restore.
