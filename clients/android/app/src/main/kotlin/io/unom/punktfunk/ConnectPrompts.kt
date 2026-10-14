@@ -24,6 +24,8 @@ import io.unom.punktfunk.models.PendingTrust
 internal fun ConnectPrompts(
     /** The client identity — the PIN ceremony needs it to run SPAKE2; null while it is still minting. */
     identity: ClientIdentity?,
+    /** Runs the PIN ceremony. */
+    services: HostServices,
     presets: List<StreamPreset>,
     isOnline: (KnownHost) -> Boolean,
     // ---- trust / pairing --------------------------------------------------------------------
@@ -87,7 +89,7 @@ internal fun ConnectPrompts(
             )
             PendingTrust.Kind.PAIR -> {
                 val onSavePaired = { fp: String -> onPaired(pt, fp) }
-                PairPinDialog(pt, identity, onSavePaired) { onPendingTrustChange(null) }
+                PairPinDialog(pt, services, identity, onSavePaired) { onPendingTrustChange(null) }
             }
         }
     }

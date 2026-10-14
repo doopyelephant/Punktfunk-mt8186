@@ -80,7 +80,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil3.ImageLoader
 import io.unom.punktfunk.components.launcherIcon
-import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.link.DeepLinks
 import io.unom.punktfunk.kit.library.Download
 import io.unom.punktfunk.kit.library.GameEntry
@@ -236,6 +235,7 @@ fun LibraryScreen(
     }
     val streamSettings = remember(settings, preset) { settings.effectiveFor(preset) }
     val knownHostStore = remember { KnownHostStore(context) }
+    val services = remember { HostServices(knownHostStore, JniHostNative(context)) }
     // The profile picker a launch waits on.
     var profileAsk by remember { mutableStateOf<ProfileAsk?>(null) }
     profileAsk?.let { ask ->
@@ -267,11 +267,9 @@ fun LibraryScreen(
         "${host.name} — Library"
     }
 
-    // Dial the host over the same pinned mTLS trust, booting straight into this title (the host
-    // resolves `launch` = its library id). Shared by both presentations: a tap on a grid tile and A
-    // on a centred cover are the same act, and a launch that behaved differently between them would
-    // be a bug nobody could see until they switched input device. [link] names the profile to
-    // play as; [redial] marks the one dial a [ProfileRetry] grants.
+    // Dial through [HostServices.dial] on the pinned trust, booting straight into this title (the
+    // host resolves `launch` = its library id). A grid tap and A on a centred cover share this one
+    // launch. [link] names the profile to play as; [redial] marks the one dial [ProfileRetry] grants.
     fun launch(identity: ClientIdentity, game: GameEntry, link: String? = null, redial: Boolean = false) {
         if (launching) return
         launching = true
@@ -297,18 +295,18 @@ fun LibraryScreen(
                 }
                 return@launch
             }
-            val handle = connectToHost(
-                context, streamSettings, identity,
-                host.address, host.port, host.fpHex,
+            val spec = DialSpec(
+                streamSettings, identity, host.address, host.port, host.fpHex,
                 launch = game.id.takeUnless { game.isDesktop },
                 dialer = "touch/library",
                 preset = preset,
                 profile = choice.id,
             )
+            val dialed = services.dial(spec, host, host.name)
             launching = false
-            if (handle != 0L) {
+            if (dialed is HostServices.Connected) {
                 onLaunched(
-                    SessionFactory.afterDial(handle, host, streamSettings, preset, knownHostStore).copy(
+                    dialed.session.copy(
                         // Where to come back to when this game exits — this shelf, pin and all,
                         // not the host's default one.
                         launchedFromLibrary = true,
@@ -323,8 +321,8 @@ fun LibraryScreen(
                         },
                     ),
                 )
-            } else {
-                val token = NativeBridge.nativeTakeLastError()
+            } else if (dialed is HostServices.Failed) {
+                val token = dialed.token
                 if (ProfileRetry.afterRefusal(token, host, choice, redial, knownHostStore) { h, p ->
                         stillListed(identity, h, p)
                     }

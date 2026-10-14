@@ -22,10 +22,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.withStarted
-import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
-import io.unom.punktfunk.kit.discovery.Presence
-import io.unom.punktfunk.kit.discovery.PresenceTracker
 import io.unom.punktfunk.kit.link.DeepLinks
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.models.ActiveSession
@@ -149,10 +146,9 @@ fun ConnectScreen(
         if (learned) ctl.refreshHosts()
     }
     // The probe sweep behind [ConnectController.reachable]. An mDNS advert is not proof of life: a
-    // suspending host sends no goodbye, and its cache entry lives 75 minutes. [Presence] probes
-    // every saved host at its live and saved address every ~12 s, and at once on a network change;
-    // gated on LNP, since blocked UDP would only time out.
-    val presence = remember { PresenceTracker() }
+    // suspending host sends no goodbye, and its cache entry lives 75 minutes. [HostServices.sweep]
+    // probes every saved host at its live and saved address every ~12 s, and at once on a network
+    // change; gated on LNP, since blocked UDP would only time out.
     var networkGen by remember { mutableIntStateOf(0) }
     DisposableEffect(Unit) {
         val onNetwork: () -> Unit = { networkGen++ }
@@ -169,20 +165,13 @@ fun ConnectScreen(
         while (true) {
             appLifecycle?.withStarted {}
             val saved = ctl.savedHosts
-            val up = withContext(Dispatchers.IO) {
-                Presence.sweep(
-                    saved,
-                    liveFor = { kh -> ctl.discovered.firstOrNull { kh.matches(it) } },
-                    probe = { addr, port -> NativeBridge.nativeProbe(addr, port, Presence.PROBE_MS) },
-                )
+            val swept = withContext(Dispatchers.IO) {
+                ctl.services.sweep(saved) { kh -> ctl.discovered.firstOrNull { kh.matches(it) } }
             }
-            ctl.reachable = presence.apply(saved.map { it.id }.toSet(), up.keys)
-            // A pinned host that answered somewhere else has moved: follow it, so the dial and
-            // the library fetch go where it lives. The list refresh restarts this loop.
-            val moved = withContext(Dispatchers.IO) {
-                saved.any { kh -> up[kh.id]?.let { knownHostStore.learnAddress(kh.fpHex, it.address, it.port) } == true }
-            }
-            if (moved) {
+            ctl.reachable = swept.reachable
+            // A pinned host that answered somewhere else has moved, and the sweep followed it so
+            // the dial and the library fetch go where it lives. The list refresh restarts this loop.
+            if (swept.moved) {
                 ctl.refreshHosts()
                 return@LaunchedEffect
             }
@@ -251,7 +240,7 @@ fun ConnectScreen(
         ctl.connecting = true
         ctl.pauseBrowse() // a browse running through the burst would measure itself
         scope.launch {
-            runSpeedTest(context, id, entry.host.address, entry.host.port, entry.host.fpHex) { p ->
+            runSpeedTest(ctl.services, id, entry.host.address, entry.host.port, entry.host.fpHex) { p ->
                 // A dismissed dialog abandons the run; don't drag it back onto the screen.
                 if (speedTest != null) speedTestPhase = p
             }
@@ -458,6 +447,7 @@ fun ConnectScreen(
     // ConnectPrompts.kt. It decides nothing: each action below lands back in the controller.
     ConnectPrompts(
         identity = ctl.identity,
+        services = ctl.services,
         presets = presets,
         isOnline = { it.isOnline(ctl.reachable) },
         pendingTrust = ctl.pendingTrust,

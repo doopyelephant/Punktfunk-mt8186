@@ -81,7 +81,7 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
     val app = appContext ?: return
     val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
     val id = identity
-    val kh = knownHostStore.resolve(fp, addr, c.optInt("port"))
+    val kh = services.store.resolve(fp, addr, c.optInt("port"))
     if (refreshOnly) {
         // Silent path — no notice, but the failed load still gets its retry.
         if (id == null) { identities.blockedMessage(); return }
