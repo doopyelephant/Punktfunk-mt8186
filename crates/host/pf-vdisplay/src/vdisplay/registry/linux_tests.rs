@@ -2,13 +2,10 @@
 //!
 //! The pool, its linger timer and the policy store are process globals, and the linger
 //! comes from the environment. Every test therefore runs its body in a child of this test
-//! binary ([`in_child`]): an unconfigured host with an empty config dir.
+//! binary ([`in_child`]): an unconfigured host with an empty scratch home.
 //!
 //! A test asserts the backend calls in order, read off the fake's log, and the pooled
 //! display's `lifecycle::State`.
-
-use std::path::Path;
-use std::process::Command;
 
 use super::*;
 use crate::fake::{Call, FakeDisplay};
@@ -25,47 +22,12 @@ const SMALL: Mode = Mode {
     refresh_hz: 60,
 };
 
-/// Set on the child only: the scratch dir that is its config dir.
-const CHILD_DIR: &str = "PF_REGISTRY_TEST_DIR";
 /// For a child whose released displays must stay kept for the length of the test.
 const KEPT: &[(&str, &str)] = &[("PUNKTFUNK_MONITOR_LINGER_MS", "60000")];
 
-/// Run `body` in a child of this test binary and pass when it does. `test` is the
-/// calling test's name. The child is an unconfigured host: an empty config dir and
-/// no inherited `PUNKTFUNK_*`, then `env`.
+/// [`crate::fake::in_child`] for this module.
 fn in_child(test: &str, env: &[(&str, &str)], body: fn()) {
-    if let Some(dir) = std::env::var_os(CHILD_DIR) {
-        body();
-        // The body's last act. A filter that matched no test would exit 0 without it.
-        std::fs::write(Path::new(&dir).join("ran"), "").expect("mark the run");
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("pf-registry-{test}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("scratch dir");
-    let module = module_path!().split_once("::").expect("crate::module").1;
-    let mut child = Command::new(std::env::current_exe().expect("this test binary"));
-    let test = format!("{module}::{test}");
-    child.args(["--exact", &test, "--include-ignored", "--nocapture"]);
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("PUNKTFUNK_") {
-            child.env_remove(key);
-        }
-    }
-    let child = child
-        .env(CHILD_DIR, &dir)
-        .env("PUNKTFUNK_CONFIG_DIR", &dir)
-        .envs(env.iter().copied())
-        .output()
-        .expect("run the child");
-    let ran = dir.join("ran").exists();
-    std::fs::remove_dir_all(&dir).ok();
-    assert!(
-        child.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&child.stdout),
-        String::from_utf8_lossy(&child.stderr)
-    );
-    assert!(ran, "the child ran no test");
+    crate::fake::in_child(module_path!(), test, env, body)
 }
 
 fn acquire(fake: &FakeDisplay, mode: Mode, quit_now: bool) -> VirtualOutput {

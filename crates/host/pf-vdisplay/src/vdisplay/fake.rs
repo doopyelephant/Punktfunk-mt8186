@@ -9,6 +9,8 @@
 //! share one log and one script, so box one for the code under test and keep the other.
 //! `take_undo_seqs` answers empty and is not logged: it would only pad every acquire.
 //!
+//! [`in_child`] runs a test body in a child of the test binary, for code on process globals.
+//!
 //! Pin the contract with the tests below.
 
 use std::sync::{Arc, Mutex};
@@ -295,6 +297,56 @@ impl VirtualDisplay for FakeDisplay {
         self.log(Call::ResizeKept(seat.map(str::to_string), mode));
         self.answer(|s| s.resizes)
     }
+}
+
+/// Set on the child only: the scratch dir that is its config, state, runtime dir and home.
+const CHILD_DIR: &str = "PF_VDISPLAY_TEST_DIR";
+
+/// Run `body` in a child of this test binary and pass when it does. `module` is the caller's
+/// `module_path!()`, `test` its name. The child is an unconfigured host on a box of its own: one
+/// empty scratch dir for config, state, runtime dir and home, no inherited `PUNKTFUNK_*`, then
+/// `env`. Nothing it writes or `systemctl --user` reaches the box's.
+pub(crate) fn in_child(module: &str, test: &str, env: &[(&str, &str)], body: fn()) {
+    if let Some(dir) = std::env::var_os(CHILD_DIR) {
+        body();
+        // The body's last act. A filter that matched no test would exit 0 without it.
+        std::fs::write(std::path::Path::new(&dir).join("ran"), "").expect("mark the run");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("pf-vdisplay-{test}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let module = module.split_once("::").expect("crate::module").1;
+    let mut child = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+    let test = format!("{module}::{test}");
+    child.args(["--exact", &test, "--include-ignored", "--nocapture"]);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("PUNKTFUNK_") {
+            child.env_remove(key);
+        }
+    }
+    for var in [
+        CHILD_DIR,
+        "PUNKTFUNK_CONFIG_DIR",
+        "XDG_STATE_HOME",
+        "XDG_RUNTIME_DIR",
+        "HOME",
+    ] {
+        child.env(var, &dir);
+    }
+    let child = child
+        .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        .envs(env.iter().copied())
+        .output()
+        .expect("run the child");
+    let ran = dir.join("ran").exists();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        child.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert!(ran, "the child ran no test");
 }
 
 #[cfg(test)]

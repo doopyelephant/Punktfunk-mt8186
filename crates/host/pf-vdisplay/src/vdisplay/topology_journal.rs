@@ -58,6 +58,8 @@ pub struct Head {
     pub mode: Option<String>,
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use linux::crash;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::{apply, done, push, reclaim};
 
@@ -206,6 +208,21 @@ mod linux {
             return;
         }
         with(|j| j.apply(seqs, backend))
+    }
+
+    /// Test: this process's file becomes one a dead host left, and the next push opens a fresh
+    /// one, as a host started after a crash does.
+    #[cfg(test)]
+    pub(crate) fn crash() {
+        let mut slot = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut j) = slot.take() else {
+            return;
+        };
+        let _ = std::fs::remove_file(&j.path);
+        j.doc.owner.boot_id = "a boot that is over".to_string();
+        j.doc.owner.start = 0;
+        j.path = dir().join(j.doc.owner.file_name());
+        j.persist();
     }
 
     /// Take back what dead hosts left: every file in the dir whose owner is gone, newest entry

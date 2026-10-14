@@ -1834,6 +1834,280 @@ mod tests {
         assert!(!sentinel_advanced(Baseline::At(t0), None));
     }
 
+    /// The hand-back's own table: each trigger in each phase.
+    #[test]
+    fn the_hand_back_follows_its_table() {
+        use HandBack::{Due, Idle, Running};
+        let now = Instant::now();
+        let at = now + Duration::from_secs(5);
+        let later = now + Duration::from_secs(30);
+        // Last session out: hand back at `at`, or keep the box (keep-alive forever).
+        let mut h = Idle;
+        h.schedule(Some(at));
+        assert_eq!(h, Due(at));
+        let mut h = Idle;
+        h.schedule(None);
+        assert_eq!(h, Idle);
+        // A client returns before `at`; one with nothing pending changes nothing.
+        let mut h = Due(at);
+        assert_eq!(h.cancel(), Cancel::Cancelled);
+        assert_eq!(h, Idle);
+        assert_eq!(h.cancel(), Cancel::Nothing);
+        // The worker's tick: nothing before `at`, then it runs.
+        let mut h = Due(at);
+        assert!(!h.pop(now));
+        assert!(h.pop(at));
+        assert_eq!(h, Running { then: None });
+        // While it runs a connect waits, and a new deadline waits its turn: never two at once.
+        assert_eq!(h.cancel(), Cancel::Wait);
+        h.schedule(Some(later));
+        assert_eq!(h, Running { then: Some(later) });
+        assert!(!h.pop(later));
+        // SteamOS with no panel, or a disconnect meanwhile: due again once it ends.
+        h.finish();
+        assert_eq!(h, Due(later));
+        let mut h = Running { then: Some(at) };
+        h.schedule(None);
+        h.finish();
+        assert_eq!(h, Idle, "keep-alive forever drops the follow-up");
+        // Console Release: due now.
+        let mut h = Idle;
+        h.schedule(Some(now));
+        assert!(h.pop(now));
+        // What the console shows.
+        assert_eq!(Due(at).due_in(now), Some(Duration::from_secs(5)));
+        assert_eq!(
+            Running { then: Some(at) }.due_in(now),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(Running { then: None }.due_in(now), None);
+        assert_eq!(Idle.due_in(now), None);
+    }
+
+    /// What each state of the table gets back from the session-plus hand-back. SteamOS has its
+    /// own branch, and SCREEN_* and the bind settle themselves, so neither is in the plan.
+    #[test]
+    fn each_state_hands_back_what_it_took() {
+        let unit = "gamescope-session-plus@steam.service";
+        let plan = |steps: &[TakeoverStep]| hand_back_plan(steps);
+        let units_only = HandBackPlan {
+            session: false,
+            units: vec![unit.into()],
+            dm: None,
+        };
+        assert_eq!(plan(&[units(&[unit])]), units_only, "spawn, Freed");
+        assert_eq!(
+            plan(&[units(&[unit]), TakeoverStep::StopSession]),
+            HandBackPlan {
+                session: true,
+                ..units_only
+            },
+            "managed, Running"
+        );
+        assert_eq!(
+            plan(&[TakeoverStep::StopSession]),
+            HandBackPlan {
+                session: true,
+                ..HandBackPlan::default()
+            },
+            "managed on a box whose Game Mode was down"
+        );
+        let remoded = [
+            TakeoverStep::UnsetScreenEnv,
+            TakeoverStep::RemoveSessionDropin,
+        ];
+        assert_eq!(plan(&remoded), HandBackPlan::default(), "attach, Remoded");
+        assert_eq!(
+            plan(&[TakeoverStep::RestoreSteamos]),
+            HandBackPlan::default(),
+            "SteamOS"
+        );
+        let dm = TakeoverStep::StartDisplayManager {
+            unit: "sddm.service".into(),
+        };
+        assert_eq!(
+            plan(&[units(&[unit]), dm]).dm.as_deref(),
+            Some("sddm.service"),
+            "an older host's DM stop: the DM comes back, its autologin brings the units"
+        );
+        assert_eq!(
+            plan(&[units(&["a", "b"]), units(&["b", "c"])]).units,
+            ["a", "b", "c"],
+            "adopted beside our own, each unit restarts once"
+        );
+    }
+
+    fn sorted(steps: impl IntoIterator<Item = TakeoverStep>) -> Vec<String> {
+        let mut v: Vec<String> = steps.into_iter().map(|s| format!("{s:?}")).collect();
+        v.sort();
+        v
+    }
+
+    fn journal_files() -> usize {
+        std::fs::read_dir(pf_paths::state_dir().join("topology-journal")).map_or(0, |d| d.count())
+    }
+
+    const UNIT: &str = "gamescope-session-plus@steam.service";
+
+    /// A takeover state as the live code leaves it: the steps it took, in its order.
+    type Took = fn(&mut Takeover);
+
+    /// A host killed in each state of the table, then started again: the next one owes exactly
+    /// what the dead one did, hands it back after the grace, and sweeps the drop-ins it does not
+    /// owe. Runs in a child: the takeover and the journal are process globals.
+    #[test]
+    fn a_crash_in_every_state_is_handed_back_by_the_next_host() {
+        let name = "a_crash_in_every_state_is_handed_back_by_the_next_host";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            let rows: [(&str, Took, Vec<TakeoverStep>); 9] = [
+                ("Free", |_| {}, vec![]),
+                (
+                    "spawn, Freed",
+                    |t| t.owe_units(vec![UNIT.into()]),
+                    vec![units(&[UNIT])],
+                ),
+                (
+                    "managed, Running",
+                    |t| {
+                        t.owe_units(vec![UNIT.into()]);
+                        t.owe_once(TakeoverStep::StopSession);
+                    },
+                    vec![units(&[UNIT]), TakeoverStep::StopSession],
+                ),
+                (
+                    "managed on a box whose Game Mode was down",
+                    |t| {
+                        t.owe_once(TakeoverStep::StopSession);
+                    },
+                    vec![TakeoverStep::StopSession],
+                ),
+                (
+                    "SteamOS, Running",
+                    |t| {
+                        t.owe_once(TakeoverStep::RestoreSteamos);
+                    },
+                    vec![TakeoverStep::RestoreSteamos],
+                ),
+                (
+                    "attach, Remoded: the startup sweep removes the bind",
+                    |t| {
+                        t.owe_once(TakeoverStep::UnsetScreenEnv);
+                        t.owe_once(TakeoverStep::RemoveSessionDropin);
+                    },
+                    vec![TakeoverStep::UnsetScreenEnv],
+                ),
+                (
+                    "SwitchHonored with SCREEN_* still owed",
+                    |t| {
+                        t.owe_units(vec![UNIT.into()]);
+                        t.owe_once(TakeoverStep::StopSession);
+                        t.owe_once(TakeoverStep::UnsetScreenEnv);
+                        t.owe_units(Vec::new());
+                        t.settle(|s| matches!(s, TakeoverStep::StopSession));
+                    },
+                    vec![TakeoverStep::UnsetScreenEnv],
+                ),
+                (
+                    "HandingBack: taken, its restarts not yet issued",
+                    |t| {
+                        t.owe_units(vec![UNIT.into()]);
+                        t.owe_once(TakeoverStep::StopSession);
+                        drop(t.take(|_| true));
+                    },
+                    vec![units(&[UNIT]), TakeoverStep::StopSession],
+                ),
+                (
+                    "a takeover from another boot",
+                    |_| {
+                        journal::push(
+                            "gamescope",
+                            journal::Undo::Takeover {
+                                boot: "a boot that is over".into(),
+                                step: units(&[UNIT]),
+                            },
+                        );
+                    },
+                    vec![],
+                ),
+            ];
+            for (state, took, want) in rows {
+                took(&mut takeover());
+                journal::crash();
+                *takeover() = Takeover::EMPTY;
+                for path in [steamos_dropin_path(), session_plus_dropin_path()] {
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(&path, "[Service]\n").unwrap();
+                }
+                let before = Instant::now();
+                journal::reclaim(&crate::backend_by_id);
+                restore_takeover_on_startup();
+
+                let t = takeover();
+                assert_eq!(
+                    sorted(t.owed.iter().map(|o| o.step.clone())),
+                    sorted(want.clone()),
+                    "{state}"
+                );
+                match t.hand_back {
+                    HandBack::Due(at) => assert!(
+                        !want.is_empty() && at > before && at <= Instant::now() + ADOPT_GRACE,
+                        "{state}"
+                    ),
+                    other => assert!(
+                        want.is_empty() && other == HandBack::Idle,
+                        "{state}: {other:?}"
+                    ),
+                }
+                assert_eq!(
+                    journal_files(),
+                    usize::from(!want.is_empty()),
+                    "{state}: the dead file goes"
+                );
+                let steamos = want.contains(&TakeoverStep::RestoreSteamos);
+                assert_eq!(steamos_dropin_path().exists(), steamos, "{state}");
+                assert!(!session_plus_dropin_path().exists(), "{state}");
+                drop(t);
+                takeover().settle(|_| true);
+                *takeover() = Takeover::EMPTY;
+                let _ = std::fs::remove_file(steamos_dropin_path());
+            }
+
+            // An older host's runtime-dir record: its steps, its masks, and the file goes.
+            let record = format!(
+                r#"{{"stopped_autologin":["{UNIT}"],"steamos":false,"managed_session":true,"forced_screen_env":true}}"#
+            );
+            std::fs::write(legacy_record_path(), record).unwrap();
+            restore_takeover_on_startup();
+            {
+                let t = takeover();
+                let want = [
+                    units(&[UNIT]),
+                    TakeoverStep::StopSession,
+                    TakeoverStep::UnsetScreenEnv,
+                ];
+                assert_eq!(sorted(t.owed.iter().map(|o| o.step.clone())), sorted(want));
+                assert!(t.autologin_masked);
+                assert!(matches!(t.hand_back, HandBack::Due(_)));
+            }
+            assert!(!legacy_record_path().exists());
+            takeover().settle(|_| true);
+            *takeover() = Takeover::EMPTY;
+
+            // A host mid-takeover adopts a dead one's steps beside its own; its hand-back stays.
+            takeover().owe_units(vec![UNIT.into()]);
+            journal::crash();
+            *takeover() = Takeover::EMPTY;
+            takeover().owe_once(TakeoverStep::UnsetScreenEnv);
+            journal::reclaim(&crate::backend_by_id);
+            let t = takeover();
+            assert_eq!(
+                sorted(t.owed.iter().map(|o| o.step.clone())),
+                sorted([units(&[UNIT]), TakeoverStep::UnsetScreenEnv])
+            );
+            assert_eq!(t.hand_back, HandBack::Idle);
+        });
+    }
+
     /// `--plain` ACTIVE is the third column. Wrong column is silent both ways.
     #[test]
     fn listed_units_take_the_active_column_not_the_load_column() {

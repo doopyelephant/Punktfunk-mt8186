@@ -66,7 +66,7 @@ pub(super) fn write_headless_shim() -> Result<std::path::PathBuf> {
 
 /// `zz-` sorts last, overriding any distro drop-in. Runtime dir, like the bind drop-in: a host that
 /// dies mid-takeover must not leave the panel's Game Mode headless past a reboot.
-fn steamos_dropin_path() -> std::path::PathBuf {
+pub(super) fn steamos_dropin_path() -> std::path::PathBuf {
     let base = crate::session::runtime_dir();
     std::path::Path::new(&base)
         .join("systemd/user/gamescope-session.service.d/zz-punktfunk-headless.conf")
@@ -142,7 +142,7 @@ pub(super) fn remove_steamos_dropin() -> bool {
 /// Autologin-unit bind drop-in. Must live in `$XDG_RUNTIME_DIR`, not `$HOME`: it applies to the
 /// whole `gamescope-session-plus@` template, and both paths it names are tmpfs. A `$HOME` copy
 /// survives a reboot that deletes its sources, and a missing bind source fails Game Mode outright.
-fn session_plus_dropin_path() -> std::path::PathBuf {
+pub(super) fn session_plus_dropin_path() -> std::path::PathBuf {
     let base = crate::session::runtime_dir();
     std::path::Path::new(&base)
         .join("systemd/user/gamescope-session-plus@.service.d/zz-punktfunk-bind.conf")
