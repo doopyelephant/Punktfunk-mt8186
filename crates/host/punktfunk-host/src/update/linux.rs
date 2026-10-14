@@ -15,8 +15,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// Root helper outcome. Same shape as `pf-update`'s `HelperResult`.
-const HELPER_RESULT: &str = "/var/lib/punktfunk/update-result.json";
+/// Root helper outcome, in the update unit's `StateDirectory=`, which only root writes. Same
+/// shape as `pf-update`'s `HelperResult`.
+const HELPER_RESULT: &str = "/var/lib/punktfunk-update/update-result.json";
 
 /// Unit the polkit rule scopes to. Presence means the helper is installed.
 const UNIT_PATH: &str = "/usr/lib/systemd/system/punktfunk-update.service";

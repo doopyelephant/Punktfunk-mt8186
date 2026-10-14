@@ -19,12 +19,12 @@
 
 use super::accounts::Passwd;
 use super::shared::{self, make_dir};
-use super::{err, run};
+use super::{err, run, safe_open};
 use crate::backend::BackendError;
 use crate::model::SeatId;
 use crate::steam;
 use std::collections::HashSet;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -77,17 +77,17 @@ pub(super) struct Shares {
     pub libraries: Vec<Library>,
 }
 
-fn libraries_dir(box_dir: &Path, id: &SeatId) -> PathBuf {
-    shared::seat_dir(box_dir, id).join("libraries")
+fn libraries_dir(state: &Path, id: &SeatId) -> PathBuf {
+    shared::seat_dir(state, id).join("libraries")
 }
 
 /// The library as the seat's Steam lists it.
-fn root_dir(box_dir: &Path, id: &SeatId, key: &str) -> PathBuf {
-    libraries_dir(box_dir, id).join(key)
+fn root_dir(state: &Path, id: &SeatId, key: &str) -> PathBuf {
+    libraries_dir(state, id).join(key)
 }
 
-fn private_dir(box_dir: &Path, id: &SeatId, key: &str) -> PathBuf {
-    shared::seat_dir(box_dir, id).join("private").join(key)
+fn private_dir(state: &Path, id: &SeatId, key: &str) -> PathBuf {
+    shared::seat_dir(state, id).join("private").join(key)
 }
 
 fn stage_dir(id: &SeatId, key: &str) -> PathBuf {
@@ -225,10 +225,11 @@ fn spots(steamapps: &Path) -> Vec<Spot> {
 /// wrote none or the file is unreadable.
 fn writable(box_dir: &Path) -> bool {
     let read = || -> std::io::Result<Option<bool>> {
-        let Some((file, _)) = shared::open_regular(&box_dir.join(DEFAULTS))? else {
+        let path = box_dir.join(DEFAULTS);
+        let Some((bytes, _)) = safe_open::read(&path, shared::MAX_TRUST_BYTES)? else {
             return Ok(None);
         };
-        let defaults: serde_json::Value = serde_json::from_reader(file)?;
+        let defaults: serde_json::Value = serde_json::from_slice(&bytes)?;
         Ok(defaults["library_writable"].as_bool())
     };
     read()
@@ -249,12 +250,13 @@ fn fstype(path: &Path) -> Option<String> {
     Some(found.ok()?.trim().to_owned())
 }
 
-/// The libraries of the owner's Steam at `steam_root` for seat `seat`, their folders in place,
-/// read-only when the box says so. `None` when there is nothing to show: no such Steam, one that
-/// is root's or the seat's, or no list. Root's is never mapped: a seat would own every root file
-/// in the library.
+/// The libraries of the owner's Steam at `steam_root` for seat `seat`, their folders in place
+/// under `state`, read-only when the box's defaults in `box_dir` say so. `None` when there is
+/// nothing to show: no such Steam, one that is root's or the seat's, or no list. Root's is never
+/// mapped: a seat would own every root file in the library.
 pub(super) fn share(
     box_dir: &Path,
+    state: &Path,
     id: &SeatId,
     seat: &Passwd,
     steam_root: Option<&Path>,
@@ -274,12 +276,8 @@ pub(super) fn share(
         return None;
     };
     let list = steam_root.join("steamapps").join(LIST);
-    let vdf = match shared::open_regular(&list) {
-        Ok(Some((mut file, _))) => {
-            let mut text = String::new();
-            file.read_to_string(&mut text).ok()?;
-            text
-        }
+    let vdf = match safe_open::read(&list, MAX_LIST_BYTES) {
+        Ok(Some((bytes, _))) => String::from_utf8(bytes).ok()?,
         Ok(None) => return None,
         Err(error) => {
             tracing::warn!(%error, "owner's steam library list unreadable");
@@ -295,7 +293,7 @@ pub(super) fn share(
             }
             library
         })
-        .filter(|library| match prepare(box_dir, id, seat, owner, library) {
+        .filter(|library| match prepare(state, id, seat, owner, library) {
             Ok(()) => true,
             Err(error) => {
                 let library = library.steamapps.display();
@@ -318,7 +316,7 @@ pub(super) fn share(
 /// the unit starts: a missing one fails it with `226/NAMESPACE`, and none can be made inside the
 /// idmapped mount, where root has no id.
 fn prepare(
-    box_dir: &Path,
+    state: &Path,
     id: &SeatId,
     seat: &Passwd,
     owner: (u32, u32),
@@ -346,8 +344,8 @@ fn prepare(
         args.extend(missing.iter().map(String::as_str));
         run("library_dirs", "setpriv", &args)?;
     }
-    make_dir(&libraries_dir(box_dir, id), 0o711).map_err(|e| io("create the libraries", e))?;
-    let root = root_dir(box_dir, id, &library.key);
+    make_dir(&libraries_dir(state, id), 0o711).map_err(|e| io("create the libraries", e))?;
+    let root = root_dir(state, id, &library.key);
     let mount_point = root.join("steamapps");
     std::fs::create_dir_all(&root).map_err(|e| io("create the library", e))?;
     // The mount point is made while the folder is root's alone; the sticky bit then keeps the
@@ -371,8 +369,8 @@ fn prepare(
         .map_err(|e| io("own the library", e))?;
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o1770))
         .map_err(|e| io("open the library to the seat", e))?;
-    let private = private_dir(box_dir, id, &library.key);
-    make_dir(&shared::seat_dir(box_dir, id).join("private"), 0o711)
+    let private = private_dir(state, id, &library.key);
+    make_dir(&shared::seat_dir(state, id).join("private"), 0o711)
         .and_then(|()| make_dir(&private, 0o711))
         .map_err(|e| io("create the private folders", e))?;
     for name in PRIVATE {
@@ -412,14 +410,14 @@ fn make_spots(private: &Path, spots: &[Spot], seat: &Passwd) -> std::io::Result<
 /// unit starts, read-only if the box says so, and unmount it after; hide its own path, bind the
 /// stage, the seat's private folders and its spots' copies over it, and keep the owner's library
 /// list there read-only. A mount that fails leaves the seat an empty library, not a failed start.
-pub(super) fn unit_lines(box_dir: &Path, id: &SeatId, shares: &Shares) -> String {
+pub(super) fn unit_lines(state: &Path, id: &SeatId, shares: &Shares) -> String {
     let host = format!("{} -t 1 -m --", shares.nsenter.display());
     let ro = if shares.read_only { "ro," } else { "" };
     let mut out = String::new();
     for library in &shares.libraries {
         let stage = stage_dir(id, &library.key);
-        let target = root_dir(box_dir, id, &library.key).join("steamapps");
-        let private = private_dir(box_dir, id, &library.key);
+        let target = root_dir(state, id, &library.key).join("steamapps");
+        let private = private_dir(state, id, &library.key);
         let (stage, owner) = (stage.display(), library.steamapps.display());
         out.push_str(&format!(
             "ExecStartPre=-+{host} {} --bind -o \"{ro}nosuid,nodev,X-mount.idmap={}\" \"{owner}\" {stage}\n\
@@ -458,11 +456,11 @@ pub(super) fn unit_lines(box_dir: &Path, id: &SeatId, shares: &Shares) -> String
 /// Lists `libraries` in the seat's Steam and drops the ones it no longer has, and any folder
 /// under `/run/media`, which a seat never sees. Steam's own entries stay as written. Never fails
 /// the start: an unlisted library is one the seat's Steam doesn't offer.
-pub(super) fn register(box_dir: &Path, id: &SeatId, seat: &Passwd, libraries: &[Library]) {
-    let ours = libraries_dir(box_dir, id);
+pub(super) fn register(state: &Path, id: &SeatId, seat: &Passwd, libraries: &[Library]) {
+    let ours = libraries_dir(state, id);
     let wanted: Vec<String> = libraries
         .iter()
-        .map(|l| root_dir(box_dir, id, &l.key).to_string_lossy().into_owned())
+        .map(|l| root_dir(state, id, &l.key).to_string_lossy().into_owned())
         .collect();
     let managed =
         |path: &str| Path::new(path).starts_with(&ours) || path.starts_with("/run/media/");
@@ -476,53 +474,37 @@ pub(super) fn register(box_dir: &Path, id: &SeatId, seat: &Passwd, libraries: &[
 }
 
 /// Rewrites `.local/share/Steam/<dir>/libraryfolders.vdf` under `home` through `merge`. Root
-/// writes in a tree the seat user owns, so no link on the way is followed, and the new file is
-/// the seat's. An absent file stays absent: Steam writes its own on first run.
-fn merge_list(
+/// writes in a tree the seat user owns, so it goes through [`safe_open`]: no link on the way is
+/// followed, a FIFO there doesn't block, and the new file is the seat's. An absent file stays
+/// absent: Steam writes its own on first run.
+pub(super) fn merge_list(
     home: &Path,
     dir: &str,
     seat: &Passwd,
     merge: impl Fn(&str) -> Option<String>,
 ) -> std::io::Result<()> {
-    use rustix::fs::{Mode, OFlags};
-    let open = |at: &OwnedFd, name: &str, flags: OFlags| {
-        let flags = flags | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        match rustix::fs::openat(at, name, flags, Mode::empty()) {
-            Ok(fd) => Ok(Some(fd)),
-            Err(e) if e == rustix::io::Errno::NOENT => Ok(None),
-            Err(e) => Err(std::io::Error::from(e)),
-        }
+    let path = [".local", "share", "Steam", dir];
+    let Some(at) = safe_open::walk(safe_open::dir(home)?, &path)? else {
+        return Ok(());
     };
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let mut at = rustix::fs::open(home, flags, Mode::empty())?;
-    for name in [".local", "share", "Steam", dir] {
-        match open(&at, name, OFlags::DIRECTORY)? {
-            Some(next) => at = next,
-            None => return Ok(()),
-        }
-    }
-    match open(&at, LIST, OFlags::empty())? {
-        Some(file) => rewrite(&at, std::fs::File::from(file), seat, merge),
+    match safe_open::read_at(&at, LIST, MAX_LIST_BYTES)? {
+        Some((bytes, meta)) => rewrite(&at, &bytes, &meta, seat, merge),
         None => Ok(()),
     }
 }
 
 fn rewrite(
     dir: &OwnedFd,
-    mut file: std::fs::File,
+    bytes: &[u8],
+    meta: &std::fs::Metadata,
     seat: &Passwd,
     merge: impl Fn(&str) -> Option<String>,
 ) -> std::io::Result<()> {
     use rustix::fs::{AtFlags, Mode, OFlags};
     let invalid =
         |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_owned());
-    let meta = file.metadata()?;
-    if !meta.is_file() || meta.nlink() > 1 || meta.len() > MAX_LIST_BYTES {
-        return Err(invalid("not a plain single-link file within the size cap"));
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text)?;
-    let merged = merge(&text).ok_or_else(|| invalid("not a steam library list"))?;
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid("not text"))?;
+    let merged = merge(text).ok_or_else(|| invalid("not a steam library list"))?;
     if merged == text {
         return Ok(());
     }
@@ -736,9 +718,9 @@ mod tests {
                 dir: path.ends_with("var"),
             })
             .collect();
-        let box_dir = Path::new("/b");
-        let writable = unit_lines(box_dir, &id(), &shares(false, Vec::new()));
-        let read_only = unit_lines(box_dir, &id(), &shares(true, shares_spots));
+        let state = Path::new("/b");
+        let writable = unit_lines(state, &id(), &shares(false, Vec::new()));
+        let read_only = unit_lines(state, &id(), &shares(true, shares_spots));
         let seat = "/b/seats/0123456789abcdef0123456789abcdef";
         let mut binds = String::new();
         for spot in spots {
@@ -915,6 +897,32 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "\"libraryfolders\"\n{\n}\n"
+        );
+    }
+
+    /// A FIFO for a seat's library list or the box's Seat defaults answers at once.
+    #[test]
+    fn a_fifo_in_a_tree_root_reads_does_not_block() {
+        use super::super::safe_open::tests::{fifo, within};
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(steam_file(&home, "steamapps").parent().unwrap()).unwrap();
+        fifo(&steam_file(&home, "steamapps"));
+        let seat = me(temp.path());
+        let h = home.clone();
+        let merge = |_: &str| Some("changed".to_owned());
+        let merged = within(move || merge_list(&h, "steamapps", &seat, merge).is_ok());
+        assert_eq!(
+            merged,
+            Some(false),
+            "a library list FIFO is refused at once"
+        );
+        fifo(&temp.path().join(DEFAULTS));
+        let b = temp.path().to_path_buf();
+        assert_eq!(
+            within(move || writable(&b)),
+            Some(true),
+            "unreadable reads as writable"
         );
     }
 }

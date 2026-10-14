@@ -9,8 +9,9 @@
 //! upgrade every installed `punktfunk*` package; the verb picks which marker to read and
 //! which binary the post-install gate (`--version` must exit 0) runs.
 //!
-//! Result JSON is `/var/lib/punktfunk/{,client-}update-result.json` (root-written,
-//! world-readable). stdout/stderr go to the unit journal.
+//! Result JSON is root-written and world-readable: the host's in
+//! `/var/lib/punktfunk-update/`, the unit's `StateDirectory=`, the client's in
+//! `/var/lib/punktfunk/`. stdout/stderr go to the unit journal.
 //!
 //! Design: `host-update-from-web-console.md`.
 
@@ -51,7 +52,7 @@ mod linux_main {
 
         fn result_path(self) -> &'static str {
             match self {
-                Mode::Host => "/var/lib/punktfunk/update-result.json",
+                Mode::Host => "/var/lib/punktfunk-update/update-result.json",
                 Mode::Client => "/var/lib/punktfunk/client-update-result.json",
             }
         }
