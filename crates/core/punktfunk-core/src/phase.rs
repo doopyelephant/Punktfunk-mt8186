@@ -498,18 +498,18 @@ impl SlotIntervals {
 mod tests {
     use super::*;
 
-    const P: i64 = 8_333_333; // 120 Hz in ns
+    pub(super) const P: i64 = 8_333_333; // 120 Hz in ns
 
     /// Realtime PTS vs monotonic present clock. The loop is not told the offset.
-    const PTS0: u64 = 1_786_000_000_000_000_000;
-    const DOMAIN: i64 = -1_785_000_000_000_000_000;
+    pub(super) const PTS0: u64 = 1_786_000_000_000_000_000;
+    pub(super) const DOMAIN: i64 = -1_785_000_000_000_000_000;
     /// Transport + decode: `ready − pts` once the domain is taken out.
-    const DELAY: i64 = 12_000_000;
+    pub(super) const DELAY: i64 = 12_000_000;
 
     /// Deterministic LCG in ±spread around zero — no OS randomness in tests.
-    struct Lcg(u64);
+    pub(super) struct Lcg(pub(super) u64);
     impl Lcg {
-        fn noise(&mut self, spread_ns: i64) -> i64 {
+        pub(super) fn noise(&mut self, spread_ns: i64) -> i64 {
             self.0 = self
                 .0
                 .wrapping_mul(6364136223846793005)
@@ -521,7 +521,7 @@ mod tests {
         }
     }
 
-    fn pts_at(k: i64) -> u64 {
+    pub(super) fn pts_at(k: i64) -> u64 {
         (PTS0 as i64 + k * P) as u64
     }
 
@@ -1067,3 +1067,6 @@ mod slot_clock_tests {
         assert_eq!(SlotIntervals::default().judder_permille(), 0);
     }
 }
+
+#[cfg(test)]
+mod vectors;
