@@ -171,12 +171,12 @@ struct Enumerator {
 }
 
 impl Drop for Enumerator {
+    // The watcher holds its own `Arc<Watch>` and leaves within `POLL_MS` of the event. Never
+    // join it: at process exit Windows has already ended it, and `join` then panics inside COM
+    // `Release`, which cannot unwind — a fast-fail in the audio service or the game.
     fn drop(&mut self) {
         // SAFETY: the stop event is owned by `watch`, alive here.
         let _ = unsafe { SetEvent(HANDLE(self.watch.stop.as_raw_handle())) };
-        if let Some(watcher) = self.watcher.get_mut().ok().and_then(Option::take) {
-            let _ = watcher.join();
-        }
     }
 }
 
