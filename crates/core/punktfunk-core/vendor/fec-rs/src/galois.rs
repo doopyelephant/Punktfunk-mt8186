@@ -42,14 +42,8 @@ pub fn exp(a: u8, n: usize) -> u8 {
     EXP_TABLE[log_result]
 }
 
-/// Multiply each element of `input` by `c` and write to `out`.
-///
-/// Uses SIMD acceleration when available:
-/// - GFNI + AVX2 (best: single-instruction GF multiply on 32 bytes)
-/// - AVX2 VPSHUFB (split-table nibble lookup on 32 bytes)
-/// - GFNI + SSE (single-instruction GF multiply on 16 bytes)
-/// - SSSE3 VPSHUFB (split-table nibble lookup on 16 bytes)
-/// - Scalar fallback
+/// Multiply each element of `input` by `c` and write to `out`, on the best kernel this CPU
+/// has ([`detect_mul_slice`]).
 #[inline]
 pub fn mul_slice(c: u8, input: &[u8], out: &mut [u8]) {
     assert_eq!(input.len(), out.len());
@@ -61,41 +55,11 @@ pub fn mul_slice(c: u8, input: &[u8], out: &mut [u8]) {
         out.copy_from_slice(input);
         return;
     }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
-            unsafe {
-                mul_slice_gfni_avx2(c, input, out);
-            }
-            return;
-        }
-        if is_x86_feature_detected!("avx2") {
-            unsafe {
-                mul_slice_avx2(c, input, out);
-            }
-            return;
-        }
-        if is_x86_feature_detected!("gfni") {
-            unsafe {
-                mul_slice_gfni_sse(c, input, out);
-            }
-            return;
-        }
-        if is_x86_feature_detected!("ssse3") {
-            unsafe {
-                mul_slice_ssse3(c, input, out);
-            }
-            return;
-        }
-    }
-
-    mul_slice_scalar(c, input, out);
+    detect_mul_slice().0(c, input, out)
 }
 
-/// Multiply each element of `input` by `c` and XOR into `out`.
-///
-/// Uses SIMD acceleration when available (same priority as `mul_slice`).
+/// Multiply each element of `input` by `c` and XOR into `out`, on the best kernel this CPU
+/// has ([`detect_mul_slice`]).
 #[inline]
 pub fn mul_slice_xor(c: u8, input: &[u8], out: &mut [u8]) {
     assert_eq!(input.len(), out.len());
@@ -108,138 +72,35 @@ pub fn mul_slice_xor(c: u8, input: &[u8], out: &mut [u8]) {
         }
         return;
     }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
-            unsafe {
-                mul_slice_xor_gfni_avx2(c, input, out);
-            }
-            return;
-        }
-        if is_x86_feature_detected!("avx2") {
-            unsafe {
-                mul_slice_xor_avx2(c, input, out);
-            }
-            return;
-        }
-        if is_x86_feature_detected!("gfni") {
-            unsafe {
-                mul_slice_xor_gfni_sse(c, input, out);
-            }
-            return;
-        }
-        if is_x86_feature_detected!("ssse3") {
-            unsafe {
-                mul_slice_xor_ssse3(c, input, out);
-            }
-            return;
-        }
-    }
-
-    mul_slice_xor_scalar(c, input, out);
+    detect_mul_slice().1(c, input, out)
 }
 
 /// Function pointer types for bulk GF(2^8) operations.
 pub type MulSliceFn = fn(u8, &[u8], &mut [u8]);
 
-/// Pair of (mul_slice, mul_slice_xor) function pointers for the best available SIMD path.
+/// `(mul_slice, mul_slice_xor)` for the best instruction set this CPU has, in priority order:
+/// GFNI+AVX2, AVX2, GFNI+SSE, SSSE3, scalar.
 ///
-/// Unlike `mul_slice`/`mul_slice_xor`, these skip runtime feature detection on every call.
-/// The caller checks once and stores the result.
-///
-/// Note: These raw dispatch functions do NOT handle the c==0 or c==1 special cases.
-/// The caller must handle those before calling through the function pointer.
+/// Neither handles `c == 0` or `c == 1`; the caller does, as `mul_slice` and `mul_slice_xor`
+/// do. Each kernel's entry re-checks its feature (one cached load) before the instructions, so
+/// the pair stays sound as plain `fn`s whoever calls them.
 pub fn detect_mul_slice() -> (MulSliceFn, MulSliceFn) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
-            return (
-                wrap_mul_slice_gfni_avx2 as MulSliceFn,
-                wrap_mul_slice_xor_gfni_avx2 as MulSliceFn,
-            );
+            return (x86::gfni_avx2::<false>, x86::gfni_avx2::<true>);
         }
         if is_x86_feature_detected!("avx2") {
-            return (
-                wrap_mul_slice_avx2 as MulSliceFn,
-                wrap_mul_slice_xor_avx2 as MulSliceFn,
-            );
+            return (x86::avx2::<false>, x86::avx2::<true>);
         }
         if is_x86_feature_detected!("gfni") {
-            return (
-                wrap_mul_slice_gfni_sse as MulSliceFn,
-                wrap_mul_slice_xor_gfni_sse as MulSliceFn,
-            );
+            return (x86::gfni_sse::<false>, x86::gfni_sse::<true>);
         }
         if is_x86_feature_detected!("ssse3") {
-            return (
-                wrap_mul_slice_ssse3 as MulSliceFn,
-                wrap_mul_slice_xor_ssse3 as MulSliceFn,
-            );
+            return (x86::ssse3::<false>, x86::ssse3::<true>);
         }
     }
-    (
-        mul_slice_scalar as MulSliceFn,
-        mul_slice_xor_scalar as MulSliceFn,
-    )
-}
-
-// Safe wrappers for SIMD functions (used as function pointer targets)
-#[cfg(target_arch = "x86_64")]
-fn wrap_mul_slice_gfni_avx2(c: u8, input: &[u8], out: &mut [u8]) {
-    // The unsafe callee bounds every load AND store on input.len(); unequal
-    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
-    assert_eq!(input.len(), out.len());
-    unsafe { mul_slice_gfni_avx2(c, input, out) }
-}
-#[cfg(target_arch = "x86_64")]
-fn wrap_mul_slice_xor_gfni_avx2(c: u8, input: &[u8], out: &mut [u8]) {
-    // The unsafe callee bounds every load AND store on input.len(); unequal
-    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
-    assert_eq!(input.len(), out.len());
-    unsafe { mul_slice_xor_gfni_avx2(c, input, out) }
-}
-#[cfg(target_arch = "x86_64")]
-fn wrap_mul_slice_avx2(c: u8, input: &[u8], out: &mut [u8]) {
-    // The unsafe callee bounds every load AND store on input.len(); unequal
-    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
-    assert_eq!(input.len(), out.len());
-    unsafe { mul_slice_avx2(c, input, out) }
-}
-#[cfg(target_arch = "x86_64")]
-fn wrap_mul_slice_xor_avx2(c: u8, input: &[u8], out: &mut [u8]) {
-    // The unsafe callee bounds every load AND store on input.len(); unequal
-    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
-    assert_eq!(input.len(), out.len());
-    unsafe { mul_slice_xor_avx2(c, input, out) }
-}
-#[cfg(target_arch = "x86_64")]
-fn wrap_mul_slice_gfni_sse(c: u8, input: &[u8], out: &mut [u8]) {
-    // The unsafe callee bounds every load AND store on input.len(); unequal
-    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
-    assert_eq!(input.len(), out.len());
-    unsafe { mul_slice_gfni_sse(c, input, out) }
-}
-#[cfg(target_arch = "x86_64")]
-fn wrap_mul_slice_xor_gfni_sse(c: u8, input: &[u8], out: &mut [u8]) {
-    // The unsafe callee bounds every load AND store on input.len(); unequal
-    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
-    assert_eq!(input.len(), out.len());
-    unsafe { mul_slice_xor_gfni_sse(c, input, out) }
-}
-#[cfg(target_arch = "x86_64")]
-fn wrap_mul_slice_ssse3(c: u8, input: &[u8], out: &mut [u8]) {
-    // The unsafe callee bounds every load AND store on input.len(); unequal
-    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
-    assert_eq!(input.len(), out.len());
-    unsafe { mul_slice_ssse3(c, input, out) }
-}
-#[cfg(target_arch = "x86_64")]
-fn wrap_mul_slice_xor_ssse3(c: u8, input: &[u8], out: &mut [u8]) {
-    // The unsafe callee bounds every load AND store on input.len(); unequal
-    // lengths would write past `out`. Same invariant mul_slice/mul_slice_xor enforce.
-    assert_eq!(input.len(), out.len());
-    unsafe { mul_slice_xor_ssse3(c, input, out) }
+    (mul_slice_scalar, mul_slice_xor_scalar)
 }
 
 // ── Scalar fallback ──────────────────────────────────────────────────────
@@ -258,252 +119,163 @@ fn mul_slice_xor_scalar(c: u8, input: &[u8], out: &mut [u8]) {
     }
 }
 
-// ── x86_64 SIMD implementations ─────────────────────────────────────────
-
-// ── GFNI + AVX2 (best path: 32 bytes per vgf2p8affineqb) ──────────────
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "gfni,avx2")]
-unsafe fn mul_slice_gfni_avx2(c: u8, input: &[u8], out: &mut [u8]) {
-    use core::arch::x86_64::*;
-
-    let matrix = GFNI_TABLE[c as usize] as i64;
-    let mat_vec = _mm256_set1_epi64x(matrix);
-
-    let len = input.len();
-    let mut i = 0;
-
-    while i + 32 <= len {
-        let data = _mm256_loadu_si256(input.as_ptr().add(i) as *const _);
-        let result = _mm256_gf2p8affine_epi64_epi8(data, mat_vec, 0);
-        _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut _, result);
-        i += 32;
-    }
-
-    let mt = &MUL_TABLE[c as usize];
-    while i < len {
-        *out.get_unchecked_mut(i) = mt[*input.get_unchecked(i) as usize];
-        i += 1;
-    }
-}
+// ── x86_64 kernels ───────────────────────────────────────────────────────
+//
+// Each kernel is compiled for one instruction set, which is the whole of its contract: the safe
+// entry in front of it checks the CPU and takes the scalar path otherwise, so no caller carries
+// an obligation. Both slices are walked as `chunks_exact`, with the tails on the scalar table,
+// so a length never reaches a pointer.
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "gfni,avx2")]
-unsafe fn mul_slice_xor_gfni_avx2(c: u8, input: &[u8], out: &mut [u8]) {
+mod x86 {
+    use super::{
+        mul_slice_scalar, mul_slice_xor_scalar, GFNI_TABLE, MUL_TABLE_HIGH, MUL_TABLE_LOW,
+    };
     use core::arch::x86_64::*;
 
-    let matrix = GFNI_TABLE[c as usize] as i64;
-    let mat_vec = _mm256_set1_epi64x(matrix);
-
-    let len = input.len();
-    let mut i = 0;
-
-    while i + 32 <= len {
-        let data = _mm256_loadu_si256(input.as_ptr().add(i) as *const _);
-        let existing = _mm256_loadu_si256(out.as_ptr().add(i) as *const _);
-        let mul_result = _mm256_gf2p8affine_epi64_epi8(data, mat_vec, 0);
-        let result = _mm256_xor_si256(mul_result, existing);
-        _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut _, result);
-        i += 32;
+    /// `out = c * input`, or `out ^= c * input` with `XOR`, on the scalar table.
+    fn scalar<const XOR: bool>(c: u8, input: &[u8], out: &mut [u8]) {
+        if XOR {
+            mul_slice_xor_scalar(c, input, out)
+        } else {
+            mul_slice_scalar(c, input, out)
+        }
     }
 
-    let mt = &MUL_TABLE[c as usize];
-    while i < len {
-        *out.get_unchecked_mut(i) ^= mt[*input.get_unchecked(i) as usize];
-        i += 1;
-    }
-}
-
-// ── GFNI + SSE (16 bytes per vgf2p8affineqb) ──────────────────────────
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "gfni")]
-unsafe fn mul_slice_gfni_sse(c: u8, input: &[u8], out: &mut [u8]) {
-    use core::arch::x86_64::*;
-
-    let matrix = GFNI_TABLE[c as usize] as i64;
-    let mat_vec = _mm_set1_epi64x(matrix);
-
-    let len = input.len();
-    let mut i = 0;
-
-    while i + 16 <= len {
-        let data = _mm_loadu_si128(input.as_ptr().add(i) as *const _);
-        let result = _mm_gf2p8affine_epi64_epi8(data, mat_vec, 0);
-        _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut _, result);
-        i += 16;
+    /// 32 bytes per `vgf2p8affineqb`.
+    pub(super) fn gfni_avx2<const XOR: bool>(c: u8, input: &[u8], out: &mut [u8]) {
+        assert_eq!(input.len(), out.len());
+        if is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2") {
+            // SAFETY: the kernel's instruction set was detected just above.
+            unsafe { gfni_avx2_kernel::<XOR>(c, input, out) }
+        } else {
+            scalar::<XOR>(c, input, out)
+        }
     }
 
-    let mt = &MUL_TABLE[c as usize];
-    while i < len {
-        *out.get_unchecked_mut(i) = mt[*input.get_unchecked(i) as usize];
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "gfni")]
-unsafe fn mul_slice_xor_gfni_sse(c: u8, input: &[u8], out: &mut [u8]) {
-    use core::arch::x86_64::*;
-
-    let matrix = GFNI_TABLE[c as usize] as i64;
-    let mat_vec = _mm_set1_epi64x(matrix);
-
-    let len = input.len();
-    let mut i = 0;
-
-    while i + 16 <= len {
-        let data = _mm_loadu_si128(input.as_ptr().add(i) as *const _);
-        let existing = _mm_loadu_si128(out.as_ptr().add(i) as *const _);
-        let mul_result = _mm_gf2p8affine_epi64_epi8(data, mat_vec, 0);
-        let result = _mm_xor_si128(mul_result, existing);
-        _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut _, result);
-        i += 16;
+    #[target_feature(enable = "gfni,avx2")]
+    unsafe fn gfni_avx2_kernel<const XOR: bool>(c: u8, input: &[u8], out: &mut [u8]) {
+        let mat = _mm256_set1_epi64x(GFNI_TABLE[c as usize] as i64);
+        let (mut ins, mut outs) = (input.chunks_exact(32), out.chunks_exact_mut(32));
+        for (i, o) in (&mut ins).zip(&mut outs) {
+            // SAFETY: `i` and `o` are 32-byte chunks; the unaligned load and store stay inside.
+            unsafe {
+                let mut v =
+                    _mm256_gf2p8affine_epi64_epi8(_mm256_loadu_si256(i.as_ptr().cast()), mat, 0);
+                if XOR {
+                    v = _mm256_xor_si256(v, _mm256_loadu_si256(o.as_ptr().cast()));
+                }
+                _mm256_storeu_si256(o.as_mut_ptr().cast(), v);
+            }
+        }
+        scalar::<XOR>(c, ins.remainder(), outs.into_remainder());
     }
 
-    let mt = &MUL_TABLE[c as usize];
-    while i < len {
-        *out.get_unchecked_mut(i) ^= mt[*input.get_unchecked(i) as usize];
-        i += 1;
-    }
-}
-
-// ── AVX2 VPSHUFB (32 bytes, split-table nibble lookup) ─────────────────
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn mul_slice_avx2(c: u8, input: &[u8], out: &mut [u8]) {
-    use core::arch::x86_64::*;
-
-    let low = &MUL_TABLE_LOW[c as usize];
-    let high = &MUL_TABLE_HIGH[c as usize];
-
-    // Broadcast the 16-byte low/high tables to 256-bit registers by duplicating
-    let low_vec = _mm256_broadcastsi128_si256(_mm_loadu_si128(low.as_ptr() as *const _));
-    let high_vec = _mm256_broadcastsi128_si256(_mm_loadu_si128(high.as_ptr() as *const _));
-    let mask = _mm256_set1_epi8(0x0F);
-
-    let len = input.len();
-    let mut i = 0;
-
-    // Process 32 bytes at a time
-    while i + 32 <= len {
-        let data = _mm256_loadu_si256(input.as_ptr().add(i) as *const _);
-        let lo_nibble = _mm256_and_si256(data, mask);
-        let hi_nibble = _mm256_and_si256(_mm256_srli_epi64(data, 4), mask);
-        let lo_result = _mm256_shuffle_epi8(low_vec, lo_nibble);
-        let hi_result = _mm256_shuffle_epi8(high_vec, hi_nibble);
-        let result = _mm256_xor_si256(lo_result, hi_result);
-        _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut _, result);
-        i += 32;
+    /// 16 bytes per `vgf2p8affineqb`.
+    pub(super) fn gfni_sse<const XOR: bool>(c: u8, input: &[u8], out: &mut [u8]) {
+        assert_eq!(input.len(), out.len());
+        if is_x86_feature_detected!("gfni") {
+            // SAFETY: the kernel's instruction set was detected just above.
+            unsafe { gfni_sse_kernel::<XOR>(c, input, out) }
+        } else {
+            scalar::<XOR>(c, input, out)
+        }
     }
 
-    // Handle remaining bytes with scalar
-    let mt = &MUL_TABLE[c as usize];
-    while i < len {
-        *out.get_unchecked_mut(i) = mt[*input.get_unchecked(i) as usize];
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn mul_slice_xor_avx2(c: u8, input: &[u8], out: &mut [u8]) {
-    use core::arch::x86_64::*;
-
-    let low = &MUL_TABLE_LOW[c as usize];
-    let high = &MUL_TABLE_HIGH[c as usize];
-
-    let low_vec = _mm256_broadcastsi128_si256(_mm_loadu_si128(low.as_ptr() as *const _));
-    let high_vec = _mm256_broadcastsi128_si256(_mm_loadu_si128(high.as_ptr() as *const _));
-    let mask = _mm256_set1_epi8(0x0F);
-
-    let len = input.len();
-    let mut i = 0;
-
-    while i + 32 <= len {
-        let data = _mm256_loadu_si256(input.as_ptr().add(i) as *const _);
-        let existing = _mm256_loadu_si256(out.as_ptr().add(i) as *const _);
-        let lo_nibble = _mm256_and_si256(data, mask);
-        let hi_nibble = _mm256_and_si256(_mm256_srli_epi64(data, 4), mask);
-        let lo_result = _mm256_shuffle_epi8(low_vec, lo_nibble);
-        let hi_result = _mm256_shuffle_epi8(high_vec, hi_nibble);
-        let result = _mm256_xor_si256(_mm256_xor_si256(lo_result, hi_result), existing);
-        _mm256_storeu_si256(out.as_mut_ptr().add(i) as *mut _, result);
-        i += 32;
+    #[target_feature(enable = "gfni")]
+    unsafe fn gfni_sse_kernel<const XOR: bool>(c: u8, input: &[u8], out: &mut [u8]) {
+        let mat = _mm_set1_epi64x(GFNI_TABLE[c as usize] as i64);
+        let (mut ins, mut outs) = (input.chunks_exact(16), out.chunks_exact_mut(16));
+        for (i, o) in (&mut ins).zip(&mut outs) {
+            // SAFETY: `i` and `o` are 16-byte chunks; the unaligned load and store stay inside.
+            unsafe {
+                let mut v = _mm_gf2p8affine_epi64_epi8(_mm_loadu_si128(i.as_ptr().cast()), mat, 0);
+                if XOR {
+                    v = _mm_xor_si128(v, _mm_loadu_si128(o.as_ptr().cast()));
+                }
+                _mm_storeu_si128(o.as_mut_ptr().cast(), v);
+            }
+        }
+        scalar::<XOR>(c, ins.remainder(), outs.into_remainder());
     }
 
-    let mt = &MUL_TABLE[c as usize];
-    while i < len {
-        *out.get_unchecked_mut(i) ^= mt[*input.get_unchecked(i) as usize];
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "ssse3")]
-unsafe fn mul_slice_ssse3(c: u8, input: &[u8], out: &mut [u8]) {
-    use core::arch::x86_64::*;
-
-    let low = &MUL_TABLE_LOW[c as usize];
-    let high = &MUL_TABLE_HIGH[c as usize];
-
-    let low_vec = _mm_loadu_si128(low.as_ptr() as *const _);
-    let high_vec = _mm_loadu_si128(high.as_ptr() as *const _);
-    let mask = _mm_set1_epi8(0x0F);
-
-    let len = input.len();
-    let mut i = 0;
-
-    while i + 16 <= len {
-        let data = _mm_loadu_si128(input.as_ptr().add(i) as *const _);
-        let lo_nibble = _mm_and_si128(data, mask);
-        let hi_nibble = _mm_and_si128(_mm_srli_epi64(data, 4), mask);
-        let lo_result = _mm_shuffle_epi8(low_vec, lo_nibble);
-        let hi_result = _mm_shuffle_epi8(high_vec, hi_nibble);
-        let result = _mm_xor_si128(lo_result, hi_result);
-        _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut _, result);
-        i += 16;
+    /// 32 bytes per pair of `vpshufb` nibble lookups.
+    pub(super) fn avx2<const XOR: bool>(c: u8, input: &[u8], out: &mut [u8]) {
+        assert_eq!(input.len(), out.len());
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: the kernel's instruction set was detected just above.
+            unsafe { avx2_kernel::<XOR>(c, input, out) }
+        } else {
+            scalar::<XOR>(c, input, out)
+        }
     }
 
-    let mt = &MUL_TABLE[c as usize];
-    while i < len {
-        *out.get_unchecked_mut(i) = mt[*input.get_unchecked(i) as usize];
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "ssse3")]
-unsafe fn mul_slice_xor_ssse3(c: u8, input: &[u8], out: &mut [u8]) {
-    use core::arch::x86_64::*;
-
-    let low = &MUL_TABLE_LOW[c as usize];
-    let high = &MUL_TABLE_HIGH[c as usize];
-
-    let low_vec = _mm_loadu_si128(low.as_ptr() as *const _);
-    let high_vec = _mm_loadu_si128(high.as_ptr() as *const _);
-    let mask = _mm_set1_epi8(0x0F);
-
-    let len = input.len();
-    let mut i = 0;
-
-    while i + 16 <= len {
-        let data = _mm_loadu_si128(input.as_ptr().add(i) as *const _);
-        let existing = _mm_loadu_si128(out.as_ptr().add(i) as *const _);
-        let lo_nibble = _mm_and_si128(data, mask);
-        let hi_nibble = _mm_and_si128(_mm_srli_epi64(data, 4), mask);
-        let lo_result = _mm_shuffle_epi8(low_vec, lo_nibble);
-        let hi_result = _mm_shuffle_epi8(high_vec, hi_nibble);
-        let result = _mm_xor_si128(_mm_xor_si128(lo_result, hi_result), existing);
-        _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut _, result);
-        i += 16;
+    #[target_feature(enable = "avx2")]
+    unsafe fn avx2_kernel<const XOR: bool>(c: u8, input: &[u8], out: &mut [u8]) {
+        let (low, high) = (&MUL_TABLE_LOW[c as usize], &MUL_TABLE_HIGH[c as usize]);
+        // SAFETY: both table rows are 16 bytes, the width of one unaligned load.
+        let (low, high) = unsafe {
+            (
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(low.as_ptr().cast())),
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(high.as_ptr().cast())),
+            )
+        };
+        let mask = _mm256_set1_epi8(0x0F);
+        let (mut ins, mut outs) = (input.chunks_exact(32), out.chunks_exact_mut(32));
+        for (i, o) in (&mut ins).zip(&mut outs) {
+            // SAFETY: `i` and `o` are 32-byte chunks; the unaligned load and store stay inside.
+            unsafe {
+                let data = _mm256_loadu_si256(i.as_ptr().cast());
+                let lo = _mm256_shuffle_epi8(low, _mm256_and_si256(data, mask));
+                let hi =
+                    _mm256_shuffle_epi8(high, _mm256_and_si256(_mm256_srli_epi64(data, 4), mask));
+                let mut v = _mm256_xor_si256(lo, hi);
+                if XOR {
+                    v = _mm256_xor_si256(v, _mm256_loadu_si256(o.as_ptr().cast()));
+                }
+                _mm256_storeu_si256(o.as_mut_ptr().cast(), v);
+            }
+        }
+        scalar::<XOR>(c, ins.remainder(), outs.into_remainder());
     }
 
-    let mt = &MUL_TABLE[c as usize];
-    while i < len {
-        *out.get_unchecked_mut(i) ^= mt[*input.get_unchecked(i) as usize];
-        i += 1;
+    /// 16 bytes per pair of `pshufb` nibble lookups.
+    pub(super) fn ssse3<const XOR: bool>(c: u8, input: &[u8], out: &mut [u8]) {
+        assert_eq!(input.len(), out.len());
+        if is_x86_feature_detected!("ssse3") {
+            // SAFETY: the kernel's instruction set was detected just above.
+            unsafe { ssse3_kernel::<XOR>(c, input, out) }
+        } else {
+            scalar::<XOR>(c, input, out)
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    unsafe fn ssse3_kernel<const XOR: bool>(c: u8, input: &[u8], out: &mut [u8]) {
+        let (low, high) = (&MUL_TABLE_LOW[c as usize], &MUL_TABLE_HIGH[c as usize]);
+        // SAFETY: both table rows are 16 bytes, the width of one unaligned load.
+        let (low, high) = unsafe {
+            (
+                _mm_loadu_si128(low.as_ptr().cast()),
+                _mm_loadu_si128(high.as_ptr().cast()),
+            )
+        };
+        let mask = _mm_set1_epi8(0x0F);
+        let (mut ins, mut outs) = (input.chunks_exact(16), out.chunks_exact_mut(16));
+        for (i, o) in (&mut ins).zip(&mut outs) {
+            // SAFETY: `i` and `o` are 16-byte chunks; the unaligned load and store stay inside.
+            unsafe {
+                let data = _mm_loadu_si128(i.as_ptr().cast());
+                let lo = _mm_shuffle_epi8(low, _mm_and_si128(data, mask));
+                let hi = _mm_shuffle_epi8(high, _mm_and_si128(_mm_srli_epi64(data, 4), mask));
+                let mut v = _mm_xor_si128(lo, hi);
+                if XOR {
+                    v = _mm_xor_si128(v, _mm_loadu_si128(o.as_ptr().cast()));
+                }
+                _mm_storeu_si128(o.as_mut_ptr().cast(), v);
+            }
+        }
+        scalar::<XOR>(c, ins.remainder(), outs.into_remainder());
     }
 }
 
@@ -655,6 +427,60 @@ mod tests {
             mul_slice_scalar(42, &input, &mut expected);
             mul_slice(42, &input, &mut out);
             assert_eq!(out, expected, "mul_slice mismatch for size={size}");
+        }
+    }
+
+    /// Every kernel this CPU has against the scalar table, for every multiplier and tails of
+    /// every length. A kernel the CPU lacks is reported, not silently passed on its fallback.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kernels_match_scalar() {
+        let kernels: [(&str, bool, MulSliceFn, MulSliceFn); 4] = [
+            (
+                "gfni+avx2",
+                is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx2"),
+                x86::gfni_avx2::<false>,
+                x86::gfni_avx2::<true>,
+            ),
+            (
+                "avx2",
+                is_x86_feature_detected!("avx2"),
+                x86::avx2::<false>,
+                x86::avx2::<true>,
+            ),
+            (
+                "gfni",
+                is_x86_feature_detected!("gfni"),
+                x86::gfni_sse::<false>,
+                x86::gfni_sse::<true>,
+            ),
+            (
+                "ssse3",
+                is_x86_feature_detected!("ssse3"),
+                x86::ssse3::<false>,
+                x86::ssse3::<true>,
+            ),
+        ];
+        let input: Vec<u8> = (0..1000u32).map(|i| (i * 7 + 3) as u8).collect();
+        for (name, present, mul, mul_xor) in kernels {
+            if !present {
+                eprintln!("{name}: not on this CPU, skipped");
+                continue;
+            }
+            for c in 0..=255u8 {
+                for len in [0usize, 1, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 100, 1000] {
+                    let input = &input[..len];
+                    let (mut want, mut got) = (vec![0xABu8; len], vec![0xABu8; len]);
+                    mul_slice_scalar(c, input, &mut want);
+                    mul(c, input, &mut got);
+                    assert_eq!(got, want, "{name} mul c={c} len={len}");
+                    let (mut want, mut got) = (vec![0xABu8; len], vec![0xABu8; len]);
+                    mul_slice_xor_scalar(c, input, &mut want);
+                    mul_xor(c, input, &mut got);
+                    assert_eq!(got, want, "{name} xor c={c} len={len}");
+                }
+            }
+            eprintln!("{name}: matches scalar");
         }
     }
 }

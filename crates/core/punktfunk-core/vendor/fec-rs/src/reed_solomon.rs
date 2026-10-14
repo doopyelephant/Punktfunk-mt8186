@@ -622,8 +622,6 @@ impl ReedSolomon {
 
             // For each data shard input, encode into each missing data output
             for (i_input, &valid_idx) in valid_indices.iter().enumerate() {
-                // SAFETY: valid_idx and missing indices are disjoint sets,
-                // so we can safely read from valid_idx while writing to missing indices.
                 // Pointer AND length from the same `get()` — an impl whose `len()`
                 // disagrees with its slice then panics in `mul_slice` instead of this
                 // fabricating an out-of-bounds slice from the trait-reported length.
@@ -632,6 +630,8 @@ impl ReedSolomon {
                     debug_assert_eq!(input.len(), shard_len);
                     (input.as_ptr(), input.len())
                 };
+                // SAFETY: `valid_idx` and the missing indices are disjoint, so this read never
+                // aliases a `get_mut()` below; pointer and length came from one live slice.
                 let input_slice = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
 
                 for (i_out, &missing_idx) in missing_data_indices.iter().enumerate() {
@@ -665,13 +665,14 @@ impl ReedSolomon {
                 .collect();
 
             for i_input in 0..self.data_shard_count {
-                // SAFETY: data shards (0..data_shard_count) are disjoint from parity shards.
                 // Same discipline as the data-shard loop above: length from the slice.
                 let (input_ptr, input_len) = {
                     let input = shards[i_input].get().unwrap();
                     debug_assert_eq!(input.len(), shard_len);
                     (input.as_ptr(), input.len())
                 };
+                // SAFETY: data shards (0..data_shard_count) are disjoint from the parity shards
+                // written below; pointer and length came from one live slice.
                 let input_slice = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
 
                 for (i_out, &missing_idx) in missing_parity_indices.iter().enumerate() {
