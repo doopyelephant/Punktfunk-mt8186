@@ -127,15 +127,32 @@ After connect, build your decoder and presenter from what the host chose, never 
 ## Video
 
 `punktfunk_connection_next_au` delivers complete access units in order, with parameter sets in
-band. The first is an IDR; after that the stream is P-frames only, so loss recovery is yours:
+band. The first is an IDR; after that the stream is P-frames only. The core recovers from loss:
+it freezes on the last good picture, asks the host for a repair, and asks again until one
+decodes. Tell it what your decoder sees:
 
-- Call `punktfunk_connection_note_frame_index` for every AU. On a gap it asks the host for a
-  reference-frame repair and writes `gap_out`.
-- Poll `punktfunk_connection_frames_dropped`. When it climbs, call
-  `punktfunk_connection_request_keyframe`, at most once per ~100 ms. The decoder conceals missing
-  references without an error, so this counter is the signal.
-- To freeze on the last good picture until the stream recovers, use the `punktfunk_reanchor_gate_*`
-  helpers; they read `PUNKTFUNK_USER_FLAG_RECOVERY_ANCHOR` / `_RECOVERY_POINT` from `frame.flags`.
+- Call `punktfunk_connection_recovery_on_frame` for every AU before you decode it, in the order
+  `next_au` returned them. Pass `complete = true`, and `decode_order = 0` unless your decoder
+  numbers its decodes. When `out_admit` is false, drop the AU: it arrived behind one you already
+  took and would rewind the decoder. `out_gap` is the number of frames lost ahead of it, and the
+  `gap` that `punktfunk_au_admission_note` takes.
+- Call `punktfunk_connection_recovery_on_decoded` for every picture the decoder returns, with its
+  AU's `flags`. Pass `keyframe = false`, `PUNKTFUNK_ANCHOR_EVIDENCE_UNAVAILABLE` and
+  `decode_order = 0` unless your decoder reports them. When `out_hold` is true, keep the last good
+  picture on screen and discard this one. `out_forgive` true tells a decoder that tracks damaged
+  references to clear that record.
+- Call `punktfunk_connection_recovery_on_no_output` for an AU the decoder refused or returned
+  nothing for. Call `punktfunk_connection_recovery_lost` for a loss the frame index doesn't show:
+  a wedged decoder, an AU you had to drop.
+- Call `punktfunk_connection_recovery_reset` when the decoder stops while the session lives: you
+  rebuild it, or you drain AUs undecoded in the background. Without it the core keeps asking for a
+  keyframe that nothing decodes.
+- Call `punktfunk_connection_request_keyframe` when your decoder needs an IDR: it lost its state,
+  or it has no parameter sets yet. Once a decoder reports, the core sends one ask per 100 ms at
+  most, so you can call it for every AU you can't decode.
+
+The core watches for unrecoverable frames itself. `punktfunk_connection_frames_dropped` is a
+counter for a stats view.
 
 `punktfunk_connection_request_mode` switches resolution or refresh mid-session. When the host
 accepts, the next AU is an IDR: rebuild the decoder from it.
@@ -202,15 +219,18 @@ int main(int argc, char **argv) {
     if (!c) { fprintf(stderr, "connect: status %d\n", status); return 1; }
 
     uint8_t codec = 0; punktfunk_connection_codec(c, &codec);
-    PunktfunkFrame f; uint64_t seen = 0, drops = 0;
+    PunktfunkFrame f;
     for (int n = 0; n < 600;) {
         PunktfunkStatus rc = punktfunk_connection_next_au(c, &f, 20);
         if (rc == PUNKTFUNK_STATUS_CLOSED) break;
         if (rc != PUNKTFUNK_STATUS_OK) continue;
-        punktfunk_connection_note_frame_index(c, f.frame_index, NULL);
-        /* feed f.data / f.len to a decoder for `codec` */
-        punktfunk_connection_frames_dropped(c, &drops);
-        if (drops > seen) { punktfunk_connection_request_keyframe(c); seen = drops; }
+        bool admit = true, hold = false;
+        punktfunk_connection_recovery_on_frame(c, f.frame_index, true, 0, &admit, NULL);
+        if (!admit) continue; /* behind an AU already taken */
+        /* feed f.data / f.len to a decoder for `codec`, then for the picture it returns: */
+        punktfunk_connection_recovery_on_decoded(
+            c, f.flags, false, PUNKTFUNK_ANCHOR_EVIDENCE_UNAVAILABLE, 0, &hold, NULL);
+        /* show the picture unless `hold` */
         n++;
     }
     punktfunk_connection_disconnect_quit(c);
@@ -219,7 +239,8 @@ int main(int argc, char **argv) {
 }
 ```
 
-A real client throttles the keyframe request, persists the identity and `host_fp`, and runs audio
-and feedback on their own threads. For a complete client over the same API, read
+A real client reports a refused AU and a stopped decoder too, persists the identity and
+`host_fp`, and runs audio and feedback on their own threads. For a complete client over the same
+API, read
 [`crates/client/pf-client-core/src/session.rs`](https://git.unom.io/unom/punktfunk/src/branch/main/crates/client/pf-client-core/src/session.rs).
 `bash crates/client/punktfunk-ffi/tests/c/run.sh` proves the static library links from C on your machine.

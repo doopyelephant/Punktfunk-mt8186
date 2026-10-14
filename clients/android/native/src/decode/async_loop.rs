@@ -3,10 +3,10 @@
 use ndk::data_space::DataSpace;
 use ndk::media::media_codec::{AsyncNotifyCallback, MediaCodec, MediaCodecDirection};
 use ndk::native_window::NativeWindow;
-use punktfunk_core::client::NativeClient;
+use punktfunk_core::client::{Decoded, NativeClient};
 use punktfunk_core::error::PunktfunkError;
 use punktfunk_core::packet::FLAG_SOF;
-use punktfunk_core::reanchor::{AuAdmission, DecoderClass, GateVerdict, ReanchorGate, Resume};
+use punktfunk_core::reanchor::{AnchorEvidence, DecoderClass, LocalRecovery};
 use punktfunk_core::session::Frame;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -29,6 +29,7 @@ use super::setup::{
 use super::surface_control::{Layer, PresentComplete};
 use super::vsync::{VsyncClock, VsyncShared};
 use super::{Backstops, DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP};
+use crate::au_intake::{Delivery, Intake};
 use crate::input_stall::{InputStall, RungFloor, INPUT_STALL_PATIENCE, SETTLED_FRAMES};
 use crate::sys::{now_monotonic_ns, sysprop};
 
@@ -48,11 +49,9 @@ struct OutputReady {
 /// internal looper thread) push the codec ones; the feeder thread pushes `Au`. Each carries only
 /// owned/`Copy` data so the callback closures satisfy the `Send` bound and never touch the codec.
 pub(super) enum DecodeEvent {
-    /// A received access unit from the feeder, ready to queue into the decoder. The `u32` is the
-    /// feeder's [`NativeClient::note_frame_index`] verdict — the forward frame-index gap's WIDTH
-    /// (0 = none), so the loop arms the freeze gate with the same signal and pre-credits the
-    /// reassembler's later `frames_dropped` climb for the loss (the feeder already fired the RFI
-    /// request).
+    /// A received access unit from the feeder, ready to queue into the decoder. The `u32` is
+    /// the gap ahead of it from [`NativeClient::recovery_on_au`] (0 = none): the receiver rule
+    /// and the ladder's loss mark key on it. Core armed the freeze and asked at the report.
     Au(Frame, u32),
     /// An input buffer slot freed (index) — we can queue an AU into it.
     InputAvailable(usize),
@@ -379,15 +378,14 @@ fn run_codec(
         decoded_size: opts.decoded_size.clone(),
         lower_rung,
     };
-    let mut state = State::new(asc, presenter, ReanchorGate::new(client.frames_dropped()));
-    state.admit = admission(client.codec, &ctx.codec.name().unwrap_or_default());
-    if rebuilt || opts.restart {
-        // A fresh decoder holds no reference picture, so every P-frame before a keyframe is a
-        // reference error, and reference errors can hang a hardware decoder. None reach this one.
-        // A session's first decoder needs no ask: the stream opens on an IDR.
-        state.await_keyframe = true;
-        state.gate.arm(Instant::now());
-        let _ = client.request_keyframe();
+    // A fresh decoder holds no reference picture, so every P-frame before a keyframe is a
+    // reference error, and reference errors can hang a hardware decoder. None reach this one.
+    // A session's first decoder needs no ask: the stream opens on an IDR.
+    let await_keyframe = rebuilt || opts.restart;
+    let class = admission(client.codec, &ctx.codec.name().unwrap_or_default());
+    let mut state = State::new(asc, presenter, Intake::new(class, await_keyframe));
+    if await_keyframe {
+        client.recovery_lost();
     }
 
     // `ev_tx` moves into the feeder: from here only it and the codec callbacks keep the channel up.
@@ -419,7 +417,7 @@ fn run_codec(
             .into_iter()
             .chain(std::iter::from_fn(|| ev_rx.try_recv().ok()))
         {
-            state.dispatch(ev, &mut pass);
+            state.dispatch(client, ev, &mut pass);
         }
         let had_output = !state.ready.is_empty();
         let rendered_before = state.rendered;
@@ -435,7 +433,11 @@ fn run_codec(
         }
         state.housekeeping(&ctx, had_output, &pass);
     }
-    teardown(state, ctx, aux, render_cb, feeder, shutdown, stale)
+    let end = teardown(state, ctx, aux, render_cb, feeder, shutdown, stale);
+    // The codec and its feeder are gone, so nothing reports: with the freeze left up, core
+    // would ask for a keyframe every half second of a rebuild or a keep-alive drain.
+    client.recovery_reset();
+    end
 }
 
 /// The SurfaceView timeline presenter (see `presenter.rs`): newest-wins / smoothing store,
@@ -804,7 +806,7 @@ struct Pass {
     aus_dropped: u64,
     /// The codec freed an input slot this pass (the hung-codec check, see [`InputStall`]).
     input_offered: bool,
-    /// The admission rule or a dropped AU asked for a keyframe this pass.
+    /// The receiver rule asked for a keyframe this pass.
     ask_keyframe: bool,
     /// ASurfaceControl transaction completions, applied after the drain (on the decode thread,
     /// not the binder thread that posted them).
@@ -829,12 +831,10 @@ struct State {
     /// pts → realtime ns at the AU's LAST piece entering the codec — the P3 decode-split ledger
     /// (`feed` = received→queued, `codec` = queued→decoded). Always on; consumed by `present`.
     queued_stamps: VecDeque<(u64, i128)>,
-    /// Freeze-until-reanchor gate. Armed on a frame-index gap (the feeder's Au verdict), a
-    /// parked-AU overflow drop, a dropped-count climb, a recoverable codec error, or a rebuild;
-    /// `recovery_flags` carries each AU's user_flags from `dispatch` (feed) to `present`, keyed
-    /// by the codec-echoed pts.
-    gate: ReanchorGate,
+    /// Core's freeze arm count at the last cadence re-anchor ([`NativeClient::recovery_arms`]).
     last_arms: u64,
+    /// Each AU's wire flags from `dispatch` to `present`, keyed by the codec-echoed pts: what
+    /// core's freeze folds per decoded output.
     recovery_flags: VecDeque<(u64, u32)>,
     fatal: bool,
     /// The codec stopped taking input with AUs waiting: this run ends and the codec is rebuilt.
@@ -843,13 +843,9 @@ struct State {
     /// The codec handing back no buffer for a slot it offered: it left the executing state,
     /// whether or not its error callback ran.
     refused: InputStall,
-    /// A rebuilt run drops every AU before the first keyframe.
-    await_keyframe: bool,
     backstops: Backstops,
-    /// The receiver rule on AV1 sessions ([`admission`]); `None` feeds every AU.
-    admit: Option<Admit>,
-    /// AUs the rule kept off the codec. They owe output like fed ones ([`Backstops::poll`]).
-    withheld: u64,
+    /// Which AUs reach the codec: the AV1 receiver rule and a rebuilt run's keyframe wait.
+    intake: Intake,
     /// An AU was lost, here or on the wire, and no keyframe has been fed since.
     loss_open: bool,
     /// The codec was fed past a loss or reported an error: a failure after this may be the
@@ -857,21 +853,10 @@ struct State {
     unclean: bool,
 }
 
-/// [`AuAdmission`] and what the loop keeps beside it.
-struct Admit {
-    rule: AuAdmission,
-    class: DecoderClass,
-    /// The AU whose parts are withheld: the rule decides on the first part.
-    parts_of: Option<u32>,
-    /// A backstop asked for a keyframe during the current stretch.
-    backstop: bool,
-    /// This loop dropped an admitted AU; the next first part is noted with a gap.
-    local_gap: bool,
-}
-
-/// The receiver rule for this session: AV1 only, strict on the Tensor G5 decoder, lenient on
-/// the rest. `debug.punktfunk.au_admission` = `strict` / `lenient` / `off` overrides the pick.
-fn admission(codec: u8, decoder: &str) -> Option<Admit> {
+/// The receiver rule's decoder class for this session ([`Intake`]): AV1 only, strict on the
+/// Tensor G5 decoder, lenient on the rest. `debug.punktfunk.au_admission` = `strict` /
+/// `lenient` / `off` overrides the pick.
+fn admission(codec: u8, decoder: &str) -> Option<DecoderClass> {
     if codec != punktfunk_core::quic::CODEC_AV1 {
         return None;
     }
@@ -883,17 +868,34 @@ fn admission(codec: u8, decoder: &str) -> Option<Admit> {
         _ => DecoderClass::Lenient,
     };
     log::info!("decode: AV1 AU admission {class:?} for {decoder}");
-    Some(Admit {
-        rule: AuAdmission::default(),
-        class,
-        parts_of: None,
-        backstop: false,
-        local_gap: false,
-    })
+    Some(class)
+}
+
+/// One feeder delivery as the intake rules see it.
+fn delivery(f: &Frame) -> Delivery {
+    Delivery {
+        index: f.frame_index,
+        first: f.part.is_none_or(|p| p.first),
+        flags: f.flags,
+    }
+}
+
+/// Fold one decoded output into core's freeze: `true` shows it. MediaCodec flags no keyframe
+/// and parses nothing, so the AU's wire flags carry it all.
+fn shows(client: &NativeClient, flags: u32) -> bool {
+    !client
+        .recovery_on_decoded(Decoded {
+            flags,
+            keyframe: false,
+            evidence: AnchorEvidence::Unavailable,
+            local: LocalRecovery::NONE,
+            decode_order: None,
+        })
+        .hold
 }
 
 impl State {
-    fn new(asc: Option<AscBackend>, presenter: Option<Presenter>, gate: ReanchorGate) -> State {
+    fn new(asc: Option<AscBackend>, presenter: Option<Presenter>, intake: Intake) -> State {
         State {
             asc,
             presenter,
@@ -907,43 +909,30 @@ impl State {
             oversized_dropped: 0,
             part_open: None,
             queued_stamps: VecDeque::new(),
-            last_arms: gate.arms(),
-            gate,
+            last_arms: 0,
             recovery_flags: VecDeque::new(),
             fatal: false,
             wedged: false,
             stall: InputStall::default(),
             refused: InputStall::default(),
-            await_keyframe: false,
             backstops: Backstops::new(),
-            admit: None,
-            withheld: 0,
+            intake,
             loss_open: false,
             unclean: false,
         }
     }
 
     /// Route one [`DecodeEvent`] into the working sets.
-    fn dispatch(&mut self, ev: DecodeEvent, pass: &mut Pass) {
+    fn dispatch(&mut self, client: &NativeClient, ev: DecodeEvent, pass: &mut Pass) {
         match ev {
             DecodeEvent::Au(f, gap) => {
-                // A forward frame-index gap arms the freeze; park this AU's flags for the present
-                // side to fold `on_decoded`. Credited arm: the gap width pre-covers the
-                // reassembler's later `frames_dropped` climb for the same loss, so a fast RFI
-                // anchor that heals in between isn't re-frozen by it.
                 if gap > 0 {
-                    self.gate
-                        .arm_expecting_drops(Instant::now(), u64::from(gap));
                     self.loss_open = true;
                 }
-                if self.withhold(&f, gap, pass) {
+                let verdict = self.intake.note(delivery(&f), gap);
+                pass.ask_keyframe |= verdict.ask_keyframe;
+                if !verdict.feed {
                     return;
-                }
-                if self.await_keyframe {
-                    if f.flags & u32::from(FLAG_SOF) == 0 {
-                        return;
-                    }
-                    self.await_keyframe = false;
                 }
                 // One entry per AU (parts share the pts): the completing delivery carries it.
                 if f.complete {
@@ -979,75 +968,35 @@ impl State {
             DecodeEvent::Vsync => pass.vsync_tick = true,
             DecodeEvent::ImageAvailable => {}
             DecodeEvent::Error { fatal: true } => self.fatal = true,
-            // A recoverable/transient codec error is a decode hiccup on a broken reference chain —
-            // arm the freeze so the concealed output it recovers into is held off the screen.
+            // A recoverable or transient codec error is a decode hiccup on a broken reference
+            // chain: core holds the concealed output it recovers into off the screen.
             DecodeEvent::Error { fatal: false } => {
-                self.gate.arm(Instant::now());
+                client.recovery_on_codec_error();
                 self.unclean = true;
             }
             DecodeEvent::PresentComplete(pc) => pass.present_completes.push(pc),
         }
     }
 
-    /// The receiver rule ([`Admit`]): `true` keeps `f` off the codec and out of
-    /// `recovery_flags`. Decided on an AU's first part; its later parts follow.
-    fn withhold(&mut self, f: &Frame, gap: u32, pass: &mut Pass) -> bool {
-        let Some(a) = self.admit.as_mut() else {
-            return false;
-        };
-        if f.part.is_some_and(|p| !p.first) {
-            return a.parts_of == Some(f.frame_index);
-        }
-        let gap = if std::mem::take(&mut a.local_gap) {
-            gap.max(1)
-        } else {
-            gap
-        };
-        let step = a.rule.note(f.frame_index, gap, f.flags, a.class, None);
-        a.parts_of = step.withhold.then_some(f.frame_index);
-        if let Some(e) = step.ended {
-            log::info!(
-                "decode: withheld {} AU(s) from frame {} after a loss, until {} at frame {}{}",
-                e.withheld,
-                e.first,
-                match e.by {
-                    Resume::Idr => "an IDR",
-                    Resume::Anchor => "the anchor",
-                    Resume::WaveStart => "a wave start",
-                    Resume::Concealed => "the concealer",
-                },
-                f.frame_index,
-                if std::mem::take(&mut a.backstop) {
-                    " (a backstop asked for it)"
-                } else {
-                    ""
-                }
-            );
-        }
-        self.withheld += u64::from(step.withhold);
-        pass.ask_keyframe |= step.ask_keyframe;
-        step.withhold
-    }
-
     /// This loop dropped an AU the rule had admitted, and the AUs behind it may name it. The
     /// parked ones are judged again and the next arrival sees the gap, as for a network loss.
     fn local_loss(&mut self, pass: &mut Pass) {
-        let Some(a) = self.admit.as_mut() else {
+        if !self.intake.local_loss() {
             return;
-        };
-        a.local_gap = true;
+        }
         for f in std::mem::take(&mut self.pending_aus) {
-            if !self.withhold(&f, 0, pass) {
+            let verdict = self.intake.rejudge(delivery(&f));
+            pass.ask_keyframe |= verdict.ask_keyframe;
+            if verdict.feed {
                 self.pending_aus.push_back(f);
             }
         }
     }
 
-    /// `feed` dropped an admitted AU: freeze now, ask for a keyframe through the pass's throttled
-    /// ask, and re-judge the parked AUs behind it ([`State::local_loss`]).
-    fn drop_admitted(&mut self, pass: &mut Pass) {
-        self.gate.arm(Instant::now());
-        pass.ask_keyframe = true;
+    /// `feed` dropped an admitted AU: core freezes and asks for a keyframe, and the parked AUs
+    /// behind it are judged again ([`State::local_loss`]).
+    fn drop_admitted(&mut self, client: &NativeClient, pass: &mut Pass) {
+        client.recovery_lost();
         self.loss_open = true;
         self.local_loss(pass);
     }
@@ -1095,13 +1044,12 @@ impl State {
             }
         }
         self.feed(ctx, pass);
-        // The cadence loop's re-anchor seam. A fresh arm means a loss was detected: the frames
-        // that reach the presenter on the far side come through a decoder that has just
-        // recovered, so the source→presentable delay the loop had measured is not the one it
-        // will see. Watched by ARM COUNT because the arm sites are spread across the dispatcher,
-        // the feeder and the backstops, and the count catches every one of them.
-        if self.gate.arms() != self.last_arms {
-            self.last_arms = self.gate.arms();
+        // The cadence loop's re-anchor seam. An arm is a loss: the frames past it come through
+        // a decoder that just recovered, so the source→presentable delay the loop measured no
+        // longer holds. Core's arm count catches every site, its own tick included.
+        let arms = ctx.client.recovery_arms();
+        if arms != self.last_arms {
+            self.last_arms = arms;
             if let Some(p) = self.presenter.as_mut() {
                 p.reset_cadence();
             }
@@ -1152,7 +1100,7 @@ impl State {
                     // The close makes the codec emit concealed garbage at the dead pts — freeze it
                     // off the glass until the recovery keyframe re-anchors.
                     self.pending_aus.push_front(frame);
-                    self.drop_admitted(pass);
+                    self.drop_admitted(&ctx.client, pass);
                     continue;
                 }
                 // No AU open: an orphan non-first piece lost its head upstream — discard and
@@ -1160,8 +1108,7 @@ impl State {
                 // that lost the head already told the admission rule.
                 if !first {
                     self.free_inputs.push_front(idx);
-                    self.gate.arm(Instant::now());
-                    pass.ask_keyframe = true;
+                    ctx.client.recovery_lost();
                     continue;
                 }
             }
@@ -1196,15 +1143,14 @@ impl State {
                 if frame.part.is_some() {
                     // Pieces already queued can't be unqueued: poison the ledger so the next
                     // delivery mismatches and takes the close-empty path above.
-                    self.gate.arm(Instant::now());
-                    pass.ask_keyframe = true;
+                    ctx.client.recovery_lost();
                     self.part_open = Some(PartFeed {
                         index: frame.frame_index,
                         expected: usize::MAX,
                         pts_us,
                     });
                 } else {
-                    self.drop_admitted(pass);
+                    self.drop_admitted(&ctx.client, pass);
                 }
                 continue;
             }
@@ -1227,7 +1173,7 @@ impl State {
                     });
                 } else {
                     // A whole AU lost here is a loss like any other.
-                    self.drop_admitted(pass);
+                    self.drop_admitted(&ctx.client, pass);
                 }
                 continue;
             }
@@ -1298,10 +1244,10 @@ impl State {
     }
 
     /// Route the ready outputs toward glass, recording each one's decode-split + e2e first, then
-    /// folding EVERY output through the re-anchor gate in pts (== decode) order — even the ones
-    /// newest-wins discards — so the two-mark re-anchor count stays correct. A withheld verdict is
-    /// concealment: released unrendered (the SurfaceView keeps the last frame frozen on) or
-    /// dropped off-glass (ASC). With the timeline presenter the approved ones go to its store and
+    /// folding EVERY output through core's freeze ([`shows`]) in pts (== decode) order — even
+    /// the ones newest-wins discards — so the two-mark re-anchor count stays correct. A held one
+    /// is concealment: released unrendered (the SurfaceView keeps the last frame frozen on) or
+    /// dropped off-glass (ASC). With the timeline presenter the shown ones go to its store and
     /// `Presenter::pump` releases them budgeted; legacy `arrival` presents only the NEWEST
     /// immediately. `ready` is drained.
     fn present(&mut self, ctx: &Ctx) {
@@ -1312,7 +1258,6 @@ impl State {
         let meter = self.asc.is_none().then_some(&*ctx.meter);
         self.note_decode_stage(ctx, meter);
         let codec = &ctx.codec;
-        let now = Instant::now();
         let mut skipped: u64 = 0;
         let ready = std::mem::take(&mut self.ready);
         if let Some(a) = self.asc.as_mut() {
@@ -1320,7 +1265,7 @@ impl State {
             // measured there from the real transaction latches, not here.
             for o in ready {
                 let flags = take_flags(&mut self.recovery_flags, o.pts_us);
-                let present = self.gate.on_decoded(flags, false, now) == GateVerdict::Present;
+                let present = shows(&ctx.client, flags);
                 skipped += u64::from(!present);
                 a.on_output(
                     codec,
@@ -1338,7 +1283,7 @@ impl State {
         if let Some(p) = self.presenter.as_mut() {
             for o in ready {
                 let flags = take_flags(&mut self.recovery_flags, o.pts_us);
-                if self.gate.on_decoded(flags, false, now) == GateVerdict::Present {
+                if shows(&ctx.client, flags) {
                     let dropped =
                         p.submit(codec, o.index, o.pts_us, o.decoded_ns, o.decoded_mono_ns);
                     skipped += dropped;
@@ -1355,7 +1300,7 @@ impl State {
             let last = ready.len() - 1;
             for (i, o) in ready.into_iter().enumerate() {
                 let flags = take_flags(&mut self.recovery_flags, o.pts_us);
-                let present = self.gate.on_decoded(flags, false, now) == GateVerdict::Present;
+                let present = shows(&ctx.client, flags);
                 let render = i == last && present;
                 match codec.release_output_buffer_by_index(o.index, render) {
                     Ok(()) if render => {
@@ -1417,10 +1362,9 @@ impl State {
         }
     }
 
-    /// The hung-codec check ([`InputStall`]), the keyframe backstops ([`Backstops::poll`]), then the
-    /// pass's keyframe ask (the admission rule's or `feed`'s) through the same throttle.
-    /// Evaluated after `feed`, so an AU that arrived this pass has either been fed or is parked
-    /// in `pending_aus`.
+    /// The hung-codec check ([`InputStall`]), the backstops ([`Backstops::poll`]), then the
+    /// receiver rule's keyframe ask, once a pass; core throttles it. Evaluated after `feed`, so
+    /// an AU that arrived this pass has either been fed or is parked in `pending_aus`.
     fn housekeeping(&mut self, ctx: &Ctx, had_output: bool, pass: &Pass) {
         let waiting = !self.pending_aus.is_empty();
         if self.stall.poll(pass.input_offered, waiting, Instant::now()) {
@@ -1431,19 +1375,15 @@ impl State {
             );
             self.wedged = true;
         }
-        let backstop = self.backstops.poll(
+        self.backstops.poll(
             &ctx.client,
-            &mut self.gate,
-            self.fed + self.withheld,
+            self.fed + self.intake.withheld(),
             had_output,
             waiting,
             pass.aus_dropped,
         );
-        if let Some(a) = self.admit.as_mut() {
-            a.backstop |= backstop && a.rule.is_withholding();
-        }
         if pass.ask_keyframe {
-            self.backstops.ask(&ctx.client);
+            let _ = ctx.client.request_keyframe();
         }
     }
 }
@@ -1512,13 +1452,14 @@ fn feeder_loop(
     while !shutdown.load(Ordering::Relaxed) {
         match client.next_frame(Duration::from_millis(5)) {
             Ok(frame) => {
-                // Loss recovery (RFI): a forward frame-index gap fires a throttled reference-frame-
-                // invalidation request (a cheap clean P-frame instead of a full IDR); the verdict
-                // rides the Au event so the loop arms its freeze gate on the same signal. Parts
-                // repeat their AU's index — note it once, on the first piece.
+                // Reported here so core asks for a lost range the moment it shows. Parts repeat
+                // their AU's index: once, on the first. Only the gap is taken: this loop feeds
+                // a straggler too.
                 let au_first = frame.part.is_none_or(|p| p.first);
                 let gap = if au_first {
-                    client.note_frame_index(frame.frame_index)
+                    client
+                        .recovery_on_au(frame.frame_index, frame.complete, 0)
+                        .gap
                 } else {
                     0
                 };

@@ -61,8 +61,8 @@ pub(super) fn take_by_pts<V: Copy>(q: &mut VecDeque<(u64, V)>, pts_us: u64) -> O
 /// The AU `user_flags` for a decoded output, keyed by the echoed `presentationTimeUs`. Recovery
 /// signalling (FLAG_SOF IDR marker / RECOVERY_ANCHOR / RECOVERY_POINT) rides the AU's flags, which are
 /// only in scope at feed time — so the feed side parks `(pts_us, flags)` here and the present side
-/// looks them up to fold [`ReanchorGate::on_decoded`]. A miss (probe filler, or an entry aged past
-/// the cap) reads `0` — no recovery flags, decoded normally.
+/// looks them up to report the picture to core's freeze ([`NativeClient::recovery_on_decoded`]). A
+/// miss (probe filler, or an entry aged past the cap) reads `0` — no recovery flags, decoded normally.
 pub(super) fn take_flags(map: &mut VecDeque<(u64, u32)>, pts_us: u64) -> u32 {
     take_by_pts(map, pts_us).unwrap_or(0)
 }

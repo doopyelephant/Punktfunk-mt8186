@@ -468,10 +468,6 @@ pub struct AuAdmission {
 }
 
 impl AuAdmission {
-    pub fn is_withholding(&self) -> bool {
-        self.withholding
-    }
-
     /// Fold one AU: its `index`, the index `gap` ahead of it (0 for none), its wire `flags`,
     /// the decoder's `class`, and the concealer's `verdict` on a lane that has one.
     pub fn note(
@@ -1323,7 +1319,6 @@ mod tests {
             let s = a.note(i, gap, flags, Strict, Some(Concealment::Decodable));
             assert_eq!((s.withhold, s.ask_keyframe), FEED);
         }
-        assert!(!a.is_withholding());
     }
 
     #[test]

@@ -1319,14 +1319,10 @@ public final class PunktfunkConnection: @unchecked Sendable {
         }
     }
 
-    /// Ask the host's encoder to emit a fresh IDR keyframe now — recovery when the local
-    /// decoder has wedged. The host opens the infinite-GOP stream with one IDR and then sends
-    /// P-frames only, so a stalled decode (a lost/corrupt opening IDR, a bad early P-frame —
-    /// most likely on the cold first connect) would otherwise stay frozen until the next
-    /// loss-triggered recovery keyframe, which may be far off. Fire-and-forget; the recovered
-    /// keyframe is the only ack. THROTTLE at the call site — the decode stays wedged for
-    /// several frames until the IDR lands, so requesting every frame would flood the control
-    /// stream. Silently dropped after close.
+    /// The decoder needs an IDR: under the host's infinite GOP none comes unasked. Safe to call
+    /// per frame while it is wedged: with a decoder reporting, the core arms the freeze and
+    /// sends one ask per 100 ms window. Fire-and-forget; the keyframe is the only ack.
+    /// Silently dropped after close.
     public func requestKeyframe() {
         withLiveHandle(or: ()) { h in
             _ = punktfunk_connection_request_keyframe(h)
@@ -1337,8 +1333,8 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// `nextAU()` (so QUIC flow control and host pacing stay healthy) but DISCARD each AU before any
     /// VideoToolbox/Metal decode or render — the crash/jetsam-safe way to hold a backgrounded
     /// session (audio keeps rendering; no GPU work off-screen). Set on `SessionModel.enterBackground`,
-    /// cleared on `exitBackground` (which then requests a fresh IDR; the pump's re-anchor gate
-    /// auto-arms on the resumed frame-index gap). Its own tiny lock — read on the pump thread every
+    /// cleared on `exitBackground` (which then requests a fresh IDR; the core's freeze arms on
+    /// the resumed frame-index gap). Its own tiny lock — read on the pump thread every
     /// iteration, written on the main actor; never contends the ABI/plane locks.
     private let videoDropLock = NSLock()
     private var videoDropped = false
@@ -1350,32 +1346,56 @@ public final class PunktfunkConnection: @unchecked Sendable {
         videoDropLock.lock(); videoDropped = dropped; videoDropLock.unlock()
     }
 
-    /// Feed each received AU's `frameIndex` (in receive order) and get back the WIDTH of the
-    /// forward gap it revealed (0 = none). A gap means the intervening frames were lost and the
-    /// following AUs reference a picture that never arrived, so the core fires a THROTTLED RFI
-    /// request for the lost range and an RFI-capable host recovers with a clean P-frame instead of
-    /// a 20-40x IDR spike. The re-anchor gate arms with the width, so the reassembler's later
-    /// `framesDropped` climb for the SAME loss cannot re-freeze a stream an anchor already healed.
-    /// Call it for every received AU. Returns 0 after close.
-    public func noteFrameIndexGapWidth(_ frameIndex: UInt32) -> UInt32 {
-        return withLiveHandle(or: 0) { h in
-            var width: UInt32 = 0
-            _ = punktfunk_connection_note_frame_index_ex(h, frameIndex, &width)
-            return width
+    // MARK: - Loss recovery
+    //
+    // The freeze, the RFI and keyframe asks and their one ask window live in the core. A pump
+    // reports what its decoder saw through these five calls and obeys `admit` and the hold.
+
+    /// Report one AU before decode, in receive order. On a gap the core arms the freeze and asks
+    /// the host for the lost range. `admit` false: drop the AU, it sits behind one already seen
+    /// and would rewind the decoder. `gap` is the frames lost ahead of it. After close every AU
+    /// is admitted.
+    public func recoveryOnFrame(_ frameIndex: UInt32) -> (admit: Bool, gap: UInt32) {
+        return withLiveHandle(or: (true, 0)) { h in
+            var admit = true
+            var gap: UInt32 = 0
+            _ = punktfunk_connection_recovery_on_frame(h, frameIndex, true, 0, &admit, &gap)
+            return (admit, gap)
         }
     }
 
-    /// Cumulative access units the host→client reassembler dropped as unrecoverable (FEC couldn't
-    /// rebuild them). The video pump polls this and calls `requestKeyframe()` when it climbs — the
-    /// correct loss trigger under the host's infinite GOP, where unrecoverable loss yields
-    /// reference-missing delta frames the decoder *silently conceals* (a frozen / garbage picture,
-    /// no decode error and no `.failed` layer), so a decode-error trigger rarely fires. Monotonic
-    /// for the session; 0 after close. Cheap (an atomic load) — safe to poll every pump iteration.
-    public func framesDropped() -> UInt64 {
-        return withLiveHandle(or: 0) { h in
-            var out: UInt64 = 0
-            _ = punktfunk_connection_frames_dropped(h, &out)
-            return out
+    /// Report one decoded picture by its AU's wire flags. True: keep the last good picture on
+    /// glass instead of this one. VideoToolbox flags no keyframe and the client keeps no
+    /// reference ledger, so the flags carry it all.
+    public func recoveryOnDecoded(flags: UInt32) -> Bool {
+        return withLiveHandle(or: false) { h in
+            var hold = false
+            _ = punktfunk_connection_recovery_on_decoded(
+                h, flags, false, UInt32(PUNKTFUNK_ANCHOR_EVIDENCE_UNAVAILABLE), 0, &hold, nil)
+            return hold
+        }
+    }
+
+    /// Report an AU the decoder refused. Three in a row freeze and ask for a keyframe.
+    public func recoveryOnNoOutput() {
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_recovery_on_no_output(h)
+        }
+    }
+
+    /// Report a loss the frame index cannot show, such as a wedged decoder: the core freezes
+    /// and asks for a keyframe.
+    public func recoveryLost() {
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_recovery_lost(h)
+        }
+    }
+
+    /// The decoder is gone or parked: a pump start, a background drain. Drops the freeze so
+    /// the core asks for nothing until the next report starts a fresh one.
+    public func recoveryReset() {
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_recovery_reset(h)
         }
     }
 

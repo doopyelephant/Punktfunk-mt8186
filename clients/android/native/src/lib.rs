@@ -28,6 +28,9 @@ use jni::EnvUnowned;
 mod adpf;
 #[cfg(target_os = "android")]
 mod audio;
+// `decode`'s AU intake rules, `test`-gated like `input_stall` so their table runs off-device.
+#[cfg(any(target_os = "android", test))]
+mod au_intake;
 // The Skia console UI host (design/android-skia-console-port.md): the shared `pf-console-ui`
 // shell over EGL/GLES, on every ABI (the armv7 Skia archive is self-hosted — see Cargo.toml).
 #[cfg(target_os = "android")]

@@ -345,6 +345,15 @@
 // `PunktfunkStatus` code).
 #define PUNKTFUNK_CLIP_ERROR 6
 
+// [`punktfunk_connection_recovery_on_decoded`]'s `evidence`: the lane has no parser.
+#define PUNKTFUNK_ANCHOR_EVIDENCE_UNAVAILABLE 0
+
+// The picture predicts only from references that decoded clean.
+#define PUNKTFUNK_ANCHOR_EVIDENCE_CLEAN 1
+
+// The picture predicts from a concealed one: its anchor flag does not lift the freeze.
+#define PUNKTFUNK_ANCHOR_EVIDENCE_DAMAGED 2
+
 // Most findings one report carries; the rules can produce seven.
 #define PUNKTFUNK_HEALTH_FINDINGS_MAX 8
 
@@ -369,7 +378,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 51
+#define PUNKTFUNK_ABI_VERSION 53
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -1480,12 +1489,6 @@ typedef struct PunktfunkH265Concealer PunktfunkH265Concealer;
 
 // Opaque session handle. C sees only the pointer.
 typedef struct PunktfunkSession PunktfunkSession;
-
-// Shared post-loss freeze. A client feeds *arm* (loss), each decoded frame
-// ([`on_decoded`](Self::on_decoded)), each no-output AU ([`on_no_output`](Self::on_no_output)),
-// and a periodic [`poll`](Self::poll). The gate emits *intents* only: `true` means the client
-// should ask for a keyframe through its own ~100 ms throttle. The gate never touches the wire.
-typedef struct ReanchorGate ReanchorGate;
 
 // Log sink for [`punktfunk_set_log_callback`]. `level` 1..=5 (error…trace).
 // `target` and `message` are NUL-terminated UTF-8, borrowed for this call —
@@ -3401,8 +3404,9 @@ PunktfunkStatus punktfunk_connection_request_mode(const PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Request an IDR now. Infinite GOP has one opening IDR; throttle — a wedged
-// decoder stays stuck for several frames, so per-frame requests flood control.
+// The decoder needs an IDR; infinite GOP sends none unasked. With a decoder reporting
+// through `punktfunk_connection_recovery_*` the core arms the freeze and sends one ask per
+// 100 ms window. Before the first report, and after a reset, the ask goes at once: throttle.
 //
 // # Safety
 // `c` is a valid connection handle.
@@ -3421,32 +3425,74 @@ PunktfunkStatus punktfunk_connection_request_rfi(const PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Note each received `frame_index`. A forward gap fires throttled RFI; keyframe
-// on `frames_dropped` is the backstop. `gap_out` (nullable) is whether a gap was seen.
+// Report one AU before decode, in receive order; a sliced AU once, on its first part. On a
+// gap the core arms the freeze and asks the host for the lost range. `out_admit` false:
+// drop the AU, a straggler a reference decoder rewinds on or a partial a newer frame beat.
+// `out_gap` is the frames lost ahead of it, the `gap` [`punktfunk_au_admission_note`]
+// takes. `complete` false is a partial delivery. `decode_order` is the decoder's count so
+// far, 0 where it numbers none.
 //
 // # Safety
-// `c` is a valid connection handle; `gap_out` is writable or NULL.
-PunktfunkStatus punktfunk_connection_note_frame_index(const PunktfunkConnection *c,
-                                                      uint32_t frame_index,
-                                                      bool *gap_out);
+// `c` is a valid connection handle; the out pointers are writable or NULL.
+PunktfunkStatus punktfunk_connection_recovery_on_frame(const PunktfunkConnection *c,
+                                                       uint32_t index,
+                                                       bool complete,
+                                                       uint64_t decode_order,
+                                                       bool *out_admit,
+                                                       uint32_t *out_gap);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// [`punktfunk_connection_note_frame_index`] with the gap width: writes how many
-// frames this arrival revealed as missing (0 = contiguous/straggler). Pass the
-// width to [`punktfunk_reanchor_gate_arm_expecting_drops`] so a later
-// `frames_dropped` climb for the same loss cannot re-freeze a healed stream.
+// Report one decoded picture. `out_hold` true: keep the last good picture on glass
+// instead of this one. `flags` are the AU's wire flags; `keyframe` is the decoder's own
+// IDR bit, false where it flags none; `evidence` is a `PUNKTFUNK_ANCHOR_EVIDENCE_*`;
+// `decode_order` is this picture's decode count from 1, 0 where the decoder numbers none.
+// `out_forgive` true: the freeze lifted on an intra-refresh heal, so a reference-chain
+// ledger forgets its damage marks. An unknown `evidence` returns
+// [`PunktfunkStatus::InvalidArg`].
 //
 // # Safety
-// `c` is a valid connection handle; `gap_width_out` is writable or NULL.
-PunktfunkStatus punktfunk_connection_note_frame_index_ex(const PunktfunkConnection *c,
-                                                         uint32_t frame_index,
-                                                         uint32_t *gap_width_out);
+// `c` is a valid connection handle; the out pointers are writable or NULL.
+PunktfunkStatus punktfunk_connection_recovery_on_decoded(const PunktfunkConnection *c,
+                                                         uint32_t flags,
+                                                         bool keyframe,
+                                                         uint32_t evidence,
+                                                         uint64_t decode_order,
+                                                         bool *out_hold,
+                                                         bool *out_forgive);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Unrecoverable reassembler drops. Poll and request a keyframe when it climbs —
-// infinite GOP conceals missing refs with no decode error. Writes 0 on NULL.
+// An AU produced no picture. Three in a row arm the freeze and ask for a keyframe.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_recovery_on_no_output(const PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// A loss the frame index cannot show, such as a wedged decoder: arms the freeze and asks
+// for a keyframe.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_recovery_lost(const PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The decoder is gone or parked (a restart, a background drain): drops the freeze.
+// Nothing asks until the next report, which starts a fresh one. Call it while draining
+// AUs undecoded: a freeze nothing reports to asks for a keyframe every half second.
+//
+// # Safety
+// `c` is a valid connection handle.
+PunktfunkStatus punktfunk_connection_recovery_reset(const PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Unrecoverable reassembler drops. For a client that reports through
+// `punktfunk_connection_recovery_*` the core watches it: a climb past a gap's credit
+// freezes and asks for a keyframe. Writes 0 on NULL.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable (NULL is skipped).
@@ -3628,69 +3674,6 @@ void punktfunk_h265_concealer_release(uint8_t *buf, uintptr_t len);
 PunktfunkStatus punktfunk_av1_sequence_info(const uint8_t *data,
                                             uintptr_t len,
                                             PunktfunkAv1SequenceInfo *out);
-
-// Create a re-anchor gate seeded with the session's current `frames_dropped` (so
-// the first [`punktfunk_reanchor_gate_poll`] doesn't read the baseline as a loss).
-// Free with [`punktfunk_reanchor_gate_free`]. Never returns NULL.
-ReanchorGate *punktfunk_reanchor_gate_new(uint64_t frames_dropped);
-
-// Free a gate created by [`punktfunk_reanchor_gate_new`]. NULL is a no-op.
-//
-// # Safety
-// `g` was returned by [`punktfunk_reanchor_gate_new`] and is not used after this call.
-void punktfunk_reanchor_gate_free(ReanchorGate *g);
-
-// Arm the freeze: a loss was detected (frame-index gap, or decoder wedge/demotion).
-// Zeroes the recovery-mark count and (re-)sets the backstop deadline. NULL is a no-op.
-//
-// # Safety
-// `g` is a valid gate handle.
-void punktfunk_reanchor_gate_arm(ReanchorGate *g);
-
-// Arm for a frame-index gap, pre-crediting `expected_drops` so a later
-// `frames_dropped` climb is not a second loss (double-arm race). Plain `arm`
-// for decoder wedge/demotion. NULL is a no-op.
-//
-// # Safety
-// `g` is a valid gate handle.
-void punktfunk_reanchor_gate_arm_expecting_drops(ReanchorGate *g, uint64_t expected_drops);
-
-// Fold one decoded frame; `out_present` is whether to display it. Reads `FLAG_SOF`,
-// `USER_FLAG_RECOVERY_ANCHOR`, `USER_FLAG_RECOVERY_POINT`. Platform decoders that
-// do not flag IDRs pass `decoder_keyframe = false` — wire `FLAG_SOF` covers it.
-// Uncorroborated: C callers cannot supply bitstream evidence.
-//
-// # Safety
-// `g` is a valid gate handle; `out_present` is writable or NULL.
-PunktfunkStatus punktfunk_reanchor_gate_on_decoded(ReanchorGate *g,
-                                                   uint32_t flags,
-                                                   bool decoder_keyframe,
-                                                   bool *out_present);
-
-// A received AU produced no decoded frame. Writes to `out_request_kf` whether the
-// no-output streak has tripped and the client should (throttled) request a keyframe
-// — the gate arms the freeze at the same time.
-//
-// # Safety
-// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
-PunktfunkStatus punktfunk_reanchor_gate_on_no_output(ReanchorGate *g, bool *out_request_kf);
-
-// Periodic fold of `frames_dropped` plus the overdue backstop. Writes to
-// `out_request_kf` whether the client should (throttled) request a keyframe
-// (a drop-count climb armed a freeze, or the freeze is overdue and re-asks).
-//
-// # Safety
-// `g` is a valid gate handle; `out_request_kf` is writable or NULL.
-PunktfunkStatus punktfunk_reanchor_gate_poll(ReanchorGate *g,
-                                             uint64_t frames_dropped,
-                                             bool *out_request_kf);
-
-// Whether the gate is currently withholding concealed frames (frozen on the last
-// good picture). Writes `false` on a NULL gate.
-//
-// # Safety
-// `g` is a valid gate handle; `out_holding` is writable or NULL.
-PunktfunkStatus punktfunk_reanchor_gate_is_holding(const ReanchorGate *g, bool *out_holding);
 
 // Create an admission rule. Free with [`punktfunk_au_admission_free`]. Never returns NULL.
 AuAdmission *punktfunk_au_admission_new(void);

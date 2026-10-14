@@ -170,9 +170,9 @@ fn a_dropped_access_unit_is_detected_on_the_very_next_one() {
 
 /// HEVC drop detection is RPS `MissingReference` only — no `frame_num` gap.
 /// A sub-layer non-reference (`TRAIL_N` and friends) is named by nobody, so
-/// its loss is a missing output frame (`client::FrameOrder::Gap`), not bitstream
-/// damage. Both verdicts are asserted so silence is not a hole and a hole
-/// cannot hide behind it.
+/// its loss is a gap in the frame index, which the client's recovery driver
+/// reports (`client::Arrival::gap`), not bitstream damage. Both verdicts are
+/// asserted so silence is not a hole and a hole cannot hide behind it.
 #[test]
 fn a_dropped_hevc_reference_picture_is_detected_through_the_rps() {
     // Classify from a clean replay so the labels are the stream's, not a guess.

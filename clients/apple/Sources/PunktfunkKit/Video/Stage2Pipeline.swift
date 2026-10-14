@@ -1019,7 +1019,7 @@ private final class DeadlineLinkDelegate: NSObject, CAMetalDisplayLinkDelegate {
 /// decode signal. Created as a pipeline property so the decoder's `onDecoded` callback (built in
 /// `init`, before the connection exists) can capture it, then `start` binds the live connection +
 /// the arming flag once known — the same "reference captured in init, configured in start" shape as
-/// `recovery`/`gate`. `record` runs on VideoToolbox's callback thread; `bind` runs once on the main
+/// `HudSink`. `record` runs on VideoToolbox's callback thread; `bind` runs once on the main
 /// thread before the pump feeds the first AU, so the plain fields are safe (set-once, then read).
 private final class DecodeReport: @unchecked Sendable {
     private weak var connection: PunktfunkConnection?
@@ -1052,6 +1052,40 @@ final class HudSink: @unchecked Sendable {
     func floor(ns: Int64) { connection?.hudOsFloor(ns: ns) }
 }
 
+/// The decode callbacks' way to the core's loss recovery, which owns the freeze and every ask.
+/// Built in `init`, before a connection exists: `start` binds the session's and `stop` unbinds
+/// it, so a late callback reports nothing. The callbacks run on VideoToolbox threads, hence the
+/// lock. `refusing` gives a run of refusals its one log line.
+private final class RecoveryReport: @unchecked Sendable {
+    private let lock = NSLock()
+    private var connection: PunktfunkConnection?
+    private var refusing = false
+
+    func bind(_ c: PunktfunkConnection?) {
+        lock.lock(); connection = c; refusing = false; lock.unlock()
+    }
+
+    /// One decoded picture. True: hold the last good one instead. Unbound, everything shows.
+    func decoded(flags: UInt32) -> Bool {
+        lock.lock()
+        refusing = false
+        let c = connection
+        lock.unlock()
+        return c?.recoveryOnDecoded(flags: flags) ?? false
+    }
+
+    /// One refused AU. True on the first since a decoded picture.
+    func refused() -> Bool {
+        lock.lock()
+        let first = !refusing
+        refusing = true
+        let c = connection
+        lock.unlock()
+        c?.recoveryOnNoOutput()
+        return first
+    }
+}
+
 public final class Stage2Pipeline {
     private let ring: FrameStore<ReadyFrame>
     private let presenter: MetalVideoPresenter
@@ -1077,15 +1111,12 @@ public final class Stage2Pipeline {
     private let endToEndMeter: LatencyMeter?
     /// The stats overlay's decode, display and OS-floor stamps; `start` binds the connection.
     private let hud = HudSink()
-    private let recovery = KeyframeRecovery()
+    /// The decoder callbacks' reports to the core's loss recovery; `start` binds the connection.
+    private let recovery = RecoveryReport()
     /// Feeds the core Automatic-bitrate controller's decode signal from the decode callback; `start`
     /// binds the live connection + arming flag (see DecodeReport).
     private let decodeReport = DecodeReport()
     private let frameHDR = FrameHDRReporter()
-    /// Post-loss freeze-until-reanchor gate (shared core policy via the C ABI). Created here seeded 0;
-    /// `start` reseeds it to the live connection's drop count. Captured by the decoder callbacks
-    /// (which withhold concealed frames) and driven by the pump (arm on a gap, poll per iteration).
-    private let gate = ReanchorGate(framesDropped: 0)
     private var token = StopFlag()
     /// LIVE host↔client clock offset, read AT EACH RECORD — never cached per session. Until
     /// 2026-08-13 this was a `let` snapshot of the connect-time handshake, and on a host whose
@@ -1168,7 +1199,6 @@ public final class Stage2Pipeline {
         let ring = ring
         let recovery = recovery
         let renderSignal = renderSignal
-        let gate = gate
         let decodeReport = decodeReport
         let frameHDR = frameHDR
         let hud = hud
@@ -1184,7 +1214,7 @@ public final class Stage2Pipeline {
             onDecoded: { frame in
                 // Decode stage = received→decoded, both client CLOCK_REALTIME (offset 0 — no
                 // skew applies). Stamped at decode completion, so it covers every decoded frame,
-                // including ones the re-anchor gate withholds or the newest-wins ring drops.
+                // including ones the core's freeze holds or the newest-wins ring drops.
                 hud.decoded(
                     ptsNs: frame.ptsNs, receivedNs: frame.receivedNs, decodedNs: frame.decodedNs)
                 debugStats.decoded(
@@ -1193,12 +1223,10 @@ public final class Stage2Pipeline {
                 // device's real decode limit instead of the network link ceiling. Every decoded
                 // frame (not just presented ones), so a newest-wins drop can't hide the backlog.
                 decodeReport.record(receivedNs: frame.receivedNs, decodedNs: frame.decodedNs)
-                // Freeze-until-reanchor: WITHHOLD a decoder-concealed post-loss frame (the gray/
-                // garbage VideoToolbox returns Ok for a reference-missing delta) — don't submit it,
-                // so the CAMetalLayer keeps its last good drawable on glass. The gate lifts (returns
-                // present) on a proven clean re-anchor (IDR / RFI anchor / 2nd recovery mark) or the
-                // bounded backstop. decoderKeyframe=false: VT doesn't flag IDRs, the wire FLAG_SOF does.
-                guard gate.onDecoded(flags: frame.flags) else { return }
+                // VideoToolbox returns Ok with a gray picture for a delta whose reference is gone.
+                // While the core's freeze holds, such a frame is not submitted, so the CAMetalLayer
+                // keeps its last good drawable until a proven re-anchor lifts it.
+                if recovery.decoded(flags: frame.flags) { return }
                 if case .video(_, let isHDR) = frame.image { frameHDR.note(isHDR) }
                 if let decodedSink {
                     let submitStarted = CACurrentMediaTime()
@@ -1215,15 +1243,13 @@ public final class Stage2Pipeline {
                 // FRAME ARRIVAL is the render trigger (never the display link — see the header).
                 renderSignal.signal()
             },
-            // Async decode failure: fold it into the gate's no-output streak (which arms the freeze
-            // after a short run, matching the desktop), and when that trips ask the host for a
-            // fresh IDR now (infinite GOP — it wouldn't otherwise come soon). One WARN per sent
-            // ask carries the OSStatus, the only trace a field log has of what VideoToolbox refused.
+            // Async decode failure: reported to the core, which freezes and asks for an IDR after
+            // three in a row. One WARN per run of refusals carries the OSStatus, the only trace
+            // a field log has of what VideoToolbox refused.
             onDecodeError: { status in
-                if gate.onNoOutput(), recovery.request() {
+                if recovery.refused() {
                     pumpLog.warning(
-                        "video: VideoToolbox refused an AU status=\(status, privacy: .public) — asked the host for a keyframe"
-                    )
+                        "video: VideoToolbox refused an AU status=\(status, privacy: .public)")
                 }
             })
     }
@@ -1246,10 +1272,10 @@ public final class Stage2Pipeline {
     ) {
         clockOffset = { connection.clockOffsetNs } // live (re-synced) — see the field doc
         frameHDR.bind(onFrameHDR)
-        recovery.bind(connection) // arm host-keyframe recovery for this session
+        recovery.bind(connection) // the decode callbacks' reports to the core's loss recovery
         decodeReport.bind(connection) // arm the Automatic-bitrate decode signal for this session
         hud.bind(connection) // the overlay's decode, display and floor stamps
-        gate.reseed(framesDropped: connection.framesDropped()) // baseline the freeze to this session
+        connection.recoveryReset() // a pipeline start is a fresh decoder: the freeze starts over
         // A fresh session is a fresh source clock: re-anchor on its first frame rather than slew
         // for seconds off the previous host's offset. (Mid-session discontinuities — background
         // resume, a stream idle under the infinite GOP — arrive as a source-timestamp gap the loop
@@ -1284,7 +1310,7 @@ public final class Stage2Pipeline {
                 onHdrMeta: { [weak presenter] meta in presenter?.setHdrMeta(meta) })
             : Self.makeVideoToolboxPump(
                 connection: connection, token: token, pumpStopped: pumpStopped,
-                decoder: decoder, gate: gate, recovery: recovery,
+                decoder: decoder,
                 onFrame: onFrame, onSessionEnd: onSessionEnd, onDecodedSize: onDecodedSize,
                 onHdrMeta: { presenter.setHdrMeta($0) })
         thread.name = "punktfunk-stage2-pump"
@@ -1878,7 +1904,7 @@ public final class Stage2Pipeline {
             _ = renderStopped.wait(timeout: .now() + 0.5)
         }
         decoder.reset()
-        recovery.bind(nil) // stop requesting keyframes once the session is torn down
+        recovery.bind(nil) // a late decode callback reports nothing once the session is torn down
     }
 
     deinit {
@@ -1892,7 +1918,7 @@ public final class Stage2Pipeline {
     /// can't leak a live pipeline.
     private static func makeVideoToolboxPump(
         connection: PunktfunkConnection, token: StopFlag, pumpStopped: DispatchSemaphore,
-        decoder: VideoDecoder, gate: ReanchorGate, recovery: KeyframeRecovery,
+        decoder: VideoDecoder,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
         onSessionEnd: (@Sendable () -> Void)?,
         onDecodedSize: (@Sendable (Int, Int) -> Void)?,
@@ -1900,7 +1926,7 @@ public final class Stage2Pipeline {
     ) -> Thread {
         Thread {
             defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
-            var intake = AUIntake(connection: connection, gate: gate, recovery: recovery)
+            var intake = AUIntake(connection: connection)
             // Hardware-only backstop (4:4:4, AV1): 3 s in which every decode fails means this device
             // can't decode the mode at all, e.g. past a resolution ceiling. End instead of looping on
             // black. Timed, not counted: after a failure only IDRs reach the decoder.
