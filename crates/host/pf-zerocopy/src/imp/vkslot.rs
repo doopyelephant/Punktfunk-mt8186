@@ -18,7 +18,7 @@
 //! session still starts.
 
 use super::cuda::{self, CUdeviceptr, PlaneLayout};
-use super::vkdev;
+use super::vkdev::{self, VkBufferAlloc};
 use anyhow::{anyhow, ensure, Context as _, Result};
 use ash::vk;
 use std::os::fd::{FromRawFd as _, OwnedFd};
@@ -123,8 +123,7 @@ pub struct VkSlotRef {
 /// against a still-executing submit). Bindings are written once: slot buffer is immutable,
 /// cursor staging is shared.
 struct SlotAlloc {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
+    buf: VkBufferAlloc,
     /// Allocation size, what a second OPAQUE_FD import ([`VkSlotBlend::slot_fd`]) must cover.
     size: u64,
     /// CUDA import of the exported OPAQUE_FD — drop before the Vulkan memory is freed.
@@ -251,8 +250,7 @@ struct ReframeStage {
     pipeline: vk::Pipeline,
     pool: vk::DescriptorPool,
     /// Float intermediate, `4` floats per texel of the widest plane's x pass.
-    tmp: vk::Buffer,
-    tmp_mem: vk::DeviceMemory,
+    tmp: VkBufferAlloc,
     tmp_bytes: u64,
     /// One set per (staging slot id, NVENC slot id) pair. Freed with the slots.
     sets: Vec<(usize, usize, vk::DescriptorSet)>,
@@ -274,8 +272,7 @@ pub struct VkSlotBlend {
     /// One pipeline per [`SlotFormat`], indexed by `mode()` (spec constant).
     pipelines: [vk::Pipeline; PIPELINE_MODES as usize],
     /// Host-visible cursor bitmap (CURSOR_MAX²·4, tight rows), persistently mapped.
-    cur_buf: vk::Buffer,
-    cur_mem: vk::DeviceMemory,
+    cur: VkBufferAlloc,
     cur_map: *mut u8,
     slots: Vec<SlotAlloc>,
     /// Stream-ordered blend (`None` = CPU-synced only). See [`Timeline`].
@@ -317,8 +314,7 @@ impl VkSlotBlend {
                 pipe_layout: vk::PipelineLayout::null(),
                 desc_pool: vk::DescriptorPool::null(),
                 pipelines: [vk::Pipeline::null(); PIPELINE_MODES as usize],
-                cur_buf: vk::Buffer::null(),
-                cur_mem: vk::DeviceMemory::null(),
+                cur: VkBufferAlloc::default(),
                 cur_map: std::ptr::null_mut(),
                 slots: Vec::new(),
                 timeline: None,
@@ -416,7 +412,7 @@ impl VkSlotBlend {
                 .context("create fence")?;
 
             let cur_size = (CURSOR_MAX * CURSOR_MAX * 4) as u64;
-            self.cur_buf = d
+            self.cur.buffer = d
                 .create_buffer(
                     &vk::BufferCreateInfo::default()
                         .size(cur_size)
@@ -424,14 +420,14 @@ impl VkSlotBlend {
                     None,
                 )
                 .context("create cursor buffer")?;
-            let reqs = d.get_buffer_memory_requirements(self.cur_buf);
+            let reqs = d.get_buffer_memory_requirements(self.cur.buffer);
             let mem_type = self
                 .memory_type(
                     reqs.memory_type_bits,
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 )
                 .context("cursor buffer memory type")?;
-            self.cur_mem = d
+            self.cur.memory = d
                 .allocate_memory(
                     &vk::MemoryAllocateInfo::default()
                         .allocation_size(reqs.size)
@@ -439,10 +435,10 @@ impl VkSlotBlend {
                     None,
                 )
                 .context("allocate cursor memory")?;
-            d.bind_buffer_memory(self.cur_buf, self.cur_mem, 0)
+            d.bind_buffer_memory(self.cur.buffer, self.cur.memory, 0)
                 .context("bind cursor memory")?;
             self.cur_map = d
-                .map_memory(self.cur_mem, 0, cur_size, vk::MemoryMapFlags::empty())
+                .map_memory(self.cur.memory, 0, cur_size, vk::MemoryMapFlags::empty())
                 .context("map cursor memory")? as *mut u8;
 
             // Binding 0 = surface SSBO, 1 = cursor SSBO (written once in `alloc_slot`).
@@ -583,9 +579,9 @@ impl VkSlotBlend {
                     return Err(e).context("allocate exportable slot memory");
                 }
             };
+            let buf = VkBufferAlloc { buffer, memory };
             if let Err(e) = d.bind_buffer_memory(buffer, memory, 0) {
-                d.free_memory(memory, None);
-                d.destroy_buffer(buffer, None);
+                buf.destroy(d);
                 return Err(e).context("bind slot memory");
             }
             let fd = match self.ext_fd.get_memory_fd(
@@ -595,16 +591,14 @@ impl VkSlotBlend {
             ) {
                 Ok(f) => OwnedFd::from_raw_fd(f),
                 Err(e) => {
-                    d.free_memory(memory, None);
-                    d.destroy_buffer(buffer, None);
+                    buf.destroy(d);
                     return Err(e).context("vkGetMemoryFdKHR(slot)");
                 }
             };
             let ext = match cuda::ExternalDmabuf::import_owned_fd(fd, reqs.size) {
                 Ok(c) => c,
                 Err(e) => {
-                    d.free_memory(memory, None);
-                    d.destroy_buffer(buffer, None);
+                    buf.destroy(d);
                     return Err(e).context("cuImportExternalMemory(slot OPAQUE_FD)");
                 }
             };
@@ -619,8 +613,7 @@ impl VkSlotBlend {
                 Ok(s) => s[0],
                 Err(e) => {
                     drop(ext); // CUDA mapping first
-                    d.free_memory(memory, None);
-                    d.destroy_buffer(buffer, None);
+                    buf.destroy(d);
                     return Err(e).context("allocate slot descriptor set");
                 }
             };
@@ -629,7 +622,7 @@ impl VkSlotBlend {
                 .offset(0)
                 .range(size)];
             let cur_info = [vk::DescriptorBufferInfo::default()
-                .buffer(self.cur_buf)
+                .buffer(self.cur.buffer)
                 .offset(0)
                 .range((CURSOR_MAX * CURSOR_MAX * 4) as u64)];
             let writes = [
@@ -655,8 +648,7 @@ impl VkSlotBlend {
                 Err(e) => {
                     let _ = d.free_descriptor_sets(self.desc_pool, &[desc]);
                     drop(ext); // CUDA mapping first
-                    d.free_memory(memory, None);
-                    d.destroy_buffer(buffer, None);
+                    buf.destroy(d);
                     return Err(e).context("allocate slot command buffer");
                 }
             };
@@ -667,8 +659,7 @@ impl VkSlotBlend {
                 id: self.slots.len(),
             };
             self.slots.push(SlotAlloc {
-                buffer,
-                memory,
+                buf,
                 size: reqs.size,
                 cuda: ext,
                 cmd,
@@ -687,11 +678,11 @@ impl VkSlotBlend {
             .slots
             .get(id)
             .ok_or_else(|| anyhow!("bad slot id {id}"))?;
-        // SAFETY: `s.memory` is a live exportable allocation of this device.
+        // SAFETY: `s.buf.memory` is a live exportable allocation of this device.
         let fd = unsafe {
             self.ext_fd.get_memory_fd(
                 &vk::MemoryGetFdInfoKHR::default()
-                    .memory(s.memory)
+                    .memory(s.buf.memory)
                     .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD),
             )
         }
@@ -729,8 +720,7 @@ impl VkSlotBlend {
             unsafe {
                 let _ = self.device.free_descriptor_sets(self.desc_pool, &[s.desc]);
                 self.device.free_command_buffers(self.cmd_pool, &[s.cmd]);
-                self.device.destroy_buffer(s.buffer, None);
-                self.device.free_memory(s.memory, None);
+                s.buf.destroy(&self.device);
             }
         }
     }
@@ -1180,10 +1170,8 @@ impl VkSlotBlend {
             for (_, _, set) in stage.sets.drain(..) {
                 let _ = d.free_descriptor_sets(stage.pool, &[set]);
             }
-            d.destroy_buffer(stage.tmp, None);
-            d.free_memory(stage.tmp_mem, None);
-            stage.tmp = vk::Buffer::null();
-            stage.tmp_mem = vk::DeviceMemory::null();
+            stage.tmp.destroy(d);
+            stage.tmp = VkBufferAlloc::default();
             stage.tmp_bytes = 0;
             let tmp = d
                 .create_buffer(
@@ -1193,7 +1181,7 @@ impl VkSlotBlend {
                     None,
                 )
                 .context("create reframe intermediate")?;
-            stage.tmp = tmp;
+            stage.tmp.buffer = tmp;
             let reqs = d.get_buffer_memory_requirements(tmp);
             let mem_type = vkdev::memory_type(
                 &self.mem_props,
@@ -1201,7 +1189,7 @@ impl VkSlotBlend {
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )
             .context("reframe intermediate memory")?;
-            stage.tmp_mem = d
+            stage.tmp.memory = d
                 .allocate_memory(
                     &vk::MemoryAllocateInfo::default()
                         .allocation_size(reqs.size)
@@ -1209,7 +1197,7 @@ impl VkSlotBlend {
                     None,
                 )
                 .context("allocate reframe intermediate")?;
-            d.bind_buffer_memory(tmp, stage.tmp_mem, 0)
+            d.bind_buffer_memory(tmp, stage.tmp.memory, 0)
                 .context("bind reframe intermediate")?;
             stage.tmp_bytes = tmp_bytes;
         }
@@ -1223,8 +1211,7 @@ impl VkSlotBlend {
             pipe_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
             pool: vk::DescriptorPool::null(),
-            tmp: vk::Buffer::null(),
-            tmp_mem: vk::DeviceMemory::null(),
+            tmp: VkBufferAlloc::default(),
             tmp_bytes: 0,
             sets: Vec::new(),
         };
@@ -1311,7 +1298,7 @@ impl VkSlotBlend {
     /// The descriptor set binding staging slot `src`, the intermediate and NVENC slot `dst`.
     fn reframe_set(&mut self, src: usize, dst: usize) -> Result<vk::DescriptorSet> {
         let (src_buf, dst_buf) = match (self.slots.get(src), self.slots.get(dst)) {
-            (Some(s), Some(d)) => (s.buffer, d.buffer),
+            (Some(s), Some(d)) => (s.buf.buffer, d.buf.buffer),
             _ => anyhow::bail!("bad reframe slot ids {src} → {dst}"),
         };
         let stage = self.reframe.as_mut().expect("ensure_reframe ran");
@@ -1336,7 +1323,7 @@ impl VkSlotBlend {
                     .offset(0)
                     .range(vk::WHOLE_SIZE)]
             };
-            let (a, b, c) = (info(src_buf), info(stage.tmp), info(dst_buf));
+            let (a, b, c) = (info(src_buf), info(stage.tmp.buffer), info(dst_buf));
             fn write<'a>(
                 set: vk::DescriptorSet,
                 binding: u32,
@@ -1366,8 +1353,7 @@ impl Drop for VkSlotBlend {
             // device. `free_slots` waited the queue idle and freed the sets.
             unsafe {
                 let d = &self.device;
-                d.destroy_buffer(stage.tmp, None);
-                d.free_memory(stage.tmp_mem, None);
+                stage.tmp.destroy(d);
                 d.destroy_pipeline(stage.pipeline, None);
                 d.destroy_pipeline_layout(stage.pipe_layout, None);
                 d.destroy_descriptor_pool(stage.pool, None);
@@ -1407,14 +1393,9 @@ impl Drop for VkSlotBlend {
                 d.destroy_descriptor_set_layout(self.desc_layout, None);
             }
             if !self.cur_map.is_null() {
-                d.unmap_memory(self.cur_mem);
+                d.unmap_memory(self.cur.memory);
             }
-            if self.cur_buf != vk::Buffer::null() {
-                d.destroy_buffer(self.cur_buf, None);
-            }
-            if self.cur_mem != vk::DeviceMemory::null() {
-                d.free_memory(self.cur_mem, None);
-            }
+            self.cur.destroy(d);
             if self.fence != vk::Fence::null() {
                 d.destroy_fence(self.fence, None);
             }

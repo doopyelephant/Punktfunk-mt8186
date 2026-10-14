@@ -15,8 +15,9 @@
 //! reusing one waits its own value first.
 
 use super::VkBridge;
+use crate::imp::drm;
 use crate::imp::proto::{ConvertOut, ConvertSrc, CursorRect};
-use crate::imp::{drm, vkdev};
+use crate::imp::vkdev::{self, VkBufferAlloc, VkImageAlloc};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use ash::vk;
 use std::collections::HashMap;
@@ -32,9 +33,7 @@ const CURSOR_MAX_BYTES: u64 = 256 * 256 * 4;
 const FRAMES: usize = 4;
 
 struct SrcImage {
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    view: vk::ImageView,
+    alloc: VkImageAlloc,
     /// Geometry the image was created for; a change re-imports.
     shape: (u32, u64, u32, u32, u32, u32),
     /// A submitted pass has acquired it: the first acquire transitions from UNDEFINED,
@@ -43,14 +42,12 @@ struct SrcImage {
 }
 
 struct SlotBuf {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
+    buf: VkBufferAlloc,
     size: u64,
 }
 
 struct CursorBuf {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
+    buf: VkBufferAlloc,
     cap: u64,
     map: *mut u8,
 }
@@ -93,18 +90,14 @@ impl ConvertState {
         // retires the work before any handle it used is freed.
         unsafe {
             for (_, s) in self.srcs.drain() {
-                d.destroy_image_view(s.view, None);
-                d.destroy_image(s.image, None);
-                d.free_memory(s.memory, None);
+                s.alloc.destroy(d);
             }
             for (_, s) in self.slots.drain() {
-                d.destroy_buffer(s.buffer, None);
-                d.free_memory(s.memory, None);
+                s.buf.destroy(d);
             }
             if let Some(c) = self.cursor.take() {
-                d.unmap_memory(c.memory);
-                d.destroy_buffer(c.buffer, None);
-                d.free_memory(c.memory, None);
+                d.unmap_memory(c.buf.memory);
+                c.buf.destroy(d);
             }
             let cmds: Vec<vk::CommandBuffer> = self.frames.drain(..).map(|f| f.cmd).collect();
             if !cmds.is_empty() {
@@ -358,23 +351,15 @@ impl VkBridge {
                     return Err(e).context("import slot OPAQUE_FD");
                 }
             };
+            let buf = VkBufferAlloc { buffer, memory };
             if let Err(e) = d.bind_buffer_memory(buffer, memory, 0) {
-                d.free_memory(memory, None);
-                d.destroy_buffer(buffer, None);
+                buf.destroy(d);
                 return Err(e).context("bind slot import");
             }
             let st = self.conv.as_mut().expect("ensured above");
-            if let Some(old) = st.slots.insert(
-                id,
-                SlotBuf {
-                    buffer,
-                    memory,
-                    size,
-                },
-            ) {
+            if let Some(old) = st.slots.insert(id, SlotBuf { buf, size }) {
                 let _ = d.device_wait_idle();
-                d.destroy_buffer(old.buffer, None);
-                d.free_memory(old.memory, None);
+                old.buf.destroy(d);
             }
             Ok(())
         }
@@ -389,8 +374,7 @@ impl VkBridge {
             unsafe {
                 let _ = self.device.device_wait_idle();
                 for (_, s) in st.slots.drain() {
-                    self.device.destroy_buffer(s.buffer, None);
-                    self.device.free_memory(s.memory, None);
+                    s.buf.destroy(&self.device);
                 }
             }
         }
@@ -479,9 +463,8 @@ impl VkBridge {
             st.cursor_dims = None;
             if let Some(old) = st.cursor.take() {
                 let _ = d.device_wait_idle();
-                d.unmap_memory(old.memory);
-                d.destroy_buffer(old.buffer, None);
-                d.free_memory(old.memory, None);
+                d.unmap_memory(old.buf.memory);
+                old.buf.destroy(d);
             }
             let cap = need.max(16);
             let buffer = d
@@ -508,27 +491,21 @@ impl VkBridge {
                 )
                 .inspect_err(|_| d.destroy_buffer(buffer, None))
                 .context("allocate cursor memory")?;
+            let buf = VkBufferAlloc { buffer, memory };
             if let Err(e) = d.bind_buffer_memory(buffer, memory, 0) {
-                d.free_memory(memory, None);
-                d.destroy_buffer(buffer, None);
+                buf.destroy(d);
                 return Err(e).context("bind cursor memory");
             }
             let map = match d.map_memory(memory, 0, cap, vk::MemoryMapFlags::empty()) {
                 Ok(p) => p.cast::<u8>(),
                 Err(e) => {
-                    d.free_memory(memory, None);
-                    d.destroy_buffer(buffer, None);
+                    buf.destroy(d);
                     return Err(e).context("map cursor memory");
                 }
             };
             std::ptr::write_bytes(map, 0, cap as usize);
             let st = self.conv.as_mut().expect("convert state");
-            st.cursor = Some(CursorBuf {
-                buffer,
-                memory,
-                cap,
-                map,
-            });
+            st.cursor = Some(CursorBuf { buf, cap, map });
             Ok(())
         }
     }
@@ -545,13 +522,11 @@ impl VkBridge {
             let st = self.conv.as_mut().expect("convert state");
             if let Some(img) = st.srcs.get_mut(&s.fd) {
                 if img.shape == shape {
-                    return Ok((img.image, img.view, !img.acquired));
+                    return Ok((img.alloc.image, img.alloc.view, !img.acquired));
                 }
                 let old = st.srcs.remove(&s.fd).expect("checked");
                 let _ = self.device.device_wait_idle();
-                self.device.destroy_image_view(old.view, None);
-                self.device.destroy_image(old.image, None);
-                self.device.free_memory(old.memory, None);
+                old.alloc.destroy(&self.device);
             }
             ensure!(
                 !matches!(s.fourcc, drm::NV12 | drm::P010),
@@ -563,7 +538,7 @@ impl VkBridge {
             // SAFETY: `s.fd` is the worker's cached dmabuf fd, open for this synchronous call;
             // the import dups it and keeps no borrow.
             let fd = BorrowedFd::borrow_raw(s.fd);
-            let (image, memory) = vkdev::import_dmabuf_image(
+            let mut alloc = vkdev::import_dmabuf_image(
                 &self.instance,
                 self.phys,
                 &self.device,
@@ -582,11 +557,10 @@ impl VkBridge {
                 },
                 None,
             )?;
-            let view = match vkdev::color_view(&self.device, image, fmt, 0) {
+            alloc.view = match vkdev::color_view(&self.device, alloc.image, fmt, 0) {
                 Ok(v) => v,
                 Err(e) => {
-                    self.device.destroy_image(image, None);
-                    self.device.free_memory(memory, None);
+                    alloc.destroy(&self.device);
                     return Err(e);
                 }
             };
@@ -594,14 +568,12 @@ impl VkBridge {
             st.srcs.insert(
                 s.fd,
                 SrcImage {
-                    image,
-                    memory,
-                    view,
+                    alloc,
                     shape,
                     acquired: false,
                 },
             );
-            Ok((image, view, true))
+            Ok((alloc.image, alloc.view, true))
         }
     }
 
@@ -614,9 +586,7 @@ impl VkBridge {
                 // retires the work before any handle it used is freed.
                 unsafe {
                     let _ = self.device.device_wait_idle();
-                    self.device.destroy_image_view(old.view, None);
-                    self.device.destroy_image(old.image, None);
-                    self.device.free_memory(old.memory, None);
+                    old.alloc.destroy(&self.device);
                 }
             }
         }
@@ -691,10 +661,10 @@ impl VkBridge {
                 .image_view(view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let dst_info = [vk::DescriptorBufferInfo::default()
-                .buffer(slot_buf.buffer)
+                .buffer(slot_buf.buf.buffer)
                 .range(vk::WHOLE_SIZE)];
             let cur_info = [vk::DescriptorBufferInfo::default()
-                .buffer(cur.buffer)
+                .buffer(cur.buf.buffer)
                 .range(vk::WHOLE_SIZE)];
             d.update_descriptor_sets(
                 &[
@@ -884,7 +854,7 @@ impl VkBridge {
             }
             let (src_buffer, src_size) = {
                 let s = &self.src_cache[&src.fd];
-                (s.buffer, s.size)
+                (s.buf.buffer, s.size)
             };
             anyhow::ensure!(src_size >= span, "dmabuf smaller than its planes");
             let (idx, cmd, _, value) = self.next_pass()?;
@@ -924,7 +894,7 @@ impl VkBridge {
                 &[acquire],
                 &[],
             );
-            d.cmd_copy_buffer(cmd, src_buffer, slot_buf.buffer, &regions);
+            d.cmd_copy_buffer(cmd, src_buffer, slot_buf.buf.buffer, &regions);
             d.end_command_buffer(cmd).context("end copy cmd")?;
             self.submit_pass(idx, cmd, value)
         }

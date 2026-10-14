@@ -7,7 +7,7 @@
 use crate::vk_util::{color_range, make_host_buffer, make_plain_image};
 use anyhow::Result;
 use ash::vk;
-use pf_zerocopy::vkdev::MappedMemory;
+use pf_zerocopy::vkdev::{MappedMemory, VkBufferAlloc, VkImageAlloc};
 
 /// Cursor overlay cap (px). The CSC shader bounds sampling by push constant, so one allocation
 /// fits every pointer bitmap; a larger one uploads its top-left corner.
@@ -17,11 +17,8 @@ pub(crate) const CURSOR_MAX: u32 = 256;
 /// Per slot: a shared image races the previous frame's sampled read, and a shared serial leaves
 /// the other slot showing the previous pointer. [`Default`] is all-null.
 pub(crate) struct CursorPlane {
-    pub(crate) img: vk::Image,
-    mem: vk::DeviceMemory,
-    pub(crate) view: vk::ImageView,
-    pub(crate) stage: vk::Buffer,
-    stage_mem: vk::DeviceMemory,
+    pub(crate) img: VkImageAlloc,
+    pub(crate) stage: VkBufferAlloc,
     /// Serial of the uploaded bitmap. `u64::MAX` before the first: a real serial may be 0.
     serial: u64,
     /// The image has left UNDEFINED.
@@ -31,11 +28,8 @@ pub(crate) struct CursorPlane {
 impl Default for CursorPlane {
     fn default() -> Self {
         Self {
-            img: vk::Image::null(),
-            mem: vk::DeviceMemory::null(),
-            view: vk::ImageView::null(),
-            stage: vk::Buffer::null(),
-            stage_mem: vk::DeviceMemory::null(),
+            img: VkImageAlloc::default(),
+            stage: VkBufferAlloc::default(),
             serial: u64::MAX,
             ready: false,
         }
@@ -48,7 +42,7 @@ impl CursorPlane {
         dev: &ash::Device,
         mem_props: &vk::PhysicalDeviceMemoryProperties,
     ) -> Result<Self> {
-        let (img, mem, view) = make_plain_image(
+        let img = make_plain_image(
             dev,
             mem_props,
             vk::Format::R8G8B8A8_UNORM,
@@ -58,8 +52,6 @@ impl CursorPlane {
         )?;
         let mut me = Self {
             img,
-            mem,
-            view,
             ..Self::default()
         };
         match make_host_buffer(
@@ -68,8 +60,8 @@ impl CursorPlane {
             (CURSOR_MAX * CURSOR_MAX * 4) as u64,
             vk::BufferUsageFlags::TRANSFER_SRC,
         ) {
-            Ok((stage, stage_mem)) => {
-                (me.stage, me.stage_mem) = (stage, stage_mem);
+            Ok(stage) => {
+                me.stage = stage;
                 Ok(me)
             }
             Err(e) => {
@@ -90,7 +82,7 @@ impl CursorPlane {
         cursor: Option<&pf_frame::CursorOverlay>,
         pq: bool,
     ) -> Result<[i32; 4]> {
-        let img = self.img;
+        let img = self.img.image;
         let barrier = |old: vk::ImageLayout, new: vk::ImageLayout, ss, sa, ds, da| {
             vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(ss)
@@ -113,7 +105,7 @@ impl CursorPlane {
                     let n = ((cw as usize) * (ch as usize) * 4).min(px.len());
                     // The plane's staging memory: host-visible, `CURSOR_MAX`² × 4 bytes, mapped
                     // only here.
-                    MappedMemory::map(dev, self.stage_mem, n)?.copy_from_slice(&px[..n]);
+                    MappedMemory::map(dev, self.stage.memory, n)?.copy_from_slice(&px[..n]);
                     let old = if self.ready {
                         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                     } else {
@@ -132,7 +124,7 @@ impl CursorPlane {
                     );
                     dev.cmd_copy_buffer_to_image(
                         cmd,
-                        self.stage,
+                        self.stage.buffer,
                         img,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[vk::BufferImageCopy::default()
@@ -191,11 +183,8 @@ impl CursorPlane {
 
     /// Destroy every handle. A null one, from a partly built slot, is a no-op.
     pub(crate) unsafe fn destroy(self, dev: &ash::Device) {
-        dev.destroy_image_view(self.view, None);
-        dev.destroy_image(self.img, None);
-        dev.free_memory(self.mem, None);
-        dev.destroy_buffer(self.stage, None);
-        dev.free_memory(self.stage_mem, None);
+        self.img.destroy(dev);
+        self.stage.destroy(dev);
     }
 }
 

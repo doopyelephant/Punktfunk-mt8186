@@ -15,6 +15,7 @@ use super::*;
 use crate::vk_util::{ext_advertised, find_mem, find_mem_preferring, make_plain_image, make_view};
 use anyhow::{bail, Result};
 use ash::vk;
+use pf_zerocopy::vkdev::VkImageAlloc;
 use std::ffi::c_void;
 
 pub(super) fn align_up(v: u64, a: u64) -> u64 {
@@ -331,7 +332,7 @@ pub(super) unsafe fn make_video_image(
     usage: vk::ImageUsageFlags,
     profile_list: &mut vk::VideoProfileListInfoKHR,
     concurrent: &[u32],
-) -> Result<(vk::Image, vk::DeviceMemory)> {
+) -> Result<VkImageAlloc> {
     make_video_image_flags(
         device,
         mp,
@@ -360,7 +361,7 @@ pub(super) unsafe fn make_video_image_flags(
     flags: vk::ImageCreateFlags,
     profile_list: &mut vk::VideoProfileListInfoKHR,
     concurrent: &[u32],
-) -> Result<(vk::Image, vk::DeviceMemory)> {
+) -> Result<VkImageAlloc> {
     let mut ci = vk::ImageCreateInfo::default()
         .flags(flags)
         .image_type(vk::ImageType::TYPE_2D)
@@ -386,7 +387,7 @@ pub(super) unsafe fn make_video_image_flags(
     }
     let img = device.create_image(&ci, None)?;
     let req = device.get_image_memory_requirements(img);
-    // Destroy the image if alloc fails: callers only ever see the completed pair.
+    // Destroy the image if alloc fails: callers only ever see the completed alloc, view null.
     let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
     let mem = match find_mem_preferring(mp, req.memory_type_bits, local).and_then(|ti| {
         Ok(device.allocate_memory(
@@ -402,12 +403,16 @@ pub(super) unsafe fn make_video_image_flags(
             return Err(e);
         }
     };
+    let alloc = VkImageAlloc {
+        image: img,
+        memory: mem,
+        view: vk::ImageView::null(),
+    };
     if let Err(e) = device.bind_image_memory(img, mem, 0) {
-        device.destroy_image(img, None);
-        device.free_memory(mem, None);
+        alloc.destroy(device);
         return Err(e.into());
     }
-    Ok((img, mem))
+    Ok(alloc)
 }
 
 /// Build one in-flight frame's private resources into `f`. `profile_list`/`profile` are
@@ -439,7 +444,7 @@ pub(super) unsafe fn make_frame(
     // Padded-copy staging: aligned encode-src filled by a transfer blit each frame.
     // TRANSFER_SRC: `record_pad_blit` self-copies the last visible column.
     if let Some(fmt) = pad_fmt {
-        (f.pad_img, f.pad_mem) = make_video_image(
+        f.pad = make_video_image(
             device,
             mem_props,
             fmt,
@@ -452,7 +457,7 @@ pub(super) unsafe fn make_frame(
             profile_list,
             fams,
         )?;
-        f.pad_view = make_view(device, f.pad_img, fmt, 0)?;
+        f.pad.view = make_view(device, f.pad.image, fmt, 0)?;
     }
     // RGB-direct skips CSC: encode-src is the imported RGB (or lazy CPU staging).
     // Frame keeps the null handles; teardown treats them as empty.
@@ -516,7 +521,7 @@ unsafe fn make_frame_csc(
         // The CSC writes the picture's planes through plane views: no scratch, no copies.
         // MUTABLE_FORMAT allows a plane view; EXTENDED_USAGE lets STORAGE be a view-format
         // capability the picture format itself lacks.
-        (f.nv12_src, f.nv12_mem) = make_video_image_flags(
+        f.nv12 = make_video_image_flags(
             device,
             mem_props,
             pic,
@@ -530,30 +535,30 @@ unsafe fn make_frame_csc(
             profile_list,
             fams,
         )?;
-        f.nv12_view = make_usage_view(
+        f.nv12.view = make_usage_view(
             device,
-            f.nv12_src,
+            f.nv12.image,
             pic,
             vk::ImageAspectFlags::COLOR,
             vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
         )?;
         let storage = vk::ImageUsageFlags::STORAGE;
-        f.y_view = make_usage_view(
+        f.y.view = make_usage_view(
             device,
-            f.nv12_src,
+            f.nv12.image,
             y_fmt,
             vk::ImageAspectFlags::PLANE_0,
             storage,
         )?;
-        f.uv_view = make_usage_view(
+        f.uv.view = make_usage_view(
             device,
-            f.nv12_src,
+            f.nv12.image,
             uv_fmt,
             vk::ImageAspectFlags::PLANE_1,
             storage,
         )?;
     } else {
-        (f.nv12_src, f.nv12_mem) = make_video_image(
+        f.nv12 = make_video_image(
             device,
             mem_props,
             pic,
@@ -564,10 +569,10 @@ unsafe fn make_frame_csc(
             profile_list,
             fams,
         )?;
-        f.nv12_view = make_view(device, f.nv12_src, pic, 0)?;
+        f.nv12.view = make_view(device, f.nv12.image, pic, 0)?;
         // Scratch planes, copied into the picture after the CSC (`vkCmdCopyImage` needs equal
         // texel-block size).
-        (f.y_img, f.y_mem, f.y_view) = make_plain_image(
+        f.y = make_plain_image(
             device,
             mem_props,
             y_fmt,
@@ -575,7 +580,7 @@ unsafe fn make_frame_csc(
             h,
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
         )?;
-        (f.uv_img, f.uv_mem, f.uv_view) = make_plain_image(
+        f.uv = make_plain_image(
             device,
             mem_props,
             uv_fmt,
@@ -595,14 +600,14 @@ unsafe fn make_frame_csc(
             .set_layouts(&dsls),
     )?[0];
     let y_info = [vk::DescriptorImageInfo::default()
-        .image_view(f.y_view)
+        .image_view(f.y.view)
         .image_layout(vk::ImageLayout::GENERAL)];
     let uv_info = [vk::DescriptorImageInfo::default()
-        .image_view(f.uv_view)
+        .image_view(f.uv.view)
         .image_layout(vk::ImageLayout::GENERAL)];
     let cur_info = [vk::DescriptorImageInfo::default()
         .sampler(sampler)
-        .image_view(f.cursor.view)
+        .image_view(f.cursor.img.view)
         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
     device.update_descriptor_sets(
         &[
@@ -641,15 +646,15 @@ unsafe fn make_frame_common(
     with_ts: bool,
     f: &mut Frame,
 ) -> Result<()> {
-    f.bs_buf = device.create_buffer(
+    f.bs.buffer = device.create_buffer(
         &vk::BufferCreateInfo::default()
             .size(bs_size)
             .usage(vk::BufferUsageFlags::VIDEO_ENCODE_DST_KHR)
             .push_next(profile_list),
         None,
     )?;
-    let bs_req = device.get_buffer_memory_requirements(f.bs_buf);
-    f.bs_mem = device.allocate_memory(
+    let bs_req = device.get_buffer_memory_requirements(f.bs.buffer);
+    f.bs.memory = device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(bs_req.size)
             .memory_type_index(find_mem(
@@ -659,12 +664,14 @@ unsafe fn make_frame_common(
             )?),
         None,
     )?;
-    device.bind_buffer_memory(f.bs_buf, f.bs_mem, 0)?;
+    device.bind_buffer_memory(f.bs.buffer, f.bs.memory, 0)?;
     // Map once for the slot's lifetime; `read_slot` copies AUs out of coherent memory.
     // `vkFreeMemory` unmaps at teardown.
-    f.bs_ptr = BsPtr(
-        device.map_memory(f.bs_mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())? as *const u8,
-    );
+    f.bs_ptr =
+        BsPtr(
+            device.map_memory(f.bs.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+                as *const u8,
+        );
     // Two timestamps bracket this slot's compute batch (CSC split).
     if with_ts {
         f.ts_pool = device.create_query_pool(

@@ -1,7 +1,7 @@
 //! Vulkan helpers the LINEAR bridge ([`super::vulkan`]), the NVENC slot blend
 //! ([`super::vkslot`]) and pf-encode's Vulkan encoders share: the NVIDIA compute device CUDA
-//! runs on, the memory-type pick, a memory map held as a borrow, and the explicit-modifier
-//! dmabuf import.
+//! runs on, the memory-type pick, a memory map held as a borrow, image and buffer owners that
+//! carry their memory, and the explicit-modifier dmabuf import.
 
 use anyhow::{anyhow, ensure, Context, Result};
 use ash::vk;
@@ -317,6 +317,64 @@ impl Drop for MappedMemory<'_> {
     }
 }
 
+/// An image, the dedicated memory bound to it, and a view of it (null when it has none).
+/// No `Drop`: the owner destroys it once the GPU is idle and before the device, so a field
+/// left out of its teardown leaks and never dangles.
+#[derive(Clone, Copy, Default)]
+pub struct VkImageAlloc {
+    pub image: vk::Image,
+    pub memory: vk::DeviceMemory,
+    pub view: vk::ImageView,
+}
+
+impl VkImageAlloc {
+    /// Destroy the view, then the image, then free the memory. Null handles are skipped.
+    ///
+    /// # Safety
+    /// The handles belong to `device`, nothing queued still uses them, and `self` is not
+    /// destroyed twice.
+    pub unsafe fn destroy(self, device: &ash::Device) {
+        // SAFETY: caller contract; each handle is destroyed once, dependents first.
+        unsafe {
+            if self.view != vk::ImageView::null() {
+                device.destroy_image_view(self.view, None);
+            }
+            if self.image != vk::Image::null() {
+                device.destroy_image(self.image, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                device.free_memory(self.memory, None);
+            }
+        }
+    }
+}
+
+/// A buffer and the dedicated memory bound to it. Owned like [`VkImageAlloc`].
+#[derive(Clone, Copy, Default)]
+pub struct VkBufferAlloc {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+}
+
+impl VkBufferAlloc {
+    /// Destroy the buffer, then free the memory (which unmaps a persistent mapping). Null
+    /// handles are skipped.
+    ///
+    /// # Safety
+    /// As [`VkImageAlloc::destroy`].
+    pub unsafe fn destroy(self, device: &ash::Device) {
+        // SAFETY: caller contract; each handle is destroyed once, the buffer first.
+        unsafe {
+            if self.buffer != vk::Buffer::null() {
+                device.destroy_buffer(self.buffer, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                device.free_memory(self.memory, None);
+            }
+        }
+    }
+}
+
 /// A dmabuf to import as a `TYPE_2D` image with an explicit DRM modifier layout.
 pub struct DmabufImage<'a> {
     /// Borrowed: the import takes a dup of it.
@@ -419,8 +477,8 @@ pub unsafe fn modifier_importable(
 ///
 /// The import takes a dup of `src.fd`: Vulkan owns the dup only once memory allocation
 /// succeeds, and `vkFreeMemory` then closes it. On failure every handle this call created is
-/// destroyed, and the caller's fd stays theirs. The caller destroys the image, then frees the
-/// memory.
+/// destroyed, and the caller's fd stays theirs. The returned alloc has no view; the caller
+/// destroys it.
 ///
 /// # Safety
 /// `device` and `ext_fd` belong to the live device `mem_props` describes, with
@@ -434,7 +492,7 @@ pub unsafe fn import_dmabuf_image(
     mem_props: &vk::PhysicalDeviceMemoryProperties,
     src: &DmabufImage,
     profile_list: Option<&mut vk::VideoProfileListInfoKHR>,
-) -> Result<(vk::Image, vk::DeviceMemory)> {
+) -> Result<VkImageAlloc> {
     use std::os::fd::{AsRawFd, IntoRawFd};
     // SAFETY: caller contract for `instance`/`pd`; the queries read locals and `profile_list`.
     let supported = unsafe {
@@ -528,12 +586,16 @@ pub unsafe fn import_dmabuf_image(
                 return Err(e).context("import dmabuf memory (image)"); // `dup` closes once
             }
         };
+        let alloc = VkImageAlloc {
+            image,
+            memory,
+            view: vk::ImageView::null(),
+        };
         if let Err(e) = device.bind_image_memory(image, memory, 0) {
-            device.destroy_image(image, None);
-            device.free_memory(memory, None); // closes the imported fd
+            alloc.destroy(device); // frees the memory, which closes the imported fd
             return Err(e).context("bind dmabuf image");
         }
-        Ok((image, memory))
+        Ok(alloc)
     }
 }
 

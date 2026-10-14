@@ -177,16 +177,16 @@ fn slot_vram_cost_stays_bounded() {
         // SAFETY: plain memory-requirement queries on images this encoder owns.
         let per_slot: u64 = unsafe {
             [
-                enc.slots[0].y_img,
-                enc.slots[0].uv_img,
-                enc.slots[0].cursor.img,
+                enc.slots[0].y.image,
+                enc.slots[0].uv.image,
+                enc.slots[0].cursor.img.image,
             ]
             .iter()
             .map(|&i| enc.device.get_image_memory_requirements(i).size)
             .sum::<u64>()
                 + enc
                     .device
-                    .get_buffer_memory_requirements(enc.slots[0].cursor.stage)
+                    .get_buffer_memory_requirements(enc.slots[0].cursor.stage.buffer)
                     .size
         };
         assert!(per_slot > 0, "{name}: a slot must own real memory");
