@@ -272,7 +272,7 @@ pub struct RecoveryPolicy {
     pub cycle: Option<u32>,
     pub mid_wave: MidWave,
     /// An anchor or a confirmed reference abandons a wave in flight. `false` where the driver
-    /// sweeps on once asked (NVENC): the wave keeps the frame, an anchor's tag rides it and a
+    /// sweeps on once asked (NVENC): the wave keeps the frame, the anchor goes untagged and a
     /// confirmed reference waits for the close.
     pub abandons: bool,
 }
@@ -339,7 +339,8 @@ pub struct FramePlan {
 /// reference, then the wave. An IDR drops every other ask and the wave with it. An anchor
 /// or a confirmed reference is clean on its own, so it abandons a wave in flight unless the
 /// driver sweeps on ([`RecoveryPolicy::abandons`]). An armed loss with no answer starts a
-/// wave, or takes the IDR where the session has none.
+/// wave, or takes the IDR where the session has none. A wave picture is never an anchor: a
+/// loss the wave answers still damages it, and the close lifts the freeze.
 pub fn plan_frame(state: Recovery, pending: Pending, policy: &RecoveryPolicy) -> FramePlan {
     let clean = |refs| FramePlan {
         refs,
@@ -377,11 +378,7 @@ pub fn plan_frame(state: Recovery, pending: Pending, policy: &RecoveryPolicy) ->
         }
     }
     FramePlan {
-        refs: if pending.anchor {
-            FrameRef::Anchor
-        } else {
-            FrameRef::Chain
-        },
+        refs: FrameRef::Chain,
         wave: Some(wave),
         mark: wave.mark(state.spoiled),
         dirty: !wave.closes() || state.spoiled,
