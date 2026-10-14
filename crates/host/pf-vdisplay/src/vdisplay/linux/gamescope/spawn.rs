@@ -308,6 +308,8 @@ pub(super) fn spawn(
         // before its PipeWire node appears. Nested apps get gamescope's own DISPLAY.
         .env_remove("DISPLAY")
         .env_remove("WAYLAND_DISPLAY");
+    // The live session's runtime dir, bus and desktop name; the removals above stay.
+    pf_host_config::session::export_to(&mut cmd);
     if let Ok(logf) = std::fs::File::create(log) {
         if let Ok(log2) = logf.try_clone() {
             cmd.stdout(Stdio::from(logf)).stderr(Stdio::from(log2));

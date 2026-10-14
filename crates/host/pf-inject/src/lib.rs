@@ -101,7 +101,9 @@ pub fn open(backend: Backend) -> Result<Box<dyn InputInjector>> {
             libei::LibeiInjector::open_with(libei_ei_source())?,
         )),
         Backend::GamescopeEi => Ok(Box::new(libei::LibeiInjector::open_with(
-            libei::EiSource::SocketPathFile(pf_paths::gamescope_ei_socket_file()),
+            libei::EiSource::SocketPathFile(pf_paths::gamescope_ei_socket_file(
+                pf_host_config::session::runtime_dir().as_deref(),
+            )),
         )?)),
     }
 }
@@ -280,7 +282,7 @@ pub fn set_backend_id(_id: &str) {}
 /// `org.gnome.Mutter.RemoteDesktop` (`libei_ei_source`), so headless-capable.
 ///
 /// Order: live [`set_backend_id`] (from `pf_vdisplay::input_backend_id`), then
-/// `PUNKTFUNK_INPUT_BACKEND`, then `PUNKTFUNK_COMPOSITOR`, then `XDG_CURRENT_DESKTOP`.
+/// `PUNKTFUNK_INPUT_BACKEND`, then `PUNKTFUNK_COMPOSITOR`, then the session's desktop name.
 /// Env rungs run only before a session publishes (and on the operator-pinned path, which
 /// publishes nothing), so a live stream never `getenv`s — see [`SESSION_BACKEND`].
 #[cfg(target_os = "linux")]
@@ -314,9 +316,9 @@ pub fn default_backend() -> Backend {
         {
             return Backend::WlrVirtual;
         }
-        // mutter (GNOME) falls through to the XDG_CURRENT_DESKTOP check below.
+        // mutter (GNOME) falls through to the desktop check below.
     }
-    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let desktop = pf_host_config::session::current_desktop().unwrap_or_default();
     let d = desktop.to_ascii_uppercase();
     if d.contains("KDE") {
         Backend::KwinFakeInput
@@ -662,7 +664,7 @@ fn libei_ei_source() -> libei::EiSource {
         .compositor
         .as_deref()
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("mutter"))
-        || std::env::var("XDG_CURRENT_DESKTOP")
+        || pf_host_config::session::current_desktop()
             .unwrap_or_default()
             .to_ascii_uppercase()
             .contains("GNOME");
@@ -824,6 +826,11 @@ pub mod steam_controller;
 #[cfg(target_os = "linux")]
 #[path = "inject/linux/steam_controller2.rs"]
 pub mod steam_controller2;
+/// Virtual 2015 Steam Controller (`28DE:1102`) via UMDF + shm (device-type 15): raw mirror of
+/// a client-captured pad, typed fallback, Steam's feature writes back to the client.
+#[cfg(target_os = "windows")]
+#[path = "inject/windows/steam_controller_windows.rs"]
+pub mod steam_controller_windows;
 /// Virtual Steam Deck via UMDF + shm (device-type 3). Steam Input promotes it because of
 /// the `&MI_02` hardware-id synthesis.
 #[cfg(target_os = "windows")]

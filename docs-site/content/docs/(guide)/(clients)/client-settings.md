@@ -97,7 +97,7 @@ Touch modes, mouse modes and the in-stream keys are explained on [Input](/docs/i
 | **Hold Select for guide** | Automatic | Hold Select about ⅓ s to press the host's guide button. A Select tap then arrives a beat late. Automatic turns it on in Gaming Mode and on iPhone, iPad and Apple TV. | All |
 | **Controller haptics** | On | Plays a DualSense's voice-coil haptics, over USB or Bluetooth (Android: USB). See [Controller audio](/docs/controller-audio). | Linux, Windows, Android |
 | **Controller speaker** | On (Android: off) | Plays the game's pad audio on a DualSense's speaker. | Linux, Windows, Android |
-| **Steam Controller 2 passthrough** | Off | Passes a Steam Controller 2 to a Linux or Windows host as itself, so its trackpads, gyro and haptics work as they do locally. Mac: USB, the Puck or Bluetooth. iPhone, iPad, Apple TV: Bluetooth. Android and the desktop clients always pass one through. | Apple |
+| **Steam Controller 2 passthrough** | Off | Passes a Steam Controller 2 or a 2015 Steam Controller to a Linux or Windows host as itself, so its trackpads, gyro and haptics work as they do locally. Mac: USB, a dongle or Bluetooth. iPhone, iPad, Apple TV: Bluetooth. Android and the desktop clients always pass one through. | Apple |
 | **DualSense over USB** | On | Drives a USB DualSense or DualShock 4 directly, for adaptive triggers, lightbar and gyro. | Android |
 | **Rumble on this phone**, **Gyro from this phone** | Off | The phone's own motor and gyro stand in for a clip-on pad's. | Android, iPhone |
 
@@ -141,8 +141,8 @@ shortcuts. It's on every app and in the console (which edits your defaults only)
 
 | Setting | Default | What it does | Where |
 |---|---|---|---|
-| **Controller-optimized UI** | On | Switches to the console when a controller is in use. | Linux, Android (not Android TV, which always uses it), Apple |
-| **Show it** | With a controller | **Always** keeps the console without a pad, for a docked phone or tablet. | Linux, Android, Apple |
+| **Controller-optimized UI** | On | Switches to the console when a controller is in use. | Linux, Windows (x64), Android (not Android TV, which always uses it), Apple |
+| **Show it** | With a controller | **Always** keeps the console without a pad, for a docked phone or tablet. | Linux, Windows (x64), Android, Apple |
 | **Background** | Violet | The console's backdrop colour: 20 dark fields, then 16 pale ones. **Eclipse** is true black for OLED screens. | Console; Apple TV **Settings** |
 | **Reduce motion** | Off | Stops the console's moving backdrop. Apple follows the system setting instead, and so do Windows and Linux desktops that report one (GNOME, KDE); the row then hides. | Console on Linux, Windows, Android |
 | **Reduce interface resolution** | On for Android TV, off on phones | Draws the console at 1080p and lets the screen scale it up, for slow 4K TV boxes. The stream isn't affected. | Android console |

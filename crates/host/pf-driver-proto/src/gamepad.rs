@@ -59,6 +59,10 @@ pub const DEVTYPE_HORIPAD_STEAM: u8 = 12;
 pub const DEVTYPE_JOYCON_LEFT: u8 = 13;
 /// Right Joy-Con over Bluetooth (`VID_057E&PID_2007`), device type 2.
 pub const DEVTYPE_JOYCON_RIGHT: u8 = 14;
+/// The 2015 Steam Controller, wired (`VID_28DE&PID_1102`): the Deck's unnumbered feature
+/// contract on its own descriptor ([`crate::deck::SC_RDESC`]). A captured pad's identity rides
+/// the devnode as the Triton's does ([`crate::triton::IDENTITY_PROPKEY_FMTID`]).
+pub const DEVTYPE_STEAMCONTROLLER: u8 = 15;
 
 /// Written into the section's `driver_proto` on attach. The section starts zeroed, so `0`
 /// means no driver has attached. Bump on a gamepad-layout change.
@@ -73,8 +77,8 @@ pub const GAMEPAD_PROTO_VERSION: u32 = 3;
 /// compares this instead and flags an older driver. Bump it with any driver change a game or
 /// the host depends on. `1`: devnode-index serials, Deck packet numbers, refused unknown ids.
 /// `2`: Share on the Series Xbox pad. `3`: the Switch Pro identity. `4`: the 8BitDo and
-/// HORIPAD identities. `5`: the Joy-Con halves.
-pub const GAMEPAD_DRIVER_REV: u32 = 5;
+/// HORIPAD identities. `5`: the Joy-Con halves. `6`: the 2015 Steam Controller.
+pub const GAMEPAD_DRIVER_REV: u32 = 6;
 
 // Channel proof: who to hand the DATA section to. Do not take the duplication target from
 // the mailbox's `driver_pid` — LocalService can spawn a world-executable WUDFHost and publish
@@ -533,8 +537,9 @@ pub fn serve_due(now_us: u64, due_us: u64, period_us: u64) -> Option<u64> {
 /// A USB `DualSense` advances four every report: the 8-bit counter (byte 7), a 32-bit packet
 /// sequence (12–15), `sensor_timestamp` (28–31) and a second 32-bit timer (49–52) about 2 ms
 /// after it. Motion code integrates gyro over `sensor_timestamp`, so it has to advance by the
-/// real time between the reports a game receives. A Deck frame carries `unPacketNum` (4–7),
-/// and Valve's `controller_structs.h` tells readers to skip a repeated one. The host publishes
+/// real time between the reports a game receives. A Deck or Steam Controller frame carries
+/// `unPacketNum` (4–7), and Valve's `controller_structs.h` tells readers to skip a repeated one.
+/// The host publishes
 /// at its client's rate and the driver serves at the hardware's, so the driver owns every
 /// clock. A Switch Pro `0x30` or `0x21` carries an 8-bit timer (byte 1). `serial` is this
 /// report's index, `elapsed_us` the time since the first report; every field wraps as hardware
@@ -566,7 +571,7 @@ pub fn stamp_report_clock(
             report[34] = ts as u8;
             true
         }
-        DEVTYPE_STEAMDECK => {
+        DEVTYPE_STEAMDECK | DEVTYPE_STEAMCONTROLLER => {
             report[4..8].copy_from_slice(&serial.to_le_bytes());
             true
         }
@@ -611,6 +616,7 @@ pub fn pad_serial(device_type: u8, index: u8) -> String {
     match device_type {
         DEVTYPE_DUALSHOCK4 => alloc::format!("DEADBEEF00{low:02X}"),
         DEVTYPE_STEAMDECK => alloc::format!("FVPF{:08X}", 0x5046_0000u32 | index as u32),
+        DEVTYPE_STEAMCONTROLLER => alloc::format!("FVPF1102{index:04X}"),
         DEVTYPE_XBOX => xbox(0x10),
         DEVTYPE_XBOX_ONE_S => xbox(0x30),
         DEVTYPE_XBOX_ELITE => xbox(0x50),
@@ -643,7 +649,8 @@ pub fn pad_serial(device_type: u8, index: u8) -> String {
 /// each names. A token that prefixes another comes after it (`pf_dualsense` after
 /// `pf_dualsenseedge`), so the first match is the right one. Windows Server has no
 /// `xinputhid`, so every Xbox kind binds `pf_xbox_nofilter`; the section fixes the PID.
-pub const HWID_DEVTYPES: [(&str, u8); 16] = [
+pub const HWID_DEVTYPES: [(&str, u8); 17] = [
+    ("pf_steamcontroller", DEVTYPE_STEAMCONTROLLER),
     ("pf_switchpro", DEVTYPE_SWITCH_PRO),
     ("pf_joycon_left", DEVTYPE_JOYCON_LEFT),
     ("pf_joycon_right", DEVTYPE_JOYCON_RIGHT),
@@ -690,6 +697,7 @@ pub const fn identity_vid_pid(device_type: u8) -> Option<(u16, u16)> {
         DEVTYPE_HORIPAD_STEAM => (0x0F0D, 0x01AB),
         DEVTYPE_JOYCON_LEFT => (0x057E, 0x2006),
         DEVTYPE_JOYCON_RIGHT => (0x057E, 0x2007),
+        DEVTYPE_STEAMCONTROLLER => (0x28DE, 0x1102),
         _ => return None,
     })
 }
@@ -779,7 +787,7 @@ mod tests {
     #[test]
     fn no_two_pads_share_a_serial() {
         let mut seen = std::collections::HashMap::new();
-        for devtype in DEVTYPE_DUALSENSE..=DEVTYPE_JOYCON_RIGHT {
+        for devtype in DEVTYPE_DUALSENSE..=DEVTYPE_STEAMCONTROLLER {
             for index in 0..16u8 {
                 let serial = pad_serial(devtype, index);
                 if let Some(prev) = seen.insert(serial.clone(), (devtype, index)) {
@@ -801,6 +809,7 @@ mod tests {
         assert_eq!(pad_serial(DEVTYPE_DUALSHOCK4, 0), "DEADBEEF0001");
         assert_eq!(pad_serial(DEVTYPE_STEAMDECK, 2), "FVPF50460002");
         assert_eq!(pad_serial(DEVTYPE_TRITON, 12), "FVPF130212D03");
+        assert_eq!(pad_serial(DEVTYPE_STEAMCONTROLLER, 3), "FVPF11020003");
     }
 
     /// The driver settles its identity from the hardware ids before hidclass asks, and refuses
@@ -827,7 +836,7 @@ mod tests {
         );
         assert_eq!(devtype_from_hwids("usb\\vid_054c&pid_0ce6"), None);
         assert_eq!(devtype_from_hwids(""), None, "a failed property query");
-        assert_eq!(identity_vid_pid(DEVTYPE_JOYCON_RIGHT + 1), None);
+        assert_eq!(identity_vid_pid(DEVTYPE_STEAMCONTROLLER + 1), None);
         assert_eq!(
             identity_vid_pid(DEVTYPE_DUALSENSE_EDGE),
             Some((0x054C, 0x0DF2))

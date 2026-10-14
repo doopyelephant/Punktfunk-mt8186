@@ -53,15 +53,16 @@ pub struct SessionIsolation {
 
 #[cfg(target_os = "linux")]
 impl SessionIsolation {
-    /// Build the identity, computing the relay path under the session env lock: the producer-side
-    /// `XDG_RUNTIME_DIR` read must not race a concurrent handshake's `apply_session_env`.
+    /// Build the identity. The relay sits in the stored session's runtime dir, where the pinned
+    /// injector looks for it.
     pub fn new(
         id: String,
         sink: Option<String>,
         mic_source: Option<String>,
         steam_home: Option<std::path::PathBuf>,
     ) -> SessionIsolation {
-        let ei_relay = crate::with_env_lock(|| pf_paths::gamescope_ei_socket_file_for(&id));
+        let runtime = pf_host_config::session::runtime_dir();
+        let ei_relay = pf_paths::gamescope_ei_socket_file_for(runtime.as_deref(), &id);
         SessionIsolation {
             id,
             ei_relay,

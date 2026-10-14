@@ -13,6 +13,10 @@
 // The firmware re-enables lizard mode after a few seconds of silence, so `disableLizard` and
 // `normalizeJoysticks` repeat every ~3 s. The client never enables the gyro itself; Steam's
 // forwarded write does.
+//
+// A 2015 Steam Controller (`Sc1Device`, `1102`/`1142`) matches the same usage pair. Its reports
+// carry no id and go up verbatim; its lizard mode goes off once per bond cycle, never on the
+// keep-alive, whose settings reset would undo Steam's every 3 s.
 
 #if os(macOS)
 
@@ -69,6 +73,7 @@ final class Sc2UsbLink {
     /// main actor at claim time).
     private let dongleLock = NSLock()
     private var dongleSources: Set<UInt64> = []
+    private var classicSources: Set<UInt64> = []
     private var serials: [UInt64: String] = [:]
 
     /// The pad's engraved serial (`FXA…`), read once on the slot's first report — nil when the
@@ -101,6 +106,13 @@ final class Sc2UsbLink {
         dongleLock.lock()
         defer { dongleLock.unlock() }
         return dongleSources.contains(source)
+    }
+
+    /// Whether `source` is a 2015 Steam Controller. Safe from any thread.
+    func isClassic(source: UInt64) -> Bool {
+        dongleLock.lock()
+        defer { dongleLock.unlock() }
+        return classicSources.contains(source)
     }
 
     /// `IOHIDDeviceRegisterInputReportCallback`'s report buffer size. The Triton's longest input
@@ -141,7 +153,7 @@ final class Sc2UsbLink {
     }
 
     private static func matchingCriteria() -> [CFDictionary] {
-        Sc2Device.usbPIDs.map { pid in
+        (Sc2Device.usbPIDs + Sc1Device.usbPIDs).map { pid in
             [
                 kIOHIDVendorIDKey: Sc2Device.vidValve,
                 kIOHIDProductIDKey: pid,
@@ -207,11 +219,15 @@ final class Sc2UsbLink {
             // cancels, so it reaches a collection that is still open.
             stopKeepAlive()
             sendFeature([Sc2Device.enableLizard])
+            for (id, dev) in open where isClassic(source: id) {
+                for frame in Sc1Device.lizardOn { _ = setClassic(dev, kIOHIDReportTypeFeature, frame) }
+            }
             for (id, dev) in open { cancel(id: id, device: dev) }
             open.removeAll()
             denied.removeAll()
             dongleLock.lock()
             dongleSources.removeAll()
+            classicSources.removeAll()
             serials.removeAll()
             dongleLock.unlock()
             seenIds.removeAll()
@@ -270,9 +286,11 @@ final class Sc2UsbLink {
                 return
             }
             let type: IOHIDReportType = kind == 1 ? kIOHIDReportTypeFeature : kIOHIDReportTypeOutput
-            let rc = frame.withUnsafeBufferPointer { buf in
-                IOHIDDeviceSetReport(dev, type, CFIndex(id), buf.baseAddress!, buf.count)
-            }
+            let rc = isClassic(source: source)
+                ? setClassic(dev, type, frame)
+                : frame.withUnsafeBufferPointer { buf in
+                    IOHIDDeviceSetReport(dev, type, CFIndex(id), buf.baseAddress!, buf.count)
+                }
             if rc != kIOReturnSuccess {
                 // Not fatal and deliberately not retried: rumble is re-sent by Steam every
                 // 25–40 ms and settings every ~3 s, so the next frame self-heals. Worth a line —
@@ -326,11 +344,11 @@ final class Sc2UsbLink {
         buf.initialize(repeating: 0, count: Self.reportBufSize)
         buffers[id] = buf
         open[id] = device
-        if Sc2Device.isDongle(pid: pid) {
-            dongleLock.lock()
-            dongleSources.insert(id)
-            dongleLock.unlock()
-        }
+        let classic = Sc1Device.usbPIDs.contains(pid)
+        dongleLock.lock()
+        if Sc2Device.isDongle(pid: pid) || pid == Sc1Device.pidDongle { dongleSources.insert(id) }
+        if classic { classicSources.insert(id) }
+        dongleLock.unlock()
         IOHIDDeviceRegisterInputReportCallback(
             device, buf, Self.reportBufSize,
             { ctx, _, sender, _, reportID, report, len in
@@ -342,9 +360,9 @@ final class Sc2UsbLink {
         IOHIDDeviceSetDispatchQueue(device, queue)
         IOHIDDeviceActivate(device)
         log.info(
-            "SC2 USB: opened \(Sc2Device.isDongle(pid: pid) ? "Puck" : "wired", privacy: .public) collection 0x\(String(format: "%04x", pid), privacy: .public) (\(self.open.count, privacy: .public) open)"
+            "SC2 USB: opened \(isDongle(source: id) ? "dongle" : "wired", privacy: .public) collection 0x\(String(format: "%04x", pid), privacy: .public) (\(self.open.count, privacy: .public) open)"
         )
-        startKeepAlive()
+        if !classic { startKeepAlive() }
     }
 
     /// A collection went away: retire it and tell the capture, so ONE pad of several unplugging
@@ -359,6 +377,7 @@ final class Sc2UsbLink {
         cancel(id: id, device: mine)
         dongleLock.lock()
         dongleSources.remove(id)
+        classicSources.remove(id)
         serials.removeValue(forKey: id)
         dongleLock.unlock()
         onSourceClosed(id)
@@ -379,6 +398,10 @@ final class Sc2UsbLink {
         // asynchronous), so a report can still arrive for a collection we have retired. Acting on
         // it resurrects the source downstream and claims a wire slot nothing will ever release.
         guard len > 0, let source = Self.registryID(device), open[source] != nil else { return }
+        if isClassic(source: source) {
+            handleClassic(source: source, Array(UnsafeBufferPointer(start: report, count: min(Int(len), Self.reportBufSize))))
+            return
+        }
         let id = UInt8(truncatingIfNeeded: reportID)
         // The payload byte position follows the same id-in-band rule the framing below applies.
         let wirelessPayload: UInt8? = (id == Sc2Device.idWireless || id == Sc2Device.idWirelessX)
@@ -430,6 +453,55 @@ final class Sc2UsbLink {
         onReport(source, framed)
     }
 
+    /// One 2015 pad's report, unnumbered and forwarded as it came. Its first report of a bond cycle
+    /// turns lizard mode off; a dongle's disconnect edge re-arms that for the next pad.
+    private func handleClassic(source: UInt64, _ report: [UInt8]) {
+        if Sc1Device.isWirelessDisconnect(report) {
+            serialAttempted.remove(source)
+        } else if serialAttempted.insert(source).inserted, let dev = open[source] {
+            for frame in Sc1Device.lizardOff { _ = setClassic(dev, kIOHIDReportTypeFeature, frame) }
+        }
+        if report.count >= 3, seenIds.insert(report[2]).inserted {
+            log.info("SC2 USB: 2015 frame type=0x\(String(report[2], radix: 16), privacy: .public) seen (len=\(report.count, privacy: .public))")
+        }
+        onReport(source, report)
+    }
+
+    /// One id-0 frame to a 2015 pad: IOKit takes it without the id, as 64 bytes. Its dongle
+    /// refuses a write while the radio is busy, so retry for 25 ms, as SDL does.
+    private func setClassic(_ dev: IOHIDDevice, _ type: IOHIDReportType, _ frame: [UInt8]) -> IOReturn {
+        var payload = Array(frame.dropFirst().prefix(64))
+        payload += [UInt8](repeating: 0, count: 64 - payload.count)
+        var rc = kIOReturnError
+        for _ in 0..<50 {
+            rc = payload.withUnsafeBufferPointer { buf in
+                IOHIDDeviceSetReport(dev, type, 0, buf.baseAddress!, buf.count)
+            }
+            if rc == kIOReturnSuccess { break }
+            usleep(500)
+        }
+        return rc
+    }
+
+    /// `exchange` for a 2015 pad: it answers unnumbered, so the id 0 the host expects goes in front.
+    private func classicExchange(_ dev: IOHIDDevice, _ request: [UInt8]) -> [UInt8]? {
+        guard request.count >= 2,
+              setClassic(dev, kIOHIDReportTypeFeature, request) == kIOReturnSuccess
+        else { return nil }
+        for _ in 0..<10 {
+            usleep(20_000)
+            var buf = [UInt8](repeating: 0, count: 64)
+            var len: CFIndex = buf.count
+            let rc = buf.withUnsafeMutableBufferPointer { p in
+                IOHIDDeviceGetReport(dev, kIOHIDReportTypeFeature, 0, p.baseAddress!, &len)
+            }
+            if rc == kIOReturnSuccess, len > 1, buf[0] == request[1] {
+                return [0] + buf[..<min(Int(len), buf.count)]
+            }
+        }
+        return nil
+    }
+
     /// One feature-2 GET per bond cycle — the engraved per-pad serial (`Sc2Device.
     /// featureSerial`). Blocking and synchronous at the kernel boundary, so it obeys the
     /// once-per-pad rule the Android transport pins for GET_REPORT: never per input report. A
@@ -465,10 +537,15 @@ final class Sc2UsbLink {
     func identity(source: UInt64) -> PunktfunkConnection.PadIdentity? {
         guard let dev = open[source] else { return nil }
         let serial = (IOHIDDeviceGetProperty(dev, kIOHIDSerialNumberKey as CFString) as? String) ?? ""
-        let puck = isDongle(source: source)
-        let requests = PunktfunkConnection.sc2IdentityRequests(puck: puck)
+        // The host mirrors every 2015 pad as wired, so it has no slot.
+        let classic = isClassic(source: source)
+        let puck = !classic && isDongle(source: source)
+        let requests = classic
+            ? PunktfunkConnection.sc1IdentityRequests()
+            : PunktfunkConnection.sc2IdentityRequests(puck: puck)
         let replies = requests.compactMap { request in
-            exchange(dev, request).map { PunktfunkConnection.PadIdentity.Reply(request: request, reply: $0) }
+            (classic ? classicExchange(dev, request) : exchange(dev, request))
+                .map { PunktfunkConnection.PadIdentity.Reply(request: request, reply: $0) }
         }
         let slot = puck ? UInt8(clamping: min(max((Self.interfaceNumber(dev) ?? 2) - 2, 0), 3)) : 0
         log.info("SC2 USB: identity \(serial, privacy: .public) slot \(slot), \(replies.count, privacy: .public)/\(requests.count, privacy: .public) replies")
@@ -537,7 +614,7 @@ final class Sc2UsbLink {
     /// Write id-first feature frames to every open collection, in order. `IOHIDDeviceSetReport`
     /// is synchronous, so a frame sent here has landed before the next line runs.
     private func sendFeature(_ frames: [[UInt8]]) {
-        for (_, dev) in open {
+        for (id, dev) in open where !isClassic(source: id) {
             for frame in frames {
                 _ = frame.withUnsafeBufferPointer { buf in
                     IOHIDDeviceSetReport(

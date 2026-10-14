@@ -639,6 +639,101 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc2Identity
     .resolve::<LogErrorAndDefault>()
 }
 
+/// `NativeBridge.nativeSc1IdentityRequest(index): ByteArray?` — the `index`th feature query a
+/// 2015 Steam Controller's identity is read with; null past the last.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc1IdentityRequest<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    index: jint,
+) -> JByteArray<'local> {
+    env.with_env(|env| -> jni::errors::Result<JByteArray<'local>> {
+        let nth = usize::try_from(index).ok();
+        match nth.and_then(|i| punktfunk_core::client::sc2::classic_identity_requests().nth(i)) {
+            Some(request) => env.byte_array_from_slice(request),
+            None => Ok(JByteArray::default()),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeSc1BleState(): ByteArray` — a fresh state for one 2015 Steam Controller's
+/// Bluetooth input, for [`nativeSc1BleInput`].
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc1BleState<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> JByteArray<'local> {
+    use punktfunk_core::client::sc1_ble::CLASSIC_BLE_STATE;
+    env.with_env(|env| env.byte_array_from_slice(&[0u8; CLASSIC_BLE_STATE]))
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeSc1BleInput(state, segment): ByteArray?` — one segment of a 2015 Steam
+/// Controller's Bluetooth input, `[0x03, header, 18 bytes]`; the 64-byte wired frame when it
+/// completed a state message, else null. `state` is updated in place.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc1BleInput<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    state: JByteArray<'local>,
+    segment: JByteArray<'local>,
+) -> JByteArray<'local> {
+    use punktfunk_core::client::sc1_ble::{classic_ble_input, CLASSIC_BLE_STATE};
+    env.with_env(|env| -> jni::errors::Result<JByteArray<'local>> {
+        let mut held = [0i8; CLASSIC_BLE_STATE];
+        state.get_region(env, 0, &mut held)?;
+        let mut st = held.map(|b| b as u8);
+        let seg = env.convert_byte_array(&segment)?;
+        let mut out = [0u8; 64];
+        let done = classic_ble_input(&mut st, &seg, &mut out);
+        state.set_region(env, 0, &st.map(|b| b as i8))?;
+        if done {
+            env.byte_array_from_slice(&out)
+        } else {
+            Ok(JByteArray::default())
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeSc1BleSegments(frame): ByteArray` — a wired feature frame for a 2015
+/// Steam Controller, report id 0 first, as its Bluetooth segments back to back.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc1BleSegments<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    frame: JByteArray<'local>,
+) -> JByteArray<'local> {
+    env.with_env(|env| -> jni::errors::Result<JByteArray<'local>> {
+        let frame = env.convert_byte_array(&frame)?;
+        let segs: Vec<u8> = punktfunk_core::client::sc1_ble::classic_ble_segments(&frame)
+            .flatten()
+            .collect();
+        env.byte_array_from_slice(&segs)
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeSc1BleReply(segments): ByteArray?` — the segments read back for one 2015
+/// Steam Controller feature query, in order; the reply, report id 0 first, once the last is in.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSc1BleReply<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+    segments: JByteArray<'local>,
+) -> JByteArray<'local> {
+    env.with_env(|env| -> jni::errors::Result<JByteArray<'local>> {
+        let segments = env.convert_byte_array(&segments)?;
+        let mut reply = [0u8; 73];
+        match punktfunk_core::client::sc1_ble::classic_ble_reply(&segments, &mut reply) {
+            Some(n) => env.byte_array_from_slice(&reply[..n]),
+            None => Ok(JByteArray::default()),
+        }
+    })
+    .resolve::<LogErrorAndDefault>()
+}
+
 /// `NativeBridge.nativeSendPadIdentity(handle, pad, slot, serial, replies)` — a captured Steam
 /// Controller 2's identity for wire pad `pad`: its Puck slot (0 off a Puck), its USB serial (empty
 /// when unknown) and its replies to the identity queries, packed `[len][request][len][reply]…`.

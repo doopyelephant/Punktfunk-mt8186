@@ -492,6 +492,8 @@ private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivi
     val active = activity?.sc2MenuActive == true
     val usbManager = context.getSystemService(Context.USB_SERVICE) as android.hardware.usb.UsbManager
     val permitted = usbDev != null && usbManager.hasPermission(usbDev)
+    val classic = usbDev != null && usbDev.productId in io.unom.punktfunk.kit.Sc1Device.USB_PIDS
+    val name = if (classic) "Steam Controller" else "Steam Controller 2"
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(16.dp),
@@ -499,7 +501,7 @@ private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivi
         ) {
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    "Steam Controller 2",
+                    name,
                     style = MaterialTheme.typography.bodyLarge,
                     modifier = Modifier.weight(1f),
                 )
@@ -515,6 +517,8 @@ private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivi
                 when {
                     usbDev == null -> "Paired via Bluetooth"
                     usbDev.productId == io.unom.punktfunk.kit.Sc2Device.PID_WIRED -> "Wired (USB)"
+                    usbDev.productId == io.unom.punktfunk.kit.Sc1Device.PID_WIRED -> "Wired (USB)"
+                    classic -> "Wireless dongle (USB)"
                     else -> "Puck dongle (USB)"
                 },
                 style = MaterialTheme.typography.bodySmall,
@@ -523,7 +527,7 @@ private fun Sc2Row(usbDev: android.hardware.usb.UsbDevice?, activity: MainActivi
             when {
                 active -> {
                     Text(
-                        "Captured — streams as-is: the host presents a real Steam Controller 2 " +
+                        "Captured — streams as-is: the host presents a real $name " +
                             "that its Steam drives directly (trackpads, gyro, haptics).",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,

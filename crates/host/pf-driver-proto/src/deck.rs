@@ -1,6 +1,6 @@
-//! Steam Deck controller interface, served by `pf-gamepad` for device type 3 and by `pf-inject`
-//! over the Linux gadget and usbip transports. Its one feature report is unnumbered and Steam
-//! drives it as command and response.
+//! Steam Deck and 2015 Steam Controller interfaces, served by `pf-gamepad` (device types 3 and
+//! 15) and by `pf-inject` over the Linux gadget and usbip transports. Their one feature report is
+//! unnumbered and Steam drives it as command and response.
 
 use crate::triton::{ID_GET_ATTRIBUTES_VALUES, ID_GET_STRING_ATTRIBUTE};
 
@@ -79,10 +79,103 @@ pub fn feature_reply(last_set: &[u8], serial: &str) -> [u8; 64] {
     r
 }
 
+/// Controller interface of the 2015 Steam Controller (interface 2 of a wired `28DE:1102`): one
+/// vendor collection with 64-byte input, output and feature reports, all unnumbered. Steam and
+/// `hid-steam` read the bytes raw, so only the report set matters.
+#[rustfmt::skip]
+pub static SC_RDESC: [u8; 33] = [
+    0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x40,
+    0x09, 0x01, 0x81, 0x02, 0x95, 0x40, 0x09, 0x01, 0x91, 0x02, 0x95, 0x40, 0x09, 0x01, 0xb1, 0x02,
+    0xc0,
+];
+
+/// A Steam Controller at rest: header `[0x01, 0x00, ID_CONTROLLER_STATE, 60]`, every control
+/// released.
+pub const SC_NEUTRAL_REPORT: [u8; 64] = {
+    let mut r = [0u8; 64];
+    r[0] = 0x01;
+    r[2] = 0x01;
+    r[3] = 0x3C;
+    r
+};
+
+/// Firmware build time a Steam Controller with no recorded identity reports (2024-07-30): later
+/// than any firmware Valve shipped for the pad, so Steam offers no update.
+const SC_FW_BUILD_TIME: u32 = 0x66A8_C000;
+
+/// GET_FEATURE reply of a wired Steam Controller to the latched SET `last_set` (command byte
+/// first): `0x83` answers these stand-in attributes, everything else as the Deck does
+/// ([`feature_reply`]). A captured pad's own replies come first, where its client sent them.
+pub fn sc_feature_reply(last_set: &[u8], serial: &str) -> [u8; 64] {
+    if last_set.first() != Some(&ID_GET_ATTRIBUTES_VALUES) {
+        return feature_reply(last_set, serial);
+    }
+    // (attribute id, u32 LE), ids per SDL's controller_constants.h.
+    let attrs: [(u8, u32); 6] = [
+        (0x00, 0),                // ATTRIB_UNIQUE_ID
+        (0x01, 0x1102),           // ATTRIB_PRODUCT_ID
+        (0x02, 0x03),             // ATTRIB_CAPABILITIES
+        (0x0A, 0x55D2_926D),      // ATTRIB_BOOTLOADER_BUILD_TIME (2015-08-18)
+        (0x04, SC_FW_BUILD_TIME), // ATTRIB_FIRMWARE_BUILD_TIME
+        (0x09, 0x0A),             // ATTRIB_BOARD_REVISION
+    ];
+    let mut r = [0u8; 64];
+    r[0] = ID_GET_ATTRIBUTES_VALUES;
+    r[1] = (attrs.len() * 5) as u8;
+    for (slot, (id, value)) in attrs.into_iter().enumerate() {
+        let o = 2 + slot * 5;
+        r[o] = id;
+        r[o + 1..o + 5].copy_from_slice(&value.to_le_bytes());
+    }
+    r
+}
+
+/// The GET_FEATURE answer of a mirrored Steam Controller: its client's recorded reply to
+/// `last_set`, else [`sc_feature_reply`]. Recorded pairs are id-first and this report has no
+/// id, so the lookup asks with id 0 and the answer drops it.
+pub fn sc_mirror_reply(
+    recorded: impl FnOnce(&[u8]) -> Option<[u8; 64]>,
+    last_set: &[u8],
+    serial: &str,
+) -> [u8; 64] {
+    let mut asked = [0u8; 65];
+    let n = last_set.len().min(64);
+    asked[1..1 + n].copy_from_slice(&last_set[..n]);
+    match recorded(&asked[..1 + n]) {
+        Some(reply) => {
+            let mut r = [0u8; 64];
+            r[..63].copy_from_slice(&reply[1..]);
+            r
+        }
+        None => sc_feature_reply(last_set, serial),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gamepad;
+
+    /// The Steam Controller answers its attributes as itself, its serial as the Deck does, and
+    /// a recorded reply without the id its client read it with.
+    #[test]
+    fn steam_controller_feature_replies() {
+        let serial = gamepad::pad_serial(gamepad::DEVTYPE_STEAMCONTROLLER, 1);
+        let r = sc_feature_reply(&[0x83], &serial);
+        assert_eq!(r[..2], [0x83, 30]);
+        assert_eq!(r[7..12], [0x01, 0x02, 0x11, 0, 0], "product id 0x1102");
+        let r = sc_feature_reply(&[0xAE, 0x15, 0x01], &serial);
+        assert_eq!(r[..3], [0xAE, 12, 0x01]);
+
+        let mut recorded = [0u8; 64];
+        recorded[..5].copy_from_slice(&[0x00, 0xAE, 0x02, 0x01, b'F']);
+        let lookup = |asked: &[u8]| (asked == [0x00, 0xAE, 0x15, 0x01]).then_some(recorded);
+        let r = sc_mirror_reply(lookup, &[0xAE, 0x15, 0x01], &serial);
+        assert_eq!(r[..4], [0xAE, 0x02, 0x01, b'F']);
+        let r = sc_mirror_reply(lookup, &[0x83], &serial);
+        assert_eq!(r[..2], [0x83, 30], "an unrecorded query");
+        assert_eq!(SC_NEUTRAL_REPORT[..4], [0x01, 0x00, 0x01, 0x3C]);
+    }
 
     /// The Deck answers the command Steam last set: `0x83` with build-time attributes, `0xAE`
     /// with the unit serial under the requested attribute, anything else as an echo.

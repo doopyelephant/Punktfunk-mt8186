@@ -186,11 +186,10 @@ pub(super) fn runtime_status() -> RuntimeStatus {
 
 #[cfg(target_os = "linux")]
 fn run_systemctl(args: &[&str]) -> Result<()> {
-    let status = Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .status()
-        .context("run systemctl (is systemd available in this session?)")?;
+    let status =
+        pf_host_config::session::export_to(Command::new("systemctl").arg("--user").args(args))
+            .status()
+            .context("run systemctl (is systemd available in this session?)")?;
     if !status.success() {
         bail!(
             "systemctl --user {} failed — is the punktfunk-scripting package installed?",
@@ -204,11 +203,10 @@ fn run_systemctl(args: &[&str]) -> Result<()> {
 /// non-zero for a normal "inactive"/"disabled", so the text is the answer.
 #[cfg(target_os = "linux")]
 fn systemctl_output(args: &[&str]) -> Option<String> {
-    let out = Command::new("systemctl")
-        .arg("--user")
-        .args(args)
-        .output()
-        .ok()?;
+    let out =
+        pf_host_config::session::export_to(Command::new("systemctl").arg("--user").args(args))
+            .output()
+            .ok()?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() {
         None

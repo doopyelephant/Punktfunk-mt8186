@@ -1,10 +1,11 @@
-//! General: session and statistics, plus the device-wide rows a preset never carries.
+//! General: session, console and statistics, plus the device-wide rows a preset never carries.
 
 use super::{
     advanced_group, described_labeled, described_overridable, group, presets, rows, setting_combo,
     setting_toggle, Cx,
 };
 use crate::trust::{KnownHosts, Settings};
+use pf_client_core::settings::GamepadUi;
 use pf_client_core::start;
 use pf_client_core::trust::{HudCorner, StatsVerbosity};
 use punktfunk_core::hud::{stats_scale, STATS_SCALE_PCTS};
@@ -36,7 +37,7 @@ fn start_in_help() -> String {
     }
 }
 
-/// General: session, statistics.
+/// General: session, console, statistics.
 pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
     let Cx {
         scope,
@@ -113,6 +114,44 @@ pub(super) fn general_section(cx: &Cx) -> Vec<Element> {
         .collect(),
         None,
     );
+    // Which interface this device opens: the device's, never a preset's, and only where the
+    // session ships its console.
+    if !preset_mode && crate::app::hosts::CONSOLE_UI_AVAILABLE {
+        let ui = s.gamepad_ui();
+        let on_toggle = setting_toggle(
+            cx,
+            scope,
+            rows::GAMEPAD_UI.key,
+            ui != GamepadUi::Off,
+            |s, on| s.set_gamepad_ui_enabled(on),
+        );
+        let mode_combo = setting_combo(
+            cx,
+            scope,
+            rows::GAMEPAD_UI_MODE.key,
+            vec!["With a controller".into(), "Always".into()],
+            usize::from(s.gamepad_ui_always()),
+            |s, i| s.set_gamepad_ui_always(i == 1),
+        )
+        .enabled(ui != GamepadUi::Off);
+        out.extend(group(
+            Some("Console"),
+            vec![
+                described_labeled(
+                    rows::GAMEPAD_UI.label,
+                    on_toggle,
+                    "Opens the console, the interface built for a controller.",
+                ),
+                described_labeled(
+                    rows::GAMEPAD_UI_MODE.label,
+                    mode_combo,
+                    "Always opens it at launch. Otherwise it opens when a controller connects, \
+                     and this window returns when the last one disconnects.",
+                ),
+            ],
+            None,
+        ));
+    }
     let mut stats_rows = vec![described_overridable(
         cx,
         &rows::STATS,

@@ -372,14 +372,16 @@ fn connect_spawn(
     }
 }
 
-/// "Open console UI": run the console (`punktfunk-session --browse`) in the session window.
-/// The shell yields exactly like a stream — hidden on the console window's `ready`, restored
-/// when the child exits (launched titles stream in that same window, so the whole couch
-/// round-trip happens without the shell).
+/// Run the console (`punktfunk-session --browse`) in the session window. The shell yields
+/// exactly like a stream — hidden on the console window's `ready`, restored when the child
+/// exits (launched titles stream in that same window, so the whole couch round-trip happens
+/// without the shell). `until_no_pads`: a controller connecting opened it, so it hands the
+/// desk back once the last one is gone.
 pub(crate) fn open_console(
     ctx: &Arc<AppCtx>,
     set_screen: &AsyncSetState<Screen>,
     set_status: &AsyncSetState<String>,
+    until_no_pads: bool,
 ) {
     let child = CancelHandle::default();
     *ctx.shared.session.lock().unwrap() = child.clone();
@@ -391,7 +393,7 @@ pub(crate) fn open_console(
 
     let shared = ctx.shared.clone();
     let (ss, st) = (set_screen.clone(), set_status.clone());
-    let spawned = crate::spawn::spawn_browse(fullscreen, child, move |event| {
+    let spawned = crate::spawn::spawn_browse(fullscreen, until_no_pads, child, move |event| {
         use crate::spawn::SpawnEvent;
         match event {
             SpawnEvent::Ready => {

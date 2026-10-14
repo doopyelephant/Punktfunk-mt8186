@@ -280,6 +280,7 @@ mod tests {
             super::super::dualshock4_windows::DS4_HWID,
             super::super::steam_deck_windows::DECK_HWID,
             super::super::triton_windows::TRITON_HWID,
+            super::super::steam_controller_windows::SC_HWID,
             super::super::switch_pro_windows::SWITCH_HWID,
             super::super::switch_pro_windows::JOYCON_LEFT_HWID,
             super::super::switch_pro_windows::JOYCON_RIGHT_HWID,
@@ -399,6 +400,10 @@ mod tests {
             (
                 super::super::triton_windows::TRITON_HWID,
                 pf_driver_proto::gamepad::DEVTYPE_TRITON,
+            ),
+            (
+                super::super::steam_controller_windows::SC_HWID,
+                pf_driver_proto::gamepad::DEVTYPE_STEAMCONTROLLER,
             ),
             (
                 super::super::switch_pro_windows::SWITCH_HWID,

@@ -1,6 +1,7 @@
 // Captured Steam Controller 2 pads: the glue between a transport link and the punktfunk wire.
 // Exactly one transport runs (`startTransport`): `Sc2UsbLink` for a wired pad or a Puck (macOS
 // only), else `Sc2BleLink`. Running both would double-feed a pad that is charging and paired.
+// A 2015 pad (`Sc1Device`), on a Mac's USB or on Bluetooth, rides the same path as pref 5.
 //
 // Each HID source (a USB collection or the BLE link) is its own `PadSource` with its own wire
 // slot, so a Puck with four pads claims four. A slot is claimed on the source's first state report
@@ -191,6 +192,16 @@ public final class Sc2Capture {
         #endif
     }
 
+    /// Whether `source` is a 2015 Steam Controller. Safe from any thread; never call with `lock` held.
+    private func isClassicSource(_ source: UInt64) -> Bool {
+        if source == Self.bleSource { return link.isClassic }
+        #if os(macOS)
+        return usbLink.isClassic(source: source)
+        #else
+        return false
+        #endif
+    }
+
     /// Hold the SC2 twins back before `GamepadCapture` starts forwarding. On a Mac that can open
     /// an attached USB SC2 the claim lands within a second (the identity read included); its twin
     /// would otherwise reach the host first as an Xbox pad and push the SC2 to the next pad index.
@@ -348,13 +359,19 @@ public final class Sc2Capture {
 
     private func handleReport(source: UInt64, _ framed: [UInt8]) {
         guard let id = framed.first else { return }
-        if id == Sc2Device.idWireless || id == Sc2Device.idWirelessX {
-            handleWireless(source: source, framed)
+        let classic = isClassicSource(source)
+        let wireless = classic
+            ? Sc1Device.isFrame(framed, type: Sc1Device.typeWireless)
+            : id == Sc2Device.idWireless || id == Sc2Device.idWirelessX
+        if wireless {
+            handleWireless(source: source, framed, classic: classic)
             return
         }
         var state = Sc2Device.State()
         var report = framed
-        let isState = Sc2Device.parseState(report, into: &state)
+        let isState = classic
+            ? Sc1Device.parseState(report, into: &state)
+            : Sc2Device.parseState(report, into: &state)
         lock.lock()
         if stopped || suspended {
             lock.unlock()
@@ -426,10 +443,12 @@ public final class Sc2Capture {
     ///
     /// A connect needs nothing: the first state report claims the slot, and the host's virtual
     /// Puck queues its own connect edge.
-    private func handleWireless(source: UInt64, _ framed: [UInt8]) {
-        guard isDongleSource(source), framed.count >= 2,
-              framed[1] == Sc2Device.wirelessDisconnect else { return }
-        log.info("SC2: Puck reports controller powered off — releasing wire slot")
+    private func handleWireless(source: UInt64, _ framed: [UInt8], classic: Bool) {
+        let off = classic
+            ? Sc1Device.isWirelessDisconnect(framed)
+            : framed.count >= 2 && framed[1] == Sc2Device.wirelessDisconnect
+        guard isDongleSource(source), off else { return }
+        log.info("SC2: dongle reports controller powered off — releasing wire slot")
         releaseSource(source, reason: "puck wireless disconnect")
     }
 
@@ -529,8 +548,8 @@ public final class Sc2Capture {
                 // four controller slots; a Windows host folds it onto the wired identity), so
                 // it declares its own kind — a wired or BLE pad stays `.steamController2`.
                 let dongle = self.isDongleSource(source)
-                let kind: PunktfunkConnection.GamepadType =
-                    dongle ? .steamController2Puck : .steamController2
+                let kind: PunktfunkConnection.GamepadType = self.isClassicSource(source)
+                    ? .steamController : dongle ? .steamController2Puck : .steamController2
                 #if os(macOS)
                 let serial = source == Sc2Capture.bleSource
                     ? nil : self.usbLink.serial(source: source)
@@ -596,7 +615,8 @@ public final class Sc2Capture {
         lock.unlock()
         chord?.cancel()
         guard let index else { return }
-        write(source: source, kind: 0, frame: Self.rumbleStop)
+        // A 2015 pad's haptics are finite pulse trains; `0x80` means something else to it.
+        if !isClassicSource(source) { write(source: source, kind: 0, frame: Self.rumbleStop) }
         connection.send(.gamepadRemove(pad: UInt32(index)))
         DispatchQueue.main.async { [weak self, manager] in
             MainActor.assumeIsolated {

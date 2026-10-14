@@ -9,9 +9,10 @@ import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * The captured Steam Controller 2s of one transport link ([Sc2UsbLink] / [Sc2BleLink]) — a
- * cable or Bluetooth link carries one pad, a Puck one per slot interface — and one of two
- * consumers:
+ * The captured Steam Controllers of one transport link ([Sc2UsbLink] / [Sc2BleLink]) — a
+ * cable or Bluetooth link carries one pad, a dongle one per slot interface — and one of two
+ * consumers. A 2015 pad ([Sc1Device]) takes the same path, its state parsed into the
+ * Steam Controller 2's layout and its raw reports mirrored by the host as a `28DE:1102`:
  *
  * **Stream mode** (`router != null`, owned by StreamScreen):
  * - **Raw plane (the point):** every input report goes to core
@@ -49,7 +50,15 @@ class Sc2Capture(
     private val ble = Sc2BleLink(context, { report, len -> onReport(report, len, BLE_IFACE) }, ::onLinkClosed)
     @Volatile private var activeLink: Int = LINK_NONE
 
-    /** True when the USB link is a Puck dongle — the only transport whose wireless-status
+    /** True when the live link carries a 2015 pad ([Sc1Device]) rather than a Steam Controller 2. */
+    private val classic: Boolean
+        get() = when (activeLink) {
+            LINK_USB -> usb.isClassic
+            LINK_BLE -> ble.isClassic
+            else -> false
+        }
+
+    /** True when the USB link is a dongle — the only transport whose wireless-status
      *  reports are authoritative. A WIRED pad also emits them, truthfully reporting "no radio
      *  link" — acting on that tore the slot down 255 ms after creation (first on-glass run). */
     @Volatile private var dongleLink = false
@@ -116,7 +125,7 @@ class Sc2Capture(
         val ok = usb.start(dev)
         if (ok) {
             activeLink = LINK_USB
-            dongleLink = dev.productId != Sc2Device.PID_WIRED
+            dongleLink = dev.productId != if (classic) Sc1Device.PID_WIRED else Sc2Device.PID_WIRED
             reporting = true
             onActiveChanged?.invoke(true)
         }
@@ -150,6 +159,13 @@ class Sc2Capture(
     fun testRumble(): Boolean {
         if (!reporting) return false
         val ifaces = pads.keys.toList().ifEmpty { listOf(HidUsbLink.ANY_IFACE) }
+        if (classic) {
+            // The 2015 pad buzzes its trackpads: a finite pulse train, so no stop frame.
+            Thread({
+                for (iface in ifaces) for (side in 0..1) writeLink(HID_RAW_FEATURE, CLASSIC_BUZZ[side], iface)
+            }, "pf-sc1-buzz").start()
+            return true
+        }
         for (iface in ifaces) writeLink(HID_RAW_OUTPUT, Sc2Device.rumbleFrame(0xFFFF, 0xFFFF), iface)
         Handler(Looper.getMainLooper()).postDelayed(
             { for (iface in ifaces) writeLink(HID_RAW_OUTPUT, RUMBLE_STOP, iface) },
@@ -171,7 +187,7 @@ class Sc2Capture(
         val wasActive = activeLink != LINK_NONE
         // The firmware holds the last rumble level it got: put the motors down before letting go.
         // USB goes EP0-direct, since the interrupt queue stops draining with the reader.
-        for (iface in pads.keys) {
+        for (iface in pads.keys.takeIf { !classic }.orEmpty()) {
             when (activeLink) {
                 LINK_USB -> usb.writeControl(RUMBLE_STOP, iface)
                 LINK_BLE -> ble.writeRaw(HID_RAW_OUTPUT, RUMBLE_STOP)
@@ -196,21 +212,37 @@ class Sc2Capture(
             reporting = true
             onActiveChanged?.invoke(true) // a re-acquired BLE pad is live again
         }
-        val id = report[0].toInt() and 0xFF
+        // A 2015 pad's frames have no id: its frame type stands in.
+        val id = report[if (classic && len >= 3) 2 else 0].toInt() and 0xFF
         if (seenIds.add(id)) Log.i(TAG, "SC2 report id=0x%02x seen (len=%d)".format(id, len))
         // Wireless status: authoritative ONLY through a Puck dongle (powering the pad off frees
         // its wire index + the host's virtual device). A wired/BLE pad emits it too — truthfully
         // saying "no radio link" — and must NOT tear the slot down (SDL's wired path likewise
         // marks the controller connected unconditionally and reconnects on any state report).
-        if ((id == Sc2Device.ID_WIRELESS || id == Sc2Device.ID_WIRELESS_X) && len >= 2) {
-            if (dongleLink && report[1].toInt() and 0xFF == Sc2Device.WIRELESS_DISCONNECT) {
-                Log.i(TAG, "Puck reports the controller on interface $iface powered off — releasing its wire slot")
+        val wireless = if (classic) {
+            Sc1Device.isFrame(report, len, Sc1Device.TYPE_WIRELESS)
+        } else {
+            (id == Sc2Device.ID_WIRELESS || id == Sc2Device.ID_WIRELESS_X) && len >= 2
+        }
+        if (wireless) {
+            val off = if (classic) {
+                Sc1Device.isWirelessDisconnect(report, len)
+            } else {
+                report[1].toInt() and 0xFF == Sc2Device.WIRELESS_DISCONNECT
+            }
+            if (dongleLink && off) {
+                Log.i(TAG, "dongle reports the controller on interface $iface powered off — releasing its wire slot")
                 pads.remove(iface)?.let(::releasePad)
             }
             return
         }
         val pad = pads.getOrPut(iface) { Pad(iface) }
-        if (!Sc2Device.parseState(report, len, pad.state)) {
+        val parsed = if (classic) {
+            Sc1Device.parseState(report, len, pad.state)
+        } else {
+            Sc2Device.parseState(report, len, pad.state)
+        }
+        if (!parsed) {
             // Battery/status and future report types still belong to the as-is stream.
             forwardRaw(pad, report, len)
             return
@@ -237,14 +269,19 @@ class Sc2Capture(
     private fun claim(router: GamepadRouter, pad: Pad) {
         if (pad.claiming) return
         pad.claiming = true
-        val (puck, link, started) = Triple(dongleLink, activeLink, pad.epoch)
+        val (puck, link, started) = Triple(dongleLink && !classic, activeLink, pad.epoch)
+        val wasClassic = classic
         Thread({
-            val identity = runCatching { readIdentity(link, puck, pad.iface) }.getOrNull()
-            // A Puck's pad slots are its interfaces 2–5.
+            val identity = runCatching { readIdentity(link, puck, wasClassic, pad.iface) }.getOrNull()
+            // A Puck's pad slots are its interfaces 2–5. The host mirrors each 2015 pad as wired.
             val slot = if (puck) (pad.iface - 2).coerceIn(0, 3) else 0
             synchronized(pad) {
                 if (started == pad.epoch) {
-                    val pref = if (puck) Gamepad.PREF_STEAMCONTROLLER2_PUCK else Gamepad.PREF_STEAMCONTROLLER2
+                    val pref = when {
+                        wasClassic -> Gamepad.PREF_STEAMCONTROLLER
+                        puck -> Gamepad.PREF_STEAMCONTROLLER2_PUCK
+                        else -> Gamepad.PREF_STEAMCONTROLLER2
+                    }
                     pad.wire = router.openExternal(pref)?.also { p ->
                         identity?.let { (serial, replies) -> p.identity(slot, serial, replies) }
                         val via = if (puck) "Puck slot $slot" else "direct"
@@ -260,13 +297,17 @@ class Sc2Capture(
      * The serial and packed replies the host mirrors: the USB serial over a cable or Puck, the
      * engraved serial (`0xAE` attribute 1) over Bluetooth. Null when the pad answered nothing.
      */
-    private fun readIdentity(link: Int, puck: Boolean, iface: Int): Pair<String, ByteArray>? {
+    private fun readIdentity(link: Int, puck: Boolean, classic: Boolean, iface: Int): Pair<String, ByteArray>? {
         val packed = java.io.ByteArrayOutputStream()
         var unitSerial = ""
         var answered = 0
         var asked = 0
         while (true) {
-            val request = NativeBridge.nativeSc2IdentityRequest(puck, asked) ?: break
+            val request = if (classic) {
+                NativeBridge.nativeSc1IdentityRequest(asked)
+            } else {
+                NativeBridge.nativeSc2IdentityRequest(puck, asked)
+            } ?: break
             asked++
             val reply = when (link) {
                 LINK_USB -> usb.exchange(request, iface)
@@ -279,7 +320,7 @@ class Sc2Capture(
                 packed.write(part, 0, n)
             }
             answered++
-            if (request.contentEquals(SERIAL_QUERY)) {
+            if (request.drop(1).toByteArray().contentEquals(SERIAL_QUERY)) {
                 unitSerial = reply.drop(4).takeWhile { it != 0.toByte() }.toByteArray().decodeToString()
             }
         }
@@ -389,11 +430,15 @@ class Sc2Capture(
 
         val RUMBLE_STOP = Sc2Device.rumbleFrame(0, 0)
 
-        /** The `0xAE` query for attribute 1, the engraved serial. */
-        val SERIAL_QUERY = byteArrayOf(0x01, 0xAE.toByte(), 0x15, 0x01)
+        /** The `0xAE` query for attribute 1, the engraved serial, after its report id. */
+        val SERIAL_QUERY = byteArrayOf(0xAE.toByte(), 0x15, 0x01)
 
         /** The C ABI's `HID_RAW_OUTPUT` — the kind every output report goes out as. */
         const val HID_RAW_OUTPUT = 0
+        const val HID_RAW_FEATURE = 1
+
+        /** Right, then left trackpad: 2 ms on, 2 ms off, for [RUMBLE_MS]. */
+        val CLASSIC_BUZZ = Array(2) { Sc1Device.hapticPulse(it, 2000, 2000, (RUMBLE_MS / 4).toInt()) }
 
         /** Matches the vibrator pulse the ordinary pad test gives: long enough to feel, short
          *  enough that a stuck stop frame is not a running motor. */

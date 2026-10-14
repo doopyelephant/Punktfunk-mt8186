@@ -208,7 +208,7 @@ impl Compositor {
 /// Cache if this is a hot path; do not block the async runtime.
 ///
 /// Live/pinned session wins over each backend's env-reading probe. Those probes
-/// miss a host started outside the session; env is retargeted only on connect
+/// miss a host started outside the session; the session is stored only on connect
 /// ([`apply_session_env`]). Listing a live-but-ungranted KWin and failing at
 /// `create` beats "no usable compositor" on a box that is running KDE.
 pub fn available() -> Vec<Compositor> {
@@ -259,18 +259,11 @@ fn compositor_from_pin(v: &str) -> Option<Compositor> {
     })
 }
 
-/// Serializes this crate's process-env reads/writes on the per-session setup
-/// path so two concurrent `spawn_blocking` sessions cannot interleave
-/// retarget with each other's reads.
+/// Serializes this crate's process-env reads against its env writers.
 ///
-/// Does **not** make `set_var`/`remove_var` sound. `setenv(3)` mutates
-/// `environ`; any concurrent `getenv` in the process is a data race. glibc,
-/// zbus, wayland-client, and Mesa do not take this lock.
-///
-/// Remaining writes are [`apply_session_env`]'s four desktop variables,
-/// which foreign loaders read from `environ` only. The lock orders our
-/// own readers and keeps those writes from racing each other — discipline,
-/// never proof.
+/// The host writes no session variable: the live session is stored in
+/// [`pf_host_config::session`]. The one writer left is a test (`routing.rs`),
+/// and the lock keeps its `set_var` off the readers that run beside it.
 pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Run `f` with [`ENV_LOCK`] held. Wrap any session-setup `set_var`/`remove_var`.
@@ -280,7 +273,8 @@ pub fn with_env_lock<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Compositor to drive: `PUNKTFUNK_COMPOSITOR` pin, else the live session
-/// ([`detect_active_session`]), else a last-resort `XDG_CURRENT_DESKTOP` read.
+/// ([`detect_active_session`]), else a last-resort read of the stored session's
+/// `XDG_CURRENT_DESKTOP` ([`pf_host_config::session::current_desktop`]).
 pub fn detect() -> Result<Compositor> {
     // Variants are Linux backends. Off Linux, do not fall through to the XDG
     // sniff: `mgmt/display.rs` puts that error verbatim on `/display/monitors`.
@@ -301,10 +295,7 @@ pub fn detect() -> Result<Compositor> {
         if let Some(c) = compositor_for_kind(detect_active_session().kind) {
             return Ok(c);
         }
-        // [`ENV_LOCK`]: another session's `apply_session_env` may `set_var`/`remove_var`
-        // this key. glibc `getenv` concurrent with `setenv` is UB even on a different
-        // variable. Read-then-drop: only the read needs serializing.
-        let desktop = with_env_lock(|| std::env::var("XDG_CURRENT_DESKTOP"))
+        let desktop = pf_host_config::session::current_desktop()
             .unwrap_or_default()
             .to_ascii_uppercase();
         compositor_from_xdg(&desktop)
@@ -673,8 +664,6 @@ use manager::unconfigured_topology;
 /// [`resolve_topology`] of `Auto`.
 #[cfg(not(target_os = "windows"))]
 fn unconfigured_topology() -> policy::Topology {
-    // [`ENV_LOCK`]: this runs inside `create`, concurrent with another session's
-    // `apply_session_env`; racing `getenv` is UB even though nobody writes these keys.
     let legacy = with_env_lock(|| {
         [
             "PUNKTFUNK_KWIN_VIRTUAL_PRIMARY",

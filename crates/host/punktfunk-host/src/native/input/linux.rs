@@ -232,9 +232,10 @@ impl PadBackends {
         }
     }
 
-    /// A Triton device (either shape) is live: its USB OUT is 1 kHz, so haptics poll at 1 ms.
-    pub(super) fn sc2_active(&self) -> bool {
-        self.steamctrl2.is_some() || self.steamctrl2_puck.is_some()
+    /// A Steam Controller of either generation is live. Steam plays its trackpad haptics as
+    /// single pulses, up to 1 kHz on a Triton, so they poll at 1 ms.
+    pub(super) fn steam_haptics_live(&self) -> bool {
+        self.steamctrl.is_some() || self.steamctrl2.is_some() || self.steamctrl2_puck.is_some()
     }
 
     /// Every live UHID manager; [`Self::pump`] and [`Self::heartbeat`] both walk it. A new field

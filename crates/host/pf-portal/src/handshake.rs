@@ -1,6 +1,6 @@
 //! Bounded portal handshake steps and the ScreenCast cursor-mode negotiation,
 //! shared by capture, the virtual displays and the libei injector. They run on
-//! [`crate::portal_runtime`], the one runtime ashpd's process-global connection lives on.
+//! [`crate::portal_runtime`], where each session's bus connection reads.
 //!
 //! Every ScreenCast handshake shares [`HANDSHAKE_BUDGET`] with its bounded
 //! steps ([`within`], [`finish_or_close`], [`close_session`]) and the

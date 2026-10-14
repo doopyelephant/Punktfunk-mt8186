@@ -67,7 +67,7 @@ mod backends {
             _rich: punktfunk_core::quic::RichInput,
         ) {
         }
-        pub(super) fn sc2_active(&self) -> bool {
+        pub(super) fn steam_haptics_live(&self) -> bool {
             false
         }
         pub(super) fn pump(
@@ -81,13 +81,17 @@ mod backends {
 }
 use backends::PadBackends;
 
-/// How long a declared Steam Controller 2 waits for its identity ([`Pads::waits_for_identity`]).
+/// How long a declared Steam Controller waits for its identity ([`Pads::waits_for_identity`]).
 const IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-fn is_sc2(kind: GamepadPref) -> bool {
+/// The kinds whose virtual pad answers as the physical one a client captured: both Steam
+/// Controllers.
+fn takes_identity(kind: GamepadPref) -> bool {
     matches!(
         kind,
-        GamepadPref::SteamController2 | GamepadPref::SteamController2Puck
+        GamepadPref::SteamController
+            | GamepadPref::SteamController2
+            | GamepadPref::SteamController2Puck
     )
 }
 
@@ -120,11 +124,11 @@ struct Pads {
     /// What the client asked for, before [`resolve_pad_kind`] folded it. `None` until
     /// this pad declares. Reported by the Controllers feed, never used for routing.
     declared: [Option<GamepadPref>; MAX_WIRE_PADS],
-    /// What a captured Steam Controller 2 told us it is, by wire pad. Kept across a re-plug: a
+    /// What a captured Steam Controller told us it is, by wire pad. Kept across a re-plug: a
     /// new pad on the index sends its own before it arrives.
     identities: [Option<std::sync::Arc<crate::inject::triton_proto::Sc2Identity>>; MAX_WIRE_PADS],
-    /// When each pad declared a Steam Controller 2 kind ([`Pads::waits_for_identity`]).
-    sc2_declared: [Option<std::time::Instant>; MAX_WIRE_PADS],
+    /// When each pad declared a kind that [`takes_identity`] ([`Pads::waits_for_identity`]).
+    identity_since: [Option<std::time::Instant>; MAX_WIRE_PADS],
     /// Manager that holds a built device at this index (`None` = none). Stays put
     /// if `kinds[idx]` later changes (arrival-after-first-frame), so a pad is
     /// never duplicated and removal always hits the manager that owns it.
@@ -161,7 +165,7 @@ impl Pads {
             kinds: [default; MAX_WIRE_PADS],
             declared: [None; MAX_WIRE_PADS],
             identities: Default::default(),
-            sc2_declared: [None; MAX_WIRE_PADS],
+            identity_since: [None; MAX_WIRE_PADS],
             owner: [None; MAX_WIRE_PADS],
             xbox360: None,
             backends: {
@@ -194,16 +198,16 @@ impl Pads {
                 "gamepad kind declared (per-pad)"
             );
         }
-        match (is_sc2(self.kinds[idx]), is_sc2(resolved)) {
-            (false, true) => self.sc2_declared[idx] = Some(std::time::Instant::now()),
-            (_, false) => self.sc2_declared[idx] = None,
+        match (takes_identity(self.kinds[idx]), takes_identity(resolved)) {
+            (false, true) => self.identity_since[idx] = Some(std::time::Instant::now()),
+            (_, false) => self.identity_since[idx] = None,
             (true, true) => {}
         }
         self.kinds[idx] = resolved;
         self.declared[idx] = Some(kind);
     }
 
-    /// Who the Steam Controller 2 on wire pad `id.pad` is, for the virtual pad built next.
+    /// Who the Steam Controller on wire pad `id.pad` is, for the virtual pad built next.
     fn set_identity(&mut self, id: &punktfunk_core::quic::PadIdentity) {
         let idx = usize::from(id.pad);
         if idx >= MAX_WIRE_PADS {
@@ -223,14 +227,14 @@ impl Pads {
     }
 
     /// A client sends a pad's identity on the control stream and its arrival as a datagram, so
-    /// the arrival can land first. An SC2 waits up to [`IDENTITY_WAIT`] for it: the virtual
-    /// pad is built once, as itself. A client that sends none gets the canned identity.
+    /// the arrival can land first. A Steam Controller waits up to [`IDENTITY_WAIT`] for it: the
+    /// virtual pad is built once, as itself. A client that sends none gets the canned identity.
     fn waits_for_identity(&self, idx: usize) -> bool {
         cfg!(any(target_os = "linux", windows))
             && self.owner[idx].is_none()
-            && is_sc2(self.kinds[idx])
+            && takes_identity(self.kinds[idx])
             && self.identities[idx].is_none()
-            && self.sc2_declared[idx].is_some_and(|t| t.elapsed() < IDENTITY_WAIT)
+            && self.identity_since[idx].is_some_and(|t| t.elapsed() < IDENTITY_WAIT)
     }
 
     /// This pad as the Controllers feed reports it: the device the host built, the
@@ -294,7 +298,7 @@ impl Pads {
             return;
         };
         let had_device = self.owner[idx].is_some();
-        if present && !had_device && is_sc2(self.kinds[idx]) {
+        if present && !had_device && takes_identity(self.kinds[idx]) {
             crate::inject::triton_proto::stage_identity(slot, self.identities[idx].clone());
         }
         let (kind, new_owner) = route_decision(self.owner[idx], self.kinds[idx], present);
@@ -444,10 +448,10 @@ impl Pads {
         self.backends.apply_rich(kind, rich);
     }
 
-    /// Triton USB OUT is 1 kHz; poll haptics at 1 ms so trackpad pulses do not sit 4 ms
-    /// then burst. Other backends stay at 4 ms to avoid idle churn.
+    /// Poll a Steam Controller's haptics at 1 ms so trackpad pulses do not sit 4 ms then
+    /// burst. Other backends stay at 4 ms to avoid idle churn.
     fn feedback_poll_interval(&self) -> std::time::Duration {
-        if self.backends.sc2_active() {
+        if self.backends.steam_haptics_live() {
             return std::time::Duration::from_millis(1);
         }
         std::time::Duration::from_millis(4)
@@ -621,7 +625,7 @@ pub(super) enum ClientInput {
     /// 0xCC/0x05 stylus batches, diffed into a per-session virtual tablet
     /// (`design/pen-tablet-input.md`).
     Pen(punktfunk_core::quic::PenBatch),
-    /// A captured Steam Controller 2's serial and feature replies, off the control stream.
+    /// A captured Steam Controller's serial and feature replies, off the control stream.
     PadIdentity(punktfunk_core::quic::PadIdentity),
 }
 
@@ -1479,17 +1483,20 @@ mod tests {
         assert!(pads.rich_in_slot_space(report(2)).is_none());
     }
 
-    /// A Steam Controller 2 is built once, as itself: it waits for the identity its client
-    /// sends, and nothing else waits.
+    /// A Steam Controller of either generation is built once, as itself: it waits for the
+    /// identity its client sends, and nothing else waits.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_steam_controller_2_waits_for_its_identity() {
+    fn a_steam_controller_waits_for_its_identity() {
         let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous(), None);
         // Set the resolved kind directly: a box without `/dev/uhid` folds an SC2 to Xbox 360.
         pads.kinds[1] = GamepadPref::SteamController2;
-        pads.sc2_declared[1] = Some(std::time::Instant::now());
-        pads.sc2_declared[2] = Some(std::time::Instant::now());
+        pads.kinds[4] = GamepadPref::SteamController;
+        for idx in [1, 2, 4] {
+            pads.identity_since[idx] = Some(std::time::Instant::now());
+        }
         assert!(pads.waits_for_identity(1));
+        assert!(pads.waits_for_identity(4));
         assert!(!pads.waits_for_identity(2), "an Xbox pad never waits");
         pads.set_identity(&punktfunk_core::quic::PadIdentity {
             pad: 1,
@@ -1499,7 +1506,7 @@ mod tests {
         });
         assert!(!pads.waits_for_identity(1));
         pads.kinds[3] = GamepadPref::SteamController2;
-        pads.sc2_declared[3] = Some(std::time::Instant::now() - IDENTITY_WAIT);
+        pads.identity_since[3] = Some(std::time::Instant::now() - IDENTITY_WAIT);
         assert!(!pads.waits_for_identity(3), "the wait ends");
     }
 

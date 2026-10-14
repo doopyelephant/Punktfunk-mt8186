@@ -63,8 +63,13 @@ fn restart_act() -> Result<(), String> {
         .and_then(host_unit)
         .ok_or("the host is not running as its user service")?;
     // `--no-block`: this process is the one systemd stops.
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "--no-block", "restart", &unit])
+    let status =
+        pf_host_config::session::export_to(std::process::Command::new("systemctl").args([
+            "--user",
+            "--no-block",
+            "restart",
+            &unit,
+        ]))
         .status()
         .map_err(|e| format!("systemctl: {e}"))?;
     if status.success() {

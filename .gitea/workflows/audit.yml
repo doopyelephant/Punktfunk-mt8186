@@ -281,8 +281,8 @@ jobs:
   # ── Miri ─────────────────────────────────────────────────────────────────────────────────────
   # WHAT THIS BUYS, precisely — one thing, and it is worth having:
   #   It interprets `pf-driver-proto` CROSS-COMPILED TO `x86_64-pc-windows-msvc`, on a Linux
-  #   runner, with no Windows box anywhere in the loop. That crate is `#![forbid(unsafe_code)]`
-  #   and is path-dep'd by BOTH the main workspace and the driver workspace, so it is the layout
+  #   runner, with no Windows box anywhere in the loop. Its only unsafe is the section view every
+  #   Windows section owner reads through. It is path-dep'd by BOTH workspaces, so it is the layout
   #   oracle for every frame and IOCTL crossing that boundary — and drift there is silent
   #   corruption, not a compile error. Nothing else in CI checks it at MSVC layout.
   #   On the first run ever performed against this repo it found a real defect: a layout test

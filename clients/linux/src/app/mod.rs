@@ -174,28 +174,6 @@ pub enum AppMsg {
     Toast(String),
 }
 
-/// Whether Controller-optimized UI opens the console on this poll: on the first controller
-/// and never on a later one, so a console the player quit stays closed until every
-/// controller has gone and one comes back. Always opens it once, at launch.
-fn console_opens(ui: GamepadUi, prev: usize, now: usize) -> bool {
-    ui == GamepadUi::WithController && prev == 0 && now > 0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_console_opens_on_the_first_controller_only() {
-        assert!(console_opens(GamepadUi::WithController, 0, 1));
-        assert!(!console_opens(GamepadUi::WithController, 1, 2));
-        assert!(!console_opens(GamepadUi::WithController, 2, 1));
-        assert!(!console_opens(GamepadUi::WithController, 1, 0));
-        assert!(!console_opens(GamepadUi::Off, 0, 1));
-        assert!(!console_opens(GamepadUi::Always, 0, 1));
-    }
-}
-
 pub struct AppInit {
     pub gamepad: crate::gamepad::GamepadService,
 }
@@ -575,7 +553,8 @@ impl SimpleComponent for AppModel {
             AppMsg::OpenConsole => self.open_console(&sender, false),
             AppMsg::Pads(n) => {
                 let prev = std::mem::replace(&mut self.pads, n);
-                if !self.flight.busy() && console_opens(self.store.settings().gamepad_ui(), prev, n)
+                if !self.flight.busy()
+                    && orchestrate::console_opens(self.store.settings().gamepad_ui(), prev, n)
                 {
                     self.open_console(&sender, true);
                 }

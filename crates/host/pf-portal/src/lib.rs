@@ -1,17 +1,16 @@
-//! Process-lifetime tokio runtime for every portal call in the host.
+//! Process-lifetime tokio runtime for every portal call in the host, and the session-bus
+//! connection each call makes.
 //!
-//! ashpd caches its D-Bus connection in a process-global `OnceLock`. The first
-//! portal proxy creates it, and zbus spawns the connection's reader on
-//! whichever tokio runtime is current at that moment.
+//! zbus spawns a connection's reader on the tokio runtime current when it is built. A portal
+//! session's connection is built inside `portal_runtime().block_on`, so its reader lives as
+//! long as the session, whichever thread asked for it.
 //!
-//! A per-session runtime that is dropped at teardown leaves that cached
-//! connection with no executor. Every later portal call in the process then
-//! waits for a reply nothing is left alive to read.
+//! Never drop this runtime. `block_on` takes `&self`, so every portal thread can park on it
+//! concurrently: capture, the virtual displays and the libei injector. A portal session lives
+//! while its proxy holds the connection: close it explicitly (`close_session`).
 //!
-//! Never build a per-session runtime, and never drop this one. `block_on`
-//! takes `&self`, so every portal thread can park on it concurrently: capture,
-//! the virtual displays and the libei injector. A portal session made here
-//! outlives the thread that made it: close it explicitly (`close_session`).
+//! Every proxy is built `with_connection(session_bus())`. ashpd's `new()` constructors share
+//! one connection, opened from the environment at first use, which never follows the session.
 //!
 //! [`cursor_mode`] is the pure ScreenCast cursor ladder, compiled on every
 //! target so its tests run without a compositor.
@@ -29,6 +28,24 @@ pub use handshake::{
 use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use tokio::runtime::Runtime;
+
+/// A connection to the live session's bus, by [`pf_host_config::session::dbus_address`], for a
+/// caller that names or serves something on it first.
+#[cfg(target_os = "linux")]
+pub fn session_bus_builder() -> ashpd::zbus::Result<ashpd::zbus::connection::Builder<'static>> {
+    use ashpd::zbus::connection::Builder;
+    match pf_host_config::session::dbus_address() {
+        Some(address) => Builder::address(address.as_str()),
+        None => Builder::session(),
+    }
+}
+
+/// A new connection from [`session_bus_builder`]. Its owner decides how long it lives: Mutter
+/// and the portals end the sessions made on it when it closes.
+#[cfg(target_os = "linux")]
+pub async fn session_bus() -> ashpd::zbus::Result<ashpd::zbus::Connection> {
+    session_bus_builder()?.build().await
+}
 
 /// `Result` so a failed build fails the handshake with a reason instead of aborting the process.
 #[cfg(target_os = "linux")]

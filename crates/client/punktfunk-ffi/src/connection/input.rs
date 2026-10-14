@@ -211,6 +211,130 @@ pub unsafe extern "C" fn punktfunk_sc2_identity_request(
     req.len()
 }
 
+/// [`punktfunk_sc2_identity_request`] for a 2015 Steam Controller: the `index`-th query, report
+/// id 0 first. Returns its length; 0 past the last one or when `cap` is short.
+///
+/// # Safety
+/// `out` points to `cap` writable bytes.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_sc1_identity_request(
+    index: u32,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    let Some(req) = punktfunk_core::client::sc2::classic_identity_requests().nth(index as usize)
+    else {
+        return 0;
+    };
+    if out.is_null() || cap < req.len() {
+        return 0;
+    }
+    // SAFETY: the caller grants `cap` writable bytes at `out`; `req` fits.
+    unsafe { std::ptr::copy_nonoverlapping(req.as_ptr(), out, req.len()) };
+    req.len()
+}
+
+/// Bytes of state [`punktfunk_sc1_ble_input`] keeps per pad.
+#[cfg(feature = "quic")]
+pub const PUNKTFUNK_SC1_BLE_STATE_LEN: usize = 160;
+#[cfg(feature = "quic")]
+const _: () =
+    assert!(PUNKTFUNK_SC1_BLE_STATE_LEN == punktfunk_core::client::sc1_ble::CLASSIC_BLE_STATE);
+
+/// One segment of a 2015 Steam Controller's Bluetooth input, `[0x03, header, 18 bytes]`. True
+/// when it completed a state message: `out` then holds the 64-byte wired frame to forward.
+/// `state` is [`PUNKTFUNK_SC1_BLE_STATE_LEN`] bytes, zeroed once per link and kept.
+///
+/// # Safety
+/// `state` points to that many writable bytes, `segment` to `len` readable ones, `out` to 64
+/// writable ones.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_sc1_ble_input(
+    state: *mut u8,
+    segment: *const u8,
+    len: usize,
+    out: *mut u8,
+) -> bool {
+    use punktfunk_core::client::sc1_ble::CLASSIC_BLE_STATE;
+    if state.is_null() || segment.is_null() || out.is_null() {
+        return false;
+    }
+    // SAFETY: the caller grants each buffer at the size documented above.
+    let (state, segment, out) = unsafe {
+        (
+            &mut *state.cast::<[u8; CLASSIC_BLE_STATE]>(),
+            std::slice::from_raw_parts(segment, len),
+            &mut *out.cast::<[u8; 64]>(),
+        )
+    };
+    punktfunk_core::client::sc1_ble::classic_ble_input(state, segment, out)
+}
+
+/// A wired feature frame for a 2015 Steam Controller, report id 0 first, as the 20-byte
+/// segments its Bluetooth link takes, back to back in `out`. Returns the bytes written; 0 when
+/// `cap` is short.
+///
+/// # Safety
+/// `frame` points to `len` readable bytes, `out` to `cap` writable ones.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_sc1_ble_segments(
+    frame: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    use punktfunk_core::client::sc1_ble::{classic_ble_segments, SEGMENT};
+    if frame.is_null() || out.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller grants `len` readable bytes at `frame`.
+    let segs: Vec<_> =
+        classic_ble_segments(unsafe { std::slice::from_raw_parts(frame, len) }).collect();
+    if cap < segs.len() * SEGMENT {
+        return 0;
+    }
+    // SAFETY: the caller grants `cap` writable bytes at `out`, and the segments fit.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, cap) };
+    for (i, seg) in segs.iter().enumerate() {
+        out[i * SEGMENT..(i + 1) * SEGMENT].copy_from_slice(seg);
+    }
+    segs.len() * SEGMENT
+}
+
+/// The segments read back for one 2015 Steam Controller feature query, back to back and in
+/// order. Once the last one is in, the reply goes to `out`, report id 0 first, and this returns
+/// its length; 0 before then or when `cap` is short.
+///
+/// # Safety
+/// `segments` points to `len` readable bytes, `out` to `cap` writable ones.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_sc1_ble_reply(
+    segments: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> usize {
+    if segments.is_null() || out.is_null() {
+        return 0;
+    }
+    let mut reply = [0u8; 73];
+    // SAFETY: the caller grants `len` readable bytes at `segments`.
+    let segments = unsafe { std::slice::from_raw_parts(segments, len) };
+    let Some(n) = punktfunk_core::client::sc1_ble::classic_ble_reply(segments, &mut reply) else {
+        return 0;
+    };
+    if cap < n {
+        return 0;
+    }
+    // SAFETY: the caller grants `cap` writable bytes at `out`; `n` fits.
+    unsafe { std::ptr::copy_nonoverlapping(reply.as_ptr(), out, n) };
+    n
+}
+
 /// Tell the host who the Steam Controller 2 on `pad` is, before its arrival: `serial` is its USB
 /// serial (UTF-8, NUL-terminated), `replies` the `(request, reply)` pairs packed as
 /// `[len][request][len][reply]…`, each part at most 64 bytes. `slot` is a Puck pad's slot (its USB

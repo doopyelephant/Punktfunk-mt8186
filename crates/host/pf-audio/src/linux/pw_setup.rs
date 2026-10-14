@@ -4,17 +4,20 @@
 use anyhow::{Context, Result};
 use pipewire as pw;
 
-/// Init the library (idempotent), then a main loop and its connection to this session's
-/// daemon. `label` prefixes each error. The core holds its context, so the pair keeps the connection alive;
-/// guards and listeners borrow them and stay in the caller's frame.
+/// Init the library (idempotent), then a main loop and its connection to the live session's
+/// daemon, by its socket when a session is stored. `label` prefixes each error. The core holds
+/// its context, so the pair keeps the connection alive; guards and listeners borrow them and
+/// stay in the caller's frame.
 pub(super) fn pw_connect(label: &str) -> Result<(pw::main_loop::MainLoopRc, pw::core::CoreRc)> {
     pw::init();
     let mainloop =
         pw::main_loop::MainLoopRc::new(None).with_context(|| format!("{label} MainLoop"))?;
     let context =
         pw::context::ContextRc::new(&mainloop, None).with_context(|| format!("{label} Context"))?;
+    let remote = pf_host_config::session::pipewire_remote()
+        .map(|socket| pw::properties::properties! { *pw::keys::REMOTE_NAME => socket });
     let core = context
-        .connect_rc(None)
+        .connect_rc(remote)
         .with_context(|| format!("{label} connect (is PipeWire running in this session?)"))?;
     Ok((mainloop, core))
 }

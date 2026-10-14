@@ -36,6 +36,8 @@ rows! {
     FULLSCREEN_ON_STREAM: "fullscreen_on_stream", "Start streams fullscreen", "general", false;
     AUTO_WAKE: "auto_wake", "Auto-wake on connect", "general", false;
     START_IN: "start_in", "Start in", "general", false;
+    GAMEPAD_UI: "gamepad_ui_enabled", "Controller-optimized UI", "general", false;
+    GAMEPAD_UI_MODE: "gamepad_ui_mode", "Show it", "general", false;
     STATS: "stats_verbosity", "Statistics overlay", "general", false;
     SHOW_ADVANCED: "show_advanced", "Show advanced", "general", false;
     ADVANCED_STATS: "advanced_stats", "Advanced statistics", "general", true;
@@ -100,22 +102,14 @@ mod tests {
             "background_timeout_minutes",
             "a phone or TV app in the background",
         ),
-        (
-            "gamepad_ui_enabled",
-            "this shell never opens the console on its own",
-        ),
-        (
-            "gamepad_ui_mode",
-            "this shell never opens the console on its own",
-        ),
         ("follow_os_theme", "the console's own look"),
         ("ui_palette", "the console's own look"),
         ("reduce_motion", "the console's own look"),
         ("reduce_ui_resolution", "a weak GPU's console"),
         ("library_view", "the console's library"),
         ("library_sections", "the console's library"),
-        ("host_sort", "this host list has one order"),
-        ("host_grouping", "this host list has one order"),
+        ("host_sort", "Sort on the Hosts header"),
+        ("host_grouping", "Group on the Hosts header"),
         ("second_screen", "an Android handheld's second screen"),
         ("low_latency", "a MediaCodec decoder flag"),
         ("audio_route", "webOS's own audio plane"),

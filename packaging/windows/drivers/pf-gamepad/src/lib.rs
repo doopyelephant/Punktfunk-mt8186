@@ -15,7 +15,8 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use pf_driver_proto::gamepad::{
     DEVTYPE_8BITDO_PRO2, DEVTYPE_8BITDO_PRO3, DEVTYPE_8BITDO_ULTIMATE2, DEVTYPE_HORIPAD_STEAM,
-    DEVTYPE_JOYCON_LEFT, DEVTYPE_JOYCON_RIGHT, DEVTYPE_STEAMDECK, PadShm, pad_serial,
+    DEVTYPE_JOYCON_LEFT, DEVTYPE_JOYCON_RIGHT, DEVTYPE_STEAMCONTROLLER, DEVTYPE_STEAMDECK,
+    DEVTYPE_TRITON, PadShm, pad_serial,
 };
 use pf_driver_proto::switch::is_switch;
 use pf_driver_proto::{deck, dualsense, dualshock4, triton, xbox};
@@ -60,6 +61,8 @@ const TRITON_PID: u16 = 0x1302;
 /// `DS_VER` here: 0x0307 is the captured value, and the whole point of this identity is fidelity
 /// to the capture.
 const TRITON_VER: u16 = 0x0307;
+/// The 2015 Steam Controller, wired (28DE:1102), served when the host stamps device_type=15.
+const SC_PID: u16 = 0x1102;
 /// Nintendo Switch Pro Controller, wired, served when the host stamps device_type=8. bcdDevice
 /// 2.00, as the Linux UHID pad presents it.
 const SWITCH_VID: u16 = 0x057E;
@@ -138,6 +141,7 @@ const fn hid_desc(rdesc_len: usize) -> [u8; 9] {
     let len = (rdesc_len as u16).to_le_bytes();
     [0x09, 0x21, 0x00, 0x01, 0x00, 0x01, 0x22, len[0], len[1]]
 }
+static SC_HID_DESC: [u8; 9] = hid_desc(deck::SC_RDESC.len());
 static EIGHTBITDO_HID_DESC: [u8; 9] = hid_desc(eightbitdo::RDESC_WITH_PROOF.len());
 static EIGHTBITDO_CAPS_HID_DESC: [u8; 9] = hid_desc(eightbitdo::RDESC_CAPS_WITH_PROOF.len());
 static HORI_HID_DESC: [u8; 9] = hid_desc(hori::RDESC_WITH_PROOF.len());
@@ -181,6 +185,10 @@ fn hid_attrs(devtype: u8) -> [u8; 32] {
         assert!(matches!(id(6), Some((XBOX_VID, XBOX_PID_ELITE2))));
         assert!(matches!(id(7), Some((DECK_VID, TRITON_PID))));
         assert!(matches!(id(8), Some((SWITCH_VID, SWITCH_PID))));
+        assert!(matches!(
+            id(DEVTYPE_STEAMCONTROLLER),
+            Some((DECK_VID, SC_PID))
+        ));
     };
     let mut a = [0u8; 32];
     a[0..4].copy_from_slice(&32u32.to_le_bytes());
@@ -224,6 +232,7 @@ fn neutral_report(devtype: u8) -> [u8; 64] {
         }
         DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => eightbitdo::NEUTRAL_REPORT,
         DEVTYPE_HORIPAD_STEAM => hori::NEUTRAL_REPORT,
+        DEVTYPE_STEAMCONTROLLER => deck::SC_NEUTRAL_REPORT,
         _ => dualsense::NEUTRAL_REPORT, // DualSense and Edge share the report 0x01 shape
     }
 }
@@ -628,7 +637,8 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
         }
     }
 
-    if PNP_DEVTYPE.load(Ordering::Relaxed) == pf_driver_proto::gamepad::DEVTYPE_TRITON as u32 {
+    let pnp = PNP_DEVTYPE.load(Ordering::Relaxed);
+    if pnp == DEVTYPE_TRITON as u32 || pnp == DEVTYPE_STEAMCONTROLLER as u32 {
         // SAFETY: `device` is the live device just created — the exact contract this fn requires.
         let blob = unsafe {
             wdf::query_binary_property(
@@ -637,7 +647,7 @@ extern "C" fn evt_device_add(_driver: WDFDRIVER, mut device_init: PWDFDEVICE_INI
                 pf_driver_proto::triton::IDENTITY_PROPKEY_PID,
             )
         };
-        if let Ok(mut g) = TRITON_IDENTITY.lock() {
+        if let Ok(mut g) = MIRROR_IDENTITY.lock() {
             *g = blob.unwrap_or_default();
         }
     }
@@ -712,6 +722,7 @@ extern "C" fn evt_io_device_control(
             DEVTYPE_8BITDO_ULTIMATE2 => &EIGHTBITDO_HID_DESC,
             DEVTYPE_8BITDO_PRO2 | DEVTYPE_8BITDO_PRO3 => &EIGHTBITDO_CAPS_HID_DESC,
             DEVTYPE_HORIPAD_STEAM => &HORI_HID_DESC,
+            DEVTYPE_STEAMCONTROLLER => &SC_HID_DESC,
             _ => &HID_DESC,
         }),
         IOCTL_HID_GET_DEVICE_ATTRIBUTES => request.copy_to_output(&hid_attrs(device_type())),
@@ -728,6 +739,7 @@ extern "C" fn evt_io_device_control(
             }
             dt @ DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => eightbitdo::rdesc(dt, true),
             DEVTYPE_HORIPAD_STEAM => &hori::RDESC_WITH_PROOF[..],
+            DEVTYPE_STEAMCONTROLLER => &deck::SC_RDESC[..],
             _ => &dualsense::RDESC[..],
         }),
         IOCTL_HID_WRITE_REPORT | IOCTL_UMDF_HID_SET_OUTPUT_REPORT => {
@@ -889,24 +901,24 @@ static LAST_SET_FEATURE: std::sync::Mutex<[u8; 64]> = std::sync::Mutex::new([0; 
 static TRITON_LAST_SET: std::sync::Mutex<([u8; 64], usize)> = std::sync::Mutex::new(([0; 64], 0));
 
 /// The client's identity the host stored on this devnode (`triton::identity_blob`), read at
-/// `EvtDeviceAdd`. Empty when the host set none.
-static TRITON_IDENTITY: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+/// `EvtDeviceAdd` for a Steam Controller of either generation. Empty when the host set none.
+static MIRROR_IDENTITY: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
 
-/// The engraved serial of the pad this one mirrors, else the per-index one.
-fn triton_serial() -> String {
-    let blob = TRITON_IDENTITY
+/// The engraved serial of the pad this one mirrors, else the per-index one for `devtype`.
+fn mirror_serial(devtype: u8) -> String {
+    let blob = MIRROR_IDENTITY
         .lock()
         .map(|g| g.clone())
         .unwrap_or_default();
     match pf_driver_proto::triton::Identity::parse(&blob) {
         Some(id) if !id.serial.is_empty() => id.serial.into(),
-        _ => pad_serial(pf_driver_proto::gamepad::DEVTYPE_TRITON, pad_index()),
+        _ => pad_serial(devtype, pad_index()),
     }
 }
 
-/// The mirrored pad's own reply to `last_set`, when its client recorded one.
-fn triton_recorded_reply(last_set: &[u8]) -> Option<[u8; 64]> {
-    let blob = TRITON_IDENTITY.lock().ok()?;
+/// The mirrored pad's own reply to `last_set` (id-first), when its client recorded one.
+fn recorded_reply(last_set: &[u8]) -> Option<[u8; 64]> {
+    let blob = MIRROR_IDENTITY.lock().ok()?;
     pf_driver_proto::triton::Identity::parse(&blob)?.reply(last_set)
 }
 
@@ -976,6 +988,17 @@ fn on_set_feature(request: &Request) -> NTSTATUS {
                 out[1..1 + n].copy_from_slice(&src[..n]);
                 publish_output(view, &out, false);
             }
+            // 2015 Steam Controller: every SET but the proof goes to the host FEATURE-tagged,
+            // re-prefixed with report id 0; the host decides which reach the physical pad.
+            if device_type() == DEVTYPE_STEAMCONTROLLER
+                && !src.starts_with(&pf_driver_proto::gamepad::DECK_PROOF_CMD)
+                && let Some(view) = CHANNEL.data()
+            {
+                let mut out = [0u8; 64];
+                let n = src.len().min(63);
+                out[1..1 + n].copy_from_slice(&src[..n]);
+                publish_output(view, &out, true);
+            }
         }
     }
     dbglog!("[pf-gamepad] SET_FEATURE (acked, latched for GET)");
@@ -993,6 +1016,20 @@ fn deck_feature_reply() -> [u8; 64] {
         return proof_reply();
     }
     deck::feature_reply(&last, &pad_serial(DEVTYPE_STEAMDECK, pad_index()))
+}
+
+/// 2015 Steam Controller identity: the Deck's contract and proof, answered as the pad its
+/// client captured where the host stored that pad's identity on the devnode.
+fn sc_feature_answer() -> [u8; 64] {
+    let last = LAST_SET_FEATURE.lock().map(|g| *g).unwrap_or([0u8; 64]);
+    if last.starts_with(&pf_driver_proto::gamepad::DECK_PROOF_CMD) {
+        return proof_reply();
+    }
+    deck::sc_mirror_reply(
+        recorded_reply,
+        &last,
+        &mirror_serial(DEVTYPE_STEAMCONTROLLER),
+    )
 }
 
 /// The channel-proof GET_FEATURE answer both command-driven identities (Deck + Triton) serve:
@@ -1020,14 +1057,14 @@ fn on_get_feature(request: &Request) -> NTSTATUS {
         let is_proof = triton_proof_requested(&last[..len]);
         let mut reply = if is_proof {
             proof_reply()
-        } else if let Some(recorded) = triton_recorded_reply(&last[..len]) {
+        } else if let Some(recorded) = recorded_reply(&last[..len]) {
             recorded
         } else {
             // The query dance (0x83 attributes / 0xAE string / 0xF2 firmware) + echo fallback —
             // and feature report 2 rides the SAME machine (mirror semantics, no special table).
             pf_driver_proto::triton::feature_reply(
                 &last[..len],
-                &triton_serial(),
+                &mirror_serial(DEVTYPE_TRITON),
                 pf_driver_proto::triton::unit_id(pad_index()),
             )
         };
@@ -1054,6 +1091,9 @@ fn on_get_feature(request: &Request) -> NTSTATUS {
     }
     if device_type() == 3 {
         return request.copy_to_output(&deck_feature_reply());
+    }
+    if device_type() == DEVTYPE_STEAMCONTROLLER {
+        return request.copy_to_output(&sc_feature_answer());
     }
     let (bytes, _) = match request.input_bytes(1) {
         Ok(v) => v,
@@ -1120,7 +1160,7 @@ fn on_get_string(request: &Request) -> NTSTATUS {
     let s: String = match string_id {
         // DualShock 4 v2 (09CC) reports the SIE name too; "Sony Computer" was the v1 (05C4).
         0 | 0x000e => match devtype {
-            3 | 7 => "Valve Software".into(),
+            3 | 7 | DEVTYPE_STEAMCONTROLLER => "Valve Software".into(),
             4..=6 => "Microsoft".into(),
             8 | DEVTYPE_JOYCON_LEFT | DEVTYPE_JOYCON_RIGHT => "Nintendo Co., Ltd.".into(),
             DEVTYPE_8BITDO_ULTIMATE2..=DEVTYPE_8BITDO_PRO3 => "8BitDo".into(),
@@ -1130,7 +1170,9 @@ fn on_get_string(request: &Request) -> NTSTATUS {
         // Per-pad serials: SDL reads this via HidD_GetSerialNumberString and Steam dedups pads
         // by it. The PS serials end in the pairing MAC's low octet (`on_get_feature`); the Deck
         // and Triton serials match their 0xAE answers. Steam reads both.
-        2 | 0x0010 if devtype == pf_driver_proto::gamepad::DEVTYPE_TRITON => triton_serial(),
+        2 | 0x0010 if matches!(devtype, DEVTYPE_TRITON | DEVTYPE_STEAMCONTROLLER) => {
+            mirror_serial(devtype)
+        }
         2 | 0x0010 => pad_serial(devtype, pad_index()),
         _ => match devtype {
             1 => "Wireless Controller".into(),
@@ -1153,6 +1195,7 @@ fn on_get_string(request: &Request) -> NTSTATUS {
             DEVTYPE_8BITDO_PRO2 => "8BitDo Pro 2".into(),
             DEVTYPE_8BITDO_PRO3 => "8BitDo Pro 3".into(),
             DEVTYPE_HORIPAD_STEAM => hori::NAME.into(),
+            DEVTYPE_STEAMCONTROLLER => "Wired Controller".into(),
             _ => "DualSense Wireless Controller".into(),
         },
     };

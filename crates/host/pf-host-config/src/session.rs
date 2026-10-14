@@ -1,8 +1,9 @@
 //! The live graphical session as the host last detected it.
 //!
-//! pf-vdisplay's `apply_session_env` stores it; the Wayland backends and every desktop-facing
-//! child read `WAYLAND_DISPLAY` from here, never from the process environment. The other three
-//! session variables are still written to the environment.
+//! pf-vdisplay's `apply_session_env` stores it. The host reads the four session variables from
+//! here and hands them to each desktop-facing child through [`export_to`]; it never writes them
+//! into its own environment. Until the first [`set`], each reader falls back to the environment
+//! this process started with.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -65,9 +66,11 @@ fn carry(mut env: SessionEnv, live: bool, last: Option<String>) -> SessionEnv {
 }
 
 fn inherited() -> Option<String> {
-    std::env::var("WAYLAND_DISPLAY")
-        .ok()
-        .filter(|s| !s.is_empty())
+    inherited_var("WAYLAND_DISPLAY")
+}
+
+fn inherited_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
 /// `WAYLAND_DISPLAY` as the host sees it: the stored session's, or the one this process
@@ -77,6 +80,43 @@ pub fn wayland_display() -> Option<String> {
         Some(env) => env.wayland_display.clone(),
         None => inherited(),
     }
+}
+
+/// `XDG_RUNTIME_DIR` as the host sees it, on the same terms as [`wayland_display`].
+pub fn runtime_dir() -> Option<String> {
+    match get() {
+        Some(env) => Some(env.xdg_runtime_dir.clone()).filter(|d| !d.is_empty()),
+        None => inherited_var("XDG_RUNTIME_DIR"),
+    }
+}
+
+/// The session bus address, on the same terms. `None`: the caller lets zbus pick its default.
+pub fn dbus_address() -> Option<String> {
+    match get() {
+        Some(env) => Some(env.dbus_session_bus_address.clone()).filter(|a| !a.is_empty()),
+        None => inherited_var("DBUS_SESSION_BUS_ADDRESS"),
+    }
+}
+
+/// `XDG_CURRENT_DESKTOP`, on the same terms. A stored session that is not live names none, so
+/// a stale desktop name cannot route into a dead session.
+pub fn current_desktop() -> Option<String> {
+    match get() {
+        Some(env) => env.xdg_current_desktop.clone(),
+        None => inherited_var("XDG_CURRENT_DESKTOP"),
+    }
+}
+
+/// The stored session's PipeWire socket, for libpipewire's `remote.name`. `None` while nothing
+/// is stored, or when the operator points `PIPEWIRE_REMOTE` / `PIPEWIRE_RUNTIME_DIR` elsewhere:
+/// libpipewire then resolves the socket from the environment.
+pub fn pipewire_remote() -> Option<String> {
+    if inherited_var("PIPEWIRE_REMOTE").is_some() || inherited_var("PIPEWIRE_RUNTIME_DIR").is_some()
+    {
+        return None;
+    }
+    let env = get()?;
+    (!env.xdg_runtime_dir.is_empty()).then(|| format!("{}/pipewire-0", env.xdg_runtime_dir))
 }
 
 /// The live compositor's socket, connected. `None` while nothing is stored: the caller then
@@ -90,14 +130,37 @@ pub fn wayland_stream() -> Option<std::io::Result<std::os::unix::net::UnixStream
     })
 }
 
-/// Hand `cmd` the stored session's `WAYLAND_DISPLAY`, set or unset. A child inherits the other
-/// session variables from the process environment.
+/// Hand `cmd` the stored session: `WAYLAND_DISPLAY` and `XDG_CURRENT_DESKTOP` set or unset,
+/// `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` set. A variable `cmd` already sets or
+/// removes stays as its caller decided, so a spawn helper may call this for every child.
+/// Nothing stored: the child inherits the process environment, which is then the same thing.
 pub fn export_to(cmd: &mut std::process::Command) -> &mut std::process::Command {
-    if let Some(env) = get() {
-        match &env.wayland_display {
-            Some(name) => cmd.env("WAYLAND_DISPLAY", name),
-            None => cmd.env_remove("WAYLAND_DISPLAY"),
-        };
+    let Some(env) = get() else {
+        return cmd;
+    };
+    let decided: Vec<std::ffi::OsString> = cmd.get_envs().map(|(k, _)| k.to_owned()).collect();
+    let vars = [
+        ("WAYLAND_DISPLAY", env.wayland_display.as_deref()),
+        ("XDG_CURRENT_DESKTOP", env.xdg_current_desktop.as_deref()),
+        ("XDG_RUNTIME_DIR", Some(env.xdg_runtime_dir.as_str())),
+        (
+            "DBUS_SESSION_BUS_ADDRESS",
+            Some(env.dbus_session_bus_address.as_str()),
+        ),
+    ];
+    for (name, value) in vars {
+        if decided.iter().any(|k| k == name) {
+            continue;
+        }
+        match value {
+            Some("") => {}
+            Some(value) => {
+                cmd.env(name, value);
+            }
+            None => {
+                cmd.env_remove(name);
+            }
+        }
     }
     cmd
 }

@@ -85,6 +85,19 @@ impl PadState for crate::steam_proto::SteamState {
     }
 }
 
+/// A mirrored report carries its own motion; only the typed plane's is watched.
+impl PadState for crate::steam_proto::ScState {
+    fn neutral() -> Self {
+        Self::neutral()
+    }
+    fn neutralize_gyro(&mut self) -> bool {
+        self.typed.neutralize_gyro()
+    }
+    fn clear_rich(&mut self) {
+        Self::clear_rich(self)
+    }
+}
+
 impl PadState for crate::switch_proto::SwitchState {
     fn neutral() -> Self {
         Self::neutral()

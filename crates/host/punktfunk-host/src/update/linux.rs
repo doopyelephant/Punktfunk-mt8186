@@ -173,14 +173,16 @@ pub(super) fn run_apply_steamos(
 
     const UNIT: &str = "pf-source-update";
     // `--collect` reaps the transient unit even on failure, so a retry can reuse the name.
-    let launched = Command::new("systemd-run")
-        .args(["--user", "--collect", "--unit", UNIT, "bash", "-c"])
-        .arg(format!(
-            "exec >> '{}' 2>&1; exec bash '{}' --pull",
-            log.display(),
-            script.display()
-        ))
-        .status();
+    let launched = pf_host_config::session::export_to(
+        Command::new("systemd-run")
+            .args(["--user", "--collect", "--unit", UNIT, "bash", "-c"])
+            .arg(format!(
+                "exec >> '{}' 2>&1; exec bash '{}' --pull",
+                log.display(),
+                script.display()
+            )),
+    )
+    .status();
     match launched {
         Ok(s) if s.success() => {}
         Ok(s) => {
@@ -198,9 +200,11 @@ pub(super) fn run_apply_steamos(
     let deadline = Instant::now() + Duration::from_secs(90 * 60);
     loop {
         std::thread::sleep(Duration::from_secs(5));
-        let state = capture(Command::new("systemctl").args(["--user", "is-active", UNIT]))
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "failed".into());
+        let state = capture(pf_host_config::session::export_to(
+            Command::new("systemctl").args(["--user", "is-active", UNIT]),
+        ))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "failed".into());
         match state.as_str() {
             "active" | "activating" | "deactivating" | "reloading" => {
                 if Instant::now() > deadline {
@@ -377,19 +381,14 @@ pub(super) fn run_apply(
     stage("restarting");
     // Web console and plugin runner first (own units), then us. `--no-block`: this process is
     // the one restarting. `try-restart` leaves an opted-out runner off.
-    let _ = Command::new("systemctl")
-        .args(["--user", "--no-block", "restart", "punktfunk-web.service"])
-        .status();
-    let _ = Command::new("systemctl")
-        .args([
-            "--user",
-            "--no-block",
-            "try-restart",
-            "punktfunk-scripting.service",
-        ])
-        .status();
-    let _ = Command::new("systemctl")
-        .args(["--user", "--no-block", "restart", "punktfunk-host.service"])
-        .status();
+    for args in [
+        ["restart", "punktfunk-web.service"],
+        ["try-restart", "punktfunk-scripting.service"],
+        ["restart", "punktfunk-host.service"],
+    ] {
+        let mut systemctl = Command::new("systemctl");
+        systemctl.args(["--user", "--no-block"]).args(args);
+        let _ = pf_host_config::session::export_to(&mut systemctl).status();
+    }
     Ok(())
 }
