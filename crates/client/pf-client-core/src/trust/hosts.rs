@@ -853,6 +853,25 @@ pub fn persist_host(
     })
 }
 
+/// A host a pairing ceremony verified, and the store's answer to saving it.
+pub struct Paired {
+    /// The certificate fingerprint the ceremony verified.
+    pub fp: [u8; 32],
+    /// [`fp`](Self::fp) as lowercase hex, the form the store and the shells key on.
+    pub fp_hex: String,
+    /// `Err` when the ceremony held and the write did not. The pairing stands; a shell says
+    /// "Paired, but couldn't save" and does not retry the ceremony.
+    pub saved: Result<()>,
+}
+
+/// The save every pairing ceremony ends in: the host `fp` names, trusted and `paired`, by
+/// [`persist_host`]. `mac` is as there.
+pub fn save_paired(name: &str, addr: &str, port: u16, fp: [u8; 32], mac: &[String]) -> Paired {
+    let fp_hex = punktfunk_core::fp::hex(&fp);
+    let saved = persist_host(name, addr, port, &fp_hex, true, mac);
+    Paired { fp, fp_hex, saved }
+}
+
 /// [`KnownHosts::add`] under the store's lock, saved unless it refuses the edit.
 pub fn add_host(edit: &HostEdit) -> Result<()> {
     let mut added = Ok(AddOutcome::Unchanged);

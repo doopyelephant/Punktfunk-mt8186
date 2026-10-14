@@ -1,12 +1,11 @@
-//! `orchestrate::unpair_host` against a scratch config dir. The config and cache dirs come
-//! from the environment, so the test runs this binary again as a child with them pointed at
-//! the scratch dir, and the child runs the body. This process's environment is never written.
+//! `orchestrate::unpair_host` against a scratch config dir (see `common`).
 #![cfg(any(target_os = "linux", windows))]
+
+mod common;
 
 use pf_client_core::orchestrate;
 use pf_client_core::trust::{KnownHosts, Settings};
 use std::path::Path;
-use std::process::Command;
 
 /// Set on the child only: the scratch dir its body works in.
 const CHILD_HOME: &str = "PF_UNPAIR_TEST_HOME";
@@ -15,33 +14,11 @@ const CHILD_HOME: &str = "PF_UNPAIR_TEST_HOME";
 /// default pointing at the record. Every shell unpairs through this one function.
 #[test]
 fn unpairing_keeps_the_record_and_clears_what_its_pin_keyed() {
-    if let Some(home) = std::env::var_os(CHILD_HOME) {
-        return unpair_in(Path::new(&home));
-    }
-    let home = std::env::temp_dir().join(format!("pf-core-unpair-{}", std::process::id()));
-    std::fs::create_dir_all(&home).expect("scratch dir");
-    let child = Command::new(std::env::current_exe().expect("this test binary"))
-        .args([
-            "--exact",
-            "unpairing_keeps_the_record_and_clears_what_its_pin_keyed",
-            "--nocapture",
-        ])
-        .env(CHILD_HOME, &home)
-        .env("PUNKTFUNK_CONFIG_DIR", home.join("config"))
-        .env("XDG_CACHE_HOME", &home)
-        .env("LOCALAPPDATA", &home)
-        .output()
-        .expect("run the child");
-    // The body's last act. A filter that matched no test would exit 0 without it.
-    let ran = home.join("ran").exists();
-    std::fs::remove_dir_all(&home).ok();
-    assert!(
-        child.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&child.stdout),
-        String::from_utf8_lossy(&child.stderr)
+    common::in_scratch_home(
+        "unpairing_keeps_the_record_and_clears_what_its_pin_keyed",
+        CHILD_HOME,
+        unpair_in,
     );
-    assert!(ran, "the child ran no test");
 }
 
 /// The body, run in the child: `home` holds the config dir and the cache its environment names.
@@ -97,6 +74,4 @@ fn unpair_in(home: &Path) {
         std::fs::read(store.join("client-known-hosts.json")).expect("the store"),
         before
     );
-
-    std::fs::write(home.join("ran"), b"").expect("mark the run");
 }

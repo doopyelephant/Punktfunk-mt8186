@@ -219,20 +219,13 @@ mod session_main {
                 return exit::CONNECT_FAILED;
             }
         };
-        match trust::pair_with_host(&addr, port, &identity, pin, &name) {
-            Ok(fp) => {
-                let fp_hex = trust::hex(&fp);
-                if let Err(e) = trust::persist_host(
-                    &arg_value("--host-label").unwrap_or_else(|| addr.clone()),
-                    &addr,
-                    port,
-                    &fp_hex,
-                    true,
-                    &[],
-                ) {
+        let label = arg_value("--host-label").unwrap_or_else(|| addr.clone());
+        match trust::pair_and_save(&addr, port, &identity, pin, &name, &label, &[]) {
+            Ok(paired) => {
+                if let Err(e) = paired.saved {
                     eprintln!("couldn't save the host: {e:#}");
                 }
-                println!("paired {addr}:{port} fp={fp_hex}");
+                println!("paired {addr}:{port} fp={}", paired.fp_hex);
                 0
             }
             Err(e) => {

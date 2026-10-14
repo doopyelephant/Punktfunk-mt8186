@@ -1035,12 +1035,12 @@ impl ServiceState {
                             .find(|(f, _)| *f == fp_hex)
                             .or_else(|| named.iter().find(|(f, _)| f.is_empty()))
                             .map_or_else(|| addr.clone(), |(_, n)| n.clone());
-                        let saved = trust::persist_host(&name, &addr, port, &fp_hex, true, &[]);
+                        let paired = trust::save_paired(&name, &addr, port, fp, &[]);
                         if !current() {
                             return;
                         }
-                        match saved {
-                            Ok(()) => say(PairPhase::Paired { key: fp_hex }),
+                        match paired.saved {
+                            Ok(()) => say(PairPhase::Paired { key: paired.fp_hex }),
                             // Not "Paired": the pin is gone by the next launch.
                             Err(e) => say(PairPhase::Failed(format!(
                                 "Paired, but couldn't save — {e:#}"

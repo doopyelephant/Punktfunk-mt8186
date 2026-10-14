@@ -459,24 +459,23 @@ pub(crate) fn request_access(props: &Svc, target: &Target) {
                 return;
             }
         };
-        let saved = trust::persist_host(
+        let paired = trust::save_paired(
             &target.host.name,
             &target.host.addr,
             target.host.port,
-            &trust::hex(&fp),
-            true,
+            fp,
             &target.host.mac,
         );
         // Only a link's request streams; `connect` clears the status line, so a save error
         // goes after it.
         if target.from_link {
             connect(&ctx, &target, Some(fp), &ss, &st);
-            if let Err(e) = saved {
+            if let Err(e) = paired.saved {
                 st.call(format!("Paired, but couldn't save — {e:#}"));
             }
             return;
         }
-        st.call(match saved {
+        st.call(match paired.saved {
             Ok(()) => format!("Paired with {}", target.host.name),
             Err(e) => format!("Paired, but couldn't save — {e:#}"),
         });
