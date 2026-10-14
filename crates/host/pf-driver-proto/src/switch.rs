@@ -43,7 +43,7 @@ pub const BAT_CON_FULL_WIRED: u8 = 0x91;
 pub const VIBRATOR_READY: u8 = 0x70;
 
 /// Two 12-bit values in `hid_field_extract` little-endian bitfield order.
-pub fn pack12(a: u16, b: u16) -> [u8; 3] {
+pub const fn pack12(a: u16, b: u16) -> [u8; 3] {
     [
         (a & 0xFF) as u8,
         ((a >> 8) & 0x0F) as u8 | ((b & 0x0F) << 4) as u8,
@@ -54,7 +54,7 @@ pub fn pack12(a: u16, b: u16) -> [u8; 3] {
 /// Input report `0x30`: the 13-byte header (timer, battery, 24 button bits, packed
 /// `[lx, ly, rx, ry]`, vibrator), then three IMU frames of accel and gyro repeating one
 /// sample, i16 LE.
-pub fn state_report(
+pub const fn state_report(
     timer: u8,
     buttons: u32,
     sticks: [u16; 4],
@@ -65,21 +65,38 @@ pub fn state_report(
     r[0] = 0x30;
     r[1] = timer;
     r[2] = BAT_CON_FULL_WIRED;
-    r[3..6].copy_from_slice(&buttons.to_le_bytes()[..3]);
-    r[6..9].copy_from_slice(&pack12(sticks[0], sticks[1]));
-    r[9..12].copy_from_slice(&pack12(sticks[2], sticks[3]));
+    let held = buttons.to_le_bytes();
+    let (left, right) = (pack12(sticks[0], sticks[1]), pack12(sticks[2], sticks[3]));
+    let mut i = 0;
+    while i < 3 {
+        r[3 + i] = held[i];
+        r[6 + i] = left[i];
+        r[9 + i] = right[i];
+        i += 1;
+    }
     r[12] = VIBRATOR_READY;
-    for frame in r[13..49].chunks_exact_mut(12) {
-        for (i, v) in accel.iter().chain(gyro.iter()).enumerate() {
-            frame[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+    let mut at = 13;
+    while at < 49 {
+        let mut axis = 0;
+        while axis < 6 {
+            let v = if axis < 3 {
+                accel[axis]
+            } else {
+                gyro[axis - 3]
+            }
+            .to_le_bytes();
+            r[at + axis * 2] = v[0];
+            r[at + axis * 2 + 1] = v[1];
+            axis += 1;
         }
+        at += 12;
     }
     r
 }
 
 /// At rest: sticks centred, nothing held, 1 g on +Z. Zero accel reads as free fall. A right
 /// Joy-Con's IMU is mounted turned over, so its gravity reads on −Z.
-pub fn neutral_report(device_type: u8) -> [u8; REPORT_LEN] {
+pub const fn neutral_report(device_type: u8) -> [u8; REPORT_LEN] {
     let z = match device_type {
         crate::gamepad::DEVTYPE_JOYCON_RIGHT => -4096,
         _ => 4096,

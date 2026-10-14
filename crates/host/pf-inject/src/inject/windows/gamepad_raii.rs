@@ -16,248 +16,47 @@
 use super::channel_proof;
 pub(super) use super::channel_proof::ProofTransport;
 use crate::pad_shm_ring::SectionView;
-use crate::pad_slots::PadCreateFault;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use pf_driver_proto::gamepad::{PadBootstrap, BOOT_MAGIC, GAMEPAD_PROTO_VERSION};
-use pf_paths_win::SecurityAttributes;
-use std::ffi::c_void;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use pf_driver_proto::pad_delivery::{
+    Action, Delivery, Observation, Phase, PidAnswer, MAX_DELIVERY_ATTEMPTS,
+};
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::sync::atomic::{fence, AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use windows::core::{w, GUID, HRESULT, HSTRING, PCWSTR};
-use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Get_DevNode_PropertyW, CM_Get_DevNode_Status, CM_Locate_DevNodeW, CM_DEVNODE_STATUS_FLAGS,
-    CM_LOCATE_DEVNODE_NORMAL, CM_PROB, CR_SUCCESS, DN_DRIVER_LOADED, DN_HAS_PROBLEM, DN_STARTED,
-};
-use windows::Win32::Devices::Enumeration::Pnp::{
-    SwDeviceClose, SwDeviceCreate, HSWDEVICE, SW_DEVICE_CREATE_INFO,
-};
-use windows::Win32::Devices::Properties::{
-    DEVPKEY_Device_HardwareIds, DEVPKEY_Device_SessionId, DEVPROPCOMPKEY, DEVPROPERTY, DEVPROPTYPE,
-    DEVPROP_STORE_SYSTEM, DEVPROP_TYPE_BINARY, DEVPROP_TYPE_STRING_LIST, DEVPROP_TYPE_UINT32,
-};
+use windows::core::HSTRING;
 use windows::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, SetLastError, DEVPROPKEY, DUPLICATE_HANDLE_OPTIONS,
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, E_FAIL, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WIN32_ERROR,
+    DuplicateHandle, DUPLICATE_HANDLE_OPTIONS, HANDLE, WAIT_OBJECT_0,
 };
-use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, OpenFileMappingW, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
-    FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
-};
-use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, SetEvent, WaitForSingleObject,
-};
+use windows::Win32::System::Threading::{GetCurrentProcess, WaitForSingleObject};
+
+#[path = "pad_section.rs"]
+mod section;
+pub(crate) use section::{named_section_exists, Shm};
+#[path = "pad_swdevice.rs"]
+mod swdevice;
+pub use swdevice::set_pad_session;
+pub(super) use swdevice::{create_swdevice, verify_fence, FenceAt, SwDevice, SwDeviceProfile};
+#[path = "pad_attach.rs"]
+mod attach;
+#[path = "pad_driver_store.rs"]
+mod driver_store;
+pub(super) use attach::DriverAttach;
 
 /// `SECTION_MAP_READ | SECTION_MAP_WRITE` — what the pad driver maps. Granted in
 /// [`PadChannel::deliver_to`] instead of `DUPLICATE_SAME_ACCESS`, so the remote handle
 /// cannot take ownership, change security, or delete the section.
 const SECTION_MAP_RW: u32 = 0x0004 | 0x0002;
 
-/// Pagefile-backed section plus its mapped RW view. Drop unmaps the view, then the
-/// [`OwnedHandle`] closes the section. Unnamed = sealed DATA; named = bootstrap mailbox.
-pub(super) struct Shm {
-    /// Duplication source for the sealed channel.
-    handle: OwnedHandle,
-    view: MEMORY_MAPPED_VIEW_ADDRESS,
-    /// Bytes mapped at `view`.
-    len: usize,
-}
-
-impl Shm {
-    /// Unnamed `size`-byte section, mapped RW — the sealed DATA section.
-    /// SDDL `D:P(A;;GA;;;SY)`: no name to open or squat; the driver gets a duplicated handle
-    /// that carries this process's access without re-checking the DACL (`design/idd-push-security.md`).
-    pub(super) fn create_unnamed(size: usize) -> Result<Shm> {
-        let sa = SecurityAttributes::new("D:P(A;;GA;;;SY)")?;
-        // Unnamed: nothing to collide with, so the flag is always false.
-        Self::create_inner(&sa, PCWSTR::null(), size)
-            .map(|(shm, _)| shm)
-            .context("create unnamed gamepad DATA section")
-    }
-
-    /// Named `size`-byte section, mapped RW — the bootstrap mailbox.
-    /// SDDL `D:P(A;;GA;;;SY)(A;;GA;;;LS)`: SYSTEM plus LocalService (WUDFHost opens by name).
-    ///
-    /// `Global\` names are creatable by any `SeCreateGlobalPrivilege` holder. If the name
-    /// already exists, `CreateFileMappingW` silently opens it (`ERROR_ALREADY_EXISTS`);
-    /// close and retry, then fail rather than handshake through a foreign mailbox.
-    /// A DACL we cannot open never reaches that branch: it is `ERROR_ACCESS_DENIED`,
-    /// which [`classify_named_create_failure`] splits from "cannot create Global\\".
-    pub(super) fn create_named(name: &HSTRING, size: usize) -> Result<Shm> {
-        // One descriptor for the squat-retry loop. `D:P` strips inherited ACEs so only
-        // SYSTEM + LocalService are granted.
-        let sa = SecurityAttributes::new("D:P(A;;GA;;;SY)(A;;GA;;;LS)")?;
-        for attempt in 0..5 {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            // SAFETY: clearing the thread error slot so ERROR_ALREADY_EXISTS below is unambiguous.
-            unsafe { SetLastError(WIN32_ERROR(0)) };
-            let (shm, existed) = match Self::create_inner(&sa, PCWSTR(name.as_ptr()), size) {
-                Ok(pair) => pair,
-                Err(e) => return Err(classify_named_create_failure(name, e)),
-            };
-            // The verdict comes from the create itself, not from a re-read of the error slot
-            // after the mapping call — and a section we merely opened was not zeroed.
-            if !existed {
-                return Ok(shm);
-            }
-            // `shm` drops here → unmap + close our handle to the foreign object, then retry.
-        }
-        Err(anyhow!(
-            "bootstrap mailbox {name} already exists and stayed alive across retries — another \
-             punktfunk-host instance is serving this pad index, or a local service is squatting the \
-             name (gamepad DoS attempt?)"
-        )
-        .context(PadCreateFault::IndexOwnedElsewhere))
-    }
-
-    /// `true` in the tuple means `CreateFileMappingW` OPENED an existing section rather than
-    /// creating one — the caller decides what to do about it. Read here, immediately after the
-    /// create, because the mapping call below can clobber the thread error slot.
-    fn create_inner(sa: &SecurityAttributes, name: PCWSTR, size: usize) -> Result<(Shm, bool)> {
-        // SAFETY: an anonymous (pagefile-backed) section of `size` bytes with the caller's SDDL; the
-        // descriptor behind `sa` outlives this call, and the section copies it.
-        let map = unsafe {
-            CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                Some(sa.as_ptr()),
-                PAGE_READWRITE,
-                0,
-                size as u32,
-                name,
-            )?
-        };
-        // SAFETY: read before anything else can touch the thread error slot.
-        let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
-        // SAFETY: `map` is a fresh section handle we own; take ownership immediately so the early
-        // return (and drop) closes it. `map` is `Copy`; `from_raw_handle` only copies the pointer.
-        let handle = unsafe { OwnedHandle::from_raw_handle(map.0) };
-        // SAFETY: `map` is a valid section handle; map the whole thing read/write.
-        let view = unsafe { MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, size) };
-        if view.Value.is_null() {
-            // `handle` drops here → closes the section. No view to unmap.
-            return Err(anyhow!("MapViewOfFile failed"));
-        }
-        if !existed {
-            // Only ours. Windows zero-fills a new pagefile-backed section, so this is belt —
-            // but running it on a section we merely OPENED would wipe a live mailbox that
-            // belongs to another host instance, which the caller is about to back away from.
-            // SAFETY: `view` points at `size` writable bytes (just mapped).
-            unsafe { core::ptr::write_bytes(view.Value as *mut u8, 0, size) };
-        }
-        Ok((
-            Shm {
-                handle,
-                view,
-                len: size,
-            },
-            existed,
-        ))
-    }
-
-    /// The mapping, stable for this `Shm`'s lifetime (`MapViewOfFile` pins the address).
-    pub(super) fn view(&self) -> SectionView<'_> {
-        // SAFETY: `MapViewOfFile` mapped `len` RW bytes at `view`, page-aligned; `Drop` unmaps
-        // them only after this borrow ends. The shared bytes are only reached through the view.
-        unsafe { SectionView::from_raw(self.view.Value.cast(), self.len) }
-    }
-
-    fn raw_handle(&self) -> HANDLE {
-        HANDLE(self.handle.as_raw_handle())
-    }
-}
-
-impl Drop for Shm {
-    fn drop(&mut self) {
-        // SAFETY: `view` came from `MapViewOfFile`; unmap it BEFORE the `handle` field closes the
-        // section (struct fields drop only after this `Drop::drop` returns).
-        unsafe {
-            let _ = UnmapViewOfFile(self.view);
-        }
-    }
-}
-
-/// Split `CreateFileMappingW`'s `ERROR_ACCESS_DENIED` into two causes:
-///
-/// * Name taken, DACL excludes us — creating over an existing name is an open.
-///   Mailbox SDDL is SYSTEM + LocalService, so a LocalSystem host vs an elevated
-///   Administrator console is this case, not `ERROR_ALREADY_EXISTS`.
-/// * Name free, we cannot create `Global\` — needs `SeCreateGlobalPrivilege`.
-///
-/// `OpenFileMappingW` looks up before the access check: missing → `ERROR_FILE_NOT_FOUND`,
-/// present-but-denied → `ERROR_ACCESS_DENIED`. The taken case carries
-/// [`PadCreateFault`] so the pad manager does not tell the operator to reinstall.
-fn classify_named_create_failure(name: &HSTRING, e: anyhow::Error) -> anyhow::Error {
-    let denied = e
-        .downcast_ref::<windows::core::Error>()
-        .is_some_and(|w| w.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
-    if !denied {
-        return e.context(format!("create gamepad bootstrap mailbox {name}"));
-    }
-    if named_section_exists(name) {
-        return e
-            .context(PadCreateFault::IndexOwnedElsewhere)
-            .context(format!(
-            "bootstrap mailbox {name} exists and belongs to a process this one may not open — a \
-             live session's pad, held by the LocalSystem host service (its mailboxes grant SYSTEM \
-             + LocalService only, so an Administrator console sees ACCESS_DENIED, not \
-             ALREADY_EXISTS). Nothing is wrong with the drivers"
-        ));
-    }
-    e.context(format!(
-        "create gamepad bootstrap mailbox {name}: access denied although the name is FREE — this \
-         process may not create Global\\ objects at all (that needs SeCreateGlobalPrivilege, which \
-         SYSTEM and services hold and a user token does not)"
-    ))
-}
-
-/// Whether a section with this name exists as seen from this process.
-/// `true` also when the object is present but closed to us (ACCESS_DENIED on open): a
-/// LocalSystem host's mailbox is closed to an Administrator console.
-/// Picks a pad slot or an error text, never trust — a squatter can make this say either.
-pub(crate) fn named_section_exists(name: &HSTRING) -> bool {
-    // SAFETY: `name` is a live NUL-terminated UTF-16 string for the duration of the call. Ask for
-    // the least access there is (`FILE_MAP_READ`): the handle is closed immediately and never
-    // mapped — we want the lookup's verdict, not the object.
-    let opened = unsafe { OpenFileMappingW(FILE_MAP_READ.0, false, PCWSTR(name.as_ptr())) };
-    match opened {
-        Ok(h) => {
-            // SAFETY: `h` is the handle just opened here and referenced nowhere else.
-            unsafe {
-                let _ = CloseHandle(h);
-            }
-            true
-        }
-        // ERROR_FILE_NOT_FOUND (and anything else) reads as absent; ACCESS_DENIED is presence.
-        Err(e) => e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0),
-    }
-}
-
 /// Host-wide [`PadBootstrap::handle_seq`]. Never 0, so two pads on the same index
 /// cannot hand a persistent driver the same seq twice. Starts at 1.
 static BOOT_SEQ: AtomicU32 = AtomicU32::new(1);
-
-/// Cap on FAILED deliveries per pad. Each attempt duplicates a handle into a WUDFHost;
-/// a flapping mailbox pid must not mint unbounded remote handles. Successes stand
-/// until the target exits ([`PadChannel::delivered`]).
-const MAX_DELIVERY_ATTEMPTS: u32 = 16;
-
-/// How often an unattached pad may ask the devnode for a channel proof.
-/// The pump ticks every few milliseconds; a proof query is a device open + I/O.
-/// 250 ms is past a healthy driver's attach (tens of ms) and idle once delivered.
-const PROOF_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Opt-in fallback when there is no `SwDeviceCreate` instance id (`devgen`/`devcon`).
 /// Trusts the mailbox `driver_pid` — the path [`PadChannel::pump`] otherwise refuses.
 /// Per-boot, logged loudly. Normal pads and the resident mouse never need it.
 pub(super) const TRUST_MAILBOX_ENV: &str = "PUNKTFUNK_PAD_CHANNEL_TRUST_MAILBOX";
-
-/// Unanswered proof queries before one operator-facing warn.
-/// At [`PROOF_PROBE_INTERVAL`] this is ~5 s — past attach and the eager window.
-const PROOF_FAILURES_BEFORE_WARN: u32 = 20;
 
 /// Mailbox names this process created and still holds. [`crate::pad_pool`] skips an index
 /// only when another process serves it; our own pad inside its unplug grace is not that.
@@ -272,9 +71,9 @@ pub(crate) fn created_here(name: &str) -> bool {
     created_names().iter().any(|n| n == name)
 }
 
-/// One pad's sealed host↔driver channel: unnamed DATA, named mailbox, and the
-/// [`Self::pump`] state machine. Drop closes the mailbox; a persistent driver
-/// treats the vanished name as "host gone".
+/// One pad's sealed host↔driver channel: unnamed DATA, named mailbox, and the OS side of its
+/// [`Delivery`]. Drop closes the mailbox; a persistent driver treats the vanished name as
+/// "host gone".
 pub(super) struct PadChannel {
     data: Shm,
     boot: Shm,
@@ -284,24 +83,16 @@ pub(super) struct PadChannel {
     devnode: Option<(String, ProofTransport)>,
     /// Must match the proof so a mis-resolved interface cannot cross-wire two pads.
     pad_index: u32,
-    last_probe: Option<Instant>,
-    /// Last pid delivered or rejected — never retry the same value within a probe interval
-    /// (hot-loop trap). A failed delivery clears it so the next probe tries again.
-    last_seen_pid: u32,
-    attempts: u32,
-    /// WUDFHost that holds the DATA handle. `Some` ⇒ no other process is served while it lives.
-    delivered: Option<Delivered>,
-    warned_proto: bool,
-    warned_cap: bool,
-    warned_takeover: bool,
-    warned_unproven: bool,
-    proof_failures: u32,
+    delivery: Delivery,
+    /// The WUDFHost holding the DATA handle: `Some` exactly while `delivery` is delivered.
+    target: Option<Delivered>,
+    /// Zero of the clock [`Observation::Tick`] carries.
+    born: Instant,
 }
 
 /// Completed delivery, pinned by a live process handle — never by pid.
 /// A recycled pid cannot read as "the process we served has exited".
 struct Delivered {
-    pid: u32,
     /// `SYNCHRONIZE`; signaled ⇔ exited. Same idiom as the frame channel's `driver_alive`.
     process: OwnedHandle,
 }
@@ -343,15 +134,9 @@ impl PadChannel {
             boot_name,
             devnode: None,
             pad_index: 0,
-            last_probe: None,
-            last_seen_pid: 0,
-            attempts: 0,
-            delivered: None,
-            warned_proto: false,
-            warned_cap: false,
-            warned_takeover: false,
-            warned_unproven: false,
-            proof_failures: 0,
+            delivery: Delivery::default(),
+            target: None,
+            born: Instant::now(),
         })
     }
 }
@@ -390,73 +175,128 @@ impl PadChannel {
         self.devnode = instance_id.map(|id| (id, transport));
     }
 
-    /// One tick of the delivery state machine (pad service pump, ≤4 ms). Idle cost is
-    /// an atomic load; once delivered, a 0 ms wait.
+    /// One tick of the delivery (pad service pump, ≤4 ms): tell [`Delivery::step`] what the
+    /// mailbox and the delivered process say, and carry out its answer. Idle cost is an atomic
+    /// load and a clock read; once delivered, a 0 ms wait.
     pub(super) fn pump(&mut self) {
-        // Driver writes its proto even when it refuses the handshake, so a mismatch is visible.
-        let drv_proto = self.boot_load(core::mem::offset_of!(PadBootstrap, driver_proto));
-        if drv_proto != 0 && drv_proto != GAMEPAD_PROTO_VERSION && !self.warned_proto {
-            self.warned_proto = true;
+        let proto = self.boot_load(core::mem::offset_of!(PadBootstrap, driver_proto));
+        if let Action::WarnProtoMismatch(driver_proto) =
+            self.delivery.step(Observation::DriverProto(proto))
+        {
             crate::note_pad_driver(crate::PadDriverVerdict::ProtocolMismatch {
-                driver_proto: drv_proto,
+                driver_proto,
                 host_proto: GAMEPAD_PROTO_VERSION,
             });
             tracing::warn!(
                 mailbox = %self.boot_name,
-                driver_proto = drv_proto,
+                driver_proto,
                 host_proto = GAMEPAD_PROTO_VERSION,
                 "gamepad driver/host protocol mismatch on the bootstrap mailbox — update the \
                  drivers: punktfunk-host.exe driver install --gamepad"
             );
         }
 
-        // A delivery stands until the target process dies. UMDF restarting a crashed host
-        // is the one legitimate re-attach, visible here as an exited handle.
-        if let Some(d) = self.delivered.as_ref() {
-            if !d.exited() {
-                return;
-            }
-            tracing::info!(
+        let exited = self.target.as_ref().is_some_and(Delivered::exited);
+        let now = self.born.elapsed();
+        match self.delivery.step(Observation::Tick { now, exited }) {
+            Action::WarnCapped => tracing::warn!(
                 mailbox = %self.boot_name,
-                exited_pid = d.pid,
-                "the WUDFHost this channel was delivered to has exited (driver crash / host \
-                 restart) — re-attaching to the restarted driver"
-            );
-            self.delivered = None;
-            self.attempts = 0; // a genuine restart earns a fresh budget
-            self.last_seen_pid = 0;
-            self.last_probe = None;
-        }
-        if self.attempts >= MAX_DELIVERY_ATTEMPTS {
-            if !self.warned_cap {
-                self.warned_cap = true;
-                tracing::warn!(
-                    mailbox = %self.boot_name,
-                    attempts = self.attempts,
-                    "gamepad channel delivery cap reached — no further handles will be duplicated"
-                );
+                attempts = MAX_DELIVERY_ATTEMPTS,
+                "gamepad channel delivery cap reached — no further handles will be duplicated"
+            ),
+            Action::Resolve { reattach } => {
+                if let Some(exited_pid) = reattach {
+                    tracing::info!(
+                        mailbox = %self.boot_name,
+                        exited_pid,
+                        "the WUDFHost this channel was delivered to has exited (driver crash / \
+                         host restart) — re-attaching to the restarted driver"
+                    );
+                    self.target = None;
+                }
+                self.resolve();
             }
-            return;
+            _ => {}
         }
-        if self
-            .last_probe
-            .is_some_and(|t| t.elapsed() < PROOF_PROBE_INTERVAL)
-        {
-            return;
-        }
-        self.last_probe = Some(Instant::now());
+    }
 
-        let Some(pid) = self.resolve_driver_pid() else {
-            return;
+    /// Ask who the driver is and act on the answer. The pid comes from the DEVNODE
+    /// ([`channel_proof`]), never from the mailbox: only the driver PnP-bound to the
+    /// `SwDeviceCreate`'d device can answer that I/O. The mailbox's `driver_pid` stands in only
+    /// on the `devgen` path, and only with [`TRUST_MAILBOX_ENV`] set: LocalService can write it.
+    fn resolve(&mut self) {
+        const NO_DEVNODE: &str = "this pad has no SwDeviceCreate devnode to ask";
+        let devnode = self.devnode.clone();
+        let mut proof_error = None;
+        let answer = match &devnode {
+            Some((instance_id, transport)) => {
+                match channel_proof::query(instance_id, *transport, self.pad_index) {
+                    Ok(pid) => PidAnswer::Proved(pid),
+                    Err(e) => {
+                        proof_error = Some(e);
+                        PidAnswer::NoProof
+                    }
+                }
+            }
+            None if std::env::var_os(TRUST_MAILBOX_ENV).is_none() => PidAnswer::Refused,
+            None => {
+                PidAnswer::Mailbox(self.boot_load(core::mem::offset_of!(PadBootstrap, driver_pid)))
+            }
         };
-        if pid == self.last_seen_pid {
-            return; // already tried this one and it failed — don't spin on it
+        match self.delivery.step(Observation::Pid(answer)) {
+            Action::Deliver { pid, unverified } => {
+                if unverified {
+                    tracing::warn!(
+                        mailbox = %self.boot_name,
+                        reason = NO_DEVNODE,
+                        "delivering this pad channel on the UNVERIFIED mailbox pid — a local \
+                         service that wins the startup race can redirect this pad's input section \
+                         (forged gamepad input + a read of pad state). Documented residual; the \
+                         virtual MOUSE and the XUSB pad are both proved."
+                    );
+                }
+                self.deliver(pid);
+            }
+            Action::NoProof { failures, warn } => {
+                let devnode = devnode.map(|(id, _)| id).unwrap_or_default();
+                let error = proof_error.map(|e| format!("{e:#}")).unwrap_or_default();
+                // Debug while the driver may still be starting; one warn once it is clearly not.
+                if warn {
+                    tracing::warn!(
+                        mailbox = %self.boot_name,
+                        devnode = %devnode,
+                        error = %error,
+                        "the pad's devnode has not answered a channel proof — the host will NOT \
+                         hand the DATA section to a pid it cannot verify, so this pad stays \
+                         unattached (an old driver? reinstall: punktfunk-host.exe driver install \
+                         --gamepad)"
+                    );
+                } else {
+                    tracing::debug!(
+                        mailbox = %self.boot_name,
+                        attempt = failures,
+                        error = %error,
+                        "no channel proof yet"
+                    );
+                }
+            }
+            Action::WarnRefused => tracing::warn!(
+                mailbox = %self.boot_name,
+                reason = NO_DEVNODE,
+                "no channel proof for this pad's driver — refusing the DATA section, since \
+                 any local service can write the mailbox pid. Set {TRUST_MAILBOX_ENV}=1 to \
+                 accept the old, unverified handshake on a driver bring-up box"
+            ),
+            _ => {}
         }
-        self.last_seen_pid = pid;
-        self.attempts += 1;
+    }
+
+    /// Hand the DATA section to `pid` and tell the delivery how it went.
+    fn deliver(&mut self, pid: u32) {
         match self.deliver_to(pid) {
             Ok((seq, process)) => {
-                self.delivered = Some(Delivered { pid, process });
+                self.target = Some(Delivered { process });
+                self.delivery.step(Observation::Delivered(pid));
                 tracing::info!(
                     mailbox = %self.boot_name,
                     wudf_pid = pid,
@@ -472,84 +312,9 @@ impl PadChannel {
                     error = %format!("{e:#}"),
                     "sealed gamepad channel delivery failed"
                 );
-                // `last_seen_pid` was stamped before the attempt, so leaving it set retires
-                // this pid for the pad's life and one transient failure strands the pad.
-                // Clearing it retries at the next probe; the attempt cap still bounds it.
-                self.last_seen_pid = 0;
+                self.delivery.step(Observation::DeliveryFailed);
             }
         }
-    }
-
-    /// Pid to receive this pad's DATA section — from the DEVNODE ([`channel_proof`]),
-    /// never from the mailbox. Only the driver PnP-bound to the `SwDeviceCreate`'d
-    /// device can answer that I/O. Evidence: `design/gamepad-channel-sealing.md`.
-    fn resolve_driver_pid(&mut self) -> Option<u32> {
-        let Some((instance_id, transport)) = self.devnode.clone() else {
-            return self.unproven_mailbox_pid("this pad has no SwDeviceCreate devnode to ask");
-        };
-        match channel_proof::query(&instance_id, transport, self.pad_index) {
-            Ok(pid) => {
-                self.proof_failures = 0;
-                Some(pid)
-            }
-            Err(e) => {
-                self.proof_failures += 1;
-                // Debug while the driver may still be starting; one warn once it is clearly not.
-                if self.proof_failures == PROOF_FAILURES_BEFORE_WARN {
-                    tracing::warn!(
-                        mailbox = %self.boot_name,
-                        devnode = %instance_id,
-                        error = %format!("{e:#}"),
-                        "the pad's devnode has not answered a channel proof — the host will NOT \
-                         hand the DATA section to a pid it cannot verify, so this pad stays \
-                         unattached (an old driver? reinstall: punktfunk-host.exe driver install \
-                         --gamepad)"
-                    );
-                } else {
-                    tracing::debug!(
-                        mailbox = %self.boot_name,
-                        attempt = self.proof_failures,
-                        error = %format!("{e:#}"),
-                        "no channel proof yet"
-                    );
-                }
-                None
-            }
-        }
-    }
-
-    /// Mailbox `driver_pid` for the `devgen` path that has no instance id to query.
-    /// Refused unless [`TRUST_MAILBOX_ENV`] is set: LocalService can write that field.
-    fn unproven_mailbox_pid(&mut self, why: &str) -> Option<u32> {
-        if std::env::var_os(TRUST_MAILBOX_ENV).is_none() {
-            if !self.warned_unproven {
-                self.warned_unproven = true;
-                tracing::warn!(
-                    mailbox = %self.boot_name,
-                    reason = why,
-                    "no channel proof for this pad's driver — refusing the DATA section, since \
-                     any local service can write the mailbox pid. Set {TRUST_MAILBOX_ENV}=1 to \
-                     accept the old, unverified handshake on a driver bring-up box"
-                );
-            }
-            return None;
-        }
-        let pid = self.boot_load(core::mem::offset_of!(PadBootstrap, driver_pid));
-        if pid == 0 {
-            return None;
-        }
-        if !self.warned_unproven {
-            self.warned_unproven = true;
-            tracing::warn!(
-                mailbox = %self.boot_name,
-                reason = why,
-                "delivering this pad channel on the UNVERIFIED mailbox pid — a local service that \
-                 wins the startup race can redirect this pad's input section (forged gamepad input \
-                 + a read of pad state). Documented residual; the virtual MOUSE and the XUSB pad are \
-                 both proved."
-            );
-        }
-        Some(pid)
     }
 
     /// Duplicate the DATA section into a verified WUDFHost `pid`, then publish handle
@@ -602,14 +367,15 @@ impl PadChannel {
         Ok((seq, process))
     }
 
-    /// Pump until a pid is acted on or `timeout` passes. Closes the DualShock 4 identity
+    /// Pump until the section is delivered or `timeout` passes. Closes the DualShock 4 identity
     /// race: the driver reads `device_type` from DATA when hidclass asks for descriptors.
     pub(super) fn deliver_eager(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
             self.pump();
-            if self.last_seen_pid != 0 || Instant::now() >= deadline {
-                if self.delivered.is_none() {
+            let delivered = matches!(self.delivery.phase, Phase::Delivered { .. });
+            if delivered || Instant::now() >= deadline {
+                if !delivered {
                     tracing::debug!(
                         mailbox = %self.boot_name,
                         "eager gamepad-channel delivery window passed without an attach — the \
@@ -624,711 +390,13 @@ impl PadChannel {
     }
 }
 
-/// `SwDeviceCreate` completion context: event, HRESULT, and PnP instance id.
-/// [`create_swdevice`] blocks on the event.
-#[repr(C)]
-struct SwCreateCtx {
-    event: HANDLE,
-    result: HRESULT,
-    instance_id: [u16; 128],
-}
-
-/// `SwDeviceCreate` callback: stash result + instance id and wake the creator.
-/// The creator blocks on the event, so there is no concurrent access to `*ctx`.
-unsafe extern "system" fn sw_create_cb(
-    _dev: HSWDEVICE,
-    result: HRESULT,
-    ctx: *const c_void,
-    id: PCWSTR,
-) {
-    if !ctx.is_null() {
-        // SAFETY: ctx is the &mut SwCreateCtx the creator passed; it outlives this callback (the
-        // creator blocks on the event). `id` is a NUL-terminated string for the callback's duration.
-        unsafe {
-            let c = ctx as *mut SwCreateCtx;
-            (*c).result = result;
-            if !id.is_null() {
-                for i in 0..(*c).instance_id.len() - 1 {
-                    let ch = *id.0.add(i);
-                    (*c).instance_id[i] = ch;
-                    if ch == 0 {
-                        break;
-                    }
-                }
-            }
-            let _ = SetEvent((*c).event);
-        }
-    }
-}
-
-impl SwCreateCtx {
-    fn instance_id(&self) -> Option<String> {
-        let len = self.instance_id.iter().position(|&c| c == 0)?;
-        (len > 0).then(|| String::from_utf16_lossy(&self.instance_id[..len]))
-    }
-}
-
-/// A `SwDeviceCreate`'d devnode; drop removes it (`SwDeviceClose`).
-pub(super) struct SwDevice(HSWDEVICE);
-
-/// PnP identity for a virtual devnode, so one [`create_swdevice`] builds every pad, the XUSB
-/// pad and the mouse.
-pub(super) struct SwDeviceProfile<'a> {
-    /// Distinct namespaces per type (`pf_pad_<idx>` vs `pf_ds4_<idx>`) so two types never reuse
-    /// a devnode shell.
-    pub instance: &'a str,
-    /// `Data1` of the ContainerId — a per-family tag (`"PFDS"` pads, `"PFMO"` mouse) so two
-    /// families at the same index never share a container (Windows would group them as one
-    /// device).
-    pub container_tag: u32,
-    /// Also stamped into the devnode Location, which the driver reads as its bootstrap-mailbox
-    /// index.
-    pub container_index: u8,
-    /// INF-matched hardware id, listed first so the INF binds.
-    pub hwid: &'static str,
-    /// `VID_…&PID_…` behind the synthesized `USB\` hardware and compatible ids. `None` lists the
-    /// INF id alone: XInput finds the XUSB pad by interface GUID, not VID/PID.
-    pub usb_vid_pid: Option<&'a str>,
-    /// Appended as `&MI_xx` on the USB hardware ids. hidclass mirrors the parent's `USB\VID…`
-    /// tokens into the HID child; hidapi/SDL/Steam parse `MI_` as `bInterfaceNumber` (0 if
-    /// absent). The Steam Deck controller lives on interface 2.
-    pub usb_mi: Option<u8>,
-    /// Present as a classic-Bluetooth HID pad: `BTHENUM\` hardware and compatible ids built from
-    /// `usb_vid_pid` instead of `USB\` ones. SDL and Steam read the bus from the compatible ids.
-    pub bluetooth: bool,
-    pub description: &'a str,
-    /// The `SWD\<enumerator>\<instance>` namespace. hidclass names the HID child after it, so a
-    /// pad Steam must recognise carries its VID/PID here (`VID_054C&PID_0CE6&MI_03`,
-    /// `VID_045E&PID_0B13`): Steam merges a pad's views by that token in the path, and under
-    /// `punktfunk` it listed the same pad twice.
-    pub enumerator: &'a str,
-    /// A binary device property the driver reads at `EvtDeviceAdd`: `(fmtid, pid, bytes)`.
-    pub property: Option<(u128, u32, &'a [u8])>,
-}
-
-/// The Bluetooth HID service every classic-Bluetooth pad enumerates under.
-const BTH_HID_SERVICE: &str = "BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}";
-
-/// `VID_2DC8&PID_6012` → the hardware id Windows gives that pad over Bluetooth,
-/// `BTHENUM\{00001124-…}_VID&00022DC8_PID&6012` (`0002`: a USB-IF vendor id).
-fn bthenum_id(vid_pid: &str) -> String {
-    let vid = vid_pid.get(4..8).unwrap_or("0000");
-    let pid = vid_pid.get(13..17).unwrap_or("0000");
-    format!("{BTH_HID_SERVICE}_VID&0002{vid}_PID&{pid}")
-}
-
-static PAD_SESSION: OnceLock<u32> = OnceLock::new();
-
-/// The session every [`create_swdevice`] devnode is fenced to: this process's own, unless
-/// [`set_pad_session`] ran first. `None` only while Windows can't say.
-pub fn pad_session() -> Option<u32> {
-    if let Some(&session) = PAD_SESSION.get() {
-        return Some(session);
-    }
-    pf_win_display::own_session_id().map(|own| *PAD_SESSION.get_or_init(|| own))
-}
-
-/// Fence this process's devnodes to `session` instead of its own. First call wins, so call it
-/// before the first device opens.
-pub fn set_pad_session(session: u32) {
-    let _ = PAD_SESSION.set(session);
-}
-
-/// `SwDeviceCreate`'s `pProperties`: the profile's binary property, then
-/// `DEVPKEY_Device_SessionId`. hidclass's children inherit the session from birth, which hides
-/// them from every other session. Each `Buffer` points into `binary` or `session`.
-fn devnode_properties(binary: Option<(u128, u32, &[u8])>, session: &[u8; 4]) -> Vec<DEVPROPERTY> {
-    let prop = |key: DEVPROPKEY, ty: DEVPROPTYPE, bytes: &[u8]| DEVPROPERTY {
-        CompKey: DEVPROPCOMPKEY {
-            Key: key,
-            Store: DEVPROP_STORE_SYSTEM,
-            LocaleName: PCWSTR::null(),
-        },
-        Type: ty,
-        BufferSize: bytes.len() as u32,
-        Buffer: bytes.as_ptr() as *mut c_void,
-    };
-    let mut props = Vec::with_capacity(2);
-    if let Some((fmtid, pid, bytes)) = binary {
-        let key = DEVPROPKEY {
-            fmtid: GUID::from_u128(fmtid),
-            pid,
-        };
-        props.push(prop(key, DEVPROP_TYPE_BINARY, bytes));
-    }
-    props.push(prop(DEVPKEY_Device_SessionId, DEVPROP_TYPE_UINT32, session));
-    props
-}
-
-/// Where a devnode's game-facing interfaces live, so [`verify_fence`] reads the session there.
-pub(super) enum FenceAt {
-    /// hidclass's children. `pad` also marks the pad driver unattached when none appears.
-    HidChildren { pad: bool },
-    /// The devnode itself: `pf-xusb` owns its XUSB interface and has no child.
-    Parent,
-}
-
-/// Read [`pad_session`] back where `at` says games look. A devnode that does not carry it is
-/// [`PadCreateFault::SessionFence`], logged with what was read; the caller drops the
-/// [`SwDevice`], which removes it. No HID child within 500 ms is a driver that never bound: an
-/// unclassified error carrying the devnode's PnP status, so the driver hint still applies.
-pub(super) fn verify_fence(instance_id: Option<&str>, at: FenceAt) -> Result<()> {
-    let (Some(id), Some(want)) = (instance_id, pad_session()) else {
-        return Err(anyhow!(
-            "the devnode's instance id or this host's session id is unknown"
-        ))
-        .context(PadCreateFault::SessionFence);
-    };
-    let nodes = match at {
-        FenceAt::Parent => vec![id.to_owned()],
-        FenceAt::HidChildren { pad } => hid_children(id, pad)?,
-    };
-    for node in nodes {
-        let read = match channel_proof::get_devnode_session(&node) {
-            Ok(Some(s)) if s == want => continue,
-            Ok(Some(s)) => s.to_string(),
-            Ok(None) => "none".to_owned(),
-            Err(e) => format!("{e:#}"),
-        };
-        tracing::warn!(
-            devnode = %node,
-            read = %read,
-            want,
-            "virtual devnode without this host's session id — removing it"
-        );
-        return Err(anyhow!("{node} carries session {read}, not {want}"))
-            .context(PadCreateFault::SessionFence);
-    }
-    Ok(())
-}
-
-/// `id`'s HID children. hidclass makes them ~40 ms after the driver starts; the caller has
-/// already waited for that, so 500 ms more is the margin.
-fn hid_children(id: &str, pad: bool) -> Result<Vec<String>> {
-    let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
-        let kids = channel_proof::child_device_ids(id)?;
-        if !kids.is_empty() {
-            return Ok(kids);
-        }
-        if Instant::now() >= deadline {
-            if pad {
-                crate::note_pad_driver(crate::PadDriverVerdict::NotAttached);
-            }
-            return Err(anyhow!(
-                "no HID collection under the new devnode: {}",
-                devnode_status_line(id, pad)
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Spawn a virtual devnode under `p.enumerator`, fenced to [`pad_session`], and return it with
-/// its PnP instance id. No session, no devnode.
-///
-/// Game detection (`design/windows-dualsense-game-detection.md`): `HIDD_ATTRIBUTES` VID/PID
-/// satisfies SDL/HIDAPI/RawInput, but a native PS5 path classifies connection type by walking
-/// to the parent and matching `"USB"`/`"BTHENUM"` in `DEVPKEY_Device_CompatibleIds`. Set these
-/// via `SW_DEVICE_CREATE_INFO` only — a later `DEVPROPERTY` write of bus/identity keys is ignored:
-/// - `pszzCompatibleIds` starts with a `USB\` token so the parent walk resolves USB.
-/// - `pszzHardwareIds` lists the INF id first, then `USB\VID_…[&REV_0100]`, so hidclass derives
-///   `HID\VID_…` child ids a genuine USB DualSense exposes.
-/// - a deterministic per-pad `pContainerId` (the null sentinel trips an `xinput1_4` slot skip).
-///
-/// Enumerator names must not contain `_` (`punktfunk`, not `pf_dualsense`) and `pCallback` is
-/// mandatory — either yields `E_INVALIDARG`. The caller must be Administrator (the host runs as
-/// LocalSystem).
-pub(super) fn create_swdevice(p: &SwDeviceProfile) -> Result<(SwDevice, Option<String>)> {
-    let session = pad_session()
-        .context("fence the devnode to this host's session: the session id is unknown")
-        .context(PadCreateFault::SessionFence)?;
-    let multi_sz = |ids: &[&str]| -> Vec<u16> {
-        ids.iter()
-            .flat_map(|s| s.encode_utf16().chain(std::iter::once(0)))
-            .chain(std::iter::once(0))
-            .collect()
-    };
-    let (hwids, compat) = match p.usb_vid_pid {
-        Some(vid_pid) if p.bluetooth => {
-            let bth = bthenum_id(vid_pid);
-            // A `BTHENUM\` token and no `USB` one → native bus-type detection resolves Bluetooth.
-            let compat = multi_sz(&[&bth, BTH_HID_SERVICE]);
-            (multi_sz(&[p.hwid, &bth]), Some(compat))
-        }
-        Some(vid_pid) => {
-            let mi = p.usb_mi.map(|n| format!("&MI_{n:02}")).unwrap_or_default();
-            let usb_rev = format!("USB\\{vid_pid}&REV_0100{mi}");
-            let usb = format!("USB\\{vid_pid}{mi}");
-            let hwids = multi_sz(&[p.hwid, &usb_rev, &usb]);
-            // A `USB\` token first → native bus-type detection resolves USB.
-            let compat = multi_sz(&[&usb, "USB\\Class_03&SubClass_00&Prot_00", "USB\\Class_03"]);
-            (hwids, Some(compat))
-        }
-        None => (multi_sz(&[p.hwid]), None),
-    };
-    let instid = HSTRING::from(p.instance);
-    let desc = HSTRING::from(p.description);
-    // Pad index in Location — the driver polls its bootstrap mailbox by it.
-    let loc = HSTRING::from(p.container_index.to_string());
-    let enumerator = HSTRING::from(p.enumerator);
-    let container = GUID::from_values(
-        p.container_tag,
-        0x0000,
-        0x0000,
-        [0, 0, 0, 0, 0, 0, 0, p.container_index],
-    );
-
-    // The id buffers and `container` outlive SwDeviceCreate (we wait on the event before return).
-    let info = SW_DEVICE_CREATE_INFO {
-        cbSize: size_of::<SW_DEVICE_CREATE_INFO>() as u32,
-        pszInstanceId: PCWSTR(instid.as_ptr()),
-        pszzHardwareIds: PCWSTR(hwids.as_ptr()),
-        pszzCompatibleIds: compat
-            .as_ref()
-            .map_or(PCWSTR::null(), |c| PCWSTR(c.as_ptr())),
-        pContainerId: &container,
-        CapabilityFlags: 0x0000_000B, // DriverRequired | SilentInstall | Removable
-        pszDeviceDescription: PCWSTR(desc.as_ptr()),
-        pszDeviceLocation: PCWSTR(loc.as_ptr()),
-        ..Default::default()
-    };
-
-    // `p.property`'s bytes and `session_bytes` outlive the call; SwDeviceCreate only reads them.
-    let session_bytes = session.to_ne_bytes();
-    let props = devnode_properties(p.property, &session_bytes);
-
-    // SAFETY: a manual-reset, initially-unsignaled, unnamed event.
-    let event = unsafe { CreateEventW(None, true, false, PCWSTR::null())? };
-    // `result` starts as E_FAIL: a timeout must not read a zeroed HRESULT as success.
-    // Heap-allocated: `sw_create_cb` writes through this pointer then `SetEvent`s. The wait is
-    // 10 s; on a wedged-PnP timeout the callback may still be pending, so we leak the box and
-    // leave the event open rather than let a late write hit recycled memory or a reused handle.
-    let ctx = Box::into_raw(Box::new(SwCreateCtx {
-        event,
-        result: E_FAIL,
-        instance_id: [0; 128],
-    }));
-    // SAFETY: info, `props` + the buffers outlive the call; `ctx` is a live heap allocation that
-    // outlives every path below (reclaimed only where the callback provably ran). windows-rs
-    // returns the HSWDEVICE (the C out-param) as the Result value.
-    let hsw = match unsafe {
-        SwDeviceCreate(
-            PCWSTR(enumerator.as_ptr()),
-            w!("HTREE\\ROOT\\0"),
-            &info,
-            Some(props.as_slice()),
-            Some(sw_create_cb),
-            Some(ctx as *const c_void),
-        )
-    } {
-        Ok(h) => h,
-        Err(e) => {
-            // SAFETY: the call failed, so no callback was registered and `ctx` is ours to reclaim;
-            // `event` is valid and unreferenced.
-            unsafe {
-                drop(Box::from_raw(ctx));
-                let _ = CloseHandle(event);
-            }
-            return Err(anyhow!("SwDeviceCreate({}): {e}", p.instance));
-        }
-    };
-    // From here the handle is ours: every early return removes the devnode.
-    let sw = SwDevice(hsw);
-    // SAFETY: event is valid.
-    let wait = unsafe { WaitForSingleObject(event, 10_000) };
-    if wait != WAIT_OBJECT_0 {
-        // Timed out: leak `ctx` and leave `event` open so a late callback writes live memory.
-        return Err(anyhow!(
-            "SwDeviceCreate({}) enumeration callback never fired (10s) — PnP may be wedged",
-            p.instance
-        ));
-    }
-    // SAFETY: the callback signalled the event, so nothing else will touch `ctx`/`event`.
-    // `ctx` came from `Box::into_raw` above and is reclaimed exactly once here; `event` is
-    // valid and no longer referenced by a pending callback.
-    let ctx = unsafe {
-        let _ = CloseHandle(event);
-        Box::from_raw(ctx)
-    };
-    if ctx.result.is_err() {
-        return Err(anyhow!(
-            "SwDeviceCreate({}) enumeration: {:?}",
-            p.instance,
-            ctx.result
-        ));
-    }
-    let instance_id = ctx.instance_id();
-    if let Some(id) = &instance_id {
-        tracing::debug!(devnode = %id, session, "virtual devnode fenced to this session");
-    }
-    Ok((sw, instance_id))
-}
-
-impl Drop for SwDevice {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` is the handle `SwDeviceCreate` returned; `SwDeviceClose` removes the devnode.
-        unsafe { SwDeviceClose(self.0) };
-    }
-}
-
-/// PnP bind + driver stamp window before a diagnosis warn.
-const ATTACH_GRACE: Duration = Duration::from_secs(3);
-
-/// Per-pad attach watcher. Feed `driver_proto` every service tick; logs attach,
-/// version mismatch, a pad that enumerated as another controller, or — after
-/// [`ATTACH_GRACE`] of silence — one diagnosis. States never repeat a log line, so the
-/// pump can call this at full rate.
-pub(super) struct DriverAttach {
-    driver: &'static str,
-    inf: &'static str,
-    driver_log: &'static str,
-    shm_name: String,
-    /// `None` on the out-of-band fallback path.
-    instance_id: Option<String>,
-    /// The `device_type` the pad's hardware id names; `None` for the XUSB pad and the mouse.
-    identity: Option<u8>,
-    created: Instant,
-    state: AttachState,
-}
-
-enum AttachState {
-    Waiting,
-    /// Diagnosis logged; still watching so a late attach gets its INFO line.
-    Warned,
-    Attached,
-}
-
-impl DriverAttach {
-    pub(super) fn new(
-        driver: &'static str,
-        inf: &'static str,
-        driver_log: &'static str,
-        shm_name: String,
-        instance_id: Option<String>,
-    ) -> DriverAttach {
-        DriverAttach {
-            driver,
-            inf,
-            driver_log,
-            shm_name,
-            instance_id,
-            identity: pf_driver_proto::gamepad::devtype_from_hwids(driver),
-            created: Instant::now(),
-            state: AttachState::Waiting,
-        }
-    }
-
-    /// For the XUSB pad and the mouse, whose sections carry no driver revision.
-    pub(super) fn observe(&mut self, driver_proto: u32) {
-        self.observe_pad(driver_proto, 0);
-    }
-
-    /// `driver_rev` is read after `driver_proto` ([`crate::pad_shm_ring::driver_marks`]);
-    /// only the attach tick uses it.
-    pub(super) fn observe_pad(&mut self, driver_proto: u32, driver_rev: u32) {
-        match self.state {
-            AttachState::Attached => {}
-            AttachState::Waiting | AttachState::Warned if driver_proto != 0 => {
-                let late = matches!(self.state, AttachState::Warned);
-                tracing::info!(
-                    driver = self.driver,
-                    shm = %self.shm_name,
-                    proto = driver_proto,
-                    late,
-                    "gamepad driver attached to the shared section"
-                );
-                if driver_proto != pf_driver_proto::gamepad::GAMEPAD_PROTO_VERSION {
-                    tracing::warn!(
-                        driver = self.driver,
-                        driver_proto,
-                        host_proto = pf_driver_proto::gamepad::GAMEPAD_PROTO_VERSION,
-                        "gamepad driver/host protocol mismatch — update the drivers: punktfunk-host.exe driver install --gamepad"
-                    );
-                }
-                self.check_pad(driver_rev);
-                self.state = AttachState::Attached;
-            }
-            AttachState::Waiting if self.created.elapsed() >= ATTACH_GRACE => {
-                if self.identity.is_some() {
-                    crate::note_pad_driver(crate::PadDriverVerdict::NotAttached);
-                }
-                self.diagnose();
-                self.state = AttachState::Warned;
-            }
-            _ => {}
-        }
-    }
-
-    /// Judge a freshly attached pad's driver ([`crate::pad_attach_verdict`]) for the diagnostics
-    /// row, and WARN on an old revision or on a pad that reports another controller's VID/PID
-    /// than its hardware id names (an older driver that did not know the id).
-    fn check_pad(&self, driver_rev: u32) {
-        let Some(devtype) = self.identity else {
-            return;
-        };
-        let got = self
-            .instance_id
-            .as_deref()
-            .and_then(channel_proof::hid_vid_pid);
-        let verdict = crate::pad_attach_verdict(devtype, driver_rev, got);
-        let fix = "reinstall the host with its controller drivers";
-        match &verdict {
-            crate::PadDriverVerdict::WrongIdentity { want, got } => tracing::warn!(
-                driver = self.driver,
-                want = %format!("VID_{:04X}&PID_{:04X}", want.0, want.1),
-                got = %format!("VID_{:04X}&PID_{:04X}", got.0, got.1),
-                fix,
-                "virtual pad enumerated as another controller; games see the wrong pad"
-            ),
-            crate::PadDriverVerdict::Stale {
-                driver_rev,
-                host_rev,
-            } => tracing::warn!(
-                driver = self.driver,
-                driver_rev,
-                host_rev,
-                fix,
-                "gamepad driver is older than this host; pads run with its old behaviour"
-            ),
-            _ => {}
-        }
-        crate::note_pad_driver(verdict);
-    }
-
-    /// One-shot WARN: driver-store presence, devnode PnP problem, where to look next.
-    ///
-    /// Spawns a thread and returns. The caller is the pad service thread (input + rumble);
-    /// `pnputil` can block for tens of seconds and a deadline wait would stall every
-    /// unattached pad on that same wait.
-    fn diagnose(&self) {
-        let (driver, inf, driver_log) = (self.driver, self.inf, self.driver_log);
-        let shm_name = self.shm_name.clone();
-        let instance_id = self.instance_id.clone();
-        let pad = self.identity.is_some();
-        std::thread::Builder::new()
-            .name("pf-driver-diagnose".into())
-            .spawn(move || diagnose_blocking(driver, inf, driver_log, &shm_name, instance_id, pad))
-            .ok();
-    }
-}
-
-/// Split out of [`DriverAttach::diagnose`] so the blocking wait is visible as blocking.
-fn diagnose_blocking(
-    driver: &'static str,
-    inf: &'static str,
-    driver_log: &'static str,
-    shm_name: &str,
-    instance_id: Option<String>,
-    pad: bool,
-) {
-    let store = match driver_store_has(inf) {
-        Some(true) => "driver package present in the driver store",
-        Some(false) => {
-            "driver package NOT in the driver store — run: punktfunk-host.exe driver install --gamepad"
-        }
-        None => "driver store could not be queried (pnputil failed or still enumerating)",
-    };
-    let devnode = match &instance_id {
-        Some(id) => devnode_status_line(id, pad),
-        None => "no per-session devnode (SwDeviceCreate failed earlier — see the warning above)"
-            .to_string(),
-    };
-    tracing::warn!(
-        driver,
-        shm = %shm_name,
-        grace_secs = ATTACH_GRACE.as_secs(),
-        store,
-        devnode = %devnode,
-        driver_log,
-        "gamepad driver has not attached to the shared section — the virtual pad exists but no \
-         driver is serving it (games will not see it); an old (pre-sealed-channel) driver also \
-         reads as not-attached: update with punktfunk-host.exe driver install --gamepad \
-         (driver_log is only written by debug driver builds, or with the PFXUSB_DEBUG_LOG / \
-         PFGAMEPAD_DEBUG_LOG / PFMOUSE_DEBUG_LOG system env var set + the device restarted)"
-    );
-}
-
-/// How long [`driver_store_inventory`] waits for pnputil. Only [`diagnose_blocking`]
-/// waits, on its own thread. pnputil routinely exceeds a couple of seconds on a
-/// busy driver store; 30 s is enough to report the inventory instead of "still enumerating".
-const INVENTORY_WAIT: Duration = Duration::from_secs(30);
-
-/// `pnputil /enum-drivers`, lower-cased, once per process. Failure-path only.
-/// Query runs on its own thread so a wedged pnputil is not re-run per pad.
-/// `None` = still running past [`INVENTORY_WAIT`], or failed; a late result still caches.
-fn driver_store_inventory() -> Option<&'static str> {
-    static INV: OnceLock<String> = OnceLock::new();
-    static SPAWN: std::sync::Once = std::sync::Once::new();
-    SPAWN.call_once(|| {
-        std::thread::spawn(|| {
-            let pnputil = pf_paths::system32("pnputil.exe");
-            let inv = std::process::Command::new(&pnputil)
-                .arg("/enum-drivers")
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase())
-                .unwrap_or_default();
-            let _ = INV.set(inv);
-        });
-    });
-    let deadline = Instant::now() + INVENTORY_WAIT;
-    loop {
-        if let Some(inv) = INV.get() {
-            return Some(inv);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// `None` = pnputil unavailable, failed, or still enumerating.
-fn driver_store_has(inf: &str) -> Option<bool> {
-    let inv = driver_store_inventory()?;
-    if inv.is_empty() {
-        return None;
-    }
-    Some(inv.contains(&inf.to_ascii_lowercase()))
-}
-
-fn devnode_status_line(instance_id: &str, pad: bool) -> String {
-    let wide = HSTRING::from(instance_id);
-    let mut devinst = 0u32;
-    // SAFETY: `wide` is a valid NUL-terminated UTF-16 instance id; `devinst` receives the handle.
-    let cr = unsafe {
-        CM_Locate_DevNodeW(
-            &mut devinst,
-            PCWSTR(wide.as_ptr()),
-            CM_LOCATE_DEVNODE_NORMAL,
-        )
-    };
-    if cr != CR_SUCCESS {
-        return format!(
-            "devnode {instance_id} not found (CM_Locate_DevNodeW CR={})",
-            cr.0
-        );
-    }
-    let mut status = CM_DEVNODE_STATUS_FLAGS(0);
-    let mut problem = CM_PROB(0);
-    // SAFETY: devinst is the devnode located above; the two out-params receive status + problem.
-    let cr = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) };
-    if cr != CR_SUCCESS {
-        return format!("devnode {instance_id}: status query failed (CR={})", cr.0);
-    }
-    if status.0 & DN_HAS_PROBLEM.0 != 0 {
-        let refused =
-            pad && hardware_ids(devinst).is_some_and(|ids| crate::pad_refused(problem.0, &ids));
-        let hint = if refused {
-            "the gamepad driver refused it: no pf_* hardware id names this pad; the host and \
-             driver disagree on the controller list — reinstall both"
-        } else {
-            cm_problem_hint(problem.0)
-        };
-        return format!(
-            "devnode {instance_id} has PnP problem code {} ({hint}) [status 0x{:08x}]",
-            problem.0, status.0
-        );
-    }
-    format!(
-        "devnode {instance_id} status 0x{:08x} (driver_loaded={} started={})",
-        status.0,
-        status.0 & DN_DRIVER_LOADED.0 != 0,
-        status.0 & DN_STARTED.0 != 0,
-    )
-}
-
-/// A devnode's hardware ids, lowercase and `;`-terminated, the form the driver matches on.
-fn hardware_ids(devinst: u32) -> Option<String> {
-    let mut ty = DEVPROPTYPE(0);
-    let mut buf = [0u16; 512];
-    let mut size = std::mem::size_of_val(&buf) as u32;
-    // SAFETY: `devinst` is a located devnode; the key is a static const; `buf` holds `size`
-    // bytes and `ty` / `size` are valid out-params.
-    let cr = unsafe {
-        CM_Get_DevNode_PropertyW(
-            devinst,
-            &DEVPKEY_Device_HardwareIds,
-            &mut ty,
-            Some(buf.as_mut_ptr().cast()),
-            &mut size,
-            0,
-        )
-    };
-    if cr != CR_SUCCESS || ty != DEVPROP_TYPE_STRING_LIST {
-        return None;
-    }
-    let len = (size as usize / 2).min(buf.len());
-    Some(
-        buf[..len]
-            .split(|&c| c == 0)
-            .filter(|id| !id.is_empty())
-            .map(|id| String::from_utf16_lossy(id).to_ascii_lowercase() + ";")
-            .collect(),
-    )
-}
-
-fn cm_problem_hint(problem: u32) -> &'static str {
-    match problem {
-        1 => "not configured — no driver bound; install the drivers",
-        10 => "device did not start — driver bound but the start failed; check the driver log",
-        18 => "reinstall required — re-run driver install",
-        24 => "device not present/working — PnP could not start the virtual devnode",
-        28 => "drivers not installed — the pf driver package is missing from the store or its certificate is not trusted",
-        31 => "driver did not load — the package was found but the load failed",
-        39 => "driver corrupt or missing — reinstall the drivers",
-        43 => "reported failure after start — check the driver log",
-        52 => "driver signature rejected — certificate not in Root/TrustedPublisher, or blocked by Memory Integrity",
-        _ => "see Device Manager for this code",
-    }
-}
-
-#[cfg(test)]
-mod bthenum_tests {
-    use super::*;
-
-    /// hidapi reports Bluetooth for a `BTHENUM` compatible id, and USB for any id that says `USB`.
-    #[test]
-    fn bluetooth_ids_name_the_pad_and_never_usb() {
-        let id = bthenum_id("VID_2DC8&PID_6012");
-        assert_eq!(
-            id,
-            "BTHENUM\\{00001124-0000-1000-8000-00805f9b34fb}_VID&00022DC8_PID&6012"
-        );
-        assert!(!id.to_ascii_uppercase().contains("USB"));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::windows::io::FromRawHandle;
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
-
-    /// Every devnode carries a 4-byte UINT32 `SessionId`, after the profile's binary property
-    /// when it has one.
-    #[test]
-    fn every_devnode_carries_the_session_property() {
-        let session = 15u32.to_ne_bytes();
-        let only = devnode_properties(None, &session);
-        assert_eq!(only.len(), 1, "no binary property, only the fence");
-        let fence = &only[0];
-        assert_eq!(fence.CompKey.Key, DEVPKEY_Device_SessionId);
-        assert_eq!(fence.Type, DEVPROP_TYPE_UINT32);
-        assert_eq!(fence.BufferSize, 4);
-        assert_eq!(fence.Buffer, session.as_ptr() as *mut c_void);
-
-        let blob = [1u8, 2, 3];
-        let both = devnode_properties(Some((0x1234, 7, &blob)), &session);
-        assert_eq!(both.len(), 2);
-        assert_eq!(both[0].CompKey.Key.pid, 7);
-        assert_eq!(both[0].Type, DEVPROP_TYPE_BINARY);
-        assert_eq!(both[0].BufferSize, 3);
-        assert_eq!(both[0].Buffer, blob.as_ptr() as *mut c_void);
-        assert_eq!(both[1].CompKey.Key, DEVPKEY_Device_SessionId);
-        assert_eq!(both[1].BufferSize, 4);
-    }
 
     /// Pin [`Delivered::exited`] to the process object, not the pid.
     /// Alive refuses a takeover; exited still lets UMDF restart re-deliver.
@@ -1354,7 +422,7 @@ mod tests {
             .expect("OpenProcess(SYNCHRONIZE) on our own child");
             OwnedHandle::from_raw_handle(h.0 as _)
         };
-        let delivered = Delivered { pid, process };
+        let delivered = Delivered { process };
         assert!(
             !delivered.exited(),
             "a running target must read as ALIVE — this is what refuses a channel takeover"
