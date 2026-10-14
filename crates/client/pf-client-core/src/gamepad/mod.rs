@@ -88,8 +88,9 @@ enum Ctl {
     MenuMode(bool),
     MenuRumble(MenuPulse),
     Mask(bool),
-    /// In-stream ring is up: forwarded pads → [`MenuEvent`]s. It does not mask: without
-    /// [`Ctl::Mask`] the same presses also reach the host.
+    /// The ring or a console launch hold is up: forwarded pads → [`MenuEvent`]s, or the menu
+    /// pads before a session attaches. It does not mask: without [`Ctl::Mask`] the same
+    /// presses also reach the host.
     RingNav(bool),
     /// Whether anything is listening for a Select chord ([`GamepadService::set_chords_live`]).
     ChordsLive(bool),
@@ -220,8 +221,8 @@ impl GamepadService {
         let _ = self.ctl.send(Ctl::ChordsLive(on));
     }
 
-    /// Forwarded pads drive the ring. Without [`Self::set_masked`] the same presses also reach
-    /// the host.
+    /// Forwarded pads drive the ring, or every pad does before a session attaches (a launch
+    /// hold). Without [`Self::set_masked`] the same presses also reach the host.
     pub fn set_ring_nav(&self, on: bool) {
         let _ = self.ctl.send(Ctl::RingNav(on));
     }

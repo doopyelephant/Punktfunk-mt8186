@@ -8,7 +8,7 @@
 use super::select_gesture::{select_chord, SelectChord, SelectGesture};
 use punktfunk_core::client::Sc2Gate;
 use punktfunk_core::input::gamepad as wire;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The client's asks that decide where pad input goes. Each `Ctl` has its own caller, so the
 /// fields are kept as sent and read together.
@@ -18,7 +18,8 @@ pub(super) struct Gates {
     pub(super) menu_mode: bool,
     /// The overlay owns the pads: neutral on the host, slots still open.
     pub(super) masked: bool,
-    /// The in-stream ring polls the forwarded pads.
+    /// The ring or a console launch hold polls the pads: the forwarded ones, or the menu pads
+    /// before a session attaches.
     pub(super) ring_nav: bool,
     /// Physical Guide and Quick Access reach the host; off, they stay with the local shell.
     pub(super) system_forward: bool,
@@ -44,11 +45,12 @@ impl Default for Gates {
 /// Where pad input goes. Forwarded slots exist only with a session; menu pads only without.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum InputRoute {
-    /// No session, no menu: no pad is open.
+    /// No session, no menu, no ring: no pad is open.
     Closed,
-    /// No session: every pad open and polled into menu events.
+    /// No session: every pad open and polled into menu events, for the console or for a ring
+    /// or launch hold before attach.
     Menu,
-    /// No session, menu pads open, but the mask or the ring holds them: nothing moves.
+    /// No session, menu pads open, the mask alone holds them: nothing moves.
     MenuHeld,
     /// Forwarded pads drive the host.
     Host,
@@ -71,6 +73,11 @@ pub(super) enum MenuReads {
 }
 
 impl InputRoute {
+    /// Menu pads are open (no session, and menu mode or the ring wants them).
+    pub(super) fn opens_menu_pads(self) -> bool {
+        matches!(self, InputRoute::Menu | InputRoute::MenuHeld)
+    }
+
     pub(super) fn menu_reads(self) -> MenuReads {
         match self {
             InputRoute::Menu => MenuReads::MenuPads,
@@ -89,8 +96,10 @@ impl Gates {
             (true, true, false) => InputRoute::Masked,
             (true, true, true) => InputRoute::Ring,
             (true, false, true) => InputRoute::HostAndRing,
+            // A launch hold over a stream not yet attached: its B cancels the dial.
+            (false, _, true) => InputRoute::Menu,
             (false, false, false) if self.menu_mode => InputRoute::Menu,
-            (false, ..) if self.menu_mode => InputRoute::MenuHeld,
+            (false, true, false) if self.menu_mode => InputRoute::MenuHeld,
             (false, ..) => InputRoute::Closed,
         }
     }
@@ -102,6 +111,32 @@ impl Gates {
             system_local: !self.system_forward,
             chords: self.chords_live,
         }
+    }
+}
+
+/// A pad opened a moment ago reads every button up until its first input report. 50 ms
+/// covers a 60 Hz report period three times over.
+const MENU_SETTLE: Duration = Duration::from_millis(50);
+
+/// Menu navigation adopts what is held, instead of firing it, for [`MENU_SETTLE`] after a
+/// forwarded pad opens. A button held across attach would otherwise read up, then down.
+#[derive(Default)]
+pub(super) struct MenuSettle {
+    until: Option<Instant>,
+}
+
+impl MenuSettle {
+    pub(super) fn start(&mut self, now: Instant) {
+        self.until = Some(now + MENU_SETTLE);
+    }
+
+    /// True while a menu poll must adopt held state rather than fire it.
+    pub(super) fn adopting(&mut self, now: Instant) -> bool {
+        let adopting = self.until.is_some_and(|t| now < t);
+        if !adopting {
+            self.until = None;
+        }
+        adopting
     }
 }
 
@@ -300,8 +335,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use wire::{
-        BTN_A as A, BTN_BACK as SELECT, BTN_GUIDE as GUIDE, BTN_LB as LB, BTN_MISC1 as QAM,
-        BTN_RB as RB, BTN_START as START, BTN_X as X, BTN_Y as Y,
+        BTN_A as A, BTN_B as B, BTN_BACK as SELECT, BTN_GUIDE as GUIDE, BTN_LB as LB,
+        BTN_MISC1 as QAM, BTN_RB as RB, BTN_START as START, BTN_X as X, BTN_Y as Y,
     };
     use Action::{Escape, Forward, Readopt, Rearm};
 
@@ -628,13 +663,15 @@ mod tests {
         // (session, menu_mode, masked, ring_nav)
         let rows = [
             ((false, false, false, false), Closed, Nothing),
-            ((false, false, false, true), Closed, Nothing),
+            ((false, false, false, true), Menu, MenuPads),
             ((false, false, true, false), Closed, Nothing),
-            ((false, false, true, true), Closed, Nothing),
+            // A launch hold before attach reads the menu pads, with or without menu mode.
+            ((false, false, true, true), Menu, MenuPads),
             ((false, true, false, false), Menu, MenuPads),
+            // The mask alone, with no session, moves nothing.
             ((false, true, true, false), MenuHeld, Nothing),
-            ((false, true, false, true), MenuHeld, Nothing),
-            ((false, true, true, true), MenuHeld, Nothing),
+            ((false, true, false, true), Menu, MenuPads),
+            ((false, true, true, true), Menu, MenuPads),
             ((true, false, false, false), Host, Nothing),
             ((true, true, false, false), Host, Nothing),
             ((true, false, true, false), Masked, Nothing),
@@ -654,12 +691,69 @@ mod tests {
             let at = (session, menu_mode, masked, ring_nav);
             assert_eq!(gates.input_route(session), want, "{at:?}");
             assert_eq!(want.menu_reads(), reads, "{at:?}");
+            let opens = !session && (menu_mode || ring_nav);
+            assert_eq!(want.opens_menu_pads(), opens, "{at:?}");
             if session {
                 let pad = &mut PadRoute::default();
                 let sent = !route(down(A), &gates, pad, Instant::now()).is_empty();
                 assert_eq!(sent, matches!(want, Host | HostAndRing), "{at:?}");
             }
         }
+    }
+
+    /// A B held through a launch hold and across attach never fires Back, so it cannot
+    /// reveal the stream; the next real press does. The new slots read B up until they report.
+    #[test]
+    fn a_button_held_across_attach_is_adopted() {
+        use crate::menu_nav::{MenuEvent, MenuNav, MenuSample};
+        let b = |down| MenuSample {
+            buttons: [false, down, false, false, false, false],
+            ..MenuSample::default()
+        };
+        // What `menu_poll` does with one merged sample.
+        fn poll(
+            nav: &mut MenuNav,
+            settle: &mut MenuSettle,
+            s: &MenuSample,
+            now: Instant,
+        ) -> Vec<MenuEvent> {
+            if settle.adopting(now) {
+                nav.reset();
+            }
+            let mut out = Vec::new();
+            nav.poll(s, now, &mut out);
+            out
+        }
+        let (mut nav, mut settle) = (MenuNav::new(), MenuSettle::default());
+        let t = Instant::now();
+        let ms = |n| t + Duration::from_millis(n);
+        // The hold reads the menu pads: B pressed then is a Back, for the cancel.
+        assert!(poll(&mut nav, &mut settle, &b(false), ms(0)).is_empty());
+        assert_eq!(
+            poll(&mut nav, &mut settle, &b(true), ms(10)),
+            [MenuEvent::Back]
+        );
+        // Attach with B still down: the slots open, the first sample reads B up.
+        settle.start(ms(20));
+        for (at, down) in [(20, false), (30, true), (60, true), (90, true)] {
+            let fired = poll(&mut nav, &mut settle, &b(down), ms(at));
+            assert!(fired.is_empty(), "B fired at {at} ms");
+        }
+        assert!(poll(&mut nav, &mut settle, &b(false), ms(100)).is_empty());
+        assert_eq!(
+            poll(&mut nav, &mut settle, &b(true), ms(110)),
+            [MenuEvent::Back]
+        );
+        // The forwarded slot under the hold's mask sends nothing; the hand-back adopts B.
+        let gates = Gates {
+            masked: true,
+            ring_nav: true,
+            ..host()
+        };
+        let mut pad = PadRoute::default();
+        assert!(route(down(B), &gates, &mut pad, ms(30)).is_empty());
+        assert!(pad.adopt(vec![B], false, true));
+        assert_eq!(route(up(B), &host(), &mut pad, ms(120)), [off(B), Rearm]);
     }
 
     /// a05b711ac: a raw Steam Controller runs the mask, system buttons and chord itself.

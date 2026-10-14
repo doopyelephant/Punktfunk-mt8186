@@ -4,7 +4,7 @@
 //! from the caller's loop.
 
 use super::ds5::Ds5Feedback;
-use super::route::{route, Action, Gates, MenuReads, PadInput, PadRoute};
+use super::route::{route, Action, Gates, MenuReads, MenuSettle, PadInput, PadRoute};
 use super::select_gesture::TAP_PRESS;
 use super::{is_steam_deck, set_valve_hidapi, Ctl, SelectChord, DISCONNECT_HOLD};
 use crate::menu_nav::{
@@ -397,6 +397,8 @@ pub(super) struct Worker {
     menu_open: Vec<(u32, sdl3::gamepad::Gamepad)>,
     /// Menu pad that last had a button or stick engaged — the one a detent pulse belongs in.
     menu_last: Option<u32>,
+    /// A forwarded slot just opened: menu navigation adopts until it has reported.
+    menu_settle: MenuSettle,
     /// Menu pad power, `(id, level)`. Cached: [`publish`](Self::publish) runs on every hotplug.
     battery: Option<(u32, PadBattery)>,
     battery_at: Option<Instant>,
@@ -542,8 +544,9 @@ impl Worker {
             .map_or_else(|| self.order.clone(), |id| vec![id])
     }
 
-    /// The one place that opens (= grabs) hardware. Dropping a handle is `SDL_CloseGamepad`;
-    /// on a Deck the firmware watchdog then restores lizard mode.
+    /// The one place that opens (= grabs) hardware: forwarded slots in a session, else the
+    /// menu pads while menu mode or the ring wants them. Dropping a handle is
+    /// `SDL_CloseGamepad`; on a Deck the firmware watchdog then restores lizard mode.
     fn sync_open(&mut self) {
         if self.attached.is_some() {
             self.menu_open.clear();
@@ -552,7 +555,7 @@ impl Worker {
             return;
         }
         self.close_all_slots();
-        let want = if self.gates.menu_mode {
+        let want = if self.gates.input_route(false).opens_menu_pads() {
             self.menu_ids()
         } else {
             Vec::new()
@@ -737,6 +740,7 @@ impl Worker {
                     "gamepad forwarding (slot opened)"
                 );
                 self.slots.push(slot);
+                self.menu_settle.start(Instant::now());
             }
             Err(e) => tracing::warn!(id, error = %e, "gamepad open failed"),
         }
@@ -842,6 +846,16 @@ impl Worker {
             if unsafe { slot.pad.has_sensor(s) } {
                 let _ = slot.pad.sensor_set_enabled(s, enabled);
             }
+        }
+    }
+
+    /// The ring or a launch hold. Before attach it reads the menu pads, so they open even
+    /// outside menu mode.
+    fn set_ring_nav(&mut self, on: bool) {
+        self.gates.ring_nav = on;
+        self.menu_nav.reset();
+        if self.attached.is_none() {
+            self.sync_open();
         }
     }
 
@@ -1331,10 +1345,7 @@ impl Worker {
                     }
                     self.sync_open();
                 }
-                Ok(Ctl::RingNav(on)) => {
-                    self.gates.ring_nav = on;
-                    self.menu_nav.reset();
-                }
+                Ok(Ctl::RingNav(on)) => self.set_ring_nav(on),
                 Ok(Ctl::MenuRumble(pulse)) => {
                     if self.attached.is_none() {
                         // The pad that last acted, not the newest: with two on the console the
@@ -1555,8 +1566,12 @@ impl Worker {
             self.menu_last = Some(pads[i].0);
         }
         let merged = merge_samples(&samples);
+        let now = Instant::now();
+        if self.menu_settle.adopting(now) {
+            self.menu_nav.reset();
+        }
         let mut out = Vec::new();
-        self.menu_nav.poll(&merged, Instant::now(), &mut out);
+        self.menu_nav.poll(&merged, now, &mut out);
         for e in out {
             let _ = self.menu_tx.try_send(e);
         }
@@ -1732,6 +1747,7 @@ impl Worker {
             slots: Vec::new(),
             menu_open: Vec::new(),
             menu_last: None,
+            menu_settle: MenuSettle::default(),
             battery: None,
             battery_at: None,
             order: Vec::new(),
@@ -1790,11 +1806,8 @@ pub(super) fn run(
 
         // Wait, don't sleep+poll. 10 ms attached/menu bounds chord-hold and haptic
         // jitter (DISCONNECT_HOLD is 1500 ms). Idle wakes at 30 ms for hotplug + ctl.
-        let timeout = Duration::from_millis(if w.attached.is_some() || w.gates.menu_mode {
-            10
-        } else {
-            30
-        });
+        let menu = w.gates.input_route(false).opens_menu_pads();
+        let timeout = Duration::from_millis(if w.attached.is_some() || menu { 10 } else { 30 });
         if let Some(event) = pump.wait_event_timeout(timeout) {
             w.handle_event(event);
             while let Some(event) = pump.poll_event() {
