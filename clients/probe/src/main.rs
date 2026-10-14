@@ -27,8 +27,8 @@ use punktfunk_core::quic::v2::hello::{ClientHello, Ready, ServerHello};
 use punktfunk_core::quic::v2::io as v2io;
 use punktfunk_core::quic::v2::msg::{decode, V2Message};
 use punktfunk_core::quic::{
-    endpoint, window_loss_ppm, BitrateChanged, CursorRenderMode, Hello, ProbeRequest, ProbeResult,
-    Reconfigure, Reconfigured, SetBitrate, Welcome,
+    endpoint, window_loss_ppm, BitrateChanged, CursorRenderMode, CursorShape, Hello, ProbeRequest,
+    ProbeResult, Reconfigure, Reconfigured, SetBitrate, Welcome,
 };
 use punktfunk_core::session::test_frame;
 use punktfunk_core::{CompositorPref, Mode, PunktfunkError, Session};
@@ -1288,9 +1288,22 @@ fn spawn_cursor_test(
                 }
             }
         }
-        // Drain (and just log) whatever the host still sends on the control stream.
+        // Drain whatever the host still sends on the control stream; a shape says what
+        // size it came in.
         while let Ok((ty, b)) = cr.read_frame().await {
-            tracing::debug!(len = b.len(), ty, "cursor-capture: control message drained");
+            match decode::<CursorShape>(ty, &b) {
+                Ok(s) => tracing::info!(
+                    serial = s.serial,
+                    w = s.w,
+                    h = s.h,
+                    hot_x = s.hot_x,
+                    hot_y = s.hot_y,
+                    "cursor-channel: CursorShape received"
+                ),
+                Err(_) => {
+                    tracing::debug!(len = b.len(), ty, "cursor-capture: control message drained")
+                }
+            }
         }
     });
     let wiggle_conn = conn.clone();
