@@ -37,7 +37,7 @@ struct SrcImage {
     view: vk::ImageView,
     /// Geometry the image was created for; a change re-imports.
     shape: (u32, u64, u32, u32, u32, u32),
-    /// A submitted pass has acquired it: the first acquire transitions from PREINITIALIZED,
+    /// A submitted pass has acquired it: the first acquire transitions from UNDEFINED,
     /// later ones from the read layout.
     acquired: bool,
 }
@@ -577,8 +577,6 @@ impl VkBridge {
                         .offset(u64::from(s.offset))
                         .row_pitch(u64::from(s.stride))],
                     usage: vk::ImageUsageFlags::SAMPLED,
-                    // The first acquire barrier transitions from PREINITIALIZED.
-                    initial_layout: vk::ImageLayout::PREINITIALIZED,
                 },
                 None,
             )?;
@@ -728,7 +726,7 @@ impl VkBridge {
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .old_layout(if first {
-                    vk::ImageLayout::PREINITIALIZED
+                    vk::ImageLayout::UNDEFINED
                 } else {
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
                 })
@@ -785,7 +783,7 @@ impl VkBridge {
             );
             d.end_command_buffer(cmd).context("end convert cmd")?;
             let value = self.submit_pass(idx, cmd, value)?;
-            // Only a submitted pass took the image out of PREINITIALIZED.
+            // Only a submitted pass took the image out of UNDEFINED.
             if let Some(img) = self.conv.as_mut().and_then(|st| st.srcs.get_mut(&src.fd)) {
                 img.acquired = true;
             }

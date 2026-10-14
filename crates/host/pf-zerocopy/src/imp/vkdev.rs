@@ -324,8 +324,6 @@ pub struct DmabufImage<'a> {
     /// One `(offset, row_pitch)` layout per memory plane of `format`.
     pub planes: &'a [vk::SubresourceLayout],
     pub usage: vk::ImageUsageFlags,
-    /// `PREINITIALIZED` when the first acquire barrier transitions from it; else `UNDEFINED`.
-    pub initial_layout: vk::ImageLayout,
 }
 
 /// Import `src` as an image bound to its own dedicated memory. The memory type comes from the
@@ -368,7 +366,8 @@ pub unsafe fn import_dmabuf_image(
         .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
         .usage(src.usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(src.initial_layout)
+        // External memory starts UNDEFINED; the first acquire barrier names that layout.
+        .initial_layout(vk::ImageLayout::UNDEFINED)
         .push_next(&mut ext)
         .push_next(&mut drm);
     if let Some(pl) = profile_list {

@@ -523,7 +523,6 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
             modifier: d.modifier,
             planes: &planes,
             usage,
-            initial_layout: vk::ImageLayout::UNDEFINED,
         },
         profile_list,
     )?;
