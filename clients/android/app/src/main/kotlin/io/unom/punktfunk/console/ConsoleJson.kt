@@ -255,8 +255,11 @@ internal object ConsoleJson {
     }
 
     // ---- wake / pair ------------------------------------------------------------------------
+    // `req` is the command's own, copied verbatim: the console drops a push whose key it is
+    // not waiting on.
 
     fun wakeStatus(
+        req: JSONObject,
         key: String,
         name: String,
         seconds: Int,
@@ -264,6 +267,7 @@ internal object ConsoleJson {
         online: Boolean,
         thenConnect: Boolean,
     ): String = JSONObject()
+        .put("req", req)
         .put("key", key)
         .put("name", name)
         .put("seconds", seconds)
@@ -272,11 +276,14 @@ internal object ConsoleJson {
         .put("then_connect", thenConnect)
         .toString()
 
-    fun pairIdle(): String = "\"Idle\""
-    fun pairBusy(): String = "\"Busy\""
-    fun pairFailed(msg: String): String = JSONObject().put("Failed", msg).toString()
-    fun pairPaired(key: String): String =
-        JSONObject().put("Paired", JSONObject().put("key", key)).toString()
+    fun pairBusy(req: JSONObject): String = pair(req, "Busy")
+    fun pairFailed(req: JSONObject, msg: String): String = pair(req, JSONObject().put("Failed", msg))
+    fun pairPaired(req: JSONObject, key: String): String =
+        pair(req, JSONObject().put("Paired", JSONObject().put("key", key)))
+
+    /** `PairStatus`: the phase under the `Pair` or `RequestAccess` command's `req`. */
+    private fun pair(req: JSONObject, phase: Any): String =
+        JSONObject().put("req", req).put("phase", phase).toString()
 
     // ---- speed test / profiles ----------------------------------------------------------------
 
@@ -326,10 +333,11 @@ internal object ConsoleJson {
     // ---- library ------------------------------------------------------------------------------
 
     /**
-     * `[LibraryGame]` from the Kotlin catalog — the desktop service's `to_model` mapping.
-     * Without `stats` the Recent and Most played sorts fall back to host order.
+     * `{"req", "games": [LibraryGame]}` from the Kotlin catalog — the desktop service's
+     * `to_model` mapping, under the `FetchLibrary` command's `req`. Without `stats` the Recent
+     * and Most played sorts fall back to host order.
      */
-    fun libraryGames(games: List<GameEntry>): String {
+    fun libraryGames(req: JSONObject, games: List<GameEntry>): String {
         val out = JSONArray()
         for (g in games) {
             out.put(
@@ -348,7 +356,7 @@ internal object ConsoleJson {
                     .put("install", g.install?.let(::installJson) ?: JSONObject.NULL),
             )
         }
-        return out.toString()
+        return JSONObject().put("req", req).put("games", out).toString()
     }
 
     private fun installJson(i: TitleInstall): JSONObject = JSONObject().put("state", i.state).apply {
@@ -361,12 +369,11 @@ internal object ConsoleJson {
         t.isNotEmpty() && t.length <= 32 && t[0] in 'a'..'z' &&
             t.all { it in 'a'..'z' || it in '0'..'9' || it == '-' }
 
-    fun libraryError(title: String, body: String, canRetry: Boolean): String = JSONObject()
-        .put(
-            "Error",
-            JSONObject().put("title", title).put("body", body).put("can_retry", canRetry),
-        )
-        .toString()
+    /** `{"req", "phase": {"Error": …}}` under the `FetchLibrary` command's `req`. */
+    fun libraryError(req: JSONObject, title: String, body: String, canRetry: Boolean): String {
+        val error = JSONObject().put("title", title).put("body", body).put("can_retry", canRetry)
+        return JSONObject().put("req", req).put("phase", JSONObject().put("Error", error)).toString()
+    }
 
     fun stringArray(items: Collection<String>): String = JSONArray(items).toString()
 

@@ -1,10 +1,11 @@
 //! Library model — everything the overlay shares that is not Skia.
 //!
-//! Games, phase, incoming art, generation and fetch epoch live in [`LibraryShared`].
+//! Games, phase, incoming art, generation and the fetch they answer live in [`LibraryShared`].
 //! Fetch threads write; the renderer drains per frame. The sections and favorites
 //! settings helpers sit alongside. Cursor maths is [`crate::grid`], the card transform
 //! [`crate::coverflow`], the palettes [`crate::palette`]. Rendering is `skia_overlay`.
 
+use crate::model::RequestKey;
 use skia_safe::{ConditionallySend, Image};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -189,9 +190,9 @@ struct Shared {
     games: Vec<LibraryGame>,
     /// Disk cache vs live host. Live [`LibraryShared::set_games`] resets this to [`Stale::No`].
     stale: Stale,
-    /// Every poster fetched for this epoch, encoded, by title id. Kept for the fetch, not
+    /// Every poster of the fetch on hand, encoded, by title id. Kept for the fetch, not
     /// queued: whichever screen is up decodes what it lacks, and a cover a screen evicted
-    /// or never drew comes back from here. Cleared by [`LibraryShared::begin_fetch`].
+    /// or never drew comes back from here. Cleared when a fetch begins.
     art: HashMap<String, Arc<[u8]>>,
     /// Posters a host decoded on its own thread, waiting to be adopted. Separate from
     /// [`Shared::art`] because taking one costs nothing: the work is already done.
@@ -201,12 +202,9 @@ struct Shared {
     art_scale: Option<f64>,
     /// Bumped on phase/games changes so the renderer re-syncs its snapshot.
     generation: u64,
-    /// Bumped once per fetch, by [`LibraryShared::begin_fetch`].
-    ///
-    /// Distinguishes "this shelf's list" from "the previous host's, still here" without
-    /// catching `Loading`. A warm cache publishes `Ready` inside one 60 Hz frame, so a
-    /// phase edge can be missed; a counter cannot.
-    fetch_epoch: u64,
+    /// The fetch the list answers, set as the shell sends it. Its host says whose list this
+    /// is; a list or phase written under another key is dropped.
+    req: RequestKey,
     /// Each launched title's host-side state string (`launching`, `running`, …) and whether a
     /// `window` is still to come, by library id — the launch hold's answer. Replaced whole on
     /// every `/status` read.
@@ -271,7 +269,7 @@ impl Default for LibraryShared {
             decoded_in: VecDeque::new(),
             art_scale: None,
             generation: 0,
-            fetch_epoch: 0,
+            req: RequestKey::default(),
             states: std::collections::HashMap::new(),
             downloads: std::collections::HashMap::new(),
             grants: None,
@@ -281,60 +279,67 @@ impl Default for LibraryShared {
 }
 
 impl LibraryShared {
-    /// A fetch is starting: `Loading`, and the epoch advances.
-    ///
-    /// Must go through here, not `set_phase(Loading)`. A cache that answers before the next
-    /// frame would otherwise leave the epoch unchanged and the shelf on the previous host.
-    pub fn begin_fetch(&self) {
-        self.begin(false);
-    }
-
-    /// [`Self::begin_fetch`] for another host than the list on hand, which goes too. The
-    /// shell calls it as it sends the fetch, so a shelf pushed with that fetch never syncs
-    /// the previous host's titles; the platform's own call can be a service tick away.
-    pub(crate) fn begin_host_fetch(&self) {
-        self.begin(true);
-    }
-
-    fn begin(&self, new_host: bool) {
+    /// The shell sends fetch `req`: only `req`'s list and phase land from now. Another host's
+    /// titles go at once, `Loading`, so no shelf takes them as `req`'s; the same host's stay
+    /// on screen until its producer begins. Runs before the send: the answer can come first.
+    pub(crate) fn begin(&self, req: &RequestKey) {
         let mut s = self.0.lock().unwrap();
-        s.phase = LibraryPhase::Loading;
+        let new_host = s.req.host != req.host;
+        s.req = req.clone();
         if new_host {
             s.games.clear();
+            Self::restart(&mut s);
         }
-        // Previous host's stale note is not this fetch's; a cached render re-declares it.
+    }
+
+    /// A producer starts on the fetch it was sent: `Loading`, and the posters and stale note a
+    /// superseded fetch may have left go. The key stays the shell's.
+    pub fn begin_fetch(&self) {
+        Self::restart(&mut self.0.lock().unwrap());
+    }
+
+    fn restart(s: &mut Shared) {
+        s.phase = LibraryPhase::Loading;
         s.stale = Stale::No;
-        // The previous host's posters are not this fetch's.
         s.art.clear();
         s.decoded_in.clear();
-        s.fetch_epoch += 1;
         s.generation += 1;
     }
 
-    /// Fetch the model is on. A shelf records this at push; a later difference means a new fetch
-    /// owns the list. `pub` because the worker that does the fetching lives in the shell crate.
+    /// The epoch of the fetch the list answers. A worker that finds it moved stops: its
+    /// answers would be dropped.
     pub fn fetch_epoch(&self) -> u64 {
-        self.0.lock().unwrap().fetch_epoch
+        self.0.lock().unwrap().req.epoch
     }
 
-    pub fn set_phase(&self, phase: LibraryPhase) {
+    /// The fetch the list answers. Its host is whose titles these are.
+    pub(crate) fn req(&self) -> RequestKey {
+        self.0.lock().unwrap().req.clone()
+    }
+
+    /// `req`'s phase; dropped for any other fetch.
+    pub fn set_phase(&self, req: &RequestKey, phase: LibraryPhase) {
         let mut s = self.0.lock().unwrap();
+        if s.req != *req {
+            return;
+        }
         s.phase = phase;
         s.generation += 1;
     }
 
-    /// Host titles → carousel (empty = empty scene). Clears cached staleness.
+    /// `req`'s titles → carousel (empty = empty scene); dropped for any other fetch. Clears
+    /// cached staleness.
     ///
     /// Launchers move to the front, host title order kept within each group. Grouping here
     /// so cursor math, the art pump, and [`GridShape`] all see the same prefix.
-    pub fn set_games(&self, games: Vec<LibraryGame>) {
-        self.put_games(games, Stale::No);
+    pub fn set_games(&self, req: &RequestKey, games: Vec<LibraryGame>) {
+        self.put_games(req, games, Stale::No);
     }
 
     /// Disk-cache catalog while the host is still being asked. Live fetch stays in flight.
     /// A shell that sends a wake says so with [`Self::set_stale`]`(Waking)`.
-    pub fn set_games_cached(&self, games: Vec<LibraryGame>) {
-        self.put_games(games, Stale::Checking);
+    pub fn set_games_cached(&self, req: &RequestKey, games: Vec<LibraryGame>) {
+        self.put_games(req, games, Stale::Checking);
     }
 
     /// Shelf copy about a cached catalog, catalog unchanged. No-op on a live shelf, so a late
@@ -348,13 +353,16 @@ impl LibraryShared {
         s.generation += 1;
     }
 
-    fn put_games(&self, mut games: Vec<LibraryGame>, stale: Stale) {
+    fn put_games(&self, req: &RequestKey, mut games: Vec<LibraryGame>, stale: Stale) {
         // Empty is the CATALOG's verdict, taken before the desktop tile joins: a host with
         // no plugins keeps its empty copy, and gets the tile beside it.
         let empty = games.is_empty();
         games.insert(0, desktop_tile());
         order(&mut games);
         let mut s = self.0.lock().unwrap();
+        if s.req != *req {
+            return;
+        }
         s.phase = if empty {
             LibraryPhase::Empty
         } else {
@@ -647,12 +655,15 @@ mod tests {
             install: None,
         };
         let shared = LibraryShared::default();
-        shared.set_games(vec![
-            g("Celeste", false),
-            g("Big Picture", true),
-            g("Portal 2", false),
-            g("Heroic", true),
-        ]);
+        shared.set_games(
+            &shared.req(),
+            vec![
+                g("Celeste", false),
+                g("Big Picture", true),
+                g("Portal 2", false),
+                g("Heroic", true),
+            ],
+        );
         let snap = shared.snapshot();
         assert!(matches!(snap.phase, LibraryPhase::Ready));
         assert_eq!(snap.stale, Stale::No, "a live fetch is not a memory");
@@ -687,13 +698,16 @@ mod tests {
             install: None,
         };
         let shared = LibraryShared::default();
-        shared.set_games(vec![
-            g("Celeste", false),
-            g("Big Picture", true),
-            g("Portal 2", false),
-            g("Heroic", true),
-            g("Tunic", false),
-        ]);
+        shared.set_games(
+            &shared.req(),
+            vec![
+                g("Celeste", false),
+                g("Big Picture", true),
+                g("Portal 2", false),
+                g("Heroic", true),
+                g("Tunic", false),
+            ],
+        );
         let up = running(&["steam:Portal 2", "steam:Heroic"], "running");
         shared.set_running(&up);
         let snap = shared.snapshot();
@@ -747,21 +761,24 @@ mod tests {
     #[test]
     fn status_reads_keep_state_and_count_even_when_nothing_changed() {
         let shared = LibraryShared::default();
-        shared.set_games(vec![LibraryGame {
-            id: "steam:Celeste".into(),
-            title: "Celeste".into(),
-            store: "steam".into(),
-            launcher: false,
-            icon: String::new(),
-            platform: None,
-            developer: None,
-            year: None,
-            genres: Vec::new(),
-            stats: None,
-            running: false,
-            endable: false,
-            install: None,
-        }]);
+        shared.set_games(
+            &shared.req(),
+            vec![LibraryGame {
+                id: "steam:Celeste".into(),
+                title: "Celeste".into(),
+                store: "steam".into(),
+                launcher: false,
+                icon: String::new(),
+                platform: None,
+                developer: None,
+                year: None,
+                genres: Vec::new(),
+                stats: None,
+                running: false,
+                endable: false,
+                install: None,
+            }],
+        );
         assert_eq!(shared.status_gen(), 0);
         shared.set_running(&running(&["steam:Celeste"], "launching"));
         assert_eq!(shared.status_gen(), 1);
@@ -810,7 +827,7 @@ mod tests {
             install: None,
         };
         let shared = LibraryShared::default();
-        shared.set_games_cached(vec![g("Celeste"), g("Tunic")]);
+        shared.set_games_cached(&shared.req(), vec![g("Celeste"), g("Tunic")]);
         let cached = shared.snapshot();
         assert!(matches!(cached.phase, LibraryPhase::Ready));
         assert_eq!(
@@ -824,7 +841,7 @@ mod tests {
         // The retry window closed with no answer: same titles, different words.
         shared.set_stale(Stale::Offline);
         assert_eq!(shared.snapshot().stale, Stale::Offline);
-        shared.set_games(vec![g("Celeste"), g("Tunic"), g("Hades")]);
+        shared.set_games(&shared.req(), vec![g("Celeste"), g("Tunic"), g("Hades")]);
         let live = shared.snapshot();
         assert_eq!(
             live.stale,
@@ -843,6 +860,7 @@ mod tests {
     fn set_games_leaves_a_launcher_less_library_alone() {
         let shared = LibraryShared::default();
         shared.set_games(
+            &shared.req(),
             ["Celeste", "Portal 2", "Tunic"]
                 .iter()
                 .map(|t| LibraryGame {
@@ -900,7 +918,7 @@ mod tests {
             r#"{{"downloads":[{{"app_id":"custom:a","state":"downloading","done_bytes":1}}],
                 "grants":{GRANT_ALL}}}"#
         ));
-        shared.set_games(games);
+        shared.set_games(&shared.req(), games);
         let files = quail().unwrap().install.unwrap();
         assert_eq!(files.download.unwrap().state, "downloading");
         assert_eq!(files.action, Some(InstallAction::Pause));
@@ -918,7 +936,7 @@ mod tests {
     #[test]
     fn the_desktop_tile_leads_every_shelf_including_an_empty_one() {
         let shared = LibraryShared::default();
-        shared.set_games(Vec::new());
+        shared.set_games(&shared.req(), Vec::new());
         let snap = shared.snapshot();
         assert!(matches!(snap.phase, LibraryPhase::Empty));
         assert_eq!(snap.games.len(), 1);
@@ -926,21 +944,24 @@ mod tests {
         assert!(snap.games[0].leads());
 
         // A running title re-orders the games; the tile is not one of them.
-        shared.set_games(vec![LibraryGame {
-            id: "steam:Celeste".into(),
-            title: "Celeste".into(),
-            store: "steam".into(),
-            launcher: false,
-            icon: String::new(),
-            platform: None,
-            developer: None,
-            year: None,
-            genres: Vec::new(),
-            stats: None,
-            running: true,
-            endable: false,
-            install: None,
-        }]);
+        shared.set_games(
+            &shared.req(),
+            vec![LibraryGame {
+                id: "steam:Celeste".into(),
+                title: "Celeste".into(),
+                store: "steam".into(),
+                launcher: false,
+                icon: String::new(),
+                platform: None,
+                developer: None,
+                year: None,
+                genres: Vec::new(),
+                stats: None,
+                running: true,
+                endable: false,
+                install: None,
+            }],
+        );
         assert_eq!(shared.snapshot().games[0].id, DESKTOP_ID);
     }
 
@@ -959,6 +980,7 @@ mod tests {
 
         let shared = LibraryShared::default();
         shared.set_games(
+            &shared.req(),
             ["Celeste", "Tunic"]
                 .iter()
                 .map(|t| LibraryGame {

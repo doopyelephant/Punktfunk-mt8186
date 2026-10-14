@@ -166,10 +166,7 @@ fn run_verb(verb: Verb, h: &HostRow, ctx: &mut Ctx, fx: &mut Outbox) {
             }
         }
         Verb::Wake => {
-            fx.cmds.push(ConsoleCmd::Wake {
-                key: h.key.clone(),
-                then_connect: false,
-            });
+            fx.cmds.push(ConsoleCmd::wake(&h.key, false));
             fx.toast = Some(format!("Waking {}\u{2026}", h.name));
         }
         Verb::Details => fx.push(Screen::CardMenu(CardMenu::host_details(h))),
@@ -227,17 +224,18 @@ impl HomeScreen {
     }
 
     /// The host whose games the row wants now: the focused one once the carousel rests
-    /// on it, when paired, saved and online, and when `library_fp` (whose list the shared
-    /// library holds) is not already its. A sleeping host is left alone: a fetch wakes it.
+    /// on it, when paired, saved and online, and when `library_host` (the host of the fetch
+    /// the shared list answers) is not already its. A sleeping host is left alone: a fetch
+    /// wakes it.
     pub(crate) fn wants_shelf<'h>(
         &self,
         hosts: &'h [HostRow],
-        library_fp: Option<&str>,
+        library_host: &str,
     ) -> Option<&'h HostRow> {
         let h = self.focused(hosts)?;
         let settled = (self.anim.pos - f64::from(self.cursor)).abs() < 0.05;
-        let current = self.shelf.as_ref().is_some_and(|s| s.shelf_of(h))
-            && library_fp == Some(h.fp_hex.as_str());
+        let current =
+            self.shelf.as_ref().is_some_and(|s| s.shelf_of(h)) && library_host == h.fp_hex;
         (settled && h.paired && h.saved && h.online && !current).then_some(h)
     }
 
@@ -469,10 +467,7 @@ impl ScreenView for HomeScreen {
                     )),
                     Slot::Host(h) if !h.online && h.can_wake => {
                         // Wake first; the overlay connects once the host answers.
-                        fx.cmds.push(ConsoleCmd::Wake {
-                            key: h.key.clone(),
-                            then_connect: true,
-                        });
+                        fx.cmds.push(ConsoleCmd::wake(&h.key, true));
                     }
                     Slot::Host(h) => {
                         // Dial even when the pips say offline: a routed or VPN host
@@ -1407,25 +1402,22 @@ mod tests {
         let mut s = HomeScreen::new();
         s.reconcile(&hosts);
         assert_eq!(
-            s.wants_shelf(&hosts, None).map(|h| h.key.as_str()),
+            s.wants_shelf(&hosts, "").map(|h| h.key.as_str()),
             Some("desk")
         );
         s.set_shelf(LibraryScreen::embedded(&desk));
-        assert!(s.wants_shelf(&hosts, Some("d1")).is_none(), "asked once");
+        assert!(s.wants_shelf(&hosts, "d1").is_none(), "asked once");
         assert!(
-            s.wants_shelf(&hosts, Some("other")).is_some(),
+            s.wants_shelf(&hosts, "other").is_some(),
             "the list became another host's"
         );
         s.cursor = 1;
         assert!(
-            s.wants_shelf(&hosts, None).is_none(),
+            s.wants_shelf(&hosts, "").is_none(),
             "the carousel is still moving"
         );
         s.anim = Spring::rest(1.0);
-        assert!(
-            s.wants_shelf(&hosts, None).is_none(),
-            "a fetch would wake it"
-        );
+        assert!(s.wants_shelf(&hosts, "").is_none(), "a fetch would wake it");
     }
 
     /// A pin's Confirm connects with that preset (one-off); the overlay title

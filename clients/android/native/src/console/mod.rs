@@ -19,10 +19,11 @@ use jni::EnvUnowned;
 
 use crate::session::{jni_guard, HandleTable};
 use pf_client_core::menu_nav::MenuSample;
-use pf_console_ui::bridge::{self, CreateOptions, EntryJson, MenuCode, PadsJson, PresetJson};
+use pf_console_ui::bridge::{
+    self, CreateOptions, EntryJson, GamesPush, MenuCode, PadsJson, PhasePush, PresetJson,
+};
 use pf_console_ui::{
-    HostRow, Insets, LibraryGame, LibraryPhase, PairPhase, Platform, ProfilesAnswer, SpeedPhase,
-    Stale, WakeStatus,
+    HostRow, Insets, PairStatus, Platform, ProfilesAnswer, SpeedPhase, Stale, WakeStatus,
 };
 use std::time::Duration;
 
@@ -422,16 +423,16 @@ json_pusher!(
 );
 
 json_pusher!(
-/// `NativeBridge.nativeConsoleSetPair(handle, json)` — the pairing ceremony's phase
-/// (`"Idle"`, `"Busy"`, `{"Failed": "why"}`, `{"Paired": {"key": "…"}}`).
+/// `NativeBridge.nativeConsoleSetPair(handle, json)` — the pairing ceremony's phase and the
+/// command's `req` (`{"req": …, "phase": "Busy" | {"Failed": "why"} | {"Paired": {"key": "…"}}}`).
     Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetPair,
-    PairPhase,
+    PairStatus,
     |h, p| h.handles.console.set_pair(p)
 );
 
 json_pusher!(
-/// `NativeBridge.nativeConsoleSetWake(handle, json)` — the wake-and-wait card's status
-/// (`WakeStatus` JSON, or `null` to clear).
+/// `NativeBridge.nativeConsoleSetWake(handle, json)` — the wake card's status under the
+/// `Wake`'s `req` (`WakeStatus` JSON), or `null` when the wake ended.
     Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleSetWake,
     Option<WakeStatus>,
     |h, w| h.handles.console.set_wake(w)
@@ -502,9 +503,8 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleNoti
     .resolve::<LogErrorAndDefault>()
 }
 
-/// `NativeBridge.nativeConsoleLibraryBegin(handle)` — a fetch is starting for the shelf on
-/// screen: bumps the fetch epoch and sets `Loading`. Call this — not a bare `Loading` phase —
-/// so the shelf can tell its own result from a previous host's cached one.
+/// `NativeBridge.nativeConsoleLibraryBegin(handle)` — a fetch is starting: `Loading`, and the
+/// posters a superseded fetch left go.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibraryBegin(
     _env: EnvUnowned,
@@ -535,15 +535,16 @@ json_pusher!(
 );
 
 json_pusher!(
-/// `NativeBridge.nativeConsoleLibraryPhase(handle, json)` — `"Loading"`, `"Empty"`, `"Ready"`,
-/// or `{"Error": {"title", "body", "can_retry"}}`.
+/// `NativeBridge.nativeConsoleLibraryPhase(handle, json)` — `{"req": …, "phase": "Loading" |
+/// "Empty" | "Ready" | {"Error": {"title", "body", "can_retry"}}}`, `req` the `FetchLibrary`'s.
     Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibraryPhase,
-    LibraryPhase,
-    |h, p| h.handles.library.set_phase(p)
+    PhasePush,
+    |h, p| h.handles.library.set_phase(&p.req, p.phase)
 );
 
-/// `NativeBridge.nativeConsoleLibraryGames(handle, json, cached)` — the catalog (`[LibraryGame]`);
-/// `cached` = this is the last-known list from the cache, shown while the fetch runs.
+/// `NativeBridge.nativeConsoleLibraryGames(handle, json, cached)` — the catalog as
+/// `{"req": …, "games": [LibraryGame]}`, `req` the `FetchLibrary`'s; `cached` = this is the
+/// last-known list from the cache, shown while the fetch runs.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibraryGames(
     mut env: EnvUnowned,
@@ -553,14 +554,11 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeConsoleLibr
     cached: jboolean,
 ) {
     env.with_env(|env| -> jni::errors::Result<()> {
-        if let (Some(h), Some(games)) = (
-            CONSOLES.get(handle),
-            json_arg::<Vec<LibraryGame>>(env, &json),
-        ) {
+        if let (Some(h), Some(p)) = (CONSOLES.get(handle), json_arg::<GamesPush>(env, &json)) {
             if cached {
-                h.handles.library.set_games_cached(games);
+                h.handles.library.set_games_cached(&p.req, p.games);
             } else {
-                h.handles.library.set_games(games);
+                h.handles.library.set_games(&p.req, p.games);
             }
         }
         Ok(())

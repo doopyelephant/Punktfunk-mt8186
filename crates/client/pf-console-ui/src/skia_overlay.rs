@@ -495,7 +495,7 @@ impl Overlay for SkiaOverlay {
         self.ring.tick();
         // Host actions ride the console command bus (same as the power rows).
         for cmd in self.ring.take_cmds() {
-            if let Some(shell) = &self.shell {
+            if let Some(shell) = &mut self.shell {
                 shell.send_cmd(cmd);
             }
         }

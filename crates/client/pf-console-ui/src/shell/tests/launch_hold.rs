@@ -68,10 +68,13 @@ fn on_shelf() -> (Shell, LibraryShared, ConsoleBus) {
     )
     .unwrap();
     s.fake_clock = Some((100.0, 0.0));
-    library.set_games(vec![
-        game("steam:570", "Dota 2", false),
-        game("steam:ui", "Big Picture", true),
-    ]);
+    library.set_games(
+        &library.req(),
+        vec![
+            game("steam:570", "Dota 2", false),
+            game("steam:ui", "Big Picture", true),
+        ],
+    );
     (s, library, bus)
 }
 

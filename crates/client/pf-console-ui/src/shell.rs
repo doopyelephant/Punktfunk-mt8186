@@ -11,7 +11,8 @@ use crate::anim::{springs, Spring};
 use crate::glyphs::GlyphStyle;
 use crate::library::LibraryShared;
 use crate::model::{
-    ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, SpeedPhase, SpeedStatus, WakeStatus,
+    ConsoleBus, ConsoleCmd, ConsoleShared, HostRow, PairPhase, PairStatus, SpeedPhase, SpeedStatus,
+    WakeStatus,
 };
 use crate::platform::Platform;
 #[cfg(test)]
@@ -293,11 +294,6 @@ pub(crate) struct Shell {
     parked: [Option<Screen>; TABS.len()],
     /// The host key the Games root was built for.
     games_key: Option<String>,
-    /// Whose list the shared library holds: the host of the last `FetchLibrary` sent.
-    library_fp: Option<String>,
-    /// The host the last `Pair` went to. The one pairing phase is its, so another host's
-    /// Pair screen on top neither shows it nor closes on it.
-    pairing: Option<(String, u16)>,
     /// Focus is on the tab strip, not the screen.
     strip_focus: bool,
     /// The shell moved focus to the strip because the root had nothing to focus. It goes
@@ -345,14 +341,12 @@ pub(crate) struct Shell {
     /// Host title of the last connect. [`Self::session_reconnecting`] has no
     /// `Launch` of its own, so nothing else can name the host.
     last_connect_title: Option<String>,
+    /// The wake card, as the shared slot holds it. [`Self::send_cmd`] raises the slot with
+    /// the `Wake`, so input is gated in the same press.
     wake: Option<WakeStatus>,
-    /// `wake` is a local placeholder raised in [`Self::apply`] before the
-    /// first `WakeStatus` (~100 ms–1 s). `sync` must not clear it in that
-    /// window or navigation races the wake ungated.
-    wake_optimistic: bool,
-    /// The speed-test takeover. No optimistic twin: [`Self::apply`] seeds the shared slot
-    /// itself, so the service thread only ever advances the phase and `sync` can mirror
-    /// the slot verbatim — including the `None` a dismiss writes.
+    /// The speed-test takeover, as the shared slot holds it. [`Self::send_cmd`] seeds the slot,
+    /// so the service thread only ever advances the phase and `sync` can mirror the slot
+    /// verbatim — including the `None` a dismiss writes.
     speed: Option<SpeedStatus>,
     /// The speed chart as drawn, chasing `speed` every frame.
     speed_view: overlays::SpeedView,
@@ -428,8 +422,6 @@ impl Shell {
             stack,
             parked: [None, None, None, None],
             games_key: None,
-            library_fp: None,
-            pairing: None,
             strip_focus: false,
             strip_parked: false,
             root_targets: None,
@@ -471,7 +463,6 @@ impl Shell {
             profiles: Default::default(),
             last_connect_title: None,
             wake: None,
-            wake_optimistic: false,
             speed: None,
             speed_view: overlays::SpeedView::default(),
             toast: None,
@@ -772,15 +763,12 @@ impl Shell {
         }
     }
 
+    /// A pairing phase reaches the Pair screen on top only when that screen sent its request.
+    /// A success toasts wherever the player is and closes only the screen that asked.
     fn sync_pair(&mut self) {
-        let pair = self.console.pair();
-        let pairing = self.pairing.clone();
-        let ours = |s: &Screen| match (s, &pairing) {
-            (Screen::Pair(p), Some((addr, port))) => p.target() == (addr.as_str(), *port),
-            _ => false,
-        };
-        let top_is_ours = self.stack.last().is_some_and(ours);
-        match &pair {
+        let PairStatus { req, phase } = self.console.pair();
+        let top_is_ours = matches!(self.stack.last(), Some(Screen::Pair(p)) if p.sent(&req));
+        match &phase {
             PairPhase::Idle => {}
             PairPhase::Paired { key } => {
                 let name = self
@@ -789,8 +777,7 @@ impl Shell {
                     .find(|h| &h.key == key)
                     .map_or_else(|| "the host".to_string(), |h| h.name.clone());
                 self.show_toast_kind(format!("Paired with {name}"), ToastKind::Success);
-                self.console.set_pair(PairPhase::Idle);
-                self.pairing = None;
+                self.console.settle_pair(&req);
                 if top_is_ours {
                     self.apply_nav(Nav::Pop);
                 }
@@ -806,27 +793,16 @@ impl Shell {
                     p.apply_phase(phase);
                 }
                 if matches!(phase, PairPhase::Failed(_)) {
-                    self.console.set_pair(PairPhase::Idle);
-                    self.pairing = None;
+                    self.console.settle_pair(&req);
                 }
             }
         }
     }
 
-    /// Mirrors the service's wake and speed status. A woken host with `then_connect` goes
-    /// straight into its connect, once: the slot is cleared here, not at the service's next
-    /// bus drain.
+    /// Mirrors the wake and speed slots. A woken host with `then_connect` goes straight into
+    /// its connect, once: the slot is cleared here, and a late status for that wake is dropped.
     fn sync_wake(&mut self) {
-        match self.console.wake() {
-            Some(w) => {
-                self.wake_optimistic = false;
-                self.wake = Some(w);
-            }
-            // No service status yet: keep the placeholder. Clearing it here
-            // reopens the ungated window it exists to close.
-            None if !self.wake_optimistic => self.wake = None,
-            None => {}
-        }
+        self.wake = self.console.wake();
         self.speed = self.console.speed();
         if let Some(w) = &self.wake {
             if w.online {
@@ -837,7 +813,7 @@ impl Shell {
                         .map(|h| ConnectIntent::to_host(h, None))
                 });
                 self.bus.send(ConsoleCmd::CancelWake);
-                self.console.set_wake(None);
+                self.console.put_wake(None);
                 self.wake = None;
                 if let Some(Some(intent)) = intent {
                     self.start_connect(intent);
@@ -872,17 +848,12 @@ impl Shell {
         let Some(Screen::Home(home)) = self.stack.last_mut() else {
             return;
         };
-        let Some(host) = home.wants_shelf(&self.hosts, self.library_fp.as_deref()) else {
+        let Some(host) = home.wants_shelf(&self.hosts, &self.library.req().host) else {
             return;
         };
         let host = host.clone();
         home.set_shelf(crate::screens::library::LibraryScreen::embedded(&host));
-        self.note_fetch(&host.fp_hex);
-        self.bus.send(ConsoleCmd::FetchLibrary {
-            addr: host.addr.clone(),
-            mgmt: host.mgmt_port,
-            fp_hex: host.fp_hex.clone(),
-        });
+        self.send_cmd(ConsoleCmd::fetch_library(&host));
         self.ask_profiles(&host);
     }
 
@@ -1010,7 +981,7 @@ impl Shell {
                 };
                 // The shared list is one host's: a root whose host is not the last fetched
                 // would show another host's games.
-                let mine = self.library_fp.as_deref() == Some(host.fp_hex.as_str());
+                let mine = self.library.req().host == host.fp_hex;
                 match parked {
                     Some(root) if mine && self.games_key.as_deref() == Some(host.key.as_str()) => {
                         Some(root)
@@ -1039,7 +1010,7 @@ impl Shell {
         let parked = std::mem::take(&mut self.parked);
         let motion = std::mem::replace(&mut self.motion, Motion::None);
         let strip_focus = std::mem::replace(&mut self.strip_focus, false);
-        let keys = (self.games_key.take(), self.library_fp.take());
+        let games_key = self.games_key.take();
         let bus = std::mem::take(&mut self.bus);
         let library = std::mem::take(&mut self.library);
         let profiles = std::mem::take(&mut self.profiles);
@@ -1050,7 +1021,8 @@ impl Shell {
             self.hosts_gen,
         );
         self.hosts_gen = self.console.hosts_gen();
-        self.library.set_games(stand_in_games());
+        self.library
+            .set_games(&self.library.req(), stand_in_games());
         let poster = stand_in_poster();
         let mut draw = |s: &mut Shell, frames: usize| {
             for _ in 0..frames {
@@ -1070,7 +1042,7 @@ impl Shell {
         (self.tab, self.stack, self.parked, self.motion) = (tab, stack, parked, motion);
         (self.strip_focus, self.bus, self.library) = (strip_focus, bus, library);
         self.profiles = profiles;
-        (self.games_key, self.library_fp) = keys;
+        self.games_key = games_key;
         // The saved generation, so a list published meanwhile is still taken on the next sync.
         (self.hosts, self.hosts_gen) = hosts;
         crate::el::forget_handoff();
@@ -1111,24 +1083,9 @@ impl Shell {
             .cloned()
     }
 
-    /// A library fetch for `fp_hex` is about to go out. Another host's list leaves the model
-    /// now, before a shelf pushed with the fetch syncs it as its own. Call it before the send:
-    /// after, it could wipe what the platform's fetch already delivered.
-    pub(crate) fn note_fetch(&mut self, fp_hex: &str) {
-        if self.library_fp.as_deref() != Some(fp_hex) {
-            self.library.begin_host_fetch();
-        }
-        self.library_fp = Some(fp_hex.to_string());
-    }
-
     /// A fresh shelf for `host`, its fetch sent.
     fn shelf_root(&mut self, host: &HostRow) -> Screen {
-        self.note_fetch(&host.fp_hex);
-        self.bus.send(ConsoleCmd::FetchLibrary {
-            addr: host.addr.clone(),
-            mgmt: host.mgmt_port,
-            fp_hex: host.fp_hex.clone(),
-        });
+        self.send_cmd(ConsoleCmd::fetch_library(host));
         self.ask_profiles(host);
         self.games_key = Some(host.key.clone());
         Screen::Library(crate::screens::library::LibraryScreen::new(host))
@@ -1283,15 +1240,13 @@ impl Shell {
             (Takeover::SeatWait, MenuEvent::Back) => self.seat_wait = None,
             (Takeover::Wake, MenuEvent::Back) => {
                 self.bus.send(ConsoleCmd::CancelWake);
+                self.console.put_wake(None);
                 self.wake = None;
-                self.wake_optimistic = false;
             }
             (Takeover::Wake, MenuEvent::Confirm) => {
                 let w = self.wake.as_ref().filter(|w| w.timed_out)?;
-                self.bus.send(ConsoleCmd::Wake {
-                    key: w.key.clone(),
-                    then_connect: w.then_connect,
-                });
+                let again = ConsoleCmd::wake(&w.key, w.then_connect);
+                self.send_cmd(again);
             }
             // Dismissing mid-burst abandons the measurement, not the burst: the host
             // finishes it either way, and `advance_speed` drops the late report.
@@ -1481,8 +1436,40 @@ impl Shell {
         }
     }
 
-    /// Push a command with no screen: in-stream ring host actions, a re-rooted shelf's fetch.
-    pub(crate) fn send_cmd(&self, cmd: ConsoleCmd) {
+    /// Send `cmd`, first opening the slot its answer lands in: an answer can come back before
+    /// the next line runs. A `FetchLibrary`, `Wake` or `SpeedTest` must come through here.
+    pub(crate) fn send_cmd(&mut self, cmd: ConsoleCmd) {
+        match &cmd {
+            ConsoleCmd::FetchLibrary { req, .. } => self.library.begin(req),
+            // The card is up in the same press: the first status is ~100 ms–1 s away, and
+            // the input it gates would otherwise run on.
+            ConsoleCmd::Wake {
+                key,
+                then_connect,
+                req,
+            } => {
+                let row = self.hosts.iter().find(|h| &h.key == key);
+                self.console.put_wake(Some(WakeStatus {
+                    req: req.clone(),
+                    key: key.clone(),
+                    name: row.map(|h| h.name.clone()).unwrap_or_default(),
+                    seconds: 0,
+                    timed_out: false,
+                    online: false,
+                    then_connect: *then_connect,
+                }));
+                self.wake = self.console.wake();
+            }
+            // The takeover must be up before the connect blocks, and seeding it on the side
+            // that clears it is what makes a dismissed test's late report a no-op
+            // (`ConsoleShared::advance_speed`).
+            ConsoleCmd::SpeedTest { key, host_name, .. } => {
+                let status = SpeedStatus::new(key.clone(), host_name.clone());
+                self.console.set_speed(Some(status));
+                self.speed = self.console.speed();
+            }
+            _ => {}
+        }
         self.bus.send(cmd);
     }
 
@@ -1539,47 +1526,11 @@ impl Shell {
 
     fn apply(&mut self, fx: Outbox) {
         for cmd in fx.cmds {
-            if let ConsoleCmd::FetchLibrary { fp_hex, .. } = &cmd {
-                self.note_fetch(fp_hex);
-            }
-            if let ConsoleCmd::Pair { addr, port, .. }
-            | ConsoleCmd::RequestAccess { addr, port, .. } = &cmd
-            {
-                self.pairing = Some((addr.clone(), *port));
-            }
             if let ConsoleCmd::FetchProfiles { fp_hex, .. } = &cmd {
                 self.console.take_profiles(fp_hex);
                 self.profiles.ask(fp_hex);
             }
-            // Gate wake in this call, like `connecting`. First WakeStatus is
-            // ~100 ms–1 s away; without a placeholder the cursor keeps moving
-            // and a fast wake never shows "Waking…". `sync` supersedes it.
-            if let ConsoleCmd::Wake { key, then_connect } = &cmd {
-                let name = self
-                    .hosts
-                    .iter()
-                    .find(|h| &h.key == key)
-                    .map(|h| h.name.clone())
-                    .unwrap_or_default();
-                self.wake = Some(WakeStatus {
-                    key: key.clone(),
-                    name,
-                    seconds: 0,
-                    timed_out: false,
-                    online: false,
-                    then_connect: *then_connect,
-                });
-                self.wake_optimistic = true;
-            }
-            // The shell seeds the slot, not the service thread: the takeover must be up
-            // before the connect blocks, and seeding it on the side that clears it is what
-            // makes a dismissed test's late report a no-op (`ConsoleShared::advance_speed`).
-            if let ConsoleCmd::SpeedTest { key, host_name, .. } = &cmd {
-                let status = SpeedStatus::new(key.clone(), host_name.clone());
-                self.console.set_speed(Some(status));
-                self.speed = self.console.speed();
-            }
-            self.bus.send(cmd);
+            self.send_cmd(cmd);
         }
         if let Some(text) = fx.toast {
             self.show_toast(text);

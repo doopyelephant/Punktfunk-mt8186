@@ -158,6 +158,7 @@ fn dump_console_screens() {
     dump(&mut s, 40, 8, "06-pair", true);
 
     library.set_games(
+        &library.req(),
         [
             "Hades II",
             "Elden Ring",
@@ -298,7 +299,7 @@ fn dump_console_screens() {
             .collect();
         list[2].stats = played(2 * 3_600_000);
         list[3].stats = played(3 * 86_400_000);
-        games_lib.set_games(list);
+        games_lib.set_games(&games_lib.req(), list);
         let console6 = ConsoleShared::default();
         console6.set_hosts(hosts());
         let mut s6 = Shell::new(
@@ -351,6 +352,7 @@ fn dump_console_screens() {
     }
 
     console.set_wake(Some(WakeStatus {
+        req: Default::default(),
         key: "bb22".into(),
         name: "Office Tower".into(),
         seconds: 12,
@@ -360,6 +362,7 @@ fn dump_console_screens() {
     }));
     dump(&mut s, 10, 8, "08-waking", true);
     console.set_wake(Some(WakeStatus {
+        req: Default::default(),
         key: "bb22".into(),
         name: "Office Tower".into(),
         seconds: 90,
@@ -599,7 +602,7 @@ fn collections_shell_inner(
             library.push_art(g.id.clone(), poster_png(i));
         }
     }
-    library.set_games(games);
+    library.set_games(&library.req(), games);
     let console = ConsoleShared::default();
     console.set_hosts(hosts());
     let sh = Shell::new(
@@ -680,7 +683,7 @@ fn store_shots() {
         for (i, (title, ..)) in STORE_TITLES.iter().enumerate() {
             library.push_art(format!("steam:{i}"), store_poster(i, title, &fonts));
         }
-        library.set_games(store_games());
+        library.set_games(&library.req(), store_games());
         library
     };
 

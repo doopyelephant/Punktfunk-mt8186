@@ -851,7 +851,8 @@ object SkiaConsole {
      * holds one of each; a name missing here must be in [ignoredCommands].
      */
     internal val commands: Map<String, (JSONObject) -> Unit> = mapOf(
-        "CancelWake" to { _ -> wakeGen.incrementAndGet(); NativeBridge.nativeConsoleSetWake(handle, "null") },
+        // The console closed the card itself; a `null` here could close the next wake's.
+        "CancelWake" to { _ -> wakeGen.incrementAndGet() },
         "Probe" to { _ -> resumeDiscovery(); pushHosts() },
         "LoadLicenses" to { _ -> loadLicenses() },
         "FetchLibrary" to { c -> fetchLibrary(c, refreshOnly = false) },
@@ -1095,7 +1096,8 @@ object SkiaConsole {
 
     /**
      * One pairing off the main thread ([ask] returns the host fingerprint, or `""`), reported Busy,
-     * then Paired or Failed. A later pairing makes this one's answer stale.
+     * then Paired or Failed, under the command's `req`. A later pairing makes this one's answer
+     * stale.
      */
     private fun runPairing(
         c: JSONObject,
@@ -1103,13 +1105,14 @@ object SkiaConsole {
         ask: (ClientIdentity, String, Int) -> String,
     ) {
         val addr = c.optString("addr"); val port = c.optInt("port")
+        val req = c.optJSONObject("req") ?: JSONObject()
         val id = identity
         if (id == null) {
-            NativeBridge.nativeConsoleSetPair(handle, ConsoleJson.pairFailed(identities.blockedMessage()))
+            NativeBridge.nativeConsoleSetPair(handle, ConsoleJson.pairFailed(req, identities.blockedMessage()))
             return
         }
         val gen = pairGen.incrementAndGet()
-        NativeBridge.nativeConsoleSetPair(handle, ConsoleJson.pairBusy())
+        NativeBridge.nativeConsoleSetPair(handle, ConsoleJson.pairBusy(req))
         ioPool.execute {
             val fp = runCatching { ask(id, addr, port) }.getOrDefault("")
             val err = if (fp.isEmpty()) NativeBridge.nativeTakeLastError() else ""
@@ -1124,21 +1127,23 @@ object SkiaConsole {
                         ?: addr
                     knownHostStore.trust(addr, port, hostName, fp, paired = true)
                     pushHosts(); pushKnownHosts()
-                    NativeBridge.nativeConsoleSetPair(handle, ConsoleJson.pairPaired(fp))
+                    NativeBridge.nativeConsoleSetPair(handle, ConsoleJson.pairPaired(req, fp))
                 } else {
-                    NativeBridge.nativeConsoleSetPair(handle, ConsoleJson.pairFailed(wording(err)))
+                    NativeBridge.nativeConsoleSetPair(handle, ConsoleJson.pairFailed(req, wording(err)))
                 }
             }
         }
     }
 
     /**
-     * The wake-and-wait loop ([WakeLoop], the desktop's `spawn_wake`); the console reads
-     * `online`/`timed_out` off the status and acts (a `then_connect` wake dials from the shell's
-     * side once online). Online is a probe of the host, at its live advert's address if it has one.
+     * The wake-and-wait loop ([WakeLoop], the desktop's `spawn_wake`), each status under the
+     * command's `req`; the console reads `online`/`timed_out` off it and acts (a `then_connect`
+     * wake dials from the shell's side once online). Online is a probe of the host, at its live
+     * advert's address if it has one.
      */
     private fun wake(c: JSONObject) {
         val key = c.optString("key"); val thenConnect = c.optBoolean("then_connect")
+        val req = c.optJSONObject("req") ?: JSONObject()
         val kh = hostForKey(key) ?: return
         if (kh.mac.isEmpty()) return
         val gen = wakeGen.incrementAndGet()
@@ -1155,7 +1160,7 @@ object SkiaConsole {
             ) { seconds, timedOut, online ->
                 NativeBridge.nativeConsoleSetWake(
                     handle,
-                    ConsoleJson.wakeStatus(key, name, seconds, timedOut, online, thenConnect),
+                    ConsoleJson.wakeStatus(req, key, name, seconds, timedOut, online, thenConnect),
                 )
             }
         }
