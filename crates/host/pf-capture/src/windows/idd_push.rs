@@ -9,9 +9,10 @@
 //! live in [`pf_driver_proto`] — both sides `use` it, so drift is a compile error.
 
 use super::dxgi::WinCaptureTarget;
-use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
+use super::{CapturedFrame, Capturer, PixelFormat};
 use crate::cursor_state::CursorModel;
 use crate::cursor_witness::CursorWitness;
+use crate::pixelless::DeliveryGate;
 use anyhow::{bail, Context, Result};
 use pf_paths_win::SecurityAttributes;
 use pf_win_display::open_wudfhost;
@@ -243,12 +244,9 @@ pub struct IddPushCapturer {
     ccd: pf_win_display::win_display::CcdTargetKey,
     /// Monotonic count of NEW source images the driver reported (`FrameOrigin::Source` only).
     source_seq: u64,
-    /// The driver's own source counter at the last delivery — the freshness test.
-    driver_source_seq: u64,
-    /// Geometry and format of the last delivery. A mode or depth change must reach the stream
-    /// loop even over a desktop composing nothing: it rebuilds the encoder off the frame, and
-    /// the in-place resize waits for one at the new size with the encoder untouched.
-    delivered: Option<(u32, u32, PixelFormat)>,
+    /// The freshness test, over the driver's source counter and the delivered size and format.
+    /// The in-place resize waits for a delivery at the new size with the encoder untouched.
+    delivery: DeliveryGate<(u32, u32, PixelFormat)>,
     /// Health classifier + staged-recovery ladder over this capturer's clocks (WP12/WP13).
     recovery: recovery::Supervisor,
     /// A closed episode's measured outage, until the stream loop takes it (WP14).

@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::cursor_state::Event;
+use crate::pixelless;
 
 impl IddPushCapturer {
     /// QPC ticks per second, read once. `0` when the call failed; every span then reads 0.
@@ -90,21 +91,11 @@ impl IddPushCapturer {
         if let Some(age) = self.heartbeat_age() {
             self.max_hb_age_us = self.max_hb_age_us.max(age.as_micros() as u64);
         }
-        // The driver's pool counter is the only source clock this side has. Before the
-        // encoder opens there is no counter at all, and the loop needs one frame to open it.
-        let opened = self.encoder.is_some();
-        let driver_seq = self.encoder.map_or(0, |t| t.source_seq);
         let geometry = (self.width, self.height, self.out_format());
-        // A re-opened encoder's fresh section reads 0 until the pool takes a frame: no news,
-        // not a delivery.
-        if opened
-            && (driver_seq == 0 || driver_seq == self.driver_source_seq)
-            && self.delivered == Some(geometry)
-        {
+        let driver_seq = self.encoder.map(|t| t.source_seq);
+        if !self.delivery.admit(driver_seq, geometry) {
             return Ok(None);
         }
-        self.driver_source_seq = driver_seq;
-        self.delivered = Some(geometry);
         let now = Instant::now();
         // The newest access unit's OS present stamp against the moment the host took it: the
         // ground-truth clock that tells "DWM stopped presenting" from "we were late".
@@ -191,19 +182,13 @@ impl IddPushCapturer {
         // Pending sample is the ending frame's move — discarded, never folded.
         self.cursor.fresh_frame();
         self.source_seq += 1;
-        Ok(Some(CapturedFrame {
-            // The driver stamps each access unit with the frame's own present QPC; this side
-            // reports the sequence only.
-            provenance: pf_frame::Provenance::source(self.source_seq, 0),
-            width: self.width,
-            height: self.height,
-            pts_ns: now_ns(),
-            format: geometry.2,
-            // No pixels cross the boundary: the loop sees `Encoder::ready_aus` answer `Some`
-            // and owes wire indexes instead of submitting this frame.
-            payload: FramePayload::Cpu(Vec::new()),
-            cursor: None,
-        }))
+        let (width, height, format) = geometry;
+        Ok(Some(pixelless::frame(
+            self.source_seq,
+            width,
+            height,
+            format,
+        )))
     }
 }
 

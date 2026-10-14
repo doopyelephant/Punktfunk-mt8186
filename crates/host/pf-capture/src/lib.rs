@@ -658,6 +658,9 @@ mod cursor_witness;
 // so its table of past cursor defects runs on every target.
 #[path = "windows/cursor_state.rs"]
 mod cursor_state;
+// The delivery gate and the frame shape of the two capturers that hand over no pixels. Pure.
+#[path = "windows/pixelless.rs"]
+mod pixelless;
 // The IDD-push stall model: holes in DWM delivery and their verdicts. Pure over `Instant`s,
 // so its tests run on every target; `idd_push/stall.rs` writes the report.
 #[path = "windows/stall_model.rs"]
