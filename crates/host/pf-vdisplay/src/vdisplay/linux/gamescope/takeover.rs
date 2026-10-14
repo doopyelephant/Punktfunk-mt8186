@@ -22,6 +22,9 @@ pub(super) struct Takeover {
     hand_back: HandBack,
     /// A managed launch runs. Another waits on [`WAKE`]; nothing on the hand-back path does.
     launching: bool,
+    /// The latest launch took the box and produced no session ([`launch_tracked`]), so the
+    /// hand-back does not wait on keep-alive forever ([`hand_back_delay`]).
+    launch_failed: bool,
     /// The managed `exclusive` darken. A bool, not a count: the session outlives connects.
     darkened: bool,
     /// Bumped by every hand-back, so a launch that began before one can tell.
@@ -66,6 +69,7 @@ impl Takeover {
         managed: None,
         hand_back: HandBack::Idle,
         launching: false,
+        launch_failed: false,
         darkened: false,
         generation: 0,
         autologin_masked: false,
@@ -1263,13 +1267,21 @@ fn restore_delay() -> Option<Duration> {
     }
 }
 
-/// Debounced restore so a reconnect reuses the warm session. `keep_alive=forever` schedules none.
+/// The hand-back's delay: the keep-alive's, `None` (forever) keeping the box. Forever keeps a
+/// session, not a box a failed launch left dark: that one hands back after the debounce.
+fn hand_back_delay(keep_alive: Option<Duration>, launch_failed: bool) -> Option<Duration> {
+    keep_alive.or(launch_failed.then_some(RESTORE_DEBOUNCE))
+}
+
+/// Debounced restore so a reconnect reuses the warm session. `keep_alive=forever` schedules none
+/// unless the latest launch produced no session ([`hand_back_delay`]).
 pub fn schedule_restore_tv_session() {
-    let delay = restore_delay();
+    let keep_alive = restore_delay();
     let mut t = takeover();
     if !t.live() {
         return; // nothing was taken over → nothing to restore (also the non-managed path)
     }
+    let delay = hand_back_delay(keep_alive, t.launch_failed);
     t.hand_back.schedule(delay.map(|d| Instant::now() + d));
     match delay {
         None => tracing::info!(
@@ -1278,9 +1290,31 @@ pub fn schedule_restore_tv_session() {
         ),
         Some(delay) => tracing::info!(
             secs = delay.as_secs(),
+            launch_failed = t.launch_failed,
             "gamescope: scheduled TV-session restore (keep-alive policy; cancelled on reconnect)"
         ),
     }
+}
+
+/// A launch that took the box failed: hand it back on the keep-alive, or after the debounce
+/// under forever.
+pub(super) fn hand_back_after_failed_launch() {
+    takeover().launch_failed = true;
+    schedule_restore_tv_session();
+}
+
+/// Run one create and record what it left. A session clears [`Takeover::launch_failed`]; a
+/// failure that took a box no takeover held sets it. A refused join takes nothing.
+pub(super) fn launch_tracked<T>(create: impl FnOnce() -> Result<T>) -> Result<T> {
+    let fresh = !takeover_live();
+    let out = create();
+    let mut t = takeover();
+    if out.is_ok() {
+        t.launch_failed = false;
+    } else if fresh && t.live() {
+        t.launch_failed = true;
+    }
+    out
 }
 
 /// A takeover the host still holds, as the console lists it.
@@ -1882,6 +1916,56 @@ mod tests {
         );
         assert_eq!(Running { then: None }.due_in(now), None);
         assert_eq!(Idle.due_in(now), None);
+    }
+
+    /// Keep-alive decides the hand-back, except that forever keeps a session and not a box a
+    /// failed launch left dark.
+    #[test]
+    fn forever_keeps_a_session_not_a_failed_launch() {
+        let linger = Some(Duration::from_secs(600));
+        assert_eq!(hand_back_delay(None, false), None);
+        assert_eq!(hand_back_delay(None, true), Some(RESTORE_DEBOUNCE));
+        assert_eq!(hand_back_delay(linger, false), linger);
+        assert_eq!(hand_back_delay(linger, true), linger);
+        assert_eq!(
+            hand_back_delay(Some(Duration::ZERO), true),
+            Some(Duration::ZERO)
+        );
+    }
+
+    /// Under keep-alive forever a launch that took the box and produced no session hands it
+    /// back after the debounce; a session keeps it, and a refused join changes nothing. Runs in
+    /// a child: the takeover, the journal and the console's policy are process globals.
+    #[test]
+    fn forever_hands_back_a_box_a_failed_launch_left_dark() {
+        let name = "forever_hands_back_a_box_a_failed_launch_left_dark";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            let forever = r#"{ "keep_alive": { "mode": "forever" } }"#;
+            let policy = pf_paths::config_dir().join("display-settings.json");
+            std::fs::write(policy, forever).expect("write the policy");
+            let due = || takeover().hand_back.due_in(Instant::now());
+            let launch = |ok: bool| {
+                launch_tracked(|| {
+                    takeover().owe_units(vec![UNIT.into()]);
+                    ok.then_some(()).ok_or_else(|| anyhow!("no node"))
+                })
+            };
+            // The launch frees the box and fails; the session's last hold then schedules.
+            assert!(launch(false).is_err());
+            schedule_restore_tv_session();
+            assert!(due().is_some_and(|d| d <= RESTORE_DEBOUNCE), "{:?}", due());
+            // The client returns and its launch streams: forever keeps the box.
+            cancel_pending_restore();
+            assert!(launch(true).is_ok());
+            schedule_restore_tv_session();
+            assert_eq!(due(), None);
+            assert!(launch_tracked(|| Err::<(), _>(anyhow!("join refused"))).is_err());
+            schedule_restore_tv_session();
+            assert_eq!(due(), None, "a refused join took nothing");
+            // A managed relaunch on the taken box fails.
+            hand_back_after_failed_launch();
+            assert!(due().is_some_and(|d| d <= RESTORE_DEBOUNCE), "{:?}", due());
+        });
     }
 
     /// What each state of the table gets back from the session-plus hand-back. SteamOS has its
