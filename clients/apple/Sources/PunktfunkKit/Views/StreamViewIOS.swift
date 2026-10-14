@@ -161,25 +161,13 @@ public final class StreamViewController: StreamViewControllerBase {
     private var screenModeWork: DispatchWorkItem?
     #endif
     private var onExternal = false
-    // `prefersPointerLocked` mirrors `wantsPointerLock`; SpringBoard grants or drops on its own
-    // terms. `requestPointerLock` re-asks only on an event that can change its answer: a drop
-    // while wanted, a click while unlocked, the scene going active, the window filling the screen
-    // again. Each is one false→true edge — re-asserting a value it already holds is ignored.
-
-    /// True while a re-ask holds `prefersPointerLocked` at false for `pointerLockEdgeHold`.
-    private var pointerLockSuppressed = false
+    /// The re-ask edge and its clocks; `prefersPointerLocked` mirrors `wantsPointerLock` outside
+    /// an edge. SpringBoard grants or drops on its own terms.
+    private var pointerLock = PointerLock()
     /// The quick-action ring is up, so the mouse is UIKit's: a locked pointer cannot click a
     /// button above the video. Only the lock yields. The keyboard stays captured, or ⌃⌥⇧O
     /// could not close the ring.
     private var ringHoldsPointer = false
-    /// Long enough for UIKit to push the false pass to the scene before the true one follows.
-    private static let pointerLockEdgeHold: TimeInterval = 0.05
-    /// When the last drop-triggered re-ask was scheduled. A grant SpringBoard revokes at once
-    /// would otherwise re-ask on every revoke; one a second keeps that bounded.
-    private var pointerLockDropRelockAt: CFTimeInterval = -.infinity
-    /// Whether the window filled its screen at the last layout pass (assumed so until a pass says
-    /// otherwise) — the pass that makes it fill again, a re-maximise, is the one that re-asks.
-    private var windowFilledScreen = true
     #endif
 
     /// Reads whether the scene's pointer is actually locked right now; nil = state
@@ -277,7 +265,9 @@ public final class StreamViewController: StreamViewControllerBase {
             && connection?.canSendPointer == true
     }
 
-    public override var prefersPointerLocked: Bool { wantsPointerLock && !pointerLockSuppressed }
+    public override var prefersPointerLocked: Bool {
+        pointerLock.prefersLocked(wanted: wantsPointerLock)
+    }
     public override var prefersHomeIndicatorAutoHidden: Bool { true }
 
     // NOTE: we deliberately do NOT override `childViewControllerForPointerLock`. The default
@@ -488,11 +478,12 @@ public final class StreamViewController: StreamViewControllerBase {
         streamView.onPointerButton = { [weak self] button, down in
             guard let self else { return }
             // Released → a primary press into the video re-engages capture, like macOS's
-            // `engageCapture(fromClick:)`. It is the local gesture, never forwarded: InputCapture's
-            // latch swallows its release. Only button 1 has that latch; another button would send
-            // a lone release and eat the next click. Captured → the absolute path forwards it.
+            // `engageCapture(fromClick:)`. It is the local gesture, never forwarded.
+            // Captured → the absolute path forwards it.
             if !self.captured {
-                if down, button == 1, self.captureEnabled { self.setCaptured(true, fromClick: true) }
+                if PointerLock.clickEngagesCapture(button: button, down: down), self.captureEnabled {
+                    self.setCaptured(true, fromClick: true)
+                }
                 return
             }
             guard self.inputCapture?.gcMouseForwarding == false else { return }
@@ -500,7 +491,7 @@ public final class StreamViewController: StreamViewControllerBase {
             // Captured but unlocked: the click is the user gesture SpringBoard wants before it
             // hands a declined or dropped lock back. On the UP, so the click has fully forwarded
             // on one transport — a grant mid-click would strand the release on the GCMouse path.
-            if !down { self.requestPointerLock() }
+            if !down { self.stepPointerLock(.reask) }
         }
         // Every scroll, wheel and trackpad, locked or not: UIKit applies Natural Scrolling, which
         // GCMouse's raw wheel does not, so the direction never changes with the lock.
@@ -616,26 +607,20 @@ public final class StreamViewController: StreamViewControllerBase {
             } else {
                 // Captured before the scene was active (a launch straight into a stream): the
                 // first ask found no frontmost scene, so ask again now there is one.
-                self.requestPointerLock()
+                self.stepPointerLock(.reask)
             }
         })
         // The system grants or drops the lock on its own terms (Slide Over, Stage Manager, the
         // window leaving screen size). Re-resolve the routing on every change; a drop while the
-        // lock is still wanted asks once more, a turn later, so a drop that precedes the app's own
-        // resign finds `captured` already cleared and does nothing.
+        // lock is still wanted asks once more (`PointerLock`).
         observers.append(NotificationCenter.default.addObserver(
             forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main
         ) { [weak self] note in
             guard let self else { return }
             self.syncPointerLock()
-            guard (note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene)
-                === self.view.window?.windowScene,
-                self.wantsPointerLock, self.pointerLockEngaged() == false
-            else { return }
-            let now = CACurrentMediaTime()
-            guard now - self.pointerLockDropRelockAt >= 1 else { return }
-            self.pointerLockDropRelockAt = now
-            DispatchQueue.main.async { [weak self] in self?.requestPointerLock() }
+            let scene = note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene
+            self.stepPointerLock(
+                .lockChanged(ours: scene === self.view.window?.windowScene, at: CACurrentMediaTime()))
         })
         // The Stream menu's "Release Mouse" (⌃⌥⇧Q) posts this — the discoverable menu surface for
         // the RELEASED state. While CAPTURED the combo is recognized from the HID stream in
@@ -782,9 +767,7 @@ public final class StreamViewController: StreamViewControllerBase {
         noteScreen()
         #endif
         // The window back at screen size (a windowed scene re-maximised) can hold the lock again.
-        let fills = windowFillsScreen
-        if fills, !windowFilledScreen { requestPointerLock() }
-        windowFilledScreen = fills
+        stepPointerLock(.layout(fills: windowFillsScreen))
         #endif
         #if os(tvOS)
         applyDisplayCriteriaIfNeeded()
@@ -1062,20 +1045,25 @@ public final class StreamViewController: StreamViewControllerBase {
         view.window?.windowScene?.activationState == .foregroundActive && windowFillsScreen
     }
 
-    /// Ask again for a lock SpringBoard declined or dropped, while the scene can hold one: one
-    /// false→true edge, with the chain re-anchored in case a reparent broke the walk to us. A call
-    /// during the edge folds into it. No-op when the lock is held or no longer wanted. Main queue.
-    private func requestPointerLock() {
-        guard wantsPointerLock, pointerLockEngaged() != true, sceneCanHoldPointerLock,
-              !pointerLockSuppressed
-        else { return }
-        pointerLockSuppressed = true
-        updatePointerLockChain()
-        setNeedsUpdateOfPrefersPointerLocked()
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.pointerLockEdgeHold) { [weak self] in
-            guard let self else { return }
-            self.pointerLockSuppressed = false
-            self.setNeedsUpdateOfPrefersPointerLocked()
+    /// Step the lock's state with what the scene says now, and do what it returns. Main queue.
+    private func stepPointerLock(_ event: PointerLock.Event) {
+        let facts = PointerLock.Facts(
+            wanted: wantsPointerLock, granted: pointerLockEngaged(),
+            sceneCanHold: sceneCanHoldPointerLock)
+        switch pointerLock.step(event, facts) {
+        case .none:
+            break
+        case .beginEdge:
+            // Re-anchored in case a reparent broke the walk to us.
+            updatePointerLockChain()
+            setNeedsUpdateOfPrefersPointerLocked()
+            DispatchQueue.main.asyncAfter(deadline: .now() + PointerLock.edgeHold) { [weak self] in
+                self?.stepPointerLock(.edgeEnded)
+            }
+        case .endEdge:
+            setNeedsUpdateOfPrefersPointerLocked()
+        case .reaskNextTurn:
+            DispatchQueue.main.async { [weak self] in self?.stepPointerLock(.reask) }
         }
     }
     #endif

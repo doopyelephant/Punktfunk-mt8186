@@ -179,8 +179,7 @@ extension HostActions {
         // test nor a log inbox.
         let paired = host.pinnedSHA256 != nil
         let measurable = paired && !DemoMode.isDemo(host)
-        let wakeable = pinned == nil && !online && !host.wakeMacs.isEmpty
-            && PunktfunkConnection.wakeOnLANAvailable
+        let wakeable = pinned == nil && !online && WakePolicy.canWake(host.wakeMacs)
         self.init(
             connect: { surface.connect(selection) },
             pair: surface.pair,
@@ -234,7 +233,7 @@ enum HostStatus: Equatable {
             } else {
                 self = .online
             }
-        } else if autoWake, !host.wakeMacs.isEmpty, PunktfunkConnection.wakeOnLANAvailable {
+        } else if WakePolicy.autoWakes(host.wakeMacs, autoWake: autoWake) {
             self = .offlineWakes
         } else {
             self = .offline
@@ -313,7 +312,7 @@ struct HostCardView: View {
     var pinnedPreset: StreamPreset? = nil
     /// What the host has up right now (`NowPlayingStore`), if anything.
     var nowPlaying: String? = nil
-    @AppStorage(DefaultsKey.autoWake) private var autoWake = SettingDefault.autoWake
+    @AutoWake private var autoWake
 
     /// The preset this card announces: a pinned card's own, else the host's binding.
     private var shownPreset: StreamPreset? {

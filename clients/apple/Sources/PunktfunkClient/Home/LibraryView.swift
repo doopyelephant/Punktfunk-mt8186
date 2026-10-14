@@ -101,7 +101,7 @@ struct LibraryView: View {
     /// Collections place).
     @AppStorage(DefaultsKey.librarySort) private var sortRaw = SettingDefault.librarySort
     @AppStorage(DefaultsKey.libraryGroupBy) private var groupByRaw = ""
-    @AppStorage(DefaultsKey.autoWake) private var autoWake = SettingDefault.autoWake
+    @AutoWake private var autoWake
     @Environment(\.dismiss) private var dismiss
     /// Resolves a pinned shelf's preset NAME for the title (the target carries only its id).
     @ObservedObject private var presets = PresetStore.shared
@@ -1041,8 +1041,7 @@ struct LibraryView: View {
             case .failed(let error, _):
                 // Titles on screen outrank the error; the staleness note carries the situation.
                 if games.isEmpty { errorText = LibraryLoad.failure(error) }
-                if case .unreachable = error, !autoWake, !current.wakeMacs.isEmpty,
-                   PunktfunkConnection.wakeOnLANAvailable {
+                if case .unreachable = error, !autoWake, WakePolicy.canWake(current.wakeMacs) {
                     wakeOffered = true
                 }
             case .status(let up, let downloads, let grants):

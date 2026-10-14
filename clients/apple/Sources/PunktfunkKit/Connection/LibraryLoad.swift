@@ -36,22 +36,22 @@ public struct LibraryLoad {
         "Couldn't load the library — \(error.errorDescription ?? "")"
     }
 
-    /// Load `target`'s library, cached under `hostID`. With `autoWake` (the player's setting) on
-    /// and `wakeMacs` known, it wakes the host first and retries an unreachable fetch while it
-    /// boots; otherwise it asks once. Cancelling the consumer cancels the load.
+    /// Load `target`'s library, cached under `hostID`. When `WakePolicy.autoWakes` the host
+    /// (`autoWake` is the player's setting), it wakes the host first and retries an unreachable
+    /// fetch while it boots; otherwise it asks once. Cancelling the consumer cancels the load.
     public static func run(
         target: MgmtTarget, hostID: String, wakeMacs: [String], autoWake: Bool
     ) -> AsyncStream<LibraryLoadEvent> {
         // Sent on every open, not only when the host looks offline: an awake machine ignores a
         // magic packet, and finding out first costs more than sending it.
         let wake: (() -> Void)? =
-            !autoWake || wakeMacs.isEmpty || !PunktfunkConnection.wakeOnLANAvailable
-            ? nil
-            : {
+            WakePolicy.autoWakes(wakeMacs, autoWake: autoWake)
+            ? {
                 DispatchQueue.global(qos: .userInitiated).async { // blocking sends
                     PunktfunkConnection.wakeOnLAN(macs: wakeMacs, lastKnownIP: target.address)
                 }
             }
+            : nil
         let load = LibraryLoad(
             hostID: hostID, cache: LibraryCache.shared, wake: wake,
             fetch: { try await LibraryClient.fetch(target) },

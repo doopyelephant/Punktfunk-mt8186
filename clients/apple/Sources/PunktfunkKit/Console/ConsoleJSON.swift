@@ -109,7 +109,7 @@ public enum ConsoleJSON {
             // sends no mDNS goodbye, so its record lingers long enough to keep the pip green.
             "online": online,
             "mgmt_port": Int(advert?.mgmtPort ?? host.effectiveMgmtPort),
-            "can_wake": !online && !host.wakeMacs.isEmpty,
+            "can_wake": !online && WakePolicy.canWake(host.wakeMacs),
             "clipboard_sync": host.clipboardSync ?? false,
             "last_used": host.lastConnected.map { Int($0.timeIntervalSince1970) } ?? NSNull(),
             "os": advert.map { $0.osChain.isEmpty ? (host.osChain ?? "") : $0.osChain }
