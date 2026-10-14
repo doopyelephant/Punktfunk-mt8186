@@ -251,10 +251,10 @@ pub(super) fn remove_session_plus_dropin() -> bool {
     removed
 }
 
-/// Remove, clear the armed flag, `daemon-reload`: the flag and the template cannot disagree.
+/// Remove, settle the owed step, `daemon-reload`: the takeover and the template cannot disagree.
 pub(super) fn disarm_session_plus_dropin() {
     let removed = remove_session_plus_dropin();
-    takeover().session_dropin_armed = false;
+    takeover().settle(|s| matches!(s, TakeoverStep::RemoveSessionDropin));
     if removed {
         systemctl_user(&["daemon-reload"]);
     }

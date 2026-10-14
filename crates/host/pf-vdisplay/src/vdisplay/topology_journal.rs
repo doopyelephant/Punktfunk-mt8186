@@ -1,6 +1,6 @@
 //! Write-ahead journal of what a backend changes on the desk — the heads an `exclusive`
-//! create disables, the headless output it adds — so the change is taken back in reverse at
-//! teardown, and by the next host when this one dies mid-stream.
+//! create disables, the headless output it adds, the box session a gamescope takeover takes —
+//! so the change is taken back at teardown, and by the next host when this one dies mid-stream.
 //!
 //! One file per host process under `state_dir()/topology-journal/`, named by the owner's pid
 //! and start time, rewritten whole with [`pf_paths::replace_file`] on every push and pop. A
@@ -26,6 +26,28 @@ pub enum Undo {
     /// named it: another instance may have given the name to the box's only screen, so a
     /// backend that cannot match it answers `Ok` and leaves the output alone.
     RemoveOutput { name: String, instance: String },
+    /// Hand back one step a gamescope takeover took of the box's own session. `boot` is the
+    /// boot it was taken in: the session lives in the user manager, so another boot has it back.
+    Takeover { boot: String, step: TakeoverStep },
+}
+
+/// What a gamescope takeover takes of the box's own session, one variant per step.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TakeoverStep {
+    /// The box's autologin Game Mode units, killed and, where a display manager relogins,
+    /// idled behind a drop-in. Undo restarts them.
+    RestartAutologin { units: Vec<String> },
+    /// Our managed `gamescope-session-plus` unit. Undo stops it.
+    StopSession,
+    /// SteamOS's own session, run headless under our drop-in. Undo restarts it without.
+    RestoreSteamos,
+    /// `SCREEN_*` set in the user manager. Undo unsets them.
+    UnsetScreenEnv,
+    /// Our bind drop-in on the box's Game Mode template. Undo removes it.
+    RemoveSessionDropin,
+    /// A display manager an older host stopped; no host stops one today. Undo restarts it.
+    StartDisplayManager { unit: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

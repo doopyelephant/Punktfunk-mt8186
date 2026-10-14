@@ -348,10 +348,10 @@ pub(crate) async fn serve(
     // Debounced TV-session restore on idle, not per-disconnect. Dropping this stops it.
     let _restore_worker = (!door).then(crate::vdisplay::start_restore_worker);
     if !door {
-        // Recover a takeover stranded by a crashed previous instance (`$XDG_RUNTIME_DIR`), and
-        // take back the desk changes it journaled (`$XDG_STATE_HOME`).
-        crate::vdisplay::restore_takeover_on_startup();
+        // Take back the desk changes a crashed previous instance journaled; its gamescope
+        // takeover is adopted, then swept and handed back by the startup restore.
         crate::vdisplay::reclaim_topology_journal();
+        crate::vdisplay::restore_takeover_on_startup();
         // Takeover needs the host user in `punktfunk`. Missing membership degrades to mirroring.
         // No-op off Linux.
         crate::vdisplay::preflight_takeover_privilege();

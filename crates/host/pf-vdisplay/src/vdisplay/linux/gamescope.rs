@@ -11,6 +11,7 @@
 //! Takeover: `design/gamemode-and-dedicated-sessions.md`.
 
 use super::{DisplayOwnership, Mode, VirtualDisplay, VirtualOutput};
+use crate::topology_journal::TakeoverStep;
 use anyhow::{anyhow, bail, Context, Result};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -108,14 +109,6 @@ impl SessionState {
     }
 }
 
-/// Serialises the managed-session launch in [`create_managed_session`] — and nothing else.
-///
-/// LOCK ORDER: `MANAGED_LAUNCH` → [`takeover()`], never the reverse. No restore path may take this
-/// lock: `do_restore_tv_session` needs [`takeover()`] and must not sit behind a ~90 s launch. Two
-/// Managed connects in one launch window both relaunch otherwise, and the second
-/// `stop_session(SESSION_UNIT)` kills the unit the first is still polling.
-static MANAGED_LAUNCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 const SESSION_UNIT: &str = "punktfunk-gamescope";
 const SESSION_PLUS_BIN: &str = "/usr/share/gamescope-session-plus/gamescope-session-plus";
 
@@ -195,6 +188,12 @@ impl VirtualDisplay for GamescopeDisplay {
     fn take_topology_restore(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
         // Every spawn is its own group; cross-session ordering is `panel_dpms`'s refcount, not the group float.
         self.pending_restore.take()
+    }
+
+    /// A dead host's takeover step, from `topology_journal::reclaim`: adopted, not run here.
+    /// Never reached through `apply`: the takeover hands the registry no seqs.
+    fn undo(&mut self, undo: &crate::topology_journal::Undo) -> Result<()> {
+        adopt(undo)
     }
 
     fn poolable_now(&self) -> bool {
@@ -426,18 +425,18 @@ fn create_attach(node: &str, mode: Mode, hdr: bool) -> Result<VirtualOutput> {
 /// Host-managed session at the client's mode, state in [`Takeover::managed`]. Reuse if mode and
 /// node are live; otherwise relaunch — gamescope cannot change output mode live.
 fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<VirtualOutput> {
-    // Not a bare `PENDING_RESTORE` clear: cancel also waits out a restore that already popped
-    // (`keep_alive=off` is 0 s debounce).
+    // Not a bare clear: cancel also waits out a restore that already popped (`keep_alive=off` is
+    // 0 s debounce).
     cancel_pending_restore();
     if steamos_session_present() {
         return create_managed_session_steamos(mode, hdr);
     }
-    // Gated on the idled takeover, not `stopped_dm`: live takeovers leave the DM up, and that field
-    // is what armed this. Skip and capture loss relaunches game mode over the booting desktop.
+    // Gated on the idled takeover, not an adopted DM stop: live takeovers leave the DM up, and the
+    // idle drop-in is what armed this. Skip and capture loss relaunches game mode over the booting
+    // desktop.
     if takeover_idled() && session_select_requested() {
         // Consume an adopted DM stop exactly once; a live takeover has none.
-        let adopted_dm = takeover().stopped_dm.take();
-        honor_session_select_switch(adopted_dm);
+        honor_session_select_switch(take_adopted_dm());
         return Err(anyhow!(
             "the user switched the box to the desktop session — the box's own game mode is handed \
              back; re-detection follows the desktop compositor as it comes up"
@@ -504,10 +503,9 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
     // Desktop Steam also holds the instance; SESSION_UNIT's own Steam is exempt via cgroup.
     free_desktop_steam()?;
     // Decide under the lock, act outside it. Holding the takeover lock across `launch_session`
-    // (~90 s) pins shutdown restore behind `native.rs`'s 20 s grace. [`MANAGED_LAUNCH`] is the
-    // exclusion: held from before the decision so a second connect re-tests after the first
-    // records, and touched by no restore path.
-    let _launching = MANAGED_LAUNCH.lock().unwrap_or_else(|e| e.into_inner());
+    // (~90 s) pins shutdown restore behind `native.rs`'s 20 s grace. [`Launching`] is the
+    // exclusion: taken before the decision so a second connect re-tests after the first records.
+    let _launching = Launching::begin();
     let same_mode = {
         let mut t = takeover();
         let same = t.managed.as_ref().is_some_and(|s| s.matches(mode, hdr));
@@ -534,10 +532,14 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
         tracing::warn!("gamescope session: tracked session has no live node — relaunching");
         takeover().managed = None;
     }
+    takeover().owe_once(TakeoverStep::StopSession);
     // Holding nothing: `launch_session` stops the old unit first, so discovery sees one node.
     let node_id = match launch_session(client, SESSION_UNIT, mode, hdr) {
         Ok(id) => id,
         Err(e) => {
+            if !session_unit_running() {
+                takeover().settle(|s| matches!(s, TakeoverStep::StopSession));
+            }
             // Takeover already happened; arm restore or a failed launch leaves the box sessionless.
             schedule_restore_tv_session();
             return Err(e);
@@ -552,9 +554,6 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
         refresh_hz: mode.refresh_hz,
         hdr,
     });
-    // After the guard dropped: `persist_takeover` samples the same mutex. A session that stole
-    // nothing would otherwise write an empty state and delete the file.
-    persist_takeover();
     tracing::info!(
         node_id,
         w = mode.width,
@@ -684,12 +683,12 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
     }
     refuse_low_disk_restart()?;
     let shim_dir = write_headless_shim()?;
-    // Recorded before the drop-in exists: a crash from here on still owes the box its panel.
-    t.steamos = true;
-    persist_takeover_held(&t);
+    // Owed before the drop-in exists: a crash from here on still owes the box its panel.
+    let owed_here = t.owe_once(TakeoverStep::RestoreSteamos);
     if let Err(e) = write_steamos_dropin(&shim_dir, mode, hdr) {
-        t.steamos = false;
-        persist_takeover_held(&t);
+        if owed_here {
+            t.settle(|s| matches!(s, TakeoverStep::RestoreSteamos));
+        }
         return Err(e);
     }
     systemctl_user(&["daemon-reload"]);
@@ -698,7 +697,7 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
     systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
     forget_host_short_sessions();
     drop(t);
-    // Takeover already happened; a bare `?` would leave the box headless with PENDING_RESTORE unset.
+    // Takeover already happened; a bare `?` would leave the box headless with no hand-back due.
     let node_id = match poll_managed_node(Duration::from_secs(30), STEAMOS_SESSION_UNIT) {
         Some(id) => id,
         None => {
@@ -722,7 +721,6 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
         refresh_hz: mode.refresh_hz,
         hdr,
     });
-    persist_takeover();
     tracing::info!(
         node_id,
         w = mode.width,
@@ -824,21 +822,21 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
         "gamescope: relaunching the box game-mode session at the client's resolution"
     );
     // Manager keeps these for the rest of the login; restore owes [`unset_forced_session_screen_env`].
-    // Recorded before they are set: they outlive the process.
-    takeover().forced_screen_env = true;
-    persist_takeover();
+    // Owed before they are set: they outlive the process.
+    takeover().owe_once(TakeoverStep::UnsetScreenEnv);
     systemctl_user(&[
         "set-environment",
         &format!("SCREEN_WIDTH={}", mode.width),
         &format!("SCREEN_HEIGHT={}", mode.height),
         &format!("CUSTOM_REFRESH_RATES={}", mode.refresh_hz.max(1)),
     ]);
+    // Owed before it is written: an unowed drop-in outlives the takeover, and Game Mode then runs
+    // our patched gamescope.
+    let owed_here = takeover().owe_once(TakeoverStep::RemoveSessionDropin);
     let mut bound = match write_gamescope_bin_wrapper()
         .and_then(|w| write_session_plus_dropin(&w, mode, hdr, WsiPlan::resolve()))
     {
         Ok(true) => {
-            // Before the restart: skip this flag and `takeover_live()` is false, so the drop-in outlives us.
-            takeover().session_dropin_armed = true;
             tracing::info!(
                 bin = %gamescope_bin(),
                 %unit,
@@ -849,12 +847,15 @@ fn ensure_box_gamescope_mode(mode: Mode, hdr: bool) -> Result<u32> {
             true
         }
         Ok(false) => {
-            // No bind to arm also removes; the flag must follow or restore owes a gone drop-in.
-            takeover().session_dropin_armed = false;
+            // No bind to arm also removes; the takeover must follow or restore owes a gone drop-in.
+            takeover().settle(|s| matches!(s, TakeoverStep::RemoveSessionDropin));
             false
         }
         Err(e) => {
             tracing::warn!(error = %e, "gamescope: box-session drop-in not written");
+            if owed_here {
+                takeover().settle(|s| matches!(s, TakeoverStep::RemoveSessionDropin));
+            }
             false
         }
     };

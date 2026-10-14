@@ -208,6 +208,7 @@ impl VirtualDisplay for WlrootsDisplay {
                     .map(|_| ())
                     .with_context(|| format!("swaymsg output {name} unplug"))
             }
+            Undo::Takeover { .. } => bail!("no undo in wlroots for {undo:?}"),
         }
     }
 

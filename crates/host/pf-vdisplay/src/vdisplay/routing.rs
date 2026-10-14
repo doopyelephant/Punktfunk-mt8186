@@ -589,8 +589,8 @@ pub fn start_restore_worker() -> std::sync::Arc<()> {
 }
 
 /// Recover a stranded TV takeover from a crashed previous host. Call once at
-/// `serve` startup, beside [`start_restore_worker`]. No-op when nothing was
-/// persisted.
+/// `serve` startup, after [`reclaim_topology_journal`] adopts its steps and beside
+/// [`start_restore_worker`]. No-op when nothing was journaled.
 #[cfg(target_os = "linux")]
 pub fn restore_takeover_on_startup() {
     gamescope::restore_takeover_on_startup();
@@ -600,7 +600,7 @@ pub fn restore_takeover_on_startup() {
 pub fn restore_takeover_on_startup() {}
 
 /// Take back the desk changes a dead host journaled ([`crate::topology_journal`]). Call at
-/// `serve` startup beside [`restore_takeover_on_startup`], and when a compositor instance
+/// `serve` startup before [`restore_takeover_on_startup`], and when a compositor instance
 /// appears. No-op with nothing journaled.
 #[cfg(target_os = "linux")]
 pub fn reclaim_topology_journal() {
