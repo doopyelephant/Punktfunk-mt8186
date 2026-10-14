@@ -227,16 +227,9 @@ pub fn pin_dialog(
         glib::spawn_future_local(async move {
             match rx.recv().await {
                 Ok(Ok(fp)) => {
-                    let fp_hex = trust::hex(&fp);
-                    let saved = trust::persist_host(
-                        &req.host.name,
-                        &req.host.addr,
-                        req.host.port,
-                        &fp_hex,
-                        true,
-                        &[],
-                    );
-                    sender.input(AppMsg::Toast(match saved {
+                    let paired =
+                        trust::save_paired(&req.host.name, &req.host.addr, req.host.port, fp, &[]);
+                    sender.input(AppMsg::Toast(match &paired.saved {
                         Ok(()) if then_connect => "Paired — connecting…".into(),
                         Ok(()) => format!("Paired with {}", req.host.name),
                         Err(e) => format!("Paired, but couldn't save — {e:#}"),
@@ -244,7 +237,7 @@ pub fn pin_dialog(
                     if then_connect {
                         sender.input(AppMsg::StartSession {
                             req,
-                            fp_hex,
+                            fp_hex: paired.fp_hex,
                             tofu: false,
                             opts: SpawnOpts::default(),
                         });

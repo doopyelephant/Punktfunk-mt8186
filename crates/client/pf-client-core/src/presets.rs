@@ -12,7 +12,7 @@
 //!
 //! Design: `design/client-settings-profiles.md`.
 
-use crate::trust::{config_dir, load_json, write_atomic, Settings, StatsVerbosity};
+use crate::trust::{config_dir, load_json, write_atomic, FileStamp, Settings, StatsVerbosity};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -431,6 +431,13 @@ impl PresetsFile {
         config_dir()
             .map(|dir| Self::load_from(&dir))
             .unwrap_or_default()
+    }
+
+    /// [`load`](Self::load), or `None` while both catalog files are as `seen` recorded them.
+    pub fn load_if_changed(seen: &mut FileStamp) -> Option<PresetsFile> {
+        let dir = config_dir().ok()?;
+        seen.moved(&[&dir.join(FILE), &dir.join(LEGACY_FILE)])
+            .then(|| Self::load_from(&dir))
     }
 
     fn load_from(dir: &Path) -> PresetsFile {

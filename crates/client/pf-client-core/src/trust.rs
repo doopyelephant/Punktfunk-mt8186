@@ -30,12 +30,12 @@ pub use crate::settings::{
 pub(crate) use hosts::StoreLock;
 pub use hosts::{
     add_host, learn_from_advert, learn_mgmt_port_by_fp, persist_host, rekey_addr, same_pin,
-    touch_last_used, AddOutcome, FieldError, HostEdit, HostField, KnownHost, KnownHosts,
-    PREV_ADDRS_MAX,
+    save_paired, touch_last_used, AddOutcome, FieldError, FileStamp, HostEdit, HostField,
+    KnownHost, KnownHosts, Paired, PREV_ADDRS_MAX,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use identity::{
-    device_name, load_or_create_identity, pair_with_host, request_access_to_host,
+    device_name, load_or_create_identity, pair_and_save, pair_with_host, request_access_to_host,
     REQUEST_ACCESS_TIMEOUT,
 };
 pub use messages::{

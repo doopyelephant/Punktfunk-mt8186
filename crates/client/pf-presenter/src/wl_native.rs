@@ -19,6 +19,7 @@
 //! and [`NativeLane::pump`] dispatches them. Presentation times arrive on CLOCK_MONOTONIC
 //! and are moved onto the session's realtime clock as they land.
 
+use crate::wl_side::{monotonic_to_realtime, release_registry, SdlWayland};
 use anyhow::{Context as _, Result};
 use pf_client_core::video::{ColorDesc, DmabufFrame};
 use punktfunk_core::quic::HdrMeta;
@@ -28,8 +29,8 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
-use wayland_backend::client::{Backend, ObjectId};
-use wayland_client::globals::{registry_queue_init, GlobalList, GlobalListContents};
+use wayland_backend::client::ObjectId;
+use wayland_client::globals::{GlobalList, GlobalListContents};
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_region, wl_registry, wl_subcompositor, wl_subsurface, wl_surface,
 };
@@ -543,13 +544,6 @@ struct HudGlobals {
     viewporter: wp_viewporter::WpViewporter,
 }
 
-fn monotonic_to_realtime(mono_ns: u64) -> u64 {
-    let now_mono = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    let now_mono = now_mono.tv_sec as u64 * 1_000_000_000 + now_mono.tv_nsec as u64;
-    let now_real = pf_client_core::session::now_ns();
-    now_real.wrapping_add(mono_ns).wrapping_sub(now_mono)
-}
-
 pub struct NativeLane {
     conn: Connection,
     queue: EventQueue<LaneState>,
@@ -612,26 +606,10 @@ impl NativeLane {
             );
             return Ok(None);
         }
-        // SAFETY: the live window owns the pointers; none transfers ownership.
-        let (display, surface_ptr, viewport_ptr) = unsafe {
-            let props = sdl3::sys::video::SDL_GetWindowProperties(window.raw());
-            let get = |name| {
-                sdl3::sys::properties::SDL_GetPointerProperty(props, name, std::ptr::null_mut())
-            };
-            (
-                get(sdl3::sys::video::SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER),
-                get(sdl3::sys::video::SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER),
-                get(sdl3::sys::video::SDL_PROP_WINDOW_WAYLAND_VIEWPORT_POINTER),
-            )
-        };
-        if display.is_null() || surface_ptr.is_null() {
+        let Some(sdl) = SdlWayland::of(window) else {
             return Ok(None);
-        }
-        // SAFETY: window.context() is retained until after the foreign backend is dropped.
-        let backend = unsafe { Backend::from_foreign_display(display.cast()) };
-        let conn = Connection::from_backend(backend);
-        let (globals, mut queue) =
-            registry_queue_init::<LaneState>(&conn).context("native lane registry")?;
+        };
+        let (conn, globals, mut queue) = sdl.connect::<LaneState>("native lane registry")?;
         let qh = queue.handle();
         let dmabuf: dmabuf::ZwpLinuxDmabufV1 = match globals.bind(&qh, 4..=5, ()) {
             Ok(d) => d,
@@ -666,12 +644,7 @@ impl NativeLane {
             }),
             _ => None,
         };
-        // SAFETY: SDL's live wl_surface proxy on this display; the interface matches.
-        let surface_id =
-            unsafe { ObjectId::from_ptr(wl_surface::WlSurface::interface(), surface_ptr.cast()) }
-                .context("SDL wl_surface id")?;
-        let surface =
-            wl_surface::WlSurface::from_id(&conn, surface_id).context("SDL wl_surface proxy")?;
+        let surface = sdl.surface_proxy(&conn)?;
         dmabuf.get_surface_feedback(&surface, &qh, ());
         let mut state = LaneState::default();
         for _ in 0..4 {
@@ -693,7 +666,7 @@ impl NativeLane {
             pairs = state.pairs.len(),
             scanout_pairs = state.scanout.len(),
             color_representation = color_repr.is_some(),
-            viewport = !viewport_ptr.is_null(),
+            viewport = !sdl.viewport.is_null(),
             overlay_surface = hud_globals.is_some(),
             explicit_sync = syncobj.is_some(),
             hdr = color_mgr.is_some()
@@ -714,7 +687,7 @@ impl NativeLane {
             color_repr,
             repr: None,
             repr_set: None,
-            has_viewport: !viewport_ptr.is_null(),
+            has_viewport: !sdl.viewport.is_null(),
             hud_globals,
             hud: None,
             syncobj,
@@ -1338,12 +1311,7 @@ impl Drop for NativeLane {
         }
         self.dmabuf.destroy();
         self.presentation.destroy();
-        if let Some(globals) = self.globals.take() {
-            let id = globals.registry().id();
-            globals.destroy();
-            let _ = self.conn.backend().destroy_object(&id);
-        }
-        let _ = self.conn.flush();
+        release_registry(&mut self.globals, &self.conn);
     }
 }
 
@@ -1389,16 +1357,5 @@ mod tests {
         );
         let s = super::hdr_static(&meta(4000, 400), 2);
         assert_eq!(s.max_cll, Some(4000), "version 2 lifts the range rule");
-    }
-
-    /// The lane's realtime stamp moves with the wall clock, never with the monotonic offset
-    /// alone: a presented time "now" lands at "now" on the session clock.
-    #[test]
-    fn a_presented_now_lands_on_the_session_clock_now() {
-        let mono = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-        let mono = mono.tv_sec as u64 * 1_000_000_000 + mono.tv_nsec as u64;
-        let real = pf_client_core::session::now_ns();
-        let got = super::monotonic_to_realtime(mono);
-        assert!(got.abs_diff(real) < 50_000_000, "{got} vs {real}");
     }
 }

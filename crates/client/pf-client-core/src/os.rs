@@ -45,6 +45,39 @@ mod tests {
         );
     }
 
+    /// The grammar and the walk every client runs, from the shared vector file.
+    #[test]
+    fn shared_advert_vectors_agree_on_the_os_chain() {
+        let raw = include_str!("../../../../clients/shared/advert-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+        let chains = file["os_chain"].as_array().expect("os_chain cases");
+        assert!(
+            chains.len() >= 10,
+            "the vector file is the contract; keep it rich"
+        );
+        for case in chains {
+            let raw = case["raw"].as_str().unwrap();
+            assert_eq!(
+                sanitize_os(raw),
+                case["expect"].as_str().unwrap(),
+                "{raw:?}"
+            );
+        }
+        for case in file["os_icon_tokens"]
+            .as_array()
+            .expect("os_icon_tokens cases")
+        {
+            let chain = case["chain"].as_str().unwrap();
+            let want: Vec<&str> = case["expect"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap())
+                .collect();
+            assert_eq!(os_icon_tokens(chain), want, "{chain:?}");
+        }
+    }
+
     #[test]
     fn walk_of_nothing_is_empty() {
         assert!(os_icon_tokens("").is_empty());

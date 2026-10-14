@@ -11,14 +11,14 @@
 //! move onto the session clock as they land. The `zero_copy` kind bit is the only word a
 //! client gets on whether the compositor scans its buffer out; the stats line shows it.
 
+use crate::wl_side::{monotonic_to_realtime, release_registry, SdlWayland};
 use anyhow::{Context as _, Result};
 use sdl3::video::WindowContext;
 use std::collections::HashMap;
 use std::sync::Arc;
-use wayland_backend::client::{Backend, ObjectId};
-use wayland_client::globals::{registry_queue_init, GlobalList, GlobalListContents};
+use wayland_client::globals::{GlobalList, GlobalListContents};
 use wayland_client::protocol::{wl_registry, wl_surface};
-use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 use wayland_protocols::wp::content_type::v1::client::{
     wp_content_type_manager_v1 as ctm, wp_content_type_v1 as ct,
 };
@@ -131,13 +131,6 @@ impl Dispatch<pfb::WpPresentationFeedback, u64> for State {
     }
 }
 
-fn monotonic_to_realtime(mono_ns: u64) -> u64 {
-    let now_mono = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    let now_mono = now_mono.tv_sec as u64 * 1_000_000_000 + now_mono.tv_nsec as u64;
-    let now_real = pf_client_core::session::now_ns();
-    now_real.wrapping_add(mono_ns).wrapping_sub(now_mono)
-}
-
 pub struct SurfaceFeedback {
     conn: Connection,
     queue: EventQueue<State>,
@@ -164,36 +157,16 @@ impl SurfaceFeedback {
         if window.subsystem().current_video_driver() != "wayland" {
             return Ok(None);
         }
-        // SAFETY: the live window owns the pointers; none transfers ownership.
-        let (display, surface_ptr) = unsafe {
-            let props = sdl3::sys::video::SDL_GetWindowProperties(window.raw());
-            let get = |name| {
-                sdl3::sys::properties::SDL_GetPointerProperty(props, name, std::ptr::null_mut())
-            };
-            (
-                get(sdl3::sys::video::SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER),
-                get(sdl3::sys::video::SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER),
-            )
-        };
-        if display.is_null() || surface_ptr.is_null() {
+        let Some(sdl) = SdlWayland::of(window) else {
             return Ok(None);
-        }
-        // SAFETY: window.context() is retained until after the foreign backend is dropped.
-        let backend = unsafe { Backend::from_foreign_display(display.cast()) };
-        let conn = Connection::from_backend(backend);
-        let (globals, mut queue) =
-            registry_queue_init::<State>(&conn).context("surface feedback registry")?;
+        };
+        let (conn, globals, mut queue) = sdl.connect::<State>("surface feedback registry")?;
         let qh = queue.handle();
         let presentation: wp_presentation::WpPresentation = match globals.bind(&qh, 1..=2, ()) {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
-        // SAFETY: SDL's live wl_surface proxy on this display; the interface matches.
-        let surface_id =
-            unsafe { ObjectId::from_ptr(wl_surface::WlSurface::interface(), surface_ptr.cast()) }
-                .context("SDL wl_surface id")?;
-        let surface =
-            wl_surface::WlSurface::from_id(&conn, surface_id).context("SDL wl_surface proxy")?;
+        let surface = sdl.surface_proxy(&conn)?;
         // Tag the surface as a game for the compositors that act on it: Hyprland's
         // fullscreen-game refresh mode, KWin's content-type hint to the display.
         let manager: Option<ctm::WpContentTypeManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
@@ -272,11 +245,6 @@ impl Drop for SurfaceFeedback {
         // A feedback object has no destructor: the compositor retires it with its answer.
         self.state.pending.clear();
         self.presentation.destroy();
-        if let Some(globals) = self.globals.take() {
-            let id = globals.registry().id();
-            globals.destroy();
-            let _ = self.conn.backend().destroy_object(&id);
-        }
-        let _ = self.conn.flush();
+        release_registry(&mut self.globals, &self.conn);
     }
 }

@@ -171,6 +171,53 @@ pub struct AdapterDecode {
     pub formats: Vec<pf_vkdecode::probe::ProfileProbe>,
 }
 
+impl AdapterDecode {
+    /// One reason per conjunct of [`video_decode_gate`] that failed; empty exactly when
+    /// `usable`.
+    pub fn why_not(&self) -> Vec<String> {
+        let mut why = Vec::new();
+        if !self.api_1_3 {
+            why.push("device is not Vulkan 1.3".to_string());
+        }
+        if !self.features_ok {
+            why.push(
+                "missing samplerYcbcrConversion / timelineSemaphore / synchronization2".to_string(),
+            );
+        }
+        if self.decode_family.is_none() {
+            why.push("no queue family advertises VIDEO_DECODE".to_string());
+        }
+        if !self.base_missing.is_empty() {
+            why.push(format!("missing {}", self.base_missing.join(", ")));
+        }
+        if self.codec_exts.is_empty() {
+            why.push("no VK_KHR_video_decode_{h264,h265,av1} extension".to_string());
+        }
+        why
+    }
+
+    /// Every codec bit in `codec_ops`, VP9 included though no rung decodes it, so the names
+    /// account for the whole mask. A bit with no name is reported by value.
+    pub fn codec_names(&self) -> Vec<String> {
+        const OPS: [(u32, &str); 4] = [
+            (0x1, "H.264"),
+            (0x2, "H.265"),
+            (0x4, "AV1"),
+            (0x8, "VP9 (no punktfunk rung)"),
+        ];
+        let mut names: Vec<String> = OPS
+            .iter()
+            .filter(|(bit, _)| self.codec_ops & bit != 0)
+            .map(|(_, name)| (*name).to_string())
+            .collect();
+        let unknown = self.codec_ops & !OPS.iter().map(|(bit, _)| bit).sum::<u32>();
+        if unknown != 0 {
+            names.push(format!("unrecognised bits 0x{unknown:X}"));
+        }
+        names
+    }
+}
+
 /// `VK_EXT_present_mode_fifo_latest_ready`, hand-declared: ash does not name it.
 /// An unenabled driver reports the mode as the raw number `1000361000`.
 ///
@@ -1764,6 +1811,60 @@ fn pick_present_mode(
 mod tests {
     use super::*;
     use vk::PresentModeKHR as M;
+
+    /// An adapter whose five gate inputs are the low bits of `mask` (set = the input holds).
+    fn adapter(mask: u32) -> AdapterDecode {
+        let has = |bit: u32| mask & (1 << bit) != 0;
+        AdapterDecode {
+            index: 0,
+            name: "test".into(),
+            discrete: true,
+            api_1_3: has(0),
+            features_ok: has(1),
+            decode_family: has(2).then_some(0),
+            codec_ops: 0,
+            base_missing: if has(3) {
+                Vec::new()
+            } else {
+                vec!["VK_KHR_video_queue".into()]
+            },
+            codec_exts: if has(4) {
+                vec!["VK_KHR_video_decode_h264".into()]
+            } else {
+                Vec::new()
+            },
+            usable: video_decode_gate(has(0), has(1), has(2), has(3), has(4)),
+            formats: Vec::new(),
+        }
+    }
+
+    /// `--probe-decode` prints `why_not` for a refused device: it names one reason per
+    /// failed input and nothing for a device the gate admits. A conjunct added to the gate
+    /// without a reason changes the gate's arity and stops this compiling.
+    #[test]
+    fn why_not_is_empty_exactly_when_the_gate_admits_the_device() {
+        for mask in 0..32u32 {
+            let a = adapter(mask);
+            let failed = (!mask & 0b11111).count_ones() as usize;
+            assert_eq!(a.why_not().len(), failed, "mask {mask:05b}");
+            assert_eq!(a.usable, a.why_not().is_empty(), "mask {mask:05b}");
+        }
+    }
+
+    /// The report names every bit the driver set, VP9 too, and a bit it cannot name by value.
+    #[test]
+    fn codec_names_account_for_the_whole_mask() {
+        let ops = |codec_ops| AdapterDecode {
+            codec_ops,
+            ..adapter(0b11111)
+        };
+        assert!(ops(0).codec_names().is_empty());
+        assert_eq!(ops(0x3).codec_names(), ["H.264", "H.265"]);
+        assert_eq!(
+            ops(0x4 | 0x8 | 0x10).codec_names(),
+            ["AV1", "VP9 (no punktfunk rung)", "unrecognised bits 0x10"]
+        );
+    }
 
     /// Offered and wanted, present-wait2 replaces the original pair: a swapchain times its
     /// presents with one generation.

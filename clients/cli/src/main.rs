@@ -674,7 +674,7 @@ from the config directory for a true factory reset."
             }
         };
         let name = value(args, "--name").unwrap_or_else(trust::device_name);
-        let paired = trust::pair_with_host(&addr, port, &identity, &pin, &name);
+        let paired = trust::pair_and_save(&addr, port, &identity, &pin, &name, &addr, &[]);
         report_paired(
             &addr,
             port,
@@ -714,7 +714,8 @@ from the config directory for a true factory reset."
         let name = value(args, "--name").unwrap_or_else(trust::device_name);
         let pin = access_pin(&KnownHosts::load(), fp.as_deref(), addr, port);
         eprintln!("waiting for {addr} to approve this device…");
-        let paired = trust::request_access_to_host(addr, port, &identity, pin, &name, None);
+        let paired = trust::request_access_to_host(addr, port, &identity, pin, &name, None)
+            .map(|fp| trust::save_paired(addr, addr, port, fp, &[]));
         report_paired(
             addr,
             port,
@@ -722,14 +723,13 @@ from the config directory for a true factory reset."
         )
     }
 
-    fn report_paired(addr: &str, port: u16, paired: Result<[u8; 32], String>) -> u8 {
+    fn report_paired(addr: &str, port: u16, paired: Result<trust::Paired, String>) -> u8 {
         match paired {
-            Ok(fp) => {
-                let fp_hex = trust::hex(&fp);
-                if let Err(e) = trust::persist_host(addr, addr, port, &fp_hex, true, &[]) {
+            Ok(paired) => {
+                if let Err(e) = paired.saved {
                     eprintln!("couldn't save the host: {e:#}");
                 }
-                println!("paired {addr}:{port} fp={fp_hex}");
+                println!("paired {addr}:{port} fp={}", paired.fp_hex);
                 OK
             }
             Err(msg) => {

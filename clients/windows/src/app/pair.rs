@@ -42,22 +42,16 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
                 let generation = ctx3.shared.pair_gen.fetch_add(1, Ordering::SeqCst) + 1;
                 std::thread::spawn(move || {
                     let current = || ctx3.shared.pair_gen.load(Ordering::SeqCst) == generation;
-                    match trust::pair_with_host(
+                    match trust::pair_and_save(
                         &target3.host.addr,
                         target3.host.port,
                         &ctx3.identity,
                         &pin,
                         &trust::device_name(),
+                        &target3.host.name,
+                        &target3.host.mac,
                     ) {
-                        Ok(fp) => {
-                            let saved = trust::persist_host(
-                                &target3.host.name,
-                                &target3.host.addr,
-                                target3.host.port,
-                                &trust::hex(&fp),
-                                true,
-                                &target3.host.mac,
-                            );
+                        Ok(paired) => {
                             if !current() {
                                 return;
                             }
@@ -65,13 +59,13 @@ pub(crate) fn pair_page(props: &Svc, cx: &mut RenderCx) -> Element {
                             // Connect dials it. `connect` clears the status line, so a save
                             // error goes after it.
                             if target3.from_link {
-                                connect(&ctx3, &target3, Some(fp), &ss, &st);
-                                if let Err(e) = saved {
+                                connect(&ctx3, &target3, Some(paired.fp), &ss, &st);
+                                if let Err(e) = paired.saved {
                                     st.call(format!("Paired, but couldn't save — {e:#}"));
                                 }
                                 return;
                             }
-                            st.call(match saved {
+                            st.call(match paired.saved {
                                 Ok(()) => format!("Paired with {}", target3.host.name),
                                 Err(e) => format!("Paired, but couldn't save — {e:#}"),
                             });

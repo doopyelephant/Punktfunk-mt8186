@@ -219,20 +219,13 @@ mod session_main {
                 return exit::CONNECT_FAILED;
             }
         };
-        match trust::pair_with_host(&addr, port, &identity, pin, &name) {
-            Ok(fp) => {
-                let fp_hex = trust::hex(&fp);
-                if let Err(e) = trust::persist_host(
-                    &arg_value("--host-label").unwrap_or_else(|| addr.clone()),
-                    &addr,
-                    port,
-                    &fp_hex,
-                    true,
-                    &[],
-                ) {
+        let label = arg_value("--host-label").unwrap_or_else(|| addr.clone());
+        match trust::pair_and_save(&addr, port, &identity, pin, &name, &label, &[]) {
+            Ok(paired) => {
+                if let Err(e) = paired.saved {
                     eprintln!("couldn't save the host: {e:#}");
                 }
-                println!("paired {addr}:{port} fp={fp_hex}");
+                println!("paired {addr}:{port} fp={}", paired.fp_hex);
                 0
             }
             Err(e) => {
@@ -565,24 +558,7 @@ mod session_main {
                         "     vulkan video decode: {}",
                         if a.usable { "YES" } else { "no" }
                     );
-                    // Name every advertised bit, including unsupported VP9, so the labels
-                    // account for the complete mask.
-                    const OPS: [(u32, &str); 4] = [
-                        (0x1, "H.264"),
-                        (0x2, "H.265"),
-                        (0x4, "AV1"),
-                        (0x8, "VP9 (no punktfunk rung)"),
-                    ];
-                    let mut codecs: Vec<String> = OPS
-                        .iter()
-                        .filter(|(bit, _)| a.codec_ops & bit != 0)
-                        .map(|(_, n)| (*n).to_string())
-                        .collect();
-                    let named: u32 = OPS.iter().map(|(b, _)| b).sum();
-                    let unknown = a.codec_ops & !named;
-                    if unknown != 0 {
-                        codecs.push(format!("unrecognised bits 0x{unknown:X}"));
-                    }
+                    let codecs = a.codec_names();
                     println!(
                         "     driver decode ops:   {}",
                         if codecs.is_empty() {
@@ -592,28 +568,8 @@ mod session_main {
                         }
                     );
                     if !a.usable {
-                        // Say which conjunct failed. "no" with no reason is the thing
-                        // this whole flag exists to stop.
-                        let mut why: Vec<String> = Vec::new();
-                        if !a.api_1_3 {
-                            why.push("device is not Vulkan 1.3".into());
-                        }
-                        if !a.features_ok {
-                            why.push(
-                                "missing samplerYcbcrConversion / timelineSemaphore / \
-                                 synchronization2"
-                                    .into(),
-                            );
-                        }
-                        if a.decode_family.is_none() {
-                            why.push("no queue family advertises VIDEO_DECODE".into());
-                        }
-                        if !a.base_missing.is_empty() {
-                            why.push(format!("missing {}", a.base_missing.join(", ")));
-                        }
-                        if a.codec_exts.is_empty() {
-                            why.push("no VK_KHR_video_decode_{h264,h265,av1} extension".into());
-                        }
+                        // "no" with no reason is the thing this whole flag exists to stop.
+                        let why = a.why_not();
                         println!("     why not:             {}", why.join("; "));
                     } else {
                         println!("     extensions:          {}", a.codec_exts.join(", "));

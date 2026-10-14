@@ -63,6 +63,8 @@ mod win32;
 pub mod wl_feedback;
 #[cfg(target_os = "linux")]
 pub mod wl_native;
+#[cfg(target_os = "linux")]
+mod wl_side;
 
 #[cfg(any(target_os = "linux", windows))]
 pub use run::{run_browse, run_session, ActionOutcome, Outcome, SessionOpts};

@@ -289,6 +289,39 @@ mod tests {
         assert!(same_host(&placeholder, &unpinned));
     }
 
+    /// The match rule every client runs, from the shared vector file.
+    #[test]
+    fn shared_advert_vectors_agree_on_who_is_who() {
+        let raw = include_str!("../../../../clients/shared/advert-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+        let cases = file["match"].as_array().expect("match cases");
+        assert!(
+            cases.len() >= 10,
+            "the vector file is the contract; keep it rich"
+        );
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let (saved, advert) = (&case["saved"], &case["advert"]);
+            let saved = crate::trust::KnownHost {
+                addr: saved["addr"].as_str().unwrap().into(),
+                port: saved["port"].as_u64().unwrap() as u16,
+                fp_hex: saved["fp"].as_str().unwrap().into(),
+                ..Default::default()
+            };
+            let advert = DiscoveredHost {
+                addr: advert["addr"].as_str().unwrap().into(),
+                port: advert["port"].as_u64().unwrap() as u16,
+                fp_hex: advert["fp"].as_str().unwrap().into(),
+                ..host("id", "desk._punktfunk._udp.local.", "")
+            };
+            assert_eq!(
+                same_host(&saved, &advert),
+                case["same"].as_bool().unwrap(),
+                "{name}"
+            );
+        }
+    }
+
     /// A woken host's advert counts only if it is that host: a pinned target is matched by
     /// its pin wherever it came back, never by an fp-less advert at its old address.
     #[test]

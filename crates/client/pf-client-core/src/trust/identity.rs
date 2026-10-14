@@ -1,7 +1,7 @@
 //! This client's mTLS identity: the key pair it presents, the owner-only key file, the
 //! label hosts file it under, and the SPAKE2 PIN ceremony that pins a host.
 
-use super::config_dir;
+use super::{config_dir, save_paired, Paired};
 #[cfg(windows)]
 use anyhow::Context as _;
 use anyhow::{anyhow, Result};
@@ -134,6 +134,21 @@ pub fn pair_with_host(
         device_name,
         std::time::Duration::from_secs(90),
     )
+}
+
+/// [`pair_with_host`], then [`save_paired`] under `name` with `mac`. `Err` is the ceremony's;
+/// a failed save is [`Paired::saved`].
+pub fn pair_and_save(
+    addr: &str,
+    port: u16,
+    identity: &(String, String),
+    pin: &str,
+    device_name: &str,
+    name: &str,
+    mac: &[String],
+) -> std::result::Result<Paired, punktfunk_core::PunktfunkError> {
+    pair_with_host(addr, port, identity, pin, device_name)
+        .map(|fp| save_paired(name, addr, port, fp, mac))
 }
 
 /// The host waits 180 s for its operator to decide; this outlasts it so the client hears

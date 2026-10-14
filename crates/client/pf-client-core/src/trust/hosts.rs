@@ -411,6 +411,29 @@ impl Drop for StoreLock {
     }
 }
 
+/// Size and modification time of a store's files: whether a re-read could find anything new.
+/// A save renames a new file over the old one, so equal stamps mean no save landed between
+/// them. A missing file is a stamp of its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileStamp(Vec<Option<(u64, Option<std::time::SystemTime>)>>);
+
+impl FileStamp {
+    /// Take `paths`' stamp into `self`; `true` when it differs from the one held. A fresh
+    /// `FileStamp::default()` matches no file, so its first call is always `true`.
+    pub(crate) fn moved(&mut self, paths: &[&Path]) -> bool {
+        let now = FileStamp(
+            paths
+                .iter()
+                .map(|p| {
+                    let meta = std::fs::metadata(p).ok()?;
+                    Some((meta.len(), meta.modified().ok()))
+                })
+                .collect(),
+        );
+        std::mem::replace(self, now) != *self
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct KnownHosts {
     pub hosts: Vec<KnownHost>,
@@ -419,6 +442,13 @@ pub struct KnownHosts {
 impl KnownHosts {
     fn path() -> Result<PathBuf> {
         Ok(config_dir()?.join("client-known-hosts.json"))
+    }
+
+    /// [`load`](Self::load), or `None` while the file is as `seen` recorded it. The stamp is
+    /// taken before the read, so a save in between shows on the next call.
+    pub fn load_if_changed(seen: &mut FileStamp) -> Option<KnownHosts> {
+        let path = Self::path().ok()?;
+        seen.moved(&[&path]).then(Self::load)
     }
 
     /// The store, minting ids on records that lack one. The mint is a write, so it is
@@ -823,6 +853,25 @@ pub fn persist_host(
     })
 }
 
+/// A host a pairing ceremony verified, and the store's answer to saving it.
+pub struct Paired {
+    /// The certificate fingerprint the ceremony verified.
+    pub fp: [u8; 32],
+    /// [`fp`](Self::fp) as lowercase hex, the form the store and the shells key on.
+    pub fp_hex: String,
+    /// `Err` when the ceremony held and the write did not. The pairing stands; a shell says
+    /// "Paired, but couldn't save" and does not retry the ceremony.
+    pub saved: Result<()>,
+}
+
+/// The save every pairing ceremony ends in: the host `fp` names, trusted and `paired`, by
+/// [`persist_host`]. `mac` is as there.
+pub fn save_paired(name: &str, addr: &str, port: u16, fp: [u8; 32], mac: &[String]) -> Paired {
+    let fp_hex = punktfunk_core::fp::hex(&fp);
+    let saved = persist_host(name, addr, port, &fp_hex, true, mac);
+    Paired { fp, fp_hex, saved }
+}
+
 /// [`KnownHosts::add`] under the store's lock, saved unless it refuses the edit.
 pub fn add_host(edit: &HostEdit) -> Result<()> {
     let mut added = Ok(AddOutcome::Unchanged);
@@ -1061,6 +1110,24 @@ mod tests {
         assert_eq!(stored.hosts.len(), 1);
         // The thread no longer counts as holding the lock: a later edit takes it again.
         assert!(!LOCK_HELD.get());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// A re-read is owed on the first look and after a save, and not otherwise.
+    #[test]
+    fn a_stamp_moves_with_the_file_and_not_without_it() {
+        let _guard = crate::trust::store_health_lock();
+        let path = scratch_store("hosts-stamp");
+        let mut seen = FileStamp::default();
+        assert!(seen.moved(&[&path]), "the first look reads, file or none");
+        assert!(!seen.moved(&[&path]), "a file that stays missing");
+        KnownHosts::locked_at(&path, |k| (true, k.hosts.push(named("one")))).unwrap();
+        assert!(seen.moved(&[&path]), "the file appeared");
+        assert!(!seen.moved(&[&path]));
+        KnownHosts::locked_at(&path, |k| (true, k.hosts.push(named("two")))).unwrap();
+        assert!(seen.moved(&[&path]), "a save that grew the file");
+        std::fs::remove_file(&path).unwrap();
+        assert!(seen.moved(&[&path]), "the file went");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
