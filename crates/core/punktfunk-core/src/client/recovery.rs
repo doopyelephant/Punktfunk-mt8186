@@ -1247,394 +1247,130 @@ mod driver_tests {
     };
     use crate::packet::{FLAG_SOF, USER_FLAG_RECOVERY_ANCHOR, USER_FLAG_RECOVERY_POINT};
     use crate::reanchor::{AnchorEvidence, LocalRecovery};
+    use serde_json::Value;
     use std::time::{Duration, Instant};
 
-    const CLEAN: AnchorEvidence = AnchorEvidence::Unavailable;
-    const DAMAGED: AnchorEvidence = AnchorEvidence::ReferencesDamaged;
-    const NONE: RecoveryAsk = RecoveryAsk::None;
-    const KEYFRAME: RecoveryAsk = RecoveryAsk::Keyframe;
-
-    fn au(index: u32) -> E {
-        E::Arrived {
-            index,
-            complete: true,
-            decode_order: 0,
-        }
+    fn num(v: &Value, key: &str, default: u64) -> u64 {
+        v.get(key).map_or(default, |x| x.as_u64().expect(key))
     }
 
-    fn decoded(flags: u32, evidence: AnchorEvidence) -> E {
-        E::Decoded(Decoded {
+    fn flag(v: &Value, key: &str, default: bool) -> bool {
+        v.get(key).map_or(default, |x| x.as_bool().expect(key))
+    }
+
+    fn decoded(s: &Value) -> Decoded {
+        let names = s.get("flags").and_then(Value::as_array);
+        let flags = names.into_iter().flatten().fold(0, |acc, name| {
+            acc | match name.as_str() {
+                Some("sof") => u32::from(FLAG_SOF),
+                Some("anchor") => USER_FLAG_RECOVERY_ANCHOR,
+                Some("point") => USER_FLAG_RECOVERY_POINT,
+                other => panic!("flag {other:?}"),
+            }
+        });
+        Decoded {
             flags,
-            keyframe: false,
-            evidence,
-            local: LocalRecovery::NONE,
-            decode_order: None,
-        })
+            keyframe: flag(s, "keyframe", false),
+            evidence: match s.get("evidence").and_then(Value::as_str) {
+                None | Some("unavailable") => AnchorEvidence::Unavailable,
+                Some("clean") => AnchorEvidence::ReferencesClean,
+                Some("damaged") => AnchorEvidence::ReferencesDamaged,
+                other => panic!("evidence {other:?}"),
+            },
+            local: LocalRecovery {
+                sei_here: flag(s, "sei", false),
+                is_recovery_point: flag(s, "recovery_point", false),
+            },
+            decode_order: s.get("decode_order").map(|x| x.as_u64().expect("order")),
+        }
     }
 
-    fn want(admit: bool, hold: bool, forgive_chain: bool, ask: RecoveryAsk) -> RecoveryStep {
+    fn event(s: &Value) -> E {
+        let index = || num(s, "index", u64::MAX) as u32;
+        match s["ev"].as_str().expect("ev") {
+            "arrived" => E::Arrived {
+                index: index(),
+                complete: flag(s, "complete", true),
+                decode_order: num(s, "decode_order", 0),
+            },
+            "decoded" => E::Decoded(decoded(s)),
+            "no_output" => E::NoOutput,
+            "lost" => E::Lost,
+            "codec_error" => E::CodecError,
+            "need_keyframe" => E::NeedKeyframe,
+            "tail_short" => E::TailShort { index: index() },
+            "tick" => E::Tick {
+                frames_dropped: num(s, "frames_dropped", 0),
+            },
+            other => panic!("event {other}"),
+        }
+    }
+
+    fn want(s: &Value) -> RecoveryStep {
+        let w = &s["want"];
         RecoveryStep {
-            admit,
-            gap: 0,
-            hold,
-            forgive_chain,
-            ask,
+            admit: flag(w, "admit", true),
+            gap: num(w, "gap", 0) as u32,
+            hold: flag(w, "hold", false),
+            forgive_chain: flag(w, "forgive_chain", false),
+            ask: match w.get("ask") {
+                None => RecoveryAsk::None,
+                Some(Value::String(kind)) if kind == "keyframe" => RecoveryAsk::Keyframe,
+                Some(Value::Array(r)) => RecoveryAsk::Rfi(
+                    r[0].as_u64().expect("first") as u32,
+                    r[1].as_u64().expect("last") as u32,
+                ),
+                other => panic!("ask {other:?}"),
+            },
         }
     }
 
-    /// Replay `rows` (ms from a start, event, expected step) against one engaged driver.
-    /// The gap width has its own test.
-    fn replay(rows: &[(u64, E, RecoveryStep)]) {
+    /// `clients/shared/recovery-driver-vectors.json`, every case on a fresh driver. An
+    /// embedder's report engages the gate at the script's drop count, as `NativeClient` does.
+    #[test]
+    fn shared_vectors() {
+        let raw = include_str!("../../../../../clients/shared/recovery-driver-vectors.json");
+        let file: Value = serde_json::from_str(raw).expect("vector file parses");
         let t0 = Instant::now();
-        let mut d = RecoveryDriver::default();
-        d.engage(0);
-        for (i, (ms, ev, expect)) in rows.iter().enumerate() {
-            let got = d.step(*ev, t0 + Duration::from_millis(*ms));
-            assert_eq!(
-                RecoveryStep { gap: 0, ..got },
-                *expect,
-                "row {i}: {ev:?} at {ms} ms"
-            );
+        let cases = file["cases"].as_array().expect("cases");
+        assert!(cases.iter().any(|c| flag(c, "abi", false)));
+        for case in cases {
+            let name = case["name"].as_str().expect("name");
+            let mut d = RecoveryDriver::default();
+            d.set_all_intra(flag(case, "all_intra", false));
+            let mut dropped = 0;
+            for (i, s) in case["steps"].as_array().expect("steps").iter().enumerate() {
+                let now = t0 + Duration::from_millis(num(s, "at_ms", 0));
+                let got = match s["ev"].as_str().expect("ev") {
+                    "reset" => {
+                        d.reset();
+                        continue;
+                    }
+                    "noted" => {
+                        let (order, ask) = d.observe(num(s, "index", u64::MAX) as u32, now);
+                        RecoveryStep {
+                            admit: true,
+                            gap: match order {
+                                FrameOrder::Gap(gap) => gap,
+                                FrameOrder::InOrder | FrameOrder::Straggler => 0,
+                            },
+                            hold: false,
+                            forgive_chain: false,
+                            ask,
+                        }
+                    }
+                    _ => {
+                        let ev = event(s);
+                        match ev {
+                            E::Tick { frames_dropped } => dropped = frames_dropped,
+                            E::NeedKeyframe | E::TailShort { .. } => {}
+                            _ => d.engage(dropped),
+                        }
+                        d.step(ev, now)
+                    }
+                };
+                assert_eq!(got, want(s), "{name}: step {i}");
+            }
         }
-    }
-
-    #[test]
-    fn a_gap_reports_its_width_and_a_straggler_none() {
-        let t0 = Instant::now();
-        let mut d = RecoveryDriver::default();
-        d.engage(0);
-        assert_eq!(d.step(au(100), t0).gap, 0);
-        assert_eq!(d.step(au(103), t0).gap, 2);
-        let late = d.step(au(101), t0);
-        assert_eq!((late.admit, late.gap), (false, 0));
-    }
-
-    #[test]
-    fn a_codec_error_holds_without_asking_until_the_backstop() {
-        replay(&[
-            (0, au(100), want(true, false, false, NONE)),
-            (0, E::CodecError, want(true, true, false, NONE)),
-            (
-                499,
-                E::Tick { frames_dropped: 0 },
-                want(true, true, false, NONE),
-            ),
-            (
-                500,
-                E::Tick { frames_dropped: 0 },
-                want(true, true, false, KEYFRAME),
-            ),
-        ]);
-    }
-
-    #[test]
-    fn a_parked_decoder_asks_nothing_and_the_next_report_starts_fresh() {
-        let t0 = Instant::now();
-        let at = |ms| t0 + Duration::from_millis(ms);
-        let mut d = RecoveryDriver::default();
-        d.engage(0);
-        d.step(au(100), t0);
-        assert_eq!(d.step(E::Lost, t0), want(true, true, false, KEYFRAME));
-        assert_eq!(d.arms(), 1);
-        d.reset();
-        assert_eq!(d.arms(), 0);
-        // Drops and the old freeze's deadline pass with the decoder parked.
-        let parked = d.step(E::Tick { frames_dropped: 5 }, at(600));
-        assert_eq!(parked, want(true, false, false, NONE));
-        d.engage(5);
-        assert_eq!(d.step(au(101), at(700)), want(true, false, false, NONE));
-        let fresh = d.step(E::Tick { frames_dropped: 5 }, at(701));
-        assert_eq!(fresh, want(true, false, false, NONE));
-    }
-
-    #[test]
-    fn a_fast_anchor_is_not_refrozen_by_the_same_losss_drop_climb() {
-        replay(&[
-            (0, au(100), want(true, false, false, NONE)),
-            (
-                0,
-                au(102),
-                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
-            ),
-            (
-                60,
-                decoded(USER_FLAG_RECOVERY_ANCHOR, CLEAN),
-                want(true, false, false, NONE),
-            ),
-            (
-                120,
-                E::Tick { frames_dropped: 1 },
-                want(true, false, false, NONE),
-            ),
-        ]);
-    }
-
-    #[test]
-    fn an_anchor_the_decoder_refutes_holds_until_the_original_backstop() {
-        replay(&[
-            (0, au(100), want(true, false, false, NONE)),
-            (
-                0,
-                au(102),
-                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
-            ),
-            (
-                60,
-                decoded(USER_FLAG_RECOVERY_ANCHOR, DAMAGED),
-                want(true, true, false, NONE),
-            ),
-            (
-                120,
-                E::Tick { frames_dropped: 1 },
-                want(true, true, false, NONE),
-            ),
-            (
-                499,
-                E::Tick { frames_dropped: 1 },
-                want(true, true, false, NONE),
-            ),
-            (
-                500,
-                E::Tick { frames_dropped: 1 },
-                want(true, true, false, KEYFRAME),
-            ),
-        ]);
-    }
-
-    #[test]
-    fn a_damaged_chain_on_an_open_gate_holds_and_asks_at_once() {
-        replay(&[
-            (0, au(100), want(true, false, false, NONE)),
-            (0, decoded(0, DAMAGED), want(true, true, false, KEYFRAME)),
-        ]);
-    }
-
-    #[test]
-    fn a_damaged_chain_inside_the_window_waits_for_the_backstop() {
-        replay(&[
-            (0, au(100), want(true, false, false, NONE)),
-            (
-                0,
-                au(102),
-                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
-            ),
-            (
-                60,
-                decoded(USER_FLAG_RECOVERY_ANCHOR, CLEAN),
-                want(true, false, false, NONE),
-            ),
-            (70, decoded(0, DAMAGED), want(true, true, false, NONE)),
-            (
-                569,
-                E::Tick { frames_dropped: 1 },
-                want(true, true, false, NONE),
-            ),
-            (
-                570,
-                E::Tick { frames_dropped: 1 },
-                want(true, true, false, KEYFRAME),
-            ),
-        ]);
-    }
-
-    #[test]
-    fn a_wave_lift_forgives_the_chain_and_suspends_damage_for_one_frame() {
-        replay(&[
-            (0, au(100), want(true, false, false, NONE)),
-            (
-                0,
-                au(102),
-                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
-            ),
-            (
-                50,
-                decoded(USER_FLAG_RECOVERY_POINT, CLEAN),
-                want(true, true, false, NONE),
-            ),
-            (
-                80,
-                decoded(USER_FLAG_RECOVERY_POINT, CLEAN),
-                want(true, false, true, NONE),
-            ),
-            (
-                90,
-                decoded(USER_FLAG_RECOVERY_ANCHOR, DAMAGED),
-                want(true, false, false, NONE),
-            ),
-            (100, decoded(0, DAMAGED), want(true, true, false, KEYFRAME)),
-        ]);
-    }
-
-    #[test]
-    fn a_straggler_is_dropped_and_a_swallowed_gap_goes_when_the_window_opens() {
-        replay(&[
-            (0, au(100), want(true, false, false, NONE)),
-            (
-                0,
-                au(102),
-                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
-            ),
-            (10, au(101), want(false, true, false, NONE)),
-            (30, au(104), want(true, true, false, NONE)),
-            (
-                100,
-                au(105),
-                want(true, true, false, RecoveryAsk::Rfi(103, 103)),
-            ),
-        ]);
-    }
-
-    #[test]
-    fn a_keyframe_on_the_tick_drops_the_pending_range() {
-        replay(&[
-            (0, au(100), want(true, false, false, NONE)),
-            (
-                0,
-                au(102),
-                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
-            ),
-            (30, au(104), want(true, true, false, NONE)),
-            (
-                100,
-                E::Tick { frames_dropped: 5 },
-                want(true, true, false, KEYFRAME),
-            ),
-            (
-                101,
-                E::Tick { frames_dropped: 5 },
-                want(true, true, false, NONE),
-            ),
-        ]);
-    }
-
-    #[test]
-    fn a_no_output_streak_inside_the_window_is_re_asked_by_its_own_backstop() {
-        replay(&[
-            (0, au(100), want(true, false, false, NONE)),
-            (
-                0,
-                au(102),
-                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
-            ),
-            (10, E::NoOutput, want(true, true, false, NONE)),
-            (20, E::NoOutput, want(true, true, false, NONE)),
-            (30, E::NoOutput, want(true, true, false, NONE)),
-            (
-                120,
-                E::Tick { frames_dropped: 1 },
-                want(true, true, false, NONE),
-            ),
-            (
-                529,
-                E::Tick { frames_dropped: 1 },
-                want(true, true, false, NONE),
-            ),
-            (
-                530,
-                E::Tick { frames_dropped: 1 },
-                want(true, true, false, KEYFRAME),
-            ),
-        ]);
-    }
-
-    #[test]
-    fn an_engaged_keyframe_ask_shuts_the_window_for_the_next_gap() {
-        replay(&[
-            (0, au(100), want(true, false, false, NONE)),
-            (0, E::NeedKeyframe, want(true, true, false, KEYFRAME)),
-            (1, au(102), want(true, true, false, NONE)),
-            (
-                100,
-                E::Tick { frames_dropped: 0 },
-                want(true, true, false, RecoveryAsk::Rfi(101, 101)),
-            ),
-        ]);
-    }
-
-    #[test]
-    fn a_lost_au_arms_and_asks_and_the_idr_lifts() {
-        replay(&[
-            (0, au(100), want(true, false, false, NONE)),
-            (0, E::Lost, want(true, true, false, KEYFRAME)),
-            (
-                50,
-                decoded(u32::from(FLAG_SOF), CLEAN),
-                want(true, false, false, NONE),
-            ),
-        ]);
-    }
-
-    #[test]
-    fn a_client_on_its_own_gate_asks_at_once_and_never_holds() {
-        let t0 = Instant::now();
-        let mut d = RecoveryDriver::default();
-        assert_eq!(d.observe(100, t0), (FrameOrder::InOrder, NONE));
-        assert_eq!(
-            d.step(E::NeedKeyframe, t0),
-            want(true, false, false, KEYFRAME)
-        );
-        assert_eq!(
-            d.observe(102, t0 + Duration::from_millis(1)),
-            (FrameOrder::Gap(1), RecoveryAsk::Rfi(101, 101))
-        );
-        assert_eq!(
-            d.step(E::Tick { frames_dropped: 3 }, t0 + Duration::from_secs(1)),
-            want(true, false, false, NONE)
-        );
-    }
-
-    #[test]
-    fn a_stale_partial_is_dropped_and_a_pyrowave_straggler_is_kept() {
-        let t0 = Instant::now();
-        let mut d = RecoveryDriver::default();
-        d.set_all_intra(true);
-        d.engage(0);
-        let part = |index| E::Arrived {
-            index,
-            complete: false,
-            decode_order: 0,
-        };
-        assert!(d.step(au(100), t0).admit);
-        assert!(d.step(part(101), t0).admit);
-        assert!(
-            !d.step(part(101), t0).admit,
-            "a repeat partial is the stale past"
-        );
-        assert!(
-            d.step(au(101), t0).admit,
-            "a PyroWave straggler still decodes"
-        );
-    }
-
-    #[test]
-    fn a_recovery_point_decoded_before_the_arm_cannot_lift() {
-        let t0 = Instant::now();
-        let mut d = RecoveryDriver::default();
-        d.engage(0);
-        let at = |index, decode_order| E::Arrived {
-            index,
-            complete: true,
-            decode_order,
-        };
-        let point = |decode_order| {
-            E::Decoded(Decoded {
-                flags: 0,
-                keyframe: false,
-                evidence: CLEAN,
-                local: LocalRecovery {
-                    sei_here: true,
-                    is_recovery_point: true,
-                },
-                decode_order: Some(decode_order),
-            })
-        };
-        d.step(at(100, 0), t0);
-        assert!(
-            d.step(at(102, 5), t0).hold,
-            "the gap arms; the watermark is 5"
-        );
-        // A DPB flush hands back a picture decoded before the loss: its SEI is ignored.
-        assert_eq!(d.step(point(5), t0), want(true, true, false, NONE));
-        assert_eq!(d.step(point(6), t0), want(true, false, true, NONE));
     }
 }
