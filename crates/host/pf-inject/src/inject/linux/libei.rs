@@ -907,7 +907,7 @@ impl EiState {
                 }
                 None => emitted = false,
             },
-            Op::Key { evdev, down, .. } => match slot.interface::<ei::Keyboard>() {
+            Op::Key { evdev, down } => match slot.interface::<ei::Keyboard>() {
                 Some(k) => {
                     let st = if down {
                         ei::keyboard::KeyState::Press

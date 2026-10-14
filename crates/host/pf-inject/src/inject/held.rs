@@ -53,6 +53,11 @@ impl HeldInput {
         }
     }
 
+    /// The key codes held, in no order.
+    pub fn keys(&self) -> impl Iterator<Item = u32> + '_ {
+        self.keys.keys().copied()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.buttons.is_empty() && self.keys.is_empty() && self.touch.is_empty()
     }

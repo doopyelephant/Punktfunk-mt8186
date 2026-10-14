@@ -367,7 +367,7 @@ impl KwinFakeInjector {
                 self.fake.pointer_motion_absolute(x, y);
             }
             Op::Button { evdev, down } => self.fake.button(evdev, down.into()),
-            Op::Key { evdev, down, .. } => self.fake.keyboard_key(evdev.into(), down.into()),
+            Op::Key { evdev, down } => self.fake.keyboard_key(evdev.into(), down.into()),
             Op::TouchDown { id, at } => {
                 let (x, y) = self.place(&at);
                 self.fake.touch_down(id, x, y);

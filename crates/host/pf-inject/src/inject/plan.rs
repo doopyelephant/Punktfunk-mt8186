@@ -68,12 +68,11 @@ pub(crate) enum Op {
         evdev: u32,
         down: bool,
     },
-    /// An evdev key. `toggles` is false when the evdev key was already in that state: xkb
-    /// counts presses per key, so only a toggle may feed it.
+    /// An evdev key, once per change of its state: it goes down with the first wire key that
+    /// holds it and up with the last. xkb counts presses per key, so it may feed on every one.
     Key {
         evdev: u16,
         down: bool,
-        toggles: bool,
     },
     /// `id` is the client's touch id.
     TouchDown {
@@ -96,13 +95,12 @@ pub(crate) enum Op {
 pub(crate) struct Plan {
     /// Presses the device holds. Keys by the low byte, the VK every injector takes.
     held: HeldInput,
-    /// Evdev keys down as sent, for [`Op::Key`]'s `toggles`.
-    keys_down: Vec<u16>,
 }
 
 impl Plan {
     /// What the device emits for `ev`, noting what it now holds. `None` for a repeat, a stale
-    /// key up, an unmapped code, a zero-sized surface, scroll and pads.
+    /// key up, a key another held VK keeps down (VK_SHIFT beside VK_LSHIFT), an unmapped
+    /// code, a zero-sized surface, scroll and pads.
     pub fn step(&mut self, ev: &InputEvent) -> Option<Op> {
         let down = matches!(ev.kind, InputKind::KeyDown | InputKind::MouseButtonDown);
         Some(match ev.kind {
@@ -122,12 +120,14 @@ impl Plan {
                 if !self.held.note(&InputEvent { code: vk, ..*ev }) {
                     return None;
                 }
-                let toggles = toggle(&mut self.keys_down, evdev, down);
-                Op::Key {
-                    evdev,
-                    down,
-                    toggles,
+                let aliased = self
+                    .held
+                    .keys()
+                    .any(|k| k != vk && vk_to_evdev(k as u8) == Some(evdev));
+                if aliased {
+                    return None;
                 }
+                Op::Key { evdev, down }
             }
             InputKind::TouchDown => {
                 let at = Abs::of(ev)?;
@@ -163,17 +163,6 @@ impl Plan {
         let ups = self.held.clone().release_classes(keys, pointer);
         ups.iter().filter_map(|up| self.step(up)).collect()
     }
-}
-
-/// Record an evdev key on the down set; `true` when it changes state.
-fn toggle(keys_down: &mut Vec<u16>, evdev: u16, down: bool) -> bool {
-    let was = keys_down.contains(&evdev);
-    if down && !was {
-        keys_down.push(evdev);
-    } else if !down {
-        keys_down.retain(|&k| k != evdev);
-    }
-    down != was
 }
 
 #[cfg(test)]
@@ -221,12 +210,8 @@ mod tests {
         }
     }
 
-    fn key(evdev: u16, down: bool, toggles: bool) -> Op {
-        Op::Key {
-            evdev,
-            down,
-            toggles,
-        }
+    fn key(evdev: u16, down: bool) -> Op {
+        Op::Key { evdev, down }
     }
 
     fn button(evdev: u32, down: bool) -> Op {
@@ -256,23 +241,37 @@ mod tests {
             (
                 "an auto-repeat presses once",
                 vec![down(VK_A), down(VK_A), down(VK_A), up(VK_A)],
-                vec![key(KEY_A, true, true), key(KEY_A, false, true)],
+                vec![key(KEY_A, true), key(KEY_A, false)],
             ),
             ("a stale up stops here", vec![up(VK_A)], vec![]),
             (
                 "a code past the low byte is the same key",
                 vec![down(VK_A), down(0x100 | VK_A), up(0x100 | VK_A), up(VK_A)],
-                vec![key(KEY_A, true, true), key(KEY_A, false, true)],
+                vec![key(KEY_A, true), key(KEY_A, false)],
             ),
             (
-                "two VKs on one evdev key feed xkb on its first down and first up",
-                vec![down(VK_LSHIFT), down(VK_SHIFT), up(VK_SHIFT), up(VK_LSHIFT)],
+                "a ring's Shift under a held Left Shift neither presses nor lifts it",
                 vec![
-                    key(KEY_LEFTSHIFT, true, true),
-                    key(KEY_LEFTSHIFT, true, false),
-                    key(KEY_LEFTSHIFT, false, true),
-                    key(KEY_LEFTSHIFT, false, false),
+                    down(VK_LSHIFT),
+                    down(VK_SHIFT),
+                    down(VK_A),
+                    up(VK_A),
+                    up(VK_SHIFT),
+                    down(VK_A),
+                    up(VK_LSHIFT),
                 ],
+                vec![
+                    key(KEY_LEFTSHIFT, true),
+                    key(KEY_A, true),
+                    key(KEY_A, false),
+                    key(KEY_A, true),
+                    key(KEY_LEFTSHIFT, false),
+                ],
+            ),
+            (
+                "the last of two VKs on one key lifts it, whichever it is",
+                vec![down(VK_SHIFT), down(VK_LSHIFT), up(VK_SHIFT), up(VK_LSHIFT)],
+                vec![key(KEY_LEFTSHIFT, true), key(KEY_LEFTSHIFT, false)],
             ),
             (
                 "an unmapped key goes nowhere",
@@ -381,8 +380,8 @@ mod tests {
         }
     }
 
-    /// A lost up and a session's open press: the device lifts each once before it closes, and a
-    /// later down of the same key presses again.
+    /// A lost up and a session's open press: the device lifts each once before it closes, a
+    /// key two VKs hold included, and a later down of the same key presses again.
     #[test]
     fn a_closing_device_releases_what_it_holds_once() {
         let mut plan = Plan::default();
@@ -391,6 +390,8 @@ mod tests {
             &[
                 down(VK_A),
                 down(VK_A),
+                down(VK_LSHIFT),
+                down(VK_SHIFT),
                 ev(InputKind::MouseButtonDown, 3),
                 at(InputKind::TouchDown, 7, (1, 1), (2, 2)),
                 down(VK_TAB),
@@ -400,13 +401,14 @@ mod tests {
         assert_eq!(
             sorted(plan.release()),
             sorted(vec![
-                key(KEY_A, false, true),
+                key(KEY_A, false),
+                key(KEY_LEFTSHIFT, false),
                 button(BTN_RIGHT, false),
                 Op::TouchUp { id: 7 },
             ])
         );
         assert!(plan.release().is_empty());
-        assert_eq!(run(&mut plan, &[down(VK_A)]), [key(KEY_A, true, true)]);
+        assert_eq!(run(&mut plan, &[down(VK_A)]), [key(KEY_A, true)]);
     }
 
     /// The pointer lets go and the keys stay: a re-aimed wlr pointer drops its buttons only.
@@ -418,7 +420,7 @@ mod tests {
             &[down(VK_LCONTROL), ev(InputKind::MouseButtonDown, 1)],
         );
         assert_eq!(plan.lift(false, true), [button(BTN_LEFT, false)]);
-        assert_eq!(plan.release(), [key(KEY_LEFTCTRL, false, true)]);
+        assert_eq!(plan.release(), [key(KEY_LEFTCTRL, false)]);
     }
 
     /// Ctrl held through an Alt+Tab-style focus change: the compositor moves focus, the
@@ -442,21 +444,18 @@ mod tests {
         assert_eq!(
             ops,
             [
-                key(KEY_LEFTCTRL, true, true),
-                key(KEY_TAB, true, true),
-                key(KEY_TAB, false, true),
-                key(KEY_TAB, true, true),
-                key(KEY_TAB, false, true),
+                key(KEY_LEFTCTRL, true),
+                key(KEY_TAB, true),
+                key(KEY_TAB, false),
+                key(KEY_TAB, true),
+                key(KEY_TAB, false),
             ]
         );
-        assert_eq!(plan.release(), [key(KEY_LEFTCTRL, false, true)]);
+        assert_eq!(plan.release(), [key(KEY_LEFTCTRL, false)]);
         let mut next = Plan::default();
         assert_eq!(
             run(&mut next, &[down(VK_LCONTROL), up(VK_LCONTROL)]),
-            [
-                key(KEY_LEFTCTRL, true, true),
-                key(KEY_LEFTCTRL, false, true)
-            ]
+            [key(KEY_LEFTCTRL, true), key(KEY_LEFTCTRL, false)]
         );
     }
 
@@ -480,10 +479,10 @@ mod tests {
         assert_eq!(
             ops,
             [
-                key(KEY_A, true, true),
-                key(KEY_LEFTCTRL, true, true),
-                key(KEY_A, false, true),
-                key(KEY_LEFTCTRL, false, true),
+                key(KEY_A, true),
+                key(KEY_LEFTCTRL, true),
+                key(KEY_A, false),
+                key(KEY_LEFTCTRL, false),
             ]
         );
         assert!(plan.release().is_empty());

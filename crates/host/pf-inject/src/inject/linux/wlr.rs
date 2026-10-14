@@ -171,7 +171,7 @@ pub struct WlrootsInjector {
     /// What `pointer` and `keyboard` hold. Released before either goes; the compositor will not.
     plan: Plan,
     keyboard: ZwpVirtualKeyboardV1,
-    /// Fed only a key's toggles: it counts presses per key, and this injector outlives the
+    /// Fed only the plan's key ops: it counts presses per key, and this injector outlives the
     /// session, so an unmatched down would pin its modifier for the host's lifetime.
     xkb_state: xkb::State,
     _keymap_file: std::fs::File, // compositor mmaps this memfd; drop would unmap it
@@ -412,16 +412,10 @@ impl WlrootsInjector {
                 self.pointer.button(t, evdev, st);
                 self.pointer.frame();
             }
-            Op::Key {
-                evdev,
-                down,
-                toggles,
-            } => {
+            Op::Key { evdev, down } => {
                 self.keyboard.key(t, evdev.into(), down.into());
-                if toggles {
-                    self.xkb_state
-                        .update_key(xkb_keycode(evdev), key_direction(down));
-                }
+                self.xkb_state
+                    .update_key(xkb_keycode(evdev), key_direction(down));
                 self.send_modifiers();
             }
             Op::Text(cp) => self.type_text(cp)?,
@@ -536,14 +530,8 @@ impl Drop for WlrootsInjector {
     /// default), and an open gesture's axis interaction outlives the pointer's destroy.
     fn drop(&mut self) {
         let t = self.now_ms();
-        // One up per evdev key: a key that does not toggle is already up.
         for op in self.plan.lift(true, false) {
-            if let Op::Key {
-                evdev,
-                toggles: true,
-                ..
-            } = op
-            {
+            if let Op::Key { evdev, .. } = op {
                 self.keyboard.key(t, evdev.into(), 0);
                 self.xkb_state
                     .update_key(xkb_keycode(evdev), key_direction(false));
@@ -649,14 +637,15 @@ fn memfd_with(s: &str) -> Result<std::fs::File> {
 mod tests {
     use super::*;
 
-    const KEY_LEFTMETA: u16 = 125;
     const VK_LWIN: u32 = 0x5B;
+    const VK_SHIFT: u32 = 0x10;
+    const VK_LSHIFT: u32 = 0xA0;
 
-    /// The trap the plan's gate exists for: xkb counts presses per key, so two Super downs and
-    /// one up leave Super depressed for good. Fed only the plan's toggles, the same stream
-    /// clears it.
+    /// xkb counts presses per key, so two Super downs and one up leave Super depressed for
+    /// good. Fed only the plan's key ops, the same stream clears it. A Shift the ring presses
+    /// and lifts under a held Left Shift leaves Shift depressed until Left Shift goes up.
     #[test]
-    fn xkb_counts_presses_so_only_toggles_may_feed_it() {
+    fn xkb_counts_presses_so_only_the_plans_keys_may_feed_it() {
         let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let Some(keymap) = xkb::Keymap::new_from_names(
             &ctx,
@@ -670,11 +659,10 @@ mod tests {
             eprintln!("no xkb data on this box — skipped");
             return;
         };
-        let stream = [true, true, false];
-        let depressed = |gate: bool| {
+        let depressed = |stream: &[(u32, bool)], gate: bool| {
             let mut st = xkb::State::new(&keymap);
             let mut plan = Plan::default();
-            for down in stream {
+            for &(vk, down) in stream {
                 let kind = if down {
                     InputKind::KeyDown
                 } else {
@@ -683,19 +671,28 @@ mod tests {
                 let ev = InputEvent {
                     kind,
                     _pad: [0; 3],
-                    code: VK_LWIN,
+                    code: vk,
                     x: 0,
                     y: 0,
                     flags: 0,
                 };
-                let toggles = matches!(plan.step(&ev), Some(Op::Key { toggles: true, .. }));
-                if !gate || toggles {
-                    st.update_key(xkb_keycode(KEY_LEFTMETA), key_direction(down));
+                let key = match plan.step(&ev) {
+                    Some(Op::Key { evdev, down }) => Some((evdev, down)),
+                    _ => None,
+                };
+                let wire = crate::vk_to_evdev(vk as u8).map(|evdev| (evdev, down));
+                if let Some((evdev, down)) = if gate { key } else { wire } {
+                    st.update_key(xkb_keycode(evdev), key_direction(down));
                 }
             }
             st.serialize_mods(xkb::STATE_MODS_DEPRESSED)
         };
-        assert_ne!(depressed(false), 0, "ungated: Super pinned after the up");
-        assert_eq!(depressed(true), 0, "gated: the one up clears it");
+        let repeat = [(VK_LWIN, true), (VK_LWIN, true), (VK_LWIN, false)];
+        assert_ne!(depressed(&repeat, false), 0, "ungated: Super pinned");
+        assert_eq!(depressed(&repeat, true), 0, "gated: the one up clears it");
+        let ring = [(VK_LSHIFT, true), (VK_SHIFT, true), (VK_SHIFT, false)];
+        assert_ne!(depressed(&ring, true), 0, "Left Shift still held");
+        let lifted = [ring.as_slice(), &[(VK_LSHIFT, false)]].concat();
+        assert_eq!(depressed(&lifted, true), 0);
     }
 }
