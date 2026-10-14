@@ -295,6 +295,7 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
 
 
     DisposableEffect(handle) {
+        SessionGate.owner.attach(handle)
         streamWindow.attach()
         peripherals.start()
         // The panel's refresh pin, unbuffered input dispatch and the render-rate vote.
@@ -303,7 +304,8 @@ fun StreamScreen(session: ActiveSession, onSessionEnded: (SessionEndReason) -> U
             peripherals.stop()
             streamWindow.detach()
             planes.dispose()
-            SessionGate.close(handle) // the QUIC close drains for up to 300 ms, off this thread
+            // Closes an ended session only. A recreated activity's screen attaches to a live one.
+            SessionGate.owner.detach(handle)
         }
     }
 

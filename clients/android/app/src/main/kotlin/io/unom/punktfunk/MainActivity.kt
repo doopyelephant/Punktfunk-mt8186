@@ -300,9 +300,10 @@ class MainActivity : ComponentActivity() {
         // — the streaming one gets backgrounded, and backgrounding ends a session — so the refusal
         // has to happen HERE, before this instance is resumed, not inside the composition (which
         // only ever sees the rare `onNewIntent` case). Finishing now leaves the streaming task in
-        // front, untouched.
+        // front, untouched. A recreated activity already handled its intent: it carries no link.
+        val link = if (savedInstanceState == null) deepLinkFrom(intent) else null
         val live = SessionGate.live
-        if (live != null && deepLinkFrom(intent) != null) {
+        if (live != null && link != null) {
             // Pointing at the host already being streamed is the one exception, and its right
             // answer is to do nothing: the intent has already brought the app forward, which is
             // what "focus it" means here.
@@ -316,7 +317,7 @@ class MainActivity : ComponentActivity() {
             finish()
             return
         }
-        pendingDeepLink = deepLinkFrom(intent)
+        pendingDeepLink = link
         resolveHighRefreshMode()
         setConsoleHighRefreshRate(true) // the console UI wants max refresh; streaming manages its own
         // Dark, transparent system bars regardless of the system theme — our UI is always dark, so
