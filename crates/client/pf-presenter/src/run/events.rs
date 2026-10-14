@@ -312,10 +312,8 @@ impl Shell {
                             ),
                         }
                     }
-                    // A manual flip outranks the standing hint until the host's
-                    // intent next changes (the hint edge clears this).
                     if flipped {
-                        st.hint_override = true;
+                        st.cursor.manual_flip();
                     }
                 }
             }
@@ -381,10 +379,7 @@ impl Shell {
             return;
         };
         let video = st.last_video;
-        // The echo of our own follow-warp is not the user moving.
-        if Instant::now() >= st.warp_echo_until {
-            st.last_user_motion = Instant::now();
-        }
+        st.cursor.user_moved(Instant::now());
         let Some(cap) = st.capture.as_mut() else {
             return;
         };
@@ -511,7 +506,9 @@ impl Shell {
     }
 
     /// Drain forwarded cursor shape/state and drive the local OS cursor — only
-    /// meaningful in the desktop mouse model (capture's relative lock hides it).
+    /// meaningful in the desktop mouse model (capture's relative lock hides it). The
+    /// decisions are [`CursorModel`](crate::cursor_model::CursorModel)'s; this gathers
+    /// its inputs and performs them.
     pub(super) fn cursor_tick(&mut self, st: &mut StreamState) {
         // Host-framebuffer px → cursor-surface px: the placement scale (physical px per
         // host px) over what the backend scales a cursor by itself, so the pointer is the
@@ -526,93 +523,80 @@ impl Shell {
                 .as_ref()
                 .is_some_and(|cap| cap.captured() && cap.desktop());
             chan.pump(c, &self.mouse, desktop_active, cursor_scale);
-            // We draw the pointer while released (a released cursor over a composited one is
-            // a frozen twin), in desktop mode, or relative on the host's hint: only the state
-            // it keeps forwarding can clear the hint. Without the pointer grant the host
-            // pointer is someone else's, so the host draws it.
-            let hint_relative = !st.hint_override && st.last_hint == Some(true);
-            let client_draws = match st.capture.as_ref() {
-                Some(cap) => {
-                    (!cap.captured() || cap.desktop() || hint_relative)
-                        && cap.grants() & punktfunk_core::quic::GRANT_POINTER != 0
-                }
-                None => true,
-            };
-            if chan.negotiated() && st.sent_client_draws != Some(client_draws) {
-                st.sent_client_draws = Some(client_draws);
-                let _ = c.set_cursor_render(client_draws);
-            }
         }
-        // Host-driven mode flip: `relative_hint` set = run captured relative; clear
-        // = return to absolute. Edge-triggered so a manual chord is not fought: the
-        // override latch holds until the host's intent next changes. The hint must hold
-        // [`HINT_SETTLE`] with no button down (Windows hides the pointer for a click or a
-        // keystroke), and a grab needs the pointer over this window.
         let hint_state = st.cursor_chan.as_ref().and_then(|ch| ch.state());
-        if let Some(hs) = hint_state {
-            let hint = hs.relative_hint();
-            if st.last_hint != Some(hint) {
-                st.last_hint = Some(hint);
-                st.hint_override = false;
-                st.hint_since = std::time::Instant::now();
-            }
-            if !st.hint_override && st.hint_since.elapsed() >= HINT_SETTLE {
-                let video = st.last_video;
-                let over_us = !hint || self.mouse.focused_window_id() == Some(self.window.id());
-                if let Some(cap) = st.capture.as_mut() {
-                    if cap.captured()
-                        && !cap.buttons_held()
-                        && over_us
-                        && !self.ring_was_open
-                        && cap.set_desktop(!hint)
-                    {
-                        self.capture_on(cap);
-                        if cap.desktop() {
-                            // Reappear where the host last had the pointer so the
-                            // hand-back is seamless.
-                            if let Some(video) = video {
-                                let (wx, wy) = content_to_window(
-                                    self.opts.video_fit,
-                                    self.window.size(),
-                                    self.window.size_in_pixels(),
-                                    video,
-                                    hs.x,
-                                    hs.y,
-                                );
-                                self.mouse.warp_mouse_in_window(&self.window, wx, wy);
-                            }
-                        }
-                        tracing::info!(
-                            desktop = cap.desktop(),
-                            "host cursor hint: mouse model flipped"
-                        );
-                    }
+        let a = st
+            .cursor
+            .decide(&self.cursor_inputs(st, hint_state), Instant::now());
+        if let (Some(draws), Some(c)) = (a.client_draws, st.connector.as_ref()) {
+            let _ = c.set_cursor_render(draws);
+        }
+        let Some(hs) = hint_state else {
+            return;
+        };
+        if let (Some(desktop), Some(cap)) = (a.want_desktop, st.capture.as_mut()) {
+            if cap.set_desktop(desktop) {
+                self.capture_on(cap);
+                // Reappear where the host last had the pointer so the hand-back is seamless.
+                if let (true, Some(video)) = (cap.desktop(), st.last_video) {
+                    self.warp_to_host(video, (hs.x, hs.y));
                 }
-            }
-            // Something else moved the pointer we draw (controller mouse, a trackpad
-            // gesture, an app warping it): once the user's own mouse has been still for
-            // longer than a round trip, the local cursor goes where the host put it.
-            let over_us = self.mouse.focused_window_id() == Some(self.window.id());
-            let still = st.last_user_motion.elapsed() >= FOLLOW_HOST_AFTER;
-            if let (Some(cap), Some(video)) = (st.capture.as_mut(), st.last_video) {
-                let drifted = cap.last_abs().is_some_and(|(x, y)| {
-                    (x - hs.x).abs() > FOLLOW_SLACK_PX || (y - hs.y).abs() > FOLLOW_SLACK_PX
-                });
-                if cap.captured() && cap.desktop() && hs.visible() && over_us && still && drifted {
-                    let (wx, wy) = content_to_window(
-                        self.opts.video_fit,
-                        self.window.size(),
-                        self.window.size_in_pixels(),
-                        video,
-                        hs.x,
-                        hs.y,
-                    );
-                    st.warp_echo_until = Instant::now() + WARP_ECHO;
-                    self.mouse.warp_mouse_in_window(&self.window, wx, wy);
-                    cap.followed_host((hs.x, hs.y));
-                }
+                tracing::info!(
+                    desktop = cap.desktop(),
+                    "host cursor hint: mouse model flipped"
+                );
             }
         }
+        // Gathered again: the flip and its warp above change what the follow reads.
+        let inputs = self.cursor_inputs(st, hint_state);
+        if st.cursor.follow(&inputs, Instant::now()) {
+            if let (Some(cap), Some(video)) = (st.capture.as_mut(), st.last_video) {
+                self.warp_to_host(video, (hs.x, hs.y));
+                cap.followed_host((hs.x, hs.y));
+            }
+        }
+    }
+
+    /// What the cursor decisions read: the channel, the capture, SDL's pointer focus, the
+    /// ring.
+    fn cursor_inputs(
+        &self,
+        st: &StreamState,
+        host: Option<punktfunk_core::quic::CursorState>,
+    ) -> crate::cursor_model::Inputs {
+        use crate::cursor_model::{CaptureFacts, HostCursor, Inputs};
+        Inputs {
+            negotiated: st.connector.is_some()
+                && st.cursor_chan.as_ref().is_some_and(|ch| ch.negotiated()),
+            host: host.map(|hs| HostCursor {
+                relative_hint: hs.relative_hint(),
+                visible: hs.visible(),
+                pos: (hs.x, hs.y),
+            }),
+            capture: st.capture.as_ref().map(|cap| CaptureFacts {
+                captured: cap.captured(),
+                desktop: cap.desktop(),
+                buttons_held: cap.buttons_held(),
+                pointer: cap.grants() & punktfunk_core::quic::GRANT_POINTER != 0,
+                last_abs: cap.last_abs(),
+            }),
+            over_us: self.mouse.focused_window_id() == Some(self.window.id()),
+            ring_open: self.ring_was_open,
+            video: st.last_video.is_some(),
+        }
+    }
+
+    /// Put the local cursor on the host's pointer at frame pixel `pos`.
+    fn warp_to_host(&self, video: (u32, u32), pos: (i32, i32)) {
+        let (wx, wy) = content_to_window(
+            self.opts.video_fit,
+            self.window.size(),
+            self.window.size_in_pixels(),
+            video,
+            pos.0,
+            pos.1,
+        );
+        self.mouse.warp_mouse_in_window(&self.window, wx, wy);
     }
 
     /// SDL text input tracks overlay editing (IME / Steam OSK), edge-wise.
@@ -1120,20 +1104,6 @@ pub(super) fn cursor_surface_scale(window: &sdl3::video::Window) -> f32 {
         1.0
     }
 }
-
-/// How long the host's relative hint must hold before the mouse model follows it: longer
-/// than the hide Windows does for a click, short against a game grabbing the pointer.
-pub(super) const HINT_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// Mouse stillness before the local cursor follows host-driven motion: past a round trip, so
-/// the host's echo of the user's own motion is never mistaken for someone else's.
-pub(super) const FOLLOW_HOST_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// How long motion events after a follow-warp are its echo, not the user.
-pub(super) const WARP_ECHO: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// Rounding between window and frame pixels; a smaller difference is the same spot.
-pub(super) const FOLLOW_SLACK_PX: i32 = 2;
 
 #[cfg(test)]
 mod tests {

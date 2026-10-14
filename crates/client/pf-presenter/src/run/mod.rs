@@ -447,22 +447,8 @@ struct StreamState {
     last_video: Option<(u32, u32)>,
     /// Created with the connector; inert when the host did not negotiate the channel.
     cursor_chan: Option<crate::cursor::CursorChannel>,
-    /// Auto-flip fires on changes only, so it never fights a user who chorded away.
-    last_hint: Option<bool>,
-    /// When `last_hint` last changed; the flip waits out
-    /// [`HINT_SETTLE`](events::HINT_SETTLE) from here.
-    hint_since: std::time::Instant,
-    /// When the user last moved the mouse; the local cursor follows host-driven motion only
-    /// after [`FOLLOW_HOST_AFTER`](events::FOLLOW_HOST_AFTER) of stillness.
-    last_user_motion: std::time::Instant,
-    /// Motion events before this are the echo of a follow-warp.
-    warp_echo_until: std::time::Instant,
-    /// User flipped the model manually. The standing hint stops driving until the
-    /// host's intent next changes (a fresh hint edge clears this and applies).
-    hint_override: bool,
-    /// Last `client_draws` told to the host; `None` = nothing sent yet. Edge-detected
-    /// from the live mouse model so chord, auto-flip, and engage/release share one path.
-    sent_client_draws: Option<bool>,
+    /// Who draws the pointer, the host hint's settle, and the follow-warp's echo.
+    cursor: crate::cursor_model::CursorModel,
     /// Welcome advert, then every mid-session `AccessUpdate` (latest wins). Default is
     /// full control, permanent — what a host that never sent access decodes to.
     access: pf_client_core::access::SessionAccess,

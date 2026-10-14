@@ -22,6 +22,9 @@
 pub(crate) mod csc;
 #[cfg(any(target_os = "linux", windows))]
 pub mod cursor;
+// Pure cursor decisions: built (and tested) on every platform, used by `run`.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+mod cursor_model;
 #[cfg(windows)]
 pub(crate) mod d3d11;
 #[cfg(target_os = "linux")]
