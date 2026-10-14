@@ -144,10 +144,6 @@ pub struct CaptureEpisode {
     pub consecutive_failures: u32,
     pub cooldown: std::time::Duration,
 }
-// The Linux capturer reaches `DmabufFrame` through `super::`; `CursorOverlay` it names directly as
-// `pf_frame::CursorOverlay`, so only `DmabufFrame` needs to sit in this crate root's scope.
-#[cfg(target_os = "linux")]
-use pf_frame::DmabufFrame;
 
 /// Context on a capture loss whose display is still up (the import side broke, not the
 /// compositor): the host may re-attach a capturer to the same output instead of creating

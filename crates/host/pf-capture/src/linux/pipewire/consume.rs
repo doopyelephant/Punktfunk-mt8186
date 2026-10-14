@@ -10,7 +10,7 @@ use super::queue::{RenderFence, RENDER_GUARD};
 use super::UserData;
 use crate::linux::pw_cursor::composite_cursor;
 use crate::linux::sync_timeline::{plane_count, StreamBuffers, SyncPoints};
-use crate::{CapturedFrame, DmabufFrame, FramePayload, PixelFormat};
+use crate::{CapturedFrame, FramePayload, PixelFormat};
 use pf_dmabuf::{ReadMap, Share};
 use pipewire as pw;
 use pw::spa;
@@ -534,17 +534,14 @@ fn publish_held(
         height: a.h as u32,
         pts_ns: a.pts_ns,
         format: fmt,
-        payload: FramePayload::Dmabuf(DmabufFrame {
-            fd: dup,
+        payload: FramePayload::Dmabuf(ud.signals.held_dmabuf(
+            dup,
             fourcc,
-            modifier: ud.modifier,
-            offset,
-            stride,
+            ud.modifier,
+            (offset, stride),
             plane1,
-            hold: Some(hold),
-            health: ud.signals.health.clone(),
-            rebuild: ud.signals.broken.clone(),
-        }),
+            hold,
+        )),
         // RGB→NV12 backends blend cursor-as-metadata. Gamescope burns the pointer in;
         // native NV12/P010 has none.
         cursor: ud.cursor.overlay(),
