@@ -49,6 +49,58 @@ async fn the_cert_lane_reads_profiles_but_never_edits_them() {
     assert_eq!(send_cert(&app, create, fp).await, StatusCode::UNAUTHORIZED);
 }
 
+/// A paired device wakes the profile it lands in when it names none; another profile's seat
+/// needs the launch grant. The console wakes any.
+#[tokio::test]
+async fn waking_another_profiles_seat_needs_the_launch_grant() {
+    use punktfunk_core::quic::{GRANT_GAMEPAD, GRANT_LAUNCH};
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(
+                std::env::temp_dir().join(format!("pf-mgmt-prof-wake-{}.json", std::process::id())),
+            ),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let access = |grants| {
+        Some(crate::native_pairing::Access {
+            grants,
+            expires_unix: None,
+            until_disconnect: false,
+        })
+    };
+    let (guest, full) = ("aaaa00000049", "bbbb00000049");
+    np.add_with_access("guest", guest, access(GRANT_GAMEPAD))
+        .unwrap();
+    np.add_with_access("full", full, access(GRANT_GAMEPAD | GRANT_LAUNCH))
+        .unwrap();
+    let state = state_with_profiles("wake");
+    let owner = state.profiles.get().unwrap().owner_id().unwrap();
+    let app = test_app_native(state, np);
+    let create = json_req(
+        Method::POST,
+        "/api/v1/profiles",
+        serde_json::json!({ "display_name": "Kid" }),
+    );
+    let (status, kid) = send(&app, create).await;
+    assert_eq!(status, StatusCode::CREATED, "{kid}");
+    let kid = kid["id"].as_str().unwrap().to_string();
+    let wake = |id: &str| {
+        axum::http::Request::post(format!("/api/v1/profiles/{id}/wake"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        send_cert(&app, wake(&kid), guest).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(send_cert(&app, wake(&owner), guest).await, StatusCode::OK);
+    assert_eq!(send_cert(&app, wake(&kid), full).await, StatusCode::OK);
+    assert_eq!(send(&app, wake(&kid)).await.0, StatusCode::OK);
+}
+
 /// Where there are no seats the read says so and a change is a plain 409. The lanes are
 /// pinned by `every_route_is_classified_for_the_plugin_and_cert_lanes`.
 #[cfg(not(windows))]

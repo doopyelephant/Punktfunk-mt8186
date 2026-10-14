@@ -12,12 +12,14 @@ import {
 } from "@/api/pluginSurface";
 import { gamePlugins, usePlugins } from "@/api/plugins";
 import { useSeat } from "@/api/seat";
+import { PasswordConfirmDialog } from "@/components/password-confirm";
 import {
 	type JsonObject,
 	type JsonSchemaDoc,
 	SchemaForm,
 } from "@/components/schema-form";
 import { Button } from "@/components/ui/button";
+import { newlyHanded } from "@/lib/handed-paths";
 import { m } from "@/paraglide/messages";
 import { Group } from "./fields";
 import type { PluginTabSpec } from "./view";
@@ -98,6 +100,8 @@ const PluginTab: FC<{
 	const [draft, setDraft] = useState<JsonObject | null>(stored);
 	const [saving, setSaving] = useState(false);
 	const [refused, setRefused] = useState<{ path: string; error: string }[]>([]);
+	// A save that hands a folder over waits for the console password.
+	const [asking, setAsking] = useState(false);
 
 	if (loaded.tag === "offline") {
 		return (
@@ -113,16 +117,27 @@ const PluginTab: FC<{
 	}
 
 	const dirty = JSON.stringify(draft) !== JSON.stringify(stored);
+	const put = async (value: JsonObject, password?: string) => {
+		const saved = await pluginSurfaceOrThrow<{
+			access?: { refused?: { path: string; error: string }[] };
+		} | null>(sectionUrl(plugin.id, entryId), {
+			method: "PUT",
+			body: value,
+			password,
+		});
+		setRefused(saved?.access?.refused ?? []);
+		toast.success(m.library_entry_saved());
+		await qc.invalidateQueries({ queryKey: sectionKey(plugin.id, entryId) });
+	};
 	const save = async () => {
 		if (!draft) return;
+		if (newlyHanded(loaded.section.schema, stored, draft).length) {
+			setAsking(true);
+			return;
+		}
 		setSaving(true);
 		try {
-			const saved = await pluginSurfaceOrThrow<{
-				access?: { refused?: { path: string; error: string }[] };
-			} | null>(sectionUrl(plugin.id, entryId), { method: "PUT", body: draft });
-			setRefused(saved?.access?.refused ?? []);
-			toast.success(m.library_entry_saved());
-			await qc.invalidateQueries({ queryKey: sectionKey(plugin.id, entryId) });
+			await put(draft);
 		} catch (e) {
 			toast.error(
 				m.library_entry_plugin_save_failed({
@@ -192,6 +207,17 @@ const PluginTab: FC<{
 					{m.library_save()}
 				</Button>
 			</div>
+			<PasswordConfirmDialog
+				open={asking}
+				id={`plugin-game-password-${plugin.id}`}
+				title={m.plugin_form_confirm_title()}
+				body={m.plugin_form_confirm_body({ plugin: plugin.title })}
+				submitLabel={m.library_save()}
+				onSubmit={async (password) => {
+					if (draft) await put(draft, password);
+				}}
+				onClose={() => setAsking(false)}
+			/>
 		</Group>
 	);
 };

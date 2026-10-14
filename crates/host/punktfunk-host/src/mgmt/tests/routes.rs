@@ -156,6 +156,7 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         ("POST", "/api/v1/library/custom", true, false),
         // The stored row names host paths (`detect`): operator only, like hide.
         ("GET", "/api/v1/library/custom/{id}", false, false),
+        // A plugin reaches only its own provider's rows: `a_plugin_changes_only_its_own_library_rows`.
         ("PUT", "/api/v1/library/custom/{id}", true, false),
         ("DELETE", "/api/v1/library/custom/{id}", true, false),
         ("PUT", "/api/v1/library/provider/{provider}", true, false),
@@ -326,6 +327,57 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
             if *cert_ok { "reachable" } else { "denied" }
         );
     }
+}
+
+/// The plugin lane reaches `PUT` and `DELETE /library/custom/{id}`, but a row is a plugin's only
+/// when its own provider publishes it: the operator's rows and another plugin's answer 403.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_plugin_changes_only_its_own_library_rows() {
+    let _dir = ConfigDirOverride::new();
+    let app = test_app(test_state(), None);
+    let manual = crate::library::add_custom(
+        serde_json::from_value(serde_json::json!({ "title": "Mine" })).unwrap(),
+    )
+    .unwrap()
+    .id;
+    let published = |provider: &str| {
+        let row = serde_json::json!({ "external_id": "a", "title": "A" });
+        let inputs = vec![serde_json::from_value(row).unwrap()];
+        match crate::library::reconcile_provider(provider, None, inputs).unwrap() {
+            crate::library::MutateOutcome::Done(rows) => rows[0].id.clone(),
+            _ => panic!("reconcile {provider}"),
+        }
+    };
+    let (own, other) = (published("demo"), published("romm"));
+    let put = |token: &str, id: &str| {
+        let body = serde_json::json!({ "title": "Renamed" });
+        let path = format!("/api/v1/library/custom/{id}");
+        with_bearer(json_req(Method::PUT, &path, body), token)
+    };
+    let delete = |token: &str, id: &str| {
+        let req = axum::http::Request::delete(format!("/api/v1/library/custom/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        with_bearer(req, token)
+    };
+    // `demo-secret` is the identified `demo` plugin; `plugin-secret` is the runner's shared token.
+    for token in ["demo-secret", "plugin-secret"] {
+        for id in [&manual, &other] {
+            let (status, _) = send(&app, put(token, id)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{token} PUT {id}");
+            let (status, _) = send(&app, delete(token, id)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{token} DELETE {id}");
+        }
+    }
+    assert_eq!(crate::library::get_custom(&manual).unwrap().title, "Mine");
+    // Its own row still changes through its reconcile, not here.
+    let (status, _) = send(&app, put("demo-secret", &own)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = send(&app, put("test-secret", &manual)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&app, delete("test-secret", &manual)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
 /// The seat proxy is the operator's: no plugin and no paired device reaches a seat through it.

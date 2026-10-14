@@ -1,8 +1,16 @@
 // The console's calls to a plugin's own surfaces: `/api/plugin-metadata`, `/api/plugin-config` and
 // `/api/plugin-game`. Hand-written, since the plugin serves them and not the host API. Built on
 // `apiFetch`, so a lost session goes to /login like every other call.
+import { PASSWORD_HEADER } from "@/lib/password-gates";
 import { m } from "@/paraglide/messages";
 import { ApiError, apiFetch } from "./fetcher";
+
+/** A save: its JSON body, and the console password when the save hands a folder over. */
+interface Send {
+	method: "PUT" | "POST";
+	body: unknown;
+	password?: string;
+}
 
 /** A surface's refusal: the plugin's own `issue`, the route's `error`, and its 404 markers. */
 interface SurfaceRefusal {
@@ -26,14 +34,19 @@ export type SurfaceAnswer<T> =
  */
 export async function pluginSurface<T>(
 	url: string,
-	send?: { method: "PUT" | "POST"; body: unknown },
+	send?: Send,
 ): Promise<SurfaceAnswer<T>> {
 	try {
 		const body = await apiFetch<T>(
 			url,
 			send && {
 				method: send.method,
-				headers: { "content-type": "application/json" },
+				headers: {
+					"content-type": "application/json",
+					...(send.password === undefined
+						? {}
+						: { [PASSWORD_HEADER]: send.password }),
+				},
 				body: JSON.stringify(send.body),
 			},
 		);
@@ -55,12 +68,15 @@ export function refusalText(body: SurfaceRefusal | undefined): string {
 	return body?.statusMessage || m.library_source_settings_refused();
 }
 
-/** {@link pluginSurface}, throwing the refusal's text: for a caller with no marker to read. */
+/**
+ * {@link pluginSurface}, throwing the refusal as an `ApiError` whose message is its text: for a
+ * caller with no marker to read. A password dialog reads its status.
+ */
 export async function pluginSurfaceOrThrow<T>(
 	url: string,
-	send?: { method: "PUT" | "POST"; body: unknown },
+	send?: Send,
 ): Promise<T> {
 	const r = await pluginSurface<T>(url, send);
-	if (!r.ok) throw new Error(refusalText(r.body));
+	if (!r.ok) throw new ApiError(r.status, r.body, refusalText(r.body));
 	return r.body;
 }

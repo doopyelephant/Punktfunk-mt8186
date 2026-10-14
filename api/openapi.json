@@ -3129,6 +3129,16 @@
               }
             }
           },
+          "403": {
+            "description": "A plugin named a row its own provider does not publish",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "404": {
             "description": "No custom entry with that id",
             "content": {
@@ -3173,6 +3183,16 @@
           },
           "401": {
             "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A plugin named a row its own provider does not publish",
             "content": {
               "application/json": {
                 "schema": {
@@ -6805,7 +6825,7 @@
           "profiles"
         ],
         "summary": "Get a profile's seat ready",
-        "description": "Starts a stopped seat so the next connect lands in it, and answers at once with the seat\n`starting`; poll `enumerate` until it is `ready`. A light seat starts with its first\nconnect, so on Linux this only answers the row.",
+        "description": "Starts a stopped seat so the next connect lands in it, and answers at once with the seat\n`starting`; poll `enumerate` until it is `ready`. A light seat starts with its first\nconnect, so on Linux this only answers the row. A paired device wakes the profile it lands\nin when it names none; any other needs its launch grant.",
         "operationId": "wakeProfile",
         "parameters": [
           {
@@ -6831,6 +6851,16 @@
           },
           "401": {
             "description": "Missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "This device may not start another profile's seat",
             "content": {
               "application/json": {
                 "schema": {

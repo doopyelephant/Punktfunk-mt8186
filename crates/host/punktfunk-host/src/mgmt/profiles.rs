@@ -3,9 +3,9 @@
 //! Three routes are on the cert lane, for every paired device: the list a client's picker
 //! shows, a profile's picture, and waking its seat. Everything that changes a profile is the
 //! console's, among them turning seats on. A profile is not a trust boundary: any paired
-//! device may pick any profile.
+//! device may pick any profile, but starting another profile's seat takes the launch grant.
 
-use super::auth::PairedDevice;
+use super::auth::{AuthLane, PairedDevice};
 use super::shared::*;
 use crate::profiles::{
     EditError, Home, OsAccount, Profile, ProfileCreate, ProfileUpdate, Profiles,
@@ -500,7 +500,8 @@ pub(crate) async fn get_profile_avatar(
 ///
 /// Starts a stopped seat so the next connect lands in it, and answers at once with the seat
 /// `starting`; poll `enumerate` until it is `ready`. A light seat starts with its first
-/// connect, so on Linux this only answers the row.
+/// connect, so on Linux this only answers the row. A paired device wakes the profile it lands
+/// in when it names none; any other needs its launch grant.
 #[utoipa::path(
     post,
     path = "/profiles/{id}/wake",
@@ -510,11 +511,14 @@ pub(crate) async fn get_profile_avatar(
     responses(
         (status = OK, description = "The profile, its seat as it is now", body = ProfilePublic),
         (status = UNAUTHORIZED, description = "Missing or invalid credentials", body = ApiError),
+        (status = FORBIDDEN, description = "This device may not start another profile's seat", body = ApiError),
         (status = NOT_FOUND, description = "No profile with that id", body = ApiError),
     )
 )]
 pub(crate) async fn wake_profile(
     State(st): State<Arc<MgmtState>>,
+    Extension(lane): Extension<AuthLane>,
+    device: Option<Extension<PairedDevice>>,
     Path(id): Path<String>,
 ) -> Response {
     let Some(profiles) = st.app.profiles.get() else {
@@ -523,6 +527,13 @@ pub(crate) async fn wake_profile(
     let Some(p) = profiles.get(&id) else {
         return api_error(StatusCode::NOT_FOUND, "no profile with that id");
     };
+    let fp = device.map(|Extension(PairedDevice(fp))| fp);
+    if lane != AuthLane::Admin && !may_wake(&st, profiles, &p.id, fp.as_deref()) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "This device isn't allowed to start another profile's seat.",
+        );
+    }
     let seats = seats_now().await;
     let on_a_row = match seats.row_of(&p.os_account) {
         Some(row) => {
@@ -539,6 +550,20 @@ pub(crate) async fn wake_profile(
         }
     }
     Json(row).into_response()
+}
+
+/// A paired device wakes the profile it lands in when it names none, and another only while
+/// its live mask (expiry-aware) carries the launch grant.
+fn may_wake(st: &MgmtState, profiles: &Profiles, id: &str, fp: Option<&str>) -> bool {
+    let Some(fp) = fp else {
+        return false;
+    };
+    let own = profiles.resolve(Some(fp), None).is_ok_and(|r| r.id == id);
+    own || st
+        .native
+        .as_ref()
+        .and_then(|n| n.effective(fp, crate::clock::unix_secs()))
+        .is_some_and(|mask| mask & punktfunk_core::quic::GRANT_LAUNCH != 0)
 }
 
 /// List the profiles with what the console manages

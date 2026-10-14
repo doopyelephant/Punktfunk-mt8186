@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { handedPaths, keepAfterDrop, newlyHanded } from "./handedPaths";
+import { handedPaths, keepAfterDrop, newlyHanded } from "./handed-paths";
 
 const schema = {
 	schema: {

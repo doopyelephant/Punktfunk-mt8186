@@ -20,9 +20,11 @@ import {
 	useUpdateNativeClientAccess,
 } from "@/api/gen/native/native";
 import { useDialogs } from "@/components/dialogs";
+import { PasswordConfirmDialog } from "@/components/password-confirm";
 import { ROW } from "@/components/stagger";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { widensAccess } from "@/lib/password-gates";
 import { m } from "@/paraglide/messages";
 import {
 	ClientPolicySheet,
@@ -173,11 +175,28 @@ export function usePairedDevices() {
 		);
 	};
 
+	// A change that widens a device's access waits for the console password; the sheet stays open.
+	const [widening, setWidening] = useState<{
+		fingerprint: string;
+		body: UpdateNativeAccess;
+	} | null>(null);
 	const savedAccess = () => {
 		setEditing(null);
 		qc.invalidateQueries({ queryKey: getListNativeClientsQueryKey() });
 	};
-	const onSaveAccess = (fingerprint: string, body: UpdateNativeAccess) =>
+	const onSaveAccess = (fingerprint: string, body: UpdateNativeAccess) => {
+		const row = rows.find(
+			(r) => r.protocol === "native" && r.fingerprint === fingerprint,
+		);
+		const stored = row && {
+			grants: row.grants,
+			expires_unix: row.expiresUnix,
+			until_disconnect: row.untilDisconnect,
+		};
+		if (widensAccess(stored, body, Math.floor(Date.now() / 1000))) {
+			setWidening({ fingerprint, body });
+			return;
+		}
 		patchAccess.mutate(
 			{ fingerprint, data: body },
 			{
@@ -185,6 +204,7 @@ export function usePairedDevices() {
 				onError: () => toast.error(m.access_edit_failed()),
 			},
 		);
+	};
 	// "Expire now" = the same partial PATCH with a zero relative expiry — cuts live sessions
 	// from this device with the typed AccessExpired close; the row stays listed as "Expired".
 	const onExpireNow = (fingerprint: string) =>
@@ -301,6 +321,25 @@ export function usePairedDevices() {
 					onExpireNow={onExpireNow}
 					onRemove={onRemoveFromSheet}
 					isPending={patchAccess.isPending}
+				/>
+				<PasswordConfirmDialog
+					open={widening !== null}
+					id="access-widen-password"
+					title={m.access_edit_title()}
+					body={m.access_widen_confirm_body()}
+					submitLabel={m.common_save()}
+					failedText={m.access_edit_failed()}
+					onSubmit={async (password) => {
+						if (!widening) return;
+						// The console's server reads the password from the body and strips it.
+						const data = { ...widening.body, password } as UpdateNativeAccess;
+						await patchAccess.mutateAsync({
+							fingerprint: widening.fingerprint,
+							data,
+						});
+						savedAccess();
+					}}
+					onClose={() => setWidening(null)}
 				/>
 			</>
 		),

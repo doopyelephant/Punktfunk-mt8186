@@ -10,8 +10,10 @@ import {
 	useGetHostSettings,
 	useGetPlayingApps,
 } from "@/api/gen/host/host";
+import { PasswordConfirmDialog } from "@/components/password-confirm";
 import { apiErrorMessage } from "@/lib/errors";
 import { useLocale } from "@/lib/i18n";
+import { touchesPlane } from "@/lib/password-gates";
 import { m } from "@/paraglide/messages";
 import { GpuRow } from "../Host/GpuRow";
 import { ConfirmDialog } from "../Host/PowerCard";
@@ -75,12 +77,26 @@ export const HostSettings: FC<{ top?: ReactNode }> = ({ top }) => {
 			return next;
 		});
 
+	// A plane setting waits for the console password; until then the control shows the stored value.
+	const [asking, setAsking] = useState<{ id: string; value: unknown } | null>(
+		null,
+	);
+	const askingRow = state.data?.settings.find((s) => s.id === asking?.id);
+
 	// One key per request: the answer is the whole new state, so it replaces the cache outright.
+	const save = async (id: string, value: unknown, password?: string) => {
+		// The console's server reads the password from the body and strips it.
+		const next = await patchHostSettings({ [id]: value, password });
+		qc.setQueryData(getGetHostSettingsQueryKey(), next);
+	};
 	const onSet = async (id: string, value: unknown) => {
+		if (touchesPlane({ [id]: value })) {
+			setAsking({ id, value });
+			return;
+		}
 		settle(id, true);
 		try {
-			const next = await patchHostSettings({ [id]: value });
-			qc.setQueryData(getGetHostSettingsQueryKey(), next);
+			await save(id, value);
 		} catch (e) {
 			toast.error(apiErrorMessage(e) ?? m.host_settings_save_failed());
 			qc.invalidateQueries({ queryKey: getGetHostSettingsQueryKey() });
@@ -111,6 +127,20 @@ export const HostSettings: FC<{ top?: ReactNode }> = ({ top }) => {
 						onRestart={() => setConfirming(true)}
 					/>
 				}
+			/>
+			<PasswordConfirmDialog
+				open={asking !== null}
+				id="host-settings-password"
+				title={m.host_settings_confirm_title({
+					name: askingRow ? labelOf(askingRow) : "",
+				})}
+				body={m.host_settings_confirm_body()}
+				submitLabel={m.common_save()}
+				failedText={m.host_settings_save_failed()}
+				onSubmit={async (password) => {
+					if (asking) await save(asking.id, asking.value, password);
+				}}
+				onClose={() => setAsking(null)}
 			/>
 			{confirming && restartAction && (
 				<ConfirmDialog
