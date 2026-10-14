@@ -76,7 +76,15 @@ fn variant(mut payload: Value, name: &str) -> Result<Value> {
 /// Run one `Action`; niri answers `"Handled"`. Unknown output or window names are not errors to
 /// niri, so a caller that cares reads the result back.
 pub(crate) fn action(action: Value) -> Result<()> {
-    request(&json!({ "Action": action })).map(drop)
+    request(&action_request(action)).map(drop)
+}
+
+pub(crate) fn action_request(action: Value) -> Value {
+    json!({ "Action": action })
+}
+
+pub(crate) fn output_request(output: &str, action: Value) -> Value {
+    json!({ "Output": { "output": output, "action": action } })
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -91,6 +99,10 @@ pub(crate) struct OutputMode {
 pub(crate) struct Logical {
     pub x: i32,
     pub y: i32,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
     pub scale: f64,
 }
 
@@ -118,6 +130,7 @@ impl Output {
 pub(crate) struct Workspace {
     pub id: u64,
     pub idx: u8,
+    pub name: Option<String>,
     pub output: Option<String>,
     #[serde(default)]
     pub is_active: bool,
@@ -135,6 +148,15 @@ pub(crate) struct Window {
     pub workspace_id: Option<u64>,
     #[serde(default)]
     pub is_focused: bool,
+    #[serde(default)]
+    pub layout: WindowLayout,
+}
+
+/// The one layout field the host reads: the tile's size in logical pixels.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct WindowLayout {
+    #[serde(default)]
+    pub tile_size: (f64, f64),
 }
 
 pub(crate) fn version() -> Result<String> {
@@ -163,7 +185,7 @@ pub(crate) fn windows() -> Result<Vec<Window>> {
 /// Configure `output` (`Off`, `On`, `{"Scale":…}`, `{"CustomMode":…}`). An output niri does not
 /// know is an error here, not niri's silent `OutputWasMissing`.
 pub(crate) fn output_action(output: &str, action: Value) -> Result<()> {
-    let reply = request(&json!({ "Output": { "output": output, "action": action } }))?;
+    let reply = request(&output_request(output, action))?;
     match variant(reply, "OutputConfigChanged")?.as_str() {
         Some("OutputWasMissing") => bail!("niri has no output {output}"),
         _ => Ok(()),

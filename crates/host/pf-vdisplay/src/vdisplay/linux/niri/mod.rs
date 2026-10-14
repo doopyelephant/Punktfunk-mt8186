@@ -9,10 +9,12 @@
 //! killed host is recognisable and [`reclaim_leftovers_once`] can remove it.
 
 pub(crate) mod cast;
+pub(crate) mod desktop;
 pub(crate) mod ipc;
 
 use super::{Mode, SessionCastParts, VirtualDisplay, VirtualOutput};
 use crate::hyprland::{is_managed_output, next_output_name, output_owner_pid};
+use crate::topology_journal::{self as journal, Undo};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::sync::Once;
@@ -194,22 +196,39 @@ struct PendingCast {
 }
 
 pub struct NiriDisplay {
+    /// Whose display this is, for the per-device topology and scale resolved inside `create`.
+    client_fp: Option<[u8; 32]>,
     /// The registry splits the output's lifetime from the session's cast around `create`.
     handoff_cast: bool,
     pending_cast: Option<PendingCast>,
     /// `mode_conflict: join`: the registry shares a live output and casts it for this session.
     join_live: bool,
-    /// The last `create`'s output, for `apply_position`.
-    last_output: Option<String>,
+    /// Journal seqs of the heads `exclusive` turned off, across every `create` of this instance:
+    /// one instance serves the host's retry loop, and only attempt 1 finds heads to turn off.
+    /// The registry takes them and runs them when the group empties; [`Drop`] runs what a
+    /// create that never reached the pool left.
+    pending_undo: Vec<u64>,
+    /// The output the last `create` or recast used: the next `create` carries its workspace
+    /// over, and `apply_position` places it.
+    prev_output: Option<String>,
+}
+
+impl Drop for NiriDisplay {
+    fn drop(&mut self) {
+        let seqs = std::mem::take(&mut self.pending_undo);
+        journal::apply(&seqs, self);
+    }
 }
 
 impl NiriDisplay {
     pub fn new() -> Result<Self> {
         Ok(NiriDisplay {
+            client_fp: None,
             handoff_cast: false,
             pending_cast: None,
             join_live: false,
-            last_output: None,
+            pending_undo: Vec::new(),
+            prev_output: None,
         })
     }
 }
@@ -223,6 +242,18 @@ impl VirtualDisplay for NiriDisplay {
     /// metadata to give, so the cast matches it and the host composites nothing.
     fn last_portal_cursor_mode(&self) -> Option<crate::PortalCursorMode> {
         Some(crate::PortalCursorMode::Embedded)
+    }
+
+    fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
+        self.client_fp = fingerprint;
+    }
+
+    fn take_undo_seqs(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pending_undo)
+    }
+
+    fn undo(&mut self, undo: &Undo) -> Result<()> {
+        desktop::undo(undo)
     }
 
     fn set_join_live(&mut self, on: bool) {
@@ -255,12 +286,14 @@ impl VirtualDisplay for NiriDisplay {
             }
         }
         let (node_id, keepalive) = cast::start(name, false)?;
+        // A recast output is the workspace source for the next `create`, as on Hyprland.
+        self.prev_output = Some(name.to_string());
         Ok(Some((node_id, None, keepalive)))
     }
 
     /// Where the console's arrangement puts this output, in niri's logical space.
     fn apply_position(&mut self, x: i32, y: i32) {
-        let Some(name) = self.last_output.as_deref() else {
+        let Some(name) = self.prev_output.as_deref() else {
             return;
         };
         let at = json!({ "Position": { "position": { "Specific": { "x": x, "y": y } } } });
@@ -290,12 +323,26 @@ impl VirtualDisplay for NiriDisplay {
                 "niri: the virtual output came up at another size — streaming what it has"
             );
         }
+        if let Some(scale) = crate::policy::prefs()
+            .get()
+            .scale_for(crate::policy::fp_hex(self.client_fp).as_deref())
+        {
+            desktop::apply_scale(&name, scale);
+        }
         focus_output(&name);
         let (node_id, cast) = cast::start(&name, false)?;
         tracing::info!(
             output = %name, node_id, w = width, h = height, mhz,
             "niri virtual output ready"
         );
+        // Last fallible step: nothing after it can fail, so no path turns heads off and then
+        // unwinds past the journal hand-off.
+        if crate::backend::exclusive_wanted("niri", self.client_fp) {
+            desktop::disable_other_heads(&name, &mut self.pending_undo);
+        }
+        if let Some(prev) = self.prev_output.replace(name.clone()) {
+            desktop::adopt_active_workspace(&prev, &name);
+        }
         let keepalive: Box<dyn Send> = if self.handoff_cast {
             self.pending_cast = Some(PendingCast {
                 name: name.clone(),
@@ -309,7 +356,6 @@ impl VirtualDisplay for NiriDisplay {
                 _output: output,
             })
         };
-        self.last_output = Some(name.clone());
         let mut out =
             VirtualOutput::owned(node_id, Some((width, height, mode.refresh_hz)), keepalive);
         // Extend topology: input and direct capture find the output by its `wl_output` name.

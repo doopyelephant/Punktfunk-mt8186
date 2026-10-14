@@ -140,19 +140,22 @@ impl Compositor {
     pub fn honours_keep_monitors(self) -> bool {
         matches!(
             self,
-            Compositor::Kwin | Compositor::Hyprland | Compositor::Wlroots
+            Compositor::Kwin | Compositor::Hyprland | Compositor::Wlroots | Compositor::Niri
         )
     }
 
     /// Puts a launch on a workspace of its own (`claim_workspace`).
     pub fn places_launch_workspace(self) -> bool {
-        matches!(self, Compositor::Hyprland | Compositor::Wlroots)
+        matches!(
+            self,
+            Compositor::Hyprland | Compositor::Wlroots | Compositor::Niri
+        )
     }
 
-    /// Starts a device's screen at its own scale. Mutter only: KWin and Windows remember each
-    /// device's scale themselves.
+    /// Starts a device's screen at its own scale. Mutter and niri: KWin and Windows remember
+    /// each device's scale themselves.
     pub fn applies_device_scale(self) -> bool {
-        matches!(self, Compositor::Mutter)
+        matches!(self, Compositor::Mutter | Compositor::Niri)
     }
 
     pub fn label(self) -> &'static str {
@@ -1078,6 +1081,15 @@ mod tests {
         );
         // No live session → no backend; the caller maps this to handshake error / fallback.
         assert_eq!(compositor_for_kind(ActiveKind::None), None);
+    }
+
+    /// The console greys out a setting no backend here can honour; niri honours these three.
+    #[test]
+    fn niri_claims_the_desktop_integration_it_implements() {
+        let niri = Compositor::Niri;
+        assert!(niri.honours_keep_monitors());
+        assert!(niri.places_launch_workspace());
+        assert!(niri.applies_device_scale());
     }
 
     /// Spawn-vs-attach for [`gamescope_hdr_available`] /
