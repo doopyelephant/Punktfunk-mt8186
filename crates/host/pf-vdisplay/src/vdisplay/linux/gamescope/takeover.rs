@@ -23,7 +23,7 @@ pub(super) struct Takeover {
     /// A managed launch runs. Another waits on [`WAKE`]; nothing on the hand-back path does.
     launching: bool,
     /// The latest launch took the box and produced no session ([`launch_tracked`]), so the
-    /// hand-back does not wait on keep-alive forever ([`hand_back_delay`]).
+    /// hand-back waits the debounce at most, whatever the keep-alive ([`hand_back_delay`]).
     launch_failed: bool,
     /// The managed `exclusive` darken. A bool, not a count: the session outlives connects.
     darkened: bool,
@@ -1267,14 +1267,18 @@ fn restore_delay() -> Option<Duration> {
     }
 }
 
-/// The hand-back's delay: the keep-alive's, `None` (forever) keeping the box. Forever keeps a
-/// session, not a box a failed launch left dark: that one hands back after the debounce.
+/// The hand-back's delay: the keep-alive's, `None` (forever) keeping the box. A keep-alive keeps
+/// a session; a failed launch left none, so its box goes back after the debounce at most.
 fn hand_back_delay(keep_alive: Option<Duration>, launch_failed: bool) -> Option<Duration> {
-    keep_alive.or(launch_failed.then_some(RESTORE_DEBOUNCE))
+    if launch_failed {
+        Some(keep_alive.map_or(RESTORE_DEBOUNCE, |d| d.min(RESTORE_DEBOUNCE)))
+    } else {
+        keep_alive
+    }
 }
 
-/// Debounced restore so a reconnect reuses the warm session. `keep_alive=forever` schedules none
-/// unless the latest launch produced no session ([`hand_back_delay`]).
+/// Debounced restore so a reconnect reuses the warm session, on the keep-alive's delay
+/// (`forever` schedules none), or the debounce after a launch that produced no session.
 pub fn schedule_restore_tv_session() {
     let keep_alive = restore_delay();
     let mut t = takeover();
@@ -1296,8 +1300,7 @@ pub fn schedule_restore_tv_session() {
     }
 }
 
-/// A launch that took the box failed: hand it back on the keep-alive, or after the debounce
-/// under forever.
+/// A launch that took the box failed: hand it back after the debounce at most.
 pub(super) fn hand_back_after_failed_launch() {
     takeover().launch_failed = true;
     schedule_restore_tv_session();
@@ -1918,15 +1921,15 @@ mod tests {
         assert_eq!(Idle.due_in(now), None);
     }
 
-    /// Keep-alive decides the hand-back, except that forever keeps a session and not a box a
-    /// failed launch left dark.
+    /// Keep-alive decides the hand-back of a session. A failed launch left none, so forever and
+    /// a timed keep-alive alike hand its box back after the debounce; a shorter one stays.
     #[test]
-    fn forever_keeps_a_session_not_a_failed_launch() {
+    fn keep_alive_keeps_a_session_not_a_failed_launch() {
         let linger = Some(Duration::from_secs(600));
         assert_eq!(hand_back_delay(None, false), None);
         assert_eq!(hand_back_delay(None, true), Some(RESTORE_DEBOUNCE));
         assert_eq!(hand_back_delay(linger, false), linger);
-        assert_eq!(hand_back_delay(linger, true), linger);
+        assert_eq!(hand_back_delay(linger, true), Some(RESTORE_DEBOUNCE));
         assert_eq!(
             hand_back_delay(Some(Duration::ZERO), true),
             Some(Duration::ZERO)
