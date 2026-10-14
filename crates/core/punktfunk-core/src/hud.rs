@@ -552,7 +552,8 @@ pub fn player_label(slots: u16) -> Option<String> {
     }
 }
 
-/// The codec as the overlay names it. Empty for a wire id this build does not know.
+/// The codec as every overlay and client names it. Empty for a wire id this build does not
+/// know: a caller leaves it out rather than guess.
 pub fn codec_label(codec: u8) -> &'static str {
     match codec {
         crate::quic::CODEC_H264 => "H.264",
@@ -1495,6 +1496,16 @@ fn standard_lines(s: &StatsSnapshot, tier: StatsVerbosity) -> Vec<HudLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each wire codec has its name; an id this build does not know is empty, never a guess.
+    #[test]
+    fn codec_label_names_each_codec_and_leaves_an_unknown_one_empty() {
+        use crate::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
+        let named = [CODEC_H264, CODEC_HEVC, CODEC_AV1, CODEC_PYROWAVE].map(codec_label);
+        assert_eq!(named, ["H.264", "HEVC", "AV1", "PyroWave"]);
+        assert_eq!(codec_label(0), "");
+        assert_eq!(codec_label(0x10), "");
+    }
 
     /// Apple devices already store these names; they must round-trip unchanged.
     #[test]
