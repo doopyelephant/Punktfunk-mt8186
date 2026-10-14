@@ -294,8 +294,9 @@ unsafe fn copy_blocking(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
     }
 }
 
-/// Enqueue `copy` with no CPU wait. Stream-ordered consumers only: `src` must stay valid until
-/// downstream stream work (the encode) finishes.
+/// Enqueue `copy` with no CPU wait. Stream-ordered consumers only: the source buffer must not
+/// be dropped until downstream stream work (the encode) finishes. A pooled one is recycled on
+/// drop, and the next capture writes over it while this copy may still read.
 unsafe fn copy_async(copy: &CUDA_MEMCPY2D, what: &str) -> Result<()> {
     // SAFETY: caller: context current and `copy` describes live in-bounds memory that stays valid
     // until the stream work completes.
@@ -549,8 +550,8 @@ impl BufferPool {
         self.height
     }
 
-    /// Recycled if free, else freshly allocated. Returns to this pool on drop (consumer must have
-    /// synced). NV12: Y and its paired UV.
+    /// Recycled if free, else freshly allocated. Returns to this pool on drop, under
+    /// [`DeviceBuffer`]'s rule for unsynced copies. NV12: Y and its paired UV.
     pub fn get(&self) -> Result<DeviceBuffer> {
         let reuse = {
             let mut g = self.inner.lock().unwrap();
@@ -599,6 +600,9 @@ impl Planes {
 
 /// Pitched device buffer for one captured frame. Filled from the EGL-mapped dmabuf so the dmabuf
 /// can return to the compositor immediately. Pooled buffers recycle on drop; others free.
+///
+/// Drop cannot tell whether a copy still reads the buffer. Whoever issues a `sync: false` copy
+/// out of it keeps it alive until that copy ran: the safety contract of each copy function.
 pub struct DeviceBuffer {
     pub ptr: CUdeviceptr,
     pub pitch: usize,
@@ -713,7 +717,7 @@ impl Drop for DeviceBuffer {
             return;
         }
         if let Some(pool) = &self.pool {
-            // Consumer synced before drop. Y and UV go back together so `get` can pop them as a unit.
+            // The next `get` overwrites it. Y and UV go back together so `get` can pop them as a unit.
             let mut g = pool.lock().unwrap();
             g.free.push(self.ptr);
             if let Some((uv_ptr, _)) = self.uv() {
@@ -844,8 +848,8 @@ pub unsafe fn copy_surface_to_surface(
 ///
 /// # Safety
 /// The context is current, `src` describes a live allocation, `dst_ptr` is a live allocation of
-/// `src.height` rows of `dst_pitch` ≥ `src.width * 4` bytes, and with `sync: false` `src` stays
-/// valid until downstream stream work completes.
+/// `src.height` rows of `dst_pitch` ≥ `src.width * 4` bytes, and with `sync: false` `src` is not
+/// dropped until downstream stream work completes.
 pub unsafe fn copy_device_to_device(
     src: &DeviceBuffer,
     dst_ptr: CUdeviceptr,
@@ -884,8 +888,8 @@ fn device_copy(
 ///
 /// # Safety
 /// The context is current, `src` describes a live allocation, each `dsts` plane is live with
-/// the rows its layout's plane table gives it at that pitch, and with `sync: false` `src` stays
-/// valid until downstream stream work completes.
+/// the rows its layout's plane table gives it at that pitch, and with `sync: false` `src` is
+/// not dropped until downstream stream work completes.
 unsafe fn copy_planes_to_device(
     src: &DeviceBuffer,
     dsts: &[(CUdeviceptr, usize)],
@@ -917,7 +921,7 @@ unsafe fn copy_planes_to_device(
 /// # Safety
 /// The context is current, `src` describes a live allocation, `y_dst`/`uv_dst` are live planes
 /// at `y_pitch`/`uv_pitch` holding [`PlaneLayout::Nv12`]'s rows for `src`, and with
-/// `sync: false` `src` stays valid until downstream stream work completes.
+/// `sync: false` `src` is not dropped until downstream stream work completes.
 pub unsafe fn copy_nv12_to_device(
     src: &DeviceBuffer,
     y_dst: CUdeviceptr,
@@ -936,8 +940,8 @@ pub unsafe fn copy_nv12_to_device(
 ///
 /// # Safety
 /// The context is current, `src` describes a live stacked allocation, each `dsts` plane is live
-/// with `src.height` rows of its pitch ≥ `src.width`, and with `sync: false` `src` stays valid
-/// until downstream stream work completes.
+/// with `src.height` rows of its pitch ≥ `src.width`, and with `sync: false` `src` is not
+/// dropped until downstream stream work completes.
 pub unsafe fn copy_yuv444_to_device(
     src: &DeviceBuffer,
     dsts: [(CUdeviceptr, usize); 3],
