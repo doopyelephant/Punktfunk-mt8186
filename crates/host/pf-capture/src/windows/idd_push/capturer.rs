@@ -92,8 +92,8 @@ impl IddPushCapturer {
             self.max_hb_age_us = self.max_hb_age_us.max(age.as_micros() as u64);
         }
         let geometry = (self.width, self.height, self.out_format());
-        let driver_seq = self.encoder.map(|t| t.source_seq);
-        if !self.delivery.admit(driver_seq, geometry) {
+        let source = self.encoder.map(|t| (t.opened_at, t.source_seq));
+        if !self.delivery.admit(source, geometry) {
             return Ok(None);
         }
         let now = Instant::now();

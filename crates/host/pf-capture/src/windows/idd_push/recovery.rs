@@ -387,6 +387,7 @@ mod tests {
     fn enc(last_au: Instant, published_total: u64, detached: u32) -> Option<EncoderTelemetry> {
         Some(EncoderTelemetry {
             last_au,
+            opened_at: last_au,
             published_total,
             detached,
             source_seq: 0,

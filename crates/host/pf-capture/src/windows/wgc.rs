@@ -406,8 +406,8 @@ impl WgcCapturer {
                 other => tracing::debug!(kind = other, "capture worker: unknown event"),
             }
         }
-        let seq = self.encoder.map(|t| t.source_seq);
-        if !self.delivery.admit(seq, (self.width, self.height)) {
+        let source = self.encoder.map(|t| (t.opened_at, t.source_seq));
+        if !self.delivery.admit(source, (self.width, self.height)) {
             return Ok(None);
         }
         self.frames += 1;

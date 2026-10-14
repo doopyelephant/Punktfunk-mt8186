@@ -421,7 +421,7 @@ pub struct EncoderProxy {
     /// Bitstream capture while `PUNKTFUNK_IDD_DIAG` is on; dropped on the first write error.
     dump: Option<AuDump>,
     /// Stands in for `last_au_qpc` until the first publish, so a never-producing encoder is
-    /// silent from a known instant rather than invisible.
+    /// silent from a known instant rather than invisible. Also this proxy's identity.
     opened_at: Instant,
     /// The backend the driver opened, for the status surface.
     backend: &'static str,
@@ -665,7 +665,8 @@ impl Encoder for EncoderProxy {
     }
 
     /// The classifier's two clocks straight from the AU header: the drain worker's heartbeat and
-    /// the encoder's publish stamp, both QPC ages turned into local instants.
+    /// the encoder's publish stamp, both QPC ages turned into local instants. `opened_at` tells
+    /// this proxy's counters from its predecessor's.
     fn telemetry(&self) -> Option<pf_frame::health::EncoderTelemetry> {
         let h = self.snapshot();
         let stamp = |qpc: u64| {
@@ -677,6 +678,7 @@ impl Encoder for EncoderProxy {
             // Before the first access unit the encoder's open time stands in, so a
             // never-producing encoder is silent from a known instant.
             last_au: stamp(h.last_au_qpc).unwrap_or(self.opened_at),
+            opened_at: self.opened_at,
             published_total: h.published_total,
             detached: h.detached,
             source_seq: h.source_seq,
