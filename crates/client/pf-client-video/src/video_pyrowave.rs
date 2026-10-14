@@ -3,10 +3,10 @@
 //! packet: `push_packet` → ready → `decode_gpu_buffer` into our command buffer,
 //! submitted under [`QueueLock`], fence-waited.
 //!
-//! Output is three STORAGE planes (Y full-res; Cb/Cr half-res, or full-res on 4:4:4;
-//! R8, or R16 UNORM at 10-bit). Encoder RG packing is invalid here (`pyrowave.h`).
-//! Colour comes from negotiated `ColorInfo`; the bitstream has no VUI. A plane-set
-//! ring keeps decode from overwriting a set the presenter still samples.
+//! Output is three planes (Y full-res; Cb/Cr half-res, or full-res on 4:4:4; R8, or R16
+//! UNORM at 10-bit), drawn by fragment passes where pyrowave prefers them, else by compute.
+//! Encoder RG packing is invalid here (`pyrowave.h`). Colour is the negotiated `ColorInfo`;
+//! the bitstream has no VUI. A plane-set ring keeps decode off a set the presenter samples.
 //!
 //! pyrowave 0.4.0 needs instance/device create-infos alive for the shared device.
 //! The presenter does not pin its originals, so [`Hold`] reconstructs content-equivalent
@@ -258,8 +258,9 @@ struct RetiredRing {
     retired_at: Instant,
 }
 
-/// One decode-output plane: STORAGE (decode writes) + SAMPLED (presenter CSC), in
-/// device-local memory. No such memory type is an error.
+/// One decode-output plane in device-local memory: STORAGE (compute decode, the native
+/// lane's chroma pass) + SAMPLED (presenter CSC), plus COLOR_ATTACHMENT when the
+/// `fragment` iDWT draws into it. No such memory type is an error.
 ///
 /// # Safety
 ///
@@ -270,7 +271,12 @@ unsafe fn make_plane(
     w: u32,
     h: u32,
     fmt: vk::Format,
+    fragment: bool,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+    let mut usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+    if fragment {
+        usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+    }
     // SAFETY: fn contract; the create-info is a local that outlives the call.
     let img = unsafe {
         device.create_image(
@@ -286,7 +292,7 @@ unsafe fn make_plane(
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
+                .usage(usage)
                 .initial_layout(vk::ImageLayout::UNDEFINED),
             None,
         )
@@ -371,6 +377,7 @@ unsafe fn build_ring(
     height: u32,
     chroma444: bool,
     fmt: vk::Format,
+    fragment: bool,
 ) -> Result<Arc<PlaneRing>> {
     // Presenter planar CSC samples with normalized UVs; chroma resolution is transparent.
     let (cw, ch) = if chroma444 {
@@ -392,7 +399,7 @@ unsafe fn build_ring(
             .enumerate()
         {
             // SAFETY: fn contract.
-            match unsafe { make_plane(device, mem_props, w, h, fmt) } {
+            match unsafe { make_plane(device, mem_props, w, h, fmt, fragment) } {
                 Ok(p) => (set.imgs[i], set.mems[i], set.views[i]) = p,
                 Err(e) => {
                     // SAFETY: every handle in `ring` is null or made above, never used.
@@ -418,8 +425,11 @@ pub struct PyroWaveDecoder {
     pw_dev: pw::pyrowave_device,
     pw_dec: pw::pyrowave_decoder,
     ring: Arc<PlaneRing>,
-    /// Per slot: written once. First use transitions from UNDEFINED, later ones
-    /// GENERAL→GENERAL.
+    /// The iDWT runs as fragment passes into the planes, pyrowave's pick for the GPU
+    /// (Mali, Qualcomm's driver), when the plane format takes colour attachments.
+    fragment: bool,
+    /// Per slot: written once. First use transitions from UNDEFINED, later ones from
+    /// GENERAL.
     initialized: [bool; RING],
     retired: Vec<RetiredRing>,
     next: usize,
@@ -511,6 +521,24 @@ impl PyroWaveDecoder {
         // SAFETY: fn contract; the presenter created queue 0 of its graphics family.
         let queue = unsafe { device.get_device_queue(vkd.graphics_qf, 0) };
 
+        let pdev = vk::PhysicalDevice::from_raw(vkd.physical_device as u64);
+        // SAFETY: fn contract: `pdev` is the live instance's physical device.
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
+        let plane_fmt = if hdr16 {
+            vk::Format::R16_UNORM
+        } else {
+            vk::Format::R8_UNORM
+        };
+        // SAFETY: as above.
+        let plane_features =
+            unsafe { instance.get_physical_device_format_properties(pdev, plane_fmt) }
+                .optimal_tiling_features;
+        // R16_UNORM STORAGE_IMAGE is optional in Vulkan. Probe so a miss is a clear
+        // error instead of a validation failure.
+        if hdr16 && !plane_features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE) {
+            bail!("10-bit PyroWave decode needs R16_UNORM storage images, which this GPU lacks");
+        }
+
         let hold = Box::new(Hold::build(vkd));
         let queue_lock = vkd.queue_lock.clone();
         let mut queue_info = pw::pyrowave_device_create_queue_info {
@@ -550,6 +578,10 @@ impl PyroWaveDecoder {
         let _ = unsafe {
             pw::pyrowave_device_set_queue_type(pw_dev, pw::VkQueueFlagBits_VK_QUEUE_COMPUTE_BIT)
         };
+        // The fragment iDWT draws into the planes; R16_UNORM colour attachments are optional.
+        // SAFETY: `pw_dev` was created above.
+        let fragment = unsafe { pw::pyrowave_decoder_device_prefers_fragment_path(pw_dev) }
+            && plane_features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT);
 
         let dinfo = pw::pyrowave_decoder_create_info {
             device: pw_dev,
@@ -560,8 +592,7 @@ impl PyroWaveDecoder {
             } else {
                 pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
             },
-            // fragment-iDWT is Mali/Adreno only.
-            fragment_path: false,
+            fragment_path: fragment,
         };
         let mut pw_dec: pw::pyrowave_decoder = std::ptr::null_mut();
         // SAFETY: `pw_dev` was created above; `dinfo` and `pw_dec` are locals.
@@ -580,36 +611,18 @@ impl PyroWaveDecoder {
             }
         };
 
-        let pdev = vk::PhysicalDevice::from_raw(vkd.physical_device as u64);
-        // SAFETY: fn contract: `pdev` is the live instance's physical device.
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
-        // R16_UNORM STORAGE_IMAGE is optional in Vulkan. Probe so a miss is a clear
-        // error instead of a validation failure.
-        let plane_fmt = if hdr16 {
-            // SAFETY: as above.
-            let props = unsafe {
-                instance.get_physical_device_format_properties(pdev, vk::Format::R16_UNORM)
-            };
-            if !props
-                .optimal_tiling_features
-                .contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
-            {
-                destroy_pw();
-                bail!("this GPU lacks R16_UNORM STORAGE_IMAGE — cannot decode a 10-bit PyroWave session");
-            }
-            vk::Format::R16_UNORM
-        } else {
-            vk::Format::R8_UNORM
-        };
         // SAFETY: fn contract; `mem_props` are the device's physical device's.
-        let ring =
-            match unsafe { build_ring(&device, &mem_props, width, height, chroma444, plane_fmt) } {
-                Ok(r) => r,
-                Err(e) => {
-                    destroy_pw();
-                    return Err(e);
-                }
-            };
+        let ring = match unsafe {
+            build_ring(
+                &device, &mem_props, width, height, chroma444, plane_fmt, fragment,
+            )
+        } {
+            Ok(r) => r,
+            Err(e) => {
+                destroy_pw();
+                return Err(e);
+            }
+        };
 
         // SAFETY: fn contract; every create-info is a local that outlives its call.
         let (cmd_pool, cmd, fence) = unsafe {
@@ -632,7 +645,8 @@ impl PyroWaveDecoder {
         tracing::info!(
             width,
             height,
-            "PyroWave decoder open on the presenter's device (compute iDWT, BT.709 limited)"
+            idwt = if fragment { "fragment" } else { "compute" },
+            "PyroWave decoder open on the presenter's device"
         );
         Ok(PyroWaveDecoder {
             device,
@@ -642,6 +656,7 @@ impl PyroWaveDecoder {
             pw_dev,
             pw_dec,
             ring,
+            fragment,
             initialized: [false; RING],
             retired: Vec::new(),
             next: 0,
@@ -678,7 +693,7 @@ impl PyroWaveDecoder {
             } else {
                 pw::pyrowave_chroma_subsampling_PYROWAVE_CHROMA_SUBSAMPLING_420
             },
-            fragment_path: false,
+            fragment_path: self.fragment,
         };
         let mut new_dec: pw::pyrowave_decoder = std::ptr::null_mut();
         // SAFETY: `pw_dev` is this decoder's live device; `dinfo`/`new_dec` are locals.
@@ -698,6 +713,7 @@ impl PyroWaveDecoder {
                 height,
                 self.chroma444,
                 fmt,
+                self.fragment,
             )
         } {
             Ok(r) => r,
@@ -954,20 +970,33 @@ impl PyroWaveDecoder {
             base_array_layer: 0,
             layer_count: 1,
         };
+        // Every reader of a decoded slot (same queue): CSC sampling, or the native lane's
+        // chroma pass and luma copy.
+        let readers = vk::PipelineStageFlags2::FRAGMENT_SHADER
+            | vk::PipelineStageFlags2::COMPUTE_SHADER
+            | vk::PipelineStageFlags2::COPY;
+        // pyrowave's render passes take the planes in ATTACHMENT_OPTIMAL and leave them there.
+        let (write_stage, write_access, write_layout) = if self.fragment {
+            (
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::ImageLayout::ATTACHMENT_OPTIMAL,
+            )
+        } else {
+            (
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                vk::ImageLayout::GENERAL,
+            )
+        };
         let to_write = |img| {
             vk::ImageMemoryBarrier2::default()
-                // Order against the presenter's prior reads of this slot (same queue): CSC
-                // sampling, or the native lane's chroma pass and luma copy.
-                .src_stage_mask(
-                    vk::PipelineStageFlags2::FRAGMENT_SHADER
-                        | vk::PipelineStageFlags2::COMPUTE_SHADER
-                        | vk::PipelineStageFlags2::COPY,
-                )
+                .src_stage_mask(readers)
                 .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(write_stage)
+                .dst_access_mask(write_access)
                 .old_layout(old_layout)
-                .new_layout(vk::ImageLayout::GENERAL)
+                .new_layout(write_layout)
                 .image(img)
                 .subresource_range(range)
         };
@@ -999,7 +1028,7 @@ impl PyroWaveDecoder {
             layer: 0,
             aspect: pw::VkImageAspectFlagBits_VK_IMAGE_ASPECT_COLOR_BIT,
             swizzle: pw::VkComponentSwizzle_VK_COMPONENT_SWIZZLE_IDENTITY,
-            layout: pw::VkImageLayout_VK_IMAGE_LAYOUT_GENERAL,
+            layout: write_layout.as_raw() as pw::VkImageLayout,
         };
         let (w, h) = (self.width, self.height);
         let (cw, ch) = if self.chroma444 {
@@ -1016,7 +1045,7 @@ impl PyroWaveDecoder {
         };
         // SAFETY: `pw_dev`/`pw_dec` are this decoder's; `cmd` is recording on this thread
         // only and is unset again before return. `buffers` names the slot's ring images at
-        // their created format and extent, in GENERAL after the barrier above.
+        // their created format and extent, in `write_layout` after the barrier above.
         let dec_res = unsafe {
             pw::pyrowave_device_set_command_buffer(
                 self.pw_dev,
@@ -1033,15 +1062,19 @@ impl PyroWaveDecoder {
         };
         pw_check(dec_res, "decode_gpu_buffer")?;
 
-        // Storage writes → presenter fragment sampling. Layout stays GENERAL: that is
-        // what the planar CSC descriptors use.
+        // Decode writes → every reader, in GENERAL: what their descriptors and copies use.
+        // The native lane's own barrier waits on compute only, so this one covers it.
         let to_read = |img| {
             vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                .old_layout(vk::ImageLayout::GENERAL)
+                .src_stage_mask(write_stage)
+                .src_access_mask(write_access)
+                .dst_stage_mask(readers)
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_SAMPLED_READ
+                        | vk::AccessFlags2::SHADER_STORAGE_READ
+                        | vk::AccessFlags2::TRANSFER_READ,
+                )
+                .old_layout(write_layout)
                 .new_layout(vk::ImageLayout::GENERAL)
                 .image(img)
                 .subresource_range(range)
