@@ -399,7 +399,7 @@ pub(crate) fn probe_only_stream(common: &mut StreamCommon, probe_seq: bool) -> R
     const PROBE_ONLY_BYTES: u64 = 2 << 30;
     tracing::info!("diagnostic session: probes only, no pipeline");
     let started = std::time::Instant::now();
-    while !common.stop.load(Ordering::SeqCst) && started.elapsed() < PROBE_ONLY_MAX {
+    while !common.life.stopping() && started.elapsed() < PROBE_ONLY_MAX {
         if common.session.stats().bytes_sent >= PROBE_ONLY_BYTES {
             while common.ends.probe_rx.try_recv().is_ok() {
                 let _ = common.ends.probe_result_tx.send(declined());
@@ -407,7 +407,7 @@ pub(crate) fn probe_only_stream(common: &mut StreamCommon, probe_seq: bool) -> R
         } else {
             service_probes(
                 &mut common.session,
-                &common.stop,
+                common.life.stop_flag(),
                 &common.ends.probe_rx,
                 &common.ends.probe_result_tx,
                 probe_seq,
@@ -494,11 +494,8 @@ pub(crate) struct StreamCommon {
     pub(crate) session: Session,
     pub(crate) mode: punktfunk_core::Mode,
     pub(crate) seconds: u32,
-    pub(crate) stop: Arc<AtomicBool>,
-    /// Set on `QUIT_CODE`. Display lease skips keep-alive linger for a user stop.
-    pub(crate) quit: Arc<AtomicBool>,
-    /// [`crate::events::SessionEndReason`] latch for the session summary; first write wins.
-    pub(crate) end_reason: Arc<std::sync::atomic::AtomicU8>,
+    /// The flags every thread of the session reads, and the one `end` that writes them.
+    pub(crate) life: crate::lifecycle::Lifecycle,
     /// Session totals for the summary; the encode loop notes every bitrate it runs at.
     pub(crate) counters: Arc<crate::session_status::SessionCounters>,
     pub(crate) ends: super::wiring::StreamEnds,

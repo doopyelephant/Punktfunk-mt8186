@@ -267,6 +267,95 @@ pub(crate) fn reconfig_allowed(
     compositor != Some(crate::vdisplay::Compositor::Gamescope) && !per_client_mode && !shared
 }
 
+/// The send loop's idle tick: with no AU in hand it still revisits `stop`, the FEC target and
+/// the 2 s stats window. The encode loop's hand-off re-reads its flags on the same tick.
+const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// 40 idle ticks. A paced AU is a few ms and the final probe report one more; past this the
+/// socket write is stuck, and the thread is left to it rather than holding the session's end.
+pub(super) const SEND_JOIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The send thread and the one strong sender to it. A client's NACK reaches the thread
+/// through a weak sender, so dropping this one ends the loop; the drop then waits for the
+/// thread, so a summary built after it holds every counter the thread writes.
+pub(super) struct SendThread {
+    tx: Option<Arc<std::sync::mpsc::SyncSender<SendMsg>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SendThread {
+    pub(super) fn new(
+        tx: Arc<std::sync::mpsc::SyncSender<SendMsg>>,
+        thread: std::thread::JoinHandle<()>,
+    ) -> Self {
+        SendThread {
+            tx: Some(tx),
+            thread: Some(thread),
+        }
+    }
+
+    /// Queue `msg`, waiting while the queue is full and asking `give_up` every idle tick.
+    /// `false` once the thread is gone or `give_up` says so: either way the AU is dropped
+    /// and the caller is leaving. A full queue is retried every millisecond: a slot frees
+    /// after one paced send, so the wait past it is under a millisecond.
+    pub(super) fn send(&self, msg: SendMsg, mut give_up: impl FnMut() -> bool) -> bool {
+        use std::sync::mpsc::TrySendError;
+        const FULL_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
+        let Some(tx) = self.tx.as_ref() else {
+            return false;
+        };
+        let mut msg = msg;
+        let mut asked = std::time::Instant::now();
+        loop {
+            match tx.try_send(msg) {
+                Ok(()) => return true,
+                Err(TrySendError::Disconnected(_)) => return false,
+                Err(TrySendError::Full(back)) => {
+                    if asked.elapsed() >= IDLE_TICK {
+                        if give_up() {
+                            return false;
+                        }
+                        asked = std::time::Instant::now();
+                    }
+                    msg = back;
+                    std::thread::sleep(FULL_RETRY);
+                }
+            }
+        }
+    }
+
+    /// Close the channel and wait for the thread, at most [`SEND_JOIN_GRACE`]. A second call
+    /// does nothing.
+    pub(super) fn join(&mut self) {
+        self.join_within(SEND_JOIN_GRACE);
+    }
+
+    fn join_within(&mut self, grace: std::time::Duration) {
+        drop(self.tx.take());
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + grace;
+        while !thread.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+        } else {
+            tracing::warn!(
+                grace_s = grace.as_secs(),
+                "send thread still running after its channel closed — detaching it"
+            );
+        }
+    }
+}
+
+impl Drop for SendThread {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn send_loop(
     session: Session,
@@ -312,9 +401,6 @@ pub(super) fn send_loop(
         wire,
         stats,
     };
-    // Idle tick: with no AU in hand the loop still revisits `stop`, the FEC target and the
-    // 2 s stats window.
-    const IDLE_TICK: std::time::Duration = std::time::Duration::from_millis(50);
     apply_fec_target(&mut lp.session, &lp.fec_target);
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -719,10 +805,77 @@ impl PerfLine {
 
 #[cfg(test)]
 mod tests {
-    use super::{send_loop, AuMeta, FrameMsg, PaceStat, PerfWindow, SendMsg, SendStats};
+    use super::{
+        send_loop, AuMeta, FrameMsg, PaceStat, PerfWindow, SendMsg, SendStats, SendThread,
+    };
     use punktfunk_core::transport::Transport;
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
     use std::sync::Arc;
+
+    /// Dropping the handle closes the channel and waits for the thread, so nothing of the
+    /// session runs on past the drop.
+    #[test]
+    fn dropping_the_handle_joins_the_thread() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<SendMsg>(1);
+        let ended = Arc::new(AtomicBool::new(false));
+        let thread = std::thread::spawn({
+            let ended = ended.clone();
+            move || {
+                while rx.recv().is_ok() {}
+                ended.store(true, Ordering::SeqCst);
+            }
+        });
+        drop(SendThread::new(Arc::new(tx), thread));
+        assert!(ended.load(Ordering::SeqCst));
+    }
+
+    /// A thread that never comes back is left to its stuck write once the grace is spent:
+    /// the session's end waits that long and no longer.
+    #[test]
+    fn a_stuck_thread_is_detached_after_the_grace() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<SendMsg>(1);
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _ = hold_rx.recv();
+        });
+        let mut send = SendThread::new(Arc::new(tx), thread);
+        let started = std::time::Instant::now();
+        send.join_within(std::time::Duration::from_millis(50));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(!send.send(resend(), || false));
+        drop(send);
+        drop(hold_tx);
+    }
+
+    /// A full queue holds the caller only until `give_up` says so, asked once per idle tick,
+    /// so a stopped loop is never held by a sender that stopped taking.
+    #[test]
+    fn a_blocked_send_gives_up_when_asked() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<SendMsg>(1);
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let _ = hold_rx.recv();
+        });
+        let send = SendThread::new(Arc::new(tx), thread);
+        assert!(send.send(resend(), || false), "the first fills the queue");
+        let started = std::time::Instant::now();
+        let mut asked = 0;
+        assert!(!send.send(resend(), || {
+            asked += 1;
+            asked >= 3
+        }));
+        assert_eq!(asked, 3, "asked once per tick, not spun");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(hold_tx);
+    }
+
+    fn resend() -> SendMsg {
+        SendMsg::Resend {
+            frame: 0,
+            shards: Vec::new(),
+        }
+    }
 
     /// A send thread on `transport` at 20 Mbit/s in `shape`: its frame channel, its stop
     /// flag, the counters it reports into and the thread.

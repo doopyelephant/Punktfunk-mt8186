@@ -507,6 +507,9 @@ pub(super) async fn negotiate(
                     victims = victims.len(),
                     "mode-conflict: STEAL — preempting the live session(s)"
                 );
+                // The registry names the end first; the flag alone also reaches a victim
+                // still in bring-up, and the compat plane's own flag.
+                crate::session_status::stolen(&victims);
                 for v in &victims {
                     v.store(true, Ordering::SeqCst);
                 }

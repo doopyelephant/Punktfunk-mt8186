@@ -104,8 +104,8 @@ impl StreamState {
                 self.bit_depth,
                 self.enc_now(),
                 self.plan,
-                &self.quit,
-                &self.stop,
+                self.life.quit_flag(),
+                self.life.stop_flag(),
                 None,
                 8,
                 None,
@@ -184,7 +184,7 @@ impl StreamState {
                 self.bit_depth,
                 enc_of,
                 self.plan,
-                &self.quit,
+                self.life.quit_flag(),
                 self.cur_display_gen,
                 None,
                 Some(resize_trace.as_ref()),
@@ -260,7 +260,7 @@ impl StreamState {
                 self.bit_depth,
                 enc_of,
                 self.plan,
-                &self.quit,
+                self.life.quit_flag(),
                 self.cur_display_gen,
                 None,
                 Some(trace.as_ref()),
@@ -301,8 +301,7 @@ impl StreamState {
             if let Some(g) = self.game_life.as_ref() {
                 crate::gamelease::report_exit(&g.shared());
             }
-            crate::events::SessionEndReason::GameExited.latch(&self.end_reason);
-            self.quit.store(true, Ordering::SeqCst);
+            self.life.end(crate::events::SessionEndReason::GameExited);
             self.conn
                 .close(punktfunk_core::quic::APP_EXITED_CLOSE_CODE, b"game exited");
             return Ok(false);
@@ -380,8 +379,8 @@ impl StreamState {
                     self.bit_depth,
                     enc_of,
                     self.plan,
-                    &self.quit,
-                    &self.stop,
+                    self.life.quit_flag(),
+                    self.life.stop_flag(),
                     self.cur_display_gen,
                     1,
                     None,
@@ -390,8 +389,7 @@ impl StreamState {
                 ) {
                     Ok(p) => break 'built p,
                     Err(e2) => {
-                        if self.stop.load(Ordering::SeqCst) || budget.expired(Some(self.compositor))
-                        {
+                        if self.life.stopping() || budget.expired(Some(self.compositor)) {
                             return Err(e2).context(
                                 "capture lost — no compositor came up within the rebuild budget",
                             );
