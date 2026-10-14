@@ -31,13 +31,14 @@ const HOST_READY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const START_TIMEOUT: Duration = Duration::from_secs(180);
 const FIRST_RESTART_DELAY: Duration = Duration::from_secs(1);
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
-/// The wait before a seat's next cycle, and before its host starts again in one.
+/// The wait before a seat's next cycle, and before its host starts again in one. A host that
+/// served a minute clears it, as the web console's run does.
 const RESTART: Backoff = Backoff::new(
     Curve::Doubling {
         first: FIRST_RESTART_DELAY,
         cap: MAX_RESTART_DELAY,
     },
-    Reset::Never,
+    Reset::AfterRun(Duration::from_secs(60)),
 );
 
 /// How long the worker sleeps between two looks of one kind.
@@ -57,10 +58,6 @@ pub(crate) enum Code {
     Quality,
     HostReadyTimeout,
     HostExited,
-    PortInUse,
-    SeatsOff,
-    TermserviceStopped,
-    SeatDisplayDriver,
     AccountNotOwned,
     AccountIsAdministrator,
     AccountPolicy,
@@ -82,10 +79,6 @@ impl Code {
             "quality_failed" => Self::QualityFailed,
             "host_ready_timeout" => Self::HostReadyTimeout,
             "host_exited" => Self::HostExited,
-            "port_in_use" => Self::PortInUse,
-            "seats_off" => Self::SeatsOff,
-            "termservice_stopped" => Self::TermserviceStopped,
-            "seat_display_driver" => Self::SeatDisplayDriver,
             "account_not_owned" => Self::AccountNotOwned,
             "account_is_administrator" => Self::AccountIsAdministrator,
             "account_policy" => Self::AccountPolicy,
@@ -121,10 +114,6 @@ impl Code {
             | Self::KeeperExited
             | Self::HostReadyTimeout
             | Self::HostExited
-            | Self::PortInUse
-            | Self::SeatsOff
-            | Self::TermserviceStopped
-            | Self::SeatDisplayDriver
             | Self::Other => false,
         }
     }
@@ -159,14 +148,6 @@ impl Fault {
             }
             Code::HostReadyTimeout | Code::HostExited => {
                 "punktfunk didn't start on the seat. The seat's log has the cause."
-            }
-            Code::PortInUse => {
-                "Another program holds the seat's port. Restart the PC, then try again."
-            }
-            Code::SeatsOff => "Seats are off. Turn them on under Profiles → Seats.",
-            Code::TermserviceStopped => "Remote Desktop Services isn't running. Restart the PC.",
-            Code::SeatDisplayDriver => {
-                "The seat display driver isn't installed. Turn seats off and on again under Profiles → Seats."
             }
             Code::AccountNotOwned
             | Code::AccountIsAdministrator
@@ -357,7 +338,7 @@ pub(crate) struct State {
     stage: Stage,
     status: RuntimeStatus,
     session: Option<u32>,
-    /// The first start's outcome, which `start` waits for.
+    /// The latest outcome: the first start waits for one, a repeated start answers it.
     answer: Option<Result<(), BackendError>>,
     stop: Option<Stop>,
     gate: Gate,
@@ -396,8 +377,8 @@ impl State {
         self.session
     }
 
-    /// The first start's outcome. It stays unset through a failed gate that gets another
-    /// session, and when the start runs out of time.
+    /// The latest outcome: `Ok` once the host serves, the fault of a cycle that failed, or
+    /// the start's timeout. A failed gate that gets another session leaves it as it was.
     pub(crate) fn answer(&self) -> Option<&Result<(), BackendError>> {
         self.answer.as_ref()
     }
@@ -444,6 +425,7 @@ impl State {
             Observation::StartTimedOut => {
                 self.stop = Some(Stop::TimedOut(self.stage));
                 self.status = RuntimeStatus::failed(self.stage.timed_out());
+                self.answer = Some(Err(self.start_timeout()));
                 Vec::new()
             }
             Observation::Failed(_) if self.finished() => vec![Action::Finish],
@@ -503,10 +485,11 @@ impl State {
         }
     }
 
-    /// A stop or a lost keeper, then the session, then the limit. A stop reads as a lost
-    /// keeper here.
+    /// A stop, a lost keeper, then the session, then the limit.
     fn signing_in(&mut self, probe: Probe, late: bool) -> Vec<Action> {
-        if self.stopping() || probe.keeper.is_some() {
+        if self.stopping() {
+            self.end(None)
+        } else if probe.keeper.is_some() {
             self.fail(
                 "rdp_keeper_exited",
                 "RDP keeper exited before its WTS session became active",
@@ -537,26 +520,31 @@ impl State {
         }
     }
 
-    /// The gate's exit first. A stop, a lost keeper and the limit all read as a gate out of
-    /// time, which no new cycle follows.
+    /// The gate's exit first, then a stop, a lost keeper, then the limit. Only the gate's
+    /// exit or its limit is the gate's verdict.
     fn gating(&mut self, probe: Probe, late: bool) -> Vec<Action> {
-        match probe.gate {
-            Some(0) => {
+        match (probe.gate, probe.keeper) {
+            (Some(0), _) => {
                 self.phase = Phase::Collecting;
                 vec![Action::CollectGate]
             }
-            Some(code) => self.fail(
+            (Some(code), _) => self.fail(
                 "quality_failed",
                 format!("same-session virtual-display quality gate exited with code {code}"),
             ),
-            None if self.stopping() || probe.keeper.is_some() || late => self.fail(
+            (None, _) if self.stopping() => self.end(None),
+            (None, Some(code)) => self.fail(
+                "rdp_keeper_exited",
+                format!("RDP keeper exited with code {code} during the display check"),
+            ),
+            (None, None) if late => self.fail(
                 "quality_timeout",
                 format!(
                     "same-session virtual-display quality gate did not finish within {} seconds",
                     QUALITY_TIMEOUT.as_secs()
                 ),
             ),
-            None => vec![Action::Wait(GATE_POLL)],
+            (None, None) => vec![Action::Wait(GATE_POLL)],
         }
     }
 
@@ -579,7 +567,7 @@ impl State {
             )
         } else if probe.ready {
             self.status = RuntimeStatus::running();
-            self.answer.get_or_insert(Ok(()));
+            self.answer = Some(Ok(()));
             self.restart.started(now);
             self.host_restart.started(now);
             self.phase = Phase::Running;
@@ -685,7 +673,7 @@ impl State {
         }
         let retry = !stopping && (gate_retry || !fault.code.permanent());
         let mut actions = Vec::new();
-        // The first answer reaches the caller; later failures have only the log.
+        // The first start's caller logs the first outcome; the log has every later one.
         if !stopping && (self.answer.is_some() || gate_retry) {
             actions.push(Action::Report {
                 error: fault.error.clone(),
@@ -694,7 +682,7 @@ impl State {
         }
         if !gate_retry {
             self.status = RuntimeStatus::failed(fault.plain());
-            self.answer.get_or_insert(Err(fault.error));
+            self.answer = Some(Err(fault.error));
         }
         if retry {
             self.phase = Phase::Resting {
@@ -754,22 +742,10 @@ mod tests {
         ("quality_anything_else", true, SCREEN),
         ("host_ready_timeout", false, HOST),
         ("host_exited", false, HOST),
-        (
-            "port_in_use",
-            false,
-            "Another program holds the seat's port.",
-        ),
-        ("seats_off", false, "Seats are off."),
-        (
-            "termservice_stopped",
-            false,
-            "Remote Desktop Services isn't running.",
-        ),
-        (
-            "seat_display_driver",
-            false,
-            "The seat display driver isn't installed.",
-        ),
+        ("port_in_use", false, MESSAGE),
+        ("seats_off", false, MESSAGE),
+        ("termservice_stopped", false, MESSAGE),
+        ("seat_display_driver", false, MESSAGE),
         ("account_not_owned", true, MESSAGE),
         ("account_is_administrator", true, MESSAGE),
         ("account_policy", true, MESSAGE),
@@ -1181,9 +1157,20 @@ mod tests {
     #[test]
     fn a_host_that_exits_while_it_serves_starts_again_in_the_session() {
         let mut bench = bench(At::Running);
-        // An hour of serving between two exits doesn't shorten the next wait.
-        for secs in [1, 2, 4, 8, 16, 30, 30] {
-            assert_eq!(bench.later(HOUR).see(host(3)), [Action::LogHostExit(3)]);
+        // A host that served less than a minute doesn't shorten the next wait; one that served
+        // a minute starts the doubling over.
+        for (served, secs) in [
+            (59, 1),
+            (59, 2),
+            (59, 4),
+            (59, 8),
+            (59, 16),
+            (59, 30),
+            (59, 30),
+            (60, 1),
+        ] {
+            let served = Duration::from_secs(served);
+            assert_eq!(bench.later(served).see(host(3)), [Action::LogHostExit(3)]);
             let detail = format!("punktfunk stopped on the seat. Restarting it in {secs} s…");
             assert_eq!(
                 *bench.state.status(),
@@ -1241,16 +1228,11 @@ mod tests {
         const STARTING: &str = "RDP keeper exited with code 5 during host startup";
         const SERVING: &str = "RDP keeper process exited with code 5";
         const DOWN: &str = "RDP keeper exited during host restart backoff";
-        // Phase, the fault, and what follows the teardown. A keeper lost under the gate reads
-        // as a gate out of time, which no new cycle follows.
+        const CHECKING: &str = "RDP keeper exited with code 5 during the display check";
+        // Phase, the fault, and what follows the teardown: another cycle, every time.
         let rows = [
             (At::SigningIn, "rdp_keeper_exited", EARLY, vec![]),
-            (
-                At::Gating,
-                "quality_timeout",
-                GATE_OUT_OF_TIME,
-                vec![Action::Finish],
-            ),
+            (At::Gating, "rdp_keeper_exited", CHECKING, vec![]),
             (At::Readying, "rdp_keeper_exited", STARTING, vec![]),
             (
                 At::Running,
@@ -1270,8 +1252,19 @@ mod tests {
             assert_eq!(bench.see(keeper(5)), [Action::EndCycle], "{at:?}");
             assert_eq!(bench.ending(), Some((code, message)), "{at:?}");
             assert_eq!(bench.see(NOTHING), then, "{at:?}");
-            assert_eq!(bench.state.finished(), at == At::Gating, "{at:?}");
+            assert!(!bench.state.finished(), "{at:?}");
         }
+    }
+
+    #[test]
+    fn a_keeper_lost_under_the_gate_leaves_the_gate_owed() {
+        let mut bench = bench(At::Gating);
+        assert_eq!(bench.see(keeper(5)), [Action::EndCycle]);
+        assert_eq!(bench.see(NOTHING), []);
+        bench.rests(Duration::from_secs(1));
+        assert_eq!(bench.see(SESSION), [Action::EnterSession(7)]);
+        let check = [Action::Announce(Stage::Display, 1), Action::StartGate];
+        assert_eq!(bench.see(NOTHING), check);
     }
 
     #[test]
@@ -1300,11 +1293,7 @@ mod tests {
                 then.push(Action::Finish);
             }
             assert_eq!(bench.see(NOTHING), then, "{at:?} {code}");
-            let answer = match answered {
-                true => Ok(()),
-                false => Err((code, MESSAGE)),
-            };
-            assert_eq!(bench.answer(), Some(answer), "{at:?} {code}");
+            assert_eq!(bench.answer(), Some(Err((code, MESSAGE))), "{at:?} {code}");
             assert_eq!(bench.state.finished(), !retry, "{at:?} {code}");
         }
     }
@@ -1317,27 +1306,35 @@ mod tests {
     }
 
     #[test]
-    fn the_cycle_delay_doubles_to_its_cap_and_never_shrinks() {
+    fn the_cycle_delay_doubles_to_its_cap_until_a_host_serves_a_minute() {
         let mut bench = bench(At::SigningIn);
         for secs in [1, 2, 4] {
             assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
             bench.see(NOTHING);
             bench.rests(Duration::from_secs(secs));
         }
-        // An hour of serving in between changes nothing.
+        // A cycle whose host served less than a minute counts as a failure in a row.
         for (_, probe, actions) in road().into_iter().skip(1) {
             assert_eq!(bench.see(probe), actions);
         }
-        bench.later(HOUR);
+        bench.later(Duration::from_secs(59));
         for secs in [8, 16, 30, 30] {
             assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
             bench.see(NOTHING);
             bench.rests(Duration::from_secs(secs));
         }
+        // One whose host served a minute starts the doubling over.
+        assert_eq!(bench.see(SESSION), [Action::EnterSession(7)]);
+        assert_eq!(bench.see(NOTHING), start_host());
+        assert_eq!(bench.see(READY), []);
+        bench.later(Duration::from_secs(60));
+        assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
+        bench.see(NOTHING);
+        bench.rests(Duration::from_secs(1));
     }
 
     #[test]
-    fn the_first_answer_stays_when_a_later_cycle_serves() {
+    fn a_later_cycle_that_serves_replaces_the_answer() {
         let mut bench = bench(At::SigningIn);
         assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
         assert_eq!(bench.see(NOTHING), []);
@@ -1350,28 +1347,25 @@ mod tests {
             assert_eq!(bench.see(probe), actions);
         }
         assert_eq!(*bench.state.status(), RuntimeStatus::running());
-        let now = bench
-            .answer()
-            .map(|answer| answer.map_err(|(code, _)| code));
-        assert_eq!(now, Some(Err("rdp_keeper_exited")));
+        assert_eq!(bench.answer(), Some(Ok(())));
     }
 
     #[test]
     fn a_stop_in_every_phase_ends_stopped() {
-        const EARLY: (&str, &str) = (
-            "rdp_keeper_exited",
-            "RDP keeper exited before its WTS session became active",
-        );
-        const GATE: (&str, &str) = ("quality_timeout", GATE_OUT_OF_TIME);
+        const LOST: (&str, &str) = ("rdp_keeper_exited", "RDP keeper process exited with code 5");
         let check = vec![Action::Announce(Stage::Display, 1), Action::StartGate];
         let end = [Action::EndCycle, Action::Finish];
         // Phase, what the worker still does, and what the start is answered. The two phases
         // that only wait for an action to return start the next child before the stop is read.
         let rows = [
             (At::Fresh, vec![Action::Finish], Err(STOPPED_EARLY)),
-            (At::SigningIn, end.to_vec(), Err(EARLY)),
-            (At::Entering, [check, end.to_vec()].concat(), Err(GATE)),
-            (At::Gating, end.to_vec(), Err(GATE)),
+            (At::SigningIn, end.to_vec(), Err(STOPPED_EARLY)),
+            (
+                At::Entering,
+                [check, end.to_vec()].concat(),
+                Err(STOPPED_EARLY),
+            ),
+            (At::Gating, end.to_vec(), Err(STOPPED_EARLY)),
             (
                 At::Collecting,
                 [start_host(), end.to_vec()].concat(),
@@ -1380,8 +1374,8 @@ mod tests {
             (At::Readying, end.to_vec(), Err(STOPPED_READYING)),
             (At::Running, end.to_vec(), Ok(())),
             (At::HostDown, end.to_vec(), Ok(())),
-            (At::Ending, vec![Action::Finish], Ok(())),
-            (At::Resting, vec![Action::Finish], Ok(())),
+            (At::Ending, vec![Action::Finish], Err(LOST)),
+            (At::Resting, vec![Action::Finish], Err(LOST)),
         ];
         for (at, actions, answer) in rows {
             let mut bench = bench(at);
@@ -1440,7 +1434,7 @@ mod tests {
         assert_eq!(bench.see(READY), [Action::EndCycle]);
         assert_eq!(bench.ending(), Some(STOPPED_READYING));
         assert_eq!(bench.run_out(), [Action::Finish]);
-        assert_eq!(bench.answer(), Some(Ok(())));
+        assert_eq!(bench.answer(), Some(Err(STOPPED_READYING)));
     }
 
     #[test]
@@ -1476,8 +1470,9 @@ mod tests {
                 bench.asks(Observation::StartTimedOut);
                 let why = format!("The seat didn't start in time. It stopped while {stage}.");
                 assert_eq!(*bench.state.status(), shows(RuntimeState::Failed, &why));
-                // The caller answers the timeout itself; the state keeps no answer for it.
-                assert_eq!(bench.answer(), None, "{at:?}");
+                // A second start before the worker leaves answers the timeout too.
+                let timed_out = Err(("start_timeout", message.as_str()));
+                assert_eq!(bench.answer(), Some(timed_out), "{at:?}");
                 if !stop_first {
                     bench.asks(Observation::Stop);
                 }
