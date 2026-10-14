@@ -40,6 +40,14 @@ impl std::fmt::Display for NoVirtualOutputs {
 
 impl std::error::Error for NoVirtualOutputs {}
 
+impl NoVirtualOutputs {
+    /// The sentence the client shows.
+    pub fn user_message(&self) -> &'static str {
+        "The host's niri can't create a display for this stream. Its owner can install biri; the \
+         web console shows how."
+    }
+}
+
 /// A niri session is running for this user.
 pub(crate) fn is_available() -> bool {
     crate::session::niri_socket().is_some()

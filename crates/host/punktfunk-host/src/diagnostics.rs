@@ -26,6 +26,7 @@ pub mod ids {
     pub const UINPUT_ACCESS: &str = "uinput_access";
     pub const SERVER_CONFLICT: &str = "server_conflict";
     pub const HYPRLAND_PERMISSIONS: &str = "hyprland_permissions";
+    pub const NIRI_VIRTUAL_OUTPUTS: &str = "niri_virtual_outputs";
     pub const OMARCHY_UPDATES: &str = "omarchy_updates";
     pub const VDISPLAY_DRIVER: &str = "vdisplay_driver";
     pub const PAD_AUDIO: &str = "pad_audio";
@@ -484,6 +485,7 @@ mod tests {
             ids::UINPUT_ACCESS,
             ids::SERVER_CONFLICT,
             ids::HYPRLAND_PERMISSIONS,
+            ids::NIRI_VIRTUAL_OUTPUTS,
             ids::OMARCHY_UPDATES,
             ids::VDISPLAY_DRIVER,
             ids::ENCODER_SHARING,

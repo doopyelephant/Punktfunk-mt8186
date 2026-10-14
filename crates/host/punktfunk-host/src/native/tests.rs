@@ -146,6 +146,21 @@ fn a_buried_pin_miss_still_reaches_the_client_in_words() {
     assert_eq!(setup_failed_sentence(&other), None);
 }
 
+/// Stock niri names biri to the player, whatever `.context` the pipeline wrapped it in.
+#[cfg(target_os = "linux")]
+#[test]
+fn stock_niri_reaches_the_client_in_words() {
+    use anyhow::Context;
+    let buried = Err::<(), _>(pf_vdisplay::NoVirtualOutputs)
+        .context("create virtual output")
+        .context("build the session pipeline")
+        .unwrap_err();
+
+    let said = setup_failed_sentence(&buried).expect("stock niri has words for the user");
+    assert!(said.contains("biri"), "{said}");
+    assert!(said.len() <= punktfunk_core::quic::REFUSED_REASON_MAX);
+}
+
 #[test]
 fn live_mode_pack_roundtrips_and_interval_recovers_hz() {
     use crate::session_status::{pack_mode, unpack_mode};

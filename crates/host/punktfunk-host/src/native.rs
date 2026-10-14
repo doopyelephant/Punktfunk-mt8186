@@ -749,6 +749,10 @@ pub(crate) fn setup_failed_sentence(e: &anyhow::Error) -> Option<String> {
     if let Some(m) = e.downcast_ref::<pf_vdisplay::monitors::MonitorNotFound>() {
         return Some(m.user_message());
     }
+    #[cfg(target_os = "linux")]
+    if let Some(n) = e.downcast_ref::<pf_vdisplay::NoVirtualOutputs>() {
+        return Some(n.user_message().into());
+    }
     e.downcast_ref::<pf_vdisplay::DisplayAsleep>()
         .map(|d| d.user_message())
 }

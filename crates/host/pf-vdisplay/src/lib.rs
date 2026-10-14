@@ -904,6 +904,8 @@ mod hyprland;
 #[cfg(target_os = "linux")]
 #[path = "vdisplay/linux/niri/mod.rs"]
 mod niri;
+#[cfg(target_os = "linux")]
+pub use niri::NoVirtualOutputs;
 
 /// Bounded dispatch loop shared by the in-process Wayland protocol clients.
 #[cfg(target_os = "linux")]
