@@ -24,7 +24,7 @@ mod input_task;
 mod rx_gap;
 
 /// What the control task tells the data pump, in arrival order. The pump drains the channel
-/// once per iteration ([`data::drain_events`]).
+/// once per iteration.
 #[derive(Debug, PartialEq)]
 enum PumpEvent {
     /// A mid-stream clock re-sync moved [`ClientShared::clock_offset`].
