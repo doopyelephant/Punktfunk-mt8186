@@ -268,7 +268,7 @@ fn open_nvenc(p: &OpenParams) -> Result<Box<dyn Encoder>> {
             p.hdr,
             p.chroma,
             p.cursor_blend,
-            p.max_slices,
+            p.slices,
         )?) as Box<dyn Encoder>)
     }
     #[cfg(not(feature = "nvenc"))]
@@ -958,7 +958,7 @@ mod tests {
             hdr: false,
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
-            max_slices: 4,
+            slices: 4,
         };
         let (enc, label) =
             open_video_backend_linux("software", &sw).expect("software arm must open GPU-free");
@@ -993,7 +993,7 @@ mod tests {
             hdr: false,
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
-            max_slices: 4,
+            slices: 4,
         };
         match open_video_backend_linux("vulkan", &hevc) {
             Ok((_, label)) => assert!(matches!(label, "vulkan" | "vaapi-native"), "{label}"),
@@ -1020,7 +1020,7 @@ mod tests {
             hdr: false,
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
-            max_slices: 32,
+            slices: 4,
         };
         let (enc, backend) = open_video_backend_linux("auto", &p).expect("open");
         assert_eq!(backend, "vaapi-native");

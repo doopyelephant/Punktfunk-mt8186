@@ -37,8 +37,8 @@ pub struct StreamConfig {
     /// Client asked for HDR (`dynamicRangeMode != 0`) and the host can deliver it.
     /// Encoder picks Main10 from the captured (P010) format. Always `false` on SDR hosts.
     pub hdr: bool,
-    /// Client's `x-nv-video[0].videoEncoderSlicesPerFrame`. Hardware TV decoders wedge on
-    /// multi-slice AUs they did not request. Absent ⇒ 1.
+    /// Client's `x-nv-video[0].videoEncoderSlicesPerFrame`, the session's slice count. Hardware
+    /// TV decoders wedge on multi-slice AUs they did not request. Absent ⇒ 1.
     pub slices: u32,
     /// Client echoed `SS_ENC_VIDEO`; shards are AES-128-GCM-sealed under the `/launch` rikey.
     /// Only true when the host advertised the bit (`gs_video_encryption_offered`).
@@ -849,7 +849,7 @@ fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_pla
         cfg.codec,
         cursor_blend,
         false,
-        cfg.slices > 1,
+        cfg.slices,
     )
 }
 

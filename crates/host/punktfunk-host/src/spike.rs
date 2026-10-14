@@ -285,8 +285,8 @@ pub fn run(opts: Options) -> Result<()> {
             bit_depth,
             hdr,
             encode::ChromaFormat::Yuv420,
-            false, // no cursor to blend
-            4,     // no client decoder; keep the backend multi-slice default
+            false,                               // no cursor to blend
+            crate::session_plan::DEFAULT_SLICES, // no client decoder
         )
         .context("open encoder")?
     };
@@ -693,7 +693,7 @@ mod plat {
             opts.codec,
             false, // IDD composites the pointer
             false, // no mid-stream cursor-forward flip in a spike
-            false, // no client decoder to slice for
+            1,     // no client decoder to slice for
         );
         capture::open_driver_encoder(
             &plan,

@@ -48,7 +48,7 @@ pub(in crate::native) type PrepHandle = (
 
 /// A virtual-display session's plan on `compositor`, `pyrowave_bpp` the session's. Bring-up
 /// and the Welcome-time prep both resolve here, so a prepared pipeline is built from the plan
-/// its session runs.
+/// its session runs. `multi_slice` names no count, so it takes the host's default.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_plan(
     bit_depth: u8,
@@ -78,7 +78,11 @@ pub(super) fn resolve_plan(
             route,
         ),
         cursor_forward,
-        multi_slice,
+        if multi_slice {
+            crate::session_plan::DEFAULT_SLICES
+        } else {
+            1
+        },
     );
     // After resolve: a self-painting gamescope node would otherwise get a second XFixes pointer.
     plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(
@@ -431,7 +435,7 @@ pub(super) fn open_session_encoder(
                 plan.hdr,
                 plan.chroma,
                 plan.cursor_blend,
-                plan.max_slices,
+                plan.slices,
             )
         },
     )?;

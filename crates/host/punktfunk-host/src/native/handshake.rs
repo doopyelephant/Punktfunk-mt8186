@@ -810,7 +810,7 @@ pub(super) async fn negotiate(
             let client_hdr = hello.display_hdr.map(crate::encode::hdr_meta_from_wire);
             // Read back off Welcome so the prepared display and session wiring cannot disagree.
             let cursor_fw = welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0;
-            // Same bit SessionContext reads; a different max_slices would change the wire mid-flow.
+            // Same bit SessionContext reads; a different slice count would change the wire mid-flow.
             let multi_slice = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE != 0;
             let (mode, shard_payload) = (hello.mode, welcome.shard_payload);
             // Sampled here so the closure need not capture `hello`. The build may re-resolve

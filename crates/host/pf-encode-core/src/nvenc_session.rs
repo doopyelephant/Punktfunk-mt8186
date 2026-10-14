@@ -492,9 +492,9 @@ pub struct NvSession {
     pub subframe_broken: bool,
     /// Slice count latched at open so reconfigure presents the same slicing.
     pub slices: u32,
-    /// Client decoder slice ceiling. 1 = single-slice: decoders that never asked can wedge on
-    /// multi-slice AUs.
-    pub max_slices: u32,
+    /// H.264/HEVC slices per frame the client takes, `1..=32`. 1 = single-slice: decoders that
+    /// never asked can wedge on multi-slice AUs.
+    pub client_slices: u32,
     /// `NV_ENC_CAPS_NUM_ENCODER_ENGINES` (`0` = unprobed). The driver accepts a split wider
     /// than the hardware and silently encodes narrower; this is the only honest width.
     pub encoder_engines: u32,
@@ -534,7 +534,7 @@ impl NvSession {
         height: u32,
         fps: u32,
         bitrate_bps: u64,
-        max_slices: u32,
+        client_slices: u32,
     ) -> Self {
         Self {
             api,
@@ -565,8 +565,8 @@ impl NvSession {
             subframe_opened_with: false,
             subframe_broken: false,
             slices: 1,
-            // A zero caller must not zero the resolver's default arithmetic.
-            max_slices: max_slices.max(1),
+            // A zero caller is single-slice; 32 is the knob's top.
+            client_slices: client_slices.clamp(1, 32),
             encoder_engines: 0,
             last_submit_at: None,
             send_spread_us: 0,
@@ -741,7 +741,7 @@ impl NvSession {
             subframe_readback = self.subframe_cap,
             dynamic_slice = dyn_slice != 0,
             engines = self.encoder_engines,
-            max_slices = self.max_slices,
+            client_slices = self.client_slices,
             max = %format!("{wmax}x{hmax}"),
             ten_bit,
             "NVENC capabilities probed"
@@ -753,6 +753,7 @@ impl NvSession {
     }
 
     /// Split mode, slice count and sub-frame for the next open, from the probed caps.
+    /// The slice count is the client's, unless `PUNKTFUNK_NVENC_SLICES` overrides it.
     /// A measured split verdict beats the static rule ([`open_split_mode`]), except on a
     /// single-slice client: a verdict cached for a sliced session must not turn split on.
     /// `subframe_broken` beats the operator's force.
@@ -763,15 +764,14 @@ impl NvSession {
             self.bit_depth,
             pixel_rate,
             self.encoder_engines,
-            self.max_slices,
+            self.client_slices,
         );
-        let split_mode = if self.max_slices <= 1 {
+        let split_mode = if self.client_slices <= 1 {
             static_mode
         } else {
             open_split_mode(static_mode, &self.split_key())
         };
-        // Default 4 slices, clamped by the client ceiling; `PUNKTFUNK_NVENC_SLICES` overrides.
-        self.slices = resolve_slices(self.codec, 4.min(self.max_slices));
+        self.slices = resolve_slices(self.codec, self.client_slices);
         let subframe = resolve_subframe(self.slices, self.subframe_cap) && !self.subframe_broken;
         self.subframe_forced = subframe_env_forced();
         // Before the ladder, the ceiling key and the chunked-poll latch: a drop inside
@@ -2191,6 +2191,23 @@ mod recovery_tests {
         assert!(!s.pending_anchor && !s.distrusted && !s.session_async);
         assert_eq!(s.frame_idx, 2, "the next open continues the wire index");
         assert!(s.force_kf && s.subframe_broken);
+    }
+
+    /// The client's slice count is the encoded count; AV1 has tiles, not slices. A
+    /// single-slice client never gets split encode, which emits a slice per engine.
+    #[test]
+    fn the_session_slices_as_the_client_asked() {
+        let shape = |codec, client| {
+            let mut s = NvSession::new(&API, codec, 3840, 2160, 120, 80_000_000, client);
+            let split = s.resolve_shape();
+            (s.slices, split)
+        };
+        assert_eq!(shape(Codec::H265, 1), (1, DISABLE));
+        assert_eq!(shape(Codec::H265, 8).0, 8);
+        assert_eq!(shape(Codec::H264, 2).0, 2);
+        assert_eq!(shape(Codec::Av1, 8).0, 1);
+        assert_eq!(shape(Codec::H265, 0), (1, DISABLE));
+        assert_eq!(shape(Codec::H265, 64).0, 32);
     }
 
     #[test]
