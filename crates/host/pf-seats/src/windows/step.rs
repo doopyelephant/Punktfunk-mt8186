@@ -31,13 +31,14 @@ const HOST_READY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const START_TIMEOUT: Duration = Duration::from_secs(180);
 const FIRST_RESTART_DELAY: Duration = Duration::from_secs(1);
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
-/// The wait before a seat's next cycle, and before its host starts again in one.
+/// The wait before a seat's next cycle, and before its host starts again in one. A host that
+/// served a minute clears it, as the web console's run does.
 const RESTART: Backoff = Backoff::new(
     Curve::Doubling {
         first: FIRST_RESTART_DELAY,
         cap: MAX_RESTART_DELAY,
     },
-    Reset::Never,
+    Reset::AfterRun(Duration::from_secs(60)),
 );
 
 /// How long the worker sleeps between two looks of one kind.
@@ -1181,9 +1182,20 @@ mod tests {
     #[test]
     fn a_host_that_exits_while_it_serves_starts_again_in_the_session() {
         let mut bench = bench(At::Running);
-        // An hour of serving between two exits doesn't shorten the next wait.
-        for secs in [1, 2, 4, 8, 16, 30, 30] {
-            assert_eq!(bench.later(HOUR).see(host(3)), [Action::LogHostExit(3)]);
+        // A host that served less than a minute doesn't shorten the next wait; one that served
+        // a minute starts the doubling over.
+        for (served, secs) in [
+            (59, 1),
+            (59, 2),
+            (59, 4),
+            (59, 8),
+            (59, 16),
+            (59, 30),
+            (59, 30),
+            (60, 1),
+        ] {
+            let served = Duration::from_secs(served);
+            assert_eq!(bench.later(served).see(host(3)), [Action::LogHostExit(3)]);
             let detail = format!("punktfunk stopped on the seat. Restarting it in {secs} s…");
             assert_eq!(
                 *bench.state.status(),
@@ -1317,23 +1329,31 @@ mod tests {
     }
 
     #[test]
-    fn the_cycle_delay_doubles_to_its_cap_and_never_shrinks() {
+    fn the_cycle_delay_doubles_to_its_cap_until_a_host_serves_a_minute() {
         let mut bench = bench(At::SigningIn);
         for secs in [1, 2, 4] {
             assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
             bench.see(NOTHING);
             bench.rests(Duration::from_secs(secs));
         }
-        // An hour of serving in between changes nothing.
+        // A cycle whose host served less than a minute counts as a failure in a row.
         for (_, probe, actions) in road().into_iter().skip(1) {
             assert_eq!(bench.see(probe), actions);
         }
-        bench.later(HOUR);
+        bench.later(Duration::from_secs(59));
         for secs in [8, 16, 30, 30] {
             assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
             bench.see(NOTHING);
             bench.rests(Duration::from_secs(secs));
         }
+        // One whose host served a minute starts the doubling over.
+        assert_eq!(bench.see(SESSION), [Action::EnterSession(7)]);
+        assert_eq!(bench.see(NOTHING), start_host());
+        assert_eq!(bench.see(READY), []);
+        bench.later(Duration::from_secs(60));
+        assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
+        bench.see(NOTHING);
+        bench.rests(Duration::from_secs(1));
     }
 
     #[test]
