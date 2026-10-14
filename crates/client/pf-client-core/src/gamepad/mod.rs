@@ -10,10 +10,11 @@
 //! driver stays off; an attached session supersedes. This thread is the single
 //! rumble/HID-output consumer. Menu types live in `menu_nav`.
 //!
-//! `worker` owns SDL and the forwarded slots; `ds5` builds the DualSense effects packets;
-//! `select_gesture` is the hold-Select state machine.
+//! `worker` owns SDL and the forwarded slots; `route` decides where pad input goes; `ds5`
+//! builds the DualSense effects packets; `select_gesture` is the hold-Select state machine.
 
 mod ds5;
+mod route;
 mod select_gesture;
 mod worker;
 
@@ -95,8 +96,8 @@ enum Ctl {
     MenuMode(bool),
     MenuRumble(MenuPulse),
     Mask(bool),
-    /// In-stream ring is up: first forwarded pad → [`MenuEvent`]s. Pair with
-    /// [`Ctl::Mask`] so the same presses never reach the host.
+    /// In-stream ring is up: forwarded pads → [`MenuEvent`]s. It does not mask: without
+    /// [`Ctl::Mask`] the same presses also reach the host.
     RingNav(bool),
     /// Whether anything is listening for a Select chord ([`GamepadService::set_chords_live`]).
     ChordsLive(bool),
@@ -240,7 +241,8 @@ impl GamepadService {
         let _ = self.ctl.send(Ctl::ChordsLive(on));
     }
 
-    /// Pair with [`Self::set_masked`] so the same presses never reach the host.
+    /// Forwarded pads drive the ring. Without [`Self::set_masked`] the same presses also reach
+    /// the host.
     pub fn set_ring_nav(&self, on: bool) {
         let _ = self.ctl.send(Ctl::RingNav(on));
     }
