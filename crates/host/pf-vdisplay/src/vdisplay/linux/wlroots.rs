@@ -181,20 +181,17 @@ impl VirtualDisplay for WlrootsDisplay {
         std::mem::take(&mut self.pending_undo)
     }
 
+    fn heads(&self) -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+        list_monitors()
+    }
+
     /// Heads come back through `enable`. The output goes only if this sway named it: another
     /// instance's `HEADLESS-N` may be the box's only screen.
     fn undo(&mut self, undo: &Undo) -> Result<()> {
         match undo {
             Undo::EnableHeads { heads } => {
                 let names: Vec<String> = heads.iter().map(|h| h.name.clone()).collect();
-                let dark = restore_heads(&names);
-                if dark.is_empty() {
-                    return Ok(());
-                }
-                bail!(
-                    "{} still inactive; `swaymsg output <name> enable` puts it back",
-                    dark.join(", ")
-                )
+                restore_heads(&names)
             }
             Undo::RemoveOutput { name, instance } => {
                 if instance.is_empty() || *instance != sway_instance() {
@@ -725,34 +722,21 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
 
 /// Re-enable heads `exclusive` disabled, **before** the output they made way for is unplugged:
 /// sway must not see zero enabled outputs. `enable` is the inverse of `disable` (Hyprland needs
-/// `hyprctl reload`). Returns the heads still inactive, each logged with the hand command.
-fn restore_heads(disabled: &[String]) -> Vec<String> {
-    let mut dark = Vec::new();
-    for name in disabled {
-        match swaymsg(&enable_argv(name)) {
-            Ok(_) => {
-                if wait_head_enabled_is(name, true, DISABLE_BUDGET) {
-                    tracing::info!(output = %name, "wlroots: re-enabled the output `topology: exclusive` disabled");
-                } else {
-                    tracing::warn!(
-                        output = %name,
-                        "wlroots: `output enable` was accepted but the output is still inactive — \
-                         re-enable it by hand with `swaymsg output {name} enable`"
-                    );
-                    dark.push(name.clone());
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    output = %name, error = %format!("{e:#}"),
-                    "wlroots: could not re-enable this output — it is still dark. Run \
-                     `swaymsg output {name} enable` by hand."
-                );
-                dark.push(name.clone());
-            }
+/// `hyprctl reload`). Every head is tried; the journal reads them back.
+fn restore_heads(heads: &[String]) -> Result<()> {
+    let mut refused = Vec::new();
+    for name in heads {
+        if let Err(e) = swaymsg(&enable_argv(name)) {
+            refused.push(format!("{name} ({e:#})"));
         }
     }
-    dark
+    if refused.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "sway did not enable {}; `swaymsg output <name> enable` puts it back",
+        refused.join(", ")
+    )
 }
 
 /// The headless output of one `create`, unplugged on drop. `seq` is its journal entry: the

@@ -369,11 +369,16 @@ pub trait VirtualDisplay: Send {
     fn take_undo_seqs(&mut self) -> Vec<u64> {
         Vec::new()
     }
-    /// Take back one desk change this backend journaled. `Ok`: the desk is as it was before the
-    /// step, or the change is moot. `Err`: what is still wrong, with the hand command. Default:
-    /// this backend journals nothing.
+    /// Take back one desk change this backend journaled. `Ok`: the change was made, or is moot;
+    /// the journal then re-reads [`heads`](Self::heads) to see it took. `Err`: what is still
+    /// wrong, with the hand command. Default: this backend journals nothing.
     fn undo(&mut self, undo: &crate::topology_journal::Undo) -> Result<()> {
         anyhow::bail!("no undo in {} for {undo:?}", self.name())
+    }
+    /// Every head the compositor lists, disabled ones included: what the journal reads back
+    /// after an undo. Default: this backend lists none.
+    fn heads(&self) -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+        anyhow::bail!("{} lists no heads", self.name())
     }
     /// Whether this [`create`](Self::create) is the first display in its group. Mutter exclusive
     /// `ApplyMonitorsConfig` applies only on first; a later sibling extends, because a fresh

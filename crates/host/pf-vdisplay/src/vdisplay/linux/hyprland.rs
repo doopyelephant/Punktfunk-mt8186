@@ -299,6 +299,10 @@ impl VirtualDisplay for HyprlandDisplay {
         std::mem::take(&mut self.pending_undo)
     }
 
+    fn heads(&self) -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+        list_monitors()
+    }
+
     /// Heads come back through `hyprctl reload`, run only when one is dark. The output goes
     /// only if this Hyprland named it: another instance may have reused the name.
     fn undo(&mut self, undo: &Undo) -> Result<()> {
@@ -1179,42 +1183,14 @@ fn head_is_enabled(name: &str) -> Result<Option<bool>> {
 /// A reload drops every runtime `hyprctl keyword`/`eval` override, including
 /// our streamed-output rule (harmless — teardown removes the output next) and
 /// any the operator set by hand; a hyprlang config re-runs `exec =` lines
-/// (`exec-once` does not). So it runs only when one of `heads` is dark. A head
-/// still dark after it is the operator's config: warned about, not retried.
+/// (`exec-once` does not). So it runs only when one of `heads` is dark. `reload`
+/// answers `ok` for "config parsed", not "the head came back": the journal reads
+/// the heads back, and one the operator's own config disables stays dark there.
 fn restore_heads(heads: &[String]) -> Result<()> {
-    let dark = || -> Result<Vec<&String>> {
-        let mut dark = Vec::new();
-        for name in heads {
-            if head_is_enabled(name)? == Some(false) {
-                dark.push(name);
-            }
+    for name in heads {
+        if head_is_enabled(name)? == Some(false) {
+            return hyprctl_dispatch(&["reload"]).context("hyprctl reload");
         }
-        Ok(dark)
-    };
-    if dark()?.is_empty() {
-        return Ok(());
-    }
-    hyprctl_dispatch(&["reload"]).context("hyprctl reload")?;
-    // `reload` answers `ok` for "config parsed", not "the head came back". Read it back.
-    let deadline = Instant::now() + DISABLE_BUDGET;
-    let still_dark = loop {
-        let now = dark()?;
-        if now.is_empty() || Instant::now() >= deadline {
-            break now;
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    if still_dark.is_empty() {
-        tracing::info!(
-            ?heads,
-            "hyprland: re-enabled the heads `topology: exclusive` disabled"
-        );
-    } else {
-        tracing::warn!(
-            ?heads, ?still_dark,
-            "hyprland: `hyprctl reload` ran but these heads are still disabled — the operator's own \
-             config may disable them, otherwise they need a manual `hyprctl reload`"
-        );
     }
     Ok(())
 }

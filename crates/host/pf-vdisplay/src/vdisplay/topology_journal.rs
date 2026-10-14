@@ -9,7 +9,8 @@
 //! [`reclaim`] runs every file whose owner is dead. The engine names no backend: each entry
 //! goes to [`VirtualDisplay::undo`](crate::VirtualDisplay::undo) of the backend it records.
 //!
-//! An undo that fails stays for the next pass. A file this version cannot read is left alone.
+//! An undo that fails, or whose heads do not read back lit, stays for the next pass. A file this
+//! version cannot read is left alone.
 //! Pin the contract with the tests below; the design is
 //! `design/component-health/16-topology-journal.md` (planning).
 
@@ -67,10 +68,11 @@ pub(crate) use linux::{apply, done, push, reclaim};
 mod linux {
     use super::Undo;
     use crate::VirtualDisplay;
-    use anyhow::{Context, Result};
+    use anyhow::{bail, Context, Result};
     use serde::{Deserialize, Serialize};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     /// Bumped when a reader of today's file could misread tomorrow's. A newer file is left alone.
     const VERSION: u32 = 1;
@@ -174,7 +176,10 @@ mod linux {
             run(
                 &mut self.doc.entries,
                 |e| seqs.contains(&e.seq) && e.backend == name,
-                |e| backend.undo(&e.undo),
+                |e| {
+                    backend.undo(&e.undo)?;
+                    settled(&*backend, &e.undo, crate::monitors::DISABLE_BUDGET)
+                },
             );
             self.persist();
         }
@@ -262,12 +267,38 @@ mod linux {
                 |e| {
                     let mut backend = open(&e.backend)
                         .with_context(|| format!("no {} backend to run the undo", e.backend))?;
-                    backend.undo(&e.undo)
+                    backend.undo(&e.undo)?;
+                    settled(&*backend, &e.undo, crate::monitors::DISABLE_BUDGET)
                 },
             );
             if let Err(e) = write_doc(&path, &doc) {
                 tracing::error!(path = %path.display(), error = %e, "topology journal not rewritten");
             }
+        }
+    }
+
+    /// Read back what an undo claims: every head an `EnableHeads` names is lit, or no longer
+    /// listed, within `budget`. The compositor applies asynchronously and may decide otherwise;
+    /// a head still dark is the `Err` that keeps the entry.
+    fn settled(backend: &dyn VirtualDisplay, undo: &Undo, budget: Duration) -> Result<()> {
+        let Undo::EnableHeads { heads } = undo else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + budget;
+        loop {
+            let listed = backend.heads().context("list the heads back")?;
+            let dark: Vec<&str> = heads
+                .iter()
+                .filter(|h| listed.iter().any(|m| m.connector == h.name && !m.enabled))
+                .map(|h| h.name.as_str())
+                .collect();
+            if dark.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!("{} still disabled after the undo", dark.join(", "));
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -442,6 +473,35 @@ mod linux {
             assert_eq!(fake.take_calls(), [Call::Undo(heads(&["DP-1"]))]);
             assert_eq!(files(&dir), 0);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// An undo counts only once the heads read back lit: one still listed dark is the
+        /// error that keeps the entry, one no longer listed (unplugged) is settled.
+        #[test]
+        fn an_undo_is_settled_when_its_heads_read_back_lit() {
+            let head = |enabled| crate::monitors::PhysicalMonitor {
+                connector: "DP-1".into(),
+                description: "DP-1".into(),
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 60_000,
+                x: 0,
+                y: 0,
+                scale: 1.0,
+                primary: false,
+                enabled,
+                managed: false,
+            };
+            let fake = FakeDisplay::new("fake");
+            let undo = heads(&["DP-1"]);
+            fake.script(|s| s.heads = vec![head(false)]);
+            let err = settled(&fake, &undo, Duration::ZERO).expect_err("still dark");
+            assert_eq!(err.to_string(), "DP-1 still disabled after the undo");
+            fake.script(|s| s.heads = vec![head(true)]);
+            assert!(settled(&fake, &undo, Duration::ZERO).is_ok());
+            fake.script(|s| s.heads = Vec::new());
+            assert!(settled(&fake, &undo, Duration::ZERO).is_ok());
+            assert!(settled(&fake, &output("HEADLESS-2"), Duration::ZERO).is_ok());
         }
 
         /// A backend that cannot be opened (its compositor is not up) keeps every entry.

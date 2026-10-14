@@ -64,6 +64,8 @@ pub(crate) struct Script {
     pub(crate) undo: Option<crate::topology_journal::Undo>,
     /// `undo` of exactly this fails; every other undo succeeds.
     pub(crate) fail_undo: Option<crate::topology_journal::Undo>,
+    /// `heads`.
+    pub(crate) heads: Vec<crate::monitors::PhysicalMonitor>,
     /// `isolation_key`.
     pub(crate) isolation: Option<String>,
     /// `sole_instance`.
@@ -125,6 +127,7 @@ impl FakeDisplay {
                     restore: false,
                     undo: None,
                     fail_undo: None,
+                    heads: Vec::new(),
                     isolation: None,
                     sole_instance: false,
                     alive: true,
@@ -300,6 +303,10 @@ impl VirtualDisplay for FakeDisplay {
             anyhow::bail!("scripted to fail");
         }
         Ok(())
+    }
+
+    fn heads(&self) -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+        Ok(self.answer(|s| s.heads.clone()))
     }
 
     fn set_first_in_group(&mut self, first: bool) {

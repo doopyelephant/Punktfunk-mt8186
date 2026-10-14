@@ -230,8 +230,12 @@ impl VirtualDisplay for KwinDisplay {
         std::mem::take(&mut self.pending_undo)
     }
 
-    /// Heads come back at their journaled mode and are read back. KWin journals no output:
-    /// ours goes with the Wayland connection that made it.
+    fn heads(&self) -> Result<Vec<crate::monitors::PhysicalMonitor>> {
+        list_monitors()
+    }
+
+    /// Heads come back at their journaled mode. KWin journals no output: ours goes with the
+    /// Wayland connection that made it.
     // A dead host's entry runs too, though KWin re-lit the heads when that host's output went:
     // a head turned off since comes back on. A mark on the entry would skip it.
     fn undo(&mut self, undo: &Undo) -> Result<()> {
@@ -242,14 +246,8 @@ impl VirtualDisplay for KwinDisplay {
             .iter()
             .map(|h| (h.name.clone(), h.mode.clone().unwrap_or_default()))
             .collect();
-        let dark = restore_heads(&heads)?;
-        if dark.is_empty() {
-            return Ok(());
-        }
-        bail!(
-            "{} still disabled; `kscreen-doctor output.<name>.enable` puts it back",
-            dark.join(", ")
-        )
+        restore_heads(&heads);
+        Ok(())
     }
 
     fn set_hw_cursor(&mut self, on: bool) {
@@ -571,11 +569,10 @@ fn union_restore(
 }
 
 /// Re-enable `heads` (`(name, "WxH@Hz")`) in-process, `kscreen-doctor` if the compositor
-/// misses its budget, then read back: the names still disabled. A head KWin no longer lists is
-/// not dark. This runs under the monitor set with our output; when it goes, KWin applies the
-/// setup stored for the set without it, which can disable the heads again, so one delayed
-/// pass re-asserts them. One shot, never a loop.
-fn restore_heads(heads: &[(String, String)]) -> Result<Vec<String>> {
+/// misses its budget. This runs under the monitor set with our output; when it goes, KWin
+/// applies the setup stored for the set without it, which can disable the heads again, so one
+/// delayed pass re-asserts them. One shot, never a loop.
+fn restore_heads(heads: &[(String, String)]) {
     if !crate::kwin_output_mgmt::reenable_outputs(heads) {
         reenable_outputs_kscreen(heads);
     }
@@ -587,12 +584,6 @@ fn restore_heads(heads: &[(String, String)]) -> Result<Vec<String>> {
             reenable_pass(&verify, "post-teardown", true);
         })
         .ok();
-    let now = crate::kwin_output_mgmt::list_monitors().context("read KWin's outputs back")?;
-    Ok(heads
-        .iter()
-        .filter(|(name, _)| now.iter().any(|m| &m.connector == name && !m.enabled))
-        .map(|(name, _)| name.clone())
-        .collect())
 }
 
 /// Re-enable outputs `exclusive` disabled, via `kscreen-doctor` — fallback when
