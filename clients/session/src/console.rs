@@ -457,6 +457,9 @@ impl Service {
     }
 }
 
+/// A worker thread a command started. The service never joins one; a test waits on it.
+type Worker = Option<std::thread::JoinHandle<()>>;
+
 struct ServiceState {
     console: ConsoleShared,
     library: LibraryShared,
@@ -590,7 +593,7 @@ impl ServiceState {
                 req,
             } => self.fetch_library(addr, port, mgmt, fp_hex, req),
             ConsoleCmd::RefreshRunning { addr, mgmt, fp_hex } => {
-                self.refresh_running(addr, mgmt, fp_hex)
+                self.refresh_running(addr, mgmt, fp_hex);
             }
             ConsoleCmd::FetchProfiles { addr, mgmt, fp_hex } => {
                 self.fetch_profiles(addr, mgmt, fp_hex)
@@ -629,7 +632,9 @@ impl ServiceState {
                 fp_hex,
                 app_id,
                 title,
-            } => self.end_game(addr, mgmt, fp_hex, app_id, title),
+            } => {
+                self.end_game(addr, mgmt, fp_hex, app_id, title);
+            }
             ConsoleCmd::Install {
                 addr,
                 mgmt,
@@ -637,7 +642,9 @@ impl ServiceState {
                 app_id,
                 title,
                 action,
-            } => self.change_install(addr, mgmt, fp_hex, app_id, title, action),
+            } => {
+                self.change_install(addr, mgmt, fp_hex, app_id, title, action);
+            }
             ConsoleCmd::Pair {
                 addr,
                 port,
@@ -770,7 +777,7 @@ impl ServiceState {
         );
     }
 
-    fn refresh_running(&self, addr: String, mgmt: u16, fp_hex: String) {
+    fn refresh_running(&self, addr: String, mgmt: u16, fp_hex: String) -> Worker {
         // The carousel behind the shelf reads a different cache for the same fact;
         // dropping it here is what stops a tile advertising the game just quit.
         library::invalidate_running(&fp_hex);
@@ -792,7 +799,7 @@ impl ServiceState {
                     shared.set_running(&status.games);
                 }
             })
-            .ok();
+            .ok()
     }
 
     /// The box's profiles for the picker, off the service thread like every fetch here.
@@ -932,7 +939,14 @@ impl ServiceState {
             .ok();
     }
 
-    fn end_game(&self, addr: String, mgmt: u16, fp_hex: String, app_id: String, title: String) {
+    fn end_game(
+        &self,
+        addr: String,
+        mgmt: u16,
+        fp_hex: String,
+        app_id: String,
+        title: String,
+    ) -> Worker {
         // Same worker-thread reason as `refresh_running`; the re-read after it is what
         // takes the Resume badge off the poster.
         library::invalidate_running(&fp_hex);
@@ -953,7 +967,7 @@ impl ServiceState {
                     shared.set_running(&running);
                 }
             })
-            .ok();
+            .ok()
     }
 
     fn change_install(
@@ -964,7 +978,7 @@ impl ServiceState {
         app_id: String,
         title: String,
         action: library::InstallAction,
-    ) {
+    ) -> Worker {
         let shared = self.library.clone();
         let identity = self.identity.clone();
         let pin = trust::parse_hex32(&fp_hex);
@@ -987,7 +1001,7 @@ impl ServiceState {
                     shared.set_running(&status.games);
                 }
             })
-            .ok();
+            .ok()
     }
 
     /// Run one pairing (`ask`: the PIN ceremony or a request access) on its own thread and
@@ -1571,7 +1585,7 @@ fn spawn_fetch(
     fp_hex: String,
     macs: Vec<String>,
     req: RequestKey,
-) {
+) -> Worker {
     // Drops what an older fetch left; the list and phase land only under `req`.
     shared.begin_fetch();
     let pin = trust::parse_hex32(&fp_hex);
@@ -1698,7 +1712,7 @@ fn spawn_fetch(
                 }
             }
         })
-        .ok();
+        .ok()
 }
 
 /// The wire catalog in the shell's own terms.

@@ -420,10 +420,11 @@ from the config directory for a true factory reset."
     /// Read, set, or clear `Settings::default_host` — the pointer every client's bare
     /// launch resolves through. A headless box (a Deck over ssh) has no other door to it.
     fn default_host_cmd(args: &[String]) -> u8 {
-        let mut settings = Settings::load();
         if has(args, "--clear") {
-            settings.default_host = None;
-            settings.save();
+            Settings::update(|s| {
+                s.default_host = None;
+                true
+            });
             println!("cleared");
             return OK;
         }
@@ -443,13 +444,15 @@ from the config directory for a true factory reset."
                 eprintln!("{} has no record id — re-save it", host.name);
                 return UNRESOLVED;
             };
-            settings.default_host = Some(id);
-            settings.save();
+            Settings::update(|s| {
+                s.default_host = Some(id);
+                true
+            });
             println!("{}\t{}:{}", host.name, host.addr, host.port);
             return OK;
         }
         let known = KnownHosts::load();
-        match start::default_host_with_source(&settings, &known) {
+        match start::default_host_with_source(&Settings::load(), &known) {
             (Some(i), source) => {
                 let h = &known.hosts[i];
                 println!("{}\t{}:{}\t{}", h.name, h.addr, h.port, source.as_str());

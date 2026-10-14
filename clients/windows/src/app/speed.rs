@@ -158,12 +158,13 @@ pub(crate) fn speed_page(props: &SpeedProps, cx: &mut RenderCx) -> Element {
             let write_global = {
                 let (ctx, ss) = (ctx.clone(), set_screen.clone());
                 move || {
-                    // Rebase on the file before the whole-struct save — same discipline as
-                    // `commit()`; another writer may have moved it under this snapshot.
+                    // The file under its lock, as `commit()` edits it: another writer may have
+                    // moved it under this snapshot.
                     let mut s = ctx.settings.lock().unwrap();
-                    *s = crate::trust::Settings::load();
-                    s.bitrate_kbps = kbps;
-                    s.save();
+                    *s = crate::trust::Settings::update(|file| {
+                        file.bitrate_kbps = kbps;
+                        true
+                    });
                     ss.call(Screen::Hosts);
                 }
             };

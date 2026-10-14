@@ -79,15 +79,15 @@ pub(super) fn controllers_section(cx: &Cx) -> Vec<Element> {
                 } else {
                     keys.get(sel - 1).cloned()
                 };
-                // Apply live to the gamepad service and persist — the spawned session
-                // reads `forward_pad` at connect. Rebase on the file first (the same
-                // discipline as `commit()`): this handler bypasses commit and a stale
-                // whole-struct save would revert other writers.
+                // Apply live to the gamepad service and persist: the spawned session reads
+                // `forward_pad` at connect. This handler bypasses `commit()`, so it edits the
+                // file under its lock the same way.
                 svc.set_pinned(key.clone());
                 let mut s = ctx2.settings.lock().unwrap();
-                *s = Settings::load();
-                s.forward_pad = key.unwrap_or_default();
-                s.save();
+                *s = Settings::update(|file| {
+                    file.forward_pad = key.unwrap_or_default();
+                    true
+                });
             })
             // Dimmed with the master switch above it, like echo cancellation under the mic:
             // this and the three below have nothing to act on while no controller is
