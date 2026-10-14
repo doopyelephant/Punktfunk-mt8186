@@ -85,11 +85,6 @@ impl Nvml {
     }
 }
 
-/// Device nodes only — no CUDA/NVML init on the probe.
-fn nvidia_present() -> bool {
-    std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/nvidia0").exists()
-}
-
 struct NvmlPin {
     nvml: Nvml,
     pinned: Vec<NvmlDevice>,
@@ -148,7 +143,7 @@ impl Drop for ClockGuard {
 /// Install the NVIDIA P2-cap application profile. Does not arm the clock pin;
 /// that is refcounted per live client via [`session_pin`].
 pub fn on_host_start() {
-    if nvidia_present() {
+    if pf_gpu::nvidia_present() {
         ensure_cuda_perf_profile();
     }
 }
@@ -187,7 +182,11 @@ pub fn session_pin() -> SessionClockPin {
     state.live += 1;
     if state.live == 1 {
         // 0→1: arm. `pin_nvidia` resets first so a crash leftover is not compounded.
-        let nvml = if nvidia_present() { pin_nvidia() } else { None };
+        let nvml = if pf_gpu::nvidia_present() {
+            pin_nvidia()
+        } else {
+            None
+        };
         let amd = pin_amdgpu();
         state.guard = if nvml.is_none() && amd.is_empty() {
             None

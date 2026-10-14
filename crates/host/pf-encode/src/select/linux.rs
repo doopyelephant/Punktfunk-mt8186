@@ -499,12 +499,6 @@ fn probe_vulkan_encode_caps(codec: Codec) -> vulkan_video::VulkanEncodeCaps {
     caps
 }
 
-/// NVIDIA-presence for the `auto` selector: these device nodes, no CUDA
-/// context (that would allocate GPU state on every maybe-NVIDIA host).
-fn nvidia_present() -> bool {
-    std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/nvidia0").exists()
-}
-
 /// The `auto` Linux backend decision, shared by [`open_video`] and
 /// [`linux_zero_copy_is_vaapi`]. Manual GPU preference picks that vendor's
 /// backend (NVIDIA still needs the proprietary device nodes); else the
@@ -519,11 +513,11 @@ fn linux_auto_is_vaapi() -> bool {
     }
     if let Some(g) = pf_gpu::manual_selection() {
         if g.vendor_id == pf_gpu::VENDOR_NVIDIA {
-            return !nvidia_present();
+            return !pf_gpu::nvidia_present();
         }
         return true;
     }
-    !nvidia_present()
+    !pf_gpu::nvidia_present()
 }
 
 /// Resolved Linux encode backend. One alias table for [`open_video_backend`]
