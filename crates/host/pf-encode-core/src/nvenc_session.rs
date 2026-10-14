@@ -22,7 +22,7 @@ use super::nvenc_core::{
 use super::nvenc_status;
 use super::{max_forced_split_mode, resolve_split_mode, AuChunk, Codec, EncodedFrame};
 use crate::rfi::{
-    plan_frame, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, Wave, WaveMark,
+    plan_frame, FramePlan, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, Wave, WaveMark,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
@@ -1091,9 +1091,9 @@ impl NvSession {
     }
 
     /// Map `input.reg`, author this frame's pic params (forced IDR, recovery anchor, wave
-    /// start, HDR SEI on every IDR) and submit it into bitstream [`Self::slot`]. `next`
-    /// advances only once the picture is queued, so a failed opening frame keeps its IDR SEI
-    /// on the retry; a failed encode re-arms the forced IDR and the anchor it spent.
+    /// start, HDR SEI on every IDR) and submit it into bitstream [`Self::slot`]. The frame's
+    /// plan is spent only once the picture is queued ([`Self::spend`]): a failed encode
+    /// leaves the session as it was, and the retry is the same frame.
     ///
     /// # Safety
     /// The session is open, `input.reg` is registered on it, and its surface holds this frame
@@ -1115,24 +1115,20 @@ impl NvSession {
             .map_err(|e| nvenc_status::call_err("map_input_resource", e))?;
         let t_map = tm.elapsed();
 
-        let pts = self.frame_idx as u64;
-        self.frame_idx += 1;
-        let ts = pts as i64;
-        let forced = std::mem::take(&mut self.force_kf);
+        let ts = self.frame_idx;
+        let pts = ts as u64;
+        let forced = self.force_kf;
         let ltr = self.ltr_peek(ts);
         // The opening frame is an IDR the driver emits unasked: only a forced one is planned
         // as an IDR, which drops the anchor and flushes the wave, queue and all.
         let pending = Pending {
             idr: forced,
-            anchor: std::mem::take(&mut self.pending_anchor),
+            anchor: self.pending_anchor,
             acked: !opening && ltr.is_some_and(|(_, force)| force.is_some()),
             loss: false,
         };
         let plan = plan_frame(self.recovery(), pending, &self.policy());
         let flags = if forced {
-            // The IDR flushes the DPB: every later reference is clean again.
-            self.distrusted = false;
-            self.wave_span = self.wave_span.map(|(s, close)| (s, close.min(ts)));
             nv::NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_FORCEIDR as u32
                 | nv::NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS as u32
         } else {
@@ -1141,22 +1137,11 @@ impl NvSession {
         // The first frame after invalidation, or one that references a confirmed picture.
         let anchor = matches!(plan.refs, FrameRef::Anchor | FrameRef::Acked);
         let (wave, mark) = (plan.wave, plan.mark);
-        if let Some(w) = wave.filter(|w| w.index == 0) {
-            // A wave after a spoiled one keeps the spoiled pictures dirty too.
-            let start = match self.wave_span {
-                Some((s, _)) if self.wave_spoiled => s,
-                _ => ts,
-            };
-            self.wave_span = Some((start, ts + i64::from(w.cycle) - 1));
-        }
-        (self.wave, self.wave_queued) = (plan.next.wave, plan.next.queued);
-        self.wave_spoiled = plan.next.spoiled || (plan.dirty && wave.is_some_and(Wave::closes));
         // P-only + infinite GOP: IDRs are forced, or the opening frame NVENC emits as one.
         // Chunked poll flags early chunks from this before the driver reports `pictureType`.
         let idr = forced || opening;
         // The long-term step sits out an IDR, which empties the slots, and a wave.
         let ltr = ltr.filter(|_| !idr && wave.is_none());
-        self.ltr_mark(ts, idr, ltr);
         let mut pic = nv::NV_ENC_PIC_PARAMS {
             version: nv::NV_ENC_PIC_PARAMS_VER,
             inputWidth: self.width,
@@ -1263,11 +1248,10 @@ impl NvSession {
             // Nothing owns the mapping yet; left mapped, the slot's next map fails too.
             // SAFETY: the mapping made above on this session, unmapped once.
             let _ = unsafe { (self.api.unmap_input_resource)(self.encoder, mp.mappedResource) };
-            self.force_kf |= flags != 0;
-            self.pending_anchor |= anchor;
             return Err(nvenc_status::call_err("encode_picture", e));
         }
         let t_pic = tp.elapsed();
+        self.spend(ts, idr, plan, ltr);
         self.next += 1;
         self.pending.push_back(PendingEncode {
             bs: self.bitstreams[slot],
@@ -1295,6 +1279,29 @@ impl NvSession {
             map: t_map,
             pic: t_pic,
         })
+    }
+
+    /// Frame `ts` is queued: spend what its plan took. A forced IDR flushes the DPB, so every
+    /// later reference is clean again and nothing before it stays in a wave's span.
+    fn spend(&mut self, ts: i64, idr: bool, plan: FramePlan, ltr: Option<LtrStep>) {
+        self.frame_idx = ts + 1;
+        self.pending_anchor = false;
+        if std::mem::take(&mut self.force_kf) {
+            self.distrusted = false;
+            self.wave_span = self.wave_span.map(|(s, close)| (s, close.min(ts)));
+        }
+        if let Some(w) = plan.wave.filter(|w| w.index == 0) {
+            // A wave after a spoiled one keeps the spoiled pictures dirty too.
+            let start = match self.wave_span {
+                Some((s, _)) if self.wave_spoiled => s,
+                _ => ts,
+            };
+            self.wave_span = Some((start, ts + i64::from(w.cycle) - 1));
+        }
+        (self.wave, self.wave_queued) = (plan.next.wave, plan.next.queued);
+        let spoiled_close = plan.dirty && plan.wave.is_some_and(Wave::closes);
+        self.wave_spoiled = plan.next.spoiled || spoiled_close;
+        self.ltr_mark(ts, idr, ltr);
     }
 
     /// The long-term step frame `ts` would take while the host holds confirmed references:
@@ -1903,13 +1910,27 @@ mod recovery_tests {
         lock(*mut c_void, *mut nv::NV_ENC_LOCK_BITSTREAM);
         register(*mut c_void, *mut nv::NV_ENC_REGISTER_RESOURCE);
         map(*mut c_void, *mut nv::NV_ENC_MAP_INPUT_RESOURCE);
-        picture(*mut c_void, *mut nv::NV_ENC_PIC_PARAMS);
         invalidate(*mut c_void, u64);
     }
     #[cfg(windows)]
     accept! { event(*mut c_void, *mut nv::NV_ENC_EVENT_PARAMS); }
     #[cfg(target_os = "linux")]
     accept! { streams(*mut c_void, *mut c_void, *mut c_void); }
+
+    thread_local! {
+        /// Pictures the stub driver refuses before it takes one, on this test's thread.
+        static REFUSE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    unsafe extern "C" fn picture(_: *mut c_void, _: *mut nv::NV_ENC_PIC_PARAMS) -> nv::NVENCSTATUS {
+        match REFUSE.get() {
+            0 => nv::NVENCSTATUS::NV_ENC_SUCCESS,
+            n => {
+                REFUSE.set(n - 1);
+                nv::NVENCSTATUS::NV_ENC_ERR_GENERIC
+            }
+        }
+    }
 
     static API: EncodeApi = EncodeApi {
         open_encode_session_ex: open,
@@ -2028,6 +2049,44 @@ mod recovery_tests {
         };
         assert_eq!(s.wave_cycle(), cycle.unwrap_or(0));
         (nvenc(cycle).0, Session { s, floor: false })
+    }
+
+    /// A wave's start frame the driver refuses: the wave must not move on without its sweep,
+    /// and the forced IDR, the anchor and the long-term slots are not spent either.
+    #[test]
+    fn a_refused_picture_spends_nothing() {
+        let mut s = stub_session(Codec::H265, 128);
+        encode(&mut s).expect("the opening IDR");
+        assert!(s.invalidate_ref_frames(0, 0), "no anchor: a wave is armed");
+        let state = |s: &NvSession| (s.frame_idx, s.wave, s.force_kf, s.pending_anchor, s.next);
+        let before = state(&s);
+        REFUSE.set(1);
+        assert!(encode(&mut s).is_err());
+        assert_eq!(state(&s), before);
+        let retry = encode(&mut s).expect("the driver takes the retry");
+        assert_eq!(retry.mark, WaveMark::Start, "the retry starts the wave");
+
+        s.force_kf = true;
+        s.pending_anchor = true;
+        s.distrusted = true;
+        REFUSE.set(1);
+        assert!(encode(&mut s).is_err());
+        assert!(s.force_kf && s.pending_anchor && s.distrusted);
+        assert!(encode(&mut s).expect("the retry").idr_hint);
+        assert!(!s.force_kf && !s.pending_anchor && !s.distrusted);
+
+        // A plain frame under confirmed references marks a long-term slot.
+        s.reference_floor = Some(Acked {
+            last: s.frame_idx - 1,
+            mask: u16::MAX,
+        });
+        REFUSE.set(1);
+        assert!(encode(&mut s).is_err());
+        assert_eq!(
+            s.ltr_slots,
+            [None, None],
+            "no slot holds a picture that was never queued"
+        );
     }
 
     #[test]
