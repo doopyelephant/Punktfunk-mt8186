@@ -8,7 +8,8 @@
 //! ([`serve_usb`]), so no byte of its descriptors comes from the seat and a supervisor restart
 //! leaves it running. A pad lives as long as its relay, a USB device as long as its pad server:
 //! the seat hanging up, or its host dying, ends both. A relayed pad and an attached USB socket
-//! sit in systemd's fd store, so a supervisor restart picks them up again ([`resume`]).
+//! sit in systemd's fd store, so a supervisor restart picks them up again ([`resume`]). A seat's
+//! stop takes both back ([`revoke`]).
 
 use crate::vhci;
 use anyhow::Context as _;
@@ -17,14 +18,16 @@ use pf_inject::usbip;
 use pf_inject::usbip_relay::Hello;
 use pf_seats::linux::{socket, LinuxBackend};
 use pf_seats::SeatService;
+use rustix::net::Shutdown;
 use std::collections::HashMap;
 use std::net::TcpStream;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 pub const SOCKET_PATH: &str = pf_paths::seat::PADS_SOCKET;
@@ -41,27 +44,40 @@ const RELAYED: &str = "/run/punktfunk/pads/relayed";
 static HELD: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Mutex::default);
 /// Pad servers per account, from the request to the device's end.
 static SERVED: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Mutex::default);
+/// Connections per peer uid, from accept until their request is read.
+static PENDING: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Mutex::default);
+/// Unread connections one uid may hold: a seat host sends its request at once.
+const PENDING_PER_UID: usize = 4;
+/// Unread connections from every uid together, each a thread of the unit's own task limit.
+const PENDING_TOTAL: usize = 16;
 
-/// One of an account's slots in `held`, given back on drop.
+/// One of a key's slots in `held`, an account's or a peer uid's, given back on drop.
 struct Slot {
     held: &'static Mutex<HashMap<String, usize>>,
-    account: String,
+    key: String,
 }
 
 impl Slot {
-    fn take(
-        held: &'static Mutex<HashMap<String, usize>>,
-        account: &str,
-        cap: usize,
-    ) -> Option<Slot> {
+    fn take(held: &'static Mutex<HashMap<String, usize>>, key: &str, cap: usize) -> Option<Slot> {
         admit(
             &mut held.lock().unwrap_or_else(|e| e.into_inner()),
-            account,
+            key,
             cap,
         )
         .then(|| Slot {
             held,
-            account: account.to_owned(),
+            key: key.to_owned(),
+        })
+    }
+
+    /// A slot for one unread connection from `uid`, within [`PENDING_PER_UID`] and
+    /// [`PENDING_TOTAL`].
+    fn pending(uid: u32) -> Option<Slot> {
+        let key = uid.to_string();
+        let admitted = admit_pending(&mut PENDING.lock().unwrap_or_else(|e| e.into_inner()), &key);
+        admitted.then_some(Slot {
+            held: &PENDING,
+            key,
         })
     }
 }
@@ -70,9 +86,14 @@ impl Drop for Slot {
     fn drop(&mut self) {
         release(
             &mut self.held.lock().unwrap_or_else(|e| e.into_inner()),
-            &self.account,
+            &self.key,
         );
     }
+}
+
+/// Counts one more unread connection from `uid`; `false` at its cap or the total.
+fn admit_pending(pending: &mut HashMap<String, usize>, uid: &str) -> bool {
+    pending.values().sum::<usize>() < PENDING_TOTAL && admit(pending, uid, PENDING_PER_UID)
 }
 
 /// Counts one more for `account`; `false` at `cap`.
@@ -91,6 +112,52 @@ fn release(held: &mut HashMap<String, usize>, account: &str) {
         if *count == 0 {
             held.remove(account);
         }
+    }
+}
+
+/// A copy of every relay and USB socket a seat holds, with its account, by [`Hold`] id.
+static HOLDS: LazyLock<Mutex<HashMap<u64, (String, OwnedFd)>>> = LazyLock::new(Mutex::default);
+static NEXT_HOLD: AtomicU64 = AtomicU64::new(0);
+
+fn holds() -> MutexGuard<'static, HashMap<u64, (String, OwnedFd)>> {
+    HOLDS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One socket `account` holds, listed for [`revoke`] until dropped.
+struct Hold(u64);
+
+impl Hold {
+    fn new(account: &str, sock: BorrowedFd<'_>) -> std::io::Result<Hold> {
+        let copy = sock.try_clone_to_owned()?;
+        let id = NEXT_HOLD.fetch_add(1, Ordering::Relaxed);
+        holds().insert(id, (account.to_owned(), copy));
+        Ok(Hold(id))
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        holds().remove(&self.0);
+    }
+}
+
+/// Takes back what `account` holds once its seat stopped: each relay and USB socket is shut
+/// down, so its relay reads the seat hanging up and drops the pad, and `vhci_hcd` drops the USB
+/// device, whose pad server then exits. A process that outlived the seat keeps none of them.
+pub fn revoke(account: &str) {
+    let held = holds();
+    let mine: Vec<&OwnedFd> = held
+        .values()
+        .filter(|(holder, _)| holder == account)
+        .map(|(_, sock)| sock)
+        .collect();
+    for sock in &mine {
+        if let Err(error) = rustix::net::shutdown(sock, Shutdown::Both) {
+            tracing::debug!(%error, account, "seat socket not shut down");
+        }
+    }
+    if !mine.is_empty() {
+        tracing::info!(account, sockets = mine.len(), "seat's pads taken back");
     }
 }
 
@@ -145,7 +212,7 @@ pub fn resume() -> Vec<(String, OwnedFd)> {
         let spawned = std::thread::Builder::new()
             .name("seat-usb".into())
             .spawn(move || {
-                vhci::watch(port, recorded, sock);
+                watch_usb(port, recorded, sock);
                 tracing::info!(port, "seat USB device gone");
             });
         if let Err(error) = spawned {
@@ -155,7 +222,8 @@ pub fn resume() -> Vec<(String, OwnedFd)> {
     other
 }
 
-/// Relays `pad` until its seat hangs up, listed for `list` and in systemd's fd store meanwhile.
+/// Relays `pad` until its seat hangs up or stops ([`revoke`]), listed for `list` and in
+/// systemd's fd store meanwhile. A pad a stop couldn't take back is dropped at once.
 fn run_relay(
     name: &str,
     account: &str,
@@ -164,6 +232,14 @@ fn run_relay(
     pad: BrokeredPad,
     relay: UnixDatagram,
 ) {
+    let _hold = match Hold::new(account, relay.as_fd()) {
+        Ok(hold) => hold,
+        Err(error) => {
+            tracing::warn!(%error, account, pad = kind.label(), "seat pad not revocable, dropped");
+            pad_broker::forget(name);
+            return;
+        }
+    };
     let record =
         pad_broker::parse_store_name(name).map(|(serial, ..)| Path::new(RELAYED).join(serial));
     if let Some(record) = &record {
@@ -246,7 +322,8 @@ pub fn refresh_hidraw() {
     }
 }
 
-/// Serves `listener` until the process ends: one thread per pad, for the pad's life.
+/// Serves `listener` until the process ends: one thread per pad, for the pad's life. A
+/// connection past its uid's share of unread ones ([`Slot::pending`]) closes unanswered.
 pub fn serve(listener: UnixListener, service: Arc<SeatService<LinuxBackend>>) {
     for stream in listener.incoming() {
         let stream = match stream {
@@ -256,24 +333,29 @@ pub fn serve(listener: UnixListener, service: Arc<SeatService<LinuxBackend>>) {
                 continue;
             }
         };
+        let uid = match socket::peer_uid(&stream) {
+            Ok(uid) => uid,
+            Err(error) => {
+                tracing::warn!(%error, "pads socket peer credentials");
+                continue;
+            }
+        };
+        let Some(pending) = Slot::pending(uid) else {
+            tracing::debug!(uid, "pads socket busy: connection closed");
+            continue;
+        };
         let service = Arc::clone(&service);
         let spawned = std::thread::Builder::new()
             .name("seat-pad".into())
-            .spawn(move || handle(&service, stream));
+            .spawn(move || handle(&service, stream, uid, pending));
         if let Err(error) = spawned {
             tracing::warn!(%error, "pads socket thread did not start");
         }
     }
 }
 
-fn handle(service: &SeatService<LinuxBackend>, stream: UnixStream) {
-    let uid = match socket::peer_uid(&stream) {
-        Ok(uid) => uid,
-        Err(error) => {
-            tracing::warn!(%error, "pads socket peer credentials");
-            return;
-        }
-    };
+/// Answers `uid`'s request. `pending` is given back once the request is read.
+fn handle(service: &SeatService<LinuxBackend>, stream: UnixStream, uid: u32, pending: Slot) {
     let Some(account) = service.backend().running_account(uid) else {
         tracing::warn!(uid, "pads socket refused a peer that is no running seat");
         return;
@@ -288,26 +370,33 @@ fn handle(service: &SeatService<LinuxBackend>, stream: UnixStream) {
         }
     };
     match request {
-        Request::Create { kind, index } => create(stream, &account, kind, index),
+        Request::Create { kind, index } => {
+            drop(pending);
+            create(stream, &account, kind, index);
+        }
         Request::Serve {
             kind,
             index,
             slot,
             identity_len,
-        } => match pad_broker::read_identity(&stream, identity_len) {
-            Ok(identity) => {
-                let hello = Hello {
-                    kind,
-                    index,
-                    slot,
-                    identity,
-                };
-                serve_usb(stream, &account, &hello);
+        } => {
+            let identity = pad_broker::read_identity(&stream, identity_len);
+            drop(pending);
+            match identity {
+                Ok(identity) => {
+                    let hello = Hello {
+                        kind,
+                        index,
+                        slot,
+                        identity,
+                    };
+                    serve_usb(stream, &account, &hello);
+                }
+                Err(error) => {
+                    tracing::debug!(error = %format!("{error:#}"), account, "pads socket request");
+                }
             }
-            Err(error) => {
-                tracing::debug!(error = %format!("{error:#}"), account, "pads socket request");
-            }
-        },
+        }
         // A seat host from before served USB pads hands over a device it serves itself, with
         // descriptors it chose. Its socket closes unattached; the host falls back to uhid.
         Request::Attach { .. } | Request::Detach { .. } => {
@@ -419,10 +508,23 @@ fn serve_usb(stream: UnixStream, account: &str, hello: &Hello) {
     tracing::info!(account, port, pad = label, "seat USB device served");
     let recorded = client.as_raw_fd();
     pad_broker::keep_usb(port, recorded, client.as_fd());
-    vhci::watch(port, recorded, OwnedFd::from(client));
+    watch_usb(port, recorded, OwnedFd::from(client));
     // The pad server ends with the connection; reap it.
     let _ = server.wait();
     tracing::info!(account, port, "seat USB device gone");
+}
+
+/// Watches a seat's USB socket until its connection ends, held for its port's seat
+/// ([`revoke`]). A socket no seat's row names, or one that can't be held, is shut down at once.
+fn watch_usb(port: u16, recorded: RawFd, sock: OwnedFd) {
+    let held = vhci::account_at(port)
+        .ok_or_else(|| std::io::Error::other("no seat's row names the port"))
+        .and_then(|account| Hold::new(&account, sock.as_fd()));
+    if let Err(error) = &held {
+        tracing::warn!(%error, port, "seat USB device not revocable, detached");
+        let _ = rustix::net::shutdown(&sock, Shutdown::Both);
+    }
+    vhci::watch(port, recorded, sock);
 }
 
 /// Starts `hello`'s pad server in a transient scope, so a supervisor restart leaves it running:
@@ -486,6 +588,56 @@ mod tests {
             !held.contains_key("pf-seat-1"),
             "a seat with no pads is forgotten"
         );
+    }
+
+    /// Unread connections: four per uid, sixteen in all, and a slot back once one is read.
+    #[test]
+    fn unread_connections_are_capped_per_uid_and_in_all() {
+        let mut pending = HashMap::new();
+        for _ in 0..PENDING_PER_UID {
+            assert!(admit_pending(&mut pending, "1000"));
+        }
+        assert!(!admit_pending(&mut pending, "1000"), "one uid's cap");
+        for uid in 1..PENDING_TOTAL / PENDING_PER_UID {
+            for _ in 0..PENDING_PER_UID {
+                assert!(admit_pending(&mut pending, &format!("200{uid}")));
+            }
+        }
+        assert!(!admit_pending(&mut pending, "3000"), "the total");
+        release(&mut pending, "1000");
+        assert!(admit_pending(&mut pending, "3000"));
+    }
+
+    /// A stop shuts down that seat's relays and USB sockets and no other seat's: the relay and
+    /// the seat read a hang-up, and so does the pad server. A dropped hold leaves the list.
+    #[test]
+    fn a_stop_takes_back_only_that_seats_sockets() {
+        use std::io::{ErrorKind, Read as _};
+        let (relay, seat) = pad_broker::relay_pair().unwrap();
+        let (usb, mut server) = usbip::loopback_pair().unwrap();
+        let (other, _other_seat) = pad_broker::relay_pair().unwrap();
+        let held = [
+            Hold::new("pf-test-stop", relay.as_fd()).unwrap(),
+            Hold::new("pf-test-stop", usb.as_fd()).unwrap(),
+            Hold::new("pf-test-other", other.as_fd()).unwrap(),
+        ];
+        revoke("pf-test-stop");
+        assert_eq!(relay.recv(&mut [0; 8]).unwrap(), 0, "the relay");
+        assert_eq!(
+            UnixDatagram::from(seat).recv(&mut [0; 8]).unwrap(),
+            0,
+            "the seat"
+        );
+        assert_eq!(server.read(&mut [0; 8]).unwrap(), 0, "the pad server");
+        other.set_nonblocking(true).unwrap();
+        let kept = other.recv(&mut [0; 8]).unwrap_err().kind();
+        assert_eq!(kept, ErrorKind::WouldBlock, "another seat keeps its pad");
+        drop(held);
+        let left = holds()
+            .values()
+            .filter(|(a, _)| a.starts_with("pf-test-"))
+            .count();
+        assert_eq!(left, 0);
     }
 
     #[test]

@@ -98,7 +98,7 @@ struct Inner {
 }
 
 /// Runs beside a seat's unit: `Some(uid)` before the unit starts and for a seat found running,
-/// never for the owner's row; `None` once a unit stopped. Every call must be idempotent.
+/// `None` once it stopped; neither for the owner's row. Every call must be idempotent.
 pub type UnitHook = Box<dyn Fn(&str, Option<u32>) + Send + Sync>;
 
 fn unit_hook(inner: &Inner, account: &str, uid: Option<u32>) {
@@ -138,25 +138,31 @@ impl Tracked {
     }
 }
 
-/// Stops `account`'s unit if it is up, then ends what runs beside it. A unit that was never
+/// Stops `account`'s unit if it is up. A seat's user ends with it, so nothing it started under
+/// its own manager survives, and then the hook takes back what runs beside it. The owner's row
+/// keeps both: its account is a person's, whose own login may hold pads. A unit that was never
 /// started is fine.
-fn stop_unit(inner: &Inner, id: &SeatId, account: &str) -> Result<(), BackendError> {
+fn stop_unit(inner: &Inner, id: &SeatId, account: &str, owner: bool) -> Result<(), BackendError> {
     let unit = session::unit(account);
     if session::state(account)?.active != "inactive" {
         run("systemctl_failed", "systemctl", &["stop", &unit])?;
     }
     // A failed unit keeps its state until reset, and would read as failed after a stop.
     let _ = run("systemctl_failed", "systemctl", &["reset-failed", &unit]);
-    // The owner's row stays tracked: its own host reads the trust copy while the unit is down.
-    {
-        let mut running = inner.running.lock().unwrap_or_else(|e| e.into_inner());
-        if running.get(id).is_some_and(|t| t.owner.is_none()) {
-            running.remove(id);
-        }
-    }
-    unit_hook(inner, account, None);
     inner.acl_dirty.store(true, Ordering::SeqCst);
-    Ok(())
+    // The owner's row stays tracked: its own host reads the trust copy while the unit is down.
+    if owner {
+        return Ok(());
+    }
+    // Untracked first, so the pad broker refuses the user while it ends.
+    inner
+        .running
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(id);
+    let ended = accounts::quiesce(account);
+    unit_hook(inner, account, None);
+    ended
 }
 
 /// Runs `systemctl --user <verb>` on the owner's own `punktfunk-host`. The owner's user unit
@@ -276,7 +282,7 @@ impl LinuxBackend {
     }
 
     fn stop_unit(&self, seat: &Seat) -> Result<(), BackendError> {
-        stop_unit(&self.inner, &seat.id, &seat.account)
+        stop_unit(&self.inner, &seat.id, &seat.account, seat.owner)
     }
 
     /// The owner's account and what its host reads, in place: the trust copy, and, unless a host
@@ -512,8 +518,10 @@ impl PlatformBackend for LinuxBackend {
         Ok(())
     }
 
+    /// The owner's row, for the account `door-helper` recorded and no other.
     fn adopt(&self, seat: &Seat) -> Result<(), BackendError> {
         let passwd = accounts::require_owner(&seat.account)?;
+        accounts::require_recorded(&self.inner.state, &seat.account)?;
         self.prepare_owner(seat, &passwd)?;
         self.track(&seat.id, Tracked::of(seat, &passwd));
         Ok(())
@@ -798,7 +806,7 @@ fn yield_to_the_desk(inner: &Inner, id: &SeatId, account: &str) {
         return;
     }
     tracing::info!(%account, "owner at the machine: ending the headless session");
-    match stop_unit(inner, id, account) {
+    match stop_unit(inner, id, account, true) {
         Ok(()) => user_host(account, "start"),
         Err(error) => tracing::warn!(%account, %error, "headless session not ended"),
     }

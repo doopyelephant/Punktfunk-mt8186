@@ -637,7 +637,8 @@ impl<U: Uinput> Proxy<U> {
         let Some(open) = self.opens.get_mut(&fh) else {
             return cuse::error(unique, EBADF);
         };
-        let learned = open.compat != Some(compat);
+        // Stored once, with the first ABI: a caller flipping ABIs must not re-store each call.
+        let learned = open.compat.is_none();
         open.compat = Some(compat);
         let answer = replay(&open.dev, call, &phys);
         if learned {
@@ -859,16 +860,22 @@ fn up(account: &str, uid: u32) {
     }
 }
 
-/// `account`'s CUSE device, its node handed to `uid`, `0600`.
+/// `account`'s CUSE device, its node handed to `uid`, `0600`. An earlier device of that name
+/// still there after two seconds fails it: the kernel refuses a twin name, and the `chown` would
+/// land on the old node.
 fn make(account: &str, uid: u32) -> io::Result<File> {
     let devname = pf_paths::seat::uinput_devname(account);
-    // One that just ended lingers until systemd drops its stored copy; a twin name is refused.
+    // One that just ended lingers until systemd drops its stored copy.
     let sysfs = Path::new("/sys/class/cuse").join(devname.replace('/', "!"));
     for _ in 0..20 {
         if !sysfs.exists() {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+    if sysfs.exists() {
+        let still = format!("an earlier /dev/{devname} is still there");
+        return Err(io::Error::new(ErrorKind::AlreadyExists, still));
     }
     let chan = std::fs::OpenOptions::new()
         .read(true)
@@ -1260,6 +1267,37 @@ mod tests {
             ]
             .concat();
             self.send(cuse::FUSE_READ, &body)
+        }
+    }
+
+    /// An open's fd-store name keeps the ABI of its first ioctl: a caller that flips ABIs on
+    /// every call stores nothing again.
+    #[test]
+    fn an_opens_abi_is_stored_once() {
+        let (_kernel, ours) = pad_broker::relay_pair().unwrap();
+        let opener = Box::new(|| {
+            let (queue, _) = UnixDatagram::pair()?;
+            Ok(Fake {
+                queue,
+                log: Arc::default(),
+            })
+        });
+        let mut proxy = Proxy::new(File::from(ours), "pf-seat-1", opener, Vec::new());
+        proxy.handle(&cuse::request(cuse::FUSE_OPEN, 2, &[0; 8]));
+        let abis = [cuse::FUSE_IOCTL_32BIT, 0, cuse::FUSE_IOCTL_32BIT, 0];
+        for (n, flags) in abis.into_iter().enumerate() {
+            let body = [
+                &1u64.to_ne_bytes()[..],
+                &flags.to_ne_bytes(),
+                &(UI_SET_BIT | 100).to_ne_bytes(),
+                &1u64.to_ne_bytes(),
+                &0u32.to_ne_bytes(),
+                &0u32.to_ne_bytes(),
+            ]
+            .concat();
+            proxy.handle(&cuse::request(cuse::FUSE_IOCTL, 4 + 2 * n as u64, &body));
+            let stored = proxy.opens[&1].stored.as_deref();
+            assert_eq!(stored, Some("uinput/pf-seat-1/1/32/-"), "call {n}");
         }
     }
 

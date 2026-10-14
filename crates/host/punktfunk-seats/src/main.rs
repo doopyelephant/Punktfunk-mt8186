@@ -45,7 +45,7 @@ mod linux {
         \x20 serve [--steam-source DIR]  run the supervisor (root)\n\
         \x20 list                        every seat and its state\n\
         \x20 create <name>               add a seat\n\
-        \x20 adopt-owner <account>       make a user the box owner's row\n\
+        \x20 adopt-owner <account>       the owner's row, for the user door-helper recorded\n\
         \x20 start <id> | stop <id> | delete <id>\n\
         \x20 doctor                      what a seat needs and what is missing\n\
         \x20 seating                     whether seats are on\n\
@@ -190,7 +190,7 @@ mod linux {
 
     /// Runs the supervisor: autostart seats first, then the socket until the process is stopped.
     /// Seats are units of their own, so stopping the supervisor leaves them running. Each seat's
-    /// uinput proxy comes and goes with its unit.
+    /// uinput proxy comes and goes with its unit, and its pads go when it stops.
     fn serve(socket_path: &std::path::Path, steam_source: Option<PathBuf>) -> Result<(), String> {
         pf_seats::logging::to_stderr();
         // Adopts systemd's kept fds close-on-exec before anything here can spawn a child.
@@ -198,7 +198,12 @@ mod linux {
         let state = PathBuf::from(pf_seats::linux::STATE_DIR);
         let backend = LinuxBackend::open(pf_paths::config_dir(), state, steam_source)
             .map_err(|e| format!("open the seat backend: {e}"))?
-            .on_unit(Box::new(crate::uinput::hook));
+            .on_unit(Box::new(|account, uid| {
+                crate::uinput::hook(account, uid);
+                if uid.is_none() {
+                    pads::revoke(account);
+                }
+            }));
         let service = Arc::new(
             backend
                 .open_service()

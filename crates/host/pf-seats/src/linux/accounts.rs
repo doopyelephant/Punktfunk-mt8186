@@ -214,9 +214,10 @@ pub(super) fn is_ordinary(passwd: &Passwd) -> bool {
     (1000..60000).contains(&passwd.uid) && !is_seat(passwd)
 }
 
-/// The owner's account for `account`: it must exist and be an ordinary user. Never created here,
-/// and never deleted.
+/// The owner's account for `account`: a Unix name, an existing user and an ordinary one. Never
+/// created here, and never deleted.
 pub(super) fn require_owner(account: &str) -> Result<Passwd, BackendError> {
+    check_name(account)?;
     match lookup(account)? {
         Some(found) if is_ordinary(&found) => Ok(found),
         Some(_) => Err(err(
@@ -228,6 +229,25 @@ pub(super) fn require_owner(account: &str) -> Result<Passwd, BackendError> {
             format!("account '{account}' doesn't exist"),
         )),
     }
+}
+
+/// Where `door-helper` writes the box owner's account, under the state directory.
+const OWNER_FILE: &str = "owner";
+
+/// Refuses `account` as the owner's row unless it is the one `door-helper` recorded in `state`,
+/// a directory only root writes. The door asks for the row, so it can't name another account.
+pub(super) fn require_recorded(state: &Path, account: &str) -> Result<(), BackendError> {
+    let recorded = super::safe_open::read(&state.join(OWNER_FILE), 64)
+        .ok()
+        .flatten()
+        .map(|(bytes, _)| String::from_utf8_lossy(&bytes).trim().to_owned());
+    if recorded.as_deref() == Some(account) {
+        return Ok(());
+    }
+    Err(err(
+        "owner_not_recorded",
+        format!("account '{account}' isn't the owner door-helper recorded"),
+    ))
 }
 
 /// The seat's user, which must exist and carry the seat's marker.
@@ -261,8 +281,9 @@ pub(super) fn delete(seat: &Seat) -> Result<(), BackendError> {
     }
 }
 
-/// Ends everything the user still runs, before its account is deleted or rehomed. Its user
-/// manager outlives the seat's unit by seconds, and `userdel` or `usermod` refuse a busy user.
+/// Ends everything the user still runs: at its seat's stop, and before its account is deleted or
+/// rehomed. Its user manager outlives the seat's unit by seconds, and `userdel` or `usermod`
+/// refuse a busy user.
 pub(super) fn quiesce(account: &str) -> Result<(), BackendError> {
     let present = || run("loginctl_failed", "loginctl", &["show-user", account]).is_ok();
     if present() {
@@ -359,6 +380,24 @@ mod tests {
         assert!(!is_ordinary(&row(60000, "")), "nobody and the above");
         assert!(!is_ordinary(&row(0, "root")));
         assert!(!is_ordinary(&row(1001, &marker(&id()))), "a seat's account");
+    }
+
+    /// Only the account `door-helper` recorded can become the owner's row; with no record, none.
+    #[test]
+    fn only_the_recorded_owner_is_adopted() {
+        let state = tempfile::tempdir().unwrap();
+        let refused = |account: &str| require_recorded(state.path(), account).is_err();
+        assert!(refused("alice"), "nothing recorded");
+        std::fs::write(state.path().join(OWNER_FILE), "alice\n").unwrap();
+        assert!(!refused("alice"));
+        assert!(refused("bob"));
+        assert!(refused(""));
+    }
+
+    /// An owner name `getent` could read as an option is refused before anything runs.
+    #[test]
+    fn an_owner_name_is_checked_before_any_lookup() {
+        assert_eq!(require_owner("-s").unwrap_err().code, "account_invalid");
     }
 
     #[test]

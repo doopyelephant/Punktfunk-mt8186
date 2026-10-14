@@ -17,10 +17,12 @@ use super::session::PRIVATE_DIRS;
 use super::{err, run, safe_open};
 use crate::backend::BackendError;
 use crate::model::SeatId;
-use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::fs::{AtFlags, Mode, OFlags, XattrFlags};
+use rustix::io::Errno;
 use std::collections::HashSet;
+use std::ffi::CStr;
 use std::io::Write as _;
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
@@ -205,19 +207,125 @@ fn dir_in(at: &OwnedFd, name: &str) -> std::io::Result<OwnedFd> {
     safe_open::dir_at(at, name)?.ok_or_else(|| std::io::ErrorKind::NotFound.into())
 }
 
-/// Re-applies the ACL mask below the games folder. A file one seat creates with mode 0644 or 0755
-/// gets a mask of `r--` or `r-x` that cuts the group entry, so the other seats can't write it.
+/// The access ACL as the kernel stores it: a 4-byte version 2, then 8-byte entries, little-endian.
+const ACL_ACCESS: &str = "system.posix_acl_access";
+/// An ACL entry's tag for the mask.
+const ACL_MASK: u16 = 0x10;
+/// Folders deeper than this below `games` keep their mask: the walk holds a handle per level.
+const ACL_DEPTH: usize = 64;
+
+/// Re-applies `m::rwX` below the games folder, as `setfacl -R` would. A file one seat creates
+/// with mode 0644 or 0755 gets a mask of `r--` or `r-x` that cuts the group entry, so the other
+/// seats can't write it. Every seat writes in the tree, so it is walked through handles: each
+/// entry opened in its folder's handle without following a link, and changed through its own.
 ///
 /// Walks the whole tree each call: cheap for a normal library, slow past millions of files,
 /// where an inotify watch on `steamapps` would fix only what changed.
 pub(super) fn fix_acl(state: &Path) -> Result<(), BackendError> {
-    let games = games_dir(state);
-    run(
-        "setfacl_failed",
-        "setfacl",
-        &["-R", "-m", "m::rwX", &games.to_string_lossy()],
-    )
-    .map(drop)
+    let io = |what: &str, e| io_err("games_acl", what, e);
+    let top = safe_open::dir(state).map_err(|e| io("open the state directory", e))?;
+    let Some(games) = safe_open::dir_at(&top, "games").map_err(|e| io("open games", e))? else {
+        return Ok(());
+    };
+    mask_tree(games).map_err(|e| io("repair the games ACL mask", e))
+}
+
+/// [`fix_acl`]'s walk below `top`, depth first. An entry that goes, or turns into something else
+/// mid-walk, is skipped; the first other error ends the walk's answer, not the walk.
+fn mask_tree(top: OwnedFd) -> std::io::Result<()> {
+    set_mask(&top, true)?;
+    let mut first = None;
+    let mut stack = vec![rustix::fs::Dir::new(top)?];
+    while let Some(dir) = stack.last_mut() {
+        let Some(entry) = dir.read() else {
+            stack.pop();
+            continue;
+        };
+        let child = entry
+            .map_err(std::io::Error::from)
+            .and_then(|entry| mask_entry(dir.fd()?, entry.file_name()))
+            .and_then(|sub| {
+                sub.map(rustix::fs::Dir::new)
+                    .transpose()
+                    .map_err(Into::into)
+            });
+        match child {
+            Ok(Some(sub)) if stack.len() < ACL_DEPTH => stack.push(sub),
+            Ok(_) => {}
+            Err(error) => {
+                first.get_or_insert(error);
+            }
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// Repairs the mask of `name` in `at`; a folder comes back to be walked. Only a folder or a
+/// regular file is opened, never through a link; one swapped for a link or another kind since
+/// it was listed is skipped. A FIFO, socket or link has no mask to repair.
+fn mask_entry(at: BorrowedFd<'_>, name: &CStr) -> std::io::Result<Option<OwnedFd>> {
+    use rustix::fs::FileType;
+    if name == c"." || name == c".." {
+        return Ok(None);
+    }
+    let Ok(listed) = rustix::fs::statat(at, name, AtFlags::SYMLINK_NOFOLLOW) else {
+        return Ok(None);
+    };
+    let kind = FileType::from_raw_mode(listed.st_mode);
+    let flags = match kind {
+        FileType::Directory => OFlags::DIRECTORY,
+        FileType::RegularFile => OFlags::NOCTTY,
+        _ => return Ok(None),
+    };
+    let flags = flags | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let fd = match rustix::fs::openat(at, name, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(e) if [Errno::NOENT, Errno::LOOP, Errno::NOTDIR, Errno::NXIO].contains(&e) => {
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mode = rustix::fs::fstat(&fd)?.st_mode;
+    if FileType::from_raw_mode(mode) != kind {
+        return Ok(None);
+    }
+    let dir = kind == FileType::Directory;
+    set_mask(&fd, dir || mode & 0o111 != 0)?;
+    Ok(dir.then_some(fd))
+}
+
+/// Sets the mask of `fd`'s access ACL to `rw`, plus `x` when `exec`. A file with no ACL has no
+/// named entry for a mask to cut, and stays as it is.
+fn set_mask(fd: impl AsFd, exec: bool) -> std::io::Result<()> {
+    let mut buf = [0u8; 1024];
+    let len = match rustix::fs::fgetxattr(&fd, ACL_ACCESS, &mut buf[..]) {
+        Ok(len) => len,
+        Err(e) if e == Errno::NODATA => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(acl) = with_mask(&buf[..len], if exec { 7 } else { 6 }) {
+        rustix::fs::fsetxattr(&fd, ACL_ACCESS, &acl, XattrFlags::REPLACE)?;
+    }
+    Ok(())
+}
+
+/// `acl` with its mask set to `perm`; `None` when it is no version-2 ACL, has no mask, or its
+/// mask is `perm` already.
+fn with_mask(acl: &[u8], perm: u16) -> Option<Vec<u8>> {
+    let (version, entries) = acl.split_first_chunk::<4>()?;
+    if u32::from_le_bytes(*version) != 2 || !entries.len().is_multiple_of(8) {
+        return None;
+    }
+    let mask = entries
+        .chunks_exact(8)
+        .position(|e| u16::from_le_bytes([e[0], e[1]]) == ACL_MASK)?;
+    let at = 4 + mask * 8 + 2;
+    if u16::from_le_bytes([acl[at], acl[at + 1]]) == perm {
+        return None;
+    }
+    let mut out = acl.to_vec();
+    out[at..at + 2].copy_from_slice(&perm.to_le_bytes());
+    Some(out)
 }
 
 /// The seat's private directories, owned by its user and in place before its unit starts: a
@@ -679,6 +787,84 @@ mod tests {
     fn box_with_identity(dir: &Path) {
         std::fs::write(dir.join("native-cert.pem"), "cert").unwrap();
         std::fs::write(dir.join("native-key.pem"), "key").unwrap();
+    }
+
+    /// An access ACL: owner `rw`, group `r`, a named group `rw`, the mask, other `r`.
+    fn acl(mask: u16) -> Vec<u8> {
+        let entry = |tag: u16, perm: u16, id: u32| {
+            [
+                &tag.to_le_bytes()[..],
+                &perm.to_le_bytes(),
+                &id.to_le_bytes(),
+            ]
+            .concat()
+        };
+        let none = u32::MAX;
+        [
+            2u32.to_le_bytes().to_vec(),
+            entry(0x01, 6, none),
+            entry(0x04, 4, none),
+            entry(0x08, 6, 4242),
+            entry(ACL_MASK, mask, none),
+            entry(0x20, 4, none),
+        ]
+        .concat()
+    }
+
+    /// `m::rwX` as `setfacl` reads it, and nothing done to an ACL it can't read.
+    #[test]
+    fn the_acl_mask_becomes_rw_with_x_where_asked() {
+        assert_eq!(with_mask(&acl(4), 6), Some(acl(6)));
+        assert_eq!(with_mask(&acl(5), 7), Some(acl(7)));
+        assert_eq!(with_mask(&acl(6), 6), None, "already rw");
+        assert_eq!(with_mask(&acl(4)[..20], 6), None, "torn");
+        let mut version_1 = acl(4);
+        version_1[0] = 1;
+        assert_eq!(with_mask(&version_1, 6), None, "not version 2");
+    }
+
+    /// The games walk repairs what is inside and never what a link leads to, also when a folder
+    /// it listed is swapped for a link before it opens it. POSIX ACLs are Linux's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_link_swapped_in_mid_walk_is_not_followed() {
+        let mask_of = |path: &Path| {
+            let mut buf = [0u8; 1024];
+            let len = rustix::fs::getxattr(path, ACL_ACCESS, &mut buf[..]).unwrap();
+            let mut entries = buf[4..len].chunks_exact(8);
+            let mask = entries.find(|e| u16::from_le_bytes([e[0], e[1]]) == ACL_MASK);
+            mask.map(|e| u16::from_le_bytes([e[2], e[3]])).unwrap()
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let (games, outside) = (temp.path().join("games"), temp.path().join("outside"));
+        std::fs::create_dir_all(games.join("sub")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(games.join("sub/a"), "x").unwrap();
+        std::fs::write(outside.join("b"), "x").unwrap();
+        for path in [games.join("sub"), games.join("sub/a"), outside.join("b")] {
+            let set = rustix::fs::setxattr(&path, ACL_ACCESS, &acl(4), XattrFlags::empty());
+            if set.is_err() {
+                eprintln!("no POSIX ACLs under {}: skipped", temp.path().display());
+                return;
+            }
+        }
+        rustix::fs::setxattr(&outside, ACL_ACCESS, &acl(4), XattrFlags::empty()).unwrap();
+        let handle = safe_open::dir(&games).unwrap();
+        let mut listing = rustix::fs::Dir::read_from(&handle).unwrap();
+        let listed = std::iter::from_fn(|| listing.read())
+            .map(Result::unwrap)
+            .find(|e| e.file_name() == c"sub")
+            .unwrap();
+        assert_eq!(listed.file_type(), rustix::fs::FileType::Directory);
+        std::fs::rename(games.join("sub"), games.join("sub.old")).unwrap();
+        std::os::unix::fs::symlink(&outside, games.join("sub")).unwrap();
+        let opened = mask_entry(handle.as_fd(), listed.file_name()).unwrap();
+        assert!(opened.is_none(), "the link is not opened");
+        mask_tree(safe_open::dir(&games).unwrap()).unwrap();
+        assert_eq!(mask_of(&outside), 4, "the link's target");
+        assert_eq!(mask_of(&outside.join("b")), 4);
+        assert_eq!(mask_of(&games.join("sub.old")), 7, "a folder takes x");
+        assert_eq!(mask_of(&games.join("sub.old/a")), 6);
     }
 
     #[test]
