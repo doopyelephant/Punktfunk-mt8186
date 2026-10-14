@@ -8,6 +8,7 @@ import {
 	pluginSurfaceOrThrow,
 	refusalText,
 } from "@/api/pluginSurface";
+import { PasswordConfirmDialog } from "@/components/password-confirm";
 import {
 	type JsonObject,
 	type JsonSchemaDoc,
@@ -21,6 +22,7 @@ import {
 	DialogTitle,
 } from "@/components/ui/dialog";
 import { Spinner } from "@/components/ui/spinner";
+import { newlyHanded } from "@/lib/handed-paths";
 import { m } from "@/paraglide/messages";
 
 /**
@@ -69,20 +71,30 @@ export const SourceSettingsDialog: FC<{
 		gcTime: 0,
 	});
 	const [saving, setSaving] = useState(false);
+	// A save that hands a folder over waits for the console password.
+	const [asking, setAsking] = useState<JsonObject | null>(null);
 
+	const put = async (value: JsonObject, password?: string) => {
+		const saved = await pluginSurfaceOrThrow<{
+			access?: { refused?: { path: string; error: string }[] };
+		} | null>(configUrl, { method: "PUT", body: value, password });
+		for (const r of saved?.access?.refused ?? []) {
+			toast.error(
+				m.plugin_form_grant_refused({ path: r.path, issue: r.error }),
+			);
+		}
+		toast.success(m.library_source_settings_saved());
+		onClose();
+	};
 	const save = async (value: JsonObject) => {
+		const loaded = config.data?.tag === "ready" ? config.data : null;
+		if (loaded && newlyHanded(loaded.schema, loaded.value, value).length) {
+			setAsking(value);
+			return;
+		}
 		setSaving(true);
 		try {
-			const saved = await pluginSurfaceOrThrow<{
-				access?: { refused?: { path: string; error: string }[] };
-			} | null>(configUrl, { method: "PUT", body: value });
-			for (const r of saved?.access?.refused ?? []) {
-				toast.error(
-					m.plugin_form_grant_refused({ path: r.path, issue: r.error }),
-				);
-			}
-			toast.success(m.library_source_settings_saved());
-			onClose();
+			await put(value);
 		} catch (e) {
 			toast.error(
 				m.library_source_settings_failed({
@@ -132,6 +144,17 @@ export const SourceSettingsDialog: FC<{
 					/>
 				)}
 			</DialogContent>
+			<PasswordConfirmDialog
+				open={asking !== null}
+				id="plugin-form-password"
+				title={m.plugin_form_confirm_title()}
+				body={m.plugin_form_confirm_body({ plugin: source.label })}
+				submitLabel={m.library_source_settings_save()}
+				onSubmit={async (password) => {
+					if (asking) await put(asking, password);
+				}}
+				onClose={() => setAsking(null)}
+			/>
 		</Dialog>
 	);
 };

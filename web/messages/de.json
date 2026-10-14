@@ -388,6 +388,8 @@
 	"plugin_access_allow": "Erlauben",
 	"plugin_access_dont_allow": "Nicht erlauben",
 	"plugin_access_allow_all": "Alle erlauben",
+	"plugin_form_confirm_title": "Diese Ordner freigeben?",
+	"plugin_form_confirm_body": "{plugin} kann dann die eingetragenen Ordner nutzen. Bestätige mit dem Konsolen-Passwort.",
 	"plugin_access_confirm_title": "Zugriff erlauben?",
 	"plugin_access_confirm_body": "Das Plugin bekommt, worum es auf diesem Rechner gebeten hat. Bestätige mit dem Konsolen-Passwort.",
 	"emulators_adopt_confirm_title": "Diese Kopie verwenden?",

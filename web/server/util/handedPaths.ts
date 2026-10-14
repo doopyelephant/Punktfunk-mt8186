@@ -58,13 +58,15 @@ export async function grantHandedPaths(
 }
 
 /** PUT a form's value to the plugin's `path`, then grant the paths this save handed over and let
- * `form` go of the ones it dropped. The value before the save is read first; if that read fails,
- * nothing is granted or let go. A failed release leaves the grant in place. */
+ * `form` go of the ones it dropped. `ask` runs first when the save hands over a path, and a throw
+ * from it saves nothing. The value before the save is read first; if that read fails, nothing is
+ * granted or let go. A failed release leaves the grant in place. */
 export async function putAndGrant(
 	id: string,
 	path: string,
 	body: Uint8Array | undefined,
 	form: string,
+	ask: () => Promise<void>,
 ): Promise<{ res: Response | null; access?: GrantOutcome }> {
 	const before = await callPlugin(id, path, { method: "GET" });
 	const prior = before?.ok
@@ -73,19 +75,23 @@ export async function putAndGrant(
 				value?: unknown;
 			} | null)
 		: null;
+	let value: unknown;
+	try {
+		value = body && JSON.parse(new TextDecoder().decode(body));
+	} catch {
+		value = undefined;
+	}
+	const handed =
+		prior && value !== undefined
+			? newlyHanded(prior.schema, prior.value, value)
+			: [];
+	if (handed.length) await ask();
 	const res = await callPlugin(id, path, {
 		method: "PUT",
 		headers: { "content-type": "application/json" },
 		body,
 	});
-	if (!res?.ok || !prior || !body) return { res };
-	let value: unknown;
-	try {
-		value = JSON.parse(new TextDecoder().decode(body));
-	} catch {
-		return { res };
-	}
-	const handed = newlyHanded(prior.schema, prior.value, value);
+	if (!res?.ok || !prior || value === undefined) return { res };
 	const access = handed.length
 		? await grantHandedPaths(id, handed, form)
 		: undefined;

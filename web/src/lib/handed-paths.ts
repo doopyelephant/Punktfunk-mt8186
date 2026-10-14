@@ -1,5 +1,6 @@
 // The folders an operator types into a plugin's form (`format: "pf:path"`, or `"pf:path:write"`).
-// The console's server grants the ones a save adds (server/util/handedPaths.ts).
+// The console's server grants the ones a save adds (server/util/handedPaths.ts) and asks for the
+// console password first; the form pages read the same rule, so they ask exactly then.
 import { flatten, handed, type JsonSchemaNode } from "./schema-node";
 
 export interface HandedPath {

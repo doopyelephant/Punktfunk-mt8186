@@ -503,6 +503,8 @@
 	"plugin_form_path_read": "Saving gives {plugin} read access to the folders entered here.",
 	"plugin_form_path_write": "Saving gives {plugin} read and write access to the folders entered here.",
 	"plugin_form_grant_refused": "Couldn't give access to {path} — {issue}",
+	"plugin_form_confirm_title": "Hand over these folders?",
+	"plugin_form_confirm_body": "{plugin} can then use the folders you typed in. Confirm with your console password.",
 	"library_hide_action": "Hide from your devices",
 	"library_unhide_action": "Show on your devices again",
 	"library_hidden_badge": "Hidden",
