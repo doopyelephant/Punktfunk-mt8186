@@ -126,5 +126,5 @@ src/
     gen/             GENERATED react-query hooks + models (orval)
   lib/i18n.ts        reactive Paraglide locale hook
   paraglide/         GENERATED i18n runtime (paraglide)
-messages/{en,de}.json   translation sources
+messages/{en,de,es}.json   translation sources
 ```
