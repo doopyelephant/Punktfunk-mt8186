@@ -134,39 +134,40 @@ pub struct NativeReleaseToken {
     pub presented: bool,
 }
 
-/// Sends [`NativeReleaseToken`] once on drop. The presenter holds the frame
-/// until its sampling fence is waited, so drop means the GPU is done. A dead
-/// channel (backend demoted or rebuilt) is ignored.
-pub struct NativeReleaseGuard {
-    tx: std::sync::mpsc::Sender<NativeReleaseToken>,
-    token: Option<NativeReleaseToken>,
+/// Hands a shipped picture's token back to its rung, once, on drop. The presenter
+/// holds the frame until its sampling fence is waited, so drop means the GPU is done
+/// reading. A dead channel is a rung demoted or rebuilt, and is ignored.
+pub struct ReleaseGuard<T: Copy> {
+    tx: std::sync::mpsc::Sender<T>,
+    token: T,
 }
 
-impl NativeReleaseGuard {
-    pub(crate) fn new(
-        tx: std::sync::mpsc::Sender<NativeReleaseToken>,
-        token: NativeReleaseToken,
-    ) -> Self {
-        Self {
-            tx,
-            token: Some(token),
-        }
+impl<T: Copy> ReleaseGuard<T> {
+    pub(crate) fn new(tx: std::sync::mpsc::Sender<T>, token: T) -> Self {
+        Self { tx, token }
     }
 
+    /// The token this guard hands back.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn token(&self) -> T {
+        self.token
+    }
+}
+
+impl<T: Copy> Drop for ReleaseGuard<T> {
+    fn drop(&mut self) {
+        let _ = self.tx.send(self.token);
+    }
+}
+
+/// The Vulkan rung's guard: its token also says whether the picture was presented.
+pub type NativeReleaseGuard = ReleaseGuard<NativeReleaseToken>;
+
+impl ReleaseGuard<NativeReleaseToken> {
     /// Sampling submit, including the frame's `value + 1` timeline signal, was enqueued.
     /// The decoder then waits that write-back.
     pub fn mark_presented(&mut self) {
-        if let Some(token) = &mut self.token {
-            token.presented = true;
-        }
-    }
-}
-
-impl Drop for NativeReleaseGuard {
-    fn drop(&mut self) {
-        if let Some(token) = self.token.take() {
-            let _ = self.tx.send(token);
-        }
+        self.token.presented = true;
     }
 }
 
@@ -517,17 +518,32 @@ pub struct DrmFrameGuard(
     pub(crate) FrameGuard,
 );
 
-/// The rung's own hold behind a [`DrmFrameGuard`]; opaque to the presenter.
+/// The rung's own hold behind a [`DrmFrameGuard`]; opaque to the presenter. The
+/// token goes back first, then the fds close.
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub(crate) enum FrameGuard {
-    Va(crate::video_vaapi_native::VaFrameGuard),
-    V4l2(crate::video_v4l2::V4l2FrameGuard),
+    /// One fd per OBJECT, not per plane: planes share objects, and closing a shared
+    /// fd twice would close an unrelated file.
+    Va(
+        ReleaseGuard<crate::video_vaapi_native::VaRelease>,
+        Vec<std::os::fd::OwnedFd>,
+    ),
+    /// The pool's fds, shared: they stay open past a pool rebuild, so an imported
+    /// frame never dangles.
+    V4l2(
+        ReleaseGuard<crate::video_v4l2::Release>,
+        std::sync::Arc<Vec<std::os::fd::OwnedFd>>,
+    ),
 }
 
-/// New-rung frames handed on before a demoted Vulkan rung's pools may go, and their floor
-/// age: the same displacement PyroWave waits for its retired rings (depth-2 channel).
+/// New-rung frames handed on before a demoted Vulkan rung's pools may go. The release
+/// tokens do not cover this: the presenter re-samples its last picture on a redraw
+/// until a new one displaces it, and the depth-2 pump channel can still hold an old
+/// one. Eight new frames displace them all.
 const RETIRE_HANDOVERS: u32 = 8;
+/// Floor age for the same wait. Frames keep flowing while `present` is stalled on an
+/// occluded swapchain, and would count the eight off with the old picture still up.
 const RETIRE_MIN_AGE: std::time::Duration = std::time::Duration::from_millis(250);
 
 pub struct Decoder {

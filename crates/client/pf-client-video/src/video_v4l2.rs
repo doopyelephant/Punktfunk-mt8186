@@ -45,6 +45,7 @@ use crate::video::DmabufFrame;
 use crate::video::DmabufPlane;
 use crate::video::DrmFrameGuard;
 use crate::video::FrameGuard;
+use crate::video::ReleaseGuard;
 use crate::video::StreamFormat;
 use crate::video::V4l2Summary;
 use crate::video_color::ColorDesc;
@@ -259,20 +260,6 @@ pub(crate) struct Release {
     pub(crate) pool: u32,
     pub(crate) generation: u64,
     pub(crate) index: u32,
-}
-
-/// Holds one shipped picture's buffer until the presenter is done reading it.
-/// The fds stay open past a pool rebuild so an imported frame never dangles.
-pub struct V4l2FrameGuard {
-    pub(crate) _fds: Arc<Vec<OwnedFd>>,
-    pub(crate) tx: mpsc::Sender<Release>,
-    pub(crate) release: Release,
-}
-
-impl Drop for V4l2FrameGuard {
-    fn drop(&mut self) {
-        let _ = self.tx.send(self.release);
-    }
 }
 
 /// Facts of the access unit a picture decodes, recorded when it was queued.
@@ -603,31 +590,32 @@ impl<D: Opened> StatefulRung<D> {
     /// A new stream shape gets a new node session: the input buffers are
     /// sized for it and the picture format follows its bit depth.
     fn ensure_session(&mut self, shape: Shape) -> Result<&mut Session<D>> {
-        if self.session.as_ref().is_some_and(|s| s.shape == shape) {
-            return Ok(self.session.as_mut().expect("just matched"));
-        }
-        if let Some(old) = self.session.take() {
+        let (wire, path) = (self.wire, &self.node);
+        let retire = |old: Session<D>| {
             tracing::info!(from = ?old.shape, to = ?shape,
                 "V4L2 stream renegotiated — reopening the decoder");
-        }
-        let wanted = if shape.bit_depth > 8 {
-            uapi::V4L2_PIX_FMT_P010
-        } else {
-            uapi::V4L2_PIX_FMT_NV12
         };
-        let fourcc = wire_fourcc(self.wire).expect("construction checked the codec");
-        let node = D::open(&self.node).with_context(|| format!("open {}", self.node.display()))?;
-        let decoder = Stateful::open(node, fourcc, shape.coded.0, shape.coded.1, &[wanted])
-            .map_err(|e| anyhow!("{e}"))
-            .context("start the V4L2 decoder")?;
-        Ok(self.session.insert(Session {
-            decoder,
-            shape,
-            pool: crate::video_types::next_pool_generation(),
-            exports: Arc::new(Vec::new()),
-            exported_generation: 0,
-            pending: VecDeque::new(),
-        }))
+        let build = || {
+            let wanted = if shape.bit_depth > 8 {
+                uapi::V4L2_PIX_FMT_P010
+            } else {
+                uapi::V4L2_PIX_FMT_NV12
+            };
+            let fourcc = wire_fourcc(wire).expect("construction checked the codec");
+            let node = D::open(path).with_context(|| format!("open {}", path.display()))?;
+            let decoder = Stateful::open(node, fourcc, shape.coded.0, shape.coded.1, &[wanted])
+                .map_err(|e| anyhow!("{e}"))
+                .context("start the V4L2 decoder")?;
+            Ok(Session {
+                decoder,
+                shape,
+                pool: crate::video_types::next_pool_generation(),
+                exports: Arc::new(Vec::new()),
+                exported_generation: 0,
+                pending: VecDeque::new(),
+            })
+        };
+        crate::video_types::ensure_session(&mut self.session, shape, |s| s.shape, retire, build)
     }
 
     fn drain_releases(&mut self) {
@@ -761,15 +749,17 @@ impl<D: Opened> StatefulRung<D> {
                 | ((picture.generation & 0xffff) << 32)
                 | u64::from(picture.index),
             path: DECODER_PIN,
-            guard: DrmFrameGuard(FrameGuard::V4l2(V4l2FrameGuard {
-                _fds: s.exports.clone(),
-                tx: self.release_tx.clone(),
-                release: Release {
-                    pool: s.pool,
-                    generation: picture.generation,
-                    index: picture.index,
-                },
-            })),
+            guard: DrmFrameGuard(FrameGuard::V4l2(
+                ReleaseGuard::new(
+                    self.release_tx.clone(),
+                    Release {
+                        pool: s.pool,
+                        generation: picture.generation,
+                        index: picture.index,
+                    },
+                ),
+                s.exports.clone(),
+            )),
         }))
     }
 }

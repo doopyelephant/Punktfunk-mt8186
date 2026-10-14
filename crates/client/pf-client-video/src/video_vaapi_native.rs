@@ -36,6 +36,7 @@ use crate::video::DmabufFrame;
 use crate::video::DmabufPlane;
 use crate::video::DrmFrameGuard;
 use crate::video::FrameGuard;
+use crate::video::ReleaseGuard;
 use crate::video::StreamFormat;
 use crate::video_color::ColorDesc;
 use crate::video_types::display_of;
@@ -81,33 +82,17 @@ struct StreamShape {
 /// Token a shipped frame hands back. A retired pool's index must not free a
 /// surface in the new one.
 #[derive(Debug, Clone, Copy)]
-struct VaRelease {
+pub(crate) struct VaRelease {
     surface: usize,
     generation: u64,
-}
-
-/// Pins one shipped picture's surface until the presenter has waited its fence.
-/// The presenter dups every imported fd; drop means the GPU is done reading.
-pub struct VaFrameGuard {
-    /// One `OwnedFd` per OBJECT, not per plane. Planes share objects; closing a
-    /// shared fd twice would close an unrelated file.
-    _fds: Vec<OwnedFd>,
-    tx: mpsc::Sender<VaRelease>,
-    release: VaRelease,
-}
-
-impl Drop for VaFrameGuard {
-    fn drop(&mut self) {
-        let _ = self.tx.send(self.release);
-    }
 }
 
 /// The release token of a frame this rung shipped.
 #[cfg(test)]
 fn release_of(guard: &DrmFrameGuard) -> VaRelease {
     match &guard.0 {
-        FrameGuard::Va(g) => g.release,
-        FrameGuard::V4l2(_) => unreachable!("a VAAPI frame carries a VAAPI guard"),
+        FrameGuard::Va(g, _) => g.token(),
+        FrameGuard::V4l2(..) => unreachable!("a VAAPI frame carries a VAAPI guard"),
     }
 }
 
@@ -461,7 +446,7 @@ impl NativeVaapiDecoder {
     }
 
     /// This AU's frame off the front first so [`trim_deliverable`] bounds carry-over.
-    /// Trimmed frames free their surface through [`VaFrameGuard`] on drop.
+    /// Trimmed frames free their surface through their [`ReleaseGuard`] on drop.
     fn take_deliverable(&mut self) -> Option<DmabufFrame> {
         let shipped = self.deliverable.pop_front();
         // No session means no pool; cap 0 is "no surfaces exist".
@@ -945,25 +930,24 @@ fn ensure_session<'a>(
     shape: StreamShape,
     generation: &mut u64,
 ) -> Result<&'a mut Session> {
-    if slot.as_ref().is_some_and(|s| s.shape == shape) {
-        return Ok(slot.as_mut().expect("just matched"));
-    }
-    if let Some(old) = slot.take() {
+    let retire = |old: Session| {
         tracing::info!(
             from = ?old.shape,
             to = ?shape,
             "native VAAPI stream renegotiated — rebuilding the session"
         );
-        // Destroy first so the old pool's memory is released. Consumer-held
-        // surfaces are fine: exported PRIME fds keep the pixels alive.
+        // Consumer-held surfaces are fine: exported PRIME fds keep the pixels alive.
         old.destroy(d);
-    }
-    // New generation, unique in the process: a stale token must not free an index in the
-    // replacement pool, and the presenter's cache must not take it for a past stream's.
-    *generation = u64::from(crate::video_types::next_pool_generation());
-    let mut built = Session::build(d, codec, shape)?;
-    built.generation = *generation;
-    Ok(slot.insert(built))
+    };
+    let build = || {
+        // New generation, unique in the process: a stale token must not free an index in the
+        // replacement pool, and the presenter's cache must not take it for a past stream's.
+        *generation = u64::from(crate::video_types::next_pool_generation());
+        let mut built = Session::build(d, codec, shape)?;
+        built.generation = *generation;
+        Ok(built)
+    };
+    crate::video_types::ensure_session(slot, shape, |s| s.shape, retire, build)
 }
 
 /// Bindings from the ledger first, then the setup picture by `slot_of`. A
@@ -1250,14 +1234,16 @@ fn ship(
         sync_fds,
         pool_key: (s.generation << 32) | surface_index as u64,
         path: DECODER_PIN,
-        guard: DrmFrameGuard(FrameGuard::Va(VaFrameGuard {
-            _fds: fds,
-            tx: tx.clone(),
-            release: VaRelease {
-                surface: surface_index,
-                generation: s.generation,
-            },
-        })),
+        guard: DrmFrameGuard(FrameGuard::Va(
+            ReleaseGuard::new(
+                tx.clone(),
+                VaRelease {
+                    surface: surface_index,
+                    generation: s.generation,
+                },
+            ),
+            fds,
+        )),
     })
 }
 
@@ -1803,14 +1789,16 @@ mod tests {
             sync_fds: Vec::new(),
             pool_key: (1 << 32) | surface as u64,
             path: DECODER_PIN,
-            guard: DrmFrameGuard(FrameGuard::Va(VaFrameGuard {
-                _fds: Vec::new(),
-                tx: tx.clone(),
-                release: VaRelease {
-                    surface,
-                    generation: 1,
-                },
-            })),
+            guard: DrmFrameGuard(FrameGuard::Va(
+                ReleaseGuard::new(
+                    tx.clone(),
+                    VaRelease {
+                        surface,
+                        generation: 1,
+                    },
+                ),
+                Vec::new(),
+            )),
         }
     }
 
