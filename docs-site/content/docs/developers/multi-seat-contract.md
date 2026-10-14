@@ -256,8 +256,10 @@ desktop audio, `PUNKTFUNK_MIC_DEVICE` only pins the microphone, and a cable pinn
 ## Linux seats
 
 On Linux the supervisor is the root daemon `punktfunk-seats` (`punktfunk-seats.service`), not part
-of the box host. It keeps its ledger in `seats/` under the box host's config directory,
-`/var/lib/punktfunk`, and starts one `punktfunk-seat@<user>.service` per seat. A seat is a
+of the box host. Its state is `/var/lib/punktfunk-seats`, root's alone: the ledger in `seats/`, each
+seat's home and trust copy, and the shared games folder. The paths below are under it. The box
+host's directory, `/var/lib/punktfunk`, is the door's; the daemon reads it for the trust copies.
+It starts one `punktfunk-seat@<user>.service` per seat. A seat is a
 system-range user, `pf-seat-<n>`, with a logind session of its own, a headless compositor
 (`kwin_wayland`, else gamescope) and a stock `punktfunk-host serve`, all run by
 `/usr/libexec/punktfunk/seat-session`.
@@ -285,7 +287,7 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   `profiles/`,
   `root:<seat user>` `0640`. The daemon recopies a file within 2 seconds of its change while the
   seat runs. The box's key never crosses, and a copy left by an older install is removed.
-- **Games.** `games/steamapps/` is one library every seat writes (group `punktfunk`, setgid,
+- **Games.** `games/steamapps/` is one library every seat writes (group `punktfunk-games`, setgid,
   default ACL). Each seat's own `compatdata`, `shadercache` and `downloading` under `seats/<id>/`
   are bind-mounted over the shared ones, so prefixes never cross. Everything that needs the
   binds must descend from the unit; a process started through `systemd-run --user` or a user
@@ -320,7 +322,11 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   that doesn't exist yet, such as the `dist.lock` of a Proton the owner never ran, stays read-only.
 - **Stopping.** `pam_systemd` moves the runner into the session's scope, so stopping the unit
   can't reach it. The runner ends its children on `SIGTERM`, and `seat-reap` ends the session
-  by the id the runner recorded.
+  by the id the runner recorded. The daemon's stop then ends the seat's user
+  (`loginctl terminate-user`, `SIGKILL` after 3 seconds; a user still running after 10 fails the
+  stop with `user_busy`) and takes back its pads and USB devices: it shuts down every relay and
+  USB/IP socket it handed the seat, also after a restart of the daemon. A stop of the owner's row
+  ends neither: that account is a person's.
 - **Pads.** A seat user can't open `/dev/uinput` or `/dev/uhid`: they are the console user's.
   A seat host that can write the node opens it itself, as the owner's host at the desk does
   through seat0's ACL. One that can't asks the daemon's pad broker, `/run/punktfunk/pads.sock`,
@@ -409,8 +415,10 @@ started with `PUNKTFUNK_SEAT_SESSION=1` is a seat host and never the door, howev
 asked for.
 
 The box owner is a seat like any other. `adopt-owner <user>` adds a ledger row for an ordinary
-account that exists (uid 1000 up, never a seat's); deleting the row never removes the account or
-its home. It takes a slot and ports from the same pools, and the door places the owner profile,
+account that exists (uid 1000 up, never a seat's), and only for the one `door-helper on` recorded
+in `/var/lib/punktfunk-seats/owner`. Any other account, or any while nothing is recorded, answers
+`owner_not_recorded`. Only root writes that file, so the door can't name another account.
+Deleting the row never removes the account or its home. It takes a slot and ports from the same pools, and the door places the owner profile,
 the profiles that share the owner's desktop and the light seats on it.
 
 | Variable | The owner's row |
