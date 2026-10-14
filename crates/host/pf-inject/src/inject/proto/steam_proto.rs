@@ -460,6 +460,42 @@ pub fn sc_from_gamepad(
     s
 }
 
+/// Fold a typed frame into a Steam Controller's typed state. PADDLE1/2 map natively in
+/// [`sc_from_gamepad`]; 3/4 fold through `paddles`, masked so they cannot double-fire the same
+/// grips. Left-pad contact, motion and pad clicks from the rich plane survive. The right pad is
+/// the wire right stick, a rich contact winning only while the stick is centered.
+pub fn sc_merge_frame(
+    prev: &SteamState,
+    f: &GamepadFrame,
+    paddles: super::steam_remap::PaddleFallback,
+) -> SteamState {
+    let native = f.buttons & (gs::BTN_PADDLE1 | gs::BTN_PADDLE2);
+    let folded =
+        super::steam_remap::fold_paddles(f.buttons & !(gs::BTN_PADDLE1 | gs::BTN_PADDLE2), paddles);
+    let mut s = sc_from_gamepad(
+        folded | native,
+        f.ls_x,
+        f.ls_y,
+        f.rs_x,
+        f.rs_y,
+        f.left_trigger,
+        f.right_trigger,
+    );
+    s.lpad_x = prev.lpad_x;
+    s.lpad_y = prev.lpad_y;
+    s.gyro = prev.gyro;
+    s.accel = prev.accel;
+    s.buttons |= prev.buttons & btn::LPAD_TOUCH;
+    s.lpad_click = prev.lpad_click;
+    if f.rs_x == 0 && f.rs_y == 0 {
+        s.rpad_x = prev.rpad_x;
+        s.rpad_y = prev.rpad_y;
+        s.buttons |= prev.buttons & btn::RPAD_TOUCH;
+        s.rpad_click = prev.rpad_click;
+    }
+    s
+}
+
 /// `ID_CONTROLLER_STATE` into the unnumbered 64-byte frame
 /// `steam_do_input_event` parses (SDL `ValveControllerStatePacket_t`). 24-bit buttons at
 /// 8..11, **u8** triggers at 11/12 and again in 15 bits at 24/26 as a wired pad sends them,
@@ -740,16 +776,12 @@ pub fn neutral_deck_report() -> [u8; STEAM_REPORT_LEN] {
 pub use pf_driver_proto::deck::feature_reply;
 
 /// Controller interface of a wired Steam Controller (interface 2 of `28DE:1102`, mouse and
-/// keyboard on 0 and 1 as on the Deck): one vendor collection, 64-byte input, output and
-/// feature reports. `hid-steam` and Steam read the bytes raw, so only the report set matters.
-#[rustfmt::skip]
-pub const RDESC_SC_CTRL: &[u8] = &[
-    0x06,0x00,0xff,0x09,0x01,0xa1,0x01,0x15,0x00,0x26,0xff,0x00,0x75,0x08,0x95,0x40,
-    0x09,0x01,0x81,0x02,0x95,0x40,0x09,0x01,0x91,0x02,0x95,0x40,0x09,0x01,0xb1,0x02,0xc0];
+/// keyboard on 0 and 1 as on the Deck). The Windows driver serves the same bytes.
+pub const RDESC_SC_CTRL: &[u8] = &pf_driver_proto::deck::SC_RDESC;
 
-/// Unit serial of virtual Steam Controller `index`. `FVPF` marks it virtual, as on the Deck.
+/// Unit serial of virtual Steam Controller `index`, the one the Windows driver reports too.
 pub fn sc_serial(index: u8) -> String {
-    format!("FVPF1102{index:04X}")
+    pf_driver_proto::gamepad::pad_serial(pf_driver_proto::gamepad::DEVTYPE_STEAMCONTROLLER, index)
 }
 
 /// A Steam Controller at rest, as real-USB transports stream it before the first state.
@@ -759,36 +791,8 @@ pub fn neutral_sc_report() -> [u8; STEAM_REPORT_LEN] {
     r
 }
 
-/// Firmware build time of a virtual Steam Controller with no captured identity (2024-07-30).
-/// Later than any firmware Valve shipped for the pad, so Steam offers no update.
-const SC_FW_BUILD_TIME: u32 = 0x66A8_C000;
-
-/// GET_FEATURE reply of a wired Steam Controller to the latched SET `last_set` (command byte
-/// first): `0x83` answers these stand-in attributes, everything else as the Deck does
-/// ([`feature_reply`]). A captured pad's own replies come first, where the client sent them.
-pub fn sc_feature_reply(last_set: &[u8], serial: &str) -> [u8; STEAM_REPORT_LEN] {
-    if last_set.first() != Some(&ID_GET_ATTRIBUTES_VALUES) {
-        return feature_reply(last_set, serial);
-    }
-    // (attribute id, u32 LE), ids per SDL's controller_constants.h.
-    let attrs: [(u8, u32); 6] = [
-        (0x00, 0),                // ATTRIB_UNIQUE_ID
-        (0x01, 0x1102),           // ATTRIB_PRODUCT_ID
-        (0x02, 0x03),             // ATTRIB_CAPABILITIES
-        (0x0A, 0x55D2_926D),      // ATTRIB_BOOTLOADER_BUILD_TIME (2015-08-18)
-        (0x04, SC_FW_BUILD_TIME), // ATTRIB_FIRMWARE_BUILD_TIME
-        (0x09, 0x0A),             // ATTRIB_BOARD_REVISION
-    ];
-    let mut r = [0u8; STEAM_REPORT_LEN];
-    r[0] = ID_GET_ATTRIBUTES_VALUES;
-    r[1] = (attrs.len() * 5) as u8;
-    for (slot, (id, value)) in attrs.into_iter().enumerate() {
-        let o = 2 + slot * 5;
-        r[o] = id;
-        r[o + 1..o + 5].copy_from_slice(&value.to_le_bytes());
-    }
-    r
-}
+/// A Steam Controller's GET_FEATURE answers, shared with the Windows driver.
+pub use pf_driver_proto::deck::{sc_feature_reply, sc_mirror_reply};
 
 #[cfg(test)]
 mod tests {
@@ -1038,6 +1042,19 @@ mod tests {
             pulled(SteamState::from_gamepad(0, 0, 0, 0, 0, 1, 255).buttons),
             pulled(sc_from_gamepad(0, 0, 0, 0, 0, 1, 255).buttons)
         );
+    }
+
+    /// `clients/shared/sc1-vectors.json` `buttons`: the Swift and Kotlin parsers read the same
+    /// rows in the other direction.
+    #[test]
+    fn sc_fallback_buttons_match_the_shared_vectors() {
+        let raw = include_str!("../../../../../../clients/shared/sc1-vectors.json");
+        let file: serde_json::Value = serde_json::from_str(raw).expect("vector file parses");
+        for row in file["buttons"].as_array().expect("buttons") {
+            let wire = row["wire"].as_u64().unwrap() as u32;
+            let sc = sc_from_gamepad(wire, 0, 0, 0, 0, 0, 0).buttons;
+            assert_eq!(sc, row["sc1"].as_u64().unwrap(), "{}", row["name"]);
+        }
     }
 
     /// SC frame vs `ID_CONTROLLER_STATE`: 24-bit buttons, u8 triggers,

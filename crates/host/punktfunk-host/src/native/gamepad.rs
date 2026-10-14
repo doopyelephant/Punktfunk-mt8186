@@ -46,9 +46,9 @@ pub(super) fn resolve_pad_kind(kind: GamepadPref) -> GamepadPref {
 
 /// Session backend from client `pref`, then `PUNKTFUNK_GAMEPAD` under Auto, then Xbox 360.
 ///
-/// `linux`/`windows` are the host OS. Every kind has a Linux and a Windows backend except the
-/// Steam Controller (Linux only); other wishes fold to Xbox 360 (never an error — a session
-/// without rich pads still streams). Steam Controller 2 is Linux UHID and Windows
+/// `linux`/`windows` are the host OS. Every kind has a Linux and a Windows backend, the two
+/// Switch 2 pads folding to the Switch Pro on Windows; other wishes fold to Xbox 360 (never an
+/// error — a session without rich pads still streams). Steam Controller 2 is Linux UHID and Windows
 /// DEVTYPE_TRITON; the SC2 Puck has a native Linux identity and folds onto the wired one on
 /// Windows.
 ///
@@ -68,7 +68,7 @@ fn pick_gamepad(pref: GamepadPref, env: Option<&str>, linux: bool, windows: bool
         // Linux: uinput `045E:0B00`, the one Xbox identity whose paddles SDL maps.
         GamepadPref::XboxElite if linux || windows => GamepadPref::XboxElite,
         GamepadPref::SteamDeck if linux => GamepadPref::SteamDeck,
-        GamepadPref::SteamController if linux => GamepadPref::SteamController,
+        GamepadPref::SteamController if linux || windows => GamepadPref::SteamController,
         GamepadPref::SteamDeck if windows => GamepadPref::SteamDeck,
         GamepadPref::DualSenseEdge if linux || windows => GamepadPref::DualSenseEdge,
         // Linux UHID hid-nintendo (≥ 5.16); Windows UMDF device type 8.
@@ -325,7 +325,8 @@ fn degrade_xbox_identity(chosen: GamepadPref) -> GamepadPref {
 /// UMDF identities newer than the first driver package, with the INF model token each needs. One
 /// package carries both Joy-Con halves, so the left one stands for the pair.
 #[cfg(target_os = "windows")]
-const DRIVER_IDENTITIES: [(GamepadPref, &str); 8] = [
+const DRIVER_IDENTITIES: [(GamepadPref, &str); 9] = [
+    (GamepadPref::SteamController, "pf_steamcontroller"),
     (GamepadPref::SwitchPro, "pf_switchpro"),
     (GamepadPref::EightBitDoUltimate2, "pf_8bitdo_ultimate2"),
     (GamepadPref::EightBitDoPro2, "pf_8bitdo_pro2"),
@@ -559,7 +560,11 @@ mod tests {
             pick_gamepad(Auto, Some("steamcontroller"), true, false),
             SteamController
         );
-        assert_eq!(pick_gamepad(SteamController, None, false, true), Xbox360);
+        assert_eq!(
+            pick_gamepad(SteamController, None, false, true),
+            SteamController
+        );
+        assert_eq!(pick_gamepad(SteamController, None, false, false), Xbox360);
 
         assert_eq!(
             pick_gamepad(DualSenseEdge, None, true, false),

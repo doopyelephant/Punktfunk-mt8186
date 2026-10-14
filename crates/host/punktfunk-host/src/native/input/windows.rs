@@ -25,6 +25,7 @@ pub(super) struct PadBackends {
     dualsense_edge_win: Option<crate::inject::dualsense_edge_windows::DualSenseEdgeWindowsManager>,
     dualshock4_win: Option<crate::inject::dualshock4_windows::DualShock4WindowsManager>,
     steamdeck_win: Option<crate::inject::steam_deck_windows::SteamDeckWindowsManager>,
+    steamctrl_win: Option<crate::inject::steam_controller_windows::SteamControllerWindowsManager>,
     switchpro_win: Option<crate::inject::switch_pro_windows::SwitchProWindowsManager>,
     eightbitdo_ultimate2_win: Option<crate::inject::eightbitdo_windows::EightBitDoWindowsManager>,
     eightbitdo_pro2_win: Option<crate::inject::eightbitdo_windows::EightBitDoWindowsManager>,
@@ -67,6 +68,12 @@ impl PadBackends {
             GamepadPref::SteamDeck => self
                 .steamdeck_win
                 .get_or_insert_with(crate::inject::steam_deck_windows::SteamDeckWindowsManager::new)
+                .handle(ev),
+            GamepadPref::SteamController => self
+                .steamctrl_win
+                .get_or_insert_with(
+                    crate::inject::steam_controller_windows::SteamControllerWindowsManager::new,
+                )
                 .handle(ev),
             GamepadPref::EightBitDoUltimate2 => self
                 .eightbitdo_ultimate2_win
@@ -150,6 +157,11 @@ impl PadBackends {
                     m.apply_rich(rich)
                 }
             }
+            GamepadPref::SteamController => {
+                if let Some(m) = &mut self.steamctrl_win {
+                    m.apply_rich(rich)
+                }
+            }
             GamepadPref::SwitchPro => {
                 if let Some(m) = &mut self.switchpro_win {
                     m.apply_rich(rich)
@@ -184,9 +196,10 @@ impl PadBackends {
         }
     }
 
-    /// A Triton device is live: its USB OUT is 1 kHz, so haptics poll at 1 ms.
+    /// A Steam Controller of either generation is live. Steam plays its trackpad haptics as
+    /// single pulses, up to 1 kHz on a Triton, so they poll at 1 ms.
     pub(super) fn steam_haptics_live(&self) -> bool {
-        self.steamctrl2.is_some()
+        self.steamctrl2.is_some() || self.steamctrl_win.is_some()
     }
 
     /// Every live UMDF manager; [`Self::pump`] and [`Self::heartbeat`] both walk it. A new field
@@ -201,6 +214,7 @@ impl PadBackends {
             dualsense_edge_win,
             dualshock4_win,
             steamdeck_win,
+            steamctrl_win,
             switchpro_win,
             eightbitdo_ultimate2_win,
             eightbitdo_pro2_win,
@@ -217,6 +231,7 @@ impl PadBackends {
             dualsense_edge_win.as_mut().map(|m| m as &mut dyn UhidTick),
             dualshock4_win.as_mut().map(|m| m as &mut dyn UhidTick),
             steamdeck_win.as_mut().map(|m| m as &mut dyn UhidTick),
+            steamctrl_win.as_mut().map(|m| m as &mut dyn UhidTick),
             switchpro_win.as_mut().map(|m| m as &mut dyn UhidTick),
             eightbitdo_ultimate2_win
                 .as_mut()

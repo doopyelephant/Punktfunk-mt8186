@@ -14,7 +14,7 @@
 //! answer `err = 0` or the kernel stalls ~5 s per command.
 
 use super::steam_proto::{
-    btn, parse_steam_output, sc_from_gamepad, serial_reply, serialize_deck_state,
+    btn, parse_steam_output, sc_merge_frame, serial_reply, serialize_deck_state,
     serialize_sc_state, ScState, SteamFeedback, SteamModel, SteamState, STEAMDECK_RDESC,
     STEAM_REPORT_LEN, STEAM_VENDOR,
 };
@@ -408,46 +408,6 @@ impl Default for ScProto {
     }
 }
 
-impl ScProto {
-    /// PADDLE1/2 map natively in [`sc_from_gamepad`]. Mask them out of the fold so 3/4 cannot
-    /// double-fire the same grips.
-    fn merge_typed(
-        &self,
-        prev: &SteamState,
-        f: &punktfunk_core::input::GamepadFrame,
-    ) -> SteamState {
-        use punktfunk_core::input::gamepad as gs;
-        let native = f.buttons & (gs::BTN_PADDLE1 | gs::BTN_PADDLE2);
-        let folded = crate::steam_remap::fold_paddles(
-            f.buttons & !(gs::BTN_PADDLE1 | gs::BTN_PADDLE2),
-            self.remap.paddles,
-        );
-        let mut s = sc_from_gamepad(
-            folded | native,
-            f.ls_x,
-            f.ls_y,
-            f.rs_x,
-            f.rs_y,
-            f.left_trigger,
-            f.right_trigger,
-        );
-        s.lpad_x = prev.lpad_x;
-        s.lpad_y = prev.lpad_y;
-        s.gyro = prev.gyro;
-        s.accel = prev.accel;
-        s.buttons |= prev.buttons & btn::LPAD_TOUCH;
-        s.lpad_click = prev.lpad_click;
-        // Right pad is the wire right stick; a rich contact (TouchpadEx surface 2) overrides only while the stick is centered.
-        if f.rs_x == 0 && f.rs_y == 0 {
-            s.rpad_x = prev.rpad_x;
-            s.rpad_y = prev.rpad_y;
-            s.buttons |= prev.buttons & btn::RPAD_TOUCH;
-            s.rpad_click = prev.rpad_click;
-        }
-        s
-    }
-}
-
 impl PadProto for ScProto {
     type Pad = ScTransport;
 
@@ -471,7 +431,8 @@ impl PadProto for ScProto {
     /// and show the client is alive.
     fn merge_frame(&self, prev: &ScState, f: &punktfunk_core::input::GamepadFrame) -> ScState {
         let mut next = *prev;
-        next.typed_frame(self.merge_typed(&prev.typed, f), Instant::now());
+        let typed = sc_merge_frame(&prev.typed, f, self.remap.paddles);
+        next.typed_frame(typed, Instant::now());
         next
     }
 
@@ -508,6 +469,7 @@ pub type SteamCtrlManager = UhidManager<ScProto>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::steam_proto::sc_from_gamepad;
     use crate::test_sysfs::{input_devices, wait_input_gone};
 
     fn find_node(name: &str) -> Option<String> {

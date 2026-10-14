@@ -10,7 +10,7 @@
 
 use super::steam_proto::{
     deck_serial, feature_reply, neutral_deck_report, neutral_sc_report, parse_steam_output,
-    sc_feature_reply, sc_serial, SteamFeedback, SteamModel, SteamState, RDESC_DECK_CTRL,
+    sc_mirror_reply, sc_serial, SteamFeedback, SteamModel, SteamState, RDESC_DECK_CTRL,
     RDESC_DECK_KBD, RDESC_DECK_MOUSE, RDESC_SC_CTRL,
 };
 use super::triton_proto::Sc2Identity;
@@ -50,19 +50,13 @@ struct ControllerHandler {
 impl ControllerHandler {
     /// The GET_REPORT answer to `last_set`, command byte first.
     fn feature_get(&self) -> [u8; 64] {
-        if self.model == SteamModel::Deck {
-            return feature_reply(&self.last_set, &self.serial);
-        }
-        // Recorded pairs are id-first; this pad's reports have no id, so it reads as 0.
-        let mut asked = vec![0];
-        asked.extend_from_slice(&self.last_set);
-        match self.identity.as_ref().and_then(|i| i.reply(&asked)) {
-            Some(recorded) => {
-                let mut r = [0u8; 64];
-                r[..63].copy_from_slice(&recorded[1..]);
-                r
-            }
-            None => sc_feature_reply(&self.last_set, &self.serial),
+        match self.model {
+            SteamModel::Deck => feature_reply(&self.last_set, &self.serial),
+            SteamModel::Controller => sc_mirror_reply(
+                |asked| self.identity.as_ref().and_then(|i| i.reply(asked)),
+                &self.last_set,
+                &self.serial,
+            ),
         }
     }
 }
