@@ -1,4 +1,5 @@
-# Does the NixOS module actually evaluate, and does it still render the units we decided on?
+# Does the NixOS module actually evaluate, and does it still render the drop-ins we decided on?
+# The units under them are the packages' own (scripts/*.service); vm-test.nix runs them.
 #
 # WHY THIS FILE EXISTS. `nix flake check` does NOT check `nixosModules`. It forces the value and
 # asserts it is a lambda taking an open attribute set — nothing more; nix's own source carries
@@ -156,6 +157,15 @@ let
     lib.hasInfix infix cfg.systemd.units."${name}".text;
   # A module's own failed assertions, as messages.
   failedAssertions = cfg: map (a: a.message) (lib.filter (a: !a.assertion) cfg.assertions);
+  # A shipped unit's EnvironmentFile entries without host.env, which NixOS never reads. A drop-in
+  # that clears the list must restate these, in this order.
+  shippedEnvFiles =
+    unitFile:
+    lib.filter (f: !(lib.hasSuffix "/host.env" f)) (
+      map (lib.removePrefix "EnvironmentFile=") (
+        lib.filter (lib.hasPrefix "EnvironmentFile=") (lib.splitString "\n" (builtins.readFile unitFile))
+      )
+    );
 
   results = [
     # --- the module evaluates at all, in every shape an operator can ask for -------------------
@@ -203,11 +213,13 @@ let
     # --- the KWin identification trap (packaging/arch/punktfunk-host.install) -------------------
     # The host MUST exec the plain store path. A capability wrapper here would put CAP_SYS_NICE in
     # the process's permitted set, and the kernel then refuses KWin the /proc/<pid>/exe readlink it
-    # identifies the client by — which cost every KDE box its desktop streaming in 0.26.0-1.
+    # identifies the client by. The packaged ExecStart is that path; GameStream replaces it here.
     {
-      name = "host ExecStart is the store binary, never a capability wrapper";
+      # The empty line clears the packaged ExecStart: two on a simple service fail the unit.
+      name = "gamestream=true runs the store binary with --gamestream, never a wrapper";
       ok =
-        has desktop "punktfunk-host" "ExecStart=/pf-stub/system-punktfunk-host/bin/punktfunk-host serve"
+        has desktop "punktfunk-host"
+          "ExecStart=\nExecStart=/pf-stub/system-punktfunk-host/bin/punktfunk-host serve --gamestream\n"
         && !(has desktop "punktfunk-host" "ExecStart=/run/wrappers");
     }
     # ...while the ENCODE WORKER, which nothing ever has to identify, is pointed at the wrapper.
@@ -248,10 +260,6 @@ let
 
     # --- GameStream opt-out reaches both the argv and the firewall -----------------------------
     {
-      name = "gamestream=true passes --gamestream";
-      ok = has desktop "punktfunk-host" "serve --gamestream";
-    }
-    {
       name = "gamestream=false drops --gamestream and its firewall ports";
       ok =
         !(has nativeOnly "punktfunk-host" "--gamestream")
@@ -273,17 +281,17 @@ let
         && lib.elem 47993 appliance.networking.firewall.allowedTCPPorts;
     }
 
+    # --- the console ---------------------------------------------------------------------------
     {
       # web-init.sh writes a PUNKTFUNK_UI_BIND into host.env; read, it would beat `web.bind`. The
-      # token stays mandatory: a console without it fails closed.
+      # rest is the shipped list as it stands, mandatory token included.
       name = "the console binds where web.bind says, never host.env";
       ok =
         let
           files = appliance.systemd.user.services.punktfunk-web.serviceConfig.EnvironmentFile;
         in
         lib.head files == ""
-        && !(lib.any (lib.hasInfix "host.env") files)
-        && lib.elem "%h/.config/punktfunk/mgmt-token" files
+        && lib.tail files == shippedEnvFiles ../../scripts/punktfunk-web.service
         && has appliance "punktfunk-web" "PUNKTFUNK_UI_BIND=0.0.0.0";
     }
 
@@ -461,11 +469,13 @@ let
       ok =
         let
           files = seats.systemd.user.services.punktfunk-host.serviceConfig.EnvironmentFile;
+          shipped = shippedEnvFiles ../../scripts/punktfunk-host.service;
         in
         lib.head files == ""
         && lib.length files == 3
         && lib.hasInfix "punktfunk-host.env" (lib.elemAt files 1)
-        && lib.last files == "-/run/punktfunk/seats/%u.env";
+        && shipped == [ "-/run/punktfunk/seats/%u.env" ]
+        && lib.last files == lib.last shipped;
     }
     {
       name = "a host without seats keeps its ports and units as they were";

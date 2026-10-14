@@ -126,8 +126,10 @@ GPU driver. `nix fmt` formats the `.nix` files.
   `// FIXME: if we have a 'nixpkgs' input, use it to check the module.`). Measured: a module setting
   a nonexistent option, referencing a nonexistent `pkgs` attribute **and** calling a nonexistent
   `lib` function passes clean, printing *all checks passed!*. So that line means nothing.
-  [`module-check.nix`](module-check.nix) closes the gap by evaluating against real nixpkgs in four
-  scenarios and asserting on the rendered systemd units. Two rules if you edit it: **keep every
+  [`module-check.nix`](module-check.nix) closes the gap by evaluating against real nixpkgs in a set
+  of scenarios and asserting on what the module renders: the drop-ins over the packaged user units,
+  and the system wiring. What the shipped unit itself declares is
+  [`vm-test.nix`](vm-test.nix)'s to check. Two rules if you edit it: **keep every
   assertion pure Nix** (instantiating the derivation is what runs them, which is what lets the cheap
   `--no-build` CI leg cover it), and **assert list-valued unit fields on the evaluated lists**, not
   the rendered text — systemd renders `After=` as one space-separated line, so an `hasInfix` on it
