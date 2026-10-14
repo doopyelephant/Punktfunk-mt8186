@@ -5,8 +5,9 @@
 //! This process is unprivileged. polkit authorizes `systemctl start
 //! punktfunk-update.service` for the `punktfunk-update` group (packaged empty).
 //! The request carries nothing: ExecStart is fixed and the helper reads
-//! root-owned state. polkit uses NSS at request time, so a fresh `usermod -aG`
-//! counts without re-login; [`opted_in`] uses the same NSS route.
+//! root-owned state. polkit judges the caller's own groups, which the user manager
+//! fixes when it starts, so a fresh `usermod -aG` counts after a restart;
+//! [`opted_in`] reads the same.
 
 #![cfg(target_os = "linux")]
 
@@ -53,8 +54,8 @@ pub(super) fn pacman_opted_in() -> bool {
         .unwrap_or(false)
 }
 
-/// Group membership via NSS, matching polkit — not this process's (possibly stale)
-/// credentials. Cached; the status endpoint polls this.
+/// This process's groups hold `punktfunk-update`, as polkit sees them. A `usermod` since the
+/// host started is not among them. Cached; the status endpoint polls this.
 pub(super) fn opted_in() -> bool {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(Instant, bool)>>> =
         std::sync::OnceLock::new();
@@ -73,8 +74,7 @@ pub(super) fn opted_in() -> bool {
 }
 
 fn probe_group_membership() -> Option<bool> {
-    let user = capture(Command::new("id").arg("-un"))?;
-    let groups = capture(Command::new("id").args(["-nG", user.trim()]))?;
+    let groups = capture(Command::new("id").arg("-nG"))?;
     Some(groups.split_whitespace().any(|g| g == "punktfunk-update"))
 }
 
@@ -242,8 +242,9 @@ pub(super) fn run_apply(
 ) -> Result<(), (&'static str, String)> {
     let started_unix = crate::clock::unix_secs_u64();
 
+    // No password prompt on the box's own desktop: a refusal answers at once.
     let mut child = Command::new("systemctl")
-        .args(["start", "punktfunk-update.service"])
+        .args(["start", "--no-ask-password", "punktfunk-update.service"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -275,9 +276,10 @@ pub(super) fn run_apply(
             use std::io::Read as _;
             let _ = stderr.read_to_string(&mut err);
         }
-        let denial = err.contains("interactive authentication")
-            || err.contains("Access denied")
-            || err.contains("Permission denied");
+        let said = err.to_ascii_lowercase();
+        let denial = said.contains("interactive authentication")
+            || said.contains("access denied")
+            || said.contains("permission denied");
         return Err((
             "applying",
             if denial {

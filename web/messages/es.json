@@ -910,7 +910,7 @@
 	"update_result_staged": "La actualización a {to} está preparada: reinicia este host para finalizar.",
 	"update_result_noop": "Tu fuente de paquetes no tenía nada más reciente: inténtalo de nuevo en unos minutos.",
 	"update_result_noop_source": "Nada que recompilar: este host ya tiene la compilación más reciente.",
-	"update_opt_in": "Para habilitar actualizaciones con un solo clic desde aquí, ejecuta esto una vez en el host (luego cierra sesión e inicia de nuevo):",
+	"update_opt_in": "Para habilitar actualizaciones con un solo clic desde aquí, ejecuta esto una vez en el host (luego reinícialo):",
 	"update_result_failed": "La actualización a {to} falló durante {stage}.",
 	"update_result_log": "Registro del instalador:",
 	"library_field_role": "Esta entrada abre un lanzador",
