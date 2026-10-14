@@ -13,7 +13,7 @@ use crate::glyphs::{Hint, HintKey};
 use crate::pointer::Pointer;
 use crate::ring::draw_keycap_disc;
 use crate::screens::{Ctx, Outbox, ScreenView, TextEntry};
-use crate::theme::{accent, fg, fill, on_accent, stroke, Fonts, PanelStroke, W};
+use crate::theme::{fill, stroke, Fonts, Frame, PanelStroke, W};
 use crate::widgets::{
     field_key, permits, type_text, Charset, Entry, ListMsg, MenuList, RowSpec, ROW_MAX_W,
 };
@@ -230,6 +230,7 @@ impl KeyTray {
     fn render(
         &mut self,
         canvas: &Canvas,
+        ui: &Frame,
         fonts: &Fonts,
         w: f64,
         bottom: f64,
@@ -245,6 +246,7 @@ impl KeyTray {
         let rect = Rect::from_xywh(x0 as f32, y0 as f32, tray_w as f32, tray_h as f32);
         crate::theme::panel(
             canvas,
+            ui,
             rect,
             22.0,
             Some(Color4f::new(0.05, 0.045, 0.09, 0.55)),
@@ -268,7 +270,7 @@ impl KeyTray {
                 let focused = r == self.row && c == self.col;
                 let is_chosen = chosen == Some(*name);
                 let face = if focused {
-                    let mut b = accent(1.0);
+                    let mut b = ui.accent(1.0);
                     if self.flash > 0.02 {
                         let f = self.flash as f32;
                         b = Color4f::new(
@@ -280,17 +282,17 @@ impl KeyTray {
                     }
                     b
                 } else if is_chosen {
-                    accent(0.35)
+                    ui.accent(0.35)
                 } else {
-                    fg(0.08)
+                    ui.fg(0.08)
                 };
                 let rr = RRect::new_rect_xy(kr, 9.0 * kf, 9.0 * kf);
                 canvas.draw_rrect(rr, &fill(face));
                 if is_chosen && !focused {
-                    canvas.draw_rrect(rr, &stroke(accent(0.9), kf));
+                    canvas.draw_rrect(rr, &stroke(ui.accent(0.9), kf));
                 }
                 // Accent fill: legend ink is `on_accent`, not field `fg`.
-                let ink = if focused { on_accent() } else { fg(1.0) };
+                let ink = if focused { ui.on_accent() } else { ui.fg(1.0) };
                 let tw = f64::from(fonts.measure(&legends[c], W::Medium, size));
                 fonts.draw(
                     canvas,
@@ -563,9 +565,11 @@ impl ScreenView for ShortcutEditorScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let kf = k as f32;
         crate::widgets::blurb(
             canvas,
+            ui,
             fonts,
             "Hold the modifiers marked on, then press the key. The dial draws it as a keycap.",
             rect,
@@ -590,7 +594,7 @@ impl ScreenView for ShortcutEditorScreen {
             f64::from(top) + 26.0 * k,
             W::SemiBold,
             18.0 * k,
-            fg(if chip.is_empty() { 0.45 } else { 0.95 }),
+            ui.fg(if chip.is_empty() { 0.45 } else { 0.95 }),
         );
         fonts.draw(
             canvas,
@@ -599,7 +603,7 @@ impl ScreenView for ShortcutEditorScreen {
             f64::from(top) + 46.0 * k,
             W::Regular,
             12.0 * k,
-            fg(0.5),
+            ui.fg(0.5),
         );
 
         // Shrink the list by whichever tray is seated so the edited row stays in view.
@@ -616,6 +620,7 @@ impl ScreenView for ShortcutEditorScreen {
         self.list.lift = self.keyboard.lift(rect, k);
         self.list.render(
             canvas,
+            ui,
             list_rect,
             &rows,
             fonts,
@@ -623,10 +628,11 @@ impl ScreenView for ShortcutEditorScreen {
             dt,
             !self.editing_name && !self.picking_key,
         );
-        self.keyboard.render(canvas, fonts, rect, k);
+        self.keyboard.render(canvas, ui, fonts, rect, k);
         if seat_keys > 0.0 {
             self.keys.render(
                 canvas,
+                ui,
                 fonts,
                 f64::from(rect.width()),
                 f64::from(rect.bottom),

@@ -37,7 +37,7 @@ mod overlays;
 mod render;
 
 use backdrop::Backdrop;
-use connect::{Asking, Connecting, Launching, SeatWait};
+use connect::{Connect, Launching, Reask};
 
 /// Reduced-motion nav: 0.22 s, critically damped. `render.rs` draws it as a
 /// crossfade (no slide, no scale). Instant swap would drop the only spatial cue.
@@ -63,6 +63,7 @@ const BOTTOM_BAND: f64 = 86.0;
 /// A tab switch slides the new root this share of the width.
 pub(crate) const TAB_SLIDE: f64 = 0.25;
 /// Seconds OK stays down on a remote before it opens the focused card's menu instead.
+/// UIKit's default long press, so a hold here lasts as long as one anywhere on the TV.
 const HOLD_S: f64 = 0.5;
 
 /// Top-level tabs, in strip order.
@@ -164,10 +165,10 @@ pub(crate) enum ToastMark {
 }
 
 impl ToastKind {
-    pub(crate) fn look(self) -> (Color4f, ToastMark) {
+    pub(crate) fn look(self, ui: &crate::theme::Frame) -> (Color4f, ToastMark) {
         match self {
-            ToastKind::Info => (crate::theme::fg(0.55), ToastMark::Dot),
-            ToastKind::Success => (crate::theme::accent(1.0), ToastMark::Check),
+            ToastKind::Info => (ui.fg(0.55), ToastMark::Dot),
+            ToastKind::Success => (ui.accent(1.0), ToastMark::Check),
             // Fixed RGB: `moss` accent is green, `ember` is orange — either
             // would paint a failure in the "this is fine" colour.
             ToastKind::Error => (Color4f::new(0.93, 0.31, 0.28, 1.0), ToastMark::Bang),
@@ -183,7 +184,8 @@ struct Toast {
     seat: Spring,
 }
 
-/// Seconds between `/status` reads while a shelf tile shows a live download.
+/// Seconds between `/status` reads while a shelf tile shows a live download. Often enough
+/// that the percentage moves, rare enough that a long download is not a stream of requests.
 const DOWNLOADS_POLL: f64 = 2.0;
 
 /// Host-supplied construction options.
@@ -274,8 +276,8 @@ pub const DEFAULT_GPU_CACHE_BYTES: usize = 160 << 20;
 /// before a stream takes the GPU.
 pub const MIN_GPU_CACHE_BYTES: usize = 96 << 20;
 
-/// The full-screen card that owns input, in the order input checks them. Asking and
-/// connecting coexist (the card shows after a beat), and a woken host goes on to connect.
+/// The full-screen card that owns input: the connect's phase, else the wake card, else the
+/// speed test. A woken host goes on to connect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Takeover {
     Launching,
@@ -323,19 +325,11 @@ pub(crate) struct Shell {
     /// The `host_sort` / `host_grouping` values `hosts` was last arranged by.
     hosts_order: (Option<serde_json::Value>, Option<serde_json::Value>),
     pub(crate) in_stream: bool,
-    connecting: Option<Connecting>,
-    launching: Option<Launching>,
-    /// Input waits while this is up; Back drops it.
-    asking: Option<Asking>,
-    /// Input waits while this is up; Back drops it.
-    seat_wait: Option<SeatWait>,
-    /// The dialed connect as it would ask again, while it might still come back
-    /// `profile-unknown`. `None` once it streams, fails otherwise, or is itself the second ask.
-    reask: Option<ConnectIntent>,
-    /// Set by [`Self::profile_gone`]; the failure that follows asks again instead of toasting.
-    reask_now: Option<ConnectIntent>,
-    /// The ask in flight is that second ask.
-    reasking: bool,
+    /// Where the connect is, from the press to the stream. Input waits while it is past
+    /// [`Connect::Idle`].
+    connect: Connect,
+    /// How far a connect is from asking its profiles a second time.
+    reask: Reask,
     /// What each paired host listed of its profiles this run, and this run's picks.
     profiles: crate::screens::profiles::ProfileBook,
     /// Host title of the last connect. [`Self::session_reconnecting`] has no
@@ -381,6 +375,9 @@ pub(crate) struct Shell {
     last_frame: Option<Instant>,
     /// Last menu, pointer, key or text input — the idle clock ([`crate::console::IDLE_AFTER`]).
     last_input: Instant,
+    /// The last frame's ink, motion and inset: what the next frame follows on from, what
+    /// input between frames reads, and what a host's chrome over a stream draws in.
+    pub(crate) ui: crate::theme::Frame,
     /// Test-only `(t, step)`: clock reads `t` and each frame adds `step`.
     /// The aurora phase *is* the clock; wall time never agrees across dumps.
     #[cfg(test)]
@@ -453,13 +450,8 @@ impl Shell {
             hosts_order: (None, None),
             pad_testing: false,
             in_stream: false,
-            connecting: None,
-            launching: None,
-            asking: None,
-            seat_wait: None,
-            reask: None,
-            reask_now: None,
-            reasking: false,
+            connect: Connect::Idle,
+            reask: Reask::None,
             profiles: Default::default(),
             last_connect_title: None,
             wake: None,
@@ -481,6 +473,7 @@ impl Shell {
             t0: Instant::now(),
             last_frame: None,
             last_input: Instant::now(),
+            ui: crate::theme::Frame::default(),
             #[cfg(test)]
             fake_clock: None,
         })
@@ -565,22 +558,18 @@ impl Shell {
         self.stack.len() == 1 && self.strip_focus && self.takeover().is_none()
     }
 
-    /// The takeover that owns input: the first one up, in [`Takeover`]'s order.
+    /// The takeover that owns input. A service thread can raise the wake or speed card under
+    /// a connect, so those come after it.
     pub(crate) fn takeover(&self) -> Option<Takeover> {
-        let up = [
-            (self.launching.is_some(), Takeover::Launching),
-            (self.asking.is_some(), Takeover::Asking),
-            (self.seat_wait.is_some(), Takeover::SeatWait),
-            (self.connecting.is_some(), Takeover::Connecting),
-            (self.wake.is_some(), Takeover::Wake),
-            (self.speed.is_some(), Takeover::Speed),
-        ];
-        up.into_iter().find_map(|(on, t)| on.then_some(t))
+        self.connect
+            .takeover()
+            .or(self.wake.as_ref().map(|_| Takeover::Wake))
+            .or(self.speed.as_ref().map(|_| Takeover::Speed))
     }
 
     pub(crate) fn editing(&self) -> bool {
         !self.in_stream
-            && self.connecting.is_none()
+            && self.connect.card().is_none()
             && !self.holds_stream()
             && self.stack.last().is_some_and(|s| s.view().editing())
     }
@@ -622,6 +611,7 @@ impl Shell {
             device: &self.device,
             t,
             profiles: &self.profiles,
+            ui: &self.ui,
         };
         (ctx, self.stack.last_mut().expect("non-empty stack"))
     }
@@ -629,7 +619,7 @@ impl Shell {
     /// The console is covering a live stream — a launch hold — and wants the
     /// pad as menu events, masked off the wire.
     pub(crate) fn holds_stream(&self) -> bool {
-        self.launching.is_some()
+        self.connect.launching().is_some()
     }
 
     /// No input for [`crate::console::IDLE_AFTER`].
@@ -686,7 +676,7 @@ impl Shell {
     /// `/status` every [`DOWNLOADS_POLL`] so its tile's percentage moves.
     fn tick_downloads(&mut self) {
         let t = self.t();
-        if self.launching.is_some() || t - self.downloads_polled < DOWNLOADS_POLL {
+        if self.holds_stream() || t - self.downloads_polled < DOWNLOADS_POLL {
             return;
         }
         if !self.library.any_live_download() {
@@ -819,7 +809,7 @@ impl Shell {
                     self.start_connect(intent);
                     // Wake takeover was already full-screen; skip the connect
                     // fade so home does not flash through.
-                    if let Some(c) = &mut self.connecting {
+                    if let Some(c) = self.connect.card_mut() {
                         c.appear = 1.0;
                     }
                 }
@@ -1045,7 +1035,7 @@ impl Shell {
         self.games_key = games_key;
         // The saved generation, so a list published meanwhile is still taken on the next sync.
         (self.hosts, self.hosts_gen) = hosts;
-        crate::el::forget_handoff();
+        self.ui.el.forget_handoff();
     }
 
     /// Warm-up only: every shelf drawn or parked shows the stand-in cover, entrance over.
@@ -1218,26 +1208,20 @@ impl Shell {
     fn takeover_menu(&mut self, t: Takeover, ev: MenuEvent) -> Option<MenuPulse> {
         match (t, ev) {
             (Takeover::Launching, MenuEvent::Confirm | MenuEvent::Back)
-                if self.launching.as_ref().is_some_and(|l| l.connected) =>
+                if self.connect.launching().is_some_and(|l| l.connected) =>
             {
                 self.reveal_stream();
             }
-            (Takeover::Launching, MenuEvent::Back) => {
-                self.launching = None;
-                self.actions.push_back(OverlayAction::CancelConnect);
-            }
             // Dropped here, not on the next `session_phase`: a dial blocked on the host
             // never sends one. Hosts handle a dial that lands after the cancel.
-            (Takeover::Connecting, MenuEvent::Back) => {
-                self.connecting = None;
+            (Takeover::Launching | Takeover::Connecting, MenuEvent::Back) => {
+                self.connect = Connect::Idle;
                 self.actions.push_back(OverlayAction::CancelConnect);
             }
             // Nothing has dialed yet: no cancel to send.
-            (Takeover::Asking, MenuEvent::Back) => {
-                self.asking = None;
-                self.connecting = None;
+            (Takeover::Asking | Takeover::SeatWait, MenuEvent::Back) => {
+                self.connect = Connect::Idle;
             }
-            (Takeover::SeatWait, MenuEvent::Back) => self.seat_wait = None,
             (Takeover::Wake, MenuEvent::Back) => {
                 self.bus.send(ConsoleCmd::CancelWake);
                 self.console.put_wake(None);
@@ -1278,11 +1262,11 @@ impl Shell {
         // the library would start a second session. Right button is its B.
         match self.takeover() {
             Some(Takeover::Launching) => {
-                let connected = self.launching.as_ref().is_some_and(|l| l.connected);
+                let connected = self.connect.launching().is_some_and(|l| l.connected);
                 if connected && (p.press() || p.kind == PointerKind::Back) {
                     self.reveal_stream();
                 } else if !connected && p.kind == PointerKind::Back {
-                    self.launching = None;
+                    self.connect = Connect::Idle;
                     self.actions.push_back(OverlayAction::CancelConnect);
                 }
                 return true;

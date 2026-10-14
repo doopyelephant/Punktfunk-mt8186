@@ -1,5 +1,6 @@
 use super::*;
 use crate::pointer::{Pointer, PointerKind};
+use crate::theme::Frame as Ui;
 use std::cell::RefCell;
 
 fn canvas() -> skia_safe::Surface {
@@ -60,7 +61,7 @@ fn a_scroll_offsets_clips_and_hit_tests_its_children() {
     // 20 rows at a 100 px pitch, 300 px of viewport.
     let frame = tree.layout(tall_list(list, 20, &drawn), view);
     assert_eq!(frame.scroll(list).map(|(_, max)| max), Some(1690.0));
-    tree.paint(surface.canvas(), frame);
+    tree.paint(surface.canvas(), &Ui::default(), frame);
     assert_eq!(*drawn.borrow(), [0, 1, 2]);
     assert_eq!(tree.hit(10.0, 150.0), Some(Id::new("row", 1)));
     // The gap between rows belongs to the viewport, not a row.
@@ -69,7 +70,7 @@ fn a_scroll_offsets_clips_and_hit_tests_its_children() {
     tree.set_offset(list, 250.0);
     drawn.borrow_mut().clear();
     let frame = tree.layout(tall_list(list, 20, &drawn), view);
-    tree.paint(surface.canvas(), frame);
+    tree.paint(surface.canvas(), &Ui::default(), frame);
     assert_eq!(*drawn.borrow(), [2, 3, 4, 5]);
     assert_eq!(tree.rect(Id::new("row", 2)).map(|r| r.top), Some(-50.0));
     // Row 2 hangs above the viewport: the part outside is not hittable.
@@ -79,7 +80,7 @@ fn a_scroll_offsets_clips_and_hit_tests_its_children() {
     // Content shrank under the offset: it clamps to the new end.
     tree.set_offset(list, 5000.0);
     let frame = tree.layout(tall_list(list, 5, &drawn), view);
-    tree.paint(surface.canvas(), frame);
+    tree.paint(surface.canvas(), &Ui::default(), frame);
     assert_eq!(tree.offset(list), 190.0);
 }
 
@@ -121,7 +122,7 @@ fn a_virtual_list_builds_only_what_is_in_view() {
     // 400 px of overscan each side of 100 000..100 800.
     assert_eq!(*built.borrow(), (996..1012).collect::<Vec<_>>());
     let mut surface = canvas();
-    tree.paint(surface.canvas(), frame);
+    tree.paint(surface.canvas(), &Ui::default(), frame);
     assert_eq!(tree.rect(Id::new("cell", 1000)).map(|r| r.top), Some(0.0));
     assert_eq!(tree.hit(10.0, 5.0), Some(Id::new("cell", 1000)));
 }
@@ -133,7 +134,7 @@ fn frame_of(tree: &mut Tree, list: Id) {
         tall_list(list, 20, &drawn),
         Rect::from_xywh(0.0, 0.0, 400.0, 300.0),
     );
-    tree.paint(canvas().canvas(), frame);
+    tree.paint(canvas().canvas(), &Ui::default(), frame);
 }
 
 fn run(tree: &mut Tree, list: Id, seconds: f32) {
@@ -214,12 +215,14 @@ fn the_plate_glides_between_trees() {
         let mut surface = canvas();
         let (mut upper, mut lower) = (Tree::new(), Tree::new());
         let lower_rect = Rect::from_xywh(400.0, 500.0, 100.0, 60.0);
-        let frame = |upper: &mut Tree, lower: &mut Tree, s: &mut skia_safe::Surface| {
-            super::begin_frame();
+        let mut ui = Ui::default();
+        let mut frame = |upper: &mut Tree, lower: &mut Tree, s: &mut skia_safe::Surface| {
+            ui = ui.next(ui.ink, false, false, 0.0);
+            let ui = &ui;
             let paint = |t: &mut Tree, el: El<'_>, s: &mut skia_safe::Surface| {
                 let root = El::column().child(el);
                 let f = t.layout(root, Rect::from_xywh(0.0, 0.0, 1280.0, 800.0));
-                t.paint_focus(s.canvas(), f, 1.0, 1.0 / 120.0, false);
+                t.paint_focus(s.canvas(), ui, f, 1.0, 1.0 / 120.0, false);
             };
             if upper_first {
                 paint(upper, target("up", 0, card(0)), s);
@@ -284,7 +287,7 @@ fn shelf(tree: &mut Tree, surface: &mut skia_safe::Surface) {
         ))
         .child(target("far", 0, Rect::from_xywh(0.0, 400.0, 100.0, 60.0)));
     let frame = tree.layout(root, Rect::from_xywh(0.0, 0.0, 600.0, 600.0));
-    tree.paint(surface.canvas(), frame);
+    tree.paint(surface.canvas(), &Ui::default(), frame);
 }
 
 #[test]
@@ -321,11 +324,13 @@ fn the_plate_travels_lands_and_settles() {
     use pf_client_core::menu_nav::MenuDir::*;
     let mut surface = canvas();
     let mut tree = Tree::new();
-    let draw = |tree: &mut Tree, surface: &mut skia_safe::Surface| {
+    let ui = &Ui::default();
+    let draw_in = |tree: &mut Tree, surface: &mut skia_safe::Surface, ui: &Ui| {
         let root = El::column().children((0..3).map(|i| target("card", i, card(i))));
         let frame = tree.layout(root, Rect::from_xywh(0.0, 0.0, 600.0, 600.0));
-        tree.paint_focus(surface.canvas(), frame, 1.0, 1.0 / 120.0, false);
+        tree.paint_focus(surface.canvas(), ui, frame, 1.0, 1.0 / 120.0, false);
     };
+    let draw = |tree: &mut Tree, surface: &mut skia_safe::Surface| draw_in(tree, surface, ui);
     tree.set_focus(Some(Id::new("card", 0)));
     draw(&mut tree, &mut surface);
     assert_eq!(
@@ -355,10 +360,12 @@ fn the_plate_travels_lands_and_settles() {
     assert_eq!(tree.plate_rect().unwrap().0.left, 120.0);
     assert!(!tree.plate_busy(), "the landing wobble has settled");
 
-    crate::theme::set_reduce_motion(true);
+    let reduced = Ui {
+        reduce_motion: true,
+        ..Ui::default()
+    };
     tree.move_focus(Right);
-    draw(&mut tree, &mut surface);
-    crate::theme::set_reduce_motion(false);
+    draw_in(&mut tree, &mut surface, &reduced);
     assert_eq!(
         tree.plate_rect().unwrap().0.left,
         240.0,
@@ -369,9 +376,14 @@ fn the_plate_travels_lands_and_settles() {
 
 /// Paint the cards in `shown` of a row of three, the plate stepping a 60 Hz frame.
 fn cards(tree: &mut Tree, shown: &[usize]) {
+    cards_in(tree, shown, &Ui::default());
+}
+
+/// [`cards`] in a given frame, whose census counts them.
+fn cards_in(tree: &mut Tree, shown: &[usize], ui: &Ui) {
     let root = El::column().children(shown.iter().map(|&i| target("card", i, card(i))));
     let frame = tree.layout(root, Rect::from_xywh(0.0, 0.0, 600.0, 600.0));
-    tree.paint_focus(canvas().canvas(), frame, 1.0, 1.0 / 60.0, false);
+    tree.paint_focus(canvas().canvas(), ui, frame, 1.0, 1.0 / 60.0, false);
 }
 
 #[test]
@@ -430,15 +442,17 @@ fn a_held_focus_the_frame_lacks_fades_the_plate_out() {
 #[test]
 fn a_tree_with_no_targets_counts_none_and_focus_waits() {
     let mut tree = Tree::new();
+    let ui = &Ui::default();
+    let el = &ui.el;
     tree.set_focus(Some(Id::new("card", 2)));
-    assert_eq!(census(|| cards(&mut tree, &[0, 1, 2])), 3);
+    assert_eq!(el.census(|| cards_in(&mut tree, &[0, 1, 2], ui)), 3);
 
     // Nothing focusable: the census says so, focus waits and the plate fades.
     let empty = |tree: &mut Tree| {
         let frame = tree.layout(El::column(), Rect::from_xywh(0.0, 0.0, 600.0, 600.0));
-        tree.paint_focus(canvas().canvas(), frame, 1.0, 1.0 / 60.0, false);
+        tree.paint_focus(canvas().canvas(), ui, frame, 1.0, 1.0 / 60.0, false);
     };
-    assert_eq!(census(|| empty(&mut tree)), 0);
+    assert_eq!(el.census(|| empty(&mut tree)), 0);
     for _ in 0..60 {
         empty(&mut tree);
     }
@@ -450,13 +464,13 @@ fn a_tree_with_no_targets_counts_none_and_focus_waits() {
     assert_eq!(tree.focus(), Some(Id::new("card", 1)));
 
     // Nested counts add up; a claim outside a census goes nowhere.
-    assert_eq!(census(|| claim(2)), 2);
-    let outer = census(|| {
-        census(|| cards(&mut tree, &[0, 1]));
-        claim(1);
+    assert_eq!(el.census(|| el.claim(2)), 2);
+    let outer = el.census(|| {
+        el.census(|| cards_in(&mut tree, &[0, 1], ui));
+        el.claim(1);
     });
     assert_eq!(outer, 3);
-    claim(5);
+    el.claim(5);
 }
 
 /// Up from the top row answers nothing and leaves focus put: a screen reads that as its
@@ -539,7 +553,7 @@ fn a_sideways_drag_moves_a_row_and_flings_it() {
     let mut surface = canvas();
     let view = Rect::from_xywh(0.0, 0.0, 400.0, 300.0);
     let frame = tree.layout(wide_row(row, &drawn), view);
-    tree.paint(surface.canvas(), frame);
+    tree.paint(surface.canvas(), &Ui::default(), frame);
     let at = |kind| Pointer {
         x: 10.0,
         y: 150.0,
@@ -578,7 +592,7 @@ fn a_sideways_drag_moves_a_row_and_flings_it() {
     for _ in 0..240 {
         tree.tick(1.0 / 120.0);
         let frame = tree.layout(wide_row(row, &drawn), view);
-        tree.paint(surface.canvas(), frame);
+        tree.paint(surface.canvas(), &Ui::default(), frame);
     }
     let coasted = tree.offset(row);
     assert!(coasted > 400.0, "{coasted}");

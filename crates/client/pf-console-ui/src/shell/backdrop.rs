@@ -32,8 +32,8 @@ pub(super) struct Backdrop {
     /// Backdrop scrim: rgb = vignette target (black on dark, white on pale),
     /// a = strength. Kept with the ink.
     mesh_scrim: [f32; 4],
-    /// Text/accent/glass for this palette, published once per frame
-    /// (see [`crate::theme::set_ink`]).
+    /// Text/accent/glass for this palette: the ink each frame's [`crate::theme::Frame`]
+    /// carries.
     pub(super) ink: crate::theme::Ink,
     /// 0 = launcher aurora, 1 = form field. Chased so the backdrop settles
     /// with the screen transition.

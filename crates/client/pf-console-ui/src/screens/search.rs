@@ -172,8 +172,10 @@ impl ScreenView for SearchScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let below = blurb(
             canvas,
+            ui,
             fonts,
             "Finds the titles on this host whose name contains what you type.",
             rect,
@@ -195,8 +197,8 @@ impl ScreenView for SearchScreen {
         ];
         self.list.lift = self.keyboard.lift(rect, k);
         self.list
-            .render(canvas, list_rect, &rows, fonts, k, dt, !self.editing);
-        self.keyboard.render(canvas, fonts, rect, k);
+            .render(canvas, ui, list_rect, &rows, fonts, k, dt, !self.editing);
+        self.keyboard.render(canvas, ui, fonts, rect, k);
     }
 
     fn press(&mut self) {

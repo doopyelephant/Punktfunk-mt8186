@@ -25,6 +25,8 @@ pub struct Flick {
     pub content_h: f64,
     /// One Up or Down moves [`STEP_LINES`] of these, px: the owner's line height.
     pub step: f64,
+    /// Reduce Motion, as the owner last drew: a step lands at once.
+    pub reduced: bool,
 }
 
 impl Flick {
@@ -36,7 +38,7 @@ impl Flick {
         }
         self.goal = goal;
         self.flinging = false;
-        if crate::theme::reduce_motion() {
+        if self.reduced {
             self.scroll = goal;
             self.vel = 0.0;
         }
@@ -156,7 +158,6 @@ mod tests {
     /// A step moves the goal at once and the page over the next frames, never past it.
     #[test]
     fn a_step_glides_to_its_goal() {
-        crate::theme::set_reduce_motion(false);
         let mut f = page();
         assert!(matches!(
             f.menu(MenuEvent::Move(MenuDir::Down)),
@@ -175,7 +176,6 @@ mod tests {
     /// The ends bump; a page is the viewport less a step; reduced motion lands at once.
     #[test]
     fn the_ends_bump_and_reduced_motion_lands_at_once() {
-        crate::theme::set_reduce_motion(false);
         let mut f = page();
         assert!(matches!(
             f.menu(MenuEvent::Move(MenuDir::Up)),
@@ -183,16 +183,14 @@ mod tests {
         ));
         f.menu(MenuEvent::Move(MenuDir::Right));
         assert_eq!(f.goal(), 580.0);
-        crate::theme::set_reduce_motion(true);
+        f.reduced = true;
         f.menu(MenuEvent::Move(MenuDir::Right));
         assert_eq!((f.goal(), f.scroll), (1160.0, 1160.0));
-        crate::theme::set_reduce_motion(false);
     }
 
     /// A finger owns the offset while it drags; its fling coasts and stops inside the content.
     #[test]
     fn a_finger_drags_and_its_fling_coasts() {
-        crate::theme::set_reduce_motion(false);
         let mut f = page();
         let pan = |kind| Pointer {
             x: 0.0,

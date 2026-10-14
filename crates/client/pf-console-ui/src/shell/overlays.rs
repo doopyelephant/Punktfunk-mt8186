@@ -3,10 +3,10 @@
 use crate::anim::{approach, springs};
 use crate::coverflow::{card_matrix, PERSPECTIVE};
 use crate::glyphs::{hint_bar, Hint, HintKey};
-use crate::theme::{edge, fg, fill, Fonts, PanelStroke, W};
+use crate::theme::{fill, Fonts, Frame, PanelStroke, W};
 use skia_safe::{gradient, Canvas, Color4f, Image, PathBuilder, Point, RRect, Rect, TileMode, M44};
 
-use super::{Launching, Shell, ToastMark, BOTTOM_BAND};
+use super::{Connect, Launching, Shell, ToastMark, BOTTOM_BAND};
 use crate::model::{SpeedPhase, SpeedStatus};
 
 /// Kind mark in a 13 dp box.
@@ -62,8 +62,9 @@ impl Shell {
         t: f64,
         fonts: &Fonts,
     ) {
+        let ui = &self.ui;
         // Resolved before the chain below: naming the layer Apply writes to reads the
-        // whole shell, which the chain's `&mut self.connecting` arm would forbid.
+        // whole shell, which the chain's `card_mut` arm would forbid.
         let pinned_by = self
             .speed
             .as_ref()
@@ -72,7 +73,7 @@ impl Shell {
         // Connect, wake and the speed test share one full-screen shape. A connect can
         // follow a wake (`sync`) so they share the backdrop and never blink between them.
         let takeover: Option<(f64, bool, String, String, Vec<Hint>)> =
-            if let Some(c) = &mut self.connecting {
+            if let Some(c) = self.connect.card_mut() {
                 c.appear = approach(c.appear, 1.0, dt, 0.07);
                 if c.request_access {
                     Some((
@@ -94,7 +95,7 @@ impl Shell {
                         vec![Hint::new(HintKey::Back, "Cancel")],
                     ))
                 }
-            } else if let Some(sw) = &mut self.seat_wait {
+            } else if let Connect::SeatWait(sw) = &mut self.connect {
                 sw.appear = approach(sw.appear, 1.0, dt, 0.07);
                 Some((
                     sw.appear,
@@ -194,7 +195,7 @@ impl Shell {
         let charted = self
             .speed
             .as_ref()
-            .filter(|_| self.connecting.is_none() && self.wake.is_none())
+            .filter(|_| self.connect.card().is_none() && self.wake.is_none())
             .filter(|sp| !matches!(sp.phase, SpeedPhase::Connecting | SpeedPhase::Failed(_)));
         match (takeover, charted) {
             (Some((_, _, title, body, hints)), Some(sp)) => {
@@ -207,18 +208,18 @@ impl Shell {
                     canvas, w, h, k, appear, t, fonts, spinner, &title, &body, &hints,
                 );
                 // The seat wait's Cancel takes a click; the other takeovers' legends do not.
-                if self.seat_wait.is_some() {
+                if self.connect.seat_wait().is_some() {
                     self.hint_rects = rects;
                 }
             }
             (None, _) => {}
         }
-        if let Some(l) = &mut self.launching {
+        if let Some(l) = self.connect.launching_mut() {
             l.appear = approach(l.appear, 1.0, dt, 0.09);
             l.flight.step_spec(1.0, crate::anim::springs::LAUNCH, dt);
             l.flight.settle(1.0, 0.001, 0.01);
         }
-        if let Some(l) = &self.launching {
+        if let Some(l) = self.connect.launching() {
             // The shelf that launched it still holds its decoded poster underneath.
             let poster = (self.stack.last())
                 .and_then(crate::screens::Screen::shelf)
@@ -231,7 +232,7 @@ impl Shell {
         }
         if let Some(toast) = &mut self.toast {
             let age = t - toast.at;
-            if crate::theme::reduce_motion() {
+            if ui.reduce_motion {
                 toast.seat = crate::anim::Spring::rest(1.0);
             } else {
                 toast.seat.step_spec(1.0, springs::MODAL, dt);
@@ -245,7 +246,7 @@ impl Shell {
                 1.0
             };
             let alpha = (slide * fade) as f32;
-            let (tint, mark) = toast.kind.look();
+            let (tint, mark) = toast.kind.look(ui);
             let size = 13.0 * k;
             let tw = f64::from(fonts.measure(&toast.text, W::Medium, size));
             let (pad_x, bh) = (16.0 * k, 34.0 * k);
@@ -263,10 +264,11 @@ impl Shell {
             crate::theme::save_layer_alpha(canvas, Some(bounds), alpha);
             canvas.draw_rrect(
                 skia_safe::RRect::new_rect_xy(rect, (bh / 2.0) as f32, (bh / 2.0) as f32),
-                &fill(crate::theme::shade(0.6)),
+                &fill(ui.shade(0.6)),
             );
             crate::theme::panel(
                 canvas,
+                ui,
                 rect,
                 (bh / 2.0 / k) as f32,
                 None,
@@ -282,7 +284,7 @@ impl Shell {
                 cy + size * 0.36,
                 W::Medium,
                 size,
-                fg(0.92),
+                ui.fg(0.92),
             );
             canvas.restore();
         }
@@ -305,6 +307,7 @@ impl Shell {
         body: &str,
         hints: &[Hint],
     ) -> Vec<(HintKey, Rect)> {
+        let ui = &self.ui;
         let cx = w / 2.0;
         // Only while it is arriving: an unbounded layer is a full-screen offscreen per frame,
         // and `appear` is at 1.0 within half a second of a hold that runs for many.
@@ -317,14 +320,14 @@ impl Shell {
 
         let title_y = h / 2.0 + if spinner { 14.0 * k } else { 0.0 };
         if spinner {
-            crate::theme::spinner(canvas, cx, title_y - 52.0 * k, 22.0 * k, t);
+            crate::theme::spinner(canvas, ui, cx, title_y - 52.0 * k, 22.0 * k, t);
         }
         fonts.centered(
             canvas,
             title,
             W::SemiBold,
             23.0 * k,
-            fg(1.0),
+            ui.fg(1.0),
             cx,
             title_y,
             w * 0.82,
@@ -335,7 +338,7 @@ impl Shell {
                 body,
                 W::Regular,
                 14.0 * k,
-                fg(0.55),
+                ui.fg(0.55),
                 cx,
                 title_y + 32.0 * k,
                 w * 0.66,
@@ -360,6 +363,7 @@ impl Shell {
         (title, body): (&str, &str),
         hints: &[Hint],
     ) {
+        let ui = &self.ui;
         canvas.save();
         self.draw_takeover_field(canvas, w, h, t);
         let (done, rec) = measured(&sp.phase);
@@ -375,11 +379,20 @@ impl Shell {
             _ => title.to_string(),
         };
         let title = caption.as_str();
-        let (cx, cw) = (w / 2.0, (620.0 * k).min(w - 2.0 * edge(k)));
+        let (cx, cw) = (w / 2.0, (620.0 * k).min(w - 2.0 * ui.edge(k)));
         let ch = (180.0 * k).min(h * 0.34);
         // Caption, figure, chart and body, centred as one block.
         let top = (h - (96.0 * k + ch + 64.0 * k)) / 2.0;
-        fonts.centered(canvas, title, W::SemiBold, 15.0 * k, fg(0.62), cx, top, cw);
+        fonts.centered(
+            canvas,
+            title,
+            W::SemiBold,
+            15.0 * k,
+            ui.fg(0.62),
+            cx,
+            top,
+            cw,
+        );
         let figure = match (done, sp.trace.is_empty()) {
             (None, true) => "\u{2014}".into(),
             _ => mbps(self.speed_view.figure.round() as u32),
@@ -389,7 +402,7 @@ impl Shell {
             &figure,
             W::Bold,
             44.0 * k,
-            fg(1.0),
+            ui.fg(1.0),
             cx,
             top + 22.0 * k,
             cw,
@@ -400,14 +413,24 @@ impl Shell {
             cw as f32,
             ch as f32,
         );
-        speed_chart(canvas, fonts, chart, &sp.trace, rec, &self.speed_view, k, t);
+        speed_chart(
+            canvas,
+            ui,
+            fonts,
+            chart,
+            &sp.trace,
+            rec,
+            &self.speed_view,
+            k,
+            t,
+        );
         let body_top = f64::from(chart.bottom) + 34.0 * k;
         fonts.centered(
             canvas,
             body,
             W::Regular,
             14.0 * k,
-            fg(0.55),
+            ui.fg(0.55),
             cx,
             body_top,
             cw,
@@ -425,13 +448,14 @@ impl Shell {
     /// vignette over it, which reads as a lighter band with a hard edge. The pool still
     /// centres on the safe rect, because that is where the text it separates sits.
     fn draw_takeover_field(&self, canvas: &Canvas, w: f64, h: f64, t: f64) {
+        let ui = &self.ui;
         let (left, top) = self.last_insets;
         let (fw, fh) = (f64::from(self.last_full.0), f64::from(self.last_full.1));
         canvas.save();
         canvas.translate((-left, -top));
         self.draw_aurora(canvas, fw, fh, t, 0.0);
         let mut vignette = crate::theme::shaded();
-        let shades = [crate::theme::shade(0.5), crate::theme::shade(0.0)];
+        let shades = [ui.shade(0.5), ui.shade(0.0)];
         vignette.set_shader(gradient::shaders::radial_gradient(
             (
                 Point::new(left + (w / 2.0) as f32, top + (h / 2.0) as f32),
@@ -461,9 +485,19 @@ impl Shell {
         if hints.is_empty() {
             return Vec::new();
         }
-        let probe = hint_bar(canvas, fonts, hints, self.glyphs, -10_000.0, -10_000.0, k);
+        let probe = hint_bar(
+            canvas,
+            &self.ui,
+            fonts,
+            hints,
+            self.glyphs,
+            -10_000.0,
+            -10_000.0,
+            k,
+        );
         hint_bar(
             canvas,
+            &self.ui,
             fonts,
             hints,
             self.glyphs,
@@ -489,6 +523,7 @@ impl Shell {
         l: &Launching,
         poster: Option<&Image>,
     ) {
+        let ui = &self.ui;
         // Fades in rather than replacing the shelf outright: the cover has to be seen
         // LEAVING its tile, which means the tile has to still be there when it does.
         if l.appear < 0.999 {
@@ -514,7 +549,7 @@ impl Shell {
         let tail = if downloading.is_some() { 66.0 } else { 38.0 };
         let rest = (11.0 + rows.iter().map(|(_, size, _)| size + 7.0).sum::<f64>() + tail) * k;
         let lay = launch_layout(w, h, k, rest, |dw| {
-            fonts.title_height(&l.title, W::SemiBold, 34.0 * k, fg(a), dw)
+            fonts.title_height(&l.title, W::SemiBold, 34.0 * k, ui.fg(a), dw)
         });
         let (cw, ch) = (lay.cw, lay.ch);
         let settled = Rect::from_xywh(lay.cover_x as f32, lay.cover_y as f32, cw as f32, ch as f32);
@@ -544,7 +579,7 @@ impl Shell {
         canvas.concat_44(&M44::row_major(&m));
         let card = Rect::from_wh(cw as f32, ch as f32);
         let corner = (14.0 * k) as f32;
-        let mut shadow = fill(crate::theme::shade(0.6));
+        let mut shadow = fill(ui.shade(0.6));
         shadow.set_mask_filter(skia_safe::MaskFilter::blur(
             skia_safe::BlurStyle::Normal,
             (18.0 * k) as f32,
@@ -573,17 +608,17 @@ impl Shell {
                     Some((&src, skia_safe::canvas::SrcRectConstraint::Fast)),
                     card,
                     crate::theme::art_sampling(),
-                    &fill(fg(1.0)),
+                    &fill(ui.fg(1.0)),
                 );
                 canvas.restore();
             }
             None => crate::screens::library::art::draw_poster_placeholder(
-                canvas, fonts, None, card, k, 1.0,
+                canvas, ui, fonts, None, card, k, 1.0,
             ),
         }
         canvas.draw_rrect(
             RRect::new_rect_xy(card, corner, corner),
-            &crate::theme::stroke(fg(0.14), k.max(1.0) as f32),
+            &crate::theme::stroke(ui.fg(0.14), k.max(1.0) as f32),
         );
         canvas.restore();
 
@@ -595,14 +630,23 @@ impl Shell {
             &l.title,
             W::SemiBold,
             34.0 * k,
-            fg(a),
+            ui.fg(a),
             dx,
             lay.col_y,
             dw,
         );
         let mut y = lay.col_y + lay.title_h + 11.0 * k;
         for (text, size, alpha) in rows {
-            fonts.leading(canvas, text, W::Regular, size * k, fg(alpha * a), dx, y, dw);
+            fonts.leading(
+                canvas,
+                text,
+                W::Regular,
+                size * k,
+                ui.fg(alpha * a),
+                dx,
+                y,
+                dw,
+            );
             y += (size + 7.0) * k;
         }
         match (l.failed.as_deref(), downloading) {
@@ -614,7 +658,7 @@ impl Shell {
                     why,
                     W::Regular,
                     12.5 * k,
-                    fg(0.85 * a),
+                    ui.fg(0.85 * a),
                     dx,
                     y + 26.0 * k,
                     dw,
@@ -630,7 +674,7 @@ impl Shell {
                     (4.0 * k) as f32,
                 );
                 let r = (2.0 * k) as f32;
-                canvas.draw_rrect(RRect::new_rect_xy(bar, r, r), &fill(fg(0.14 * a)));
+                canvas.draw_rrect(RRect::new_rect_xy(bar, r, r), &fill(ui.fg(0.14 * a)));
                 let (from, width) = match d.fraction() {
                     Some(f) => (0.0, f as f32),
                     // No total: a segment travels the track.
@@ -642,7 +686,7 @@ impl Shell {
                     bar.width() * width,
                     bar.height(),
                 );
-                canvas.draw_rrect(RRect::new_rect_xy(done, r, r), &fill(fg(0.85 * a)));
+                canvas.draw_rrect(RRect::new_rect_xy(done, r, r), &fill(ui.fg(0.85 * a)));
                 let line = if d.state == "downloading" {
                     format!("Downloading \u{b7} {}", d.line())
                 } else {
@@ -653,7 +697,7 @@ impl Shell {
                     &line,
                     W::Regular,
                     12.5 * k,
-                    fg(0.7 * a),
+                    ui.fg(0.7 * a),
                     dx,
                     y + 36.0 * k,
                     dw,
@@ -663,14 +707,14 @@ impl Shell {
                     "Leaving won't stop the download.",
                     W::Regular,
                     11.5 * k,
-                    fg(0.4 * a),
+                    ui.fg(0.4 * a),
                     dx,
                     y + 54.0 * k,
                     dw,
                 );
             }
             (None, None) => {
-                crate::theme::spinner(canvas, dx + 8.0 * k, y + 30.0 * k, 8.0 * k, t);
+                crate::theme::spinner(canvas, ui, dx + 8.0 * k, y + 30.0 * k, 8.0 * k, t);
                 fonts.leading(
                     canvas,
                     if l.window_wait {
@@ -682,7 +726,7 @@ impl Shell {
                     },
                     W::Regular,
                     12.5 * k,
-                    fg(0.5 * a),
+                    ui.fg(0.5 * a),
                     dx + 24.0 * k,
                     y + 22.0 * k,
                     dw,
@@ -922,6 +966,7 @@ fn chart_points(trace: &[(f32, u32)], r: Rect, x_max: f32, y_max: f32) -> Vec<Po
 #[allow(clippy::too_many_arguments)]
 fn speed_chart(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     r: Rect,
     trace: &[(f32, u32)],
@@ -932,7 +977,7 @@ fn speed_chart(
 ) {
     let kf = k as f32;
     let (x_max, y_max) = (view.x_max as f32, view.y_max as f32);
-    let grid = crate::theme::stroke(fg(0.16), kf);
+    let grid = crate::theme::stroke(ui.fg(0.16), kf);
     for i in 0..=2u32 {
         let value = view.y_round / 2 * i;
         let y = r.bottom - r.height() * value as f32 / y_max;
@@ -950,7 +995,7 @@ fn speed_chart(
                 base,
                 W::Medium,
                 11.0 * k,
-                fg(0.45),
+                ui.fg(0.45),
             );
         }
     }
@@ -962,16 +1007,17 @@ fn speed_chart(
         axis,
         W::Medium,
         11.0 * k,
-        fg(0.45),
+        ui.fg(0.45),
     );
     let end = format!("{:.0} s", view.x_max.round());
     let end_w = f64::from(fonts.measure(&end, W::Medium, 11.0 * k));
     let end_x = f64::from(r.right) - end_w;
-    fonts.draw(canvas, &end, end_x, axis, W::Medium, 11.0 * k, fg(0.45));
+    fonts.draw(canvas, &end, end_x, axis, W::Medium, 11.0 * k, ui.fg(0.45));
     if trace.is_empty() {
         if rec.is_none() {
             crate::theme::spinner(
                 canvas,
+                ui,
                 f64::from(r.center_x()),
                 f64::from(r.center_y()),
                 18.0 * k,
@@ -996,11 +1042,11 @@ fn speed_chart(
     area.line_to((last.x, r.bottom));
     area.line_to((pts[0].x, r.bottom));
     area.close();
-    let mut fade = fill(fg(1.0));
+    let mut fade = fill(ui.fg(1.0));
     fade.set_shader(gradient::shaders::linear_gradient(
         (Point::new(0.0, r.top), Point::new(0.0, r.bottom)),
         &gradient::Gradient::new(
-            gradient::Colors::new_evenly_spaced(&[fg(0.30), fg(0.0)], TileMode::Clamp, None),
+            gradient::Colors::new_evenly_spaced(&[ui.fg(0.30), ui.fg(0.0)], TileMode::Clamp, None),
             gradient::Interpolation::default(),
         ),
         None,
@@ -1008,7 +1054,7 @@ fn speed_chart(
     canvas.draw_path(&area.detach(), &fade);
     let mut line = PathBuilder::new();
     curve(&mut line);
-    let mut ink = crate::theme::stroke(fg(0.95), 2.5 * kf);
+    let mut ink = crate::theme::stroke(ui.fg(0.95), 2.5 * kf);
     ink.set_stroke_cap(skia_safe::paint::Cap::Round);
     ink.set_stroke_join(skia_safe::paint::Join::Round);
     canvas.draw_path(&line.detach(), &ink);
@@ -1027,9 +1073,9 @@ fn speed_chart(
         None => {
             // The newest sample breathes while more are coming.
             let pulse = (t * 1.4).fract() as f32;
-            let halo = fg(0.5 * (1.0 - pulse));
+            let halo = ui.fg(0.5 * (1.0 - pulse));
             canvas.draw_circle(last, (4.0 + 10.0 * pulse) * kf, &fill(halo));
-            canvas.draw_circle(last, 4.0 * kf, &fill(fg(1.0)));
+            canvas.draw_circle(last, 4.0 * kf, &fill(ui.fg(1.0)));
         }
     }
 }

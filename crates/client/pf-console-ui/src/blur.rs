@@ -86,9 +86,6 @@ thread_local! {
     static BLUR: OnceCell<Option<RuntimeEffect>> = const { OnceCell::new() };
     static PIXEL: OnceCell<Option<RuntimeEffect>> = const { OnceCell::new() };
     static OVERRIDE: std::cell::Cell<Option<Style>> = const { std::cell::Cell::new(None) };
-    /// The shell is painting a screen into a transition layer. A copy of the surface
-    /// cannot see that layer, so a band drawn inside it would blur the field behind.
-    static IN_LAYER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn blur_effect() -> Option<RuntimeEffect> {
@@ -157,15 +154,10 @@ pub fn active() -> bool {
     style() != Style::Off
 }
 
-/// Set while the shell paints a screen into a layer; bands inside it are skipped.
-pub fn set_in_layer(on: bool) {
-    IN_LAYER.with(|c| c.set(on));
-}
-
 /// Soften what `canvas` already holds under `rect` by `band`. Inside a transition layer
 /// the surface holds none of the screen, so the band is left off for those frames.
-pub fn backdrop(canvas: &Canvas, rect: Rect, band: Band) {
-    if IN_LAYER.with(std::cell::Cell::get) {
+pub fn backdrop(canvas: &Canvas, ui: &crate::theme::Frame, rect: Rect, band: Band) {
+    if ui.in_layer.get() {
         return;
     }
     match style() {
@@ -344,6 +336,7 @@ fn pixel(canvas: &Canvas, rect: Rect, band: Band, stepped: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::Frame;
     use skia_safe::Color;
 
     /// 8 px stripes under a top band: rows at the clear edge keep full contrast, rows at
@@ -363,7 +356,12 @@ mod tests {
             sigma: 8.0,
             over: 0.0,
         };
-        backdrop(canvas, Rect::from_xywh(0.0, 0.0, 64.0, 100.0), band);
+        backdrop(
+            canvas,
+            &Frame::default(),
+            Rect::from_xywh(0.0, 0.0, 64.0, 100.0),
+            band,
+        );
         let px = surface.image_snapshot();
         let info = px.image_info();
         let mut bytes = vec![0u8; info.compute_min_byte_size()];
@@ -413,7 +411,12 @@ mod tests {
                 sigma: 14.0,
                 over: 0.0,
             };
-            backdrop(canvas, Rect::from_xywh(0.0, 0.0, 64.0, 80.0), band);
+            backdrop(
+                canvas,
+                &Frame::default(),
+                Rect::from_xywh(0.0, 0.0, 64.0, 80.0),
+                band,
+            );
             set_style_override(None);
             let px = surface.image_snapshot();
             let info = px.image_info();

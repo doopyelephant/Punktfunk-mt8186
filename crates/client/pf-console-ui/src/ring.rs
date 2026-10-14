@@ -136,6 +136,8 @@ pub struct Ring {
     spring: Spring,
     /// Closed for input, still winding in.
     closing: bool,
+    /// Reduce Motion as of the last draw: a close between draws reads it.
+    reduced: bool,
     /// Per-slot highlight 0…1 (centre is 6), eased so the glow travels instead of snapping.
     hot: [f32; 7],
     sheet_rise: f64,
@@ -175,6 +177,7 @@ impl Ring {
             frame: 0,
             spring: Spring::rest(0.0),
             closing: false,
+            reduced: false,
             hot: [0.0; 7],
             sheet_rise: 0.0,
             geom: vec![Rect::new_empty(); 7],
@@ -296,7 +299,7 @@ impl Ring {
         self.progress = 0.0;
         // Not a snap: `render` winds `shown` down and clears `closing` on land.
         // Reduce motion closes at once.
-        self.closing = self.shown > 0.0 && !crate::theme::reduce_motion();
+        self.closing = self.shown > 0.0 && !self.reduced;
         if !self.closing {
             self.shown = 0.0;
         }
@@ -1086,6 +1089,7 @@ impl Ring {
     pub fn render(
         &mut self,
         canvas: &Canvas,
+        ui: &crate::theme::Frame,
         width: u32,
         height: u32,
         scale: f32,
@@ -1097,7 +1101,8 @@ impl Ring {
         }
         // Twist drives opening; after commit the spring overshoots then seats. Reduce
         // motion: fade in place, no spring/spiral. Closing winds `shown` down.
-        let reduce = crate::theme::reduce_motion();
+        let reduce = ui.reduce_motion;
+        self.reduced = reduce;
         if self.closing {
             self.shown = approach(f64::from(self.shown), 0.0, dt, 0.045) as f32;
             self.spring = Spring::rest(f64::from(self.shown));
@@ -1331,15 +1336,17 @@ impl Ring {
             );
         }
         if self.sheet {
-            self.render_sheet(canvas, width, height, scale, fonts, dt);
+            self.render_sheet(canvas, ui, width, height, scale, fonts, dt);
         } else {
             self.sheet_rect = Rect::new_empty();
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_sheet(
         &mut self,
         canvas: &Canvas,
+        ui: &crate::theme::Frame,
         width: u32,
         height: u32,
         scale: f32,
@@ -1377,7 +1384,8 @@ impl Ring {
         );
         canvas.save();
         canvas.clip_rect(inner, None, None);
-        self.list.render(canvas, inner, &specs, fonts, k, dt, true);
+        self.list
+            .render(canvas, ui, inner, &specs, fonts, k, dt, true);
         canvas.restore();
         self.sheet_rect = rect;
     }
@@ -2153,7 +2161,8 @@ mod tests {
         r.input(RingInput::Toggle { x: 640.0, y: 300.0 });
         r.menu(MenuEvent::Confirm); // the lit centre opens the sheet
         for _ in 0..120 {
-            r.render(surface.canvas(), 1280, 800, 1.0, &fonts, 1.0 / 60.0);
+            let ui = crate::theme::Frame::default();
+            r.render(surface.canvas(), &ui, 1280, 800, 1.0, &fonts, 1.0 / 60.0);
         }
         let row = r.list.row_rect(0).expect("the sheet drew its rows");
         (r, row)

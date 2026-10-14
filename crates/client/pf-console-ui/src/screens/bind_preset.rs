@@ -9,7 +9,7 @@ use crate::glyphs::{Hint, HintKey};
 use crate::model::ConsoleCmd;
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, ScreenView};
-use crate::theme::{fg, Fonts, W};
+use crate::theme::{Fonts, W};
 use crate::widgets::{ListMsg, MenuList, RowSpec, FOOT_DETAIL_H};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Rect};
@@ -168,6 +168,7 @@ impl ScreenView for BindPresetScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let cx = f64::from(rect.left) + f64::from(rect.width()) / 2.0;
         if self.presets.is_empty() {
             fonts.centered(
@@ -175,7 +176,7 @@ impl ScreenView for BindPresetScreen {
                 "No presets yet \u{2014} create them in the desktop app, then choose one here.",
                 W::Regular,
                 14.0 * k,
-                fg(0.55),
+                ui.fg(0.55),
                 cx,
                 f64::from(rect.top) + f64::from(rect.height()) / 2.0,
                 f64::from(rect.width()) * 0.7,
@@ -227,7 +228,7 @@ impl ScreenView for BindPresetScreen {
             })
             .collect();
         self.list
-            .render(canvas, list_rect, &rows, fonts, k, dt, true);
+            .render(canvas, ui, list_rect, &rows, fonts, k, dt, true);
     }
 
     /// The explainer under the list, once there is a list.

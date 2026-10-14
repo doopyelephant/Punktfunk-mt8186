@@ -20,7 +20,7 @@ use crate::model::{OtherDevice, PadTestState};
 use crate::platform::Platform;
 use crate::pointer::{Pointer, PointerKind};
 use crate::screens::{Ctx, Outbox, Screen, ScreenView};
-use crate::theme::{accent, edge, fg, Fonts, PanelStroke, W};
+use crate::theme::{Fonts, Frame, PanelStroke, W};
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse, PadInfo};
 use skia_safe::{Canvas, Rect};
 
@@ -222,6 +222,7 @@ impl ScreenView for PlayersScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let all = targets(ctx, &self.others);
         // The first target takes focus once; a card that goes reseats it in the tree.
         if self.tree.focus().is_none() {
@@ -244,7 +245,7 @@ impl ScreenView for PlayersScreen {
         let reach = 64.0 * k;
         // On the margin; past the screen's width the row glides to centre the focused card.
         // A swipe parks it until focus moves.
-        let x0 = air + edge(k);
+        let x0 = air + ui.edge(k);
         let strip = strip();
         let focus_x = cards
             .iter()
@@ -252,8 +253,11 @@ impl ScreenView for PlayersScreen {
             .map(|i| x0 + i as f64 * (cw + gap) + cw / 2.0);
         let max = (x0 * 2.0 + row_w - w).max(0.0);
         let want = focus_x.map_or(0.0, |x| (x - w / 2.0).clamp(0.0, max));
-        self.tree
-            .follow(strip, want as f32, std::mem::take(&mut self.snap));
+        self.tree.follow(
+            strip,
+            want as f32,
+            std::mem::take(&mut self.snap) || ui.reduce_motion,
+        );
         self.tree.tick(dt as f32);
         let top = 24.0 * k;
         let row = El::scroll(strip, Axis::Horizontal)
@@ -270,7 +274,7 @@ impl ScreenView for PlayersScreen {
                 let t = *t;
                 let others = &self.others;
                 El::paint(move |canvas, r| {
-                    card(canvas, fonts, t, pads, others, drawings, platform, r, k)
+                    card(canvas, ui, fonts, t, pads, others, drawings, platform, r, k)
                 })
                 .id(target_id(t, pads))
                 .focusable((CARD_CORNER * k) as f32)
@@ -289,7 +293,8 @@ impl ScreenView for PlayersScreen {
             ctx.device.platform,
             ctx.device.fallback_ui,
         );
-        self.tree.paint_focus(canvas, frame, k as f32, dt, cheap);
+        self.tree
+            .paint_focus(canvas, ui, frame, k as f32, dt, cheap);
     }
 
     /// Why the no-pads and grants cards exist; a pad's card says all it has.
@@ -331,6 +336,7 @@ fn activate(t: Target, ctx: &Ctx, fx: &mut Outbox) -> Option<MenuPulse> {
 #[allow(clippy::too_many_arguments)]
 fn card(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     t: Target,
     pads: &[PadInfo],
@@ -342,6 +348,7 @@ fn card(
 ) {
     crate::theme::panel(
         canvas,
+        ui,
         r,
         CARD_CORNER as f32,
         None,
@@ -368,10 +375,19 @@ fn card(
             base - 22.0 * k,
             W::Bold,
             size,
-            fg(1.0),
+            ui.fg(1.0),
             max_w,
         );
-        fonts.draw_clipped(canvas, line, l, base, W::Regular, 13.0 * k, fg(0.55), max_w);
+        fonts.draw_clipped(
+            canvas,
+            line,
+            l,
+            base,
+            W::Regular,
+            13.0 * k,
+            ui.fg(0.55),
+            max_w,
+        );
     };
     match t {
         Target::Others => {
@@ -382,14 +398,14 @@ fn card(
                 _ => "pointer",
             };
             let (title, line) = others_lines(others);
-            return plain(icon, &title, &line, fg(0.5));
+            return plain(icon, &title, &line, ui.fg(0.5));
         }
         Target::Grants => {
             return plain(
                 "circle-help",
                 "Not showing?",
                 "Some controllers need access first",
-                accent(1.0),
+                ui.accent(1.0),
             );
         }
         _ => {}
@@ -397,7 +413,7 @@ fn card(
     let Target::Pad(i) = t else {
         // No pad: the key device that drives instead.
         let mark = device_icon(None, platform);
-        crate::glyphs::pad_mark(canvas, mark, l, mark_cy, MARK * k, k, fg(0.5));
+        crate::glyphs::pad_mark(canvas, mark, l, mark_cy, MARK * k, k, ui.fg(0.5));
         fonts.draw_clipped(
             canvas,
             "No controller",
@@ -405,7 +421,7 @@ fn card(
             base - 22.0 * k,
             W::Bold,
             21.0 * k,
-            fg(0.8),
+            ui.fg(0.8),
             max_w,
         );
         fonts.draw_clipped(
@@ -415,7 +431,7 @@ fn card(
             base,
             W::Regular,
             13.0 * k,
-            fg(0.55),
+            ui.fg(0.55),
             max_w,
         );
         return;
@@ -429,11 +445,22 @@ fn card(
         let (w, h) = (f64::from(art.w) * scale, f64::from(art.h) * scale);
         let x = f64::from(r.center_x()) - w / 2.0;
         let y = t0 + (room_h - h) / 2.0;
-        draw_pad(canvas, fonts, d, &PadTestState::default(), x, y, scale, k);
+        draw_pad(
+            canvas,
+            ui,
+            fonts,
+            d,
+            &PadTestState::default(),
+            x,
+            y,
+            scale,
+            k,
+        );
     }
     if let Some(b) = p.battery {
         crate::glyphs::battery_pip(
             canvas,
+            ui,
             f64::from(r.right) - pad - 22.0 * k,
             t0 + 16.0 * k,
             22.0 * k,
@@ -454,7 +481,7 @@ fn card(
         base - 22.0 * k,
         W::Bold,
         17.0 * k,
-        fg(1.0),
+        ui.fg(1.0),
         max_w,
     );
     fonts.draw_clipped(
@@ -464,7 +491,7 @@ fn card(
         base,
         W::Regular,
         13.0 * k,
-        fg(0.7),
+        ui.fg(0.7),
         max_w,
     );
 }

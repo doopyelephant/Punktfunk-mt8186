@@ -159,6 +159,7 @@ impl ScreenView for PresetMenu {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         if (ctx.t - self.read_at).abs() >= 0.5 {
             self.read_at = ctx.t;
             if let Some((_, name)) = ctx
@@ -186,7 +187,8 @@ impl ScreenView for PresetMenu {
                 row
             })
             .collect();
-        self.list.render(canvas, rect, &rows, fonts, k, dt, true);
+        self.list
+            .render(canvas, ui, rect, &rows, fonts, k, dt, true);
     }
 
     fn press(&mut self) {
@@ -399,11 +401,12 @@ impl ScreenView for PresetName {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let text = self.error.as_deref().unwrap_or(
             "Name it for what it is for: Couch, Low latency, Travel. The name shows on the \
              cards it is pinned to.",
         );
-        let below = blurb(canvas, fonts, text, rect, k);
+        let below = blurb(canvas, ui, fonts, text, rect, k);
         self.keyboard.seat(self.editing, ctx.device, dt);
         let tray_h = self.keyboard.reserve(k);
         let list_rect = Rect::from_ltrb(
@@ -418,8 +421,8 @@ impl ScreenView for PresetName {
         let rows = [field, RowSpec::action(action, !self.name.trim().is_empty())];
         self.list.lift = self.keyboard.lift(rect, k);
         self.list
-            .render(canvas, list_rect, &rows, fonts, k, dt, !self.editing);
-        self.keyboard.render(canvas, fonts, rect, k);
+            .render(canvas, ui, list_rect, &rows, fonts, k, dt, !self.editing);
+        self.keyboard.render(canvas, ui, fonts, rect, k);
     }
 
     fn press(&mut self) {
@@ -573,8 +576,10 @@ impl ScreenView for PresetEdit {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let below = blurb(
             canvas,
+            ui,
             fonts,
             "A dot marks what this preset changes; everything else follows Settings. X puts a \
              row back on the global value.",
@@ -598,7 +603,7 @@ impl ScreenView for PresetEdit {
         self.list.cursor = self.list.cursor.min(rows.len().saturating_sub(1));
         let list_rect = Rect::from_ltrb(rect.left, below.top, rect.right, rect.bottom);
         self.list
-            .render(canvas, list_rect, &rows, fonts, k, dt, true);
+            .render(canvas, ui, list_rect, &rows, fonts, k, dt, true);
     }
 
     fn press(&mut self) {

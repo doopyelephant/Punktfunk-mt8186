@@ -10,7 +10,7 @@ use crate::glyphs::{Hint, HintKey};
 use crate::model::{ConsoleCmd, HostRow, PairPhase, RequestKey};
 use crate::pointer::Pointer;
 use crate::screens::{Ctx, Outbox, ScreenView, TextEntry};
-use crate::theme::{fg, Fonts, ERROR, W};
+use crate::theme::{Fonts, ERROR, W};
 use crate::widgets::{
     blurb, field_key, permits, type_text, Charset, Entry, ListMsg, MenuList, RowSpec,
 };
@@ -344,13 +344,14 @@ impl ScreenView for PairScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let cx = f64::from(rect.left) + f64::from(rect.width()) / 2.0;
         let intro = if self.can_request() {
             "Request access and approve this device on the host, or enter the PIN it shows."
         } else {
             "Enter the PIN from the host's web console (Pairing page) or its log."
         };
-        let below = blurb(canvas, fonts, intro, rect, k);
+        let below = blurb(canvas, ui, fonts, intro, rect, k);
 
         self.keyboard.seat(self.editing.is_some(), ctx.device, dt);
         let tray_h = self.keyboard.reserve(k);
@@ -366,6 +367,7 @@ impl ScreenView for PairScreen {
         self.list.lift = self.keyboard.lift(rect, k);
         self.list.render(
             canvas,
+            ui,
             list_rect,
             &rows,
             fonts,
@@ -376,7 +378,14 @@ impl ScreenView for PairScreen {
 
         let status_y = f64::from(rect.bottom) - tray_h - status_h + 6.0 * k;
         if self.busy {
-            crate::theme::spinner(canvas, cx - 70.0 * k, status_y + 8.0 * k, 7.0 * k, ctx.t);
+            crate::theme::spinner(
+                canvas,
+                ui,
+                cx - 70.0 * k,
+                status_y + 8.0 * k,
+                7.0 * k,
+                ctx.t,
+            );
             let waiting = match self.requesting {
                 true => "Approve this device in the host's console",
                 false => "Pairing… confirm the PIN on the host",
@@ -386,7 +395,7 @@ impl ScreenView for PairScreen {
                 waiting,
                 W::Regular,
                 13.0 * k,
-                fg(0.55),
+                ui.fg(0.55),
                 cx + 10.0 * k,
                 status_y,
                 f64::from(rect.width()) * 0.6,
@@ -404,7 +413,7 @@ impl ScreenView for PairScreen {
             );
         }
 
-        self.keyboard.render(canvas, fonts, rect, k);
+        self.keyboard.render(canvas, ui, fonts, rect, k);
     }
 
     fn title(&self) -> String {

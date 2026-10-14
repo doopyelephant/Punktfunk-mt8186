@@ -84,8 +84,9 @@ impl ScreenView for GrantsScreen {
         k: f64,
         dt: f64,
         fonts: &Fonts,
-        _ctx: &mut Ctx,
+        ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         let rows: Vec<RowSpec> = PASSTHROUGH
             .iter()
             .map(|(_, label, verb)| RowSpec {
@@ -94,7 +95,8 @@ impl ScreenView for GrantsScreen {
                 ..RowSpec::default()
             })
             .collect();
-        self.list.render(canvas, rect, &rows, fonts, k, dt, true);
+        self.list
+            .render(canvas, ui, rect, &rows, fonts, k, dt, true);
     }
 
     /// Why the focused row exists.

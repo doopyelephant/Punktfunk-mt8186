@@ -26,7 +26,7 @@ use crate::screens::card_menu::CardMenu;
 use crate::screens::library::LibraryScreen;
 use crate::screens::profiles::{ProfileBook, ProfilesScreen};
 use crate::screens::{ConnectIntent, Ctx, Outbox, Screen, ScreenView};
-use crate::theme::{accent, edge, fg, fill, stroke, Fonts, PanelStroke, W};
+use crate::theme::{fill, stroke, Fonts, Frame, PanelStroke, W};
 use crate::widgets::{button, button_w, BUTTON_H};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Color4f, MaskFilter, PathBuilder, RRect, Rect};
@@ -614,8 +614,8 @@ impl ScreenView for HomeScreen {
         let say = |(title, sub): (&str, &str)| format!("{title}, {sub}");
         Some(match self.slot(hosts) {
             Slot::Host(h) => match h.remembered() {
-                Some(p) => format!("{}, {}, as {}", h.name, status(h).0, p.display_name),
-                None => format!("{}, {}", h.name, status(h).0),
+                Some(p) => format!("{}, {}, as {}", h.name, status(ctx.ui, h).0, p.display_name),
+                None => format!("{}, {}", h.name, status(ctx.ui, h).0),
             },
             Slot::AddHost => say(action_text(ActionTile::AddHost)),
             Slot::Rescan => say(action_text(ActionTile::Rescan)),
@@ -660,6 +660,7 @@ impl ScreenView for HomeScreen {
         fonts: &Fonts,
         ctx: &mut Ctx,
     ) {
+        let ui = ctx.ui;
         self.reconcile(ctx.hosts);
         let reduced = super::settings::rows::reduce_ui_res(
             ctx.settings,
@@ -673,7 +674,7 @@ impl ScreenView for HomeScreen {
         self.bump.settle(0.0, 0.3, 4.0);
         // Reduced motion drops bump travel, not the chase. Freezing the cursor
         // spring would jump the row; the refusal is already a Boundary haptic.
-        if crate::theme::reduce_motion() {
+        if ui.reduce_motion {
             self.bump = Spring::rest(0.0);
         }
         // Origin is the cursor, not 0: a restored selection must assemble in place.
@@ -683,6 +684,7 @@ impl ScreenView for HomeScreen {
                 entrances::CARDS,
                 self.cursor.max(0) as usize,
                 ctx.t,
+                ctx.ui.reduce_motion,
             ));
         }
         if self.entrance.is_some_and(|e| e.done(ctx.t)) {
@@ -693,7 +695,7 @@ impl ScreenView for HomeScreen {
         }
 
         let w = f64::from(rect.width());
-        let margin = edge(k);
+        let margin = ui.edge(k);
         let tile_w = (TILE_W * k).min((w - 2.0 * margin) * 0.8);
         let tile_h = TILE_H * k;
         let pitch = tile_w + TILE_GAP * k;
@@ -712,7 +714,7 @@ impl ScreenView for HomeScreen {
         };
         let block = ROW_AIR * k + tile_h + verbs_h;
         let page_to = if self.below { block } else { 0.0 };
-        if crate::theme::reduce_motion() {
+        if ui.reduce_motion {
             self.page = Spring::rest(page_to);
         } else {
             self.page
@@ -797,9 +799,9 @@ impl ScreenView for HomeScreen {
                         let (x, y) = (f64::from(tile.left), f64::from(tile.top) - 10.0 * k);
                         let size = GROUP_CAPTION * k;
                         let upper = text.to_uppercase();
-                        fonts.draw(canvas, &upper, x, y, W::SemiBold, size, fg(0.55));
+                        fonts.draw(canvas, &upper, x, y, W::SemiBold, size, ui.fg(0.55));
                     }
-                    look.paint(canvas, fonts, &slot)
+                    look.paint(canvas, ui, fonts, &slot)
                 })
             };
             row = row.child(
@@ -843,7 +845,7 @@ impl ScreenView for HomeScreen {
                     if layered {
                         crate::theme::save_layer_alpha(canvas, r.with_outset((8.0, 8.0)), fade);
                     }
-                    button(canvas, fonts, &label, r, k);
+                    button(canvas, ui, fonts, &label, r, k);
                     if layered {
                         canvas.restore();
                     }
@@ -863,7 +865,8 @@ impl ScreenView for HomeScreen {
         };
         self.tree.set_focus(focused);
         // The plate is the focus mark: it lifts the card, so the card draws no halo.
-        self.tree.paint_focus(canvas, frame, k as f32, dt, reduced);
+        self.tree
+            .paint_focus(canvas, ui, frame, k as f32, dt, reduced);
 
         self.shelf_rect = Rect::new_empty();
         let games_top = top + block + GAMES_AIR * k;
@@ -892,7 +895,7 @@ impl ScreenView for HomeScreen {
                     games_top + 30.0 * k,
                     W::Medium,
                     15.0 * k,
-                    fg(0.62),
+                    ui.fg(0.62),
                     w - 2.0 * margin,
                 );
             }
@@ -916,7 +919,7 @@ struct TileLook {
 }
 
 impl TileLook {
-    fn paint(&self, canvas: &Canvas, fonts: &Fonts, slot: &Slot<'_>) {
+    fn paint(&self, canvas: &Canvas, ui: &Frame, fonts: &Fonts, slot: &Slot<'_>) {
         let TileLook {
             tile,
             center: (cx, cy),
@@ -935,9 +938,9 @@ impl TileLook {
             crate::theme::save_layer_alpha(canvas, bounds, fade as f32);
         }
         match slot {
-            Slot::Host(h) => draw_host_tile(canvas, fonts, h, tile, k),
-            Slot::AddHost => draw_action_tile(canvas, fonts, tile, k, ActionTile::AddHost),
-            Slot::Rescan => draw_action_tile(canvas, fonts, tile, k, ActionTile::Rescan),
+            Slot::Host(h) => draw_host_tile(canvas, ui, fonts, h, tile, k),
+            Slot::AddHost => draw_action_tile(canvas, ui, fonts, tile, k, ActionTile::AddHost),
+            Slot::Rescan => draw_action_tile(canvas, ui, fonts, tile, k, ActionTile::Rescan),
         }
         if layered {
             canvas.restore();
@@ -948,18 +951,19 @@ impl TileLook {
 
 /// A card: the badge, then what the host is doing over its name, a lock while OK would
 /// pair first, and the face of the profile it remembers.
-fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f64) {
+fn draw_host_tile(canvas: &Canvas, ui: &Frame, fonts: &Fonts, h: &HostRow, rect: Rect, k: f64) {
     let stroke = if h.saved {
         PanelStroke::Plain(0.08)
     } else {
         PanelStroke::EdgeDashed
     };
-    crate::theme::panel(canvas, rect, TILE_CORNER as f32, None, stroke, k as f32);
+    crate::theme::panel(canvas, ui, rect, TILE_CORNER as f32, None, stroke, k as f32);
     let pad = 20.0 * k;
     let cy = f64::from(rect.center_y());
     let l = f64::from(rect.left) + pad;
     draw_badge(
         canvas,
+        ui,
         fonts,
         &h.name,
         &h.os,
@@ -971,23 +975,23 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
     let tx = l + (BADGE + 16.0) * k;
     let mut right = f64::from(rect.right) - pad;
     if !h.paired {
-        draw_lock(canvas, right - 11.0 * k, cy - 9.0 * k, k);
+        draw_lock(canvas, ui, right - 11.0 * k, cy - 9.0 * k, k);
         right -= 23.0 * k;
     }
     if let Some(pick) = h.remembered() {
         let r = 17.0 * k;
         let cx = (right - r) as f32;
-        super::profiles::draw_pick(canvas, fonts, Some(pick), cx, cy as f32, r);
+        super::profiles::draw_pick(canvas, ui, fonts, Some(pick), cx, cy as f32, r);
         right -= 2.0 * r + 10.0 * k;
     }
     let max_w = right - tx;
-    let (line, ink) = status(h);
+    let (line, ink) = status(ui, h);
     let sub_base = cy - 7.0 * k;
     let mut x = tx;
     if h.online || !h.running.is_empty() {
         let r = 3.5 * k;
         let dot = ((x + r) as f32, (sub_base - 4.6 * k) as f32);
-        canvas.draw_circle(dot, r as f32, &fill(crate::theme::live()));
+        canvas.draw_circle(dot, r as f32, &fill(ui.live()));
         x += 2.0 * r + 6.0 * k;
     }
     fonts.draw_clipped(
@@ -1007,7 +1011,7 @@ fn draw_host_tile(canvas: &Canvas, fonts: &Fonts, h: &HostRow, rect: Rect, k: f6
         cy + 18.0 * k,
         W::Bold,
         21.0 * k,
-        fg(1.0),
+        ui.fg(1.0),
         max_w,
     );
 }
@@ -1029,22 +1033,25 @@ fn no_games(slot: &Slot<'_>) -> Option<String> {
 
 /// A card's one status line and its ink: what the host is doing, whether OK will reach
 /// it, and the preset a pinned or bound card connects with.
-fn status(h: &HostRow) -> (String, Color4f) {
+fn status(ui: &Frame, h: &HostRow) -> (String, Color4f) {
     if let Some(p) = &h.pin {
-        return (p.name.clone(), accent_color(p.accent.as_deref()));
+        return (p.name.clone(), accent_color(ui, p.accent.as_deref()));
     }
     let (base, ink) = if !h.running.is_empty() {
-        return (format!("Playing {}", h.running), crate::theme::live());
+        return (format!("Playing {}", h.running), ui.live());
     } else if !h.saved {
-        ("Found on this network".to_string(), fg(0.7))
+        ("Found on this network".to_string(), ui.fg(0.7))
     } else if !h.paired {
-        ("Not paired yet".to_string(), fg(0.7))
+        ("Not paired yet".to_string(), ui.fg(0.7))
     } else if h.online {
-        ("Online".to_string(), crate::theme::live())
+        ("Online".to_string(), ui.live())
     } else if h.can_wake {
-        ("Offline \u{b7} wakes when you connect".to_string(), fg(0.7))
+        (
+            "Offline \u{b7} wakes when you connect".to_string(),
+            ui.fg(0.7),
+        )
     } else {
-        ("Offline".to_string(), fg(0.7))
+        ("Offline".to_string(), ui.fg(0.7))
     };
     match &h.bound_preset {
         Some(b) => (format!("{base} \u{b7} {}", b.name), ink),
@@ -1053,15 +1060,15 @@ fn status(h: &HostRow) -> (String, Color4f) {
 }
 
 /// `#RRGGBB` accent, or the card's ink. A malformed value falls back.
-fn accent_color(hex: Option<&str>) -> skia_safe::Color4f {
+fn accent_color(ui: &Frame, hex: Option<&str>) -> skia_safe::Color4f {
     let Some(hex) = hex
         .and_then(|a| a.strip_prefix('#'))
         .filter(|h| h.len() == 6)
     else {
-        return fg(0.85);
+        return ui.fg(0.85);
     };
     let Ok(v) = u32::from_str_radix(hex, 16) else {
-        return fg(0.85);
+        return ui.fg(0.85);
     };
     skia_safe::Color4f::new(
         ((v >> 16) & 0xff) as f32 / 255.0,
@@ -1085,9 +1092,17 @@ fn action_text(kind: ActionTile) -> (&'static str, &'static str) {
     }
 }
 
-fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: ActionTile) {
+fn draw_action_tile(
+    canvas: &Canvas,
+    ui: &Frame,
+    fonts: &Fonts,
+    rect: Rect,
+    k: f64,
+    kind: ActionTile,
+) {
     crate::theme::panel(
         canvas,
+        ui,
         rect,
         TILE_CORNER as f32,
         None,
@@ -1100,10 +1115,10 @@ fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: Ac
     let side = BADGE * k;
     let badge = Rect::from_xywh(l as f32, (cy - side / 2.0) as f32, side as f32, side as f32);
     let rr = RRect::new_rect_xy(badge, (14.0 * k) as f32, (14.0 * k) as f32);
-    canvas.draw_rrect(rr, &fill(fg(0.14)));
-    canvas.draw_rrect(rr, &stroke(fg(0.35), k.max(1.0) as f32));
+    canvas.draw_rrect(rr, &fill(ui.fg(0.14)));
+    canvas.draw_rrect(rr, &stroke(ui.fg(0.35), k.max(1.0) as f32));
     let (bcx, bcy) = (l + side / 2.0, cy);
-    let ink = fg(0.9);
+    let ink = ui.fg(0.9);
     let mut p = stroke(ink, (3.0 * k) as f32);
     p.set_stroke_cap(skia_safe::PaintCap::Round);
     let r = 9.0 * k;
@@ -1155,7 +1170,7 @@ fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: Ac
         cy - 7.0 * k,
         W::SemiBold,
         14.0 * k,
-        fg(0.6),
+        ui.fg(0.6),
         max_w,
     );
     fonts.draw_clipped(
@@ -1165,7 +1180,7 @@ fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: Ac
         cy + 18.0 * k,
         W::Bold,
         21.0 * k,
-        fg(1.0),
+        ui.fg(1.0),
         max_w,
     );
 }
@@ -1175,6 +1190,7 @@ fn draw_action_tile(canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64, kind: Ac
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_badge(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     name: &str,
     os: &str,
@@ -1195,11 +1211,11 @@ pub(crate) fn draw_badge(
         ));
         canvas.draw_rrect(rr, &glow);
         canvas.draw_rrect(rr, &fill(Color4f::new(1.0, 1.0, 1.0, 1.0)));
-        accent(1.0)
+        ui.accent(1.0)
     } else {
-        canvas.draw_rrect(rr, &fill(fg(0.14)));
-        canvas.draw_rrect(rr, &stroke(fg(0.35), k.max(1.0) as f32));
-        fg(0.9)
+        canvas.draw_rrect(rr, &fill(ui.fg(0.14)));
+        canvas.draw_rrect(rr, &stroke(ui.fg(0.35), k.max(1.0) as f32));
+        ui.fg(0.9)
     };
     // ~54% of the badge so the mark sits on it, not cropped to it. `os_mark`
     // letterboxes a non-square master.
@@ -1234,8 +1250,8 @@ pub(crate) fn draw_badge(
     );
 }
 
-fn draw_lock(canvas: &Canvas, x: f64, y: f64, k: f64) {
-    let ink = fg(0.5);
+fn draw_lock(canvas: &Canvas, ui: &Frame, x: f64, y: f64, k: f64) {
+    let ink = ui.fg(0.5);
     let body_w = 11.0 * k;
     let body_h = 8.0 * k;
     let body_top = y + 5.0 * k;

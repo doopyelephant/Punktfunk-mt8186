@@ -83,7 +83,7 @@ fn a_connect_asks_for_the_list_before_it_dials() {
     assert!(!s.at_root());
     // Back drops it; nothing was dialed, so nothing is cancelled.
     s.handle_menu(MenuEvent::Back);
-    assert!(s.asking.is_none() && s.take_action().is_none());
+    assert!(s.connect.asking().is_none() && s.take_action().is_none());
 }
 
 fn draw(s: &mut Shell) {
@@ -260,7 +260,7 @@ fn a_silent_or_failed_host_dials_with_the_cards_pick() {
     s.start_connect(ConnectIntent::to_host(&row, None));
     s.fake_clock = Some((10.0 + ASKING_CARD_AFTER, 0.0));
     s.sync();
-    assert!(s.connecting.is_some(), "a slow list puts the card up");
+    assert!(s.connect.card().is_some(), "a slow list puts the card up");
     s.fake_clock = Some((10.0 + PROFILES_WAIT, 0.0));
     s.sync();
     assert_eq!(launched_as(&mut s), Some(Some("kid".into())));
@@ -341,7 +341,7 @@ fn a_stopped_seat_is_woken_and_waited_for_before_the_dial() {
     console.set_profiles("aa11", seated(SeatState::Starting, Some("Signing in")));
     s.sync();
     assert!(s.take_action().is_none());
-    let wait = s.seat_wait.as_ref().expect("still waiting");
+    let wait = s.connect.seat_wait().expect("still waiting");
     assert_eq!(wait.detail.as_deref(), Some("Signing in"));
 
     s.fake_clock = Some((10.0 + 2.0 * SEAT_POLL, 0.0));
@@ -350,7 +350,7 @@ fn a_stopped_seat_is_woken_and_waited_for_before_the_dial() {
     console.set_profiles("aa11", seated(SeatState::Ready, None));
     s.sync();
     assert_eq!(launched_as(&mut s), Some(Some("kid".into())));
-    assert!(s.seat_wait.is_none());
+    assert!(s.connect.seat_wait().is_none());
 }
 
 /// A starting seat is not woken again; an occupied one is dialed as it is.
@@ -364,7 +364,7 @@ fn a_starting_seat_waits_and_an_occupied_one_dials() {
     assert!(s.take_action().is_none());
     assert!(!bus.drain().contains(&woke(&row)));
     assert_eq!(
-        s.seat_wait.as_ref().and_then(|w| w.detail.as_deref()),
+        s.connect.seat_wait().and_then(|w| w.detail.as_deref()),
         Some("Setting up")
     );
     s.fake_clock = Some((10.0 + SEAT_POLL, 0.0));
@@ -381,7 +381,7 @@ fn cancel_leaves_the_wait_without_a_dial() {
         s.start_connect(ConnectIntent::to_host(&row, None));
         console.set_profiles("aa11", seated(SeatState::Stopped, None));
         s.sync();
-        assert!(s.seat_wait.is_some());
+        assert!(s.connect.seat_wait().is_some());
         if by_click {
             let fonts = crate::theme::build_fonts().unwrap();
             let mut surface = skia_safe::surfaces::raster_n32_premul((1280, 800)).unwrap();
@@ -399,7 +399,7 @@ fn cancel_leaves_the_wait_without_a_dial() {
         } else {
             s.handle_menu(MenuEvent::Back);
         }
-        assert!(s.seat_wait.is_none(), "by_click = {by_click}");
+        assert!(s.connect.seat_wait().is_none(), "by_click = {by_click}");
         bus.drain();
         s.fake_clock = Some((10.0 + 2.0 * SEAT_POLL, 0.0));
         console.set_profiles("aa11", seated(SeatState::Ready, None));
@@ -418,7 +418,7 @@ fn an_unavailable_seat_shows_its_line_and_stops() {
         seated(SeatState::Unavailable, Some("Seats are off.")),
     );
     s.sync();
-    assert!(s.take_action().is_none() && s.seat_wait.is_none());
+    assert!(s.take_action().is_none() && s.connect.seat_wait().is_none());
     assert_eq!(
         s.toast.as_ref().map(|t| t.text.as_str()),
         Some("Seats are off.")
@@ -434,7 +434,7 @@ fn an_unavailable_seat_shows_its_line_and_stops() {
         seated(SeatState::Unavailable, Some("Sign-in failed.")),
     );
     s.sync();
-    assert!(s.take_action().is_none() && s.seat_wait.is_none());
+    assert!(s.take_action().is_none() && s.connect.seat_wait().is_none());
     assert_eq!(
         s.toast.as_ref().map(|t| t.text.as_str()),
         Some("Sign-in failed.")
@@ -458,7 +458,7 @@ fn a_picked_stopped_seat_is_woken() {
     s.handle_menu(MenuEvent::Confirm);
     assert!(s.take_action().is_none(), "the seat is not up yet");
     assert!(bus.drain().contains(&woke(&row)));
-    assert!(s.seat_wait.is_some());
+    assert!(s.connect.seat_wait().is_some());
 }
 
 /// Switch profile's list arrives through the shell, keyed on the host, and the book keeps it.

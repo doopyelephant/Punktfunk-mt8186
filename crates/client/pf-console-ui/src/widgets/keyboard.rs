@@ -3,7 +3,7 @@
 use crate::anim::{Spring, TRAY_C, TRAY_K};
 use crate::el::{El, Id, Tree};
 use crate::pointer::Pointer;
-use crate::theme::{fg, fill, stroke, Fonts, PanelStroke, W};
+use crate::theme::{fill, stroke, Fonts, Frame, PanelStroke, W};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use skia_safe::{Canvas, Paint, PathBuilder, RRect, Rect};
 
@@ -321,6 +321,7 @@ impl Keyboard {
     pub fn render(
         &mut self,
         canvas: &Canvas,
+        ui: &Frame,
         fonts: &Fonts,
         w: f64,
         bottom: f64,
@@ -357,10 +358,12 @@ impl Keyboard {
                 self.keys
                     .push((kr.with_offset((seated.left, seated.top + slide)), key));
                 root = root.child(
-                    El::paint(move |canvas, r| draw_key(canvas, fonts, key, shift, r, corner, k))
-                        .id(key_id(r, c))
-                        .focusable(corner)
-                        .place(kr),
+                    El::paint(move |canvas, r| {
+                        draw_key(canvas, ui, fonts, key, shift, r, corner, k)
+                    })
+                    .id(key_id(r, c))
+                    .focusable(corner)
+                    .place(kr),
                 );
             }
         }
@@ -368,6 +371,7 @@ impl Keyboard {
         canvas.translate((0.0, slide));
         crate::theme::panel(
             canvas,
+            ui,
             seated,
             22.0,
             Some(skia_safe::Color4f::new(0.05, 0.045, 0.09, 0.55)),
@@ -379,7 +383,7 @@ impl Keyboard {
         self.tree
             .set_focus(self.shown.then(|| key_id(self.row, self.col)));
         self.tree
-            .paint_focus(canvas, frame, k as f32, self.dt, false);
+            .paint_focus(canvas, ui, frame, k as f32, self.dt, false);
         canvas.restore();
     }
 }
@@ -390,14 +394,24 @@ fn key_id(row: usize, col: usize) -> Id {
 
 /// One key's face and legend in `r`. Focus is the plate behind it. Armed, Shift's face is
 /// lit and the letters show the capital they would type.
-fn draw_key(canvas: &Canvas, fonts: &Fonts, key: Key, shift: bool, r: Rect, corner: f32, k: f64) {
+#[allow(clippy::too_many_arguments)]
+fn draw_key(
+    canvas: &Canvas,
+    ui: &Frame,
+    fonts: &Fonts,
+    key: Key,
+    shift: bool,
+    r: Rect,
+    corner: f32,
+    k: f64,
+) {
     let face = if shift && key == Key::Shift {
         0.3
     } else {
         0.08
     };
-    canvas.draw_rrect(RRect::new_rect_xy(r, corner, corner), &fill(fg(face)));
-    let ink = fg(1.0);
+    canvas.draw_rrect(RRect::new_rect_xy(r, corner, corner), &fill(ui.fg(face)));
+    let ink = ui.fg(1.0);
     let (cx, cy) = (f64::from(r.center_x()), f64::from(r.center_y()));
     match key {
         Key::Char(ch) => {
@@ -629,10 +643,11 @@ mod tests {
     /// read as outside, which is what closes the field.
     #[test]
     fn keyboard_covers_its_gaps() {
+        let ui = &crate::theme::Frame::default();
         let mut k = kb();
         let mut surface = skia_safe::surfaces::raster_n32_premul((800, 600)).unwrap();
         let fonts = crate::theme::build_fonts().unwrap();
-        k.render(surface.canvas(), &fonts, 800.0, 600.0, 1.0, 1.0);
+        k.render(surface.canvas(), ui, &fonts, 800.0, 600.0, 1.0, 1.0);
         let (a, b) = (k.keys[10].0, k.keys[11].0);
         let at = |x: f32, y: f32| Pointer {
             x: f64::from(x),
@@ -653,13 +668,14 @@ mod tests {
     /// and fades out with the tray.
     #[test]
     fn keyboard_focus_is_the_plate() {
+        let ui = &crate::theme::Frame::default();
         let mut k = kb();
         let mut surface = skia_safe::surfaces::raster_n32_premul((800, 600)).unwrap();
         let fonts = crate::theme::build_fonts().unwrap();
         let mut frames = |k: &mut Keyboard, shown: bool| {
             for _ in 0..90 {
                 let seat = k.seat(shown, 1.0 / 60.0);
-                k.render(surface.canvas(), &fonts, 800.0, 600.0, seat, 1.0);
+                k.render(surface.canvas(), ui, &fonts, 800.0, 600.0, seat, 1.0);
             }
         };
         let on = |k: &Keyboard, i: usize| {

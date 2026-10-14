@@ -3,7 +3,7 @@
 
 use crate::grid::{GRID_H, GRID_W};
 use crate::library::{initials, store_label, LibraryGame};
-use crate::theme::{art_sampling, fg, fill, Fonts, W};
+use crate::theme::{art_sampling, fill, Fonts, Frame, W};
 use skia_safe::{Canvas, Color4f, Data, Image, Point, Rect};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -275,8 +275,8 @@ const FACE_TINT: f32 = 0.20;
 const LAUNCHER_FACE_TINT: f32 = 0.38;
 
 /// Own function so the contrast test asserts this colour, not a re-derived one.
-pub(super) fn placeholder_face(launcher: bool) -> Color4f {
-    crate::theme::card_face(if launcher {
+pub(super) fn placeholder_face(ui: &Frame, launcher: bool) -> Color4f {
+    ui.card_face(if launcher {
         LAUNCHER_FACE_TINT
     } else {
         FACE_TINT
@@ -288,6 +288,7 @@ pub(super) fn placeholder_face(launcher: bool) -> Color4f {
 /// each layer stores and reloads the whole framebuffer.
 pub(crate) fn draw_poster_placeholder(
     canvas: &Canvas,
+    ui: &Frame,
     fonts: &Fonts,
     game: Option<&LibraryGame>,
     rect: Rect,
@@ -295,12 +296,12 @@ pub(crate) fn draw_poster_placeholder(
     alpha: f32,
 ) {
     let ink = |a: f32| {
-        let c = fg(a);
+        let c = ui.fg(a);
         Color4f::new(c.r, c.g, c.b, c.a * alpha)
     };
     // Side cards overlap; glass shows the neighbour. `card_face` tints without alpha.
     let launcher = matches!(game, Some(g) if g.launcher);
-    let face = placeholder_face(launcher);
+    let face = placeholder_face(ui, launcher);
     canvas.draw_rect(
         rect,
         &fill(Color4f::new(face.r, face.g, face.b, face.a * alpha)),

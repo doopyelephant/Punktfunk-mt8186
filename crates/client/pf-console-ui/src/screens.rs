@@ -32,7 +32,7 @@ use crate::glyphs::Hint;
 use crate::library::LibraryShared;
 use crate::model::{ConsoleCmd, HostRow};
 use crate::pointer::Pointer;
-use crate::theme::Fonts;
+use crate::theme::{Fonts, Frame};
 use crate::widgets::{Entry, Keyboard, ROW_H};
 use pf_client_core::console::OverlayAction;
 use pf_client_core::menu_nav::{MenuEvent, MenuPulse};
@@ -95,6 +95,8 @@ pub struct Ctx<'a> {
     pub t: f64,
     /// What each paired host listed of its profiles this run.
     pub(crate) profiles: &'a profiles::ProfileBook,
+    /// This frame's ink, motion and inset. Input reads the last frame's.
+    pub ui: &'a crate::theme::Frame,
 }
 
 #[cfg(test)]
@@ -132,6 +134,7 @@ impl<'a> Ctx<'a> {
             device: &DESKTOP,
             t: 0.0,
             profiles: &profiles::NO_PROFILES,
+            ui: Box::leak(Box::default()),
         }
     }
 }
@@ -229,10 +232,17 @@ impl TextEntry {
     }
 
     /// Draws the tray rising from the bottom of `rect`, while it is up at all.
-    pub(crate) fn render(&mut self, canvas: &Canvas, fonts: &Fonts, rect: Rect, k: f64) {
+    pub(crate) fn render(
+        &mut self,
+        canvas: &Canvas,
+        ui: &Frame,
+        fonts: &Fonts,
+        rect: Rect,
+        k: f64,
+    ) {
         if self.seat > 0.0 {
             let (w, bottom) = (f64::from(rect.width()), f64::from(rect.bottom));
-            (self.keyboard).render(canvas, fonts, w, bottom, self.seat, k);
+            (self.keyboard).render(canvas, ui, fonts, w, bottom, self.seat, k);
         }
     }
 
@@ -644,6 +654,7 @@ impl Screen {
         fonts: &Fonts,
         ctx: &Ctx,
     ) {
+        let ui = ctx.ui;
         match self {
             Screen::Library(s) => s.render_pinned(canvas, rect, k, fonts, ctx),
             Screen::Settings(s) => s.render_pinned(canvas, rect, k, dt, fonts, ctx),
@@ -652,13 +663,14 @@ impl Screen {
                     return;
                 };
                 let h = (crate::widgets::FOOT_DETAIL_H * k) as f32;
-                let edge = crate::theme::edge(k);
+                let edge = ui.edge(k);
                 crate::widgets::Foot {
                     detail: Some(&detail),
                     ..Default::default()
                 }
                 .paint(
                     canvas,
+                    ui,
                     fonts,
                     Rect::from_ltrb(rect.left, rect.bottom - h, rect.right, rect.bottom),
                     (f64::from(rect.left) + edge, f64::from(rect.right) - edge),

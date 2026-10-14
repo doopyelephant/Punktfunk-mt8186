@@ -4,6 +4,7 @@ use super::focus::{score, Group, Plate};
 use super::{Axis, El, Id, Kind, Painter, Virtual};
 use crate::anim::{springs, Spring};
 use crate::pointer::{Pointer, PointerKind};
+use crate::theme::Frame as Ui;
 use pf_client_core::menu_nav::MenuDir;
 use skia_safe::{Canvas, Rect};
 use std::collections::HashMap;
@@ -89,21 +90,27 @@ struct GroupBox {
 
 /// A plate that stopped being live this paint leaves its rect for another tree's plate;
 /// one whose rect was taken hides.
-fn hand_off(plate: &mut super::Plate, canvas: &Canvas, was: bool) {
+fn hand_off(plate: &mut super::Plate, canvas: &Canvas, was: bool, ui: &Ui) {
     let id = plate.id();
     if was && !plate.live() {
         let m = canvas.local_to_device_as_3x3();
         if let Some((r, corner)) = plate.rect().filter(|_| m.is_scale_translate()) {
-            super::focus::offer(id, m.map_rect(r).0, corner * m.scale_y());
+            ui.el.offer(id, m.map_rect(r).0, corner * m.scale_y());
         }
     }
-    if super::focus::taken_from(id) {
+    if ui.el.taken_from(id) {
         plate.hide();
     }
 }
 
 /// A plate waiting for focus to arrive from another tree starts where that tree's left.
-fn take_over(plate: &mut super::Plate, canvas: &Canvas, space: Option<Id>, shift: (f32, f32)) {
+fn take_over(
+    plate: &mut super::Plate,
+    canvas: &Canvas,
+    space: Option<Id>,
+    shift: (f32, f32),
+    ui: &Ui,
+) {
     if !plate.waiting() {
         return;
     }
@@ -112,7 +119,7 @@ fn take_over(plate: &mut super::Plate, canvas: &Canvas, space: Option<Id>, shift
         return;
     };
     let id = plate.id();
-    if let Some((dev, corner)) = super::focus::take(id) {
+    if let Some((dev, corner)) = ui.el.take(id) {
         // Local to the canvas, then into the scroll's content: the plate draws content - shift.
         let local = inv.map_rect(dev).0.with_offset(shift);
         plate.seed(local, corner / m.scale_y(), space, shift);
@@ -202,21 +209,36 @@ impl Tree {
 
     /// Paint `frame` in tree order. Scrolled nodes shift and clip to their viewports;
     /// a node wholly outside them is skipped.
-    pub fn paint(&mut self, canvas: &Canvas, frame: Frame<'_>) {
-        self.paint_inner(canvas, frame, None);
+    pub fn paint(&mut self, canvas: &Canvas, ui: &Ui, frame: Frame<'_>) {
+        self.paint_inner(canvas, ui, frame, None);
     }
 
     /// [`Self::paint`], with the focus plate advanced `dt` seconds toward this frame's
     /// rect of the focused node and drawn behind its whole focus group; with no focused
     /// node it glides on and fades. `k` scales the plate's outset; `cheap` drops its
     /// blurred shadow.
-    pub fn paint_focus(&mut self, canvas: &Canvas, frame: Frame<'_>, k: f32, dt: f64, cheap: bool) {
-        self.paint_inner(canvas, frame, Some((k, dt, cheap)));
+    pub fn paint_focus(
+        &mut self,
+        canvas: &Canvas,
+        ui: &Ui,
+        frame: Frame<'_>,
+        k: f32,
+        dt: f64,
+        cheap: bool,
+    ) {
+        self.paint_inner(canvas, ui, frame, Some((k, dt, cheap)));
     }
 
     /// A focus the caller did not hold and this frame lacks reseats on the target nearest
-    /// where it stood. Every paint reports its targets to the running [`super::census`].
-    fn paint_inner(&mut self, canvas: &Canvas, frame: Frame<'_>, plate: Option<(f32, f64, bool)>) {
+    /// where it stood. Every paint reports its targets to the running census
+    /// ([`super::Ledger::census`]).
+    fn paint_inner(
+        &mut self,
+        canvas: &Canvas,
+        ui: &Ui,
+        frame: Frame<'_>,
+        plate: Option<(f32, f64, bool)>,
+    ) {
         let last = self.focus.and_then(|f| self.rect(f));
         let anchor = last.or_else(|| self.plate.rect().map(|p| p.0));
         self.placed.clear();
@@ -266,9 +288,9 @@ impl Tree {
                 canvas.clip_rect(clip[i], None, true);
             }
             let was = self.plate.live();
-            self.plate.lose(dt, i.map(|i| shift[i]));
-            hand_off(&mut self.plate, canvas, was);
-            self.plate.draw(canvas, k, cheap);
+            self.plate.lose(dt, i.map(|i| shift[i]), ui);
+            hand_off(&mut self.plate, canvas, was, ui);
+            self.plate.draw(canvas, k, cheap, ui);
             canvas.restore();
         }
         for (i, n) in frame.nodes.into_iter().enumerate() {
@@ -277,14 +299,14 @@ impl Tree {
             {
                 canvas.save();
                 let was = self.plate.live();
-                take_over(&mut self.plate, canvas, space, d);
-                self.plate.step(id, target, corner, dt, space, d);
-                hand_off(&mut self.plate, canvas, was);
+                take_over(&mut self.plate, canvas, space, d, ui);
+                self.plate.step(id, target, corner, dt, space, d, ui);
+                hand_off(&mut self.plate, canvas, was, ui);
                 // A plate still coming in from outside its viewport would be cut at its edge.
                 if let Some(c) = c.filter(|_| !self.plate.arriving()) {
                     canvas.clip_rect(c, None, true);
                 }
-                self.plate.draw(canvas, k, cheap);
+                self.plate.draw(canvas, k, cheap, ui);
                 canvas.restore();
             }
             let (d, c) = n
@@ -328,7 +350,8 @@ impl Tree {
             p(canvas, rect);
             canvas.restore();
         }
-        super::claim(self.placed.iter().filter(|p| p.focus.is_some()).count());
+        ui.el
+            .claim(self.placed.iter().filter(|p| p.focus.is_some()).count());
         self.remember();
     }
 
@@ -510,8 +533,9 @@ impl Tree {
 
     /// Take `scroll` to `target` on the focus spring — the move a focus change asks for;
     /// call it every frame. A finger, a fling or a bounce holds it off, and a scroll a
-    /// finger parked waits for a target other than the one it left. `snap`, or reduced
-    /// motion, lands at once. Clamped to the content on the next [`Self::layout`].
+    /// finger parked waits for a target other than the one it left. `snap` lands at once:
+    /// a caller under reduced motion passes it. Clamped to the content on the next
+    /// [`Self::layout`].
     pub fn follow(&mut self, scroll: Id, target: f32, snap: bool) {
         let s = self.scrolls.entry(scroll).or_default();
         if s.parked && s.asked == Some(target) {
@@ -522,7 +546,7 @@ impl Tree {
         if s.held || s.vel != 0.0 || s.bounce.is_some() {
             return;
         }
-        if snap || crate::theme::reduce_motion() || s.offset == target {
+        if snap || s.offset == target {
             s.offset = target;
             s.goal = None;
         } else {
