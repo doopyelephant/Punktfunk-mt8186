@@ -79,6 +79,27 @@ final class Sc1DeviceTests: XCTestCase {
         }
     }
 
+    /// The Bluetooth link's three core calls: features out as segments, input in as wired
+    /// frames, replies rebuilt with report id 0 first.
+    func testBluetoothSegmentsGoThroughCore() {
+        let segments = PunktfunkConnection.sc1BleSegments(frame: Sc1Device.lizardOff[2])
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEqual(Array(segments[0][..<4]), [0x03, 0xC0, 0x87, 12])
+
+        var state = PunktfunkConnection.sc1BleState()
+        var segment = [UInt8](repeating: 0, count: 20)
+        segment[..<5] = [0x03, 0xC0, 0x14, 0x00, 0x80] // a chunked state: A held
+        let frame = PunktfunkConnection.sc1BleInput(state: &state, segment: segment)
+        XCTAssertEqual(frame.map { Array($0[..<4]) }, [0x01, 0x00, 0x01, 0x3C])
+        var parsed = Sc2Device.State()
+        XCTAssertTrue(Sc1Device.parseState(frame ?? [], into: &parsed))
+        XCTAssertEqual(parsed.buttons, Sc2Device.btnA)
+
+        let reply = PunktfunkConnection.sc1BleReply(
+            segments: [0x03, 0xC0, 0x83, 0x00] + [UInt8](repeating: 0, count: 16))
+        XCTAssertEqual(reply.map { Array($0[..<3]) }, [0x00, 0x83, 0x00])
+    }
+
     func testIdentityQueriesComeFromCore() {
         XCTAssertEqual(PunktfunkConnection.sc1IdentityRequests(), [
             [0x00, 0x83, 0x00], [0x00, 0xAE, 0x15, 0x00], [0x00, 0xAE, 0x15, 0x01],

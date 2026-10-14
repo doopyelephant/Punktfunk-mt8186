@@ -1,7 +1,7 @@
 // Captured Steam Controller 2 pads: the glue between a transport link and the punktfunk wire.
 // Exactly one transport runs (`startTransport`): `Sc2UsbLink` for a wired pad or a Puck (macOS
 // only), else `Sc2BleLink`. Running both would double-feed a pad that is charging and paired.
-// A 2015 pad on a Mac's USB (`Sc1Device`) rides the same path and arrives as pref 5.
+// A 2015 pad (`Sc1Device`), on a Mac's USB or on Bluetooth, rides the same path as pref 5.
 //
 // Each HID source (a USB collection or the BLE link) is its own `PadSource` with its own wire
 // slot, so a Puck with four pads claims four. A slot is claimed on the source's first state report
@@ -194,8 +194,9 @@ public final class Sc2Capture {
 
     /// Whether `source` is a 2015 Steam Controller. Safe from any thread; never call with `lock` held.
     private func isClassicSource(_ source: UInt64) -> Bool {
+        if source == Self.bleSource { return link.isClassic }
         #if os(macOS)
-        return source != Self.bleSource && usbLink.isClassic(source: source)
+        return usbLink.isClassic(source: source)
         #else
         return false
         #endif

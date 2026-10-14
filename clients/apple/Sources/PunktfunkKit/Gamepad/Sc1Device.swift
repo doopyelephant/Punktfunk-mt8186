@@ -12,6 +12,11 @@ enum Sc1Device {
     static let pidDongle = 0x1142
     static let usbPIDs = [pidWired, pidDongle]
 
+    /// The Bluetooth input characteristic: 19-byte segments, `[header, 18 bytes]`, which the
+    /// HID report id `0x03` turns into the segments core decodes.
+    static let bleInputCharUUID = "100F6C33-1735-4313-B402-38567131E5F3"
+    static let bleReport: UInt8 = 0x03
+
     static let typeState: UInt8 = 0x01
     static let typeWireless: UInt8 = 0x03
     /// Wireless event byte: the pad behind a dongle slot powered off.

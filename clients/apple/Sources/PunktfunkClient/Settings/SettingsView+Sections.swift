@@ -37,9 +37,11 @@ extension SettingsView {
         return "Stream a Steam Controller 2, its Puck or a 2015 Steam Controller as-is; "
             + "needs Input Monitoring (or Bluetooth) access."
         #elseif os(tvOS)
-        return "Stream a Steam Controller 2 as-is; needs Bluetooth access."
+        return "Stream a Steam Controller 2 or a 2015 Steam Controller as-is; "
+            + "needs Bluetooth access."
         #else
-        return "Browse and stream with a Steam Controller 2 as-is; needs Bluetooth access."
+        return "Browse and stream with a Steam Controller 2 or a 2015 Steam Controller as-is; "
+            + "needs Bluetooth access."
         #endif
     }
 
