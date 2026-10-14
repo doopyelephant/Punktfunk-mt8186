@@ -17,8 +17,8 @@
 use super::policy::{intra_refresh_requested, ltr_test_force_at};
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
 use crate::ltr::{LtrMirror, LtrStep, NUM_LTR_SLOTS};
-use crate::retrieve::{poll_budget_ms, AuQueue, RetrieveThread};
-use crate::stall::{Rebuild, Stall};
+use crate::retrieve::{AuQueue, RetrieveThread};
+use crate::stall::{poll_budget_ms, Rebuild, Stall};
 use anyhow::{anyhow, bail, Context, Result};
 use libvpl_sys as vpl;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};

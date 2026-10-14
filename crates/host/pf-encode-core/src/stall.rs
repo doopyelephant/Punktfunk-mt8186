@@ -1,8 +1,13 @@
-//! How far a stalled encoder's recovery escalates while no access unit arrives. AMF, QSV and
-//! Media Foundation keep their context across a reset and rebuild in place first; a second
-//! reset with no access unit between drops the context instead, because a re-Init on the same
-//! context cannot clear a dead hardware session. Pure, so its table runs wherever this crate
-//! builds.
+//! How long AMF, QSV and Media Foundation wait for an access unit, and how far a stalled
+//! encoder's recovery escalates while none arrives. The three keep their context across a
+//! reset and rebuild in place first; a second reset with no access unit between drops the
+//! context instead, because a re-Init on the same context cannot clear a dead hardware
+//! session. Pure, so its tests run wherever this crate builds.
+
+/// How long `poll` waits for an AU: three quarters of a frame interval, 1 to 12 ms.
+pub fn poll_budget_ms(fps: u32) -> u32 {
+    (750 / fps.max(1)).clamp(1, 12)
+}
 
 /// Where a backend's stall recovery stands since its last access unit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -36,7 +41,13 @@ impl Stall {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rebuild, Stall};
+    use super::{poll_budget_ms, Rebuild, Stall};
+
+    #[test]
+    fn the_poll_budget_is_three_quarters_of_a_frame_within_1_to_12_ms() {
+        let budgets = [0, 30, 60, 120, 240, 1000].map(poll_budget_ms);
+        assert_eq!(budgets, [12, 12, 12, 6, 3, 1]);
+    }
 
     /// Events: `r` a reset, `o` an access unit. Rebuilds: `I` in place, `R` reopen.
     #[test]

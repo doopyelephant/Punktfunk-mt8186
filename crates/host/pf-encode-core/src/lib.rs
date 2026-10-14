@@ -38,7 +38,7 @@ pub mod ltr;
 ))]
 pub mod fake;
 pub mod smoke_pattern;
-// How far AMF, QSV and Media Foundation escalate a reset while no AU arrives. Pure.
+// How long AMF, QSV and Media Foundation wait for an AU, and how far a reset escalates.
 pub mod stall;
 // Shared loss-recovery env knobs. Defaults and API clamps stay per-backend.
 #[cfg(any(target_os = "linux", target_os = "windows"))]

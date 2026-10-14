@@ -15,8 +15,8 @@
 //! Evidence: `design/media-foundation-encoder.md`.
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
-use crate::retrieve::{poll_budget_ms, AuQueue};
-use crate::stall::{Rebuild, Stall};
+use crate::retrieve::AuQueue;
+use crate::stall::{poll_budget_ms, Rebuild, Stall};
 use anyhow::{anyhow, bail, Context, Result};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 use std::mem::ManuallyDrop;

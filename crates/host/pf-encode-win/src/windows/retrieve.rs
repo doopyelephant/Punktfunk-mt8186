@@ -86,11 +86,6 @@ pub struct Out<P, X = ()> {
     pub extra: X,
 }
 
-/// How long `poll` waits for an AU: three quarters of a frame interval, 1 to 12 ms.
-pub fn poll_budget_ms(fps: u32) -> u32 {
-    (750 / fps.max(1)).clamp(1, 12)
-}
-
 /// The finished-AU queue and the [`Ready`] that announces it.
 pub struct AuQueue<P, X = ()> {
     out: Mutex<Out<P, X>>,
@@ -316,11 +311,5 @@ mod tests {
         assert!(logged());
         q.reset();
         assert!(!logged());
-    }
-
-    #[test]
-    fn the_poll_budget_is_three_quarters_of_a_frame_within_1_to_12_ms() {
-        let budgets = [0, 30, 60, 120, 240, 1000].map(poll_budget_ms);
-        assert_eq!(budgets, [12, 12, 12, 6, 3, 1]);
     }
 }
