@@ -19,6 +19,9 @@ set -eu
 
 BOX=/var/lib/punktfunk
 MARK="$BOX/door-on"
+# The seat supervisor's own directory. `owner` there names the one account it adopts as the box
+# owner's row; only root writes it, so the door can't pick another.
+STATE=/var/lib/punktfunk-seats
 SEATS=/usr/libexec/punktfunk/punktfunk-seats
 GROUP=punktfunk-update
 # What the box's host keeps: identity, id, pairings, profiles, display and hook settings, and the
@@ -113,6 +116,10 @@ door_on() {
         take_avatars
         : >"$MARK"
     fi
+    install -d -m 0711 -o root -g root "$STATE"
+    printf '%s\n' "$user" >"$STATE/owner.tmp"
+    chmod 0600 "$STATE/owner.tmp"
+    mv -f "$STATE/owner.tmp" "$STATE/owner"
     systemctl enable --now punktfunk-seats.service
     wait_for_socket
     "$SEATS" adopt-owner "$user" >/dev/null
@@ -144,7 +151,7 @@ door_off() {
         row=$(owner_row)
         [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null
     fi
-    rm -f "$MARK"
+    rm -f "$MARK" "$STATE/owner"
     systemctl disable --now punktfunk-web-door.service punktfunk-door.service punktfunk-seats.service
     user_ctl try-restart punktfunk-host.service || true
     # Their console comes back only if it was theirs to begin with.

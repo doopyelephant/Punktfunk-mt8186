@@ -231,6 +231,25 @@ pub(super) fn require_owner(account: &str) -> Result<Passwd, BackendError> {
     }
 }
 
+/// Where `door-helper` writes the box owner's account, under the state directory.
+const OWNER_FILE: &str = "owner";
+
+/// Refuses `account` as the owner's row unless it is the one `door-helper` recorded in `state`,
+/// a directory only root writes. The door asks for the row, so it can't name another account.
+pub(super) fn require_recorded(state: &Path, account: &str) -> Result<(), BackendError> {
+    let recorded = super::safe_open::read(&state.join(OWNER_FILE), 64)
+        .ok()
+        .flatten()
+        .map(|(bytes, _)| String::from_utf8_lossy(&bytes).trim().to_owned());
+    if recorded.as_deref() == Some(account) {
+        return Ok(());
+    }
+    Err(err(
+        "owner_not_recorded",
+        format!("account '{account}' isn't the owner door-helper recorded"),
+    ))
+}
+
 /// The seat's user, which must exist and carry the seat's marker.
 pub(super) fn require(seat: &Seat) -> Result<Passwd, BackendError> {
     match lookup(&seat.account)? {
@@ -361,6 +380,18 @@ mod tests {
         assert!(!is_ordinary(&row(60000, "")), "nobody and the above");
         assert!(!is_ordinary(&row(0, "root")));
         assert!(!is_ordinary(&row(1001, &marker(&id()))), "a seat's account");
+    }
+
+    /// Only the account `door-helper` recorded can become the owner's row; with no record, none.
+    #[test]
+    fn only_the_recorded_owner_is_adopted() {
+        let state = tempfile::tempdir().unwrap();
+        let refused = |account: &str| require_recorded(state.path(), account).is_err();
+        assert!(refused("alice"), "nothing recorded");
+        std::fs::write(state.path().join(OWNER_FILE), "alice\n").unwrap();
+        assert!(!refused("alice"));
+        assert!(refused("bob"));
+        assert!(refused(""));
     }
 
     /// An owner name `getent` could read as an option is refused before anything runs.

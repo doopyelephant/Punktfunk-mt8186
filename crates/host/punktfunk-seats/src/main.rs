@@ -45,7 +45,7 @@ mod linux {
         \x20 serve [--steam-source DIR]  run the supervisor (root)\n\
         \x20 list                        every seat and its state\n\
         \x20 create <name>               add a seat\n\
-        \x20 adopt-owner <account>       make a user the box owner's row\n\
+        \x20 adopt-owner <account>       the owner's row, for the user door-helper recorded\n\
         \x20 start <id> | stop <id> | delete <id>\n\
         \x20 doctor                      what a seat needs and what is missing\n\
         \x20 seating                     whether seats are on\n\

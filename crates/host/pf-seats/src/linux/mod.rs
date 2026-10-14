@@ -518,8 +518,10 @@ impl PlatformBackend for LinuxBackend {
         Ok(())
     }
 
+    /// The owner's row, for the account `door-helper` recorded and no other.
     fn adopt(&self, seat: &Seat) -> Result<(), BackendError> {
         let passwd = accounts::require_owner(&seat.account)?;
+        accounts::require_recorded(&self.inner.state, &seat.account)?;
         self.prepare_owner(seat, &passwd)?;
         self.track(&seat.id, Tracked::of(seat, &passwd));
         Ok(())
