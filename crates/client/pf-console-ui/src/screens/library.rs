@@ -477,14 +477,6 @@ impl LibraryScreen {
         self.art = art;
     }
 
-    fn fetch_cmd(&self) -> ConsoleCmd {
-        ConsoleCmd::FetchLibrary {
-            addr: self.host.addr.clone(),
-            mgmt: self.host.mgmt_port,
-            fp_hex: self.host.fp_hex.clone(),
-        }
-    }
-
     fn sync(&mut self, library: &LibraryShared) {
         if self.shared.is_none() {
             self.shared = Some(library.clone());
@@ -711,7 +703,7 @@ impl LibraryScreen {
         match self.state_action()? {
             "Retry" => {
                 self.phase = LibraryPhase::Loading; // optimistic; the fetch re-syncs
-                fx.cmds.push(self.fetch_cmd());
+                fx.cmds.push(ConsoleCmd::fetch_library(&self.host));
             }
             _ => fx.connect = Some(self.desktop_intent()),
         }

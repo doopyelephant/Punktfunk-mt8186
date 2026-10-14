@@ -1,11 +1,12 @@
 //! The JSON a native host and the console exchange across a language boundary: what the host
 //! hands at create, the entry, pad and preset pushes, and the events it reads back. Android (JNI)
-//! and Apple (C ABI) both speak it, so Kotlin and Swift encode one contract.
+//! and Apple (C ABI) both speak it, so Kotlin and Swift encode one contract. A push that
+//! answers a command carries the command's `req` verbatim.
 
 use crate::store::PresetEntry;
 use crate::{
-    Console, ConsoleEntry, ConsoleOptions, DeviceScreen, HostRow, Key, Platform, SnapshotStore,
-    Stale,
+    Console, ConsoleEntry, ConsoleOptions, DeviceScreen, HostRow, Key, LibraryGame, LibraryPhase,
+    Platform, RequestKey, SnapshotStore, Stale,
 };
 use pf_client_core::console::{OverlayAction, PointerButton, PointerInput, SessionPhase};
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse, PadBattery, PadInfo};
@@ -195,6 +196,20 @@ impl PadsJson {
             .collect();
         (self.label, self.pref.map(GamepadPref::from_u8), pads)
     }
+}
+
+/// `{"req": RequestKey, "games": [LibraryGame]}`: the catalog that answers `FetchLibrary` `req`.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct GamesPush {
+    pub req: RequestKey,
+    pub games: Vec<LibraryGame>,
+}
+
+/// `{"req": RequestKey, "phase": LibraryPhase}`: a library phase for `FetchLibrary` `req`.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PhasePush {
+    pub req: RequestKey,
+    pub phase: LibraryPhase,
 }
 
 /// One preset as the host sends it. `overrides` is the console's settings encoding; an
@@ -658,6 +673,27 @@ mod tests {
         assert_eq!(sampled, all);
     }
 
+    /// A keyed push carries its command's `req` verbatim, which is how a producer stamps it.
+    #[test]
+    fn keyed_pushes_carry_their_commands_req() {
+        let file = vectors();
+        let commands = file["commands"].as_array().unwrap();
+        let req_of = |name: &str| commands.iter().find_map(|c| c.get(name)).unwrap()["req"].clone();
+        for (model, command) in [
+            ("PairStatus", "Pair"),
+            ("WakeStatus", "Wake"),
+            ("PhasePush", "FetchLibrary"),
+            ("GamesPush", "FetchLibrary"),
+        ] {
+            let req = req_of(command);
+            let key: RequestKey = serde_json::from_value(req.clone()).unwrap();
+            assert!(key.epoch > 0, "{command} carries a minted key");
+            for s in file["models"][model].as_array().unwrap() {
+                assert_eq!(s["req"], req, "{model} answers {command}");
+            }
+        }
+    }
+
     /// Every key of `want` comes back in `got` with its value; `got` may add defaults.
     fn keeps(want: &serde_json::Value, got: &serde_json::Value) -> bool {
         use serde_json::Value::{Array, Object};
@@ -683,11 +719,12 @@ mod tests {
         for (model, samples) in file["models"].as_object().unwrap() {
             for s in samples.as_array().unwrap() {
                 let got = match model.as_str() {
-                    "PairPhase" => read_back::<crate::PairPhase>(s),
+                    "PairStatus" => read_back::<crate::PairStatus>(s),
                     "WakeStatus" => read_back::<crate::WakeStatus>(s),
                     "SpeedPhase" => read_back::<crate::SpeedPhase>(s),
                     "ProfilesAnswer" => read_back::<crate::ProfilesAnswer>(s),
-                    "LibraryPhase" => read_back::<crate::LibraryPhase>(s),
+                    "PhasePush" => read_back::<PhasePush>(s),
+                    "GamesPush" => read_back::<GamesPush>(s),
                     "DownloadsPush" => read_back::<crate::DownloadsPush>(s),
                     "PadsJson" => read_back::<PadsJson>(s),
                     "Settings" => read_back::<Settings>(s),

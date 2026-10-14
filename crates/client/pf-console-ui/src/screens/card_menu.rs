@@ -562,10 +562,7 @@ impl CardMenu {
                 fx.pop();
             }
             Action::Wake => {
-                fx.cmds.push(ConsoleCmd::Wake {
-                    key,
-                    then_connect: false,
-                });
+                fx.cmds.push(ConsoleCmd::wake(&key, false));
                 fx.pop();
             }
             Action::Pair => fx.replace(Screen::Pair(super::pair::PairScreen::new(

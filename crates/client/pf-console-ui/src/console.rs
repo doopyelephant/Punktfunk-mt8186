@@ -153,9 +153,6 @@ impl Console {
         let stream = stream_intent(&entry);
         let fetch = entry_fetch(&entry);
         let stack = entry_stack(entry, &opts.device_name);
-        if let Some(cmd) = fetch {
-            handles.bus.send(cmd);
-        }
         let mut shell = Shell::new(
             handles.console.clone(),
             handles.library.clone(),
@@ -163,6 +160,9 @@ impl Console {
             opts,
             stack,
         )?;
+        if let Some(cmd) = fetch {
+            shell.send_cmd(cmd);
+        }
         if let Some(intent) = stream {
             shell.start_connect(intent);
         }
@@ -292,11 +292,6 @@ impl Console {
         let fetch = entry_fetch(&entry);
         let stack = entry_stack(entry, self.shell.device_name());
         if let Some(cmd) = fetch {
-            // The shell's record of whose list the model holds, or the parked Hosts shelf
-            // takes this host's games as its own.
-            if let ConsoleCmd::FetchLibrary { fp_hex, .. } = &cmd {
-                self.shell.note_fetch(fp_hex);
-            }
             self.shell.send_cmd(cmd);
         }
         self.shell.replace_stack(stack);
@@ -351,11 +346,7 @@ fn entry_fetch(entry: &ConsoleEntry) -> Option<ConsoleCmd> {
     let (ConsoleEntry::Library(host) | ConsoleEntry::Stream(host)) = entry else {
         return None;
     };
-    Some(ConsoleCmd::FetchLibrary {
-        addr: host.addr.clone(),
-        mgmt: host.mgmt_port,
-        fp_hex: host.fp_hex.clone(),
-    })
+    Some(ConsoleCmd::fetch_library(host))
 }
 
 fn entry_stack(entry: ConsoleEntry, device_name: &str) -> Vec<Screen> {
@@ -431,7 +422,10 @@ mod tests {
             ConsoleEntry::Library(Box::new(row())),
             ConsoleEntry::Stream(Box::new(row())),
         ] {
-            let Some(ConsoleCmd::FetchLibrary { addr, mgmt, fp_hex }) = entry_fetch(&entry) else {
+            let Some(ConsoleCmd::FetchLibrary {
+                addr, mgmt, fp_hex, ..
+            }) = entry_fetch(&entry)
+            else {
                 panic!("a shelf entry fetches its library");
             };
             assert_eq!(
@@ -466,6 +460,99 @@ mod tests {
             stack.as_slice(),
             [Screen::Home(_), Screen::Pair(_)]
         ));
+    }
+
+    fn den() -> HostRow {
+        HostRow::fixture("bb", "Den")
+    }
+
+    /// A console at Home over two paired hosts, Desk under the row, its first frame drawn.
+    fn at_home() -> (ConsoleHandles, Console) {
+        crate::screens::settings::tests::fake_home();
+        let handles = ConsoleHandles::new();
+        handles.console.set_hosts(vec![row(), den()]);
+        let mut opts = ConsoleOptions::desktop("deck".into(), false);
+        opts.store = Some(std::sync::Arc::new(crate::store::SnapshotStore::new(
+            Default::default(),
+            Vec::new(),
+        )));
+        let mut console = Console::new(opts, ConsoleEntry::Home, &handles).unwrap();
+        draw(&mut console);
+        (handles, console)
+    }
+
+    fn draw(console: &mut Console) {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((480, 300)).unwrap();
+        console.frame(
+            surface.canvas(),
+            &Viewport::plain(480, 300),
+            None,
+            None,
+            &[],
+        );
+    }
+
+    /// The library fetches waiting on the bus, by key.
+    fn fetches(bus: &ConsoleBus) -> Vec<crate::model::RequestKey> {
+        (bus.drain().into_iter())
+            .filter_map(|c| match c {
+                ConsoleCmd::FetchLibrary { req, .. } => Some(req),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn title(id: &str) -> crate::LibraryGame {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "title": id, "store": "steam", "launcher": false, "icon": "",
+            "platform": null, "running": false
+        }))
+        .unwrap()
+    }
+
+    /// A deep link's fetch is the model's: back on the Hosts tab, the row's shelf for the other
+    /// host asks again rather than showing the linked host's games under its card.
+    #[test]
+    fn a_deep_links_fetch_moves_the_hosts_shelf_on() {
+        let (handles, mut console) = at_home();
+        let desk = fetches(&handles.bus);
+        assert_eq!(desk.len(), 1, "the row asks for the games under it");
+        console.navigate(ConsoleEntry::Library(Box::new(den())));
+        let linked = fetches(&handles.bus);
+        assert_eq!(
+            handles.library.req(),
+            linked[0],
+            "the model is on the link's fetch"
+        );
+        console.menu(MenuEvent::JumpBack, InputSource::Pad);
+        draw(&mut console);
+        let again = fetches(&handles.bus);
+        assert_eq!(
+            again.iter().map(|r| r.host.as_str()).collect::<Vec<_>>(),
+            [desk[0].host.as_str()],
+            "the parked row asks for its own host again"
+        );
+    }
+
+    /// A catalog that comes back for a host the console has moved off is dropped by its key;
+    /// the host on screen still gets its own.
+    #[test]
+    fn a_late_catalog_for_a_host_left_behind_is_dropped_by_key() {
+        let (handles, mut console) = at_home();
+        let left = fetches(&handles.bus).remove(0);
+        console.navigate(ConsoleEntry::Library(Box::new(den())));
+        let shown = fetches(&handles.bus).remove(0);
+        handles.library.set_games(&left, vec![title("left:1")]);
+        handles.library.set_phase(&left, crate::LibraryPhase::Ready);
+        let snap = handles.library.snapshot();
+        assert!(snap.games.is_empty(), "the left host's titles never land");
+        assert!(matches!(snap.phase, crate::LibraryPhase::Loading));
+        handles.library.set_games(&shown, vec![title("den:1")]);
+        draw(&mut console);
+        let ids: Vec<String> = (handles.library.snapshot().games.into_iter())
+            .map(|g| g.id)
+            .collect();
+        assert_eq!(ids, [crate::library::DESKTOP_ID, "den:1"]);
     }
 
     /// Returning to the shelf on top keeps it (its posters survive the stream); another

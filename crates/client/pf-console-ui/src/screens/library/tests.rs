@@ -47,6 +47,7 @@ fn live_shelf() -> (LibraryScreen, LibraryShared) {
     crate::screens::settings::tests::fake_home();
     let library = LibraryShared::default();
     library.set_games(
+        &library.req(),
         ["Zeta", "Alpha", "Nimbus", "Bravo", "Kilo", "Delta"]
             .iter()
             .enumerate()
@@ -450,11 +451,14 @@ fn the_shelf_is_one_line_among_the_tabs_rows() {
 fn a_failed_list_offers_retry_and_a_way_up() {
     crate::screens::settings::tests::fake_home();
     let library = LibraryShared::default();
-    library.set_phase(LibraryPhase::Error {
-        title: "Couldn't load the library".into(),
-        body: "The host refused.".into(),
-        can_retry: true,
-    });
+    library.set_phase(
+        &library.req(),
+        LibraryPhase::Error {
+            title: "Couldn't load the library".into(),
+            body: "The host refused.".into(),
+            can_retry: true,
+        },
+    );
     let mut settings = pf_client_core::trust::Settings::default();
     let mut s = LibraryScreen::new(&host());
     let (pulse, _) = press(&mut s, &library, &mut settings, right());
@@ -485,11 +489,14 @@ fn a_failed_list_offers_retry_and_a_way_up() {
 
     let mut s = LibraryScreen::new(&host());
     s.all_titles();
-    library.set_phase(LibraryPhase::Error {
-        title: "Couldn't load the library".into(),
-        body: "The host refused.".into(),
-        can_retry: true,
-    });
+    library.set_phase(
+        &library.req(),
+        LibraryPhase::Error {
+            title: "Couldn't load the library".into(),
+            body: "The host refused.".into(),
+            can_retry: true,
+        },
+    );
     let (pulse, _) = press(&mut s, &library, &mut settings, up());
     assert!(matches!(pulse, Some(MenuPulse::Boundary)));
     assert_eq!(s.zone, Zone::State);
@@ -534,7 +541,7 @@ fn a_band_holds_its_titles_out_of_the_grid_only_while_it_shows() {
     };
     list[1].stats = played(5);
     list[2].stats = played(9);
-    library.set_games(list);
+    library.set_games(&library.req(), list);
     let mut s = LibraryScreen::new(&host());
     s.sync(&library);
     let mut settings = pf_client_core::trust::Settings::default();
@@ -819,7 +826,7 @@ fn long_grid() -> (
     let library = LibraryShared::default();
     let titles: Vec<String> = (0..200).map(|i| format!("Title {i:03}")).collect();
     let spec: Vec<(&str, Option<&str>)> = titles.iter().map(|t| (t.as_str(), None)).collect();
-    library.set_games(games(&spec));
+    library.set_games(&library.req(), games(&spec));
     let mut s = LibraryScreen::new(&host());
     // A drilled shelf's plain grid: no sections above.
     s.all_titles();
@@ -966,7 +973,7 @@ fn decode_ahead_is_a_window_of_places() {
     let library = LibraryShared::default();
     let titles: Vec<String> = (0..300).map(|i| format!("Title {i:03}")).collect();
     let spec: Vec<(&str, Option<&str>)> = titles.iter().map(|t| (t.as_str(), None)).collect();
-    library.set_games(games(&spec));
+    library.set_games(&library.req(), games(&spec));
     let mut s = LibraryScreen::new(&host());
     s.all_titles();
     s.sync(&library);
@@ -994,13 +1001,16 @@ fn handed_over_posters_survive_the_first_list_and_only_that_one() {
             .image_snapshot()
     };
     let library = LibraryShared::default();
-    library.set_games(games(&[("Ico", Some("PS2")), ("Journey", None)]));
+    library.set_games(
+        &library.req(),
+        games(&[("Ico", Some("PS2")), ("Journey", None)]),
+    );
     let mut s = LibraryScreen::new(&host());
     s.adopt_art(HashMap::from([("g0".to_string(), poster())]));
     s.sync(&library);
     assert_eq!(s.art.len(), 1, "the hand-over was wiped by the first list");
 
-    library.set_games(games(&[("Rez", Some("PS2"))]));
+    library.set_games(&library.req(), games(&[("Rez", Some("PS2"))]));
     s.sync(&library);
     assert!(s.art.is_empty(), "a different library kept the old covers");
 }
@@ -1036,7 +1046,7 @@ fn confirm_on_the_desktop_tile_launches_nothing() {
 fn an_empty_library_still_streams_the_desktop() {
     crate::screens::settings::tests::fake_home();
     let library = LibraryShared::default();
-    library.set_games(Vec::new());
+    library.set_games(&library.req(), Vec::new());
     let mut s = LibraryScreen::new(&host());
     s.sync(&library);
     s.entrance_armed = true;
@@ -1076,7 +1086,7 @@ fn the_desktop_tile_says_resume_when_the_host_has_a_game_up() {
 #[test]
 fn a_cover_one_screen_took_reaches_another() {
     let library = LibraryShared::default();
-    library.set_games(games(&[("Alpha", None)]));
+    library.set_games(&library.req(), games(&[("Alpha", None)]));
     let bytes = poster_png(1);
     library.push_art("g0".into(), bytes.clone());
     library.push_decoded("g0".into(), decode_poster_off_thread(&bytes, 1.0).unwrap());
@@ -1100,7 +1110,7 @@ fn a_cover_one_screen_took_reaches_another() {
 #[test]
 fn screens_on_one_host_share_a_cover() {
     let library = LibraryShared::default();
-    library.set_games(games(&[("Alpha", None)]));
+    library.set_games(&library.req(), games(&[("Alpha", None)]));
     let poster = decode_poster_off_thread(&poster_png(2), 1.0).unwrap();
     library.push_decoded("g0".into(), poster);
     let mut first = LibraryScreen::new(&host());
@@ -1277,7 +1287,7 @@ fn dump_library() {
     let games_tab = |view: LibraryView, library: &LibraryShared| tab(view, "", "violet", library);
     let full = || {
         let library = LibraryShared::default();
-        library.set_games(list());
+        library.set_games(&library.req(), list());
         for i in 1..titles.len() {
             if i != 6 {
                 library.push_art(format!("steam:{i}"), poster_png(i));
@@ -1328,8 +1338,8 @@ fn dump_library() {
     ] {
         let library = LibraryShared::default();
         match phase {
-            Some(LibraryPhase::Empty) => library.set_games(Vec::new()),
-            Some(p) => library.set_phase(p),
+            Some(LibraryPhase::Empty) => library.set_games(&library.req(), Vec::new()),
+            Some(p) => library.set_phase(&library.req(), p),
             None => {}
         }
         let mut s = games_tab(LibraryView::Grid, &library);
@@ -1354,7 +1364,7 @@ fn dump_library() {
     for (i, g) in games.iter_mut().enumerate() {
         g.platform = Some(["PC", "PS2", "SNES"][i % 3].into());
     }
-    mixed.set_games(games);
+    mixed.set_games(&mixed.req(), games);
     for i in 1..titles.len() {
         mixed.push_art(format!("steam:{i}"), poster_png(i));
     }
