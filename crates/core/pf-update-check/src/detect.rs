@@ -108,6 +108,10 @@ pub struct Probe {
 /// The Deck build's checkout, under `$HOME`.
 pub const SOURCE_CHECKOUT: &str = "punktfunk";
 
+/// The copy of a Deck build that its door and seats run, outside the owner's 0700 home
+/// (`scripts/steamdeck/door.sh`). `source-head` beside it is the checkout's `.git/HEAD`.
+pub const STEAMOS_SYSTEM_COPY: &str = "/opt/punktfunk/host";
+
 /// A Deck build's channel is the branch its checkout follows: `stable` moves at each announced
 /// release, anything else (`main`, a detached tree) is canary.
 pub fn source_channel(head: Option<&str>) -> Channel {
@@ -120,13 +124,19 @@ pub fn source_channel(head: Option<&str>) -> Channel {
 /// Live probe for `product`. Consumers cache [`classify`], not this.
 pub fn gather(product: Product, version: &str) -> Probe {
     let home = std::env::var_os("HOME").map(PathBuf::from);
+    let exe = std::env::current_exe().unwrap_or_default();
+    let head = if exe.starts_with(STEAMOS_SYSTEM_COPY) {
+        Some(Path::new(STEAMOS_SYSTEM_COPY).join("source-head"))
+    } else {
+        home.as_ref()
+            .map(|h| h.join(SOURCE_CHECKOUT).join(".git/HEAD"))
+    };
     Probe {
         windows: cfg!(target_os = "windows"),
-        exe: std::env::current_exe().unwrap_or_default(),
-        source_head: home
-            .as_ref()
+        source_head: head
             .filter(|_| product == Product::Host)
-            .and_then(|h| std::fs::read_to_string(h.join(SOURCE_CHECKOUT).join(".git/HEAD")).ok()),
+            .and_then(|h| std::fs::read_to_string(h).ok()),
+        exe,
         home,
         // FLATPAK_ID can be missing after a portal spawn; `/.flatpak-info` still exists.
         flatpak: product == Product::Client
@@ -140,8 +150,8 @@ pub fn gather(product: Product, version: &str) -> Probe {
 }
 
 /// Order matters; each rung is a fact the caller cannot forge.
-/// flatpak > sysext > Nix store > cargo `target/` > user-owned Deck build >
-/// package marker (rpm-ostree when ostree-booted) > `source`.
+/// flatpak > sysext > Nix store > cargo `target/` > a Deck build's system copy > user-owned
+/// Deck build > package marker (rpm-ostree when ostree-booted) > `source`.
 pub fn classify(p: &Probe, product: Product) -> (InstallKind, Channel) {
     if p.windows {
         // Only the installer is a Windows delivery. A cargo build is not under
@@ -185,6 +195,13 @@ pub fn classify(p: &Probe, product: Product) -> (InstallKind, Channel) {
     let exe_str = p.exe.to_string_lossy().to_string();
     if exe_str.contains("/target/") {
         return (InstallKind::Source, Channel::Stable);
+    }
+    // The door and seats of a Deck build run its copy as users with another home.
+    if product == Product::Host && p.exe.starts_with(STEAMOS_SYSTEM_COPY) {
+        return (
+            InstallKind::SteamosSource,
+            source_channel(p.source_head.as_deref()),
+        );
     }
     if let Some(home) = &p.home {
         if p.exe.starts_with(home) {
@@ -343,6 +360,25 @@ mod tests {
                 "{head:?}"
             );
         }
+    }
+
+    /// The door runs as `punktfunk`, whose home is not the owner's; the copy's own stamp of the
+    /// checkout's branch is its channel.
+    #[test]
+    fn a_deck_builds_system_copy_is_still_the_deck_build() {
+        let mut p = host_probe();
+        p.exe = PathBuf::from("/opt/punktfunk/host/punktfunk-host");
+        p.home = Some(PathBuf::from("/var/lib/punktfunk"));
+        p.source_head = Some("ref: refs/heads/stable\n".into());
+        assert_eq!(
+            classify(&p, Product::Host),
+            (InstallKind::SteamosSource, Channel::Stable)
+        );
+        p.source_head = None;
+        assert_eq!(
+            classify(&p, Product::Host),
+            (InstallKind::SteamosSource, Channel::Canary)
+        );
     }
 
     #[test]

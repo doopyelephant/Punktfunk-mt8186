@@ -51,10 +51,10 @@ log "Rebuilding host (release)"
 # nvenc,vulkan-encode matches the packaged builds (deb/arch) — see install.sh.
 # punktfunk-encode-worker rides along: host and worker version-check each other over their socket
 # and fall back to the in-process encoder on any mismatch, so an update must never move one
-# without the other.
+# without the other. punktfunk-seats is the door's supervisor (door.sh).
 distrobox enter "$BOX" -- bash -lc "set -e
 export PATH=\$HOME/.cargo/bin:\$PATH CARGO_TARGET_DIR='$TARGET_DIR' PUNKTFUNK_BUILD_VERSION='$PF_BUILD_VERSION'
-cd '$SRC' && cargo build -r -p punktfunk-host -p punktfunk-encode-worker --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode"
+cd '$SRC' && cargo build -r -p punktfunk-host -p punktfunk-encode-worker -p punktfunk-seats --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode"
 MISSING="$({ ldd "$BIN" 2>/dev/null || true; } | awk '/not found/ {print $1}' | sort -u | tr '\n' ' ')"
 [ -z "$MISSING" ] || die "the host rebuilt, but SteamOS still cannot load it. Missing: $MISSING
      Another rebuild will not help, and the services were left as they are. Report it:
@@ -166,10 +166,12 @@ elif [ -t 0 ]; then
 fi
 if [ "$SUDO_OK" = 1 ]; then
     apply_system_tuning
+    [ "$WEB" = 0 ] || door_install
 else
     warn "no usable sudo — SKIPPED gamepad/udev/vhci/UDP tuning (all root-only; no user-space alternative)."
     warn "A stock SteamOS 'deck' account has NO password — set one with 'passwd', then re-run. Gamepads stay"
     warn "Xbox-360 until this runs and you reboot."
+    door_refresh
 fi
 echo
 warn "If the controller still shows as an Xbox 360 pad, REBOOT the Deck once — the 'input' group and the"
@@ -197,8 +199,9 @@ case "$EXEC" in *" --gamestream"*)
 esac
 if [ -n "$EXEC" ]; then
     write_host_unit "$EXEC"
-    systemctl --user daemon-reload
 fi
+door_yield_web_unit
+systemctl --user daemon-reload
 
 log "Restarting services"
 # --no-block: when this script runs INSIDE punktfunk-rebuild-check.service (ordered

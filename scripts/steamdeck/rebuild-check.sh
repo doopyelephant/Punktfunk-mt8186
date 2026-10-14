@@ -10,7 +10,8 @@
 #     all live under /home, which SteamOS updates never touch — so the rebuild is warm.
 #
 # Root is NOT needed: the /etc system tuning survives updates via the atomic-update keep list
-# (see punktfunk-atomic-keep.conf); only the binary has to chase the OS libraries.
+# (see punktfunk-atomic-keep.conf); only the binary has to chase the OS libraries. The copy the
+# door and seats run is the owner's, so update.sh refreshes it too (door.sh).
 set -euo pipefail
 
 # systemd user units get a minimal PATH — distrobox commonly lives in ~/.local/bin.
@@ -39,6 +40,12 @@ if [ -n "$GS_BIN" ]; then
         echo "punktfunk-gamescope no longer loads after a SteamOS update — rebuilding it" >&2
         NEED=1
     fi
+fi
+
+# The door's supervisor links only glibc, so this should never fire. A rebuild can't replace it
+# without sudo, so it only says so.
+if [ -x "$PF_OPT/libexec/punktfunk-seats" ] && ldd "$PF_OPT/libexec/punktfunk-seats" 2>/dev/null | grep -q "not found"; then
+    echo "the seat supervisor no longer loads: run bash $SRC/scripts/steamdeck/update.sh in Konsole with your password" >&2
 fi
 
 [ "$NEED" = 0 ] && exit 0 # everything resolves — nothing to do (every normal boot)

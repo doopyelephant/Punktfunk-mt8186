@@ -44,6 +44,7 @@ serving HTTPS (HTTP/1.1 over TLS) with the host's identity cert), so its service
 | `install.sh` | Idempotent installer: ensure the `pf2` distrobox + toolchain → build host + web + **plugin runner** → write config → build the **HDR gamescope** below → tune sysctl + udev + `vhci-hcd` + `input` group and **register it on SteamOS's atomic-update keep list** (sudo) → install + start `punktfunk-host` / `punktfunk-web` systemd **user** services with linger, plus the **rebuild check** below. |
 | `update.sh` | Rebuild everything from the current source and restart the services (config + pairings persist). `--pull` does `git pull` first, on the branch the checkout follows: `stable` (releases, the default) or `main` (canary). Also retrofits anything a newer install.sh writes (runner, HDR gamescope, keep-list registration, rebuild check) onto older installs, and re-applies the system tuning and the host unit from the checkout. |
 | `lib.sh` | Sourced by `install.sh`, `update.sh` and `rebuild-check.sh`: the build paths, the log helpers, `apply_system_tuning` (the repo's `/etc` files, groups and capabilities, every run) and `write_host_unit`. |
+| `door.sh` | Sourced by `lib.sh`: **Reachable without logging in**. `door_install` (sudo, every `install.sh` and `update.sh` that has it) lays out the files the `punktfunk-seats` package ships; `door_refresh` (no sudo) copies a same-version rebuild into the door's copy of the host and console. |
 | `build-version.sh` | The version a build reports: a release tag's `X.Y.Z`, else the canary base (`scripts/ci/pf-version.sh`) plus the commit, so the console and the channel's feed agree. |
 | `heal-box.sh` | Run by `install.sh` and `update.sh` before they enter the box: if its `fuse-overlayfs` helper died, podman reuses the dead mount on every start (`transport endpoint is not connected`). This detaches it so the next start remounts. A no-op on a healthy box. |
 | `install-tray.sh` | Run by `install.sh` and `update.sh`: build the status tray (`punktfunk-tray`) in its own cargo run and install it user-scoped. The host writes its autostart entry, so it shows in the Desktop-mode panel from the next login. Best-effort: a failure warns and the host runs without it. |
@@ -107,6 +108,14 @@ default `pf2`), `PUNKTFUNK_MGMT_PORT` (47990), `PUNKTFUNK_WEB_PORT` (47992).
   Plus `/etc/atomic-update.conf.d/punktfunk.conf`, which registers the four files on
   SteamOS's atomic-update keep list so A/B OS updates carry them over (verified: without it an
   update silently strips them — pads degrade to Xbox 360, buffers drop to 208 KB).
+
+- **Reachable without logging in (sudo, with the web console):** the seat supervisor and the
+  door's helpers under `/opt/punktfunk/libexec` (root's), the host and console the door and seats
+  run in `/opt/punktfunk/host` (yours, so a rebuild refreshes it), their units in
+  `/etc/systemd/system`, the polkit, udev and tmpfiles files in `/etc`, and `/var/lib/punktfunk`
+  and `/var/lib/punktfunk-seats` bind-mounted from `/home/.steamos/offload/var/lib`: the var
+  partition is 256 MB and holds every seat's home. `$USER` joins `punktfunk-update`, the group
+  that may start the switch. Off until it's ticked under **Profiles**.
 
 ## Operating
 

@@ -76,6 +76,32 @@ give() {
     as_door cat -- "$BOX/$1" | as_user sh -c 'umask 077; mkdir -p "$(dirname "$1")"; cat >"$1.tmp" && mv -f "$1.tmp" "$1"' sh "$OWN/$1"
 }
 
+# SteamOS keeps the console's password in web.env, beside its session secret and bind. There the
+# door takes the password line alone, and hands it back into that file.
+PASSWORD_LINE='^[[:space:]]*PUNKTFUNK_UI_PASSWORD(_HASH)?='
+steamos_password() { as_user test -f "$OWN/web.env" && ! as_user test -f "$OWN/web-password"; }
+
+take_password() {
+    steamos_password || return 0
+    tmp=$(mktemp "$BOX/.door.XXXXXX")
+    as_user cat -- "$OWN/web.env" | grep -E "$PASSWORD_LINE" >"$tmp" || true
+    chown punktfunk:punktfunk "$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$BOX/web-password"
+}
+
+give_password() {
+    if ! steamos_password; then
+        give web-password
+        return 0
+    fi
+    line=$(as_door cat -- "$BOX/web-password" 2>/dev/null | grep -E "$PASSWORD_LINE" | tail -n1)
+    [ -n "$line" ] || return 0
+    # shellcheck disable=SC2016 # the inner shell expands its own arguments
+    as_user sh -c 'umask 077; { grep -vE "$3" "$1" || true; } >"$1.tmp" && printf "%s\n" "$2" >>"$1.tmp" && mv -f "$1.tmp" "$1"' \
+        sh "$OWN/web.env" "$line" "$PASSWORD_LINE"
+}
+
 safe_name() {
     case $1 in '' | . | .. | *[!A-Za-z0-9._-]*) return 1 ;; esac
 }
@@ -113,6 +139,7 @@ door_on() {
     usermod -aG punktfunk-games "$user"
     if [ ! -e "$MARK" ]; then
         for f in $FILES; do take "$f"; done
+        take_password
         take_avatars
         : >"$MARK"
     fi
@@ -140,7 +167,8 @@ owner_row() {
 door_off() {
     systemctl stop punktfunk-web-door.service punktfunk-door.service || true
     if [ -e "$MARK" ]; then
-        for f in $FILES; do give "$f"; done
+        for f in $FILES; do [ "$f" = web-password ] || give "$f"; done
+        give_password
         give_avatars
     fi
     if systemctl is-active --quiet punktfunk-seats.service; then

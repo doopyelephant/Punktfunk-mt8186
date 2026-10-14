@@ -139,10 +139,11 @@ PF_BUILD_VERSION="$(bash "$SRC/scripts/steamdeck/build-version.sh" "$SRC")"
 # SEPARATE binary that lands next to the host in $TARGET_DIR/release (which is how the host finds
 # it — sibling of /proc/self/exe). The sudo block further down setcaps that one and only that one;
 # the host must stay capability-free or KWin cannot identify it and Desktop mode dies.
+# punktfunk-seats is the seat supervisor behind Reachable without logging in (door.sh).
 distrobox enter "$BOX" -- bash -lc "
 set -e
 export PATH=\$HOME/.cargo/bin:\$PATH CARGO_TARGET_DIR='$TARGET_DIR' PUNKTFUNK_BUILD_VERSION='$PF_BUILD_VERSION'
-cd '$SRC' && cargo build -r -p punktfunk-host -p punktfunk-encode-worker --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode
+cd '$SRC' && cargo build -r -p punktfunk-host -p punktfunk-encode-worker -p punktfunk-seats --features punktfunk-host/nvenc,punktfunk-host/vulkan-encode
 "
 [ -x "$BIN" ] || die "build did not produce $BIN"
 # ldd out here on SteamOS, never inside the box, where every soname resolves by construction. The
@@ -324,6 +325,7 @@ log "System tuning (UDP buffers + gamepad rules + vhci-hcd + input/punktfunk gro
 # skip here (no password / no TTY) was already reported loudly there.
 if [ "$SUDO_OK" = 1 ]; then
     apply_system_tuning
+    [ "$WITH_WEB" = 0 ] || door_install
 else
     warn "no usable sudo — SKIPPED system tuning. Gamepad passthrough + clean streaming need root (udev"
     warn "rule, 'input' + 'punktfunk' groups, vhci-hcd, UDP buffers) — there is no user-space way to do these."
@@ -379,6 +381,7 @@ RestartSec=3
 [Install]
 WantedBy=default.target
 EOF
+    door_yield_web_unit
     ok "punktfunk-web.service (port $WEB_PORT)"
 fi
 
