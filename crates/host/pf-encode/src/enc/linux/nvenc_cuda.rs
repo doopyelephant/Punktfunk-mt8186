@@ -1296,8 +1296,9 @@ impl NvencCudaEncoder {
     }
 
     /// CPU pixels into a reused pitched device buffer: BGRA-order 32-bit as is, RGBA-order
-    /// swizzled, 24-bit repacked, NV12 as two planes. Synchronous, so the buffer is free
-    /// again on return.
+    /// swizzled, 24-bit repacked, NV12 as two planes. Synchronous on this thread's copy stream,
+    /// behind the previous frame's queued slot copy out of the same buffer, so the reuse never
+    /// overwrites a copy in flight. Moving either copy to another stream breaks that.
     fn upload_cpu(
         &mut self,
         captured: &CapturedFrame,
