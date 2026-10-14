@@ -230,9 +230,10 @@ final class SessionModel: ObservableObject {
     let clientQueue = LatencyMeter()
     /// Its p50 over the last window, for `hudFacts`.
     private var queueP50Ms: Double?
-    private var statsTimer: Timer?
-    private var audio: SessionAudio?
-    private var gamepadCapture: GamepadCapture?
+    /// Everything this session started. `disconnect` stops it in reverse start order.
+    private let resources = SessionResources()
+    private var audio: SessionAudio? { resources.part() }
+    private var gamepadCapture: GamepadCapture? { resources.part() }
     /// The in-stream ring's pad path (design/touch-client-overlay.md §2.6), forwarded from the
     /// capture so the view can wire them once per session. The chord carries the pad's wire
     /// index; a remote's Back and a captured Steam Controller carry none.
@@ -275,7 +276,7 @@ final class SessionModel: ObservableObject {
     /// controller arrive and, on hide, one leave (§9). Never toggled by the ring's own open and
     /// close (§8 trap 4).
     @Published private(set) var virtualPadShown = false
-    private(set) var virtualPad: VirtualPadWire?
+    var virtualPad: VirtualPadWire? { resources.part() }
 
     /// Whether the pad's input can reach the host at all: the forwarding setting and the
     /// session's controller grant, the two gates a real pad's sends have.
@@ -286,27 +287,24 @@ final class SessionModel: ObservableObject {
     func toggleVirtualPad() {
         if let pad = virtualPad {
             pad.close()
-            virtualPad = nil
+            resources.remove(pad)
             virtualPadShown = false
             return
         }
         guard let conn = connection, let pad = VirtualPadWire(connection: conn, manager: .shared) else { return }
         // Toggled from the ring, so the ring is up: the pad starts masked and unmasks on close.
         pad.masked = gamepadCapture?.ringOpen ?? false
-        virtualPad = pad
+        // Started last, so it closes first: its pad leaves the wire before any capture stops.
+        resources.add(pad, stop: pad.close)
         virtualPadShown = true
     }
-    private var gamepadFeedback: GamepadFeedback?
     /// The live session's Steam Controller 2 as-is passthrough (`settings.sc2Capture` &&
-    /// `settings.gamepadForwarding`) — built beside GamepadCapture/GamepadFeedback in
-    /// `beginStreaming`, torn down in `disconnect` in the Android order (unhook the hidRaw
-    /// sink → feedback stops → capture stops, which also frees its wire index).
-    private var sc2Capture: Sc2Capture?
+    /// `settings.gamepadForwarding`), started in `beginStreaming`.
+    private var sc2Capture: Sc2Capture? { resources.part() }
     #if !os(tvOS)
-    /// The live session's clipboard bridge (design/clipboard-and-file-transfer.md §5) — created
-    /// by `beginStreaming` when the per-host toggle is on and the host advertises
-    /// `HOST_CAP_CLIPBOARD`; stopped (off-main, drain joined) in `disconnect`.
-    private var clipboardSync: ClipboardSync?
+    /// The live session's clipboard bridge (design/clipboard-and-file-transfer.md §5), when the
+    /// per-host toggle is on and the host advertises `HOST_CAP_CLIPBOARD`.
+    private var clipboardSync: ClipboardSync? { resources.part() }
     #endif
     /// Whether clipboard sync is live (host-acked `ClipState.enabled`) — drives the Stream menu
     /// item's title and the settings footnote. Always false on tvOS, which has no pasteboard.
@@ -318,7 +316,7 @@ final class SessionModel: ObservableObject {
     /// Siri Remote → host pointer while streaming (touch surface moves, press = left click,
     /// Play/Pause = right click) + the remote's deliberate exit (hold Back ≥ 1 s). See
     /// SiriRemotePointer — same trust gate/lifecycle as the gamepad capture above.
-    private var remotePointer: SiriRemotePointer?
+    private var remotePointer: SiriRemotePointer? { resources.part() }
     #endif
 
     var isBusy: Bool { phase != .idle }
@@ -328,10 +326,8 @@ final class SessionModel: ObservableObject {
     /// and is cleared on foreground or teardown. iOS/iPadOS only in practice.
     @Published private(set) var isBackgrounded = false
     /// When the backgrounded keep-alive will auto-disconnect (nil unless backgrounded) — drives the
-    /// Live Activity countdown. Set alongside `backgroundTimer`.
+    /// Live Activity countdown. Set alongside the background timer.
     @Published private(set) var backgroundDeadline: Date?
-    /// Bounded auto-disconnect for a backgrounded keep-alive session. Fires on `.main`.
-    private var backgroundTimer: DispatchSourceTimer?
 
     /// Holds off display sleep (and, on macOS, the screen saver) for the life of a session —
     /// nothing about watching a stream looks like user activity to the OS, least of all a
@@ -571,9 +567,16 @@ final class SessionModel: ObservableObject {
             // The timer fires on `.main`, so the actor's executor is the main thread here.
             MainActor.assumeIsolated { self?.disconnect(deliberate: false) }
         }
-        backgroundTimer?.cancel()
-        backgroundTimer = timer
+        cancelBackgroundTimer()
+        resources.add(timer, stop: { timer.cancel() })
         timer.resume()
+    }
+
+    /// The keep-alive's auto-disconnect, the one dispatch source a session starts.
+    private func cancelBackgroundTimer() {
+        guard let timer: DispatchSourceTimer = resources.part() else { return }
+        timer.cancel()
+        resources.remove(timer)
     }
 
     /// Return to foreground: cancel the timeout, resume mic + video, and force a clean re-anchor —
@@ -583,8 +586,7 @@ final class SessionModel: ObservableObject {
         guard isBackgrounded else { return }
         isBackgrounded = false
         backgroundDeadline = nil
-        backgroundTimer?.cancel()
-        backgroundTimer = nil
+        cancelBackgroundTimer()
         applyMicMute() // back to the user's own choice — which may well still be "muted"
         if let conn = connection {
             conn.setVideoDropped(false)
@@ -812,86 +814,35 @@ final class SessionModel: ObservableObject {
             let line = "disconnect \(activeHost?.displayName ?? "-") deliberate=\(deliberate) phase=\(phase)"
             sessionLog.info("\(line, privacy: .public)")
         }
-        statsTimer?.invalidate()
-        statsTimer = nil
         // What this host has up is about to change, so the cards must ask again rather than wait
         // out the cache's TTL naming the game the user just left.
         if let host = activeHost { NowPlayingStore.shared.invalidate(host) }
-        // No-op when this session never reached `.streaming` (a refused/aborted connect).
-        displaySleepGuard.release()
-        // Drop any armed background keep-alive (incl. the timeout that just fired us).
-        backgroundTimer?.cancel()
-        backgroundTimer = nil
         isBackgrounded = false
         backgroundDeadline = nil
         // The mic mute is per-session and never persisted: the next stream starts live (if the
         // mic is enabled), rather than silently carrying a mute nobody remembers making.
         micMuted = false
-        let audio = self.audio
-        self.audio = nil
-        // The virtual pad's slot goes the same way, while the connection is still up.
-        virtualPad?.close()
-        virtualPad = nil
         virtualPadShown = false
-        // Gamepad capture is main-actor (releases held buttons on the wire while the
-        // connection is still up); the feedback drain joins off-main like audio.
-        gamepadCapture?.stop()
-        gamepadCapture = nil
-        // Android's teardown order: unhook the hidRaw sink first (no raw replay onto a dying
-        // capture), then the capture — its stop sends gamepadRemove and frees the wire index
-        // while the connection is still up. The feedback drain joins off-main below.
-        gamepadFeedback?.setHidRawSink(nil)
-        sc2Capture?.stop()
-        sc2Capture = nil
+        clipboardEnabled = false
+        let conn = connection
+        #if os(macOS)
+        let closing = Self.closing
+        closing.enter()
+        #endif
+        // Every part's main half now, while the connection is up; the joins, then the close,
+        // off-main. A deliberate quit must reach the host before the close.
+        resources.stop {
+            if deliberate { conn?.disconnectQuit() }
+            conn?.close()
+            #if os(macOS)
+            closing.leave()
+            #endif
+        }
         // Every hint, notice and access latch is per-session. After the captures: the SC2
         // capture's `.released` edge never lands once it is deallocated, so the reset drops
         // its badge, and no pending clear fires into the next stream.
         notices.cancelTimers()
         notices = SessionNotices()
-        #if os(tvOS)
-        remotePointer?.stop() // releases any held click while the connection is still up
-        remotePointer = nil
-        #endif
-        let feedback = gamepadFeedback
-        gamepadFeedback = nil
-        #if !os(tvOS)
-        let clipboard = clipboardSync
-        clipboardSync = nil
-        #endif
-        clipboardEnabled = false
-        if let conn = connection {
-            #if os(macOS)
-            let closing = Self.closing
-            closing.enter()
-            #endif
-            // Drain-thread teardown waits the pullers out and close() waits out in-flight
-            // polls + joins the Rust worker threads — keep all of it off the main actor,
-            // in this order (no poll left on any plane when the handle is freed).
-            Task.detached {
-                #if os(macOS)
-                defer { closing.leave() }
-                #endif
-                audio?.stop()
-                feedback?.stop()
-                #if !os(tvOS)
-                // Disables sync on the wire while the connection is still up — and on iOS pulls a
-                // host offer the user has not pasted yet down to real bytes, which needs that
-                // connection, so it must stay ahead of the close below.
-                clipboard?.stop()
-                #endif
-                // Deliberate user quit → tell the host to skip the keep-alive linger (must precede close).
-                if deliberate { conn.disconnectQuit() }
-                conn.close()
-            }
-        } else {
-            Task.detached {
-                audio?.stop()
-                feedback?.stop()
-                #if !os(tvOS)
-                clipboard?.stop()
-                #endif
-            }
-        }
         connection = nil
         activeHost = nil
         // A user-ended stream that STARTED on a shelf goes back to it — the same rule a game
@@ -1088,6 +1039,14 @@ final class SessionModel: ObservableObject {
         }
     }
 
+    /// Start what a trusted session runs: audio and the pads wait for the trust decision, so no
+    /// host sound, mic uplink or forwarded pad comes before it.
+    ///
+    /// `resources` stops the parts newest first, so they start here in the reverse of the
+    /// teardown order. On main, while the connection is up: `GamepadCapture` before
+    /// `Sc2Capture`, whose claim release would otherwise re-forward the SC2's twin onto a live
+    /// capture; then the remote pointer. Off-main: audio, the feedback drain, then the
+    /// clipboard, which still needs the connection, then the close.
     private func beginStreaming() {
         guard let conn = connection else { return }
         // Input capture itself is owned by StreamView (engaged by the captureEnabled
@@ -1096,11 +1055,21 @@ final class SessionModel: ObservableObject {
         watchLaunch()
         refreshStreamedGame()
         displaySleepGuard.acquire()
+        resources.add(displaySleepGuard, stop: displaySleepGuard.release)
         noteStreamStart()
-        // Audio starts with streaming, not during the trust prompt — no host sound (or
-        // mic uplink!) before the user trusted the host. Devices and the mic switch come from the
-        // session's resolved settings ("" = system default), so a preset that turns the mic on
-        // for work calls applies to the uplink too.
+        #if !os(tvOS)
+        // Opt-in per host, advertised by the host, and granted to this device (per-client access
+        // §5): the host would refuse an ungranted ask anyway, and not asking keeps the UI honest.
+        if activeHost?.clipboardSync == true, conn.hostSupportsClipboard, conn.canUseClipboard {
+            startClipboardSync(conn)
+        }
+        #endif
+        // The host's rumble, lightbar, player LEDs and triggers, back onto the pad each names.
+        let feedback = GamepadFeedback(connection: conn, manager: .shared)
+        feedback.start()
+        resources.add(feedback, join: { feedback.stop() })
+        // Devices and the mic switch come from the session's resolved settings ("" = system
+        // default), so a preset that turns the mic on applies to the uplink too.
         let audio = SessionAudio(connection: conn)
         audio.start(
             speakerUID: settings.speakerUID,
@@ -1110,28 +1079,40 @@ final class SessionModel: ObservableObject {
             // uplink at all — a capture the host would only drop is pure privacy downside.
             micEnabled: settings.micEnabled && conn.canUseMic,
             echoCancel: settings.echoCancel,
-            // The A/V sync reference: `endToEnd` is capture→on-glass, the one figure that says
-            // where the picture actually IS, and the audio ring steers its depth to land with it.
-            // The same meter object the presenter writes per presented frame, so audio reads the
-            // video plane's own measurement rather than a second estimate of it — and under the
-            // stage-1 fallback presenter, which stamps nothing, it stays empty and the loop
-            // correctly declines to correct.
+            // The A/V sync reference: the presenter's own capture→on-glass meter. The stage-1
+            // fallback stamps nothing, so the loop then declines to correct.
             videoLatency: endToEnd)
-        self.audio = audio
-        // Gamepads: forward every controller GamepadManager selected — each on its own wire pad
-        // index (a pin forwards only one, Automatic forwards all) — and render the host's feedback
-        // back to the pad it's addressed to (rumble always; lightbar/player-LEDs/adaptive-triggers
-        // when a pad's virtual device is a DualSense). Same trust gate as audio — nothing is
-        // forwarded during the trust prompt.
-        // `gamepadForwarding` off means the host gets this device's pads from somewhere else
-        // (USB passthrough, or a pad plugged into the host) — capture still runs, and still
-        // watches for the escape chord, but puts nothing on the wire.
-        // System-button routing: whether raw guide/share presses ride the wire, and whether
-        // hold-Select arms as the alternate guide route (auto = on everywhere but macOS —
-        // iOS reserves the physical Home press, tvOS never delivers it).
+        resources.add(audio, join: { audio.stop() })
+        #if os(tvOS)
+        let pointer = SiriRemotePointer(connection: conn)
+        pointer.onDisconnectRequest = { [weak self] in self?.disconnect() }
+        // The remote's short Back is the ring's opener on tvOS — the same hook the pad chord
+        // uses, so the view wires one closure for both.
+        pointer.onShortBack = { [weak self] in self?.onRingChord?(nil) }
+        pointer.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
+        pointer.start()
+        resources.add(pointer, stop: pointer.stop)
+        #endif
+        // Steam Controller 2 as-is passthrough (opt-in, gated like Android and on the controller
+        // grant): its raw reports go to the host, and Steam's writes come back through the
+        // feedback's hidRaw sink. The wire slot is claimed on the first state report.
         if settings.sc2Capture, settings.gamepadForwarding, conn.canSendGamepad {
-            Sc2Capture.holdTwins(manager: .shared)
+            Sc2Capture.holdTwins(manager: .shared) // before GamepadCapture forwards a twin
+            let sc2 = Sc2Capture(connection: conn, manager: .shared)
+            // A captured SC2's raw feed bypasses GC, so it brings its own escape chord.
+            sc2.onDisconnectRequest = { [weak self] in self?.disconnect() }
+            // The ring's pad path, the same two hooks GamepadCapture gets below.
+            sc2.onRingChord = { [weak self] in self?.onRingChord?(nil) }
+            sc2.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
+            // Claim/release → the bottom-stack badge (the capture's only UI surface).
+            sc2.onPhaseChange = { [weak self] phase in self?.noteSc2Phase(phase) }
+            feedback.setHidRawSink(sc2.onHidRaw)
+            sc2.start()
+            // The sink goes first: no raw replay onto a dying capture.
+            resources.add(sc2, stop: { feedback.setHidRawSink(nil); sc2.stop() })
         }
+        // Every controller GamepadManager selected, each on its own wire pad. With forwarding
+        // off the host gets the pads elsewhere: capture still watches for the escape chord.
         let capture = GamepadCapture(
             connection: conn, manager: .shared, forwarding: settings.gamepadForwarding,
             systemForward: settings.systemButtonsForward,
@@ -1145,70 +1126,22 @@ final class SessionModel: ObservableObject {
         capture.onRingChord = { [weak self] pad in self?.onRingChord?(pad) }
         capture.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
         capture.start()
-        gamepadCapture = capture
-        let feedback = GamepadFeedback(connection: conn, manager: .shared)
-        feedback.start()
-        gamepadFeedback = feedback
         capture.onOwnershipChange = { [weak feedback] owned in feedback?.setSilenced(!owned) }
-        // Steam Controller 2 as-is passthrough (opt-in): capture an OS-paired SC2's vendor GATT
-        // service and forward its raw reports — the host mirrors a real 28DE:1302 that its
-        // Steam drives directly, and Steam's rumble/settings writes come back through the
-        // feedback drain's hidRaw sink onto the physical controller. Gated like Android
-        // (StreamScreen's `sc2Capture && gamepadForwarding`); started after GamepadFeedback so
-        // the sink's drain is already up. The wire slot is claimed lazily on the first state
-        // report, so an absent controller costs nothing but the 2 s acquisition poll.
-        // Also grant-gated (per-client access §7, the clipboard's "not asking keeps the UI
-        // honest" rule): in a controller-excluded session the connection would silently drop
-        // the arrival and every report — holding the BLE radio, claiming a wire slot, and
-        // showing a "passing through" badge for a passthrough that cannot happen. A grant
-        // added mid-session engages on the next stream, exactly like the clipboard.
-        if settings.sc2Capture, settings.gamepadForwarding, conn.canSendGamepad {
-            let sc2 = Sc2Capture(connection: conn, manager: .shared)
-            // The same escape-chord contract as GamepadCapture — a captured SC2's raw feed
-            // bypasses GC entirely, so it brings its own way out of the stream.
-            sc2.onDisconnectRequest = { [weak self] in self?.disconnect() }
-            // The ring's pad path, the same two hooks GamepadCapture gets above.
-            sc2.onRingChord = { [weak self] in self?.onRingChord?(nil) }
-            sc2.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
-            // Claim/release → the bottom-stack badge (the capture's only UI surface).
-            sc2.onPhaseChange = { [weak self] phase in self?.noteSc2Phase(phase) }
-            feedback.setHidRawSink(sc2.onHidRaw)
-            sc2.start()
-            sc2Capture = sc2
-        }
-        #if !os(tvOS)
-        // Shared clipboard: opt-in per host AND host-advertised (older hosts / operator-disabled
-        // hosts never see a ClipControl) AND granted to this device (per-client access §5 —
-        // without the bit the host would refuse with CLIP_REASON_NOT_PERMITTED anyway; not
-        // asking keeps the UI honest). Same trust gate as audio — nothing is announced
-        // during the trust prompt.
-        if activeHost?.clipboardSync == true, conn.hostSupportsClipboard, conn.canUseClipboard {
-            startClipboardSync(conn)
-        }
-        #endif
-        #if os(tvOS)
-        let pointer = SiriRemotePointer(connection: conn)
-        pointer.onDisconnectRequest = { [weak self] in self?.disconnect() }
-        // The remote's short Back is the ring's opener on tvOS — the same hook the pad chord
-        // uses, so the view wires one closure for both.
-        pointer.onShortBack = { [weak self] in self?.onRingChord?(nil) }
-        pointer.onRingNav = { [weak self] nav in self?.onRingNav?(nav) }
-        pointer.start()
-        remotePointer = pointer
-        #endif
+        resources.add(capture, stop: capture.stop)
     }
 
     #if !os(tvOS)
     /// Create + start the session's clipboard bridge and route its host acks into the published
     /// UI state. `ClipboardSync.start()` sends the enable; the host's `.state` answer flips
-    /// `clipboardEnabled`, or leaves it false.
+    /// `clipboardEnabled`, or leaves it false. Its stop disables sync on the wire and, on iOS,
+    /// pulls an unpasted host offer down to bytes, so it joins before the connection closes.
     private func startClipboardSync(_ conn: PunktfunkConnection) {
         let sync = ClipboardSync(connection: conn)
         sync.onState = { [weak self] enabled, _, _ in
             Task { @MainActor in self?.clipboardEnabled = enabled }
         }
         sync.start()
-        clipboardSync = sync
+        resources.add(sync, join: { sync.stop() })
     }
     #endif
 
@@ -1219,7 +1152,7 @@ final class SessionModel: ObservableObject {
         #if !os(tvOS)
         guard let conn = connection, phase == .streaming else { return }
         if let sync = clipboardSync {
-            clipboardSync = nil
+            resources.remove(sync)
             clipboardEnabled = false
             Task.detached { sync.stop() }
         } else if conn.hostSupportsClipboard, conn.canUseClipboard {
@@ -1274,7 +1207,7 @@ final class SessionModel: ObservableObject {
         }
         // .common so the HUD keeps updating during window drags / menu tracking.
         RunLoop.main.add(timer, forMode: .common)
-        statsTimer = timer
+        resources.add(timer, stop: timer.invalidate)
     }
 
     /// Re-format the overlay from the last drained window: each second, and at once on a tier
