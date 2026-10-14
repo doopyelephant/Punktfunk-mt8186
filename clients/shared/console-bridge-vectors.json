@@ -1,5 +1,5 @@
 {
-  "$comment": "The console bridge's JSON (pf-console-ui bridge.rs), pinned by pf-console-ui bridge::tests, the Kotlin ConsoleBridgeVectorTest and the Swift ConsoleJSONTests. Hand-written: this file is the contract, not what serde emits today. A new ConsoleCmd variant or pushed shape adds a sample here.",
+  "$comment": "The console bridge's JSON (pf-console-ui bridge.rs), pinned by pf-console-ui bridge::tests, the Kotlin ConsoleBridgeVectorTest and the Swift ConsoleJSONTests and ConsoleCommandTests. Hand-written: this file is the contract, not what serde emits today. A new ConsoleCmd variant or pushed shape adds a sample here.",
   "commands": [
     {"FetchLibrary": {"addr": "10.0.0.2", "mgmt": 47990, "fp_hex": "ab12", "req": {"host": "ab12", "epoch": 3}}},
     {"RefreshRunning": {"addr": "10.0.0.2", "mgmt": 47990, "fp_hex": "ab12"}},
