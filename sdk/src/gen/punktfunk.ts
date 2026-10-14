@@ -1392,6 +1392,8 @@ export type WakeProfile200 = ProfilePublic
 export const WakeProfile200 = ProfilePublic
 export type WakeProfile401 = ApiError
 export const WakeProfile401 = ApiError
+export type WakeProfile403 = ApiError
+export const WakeProfile403 = ApiError
 export type WakeProfile404 = ApiError
 export const WakeProfile404 = ApiError
 export type StopSession401 = ApiError
@@ -2939,6 +2941,7 @@ export const make = (
       withResponse(options?.config)(HttpClientResponse.matchStatus({
       "2xx": decodeSuccess(WakeProfile200),
       "401": decodeError("WakeProfile401", WakeProfile401),
+      "403": decodeError("WakeProfile403", WakeProfile403),
       "404": decodeError("WakeProfile404", WakeProfile404),
       orElse: unexpectedStatus
     }))
@@ -4257,11 +4260,12 @@ readonly "stopProfileSeat": {
   /**
 * Starts a stopped seat so the next connect lands in it, and answers at once with the seat
 * `starting`; poll `enumerate` until it is `ready`. A light seat starts with its first
-* connect, so on Linux this only answers the row.
+* connect, so on Linux this only answers the row. A paired device wakes the profile it lands
+* in when it names none; any other needs its launch grant.
 */
 readonly "wakeProfile": {
-    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly config: Config }): Effect.Effect<WithOptionalResponse<typeof WakeProfile200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"WakeProfile401", typeof WakeProfile401.Type> | PunktfunkError<"WakeProfile404", typeof WakeProfile404.Type>>;
-    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly config?: Config | undefined } | undefined): Effect.Effect<WithOptionalResponse<typeof WakeProfile200.Type, Config | undefined>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"WakeProfile401", typeof WakeProfile401.Type> | PunktfunkError<"WakeProfile404", typeof WakeProfile404.Type>>;
+    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly config: Config }): Effect.Effect<WithOptionalResponse<typeof WakeProfile200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"WakeProfile401", typeof WakeProfile401.Type> | PunktfunkError<"WakeProfile403", typeof WakeProfile403.Type> | PunktfunkError<"WakeProfile404", typeof WakeProfile404.Type>>;
+    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly config?: Config | undefined } | undefined): Effect.Effect<WithOptionalResponse<typeof WakeProfile200.Type, Config | undefined>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"WakeProfile401", typeof WakeProfile401.Type> | PunktfunkError<"WakeProfile403", typeof WakeProfile403.Type> | PunktfunkError<"WakeProfile404", typeof WakeProfile404.Type>>;
   }
   /**
 * A deliberate stop: skip keep-alive linger and apply `game_on_session_end`.
