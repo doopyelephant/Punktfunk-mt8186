@@ -120,6 +120,17 @@ impl PadKind {
         })
     }
 
+    /// Whether a seat's input report goes to this kind's device. The SC2's captured descriptor
+    /// also declares a mouse (`0x40`) and a keyboard (`0x41`); only its controller ids pass.
+    pub fn takes(self, report: &[u8]) -> bool {
+        match self {
+            PadKind::SteamController2 => report
+                .first()
+                .is_some_and(|&id| pf_driver_proto::triton::input_len(id).is_some()),
+            _ => true,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             PadKind::Xbox360 | PadKind::XboxOne | PadKind::XboxElite2 => {
@@ -471,6 +482,7 @@ pub fn reply(
 
 /// A pad the supervisor built for a seat, ready to [`relay`].
 pub struct BrokeredPad {
+    kind: PadKind,
     dev: Brokered,
 }
 
@@ -496,7 +508,7 @@ pub fn build(kind: PadKind, index: u8, account: &str) -> Result<BrokeredPad> {
         id.phys = seat_phys(account, &own);
         Brokered::Uhid(UhidDevice::open(&id.as_create2())?)
     };
-    Ok(BrokeredPad { dev })
+    Ok(BrokeredPad { kind, dev })
 }
 
 /// `(supervisor end, seat end)` of a fresh relay.
@@ -723,7 +735,7 @@ pub fn kept() -> Kept {
             name,
             kind,
             index,
-            pad: BrokeredPad { dev },
+            pad: BrokeredPad { kind, dev },
             relay: UnixDatagram::from(relay),
         });
     }
@@ -739,9 +751,10 @@ pub fn kept() -> Kept {
 /// Move the seat's events into the pad and the pad's back, until the seat hangs up. Blocks:
 /// one thread per relayed pad. A seat that stops reading loses what it missed, never the pad.
 pub fn relay(pad: BrokeredPad, seat: UnixDatagram) {
+    let kind = pad.kind;
     match pad.dev {
         Brokered::Uinput(dev) => relay_uinput(dev, seat),
-        Brokered::Uhid(dev) => dev.relay(seat),
+        Brokered::Uhid(dev) => dev.relay(seat, |report| kind.takes(report)),
     }
 }
 
@@ -917,6 +930,38 @@ mod tests {
         assert_eq!(parse_usb_store_name("pad/1-0/10/0/x/k"), None);
         assert_eq!(parse_usb_store_name("usb/9/x"), None);
         assert_eq!(parse_usb_store_name("served/9"), None);
+    }
+
+    /// No uhid kind takes a report its own table makes a keyboard, consumer control or pointer
+    /// of, and no table without report ids declares one.
+    #[test]
+    fn no_uhid_kind_takes_a_report_its_table_makes_a_keyboard_or_pointer() {
+        for kind in (0..=255).filter_map(PadKind::from_wire) {
+            let Some(id) = kind.uhid(0) else { continue };
+            for risky in crate::usbip_relay::risky_input_reports(id.rdesc) {
+                let risky =
+                    risky.unwrap_or_else(|| panic!("{} is risky without ids", kind.label()));
+                assert!(
+                    !kind.takes(&[risky, 0, 0]),
+                    "{} takes {risky:#04x}",
+                    kind.label()
+                );
+            }
+        }
+    }
+
+    /// Only the SC2's controller reports reach its device; its keyboard and mouse never do.
+    #[test]
+    fn a_seat_sc2_takes_no_keyboard_or_mouse_report() {
+        let sc2 = PadKind::SteamController2;
+        for id in [0x42, 0x45, 0x43, 0x44, 0x79, 0x7B] {
+            assert!(sc2.takes(&[id, 0, 0]), "{id:#04x}");
+        }
+        for id in [0x40, 0x41, 0x01, 0x80] {
+            assert!(!sc2.takes(&[id, 0, 0]), "{id:#04x}");
+        }
+        assert!(!sc2.takes(&[]), "an empty report");
+        assert!(PadKind::DualSense.takes(&[0x01]));
     }
 
     /// An `Attach` crosses with its socket; the answer carries the port.
