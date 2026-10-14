@@ -433,6 +433,8 @@ struct InFlight {
 pub struct PyroWaveEncoder {
     _entry: ash::Entry,
     instance: ash::Instance,
+    /// The physical device `device` was created on.
+    pd: vk::PhysicalDevice,
     device: ash::Device,
     ext_fd: ash::khr::external_memory_fd::Device,
     queue: vk::Queue,
@@ -1086,6 +1088,7 @@ impl PyroWaveEncoder {
         let mut me = Self {
             _entry: entry,
             instance,
+            pd,
             device,
             ext_fd,
             queue,
@@ -1375,7 +1378,16 @@ impl PyroWaveEncoder {
             &self.device,
             key,
             (cw, ch),
-            || match import_rgb_dmabuf(&self.device, &self.ext_fd, &self.mem_props, d, cw, ch) {
+            || match import_rgb_dmabuf(
+                &self.instance,
+                self.pd,
+                &self.device,
+                &self.ext_fd,
+                &self.mem_props,
+                d,
+                cw,
+                ch,
+            ) {
                 Ok(t) => {
                     d.health.note_raw_import_ok();
                     Ok(t)

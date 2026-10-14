@@ -78,6 +78,8 @@ mod convert;
 pub struct VkBridge {
     _entry: ash::Entry,
     instance: ash::Instance,
+    /// The physical device `device` was created on.
+    phys: vk::PhysicalDevice,
     device: ash::Device,
     ext_fd: ash::khr::external_memory_fd::Device,
     queue: vk::Queue,
@@ -139,7 +141,7 @@ impl VkBridge {
             ),
             None => {}
         }
-        let (instance, device, qf) = (nv.instance, nv.device, nv.queue_family);
+        let (instance, device, qf, phys) = (nv.instance, nv.device, nv.queue_family, nv.phys);
         // SAFETY: `instance` and `device` are the live handles just opened; ash cannot check
         // create infos, so every one below is a local that outlives its synchronous call.
         unsafe {
@@ -150,6 +152,7 @@ impl VkBridge {
             let mut me = VkBridge {
                 _entry: nv.entry,
                 instance,
+                phys,
                 device,
                 ext_fd,
                 queue,

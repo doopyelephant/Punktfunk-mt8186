@@ -564,6 +564,8 @@ impl VkBridge {
             // the import dups it and keeps no borrow.
             let fd = BorrowedFd::borrow_raw(s.fd);
             let (image, memory) = vkdev::import_dmabuf_image(
+                &self.instance,
+                self.phys,
                 &self.device,
                 &self.ext_fd,
                 &self.mem_props,

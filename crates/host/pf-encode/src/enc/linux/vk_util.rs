@@ -450,7 +450,10 @@ impl ImportCache {
 }
 
 /// Caller destroys all three returned handles.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn import_rgb_dmabuf(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
     device: &ash::Device,
     ext_fd: &ash::khr::external_memory_fd::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -459,6 +462,8 @@ pub(crate) unsafe fn import_rgb_dmabuf(
     ch: u32,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
     import_rgb_dmabuf_as(
+        instance,
+        pd,
         device,
         ext_fd,
         mem_props,
@@ -475,6 +480,8 @@ pub(crate) unsafe fn import_rgb_dmabuf(
 /// from plane-1, else shared-stride contiguous planes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn import_rgb_dmabuf_as(
+    instance: &ash::Instance,
+    pd: vk::PhysicalDevice,
     device: &ash::Device,
     ext_fd: &ash::khr::external_memory_fd::Device,
     mem_props: &vk::PhysicalDeviceMemoryProperties,
@@ -512,6 +519,8 @@ pub(crate) unsafe fn import_rgb_dmabuf_as(
             .row_pitch(d.stride as u64)]
     };
     let (img, mem) = pf_zerocopy::vkdev::import_dmabuf_image(
+        instance,
+        pd,
         device,
         ext_fd,
         mem_props,

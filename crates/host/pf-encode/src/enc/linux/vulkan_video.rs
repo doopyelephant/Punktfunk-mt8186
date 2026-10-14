@@ -443,9 +443,7 @@ unsafe fn one_plane_modifiers(
         .collect()
 }
 
-/// Whether `pd` accepts a dmabuf import of `fmt` tiled as `modifier` with `usage` —
-/// and, when `profile` is given, under that video profile. IMPORTABLE on the
-/// external properties is the whole answer.
+/// [`pf_zerocopy::vkdev::modifier_importable`] under the single video `profile`, when given.
 ///
 /// # Safety
 /// `instance`/`pd` must be live and paired; `profile` must be a fully-wired profile.
@@ -457,34 +455,9 @@ unsafe fn modifier_importable(
     usage: vk::ImageUsageFlags,
     profile: Option<&vk::VideoProfileInfoKHR>,
 ) -> bool {
-    let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
-        .drm_format_modifier(modifier)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
-        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-    let profile_arr = profile.map(|p| [*p]);
-    let mut plist = vk::VideoProfileListInfoKHR::default();
-    let mut info = vk::PhysicalDeviceImageFormatInfo2::default()
-        .format(fmt)
-        .ty(vk::ImageType::TYPE_2D)
-        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-        .usage(usage)
-        .flags(vk::ImageCreateFlags::empty())
-        .push_next(&mut modifier_info)
-        .push_next(&mut external);
-    if let Some(profiles) = &profile_arr {
-        plist = plist.profiles(profiles);
-        info = info.push_next(&mut plist);
-    }
-    let mut ext_props = vk::ExternalImageFormatProperties::default();
-    let mut props = vk::ImageFormatProperties2::default().push_next(&mut ext_props);
-    instance
-        .get_physical_device_image_format_properties2(pd, &info, &mut props)
-        .is_ok()
-        && ext_props
-            .external_memory_properties
-            .external_memory_features
-            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+    let list =
+        profile.map(|p| vk::VideoProfileListInfoKHR::default().profiles(std::slice::from_ref(p)));
+    pf_zerocopy::vkdev::modifier_importable(instance, pd, fmt, modifier, usage, list.as_ref())
 }
 
 /// DRM modifiers the encode device accepts for a `fourcc` capture dmabuf in every
@@ -740,6 +713,8 @@ struct OpenSpec {
 pub struct VulkanVideoEncoder {
     _entry: ash::Entry,
     instance: ash::Instance,
+    /// The physical device `device` was created on.
+    pd: vk::PhysicalDevice,
     device: ash::Device,
     ext_fd: ash::khr::external_memory_fd::Device,
     vq_dev: ash::khr::video_queue::Device,
@@ -1688,6 +1663,7 @@ impl VulkanVideoEncoder {
         Ok(Self {
             _entry: entry,
             instance,
+            pd,
             device,
             ext_fd,
             vq_dev,
@@ -1777,6 +1753,8 @@ impl VulkanVideoEncoder {
             let arr = [profile];
             let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
             return super::vk_util::import_rgb_dmabuf_as(
+                &self.instance,
+                self.pd,
                 &self.device,
                 &self.ext_fd,
                 &self.mem_props,
@@ -1790,6 +1768,8 @@ impl VulkanVideoEncoder {
         if self.rgb.as_ref().is_some_and(|r| r.padded) {
             // Padded-copy: import is only a transfer source for the blit — no video profile.
             super::vk_util::import_rgb_dmabuf_as(
+                &self.instance,
+                self.pd,
                 &self.device,
                 &self.ext_fd,
                 &self.mem_props,
@@ -1809,6 +1789,8 @@ impl VulkanVideoEncoder {
             let arr = [profile];
             let mut plist = vk::VideoProfileListInfoKHR::default().profiles(&arr);
             super::vk_util::import_rgb_dmabuf_as(
+                &self.instance,
+                self.pd,
                 &self.device,
                 &self.ext_fd,
                 &self.mem_props,
@@ -1820,6 +1802,8 @@ impl VulkanVideoEncoder {
             )
         } else {
             super::vk_util::import_rgb_dmabuf(
+                &self.instance,
+                self.pd,
                 &self.device,
                 &self.ext_fd,
                 &self.mem_props,
