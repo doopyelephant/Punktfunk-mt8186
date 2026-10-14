@@ -504,10 +504,11 @@ impl State {
         }
     }
 
-    /// A stop or a lost keeper, then the session, then the limit. A stop reads as a lost
-    /// keeper here.
+    /// A stop, a lost keeper, then the session, then the limit.
     fn signing_in(&mut self, probe: Probe, late: bool) -> Vec<Action> {
-        if self.stopping() || probe.keeper.is_some() {
+        if self.stopping() {
+            self.end(None)
+        } else if probe.keeper.is_some() {
             self.fail(
                 "rdp_keeper_exited",
                 "RDP keeper exited before its WTS session became active",
@@ -538,26 +539,31 @@ impl State {
         }
     }
 
-    /// The gate's exit first. A stop, a lost keeper and the limit all read as a gate out of
-    /// time, which no new cycle follows.
+    /// The gate's exit first, then a stop, a lost keeper, then the limit. Only the gate's
+    /// exit or its limit is the gate's verdict.
     fn gating(&mut self, probe: Probe, late: bool) -> Vec<Action> {
-        match probe.gate {
-            Some(0) => {
+        match (probe.gate, probe.keeper) {
+            (Some(0), _) => {
                 self.phase = Phase::Collecting;
                 vec![Action::CollectGate]
             }
-            Some(code) => self.fail(
+            (Some(code), _) => self.fail(
                 "quality_failed",
                 format!("same-session virtual-display quality gate exited with code {code}"),
             ),
-            None if self.stopping() || probe.keeper.is_some() || late => self.fail(
+            (None, _) if self.stopping() => self.end(None),
+            (None, Some(code)) => self.fail(
+                "rdp_keeper_exited",
+                format!("RDP keeper exited with code {code} during the display check"),
+            ),
+            (None, None) if late => self.fail(
                 "quality_timeout",
                 format!(
                     "same-session virtual-display quality gate did not finish within {} seconds",
                     QUALITY_TIMEOUT.as_secs()
                 ),
             ),
-            None => vec![Action::Wait(GATE_POLL)],
+            (None, None) => vec![Action::Wait(GATE_POLL)],
         }
     }
 
@@ -1253,16 +1259,11 @@ mod tests {
         const STARTING: &str = "RDP keeper exited with code 5 during host startup";
         const SERVING: &str = "RDP keeper process exited with code 5";
         const DOWN: &str = "RDP keeper exited during host restart backoff";
-        // Phase, the fault, and what follows the teardown. A keeper lost under the gate reads
-        // as a gate out of time, which no new cycle follows.
+        const CHECKING: &str = "RDP keeper exited with code 5 during the display check";
+        // Phase, the fault, and what follows the teardown: another cycle, every time.
         let rows = [
             (At::SigningIn, "rdp_keeper_exited", EARLY, vec![]),
-            (
-                At::Gating,
-                "quality_timeout",
-                GATE_OUT_OF_TIME,
-                vec![Action::Finish],
-            ),
+            (At::Gating, "rdp_keeper_exited", CHECKING, vec![]),
             (At::Readying, "rdp_keeper_exited", STARTING, vec![]),
             (
                 At::Running,
@@ -1282,8 +1283,19 @@ mod tests {
             assert_eq!(bench.see(keeper(5)), [Action::EndCycle], "{at:?}");
             assert_eq!(bench.ending(), Some((code, message)), "{at:?}");
             assert_eq!(bench.see(NOTHING), then, "{at:?}");
-            assert_eq!(bench.state.finished(), at == At::Gating, "{at:?}");
+            assert!(!bench.state.finished(), "{at:?}");
         }
+    }
+
+    #[test]
+    fn a_keeper_lost_under_the_gate_leaves_the_gate_owed() {
+        let mut bench = bench(At::Gating);
+        assert_eq!(bench.see(keeper(5)), [Action::EndCycle]);
+        assert_eq!(bench.see(NOTHING), []);
+        bench.rests(Duration::from_secs(1));
+        assert_eq!(bench.see(SESSION), [Action::EnterSession(7)]);
+        let check = [Action::Announce(Stage::Display, 1), Action::StartGate];
+        assert_eq!(bench.see(NOTHING), check);
     }
 
     #[test]
@@ -1378,20 +1390,19 @@ mod tests {
 
     #[test]
     fn a_stop_in_every_phase_ends_stopped() {
-        const EARLY: (&str, &str) = (
-            "rdp_keeper_exited",
-            "RDP keeper exited before its WTS session became active",
-        );
-        const GATE: (&str, &str) = ("quality_timeout", GATE_OUT_OF_TIME);
         let check = vec![Action::Announce(Stage::Display, 1), Action::StartGate];
         let end = [Action::EndCycle, Action::Finish];
         // Phase, what the worker still does, and what the start is answered. The two phases
         // that only wait for an action to return start the next child before the stop is read.
         let rows = [
             (At::Fresh, vec![Action::Finish], Err(STOPPED_EARLY)),
-            (At::SigningIn, end.to_vec(), Err(EARLY)),
-            (At::Entering, [check, end.to_vec()].concat(), Err(GATE)),
-            (At::Gating, end.to_vec(), Err(GATE)),
+            (At::SigningIn, end.to_vec(), Err(STOPPED_EARLY)),
+            (
+                At::Entering,
+                [check, end.to_vec()].concat(),
+                Err(STOPPED_EARLY),
+            ),
+            (At::Gating, end.to_vec(), Err(STOPPED_EARLY)),
             (
                 At::Collecting,
                 [start_host(), end.to_vec()].concat(),
