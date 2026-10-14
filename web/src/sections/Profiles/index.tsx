@@ -11,6 +11,7 @@ import {
 import type { DoorChange } from "@/api/gen/model/doorChange";
 import type { ProfileAdmin } from "@/api/gen/model/profileAdmin";
 import type { ProfileCreate } from "@/api/gen/model/profileCreate";
+import type { SeatingChange } from "@/api/gen/model/seatingChange";
 import {
 	deleteProfile,
 	endProfileSession,
@@ -151,7 +152,7 @@ export const SectionProfiles: FC = () => {
 			),
 		onError: failed(m.profiles_seat_failed()),
 	});
-	// A refused turn-on answers `enabled: false` with its checks, so only a transport failure toasts.
+	// A refused turn-on answers `enabled: false` with its checks; the password dialog shows the rest.
 	const changeSeating = useSetSeating({
 		mutation: {
 			onSuccess: (next) => {
@@ -159,7 +160,6 @@ export const SectionProfiles: FC = () => {
 				qc.invalidateQueries({ queryKey: getGetSeatsDoctorQueryKey() });
 				refresh();
 			},
-			onError: failed(m.profiles_seats_failed()),
 		},
 	});
 	// The console password rides in the body; the console's server strips it before the host.
@@ -317,9 +317,14 @@ export const SectionProfiles: FC = () => {
 						changeSeating.isPending &&
 						changeSeating.variables?.data.prepare === true
 					}
-					onChange={(enabled, allowRdp, prepare) =>
-						changeSeating.mutate({
-							data: { enabled, allow_rdp_from_network: allowRdp, prepare },
+					onChange={(change, password) =>
+						changeSeating.mutateAsync({
+							data: {
+								enabled: change.enabled,
+								allow_rdp_from_network: change.allowRdp,
+								prepare: change.prepare,
+								password,
+							} as SeatingChange,
 						})
 					}
 					onRestart={async (password) => {

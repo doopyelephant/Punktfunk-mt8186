@@ -192,6 +192,7 @@ export const SourcesSection: FC<{
 					onClose={() => setSettingsFor(null)}
 				/>
 			)}
+			{access.dialog}
 		</Stagger>
 	);
 };

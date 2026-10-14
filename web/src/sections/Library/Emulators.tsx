@@ -9,7 +9,9 @@ import {
 	useInstallEmulator,
 	useRemoveEmulator,
 } from "@/api/gen/emulators/emulators";
+import type { AdoptRequest } from "@/api/gen/model/adoptRequest";
 import type { EmulatorStatus } from "@/api/gen/model/emulatorStatus";
+import { PasswordConfirmDialog } from "@/components/password-confirm";
 import { ROW_GAP, Stagger } from "@/components/stagger";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -37,36 +39,52 @@ const Where: FC<{ e: EmulatorStatus }> = ({ e }) => {
 	);
 };
 
-/** The operator's own copy, one no rule finds: its program's path, adopted on Add. */
+/**
+ * The operator's own copy, one no rule finds: its program's path, adopted on Add. The host runs
+ * that program for the emulator's games, so Add asks for the console password first.
+ */
 const Adopt: FC<{ id: string; onDone: () => void }> = ({ id, onDone }) => {
 	const [exe, setExe] = useState("");
-	const adopt = useAdoptEmulator({
-		mutation: {
-			onSuccess: onDone,
-			onError: () => toast.error(m.emulators_adopt_failed()),
-		},
-	});
+	const [asking, setAsking] = useState(false);
+	const adopt = useAdoptEmulator();
 	const submit = (e: FormEvent) => {
 		e.preventDefault();
-		if (exe.trim()) adopt.mutate({ id, data: { exe: exe.trim() } });
+		if (exe.trim()) setAsking(true);
 	};
 	return (
-		<form onSubmit={submit} className="flex w-full gap-2">
-			<Input
-				value={exe}
-				onChange={(e) => setExe(e.target.value)}
-				placeholder={m.emulators_adopt_path()}
-				aria-label={m.emulators_adopt_path()}
-				className="font-mono text-xs"
+		<>
+			<form onSubmit={submit} className="flex w-full gap-2">
+				<Input
+					value={exe}
+					onChange={(e) => setExe(e.target.value)}
+					placeholder={m.emulators_adopt_path()}
+					aria-label={m.emulators_adopt_path()}
+					className="font-mono text-xs"
+				/>
+				<Button
+					size="input"
+					type="submit"
+					disabled={!exe.trim() || adopt.isPending}
+				>
+					{m.emulators_adopt_add()}
+				</Button>
+			</form>
+			<PasswordConfirmDialog
+				open={asking}
+				id="emulator-adopt-password"
+				title={m.emulators_adopt_confirm_title()}
+				body={m.emulators_adopt_confirm_body()}
+				submitLabel={m.emulators_adopt_add()}
+				failedText={m.emulators_adopt_failed()}
+				onSubmit={async (password) => {
+					// The console's server reads the password from the body and strips it.
+					const data = { exe: exe.trim(), password } as AdoptRequest;
+					await adopt.mutateAsync({ id, data });
+					onDone();
+				}}
+				onClose={() => setAsking(false)}
 			/>
-			<Button
-				size="input"
-				type="submit"
-				disabled={!exe.trim() || adopt.isPending}
-			>
-				{m.emulators_adopt_add()}
-			</Button>
-		</form>
+		</>
 	);
 };
 

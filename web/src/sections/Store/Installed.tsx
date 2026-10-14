@@ -69,6 +69,7 @@ export const InstalledTab: FC<{
 				onAccessDecision={access.onDecide}
 				pages={new Set(uiPlugins(plugins.data).map((p) => p.id))}
 			/>
+			{access.dialog}
 		</div>
 	);
 };

@@ -11,12 +11,14 @@ import {
 } from "lucide-react";
 import { type FC, useState } from "react";
 import { useGetEmulators } from "@/api/gen/emulators/emulators";
+import type { DecideRequest } from "@/api/gen/model/decideRequest";
 import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot";
 import {
 	getGetPluginAccessQueryKey,
 	useDecidePluginAccess,
 	useGetPluginAccess,
 } from "@/api/gen/plugin-access/plugin-access";
+import { PasswordConfirmDialog } from "@/components/password-confirm";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
@@ -24,34 +26,68 @@ import { m } from "@/paraglide/messages";
 export type AccessDecision = "allow" | "deny" | "forget";
 export type DecideAccess = (paths: string[], decision: AccessDecision) => void;
 
+/**
+ * The access rows and their decisions. **Allow** asks for the console password in `dialog`, which
+ * the page mounts; **Don't allow** and **Forget** only narrow and don't ask.
+ */
 export const usePluginAccess = () => {
 	const qc = useQueryClient();
 	const access = useGetPluginAccess();
 	const decide = useDecidePluginAccess();
+	const [allowing, setAllowing] = useState<{
+		plugin: string;
+		paths: string[];
+	} | null>(null);
+	const run = async (
+		plugin: string,
+		paths: string[],
+		decision: AccessDecision,
+		password?: string,
+	) => {
+		for (const path of paths) {
+			// The console's server reads the password from the body and strips it.
+			const data = { path, decision, password } as DecideRequest;
+			const snapshot = await decide.mutateAsync({ plugin, data });
+			qc.setQueryData<PluginAccessSnapshot[]>(
+				getGetPluginAccessQueryKey(),
+				(rows = []) => [
+					...rows.filter((row) => row.plugin !== plugin),
+					snapshot,
+				],
+			);
+		}
+	};
 	const onDecide = async (
 		plugin: string,
 		paths: string[],
 		decision: AccessDecision,
 	) => {
+		if (decision === "allow") {
+			setAllowing({ plugin, paths });
+			return;
+		}
 		try {
-			for (const path of paths) {
-				const snapshot = await decide.mutateAsync({
-					plugin,
-					data: { path, decision },
-				});
-				qc.setQueryData<PluginAccessSnapshot[]>(
-					getGetPluginAccessQueryKey(),
-					(rows = []) => [
-						...rows.filter((row) => row.plugin !== plugin),
-						snapshot,
-					],
-				);
-			}
+			await run(plugin, paths, decision);
 		} catch {
 			toast.error(m.plugin_access_decision_failed());
 		}
 	};
-	return { access, busy: decide.isPending, onDecide };
+	const dialog = (
+		<PasswordConfirmDialog
+			open={allowing !== null}
+			id="plugin-access-password"
+			title={m.plugin_access_confirm_title()}
+			body={m.plugin_access_confirm_body()}
+			submitLabel={m.plugin_access_allow()}
+			failedText={m.plugin_access_decision_failed()}
+			onSubmit={async (password) => {
+				if (allowing)
+					await run(allowing.plugin, allowing.paths, "allow", password);
+			}}
+			onClose={() => setAllowing(null)}
+		/>
+	);
+	return { access, busy: decide.isPending, onDecide, dialog };
 };
 
 const Mode: FC<{ write: boolean }> = ({ write }) => (

@@ -766,7 +766,8 @@ const PREPARES = new Set(["rds_role", "rds_licensing", "restart"]);
  * **Seats**: the switch, the Remote Desktop choice, and what the checks found. While seats are on,
  * changing the choice turns them on again with it. A refused turn-on answers off with its errors,
  * which is what the list shows. When Windows lacks the Session Host role or licensing, **Set up
- * Remote Desktop** installs them and turns seats on in one go.
+ * Remote Desktop** installs them and turns seats on in one go. Every change asks for the console
+ * password first.
  */
 export const SeatsDialog: FC<{
 	open: boolean;
@@ -774,7 +775,10 @@ export const SeatsDialog: FC<{
 	isPending: boolean;
 	/** The pending change is **Set up Remote Desktop**, which takes minutes. */
 	preparing?: boolean;
-	onChange: (enabled: boolean, allowRdp: boolean, prepare?: boolean) => void;
+	onChange: (
+		change: { enabled: boolean; allowRdp: boolean; prepare?: boolean },
+		password: string,
+	) => unknown;
 	/** Restart the host once the console password is re-entered. */
 	onRestart?: (password: string) => Promise<void>;
 	onClose: () => void;
@@ -789,6 +793,11 @@ export const SeatsDialog: FC<{
 }) => {
 	const [allowRdp, setAllowRdp] = useState(false);
 	const [restarting, setRestarting] = useState(false);
+	const [asking, setAsking] = useState<{
+		enabled: boolean;
+		allowRdp: boolean;
+		prepare?: boolean;
+	} | null>(null);
 	const stored = seating?.allow_rdp_from_network === true;
 	useEffect(() => {
 		if (open) setAllowRdp(stored);
@@ -798,6 +807,27 @@ export const SeatsDialog: FC<{
 	const fixable =
 		!on && checks.some((c) => PREPARES.has(c.code) && c.level !== "info");
 	const needsRestart = checks.some((c) => c.code === "restart");
+	if (asking) {
+		return (
+			<PasswordConfirmDialog
+				open
+				id="seats-password"
+				title={m.profiles_seats_confirm_title()}
+				body={m.profiles_seats_confirm_body()}
+				submitLabel={m.common_confirm()}
+				busyLabel={asking.prepare ? m.profiles_seats_preparing() : undefined}
+				failedText={m.profiles_seats_failed()}
+				onSubmit={async (password) => {
+					await onChange(asking, password);
+				}}
+				onClose={() => {
+					// While seats are on, the choice on screen is the stored one.
+					if (on) setAllowRdp(stored);
+					setAsking(null);
+				}}
+			/>
+		);
+	}
 	if (restarting && onRestart) {
 		return (
 			<PasswordConfirmDialog
@@ -831,7 +861,9 @@ export const SeatsDialog: FC<{
 						id="seats-on"
 						checked={on}
 						disabled={isPending || !seating}
-						onCheckedChange={(v) => onChange(v === true, allowRdp)}
+						onCheckedChange={(v) =>
+							setAsking({ enabled: v === true, allowRdp })
+						}
 					/>
 					<Label htmlFor="seats-on">{m.profiles_seats_on()}</Label>
 				</div>
@@ -844,7 +876,7 @@ export const SeatsDialog: FC<{
 							disabled={isPending}
 							onCheckedChange={(v) => {
 								setAllowRdp(v === true);
-								if (on) onChange(true, v === true);
+								if (on) setAsking({ enabled: true, allowRdp: v === true });
 							}}
 						/>
 						<div className="space-y-1">
@@ -875,7 +907,9 @@ export const SeatsDialog: FC<{
 						<Button
 							variant="outline"
 							disabled={isPending}
-							onClick={() => onChange(true, allowRdp, true)}
+							onClick={() =>
+								setAsking({ enabled: true, allowRdp, prepare: true })
+							}
 						>
 							{preparing && <Spinner className="size-4" />}
 							{preparing
