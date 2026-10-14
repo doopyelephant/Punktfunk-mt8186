@@ -5,10 +5,8 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
 import io.unom.punktfunk.kit.discovery.HostDiscovery
-import io.unom.punktfunk.kit.discovery.Presence
 import io.unom.punktfunk.kit.link.DeepLinkResult
 import io.unom.punktfunk.kit.link.DeepLinks
 import io.unom.punktfunk.kit.link.HostResolution
@@ -38,10 +36,10 @@ private class RequestAccessState(val target: PendingTrust) {
 
 /**
  * A plain dial in flight: [hostName] labels the [ConnectOverlay]'s "Connecting…" phase, and its
- * Cancel trips [cancelled]. A late handle is closed silently, as [RequestAccessState]'s is.
+ * Cancel trips [ticket]. A late handle is closed silently, as [RequestAccessState]'s is.
  */
 private class ConnectAttempt(val hostName: String) {
-    val cancelled = AtomicBoolean(false)
+    val ticket = HostServices.Ticket()
 }
 
 /**
@@ -65,6 +63,9 @@ internal class ConnectController(
 
     val knownHostStore = KnownHostStore(context)
 
+    /** Dial, pin, wake and presence, over [knownHostStore]. */
+    val services = HostServices(knownHostStore, JniHostNative(context))
+
     /** The settings-preset catalog: what a tap connects with, the one-offs, the pinned cards. */
     val presetStore = PresetStore(context)
 
@@ -78,7 +79,7 @@ internal class ConnectController(
      * Wakes a sleeping saved host and waits for it to answer before dialing; its overlay rides
      * over both homes. A cold boot can take a minute and more to answer again.
      */
-    val waker = WakeController(scope)
+    val waker = WakeController(scope, services)
     private val identities = IdentityHolder.shared(context)
 
     var discovered by mutableStateOf<List<DiscoveredHost>>(emptyList())
@@ -159,26 +160,6 @@ internal class ConnectController(
         return null
     }
 
-    // The native connect for a plain dial and for request access; the library launches by id.
-    private suspend fun connectNative(
-        id: ClientIdentity,
-        targetHost: String,
-        targetPort: Int,
-        pinHex: String,
-        timeoutMs: Int,
-        preset: StreamPreset?,
-        launch: String?,
-        profile: String? = null,
-    ): Long = connectToHost(
-        context, settings.effectiveFor(preset), id, targetHost, targetPort, pinHex,
-        launch = launch, dialer = "touch/host-grid", timeoutMs = timeoutMs, preset = preset,
-        profile = profile,
-    )
-
-    // What the stream screen is handed: the settings this connect used, and the host's record.
-    private fun session(handle: Long, record: KnownHost?, preset: StreamPreset?): ActiveSession =
-        SessionFactory.afterDial(handle, record, settings.effectiveFor(preset), preset, knownHostStore)
-
     // The dial itself, identity ready. A TOFU dial saves what the host presented, unpaired.
     // [onFailure] takes an unreachable dial (the wake wait), [onMismatch] a refused pin;
     // [redial] marks the one dial a [ProfileRetry] grants.
@@ -205,7 +186,7 @@ internal class ConnectController(
             val choice = chooseProfile(
                 knownHostStore, id, record, linkAs.also { linkAs = null },
                 wait = { w ->
-                    if (w != null && thisAttempt.cancelled.get()) {
+                    if (w != null && thisAttempt.ticket.cancelled) {
                         w.cancelled.complete(Unit)
                     } else {
                         if (w != null) attempt = null // the wait takes the overlay's place
@@ -213,7 +194,7 @@ internal class ConnectController(
                     }
                 },
             ) { ask ->
-                if (thisAttempt.cancelled.get()) {
+                if (thisAttempt.ticket.cancelled) {
                     ask.answer.complete(null)
                 } else {
                     attempt = null // the picker takes the overlay's place
@@ -221,7 +202,7 @@ internal class ConnectController(
                 }
             }
             profileAsk = null
-            if (thisAttempt.cancelled.get()) return@launch
+            if (thisAttempt.ticket.cancelled) return@launch
             if (choice !is ProfileChoice.Dial) {
                 connecting = false
                 if (choice is ProfileChoice.Refused) status = choice.line
@@ -230,28 +211,24 @@ internal class ConnectController(
             }
             attempt = thisAttempt
             refreshHosts()
-            val handle = connectNative(
-                id, targetHost, targetPort, pinHex ?: "", CONNECT_TIMEOUT_MS, preset, launch, choice.id,
+            val spec = DialSpec(
+                settings.effectiveFor(preset), id, targetHost, targetPort, pinHex ?: "", launch,
+                dialer = "touch/host-grid", preset = preset, profile = choice.id,
             )
+            // By this dial's pin (the address may also name the other OS of a dual-boot box); with
+            // no saved record, a TOFU dial pins what the host presented, unpaired.
+            val dialed = services.dial(spec, record, name, ticket = thisAttempt.ticket)
             // Cancelled mid-dial: cancelConnect already returned the UI and resumed the browse,
-            // so the just-opened session closes silently.
-            if (thisAttempt.cancelled.get()) {
-                if (handle != 0L) withContext(Dispatchers.IO) { NativeBridge.nativeClose(handle) }
-                return@launch
-            }
+            // and the just-opened session closed silently.
+            if (dialed is HostServices.Cancelled) return@launch
             attempt = null
             connecting = false
-            if (handle != 0L) {
-                // By this dial's pin (the address may also name the other OS of a dual-boot box);
-                // with no saved record, a TOFU dial pins what the host presented, unpaired.
-                val dialed = record
-                    ?: SessionFactory.pinPresented(handle, targetHost, targetPort, name, paired = false, knownHostStore)
-                onConnected(session(handle, dialed, preset))
-            } else {
+            if (dialed is HostServices.Connected) {
+                onConnected(dialed.session)
+            } else if (dialed is HostServices.Failed) {
                 resumeBrowse()
-                val token = NativeBridge.nativeTakeLastError()
-                val unreachable = token == "timeout" || token == "io" || token.isEmpty()
-                if (onFailure != null && unreachable) {
+                val token = dialed.token
+                if (onFailure != null && dialed.unreachable) {
                     // Clearing `attempt` above and starting the wake here land in one recompose,
                     // so the overlay slides Connecting → Waking without a blank frame.
                     onFailure()
@@ -280,11 +257,11 @@ internal class ConnectController(
 
     /**
      * Cancels a plain dial in flight (the overlay's "Connecting…" phase). The native connect
-     * can't be aborted, so this flags the attempt, whose late handle [doConnectDirect] closes,
+     * can't be aborted, so this cancels the attempt's ticket, whose late handle the dial closes,
      * and returns the UI now with the browse resumed.
      */
     fun cancelConnect() {
-        attempt?.cancelled?.set(true)
+        attempt?.ticket?.cancel()
         attempt = null
         connecting = false
         resumeBrowse()
@@ -323,7 +300,7 @@ internal class ConnectController(
         val down = kh == null || !kh.isOnline(reachable)
         if (settings.autoWakeEnabled && macs.isNotEmpty() && down) {
             // Fire-and-forget first packet (harmless if it's awake), then dial-first.
-            scope.launch(Dispatchers.IO) { NativeBridge.nativeWakeOnLan(macs.joinToString(","), targetHost) }
+            scope.launch(Dispatchers.IO) { services.sendWake(macs, targetHost) }
             doConnectDirect(targetHost, targetPort, name, pinHex, preset, launch, onMismatch = onMismatch, onFailure = {
                 waker.start(
                     hostName = name,
@@ -332,15 +309,7 @@ internal class ConnectController(
                     lastIp = targetHost,
                     // A live advert would answer in milliseconds and lie (see [isOnline]); this
                     // asks the host itself, at the address it advertises if it moved lease.
-                    isOnline = {
-                        val live = liveAdvert()
-                        Presence.isSelf(
-                            pinHex ?: "",
-                            NativeBridge.nativeProbe(
-                                live?.host ?: targetHost, live?.port ?: targetPort, 3_000,
-                            ),
-                        )
-                    },
+                    isOnline = { services.answers(pinHex ?: "", targetHost, targetPort, liveAdvert(), 3_000) },
                     onOnline = {
                         val live = liveAdvert()
                         // Woke back on a new address? Re-point the saved record at it, keeping
@@ -377,30 +346,27 @@ internal class ConnectController(
             // Pin the advertised fingerprint for a discovered host (defence against an impostor while
             // we wait); a manually-typed host has none, so trust-on-first-use.
             val pinHex = target.advertisedFp ?: ""
-            val fp = withContext(Dispatchers.IO) {
-                NativeBridge.nativeRequestAccess(
-                    target.host, target.port, id.certPem, id.privateKeyPem, pinHex, deviceName(context),
-                )
+            val paired = withContext(Dispatchers.IO) {
+                services.requestAccess(target.host, target.port, id, pinHex, deviceName(context))
             }
             // Cancelled while we waited: don't touch UI a fresh action may now own.
             if (req.cancelled.get()) return@launch
             awaiting = null
             connecting = false
-            if (fp.isNotEmpty()) {
-                knownHostStore.trust(target.host, target.port, target.name, fp, paired = true)
-                refreshHosts()
-                if (target.fromLink) {
-                    doConnect(target.host, target.port, target.name, fp, target.preset, target.launch)
-                } else {
-                    notice = "Paired with ${target.name}"
+            when (paired) {
+                is HostServices.Paired.Ok -> {
+                    services.trustPaired(target.host, target.port, target.name, paired.fp)
+                    refreshHosts()
+                    if (target.fromLink) {
+                        doConnect(target.host, target.port, target.name, paired.fp, target.preset, target.launch)
+                    } else {
+                        notice = "Paired with ${target.name}"
+                    }
                 }
-            } else {
                 // Cause-specific: an operator denial, an approval timeout, and a request that
                 // never reached the host are different problems with different fixes.
-                status = ConnectErrors.connectMessage(
-                    NativeBridge.nativeTakeLastError(),
-                    requestAccess = true,
-                )
+                is HostServices.Paired.Failed ->
+                    status = ConnectErrors.connectMessage(paired.token, requestAccess = true)
             }
         }
     }
@@ -492,7 +458,7 @@ internal class ConnectController(
 
     /** The PIN ceremony finished with [fp]: save the host as paired. Only a link's pairing streams. */
     fun paired(pt: PendingTrust, fp: String) {
-        knownHostStore.trust(pt.host, pt.port, pt.name, fp, paired = true)
+        services.trustPaired(pt.host, pt.port, pt.name, fp)
         refreshHosts()
         pendingTrust = null
         if (pt.fromLink) {
@@ -610,11 +576,7 @@ internal class ConnectController(
             connectsAfter = false,
             macs = kh.mac,
             lastIp = kh.address,
-            isOnline = {
-                Presence.probeSelf(kh, discovered.firstOrNull { kh.matches(it) }) { addr, port ->
-                    NativeBridge.nativeProbe(addr, port, 3_000)
-                }
-            },
+            isOnline = { services.answers(kh, discovered.firstOrNull { kh.matches(it) }, 3_000) },
             onOnline = {},
         )
     }

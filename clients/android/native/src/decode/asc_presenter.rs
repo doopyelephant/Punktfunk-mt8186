@@ -33,6 +33,7 @@ use super::async_loop::DecodeEvent;
 use super::latency::{now_realtime_ns, p50_max_ms, take_by_pts};
 use super::presenter::{cadence_suffix, PresentPriority};
 use super::surface_control::{fence_signal_ns, present, Layer, PresentComplete};
+use crate::apply_margin::ApplyMargin;
 use crate::session::PictureLayers;
 use crate::sys::{now_monotonic_ns, sysprop};
 
@@ -43,14 +44,6 @@ const READER_MAX_IMAGES: i32 = 8;
 
 /// Fallback panel period while none has been learned yet — one 120 Hz frame.
 const FALLBACK_PERIOD_NS: i64 = 8_333_333;
-
-/// Apply-ahead beyond the learned lead: the binder hop plus SurfaceFlinger's wakeup→latch gap.
-/// Starts at zero (measured as enough on the A024), widens [`APPLY_MARGIN_STEP_NS`] per slot miss
-/// to [`APPLY_MARGIN_MAX_NS`], and narrows one step per [`MARGIN_DECAY_PRESENTS`] clean presents.
-const APPLY_MARGIN_NS: i64 = 0;
-const APPLY_MARGIN_STEP_NS: i64 = 500_000;
-const APPLY_MARGIN_MAX_NS: i64 = 2_500_000;
-const MARGIN_DECAY_PRESENTS: u32 = 120;
 
 /// A completion that never arrives force-opens the budget after this long (the gate's backstop).
 const STALE_REOPEN_NS: i64 = 100_000_000;
@@ -175,9 +168,7 @@ pub(super) struct AscBackend {
     /// Slots a frame may be held beyond the first reachable one: 1 under latency, the buffer
     /// under smooth. 0 is the collision the sysprop A/B reproduces.
     max_ahead: i64,
-    apply_margin_ns: i64,
-    /// Presents since the last slot miss; [`MARGIN_DECAY_PRESENTS`] of them narrow the margin.
-    clean_presents: u32,
+    apply_margin: ApplyMargin,
     /// `debug.punktfunk.asc_pacing` = 0: as-soon-as-possible targets, two pending — the pre-overhaul
     /// behaviour, for the on-glass A/B.
     pacing: bool,
@@ -346,8 +337,7 @@ impl AscBackend {
             clock: SlotClock::seeded(panel_hz),
             last_slot: None,
             max_ahead,
-            apply_margin_ns: APPLY_MARGIN_NS,
-            clean_presents: 0,
+            apply_margin: ApplyMargin::new(),
             pacing,
             hold_chain,
             last_held: false,
@@ -487,7 +477,7 @@ impl AscBackend {
         }
         let reachable = self
             .clock
-            .slot_after(earliest + self.clock.lead_ns() + self.apply_margin_ns);
+            .slot_after(earliest + self.clock.lead_ns() + self.apply_margin.ns());
         let mut slot = pace_slot(reachable, self.last_slot, self.max_ahead);
         let mut held = slot > reachable;
         if held && self.last_held && !self.hold_chain && self.fifo_capacity == 0 {
@@ -846,20 +836,13 @@ impl AscBackend {
             self.intervals.note(observed - prev);
         }
         self.last_observed_slot = Some(observed);
-        if assigned.is_some_and(|s| observed > s) {
-            // SurfaceFlinger woke before the apply landed, or the uid's frame-rate override
-            // skipped that vsync: the next frame must not aim at the slot this one took.
+        // SurfaceFlinger woke before the apply landed, or the uid's frame-rate override skipped
+        // that vsync: the next frame must not aim at the slot this one took.
+        let missed = assigned.is_some_and(|s| observed > s);
+        if missed {
             self.slot_miss += 1;
-            self.clean_presents = 0;
-            self.apply_margin_ns =
-                (self.apply_margin_ns + APPLY_MARGIN_STEP_NS).min(APPLY_MARGIN_MAX_NS);
-        } else {
-            self.clean_presents += 1;
-            if self.clean_presents >= MARGIN_DECAY_PRESENTS {
-                self.clean_presents = 0;
-                self.apply_margin_ns = (self.apply_margin_ns - APPLY_MARGIN_STEP_NS).max(0);
-            }
         }
+        self.apply_margin.observe(missed);
         if self.last_slot.is_none_or(|l| observed > l) {
             self.last_slot = Some(observed);
         }
@@ -903,7 +886,7 @@ impl AscBackend {
             e2e_max,
             self.clock.period_ns() as f64 / 1e6,
             self.clock.lead_ns() as f64 / 1e6,
-            self.apply_margin_ns / 1000,
+            self.apply_margin.ns() / 1000,
             self.held,
             self.slot_miss,
             self.coalesced,

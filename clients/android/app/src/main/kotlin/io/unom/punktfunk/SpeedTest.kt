@@ -1,6 +1,5 @@
 package io.unom.punktfunk
 
-import android.content.Context
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.KnownHost
@@ -157,8 +156,9 @@ private fun fixed(x: Double, places: Int): String =
     BigDecimal(x).setScale(places, RoundingMode.HALF_EVEN).toPlainString()
 
 /**
- * Connect to [host]:[port] as a diagnostic session, run the network check, and report. Suspends
- * on IO — call from a coroutine; [onPhase] is invoked as it progresses so the dialog can narrate.
+ * Connect to [host]:[port] through [services] as a diagnostic session, run the network check, and
+ * report. Suspends on IO — call from a coroutine; [onPhase] is invoked as it progresses so the
+ * dialog can narrate.
  *
  * The connect is deliberately minimal: 1280×720@60, no launch, host-default bitrate, and probes
  * only — the host builds no display or encoder for it. The check itself is the core's
@@ -166,7 +166,7 @@ private fun fixed(x: Double, places: Int): String =
  * it, two shaped legs, both ends' facts, and the findings.
  */
 suspend fun runSpeedTest(
-    context: Context,
+    services: HostServices,
     identity: ClientIdentity,
     host: String,
     port: Int,
@@ -184,18 +184,19 @@ suspend fun runSpeedTest(
         hdrEnabled = false,
         audioChannels = 2,
     )
-    val handle = connectToHost(
-        context, probeSettings, identity, host, port, pinHex,
+    val spec = DialSpec(
+        probeSettings, identity, host, port, pinHex,
         launch = null, dialer = "speed-test", timeoutMs = SPEED_TEST_CONNECT_TIMEOUT_MS,
         deliveryFlags = DELIVERY_PROBE_ONLY,
     )
-    if (handle == 0L) {
-        onPhase(
-            SpeedTestPhase.Failed(
-                ConnectErrors.connectMessage(NativeBridge.nativeTakeLastError(), requestAccess = false),
-            ),
-        )
-        return
+    val handle = when (val opened = services.open(spec)) {
+        is HostServices.Open -> opened.handle
+        is HostServices.Failed -> {
+            onPhase(SpeedTestPhase.Failed(ConnectErrors.connectMessage(opened.token, requestAccess = false)))
+            return
+        }
+        // No ticket: nothing cancels it.
+        HostServices.Cancelled -> return
     }
     try {
         onPhase(SpeedTestPhase.Measuring)

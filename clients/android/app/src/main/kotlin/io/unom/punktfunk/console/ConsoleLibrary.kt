@@ -24,9 +24,6 @@ private val artPool = Executors.newFixedThreadPool(3) { r -> Thread(r, "pf-conso
 /** The library fetch in flight (its generation; a newer one supersedes it). */
 private val fetchGen = AtomicLong(0)
 
-/** The last `FetchLibrary`'s host and `req`. A refetch this shell starts answers under it. */
-private var libraryReq: Pair<String, JSONObject>? = null
-
 /** End a title this device launched, say how it went, then re-read what the host runs. */
 internal fun SkiaConsole.endGame(c: JSONObject) {
     val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
@@ -38,7 +35,7 @@ internal fun SkiaConsole.endGame(c: JSONObject) {
     }
     ioPool.execute {
         val outcome = LibraryClient.endGame(id, addr, mgmt, fp, appId)
-        main.post {
+        state.launch {
             notice(outcome.notice(title))
             fetchLibrary(c, refreshOnly = true)
         }
@@ -60,7 +57,7 @@ internal fun SkiaConsole.changeInstall(c: JSONObject) {
     }
     ioPool.execute {
         val outcome = LibraryClient.changeInstall(id, addr, mgmt, fp, appId, action)
-        main.post {
+        state.launch {
             notice(outcome.notice(action, title))
             val removed = outcome == InstallOutcome.Done && action == InstallAction.Remove
             fetchLibrary(c, refreshOnly = !removed)
@@ -75,13 +72,12 @@ internal fun SkiaConsole.changeInstall(c: JSONObject) {
  * command's `req`; a refetch this shell starts reuses the last one, and only for its host.
  * A wake takes the MACs of the record the pin names, else of the placeholder at `addr` and
  * `port`, the stream port ([io.unom.punktfunk.kit.security.KnownHostStore.resolve]).
- * Main thread only.
  */
 internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
     val app = appContext ?: return
     val addr = c.optString("addr"); val mgmt = c.optInt("mgmt"); val fp = c.optString("fp_hex")
     val id = identity
-    val kh = knownHostStore.resolve(fp, addr, c.optInt("port"))
+    val kh = services.store.resolve(fp, addr, c.optInt("port"))
     if (refreshOnly) {
         // Silent path — no notice, but the failed load still gets its retry.
         if (id == null) { identities.blockedMessage(); return }
@@ -90,8 +86,8 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
         ioPool.execute {
             val status = LibraryClient.fetchStatus(addr, mgmt, id.certPem, id.privateKeyPem, fp)
             val games = status.games
-            main.post {
-                if (handle == 0L) return@post
+            state.launch {
+                if (handle == 0L) return@launch
                 if (gen == fetchGen.get()) {
                     NativeBridge.nativeConsoleLibraryDownloads(
                         handle,
@@ -101,15 +97,15 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
                 }
                 // The carousel behind the shelf shows the same fact from its own map; this
                 // answer is fresher than anything its TTL would fetch.
-                nowPlayingAt[fp] = android.os.SystemClock.elapsedRealtime()
+                services.nowPlayingAt[fp] = android.os.SystemClock.elapsedRealtime()
                 recordNowPlaying(fp, games)
             }
         }
         return
     }
-    val req = c.optJSONObject("req")?.also { libraryReq = fp to it }
-        ?: libraryReq?.takeIf { it.first == fp }?.second
-        ?: return // the console has moved off this host: no shelf to refill
+    val req = state.now {
+        c.optJSONObject("req")?.also { libraryReq = fp to it } ?: libraryReq?.takeIf { it.first == fp }?.second
+    } ?: return // the console has moved off this host: no shelf to refill
     val gen = fetchGen.incrementAndGet()
     NativeBridge.nativeConsoleLibraryBegin(handle)
     if (id == null) {
@@ -118,15 +114,16 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
     }
     val cache = LibraryCache.standard(app.cacheDir)
     val cacheKey = LibraryCache.keyFor(kh, fp)
+    val autoWake = state.now { settings.autoWakeEnabled }
     ioPool.execute {
         val cached = cache.load(cacheKey)?.games?.takeIf { it.isNotEmpty() }
-        if (cached != null) main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryGames(handle, ConsoleJson.libraryGames(req, cached), true) }
+        if (cached != null) state.launch { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryGames(handle, ConsoleJson.libraryGames(req, cached), true) }
         val result = LibraryClient.fetchAcrossWake(
             addr, mgmt, id.certPem, id.privateKeyPem, fp,
             macs = kh?.mac.orEmpty(),
-            autoWake = settings.autoWakeEnabled,
+            autoWake = autoWake,
             isCancelled = { gen != fetchGen.get() },
-            onWaking = { main.post { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryStale(handle, 1) } },
+            onWaking = { state.launch { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryStale(handle, 1) } },
         )
         if (gen != fetchGen.get()) return@execute
         when (val r = result) {
@@ -134,8 +131,8 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
                 val games = r.games
                 cache.store(cacheKey, games)
                 val up = LibraryClient.fetchRunning(addr, mgmt, id.certPem, id.privateKeyPem, fp)
-                main.post {
-                    if (gen != fetchGen.get()) return@post
+                state.launch {
+                    if (gen != fetchGen.get()) return@launch
                     NativeBridge.nativeConsoleLibraryGames(handle, ConsoleJson.libraryGames(req, games), false)
                     NativeBridge.nativeConsoleLibraryStale(handle, 0)
                     NativeBridge.nativeConsoleLibraryRunning(handle, ConsoleJson.runningGames(up))
@@ -144,16 +141,16 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
             }
             is LibraryResult.Unauthorized -> {
                 if (cached != null) pumpArt(cached, gen, id, addr, fp, offline = true)
-                main.post {
-                    if (gen != fetchGen.get()) return@post
+                state.launch {
+                    if (gen != fetchGen.get()) return@launch
                     if (cached != null) NativeBridge.nativeConsoleLibraryStale(handle, 2)
                     else NativeBridge.nativeConsoleLibraryPhase(handle, ConsoleJson.libraryError(req, "Not paired", r.message, false))
                 }
             }
             is LibraryResult.Error -> {
                 if (cached != null) pumpArt(cached, gen, id, addr, fp, offline = true)
-                main.post {
-                    if (gen != fetchGen.get()) return@post
+                state.launch {
+                    if (gen != fetchGen.get()) return@launch
                     if (cached != null) NativeBridge.nativeConsoleLibraryStale(handle, 2)
                     else NativeBridge.nativeConsoleLibraryPhase(handle, ConsoleJson.libraryError(req, "Couldn't load the library", r.message, true))
                 }
@@ -187,7 +184,7 @@ private fun SkiaConsole.pumpArt(
         artPool.execute {
             if (gen != fetchGen.get()) return@execute
             val bytes = fetchArt(candidates, http, offline) ?: return@execute
-            main.post { if (gen == fetchGen.get() && handle != 0L) NativeBridge.nativeConsoleLibraryArt(handle, g.id, bytes) }
+            state.launch { if (gen == fetchGen.get() && handle != 0L) NativeBridge.nativeConsoleLibraryArt(handle, g.id, bytes) }
         }
     }
 }

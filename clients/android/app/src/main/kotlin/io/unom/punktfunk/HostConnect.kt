@@ -9,15 +9,11 @@ import io.unom.punktfunk.kit.Gamepad
 import io.unom.punktfunk.kit.ConnectRequest
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.VideoDecoders
-import io.unom.punktfunk.kit.security.ClientIdentity
 import io.unom.punktfunk.kit.security.KnownHost
 import io.unom.punktfunk.kit.security.KnownHostStore
 import io.unom.punktfunk.models.ActiveSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -33,7 +29,7 @@ const val CONNECT_TIMEOUT_MS = 10_000
  */
 const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
 
-/** What every shell does once [connectToHost] hands back a session handle. */
+/** The session [HostServices.dial] hands every shell once a dial lands. */
 object SessionFactory {
     /**
      * The session a dial opened, for the stream screen. [settings] is what the dial used. The
@@ -48,7 +44,7 @@ object SessionFactory {
         settings: Settings,
         preset: StreamPreset?,
         store: KnownHostStore,
-        mgmtPort: Int = NativeBridge.nativeHostMgmtPort(handle),
+        mgmtPort: Int,
     ): ActiveSession {
         if (record != null) store.learnMgmtPort(record, mgmtPort)
         return ActiveSession(
@@ -60,17 +56,6 @@ object SessionFactory {
         )
     }
 
-    /** Save the identity the host on [handle] presented; `null` when it presented none. */
-    fun pinPresented(
-        handle: Long,
-        host: String,
-        port: Int,
-        name: String,
-        paired: Boolean,
-        store: KnownHostStore,
-    ): KnownHost? =
-        NativeBridge.nativeHostFingerprint(handle).takeIf { it.isNotEmpty() }
-            ?.let { store.trust(host, port, name, it, paired) }
 }
 
 /**
@@ -81,10 +66,10 @@ object SessionFactory {
  * arrives as a second activity instance that knows nothing about the first; static state is what
  * crosses that gap.
  *
- * It also gates [connectToHost]. The console's native shell and its event pump outlive the screen
- * that raised them, so a `Launch` behind a live stream still reaches the dial: the host admits it
- * by `mode-conflict: JOIN` at the owner's mode and this side neither shows nor closes it. One
- * launch, one session.
+ * It also gates [HostServices.open]. The console's native shell and its event pump outlive the
+ * screen that raised them, so a `Launch` behind a live stream still reaches the dial: the host
+ * admits it by `mode-conflict: JOIN` at the owner's mode and this side neither shows nor closes
+ * it. One launch, one session.
  */
 object SessionGate {
     /** The host a live stream is on. */
@@ -153,62 +138,13 @@ class SessionOwner(private val close: (Long) -> Unit) {
 }
 
 /**
- * The one place [NativeBridge.nativeConnect] is assembled — shared by [ConnectScreen], the library
- * launcher ([LibraryScreen]) and the console shell. Derives the mode / HDR / gamepad settings the
- * host needs from [settings]. [pinHex] is the pinned fingerprint (empty ⇒ TOFU). [launch] is a
- * store-qualified library id (`steam:<appid>` / `custom:<id>`) to boot straight into a game, or
- * `null` for the desktop. [dialer] names the shell and path that asked, for the log and the wire.
- *
- * Gated by [SessionGate]: a dial behind a live session, or beside one already in flight, returns
- * `0` without touching the host. Returns the session handle, or `0` on failure. Call off the main
- * thread.
+ * The one place [NativeBridge.nativeConnect] is assembled, for [JniHostNative]. Derives the mode,
+ * HDR and gamepad settings the host needs from [spec]'s settings, waits for the last session's
+ * close, and dials off the main thread. The dial cannot be interrupted, so it runs
+ * `NonCancellable`. Returns the session handle, or `0` on failure.
  */
-suspend fun connectToHost(
-    context: Context,
-    settings: Settings,
-    identity: ClientIdentity,
-    host: String,
-    port: Int,
-    pinHex: String,
-    launch: String?,
-    dialer: String,
-    timeoutMs: Int = CONNECT_TIMEOUT_MS,
-    preset: StreamPreset? = null,
-    // [DELIVERY_PROBE_ONLY] for a network check; a plain connect streams.
-    deliveryFlags: Int = 0,
-    // The host profile to play as (its id); `null` sends none.
-    profile: String? = null,
-): Long {
-    // One launch, one session: every shell's connect lands here, so the refusal lives here too.
-    if (!SessionGate.take()) {
-        Log.w("punktfunk", "dial refused ($dialer): this device already has a session or a dial in hand")
-        return 0L
-    }
-    try {
-        return dial(
-            context, settings, identity, host, port, pinHex, launch, dialer, timeoutMs, preset,
-            deliveryFlags, profile,
-        )
-    } finally {
-        SessionGate.release()
-    }
-}
-
-/** [connectToHost] with the gate already taken. */
-private suspend fun dial(
-    context: Context,
-    settings: Settings,
-    identity: ClientIdentity,
-    host: String,
-    port: Int,
-    pinHex: String,
-    launch: String?,
-    dialer: String,
-    timeoutMs: Int,
-    preset: StreamPreset?,
-    deliveryFlags: Int,
-    profile: String?,
-): Long {
+suspend fun connectToHost(context: Context, spec: DialSpec): Long {
+    val settings = spec.settings
     // Advertise HDR only when the user enabled it AND this device's display can present it (else the
     // host sends a proper SDR stream rather than PQ the panel would mis-tone-map).
     val (baseW, baseH, hz) = settings.effectiveMode(context)
@@ -237,7 +173,7 @@ private suspend fun dial(
     val (audioRateHz, audioBits) = settings.audioFormatWire()
     // NonCancellable: a cancelled withContext drops its result, and the dial cannot be
     // interrupted — the session would open with nobody to close it.
-    val handle = withContext(Dispatchers.IO + NonCancellable) {
+    return withContext(Dispatchers.IO + NonCancellable) {
         SessionGate.awaitClosed() // the last stream's close, which its screen handed off
         // Transport-level half of "Low-latency mode (experimental)" (DSCP marking on the media
         // sockets) — must be applied before connect, since sockets are tagged at creation.
@@ -270,8 +206,8 @@ private suspend fun dial(
                 " (lowLatency=${settings.lowLatencyMode})",
         )
         val request = ConnectRequest(
-            host = host, port = port, width = w, height = h, refreshHz = hz,
-            certPem = identity.certPem, keyPem = identity.privateKeyPem, pinHex = pinHex,
+            host = spec.host, port = spec.port, width = w, height = h, refreshHz = hz,
+            certPem = spec.identity.certPem, keyPem = spec.identity.privateKeyPem, pinHex = spec.pinHex,
             bitrateKbps = if (pyrowave) 0 else settings.bitrateKbps, compositorPref = settings.compositor,
             pyrowaveBppX100 = settings.pyrowaveBppX100(), gamepadPref = gamepadPref,
             hdrEnabled = hdrEnabled, tenBitSdr = tenBitSdr, multiSliceOk = multiSlice,
@@ -285,8 +221,8 @@ private suspend fun dial(
             // What this device can decode (H.264 always; HEVC and AV1 when a real decoder exists) +
             // the soft codec preference (user choice, or the Automatic AV1 rule above) — the
             // host resolves the emitted codec from both.
-            videoCodecs = codecBits, preferredCodec = preferredCodec, timeoutMs = timeoutMs,
-            launch = launch,
+            videoCodecs = codecBits, preferredCodec = preferredCodec, timeoutMs = spec.timeoutMs,
+            launch = spec.launch,
             // The host's approval-list / trust-store label for this device — the same
             // user-set device name the pairing dialogs offer for nativePair.
             deviceName = deviceName(context),
@@ -299,17 +235,12 @@ private suspend fun dial(
             videoFit = settings.videoFit,
             // Which build, and which shell and path, opened this session — the host's
             // `handshake complete` `client=` field.
-            dialer = "android ${appVersion(context)} $dialer",
-            presetId = preset?.id,
-            presetName = preset?.name,
-            deliveryFlags = deliveryFlags,
-            profile = profile,
+            dialer = "android ${appVersion(context)} ${spec.dialer}",
+            presetId = spec.preset?.id,
+            presetName = spec.preset?.name,
+            deliveryFlags = spec.deliveryFlags,
+            profile = spec.profile,
         )
         NativeBridge.nativeConnect(request.toJson())
     }
-    if (handle != 0L && !currentCoroutineContext().isActive) {
-        withContext(Dispatchers.IO + NonCancellable) { NativeBridge.nativeClose(handle) }
-    }
-    currentCoroutineContext().ensureActive()
-    return handle
 }
