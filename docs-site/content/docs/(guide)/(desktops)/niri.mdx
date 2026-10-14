@@ -118,6 +118,12 @@ session, as above, and leave the pin unset.
 The log adds niri's reason, such as `not supported on the Winit backend`. This niri runs as a
 window inside another compositor, and a nested niri can't host virtual outputs. Run niri on a TTY.
 
+### "no X display for the launch"
+
+niri runs X11 apps, Steam and Lutris among them, through `xwayland-satellite`, and turns its X11
+support off when that isn't installed. Install `xwayland-satellite`, log out and back in, and
+launch again.
+
 ### "no direct capture on this compositor — using the ScreenCast portal"
 
 The stream carries on through niri's built-in screencast; the log's `reason` says why direct
