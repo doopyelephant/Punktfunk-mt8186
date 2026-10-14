@@ -268,6 +268,14 @@ struct ContentView: View {
             } message: { confirm in
                 Text(confirm.message)
             }
+            #if os(iOS)
+            // A phone holds landscape under both; `home` shows the console.
+            .onChange(of: gamepadUIActive && (model.connection == nil || consoleHoldsStream),
+                      initial: true) { _, shown in LandscapeLock.console = shown }
+            .onChange(of: model.connection != nil, initial: true) { _, up in
+                LandscapeLock.streaming = up
+            }
+            #endif
     }
 
     /// The confirmed link's action: exactly what a `.known` (id-referenced) link would have done,
