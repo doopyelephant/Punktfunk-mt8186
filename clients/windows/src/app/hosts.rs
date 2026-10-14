@@ -781,11 +781,10 @@ fn arrange_button(props: &HostsProps, settings: &Settings) -> Button {
             let Some((_, key, value)) = table.iter().find(|(label, ..)| *label == item) else {
                 return;
             };
-            // Whole-file writer: rebase on the store before mutating, or a setting
-            // another surface just wrote is reverted.
-            let mut settings = Settings::load();
-            settings.extra.insert((*key).into(), (*value).into());
-            settings.save();
+            Settings::update(|s| {
+                s.extra.insert((*key).into(), (*value).into());
+                true
+            });
             set_hosts_rev.call(hosts_rev + 1);
         })
 }
@@ -1121,13 +1120,12 @@ fn saved_menu(
                 MenuAction::Pin(id, on) => {
                     pin_tile(&svc, &who, id, *on, (hosts_rev, &set_hosts_rev))
                 }
-                // Whole-file writer: rebase on the store before mutating, or a setting
-                // another surface just wrote is reverted.
                 MenuAction::ToggleDefault => {
-                    let mut settings = Settings::load();
-                    let on = settings.default_host != record_id;
-                    settings.default_host = on.then(|| record_id.clone()).flatten();
-                    settings.save();
+                    Settings::update(|s| {
+                        let on = s.default_host != record_id;
+                        s.default_host = on.then(|| record_id.clone()).flatten();
+                        true
+                    });
                     svc.set_status.call(String::new());
                     set_hosts_rev.call(hosts_rev + 1);
                 }

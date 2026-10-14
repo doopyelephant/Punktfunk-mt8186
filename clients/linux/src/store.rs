@@ -76,14 +76,16 @@ impl Store {
         Ok(r)
     }
 
-    /// Re-read the settings file, apply `f`, save, and tell the listeners. A failed write is
-    /// logged by nobody, like every settings save: it must never take a stream down.
+    /// [`Settings::update`], then tell the listeners. A failed write is logged by nobody, like
+    /// every settings save: it must never take a stream down.
     pub fn update_settings<R>(&self, f: impl FnOnce(&mut Settings) -> R) -> R {
-        let mut s = Settings::load();
-        let r = f(&mut s);
-        s.save();
+        let mut r = None;
+        let s = Settings::update(|s| {
+            r = Some(f(s));
+            true
+        });
         self.set(Changed::Settings, s, &self.settings);
-        r
+        r.expect("Settings::update runs its edit")
     }
 
     /// [`PresetsFile::update`], then tell the listeners.

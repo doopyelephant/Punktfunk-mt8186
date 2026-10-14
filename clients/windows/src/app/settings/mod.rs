@@ -49,20 +49,19 @@ pub(super) fn commit(
     edit: impl FnOnce(&mut Settings),
 ) {
     if scope.is_empty() {
-        // Rebase on the file before the whole-struct save: a spawned session and the console
-        // write it too (match-window size, their own settings), and saving the stale snapshot
-        // in `ctx.settings` would revert them. presets.rs says why there is no merge. The
-        // snapshot follows the fresh load, so every row renders what is on disk.
+        // Edit the file under its lock, never the snapshot: a spawned session and the console
+        // write it too (match-window size, their own settings). The snapshot follows the
+        // result, so every row renders what is on disk.
         let mut s = ctx.settings.lock().unwrap();
-        *s = Settings::load();
-        edit(&mut s);
-        s.save();
+        *s = Settings::update(|file| {
+            edit(file);
+            true
+        });
         rev.1.call(rev.0 + 1);
         return;
     }
-    // The same rebase as the global arm above: the preset's effective values derive from
-    // `base`, and another process (session resize, console UI, Decky) may have moved a
-    // global under the snapshot.
+    // The file, not the snapshot, here too: the preset's effective values derive from `base`,
+    // and another process (session resize, console UI, Decky) may have moved a global.
     let base = {
         let mut s = ctx.settings.lock().unwrap();
         *s = Settings::load();

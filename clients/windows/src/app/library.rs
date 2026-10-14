@@ -327,9 +327,10 @@ fn sort_row(current: SortKey, on_pick: impl Fn(SortKey) + 'static) -> Element {
                     return;
                 };
                 let key = *key;
-                let mut settings = Settings::load();
-                settings.library_sort = key.id().to_string();
-                settings.save();
+                Settings::update(|s| {
+                    s.library_sort = key.id().to_string();
+                    true
+                });
                 *STORED_SORT.lock().unwrap() = Some(key);
                 on_pick(key);
             }),
