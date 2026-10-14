@@ -6,7 +6,9 @@
 //! absent, not clean.
 
 /// One report window: the pump's tick, the controller's unit of time, and
-/// the cadence the host reads a missing loss report against.
+/// the cadence the host reads a missing loss report against. A window the client
+/// discards (probe tail, host pipeline gap) sends no report, so a report a window
+/// late is a discard, not jitter.
 pub const WINDOW: std::time::Duration = std::time::Duration::from_micros(WINDOW_US as u64);
 /// The same, in µs, where the arithmetic is integer.
 pub(crate) const WINDOW_US: i64 = 750_000;

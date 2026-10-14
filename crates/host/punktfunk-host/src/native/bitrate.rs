@@ -385,7 +385,7 @@ impl UnrecoveredRun {
 
     /// Close the window this report ends; returns the run it leaves.
     pub(super) fn report(&mut self, now: std::time::Instant) -> u32 {
-        let late = punktfunk_core::client::ADAPT_REPORT_INTERVAL * 3 / 2;
+        let late = punktfunk_core::abr::WINDOW * 3 / 2;
         let discarded = self
             .last_report
             .is_some_and(|t| now.duration_since(t) > late);
@@ -765,7 +765,7 @@ mod tests {
     /// it must not leak into the clean window that follows.
     #[test]
     fn an_rfi_from_a_discarded_window_does_not_price_the_next_report() {
-        let w = punktfunk_core::client::ADAPT_REPORT_INTERVAL;
+        let w = punktfunk_core::abr::WINDOW;
         let t0 = std::time::Instant::now();
         let mut run = UnrecoveredRun::default();
         assert_eq!(run.report(t0), 0);

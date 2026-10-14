@@ -8,11 +8,12 @@
 //!
 //! Two detectors: clock-based (`FLUSH_LATENCY` / `FLUSH_AFTER`, disarmed when
 //! `clock_offset_ns == 0`) and clock-free (`QUEUE_HIGH` / `STANDING_TIME`).
-//! The host recovery-cadence detector compares against `FLUSH_COOLDOWN` and
-//! `NO_VIDEO_RETRY` themselves — do not copy the numbers.
+//! The jump spacing is [`FLUSH_COOLDOWN`], in [`crate::reanchor`] where the host's
+//! recovery-cadence detector reads it.
 //!
 //! Tests in this file; pump wiring in `client/pump/data.rs`.
 
+use crate::reanchor::FLUSH_COOLDOWN;
 use crate::session::Frame;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,26 +52,6 @@ pub(crate) const FLUSH_LATENCY: Duration = Duration::from_millis(400);
 /// clock-based jump. 250 ms: a genuine standing queue puts every frame over the
 /// bound; a one-off (IDR, scan blip) clears in a frame or two and resets the run.
 pub(crate) const FLUSH_AFTER: Duration = Duration::from_millis(250);
-
-/// Minimum spacing between jump-to-live events. A bottleneck that rebuilds the
-/// queue instantly then degrades to a periodic skip instead of a keyframe storm.
-///
-/// Public: the host recovery-cadence detector compares against this constant, not
-/// a copy. Each jump asks for a keyframe at exactly this period forever; that
-/// perfect 2 s cadence is this cooldown, not a physical display disturbance.
-pub const FLUSH_COOLDOWN: Duration = Duration::from_secs(2);
-
-/// Keyframe re-ask spacing while no video has arrived — the opposite of
-/// [`FLUSH_COOLDOWN`] (nothing vs too much). Public and 2600 ms (not 2000) so
-/// the host recovery-cadence detector can tell the two faults apart; embedders
-/// own this timer and must use this constant. The delivery count in each feedback
-/// window settles it.
-pub const NO_VIDEO_RETRY: Duration = Duration::from_millis(2600);
-
-/// One adaptive-FEC / ABR report window. A window the client discards (probe
-/// tail, host pipeline gap) sends no report, so the host
-/// reads a report later than this by a window as a discard, not jitter.
-pub const ADAPT_REPORT_INTERVAL: Duration = crate::abr::WINDOW;
 
 /// A clock-triggered jump that discarded fewer datagrams than this (and no queued
 /// AUs) found no local backlog. Flushing helps neither a wall-clock step (NTP

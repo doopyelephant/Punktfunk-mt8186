@@ -47,9 +47,9 @@ pub mod sc2;
 use crate::rumble;
 mod worker;
 
-pub use self::frame_channel::{ADAPT_REPORT_INTERVAL, FLUSH_COOLDOWN, NO_VIDEO_RETRY};
 pub use self::planes::AudioPacket;
 pub use self::probe::ProbeOutcome;
+pub use crate::reanchor::{FLUSH_COOLDOWN, NO_VIDEO_RETRY};
 
 pub use crate::audio::{
     audio_mute_label, audio_mute_notice, mic_mute_label, mic_mute_notice, AUDIO_MUTE_HOST,
