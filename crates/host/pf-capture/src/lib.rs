@@ -843,28 +843,12 @@ pub struct IddPushOpts {
 /// Windows IDD direct-push capturer on a pf-vdisplay target. On failure `keepalive` is handed
 /// back so the caller can retire the display.
 #[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
 pub fn open_idd_push(
     target: pf_frame::dxgi::WinCaptureTarget,
     preferred: Option<(u32, u32, u32)>,
-    want_hdr: bool,
-    ten_bit_sdr: bool,
-    want_444: bool,
-    pyrowave: bool,
     keepalive: Box<dyn Send>,
-    cursor_sender: Option<CursorChannelSender>,
-    cursor_forward: Option<CursorForwardSender>,
-    forwards_to_client: bool,
+    opts: IddPushOpts,
 ) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
-    let opts = IddPushOpts {
-        want_hdr,
-        ten_bit_sdr,
-        want_444,
-        pyrowave,
-        cursor_sender,
-        cursor_forward,
-        forwards_to_client,
-    };
     idd_push::IddPushCapturer::open(target, preferred, keepalive, opts)
         .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
