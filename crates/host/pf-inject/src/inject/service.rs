@@ -58,8 +58,6 @@ struct InjectorSlot {
     open_backend: Option<Backend>,
     /// Last open or inject failure. The next open waits [`INJECTOR_REOPEN_BACKOFF`] from it.
     last_failed: Option<std::time::Instant>,
-    /// What the open injector's keyboard holds; repeats and stale ups stop here.
-    gate: KeyGate,
 }
 
 impl InjectorSlot {
@@ -129,7 +127,6 @@ impl InjectorSlot {
                 self.injector = Some(i);
                 self.open_backend = want;
                 self.last_failed = None;
-                self.gate.reset();
             }
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "pointer/keyboard injection unavailable — will retry");
@@ -138,16 +135,13 @@ impl InjectorSlot {
         }
     }
 
-    /// Inject in order, key transitions only ([`KeyGate`]). A failure drops the injector and
-    /// the rest of the batch, which is stale by the time a later event reopens it.
+    /// Inject in order. A failure drops the injector and the rest of the batch, which is stale
+    /// by the time a later event reopens it.
     fn inject_batch(&mut self, batch: Vec<InputEvent>) {
         let Some(inj) = self.injector.as_mut() else {
             return;
         };
         for ev in batch {
-            if !self.gate.admit(&ev) {
-                continue;
-            }
             if let Err(e) = inj.inject(&ev) {
                 self.fail(&e);
                 return;
@@ -165,7 +159,7 @@ fn injector_service_thread(
     pin: Option<std::path::PathBuf>,
 ) {
     let mut slot = InjectorSlot::default();
-    let mut warped_gen = crate::aim_gen();
+    let mut warped_gen = crate::aim().generation;
     while let Some(batch) = slot.next_batch(&rx) {
         // Read the published backend from its `RwLock`, not `getenv`: `setenv` on connect raced
         // this hot path. A pin never follows; its target can only die.
@@ -192,51 +186,21 @@ fn injector_service_thread(
             Ok(opened)
         });
         if slot.injector.is_some() {
+            let aim = crate::aim();
             slot.inject_batch(warp_onto_stream_head(
                 coalesce(batch),
-                crate::aim_gen(),
+                aim.generation,
                 &mut warped_gen,
-                crate::stream_extent(),
+                aim.target.extent,
             ));
         }
     }
     tracing::debug!("injector service stopped (host shutting down)");
 }
 
-/// Key transitions only, toward a compositor. A client forwards its OS auto-repeat as more
-/// downs; a Wayland app repeats a held key itself, and Hyprland matches binds on every press
-/// it is handed, so a repeat re-ran a chord's bind and could eat the key's release. A down
-/// for a held key and an up for a key that is not held stop here. Windows keeps repeats:
-/// `SendInput` never repeats on its own.
-#[derive(Default)]
-struct KeyGate {
-    held: std::collections::HashSet<u8>,
-}
-
-impl KeyGate {
-    /// Whether `ev` changes what the compositor holds. Every other kind passes.
-    fn admit(&mut self, ev: &InputEvent) -> bool {
-        if cfg!(target_os = "windows") {
-            return true;
-        }
-        // The injectors take the low byte as the VK; so does the gate.
-        let vk = ev.code as u8;
-        match ev.kind {
-            InputKind::KeyDown => self.held.insert(vk),
-            InputKind::KeyUp => self.held.remove(&vk),
-            _ => true,
-        }
-    }
-
-    /// New devices hold nothing: the next down of a still-held key is a press again.
-    fn reset(&mut self) {
-        self.held.clear();
-    }
-}
-
-/// Centre of the streamed head: a sample at half of `extent`, which is the head's own mode when
-/// [`crate::stream_extent`] knows it — libei resolves its region by that size — and `2×2`
-/// otherwise, since every other backend normalizes the position and takes any extent.
+/// Centre of the streamed head: a sample at half of `extent`, which is the head's own mode once
+/// [`crate::set_stream_extent`] published it — libei resolves its region by that size — and
+/// `2×2` otherwise, since every other backend normalizes the position and takes any extent.
 fn head_centre(extent: Option<(u16, u16)>) -> InputEvent {
     let (w, h) = extent.filter(|(w, h)| *w > 1 && *h > 1).unwrap_or((2, 2));
     InputEvent {
@@ -252,8 +216,8 @@ fn head_centre(extent: Option<(u16, u16)>) -> InputEvent {
 /// Start a session's first pointer motion on the streamed head. The host pointer sits wherever
 /// the operator left it — on an extended desktop that is another monitor, and a relative delta
 /// has no way to cross onto the streamed one. Absolute motion already lands there and only
-/// clears the debt. One warp per capture bring-up ([`crate::aim_gen`]), and only once the client
-/// actually moves, so an idle session never takes the operator's pointer.
+/// clears the debt. One warp per capture bring-up ([`crate::AimState::generation`]), and only
+/// once the client actually moves, so an idle session never takes the operator's pointer.
 fn warp_onto_stream_head(
     events: Vec<InputEvent>,
     aim: u64,
@@ -533,26 +497,14 @@ mod tests {
         assert_eq!((out[1].x, out[1].flags), (240, 0));
     }
 
-    /// A repeat and a stale up stop at the gate; the one up after repeats passes, and a
-    /// reopened device sees the still-held key pressed again.
+    /// Every key event reaches the injector: each Linux device gates its own keys in its plan,
+    /// and `SendInput` keeps every repeat because it never repeats on its own.
     #[test]
-    #[cfg_attr(target_os = "windows", ignore = "SendInput keeps every repeat")]
-    fn the_key_gate_passes_transitions_only() {
-        let mut gate = KeyGate::default();
-        let down = mk(InputKind::KeyDown, 0x41, 0, 0);
-        let up = mk(InputKind::KeyUp, 0x41, 0, 0);
-        assert!(gate.admit(&down));
-        assert!(!gate.admit(&down), "auto-repeat");
-        assert!(gate.admit(&mk(InputKind::MouseMove, 0, 1, 1)));
-        assert!(gate.admit(&mk(InputKind::KeyDown, 0x42, 0, 0)));
-        assert!(gate.admit(&up));
-        assert!(!gate.admit(&up), "stale up");
-        assert!(gate.admit(&down));
-        gate.reset();
-        assert!(gate.admit(&down), "a new device holds nothing");
-        assert!(
-            !gate.admit(&mk(InputKind::KeyDown, 0x141, 0, 0)),
-            "same low byte"
-        );
+    fn the_service_passes_every_key_event() {
+        let log = Rc::default();
+        let mut slot = InjectorSlot::default();
+        slot.ensure_open(None, || fake(&log, None));
+        slot.inject_batch(keys(&[0x41, 0x41, 0x41]));
+        assert_eq!(*log.borrow(), [0x41, 0x41, 0x41]);
     }
 }

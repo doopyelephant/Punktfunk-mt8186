@@ -40,22 +40,23 @@ static STATE: Mutex<State> = Mutex::new(State {
     queried: None,
 });
 
-/// Publish the streamed output (its CCD target id) that absolute input maps into. The host calls
-/// this at capture bring-up; it is never cleared at teardown — a deactivated target simply stops
-/// resolving (the last-known rect is kept, and nothing injects between sessions), and the next
-/// session's bring-up re-targets. One slot per process: with parallel sessions the LAST bring-up
-/// wins for every session's absolute input — per-session routing needs source-tagged input
-/// events (parallel-displays plan) and the single slot is never worse than the historical
-/// whole-desktop mapping.
+/// Publish the streamed output (its CCD target id) that absolute input maps into, at capture
+/// bring-up, then bump the aim generation: whoever sees the new generation finds this target.
+/// Never cleared at teardown: a deactivated target stops resolving, the last-known rect stays,
+/// and nothing injects between sessions. One slot per process: with parallel sessions the last
+/// bring-up wins for every session's absolute input; per-session routing needs source-tagged
+/// input events (parallel-displays plan).
 pub fn set_stream_target(target: Option<pf_win_display::win_display::CcdTargetKey>) {
-    crate::bump_aim_gen();
-    let mut st = STATE.lock().unwrap();
-    if st.target != target {
-        tracing::info!(?target, "absolute-input stream target set");
-        st.target = target;
-        st.rect = None;
-        st.queried = None;
+    {
+        let mut st = STATE.lock().unwrap();
+        if st.target != target {
+            tracing::info!(?target, "absolute-input stream target set");
+            st.target = target;
+            st.rect = None;
+            st.queried = None;
+        }
     }
+    crate::publish_aim(true, |_| {});
 }
 
 /// Cached streamed-output rect. `None` = no target / never resolved

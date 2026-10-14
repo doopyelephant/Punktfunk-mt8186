@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 const MAX_HELD: usize = 256;
 
 /// Fed every event on its way to the injector; [`Self::release`] at session end.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct HeldInput {
     buttons: HashSet<u32>,
     /// Code → the press's [`crate::KEY_FLAG_SEMANTIC_VK`]: the release resolves a semantic key
@@ -19,20 +19,20 @@ pub struct HeldInput {
 }
 
 impl HeldInput {
-    pub fn note(&mut self, ev: &InputEvent) {
+    /// Record `ev`; `true` when it changes what is held. A down for a code already held, an up
+    /// for one that is not, a down past the cap and every other kind are `false`.
+    pub fn note(&mut self, ev: &InputEvent) -> bool {
         match ev.kind {
             InputKind::KeyDown
                 if self.keys.len() < MAX_HELD || self.keys.contains_key(&ev.code) =>
             {
-                self.keys
-                    .insert(ev.code, ev.flags & crate::KEY_FLAG_SEMANTIC_VK);
-                return;
+                return self
+                    .keys
+                    .insert(ev.code, ev.flags & crate::KEY_FLAG_SEMANTIC_VK)
+                    .is_none();
             }
-            InputKind::KeyDown => return,
-            InputKind::KeyUp => {
-                self.keys.remove(&ev.code);
-                return;
-            }
+            InputKind::KeyDown => return false,
+            InputKind::KeyUp => return self.keys.remove(&ev.code).is_some(),
             _ => {}
         }
         let (set, down) = match ev.kind {
@@ -44,13 +44,18 @@ impl HeldInput {
             #[cfg(windows)]
             InputKind::TouchMove => (&mut self.touch, true),
             InputKind::TouchUp => (&mut self.touch, false),
-            _ => return,
+            _ => return false,
         };
-        if !down {
-            set.remove(&ev.code);
-        } else if set.len() < MAX_HELD {
-            set.insert(ev.code);
+        if down {
+            set.len() < MAX_HELD && set.insert(ev.code)
+        } else {
+            set.remove(&ev.code)
         }
+    }
+
+    /// The key codes held, in no order.
+    pub fn keys(&self) -> impl Iterator<Item = u32> + '_ {
+        self.keys.keys().copied()
     }
 
     pub fn is_empty(&self) -> bool {

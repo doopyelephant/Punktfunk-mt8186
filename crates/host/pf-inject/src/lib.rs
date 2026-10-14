@@ -16,10 +16,8 @@ use punktfunk_core::input::{InputEvent, InputKind};
 
 #[path = "inject/keymap.rs"]
 mod keymap;
-#[cfg(target_os = "linux")]
-pub(crate) use keymap::gs_button_to_evdev;
 pub use keymap::KEY_FLAG_SEMANTIC_VK;
-// Linux injectors always call this; Windows only the SendInput mirror test. Keep the re-export.
+// The Linux plan maps keys through this; the SendInput mirror test pins its table to it.
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub use keymap::vk_to_evdev;
 
@@ -41,6 +39,11 @@ pub mod scroll;
 /// ungated like [`scroll`].
 #[path = "inject/head_pick.rs"]
 mod head_pick;
+
+/// Keys and pointer → what a Linux backend emits, and what its device holds. Pure and ungated
+/// like [`scroll`].
+#[path = "inject/plan.rs"]
+mod plan;
 
 /// Host-session injector. Not `Send`: owns compositor resources and stays on the control
 /// thread that created it.
@@ -154,40 +157,60 @@ impl AbsoluteAnchor {
     }
 }
 
-/// Current absolute-coordinate anchor. `RwLock` not env: the injector is host-lifetime behind
+/// Where absolute input aims, as the host published it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct AimState {
+    /// The session's output name, the streamed head's mode and the host-wide anchor.
+    pub target: head_pick::StreamTarget,
+    /// Capture bring-ups so far, unchanged head included: a new session owes a warp too.
+    pub generation: u64,
+}
+
+/// One lock, so a reader sees one aim. `RwLock` not env: the injector is host-lifetime behind
 /// a channel, so a session reaches it only through typed process state. See `SESSION_BACKEND`.
-static ABSOLUTE_ANCHOR: std::sync::RwLock<Option<AbsoluteAnchor>> = std::sync::RwLock::new(None);
+static AIM: std::sync::RwLock<AimState> = std::sync::RwLock::new(AimState {
+    target: head_pick::StreamTarget {
+        name: None,
+        extent: None,
+        anchor: None,
+    },
+    generation: 0,
+});
 
-/// Capture bring-ups so far — every publish of an aim slot (`set_stream_output`,
-/// `set_stream_target`) bumps it, unchanged name included: a new session owes a warp too.
-static AIM_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Called by both aim slots. Cross-platform: the debt is a pointer position, not a backend.
-pub(crate) fn bump_aim_gen() {
-    AIM_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// The aim in one read.
+pub(crate) fn aim() -> AimState {
+    AIM.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-pub(crate) fn aim_gen() -> u64 {
-    AIM_GEN.load(std::sync::atomic::Ordering::Relaxed)
+/// Write the aim under its lock. A capture bring-up bumps the generation after its head is in
+/// place, in the same write, so a reader that sees the new generation sees that head.
+pub(crate) fn publish_aim(bring_up: bool, write: impl FnOnce(&mut head_pick::StreamTarget)) {
+    let mut aim = AIM.write().unwrap_or_else(|e| e.into_inner());
+    write(&mut aim.target);
+    if bring_up {
+        aim.generation += 1;
+    }
 }
-
-/// Largest normalised absolute position. A client may send `x == w` (a touch on the far edge);
-/// mapped as 1.0 that lands one pixel past the head, on the neighbouring monitor.
-#[cfg(target_os = "linux")]
-pub(crate) const ABS_EDGE: f32 = 1.0 - 1.0 / 65536.0;
-
-/// Streamed head's mode, published beside the aim at capture bring-up.
-static STREAM_EXTENT: std::sync::RwLock<Option<(u16, u16)>> = std::sync::RwLock::new(None);
 
 /// Extent the pointer warp sends its centre at. A backend that resolves an absolute sample by
 /// SIZE (libei regions) only recognizes the streamed head at the head's own mode; the others
 /// normalize and take any extent. `None` leaves the warp on its neutral extent.
 pub fn set_stream_extent(mode: Option<(u16, u16)>) {
-    *STREAM_EXTENT.write().unwrap_or_else(|e| e.into_inner()) = mode;
+    publish_aim(false, |t| t.extent = mode);
 }
 
-pub(crate) fn stream_extent() -> Option<(u16, u16)> {
-    *STREAM_EXTENT.read().unwrap_or_else(|e| e.into_inner())
+#[cfg(test)]
+mod aim_tests {
+    /// A bring-up's head and its generation land in one write, so one read sees both.
+    #[test]
+    fn a_bring_up_publishes_its_head_with_its_generation() {
+        let before = super::aim().generation;
+        super::publish_aim(true, |t| t.extent = Some((1234, 567)));
+        let aim = super::aim();
+        assert!(aim.generation > before);
+        assert_eq!(aim.target.extent, Some((1234, 567)));
+        super::set_stream_extent(None);
+    }
 }
 
 /// Pin absolute coordinates to a specific output. `None` keeps size-matching.
@@ -198,36 +221,28 @@ pub(crate) fn stream_extent() -> Option<(u16, u16)> {
 ///
 /// The wlroots backend ignores this and aims via `stream_output::set_stream_output`, which
 /// the host publishes per session (last-bring-up-wins, same as Windows `stream_target`).
-/// Separate slots: this is the operator's host-wide capture pin, recomputed from policy;
-/// stream output is the head the session's capture actually attached to.
+/// Separate fields of the aim: this is the operator's host-wide capture pin, recomputed from
+/// policy; stream output is the head the session's capture actually attached to.
 pub fn set_absolute_anchor(anchor: Option<AbsoluteAnchor>) {
     let anchor = anchor.filter(|a| !a.is_empty());
     tracing::debug!(?anchor, "input: absolute-coordinate anchor set");
-    *ABSOLUTE_ANCHOR.write().unwrap_or_else(|e| e.into_inner()) = anchor;
+    publish_aim(false, |t| t.anchor = anchor);
 }
 
 pub fn absolute_anchor() -> Option<AbsoluteAnchor> {
-    ABSOLUTE_ANCHOR
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    aim().target.anchor
 }
 
-/// The session's output name, the streamed mode and the host-wide anchor, read together so
-/// one sample sees one aim.
+/// The session's output name, the streamed mode and the host-wide anchor, in one read.
 #[cfg(target_os = "linux")]
 pub(crate) fn stream_target() -> head_pick::StreamTarget {
-    head_pick::StreamTarget {
-        name: stream_output(),
-        extent: stream_extent(),
-        anchor: absolute_anchor(),
-    }
+    aim().target
 }
 
 /// Backend the live session resolved to. Host writes this from `pf_vdisplay::input_backend_id`
 /// on connect and on mid-stream Desktop↔Game switch.
 ///
-/// `RwLock` not env, same reason as [`ABSOLUTE_ANCHOR`]. [`default_backend`] runs once per
+/// `RwLock` not env, same reason as [`AIM`]. [`default_backend`] runs once per
 /// input batch; a `getenv` racing a per-session `setenv` is an `environ` data race with no
 /// attacker needed. Host-lifetime, last-write-wins; nothing clears it when a session ends.
 #[cfg(target_os = "linux")]
@@ -1028,6 +1043,26 @@ fn monotonic_us() -> u64 {
     // SAFETY: `CLOCK_MONOTONIC` is a valid clock id and `ts` is a live, writable timespec.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod clock_tests {
+    /// A stamp is a reading of `CLOCK_MONOTONIC` itself, not time since some private start.
+    #[test]
+    fn input_is_stamped_on_the_compositors_clock() {
+        let read = || {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: as in `monotonic_us`: a valid clock id and a live, writable timespec.
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+            ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000
+        };
+        let before = read();
+        let stamp = super::monotonic_us();
+        assert!((before..=read()).contains(&stamp));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
