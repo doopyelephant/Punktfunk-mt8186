@@ -236,6 +236,19 @@ export const LinuxDoorOff: Story = {
 	args: { door: { on: false, changing: false, onChange: noop } },
 };
 
+/** A box that can't turn the door on yet: the host's sentence says what to do, the switch waits. */
+export const LinuxDoorUnavailable: Story = {
+	args: {
+		door: {
+			on: false,
+			changing: false,
+			unavailable:
+				"This install is missing the punktfunk-seats package. Install it: sudo pacman -S punktfunk-seats",
+			onChange: noop,
+		},
+	},
+};
+
 /** The switch under way: the host and the console restart, then the page answers from the other. */
 export const LinuxDoorSwitching: Story = {
 	args: { door: { on: false, changing: true, onChange: noop } },

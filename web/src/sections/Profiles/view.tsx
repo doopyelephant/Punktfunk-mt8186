@@ -127,6 +127,8 @@ export type DoorControl = {
 	on: boolean;
 	/** The switch is under way: the host that answers is changing. */
 	changing: boolean;
+	/** What stops turning it on here, the host's sentence. The switch waits until it's fixed. */
+	unavailable?: string | null;
 	/** Opens the confirmation. */
 	onChange: () => void;
 };
@@ -226,6 +228,11 @@ const DoorRow: FC<{ door: DoorControl }> = ({ door }) => (
 					{m.profiles_door_games()}
 				</p>
 			)}
+			{!door.on && door.unavailable && (
+				<p className="text-sm text-amber-600 dark:text-amber-500">
+					{door.unavailable}
+				</p>
+			)}
 		</div>
 		{door.changing ? (
 			<span className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -237,6 +244,7 @@ const DoorRow: FC<{ door: DoorControl }> = ({ door }) => (
 				id="door-switch"
 				className="mt-1"
 				checked={door.on}
+				disabled={!door.on && !!door.unavailable}
 				onCheckedChange={() => door.onChange()}
 			/>
 		)}

@@ -12610,6 +12610,13 @@
             "type": "boolean",
             "description": "This host is the door (Linux, **Reachable without logging in**): a system service that\nplaces every connect on a seat and streams nothing itself."
           },
+          "door_unavailable": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why turning the door on would be refused here, as the operator's next move: the files a\nchannel installs it with are missing, or the account isn't in `punktfunk-update`. `null`\nwhen it would start, and on the door itself."
+          },
           "fingerprint": {
             "type": [
               "string",

@@ -71,11 +71,16 @@ background, and the monitor is never touched. It is also what gives a profile a 
 own: **Own desktop** is a user of its own with its own Steam, and up to four seats share the box,
 yours included.
 
-1. Add your user to the group that may start the switch:
+1. Add your user to the group that may start the switch, then restart the computer. The host
+   keeps the groups it started with, so logging out is not enough:
 
    ```sh
    sudo usermod -aG punktfunk-update $USER
    ```
+
+   On SteamOS, run `bash ~/punktfunk/scripts/steamdeck/update.sh` in Konsole instead and enter
+   your password: it sets the switch up and joins the group. Restart once after. On NixOS, set
+   `services.punktfunk.seats.enable = true` and rebuild.
 
 2. Open **Profiles** and tick **Reachable without logging in**. Confirm with the console
    password. The page reloads while the host restarts, and the console asks you to sign in again.
@@ -106,7 +111,8 @@ their own stay on the box, stopped, and come back with the switch.
 
 | Check | Fix |
 |---|---|
-| The switch says `Add … to the punktfunk-update group first` | Run the command in step 1, then try again. |
+| The switch says `Add … to the punktfunk-update group first` | Run the command in step 1, restart, then try again. |
+| The switch is greyed out, with a line under it | The line names what this box is missing and the command that adds it. Reload the page after. |
 | A profile shows **Unavailable** | Its seat didn't start. **Doctor** names the failing check. |
 
 ## How players pick
