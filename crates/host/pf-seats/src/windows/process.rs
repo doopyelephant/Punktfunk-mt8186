@@ -19,7 +19,6 @@ use std::io::Write as _;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::Path;
-use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     SetHandleInformation, GENERIC_WRITE, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
@@ -96,26 +95,6 @@ impl ChildProcess {
         unsafe { GetExitCodeProcess(HANDLE(self.process.as_raw_handle()), &mut code) }
             .map_err(|error| io_error("process_wait", "GetExitCodeProcess failed", error))?;
         Ok(Some(code))
-    }
-
-    pub(super) fn wait(
-        &self,
-        timeout: Duration,
-        mut cancelled: impl FnMut() -> bool,
-    ) -> WinResult<Option<u32>> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(code) = self.exit_code()? {
-                return Ok(Some(code));
-            }
-            if cancelled() {
-                return Ok(None);
-            }
-            if Instant::now() >= deadline {
-                return Ok(None);
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
     }
 
     pub(super) fn terminate(&self) {
