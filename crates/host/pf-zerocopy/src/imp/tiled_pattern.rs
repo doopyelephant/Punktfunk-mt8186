@@ -1,7 +1,7 @@
 //! A tiled BGRx dmabuf for the hand-run NVIDIA convert test: the shape a compositor hands
 //! the capture path. Test-only.
 
-use super::vkdev::{memory_type, MappedMemory};
+use super::vkdev::{format_modifiers, memory_type, MappedMemory};
 use anyhow::{Context, Result};
 use ash::vk;
 use std::os::fd::OwnedFd;
@@ -128,16 +128,7 @@ impl TiledPattern {
             let ext_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
             let ext_mod = ash::ext::image_drm_format_modifier::Device::new(&instance, &device);
             let fmt = vk::Format::B8G8R8A8_UNORM;
-            let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
-            let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
-            instance.get_physical_device_format_properties2(phys, fmt, &mut fp2);
-            let n = list.drm_format_modifier_count as usize;
-            let mut mods = vec![vk::DrmFormatModifierPropertiesEXT::default(); n];
-            let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
-                .drm_format_modifier_properties(&mut mods);
-            let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
-            instance.get_physical_device_format_properties2(phys, fmt, &mut fp2);
-            let tiled = mods
+            let tiled = format_modifiers(&instance, phys, fmt)
                 .iter()
                 .find(|m| {
                     m.drm_format_modifier != 0

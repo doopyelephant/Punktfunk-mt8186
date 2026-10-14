@@ -426,18 +426,7 @@ unsafe fn one_plane_modifiers(
     pd: vk::PhysicalDevice,
     fmt: vk::Format,
 ) -> Vec<u64> {
-    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
-    let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
-    instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
-    let mut props = vec![
-        vk::DrmFormatModifierPropertiesEXT::default();
-        list.drm_format_modifier_count as usize
-    ];
-    list.p_drm_format_modifier_properties = props.as_mut_ptr();
-    let mut fp2 = vk::FormatProperties2::default().push_next(&mut list);
-    instance.get_physical_device_format_properties2(pd, fmt, &mut fp2);
-    props.truncate(list.drm_format_modifier_count as usize);
-    props
+    pf_zerocopy::vkdev::format_modifiers(instance, pd, fmt)
         .into_iter()
         // Capture hands one fd/offset/stride.
         .filter(|p| p.drm_format_modifier_plane_count == 1)
