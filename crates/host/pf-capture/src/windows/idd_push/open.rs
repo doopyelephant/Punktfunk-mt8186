@@ -26,33 +26,16 @@ impl IddPushCapturer {
     ///
     /// There is no fallback capture path: the driver is the only Windows video
     /// source, and its encoder opens later, at `SET_ENCODE`.
-    #[allow(clippy::too_many_arguments)]
     pub fn open(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
-        want_hdr: bool,
-        ten_bit_sdr: bool,
-        want_444: bool,
-        pyrowave: bool,
         keepalive: Box<dyn Send>,
-        cursor_sender: Option<crate::CursorChannelSender>,
-        cursor_forward: Option<crate::CursorForwardSender>,
-        forwards_to_client: bool,
+        opts: crate::IddPushOpts,
     ) -> std::result::Result<Self, (anyhow::Error, Box<dyn Send>)> {
         // Idempotent: first capturer starts it so stall logs can correlate DWM holes
         // with OS display events for the session's life.
         pf_win_display::display_events::spawn_once();
-        match Self::open_inner(
-            target,
-            preferred,
-            want_hdr,
-            ten_bit_sdr,
-            want_444,
-            pyrowave,
-            cursor_sender,
-            cursor_forward,
-            forwards_to_client,
-        ) {
+        match Self::open_inner(target, preferred, opts) {
             Ok(mut me) => {
                 me._keepalive = keepalive;
                 Ok(me)
@@ -61,20 +44,20 @@ impl IddPushCapturer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn open_inner(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
-        want_hdr: bool,
-        ten_bit_sdr: bool,
-        want_444: bool,
-        pyrowave: bool,
-        cursor_sender: Option<crate::CursorChannelSender>,
-        cursor_forward: Option<crate::CursorForwardSender>,
-        // This session negotiated client-side cursor drawing (`HOST_CAP_CURSOR`). False ⇒ the
-        // pointer can only reach the wire through the driver pool's blend.
-        forwards_to_client: bool,
+        opts: crate::IddPushOpts,
     ) -> Result<Self> {
+        let crate::IddPushOpts {
+            want_hdr,
+            ten_bit_sdr,
+            want_444,
+            pyrowave,
+            cursor_sender,
+            cursor_forward,
+            forwards_to_client,
+        } = opts;
         let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the encoder's input")?;
         // The complete CCD identity every display-global helper below selects paths by (the
