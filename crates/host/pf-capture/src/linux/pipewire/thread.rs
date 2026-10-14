@@ -321,8 +321,8 @@ fn resolve_offer(
 ) -> Offer {
     if plan.gpu_import_latched {
         tracing::warn!(
-            "zero-copy GPU import disabled for this capture identity (repeated import-worker \
-             deaths or a previous dmabuf negotiation timeout) — using CPU path"
+            "zero-copy GPU import disabled for this capture identity (repeated lost imports or \
+             a previous dmabuf negotiation timeout) — using CPU path"
         );
     }
     let mut importer = if plan.build_importer {

@@ -158,7 +158,7 @@ fn handle_passthrough_fallback(ud: &mut UserData, reason: PassthroughFallback) -
         PassthroughFallbackAction::Cpu => true,
         PassthroughFallbackAction::Drop => false,
         PassthroughFallbackAction::DropTiledAndRebuild => {
-            if ud.signals.health.refuse_passthrough_tiled() {
+            if ud.signals.health.refuse(pf_zerocopy::Refusal::Tiled) {
                 tracing::warn!(
                     "tiled raw-dmabuf passthrough could not continue ({}) — capture rebuilds \
                      on LINEAR",
@@ -169,7 +169,7 @@ fn handle_passthrough_fallback(ud: &mut UserData, reason: PassthroughFallback) -
             false
         }
         PassthroughFallbackAction::DropPlanarAndRebuild => {
-            ud.signals.health.refuse_planar();
+            ud.signals.health.refuse(pf_zerocopy::Refusal::Planar);
             ud.signals.broken.store(true, Ordering::Relaxed);
             false
         }
