@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use bytemuck::Pod;
@@ -29,8 +29,9 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::idd_push::driver_encode::{open_remote_encoder, DriverEncodeParams, HandleTarget};
+use crate::pixelless::{self, DeliveryGate};
 use crate::worker_link::{Link, Message, Peer};
-use crate::{CapturedFrame, Capturer, EncodeCtlSender, FramePayload, PixelFormat, SetEncodeSender};
+use crate::{CapturedFrame, Capturer, EncodeCtlSender, PixelFormat, SetEncodeSender};
 
 /// How long the worker has to say hello. A process's first lines of `main`.
 const HELLO_BOUND: Duration = Duration::from_secs(5);
@@ -275,13 +276,6 @@ pub struct WgcSource {
     pub hdr: bool,
 }
 
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
 fn side(v: u32) -> Option<u32> {
     (1..=MAX_SIDE).contains(&v).then_some(v)
 }
@@ -359,8 +353,7 @@ pub fn open_wgc(
         height,
         fp16,
         encoder: None,
-        seen_seq: 0,
-        delivered: None,
+        delivery: DeliveryGate::new(),
         frames: 0,
         last_fresh: Instant::now(),
         _keepalive: keepalive,
@@ -378,10 +371,8 @@ struct WgcCapturer {
     fp16: bool,
     /// The session encoder's clocks, handed over once per loop tick.
     encoder: Option<pf_frame::health::EncoderTelemetry>,
-    /// The worker's source sequence at the last delivery.
-    seen_seq: u64,
-    /// The geometry last delivered; a new one is a delivery of its own.
-    delivered: Option<(u32, u32)>,
+    /// The freshness test, over the worker's source counter and the delivered size.
+    delivery: DeliveryGate<(u32, u32)>,
     frames: u64,
     /// When the worker's pool last took a frame, for the health surface.
     last_fresh: Instant,
@@ -415,33 +406,23 @@ impl WgcCapturer {
                 other => tracing::debug!(kind = other, "capture worker: unknown event"),
             }
         }
-        // The worker's pool counter is the only source clock this side has. Before the encoder
-        // opens there is none, and the loop needs one frame to open it.
-        let opened = self.encoder.is_some();
-        let seq = self.encoder.map_or(0, |t| t.source_seq);
-        let geometry = (self.width, self.height);
-        if opened && (seq == 0 || seq == self.seen_seq) && self.delivered == Some(geometry) {
+        let seq = self.encoder.map(|t| t.source_seq);
+        if !self.delivery.admit(seq, (self.width, self.height)) {
             return Ok(None);
         }
-        self.seen_seq = seq;
-        self.delivered = Some(geometry);
         self.frames += 1;
         self.last_fresh = Instant::now();
-        Ok(Some(CapturedFrame {
-            provenance: pf_frame::Provenance::source(self.frames, 0),
-            width: self.width,
-            height: self.height,
-            pts_ns: now_ns(),
-            format: if self.fp16 {
-                PixelFormat::P010
-            } else {
-                PixelFormat::Nv12
-            },
-            // No pixels cross the boundary: the loop sees `Encoder::ready_aus` answer `Some`
-            // and owes wire indexes instead of submitting this frame.
-            payload: FramePayload::Cpu(Vec::new()),
-            cursor: None,
-        }))
+        let format = if self.fp16 {
+            PixelFormat::P010
+        } else {
+            PixelFormat::Nv12
+        };
+        Ok(Some(pixelless::frame(
+            self.frames,
+            self.width,
+            self.height,
+            format,
+        )))
     }
 }
 

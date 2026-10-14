@@ -295,6 +295,7 @@ impl GsState {
 impl AppState {
     /// End the session if another client stole its display since the last call. A steal is
     /// a drop, not a quit: the display lingers for the stealer, as a native victim's does.
+    /// The summary says `stolen`, as a native victim's does.
     pub(crate) fn end_if_preempted(&self) -> bool {
         if !self
             .gs
@@ -303,6 +304,7 @@ impl AppState {
         {
             return false;
         }
+        crate::session_status::stolen_on(crate::events::Plane::Gamestream);
         self.end_session("another client took the display");
         true
     }

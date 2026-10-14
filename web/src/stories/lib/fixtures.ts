@@ -64,6 +64,7 @@ export const statusActive: RuntimeStatus = {
 		{
 			id: 1,
 			plane: "native",
+			phase: "streaming",
 			client: "aabbccddeeff",
 			client_name: "Living room TV",
 			profile: { id: "9a3f1c2b7e40", display_name: "Kid" },
@@ -80,6 +81,7 @@ export const statusActive: RuntimeStatus = {
 		{
 			id: 2,
 			plane: "native",
+			phase: "streaming",
 			client: "112233445566",
 			client_name: "Enrico's phone",
 			profile: { id: "4f1c3a9b0e27", display_name: "Enrico" },

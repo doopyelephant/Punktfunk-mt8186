@@ -3,13 +3,12 @@
 //! Enumeration copies session IDs and states before releasing WTS memory, then
 //! queries each user and domain through `WTSQuerySessionInformationW`. A usable
 //! seat session must be active, non-console, local to this computer, and match
-//! the complete account name under Windows case rules. Zero or multiple matches
-//! are errors after the bounded wait. Disconnected sessions remain visible to
-//! diagnostics but are never returned as display-capable. Logoff always takes
-//! the exact session ID recorded by the supervisor.
+//! the complete account name under Windows case rules. Multiple matches are an
+//! error; how long to wait for one is the supervisor's. Disconnected sessions
+//! remain visible to diagnostics but are never returned as display-capable.
+//! Logoff always takes the exact session ID recorded by the supervisor.
 
 use crate::windows::util::{backend_error, computer_name, io_error, WinResult};
-use std::time::{Duration, Instant};
 use windows::core::PWSTR;
 use windows::Win32::System::RemoteDesktop::{
     WTSActive, WTSDomainName, WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
@@ -103,32 +102,6 @@ fn one_account_session(account: &str, active_only: bool) -> WinResult<Option<Ses
             "wts_ambiguous",
             format!("{count} non-console local sessions match account '{account}'"),
         )),
-    }
-}
-
-pub(super) fn wait_for_active_account(
-    account: &str,
-    timeout: Duration,
-    mut cancelled: impl FnMut() -> WinResult<bool>,
-) -> WinResult<Session> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cancelled()? {
-            return Err(backend_error(
-                "rdp_keeper_exited",
-                "RDP keeper exited before its WTS session became active",
-            ));
-        }
-        if let Some(session) = active_for_account(account)? {
-            return Ok(session);
-        }
-        if Instant::now() >= deadline {
-            return Err(backend_error(
-                "wts_timeout",
-                format!("no active non-console WTS session appeared for '{account}'"),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(250));
     }
 }
 

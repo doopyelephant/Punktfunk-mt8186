@@ -344,15 +344,11 @@ async fn h_resume(
         return xml(error_xml(NOT_OWNER));
     }
     // PLAY skips if `streaming` is still true, so clear the flags and wait for exit.
-    let before = st.media_exited.load(std::sync::atomic::Ordering::SeqCst);
-    let expected = u64::from(
-        st.streaming
-            .swap(false, std::sync::atomic::Ordering::SeqCst),
-    ) + u64::from(
-        st.audio_streaming
-            .swap(false, std::sync::atomic::Ordering::SeqCst),
-    );
-    wait_media_exit(&st, before, expected).await;
+    st.streaming
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    st.audio_streaming
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    wait_media_idle(&st).await;
     // Resume mints new rikey; control-GCM and audio-CBC derive from it. Present → replace;
     // malformed → refuse (streaming on keys the client does not hold is worse); absent → keep.
     // Teardown during the wait can clear `launch`. ANNOUNCE re-negotiates audio — ignore
@@ -442,49 +438,20 @@ async fn h_unpair(
     )
 }
 
-/// Wait for `expected` stopped media threads to exit, so their teardown cannot stomp a
-/// successor's capturer or flags. 2 s bound: a timeout proceeds, media-less at worst.
-/// Until every media thread started has exited, at most 2 s, so the old session's ports are
-/// free and its capturer and lease teardown done before this session's PLAY.
+/// Until every media thread PLAY started has exited, at most 2 s, so the old session's ports
+/// are free and its capturer and lease teardown done before a successor's PLAY. A timeout
+/// proceeds, media-less at worst.
 async fn wait_media_idle(st: &AppState) {
-    use std::sync::atomic::Ordering::SeqCst;
-    let live = || {
-        st.media_started
-            .load(SeqCst)
-            .saturating_sub(st.media_exited.load(SeqCst))
-    };
-    if live() == 0 {
+    let live = st.media.wait_idle(std::time::Duration::ZERO).await;
+    if live == 0 {
         return;
     }
     tracing::info!(
-        threads = live(),
+        threads = live,
         "stopping the previous connection's media threads"
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while live() > 0 {
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!("previous media threads still exiting after 2 s; proceeding");
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-}
-
-async fn wait_media_exit(st: &AppState, before: u64, expected: u64) {
-    if expected == 0 {
-        return;
-    }
-    tracing::info!(
-        threads = expected,
-        "stopping the previous connection's media threads"
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while st.media_exited.load(std::sync::atomic::Ordering::SeqCst) < before + expected {
-        if std::time::Instant::now() >= deadline {
-            tracing::warn!("previous media threads still exiting after 2 s; proceeding");
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    if st.media.wait_idle(std::time::Duration::from_secs(2)).await > 0 {
+        tracing::warn!("previous media threads still exiting after 2 s; proceeding");
     }
 }
 
@@ -1248,15 +1215,14 @@ mod tests {
         st.streaming.store(true, SeqCst);
         st.audio_streaming.store(true, SeqCst);
         // Stand-in for the two media threads: they exit once their flags drop.
-        let threads = {
-            let st = st.clone();
-            tokio::spawn(async move {
-                while st.streaming.load(SeqCst) || st.audio_streaming.load(SeqCst) {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        for _ in 0..2 {
+            let flags = st.clone();
+            st.media.track(std::thread::spawn(move || {
+                while flags.streaming.load(SeqCst) || flags.audio_streaming.load(SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
-                st.media_exited.fetch_add(2, SeqCst);
-            })
-        };
+            }));
+        }
 
         let q = HashMap::from([
             ("rikey".to_string(), "22".repeat(16)),
@@ -1273,7 +1239,11 @@ mod tests {
             !st.streaming.load(SeqCst) && !st.audio_streaming.load(SeqCst),
             "the owner's media must stop"
         );
-        threads.await.unwrap();
+        assert_eq!(
+            st.media.wait_idle(std::time::Duration::from_secs(2)).await,
+            0,
+            "the owner's media threads are gone"
+        );
         assert!(!st.quit.load(SeqCst), "a steal is a drop, not a quit");
         assert_eq!(
             st.launch.lock().unwrap().as_ref().unwrap().owner_fp,

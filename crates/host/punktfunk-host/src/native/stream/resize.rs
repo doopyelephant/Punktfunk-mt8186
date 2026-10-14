@@ -25,7 +25,7 @@ impl StreamState {
         let vout = match crate::vdisplay::registry::acquire(
             &mut self.vd,
             new_display_mode,
-            self.quit.clone(),
+            self.life.quit_flag().clone(),
             None,
         ) {
             Ok(v) => v,
@@ -77,7 +77,7 @@ impl StreamState {
                     Ok(e) => break Some(e),
                     Err(e) => {
                         if std::time::Instant::now() >= open_deadline
-                            || self.quit.load(Ordering::Relaxed)
+                            || self.life.quit_flag().load(Ordering::Relaxed)
                         {
                             tracing::warn!(error = %format!("{e:#}"),
                                 "resize: re-opening the driver encoder at the new mode failed - full rebuild");

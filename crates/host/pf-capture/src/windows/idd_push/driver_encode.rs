@@ -521,6 +521,11 @@ impl Encoder for EncoderProxy {
         bail!("driver encode: the driver encodes; nothing to submit")
     }
 
+    fn submit_indexed(&mut self, frame: &CapturedFrame, _wire_index: u32) -> Result<()> {
+        // The driver numbers its own access units; `reset` rebases them.
+        self.submit(frame)
+    }
+
     fn caps(&self) -> EncoderCaps {
         self.caps
     }
@@ -616,6 +621,16 @@ impl Encoder for EncoderProxy {
             }
         }
         Ok(Some(frame))
+    }
+
+    fn set_pipelined(&mut self, _on: bool) -> bool {
+        // The driver's encode thread retrieves: there is no host-side wait to pipeline.
+        false
+    }
+
+    fn ready_event(&self) -> Option<isize> {
+        // `ready_aus` waits on the section's own event.
+        None
     }
 
     fn supports_chunked_poll(&self) -> bool {
@@ -752,8 +767,34 @@ impl Encoder for EncoderProxy {
         }
     }
 
+    fn set_send_spread_us(&mut self, _us: u32) {
+        // Only the Linux split arbiter prices a send.
+    }
+
+    fn set_input_ring_depth(&mut self, _depth: usize) {
+        // The driver owns its input ring.
+    }
+
+    fn set_input_crop(&mut self, _rect: [u32; 4]) -> Result<()> {
+        // `crops_input` is false: the host never asks the driver to crop.
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.ctl(encode::ENCODE_CTL_FLUSH, 0, 0, [0; 28])
             .context("driver encode: flush")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every `Encoder` method is written here: this is a proxy, so an inherited default
+    /// would mean the driver never hears the call.
+    #[test]
+    fn the_proxy_writes_every_trait_method() {
+        pf_encode_win::smoke_pattern::assert_writes_every_encoder_method(
+            include_str!("driver_encode.rs"),
+            "impl Encoder for EncoderProxy {",
+        );
     }
 }

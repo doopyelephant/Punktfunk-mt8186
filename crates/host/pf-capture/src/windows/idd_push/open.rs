@@ -7,6 +7,7 @@
 //! `design/idd-push-security.md`.
 
 use super::*;
+use crate::cursor_state::Opening;
 
 /// `SECURITY_ATTRIBUTES` for the unnamed AU section and its event: SDDL
 /// `D:P(A;;GA;;;SY)`, protected, `bInheritHandle: false`. The cursor section takes the
@@ -25,33 +26,16 @@ impl IddPushCapturer {
     ///
     /// There is no fallback capture path: the driver is the only Windows video
     /// source, and its encoder opens later, at `SET_ENCODE`.
-    #[allow(clippy::too_many_arguments)]
     pub fn open(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
-        want_hdr: bool,
-        ten_bit_sdr: bool,
-        want_444: bool,
-        pyrowave: bool,
         keepalive: Box<dyn Send>,
-        cursor_sender: Option<crate::CursorChannelSender>,
-        cursor_forward: Option<crate::CursorForwardSender>,
-        forwards_to_client: bool,
+        opts: crate::IddPushOpts,
     ) -> std::result::Result<Self, (anyhow::Error, Box<dyn Send>)> {
         // Idempotent: first capturer starts it so stall logs can correlate DWM holes
         // with OS display events for the session's life.
         pf_win_display::display_events::spawn_once();
-        match Self::open_inner(
-            target,
-            preferred,
-            want_hdr,
-            ten_bit_sdr,
-            want_444,
-            pyrowave,
-            cursor_sender,
-            cursor_forward,
-            forwards_to_client,
-        ) {
+        match Self::open_inner(target, preferred, opts) {
             Ok(mut me) => {
                 me._keepalive = keepalive;
                 Ok(me)
@@ -60,20 +44,20 @@ impl IddPushCapturer {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn open_inner(
         target: WinCaptureTarget,
         preferred: Option<(u32, u32, u32)>,
-        want_hdr: bool,
-        ten_bit_sdr: bool,
-        want_444: bool,
-        pyrowave: bool,
-        cursor_sender: Option<crate::CursorChannelSender>,
-        cursor_forward: Option<crate::CursorForwardSender>,
-        // This session negotiated client-side cursor drawing (`HOST_CAP_CURSOR`). False ⇒ the
-        // pointer can only reach the wire through the driver pool's blend.
-        forwards_to_client: bool,
+        opts: crate::IddPushOpts,
     ) -> Result<Self> {
+        let crate::IddPushOpts {
+            want_hdr,
+            ten_bit_sdr,
+            want_444,
+            pyrowave,
+            cursor_sender,
+            cursor_forward,
+            forwards_to_client,
+        } = opts;
         let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the encoder's input")?;
         // The complete CCD identity every display-global helper below selects paths by (the
@@ -197,13 +181,12 @@ impl IddPushCapturer {
                 }
             }
         });
-        // Sticky hardware-cursor declare from an earlier session keeps the pointer out of DWM's
-        // frames. Force the pool's blend whenever no CLIENT draws one. Not `cursor_shared` alone:
-        // a channel is delivered TO an excluded target as the blend's shape source, so that test
-        // cancelled the rescue with the very channel opened for it.
-        let composite_forced =
-            target.cursor_excluded && (!forwards_to_client || cursor_shared.is_none());
-        if composite_forced {
+        let (cursor_model, forward_reset) = CursorModel::open(Opening {
+            excluded: target.cursor_excluded,
+            channel: cursor_shared.is_some(),
+            client_draws: forwards_to_client,
+        });
+        if cursor_model.pinned() {
             tracing::info!(
                 target_id = target.target_id,
                 forwards_to_client,
@@ -213,9 +196,9 @@ impl IddPushCapturer {
                  blend has no shape source either"
             );
         }
-        // Same gate as the live channel. IddCx cannot deliver masked/monochrome
-        // (`cursor_poll.rs`), so the GDI poller is the client's shape source.
-        let cursor_poll = (cursor_shared.is_some() || composite_forced).then(|| {
+        // IddCx cannot deliver masked/monochrome (`cursor_poll.rs`), so the GDI poller is the
+        // client's shape source under any declare.
+        let cursor_poll = cursor_model.declared().then(|| {
             let rect = pf_win_display::win_display::source_desktop_rect(ccd).unwrap_or((
                 0,
                 0,
@@ -224,13 +207,11 @@ impl IddPushCapturer {
             ));
             cursor_poll::CursorPoller::spawn(ccd, rect)
         });
-        // Previous session may have died on the secure desktop with desired
-        // state `false`; delivery would then start undeclared. Fresh sessions
-        // start declared; `poll_secure_desktop` re-disables if still locked. A
-        // forced-composite session starts the other way: the driver blends from
-        // the first frame.
-        if let (Some(_), Some(fwd)) = (cursor_shared.as_ref(), cursor_forward.as_ref()) {
-            if let Err(e) = fwd(!composite_forced) {
+        // An earlier session may have died under the secure desktop with the flag down, and
+        // delivery would then start undeclared. `poll_secure_desktop` stands it down again if
+        // the desktop is still locked.
+        if let (Some(on), Some(fwd)) = (forward_reset, cursor_forward.as_ref()) {
+            if let Err(e) = fwd(on) {
                 tracing::debug!("cursor-forward reset at open failed: {e:#}");
             }
         }
@@ -267,8 +248,7 @@ impl IddPushCapturer {
             target_id: target.target_id,
             ccd,
             source_seq: 0,
-            driver_source_seq: 0,
-            delivered: None,
+            delivery: DeliveryGate::new(),
             recovery: super::recovery::Supervisor::new(Instant::now()),
             recovered_outage: None,
             pending_stage: None,
@@ -314,10 +294,7 @@ impl IddPushCapturer {
             cursor_poll,
             cursor_forward,
             cursor_sender,
-            secure_active: false,
-            composite_cursor: composite_forced,
-            composite_forced,
-            cursor_shm_latched: false,
+            cursor_model,
             sdr_white_scale: 2.5,
             sdr_white_logged: false,
             // Taken at open so the display cannot idle off under the session;
