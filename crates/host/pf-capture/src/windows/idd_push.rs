@@ -259,8 +259,12 @@ pub struct IddPushCapturer {
     /// Hardware-cursor shm (`Some` = delivered). The driver publishes into it and blends
     /// from it; this side reads it for the client's own pointer.
     cursor_shared: Option<cursor::CursorShared>,
-    /// GDI overlay source while alive — full-fidelity shapes IddCx never delivers.
+    /// GDI pointer position and visibility while alive, and the shape for a cursor the
+    /// section holds none of.
     cursor_poll: Option<cursor_poll::CursorPoller>,
+    /// Whether the client's last shape came from the section; the first and every change
+    /// are logged.
+    shape_from_section: Option<bool>,
     /// `IOCTL_SET_CURSOR_FORWARD`. A declared IddCx hardware cursor blocks the
     /// OS software-cursor path; [`Self::poll_secure_desktop`] stands it down at UAC/Winlogon.
     cursor_forward: Option<crate::CursorForwardSender>,

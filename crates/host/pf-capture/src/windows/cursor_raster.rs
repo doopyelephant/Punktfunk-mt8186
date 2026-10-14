@@ -7,6 +7,16 @@
 
 use pf_driver_proto::cursor::INVERT_RGBA;
 
+/// How the OS draws a cursor. Monochrome cursors are masked on both sources: the OS converts
+/// them for the driver's section, and the poller's truth table does the same.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ShapeClass {
+    /// Straight alpha.
+    Alpha,
+    /// A mask with invert pixels.
+    Masked,
+}
+
 /// `rgba` is `Arc` so slot publish and every downstream attach is a refcount bump.
 pub(crate) struct Shape {
     pub(crate) rgba: std::sync::Arc<Vec<u8>>,
@@ -15,6 +25,7 @@ pub(crate) struct Shape {
     pub(crate) hot_x: u32,
     pub(crate) hot_y: u32,
     pub(crate) serial: u64,
+    pub(crate) class: ShapeClass,
 }
 
 /// One poll's overlay. `pos` is the pointer relative to `rect`'s origin, and outside `rect`
@@ -54,6 +65,39 @@ pub(crate) fn compose_overlay(
         hot_y: s.hot_y,
         visible: shown && in_rect,
     })
+}
+
+/// The overlay the client draws: the poller's position and visibility carrying the shape
+/// the OS rendered for this display, read from the driver's section. `GetIconInfo` hands
+/// the poller the 96-DPI bitmap whatever the display's scale; the section holds the one
+/// Windows draws. A masked cursor the section did not receive leaves it on the last alpha
+/// shape, so a class mismatch keeps the poller's own.
+pub(crate) fn with_section_shape(
+    polled: pf_frame::CursorOverlay,
+    polled_class: Option<ShapeClass>,
+    section: Option<(pf_frame::CursorOverlay, ShapeClass)>,
+) -> pf_frame::CursorOverlay {
+    let Some((sec, class)) = section else {
+        return polled;
+    };
+    if polled.w == 0 || sec.w == 0 || polled_class != Some(class) {
+        return polled;
+    }
+    let (px, py) = (
+        polled.x + polled.hot_x as i32,
+        polled.y + polled.hot_y as i32,
+    );
+    pf_frame::CursorOverlay {
+        x: px - sec.hot_x as i32,
+        y: py - sec.hot_y as i32,
+        w: sec.w,
+        h: sec.h,
+        rgba: sec.rgba,
+        serial: sec.serial,
+        hot_x: sec.hot_x,
+        hot_y: sec.hot_y,
+        visible: polled.visible,
+    }
 }
 
 /// Alpha channel entirely zero: old-style cursor whose transparency (and invert)
@@ -144,7 +188,58 @@ mod tests {
             hot_x: 1,
             hot_y: 1,
             serial: 7,
+            class: ShapeClass::Alpha,
         }
+    }
+
+    fn section(w: u32, hot: (u32, u32)) -> pf_frame::CursorOverlay {
+        pf_frame::CursorOverlay {
+            x: 0,
+            y: 0,
+            w,
+            h: w,
+            rgba: std::sync::Arc::new(vec![1; (w * w * 4) as usize]),
+            serial: 5 | (1 << 31),
+            hot_x: hot.0,
+            hot_y: hot.1,
+            visible: false,
+        }
+    }
+
+    /// The section's shape rides the poller's hotspot position and visibility; a class
+    /// mismatch, an empty section or a shapeless poll keep the poller's overlay.
+    #[test]
+    fn the_section_shape_rides_the_polled_position() {
+        let rect = (0, 0, 100, 100);
+        let polled = compose_overlay((10, 20), rect, true, Some(&arrow())).expect("overlay");
+        let sec = section(48, (12, 14));
+        let alpha = Some(ShapeClass::Alpha);
+        let o = with_section_shape(
+            polled.clone(),
+            alpha,
+            Some((sec.clone(), ShapeClass::Alpha)),
+        );
+        assert_eq!(
+            (o.x, o.y, o.w, o.h, o.hot_x, o.hot_y),
+            (-2, 6, 48, 48, 12, 14)
+        );
+        assert!(o.visible);
+        assert_eq!(o.serial, 5 | (1 << 31));
+        let masked = Some(ShapeClass::Masked);
+        let kept = with_section_shape(
+            polled.clone(),
+            masked,
+            Some((sec.clone(), ShapeClass::Alpha)),
+        );
+        assert_eq!((kept.w, kept.serial), (2, 7));
+        assert_eq!(with_section_shape(polled.clone(), alpha, None).serial, 7);
+        let empty = Some((section(0, (0, 0)), ShapeClass::Alpha));
+        assert_eq!(with_section_shape(polled, alpha, empty).serial, 7);
+        let hide = compose_overlay((1, 1), rect, false, None).expect("hide");
+        assert_eq!(
+            with_section_shape(hide, None, Some((sec, ShapeClass::Alpha))).w,
+            0
+        );
     }
 
     /// The overlay is the pointer less the hotspot, visible only inside the target's rect.

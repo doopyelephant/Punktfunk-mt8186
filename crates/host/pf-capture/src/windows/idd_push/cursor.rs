@@ -9,9 +9,10 @@
 //! session 0: the HDR desktop's SDR-white scale.
 
 use super::*;
+use crate::cursor_raster::ShapeClass;
 use pf_driver_proto::cursor::{
     shape_extent, shape_rgba, CursorShm, ShapeRgba, CURSOR_MAGIC, CURSOR_SHAPE_OFFSET,
-    CURSOR_SHM_SIZE,
+    CURSOR_SHM_SIZE, CURSOR_TYPE_ALPHA,
 };
 use std::mem::offset_of;
 
@@ -31,19 +32,29 @@ struct ConvertedShape {
     h: u32,
     hot_x: u32,
     hot_y: u32,
+    class: ShapeClass,
 }
 
-impl From<ShapeRgba> for ConvertedShape {
-    fn from(s: ShapeRgba) -> Self {
+impl ConvertedShape {
+    fn new(hdr: &CursorShm, s: ShapeRgba) -> Self {
         Self {
             rgba: std::sync::Arc::new(s.rgba),
             w: s.w,
             h: s.h,
             hot_x: s.hot_x,
             hot_y: s.hot_y,
+            class: if hdr.cursor_type == CURSOR_TYPE_ALPHA {
+                ShapeClass::Alpha
+            } else {
+                ShapeClass::Masked
+            },
         }
     }
 }
+
+/// Set on every section serial. The client caches shapes by a `u32` serial the poller also
+/// numbers from 1; bit 31 keeps the two apart and survives the forwarder's truncation.
+pub(super) const SECTION_SERIAL_TAG: u64 = 1 << 31;
 
 /// The header in words: it is all `u32`s and ends where the shape starts.
 const HEADER_WORDS: usize = size_of::<CursorShm>() / 4;
@@ -88,9 +99,15 @@ impl CursorShared {
             .store(scale.to_bits(), Ordering::Relaxed);
     }
 
-    /// Seqlock-read the latest publish as a frame-relative [`pf_frame::CursorOverlay`].
-    /// `None` until the first publish. Hidden pointer → `Some` with `visible: false` — the
-    /// forwarder turns that into the client's relative-mode hint, as on Linux.
+    /// Class of the shape the last [`Self::read`] returned; `None` before any shape.
+    pub(super) fn shape_class(&self) -> Option<ShapeClass> {
+        self.cached.as_ref().map(|s| s.class)
+    }
+
+    /// Seqlock-read the latest publish as a frame-relative [`pf_frame::CursorOverlay`], its
+    /// serial tagged [`SECTION_SERIAL_TAG`]. `None` until the first publish. Hidden pointer →
+    /// `Some` with `visible: false` — the forwarder turns that into the client's
+    /// relative-mode hint, as on Linux.
     pub(super) fn read(&mut self) -> Option<pf_frame::CursorOverlay> {
         let seq = self.section.word32(offset_of!(CursorShm, seq));
         for _ in 0..64 {
@@ -116,7 +133,7 @@ impl CursorShared {
                 if seq.load(Ordering::Relaxed) != s1 {
                     continue;
                 }
-                self.cached = Some(shape_rgba(&hdr, &raw).into());
+                self.cached = Some(ConvertedShape::new(&hdr, shape_rgba(&hdr, &raw)));
                 self.cached_id = hdr.shape_id;
             } else {
                 std::sync::atomic::fence(Ordering::Acquire);
@@ -144,7 +161,7 @@ impl CursorShared {
                 w: shape.w,
                 h: shape.h,
                 rgba: shape.rgba.clone(),
-                serial: u64::from(hdr.shape_id),
+                serial: u64::from(hdr.shape_id) | SECTION_SERIAL_TAG,
                 hot_x: shape.hot_x,
                 hot_y: shape.hot_y,
                 visible: hdr.visible != 0,
@@ -157,7 +174,6 @@ impl CursorShared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pf_driver_proto::cursor::CURSOR_TYPE_ALPHA;
 
     /// Stand in for the driver: the header and the shape's pixels, then `seq`.
     fn publish(shared: &CursorShared, seq: u32, hdr: CursorShm, bgra: &[[u8; 4]]) {
@@ -197,6 +213,8 @@ mod tests {
         publish(&shared, 2, hdr, &[[1, 2, 3, 4], [5, 6, 7, 8]]);
         let got = shared.read().expect("a published cursor");
         assert_eq!((got.x, got.y, got.w, got.h, got.hot_x), (5, -7, 2, 1, 1));
+        assert_eq!(got.serial, 1 | SECTION_SERIAL_TAG);
+        assert_eq!(shared.shape_class(), Some(ShapeClass::Alpha));
         assert!(got.visible);
         // ALPHA shapes are BGRA in the section and RGBA on the way out.
         assert_eq!(got.rgba[..], [3, 2, 1, 4, 7, 6, 5, 8]);

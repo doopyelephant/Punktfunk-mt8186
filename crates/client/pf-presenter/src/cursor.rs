@@ -95,6 +95,14 @@ impl CursorChannel {
                 tracing::warn!(w, h, "cursor shape malformed — ignored");
                 continue;
             }
+            tracing::debug!(
+                serial = shape.serial,
+                w,
+                h,
+                hot_x = shape.hot_x,
+                hot_y = shape.hot_y,
+                "cursor shape received"
+            );
             // Re-sent serial replaces the entry; force re-install if it is current.
             if matches!(self.installed, Some((s, _)) if s == shape.serial) {
                 self.installed = None;
