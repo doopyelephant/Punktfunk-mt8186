@@ -84,7 +84,8 @@ classify() {
             case "$path" in
                 sdk/*|plugin-kit/*|api/openapi.json|scripts/ci/retry.sh|\
                 clients/shared/library-id-vectors.json|\
-                crates/host/punktfunk-host/testdata/path-refusal-vectors.json)
+                crates/host/punktfunk-host/testdata/path-refusal-vectors.json|\
+                packaging/nix/packages.nix|packaging/nix/nixos-module.nix)
                     sdk_plugin_kit=true
                     ;;
             esac
@@ -188,6 +189,9 @@ self_test() {
     # The runner's sandbox replays the host's path refusals.
     check path-refusal-vectors 'crates/host/punktfunk-host/testdata/path-refusal-vectors.json' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=true decky_typecheck=false'
+    # The runner tests read how the Nix packages install its unit.
+    check nix-runner-unit 'packaging/nix/packages.nix' \
+        'rust=false rust_arm64=false web=false docs_site=false sdk_plugin_kit=true decky_typecheck=false'
     check openapi 'api/openapi.json' \
         'rust=true rust_arm64=false web=true docs_site=false sdk_plugin_kit=true decky_typecheck=false'
     check platforms 'data/platforms.json' \
