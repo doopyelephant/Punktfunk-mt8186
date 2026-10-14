@@ -319,9 +319,9 @@ pub trait Encoder: Send {
     }
     /// Access units a backend that encodes without [`submit`](Self::submit)
     /// already holds for [`poll_chunk`](Self::poll_chunk), waiting until
-    /// `deadline` for the first. The loop owes one wire index per AU counted
-    /// and drains them at once. `None` (default): the backend encodes what
-    /// `submit` hands it, so the loop submits this tick's frame instead.
+    /// `deadline` for the first. The loop asks only for a pixel-less frame, owes
+    /// one wire index per AU counted and drains them at once. `None` (default):
+    /// the backend encodes what `submit` hands it, so the loop submits the frame.
     fn ready_aus(&mut self, _deadline: std::time::Instant) -> Option<usize> {
         None
     }

@@ -1232,6 +1232,7 @@ impl QsvEncoder {
             FramePayload::Cpu(_) => {
                 bail!("native QSV is D3D11-only; got a CPU frame (video processor lost?)")
             }
+            FramePayload::Pixelless => bail!("native QSV is D3D11-only; got a pixel-less frame"),
         };
         anyhow::ensure!(
             captured.format == self.input,

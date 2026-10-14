@@ -377,10 +377,12 @@ enum Source<'a> {
     Dmabuf(&'a DmabufFrame),
 }
 
-/// Clone the producer hold only for a raw dmabuf submission.
+/// The hold that keeps the captured buffer unrecycled until its AU is retrieved: a stream-ordered
+/// copy or fused pass may still read it after `submit` returns.
 fn source_hold(frame: &CapturedFrame) -> Option<pf_frame::FrameHold> {
     match &frame.payload {
         FramePayload::Dmabuf(d) => d.hold.clone(),
+        FramePayload::Cuda(b) => Some(b.hold()),
         _ => None,
     }
 }
@@ -1294,8 +1296,9 @@ impl NvencCudaEncoder {
     }
 
     /// CPU pixels into a reused pitched device buffer: BGRA-order 32-bit as is, RGBA-order
-    /// swizzled, 24-bit repacked, NV12 as two planes. Synchronous, so the buffer is free
-    /// again on return.
+    /// swizzled, 24-bit repacked, NV12 as two planes. Synchronous on this thread's copy stream,
+    /// behind the previous frame's queued slot copy out of the same buffer, so the reuse never
+    /// overwrites a copy in flight. Moving either copy to another stream breaks that.
     fn upload_cpu(
         &mut self,
         captured: &CapturedFrame,

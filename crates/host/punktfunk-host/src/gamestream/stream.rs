@@ -1575,6 +1575,7 @@ impl GsLoop<'_> {
             crate::send_pacing::wait_next_tick(
                 &mut **self.capturer,
                 &mut *self.video.enc,
+                &self.frame,
                 &mut self.cap_credit,
                 &mut self.next_frame,
                 tick.fresh.then_some(tick.start),
@@ -1755,15 +1756,15 @@ impl GsLoop<'_> {
     fn encode_and_send(&mut self, tick: &GsTick) -> Result<GsFlow> {
         self.request_keyframes();
         self.apply_hdr_meta();
-        // An encoder the loop does not feed (the Windows driver) already holds the access units
-        // it owes — waited for after a fresh frame, never on a repeat; every other backend
-        // takes this tick's frame.
+        // A pixel-less frame's encoder (the Windows driver) already holds the access units it
+        // owes — waited for after a fresh frame, never on a repeat; every other backend takes
+        // this tick's frame.
         let au_wait = if tick.fresh {
             tick.start + self.frame_interval
         } else {
             tick.start
         };
-        let owed = self.video.enc.ready_aus(au_wait);
+        let owed = crate::send_pacing::owed_aus(&self.frame, &mut *self.video.enc, au_wait);
         let submitted = match owed {
             Some(_) => Ok(()),
             None => {

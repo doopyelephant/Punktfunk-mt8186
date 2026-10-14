@@ -174,10 +174,7 @@ impl Encoder for OpenH264Encoder {
             captured.format,
             self.src_format
         );
-        // `Cpu` is the only non-Linux payload today; becomes refutable when D3D11 lands.
-        #[allow(irrefutable_let_patterns)]
-        let FramePayload::Cpu(bytes) = &captured.payload
-        else {
+        let FramePayload::Cpu(bytes) = &captured.payload else {
             bail!("openh264 backend requires a CPU frame payload");
         };
         let w = self.width as usize;

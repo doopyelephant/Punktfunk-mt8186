@@ -345,15 +345,15 @@ impl StreamState {
             .clock
             .au_seq
             .wrapping_add(self.clock.inflight.len() as u32);
-        // An encoder the loop does not feed (the Windows driver) already holds `owed` access
-        // units — waited for after a fresh frame, never on a repeat — and drains them at
-        // depth 1; every other backend takes this tick's frame.
+        // A pixel-less frame's encoder (the Windows driver) already holds `owed` access units —
+        // waited for after a fresh frame, never on a repeat — and drains them at depth 1; every
+        // other backend takes this tick's frame.
         let au_wait = if repeat {
             t_submit
         } else {
             t_submit + self.interval
         };
-        let owed = self.enc.ready_aus(au_wait);
+        let owed = crate::send_pacing::owed_aus(&self.frame, &mut *self.enc, au_wait);
         let depth = if owed.is_some() { 1 } else { depth };
         let submitted = match owed {
             Some(_) => Ok(()),
@@ -799,6 +799,7 @@ impl StreamState {
         crate::send_pacing::wait_next_tick(
             &mut *self.capturer,
             &mut *self.enc,
+            &self.frame,
             &mut self.pace,
             &mut self.next,
             (!repeat).then_some(t_cap),

@@ -622,6 +622,7 @@ impl Encoder for NvencD3d11Encoder {
                     "NVENC D3D11 encoder needs a GPU texture frame (use the software encoder for CPU frames)"
                 )
             }
+            FramePayload::Pixelless => bail!("NVENC D3D11 encoder needs a GPU texture frame"),
         };
         self.prepare_d3d11(
             &frame.device,
