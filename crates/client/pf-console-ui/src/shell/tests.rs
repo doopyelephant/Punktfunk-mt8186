@@ -380,7 +380,7 @@ fn a_held_ok_opens_the_card_menu() {
         matches!(s.take_action(), Some(OverlayAction::Launch { .. })),
         "a click connects"
     );
-    s.connecting = None;
+    s.set_connecting(None);
     s.ok(true);
     s.fake_clock = Some((10.8, 0.0));
     s.tick_ok();
@@ -433,7 +433,7 @@ fn connect_flow_raises_launch_and_cancel() {
         s.take_action(),
         Some(OverlayAction::Launch { launch: None, .. })
     ));
-    assert!(s.connecting.is_some());
+    assert!(s.connect.card().is_some());
     // Cancel drops the takeover immediately. Waiting for a session phase burns the
     // connect budget; an embedder that drops a canceled dial sends no phase at all.
     s.handle_menu(MenuEvent::Back);
@@ -441,9 +441,12 @@ fn connect_flow_raises_launch_and_cancel() {
         s.take_action(),
         Some(OverlayAction::CancelConnect)
     ));
-    assert!(s.connecting.is_none(), "cancel drops the takeover itself");
+    assert!(
+        s.connect.card().is_none(),
+        "cancel drops the takeover itself"
+    );
     s.session_ended(None);
-    assert!(s.connecting.is_none());
+    assert!(s.connect.card().is_none());
 }
 
 fn finish_motion(s: &mut Shell) {
@@ -1667,7 +1670,10 @@ fn the_rescan_tile_probes_and_never_connects() {
         s.take_action().is_none(),
         "a scan must raise no Launch, and no Quit"
     );
-    assert!(s.connecting.is_none(), "and must not open the connect card");
+    assert!(
+        s.connect.card().is_none(),
+        "and must not open the connect card"
+    );
     assert_eq!(s.stack.len(), 1, "and must push no screen");
     assert!(s.toast.is_some(), "it says it is scanning");
     // One step back is Add Host, which does push — proof the walk reached the end.
@@ -2260,7 +2266,7 @@ fn the_announcement_stays_quiet_where_it_cannot_name_the_focus() {
     let (mut s, _console, _library) = shell(vec![Screen::Home(HomeScreen::new())]);
     s.sync();
     s.handle_menu(MenuEvent::Confirm);
-    assert!(s.connecting.is_some());
+    assert!(s.connect.card().is_some());
     assert!(
         s.focus_announcement().is_none(),
         "a takeover owns the input"

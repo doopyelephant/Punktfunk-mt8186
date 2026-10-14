@@ -95,11 +95,11 @@ fn a_launched_title_holds_the_stream_until_the_host_says_running() {
         "the hold is up from the press, not the first frame"
     );
     assert!(
-        s.connecting.is_none(),
+        s.connect.card().is_none(),
         "and it replaces the connect card rather than stacking on it"
     );
     assert_eq!(
-        s.launching.as_ref().map(|l| l.facts.as_str()),
+        s.connect.launching().map(|l| l.facts.as_str()),
         Some("PC · Steam"),
         "platform, year, store — this mock has no year"
     );
@@ -182,7 +182,7 @@ fn the_hold_ignores_state_read_before_the_launch_and_says_so_without_a_lease() {
         "the hold keeps the screen"
     );
     assert_eq!(
-        s.launching.as_ref().and_then(|l| l.failed.as_deref()),
+        s.connect.launching().and_then(|l| l.failed.as_deref()),
         Some("The host didn't start Dota 2 — nothing is running for it.")
     );
     s.handle_menu(MenuEvent::Confirm);
@@ -228,7 +228,7 @@ fn the_hold_waits_for_the_window_where_the_host_reports_one() {
     library.set_running(&loading("running"));
     s.sync();
     assert!(s.holds_stream(), "running, with a window still to come");
-    assert!(s.launching.as_ref().is_some_and(|l| l.window_wait));
+    assert!(s.connect.launching().is_some_and(|l| l.window_wait));
     library.set_running(&running("steam:570", "window"));
     s.sync();
     assert!(s.in_stream && !s.holds_stream(), "the window is up");
@@ -263,13 +263,13 @@ fn a_title_still_downloading_holds_with_its_progress() {
     library.set_running(&running("steam:570", "launching"));
     at(&mut s, 100.0 + LAUNCH_HOLD_MAX * 3.0);
     s.sync();
-    let l = s.launching.as_ref().expect("still holding");
+    let l = s.connect.launching().expect("still holding");
     assert_eq!(l.download.as_ref().map(|d| d.done_bytes), Some(5));
     assert!(l.failed.is_none(), "no cap runs while the files come");
 
     library.set_downloads(&[], None);
     s.session_streaming();
-    assert!(s.launching.as_ref().is_some_and(|l| l.download.is_none()));
+    assert!(s.connect.launching().is_some_and(|l| l.download.is_none()));
     s.sync();
     assert!(
         s.holds_stream(),
@@ -291,7 +291,7 @@ fn a_download_that_stopped_is_the_holds_sentence() {
     library.set_running(&[]);
     s.sync();
     assert_eq!(
-        s.launching.as_ref().and_then(|l| l.failed.as_deref()),
+        s.connect.launching().and_then(|l| l.failed.as_deref()),
         Some("Dota 2 didn't download \u{2014} the server is down")
     );
 }
@@ -301,7 +301,7 @@ fn launcher_tiles_skip_the_hold_and_a_press_ends_it() {
     let (mut s, _library, _bus) = on_shelf();
     s.start_connect(intent("steam:ui"));
     assert!(
-        s.connecting.is_some(),
+        s.connect.card().is_some(),
         "a launcher tile keeps the plain connect card"
     );
     s.session_streaming();

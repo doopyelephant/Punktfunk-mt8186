@@ -6,7 +6,7 @@ use crate::glyphs::{hint_bar, Hint, HintKey};
 use crate::theme::{edge, fg, fill, Fonts, PanelStroke, W};
 use skia_safe::{gradient, Canvas, Color4f, Image, PathBuilder, Point, RRect, Rect, TileMode, M44};
 
-use super::{Launching, Shell, ToastMark, BOTTOM_BAND};
+use super::{Connect, Launching, Shell, ToastMark, BOTTOM_BAND};
 use crate::model::{SpeedPhase, SpeedStatus};
 
 /// Kind mark in a 13 dp box.
@@ -63,7 +63,7 @@ impl Shell {
         fonts: &Fonts,
     ) {
         // Resolved before the chain below: naming the layer Apply writes to reads the
-        // whole shell, which the chain's `&mut self.connecting` arm would forbid.
+        // whole shell, which the chain's `card_mut` arm would forbid.
         let pinned_by = self
             .speed
             .as_ref()
@@ -72,7 +72,7 @@ impl Shell {
         // Connect, wake and the speed test share one full-screen shape. A connect can
         // follow a wake (`sync`) so they share the backdrop and never blink between them.
         let takeover: Option<(f64, bool, String, String, Vec<Hint>)> =
-            if let Some(c) = &mut self.connecting {
+            if let Some(c) = self.connect.card_mut() {
                 c.appear = approach(c.appear, 1.0, dt, 0.07);
                 if c.request_access {
                     Some((
@@ -94,7 +94,7 @@ impl Shell {
                         vec![Hint::new(HintKey::Back, "Cancel")],
                     ))
                 }
-            } else if let Some(sw) = &mut self.seat_wait {
+            } else if let Connect::SeatWait(sw) = &mut self.connect {
                 sw.appear = approach(sw.appear, 1.0, dt, 0.07);
                 Some((
                     sw.appear,
@@ -194,7 +194,7 @@ impl Shell {
         let charted = self
             .speed
             .as_ref()
-            .filter(|_| self.connecting.is_none() && self.wake.is_none())
+            .filter(|_| self.connect.card().is_none() && self.wake.is_none())
             .filter(|sp| !matches!(sp.phase, SpeedPhase::Connecting | SpeedPhase::Failed(_)));
         match (takeover, charted) {
             (Some((_, _, title, body, hints)), Some(sp)) => {
@@ -207,18 +207,18 @@ impl Shell {
                     canvas, w, h, k, appear, t, fonts, spinner, &title, &body, &hints,
                 );
                 // The seat wait's Cancel takes a click; the other takeovers' legends do not.
-                if self.seat_wait.is_some() {
+                if self.connect.seat_wait().is_some() {
                     self.hint_rects = rects;
                 }
             }
             (None, _) => {}
         }
-        if let Some(l) = &mut self.launching {
+        if let Some(l) = self.connect.launching_mut() {
             l.appear = approach(l.appear, 1.0, dt, 0.09);
             l.flight.step_spec(1.0, crate::anim::springs::LAUNCH, dt);
             l.flight.settle(1.0, 0.001, 0.01);
         }
-        if let Some(l) = &self.launching {
+        if let Some(l) = self.connect.launching() {
             // The shelf that launched it still holds its decoded poster underneath.
             let poster = (self.stack.last())
                 .and_then(crate::screens::Screen::shelf)

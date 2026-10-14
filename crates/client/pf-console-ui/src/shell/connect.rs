@@ -1,13 +1,125 @@
 //! The connect pipeline: a press on a host or a game, the profile and seat checks before
 //! the dial, the connecting card, and the launch hold until the game is up.
 
-use super::{Shell, ToastKind};
+use super::{Shell, Takeover, ToastKind};
 use crate::anim::Spring;
 use crate::model::{ConsoleCmd, HostRow, ProfilesAnswer};
 use crate::screens::{ConnectIntent, Nav, ProfileAsk, Screen, Seated};
 use pf_client_core::console::OverlayAction;
 use pf_client_core::profiles::{seat_gate, ProfilePick, SeatGate};
 use skia_safe::Rect;
+
+/// One connect from the press to the stream, one phase at a time.
+#[derive(Default)]
+pub(super) enum Connect {
+    #[default]
+    Idle,
+    /// Waiting on the box's profile list; `card` is the connect card a slow list puts up.
+    Asking {
+        ask: Asking,
+        card: Option<Connecting>,
+    },
+    SeatWait(SeatWait),
+    /// Dialed, until the stream or a failure.
+    Connecting(Connecting),
+    /// Dialed for a title: the hold stays up over the stream until the game is.
+    Launching(Launching),
+}
+
+impl Connect {
+    /// The takeover this phase raises.
+    pub(super) fn takeover(&self) -> Option<Takeover> {
+        match self {
+            Connect::Idle => None,
+            Connect::Asking { .. } => Some(Takeover::Asking),
+            Connect::SeatWait(_) => Some(Takeover::SeatWait),
+            Connect::Connecting(_) => Some(Takeover::Connecting),
+            Connect::Launching(_) => Some(Takeover::Launching),
+        }
+    }
+
+    /// The connect card on screen: the dial's, or a slow ask's.
+    pub(super) fn card(&self) -> Option<&Connecting> {
+        match self {
+            Connect::Connecting(c) | Connect::Asking { card: Some(c), .. } => Some(c),
+            _ => None,
+        }
+    }
+
+    pub(super) fn card_mut(&mut self) -> Option<&mut Connecting> {
+        match self {
+            Connect::Connecting(c) | Connect::Asking { card: Some(c), .. } => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Up over an ask, else in place of whatever phase there was.
+    fn show_card(&mut self, c: Connecting) {
+        match self {
+            Connect::Asking { card, .. } => *card = Some(c),
+            _ => *self = Connect::Connecting(c),
+        }
+    }
+
+    /// The card goes; an ask under it keeps waiting.
+    fn drop_card(&mut self) {
+        match self {
+            Connect::Connecting(_) => *self = Connect::Idle,
+            Connect::Asking { card, .. } => *card = None,
+            _ => {}
+        }
+    }
+
+    /// The dial's takeovers go. An ask or a seat wait comes before any dial and stays.
+    fn end_dial(&mut self) {
+        self.drop_card();
+        if matches!(self, Connect::Launching(_)) {
+            *self = Connect::Idle;
+        }
+    }
+
+    pub(super) fn asking(&self) -> Option<&Asking> {
+        match self {
+            Connect::Asking { ask, .. } => Some(ask),
+            _ => None,
+        }
+    }
+
+    pub(super) fn seat_wait(&self) -> Option<&SeatWait> {
+        match self {
+            Connect::SeatWait(w) => Some(w),
+            _ => None,
+        }
+    }
+
+    pub(super) fn launching(&self) -> Option<&Launching> {
+        match self {
+            Connect::Launching(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    pub(super) fn launching_mut(&mut self) -> Option<&mut Launching> {
+        match self {
+            Connect::Launching(l) => Some(l),
+            _ => None,
+        }
+    }
+}
+
+/// How far a connect is from asking its profiles a second time, after the box answered
+/// `profile-unknown`. A connect asks again at most once.
+#[derive(Default)]
+pub(super) enum Reask {
+    #[default]
+    None,
+    /// Dialed, and might still come back `profile-unknown`: the connect as it would ask again.
+    Armed(ConnectIntent),
+    /// [`Shell::profile_gone`] came: the failure that follows asks again instead of toasting.
+    Due(ConnectIntent),
+    /// The ask in flight is the second one.
+    Asking,
+}
 
 /// A connect waiting on its box's profile list (§10.1) before it dials.
 pub(super) struct Asking {
@@ -17,6 +129,7 @@ pub(super) struct Asking {
 }
 
 /// Seconds a connect waits for the profile list before it dials with the remembered pick.
+/// Long enough for a slow box to answer, short enough that a dead one does not hold the press.
 pub(super) const PROFILES_WAIT: f64 = 3.0;
 /// A list slower than this puts the connect card up; a fast one shows nothing.
 pub(super) const ASKING_CARD_AFTER: f64 = 0.25;
@@ -128,6 +241,7 @@ pub(super) const LAUNCH_POLL: f64 = 1.0;
 pub(super) const LAUNCH_POLL_STALL: f64 = 5.0;
 /// The host lists nothing for the title: the launch did not resolve
 /// (no recipe, launcher missing). The host logs it and streams on; so do we.
+/// Three [`LAUNCH_POLL_STALL`] retries, so a lost answer or two cannot end the hold.
 pub(super) const LAUNCH_NO_LEASE: f64 = 15.0;
 /// A game still `launching`, or `running` without its window, this long is one
 /// the player wants to see for themselves — a cold Steam boot with shader work
@@ -135,28 +249,32 @@ pub(super) const LAUNCH_NO_LEASE: f64 = 15.0;
 pub(super) const LAUNCH_HOLD_MAX: f64 = 120.0;
 
 impl Shell {
+    /// The connect card for `title`, over an ask still waiting; `None` takes the card down.
     pub(crate) fn set_connecting(&mut self, title: Option<String>) {
         match title {
             Some(title) => {
                 self.last_connect_title = Some(title.clone());
-                self.connecting = Some(Connecting {
+                self.connect.show_card(Connecting {
                     title,
                     appear: 0.0,
                     request_access: false,
                 })
             }
-            None => self.connecting = None,
+            None => self.connect.drop_card(),
         }
     }
 
+    /// A due re-ask connects again; a second ask in flight stays the second.
     pub(crate) fn session_failed(&mut self, msg: &str) {
-        self.connecting = None;
-        self.launching = None;
+        self.connect.end_dial();
         self.in_stream = false;
-        self.reask = None;
-        if let Some(intent) = self.reask_now.take() {
-            self.reasking = true;
-            return self.start_connect(intent);
+        match std::mem::take(&mut self.reask) {
+            Reask::Due(intent) => {
+                self.reask = Reask::Asking;
+                return self.start_connect(intent);
+            }
+            Reask::Asking => self.reask = Reask::Asking,
+            Reask::None | Reask::Armed(_) => {}
         }
         self.show_toast_kind(format!("Couldn't connect — {msg}"), ToastKind::Error);
     }
@@ -164,7 +282,10 @@ impl Shell {
     /// The box no longer has the profile the last connect named: forget the card's pick and
     /// ask its list once more. A second miss fails as any other refusal does.
     pub(crate) fn profile_gone(&mut self) {
-        let Some(intent) = self.reask.take() else {
+        if !matches!(self.reask, Reask::Armed(_)) {
+            return;
+        }
+        let Reask::Armed(intent) = std::mem::take(&mut self.reask) else {
             return;
         };
         if let Some(ask) = &intent.ask {
@@ -173,15 +294,17 @@ impl Shell {
                 profile: None,
             });
         }
-        self.reask_now = Some(intent);
+        self.reask = Reask::Due(intent);
     }
 
     pub(crate) fn session_streaming(&mut self) {
-        self.connecting = None;
-        self.reask = None;
+        self.connect.drop_card();
+        if matches!(self.reask, Reask::Armed(_)) {
+            self.reask = Reask::None;
+        }
         let t = self.t();
         let reads = self.library.status_gen();
-        let Some(l) = &mut self.launching else {
+        let Some(l) = self.connect.launching_mut() else {
             self.in_stream = true;
             return;
         };
@@ -244,7 +367,7 @@ impl Shell {
 
     /// Drop the hold and let the stream through.
     pub(super) fn reveal_stream(&mut self) {
-        self.launching = None;
+        self.connect = Connect::Idle;
         self.in_stream = true;
         // Hosts that swap to a stream view of their own have been holding the session since
         // the dial landed; this is what releases it. A host that composites this console over
@@ -257,7 +380,9 @@ impl Shell {
     pub(super) fn tick_launch(&mut self) {
         let t = self.t();
         let reads = self.library.status_gen();
-        let Some(l) = &self.launching else { return };
+        let Some(l) = self.connect.launching() else {
+            return;
+        };
         if l.failed.is_some() {
             return;
         }
@@ -269,7 +394,7 @@ impl Shell {
         // read is how far they are. The lease is the SESSION's, so a title that was already up
         // would otherwise read as "running" and reveal a stream that does not exist.
         if !l.connected {
-            if let Some(l) = &mut self.launching {
+            if let Some(l) = self.connect.launching_mut() {
                 l.download = download.filter(|d| d.live());
             }
             self.poll_launch(t, reads);
@@ -289,7 +414,7 @@ impl Shell {
             .then(|| download.and_then(|d| d.stopped(&l.title)))
             .flatten();
         if let Some(why) = stopped.or_else(|| launch_gave_up(&l.title, word, elapsed)) {
-            if let Some(l) = &mut self.launching {
+            if let Some(l) = self.connect.launching_mut() {
                 l.failed = Some(why);
             }
             return;
@@ -308,14 +433,16 @@ impl Shell {
             return;
         }
         self.poll_launch(t, reads);
-        if let Some(l) = &mut self.launching {
+        if let Some(l) = self.connect.launching_mut() {
             l.window_wait = window_wait;
         }
     }
 
     /// Ask the host again once the last answer landed, or once it is overdue.
     fn poll_launch(&mut self, t: f64, reads: u64) {
-        let Some(l) = &self.launching else { return };
+        let Some(l) = self.connect.launching() else {
+            return;
+        };
         let waited = t - l.last_poll;
         if (reads != l.poll_gen && waited >= LAUNCH_POLL) || waited >= LAUNCH_POLL_STALL {
             let poll = ConsoleCmd::RefreshRunning {
@@ -323,7 +450,7 @@ impl Shell {
                 mgmt: l.host.mgmt,
                 fp_hex: l.host.fp_hex.clone(),
             };
-            if let Some(l) = &mut self.launching {
+            if let Some(l) = self.connect.launching_mut() {
                 l.last_poll = t;
                 l.poll_gen = reads;
             }
@@ -332,8 +459,7 @@ impl Shell {
     }
 
     pub(crate) fn session_ended(&mut self, reason: Option<&str>) {
-        self.connecting = None;
-        self.launching = None;
+        self.connect.end_dial();
         self.in_stream = false;
         // Stack survives a stream, so nothing else refreshes the running set:
         // without this the Resume badge still names the title they just quit.
@@ -358,8 +484,8 @@ impl Shell {
     /// `appear = 1.0`: the retry follows a live stream; fading in is a flash.
     pub(crate) fn session_reconnecting(&mut self, msg: &str) {
         self.in_stream = false;
-        self.launching = None;
-        self.connecting = Some(Connecting {
+        self.connect.end_dial();
+        self.connect.show_card(Connecting {
             // `None` only if the shell never raised the connect (`--connect`
             // has no console). Prefer a codec-change name over empty string.
             title: self
@@ -373,7 +499,7 @@ impl Shell {
     }
 
     /// Every connect starts here. One that asks first waits for the box's profile list
-    /// ([`Self::tick_asking`]); the rest dial now.
+    /// ([`Self::tick_asking`]), under any connect card already up; the rest dial now.
     pub(crate) fn start_connect(&mut self, mut intent: ConnectIntent) {
         let Some(ask) = intent.ask.take().filter(|_| self.device.profiles) else {
             return self.dial_when_seated(intent);
@@ -386,43 +512,55 @@ impl Shell {
             fp_hex: intent.fp_hex.clone(),
         });
         let since = self.t();
-        self.asking = Some(Asking { intent, ask, since });
+        let card = match std::mem::take(&mut self.connect) {
+            Connect::Connecting(c) | Connect::Asking { card: Some(c), .. } => Some(c),
+            _ => None,
+        };
+        let ask = Asking { intent, ask, since };
+        self.connect = Connect::Asking { ask, card };
     }
 
     /// The asking connect, once its list lands: §10.1 through `picker_decision`. No answer
     /// in [`PROFILES_WAIT`], or a failed one, dials with the remembered pick, if any.
     pub(super) fn tick_asking(&mut self) {
-        let Some(a) = &self.asking else { return };
+        let t = self.t();
+        let Connect::Asking { ask: a, card } = &self.connect else {
+            return;
+        };
         let answer = self.console.take_profiles(&a.intent.fp_hex);
-        let waited = self.t() - a.since;
+        let waited = t - a.since;
         if answer.is_none() && waited < PROFILES_WAIT {
-            if waited >= ASKING_CARD_AFTER && self.connecting.is_none() {
+            if waited >= ASKING_CARD_AFTER && card.is_none() {
                 let title = a.intent.title.clone();
                 self.set_connecting(Some(title));
             }
             return;
         }
-        let Some(Asking {
-            mut intent, ask, ..
-        }) = self.asking.take()
+        let Connect::Asking {
+            ask: Asking {
+                mut intent, ask, ..
+            },
+            ..
+        } = std::mem::take(&mut self.connect)
         else {
             return;
         };
         if let Some(answer) = &answer {
             self.profiles.learn(&intent.fp_hex, answer);
         }
-        self.connecting = None;
         // A first ask may come back `profile-unknown` and ask again; the second may not.
-        let first = !std::mem::take(&mut self.reasking);
-        self.reask = first.then(|| ConnectIntent {
-            profile: None,
-            seat: None,
-            ask: Some(ProfileAsk {
-                saved: None,
-                ..ask.clone()
+        self.reask = match self.reask {
+            Reask::Asking => Reask::None,
+            _ => Reask::Armed(ConnectIntent {
+                profile: None,
+                seat: None,
+                ask: Some(ProfileAsk {
+                    saved: None,
+                    ..ask.clone()
+                }),
+                ..intent.clone()
             }),
-            ..intent.clone()
-        });
+        };
         let listed = match answer {
             Some(ProfilesAnswer::Listed(l)) if !l.is_empty() => Some(l),
             Some(ProfilesAnswer::Listed(_) | ProfilesAnswer::NoProfiles) => None,
@@ -506,10 +644,10 @@ impl Shell {
 
     /// A connect, a seat wait or the screen on top takes `fp`'s next answer.
     fn waits_on_profiles(&self, fp: &str) -> bool {
-        self.asking.as_ref().is_some_and(|a| a.intent.fp_hex == fp)
+        self.connect.asking().is_some_and(|a| a.intent.fp_hex == fp)
             || self
-                .seat_wait
-                .as_ref()
+                .connect
+                .seat_wait()
                 .is_some_and(|w| w.intent.fp_hex == fp)
             || matches!(self.stack.last(), Some(Screen::Profiles(p)) if p.waiting() && p.fp_hex() == fp)
     }
@@ -536,7 +674,7 @@ impl Shell {
         };
         // An answer left from an earlier ask is not this wait's.
         self.console.take_profiles(&intent.fp_hex);
-        self.seat_wait = Some(SeatWait {
+        self.connect = Connect::SeatWait(SeatWait {
             intent,
             mgmt,
             id: row.id,
@@ -550,7 +688,10 @@ impl Shell {
     /// While a seat comes up: read the profile list every [`SEAT_POLL`] seconds. `ready` or
     /// `occupied` dials; `unavailable` says why and stops. A failed read waits for the next.
     pub(super) fn tick_seat_wait(&mut self) {
-        let Some(mut w) = self.seat_wait.take() else {
+        if self.connect.seat_wait().is_none() {
+            return;
+        }
+        let Connect::SeatWait(mut w) = std::mem::take(&mut self.connect) else {
             return;
         };
         let answer = self.console.take_profiles(&w.intent.fp_hex);
@@ -578,7 +719,7 @@ impl Shell {
                 fp_hex: w.intent.fp_hex.clone(),
             });
         }
-        self.seat_wait = Some(w);
+        self.connect = Connect::SeatWait(w);
     }
 
     fn dial(&mut self, intent: ConnectIntent) {
@@ -605,11 +746,13 @@ impl Shell {
             )),
             _ => None,
         };
-        self.launching = launch.and_then(|(host, from)| self.launch_hold(host, from));
-        if self.launching.is_none() {
-            self.set_connecting(Some(intent.title.clone()));
-            if let Some(c) = &mut self.connecting {
-                c.request_access = intent.request_access;
+        match launch.and_then(|(host, from)| self.launch_hold(host, from)) {
+            Some(hold) => self.connect = Connect::Launching(hold),
+            None => {
+                self.set_connecting(Some(intent.title.clone()));
+                if let Some(c) = self.connect.card_mut() {
+                    c.request_access = intent.request_access;
+                }
             }
         }
         self.actions.push_back(OverlayAction::Launch {
@@ -622,5 +765,54 @@ impl Shell {
             preset: intent.preset,
             profile: intent.profile,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asking(card: Option<Connecting>) -> Connect {
+        let host = HostRow::default();
+        let ask = Asking {
+            intent: ConnectIntent::to_host(&host, None),
+            ask: ProfileAsk {
+                key: String::new(),
+                name: String::new(),
+                mgmt: 0,
+                saved: None,
+            },
+            since: 0.0,
+        };
+        Connect::Asking { ask, card }
+    }
+
+    /// Each phase raises its own takeover. The card rides an ask and goes without it; the
+    /// end of a dial leaves an ask waiting.
+    #[test]
+    fn a_connect_phase_owns_its_takeover_and_its_card() {
+        let card = |title: &str| Connecting {
+            title: title.into(),
+            appear: 0.0,
+            request_access: false,
+        };
+        let mut c = asking(None);
+        assert_eq!(c.takeover(), Some(Takeover::Asking));
+        c.show_card(card("Den"));
+        assert_eq!(c.card().map(|c| c.title.as_str()), Some("Den"));
+        assert_eq!(
+            c.takeover(),
+            Some(Takeover::Asking),
+            "the card waits on the ask"
+        );
+        c.end_dial();
+        assert!(c.card().is_none() && c.asking().is_some());
+
+        let mut c = Connect::Idle;
+        c.show_card(card("Den"));
+        assert_eq!(c.takeover(), Some(Takeover::Connecting));
+        c.drop_card();
+        assert!(matches!(c, Connect::Idle));
+        assert_eq!(c.takeover(), None);
     }
 }
