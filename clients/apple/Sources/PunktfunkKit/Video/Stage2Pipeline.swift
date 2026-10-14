@@ -1086,6 +1086,7 @@ private final class RecoveryReport: @unchecked Sendable {
     }
 }
 
+@MainActor
 public final class Stage2Pipeline {
     private let ring: FrameStore<ReadyFrame>
     private let presenter: MetalVideoPresenter
@@ -1350,7 +1351,8 @@ public final class Stage2Pipeline {
     private func startArrivalPresenter(policy: PresentPolicy, debugStats: PresentDebugStats?) {
         let token = token
         let ring = ring
-        let presenter = presenter
+        // The render thread draws through it, as MetalVideoPresenter's threading note allows.
+        nonisolated(unsafe) let presenter = presenter
         let vsyncClock = vsyncClock
         let endToEndMeter = endToEndMeter
         let hud = hud
@@ -1493,12 +1495,14 @@ public final class Stage2Pipeline {
         let ring = ring
         let renderSignal = renderSignal
         let renderStopped = renderStopped
-        let presenter = presenter
+        // The render and link threads draw through both, as MetalVideoPresenter's threading
+        // note allows: main touches only the layer's geometry.
+        nonisolated(unsafe) let presenter = presenter
         let endToEndMeter = endToEndMeter
         let hud = hud
         let clockOffset = clockOffset
         let hint = frameRateHint
-        let layer = presenter.layer
+        nonisolated(unsafe) let layer = presenter.layer
         let onWedged = onPresentWedged
         let stash = LatestBox<VendedDrawable>()
         // Cadence targeting under deadline pacing: the link's vend IS the grid snap, so the clock
@@ -1829,7 +1833,7 @@ public final class Stage2Pipeline {
 
     /// The layer's private compositing status for the debug line: 0 scans out Direct, non-zero
     /// composites. Debug builds only; `na` where the property is missing.
-    static func compositionStatus(_ layer: CAMetalLayer) -> String {
+    nonisolated static func compositionStatus(_ layer: CAMetalLayer) -> String {
         #if DEBUG
         let key = "displayCompositingInternalStatus"
         guard layer.responds(to: NSSelectorFromString(key)),
@@ -1916,7 +1920,7 @@ public final class Stage2Pipeline {
     /// decoder's own callback fills the ready ring. A failed submit drops the decode session and
     /// waits for the next IDR's parameter sets. Static + capture-by-parameter so a missed stop
     /// can't leak a live pipeline.
-    private static func makeVideoToolboxPump(
+    private nonisolated static func makeVideoToolboxPump(
         connection: PunktfunkConnection, token: StopFlag, pumpStopped: DispatchSemaphore,
         decoder: VideoDecoder,
         onFrame: (@Sendable (AccessUnit) -> Void)?,
@@ -1982,7 +1986,7 @@ public final class Stage2Pipeline {
     /// silenced host-side for this codec, and a lossy (partial-delivery) frame is MEANT to
     /// present as localized blur — never a freeze. Static + capture-by-parameter for the same
     /// reason the VT pump avoids capturing `self` (a missed stop must not leak a live pipeline).
-    private static func makePyroWavePump(
+    private nonisolated static func makePyroWavePump(
         connection: PunktfunkConnection, token: StopFlag, pumpStopped: DispatchSemaphore,
         ring: FrameStore<ReadyFrame>, renderSignal: DispatchSemaphore,
         device: MTLDevice, queue: MTLCommandQueue,
@@ -2092,11 +2096,11 @@ public final class Stage2Pipeline {
 
     /// Block until `t` (`CACurrentMediaTime` seconds) as an absolute deadline on the mach clock
     /// that time counts in, so a late start does not stretch the wait.
-    static func wait(untilMediaTime t: CFTimeInterval) {
+    nonisolated static func wait(untilMediaTime t: CFTimeInterval) {
         mach_wait_until(UInt64(t * 1e9 * Double(timebase.denom) / Double(timebase.numer)))
     }
 
-    private static let timebase: mach_timebase_info_data_t = {
+    private nonisolated static let timebase: mach_timebase_info_data_t = {
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
         return info
@@ -2105,7 +2109,7 @@ public final class Stage2Pipeline {
     /// Convert a `CADisplayLink.targetTimestamp` (CACurrentMediaTime basis) to a `CLOCK_REALTIME`
     /// nanosecond instant — the present clock the AU pts + skew offset live in. Projects to the target
     /// present time (when the frame is actually on glass), not the moment we drew.
-    public static func realtimeNs(forDisplayLinkTimestamp t: CFTimeInterval) -> Int64 {
+    public nonisolated static func realtimeNs(forDisplayLinkTimestamp t: CFTimeInterval) -> Int64 {
         let caNow = CACurrentMediaTime()
         let realtimeNow = realtimeNowNs()
         return realtimeNow + Int64((t - caNow) * 1_000_000_000)
@@ -2124,7 +2128,7 @@ public final class Stage2Pipeline {
     /// by the loop's own offset estimator and need no conversion at all — but the two clocks
     /// diverge across device sleep, which is exactly why the conversion is done per frame here
     /// rather than once per session.)
-    static func mediaTimeNs(forRealtimeNs t: Int64) -> Int64 {
+    nonisolated static func mediaTimeNs(forRealtimeNs t: Int64) -> Int64 {
         let caNow = CACurrentMediaTime()
         let realtimeNow = realtimeNowNs()
         return Int64(caNow * 1_000_000_000) + (t - realtimeNow)
@@ -2138,7 +2142,7 @@ public final class Stage2Pipeline {
     /// not on the source's timeline at all, so it is folded through `noteOffCadence`: due as soon
     /// as it is ready, and the estimate left alone. Folding "now" in would drag the offset toward
     /// this instant precisely when the loop has the least evidence.
-    private static func dated(
+    private nonisolated static func dated(
         _ frame: ReadyFrame, by clock: CadenceClock?, hint: FrameRateHint
     ) -> ReadyFrame {
         guard let clock else { return frame }

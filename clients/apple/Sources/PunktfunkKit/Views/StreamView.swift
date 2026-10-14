@@ -379,7 +379,7 @@ public final class StreamLayerView: NSView {
         ) { [weak self] _ in
             self?.screenValuesStale = true
             self?.layoutPresenter()
-            self?.presenter.screenChanged()
+            MainActor.assumeIsolated { self?.presenter.screenChanged() }
         })
         // The same screen with a new mode, or a housing that came or went with it.
         windowObservers.append(NotificationCenter.default.addObserver(
@@ -1214,7 +1214,7 @@ public final class StreamLayerView: NSView {
         window?.invalidateCursorRects(for: self)
     }
 
-    deinit {
+    isolated deinit {
         removeMouseMonitor()
         appObservers.forEach(NotificationCenter.default.removeObserver(_:))
         windowObservers.forEach(NotificationCenter.default.removeObserver(_:))

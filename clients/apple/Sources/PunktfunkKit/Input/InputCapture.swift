@@ -51,6 +51,7 @@ import os
 private let inputLog = ClientLog(category: "input")
 private let inputDebug = ProcessInfo.processInfo.environment["PUNKTFUNK_INPUT_DEBUG"] == "1"
 
+@MainActor
 public final class InputCapture {
     private static weak var activeCapture: InputCapture?
 
@@ -167,14 +168,14 @@ public final class InputCapture {
     #if os(iOS) || os(visionOS)
     /// Windows VKs of the three modifier classes in the ⌃⌥⇧ chords, both L/R sides:
     /// control (0xA2/0xA3), option (0xA4/0xA5), shift (0xA0/0xA1). Used to sift the HID key stream.
-    private static let chordModifierVKs: Set<UInt32> = [0xA2, 0xA3, 0xA4, 0xA5, 0xA0, 0xA1]
+    nonisolated private static let chordModifierVKs: Set<UInt32> = [0xA2, 0xA3, 0xA4, 0xA5, 0xA0, 0xA1]
 
     private var hasChordModifiers: Bool { Self.holdsChordModifiers(chordModifiersDown) }
     #endif
 
     /// Whether `held` (Windows VKs) has Control AND Option AND Shift, either side of each — the
     /// modifier precondition for the iPad's `padChords`.
-    static func holdsChordModifiers(_ held: Set<UInt32>) -> Bool {
+    nonisolated static func holdsChordModifiers(_ held: Set<UInt32>) -> Bool {
         (held.contains(0xA2) || held.contains(0xA3)) // control
             && (held.contains(0xA4) || held.contains(0xA5)) // option
             && (held.contains(0xA0) || held.contains(0xA1)) // shift
@@ -288,7 +289,7 @@ public final class InputCapture {
         observers.append(NotificationCenter.default.addObserver(
             forName: .GCMouseDidConnect, object: nil, queue: .main
         ) { [weak self] n in
-            if let m = n.object as? GCMouse { self?.attach(mouse: m) }
+            if let m = n.object as? GCMouse { MainActor.assumeIsolated { self?.attach(mouse: m) } }
         })
         #if os(iOS) || os(visionOS)
         // The mouse can become the *current* one after it connected (and after our start()
@@ -297,13 +298,15 @@ public final class InputCapture {
         observers.append(NotificationCenter.default.addObserver(
             forName: .GCMouseDidBecomeCurrent, object: nil, queue: .main
         ) { [weak self] n in
-            if let m = n.object as? GCMouse { self?.attach(mouse: m) }
+            if let m = n.object as? GCMouse { MainActor.assumeIsolated { self?.attach(mouse: m) } }
         })
         #endif
         observers.append(NotificationCenter.default.addObserver(
             forName: .GCKeyboardDidConnect, object: nil, queue: .main
         ) { [weak self] n in
-            if let k = n.object as? GCKeyboard { self?.attach(keyboard: k) }
+            if let k = n.object as? GCKeyboard {
+                MainActor.assumeIsolated { self?.attach(keyboard: k) }
+            }
         })
         #if !os(macOS)
         // A device that drops mid-press never sends its releases, and the repeat ticker would
@@ -311,12 +314,12 @@ public final class InputCapture {
         observers.append(NotificationCenter.default.addObserver(
             forName: .GCMouseDidDisconnect, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.releaseMouseButtons()
+            MainActor.assumeIsolated { self?.releaseMouseButtons() }
         })
         observers.append(NotificationCenter.default.addObserver(
             forName: .GCKeyboardDidDisconnect, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.releaseAll()
+            MainActor.assumeIsolated { self?.releaseAll() }
         })
         #endif
         // Focus loss: GC stops delivering, so release everything still held host-side.
@@ -328,7 +331,7 @@ public final class InputCapture {
         observers.append(NotificationCenter.default.addObserver(
             forName: resignActive, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.releaseAll()
+            MainActor.assumeIsolated { self?.releaseAll() }
         })
         // Runs before any menu key equivalent and StreamLayerView's keyDown, the host's only key
         // path on macOS, so an event it swallows must be handled or forwarded right here.
@@ -349,7 +352,7 @@ public final class InputCapture {
             }
             let flags = Self.chordFlags(event)
             // A held chord auto-repeats: swallow the repeats and act on the first press only.
-            func take(_ vk: UInt32, _ action: (() -> Void)?) -> NSEvent? {
+            @MainActor func take(_ vk: UInt32, _ action: (() -> Void)?) -> NSEvent? {
                 if !event.isARepeat { self.suppressedVK = vk; action?() }
                 return nil
             }
@@ -426,7 +429,7 @@ public final class InputCapture {
         #endif
     }
 
-    deinit { stop() }
+    isolated deinit { stop() }
 
     /// Send release events for everything currently held, and drop the motion residuals
     /// and modifier/latch tracking (GC delivers nothing while inactive, so a ⌘ released
@@ -471,12 +474,22 @@ public final class InputCapture {
         0x14, 0x90, 0x91, // CapsLock, NumLock, ScrollLock
     ]
 
+    /// One repeat of `vk`. Stops the moment the key is no longer held — a release that raced
+    /// the timer, or a releaseAll from a blur, must not keep typing into the host.
+    private func repeatKey(_ vk: UInt32) {
+        guard autoRepeatVK == vk, forwarding, pressedVKs.contains(vk) else {
+            stopAutoRepeat()
+            return
+        }
+        emitKey(vk, down: true)
+    }
+
     /// Start (or hand over) the held-key auto-repeat, matching a real keyboard's delay-then-rate.
     ///
     /// GameController reports a key ONCE on press and once on release — it has no repeat channel —
     /// and the host injects exactly what it is told, so nothing downstream ever turns a held key
-    /// into a stream of presses. Holding Backspace deleted a single character. macOS is unaffected:
-    /// its NSEvent path already receives the window server's own repeats and forwards them.
+    /// into a stream of presses. macOS is unaffected: its NSEvent path already receives the
+    /// window server's own repeats and forwards them.
     ///
     /// Only the newest key repeats, which is what a hardware keyboard does — pressing a second key
     /// takes the repeat over from the first. Timings are the iOS/macOS defaults (~0.5 s delay,
@@ -485,21 +498,16 @@ public final class InputCapture {
         guard !Self.noAutoRepeatVKs.contains(vk) else { return }
         stopAutoRepeat()
         autoRepeatVK = vk
+        // Both timers fire on the main run loop.
         let timer = Timer(timeInterval: 0.5, repeats: false) { [weak self] _ in
-            guard let self, self.autoRepeatVK == vk else { return }
-            let ticker = Timer(timeInterval: 0.04, repeats: true) { [weak self] _ in
-                // Stop the moment the key is no longer held — a release that raced the timer, or a
-                // releaseAll from a blur, must not keep typing into the host.
-                guard let self, self.autoRepeatVK == vk, self.forwarding,
-                      self.pressedVKs.contains(vk)
-                else {
-                    self?.stopAutoRepeat()
-                    return
+            MainActor.assumeIsolated {
+                guard let self, self.autoRepeatVK == vk else { return }
+                let ticker = Timer(timeInterval: 0.04, repeats: true) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.repeatKey(vk) }
                 }
-                self.emitKey(vk, down: true)
+                self.autoRepeatTimer = ticker
+                RunLoop.main.add(ticker, forMode: .common)
             }
-            self.autoRepeatTimer = ticker
-            RunLoop.main.add(ticker, forMode: .common)
         }
         autoRepeatTimer = timer
         RunLoop.main.add(timer, forMode: .common)
@@ -647,7 +655,7 @@ public final class InputCapture {
     /// we track (`isDown`, from pressedVKs — SDL ships the same fallback). Each keyCode
     /// maps to the L/R modifier VK `hidToVK` already emits, so the host needs no change.
     /// Returns nil for modifiers the host doesn't consume on this path (Fn, Caps Lock).
-    static func resolveModifier(
+    nonisolated static func resolveModifier(
         keyCode: UInt16, rawFlags: UInt, isDown: (UInt32) -> Bool
     ) -> (vk: UInt32, down: Bool)? {
         guard let mod = modifierBits[keyCode] else { return nil }
@@ -670,10 +678,10 @@ public final class InputCapture {
     /// stopped being recognized the moment Caps Lock was on — ⌘⎋ and ⌃⌥⇧Q, both escape hatches,
     /// included. That was survivable while the monitor claimed six chords; it is not, now that it
     /// swallows every ⌘ chord there is.
-    static let chordFlagMask: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
+    nonisolated static let chordFlagMask: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
 
     /// One event's chord modifiers (see `chordFlagMask`).
-    static func chordFlags(_ event: NSEvent) -> NSEvent.ModifierFlags {
+    nonisolated static func chordFlags(_ event: NSEvent) -> NSEvent.ModifierFlags {
         event.modifierFlags.intersection(chordFlagMask)
     }
 
@@ -686,7 +694,7 @@ public final class InputCapture {
     /// reads `inhibit` and never `desktop` (`pf-presenter`'s `apply_capture`). A remote desktop
     /// needs the host's ⌘ chords too, and under the desktop model the unlocked pointer clicking
     /// another window is the always-available way back.
-    static func forwardsCommandChord(
+    nonisolated static func forwardsCommandChord(
         keyCode: UInt16, flags: NSEvent.ModifierFlags,
         forwarding: Bool, inhibitShortcuts: Bool
     ) -> Bool {
@@ -706,7 +714,7 @@ public final class InputCapture {
     /// a keyUp from `keyUp(with:)` while ⌘ is held, so the monitor takes any held key released
     /// under ⌘, including one pressed before ⌘ went down. A key the ⌘-chord passthrough pressed
     /// is taken whatever the modifiers are by its release.
-    static func takeRelease(
+    nonisolated static func takeRelease(
         _ event: NSEvent, forwarding: Bool, pressedVKs: Set<UInt32>, chordVKs: inout Set<UInt32>
     ) -> UInt32? {
         guard forwarding, event.type == .keyUp, let vk = keyCodeToVK[event.keyCode]
