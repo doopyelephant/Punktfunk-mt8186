@@ -90,7 +90,7 @@ struct SettingsView: View {
     /// every other platform reaches it through the gamepad settings screen, which an Apple TV
     /// without a controller cannot open.
     @AppStorage(DefaultsKey.uiPalette) var uiPalette = SettingDefault.uiPalette
-    @AppStorage(DefaultsKey.autoWake) var autoWakeEnabled = SettingDefault.autoWake
+    @AutoWake var autoWakeEnabled
     @AppStorage(DefaultsKey.backgroundKeepAlive) var backgroundKeepAlive =
         SettingDefault.backgroundKeepAlive
     @AppStorage(DefaultsKey.backgroundTimeoutMinutes) var backgroundTimeoutMinutes =

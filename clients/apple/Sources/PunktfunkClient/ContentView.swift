@@ -148,7 +148,7 @@ struct ContentView: View {
     /// Auto-wake on connect (Settings → General). On (default): a dial to an offline saved host
     /// fires Wake-on-LAN up front and falls into the "Waking…" wait if the dial fails. Off: connects
     /// go straight through with no wake. The explicit "Wake Host" action is unaffected either way.
-    @AppStorage(DefaultsKey.autoWake) private var autoWakeEnabled = SettingDefault.autoWake
+    @AutoWake private var autoWakeEnabled
     /// Where a bare launch opens (Settings → Library). Library (the default) opens the default
     /// host's shelf; Stream also dials its desktop. Resolved once per process by
     /// `applyStartScreen`, never on foregrounding — see `startApplied`.

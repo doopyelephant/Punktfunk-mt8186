@@ -219,8 +219,7 @@ struct ConnectFlow {
         // A host the probe calls down still gets the dial first: a routed host (VPN, another
         // subnet) answers without advertising. `prepareWake` already sent the magic packet, so
         // only a failed dial falls into the visible "Waking…" wait, which redials once it answers.
-        if autoWake, PunktfunkConnection.wakeOnLANAvailable,
-           !host.wakeMacs.isEmpty, !store.probedOnline.contains(host.id) {
+        if wakesFirst(host) {
             discovery.start() // so the wake-wait can pick up a host that moved address
             startSessionDirect(
                 host, launchID: launchID, preset: preset, allowTofu: allowTofu,
@@ -317,14 +316,19 @@ struct ConnectFlow {
             store.updateMgmtPort(host.id, port: live.mgmtPort)
         }
         // Auto-wake only. With it off, connects go straight through (no packet).
-        if autoWake, PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty,
-           !store.probedOnline.contains(host.id) {
+        if wakesFirst(host) {
             let macs = host.wakeMacs
             let ip = host.address
             DispatchQueue.global(qos: .userInitiated).async {
                 PunktfunkConnection.wakeOnLAN(macs: macs, lastKnownIP: ip)
             }
         }
+    }
+
+    /// Auto-wake fires a packet before the dial, unless the last probe reached the host.
+    private func wakesFirst(_ host: StoredHost) -> Bool {
+        WakePolicy.autoWakes(host.wakeMacs, autoWake: autoWake)
+            && !store.probedOnline.contains(host.id)
     }
 
     /// The no-PIN delegated-approval flow: ask the host, which parks the request until the
@@ -365,7 +369,7 @@ struct ConnectFlow {
     /// Explicit wake-only (a host card's or the library's "Wake Host"): fire the packet and wait
     /// for the host to come online, then run `onOnline`, but don't connect.
     func wakeOnly(_ host: StoredHost, onOnline: @escaping () -> Void = {}) {
-        guard PunktfunkConnection.wakeOnLANAvailable, !host.wakeMacs.isEmpty else { return }
+        guard WakePolicy.canWake(host.wakeMacs) else { return }
         discovery.start()
         waker.start(
             host: host, connectsAfter: false, macs: host.wakeMacs, lastIP: host.address,
