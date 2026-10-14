@@ -3,6 +3,7 @@
 #
 #   a host binary that loads         -> exit 0, update.sh never runs
 #   no host binary                   -> update.sh runs once and the attempt stamp is cleared
+#   the same with no host.env        -> update.sh still runs
 #   update.sh fails                  -> the stamp stays, and the next boot does not retry
 #
 # bash -n and shellcheck cannot see an unbound variable in lib.sh or a broken `set -e` path; this
@@ -35,10 +36,15 @@ run > /dev/null
 [ "$(calls)" = 1 ] || fail "a missing host binary ran update.sh $(calls) times, not once"
 [ ! -e "$stamp" ] || fail "a successful rebuild left its attempt stamp"
 
+rm "$tmp/home/.config/punktfunk/host.env"
+run > /dev/null || fail "with no host.env a missing host binary did not rebuild"
+[ "$(calls)" = 2 ] || fail "with no host.env update.sh ran $(calls) times in all, not twice"
+: > "$tmp/home/.config/punktfunk/host.env"
+
 stub 1
 run > /dev/null && fail "a failed update.sh did not fail the check"
 [ -e "$stamp" ] || fail "a failed rebuild cleared its attempt stamp"
 out=$(run)
 case $out in *"not retrying"*) ;; *) fail "the second boot retried the rebuild: $out" ;; esac
-[ "$(calls)" = 2 ] || fail "the second boot ran update.sh again"
+[ "$(calls)" = 3 ] || fail "the second boot ran update.sh again"
 echo "check-steamdeck-rebuild: healthy, rebuild and no-retry paths behave"
