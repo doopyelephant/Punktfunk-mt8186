@@ -798,4 +798,677 @@ mod tests {
             assert_eq!(counted, code == "quality_failed", "{code}");
         }
     }
+
+    const SEAT: &str = "pf-seat-1";
+    const MS: Duration = Duration::from_millis(1);
+    const HOUR: Duration = Duration::from_secs(3600);
+    const NOTHING: Probe = Probe {
+        keeper: None,
+        gate: None,
+        host: None,
+        session: None,
+        ready: false,
+    };
+    const SESSION: Probe = Probe {
+        session: Some(7),
+        ..NOTHING
+    };
+    const READY: Probe = Probe {
+        ready: true,
+        ..NOTHING
+    };
+    const SIGNING_IN: &str = "Signing in to the seat's Windows account…";
+    const CHECKING: &str = "Checking the seat's screen and graphics card…";
+    const STARTING_HOST: &str = "Starting punktfunk on the seat…";
+    const NO_SCREEN: &str = "The seat's screen didn't start. The graphics card or the seat display driver failed its check.";
+    const NO_HOST: &str = "punktfunk didn't start on the seat. The seat's log has the cause.";
+    const GATE_OUT_OF_TIME: &str =
+        "same-session virtual-display quality gate did not finish within 60 seconds";
+    const STOPPED_EARLY: (&str, &str) = ("seat_stopping", "seat stopped before startup completed");
+    const STOPPED_READYING: (&str, &str) = (
+        "seat_stopping",
+        "seat stopped while waiting for host readiness",
+    );
+
+    fn keeper(code: u32) -> Probe {
+        Probe {
+            keeper: Some(code),
+            ..NOTHING
+        }
+    }
+
+    fn gate(code: u32) -> Probe {
+        Probe {
+            gate: Some(code),
+            ..NOTHING
+        }
+    }
+
+    fn host(code: u32) -> Probe {
+        Probe {
+            host: Some(code),
+            ..NOTHING
+        }
+    }
+
+    fn error(code: &str, message: &str) -> BackendError {
+        BackendError::new(code, message)
+    }
+
+    fn shows(state: RuntimeState, detail: &str) -> RuntimeStatus {
+        RuntimeStatus {
+            state,
+            detail: Some(detail.into()),
+        }
+    }
+
+    fn start_cycle() -> Vec<Action> {
+        vec![Action::Announce(Stage::SignIn, 0), Action::StartKeeper]
+    }
+
+    fn start_host() -> Vec<Action> {
+        vec![Action::Announce(Stage::Host, 0), Action::StartHost]
+    }
+
+    fn report(code: &str, message: &str, retry: bool) -> Vec<Action> {
+        vec![Action::Report {
+            error: error(code, message),
+            retry,
+        }]
+    }
+
+    /// A seat's state and a clock that only the test moves.
+    struct Bench {
+        state: State,
+        now: Instant,
+    }
+
+    impl Bench {
+        fn see(&mut self, probe: Probe) -> Vec<Action> {
+            self.state.step(Observation::Probe(probe), self.now)
+        }
+
+        fn later(&mut self, by: Duration) -> &mut Self {
+            self.now += by;
+            self
+        }
+
+        fn fails(&mut self, code: &str) -> Vec<Action> {
+            let fault = error(code, MESSAGE).into();
+            self.state.step(Observation::Failed(fault), self.now)
+        }
+
+        /// A caller's request only marks the state.
+        fn asks(&mut self, request: Observation) {
+            assert_eq!(self.state.step(request, self.now), []);
+        }
+
+        /// The start's answer as its code and message.
+        fn answer(&self) -> Option<Result<(), (&str, &str)>> {
+            self.state.answer().map(|answer| match answer {
+                Ok(()) => Ok(()),
+                Err(error) => Err((error.code.as_str(), error.message.as_str())),
+            })
+        }
+
+        fn ending(&self) -> Option<(&str, &str)> {
+            match &self.state.phase {
+                Phase::Ending { fault: Some(fault) } => {
+                    Some((fault.error.code.as_str(), fault.error.message.as_str()))
+                }
+                _ => None,
+            }
+        }
+
+        /// The seat rests exactly `delay`, then starts its next cycle.
+        fn rests(&mut self, delay: Duration) {
+            self.later(delay - MS);
+            assert_eq!(self.see(NOTHING), [Action::Wait(DELAY_POLL)]);
+            assert_eq!(self.later(MS).see(NOTHING), start_cycle());
+        }
+
+        /// Look at nothing until the worker leaves: every action it was given on the way.
+        fn run_out(&mut self) -> Vec<Action> {
+            let mut all = Vec::new();
+            for _ in 0..8 {
+                all.extend(self.see(NOTHING));
+                if all.last() == Some(&Action::Finish) {
+                    assert!(self.state.finished());
+                    return all;
+                }
+            }
+            panic!("the worker did not leave: {all:?}");
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum At {
+        Fresh,
+        SigningIn,
+        Entering,
+        Gating,
+        Collecting,
+        Readying,
+        Running,
+        HostDown,
+        Ending,
+        Resting,
+    }
+
+    /// What a clean start sees and is told to do on its way into each phase.
+    fn road() -> [(At, Probe, Vec<Action>); 6] {
+        let check = vec![Action::Announce(Stage::Display, 1), Action::StartGate];
+        [
+            (At::SigningIn, NOTHING, start_cycle()),
+            (At::Entering, SESSION, vec![Action::EnterSession(7)]),
+            (At::Gating, NOTHING, check),
+            (At::Collecting, gate(0), vec![Action::CollectGate]),
+            (At::Readying, NOTHING, start_host()),
+            (At::Running, READY, vec![]),
+        ]
+    }
+
+    /// A seat driven to `at` by a clean start. `HostDown` follows a host that exited while it
+    /// served; `Ending` and `Resting` follow a keeper lost then.
+    fn bench(at: At) -> Bench {
+        let mut bench = Bench {
+            state: State::new(SEAT.into()),
+            now: Instant::now(),
+        };
+        if at == At::Fresh {
+            return bench;
+        }
+        for (reached, probe, actions) in road() {
+            assert_eq!(bench.see(probe), actions, "into {reached:?}");
+            if reached == at {
+                return bench;
+            }
+        }
+        if at == At::HostDown {
+            assert_eq!(bench.see(host(3)), [Action::LogHostExit(3)]);
+            return bench;
+        }
+        assert_eq!(bench.see(keeper(5)), [Action::EndCycle]);
+        if at == At::Resting {
+            let lost = report(
+                "rdp_keeper_exited",
+                "RDP keeper process exited with code 5",
+                true,
+            );
+            assert_eq!(bench.see(NOTHING), lost);
+        }
+        bench
+    }
+
+    #[test]
+    fn the_limits_keep_their_values() {
+        assert_eq!(SESSION_TIMEOUT, Duration::from_secs(45));
+        assert_eq!(QUALITY_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(QUALITY_SESSIONS, 5);
+        assert_eq!(HOST_READY_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(START_TIMEOUT, Duration::from_secs(180));
+        assert_eq!(FIRST_RESTART_DELAY, Duration::from_secs(1));
+        assert_eq!(MAX_RESTART_DELAY, Duration::from_secs(30));
+        let polls = [SESSION_POLL, GATE_POLL, READY_POLL, WATCH_POLL, DELAY_POLL];
+        assert_eq!(
+            polls.map(|poll| poll.as_millis()),
+            [250, 100, 200, 250, 100]
+        );
+    }
+
+    #[test]
+    fn a_clean_start_runs_each_stage_once() {
+        let mut bench = bench(At::Fresh);
+        assert_eq!(
+            *bench.state.status(),
+            shows(RuntimeState::Starting, SIGNING_IN)
+        );
+        let after = [
+            shows(RuntimeState::Starting, SIGNING_IN),
+            shows(RuntimeState::Starting, SIGNING_IN),
+            shows(RuntimeState::Starting, CHECKING),
+            shows(RuntimeState::Starting, CHECKING),
+            shows(RuntimeState::Starting, STARTING_HOST),
+            RuntimeStatus::running(),
+        ];
+        for ((reached, probe, actions), status) in road().into_iter().zip(after) {
+            assert_eq!(bench.answer(), None, "before {reached:?}");
+            assert_eq!(bench.see(probe), actions, "into {reached:?}");
+            assert_eq!(*bench.state.status(), status, "in {reached:?}");
+        }
+        assert_eq!(bench.answer(), Some(Ok(())));
+        assert_eq!(bench.state.session(), Some(7));
+        // The host serves: the worker only watches.
+        assert_eq!(bench.later(HOUR).see(NOTHING), [Action::Wait(WATCH_POLL)]);
+        assert!(!bench.state.finished());
+    }
+
+    #[test]
+    fn the_worker_looks_at_what_the_phase_waits_for() {
+        let looks = [
+            (At::Fresh, Look::Clock),
+            (At::SigningIn, Look::Session),
+            (At::Entering, Look::Clock),
+            (At::Gating, Look::Gate),
+            (At::Collecting, Look::Clock),
+            (At::Readying, Look::Ports),
+            (At::Running, Look::Exits),
+            (At::HostDown, Look::Keeper),
+            (At::Ending, Look::Clock),
+            (At::Resting, Look::Clock),
+        ];
+        for (at, look) in looks {
+            assert_eq!(bench(at).state.look(), look, "{at:?}");
+        }
+    }
+
+    #[test]
+    fn a_wait_runs_out_at_its_limit_counted_from_its_first_look() {
+        let rows = [
+            (
+                At::SigningIn,
+                45,
+                SESSION_POLL,
+                "wts_timeout",
+                "no active non-console WTS session appeared for 'pf-seat-1'",
+            ),
+            (
+                At::Gating,
+                60,
+                GATE_POLL,
+                "quality_timeout",
+                GATE_OUT_OF_TIME,
+            ),
+            (
+                At::Readying,
+                30,
+                READY_POLL,
+                "host_ready_timeout",
+                "punktfunk-host did not open both assigned ports within 30 seconds",
+            ),
+        ];
+        for (at, limit, poll, code, message) in rows {
+            let mut bench = bench(at);
+            // The action that started the child took a while; the wait starts after it.
+            bench.later(Duration::from_secs(20));
+            assert_eq!(bench.see(NOTHING), [Action::Wait(poll)], "{at:?}");
+            bench.later(Duration::from_secs(limit) - MS);
+            assert_eq!(bench.see(NOTHING), [Action::Wait(poll)], "{at:?}");
+            assert_eq!(bench.later(MS).see(NOTHING), [Action::EndCycle], "{at:?}");
+            assert_eq!(bench.ending(), Some((code, message)), "{at:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_gate_gets_five_sessions() {
+        let failed = "same-session virtual-display quality gate exited with code 1";
+        let mut bench = bench(At::Gating);
+        for session in 1..QUALITY_SESSIONS {
+            assert_eq!(bench.see(gate(1)), [Action::EndCycle]);
+            // Another session follows: the start is not answered and the console still
+            // reads the check.
+            assert_eq!(bench.see(NOTHING), report("quality_failed", failed, true));
+            assert_eq!(bench.answer(), None);
+            let detail = match session {
+                1 => CHECKING.to_owned(),
+                n => format!("Checking the seat's screen and graphics card (try {n} of 5)…"),
+            };
+            assert_eq!(
+                *bench.state.status(),
+                shows(RuntimeState::Starting, &detail)
+            );
+            bench.rests(Duration::from_secs(1 << (session - 1)));
+            assert_eq!(bench.see(SESSION), [Action::EnterSession(7)]);
+            let check = [
+                Action::Announce(Stage::Display, session + 1),
+                Action::StartGate,
+            ];
+            assert_eq!(bench.see(NOTHING), check);
+        }
+        // The fifth failure is the gate's answer, and the start's.
+        assert_eq!(bench.see(gate(1)), [Action::EndCycle]);
+        assert_eq!(bench.see(NOTHING), [Action::Finish]);
+        assert_eq!(bench.answer(), Some(Err(("quality_failed", failed))));
+        assert_eq!(
+            *bench.state.status(),
+            shows(RuntimeState::Failed, NO_SCREEN)
+        );
+        assert!(bench.state.finished());
+    }
+
+    #[test]
+    fn a_gate_that_passed_is_not_run_again() {
+        let mut bench = bench(At::Resting);
+        bench.rests(Duration::from_secs(1));
+        assert_eq!(bench.see(SESSION), [Action::EnterSession(7)]);
+        assert_eq!(bench.see(NOTHING), start_host());
+    }
+
+    #[test]
+    fn a_host_that_exits_before_it_is_ready_ends_the_cycle() {
+        let exited = "punktfunk-host exited with code 1 before readiness";
+        let mut bench = bench(At::Readying);
+        assert_eq!(bench.see(host(1)), [Action::EndCycle]);
+        // The console reads the old status until the session is logged off.
+        assert_eq!(
+            *bench.state.status(),
+            shows(RuntimeState::Starting, STARTING_HOST)
+        );
+        assert_eq!(bench.state.session(), Some(7));
+        // The first failure is the start's answer, so its caller logs it.
+        assert_eq!(bench.see(NOTHING), []);
+        assert_eq!(bench.answer(), Some(Err(("host_exited", exited))));
+        assert_eq!(*bench.state.status(), shows(RuntimeState::Failed, NO_HOST));
+        assert_eq!(bench.state.session(), None);
+        bench.rests(Duration::from_secs(1));
+        assert_eq!(
+            *bench.state.status(),
+            shows(RuntimeState::Starting, SIGNING_IN)
+        );
+        // The gate passed in the first cycle. A second failure has only the log.
+        assert_eq!(bench.see(SESSION), [Action::EnterSession(7)]);
+        assert_eq!(bench.see(NOTHING), start_host());
+        assert_eq!(bench.see(host(1)), [Action::EndCycle]);
+        assert_eq!(bench.see(NOTHING), report("host_exited", exited, true));
+        bench.rests(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_host_that_exits_while_it_serves_starts_again_in_the_session() {
+        let mut bench = bench(At::Running);
+        // An hour of serving between two exits doesn't shorten the next wait.
+        for secs in [1, 2, 4, 8, 16, 30, 30] {
+            assert_eq!(bench.later(HOUR).see(host(3)), [Action::LogHostExit(3)]);
+            let detail = format!("punktfunk stopped on the seat. Restarting it in {secs} s…");
+            assert_eq!(
+                *bench.state.status(),
+                shows(RuntimeState::Starting, &detail)
+            );
+            bench.later(Duration::from_secs(secs) - MS);
+            assert_eq!(bench.see(NOTHING), [Action::Wait(DELAY_POLL)]);
+            // No stage is announced: the start was answered long ago.
+            assert_eq!(bench.later(MS).see(NOTHING), [Action::StartHost]);
+            assert_eq!(
+                *bench.state.status(),
+                shows(RuntimeState::Starting, &detail)
+            );
+            assert_eq!(bench.see(READY), []);
+            assert_eq!(*bench.state.status(), RuntimeStatus::running());
+        }
+        assert_eq!(bench.answer(), Some(Ok(())));
+        assert_eq!(bench.state.session(), Some(7));
+    }
+
+    #[test]
+    fn the_host_delay_starts_over_with_each_cycle() {
+        let mut bench = bench(At::Running);
+        for _ in 0..3 {
+            assert_eq!(bench.see(host(3)), [Action::LogHostExit(3)]);
+            bench.later(Duration::from_secs(30));
+            assert_eq!(bench.see(NOTHING), [Action::StartHost]);
+            assert_eq!(bench.see(READY), []);
+        }
+        assert_eq!(bench.see(keeper(5)), [Action::EndCycle]);
+        bench.see(NOTHING);
+        bench.rests(Duration::from_secs(1));
+        assert_eq!(bench.see(SESSION), [Action::EnterSession(7)]);
+        assert_eq!(bench.see(NOTHING), start_host());
+        assert_eq!(bench.see(READY), []);
+        assert_eq!(bench.see(host(3)), [Action::LogHostExit(3)]);
+        let detail = "punktfunk stopped on the seat. Restarting it in 1 s…";
+        assert_eq!(*bench.state.status(), shows(RuntimeState::Starting, detail));
+    }
+
+    #[test]
+    fn a_lost_keeper_ends_the_cycle_from_every_phase() {
+        const EARLY: &str = "RDP keeper exited before its WTS session became active";
+        const STARTING: &str = "RDP keeper exited with code 5 during host startup";
+        const SERVING: &str = "RDP keeper process exited with code 5";
+        const DOWN: &str = "RDP keeper exited during host restart backoff";
+        // Phase, the fault, and what follows the teardown. A keeper lost under the gate reads
+        // as a gate out of time, which no new cycle follows.
+        let rows = [
+            (At::SigningIn, "rdp_keeper_exited", EARLY, vec![]),
+            (
+                At::Gating,
+                "quality_timeout",
+                GATE_OUT_OF_TIME,
+                vec![Action::Finish],
+            ),
+            (At::Readying, "rdp_keeper_exited", STARTING, vec![]),
+            (
+                At::Running,
+                "rdp_keeper_exited",
+                SERVING,
+                report("rdp_keeper_exited", SERVING, true),
+            ),
+            (
+                At::HostDown,
+                "rdp_keeper_exited",
+                DOWN,
+                report("rdp_keeper_exited", DOWN, true),
+            ),
+        ];
+        for (at, code, message, then) in rows {
+            let mut bench = bench(at);
+            assert_eq!(bench.see(keeper(5)), [Action::EndCycle], "{at:?}");
+            assert_eq!(bench.ending(), Some((code, message)), "{at:?}");
+            assert_eq!(bench.see(NOTHING), then, "{at:?}");
+            assert_eq!(bench.state.finished(), at == At::Gating, "{at:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_action_ends_the_cycle_and_its_code_decides_the_retry() {
+        // Phase, the code an action or a probe failed with, whether a cycle follows, and
+        // whether the start had been answered, which puts the failure in the log.
+        let rows = [
+            (At::SigningIn, "keeper_spawn", true, false),
+            (At::SigningIn, "credential_missing", false, false),
+            (At::SigningIn, "wts_enumerate", true, false),
+            (At::Entering, "seat_root", true, false),
+            (At::Gating, "process_spawn", true, false),
+            (At::Collecting, "quality_empty", false, false),
+            (At::Readying, "process_spawn", true, false),
+            (At::Running, "process_wait", true, true),
+            (At::HostDown, "process_spawn", true, true),
+        ];
+        for (at, code, retry, answered) in rows {
+            let mut bench = bench(at);
+            assert_eq!(bench.fails(code), [Action::EndCycle], "{at:?} {code}");
+            let mut then = match answered {
+                true => report(code, MESSAGE, retry),
+                false => vec![],
+            };
+            if !retry {
+                then.push(Action::Finish);
+            }
+            assert_eq!(bench.see(NOTHING), then, "{at:?} {code}");
+            let answer = match answered {
+                true => Ok(()),
+                false => Err((code, MESSAGE)),
+            };
+            assert_eq!(bench.answer(), Some(answer), "{at:?} {code}");
+            assert_eq!(bench.state.finished(), !retry, "{at:?} {code}");
+        }
+    }
+
+    #[test]
+    fn a_gate_whose_output_fails_stays_owed() {
+        let mut bench = bench(At::Collecting);
+        bench.fails("quality_output");
+        assert_eq!(bench.state.gate, Gate::Owed { failures: 0 });
+    }
+
+    #[test]
+    fn the_cycle_delay_doubles_to_its_cap_and_never_shrinks() {
+        let mut bench = bench(At::SigningIn);
+        for secs in [1, 2, 4] {
+            assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
+            bench.see(NOTHING);
+            bench.rests(Duration::from_secs(secs));
+        }
+        // An hour of serving in between changes nothing.
+        for (_, probe, actions) in road().into_iter().skip(1) {
+            assert_eq!(bench.see(probe), actions);
+        }
+        bench.later(HOUR);
+        for secs in [8, 16, 30, 30] {
+            assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
+            bench.see(NOTHING);
+            bench.rests(Duration::from_secs(secs));
+        }
+    }
+
+    #[test]
+    fn the_first_answer_stays_when_a_later_cycle_serves() {
+        let mut bench = bench(At::SigningIn);
+        assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
+        assert_eq!(bench.see(NOTHING), []);
+        let first = bench
+            .answer()
+            .map(|answer| answer.map_err(|(code, _)| code));
+        assert_eq!(first, Some(Err("rdp_keeper_exited")));
+        bench.rests(Duration::from_secs(1));
+        for (_, probe, actions) in road().into_iter().skip(1) {
+            assert_eq!(bench.see(probe), actions);
+        }
+        assert_eq!(*bench.state.status(), RuntimeStatus::running());
+        let now = bench
+            .answer()
+            .map(|answer| answer.map_err(|(code, _)| code));
+        assert_eq!(now, Some(Err("rdp_keeper_exited")));
+    }
+
+    #[test]
+    fn a_stop_in_every_phase_ends_stopped() {
+        const EARLY: (&str, &str) = (
+            "rdp_keeper_exited",
+            "RDP keeper exited before its WTS session became active",
+        );
+        const GATE: (&str, &str) = ("quality_timeout", GATE_OUT_OF_TIME);
+        let check = vec![Action::Announce(Stage::Display, 1), Action::StartGate];
+        let end = [Action::EndCycle, Action::Finish];
+        // Phase, what the worker still does, and what the start is answered. The two phases
+        // that only wait for an action to return start the next child before the stop is read.
+        let rows = [
+            (At::Fresh, vec![Action::Finish], Err(STOPPED_EARLY)),
+            (At::SigningIn, end.to_vec(), Err(EARLY)),
+            (At::Entering, [check, end.to_vec()].concat(), Err(GATE)),
+            (At::Gating, end.to_vec(), Err(GATE)),
+            (
+                At::Collecting,
+                [start_host(), end.to_vec()].concat(),
+                Err(STOPPED_READYING),
+            ),
+            (At::Readying, end.to_vec(), Err(STOPPED_READYING)),
+            (At::Running, end.to_vec(), Ok(())),
+            (At::HostDown, end.to_vec(), Ok(())),
+            (At::Ending, vec![Action::Finish], Ok(())),
+            (At::Resting, vec![Action::Finish], Ok(())),
+        ];
+        for (at, actions, answer) in rows {
+            let mut bench = bench(at);
+            let before = bench.state.clone();
+            bench.asks(Observation::Stop);
+            // The request is only marked: the phase and the status move when the worker looks.
+            assert_eq!(bench.state.phase, before.phase, "{at:?}");
+            assert_eq!(bench.state.status(), before.status(), "{at:?}");
+            assert_eq!(bench.run_out(), actions, "{at:?}");
+            assert_eq!(*bench.state.status(), RuntimeStatus::stopped(), "{at:?}");
+            assert_eq!(bench.answer(), Some(answer), "{at:?}");
+            assert_eq!(bench.state.session(), None, "{at:?}");
+            // A second stop, and a look after the worker left, change nothing.
+            bench.asks(Observation::Stop);
+            assert_eq!(bench.see(NOTHING), [Action::Finish], "{at:?}");
+            assert_eq!(*bench.state.status(), RuntimeStatus::stopped(), "{at:?}");
+        }
+    }
+
+    #[test]
+    fn a_serving_seat_reads_stopping_while_it_is_torn_down() {
+        let stopping = RuntimeStatus {
+            state: RuntimeState::Stopping,
+            detail: None,
+        };
+        let mut bench = bench(At::Running);
+        bench.asks(Observation::Stop);
+        assert_eq!(bench.see(NOTHING), [Action::EndCycle]);
+        assert_eq!(*bench.state.status(), stopping);
+        // A host waiting to start again keeps its line instead.
+        let mut bench = self::bench(At::HostDown);
+        let before = bench.state.status().clone();
+        bench.asks(Observation::Stop);
+        assert_eq!(bench.see(NOTHING), [Action::EndCycle]);
+        assert_eq!(*bench.state.status(), before);
+    }
+
+    #[test]
+    fn a_gate_that_exits_wins_over_a_stop() {
+        let mut bench = bench(At::Gating);
+        bench.asks(Observation::Stop);
+        assert_eq!(bench.see(gate(1)), [Action::EndCycle]);
+        // The failed gate was owed another session, so it is not the start's answer.
+        assert_eq!(bench.see(NOTHING), [Action::Finish]);
+        assert_eq!(bench.answer(), Some(Err(STOPPED_EARLY)));
+        assert_eq!(*bench.state.status(), RuntimeStatus::stopped());
+    }
+
+    #[test]
+    fn a_restart_wait_that_is_over_wins_over_a_stop() {
+        let mut bench = bench(At::HostDown);
+        bench.asks(Observation::Stop);
+        // The host starts once more; its ready wait is where the stop is read.
+        bench.later(Duration::from_secs(1));
+        assert_eq!(bench.see(NOTHING), [Action::StartHost]);
+        assert_eq!(bench.see(READY), [Action::EndCycle]);
+        assert_eq!(bench.ending(), Some(STOPPED_READYING));
+        assert_eq!(bench.run_out(), [Action::Finish]);
+        assert_eq!(bench.answer(), Some(Ok(())));
+    }
+
+    #[test]
+    fn a_stage_keeps_the_name_the_log_carries() {
+        let stages = [Stage::SignIn, Stage::Display, Stage::Host];
+        let names = ["sign_in", "display_check", "host_ready"];
+        assert_eq!(stages.map(Stage::name), names);
+    }
+
+    #[test]
+    fn a_start_out_of_time_reads_failed_from_every_stage() {
+        const SIGN_IN: &str = "signing in to the seat's Windows account";
+        const DISPLAY: &str = "checking the seat's screen and graphics card";
+        const HOST: &str = "starting punktfunk on the seat";
+        let rows = [
+            (At::Fresh, SIGN_IN),
+            (At::SigningIn, SIGN_IN),
+            (At::Entering, SIGN_IN),
+            (At::Gating, DISPLAY),
+            (At::Collecting, DISPLAY),
+            (At::Readying, HOST),
+        ];
+        for (at, stage) in rows {
+            // A stop asked before or after the start gave up doesn't make it a stopped seat.
+            for stop_first in [false, true] {
+                let mut bench = bench(at);
+                let refused = bench.state.start_timeout();
+                let message = format!("seat did not become ready within 180 seconds while {stage}");
+                assert_eq!(refused, error("start_timeout", &message), "{at:?}");
+                if stop_first {
+                    bench.asks(Observation::Stop);
+                }
+                bench.asks(Observation::StartTimedOut);
+                let why = format!("The seat didn't start in time. It stopped while {stage}.");
+                assert_eq!(*bench.state.status(), shows(RuntimeState::Failed, &why));
+                // The caller answers the timeout itself; the state keeps no answer for it.
+                assert_eq!(bench.answer(), None, "{at:?}");
+                if !stop_first {
+                    bench.asks(Observation::Stop);
+                }
+                bench.run_out();
+                assert_eq!(*bench.state.status(), shows(RuntimeState::Failed, &why));
+                assert!(matches!(bench.answer(), Some(Err(_))), "{at:?}");
+            }
+        }
+    }
 }
