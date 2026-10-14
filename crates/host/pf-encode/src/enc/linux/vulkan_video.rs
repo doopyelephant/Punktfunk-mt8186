@@ -3733,7 +3733,13 @@ impl VulkanVideoEncoder {
             }
             _ => (None, None),
         };
-        self.record_submit(slot, frame, wire)?;
+        // A frame's plan is spent only once it is submitted: a failed record hands the armed
+        // loss and the wave back, so the retry plans the same frame.
+        let unspent = (self.pending_loss, self.wave);
+        if let Err(e) = self.record_submit(slot, frame, wire) {
+            (self.pending_loss, self.wave) = unspent;
+            return Err(e);
+        }
         self.in_flight.push_back(slot);
         Ok(())
     }
