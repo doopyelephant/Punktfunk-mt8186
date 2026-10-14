@@ -1747,3 +1747,6 @@ fn load_fake(shared: &LibraryShared, req: &RequestKey, path: &str) {
     }
     shared.set_games(req, to_model(&games));
 }
+
+#[cfg(test)]
+mod tests;
