@@ -7,6 +7,7 @@
 //! `design/idd-push-security.md`.
 
 use super::*;
+use crate::cursor_state::Opening;
 
 /// `SECURITY_ATTRIBUTES` for the unnamed AU section and its event: SDDL
 /// `D:P(A;;GA;;;SY)`, protected, `bInheritHandle: false`. The cursor section takes the
@@ -197,13 +198,12 @@ impl IddPushCapturer {
                 }
             }
         });
-        // Sticky hardware-cursor declare from an earlier session keeps the pointer out of DWM's
-        // frames. Force the pool's blend whenever no CLIENT draws one. Not `cursor_shared` alone:
-        // a channel is delivered TO an excluded target as the blend's shape source, so that test
-        // cancelled the rescue with the very channel opened for it.
-        let composite_forced =
-            target.cursor_excluded && (!forwards_to_client || cursor_shared.is_none());
-        if composite_forced {
+        let (cursor_model, forward_reset) = CursorModel::open(Opening {
+            excluded: target.cursor_excluded,
+            channel: cursor_shared.is_some(),
+            client_draws: forwards_to_client,
+        });
+        if cursor_model.pinned() {
             tracing::info!(
                 target_id = target.target_id,
                 forwards_to_client,
@@ -213,9 +213,9 @@ impl IddPushCapturer {
                  blend has no shape source either"
             );
         }
-        // Same gate as the live channel. IddCx cannot deliver masked/monochrome
-        // (`cursor_poll.rs`), so the GDI poller is the client's shape source.
-        let cursor_poll = (cursor_shared.is_some() || composite_forced).then(|| {
+        // IddCx cannot deliver masked/monochrome (`cursor_poll.rs`), so the GDI poller is the
+        // client's shape source under any declare.
+        let cursor_poll = cursor_model.declared().then(|| {
             let rect = pf_win_display::win_display::source_desktop_rect(ccd).unwrap_or((
                 0,
                 0,
@@ -224,13 +224,11 @@ impl IddPushCapturer {
             ));
             cursor_poll::CursorPoller::spawn(ccd, rect)
         });
-        // Previous session may have died on the secure desktop with desired
-        // state `false`; delivery would then start undeclared. Fresh sessions
-        // start declared; `poll_secure_desktop` re-disables if still locked. A
-        // forced-composite session starts the other way: the driver blends from
-        // the first frame.
-        if let (Some(_), Some(fwd)) = (cursor_shared.as_ref(), cursor_forward.as_ref()) {
-            if let Err(e) = fwd(!composite_forced) {
+        // An earlier session may have died under the secure desktop with the flag down, and
+        // delivery would then start undeclared. `poll_secure_desktop` stands it down again if
+        // the desktop is still locked.
+        if let (Some(on), Some(fwd)) = (forward_reset, cursor_forward.as_ref()) {
+            if let Err(e) = fwd(on) {
                 tracing::debug!("cursor-forward reset at open failed: {e:#}");
             }
         }
@@ -314,10 +312,7 @@ impl IddPushCapturer {
             cursor_poll,
             cursor_forward,
             cursor_sender,
-            secure_active: false,
-            composite_cursor: composite_forced,
-            composite_forced,
-            cursor_shm_latched: false,
+            cursor_model,
             sdr_white_scale: 2.5,
             sdr_white_logged: false,
             // Taken at open so the display cannot idle off under the session;

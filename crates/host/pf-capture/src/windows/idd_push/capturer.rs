@@ -10,6 +10,7 @@
 //! restart the ladder's first rung runs.
 
 use super::*;
+use crate::cursor_state::Event;
 
 impl IddPushCapturer {
     /// QPC ticks per second, read once. `0` when the call failed; every span then reads 0.
@@ -143,7 +144,7 @@ impl IddPushCapturer {
                 // Gap accumulator only; this call's pending (ending-frame move) is still unfolded.
                 // Under a declared hardware cursor pointer travel composes nothing, so it is no
                 // witness: the hole reads as damage-idle, as `health` reads it.
-                cursor_moved_px: if self.cursor_shared.is_some() || self.composite_cursor {
+                cursor_moved_px: if self.cursor_model.declared() {
                     Some(0)
                 } else {
                     self.cursor.moved_px()
@@ -204,42 +205,6 @@ impl IddPushCapturer {
             cursor: None,
         }))
     }
-    /// Hand the re-arrived monitor its cursor channel again.
-    ///
-    /// The driver's cursor worker does not survive a re-arrival: the desired forward flag is
-    /// inherited, but the worker is gone until a channel is delivered, and the composite render
-    /// model has no other shape source. A mid-stream flip to capture-the-cursor then stores
-    /// cleanly on both sides and blends nothing — the driver logs "no live worker" and waits for
-    /// a delivery that never comes. Idempotent driver-side, so re-delivering costs one IOCTL.
-    fn redeliver_cursor_channel(&mut self) {
-        let (Some(cs), Some(send)) = (self.cursor_shared.as_ref(), self.cursor_sender.as_ref())
-        else {
-            return;
-        };
-        tracing::info!(
-            target_id = self.target_id,
-            composite = self.composite_cursor,
-            "cursor channel: re-delivering after the monitor re-arrival"
-        );
-        if !deliver_cursor_channel(&self.broker, self.target_id, cs, send) {
-            tracing::warn!(
-                target_id = self.target_id,
-                "cursor channel re-delivery failed after the re-arrival — a flip to the capture \
-                 model will have no shape to blend"
-            );
-            return;
-        }
-        // Delivery starts the worker declared; restore the model this session runs.
-        if let Some(fwd) = self.cursor_forward.as_ref()
-            && let Err(e) = fwd(self.driver_forward())
-        {
-            tracing::warn!(
-                composite = self.composite_cursor,
-                error = %format!("{e:#}"),
-                "cursor render model not re-applied after the re-arrival"
-            );
-        }
-    }
 }
 
 impl Capturer for IddPushCapturer {
@@ -248,33 +213,7 @@ impl Capturer for IddPushCapturer {
     }
 
     fn set_cursor_forward(&mut self, on: bool) {
-        // Capture model: the declared hardware cursor stays excluded (no working un-declare);
-        // the driver blends it into the frames it encodes. `composite_forced` cannot turn off
-        // — no client draws. Under the secure desktop the driver stays stood down; dismissal
-        // applies the model chosen here.
-        let composite = (!on && self.cursor_shared.is_some()) || self.composite_forced;
-        if self.composite_cursor != composite {
-            self.composite_cursor = composite;
-            tracing::info!(
-                composite,
-                "cursor render model: the driver composites {}",
-                if composite {
-                    "ON (capture model — blending the pointer into what it encodes)"
-                } else {
-                    "OFF (client draws locally)"
-                }
-            );
-            if let (Some(_), Some(fwd)) =
-                (self.cursor_shared.as_ref(), self.cursor_forward.as_ref())
-                && let Err(e) = fwd(self.driver_forward())
-            {
-                tracing::warn!(
-                    composite,
-                    error = %format!("{e:#}"),
-                    "cursor render model: the driver did not take the flip"
-                );
-            }
-        }
+        self.cursor_event(Event::ClientDraws(on));
     }
 
     fn next_frame(&mut self) -> Result<CapturedFrame> {
@@ -332,7 +271,7 @@ impl Capturer for IddPushCapturer {
         // monitor composes SDR whatever the session negotiated. Re-assert before the encoder
         // re-opens, or it opens for FP16 against a BGRA surface the pool can only refuse.
         self.pin_negotiated_depth();
-        self.redeliver_cursor_channel();
+        self.cursor_event(Event::Rearrived);
         true
     }
 
@@ -433,13 +372,10 @@ impl Capturer for IddPushCapturer {
 
 impl Drop for IddPushCapturer {
     fn drop(&mut self) {
-        // Must not leave per-target desired-state off: the next session would
-        // adopt undeclared and silently run the composite model. Open-time reset
-        // covers host crash; this is orderly teardown.
-        if self.secure_active && self.cursor_shared.is_some() {
-            if let Some(fwd) = self.cursor_forward.as_ref() {
-                let _ = fwd(true);
-            }
+        // The open-time reset covers a host that died under the secure desktop; this is the
+        // orderly end.
+        if let (Some(on), Some(fwd)) = (self.cursor_model.close(), self.cursor_forward.as_ref()) {
+            let _ = fwd(on);
         }
     }
 }

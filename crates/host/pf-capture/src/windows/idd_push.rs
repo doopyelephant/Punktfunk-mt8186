@@ -10,6 +10,7 @@
 
 use super::dxgi::WinCaptureTarget;
 use super::{CapturedFrame, Capturer, FramePayload, PixelFormat};
+use crate::cursor_state::CursorModel;
 use crate::cursor_witness::CursorWitness;
 use anyhow::{bail, Context, Result};
 use pf_paths_win::SecurityAttributes;
@@ -272,15 +273,9 @@ pub struct IddPushCapturer {
     /// Kept so a re-arrived monitor can be handed the cursor channel again. The driver's worker
     /// does not survive a re-arrival, and the composite render model has no other shape source.
     cursor_sender: Option<crate::CursorChannelSender>,
-    /// Poller reports a secure input desktop and the declare is stood down.
-    secure_active: bool,
-    /// The client draws no pointer, so the driver blends the excluded one into what it encodes.
-    composite_cursor: bool,
-    /// No cursor channel, but the target still has an earlier session's hardware-cursor
-    /// declare (`WinCaptureTarget::cursor_excluded`). Pins `composite_cursor` on.
-    composite_forced: bool,
-    /// [`Self::live_cursor`] fell back to shm. Independent serial namespaces — never unlatch.
-    cursor_shm_latched: bool,
+    /// Who draws the pointer, whether the secure desktop has the declare stood down, and
+    /// which source the client's shape is read from.
+    cursor_model: CursorModel,
     /// HDR cursor match to desktop SDR white (vs 80 nits). 2.5 ≈ Windows default; stamped into
     /// the cursor section because session 0 cannot query it.
     sdr_white_scale: f32,

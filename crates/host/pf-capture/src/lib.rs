@@ -654,6 +654,10 @@ mod au_reader;
 // same reason: the rule that decides whether a silent desktop resets gets tests on every target.
 #[path = "windows/cursor_witness.rs"]
 mod cursor_witness;
+// The IDD-push cursor render model: who draws the pointer and what the driver is told. Pure,
+// so its table of past cursor defects runs on every target.
+#[path = "windows/cursor_state.rs"]
+mod cursor_state;
 // The IDD-push stall model: holes in DWM delivery and their verdicts. Pure over `Instant`s,
 // so its tests run on every target; `idd_push/stall.rs` writes the report.
 #[path = "windows/stall_model.rs"]
