@@ -18,11 +18,11 @@ use super::{
 
 /// What one frame came out as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Au {
-    refs: FrameRef,
-    wave: Option<Wave>,
-    mark: WaveMark,
-    dirty: bool,
+pub(crate) struct Au {
+    pub(crate) refs: FrameRef,
+    pub(crate) wave: Option<Wave>,
+    pub(crate) mark: WaveMark,
+    pub(crate) dirty: bool,
 }
 
 impl From<FramePlan> for Au {
@@ -60,7 +60,7 @@ impl Au {
     }
 }
 
-trait Model {
+pub(crate) trait Model {
     /// One event; `Some` for a frame.
     fn event(&mut self, e: u8) -> Option<Au>;
 }
@@ -340,7 +340,7 @@ impl Model for VaapiPlanned {
 /// `nvenc_session.rs`: `invalidate_ref_frames`, `start_wave`, `encode`, `ltr_step`. The range
 /// plan's answer is the event: `a` anchors, `l` declines.
 #[derive(Default)]
-struct NvencToday {
+pub(crate) struct NvencToday {
     cycle: u32,
     frame_idx: i64,
     force_kf: bool,
@@ -432,7 +432,7 @@ impl NvencToday {
 
 /// NVENC through the planner: a sweep in flight takes every loss, and one spoils it when the
 /// lost frame sits inside a sweep that has started.
-struct NvencPlanned {
+pub(crate) struct NvencPlanned {
     policy: RecoveryPolicy,
     state: Recovery,
     frames: i64,
@@ -522,7 +522,7 @@ fn vaapi(cycle: Option<u32>) -> (VaapiToday, VaapiPlanned) {
     (today, planned)
 }
 
-fn nvenc(cycle: Option<u32>) -> (NvencToday, NvencPlanned) {
+pub(crate) fn nvenc(cycle: Option<u32>) -> (NvencToday, NvencPlanned) {
     let today = NvencToday {
         cycle: cycle.unwrap_or(0),
         ..NvencToday::default()
@@ -544,7 +544,7 @@ fn nvenc(cycle: Option<u32>) -> (NvencToday, NvencPlanned) {
 
 /// `(events, frames, the rule)`, on a four-frame wave unless the rule says the session has
 /// none.
-type Row = (&'static str, &'static str, &'static str);
+pub(crate) type Row = (&'static str, &'static str, &'static str);
 
 const VULKAN: &[Row] = &[
     ("ff", "I .", "the first frame is an IDR"),
@@ -610,7 +610,7 @@ const VAAPI: &[Row] = &[
 
 const VAAPI_NO_WAVE: &[Row] = &[("flff", "I . .", "a loss with no anchor is declined")];
 
-const NVENC: &[Row] = &[
+pub(crate) const NVENC: &[Row] = &[
     ("ff", "I .", "the opening frame is an IDR"),
     ("fkff", "I I .", "a keyframe request"),
     ("faff", "I A .", "a loss the range plan anchors"),
@@ -648,9 +648,9 @@ const NVENC: &[Row] = &[
 ];
 
 /// AV1, or the wave turned off.
-const NVENC_NO_WAVE: &[Row] = &[("flff", "I . .", "a declined loss stays the caller's")];
+pub(crate) const NVENC_NO_WAVE: &[Row] = &[("flff", "I . .", "a declined loss stays the caller's")];
 
-fn check<T: Model, P: Model>(rows: &[Row], make: impl Fn() -> (T, P)) {
+pub(crate) fn check<T: Model, P: Model>(rows: &[Row], make: impl Fn() -> (T, P)) {
     for &(events, frames, rule) in rows {
         let (mut today, mut planned) = make();
         assert_eq!(run(&mut today, events), frames, "today: {rule} ({events})");
@@ -663,7 +663,7 @@ fn check<T: Model, P: Model>(rows: &[Row], make: impl Fn() -> (T, P)) {
 }
 
 /// Every sequence of up to seven events, frame by frame, on both models.
-fn sweep<T: Model, P: Model>(make: impl Fn() -> (T, P)) {
+pub(crate) fn sweep<T: Model, P: Model>(make: impl Fn() -> (T, P)) {
     const EVENTS: &[u8] = b"fkal+-";
     for len in 1..=7u32 {
         for n in 0..EVENTS.len().pow(len) {

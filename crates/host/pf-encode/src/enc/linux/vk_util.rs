@@ -433,7 +433,8 @@ impl ImportCache {
             mem,
             view,
         });
-        tracing::debug!(
+        // Trace: a producer ring deeper than `keep` misses every frame.
+        tracing::trace!(
             resident = self.entries.len(),
             miss_us = t0.elapsed().as_micros() as u64,
             "imported a new dmabuf buffer"

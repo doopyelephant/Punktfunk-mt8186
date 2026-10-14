@@ -98,6 +98,7 @@
 	"status_last_end_host_error": "der Host hatte einen Fehler",
 	"status_last_end_lost": "die Verbindung ging verloren",
 	"status_last_end_stopped": "du hast sie beendet",
+	"status_last_end_stolen": "ein anderes Gerät hat den Bildschirm übernommen",
 	"audio_wiring_title": "Audio-Verkabelung",
 	"audio_output": "Spielaudio",
 	"audio_microphone": "Mikrofon",

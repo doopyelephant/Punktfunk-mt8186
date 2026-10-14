@@ -266,8 +266,9 @@ fn fake_session_with_flags(
     Arc<std::sync::atomic::AtomicBool>,
     Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let quit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let life = crate::lifecycle::Lifecycle::new();
+    let stop = life.stop_flag().clone();
+    let quit = life.quit_flag().clone();
     let idr = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let controls = crate::session_status::SessionControls::open();
     // Controller-only pairing: the ceiling every per-session re-point below is clamped to.
@@ -283,8 +284,7 @@ fn fake_session_with_flags(
         mode: Arc::new(std::sync::atomic::AtomicU64::new(
             (1920u64 << 32) | (1080u64 << 16) | 60,
         )),
-        stop: stop.clone(),
-        quit: quit.clone(),
+        life,
         force_idr: idr.clone(),
         controls,
         ..crate::session_status::Registration::fake(client)

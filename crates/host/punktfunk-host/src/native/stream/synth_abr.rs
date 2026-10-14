@@ -245,9 +245,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
                 session,
                 mode,
                 seconds,
-                stop,
-                quit,
-                end_reason,
+                life,
                 counters,
                 ends:
                     StreamEnds {
@@ -307,12 +305,12 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         probe_rx,
         probe_result_tx.clone(),
         probe_seq,
-        stop.clone(),
+        life.stop_flag().clone(),
         ramp_open,
         fit_pin,
     );
     let build_until = std::time::Instant::now() + bringup_delay;
-    while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < build_until {
+    while !life.stopping() && std::time::Instant::now() < build_until {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     let (session, probe_rx) = ramp.finish();
@@ -351,7 +349,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
     let send_thread = std::thread::Builder::new()
         .name("punktfunk-send".into())
         .spawn({
-            let stop = stop.clone();
+            let stop = life.stop_flag().clone();
             let fec_target = fec_target.clone();
             move || {
                 send_loop(
@@ -399,8 +397,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         mode: live_mode,
         bitrate_kbps: live_bitrate.clone(),
         codec,
-        stop: stop.clone(),
-        quit,
+        life: life.clone(),
         // Nothing drains it here: a console force-keyframe is a no-op on this source.
         force_idr: Arc::new(AtomicBool::new(false)),
         client: client_label,
@@ -418,7 +415,6 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         controls,
         bit_depth,
         chroma,
-        end_reason,
         counters: counters.clone(),
         peer: Some(peer),
     });
@@ -429,7 +425,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
     let mut idr_due: Option<std::time::Instant> = Some(started);
     // `recovery.rs`'s gate, so a burst of asks costs what it costs a real host.
     let (mut kf_gate, mut last_idr) = (KeyframeGate::default(), None);
-    while !stop.load(Ordering::SeqCst) {
+    while !life.stopping() {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             break;
         }
@@ -530,7 +526,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
         }
     }
     drop(frame_tx);
-    stop.store(true, Ordering::SeqCst);
+    life.end(crate::events::SessionEndReason::HostEnded);
     let _ = send_thread.join();
     tracing::info!(
         frames = au_seq,

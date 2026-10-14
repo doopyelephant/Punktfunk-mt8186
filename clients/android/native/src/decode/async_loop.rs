@@ -29,7 +29,7 @@ use super::setup::{
 use super::surface_control::{Layer, PresentComplete};
 use super::vsync::{VsyncClock, VsyncShared};
 use super::{Backstops, DecodeOptions, FRAME_PARK_CAP, IN_FLIGHT_CAP};
-use crate::au_intake::{Delivery, Intake};
+use crate::au_intake::{hand_on, Delivery, Intake};
 use crate::input_stall::{InputStall, RungFloor, INPUT_STALL_PATIENCE, SETTLED_FRAMES};
 use crate::sys::{now_monotonic_ns, sysprop};
 
@@ -49,7 +49,7 @@ struct OutputReady {
 /// internal looper thread) push the codec ones; the feeder thread pushes `Au`. Each carries only
 /// owned/`Copy` data so the callback closures satisfy the `Send` bound and never touch the codec.
 pub(super) enum DecodeEvent {
-    /// A received access unit from the feeder, ready to queue into the decoder. The `u32` is
+    /// A received access unit core admitted, ready to queue into the decoder. The `u32` is
     /// the gap ahead of it from [`NativeClient::recovery_on_au`] (0 = none): the receiver rule
     /// and the ladder's loss mark key on it. Core armed the freeze and asked at the report.
     Au(Frame, u32),
@@ -1437,9 +1437,10 @@ impl Feeder {
 }
 
 /// The `pf-decode-feed` thread: block on the connector for the next access unit so the async loop
-/// never has to. Stamps receipt for the decode stage (the connector already noted it for the
-/// overlay), stamps `last_gap_ns` on a loss gap, then hands the AU to the loop via the event
-/// channel. Exits when `shutdown` is set, the session closes, or the loop's receiver is gone.
+/// never has to. Drops what core refuses, stamps `last_gap_ns` on a loss gap, stamps receipt for
+/// the decode stage (the connector already noted it for the overlay), then hands the AU to the
+/// loop via the event channel. Exits when `shutdown` is set, the session closes, or the loop's
+/// receiver is gone.
 fn feeder_loop(
     client: Arc<NativeClient>,
     stats: Arc<crate::stats::VideoStats>,
@@ -1449,20 +1450,21 @@ fn feeder_loop(
     ev_tx: mpsc::Sender<DecodeEvent>,
     last_gap_ns: Arc<AtomicI64>,
 ) {
+    let mut refused = None;
     while !shutdown.load(Ordering::Relaxed) {
         match client.next_frame(Duration::from_millis(5)) {
             Ok(frame) => {
                 // Reported here so core asks for a lost range the moment it shows. Parts repeat
-                // their AU's index: once, on the first. Only the gap is taken: this loop feeds
-                // a straggler too.
-                let au_first = frame.part.is_none_or(|p| p.first);
-                let gap = if au_first {
-                    client
-                        .recovery_on_au(frame.frame_index, frame.complete, 0)
-                        .gap
-                } else {
-                    0
-                };
+                // their AU's index: once, on the first. A refused straggler would rewind the
+                // decoder's references; it never reaches the loop and is no loss.
+                let arrival = frame
+                    .part
+                    .is_none_or(|p| p.first)
+                    .then(|| client.recovery_on_au(frame.frame_index, frame.complete, 0));
+                if !hand_on(&mut refused, frame.frame_index, arrival.map(|a| a.admit)) {
+                    continue;
+                }
+                let gap = arrival.map_or(0, |a| a.gap);
                 if gap > 0 {
                     last_gap_ns.store(now_monotonic_ns(), Ordering::Relaxed);
                 }

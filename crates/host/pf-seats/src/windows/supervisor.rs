@@ -1,41 +1,34 @@
-//! Per-seat RDP, quality-gate, and host lifecycle supervision.
+//! Per-seat RDP, quality-gate, and host lifecycle supervision: the OS side.
 //!
-//! Each runtime has its own stop flag, condition variable, child snapshot, and
-//! worker; there is no process-global seat singleton. Start blocks until the
-//! keeper creates one exact active WTS session, the same-session SDR quality
-//! gate succeeds, and both host ports accept connections. Host crashes restart
-//! with capped exponential delay while the keeper lives. Keeper loss ends the
-//! host, closes the keeper's job, logs off only the recorded session, and
-//! retries without spinning.
-//! Explicit stop is idempotent and waits for that teardown to finish.
+//! Each seat has one [`Runtime`]: its [`State`], a condition variable and a worker.
+//! There is no process-global seat singleton. The worker probes what the state names,
+//! feeds [`State::step`] and performs the actions it answers; `start` and `stop` feed
+//! their requests into the same state and wait on it. The lifecycle, with every timeout
+//! and the retry rule, is `step.rs`.
+//!
+//! Start blocks until the keeper's session is active, the same-session SDR quality gate
+//! has passed and the host holds both ports. A cycle that ends closes the keeper's job
+//! and logs off only the session it recorded. Explicit stop is idempotent and waits for
+//! that teardown to finish.
 
 use crate::bootstrap::RdpBootstrap;
 use crate::model::{RuntimeStatus, Seat};
 use crate::persistence::SecretRoot;
+use crate::seat_step::{Action, Look, Observation, Probe, State, START_TIMEOUT};
 use crate::windows::accounts::AccountManager;
 use crate::windows::process::{self, ChildProcess, Job};
 use crate::windows::rdp;
 use crate::windows::util::{backend_error, io_error, port_open, udp_port_owners, WinResult};
 use crate::windows::wts;
 use rand::Rng as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const SESSION_TIMEOUT: Duration = Duration::from_secs(45);
-const QUALITY_TIMEOUT: Duration = Duration::from_secs(60);
-/// Fresh sessions a failing gate gets. A session whose display misses its path never
-/// gets one; a fresh logon passes about 40% of the time on 9300.
-const QUALITY_SESSIONS: u32 = 5;
-const HOST_READY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Room for a slow first logon plus two gate sessions, the usual worst healthy start.
-const START_TIMEOUT: Duration = Duration::from_secs(180);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
-const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub(super) struct Supervisor {
@@ -46,137 +39,46 @@ pub(super) struct Supervisor {
 }
 
 struct Runtime {
-    account: String,
-    stop: AtomicBool,
-    snapshot: Mutex<RuntimeSnapshot>,
+    state: Mutex<State>,
     changed: Condvar,
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
-#[derive(Clone)]
+/// What `status` and Doctor read of a seat.
 pub(super) struct RuntimeSnapshot {
     pub status: RuntimeStatus,
     pub session_id: Option<u32>,
-    pub keeper_pid: Option<u32>,
-    pub host_pid: Option<u32>,
-    pub finished: bool,
-    initial: Option<Result<(), crate::backend::BackendError>>,
-    step: Step,
-    /// Set when the start ran out of time: the seat then reads failed with this, not stopped.
-    timed_out: Option<String>,
 }
 
 impl Runtime {
     fn new(account: String) -> Self {
         Self {
-            account,
-            stop: AtomicBool::new(false),
-            snapshot: Mutex::new(RuntimeSnapshot {
-                status: RuntimeStatus {
-                    state: crate::model::RuntimeState::Starting,
-                    detail: Some(Step::SignIn.detail(0)),
-                },
-                session_id: None,
-                keeper_pid: None,
-                host_pid: None,
-                finished: false,
-                initial: None,
-                step: Step::SignIn,
-                timed_out: None,
-            }),
+            state: Mutex::new(State::new(account)),
             changed: Condvar::new(),
             join: Mutex::new(None),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, RuntimeSnapshot> {
-        self.snapshot
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn update(&self, update: impl FnOnce(&mut RuntimeSnapshot)) {
-        update(&mut self.lock());
+    /// Feed one observation and wake whoever waits on the state.
+    fn step(&self, observation: Observation) -> Vec<Action> {
+        let actions = self.lock().step(observation, Instant::now());
         self.changed.notify_all();
+        actions
     }
 
-    fn status(&self) -> RuntimeSnapshot {
-        self.lock().clone()
-    }
-
-    /// Enter `step` while starting: the console shows its detail, the log names it, and a
-    /// start that runs out of time says where it stood.
-    fn step(&self, seat: &Seat, step: Step, attempt: u32) {
-        tracing::info!(seat = %seat.id, step = step.name(), attempt, "seat start step");
-        self.update(|snapshot| {
-            snapshot.status = RuntimeStatus {
-                state: crate::model::RuntimeState::Starting,
-                detail: Some(step.detail(attempt)),
-            };
-            snapshot.step = step;
-        });
-    }
-}
-
-/// The stages of a seat start, in order.
-#[derive(Clone, Copy)]
-enum Step {
-    SignIn,
-    Display,
-    Host,
-}
-
-impl Step {
-    fn name(self) -> &'static str {
-        match self {
-            Self::SignIn => "sign_in",
-            Self::Display => "display_check",
-            Self::Host => "host_ready",
+    fn snapshot(&self) -> RuntimeSnapshot {
+        let state = self.lock();
+        RuntimeSnapshot {
+            status: state.status().clone(),
+            session_id: state.session(),
         }
     }
-
-    fn phrase(self) -> &'static str {
-        match self {
-            Self::SignIn => "signing in to the seat's Windows account",
-            Self::Display => "checking the seat's screen and graphics card",
-            Self::Host => "starting punktfunk on the seat",
-        }
-    }
-
-    /// What the console shows while the seat is on this step. `attempt` counts gate sessions.
-    fn detail(self, attempt: u32) -> String {
-        let phrase = self.phrase();
-        let mut text = phrase[..1].to_uppercase() + &phrase[1..];
-        if attempt > 1 {
-            text += &format!(" (try {attempt} of {QUALITY_SESSIONS})");
-        }
-        text + "…"
-    }
-}
-
-/// The sentence the console shows for a seat that didn't start, on its card and in Doctor. The
-/// log keeps the code and the operator's message.
-fn plain(error: &crate::backend::BackendError) -> String {
-    let code = error.code.as_str();
-    let text = match code {
-        "wts_timeout" | "rdp_keeper_exited" => {
-            "Windows didn't sign in to the seat's account. Remote Desktop may be off or out of licences."
-        }
-        _ if code.starts_with("quality_") => {
-            "The seat's screen didn't start. The graphics card or the seat display driver failed its check."
-        }
-        "host_ready_timeout" | "host_exited" => {
-            "punktfunk didn't start on the seat. The seat's log has the cause."
-        }
-        "port_in_use" => "Another program holds the seat's port. Restart the PC, then try again.",
-        "seats_off" => "Seats are off. Turn them on under Profiles → Seats.",
-        "termservice_stopped" => "Remote Desktop Services isn't running. Restart the PC.",
-        "seat_display_driver" => {
-            "The seat display driver isn't installed. Turn seats off and on again under Profiles → Seats."
-        }
-        _ => return error.message.clone(),
-    };
-    text.into()
 }
 
 impl Supervisor {
@@ -213,13 +115,14 @@ impl Supervisor {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             if let Some(existing) = runtimes.get(&key) {
-                let snapshot = existing.status();
-                if !snapshot.finished {
-                    return match snapshot.initial {
-                        Some(Err(error)) => Err(error),
-                        _ => Ok(snapshot.status),
+                let state = existing.lock();
+                if !state.finished() {
+                    return match state.answer() {
+                        Some(Err(error)) => Err(error.clone()),
+                        _ => Ok(state.status().clone()),
                     };
                 }
+                drop(state);
                 runtimes.remove(&key);
             }
         }
@@ -246,13 +149,20 @@ impl Supervisor {
             runtime
         };
         let worker_runtime = runtime.clone();
-        let root = self.root.clone();
-        let accounts = self.accounts.clone();
-        let host_path = self.host_path.clone();
-        let seat_owned = seat.clone();
+        let rig = Rig {
+            root: self.root.clone(),
+            accounts: self.accounts.clone(),
+            host_path: self.host_path.clone(),
+            seat: seat.clone(),
+            keeper: None,
+            session: None,
+            launch: None,
+            gate: None,
+            host: None,
+        };
         let worker = match std::thread::Builder::new()
             .name(format!("seat-{}", seat.id))
-            .spawn(move || run_worker(worker_runtime, root, accounts, host_path, seat_owned))
+            .spawn(move || run_worker(&worker_runtime, rig))
         {
             Ok(worker) => worker,
             Err(error) => {
@@ -269,35 +179,25 @@ impl Supervisor {
             .unwrap_or_else(|poison| poison.into_inner()) = Some(worker);
 
         let deadline = Instant::now() + START_TIMEOUT;
-        let mut snapshot = runtime.lock();
+        let mut state = runtime.lock();
         loop {
-            if let Some(result) = snapshot.initial.clone() {
-                return result.map(|()| snapshot.status.clone());
+            if let Some(answer) = state.answer() {
+                return answer.clone().map(|()| state.status().clone());
             }
             let now = Instant::now();
             if now >= deadline {
-                let step = snapshot.step.phrase();
-                let error = backend_error(
-                    "start_timeout",
-                    format!(
-                        "seat did not become ready within {} seconds while {step}",
-                        START_TIMEOUT.as_secs()
-                    ),
-                );
+                let error = state.start_timeout();
                 tracing::warn!(seat = %seat.id, "{}", error.message);
-                let why = format!("The seat didn't start in time. It stopped while {step}.");
-                snapshot.status = RuntimeStatus::failed(why.clone());
-                snapshot.timed_out = Some(why);
-                runtime.stop.store(true, Ordering::Release);
+                state.step(Observation::StartTimedOut, now);
                 runtime.changed.notify_all();
                 return Err(error);
             }
             let wait = deadline.saturating_duration_since(now);
             let (next, _) = runtime
                 .changed
-                .wait_timeout(snapshot, wait)
+                .wait_timeout(state, wait)
                 .unwrap_or_else(|poison| poison.into_inner());
-            snapshot = next;
+            state = next;
         }
     }
 
@@ -313,11 +213,10 @@ impl Supervisor {
             wts::logoff_account_if_present(&seat.account)?;
             return Ok(RuntimeStatus::stopped());
         };
-        runtime.stop.store(true, Ordering::Release);
-        runtime.changed.notify_all();
+        runtime.step(Observation::Stop);
         let deadline = Instant::now() + STOP_TIMEOUT;
-        let mut snapshot = runtime.lock();
-        while !snapshot.finished {
+        let mut state = runtime.lock();
+        while !state.finished() {
             let now = Instant::now();
             if now >= deadline {
                 return Err(backend_error(
@@ -327,11 +226,11 @@ impl Supervisor {
             }
             let (next, _) = runtime
                 .changed
-                .wait_timeout(snapshot, deadline.saturating_duration_since(now))
+                .wait_timeout(state, deadline.saturating_duration_since(now))
                 .unwrap_or_else(|poison| poison.into_inner());
-            snapshot = next;
+            state = next;
         }
-        drop(snapshot);
+        drop(state);
         if let Some(worker) = runtime
             .join
             .lock()
@@ -364,16 +263,10 @@ impl Supervisor {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .get(seat.id.as_str())
-            .map(|runtime| runtime.status())
+            .map(|runtime| runtime.snapshot())
             .unwrap_or(RuntimeSnapshot {
                 status: RuntimeStatus::stopped(),
                 session_id: None,
-                keeper_pid: None,
-                host_pid: None,
-                finished: true,
-                initial: Some(Ok(())),
-                step: Step::SignIn,
-                timed_out: None,
             })
     }
 
@@ -386,22 +279,22 @@ impl Supervisor {
             .cloned()
             .collect();
         for runtime in &runtimes {
-            runtime.stop.store(true, Ordering::Release);
-            runtime.changed.notify_all();
+            runtime.step(Observation::Stop);
         }
         for runtime in runtimes {
             let deadline = Instant::now() + STOP_TIMEOUT;
-            let mut snapshot = runtime.lock();
-            while !snapshot.finished && Instant::now() < deadline {
+            let mut state = runtime.lock();
+            while !state.finished() && Instant::now() < deadline {
                 let (next, _) = runtime
                     .changed
-                    .wait_timeout(snapshot, Duration::from_millis(250))
+                    .wait_timeout(state, Duration::from_millis(250))
                     .unwrap_or_else(|poison| poison.into_inner());
-                snapshot = next;
+                state = next;
             }
-            drop(snapshot);
-            let _ = wts::logoff_account_if_present(&runtime.account);
-            if runtime.status().finished
+            let account = state.account().to_owned();
+            drop(state);
+            let _ = wts::logoff_account_if_present(&account);
+            if runtime.lock().finished()
                 && let Some(worker) = runtime
                     .join
                     .lock()
@@ -415,7 +308,7 @@ impl Supervisor {
             .runtimes
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        runtimes.retain(|_, runtime| !runtime.status().finished);
+        runtimes.retain(|_, runtime| !runtime.lock().finished());
         let idle = runtimes.is_empty();
         drop(runtimes);
         if idle {
@@ -424,376 +317,322 @@ impl Supervisor {
     }
 }
 
-fn run_worker(
-    runtime: Arc<Runtime>,
+/// One seat's loop: probe what the state names, step, perform what it answers.
+fn run_worker(runtime: &Runtime, mut rig: Rig) {
+    loop {
+        let look = runtime.lock().look();
+        let observation = match rig.probe(look) {
+            Ok(probe) => Observation::Probe(probe),
+            Err(error) => Observation::Failed(error.into()),
+        };
+        let mut actions = VecDeque::from(runtime.step(observation));
+        while let Some(action) = actions.pop_front() {
+            if action == Action::Finish {
+                return;
+            }
+            // A failed action is the next observation, and what it answers replaces the rest.
+            if let Err(error) = rig.perform(action) {
+                actions = runtime.step(Observation::Failed(error.into())).into();
+            }
+        }
+    }
+}
+
+/// What a seat's worker holds from the OS. Which of them are live follows from the
+/// state's phase; nothing here is read to decide what the seat does next.
+struct Rig {
     root: SecretRoot,
     accounts: AccountManager,
     host_path: PathBuf,
     seat: Seat,
-) {
-    let mut quality_done = false;
-    let mut gate_failures = 0_u32;
-    let mut delay = Duration::from_secs(1);
-    loop {
-        if runtime.stop.load(Ordering::Acquire) {
-            break;
-        }
-        runtime.update(|snapshot| {
-            snapshot.session_id = None;
-            snapshot.keeper_pid = None;
-            snapshot.host_pid = None;
-        });
-        let result = run_cycle(
-            &runtime,
-            &root,
-            &accounts,
-            &host_path,
-            &seat,
-            (&mut quality_done, gate_failures + 1),
-        );
-        match result {
-            Ok(()) => break,
-            Err(error) => {
-                let stopping = runtime.stop.load(Ordering::Acquire);
-                if error.code == "quality_failed" {
-                    gate_failures += 1;
-                }
-                // A failed gate retries in a fresh session; the start waits for those.
-                let gate_retry = error.code == "quality_failed" && gate_failures < QUALITY_SESSIONS;
-                let retry = !stopping && (gate_retry || !permanent_failure(&error));
-                // The first answer reaches the caller; later failures have only this log.
-                let answered = runtime.status().initial.is_some();
-                if !stopping && (answered || gate_retry) {
-                    tracing::warn!(
-                        seat = %seat.id,
-                        code = %error.code,
-                        retry,
-                        "seat did not start: {}",
-                        error.message
-                    );
-                }
-                runtime.update(|snapshot| {
-                    if !gate_retry {
-                        snapshot.status = RuntimeStatus::failed(plain(&error));
-                    }
-                    if snapshot.initial.is_none() && !gate_retry {
-                        snapshot.initial = Some(Err(error.clone()));
-                    }
-                    snapshot.session_id = None;
-                    snapshot.keeper_pid = None;
-                    snapshot.host_pid = None;
-                });
-                if !retry {
-                    break;
-                }
-                if !sleep_stoppable(&runtime.stop, delay) {
-                    break;
-                }
-                delay = delay.saturating_mul(2).min(MAX_RESTART_DELAY);
-            }
-        }
-    }
-    runtime.update(|snapshot| {
-        if runtime.stop.load(Ordering::Acquire) {
-            snapshot.status = match snapshot.timed_out.clone() {
-                Some(why) => RuntimeStatus::failed(why),
-                None => RuntimeStatus::stopped(),
-            };
-            if snapshot.initial.is_none() {
-                snapshot.initial = Some(Err(backend_error(
-                    "seat_stopping",
-                    "seat stopped before startup completed",
-                )));
-            }
-        }
-        snapshot.finished = true;
-        snapshot.session_id = None;
-        snapshot.keeper_pid = None;
-        snapshot.host_pid = None;
-    });
+    /// The keeper, then the job that contains it: they drop in that order.
+    keeper: Option<(ChildProcess, Job)>,
+    /// The account's session, which the end of the cycle logs off.
+    session: Option<u32>,
+    launch: Option<Launch>,
+    gate: Option<GateRun>,
+    host: Option<ChildProcess>,
 }
 
-fn run_cycle(
-    runtime: &Arc<Runtime>,
-    root: &SecretRoot,
-    accounts: &AccountManager,
-    host_path: &Path,
-    seat: &Seat,
-    (quality_done, gate_attempt): (&mut bool, u32),
-) -> WinResult<()> {
-    runtime.step(seat, Step::SignIn, 0);
-    let pin = rdp::load_pin(root)?;
-    let credential = accounts.credential_for_start(seat)?;
-    let bootstrap = RdpBootstrap::new(seat.account.clone(), credential.copy_zeroizing(), pin)
-        .map_err(|error| io_error("keeper_bootstrap", "build RDP keeper bootstrap", error))?;
-    let job = Job::new()?;
-    let keeper_exe = super::keeper::keeper_path(host_path);
-    let keeper = process::spawn_keeper(&job, &keeper_exe, &bootstrap)?;
-    drop(bootstrap);
-    runtime.update(|snapshot| snapshot.keeper_pid = Some(keeper.pid()));
+/// What a session's children start with.
+struct Launch {
+    host_root: SecretRoot,
+    temp_root: SecretRoot,
+    /// The seat's own `steam.exe`, when the box has Steam.
+    steam: Option<PathBuf>,
+    environment: Vec<u16>,
+    workdir: PathBuf,
+    /// The gate and the host write here, as the box host writes `logs\host.log`.
+    log: PathBuf,
+}
 
-    let session = wts::wait_for_active_account(&seat.account, SESSION_TIMEOUT, || {
-        if runtime.stop.load(Ordering::Acquire) {
-            return Ok(true);
+/// The running gate and the file under the seat's temporary root it encodes into.
+struct GateRun {
+    process: ChildProcess,
+    output: String,
+}
+
+impl Rig {
+    fn probe(&self, look: Look) -> WinResult<Probe> {
+        let exit = |child: Option<&ChildProcess>| match child {
+            Some(child) => child.exit_code(),
+            None => Ok(None),
+        };
+        let keeper = self.keeper.as_ref().map(|(keeper, _)| keeper);
+        let host = self.host.as_ref();
+        let mut probe = Probe::default();
+        match look {
+            Look::Clock => {}
+            Look::Session => {
+                probe.keeper = exit(keeper)?;
+                if probe.keeper.is_none() {
+                    probe.session =
+                        wts::active_for_account(&self.seat.account)?.map(|session| session.id);
+                }
+            }
+            Look::Gate => {
+                probe.gate = exit(self.gate.as_ref().map(|gate| &gate.process))?;
+                // A keeper that can't be asked reads as running: the gate's own exit decides.
+                probe.keeper = exit(keeper).ok().flatten();
+            }
+            Look::Ports => {
+                probe.keeper = exit(keeper)?;
+                probe.host = exit(host)?;
+                // Native is QUIC: ready once this host holds the UDP port, not when TCP answers.
+                probe.ready = probe.keeper.is_none()
+                    && probe.host.is_none()
+                    && host.is_some_and(|host| {
+                        udp_port_owners(self.seat.native_port).contains(&host.pid())
+                            && port_open(self.seat.mgmt_port)
+                    });
+            }
+            Look::Exits => {
+                probe.keeper = exit(keeper)?;
+                probe.host = exit(host)?;
+            }
+            Look::Keeper => probe.keeper = exit(keeper)?,
         }
-        Ok(keeper.exit_code()?.is_some())
-    });
-    let session = match session {
-        Ok(session) => session,
-        Err(error) => {
-            drop(keeper);
-            drop(job);
-            return Err(error);
+        Ok(probe)
+    }
+
+    fn perform(&mut self, action: Action) -> WinResult<()> {
+        let seat = &self.seat.id;
+        match action {
+            Action::Announce(stage, attempt) => {
+                tracing::info!(%seat, step = stage.name(), attempt, "seat start step");
+            }
+            Action::StartKeeper => return self.start_keeper(),
+            Action::EnterSession(id) => return self.enter_session(id),
+            Action::StartGate => return self.start_gate(),
+            Action::CollectGate => return self.collect_gate(),
+            Action::StartHost => return self.start_host(),
+            Action::LogHostExit(code) => {
+                tracing::warn!(%seat, code, "seat host exited; restarting");
+            }
+            Action::EndCycle => self.end_cycle(),
+            Action::Report { error, retry } => {
+                tracing::warn!(
+                    %seat,
+                    code = %error.code,
+                    retry,
+                    "seat did not start: {}",
+                    error.message
+                );
+            }
+            Action::Wait(duration) => std::thread::sleep(duration),
+            Action::Finish => {}
         }
-    };
-    runtime.update(|snapshot| snapshot.session_id = Some(session.id));
-    // The profile exists once the session does. A first copy runs beside the start; the seat's
-    // Steam titles start once it lands, and its launchers are pointed at it then.
-    super::steam::ensure_copy(session.id, &seat.account, seat.id.as_str());
-    let steam = super::steam::box_install().and(super::steam::seat_exe(&seat.account));
-    let result = (|| {
-        let host_root = root
+        Ok(())
+    }
+
+    fn start_keeper(&mut self) -> WinResult<()> {
+        let pin = rdp::load_pin(&self.root)?;
+        let credential = self.accounts.credential_for_start(&self.seat)?;
+        let bootstrap =
+            RdpBootstrap::new(self.seat.account.clone(), credential.copy_zeroizing(), pin)
+                .map_err(|error| {
+                    io_error("keeper_bootstrap", "build RDP keeper bootstrap", error)
+                })?;
+        let job = Job::new()?;
+        let keeper_exe = super::keeper::keeper_path(&self.host_path);
+        let keeper = process::spawn_keeper(&job, &keeper_exe, &bootstrap)?;
+        self.keeper = Some((keeper, job));
+        Ok(())
+    }
+
+    fn enter_session(&mut self, id: u32) -> WinResult<()> {
+        self.session = Some(id);
+        let seat = &self.seat;
+        // The profile exists once the session does. A first copy runs beside the start; the seat's
+        // Steam titles start once it lands, and its launchers are pointed at it then.
+        super::steam::ensure_copy(id, &seat.account, seat.id.as_str());
+        let steam = super::steam::box_install().and(super::steam::seat_exe(&seat.account));
+        let host_root = self
+            .root
             .open_child_dir("hosts")
             .and_then(|hosts| hosts.open_child_dir(seat.id.as_str()))
             .map_err(|error| io_error("seat_root", "open per-seat host root", error))?;
-        let temp_root = root
+        let temp_root = self
+            .root
             .open_child_dir("temp")
             .and_then(|temp| temp.open_child_dir(seat.id.as_str()))
             .map_err(|error| io_error("seat_root", "open per-seat temporary root", error))?;
         let environment =
             process::seat_environment(host_root.path(), seat, steam.as_deref(), true)?;
-        let workdir = host_path.parent().ok_or_else(|| {
+        let workdir = self.host_path.parent().ok_or_else(|| {
             backend_error(
                 "host_missing",
                 "configured host executable has no parent directory",
             )
         })?;
-        // The gate and the host write here, as the box host writes `logs\host.log`.
         let log = host_root
             .child_path("host.log")
             .map_err(|error| io_error("seat_log", "resolve the seat log", error))?;
-
-        if !*quality_done {
-            runtime.step(seat, Step::Display, gate_attempt);
-            let gate_environment =
-                process::seat_environment(host_root.path(), seat, steam.as_deref(), false)?;
-            run_quality_gate(
-                runtime,
-                &keeper,
-                session.id,
-                host_path,
-                workdir,
-                &gate_environment,
-                &temp_root,
-                seat,
-                &log,
-            )?;
-            *quality_done = true;
-        }
-
-        runtime.step(seat, Step::Host, 0);
-        let mut host = spawn_host(session.id, host_path, workdir, &environment, &log)?;
-        runtime.update(|snapshot| snapshot.host_pid = Some(host.pid()));
-        wait_host_ready(runtime, &keeper, &host, seat)?;
-        runtime.update(|snapshot| {
-            snapshot.status = RuntimeStatus::running();
-            if snapshot.initial.is_none() {
-                snapshot.initial = Some(Ok(()));
-            }
-        });
-
-        let mut host_delay = Duration::from_secs(1);
-        loop {
-            if runtime.stop.load(Ordering::Acquire) {
-                runtime.update(|snapshot| {
-                    snapshot.status = RuntimeStatus {
-                        state: crate::model::RuntimeState::Stopping,
-                        detail: None,
-                    };
-                });
-                break;
-            }
-            if let Some(code) = keeper.exit_code()? {
-                return Err(backend_error(
-                    "rdp_keeper_exited",
-                    format!("RDP keeper process exited with code {code}"),
-                ));
-            }
-            if let Some(code) = host.exit_code()? {
-                tracing::warn!(seat = %seat.id, code, "seat host exited; restarting");
-                runtime.update(|snapshot| {
-                    snapshot.status = RuntimeStatus {
-                        state: crate::model::RuntimeState::Starting,
-                        detail: Some(format!(
-                            "punktfunk stopped on the seat. Restarting it in {} s…",
-                            host_delay.as_secs()
-                        )),
-                    };
-                    snapshot.host_pid = None;
-                });
-                if !sleep_stoppable_with_keeper(&runtime.stop, &keeper, host_delay)? {
-                    break;
-                }
-                host_delay = host_delay.saturating_mul(2).min(MAX_RESTART_DELAY);
-                host = spawn_host(session.id, host_path, workdir, &environment, &log)?;
-                runtime.update(|snapshot| snapshot.host_pid = Some(host.pid()));
-                wait_host_ready(runtime, &keeper, &host, seat)?;
-                runtime.update(|snapshot| snapshot.status = RuntimeStatus::running());
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        Ok(())
-    })();
-    drop(keeper);
-    drop(job);
-    let logoff = wts::logoff(session.id);
-    result.and(logoff)
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the gate binds one process to one exact seat session"
-)]
-fn run_quality_gate(
-    runtime: &Runtime,
-    keeper: &ChildProcess,
-    session_id: u32,
-    host_path: &Path,
-    workdir: &Path,
-    environment: &[u16],
-    temp_root: &SecretRoot,
-    seat: &Seat,
-    log: &Path,
-) -> WinResult<()> {
-    let mut random = [0_u8; 8];
-    rand::rng().fill_bytes(&mut random);
-    let name = format!("quality-{}-{}.h265", seat.id, hex::encode(random));
-    temp_root
-        .write_atomic(&name, &[])
-        .map_err(|error| io_error("quality_output", "create quality output", error))?;
-    let output = temp_root
-        .child_path(&name)
-        .map_err(|error| io_error("quality_output", "resolve quality output", error))?;
-    let arguments = [
-        "spike",
-        "--source",
-        "virtual",
-        "--width",
-        "1280",
-        "--height",
-        "720",
-        "--fps",
-        "60",
-        "--seconds",
-        "1",
-        "--codec",
-        "h265",
-        "--bitrate",
-        "5",
-        "--no-loopback",
-        "--out",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .chain(std::iter::once(output.as_os_str().to_owned()))
-    .collect::<Vec<_>>();
-    let result = (|| {
-        let quality = process::spawn_in_session(
-            session_id,
-            host_path,
-            &arguments,
+        self.launch = Some(Launch {
+            temp_root,
+            steam,
             environment,
-            workdir,
+            workdir: workdir.to_owned(),
             log,
-        )?;
-        let code = quality.wait(QUALITY_TIMEOUT, || {
-            runtime.stop.load(Ordering::Acquire) || keeper.exit_code().ok().flatten().is_some()
-        })?;
-        let Some(code) = code else {
-            quality.terminate();
-            return Err(backend_error(
-                "quality_timeout",
-                "same-session virtual-display quality gate did not finish within 60 seconds",
-            ));
-        };
-        if code != 0 {
-            return Err(backend_error(
-                "quality_failed",
-                format!("same-session virtual-display quality gate exited with code {code}"),
-            ));
-        }
-        let bytes = temp_root
-            .read_current(&name, 16 * 1024 * 1024)
-            .map_err(|error| io_error("quality_output", "read quality output", error))?
-            .unwrap_or_default();
-        if bytes.is_empty() {
-            return Err(backend_error(
-                "quality_empty",
-                "same-session virtual-display quality gate produced no output",
-            ));
-        }
+            host_root,
+        });
         Ok(())
-    })();
-    let cleanup = temp_root
-        .remove_file(&name)
-        .map_err(|error| io_error("quality_output", "remove quality output", error));
-    result.and(cleanup)
-}
+    }
 
-fn spawn_host(
-    session_id: u32,
-    host_path: &Path,
-    workdir: &Path,
-    environment: &[u16],
-    log: &Path,
-) -> WinResult<ChildProcess> {
-    process::spawn_in_session(
-        session_id,
-        host_path,
-        &[OsString::from("serve")],
-        environment,
-        workdir,
-        log,
-    )
-}
+    /// The session and what its children start with. `EnterSession` comes before every
+    /// action that asks.
+    fn launch(&self) -> WinResult<(u32, &Launch)> {
+        match (self.session, &self.launch) {
+            (Some(session), Some(launch)) => Ok((session, launch)),
+            _ => Err(backend_error(
+                "seat_session",
+                "the seat's session is not prepared",
+            )),
+        }
+    }
 
-fn wait_host_ready(
-    runtime: &Runtime,
-    keeper: &ChildProcess,
-    host: &ChildProcess,
-    seat: &Seat,
-) -> WinResult<()> {
-    let deadline = Instant::now() + HOST_READY_TIMEOUT;
-    loop {
-        if runtime.stop.load(Ordering::Acquire) {
-            return Err(backend_error(
-                "seat_stopping",
-                "seat stopped while waiting for host readiness",
-            ));
+    /// Start the gate: one second of the host's own encode from a virtual display in the
+    /// seat's session. It extends the display instead of isolating it.
+    fn start_gate(&mut self) -> WinResult<()> {
+        let (session, launch) = self.launch()?;
+        let environment = process::seat_environment(
+            launch.host_root.path(),
+            &self.seat,
+            launch.steam.as_deref(),
+            false,
+        )?;
+        let mut random = [0_u8; 8];
+        rand::rng().fill_bytes(&mut random);
+        let name = format!("quality-{}-{}.h265", self.seat.id, hex::encode(random));
+        launch
+            .temp_root
+            .write_atomic(&name, &[])
+            .map_err(|error| io_error("quality_output", "create quality output", error))?;
+        let output = launch
+            .temp_root
+            .child_path(&name)
+            .map_err(|error| io_error("quality_output", "resolve quality output", error))?;
+        let arguments = [
+            "spike",
+            "--source",
+            "virtual",
+            "--width",
+            "1280",
+            "--height",
+            "720",
+            "--fps",
+            "60",
+            "--seconds",
+            "1",
+            "--codec",
+            "h265",
+            "--bitrate",
+            "5",
+            "--no-loopback",
+            "--out",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .chain(std::iter::once(output.as_os_str().to_owned()))
+        .collect::<Vec<_>>();
+        let spawned = process::spawn_in_session(
+            session,
+            &self.host_path,
+            &arguments,
+            &environment,
+            &launch.workdir,
+            &launch.log,
+        );
+        match spawned {
+            Ok(process) => {
+                self.gate = Some(GateRun {
+                    process,
+                    output: name,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                let _ = launch.temp_root.remove_file(&name);
+                Err(error)
+            }
         }
-        if let Some(code) = keeper.exit_code()? {
-            return Err(backend_error(
-                "rdp_keeper_exited",
-                format!("RDP keeper exited with code {code} during host startup"),
-            ));
+    }
+
+    /// The gate exited clean: it passed if it wrote anything. Its output is removed either
+    /// way, and an output that can't be removed fails the gate too.
+    fn collect_gate(&mut self) -> WinResult<()> {
+        let gate = self.gate.take();
+        let (_, launch) = self.launch()?;
+        let Some(gate) = gate else {
+            return Err(backend_error("quality_output", "the gate did not run"));
+        };
+        let result = launch
+            .temp_root
+            .read_current(&gate.output, 16 * 1024 * 1024)
+            .map_err(|error| io_error("quality_output", "read quality output", error))
+            .and_then(|bytes| {
+                if bytes.unwrap_or_default().is_empty() {
+                    return Err(backend_error(
+                        "quality_empty",
+                        "same-session virtual-display quality gate produced no output",
+                    ));
+                }
+                Ok(())
+            });
+        let cleanup = launch
+            .temp_root
+            .remove_file(&gate.output)
+            .map_err(|error| io_error("quality_output", "remove quality output", error));
+        result.and(cleanup)
+    }
+
+    fn start_host(&mut self) -> WinResult<()> {
+        let (session, launch) = self.launch()?;
+        let host = process::spawn_in_session(
+            session,
+            &self.host_path,
+            &[OsString::from("serve")],
+            &launch.environment,
+            &launch.workdir,
+            &launch.log,
+        )?;
+        self.host = Some(host);
+        Ok(())
+    }
+
+    /// End the cycle in this order: the host and the gate, the keeper and its job, then
+    /// the session. A session child ends when its handle drops.
+    fn end_cycle(&mut self) {
+        self.host = None;
+        if let (Some(gate), Some(launch)) = (self.gate.take(), &self.launch) {
+            drop(gate.process);
+            let _ = launch.temp_root.remove_file(&gate.output);
         }
-        if let Some(code) = host.exit_code()? {
-            return Err(backend_error(
-                "host_exited",
-                format!("punktfunk-host exited with code {code} before readiness"),
-            ));
+        self.launch = None;
+        self.keeper = None;
+        if let Some(session) = self.session.take() {
+            let _ = wts::logoff(session);
         }
-        // Native is QUIC: ready once this host holds the UDP port, not when TCP answers.
-        if udp_port_owners(seat.native_port).contains(&host.pid()) && port_open(seat.mgmt_port) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(backend_error(
-                "host_ready_timeout",
-                "punktfunk-host did not open both assigned ports within 30 seconds",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -813,53 +652,4 @@ fn ensure_ports_free(seat: &Seat) -> WinResult<()> {
         ));
     }
     Ok(())
-}
-
-fn sleep_stoppable(stop: &AtomicBool, duration: Duration) -> bool {
-    let deadline = Instant::now() + duration;
-    while Instant::now() < deadline {
-        if stop.load(Ordering::Acquire) {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    true
-}
-
-fn sleep_stoppable_with_keeper(
-    stop: &AtomicBool,
-    keeper: &ChildProcess,
-    duration: Duration,
-) -> WinResult<bool> {
-    let deadline = Instant::now() + duration;
-    while Instant::now() < deadline {
-        if stop.load(Ordering::Acquire) {
-            return Ok(false);
-        }
-        if keeper.exit_code()?.is_some() {
-            return Err(backend_error(
-                "rdp_keeper_exited",
-                "RDP keeper exited during host restart backoff",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Ok(true)
-}
-
-fn permanent_failure(error: &crate::backend::BackendError) -> bool {
-    error.code.starts_with("quality_")
-        || matches!(
-            error.code.as_str(),
-            "account_not_owned"
-                | "account_is_administrator"
-                | "account_policy"
-                | "credential_missing"
-                | "credential_invalid"
-                | "credential_verify"
-                | "host_missing"
-                | "rdp_pin_missing"
-                | "rdp_pin_invalid"
-                | "local_system_required"
-        )
 }

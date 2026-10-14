@@ -21,7 +21,9 @@ use super::nvenc_core::{
 };
 use super::nvenc_status;
 use super::{max_forced_split_mode, resolve_split_mode, AuChunk, Codec, EncodedFrame};
-use crate::rfi::{Wave, WaveMark};
+use crate::rfi::{
+    plan_frame, FramePlan, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, Wave, WaveMark,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use nvidia_video_codec_sdk::sys::nvEncodeAPI as nv;
 use std::collections::VecDeque;
@@ -168,13 +170,27 @@ struct AsyncRetrieve {
 
 impl AsyncRetrieve {
     /// Close the job channel so the thread finishes queued jobs against the live session, join
-    /// it, and drop completions nobody absorbed.
-    fn stop(mut self) {
+    /// it, and drop completions nobody absorbed. With a `limit`, first wait that long for the
+    /// thread to leave its loop: it owns the done sender, so `Disconnected` is that moment.
+    /// `false` = still inside the driver; dropping the handle detaches the thread.
+    fn stop(mut self, limit: Option<Duration>) -> bool {
         drop(self.work_tx.take());
+        if let Some(limit) = limit {
+            let deadline = Instant::now() + limit;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match self.done_rx.recv_timeout(left) {
+                    Ok(_) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => return false,
+                }
+            }
+        }
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
         while self.done_rx.try_recv().is_ok() {}
+        true
     }
 }
 
@@ -358,11 +374,76 @@ pub fn open_at_ceiling<H>(
     })
 }
 
-/// The per-session state and logic both direct-NVENC backends run. See the module docs for
-/// the invariant its private fields carry.
+/// What one open session owns and a fresh open derives again. [`NvSession::close`] replaces it
+/// whole, so a field added here cannot outlive its session. [`NvSession`] derefs to it.
+pub struct Live {
+    encoder: *mut c_void,
+    /// Submits on this session; the next one's bitstream slot is `next % POOL`.
+    next: usize,
+    bitstreams: Vec<nv::NV_ENC_OUTPUT_PTR>,
+    pending: VecDeque<PendingEncode>,
+    inited: bool,
+    /// Opened with `enableEncodeAsync` (Windows completion events). Linux is always sync.
+    pub session_async: bool,
+    async_rt: Option<AsyncRetrieve>,
+    /// Chunked poll armed (`slices ≥ 2` ∧ sub-frame ∧ sync retrieve on this thread).
+    pub subframe_chunks: bool,
+    pub chunk: Option<ChunkState>,
+    /// Armed by a successful RFI; the next submit tags that AU as the recovery anchor. Without
+    /// the tag the client lifts only on an IDR, which session glue suppresses after RFI.
+    pub pending_anchor: bool,
+    /// Intra refresh wave in flight: a declined RFI's answer instead of the IDR. The start
+    /// frame carries `forceIntraRefreshWithFrameCnt`; the driver sweeps from there.
+    pub wave: Option<Wave>,
+    /// Timestamps `[start, close)` of the latest wave. Nothing before the close is an RFI
+    /// anchor: every earlier picture still in the DPB is damaged, the span's own part dirty.
+    pub wave_span: Option<(i64, i64)>,
+    /// A loss landed inside the wave in flight. The driver ignores a re-force mid-sweep, so the
+    /// sweep runs on with damage behind it: its close carries no mark, and a fresh wave starts
+    /// on the frame after it (`wave_queued`).
+    pub wave_spoiled: bool,
+    pub wave_queued: bool,
+    /// Last invalidated ref range. Dedupes the client's resends of one loss.
+    pub last_rfi_range: Option<(i64, i64)>,
+    /// `distrust_references` latched: a resident reference may predict from a hole the
+    /// client decoded against, so RFI declines until an IDR flushes the DPB.
+    pub distrusted: bool,
+    /// Wire index each long-term slot holds; an IDR or an invalidation empties it.
+    ltr_slots: Vec<Option<i64>>,
+    ltr_next: usize,
+}
+
+impl Default for Live {
+    /// No session: a null handle and nothing in flight.
+    fn default() -> Self {
+        Live {
+            encoder: std::ptr::null_mut(),
+            next: 0,
+            bitstreams: Vec::new(),
+            pending: VecDeque::new(),
+            inited: false,
+            session_async: false,
+            async_rt: None,
+            subframe_chunks: false,
+            chunk: None,
+            pending_anchor: false,
+            wave: None,
+            wave_span: None,
+            wave_spoiled: false,
+            wave_queued: false,
+            last_rfi_range: None,
+            distrusted: false,
+            ltr_slots: Vec::new(),
+            ltr_next: 0,
+        }
+    }
+}
+
+/// The settings and the logic both direct-NVENC backends run, around the [`Live`] session.
+/// See the module docs for the invariant its private fields carry.
 pub struct NvSession {
     api: &'static EncodeApi,
-    encoder: *mut c_void,
+    live: Live,
     pub codec: Codec,
     pub codec_guid: nv::GUID,
     /// `PUNKTFUNK_NVENC_PRESET` as P1..P7, latched so open and reconfigure present one preset.
@@ -388,29 +469,10 @@ pub struct NvSession {
     /// GPU identity keying the ceiling and split caches: the Windows render-adapter LUID, the
     /// Linux `CUcontext`. Advisory: a collision costs one failed open and a re-search.
     pub gpu: u64,
-    /// Submits on this session; the next one's bitstream slot is `next % POOL`.
-    next: usize,
-    bitstreams: Vec<nv::NV_ENC_OUTPUT_PTR>,
-    pending: VecDeque<PendingEncode>,
     /// Next `inputTimeStamp`. `submit_indexed` pins it to the wire index so RFI timestamps stay
     /// 1:1 across rebuilds.
     pub frame_idx: i64,
     pub force_kf: bool,
-    /// Armed by a successful RFI; the next submit tags that AU as the recovery anchor. Without
-    /// the tag the client lifts only on an IDR, which session glue suppresses after RFI.
-    pub pending_anchor: bool,
-    /// Intra refresh wave in flight: a declined RFI's answer instead of the IDR. The start
-    /// frame carries `forceIntraRefreshWithFrameCnt`; the driver sweeps from there.
-    pub wave: Option<Wave>,
-    /// Timestamps `[start, close)` of the latest wave. Nothing before the close is an RFI
-    /// anchor: every earlier picture still in the DPB is damaged, the span's own part dirty.
-    pub wave_span: Option<(i64, i64)>,
-    /// A loss landed inside the wave in flight. The driver ignores a re-force mid-sweep, so the
-    /// sweep runs on with damage behind it: its close carries no mark, and a fresh wave starts
-    /// on the frame after it (`wave_queued`).
-    pub wave_spoiled: bool,
-    pub wave_queued: bool,
-    inited: bool,
     /// From `query_caps`. Gates RFI instead of failing later as opaque `InvalidParam`.
     pub rfi_supported: bool,
     pub custom_vbv: bool,
@@ -425,8 +487,6 @@ pub struct NvSession {
     pub subframe_forced: bool,
     /// Sub-frame as opened. A return to non-forced split restores it; never turns it on.
     pub subframe_opened_with: bool,
-    /// Chunked poll armed (`slices ≥ 2` ∧ sub-frame ∧ sync retrieve on this thread).
-    pub subframe_chunks: bool,
     /// The finish-lock prefix check caught sub-frame bytes the finished AU disowns. Later opens
     /// on this encoder resolve sub-frame off; a fresh encoder retests.
     pub subframe_broken: bool,
@@ -444,24 +504,25 @@ pub struct NvSession {
     /// sub-frame trade it cannot price.
     pub send_spread_us: u32,
     pub arbiter: Option<SplitArbiter>,
-    pub chunk: Option<ChunkState>,
     /// `sliceOffsets` for the doNotWait sampler, sized at open ([`slice_offsets_len`]).
     slice_offsets: Vec<u32>,
-    /// Opened with `enableEncodeAsync` (Windows completion events). Linux is always sync.
-    pub session_async: bool,
-    async_rt: Option<AsyncRetrieve>,
-    /// Last invalidated ref range. Dedupes the client's resends of one loss.
-    pub last_rfi_range: Option<(i64, i64)>,
-    /// `distrust_references` latched: a resident reference may predict from a hole the
-    /// client decoded against, so RFI declines until an IDR flushes the DPB.
-    pub distrusted: bool,
     /// Long-term slots the session opened with (`0` = none: AV1, or no GPU support).
     pub ltr_frames: u32,
-    /// Wire index each long-term slot holds; an IDR or an invalidation empties it.
-    ltr_slots: Vec<Option<i64>>,
-    ltr_next: usize,
     /// The newest frame the client confirmed, while the host holds confirmed references.
     pub reference_floor: Option<crate::codec::Acked>,
+}
+
+impl std::ops::Deref for NvSession {
+    type Target = Live;
+    fn deref(&self) -> &Live {
+        &self.live
+    }
+}
+
+impl std::ops::DerefMut for NvSession {
+    fn deref_mut(&mut self) -> &mut Live {
+        &mut self.live
+    }
 }
 
 impl NvSession {
@@ -477,7 +538,7 @@ impl NvSession {
     ) -> Self {
         Self {
             api,
-            encoder: std::ptr::null_mut(),
+            live: Live::default(),
             codec,
             codec_guid: super::nvenc_core::codec_guid(codec),
             preset: crate::knobs::get().nvenc_preset.max(1),
@@ -493,17 +554,8 @@ impl NvSession {
             hdr_meta: None,
             full_range: false,
             gpu: 0,
-            next: 0,
-            bitstreams: Vec::new(),
-            pending: VecDeque::new(),
             frame_idx: 0,
             force_kf: false,
-            pending_anchor: false,
-            wave: None,
-            wave_span: None,
-            wave_spoiled: false,
-            wave_queued: false,
-            inited: false,
             rfi_supported: false,
             custom_vbv: false,
             split_mode: DISABLE,
@@ -511,7 +563,6 @@ impl NvSession {
             subframe_on: false,
             subframe_forced: false,
             subframe_opened_with: false,
-            subframe_chunks: false,
             subframe_broken: false,
             slices: 1,
             // A zero caller must not zero the resolver's default arithmetic.
@@ -520,15 +571,8 @@ impl NvSession {
             last_submit_at: None,
             send_spread_us: 0,
             arbiter: None,
-            chunk: None,
             slice_offsets: Vec::new(),
-            session_async: false,
-            async_rt: None,
-            last_rfi_range: None,
-            distrusted: false,
             ltr_frames: 0,
-            ltr_slots: Vec::new(),
-            ltr_next: 0,
             reference_floor: None,
         }
     }
@@ -572,35 +616,49 @@ impl NvSession {
         session_wave_cycle(self.codec, self.height, self.fps)
     }
 
-    /// A real loss with no clean anchor: a wave heals without one. The client re-armed at
-    /// this loss, so a wave under way queues a fresh start and close behind it; its own
-    /// close still lifts unless a lost frame sits inside its sweep. Nonsense and a range
-    /// past the head stay the caller's keyframe.
+    /// How this session recovers. The driver owns the sweep: it ignores a re-force mid-sweep,
+    /// so a loss there queues a fresh wave, and nothing abandons the one in flight.
+    fn policy(&self) -> RecoveryPolicy {
+        RecoveryPolicy {
+            cycle: Some(self.wave_cycle()).filter(|&c| c != 0),
+            mid_wave: MidWave::Queue,
+            abandons: false,
+        }
+    }
+
+    /// The wave as [`plan_frame`] reads it. `wave_spoiled` outlives a spoiled close until the
+    /// next start frame, which reads it for the span, so only a started wave is spoiled.
+    fn recovery(&self) -> Recovery {
+        Recovery {
+            wave: self.wave,
+            spoiled: self.wave_spoiled && self.wave.is_some_and(|w| w.index > 0),
+            queued: self.wave_queued,
+        }
+    }
+
+    /// A real loss with no clean anchor: a wave heals without one ([`Recovery::lose`]). Its
+    /// close still lifts unless a lost frame sits inside its sweep. Nonsense, a range past
+    /// the head and a session that cannot wave stay the caller's keyframe.
     fn start_wave(&mut self, first: i64, last: i64) -> bool {
-        let cycle = self.wave_cycle();
-        if cycle == 0 || first < 0 || first > last || first >= self.frame_idx {
+        if first < 0 || first > last || first >= self.frame_idx {
             return false;
         }
-        if let Some(w) = self.wave {
-            // The driver ignores a re-force mid-sweep: this one runs out, the next queues.
-            let span_start = self.wave_span.map(|(start, _)| start);
-            self.wave_spoiled |= w.spoiled_by(span_start, self.frame_idx, last);
-            self.wave_queued = true;
-            tracing::debug!(
-                first,
-                last,
-                spoiled = self.wave_spoiled,
-                "nvenc RFI: loss mid-wave — wave queued behind it"
-            );
-            return true;
-        }
-        self.wave = Some(Wave::start(cycle));
+        let span_start = self.wave_span.map(|(start, _)| start);
+        let spoils = self
+            .wave
+            .is_some_and(|w| w.spoiled_by(span_start, self.frame_idx, last));
+        let Some(next) = self.recovery().lose(&self.policy(), spoils) else {
+            return false;
+        };
         tracing::debug!(
             first,
             last,
-            cycle,
+            mid_wave = self.wave.is_some(),
+            spoiled = next.spoiled,
             "nvenc RFI: no clean anchor — intra refresh wave"
         );
+        (self.wave, self.wave_queued) = (next.wave, next.queued);
+        self.wave_spoiled |= next.spoiled;
         true
     }
 
@@ -1075,9 +1133,9 @@ impl NvSession {
     }
 
     /// Map `input.reg`, author this frame's pic params (forced IDR, recovery anchor, wave
-    /// start, HDR SEI on every IDR) and submit it into bitstream [`Self::slot`]. `next`
-    /// advances only once the picture is queued, so a failed opening frame keeps its IDR SEI
-    /// on the retry; a failed encode re-arms the forced IDR and the anchor it spent.
+    /// start, HDR SEI on every IDR) and submit it into bitstream [`Self::slot`]. The frame's
+    /// plan is spent only once the picture is queued ([`Self::spend`]): a failed encode
+    /// leaves the session as it was, and the retry is the same frame.
     ///
     /// # Safety
     /// The session is open, `input.reg` is registered on it, and its surface holds this frame
@@ -1099,49 +1157,33 @@ impl NvSession {
             .map_err(|e| nvenc_status::call_err("map_input_resource", e))?;
         let t_map = tm.elapsed();
 
-        let pts = self.frame_idx as u64;
-        self.frame_idx += 1;
-        let flags = if std::mem::take(&mut self.force_kf) {
-            // The IDR flushes the DPB: every later reference is clean again.
-            self.distrusted = false;
+        let ts = self.frame_idx;
+        let pts = ts as u64;
+        let forced = self.force_kf;
+        let ltr = self.ltr_peek(ts);
+        // The opening frame is an IDR the driver emits unasked: only a forced one is planned
+        // as an IDR, which drops the anchor and flushes the wave, queue and all.
+        let pending = Pending {
+            idr: forced,
+            anchor: self.pending_anchor,
+            acked: !opening && ltr.is_some_and(|(_, force)| force.is_some()),
+            loss: false,
+        };
+        let plan = plan_frame(self.recovery(), pending, &self.policy());
+        let flags = if forced {
             nv::NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_FORCEIDR as u32
                 | nv::NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_OUTPUT_SPSPPS as u32
         } else {
             0
         };
-        // The first frame after invalidation. A simultaneous forced IDR is itself the re-anchor.
-        let anchor = std::mem::take(&mut self.pending_anchor) && flags == 0;
-        // An IDR flushes the wave, queue and all, and every picture from it on is clean; a
-        // wave's start frame asks for the sweep.
-        if flags != 0 {
-            self.wave = None;
-            self.wave_spoiled = false;
-            self.wave_queued = false;
-            self.wave_span = self.wave_span.map(|(s, close)| (s, close.min(pts as i64)));
-        }
-        let wave = self.wave;
-        let mark = wave.map_or(WaveMark::None, |w| w.mark(self.wave_spoiled));
-        if let Some(w) = wave {
-            let ts = pts as i64;
-            if w.index == 0 {
-                // A wave after a spoiled one keeps the spoiled pictures dirty too.
-                let start = match self.wave_span {
-                    Some((s, _)) if self.wave_spoiled => s,
-                    _ => ts,
-                };
-                self.wave_span = Some((start, ts + i64::from(w.cycle) - 1));
-                self.wave_spoiled = false;
-            }
-            self.wave = w.next();
-            if self.wave.is_none() && std::mem::take(&mut self.wave_queued) {
-                self.wave = Some(Wave::start(w.cycle));
-            }
-        }
+        // The first frame after invalidation, or one that references a confirmed picture.
+        let anchor = matches!(plan.refs, FrameRef::Anchor | FrameRef::Acked);
+        let (wave, mark) = (plan.wave, plan.mark);
         // P-only + infinite GOP: IDRs are forced, or the opening frame NVENC emits as one.
         // Chunked poll flags early chunks from this before the driver reports `pictureType`.
-        let idr = flags != 0 || opening;
-        let ltr = self.ltr_step(pts as i64, idr, wave.is_some());
-        let anchor = anchor || ltr.is_some_and(|(_, force)| force.is_some());
+        let idr = forced || opening;
+        // The long-term step sits out an IDR, which empties the slots, and a wave.
+        let ltr = ltr.filter(|_| !idr && wave.is_none());
         let mut pic = nv::NV_ENC_PIC_PARAMS {
             version: nv::NV_ENC_PIC_PARAMS_VER,
             inputWidth: self.width,
@@ -1248,14 +1290,14 @@ impl NvSession {
             // Nothing owns the mapping yet; left mapped, the slot's next map fails too.
             // SAFETY: the mapping made above on this session, unmapped once.
             let _ = unsafe { (self.api.unmap_input_resource)(self.encoder, mp.mappedResource) };
-            self.force_kf |= flags != 0;
-            self.pending_anchor |= anchor;
             return Err(nvenc_status::call_err("encode_picture", e));
         }
         let t_pic = tp.elapsed();
+        self.spend(ts, idr, plan, ltr);
         self.next += 1;
+        let bs = self.bitstreams[slot];
         self.pending.push_back(PendingEncode {
-            bs: self.bitstreams[slot],
+            bs,
             map: mp.mappedResource,
             pts_ns: input.pts_ns,
             anchor,
@@ -1269,7 +1311,7 @@ impl NvSession {
         // A dead thread would strand this AU: the caller rebuilds.
         if let Some(rt) = &self.async_rt {
             let job = RetrieveJob {
-                bs: self.bitstreams[slot] as usize,
+                bs: bs as usize,
                 event: input.event as usize,
             };
             if rt.work_tx.as_ref().is_none_or(|tx| tx.send(job).is_err()) {
@@ -1282,22 +1324,57 @@ impl NvSession {
         })
     }
 
-    /// This frame's long-term step while the host holds confirmed references: mark it into a
-    /// slot and force the newest one the client confirmed ([`crate::rfi::ltr_acked_step`]).
-    /// `None` without a floor, on an IDR (which empties the slots) and during a wave.
-    fn ltr_step(&mut self, ts: i64, idr: bool, wave: bool) -> Option<LtrStep> {
+    /// Frame `ts` is queued: spend what its plan took. A forced IDR flushes the DPB, so every
+    /// later reference is clean again and nothing before it stays in a wave's span.
+    fn spend(&mut self, ts: i64, idr: bool, plan: FramePlan, ltr: Option<LtrStep>) {
+        self.frame_idx = ts + 1;
+        self.pending_anchor = false;
+        if std::mem::take(&mut self.force_kf) {
+            self.distrusted = false;
+            self.wave_span = self.wave_span.map(|(s, close)| (s, close.min(ts)));
+        }
+        if let Some(w) = plan.wave.filter(|w| w.index == 0) {
+            // A wave after a spoiled one keeps the spoiled pictures dirty too.
+            let start = match self.wave_span {
+                Some((s, _)) if self.wave_spoiled => s,
+                _ => ts,
+            };
+            self.wave_span = Some((start, ts + i64::from(w.cycle) - 1));
+        }
+        (self.wave, self.wave_queued) = (plan.next.wave, plan.next.queued);
+        let spoiled_close = plan.dirty && plan.wave.is_some_and(Wave::closes);
+        self.wave_spoiled = plan.next.spoiled || spoiled_close;
+        self.ltr_mark(ts, idr, ltr);
+    }
+
+    /// The long-term step frame `ts` would take while the host holds confirmed references:
+    /// the slot it marks and the newest confirmed one it forces
+    /// ([`crate::rfi::ltr_acked_step`]). `None` without a floor or without long-term slots.
+    fn ltr_peek(&mut self, ts: i64) -> Option<LtrStep> {
         let n = self.ltr_frames as usize;
-        if self.ltr_slots.len() != n || idr {
+        if self.ltr_slots.len() != n {
             self.ltr_slots = vec![None; n];
             self.ltr_next = 0;
         }
-        let acked = self.reference_floor.filter(|_| n > 0 && !idr && !wave)?;
-        let (mark, force) = crate::rfi::ltr_acked_step(&self.ltr_slots, &acked, ts, self.ltr_next);
-        if let Some(m) = mark {
-            self.ltr_slots[m] = Some(ts);
-            self.ltr_next = (m + 1) % n;
+        let acked = self.reference_floor.filter(|_| n > 0)?;
+        Some(crate::rfi::ltr_acked_step(
+            &self.ltr_slots,
+            &acked,
+            ts,
+            self.ltr_next,
+        ))
+    }
+
+    /// Record frame `ts` in the slot table: an IDR empties it, a step's mark fills its slot.
+    fn ltr_mark(&mut self, ts: i64, idr: bool, step: Option<LtrStep>) {
+        if idr {
+            self.ltr_slots.fill(None);
+            self.ltr_next = 0;
         }
-        Some((mark, force))
+        if let Some((Some(m), _)) = step {
+            self.ltr_slots[m] = Some(ts);
+            self.ltr_next = (m + 1) % self.ltr_slots.len();
+        }
     }
 
     /// Unmap one retired input.
@@ -1661,11 +1738,34 @@ impl NvSession {
 
     /// First half of a teardown: join the retrieve thread (it finishes queued jobs against the
     /// still-live session), then unmap every in-flight input. The session stays open for the
-    /// backend to unregister its inputs. Idempotent.
+    /// backend to unregister its inputs. Idempotent. The join is untimed: for a retrieve loop
+    /// that bounds its own waits (Windows completion events).
     pub fn stop(&mut self) {
         if let Some(rt) = self.async_rt.take() {
-            rt.stop();
+            rt.stop(None);
         }
+        self.unmap_pending();
+    }
+
+    /// [`Self::stop`] for a retrieve loop that blocks in the driver with no timeout of its own
+    /// (Linux: `nvEncLockBitstream` returns only when the driver completes or fails the
+    /// encode). `false` = the thread did not leave the lock within `limit`. It still holds the
+    /// session and a pool bitstream, so nothing is unmapped or destroyed: the session is
+    /// forgotten as it stands, and its handle, its pool and the thread leak. The backend
+    /// leaks the inputs it registered with them.
+    pub fn stop_within(&mut self, limit: Duration) -> bool {
+        if let Some(rt) = self.async_rt.take() {
+            if !rt.stop(Some(limit)) {
+                self.live = Live::default();
+                return false;
+            }
+        }
+        self.unmap_pending();
+        true
+    }
+
+    /// Unmap every in-flight input. The session is live and no retrieve thread runs.
+    fn unmap_pending(&mut self) {
         let (api, enc) = (self.api, self.encoder);
         for p in &mut self.pending {
             let map = std::mem::replace(&mut p.map, std::ptr::null_mut());
@@ -1678,8 +1778,8 @@ impl NvSession {
     }
 
     /// Second half, after the backend's unregisters: [`Self::stop`] (a no-op if the backend
-    /// ran it), destroy the bitstream pool, hand the session to `destroy`, and reset every
-    /// field a fresh open re-derives. The next open starts with an IDR and an empty DPB, so
+    /// ran it), destroy the bitstream pool, hand the session to `destroy`, and drop everything
+    /// the session owned ([`Live`]). The next open starts with an IDR and an empty DPB, so
     /// RFI range, anchor, distrust and wave state go too.
     pub fn close(&mut self, destroy: impl FnOnce(*mut c_void)) {
         if self.encoder.is_null() {
@@ -1688,26 +1788,11 @@ impl NvSession {
         // The retrieve thread locks pool bitstreams: joined before any of them is destroyed.
         self.stop();
         for &bs in &self.bitstreams {
-            // SAFETY: a pool bitstream of the live session, destroyed once: cleared below.
+            // SAFETY: a pool bitstream of the live session, destroyed once: dropped below.
             let _ = unsafe { (self.api.destroy_bitstream_buffer)(self.encoder, bs) };
         }
         destroy(self.encoder);
-        self.encoder = std::ptr::null_mut();
-        self.bitstreams.clear();
-        self.pending.clear();
-        self.chunk = None;
-        self.subframe_chunks = false;
-        self.session_async = false;
-        self.inited = false;
-        self.next = 0;
-        self.last_rfi_range = None;
-        self.pending_anchor = false;
-        self.distrusted = false;
-        self.wave = None;
-        self.wave_span = None;
-        self.wave_spoiled = false;
-        self.wave_queued = false;
-        self.ltr_slots.clear();
+        self.live = Live::default();
     }
 }
 
@@ -1842,5 +1927,278 @@ mod ladder_tests {
         );
         assert!(res.is_err());
         assert!(live.borrow().is_empty(), "the held session was destroyed");
+    }
+}
+
+/// The session's own arbitration (`invalidate_ref_frames`, `encode`, the long-term step) on a
+/// driver that accepts every call, held to the NVENC table and model in `rfi::plan_tests`.
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::rfi::plan_tests::{check, nvenc, sweep, Au, Model, NVENC, NVENC_NO_WAVE};
+    use crate::Acked;
+
+    macro_rules! accept {
+        ($($name:ident($($arg:ty),*);)*) => {$(
+            unsafe extern "C" fn $name($(_: $arg),*) -> nv::NVENCSTATUS {
+                nv::NVENCSTATUS::NV_ENC_SUCCESS
+            }
+        )*};
+    }
+    accept! {
+        open(*mut nv::NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, *mut *mut c_void);
+        init(*mut c_void, *mut nv::NV_ENC_INITIALIZE_PARAMS);
+        reconfigure(*mut c_void, *mut nv::NV_ENC_RECONFIGURE_PARAMS);
+        destroy(*mut c_void);
+        caps(*mut c_void, nv::GUID, *mut nv::NV_ENC_CAPS_PARAM, *mut core::ffi::c_int);
+        guid_count(*mut c_void, *mut u32);
+        guids(*mut c_void, *mut nv::GUID, u32, *mut u32);
+        preset(
+            *mut c_void, nv::GUID, nv::GUID, nv::NV_ENC_TUNING_INFO, *mut nv::NV_ENC_PRESET_CONFIG
+        );
+        create_bitstream(*mut c_void, *mut nv::NV_ENC_CREATE_BITSTREAM_BUFFER);
+        release(*mut c_void, *mut c_void);
+        lock(*mut c_void, *mut nv::NV_ENC_LOCK_BITSTREAM);
+        register(*mut c_void, *mut nv::NV_ENC_REGISTER_RESOURCE);
+        map(*mut c_void, *mut nv::NV_ENC_MAP_INPUT_RESOURCE);
+        invalidate(*mut c_void, u64);
+    }
+    #[cfg(windows)]
+    accept! { event(*mut c_void, *mut nv::NV_ENC_EVENT_PARAMS); }
+    #[cfg(target_os = "linux")]
+    accept! { streams(*mut c_void, *mut c_void, *mut c_void); }
+
+    thread_local! {
+        /// Pictures the stub driver refuses before it takes one, on this test's thread.
+        static REFUSE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    unsafe extern "C" fn picture(_: *mut c_void, _: *mut nv::NV_ENC_PIC_PARAMS) -> nv::NVENCSTATUS {
+        match REFUSE.get() {
+            0 => nv::NVENCSTATUS::NV_ENC_SUCCESS,
+            n => {
+                REFUSE.set(n - 1);
+                nv::NVENCSTATUS::NV_ENC_ERR_GENERIC
+            }
+        }
+    }
+
+    static API: EncodeApi = EncodeApi {
+        open_encode_session_ex: open,
+        initialize_encoder: init,
+        reconfigure_encoder: reconfigure,
+        destroy_encoder: destroy,
+        get_encode_caps: caps,
+        get_encode_guid_count: guid_count,
+        get_encode_guids: guids,
+        get_encode_preset_config_ex: preset,
+        create_bitstream_buffer: create_bitstream,
+        destroy_bitstream_buffer: release,
+        lock_bitstream: lock,
+        unlock_bitstream: release,
+        register_resource: register,
+        unregister_resource: release,
+        map_input_resource: map,
+        unmap_input_resource: release,
+        encode_picture: picture,
+        #[cfg(windows)]
+        register_async_event: event,
+        #[cfg(windows)]
+        unregister_async_event: event,
+        invalidate_ref_frames: invalidate,
+        #[cfg(target_os = "linux")]
+        set_io_cuda_streams: streams,
+    };
+
+    /// A session open on the stub driver. `height` in 32-px rows is the wave's cycle at 60 fps.
+    fn stub_session(codec: Codec, height: u32) -> NvSession {
+        let mut s = NvSession::new(&API, codec, 128, height, 60, 1_000_000, 1);
+        s.encoder = std::ptr::NonNull::dangling().as_ptr();
+        s.bitstreams = vec![std::ptr::null_mut(); POOL];
+        s.rfi_supported = true;
+        s.ltr_frames = 2;
+        s
+    }
+
+    /// Encode one frame and return what it was queued as.
+    fn encode(s: &mut NvSession) -> Result<&PendingEncode> {
+        let input = EncodeInput {
+            reg: std::ptr::null_mut(),
+            pitch: 0,
+            event: std::ptr::null_mut(),
+            pts_ns: 0,
+            hold: None,
+        };
+        // SAFETY: the session is open on the stub driver, which reads none of its arguments.
+        unsafe { s.encode(input) }?;
+        Ok(s.pending.back().expect("the frame is queued"))
+    }
+
+    /// The real session behind the table's events. The range plan and the client's
+    /// confirmations are the event, as in the model: `a` arms the anchor, `+` keeps a
+    /// confirmed picture resident.
+    struct Session {
+        s: NvSession,
+        floor: bool,
+    }
+
+    impl Model for Session {
+        fn event(&mut self, e: u8) -> Option<Au> {
+            let s = &mut self.s;
+            match e {
+                b'k' => s.force_kf = true,
+                b'+' | b'-' => self.floor = e == b'+',
+                // No session before the first frame: the caller keyframes.
+                b'a' | b'l' if s.frame_idx == 0 => {}
+                b'l' => {
+                    s.invalidate_ref_frames(0, 0);
+                }
+                b'a' if s.wave.is_some() => {
+                    s.invalidate_ref_frames(s.frame_idx - 1, s.frame_idx - 1);
+                }
+                b'a' => s.pending_anchor = true,
+                _ => return Some(self.frame()),
+            }
+            None
+        }
+    }
+
+    impl Session {
+        fn frame(&mut self) -> Au {
+            let s = &mut self.s;
+            let last = s.frame_idx - 1;
+            s.reference_floor = self.floor.then_some(Acked {
+                last,
+                mask: u16::MAX,
+            });
+            if self.floor {
+                s.ltr_slots = vec![Some(last), None];
+            }
+            let (forced, armed, before) = (s.force_kf, s.pending_anchor, s.wave);
+            let p = encode(s).expect("the stub driver accepts every picture");
+            let wave = before.filter(|_| !forced);
+            Au {
+                refs: match (p.idr_hint, p.anchor, armed) {
+                    (true, ..) => FrameRef::Idr,
+                    (_, true, true) => FrameRef::Anchor,
+                    (_, true, false) => FrameRef::Acked,
+                    _ => FrameRef::Chain,
+                },
+                wave,
+                mark: p.mark,
+                // There is no per-picture bit; a close is clean when it carries its mark.
+                dirty: wave.is_some_and(|w| !w.closes() || p.mark != WaveMark::Close),
+            }
+        }
+    }
+
+    /// Model and session at one cycle: the height in 32-px rows, or AV1 for no wave.
+    fn pair(cycle: Option<u32>) -> (impl Model, Session) {
+        let s = match cycle {
+            Some(rows) => stub_session(Codec::H265, rows * 32),
+            None => stub_session(Codec::Av1, 128),
+        };
+        assert_eq!(s.wave_cycle(), cycle.unwrap_or(0));
+        (nvenc(cycle).0, Session { s, floor: false })
+    }
+
+    /// A wave's start frame the driver refuses: the wave must not move on without its sweep,
+    /// and the forced IDR, the anchor and the long-term slots are not spent either.
+    #[test]
+    fn a_refused_picture_spends_nothing() {
+        let mut s = stub_session(Codec::H265, 128);
+        encode(&mut s).expect("the opening IDR");
+        assert!(s.invalidate_ref_frames(0, 0), "no anchor: a wave is armed");
+        let state = |s: &NvSession| (s.frame_idx, s.wave, s.force_kf, s.pending_anchor, s.next);
+        let before = state(&s);
+        REFUSE.set(1);
+        assert!(encode(&mut s).is_err());
+        assert_eq!(state(&s), before);
+        let retry = encode(&mut s).expect("the driver takes the retry");
+        assert_eq!(retry.mark, WaveMark::Start, "the retry starts the wave");
+
+        s.force_kf = true;
+        s.pending_anchor = true;
+        s.distrusted = true;
+        REFUSE.set(1);
+        assert!(encode(&mut s).is_err());
+        assert!(s.force_kf && s.pending_anchor && s.distrusted);
+        assert!(encode(&mut s).expect("the retry").idr_hint);
+        assert!(!s.force_kf && !s.pending_anchor && !s.distrusted);
+
+        // A plain frame under confirmed references marks a long-term slot.
+        s.reference_floor = Some(Acked {
+            last: s.frame_idx - 1,
+            mask: u16::MAX,
+        });
+        REFUSE.set(1);
+        assert!(encode(&mut s).is_err());
+        assert_eq!(
+            s.ltr_slots,
+            [None, None],
+            "no slot holds a picture that was never queued"
+        );
+    }
+
+    /// A retrieve loop that takes a job and never answers: the blocking lock on a wedged driver.
+    fn stuck(_: usize, jobs: mpsc::Receiver<RetrieveJob>, _done: mpsc::Sender<RetrieveDone>) {
+        let _job = jobs.recv();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    fn answers(_: usize, jobs: mpsc::Receiver<RetrieveJob>, done: mpsc::Sender<RetrieveDone>) {
+        for job in jobs {
+            let result = Ok((Vec::new(), false));
+            let _ = done.send(RetrieveDone { bs: job.bs, result });
+        }
+    }
+
+    /// A stuck retrieve thread costs the stop its limit, not the encode thread: the session
+    /// is forgotten undestroyed. A thread that answers is joined and the session stays open.
+    #[test]
+    fn a_stuck_retrieve_thread_is_left_behind() {
+        let mut s = stub_session(Codec::H265, 128);
+        s.start_retrieve("pf-test-stuck", stuck).expect("spawn");
+        encode(&mut s).expect("queued behind the stuck lock");
+        let t0 = Instant::now();
+        assert!(!s.stop_within(Duration::from_millis(50)));
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        assert!(s.handle().is_null() && s.pending().is_empty() && !s.retrieving());
+
+        let mut s = stub_session(Codec::H265, 128);
+        s.start_retrieve("pf-test-answers", answers).expect("spawn");
+        encode(&mut s).expect("queued");
+        assert!(s.stop_within(Duration::from_secs(5)));
+        assert!(!s.handle().is_null() && !s.retrieving());
+    }
+
+    /// `close` drops what the session owned and keeps what the next open needs: the wire
+    /// index, an owed IDR, the confirmed floor and the sub-frame verdict.
+    #[test]
+    fn close_drops_the_session_and_keeps_the_settings() {
+        let mut s = stub_session(Codec::H265, 128);
+        encode(&mut s).expect("the opening IDR");
+        assert!(s.invalidate_ref_frames(0, 0), "a wave is armed");
+        encode(&mut s).expect("the wave's start");
+        (s.pending_anchor, s.distrusted, s.session_async) = (true, true, true);
+        (s.force_kf, s.subframe_broken) = (true, true);
+        s.close(|_| ());
+        assert!(s.handle().is_null() && !s.inited() && s.opening());
+        assert!(s.pending().is_empty() && s.bitstreams().is_empty());
+        assert!(s.wave.is_none() && s.wave_span.is_none() && s.ltr_slots.is_empty());
+        assert!(!s.pending_anchor && !s.distrusted && !s.session_async);
+        assert_eq!(s.frame_idx, 2, "the next open continues the wire index");
+        assert!(s.force_kf && s.subframe_broken);
+    }
+
+    #[test]
+    fn the_session_follows_the_nvenc_table() {
+        check(NVENC, || pair(Some(4)));
+        check(NVENC_NO_WAVE, || pair(None));
+        for cycle in [None, Some(2), Some(3)] {
+            sweep(|| pair(cycle));
+        }
     }
 }

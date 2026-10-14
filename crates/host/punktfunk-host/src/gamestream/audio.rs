@@ -205,7 +205,8 @@ fn build_fec_rtp(
 }
 
 /// Spawn the audio thread. `aes_key` is present only when the client negotiated
-/// AES-CBC audio; `rikeyid` seeds its per-packet IV.
+/// AES-CBC audio; `rikeyid` seeds its per-packet IV. The thread is tracked on `media`, for
+/// `/resume` and the next PLAY to wait on.
 #[allow(clippy::too_many_arguments)] // one construction site (RTSP PLAY)
 pub fn start(
     running: Arc<AtomicBool>,
@@ -217,11 +218,9 @@ pub fn start(
     owner_ip: Option<std::net::IpAddr>,
     // Other half of the endpoint guard beside `owner_ip`.
     av_ping: [u8; super::AV_PING_LEN],
-    // Last act of this thread: `/resume` waits on `AppState::media_exited`.
-    media_exited: Arc<std::sync::atomic::AtomicU64>,
+    media: &crate::host::MediaThreads,
 ) {
-    let exited = media_exited.clone();
-    if std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("punktfunk-audio".into())
         .spawn(move || {
             tracing::info!(?params, "audio stream starting");
@@ -239,13 +238,9 @@ pub fn start(
             }
             running.store(false, Ordering::SeqCst);
             tracing::info!("audio stream stopped");
-            media_exited.fetch_add(1, Ordering::SeqCst);
-        })
-        .is_err()
-    {
-        // Never started, so it will not count its exit: count it here, or every later
-        // launch waits out its deadline for this thread.
-        exited.fetch_add(1, Ordering::SeqCst);
+        }) {
+        Ok(thread) => media.track(thread),
+        Err(e) => tracing::warn!(error = %e, "audio thread did not start"),
     }
 }
 

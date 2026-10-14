@@ -23,7 +23,9 @@ use pf_vaapi::vpp;
 use pf_zerocopy::gbm::{GbmBo, GbmDevice, GBM_BO_USE_RENDERING};
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
-use crate::rfi::{self, plan_slot_recovery, Wave, WaveMark};
+use crate::rfi::{
+    self, plan_slot_recovery, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, WaveMark,
+};
 
 /// Slots a session keeps: how far back a recovery anchor may reach. A report
 /// names frames the client missed two frames ago and spends a round trip
@@ -38,17 +40,13 @@ pub struct NativeVaapiEncoder {
     codec: CodecParams,
     hdr: Option<HdrStatic>,
     force_kf: bool,
-    /// A loss plan's anchor, consumed by the next submit.
+    /// A loss plan's anchor, consumed by the next picture that encodes.
     anchor: Option<usize>,
     /// The newest frame the client confirmed, while the host holds confirmed references.
     reference_floor: Option<crate::Acked>,
     /// Intra refresh wave in flight: the rung a loss with no anchor takes instead of the
-    /// IDR. An anchor or a forced IDR abandons it; a loss reported while it runs spoils it
-    /// and queues a fresh one behind it, never a restart: iHD tracks each reference's
-    /// refreshed rows itself and a stripe that jumps back to the top never heals there.
-    wave: Option<Wave>,
-    wave_spoiled: bool,
-    wave_queued: bool,
+    /// IDR ([`recovery_policy`]).
+    recovery: Recovery,
     /// The host's wire index minus the session's own picture count.
     wire_offset: i64,
     frames: u64,
@@ -120,9 +118,7 @@ impl NativeVaapiEncoder {
             force_kf: true,
             anchor: None,
             reference_floor: None,
-            wave: None,
-            wave_spoiled: false,
-            wave_queued: false,
+            recovery: Recovery::default(),
             wire_offset: 0,
             frames: 0,
             meta: VecDeque::new(),
@@ -312,6 +308,19 @@ pub fn probe_can_encode(codec: Codec, ten_bit: bool) -> bool {
         .unwrap_or(false)
 }
 
+/// How a session recovers. iHD tracks each reference's refreshed rows itself and a stripe
+/// that jumps back to the top never heals there, so a loss mid-wave queues a fresh wave
+/// behind the one in flight. There is no wave before the first picture.
+fn recovery_policy(session: &Session, params: &SessionParams) -> RecoveryPolicy {
+    let fps = (params.fps_num / params.fps_den.max(1)).max(1);
+    RecoveryPolicy {
+        cycle: (rfi::wave_enabled() && session.next_wire() > 0)
+            .then(|| rfi::wave_cycle(session.wave_rows(), fps, u32::MAX, rfi::pinned_cycle())),
+        mid_wave: MidWave::Queue,
+        abandons: true,
+    }
+}
+
 /// What `poll` pairs back to a collected picture. `source_hold` is the deferred-requeue
 /// hold of a direct-ingested dmabuf: kept in the queue until `collect` synced the encode,
 /// it makes the producer's rewrite wait out the GPU read.
@@ -420,24 +429,28 @@ impl Encoder for NativeVaapiEncoder {
         };
         // The link loses packets: the newest picture the client confirmed, as an anchor.
         // None resident keeps the chain.
-        if let Some(acked) = self.reference_floor.filter(|_| self.anchor.is_none()) {
-            let refs: Vec<(usize, i64)> = session
-                .slots()
-                .into_iter()
-                .map(|(slot, wire)| (slot, wire + self.wire_offset))
-                .collect();
-            self.anchor = rfi::pick_acked(&refs, &acked).map(|(slot, _)| slot);
-        }
-        if self.force_kf || self.anchor.is_some() {
-            self.wave = None;
-            self.wave_spoiled = false;
-            self.wave_queued = false;
-        }
-        let wave = self.wave;
-        let mark = wave.map_or(WaveMark::None, |w| w.mark(self.wave_spoiled));
+        let confirmed = self
+            .reference_floor
+            .filter(|_| self.anchor.is_none())
+            .and_then(|acked| {
+                let refs: Vec<(usize, i64)> = session
+                    .slots()
+                    .into_iter()
+                    .map(|(slot, wire)| (slot, wire + self.wire_offset))
+                    .collect();
+                rfi::pick_acked(&refs, &acked).map(|(slot, _)| slot)
+            });
+        let pending = Pending {
+            idr: self.force_kf,
+            anchor: self.anchor.is_some(),
+            acked: confirmed.is_some(),
+            loss: false,
+        };
+        let policy = recovery_policy(session, &self.params);
+        let plan = rfi::plan_frame(self.recovery, pending, &policy);
+        let slot = self.anchor.or(confirmed);
         // An owed IDR outranks a recovery anchor, as on NVENC and Vulkan.
-        let anchor = self.anchor.take().filter(|_| !self.force_kf);
-        match (anchor, wave) {
+        match (slot.filter(|_| plan.refs != FrameRef::Idr), plan.wave) {
             (Some(slot), _) => session.encode_anchored(slot)?,
             (None, Some(w)) => {
                 let (first_row, rows) = w.stripe(session.wave_rows());
@@ -446,25 +459,20 @@ impl Encoder for NativeVaapiEncoder {
                     rows: rows as u16,
                 };
                 // A spoiled close still leans on the lost frame: never an anchor.
-                session.encode_wave(stripe, !w.closes() || self.wave_spoiled)?
+                session.encode_wave(stripe, plan.dirty)?
             }
-            (None, None) => session.encode(self.force_kf)?,
+            (None, None) => session.encode(plan.refs == FrameRef::Idr)?,
         }
+        // The picture is in: spend the plan. A failed encode above leaves the anchor, the
+        // owed IDR and the wave as they were, and the retry plans the same frame.
+        self.anchor = None;
         self.force_kf = false;
-        if let Some(w) = wave {
-            self.wave = w.next();
-            if self.wave.is_none() {
-                self.wave_spoiled = false;
-                if std::mem::take(&mut self.wave_queued) {
-                    self.wave = Some(Wave::start(w.cycle));
-                }
-            }
-        }
+        self.recovery = plan.next;
         let pts_ns = self.frames * 1_000_000_000 / u64::from(self.params.fps_num.max(1));
         self.frames += 1;
         self.meta.push_back(PendingMeta {
             pts_ns,
-            mark,
+            mark: plan.mark,
             source_hold,
         });
         Ok(())
@@ -527,30 +535,20 @@ impl Encoder for NativeVaapiEncoder {
         if self.anchor.is_some() {
             return true;
         }
-        if rfi::wave_enabled() && session.next_wire() > 0 {
-            if self.wave.is_some() {
-                // The client re-armed at this loss: this wave runs out unmarked and a
-                // fresh one, whose start and close it counts, starts behind it.
-                self.wave_spoiled = true;
-                self.wave_queued = true;
-                tracing::debug!(first, last, "vaapi-native RFI: loss mid-wave — wave queued");
-                return true;
-            }
-            // No anchor, but a wave heals without one.
-            let cycle = rfi::wave_cycle(
-                session.wave_rows(),
-                (self.params.fps_num / self.params.fps_den.max(1)).max(1),
-                u32::MAX,
-                rfi::pinned_cycle(),
-            );
-            self.wave = Some(Wave::start(cycle));
+        // No anchor, but a wave heals without one. The client re-armed at this loss, so one
+        // in flight runs out unmarked and a fresh one, whose start and close it counts,
+        // starts behind it.
+        let policy = recovery_policy(session, &self.params);
+        if let Some(next) = self.recovery.lose(&policy, true) {
             tracing::debug!(
                 first,
                 last,
-                cycle,
-                "vaapi-native RFI: no reference older than the loss — starting an intra \
-                 refresh wave instead of an IDR"
+                mid_wave = self.recovery.wave.is_some(),
+                cycle = ?policy.cycle,
+                "vaapi-native RFI: no reference older than the loss — an intra refresh wave \
+                 instead of an IDR"
             );
+            self.recovery = next;
             return true;
         }
         tracing::debug!(
@@ -622,9 +620,7 @@ impl Encoder for NativeVaapiEncoder {
         self.session = None;
         self.meta.clear();
         self.anchor = None;
-        self.wave = None;
-        self.wave_spoiled = false;
-        self.wave_queued = false;
+        self.recovery = Recovery::default();
         self.force_kf = true;
         true
     }
@@ -794,7 +790,10 @@ mod tests {
         assert!(recovery.recovery_anchor && !recovery.keyframe);
         // Everything is tainted: no anchor, so a wave answers instead of the IDR.
         assert!(enc.invalidate_ref_frames(100, 110));
-        assert!(enc.wave.is_some(), "the wave starts where the IDR used to");
+        assert!(
+            enc.recovery.wave.is_some(),
+            "the wave starts where the IDR used to"
+        );
         assert!(enc.reset());
         enc.submit(&frame(11)).expect("submit after reset");
         assert!(
@@ -844,7 +843,7 @@ mod tests {
                     enc.invalidate_ref_frames(0, WAVE_START as i64 - 1),
                     "a wave-capable encoder answers an RFI with no anchor"
                 );
-                let w = enc.wave.expect("the wave is armed");
+                let w = enc.recovery.wave.expect("the wave is armed");
                 assert_eq!(w.index, 0);
                 cycle = w.cycle as usize;
                 if restart {
@@ -862,8 +861,15 @@ mod tests {
                     enc.invalidate_ref_frames(lost, lost),
                     "a loss inside the sweep"
                 );
-                assert!(enc.wave_spoiled && enc.wave_queued, "spoiled, one queued");
-                assert_eq!(enc.wave.map(|w| w.index), Some(2), "the sweep runs on");
+                assert!(
+                    enc.recovery.spoiled && enc.recovery.queued,
+                    "spoiled, one queued"
+                );
+                assert_eq!(
+                    enc.recovery.wave.map(|w| w.index),
+                    Some(2),
+                    "the sweep runs on"
+                );
             }
             let after_wave = start2 + cycle; // the plain P after the close
             let anchor_p = after_wave + 1;
@@ -884,7 +890,7 @@ mod tests {
         let close = start2 + cycle - 1;
         let after_wave = close + 1;
         let anchor_p = after_wave + 1;
-        assert!(enc.wave.is_none(), "the wave closed");
+        assert!(enc.recovery.wave.is_none(), "the wave closed");
         assert!(aus[0].keyframe, "frame 0 is the IDR");
         for (i, au) in aus.iter().enumerate().skip(1) {
             assert!(!au.data.is_empty(), "AU {i} empty");

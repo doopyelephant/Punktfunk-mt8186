@@ -136,18 +136,14 @@ pub(super) struct StreamState {
     pub(super) last_cadence_log: Option<std::time::Instant>,
     pub(super) cadence_flips_suppressed: u32,
 
-    // ---- teardown order, which is field order: the status registration ends first, then
-    // the send thread, then game policy, then capture, encoder, display ----
+    // ---- teardown order, which is field order: the send thread first, so the summary the
+    // registration emits holds its last counters; then game policy, capture, encoder, display ----
     pub(super) _watcher: Option<std::thread::JoinHandle<()>>,
     /// `Some(joined)` on the seat's own session, which follows the seat's mode.
     #[cfg(target_os = "linux")]
     pub(super) seat_join: Option<bool>,
+    pub(super) send: super::send::SendThread,
     pub(super) live_session: crate::session_status::LiveSessionGuard,
-    // ---- the send thread ----
-    /// The one strong handle: a client's NACK reaches the send thread through a weak one,
-    /// so dropping this still ends the thread.
-    pub(super) frame_tx: Arc<std::sync::mpsc::SyncSender<SendMsg>>,
-    pub(super) send_thread: std::thread::JoinHandle<()>,
     pub(super) send_spread_us: Arc<AtomicU32>,
     pub(super) wire_rekeys: Arc<AtomicU32>,
     pub(super) live_mode: Arc<AtomicU64>,
@@ -192,11 +188,9 @@ pub(super) struct StreamState {
 
     // ---- fixed for the session ----
     pub(super) plan: crate::session_plan::SessionPlan,
-    pub(super) stop: Arc<AtomicBool>,
-    pub(super) quit: Arc<AtomicBool>,
-    /// Why this session ended, for its summary. First write wins, so the path that knows
-    /// (game exit, operator stop, the peer's own close) beats the loop's clean tail.
-    pub(super) end_reason: Arc<std::sync::atomic::AtomicU8>,
+    /// The flags every thread reads, and `end`, which the path that knows why calls first:
+    /// a game exit, an operator stop, the peer's own close beat the loop's clean tail.
+    pub(super) life: crate::lifecycle::Lifecycle,
     /// Session totals; this loop notes every encoder rate it adopts.
     pub(super) counters: Arc<crate::session_status::SessionCounters>,
     pub(super) conn: super::super::link::SessionLink,
@@ -353,9 +347,7 @@ impl StreamState {
                     session: punched_session,
                     mode,
                     seconds,
-                    stop,
-                    quit,
-                    end_reason,
+                    life,
                     counters,
                     ends:
                         StreamEnds {
@@ -439,6 +431,9 @@ impl StreamState {
             #[cfg(target_os = "linux")]
             follows_seat,
         } = ctx;
+        // The raw flags, for the display, the prep retries and the threads that poll one.
+        let stop = life.stop_flag().clone();
+        let quit = life.quit_flag().clone();
         // The data plane is punched and idle until the send thread starts.
         // Answer the client's bring-up ramp on it meanwhile: it measures the
         // link with no video to damage, and hands both back below.
@@ -616,8 +611,7 @@ impl StreamState {
             cur_display_gen,
             mode,
             &conn,
-            &stop,
-            &end_reason,
+            &life,
             launch_target.as_ref(),
             &launch_owner,
             launch_claim,
@@ -686,8 +680,7 @@ impl StreamState {
             mode: live_mode.clone(),
             bitrate_kbps: live_bitrate.clone(),
             codec: plan.codec,
-            stop: stop.clone(),
-            quit: quit.clone(),
+            life: life.clone(),
             force_idr: force_idr.clone(),
             client: client_label,
             client_name,
@@ -701,7 +694,6 @@ impl StreamState {
             controls,
             bit_depth,
             chroma: plan.chroma,
-            end_reason: end_reason.clone(),
             counters: counters.clone(),
             peer: Some(conn.remote_address().ip()),
         });
@@ -712,9 +704,7 @@ impl StreamState {
         let now = std::time::Instant::now();
         Ok(Self {
             plan,
-            stop,
-            quit,
-            end_reason,
+            life,
             counters,
             conn,
             negotiated: mode,
@@ -757,8 +747,7 @@ impl StreamState {
             reconfig_result_tx,
             retarget_tx,
             gap_tx,
-            frame_tx,
-            send_thread,
+            send: super::send::SendThread::new(frame_tx, send_thread),
             send_spread_us,
             wire_rekeys,
             live_mode,
@@ -865,10 +854,10 @@ impl StreamState {
         if let Some(joined) = self.seat_join {
             let (session_tx, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
             self.session_rx = session_rx;
-            let stop = self.stop.clone();
+            let life = self.life.clone();
             crate::seats::session_switch::follow(Box::new(move |game| {
                 if joined {
-                    stop.store(true, Ordering::SeqCst);
+                    life.end(crate::events::SessionEndReason::HostEnded);
                     return false;
                 }
                 session_tx.send(SessionSwitch::seat(game)).is_ok()
@@ -881,24 +870,27 @@ impl StreamState {
         tracing::info!("session watcher on — following a mid-stream Gaming↔Desktop switch");
         let (session_tx, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
         self.session_rx = session_rx;
-        let stop = self.stop.clone();
+        let stop = self.life.stop_flag().clone();
         self._watcher = std::thread::Builder::new()
             .name("punktfunk1-watcher".into())
             .spawn(move || session_watcher_loop(session_tx, stop))
             .ok();
     }
 
-    /// The tick loop, then the drain. Every phase is a method; the order is the contract.
-    ///
-    /// Reaching the tail is what makes the end clean: it hands the registry this session's
-    /// totals and latches `host_ended`. Any earlier exit leaves both unset, and the summary
-    /// reads that as `host_error`.
+    /// The tick loop, then [`Self::finish`]. Every phase is a method; the order is the contract.
     pub(super) fn run(mut self) -> Result<()> {
         // Concurrent sessions interleave in one log; this stamps every line below with
         // the id `/status` reports. Sync body, so the guard never straddles an await.
         let _session_span = tracing::info_span!("session", id = self.live_session.id).entered();
+        self.life.enter(crate::lifecycle::Phase::Streaming);
         self.spawn_session_watcher();
-        while !self.stop.load(Ordering::SeqCst) && std::time::Instant::now() < self.deadline {
+        let result = self.tick_loop();
+        self.finish(result.is_ok());
+        result
+    }
+
+    fn tick_loop(&mut self) -> Result<()> {
+        while !self.life.stopping() && std::time::Instant::now() < self.deadline {
             self.on_session_switch();
             self.on_mode_switch();
             self.on_topology_reassert()?;
@@ -924,9 +916,19 @@ impl StreamState {
             self.adapt_depth();
             self.sleep_to_next(t_cap, repeat);
         }
-        self.drain();
-        drop(self.frame_tx);
-        let _ = self.send_thread.join();
+        Ok(())
+    }
+
+    /// Both ends reach this: the clean tail and a `?` out of the loop. A clean loop drains
+    /// the encoder (an errored one is not polled); then the send thread is joined, the
+    /// registry gets this session's totals, and the reason is latched. Only a panic skips
+    /// it, which the summary reads as `host_error`; the send thread's own drop joins it then.
+    pub(super) fn finish(mut self, clean: bool) {
+        self.life.enter(crate::lifecycle::Phase::Ending);
+        if clean {
+            self.drain();
+        }
+        self.send.join();
         // Source against wire: `source_seq` is what DWM composed into the driver's pool,
         // `dropped` what the pool refused. A source under the refresh rate is the desktop.
         let src = self.capturer.health();
@@ -945,8 +947,11 @@ impl StreamState {
                 path_mtu: self.conn.current_mtu(),
             },
         );
-        crate::events::SessionEndReason::HostEnded.latch(&self.end_reason);
-        Ok(())
+        self.life.end(if clean {
+            crate::events::SessionEndReason::HostEnded
+        } else {
+            crate::events::SessionEndReason::HostError
+        });
     }
 }
 
@@ -1030,8 +1035,7 @@ fn spawn_launch_and_lease(
     cur_display_gen: Option<u64>,
     mode: punktfunk_core::Mode,
     conn: &crate::native::link::SessionLink,
-    stop: &Arc<AtomicBool>,
-    end_reason: &Arc<std::sync::atomic::AtomicU8>,
+    life: &crate::lifecycle::Lifecycle,
     launch_target: Option<&crate::library::LaunchTarget>,
     launch_owner: &crate::session_launch::LaunchOwner,
     launch_claim: Option<crate::launchreg::Claim>,
@@ -1120,15 +1124,11 @@ fn spawn_launch_and_lease(
 
     let end_on_game_exit = {
         let conn = conn.clone();
-        let stop = stop.clone();
-        let quit = quit.clone();
-        let end_reason = end_reason.clone();
+        let life = life.clone();
         crate::session_launch::end_on_game_exit(move || {
             tracing::info!("the launched game exited — ending the session cleanly (APP_EXITED)");
-            crate::events::SessionEndReason::GameExited.latch(&end_reason);
+            life.end(crate::events::SessionEndReason::GameExited);
             conn.close(punktfunk_core::quic::APP_EXITED_CLOSE_CODE, b"game exited");
-            quit.store(true, Ordering::SeqCst);
-            stop.store(true, Ordering::SeqCst);
         })
     };
 
@@ -1188,7 +1188,7 @@ fn spawn_launch_and_lease(
     // closes the connection.
     #[cfg(target_os = "linux")]
     if let Some(appid) = steam_exit_appid {
-        let stop = stop.clone();
+        let stop = life.stop_flag().clone();
         let end = end_on_game_exit.clone();
         let seat = seat.clone();
         let game = game_shared.clone();
