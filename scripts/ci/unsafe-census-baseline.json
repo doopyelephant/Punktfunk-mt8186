@@ -1,7 +1,17 @@
 {
   "metric": "shipped_nonffi_unsafe_ops",
   "crates": {
-    "crates/codec/pf-libva": 16,
+    "clients/android/native": 68,
+    "clients/apple/native": 16,
+    "clients/linux": 1,
+    "clients/windows": 2,
+    "crates/client/pf-client-core": 4,
+    "crates/client/pf-client-video": 16,
+    "crates/client/pf-console-ui": 1,
+    "crates/client/punktfunk-ffi": 97,
+    "crates/codec/pf-libva": 7,
+    "crates/codec/pf-v4l2": 4,
+    "crates/codec/pf-vkdecode": 5,
     "crates/core/pf-dmabuf": 3,
     "crates/core/punktfunk-core": 13,
     "crates/host/pf-audio": 23,
@@ -15,6 +25,7 @@
     "crates/host/pf-frame": 4,
     "crates/host/pf-inject": 18,
     "crates/host/pf-paths-win": 7,
+    "crates/host/pf-seat-audio": 17,
     "crates/host/pf-seats": 24,
     "crates/host/pf-vdisplay": 8,
     "crates/host/pf-win-display": 18,
@@ -22,6 +33,7 @@
     "crates/host/punktfunk-capture-worker": 3,
     "crates/host/punktfunk-host": 62,
     "crates/install/punktfunk-tray": 7,
-    "packaging/windows/drivers": 55
+    "packaging/windows/drivers": 55,
+    "packaging/windows/pf-vkhdr-layer": 38
   }
 }
