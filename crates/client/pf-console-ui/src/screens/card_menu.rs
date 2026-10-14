@@ -12,12 +12,14 @@
 use crate::glyphs::{Hint, HintKey};
 use crate::library::LibraryGame;
 use crate::model::{ConsoleCmd, HostRow};
+use crate::platform::Platform;
 use crate::pointer::Pointer;
 use crate::screens::profiles::ProfileBook;
-use crate::screens::{Ctx, Outbox, Screen, ScreenView};
+use crate::screens::{Ctx, Device, Outbox, Screen, ScreenView};
 use crate::store::SettingsStore;
 use crate::theme::{edge, fg, Fonts, W};
 use crate::widgets::{blurb, ListMsg, MenuList, RowSpec, TabStrip, TAB_STRIP_H};
+use pf_client_core::console::OverlayAction;
 use pf_client_core::library::InstallAction;
 use pf_client_core::menu_nav::{MenuDir, MenuEvent, MenuPulse};
 use pf_client_core::start;
@@ -33,6 +35,10 @@ enum Action {
     SwitchProfile,
     Wake,
     CopyLink,
+    /// A home-screen shortcut that opens the title. Android off TV only.
+    HomeScreen,
+    /// The title's link as a launcher file a frontend opens. Android off TV only.
+    LauncherFile,
     Details,
     Unpin,
     Pair,
@@ -198,12 +204,21 @@ impl CardMenu {
             .unwrap_or_default()
     }
 
-    /// The rows this menu offers. A TV has no clipboard, so no Copy link.
-    fn actions(&self, store: &dyn SettingsStore, book: &ProfileBook, tv: bool) -> Vec<Action> {
+    /// The rows this menu offers. A TV has no clipboard, so no Copy link; home-screen
+    /// shortcuts and launcher files are Android's, off TV.
+    fn actions(
+        &self,
+        store: &dyn SettingsStore,
+        book: &ProfileBook,
+        device: &Device,
+    ) -> Vec<Action> {
         let mut rows = self.all_actions(store, book);
-        if tv {
-            rows.retain(|a| *a != Action::CopyLink);
-        }
+        let handheld = device.platform == Platform::Android && !device.tv;
+        rows.retain(|a| match a {
+            Action::CopyLink => !device.tv,
+            Action::HomeScreen | Action::LauncherFile => handheld,
+            _ => true,
+        });
         rows
     }
 
@@ -238,6 +253,8 @@ impl CardMenu {
                     Action::Favorite,
                     Action::BindPreset,
                     Action::CopyLink,
+                    Action::HomeScreen,
+                    Action::LauncherFile,
                 ];
                 rows.extend(
                     game.install
@@ -337,6 +354,8 @@ impl CardMenu {
             Action::SwitchProfile => "refresh-cw",
             Action::Wake => "power",
             Action::CopyLink => "link",
+            Action::HomeScreen => "house",
+            Action::LauncherFile => "save",
             Action::Clipboard => "copy",
             Action::Details => "info",
             Action::Unpin | Action::Pin(_) => "pin",
@@ -385,6 +404,8 @@ impl CardMenu {
             Action::SwitchProfile => "Switch profile\u{2026}".into(),
             Action::Wake => "Wake host".into(),
             Action::CopyLink => "Copy link".into(),
+            Action::HomeScreen => "Add to home screen".into(),
+            Action::LauncherFile => "Save launcher file\u{2026}".into(),
             Action::Details => "Host details\u{2026}".into(),
             Action::Unpin => "Unpin card".into(),
             Action::Pair if self.host().paired => "Pair again\u{2026}".into(),
@@ -512,6 +533,16 @@ impl CardMenu {
         }
     }
 
+    /// What a shortcut or launcher file is called: the title, or the host for its desktop.
+    fn link_title(&self) -> String {
+        match &self.subject {
+            Subject::Game { game, .. } if game.id != crate::library::DESKTOP_ID => {
+                game.title.clone()
+            }
+            Subject::Game { host, .. } | Subject::Host(host) => host.name.clone(),
+        }
+    }
+
     /// A connect with `preset`: a poster's launches its title, a card's the host alone.
     fn connect(&self, preset: Option<String>) -> super::ConnectIntent {
         let game = match &self.subject {
@@ -623,6 +654,20 @@ impl CardMenu {
                     Some(url) => {
                         fx.copy = Some(url);
                         fx.toast = Some("Link copied".into());
+                    }
+                    None => fx.toast = Some("This host isn't saved any more".into()),
+                }
+                fx.pop();
+            }
+            // No toast: the OS's own confirmation or save dialog follows.
+            Action::HomeScreen | Action::LauncherFile => {
+                match self.link(store) {
+                    Some(url) => {
+                        let title = self.link_title();
+                        fx.action = Some(match action {
+                            Action::HomeScreen => OverlayAction::PinShortcut { url, title },
+                            _ => OverlayAction::SaveLauncherFile { url, title },
+                        });
                     }
                     None => fx.toast = Some("This host isn't saved any more".into()),
                 }
@@ -862,7 +907,7 @@ impl ScreenView for CardMenu {
                 _ => {}
             }
         }
-        let actions = self.actions(ctx.store, ctx.profiles, ctx.device.tv);
+        let actions = self.actions(ctx.store, ctx.profiles, ctx.device);
         let (msg, pulse) = self.list.menu(ev, actions.len());
         self.dispatch(msg, pulse, &actions, ctx, fx)
     }
@@ -879,7 +924,7 @@ impl ScreenView for CardMenu {
                 self.strip_focus = false;
             }
         }
-        let actions = self.actions(ctx.store, ctx.profiles, ctx.device.tv);
+        let actions = self.actions(ctx.store, ctx.profiles, ctx.device);
         let (msg, pulse) = self.list.pointer(p, actions.len());
         if matches!(msg, ListMsg::None) && pulse.is_none() {
             return false;
@@ -921,7 +966,7 @@ impl ScreenView for CardMenu {
         };
         let strip_top = list_rect.top;
         list_rect.top += strip_h as f32;
-        let actions = self.actions(ctx.store, ctx.profiles, ctx.device.tv);
+        let actions = self.actions(ctx.store, ctx.profiles, ctx.device);
         let rows: Vec<RowSpec> = actions
             .iter()
             .map(|&a| {
@@ -1052,10 +1097,14 @@ mod tests {
     }
 
     fn rows(s: &CardMenu) -> Vec<Action> {
+        rows_on(s, &Device::test())
+    }
+
+    fn rows_on(s: &CardMenu, device: &Device) -> Vec<Action> {
         s.actions(
             crate::store::file_store(),
             &crate::screens::profiles::NO_PROFILES,
-            false,
+            device,
         )
     }
 
@@ -1186,7 +1235,7 @@ mod tests {
         let book =
             crate::screens::profiles::ProfileBook::with("aa", vec![profile("own"), profile("kid")]);
         assert_eq!(
-            CardMenu::for_host(&asked).actions(crate::store::file_store(), &book, false),
+            CardMenu::for_host(&asked).actions(crate::store::file_store(), &book, &Device::test()),
             vec![ConnectWith, Browse, SwitchProfile, Wake, CopyLink, Details],
             "two listed profiles are a choice"
         );
@@ -1698,19 +1747,89 @@ mod tests {
     #[test]
     fn a_tv_offers_no_copy_link() {
         let menu = CardMenu::for_host(&host());
-        let desk = menu.actions(
-            crate::store::file_store(),
-            &crate::screens::profiles::NO_PROFILES,
-            false,
-        );
-        let tv = menu.actions(
-            crate::store::file_store(),
-            &crate::screens::profiles::NO_PROFILES,
-            true,
+        let desk = rows(&menu);
+        let tv = rows_on(
+            &menu,
+            &Device {
+                tv: true,
+                ..Device::test()
+            },
         );
         assert!(desk.contains(&Action::CopyLink));
         assert!(!tv.contains(&Action::CopyLink));
         assert_eq!(desk.len(), tv.len() + 1);
+    }
+
+    /// An Android handheld's title card offers a home-screen shortcut and a launcher file; a
+    /// TV, the desktop and the four-row poster menu do not. Each hands the OS the title's link.
+    #[test]
+    fn android_hands_a_titles_link_to_the_home_screen_or_a_launcher_file() {
+        use pf_client_core::trust::{KnownHost, KnownHosts, Settings};
+        let out = [Action::HomeScreen, Action::LauncherFile];
+        let card = |g: &LibraryGame| {
+            CardMenu::on(CardMenu::for_game(&host(), g, None).subject, Mode::Details)
+        };
+        let phone = Device {
+            platform: Platform::Android,
+            ..Device::test()
+        };
+        let tv = Device {
+            tv: true,
+            ..phone.clone()
+        };
+        let offers = |s: &CardMenu, d: &Device| rows_on(s, d).iter().any(|a| out.contains(a));
+        assert!(out
+            .iter()
+            .all(|a| rows_on(&card(&game()), &phone).contains(a)));
+        assert!(!offers(&card(&game()), &tv));
+        assert!(!offers(&card(&game()), &Device::test()));
+        assert!(!offers(&CardMenu::for_game(&host(), &game(), None), &phone));
+
+        let store = std::sync::Arc::new(crate::store::SnapshotStore::new(
+            Settings::default(),
+            Vec::new(),
+        ));
+        store.set_known_hosts(KnownHosts {
+            hosts: vec![KnownHost {
+                name: "Desk".into(),
+                addr: "10.0.0.5".into(),
+                port: 9777,
+                fp_hex: "aa".into(),
+                paired: true,
+                ..Default::default()
+            }],
+        });
+        let mut settings = Settings::default();
+        let library = crate::library::LibraryShared::default();
+        let mut ctx = Ctx {
+            store: store.as_ref(),
+            device: &phone,
+            ..Ctx::test(&mut settings, &library)
+        };
+        let mut fx = Outbox::default();
+        card(&game()).run(Action::HomeScreen, &mut ctx, &mut fx);
+        match fx.action {
+            Some(OverlayAction::PinShortcut { url, title }) => {
+                assert!(url.starts_with("punktfunk://connect/") && url.contains("367520"));
+                assert_eq!(title, "Hollow Knight");
+            }
+            other => panic!("expected a shortcut, got {other:?}"),
+        }
+        assert!(fx.toast.is_none() && matches!(fx.nav, Some(Nav::Pop)));
+
+        let desktop = LibraryGame {
+            id: crate::library::DESKTOP_ID.into(),
+            title: "Desktop".into(),
+            ..game()
+        };
+        let mut fx = Outbox::default();
+        card(&desktop).run(Action::LauncherFile, &mut ctx, &mut fx);
+        assert!(
+            matches!(&fx.action, Some(OverlayAction::SaveLauncherFile { url, title })
+                if title == "Desk" && !url.contains("launch=")),
+            "the desktop's file is its host's link, named after it: {:?}",
+            fx.action
+        );
     }
 
     /// A paired host's Pairing tab offers Unpair beside Pair again; it arms, then sends one

@@ -1538,6 +1538,9 @@ impl Shell {
         if let Some(text) = fx.copy {
             self.actions.push_back(OverlayAction::CopyText(text));
         }
+        if let Some(action) = fx.action {
+            self.actions.push_back(action);
+        }
         if let Some(intent) = fx.connect {
             self.start_connect(intent);
         }

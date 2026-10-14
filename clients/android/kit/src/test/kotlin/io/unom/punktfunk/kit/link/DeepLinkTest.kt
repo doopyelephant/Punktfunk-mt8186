@@ -202,6 +202,14 @@ class DeepLinkResolutionTest {
         assertNull(DeepLinks.forHost(hosts[1]).fp)
     }
 
+    /** The desktop tile's NUL id would make the parser refuse the link; its link is the host's. */
+    @Test
+    fun theDesktopTilesLinkIsTheHosts() {
+        val link = DeepLinks.forHost(desk, launch = io.unom.punktfunk.kit.library.GameEntry.DESKTOP_ID)
+        assertNull(link.launch)
+        assertTrue(DeepLinks.parse(link.toUrl()) is DeepLinkResult.Parsed)
+    }
+
     private fun host(name: String, addr: String, id: String, fp: String) =
         KnownHost(addr, DeepLinks.DEFAULT_PORT, name, fp, paired = true, id = id)
 }
