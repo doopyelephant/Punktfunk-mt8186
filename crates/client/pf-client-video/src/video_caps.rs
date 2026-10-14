@@ -44,9 +44,8 @@ fn v4l2_summary(vk: Option<&VulkanDecodeDevice>) -> V4l2Summary {
     V4l2Summary::default()
 }
 
-/// One decode rung, named so evidence and admission can talk without a
-/// per-platform [`Backend`](crate::video::Backend) variant. The CPU rung is in the
-/// table only ([`native_evidence`]).
+/// One decode rung, named so evidence, admission and the ladder share one
+/// vocabulary on every OS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeRung {
     /// pf-vkdecode on the presenter's device (`video_vk_native`).
@@ -62,15 +61,25 @@ pub enum NativeRung {
 }
 
 impl NativeRung {
+    /// The rung's two spellings: [`Self::name`], then [`Self::label`].
+    fn names(self) -> (&'static str, &'static str) {
+        match self {
+            NativeRung::Vulkan => ("native-vulkan", "native Vulkan Video"),
+            NativeRung::D3d11va => ("native-d3d11va", "native D3D11VA"),
+            NativeRung::Vaapi => ("native-vaapi", "native VAAPI"),
+            NativeRung::V4l2 => ("native-v4l2", "native V4L2"),
+            NativeRung::Software => ("software", "software"),
+        }
+    }
+
     /// Log / `PUNKTFUNK_DECODER` name — the same strings as the `stats:` decode-path tag.
     pub fn name(self) -> &'static str {
-        match self {
-            NativeRung::Vulkan => "native-vulkan",
-            NativeRung::D3d11va => "native-d3d11va",
-            NativeRung::Vaapi => "native-vaapi",
-            NativeRung::V4l2 => "native-v4l2",
-            NativeRung::Software => "software",
-        }
+        self.names().0
+    }
+
+    /// The rung as the demotion log lines name it.
+    pub(crate) fn label(self) -> &'static str {
+        self.names().1
     }
 }
 
