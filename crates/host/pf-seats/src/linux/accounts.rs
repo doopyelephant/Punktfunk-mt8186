@@ -214,9 +214,10 @@ pub(super) fn is_ordinary(passwd: &Passwd) -> bool {
     (1000..60000).contains(&passwd.uid) && !is_seat(passwd)
 }
 
-/// The owner's account for `account`: it must exist and be an ordinary user. Never created here,
-/// and never deleted.
+/// The owner's account for `account`: a Unix name, an existing user and an ordinary one. Never
+/// created here, and never deleted.
 pub(super) fn require_owner(account: &str) -> Result<Passwd, BackendError> {
+    check_name(account)?;
     match lookup(account)? {
         Some(found) if is_ordinary(&found) => Ok(found),
         Some(_) => Err(err(
@@ -360,6 +361,12 @@ mod tests {
         assert!(!is_ordinary(&row(60000, "")), "nobody and the above");
         assert!(!is_ordinary(&row(0, "root")));
         assert!(!is_ordinary(&row(1001, &marker(&id()))), "a seat's account");
+    }
+
+    /// An owner name `getent` could read as an option is refused before anything runs.
+    #[test]
+    fn an_owner_name_is_checked_before_any_lookup() {
+        assert_eq!(require_owner("-s").unwrap_err().code, "account_invalid");
     }
 
     #[test]
