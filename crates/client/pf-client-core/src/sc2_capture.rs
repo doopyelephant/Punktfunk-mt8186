@@ -1,8 +1,9 @@
-//! Raw passthrough for a Steam Controller 2 held by an SDL slot. SDL's Triton driver still
-//! feeds the typed plane (escape chord, ring, menus); a second hidapi handle on the same node
-//! forwards every input report to the host's as-is `28DE:1302` pad and replays Steam's writes on
-//! the physical controller. Trackpads, gyro and haptics exist only on this path: the host's typed
-//! fallback carries buttons, sticks and triggers. Core's send path gates each report
+//! Raw passthrough for a Steam Controller held by an SDL slot, either generation ([`Model`]).
+//! SDL's own driver still feeds the typed plane (escape chord, ring, menus); a second hidapi
+//! handle on the same node forwards every input report to the host's as-is pad (`28DE:1302`,
+//! or `28DE:1102` for the 2015 one) and replays Steam's writes on the physical controller.
+//! Trackpads, gyro and haptics exist only on this path: the host's typed fallback carries
+//! buttons, sticks and triggers. Core's send path gates each report
 //! ([`NativeClient::set_sc2_gate`]), as it does for the Apple and Android captures.
 
 use punktfunk_core::client::NativeClient;
@@ -43,6 +44,31 @@ pub(crate) fn is_sc2(pref: GamepadPref) -> bool {
     )
 }
 
+/// Which Steam Controller a capture holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Model {
+    /// The 2026 pad: on a cable, on Bluetooth, or one slot of a Puck.
+    Triton { puck: bool },
+    /// The 2015 pad on a cable or its dongle. Its reports and feature frames carry no id.
+    Classic,
+}
+
+/// The capture a slot gets: the pad in hand and the kind declared to the host are the same
+/// Steam Controller. A 2015 pad on Bluetooth frames its reports for the radio and stays typed.
+pub(crate) fn raw_model(pref: GamepadPref, declared: GamepadPref, pid: u16) -> Option<Model> {
+    match (pref, declared) {
+        (p, d) if is_sc2(p) && is_sc2(d) => Some(Model::Triton {
+            puck: p == GamepadPref::SteamController2Puck,
+        }),
+        (GamepadPref::SteamController, GamepadPref::SteamController)
+            if matches!(pid, 0x1102 | 0x1142) =>
+        {
+            Some(Model::Classic)
+        }
+        _ => None,
+    }
+}
+
 enum Cmd {
     Write(u8, Vec<u8>),
 }
@@ -56,28 +82,30 @@ pub(crate) struct Sc2Capture {
 impl Sc2Capture {
     /// `path` is the SDL slot's HID path. `None` when the node will not open (not a HIDAPI
     /// device, no permission): the slot keeps the typed plane.
-    /// `serial` is the pad's USB serial; `puck` marks a Puck slot. The reader sends the pad's
-    /// identity ([`NativeClient::send_pad_identity`]) before its first report.
+    /// `serial` is the pad's USB serial. The reader sends the pad's identity
+    /// ([`NativeClient::send_pad_identity`]) before its first report.
     pub(crate) fn open(
         path: &str,
         client: Arc<NativeClient>,
         pad: u8,
         serial: Option<String>,
-        puck: bool,
+        model: Model,
     ) -> Option<Sc2Capture> {
         let Some(dev) = Dev::open(path) else {
-            tracing::warn!(path, error = %sdl3::get_error(), "open steam controller 2 hid node");
+            tracing::warn!(path, error = %sdl3::get_error(), "open steam controller hid node");
             return None;
         };
-        dev.send_feature(&NORMALIZE_JOYSTICKS);
+        if matches!(model, Model::Triton { .. }) {
+            dev.send_feature(&NORMALIZE_JOYSTICKS);
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("pf-sc2-raw".into())
             .spawn(move || {
-                send_identity(&dev, &client, pad, serial.unwrap_or_default(), puck);
-                run(dev, &rx, &client, pad)
+                send_identity(&dev, &client, pad, serial.unwrap_or_default(), model);
+                run(dev, &rx, &client, pad, model)
             })
-            .map_err(|e| tracing::warn!(error = %e, "spawn steam controller 2 reader"))
+            .map_err(|e| tracing::warn!(error = %e, "spawn steam controller reader"))
             .ok()?;
         Some(Sc2Capture {
             tx,
@@ -142,15 +170,22 @@ impl Dev {
         u8::try_from(unsafe { (*info).interface_number }).unwrap_or(0)
     }
 
-    /// SET one feature query, then GET until the reply echoes its command, for up to a second:
-    /// a Puck stalls the GET until its pad answers over the radio.
-    fn exchange(&self, request: &[u8]) -> Option<Vec<u8>> {
-        let mut frame = [0u8; 64];
-        frame[..request.len()].copy_from_slice(request);
-        if self.send_feature(&frame) < 0 {
+    /// SET one feature query, then GET until the reply echoes its command: a Puck stalls the
+    /// GET until its pad answers over the radio, so the newer pad gets a second. The 2015 pad
+    /// gets 200 ms: its three queries must end inside the host's one-second wait.
+    fn exchange(&self, request: &[u8], model: Model) -> Option<Vec<u8>> {
+        let (sent, tries) = match model {
+            Model::Triton { .. } => {
+                let mut frame = [0u8; 64];
+                frame[..request.len()].copy_from_slice(request);
+                (self.send_feature(&frame), 50)
+            }
+            Model::Classic => (self.send_classic_feature(request), 10),
+        };
+        if sent < 0 {
             return None;
         }
-        for _ in 0..50 {
+        for _ in 0..tries {
             std::thread::sleep(std::time::Duration::from_millis(20));
             let mut buf = [0u8; 65];
             buf[0] = request[0];
@@ -166,6 +201,22 @@ impl Dev {
     fn send_feature(&self, r: &[u8]) -> i32 {
         // SAFETY: `self.0` is an open handle only this thread uses; `r` is valid for its length.
         unsafe { hid::SDL_hid_send_feature_report(self.0, r.as_ptr(), r.len()) }
+    }
+
+    /// A 2015 pad takes a feature report only as 65 bytes, id 0 first, and its dongle refuses
+    /// one while the radio is busy: retry for 25 ms, as SDL does.
+    fn send_classic_feature(&self, r: &[u8]) -> i32 {
+        let mut frame = [0u8; 65];
+        let n = r.len().min(frame.len());
+        frame[..n].copy_from_slice(&r[..n]);
+        for _ in 0..50 {
+            let sent = self.send_feature(&frame);
+            if sent >= 0 {
+                return sent;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+        -1
     }
 
     pub(crate) fn write(&self, kind: u8, r: &[u8]) -> i32 {
@@ -189,9 +240,15 @@ impl Drop for Dev {
 
 /// Read the pad's replies to core's feature queries and send them with its serial, so the host
 /// builds its virtual pad as this one.
-fn send_identity(dev: &Dev, client: &NativeClient, pad: u8, serial: String, puck: bool) {
-    let answered: Vec<(&[u8], Vec<u8>)> = punktfunk_core::client::sc2::identity_requests(puck)
-        .filter_map(|req| dev.exchange(req).map(|reply| (req, reply)))
+fn send_identity(dev: &Dev, client: &NativeClient, pad: u8, serial: String, model: Model) {
+    use punktfunk_core::client::sc2;
+    let requests: Vec<&[u8]> = match model {
+        Model::Triton { puck } => sc2::identity_requests(puck).collect(),
+        Model::Classic => sc2::classic_identity_requests().collect(),
+    };
+    let answered: Vec<(&[u8], Vec<u8>)> = requests
+        .into_iter()
+        .filter_map(|req| dev.exchange(req, model).map(|reply| (req, reply)))
         .collect();
     let replies = punktfunk_core::quic::pack_identity_replies(
         answered.iter().map(|(req, reply)| (*req, reply.as_slice())),
@@ -199,11 +256,12 @@ fn send_identity(dev: &Dev, client: &NativeClient, pad: u8, serial: String, puck
     tracing::info!(
         pad,
         serial,
+        ?model,
         replies = answered.len(),
-        "steam controller 2 identity read"
+        "steam controller identity read"
     );
     // A Puck's pad slots are its interfaces 2–5.
-    let slot = if puck {
+    let slot = if model == (Model::Triton { puck: true }) {
         dev.interface().saturating_sub(2).min(3)
     } else {
         0
@@ -215,19 +273,24 @@ fn send_identity(dev: &Dev, client: &NativeClient, pad: u8, serial: String, puck
         slot,
     };
     if let Err(error) = client.send_pad_identity(id) {
-        tracing::warn!(pad, %error, "steam controller 2 identity not sent");
+        tracing::warn!(pad, %error, "steam controller identity not sent");
     }
 }
 
-fn run(dev: Dev, rx: &Receiver<Cmd>, client: &NativeClient, pad: u8) {
+fn run(dev: Dev, rx: &Receiver<Cmd>, client: &NativeClient, pad: u8, model: Model) {
     let mut buf = [0u8; HID_REPORT_MAX];
     loop {
         loop {
             match rx.try_recv() {
                 Ok(Cmd::Write(kind, data)) => {
-                    if dev.write(kind, &data) < 0 {
-                        let id = data.first().copied().unwrap_or(0);
-                        tracing::debug!(pad, kind, id, "steam controller 2 write refused");
+                    let sent = match (model, kind) {
+                        (Model::Classic, HID_RAW_FEATURE) => dev.send_classic_feature(&data),
+                        _ => dev.write(kind, &data),
+                    };
+                    if sent < 0 {
+                        // Report id, then the command of a feature frame.
+                        let head = data.get(..2);
+                        tracing::debug!(pad, kind, ?head, "steam controller write refused");
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -240,7 +303,7 @@ fn run(dev: Dev, rx: &Receiver<Cmd>, client: &NativeClient, pad: u8) {
         };
         if n < 0 {
             // Unplug: SDL removes the slot too, which drops the capture.
-            tracing::info!(pad, "steam controller 2 hid node closed");
+            tracing::info!(pad, "steam controller hid node closed");
             return;
         }
         if n > 0 {
@@ -276,5 +339,37 @@ mod tests {
             Some(GamepadPref::SteamController2Puck)
         );
         assert_eq!(pref_for(0x28DE, 0x1205), None);
+    }
+
+    /// A raw capture needs the pad in hand and the declared kind to be the same Steam
+    /// Controller. The 2015 pad qualifies on its cable and its dongle, not on Bluetooth.
+    #[test]
+    fn raw_capture_follows_the_pad_and_the_declared_kind() {
+        use GamepadPref as P;
+        let puck = P::SteamController2Puck;
+        assert_eq!(
+            raw_model(P::SteamController2, P::SteamController2, 0x1302),
+            Some(Model::Triton { puck: false })
+        );
+        assert_eq!(
+            raw_model(puck, puck, 0x1304),
+            Some(Model::Triton { puck: true })
+        );
+        for pid in [0x1102, 0x1142] {
+            assert_eq!(
+                raw_model(P::SteamController, P::SteamController, pid),
+                Some(Model::Classic)
+            );
+        }
+        assert_eq!(
+            raw_model(P::SteamController, P::SteamController, 0x1106),
+            None
+        );
+        assert_eq!(
+            raw_model(P::SteamController, P::Xbox360, 0x1102),
+            None,
+            "a pad the player declared as something else stays typed"
+        );
+        assert_eq!(raw_model(P::Xbox360, P::SteamController, 0x028E), None);
     }
 }

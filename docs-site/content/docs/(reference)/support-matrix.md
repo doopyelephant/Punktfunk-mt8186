@@ -263,6 +263,8 @@ Apple is one app across macOS, iOS/iPadOS and tvOS. Android TV is the Android ap
 1. Several controllers, each on a stable slot. The pad-type picker on Linux, Windows and the
    console home offers Automatic, Xbox 360, Xbox One, DualSense, DualShock 4, Steam Deck and Steam
    Controller 2; Apple and Android offer the first six, with Steam Controller 2 as its own switch.
+   A 2015 Steam Controller on its cable or dongle passes through from the Linux and Windows
+   clients to a Linux host as itself, with nothing to set.
 2. DualSense and DualShock 4 touchpad and motion are forwarded, and adaptive triggers and the
    lightbar play back on a real DualSense. Any pad with a gyro sends motion. The host's virtual pad
    needs a gyro to use it: Xbox pads have none, and **Automatic** picks Xbox for pads it doesn't
