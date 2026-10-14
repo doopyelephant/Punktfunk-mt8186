@@ -58,10 +58,13 @@ struct Caps {
     omarchy: bool,
     /// The packaged root helper's unit exists.
     helper: bool,
-    /// The operator is in `punktfunk-update`, which polkit checks.
+    /// This process is in `punktfunk-update`, which polkit checks.
     opted_in: bool,
     /// Pacman's root-owned full-sysupgrade opt-in; the helper refuses pacman without it.
     pacman_optin: bool,
+    /// This host is the door, a system service as the `punktfunk` user: no group of the
+    /// operator's lets it start the helper, and the Deck's checkout is not its own.
+    door: bool,
 }
 
 impl Caps {
@@ -77,6 +80,7 @@ impl Caps {
                 // Both shell out or read root-owned config, and neither matters without a helper.
                 opted_in: helper && linux::opted_in(),
                 pacman_optin: helper && linux::pacman_opted_in(),
+                door: pf_paths::seat::role().is_door(),
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -108,7 +112,7 @@ fn helper_kind(kind: detect::InstallKind) -> bool {
 /// Group membership is not checked here: polkit enforces it when the helper starts.
 fn apply_leg(kind: detect::InstallKind, c: Caps) -> Option<Leg> {
     use detect::InstallKind as K;
-    if c.apply_disabled || c.omarchy {
+    if c.apply_disabled || c.omarchy || c.door {
         return None;
     }
     match kind {
@@ -133,12 +137,13 @@ fn support(kind: detect::InstallKind, c: Caps) -> &'static str {
 
 /// Joining `punktfunk-update` would turn the command into a button.
 fn opt_in_would_help(kind: detect::InstallKind, c: Caps) -> bool {
-    !c.apply_disabled && !c.omarchy && c.helper && !c.opted_in && helper_kind(kind)
+    !c.apply_disabled && !c.omarchy && !c.door && c.helper && !c.opted_in && helper_kind(kind)
 }
 
-/// Shown instead of an Apply button when joining the group would enable one.
+/// Shown instead of an Apply button when joining the group would enable one. The host picks the
+/// group up when it next starts with the computer.
 pub(crate) const OPT_IN_HINT: &str =
-    "sudo usermod -aG punktfunk-update $USER   # enables web-triggered updates for this host";
+    "sudo usermod -aG punktfunk-update $USER   # enables web-triggered updates after a restart";
 
 pub(crate) fn apply_support() -> &'static str {
     support(detect::detect().0, Caps::probe())
@@ -631,6 +636,7 @@ mod tests {
             helper: true,
             opted_in: true,
             pacman_optin: true,
+            door: false,
         }
     }
 
@@ -650,9 +656,9 @@ mod tests {
         ]
     };
 
-    /// The kill switch and Omarchy refuse every kind, in status and in apply alike.
+    /// The kill switch, Omarchy and the door refuse every kind, in status and in apply alike.
     #[test]
-    fn kill_switch_and_omarchy_refuse_every_leg() {
+    fn kill_switch_omarchy_and_the_door_refuse_every_leg() {
         for caps in [
             Caps {
                 apply_disabled: true,
@@ -660,6 +666,10 @@ mod tests {
             },
             Caps {
                 omarchy: true,
+                ..ready()
+            },
+            Caps {
+                door: true,
                 ..ready()
             },
         ] {

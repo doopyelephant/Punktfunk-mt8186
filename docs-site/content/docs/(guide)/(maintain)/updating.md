@@ -22,9 +22,9 @@ The channel comes from the repository you installed from (on a Steam Deck, the b
 | Install | Button |
 |---|---|
 | Windows installer | Always. |
-| apt, dnf, Bazzite sysext, rpm-ostree layer | After a one-time opt-in: `sudo usermod -aG punktfunk-update $USER`. The button appears within a minute, no new login needed. rpm-ostree stages the update: reboot to finish. |
+| apt, dnf, Bazzite sysext, rpm-ostree layer | After a one-time opt-in: `sudo usermod -aG punktfunk-update $USER`, then restart the computer. The host keeps the groups it started with, so logging out is not enough. rpm-ostree stages the update: reboot to finish. |
 | Arch (pacman) | The same opt-in, plus `PACMAN_FULL_SYSUPGRADE=1` in `/etc/punktfunk/update.conf`: the button runs a full `pacman -Syu`. |
-| Steam Deck on-device build | Always. It rebuilds on the Deck, which takes a while; the log is `~/.config/punktfunk/logs/update-steamos.log`. |
+| Steam Deck on-device build | Always, except while Reachable without logging in is on: then run `update.sh --pull` in Konsole. It rebuilds on the Deck, which takes a while; the log is `~/.config/punktfunk/logs/update-steamos.log`. |
 | Omarchy, NixOS, source builds | Command only. |
 
 The button asks for the console password and warns you if a stream is live, because updating drops

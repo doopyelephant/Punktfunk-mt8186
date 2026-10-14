@@ -232,7 +232,9 @@ SHDEPS="$(printf '%s' "$SHDEPS_RAW" | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
 # Manual additions shlibdeps can't see:
 #  - libei1: input injection (libei) is loaded at runtime, not in DT_NEEDED.
 #  - pipewire/wireplumber: runtime services (the daemon + session manager), not linked libs.
-DEPENDS="$SHDEPS, libei1, pipewire, wireplumber"
+#  - punktfunk-seats (build-seats-deb.sh): profile seats and Reachable without logging in. It ships
+#    disabled and is pinned, because the host and the supervisor speak one socket protocol.
+DEPENDS="$SHDEPS, libei1, pipewire, wireplumber, punktfunk-seats (= $VERSION)"
 # gamescope = a ready compositor backend; pipewire-pulse = desktop audio.
 # mesa-va-drivers / intel-media-va-driver = the VAAPI encode drivers for AMD (radeonsi) and Intel
 # (iHD) — pulled by default so the auto-selected VAAPI backend works out of the box; NVIDIA boxes
@@ -244,9 +246,7 @@ DEPENDS="$SHDEPS, libei1, pipewire, wireplumber"
 # by default; its systemd --user unit ships disabled (inert until you add scripts/plugins).
 # punktfunk-gamescope = HDR, the real mode and the cursor in a gamescope session. Recommends because
 # the repo carries no build for Ubuntu 24.04; apt skips a recommend it can't find.
-# punktfunk-seats = the root supervisor behind profile seats (build-seats-deb.sh). Recommends: it
-# ships disabled, so a box without a second profile loses nothing by skipping it.
-RECOMMENDS="gamescope, punktfunk-gamescope, pipewire-pulse, mesa-va-drivers, intel-media-va-driver, punktfunk-web, punktfunk-scripting, punktfunk-seats"
+RECOMMENDS="gamescope, punktfunk-gamescope, pipewire-pulse, mesa-va-drivers, intel-media-va-driver, punktfunk-web, punktfunk-scripting"
 SUGGESTS="kwin-wayland, mutter"
 
 INSTALLED_KB="$(du -k -s "$STAGE" | cut -f1)"

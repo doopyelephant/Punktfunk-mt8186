@@ -271,6 +271,7 @@ export const SectionProfiles: FC = () => {
 						? {
 								on: door,
 								changing: switching !== null,
+								unavailable: host.data?.door_unavailable,
 								onChange: () => setDoorAsk(!door),
 							}
 						: undefined

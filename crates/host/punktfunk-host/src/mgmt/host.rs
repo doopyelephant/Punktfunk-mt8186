@@ -55,6 +55,10 @@ pub(crate) struct HostInfo {
     /// This host is the door (Linux, **Reachable without logging in**): a system service that
     /// places every connect on a seat and streams nothing itself.
     door: bool,
+    /// Why turning the door on would be refused here, as the operator's next move: the files a
+    /// channel installs it with are missing, or the account isn't in `punktfunk-update`. `null`
+    /// when it would start, and on the door itself.
+    door_unavailable: Option<String>,
     /// Hex SHA-256 of this host's leaf certificate — what a client pins. Public by
     /// construction: every client reads it off the handshake. Carried here so a connect link
     /// can name it, and a first connect over an untrusted path is verified rather than blind.
@@ -546,6 +550,9 @@ pub(crate) async fn get_health() -> Json<Health> {
 )]
 pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<HostInfo> {
     let h = &st.app.host;
+    let door_unavailable = tokio::task::spawn_blocking(crate::door::unavailable)
+        .await
+        .unwrap_or_default();
     Json(HostInfo {
         hostname: h.hostname.clone(),
         uniqueid: h.uniqueid.clone(),
@@ -578,6 +585,7 @@ pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<Host
         },
         gamestream: st.gamestream_enabled,
         door: pf_paths::seat::role().is_door(),
+        door_unavailable,
         fingerprint: st.identity_fingerprint.map(hex::encode),
         ports: PortMap {
             mgmt: st.port,

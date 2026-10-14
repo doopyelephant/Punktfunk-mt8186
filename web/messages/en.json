@@ -917,7 +917,7 @@
 	"update_result_staged": "Update to {to} is staged — reboot this host to finish.",
 	"update_result_noop": "Your package source had nothing newer yet — try again in a few minutes.",
 	"update_result_noop_source": "Nothing to rebuild — this host is already on the newest build.",
-	"update_opt_in": "To enable one-click updates from here, run this once on the host (then log out and back in):",
+	"update_opt_in": "To enable one-click updates from here, run this once on the host (then restart it):",
 	"update_result_failed": "Update to {to} failed during {stage}.",
 	"update_result_log": "Installer log:",
 	"library_field_role": "This entry opens a launcher",

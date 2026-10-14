@@ -8,6 +8,9 @@
 Description=punktfunk door (the box's host, reachable without logging in)
 After=network-online.target punktfunk-seats.service
 Wants=network-online.target punktfunk-seats.service
+# The box's only way in keeps trying: a binary that won't load until a rebuild lands is back
+# within RestartSec of it.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

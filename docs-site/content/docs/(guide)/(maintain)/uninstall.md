@@ -109,7 +109,25 @@ hand, in this order.
    The container shares your home, so `~/.cargo`, `~/.rustup` and `~/.bun` are there too. Delete
    them only if nothing else of yours uses Rust or bun.
 
-3. Remove the root-owned tuning. Don't skip it: the keep-list entry carries these files through
+3. If you set up [Reachable without logging in](/docs/profiles#on-linux), turn it off under
+   **Profiles** first, then remove it. The last line deletes every seat's home and the shared
+   games folder:
+
+   ```sh
+   sudo systemctl disable --now punktfunk-web-door punktfunk-door punktfunk-seats \
+     var-lib-punktfunk.mount 'var-lib-punktfunk\x2dseats.mount'
+   sudo rm -rf /opt/punktfunk /etc/systemd/system/punktfunk-seat@.service.d
+   sudo rm -f /etc/systemd/system/punktfunk-{seats,seat@,door,web-door,door-on@,door-off@}.service \
+     /etc/systemd/system/var-lib-punktfunk*.mount \
+     /etc/polkit-1/rules.d/49-punktfunk-door.rules \
+     /etc/udev/rules.d/65-punktfunk-seats.rules /etc/tmpfiles.d/punktfunk-seats.conf
+   sudo rm -rf /home/.steamos/offload/var/lib/punktfunk /home/.steamos/offload/var/lib/punktfunk-seats
+   ```
+
+   Each seat's account stays: `getent passwd | grep punktfunk-seat=` lists them for
+   `sudo userdel`, and `sudo userdel punktfunk` removes the door's.
+
+4. Remove the root-owned tuning. Don't skip it: the keep-list entry carries these files through
    every SteamOS update.
 
    ```sh
@@ -122,7 +140,7 @@ hand, in this order.
    sudo systemctl daemon-reload
    ```
 
-4. Optional: `rm -rf ~/.config/punktfunk` for a clean slate, and
+5. Optional: `rm -rf ~/.config/punktfunk` for a clean slate, and
    `sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk`. If you had no KDE RemoteDesktop
    grant before, the installer seeded `~/.local/share/flatpak/db/kde-authorized`; delete it if
    nothing else relies on it. Your `input` group membership is harmless to keep.

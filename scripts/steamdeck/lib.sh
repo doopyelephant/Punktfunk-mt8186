@@ -97,6 +97,9 @@ apply_system_tuning() {
     ok "system tuning registered to survive SteamOS updates (atomic-update.conf.d)"
 }
 
+# shellcheck source-path=SCRIPTDIR source=door.sh
+. "$(dirname "${BASH_SOURCE[0]}")/door.sh"
+
 # write_host_unit <ExecStart value>: scripts/punktfunk-host.service with this install's command,
 # and the Deck's session environment in a drop-in beside it.
 write_host_unit() {
