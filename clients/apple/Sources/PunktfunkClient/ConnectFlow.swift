@@ -164,11 +164,14 @@ struct ConnectFlow {
         let wait = SeatWait(title: HostProfiles.wakingLine(first.displayName), detail: detail)
         seatWait = wait
         wait.task = Task { @MainActor in
-            if wake, !(await ProfileFetch.wake(host, id: first.id)) {
-                seatWait = nil
-                model.errorMessage =
-                    "Couldn't wake \(first.displayName)'s desk. Try again in a moment."
-                return
+            if wake {
+                do {
+                    try await ProfileFetch.wake(host, id: first.id)
+                } catch {
+                    seatWait = nil
+                    model.errorMessage = LibraryClient.wakeFailedLine(first.displayName, error)
+                    return
+                }
             }
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)

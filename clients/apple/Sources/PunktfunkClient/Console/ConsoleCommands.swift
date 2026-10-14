@@ -395,7 +395,7 @@ extension ConsoleModel {
     /// Starts a profile's stopped seat. The shell polls `FetchProfiles` for `ready` itself.
     private func wakeProfile(addr: String, mgmt: UInt16, fp: String, id: String) {
         guard let host = host(fp: fp, addr: addr, port: 0) else { return }
-        Task { _ = await ProfileFetch.wake(host, mgmt: mgmt, id: id) }
+        Task { try? await ProfileFetch.wake(host, mgmt: mgmt, id: id) }
     }
 
     private func pushProfiles(_ fp: String, _ answer: Any) {

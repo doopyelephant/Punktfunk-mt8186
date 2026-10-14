@@ -621,7 +621,23 @@ public enum LibraryClient {
         let response = try await send(
             "/api/v1/profiles/\(escaped)/wake", to: target, method: "POST",
             body: (Data(), "application/json"))
+        try expectWoken(response)
+    }
+
+    /// ``expectOK(_:_:)`` for a wake. An unpaired device gets 401, so a 403 is the host refusing
+    /// this device the profile's seat: `http(403)`, not `unauthorized`.
+    static func expectWoken(_ response: HTTPResponse) throws {
+        if response.status == 403 { throw LibraryError.http(403) }
         try expectOK(response, [200, 202])
+    }
+
+    /// The line a failed ``wakeProfile(id:on:)`` ends a seat wait with: the host's refusal in
+    /// its own words, any other failure under the desk it was for.
+    public static func wakeFailedLine(_ displayName: String, _ error: Error) -> String {
+        if let error = error as? LibraryError, case .http(403) = error {
+            return "This device isn't allowed to start another profile's seat."
+        }
+        return "Couldn't wake \(displayName)'s desk. Try again in a moment."
     }
 
     /// What the host currently has running, from `GET /api/v1/status`. Best-effort, as
