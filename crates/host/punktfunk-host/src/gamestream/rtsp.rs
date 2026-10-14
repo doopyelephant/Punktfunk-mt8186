@@ -97,7 +97,11 @@ fn handle_conn(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
     }
     let sealed = buf[0] & 0x80 != 0;
     // Sealed RTSP uses the `/launch` rikey, so it cannot precede a launch.
-    let key = state.launch.lock().unwrap().map(|s| s.gcm_key);
+    let key = state
+        .launch
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(|s| s.gcm_key);
     let key = match (sealed, key) {
         (false, _) => None,
         (true, Some(k)) => Some(k),
@@ -165,7 +169,7 @@ fn read_message(
 /// to a client cert. Returns the session; `PLAY` needs keys/appid, others use
 /// it as a bool.
 fn authorized_launch(state: &AppState, peer: Option<SocketAddr>) -> Option<LaunchSession> {
-    let ls = (*state.launch.lock().unwrap())?;
+    let ls = (*state.launch.lock().unwrap_or_else(|e| e.into_inner()))?;
     match (ls.peer_ip, peer.map(|p| p.ip())) {
         (Some(want), Some(got)) if want != got => None,
         // Match, or either side missing the address: launch-present only.
@@ -245,13 +249,17 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
             match stream_config(&map) {
                 Some(cfg) => {
                     tracing::info!(?cfg, "RTSP ANNOUNCE — negotiated stream config");
-                    *state.gs.stream.lock().unwrap() = Some(cfg);
+                    *state.gs.stream.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg);
                 }
                 None => tracing::warn!("RTSP ANNOUNCE — missing required video config keys"),
             }
             let ap = audio_params(&map, gs_encryption_offer());
             tracing::info!(?ap, "RTSP ANNOUNCE — negotiated audio params");
-            *state.gs.audio_params.lock().unwrap() = ap;
+            *state
+                .gs
+                .audio_params
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = ap;
             response(&req.cseq, &[], None)
         }
         "PLAY" => {
@@ -259,7 +267,7 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 tracing::warn!(?peer, "RTSP PLAY — refused: not the paired `/launch` owner");
                 return response_status("401 Unauthorized", &req.cseq, &[], None);
             };
-            let cfg = *state.gs.stream.lock().unwrap();
+            let cfg = *state.gs.stream.lock().unwrap_or_else(|e| e.into_inner());
             // Ends the whole session (both planes + launch). One plane detecting a
             // dead client must not leave the other streaming or a stale launch.
             let on_lost: super::OnSessionLost = {
@@ -313,7 +321,11 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 tracing::info!("RTSP PLAY — starting audio stream");
                 let params = audio::AudioParams {
                     host_audio: ls.host_audio,
-                    ..*state.gs.audio_params.lock().unwrap()
+                    ..*state
+                        .gs
+                        .audio_params
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
                 };
                 audio::start(
                     state.audio_streaming.clone(),

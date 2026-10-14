@@ -234,7 +234,7 @@ pub fn start(
             // its disconnect from the connection task, so there it can come first.
             drop(live_session);
             running.store(false, Ordering::SeqCst);
-            *video_hdr.lock().unwrap() = None;
+            *video_hdr.lock().unwrap_or_else(|e| e.into_inner()) = None;
             drop(stream_marker);
             crate::events::emit(crate::events::EventKind::ClientDisconnected {
                 client: event_client,
@@ -508,7 +508,7 @@ fn run(
     let pinned = crate::vdisplay::capture_monitor();
     #[cfg(not(target_os = "linux"))]
     let pinned: Option<String> = None;
-    let pooled = match video_cap.lock().unwrap().take() {
+    let pooled = match video_cap.lock().unwrap_or_else(|e| e.into_inner()).take() {
         Some((c, was_hdr, was_meta, ref was_pin))
             if was_hdr == cfg.hdr && was_meta == metadata_cursor && *was_pin == pinned =>
         {
@@ -587,7 +587,8 @@ fn run(
     // Portal terminal states are sticky and this path has no rebuild. Re-pooling a dead
     // capturer wedges the next connect; drop it and pay one fresh screencast session.
     if result.is_ok() && capturer.is_alive() {
-        *video_cap.lock().unwrap() = Some((capturer, cfg.hdr, metadata_cursor, pinned));
+        *video_cap.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((capturer, cfg.hdr, metadata_cursor, pinned));
     } else {
         tracing::info!(
             stream_failed = result.is_err(),
@@ -1815,7 +1816,12 @@ impl GsLoop<'_> {
     /// through the gate.
     fn request_keyframes(&mut self) {
         let mut want_keyframe = false;
-        if let Some((first, last)) = self.rfi_range.lock().unwrap().take() {
+        if let Some((first, last)) = self
+            .rfi_range
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             // Wider than RFI_MAX_RANGE is a phantom range — keyframe, never a force-reference.
             let width = (last as u32).wrapping_sub(first as u32);
             if width > punktfunk_core::packet::RFI_MAX_RANGE
@@ -1848,7 +1854,7 @@ impl GsLoop<'_> {
         self.video.enc.set_hdr_meta(hdr_meta);
         if hdr_meta != self.published_hdr {
             self.published_hdr = hdr_meta;
-            *self.video_hdr.lock().unwrap() = hdr_meta;
+            *self.video_hdr.lock().unwrap_or_else(|e| e.into_inner()) = hdr_meta;
         }
     }
 
