@@ -197,21 +197,26 @@ pub(super) unsafe fn probe_rgb_direct(
     Ok((x_offset, y_offset))
 }
 
-/// One plane of a multi-planar image as a storage image; the image carries `MUTABLE_FORMAT`.
-unsafe fn make_plane_view(
+/// A view of `aspect` that serves only `usage`. A view inherits the image's whole usage, and
+/// the picture format has no `STORAGE` while its plane formats have no encode input. A plane
+/// view needs the image's `MUTABLE_FORMAT`.
+unsafe fn make_usage_view(
     device: &ash::Device,
     image: vk::Image,
     fmt: vk::Format,
-    plane: vk::ImageAspectFlags,
+    aspect: vk::ImageAspectFlags,
+    usage: vk::ImageUsageFlags,
 ) -> Result<vk::ImageView> {
+    let mut view_usage = vk::ImageViewUsageCreateInfo::default().usage(usage);
     Ok(device.create_image_view(
         &vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(fmt)
+            .push_next(&mut view_usage)
             .subresource_range(
                 vk::ImageSubresourceRange::default()
-                    .aspect_mask(plane)
+                    .aspect_mask(aspect)
                     .level_count(1)
                     .layer_count(1),
             ),
@@ -525,9 +530,28 @@ unsafe fn make_frame_csc(
             profile_list,
             fams,
         )?;
-        f.nv12_view = make_view(device, f.nv12_src, pic, 0)?;
-        f.y_view = make_plane_view(device, f.nv12_src, y_fmt, vk::ImageAspectFlags::PLANE_0)?;
-        f.uv_view = make_plane_view(device, f.nv12_src, uv_fmt, vk::ImageAspectFlags::PLANE_1)?;
+        f.nv12_view = make_usage_view(
+            device,
+            f.nv12_src,
+            pic,
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageUsageFlags::VIDEO_ENCODE_SRC_KHR,
+        )?;
+        let storage = vk::ImageUsageFlags::STORAGE;
+        f.y_view = make_usage_view(
+            device,
+            f.nv12_src,
+            y_fmt,
+            vk::ImageAspectFlags::PLANE_0,
+            storage,
+        )?;
+        f.uv_view = make_usage_view(
+            device,
+            f.nv12_src,
+            uv_fmt,
+            vk::ImageAspectFlags::PLANE_1,
+            storage,
+        )?;
     } else {
         (f.nv12_src, f.nv12_mem) = make_video_image(
             device,
