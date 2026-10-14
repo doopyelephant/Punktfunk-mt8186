@@ -173,7 +173,6 @@ pub fn vk_to_evdev(vk: u8) -> Option<u16> {
 }
 
 /// GameStream button ids are not evdev order: 2 is middle, 3 is right.
-#[cfg(target_os = "linux")]
 pub(crate) fn gs_button_to_evdev(b: u32) -> Option<u32> {
     Some(match b {
         1 => 0x110, // BTN_LEFT

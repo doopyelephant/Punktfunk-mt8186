@@ -42,6 +42,11 @@ pub mod scroll;
 #[path = "inject/head_pick.rs"]
 mod head_pick;
 
+/// Keys and pointer → what a Linux backend emits, and what its device holds. Pure and ungated
+/// like [`scroll`].
+#[path = "inject/plan.rs"]
+mod plan;
+
 /// Host-session injector. Not `Send`: owns compositor resources and stays on the control
 /// thread that created it.
 pub trait InputInjector {
@@ -171,10 +176,8 @@ pub(crate) fn aim_gen() -> u64 {
     AIM_GEN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Largest normalised absolute position. A client may send `x == w` (a touch on the far edge);
-/// mapped as 1.0 that lands one pixel past the head, on the neighbouring monitor.
 #[cfg(target_os = "linux")]
-pub(crate) const ABS_EDGE: f32 = 1.0 - 1.0 / 65536.0;
+pub(crate) use plan::ABS_EDGE;
 
 /// Streamed head's mode, published beside the aim at capture bring-up.
 static STREAM_EXTENT: std::sync::RwLock<Option<(u16, u16)>> = std::sync::RwLock::new(None);
@@ -1028,6 +1031,26 @@ fn monotonic_us() -> u64 {
     // SAFETY: `CLOCK_MONOTONIC` is a valid clock id and `ts` is a live, writable timespec.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod clock_tests {
+    /// A stamp is a reading of `CLOCK_MONOTONIC` itself, not time since some private start.
+    #[test]
+    fn input_is_stamped_on_the_compositors_clock() {
+        let read = || {
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: as in `monotonic_us`: a valid clock id and a live, writable timespec.
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+            ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000
+        };
+        let before = read();
+        let stamp = super::monotonic_us();
+        assert!((before..=read()).contains(&stamp));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
