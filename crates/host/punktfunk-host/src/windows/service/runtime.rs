@@ -2,6 +2,7 @@
 //! launches the host into the active console session.
 
 use super::*;
+use pf_seats::backoff::{Backoff, Curve, Reset};
 
 /// Manual-reset STOP and SESSION events. `OnceLock` so the SCM handler stays `'static` (`HANDLE` is
 /// not `Send`); `OwnedHandle` for the process lifetime so the handler never signals a closed event.
@@ -193,6 +194,16 @@ pub(super) fn run_service() -> Result<()> {
     result
 }
 
+/// 0.5 s more per exit in a row, up to 5 s. Only a console switch or a restart the host asked
+/// for clears the count, which also arms the rollback at three.
+const HOST_BACKOFF: Backoff = Backoff::new(
+    Curve::Linear {
+        step: Duration::from_millis(500),
+        steps: 10,
+    },
+    Reset::Never,
+);
+
 /// Supervises the ordinary host in the active console session and the web console
 /// in session 0, with the seat supervisor beside them. Every wait passes through
 /// [`WebSlot::wait`] so both children remain covered while either arm blocks.
@@ -215,7 +226,7 @@ pub(super) fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
     let mut web = WebSlot::new(&exe);
     let seats = SeatsSlot::start(&exe);
 
-    let mut restarts: u32 = 0;
+    let mut backoff = HOST_BACKOFF;
     // One-shot: a rollback that itself fails must not spawn installers in a loop.
     let mut rollback_attempted = false;
     loop {
@@ -248,8 +259,8 @@ pub(super) fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
                     "launch the host into the active console session: {e:#}"
                 );
                 // A host that never starts is the boot loop the rollback exists for.
-                restarts += 1;
-                maybe_boot_loop_rollback(restarts, &mut rollback_attempted);
+                backoff.failed(Instant::now());
+                maybe_boot_loop_rollback(backoff.failures(), &mut rollback_attempted);
                 if web.wait(&[stop], 3000).is_some() {
                     break;
                 }
@@ -257,6 +268,7 @@ pub(super) fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
             }
         };
         tracing::info!(pid = child.pid, session, cmd = %host_cmd, "host launched");
+        backoff.started(Instant::now());
 
         // `HANDLE` is Copy: `proc_h` does not close the process. `child` owns both handles and
         // closes them on drop (end of iteration / continue / break).
@@ -299,7 +311,7 @@ pub(super) fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
                 unsafe {
                     let _ = TerminateProcess(proc_h, 0);
                 }
-                restarts = 0;
+                backoff.reset();
                 continue;
             }
             _ => {
@@ -309,7 +321,7 @@ pub(super) fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
                 let _ = unsafe { GetExitCodeProcess(proc_h, &mut code) };
                 if code == crate::power::RESTART_EXIT_CODE {
                     tracing::info!(pid = child.pid, "host restarting on request — relaunching");
-                    restarts = 0;
+                    backoff.reset();
                     continue;
                 }
                 tracing::warn!(
@@ -320,10 +332,9 @@ pub(super) fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
             }
         }
 
-        restarts += 1;
-        maybe_boot_loop_rollback(restarts, &mut rollback_attempted);
-        let backoff = restarts.min(10) * 500; // 0.5s..5s
-        if web.wait(&[stop], backoff).is_some() {
+        let wait = backoff.failed(Instant::now());
+        maybe_boot_loop_rollback(backoff.failures(), &mut rollback_attempted);
+        if web.wait(&[stop], wait.as_millis() as u32).is_some() {
             break;
         }
     }
