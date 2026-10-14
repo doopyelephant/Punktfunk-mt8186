@@ -19,6 +19,9 @@ use crate::pad_shm_ring::SectionView;
 use crate::pad_slots::PadCreateFault;
 use anyhow::{anyhow, Context, Result};
 use pf_driver_proto::gamepad::{PadBootstrap, BOOT_MAGIC, GAMEPAD_PROTO_VERSION};
+use pf_driver_proto::pad_delivery::{
+    Action, Delivery, Observation, Phase, PidAnswer, MAX_DELIVERY_ATTEMPTS,
+};
 use pf_paths_win::SecurityAttributes;
 use std::ffi::c_void;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -240,24 +243,10 @@ pub(crate) fn named_section_exists(name: &HSTRING) -> bool {
 /// cannot hand a persistent driver the same seq twice. Starts at 1.
 static BOOT_SEQ: AtomicU32 = AtomicU32::new(1);
 
-/// Cap on FAILED deliveries per pad. Each attempt duplicates a handle into a WUDFHost;
-/// a flapping mailbox pid must not mint unbounded remote handles. Successes stand
-/// until the target exits ([`PadChannel::delivered`]).
-const MAX_DELIVERY_ATTEMPTS: u32 = 16;
-
-/// How often an unattached pad may ask the devnode for a channel proof.
-/// The pump ticks every few milliseconds; a proof query is a device open + I/O.
-/// 250 ms is past a healthy driver's attach (tens of ms) and idle once delivered.
-const PROOF_PROBE_INTERVAL: Duration = Duration::from_millis(250);
-
 /// Opt-in fallback when there is no `SwDeviceCreate` instance id (`devgen`/`devcon`).
 /// Trusts the mailbox `driver_pid` — the path [`PadChannel::pump`] otherwise refuses.
 /// Per-boot, logged loudly. Normal pads and the resident mouse never need it.
 pub(super) const TRUST_MAILBOX_ENV: &str = "PUNKTFUNK_PAD_CHANNEL_TRUST_MAILBOX";
-
-/// Unanswered proof queries before one operator-facing warn.
-/// At [`PROOF_PROBE_INTERVAL`] this is ~5 s — past attach and the eager window.
-const PROOF_FAILURES_BEFORE_WARN: u32 = 20;
 
 /// Mailbox names this process created and still holds. [`crate::pad_pool`] skips an index
 /// only when another process serves it; our own pad inside its unplug grace is not that.
@@ -272,9 +261,9 @@ pub(crate) fn created_here(name: &str) -> bool {
     created_names().iter().any(|n| n == name)
 }
 
-/// One pad's sealed host↔driver channel: unnamed DATA, named mailbox, and the
-/// [`Self::pump`] state machine. Drop closes the mailbox; a persistent driver
-/// treats the vanished name as "host gone".
+/// One pad's sealed host↔driver channel: unnamed DATA, named mailbox, and the OS side of its
+/// [`Delivery`]. Drop closes the mailbox; a persistent driver treats the vanished name as
+/// "host gone".
 pub(super) struct PadChannel {
     data: Shm,
     boot: Shm,
@@ -284,24 +273,16 @@ pub(super) struct PadChannel {
     devnode: Option<(String, ProofTransport)>,
     /// Must match the proof so a mis-resolved interface cannot cross-wire two pads.
     pad_index: u32,
-    last_probe: Option<Instant>,
-    /// Last pid delivered or rejected — never retry the same value within a probe interval
-    /// (hot-loop trap). A failed delivery clears it so the next probe tries again.
-    last_seen_pid: u32,
-    attempts: u32,
-    /// WUDFHost that holds the DATA handle. `Some` ⇒ no other process is served while it lives.
-    delivered: Option<Delivered>,
-    warned_proto: bool,
-    warned_cap: bool,
-    warned_takeover: bool,
-    warned_unproven: bool,
-    proof_failures: u32,
+    delivery: Delivery,
+    /// The WUDFHost holding the DATA handle: `Some` exactly while `delivery` is delivered.
+    target: Option<Delivered>,
+    /// Zero of the clock [`Observation::Tick`] carries.
+    born: Instant,
 }
 
 /// Completed delivery, pinned by a live process handle — never by pid.
 /// A recycled pid cannot read as "the process we served has exited".
 struct Delivered {
-    pid: u32,
     /// `SYNCHRONIZE`; signaled ⇔ exited. Same idiom as the frame channel's `driver_alive`.
     process: OwnedHandle,
 }
@@ -343,15 +324,9 @@ impl PadChannel {
             boot_name,
             devnode: None,
             pad_index: 0,
-            last_probe: None,
-            last_seen_pid: 0,
-            attempts: 0,
-            delivered: None,
-            warned_proto: false,
-            warned_cap: false,
-            warned_takeover: false,
-            warned_unproven: false,
-            proof_failures: 0,
+            delivery: Delivery::default(),
+            target: None,
+            born: Instant::now(),
         })
     }
 }
@@ -390,73 +365,128 @@ impl PadChannel {
         self.devnode = instance_id.map(|id| (id, transport));
     }
 
-    /// One tick of the delivery state machine (pad service pump, ≤4 ms). Idle cost is
-    /// an atomic load; once delivered, a 0 ms wait.
+    /// One tick of the delivery (pad service pump, ≤4 ms): tell [`Delivery::step`] what the
+    /// mailbox and the delivered process say, and carry out its answer. Idle cost is an atomic
+    /// load and a clock read; once delivered, a 0 ms wait.
     pub(super) fn pump(&mut self) {
-        // Driver writes its proto even when it refuses the handshake, so a mismatch is visible.
-        let drv_proto = self.boot_load(core::mem::offset_of!(PadBootstrap, driver_proto));
-        if drv_proto != 0 && drv_proto != GAMEPAD_PROTO_VERSION && !self.warned_proto {
-            self.warned_proto = true;
+        let proto = self.boot_load(core::mem::offset_of!(PadBootstrap, driver_proto));
+        if let Action::WarnProtoMismatch(driver_proto) =
+            self.delivery.step(Observation::DriverProto(proto))
+        {
             crate::note_pad_driver(crate::PadDriverVerdict::ProtocolMismatch {
-                driver_proto: drv_proto,
+                driver_proto,
                 host_proto: GAMEPAD_PROTO_VERSION,
             });
             tracing::warn!(
                 mailbox = %self.boot_name,
-                driver_proto = drv_proto,
+                driver_proto,
                 host_proto = GAMEPAD_PROTO_VERSION,
                 "gamepad driver/host protocol mismatch on the bootstrap mailbox — update the \
                  drivers: punktfunk-host.exe driver install --gamepad"
             );
         }
 
-        // A delivery stands until the target process dies. UMDF restarting a crashed host
-        // is the one legitimate re-attach, visible here as an exited handle.
-        if let Some(d) = self.delivered.as_ref() {
-            if !d.exited() {
-                return;
-            }
-            tracing::info!(
+        let exited = self.target.as_ref().is_some_and(Delivered::exited);
+        let now = self.born.elapsed();
+        match self.delivery.step(Observation::Tick { now, exited }) {
+            Action::WarnCapped => tracing::warn!(
                 mailbox = %self.boot_name,
-                exited_pid = d.pid,
-                "the WUDFHost this channel was delivered to has exited (driver crash / host \
-                 restart) — re-attaching to the restarted driver"
-            );
-            self.delivered = None;
-            self.attempts = 0; // a genuine restart earns a fresh budget
-            self.last_seen_pid = 0;
-            self.last_probe = None;
-        }
-        if self.attempts >= MAX_DELIVERY_ATTEMPTS {
-            if !self.warned_cap {
-                self.warned_cap = true;
-                tracing::warn!(
-                    mailbox = %self.boot_name,
-                    attempts = self.attempts,
-                    "gamepad channel delivery cap reached — no further handles will be duplicated"
-                );
+                attempts = MAX_DELIVERY_ATTEMPTS,
+                "gamepad channel delivery cap reached — no further handles will be duplicated"
+            ),
+            Action::Resolve { reattach } => {
+                if let Some(exited_pid) = reattach {
+                    tracing::info!(
+                        mailbox = %self.boot_name,
+                        exited_pid,
+                        "the WUDFHost this channel was delivered to has exited (driver crash / \
+                         host restart) — re-attaching to the restarted driver"
+                    );
+                    self.target = None;
+                }
+                self.resolve();
             }
-            return;
+            _ => {}
         }
-        if self
-            .last_probe
-            .is_some_and(|t| t.elapsed() < PROOF_PROBE_INTERVAL)
-        {
-            return;
-        }
-        self.last_probe = Some(Instant::now());
+    }
 
-        let Some(pid) = self.resolve_driver_pid() else {
-            return;
+    /// Ask who the driver is and act on the answer. The pid comes from the DEVNODE
+    /// ([`channel_proof`]), never from the mailbox: only the driver PnP-bound to the
+    /// `SwDeviceCreate`'d device can answer that I/O. The mailbox's `driver_pid` stands in only
+    /// on the `devgen` path, and only with [`TRUST_MAILBOX_ENV`] set: LocalService can write it.
+    fn resolve(&mut self) {
+        const NO_DEVNODE: &str = "this pad has no SwDeviceCreate devnode to ask";
+        let devnode = self.devnode.clone();
+        let mut proof_error = None;
+        let answer = match &devnode {
+            Some((instance_id, transport)) => {
+                match channel_proof::query(instance_id, *transport, self.pad_index) {
+                    Ok(pid) => PidAnswer::Proved(pid),
+                    Err(e) => {
+                        proof_error = Some(e);
+                        PidAnswer::NoProof
+                    }
+                }
+            }
+            None if std::env::var_os(TRUST_MAILBOX_ENV).is_none() => PidAnswer::Refused,
+            None => {
+                PidAnswer::Mailbox(self.boot_load(core::mem::offset_of!(PadBootstrap, driver_pid)))
+            }
         };
-        if pid == self.last_seen_pid {
-            return; // already tried this one and it failed — don't spin on it
+        match self.delivery.step(Observation::Pid(answer)) {
+            Action::Deliver { pid, unverified } => {
+                if unverified {
+                    tracing::warn!(
+                        mailbox = %self.boot_name,
+                        reason = NO_DEVNODE,
+                        "delivering this pad channel on the UNVERIFIED mailbox pid — a local \
+                         service that wins the startup race can redirect this pad's input section \
+                         (forged gamepad input + a read of pad state). Documented residual; the \
+                         virtual MOUSE and the XUSB pad are both proved."
+                    );
+                }
+                self.deliver(pid);
+            }
+            Action::NoProof { failures, warn } => {
+                let devnode = devnode.map(|(id, _)| id).unwrap_or_default();
+                let error = proof_error.map(|e| format!("{e:#}")).unwrap_or_default();
+                // Debug while the driver may still be starting; one warn once it is clearly not.
+                if warn {
+                    tracing::warn!(
+                        mailbox = %self.boot_name,
+                        devnode = %devnode,
+                        error = %error,
+                        "the pad's devnode has not answered a channel proof — the host will NOT \
+                         hand the DATA section to a pid it cannot verify, so this pad stays \
+                         unattached (an old driver? reinstall: punktfunk-host.exe driver install \
+                         --gamepad)"
+                    );
+                } else {
+                    tracing::debug!(
+                        mailbox = %self.boot_name,
+                        attempt = failures,
+                        error = %error,
+                        "no channel proof yet"
+                    );
+                }
+            }
+            Action::WarnRefused => tracing::warn!(
+                mailbox = %self.boot_name,
+                reason = NO_DEVNODE,
+                "no channel proof for this pad's driver — refusing the DATA section, since \
+                 any local service can write the mailbox pid. Set {TRUST_MAILBOX_ENV}=1 to \
+                 accept the old, unverified handshake on a driver bring-up box"
+            ),
+            _ => {}
         }
-        self.last_seen_pid = pid;
-        self.attempts += 1;
+    }
+
+    /// Hand the DATA section to `pid` and tell the delivery how it went.
+    fn deliver(&mut self, pid: u32) {
         match self.deliver_to(pid) {
             Ok((seq, process)) => {
-                self.delivered = Some(Delivered { pid, process });
+                self.target = Some(Delivered { process });
+                self.delivery.step(Observation::Delivered(pid));
                 tracing::info!(
                     mailbox = %self.boot_name,
                     wudf_pid = pid,
@@ -472,84 +502,9 @@ impl PadChannel {
                     error = %format!("{e:#}"),
                     "sealed gamepad channel delivery failed"
                 );
-                // `last_seen_pid` was stamped before the attempt, so leaving it set retires
-                // this pid for the pad's life and one transient failure strands the pad.
-                // Clearing it retries at the next probe; the attempt cap still bounds it.
-                self.last_seen_pid = 0;
+                self.delivery.step(Observation::DeliveryFailed);
             }
         }
-    }
-
-    /// Pid to receive this pad's DATA section — from the DEVNODE ([`channel_proof`]),
-    /// never from the mailbox. Only the driver PnP-bound to the `SwDeviceCreate`'d
-    /// device can answer that I/O. Evidence: `design/gamepad-channel-sealing.md`.
-    fn resolve_driver_pid(&mut self) -> Option<u32> {
-        let Some((instance_id, transport)) = self.devnode.clone() else {
-            return self.unproven_mailbox_pid("this pad has no SwDeviceCreate devnode to ask");
-        };
-        match channel_proof::query(&instance_id, transport, self.pad_index) {
-            Ok(pid) => {
-                self.proof_failures = 0;
-                Some(pid)
-            }
-            Err(e) => {
-                self.proof_failures += 1;
-                // Debug while the driver may still be starting; one warn once it is clearly not.
-                if self.proof_failures == PROOF_FAILURES_BEFORE_WARN {
-                    tracing::warn!(
-                        mailbox = %self.boot_name,
-                        devnode = %instance_id,
-                        error = %format!("{e:#}"),
-                        "the pad's devnode has not answered a channel proof — the host will NOT \
-                         hand the DATA section to a pid it cannot verify, so this pad stays \
-                         unattached (an old driver? reinstall: punktfunk-host.exe driver install \
-                         --gamepad)"
-                    );
-                } else {
-                    tracing::debug!(
-                        mailbox = %self.boot_name,
-                        attempt = self.proof_failures,
-                        error = %format!("{e:#}"),
-                        "no channel proof yet"
-                    );
-                }
-                None
-            }
-        }
-    }
-
-    /// Mailbox `driver_pid` for the `devgen` path that has no instance id to query.
-    /// Refused unless [`TRUST_MAILBOX_ENV`] is set: LocalService can write that field.
-    fn unproven_mailbox_pid(&mut self, why: &str) -> Option<u32> {
-        if std::env::var_os(TRUST_MAILBOX_ENV).is_none() {
-            if !self.warned_unproven {
-                self.warned_unproven = true;
-                tracing::warn!(
-                    mailbox = %self.boot_name,
-                    reason = why,
-                    "no channel proof for this pad's driver — refusing the DATA section, since \
-                     any local service can write the mailbox pid. Set {TRUST_MAILBOX_ENV}=1 to \
-                     accept the old, unverified handshake on a driver bring-up box"
-                );
-            }
-            return None;
-        }
-        let pid = self.boot_load(core::mem::offset_of!(PadBootstrap, driver_pid));
-        if pid == 0 {
-            return None;
-        }
-        if !self.warned_unproven {
-            self.warned_unproven = true;
-            tracing::warn!(
-                mailbox = %self.boot_name,
-                reason = why,
-                "delivering this pad channel on the UNVERIFIED mailbox pid — a local service that \
-                 wins the startup race can redirect this pad's input section (forged gamepad input \
-                 + a read of pad state). Documented residual; the virtual MOUSE and the XUSB pad are \
-                 both proved."
-            );
-        }
-        Some(pid)
     }
 
     /// Duplicate the DATA section into a verified WUDFHost `pid`, then publish handle
@@ -602,14 +557,15 @@ impl PadChannel {
         Ok((seq, process))
     }
 
-    /// Pump until a pid is acted on or `timeout` passes. Closes the DualShock 4 identity
+    /// Pump until the section is delivered or `timeout` passes. Closes the DualShock 4 identity
     /// race: the driver reads `device_type` from DATA when hidclass asks for descriptors.
     pub(super) fn deliver_eager(&mut self, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
             self.pump();
-            if self.last_seen_pid != 0 || Instant::now() >= deadline {
-                if self.delivered.is_none() {
+            let delivered = matches!(self.delivery.phase, Phase::Delivered { .. });
+            if delivered || Instant::now() >= deadline {
+                if !delivered {
                     tracing::debug!(
                         mailbox = %self.boot_name,
                         "eager gamepad-channel delivery window passed without an attach — the \
@@ -1354,7 +1310,7 @@ mod tests {
             .expect("OpenProcess(SYNCHRONIZE) on our own child");
             OwnedHandle::from_raw_handle(h.0 as _)
         };
-        let delivered = Delivered { pid, process };
+        let delivered = Delivered { process };
         assert!(
             !delivered.exited(),
             "a running target must read as ALIVE — this is what refuses a channel takeover"
