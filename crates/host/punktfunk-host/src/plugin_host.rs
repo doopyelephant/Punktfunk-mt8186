@@ -13,6 +13,10 @@ pub(crate) mod store;
 pub(crate) type PluginTokens =
     std::sync::Arc<std::sync::RwLock<std::collections::BTreeMap<String, String>>>;
 
+/// Deletes a provider's library titles and returns how many went. The library sits above
+/// `plugin_host`, so the `plugins remove` CLI (`main`) and the store route (`mgmt`) pass it in.
+pub(crate) type DeleteTitles = fn(&str) -> anyhow::Result<usize>;
+
 /// A store job rewrote the token file: the pipe set reconciles now, not at its next tick.
 #[cfg(windows)]
 pub(crate) static TOKENS_CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();

@@ -545,7 +545,11 @@ pub(crate) async fn uninstall_plugin(
              removed",
         );
     }
-    match jobs::spawn_uninstall(req.pkg, st.plugin_tokens.clone()) {
+    match jobs::spawn_uninstall(
+        req.pkg,
+        st.plugin_tokens.clone(),
+        crate::library::delete_provider,
+    ) {
         Ok(job) => (StatusCode::ACCEPTED, Json(JobRef { job })).into_response(),
         Err(e) => api_error(StatusCode::CONFLICT, &format!("{e:#}")),
     }

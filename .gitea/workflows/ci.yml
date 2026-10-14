@@ -270,8 +270,8 @@ jobs:
           python3 scripts/ci/check-crate-groups.py
 
       # mgmt is the host crate's HTTP layer: game, library and plugin_host never import it, and
-      # the two under game never import game. An import upward closes a module cycle. Pure
-      # text, no cargo.
+      # the two under game never import game. plugin_host never imports library. An import
+      # upward closes a module cycle. Pure text, no cargo.
       - name: Host module layering gate
         run: |
           python3 scripts/ci/check-host-layers.py --self-test

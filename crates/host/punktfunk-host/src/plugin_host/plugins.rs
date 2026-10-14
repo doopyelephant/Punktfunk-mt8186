@@ -32,7 +32,7 @@ mod posix;
 #[cfg(not(target_os = "windows"))]
 use self::posix as plat;
 
-pub fn main(args: &[String]) -> Result<()> {
+pub fn main(args: &[String], delete_titles: super::DeleteTitles) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("add") | Some("remove") | Some("rm") | Some("uninstall") | Some("list")
         | Some("ls") => {
@@ -51,7 +51,7 @@ pub fn main(args: &[String]) -> Result<()> {
             };
             forward_to_runner(args)?;
             for provider in removing {
-                if let Err(e) = crate::library::delete_provider(&provider) {
+                if let Err(e) = delete_titles(&provider) {
                     println!("Couldn't remove the library titles of {provider}: {e:#}");
                 }
             }
