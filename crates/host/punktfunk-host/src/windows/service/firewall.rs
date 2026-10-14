@@ -78,10 +78,11 @@ fn udp_ports(native_port: u16) -> String {
     format!("47998-48010,{native_port},{},5353", seats.join(","))
 }
 
-/// Inbound streaming + mgmt rules. Best-effort; never fails the install. Scoped by
-/// [`firewall_profile_arg`] and this executable ([`fw_add_rule_args`]). The mgmt port is
-/// deliberate: `serve` binds mgmt/library to all interfaces; off-loopback
-/// `mgmt::require_auth` is read-only to a paired client cert, so opening it adds no admin surface.
+/// Inbound streaming + mgmt rules, and the browser plane's ([`sync_browser_rule`]). Best-effort;
+/// never fails the install. Scoped by [`firewall_profile_arg`] and this executable
+/// ([`fw_add_rule_args`]). The mgmt port is deliberate: `serve` binds mgmt/library to all
+/// interfaces; off-loopback `mgmt::require_auth` is read-only to a paired client cert, so
+/// opening it adds no admin surface.
 pub(super) fn add_firewall_rules(allow_public: bool) {
     let profile = firewall_profile_arg(allow_public);
     // `service install` remove-then-adds on every upgrade, so a moved install cannot leave a
@@ -122,6 +123,7 @@ pub(super) fn add_firewall_rules(allow_public: bool) {
             eprintln!("warning: firewall rule '{name}' not added (add it manually if needed)");
         }
     }
+    sync_browser_rule(exe.as_deref());
     // Print only when scoping actually happened: with no exe path the rules are still wide open.
     if exe.is_some() {
         println!(
@@ -153,9 +155,8 @@ pub(super) fn remove_firewall_rules() {
             &format!("name={FW_DATA_PLANE_RULE}"),
         ],
     );
-    for suffix in ["TCP", "UDP"] {
+    for name in ["Punktfunk TCP", "Punktfunk UDP", FW_BROWSER_RULE] {
         // netsh matches rule names case-insensitively, so this also reaps the old lowercase names.
-        let name = format!("Punktfunk {suffix}");
         let _ = run_quiet(
             "netsh",
             &[
@@ -166,6 +167,36 @@ pub(super) fn remove_firewall_rules() {
                 &format!("name={name}"),
             ],
         );
+    }
+}
+
+/// The browser plane's UDP rule.
+const FW_BROWSER_RULE: &str = "Punktfunk Browser";
+
+/// Make the browser plane's rule match what the next host serves: present while the plane is
+/// on, scoped like the others, and absent while it is off. The console's toggle applies at a
+/// host restart, so the service runs this before each host start. Best-effort.
+pub(super) fn sync_browser_rule(exe: Option<&std::path::Path>) {
+    let rule = format!("name={FW_BROWSER_RULE}");
+    let _ = run_quiet(
+        "netsh",
+        &["advfirewall", "firewall", "delete", "rule", &rule],
+    );
+    let host_env = std::fs::read_to_string(host_env_path()).unwrap_or_default();
+    let row = pf_host_config::resolve_now().config.webtransport;
+    let Some(port) = pf_host_config::listen::browser_port_from_host_env(&host_env, row) else {
+        return;
+    };
+    let profile = firewall_profile_arg(fw_public_marker().exists());
+    let ports = port.to_string();
+    if !run_netsh(&fw_add_rule_args(
+        FW_BROWSER_RULE,
+        "UDP",
+        Some(&ports),
+        exe,
+        profile,
+    )) {
+        tracing::warn!(port, "browser plane firewall rule not added");
     }
 }
 

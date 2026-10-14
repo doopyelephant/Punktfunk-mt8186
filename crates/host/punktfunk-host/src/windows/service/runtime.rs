@@ -247,6 +247,8 @@ pub(super) fn supervise(stop: HANDLE, session_ev: HANDLE) -> Result<()> {
             continue;
         }
 
+        // The box's own host only: seat hosts start under `SeatsSlot`, never through here.
+        sync_browser_rule(Some(&exe));
         let job_h = HANDLE(job.as_raw_handle());
         // SAFETY: `spawn_host` is unsafe only for its Win32 FFI. `session` is a valid console
         // session id (checked != 0xFFFFFFFF above), `cmdline`/`workdir` are live borrows, and

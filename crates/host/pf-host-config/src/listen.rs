@@ -4,6 +4,8 @@
 //! `service install` hands [`ListenPlan::from_host_env`] the `host.env` that becomes both, so
 //! the firewall rule names the port the host binds. Each value is flag > env > default, and a
 //! blank env value is unset. Neither is a registry row: the console never moves a port.
+//! [`browser_port_from_host_env`] names the browser plane's port only while the plane is on,
+//! because its firewall rule exists only then.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -11,9 +13,13 @@ use std::net::{Ipv4Addr, SocketAddr};
 pub const NATIVE_PORT: u16 = 9777;
 /// The management API's port, beside the GameStream block (47984…48010).
 pub const MGMT_PORT: u16 = 47990;
+/// The browser plane's port: WebTransport over UDP, beside the native plane's.
+pub const BROWSER_PORT: u16 = 9778;
 
 const MGMT_BIND_ENV: &str = "PUNKTFUNK_MGMT_BIND";
 const NATIVE_PORT_ENV: &str = "PUNKTFUNK_NATIVE_PORT";
+const BROWSER_ENV: &str = "PUNKTFUNK_WEBTRANSPORT";
+const BROWSER_PORT_ENV: &str = "PUNKTFUNK_WEBTRANSPORT_PORT";
 
 /// What `serve` binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,11 +93,7 @@ impl ListenPlan {
     /// keeps the default here, because the rule has to name some port.
     pub fn from_host_env(text: &str) -> ListenPlan {
         let env = |key| pf_paths::env_file::get(text, key);
-        let cmd = env("PUNKTFUNK_HOST_CMD").unwrap_or("");
-        let flag = |name: &str| {
-            let mut words = cmd.split_whitespace();
-            words.find(|w| *w == name).and_then(|_| words.next())
-        };
+        let flag = |name| cmd_flag(text, name);
         let d = ListenPlan::default();
         let mgmt = flag("--mgmt-bind").map(|v| v.parse().unwrap_or(d.mgmt));
         let native = flag("--native-port").map(|v| v.parse().unwrap_or(d.native_port));
@@ -100,6 +102,32 @@ impl ListenPlan {
             native_port: pick(native, env(NATIVE_PORT_ENV), d.native_port).unwrap_or(d.native_port),
         }
     }
+}
+
+/// The words of this `host.env`'s `PUNKTFUNK_HOST_CMD`.
+fn host_cmd(text: &str) -> std::str::SplitWhitespace<'_> {
+    pf_paths::env_file::get(text, "PUNKTFUNK_HOST_CMD")
+        .unwrap_or("")
+        .split_whitespace()
+}
+
+/// The word after `name` on this `host.env`'s `PUNKTFUNK_HOST_CMD`.
+fn cmd_flag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let mut words = host_cmd(text);
+    words.find(|w| *w == name).and_then(|_| words.next())
+}
+
+/// The browser plane's UDP port once the Windows service has loaded this `host.env`, or
+/// `None` while the plane is off. `row` is the `webtransport` row as the caller resolves it,
+/// without this file; a `--webtransport` flag, then a `PUNKTFUNK_WEBTRANSPORT` line, outrank
+/// it as they do for `serve`. The port reads as [`ListenPlan::from_host_env`] reads its ports.
+pub fn browser_port_from_host_env(text: &str, row: bool) -> Option<u16> {
+    let env = |key| pf_paths::env_file::get(text, key);
+    let line =
+        env(BROWSER_ENV).and_then(|v| crate::registry::parse_bool(&v.trim().to_ascii_lowercase()));
+    let on = host_cmd(text).any(|w| w == "--webtransport") || line.unwrap_or(row);
+    let flag = cmd_flag(text, "--webtransport-port").map(|v| v.parse().unwrap_or(BROWSER_PORT));
+    on.then(|| pick(flag, env(BROWSER_PORT_ENV), BROWSER_PORT).unwrap_or(BROWSER_PORT))
 }
 
 #[cfg(test)]
@@ -151,6 +179,32 @@ mod tests {
             native_port("PUNKTFUNK_NATIVE_PORT=9800\nPUNKTFUNK_HOST_CMD=serve --gamestream\n"),
             9800
         );
+    }
+
+    /// The browser plane's rule exists only while the plane is on, at the port `serve` binds.
+    #[test]
+    fn the_browser_rule_exists_only_while_the_plane_is_on() {
+        let port = browser_port_from_host_env;
+        assert_eq!(port("", false), None);
+        assert_eq!(port("", true), Some(9778));
+        assert_eq!(port("PUNKTFUNK_WEBTRANSPORT=on\n", false), Some(9778));
+        let off = "PUNKTFUNK_WEBTRANSPORT=0\n";
+        assert_eq!(port(off, true), None, "the line outranks the row");
+        assert_eq!(
+            port("PUNKTFUNK_WEBTRANSPORT=\n", true),
+            Some(9778),
+            "blank is unset"
+        );
+        assert_eq!(port("PUNKTFUNK_WEBTRANSPORT=maybe\n", false), None);
+        let flag = "PUNKTFUNK_WEBTRANSPORT=0\nPUNKTFUNK_HOST_CMD=serve --webtransport\n";
+        assert_eq!(port(flag, false), Some(9778), "the flag outranks the line");
+        let moved = "PUNKTFUNK_WEBTRANSPORT_PORT=9900\n";
+        assert_eq!(port(moved, true), Some(9900));
+        assert_eq!(port(moved, false), None);
+        assert_eq!(port("PUNKTFUNK_WEBTRANSPORT_PORT=x\n", true), Some(9778));
+        let both = "PUNKTFUNK_WEBTRANSPORT_PORT=9900\n\
+                    PUNKTFUNK_HOST_CMD=serve --webtransport-port 9901\n";
+        assert_eq!(port(both, true), Some(9901));
     }
 
     /// `serve` takes a flag over the env value, the default for a blank one, and refuses a

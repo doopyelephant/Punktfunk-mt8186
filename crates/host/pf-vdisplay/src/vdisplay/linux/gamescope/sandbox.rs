@@ -271,7 +271,11 @@ fn nests(bwrap: &Path) -> bool {
 mod tests {
     use super::*;
 
-    /// The shim run against a stand-in flatpak that prints what it got.
+    /// The shim run against a stand-in flatpak that prints what it got. `sh` reads the shim
+    /// instead of executing it: a child a sibling test forks while this process writes a file
+    /// holds that file open for writing until it execs, and `execve` on it then fails with
+    /// `ETXTBSY`. The stand-in is written before the shim, so its window has passed when the
+    /// shim execs it.
     fn run_shim(args: &[&str]) -> String {
         let dir = std::env::temp_dir().join(format!(
             "pf-flatpak-shim-{}-{}",
@@ -286,13 +290,12 @@ mod tests {
             "#!/bin/sh\nprintf '%s|' \"$@\"\nprintf 'WL=%s' \"${WAYLAND_DISPLAY-unset}\"\n",
         )
         .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
         let shim = dir.join("shim");
         std::fs::write(&shim, shim_script(&real)).unwrap();
-        for p in [&real, &shim] {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let out = std::process::Command::new(&shim)
+        let out = std::process::Command::new("sh")
+            .arg(&shim)
             .args(args)
             .env("GAMESCOPE_WAYLAND_DISPLAY", "gamescope-3")
             .env("XDG_RUNTIME_DIR", &dir)

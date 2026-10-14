@@ -42,9 +42,10 @@ classify() {
                 data/platforms.json|ci/rust-ci.Dockerfile|web/src/lib/command-execution.ts|\
                 scripts/ci/ensure-sccache.sh|scripts/ci/install-retrying-curl.sh|\
                 scripts/ci/check-installer-behavior.sh|scripts/ci/check-install-defaults.sh|\
-                scripts/ci/check-unsafe-hygiene.sh|\
+                scripts/ci/check-unsafe-hygiene.sh|scripts/ci/check-android-jni-names.sh|\
+                clients/android/kit/src/main/kotlin/io/unom/punktfunk/kit/NativeBridge.kt|\
                 scripts/unsafe-census.py|scripts/ci/unsafe-census-baseline.json|\
-                packaging/windows/drivers/*.rs|\
+                packaging/windows/drivers/*.rs|packaging/windows/drivers/*/*.inx|\
                 scripts/ci/check-workflow-paths.py|scripts/ci/cargo_graph.py|\
                 scripts/gen-third-party-notices.sh|scripts/gen-third-party-notices.py|\
                 about.toml|about.hbs|\
@@ -125,6 +126,9 @@ self_test() {
         'rust=false rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check android 'clients/android/app/build.gradle.kts' \
         'rust=false rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # The rust job compares its JNI names with the native exports.
+    check android-bridge 'clients/android/kit/src/main/kotlin/io/unom/punktfunk/kit/NativeBridge.kt' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     # A workspace member with no cfg gate: workspace clippy compiles it on Linux, android.yml
     # (cargo-ndk, android cfg) does not stand in for that.
     check android-native 'clients/android/native/src/lib.rs' \
@@ -144,6 +148,9 @@ self_test() {
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     # The unsafe gates in the rust job read the driver workspace's sources too.
     check driver-rust 'packaging/windows/drivers/pf-vdisplay/src/lib.rs' \
+        'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
+    # A driver INF names the hardware ids a Rust table holds, so an INF-only change runs rust.
+    check driver-inf 'packaging/windows/drivers/pf-vdisplay/pf_vdisplay.inx' \
         'rust=true rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'
     check driver-script 'packaging/windows/drivers/deploy-dev.ps1' \
         'rust=false rust_arm64=false web=false docs_site=false sdk_plugin_kit=false decky_typecheck=false'

@@ -260,7 +260,8 @@ impl VirtualDisplay for GamescopeDisplay {
         let exclusive =
             crate::effective_topology(self.client_fp) == crate::policy::Topology::Exclusive;
         // This session's route — never the process env, or a second connect retargets this one.
-        match self.route.clone() {
+        let route = self.route.clone();
+        launch_tracked(|| match route {
             Some(crate::GamescopeRoute::Managed { client }) => {
                 // A joiner shares the running session. Relaunching it at another mode or HDR
                 // would end the owner's stream.
@@ -280,7 +281,7 @@ impl VirtualDisplay for GamescopeDisplay {
             Some(crate::GamescopeRoute::Attach { node }) => create_attach(&node, mode, self.hdr),
             // No resolver on this path: bare spawn, the ladder default.
             Some(crate::GamescopeRoute::Spawn) | None => self.create_spawn(mode, exclusive),
-        }
+        })
     }
 }
 
@@ -546,8 +547,8 @@ fn create_managed_session(client: &str, mode: Mode, hdr: bool) -> Result<Virtual
             if !session_unit_running() {
                 takeover().settle(|s| matches!(s, TakeoverStep::StopSession));
             }
-            // Takeover already happened; arm restore or a failed launch leaves the box sessionless.
-            schedule_restore_tv_session();
+            // No session came up, and the old one was stopped first: hand the box back.
+            hand_back_after_failed_launch();
             return Err(e);
         }
     };
@@ -703,11 +704,11 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
     systemctl_user(&["restart", STEAMOS_SESSION_TARGET]);
     forget_host_short_sessions();
     drop(t);
-    // Takeover already happened; a bare `?` would leave the box headless with no hand-back due.
+    // The target restarted headless: a bare `?` would leave the box with no hand-back due.
     let node_id = match poll_managed_node(Duration::from_secs(30), STEAMOS_SESSION_UNIT) {
         Some(id) => id,
         None => {
-            schedule_restore_tv_session();
+            hand_back_after_failed_launch();
             bail!(
                 "SteamOS headless gamescope node did not appear within 30s after restarting \
                  {STEAMOS_SESSION_TARGET} — check `journalctl --user -u {STEAMOS_SESSION_UNIT}`"
@@ -717,7 +718,7 @@ fn create_managed_session_steamos(mode: Mode, hdr: bool) -> Result<VirtualOutput
     // Stock gamescope here means no HDR and a silently pointerless stream. Leave tracked state
     // unset on failure so the retry restarts rather than reusing what we rejected.
     if let Err(e) = verify_managed_spawn_flags(hdr, Scope::Unit(STEAMOS_SESSION_UNIT)) {
-        schedule_restore_tv_session();
+        hand_back_after_failed_launch();
         return Err(e);
     }
     point_injector_at_eis(Scope::Unit(STEAMOS_SESSION_UNIT));
