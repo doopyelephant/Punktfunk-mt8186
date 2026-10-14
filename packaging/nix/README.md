@@ -22,6 +22,7 @@ can hold: how the packages are built, and the traps.
 | `nixosModules.default` | `services.punktfunk.host` / `.client` / `.web` / `.scripting` / `.seats` |
 | `devShells.…default` | pinned Rust from `rust-toolchain.toml` + every system library |
 | `checks.…nixos-module` | evaluates the module against real nixpkgs and asserts on the rendered units |
+| `checks.…nixos-vm` | boots the module with the real packages in a VM: the user units run, the runner keeps its sandbox. Builds the host; CI runs it under the `ci:nix-rust` label |
 
 One binary covers every GPU vendor: NVENC/CUDA entry points are `dlopen`'d at runtime, so the same
 host runs on NVIDIA, AMD/Intel or software.

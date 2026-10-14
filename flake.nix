@@ -180,6 +180,12 @@
             inherit nixpkgs system;
             module = import ./packaging/nix/nixos-module.nix;
           };
+
+          # The module booted in a VM with the real packages. The eval leg instantiates it; the
+          # `ci:nix-rust` lane builds it.
+          nixos-vm = pkgs.callPackage ./packaging/nix/vm-test.nix {
+            module = self.nixosModules.default;
+          };
         }
       );
 
