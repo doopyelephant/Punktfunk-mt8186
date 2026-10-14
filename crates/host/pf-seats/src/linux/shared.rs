@@ -468,26 +468,59 @@ fn steam_root_of(home: &Path) -> Option<PathBuf> {
     data.is_dir().then_some(data)
 }
 
-/// The Steam a new seat is cloned from: the lowest-uid ordinary user that has one. A box with
-/// several Steam users picks the first; `--steam-source` names another.
-pub(super) fn find_steam_source(users: &[Passwd]) -> Option<PathBuf> {
+/// A Steam install to clone and the user it is read as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SteamSource {
+    pub root: PathBuf,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl SteamSource {
+    /// The install at `root`, read as whoever owns it: `--steam-source`, which the operator names.
+    pub(super) fn owned(root: PathBuf) -> Option<Self> {
+        let meta = std::fs::metadata(&root).ok()?;
+        Some(Self {
+            root,
+            uid: meta.uid(),
+            gid: meta.gid(),
+        })
+    }
+}
+
+/// The Steam a new seat is cloned from: the lowest-uid ordinary user that has one, read as that
+/// user. A box with several Steam users picks the first; `--steam-source` names another.
+pub(super) fn find_steam_source(users: &[Passwd]) -> Option<SteamSource> {
     let mut ordinary: Vec<&Passwd> = users
         .iter()
         .filter(|u| (1000..60000).contains(&u.uid) && !u.gecos.starts_with("punktfunk-seat="))
         .collect();
     ordinary.sort_by_key(|u| u.uid);
-    ordinary.into_iter().find_map(|u| steam_root_of(&u.home))
+    ordinary.into_iter().find_map(|u| {
+        Some(SteamSource {
+            root: steam_root_of(&u.home)?,
+            uid: u.uid,
+            gid: u.gid,
+        })
+    })
 }
 
 /// A Steam under the seat's home, cloned from `source` when there is one, and a library list that
 /// names the shared games folder first. Never fails the seat: without a clone Steam downloads
 /// itself on first run, and without the list it offers games again.
-pub(super) fn provision_steam(state: &Path, passwd: &Passwd, source: Option<&Path>) {
+pub(super) fn provision_steam(
+    state: &Path,
+    id: &SeatId,
+    passwd: &Passwd,
+    source: Option<&SteamSource>,
+) {
     let steam = passwd.home.join(".local/share/Steam");
     if !passwd.home.join(STEAM_MARKER).exists() {
         match source {
             Some(src) => {
-                if let Err(error) = clone_install(src, &steam) {
+                let stage = seat_dir(state, id).join("steam-clone");
+                if let Err(error) = clone_install(src, &stage, &steam, passwd) {
+                    let _ = std::fs::remove_dir_all(&stage);
                     let _ = std::fs::remove_dir_all(&steam);
                     tracing::warn!(%error, "steam clone did not complete; the seat downloads its own");
                 }
@@ -509,26 +542,80 @@ pub(super) fn provision_steam(state: &Path, passwd: &Passwd, source: Option<&Pat
     }
 }
 
-/// `cp -a --reflink=auto` of every non-skipped top-level entry. A filesystem without reflinks
-/// makes a real copy, which takes a while but leaves the seat a working Steam.
-fn clone_install(src: &Path, dst: &Path) -> Result<(), BackendError> {
-    let mut args = vec!["-a".to_owned(), "--reflink=auto".to_owned()];
-    let entries = std::fs::read_dir(src).map_err(|e| io_err("steam_clone", "read steam", e))?;
-    for entry in entries.flatten() {
-        if !excluded_from_clone(&entry.file_name().to_string_lossy()) {
-            args.push(entry.path().to_string_lossy().into_owned());
-        }
-    }
-    if args.len() == 2 {
+/// `cp -a --reflink=auto` of every non-skipped top-level entry, run as the source's user: root
+/// reading a user's tree would follow what that user links. The copy lands in `stage`, which only
+/// root and that user reach, then goes to the seat's user and moves to `dst`. A filesystem without
+/// reflinks makes a real copy, which takes a while but leaves the seat a working Steam.
+fn clone_install(
+    src: &SteamSource,
+    stage: &Path,
+    dst: &Path,
+    seat: &Passwd,
+) -> Result<(), BackendError> {
+    let io = |what: &str, e| io_err("steam_clone", what, e);
+    let names = clone_names(src).map_err(|e| io("read steam", e))?;
+    if names.is_empty() {
         return Err(err(
             "steam_clone",
             "the steam install holds nothing to clone",
         ));
     }
-    std::fs::create_dir_all(dst).map_err(|e| io_err("steam_clone", "create the seat steam", e))?;
-    args.push(dst.to_string_lossy().into_owned());
+    let _ = std::fs::remove_dir_all(stage);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(stage)
+        .map_err(|e| io("create the stage", e))?;
+    std::os::unix::fs::chown(stage, Some(src.uid), Some(src.gid))
+        .map_err(|e| io("own the stage", e))?;
+    let (uid, gid) = (src.uid.to_string(), src.gid.to_string());
+    let mut args = vec![
+        "--reuid".to_owned(),
+        uid,
+        "--regid".to_owned(),
+        gid,
+        "--clear-groups".to_owned(),
+        "cp".to_owned(),
+        "-a".to_owned(),
+        "--reflink=auto".to_owned(),
+        "--".to_owned(),
+    ];
+    args.extend(
+        names
+            .iter()
+            .map(|name| src.root.join(name).to_string_lossy().into_owned()),
+    );
+    args.push(stage.to_string_lossy().into_owned());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    run("steam_clone", "cp", &args).map(drop)
+    run("steam_clone", "setpriv", &args)?;
+    let owner = format!("{}:{}", seat.uid, seat.gid);
+    run(
+        "chown_failed",
+        "chown",
+        &["-R", &owner, &stage.to_string_lossy()],
+    )?;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io("create the seat steam", e))?;
+    }
+    let _ = std::fs::remove_dir_all(dst);
+    std::fs::rename(stage, dst).map_err(|e| io("move the copy into place", e))
+}
+
+/// The top-level entries of `src` a seat inherits. Its folder must be its user's own: one it
+/// links elsewhere would have root list a directory that user can't.
+fn clone_names(src: &SteamSource) -> std::io::Result<Vec<String>> {
+    let dir = safe_open::dir(&src.root)?;
+    if rustix::fs::fstat(&dir)?.st_uid != src.uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} isn't its user's own", src.root.display()),
+        ));
+    }
+    let mut out: Vec<String> = names(&dir)?
+        .into_iter()
+        .filter(|name| !excluded_from_clone(name))
+        .collect();
+    out.sort();
+    Ok(out)
 }
 
 /// Lists the shared games folder first, then the seat's own Steam. Written once; Steam owns the
@@ -759,7 +846,11 @@ mod tests {
         ];
         assert_eq!(
             find_steam_source(&users),
-            Some(temp.path().join("early/.local/share/Steam"))
+            Some(SteamSource {
+                root: temp.path().join("early/.local/share/Steam"),
+                uid: 1001,
+                gid: 1001,
+            })
         );
         assert_eq!(find_steam_source(&users[..2]), None);
     }

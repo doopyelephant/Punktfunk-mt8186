@@ -268,11 +268,11 @@ impl LinuxBackend {
             .remove(id);
     }
 
-    fn steam_source(&self) -> Option<PathBuf> {
-        self.inner.steam_source.clone().or_else(|| {
-            let users = accounts::all().ok()?;
-            shared::find_steam_source(&users)
-        })
+    fn steam_source(&self) -> Option<shared::SteamSource> {
+        match &self.inner.steam_source {
+            Some(root) => shared::SteamSource::owned(root.clone()),
+            None => shared::find_steam_source(&accounts::all().ok()?),
+        }
     }
 
     fn stop_unit(&self, seat: &Seat) -> Result<(), BackendError> {
@@ -508,7 +508,7 @@ impl PlatformBackend for LinuxBackend {
             }
             return Err(error);
         }
-        shared::provision_steam(state, &passwd, self.steam_source().as_deref());
+        shared::provision_steam(state, &seat.id, &passwd, self.steam_source().as_ref());
         Ok(())
     }
 
@@ -547,7 +547,8 @@ impl PlatformBackend for LinuxBackend {
                 shared::token_owner(door.as_ref()),
             )?;
             let source = self.steam_source();
-            let shares = libraries::share(box_dir, state, &seat.id, &passwd, source.as_deref());
+            let root = source.as_ref().map(|s| s.root.as_path());
+            let shares = libraries::share(box_dir, state, &seat.id, &passwd, root);
             let shown = shares.as_ref().map_or(&[][..], |s| s.libraries.as_slice());
             libraries::register(state, &seat.id, &passwd, shown);
             session::write_unit_files(seat, &passwd.home, state, &token, None, shares.as_ref())?;
