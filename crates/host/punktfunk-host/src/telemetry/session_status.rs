@@ -862,6 +862,7 @@ pub fn stolen(stops: &[Arc<AtomicBool>]) {
 }
 
 /// The same for a plane whose one session has no per-session flag in admission (compat).
+#[cfg(feature = "gamestream")]
 pub fn stolen_on(plane: crate::events::Plane) {
     for s in registry().iter().filter(|s| s.plane == plane) {
         s.life.end(SessionEndReason::Stolen);
@@ -1168,6 +1169,7 @@ pub(crate) mod tests {
 
     /// The compat plane keeps one session and no per-session flag in admission, so a steal
     /// there ends it by plane and leaves the native rows alone.
+    #[cfg(feature = "gamestream")]
     #[test]
     fn a_compat_steal_ends_the_plane_session_as_stolen() {
         let _registry = registry_lock();

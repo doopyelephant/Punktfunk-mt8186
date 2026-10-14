@@ -44,9 +44,11 @@ impl Host {
 
 /// The compat plane's media threads, by handle. PLAY tracks what it starts; a wait reaps the
 /// finished and says how many still run. A panic finishes a handle as a return does.
+#[cfg(feature = "gamestream")]
 #[derive(Default)]
 pub struct MediaThreads(std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>);
 
+#[cfg(feature = "gamestream")]
 impl MediaThreads {
     pub fn track(&self, thread: std::thread::JoinHandle<()>) {
         self.0
@@ -105,6 +107,7 @@ pub struct AppState {
     /// The media threads PLAY started. `/resume` and the next PLAY wait on them, so the old
     /// capturer-pool and lease teardown finish before a successor starts; the flags cannot
     /// say once `end_session` has lowered them.
+    #[cfg(feature = "gamestream")]
     pub media: MediaThreads,
     /// Client IDR / reference-frame invalidation request. Video thread forces a keyframe and clears it.
     pub force_idr: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -154,6 +157,7 @@ impl AppState {
             rfi_range: std::sync::Arc::new(std::sync::Mutex::new(None)),
             loss_stats: std::sync::Arc::new(crate::gamestream::GsLossStats::default()),
             counters: Arc::new(crate::session_status::SessionCounters::default()),
+            #[cfg(feature = "gamestream")]
             media: MediaThreads::default(),
             audio_cap: std::sync::Arc::new(std::sync::Mutex::new(None)),
             stats,
