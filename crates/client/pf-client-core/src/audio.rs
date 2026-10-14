@@ -126,8 +126,12 @@ pub struct AudioPlayer {
 }
 
 impl AudioPlayer {
-    /// No PipeWire → `Err`; caller continues video-only.
-    pub fn spawn(fmt: PlaybackFormat) -> Result<AudioPlayer> {
+    /// No PipeWire → `Err`; caller continues video-only. `policy` is the session's
+    /// ([`punktfunk_core::audio::AudioPlayout::jitter`]); the callback owns it from here.
+    pub fn spawn(
+        fmt: PlaybackFormat,
+        policy: punktfunk_core::audio::JitterPolicy,
+    ) -> Result<AudioPlayer> {
         // 64 chunks of slack (320 ms at Opus 5 ms, 128 ms at lossless 2 ms) — still above de-jitter.
         // Chunk COUNT, not scaled to frame duration, matching core `AUDIO_QUEUE`.
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
@@ -142,7 +146,9 @@ impl AudioPlayer {
         let thread = std::thread::Builder::new()
             .name("punktfunk-audio".into())
             .spawn(move || {
-                if let Err(e) = pw_thread(pcm_rx, recycle_tx, quit_rx, fmt, sync_cb, vitals_cb) {
+                if let Err(e) =
+                    pw_thread(pcm_rx, recycle_tx, quit_rx, fmt, policy, sync_cb, vitals_cb)
+                {
                     tracing::warn!(error = %e, "audio playback thread ended");
                 }
             })
@@ -224,6 +230,7 @@ fn pw_thread(
     recycle_tx: SyncSender<Vec<f32>>,
     quit_rx: pipewire::channel::Receiver<Terminate>,
     fmt: PlaybackFormat,
+    policy: punktfunk_core::audio::JitterPolicy,
     sync: Arc<punktfunk_core::audio::AudioSyncCell>,
     vitals: Arc<crate::audio_vitals::PlaybackVitals>,
 ) -> Result<()> {
@@ -284,17 +291,7 @@ fn pw_thread(
         rx: pcm_rx,
         recycle: recycle_tx,
         ring: VecDeque::with_capacity(ring_capacity),
-        policy: {
-            // Resolved format on both axes: `new_at_rate` for samples-per-ms, `set_frame_us`
-            // for the floor and one-frame shed. Defaults at 96 kHz would shed 2.5 frames at a time.
-            let mut p = punktfunk_core::audio::JitterPolicy::new_at_rate(
-                TUNING,
-                fmt.channels as u8,
-                fmt.rate_hz,
-            );
-            p.set_frame_us(fmt.frame_us);
-            p
-        },
+        policy,
         channels,
         fmt,
         negotiated: None,

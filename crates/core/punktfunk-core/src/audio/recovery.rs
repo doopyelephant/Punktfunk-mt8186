@@ -66,9 +66,9 @@ impl AudioGapTracker {
         t
     }
 
-    /// Frame length in microseconds — `audio_frame_us` on a lossless session, [`FRAME_MS`] on Opus.
-    /// Known after `Welcome`; [`new_at_frame_us`](Self::new_at_frame_us) when the value is already in hand.
-    pub fn set_frame_us(&mut self, frame_us: u32) {
+    /// Frame length in microseconds, for a plane that learns it from what it decodes
+    /// ([`super::pad_mix::plc_frames`]). A session's main plane builds at its frame instead.
+    pub(crate) fn set_frame_us(&mut self, frame_us: u32) {
         self.frame_us = frame_us.max(1);
     }
 
@@ -179,13 +179,15 @@ pub struct DroughtConceal {
 
 impl DroughtConceal {
     /// At the protocol's default frame ([`FRAME_MS`]).
-    pub fn new(max_ms: u32) -> DroughtConceal {
+    #[cfg(test)]
+    pub(crate) fn new(max_ms: u32) -> DroughtConceal {
         Self::new_at_frame_us(max_ms, FRAME_MS * 1000)
     }
 
-    /// At an explicitly negotiated frame length. Charges one frame per concealed frame and bounds
-    /// itself in wall-clock milliseconds, so the two have to agree on how long a frame is.
-    pub fn new_at_frame_us(max_ms: u32, frame_us: u32) -> DroughtConceal {
+    /// At the negotiated frame length; clients build one through [`AudioPlayout::drought`].
+    /// Charges one frame per concealed frame and bounds itself in wall-clock milliseconds, so
+    /// the two have to agree on how long a frame is.
+    pub(crate) fn new_at_frame_us(max_ms: u32, frame_us: u32) -> DroughtConceal {
         DroughtConceal {
             concealed: 0,
             max_ms,

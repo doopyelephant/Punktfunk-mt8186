@@ -18,6 +18,7 @@ use ndk::audio::{
     AudioSharingMode, AudioStream, AudioStreamBuilder, AudioUsage,
 };
 use punktfunk_core::audio::plane::{PlaneDecoder, PlaneFormat};
+use punktfunk_core::audio::AudioPlayout;
 use punktfunk_core::client::{AudioPacket, NativeClient};
 use punktfunk_core::error::PunktfunkError;
 use std::collections::VecDeque;
@@ -316,7 +317,8 @@ struct OpenCtx<'a> {
     /// The session's resolved format — what the ring is sized in and what [`arm`] holds an
     /// unspecified-rate rung to.
     fmt: PlaneFormat,
-    tuning: punktfunk_core::audio::JitterTuning,
+    /// The session's playout; every open builds its callback's policy from it.
+    playout: AudioPlayout,
     hard_cap_max: usize,
     game_audio: bool,
     counters: &'a Arc<Counters>,
@@ -520,7 +522,10 @@ fn supervise(
     // 33. Done once for the thread, not once per generation — it is the same thread throughout.
     client.register_hot_thread();
     boost_audio_thread("audio");
-    let tuning = punktfunk_core::audio::JitterTuning::AAUDIO;
+    let playout = AudioPlayout {
+        tuning: punktfunk_core::audio::JitterTuning::AAUDIO,
+        format: fmt,
+    };
     let counters = Arc::new(Counters::default());
     // The A/V sync hand-off: the realtime callback owns the ring (so it publishes the depth and
     // consumes the target), the decode thread owns the timestamps (so it computes the target).
@@ -555,12 +560,12 @@ fn supervise(
         let disconnected = Arc::new(AtomicBool::new(false));
         let ctx = OpenCtx {
             fmt,
-            tuning,
+            playout,
             // Worst transient the ring can hold before the policy trims it. Through the format's
             // own conversion rather than a samples-per-millisecond constant: the cap is a hard
             // ceiling on latency, and one computed 2.3 % shallow on a 44.1-family session would
             // trim a ring that was inside its budget.
-            hard_cap_max: fmt.ms_samples(tuning.hard_cap_ms),
+            hard_cap_max: fmt.ms_samples(playout.tuning.hard_cap_ms),
             game_audio,
             counters: &counters,
             sync: &sync,
@@ -599,7 +604,7 @@ fn supervise(
             shutdown,
             &disconnected,
             &counters,
-            fmt,
+            playout,
             &sync,
         );
         let _ = live.stream.request_stop();
@@ -686,7 +691,7 @@ impl Render {
     fn new(ctx: &OpenCtx, rx: Receiver<Vec<f32>>, free_tx: SyncSender<Vec<f32>>) -> Render {
         let OpenCtx {
             fmt,
-            tuning,
+            playout,
             hard_cap_max,
             ..
         } = *ctx;
@@ -697,13 +702,8 @@ impl Render {
         // session's longer-per-frame chunks never force a one-time realloc on the RT thread
         // (asserted in `decode_loop`).
         let ring = VecDeque::with_capacity(hard_cap_max + RING_CHUNKS * fmt.frame_samples());
-        // The de-jitter policy is told the RESOLVED format on both axes: depths are milliseconds
-        // converted to samples at the session's rate (multiplying first, so 44.1 kHz stays
-        // exact), and the target floor plus the smooth shed are denominated in FRAMES, so a 2 ms
-        // lossless frame is shed and crossfaded as one frame. Microseconds: sub-ms rungs exist.
-        let mut policy =
-            punktfunk_core::audio::JitterPolicy::new_at_rate(tuning, fmt.channels, fmt.rate_hz);
-        policy.set_frame_us(fmt.frame_us);
+        // A fresh policy per open: a device that came back may burst differently.
+        let policy = playout.jitter();
         Render {
             counters: ctx.counters.clone(),
             sync: ctx.sync.clone(),
@@ -922,10 +922,11 @@ fn decode_loop(
     shutdown: &AtomicBool,
     disconnected: &AtomicBool,
     counters: &Counters,
-    fmt: PlaneFormat,
+    playout: AudioPlayout,
     sync: &punktfunk_core::audio::AudioSyncCell,
 ) -> DecodeExit {
-    let mut plane = match Plane::new(client, live, counters, fmt, sync) {
+    let fmt = playout.format;
+    let mut plane = match Plane::new(client, live, counters, playout, sync) {
         Ok(p) => p,
         Err(exit) => return exit,
     };
@@ -985,9 +986,10 @@ impl<'a> Plane<'a> {
         client: &'a NativeClient,
         live: &'a LiveStream,
         counters: &'a Counters,
-        fmt: PlaneFormat,
+        playout: AudioPlayout,
         sync: &'a punktfunk_core::audio::AudioSyncCell,
     ) -> Result<Plane<'a>, DecodeExit> {
+        let fmt = playout.format;
         let channels = usize::from(fmt.channels);
         // An unknown Opus coupling is refused like any other init failure: a guessed pairing
         // plays the wrong speakers.
@@ -1000,19 +1002,9 @@ impl<'a> Plane<'a> {
             );
             DecodeExit::Fatal
         })?;
-        // Everything denominated in FRAMES is told this plane's frame: `MAX_CONCEAL_MS` caps a
-        // single loss event at 50 ms of synthesized audio and derives the packet count from it;
-        // the drought's wall-clock fuse and `plc_ms` are spent at the rate this session paces.
-        let mut gaps = punktfunk_core::audio::AudioGapTracker::new();
-        gaps.set_frame_us(fmt.frame_us);
-        let drought = punktfunk_core::audio::DroughtConceal::new_at_frame_us(
-            punktfunk_core::audio::JitterTuning::AAUDIO.plc_max_ms(),
-            fmt.frame_us,
-        );
         // A/V sync: this thread is the only place holding all three ingredients at once — the
         // packet's host capture `pts_ns`, the ring depth (via the sync cell) and the video plane's
-        // end-to-end figure. At the RESOLVED rate, for the same reason `JitterPolicy` is: the
-        // proposal is denominated in the ring's own samples-per-millisecond.
+        // end-to-end figure.
         let av_sync_enabled = av_sync_enabled();
         if !av_sync_enabled {
             log::info!(
@@ -1031,15 +1023,11 @@ impl<'a> Plane<'a> {
             channels,
             frame_samples: 0,
             window_peak: 0.0,
-            gaps,
-            drought,
+            gaps: playout.gaps(),
+            drought: playout.drought(),
             last_packet: std::time::Instant::now(),
             av_sync_enabled,
-            av: {
-                let mut av = punktfunk_core::audio::AvSync::new_at_rate(fmt.channels, fmt.rate_hz);
-                av.set_frame_us(fmt.frame_us);
-                av
-            },
+            av: playout.sync(),
             video_e2e: client.video_e2e_shared(),
             av_offset_out: client.audio_av_offset_shared(),
             buffer_ms_out: client.audio_buffer_ms_shared(),
