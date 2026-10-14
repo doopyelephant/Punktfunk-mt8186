@@ -15653,14 +15653,15 @@
       },
       "SessionEndReason": {
         "type": "string",
-        "description": "Why a session ended, in the client's own words\n([`punktfunk_core::client::PunktfunkEndReason`]) so both ends name the same end the\nsame way. The bytes match that ABI where the two overlap.\n\n[`Self::StoppedByOperator`] is the one a client cannot see: the host closes it as\ncode 0, which every client reads as `host_ended`.",
+        "description": "Why a session ended, in the client's own words\n([`punktfunk_core::client::PunktfunkEndReason`]) so both ends name the same end the\nsame way. The bytes match that ABI where the two overlap.\n\n[`Self::StoppedByOperator`] and [`Self::Stolen`] are the ones a client cannot see: the\nhost closes them as code 0, which every client reads as `host_ended`.",
         "enum": [
           "local",
           "game_exited",
           "host_ended",
           "host_error",
           "lost",
-          "stopped_by_operator"
+          "stopped_by_operator",
+          "stolen"
         ]
       },
       "SessionInfo": {

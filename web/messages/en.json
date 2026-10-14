@@ -102,6 +102,7 @@
 	"status_last_end_host_error": "the host hit an error",
 	"status_last_end_lost": "the connection was lost",
 	"status_last_end_stopped": "you stopped it",
+	"status_last_end_stolen": "another device took the screen",
 	"audio_wiring_title": "Audio wiring",
 	"audio_output": "Game audio",
 	"audio_microphone": "Microphone",

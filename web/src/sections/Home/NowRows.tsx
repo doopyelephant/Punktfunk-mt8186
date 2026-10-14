@@ -451,6 +451,8 @@ function endedLabel(s: SessionSummary): string {
 			return m.status_last_end_lost();
 		case "stopped_by_operator":
 			return m.status_last_end_stopped();
+		case "stolen":
+			return m.status_last_end_stolen();
 		default: {
 			const unreached: never = s.ended;
 			return unreached;

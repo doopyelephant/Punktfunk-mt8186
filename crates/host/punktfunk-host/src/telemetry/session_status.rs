@@ -849,6 +849,25 @@ pub fn owns_live_session(fp_hex: &str) -> bool {
         .any(|s| !s.join && s.client.len() == 12 && fp_hex.starts_with(s.client.as_str()))
 }
 
+/// A `mode_conflict: steal` is taking the display from every session behind one of `stops`:
+/// end each as `stolen` before its flag is raised, so that is the reason its summary keeps.
+/// Not a deliberate end: the display lingers for the newcomer, the game keeps its window.
+pub fn stolen(stops: &[Arc<AtomicBool>]) {
+    for s in registry()
+        .iter()
+        .filter(|s| stops.iter().any(|v| Arc::ptr_eq(v, s.life.stop_flag())))
+    {
+        s.life.end(SessionEndReason::Stolen);
+    }
+}
+
+/// The same for a plane whose one session has no per-session flag in admission (compat).
+pub fn stolen_on(plane: crate::events::Plane) {
+    for s in registry().iter().filter(|s| s.plane == plane) {
+        s.life.end(SessionEndReason::Stolen);
+    }
+}
+
 /// Tear down every live native session deliberately (mgmt `DELETE /session`).
 ///
 /// A deliberate end, like a client's own Stop: the display skips keep-alive linger and
@@ -1128,6 +1147,40 @@ pub(crate) mod tests {
         assert!(l1.stopping() && l1.quit_flag().load(Ordering::SeqCst));
         assert!(!l2.stopping());
         assert!(!l3.stopping());
+    }
+
+    /// A steal ends exactly the sessions behind the flags admission handed it, as `stolen`
+    /// and as a drop: `quit` stays clear so the display lingers for the newcomer.
+    #[test]
+    fn a_steal_ends_its_victims_as_stolen_and_not_deliberate() {
+        let _registry = registry_lock();
+        let (_g1, victim) = fake_session("aabbccddeeff");
+        let (_g2, other) = fake_session("112233445566");
+        stolen(&[victim.stop_flag().clone()]);
+        assert!(victim.stopping());
+        assert_eq!(victim.reason(), Some(SessionEndReason::Stolen));
+        assert!(
+            !victim.quit_flag().load(Ordering::SeqCst),
+            "a steal is a drop, not a quit"
+        );
+        assert!(!other.stopping());
+    }
+
+    /// The compat plane keeps one session and no per-session flag in admission, so a steal
+    /// there ends it by plane and leaves the native rows alone.
+    #[test]
+    fn a_compat_steal_ends_the_plane_session_as_stolen() {
+        let _registry = registry_lock();
+        let compat = Lifecycle::new();
+        let _g = register(Registration {
+            life: compat.clone(),
+            plane: crate::events::Plane::Gamestream,
+            ..Registration::fake("9f86d0818840")
+        });
+        let (_g2, native) = fake_session("112233445566");
+        stolen_on(crate::events::Plane::Gamestream);
+        assert_eq!(compat.reason(), Some(SessionEndReason::Stolen));
+        assert!(!native.stopping());
     }
 
     /// Each registered session carries its own pad feed, so a Controllers stream

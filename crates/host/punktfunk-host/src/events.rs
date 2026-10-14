@@ -138,8 +138,8 @@ pub struct SessionRef {
 /// ([`punktfunk_core::client::PunktfunkEndReason`]) so both ends name the same end the
 /// same way. The bytes match that ABI where the two overlap.
 ///
-/// [`Self::StoppedByOperator`] is the one a client cannot see: the host closes it as
-/// code 0, which every client reads as `host_ended`.
+/// [`Self::StoppedByOperator`] and [`Self::Stolen`] are the ones a client cannot see: the
+/// host closes them as code 0, which every client reads as `host_ended`.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -156,6 +156,8 @@ pub enum SessionEndReason {
     Lost = 5,
     /// `DELETE /session`, `DELETE /session/{id}`, or unpairing a streaming client.
     StoppedByOperator = 6,
+    /// Another client took the display under `mode_conflict: steal`.
+    Stolen = 7,
 }
 
 impl SessionEndReason {
@@ -168,6 +170,7 @@ impl SessionEndReason {
             4 => Self::HostError,
             5 => Self::Lost,
             6 => Self::StoppedByOperator,
+            7 => Self::Stolen,
             _ => return None,
         })
     }
@@ -863,9 +866,12 @@ mod tests {
             SessionEndReason::from_u8(6),
             Some(SessionEndReason::StoppedByOperator)
         );
-        // 0 is "nothing latched" and 7 is a byte no one writes; neither is an end.
+        // Host-only too: a stolen display closes as code 0 as well.
+        assert_eq!(SessionEndReason::Stolen as u8, 7);
+        assert_eq!(SessionEndReason::from_u8(7), Some(SessionEndReason::Stolen));
+        // 0 is "nothing latched" and 8 is a byte no one writes; neither is an end.
         assert_eq!(SessionEndReason::from_u8(0), None);
-        assert_eq!(SessionEndReason::from_u8(7), None);
+        assert_eq!(SessionEndReason::from_u8(8), None);
     }
 
     /// A paired device's id in the snapshots below.
