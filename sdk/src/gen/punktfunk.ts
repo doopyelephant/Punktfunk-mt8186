@@ -898,12 +898,16 @@ export type UpdateCustomGame400 = ApiError
 export const UpdateCustomGame400 = ApiError
 export type UpdateCustomGame401 = ApiError
 export const UpdateCustomGame401 = ApiError
+export type UpdateCustomGame403 = ApiError
+export const UpdateCustomGame403 = ApiError
 export type UpdateCustomGame404 = ApiError
 export const UpdateCustomGame404 = ApiError
 export type UpdateCustomGame500 = ApiError
 export const UpdateCustomGame500 = ApiError
 export type DeleteCustomGame401 = ApiError
 export const DeleteCustomGame401 = ApiError
+export type DeleteCustomGame403 = ApiError
+export const DeleteCustomGame403 = ApiError
 export type DeleteCustomGame404 = ApiError
 export const DeleteCustomGame404 = ApiError
 export type DeleteCustomGame500 = ApiError
@@ -2296,6 +2300,7 @@ export const make = (
       "2xx": decodeSuccess(UpdateCustomGame200),
       "400": decodeError("UpdateCustomGame400", UpdateCustomGame400),
       "401": decodeError("UpdateCustomGame401", UpdateCustomGame401),
+      "403": decodeError("UpdateCustomGame403", UpdateCustomGame403),
       "404": decodeError("UpdateCustomGame404", UpdateCustomGame404),
       "500": decodeError("UpdateCustomGame500", UpdateCustomGame500),
       orElse: unexpectedStatus
@@ -2306,6 +2311,7 @@ export const make = (
     Effect.flatMap((request) => request.pipe(
       withResponse(options?.config)(HttpClientResponse.matchStatus({
       "401": decodeError("DeleteCustomGame401", DeleteCustomGame401),
+      "403": decodeError("DeleteCustomGame403", DeleteCustomGame403),
       "404": decodeError("DeleteCustomGame404", DeleteCustomGame404),
       "500": decodeError("DeleteCustomGame500", DeleteCustomGame500),
       "204": () => Effect.void,
@@ -3746,12 +3752,12 @@ readonly "getCustomGame": {
     <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly config?: Config | undefined } | undefined): Effect.Effect<WithOptionalResponse<typeof GetCustomGame200.Type, Config | undefined>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"GetCustomGame401", typeof GetCustomGame401.Type> | PunktfunkError<"GetCustomGame404", typeof GetCustomGame404.Type>>;
   }
   readonly "updateCustomGame": {
-    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly payload: typeof UpdateCustomGameRequestJson.Encoded; readonly config: Config }): Effect.Effect<WithOptionalResponse<typeof UpdateCustomGame200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"UpdateCustomGame400", typeof UpdateCustomGame400.Type> | PunktfunkError<"UpdateCustomGame401", typeof UpdateCustomGame401.Type> | PunktfunkError<"UpdateCustomGame404", typeof UpdateCustomGame404.Type> | PunktfunkError<"UpdateCustomGame500", typeof UpdateCustomGame500.Type>>;
-    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly payload: typeof UpdateCustomGameRequestJson.Encoded; readonly config?: Config | undefined }): Effect.Effect<WithOptionalResponse<typeof UpdateCustomGame200.Type, Config | undefined>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"UpdateCustomGame400", typeof UpdateCustomGame400.Type> | PunktfunkError<"UpdateCustomGame401", typeof UpdateCustomGame401.Type> | PunktfunkError<"UpdateCustomGame404", typeof UpdateCustomGame404.Type> | PunktfunkError<"UpdateCustomGame500", typeof UpdateCustomGame500.Type>>;
+    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly payload: typeof UpdateCustomGameRequestJson.Encoded; readonly config: Config }): Effect.Effect<WithOptionalResponse<typeof UpdateCustomGame200.Type, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"UpdateCustomGame400", typeof UpdateCustomGame400.Type> | PunktfunkError<"UpdateCustomGame401", typeof UpdateCustomGame401.Type> | PunktfunkError<"UpdateCustomGame403", typeof UpdateCustomGame403.Type> | PunktfunkError<"UpdateCustomGame404", typeof UpdateCustomGame404.Type> | PunktfunkError<"UpdateCustomGame500", typeof UpdateCustomGame500.Type>>;
+    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly payload: typeof UpdateCustomGameRequestJson.Encoded; readonly config?: Config | undefined }): Effect.Effect<WithOptionalResponse<typeof UpdateCustomGame200.Type, Config | undefined>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"UpdateCustomGame400", typeof UpdateCustomGame400.Type> | PunktfunkError<"UpdateCustomGame401", typeof UpdateCustomGame401.Type> | PunktfunkError<"UpdateCustomGame403", typeof UpdateCustomGame403.Type> | PunktfunkError<"UpdateCustomGame404", typeof UpdateCustomGame404.Type> | PunktfunkError<"UpdateCustomGame500", typeof UpdateCustomGame500.Type>>;
   }
   readonly "deleteCustomGame": {
-    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly config: Config }): Effect.Effect<WithOptionalResponse<void, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"DeleteCustomGame401", typeof DeleteCustomGame401.Type> | PunktfunkError<"DeleteCustomGame404", typeof DeleteCustomGame404.Type> | PunktfunkError<"DeleteCustomGame500", typeof DeleteCustomGame500.Type>>;
-    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly config?: Config | undefined } | undefined): Effect.Effect<WithOptionalResponse<void, Config | undefined>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"DeleteCustomGame401", typeof DeleteCustomGame401.Type> | PunktfunkError<"DeleteCustomGame404", typeof DeleteCustomGame404.Type> | PunktfunkError<"DeleteCustomGame500", typeof DeleteCustomGame500.Type>>;
+    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly config: Config }): Effect.Effect<WithOptionalResponse<void, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"DeleteCustomGame401", typeof DeleteCustomGame401.Type> | PunktfunkError<"DeleteCustomGame403", typeof DeleteCustomGame403.Type> | PunktfunkError<"DeleteCustomGame404", typeof DeleteCustomGame404.Type> | PunktfunkError<"DeleteCustomGame500", typeof DeleteCustomGame500.Type>>;
+    <Config extends OperationConfig | undefined = undefined>(id: string, options: { readonly config?: Config | undefined } | undefined): Effect.Effect<WithOptionalResponse<void, Config | undefined>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"DeleteCustomGame401", typeof DeleteCustomGame401.Type> | PunktfunkError<"DeleteCustomGame403", typeof DeleteCustomGame403.Type> | PunktfunkError<"DeleteCustomGame404", typeof DeleteCustomGame404.Type> | PunktfunkError<"DeleteCustomGame500", typeof DeleteCustomGame500.Type>>;
   }
   /**
 * Curation, not access control: the title leaves every play surface and launch resolution

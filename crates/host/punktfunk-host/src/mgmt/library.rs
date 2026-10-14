@@ -11,7 +11,7 @@
 //!
 //! Pin: `mgmt::tests` lane matrix and `crate::library` art/privilege tests.
 
-use super::auth::{AnyId, AuthLane, OwnedId, ProviderId};
+use super::auth::{AnyId, AuthLane, OwnedId, PluginIdentity, ProviderId};
 use super::shared::*;
 use crate::library::sort_key;
 use axum::extract::Request;
@@ -594,12 +594,14 @@ pub(crate) async fn get_custom_game(Path(id): Path<String>) -> Response {
         (status = OK, description = "Entry updated", body = crate::library::CustomEntry),
         (status = BAD_REQUEST, description = "Empty title", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = FORBIDDEN, description = "A plugin named a row its own provider does not publish", body = ApiError),
         (status = NOT_FOUND, description = "No custom entry with that id", body = ApiError),
         (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the catalog", body = ApiError),
     )
 )]
 pub(crate) async fn update_custom_game(
     Extension(lane): Extension<AuthLane>,
+    who: Option<Extension<PluginIdentity>>,
     Path(id): Path<String>,
     ApiJson(input): ApiJson<crate::library::CustomInput>,
 ) -> Response {
@@ -613,6 +615,9 @@ pub(crate) async fn update_custom_game(
         input.prep.as_deref().unwrap_or(&[]),
         input.icon.as_deref(),
     ) {
+        return denied;
+    }
+    if let Some(denied) = not_the_plugins_row(lane, who, &id) {
         return denied;
     }
     use crate::library::MutateOutcome;
@@ -643,11 +648,19 @@ pub(crate) async fn update_custom_game(
     responses(
         (status = NO_CONTENT, description = "Entry deleted"),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+        (status = FORBIDDEN, description = "A plugin named a row its own provider does not publish", body = ApiError),
         (status = NOT_FOUND, description = "No custom entry with that id", body = ApiError),
         (status = INTERNAL_SERVER_ERROR, description = "Couldn't save the catalog", body = ApiError),
     )
 )]
-pub(crate) async fn delete_custom_game(Path(id): Path<String>) -> Response {
+pub(crate) async fn delete_custom_game(
+    Extension(lane): Extension<AuthLane>,
+    who: Option<Extension<PluginIdentity>>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(denied) = not_the_plugins_row(lane, who, &id) {
+        return denied;
+    }
     use crate::library::MutateOutcome;
     match crate::library::delete_custom(&id) {
         Ok(MutateOutcome::Done(())) => StatusCode::NO_CONTENT.into_response(),
@@ -667,6 +680,27 @@ pub(crate) async fn delete_custom_game(Path(id): Path<String>) -> Response {
         ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// On the plugin lane, a stored row its caller's provider does not publish answers 403: the
+/// operator's rows and another plugin's are not a plugin's to change. The shared runner token
+/// names no provider, so it owns none. An unknown id falls through to the 404.
+fn not_the_plugins_row(
+    lane: AuthLane,
+    who: Option<Extension<PluginIdentity>>,
+    id: &str,
+) -> Option<Response> {
+    if lane != AuthLane::Plugin {
+        return None;
+    }
+    let row = crate::library::get_custom(id)?;
+    let own = who.is_some_and(|Extension(PluginIdentity(me))| row.provider == Some(me));
+    (!own).then(|| {
+        api_error(
+            StatusCode::FORBIDDEN,
+            "A plugin can change only the library rows it publishes.",
+        )
+    })
 }
 
 #[derive(Serialize, ToSchema)]
