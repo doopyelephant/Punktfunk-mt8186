@@ -1,14 +1,14 @@
 //! What seats share and what each keeps: the games folder, the trust copy and the Steam clone.
 //!
-//! Under the box directory (`/var/lib/punktfunk`):
+//! Under the supervisor's state directory ([`super::STATE_DIR`]), root's alone:
 //!
 //! - `games/steamapps/{common,compatdata,shadercache,downloading}` is one library every seat
 //!   writes. `compatdata`, `shadercache` and `downloading` are covered per seat by bind mounts
 //!   (`session.rs`), so Wine prefixes and download state never cross.
 //! - `seats/<id>/` holds the seat user's home, those three private directories, and the box
 //!   owner's libraries as the seat sees them (`libraries.rs`).
-//! - `trust/<id>/` is a read-only copy of the box's identity, pairing store and profiles, so a
-//!   seat user can read what it needs and nothing else in the box directory.
+//! - `trust/<id>/` is a read-only copy of the box's pairing store and profiles from the door's
+//!   directory, so a seat user can read what it needs and nothing else there.
 //! - `seats/hosts/<id>/mgmt-token` is the token the box presents to that seat host's loopback
 //!   API. It belongs to the `punktfunk` user, not the seat group: every seat user is a member.
 
@@ -20,7 +20,9 @@ use crate::model::SeatId;
 use rustix::fs::OFlags;
 use std::collections::HashSet;
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{
+    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -50,32 +52,31 @@ const CLONE_SKIP: &[&str] = &["config", "userdata", "appcache", "steamapps", "lo
 /// presence says the seat already has an install.
 const STEAM_MARKER: &str = ".local/share/Steam/steam.sh";
 
-pub(super) fn seat_dir(box_dir: &Path, id: &SeatId) -> PathBuf {
-    box_dir.join("seats").join(id.as_str())
+pub(super) fn seat_dir(state: &Path, id: &SeatId) -> PathBuf {
+    state.join("seats").join(id.as_str())
 }
 
-pub(super) fn trust_dir(box_dir: &Path, id: &SeatId) -> PathBuf {
-    box_dir.join("trust").join(id.as_str())
+pub(super) fn trust_dir(state: &Path, id: &SeatId) -> PathBuf {
+    state.join("trust").join(id.as_str())
 }
 
-pub(super) fn games_dir(box_dir: &Path) -> PathBuf {
-    box_dir.join("games")
+pub(super) fn games_dir(state: &Path) -> PathBuf {
+    state.join("games")
 }
 
-/// The ledger's directory, `seats` under the box directory: the same path as
-/// `persistence::default_root()` when the box directory is the config dir. Seat directories are
-/// named by id, so they never collide with the ledger's files.
-pub fn ledger_root(box_dir: &Path) -> PathBuf {
-    box_dir.join("seats")
+/// The ledger's directory, `seats` under the state directory: `persistence::default_root()` on
+/// Linux. Seat directories are named by id, so they never collide with the ledger's files.
+pub fn ledger_root(state: &Path) -> PathBuf {
+    state.join("seats")
 }
 
-fn hosts_dir(box_dir: &Path) -> PathBuf {
-    ledger_root(box_dir).join("hosts")
+fn hosts_dir(state: &Path) -> PathBuf {
+    ledger_root(state).join("hosts")
 }
 
 /// Where the box reads a seat host's management token.
-pub(super) fn host_dir(box_dir: &Path, id: &SeatId) -> PathBuf {
-    hosts_dir(box_dir).join(id.as_str())
+pub(super) fn host_dir(state: &Path, id: &SeatId) -> PathBuf {
+    hosts_dir(state).join(id.as_str())
 }
 
 /// The owner of a seat's token file: the `punktfunk` user's `(uid, gid)` when it exists, else
@@ -86,14 +87,14 @@ pub(super) fn token_owner(punktfunk: Option<&Passwd>) -> (u32, u32) {
 
 /// Writes `line` as the seat's token file, `0600` in a `0700` directory, both owned by `owner`.
 pub(super) fn write_host_token(
-    box_dir: &Path,
+    state: &Path,
     id: &SeatId,
     line: &str,
     owner: (u32, u32),
 ) -> Result<(), BackendError> {
     let io = |what: &str, e| io_err("host_token", what, e);
-    make_dir(&hosts_dir(box_dir), 0o711).map_err(|e| io("create the hosts directory", e))?;
-    let dir = host_dir(box_dir, id);
+    make_dir(&hosts_dir(state), 0o711).map_err(|e| io("create the hosts directory", e))?;
+    let dir = host_dir(state, id);
     make_dir(&dir, 0o700).map_err(|e| io("create the token directory", e))?;
     std::os::unix::fs::chown(&dir, Some(owner.0), Some(owner.1))
         .map_err(|e| io("own the token directory", e))?;
@@ -124,19 +125,50 @@ pub(super) fn make_dir(path: &Path, mode: u32) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
-/// The directories every seat needs below the box directory, created if absent. `seats` and
-/// `trust` are `0711`: a seat user walks to its own entry and can't list the others.
-pub(super) fn ensure_layout(box_dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(box_dir)?;
-    make_dir(&ledger_root(box_dir), 0o711)?;
-    make_dir(&hosts_dir(box_dir), 0o711)?;
-    make_dir(&box_dir.join("trust"), 0o711)
+/// The state directory and the directories every seat needs below it, created `0711` if absent:
+/// a seat user walks to its own entry and can't list the others. Each must be a directory this
+/// process owns and no group or other may write; `games`, which every seat writes, only no other.
+pub(super) fn ensure_layout(state: &Path) -> std::io::Result<()> {
+    for dir in [
+        state.to_path_buf(),
+        ledger_root(state),
+        hosts_dir(state),
+        state.join("trust"),
+    ] {
+        match std::fs::DirBuilder::new().mode(0o711).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        check_owned(&dir, 0o022)?;
+    }
+    match check_owned(&games_dir(state), 0o002) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        checked => checked,
+    }
+}
+
+/// Refuses `path` unless it is a directory, not a link, owned by this process's uid, with none
+/// of the `forbidden` mode bits set.
+fn check_owned(path: &Path, forbidden: u32) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    let ours = meta.uid() == rustix::process::geteuid().as_raw();
+    if !meta.is_dir() || !ours || meta.mode() & forbidden != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a directory only the supervisor's uid can change",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The shared games library: group `punktfunk`, setgid, with a default ACL so a file one seat
 /// creates is writable by the others.
-pub(super) fn ensure_games(box_dir: &Path, gid: u32) -> Result<(), BackendError> {
-    let games = games_dir(box_dir);
+pub(super) fn ensure_games(state: &Path, gid: u32) -> Result<(), BackendError> {
+    let games = games_dir(state);
     let steamapps = games.join("steamapps");
     let mut dirs = vec![games, steamapps.clone()];
     for name in ["common", "compatdata", "shadercache", "downloading"] {
@@ -161,8 +193,8 @@ pub(super) fn ensure_games(box_dir: &Path, gid: u32) -> Result<(), BackendError>
 ///
 /// Walks the whole tree each call: cheap for a normal library, slow past millions of files,
 /// where an inotify watch on `steamapps` would fix only what changed.
-pub(super) fn fix_acl(box_dir: &Path) -> Result<(), BackendError> {
-    let games = games_dir(box_dir);
+pub(super) fn fix_acl(state: &Path) -> Result<(), BackendError> {
+    let games = games_dir(state);
     run(
         "setfacl_failed",
         "setfacl",
@@ -174,12 +206,12 @@ pub(super) fn fix_acl(box_dir: &Path) -> Result<(), BackendError> {
 /// The seat's private directories, owned by its user and in place before its unit starts: a
 /// missing bind source fails the unit with `226/NAMESPACE`.
 pub(super) fn ensure_seat_dirs(
-    box_dir: &Path,
+    state: &Path,
     id: &SeatId,
     passwd: &Passwd,
 ) -> Result<(), BackendError> {
     for name in PRIVATE_DIRS {
-        let dir = seat_dir(box_dir, id).join(name);
+        let dir = seat_dir(state, id).join(name);
         let io = |what: &str, e| io_err("seat_dirs", &format!("{what} {}", dir.display()), e);
         make_dir(&dir, 0o700).map_err(|e| io("create", e))?;
         std::os::unix::fs::chown(&dir, Some(passwd.uid), Some(passwd.gid))
@@ -189,11 +221,11 @@ pub(super) fn ensure_seat_dirs(
 }
 
 /// Removes the seat's directories, its trust copy and its token. Missing ones are fine.
-pub(super) fn remove_seat_dirs(box_dir: &Path, id: &SeatId) -> Result<(), BackendError> {
+pub(super) fn remove_seat_dirs(state: &Path, id: &SeatId) -> Result<(), BackendError> {
     for dir in [
-        seat_dir(box_dir, id),
-        trust_dir(box_dir, id),
-        host_dir(box_dir, id),
+        seat_dir(state, id),
+        trust_dir(state, id),
+        host_dir(state, id),
     ] {
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {}
@@ -312,14 +344,16 @@ fn sync_file(src: &Path, dst: &Path, reader: Reader) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// Brings the seat's trust copy level with the box, without the box's identity: a game on the
-/// seat could otherwise answer as the box. Returns whether anything changed.
+/// Brings the seat's trust copy level with the box's files in `box_dir`, without the box's
+/// identity: a game on the seat could otherwise answer as the box. Returns whether anything
+/// changed.
 pub(super) fn refresh_trust(
     box_dir: &Path,
+    state: &Path,
     id: &SeatId,
     reader: Reader,
 ) -> Result<bool, BackendError> {
-    let dst = trust_dir(box_dir, id);
+    let dst = trust_dir(state, id);
     let io = |what: &str, e| io_err("trust_copy", what, e);
     make_dir(&dst, reader.dir_mode()).map_err(|e| io("create the trust copy", e))?;
     std::os::unix::fs::chown(&dst, reader.uid, Some(reader.gid))
@@ -416,7 +450,7 @@ pub(super) fn find_steam_source(users: &[Passwd]) -> Option<PathBuf> {
 /// A Steam under the seat's home, cloned from `source` when there is one, and a library list that
 /// names the shared games folder first. Never fails the seat: without a clone Steam downloads
 /// itself on first run, and without the list it offers games again.
-pub(super) fn provision_steam(box_dir: &Path, passwd: &Passwd, source: Option<&Path>) {
+pub(super) fn provision_steam(state: &Path, passwd: &Passwd, source: Option<&Path>) {
     let steam = passwd.home.join(".local/share/Steam");
     if !passwd.home.join(STEAM_MARKER).exists() {
         match source {
@@ -429,7 +463,7 @@ pub(super) fn provision_steam(box_dir: &Path, passwd: &Passwd, source: Option<&P
             None => tracing::info!("no steam install to clone; the seat downloads its own"),
         }
     }
-    if let Err(error) = write_library_folders(box_dir, &steam) {
+    if let Err(error) = write_library_folders(state, &steam) {
         tracing::warn!(%error, "steam library list not written");
     }
     let local = passwd.home.join(".local");
@@ -467,7 +501,7 @@ fn clone_install(src: &Path, dst: &Path) -> Result<(), BackendError> {
 
 /// Lists the shared games folder first, then the seat's own Steam. Written once; Steam owns the
 /// file afterwards.
-fn write_library_folders(box_dir: &Path, steam: &Path) -> std::io::Result<()> {
+fn write_library_folders(state: &Path, steam: &Path) -> std::io::Result<()> {
     let dir = steam.join("steamapps");
     let file = dir.join("libraryfolders.vdf");
     if file.exists() {
@@ -475,7 +509,7 @@ fn write_library_folders(box_dir: &Path, steam: &Path) -> std::io::Result<()> {
     }
     std::fs::create_dir_all(&dir)?;
     let folders = [
-        games_dir(box_dir).to_string_lossy().into_owned(),
+        games_dir(state).to_string_lossy().into_owned(),
         steam.to_string_lossy().into_owned(),
     ];
     std::fs::write(file, crate::steam::library_folders_vdf(&folders))
@@ -542,6 +576,8 @@ mod tests {
     fn the_trust_copy_follows_the_box_and_is_group_readable_only() {
         let temp = tempfile::tempdir().unwrap();
         let box_dir = temp.path();
+        let state_temp = tempfile::tempdir().unwrap();
+        let state = state_temp.path();
         let gid = own_gid(box_dir);
         box_with_identity(box_dir);
         std::fs::write(box_dir.join("profiles.json"), "{}").unwrap();
@@ -549,11 +585,11 @@ mod tests {
         std::fs::write(box_dir.join("profiles/p1.png"), "png").unwrap();
         std::fs::write(box_dir.join("mgmt-token"), "secret").unwrap();
         // A copy made before seat hosts minted their own identity.
-        let trust = trust_dir(box_dir, &id());
+        let trust = trust_dir(state, &id());
         std::fs::create_dir_all(&trust).unwrap();
         std::fs::write(trust.join("native-key.pem"), "key").unwrap();
 
-        assert!(refresh_trust(box_dir, &id(), Reader::group(gid)).unwrap());
+        assert!(refresh_trust(box_dir, state, &id(), Reader::group(gid)).unwrap());
         assert_eq!(
             std::fs::read_to_string(trust.join("profiles/p1.png")).unwrap(),
             "png"
@@ -564,7 +600,7 @@ mod tests {
             assert!(!trust.join(kept).exists(), "{kept} stays the box's");
         }
         assert!(
-            !refresh_trust(box_dir, &id(), Reader::group(gid)).unwrap(),
+            !refresh_trust(box_dir, state, &id(), Reader::group(gid)).unwrap(),
             "unchanged is a no-op"
         );
 
@@ -572,7 +608,7 @@ mod tests {
         std::fs::write(box_dir.join("profiles.json"), "{\"a\":1}").unwrap();
         std::fs::write(box_dir.join("profiles/p2.png"), "png2").unwrap();
         std::fs::remove_file(box_dir.join("profiles/p1.png")).unwrap();
-        assert!(refresh_trust(box_dir, &id(), Reader::group(gid)).unwrap());
+        assert!(refresh_trust(box_dir, state, &id(), Reader::group(gid)).unwrap());
         assert_eq!(
             std::fs::read_to_string(trust.join("profiles.json")).unwrap(),
             "{\"a\":1}"
@@ -582,7 +618,7 @@ mod tests {
 
         // A file the box drops is dropped from the copy.
         std::fs::remove_file(box_dir.join("profiles.json")).unwrap();
-        assert!(refresh_trust(box_dir, &id(), Reader::group(gid)).unwrap());
+        assert!(refresh_trust(box_dir, state, &id(), Reader::group(gid)).unwrap());
         assert!(!trust.join("profiles.json").exists());
     }
 
@@ -592,13 +628,15 @@ mod tests {
     fn the_owner_s_trust_copy_is_private_to_the_account() {
         let temp = tempfile::tempdir().unwrap();
         let box_dir = temp.path();
+        let state_temp = tempfile::tempdir().unwrap();
+        let state = state_temp.path();
         box_with_identity(box_dir);
         std::fs::create_dir(box_dir.join("profiles")).unwrap();
         std::fs::write(box_dir.join("profiles/a.png"), "png").unwrap();
         let me = std::fs::metadata(box_dir).unwrap();
         let reader = Reader::person(me.uid(), me.gid());
-        assert!(refresh_trust(box_dir, &id(), reader).is_ok());
-        let trust = trust_dir(box_dir, &id());
+        assert!(refresh_trust(box_dir, state, &id(), reader).is_ok());
+        let trust = trust_dir(state, &id());
         assert_eq!(mode(&trust), 0o700);
         assert_eq!(mode(&trust.join("profiles")), 0o700);
         assert_eq!(mode(&trust.join("profiles/a.png")), 0o600);
@@ -609,14 +647,16 @@ mod tests {
     fn a_symlink_in_the_box_is_not_copied() {
         let temp = tempfile::tempdir().unwrap();
         let box_dir = temp.path();
+        let state_temp = tempfile::tempdir().unwrap();
+        let state = state_temp.path();
         box_with_identity(box_dir);
         let secret = box_dir.join("elsewhere");
         std::fs::write(&secret, "root only").unwrap();
         std::os::unix::fs::symlink(&secret, box_dir.join("profiles.json")).unwrap();
         let gid = own_gid(box_dir);
-        let error = refresh_trust(box_dir, &id(), Reader::group(gid)).unwrap_err();
+        let error = refresh_trust(box_dir, state, &id(), Reader::group(gid)).unwrap_err();
         assert_eq!(error.code, "trust_copy");
-        assert!(!trust_dir(box_dir, &id()).join("profiles.json").exists());
+        assert!(!trust_dir(state, &id()).join("profiles.json").exists());
     }
 
     #[test]
@@ -655,10 +695,12 @@ mod tests {
         assert!(!dir.exists());
     }
 
+    /// The door reads a seat host's token below `persistence::default_root()`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_ledger_directory_is_the_default_root() {
         assert_eq!(
-            ledger_root(&pf_paths::config_dir()),
+            ledger_root(Path::new(super::super::STATE_DIR)),
             crate::persistence::default_root()
         );
     }

@@ -15,10 +15,12 @@ Wants=systemd-logind.service
 Before=systemd-user-sessions.service
 
 [Service]
-# Ready once the owner's files are written and the socket is bound.
+# Ready once the owner's files are written and the socket is bound. A first start on a box whose
+# seats live under /var/lib/punktfunk moves them, stopping each seat first: room for that.
 Type=notify
-TimeoutStartSec=30
-# The box host's config directory. The ledger lands in seats/ below it.
+TimeoutStartSec=90
+# The door's directory, whose files the trust copies follow. The supervisor's own state, the
+# ledger included, is /var/lib/punktfunk-seats.
 Environment=PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk
 ExecStart=/usr/libexec/punktfunk/punktfunk-seats serve --socket /run/punktfunk/seats.sock
 # No seat attaches while the supervisor is down, so its stop opens the vhci gate once no seat

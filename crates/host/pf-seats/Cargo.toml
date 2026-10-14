@@ -24,10 +24,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 zeroize = "1"
 
-# `net` reads a socket peer's credentials (SO_PEERCRED) and `fs` opens a file without following a
-# link, both through safe wrappers, so this half keeps `forbid(unsafe_code)`.
+# `net` reads a socket peer's credentials (SO_PEERCRED), `fs` opens a file without following a
+# link and `process` names the uid the state directory must belong to, all through safe wrappers,
+# so this half keeps `forbid(unsafe_code)`.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs", "net"] }
+rustix = { version = "1", features = ["fs", "net", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 pf-paths-win = { path = "../pf-paths-win" }

@@ -14,8 +14,15 @@ use std::path::{Component, Path, PathBuf};
 pub const LEDGER_FILE: &str = "ledger.json";
 
 /// `seats` under the host config dir: `%ProgramData%\punktfunk\seats` for the SYSTEM service.
+#[cfg(not(target_os = "linux"))]
 pub fn default_root() -> PathBuf {
     pf_paths::config_dir().join("seats")
+}
+
+/// `seats` under the Linux supervisor's own state directory, which the door can't write.
+#[cfg(target_os = "linux")]
+pub fn default_root() -> PathBuf {
+    crate::linux::ledger_root(std::path::Path::new(crate::linux::STATE_DIR))
 }
 pub const MAX_LEDGER_BYTES: usize = 64 * 1024;
 const MAX_SECRET_BYTES: usize = 1_048_576;

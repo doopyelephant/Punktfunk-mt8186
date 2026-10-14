@@ -91,8 +91,8 @@ pub(super) fn mint_token() -> String {
 ///
 /// The owner's row keeps the owner's own config directory, host name and GameStream setting: it
 /// is the owner's host, behind the door. `PUNKTFUNK_SEAT_OWNER` tells the runner and the host so.
-pub(super) fn render_env(seat: &Seat, home: &Path, box_dir: &Path, token: &str) -> String {
-    let trust = shared::trust_dir(box_dir, &seat.id);
+pub(super) fn render_env(seat: &Seat, home: &Path, state: &Path, token: &str) -> String {
+    let trust = shared::trust_dir(state, &seat.id);
     let mut rows = vec![
         ("PUNKTFUNK_SEAT_SESSION", "1".to_owned()),
         ("PUNKTFUNK_SEAT_ID", seat.id.to_string()),
@@ -130,13 +130,13 @@ pub(super) fn render_env(seat: &Seat, home: &Path, box_dir: &Path, token: &str) 
 /// A SteamOS-mode Steam adopts every mounted drive holding a `steamapps` as a library, and the
 /// drive as mounted is the owner's alone. Without the proxy the unit starts all the same.
 pub(super) fn render_binds(
-    box_dir: &Path,
+    state: &Path,
     id: &SeatId,
     account: &str,
     shares: Option<&libraries::Shares>,
 ) -> String {
-    let seat = shared::seat_dir(box_dir, id);
-    let shared_steamapps = shared::games_dir(box_dir).join("steamapps");
+    let seat = shared::seat_dir(state, id);
+    let shared_steamapps = shared::games_dir(state).join("steamapps");
     let mut out = String::from("[Service]\nTemporaryFileSystem=/run/media:ro\n");
     for name in PRIVATE_DIRS {
         out.push_str(&format!(
@@ -146,7 +146,7 @@ pub(super) fn render_binds(
         ));
     }
     if let Some(shares) = shares {
-        out.push_str(&libraries::unit_lines(box_dir, id, shares));
+        out.push_str(&libraries::unit_lines(state, id, shares));
     }
     let proxy = pf_paths::seat::uinput_devname(account);
     out.push_str(&format!("BindPaths=-/dev/{proxy}:/dev/uinput\n"));
@@ -199,13 +199,13 @@ pub(super) fn write_if_changed(path: &Path, contents: &str, mode: u32) -> std::i
 pub(super) fn write_env(
     seat: &Seat,
     home: &Path,
-    box_dir: &Path,
+    state: &Path,
     token: &str,
     owner: Option<(u32, u32)>,
 ) -> Result<(), BackendError> {
     let io = |what: &str, error: std::io::Error| err("session_files", format!("{what}: {error}"));
     let path = env_path(&seat.account);
-    write_if_changed(&path, &render_env(seat, home, box_dir, token), 0o600)
+    write_if_changed(&path, &render_env(seat, home, state, token), 0o600)
         .map_err(|e| io("write the seat environment file", e))?;
     if let Some((uid, gid)) = owner {
         std::os::unix::fs::chown(&path, Some(uid), Some(gid))
@@ -220,19 +220,19 @@ pub(super) fn write_env(
 pub(super) fn write_unit_files(
     seat: &Seat,
     home: &Path,
-    box_dir: &Path,
+    state: &Path,
     token: &str,
     owner: Option<(u32, u32)>,
     shares: Option<&libraries::Shares>,
 ) -> Result<(), BackendError> {
     let io = |what: &str, error: std::io::Error| err("session_files", format!("{what}: {error}"));
-    write_env(seat, home, box_dir, token, owner)?;
+    write_env(seat, home, state, token, owner)?;
     let (name, contents) = if seat.owner {
         ("class.conf", render_class().to_owned())
     } else {
         (
             "binds.conf",
-            render_binds(box_dir, &seat.id, &seat.account, shares),
+            render_binds(state, &seat.id, &seat.account, shares),
         )
     };
     let dropin = dropin_dir(&seat.account).join(name);
@@ -369,7 +369,7 @@ mod tests {
         let text = render_env(
             &owner(),
             Path::new("/home/enrico"),
-            Path::new("/var/lib/punktfunk"),
+            Path::new("/var/lib/punktfunk-seats"),
             "ab12",
         );
         assert_eq!(
@@ -377,7 +377,7 @@ mod tests {
             "PUNKTFUNK_SEAT_SESSION=\"1\"\n\
              PUNKTFUNK_SEAT_ID=\"0123456789abcdef0123456789abcdef\"\n\
              PUNKTFUNK_SEAT_OWNER=\"1\"\n\
-             PUNKTFUNK_TRUST_DIR=\"/var/lib/punktfunk/trust/0123456789abcdef0123456789abcdef\"\n\
+             PUNKTFUNK_TRUST_DIR=\"/var/lib/punktfunk-seats/trust/0123456789abcdef0123456789abcdef\"\n\
              PUNKTFUNK_PAIRING=\"refused\"\n\
              PUNKTFUNK_NATIVE_PORT=\"9779\"\n\
              PUNKTFUNK_MGMT_BIND=\"127.0.0.1:47995\"\n\
@@ -393,16 +393,16 @@ mod tests {
     fn the_env_file_carries_the_seat_contract() {
         let text = render_env(
             &seat("Mara"),
-            Path::new("/var/lib/punktfunk/seats/0123456789abcdef0123456789abcdef/home"),
-            Path::new("/var/lib/punktfunk"),
+            Path::new("/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/home"),
+            Path::new("/var/lib/punktfunk-seats"),
             "ab12",
         );
         assert_eq!(
             text,
             "PUNKTFUNK_SEAT_SESSION=\"1\"\n\
              PUNKTFUNK_SEAT_ID=\"0123456789abcdef0123456789abcdef\"\n\
-             PUNKTFUNK_CONFIG_DIR=\"/var/lib/punktfunk/seats/0123456789abcdef0123456789abcdef/home/.config/punktfunk\"\n\
-             PUNKTFUNK_TRUST_DIR=\"/var/lib/punktfunk/trust/0123456789abcdef0123456789abcdef\"\n\
+             PUNKTFUNK_CONFIG_DIR=\"/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/home/.config/punktfunk\"\n\
+             PUNKTFUNK_TRUST_DIR=\"/var/lib/punktfunk-seats/trust/0123456789abcdef0123456789abcdef\"\n\
              PUNKTFUNK_PAIRING=\"refused\"\n\
              PUNKTFUNK_NATIVE_PORT=\"9779\"\n\
              PUNKTFUNK_MGMT_BIND=\"127.0.0.1:47995\"\n\
@@ -445,12 +445,12 @@ mod tests {
     fn the_binds_drop_in_maps_each_private_dir_and_the_uinput_proxy() {
         let id = SeatId::parse("0123456789abcdef0123456789abcdef").unwrap();
         assert_eq!(
-            render_binds(Path::new("/var/lib/punktfunk"), &id, "pf-seat-1", None),
+            render_binds(Path::new("/var/lib/punktfunk-seats"), &id, "pf-seat-1", None),
             "[Service]\n\
              TemporaryFileSystem=/run/media:ro\n\
-             BindPaths=/var/lib/punktfunk/seats/0123456789abcdef0123456789abcdef/compatdata:/var/lib/punktfunk/games/steamapps/compatdata\n\
-             BindPaths=/var/lib/punktfunk/seats/0123456789abcdef0123456789abcdef/shadercache:/var/lib/punktfunk/games/steamapps/shadercache\n\
-             BindPaths=/var/lib/punktfunk/seats/0123456789abcdef0123456789abcdef/downloading:/var/lib/punktfunk/games/steamapps/downloading\n\
+             BindPaths=/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/compatdata:/var/lib/punktfunk-seats/games/steamapps/compatdata\n\
+             BindPaths=/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/shadercache:/var/lib/punktfunk-seats/games/steamapps/shadercache\n\
+             BindPaths=/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/downloading:/var/lib/punktfunk-seats/games/steamapps/downloading\n\
              BindPaths=-/dev/punktfunk/uinput-pf-seat-1:/dev/uinput\n"
         );
     }

@@ -1,7 +1,7 @@
 //! Seat users: one system-range Linux account per seat, owned by an exact GECOS marker.
 //!
 //! The account is created with `useradd -r` so a display manager's greeter never lists it, with
-//! its home under the box directory. The GECOS field carries `punktfunk-seat=<id>`; a user is
+//! its home under the supervisor's state directory. The GECOS field carries `punktfunk-seat=<id>`; a user is
 //! touched or deleted only when that field matches exactly, so a name that collides with a
 //! person's account is refused instead of adopted.
 
@@ -162,7 +162,7 @@ pub(super) fn check_name(account: &str) -> Result<(), BackendError> {
 
 /// The seat's user, created on first use. An existing user is accepted only with the seat's
 /// marker. The second value is whether this call created it.
-pub(super) fn ensure(seat: &Seat, box_dir: &Path) -> Result<(Passwd, bool), BackendError> {
+pub(super) fn ensure(seat: &Seat, state: &Path) -> Result<(Passwd, bool), BackendError> {
     if let Some(existing) = lookup(&seat.account)? {
         return if owned_by(&existing, &seat.id) {
             Ok((existing, false))
@@ -177,7 +177,7 @@ pub(super) fn ensure(seat: &Seat, box_dir: &Path) -> Result<(Passwd, bool), Back
             groups.push(group);
         }
     }
-    let seat_dir = super::shared::seat_dir(box_dir, &seat.id);
+    let seat_dir = super::shared::seat_dir(state, &seat.id);
     super::shared::make_dir(&seat_dir, 0o711)
         .map_err(|e| err("seat_dirs", format!("create {}: {e}", seat_dir.display())))?;
     let home = seat_dir.join("home");
@@ -204,9 +204,14 @@ pub(super) fn ensure(seat: &Seat, box_dir: &Path) -> Result<(Passwd, bool), Back
     Ok((created, true))
 }
 
+/// Whether `passwd` carries a seat's marker, for any seat.
+pub(super) fn is_seat(passwd: &Passwd) -> bool {
+    passwd.gecos.starts_with(MARKER_PREFIX)
+}
+
 /// Whether `passwd` is a person's own account: in the ordinary uid range and not a seat's.
 pub(super) fn is_ordinary(passwd: &Passwd) -> bool {
-    (1000..60000).contains(&passwd.uid) && !passwd.gecos.starts_with(MARKER_PREFIX)
+    (1000..60000).contains(&passwd.uid) && !is_seat(passwd)
 }
 
 /// The owner's account for `account`: it must exist and be an ordinary user. Never created here,
@@ -256,9 +261,9 @@ pub(super) fn delete(seat: &Seat) -> Result<(), BackendError> {
     }
 }
 
-/// Ends everything the user still runs. Its user manager outlives the seat's unit by seconds,
-/// and a user deleted under it leaves live processes on a uid the next seat is handed.
-fn quiesce(account: &str) -> Result<(), BackendError> {
+/// Ends everything the user still runs, before its account is deleted or rehomed. Its user
+/// manager outlives the seat's unit by seconds, and `userdel` or `usermod` refuse a busy user.
+pub(super) fn quiesce(account: &str) -> Result<(), BackendError> {
     let present = || run("loginctl_failed", "loginctl", &["show-user", account]).is_ok();
     if present() {
         let _ = run("loginctl_failed", "loginctl", &["terminate-user", account]);
