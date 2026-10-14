@@ -95,14 +95,13 @@ pub fn acquire(
         vd.set_quit_flag(quit);
         vd.create(mode)
     };
-    // `Created` is existence, not reuse. Linux has `reused_gen`; Windows does
-    // not, so JOIN/linger reuse still reports Created until the manager
-    // surfaces its acquire outcome. Linger expiry has the matching missing
-    // `Released` — see `release`.
+    // A matched pair or none: `Created` only for a display the host made, whose teardown
+    // reports `Released`. Linux: a fresh pool entry. Windows: an owned output; its linger
+    // reuse still reports `Created` and its linger expiry no `Released` (see `release`).
     #[cfg(target_os = "linux")]
-    let created = matches!(&out, Ok(o) if o.reused_gen.is_none());
+    let created = matches!(&out, Ok(o) if o.reused_gen.is_none() && o.pool_gen.is_some());
     #[cfg(not(target_os = "linux"))]
-    let created = out.is_ok();
+    let created = matches!(&out, Ok(o) if o.ownership.pooled());
     if created {
         crate::emit_display_event(crate::DisplayEvent::Created {
             backend: backend.to_string(),
@@ -2584,5 +2583,34 @@ mod tests {
         let out = super::acquire(&mut fake.boxed(), mode, quit, Some(7)).expect("create");
         assert_eq!(out.node_id, 1);
         assert_eq!(fake.take_calls(), [Call::SetQuitFlag, Call::Create(mode)]);
+    }
+
+    /// A joiner's display is another client's, so its acquire emits no `Created`.
+    #[test]
+    fn off_linux_only_an_owned_display_is_created() {
+        let name = "off_linux_only_an_owned_display_is_created";
+        crate::fake::in_child(module_path!(), name, &[], || {
+            let fake = FakeDisplay::new("pf-vdisplay");
+            let log = fake.clone();
+            let sink = move |ev| {
+                if let crate::DisplayEvent::Created { .. } = ev {
+                    log.log(Call::Note("created".into()));
+                }
+            };
+            assert!(crate::DISPLAY_EVENT_SINK.set(Box::new(sink)).is_ok());
+            let quit = || Arc::new(AtomicBool::new(false));
+            let mode = Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            };
+            super::acquire(&mut fake.boxed(), mode, quit(), None).expect("create");
+            fake.script(|s| s.ownership = crate::DisplayOwnership::External);
+            super::acquire(&mut fake.boxed(), mode, quit(), None).expect("join");
+            let notes: Vec<_> = (fake.take_calls().into_iter())
+                .filter(|c| matches!(c, Call::Note(_)))
+                .collect();
+            assert_eq!(notes, [Call::Note("created".into())]);
+        });
     }
 }

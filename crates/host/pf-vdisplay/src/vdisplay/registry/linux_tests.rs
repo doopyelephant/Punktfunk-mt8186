@@ -382,8 +382,9 @@ fn a_kept_display_takes_the_new_mode_or_is_retired_for_a_spawn() {
     });
 }
 
-/// A display the registry does not own goes straight to the session: no pool entry,
-/// its restore left with the backend, and a kept spawn of the same name not offered.
+/// A display the registry does not own goes straight to the session: no pool entry, no
+/// display event, its restore left with the backend, and a kept spawn of the same name not
+/// offered.
 #[test]
 fn a_display_the_registry_does_not_own_passes_through() {
     let name = "a_display_the_registry_does_not_own_passes_through";
@@ -392,6 +393,7 @@ fn a_display_the_registry_does_not_own_passes_through() {
         assert!(registry::park(&mut spawn.boxed(), MODE).expect("park"));
 
         let managed = FakeDisplay::new("gamescope");
+        log_events(&managed);
         managed.script(|s| {
             s.ownership = DisplayOwnership::SessionManaged;
             s.restore = true;
