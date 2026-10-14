@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use pf_driver_proto::encode::FrameToken;
 use pf_driver_proto::encode::au::{self, AuHeader, AuSlot, HeapRing};
-use pf_encode_win::{AuChunk, Encoder};
+use pf_encode_win::{AuChunk, Encoder, TerminalEncoderError};
 use pf_frame::CapturedFrame;
 use pf_frame::pace::{FrameCredit, GapChange, Restamp};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
@@ -391,7 +391,8 @@ impl Drive<'_> {
 
     /// Submit one pool slot, or drop it where dropping is free. A dropped cursor-only frame
     /// marks the pointer changed again, or the gesture's last position is never sent. `false`
-    /// means the backend has failed [`MAX_SUBMIT_FAILURES`] times running and the thread leaves.
+    /// means the thread leaves: the backend refused with a [`TerminalEncoderError`], which no
+    /// retry can clear, or has failed [`MAX_SUBMIT_FAILURES`] times running.
     fn submit_one(&mut self, (slot, qpc, seq): (usize, u64, u64)) -> bool {
         // Back-pressure lands here: no free AU slot, no submit.
         if !self.section_has_free() {
@@ -419,6 +420,10 @@ impl Drive<'_> {
             tracing::info!("encode: submit failed: {e:#}");
             self.release_if_live(slot);
             self.set_state(au::ENCODER_WEDGED);
+            if e.downcast_ref::<TerminalEncoderError>().is_some() {
+                tracing::info!("encode: submit error is terminal — leaving");
+                return false;
+            }
             // A lazy backend re-runs its whole bring-up per submit; stop retrying at the compose
             // rate and leave the session threadless for the host's reset rung.
             self.submit_failures += 1;

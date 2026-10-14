@@ -344,19 +344,22 @@ fn a_reset_frees_the_slots_and_restamps_from_the_new_base() {
     assert_eq!(aus, [(500, KEY), (501, WHOLE)]);
 }
 
-/// The loop does not tell a terminal error from a passing one: it retries the submit on each
-/// new frame, marks the encoder wedged, and leaves after [`MAX_SUBMIT_FAILURES`] in a row.
+/// A terminal submit error ends the thread on the first submit. Any other error is retried on
+/// each new frame, and the thread leaves after [`MAX_SUBMIT_FAILURES`] in a row. Both mark the
+/// encoder wedged.
 #[test]
-fn a_terminal_submit_error_ends_the_thread_after_its_retries() {
-    let mem = Mem::new();
-    let session = session(&mem, 100);
-    let mut enc = FakeEncoder::new(WAVE);
-    (enc.fail_submits, enc.fail_terminal) = (u32::MAX, true);
-    let (aus, taken) = run(&mem, &session, enc, frames(20), true);
-    assert_eq!(taken, u64::from(MAX_SUBMIT_FAILURES));
-    assert!(aus.is_empty());
-    assert_eq!(
-        mem.word(offset_of!(AuHeader, encoder_state)),
-        au::ENCODER_WEDGED
-    );
+fn a_terminal_submit_error_ends_the_thread_at_once() {
+    for (terminal, submits) in [(true, 1), (false, u64::from(MAX_SUBMIT_FAILURES))] {
+        let mem = Mem::new();
+        let session = session(&mem, 100);
+        let mut enc = FakeEncoder::new(WAVE);
+        (enc.fail_submits, enc.fail_terminal) = (u32::MAX, terminal);
+        let (aus, taken) = run(&mem, &session, enc, frames(20), true);
+        assert_eq!(taken, submits, "terminal: {terminal}");
+        assert!(aus.is_empty());
+        assert_eq!(
+            mem.word(offset_of!(AuHeader, encoder_state)),
+            au::ENCODER_WEDGED
+        );
+    }
 }
