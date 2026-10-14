@@ -40,7 +40,7 @@ pub struct NativeVaapiEncoder {
     codec: CodecParams,
     hdr: Option<HdrStatic>,
     force_kf: bool,
-    /// A loss plan's anchor, consumed by the next submit.
+    /// A loss plan's anchor, consumed by the next picture that encodes.
     anchor: Option<usize>,
     /// The newest frame the client confirmed, while the host holds confirmed references.
     reference_floor: Option<crate::Acked>,
@@ -448,10 +448,7 @@ impl Encoder for NativeVaapiEncoder {
         };
         let policy = recovery_policy(session, &self.params);
         let plan = rfi::plan_frame(self.recovery, pending, &policy);
-        let slot = self.anchor.take().or(confirmed);
-        if plan.refs != FrameRef::Chain {
-            self.recovery = Recovery::default();
-        }
+        let slot = self.anchor.or(confirmed);
         // An owed IDR outranks a recovery anchor, as on NVENC and Vulkan.
         match (slot.filter(|_| plan.refs != FrameRef::Idr), plan.wave) {
             (Some(slot), _) => session.encode_anchored(slot)?,
@@ -466,6 +463,9 @@ impl Encoder for NativeVaapiEncoder {
             }
             (None, None) => session.encode(plan.refs == FrameRef::Idr)?,
         }
+        // The picture is in: spend the plan. A failed encode above leaves the anchor, the
+        // owed IDR and the wave as they were, and the retry plans the same frame.
+        self.anchor = None;
         self.force_kf = false;
         self.recovery = plan.next;
         let pts_ns = self.frames * 1_000_000_000 / u64::from(self.params.fps_num.max(1));
