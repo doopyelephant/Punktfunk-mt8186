@@ -583,6 +583,30 @@ struct SlipPrev {
     arm: f64,
 }
 
+/// What a row keeps from one frame to the next, found again by its [`RowKey`]: rows that
+/// come or go around it leave it its own.
+struct RowState {
+    /// Colour channel of focus (alpha, chevrons), eased. Not sprung: overshoot would
+    /// leave the palette. The plate behind the row is the focus mark itself.
+    focus: f64,
+    /// Last-drawn value: the "before" of the crossfade, and whether an adjust landed.
+    /// `None` until the row has drawn.
+    shown: Option<String>,
+    /// Switch knob position, eased toward 0/1 so a flip slides rather than snaps.
+    knob: f64,
+}
+
+/// A row across frames: its label, and how many rows above it carry the same label.
+type RowKey = (String, usize);
+
+/// Where a row's switch rests: on or off, and nowhere for a row without one.
+fn knob_rest(row: &RowSpec) -> f64 {
+    match row.control {
+        Control::Toggle(on) => f64::from(u8::from(on)),
+        _ => 0.0,
+    }
+}
+
 pub struct MenuList {
     pub cursor: usize,
     bump: Spring,
@@ -591,9 +615,8 @@ pub struct MenuList {
     tree: RefCell<Tree>,
     /// The scroll centres the focused row. A finger pan lets go until focus moves.
     follow: bool,
-    /// Colour channel of focus (alpha, chevrons), eased. Not sprung: overshoot would
-    /// leave the palette. The plate behind the row is the focus mark itself.
-    focus: Vec<f64>,
+    /// Each row's state as of the last frame, in that frame's row order.
+    state: Vec<(RowKey, RowState)>,
     /// Stepped-value displacement, chasing 0 from ±[`SLIP_DP`]. Not reset on a
     /// new step: velocity is what lets held repeats accumulate into one travel.
     slip: Spring,
@@ -602,10 +625,6 @@ pub struct MenuList {
     /// Last emitted step direction, consumed next render. The list arms slip by
     /// noticing the value changed; a refused adjust produces none.
     step_dir: i32,
-    /// Last-drawn value per row: the "before" of the crossfade, and whether an adjust landed.
-    shown: Vec<String>,
-    /// Switch knob position per row, eased toward 0/1 so a flip slides rather than snaps.
-    knobs: Vec<f64>,
     /// Mount entrance. Not replayed on a tab switch: `jump_to` seats instantly,
     /// and chasing rows that no longer exist reads as a glitch.
     entrance: Option<Entrance>,
@@ -647,12 +666,10 @@ impl MenuList {
             bump: Spring::rest(0.0),
             tree: RefCell::new(Tree::new()),
             follow: true,
-            focus: Vec::new(),
+            state: Vec::new(),
             slip: Spring::rest(0.0),
             slip_prev: None,
             step_dir: 0,
-            shown: Vec::new(),
-            knobs: Vec::new(),
             entrance: None,
             entrance_armed: false,
             age: 0.0,
@@ -861,43 +878,35 @@ impl MenuList {
         if self.snap {
             // Replaced rows share no history: snap focus, drop slip. A value that
             // "changed" because the row set swapped is not a step.
-            self.focus.clear();
-            self.shown.clear();
+            self.state.clear();
             self.slip = Spring::rest(0.0);
             self.slip_prev = None;
             self.step_dir = 0;
         }
-        self.focus.resize(rows.len(), 0.0);
-        if self.snap || self.knobs.len() != rows.len() {
-            self.knobs.clear();
-            self.knobs.extend(rows.iter().map(|r| match r.control {
-                Control::Toggle(on) => f64::from(u8::from(on)),
-                _ => 0.0,
-            }));
-        }
-        for (knob, row) in self.knobs.iter_mut().zip(rows) {
+        self.carry(rows);
+        for ((_, st), row) in self.state.iter_mut().zip(rows) {
             if let Control::Toggle(on) = row.control {
                 let target = f64::from(u8::from(on));
-                *knob = if reduce {
+                st.knob = if reduce {
                     target
                 } else {
-                    approach(*knob, target, dt, 0.05)
+                    approach(st.knob, target, dt, 0.05)
                 };
-                if (*knob - target).abs() < 0.005 {
-                    *knob = target;
+                if (st.knob - target).abs() < 0.005 {
+                    st.knob = target;
                 }
             }
         }
-        for (i, f) in self.focus.iter_mut().enumerate() {
+        for (i, (_, st)) in self.state.iter_mut().enumerate() {
             let target = if active && i == self.cursor { 1.0 } else { 0.0 };
-            *f = if self.snap {
+            st.focus = if self.snap {
                 target
             } else {
-                approach(*f, target, dt, 0.06)
+                approach(st.focus, target, dt, 0.06)
             };
             // `approach` never arrives; land once the delta is imperceptible so we can settle.
-            if (*f - target).abs() < 0.002 {
-                *f = target;
+            if (st.focus - target).abs() < 0.002 {
+                st.focus = target;
             }
         }
         self.bump.step(0.0, BUMP_K, BUMP_C, dt);
@@ -919,8 +928,11 @@ impl MenuList {
         };
         if let Some(row) = stepped {
             let now = row.value.as_deref().unwrap_or_default();
-            if self.shown.get(self.cursor).is_some_and(|p| p != now) {
-                let prev = self.shown[self.cursor].clone();
+            let shown = self
+                .state
+                .get(self.cursor)
+                .and_then(|(_, st)| st.shown.as_ref());
+            if let Some(prev) = shown.filter(|p| *p != now).cloned() {
                 // Add, never reset `vel`: two fast presses become one accelerating travel.
                 self.slip.pos =
                     (self.slip.pos + SLIP_DP * f64::from(dir)).clamp(-SLIP_MAX, SLIP_MAX);
@@ -945,9 +957,36 @@ impl MenuList {
         }
         // Record every row's value, including culled ones: a stale off-screen
         // value would later fake a change.
-        self.shown.clear();
-        self.shown
-            .extend(rows.iter().map(|r| r.value.clone().unwrap_or_default()));
+        for ((_, st), row) in self.state.iter_mut().zip(rows) {
+            let now = row.value.as_deref().unwrap_or_default();
+            if st.shown.as_deref() != Some(now) {
+                st.shown = Some(now.to_string());
+            }
+        }
+    }
+
+    /// Lines the kept state up with `rows`: each row takes its own from the last frame by
+    /// [`RowKey`], and a new row starts unfocused with its switch at rest.
+    fn carry(&mut self, rows: &[RowSpec]) {
+        let same = self.state.len() == rows.len()
+            && (self.state.iter().zip(rows)).all(|((key, _), row)| key.0 == row.label);
+        if same {
+            return;
+        }
+        let mut last: std::collections::HashMap<RowKey, RowState> =
+            std::mem::take(&mut self.state).into_iter().collect();
+        self.state = (rows.iter().enumerate())
+            .map(|(i, row)| {
+                let twins = rows[..i].iter().filter(|r| r.label == row.label).count();
+                let key = (row.label.clone(), twins);
+                let st = last.remove(&key).unwrap_or(RowState {
+                    focus: 0.0,
+                    shown: None,
+                    knob: knob_rest(row),
+                });
+                (key, st)
+            })
+            .collect();
     }
 
     /// Lays the rows out as cells in a scroll column, follows focus with the scroll and
@@ -1083,21 +1122,15 @@ impl MenuList {
         let cursor = if active { Some(self.cursor) } else { None };
         let focus_target = |i: usize| if Some(i) == cursor { 1.0 } else { 0.0 };
         self.entrance.is_none()
-            && self
-                .focus
-                .iter()
-                .enumerate()
-                .all(|(i, f)| *f == focus_target(i))
+            && (self.state.iter().enumerate()).all(|(i, (_, st))| st.focus == focus_target(i))
             && !self.tree.borrow().plate_busy()
             && self.bump.pos == 0.0
             && self.bump.vel == 0.0
             && self.slip.pos == 0.0
             && scroll_settled
-            && self
-                .knobs
-                .iter()
-                .zip(rows)
-                .all(|(knob, r)| !matches!(r.control, Control::Toggle(on) if *knob != f64::from(u8::from(on))))
+            && (self.state.iter().zip(rows)).all(
+                |((_, st), r)| !matches!(r.control, Control::Toggle(_) if st.knob != knob_rest(r)),
+            )
     }
 
     /// One row at `cell`, its laid-out rect. Bump, entrance rise and focus scale move
@@ -1114,7 +1147,7 @@ impl MenuList {
         k: f64,
         dot_gutter: f64,
     ) {
-        let f = self.focus[i];
+        let f = self.state[i].1.focus;
         let (x0, row_w) = (f64::from(cell.left), f64::from(cell.width()));
         let ent = self
             .entrance
@@ -1230,7 +1263,7 @@ impl MenuList {
             k,
             ..
         } = *fr;
-        let knob = self.knobs.get(i).copied().unwrap_or(0.0);
+        let knob = self.state.get(i).map_or(0.0, |(_, st)| st.knob);
         let (tw, th) = (36.0 * k, 20.0 * k);
         let track = Rect::from_xywh(
             (x0 + row_w - 16.0 * k - tw) as f32,
@@ -1642,6 +1675,51 @@ mod tests {
         let (_, pulse) = list.menu(MenuEvent::Move(MenuDir::Up), 2);
         assert!(matches!(pulse, Some(MenuPulse::Move)));
         assert_eq!(list.cursor, 0);
+    }
+
+    /// A row keeps its own focus and switch when a row above it goes: the state follows the
+    /// row, not its place.
+    #[test]
+    fn a_row_keeps_its_state_when_a_row_above_it_goes() {
+        let ui = &crate::theme::Frame::default();
+        let fonts = crate::theme::build_fonts().unwrap();
+        let mut surface = skia_safe::surfaces::raster_n32_premul((900, 600)).unwrap();
+        let rect = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
+        let rows = |of: &[(&str, bool)]| -> Vec<RowSpec> {
+            of.iter().map(|(l, on)| RowSpec::toggle(*l, *on)).collect()
+        };
+        let mut list = MenuList::new();
+        list.jump_to(2);
+        let three = rows(&[("A", false), ("B", false), ("C", true)]);
+        for _ in 0..120 {
+            list.render(
+                surface.canvas(),
+                ui,
+                rect,
+                &three,
+                &fonts,
+                1.0,
+                1.0 / 60.0,
+                true,
+            );
+        }
+        assert_eq!(list.state[2].1.focus, 1.0);
+        // A goes; the screen keeps its cursor on C, now second.
+        list.cursor = 1;
+        let two = rows(&[("B", false), ("C", true)]);
+        list.render(
+            surface.canvas(),
+            ui,
+            rect,
+            &two,
+            &fonts,
+            1.0,
+            1.0 / 60.0,
+            true,
+        );
+        assert_eq!(list.state[1].1.focus, 1.0, "C stays focused");
+        assert_eq!(list.state[1].1.knob, 1.0, "and on");
+        assert_eq!(list.state[0].1.focus, 0.0, "B stays unfocused");
     }
 
     /// The field being typed leaves its cell for the slot over the keyboard, below the
@@ -2128,7 +2206,7 @@ mod tests {
         );
         assert_eq!(list.bump.pos, 0.0, "recoil travel suppressed");
         // Focus still arrives: reduced motion is not unfocused.
-        assert_eq!(list.focus[0], 1.0);
+        assert_eq!(list.state[0].1.focus, 1.0);
     }
 
     /// Mount entrance arms once, retires when done, and is not replayed by a
