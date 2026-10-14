@@ -104,6 +104,12 @@ pub fn reload() {
     *CURRENT.write().unwrap_or_else(PoisonError::into_inner) = Some(next);
 }
 
+/// A fresh resolution, owned and not swapped in: for a process that reads what another one
+/// writes, as the Windows service does before each host start. [`reload`] would leak one per call.
+pub fn resolve_now() -> Snapshot {
+    build_current()
+}
+
 /// A CLI flag that sets a row outranks env and the store, and the console shows it locked.
 pub fn pin(id: &'static str, flag: &'static str, value: Value) {
     debug_assert!(registry::find(id).is_some(), "pin for unknown row {id}");

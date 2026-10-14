@@ -57,7 +57,9 @@ sudo ufw allow punktfunk-gamestream   # only with Moonlight compat on
 On Windows each rule names the Punktfunk executable as well as the port. The rules cover
 Private and Domain networks; `service install --allow-public-network` adds Public — see
 [Host CLI](/docs/host-cli#service-windows). Another program that answered discovery through
-Punktfunk's 5353 rule needs a rule of its own.
+Punktfunk's 5353 rule needs a rule of its own. The browser client's rule, **Punktfunk Browser**
+(UDP 9778), exists only while **Browser streaming** is on: the service adds or removes it each
+time it starts the host, so it follows the setting at **Restart Punktfunk**.
 
 ## Who can reach the console
 
