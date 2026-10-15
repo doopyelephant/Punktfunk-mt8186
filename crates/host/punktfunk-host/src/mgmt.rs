@@ -84,32 +84,47 @@ pub fn effective_port() -> u16 {
     EFFECTIVE_PORT.get().copied().unwrap_or(0)
 }
 
-/// Write the bound loopback URL to `<config-dir>/mgmt-endpoint`.
+/// Write the bound loopback URL to `<config-dir>/mgmt-endpoint`. `true` when the file named
+/// another port before, so a reader that kept the old one dials the wrong listener.
 ///
 /// `KEY=VALUE` so the console can `EnvironmentFile` it (Windows:
 /// `read_env_file_value`). The host is the source of truth for the port;
 /// consumers keep a 47990 fallback for an older host. Always loopback —
 /// a `0.0.0.0` bind must not become a LAN URL (bearer admin is loopback-only).
 /// Best-effort: a write failure must not stop the host from serving.
-pub fn publish_endpoint(bind: SocketAddr) {
+pub fn publish_endpoint(bind: SocketAddr) -> bool {
     // Set [`effective_port`] before the write: a failed file write must not
     // also drop the in-band Welcome port.
     let _ = EFFECTIVE_PORT.set(bind.port());
     let dir = pf_paths::config_dir();
     if let Err(e) = pf_paths::create_private_dir(&dir) {
         tracing::warn!(error = %e, "config dir for the mgmt endpoint not created");
-        return;
+        return false;
     }
+    let before = published_port(&dir);
     match write_endpoint(&dir, bind.port()) {
         Ok(path) => {
-            tracing::debug!(path = %path.display(), port = bind.port(), "published mgmt endpoint")
+            tracing::debug!(path = %path.display(), port = bind.port(), "published mgmt endpoint");
+            before != bind.port()
         }
-        Err(e) => tracing::warn!(
-            dir = %dir.display(),
-            error = %e,
-            "mgmt endpoint not published — a console on another port will fall back to 47990"
-        ),
+        Err(e) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %e,
+                "mgmt endpoint not published — a console on another port will fall back to 47990"
+            );
+            false
+        }
     }
+}
+
+/// The port `dir`'s endpoint file names: what a consumer dials. A missing or unreadable file
+/// is [`DEFAULT_PORT`], their fallback.
+fn published_port(dir: &std::path::Path) -> u16 {
+    std::fs::read_to_string(dir.join(ENDPOINT_FILE))
+        .ok()
+        .and_then(|s| s.trim().rsplit_once(':')?.1.parse().ok())
+        .unwrap_or(DEFAULT_PORT)
 }
 
 /// IO half of [`publish_endpoint`]. Directory is injected so tests skip
@@ -146,8 +161,8 @@ pub struct Options {
     /// The tray's bearer for `/local/summary` (`mgmt_token::mint_tray_token`). `None` serves
     /// no summary: a seat host, or a token file that did not land.
     pub tray_token: Option<String>,
-    /// This start minted [`Self::plugin_token`]. A runner already up predates it and the TLS
-    /// pin, so it restarts once the API serves.
+    /// This start minted [`Self::plugin_token`] or moved the published endpoint. A runner
+    /// already up predates the token, the TLS pin or the port, so it restarts once the API serves.
     pub restart_runner: bool,
 }
 
@@ -280,7 +295,7 @@ pub async fn run(
     // as it did before.
     let plain = browser_plane.then(bootstrap_app);
     if opts.restart_runner {
-        crate::plugins::restart_runtime_after_first_mint();
+        crate::plugins::restart_stale_runtime();
     }
     serve_https_with_plain(opts.bind, app, tls, plain).await
 }

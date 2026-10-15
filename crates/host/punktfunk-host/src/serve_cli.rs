@@ -191,7 +191,8 @@ pub(crate) fn parse_serve_args(args: &[String]) -> Result<ServeArgs> {
 /// `(mgmt, native, gamestream)`.
 ///
 /// The token exists before the endpoint file names it, and the config-dir ACLs converge before
-/// any runner grant. A first mint of the runner's token marks the runner for a restart.
+/// any runner grant. A first mint of the runner's token, or a moved endpoint, marks the runner
+/// for a restart.
 pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::NativeServe, bool)> {
     let mut opts = mgmt::Options {
         bind: args.mgmt_bind,
@@ -250,8 +251,9 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
         crate::plugins::converge_seat_denies();
     }
     // Same function as the token persist so the console unit sees both. A race falls back to
-    // 47990; `Restart=always` retries.
-    mgmt::publish_endpoint(opts.bind);
+    // 47990; `Restart=always` retries. A runner up before a port move still dials the old one.
+    let moved = mgmt::publish_endpoint(opts.bind);
+    opts.restart_runner |= moved && runner.installed && mints && may_restart;
     // A flag outranks env and the console's value; pinning it lets the console show why.
     if args.gamestream {
         pf_host_config::pin("gamestream", "--gamestream", serde_json::Value::Bool(true));
