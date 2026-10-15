@@ -102,6 +102,18 @@ give_password() {
         sh "$OWN/web.env" "$line" "$PASSWORD_LINE"
 }
 
+# The box's ports as the owner's host.env moves them, which the door binds in its place. Taken on
+# every run: host.env stays the owner's file, and the door never writes a port.
+PORT_LINE='^[[:space:]]*PUNKTFUNK_(MGMT_BIND|NATIVE_PORT)[[:space:]]*='
+
+take_ports() {
+    tmp=$(mktemp "$BOX/.door.XXXXXX")
+    as_user cat -- "$OWN/host.env" 2>/dev/null | grep -E "$PORT_LINE" >"$tmp" || true
+    chown punktfunk:punktfunk "$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$BOX/host.env"
+}
+
 safe_name() {
     case $1 in '' | . | .. | *[!A-Za-z0-9._-]*) return 1 ;; esac
 }
@@ -143,6 +155,7 @@ door_on() {
         take_avatars
         : >"$MARK"
     fi
+    take_ports
     install -d -m 0711 -o root -g root "$STATE"
     printf '%s\n' "$user" >"$STATE/owner.tmp"
     chmod 0600 "$STATE/owner.tmp"
