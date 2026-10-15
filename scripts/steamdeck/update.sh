@@ -200,6 +200,9 @@ esac
 if [ -n "$EXEC" ]; then
     write_host_unit "$EXEC"
 fi
+# An older console unit pinned the port that unit flag held; it reads mgmt-endpoint, as install.sh's does.
+[ "$WEB" = 0 ] || sed -i "s#set +a; export PUNKTFUNK_MGMT_URL=https://127.0.0.1:[0-9]* #[ ! -f $CONFIG/mgmt-endpoint ] || . $CONFIG/mgmt-endpoint; set +a; export #" \
+    "$UNITS/punktfunk-web.service"
 door_yield_web_unit
 systemctl --user daemon-reload
 

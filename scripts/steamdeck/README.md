@@ -64,7 +64,8 @@ Note: the Deck install matches a bare `serve` — native-only, PIN pairing requi
 `--no-gamestream` set the console's **GameStream** setting; change it later under Host → Settings.
 
 Env overrides: `PUNKTFUNK_SRC` (source dir, default `~/punktfunk`), `PUNKTFUNK_BOX` (container name,
-default `pf2`), `PUNKTFUNK_MGMT_PORT` (47990), `PUNKTFUNK_WEB_PORT` (47992).
+default `pf2`), `PUNKTFUNK_MGMT_PORT` (writes `PUNKTFUNK_MGMT_BIND` to `host.env`; default 47990),
+`PUNKTFUNK_WEB_PORT` (47992).
 
 ## What gets installed
 
@@ -73,7 +74,7 @@ default `pf2`), `PUNKTFUNK_MGMT_PORT` (47990), `PUNKTFUNK_WEB_PORT` (47992).
   password + session secret). Trust material (`cert.pem`, `mgmt-token`, `punktfunk1-paired.json`) lives
   here too and persists across updates.
 - **Services:** `~/.config/systemd/user/punktfunk-host.service` — `scripts/punktfunk-host.service`
-  with the Deck's `ExecStart` (`serve --mgmt-bind 0.0.0.0:47990`, `+ --open` if chosen — the native
+  with the Deck's `ExecStart` (`serve`, `+ --open` if chosen; the port is `host.env`'s — the native
   `punktfunk/1` plane is always on; GameStream follows the console's setting, and `update.sh` moves
   an older unit's `--gamestream` into it) and the session environment in
   `punktfunk-host.service.d/steamdeck.conf`,
