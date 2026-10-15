@@ -22,7 +22,7 @@ set -euo pipefail
 
 # --- options ---------------------------------------------------------------
 BOX_IMAGE="${PUNKTFUNK_BOX_IMAGE:-docker.io/library/debian:trixie}"
-MGMT_PORT="${PUNKTFUNK_MGMT_PORT:-47990}"
+MGMT_PORT="${PUNKTFUNK_MGMT_PORT:-}" # empty keeps host.env's port
 WEB_PORT="${PUNKTFUNK_WEB_PORT:-47992}"
 # Where the console listens. Your network by default, since a Deck in Game Mode has no browser;
 # the console refuses peers off the local network. --web-bind=127.0.0.1 keeps it to this Deck.
@@ -233,6 +233,11 @@ EOF
 else
     ok "host.env exists (left as-is)"
 fi
+if [ -n "$MGMT_PORT" ]; then
+    sed -i '/^[[:space:]]*PUNKTFUNK_MGMT_BIND[[:space:]]*=/d' "$CONFIG/host.env"
+    echo "PUNKTFUNK_MGMT_BIND=0.0.0.0:$MGMT_PORT" >>"$CONFIG/host.env"
+    ok "management port $MGMT_PORT (host.env)"
+fi
 
 # KWin authorization for Desktop-Mode streaming (and mid-stream Game↔Desktop switches): KWin
 # resolves a connecting client's /proc/<pid>/exe against a .desktop `Exec=` and only then grants
@@ -357,7 +362,7 @@ if [ -n "$GAMESTREAM" ]; then
         warn "the GameStream choice was not saved; set it in the console's Host settings"
     fi
 fi
-SERVE_ARGS="serve --mgmt-bind 0.0.0.0:$MGMT_PORT"
+SERVE_ARGS="serve"
 [ "$OPEN" = 1 ] && SERVE_ARGS="$SERVE_ARGS --open"
 write_host_unit "$BIN $SERVE_ARGS"
 ok "punktfunk-host.service ($SERVE_ARGS)"
@@ -374,7 +379,7 @@ Description=punktfunk management web console
 After=punktfunk-host.service
 
 [Service]
-ExecStart=$DISTROBOX enter $BOX -- bash -lc 'cd $SRC/web; set -a; . $CONFIG/mgmt-token; . $CONFIG/web.env; set +a; export PUNKTFUNK_MGMT_URL=https://127.0.0.1:$MGMT_PORT PORT=$WEB_PORT NITRO_PORT=$WEB_PORT PUNKTFUNK_UI_TLS_CERT=$CONFIG/cert.pem PUNKTFUNK_UI_TLS_KEY=$CONFIG/key.pem PUNKTFUNK_UI_SECURE=1 PUNKTFUNK_UI_PASSWORD_FILE=$CONFIG/web.env; exec bun .output/server/index.mjs'
+ExecStart=$DISTROBOX enter $BOX -- bash -lc 'cd $SRC/web; set -a; . $CONFIG/mgmt-token; . $CONFIG/web.env; [ ! -f $CONFIG/mgmt-endpoint ] || . $CONFIG/mgmt-endpoint; set +a; export PORT=$WEB_PORT NITRO_PORT=$WEB_PORT PUNKTFUNK_UI_TLS_CERT=$CONFIG/cert.pem PUNKTFUNK_UI_TLS_KEY=$CONFIG/key.pem PUNKTFUNK_UI_SECURE=1 PUNKTFUNK_UI_PASSWORD_FILE=$CONFIG/web.env; exec bun .output/server/index.mjs'
 Restart=on-failure
 RestartSec=3
 
