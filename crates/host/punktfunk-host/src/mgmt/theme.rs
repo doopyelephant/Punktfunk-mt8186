@@ -52,7 +52,9 @@ pub(crate) async fn get_host_theme() -> Json<HostTheme> {
 }
 
 /// Awaited on the host's own runtime, on a bus connection of its own that closes with the
-/// read. The await holds no worker while the portal thinks.
+/// read. The await holds no worker while the portal thinks. Plain method calls, not ashpd's
+/// `Settings`: its proxy caches properties, and on a portal without the Settings interface
+/// zbus warns about the failed `GetAll` on every poll.
 #[cfg(target_os = "linux")]
 async fn read() -> HostTheme {
     // A desktop running no portal must not stall the request. Anything slower than this is
@@ -61,23 +63,18 @@ async fn read() -> HostTheme {
     // worth bounding.
     const BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
     match tokio::time::timeout(BUDGET, async {
-        let Ok(bus) = pf_portal::session_bus().await else {
+        let Ok(conn) = pf_portal::session_bus().await else {
             return HostTheme::default();
         };
-        let Ok(settings) = ashpd::desktop::settings::Settings::with_connection(bus).await else {
-            return HostTheme::default();
-        };
-        // 0 = no preference, 1 = dark, 2 = light (`org.freedesktop.appearance`).
-        let mode = match settings.color_scheme().await {
-            Ok(ashpd::desktop::settings::ColorScheme::PreferDark) => Some("dark".into()),
-            Ok(ashpd::desktop::settings::ColorScheme::PreferLight) => Some("light".into()),
+        // 0 = no preference, 1 = dark, 2 = light.
+        let mode = match appearance::<u32>(&conn, "color-scheme").await {
+            Some(1) => Some("dark".into()),
+            Some(2) => Some("light".into()),
             _ => None,
         };
-        let accent = settings
-            .accent_color()
+        let accent = appearance::<(f64, f64, f64)>(&conn, "accent-color")
             .await
-            .ok()
-            .map(|c| rgb_hex(c.red(), c.green(), c.blue()));
+            .map(|(r, g, b)| rgb_hex(r, g, b));
         // Only claim a source when something actually answered, or a box with no portal
         // would read as "following" a desktop that said nothing.
         let source = (mode.is_some() || accent.is_some()).then(|| "portal".to_string());
@@ -95,6 +92,33 @@ async fn read() -> HostTheme {
             HostTheme::default()
         }
     }
+}
+
+/// One `org.freedesktop.appearance` key. `None` covers every miss: no portal, no Settings
+/// interface, a key this desktop does not publish, or a value of another type.
+#[cfg(target_os = "linux")]
+async fn appearance<T>(conn: &zbus::Connection, key: &str) -> Option<T>
+where
+    T: TryFrom<zbus::zvariant::OwnedValue>,
+{
+    let reply = conn
+        .call_method(
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.Settings"),
+            "Read",
+            &("org.freedesktop.appearance", key),
+        )
+        .await
+        .ok()?;
+    let body = reply.body();
+    // `Read`, because Settings v1 portals have no `ReadOne`. It nests the value in one more
+    // variant; peel it.
+    let value = match body.deserialize::<zbus::zvariant::Value>().ok()? {
+        zbus::zvariant::Value::Value(inner) => *inner,
+        v => v,
+    };
+    T::try_from(value.try_into_owned().ok()?).ok()
 }
 
 /// The portal reports each channel as 0.0..=1.0.
