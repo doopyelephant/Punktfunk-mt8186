@@ -14,6 +14,49 @@ short; the version-bump commit retitles it. Older sections stay as they are.
 
 ---
 
+## v0.44.1
+
+29 commits since v0.44.0. ALPN `pkf2`, C ABI 55 and driver protocol floor 9 stay. Linux Own Steam
+profiles are retired; the API drops the `steam` seat kind and `POST /profiles` drops `desktop`.
+Deep dive: `git log v0.44.0..v0.44.1`
+
+### Versions
+
+| | v0.44.0 | v0.44.1 | Notes |
+|---|---|---|---|
+| Wire protocol | punktfunk/2 | **punktfunk/2** | unchanged; the host marks native video toward LAN peers again (CS5, `SO_PRIORITY`, a qWAVE flow naming the peer) |
+| C ABI | 55 | **55** | unchanged; `include/` has no diff |
+| C headers | — | — | unchanged |
+| Rust edition / MSRV | 2024 / 1.85 | **2024 / 1.85** | unchanged |
+| Workspace crate dirs | 46 | **46** | unchanged; the console, client core and PyroWave decoder also build for the PS5 target `x86_64-sie-ps5` |
+| Virtual-display driver protocol | 9 | **9** | unchanged |
+| Windows virtual-gamepad channel | 3 | **3** | unchanged |
+| Plugin index schema | 1 | **1** | unchanged |
+| Host event schema | 1 | **1** | unchanged |
+| `api/openapi.json` | 0.44.0 | **0.44.1** | `ProfileCreate.desktop` and the `steam` seat kind are gone; `Profile.steam_home` is new |
+| gamescope patch level (`+pfhdrN`) | 31 | **31** | unchanged |
+| `@punktfunk/host` (SDK) | 0.4.0 | **0.4.0** | unchanged |
+| `@punktfunk/plugin-kit` | 0.13.0 | **0.13.0** | unchanged |
+
+### Breaking
+
+- **Own Steam is retired.** At start the host turns each Linux Own Steam profile, and each device
+  seat it migrates, into a profile sharing the owner's desktop; the Steam home stays until a
+  removal with `erase`. `POST /profiles` ignores `desktop`: a seat is a desktop of its own and
+  needs the door on Linux. Seat rows lose the `steam` kind and `steam_sign_in`.
+
+### Knobs
+
+- Gone: `PUNKTFUNK_STEAM_SEAT_HOME` (Steam per seat) and `PUNKTFUNK_STEAM_SEAT_SANDBOX` (Pads per
+  seat).
+- Steam Deck: the host unit runs a bare `serve`; a non-default `--mgmt-bind` from an older unit
+  moves into host.env. The door reads `/var/lib/punktfunk/host.env`, which door-helper fills
+  with the owner's `PUNKTFUNK_MGMT_BIND` and `PUNKTFUNK_NATIVE_PORT`.
+- Mac client: `PUNKTFUNK_PRESENT_MODE=adaptive` keeps the display-link slot while the layer scans
+  out Direct.
+
+---
+
 ## v0.44.0
 
 1114 commits since v0.43.1. **punktfunk/2 only**: the ALPN is the wire version now. **C ABI 55.**

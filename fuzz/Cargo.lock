@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "pf-bitstream"
-version = "0.44.0"
+version = "0.44.1"
 dependencies = [
  "cros-codecs",
  "tracing",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "punktfunk-core"
-version = "0.44.0"
+version = "0.44.1"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -918,6 +918,7 @@ dependencies = [
  "libc",
  "opus",
  "quinn",
+ "quinn-udp",
  "rcgen",
  "reed-solomon-simd",
  "rustls",

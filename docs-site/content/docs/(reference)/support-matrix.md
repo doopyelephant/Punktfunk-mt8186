@@ -389,8 +389,6 @@ SteamOS.
 - **gamescope headless capture on the proprietary NVIDIA driver** — plausible, not well trodden,
   and no probe would catch it failing.
 - **Touch input from a Windows client** — the same code as Linux, not run on a Windows touchscreen.
-- **AV1 10-bit SDR on a Windows AMD or Intel host** — the same encoder settings as HEVC, not yet
-  run on an RDNA3 or Arc card.
 - **Re-applying your resolution after an Omarchy theme switch** — unit-tested, not tried during a
   live stream. If a theme switch costs you your resolution, report it.
 - **`pf-webos` and the browser client** — separate repositories.

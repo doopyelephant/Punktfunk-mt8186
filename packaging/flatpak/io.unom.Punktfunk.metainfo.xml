@@ -84,6 +84,12 @@
   </branding>
 
   <releases>
+    <release version="0.44.1" date="2026-10-16">
+      <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.44.1</url>
+      <description>
+        <p>Players on a Linux host keep their controllers apart, hosts reachable without logging in serve their library, and video gets priority on Wi-Fi again.</p>
+      </description>
+    </release>
     <release version="0.44.0" date="2026-10-15">
       <url type="details">https://git.unom.io/unom/punktfunk/releases/tag/v0.44.0</url>
       <description>
