@@ -171,6 +171,19 @@ pub(crate) fn invalidate() {
     *LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// Whether a device other than `fp_hex` streams on any seat: the host-power busy check for a
+/// box whose sessions run on seat hosts. Blocking, as [`snapshot`].
+pub(crate) fn other_client_on_a_seat(fp_hex: &str) -> bool {
+    someone_else(&snapshot().occupants, fp_hex)
+}
+
+fn someone_else(occupants: &BTreeMap<String, Vec<Occupant>>, fp_hex: &str) -> bool {
+    occupants
+        .values()
+        .flatten()
+        .any(|o| !crate::session_status::is_client(&o.client, fp_hex))
+}
+
 /// A seat host's own config dir, where it keeps its management token.
 fn host_dir(seat: &pf_seats::Seat) -> PathBuf {
     pf_seats::persistence::default_root()
@@ -259,3 +272,29 @@ pub(crate) fn forward(
 
 /// A proxied library page with art can take a while on a cold seat.
 const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+mod tests {
+    use super::{someone_else, Occupant};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn only_the_callers_own_seat_sessions_leave_the_box_free() {
+        let fp = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let on = |client: &str| Occupant {
+            client: client.into(),
+            name: None,
+        };
+        let mut seats = BTreeMap::new();
+        seats.insert("owner".to_string(), vec![on(&fp[..12])]);
+        seats.insert("seat-1".to_string(), vec![]);
+        assert!(!someone_else(&seats, fp), "the caller's own stream");
+        seats.insert("seat-2".to_string(), vec![on("112233445566")]);
+        assert!(someone_else(&seats, fp), "another device on a seat");
+        seats.insert("seat-2".to_string(), vec![on("192.168.1.50")]);
+        assert!(
+            someone_else(&seats, fp),
+            "an anonymous client is always someone else"
+        );
+    }
+}

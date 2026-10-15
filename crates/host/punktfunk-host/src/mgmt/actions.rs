@@ -352,10 +352,20 @@ pub(crate) async fn invoke_action(
     }
     // Another device's LIVE session blocks a cert-lane invoke; your own does not. Admin is
     // never blocked. A GameStream stream is always another device: its cert is never native.
+    // On a box with seats, a stream on any seat host counts too.
     if lane == AuthLane::Cert {
-        let others_native = crate::session_status::other_client_live(fp.unwrap_or(""));
+        let fp_hex = fp.unwrap_or("").to_string();
+        let others_native = crate::session_status::other_client_live(&fp_hex);
         let gamestream = st.app.streaming.load(Ordering::SeqCst);
-        if others_native || gamestream {
+        let on_seat = match blocking("seat check", move || {
+            crate::seats::other_client_on_a_seat(&fp_hex)
+        })
+        .await
+        {
+            Ok(busy) => busy,
+            Err(resp) => return resp,
+        };
+        if others_native || gamestream || on_seat {
             return api_error(
                 StatusCode::CONFLICT,
                 "Another device is streaming from this host right now",

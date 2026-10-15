@@ -3,9 +3,9 @@
 //! discovery route reports.
 //!
 //! Linux drives logind over zbus, authorized for group `punktfunk` by
-//! `packaging/linux/49-punktfunk-power.rules`. Calls omit `-ignore-inhibit`
-//! and `-multiple-sessions`: a foreign inhibitor or a second local user makes
-//! logind refuse, and that is a `409 blocked`.
+//! `packaging/linux/49-punktfunk-power.rules`. A foreign inhibitor or a second
+//! local user makes logind refuse, and that is a `409 blocked`. The door has no
+//! session, so `49-punktfunk-door.rules` grants it the second-user variants.
 //! Windows uses the interactive token's `SeShutdownPrivilege`. Other platforms
 //! have no executor; the mgmt route answers `501`.
 //!

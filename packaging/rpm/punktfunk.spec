@@ -413,6 +413,7 @@ done
 for f in punktfunk-seats.service punktfunk-seat@.service; do
   install -Dm0644 packaging/linux/$f %{buildroot}%{_unitdir}/$f
 done
+install -Dm0644 packaging/linux/punktfunk-seats-user.conf %{buildroot}%{_unitdir}/user@.service.d/50-punktfunk-seats.conf
 install -Dm0644 packaging/linux/punktfunk-seats.tmpfiles %{buildroot}%{_tmpfilesdir}/punktfunk-seats.conf
 # A seat's pads: udev hands each one to its seat's user alone.
 install -Dm0644 packaging/linux/65-punktfunk-seats.rules %{buildroot}%{_udevrulesdir}/65-punktfunk-seats.rules
@@ -710,6 +711,7 @@ install -Dm0755 "$(command -v bun)" %{buildroot}%{_libexecdir}/punktfunk-bun/bun
 %{_libexecdir}/punktfunk/door-helper
 %{_unitdir}/punktfunk-seats.service
 %{_unitdir}/punktfunk-seat@.service
+%{_unitdir}/user@.service.d/50-punktfunk-seats.conf
 %{_unitdir}/punktfunk-door.service
 %{_unitdir}/punktfunk-web-door.service
 %{_unitdir}/punktfunk-door-on@.service

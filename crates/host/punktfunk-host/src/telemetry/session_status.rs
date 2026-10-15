@@ -828,15 +828,18 @@ pub fn stop_by_fingerprint(fp_hex: &str) -> usize {
     n
 }
 
+/// Whether a session's `client` label is `fp_hex`: the 12-char fingerprint prefix. An
+/// anonymous IP label is never anyone's.
+pub fn is_client(label: &str, fp_hex: &str) -> bool {
+    label.len() == 12 && fp_hex.starts_with(label)
+}
+
 /// Whether any live native session belongs to a client other than `fp_hex`.
 ///
 /// Busy check for host-power: a granted guest must not power off the host
-/// while someone else is streaming. Label match as in [`stop_by_fingerprint`].
-/// An anonymous IP-labelled session always counts as another client.
+/// while someone else is streaming. An anonymous session always counts.
 pub fn other_client_live(fp_hex: &str) -> bool {
-    registry()
-        .iter()
-        .any(|s| !(s.client.len() == 12 && fp_hex.starts_with(s.client.as_str())))
+    registry().iter().any(|s| !is_client(&s.client, fp_hex))
 }
 
 /// Whether `fp_hex` owns a live session: its own display, not a join onto another's.
