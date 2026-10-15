@@ -769,6 +769,8 @@ in
         wantedBy = [ "multi-user.target" ];
         path = seatPath;
       };
+      # packaging/linux/punktfunk-seats-user.conf: a lingering owner's units wait for the contract.
+      systemd.services."user@".after = [ "punktfunk-seats.service" ];
 
       systemd.services."punktfunk-seat@" = {
         path = seatPath;
