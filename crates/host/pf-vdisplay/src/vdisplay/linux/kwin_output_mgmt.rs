@@ -493,15 +493,23 @@ impl std::fmt::Display for OpenFailure {
 
 impl Session {
     /// [`Session::connect`] named by `op`. One log site for every caller: without it a
-    /// miss just looks like `kscreen-doctor` was slow.
+    /// miss just looks like `kscreen-doctor` was slow. No Wayland connection is `debug`:
+    /// the console's monitor list asks outside any session, and a stream without one
+    /// already fails at create.
     fn open(op: &'static str) -> Result<Session, OpenFailure> {
         let opened = Session::connect();
-        if let Err(reason) = &opened {
-            tracing::warn!(
+        match &opened {
+            Ok(_) => {}
+            Err(reason @ OpenFailure::Connect(_)) => tracing::debug!(
                 op,
                 %reason,
                 "KWin in-process output management unavailable — falling back to kscreen-doctor"
-            );
+            ),
+            Err(reason) => tracing::warn!(
+                op,
+                %reason,
+                "KWin in-process output management unavailable — falling back to kscreen-doctor"
+            ),
         }
         opened
     }
