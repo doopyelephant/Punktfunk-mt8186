@@ -5,7 +5,7 @@ use super::{
     validate_block_shape, validate_encode_shape, validate_into_shape, ErasureCoder, FecError,
 };
 use crate::config::FecScheme;
-use reed_solomon_simd::ReedSolomonEncoder;
+use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -14,6 +14,8 @@ pub struct Gf16Coder {
     /// `Mutex` keeps the `&self` trait surface; the session's one send thread
     /// holds it uncontended.
     enc: Mutex<Option<ReedSolomonEncoder>>,
+    /// Cached decoder, the receive side's twin of `enc`.
+    dec: Mutex<Option<ReedSolomonDecoder>>,
 }
 
 impl ErasureCoder for Gf16Coder {
@@ -147,30 +149,34 @@ impl ErasureCoder for Gf16Coder {
         if data[0].len() % 2 != 0 {
             return Err(FecError::Config("GF(2^16) shard length must be even"));
         }
-        let data_count = data.len();
-        // Indexed refs into the caller's slots; decoder returns owned shards,
-        // so these borrows end before the write-back below.
-        let original_in: Vec<(usize, &[u8])> = data
-            .iter()
-            .zip(have)
-            .enumerate()
-            .filter(|&(_, (_, &h))| h)
-            .map(|(i, (s, _))| (i, &**s))
-            .collect();
-        let restored = reed_solomon_simd::decode(
-            data_count,
-            recovery_count,
-            original_in,
-            recovery.iter().copied(),
-        )
-        .map_err(|_| FecError::Backend("gf16 decode"))?;
-        for (i, h) in have.iter().enumerate() {
-            if !*h {
-                let shard = restored
-                    .get(&i)
-                    .ok_or(FecError::Backend("gf16 decode left an original missing"))?;
-                data[i].copy_from_slice(shard);
+        let (data_count, shard_len) = (data.len(), data[0].len());
+        let mut guard = self.dec.lock().unwrap_or_else(|p| p.into_inner());
+        let dec = match guard.as_mut() {
+            Some(dec) => {
+                dec.reset(data_count, recovery_count, shard_len)
+                    .map_err(|_| FecError::Backend("gf16 decoder reset"))?;
+                dec
             }
+            None => guard.insert(
+                ReedSolomonDecoder::new(data_count, recovery_count, shard_len)
+                    .map_err(|_| FecError::Backend("gf16 decoder init"))?,
+            ),
+        };
+        for (i, s) in data.iter().enumerate().filter(|&(i, _)| have[i]) {
+            dec.add_original_shard(i, &**s)
+                .map_err(|_| FecError::Backend("gf16 add shard"))?;
+        }
+        for &(j, bytes) in recovery {
+            dec.add_recovery_shard(j, bytes)
+                .map_err(|_| FecError::Backend("gf16 add shard"))?;
+        }
+        // Restored shards are read out of the decoder's work space into the caller's slots.
+        let restored = dec.decode().map_err(|_| FecError::Backend("gf16 decode"))?;
+        for (i, slot) in data.iter_mut().enumerate().filter(|&(i, _)| !have[i]) {
+            let shard = restored
+                .restored_original(i)
+                .ok_or(FecError::Backend("gf16 decode left an original missing"))?;
+            slot.copy_from_slice(shard);
         }
         Ok(())
     }

@@ -214,11 +214,14 @@ mod tests {
         }
     }
 
+    /// One coder across shapes: the cached decoder reshapes between blocks.
     #[test]
     fn gf16_reconstruct_into_fills_only_the_holes() {
-        roundtrip_into(&Gf16Coder::default(), 16, 4, 256, &[1, 9], &[3]);
-        roundtrip_into(&Gf16Coder::default(), 4, 2, 16, &[0, 3], &[]);
-        roundtrip_into(&Gf16Coder::default(), 4, 2, 16, &[], &[0, 1]);
+        let coder = Gf16Coder::default();
+        roundtrip_into(&coder, 16, 4, 256, &[1, 9], &[3]);
+        roundtrip_into(&coder, 4, 2, 16, &[0, 3], &[]);
+        roundtrip_into(&coder, 4, 2, 16, &[], &[0, 1]);
+        roundtrip_into(&coder, 16, 4, 256, &[0, 15], &[0, 2]);
     }
 
     #[test]
