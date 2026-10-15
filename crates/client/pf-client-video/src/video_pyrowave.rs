@@ -1,7 +1,8 @@
 //! PyroWave client decode on the presenter's VkDevice: decode + CSC + present on one
 //! device, no interop (design/pyrowave-codec-plan.md). One AU is one self-delimiting
-//! packet: `push_packet` → ready → `decode_gpu_buffer` into our command buffer,
-//! submitted under [`QueueLock`], fence-waited.
+//! packet: `push_packet` → ready → `decode_gpu_buffer` into the slot's command buffer,
+//! submitted under [`QueueLock`] and not waited: the frame is done when the decoder's
+//! [`DecodeTimeline`] reaches its `turn` ([`PyroWaveDecoder::wait_ready`]).
 //!
 //! Output is three planes (Y full-res; Cb/Cr half-res, or full-res on 4:4:4; R8, or R16
 //! UNORM at 10-bit), drawn by fragment passes where pyrowave prefers them, else by compute.
@@ -12,15 +13,13 @@
 //! The presenter does not pin its originals, so [`Hold`] reconstructs content-equivalent
 //! ones from [`VulkanDecodeDevice`]. Pointer identity is not required.
 //!
-//! The decoder object is fixed-size. [`au_dims`] sniffs each frame's sequence header
-//! and [`PyroWaveDecoder::reconfigure`] rebuilds decoder + plane ring in place; device,
-//! command pool and pinned create-infos survive. A frame holds its ring ([`PlaneRing`]);
-//! a superseded ring is also retired for consumers that sample without holding the frame
-//! (see [`RETIRE_HANDOVERS`]).
+//! The decoder object is fixed-size: [`au_dims`] sniffs each sequence header and
+//! [`PyroWaveDecoder::reconfigure`] rebuilds decoder + plane ring in place. A frame holds its
+//! ring ([`PlaneRing`]); a superseded ring is also retired ([`RETIRE_HANDOVERS`]).
 //!
 //! Decoder invariants every method's SAFETY leans on: `device` is the presenter's live
-//! device, which outlives the decoder; `pw_dev`, `pw_dec`, the rings, `cmd` and `fence`
-//! are this decoder's own; the shared queue is touched only under `queue_lock`.
+//! device, which outlives the decoder; `pw_dev`, `pw_dec`, the rings, `cmds` and the
+//! timeline are this decoder's own; the shared queue is touched only under `queue_lock`.
 
 use crate::video_color::ColorDesc;
 use crate::video_vk::{QueueLock, VulkanDecodeDevice};
@@ -32,9 +31,12 @@ use std::ffi::{c_char, c_void, CString};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Decode writes slot N while the presenter may still sample N-1/N-2. Same-queue FIFO
-/// already serializes writes vs. reads per slot; 4 covers ≤ 1–2 frames of present latency.
+/// Slots, each a plane set and a command buffer. Decode writes slot N while N-1 may still be
+/// on the GPU and the presenter may sample N-1/N-2; reuse waits for frame N-RING.
 const RING: usize = 4;
+
+/// A decode that has not finished in this long is a lost device, not a slow one.
+const DECODE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Handovers after a resize before a retired ring's images may be destroyed. The
 /// pump→presenter channel (depth 2, newest-wins) can still hold an old-ring frame, and
@@ -206,7 +208,8 @@ unsafe extern "C" fn queue_unlock_cb(ud: *mut c_void) {
     unsafe { (*(ud as *const QueueLock)).unlock() }
 }
 
-/// Fence-waited decode output on the presenter's device, GENERAL layout.
+/// Decode output on the presenter's device, GENERAL layout. Later work on the same queue may
+/// sample it at once; any other reader calls [`PyroWaveDecoder::wait_ready`] first.
 pub struct PyroWavePlanarFrame {
     /// Keeps the planes alive past a resize or the decoder's end. A consumer that may
     /// sample the frame again holds the frame.
@@ -226,7 +229,42 @@ pub struct PyroWavePlanarFrame {
     /// Independently decodable — always a clean re-anchor.
     pub keyframe: bool,
     /// This frame's present turn ([`QueueLock::offer_present_turn`]); the presenter ends it.
+    /// Also the [`DecodeTimeline`] value its decode signals.
     pub turn: u64,
+}
+
+/// One timeline semaphore per decoder; each decode submit signals its frame's `turn`. Shared
+/// so another thread can wait for a frame. The last holder destroys the semaphore, and must
+/// drop before the device does.
+pub struct DecodeTimeline {
+    device: ash::Device,
+    sem: vk::Semaphore,
+}
+
+impl DecodeTimeline {
+    /// Block until frame `turn` has decoded, or `timeout` passes.
+    pub fn wait(&self, turn: u64, timeout: Duration) -> Result<()> {
+        let sems = [self.sem];
+        let values = [turn];
+        // SAFETY: `sem` is this timeline's live semaphore; the wait info borrows locals.
+        unsafe {
+            self.device.wait_semaphores(
+                &vk::SemaphoreWaitInfo::default()
+                    .semaphores(&sems)
+                    .values(&values),
+                timeout.as_nanos() as u64,
+            )
+        }
+        .context("pyrowave decode timeline")
+    }
+}
+
+impl Drop for DecodeTimeline {
+    fn drop(&mut self) {
+        // SAFETY: the decoder idles the queue before it lets go, so no submit still signals
+        // `sem`, and every other holder is done waiting on it.
+        unsafe { self.device.destroy_semaphore(self.sem, None) };
+    }
 }
 
 struct PlaneSet {
@@ -434,8 +472,11 @@ pub struct PyroWaveDecoder {
     retired: Vec<RetiredRing>,
     next: usize,
     cmd_pool: vk::CommandPool,
-    cmd: vk::CommandBuffer,
-    fence: vk::Fence,
+    cmds: [vk::CommandBuffer; RING],
+    timeline: Arc<DecodeTimeline>,
+    /// Per slot: the turn its last submit signals; 0 before the first.
+    slot_turn: [u64; RING],
+    last_submit: Instant,
     mem_props: vk::PhysicalDeviceMemoryProperties,
     width: u32,
     height: u32,
@@ -462,7 +503,8 @@ pub struct DecodeSplit {
     pub parse_us: u32,
     /// Command recording, payload upload included (CPU).
     pub record_us: u32,
-    /// Submit to fence: the GPU's own time plus whatever queued ahead of it.
+    /// Submit to done, as [`PyroWaveDecoder::wait_ready`] saw it: the GPU's own time plus
+    /// whatever queued ahead of it. 0 until a caller waits.
     pub gpu_us: u32,
 }
 
@@ -480,7 +522,7 @@ impl PyroWaveDecoder {
         color: ColorDesc,
         hdr16: bool,
     ) -> Result<PyroWaveDecoder> {
-        if !vkd.pyrowave_decode {
+        if !vkd.pyrowave_decode || !vkd.f_timeline_semaphore {
             bail!("presenter device lacks the PyroWave compute feature set");
         }
         if !chroma444 && (width % 2 != 0 || height % 2 != 0) {
@@ -625,21 +667,30 @@ impl PyroWaveDecoder {
         };
 
         // SAFETY: fn contract; every create-info is a local that outlives its call.
-        let (cmd_pool, cmd, fence) = unsafe {
+        let (cmd_pool, cmds, sem) = unsafe {
             let cmd_pool = device.create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
                     .queue_family_index(vkd.graphics_qf)
                     .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
                 None,
             )?;
-            let cmd = device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )?[0];
-            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
-            (cmd_pool, cmd, fence)
+            let cmds: [vk::CommandBuffer; RING] = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(cmd_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(RING as u32),
+                )?
+                .try_into()
+                .expect("RING buffers requested");
+            let mut kind = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+            let sem = device.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut kind),
+                None,
+            )?;
+            (cmd_pool, cmds, sem)
         };
 
         tracing::info!(
@@ -648,6 +699,10 @@ impl PyroWaveDecoder {
             idwt = if fragment { "fragment" } else { "compute" },
             "PyroWave decoder open on the presenter's device"
         );
+        let timeline = Arc::new(DecodeTimeline {
+            device: device.clone(),
+            sem,
+        });
         Ok(PyroWaveDecoder {
             device,
             queue,
@@ -661,8 +716,10 @@ impl PyroWaveDecoder {
             retired: Vec::new(),
             next: 0,
             cmd_pool,
-            cmd,
-            fence,
+            cmds,
+            timeline,
+            slot_turn: [0; RING],
+            last_submit: Instant::now(),
             mem_props,
             width,
             height,
@@ -675,7 +732,7 @@ impl PyroWaveDecoder {
         })
     }
 
-    /// Rebuild decoder + plane ring at new dimensions. Device, command pool, fence and
+    /// Rebuild decoder + plane ring at new dimensions. Device, command buffers, timeline and
     /// pinned create-infos are dimension-independent and survive. Build-new-before-drop-old:
     /// failure leaves the current decoder untouched. The old ring is retired, not
     /// destroyed (see [`RETIRE_HANDOVERS`]).
@@ -723,8 +780,13 @@ impl PyroWaveDecoder {
                 return Err(e).context("plane ring (mid-stream resize)");
             }
         };
-        // SAFETY: decode is fence-synchronous, so no work of the old decoder is in
-        // flight and it can go now; only the plane images wait (retired).
+        if let Err(e) = self.timeline.wait(self.turn, DECODE_TIMEOUT) {
+            // SAFETY: `new_dec` was created above and has decoded nothing.
+            unsafe { pw::pyrowave_decoder_destroy(new_dec) };
+            return Err(e);
+        }
+        // SAFETY: the wait above finished every submit of the old decoder, so it can go
+        // now; only the plane images wait (retired).
         unsafe { pw::pyrowave_decoder_destroy(self.pw_dec) };
         self.pw_dec = new_dec;
         let old = std::mem::replace(&mut self.ring, new_ring);
@@ -904,21 +966,25 @@ impl PyroWaveDecoder {
         }
 
         let slot = self.next;
+        // Frame N-RING was the slot's last: its command buffer and planes are free after it.
+        self.timeline.wait(self.slot_turn[slot], DECODE_TIMEOUT)?;
         self.next = (self.next + 1) % RING;
-        if let Err(e) = self.record_and_wait(slot) {
+        let turn = self.turn + 1;
+        if let Err(e) = self.record_and_submit(slot, turn) {
             // The buffer may still be recording or on the GPU, and the pump keeps this decoder:
             // idle the queue, then reset the buffer so the next frame can begin on it.
             let _guard = self.queue_lock.guard();
-            // SAFETY: `queue_lock` is held; after the idle `cmd` (from a RESET_COMMAND_BUFFER
-            // pool) is not pending, so it can be reset.
+            // SAFETY: `queue_lock` is held; after the idle the slot's buffer (from a
+            // RESET_COMMAND_BUFFER pool) is not pending, so it can be reset.
             unsafe {
                 let _ = self.device.queue_wait_idle(self.queue);
                 let _ = self
                     .device
-                    .reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty());
+                    .reset_command_buffer(self.cmds[slot], vk::CommandBufferResetFlags::empty());
             }
             return Err(e);
         }
+        self.slot_turn[slot] = turn;
         self.initialized[slot] = true;
 
         for r in &mut self.retired {
@@ -927,7 +993,7 @@ impl PyroWaveDecoder {
         self.reap_retired();
 
         let (w, h) = (self.width, self.height);
-        self.turn += 1;
+        self.turn = turn;
         self.queue_lock.offer_present_turn(self.turn);
         let set = &self.ring.sets[slot];
         Ok(Some(PyroWavePlanarFrame {
@@ -944,16 +1010,33 @@ impl PyroWaveDecoder {
         }))
     }
 
-    /// Record `slot`'s decode, submit it, and wait for its fence. On `Err` the command buffer
+    /// Block until `frame` has decoded, for a reader outside this queue's order: CPU
+    /// timing, another queue, an export.
+    pub fn wait_ready(&mut self, frame: &PyroWavePlanarFrame) -> Result<()> {
+        self.timeline.wait(frame.turn, DECODE_TIMEOUT)?;
+        if frame.turn == self.turn {
+            self.split.gpu_us = self.last_submit.elapsed().as_micros() as u32;
+        }
+        Ok(())
+    }
+
+    /// The timeline each frame's `turn` is signalled on, for a thread that waits without
+    /// the decoder.
+    pub fn timeline(&self) -> Arc<DecodeTimeline> {
+        self.timeline.clone()
+    }
+
+    /// Record `slot`'s decode and submit it, signalling `turn`. On `Err` the command buffer
     /// may be recording or pending; the caller idles the queue before reusing it.
-    fn record_and_wait(&mut self, slot: usize) -> Result<()> {
+    fn record_and_submit(&mut self, slot: usize, turn: u64) -> Result<()> {
         let record_started = Instant::now();
         let dev = self.device.clone();
-        // SAFETY: `cmd` is this decoder's and idle: the last submit's fence was waited, or
+        let cmd = self.cmds[slot];
+        // SAFETY: `cmd` is this slot's and idle: the slot's last turn was waited above, or
         // a failed decode idled the queue and reset it.
         unsafe {
             dev.begin_command_buffer(
-                self.cmd,
+                cmd,
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
@@ -1005,7 +1088,7 @@ impl PyroWaveDecoder {
         // SAFETY: `cmd` is recording (begun above); `pre` names this decoder's ring images.
         unsafe {
             dev.cmd_pipeline_barrier2(
-                self.cmd,
+                cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&pre),
             )
         };
@@ -1049,7 +1132,7 @@ impl PyroWaveDecoder {
         let dec_res = unsafe {
             pw::pyrowave_device_set_command_buffer(
                 self.pw_dev,
-                self.cmd.as_raw() as usize as pw::VkCommandBuffer,
+                cmd.as_raw() as usize as pw::VkCommandBuffer,
             );
             let r = pw::pyrowave_decoder_decode_gpu_buffer(
                 self.pw_dec,
@@ -1080,46 +1163,49 @@ impl PyroWaveDecoder {
                 .subresource_range(range)
         };
         let post: Vec<_> = imgs.iter().map(|&i| to_read(i)).collect();
-        // SAFETY: `cmd` is still recording; `post` names this decoder's ring images. The
-        // fence is not pending: the last submit's wait finished, or the queue was idled.
+        // SAFETY: `cmd` is still recording; `post` names this decoder's ring images.
         unsafe {
             dev.cmd_pipeline_barrier2(
-                self.cmd,
+                cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&post),
             );
-            dev.end_command_buffer(self.cmd)?;
-            dev.reset_fences(&[self.fence])?;
+            dev.end_command_buffer(cmd)?;
         }
         self.split.record_us = record_started.elapsed().as_micros() as u32;
         // The frame before this one goes to the screen first.
         self.queue_lock.yield_to_present();
-        let gpu_started = Instant::now();
+        // pyrowave keeps one payload buffer and one coefficient set per decoder and opens with
+        // copies into them: wait for the decode before, and only that, not the present after it.
+        let sems = [self.timeline.sem];
+        let after = [turn - 1];
+        let values = [turn];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
+            .wait_semaphore_values(&after)
+            .signal_semaphore_values(&values);
+        let cmds = [cmd];
+        let submit = vk::SubmitInfo::default()
+            .wait_semaphores(&sems)
+            .wait_dst_stage_mask(&stages)
+            .command_buffers(&cmds)
+            .signal_semaphores(&sems)
+            .push_next(&mut timeline);
         {
             let _guard = self.queue_lock.guard();
-            let cmds = [self.cmd];
-            // SAFETY: `queue` external sync is `queue_lock`, held above; `cmd` is executable
-            // and `fence` unsignalled; the submit info and `cmds` are locals.
-            unsafe {
-                dev.queue_submit(
-                    self.queue,
-                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                    self.fence,
-                )
-            }?;
+            // SAFETY: `queue` external sync is `queue_lock`, held above; `cmd` is executable;
+            // `turn` is above every value signalled so far and `turn - 1` was signalled or is
+            // submitted ahead of us; the submit borrows locals.
+            unsafe { dev.queue_submit(self.queue, &[submit], vk::Fence::null()) }?;
         }
-        // SAFETY: `fence` is this decoder's, named by the submit above.
-        unsafe { dev.wait_for_fences(&[self.fence], true, 5_000_000_000) }
-            .context("pyrowave decode fence")?;
-        self.split.gpu_us = gpu_started.elapsed().as_micros() as u32;
+        self.last_submit = Instant::now();
         Ok(())
     }
 }
 
 impl Drop for PyroWaveDecoder {
     fn drop(&mut self) {
-        // SAFETY: owned handles on the presenter's device. Decode is fence-synchronous so
-        // none of our work is in flight; the presenter may still sample the last slot —
-        // idle the shared queue under the lock before destroying plane images.
+        // SAFETY: owned handles on the presenter's device. Idling the shared queue under the
+        // lock finishes our submits and any presenter sampling of the last slots.
         unsafe {
             {
                 let _guard = self.queue_lock.guard();
@@ -1127,7 +1213,6 @@ impl Drop for PyroWaveDecoder {
             }
             pw::pyrowave_decoder_destroy(self.pw_dec);
             pw::pyrowave_device_destroy(self.pw_dev);
-            self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.cmd_pool, None);
             // `self.device`/instance are the presenter's — never destroyed here.
         }
