@@ -1070,21 +1070,18 @@ fn amf_hdr_encode_live_smoke() {
     }
 }
 
-/// Live 10-bit SDR: P010 HEVC Main10 under BT.709 (no HDR volume). Confirms the colour untie —
-/// the encoder must NOT emit mastering/CLL SEI, and (via `AMF_SDR10_DUMP=<path>` + ffprobe) the
-/// SPS VUI signals BT.709, not BT.2020 PQ. Same P010 ring as the HDR path; only the colour
-/// differs.
-#[test]
-#[ignore = "needs an AMD GPU with AMF"]
-fn amf_sdr10_encode_live_smoke() {
+/// Six P010 frames through a 10-bit SDR `codec` encoder on the AMD adapter: the HDR path's P010
+/// ring under BT.709, with no HDR volume. `None` after a skip line when the box has no AMD
+/// adapter or the runtime declines the open.
+fn amf_sdr10_encode(codec: Codec) -> Option<Vec<EncodedFrame>> {
     use windows::Win32::Graphics::Direct3D11::D3D11_BIND_SHADER_RESOURCE;
     if let Err(e) = try_factory() {
         eprintln!("skipping: AMF runtime unavailable ({e})");
-        return;
+        return None;
     }
     let Some(device) = amd_d3d11_device() else {
         eprintln!("skipping: no AMD adapter on this box");
-        return;
+        return None;
     };
     let (w, h, fps) = (640u32, 480u32, 60u32);
     let desc = D3D11_TEXTURE2D_DESC {
@@ -1107,7 +1104,7 @@ fn amf_sdr10_encode_live_smoke() {
     unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex)) }.expect("P010 texture");
     let tex = tex.expect("P010 texture");
     let mut enc = match AmfEncoder::open(
-        Codec::H265,
+        codec,
         PixelFormat::P010,
         w,
         h,
@@ -1120,8 +1117,8 @@ fn amf_sdr10_encode_live_smoke() {
     ) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("skipping: native AMF 10-bit SDR open declined ({e:#})");
-            return;
+            eprintln!("skipping: native AMF {codec:?} 10-bit SDR open declined ({e:#})");
+            return None;
         }
     };
     // No set_hdr_meta: a 10-bit SDR session carries no HDR volume.
@@ -1145,9 +1142,24 @@ fn amf_sdr10_encode_live_smoke() {
             aus.push(au);
         }
     }
-    assert!(!aus.is_empty(), "10-bit SDR encode produced no AUs");
+    assert!(
+        !aus.is_empty(),
+        "{codec:?} 10-bit SDR encode produced no AUs"
+    );
+    assert!(aus[0].keyframe, "{codec:?}: first AU must be a key frame");
+    Some(aus)
+}
+
+/// Live 10-bit SDR on HEVC Main10. Confirms the colour untie — the encoder must NOT emit
+/// mastering/CLL SEI, and (via `AMF_SDR10_DUMP=<path>` + ffprobe) the SPS VUI signals BT.709,
+/// not BT.2020 PQ.
+#[test]
+#[ignore = "needs an AMD GPU with AMF"]
+fn amf_sdr10_encode_live_smoke() {
+    let Some(aus) = amf_sdr10_encode(Codec::H265) else {
+        return;
+    };
     let idr = &aus[0];
-    assert!(idr.keyframe, "first AU must be an IDR");
     // No mastering (137) / CLL (144) prefix SEI on an SDR stream.
     let mut hdr_sei = false;
     for i in 0..idr.data.len().saturating_sub(5) {
@@ -1180,6 +1192,33 @@ fn amf_sdr10_encode_live_smoke() {
         "live AMF HEVC Main10 SDR: {} AUs, IDR {} bytes, hdr_sei={hdr_sei}",
         aus.len(),
         idr.data.len()
+    );
+}
+
+/// Live 10-bit SDR on AV1 (RDNA3+): the key frame's sequence header says 10-bit 4:2:0 under
+/// BT.709 studio range, not the BT.2020 PQ an HDR P010 carries.
+#[test]
+#[ignore = "needs an AMD GPU with AV1 encode"]
+fn amf_av1_sdr10_signals_bt709_live() {
+    let Some(aus) = amf_sdr10_encode(Codec::Av1) else {
+        return;
+    };
+    let seq = pf_bitstream::av1::sequence_info(&aus[0].data).expect("sequence header");
+    eprintln!("live AMF AV1 10-bit SDR: {} AUs, {seq:?}", aus.len());
+    assert!(seq.high_bitdepth && !seq.twelve_bit, "10-bit");
+    assert!(
+        !seq.mono_chrome && seq.subsampling_x && seq.subsampling_y,
+        "4:2:0"
+    );
+    assert_eq!(
+        (
+            seq.color_primaries,
+            seq.transfer_characteristics,
+            seq.matrix_coefficients,
+            seq.full_range
+        ),
+        (1, 1, 1, false),
+        "BT.709 studio range"
     );
 }
 

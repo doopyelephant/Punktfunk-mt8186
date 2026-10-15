@@ -114,33 +114,32 @@ Each session gets its own display at the client's resolution and refresh rate �
 | Host GPU | Backend | Codecs ¹ | HDR | 10-bit SDR | 4:4:4 |
 |---|---|---|---|---|---|
 | Windows · NVIDIA | NVENC | H.264 · HEVC · AV1 | ✅ | ✅ | ⚠️ ² |
-| Windows · AMD | AMF | H.264 · HEVC · AV1 | ✅ | ⚠️ ³ | ❌ ⁴ |
-| Windows · Intel | QSV | H.264 · HEVC · AV1 | ✅ | ❌ | ❌ |
-| Windows · other | Media Foundation ⁵ | H.264 · HEVC | ❌ | ❌ | ❌ |
-| Windows · none | — ⁶ | — | — | — | — |
+| Windows · AMD | AMF | H.264 · HEVC · AV1 | ✅ | ✅ | ❌ ³ |
+| Windows · Intel | QSV | H.264 · HEVC · AV1 | ✅ | ✅ | ❌ |
+| Windows · other | Media Foundation ⁴ | H.264 · HEVC | ❌ | ❌ | ❌ |
+| Windows · none | — ⁵ | — | — | — | — |
 | Linux · NVIDIA | NVENC | H.264 · HEVC · AV1 | ✅ | ✅ | ⚠️ ² |
-| Linux · AMD, Intel | Vulkan Video ⁷ | HEVC · AV1 | ✅ | ⚠️ ⁷ | ❌ |
+| Linux · AMD, Intel | Vulkan Video ⁶ | HEVC · AV1 | ✅ | ⚠️ ⁶ | ❌ |
 | Linux · AMD, Intel | VAAPI | H.264 · HEVC | ✅ | ✅ | ❌ |
-| Any GPU | PyroWave ⁸ | wavelet | ✅ | ⚠️ ⁸ | ✅ |
-| Linux · none | Software ⁹ | H.264 | ❌ | ❌ | ❌ |
+| Any GPU | PyroWave ⁷ | wavelet | ✅ | ⚠️ ⁷ | ✅ |
+| Linux · none | Software ⁸ | H.264 | ❌ | ❌ | ❌ |
 
 1. Intersected with what your GPU and driver report. AV1 encode needs NVIDIA Ada, AMD RDNA3, Intel
    Arc or newer. If the NVENC probe can't run, the host advertises all three codecs.
 2. HEVC only, where the GPU supports 4:4:4. On Windows it combines with HDR; on Linux 4:4:4 is
    8-bit, so a session asking for both gets HDR at 4:2:0.
-3. HEVC only.
-4. AMD's encoder never produces 4:4:4.
-5. Picked when the GPU isn't NVIDIA, AMD or Intel but has a hardware encoder (an Adreno, say), and
+3. AMD's encoder never produces 4:4:4.
+4. Picked when the GPU isn't NVIDIA, AMD or Intel but has a hardware encoder (an Adreno, say), and
    as the fallback when a native encoder won't open on an 8-bit 4:2:0 H.264 or HEVC session.
    Windows on ARM64 has only this backend.
-6. Windows has no software encoder: a box with no usable GPU encoder can't stream.
-7. HEVC and AV1 where the device opens that profile, 10-bit SDR included; anything else goes to
+5. Windows has no software encoder: a box with no usable GPU encoder can't stream.
+6. HEVC and AV1 where the device opens that profile, 10-bit SDR included; anything else goes to
    VAAPI. **Vulkan encoding** in
    [Host](/docs/configuration#settings-in-the-web-console) turns this backend off.
-8. [PyroWave](/docs/pyrowave) runs only when the client picks it. Full chroma on any vendor; modes
+7. [PyroWave](/docs/pyrowave) runs only when the client picks it. Full chroma on any vendor; modes
    around 8K fall back to 4:2:0. 10-bit SDR on Linux, and on Windows 11 24H2 and later. Not in
    Windows ARM64 builds.
-9. Only with `PUNKTFUNK_ENCODER=software`; `auto` never picks it on Linux.
+8. Only with `PUNKTFUNK_ENCODER=software`; `auto` never picks it on Linux.
 
 HEVC 4:4:4 means an NVIDIA host, or pick PyroWave. Asking for 4:4:4 is a client setting, off by
 default, on the Linux, Windows and Apple clients; Android has none, and GameStream sessions are
@@ -390,6 +389,8 @@ SteamOS.
 - **gamescope headless capture on the proprietary NVIDIA driver** — plausible, not well trodden,
   and no probe would catch it failing.
 - **Touch input from a Windows client** — the same code as Linux, not run on a Windows touchscreen.
+- **AV1 10-bit SDR on a Windows AMD or Intel host** — the same encoder settings as HEVC, not yet
+  run on an RDNA3 or Arc card.
 - **Re-applying your resolution after an Omarchy theme switch** — unit-tested, not tried during a
   live stream. If a theme switch costs you your resolution, report it.
 - **`pf-webos` and the browser client** — separate repositories.

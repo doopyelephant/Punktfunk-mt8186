@@ -90,12 +90,12 @@ pub(crate) fn sdr10(codec: Codec) -> bool {
     if codec == Codec::PyroWave {
         return true;
     }
-    // NVENC widens 8→10 from packed RGB for HEVC + AV1. AMF and QSV take a BT.709 P010 the
-    // driver's video processor produces (`EncodeInput::P010Sdr`) for HEVC Main10 only — their
-    // AV1 10-bit SDR is unbuilt. `can_encode_10bit` still gates on the real probe.
+    // NVENC widens 8→10 from packed RGB. AMF and QSV take a BT.709 P010 the driver produces
+    // (`EncodeInput::P010Sdr`, or `P010Wcg` from wide colour). HEVC Main10 and AV1 alike;
+    // `can_encode_10bit` still gates on the real probe.
     match windows_resolved_backend() {
         WindowsBackend::Nvenc => true,
-        WindowsBackend::Amf | WindowsBackend::Qsv => codec == Codec::H265,
+        WindowsBackend::Amf | WindowsBackend::Qsv => matches!(codec, Codec::H265 | Codec::Av1),
         _ => false,
     }
 }
