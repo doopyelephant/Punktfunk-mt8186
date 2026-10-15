@@ -54,9 +54,11 @@ impl GlyphStyle {
     /// where this shell's key device is the Siri Remote.
     pub fn keys(platform: Platform) -> GlyphStyle {
         match platform {
-            Platform::Android | Platform::WebOS | Platform::Apple | Platform::Tizen => {
-                GlyphStyle::Remote
-            }
+            Platform::Android
+            | Platform::WebOS
+            | Platform::Apple
+            | Platform::Tizen
+            | Platform::Ps5 => GlyphStyle::Remote,
             Platform::Desktop | Platform::Web => GlyphStyle::Keyboard,
         }
     }

@@ -247,7 +247,7 @@ const BACKGROUND_TIMEOUT_DEFAULT: u64 = 10;
 pub(crate) fn own_stats_corner(platform: crate::platform::Platform) -> HudCorner {
     use crate::platform::Platform;
     match platform {
-        Platform::Desktop | Platform::Android => HudCorner::TopLeft,
+        Platform::Desktop | Platform::Android | Platform::Ps5 => HudCorner::TopLeft,
         Platform::Apple | Platform::WebOS | Platform::Web | Platform::Tizen => HudCorner::TopRight,
     }
 }
@@ -617,7 +617,7 @@ fn has_window(device: &crate::screens::Device) -> bool {
     match device.platform {
         Platform::Desktop | Platform::Web | Platform::Tizen => true,
         Platform::Apple => !device.tv,
-        Platform::Android | Platform::WebOS => false,
+        Platform::Android | Platform::WebOS | Platform::Ps5 => false,
     }
 }
 
@@ -668,8 +668,7 @@ const PYROWAVE_BPP_X100: [u16; 16] = [
 /// The highest fixed bitrate this client may be set to, in kbps.
 ///
 /// webOS is the one platform with a real ceiling: the TV client bounds its own slider at
-/// 200 Mbps and clamps the document to it, so a shell offering more would write a number the
-/// classic menus take straight back off again. Everywhere else the ladder's own top stands.
+/// 200 Mbps and clamps the document to it. Everywhere else the ladder's own top stands.
 pub(crate) fn bitrate_ceiling_kbps(platform: crate::platform::Platform) -> u32 {
     match platform {
         crate::platform::Platform::WebOS => 200_000,
@@ -677,7 +676,8 @@ pub(crate) fn bitrate_ceiling_kbps(platform: crate::platform::Platform) -> u32 {
         | crate::platform::Platform::Android
         | crate::platform::Platform::Web
         | crate::platform::Platform::Apple
-        | crate::platform::Platform::Tizen => CUSTOM_MAX_MBPS * 1_000,
+        | crate::platform::Platform::Tizen
+        | crate::platform::Platform::Ps5 => CUSTOM_MAX_MBPS * 1_000,
     }
 }
 
@@ -707,6 +707,9 @@ const CODECS: [(&str, &str); 5] = [
     ("pyrowave", "PyroWave (wired LAN)"),
 ];
 
+/// The PS5's: Videodec2 decodes H.264 and HEVC, the GPU PyroWave, and nothing decodes AV1.
+const CODECS_PS5: [(&str, &str); 4] = [CODECS[0], CODECS[1], CODECS[2], CODECS[4]];
+
 /// The codecs this platform decodes. The TV's NDL pipeline takes H.264 and HEVC only:
 /// no AV1 (never presented a picture) and no PyroWave (no Vulkan presentation). A Samsung set
 /// is the same pair: its WebCodecs says yes to AV1 without ever having been measured on one.
@@ -715,6 +718,7 @@ pub(super) fn codecs(
 ) -> &'static [(&'static str, &'static str)] {
     match platform {
         crate::platform::Platform::WebOS | crate::platform::Platform::Tizen => &CODECS[..3],
+        crate::platform::Platform::Ps5 => &CODECS_PS5,
         _ => &CODECS,
     }
 }
@@ -760,14 +764,15 @@ pub(super) const PAD_TYPES: [(&str, &str); 7] = [
     ("steamdeck", "Steam Deck"),
     ("steamcontroller2", "Steam Controller 2"),
 ];
-/// The pad types `platform` can ask a host for. The TV client maps Xbox 360, Steam Deck and
-/// Steam Controller 2 to Automatic, so its row does not offer them.
+/// The pad types `platform` can ask a host for. The TV and PS5 clients map Xbox 360, Steam Deck
+/// and Steam Controller 2 to Automatic, so their rows do not offer them.
 fn pad_types(platform: crate::platform::Platform) -> Vec<(&'static str, &'static str)> {
+    use crate::platform::Platform;
     PAD_TYPES
         .iter()
         .copied()
         .filter(|(v, _)| {
-            platform != crate::platform::Platform::WebOS
+            !matches!(platform, Platform::WebOS | Platform::Ps5)
                 || !matches!(*v, "xbox360" | "steamdeck" | "steamcontroller2")
         })
         .collect()
@@ -790,7 +795,7 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
     // Rows name the platforms that OFFER them. "Everything except the other one's rows" is
     // well defined for two platforms and ambiguous for three: a new host would inherit every
     // row nobody weighed it against. Unlisted here means universal, as it always did.
-    use Platform::{Android, Apple, Desktop, WebOS};
+    use Platform::{Android, Apple, Desktop, Ps5, WebOS};
     let on: &[Platform] = match id {
         // Phone sensors: hardware a TV does not have. Apple keeps them for the iPhone and
         // iPad (`rumbleOnDevice`, `gyroFromDevice`); an Apple TV has no sensor to report.
@@ -845,15 +850,16 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
             Platform::Web,
             Apple,
             Platform::Tizen,
+            Ps5,
         ],
         // Every client ships third-party code. The browser build has no bundle to list.
-        RowId::Licenses => &[Desktop, Android, WebOS, Apple],
+        RowId::Licenses => &[Desktop, Android, WebOS, Apple, Ps5],
         // DualSense capture — the pad reaches webOS over Bluetooth HID, not hidraw, so the
         // concept is real there too (punktfunk-webos docs/NOTES.md).
         RowId::DsCapture => &[Android, WebOS],
         // Apple reads `UIAccessibility.isReduceMotionEnabled` and follows it, so the shell has
         // nothing to ask. The others carry a row because they cannot see the OS switch.
-        RowId::ReduceMotion => &[Desktop, Android, WebOS, Platform::Web, Platform::Tizen],
+        RowId::ReduceMotion => &[Desktop, Android, WebOS, Platform::Web, Platform::Tizen, Ps5],
         // Which pad is player 1 — a question only a client that can narrow forwarding to one pad
         // has to answer. Android's router, webOS's slot table and the browser's Gamepad API give
         // every controller its own wire slot, so there is nothing to pick.
@@ -863,7 +869,25 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         RowId::FullscreenMode => &[Apple],
         // Main10 at BT.709 asks nothing of the panel, and MediaCodec and NDL both decode it from
         // the SPS.
-        RowId::TenBitSdr => &[Desktop, Android, WebOS, Apple],
+        RowId::TenBitSdr => &[Desktop, Android, WebOS, Apple, Ps5],
+        // The PS5's swapchain offers SDR only until a WSI change adds PQ (its plan §9).
+        RowId::Hdr => &[
+            Desktop,
+            Android,
+            WebOS,
+            Platform::Web,
+            Apple,
+            Platform::Tizen,
+        ],
+        // The PS5 title reads no mouse.
+        RowId::Mouse | RowId::InvertScroll => &[
+            Desktop,
+            Android,
+            WebOS,
+            Platform::Web,
+            Apple,
+            Platform::Tizen,
+        ],
         // VideoToolbox and the Metal wavelet path follow the codec, so Apple picks no decoder
         // either. The TV decodes through NDL and the browser through WebCodecs.
         RowId::Decoder => &[Desktop],
@@ -954,7 +978,7 @@ fn fresh_settings(device: &crate::screens::Device) -> pf_client_core::trust::Set
             s.vsync = false;
             set_extra_bool(&mut s, device_keys::SC2, false);
         }
-        Platform::Desktop | Platform::WebOS | Platform::Web | Platform::Tizen => {}
+        Platform::Desktop | Platform::WebOS | Platform::Web | Platform::Tizen | Platform::Ps5 => {}
     }
     s
 }
@@ -1691,7 +1715,8 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             | Platform::WebOS
             | Platform::Web
             | Platform::Apple
-            | Platform::Tizen => {
+            | Platform::Tizen
+            | Platform::Ps5 => {
                 "How a physical mouse drives the host: Capture locks the pointer (relative, \
                  for games), Desktop leaves it free and sends absolute positions."
             }
@@ -1752,7 +1777,8 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             | Platform::WebOS
             | Platform::Web
             | Platform::Apple
-            | Platform::Tizen => {
+            | Platform::Tizen
+            | Platform::Ps5 => {
                 "How much the overlay shows: Compact (one line) → Normal → Detailed."
             }
         },
@@ -1830,13 +1856,14 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
              the plain immediate left click."
         }
         RowId::GamepadUi => match platform {
-            // `row_on` offers this to Android, webOS and Apple; Desktop, Web and Tizen are
+            // `row_on` offers this to Android, webOS and Apple; Desktop, Web, Tizen and PS5 are
             // here for exhaustiveness, never to be read.
             Platform::Desktop
             | Platform::Android
             | Platform::Web
             | Platform::Apple
-            | Platform::Tizen => {
+            | Platform::Tizen
+            | Platform::Ps5 => {
                 "Front the app with this console instead of the touch interface. Off returns \
                  to the touch home immediately — switch it back on there."
             }
@@ -1850,7 +1877,8 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             | Platform::Android
             | Platform::Web
             | Platform::Apple
-            | Platform::Tizen => {
+            | Platform::Tizen
+            | Platform::Ps5 => {
                 "When this console fronts the app: whenever a controller is attached, or \
                  always — for a device that lives docked to a TV. The switch above turns it \
                  off altogether."

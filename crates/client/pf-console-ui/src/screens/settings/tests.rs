@@ -1420,7 +1420,8 @@ fn every_platform_offers_rows() {
             | Platform::WebOS
             | Platform::Web
             | Platform::Apple
-            | Platform::Tizen => {}
+            | Platform::Tizen
+            | Platform::Ps5 => {}
         }
         let n = TABS
             .iter()
@@ -1429,6 +1430,27 @@ fn every_platform_offers_rows() {
             .count();
         assert!(n > 0, "{p:?} offers no settings rows at all");
     }
+}
+
+/// The PS5 offers PyroWave and no AV1, no HDR until its swapchain can scan PQ out, no mouse
+/// rows, and it can quit.
+#[test]
+fn ps5_rows_follow_what_the_title_reads() {
+    use crate::platform::Platform;
+    let offered: Vec<&str> = codecs(Platform::Ps5).iter().map(|(id, _)| *id).collect();
+    assert_eq!(offered, ["auto", "hevc", "h264", "pyrowave"]);
+    for id in [RowId::Hdr, RowId::Mouse, RowId::InvertScroll, RowId::Touch] {
+        assert!(!row_on(id, Platform::Ps5), "{id:?}");
+    }
+    for id in [
+        RowId::Codec,
+        RowId::Resolution,
+        RowId::TenBitSdr,
+        RowId::Licenses,
+    ] {
+        assert!(row_on(id, Platform::Ps5), "{id:?}");
+    }
+    assert!(Platform::Ps5.can_quit());
 }
 
 /// A Samsung set fronts the same page as the browser, so it answers the row tables exactly as
