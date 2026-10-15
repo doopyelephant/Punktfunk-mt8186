@@ -169,6 +169,9 @@ cros-codecs = { path = "crates/codec/pf-bitstream/vendor/cros-codecs" }
 # something (a raw pointer, a borrowed HANDLE, a GPU object that must not be in flight).
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# The PS5 homebrew target (punktfunk/client-ps5) is a custom target JSON whose vendor rustc does
+# not list: `all(target_os = "freebsd", target_vendor = "sie")` gates it.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("sie"))'] }
 
 # The companion lint: every `unsafe {}` / `unsafe impl` carries a `// SAFETY:` proof. Hoisted here
 # from ~85 per-file `#![deny(...)]` attributes so a NEW crate (or a new module in an old one) is

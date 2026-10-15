@@ -22,8 +22,9 @@ repository.workspace = true
 # audio, SDL gamepad service and the ureq fetches stay desktop-only, so this block carries
 # only what the portable modules touch. `quic` (not `ureq-tls`): `trust` names
 # `NativeClient`/`endpoint` for identity + pairing; nothing here fetches over HTTPS.
-# Apple targets take the same subset: the console crate builds for the Mac, iOS and tvOS.
-[target.'cfg(any(target_os = "android", target_vendor = "apple"))'.dependencies]
+# Apple targets take the same subset: the console crate builds for the Mac, iOS and tvOS, and so
+# does the PS5 homebrew title (`all(target_os = "freebsd", target_vendor = "sie")`).
+[target.'cfg(any(target_os = "android", target_vendor = "apple", all(target_os = "freebsd", target_vendor = "sie")))'.dependencies]
 punktfunk-core = { path = "../../core/punktfunk-core", features = ["quic", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -143,8 +144,8 @@ windows = { workspace = true, optional = true, features = [
 log = "0.4"
 tracing-subscriber = { version = "0.3" }
 
-# The mDNS browse (`discovery`), which Android takes without `desktop`.
-[target.'cfg(any(target_os = "linux", windows, target_os = "android"))'.dependencies]
+# The mDNS browse (`discovery`), which Android and the PS5 take without `desktop`.
+[target.'cfg(any(target_os = "linux", windows, target_os = "android", all(target_os = "freebsd", target_vendor = "sie")))'.dependencies]
 mdns-sd = { version = "0.21", optional = true }
 async-channel = { version = "2", optional = true }
 

@@ -94,8 +94,13 @@ pf-client-core = { path = "../pf-client-core", default-features = false }
 skia-safe = { version = "0.153", features = ["textlayout"] }
 pf-client-core = { path = "../pf-client-core", default-features = false }
 
+# The PS5 homebrew title: CPU raster here; the title adds Skia's Vulkan backend itself.
+[target.'cfg(all(target_os = "freebsd", target_vendor = "sie"))'.dependencies]
+skia-safe = { version = "0.153", features = ["textlayout"] }
+pf-client-core = { path = "../pf-client-core", default-features = false }
+
 # Everything the shell itself needs, on every platform it runs on.
-[target.'cfg(any(target_os = "linux", windows, target_os = "android", target_vendor = "apple", target_family = "wasm"))'.dependencies]
+[target.'cfg(any(target_os = "linux", windows, target_os = "android", target_vendor = "apple", target_family = "wasm", all(target_os = "freebsd", target_vendor = "sie")))'.dependencies]
 anyhow = "1"
 tracing = "0.1"
 # The host-facing model types (`HostRow`, `ConsoleCmd`, `LibraryGame`, …) derive serde so a host
