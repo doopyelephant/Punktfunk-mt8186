@@ -25,19 +25,23 @@ pub enum Platform {
     /// The same page and the same rows as [`Platform::Web`], but held by a remote, so it takes
     /// the TV glyph legend — and Samsung requires Back at the root to exit, so it can quit.
     Tizen,
+    /// The PS5 homebrew title (`punktfunk/client-ps5`): DualSense only, no touch, no window,
+    /// the console's one 4K output. PlayStation glyphs, PyroWave decodes, and the title quits.
+    Ps5,
 }
 
 impl Platform {
     /// Every variant. A platform absent from a universal row list offers no settings
     /// row at all, which is a blank screen rather than a missing control — walk this
     /// instead of retyping the set.
-    pub const ALL: [Platform; 6] = [
+    pub const ALL: [Platform; 7] = [
         Platform::Desktop,
         Platform::Android,
         Platform::WebOS,
         Platform::Web,
         Platform::Apple,
         Platform::Tizen,
+        Platform::Ps5,
     ];
 
     /// Whether the app may close itself. An Apple app and a browser page cannot; a packaged TV

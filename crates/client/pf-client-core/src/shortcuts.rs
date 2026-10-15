@@ -23,6 +23,8 @@ pub enum Client {
     Web,
     /// The Samsung TV client: the browser page, with the remote's Back as its menu key.
     Tizen,
+    /// The PS5 title: a DualSense, its touchpad click standing in for Create.
+    Ps5,
 }
 
 /// What to press, then what it does.
@@ -188,6 +190,12 @@ const WEBOS_PAD: &[Item] = &[
     item("L1 + R1 + Start + Select", "Hold to disconnect"),
 ];
 
+/// The console keeps Create for itself, so the touchpad click takes Select's place.
+const PS5_PAD: &[Item] = &[
+    item("Touchpad + Cross", "Open the quick actions dial"),
+    item("L1 + R1 + Options + Touchpad", "Hold to disconnect"),
+];
+
 const WEB_PAD: &[Item] = &[
     item("Select + A", "Open the quick actions menu"),
     item(
@@ -208,6 +216,7 @@ pub fn groups(client: Client, touchscreen: bool) -> Vec<Group> {
         Client::WebOS => (WEBOS_REMOTE, &[], &[], WEBOS_PAD),
         Client::Web => (&[], WEB_KEYS, &[], WEB_PAD),
         Client::Tizen => (TIZEN_REMOTE, TIZEN_KEYS, &[], WEB_PAD),
+        Client::Ps5 => (&[], &[], &[], PS5_PAD),
     };
     let mut out = Vec::new();
     if !remote.is_empty() {
@@ -233,7 +242,11 @@ pub fn groups(client: Client, touchscreen: bool) -> Vec<Group> {
     }
     out.push(Group {
         kind: Kind::Pad,
-        title: "Controller (Select is Back or View)",
+        title: if client == Client::Ps5 {
+            "DualSense"
+        } else {
+            "Controller (Select is Back or View)"
+        },
         items: pad,
     });
     out
@@ -243,7 +256,7 @@ pub fn groups(client: Client, touchscreen: bool) -> Vec<Group> {
 mod tests {
     use super::*;
 
-    const ALL: [Client; 7] = [
+    const ALL: [Client; 8] = [
         Client::Desktop,
         Client::Android,
         Client::Apple,
@@ -251,13 +264,20 @@ mod tests {
         Client::WebOS,
         Client::Web,
         Client::Tizen,
+        Client::Ps5,
     ];
 
+    /// Every client names its dial and escape chord; the PS5's use the touchpad for Select.
     #[test]
     fn every_client_lists_the_controller_chords() {
         for c in ALL {
             let pad = groups(c, true).pop().unwrap();
-            for keys in ["Select + A", "L1 + R1 + Start + Select"] {
+            let chords = if c == Client::Ps5 {
+                ["Touchpad + Cross", "L1 + R1 + Options + Touchpad"]
+            } else {
+                ["Select + A", "L1 + R1 + Start + Select"]
+            };
+            for keys in chords {
                 assert!(
                     pad.items.iter().any(|i| i.keys == keys),
                     "{c:?} lacks {keys}"

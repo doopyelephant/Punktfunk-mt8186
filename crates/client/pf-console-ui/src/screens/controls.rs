@@ -79,6 +79,7 @@ impl ControlsScreen {
             Platform::WebOS => Client::WebOS,
             Platform::Web => Client::Web,
             Platform::Tizen => Client::Tizen,
+            Platform::Ps5 => Client::Ps5,
         };
         ControlsScreen::with_client(client, ctx)
     }
