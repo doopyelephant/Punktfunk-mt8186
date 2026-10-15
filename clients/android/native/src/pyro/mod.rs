@@ -206,6 +206,11 @@ mod imp {
         let mut received: u64 = 0;
         let mut warned_silent = false;
         let mut split = SplitWindow::default();
+        // ADPF, as the MediaCodec loop has it: this thread joins the hinted set now, and the
+        // session opens on the first shown frame, once the pump has registered too.
+        client.register_hot_thread();
+        let mut hint: Option<crate::adpf::HintSession> = None;
+        let mut hint_tried = false;
 
         while !shutdown.load(Ordering::Relaxed) {
             // Live mode switch (`NativeClient::request_mode`, or the host's own resize): the
@@ -246,6 +251,7 @@ mod imp {
             };
             received += 1;
             let _ = client.note_frame_index(frame.frame_index);
+            let work_started = (Instant::now(), crate::sys::now_monotonic_ns());
 
             // Receipt stamp: core's reassembly-completion time, not the pull instant — a
             // pull stamp folds this loop's own poll wait into "network".
@@ -283,6 +289,16 @@ mod imp {
             let shown = present.show(picture.views, crop, picture.color, depth, msb_packed)?;
             if !shown {
                 continue; // swapchain was out of date; it has been rebuilt
+            }
+            if !hint_tried {
+                hint_tried = true;
+                hint = crate::decode::start_hint(client, mode.refresh_hz, opts.low_latency_mode);
+            }
+            if let Some(h) = &hint {
+                // The GPU half is what the governor under-clocks; reporting it asks for clock.
+                let total = work_started.0.elapsed().as_nanos() as i64;
+                let gpu = i64::from(decoder.last_split().gpu_us) * 1000;
+                h.report_work(work_started.1, total, (total - gpu).max(0), gpu);
             }
 
             // No latch callback on this path, so the HUD drops the `display` stage. `decode`
