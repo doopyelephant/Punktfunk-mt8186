@@ -111,7 +111,7 @@ extension SettingsView {
             .labelsHidden()
             .pickerStyle(.wheel)
             .frame(maxHeight: 140)
-            Text("The host drives a real output at exactly this mode — no scaling.")
+            Text(resolutionCaption)
                 .font(.geist(13, relativeTo: .footnote))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -258,6 +258,21 @@ extension SettingsView {
                     SettingsOptions.families()[i], height: effective.height)
                 setResolution(width: mode.w, height: mode.h)
             })
+    }
+
+    /// The caption under the wheel. The one mode that covers a Mac's camera housing names its
+    /// cost: that fullscreen is composited, never scanned out Direct.
+    private var resolutionCaption: String {
+        #if os(macOS)
+        if let screen = NSScreen.main, screen.safeAreaInsets.top > 0,
+           SafeDisplay.coversHousing(
+               content: (effective.width, effective.height),
+               panel: screen.panelPixelSize, safe: screen.notchSafePixelSize) {
+            return "Over the notch, macOS blends every frame instead of scanning it out: "
+                + "about 10 ms more display latency."
+        }
+        #endif
+        return "The host drives a real output at exactly this mode — no scaling."
     }
 
     /// The list: Native (`0x0`, which follows the display), this device's other native mode, the
