@@ -22,7 +22,7 @@ tls = ["dep:rustls"]
 # The SPAKE2 pairing ceremony on its own, so a client that pairs over a transport quinn does
 # not speak (the browser, over WebTransport) can have it without the QUIC runtime.
 pake = ["dep:spake2"]
-quic = ["tls", "pake", "dep:quinn", "dep:tokio", "dep:rcgen", "dep:opus"]
+quic = ["tls", "pake", "dep:quinn", "dep:quinn-udp", "dep:tokio", "dep:rcgen", "dep:opus"]
 # Blocking-HTTP clients that must speak the SAME pinned TLS as the QUIC plane: `tls::ureq_agent`
 # hands ureq a caller-built `rustls::ClientConfig` (which is how `PinVerify` gets installed —
 # ureq's own `TlsConfig` has no hook for a custom verifier). Separate from `tls` because the
@@ -95,6 +95,11 @@ opus = { version = "0.4", optional = true }
 # build does, so it must be a direct dep here or those slices fail to link `libc::`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# quinn's own quinn-udp, with batched `recvmsg_x`/`sendmsg_x`. Without it an Apple client reads
+# the shared socket one datagram per syscall, which caps video near 1.4 Gbit/s.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+quinn-udp = { version = "0.5", optional = true, default-features = false, features = ["fast-apple-datapath"] }
 
 [target.'cfg(windows)'.dependencies]
 # windows-sys (raw FFI, the quinn-udp choice). WinSock: `WSAPoll` (transport/udp.rs) and the
