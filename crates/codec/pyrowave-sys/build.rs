@@ -31,12 +31,15 @@ fn main() {
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let bits64 = env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap_or_default() == "64";
+    // The PS5 homebrew title: RADV is linked into it, and Granite takes the title's own
+    // GetInstanceProcAddr, so no loader is opened. cmake-rs reads CMAKE_TOOLCHAIN_FILE_<target>.
+    let ps5 = env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("sie");
     let build_here =
-        target_os == "linux" || target_os == "windows" || (target_os == "android" && bits64);
+        target_os == "linux" || target_os == "windows" || (target_os == "android" && bits64) || ps5;
     if !build_here {
         std::fs::write(
             &bindings_path,
-            "// pyrowave-sys: Linux/Windows/64-bit-Android only, empty on this target\n",
+            "// pyrowave-sys: Linux/Windows/64-bit-Android/PS5 only, empty on this target\n",
         )
         .unwrap();
         return;

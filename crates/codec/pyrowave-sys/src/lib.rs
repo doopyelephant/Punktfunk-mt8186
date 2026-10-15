@@ -18,7 +18,8 @@
 #[cfg(any(
     target_os = "linux",
     target_os = "windows",
-    all(target_os = "android", target_pointer_width = "64")
+    all(target_os = "android", target_pointer_width = "64"),
+    all(target_os = "freebsd", target_vendor = "sie")
 ))]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
