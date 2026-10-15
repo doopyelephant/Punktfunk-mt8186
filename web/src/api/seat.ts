@@ -34,8 +34,8 @@ export const useSeat = (): SeatChoice | null =>
 /**
  * True for a profile whose desktop runs its own host. On a door every profile plays on a seat, and
  * the owner's seat is one of those hosts: the owner and every seat of a desktop of its own count.
- * A profile that shares the owner's desktop, or has its own Steam in it, plays in the owner's
- * host, so it has no library of its own to choose.
+ * A profile that shares the owner's desktop plays in the owner's host, so it has no library of
+ * its own to choose.
  */
 export function isFullSeat(
 	p: ProfileAdmin,

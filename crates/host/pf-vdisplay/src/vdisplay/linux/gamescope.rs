@@ -27,9 +27,7 @@ mod dropins;
 #[path = "gamescope/heads.rs"]
 mod heads;
 #[path = "gamescope/sandbox.rs"]
-pub(crate) mod sandbox;
-#[path = "gamescope/seat.rs"]
-pub(crate) mod seat;
+mod sandbox;
 #[path = "gamescope/spawn.rs"]
 mod spawn;
 #[path = "gamescope/splash.rs"]
@@ -180,8 +178,7 @@ impl VirtualDisplay for GamescopeDisplay {
     }
 
     fn isolation_key(&self) -> Option<String> {
-        // Reuse key: a kept isolated spawn has this session's relay, Pulse and Steam-home env
-        // baked in, and the seat home is a knob the operator can turn off between sessions.
+        // Reuse key: a kept isolated spawn has this session's relay and Pulse env baked in.
         self.isolation.as_ref().map(crate::SessionIsolation::key)
     }
 
@@ -296,23 +293,13 @@ impl GamescopeDisplay {
         // instance free.
         let app = resolved_spawn_app(self.cmd.as_deref());
         let steam = app.as_deref().is_some_and(is_steam_launch);
-        // This session's own Steam home, provisioned on first use. `None` keeps every path below
-        // on the box's single Steam instance.
-        let seat_home = self
-            .isolation
-            .as_ref()
-            .filter(|_| steam)
-            .and_then(|i| i.steam_home.as_deref())
-            .and_then(seat::ensure_home);
-        let box_steam = contends_for_box_steam(steam, seat_home.is_some());
-        let exclusive = seat_spawn_may_darken(exclusive, self.isolation.as_ref());
-        if box_steam {
+        if steam {
             // No attach degrade here: a box without takeover privilege fails with the actionable error.
             stop_autologin_sessions()
                 .context("dedicated Steam launch needs the box's gaming session freed")?;
             // Desktop Steam holds the instance too; autologin stop cannot see it.
             free_desktop_steam()?;
-        } else if free_box_session_for_exclusive(box_steam, exclusive) {
+        } else if free_box_session_for_exclusive(steam, exclusive) {
             // Best-effort: on Game Mode the autologin session is DRM master, so Exclusive needs it
             // gone. A refusal costs the dark screen, not the game.
             if let Err(why) = stop_autologin_sessions() {
@@ -333,7 +320,6 @@ impl GamescopeDisplay {
             &log,
             self.hdr,
             self.isolation.as_ref(),
-            seat_home.as_deref(),
         )?;
         let mut proc = GamescopeProc {
             child,
@@ -344,11 +330,7 @@ impl GamescopeDisplay {
                 .map(|i| i.ei_relay.clone())
                 .unwrap_or_else(ei_socket_file),
             steam_home: steam
-                .then(|| {
-                    seat_home
-                        .clone()
-                        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
-                })
+                .then(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
                 .flatten(),
             started: Instant::now(),
         };
@@ -929,7 +911,7 @@ fn running_autologin_gamescope_unit() -> Option<String> {
 /// every later `vkCreateDevice` fails until reboot. Then `stop` + `reset-failed` so relaunch is clean.
 fn kill_unit(unit: &str) {
     if let Some(pid) = steam_pid_in_unit(unit) {
-        if !shut_steam_down(pid, STEAM_STOP_WAIT, None) {
+        if !shut_steam_down(pid, STEAM_STOP_WAIT) {
             tracing::warn!(
                 unit,
                 pid,

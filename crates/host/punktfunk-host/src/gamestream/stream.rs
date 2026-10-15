@@ -385,7 +385,6 @@ fn run(
                     gamescope_route.as_ref(),
                 ) && nested_launch_started,
                 seat: seat.as_deref(),
-                steam_home: None,
             },
         );
 

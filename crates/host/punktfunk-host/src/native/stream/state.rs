@@ -631,7 +631,6 @@ impl StreamState {
             &vd_params,
             compositor,
             cur_display_gen,
-            mode,
             &conn,
             &life,
             launch_target.as_ref(),
@@ -1045,8 +1044,8 @@ fn spawn_send_thread(
 }
 
 /// Launch the session's title on the display it just opened, tell the client the verdict, and
-/// take the game lease that follows it, with the dedicated-Steam exit watcher and the seat
-/// sign-in hold. `vd_params` carries the launch command, route, isolation and quit flag.
+/// take the game lease that follows it, with the dedicated-Steam exit watcher. `vd_params`
+/// carries the launch command, route and quit flag.
 /// Returns the lease's shared view for the registry and the guard that ends it with the
 /// session.
 #[allow(clippy::too_many_arguments)]
@@ -1055,7 +1054,6 @@ fn spawn_launch_and_lease(
     vd_params: &crate::vdisplay::SessionParams,
     compositor: pf_vdisplay::Compositor,
     cur_display_gen: Option<u64>,
-    mode: punktfunk_core::Mode,
     conn: &crate::native::link::SessionLink,
     life: &crate::lifecycle::Lifecycle,
     launch_target: Option<&crate::library::LaunchTarget>,
@@ -1068,13 +1066,9 @@ fn spawn_launch_and_lease(
     Option<crate::gamelease::SessionGuard>,
 ) {
     #[cfg(not(target_os = "linux"))]
-    let _ = (vd, compositor, cur_display_gen, mode);
+    let _ = (vd, compositor, cur_display_gen);
     #[cfg(target_os = "linux")]
-    let (launch, gamescope_route, isolation) = (
-        vd_params.launch.as_deref(),
-        vd_params.route.as_ref(),
-        vd_params.isolation.as_ref(),
-    );
+    let (launch, gamescope_route) = (vd_params.launch.as_deref(), vd_params.route.as_ref());
     let quit = &vd_params.quit;
     // This session's compositor, by pool generation: a concurrent seat's gamescope is equally
     // discoverable in `/proc`, so an unscoped launch or watch lands on somebody else's screen.
@@ -1099,38 +1093,14 @@ fn spawn_launch_and_lease(
             compositor,
             nested_spawn,
             seat: seat.as_deref(),
-            steam_home: isolation.and_then(|i| i.steam_home.as_deref()),
         },
     );
     let spawned_now = spawned.now;
-    // A Steam launch that ran under a seat profile's home: remember what it streamed at, so
-    // the host can have that Steam up before the profile's next connect. `vd`'s own values,
-    // not the request, because they are the registry's reuse keys.
-    #[cfg(target_os = "linux")]
-    if spawned_now && launch.is_some_and(crate::vdisplay::launch_is_steam) {
-        if let Some(profile) = isolation
-            .and_then(|i| i.steam_home.as_deref())
-            .and_then(|h| h.file_name())
-            .and_then(|n| n.to_str())
-        {
-            crate::native::prewarm::record(profile, mode, vd.hdr(), vd.hw_cursor());
-        }
-    }
-    // This seat's Steam has no account, so the stream shows its sign-in screen and not the
-    // game. Read before the verdict: the player is told what to do, and no client holds this
-    // title's cover over the screen they have to act on.
-    #[cfg(target_os = "linux")]
-    let seat_sign_in = spawned_now
-        && launch.is_some_and(crate::vdisplay::launch_is_steam)
-        && isolation.is_some_and(crate::vdisplay::seat_needs_sign_in);
-    #[cfg(not(target_os = "linux"))]
-    let seat_sign_in = false;
     if let Some(t) = launch_target {
         let _ = launch_outcome.send(launch_verdict(
             &t.game.title,
             launch_claim.as_ref(),
             spawned_now,
-            seat_sign_in,
         ));
     }
     // A dedicated Steam session ends on gamescope's own root atoms, never on process shape:
@@ -1228,16 +1198,6 @@ fn spawn_launch_and_lease(
             tracing::warn!(error = %e, "dedicated Steam exit watcher not started");
         }
     }
-    // The watcher keeps its own grace: the game the player starts after signing in is
-    // followed as any other.
-    if seat_sign_in {
-        if let Some(g) = game_shared.as_ref() {
-            g.launch_hold_ends();
-        }
-        tracing::info!(
-            "this seat's Steam has no account yet — the stream shows its sign-in screen"
-        );
-    }
     let game_life = game_lease.map(|lease| {
         crate::gamelease::SessionGuard::new(
             lease,
@@ -1251,29 +1211,17 @@ fn spawn_launch_and_lease(
 
 /// What this session's launch came to, in the client's vocabulary.
 ///
-/// One verdict from the facts the launch site has: whether it spawned, what the
-/// registry adopted against, and whether the seat it spawned into still owes
-/// Steam a sign-in. `Spawned` says nothing — the player asked for a game and is
+/// One verdict from the facts the launch site has: whether it spawned, and what the
+/// registry adopted against. `Spawned` says nothing — the player asked for a game and is
 /// about to get one; the rest need words.
 fn launch_verdict(
     title: &str,
     claim: Option<&crate::launchreg::Claim>,
     spawned: bool,
-    sign_in: bool,
 ) -> punktfunk_core::quic::LaunchOutcome {
     use crate::launchreg::Liveness;
     use punktfunk_core::quic::{LaunchOutcome, LaunchOutcomeKind as Kind};
     if spawned {
-        // The host does not re-send this launch after the sign-in, so the sentence says who does.
-        if sign_in {
-            return LaunchOutcome::new(
-                Kind::SignInNeeded,
-                &format!(
-                    "Steam on this seat isn't signed in yet. Sign in on the stream, then start \
-                     {title} from Big Picture."
-                ),
-            );
-        }
         return LaunchOutcome::new(Kind::Spawned, "");
     }
     match claim.and_then(|c| c.adopted()) {
@@ -1415,12 +1363,12 @@ mod tests {
     fn the_launch_verdict_follows_what_the_registry_adopted() {
         use punktfunk_core::quic::LaunchOutcomeKind as Kind;
 
-        let spawned = launch_verdict("Quail", None, true, false);
+        let spawned = launch_verdict("Quail", None, true);
         assert_eq!(spawned.kind, Kind::Spawned);
         assert!(spawned.message.is_empty());
         assert!(!spawned.kind.needs_telling());
 
-        let refused = launch_verdict("Quail", None, false, false);
+        let refused = launch_verdict("Quail", None, false);
         assert_eq!(refused.kind, Kind::Refused);
         assert!(refused.message.starts_with("Couldn't start Quail"));
         assert!(refused.kind.needs_telling());
@@ -1431,34 +1379,11 @@ mod tests {
         // Nothing adopted, inside the in-flight window: the host cannot see it.
         let blind = crate::launchreg::claim(fp, app, false, Some(2.0));
         assert!(!blind.must_spawn());
-        let out = launch_verdict("Quail", Some(&blind), false, false);
+        let out = launch_verdict("Quail", Some(&blind), false);
         assert_eq!(out.kind, Kind::AdoptedUnknown);
         assert!(out.message.contains("Start it again"));
         assert!(out.kind.needs_telling());
         blind.abandon();
         drop(first);
-    }
-
-    /// A seat whose Steam has no account is the one telling verdict that is not a failure: the
-    /// launch did reach Steam, and the screen the player has to act on is already streaming.
-    /// Every other launch is untouched by it.
-    #[test]
-    fn a_seat_that_owes_a_sign_in_says_so_instead_of_staying_silent() {
-        use punktfunk_core::quic::LaunchOutcomeKind as Kind;
-
-        let out = launch_verdict("Quail", None, true, true);
-        assert_eq!(out.kind, Kind::SignInNeeded);
-        assert!(out.kind.needs_telling());
-        assert!(out.message.contains("isn't signed in"));
-        assert!(out.message.contains("Quail"));
-        // No seat home, no Steam launch, nothing spawned: byte-for-byte what it said before.
-        assert_eq!(
-            launch_verdict("Quail", None, true, false).kind,
-            Kind::Spawned
-        );
-        assert_eq!(
-            launch_verdict("Quail", None, false, true).kind,
-            Kind::Refused
-        );
     }
 }

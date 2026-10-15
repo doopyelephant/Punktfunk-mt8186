@@ -418,12 +418,12 @@ The box owner is a seat like any other. `adopt-owner <user>` adds a ledger row f
 account that exists (uid 1000 up, never a seat's), and only for the one `door-helper on` recorded
 in `/var/lib/punktfunk-seats/owner`. Any other account, or any while nothing is recorded, answers
 `owner_not_recorded`. Only root writes that file, so the door can't name another account.
-Deleting the row never removes the account or its home. It takes a slot and ports from the same pools, and the door places the owner profile,
-the profiles that share the owner's desktop and the light seats on it.
+Deleting the row never removes the account or its home. It takes a slot and ports from the same pools, and the door places the owner profile
+and the profiles that share the owner's desktop on it.
 
 | Variable | The owner's row |
 |---|---|
-| `PUNKTFUNK_SEAT_OWNER` | `1`: the seat host is the owner's own, and also serves the owner and light-seat profiles. |
+| `PUNKTFUNK_SEAT_OWNER` | `1`: the seat host is the owner's own, and also serves the owner and the profiles that share the owner's desktop. |
 | `PUNKTFUNK_SEAT_HEADLESS` | `1`, set by the runner, not the file: the host runs in the row's headless session, not at the desk. |
 | `PUNKTFUNK_CONFIG_DIR`, `PUNKTFUNK_HOST_NAME`, `PUNKTFUNK_GAMESTREAM` | Not set: the owner keeps `~/.config/punktfunk` and their own settings. |
 

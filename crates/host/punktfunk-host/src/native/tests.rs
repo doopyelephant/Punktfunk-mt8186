@@ -1,20 +1,6 @@
 use super::*;
 use punktfunk_core::quic::v2::msg::V2Message;
 
-/// The knob is the only way in, and an unpaired session never gets a seat home.
-#[cfg(target_os = "linux")]
-#[test]
-fn only_a_seat_profile_with_the_knob_on_gets_a_seat_home() {
-    let seat = seat_home_for(Some("9a3f1c2b7e40"), true).expect("a seat profile has a home");
-    assert!(seat.ends_with("seats/9a3f1c2b7e40"), "{}", seat.display());
-    assert_eq!(seat_home_for(Some("9a3f1c2b7e40"), false), None, "knob off");
-    assert_eq!(
-        seat_home_for(None, true),
-        None,
-        "the owner keeps the box's Steam"
-    );
-}
-
 /// Two sessions on one profile at once: `<seat>` then `<seat>-2`, each with its own sink,
 /// and the id frees when its session ends.
 #[cfg(target_os = "linux")]
@@ -28,11 +14,7 @@ fn a_second_session_on_a_profile_gets_planes_of_its_own() {
         (first.0.as_str(), second.0.as_str()),
         ("5e1f00d1", "5e1f00d1-2")
     );
-    assert!(first.is_first(&base) && !second.is_first(&base));
-    let (a, b) = (
-        session_isolation(&first.0, Some("5e1f00d1e2a7")),
-        session_isolation(&second.0, None),
-    );
+    let (a, b) = (session_isolation(&first.0), session_isolation(&second.0));
     assert_ne!(a.ei_relay, b.ei_relay);
     assert_ne!(a.mic_source, b.mic_source);
     if a.sink.is_some() {

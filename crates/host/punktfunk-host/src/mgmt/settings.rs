@@ -106,12 +106,10 @@ pub(crate) struct HostSettingsState {
 #[schema(example = json!({"clipboard": "text", "max_fps": null}))]
 pub(crate) struct HostSettingsPatch(BTreeMap<String, Value>);
 
-/// Which seats this box runs, for the Seat defaults: full seats, or (Linux) a Steam per seat,
-/// whose warm-up is the one default it uses. A seat host has none to set.
+/// Whether this box runs seats, for the Seat defaults. A seat host has none to set.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SeatsOn {
     full: bool,
-    steam: bool,
 }
 
 pub(crate) async fn seats_on() -> SeatsOn {
@@ -121,14 +119,11 @@ pub(crate) async fn seats_on() -> SeatsOn {
     let full = tokio::task::spawn_blocking(|| crate::seats::snapshot().on)
         .await
         .unwrap_or(false);
-    SeatsOn {
-        full,
-        steam: pf_host_config::config().steam_seat_home,
-    }
+    SeatsOn { full }
 }
 
-fn shown(id: &str, group: Group, seats: SeatsOn) -> bool {
-    group != Group::Seats || seats.full || (id == "steam_prewarm" && seats.steam)
+fn shown(group: Group, seats: SeatsOn) -> bool {
+    group != Group::Seats || seats.full
 }
 
 pub(crate) fn state(seats: SeatsOn) -> HostSettingsState {
@@ -137,7 +132,7 @@ pub(crate) fn state(seats: SeatsOn) -> HostSettingsState {
     let settings = snap
         .settings
         .iter()
-        .filter(|r| r.setting.available() && shown(r.setting.id, r.setting.group, seats))
+        .filter(|r| r.setting.available() && shown(r.setting.group, seats))
         .map(|r| {
             let s = r.setting;
             let (kind, min, max, unit, options, max_len) = match s.kind {

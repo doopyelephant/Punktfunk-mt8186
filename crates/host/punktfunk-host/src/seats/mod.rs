@@ -105,9 +105,9 @@ impl Snapshot {
         self.seats.iter().find(|s| s.owner)
     }
 
-    /// The ledger row a profile plays on. A full seat names its own. On a door the owner, a
-    /// profile that shares the owner's desktop and a light seat all play in the owner's host, so
-    /// on the owner's row. Anywhere else the rest play on the host that was asked.
+    /// The ledger row a profile plays on. A full seat names its own. On a door the owner and a
+    /// profile that shares the owner's desktop play in the owner's host, so on the owner's row.
+    /// Anywhere else the rest play on the host that was asked.
     pub(crate) fn row_of<'a>(&'a self, account: &'a OsAccount) -> Option<&'a str> {
         row_in(account, self.owner(), is_door())
     }
@@ -120,10 +120,8 @@ pub(crate) fn row_in<'a>(
     door: bool,
 ) -> Option<&'a str> {
     match account {
-        OsAccount::Seat { seat: Some(id), .. } => Some(id),
-        OsAccount::Operator | OsAccount::Seat { seat: None, .. } if door => {
-            owner.map(|s| s.id.as_str())
-        }
+        OsAccount::Seat { seat: Some(id) } => Some(id),
+        OsAccount::Operator if door => owner.map(|s| s.id.as_str()),
         _ => None,
     }
 }

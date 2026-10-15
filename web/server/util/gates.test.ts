@@ -236,7 +236,7 @@ test("the five plane settings ask; any other setting does not", async () => {
 		expect(await asks({ [id]: null }), id).toBe(true);
 		expect(await asks({ max_fps: 60, [id]: "x" }), id).toBe(true);
 	}
-	expect(await asks({ max_fps: 60, steam_seat_home: true })).toBe(false);
+	expect(await asks({ max_fps: 60, gamescope_isolate: true })).toBe(false);
 });
 
 test("a refused row answers with a sentence and never reaches the host", async () => {

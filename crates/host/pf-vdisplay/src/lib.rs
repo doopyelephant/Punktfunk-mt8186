@@ -717,30 +717,6 @@ pub fn gamescope_splash_client() -> anyhow::Result<()> {
     gamescope::splash_run()
 }
 
-/// Where this session's virtual pads must be exposed for its seat's Steam to see them, or
-/// `None` when that Steam sees every pad on the box as it always has.
-///
-/// The spawn wraps the seat's nested command in a `bwrap` whose `/dev/input` is this directory,
-/// so `pf-inject` writing one symlink here is the whole of "the seat has a controller". Same
-/// decision both sides ask (`vdisplay/linux/gamescope/sandbox.rs`); `pf-inject` never learns
-/// what a seat is.
-#[cfg(target_os = "linux")]
-pub fn seat_device_dir(iso: &SessionIsolation) -> Option<std::path::PathBuf> {
-    gamescope::sandbox::plan(Some(iso), iso.steam_home.is_some()).dev()
-}
-
-/// Does this session's seat still owe Steam a sign-in?
-///
-/// A seat home carries no account, so the first Steam launch on it shows the sign-in screen
-/// rather than the game. `false` for every session without a seat home of its own — the box's
-/// Steam is signed in already (`vdisplay/linux/gamescope/seat.rs`).
-#[cfg(target_os = "linux")]
-pub fn seat_needs_sign_in(iso: &SessionIsolation) -> bool {
-    iso.steam_home
-        .as_deref()
-        .is_some_and(gamescope::seat::needs_sign_in)
-}
-
 /// Can a gamescope session on this host stream 10-bit BT.2020 PQ?
 ///
 /// Settled **before spawn** — punktfunk/1 Welcome fixes bit depth and cannot
@@ -974,26 +950,6 @@ mod wlroots;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `mgmt/display.rs` puts this error verbatim on `/display/monitors`;
-    /// the wording is a user-facing surface.
-    /// The seat is the only session the sign-in question is ever asked of: without a home of
-    /// its own a launch shares the box's Steam, which has an account.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn only_a_session_with_a_seat_home_can_owe_a_sign_in() {
-        let iso = |steam_home| SessionIsolation {
-            id: "fp".into(),
-            ei_relay: std::path::PathBuf::from("/run/pf-ei"),
-            sink: None,
-            mic_source: None,
-            steam_home,
-        };
-        assert!(!seat_needs_sign_in(&iso(None)));
-        // A home with no Steam under it is the box's, whatever the session carries.
-        let bare = std::env::temp_dir().join("pf-seat-no-steam");
-        assert!(!seat_needs_sign_in(&iso(Some(bare))));
-    }
 
     #[cfg(target_os = "linux")]
     #[test]

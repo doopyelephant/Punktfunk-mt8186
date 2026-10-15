@@ -280,22 +280,8 @@ pub struct HostConfig {
     /// (`design/gamescope-multiuser.md`). **Default ON**; `=0` restores shared
     /// host-lifetime planes. Shared-desktop and managed/attach routes are untouched.
     pub gamescope_isolate: bool,
-    /// `PUNKTFUNK_STEAM_SEAT_HOME` — run a dedicated Steam launch under the
-    /// session's own `HOME` (`pf_paths::seat_home`), so it neither waits for the
-    /// desktop Steam to shut down nor shares its account
-    /// (`design/steam-seats-warm-launch-implementation-plan.md`). **Default OFF.**
-    /// Needs a native Steam to clone; a seat signs in on its own.
-    pub steam_seat_home: bool,
-    /// `PUNKTFUNK_STEAM_SEAT_SANDBOX` — show a seat's nested Steam only the pads
-    /// this session created, by running it under `bwrap` with a per-seat
-    /// `/dev/input` and `/dev/hidraw*`
-    /// (`design/steam-seats-warm-launch-implementation-plan.md` WP-S3).
-    /// **Default OFF.** Needs a seat home and `bwrap` on `PATH`.
-    pub steam_seat_sandbox: bool,
-    /// `PUNKTFUNK_STEAM_PREWARM` — how many seats the host may hold a Big Picture Steam up for
-    /// before their clients connect, so a launch skips Steam's 13–30 s cold boot
-    /// (`design/steam-seats-warm-launch-implementation-plan.md` WP-S2). **Default 1**; `0` is
-    /// off. Each parked seat costs about a gigabyte, and only a seat home can be pre-warmed.
+    /// `PUNKTFUNK_STEAM_PREWARM` — how many of the most recent players' seats start with the
+    /// host, so a connect skips a first logon. **Default 1**; `0` is off.
     pub steam_prewarm: u32,
     /// `PUNKTFUNK_SEAT_IDLE_STOP_MIN` — minutes a running seat may sit with nobody on it before
     /// the box stops it. **Default 240**; `0` never stops one.
@@ -414,8 +400,6 @@ impl HostConfig {
             gamescope_grab_cursor: row_bool("PUNKTFUNK_GAMESCOPE_GRAB_CURSOR"),
             gamescope_splash: row_bool("PUNKTFUNK_GAMESCOPE_SPLASH"),
             gamescope_isolate: row_bool("PUNKTFUNK_GAMESCOPE_ISOLATE"),
-            steam_seat_home: row_bool("PUNKTFUNK_STEAM_SEAT_HOME"),
-            steam_seat_sandbox: row_bool("PUNKTFUNK_STEAM_SEAT_SANDBOX"),
             steam_prewarm: val("PUNKTFUNK_STEAM_PREWARM")
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(1)

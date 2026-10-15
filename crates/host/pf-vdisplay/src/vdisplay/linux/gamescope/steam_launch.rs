@@ -8,40 +8,14 @@ use std::process::Stdio;
 /// apply). `DISPLAY` and gamescope's socket come from a process already inside, Wayland and GTK
 /// from [`shape_flatpak_command`] and [`GDK_X11`]; with no such process, host env (a
 /// `steam steam://…` still reaches the running Steam over its pipe).
-pub fn launch_into_session(
-    cmd: &str,
-    seat: Option<&str>,
-    steam_home: Option<&std::path::Path>,
-) -> Result<std::process::Child> {
-    // A seat pre-warmed moments ago may still be booting Steam, and a shortcut's URI handed to a
-    // Steam that has not finished starting is never answered. Held in the launch process itself,
-    // so the caller still gets one child and the session thread waits on nothing.
-    let held = steam_home
-        .filter(|h| seat_env_applies(cmd, seat::has_steam(h)))
-        .and_then(seat_steam_log_mark)
-        .and_then(|(log, at)| {
-            let mut from = at; // `steam_up_since` rewinds a log Steam truncated on its own start
-            let up = steam_up_since(&log, &mut from);
-            let uri = reuse_holds_shortcut(cmd, up)?;
-            tracing::info!(
-                %uri,
-                "gamescope: holding this launch until the seat's Steam says it is up"
-            );
-            Some(hold_launch_until_steam_up(&uri, &log, from))
-        });
+pub fn launch_into_session(cmd: &str, seat: Option<&str>) -> Result<std::process::Child> {
     let flatpak = shape_flatpak_command(cmd);
     let mut c = Command::new("sh");
-    c.arg("-c")
-        .arg(held.as_deref().or(flatpak.as_deref()).unwrap_or(cmd));
+    c.arg("-c").arg(flatpak.as_deref().unwrap_or(cmd));
     // Keeps AppImageLauncher's binfmt hook from replacing an .AppImage with its dialog.
     c.env("APPIMAGELAUNCHER_DISABLE", "1");
     // The host's Wayland socket, for the arm below that finds no session display.
     pf_host_config::session::export_to(&mut c);
-    // A kept seat's Steam answers on its own `steam.pipe`; without this the forwarder hands the
-    // launch to the box's Steam instead. Nothing else in the session takes that home.
-    if let Some(home) = steam_home.filter(|h| seat_env_applies(cmd, seat::has_steam(h))) {
-        c.envs(seat::env(home));
-    }
     match discover_session_display_env(seat) {
         Some((x11, gamescope, _xauth)) => {
             tracing::info!(
@@ -83,22 +57,15 @@ const STEAM_SHUTDOWN_SEND_BUDGET: Duration = Duration::from_secs(STEAM_SHUTDOWN_
 /// Steam is gone in a few seconds; the shutdown restore has 20 s for this and the box's restart.
 pub(super) const STEAM_STOP_WAIT: Duration = Duration::from_secs(8);
 
-/// Ask the Steam at `pid` to quit over its home's pipe, then wait out `wait` from the call.
-/// `true` once it is gone. `seat_home` aims the request at a seat's Steam.
-pub(super) fn shut_steam_down(
-    pid: u32,
-    wait: Duration,
-    seat_home: Option<&std::path::Path>,
-) -> bool {
+/// Ask the box's Steam at `pid` to quit over its pipe, then wait out `wait` from the call.
+/// `true` once it is gone.
+pub(super) fn shut_steam_down(pid: u32, wait: Duration) -> bool {
     let deadline = Instant::now() + wait;
     let mut cmd = Command::new("steam");
     cmd.arg("-shutdown")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     pf_host_config::session::export_to(&mut cmd);
-    if let Some(home) = seat_home {
-        cmd.envs(seat::env(home));
-    }
     // Reaped: dropping Child does not wait, and the loop below polls the TARGET, not this helper.
     let _ = crate::proc::status_within(&mut cmd, wait.min(STEAM_SHUTDOWN_SEND_BUDGET));
     loop {
@@ -122,7 +89,7 @@ pub(super) fn free_desktop_steam() -> Result<()> {
         pid,
         "freeing Steam: a desktop-session Steam holds the single instance — sending `steam -shutdown`"
     );
-    if shut_steam_down(pid, STEAM_SHUTDOWN_WAIT, None) {
+    if shut_steam_down(pid, STEAM_SHUTDOWN_WAIT) {
         tracing::info!(pid, "desktop Steam exited — single instance free");
         return Ok(());
     }
@@ -219,33 +186,10 @@ pub(super) fn shape_flatpak_command(cmd: &str) -> Option<String> {
     ))
 }
 
-/// May `cmd` take the seat's env? Only a launch that talks to that seat's own Steam. A Lutris,
-/// Heroic or operator command would otherwise lose its config to a `HOME` holding one Steam and
-/// nothing else. `has_steam` is [`seat::has_steam`].
-fn seat_env_applies(cmd: &str, has_steam: bool) -> bool {
-    has_steam && is_steam_launch(cmd)
-}
-
-/// Does this launch contend for the box's one Steam? A seat's Steam locks its own home, so it
-/// needs neither the box's gaming session stopped nor the desktop Steam shut down — and on a
-/// multi-seat box that session is somebody else playing on the TV.
-pub(super) fn contends_for_box_steam(steam: bool, seat_home: bool) -> bool {
-    steam && !seat_home
-}
-
-/// The box session is DRM master, so Exclusive needs it gone. A launch that already stops it
-/// outright ([`contends_for_box_steam`]) is not asked a second time.
-pub(super) fn free_box_session_for_exclusive(box_steam: bool, exclusive: bool) -> bool {
-    !box_steam && exclusive
-}
-
-/// A seat (an isolated spawn with its own Steam home) streams beside the box's own session, so it
-/// never frees that session or darkens the box's panels, whatever the topology says.
-pub(super) fn seat_spawn_may_darken(
-    exclusive: bool,
-    isolation: Option<&crate::SessionIsolation>,
-) -> bool {
-    exclusive && isolation.is_none_or(|i| i.steam_home.is_none())
+/// The box session is DRM master, so Exclusive needs it gone. A Steam launch, which stops it
+/// outright for the box's one Steam instance, is not asked a second time.
+pub(super) fn free_box_session_for_exclusive(steam: bool, exclusive: bool) -> bool {
+    !steam && exclusive
 }
 
 /// Steam URI → insert `-gamepadui` so nested Steam is Big Picture. Idempotent. Custom cmds unchanged.
@@ -298,44 +242,10 @@ const STEAM_UP_MARGIN: Duration = Duration::from_secs(2);
 /// `steam <uri>` hands off over Steam's pipe and exits; a hung forwarder is not worth waiting on.
 const STEAM_URI_BUDGET: Duration = Duration::from_secs(20);
 
-/// Steam's console log, under the `.steam/steam` link a native install keeps in its home — the
-/// seat's when this session has one, else the box's.
-fn steam_console_log(steam_home: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
-    let home = match steam_home {
-        Some(h) => h.to_path_buf(),
-        None => std::path::PathBuf::from(std::env::var_os("HOME")?),
-    };
+/// The box's Steam console log, under the `.steam/steam` link a native install keeps.
+fn steam_console_log() -> Option<std::path::PathBuf> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
     Some(home.join(".steam/steam/logs/console_log.txt"))
-}
-
-/// Console-log length of each seat's Steam when that seat's gamescope was spawned, so a later
-/// launch into the kept session can tell this Steam's `System startup time` from the last one's.
-/// One entry per seat home; a box with no seat homes never gets one.
-static SEAT_STEAM_LOG_MARK: std::sync::Mutex<Vec<(std::path::PathBuf, u64)>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// Mark where this seat's Steam log stands as its gamescope starts.
-pub(super) fn mark_seat_steam_log(home: &std::path::Path) {
-    let Some(log) = steam_console_log(Some(home)) else {
-        return;
-    };
-    let at = std::fs::metadata(&log).map_or(0, |m| m.len());
-    let mut marks = SEAT_STEAM_LOG_MARK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match marks.iter_mut().find(|(h, _)| h == home) {
-        Some((_, mark)) => *mark = at,
-        None => marks.push((home.to_path_buf(), at)),
-    }
-}
-
-/// `(console log, offset)` of the seat's Steam at spawn. `None` for a home no spawn marked.
-fn seat_steam_log_mark(home: &std::path::Path) -> Option<(std::path::PathBuf, u64)> {
-    let marks = SEAT_STEAM_LOG_MARK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let at = marks.iter().find(|(h, _)| h == home).map(|(_, at)| *at)?;
-    Some((steam_console_log(Some(home))?, at))
 }
 
 /// Has Steam logged [`STEAM_UP_MARKER`] past `from`? `from` resets on a log Steam truncated.
@@ -358,18 +268,14 @@ fn steam_up_since(path: &std::path::Path, from: &mut u64) -> bool {
 
 /// Give the session's Steam `uri` once it is up ([`deferred_shortcut_uri`]).
 ///
-/// The forwarder reaches the nested client over its home's `steam.pipe`, so it needs that home
-/// and none of the rest of the session's env. `gamescope` is this spawn's pid: with the session
-/// gone there is nothing left to launch into, and the URI would land in the box's Steam instead.
-pub(super) fn hand_launch_to_steam_when_up(
-    uri: String,
-    gamescope: u32,
-    steam_home: Option<std::path::PathBuf>,
-) {
+/// The forwarder reaches the nested client over the home's `steam.pipe` and needs none of the
+/// session's env. `gamescope` is this spawn's pid: with the session gone there is nothing left
+/// to launch into, and the URI would land in a desktop Steam instead.
+pub(super) fn hand_launch_to_steam_when_up(uri: String, gamescope: u32) {
     let spawned = std::thread::Builder::new()
         .name("pf1-steamuri".into())
         .spawn(move || {
-            let log = steam_console_log(steam_home.as_deref());
+            let log = steam_console_log();
             let mut from = log
                 .as_ref()
                 .and_then(|p| std::fs::metadata(p).ok())
@@ -404,9 +310,6 @@ pub(super) fn hand_launch_to_steam_when_up(
             tracing::info!(%uri, steam_up = up, "gamescope: handing the launch to the nested Steam");
             let mut forward = Command::new("steam");
             forward.arg(&uri).stdout(Stdio::null()).stderr(Stdio::null());
-            if let Some(home) = &steam_home {
-                forward.envs(seat::env(home));
-            }
             if let Err(e) = crate::proc::status_within(&mut forward, STEAM_URI_BUDGET) {
                 tracing::warn!(%uri, error = %format!("{e:#}"), "gamescope: launch not handed to Steam");
             }
@@ -416,50 +319,9 @@ pub(super) fn hand_launch_to_steam_when_up(
     }
 }
 
-/// The launch a kept seat must hold back: a shortcut's URI ([`deferred_shortcut_uri`]) whose
-/// Steam has not said it is up. A pre-warmed seat is claimed while its Steam may still be
-/// starting, and a shortcut handed to that Steam waits forever. An appid, a launch with no URI,
-/// or a Steam already up goes straight through.
-fn reuse_holds_shortcut(cmd: &str, steam_up: bool) -> Option<String> {
-    deferred_shortcut_uri(cmd).filter(|_| !steam_up)
-}
-
-/// Shell that holds `uri` until this seat's Steam logs [`STEAM_UP_MARKER`] past `from`, then
-/// hands it over — the wait [`hand_launch_to_steam_when_up`] does for a cold spawn, in the one
-/// process the caller gets back as its launch. A timeout forwards anyway, as that wait does.
-fn hold_launch_until_steam_up(uri: &str, log: &std::path::Path, from: u64) -> String {
-    format!(
-        "n=0; while [ $n -lt {tries} ]; do tail -c +{at} {log} 2>/dev/null | grep -q {marker} \
-         && break; n=$((n+1)); sleep 1; done; sleep {margin}; exec steam {uri}",
-        tries = STEAM_UP_WAIT.as_secs(),
-        at = from + 1,
-        log = shell_word(&log.to_string_lossy()),
-        marker = shell_word(STEAM_UP_MARKER),
-        margin = STEAM_UP_MARGIN.as_secs(),
-        uri = shell_word(uri),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_seat_never_darkens_the_box() {
-        let iso = |home: Option<&str>| crate::SessionIsolation {
-            id: "ab12cd34".into(),
-            ei_relay: "/run/user/1000/pf-ei".into(),
-            sink: None,
-            mic_source: None,
-            steam_home: home.map(Into::into),
-        };
-        let seat = iso(Some("/var/lib/punktfunk/seats/ab12cd34"));
-        assert!(!seat_spawn_may_darken(true, Some(&seat)));
-        // A lone isolated spawn on the box's own home keeps the topology it was given.
-        assert!(seat_spawn_may_darken(true, Some(&iso(None))));
-        assert!(seat_spawn_may_darken(true, None));
-        assert!(!seat_spawn_may_darken(false, None));
-    }
 
     #[test]
     fn a_steam_is_matched_to_its_own_unit_only() {
@@ -490,51 +352,6 @@ mod tests {
         // and the `SharedDesktop` preset ("never blank the real monitors") mean what they say.
         assert!(!free_box_session_for_exclusive(false, false));
         assert!(!free_box_session_for_exclusive(true, false));
-    }
-
-    /// A session's other launchers keep their own home: only Steam talks to the seat's Steam.
-    #[test]
-    fn only_a_steam_launch_into_a_provisioned_seat_takes_the_seat_env() {
-        assert!(seat_env_applies(
-            "steam -gamepadui steam://rungameid/2379780",
-            true
-        ));
-        assert!(seat_env_applies(
-            "steam steam://rungameid/13843649396736",
-            true
-        ));
-        // A seat home nothing provisioned (Flatpak-only box) holds no Steam to reach.
-        assert!(!seat_env_applies("steam -gamepadui", false));
-        // Everything else a kept session launches keeps the box's home.
-        for other in [
-            "lutris rungameid/3",
-            "heroic://launch/x",
-            "/opt/game/run.sh",
-            "",
-        ] {
-            assert!(!seat_env_applies(other, true), "{other}");
-        }
-    }
-
-    /// A seat's Steam is not the box's. Stopping the box's gaming session for it would end the
-    /// game on the TV, which is the whole point of seats.
-    #[test]
-    fn a_seat_steam_launch_leaves_the_box_session_alone_unless_exclusive() {
-        assert!(
-            contends_for_box_steam(true, false),
-            "no seat home, one Steam"
-        );
-        assert!(!contends_for_box_steam(true, true));
-        assert!(!contends_for_box_steam(false, true));
-        // A seat Steam takes the non-Steam arm, where only Exclusive frees the box session.
-        let seat = contends_for_box_steam(true, true);
-        assert!(free_box_session_for_exclusive(seat, true));
-        assert!(!free_box_session_for_exclusive(seat, false));
-        // Without a seat home the failing arm above still owns it, exactly as before.
-        assert!(!free_box_session_for_exclusive(
-            contends_for_box_steam(true, false),
-            true
-        ));
     }
 
     #[test]
@@ -665,40 +482,6 @@ mod tests {
         assert_eq!(
             deferred_shortcut_uri("heroic --no-gui steam://rungameid/15155503380618543104"),
             None
-        );
-    }
-
-    /// A launch into a kept seat waits on the same condition a cold spawn does, and only for a
-    /// shortcut: everything else, and a Steam already up, is forwarded the moment it arrives.
-    #[test]
-    fn a_kept_seat_holds_only_a_shortcut_and_only_while_its_steam_is_starting() {
-        let shortcut = "steam steam://rungameid/15155503380618543104";
-        assert_eq!(
-            reuse_holds_shortcut(shortcut, false).as_deref(),
-            Some("steam://rungameid/15155503380618543104")
-        );
-        assert_eq!(reuse_holds_shortcut(shortcut, true), None, "Steam is up");
-        assert_eq!(
-            reuse_holds_shortcut("steam steam://rungameid/570", false),
-            None
-        );
-        assert_eq!(reuse_holds_shortcut("steam -gamepadui", false), None);
-
-        let held = hold_launch_until_steam_up(
-            "steam://rungameid/15155503380618543104",
-            std::path::Path::new("/seats/cafe0123/.steam/steam/logs/console_log.txt"),
-            4096,
-        );
-        // Reads past what the log held at spawn, waits out the same bound, forwards either way.
-        assert!(held.contains("tail -c +4097"), "{held}");
-        assert!(
-            held.contains(&format!("$n -lt {}", STEAM_UP_WAIT.as_secs())),
-            "{held}"
-        );
-        assert!(held.contains(STEAM_UP_MARKER), "{held}");
-        assert!(
-            held.ends_with("exec steam 'steam://rungameid/15155503380618543104'"),
-            "{held}"
         );
     }
 

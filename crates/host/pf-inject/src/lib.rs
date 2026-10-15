@@ -826,13 +826,6 @@ mod pad_shm_ring;
 /// everywhere or nowhere.
 #[path = "inject/pad_slots.rs"]
 pub mod pad_slots;
-/// Per-seat device visibility ([`seat_dev::SeatDev`]): the symlinks a sandboxed seat's Steam
-/// resolves its pads through, and the host-wide lock every create takes.
-///
-/// Built on every target like [`pad_gate`]: only a Linux seat ever sets a directory, but the
-/// window arithmetic and the cross-seat rule are what a test pins, everywhere or nowhere.
-#[path = "inject/seat_dev.rs"]
-pub mod seat_dev;
 /// The IMU clock virtual pads stamp into their input reports ([`sensor_clock::SensorClock`]):
 /// elapsed time in DualSense 1/3 µs, DualShock 4 5.33 µs, and µs for 8BitDo and HORIPAD.
 #[path = "inject/sensor_clock.rs"]
@@ -979,8 +972,6 @@ pub mod gamepad {
         }
         pub fn handle(&mut self, _ev: &punktfunk_core::input::GamepadEvent) {}
         pub fn pump_rumble(&mut self, _send: impl FnMut(u16, u16, u16, u16, u16)) {}
-        /// No pad is ever made here, so there is nothing to show a seat.
-        pub fn expose_in(&mut self, _dir: Option<std::path::PathBuf>) {}
     }
 }
 /// "Punktfunk Pen" uinput virtual tablet — per-session stylus the native pen plane injects

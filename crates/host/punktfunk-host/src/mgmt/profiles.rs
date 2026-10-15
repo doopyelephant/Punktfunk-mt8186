@@ -61,9 +61,6 @@ pub(crate) struct SeatPublic {
     /// client dialing `port` directly pins it. Absent: the pin of this host.
     #[serde(skip_serializing_if = "Option::is_none")]
     pin: Option<String>,
-    /// Its Steam has no account yet: the first connect shows Steam's sign-in. `null` where the
-    /// host can't tell.
-    steam_sign_in: Option<bool>,
     /// Which kind of seat it is.
     kind: SeatKind,
 }
@@ -76,8 +73,6 @@ pub(crate) enum SeatKind {
     /// The box's own session under another name; only on a door, which places it on the
     /// owner's seat.
     Shared,
-    /// A Steam of its own in the owner's session.
-    Steam,
     /// A desktop of its own: a seat with its own user and host.
     Desktop,
 }
@@ -153,11 +148,9 @@ fn public(
     }
 }
 
-/// A light seat starts with its first connect, so it is always ready to dial. A seat of its own
-/// reads its ledger row, and so does everything on a door.
+/// A seat of its own reads its ledger row, and so does everything on a door.
 fn seat(st: &MgmtState, p: &Profile, seats: &Snapshot) -> SeatPublic {
     let kind = match &p.os_account {
-        OsAccount::Seat { seat: None, .. } => SeatKind::Steam,
         OsAccount::Operator => SeatKind::Shared,
         OsAccount::Seat { .. } | OsAccount::Linux { .. } | OsAccount::Windows { .. } => {
             SeatKind::Desktop
@@ -178,7 +171,6 @@ fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot) -> SeatPublic {
         port,
         occupant: None,
         pin: None,
-        steam_sign_in: None,
         kind: SeatKind::Desktop,
     };
     if crate::seats::is_door() {
@@ -195,7 +187,6 @@ fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot) -> SeatPublic {
             port,
             occupant: None,
             pin: None,
-            steam_sign_in: steam_sign_in(&p.id),
             kind: SeatKind::Desktop,
         },
         OsAccount::Linux { .. } | OsAccount::Windows { .. } => {
@@ -212,7 +203,6 @@ fn seated(seats: &Snapshot, id: &str) -> SeatPublic {
         port,
         occupant: None,
         pin: None,
-        steam_sign_in: None,
         kind: SeatKind::Desktop,
     };
     let Some((seat, _)) = seats.seat(id) else {
@@ -377,27 +367,6 @@ fn start_seat(id: &str) {
     }
 }
 
-/// Whether the seat home still needs a Steam account. `None` with **Steam per seat** off.
-fn steam_sign_in(id: &str) -> Option<bool> {
-    #[cfg(target_os = "linux")]
-    {
-        pf_host_config::config().steam_seat_home.then(|| {
-            crate::vdisplay::seat_needs_sign_in(&crate::vdisplay::SessionIsolation {
-                id: String::new(),
-                ei_relay: std::path::PathBuf::new(),
-                sink: None,
-                mic_source: None,
-                steam_home: Some(pf_paths::seat_home(id)),
-            })
-        })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = id;
-        None
-    }
-}
-
 fn admin(st: &MgmtState, profiles: &Profiles, p: &Profile, seats: &Snapshot) -> ProfileAdmin {
     let owner = profiles.owner_id();
     ProfileAdmin {
@@ -516,9 +485,9 @@ pub(crate) async fn get_profile_avatar(
 /// Get a profile's seat ready
 ///
 /// Starts a stopped seat so the next connect lands in it, and answers at once with the seat
-/// `starting`; poll `enumerate` until it is `ready`. A light seat starts with its first
-/// connect, so on Linux this only answers the row. A paired device wakes the profile it lands
-/// in when it names none; any other needs its launch grant.
+/// `starting`; poll `enumerate` until it is `ready`. A profile with no seat to start only gets
+/// its row back. A paired device wakes the profile it lands in when it names none; any other
+/// needs its launch grant.
 #[utoipa::path(
     post,
     path = "/profiles/{id}/wake",

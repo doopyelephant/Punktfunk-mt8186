@@ -241,22 +241,6 @@ impl LeaseShared {
         crate::procscan::tree(&self.recorded())
     }
 
-    /// Stop every client holding this title's cover: report `running` now, and wait for no
-    /// window.
-    ///
-    /// For a launch whose stream already shows what the player has to act on — a seat's Steam
-    /// at its sign-in screen. Only out of `launching`: the watcher owns every state after it,
-    /// so a game the player then starts is followed as any other.
-    pub fn launch_hold_ends(&self) {
-        let _ = self.state.compare_exchange(
-            GameState::Launching as u8,
-            GameState::Running as u8,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-        self.awaiting_window.store(false, Ordering::Relaxed);
-    }
-
     /// Running, and this host will say `window` once the game's window is up.
     pub fn awaits_window(&self) -> bool {
         self.awaiting_window.load(Ordering::Relaxed) && self.state() == GameState::Running
@@ -1740,32 +1724,6 @@ mod tests {
         assert_eq!(scan_scope(false, false, Some(42)), None);
         // No compositor of ours: every other backend keeps the scan it has today.
         assert_eq!(scan_scope(true, true, None), None);
-    }
-
-    /// The state a client's launch hold ends on, and the one it never overwrites.
-    ///
-    /// `running` with no window owed is what every client reads as "the host has said all it
-    /// will" — a seat at Steam's sign-in screen needs that within seconds, not after two
-    /// minutes of cover.
-    #[test]
-    fn a_launch_with_nothing_to_wait_for_reports_running_at_once() {
-        // Recognized by a name no process has: the scan leaves this lease `launching`.
-        let spec = DetectSpec {
-            process_name: Some("pf-no-such-game".into()),
-            ..DetectSpec::default()
-        };
-        let lease = open(req("steam:signin", spec, false), Box::new(|| {}));
-        let shared = lease.shared();
-        assert_eq!(shared.state(), GameState::Launching);
-        shared.awaiting_window.store(true, Ordering::Relaxed);
-        shared.launch_hold_ends();
-        assert_eq!(shared.state(), GameState::Running);
-        assert!(!shared.awaits_window(), "no client waits for a window here");
-
-        // The watcher owns every state after `launching`: a window already found stays found.
-        shared.set_state(GameState::Window);
-        shared.launch_hold_ends();
-        assert_eq!(shared.state(), GameState::Window);
     }
 
     /// A launcher entry is Untracked regardless of how it was started.
