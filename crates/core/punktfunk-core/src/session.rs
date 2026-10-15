@@ -36,7 +36,8 @@ pub struct FramePart {
 
 /// A reassembled, FEC-recovered access unit, ready to hand to the platform decoder.
 pub struct Frame {
-    pub data: Vec<u8>,
+    /// The AU's bytes, in the memory the session assembles in ([`crate::au`]).
+    pub data: crate::au::AuBuf,
     pub frame_index: u32,
     pub pts_ns: u64,
     pub flags: u32,
@@ -976,6 +977,11 @@ impl Session {
         false
     }
 
+    /// Client: assemble access units in `memory` from the next frame on ([`crate::au`]).
+    pub fn set_au_memory(&mut self, memory: std::sync::Arc<dyn crate::au::AuMemory>) {
+        self.reassembler.set_memory(memory);
+    }
+
     /// Client: drain the transport until a whole access unit is recovered, or no more
     /// packets are pending ([`PunktfunkError::NoFrame`]).
     pub fn poll_frame(&mut self) -> Result<Frame> {
@@ -1308,9 +1314,26 @@ mod wire_equivalence_tests {
         );
     }
 
+    /// AU memory that holds a previous AU's bytes, as a reused buffer does.
+    struct DirtyMemory;
+    struct DirtyStore(Vec<u8>);
+    impl crate::au::AuStore for DirtyStore {
+        fn bytes(&self) -> &[u8] {
+            &self.0
+        }
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.0
+        }
+    }
+    impl crate::au::AuMemory for DirtyMemory {
+        fn take(&self, len: usize) -> Option<Box<dyn crate::au::AuStore>> {
+            Some(Box::new(DirtyStore(vec![0xAA; len])))
+        }
+    }
+
     /// A chunk-aligned frame that loses shards past FEC is delivered once it ages out
-    /// (`complete: false`, survivors at exact offsets, holes zero-filled). Unflagged AUs
-    /// still drop, even with the opt-in on.
+    /// (`complete: false`, survivors at exact offsets, holes zero-filled even in reused
+    /// memory). Unflagged AUs still drop, even with the opt-in on.
     #[test]
     fn partial_delivery_of_chunk_aligned_frames() {
         use crate::packet::USER_FLAG_CHUNK_ALIGNED;
@@ -1329,6 +1352,7 @@ mod wire_equivalence_tests {
         let mut host = Session::new(mk(Role::Host), media(false), Box::new(h)).unwrap();
         let mut client = Session::new(mk(Role::Client), media(false), Box::new(c)).unwrap();
         client.set_deliver_partial_frames(true);
+        client.set_au_memory(std::sync::Arc::new(DirtyMemory));
 
         let frame = pattern(8 * 1024);
         host.submit_frame(&frame, 1_000, USER_FLAG_CHUNK_ALIGNED)

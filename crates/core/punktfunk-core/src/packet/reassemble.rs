@@ -15,6 +15,7 @@
 //! [`crate::stats::Stats::fec_late_shards`].
 
 use super::*;
+use crate::au::{AuBuf, AuMemory};
 use crate::config::Config;
 use crate::error::Result;
 use crate::fec::ErasureCoder;
@@ -78,9 +79,9 @@ struct FrameBuf {
     next_part_block: u16,
     /// AU shard offset of the next prefix part (`next_part_block`'s start).
     delivered_shards: usize,
-    /// Whole data region, zeroed. Shards copy to their final offset; FEC writes only
-    /// the holes. On completion this Vec is [`Frame::data`] (truncated to `frame_bytes`).
-    buf: Vec<u8>,
+    /// Whole data region. Shards copy to their final offset; FEC writes only the holes;
+    /// a partial zeroes what never arrived. On completion it is [`Frame::data`].
+    buf: AuBuf,
     blocks: HashMap<u16, BlockState>,
     /// Blocks reconstructed into `buf`. A failed block never counts; the frame ages out.
     blocks_ok: usize,
@@ -241,6 +242,8 @@ pub struct Reassembler {
     shard_delay_ns: Vec<i64>,
     /// Video frames whose tail arrived short, oldest first ([`Self::take_short_tails`]).
     short_tails: Vec<u32>,
+    /// Where frame buffers come from ([`Self::set_memory`]).
+    memory: std::sync::Arc<dyn AuMemory>,
 }
 
 impl Reassembler {
@@ -259,6 +262,7 @@ impl Reassembler {
             in_flight_bytes: 0,
             shard_delay_ns: Vec::with_capacity(SHARD_DELAY_SAMPLES),
             short_tails: Vec::new(),
+            memory: std::sync::Arc::new(crate::au::HeapPool::default()),
         }
     }
 
@@ -296,6 +300,11 @@ impl Reassembler {
 
     pub fn take_partial(&mut self) -> Option<Frame> {
         self.pending_partial.take()
+    }
+
+    /// Assemble frames in `memory` from the next frame on.
+    pub fn set_memory(&mut self, memory: std::sync::Arc<dyn AuMemory>) {
+        self.memory = memory;
     }
 
     /// Ingest one already-decrypted packet. The AU when its last block completes, else `None`.
@@ -345,6 +354,7 @@ impl Reassembler {
             in_flight_bytes,
             shard_delay_ns,
             short_tails,
+            memory,
         } = self;
         let parts = *deliver_parts;
 
@@ -434,7 +444,7 @@ impl Reassembler {
                     epoch,
                     next_part_block: 0,
                     delivered_shards: 0,
-                    buf: vec![0; buf_len],
+                    buf: AuBuf::take(&**memory, buf_len),
                     blocks: HashMap::new(),
                     blocks_ok: 0,
                     short_tail: false,
@@ -474,7 +484,7 @@ impl Reassembler {
         // Re-check the budget: growth commits memory too.
         if buf_len > frame.buf.len() {
             charge(in_flight_bytes, buf_len - frame.buf.len(), &lim)?;
-            frame.buf.resize(buf_len, 0);
+            frame.buf.resize(buf_len, &**memory);
         }
 
         {
@@ -966,6 +976,24 @@ fn pin_totals(frame: &mut FrameBuf, g: &Geom) -> Pin {
     Pin::Keep
 }
 
+/// Zero every shard of `f` that neither arrived nor was rebuilt: frame memory is reused, so
+/// a hole holds a previous AU's bytes until a partial hands it up.
+fn zero_holes(f: &mut FrameBuf) {
+    let sb = f.shard_bytes;
+    let mut have = vec![false; f.buf.len() / sb];
+    for b in f.blocks.values() {
+        let rebuilt = b.done && b.reconstructed;
+        for (i, &h) in b.have_data.iter().enumerate() {
+            if let Some(slot) = have.get_mut(b.base_shard + i) {
+                *slot |= h || rebuilt;
+            }
+        }
+    }
+    for (i, _) in have.iter().enumerate().filter(|(_, h)| !**h) {
+        f.buf[i * sb..(i + 1) * sb].fill(0);
+    }
+}
+
 /// A slice-streamed frame's blocks tile `0..total_data`, each starting where the last
 /// ended. Bases were range-checked on arrival, but a gap or overlap would still hand up
 /// wrong bytes marked complete, with no loss counter moving.
@@ -997,7 +1025,7 @@ impl FrameBuf {
             if lo == 0 {
                 (self.buf, Some(part))
             } else {
-                (self.buf[lo..].to_vec(), Some(part))
+                (self.buf[lo..].to_vec().into(), Some(part))
             }
         } else {
             (self.buf, None)
@@ -1043,7 +1071,7 @@ impl FrameBuf {
             self.delivered_shards * self.shard_bytes,
         );
         Some(Frame {
-            data: self.buf[lo..hi].to_vec(),
+            data: self.buf[lo..hi].to_vec().into(),
             frame_index,
             pts_ns: self.pts_ns,
             flags: self.user_flags,
@@ -1101,12 +1129,14 @@ impl ReassemblyWindow {
                 completed.insert(idx, Done::of(f));
                 *in_flight_bytes -= frame_cost(f);
                 // Chunk-aligned: the buffer is already the consumer shape (received
-                // at final offsets, zeros in holes). Newest-wins. Still counted dropped.
+                // at final offsets), once the holes read zero. Newest-wins. Still counted
+                // dropped.
                 if let Some(sink) = partial_sink.as_deref_mut() {
                     // `frame_bytes > 0` also excludes an unpinned streamed frame
                     // (total still the 0 sentinel): truncate-to-0 would emit empty.
                     if f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0 && f.frame_bytes > 0 {
-                        let mut buf = std::mem::take(&mut f.buf);
+                        zero_holes(f);
+                        let mut buf = std::mem::replace(&mut f.buf, Vec::new().into());
                         buf.truncate(f.frame_bytes);
                         let newer = sink
                             .as_ref()
@@ -1179,7 +1209,7 @@ mod reset_tests {
             0,
         );
         r.pending_partial = Some(Frame {
-            data: vec![0u8; 64],
+            data: vec![0u8; 64].into(),
             frame_index: 7,
             pts_ns: 1,
             flags: 0,

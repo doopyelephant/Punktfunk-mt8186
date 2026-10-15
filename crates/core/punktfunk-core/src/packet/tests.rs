@@ -1143,7 +1143,7 @@ fn parts_coalesce_across_reordered_blocks() {
     assert_eq!(got[0].data.len(), 720 + 288, "blocks 0-2 in one part");
     let p1 = got[1].part.unwrap();
     assert!(p1.last && got[1].complete);
-    let mut rebuilt = got[0].data.clone();
+    let mut rebuilt = got[0].data.to_vec();
     rebuilt.extend_from_slice(&got[1].data);
     assert_eq!(rebuilt, src);
 }
@@ -1809,7 +1809,7 @@ mod geometry_proptests {
             for (_, _, p) in &all {
                 if let Some(f) = rig.push(p) {
                     prop_assert!(f.complete);
-                    prop_assert!(delivered.insert(f.frame_index, f.data).is_none(),
+                    prop_assert!(delivered.insert(f.frame_index, f.data.to_vec()).is_none(),
                         "a frame must deliver exactly once");
                 }
             }

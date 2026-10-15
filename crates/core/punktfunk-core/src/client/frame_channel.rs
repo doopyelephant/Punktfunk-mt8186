@@ -606,7 +606,7 @@ mod frame_channel_tests {
 
     fn frame(i: u32) -> Frame {
         Frame {
-            data: vec![i as u8],
+            data: vec![i as u8].into(),
             frame_index: i,
             pts_ns: i as u64,
             flags: 0,
@@ -1016,7 +1016,7 @@ mod hold_tests {
 
     fn frame(index: u32, complete: bool) -> Frame {
         Frame {
-            data: Vec::new(),
+            data: Vec::new().into(),
             frame_index: index,
             pts_ns: 0,
             flags: 0,
