@@ -211,7 +211,10 @@ export const HostSettingsView: FC<{
 			?.querySelector('[data-state="active"]')
 			?.scrollIntoView({ block: "nearest", inline: "nearest" });
 	}, [active]);
-	const linked = useRef(Boolean(window.location.hash));
+	// The server renders this too, where there is no window.
+	const linked = useRef(
+		typeof window !== "undefined" && Boolean(window.location.hash),
+	);
 	useEffect(() => {
 		if (!linked.current || !active) return;
 		linked.current = false;
