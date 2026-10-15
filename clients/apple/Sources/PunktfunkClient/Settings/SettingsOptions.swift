@@ -261,15 +261,18 @@ enum SettingsOptions {
         return Resolutions.familyOf(families, width, height) ?? 0
     }
 
-    /// Native (`0 × 0`, the display resolved at connect), this device's other native mode (the
-    /// safe area, below the notch), then one entry's sizes from `families()` (unnamed — a picker
-    /// shows them as plain `w × h`), deduped by dimensions (native wins a tie).
+    /// Native (`0 × 0`, the display resolved at connect), this device's other native mode (a
+    /// phone's safe area, a notched Mac's whole panel — never the one Native already is), then
+    /// one entry's sizes from `families()` (unnamed — a picker shows them as plain `w × h`),
+    /// deduped by dimensions (native wins a tie).
     @MainActor
     static func resolutionModes(family: Int) -> [(name: String, w: Int, h: Int)] {
         let entries = families()
         let sizes = entries[min(family, entries.count - 1)].sizes.map { (name: "", w: $0.w, h: $0.h) }
+        let native = NativeDisplay.mode
+        let others = nativeModes().filter { $0.w != native.width || $0.h != native.height }
         var seen = Set<String>()
-        return ([(name: "Native", w: 0, h: 0)] + nativeModes().dropFirst() + sizes)
+        return ([(name: "Native", w: 0, h: 0)] + others + sizes)
             .filter { seen.insert("\($0.w)x\($0.h)").inserted }
     }
 
@@ -316,8 +319,9 @@ enum SettingsOptions {
 
     #if os(macOS)
     /// This display's real modes: the PANEL first, then — on a notched Mac — the variant that
-    /// clears the camera housing, which is the mode a full-screen stream can show whole (see
-    /// `NSScreen.panelPixelSize`, the one definition the fullscreen video fit reads too).
+    /// clears the camera housing, which is Native's mode there (`NativeDisplay.mode`): the one
+    /// native fullscreen shows whole and scans out Direct. The panel is named for the housing it
+    /// covers only on a Mac that has one.
     ///
     /// The two are deduped here, so a second entry means "this display has a housing" and a caller
     /// can offer the choice on exactly the Macs that have one.
@@ -326,12 +330,11 @@ enum SettingsOptions {
         guard let screen = NSScreen.main else { return [] }
         let panel = screen.panelPixelSize
         let safe = screen.notchSafePixelSize
-        let modes: [(name: String, w: Int, h: Int)] = [
-            (name: "This display", w: panel.width, h: panel.height),
+        guard panel.height > safe.height else { return [(name: "This display", w: panel.width, h: panel.height)] }
+        return [
+            (name: "This display (over the notch)", w: panel.width, h: panel.height),
             (name: "This display (below the notch)", w: safe.width, h: safe.height),
         ]
-        var seen = Set<String>()
-        return modes.filter { seen.insert("\($0.w)x\($0.h)").inserted }
     }
     #endif
 

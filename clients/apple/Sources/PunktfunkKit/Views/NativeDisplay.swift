@@ -28,13 +28,15 @@ public enum NativeDisplay {
     }
     #endif
 
-    /// This app's display in landscape pixels, at its top refresh. On a Mac that is the panel, not
-    /// the framebuffer a scaled mode renders into (`NSScreen.panelPixelSize`).
+    /// This app's display in landscape pixels, at its top refresh. On a Mac that is the panel
+    /// below the camera housing (`NSScreen.notchSafePixelSize`), never the framebuffer a scaled
+    /// mode renders into: native fullscreen stops below the housing, and only that fullscreen
+    /// scans out Direct. The whole panel stays a mode of its own, picked by name.
     public static var mode: (width: Int, height: Int, hz: Int) {
         #if os(macOS)
         guard let screen = NSScreen.main else { return (1920, 1080, 60) }
-        let panel = screen.panelPixelSize
-        return (panel.width, panel.height, screen.maximumFramesPerSecond)
+        let safe = screen.notchSafePixelSize
+        return (safe.width, safe.height, screen.maximumFramesPerSecond)
         #elseif os(visionOS)
         // No screen to read: a window can grow past 4K's detail, and every Vision Pro runs 90 Hz.
         // Fixed until visionOS reports a refresh ceiling; M5 panels reach 120.
