@@ -288,7 +288,8 @@ enum Src {
     VpSdr10,
 }
 
-/// Profile, chroma format idc, luma depth and colour from the first AU's SPS (H.264/HEVC).
+/// Profile, chroma format idc, luma depth and colour from the first AU's SPS (H.264/HEVC) or
+/// sequence header (AV1).
 fn sps(
     codec: Codec,
     aus: &[EncodedFrame],
@@ -311,6 +312,27 @@ fn sps(
                 let depth = p.bit_depth_luma_minus8 + 8;
                 (p.general_profile_idc, p.chroma_format_idc, depth, p.colour)
             }),
+        Codec::Av1 => pf_bitstream::av1::sequence_info(first).map(|s| {
+            let depth = match (s.high_bitdepth, s.twelve_bit) {
+                (false, _) => 8,
+                (true, false) => 10,
+                (true, true) => 12,
+            };
+            let chroma = match (s.mono_chrome, s.subsampling_x, s.subsampling_y) {
+                (true, _, _) => 0,
+                (false, true, true) => 1,
+                (false, true, false) => 2,
+                (false, false, false) => 3,
+                (false, false, true) => 4,
+            };
+            let colour = pf_bitstream::h264::ColourDescription {
+                colour_primaries: s.color_primaries,
+                transfer_characteristics: s.transfer_characteristics,
+                matrix_coefficients: s.matrix_coefficients,
+                video_full_range: s.full_range,
+            };
+            (s.profile, chroma, depth, colour)
+        }),
         _ => None,
     }
 }
@@ -486,8 +508,9 @@ fn qsv_live_bgra_reads_in_place_as_bt709_420() {
     }
 }
 
-/// 10-bit SDR: the video processor's BT.709 P010 encodes HEVC Main10 signalled BT.709, not
-/// the BT.2020 PQ an HDR P010 carries.
+/// 10-bit SDR: the video processor's BT.709 P010 encodes HEVC Main10 and AV1 10-bit signalled
+/// BT.709 studio range, not the BT.2020 PQ an HDR P010 carries. A codec the GPU declines at
+/// 10-bit is skipped.
 #[test]
 #[ignore = "needs an Intel GPU with QSV"]
 fn qsv_live_p010_sdr_signals_bt709() {
@@ -495,31 +518,32 @@ fn qsv_live_p010_sdr_signals_bt709() {
         eprintln!("skipping: no Intel adapter");
         return;
     };
-    if !probe_can_encode_10bit(Codec::H265, None) {
-        eprintln!("skipping: this GPU declines 10-bit HEVC");
-        return;
+    for (codec, want_profile) in [(Codec::H265, 2), (Codec::Av1, 0)] {
+        if !probe_can_encode_10bit(codec, None) {
+            eprintln!("skipping {codec:?}: this GPU declines it at 10-bit");
+            continue;
+        }
+        let (aus, own) = encode(&device, codec, Src::VpSdr10, (1920, 1080), Feed::InPlace)
+            .unwrap_or_else(|e| panic!("{codec:?}: {e}"));
+        assert_eq!(aus.len(), FRAMES as usize, "{codec:?}: one AU per frame");
+        assert_eq!(own, Some((true, 3, 0)), "{codec:?}: read in place, no copy");
+        let (profile, chroma, depth, colour) = sps(codec, &aus).expect("sequence header");
+        assert_eq!(
+            (profile, chroma, depth),
+            (want_profile, 1, 10),
+            "{codec:?}: 10-bit 4:2:0"
+        );
+        assert_eq!(
+            (
+                colour.colour_primaries,
+                colour.transfer_characteristics,
+                colour.matrix_coefficients,
+                colour.video_full_range
+            ),
+            (1, 1, 1, false),
+            "{codec:?}: BT.709 studio range"
+        );
     }
-    let (aus, own) = encode(
-        &device,
-        Codec::H265,
-        Src::VpSdr10,
-        (1920, 1080),
-        Feed::InPlace,
-    )
-    .expect("encode");
-    assert_eq!(aus.len(), FRAMES as usize);
-    assert_eq!(own, Some((true, 3, 0)), "read in place, no copy");
-    let (profile, chroma, depth, colour) = sps(Codec::H265, &aus).expect("SPS");
-    assert_eq!((profile, chroma, depth), (2, 1, 10), "Main10 4:2:0");
-    assert_eq!(
-        (
-            colour.colour_primaries,
-            colour.transfer_characteristics,
-            colour.matrix_coefficients
-        ),
-        (1, 1, 1),
-        "BT.709"
-    );
 }
 
 /// G1 and G2 at 640×480, G3 at 1080 and 1800 rows, and the video processor's BT.709 P010 for

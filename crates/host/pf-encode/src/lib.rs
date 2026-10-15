@@ -448,8 +448,8 @@ pub fn resolved_backend_ingests_rgb_444() -> bool {
 /// Encoder half of the 10-bit SDR gate: this backend writes a 10-bit stream from the 8-bit
 /// surface an SDR desktop captures.
 ///
-/// Windows direct-NVENC ingests the IDD packed `Rgb10a2Sdr`; Windows AMF takes a BT.709 P010 the
-/// driver's video processor produces (HEVC only). Linux direct-NVENC takes the plain 8-bit surface
+/// Windows NVENC widens the driver's BGRA itself; Windows AMF and QSV take a BT.709 P010 the
+/// driver produces, for HEVC and AV1. Linux direct-NVENC takes the plain 8-bit surface
 /// and asks NVENC for 10-bit output. Linux VAAPI carries HEVC and Vulkan Video carries AV1, both
 /// with the RGB→YUV matrix following the BT.709 colour, not depth. The GPU still has to pass
 /// `can_encode_10bit`.
