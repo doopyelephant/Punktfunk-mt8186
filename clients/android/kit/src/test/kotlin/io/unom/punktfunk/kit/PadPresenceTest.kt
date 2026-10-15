@@ -172,6 +172,15 @@ class PadPresenceTest {
         assertFalse(Gamepad.isSc2VidPid(0x054C, 0x0CE6)) // DualSense
     }
 
+    /** A remote that claims gamepad buttons gets no wire pad from its D-pad, OK or Back; a pad's
+     * first button, or any key from a device with a stick, does. */
+    @Test
+    fun onlyPadInputOpensAWirePad() {
+        assertTrue(GamepadRouter.opensSlotOnKey(gamepadButton = true, hasStick = false))
+        assertTrue(GamepadRouter.opensSlotOnKey(gamepadButton = false, hasStick = true))
+        assertFalse(GamepadRouter.opensSlotOnKey(gamepadButton = false, hasStick = false))
+    }
+
     private companion object {
         val DPAD = listOf(
             KeyEvent.KEYCODE_DPAD_UP,

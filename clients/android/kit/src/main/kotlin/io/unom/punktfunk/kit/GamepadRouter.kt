@@ -25,9 +25,9 @@ import java.util.concurrent.ConcurrentHashMap
  * Feedback (rumble / HID) is routed BACK to the originating device by pad index via [deviceForPad].
  *
  * Selection: forward EVERY real controller (the Linux client's single-player pin has no Android UI
- * surface yet — Automatic is the only mode). Lifetime matches the session: constructed on stream
- * attach (opening a slot for every already-connected pad, so its Arrival lands before any input),
- * released on detach.
+ * surface yet — Automatic is the only mode). A device gets its slot on its first pad input
+ * ([opensSlotOnKey], or stick motion), never for being connected: TV remotes and system devices
+ * declare gamepad buttons they never press. Released on detach.
  *
  * A single controller lands on wire index 0, so its per-transition button/axis wire is byte-identical
  * to the old single-pad path (plus the Arrival/Remove declarations the contract requires — which an
@@ -201,14 +201,10 @@ class GamepadRouter(
     var onSlotClosed: ((deviceId: Int) -> Unit)? = null
 
     /**
-     * Invoked (main thread) with the deviceId whenever a slot opens for a REAL controller — the
-     * hot-plug callback or the first input from a pad the session started without. Not fired for
-     * [openExternal]: a capture link's pad has no [InputDevice] behind it and streams motion from
-     * its own IMU already. `StreamScreen` wires this to [PadSensors.onSlotOpened].
-     *
-     * Slots opened in `init` (every controller already connected) predate any assignment here, so
-     * a listener must sweep [forwardedDevices] once when it starts. Both happen on the main thread
-     * inside one composition block, so nothing can slip between the sweep and the assignment.
+     * Invoked (main thread) with the deviceId whenever a slot opens for a REAL controller — its
+     * first pad input. Not fired for [openExternal]: a capture link's pad has no [InputDevice]
+     * behind it and streams motion from its own IMU already. `StreamScreen` wires this to
+     * [PadSensors.onSlotOpened].
      */
     var onSlotOpened: ((deviceId: Int) -> Unit)? = null
 
@@ -355,39 +351,37 @@ class GamepadRouter(
 
     private val inputManager = context.getSystemService(InputManager::class.java)
     private val listener = object : InputManager.InputDeviceListener {
-        override fun onInputDeviceAdded(deviceId: Int) {
-            InputDevice.getDevice(deviceId)?.let { if (isForwardable(it)) openSlot(it) }
-        }
-
+        override fun onInputDeviceAdded(deviceId: Int) {}
         override fun onInputDeviceRemoved(deviceId: Int) = closeSlot(deviceId)
         override fun onInputDeviceChanged(deviceId: Int) {}
     }
 
     init {
         inputManager?.registerInputDeviceListener(listener, mainHandler)
-        // Open a slot for every controller already connected when the session starts — the pads that
-        // will never fire onInputDeviceAdded during this session; their Arrival lands before any input.
-        for (id in InputDevice.getDeviceIds()) {
-            InputDevice.getDevice(id)?.let { if (isForwardable(it)) openSlot(it) }
-        }
     }
 
     /**
      * One gamepad button transition for the device that produced [event] (already resolved to BTN_*
-     * bit [bit]). Opens the device's slot (declaring its type) if unseen, forwards the bit on the
-     * slot's pad index, and tracks held state. Completing the emergency stream-exit chord (Select +
-     * Start + L1 + R1) on any one pad ARMS a [EXIT_HOLD_MS] hold timer rather than leaving instantly
-     * ([onExitArmed] fires so the UI can show a "hold to quit" hint); [onExitChord] fires only if the
-     * chord is still held at expiry (a brief accidental brush is ignored), matching `DISCONNECT_HOLD`
-     * on the SDL/Apple clients. Any controller can leave.
+     * bit [bit]). False when the device has no slot and this key may not open one
+     * ([opensSlotOnKey]): the caller handles it as a plain key. Otherwise forwards the bit on the
+     * slot's pad index and tracks held state. The exit chord (Select + Start + L1 + R1) held
+     * [EXIT_HOLD_MS] on any one pad fires [onExitChord]; [onExitArmed] shows the hold hint.
      */
-    fun onButton(event: KeyEvent, bit: Int) {
-        val slot = slotFor(event.device) ?: return
+    fun onButton(event: KeyEvent, bit: Int): Boolean {
+        val dev = event.device ?: return false
+        val slot = slots[dev.id]
+            ?: if (opensSlotOnKey(KeyEvent.isGamepadButton(event.keyCode), Gamepad.hasStick(dev))) {
+                slotFor(dev)
+            } else {
+                null
+            }
+            ?: return false
         when (event.action) {
             // repeatCount guard: don't re-send a held button as auto-repeat.
             KeyEvent.ACTION_DOWN -> slotButton(slot, bit, down = true, send = event.repeatCount == 0)
             KeyEvent.ACTION_UP -> slotButton(slot, bit, down = false, send = true)
         }
+        return true
     }
 
     /**
@@ -1089,6 +1083,13 @@ class GamepadRouter(
          */
         internal fun opensRing(held: Int, bit: Int, selectAsGuide: Boolean): Boolean =
             bit == Gamepad.BTN_A && held and Gamepad.BTN_BACK != 0 && !selectAsGuide
+
+        /**
+         * Whether a key from a device with no slot yet opens one: a `KEYCODE_BUTTON_*` key, or any
+         * pad key from a device with a stick. A TV remote's D-pad, OK and Back stay keys.
+         */
+        internal fun opensSlotOnKey(gamepadButton: Boolean, hasStick: Boolean): Boolean =
+            gamepadButton || hasStick
 
         /** Synthetic slot-key base for [ExternalPad]s — below every real (positive) InputDevice id. */
         const val EXTERNAL_ID_BASE = -1000

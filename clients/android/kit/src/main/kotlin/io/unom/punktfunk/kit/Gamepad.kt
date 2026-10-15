@@ -222,14 +222,18 @@ object Gamepad {
         return looksLikeController(
             padSource = isPad(d),
             virtual = d.isVirtual,
-            hasStick = d.getMotionRange(MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null ||
-                d.getMotionRange(MotionEvent.AXIS_HAT_X, InputDevice.SOURCE_JOYSTICK) != null,
+            hasStick = hasStick(d),
             // `hasKeys` answers for the DEVICE, so a pad with no sticks at all (an arcade stick,
             // a d-pad-only pad) still counts.
             hasFaceButtons = d.hasKeys(KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B)
                 .any { it },
         )
     }
+
+    /** Whether [dev] reports a stick or a HAT on the joystick source. */
+    fun hasStick(dev: InputDevice): Boolean =
+        dev.getMotionRange(MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null ||
+            dev.getMotionRange(MotionEvent.AXIS_HAT_X, InputDevice.SOURCE_JOYSTICK) != null
 
     /** [looksLikeController]'s decision, over plain facts — the seam its truth table is tested at
      * (an [InputDevice] cannot be built off a device). */

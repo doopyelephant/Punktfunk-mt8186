@@ -743,15 +743,9 @@ class MainActivity : ComponentActivity() {
                 val bit = Gamepad.padButtonBit(key, event.flags)
                 // A pad with no trigger axis sends its triggers as L2/R2 keys.
                 if (bit == 0 && gamepadRouter?.onTriggerKey(event, key) == true) return true
-                if (bit != 0) {
-                    // The router forwards the bit on this device's own wire pad index and tracks held
-                    // state per pad. The emergency-exit chord (Select + Start + L1 + R1) is handled
-                    // inside the router: holding it briefly (~1 s, with an on-screen hint) fires
-                    // router.onExitChord (wired in StreamScreen), so a couch user with no keyboard/Back
-                    // can still leave — but an accidental brush of the four buttons no longer quits.
-                    gamepadRouter?.onButton(event, bit)
-                    return true // consumed
-                }
+                // The router forwards the bit on this device's own wire pad index, or declines a
+                // device that is no pad yet (a remote's D-pad), which then goes on as a key.
+                if (bit != 0 && gamepadRouter?.onButton(event, bit) == true) return true
             }
             // The ring is modal: its scrim owns every finger, the router masks the pad behind it,
             // and this is the same claim for keys. Non-nav keys are swallowed, not sent — except

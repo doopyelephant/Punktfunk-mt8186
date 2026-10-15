@@ -70,9 +70,8 @@ internal class StreamPeripherals(
             settings.systemButtonsForward(), settings.guideGestureEnabled(),
         )
         activity?.gamepadRouter = router
-        // Every controller that was already connected got a slot in the router's constructor, so
-        // this is the session's pad answer at t=0 — what the start banner's words are chosen from.
-        ui.padPresent = router.forwardedDevices().isNotEmpty()
+        // A pad gets its slot on its first press, so the start banner asks what is connected.
+        ui.padPresent = Gamepad.pads().isNotEmpty()
         // Select+Start+L1+R1 chord leaves the stream — a deliberate quit (signal it so the host skips
         // the keep-alive linger), unlike a host-ended / backgrounded drop. The router debounces it
         // (must be held ~1.5 s) and fires onExitChord on its main-thread timer, so leave the stream
