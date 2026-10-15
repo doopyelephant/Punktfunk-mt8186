@@ -944,7 +944,7 @@ async fn negotiate_compositor(
     // Blocking probes → spawn_blocking.
     let compositor = match source {
         #[cfg(target_os = "linux")]
-        Punktfunk1Source::Virtual if super::plays_seat_mode(profile) => {
+        Punktfunk1Source::Virtual if super::plays_seat_mode() => {
             Some(crate::seats::session_switch::connect_route())
         }
         Punktfunk1Source::Virtual => {

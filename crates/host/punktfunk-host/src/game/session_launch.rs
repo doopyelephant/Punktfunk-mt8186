@@ -177,8 +177,6 @@ pub(crate) struct SpawnAt<'a> {
     pub nested_spawn: bool,
     /// This session's compositor seat; `None` is the box's own.
     pub seat: Option<&'a str>,
-    /// The seat's Steam home, so a forwarded `steam://` reaches the Steam that reuse kept.
-    pub steam_home: Option<&'a std::path::Path>,
 }
 
 /// What [`spawn`] started.
@@ -263,7 +261,6 @@ pub(crate) fn spawn(
             cmd,
             at.seat,
             t.own_workspace,
-            at.steam_home,
         ) {
             Ok(mut spawned) => {
                 out.now = true;

@@ -208,7 +208,6 @@ pub(super) fn resolved_spawn_app(cmd: Option<&str>) -> Option<String> {
 /// The WSI layer stays out of gamescope's own Vulkan process. Only a flatpak sees gamescope's
 /// Wayland socket ([`shape_flatpak_command`], or the shim around a nested Steam); everything
 /// else gets [`GDK_X11`].
-#[allow(clippy::too_many_arguments)] // one cohesive spawn spec, one call site
 pub(super) fn spawn(
     w: u32,
     h: u32,
@@ -217,7 +216,6 @@ pub(super) fn spawn(
     log: &std::path::Path,
     hdr: bool,
     iso: Option<&crate::SessionIsolation>,
-    seat_home: Option<&std::path::Path>,
 ) -> Result<Child> {
     // Real app vs `sleep infinity` keep-alive: scopes the game-only cursor-grab flag below.
     let game_launch = app.is_some();
@@ -260,15 +258,6 @@ pub(super) fn spawn(
              an HDR10 swapchain. The punktfunk-gamescope package ships a matching layer."
         );
     }
-    // The seat home is the NESTED command's, never gamescope's: the compositor keeps the box's
-    // runtime dir, where PipeWire, Wayland and the EIS relay live. A seat we are about to fill
-    // holds no Steam yet, so this is the launch's shape alone.
-    let nested_seat_home = seat_home.filter(|_| is_steam_launch(&app));
-    // Before the Steam under it writes a line: a later launch into this kept session reads the
-    // marker past this offset to tell that Steam is up.
-    if let Some(home) = nested_seat_home {
-        mark_seat_steam_log(home);
-    }
     let mut nested_env = wsi.env(hdr);
     // A flatpak's Wayland socket rides its command; GTK in anything else stays on Xwayland.
     let flatpak = shape_flatpak_command(&app);
@@ -276,14 +265,12 @@ pub(super) fn spawn(
         nested_env.push((GDK_X11.0, GDK_X11.1.to_string()));
     }
     let app = flatpak.unwrap_or(app);
-    if let Some(home) = nested_seat_home {
-        nested_env.extend(seat::env(home));
-    }
-    let mut filter = seat_sandbox_argv(iso, nested_seat_home.is_some());
-    if is_steam_launch(&app) {
-        filter = sandbox::with_flatpak_shim(filter);
-    }
-    let script = nested_wrapper_script(&relay, splash_exe.is_some(), &nested_env, &filter);
+    let shim = if is_steam_launch(&app) {
+        sandbox::flatpak_shim()
+    } else {
+        Vec::new()
+    };
+    let script = nested_wrapper_script(&relay, splash_exe.is_some(), &nested_env, &shim);
     cmd.args(["sh", "-c", &script, "sh"]);
     if let Some(exe) = &splash_exe {
         cmd.arg(exe);
@@ -331,60 +318,19 @@ pub(super) fn spawn(
         .spawn()
         .context("spawn gamescope (is it installed? `apt install gamescope`)")?;
     if let Some(uri) = deferred {
-        // The home the nested Steam just took, so the forwarder reaches that one's pipe.
-        hand_launch_to_steam_when_up(
-            uri,
-            child.id(),
-            nested_seat_home.map(std::path::Path::to_path_buf),
-        );
+        hand_launch_to_steam_when_up(uri, child.id());
     }
     Ok(child)
 }
 
-/// The `bwrap` prefix this seat's nested command runs behind, empty when it runs unfiltered.
-/// Every reason it does not apply says so once, on the spawn that would have used it.
-fn seat_sandbox_argv(iso: Option<&crate::SessionIsolation>, seat_home: bool) -> Vec<String> {
-    let (bwrap, dev) = match sandbox::plan(iso, seat_home) {
-        sandbox::Plan::Off => return Vec::new(),
-        sandbox::Plan::NoSeatHome => {
-            tracing::info!(
-                "gamescope: this launch runs under the box's own Steam home, so its Steam sees \
-                 every pad on the box"
-            );
-            return Vec::new();
-        }
-        sandbox::Plan::NoBwrap => {
-            tracing::info!(
-                "gamescope: bwrap is not installed, so this seat's Steam sees every pad on the \
-                 box — install bubblewrap"
-            );
-            return Vec::new();
-        }
-        sandbox::Plan::On { bwrap, dev } => (bwrap, dev),
-    };
-    if let Err(e) = sandbox::ensure_dirs(&dev) {
-        tracing::warn!(seat_dev = %dev.display(), error = %e,
-            "gamescope: seat device directory not created, so this seat's Steam sees every pad \
-             on the box");
-        return Vec::new();
-    }
-    tracing::info!(seat_dev = %dev.display(),
-        "gamescope: this seat's Steam is shown only the pads the host creates for it");
-    sandbox::argv(
-        &bwrap,
-        &dev,
-        &sandbox::aux_nodes(std::path::Path::new("/dev")),
-    )
-}
-
 /// Builds the nested wrapper. Its first remaining argument is one shell command,
-/// kept intact until the inner shell parses quoting and operators. `sandbox` is the seat's
-/// device filter; empty runs the command as the session's own child, as it always did.
+/// kept intact until the inner shell parses quoting and operators. `shim` is the flatpak shim's
+/// `bwrap` prefix ([`sandbox::flatpak_shim`]); empty runs the command as the session's own child.
 fn nested_wrapper_script(
     relay: &std::path::Path,
     with_splash: bool,
     nested_env: &[(&'static str, String)],
-    sandbox: &[String],
+    shim: &[String],
 ) -> String {
     let env_kv = nested_env
         .iter()
@@ -392,15 +338,15 @@ fn nested_wrapper_script(
         .collect::<Vec<_>>()
         .join(" ");
     let relay = shell_word(&relay.to_string_lossy());
-    // Only the launch runs behind the filter. The splash and the relay write are the session's.
-    let filter = sandbox
+    // Only the launch runs behind the shim. The splash and the relay write are the session's.
+    let prefix = shim
         .iter()
         .map(|a| shell_word(a))
         .collect::<Vec<_>>()
         .join(" ");
     let mut run = String::from("exec");
-    if !filter.is_empty() {
-        run.push_str(&format!(" {filter}"));
+    if !prefix.is_empty() {
+        run.push_str(&format!(" {prefix}"));
     }
     if !env_kv.is_empty() {
         run.push_str(&format!(" env {env_kv}"));
@@ -429,7 +375,7 @@ pub(super) struct GamescopeProc {
     /// The relay file THIS spawn's wrapper wrote — the global path, or the session's per-instance
     /// one when isolated — so teardown clears its own file and never a concurrent session's.
     pub(super) relay: std::path::PathBuf,
-    /// Home of the Steam this spawn nests, when it runs one: the seat's, or the box's own.
+    /// The box's home when this spawn nests its Steam, so teardown asks that Steam to quit.
     pub(super) steam_home: Option<std::path::PathBuf>,
     pub(super) started: Instant,
 }
@@ -474,9 +420,7 @@ impl Drop for GamescopeProc {
         if let Some(home) = &self.steam_home {
             let nested = home_steam_pid(home).filter(|&pid| descends_from(pid, self.child.id()));
             if let Some(pid) = nested {
-                let box_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-                let seat = (box_home.as_ref() != Some(home)).then_some(home.as_path());
-                shut_steam_down(pid, STEAM_STOP_WAIT, seat);
+                shut_steam_down(pid, STEAM_STOP_WAIT);
             }
         }
         let _ = self.child.kill();
@@ -572,31 +516,29 @@ mod tests {
         assert!(wsi.contains("exec env 'PUNKTFUNK_GAMESCOPE_WSI=1' sh -c \"$1\""));
         assert_eq!(shell_word("a b'c;$HOME"), "'a b'\"'\"'c;$HOME'");
 
-        // The seat's device filter wraps the launch alone: the relay write and the splash are
-        // the session's, and the seat env is applied inside the sandbox.
-        let seat_env = [("HOME", "/seats/cafe0123".to_string())];
-        let filtered = nested_wrapper_script(
+        // The shim wraps the launch alone: the relay write and the splash are the session's, and
+        // the nested env is applied inside it.
+        let env = [("GDK_BACKEND", "x11".to_string())];
+        let shimmed = nested_wrapper_script(
             relay,
             true,
-            &seat_env,
+            &env,
             &[
                 "/usr/bin/bwrap".to_string(),
                 "--die-with-parent".to_string(),
             ],
         );
-        assert!(filtered.contains("env 'HOME=/seats/cafe0123' \"$1\" gamescope-splash &"));
-        assert!(filtered.contains(
-            "shift; exec '/usr/bin/bwrap' '--die-with-parent' env 'HOME=/seats/cafe0123' \
+        assert!(shimmed.contains("env 'GDK_BACKEND=x11' \"$1\" gamescope-splash &"));
+        assert!(shimmed.contains(
+            "shift; exec '/usr/bin/bwrap' '--die-with-parent' env 'GDK_BACKEND=x11' \
              sh -c \"$1\""
         ));
-        // No filter is byte-for-byte the launch this host ran before seats had one.
         assert_eq!(
-            nested_wrapper_script(relay, true, &seat_env, &[]),
+            nested_wrapper_script(relay, true, &env, &[]),
             "printf %s \"$LIBEI_SOCKET\" > '/run/user/1000/pf-ei'; \
-             env 'HOME=/seats/cafe0123' \"$1\" gamescope-splash & \
-             shift; exec env 'HOME=/seats/cafe0123' sh -c \"$1\""
+             env 'GDK_BACKEND=x11' \"$1\" gamescope-splash & \
+             shift; exec env 'GDK_BACKEND=x11' sh -c \"$1\""
         );
-        assert!(seat_sandbox_argv(None, true).is_empty(), "the knob is off");
 
         let out = std::process::Command::new("sh")
             .args([
@@ -611,7 +553,7 @@ mod tests {
         assert!(out.status.success());
         assert_eq!(out.stdout, b"quoted command stays whole");
 
-        // The same through a filter — `env` stands in for bwrap, which a test box need not have.
+        // The same through a shim — `env` stands in for bwrap, which a test box need not have.
         let out = std::process::Command::new("sh")
             .args([
                 "-c",

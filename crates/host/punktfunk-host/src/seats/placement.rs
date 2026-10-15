@@ -1,9 +1,9 @@
 //! Placement: on a box with seats, a seat profile plays on its seat's host, so the box answers
 //! that profile's connect with a `Redirect` to the seat's port, or a refusal saying why.
 //!
-//! The box resolves the profile first (`profiles.rs`); placement only routes. The owner, a
-//! profile that shares the box's desktop and a Linux light seat play on the box, or on the
-//! owner's row when the box is a door, which streams nothing itself. A device the
+//! The box resolves the profile first (`profiles.rs`); placement only routes. The owner and a
+//! profile that shares the box's desktop play on the box, or on the owner's row when the box is
+//! a door, which streams nothing itself. A device the
 //! box redirects holds its seat for [`RESERVE`], so a second device racing in finds the seat
 //! taken before the first lands. A device whose overlay says **A second device connects →
 //! Shares the screen** is redirected to an occupied seat too; the seat host's admission joins it.
@@ -41,9 +41,9 @@ pub(crate) struct Asker<'a> {
 /// Where `profile` plays for `asker`. Blocking (the supervisor's pipe and the seat's loopback
 /// API): call it off the async workers.
 ///
-/// A door streams nothing itself, so it places every profile: the owner, a profile that shares
-/// the owner's desktop and a light seat on the owner's row, a full seat on its own. A profile no
-/// row serves, because the box has no owner row yet, is refused rather than played here.
+/// A door streams nothing itself, so it places every profile: the owner and a profile that
+/// shares the owner's desktop on the owner's row, a full seat on its own. A profile no row
+/// serves, because the box has no owner row yet, is refused rather than played here.
 pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Placement {
     let own_row = ledger_seat(&profile.os_account).is_some();
     if plays_here(pf_paths::seat::role(), own_row) {
@@ -88,11 +88,10 @@ fn plays_here(role: HostRole, own_row: bool) -> bool {
 /// Seat id → the device redirected to it and until when it holds it.
 static RESERVED: Mutex<BTreeMap<String, (String, Instant)>> = Mutex::new(BTreeMap::new());
 
-/// A profile whose seat is a ledger row of its own. A light seat names none and plays on the
-/// box's own host, or on the owner's behind a door.
+/// A profile whose seat is a ledger row of its own.
 fn ledger_seat(account: &crate::profiles::OsAccount) -> Option<&str> {
     match account {
-        crate::profiles::OsAccount::Seat { seat: Some(id), .. } => Some(id),
+        crate::profiles::OsAccount::Seat { seat: Some(id) } => Some(id),
         _ => None,
     }
 }

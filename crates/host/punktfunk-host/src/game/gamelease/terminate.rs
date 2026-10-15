@@ -58,13 +58,6 @@ pub(super) fn terminate_blocking(shared: &LeaseShared) {
                 title = %shared.game.title,
                 "released the nested session's kept display to end its game"
             );
-            // That release takes every kept display, a pre-warmed seat included, and nothing
-            // else stands one back up before the next session ends — which is the player who
-            // left a game running, the one the warm launch is for.
-            #[cfg(target_os = "linux")]
-            if released > 0 {
-                crate::native::prewarm::spawn_run("game ended");
-            }
         }
         LeaseKind::Child | LeaseKind::Matched | LeaseKind::Reported | LeaseKind::Adopted => {
             // A claim that lands while the ladder runs starts the title afresh; the

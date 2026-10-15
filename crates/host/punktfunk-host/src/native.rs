@@ -29,9 +29,6 @@ use std::sync::Arc;
 
 // The session's control connection, whichever transport carries it (quinn or WebTransport).
 pub(crate) mod link;
-/// A seat's Steam, up before its client asks (`design/steam-seats-warm-launch-implementation-plan.md`).
-#[cfg(target_os = "linux")]
-pub(crate) mod prewarm;
 use crate::compositor_route::{resolve_compositor, GamescopeHold};
 
 /// GameStream presents the same virtual pad and must pick `windows_xbox_hid` from this definition.
@@ -413,13 +410,6 @@ pub(crate) async fn serve(
         max_concurrent = opts.max_concurrent,
         "accepting sessions (concurrent)"
     );
-    // Once the host serves: a seat's Steam takes half a minute to boot, and the point is that it
-    // has already booted when its device connects.
-    #[cfg(target_os = "linux")]
-    if !door {
-        prewarm::spawn_run("host start");
-    }
-
     loop {
         // A finished task stays in the set until joined; a serving host never reaches the drain
         // below, and every client probe is a task.
@@ -516,12 +506,6 @@ pub(crate) async fn serve(
                     );
                     tracing::warn!(%peer, error = %detail, "session ended with error")
                 }
-            }
-            // After `serve_session` returns: the stream thread is joined and this session's
-            // display lease is gone, so a pre-warm can adopt or replace what it left.
-            #[cfg(target_os = "linux")]
-            if !door {
-                prewarm::spawn_run("session end");
             }
         });
     }
@@ -1620,7 +1604,7 @@ pub(crate) async fn run_admitted(
                 planes.isolation.clone(),
                 planes.input_route.clone(),
                 planes.inj_session_tx.clone(),
-                plays_seat_mode(&resolved),
+                plays_seat_mode(),
             );
             move |common| SessionContext {
                 common,
@@ -1775,7 +1759,6 @@ fn spawn_input_plane(
         let frame_map = frame_map.clone();
         let pad_feed = controls.pads.clone();
         let counters = counters.clone();
-        let seat_dev = planes.seat_dev.clone();
         let input_route = planes.input_route.clone();
         std::thread::Builder::new()
             .name("punktfunk1-input".into())
@@ -1793,7 +1776,6 @@ fn spawn_input_plane(
                     grants,
                     frame_map,
                     pad_feed,
-                    seat_dev,
                     stop,
                     counters,
                 )
@@ -2136,9 +2118,6 @@ struct SessionPlanes {
     /// Linux only. Identity is the device-fingerprint prefix, so keep-alive hands a kept spawn
     /// back to the same client.
     isolation: Option<crate::vdisplay::SessionIsolation>,
-    /// Where this session's virtual pads are exposed, so its seat's Steam opens those and no
-    /// other seat's. `None` on every host without the filter, which is today's box-wide pads.
-    seat_dev: Option<std::path::PathBuf>,
     /// Pointer and keyboard: the pinned injector, else the host-lifetime one. Swappable.
     input_route: input::InputRoute,
     #[cfg(target_os = "linux")]
@@ -2184,17 +2163,12 @@ impl SessionPlanes {
                 // A seat's own session stays on shared planes: a switch moves it to the desktop.
                 None => compositor
                     .filter(|c| crate::compositor_route::session_is_isolated(*c, route))
-                    .filter(|_| !plays_seat_mode(profile))
+                    .filter(|_| !plays_seat_mode())
                     .map(|_| {
-                        // The profile is the seat: its first session takes the seat's id and
-                        // home, a concurrent second one `<seat>-2` and the box's Steam.
-                        let base = seat_id(&profile.id);
-                        let claim = SeatClaim::take(&base);
-                        let is_seat =
-                            matches!(profile.os_account, crate::profiles::OsAccount::Seat { .. });
-                        let home =
-                            (is_seat && claim.is_first(&base)).then_some(profile.id.as_str());
-                        let iso = session_isolation(&claim.0, home);
+                        // The profile's first session takes its id, a concurrent second one
+                        // `<seat>-2`.
+                        let claim = SeatClaim::take(&seat_id(&profile.id));
+                        let iso = session_isolation(&claim.0);
                         tracing::info!(id = %claim.0, profile = %profile.id,
                             sink = iso.sink.as_deref().unwrap_or("-"),
                             "isolated gamescope session — per-session input/audio/mic planes");
@@ -2202,9 +2176,6 @@ impl SessionPlanes {
                         iso
                     }),
             };
-            let seat_dev = isolation
-                .as_ref()
-                .and_then(crate::vdisplay::seat_device_dir);
             let injector = isolation
                 .as_ref()
                 .map(|i| crate::inject::InjectorService::start_at(i.ei_relay.clone()));
@@ -2219,7 +2190,6 @@ impl SessionPlanes {
             let mic_default = mic.is_none().then(crate::audio::claim_default_mic);
             SessionPlanes {
                 isolation,
-                seat_dev,
                 input_route,
                 inj_session_tx,
                 mic_tx,
@@ -2234,7 +2204,6 @@ impl SessionPlanes {
             let _ = (joined, compositor, route, profile);
             SessionPlanes {
                 isolation: None,
-                seat_dev: None,
                 input_route: input::InputRoute::new(inj_tx.clone()),
                 mic_tx,
             }
@@ -2356,7 +2325,7 @@ fn home_launch(
         return None;
     }
     #[cfg(target_os = "linux")]
-    if opens_game_mode(profile) {
+    if opens_game_mode() {
         return crate::library::game_mode_launch();
     }
     if !opens_big_picture(profile) {
@@ -2368,26 +2337,18 @@ fn home_launch(
     None
 }
 
-/// A seat in Game Mode, connected to by the seat's own profile.
+/// A seat in Game Mode, connected to by a profile it serves.
 #[cfg(target_os = "linux")]
-fn opens_game_mode(profile: &crate::profiles::Resolved) -> bool {
-    crate::seats::session_switch::in_game_mode() && plays_seat_mode(profile)
+fn opens_game_mode() -> bool {
+    crate::seats::session_switch::in_game_mode() && plays_seat_mode()
 }
 
-/// The seat's own profile, or the owner on the owner's row in its headless session: its sessions
-/// play the seat's desktop or Game Mode on shared planes and follow a switch. A light seat on the
-/// owner's row keeps a gamescope of its own; the owner's host at the desk plays as the box's.
+/// A seat's own host, or the owner's on the owner's row in its headless session: every session
+/// it serves plays the seat's desktop or Game Mode on shared planes and follows a switch. The
+/// owner's host at the desk plays as the box's.
 #[cfg(target_os = "linux")]
-pub(crate) fn plays_seat_mode(profile: &crate::profiles::Resolved) -> bool {
-    use crate::profiles::{OsAccount, SeatTier};
+pub(crate) fn plays_seat_mode() -> bool {
     pf_paths::seat::role().runs_seat_session()
-        && !matches!(
-            profile.os_account,
-            OsAccount::Seat {
-                tier: SeatTier::Light,
-                ..
-            }
-        )
 }
 
 /// A seat profile whose bare connect opens Big Picture in its own gamescope.
@@ -2527,22 +2488,15 @@ fn delivered_mode(
     }
 }
 
-/// A seat profile's Steam home while **Steam per seat** is on, or `None` for the box's own.
-#[cfg(target_os = "linux")]
-fn seat_home_for(profile: Option<&str>, on: bool) -> Option<std::path::PathBuf> {
-    profile.filter(|_| on).map(pf_paths::seat_home)
-}
-
-/// The seat a profile streams on: the head of its id. Short enough for a socket name. One
-/// function, because the pre-warm has to name the same seat a connect does or the registry
-/// hands its parked display to nobody.
+/// The seat a profile streams on: the head of its id. Short enough for a socket name, and
+/// stable, so keep-alive hands a kept spawn back to the same profile.
 #[cfg(target_os = "linux")]
 fn seat_id(profile_id: &str) -> String {
     profile_id[..profile_id.len().min(8)].to_string()
 }
 
 /// Isolation ids of the sessions streaming now. A second session on one profile is
-/// `<seat>-2`: planes of its own, and no claim on the seat's home or its parked display.
+/// `<seat>-2`: planes of its own, and no claim on the first one's kept display.
 #[cfg(target_os = "linux")]
 static LIVE_SEATS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -2562,10 +2516,6 @@ impl SeatClaim {
         live.push(id.clone());
         SeatClaim(id)
     }
-
-    fn is_first(&self, base: &str) -> bool {
-        self.0 == base
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2578,22 +2528,16 @@ impl Drop for SeatClaim {
     }
 }
 
-/// The isolated planes `id` streams on. `home` is the seat profile whose Steam home it runs
-/// under; `None` keeps the box's own.
-///
-/// The registry's reuse key is `id` plus that home, so [`prewarm`] builds this value for a seat
-/// before its client connects and the connect lands on the display already standing.
+/// The isolated planes `id` streams on. `id` is also the registry's reuse key.
 #[cfg(target_os = "linux")]
-fn session_isolation(id: &str, home: Option<&str>) -> crate::vdisplay::SessionIsolation {
+fn session_isolation(id: &str) -> crate::vdisplay::SessionIsolation {
     // Monitor-mode has no per-session sink — audio stays shared; input/mic still isolate.
     let sink =
         crate::audio::per_session_sink_possible().then(|| format!("punktfunk-speaker-iso-{id}"));
-    let steam_home = seat_home_for(home, pf_host_config::config().steam_seat_home);
     crate::vdisplay::SessionIsolation::new(
         id.to_string(),
         sink,
         Some(format!("punktfunk-mic-{id}")),
-        steam_home,
     )
 }
 

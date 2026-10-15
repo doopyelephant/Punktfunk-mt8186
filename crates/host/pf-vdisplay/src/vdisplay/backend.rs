@@ -58,21 +58,13 @@ pub struct SessionIsolation {
     pub sink: Option<String>,
     /// Nested apps' `PULSE_SOURCE` `node.name`.
     pub mic_source: Option<String>,
-    /// `HOME` a nested Steam launch runs under (`pf_paths::seat_home`), so it neither
-    /// contends with the box's Steam nor shares its account. `None` = the box's own home.
-    pub steam_home: Option<std::path::PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
 impl SessionIsolation {
     /// Build the identity. The relay sits in the stored session's runtime dir, where the pinned
     /// injector looks for it.
-    pub fn new(
-        id: String,
-        sink: Option<String>,
-        mic_source: Option<String>,
-        steam_home: Option<std::path::PathBuf>,
-    ) -> SessionIsolation {
+    pub fn new(id: String, sink: Option<String>, mic_source: Option<String>) -> SessionIsolation {
         let runtime = pf_host_config::session::runtime_dir();
         let ei_relay = pf_paths::gamescope_ei_socket_file_for(runtime.as_deref(), &id);
         SessionIsolation {
@@ -80,18 +72,13 @@ impl SessionIsolation {
             ei_relay,
             sink,
             mic_source,
-            steam_home,
         }
     }
 
-    /// The registry's reuse key. A kept spawn has this id's planes and this home baked into its
-    /// env, so only a session asking for both may be handed it back — and a pre-warm has to
-    /// build the same string, or it parks a display nobody claims.
+    /// The registry's reuse key. A kept spawn has this id's planes baked into its env, so only
+    /// a session asking for them may be handed it back.
     pub fn key(&self) -> String {
-        match &self.steam_home {
-            Some(home) => format!("{}@{}", self.id, home.display()),
-            None => self.id.clone(),
-        }
+        self.id.clone()
     }
 }
 

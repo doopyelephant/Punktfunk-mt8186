@@ -61,20 +61,15 @@ test("on a door the owner and the seats of their own have a library, the rest sh
 		display_name: "Guest",
 		seat: { port: 9778, state: "ready", kind: "shared" },
 	});
-	const steam = profile({
-		id: "t".repeat(32),
-		display_name: "Mia",
-		seat: { port: 9778, state: "ready", kind: "steam" },
-	});
 	const desktop = profile({
 		seat: { port: 9779, state: "ready", kind: "desktop" },
 	});
-	expect(seatChoices([owner, shared, steam, desktop], "linux", true)).toEqual([
+	expect(seatChoices([owner, shared, desktop], "linux", true)).toEqual([
 		{ id: "o".repeat(32), name: "Enrico" },
 		{ id: KID, name: "Kid" },
 	]);
 	// Off a door the owner is the box, and the same list offers nothing on Linux.
-	expect(seatChoices([owner, shared, steam, desktop], "linux")).toEqual([]);
+	expect(seatChoices([owner, shared, desktop], "linux")).toEqual([]);
 });
 
 test("a seat's cache asks the seat's host and the box's never does", async () => {

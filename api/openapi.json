@@ -6825,7 +6825,7 @@
           "profiles"
         ],
         "summary": "Get a profile's seat ready",
-        "description": "Starts a stopped seat so the next connect lands in it, and answers at once with the seat\n`starting`; poll `enumerate` until it is `ready`. A light seat starts with its first\nconnect, so on Linux this only answers the row. A paired device wakes the profile it lands\nin when it names none; any other needs its launch grant.",
+        "description": "Starts a stopped seat so the next connect lands in it, and answers at once with the seat\n`starting`; poll `enumerate` until it is `ready`. A profile with no seat to start only gets\nits row back. A paired device wakes the profile it lands in when it names none; any other\nneeds its launch grant.",
         "operationId": "wakeProfile",
         "parameters": [
           {
@@ -15493,7 +15493,6 @@
         "description": "What a profile's seat is. A door places every profile on a seat, so a profile on the box's own\nsession has one too: the owner's.",
         "enum": [
           "shared",
-          "steam",
           "desktop"
         ]
       },
@@ -15539,13 +15538,6 @@
           },
           "state": {
             "$ref": "#/components/schemas/SeatState"
-          },
-          "steam_sign_in": {
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "description": "Its Steam has no account yet: the first connect shows Steam's sign-in. `null` where the\nhost can't tell."
           }
         }
       },

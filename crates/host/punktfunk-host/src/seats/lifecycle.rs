@@ -189,7 +189,7 @@ pub(crate) fn run_door() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiles::{OsAccount, SeatTier};
+    use crate::profiles::OsAccount;
 
     fn seat(id: &str, owner: bool) -> Seat {
         serde_json::from_value(serde_json::json!({
@@ -215,23 +215,18 @@ mod tests {
     fn full(id: &str) -> OsAccount {
         OsAccount::Seat {
             seat: Some(id.into()),
-            tier: SeatTier::Full,
         }
     }
 
-    /// On a door the owner and a light seat warm the owner's row, a full seat its own; the
+    /// On a door the owner and a desktop sharer warm the owner's row, a full seat its own; the
     /// newest first, each row once, nothing older than two weeks, and no more than asked.
     #[test]
     fn the_most_recent_players_rows_warm_once_each() {
         let owner = seat(OWNER, true);
         let now = 10_000_000;
-        let light = OsAccount::Seat {
-            seat: None,
-            tier: SeatTier::Light,
-        };
         let profiles = [
             profile("owner", OsAccount::Operator, now - 300),
-            profile("light", light.clone(), now - 100),
+            profile("sharer", OsAccount::Operator, now - 100),
             profile("kid", full(KID), now - 200),
             profile("old", full("ff".repeat(16).as_str()), now - 15 * 24 * 3600),
             profile("never", full(KID), 0),

@@ -44,7 +44,6 @@ fn seat(id: &str, name: &str, seat: Option<&str>) -> Profile {
         name,
         OsAccount::Seat {
             seat: seat.map(Into::into),
-            tier: SeatTier::Light,
         },
     );
     p.home = Home::Bigpicture;
@@ -141,10 +140,10 @@ fn a_seat_host_refuses_another_seats_profile() {
     );
 }
 
-/// The owner's host, behind the door, plays the owner, the profiles that share the owner's
-/// desktop and the light seats, and still refuses a full seat that is another host's.
+/// The owner's host, behind the door, plays the owner and the profiles that share the owner's
+/// desktop, and still refuses a full seat that is another host's.
 #[test]
-fn the_owner_s_host_serves_the_owner_and_the_light_seats() {
+fn the_owner_s_host_serves_the_owner_and_its_sharers() {
     let mut file = box_file();
     file.profiles
         .push(profile("cccccccccccc", "Sibling", OsAccount::Operator));
@@ -154,22 +153,11 @@ fn the_owner_s_host_serves_the_owner_and_the_light_seats() {
     p.owner_host = true;
     // No ask: the owner, not a seat that names this row.
     assert_eq!(p.resolve(None, None).unwrap().id, "4f1c3a9b0e27");
-    for id in [
-        "4f1c3a9b0e27",
-        "cccccccccccc",
-        "9a3f1c2b7e40",
-        "0123456789ab",
-    ] {
+    for id in ["4f1c3a9b0e27", "cccccccccccc"] {
         assert_eq!(p.resolve(None, Some(id)).unwrap().id, id);
     }
     assert_eq!(
         p.resolve(None, Some("dddddddddddd")),
-        Err(ProfileError::NotThisSeat)
-    );
-    // An ordinary seat host still refuses a light seat.
-    p.owner_host = false;
-    assert_eq!(
-        p.resolve(None, Some("9a3f1c2b7e40")),
         Err(ProfileError::NotThisSeat)
     );
 }
@@ -312,11 +300,30 @@ fn the_design_example_parses() {
     assert_eq!(
         file.profiles[1].os_account,
         OsAccount::Seat {
-            seat: Some("c0ffee".into()),
-            tier: SeatTier::Light
+            seat: Some("c0ffee".into())
         }
     );
     assert_eq!(file.profiles[1].home, Home::Bigpicture);
+}
+
+/// An older host wrote a seat's tier. The file still reads, and a light seat is still the seat
+/// with no ledger row that [`Profiles::share_light_seats`] looks for.
+#[test]
+fn a_seat_tier_an_older_host_wrote_still_reads() {
+    let text = r#"[
+        { "kind": "seat", "tier": "light" },
+        { "kind": "seat", "seat": "c0ffee", "tier": "full" }
+    ]"#;
+    let accounts: Vec<OsAccount> = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        accounts,
+        [
+            OsAccount::Seat { seat: None },
+            OsAccount::Seat {
+                seat: Some("c0ffee".into())
+            }
+        ]
+    );
 }
 
 #[test]
@@ -378,7 +385,7 @@ fn names_are_trimmed_capped_and_unique() {
 }
 
 /// A light seat shares the owner's desktop and keeps what makes it the player's. A profile with
-/// a ledger row is a desktop of its own, whatever its tier reads, and the owner stays the owner.
+/// a ledger row is a desktop of its own, and the owner stays the owner.
 #[test]
 fn a_light_seat_becomes_a_profile_that_shares_the_desktop() {
     let mut file = box_file();

@@ -96,13 +96,11 @@ pub struct Profile {
 pub enum OsAccount {
     /// The box's own session.
     Operator,
-    /// A seat of the box. On Linux `seat` is absent and the home is `seats/<id>`; on Windows it
-    /// is the seats ledger's id.
+    /// A desktop of its own: `seat` is its row in the seats ledger. Absent is a light seat, an
+    /// Own Steam profile [`Profiles::share_light_seats`] turns into a sharer of the owner's.
     Seat {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seat: Option<String>,
-        #[serde(default)]
-        tier: SeatTier,
     },
     /// Reserved for the OS-user increment: resolves to [`ProfileError::SessionUnavailable`].
     Linux {
@@ -117,16 +115,6 @@ pub enum OsAccount {
         sid: Option<String>,
         credential: CredentialRef,
     },
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SeatTier {
-    /// A Steam home in a gamescope of its own, under the box owner's uid.
-    #[default]
-    Light,
-    /// A user of its own with its own session and host.
-    Full,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
@@ -314,7 +302,7 @@ pub struct Profiles {
     /// This host's seat id when it is a seat host; `None` on the box's own host.
     seat: Option<String>,
     /// This seat host is the box owner's, behind the door: it also serves the profiles that
-    /// play in the owner's host, the owner's own and the light seats.
+    /// share the owner's desktop.
     owner_host: bool,
 }
 
@@ -393,7 +381,6 @@ impl Profiles {
             let os_account = match &seat {
                 Some(row) => OsAccount::Seat {
                     seat: Some(row.clone()),
-                    tier: SeatTier::Full,
                 },
                 None => OsAccount::Operator,
             };
@@ -696,7 +683,7 @@ impl Profiles {
     /// the owner's desktop. Name, picture, play stats and the Steam home on disk stay; its
     /// pre-warm record goes. The owner moves first, so no converted profile takes its place.
     pub fn share_light_seats(&self) {
-        let light = |p: &Profile| matches!(p.os_account, OsAccount::Seat { seat: None, .. });
+        let light = |p: &Profile| matches!(p.os_account, OsAccount::Seat { seat: None });
         if !self.lock().file.profiles.iter().any(light) {
             return;
         }
@@ -740,10 +727,8 @@ impl Profiles {
                     .then(|| file.profiles.iter().find(|p| p.id == id))
                     .flatten()
                     .ok_or(ProfileError::Unknown)?;
-                if let (Some(mine), OsAccount::Seat { seat, .. }) = (&self.seat, &found.os_account)
-                {
-                    let light_here = self.owner_host && seat.is_none();
-                    if seat.as_ref() != Some(mine) && !light_here {
+                if let (Some(mine), OsAccount::Seat { seat }) = (&self.seat, &found.os_account) {
+                    if seat.as_ref() != Some(mine) {
                         return Err(ProfileError::NotThisSeat);
                     }
                 }

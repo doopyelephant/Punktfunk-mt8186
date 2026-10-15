@@ -436,7 +436,6 @@ mod tests {
             ei_relay: "/run/pf-ei".into(),
             sink: None,
             mic_source: None,
-            steam_home: None,
         };
         let params = crate::SessionParams {
             client_fp: Some([7; 32]),
