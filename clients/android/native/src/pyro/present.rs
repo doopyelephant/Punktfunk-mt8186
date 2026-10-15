@@ -16,9 +16,9 @@ use pf_client_video::video_vk::QueueLock;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-/// Frames the CPU may record ahead of the GPU. Two is the whole budget this lane wants:
-/// decode is synchronous (the shared decoder fence-waits before handing the planes over),
-/// so a deeper pipeline would only park finished pictures in front of the panel.
+/// Frames the CPU may record ahead of the GPU. Two is the whole budget this lane wants: the
+/// decoder already runs one frame ahead, so a deeper pipeline would only park finished
+/// pictures in front of the panel.
 const FRAMES: usize = 2;
 
 /// How long to wait for a free swapchain image before giving up on this picture.
@@ -394,8 +394,9 @@ impl<'d> Present<'d> {
         };
 
         // Bind this frame's planes. Safe to rewrite the set: the fence above proves the
-        // submit that last read it has completed. GENERAL is the layout the decoder leaves
-        // its planes in — sampling from it needs no transition, which is the point.
+        // submit that last read it has completed. The decode may still be running; it sits
+        // ahead on this queue and its closing barrier orders our sampling after its writes,
+        // in GENERAL, so no transition.
         let set = self.sets[frame];
         let infos: Vec<vk::DescriptorImageInfo> = views
             .iter()

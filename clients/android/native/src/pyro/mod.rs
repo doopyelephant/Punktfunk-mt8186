@@ -30,11 +30,11 @@ mod imp {
     use anyhow::{anyhow, Result};
     use ndk::native_window::NativeWindow;
     use pf_client_video::video_color::ColorDesc;
-    use pf_client_video::video_pyrowave::PyroWaveDecoder;
+    use pf_client_video::video_pyrowave::{DecodeTimeline, PyroWaveDecoder};
     use punktfunk_core::client::NativeClient;
     use punktfunk_core::error::PunktfunkError;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
     use crate::decode::{now_realtime_ns, DecodeOptions, NO_VIDEO_PATIENCE};
@@ -60,8 +60,8 @@ mod imp {
     const SPLIT_EVERY: Duration = Duration::from_secs(5);
 
     /// Where a frame's time goes while the stats overlay is on: mean queue wait, parse,
-    /// record, submit→fence and present, then the decoder's own GPU stage times. The HUD's
-    /// one `decode` figure cannot tell a slow GPU from a down-clocked one.
+    /// record, submit→done ([`Retire`]'s latest) and present, then the decoder's own GPU
+    /// stage times. The HUD's one `decode` figure cannot tell a slow GPU from a down-clocked one.
     #[derive(Default)]
     struct SplitWindow {
         started: Option<Instant>,
@@ -71,7 +71,7 @@ mod imp {
     }
 
     impl SplitWindow {
-        fn add(&mut self, decoder: &PyroWaveDecoder, wait_us: u64, present_us: u64) {
+        fn add(&mut self, decoder: &PyroWaveDecoder, wait_us: u64, gpu_us: u64, present_us: u64) {
             let started = *self.started.get_or_insert_with(|| {
                 decoder.gpu_stage_report(true); // the stage window starts with ours
                 Instant::now()
@@ -81,7 +81,7 @@ mod imp {
                 wait_us,
                 s.parse_us.into(),
                 s.record_us.into(),
-                s.gpu_us.into(),
+                gpu_us,
                 present_us,
             ];
             for (acc, v) in self.sum.iter_mut().zip(frame) {
@@ -109,6 +109,76 @@ mod imp {
                 started: Some(Instant::now()),
                 ..Default::default()
             };
+        }
+    }
+
+    /// A frame the lane submitted and moved on from.
+    struct Retiring {
+        timeline: Arc<DecodeTimeline>,
+        turn: u64,
+        submitted: Instant,
+        /// pts and receipt stamp while the overlay is on.
+        hud: Option<(u64, i128)>,
+    }
+
+    /// Notices finished decodes, so the lane never waits on one: per frame it waits on the
+    /// decoder's timeline, stamps the HUD's `decode` stage and keeps the GPU time for ADPF
+    /// and the split. Joined on drop, which must come before the decoder's and the device's.
+    struct Retire {
+        tx: Option<mpsc::Sender<Retiring>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        /// Submit → done of the last frame it saw, µs.
+        gpu_us: Arc<AtomicU64>,
+    }
+
+    impl Retire {
+        /// Past this a decode is wedged; the frame goes unstamped and the lane's own slot
+        /// wait reports the fault.
+        const PATIENCE: Duration = Duration::from_millis(500);
+
+        fn spawn(stats: Arc<crate::stats::VideoStats>) -> Result<Retire> {
+            let (tx, rx) = mpsc::channel::<Retiring>();
+            let gpu_us = Arc::new(AtomicU64::new(0));
+            let last = gpu_us.clone();
+            let thread = std::thread::Builder::new()
+                .name("pf-pyro-retire".into())
+                .spawn(move || {
+                    for r in rx {
+                        if r.timeline.wait(r.turn, Self::PATIENCE).is_err() {
+                            continue;
+                        }
+                        last.store(r.submitted.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        if let Some((pts_ns, received_ns)) = r.hud {
+                            let decoded_ns = now_realtime_ns();
+                            let us = crate::stats::sane_us(decoded_ns - received_ns);
+                            stats.note_decoded(pts_ns, decoded_ns, us);
+                        }
+                    }
+                })?;
+            Ok(Retire {
+                tx: Some(tx),
+                thread: Some(thread),
+                gpu_us,
+            })
+        }
+
+        fn send(&self, r: Retiring) {
+            if let Some(tx) = &self.tx {
+                let _ = tx.send(r);
+            }
+        }
+
+        fn gpu_us(&self) -> u64 {
+            self.gpu_us.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Drop for Retire {
+        fn drop(&mut self) {
+            drop(self.tx.take()); // the thread drains what is queued, then ends
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
         }
     }
 
@@ -179,6 +249,8 @@ mod imp {
 
         let mut mode = client.mode();
         let mut decoder = open_decoder(client, &dev, mode)?;
+        // Declared after the decoder, so it is joined first on every exit.
+        let retire = Retire::spawn(stats.clone())?;
         let depth = if client.bit_depth >= 10 { 10 } else { 8 };
         let msb_packed = client.bit_depth >= 10;
         log::info!(
@@ -277,7 +349,16 @@ mod imp {
             let Some(picture) = decoded else {
                 continue; // packets accumulated, frame not complete yet
             };
-            let decoded_ns = if want_stamps { now_realtime_ns() } else { 0 };
+            // Submitted, not done: the present below follows it on the same queue, and the
+            // retire thread notices when it finishes.
+            let submitted = Instant::now();
+            let submitted_ns = if want_stamps { now_realtime_ns() } else { 0 };
+            retire.send(Retiring {
+                timeline: decoder.timeline(),
+                turn: picture.turn,
+                submitted,
+                hud: stats.enabled().then_some((frame.pts_ns, received_ns)),
+            });
 
             opts.decoded_size.store(
                 crate::session::pack_surface_size(picture.width as i32, picture.height as i32),
@@ -297,25 +378,27 @@ mod imp {
             }
             if let Some(h) = &hint {
                 // The GPU half is what the governor under-clocks; reporting it asks for clock.
-                let total = work_started.0.elapsed().as_nanos() as i64;
-                let gpu = i64::from(decoder.last_split().gpu_us) * 1000;
-                h.report_work(work_started.1, total, (total - gpu).max(0), gpu);
+                // The critical path is CPU up to the decode submit, then the GPU (latest seen).
+                let cpu = work_started.0.elapsed().as_nanos() as i64;
+                let gpu = retire.gpu_us() as i64 * 1000;
+                let to_submit = submitted.duration_since(work_started.0).as_nanos() as i64;
+                h.report_work(work_started.1, to_submit + gpu, cpu, gpu);
             }
 
             // No latch callback on this path, so the HUD drops the `display` stage. `decode`
-            // ends at the decoder, as on desktop; present time is in the split log. E2E is
-            // stamped whatever the HUD state: the audio plane steers by `video_e2e`.
+            // ends when the GPU finishes, as on desktop (stamped by `retire`); present time is
+            // in the split log. E2E is stamped whatever the HUD state: the audio plane steers
+            // by `video_e2e`.
             let presented_ns = now_realtime_ns();
             let offset = clock_offset.load(Ordering::Relaxed);
             crate::stats::publish_e2e(&video_e2e, presented_ns, offset, frame.pts_ns);
             if stats.enabled() {
-                let decode_us = crate::stats::sane_us(decoded_ns - received_ns);
-                stats.note_decoded(frame.pts_ns, decoded_ns, decode_us);
                 let us = |a: i128, b: i128| crate::stats::sane_us(b - a).unwrap_or(0);
                 split.add(
                     &decoder,
                     us(received_ns, pulled_ns),
-                    us(decoded_ns, presented_ns),
+                    retire.gpu_us(),
+                    us(submitted_ns, presented_ns),
                 );
             } else {
                 split = SplitWindow::default();
@@ -323,7 +406,7 @@ mod imp {
         }
 
         // Every exit path tears down in reverse declaration order, which is Vulkan's: the
-        // decoder, the present half, the device, then the surface and instance.
+        // retire thread, the decoder, the present half, the device, then surface and instance.
         log::info!("pyro: lane stopped after {received} access units");
         Ok(())
     }
