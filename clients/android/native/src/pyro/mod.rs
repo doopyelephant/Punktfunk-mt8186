@@ -215,8 +215,8 @@ mod imp {
         while !shutdown.load(Ordering::Relaxed) {
             // Live mode switch (`NativeClient::request_mode`, or the host's own resize): the
             // decoder is fixed-size, so rebuild it. The device, surface and pipeline are all
-            // dimension-independent and stay; the swapchain follows the window, not the
-            // stream, and is rebuilt by its own out-of-date path.
+            // dimension-independent and stay; the swapchain follows the view, not the stream
+            // ([`Present::follow`]).
             let now_mode = client.mode();
             if now_mode.width != mode.width || now_mode.height != mode.height {
                 log::info!(
@@ -286,6 +286,7 @@ mod imp {
             let crop = crate::session::unpack_src_crop(
                 opts.src_crop.load(std::sync::atomic::Ordering::Relaxed),
             );
+            present.follow(opts.surface_size.load(Ordering::Relaxed))?;
             let shown = present.show(picture.views, crop, picture.color, depth, msb_packed)?;
             if !shown {
                 continue; // swapchain was out of date; it has been rebuilt
