@@ -210,9 +210,12 @@ impl Rung for crate::video_pyrowave::PyroWaveDecoder {
         complete: bool,
     ) -> Result<Option<DecodedImage>> {
         let aligned = user_flags & punktfunk_core::packet::USER_FLAG_CHUNK_ALIGNED != 0;
-        Ok(self
-            .decode_frame(au, aligned, complete)?
-            .map(DecodedImage::PyroWave))
+        let frame = self.decode_frame(au, aligned, complete)?;
+        // The presenter and the export lanes read on their own terms: hand over done planes.
+        if let Some(f) = &frame {
+            self.wait_ready(f)?;
+        }
+        Ok(frame.map(DecodedImage::PyroWave))
     }
 }
 

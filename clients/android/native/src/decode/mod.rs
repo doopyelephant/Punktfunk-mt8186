@@ -27,6 +27,8 @@ use async_loop::run_async;
 pub(crate) use setup::{codec_label, codec_mime};
 // Shared with the PyroWave lane, which exists only where the codec is built (see `crate::pyro`).
 #[cfg(target_pointer_width = "64")]
+pub(crate) use async_loop::start_hint;
+#[cfg(target_pointer_width = "64")]
 pub(crate) use latency::now_realtime_ns;
 #[cfg(target_pointer_width = "64")]
 pub(crate) use setup::boost_thread_priority;

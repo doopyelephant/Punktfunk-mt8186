@@ -16,9 +16,9 @@ use pf_client_video::video_vk::QueueLock;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-/// Frames the CPU may record ahead of the GPU. Two is the whole budget this lane wants:
-/// decode is synchronous (the shared decoder fence-waits before handing the planes over),
-/// so a deeper pipeline would only park finished pictures in front of the panel.
+/// Frames the CPU may record ahead of the GPU. Two is the whole budget this lane wants: the
+/// decoder already runs one frame ahead, so a deeper pipeline would only park finished
+/// pictures in front of the panel.
 const FRAMES: usize = 2;
 
 /// How long to wait for a free swapchain image before giving up on this picture.
@@ -70,6 +70,8 @@ pub(super) struct Present<'d> {
     fences: Vec<vk::Fence>,
     swap: SwapRes,
     frame: usize,
+    /// The view's live size as last read ([`Present::follow`]), packed; `0` = not known yet.
+    followed: u64,
     _dev: PhantomData<&'d super::device::PyroDevice>,
 }
 
@@ -201,17 +203,45 @@ impl<'d> Present<'d> {
                 extent: vk::Extent2D::default(),
             },
             frame: 0,
+            followed: 0,
             _dev: PhantomData,
         };
         p.rebuild_swapchain(color_space)?;
-        log::info!(
-            "pyro: swapchain {}x{} {:?} {:?}",
-            p.swap.extent.width,
-            p.swap.extent.height,
-            p.format,
-            p.present_mode
-        );
         Ok(p)
+    }
+
+    /// Follow the view's live size, `packed` by `pack_surface_size`. Android's WSI never
+    /// reports a resize as out of date: it keeps the old buffers and SurfaceFlinger scales
+    /// them, so the size Kotlin reports is the signal.
+    pub(super) fn follow(&mut self, packed: u64) -> Result<()> {
+        if packed == self.followed {
+            return Ok(());
+        }
+        self.followed = packed;
+        if self.extent_changed()? {
+            self.recreate()?;
+        }
+        Ok(())
+    }
+
+    /// The size the swapchain should have: the view's live size once Kotlin has reported
+    /// it, else the window's, within what the surface allows.
+    fn target_extent(&self, caps: &vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
+        let want = match crate::session::unpack_surface_size(self.followed) {
+            Some((w, h)) if w > 0 && h > 0 => vk::Extent2D {
+                width: w as u32,
+                height: h as u32,
+            },
+            _ => caps.current_extent,
+        };
+        vk::Extent2D {
+            width: want
+                .width
+                .clamp(caps.min_image_extent.width, caps.max_image_extent.width),
+            height: want
+                .height
+                .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
+        }
     }
 
     /// (Re)create the swapchain and everything sized by it, keeping the old one as the
@@ -223,9 +253,7 @@ impl<'d> Present<'d> {
             self.surface_i
                 .get_physical_device_surface_capabilities(self.pdev, self.surface)
         }?;
-        // `current_extent` is the window's real size on Android (never the 0xFFFFFFFF
-        // "you choose" sentinel), so it is also the resize signal.
-        let extent = caps.current_extent;
+        let extent = self.target_extent(&caps);
         if extent.width == 0 || extent.height == 0 {
             return Err(anyhow!("surface has no extent yet"));
         }
@@ -268,6 +296,15 @@ impl<'d> Present<'d> {
         unsafe { self.destroy_swap_res(old) };
         self.swap.swapchain = swapchain;
         self.swap.extent = extent;
+        log::info!(
+            "pyro: swapchain {}x{} {:?} {:?} (window {}x{})",
+            extent.width,
+            extent.height,
+            self.format,
+            self.present_mode,
+            caps.current_extent.width,
+            caps.current_extent.height
+        );
 
         // SAFETY: the swapchain is live; the images belong to it.
         let images = unsafe { self.swap_d.get_swapchain_images(swapchain) }?;
@@ -357,8 +394,9 @@ impl<'d> Present<'d> {
         };
 
         // Bind this frame's planes. Safe to rewrite the set: the fence above proves the
-        // submit that last read it has completed. GENERAL is the layout the decoder leaves
-        // its planes in — sampling from it needs no transition, which is the point.
+        // submit that last read it has completed. The decode may still be running; it sits
+        // ahead on this queue and its closing barrier orders our sampling after its writes,
+        // in GENERAL, so no transition.
         let set = self.sets[frame];
         let infos: Vec<vk::DescriptorImageInfo> = views
             .iter()
@@ -517,14 +555,14 @@ impl<'d> Present<'d> {
         }
     }
 
-    /// Whether the surface's size differs from the swapchain's.
+    /// Whether the size the swapchain should have differs from the one it has.
     fn extent_changed(&self) -> Result<bool> {
         // SAFETY: physical device and surface are live.
         let caps = unsafe {
             self.surface_i
                 .get_physical_device_surface_capabilities(self.pdev, self.surface)
         }?;
-        Ok(caps.current_extent != self.swap.extent)
+        Ok(self.target_extent(&caps) != self.swap.extent)
     }
 
     /// Idle the device, then rebuild the swapchain against the surface's current size.

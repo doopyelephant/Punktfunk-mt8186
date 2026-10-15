@@ -744,7 +744,7 @@ fn bring_up(
 /// The ADPF hint session, created on the first presented frame. The pump/audio priority boost is
 /// part of the experimental low-latency stack; the session itself predates it and always runs
 /// (max-performance bias gated inside).
-fn start_hint(
+pub(crate) fn start_hint(
     client: &NativeClient,
     refresh_hz: u32,
     low_latency_mode: bool,

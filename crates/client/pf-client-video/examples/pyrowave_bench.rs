@@ -390,6 +390,9 @@ mod bench {
                 for (range, aligned, complete) in &aus {
                     let t = Instant::now();
                     let out = dec.decode_frame(&data[range.clone()], *aligned, *complete)?;
+                    if let Some(f) = &out {
+                        dec.wait_ready(f)?;
+                    }
                     if timed {
                         if out.is_none() {
                             skipped += 1;
