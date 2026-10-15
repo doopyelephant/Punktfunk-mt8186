@@ -119,8 +119,7 @@ pub(super) fn seal_wire_slice(
 ) -> Result<()> {
     for (i, wire) in wires.iter_mut().enumerate() {
         let seq = seq_base.wrapping_add(i as u64);
-        let (aad, rest) = wire.split_at_mut(crate::packet::V2_CLEAR_LEN);
-        c.seal_media(seq, aad, rest)?;
+        c.seal_wire(seq, wire)?;
     }
     Ok(())
 }

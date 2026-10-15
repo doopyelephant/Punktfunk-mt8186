@@ -342,6 +342,7 @@ async fn serve(
         clock_origin_ns: clock.origin_ns(),
         keys: Some(keys),
         clock: Some(clock.clone()),
+        clear_placement: false,
     };
     let open: OpenSession = Box::new(move || Session::new(config, media, Box::new(sender)));
     let video = tokio::task::spawn_blocking(move || send_video(open, video_rx));

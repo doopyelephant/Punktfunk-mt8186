@@ -227,7 +227,8 @@ async fn dial(
             features: FeatureSet::default()
                 .with(registry::FEATURE_STREAM_CONFIG)
                 .with(registry::FEATURE_PAD_WRITES)
-                .with(registry::FEATURE_PROFILES),
+                .with(registry::FEATURE_PROFILES)
+                .with(registry::FEATURE_CLEAR_PLACEMENT),
             profile: p.profile.clone(),
             access_only: false,
         };
@@ -299,6 +300,7 @@ async fn dial(
             clock_origin_ns: server.clock_origin_ns,
             keys: Some(keys),
             clock: None,
+            clear_placement: server.features.has(registry::FEATURE_CLEAR_PLACEMENT),
         };
         let mut session = Session::new(cfg, media_v2, Box::new(media))?;
         // PyroWave: aged-out lossy frames as blocks-with-holes. All-intra renders

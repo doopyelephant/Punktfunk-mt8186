@@ -9,15 +9,17 @@ use crate::fec::ErasureCoder;
 /// [`Session::take_pump_perf`](super::Session::take_pump_perf).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PumpPerf {
-    /// `recv_batch` (recvmmsg / recvmsg_x): syscall + kernel copy.
+    /// `recv_owned`: taking the next batch the demux queued.
     pub recv_ns: u64,
     /// `open_in_place` (AES-128-GCM + replay-window upkeep).
     pub decrypt_ns: u64,
     /// `Reassembler::push` (parse, shard copy, FEC reconstruct, AU assembly).
     pub reasm_ns: u64,
-    /// `recv_batch` calls and datagrams in the window.
+    /// `recv_owned` calls and datagrams in the window.
     pub batches: u64,
     pub packets: u64,
+    /// Data shards opened straight into their frame: no copy after decrypt.
+    pub placed: u64,
 }
 
 /// Host send-path stage timings since the last

@@ -30,6 +30,7 @@ fn media(suite: Option<MediaSuite>) -> MediaV2 {
         clock_origin_ns: 0,
         keys: suite.map(|s| MediaKeys::derive(&[7; 32], s)),
         clock: None,
+        clear_placement: suite.is_some(),
     }
 }
 

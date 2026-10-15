@@ -417,6 +417,7 @@ mod tests {
             clock_origin_ns: origin,
             keys: None,
             clock: None,
+            clear_placement: false,
         }
     }
 
