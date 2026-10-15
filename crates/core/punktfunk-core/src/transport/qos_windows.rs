@@ -67,24 +67,30 @@ impl Drop for QosFlow {
     }
 }
 
-/// Put a **connected** media socket on a qWAVE flow (video → AudioVideo,
-/// audio → Voice), then best-effort pin CS5/CS6. `None` if a required step
-/// refused (logged at debug).
-pub(super) fn add_media_flow(socket: &UdpSocket, class: MediaClass) -> Option<QosFlow> {
+/// Put a media socket on a qWAVE flow (video → AudioVideo, audio → Voice), then
+/// best-effort pin CS5/CS6. `dest` names the peer of an unconnected socket; `None`
+/// takes a connected socket's own. `None` back if a required step refused (logged at debug).
+pub(super) fn add_media_flow(
+    socket: &UdpSocket,
+    dest: Option<std::net::SocketAddr>,
+    class: MediaClass,
+) -> Option<QosFlow> {
     let handle = qos_handle()?;
     let traffic_type = match class {
         MediaClass::Video => QOSTrafficTypeAudioVideo,
         MediaClass::Audio => QOSTrafficTypeVoice,
     };
     let raw = socket.as_raw_socket();
+    let dest = dest.map(socket2::SockAddr::from);
     let mut flow_id = 0u32;
-    // NULL dest: derive the 5-tuple from the connected socket (already `connect`ed).
-    // SAFETY: the socket is live for the call; `flow_id` is a valid out-pointer.
+    // SAFETY: the socket is live for the call; `dest` is null or a sockaddr that outlives
+    // it; `flow_id` is a valid out-pointer.
     let ok = unsafe {
         QOSAddSocketToFlow(
             handle,
             raw as _,
-            std::ptr::null(),
+            dest.as_ref()
+                .map_or(std::ptr::null(), |d| d.as_ptr().cast()),
             traffic_type,
             QOS_NON_ADAPTIVE_FLOW,
             &mut flow_id,
