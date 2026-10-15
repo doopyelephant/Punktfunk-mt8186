@@ -99,13 +99,10 @@ pub struct Session {
     stats: StatsCounters,
     /// Monotonic wire sequence, also the AES-GCM nonce counter.
     next_seq: u64,
-    /// Client recv ring, reused across [`poll_frame`](Self::poll_frame). Filled by one
-    /// `recvmmsg`, consumed across calls (`recv_idx`..`recv_count`). Allocated on first
-    /// client poll so host sessions do not carry it.
-    recv_scratch: Vec<Vec<u8>>,
-    recv_lens: Vec<usize>,
-    recv_count: usize,
-    recv_idx: usize,
+    /// Client: the received batch being consumed, decrypted in place datagram by datagram
+    /// across [`poll_frame`](Self::poll_frame) calls from byte `recv_off`.
+    recv_cur: Option<crate::transport::RecvBatch>,
+    recv_off: usize,
     /// Host send pool. `seal_frame` seals in place here; the caller sends then returns the
     /// buffers via [`reclaim_wires`](Self::reclaim_wires). After warmup each keeps its capacity.
     wire_pool: Vec<Vec<u8>>,
@@ -201,10 +198,8 @@ use seal::{
 };
 pub use seal::{SealSink, SendFn};
 
-/// Datagrams per client `recvmmsg` (the reused ring). 128 keeps the syscall rate
-/// ≤ ~3.4k/s at ~430k pkt/s (~4.8 Gbps) and drains the kernel buffer deeper per pump;
-/// cost is `RECV_BATCH × RECV_BUF` (~256 KB, client sessions only).
-const RECV_BATCH: usize = 128;
+/// Batches [`Session::flush_backlog`] discards at most: a line-rate sender cannot pin it.
+const FLUSH_BATCHES: usize = 128 * 1024;
 
 impl Session {
     /// [`crate::packet::encode_v2`] headers both ways, sealed under `media.keys` when it has
@@ -239,10 +234,8 @@ impl Session {
             reassembler,
             stats: StatsCounters::default(),
             next_seq: 0,
-            recv_scratch: Vec::new(),
-            recv_lens: Vec::new(),
-            recv_count: 0,
-            recv_idx: 0,
+            recv_cur: None,
+            recv_off: 0,
             wire_pool: Vec::new(),
             // Read once at construct; set `PUNKTFUNK_PERF` before connecting.
             perf: (crate::env_on("PUNKTFUNK_PERF") == Some(true)).then(PumpPerf::default),
@@ -991,25 +984,17 @@ impl Session {
                 "poll_frame called on a host session",
             ));
         }
-        if self.recv_scratch.is_empty() {
-            // Max datagram + 1: an oversized read fills the buffer and we drop it below.
-            self.recv_scratch = (0..RECV_BATCH)
-                .map(|_| vec![0u8; MAX_DATAGRAM_BYTES + 1])
-                .collect();
-            self.recv_lens = vec![0usize; RECV_BATCH];
-        }
         loop {
-            if self.recv_idx >= self.recv_count {
+            let Some(range) = self.recv_cur.as_ref().and_then(|b| b.at(self.recv_off)) else {
                 let t0 = self.perf.is_some().then(std::time::Instant::now);
-                self.recv_count = self
-                    .transport
-                    .recv_batch(&mut self.recv_scratch, &mut self.recv_lens)?;
+                // Dropping the spent batch hands its buffer back to the demux.
+                self.recv_cur = self.transport.recv_owned()?;
+                self.recv_off = 0;
                 if let (Some(p), Some(t0)) = (self.perf.as_mut(), t0) {
                     p.recv_ns += t0.elapsed().as_nanos() as u64;
                     p.batches += 1;
                 }
-                self.recv_idx = 0;
-                if self.recv_count == 0 {
+                if self.recv_cur.is_none() {
                     // Idle wire: hand over an aged-out partial if one is waiting (it only gets staler).
                     if let Some(p) = self.reassembler.take_partial() {
                         if !self.behind_epoch(p.epoch) {
@@ -1019,19 +1004,20 @@ impl Session {
                     }
                     return Err(PunktfunkError::NoFrame);
                 }
-            }
-            let i = self.recv_idx;
-            self.recv_idx += 1;
-            let len = self.recv_lens[i];
-            // recvmmsg truncates and caps `msg_len` at the buffer size: drop rather than
-            // hand up a truncated packet (same contract as scalar `recv`'s `n >= RECV_BUF`).
+                continue;
+            };
+            self.recv_off = range.end;
+            let len = range.len();
+            // A read that filled its buffer may be truncated: drop it rather than hand it up.
             if len > MAX_DATAGRAM_BYTES {
                 continue;
             }
-            // Open in place in the ring: plaintext at [8..8+n] behind the seq prefix; a
-            // probe datagram is the packet. Field-precise borrows keep the `recv_scratch`
-            // slice alive across replay/reassembly. Short / undecryptable `continue`s skip
-            // decrypt accounting (exception path, not line rate).
+            let Some(batch) = self.recv_cur.as_mut() else {
+                continue;
+            };
+            // Open in place in the received buffer; a probe datagram is the packet.
+            // Field-precise borrows keep the batch alive across replay and reassembly. Short or
+            // undecryptable `continue`s skip decrypt accounting (exception path, not line rate).
             let t_dec = self.perf.is_some().then(std::time::Instant::now);
             let (pkt_range, seq) = match &self.crypto {
                 Some(c) => {
@@ -1039,7 +1025,7 @@ impl Session {
                     if len < crate::packet::WIRE_OVERHEAD {
                         continue;
                     }
-                    let wire = &mut self.recv_scratch[i][..len];
+                    let wire = batch.bytes_mut(range.clone());
                     let low = u32::from_le_bytes(wire[1..V2_CLEAR_LEN].try_into().unwrap());
                     let reference = self.replay.as_ref().map_or(0, |w| w.reference());
                     let seq = crate::packet::expand_seq(reference, low);
@@ -1066,7 +1052,7 @@ impl Session {
                     continue;
                 }
             }
-            let pkt = &self.recv_scratch[i][pkt_range];
+            let pkt = &batch.bytes(range)[pkt_range];
             StatsCounters::add(&self.stats.packets_received, 1);
             StatsCounters::add(&self.stats.bytes_received, pkt.len() as u64);
             let t_push = self.perf.is_some().then(std::time::Instant::now);
@@ -1102,31 +1088,28 @@ impl Session {
         }
     }
 
-    /// Client: discard the pending receive backlog (current recv ring plus the kernel
-    /// socket buffer) and reset the reassembler. Returns datagrams thrown away
-    /// (`packets_dropped`). The receive path has no other skip-ahead: packets arrive in
-    /// order, and consume-at-arrival-rate never shrinks a standing queue. 1024 batches
-    /// (≈131k datagrams at the 128-deep ring) only cap a line-rate sender outrunning the loop.
+    /// Client: discard the pending receive backlog (the current batch plus every queued one)
+    /// and reset the reassembler. Returns datagrams thrown away (`packets_dropped`). The
+    /// receive path has no other skip-ahead: packets arrive in order, and
+    /// consume-at-arrival-rate never shrinks a standing queue. [`FLUSH_BATCHES`] only caps a
+    /// line-rate sender outrunning the loop.
     pub fn flush_backlog(&mut self) -> Result<u64> {
         if self.config.role != Role::Client {
             return Err(PunktfunkError::InvalidArg(
                 "flush_backlog called on a host session",
             ));
         }
-        // Undelivered tail of the current ring is backlog too.
-        let mut flushed = self.recv_count.saturating_sub(self.recv_idx) as u64;
-        self.recv_count = 0;
-        self.recv_idx = 0;
-        if !self.recv_scratch.is_empty() {
-            for _ in 0..1024 {
-                let n = self
-                    .transport
-                    .recv_batch(&mut self.recv_scratch, &mut self.recv_lens)?;
-                if n == 0 {
-                    break;
-                }
-                flushed += n as u64;
-            }
+        // The undelivered tail of the current batch is backlog too.
+        let mut flushed = self
+            .recv_cur
+            .take()
+            .map_or(0, |b| b.remaining(self.recv_off)) as u64;
+        self.recv_off = 0;
+        for _ in 0..FLUSH_BATCHES {
+            let Some(batch) = self.transport.recv_owned()? else {
+                break;
+            };
+            flushed += batch.remaining(0) as u64;
         }
         self.reassembler.reset();
         StatsCounters::add(&self.stats.packets_dropped, flushed);

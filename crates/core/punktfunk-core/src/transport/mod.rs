@@ -68,21 +68,114 @@ pub trait Transport: Send + Sync {
 
     fn recv(&self) -> std::io::Result<Option<Vec<u8>>>;
 
-    /// Receive up to `out.len()` datagrams into caller-owned `out[i]` buffers,
-    /// writing each length into `lens[i]`. `0` = none available (non-blocking).
-    /// The default is one scalar [`recv`](Self::recv) into `out[0]`.
-    fn recv_batch(&self, out: &mut [Vec<u8>], lens: &mut [usize]) -> std::io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
+    /// The next received datagrams in the buffer they arrived in, owned; `None` = none
+    /// available (non-blocking). The default is one scalar [`recv`](Self::recv).
+    fn recv_owned(&self) -> std::io::Result<Option<RecvBatch>> {
+        Ok(self.recv()?.map(RecvBatch::single))
+    }
+}
+
+/// Received datagrams in one buffer: `buf[..len]`, one every `stride` bytes, the last possibly
+/// shorter. A pooled batch hands its buffer back to the pool when dropped.
+pub struct RecvBatch {
+    buf: Vec<u8>,
+    len: usize,
+    stride: usize,
+    home: Option<std::sync::Arc<BufPool>>,
+}
+
+impl RecvBatch {
+    /// One datagram that owns its buffer.
+    pub fn single(buf: Vec<u8>) -> RecvBatch {
+        let len = buf.len();
+        RecvBatch {
+            buf,
+            len,
+            stride: len.max(1),
+            home: None,
         }
-        match self.recv()? {
-            Some(pkt) => {
-                let n = pkt.len().min(out[0].len());
-                out[0][..n].copy_from_slice(&pkt[..n]);
-                lens[0] = n;
-                Ok(1)
-            }
-            None => Ok(0),
+    }
+
+    /// The datagram starting at byte `off`, or `None` past the last.
+    pub fn at(&self, off: usize) -> Option<std::ops::Range<usize>> {
+        (off < self.len).then(|| off..(off + self.stride).min(self.len))
+    }
+
+    /// Datagrams from byte `off` to the end.
+    pub fn remaining(&self, off: usize) -> usize {
+        self.len.saturating_sub(off).div_ceil(self.stride)
+    }
+
+    pub fn bytes(&self, r: std::ops::Range<usize>) -> &[u8] {
+        &self.buf[r]
+    }
+
+    pub fn bytes_mut(&mut self, r: std::ops::Range<usize>) -> &mut [u8] {
+        &mut self.buf[r]
+    }
+}
+
+impl Drop for RecvBatch {
+    fn drop(&mut self) {
+        if let Some(pool) = self.home.take() {
+            pool.put(std::mem::take(&mut self.buf));
+        }
+    }
+}
+
+/// Receive buffers of one size, at most `max_live` of them ever allocated. Buffers come back
+/// through [`RecvBatch`]'s drop and are never freed while the pool lives.
+#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+pub(crate) struct BufPool {
+    free: std::sync::Mutex<Vec<Vec<u8>>>,
+    live: std::sync::atomic::AtomicUsize,
+    max_live: usize,
+    size: usize,
+}
+
+#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+impl BufPool {
+    pub(crate) fn new(size: usize, max_live: usize) -> std::sync::Arc<BufPool> {
+        std::sync::Arc::new(BufPool {
+            free: std::sync::Mutex::new(Vec::new()),
+            live: std::sync::atomic::AtomicUsize::new(0),
+            max_live,
+            size,
+        })
+    }
+
+    /// A buffer of `size` bytes, or `None` while `max_live` are out.
+    pub(crate) fn take(&self) -> Option<Vec<u8>> {
+        use std::sync::atomic::Ordering;
+        if let Some(b) = self.free.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            return Some(b);
+        }
+        if self.live.fetch_add(1, Ordering::Relaxed) < self.max_live {
+            return Some(vec![0; self.size]);
+        }
+        self.live.fetch_sub(1, Ordering::Relaxed);
+        None
+    }
+
+    fn put(&self, buf: Vec<u8>) {
+        self.free
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(buf);
+    }
+
+    /// `buf[..len]` as a batch that returns `buf` here when dropped.
+    pub(crate) fn lend(
+        self: &std::sync::Arc<BufPool>,
+        buf: Vec<u8>,
+        len: usize,
+        stride: usize,
+    ) -> RecvBatch {
+        RecvBatch {
+            buf,
+            len,
+            stride: stride.max(1),
+            home: Some(self.clone()),
         }
     }
 }
