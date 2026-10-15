@@ -377,6 +377,46 @@ fn names_are_trimmed_capped_and_unique() {
     assert_eq!(unique_name(&taken, "enrico"), "enrico 2");
 }
 
+/// A light seat shares the owner's desktop and keeps what makes it the player's. A profile with
+/// a ledger row is a desktop of its own, whatever its tier reads, and the owner stays the owner.
+#[test]
+fn a_light_seat_becomes_a_profile_that_shares_the_desktop() {
+    let mut file = box_file();
+    let mut kid = file.profiles.remove(1);
+    kid.avatar = Some("/api/v1/profiles/9a3f1c2b7e40/avatar".into());
+    kid.last_used_unix = 42;
+    // Hand-edited ahead of the owner.
+    file.profiles.insert(0, kid);
+    let desk = seat("aaaaaaaaaaaa", "Desk", Some("seat-a"));
+    file.profiles.push(desk.clone());
+    let (p, path) = store("share-light", &file, None);
+    p.share_light_seats();
+
+    let list = p.list();
+    assert_eq!(list[0].id, "4f1c3a9b0e27", "the owner stays first");
+    assert_eq!(p.owner_id().as_deref(), Some("4f1c3a9b0e27"));
+    let kid = p.get("9a3f1c2b7e40").unwrap();
+    assert_eq!(
+        (&kid.os_account, kid.home),
+        (&OsAccount::Operator, Home::Desktop)
+    );
+    assert_eq!((kid.display_name.as_str(), kid.last_used_unix), ("Kid", 42));
+    assert!(kid.avatar.is_some());
+    assert_eq!(p.resolve(Some(DEVICE), None).unwrap().id, kid.id);
+    assert_eq!(
+        p.get("0123456789ab").unwrap().os_account,
+        OsAccount::Operator
+    );
+    assert_eq!(p.get("aaaaaaaaaaaa").unwrap().os_account, desk.os_account);
+
+    // Saved: a restart reads it back and finds nothing left to change.
+    let again = Profiles::load_with(Some(path.clone()), None);
+    assert_eq!(json(&again.list()), json(&list));
+    let saved = std::fs::read(&path).unwrap();
+    again.share_light_seats();
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
+}
+
 #[test]
 fn a_device_seat_becomes_a_profile_its_device_lands_in() {
     let root = temp_dir("migrate");
@@ -401,13 +441,21 @@ fn a_device_seat_becomes_a_profile_its_device_lands_in() {
         .find(|x| x.display_name == "Enrico's iPad")
         .expect("the device's seat is a profile");
     assert_eq!(ipad.legacy_device.as_deref(), Some(fp.as_str()));
-    assert_eq!(ipad.home, Home::Bigpicture);
+    assert_eq!(
+        (&ipad.os_account, ipad.home),
+        (&OsAccount::Operator, Home::Desktop),
+        "it shares the owner's desktop"
+    );
+    assert_eq!(p.owner_id(), Some(p.list()[0].id.clone()));
     assert!(seats
         .join(&ipad.id)
         .join(".local/share/Steam/steam.sh")
         .exists());
-    assert!(seats.join(format!("{}.json", ipad.id)).exists());
     assert!(!seats.join("ab12cd34").exists());
+    assert!(
+        !seats.join("ab12cd34.json").exists() && !seats.join(format!("{}.json", ipad.id)).exists(),
+        "nothing is left to pre-warm"
+    );
     assert!(p
         .list()
         .iter()

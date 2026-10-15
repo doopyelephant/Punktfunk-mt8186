@@ -5892,7 +5892,7 @@
           "profiles"
         ],
         "summary": "Add a profile",
-        "description": "A seat profile (the default) plays in a seat of its own; one with `seat: false` plays the\nbox's own session under its own name. On Windows a seat is a desktop of its own: its account\nis made here, and seats must be on. On Linux a seat is a Steam of its own in the owner's\nsession, or with `desktop` a desktop of its own, which needs the door.",
+        "description": "A seat profile (the default) gets a desktop of its own, whose account is made here; one with\n`seat: false` plays the box's own session under its own name. A seat needs seats on\n(Windows) or the door (Linux).",
         "operationId": "createProfile",
         "requestBody": {
           "content": {
@@ -5936,7 +5936,7 @@
             }
           },
           "409": {
-            "description": "Another profile has that name, seats are off (Windows), or the door is off (a Linux desktop)",
+            "description": "Another profile has that name, seats are off (Windows), or the door is off (Linux)",
             "content": {
               "application/json": {
                 "schema": {
@@ -14757,6 +14757,10 @@
                   "null"
                 ],
                 "description": "The device whose seat became this profile, lowercase hex."
+              },
+              "steam_home": {
+                "type": "boolean",
+                "description": "This host keeps a Steam home for it, with that Steam's sign-in and saved games. A removal\nwith `erase` deletes it."
               }
             }
           }
@@ -14777,10 +14781,6 @@
             ],
             "description": "`#RRGGBB`."
           },
-          "desktop": {
-            "type": "boolean",
-            "description": "With `seat`, a desktop of its own: a full seat. A Windows seat always is; on Linux it\nneeds the door, and without it a seat is a Steam of its own in the owner's session."
-          },
           "display_name": {
             "type": "string"
           },
@@ -14791,13 +14791,13 @@
               },
               {
                 "$ref": "#/components/schemas/Home",
-                "description": "Defaults to `bigpicture` for a seat on Linux and to `desktop` otherwise: a Windows seat is\na desktop of its own."
+                "description": "Defaults to `desktop`."
               }
             ]
           },
           "seat": {
             "type": "boolean",
-            "description": "A seat of its own (the default), or the box's own session under another name."
+            "description": "A desktop of its own (the default), or the box's own session under another name. A\ndesktop of its own needs seats on Windows and the door on Linux."
           }
         }
       },

@@ -3,7 +3,6 @@ import {
 	AppWindow,
 	Check,
 	CircleX,
-	Gamepad2,
 	ImageMinus,
 	ImagePlus,
 	Pencil,
@@ -71,19 +70,8 @@ const STATE_WORD: Record<SeatState, () => string> = {
 	unavailable: () => m.profiles_state_unavailable(),
 };
 
-/**
- * **Steam per seat** on this host: on, off until the first Own Steam profile turns it on, or
- * off because the operator set it so. While off, an Own Steam profile plays on the owner's Steam.
- */
-export type SeatHome = "on" | "turns-on" | "off";
-
-/** Where a profile plays, as one line: the owner's desktop, a share of it, or its own seat. */
-export function playsLine(
-	p: ProfileAdmin,
-	ownerName: string,
-	seatHome: SeatHome = "on",
-	windows = false,
-): string {
+/** Where a profile plays, as one line: the owner's desktop, a share of it, or its own desktop. */
+export function playsLine(p: ProfileAdmin, ownerName: string): string {
 	if (p.owner) return m.profiles_plays_owner();
 	const seat = p.seat;
 	// A door gives the profiles on the box's own session a seat too, the owner's.
@@ -95,11 +83,7 @@ export function playsLine(
 		return seat.detail || m.profiles_seat_starting();
 	if (seat.state === "unavailable")
 		return seat.detail || STATE_WORD.unavailable();
-	if (windows || seat.kind === "desktop") return m.profiles_outcome_desktop();
-	if (seatHome !== "on") return m.profiles_plays_steam_off();
-	if (seat.steam_sign_in === true) return m.profiles_plays_steam_sign_in();
-	if (seat.steam_sign_in === false) return m.profiles_plays_steam_signed_in();
-	return m.profiles_plays_steam();
+	return m.profiles_outcome_desktop();
 }
 
 /** The doctor's line under the cards. `message` is its first error, `notes` its warnings. */
@@ -145,7 +129,6 @@ export const ProfilesView: FC<{
 	onRemove: (p: ProfileAdmin) => void;
 	/** The profile an edit is in flight for; its buttons wait. */
 	busyId: string | null;
-	seatHome?: SeatHome;
 	seats?: SeatActions;
 	/** Linux: the door's switch. */
 	door?: DoorControl;
@@ -158,7 +141,6 @@ export const ProfilesView: FC<{
 	onRemovePicture,
 	onRemove,
 	busyId,
-	seatHome = "on",
 	seats,
 	door,
 }) => {
@@ -194,7 +176,6 @@ export const ProfilesView: FC<{
 									key={p.id}
 									profile={p}
 									ownerName={ownerName}
-									seatHome={seatHome}
 									seats={seats}
 									version={avatarVersions?.[p.id]}
 									busy={busyId === p.id}
@@ -280,7 +261,6 @@ export const DoorDialog: FC<{
 const ProfileRow: FC<{
 	profile: ProfileAdmin;
 	ownerName: string;
-	seatHome: SeatHome;
 	seats?: SeatActions;
 	version?: number;
 	busy: boolean;
@@ -291,7 +271,6 @@ const ProfileRow: FC<{
 }> = ({
 	profile: p,
 	ownerName,
-	seatHome,
 	seats,
 	version,
 	busy,
@@ -303,7 +282,7 @@ const ProfileRow: FC<{
 	const file = useRef<HTMLInputElement>(null);
 	const state = p.seat?.state;
 	const facts = [
-		playsLine(p, ownerName, seatHome),
+		playsLine(p, ownerName),
 		p.home === "bigpicture"
 			? m.profiles_home_bigpicture()
 			: m.profiles_home_desktop(),
@@ -426,8 +405,8 @@ const ProfileRow: FC<{
 	);
 };
 
-/** One answer to where a new profile plays. `seats` is a desktop of its own: Windows seats. */
-type Outcome = "shared" | "steam" | "seats";
+/** One answer to where a new profile plays. `seats` is a desktop of its own. */
+type Outcome = "shared" | "seats";
 
 /**
  * **Add profile**: the picture beside a name and a colour, then one question answered as
@@ -436,14 +415,12 @@ type Outcome = "shared" | "steam" | "seats";
 export const AddProfileDialog: FC<{
 	open: boolean;
 	ownerName: string;
-	/** A light seat (own Steam) is a Linux host's. */
 	linux: boolean;
 	/** A desktop of its own is a Windows host's, once its seats are on. */
 	windows?: boolean;
 	seatsOn?: boolean;
 	/** ...or a Linux host's, once the door is on. */
 	door?: boolean;
-	seatHome?: SeatHome;
 	/** This Windows runs one desktop at a time: seats need Windows Server. */
 	needsServer?: boolean;
 	/** Colours other profiles have: the form starts on the first free one. */
@@ -458,7 +435,6 @@ export const AddProfileDialog: FC<{
 	windows = false,
 	seatsOn = false,
 	door = false,
-	seatHome = "on",
 	needsServer = false,
 	takenAccents = [],
 	onCancel,
@@ -469,23 +445,21 @@ export const AddProfileDialog: FC<{
 	const [name, setName] = useState("");
 	const [accent, setAccent] = useState<string>(freeAccent);
 	const [picture, setPicture] = useState<File | null>(null);
-	const [outcome, setOutcome] = useState<Outcome>(linux ? "steam" : "shared");
+	const [outcome, setOutcome] = useState<Outcome>("shared");
 	useEffect(() => {
 		if (!open) return;
 		setName("");
 		setAccent(freeAccent);
 		setPicture(null);
-		setOutcome(linux ? "steam" : "shared");
-	}, [open, linux, freeAccent]);
+		setOutcome("shared");
+	}, [open, freeAccent]);
 	const submit = () => {
 		if (!name.trim()) return;
 		onCreate(
 			{
 				display_name: name.trim(),
 				accent,
-				seat: outcome === "steam" || outcome === "seats",
-				// A Windows seat is always a desktop; on Linux it is the door's.
-				desktop: outcome === "seats",
+				seat: outcome === "seats",
 			},
 			picture,
 		);
@@ -497,19 +471,6 @@ export const AddProfileDialog: FC<{
 			label: m.profiles_outcome_shared({ owner: ownerName }),
 			hint: m.profiles_outcome_shared_hint(),
 			disabled: false,
-		},
-		{
-			id: "steam",
-			icon: <Gamepad2 />,
-			label: m.profiles_plays_steam(),
-			hint: !linux
-				? m.profiles_outcome_needs_linux()
-				: {
-						on: m.profiles_outcome_steam_hint,
-						"turns-on": m.profiles_outcome_steam_hint_turns_on,
-						off: m.profiles_outcome_steam_hint_off,
-					}[seatHome](),
-			disabled: !linux,
 		},
 		{
 			id: "seats",
@@ -598,8 +559,8 @@ export const AddProfileDialog: FC<{
 };
 
 /**
- * **Remove**, behind the console password. `erase` is offered where a seat home can stay; the
- * account of a desktop of its own always goes with it.
+ * **Remove**, behind the console password. `erase` is offered where this host keeps the
+ * profile's Steam; the account of a desktop of its own always goes with it.
  */
 export const RemoveProfileDialog: FC<{
 	profile: ProfileAdmin | null;
@@ -636,7 +597,7 @@ export const RemoveProfileDialog: FC<{
 			}
 			onClose={onCancel}
 		>
-			{profile.seat && !ownAccount && (
+			{profile.steam_home && !ownAccount && (
 				<div className="flex items-start gap-2">
 					<Checkbox
 						id="profile-erase"

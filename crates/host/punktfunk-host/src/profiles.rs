@@ -251,18 +251,13 @@ pub struct ProfileCreate {
     /// `#RRGGBB`.
     #[serde(default)]
     pub accent: Option<String>,
-    /// Defaults to `bigpicture` for a seat on Linux and to `desktop` otherwise: a Windows seat is
-    /// a desktop of its own.
+    /// Defaults to `desktop`.
     #[serde(default)]
     pub home: Option<Home>,
-    /// A seat of its own (the default), or the box's own session under another name.
+    /// A desktop of its own (the default), or the box's own session under another name. A
+    /// desktop of its own needs seats on Windows and the door on Linux.
     #[serde(default = "yes")]
     pub seat: bool,
-    /// With `seat`, a desktop of its own: a full seat. A Windows seat always is; on Linux it
-    /// needs the door, and without it a seat is a Steam of its own in the owner's session.
-    #[serde(default)]
-    #[schema(required = false)]
-    pub desktop: bool,
 }
 
 fn yes() -> bool {
@@ -380,7 +375,8 @@ impl Profiles {
         default_profile(&self.lock().file).map(|p| p.id.clone())
     }
 
-    /// `seat` is the ledger row a Windows seat profile plays on; a Linux seat needs none.
+    /// `seat` is the ledger row the profile's desktop runs on, which the caller makes for
+    /// `input.seat`; `None` shares the owner's desktop.
     pub fn create(&self, input: ProfileCreate, seat: Option<String>) -> Result<Profile, EditError> {
         let name = clean_name(&input.display_name)
             .ok_or_else(|| EditError::Invalid("a profile needs a name".into()))?;
@@ -394,19 +390,12 @@ impl Profiles {
                 return Err(EditError::NameTaken);
             }
             let now = now_unix();
-            let (os_account, home) = if input.seat {
-                // A Windows seat is a desktop of its own; a Linux one is a Steam home.
-                let (tier, home) = match &seat {
-                    Some(_) => (SeatTier::Full, Home::Desktop),
-                    None => (SeatTier::Light, Home::Bigpicture),
-                };
-                let account = OsAccount::Seat {
-                    seat: seat.clone(),
-                    tier,
-                };
-                (account, input.home.unwrap_or(home))
-            } else {
-                (OsAccount::Operator, input.home.unwrap_or(Home::Desktop))
+            let os_account = match &seat {
+                Some(row) => OsAccount::Seat {
+                    seat: Some(row.clone()),
+                    tier: SeatTier::Full,
+                },
+                None => OsAccount::Operator,
             };
             let profile = Profile {
                 id: new_id(&name),
@@ -414,7 +403,7 @@ impl Profiles {
                 accent: accent.clone(),
                 avatar: None,
                 os_account,
-                home,
+                home: input.home.unwrap_or_default(),
                 legacy_device: None,
                 assigned_fingerprints: Vec::new(),
                 passcode: None,
@@ -616,10 +605,11 @@ impl Profiles {
         })
     }
 
-    /// Turns each device seat under `seats` (`seats/<8 hex>` holding a Steam) into a seat
-    /// profile: named after the paired device whose fingerprint starts with those digits, with
-    /// that device as `legacy_device`, its home and record renamed to the profile id. A
-    /// directory whose device is gone becomes `Seat <8 hex>`. `paired` is `(name, fingerprint)`.
+    /// Turns each device seat under `seats` (`seats/<8 hex>` holding a Steam) into a profile that
+    /// shares the owner's desktop: named after the paired device whose fingerprint starts with
+    /// those digits, with that device as `legacy_device`. Its Steam home is renamed to the profile
+    /// id, so removing the profile can erase it, and its pre-warm record goes. A directory whose
+    /// device is gone becomes `Seat <8 hex>`. `paired` is `(name, fingerprint)`.
     pub fn migrate_device_seats(&self, seats: &Path, paired: &[(String, String)]) {
         let Ok(dir) = std::fs::read_dir(seats) else {
             return;
@@ -671,11 +661,8 @@ impl Profiles {
                 display_name,
                 accent: None,
                 avatar: None,
-                os_account: OsAccount::Seat {
-                    seat: None,
-                    tier: SeatTier::Light,
-                },
-                home: Home::Bigpicture,
+                os_account: OsAccount::Operator,
+                home: Home::Desktop,
                 legacy_device: legacy,
                 assigned_fingerprints: Vec::new(),
                 passcode: None,
@@ -693,19 +680,53 @@ impl Profiles {
         })?;
         let moved = std::fs::rename(seats.join(hex), seats.join(&id));
         if let Err(e) = moved {
-            // A profile whose home stayed behind would find no Steam; take it back.
+            // The directory still reads as a device seat, so the next start would make a second
+            // profile from it; take this one back.
             let _ = self.mutate(|file| {
                 file.profiles.retain(|p| p.id != id);
                 Ok(())
             });
             return Err(e).context("rename the seat home");
         }
-        let record = seats.join(format!("{hex}.json"));
-        if record.exists() {
-            std::fs::rename(&record, seats.join(format!("{id}.json")))
-                .context("rename the seat record")?;
-        }
+        let _ = std::fs::remove_file(seats.join(format!("{hex}.json")));
         Ok(id)
+    }
+
+    /// Turns every light seat, a Steam home in the owner's session, into a profile that shares
+    /// the owner's desktop. Name, picture, play stats and the Steam home on disk stay; its
+    /// pre-warm record goes. The owner moves first, so no converted profile takes its place.
+    pub fn share_light_seats(&self) {
+        let light = |p: &Profile| matches!(p.os_account, OsAccount::Seat { seat: None, .. });
+        if !self.lock().file.profiles.iter().any(light) {
+            return;
+        }
+        let mut shared = Vec::new();
+        let saved = self.mutate(|file| {
+            let owner = file.profiles.iter().position(is_owner);
+            let now = now_unix();
+            for p in file.profiles.iter_mut().filter(|p| light(p)) {
+                p.os_account = OsAccount::Operator;
+                p.home = Home::Desktop;
+                p.updated_unix = now;
+                shared.push(p.id.clone());
+            }
+            if let Some(at) = owner {
+                let owner = file.profiles.remove(at);
+                file.profiles.insert(0, owner);
+            }
+            Ok(())
+        });
+        if let Err(e) = saved {
+            tracing::warn!(error = %format!("{e:#}"), "light seats not moved to the owner's desktop");
+            return;
+        }
+        for id in shared {
+            #[cfg(target_os = "linux")]
+            if safe_id(&id) {
+                let _ = std::fs::remove_file(pf_paths::seat_record(&id));
+            }
+            tracing::info!(profile = %id, "light seat now shares the owner's desktop");
+        }
     }
 
     /// The profile a connect from `fp` asking for `asked` lands in (`profiles-and-seats.md`
