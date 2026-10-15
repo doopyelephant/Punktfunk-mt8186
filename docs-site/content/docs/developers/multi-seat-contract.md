@@ -429,7 +429,8 @@ and the profiles that share the owner's desktop on it.
 
 Every row sets `PUNKTFUNK_MDNS=0`, since only the door advertises. The row's environment file is
 `/run/punktfunk/seats/<user>.env`, owned by the owner, and the owner's user `punktfunk-host` reads
-it, so it moves to the row's ports at boot, logged in or not.
+it, so it moves to the row's ports at boot, logged in or not. The owner's own console,
+`punktfunk-web.service`, doesn't start while that file exists: the door's console has the port.
 
 - **One owner host.** The row's unit runs the owner's host in a `background` session, on a
   private D-Bus, beside whatever the owner has on the monitor; the user unit stands down while the
