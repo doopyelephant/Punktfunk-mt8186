@@ -56,6 +56,62 @@ mod imp {
         *CAPABLE.get_or_init(super::device::pyrowave_capable)
     }
 
+    /// How often the split below reaches logcat.
+    const SPLIT_EVERY: Duration = Duration::from_secs(5);
+
+    /// Where a frame's time goes while the stats overlay is on: mean queue wait, parse,
+    /// record, submit→fence and present, then the decoder's own GPU stage times. The HUD's
+    /// one `decode` figure cannot tell a slow GPU from a down-clocked one.
+    #[derive(Default)]
+    struct SplitWindow {
+        started: Option<Instant>,
+        frames: u32,
+        /// µs sums: wait, parse, record, gpu, present.
+        sum: [u64; 5],
+    }
+
+    impl SplitWindow {
+        fn add(&mut self, decoder: &PyroWaveDecoder, wait_us: u64, present_us: u64) {
+            let started = *self.started.get_or_insert_with(|| {
+                decoder.gpu_stage_report(true); // the stage window starts with ours
+                Instant::now()
+            });
+            let s = decoder.last_split();
+            let frame = [
+                wait_us,
+                s.parse_us.into(),
+                s.record_us.into(),
+                s.gpu_us.into(),
+                present_us,
+            ];
+            for (acc, v) in self.sum.iter_mut().zip(frame) {
+                *acc += v;
+            }
+            self.frames += 1;
+            if started.elapsed() < SPLIT_EVERY {
+                return;
+            }
+            let ms = |i: usize| self.sum[i] as f64 / f64::from(self.frames) / 1000.0;
+            log::info!(
+                "pyro: {} frames, mean ms: wait {:.2} parse {:.2} record {:.2} gpu {:.2} \
+                 present {:.2}",
+                self.frames,
+                ms(0),
+                ms(1),
+                ms(2),
+                ms(3),
+                ms(4)
+            );
+            for line in decoder.gpu_stage_report(true) {
+                log::info!("pyro:   {line}");
+            }
+            *self = SplitWindow {
+                started: Some(Instant::now()),
+                ..Default::default()
+            };
+        }
+    }
+
     /// Build a decoder for the session's current mode.
     fn open_decoder(
         client: &NativeClient,
@@ -149,6 +205,7 @@ mod imp {
         let started = Instant::now();
         let mut received: u64 = 0;
         let mut warned_silent = false;
+        let mut split = SplitWindow::default();
 
         while !shutdown.load(Ordering::Relaxed) {
             // Live mode switch (`NativeClient::request_mode`, or the host's own resize): the
@@ -169,6 +226,7 @@ mod imp {
                 drop(decoder);
                 mode = now_mode;
                 decoder = open_decoder(client, &dev, mode)?;
+                split = SplitWindow::default();
             }
 
             let frame = match client.next_frame(Duration::from_millis(5)) {
@@ -199,6 +257,7 @@ mod imp {
             } else {
                 now_realtime_ns()
             };
+            let pulled_ns = if want_stamps { now_realtime_ns() } else { 0 };
 
             let aligned = frame.flags & punktfunk_core::packet::USER_FLAG_CHUNK_ALIGNED != 0;
             let decoded = match decoder.decode_frame(&frame.data, aligned, frame.complete) {
@@ -212,6 +271,7 @@ mod imp {
             let Some(picture) = decoded else {
                 continue; // packets accumulated, frame not complete yet
             };
+            let decoded_ns = if want_stamps { now_realtime_ns() } else { 0 };
 
             opts.decoded_size.store(
                 crate::session::pack_surface_size(picture.width as i32, picture.height as i32),
@@ -225,16 +285,23 @@ mod imp {
                 continue; // swapchain was out of date; it has been rebuilt
             }
 
-            // Presented. Stamped here rather than at a latch callback: this path has no
-            // render-timestamp signal (that is the ASurfaceControl backend's), so the HUD
-            // shows the capture→decoded headline and drops the `display` stage. Stamped
-            // whatever the HUD state: the audio plane steers by `video_e2e`.
+            // No latch callback on this path, so the HUD drops the `display` stage. `decode`
+            // ends at the decoder, as on desktop; present time is in the split log. E2E is
+            // stamped whatever the HUD state: the audio plane steers by `video_e2e`.
             let presented_ns = now_realtime_ns();
             let offset = clock_offset.load(Ordering::Relaxed);
             crate::stats::publish_e2e(&video_e2e, presented_ns, offset, frame.pts_ns);
             if stats.enabled() {
-                let decode_us = crate::stats::sane_us(presented_ns - received_ns);
-                stats.note_decoded(frame.pts_ns, presented_ns, decode_us);
+                let decode_us = crate::stats::sane_us(decoded_ns - received_ns);
+                stats.note_decoded(frame.pts_ns, decoded_ns, decode_us);
+                let us = |a: i128, b: i128| crate::stats::sane_us(b - a).unwrap_or(0);
+                split.add(
+                    &decoder,
+                    us(received_ns, pulled_ns),
+                    us(decoded_ns, presented_ns),
+                );
+            } else {
+                split = SplitWindow::default();
             }
         }
 
