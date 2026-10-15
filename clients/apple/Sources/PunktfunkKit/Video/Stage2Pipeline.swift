@@ -254,6 +254,8 @@ struct AdaptiveSlotRegime {
     private var previousPtsNs: UInt64?
     private var intervalNs: Double?
     private(set) var isSlotted = true
+    /// The smoothed content interval, once two frames have shown it.
+    var interval: CFTimeInterval? { intervalNs.map { $0 / 1e9 } }
 
     mutating func update(ptsNs: UInt64) -> Bool {
         guard let previousPtsNs else {
@@ -278,7 +280,8 @@ struct AdaptiveSlotRegime {
 }
 
 /// Arrival and glass pacing's schedule against the ordinary display link, resolved once per
-/// session. `PUNKTFUNK_PRESENT_MODE` (`slot`, `immediate`, `vsync`) picks one for on-device A/B.
+/// session. `PUNKTFUNK_PRESENT_MODE` (`slot`, `immediate`, `vsync`, `adaptive`) picks one for
+/// on-device A/B; `adaptive` is the slot regime without the Direct gate.
 struct PresentPolicy: Equatable {
     /// Adaptive-refresh latency: sparse input presents at once, dense input one frame per slot.
     var adaptiveSlot: Bool
@@ -286,16 +289,21 @@ struct PresentPolicy: Equatable {
     var fixedSlot: Bool
     /// Schedule each present on the next vsync.
     var fixedVsync: Bool
+    /// Over `adaptiveSlot`: one present in flight, issued at once, while the layer scans out
+    /// Direct (`ScanoutPacer`).
+    var directGate = false
 
     static func resolve(
         env: String?, vsync: Bool, vsyncPaced: Bool, adaptiveSlotPaced: Bool
     ) -> PresentPolicy {
         let forcedSlot = env == "slot"
+        let adaptiveSlot = adaptiveSlotPaced && !vsync && env != "immediate" && env != "vsync"
+            && !forcedSlot
         return PresentPolicy(
-            adaptiveSlot: adaptiveSlotPaced && !vsync && env != "immediate" && env != "vsync"
-                && !forcedSlot,
+            adaptiveSlot: adaptiveSlot,
             fixedSlot: vsyncPaced || forcedSlot,
-            fixedVsync: env == "vsync" || (env != "immediate" && vsync))
+            fixedVsync: env == "vsync" || (env != "immediate" && vsync),
+            directGate: adaptiveSlot && env != "adaptive")
     }
 
     /// The pace the pf-present line names under `pacing`.
@@ -305,6 +313,7 @@ struct PresentPolicy: Equatable {
         case .deadline: return "deadline"
         case .glass: return "glass"
         case .arrival:
+            if directGate { return "direct" }
             return adaptiveSlot ? "adaptive" : fixedSlot ? "slot" : fixedVsync ? "vsync" : "immediate"
         }
     }
@@ -1149,6 +1158,8 @@ public final class Stage2Pipeline {
     /// Deadline pacing's staged CAMetalDisplayLink frame-rate hint (see `FrameRateHint`).
     /// Created unconditionally (cheap); only the deadline link thread drains it.
     private let frameRateHint = FrameRateHint()
+    /// The Direct gate's mode (`PresentPolicy.directGate`); idle on every other policy.
+    private let scanout = ScanoutPacer()
     /// The pf-present line, on every pacing. Built in `init` so the decode callback can count
     /// decoder output; `start` names the pace once the session's policy is resolved.
     private let debugStats: PresentDebugStats
@@ -1206,10 +1217,12 @@ public final class Stage2Pipeline {
         let cadence = cadence
         let rateHint = frameRateHint
         let vsyncClock = vsyncClock
+        let scanout = scanout
         let paceName = { rateHint.pace() }
         let debugStats = PresentDebugStats(
             cadence: cadence, pace: paceName,
-            linkPeriod: { vsyncClock.lastPeriod() }, panel: { rateHint.panel() })
+            linkPeriod: { vsyncClock.lastPeriod() }, panel: { rateHint.panel() },
+            scanoutSwitches: { scanout.drainSwitches() })
         self.debugStats = debugStats
         self.decoder = VideoDecoder(
             onDecoded: { frame in
@@ -1342,7 +1355,9 @@ public final class Stage2Pipeline {
 
     /// Arrival and glass pacing's present half (stage-2/3 — see `PresentPacing`): one render
     /// thread, one present per wake. Decoded frames are the primary wake; display-link ticks
-    /// retry a put-back frame and refresh the vsync grid `policy` schedules against.
+    /// retry a put-back frame and refresh the vsync grid `policy` schedules against. Under
+    /// `policy.directGate`, `ScanoutPacer` picks per frame between an immediate present and the
+    /// adaptive slot, and every presented callback wakes the thread too.
     ///
     /// The thread owns every layer format/colour/drawable interaction (see MetalVideoPresenter's
     /// threading notes); with displaySyncEnabled on, nextDrawable's up-to-a-frame wait lands here
@@ -1362,6 +1377,9 @@ public final class Stage2Pipeline {
         // Stage-3's bounded in-flight present gate; nil = stage-2's present-on-arrival. A local
         // (like the ring) so neither the render thread nor the presented handlers capture `self`.
         let gate: PresentGate? = pacing == .glass ? PresentGate(capacity: gateDepth) : nil
+        // The adaptive panel's Direct gate: immediate presents while the layer scans out Direct.
+        let scanout: ScanoutPacer? = policy.directGate ? self.scanout : nil
+        let rateHint = frameRateHint
         // Smoothness turns the FIFO into a holding buffer: a frame comes out once it is due.
         // Latency has no cadence clock and keeps the unconditional arrival-driven take.
         let takeReady: () -> ReadyFrame? = cadence == nil
@@ -1400,6 +1418,17 @@ public final class Stage2Pipeline {
                     debugStats?.flushIfDue(ring: ring, gate: gate)
                     return
                 }
+                // Direct: likewise wait until the previous present has flipped; the callback
+                // re-signals.
+                let panelInterval = rateHint.panel().minInterval
+                let refresh = panelInterval > 0 ? panelInterval : 1.0 / 120
+                let direct = scanout?.mode(now: CACurrentMediaTime()) == .direct
+                if direct, let scanout,
+                   !scanout.mayIssue(now: CACurrentMediaTime(), minInterval: refresh) {
+                    debugStats?.gatedWake()
+                    debugStats?.flushIfDue(ring: ring, gate: gate)
+                    return
+                }
                 guard !token.isStopped, let frame = takeReady() else {
                     gate?.release() // armed but nothing to render — don't hold the gate stale
                     debugStats?.emptyWake()
@@ -1407,7 +1436,12 @@ public final class Stage2Pipeline {
                     return
                 }
                 let now = CACurrentMediaTime()
-                let adaptiveSlotActive = policy.adaptiveSlot && adaptiveRegime.update(ptsNs: frame.ptsNs)
+                // The regime sees every frame so its interval estimate survives Direct stretches.
+                let slotRegime = policy.adaptiveSlot && adaptiveRegime.update(ptsNs: frame.ptsNs)
+                let adaptiveSlotActive = slotRegime && !direct
+                // The Direct gate judges a present's hold against the content interval, never
+                // a shorter one than the panel can flip.
+                let holdUnit = max(refresh, adaptiveRegime.interval ?? 0)
                 let slotTarget = fixedSlotTarget
                     ?? (adaptiveSlotActive ? vsyncClock.nextVsync(after: now) : nil)
                 if adaptiveSlotActive, let slotTarget,
@@ -1426,12 +1460,22 @@ public final class Stage2Pipeline {
                     : nil
                 let renderStarted = CACurrentMediaTime()
                 let issuedNs = Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: renderStarted)
+                scanout?.issued(at: renderStarted, direct: direct)
                 let onGlass: (Int64?) -> Void = { presentedNs in
                     // Stage-3: the flip reached glass (or was dropped) — free the present slot,
                     // then re-signal so the freshest waiting ring frame goes out immediately.
                     if let gate {
                         gate.release()
                         renderSignal.signal()
+                    }
+                    if let scanout {
+                        let calledAt = CACurrentMediaTime()
+                        scanout.landed(issuedAt: renderStarted)
+                        renderSignal.signal()
+                        if direct {
+                            scanout.noteDirect(
+                                hold: calledAt - renderStarted, interval: holdUnit, now: calledAt)
+                        }
                     }
                     // Fallback stamp for a dropped drawable (no system presentedTime): "now" on
                     // the Metal callback, converted to the CLOCK_REALTIME the meters live in.
@@ -1464,9 +1508,11 @@ public final class Stage2Pipeline {
                     ok: rendered, tookMs: (CACurrentMediaTime() - renderStarted) * 1000)
                 if !rendered {
                     gate?.release() // no present registered — its handler will never fire
+                    scanout?.landed(issuedAt: renderStarted)
                     ring.putBack(frame)
-                } else if let slotTarget {
-                    lastPresentTarget = slotTarget
+                } else {
+                    if let slotTarget { lastPresentTarget = slotTarget }
+                    if direct { debugStats?.directPresent() }
                 }
                 debugStats?.flushIfDue(ring: ring, gate: gate)
             } }
@@ -1866,6 +1912,12 @@ public final class Stage2Pipeline {
     public func setInteractionBoost(_ on: Bool) {
         frameRateHint.setBoost(on)
         presentLog.info("pen boost \(on ? "engaged" : "released", privacy: .public)")
+    }
+
+    /// Whether the window can scan out Direct — fullscreen, nothing of the app's own over the
+    /// video; the Direct gate probes only then (MAIN).
+    public func setDirectPossible(_ possible: Bool) {
+        scanout.setDirectPossible(possible)
     }
 
     /// Forward the layout-derived drawable pixel size to the presenter (MAIN thread — see

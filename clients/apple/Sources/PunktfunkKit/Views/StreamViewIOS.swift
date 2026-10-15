@@ -51,6 +51,8 @@ public struct StreamView: UIViewControllerRepresentable {
     public init(
         connection: PunktfunkConnection,
         captureEnabled: Bool = true,
+        // Call-site parity with macOS, whose Direct gate reads it; the touch platforms don't.
+        overlayShown: Bool = false,
         onCaptureChange: ((Bool) -> Void)? = nil,
         onDisconnectRequest: (() -> Void)? = nil,
         onDial: ((DialEvent) -> Void)? = nil,

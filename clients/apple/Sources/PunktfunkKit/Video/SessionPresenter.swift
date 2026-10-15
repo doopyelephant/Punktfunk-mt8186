@@ -246,6 +246,8 @@ final class SessionPresenter {
     private var contentSize: CGSize?
     /// The screen verdict the running pipeline chose its pacing from, and its live source.
     private var builtAdaptive = false
+    /// The window's Direct verdict (`setDirectPossible`), re-applied to each pipeline built.
+    private var directPossible = true
     private var adaptiveSync: () -> Bool = { false }
 
     /// Start the resolved presenter for `connection`.
@@ -340,6 +342,7 @@ final class SessionPresenter {
                 metalLayer = metal
             }
             stage2 = pipeline
+            pipeline.setDirectPossible(directPossible)
             // The ordinary link supplies the vsync grid, retries transient Metal drawable misses,
             // and polls which decoded IOSurface reached glass. Frame arrival remains the render
             // trigger. Deadline pacing owns its drawable-vending CAMetalDisplayLink instead.
@@ -536,6 +539,13 @@ final class SessionPresenter {
     func screenChanged() {
         guard restart != nil, adaptiveSync() != builtAdaptive else { return }
         restartPresentation()
+    }
+
+    /// Whether the window can scan out Direct — fullscreen, nothing of the app's own over the
+    /// video. Kept for each pipeline this presenter builds. Main thread.
+    func setDirectPossible(_ possible: Bool) {
+        directPossible = possible
+        stage2?.setDirectPossible(possible)
     }
 
     /// `onPresentWedged`'s cure, hopped to MAIN: a fresh pipeline, presenter and CAMetalLayer on
