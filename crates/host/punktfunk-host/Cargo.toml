@@ -237,11 +237,10 @@ libc = "0.2"
 # portal we use for libei input on KWin/GNOME; `tokio` is the default runtime.
 # `open_pipe_wire_remote` is unconditional, so ashpd's own `pipewire` feature is not
 # needed — pf-capture and pf-audio drive PipeWire with the `pipewire` crate.
-# `settings` adds the org.freedesktop.portal.Settings proxy the console's theme route reads
-# (design/web-console-overhaul.md §7) — the only cross-desktop source for the desktop's own
-# mode and accent. `inhibit` vetoes the desktop's idle suspend during a stream.
-ashpd = { version = "0.13", features = ["screencast", "remote_desktop", "settings", "inhibit"] }
-# A seat serves steamos-manager's session switch on its own bus (`seats/session_switch.rs`).
+# `inhibit` vetoes the desktop's idle suspend during a stream.
+ashpd = { version = "0.13", features = ["screencast", "remote_desktop", "inhibit"] }
+# A seat serves steamos-manager's session switch on its own bus (`seats/session_switch.rs`), and
+# the theme route reads the Settings portal with plain calls (`mgmt/theme.rs`).
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 # `session_bus`: every session-bus connection goes to the address the host detected.
 pf-portal = { path = "../pf-portal" }
