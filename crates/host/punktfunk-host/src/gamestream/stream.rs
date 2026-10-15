@@ -895,8 +895,9 @@ fn gs_bit_depth(format: crate::capture::PixelFormat) -> u8 {
 
 type PacketBatch = Vec<Vec<u8>>;
 
-/// One tick's access units: bitstream, frame type and wire frameIndex each.
-type AuBatch = Vec<(Vec<u8>, FrameType, u32)>;
+/// One tick's access units: bitstream, frame type, wire frameIndex and the instant its
+/// host-processing clock starts ([`GsLoop::poll_aus`]).
+type AuBatch = Vec<(Vec<u8>, FrameType, u32, Instant)>;
 
 /// Send `pkts` with as few syscalls as possible (`sendmmsg`, up to 64 per call). The socket is
 /// connected, so no per-message address. Returns an error on the first send failure.
@@ -971,13 +972,10 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
 /// One encoded frame handed to the packetizer: AUs plus the 90 kHz RTP timestamp.
 /// FEC runs on that thread so it never serializes behind encode.
 struct RawFrame {
-    /// `(bitstream, type, wire frameIndex)` per AU. The stream loop owns numbering (`au_seq`)
-    /// so RFI stays 1:1 with Moonlight across mid-stream encoder rebuilds.
+    /// The stream loop owns numbering (`au_seq`) so RFI stays 1:1 with Moonlight across
+    /// mid-stream encoder rebuilds.
     aus: AuBatch,
     ts: u32,
-    /// Encode-loop tick. Packetizer stamps `now - cap_at` as wire `frame_processing_latency`
-    /// (1/10 ms) — Moonlight's "Host processing latency".
-    cap_at: Instant,
 }
 
 /// Packetize AUs into data + Reed–Solomon shards, then hand the batch to the paced sender.
@@ -1010,10 +1008,10 @@ fn spawn_packetizer(
                     shells.push(spent);
                 }
                 let mut batch = shells.pop().unwrap_or_default();
-                // Wire header, 1/10 ms, saturating — a stall reports max rather than wrapping.
-                let processing_100us =
-                    u16::try_from(frame.cap_at.elapsed().as_micros() / 100).unwrap_or(u16::MAX);
-                for (au, ft, idx) in frame.aus {
+                for (au, ft, idx, from) in frame.aus {
+                    // Moonlight's "Host processing latency": 1/10 ms, saturating.
+                    let processing_100us =
+                        u16::try_from(from.elapsed().as_micros() / 100).unwrap_or(u16::MAX);
                     pk.packetize_into(&mut batch, &au, ft, frame.ts, Some(idx), processing_100us);
                 }
                 if batch.is_empty() {
@@ -1098,6 +1096,16 @@ fn spawn_sender(
         })
         .context("spawn send thread")?;
     Ok(())
+}
+
+/// The instant an epoch-nanosecond stamp names. `None` for no stamp, a stamp ahead of now,
+/// or one before `Instant`'s range.
+fn instant_of(pts_ns: u64) -> Option<Instant> {
+    if pts_ns == 0 {
+        return None;
+    }
+    let age = punktfunk_core::quic::wall_clock_ns().checked_sub(pts_ns)?;
+    Instant::now().checked_sub(Duration::from_nanos(age))
 }
 
 /// At most one IDR per this window. Floor is 100 ms: `frame_interval * 2` is 16.7 ms at
@@ -1785,9 +1793,9 @@ impl GsLoop<'_> {
 
         // 90 kHz RTP from wall-clock so a variable capture rate stays correct.
         let ts = (self.stream_start.elapsed().as_secs_f64() * 90_000.0) as u32;
-        let (aus, poll_err) = self.poll_aus();
+        let (aus, poll_err) = self.poll_aus(tick.start, owed.is_some());
         let t_pkt = tick.start.elapsed();
-        if !self.enqueue(aus, ts, tick.start) {
+        if !self.enqueue(aus, ts) {
             return Ok(GsFlow::End);
         }
         if self.recover_stall(poll_err, owed.is_some())? {
@@ -1858,8 +1866,10 @@ impl GsLoop<'_> {
     }
 
     /// Drain every access unit the encoder has ready, numbered on from `au_seq`. A poll error
-    /// comes back beside the units drained before it, for the stall recovery.
-    fn poll_aus(&mut self) -> (AuBatch, Option<anyhow::Error>) {
+    /// comes back beside the units drained before it, for the stall recovery. A unit's
+    /// processing clock starts at `tick_start`, or at its OS present when the `driver`
+    /// encoded it, since that encode ran before the tick began.
+    fn poll_aus(&mut self, tick_start: Instant, driver: bool) -> (AuBatch, Option<anyhow::Error>) {
         let mut aus = Vec::new();
         loop {
             let au = match self.video.enc.poll() {
@@ -1873,7 +1883,11 @@ impl GsLoop<'_> {
                 FrameType::P
             };
             let idx = self.video.wire.au_seq.wrapping_add(aus.len() as u32);
-            aus.push((au.data, ft, idx));
+            let from = match driver.then(|| instant_of(au.pts_ns)).flatten() {
+                Some(present) => present.min(tick_start),
+                None => tick_start,
+            };
+            aus.push((au.data, ft, idx, from));
             self.video.wire.inflight = self.video.wire.inflight.saturating_sub(1);
             self.video.watchdog.on_au();
         }
@@ -1881,12 +1895,12 @@ impl GsLoop<'_> {
 
     /// Hand one tick's access units to the packetizer. Never blocks: a full queue drops the
     /// batch and owes an IDR, so encode is never capped. `false` once the packetizer is gone.
-    fn enqueue(&mut self, aus: AuBatch, ts: u32, cap_at: Instant) -> bool {
+    fn enqueue(&mut self, aus: AuBatch, ts: u32) -> bool {
         if aus.is_empty() {
             return true;
         }
         let batch_len = aus.len() as u32;
-        match self.raw_tx.try_send(RawFrame { aus, ts, cap_at }) {
+        match self.raw_tx.try_send(RawFrame { aus, ts }) {
             Ok(()) => {
                 self.sent_batches += 1;
                 self.video.wire.au_seq = self.video.wire.au_seq.wrapping_add(batch_len);
@@ -2212,6 +2226,19 @@ mod tests {
             keyframe_coalesce_window(Duration::from_millis(200)),
             Duration::from_millis(400)
         );
+    }
+
+    /// A driver present 5 ms back starts the processing clock 5 ms back.
+    #[test]
+    fn instant_of_maps_a_present_stamp_onto_the_monotonic_clock() {
+        let now_ns = punktfunk_core::quic::wall_clock_ns();
+        let age = instant_of(now_ns - 5_000_000).unwrap().elapsed();
+        assert!(
+            age >= Duration::from_millis(5) && age < Duration::from_millis(50),
+            "{age:?}"
+        );
+        assert!(instant_of(0).is_none());
+        assert!(instant_of(now_ns + 1_000_000_000).is_none());
     }
 
     #[test]
