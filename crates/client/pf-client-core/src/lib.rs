@@ -27,7 +27,12 @@ pub mod audio_rt;
 // mDNS browse of `_punktfunk._udp`. Android folds the same events behind its JNI poll.
 #[cfg(all(
     feature = "discovery",
-    any(target_os = "linux", windows, target_os = "android")
+    any(
+        target_os = "linux",
+        windows,
+        target_os = "android",
+        all(target_os = "freebsd", target_vendor = "sie")
+    )
 ))]
 pub mod discovery;
 #[cfg(desktop)]
