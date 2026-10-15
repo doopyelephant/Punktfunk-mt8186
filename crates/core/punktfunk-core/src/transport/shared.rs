@@ -370,6 +370,8 @@ fn gso_allowed() -> bool {
 
 /// The host's media sender on a connection's shared socket.
 pub struct MediaSender {
+    /// The video mark toward this peer. Before `socket`: a Windows flow leaves before it closes.
+    _qos: Option<super::QosFlow>,
     socket: UdpSocket,
     state: UdpSocketState,
     conn: quinn::Connection,
@@ -378,18 +380,23 @@ pub struct MediaSender {
 }
 
 impl MediaSender {
-    /// `socket` is the endpoint's own (a clone of what quinn reads); `conn` names the peer.
+    /// `socket` is the endpoint's own (a clone of what quinn reads); `conn` names the peer,
+    /// which picks the video mark ([`super::set_media_qos_to`]).
     pub fn new(socket: &UdpSocket, conn: quinn::Connection) -> std::io::Result<MediaSender> {
         let socket = socket.try_clone()?;
         let state = UdpSocketState::new((&socket).into())?;
         let v6_socket = socket.local_addr()?.is_ipv6();
-        Ok(MediaSender {
+        let mut sender = MediaSender {
+            _qos: None,
             socket,
             state,
             conn,
             v6_socket,
             staging: Mutex::new(Vec::new()),
-        })
+        };
+        let (to, _) = sender.path();
+        sender._qos = super::set_media_qos_to(&sender.socket, to, super::MediaClass::Video);
+        Ok(sender)
     }
 
     /// Where the next packet goes and from which local address: the connection's current path.

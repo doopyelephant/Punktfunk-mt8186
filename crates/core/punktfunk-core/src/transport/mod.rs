@@ -33,7 +33,9 @@ pub mod sockstat;
 mod udp;
 
 pub use loopback::{loopback_drop_head, loopback_drop_tail, loopback_pair, LoopbackTransport};
-pub use qos::{grow_socket_buffers, set_dscp_default, set_media_qos, MediaClass, QosFlow};
+pub use qos::{
+    grow_socket_buffers, set_dscp_default, set_media_qos, set_media_qos_to, MediaClass, QosFlow,
+};
 
 /// A datagram transport. `recv` is non-blocking: `Ok(None)` means no packet
 /// is available, so the decode/present thread never blocks here.

@@ -129,22 +129,44 @@ pub fn set_media_qos(socket: &UdpSocket, class: MediaClass) -> Option<QosFlow> {
     }
     #[cfg(windows)]
     {
-        super::qos_windows::add_media_flow(socket, class)
+        super::qos_windows::add_media_flow(socket, None, class)
     }
     #[cfg(not(windows))]
     {
-        apply_media_qos(socket, class);
+        apply_media_qos(socket, Some(class));
+        None
+    }
+}
+
+/// [`set_media_qos`] for an unconnected socket that sends media to `peer`: the host's
+/// shared QUIC socket. Windows marks only traffic to `peer`. Elsewhere the mark is
+/// socket-wide, so it follows the latest peer and a routable one clears it: concurrent
+/// LAN and WAN sessions on one endpoint share the newest one's mark.
+pub fn set_media_qos_to(
+    socket: &UdpSocket,
+    peer: std::net::SocketAddr,
+    class: MediaClass,
+) -> Option<QosFlow> {
+    let on = dscp_enabled_for(Some(peer));
+    #[cfg(windows)]
+    {
+        on.then(|| super::qos_windows::add_media_flow(socket, Some(peer), class))
+            .flatten()
+    }
+    #[cfg(not(windows))]
+    {
+        apply_media_qos(socket, on.then_some(class));
         None
     }
 }
 
 /// Unconditional QoS apply, split out of [`set_media_qos`] so tests need not
-/// touch `PUNKTFUNK_DSCP`. Best-effort (log and continue).
+/// touch `PUNKTFUNK_DSCP`. `None` clears the mark. Best-effort (log and continue).
 #[cfg_attr(windows, allow(dead_code))]
-fn apply_media_qos(socket: &UdpSocket, class: MediaClass) {
+fn apply_media_qos(socket: &UdpSocket, class: Option<MediaClass>) {
     let sock = socket2::SockRef::from(socket);
     // DSCP occupies the high 6 bits of the TOS byte → shift left 2.
-    if let Err(e) = sock.set_tos_v4(class.dscp() << 2) {
+    if let Err(e) = sock.set_tos_v4(class.map_or(0, |c| c.dscp() << 2)) {
         tracing::debug!(error = %e, ?class, "set IP_TOS (DSCP) failed — QoS marking skipped");
     }
     // SO_PRIORITY after IP_TOS (TOS resets it to 0 on Linux). 6 is the max without
@@ -152,8 +174,9 @@ fn apply_media_qos(socket: &UdpSocket, class: MediaClass) {
     #[cfg(target_os = "linux")]
     {
         let prio = match class {
-            MediaClass::Video => 5,
-            MediaClass::Audio => 6,
+            None => 0,
+            Some(MediaClass::Video) => 5,
+            Some(MediaClass::Audio) => 6,
         };
         if let Err(e) = sock.set_priority(prio) {
             tracing::debug!(error = %e, "set SO_PRIORITY failed");
@@ -246,10 +269,24 @@ mod tests {
         }
     }
 
+    /// The shared socket is unconnected: a private peer marks it, a routable one clears it.
+    #[test]
+    fn an_unconnected_socket_follows_its_peer() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let lan = "192.168.1.233:9777".parse().unwrap();
+        let wan = "84.23.10.9:9777".parse().unwrap();
+        let _flow = set_media_qos_to(&sock, lan, MediaClass::Video);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(socket2::SockRef::from(&sock).tos_v4().unwrap(), 0xA0);
+        set_media_qos_to(&sock, wan, MediaClass::Video);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(socket2::SockRef::from(&sock).tos_v4().unwrap(), 0);
+    }
+
     #[test]
     fn apply_qos_tags_the_socket() {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        apply_media_qos(&sock, MediaClass::Video);
+        apply_media_qos(&sock, Some(MediaClass::Video));
         #[cfg(target_os = "linux")]
         {
             let s = socket2::SockRef::from(&sock);
