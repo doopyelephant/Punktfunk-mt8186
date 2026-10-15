@@ -244,17 +244,25 @@ final class PresentDebugStats: @unchecked Sendable {
     private let linkPeriod: () -> CFTimeInterval
     /// The hosting panel, read live per line — a window can move to another screen.
     private let panel: () -> PanelInfo
+    /// The Direct gate: presents it issued this window (`direct=`), and its mode switches.
+    private var directPresents = 0
+    private let scanoutSwitches: () -> Int
 
     init(
         cadence: CadenceClock?, pace: @escaping () -> String,
         linkPeriod: @escaping () -> CFTimeInterval,
-        panel: @escaping () -> PanelInfo = { PanelInfo(minHz: 0, maxHz: 0) }
+        panel: @escaping () -> PanelInfo = { PanelInfo(minHz: 0, maxHz: 0) },
+        scanoutSwitches: @escaping () -> Int = { 0 }
     ) {
         self.cadence = cadence
         self.pace = pace
         self.linkPeriod = linkPeriod
         self.panel = panel
+        self.scanoutSwitches = scanoutSwitches
     }
+
+    /// One present issued through the Direct gate.
+    func directPresent() { lock.lock(); directPresents += 1; lock.unlock() }
 
     /// Decoder output, every frame on every pacing — before the re-anchor gate and the store.
     func decoded(isRepeat: Bool) {
@@ -404,13 +412,16 @@ final class PresentDebugStats: @unchecked Sendable {
         let line = String(
             format: "pf-present pace=%@ linkMs=%.2f decoded=%d ok=%d fail=%d empty=%d "
                 + "gated=%d noDrawable=%d dropped=%d qDrop=%d qDry=%d maxRenderMs=%.1f "
-                + "inflightMax=%d forced=%d glassDeltaMs p50=%.2f max=%.2f n=%d "
+                + "inflightMax=%d forced=%d direct=%d scanSwitch=%d "
+                + "glassDeltaMs p50=%.2f max=%.2f n=%d "
                 + "latchMs p50=%.2f max=%.2f vendLeadMs p50=%.2f max=%.2f",
             pace(), linkPeriod() * 1000,
             decoded, ok, failed, empty, gated, noDrawable, dropped,
             smoothing.overflowDrops, smoothing.underflows, maxRenderMs, inflightMax,
-            gate?.drainForced() ?? 0, p50, dMax, deltas.count, latchP50, latchMax,
+            gate?.drainForced() ?? 0, directPresents, scanoutSwitches(),
+            p50, dMax, deltas.count, latchP50, latchMax,
             vendP50, vendMax) + glassLine + cadenceLine
+        directPresents = 0
         decoded = 0; decodedRepeats = 0; shownRepeats = 0
         ok = 0; failed = 0; empty = 0; dropped = 0; gated = 0; noDrawable = 0
         maxRenderMs = 0

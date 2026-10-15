@@ -368,9 +368,16 @@ final class PresentPacingTests: XCTestCase {
                 env: env, vsync: vsync, vsyncPaced: vsyncPaced, adaptiveSlotPaced: adaptive)
         }
         let adaptive = policy(nil, adaptive: true)
-        XCTAssertEqual(adaptive, PresentPolicy(adaptiveSlot: true, fixedSlot: false, fixedVsync: false))
-        XCTAssertEqual(adaptive.label(.arrival), "adaptive")
+        XCTAssertEqual(
+            adaptive,
+            PresentPolicy(adaptiveSlot: true, fixedSlot: false, fixedVsync: false, directGate: true))
+        XCTAssertEqual(adaptive.label(.arrival), "direct")
         XCTAssertEqual(policy("garbage", adaptive: true), adaptive, "an unknown mode is no mode")
+        // `adaptive` keeps the slot regime and drops the Direct gate, for A/B.
+        let slotOnly = policy("adaptive", adaptive: true)
+        XCTAssertEqual(slotOnly, PresentPolicy(adaptiveSlot: true, fixedSlot: false, fixedVsync: false))
+        XCTAssertEqual(slotOnly.label(.arrival), "adaptive")
+        XCTAssertFalse(policy("adaptive").directGate, "no gate off an adaptive panel")
 
         let vsync = policy(nil, vsync: true, adaptive: true)
         XCTAssertEqual(vsync, PresentPolicy(adaptiveSlot: false, fixedSlot: false, fixedVsync: true))

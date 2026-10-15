@@ -105,6 +105,7 @@ private final class CursorCapture {
 public struct StreamView: NSViewRepresentable {
     private let connection: PunktfunkConnection
     private let captureEnabled: Bool
+    private let overlayShown: Bool
     private let onCaptureChange: ((Bool) -> Void)?
     private let onDisconnectRequest: (() -> Void)?
     private let onFrame: (@Sendable (AccessUnit) -> Void)?
@@ -120,10 +121,13 @@ public struct StreamView: NSViewRepresentable {
     /// "click to capture" / "⌃⌥⇧Q releases" hint with it. `onDisconnectRequest` (main
     /// thread) fires on the reserved ⌃⌥⇧D combo while captured — the owner ends the
     /// session (released, the same combo reaches the Stream menu instead).
-    /// `endToEndMeter` records capture→on-glass for the A/V sync loop.
+    /// `endToEndMeter` records capture→on-glass for the A/V sync loop. `overlayShown` says the
+    /// owner draws over the video (the stats HUD): the window server blends then, so the
+    /// presenter stops probing for Direct scanout.
     public init(
         connection: PunktfunkConnection,
         captureEnabled: Bool = true,
+        overlayShown: Bool = false,
         onCaptureChange: ((Bool) -> Void)? = nil,
         onDisconnectRequest: (() -> Void)? = nil,
         // Call-site parity with the touch platforms: macOS has no twist (the ring opens from
@@ -137,6 +141,7 @@ public struct StreamView: NSViewRepresentable {
     ) {
         self.connection = connection
         self.captureEnabled = captureEnabled
+        self.overlayShown = overlayShown
         self.onCaptureChange = onCaptureChange
         self.onDisconnectRequest = onDisconnectRequest
         self.onFrame = onFrame
@@ -151,6 +156,7 @@ public struct StreamView: NSViewRepresentable {
         view.onCaptureChange = onCaptureChange
         view.onDisconnectRequest = onDisconnectRequest
         view.captureEnabled = captureEnabled
+        view.overlayShown = overlayShown
         view.endToEndMeter = endToEndMeter
         view.onResizeTarget = onResizeTarget
         view.onDecodedSize = onDecodedSize
@@ -162,6 +168,7 @@ public struct StreamView: NSViewRepresentable {
         view.onCaptureChange = onCaptureChange
         view.onDisconnectRequest = onDisconnectRequest
         view.captureEnabled = captureEnabled
+        view.overlayShown = overlayShown
         view.endToEndMeter = endToEndMeter
         view.onResizeTarget = onResizeTarget
         view.onDecodedSize = onDecodedSize
@@ -199,6 +206,12 @@ public final class StreamLayerView: NSView {
     private var screenValuesStale = true
     /// The view's screen in panel pixels per point (`NSScreen.panelScale`). Main-thread only.
     private var panelScale: Double = 1
+    /// The owner draws over the video (the stats HUD). Main-thread only.
+    var overlayShown = false {
+        didSet { if overlayShown != oldValue { pushDirectPossible() } }
+    }
+    /// Fullscreen with no overlay, as last told to the presenter. Main-thread only.
+    private var directPossible: Bool?
     private let cursorCapture = CursorCapture()
     private var inputCapture: InputCapture?
     private var appObservers: [NSObjectProtocol] = []
@@ -1130,10 +1143,20 @@ public final class StreamLayerView: NSView {
         requestAutoCapture() // entering a session is the deliberate "capture me" moment
     }
 
+    /// Tell the presenter, on a change, whether the window can scan out Direct: real fullscreen
+    /// (the notch panel window is titled, so never) with nothing of the app's own over the video.
+    private func pushDirectPossible() {
+        let possible = (window?.styleMask.contains(.fullScreen) ?? false) && !overlayShown
+        guard possible != directPossible else { return }
+        directPossible = possible
+        presenter.setDirectPossible(possible)
+    }
+
     /// Aspect-fit the stage-2 metal sublayer to the view; refresh contentsScale on a
     /// retina↔non-retina move (see SessionPresenter.layout). Also feeds the Match-window follower
-    /// the view's size in panel pixels, so a resize / retina move follows. A screen-change
-    /// observer re-runs this so the display-link range follows the view.
+    /// the view's size in panel pixels, so a resize / retina move follows, and the presenter
+    /// whether the window can scan out Direct. A screen-change observer re-runs this so the
+    /// display-link range follows the view.
     private func layoutPresenter() {
         // Only when the screen can have changed: a live resize lays out twice per step.
         if screenValuesStale {
@@ -1143,6 +1166,7 @@ public final class StreamLayerView: NSView {
             panelScale = screen?.panelScale ?? window?.backingScaleFactor ?? 1
         }
         presenter.layout(in: bounds, contentsScale: window?.backingScaleFactor ?? 1)
+        pushDirectPossible()
         displayLayer.videoGravity = SessionPresenter.gravity(VideoFit(name: connection?.settings.videoFit))
         // Feed the follower only once in a window (the screen is real then) and with real bounds.
         // Panel pixels, not backing: a scaled mode's framebuffer outsizes the panel.
