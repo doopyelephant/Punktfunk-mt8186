@@ -144,9 +144,12 @@ door_refresh() {
     ok "Reachable without logging in: refreshed"
 }
 
-# The user's own console stands down while the door's serves its port, as the packaged unit does.
+# The user's own console stands down while the door is on, as the packaged unit does. The
+# owner's contract exists from before linger starts the console at boot; the door's console doesn't.
 door_yield_web_unit() {
-    local unit=$UNITS/punktfunk-web.service
-    [ -f "$unit" ] && ! grep -q '^ConditionPathExists=!/run/punktfunk-web-door' "$unit" || return 0
-    sed -i 's|^\[Unit\]$|[Unit]\nConditionPathExists=!/run/punktfunk-web-door|' "$unit"
+    local unit=$UNITS/punktfunk-web.service line
+    [ -f "$unit" ] || return 0
+    for line in 'ConditionPathExists=!/run/punktfunk-web-door' 'ConditionPathExists=!/run/punktfunk/seats/%u.env'; do
+        grep -qxF "$line" "$unit" || sed -i "s|^\[Unit\]\$|[Unit]\n$line|" "$unit"
+    done
 }

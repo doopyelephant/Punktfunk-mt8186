@@ -521,14 +521,18 @@ pub(crate) fn restart_runtime() -> Result<bool> {
     Ok(true)
 }
 
-/// [`restart_runtime`] off the caller's thread, for the start that minted the runner's token.
-/// A runner already up holds what it saw at its own start: on Linux its unit bound only the
-/// token and TLS pin that existed then, on Windows it had none of its grants.
-pub(crate) fn restart_runtime_after_first_mint() {
+/// [`restart_runtime`] off the caller's thread, for a start the running runner predates: one
+/// that minted its token or moved the management port. A runner already up holds what it saw
+/// at its own start: on Linux its unit bound only the token, TLS pin and endpoint file that
+/// existed then, and a rename leaves it reading the old ones; on Windows it had none of its
+/// grants.
+pub(crate) fn restart_stale_runtime() {
     let spawned = std::thread::Builder::new()
         .name("runner-restart".into())
         .spawn(|| match restart_runtime() {
-            Ok(true) => tracing::info!("plugin runner restarted with the host's new credentials"),
+            Ok(true) => {
+                tracing::info!("plugin runner restarted onto the host's credentials and port")
+            }
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "plugin runner not restarted"),
         });

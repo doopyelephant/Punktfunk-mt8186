@@ -1152,7 +1152,8 @@ pub(crate) async fn set_library_art_pick(
 /// the first miss and then serves from its own store. Unknown id or kind is 404 so the client
 /// can try the next candidate, and so is a URL the fetch refused — `GET /library` advertises
 /// that one verbatim again. The response carries `Cache-Control` and an `ETag` of the bytes; a
-/// request whose `If-None-Match` names that tag gets 304 with no body.
+/// request whose `If-None-Match` names that tag gets 304 with no body. On a Linux door the
+/// covers are in the owner's home, and the owner's host serves them while it runs.
 #[utoipa::path(
     get,
     path = "/library/art/{id}/{kind}",
@@ -1179,10 +1180,10 @@ pub(crate) async fn get_library_art(
     };
     // Any catalog id (manual, provider, claimed-store) serves its local file from here.
     // The proxy does not know which store the id belongs to.
-    let stored = {
-        let id = id.clone();
-        tokio::task::spawn_blocking(move || crate::library::library_art_bytes(&id, kind)).await
-    };
+    let stored = tokio::task::spawn_blocking(move || {
+        crate::library::library_art_bytes(&id, kind).or_else(|| owner_art(&id, kind))
+    })
+    .await;
     if let Ok(Some((bytes, ctype))) = stored {
         // The tag is the bytes' hash: a replaced cover misses, an unchanged one revalidates
         // for free. A day of freshness keeps a shelf revisit off the network entirely.
@@ -1203,6 +1204,35 @@ pub(crate) async fn get_library_art(
     api_error(StatusCode::NOT_FOUND, "no art of that kind for this title")
 }
 
+/// The door's library is a copy of the owner's, whose covers sit in the owner's home where the
+/// door can't read: the owner's host serves them. `None` off a door, for a title the door doesn't
+/// list, and while that host is down; a cover never starts the owner's session. Blocking.
+fn owner_art(id: &str, kind: crate::library::ArtKind) -> Option<(Vec<u8>, String)> {
+    if !crate::seats::is_door() {
+        return None;
+    }
+    crate::library::entry_for_library_id(id)?;
+    let owner = crate::seats::list().ok()?.into_iter().find(|s| s.owner)?;
+    let path = format!("library/art/{}/{}", path_segment(id), kind.name());
+    match crate::seats::forward(&owner, "GET", &path, None, Vec::new())? {
+        (200, Some(ctype), bytes) if ctype.starts_with("image/") => Some((bytes, ctype)),
+        _ => None,
+    }
+}
+
+/// `s` as one path segment: unreserved characters, `:` and `@` stay, every other byte is
+/// percent-encoded.
+fn path_segment(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' | b'@' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// Whether an `If-None-Match` value names `etag`: a list, `*`, or a weak `W/` form of it.
 pub(super) fn not_modified(if_none_match: Option<&str>, etag: &str) -> bool {
     if_none_match.is_some_and(|v| {
@@ -1214,7 +1244,15 @@ pub(super) fn not_modified(if_none_match: Option<&str>, etag: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::not_modified;
+    use super::{not_modified, path_segment};
+
+    /// A library id reaches the owner's host as the one segment it is on the door.
+    #[test]
+    fn a_library_id_stays_one_path_segment() {
+        assert_eq!(path_segment("steam:570"), "steam:570");
+        assert_eq!(path_segment("heroic:a b/c?d"), "heroic:a%20b%2Fc%3Fd");
+        assert_eq!(path_segment("rom:é"), "rom:%C3%A9");
+    }
 
     #[test]
     fn if_none_match_forms() {

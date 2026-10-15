@@ -3724,7 +3724,8 @@ readonly "getLibrary": {
 * the first miss and then serves from its own store. Unknown id or kind is 404 so the client
 * can try the next candidate, and so is a URL the fetch refused — `GET /library` advertises
 * that one verbatim again. The response carries `Cache-Control` and an `ETag` of the bytes; a
-* request whose `If-None-Match` names that tag gets 304 with no body.
+* request whose `If-None-Match` names that tag gets 304 with no body. On a Linux door the
+* covers are in the owner's home, and the owner's host serves them while it runs.
 */
 readonly "getLibraryArt": {
     <Config extends OperationConfig | undefined = undefined>(id: string, kind: string, options: { readonly params?: typeof GetLibraryArtParams.Encoded | undefined; readonly config: Config }): Effect.Effect<WithOptionalResponse<Uint8Array | void, Config>, HttpClientError.HttpClientError | SchemaError | PunktfunkError<"GetLibraryArt401", typeof GetLibraryArt401.Type> | PunktfunkError<"GetLibraryArt404", typeof GetLibraryArt404.Type>>;
@@ -3736,7 +3737,8 @@ readonly "getLibraryArt": {
 * the first miss and then serves from its own store. Unknown id or kind is 404 so the client
 * can try the next candidate, and so is a URL the fetch refused — `GET /library` advertises
 * that one verbatim again. The response carries `Cache-Control` and an `ETag` of the bytes; a
-* request whose `If-None-Match` names that tag gets 304 with no body.
+* request whose `If-None-Match` names that tag gets 304 with no body. On a Linux door the
+* covers are in the owner's home, and the owner's host serves them while it runs.
 */
 readonly "getLibraryArtStream": (id: string, kind: string, options: { readonly params?: typeof GetLibraryArtParams.Encoded | undefined } | undefined) => Stream.Stream<Uint8Array, HttpClientError.HttpClientError>
   /**

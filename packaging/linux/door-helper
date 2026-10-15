@@ -179,7 +179,8 @@ door_off() {
         row=$(owner_row)
         [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null
     fi
-    rm -f "$MARK" "$STATE/owner"
+    # A stopped supervisor leaves the owner's contract behind, and their host and console read it.
+    rm -f "/run/punktfunk/seats/$user.env" "$MARK" "$STATE/owner"
     systemctl disable --now punktfunk-web-door.service punktfunk-door.service punktfunk-seats.service
     user_ctl try-restart punktfunk-host.service || true
     # Their console comes back only if it was theirs to begin with.

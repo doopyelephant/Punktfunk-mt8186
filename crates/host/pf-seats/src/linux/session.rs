@@ -89,10 +89,13 @@ pub(super) fn mint_token() -> String {
 /// The seat contract the host reads (`multi-seat-contract.md`), one `KEY="value"` per line, then
 /// the management token the box's client presents. Only the door advertises, so no seat does.
 ///
-/// The owner's row keeps the owner's own config directory, host name and GameStream setting: it
-/// is the owner's host, behind the door. `PUNKTFUNK_SEAT_OWNER` tells the runner and the host so.
+/// The owner's row keeps the owner's own config directory, library, host name and GameStream
+/// setting: it is the owner's host, behind the door. `PUNKTFUNK_SEAT_OWNER` tells the runner and
+/// the host so. Every other seat plays the box's library, from its trust copy.
 pub(super) fn render_env(seat: &Seat, home: &Path, state: &Path, token: &str) -> String {
-    let trust = shared::trust_dir(state, &seat.id);
+    let trust = shared::trust_dir(state, &seat.id)
+        .to_string_lossy()
+        .into_owned();
     let mut rows = vec![
         ("PUNKTFUNK_SEAT_SESSION", "1".to_owned()),
         ("PUNKTFUNK_SEAT_ID", seat.id.to_string()),
@@ -107,8 +110,13 @@ pub(super) fn render_env(seat: &Seat, home: &Path, state: &Path, token: &str) ->
         ));
     }
     rows.extend([
-        ("PUNKTFUNK_TRUST_DIR", trust.to_string_lossy().into_owned()),
+        ("PUNKTFUNK_TRUST_DIR", trust.clone()),
         ("PUNKTFUNK_PAIRING", "refused".to_owned()),
+    ]);
+    if !seat.owner {
+        rows.push(("PUNKTFUNK_LIBRARY_DIR", trust));
+    }
+    rows.extend([
         ("PUNKTFUNK_NATIVE_PORT", seat.native_port.to_string()),
         (
             "PUNKTFUNK_MGMT_BIND",
@@ -362,8 +370,8 @@ mod tests {
         }
     }
 
-    /// The owner's host is the owner's own: no config directory, host name or GameStream
-    /// setting from the row, only the contract that moves its ports behind the door.
+    /// The owner's host is the owner's own: no config directory, library, host name or
+    /// GameStream setting from the row, only the contract that moves its ports behind the door.
     #[test]
     fn the_owner_s_env_file_leaves_its_config_and_settings_alone() {
         let text = render_env(
@@ -385,6 +393,7 @@ mod tests {
              PUNKTFUNK_MGMT_TOKEN=ab12\n"
         );
         assert!(!text.contains("CONFIG_DIR"));
+        assert!(!text.contains("LIBRARY_DIR"));
         assert!(render_class().contains("XDG_SESSION_CLASS=background"));
     }
 
@@ -404,6 +413,7 @@ mod tests {
              PUNKTFUNK_CONFIG_DIR=\"/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/home/.config/punktfunk\"\n\
              PUNKTFUNK_TRUST_DIR=\"/var/lib/punktfunk-seats/trust/0123456789abcdef0123456789abcdef\"\n\
              PUNKTFUNK_PAIRING=\"refused\"\n\
+             PUNKTFUNK_LIBRARY_DIR=\"/var/lib/punktfunk-seats/trust/0123456789abcdef0123456789abcdef\"\n\
              PUNKTFUNK_NATIVE_PORT=\"9779\"\n\
              PUNKTFUNK_MGMT_BIND=\"127.0.0.1:47995\"\n\
              PUNKTFUNK_HOST_NAME=\"Mara\"\n\
@@ -428,7 +438,7 @@ mod tests {
             .find(|l| l.starts_with("PUNKTFUNK_HOST_NAME="))
             .unwrap();
         assert_eq!(line, r#"PUNKTFUNK_HOST_NAME="A \"B\" \\ $HOME 100%""#);
-        assert_eq!(text.lines().count(), 11);
+        assert_eq!(text.lines().count(), 12);
     }
 
     /// The token line is the exact form the box's client parses, and every mint differs.

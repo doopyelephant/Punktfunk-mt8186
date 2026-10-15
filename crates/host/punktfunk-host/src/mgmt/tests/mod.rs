@@ -25,6 +25,22 @@ fn published_endpoint_line_parses_the_way_both_consumers_read_it() {
     assert!(value.starts_with("https://127.0.0.1:"));
 }
 
+/// The port a reader of the endpoint file dials: the one it names, else the 47990 fallback.
+/// A start that changes it is what restarts the plugin runner.
+#[test]
+fn the_published_port_is_the_one_a_reader_dials() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(super::published_port(dir.path()), super::DEFAULT_PORT);
+    super::write_endpoint(dir.path(), 47995).unwrap();
+    assert_eq!(super::published_port(dir.path()), 47995);
+    std::fs::write(
+        dir.path().join(super::ENDPOINT_FILE),
+        "PUNKTFUNK_MGMT_URL=\n",
+    )
+    .unwrap();
+    assert_eq!(super::published_port(dir.path()), super::DEFAULT_PORT);
+}
+
 mod auth_lanes;
 mod clients;
 mod display;

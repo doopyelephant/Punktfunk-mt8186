@@ -8,7 +8,10 @@
 //! - `seats/<id>/` holds the seat user's home, those three private directories, and the box
 //!   owner's libraries as the seat sees them (`libraries.rs`).
 //! - `trust/<id>/` is a read-only copy of the box's pairing store and profiles from the door's
-//!   directory, so a seat user can read what it needs and nothing else there.
+//!   directory, so a seat user can read what it needs and nothing else there. A seat other than
+//!   the owner's also finds the box's library there.
+//! - `library/` is the box's library: a copy of the owner's, which the owner's host writes. The
+//!   door serves it to every client, and each seat's trust copy takes it from here.
 //! - `seats/hosts/<id>/mgmt-token` is the token the box presents to that seat host's loopback
 //!   API. It belongs to the `punktfunk` user, not the seat group: every seat user is a member.
 
@@ -47,6 +50,21 @@ const AVATARS: &str = "profiles";
 /// A trust file larger than this is not ours.
 pub(super) const MAX_TRUST_BYTES: u64 = 8 * 1024 * 1024;
 
+/// The library files a host reads from its library dir. Play stats stay with each host.
+const LIBRARY_FILES: [&str; 5] = [
+    "library.json",
+    "library-hidden.json",
+    "library-metadata.json",
+    "library-picks.json",
+    "library-scanners.json",
+];
+
+/// One table per metadata source, a flat folder beside the library files.
+const LIBRARY_METADATA: &str = "library-metadata";
+
+/// A big catalog with descriptions runs to tens of megabytes; past this it is not ours.
+const MAX_LIBRARY_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Steam top-level entries a seat does not inherit: the owner's account, library and logs.
 const CLONE_SKIP: &[&str] = &["config", "userdata", "appcache", "steamapps", "logs"];
 
@@ -64,6 +82,11 @@ pub(super) fn trust_dir(state: &Path, id: &SeatId) -> PathBuf {
 
 pub(super) fn games_dir(state: &Path) -> PathBuf {
     state.join("games")
+}
+
+/// The box's library, the door's `PUNKTFUNK_LIBRARY_DIR` (`punktfunk-door.service`).
+pub(super) fn box_library_dir(state: &Path) -> PathBuf {
+    state.join("library")
 }
 
 /// The ledger's directory, `seats` under the state directory: `persistence::default_root()` on
@@ -452,20 +475,22 @@ fn unlink(dir: &OwnedFd, name: &str) -> std::io::Result<bool> {
     }
 }
 
-/// Copies `name` from the box's `src` into `dst` for `reader` when it differs, and removes it from
-/// `dst` when the box has none. Returns whether `dst` changed. Both are directory handles, so no
-/// link on either side is followed, whoever owns the directory.
+/// Copies `name`, at most `max` bytes, from `src` into `dst` for `reader` when it differs, and
+/// removes it from `dst` when `src` has none. Returns whether `dst` changed. Both are directory
+/// handles, so no link on either side is followed, whoever owns the directory. An unchanged file
+/// is not read.
 fn sync_file(
     src: Option<&OwnedFd>,
     dst: &OwnedFd,
     name: &str,
     reader: Reader,
+    max: u64,
 ) -> std::io::Result<bool> {
     let found = match src {
-        Some(src) => safe_open::read_at(src, name, MAX_TRUST_BYTES)?,
+        Some(src) => safe_open::file_at(src, name, max)?,
         None => None,
     };
-    let Some((bytes, meta)) = found else {
+    let Some((file, meta)) = found else {
         return unlink(dst, name);
     };
     let wanted = (meta.mtime(), meta.mtime_nsec(), meta.size());
@@ -475,6 +500,7 @@ fn sync_file(
     if !needs_copy(wanted, current) {
         return Ok(false);
     }
+    let bytes = safe_open::read_opened(file, &meta, name, max)?;
     let temp = format!("{name}.tmp");
     unlink(dst, &temp)?;
     let create =
@@ -500,27 +526,88 @@ pub(super) fn refresh_trust(
     id: &SeatId,
     reader: Reader,
 ) -> Result<bool, BackendError> {
-    let dst = trust_dir(state, id);
     let io = |what: &str, e| io_err("trust_copy", what, e);
-    make_dir(&dst, reader.dir_mode()).map_err(|e| io("create the trust copy", e))?;
-    std::os::unix::fs::chown(&dst, reader.uid, Some(reader.gid))
-        .map_err(|e| io("own the trust copy", e))?;
-    let dst = safe_open::dir(&dst).map_err(|e| io("open the trust copy", e))?;
-    let src = match safe_open::dir(box_dir) {
-        Ok(src) => Some(src),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io("open the box directory", e)),
-    };
+    let dst = open_copy(&trust_dir(state, id), reader).map_err(|e| io("open the trust copy", e))?;
+    let src = open_source(box_dir).map_err(|e| io("open the box directory", e))?;
     let mut changed = false;
     for name in RETIRED {
         changed |= unlink(&dst, name).map_err(|e| io(&format!("remove the old {name}"), e))?;
     }
     for name in TRUST_FILES {
-        changed |= sync_file(src.as_ref(), &dst, name, reader)
+        changed |= sync_file(src.as_ref(), &dst, name, reader, MAX_TRUST_BYTES)
             .map_err(|e| io(&format!("copy {name}"), e))?;
     }
-    changed |= sync_avatars(src.as_ref(), &dst, reader).map_err(|e| io("copy the avatars", e))?;
+    changed |= sync_flat_dir(src.as_ref(), &dst, AVATARS, reader, MAX_TRUST_BYTES)
+        .map_err(|e| io("copy the avatars", e))?;
     Ok(changed)
+}
+
+/// Brings the box's library level with the owner's own in `home`, for `reader`, the door's
+/// group. Returns whether anything changed. A config folder that isn't there, as in a home not
+/// mounted yet, leaves the copy as it is: the door keeps serving the last library it had.
+pub(super) fn refresh_box_library(
+    home: &Path,
+    state: &Path,
+    reader: Reader,
+) -> Result<bool, BackendError> {
+    let io = |what: &str, e| io_err("box_library", what, e);
+    let config = safe_open::dir(home).and_then(|at| safe_open::walk(at, &[".config", "punktfunk"]));
+    let src = match config {
+        Ok(Some(src)) => src,
+        Ok(None) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(io("open the owner's config folder", e)),
+    };
+    let dst =
+        open_copy(&box_library_dir(state), reader).map_err(|e| io("open the library copy", e))?;
+    sync_library(Some(&src), &dst, reader).map_err(|e| io("copy the owner's library", e))
+}
+
+/// Brings the box's library in a seat's trust copy level with [`box_library_dir`]: the seat's
+/// `PUNKTFUNK_LIBRARY_DIR`. Never the owner's row, whose host writes the library it reads.
+pub(super) fn refresh_seat_library(
+    state: &Path,
+    id: &SeatId,
+    reader: Reader,
+) -> Result<bool, BackendError> {
+    let io = |what: &str, e| io_err("trust_copy", what, e);
+    let dst = open_copy(&trust_dir(state, id), reader).map_err(|e| io("open the trust copy", e))?;
+    let src = open_source(&box_library_dir(state)).map_err(|e| io("open the box library", e))?;
+    sync_library(src.as_ref(), &dst, reader).map_err(|e| io("copy the box library", e))
+}
+
+/// Removes the box's library: the owner's row is gone, and so is the door it was for.
+pub(super) fn remove_box_library(state: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(box_library_dir(state)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// The library files and the metadata folder from `src` into `dst`, for `reader`.
+fn sync_library(src: Option<&OwnedFd>, dst: &OwnedFd, reader: Reader) -> std::io::Result<bool> {
+    let mut changed = false;
+    for name in LIBRARY_FILES {
+        changed |= sync_file(src, dst, name, reader, MAX_LIBRARY_BYTES)?;
+    }
+    changed |= sync_flat_dir(src, dst, LIBRARY_METADATA, reader, MAX_LIBRARY_BYTES)?;
+    Ok(changed)
+}
+
+/// `dst` made and handed to `reader`, then opened: a copy root writes for one reader.
+fn open_copy(dst: &Path, reader: Reader) -> std::io::Result<OwnedFd> {
+    make_dir(dst, reader.dir_mode())?;
+    std::os::unix::fs::chown(dst, reader.uid, Some(reader.gid))?;
+    safe_open::dir(dst)
+}
+
+/// A directory a copy is taken from, `None` when it doesn't exist.
+fn open_source(dir: &Path) -> std::io::Result<Option<OwnedFd>> {
+    match safe_open::dir(dir) {
+        Ok(src) => Ok(Some(src)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// The names in `dir`, without `.` and `..`; a name that is not UTF-8 is left out.
@@ -536,22 +623,28 @@ fn names(dir: &OwnedFd) -> std::io::Result<Vec<String>> {
     Ok(out)
 }
 
-/// Mirrors the box's flat avatar directory into `dst`: copies each file, drops copies whose
-/// source is gone. A link where the directory should be is refused.
-fn sync_avatars(src: Option<&OwnedFd>, dst: &OwnedFd, reader: Reader) -> std::io::Result<bool> {
+/// Mirrors the flat directory `dir` of `src` into `dst`: copies each file of at most `max` bytes,
+/// drops copies whose source is gone. A link where the directory should be is refused.
+fn sync_flat_dir(
+    src: Option<&OwnedFd>,
+    dst: &OwnedFd,
+    dir: &str,
+    reader: Reader,
+    max: u64,
+) -> std::io::Result<bool> {
     let src = match src {
-        Some(src) => safe_open::dir_at(src, AVATARS)?,
+        Some(src) => safe_open::dir_at(src, dir)?,
         None => None,
     };
     if src.is_some() {
         let mode = Mode::from_raw_mode(reader.dir_mode() as _);
-        match rustix::fs::mkdirat(dst, AVATARS, mode) {
+        match rustix::fs::mkdirat(dst, dir, mode) {
             Ok(()) => {}
             Err(e) if e == rustix::io::Errno::EXIST => {}
             Err(e) => return Err(e.into()),
         }
     }
-    let Some(copies) = safe_open::dir_at(dst, AVATARS)? else {
+    let Some(copies) = safe_open::dir_at(dst, dir)? else {
         return Ok(false);
     };
     let mut wanted = HashSet::new();
@@ -561,7 +654,7 @@ fn sync_avatars(src: Option<&OwnedFd>, dst: &OwnedFd, reader: Reader) -> std::io
         std::os::unix::fs::fchown(&copies, reader.uid, Some(reader.gid))?;
         for name in names(src)?.into_iter().filter(|n| safe_name(n)) {
             // A link or oversized entry is skipped, not copied and not fatal.
-            if let Ok(did) = sync_file(Some(src), &copies, &name, reader) {
+            if let Ok(did) = sync_file(Some(src), &copies, &name, reader, max) {
                 changed |= did;
                 wanted.insert(name);
             }
@@ -573,7 +666,7 @@ fn sync_avatars(src: Option<&OwnedFd>, dst: &OwnedFd, reader: Reader) -> std::io
         }
     }
     if src.is_none() {
-        let _ = rustix::fs::unlinkat(dst, AVATARS, AtFlags::REMOVEDIR);
+        let _ = rustix::fs::unlinkat(dst, dir, AtFlags::REMOVEDIR);
     }
     Ok(changed)
 }
@@ -968,6 +1061,80 @@ mod tests {
         assert_eq!(mode(&trust), 0o700);
         assert_eq!(mode(&trust.join("profiles")), 0o700);
         assert_eq!(mode(&trust.join("profiles/a.png")), 0o600);
+    }
+
+    /// The box's library follows the owner's own files and reaches a seat's trust copy, minus
+    /// play stats and anything else in the owner's config folder.
+    #[test]
+    fn the_box_library_follows_the_owner_into_each_seat() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, state) = (temp.path().join("home"), temp.path().join("state"));
+        let config = home.join(".config/punktfunk");
+        std::fs::create_dir_all(config.join("library-metadata")).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(config.join("library.json"), r#"{"entries":[]}"#).unwrap();
+        std::fs::write(config.join("library-metadata/sgdb.json"), "{}").unwrap();
+        std::fs::write(config.join("library-stats.json"), "{}").unwrap();
+        std::fs::write(config.join("mgmt-token"), "secret").unwrap();
+        let reader = Reader::group(own_gid(&home));
+
+        assert!(refresh_box_library(&home, &state, reader).unwrap());
+        let copy = box_library_dir(&state);
+        assert_eq!(mode(&copy), 0o750);
+        assert_eq!(mode(&copy.join("library.json")), 0o640);
+        assert!(copy.join("library-metadata/sgdb.json").exists());
+        for kept in ["library-stats.json", "mgmt-token"] {
+            assert!(!copy.join(kept).exists(), "{kept} stays the owner's");
+        }
+        assert!(
+            !refresh_box_library(&home, &state, reader).unwrap(),
+            "unchanged is a no-op"
+        );
+
+        assert!(refresh_seat_library(&state, &id(), reader).unwrap());
+        let trust = trust_dir(&state, &id());
+        assert!(trust.join("library.json").exists());
+        assert!(trust.join("library-metadata/sgdb.json").exists());
+
+        // A file the owner drops leaves both copies.
+        std::fs::remove_file(config.join("library-metadata/sgdb.json")).unwrap();
+        assert!(refresh_box_library(&home, &state, reader).unwrap());
+        assert!(refresh_seat_library(&state, &id(), reader).unwrap());
+        assert!(!trust.join("library-metadata/sgdb.json").exists());
+
+        remove_box_library(&state).unwrap();
+        assert!(!copy.exists());
+        assert!(refresh_seat_library(&state, &id(), reader).unwrap());
+        assert!(!trust.join("library.json").exists());
+    }
+
+    /// An owner's config folder that isn't there, as in a home not mounted yet, keeps the copy
+    /// the door serves; a link among the owner's files is refused and not followed.
+    #[test]
+    fn the_box_library_survives_a_missing_home_and_refuses_a_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, state) = (temp.path().join("home"), temp.path().join("state"));
+        let config = home.join(".config/punktfunk");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(config.join("library.json"), "{}").unwrap();
+        let reader = Reader::group(own_gid(&home));
+        assert!(refresh_box_library(&home, &state, reader).unwrap());
+
+        let gone = temp.path().join("gone");
+        assert!(!refresh_box_library(&gone, &state, reader).unwrap());
+        assert!(box_library_dir(&state).join("library.json").exists());
+
+        let secret = temp.path().join("secret");
+        std::fs::write(&secret, "root only").unwrap();
+        std::fs::remove_file(config.join("library.json")).unwrap();
+        std::os::unix::fs::symlink(&secret, config.join("library.json")).unwrap();
+        let error = refresh_box_library(&home, &state, reader).unwrap_err();
+        assert_eq!(error.code, "box_library");
+        assert_ne!(
+            std::fs::read_to_string(box_library_dir(&state).join("library.json")).unwrap(),
+            "root only"
+        );
     }
 
     /// A link in the box directory is never followed into the copy.
