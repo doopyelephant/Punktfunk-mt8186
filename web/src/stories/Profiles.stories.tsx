@@ -38,8 +38,8 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-/** Every card state on Linux: owner, desktop sharer, and a light seat ready, needing its Steam
- * sign-in, in use, starting, stopped and unavailable. */
+/** Linux without the door: the owner and two desktop sharers, one of whom has a Steam kept on
+ * this host. */
 export const EveryState: Story = {};
 
 /** One person on the box: the owner's card and **Add profile**, nothing else. */
@@ -47,7 +47,7 @@ export const OneProfile: Story = {
 	args: { profiles: { data: profilesOne, isLoading: false, error: null } },
 };
 
-/** **Add profile** on Linux: own Steam offered, own desktop waiting for the seats package. */
+/** **Add profile** on Linux without the door: sharing the desktop, own desktop waiting for it. */
 export const AddOnLinux: Story = {
 	render: () => (
 		<AddProfileDialog
@@ -60,24 +60,6 @@ export const AddOnLinux: Story = {
 		/>
 	),
 };
-
-/** **Add profile** while **Steam per seat** is untouched: the first Own Steam profile turns it on. */
-export const AddTurnsOnSteamPerSeat: Story = {
-	render: () => (
-		<AddProfileDialog
-			open
-			ownerName="Enrico"
-			linux
-			seatHome="turns-on"
-			onCancel={noop}
-			onCreate={noop}
-			isPending={false}
-		/>
-	),
-};
-
-/** **Steam per seat** set off by the operator: seat profiles say they need it. */
-export const SteamPerSeatOff: Story = { args: { seatHome: "off" } };
 
 /** **Add profile** on a host that is not Linux: sharing the desktop is the one choice today. */
 export const AddElsewhere: Story = {
@@ -93,8 +75,9 @@ export const AddElsewhere: Story = {
 	),
 };
 
-/** **Remove** a seat profile: the console password, and `erase` spelled out. */
-export const RemoveSeat: Story = {
+/** **Remove** a profile this host keeps a Steam for: the console password, and `erase` spelled
+ * out. */
+export const RemoveKeepsSteam: Story = {
 	render: () => (
 		<RemoveProfileDialog
 			profile={profilesEvery[2] ?? null}

@@ -102,6 +102,11 @@ pub(crate) struct ProfileAdmin {
     legacy_device: Option<String>,
     /// Where a device that names no profile lands.
     default: bool,
+    /// This host keeps a Steam home for it, with that Steam's sign-in and saved games. A removal
+    /// with `erase` deletes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schema(required = false)]
+    steam_home: bool,
 }
 
 /// `PUT /profiles/default`.
@@ -399,6 +404,18 @@ fn admin(st: &MgmtState, profiles: &Profiles, p: &Profile, seats: &Snapshot) -> 
         public: public(st, p, owner.as_deref(), None, seats),
         legacy_device: p.legacy_device.clone(),
         default: profiles.default_profile_id().as_deref() == Some(p.id.as_str()),
+        steam_home: keeps_steam_home(&p.id),
+    }
+}
+
+/// A Steam home is a Linux host's, under its own data dir.
+fn keeps_steam_home(id: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    return pf_paths::seat_home(id).is_dir();
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = id;
+        false
     }
 }
 
@@ -593,10 +610,9 @@ pub(crate) async fn list_profiles(State(st): State<Arc<MgmtState>>) -> Response 
 
 /// Add a profile
 ///
-/// A seat profile (the default) plays in a seat of its own; one with `seat: false` plays the
-/// box's own session under its own name. On Windows a seat is a desktop of its own: its account
-/// is made here, and seats must be on. On Linux a seat is a Steam of its own in the owner's
-/// session, or with `desktop` a desktop of its own, which needs the door.
+/// A seat profile (the default) gets a desktop of its own, whose account is made here; one with
+/// `seat: false` plays the box's own session under its own name. A seat needs seats on
+/// (Windows) or the door (Linux).
 #[utoipa::path(
     post,
     path = "/profiles",
@@ -607,7 +623,7 @@ pub(crate) async fn list_profiles(State(st): State<Arc<MgmtState>>) -> Response 
         (status = CREATED, description = "The new profile", body = ProfileAdmin),
         (status = BAD_REQUEST, description = "No name, or an accent that is not #RRGGBB", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
-        (status = CONFLICT, description = "Another profile has that name, seats are off (Windows), or the door is off (a Linux desktop)", body = ApiError),
+        (status = CONFLICT, description = "Another profile has that name, seats are off (Windows), or the door is off (Linux)", body = ApiError),
         (status = UNPROCESSABLE_ENTITY, description = "The box already has eight profiles, or four seats", body = ApiError),
         (status = SERVICE_UNAVAILABLE, description = "The seat supervisor didn't answer", body = ApiError),
     )
@@ -619,16 +635,14 @@ pub(crate) async fn create_profile(
     let Some(profiles) = st.app.profiles.get() else {
         return no_profiles();
     };
-    // A Windows seat is always a desktop of its own. On Linux that is the door's: without it a
-    // seat is a Steam of its own in the owner's session, and a desktop can't be had yet.
-    let own_desktop = cfg!(windows) || input.desktop;
-    if input.seat && own_desktop && !cfg!(windows) && !crate::seats::is_door() {
+    // A Linux seat is the door's; elsewhere `new_seat` asks whether seats are on.
+    if input.seat && cfg!(target_os = "linux") && !crate::seats::is_door() {
         return api_error(
             StatusCode::CONFLICT,
             "Turn on Reachable without logging in before adding a profile with a desktop of its own.",
         );
     }
-    let seat = if input.seat && own_desktop {
+    let seat = if input.seat {
         let name = input.display_name.clone();
         match blocking("seat supervisor", move || new_seat(&name)).await {
             Ok(Ok(id)) => Some(id),

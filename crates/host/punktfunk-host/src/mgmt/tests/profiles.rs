@@ -82,7 +82,7 @@ async fn waking_another_profiles_seat_needs_the_launch_grant() {
     let create = json_req(
         Method::POST,
         "/api/v1/profiles",
-        serde_json::json!({ "display_name": "Kid" }),
+        serde_json::json!({ "display_name": "Kid", "seat": false }),
     );
     let (status, kid) = send(&app, create).await;
     assert_eq!(status, StatusCode::CREATED, "{kid}");
@@ -138,7 +138,8 @@ async fn seating_off_windows_reads_off_and_refuses_a_change() {
     );
 }
 
-/// Create, rename, a picture, the default, then removal; the owner can't be removed.
+/// Create, rename, a picture, the default, then removal; the owner can't be removed. A seat
+/// needs seats or the door, which a test host has neither of.
 #[tokio::test]
 async fn the_console_edits_profiles() {
     let app = test_app(state_with_profiles("edit"), None);
@@ -150,20 +151,27 @@ async fn the_console_edits_profiles() {
             .body(Body::from(body.to_string()))
             .unwrap()
     };
+    let (status, refused) = send(
+        &app,
+        json("POST", "/api/v1/profiles", r#"{"display_name":"Kid"}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+
     let (status, kid) = send(
         &app,
         json(
             "POST",
             "/api/v1/profiles",
-            r##"{"display_name":"Kid","accent":"#F97316"}"##,
+            r##"{"display_name":"Kid","accent":"#F97316","seat":false}"##,
         ),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
     let id = kid["id"].as_str().unwrap().to_string();
-    assert_eq!(kid["home"], "bigpicture");
+    assert_eq!(kid["home"], "desktop");
     assert_eq!(kid["accent"], "#f97316");
-    assert_eq!(kid["seat"]["port"], 9777);
+    assert!(kid.get("seat").is_none(), "plays on the box: {kid}");
 
     let (status, sharer) = send(
         &app,
@@ -176,11 +184,14 @@ async fn the_console_edits_profiles() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(sharer["home"], "desktop");
-    assert!(sharer.get("seat").is_none(), "plays on the box: {sharer}");
 
     let (status, _) = send(
         &app,
-        json("POST", "/api/v1/profiles", r#"{"display_name":"kid"}"#),
+        json(
+            "POST",
+            "/api/v1/profiles",
+            r#"{"display_name":"kid","seat":false}"#,
+        ),
     )
     .await;
     assert_eq!(
@@ -193,7 +204,7 @@ async fn the_console_edits_profiles() {
         json(
             "POST",
             "/api/v1/profiles",
-            r#"{"display_name":"Max","accent":"red"}"#,
+            r#"{"display_name":"Max","accent":"red","seat":false}"#,
         ),
     )
     .await;

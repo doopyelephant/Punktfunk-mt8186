@@ -266,6 +266,7 @@ pub fn serve(
             if let Err(e) = profiles.ensure_owner(&state.host.hostname) {
                 tracing::warn!(error = %format!("{e:#}"), "owner profile not created");
             }
+            profiles.share_light_seats();
             profiles
         }
     };

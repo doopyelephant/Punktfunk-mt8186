@@ -155,6 +155,7 @@ pub fn run(opts: Punktfunk1Options) -> Result<()> {
     if let Err(e) = profiles.ensure_owner(&crate::host::machine_hostname()) {
         tracing::warn!(error = %format!("{e:#}"), "owner profile not created");
     }
+    profiles.share_light_seats();
     // No management API → advertise no `mgmt` port (0).
     rt.block_on(serve(opts, 0, np, Arc::new(profiles), stats, ident, None))
 }

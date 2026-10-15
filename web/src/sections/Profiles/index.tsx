@@ -2,12 +2,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "@unom/ui/toast";
 import { type FC, useEffect, useState } from "react";
 import { apiFetch } from "@/api/fetcher";
-import {
-	getGetHostSettingsQueryKey,
-	patchHostSettings,
-	useGetHostInfo,
-	useGetHostSettings,
-} from "@/api/gen/host/host";
+import { useGetHostInfo } from "@/api/gen/host/host";
 import type { DoorChange } from "@/api/gen/model/doorChange";
 import type { ProfileAdmin } from "@/api/gen/model/profileAdmin";
 import type { ProfileCreate } from "@/api/gen/model/profileCreate";
@@ -40,7 +35,6 @@ import {
 	DoorDialog,
 	ProfilesView,
 	RemoveProfileDialog,
-	type SeatHome,
 	SeatsDialog,
 } from "./view";
 
@@ -100,17 +94,6 @@ export const SectionProfiles: FC = () => {
 	}, [switching]);
 	const [seatsOpen, setSeatsOpen] = useState(false);
 	const [doctorOpen, setDoctorOpen] = useState(false);
-	const settings = useGetHostSettings({ query: { enabled: linux } });
-	const seatRow = settings.data?.settings.find(
-		(s) => s.id === "steam_seat_home",
-	);
-	// Untouched, the first Own Steam profile turns it on. A value the operator set stays.
-	const seatHome: SeatHome =
-		!seatRow || seatRow.value === true
-			? "on"
-			: seatRow.source === "default"
-				? "turns-on"
-				: "off";
 	const ownerName = profiles.data?.find((p) => p.owner)?.display_name ?? "";
 	const [adding, setAdding] = useState(false);
 	const [removing, setRemoving] = useState<ProfileAdmin | null>(null);
@@ -200,22 +183,12 @@ export const SectionProfiles: FC = () => {
 			},
 		);
 
-	const turnOnSeatHome = async () => {
-		try {
-			const next = await patchHostSettings({ steam_seat_home: true });
-			qc.setQueryData(getGetHostSettingsQueryKey(), next);
-		} catch (e) {
-			toast.error(apiErrorMessage(e) ?? m.profiles_seat_home_failed());
-		}
-	};
-
 	const onCreate = (body: ProfileCreate, file: File | null) =>
 		create.mutate(
 			{ data: body },
 			{
-				onSuccess: async (made) => {
+				onSuccess: (made) => {
 					setAdding(false);
-					if (body.seat && seatHome === "turns-on") await turnOnSeatHome();
 					if (file) upload(made.id, file);
 					else refresh();
 				},
@@ -254,7 +227,6 @@ export const SectionProfiles: FC = () => {
 			<ProfilesView
 				profiles={profiles}
 				avatarVersions={versions}
-				seatHome={seatHome}
 				seats={
 					seatHost
 						? {
@@ -298,7 +270,6 @@ export const SectionProfiles: FC = () => {
 				windows={windows}
 				seatsOn={seatsOn}
 				door={door}
-				seatHome={seatHome}
 				needsServer={
 					seating.data?.checks.some(
 						(c) => c.code === "windows_server" && c.level === "error",

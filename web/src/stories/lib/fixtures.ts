@@ -591,7 +591,8 @@ export const profilesOne: ProfileAdmin[] = [
 	},
 ];
 
-/** Every card state on Linux: the owner, a desktop sharer, and a light seat in each seat state. */
+/** A Linux box without the door: the owner, two desktop sharers, and the host keeps a Steam for
+ * one of them. */
 export const profilesEvery: ProfileAdmin[] = [
 	...profilesOne,
 	{
@@ -608,80 +609,11 @@ export const profilesEvery: ProfileAdmin[] = [
 		display_name: "Kid",
 		accent: "#f97316",
 		owner: false,
-		home: "bigpicture",
-		seat: {
-			state: "ready",
-			port: 9777,
-			steam_sign_in: false,
-			kind: "steam",
-		},
+		home: "desktop",
 		last_used_unix: accessNowUnix - 600,
 		default: false,
 		legacy_device: "ab12cd34",
-	},
-	{
-		id: "2c4e6a8b0d1f",
-		display_name: "Guest",
-		owner: false,
-		home: "bigpicture",
-		seat: { state: "ready", port: 9777, steam_sign_in: true, kind: "steam" },
-		last_used_unix: 0,
-		default: false,
-	},
-	{
-		id: "7e1f3b5d9a2c",
-		display_name: "Leon",
-		accent: "#22c55e",
-		owner: false,
-		home: "bigpicture",
-		seat: {
-			state: "occupied",
-			port: 9777,
-			occupant: "Leon's Deck",
-			kind: "steam",
-		},
-		last_used_unix: accessNowUnix - 60,
-		default: false,
-	},
-	{
-		id: "5a7c9e1b3d5f",
-		display_name: "Mia",
-		accent: "#a855f7",
-		owner: false,
-		home: "bigpicture",
-		seat: {
-			state: "starting",
-			port: 9777,
-			detail: "Starting Steam",
-			kind: "steam",
-		},
-		last_used_unix: accessNowUnix - 86_400,
-		default: false,
-	},
-	{
-		id: "3d5f7b9a1c3e",
-		display_name: "Oma",
-		accent: "#14b8a6",
-		owner: false,
-		home: "desktop",
-		seat: { state: "stopped", port: 9777, kind: "steam" },
-		last_used_unix: accessNowUnix - 7 * 86_400,
-		default: false,
-	},
-	{
-		id: "8b0d2f4a6c8e",
-		display_name: "Alice",
-		accent: "#eab308",
-		owner: false,
-		home: "desktop",
-		seat: {
-			kind: "steam",
-			state: "unavailable",
-			port: 9777,
-			detail: "This profile signs in to an account this host can't start yet.",
-		},
-		last_used_unix: 0,
-		default: false,
+		steam_home: true,
 	},
 ];
 
@@ -761,7 +693,7 @@ export const profilesWindows: ProfileAdmin[] = [
 
 /**
  * A Linux door: every profile has the owner's seat or one of its own. The owner's own seat is
- * stopped until a device connects (nobody is logged in), a desktop sharer rides on it, and two
+ * stopped until a device connects (nobody is logged in), two desktop sharers ride on it, and two
  * seats of their own are ready and in use.
  */
 export const profilesDoor: ProfileAdmin[] = [
@@ -790,8 +722,8 @@ export const profilesDoor: ProfileAdmin[] = [
 		display_name: "Kid",
 		accent: "#f97316",
 		owner: false,
-		home: "bigpicture",
-		seat: { state: "stopped", port: 9778, kind: "steam" },
+		home: "desktop",
+		seat: { state: "stopped", port: 9778, kind: "shared" },
 		last_used_unix: accessNowUnix - 600,
 		default: false,
 	},
