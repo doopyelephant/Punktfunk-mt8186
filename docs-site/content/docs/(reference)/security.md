@@ -124,6 +124,8 @@ only root can change.
   **Seats update your games** on, the default, every seat also updates and installs into your own
   Steam libraries. So a seat can change game files that you and the other seats run. Turn
   **Seats update your games** off to keep your libraries read-only to seats.
+- **Your library.** Every seat gets a read-only copy of your game library, so a game on a seat
+  can read it, commands and prep steps of your custom titles included. It can't change it.
 
 ## Plugins run code on your host
 

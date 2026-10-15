@@ -62,6 +62,18 @@ pub(super) fn read_at(
     let Some((file, meta)) = file_at(at, name, max)? else {
         return Ok(None);
     };
+    let bytes = read_opened(file, &meta, name, max)?;
+    Ok(Some((bytes, meta)))
+}
+
+/// The bytes of `file`, which [`file_at`] opened as `name`. A file that grows past `max` while it
+/// is read is refused.
+pub(super) fn read_opened(
+    file: std::fs::File,
+    meta: &std::fs::Metadata,
+    name: &str,
+    max: u64,
+) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.take(max + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
@@ -70,7 +82,7 @@ pub(super) fn read_at(
             format!("{name} grew beyond {max} bytes"),
         ));
     }
-    Ok(Some((bytes, meta)))
+    Ok(bytes)
 }
 
 /// [`read_at`] for the last component of `path`, its directory opened by path.

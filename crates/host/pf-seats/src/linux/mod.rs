@@ -10,7 +10,8 @@
 //!
 //! The owner's row is the box owner's own account, adopted. Its unit runs the owner's host in a
 //! headless `background` session, and never while the owner sits at the machine: a login of theirs
-//! on a seat ends the unit, and the owner's own user host serves the row from then on.
+//! on a seat ends the unit, and the owner's own user host serves the row from then on. That
+//! host writes the box's library: the daemon copies it for the door and every other seat.
 //!
 //! A seat's pads are the daemon's too: its host asks the pad broker in the `punktfunk-seats`
 //! binary for them ([`LinuxBackend::running_account`] is its gate), and [`fence`] gives udev the
@@ -91,6 +92,10 @@ struct Inner {
     steam_source: Option<PathBuf>,
     /// Seats whose unit is up.
     running: Mutex<HashMap<SeatId, Tracked>>,
+    /// The box owner's home, once their row is known: where the box's library comes from.
+    owner_home: Mutex<Option<PathBuf>>,
+    /// The `punktfunk` group's gid, once looked up: the door reads the box's library through it.
+    door_gid: OnceLock<u32>,
     /// A seat stopped since the ACL mask was last repaired.
     acl_dirty: AtomicBool,
     /// What the binary runs beside a seat's unit ([`LinuxBackend::on_unit`]).
@@ -196,6 +201,33 @@ fn user_host(account: &str, verb: &str) {
     }
 }
 
+/// The door's group, which reads the box's library. `None` while there is no `punktfunk` group.
+fn door_reader(inner: &Inner) -> Option<shared::Reader> {
+    let gid = match inner.door_gid.get() {
+        Some(gid) => *gid,
+        None => {
+            let gid = accounts::group_gid("punktfunk").ok().flatten()?;
+            *inner.door_gid.get_or_init(|| gid)
+        }
+    };
+    Some(shared::Reader::group(gid))
+}
+
+/// Brings the box's library level with the owner's, once the owner's row is known. Returns
+/// whether anything changed.
+fn refresh_box_library(inner: &Inner) -> Result<bool, BackendError> {
+    let home = inner
+        .owner_home
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(home) = home else { return Ok(false) };
+    match door_reader(inner) {
+        Some(reader) => shared::refresh_box_library(&home, &inner.state, reader),
+        None => Ok(false),
+    }
+}
+
 /// Whether the owner has a session at the machine. A `loginctl` that doesn't answer reads as no.
 fn owner_at_desk(account: &str) -> bool {
     let own = logind::own_session(account);
@@ -221,6 +253,8 @@ impl LinuxBackend {
             state,
             steam_source,
             running: Mutex::new(HashMap::new()),
+            owner_home: Mutex::new(None),
+            door_gid: OnceLock::new(),
             acl_dirty: AtomicBool::new(false),
             hook: OnceLock::new(),
         });
@@ -287,11 +321,19 @@ impl LinuxBackend {
 
     /// The owner's account and what its host reads, in place: the trust copy, and, unless a host
     /// already runs on the environment file there, a fresh token and the file itself. A host that
-    /// is up keeps the token it started with, so the file it read stays as it is. `true` when the
-    /// environment file is new.
+    /// is up keeps the token it started with, so the file it read stays as it is. The box's
+    /// library follows their home from here on. `true` when the environment file is new.
     fn prepare_owner(&self, seat: &Seat, passwd: &accounts::Passwd) -> Result<bool, BackendError> {
         let reader = Tracked::of(seat, passwd).reader;
         shared::refresh_trust(&self.inner.box_dir, &self.inner.state, &seat.id, reader)?;
+        *self
+            .inner
+            .owner_home
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(passwd.home.clone());
+        if let Err(error) = refresh_box_library(&self.inner) {
+            tracing::warn!(account = %seat.account, %error, "box library not copied");
+        }
         if session::env_path(&seat.account).exists() {
             return Ok(false);
         }
@@ -536,6 +578,7 @@ impl PlatformBackend for LinuxBackend {
         shared::ensure_seat_dirs(state, &seat.id, &passwd)?;
         let reader = shared::Reader::group(passwd.gid);
         shared::refresh_trust(box_dir, state, &seat.id, reader)?;
+        shared::refresh_seat_library(state, &seat.id, reader)?;
         let unit = session::unit(&seat.account);
         unit_hook(&self.inner, &seat.account, Some(passwd.uid));
         // A unit already up keeps its token: the host read it when it started.
@@ -574,9 +617,19 @@ impl PlatformBackend for LinuxBackend {
         Ok(RuntimeStatus::stopped())
     }
 
+    /// The owner's row takes the box's library with it: it was the door's, and the door goes too.
     fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
         self.stop_unit(seat)?;
         self.untrack(&seat.id);
+        if seat.owner {
+            *self
+                .inner
+                .owner_home
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = None;
+            shared::remove_box_library(&self.inner.state)
+                .map_err(|e| err("box_library", format!("remove the box library: {e}")))?;
+        }
         self.remove_files(seat)
     }
 
@@ -754,16 +807,27 @@ impl LinuxBackend {
     }
 }
 
-/// While a seat runs: refreshes its trust copy when the box's files change, ends the owner's
+/// While a seat runs: refreshes its trust copy when the box's files change and, for a seat other
+/// than the owner's, the box's library, which follows the owner's own first. Ends the owner's
 /// headless session when the owner sits down at the machine, and repairs the games folder's ACL
 /// mask after a seat stops and every [`ACL_EVERY`]. The owner's row stays listed while its host
 /// is the owner's own, which reads the same copy. Ends when the backend is dropped.
 fn keep_level(inner: Weak<Inner>) {
     let mut acl_at = Instant::now();
     let mut failing: HashSet<SeatId> = HashSet::new();
+    let mut library_failing = false;
     loop {
         std::thread::sleep(TRUST_TICK);
         let Some(inner) = inner.upgrade() else { return };
+        // Logged once per outage, like a trust copy below.
+        match refresh_box_library(&inner) {
+            Ok(_) => library_failing = false,
+            Err(error) if !library_failing => {
+                library_failing = true;
+                tracing::warn!(%error, "box library not copied");
+            }
+            Err(_) => {}
+        }
         let seats: Vec<(SeatId, Tracked)> = inner
             .running
             .lock()
@@ -772,7 +836,12 @@ fn keep_level(inner: Weak<Inner>) {
             .map(|(id, tracked)| (id.clone(), tracked.clone()))
             .collect();
         for (id, tracked) in &seats {
-            match shared::refresh_trust(&inner.box_dir, &inner.state, id, tracked.reader) {
+            let refreshed = shared::refresh_trust(&inner.box_dir, &inner.state, id, tracked.reader)
+                .and_then(|_| match tracked.owner {
+                    Some(_) => Ok(false),
+                    None => shared::refresh_seat_library(&inner.state, id, tracked.reader),
+                });
+            match refreshed {
                 Ok(_) => {
                     failing.remove(id);
                 }

@@ -17,6 +17,8 @@ Type=simple
 User=punktfunk
 Group=punktfunk
 Environment=PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk
+# The box's library: the seat supervisor's copy of the owner's, which every client reads here.
+Environment=PUNKTFUNK_LIBRARY_DIR=/var/lib/punktfunk-seats/library
 ExecStart=/usr/bin/punktfunk-host serve --door
 Restart=always
 RestartSec=2

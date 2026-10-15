@@ -103,7 +103,7 @@ them together. The host logs a warning at startup for each one that is set and i
 | `PUNKTFUNK_SEAT_DISPLAY_SLOT` | `12`–`15` | The seat's connector. Not a number, out of range, or the marker absent: the host refuses every virtual-display session. |
 | `PUNKTFUNK_TRUST_DIR` | the box's config directory | The seat reads the box's pairing store, `profiles.json`, per-device display overlays and `seat-defaults.json` from here, read only, and follows their changes. A relative path is ignored. |
 | `PUNKTFUNK_PAIRING` | `refused` | Devices pair with the box. A knock is refused and no PIN window opens. A seat host refuses pairing with or without it. |
-| `PUNKTFUNK_LIBRARY_DIR` | the box's config directory (Windows only) | The seat reads the box's library from here, read only: `library*.json`, `library-metadata/` and the plugin manifests and grants its entries launch through. Play stats stay in the seat's own directory. A relative path is ignored. |
+| `PUNKTFUNK_LIBRARY_DIR` | Windows: the box's config directory. Linux: the seat's trust copy, on every seat but the owner's | The seat reads the box's library from here, read only: `library*.json`, `library-metadata/` and, on Windows, the plugin manifests and grants its entries launch through. Play stats stay in the seat's own directory. A relative path is ignored. |
 | `PUNKTFUNK_SEAT_STEAM` | the seat's own `steam.exe` (Windows only, when the box has Steam) | Steam runs once per IPC name per machine, so a seat starts Steam from here only, always with `-master_ipc_name_override pfseat<seat id>`. The supervisor copies the box's client into the seat account's profile at the seat's first start; until the file exists, the seat's Steam titles don't start. Unset or relative: no Steam on the seat. |
 
 It also sets these ordinary [host settings](/docs/configuration), so seats don't collide. A seat
@@ -150,6 +150,10 @@ session by design, and display activation fails while its session is inactive.
 - **The box's library, on Windows.** A Windows seat runs no plugins. It lists and launches the
   box's titles as its own user, and answers every library change with 409. Titles from sources
   that belong to one account (Playnite, Game Bar, Amazon, itch, Hydra) are left out.
+- **The box's library, on Linux.** The box's library is the owner's (see the owner's libraries
+  below). A seat other than the owner's lists and launches only its titles that start through
+  Steam, `steam_appid` with an id that fits 32 bits and `steam_ui`, with its own Steam, and
+  answers every library change with 409. Every other title starts from the owner's home.
 - **One profile.** The seat serves the profile whose seat it is. A connect that names another seat
   profile is refused as an unknown profile; one that names none plays as this seat's profile.
 - **One connector, one lock.** A seat host creates its virtual display on its own connector only
@@ -286,7 +290,15 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   `punktfunk1-paired.json`, `profiles.json`, `display-settings.json`, `seat-defaults.json` and
   `profiles/`,
   `root:<seat user>` `0640`. The daemon recopies a file within 2 seconds of its change while the
-  seat runs. The box's key never crosses, and a copy left by an older install is removed.
+  seat runs. The box's key never crosses, and a copy left by an older install is removed. A seat
+  other than the owner's also finds the box's library there, its `PUNKTFUNK_LIBRARY_DIR`.
+- **The box's library.** The owner's host writes the library; its plugins scan the owner's home.
+  From the owner's `~/.config/punktfunk` the daemon copies `library.json`,
+  `library-hidden.json`, `library-metadata.json`, `library-picks.json`, `library-scanners.json`
+  and `library-metadata/` to `library/`, `root:punktfunk` `0640`, within 2 seconds of a change,
+  and from there into each seat's trust copy. Play stats stay with each host. A config folder
+  it can't open, as in a home not mounted yet, leaves the copy as it was. Deleting the owner's
+  row deletes `library/`.
 - **Games.** `games/steamapps/` is one library every seat writes (group `punktfunk-games`, setgid,
   default ACL). Each seat's own `compatdata`, `shadercache` and `downloading` under `seats/<id>/`
   are bind-mounted over the shared ones, so prefixes never cross. Everything that needs the
@@ -414,6 +426,12 @@ audio device. A connect is answered with a `Redirect` to a seat, or refused with
 started with `PUNKTFUNK_SEAT_SESSION=1` is a seat host and never the door, however the door is
 asked for.
 
+Every client reads its library from the door, which has `PUNKTFUNK_LIBRARY_DIR` set to the box's
+library, `/var/lib/punktfunk-seats/library`: all of it, for every profile, read only. A cover
+there names a file in the owner's home, which the door can't read, so it asks the owner's host
+for it over that host's loopback API. While that host is down the cover answers 404; asking for
+one never starts the owner's session.
+
 The box owner is a seat like any other. `adopt-owner <user>` adds a ledger row for an ordinary
 account that exists (uid 1000 up, never a seat's), and only for the one `door-helper on` recorded
 in `/var/lib/punktfunk-seats/owner`. Any other account, or any while nothing is recorded, answers
@@ -425,7 +443,7 @@ and the profiles that share the owner's desktop on it.
 |---|---|
 | `PUNKTFUNK_SEAT_OWNER` | `1`: the seat host is the owner's own, and also serves the owner and the profiles that share the owner's desktop. |
 | `PUNKTFUNK_SEAT_HEADLESS` | `1`, set by the runner, not the file: the host runs in the row's headless session, not at the desk. |
-| `PUNKTFUNK_CONFIG_DIR`, `PUNKTFUNK_HOST_NAME`, `PUNKTFUNK_GAMESTREAM` | Not set: the owner keeps `~/.config/punktfunk` and their own settings. |
+| `PUNKTFUNK_CONFIG_DIR`, `PUNKTFUNK_LIBRARY_DIR`, `PUNKTFUNK_HOST_NAME`, `PUNKTFUNK_GAMESTREAM` | Not set: the owner keeps `~/.config/punktfunk`, the library their plugins write, and their own settings. |
 
 Every row sets `PUNKTFUNK_MDNS=0`, since only the door advertises. The row's environment file is
 `/run/punktfunk/seats/<user>.env`, owned by the owner, and the owner's user `punktfunk-host` reads

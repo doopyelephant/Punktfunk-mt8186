@@ -260,10 +260,11 @@ pub fn trust_dir() -> Option<std::path::PathBuf> {
         .filter(|dir| dir.is_absolute())
 }
 
-/// The box's config dir a Windows seat host reads the library from (`PUNKTFUNK_LIBRARY_DIR`):
-/// `library*.json`, `library-metadata/`, and the plugin manifests and grants an `exec` entry
-/// resolves against. Read only; the box host is their one writer. `None` on every other host,
-/// and for a relative path.
+/// Where a host reads the box's library from (`PUNKTFUNK_LIBRARY_DIR`): `library*.json`,
+/// `library-metadata/`, and on Windows the plugin manifests and grants an `exec` entry resolves
+/// against. A Windows seat names the box's config dir; on Linux the door and every seat but the
+/// owner's name the supervisor's copy of the owner's library. Read only; the box's host, or the
+/// owner's, is their one writer. `None` on every other host, and for a relative path.
 pub fn box_library_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("PUNKTFUNK_LIBRARY_DIR")
         .map(std::path::PathBuf::from)
