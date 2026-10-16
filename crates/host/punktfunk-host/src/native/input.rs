@@ -83,6 +83,10 @@ use backends::PadBackends;
 /// How long a declared Steam Controller waits for its identity ([`Pads::waits_for_identity`]).
 const IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long an undeclared pad waits for its kind ([`Pads::waits_for_arrival`]). A client
+/// re-sends a lost arrival twice, 100 ms apart.
+const ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The kinds whose virtual pad answers as the physical one a client captured: both Steam
 /// Controllers.
 fn takes_identity(kind: GamepadPref) -> bool {
@@ -128,6 +132,8 @@ struct Pads {
     identities: [Option<std::sync::Arc<crate::inject::triton_proto::Sc2Identity>>; MAX_WIRE_PADS],
     /// When each pad declared a kind that [`takes_identity`] ([`Pads::waits_for_identity`]).
     identity_since: [Option<std::time::Instant>; MAX_WIRE_PADS],
+    /// When each pad's first frame came with no kind declared ([`Pads::waits_for_arrival`]).
+    undeclared_since: [Option<std::time::Instant>; MAX_WIRE_PADS],
     /// Manager that holds a built device at this index (`None` = none). Stays put
     /// if `kinds[idx]` later changes (arrival-after-first-frame), so a pad is
     /// never duplicated and removal always hits the manager that owns it.
@@ -157,6 +163,7 @@ impl Pads {
             declared: [None; MAX_WIRE_PADS],
             identities: Default::default(),
             identity_since: [None; MAX_WIRE_PADS],
+            undeclared_since: [None; MAX_WIRE_PADS],
             owner: [None; MAX_WIRE_PADS],
             xbox360: None,
             backends: {
@@ -227,6 +234,17 @@ impl Pads {
             && self.identity_since[idx].is_some_and(|t| t.elapsed() < IDENTITY_WAIT)
     }
 
+    /// A built pad never changes kind, so a frame that beats a lost arrival would pin the
+    /// session default for good. An undeclared pad waits up to [`ARRIVAL_WAIT`] from its first
+    /// frame for the re-sent arrival; a client that declares nothing gets the default after.
+    fn waits_for_arrival(&mut self, idx: usize) -> bool {
+        if self.owner[idx].is_some() || self.declared[idx].is_some() {
+            return false;
+        }
+        let since = *self.undeclared_since[idx].get_or_insert_with(std::time::Instant::now);
+        since.elapsed() < ARRIVAL_WAIT
+    }
+
     /// This pad as the Controllers feed reports it: the device the host built, the
     /// kind the client asked for, and the state this thread just applied.
     fn feed_frame(&self, idx: usize, wire: &WirePads) -> crate::pad_feed::PadFrame {
@@ -264,7 +282,9 @@ impl Pads {
             }
             GamepadEvent::Arrival { index, .. } => (*index as usize, true),
         };
-        if idx >= MAX_WIRE_PADS || present && self.waits_for_identity(idx) {
+        if idx >= MAX_WIRE_PADS
+            || present && (self.waits_for_arrival(idx) || self.waits_for_identity(idx))
+        {
             return;
         }
         // The only wire→OS slot translation. Claim on present; a removal must not
@@ -1490,6 +1510,20 @@ mod tests {
         pads.kinds[3] = GamepadPref::SteamController2;
         pads.identity_since[3] = Some(std::time::Instant::now() - IDENTITY_WAIT);
         assert!(!pads.waits_for_identity(3), "the wait ends");
+    }
+
+    /// A frame that beats its pad's arrival does not build the session default: the pad waits
+    /// for its kind, and one that never declares is built once the wait ends.
+    #[test]
+    fn an_undeclared_pad_waits_for_its_arrival() {
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
+        assert!(pads.waits_for_arrival(0));
+        pads.set_kind(0, GamepadPref::SteamController2Puck);
+        assert!(!pads.waits_for_arrival(0), "the kind landed");
+        pads.undeclared_since[1] = Some(std::time::Instant::now() - ARRIVAL_WAIT);
+        assert!(!pads.waits_for_arrival(1), "the wait ends");
+        pads.owner[2] = Some(GamepadPref::Xbox360);
+        assert!(!pads.waits_for_arrival(2), "a built pad never waits");
     }
 
     /// The console and the client are told which players this session is, once per
