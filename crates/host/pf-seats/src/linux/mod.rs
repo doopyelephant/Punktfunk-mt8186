@@ -521,6 +521,14 @@ impl LinuxBackend {
         Ok(())
     }
 
+    /// Runs the prerequisite checks now and keeps them for `Seating` to reuse.
+    fn recheck(&self) -> Vec<Diagnostic> {
+        let mut slot = self.inner.checks.lock().unwrap_or_else(|e| e.into_inner());
+        let checks = self.prerequisites();
+        *slot = Some((Instant::now(), checks.clone()));
+        checks
+    }
+
     fn prerequisites(&self) -> Vec<Diagnostic> {
         let mut out = Vec::new();
         let mut check = |ok: bool, code: &str, good: &str, bad: &str| {
@@ -784,7 +792,7 @@ impl PlatformBackend for LinuxBackend {
     }
 
     fn doctor(&self, ledger: &Ledger) -> Result<Vec<Diagnostic>, BackendError> {
-        let mut out = self.prerequisites();
+        let mut out = self.recheck();
         out.extend(fence::diagnostics());
         for seat in &ledger.seats {
             let found = accounts::lookup(&seat.account)?;
@@ -835,7 +843,7 @@ impl PlatformBackend for LinuxBackend {
     }
 
     /// The checks are the last ones run within [`CHECKS_FRESH`]: the door asks every 2 s and
-    /// reads `enabled`, which is constant. Doctor runs them afresh.
+    /// reads `enabled`, which is constant. Doctor and Enable run them afresh.
     fn seating(&self) -> Result<SeatingStatus, BackendError> {
         let mut slot = self.inner.checks.lock().unwrap_or_else(|e| e.into_inner());
         let checks = cached(&mut slot, Instant::now(), || self.prerequisites());
@@ -852,7 +860,11 @@ impl PlatformBackend for LinuxBackend {
         _allow_rdp_from_network: bool,
         _prepared: Vec<Diagnostic>,
     ) -> Result<SeatingStatus, BackendError> {
-        self.seating()
+        Ok(SeatingStatus {
+            enabled: true,
+            checks: self.recheck(),
+            allow_rdp_from_network: false,
+        })
     }
 
     fn disable(&self, _keep_accounts: bool) -> Result<SeatingStatus, BackendError> {
