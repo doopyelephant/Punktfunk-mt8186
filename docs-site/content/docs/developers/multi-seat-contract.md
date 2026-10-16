@@ -64,7 +64,8 @@ never a paired device or a plugin.
 A failed check changes nothing: the answer is 200 with `enabled: false` and the check as an
 `error`. When every check passes, turning on:
 
-1. Writes the reservation marker.
+1. Writes the reservation marker with an `Enabling` value, which step 5 removes. A key that
+   still holds it, after a crash, reads as seats off; turning on again finishes it.
 2. Installs `pf_vdisplay_seats.inf` from `staging\pfvdisplay\` beside `punktfunk-host.exe`.
 3. Turns the Remote Desktop listener on if it was off, and limits the **Remote Desktop**
    firewall rules to `127.0.0.0/8` unless `allow_rdp_from_network` is `true`, with the two

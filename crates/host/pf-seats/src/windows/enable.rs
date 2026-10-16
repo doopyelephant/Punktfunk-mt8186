@@ -9,14 +9,14 @@
 //! seats go off.
 
 use super::util::{backend_error, WinResult};
-use super::{keeper, seats_enabled, server_edition, session_wrapper, SEATS_KEY};
+use super::{keeper, seats_enabled, server_edition, session_wrapper, ENABLING, SEATS_KEY};
 use crate::backend::BackendError;
 use crate::ipc::Diagnostic;
 use pf_paths::POWERSHELL;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY};
+use winreg::enums::{RegDisposition, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY};
 use winreg::RegKey;
 
 /// The role's state while it is installed and waits on a restart, as [`PROBE`] names it.
@@ -198,8 +198,8 @@ pub(super) fn prepare() -> Vec<Diagnostic> {
     rows
 }
 
-/// Turn seats on. A failure after the Seats key exists on a machine that had none puts the
-/// machine back, so `enabled` never reports a half-done switch.
+/// Turn seats on. A failure where seats were off puts the machine back, and a crash leaves the
+/// Seats key marked [`ENABLING`], so `enabled` never reports a half-done switch.
 pub(super) fn turn_on(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
     let fresh = !seats_enabled();
     let done = apply(host_path, allow_rdp_from_network);
@@ -389,9 +389,15 @@ fn apply(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
             dir.display(),
         ));
     }
-    let (seats, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
+    let (seats, disposition) = RegKey::predef(HKEY_LOCAL_MACHINE)
         .create_subkey_with_flags(SEATS_KEY, KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY)
         .map_err(|cause| refuse("seats_key", "Couldn't turn seats on.", cause))?;
+    // A new key reads as off until the last step; a finished one stays on while it is redone.
+    if disposition == RegDisposition::REG_CREATED_NEW_KEY {
+        seats
+            .set_value(ENABLING, &1_u32)
+            .map_err(|cause| refuse("seats_key", "Couldn't turn seats on.", cause))?;
+    }
     install_driver(&dir, true)?;
     allow_listener(&seats)?;
     // A choice made earlier narrowed the rules; allowing the network now widens them again.
@@ -421,7 +427,13 @@ fn apply(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
     if let Err(cause) = super::seat_listener::ensure(host_path) {
         tracing::warn!(%cause, "seat listener not ready — seats start without pad audio");
     }
-    trust_rdp_certificate(host_path)
+    trust_rdp_certificate(host_path)?;
+    match seats.delete_value(ENABLING) {
+        Err(cause) if cause.kind() != std::io::ErrorKind::NotFound => {
+            Err(refuse("seats_key", "Couldn't turn seats on.", cause))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// `{app}\staging\pfvdisplay`: the packages setup leaves beside the host for the console.

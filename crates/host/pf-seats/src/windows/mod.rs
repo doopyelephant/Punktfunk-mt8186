@@ -5,8 +5,9 @@
 //! owns only per-instance state. It opens one hardened secret root, takes the
 //! host executable from its caller, and delegates each portable command. The
 //! `HKLM\SOFTWARE\Punktfunk\Seats` key is the switch, which `enable` writes
-//! and removes: without it no seat starts. Doctor reports prerequisite and ownership evidence but never infers
-//! HDR or IDD health from static configuration.
+//! and removes: without it no seat starts, and a turn-on that did not finish leaves
+//! it marked `Enabling`, which reads as off. Doctor reports prerequisite and ownership evidence
+//! but never infers HDR or IDD health from static configuration.
 
 mod accounts;
 mod credentials;
@@ -44,8 +45,12 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY};
 use winreg::RegKey;
 
-/// Whose existence turns seats on and reserves display slots 12 through 15.
+/// Whose existence reserves display slots 12 through 15, and turns seats on unless it holds
+/// [`ENABLING`].
 const SEATS_KEY: &str = r"SOFTWARE\Punktfunk\Seats";
+/// A value of the Seats key while a turn-on is unfinished. A key without it is a complete one,
+/// which older builds left too.
+const ENABLING: &str = "Enabling";
 
 #[derive(Clone)]
 pub struct WindowsBackend {
@@ -55,11 +60,12 @@ pub struct WindowsBackend {
     supervisor: Supervisor,
 }
 
-/// Whether the seats key exists, read through the 64-bit registry view.
+/// Whether seats are on: the Seats key exists and no turn-on is unfinished, read through the
+/// 64-bit registry view.
 pub fn seats_enabled() -> bool {
     RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(SEATS_KEY, KEY_QUERY_VALUE | KEY_WOW64_64KEY)
-        .is_ok()
+        .is_ok_and(|seats| seats.get_value::<u32, _>(ENABLING).is_err())
 }
 
 /// Turn seats off without the supervisor, for the uninstaller once the service is gone: Remote
@@ -154,7 +160,7 @@ impl WindowsBackend {
         if !seats_enabled() {
             return Err(backend_error(
                 "seats_off",
-                r"HKLM\SOFTWARE\Punktfunk\Seats is missing; seats are off on this host",
+                r"HKLM\SOFTWARE\Punktfunk\Seats is missing or unfinished; seats are off on this host",
             ));
         }
         if !termservice_running()? {
