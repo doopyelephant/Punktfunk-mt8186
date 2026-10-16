@@ -18,8 +18,18 @@ import {
 	useDecidePluginAccess,
 	useGetPluginAccess,
 } from "@/api/gen/plugin-access/plugin-access";
+import { usePlugins } from "@/api/plugins";
 import { PasswordConfirmDialog } from "@/components/password-confirm";
 import { Button } from "@/components/ui/button";
+import {
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+} from "@/components/ui/dialog";
+import { isStringArray, useLocalPref } from "@/lib/prefs";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages";
 
@@ -88,7 +98,90 @@ export const usePluginAccess = () => {
 			onClose={() => setAllowing(null)}
 		/>
 	);
-	return { access, busy: decide.isPending, onDecide, dialog };
+	return {
+		access,
+		busy: decide.isPending,
+		asking: allowing !== null,
+		onDecide,
+		dialog,
+	};
+};
+
+/** Folders this browser put off with Later, as `plugin\npath`. */
+const NONE: string[] = [];
+const laterKey = (plugin: string, path: string) => `${plugin}\n${path}`;
+
+/** The first plugin with a request this browser hasn't put off. */
+export const nextAsk = (
+	rows: PluginAccessSnapshot[],
+	later: string[],
+): PluginAccessSnapshot | undefined =>
+	rows.find((row) =>
+		row.pending.some((p) => !later.includes(laterKey(row.plugin, p.path))),
+	);
+
+/** `later` with every request of `ask` added and any no longer pending dropped. */
+export const putOff = (
+	rows: PluginAccessSnapshot[],
+	later: string[],
+	ask: PluginAccessSnapshot,
+): string[] => {
+	const pending = new Set(
+		rows.flatMap((row) => row.pending.map((p) => laterKey(row.plugin, p.path))),
+	);
+	const put = ask.pending.map((p) => laterKey(ask.plugin, p.path));
+	return [...new Set([...later.filter((k) => pending.has(k)), ...put])];
+};
+
+/**
+ * Asks on any page as soon as a plugin requests a folder, so a new source's games show up
+ * without a visit to its source line. Later keeps the request there and stops this browser
+ * asking about those folders again.
+ */
+export const AccessPrompt: FC = () => {
+	const { access, busy, asking, onDecide, dialog } = usePluginAccess();
+	const plugins = usePlugins();
+	const [later, setLater] = useLocalPref(
+		"pf-access-later",
+		NONE,
+		isStringArray,
+	);
+	const rows = access.data ?? [];
+	const ask = nextAsk(rows, later);
+	const postpone = () => ask && setLater(putOff(rows, later, ask));
+	const name =
+		plugins.data?.find((p) => p.id === ask?.plugin)?.title ?? ask?.plugin;
+	return (
+		<>
+			<Dialog open={!!ask && !asking} onOpenChange={(o) => !o && postpone()}>
+				<DialogContent>
+					<DialogHeader>
+						<DialogTitle>
+							{m.plugin_access_prompt_title({ plugin: name ?? "" })}
+						</DialogTitle>
+						<DialogDescription>
+							{m.plugin_access_prompt_body()}
+						</DialogDescription>
+					</DialogHeader>
+					{ask && (
+						<PendingAccess
+							access={ask}
+							busy={busy}
+							onDecide={(paths, decision) =>
+								onDecide(ask.plugin, paths, decision)
+							}
+						/>
+					)}
+					<DialogFooter>
+						<Button variant="outline" onClick={postpone}>
+							{m.plugin_access_later()}
+						</Button>
+					</DialogFooter>
+				</DialogContent>
+			</Dialog>
+			{dialog}
+		</>
+	);
 };
 
 const Mode: FC<{ write: boolean }> = ({ write }) => (

@@ -18,6 +18,7 @@ import { DialogsProvider } from "@/components/dialogs";
 import { currentAppearance } from "@/lib/appearanceRequest";
 import { DensitySwitch, useDensity } from "@/lib/density";
 import { adoptStoredLocale, useLocale } from "@/lib/i18n";
+import { AccessPrompt } from "@/sections/PluginAccess";
 import appCss from "@/styles.css?url";
 
 export interface RouterContext {
@@ -131,6 +132,7 @@ function RootComponent() {
 						) : (
 							<AppShell>
 								<Outlet />
+								<AccessPrompt />
 							</AppShell>
 						)}
 					</DialogsProvider>
