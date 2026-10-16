@@ -160,8 +160,9 @@ start_kwin() {
     local log="$XDG_RUNTIME_DIR/punktfunk-kwin.log"
     : >"$log"
     chmod 600 "$log"
+    # kwin hands the apps it starts its public X display; their output lands in the log.
     kwin_wayland --virtual --xwayland --width "$W" --height "$H" --no-lockscreen \
-        --socket "$WAYLAND_DISPLAY" >"$log" 2>&1 &
+        --socket "$WAYLAND_DISPLAY" "printenv DISPLAY" >"$log" 2>&1 &
     KWIN_PID=$!
 
     # Ready means kwin offers the screencast global, not that the socket file exists.
@@ -179,18 +180,16 @@ start_kwin() {
         sleep 0.5
     done
 
-    # Several seats share /tmp/.X11-unix, so never take the first socket: use the display kwin
-    # logged (kwin before 6.7), else the newest X socket this seat user owns.
+    # Never guess from /tmp/.X11-unix: seats share it, and kwin 6.8 adds its own init display
+    # there, on which an X client waits forever.
     local n=""
     for _ in $(seq 1 40); do
-        n=$(grep -oE 'Using public X11 display :[0-9]+' "$log" | grep -oE '[0-9]+' | head -1 || true)
-        [[ -z "$n" ]] && n=$(find /tmp/.X11-unix -maxdepth 1 -name 'X[0-9]*' -user "$(id -u)" \
-            -printf '%T@ %f\n' 2>/dev/null | sort -rn | head -1 | sed 's/.* X//')
+        n=$(grep -m1 -xE ':[0-9]+' "$log")
         [[ -n "$n" ]] && break
         sleep 0.25
     done
     if [[ -n "$n" ]]; then
-        export DISPLAY=":$n"
+        export DISPLAY="$n"
     else
         echo "seat-session: kwin reported no X display; X11 apps such as Steam won't open" >&2
     fi
