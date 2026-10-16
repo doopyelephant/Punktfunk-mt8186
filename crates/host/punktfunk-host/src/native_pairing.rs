@@ -157,8 +157,9 @@ impl NativePairing {
         let store = store::TrustStore::open(store_path)?;
         let np = NativePairing::with_store(store, fixed_pin, arm_at_start);
         // A host with no seats answers `Some(false)`, and a seat host's read-only store never
-        // sweeps. The door, and a Windows host with seats on, ask the seat hosts.
-        np.drop_session_only_records(crate::seats::plays_on_a_seat);
+        // sweeps. The door, and a Windows host with seats on, ask the seat hosts for 10 s at most.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        np.drop_session_only_records(|fp| crate::seats::plays_on_a_seat_by(fp, deadline));
         Ok(np)
     }
 

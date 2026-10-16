@@ -265,6 +265,22 @@ pub(crate) fn plays_on_a_seat(fp_hex: &str) -> Option<bool> {
     any_on_a_seat(|o| crate::session_status::is_client(&o.client, fp_hex))
 }
 
+/// [`plays_on_a_seat`], `None` once `deadline` has passed. A supervisor that accepts and never
+/// answers would hold a caller for minutes, and the startup sweep is one.
+pub(crate) fn plays_on_a_seat_by(fp_hex: &str, deadline: Instant) -> Option<bool> {
+    if !in_play() {
+        return Some(false);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let fp = fp_hex.to_owned();
+    std::thread::spawn(move || {
+        let _ = tx.send(plays_on_a_seat(&fp));
+    });
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+        .flatten()
+}
+
 /// Ends every session on every running seat, ahead of a power action that takes the box down:
 /// a seat host doesn't hear the door's own. Blocking, as [`snapshot`].
 pub(crate) fn end_all_sessions() {
