@@ -1983,6 +1983,11 @@ public final class Stage2Pipeline {
         Thread {
             defer { pumpStopped.signal() } // let stop() join the pump (bounded) before decoder.reset()
             var intake = AUIntake(connection: connection)
+            // The core assembles each AU in a pool slot, and the sample is that slot.
+            var pool = AccessUnitSlotPool(capacity: AccessUnitSlotPool.defaultCapacity)
+            decoder.accessUnitMemory = pool
+            connection.setAccessUnitMemory(pool)
+            defer { connection.setAccessUnitMemory(nil) }
             // Hardware-only backstop (4:4:4, AV1): 3 s in which every decode fails means this device
             // can't decode the mode at all, e.g. past a resolution ceiling. End instead of looping on
             // black. Timed, not counted: after a failure only IDRs reach the decoder.
@@ -2007,6 +2012,9 @@ public final class Stage2Pipeline {
                         // too, comes back kVTVideoDecoderBadDataErr. Withheld, the anchor decodes.
                         if ready.step.withhold { return true }
                         guard let f = intake.pump.format, !token.isStopped else { return true }
+                        pool = AccessUnitSlotPool.grown(
+                            for: au, keyframe: ready.idr, from: pool, connection: connection)
+                        decoder.accessUnitMemory = pool
                         if decoder.decode(au: au, format: f) {
                             failingSinceNs = nil
                         } else {

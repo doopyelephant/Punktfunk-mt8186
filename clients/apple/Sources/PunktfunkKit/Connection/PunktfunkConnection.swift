@@ -32,7 +32,8 @@ private let statusClosed: Int32 = PUNKTFUNK_STATUS_CLOSED.rawValue
 
 /// One reassembled, FEC-recovered, decrypted access unit (Annex-B HEVC from the host).
 public struct AccessUnit: Sendable {
-    /// The AU's bytes; empty when `inPlace` says where they lie instead.
+    /// The AU's bytes: a copy, or with `inPlace` a view of the lender's slot that holds until
+    /// the next pull.
     public let data: Data
     /// Where the AU lies in memory the embedder lent (`setAccessUnitMemory`): the lender's
     /// token for the slot and the byte offset from the lender's base. The decoder reads it
@@ -1595,12 +1596,15 @@ public final class PunktfunkConnection: @unchecked Sendable {
         } decode: {
             guard let base = frame.data, frame.len > 0 else { return nil }
             let count = Int(frame.len)
-            // In lent memory the AU stays where it is; anything else is copied out, as the
-            // pointer is only valid until the next call.
+            // In lent memory the AU stays where it is and `data` views it: the view holds until
+            // the next pull, and a sample made over the slot holds the slot past that. Anything
+            // else is copied out, as the pointer is only valid until the next call.
             let inPlace = accessUnitMemory?.locate(UnsafeRawPointer(base)).map {
                 AccessUnit.InPlace(token: $0.token, offset: $0.offset, count: count)
             }
-            let data = inPlace == nil ? Data(bytes: base, count: count) : Data()
+            let data = inPlace == nil
+                ? Data(bytes: base, count: count)
+                : Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base), count: count, deallocator: .none)
             let pulledNs = realtimeNowNs()
             // Receipt = the core's reassembly-completion stamp (ABI v9); the pull instant is
             // kept separately so the client-queue wait is its own measured term. 0 would mean a

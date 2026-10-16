@@ -44,6 +44,10 @@ final class StreamPump {
 
         let thread = Thread {
             var intake = AUIntake(connection: connection)
+            // The core assembles each AU in a pool slot, and the sample is that slot.
+            var pool = AccessUnitSlotPool(capacity: AccessUnitSlotPool.defaultCapacity)
+            connection.setAccessUnitMemory(pool)
+            defer { connection.setAccessUnitMemory(nil) }
             var wasFailed = false
             // Every iteration drains its own autorelease pool: this thread has no runloop, so
             // autoreleased CM/layer temporaries would otherwise accumulate until session end.
@@ -71,8 +75,10 @@ final class StreamPump {
                     // A delta between a loss and its re-anchor references the lost picture; one
                     // such AU wedges the layer's decoder until an IDR. Withheld, the anchor lands.
                     if ready.step.withhold { return true }
+                    pool = AccessUnitSlotPool.grown(
+                        for: au, keyframe: ready.idr, from: pool, connection: connection)
                     guard let f = intake.pump.format,
-                          let sample = connection.videoCodec.sampleBuffer(au: au, format: f),
+                          let sample = connection.videoCodec.sampleBuffer(au: au, format: f, in: pool),
                           !token.isStopped // don't enqueue a stale frame after a restart
                     else { return true }
                     // Stage-1 has no decode callback, so the core's freeze is folded at ENQUEUE from
