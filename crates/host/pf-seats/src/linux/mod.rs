@@ -189,7 +189,8 @@ fn stop_unit(inner: &Inner, id: &SeatId, account: &str, owner: bool) -> Result<(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(id);
-    let ended = accounts::quiesce(account);
+    // Only the seat's own user is ended; a stranger of the same name keeps its sessions.
+    let ended = accounts::refuse_foreign(account, id).and_then(|()| accounts::quiesce(account));
     unit_hook(inner, account, None);
     ended
 }
@@ -720,7 +721,7 @@ impl PlatformBackend for LinuxBackend {
     fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
         // Before the unit is stopped: ending a stranger's sessions is not removing a seat.
         if !seat.owner {
-            accounts::refuse_foreign(seat)?;
+            accounts::refuse_foreign(&seat.account, &seat.id)?;
         }
         self.stop_unit(seat)?;
         self.untrack(&seat.id);

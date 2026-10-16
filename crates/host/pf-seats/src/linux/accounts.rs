@@ -323,11 +323,11 @@ pub(super) fn require(seat: &Seat) -> Result<Passwd, BackendError> {
     }
 }
 
-/// Refuses a user of the seat's name that isn't the seat's, before anything is done to it. An
-/// absent user is fine.
-pub(super) fn refuse_foreign(seat: &Seat) -> Result<(), BackendError> {
-    match lookup(&seat.account)? {
-        Some(found) if !owned_by(&found, &seat.id) => Err(not_owned(&seat.account, &seat.id)),
+/// Refuses a user named `account` that isn't `id`'s, before anything is done to it. An absent
+/// user is fine.
+pub(super) fn refuse_foreign(account: &str, id: &SeatId) -> Result<(), BackendError> {
+    match lookup(account)? {
+        Some(found) if !owned_by(&found, id) => Err(not_owned(account, id)),
         _ => Ok(()),
     }
 }
@@ -512,6 +512,17 @@ mod tests {
             .map(|(user, id)| (user.name.as_str(), id))
             .collect();
         assert_eq!(found, [("pf-seat-2", orphan)]);
+    }
+
+    /// A user that isn't the seat's is refused before its sessions are touched; an absent one is
+    /// not. `getent` answers for the machine's own users.
+    #[test]
+    fn a_foreign_user_is_refused_and_an_absent_one_is_not() {
+        assert_eq!(
+            refuse_foreign("root", &id()).unwrap_err().code,
+            "account_not_owned"
+        );
+        assert!(refuse_foreign("pf-seat-no-such-user", &id()).is_ok());
     }
 
     /// The owner is a person: uid 1000 up and below the nobody range, never a seat's marked
