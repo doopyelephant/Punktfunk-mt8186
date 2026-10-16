@@ -33,7 +33,9 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_ALWAYS, OPEN_EXISTING,
 };
-use windows::Win32::System::JobObjects::{AssignProcessToJobObject, JOB_OBJECT_LIMIT};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
@@ -47,8 +49,12 @@ pub(super) struct Job {
 
 impl Job {
     pub(super) fn new() -> WinResult<Self> {
-        let handle = pf_paths_win::kill_on_close_job(JOB_OBJECT_LIMIT(0))
-            .map_err(|error| io_error("job_create", "create the kill-on-close job", error))?;
+        // The host's own children (games, Steam) stay out: they end with the session logoff,
+        // which gives them a graceful exit that a job's kill does not.
+        let handle = pf_paths_win::kill_on_close_job(
+            JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+        )
+        .map_err(|error| io_error("job_create", "create the kill-on-close job", error))?;
         Ok(Self { handle })
     }
 
@@ -560,4 +566,62 @@ fn append_quoted(output: &mut Vec<u16>, value: &OsStr) -> WinResult<()> {
     output.extend(std::iter::repeat_n(b'\\' as u16, slashes * 2));
     output.push(b'"' as u16);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::windows::{util, wts};
+    use std::time::{Duration, Instant};
+
+    /// A child in another session ends when its job closes, as it must when the service dies.
+    /// It needs LocalSystem and a session beside 0, so it runs nowhere else.
+    #[test]
+    fn a_job_ends_a_child_in_another_session() {
+        if !util::is_local_system().unwrap_or(false) {
+            eprintln!("skipped: not LocalSystem");
+            return;
+        }
+        let Some(session) = wts::enumerate()
+            .unwrap()
+            .into_iter()
+            .find(|session| session.console)
+        else {
+            eprintln!("skipped: no console session");
+            return;
+        };
+        let root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let system32 = Path::new(&root).join("System32");
+        let mut environment: Vec<u16> = OsStr::new("SystemRoot=")
+            .encode_wide()
+            .chain(OsStr::new(&root).encode_wide())
+            .collect();
+        environment.extend([0, 0]);
+        let temp = tempfile::tempdir().unwrap();
+
+        let job = Job::new().unwrap();
+        let child = spawn_in_session(
+            Some(&job),
+            session.id,
+            &system32.join("PING.EXE"),
+            &[
+                OsString::from("-n"),
+                OsString::from("120"),
+                OsString::from("127.0.0.1"),
+            ],
+            &environment,
+            &system32,
+            &temp.path().join("child.log"),
+        )
+        .unwrap();
+        assert_eq!(child.exit_code().unwrap(), None, "the child runs");
+        eprintln!("child {} runs in session {}", child.pid(), session.id);
+
+        drop(job);
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while child.exit_code().unwrap().is_none() {
+            assert!(Instant::now() < give_up, "the job left its child running");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
