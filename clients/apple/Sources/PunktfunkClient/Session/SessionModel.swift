@@ -706,11 +706,13 @@ final class SessionModel: ObservableObject {
     }
 
     /// The SC2 passthrough's claim/release edges (`Sc2Capture.onPhaseChange`, delivered on
-    /// main). A claim shows the badge briefly; a release drops it at once.
+    /// main). A claim shows the badge briefly; a release drops it at once; a refused open says
+    /// where the grant lives.
     private func noteSc2Phase(_ phase: Sc2Capture.Phase) {
         switch phase {
         case .captured: flash(\.sc2Captured, true)
         case .released: notices.sc2Captured.clear()
+        case .refused: flash(\.sc2Refused, true, for: SessionNotices.launchSeconds)
         }
     }
 

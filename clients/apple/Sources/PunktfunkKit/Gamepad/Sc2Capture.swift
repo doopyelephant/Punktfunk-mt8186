@@ -101,12 +101,14 @@ public final class Sc2Capture {
     /// wire slot lands (the host is building a virtual SC2 — at stream start, or whenever a
     /// pad powers on mid-session); `released` only when the LAST claimed slot goes away, so a
     /// badge over a multi-pad Puck does not flicker off while other pads are still captured.
-    /// Delivered ON MAIN, like `onDisconnectRequest` — the capture otherwise leaves no UI
-    /// trace at all, since the device never enters the GameController world the Controllers
-    /// page lists.
+    /// `refused`: macOS would not open an attached pad, so it plays through GameController with
+    /// its lizard keyboard and mouse still live. Delivered ON MAIN, like `onDisconnectRequest` —
+    /// the capture otherwise leaves no UI trace at all, since the device never enters the
+    /// GameController world the Controllers page lists.
     public enum Phase: Equatable {
         case captured(pad: UInt8)
         case released
+        case refused
     }
     /// Fired ON MAIN on `Phase` edges — the session owner surfaces the passthrough badge.
     public var onPhaseChange: ((Phase) -> Void)?
@@ -169,6 +171,9 @@ public final class Sc2Capture {
             },
             onSourceClosed: { [weak self] source in
                 self?.releaseSource(source, reason: "usb collection removed")
+            },
+            onRefused: { [weak self] in
+                DispatchQueue.main.async { self?.onPhaseChange?(.refused) }
             })
         #endif
     }

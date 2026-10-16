@@ -269,6 +269,14 @@ struct StreamBadgeStack: View {
             if captureEnabled, model.notices.sc2Captured.isShown {
                 Sc2CapturedBadge().transition(Self.pop)
             }
+            // macOS refused the SC2's open; without this the double input has no explanation.
+            if captureEnabled, model.notices.sc2Refused.isShown {
+                AccessWarningBadge(
+                    text: "Couldn't stream the Steam Controller as itself — macOS refused access. "
+                        + "Turn Punktfunk on, or off and on, in Privacy & Security → Input Monitoring.",
+                    icon: "exclamationmark.triangle"
+                ).transition(Self.pop)
+            }
             // The Touch (passthrough) model met a host that drops contacts; the fingers run the
             // trackpad engine instead, and this says so once.
             if captureEnabled, model.notices.touchFallback.isShown {
@@ -308,6 +316,7 @@ struct StreamBadgeStack: View {
         .animation(.easeOut(duration: 0.2), value: statsVerbosity)
         .animation(.easeOut(duration: 0.2), value: model.notices.motionUnreachable.value)
         .animation(.easeOut(duration: 0.2), value: model.notices.sc2Captured.isShown)
+        .animation(.easeOut(duration: 0.2), value: model.notices.sc2Refused.isShown)
         .animation(.easeOut(duration: 0.6), value: model.notices.exitHint.isShown)
     }
 }
