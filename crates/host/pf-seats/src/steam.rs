@@ -550,12 +550,12 @@ mod tests {
     }
 
     #[test]
-    fn the_library_list_names_the_shared_folder_first() {
-        let list = library_folders_vdf(&["/g".to_owned(), "/home/s/.local/share/Steam".to_owned()]);
+    fn the_library_list_numbers_its_folders_in_order() {
+        let list = library_folders_vdf(&["/home/s/.local/share/Steam".to_owned(), "/g".to_owned()]);
         assert_eq!(
             list,
-            "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"/g\"\n\t}\n\
-             \t\"1\"\n\t{\n\t\t\"path\"\t\t\"/home/s/.local/share/Steam\"\n\t}\n}\n"
+            "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"/home/s/.local/share/Steam\"\n\t}\n\
+             \t\"1\"\n\t{\n\t\t\"path\"\t\t\"/g\"\n\t}\n}\n"
         );
     }
 

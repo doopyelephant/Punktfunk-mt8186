@@ -818,8 +818,8 @@ fn find_source(users: &[Passwd], owner: impl Fn(&Path) -> Option<u32>) -> Option
 }
 
 /// A Steam under the seat's home, cloned from `source` when there is one, and a library list that
-/// names the shared games folder first. Never fails the seat: without a clone Steam downloads
-/// itself on first run, and without the list it offers games again.
+/// names that Steam, then the shared games folder. Never fails the seat: without a clone Steam
+/// downloads itself on first run, and without the list it offers games again.
 pub(super) fn provision_steam(
     state: &Path,
     id: &SeatId,
@@ -931,8 +931,9 @@ fn clone_names(src: &SteamSource) -> std::io::Result<Vec<String>> {
     Ok(out)
 }
 
-/// Lists the shared games folder first, then the seat's own Steam. Written once; Steam owns the
-/// file afterwards.
+/// Lists the seat's own Steam, then the shared games folder. Steam reads entry `0` as its own
+/// install whatever path stands there, so a folder listed there is lost. Written once; Steam owns
+/// the file afterwards, and [`super::libraries::register`] adds the games folder if it goes.
 fn write_library_folders(state: &Path, steam: &Path) -> std::io::Result<()> {
     let dir = steam.join("steamapps");
     let file = dir.join("libraryfolders.vdf");
@@ -941,8 +942,8 @@ fn write_library_folders(state: &Path, steam: &Path) -> std::io::Result<()> {
     }
     std::fs::create_dir_all(&dir)?;
     let folders = [
-        games_dir(state).to_string_lossy().into_owned(),
         steam.to_string_lossy().into_owned(),
+        games_dir(state).to_string_lossy().into_owned(),
     ];
     std::fs::write(file, crate::steam::library_folders_vdf(&folders))
 }

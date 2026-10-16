@@ -457,14 +457,20 @@ pub(super) fn unit_lines(state: &Path, id: &SeatId, shares: &Shares) -> String {
     out
 }
 
-/// Lists `libraries` in the seat's Steam and drops the ones it no longer has, and any folder
-/// under `/run/media`, which a seat never sees. Steam's own entries stay as written. Never fails
-/// the start: an unlisted library is one the seat's Steam doesn't offer.
+/// Lists the shared games folder and `libraries` in the seat's Steam and drops the ones it no
+/// longer has, and any folder under `/run/media`, which a seat never sees. Steam's own entries
+/// stay as written, and a folder missing from the list goes last: Steam reads entry `0` as its
+/// own install and drops a folder listed there. Never fails the start: an unlisted library is
+/// one the seat's Steam doesn't offer.
 pub(super) fn register(state: &Path, id: &SeatId, seat: &Passwd, libraries: &[Library]) {
     let ours = libraries_dir(state, id);
-    let wanted: Vec<String> = libraries
-        .iter()
-        .map(|l| root_dir(state, id, &l.key).to_string_lossy().into_owned())
+    let games = shared::games_dir(state).to_string_lossy().into_owned();
+    let wanted: Vec<String> = std::iter::once(games)
+        .chain(
+            libraries
+                .iter()
+                .map(|l| root_dir(state, id, &l.key).to_string_lossy().into_owned()),
+        )
         .collect();
     let managed =
         |path: &str| Path::new(path).starts_with(&ours) || path.starts_with("/run/media/");
@@ -838,8 +844,8 @@ mod tests {
         home.join(".local/share/Steam").join(dir).join(LIST)
     }
 
-    /// Both of the seat's lists gain the box's libraries and lose a stale drive; Steam's own
-    /// entry stays, and an absent copy stays absent.
+    /// Both of the seat's lists gain the shared games folder and the box's libraries after
+    /// Steam's own entry, and lose a stale drive; an absent copy stays absent.
     #[test]
     fn the_seat_s_lists_name_the_box_s_libraries() {
         let temp = tempfile::tempdir().unwrap();
@@ -870,6 +876,7 @@ mod tests {
         );
         let after = steam::library_folders_vdf(&[
             own.clone(),
+            "/b/games".to_owned(),
             "/b/seats/0123456789abcdef0123456789abcdef/libraries/00aa".to_owned(),
         ]);
         for dir in ["steamapps", "config"] {
@@ -883,7 +890,17 @@ mod tests {
         register(Path::new("/b"), &id(), &seat, &[]);
         assert!(!steam_file(&home, "config").exists());
         let text = std::fs::read_to_string(steam_file(&home, "steamapps")).unwrap();
-        assert_eq!(steam::library_paths(&text), [own]);
+        assert_eq!(steam::library_paths(&text), [own.as_str(), "/b/games"]);
+
+        // Steam wrote its own list back without the games folder, which it drops at entry 0.
+        std::fs::write(
+            steam_file(&home, "steamapps"),
+            steam::library_folders_vdf(std::slice::from_ref(&own)),
+        )
+        .unwrap();
+        register(Path::new("/b"), &id(), &seat, &[]);
+        let text = std::fs::read_to_string(steam_file(&home, "steamapps")).unwrap();
+        assert_eq!(steam::library_paths(&text), [own.as_str(), "/b/games"]);
     }
 
     /// Root never follows a link the seat planted on the way to its lists.
