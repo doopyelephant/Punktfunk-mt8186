@@ -14,7 +14,9 @@
 # `on` that fails before the box's ports move puts the box back, and an `off` that can't hand the
 # files home starts the door again, so neither leaves the box without a host or a console. The one
 # record of "on, and for whom" is $STATE/owner, which only root writes: `on` refuses while it names
-# someone else, and `off` runs only for the user it names. The box's files move once: `on` copies
+# someone else, and `off` runs only for the user it names. A record whose account is gone names no
+# one: `on` from another member takes the door over, and `off` for it switches the door off with
+# the files left in $BOX. The box's files move once: `on` copies
 # the user's into /var/lib/punktfunk and marks that in $STATE/door-on, so a repeat never overwrites
 # what the door has changed since; `off` copies the door's back to the user and clears both.
 #
@@ -82,15 +84,24 @@ case $user in
 esac
 [ "${#user}" -le 20 ] || die "'$user' is longer than the seats accept"
 
-passwd_row=$(getent passwd "$user") || die "no user '$user'"
-uid=$(printf '%s' "$passwd_row" | cut -d: -f3)
-home=$(printf '%s' "$passwd_row" | cut -d: -f6)
-{ [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ]; } || die "'$user' is not an ordinary account"
-# The recorded owner may switch the door off after leaving the group.
-if [ "$verb" != off ]; then
-    id -nG "$user" | tr ' ' '\n' | grep -qx "$GROUP" || die "'$user' is not in the $GROUP group"
+gone=0
+uid=
+OWN=
+if passwd_row=$(getent passwd "$user"); then
+    uid=$(printf '%s' "$passwd_row" | cut -d: -f3)
+    home=$(printf '%s' "$passwd_row" | cut -d: -f6)
+    { [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ]; } || die "'$user' is not an ordinary account"
+    # The recorded owner may switch the door off after leaving the group.
+    if [ "$verb" != off ]; then
+        id -nG "$user" | tr ' ' '\n' | grep -qx "$GROUP" || die "'$user' is not in the $GROUP group"
+    fi
+    OWN="$home/.config/punktfunk"
+elif [ "$verb" = off ]; then
+    # Only the record, read under the lock, says whether this is the owner whose account is gone.
+    gone=1
+else
+    die "no user '$user'"
 fi
-OWN="$home/.config/punktfunk"
 
 # `ports` runs inside the door's start, which `on` waits for while it holds this lock.
 if [ "$verb" != ports ]; then
@@ -98,8 +109,15 @@ if [ "$verb" != ports ]; then
     flock 9
 fi
 recorded=$(cat "$RECORD" 2>/dev/null || true)
+gone_owner=
 case $verb in
-on) [ -z "$recorded" ] || [ "$recorded" = "$user" ] || die "the door is on for $recorded: turn it off from that account first" ;;
+on)
+    if [ -n "$recorded" ] && [ "$recorded" != "$user" ]; then
+        getent passwd "$recorded" >/dev/null && die "the door is on for $recorded: turn it off from that account first"
+        gone_owner=$recorded
+        echo "door-helper: $recorded is gone, the door passes to $user" >&2
+    fi
+    ;;
 off) [ "$recorded" = "$user" ] || die "the door is not on for $user" ;;
 esac
 
@@ -107,7 +125,10 @@ as_user() { runuser -u "$user" -- "$@"; }
 
 # The user's systemd manager, when they have one. A user with no login and no linger has none, and
 # then there is nothing running to change.
-user_ctl() { runuser -u "$user" -- env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user "$@" 2>/dev/null; }
+user_ctl() {
+    [ "$gone" = 0 ] || return 1
+    runuser -u "$user" -- env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user "$@" 2>/dev/null
+}
 
 # $1 a file name under $BOX, written there from stdin as the door. The door owns $BOX, so root
 # never writes a path in it: a link the door plants there leads only where the door can go.
@@ -230,6 +251,8 @@ door_on() {
     usermod -aG punktfunk-games "$user"
     install -d -m 0711 -o root -g root "$STATE"
     legacy_mark
+    # A gone owner's files stay in $BOX; this member's replace them where they have the same file.
+    [ -z "$gone_owner" ] || rm -f "$MARK"
     [ "$fresh" = 0 ] || trap undo_on EXIT
     printf '%s\n' "$user" >"$RECORD.tmp"
     chmod 0600 "$RECORD.tmp"
@@ -279,7 +302,9 @@ door_off() {
     trap restore_door EXIT
     systemctl stop punktfunk-web-door.service punktfunk-door.service || true
     legacy_mark
-    if [ -e "$MARK" ]; then
+    if [ "$gone" = 1 ]; then
+        echo "door-helper: $user is gone, the door's files stay in $BOX" >&2
+    elif [ -e "$MARK" ]; then
         for f in $FILES; do [ "$f" = web-password ] || give "$f"; done
         give_password
         give_avatars

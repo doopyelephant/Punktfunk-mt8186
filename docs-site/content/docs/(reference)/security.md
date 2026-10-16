@@ -119,7 +119,9 @@ only root can change.
   nodes belong to that seat alone. A seat's input can't type or move a pointer on the box.
 - **Stopping.** When a seat stops, everything its user runs ends, and its controllers go with it.
 - **The owner.** Only the account that turned on **Reachable without logging in** is hosted as
-  the box's owner. To hand that to another account, turn it off, then on from that account.
+  the box's owner. To hand that to another account, turn it off, then on from that account. If the
+  owner's account is deleted, a member of `punktfunk-update` can turn it on from their own account,
+  and turning it off leaves the files in `/var/lib/punktfunk`.
 - **Games.** Every seat writes the shared games folder, `/var/lib/punktfunk-seats/games`. With
   **Seats update your games** on, the default, every seat also updates and installs into your own
   Steam libraries. So a seat can change game files that you and the other seats run. Turn
