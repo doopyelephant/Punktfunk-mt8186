@@ -537,6 +537,36 @@ pub(crate) async fn get_health() -> Json<Health> {
     })
 }
 
+/// How long a probe of the door's blockers answers: it forks `id`.
+const DOOR_PROBE_FRESH: std::time::Duration = std::time::Duration::from_secs(30);
+
+type DoorProbe = std::sync::Mutex<Option<(std::time::Instant, Option<String>)>>;
+
+/// The door's blockers, read only for the console: a paired device is not told which account
+/// the host runs as, and a seat host has no door to turn on.
+async fn door_unavailable(lane: AuthLane) -> Option<String> {
+    static LAST: DoorProbe = std::sync::Mutex::new(None);
+    if lane != AuthLane::Admin || pf_paths::seat::role().is_seat_host() {
+        return None;
+    }
+    tokio::task::spawn_blocking(|| probe_door(&LAST, crate::door::unavailable))
+        .await
+        .unwrap_or_default()
+}
+
+/// `probe`'s answer, or the last one if it is under [`DOOR_PROBE_FRESH`] old.
+fn probe_door(last: &DoorProbe, probe: impl FnOnce() -> Option<String>) -> Option<String> {
+    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, answer)) = last.as_ref() {
+        if at.elapsed() < DOOR_PROBE_FRESH {
+            return answer.clone();
+        }
+    }
+    let answer = probe();
+    *last = Some((std::time::Instant::now(), answer.clone()));
+    answer
+}
+
 /// Host identity and capabilities
 #[utoipa::path(
     get,
@@ -548,11 +578,12 @@ pub(crate) async fn get_health() -> Json<Health> {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn get_host_info(State(st): State<Arc<MgmtState>>) -> Json<HostInfo> {
+pub(crate) async fn get_host_info(
+    State(st): State<Arc<MgmtState>>,
+    Extension(lane): Extension<AuthLane>,
+) -> Json<HostInfo> {
     let h = &st.app.host;
-    let door_unavailable = tokio::task::spawn_blocking(crate::door::unavailable)
-        .await
-        .unwrap_or_default();
+    let door_unavailable = door_unavailable(lane).await;
     Json(HostInfo {
         hostname: h.hostname.clone(),
         uniqueid: h.uniqueid.clone(),
@@ -911,4 +942,29 @@ fn gs_pin_pending(st: &Arc<MgmtState>) -> bool {
 #[cfg(not(feature = "gamestream"))]
 fn gs_pin_pending(_st: &Arc<MgmtState>) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_door_probe_runs_once_a_while() {
+        let last: DoorProbe = std::sync::Mutex::new(None);
+        let mut runs = 0;
+        let mut ask = |answer: Option<&str>| {
+            probe_door(&last, || {
+                runs += 1;
+                answer.map(str::to_string)
+            })
+        };
+        assert_eq!(ask(Some("first")).as_deref(), Some("first"));
+        assert_eq!(ask(None).as_deref(), Some("first"));
+        assert_eq!(runs, 1);
+        *last.lock().unwrap() = Some((
+            std::time::Instant::now() - DOOR_PROBE_FRESH,
+            Some("stale".into()),
+        ));
+        assert_eq!(probe_door(&last, || None), None);
+    }
 }

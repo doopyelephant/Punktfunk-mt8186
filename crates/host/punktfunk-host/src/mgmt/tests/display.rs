@@ -547,3 +547,29 @@ async fn gpu_endpoints_list_and_validate() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
+
+/// The door's blockers name the account the host runs as: only the console reads them.
+#[tokio::test]
+async fn host_info_keeps_the_door_blockers_from_a_paired_device() {
+    let np = Arc::new(
+        crate::native_pairing::NativePairing::load_with(
+            Some(crate::test_support::scratch().join("pf-mgmt-host-door.json")),
+            None,
+            false,
+        )
+        .unwrap(),
+    );
+    let fp = "deadbeefcafe";
+    np.add("couch", fp).unwrap();
+    let app = test_app_native(test_state(), np);
+    let mut req = get_req("/api/v1/host");
+    req.extensions_mut()
+        .insert(PeerCertFingerprint(Some(fp.to_string())));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(body["door_unavailable"].is_null(), "{body}");
+}
