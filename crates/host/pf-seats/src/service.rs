@@ -28,8 +28,15 @@ pub struct SeatService<B> {
     /// Held across every create, start, stop, delete, adopt, Enable and Disable. Only a call
     /// under it adds or drops a row.
     ops: Mutex<()>,
-    /// The seat a start or stop is changing; `List` reports its published state meanwhile.
-    changing: Mutex<Option<SeatId>>,
+    /// The start, stop or delete in flight; `List` reports its seat's published state meanwhile.
+    changing: Mutex<Option<Change>>,
+}
+
+/// A change to one seat's unit or account, and whether a stop has reached it as a start.
+struct Change {
+    id: SeatId,
+    start: bool,
+    cancelled: bool,
 }
 
 impl<B: PlatformBackend> SeatService<B> {
@@ -146,12 +153,13 @@ impl<B: PlatformBackend> SeatService<B> {
 
     fn list(&self) -> Result<CommandResult, ApiError> {
         let mut current = self.lock();
-        // Read under the ledger lock, which a change takes to mark its seat before its backend runs.
+        // Read under the ledger lock: a change marks its seat under it, before its backend runs.
         let changing = self
             .changing
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .as_ref()
+            .map(|change| change.id.clone());
         let mut next = current.clone();
         for seat in &mut next.seats {
             if changing.as_ref() == Some(&seat.id) {
@@ -259,8 +267,11 @@ impl<B: PlatformBackend> SeatService<B> {
     }
 
     fn change_runtime(&self, id: &SeatId, start: bool) -> Result<CommandResult, ApiError> {
+        if !start {
+            self.interrupt_start(id);
+        }
         let _op = self.op();
-        let original = self.begin(id)?;
+        let original = self.begin(id, start)?;
         if start {
             let published = self.publish_runtime(
                 id,
@@ -274,12 +285,17 @@ impl<B: PlatformBackend> SeatService<B> {
                 return Err(error);
             }
         }
-        let result = if start {
-            self.backend.start(&original)
-        } else {
+        let result = if !start {
             self.backend.stop(&original)
+        } else if self.start_cancelled() {
+            Err(BackendError::new(
+                "seat_stopped",
+                "the seat was stopped before it began to start",
+            ))
+        } else {
+            self.backend.start(&original)
         };
-        self.end();
+        let cancelled = self.end();
         let mut current = self.lock();
         let mut next = current.clone();
         let seat = next
@@ -291,6 +307,13 @@ impl<B: PlatformBackend> SeatService<B> {
             Ok(status) => {
                 seat.runtime = status;
                 self.learn_pin(seat);
+            }
+            Err(_) if cancelled => {
+                // The stop that reached this start records the seat's state next.
+                return Err(ApiError::new(
+                    ErrorCode::Conflict,
+                    "the seat was stopped while it started",
+                ));
             }
             Err(error) => {
                 // The backend's own account of the failure, when it has one, is the sentence
@@ -318,7 +341,7 @@ impl<B: PlatformBackend> SeatService<B> {
 
     fn delete(&self, id: &SeatId) -> Result<CommandResult, ApiError> {
         let _op = self.op();
-        let seat = self.begin(id)?;
+        let seat = self.begin(id, false)?;
         let removed = self.backend.remove(&seat);
         self.end();
         removed.map_err(ApiError::from)?;
@@ -329,15 +352,47 @@ impl<B: PlatformBackend> SeatService<B> {
     /// Marks `id` as the seat a change is on and returns its row. The mark is made under the
     /// ledger lock a `List` holds while it reads each seat, so a `List` either finishes with the
     /// seat first or skips it.
-    fn begin(&self, id: &SeatId) -> Result<Seat, ApiError> {
+    fn begin(&self, id: &SeatId, start: bool) -> Result<Seat, ApiError> {
         let current = self.lock();
         let seat = current.seat(id).cloned().ok_or_else(|| not_found(id))?;
-        *self.changing.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
+        *self.changing.lock().unwrap_or_else(|e| e.into_inner()) = Some(Change {
+            id: id.clone(),
+            start,
+            cancelled: false,
+        });
         Ok(seat)
     }
 
-    fn end(&self) {
-        *self.changing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    /// Ends the change in flight. `true` when a stop reached it as a start.
+    fn end(&self) -> bool {
+        let change = self
+            .changing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        change.is_some_and(|change| change.cancelled)
+    }
+
+    fn start_cancelled(&self) -> bool {
+        let changing = self.changing.lock().unwrap_or_else(|e| e.into_inner());
+        changing.as_ref().is_some_and(|change| change.cancelled)
+    }
+
+    /// A stop reaches the seat whose start is in flight at once, instead of queueing behind the
+    /// start for as long as it runs. The backend's stop ends what the start waits on, so the start
+    /// returns; the stop then runs in turn, for a start that hadn't reached its backend yet.
+    fn interrupt_start(&self, id: &SeatId) {
+        {
+            let mut changing = self.changing.lock().unwrap_or_else(|e| e.into_inner());
+            match changing.as_mut() {
+                Some(change) if change.start && &change.id == id => change.cancelled = true,
+                _ => return,
+            }
+        }
+        let seat = self.lock().seat(id).cloned();
+        if let Some(seat) = seat {
+            let _ = self.backend.stop(&seat);
+        }
     }
 
     /// `edit` applied to a copy of the ledger as it is now, then written. The ledger lock is held

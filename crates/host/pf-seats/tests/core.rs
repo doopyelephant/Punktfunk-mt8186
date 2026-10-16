@@ -670,6 +670,93 @@ fn the_ledger_answers_while_a_seat_is_made_removed_or_seats_turn_on() {
     turning_on.join().unwrap().unwrap();
 }
 
+/// A start that waits for a stop to end it, as a seat's unit does.
+#[derive(Clone, Default)]
+struct StopEndsStart {
+    inner: FakeBackend,
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    stopped: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl PlatformBackend for StopEndsStart {
+    fn provision(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.inner.provision(seat)
+    }
+    fn start(&self, _seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (stopped, wake) = &*self.stopped;
+        let mut stopped = stopped.lock().unwrap();
+        while !*stopped {
+            stopped = wake.wait(stopped).unwrap();
+        }
+        Err(BackendError::new("seat_exited", "the unit ended"))
+    }
+    fn stop(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        let (stopped, wake) = &*self.stopped;
+        *stopped.lock().unwrap() = true;
+        wake.notify_all();
+        self.inner.stop(seat)
+    }
+    fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.inner.remove(seat)
+    }
+    fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.status(seat)
+    }
+}
+
+/// A stop reaches a seat mid-start at once rather than queueing behind it; the start answers
+/// that it was stopped, and the seat ends up stopped, not failed.
+#[test]
+fn a_stop_reaches_a_seat_that_is_starting() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = StopEndsStart::default();
+    let service = Arc::new(SeatService::open(temp.path(), backend.clone()).unwrap());
+    let CommandResult::Created { seat } =
+        service.dispatch(create("Desk", "pf-desk", false)).unwrap()
+    else {
+        panic!("create");
+    };
+    let starter = {
+        let service = Arc::clone(&service);
+        let id = seat.id.clone();
+        std::thread::spawn(move || service.dispatch(Command::Start { id }))
+    };
+    while !backend.entered.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let (answer, answered) = std::sync::mpsc::channel();
+    {
+        let service = Arc::clone(&service);
+        let id = seat.id.clone();
+        std::thread::spawn(move || {
+            let _ = answer.send(service.dispatch(Command::Stop { id }));
+        });
+    }
+    let stopped = answered
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the stop queued behind the start");
+    assert!(matches!(
+        stopped,
+        Ok(CommandResult::Stopped { ref seat }) if seat.runtime.state == RuntimeState::Stopped
+    ));
+    let started = starter.join().unwrap().unwrap_err();
+    assert_eq!(started.code, ErrorCode::Conflict);
+    assert_eq!(
+        service.ledger().seats[0].runtime.state,
+        RuntimeState::Stopped
+    );
+    let stops = backend
+        .inner
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("stop:"))
+        .count();
+    assert_eq!(stops, 2, "once to end the start, once in turn");
+}
+
 /// A `List` reconciles a seat that is at rest and leaves one that is starting: its unit is down
 /// until the start brings it up, and reading that as a stopped seat would tear its proxy down.
 #[test]

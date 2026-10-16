@@ -38,7 +38,7 @@ use crate::persistence::{LedgerStore, StoreError};
 use crate::service::SeatService;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -101,6 +101,8 @@ struct Inner {
     door_gid: OnceLock<u32>,
     /// A seat stopped since the ACL mask was last repaired.
     acl_dirty: AtomicBool,
+    /// Stops asked of any seat so far. A start that sees it move gives up.
+    stops: AtomicU64,
     /// What the binary runs beside a seat's unit ([`LinuxBackend::on_unit`]).
     hook: OnceLock<UnitHook>,
     /// The prerequisite checks `Seating` last answered with, and when they ran.
@@ -279,6 +281,7 @@ impl LinuxBackend {
             owner: Mutex::new(None),
             door_gid: OnceLock::new(),
             acl_dirty: AtomicBool::new(false),
+            stops: AtomicU64::new(0),
             hook: OnceLock::new(),
             checks: Mutex::new(None),
         });
@@ -464,11 +467,22 @@ impl LinuxBackend {
         self.serving(seat) && (!seat.owner || session::ready_path(&seat.account).exists())
     }
 
+    /// Fails when a stop has been asked since `asked`, the count a start began at.
+    fn stopped_since(&self, asked: u64) -> Result<(), BackendError> {
+        if self.inner.stops.load(Ordering::SeqCst) == asked {
+            return Ok(());
+        }
+        Err(err("seat_stopped", "the seat was stopped while it started"))
+    }
+
     /// Waits for the unit to be active and the host's management port to answer. A unit that
-    /// ends first, or a timeout, stops the seat and fails the start.
-    fn wait_ready(&self, seat: &Seat) -> Result<(), BackendError> {
+    /// ends first, a stop or a timeout stops the seat and fails the start.
+    fn wait_ready(&self, seat: &Seat, asked: u64) -> Result<(), BackendError> {
         let deadline = Instant::now() + START_TIMEOUT;
         let failure = loop {
+            if let Err(stopped) = self.stopped_since(asked) {
+                break stopped;
+            }
             let state = session::state(&seat.account)?;
             match state.active.as_str() {
                 "active" if self.is_ready(seat) => return Ok(()),
@@ -646,8 +660,9 @@ impl PlatformBackend for LinuxBackend {
     }
 
     fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        let asked = self.inner.stops.load(Ordering::SeqCst);
         if seat.owner {
-            return self.start_owner(seat);
+            return self.start_owner(seat, asked);
         }
         let (box_dir, state) = (&self.inner.box_dir, &self.inner.state);
         let passwd = accounts::require(seat)?;
@@ -680,16 +695,18 @@ impl PlatformBackend for LinuxBackend {
             let shown = shares.as_ref().map_or(&[][..], |s| s.libraries.as_slice());
             libraries::register(state, &seat.id, &passwd, shown);
             session::write_unit_files(seat, &passwd.home, state, &token, None, shares.as_ref())?;
+            self.stopped_since(asked)?;
             let _ = run("systemctl_failed", "systemctl", &["reset-failed", &unit]);
             run("systemctl_failed", "systemctl", &["start", &unit])?;
         }
         self.track(&seat.id, Tracked::of(seat, &passwd));
-        self.wait_ready(seat)?;
+        self.wait_ready(seat, asked)?;
         Ok(RuntimeStatus::running())
     }
 
     /// Ends the headless session. A host in the owner's own login stays: it isn't the unit's.
     fn stop(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.stops.fetch_add(1, Ordering::SeqCst);
         self.stop_unit(seat)?;
         Ok(RuntimeStatus::stopped())
     }
@@ -855,29 +872,31 @@ impl LinuxBackend {
     /// unit stays down and the owner's user host is started if it isn't running. Otherwise the
     /// unit brings up the headless session and the host in it, whose runner stands the owner's
     /// user host down first.
-    fn start_owner(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+    fn start_owner(&self, seat: &Seat, asked: u64) -> Result<RuntimeStatus, BackendError> {
         let passwd = accounts::require_owner(&seat.account)?;
         self.prepare_owner(seat, &passwd)?;
         self.track(&seat.id, Tracked::of(seat, &passwd));
         if owner_at_desk(&seat.account) {
             user_host(&seat.account, "start");
-            self.wait_port(seat)?;
+            self.wait_port(seat, asked)?;
             return Ok(RuntimeStatus::running());
         }
         let unit = session::unit(&seat.account);
         // A unit already up keeps its token: the host read it when it started.
         if !session::state(&seat.account)?.live() {
             self.write_owner_files(seat, &passwd, &session::mint_token())?;
+            self.stopped_since(asked)?;
             let _ = run("systemctl_failed", "systemctl", &["reset-failed", &unit]);
             run("systemctl_failed", "systemctl", &["start", &unit])?;
         }
-        self.wait_ready(seat)?;
+        self.wait_ready(seat, asked)?;
         Ok(RuntimeStatus::running())
     }
 
-    fn wait_port(&self, seat: &Seat) -> Result<(), BackendError> {
+    fn wait_port(&self, seat: &Seat, asked: u64) -> Result<(), BackendError> {
         let deadline = Instant::now() + START_TIMEOUT;
         while !self.serving(seat) {
+            self.stopped_since(asked)?;
             if Instant::now() >= deadline {
                 return Err(err(
                     "start_timeout",
