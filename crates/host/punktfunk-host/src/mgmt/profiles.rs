@@ -1331,16 +1331,41 @@ pub(crate) async fn end_profile_session(
     Json(admin(&st, profiles, &p, &*seats_now().await)).into_response()
 }
 
-/// Paths the seat proxy never passes: pairing, trust and profiles are the box's, and a seat host
-/// updates with the box. A `.` or `..` segment is refused outright.
+/// Paths the seat proxy never passes: pairing, trust and profiles are the box's, a seat host
+/// updates with the box, and a plugin UI's credential stays on its host. A `.` or `..` segment
+/// is refused outright. `rest` is the decoded path; the query travels apart.
 fn proxy_refuses(rest: &str) -> bool {
-    let path = rest.split('?').next().unwrap_or("");
-    let first = path.trim_start_matches('/').split('/').next().unwrap_or("");
-    path.split('/').any(|s| s == "." || s == "..")
+    let first = rest
+        .trim_start_matches('/')
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("");
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    segments.iter().any(|s| *s == "." || *s == "..")
+        || matches!(
+            segments[..],
+            [plugins, _, credential]
+                if plugins.eq_ignore_ascii_case("plugins")
+                    && credential.eq_ignore_ascii_case("ui-credential")
+        )
         || matches!(
             first,
             "native" | "pair" | "profiles" | "update" | "actions" | "clients"
         )
+}
+
+/// `rest` and `query` as the seat's host reads them. The router hands `rest` over decoded, so each
+/// segment is escaped again: an encoded `?` stays part of its segment and starts no query.
+fn seat_target(rest: &str, query: Option<&str>) -> String {
+    let path = rest
+        .split('/')
+        .map(super::library::path_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    match query {
+        Some(q) => format!("{path}?{q}"),
+        None => path,
+    }
 }
 
 /// `ANY /api/v1/profiles/{id}/proxy/{*rest}`: the console reaching a seat profile's own host for
@@ -1377,10 +1402,7 @@ pub(crate) async fn proxy_profile_seat(
             "The owner's session is starting. Try again in a moment.",
         );
     }
-    let target = match uri.query() {
-        Some(q) => format!("{rest}?{q}"),
-        None => rest,
-    };
+    let target = seat_target(&rest, uri.query());
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -1475,6 +1497,7 @@ mod tests {
         assert!(!proxy_refuses("library"));
         assert!(!proxy_refuses("library/page?as=kid"));
         assert!(!proxy_refuses("plugins/rom-manager"));
+        assert!(!proxy_refuses("plugins/steam/ui"));
         for refused in [
             "native/pair/arm",
             "profiles",
@@ -1484,9 +1507,45 @@ mod tests {
             "clients",
             "library/../native/pair/arm",
             "./native",
+            "plugins/steam/ui-credential",
+            "Plugins/steam/UI-credential/",
+            "x?/../update",
         ] {
             assert!(proxy_refuses(refused), "{refused}");
         }
+    }
+
+    /// The router hands `rest` over decoded. An encoded `?` or `%` must reach the seat as the
+    /// character it is, not as a query or an escape the seat decodes a second time.
+    #[tokio::test]
+    async fn the_router_decodes_the_path_the_seat_proxy_re_escapes() {
+        use tower::ServiceExt;
+        let app = axum::Router::new().route(
+            "/profiles/{id}/proxy/{*rest}",
+            axum::routing::any(|Path((_, rest)): Path<(String, String)>| async move { rest }),
+        );
+        let req = axum::http::Request::builder()
+            .uri("/profiles/a/proxy/store/install%3F/%2e%2e/a%252Fb")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let body = axum::body::to_bytes(app.oneshot(req).await.unwrap().into_body(), 1024)
+            .await
+            .unwrap();
+        let rest = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(rest, "store/install?/../a%2Fb");
+        assert!(proxy_refuses(&rest));
+    }
+
+    #[test]
+    fn a_decoded_path_reaches_the_seat_as_the_segments_it_had() {
+        assert_eq!(seat_target("library/steam:570", None), "library/steam:570");
+        assert_eq!(
+            seat_target("store/sources/my src", Some("as=kid&x=1")),
+            "store/sources/my%20src?as=kid&x=1"
+        );
+        assert_eq!(seat_target("store/install?", None), "store/install%3F");
+        assert_eq!(seat_target("a%2Fb", None), "a%252Fb");
+        assert_eq!(seat_target("rom/é#1", None), "rom/%C3%A9%231");
     }
 
     /// The console asks for its password on some calls and relays the rest with the admin

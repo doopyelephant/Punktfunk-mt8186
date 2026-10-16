@@ -37,6 +37,12 @@ describe("seatCall", () => {
 		expect(seatCall(`${base}/%252e%252e/x`)?.rest).toBe("%2e%2e/x");
 	});
 
+	test("keeps a question mark inside its segment, escaped, so it starts no query", () => {
+		const call = seatCall(`${base}/store/install%3F`);
+		expect(call?.rest).toBe("store/install?");
+		expect(call && encodeRest(call.rest)).toBe("store/install%3F");
+	});
+
 	test("forwards the resolved path, each segment escaped once", () => {
 		const call = seatCall(`${base}/store/sources/my%20src`);
 		expect(call && seatPath(call.id, encodeRest(call.rest))).toBe(
