@@ -89,6 +89,27 @@ impl Endpoint {
         let _ = unsafe { QueryPerformanceCounter(&mut now) };
         now
     }
+
+    /// Starts the clock at `now`. The frames written before a `Stop` have played by now, so it
+    /// resumes where they end.
+    fn begin_clock(&self, now: i64) {
+        let written = self.written.load(Ordering::Acquire);
+        let begun = now - ticks_for(written, self.frequency);
+        self.start.store(begun, Ordering::Release);
+        self.started.store(true, Ordering::Release);
+    }
+
+    /// The frames played by `now` of the `written` ones: all of them while the clock is stopped.
+    fn played_at(&self, written: u64, now: i64) -> u64 {
+        if !self.started.load(Ordering::Acquire) {
+            return written;
+        }
+        played_frames(
+            written,
+            now - self.start.load(Ordering::Acquire),
+            self.frequency,
+        )
+    }
 }
 
 impl IAudioEndpoint_Impl for Endpoint_Impl {
@@ -175,11 +196,7 @@ impl IAudioEndpointRT_Impl for Endpoint_Impl {
     fn GetCurrentPadding(&self, padding: *mut i64, position: *mut AE_CURRENT_POSITION) {
         let written = self.written.load(Ordering::Acquire);
         let now = Endpoint::now();
-        let mut played = written;
-        if self.started.load(Ordering::Acquire) {
-            let ticks = now - self.start.load(Ordering::Acquire);
-            played = played_frames(written, ticks, self.frequency);
-        }
+        let played = self.played_at(written, now);
         if !padding.is_null() {
             let queued = (written - played).saturating_mul(10_000_000) / u64::from(RATE);
             // SAFETY: the engine's out parameter, checked non-null.
@@ -262,11 +279,7 @@ impl IAudioEndpointControl_Impl for Endpoint_Impl {
             return Err(E_UNEXPECTED.into());
         }
         self.open_ring();
-        // The frames written before a `Stop` have played by now: the clock resumes where they end.
-        let written = self.written.load(Ordering::Acquire);
-        let begun = Endpoint::now() - ticks_for(written, self.frequency);
-        self.start.store(begun, Ordering::Release);
-        self.started.store(true, Ordering::Release);
+        self.begin_clock(Endpoint::now());
         Ok(())
     }
 
@@ -450,20 +463,21 @@ mod tests {
     /// A `Start` after a `Stop` leaves nothing queued, however long the endpoint had rendered.
     #[test]
     fn a_restart_resumes_where_the_written_frames_end() {
+        let endpoint = Endpoint::new(1, 0);
+        let second = endpoint.frequency;
         let ten_minutes = 10 * 60 * u64::from(RATE);
-        let now = 123_456_789;
-        let start = now - ticks_for(ten_minutes, FREQUENCY);
-        assert_eq!(
-            played_frames(ten_minutes, now - start, FREQUENCY),
-            ten_minutes
-        );
+        endpoint.begin_clock(1_000 * second);
+        endpoint.written.store(ten_minutes, Ordering::Release);
+        // The engine stops the endpoint and starts it again twenty minutes on, with no `Reset`.
+        endpoint.started.store(false, Ordering::Release);
+        let later = 2_200 * second;
+        endpoint.begin_clock(later);
+        assert_eq!(endpoint.played_at(ten_minutes, later), ten_minutes);
+
         // Ten milliseconds the engine writes next play out over the next ten milliseconds.
         let ahead = ten_minutes + u64::from(RATE) / 100;
-        assert_eq!(played_frames(ahead, now - start, FREQUENCY), ten_minutes);
-        assert_eq!(
-            played_frames(ahead, now + 100_000 - start, FREQUENCY),
-            ahead
-        );
+        assert_eq!(endpoint.played_at(ahead, later), ten_minutes);
+        assert_eq!(endpoint.played_at(ahead, later + second / 100), ahead);
     }
 
     #[test]
