@@ -15,12 +15,14 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=punktfunk
-Group=punktfunk
+# Its own group: `punktfunk` owns the usbip attach nodes, which the door never opens.
+Group=punktfunk-door
 Environment=PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk
 # The box's library: the seat supervisor's copy of the owner's, which every client reads here.
 Environment=PUNKTFUNK_LIBRARY_DIR=/var/lib/punktfunk-seats/library
 # The ports the owner moved in their host.env: door-helper copies them here before each start,
-# so an update or a later edit reaches the door. `+` runs it as root, to read the owner's file.
+# so an update or a later edit reaches the door. `+` runs it as root, to read the owner's file,
+# and to move an account an older helper made out of the `punktfunk` group.
 ExecStartPre=+-/usr/libexec/punktfunk/door-helper ports
 EnvironmentFile=-/var/lib/punktfunk/host.env
 ExecStart=/usr/bin/punktfunk-host serve --door
@@ -29,6 +31,7 @@ RestartSec=2
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
+ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictRealtime=yes

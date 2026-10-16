@@ -830,6 +830,8 @@ in
       # Members of this group may start the helper templates; the helper refuses anyone else. The
       # polkit rule is the package's own file, which other distros read from /usr/share.
       users.groups.punktfunk-update = { };
+      # The door user's own group, in place of `punktfunk`, which owns the usbip attach nodes.
+      users.groups.punktfunk-door = { };
       security.polkit.enable = mkDefault true;
       environment.etc."polkit-1/rules.d/49-punktfunk-door.rules".source =
         "${cfg.seats.package}/share/polkit-1/rules.d/49-punktfunk-door.rules";

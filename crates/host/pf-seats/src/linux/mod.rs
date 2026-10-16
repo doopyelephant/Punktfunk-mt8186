@@ -201,12 +201,12 @@ fn user_host(account: &str, verb: &str) {
     }
 }
 
-/// The door's group, which reads the box's library. `None` while there is no `punktfunk` group.
+/// The door's group, which reads the box's library. `None` while there is no such group.
 fn door_reader(inner: &Inner) -> Option<shared::Reader> {
     let gid = match inner.door_gid.get() {
         Some(gid) => *gid,
         None => {
-            let gid = accounts::group_gid("punktfunk").ok().flatten()?;
+            let gid = accounts::group_gid(socket::DOOR_GROUP).ok().flatten()?;
             *inner.door_gid.get_or_init(|| gid)
         }
     };
@@ -457,10 +457,10 @@ impl LinuxBackend {
         );
         let group = |name: &str| accounts::group_gid(name).ok().flatten().is_some();
         check(
-            group("punktfunk"),
-            "punktfunk_group",
-            "the punktfunk group exists",
-            "The punktfunk group doesn't exist; reinstall the package that creates it.",
+            group(socket::DOOR_GROUP),
+            "door_group",
+            "the punktfunk-door group exists",
+            "The punktfunk-door group doesn't exist; reinstall the package that creates it.",
         );
         check(
             group("render"),

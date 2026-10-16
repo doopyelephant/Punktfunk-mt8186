@@ -493,6 +493,17 @@ let
       ok = seats.users.groups ? punktfunk-update;
     }
     {
+      # The door's user has a group of its own. `punktfunk` owns the usbip attach nodes and
+      # passes pf-dm-helper, which the door has no use for.
+      name = "the door's units run in a group the module declares";
+      ok =
+        seats.users.groups ? punktfunk-door
+        && lib.all (f: lib.hasInfix "\nGroup=punktfunk-door\n" (builtins.readFile f)) [
+          ../linux/punktfunk-door.service
+          ../linux/punktfunk-web-door.service
+        ];
+    }
+    {
       name = "seats open the seat ports with the host's";
       ok = lib.elem {
         from = 9779;
@@ -519,7 +530,8 @@ let
       ok =
         appliance.networking.firewall.allowedUDPPortRanges == [ ]
         && !(desktop.systemd.services ? punktfunk-door)
-        && !(desktop.users.groups ? punktfunk-update);
+        && !(desktop.users.groups ? punktfunk-update)
+        && !(desktop.users.groups ? punktfunk-door);
     }
 
     # --- the client half must not drag the host's system wiring in -----------------------------

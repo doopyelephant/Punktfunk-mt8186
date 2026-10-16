@@ -273,9 +273,9 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   depend on it at their own version, and it installs the units without enabling them. NixOS turns
   it on with `services.punktfunk.seats.enable`. The SteamOS on-device build lays the same files out
   under `/opt/punktfunk` and `/etc` (`scripts/steamdeck/door.sh`).
-- **The socket.** `/run/punktfunk/seats.sock` carries the same frames and commands as the Windows
-  pipe. It answers root and the `punktfunk` user, judged by the peer's credentials; any other peer
-  is closed unanswered. `enable` answers like `seating`, and `disable` is refused: seats are on while
+- **The socket.** `/run/punktfunk/seats.sock` (`0660 root:punktfunk-door`) carries the same frames
+  and commands as the Windows pipe. It answers root and the `punktfunk` user, judged by the peer's
+  credentials; any other peer is closed unanswered. `enable` answers like `seating`, and `disable` is refused: seats are on while
   the daemon runs. `punktfunk-seats list`, `create <name>`, `adopt-owner <user>`,
   `start|stop|delete <id>` and `doctor` send the same requests.
 - **The user.** Its comment is `punktfunk-seat=<id>`, and the daemon touches or deletes only an
@@ -423,7 +423,10 @@ On a box with [**Reachable without logging in**](/docs/profiles#on-linux) on, th
 is the door: `punktfunk-host serve --door` (or `PUNKTFUNK_DOOR=1`), run as the `punktfunk` user by
 `punktfunk-door.service` with `PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk`. It advertises, pairs,
 serves the management API and places every connect, and opens no display, capture, input or
-audio device. A connect is answered with a `Redirect` to a seat, or refused with
+audio device. Its primary group is `punktfunk-door`, its own: it is not in `punktfunk`, which owns
+the usbip attach nodes and passes `pf-dm-helper`. The seat socket and the box's library copy are
+that group's. `door-helper ports` moves an account an older helper made out of `punktfunk` at the
+next door start. A connect is answered with a `Redirect` to a seat, or refused with
 `SEAT_UNAVAILABLE`: the door never streams. `GET /api/v1/host` reports `door: true`. A host
 started with `PUNKTFUNK_SEAT_SESSION=1` is a seat host and never the door, however the door is
 asked for.

@@ -130,6 +130,8 @@ EOF
         NEED_RELOGIN=1
         warn "added $USER to 'punktfunk-update', which may start the switch — it applies after a reboot"
     fi
+    # The door's units run in this group and don't start without it.
+    ensure_group punktfunk-door || warn "couldn't create the 'punktfunk-door' group — the door won't start"
     sudo systemctl try-restart punktfunk-seats.service punktfunk-door.service punktfunk-web-door.service
     ok "Reachable without logging in: ready to turn on under Profiles in the console"
 }
