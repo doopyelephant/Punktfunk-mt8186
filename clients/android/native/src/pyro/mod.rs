@@ -20,13 +20,15 @@
 //! nor the Vulkan 1.3 device this needs. [`available`] answers for the whole lane.
 
 #[cfg(all(target_os = "android", target_pointer_width = "64"))]
+mod asc;
+#[cfg(all(target_os = "android", target_pointer_width = "64"))]
 mod device;
 #[cfg(all(target_os = "android", target_pointer_width = "64"))]
 mod present;
 
 #[cfg(all(target_os = "android", target_pointer_width = "64"))]
 mod imp {
-    use super::{device::PyroDevice, present::Present};
+    use super::{asc, device::PyroDevice, present::Present};
     use anyhow::{anyhow, Result};
     use ndk::native_window::NativeWindow;
     use pf_client_video::video_color::ColorDesc;
@@ -281,7 +283,24 @@ mod imp {
         let dev = Arc::new(PyroDevice::new(PyroDevice::open_surface(window)?)?);
         stats.set_decoder(&decoder_label(&dev.vkd.device_name), false);
         let smooth = opts.present_priority == 1;
-        let mut present = Present::new(&dev, smooth)?;
+        // The compositor takes our buffers where it can: no acquire, its own scaling. The
+        // swapchain stays for the smoothness intent (FIFO), ChromeOS and drivers without import.
+        let asc = if !smooth && dev.buffers && crate::decode::asc_backend_selected(opts.chromeos) {
+            asc::AscTarget::new(
+                &dev,
+                window,
+                opts.surface_size.clone(),
+                opts.src_crop.clone(),
+                client.mode().refresh_hz as f32,
+            )
+            .unwrap_or_else(|e| {
+                log::warn!("pyro: presenting through the swapchain ({e:#})");
+                None
+            })
+        } else {
+            None
+        };
+        let mut present = Present::new(&dev, smooth, asc)?;
 
         let mut mode = client.mode();
         let mut decoder = open_decoder(client, &dev, mode)?;
@@ -407,7 +426,9 @@ mod imp {
                 opts.src_crop.load(std::sync::atomic::Ordering::Relaxed),
             );
             present.follow(opts.surface_size.load(Ordering::Relaxed))?;
-            let shown = present.show(picture.views, crop, picture.color, depth, msb_packed)?;
+            let size = (picture.width, picture.height);
+            let shown =
+                present.show(picture.views, crop, picture.color, depth, msb_packed, size)?;
             if !shown {
                 continue; // swapchain was out of date; it has been rebuilt
             }

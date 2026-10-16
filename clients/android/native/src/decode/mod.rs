@@ -20,7 +20,7 @@ mod display;
 mod latency;
 mod presenter;
 mod setup;
-mod surface_control;
+pub(crate) mod surface_control;
 mod vsync;
 
 use async_loop::run_async;
@@ -28,6 +28,11 @@ pub(crate) use setup::{codec_label, codec_mime};
 // Shared with the PyroWave lane, which exists only where the codec is built (see `crate::pyro`).
 #[cfg(target_pointer_width = "64")]
 pub(crate) use async_loop::start_hint;
+// The PyroWave lane's `ASurfaceControl` present, 64-bit only like the lane.
+#[cfg(target_pointer_width = "64")]
+pub(crate) use asc_presenter::asc_backend_selected;
+#[cfg(target_pointer_width = "64")]
+pub(crate) use async_loop::DecodeEvent;
 #[cfg(target_pointer_width = "64")]
 pub(crate) use latency::now_realtime_ns;
 #[cfg(target_pointer_width = "64")]

@@ -1,7 +1,7 @@
 {
   "metric": "shipped_nonffi_unsafe_ops",
   "crates": {
-    "clients/android/native": 68,
+    "clients/android/native": 69,
     "clients/apple/native": 16,
     "clients/linux": 1,
     "clients/windows": 2,

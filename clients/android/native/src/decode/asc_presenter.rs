@@ -975,7 +975,7 @@ impl AscBackend {
 /// child layer and signals its present fence, yet Chrome can leave it undrawn, and nothing on
 /// the Android side can tell. `debug.punktfunk.present_backend` overrides both ways: `surfaceview`
 /// forces the SurfaceView presenter, `asc` forces this backend on ChromeOS.
-pub(super) fn asc_backend_selected(chromeos: bool) -> bool {
+pub(crate) fn asc_backend_selected(chromeos: bool) -> bool {
     match sysprop(c"debug.punktfunk.present_backend").as_deref() {
         Some("surfaceview") => false,
         Some("asc") => true,
