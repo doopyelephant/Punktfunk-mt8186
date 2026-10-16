@@ -18,6 +18,7 @@
 # Every read and write that touches a user's home runs as that user, so a link the user plants
 # there can't make root read or overwrite anything the user couldn't.
 set -eu
+export LC_ALL=C
 
 BOX=/var/lib/punktfunk
 MARK="$BOX/door-on"
@@ -44,9 +45,12 @@ ports) user=$(cat "$STATE/owner" 2>/dev/null) || exit 0 ;;
 *) die "usage: door-helper on|off <user>, or door-helper ports" ;;
 esac
 [ "$(id -u)" = 0 ] || die "run as root"
+# The name rule of the seat supervisor, which adopting the owner enforces (pf-seats): lowercase
+# letters, digits, `_` and `-`, starting with a letter or `_`, at most 20 characters.
 case $user in
-'' | *[!a-z0-9_.-]* | [!a-z_]*) die "'$user' is not a user name" ;;
+'' | *[!a-z0-9_-]* | [!a-z_]*) die "'$user' is not a user name the seats accept" ;;
 esac
+[ "${#user}" -le 20 ] || die "'$user' is longer than the seats accept"
 
 passwd_row=$(getent passwd "$user") || die "no user '$user'"
 uid=$(printf '%s' "$passwd_row" | cut -d: -f3)
