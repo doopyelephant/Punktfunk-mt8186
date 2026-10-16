@@ -672,6 +672,7 @@ impl PlatformBackend for LinuxBackend {
         let (box_dir, state) = (&self.inner.box_dir, &self.inner.state);
         let passwd = accounts::require(seat)?;
         accounts::close_home(&passwd.home)?;
+        shared::ensure_games(state, accounts::ensure_group(accounts::GAMES_GROUP)?)?;
         shared::ensure_seat_dirs(state, &seat.id, &passwd)?;
         let reader = shared::Reader::group(passwd.gid);
         shared::refresh_trust(box_dir, state, &seat.id, reader)?;

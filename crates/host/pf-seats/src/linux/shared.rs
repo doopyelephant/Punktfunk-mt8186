@@ -191,6 +191,10 @@ fn check_owned(path: &Path, forbidden: u32) -> std::io::Result<()> {
 /// seat creates is writable by the others. Every seat writes in it, so each folder is opened
 /// through the one above it without following a link, and changed through its own handle;
 /// `setfacl` gets each as `/proc/<pid>/fd/<n>`, which names that folder whatever its path holds.
+///
+/// `games` is sticky, so a seat can't replace `steamapps`. A link or file a seat leaves where a
+/// bind target belongs is removed. Run at each seat start: a unit's `BindPaths=` names the
+/// targets, and a planted link would send the mount somewhere else.
 pub(super) fn ensure_games(state: &Path, gid: u32) -> Result<(), BackendError> {
     let io = |what: &str, e| io_err("games_dir", what, e);
     let top = safe_open::dir(state).map_err(|e| io("open the state directory", e))?;
@@ -200,10 +204,12 @@ pub(super) fn ensure_games(state: &Path, gid: u32) -> Result<(), BackendError> {
     for name in ["common", "compatdata", "shadercache", "downloading"] {
         dirs.push(dir_in(&steamapps, name).map_err(|e| io(&format!("open {name}"), e))?);
     }
-    dirs.extend([games, steamapps]);
-    for dir in &dirs {
+    dirs.extend([steamapps, games]);
+    for (i, dir) in dirs.iter().enumerate() {
+        let sticky = i + 1 == dirs.len();
+        let mode = if sticky { 0o3775 } else { 0o2775 };
         std::os::unix::fs::fchown(dir, Some(0), Some(gid)).map_err(|e| io("own a folder", e))?;
-        rustix::fs::fchmod(dir, Mode::from_raw_mode(0o2775 as _))
+        rustix::fs::fchmod(dir, Mode::from_raw_mode(mode as _))
             .map_err(|e| io("set the mode of a folder", e.into()))?;
     }
     let group = super::accounts::GAMES_GROUP;
@@ -217,14 +223,23 @@ pub(super) fn ensure_games(state: &Path, gid: u32) -> Result<(), BackendError> {
     run("setfacl_failed", "setfacl", &args).map(drop)
 }
 
-/// `name` in `at`, created if absent, as a handle; a link there is refused.
+/// `name` in `at`, created if absent, as a handle. A link or file there is removed, never
+/// followed, and the folder made in its place.
 fn dir_in(at: &OwnedFd, name: &str) -> std::io::Result<OwnedFd> {
-    match rustix::fs::mkdirat(at, name, Mode::from_raw_mode(0o2775 as _)) {
-        Ok(()) => {}
-        Err(e) if e == rustix::io::Errno::EXIST => {}
-        Err(e) => return Err(e.into()),
-    }
-    safe_open::dir_at(at, name)?.ok_or_else(|| std::io::ErrorKind::NotFound.into())
+    let make = || match rustix::fs::mkdirat(at, name, Mode::from_raw_mode(0o2775 as _)) {
+        Ok(()) | Err(Errno::EXIST) => Ok(()),
+        Err(e) => Err(e),
+    };
+    make()?;
+    let opened = match safe_open::dir_at(at, name) {
+        Err(e) if matches!(Errno::from_io_error(&e), Some(Errno::NOTDIR | Errno::LOOP)) => {
+            rustix::fs::unlinkat(at, name, AtFlags::empty())?;
+            make()?;
+            safe_open::dir_at(at, name)?
+        }
+        opened => opened?,
+    };
+    opened.ok_or_else(|| std::io::ErrorKind::NotFound.into())
 }
 
 /// The access ACL as the kernel stores it: a 4-byte version 2, then 8-byte entries, little-endian.
@@ -984,6 +999,27 @@ mod tests {
         ] {
             assert!(!crate::steam::skipped(kept), "{kept}");
         }
+    }
+
+    /// A seat that plants a link or a file where a bind target belongs gets a folder there, and
+    /// what the link led to stays as it was.
+    #[test]
+    fn a_planted_bind_target_is_replaced_by_a_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let (steamapps, outside) = (temp.path().join("steamapps"), temp.path().join("outside"));
+        std::fs::create_dir(&steamapps).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, steamapps.join("compatdata")).unwrap();
+        std::fs::write(steamapps.join("shadercache"), "x").unwrap();
+        std::fs::create_dir(steamapps.join("downloading")).unwrap();
+        let at = safe_open::dir(&steamapps).unwrap();
+        for name in ["compatdata", "shadercache", "downloading", "common"] {
+            dir_in(&at, name).unwrap();
+            let kind = std::fs::symlink_metadata(steamapps.join(name)).unwrap();
+            assert!(kind.is_dir(), "{name}");
+        }
+        assert!(outside.join("keep").exists());
     }
 
     #[test]
