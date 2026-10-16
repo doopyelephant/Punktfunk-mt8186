@@ -143,6 +143,9 @@ number is never reused.
   0010-encoder-cached-plane-views.patch — the encoder keeps its three plane
     views while the caller passes the same images, instead of wrapping and
     destroying them every frame (0.15-0.25 ms of CPU per frame).
+  0011-decoder-in-place-payload.patch — the decoder reads packets from a
+    buffer the caller owns and wrote them into (set_payload_memory,
+    push_packet_in_place) instead of copying each packet twice and uploading it.
 
 Retired (upstream carries the fix):
   0006 external-memory consume-on-success-only — Granite b6cffd5c (2026-09-23)

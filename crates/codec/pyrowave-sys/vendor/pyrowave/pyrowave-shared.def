@@ -40,6 +40,8 @@ EXPORTS
 	pyrowave_decoder_create
 	pyrowave_decoder_clear
 	pyrowave_decoder_push_packet
+	pyrowave_decoder_set_payload_memory
+	pyrowave_decoder_push_packet_in_place
 	pyrowave_decoder_decode_is_ready
 	pyrowave_decoder_decode_is_ready_with_sideband
 	pyrowave_decoder_decode_gpu_buffer

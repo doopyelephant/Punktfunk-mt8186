@@ -1671,6 +1671,30 @@ pyrowave_decoder_push_packet(pyrowave_decoder decoder, const void *data, size_t 
 	return ret ? PYROWAVE_SUCCESS : PYROWAVE_ERROR_INVALID_ARGUMENT;
 }
 
+pyrowave_result
+pyrowave_decoder_set_payload_memory(pyrowave_decoder decoder, const pyrowave_payload_memory *memory)
+{
+	Util::set_thread_logging_interface(&null_logger);
+	if (!memory)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	const uint64_t linear[3] = {
+		uint64_t(uintptr_t(memory->linear[0])),
+		uint64_t(uintptr_t(memory->linear[1])),
+		uint64_t(uintptr_t(memory->linear[2])),
+	};
+	bool ret = decoder->decoder.set_payload_memory(uint64_t(uintptr_t(memory->buffer)), memory->size,
+	                                               memory->copy_reserve, memory->host, linear, memory->rows);
+	return ret ? PYROWAVE_SUCCESS : PYROWAVE_ERROR_INVALID_ARGUMENT;
+}
+
+pyrowave_result
+pyrowave_decoder_push_packet_in_place(pyrowave_decoder decoder, const void *data, size_t size)
+{
+	Util::set_thread_logging_interface(&null_logger);
+	bool ret = decoder->decoder.push_packet_in_place(data, size);
+	return ret ? PYROWAVE_SUCCESS : PYROWAVE_ERROR_INVALID_ARGUMENT;
+}
+
 // For error correction purposes, it may be okay to decode a frame which dropped some packets.
 bool pyrowave_decoder_decode_is_ready(pyrowave_decoder decoder, bool allow_partial_frame)
 {
