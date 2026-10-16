@@ -176,14 +176,10 @@ fn run_ephemeral(opts: Punktfunk1Options) -> Result<()> {
     rt.block_on(serve(opts, 0, np, test_profiles(), stats, ident, None))
 }
 
-/// A profile store in a temp file: tests never read or write the real `profiles.json`.
+/// A profile store in a scratch dir: tests never read or write the real `profiles.json`.
 #[cfg(test)]
 pub(crate) fn test_profiles() -> Arc<crate::profiles::Profiles> {
-    use std::sync::atomic::AtomicUsize;
-    static SEQ: AtomicUsize = AtomicUsize::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("pf-profiles-{}-{n}.json", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let path = crate::test_support::scratch().join("profiles.json");
     Arc::new(crate::profiles::Profiles::load_with(Some(path), None))
 }
 

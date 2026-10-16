@@ -5,11 +5,7 @@ use super::*;
 /// A state whose profile store holds the owner, in a temp file.
 fn state_with_profiles(tag: &str) -> Arc<AppState> {
     let state = test_state();
-    let path = std::env::temp_dir().join(format!(
-        "pf-mgmt-profiles-{tag}-{}.json",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&path);
+    let path = crate::test_support::scratch().join(format!("pf-mgmt-profiles-{tag}.json"));
     let profiles = crate::profiles::Profiles::load_with(Some(path), None);
     profiles.ensure_owner("box").unwrap();
     let _ = state.profiles.set(Arc::new(profiles));
@@ -23,9 +19,7 @@ fn state_with_profiles(tag: &str) -> Arc<AppState> {
 async fn the_cert_lane_reads_profiles_but_never_edits_them() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir().join(format!("pf-mgmt-prof-cert-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-prof-cert.json")),
             None,
             false,
         )
@@ -56,9 +50,7 @@ async fn waking_another_profiles_seat_needs_the_launch_grant() {
     use punktfunk_core::quic::{GRANT_GAMEPAD, GRANT_LAUNCH};
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir().join(format!("pf-mgmt-prof-wake-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-prof-wake.json")),
             None,
             false,
         )
@@ -292,10 +284,7 @@ async fn status_blanks_another_devices_profile() {
     let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir()
-                    .join(format!("pf-mgmt-prof-status-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-prof-status.json")),
             None,
             false,
         )
@@ -344,7 +333,7 @@ async fn a_knock_shows_the_profile_it_named() {
     let owner_name = store.get(&owner).unwrap().display_name;
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-knock-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-knock.json")),
             None,
             false,
         )
@@ -362,7 +351,7 @@ async fn a_knock_shows_the_profile_it_named() {
 /// Enumerate marks the profile the asking device's old seat became, and only for that device.
 #[tokio::test]
 async fn enumerate_marks_the_devices_old_seat() {
-    let path = std::env::temp_dir().join(format!("pf-mgmt-legacy-{}.json", std::process::id()));
+    let path = crate::test_support::scratch().join("pf-mgmt-legacy.json");
     std::fs::write(
         &path,
         r#"{"version":1,"profiles":[
@@ -380,9 +369,7 @@ async fn enumerate_marks_the_devices_old_seat() {
         )));
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir().join(format!("pf-mgmt-legacy-np-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-legacy-np.json")),
             None,
             false,
         )

@@ -171,7 +171,9 @@ mod imp {
     /// A journal a dead host wrote is what the next host reads back; an empty one is no file.
     #[test]
     fn the_journal_survives_a_round_trip_through_its_file() {
-        let p = std::env::temp_dir().join("pf-layout-db-roundtrip.json");
+        // Its own dir: `write` hardens the parent, which must not be the shared temp root.
+        let dir = std::env::temp_dir().join(format!("pf-layout-db-{}", std::process::id()));
+        let p = dir.join("roundtrip.json");
         let journal = vec![Stored {
             set: vec!["a".into(), "b".into()],
             dark: vec!["a".into()],
@@ -180,6 +182,7 @@ mod imp {
         assert_eq!(read(&p), journal);
         assert!(write(&p, &[]));
         assert!(!p.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

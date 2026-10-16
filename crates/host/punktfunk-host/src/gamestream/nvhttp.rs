@@ -921,11 +921,7 @@ mod tests {
         Arc<crate::native_pairing::NativePairing>,
         std::path::PathBuf,
     ) {
-        let p = std::env::temp_dir().join(format!(
-            "pf-nvhttp-access-{tag}-{}.json",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_file(&p);
+        let p = crate::test_support::scratch().join(format!("pf-nvhttp-access-{tag}.json"));
         let np = Arc::new(
             crate::native_pairing::NativePairing::load_with(Some(p.clone()), None, false).unwrap(),
         );

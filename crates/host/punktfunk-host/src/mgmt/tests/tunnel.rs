@@ -102,8 +102,7 @@ async fn a_tunnelled_device_token_reads_the_library_and_no_more() {
     use rcgen::{KeyPair, PublicKeyData as _, SigningKey as _, PKCS_ECDSA_P256_SHA256};
 
     let b64 = base64::engine::general_purpose::STANDARD;
-    let path = std::env::temp_dir().join(format!("pf-mgmt-tunnel-{}.json", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let path = crate::test_support::scratch().join("pf-mgmt-tunnel.json");
     let np =
         Arc::new(crate::native_pairing::NativePairing::load_with(Some(path), None, false).unwrap());
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
@@ -195,8 +194,7 @@ async fn a_paired_device_key_buys_the_cert_lane_and_no_more() {
     use rcgen::{KeyPair, PublicKeyData as _, SigningKey as _, PKCS_ECDSA_P256_SHA256};
 
     let b64 = base64::engine::general_purpose::STANDARD;
-    let path = std::env::temp_dir().join(format!("pf-mgmt-device-{}.json", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let path = crate::test_support::scratch().join("pf-mgmt-device.json");
     let np =
         Arc::new(crate::native_pairing::NativePairing::load_with(Some(path), None, false).unwrap());
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();

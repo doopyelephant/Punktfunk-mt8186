@@ -955,10 +955,6 @@ fn the_clean_round_runs_under_the_ceiling_over_a_session() {
     host.join().unwrap().unwrap();
 }
 
-fn test_paired_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("punktfunk-paired-test-{}.json", std::process::id()))
-}
-
 /// Unpaired knock is parked; approve while waiting admits the same connection, no reconnect.
 #[test]
 fn delegated_approval_admits_after_knock() {
@@ -967,8 +963,7 @@ fn delegated_approval_admits_after_knock() {
     use punktfunk_core::client::{ConnectParams, NativeClient};
     use punktfunk_core::quic::endpoint;
 
-    let store = std::env::temp_dir().join(format!("pf-approval-test-{}.json", std::process::id()));
-    let _ = std::fs::remove_file(&store);
+    let store = crate::test_support::scratch().join("pf-approval-test.json");
     let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
     let np_host = np.clone();
     let host = std::thread::spawn(move || {
@@ -1095,8 +1090,7 @@ fn access_request_pairs_without_a_session() {
     use punktfunk_core::client::NativeClient;
     use punktfunk_core::quic::endpoint;
 
-    let store = std::env::temp_dir().join(format!("pf-access-test-{}.json", std::process::id()));
-    let _ = std::fs::remove_file(&store);
+    let store = crate::test_support::scratch().join("pf-access-test.json");
     let np = Arc::new(NativePairing::load_with(Some(store.clone()), None, false).unwrap());
     let np_host = np.clone();
     let host = std::thread::spawn(move || {
@@ -1202,7 +1196,9 @@ fn pairing_ceremony_and_gate() {
     use punktfunk_core::client::{ConnectParams, NativeClient};
     use punktfunk_core::quic::endpoint;
 
-    let host = std::thread::spawn(|| {
+    let store = crate::test_support::scratch().join("punktfunk-paired-test.json");
+    let paired_store = Some(store.clone());
+    let host = std::thread::spawn(move || {
         run_ephemeral(Punktfunk1Options {
             port: 19778,
             source: Punktfunk1Source::Synthetic,
@@ -1213,7 +1209,7 @@ fn pairing_ceremony_and_gate() {
             require_pairing: true,
             allow_pairing: false,
             pairing_pin: Some("4321".into()),
-            paired_store: Some(test_paired_path()),
+            paired_store,
             idle_timeout: None,
             mdns: false,
         })
@@ -1237,7 +1233,7 @@ fn pairing_ceremony_and_gate() {
     // 2: correct PIN → paired. The one online attempt consumes the window (step 4).
     let host_fp = NativeClient::pair("127.0.0.1", 19778, identity, "4321", "test-client", timeout)
         .expect("pairing with the right PIN");
-    assert!(test_paired_path().exists());
+    assert!(store.exists());
 
     // 3: paired identity gets a session, pinned to the ceremony fingerprint.
     let client = NativeClient::connect(ConnectParams {
@@ -1257,7 +1253,6 @@ fn pairing_ceremony_and_gate() {
         NativeClient::pair("127.0.0.1", 19778, identity, "4321", "too-late", timeout).is_err(),
         "the PIN window must be single-use (one online guess)"
     );
-    let _ = std::fs::remove_file(test_paired_path());
 
     host.join().unwrap().unwrap();
 }
@@ -1345,7 +1340,7 @@ fn spawn_profile_host(
 
 /// Paired-store temp path; the shared-`np` hosts persist through it.
 fn access_store_path(tag: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("pf-access-{tag}-{}.json", std::process::id()))
+    crate::test_support::scratch().join(format!("pf-access-{tag}.json"))
 }
 
 /// `ClientHello` → `ServerHello` → `Ready`, returning streams so a test can read
@@ -1747,8 +1742,7 @@ fn a_profile_is_resolved_in_the_handshake() {
     let (cert, key) = endpoint::generate_identity().unwrap();
     let fp_hex = hex::encode(endpoint::fingerprint_of_pem(&cert).unwrap());
     np.add_with_access("Couch", &fp_hex, None).unwrap();
-    let file =
-        std::env::temp_dir().join(format!("pf-handshake-profiles-{}.json", std::process::id()));
+    let file = crate::test_support::scratch().join("pf-handshake-profiles.json");
     std::fs::write(
         &file,
         br#"{"version":1,"profiles":[
