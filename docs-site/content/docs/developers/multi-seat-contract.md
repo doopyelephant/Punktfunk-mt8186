@@ -13,7 +13,8 @@ to it. Windows seats need Windows Server and a CAL per seat; see
 The `PunktfunkHost` service runs the supervisor beside the console host, as LocalSystem in session
 0. It owns the seat accounts, the Windows sessions, RDP and the seat ledger in
 `%ProgramData%\punktfunk\seats\`. Seat hosts run in jobs of its own, so a console logon or a console
-host restart leaves them running; stopping the service logs every seat account off.
+host restart leaves them running; stopping the service logs every seat account off. After a
+crash the next start does the same for sessions a seat's games left behind.
 
 - **The pipe.** `\\.\pipe\punktfunk-seats` admits SYSTEM and Administrators only and refuses
   remote clients. Each connection carries one request: a four-byte big-endian length, then JSON,

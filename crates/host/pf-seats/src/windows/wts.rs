@@ -88,26 +88,36 @@ pub(super) fn any_for_account(account: &str) -> WinResult<Option<Session>> {
     one_account_session(account, false)
 }
 
-/// Logs off every session of `account`, whatever its state. None is success.
-pub(super) fn logoff_account_if_present(account: &str) -> WinResult<()> {
-    for session in sessions_of(account, false)? {
+/// Logs off every session of `account`, whatever its state, and counts them. None is success.
+pub(super) fn logoff_account_if_present(account: &str) -> WinResult<usize> {
+    let sessions = sessions_of(account, false)?;
+    for session in &sessions {
         logoff(session.id)?;
     }
-    Ok(())
+    Ok(sessions.len())
 }
 
 /// The non-console local sessions of `account`, and only the active ones when `active_only`.
 fn sessions_of(account: &str, active_only: bool) -> WinResult<Vec<Session>> {
     let machine = computer_name()?;
-    Ok(enumerate()?
+    Ok(of_account(enumerate()?, account, &machine, active_only))
+}
+
+fn of_account(
+    sessions: Vec<Session>,
+    account: &str,
+    machine: &str,
+    active_only: bool,
+) -> Vec<Session> {
+    sessions
         .into_iter()
         .filter(|session| {
             (!active_only || session.state == WTSActive)
                 && !session.console
                 && session.user.eq_ignore_ascii_case(account)
-                && (session.domain.is_empty() || session.domain.eq_ignore_ascii_case(&machine))
+                && (session.domain.is_empty() || session.domain.eq_ignore_ascii_case(machine))
         })
-        .collect())
+        .collect()
 }
 
 fn one_account_session(account: &str, active_only: bool) -> WinResult<Option<Session>> {
@@ -149,4 +159,45 @@ fn query_string(
     // SAFETY: this is the allocation returned by WTSQuerySessionInformationW and is freed once.
     unsafe { WTSFreeMemory(buffer.0.cast()) };
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::RemoteDesktop::WTSDisconnected;
+
+    fn session(id: u32, user: &str, domain: &str, state: WTS_CONNECTSTATE_CLASS) -> Session {
+        Session {
+            id,
+            user: user.into(),
+            domain: domain.into(),
+            state,
+            console: false,
+        }
+    }
+
+    /// A logoff by account name reaches this computer's sessions of that account, active or
+    /// not, and never the console, another account, or a domain account of the same name.
+    #[test]
+    fn an_account_s_sessions_exclude_the_console_and_strangers() {
+        let console = Session {
+            console: true,
+            ..session(1, "pf-seat-1", "BOX", WTSActive)
+        };
+        let all = vec![
+            console,
+            session(2, "pf-seat-1", "BOX", WTSDisconnected),
+            session(3, "PF-SEAT-1", "box", WTSActive),
+            session(4, "pf-seat-2", "BOX", WTSDisconnected),
+            session(5, "pf-seat-1", "CORP", WTSDisconnected),
+        ];
+        let ids = |active_only| -> Vec<u32> {
+            of_account(all.clone(), "pf-seat-1", "BOX", active_only)
+                .iter()
+                .map(|session| session.id)
+                .collect()
+        };
+        assert_eq!(ids(false), [2, 3]);
+        assert_eq!(ids(true), [3]);
+    }
 }

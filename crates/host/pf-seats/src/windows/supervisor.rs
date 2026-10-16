@@ -9,7 +9,8 @@
 //! Start blocks until the keeper's session is active, the same-session SDR quality gate
 //! has passed and the host holds both ports. A cycle that ends closes the keeper's job
 //! and logs off the account's session. Explicit stop is idempotent and waits for
-//! that teardown to finish.
+//! that teardown to finish. A service that died leaves the sessions of children that broke
+//! away from the job; the first look at each seat logs them off.
 
 use crate::bootstrap::RdpBootstrap;
 use crate::model::{RuntimeStatus, Seat};
@@ -21,7 +22,7 @@ use crate::windows::rdp;
 use crate::windows::util::{backend_error, io_error, port_open, udp_port_owners, WinResult};
 use crate::windows::wts;
 use rand::Rng as _;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -36,6 +37,8 @@ pub(super) struct Supervisor {
     accounts: AccountManager,
     host_path: PathBuf,
     runtimes: Arc<Mutex<HashMap<String, Arc<Runtime>>>>,
+    /// The seats whose account [`Self::sweep_leftovers`] has looked at.
+    swept: Arc<Mutex<HashSet<String>>>,
 }
 
 struct Runtime {
@@ -88,6 +91,7 @@ impl Supervisor {
             accounts,
             host_path,
             runtimes: Arc::new(Mutex::new(HashMap::new())),
+            swept: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -254,9 +258,42 @@ impl Supervisor {
 
     /// Logs off `seat`'s account for a caller that holds no runtime of it, so nothing here
     /// proved the account is the seat's. A stranger's account of that name keeps its sessions.
-    fn logoff_owned(&self, seat: &Seat) -> WinResult<()> {
+    fn logoff_owned(&self, seat: &Seat) -> WinResult<usize> {
         self.accounts.ensure_owned_or_absent(seat)?;
         wts::logoff_account_if_present(&seat.account)
+    }
+
+    /// Logs off what a service that died left in `seat`'s account: a child that broke away from
+    /// the job outlives it, in a disconnected session. The first look at a seat this process
+    /// doesn't run does it, and the service's ledger lock keeps a start from overlapping it.
+    pub(super) fn sweep_leftovers(&self, seat: &Seat) {
+        if !self.claim_sweep(seat) {
+            return;
+        }
+        match self.logoff_owned(seat) {
+            Ok(0) => {}
+            Ok(sessions) => {
+                tracing::info!(seat = %seat.id, sessions, "leftover seat session logged off");
+            }
+            Err(cause) => {
+                tracing::warn!(seat = %seat.id, %cause, "leftover seat session not logged off");
+            }
+        }
+    }
+
+    /// `true` once per seat, and only while no runtime of ours holds it.
+    fn claim_sweep(&self, seat: &Seat) -> bool {
+        let held = self
+            .runtimes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains_key(seat.id.as_str());
+        !held
+            && self
+                .swept
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(seat.id.to_string())
     }
 
     pub(super) fn status(&self, seat: &Seat) -> RuntimeSnapshot {
@@ -760,5 +797,27 @@ mod tests {
         let refused = supervisor.stop(&seat(&name)).unwrap_err();
         assert_eq!(refused.code, "account_not_owned");
         assert!(supervisor.stop(&seat("pfs-absent")).is_ok());
+    }
+
+    /// The sweep looks at a seat once, and not while a runtime of ours holds it.
+    #[test]
+    fn a_seat_is_swept_once_and_not_while_it_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(temp.path());
+        let idle = seat("pfs-idle");
+        assert!(supervisor.claim_sweep(&idle));
+        assert!(!supervisor.claim_sweep(&idle));
+
+        let running = seat("pfs-running");
+        let runtime = Arc::new(Runtime::new(running.account.clone()));
+        let key = running.id.to_string();
+        supervisor
+            .runtimes
+            .lock()
+            .unwrap()
+            .insert(key.clone(), runtime);
+        assert!(!supervisor.claim_sweep(&running));
+        supervisor.runtimes.lock().unwrap().remove(&key);
+        assert!(supervisor.claim_sweep(&running));
     }
 }

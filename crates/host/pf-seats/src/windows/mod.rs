@@ -249,6 +249,13 @@ impl PlatformBackend for WindowsBackend {
         Ok(self.supervisor.status(seat).status)
     }
 
+    /// Before TermService runs there is no session to find, and the look waits for it.
+    fn reconcile(&self, seat: &Seat, _status: &RuntimeStatus) {
+        if termservice_running().unwrap_or(false) {
+            self.supervisor.sweep_leftovers(seat);
+        }
+    }
+
     fn doctor(&self, ledger: &Ledger) -> Result<Vec<Diagnostic>, BackendError> {
         Ok(self.doctor_report(ledger))
     }
