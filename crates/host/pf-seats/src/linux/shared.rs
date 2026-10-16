@@ -1172,6 +1172,27 @@ mod tests {
         assert!(outside.join("keep").exists());
     }
 
+    /// A new seat's list names its own Steam at entry 0, the games folder after it, and a list
+    /// Steam already wrote stays.
+    #[test]
+    fn a_new_seat_lists_its_own_steam_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, steam) = (temp.path().join("state"), temp.path().join("home/Steam"));
+        write_library_folders(&state, &steam).unwrap();
+        let file = steam.join("steamapps/libraryfolders.vdf");
+        let listed = crate::steam::library_paths(&std::fs::read_to_string(&file).unwrap());
+        assert_eq!(
+            listed,
+            [
+                steam.to_string_lossy().into_owned(),
+                state.join("games").to_string_lossy().into_owned(),
+            ]
+        );
+        std::fs::write(&file, "steam's own").unwrap();
+        write_library_folders(&state, &steam).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "steam's own");
+    }
+
     #[test]
     fn a_clone_lists_what_a_seat_inherits() {
         let temp = tempfile::tempdir().unwrap();
