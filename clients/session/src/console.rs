@@ -12,6 +12,9 @@
 //! models. `PUNKTFUNK_FAKE_LIBRARY=<file.json>` feeds canned entries with no host
 //! (portrait paths starting with `/` load from disk), the GPU-only dev path.
 
+// Windows counts `Instant` from boot, so `now - 60 s` panics in a console started at log-in.
+#![warn(clippy::unchecked_time_subtraction)]
+
 use crate::session_main::{
     arg_flag, arg_value, fullscreen_mode, parse_host_port, session_params, stats_tier, window_pos,
 };
@@ -436,7 +439,7 @@ impl Service {
                     discovered: HashMap::new(),
                     probed: Arc::new(Mutex::new(HashMap::new())),
                     probe_inflight: Arc::new(AtomicBool::new(false)),
-                    last_probe: Instant::now() - Duration::from_secs(60),
+                    last_probe: None,
                     wake_cancel: None,
                     pair_gen: Arc::new(AtomicU64::new(0)),
                     rescan: None,
@@ -472,7 +475,9 @@ struct ServiceState {
     /// Probe results by row key, written by sweep threads.
     probed: Arc<Mutex<HashMap<String, bool>>>,
     probe_inflight: Arc<AtomicBool>,
-    last_probe: Instant,
+    /// When the last sweep ran; `None` runs one on the next tick. Never an instant in the
+    /// past: Windows' clock starts at boot, and subtracting past it panics.
+    last_probe: Option<Instant>,
     /// Cancels the active wake thread (it owns the model's wake status).
     wake_cancel: Option<Arc<AtomicBool>>,
     /// Bumped per pairing. A ceremony the player left still persists, but only the
@@ -526,7 +531,7 @@ impl ServiceState {
         // are rebuilt on a floor as well as when something could have moved them. The stores
         // under them are read again only when a file changed.
         let mut dirty = true;
-        let mut last_rows = Instant::now() - Duration::from_secs(1);
+        let mut last_rows = Instant::now();
         while !stop.load(Ordering::SeqCst) {
             // mDNS churn.
             while let Ok(ev) = discovery_rx.try_recv() {
@@ -541,7 +546,9 @@ impl ServiceState {
                 self.stores.forget();
             }
 
-            let probe_due = self.last_probe.elapsed() >= Duration::from_secs(10);
+            let probe_due = self
+                .last_probe
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(10));
             if dirty || probe_due || last_rows.elapsed() >= Duration::from_millis(500) {
                 self.publish_rows(probe_due);
                 last_rows = Instant::now();
@@ -576,7 +583,7 @@ impl ServiceState {
             self.learn_from_adverts();
         }
         if probe_due {
-            self.last_probe = Instant::now();
+            self.last_probe = Some(Instant::now());
             self.sweep(&rows);
             self.refresh_host_state(&rows);
         }
@@ -698,12 +705,10 @@ impl ServiceState {
                 }
             }
             ConsoleCmd::Probe => {
-                self.last_probe = Instant::now() - Duration::from_secs(60);
-                // "Refresh presence" means the mDNS half too, not just the QUIC sweep: the browse
-                // runs for the process's lifetime and `mdns-sd` backs its re-query interval off to
-                // as much as an hour, so a host that appeared since startup may never be asked
-                // for again. (No console screen emits Probe yet — every face button on the home
-                // screen is spoken for — but the plumbing is correct for when one does.)
+                self.last_probe = None;
+                // Home's Rescan tile. It re-queries mDNS too: the browse lives as long as the
+                // process and `mdns-sd` backs its re-query off to an hour, so a host that
+                // appeared since startup may otherwise never be asked for.
                 if let Some(r) = &self.rescan {
                     r.request();
                 }
@@ -1094,7 +1099,7 @@ impl ServiceState {
         if let Err(e) = saved {
             self.save_failed(&e);
         }
-        self.last_probe = Instant::now() - Duration::from_secs(60); // probe it now
+        self.last_probe = None; // probe it now
     }
 
     /// Edited in place, never removed and re-added: the pin, the learned MACs, the pinned
@@ -1111,7 +1116,7 @@ impl ServiceState {
             true
         });
         if found {
-            self.last_probe = Instant::now() - Duration::from_secs(60); // the address moved
+            self.last_probe = None; // the address moved
         }
     }
 
@@ -1128,7 +1133,7 @@ impl ServiceState {
         }
         // It may still be advertising, in which case it comes straight back as a
         // DISCOVERED row — unsaved and unpaired, which is the honest state.
-        self.last_probe = Instant::now() - Duration::from_secs(60);
+        self.last_probe = None;
     }
 
     fn unpair_host(&self, key: String) {
