@@ -133,6 +133,12 @@ Licensing** alone isn't enough: Session Host is its own part of the Remote Deskt
 A seat starting puts it back. If the line stays, turn seats off and on under **Profiles** →
 **Seats**.
 
+### Remote Desktop's certificate has changed
+
+Windows renews the certificate Remote Desktop presents when it expires or the PC is renamed.
+Seats only sign in to the one they recorded. Turn seats off and on under **Profiles** →
+**Seats** to record the new one.
+
 ### The seat didn't start in time
 
 The line says which step it stopped at. **Doctor** names the failing check; the seat's log has the
