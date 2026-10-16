@@ -75,6 +75,42 @@ fn box_file() -> ProfilesFile {
 }
 
 #[test]
+fn a_profile_create_would_refuse_is_vetted_before_its_seat_is_made() {
+    let (p, _) = store("vet", &box_file(), None);
+    let new = |name: &str| ProfileCreate {
+        display_name: name.into(),
+        accent: None,
+        home: None,
+        seat: true,
+    };
+    assert_eq!(p.vet_create(&new("  New\u{7}Kid  ")).unwrap(), "NewKid");
+    assert_eq!(
+        p.vet_create(&new(&"x".repeat(80))).unwrap().len(),
+        DISPLAY_NAME_MAX
+    );
+    assert!(matches!(
+        p.vet_create(&new("kid")),
+        Err(EditError::NameTaken)
+    ));
+    assert!(matches!(
+        p.vet_create(&new(" \u{7} ")),
+        Err(EditError::Invalid(_))
+    ));
+    let red = ProfileCreate {
+        accent: Some("red".into()),
+        ..new("Fresh")
+    };
+    assert!(matches!(p.vet_create(&red), Err(EditError::Invalid(_))));
+
+    let mut full = box_file();
+    full.profiles = (0..PROFILES_MAX)
+        .map(|i| profile(&format!("{i:012x}"), &format!("P{i}"), OsAccount::Operator))
+        .collect();
+    let (p, _) = store("vet-full", &full, None);
+    assert!(matches!(p.vet_create(&new("Fresh")), Err(EditError::Full)));
+}
+
+#[test]
 fn no_ask_from_a_device_with_an_old_seat_lands_in_that_profile() {
     let (p, _) = store("legacy", &box_file(), None);
     let r = p.resolve(Some(DEVICE), None).unwrap();

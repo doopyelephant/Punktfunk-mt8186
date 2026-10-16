@@ -363,6 +363,18 @@ impl Profiles {
         default_profile(&self.lock().file).map(|p| p.id.clone())
     }
 
+    /// The name [`create`](Self::create) would take `input` under, or what it would refuse. The
+    /// caller asks before it makes a seat's account for the profile.
+    pub fn vet_create(&self, input: &ProfileCreate) -> Result<String, EditError> {
+        let name = clean_name(&input.display_name)
+            .ok_or_else(|| EditError::Invalid("a profile needs a name".into()))?;
+        if let Some(accent) = &input.accent {
+            valid_accent(accent.clone())?;
+        }
+        refuse_new(&self.lock().file, &name)?;
+        Ok(name)
+    }
+
     /// `seat` is the ledger row the profile's desktop runs on, which the caller makes for
     /// `input.seat`; `None` shares the owner's desktop.
     pub fn create(&self, input: ProfileCreate, seat: Option<String>) -> Result<Profile, EditError> {
@@ -371,12 +383,7 @@ impl Profiles {
         let accent = input.accent.map(valid_accent).transpose()?;
         let mut made = None;
         self.edit(|file| {
-            if file.profiles.len() >= PROFILES_MAX {
-                return Err(EditError::Full);
-            }
-            if name_taken(&file.profiles, &name, None) {
-                return Err(EditError::NameTaken);
-            }
+            refuse_new(file, &name)?;
             let now = now_unix();
             let os_account = match &seat {
                 Some(row) => OsAccount::Seat {
@@ -966,6 +973,17 @@ pub fn clean_name(raw: &str) -> Option<String> {
         .collect();
     let name = name.trim_end().to_string();
     (!name.is_empty()).then_some(name)
+}
+
+/// Why `file` takes no new profile called `name`.
+fn refuse_new(file: &ProfilesFile, name: &str) -> Result<(), EditError> {
+    if file.profiles.len() >= PROFILES_MAX {
+        return Err(EditError::Full);
+    }
+    if name_taken(&file.profiles, name, None) {
+        return Err(EditError::NameTaken);
+    }
+    Ok(())
 }
 
 fn name_taken(profiles: &[Profile], name: &str, except: Option<&str>) -> bool {

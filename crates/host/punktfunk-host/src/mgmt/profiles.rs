@@ -611,8 +611,12 @@ pub(crate) async fn create_profile(
             "Turn on Reachable without logging in before adding a profile with a desktop of its own.",
         );
     }
+    // Vetted before the seat's account exists: a refused profile must leave none behind.
     let seat = if input.seat {
-        let name = input.display_name.clone();
+        let name = match profiles.vet_create(&input) {
+            Ok(name) => name,
+            Err(e) => return edit_error(e),
+        };
         match blocking("seat supervisor", move || new_seat(&name)).await {
             Ok(Ok(id)) => Some(id),
             Ok(Err(refusal)) => return refused(refusal),
