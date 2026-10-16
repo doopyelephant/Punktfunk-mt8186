@@ -129,6 +129,7 @@ fn public(
     owner: Option<&str>,
     device: Option<&str>,
     seats: &Snapshot,
+    operator: bool,
 ) -> ProfilePublic {
     let is_owner = owner == Some(p.id.as_str());
     ProfilePublic {
@@ -140,7 +141,7 @@ fn public(
         home: p.home,
         // A door plays every profile on a seat, the owner's included.
         seat: (crate::seats::is_door() || !matches!(p.os_account, OsAccount::Operator))
-            .then(|| seat(st, p, seats)),
+            .then(|| seat(st, p, seats, operator)),
         last_used_unix: p.last_used_unix,
         legacy_seat: device
             .zip(p.legacy_device.as_deref())
@@ -148,8 +149,9 @@ fn public(
     }
 }
 
-/// A seat of its own reads its ledger row, and so does everything on a door.
-fn seat(st: &MgmtState, p: &Profile, seats: &Snapshot) -> SeatPublic {
+/// A seat of its own reads its ledger row, and so does everything on a door. `operator`: the
+/// console is asking, and may read why a seat failed.
+fn seat(st: &MgmtState, p: &Profile, seats: &Snapshot, operator: bool) -> SeatPublic {
     let kind = match &p.os_account {
         OsAccount::Operator => SeatKind::Shared,
         OsAccount::Seat { .. } | OsAccount::Linux { .. } | OsAccount::Windows { .. } => {
@@ -158,12 +160,12 @@ fn seat(st: &MgmtState, p: &Profile, seats: &Snapshot) -> SeatPublic {
     };
     SeatPublic {
         kind,
-        ..seat_line(st, p, seats)
+        ..seat_line(st, p, seats, operator)
     }
 }
 
 /// The seat's state and port, with a placeholder kind that [`seat`] replaces.
-fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot) -> SeatPublic {
+fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot, operator: bool) -> SeatPublic {
     let port = st.app.native_port.get().copied().unwrap_or(0);
     let unavailable = |why: &str| SeatPublic {
         state: SeatState::Unavailable,
@@ -175,12 +177,12 @@ fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot) -> SeatPublic {
     };
     if crate::seats::is_door() {
         return match seats.row_of(&p.os_account) {
-            Some(id) => seated(seats, id),
+            Some(id) => seated(seats, id, operator),
             None => unavailable("This host has no seat for the owner yet."),
         };
     }
     match &p.os_account {
-        OsAccount::Seat { seat: Some(id), .. } => seated(seats, id),
+        OsAccount::Seat { seat: Some(id), .. } => seated(seats, id, operator),
         OsAccount::Seat { .. } | OsAccount::Operator => SeatPublic {
             state: SeatState::Ready,
             detail: None,
@@ -195,8 +197,9 @@ fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot) -> SeatPublic {
     }
 }
 
-/// A seat's line: its ledger row, who plays there, and its host's pin.
-fn seated(seats: &Snapshot, id: &str) -> SeatPublic {
+/// A seat's line: its ledger row, who plays there, and its host's pin. Why a seat failed is the
+/// supervisor's own text (unit, account, ports): only the `operator` reads it.
+fn seated(seats: &Snapshot, id: &str, operator: bool) -> SeatPublic {
     let line = |state, port, detail: Option<&str>| SeatPublic {
         state,
         detail: detail.map(str::to_string),
@@ -235,7 +238,11 @@ fn seated(seats: &Snapshot, id: &str) -> SeatPublic {
         RuntimeState::Failed => line(
             SeatState::Unavailable,
             port,
-            Some(detail.unwrap_or("This seat didn't start.")),
+            Some(
+                detail
+                    .filter(|_| operator)
+                    .unwrap_or("This seat didn't start."),
+            ),
         ),
         RuntimeState::Stopping | RuntimeState::Stopped | RuntimeState::Unknown => {
             line(SeatState::Stopped, port, None)
@@ -400,7 +407,7 @@ fn start_seat(id: &str) {
 fn admin(st: &MgmtState, profiles: &Profiles, p: &Profile, seats: &Snapshot) -> ProfileAdmin {
     let owner = profiles.owner_id();
     ProfileAdmin {
-        public: public(st, p, owner.as_deref(), None, seats),
+        public: public(st, p, owner.as_deref(), None, seats, true),
         legacy_device: p.legacy_device.clone(),
         default: profiles.default_profile_id().as_deref() == Some(p.id.as_str()),
         steam_home: keeps_steam_home(&p.id),
@@ -445,6 +452,7 @@ fn edit_error(e: EditError) -> Response {
 )]
 pub(crate) async fn enumerate_profiles(
     State(st): State<Arc<MgmtState>>,
+    Extension(lane): Extension<AuthLane>,
     device: Option<Extension<PairedDevice>>,
 ) -> Response {
     let device = device.map(|Extension(PairedDevice(fp))| fp);
@@ -453,10 +461,20 @@ pub(crate) async fn enumerate_profiles(
     };
     let owner = profiles.owner_id();
     let seats = seats_now().await;
+    let operator = lane == AuthLane::Admin;
     let rows: Vec<ProfilePublic> = profiles
         .list()
         .iter()
-        .map(|p| public(&st, p, owner.as_deref(), device.as_deref(), &seats))
+        .map(|p| {
+            public(
+                &st,
+                p,
+                owner.as_deref(),
+                device.as_deref(),
+                &seats,
+                operator,
+            )
+        })
         .collect();
     Json(rows).into_response()
 }
@@ -558,7 +576,15 @@ pub(crate) async fn wake_profile(
         }
         None => false,
     };
-    let mut row = public(&st, &p, profiles.owner_id().as_deref(), None, &seats);
+    let operator = lane == AuthLane::Admin;
+    let mut row = public(
+        &st,
+        &p,
+        profiles.owner_id().as_deref(),
+        None,
+        &seats,
+        operator,
+    );
     // The wake thread may not have published `starting` yet; the answer says it anyway.
     if on_a_row {
         if let Some(seat) = row.seat.as_mut().filter(|s| s.state == SeatState::Stopped) {
@@ -1550,27 +1576,41 @@ mod tests {
     }
 
     #[test]
+    fn only_the_console_reads_why_a_seat_failed() {
+        let mut failed = snap(true, RuntimeState::Failed, false);
+        failed.seats[0].runtime.detail =
+            Some("systemctl_failed: systemctl start punktfunk-seat@pf-seat-2".into());
+        let detail = |operator| seated(&failed, ID, operator).detail;
+        assert_eq!(detail(false).as_deref(), Some("This seat didn't start."));
+        assert!(detail(true).unwrap().starts_with("systemctl_failed"));
+    }
+
+    #[test]
     fn a_windows_seat_reads_its_ledger_row() {
-        let ready = seated(&snap(true, RuntimeState::Running, false), ID);
+        let ready = seated(&snap(true, RuntimeState::Running, false), ID, false);
         assert_eq!((ready.state, ready.port), (SeatState::Ready, 9778));
-        let busy = seated(&snap(true, RuntimeState::Running, true), ID);
+        let busy = seated(&snap(true, RuntimeState::Running, true), ID, false);
         assert_eq!(
             (busy.state, busy.occupant.as_deref()),
             (SeatState::Occupied, Some("Ben's Apple TV"))
         );
-        let state = |on, s| seated(&snap(on, s, false), ID).state;
+        let state = |on, s| seated(&snap(on, s, false), ID, false).state;
         assert_eq!(state(true, RuntimeState::Starting), SeatState::Starting);
         assert_eq!(state(true, RuntimeState::Stopped), SeatState::Stopped);
         assert_eq!(state(true, RuntimeState::Failed), SeatState::Unavailable);
         assert_eq!(state(false, RuntimeState::Running), SeatState::Unavailable);
-        let gone = seated(&snap(true, RuntimeState::Running, false), &"f".repeat(32));
+        let gone = seated(
+            &snap(true, RuntimeState::Running, false),
+            &"f".repeat(32),
+            false,
+        );
         assert_eq!(gone.state, SeatState::Unavailable);
         let desktop = Snapshot {
             single_session: true,
             ..snap(false, RuntimeState::Stopped, false)
         };
         assert_eq!(
-            seated(&desktop, ID).detail.as_deref(),
+            seated(&desktop, ID, false).detail.as_deref(),
             Some("This Windows edition serves one person at a time.")
         );
     }
