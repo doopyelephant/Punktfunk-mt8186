@@ -15,7 +15,6 @@ describe("seatCall", () => {
 	test("resolves dots and escapes, so the gate reads what the host reads", () => {
 		expect(seatCall(`${base}/library/./custom`)?.rest).toBe("library/custom");
 		expect(seatCall(`${base}/x/../store/install`)?.rest).toBe("store/install");
-		expect(seatCall(`${base}/store%2Finstall`)?.rest).toBe("store/install");
 		expect(seatCall(`${base}/%2e%2e/store/install`)).toBeNull();
 	});
 
@@ -24,6 +23,18 @@ describe("seatCall", () => {
 		expect(seatCall(`/api/v1/profiles/${ID}/proxy/`)).toBeNull();
 		expect(seatCall(`/api/v1/profiles/bad.id/proxy/library`)).toBeNull();
 		expect(seatCall(`${base}/../../library`)).toBeNull();
+	});
+
+	test("refuses a segment that hides a slash, so no dot segment reaches the host", () => {
+		expect(
+			seatCall(`${base}/x%2F..%2F..%2F..%2F..%2Fupdate%2Fapply`),
+		).toBeNull();
+		expect(
+			seatCall(`${base}/x%2f..%2fplugins%2fsteam%2fui-credential`),
+		).toBeNull();
+		expect(seatCall(`${base}/store%2Finstall`)).toBeNull();
+		expect(seatCall(`${base}/a%2F%2Fb`)).toBeNull();
+		expect(seatCall(`${base}/%252e%252e/x`)?.rest).toBe("%2e%2e/x");
 	});
 
 	test("forwards the resolved path, each segment escaped once", () => {
@@ -38,7 +49,7 @@ test("a plugin UI's credential is refused whichever way it is spelled", () => {
 	expect(isUiCredential("plugins/steam/ui-credential")).toBe(true);
 	expect(
 		isUiCredential(
-			seatCall(`${base}/plugins/a%2Fb/../steam/ui-credential`)?.rest ?? "",
+			seatCall(`${base}/plugins/a/../steam/ui-credential`)?.rest ?? "",
 		),
 	).toBe(true);
 	expect(isUiCredential("plugins/steam")).toBe(false);

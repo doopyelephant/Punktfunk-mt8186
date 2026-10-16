@@ -1,7 +1,7 @@
 // `/api/v1/profiles/<id>/proxy/<rest>` reaches a seat's own host through the box. The box forwards
 // it with the admin bearer, so the routes that ask for the console password on the box's own host
 // ask on the seat's too: `seatGate` in gates.ts names the one that guards `rest`.
-import { normalizePath } from "./paths";
+import { normalizeSegments } from "./paths";
 
 /** A profile id as the host accepts one: ASCII letters and digits, at most 64. */
 const ID = /^[A-Za-z0-9]{1,64}$/;
@@ -14,15 +14,22 @@ export interface SeatCall {
 
 /**
  * The seat call `pathname` makes once its dots and escapes are resolved, or `null` when it points
- * anywhere else. The gate and the forward both read the resolved path, so they cannot disagree
- * about it.
+ * anywhere else. A segment that decodes to hold a `/` (`%2F`) is refused: the forward would emit
+ * it as a separator and the host would resolve dots the gate never saw. The gate and the forward
+ * both read the returned path, so they cannot disagree about it.
  */
 export function seatCall(pathname: string): SeatCall | null {
-	const m = /^\/api\/v1\/profiles\/([^/]+)\/proxy\/(.+)$/.exec(
-		normalizePath(pathname),
-	);
-	if (!m?.[1] || !m[2] || !ID.test(m[1])) return null;
-	return { id: m[1], rest: m[2] };
+	const [api, v1, profiles, id, proxy, ...rest] = normalizeSegments(pathname);
+	if (
+		api !== "api" ||
+		v1 !== "v1" ||
+		profiles !== "profiles" ||
+		proxy !== "proxy"
+	)
+		return null;
+	if (!id || !ID.test(id) || rest.length === 0) return null;
+	if (rest.some((s) => /^\.{0,2}$|\//.test(s))) return null;
+	return { id, rest: rest.join("/") };
 }
 
 /** `rest`, each segment escaped, as the tail of a seat path. */
