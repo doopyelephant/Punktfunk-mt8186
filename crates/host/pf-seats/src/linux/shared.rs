@@ -200,11 +200,11 @@ fn check_owned(path: &Path, forbidden: u32) -> std::io::Result<()> {
 pub(super) fn ensure_games(state: &Path, gid: u32) -> Result<(), BackendError> {
     let io = |what: &str, e| io_err("games_dir", what, e);
     let top = safe_open::dir(state).map_err(|e| io("open the state directory", e))?;
-    let games = dir_in(&top, "games").map_err(|e| io("open games", e))?;
-    let steamapps = dir_in(&games, "steamapps").map_err(|e| io("open games/steamapps", e))?;
+    let games = dir_in(&top, "games", false).map_err(|e| io("open games", e))?;
+    let steamapps = dir_in(&games, "steamapps", true).map_err(|e| io("open games/steamapps", e))?;
     let mut dirs = Vec::new();
     for name in ["common", "compatdata", "shadercache", "downloading"] {
-        dirs.push(dir_in(&steamapps, name).map_err(|e| io(&format!("open {name}"), e))?);
+        dirs.push(dir_in(&steamapps, name, true).map_err(|e| io(&format!("open {name}"), e))?);
     }
     dirs.extend([steamapps, games]);
     for (i, dir) in dirs.iter().enumerate() {
@@ -225,16 +225,19 @@ pub(super) fn ensure_games(state: &Path, gid: u32) -> Result<(), BackendError> {
     run("setfacl_failed", "setfacl", &args).map(drop)
 }
 
-/// `name` in `at`, created if absent, as a handle. A link or file there is removed, never
-/// followed, and the folder made in its place.
-fn dir_in(at: &OwnedFd, name: &str) -> std::io::Result<OwnedFd> {
+/// `name` in `at`, created if absent, as a handle. A link or file there is never followed. With
+/// `replace` it is removed and a folder made in its place; without, the open fails. `games`
+/// is opened without: only root can have linked it, onto a bigger disk say.
+fn dir_in(at: &OwnedFd, name: &str, replace: bool) -> std::io::Result<OwnedFd> {
     let make = || match rustix::fs::mkdirat(at, name, Mode::from_raw_mode(0o2775 as _)) {
         Ok(()) | Err(Errno::EXIST) => Ok(()),
         Err(e) => Err(e),
     };
     make()?;
     let opened = match safe_open::dir_at(at, name) {
-        Err(e) if matches!(Errno::from_io_error(&e), Some(Errno::NOTDIR | Errno::LOOP)) => {
+        Err(e)
+            if replace && matches!(Errno::from_io_error(&e), Some(Errno::NOTDIR | Errno::LOOP)) =>
+        {
             rustix::fs::unlinkat(at, name, AtFlags::empty())?;
             make()?;
             safe_open::dir_at(at, name)?
@@ -1165,11 +1168,18 @@ mod tests {
         std::fs::create_dir(steamapps.join("downloading")).unwrap();
         let at = safe_open::dir(&steamapps).unwrap();
         for name in ["compatdata", "shadercache", "downloading", "common"] {
-            dir_in(&at, name).unwrap();
+            dir_in(&at, name, true).unwrap();
             let kind = std::fs::symlink_metadata(steamapps.join(name)).unwrap();
             assert!(kind.is_dir(), "{name}");
         }
         assert!(outside.join("keep").exists());
+
+        // Without `replace` a link stays where an admin put it, and the open fails.
+        std::os::unix::fs::symlink(&outside, steamapps.join("moved")).unwrap();
+        assert!(dir_in(&at, "moved", false).is_err());
+        assert!(std::fs::symlink_metadata(steamapps.join("moved"))
+            .unwrap()
+            .is_symlink());
     }
 
     /// A new seat's list names its own Steam at entry 0, the games folder after it, and a list
