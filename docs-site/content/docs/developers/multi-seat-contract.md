@@ -466,5 +466,6 @@ it, so it moves to the row's ports at boot, logged in or not. The owner's own co
   the owner's `~/.config/punktfunk` and `/var/lib/punktfunk` and turns the units on or off. The user
   must be in the `punktfunk-update` group.
 - **The box's ports.** The door binds the ports the owner's `host.env` names
-  (`PUNKTFUNK_MGMT_BIND`, `PUNKTFUNK_NATIVE_PORT`). Each `door-helper on` copies those lines to
-  `/var/lib/punktfunk/host.env`.
+  (`PUNKTFUNK_MGMT_BIND`, `PUNKTFUNK_NATIVE_PORT`). `door-helper ports` copies those lines to
+  `/var/lib/punktfunk/host.env` before each door start, so an update or a later edit reaches
+  the door. On NixOS the door also takes the same two keys from `services.punktfunk.host.settings`.

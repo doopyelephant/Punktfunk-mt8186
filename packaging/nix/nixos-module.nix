@@ -781,8 +781,8 @@ in
       };
 
       # The door ("Reachable without logging in"). Its host and console units name /usr/bin; the
-      # leading empty ExecStart clears the packaged one. The packaged ExecStart of both helper
-      # templates is already the store path.
+      # leading empty ExecStart clears the packaged one. The door's ExecStartPre and both helper
+      # templates already name the store path.
       systemd.services.punktfunk-door.serviceConfig.ExecStart = [
         ""
         "${cfg.host.package}/bin/punktfunk-host serve --door"
@@ -791,6 +791,18 @@ in
         ""
         "${cfg.web.package}/bin/punktfunk-web-server"
       ];
+      # The door's ports: the two `host.settings` keys that move them, and no other host knob.
+      # The host.env lines its ExecStartPre copies win over these.
+      systemd.services.punktfunk-door.path = seatPath;
+      systemd.services.punktfunk-door.environment = lib.mapAttrs (_: renderVal) (
+        lib.filterAttrs (
+          name: _:
+          builtins.elem name [
+            "PUNKTFUNK_MGMT_BIND"
+            "PUNKTFUNK_NATIVE_PORT"
+          ]
+        ) cfg.host.settings
+      );
       systemd.services."punktfunk-door-on@".path = seatPath;
       systemd.services."punktfunk-door-off@".path = seatPath;
 

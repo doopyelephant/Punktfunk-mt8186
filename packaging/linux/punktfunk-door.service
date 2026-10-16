@@ -19,7 +19,9 @@ Group=punktfunk
 Environment=PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk
 # The box's library: the seat supervisor's copy of the owner's, which every client reads here.
 Environment=PUNKTFUNK_LIBRARY_DIR=/var/lib/punktfunk-seats/library
-# The ports the owner moved in their host.env, which door-helper copies here.
+# The ports the owner moved in their host.env: door-helper copies them here before each start,
+# so an update or a later edit reaches the door. `+` runs it as root, to read the owner's file.
+ExecStartPre=+-/usr/libexec/punktfunk/door-helper ports
 EnvironmentFile=-/var/lib/punktfunk/host.env
 ExecStart=/usr/bin/punktfunk-host serve --door
 Restart=always

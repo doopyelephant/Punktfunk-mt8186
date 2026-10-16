@@ -137,6 +137,7 @@ let
       openFirewall = true;
       gamescopeHdr = false;
       settings.RUST_LOG = "info";
+      settings.PUNKTFUNK_MGMT_BIND = "0.0.0.0:47991";
     };
     services.punktfunk.seats.enable = true;
   };
@@ -430,7 +431,7 @@ let
           "ExecStart=\nExecStart=/pf-stub/punktfunk-web/bin/punktfunk-web-server";
     }
     {
-      # The helper calls useradd, runuser, flock and awk by name.
+      # The helpers and the door's ExecStartPre call useradd, runuser, flock and awk by name.
       name = "the door's helpers have a PATH with the account tools";
       ok =
         let
@@ -440,7 +441,17 @@ let
             && hasSys seats name "-util-linux-"
             && hasSys seats name "-gawk-";
         in
-        onPath "punktfunk-door-on@.service" && onPath "punktfunk-door-off@.service";
+        onPath "punktfunk-door-on@.service"
+        && onPath "punktfunk-door-off@.service"
+        && onPath "punktfunk-door.service";
+    }
+    {
+      name = "the door takes the port keys from settings and no other knob";
+      ok =
+        let
+          env = seats.systemd.services.punktfunk-door.environment;
+        in
+        env.PUNKTFUNK_MGMT_BIND or null == "0.0.0.0:47991" && !(env ? RUST_LOG);
     }
     {
       # polkit reads /etc/polkit-1/rules.d; the rule is the package's file, not a copy.

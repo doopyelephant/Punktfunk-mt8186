@@ -3,10 +3,12 @@
 #
 #   door-helper on  <user>   the box's host runs as the punktfunk system user from boot
 #   door-helper off <user>   the user's own host serves the box again
+#   door-helper ports        the recorded owner's ports, copied before each door start
 #
 # Started by punktfunk-door-on@<user>.service and punktfunk-door-off@<user>.service, which
 # 49-punktfunk-door.rules lets members of `punktfunk-update` start. The instance name is data, not
-# a command: the user must be an ordinary account in that group.
+# a command: the user must be an ordinary account in that group. `ports` is
+# punktfunk-door.service's ExecStartPre.
 #
 # Both directions are idempotent, and a run that stopped halfway converges on the next. The box's
 # files move once: `on` copies the user's into /var/lib/punktfunk and records that in
@@ -35,7 +37,12 @@ die() {
 
 verb=${1:-}
 user=${2:-}
-case $verb in on | off) ;; *) die "usage: door-helper on|off <user>" ;; esac
+case $verb in
+on | off) ;;
+# The owner the last `on` recorded; with none, the door has no ports to take.
+ports) user=$(cat "$STATE/owner" 2>/dev/null) || exit 0 ;;
+*) die "usage: door-helper on|off <user>, or door-helper ports" ;;
+esac
 [ "$(id -u)" = 0 ] || die "run as root"
 case $user in
 '' | *[!a-z0-9_.-]* | [!a-z_]*) die "'$user' is not a user name" ;;
@@ -48,8 +55,11 @@ home=$(printf '%s' "$passwd_row" | cut -d: -f6)
 id -nG "$user" | tr ' ' '\n' | grep -qx "$GROUP" || die "'$user' is not in the $GROUP group"
 OWN="$home/.config/punktfunk"
 
-exec 9>/run/punktfunk-door.lock
-flock 9
+# `ports` runs inside the door's start, which `on` waits for while it holds this lock.
+if [ "$verb" != ports ]; then
+    exec 9>/run/punktfunk-door.lock
+    flock 9
+fi
 
 as_user() { runuser -u "$user" -- "$@"; }
 as_door() { runuser -u punktfunk -- "$@"; }
@@ -101,8 +111,8 @@ give_password() {
         sh "$OWN/web.env" "$line" "$PASSWORD_LINE"
 }
 
-# The box's ports as the owner's host.env moves them, which the door binds in its place. Taken on
-# every run: host.env stays the owner's file, and the door never writes a port.
+# The box's ports as the owner's host.env moves them, which the door binds in its place. Taken at
+# each door start: host.env stays the owner's file, and the door never writes a port.
 PORT_LINE='^[[:space:]]*PUNKTFUNK_(MGMT_BIND|NATIVE_PORT)[[:space:]]*='
 
 take_ports() {
@@ -150,7 +160,6 @@ door_on() {
         take_avatars
         as_door touch "$MARK"
     fi
-    take_ports
     install -d -m 0711 -o root -g root "$STATE"
     printf '%s\n' "$user" >"$STATE/owner.tmp"
     chmod 0600 "$STATE/owner.tmp"
@@ -198,4 +207,8 @@ door_off() {
     echo "door off for $user"
 }
 
-if [ "$verb" = on ]; then door_on; else door_off; fi
+case $verb in
+on) door_on ;;
+off) door_off ;;
+ports) take_ports ;;
+esac
