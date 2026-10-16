@@ -218,11 +218,14 @@ pub struct Reassembler {
     /// The newest capture time seen, which unwraps the 32-bit field; `None` until the first
     /// packet seeds it.
     pts_ref_us: Option<i64>,
-    /// Opt-in: emit aged-out [`USER_FLAG_CHUNK_ALIGNED`] frames instead of dropping
-    /// them. Still counted in `frames_dropped` — a partial is lost data.
+    /// Opt-in: emit [`USER_FLAG_CHUNK_ALIGNED`] frames that cannot complete instead of
+    /// dropping them: aged out, overtaken by a newer frame, or released. One that went up
+    /// without its head block is still a dropped frame.
     deliver_partial: bool,
     /// Newest parked partial (newest-wins; partials are lossy).
     pending_partial: Option<Frame>,
+    /// The frame a NACK is out for ([`Self::set_partial_hold`]).
+    partial_hold: Option<u32>,
     /// Opt-in: emit each newly-contiguous AU prefix as a [`Frame`] with `part = Some`
     /// while the rest is still in flight. Any multi-block frame tiles via `base_shard`.
     deliver_parts: bool,
@@ -255,6 +258,7 @@ impl Reassembler {
             pts_ref_us: None,
             deliver_partial: false,
             pending_partial: None,
+            partial_hold: None,
             deliver_parts: false,
             video: ReassemblyWindow::default(),
             probe: ReassemblyWindow::default(),
@@ -300,6 +304,48 @@ impl Reassembler {
 
     pub fn take_partial(&mut self) -> Option<Frame> {
         self.pending_partial.take()
+    }
+
+    /// The frame a NACK is out for: a newer frame does not hand it up, since its resend may
+    /// still land.
+    pub fn set_partial_hold(&mut self, frame: Option<u32>) {
+        self.partial_hold = frame;
+    }
+
+    /// Hand chunk-aligned video frame `frame_index` up as a partial now, ahead of its loss
+    /// window; with `need_head`, only once its head block is whole. `true` when handed up.
+    pub fn release_partial(
+        &mut self,
+        frame_index: u32,
+        need_head: bool,
+        stats: &StatsCounters,
+    ) -> bool {
+        let Reassembler {
+            deliver_partial,
+            video,
+            pending_partial,
+            recovery_pool,
+            in_flight_bytes,
+            ..
+        } = self;
+        let ready = video.frames.get(&frame_index).is_some_and(|f| {
+            f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0
+                && f.frame_bytes > 0
+                && (!need_head || head_whole(f))
+        });
+        if !*deliver_partial || !ready {
+            return false;
+        }
+        let mut f = video.frames.remove(&frame_index).expect("checked above");
+        video.completed.insert(frame_index, Done::of(&f));
+        *in_flight_bytes -= frame_cost(&f);
+        if !hand_up_partial(frame_index, &mut f, pending_partial, stats) {
+            StatsCounters::add(&stats.frames_dropped, 1);
+        }
+        for block in f.blocks.values_mut() {
+            reclaim_parity(block, recovery_pool, in_flight_bytes);
+        }
+        true
     }
 
     /// Assemble frames in `memory` from the next frame on.
@@ -401,6 +447,7 @@ impl Reassembler {
             pts_ref_us: _,
             deliver_partial,
             pending_partial,
+            partial_hold,
             deliver_parts,
             video,
             probe,
@@ -463,6 +510,7 @@ impl Reassembler {
             recovery_pool,
             in_flight_bytes,
             (*deliver_partial && !is_probe).then_some(pending_partial),
+            *partial_hold,
         );
 
         // Terminated (emitted or abandoned): drop. Recovery shards of an early-complete
@@ -1047,6 +1095,58 @@ fn pin_totals(frame: &mut FrameBuf, g: &Geom) -> Pin {
 }
 
 /// Zero every shard of `f` that neither arrived nor was rebuilt: frame memory is reused, so
+/// Hand `f` up through `sink` (newest-wins) when it is chunk-aligned and its size is known:
+/// received shards at their offsets, holes zeroed and counted lost. `true` when it went up with
+/// its head block, the one at base 0, whole: a picture with patches missing, not a lost frame.
+fn hand_up_partial(
+    idx: u32,
+    f: &mut FrameBuf,
+    sink: &mut Option<Frame>,
+    stats: &StatsCounters,
+) -> bool {
+    // `frame_bytes > 0` also excludes an unpinned streamed frame (total still the 0 sentinel):
+    // truncate-to-0 would emit empty.
+    if f.user_flags & USER_FLAG_CHUNK_ALIGNED == 0 || f.frame_bytes == 0 {
+        return false;
+    }
+    let total = f.frame_bytes.div_ceil(f.shard_bytes);
+    let seen: usize = f.blocks.values().map(|b| b.data_shards).sum();
+    let missing: usize = f
+        .blocks
+        .values()
+        .filter(|b| !(b.done && b.reconstructed))
+        .map(|b| b.have_data.iter().filter(|&&h| !h).count())
+        .sum();
+    StatsCounters::add(
+        &stats.partial_shards_lost,
+        (missing + total.saturating_sub(seen)) as u64,
+    );
+    zero_holes(f);
+    let mut buf = std::mem::replace(&mut f.buf, Vec::new().into());
+    buf.truncate(f.frame_bytes);
+    let newer = sink
+        .as_ref()
+        .is_none_or(|p| idx.wrapping_sub(p.frame_index) <= u32::MAX / 2);
+    if newer {
+        *sink = Some(Frame {
+            data: buf,
+            frame_index: idx,
+            pts_ns: f.pts_ns,
+            flags: f.user_flags,
+            epoch: f.epoch,
+            complete: false,
+            part: None,
+            received_ns: 0, // stamped by Session::poll_frame at the session boundary
+        });
+    }
+    head_whole(f)
+}
+
+/// The block at base 0 arrived or was rebuilt.
+fn head_whole(f: &FrameBuf) -> bool {
+    f.blocks.values().any(|b| b.base_shard == 0 && b.done)
+}
+
 /// a hole holds a previous AU's bytes until a partial hands it up.
 fn zero_holes(f: &mut FrameBuf) {
     let sb = f.shard_bytes;
@@ -1170,9 +1270,15 @@ impl ReassemblyWindow {
         count_drops: bool,
         recovery_pool: &mut Vec<Vec<u8>>,
         in_flight_bytes: &mut usize,
-        // `Some(sink)` = deliver aged-out CHUNK_ALIGNED frames instead of only dropping them.
+        // `Some(sink)` = deliver CHUNK_ALIGNED frames instead of only dropping them.
         mut partial_sink: Option<&mut Option<Frame>>,
+        // The frame a NACK is out for: it waits for its loss window.
+        hold: Option<u32>,
     ) {
+        // A packet of a newer frame than any yet: the sender finished the frames before it.
+        let opened = self
+            .newest_frame
+            .is_none_or(|(n, _)| n != frame_index && frame_index.wrapping_sub(n) <= u32::MAX / 2);
         let (newest, newest_pts) = match self.newest_frame {
             // Newer iff within the forward half of the index space.
             Some((n, p)) if frame_index.wrapping_sub(n) > u32::MAX / 2 => (n, p),
@@ -1180,17 +1286,20 @@ impl ReassemblyWindow {
         };
         self.newest_frame = Some((newest, newest_pts));
 
-        let before = self.frames.len();
         let completed = &mut self.completed;
         let partial_on = partial_sink.is_some();
+        let mut dead = 0u64;
         self.frames.retain(|&idx, f| {
+            let chunked = partial_on && f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0;
             // Chunk-aligned partials use [`PARTIAL_WINDOW_NS`]; everything else the full window.
-            let window_ns = if partial_on && f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0 {
+            let window_ns = if chunked {
                 PARTIAL_WINDOW_NS
             } else {
                 LOSS_WINDOW_NS
             };
-            let keep = newest.wrapping_sub(idx) <= HARD_LOSS_WINDOW
+            let overtaken = chunked && opened && idx != frame_index && Some(idx) != hold;
+            let keep = !(overtaken && f.frame_bytes > 0)
+                && newest.wrapping_sub(idx) <= HARD_LOSS_WINDOW
                 && newest_pts.saturating_sub(f.pts_ns) <= window_ns;
             if !keep {
                 // Remember the index so a straggler cannot resurrect the frame
@@ -1198,42 +1307,18 @@ impl ReassemblyWindow {
                 // shards join late-shard memory exactly like an emitted frame.
                 completed.insert(idx, Done::of(f));
                 *in_flight_bytes -= frame_cost(f);
-                // Chunk-aligned: the buffer is already the consumer shape (received
-                // at final offsets), once the holes read zero. Newest-wins. Still counted
-                // dropped.
-                if let Some(sink) = partial_sink.as_deref_mut() {
-                    // `frame_bytes > 0` also excludes an unpinned streamed frame
-                    // (total still the 0 sentinel): truncate-to-0 would emit empty.
-                    if f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0 && f.frame_bytes > 0 {
-                        zero_holes(f);
-                        let mut buf = std::mem::replace(&mut f.buf, Vec::new().into());
-                        buf.truncate(f.frame_bytes);
-                        let newer = sink
-                            .as_ref()
-                            .is_none_or(|p| idx.wrapping_sub(p.frame_index) <= u32::MAX / 2);
-                        if newer {
-                            *sink = Some(Frame {
-                                data: buf,
-                                frame_index: idx,
-                                pts_ns: f.pts_ns,
-                                flags: f.user_flags,
-                                epoch: f.epoch,
-                                complete: false,
-                                part: None,
-                                received_ns: 0, // stamped by Session::poll_frame at the session boundary
-                            });
-                        }
-                    }
-                }
+                let pictured = partial_sink
+                    .as_deref_mut()
+                    .is_some_and(|sink| hand_up_partial(idx, f, sink, stats));
+                dead += u64::from(!pictured);
                 for block in f.blocks.values_mut() {
                     reclaim_parity(block, recovery_pool, in_flight_bytes);
                 }
             }
             keep
         });
-        let pruned = before - self.frames.len();
-        if pruned > 0 && count_drops {
-            StatsCounters::add(&stats.frames_dropped, pruned as u64);
+        if dead > 0 && count_drops {
+            StatsCounters::add(&stats.frames_dropped, dead);
         }
         let positions = &mut self.positions;
         self.completed.retain(|&idx, done| {

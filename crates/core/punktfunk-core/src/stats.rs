@@ -31,6 +31,11 @@ pub struct Stats {
     /// must net this out (`recovered - late`, see [`window_loss_ppm`](crate::quic::window_loss_ppm))
     /// or reordering reads as loss. Not mirrored into the C-ABI `PunktfunkStats`.
     pub fec_late_shards: u64,
+    /// Data shards a partial frame went to the decoder without: lost, and no parity rebuilt
+    /// them. Link loss beside `fec_recovered_shards`, for frames that carry no tail parity
+    /// ([`window_loss_ppm`](crate::quic::window_loss_ppm)). Not mirrored into the C-ABI
+    /// `PunktfunkStats`.
+    pub partial_shards_lost: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
     /// DATA-shard payload delivered to the video reassembler — no headers, FEC
@@ -102,6 +107,7 @@ pub struct StatsCounters {
     pub packets_send_dropped: AtomicU64,
     pub fec_recovered_shards: AtomicU64,
     pub fec_late_shards: AtomicU64,
+    pub partial_shards_lost: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub bytes_received: AtomicU64,
     pub media_bytes_received: AtomicU64,
@@ -137,6 +143,7 @@ impl StatsCounters {
             packets_send_dropped: self.packets_send_dropped.load(l),
             fec_recovered_shards: self.fec_recovered_shards.load(l),
             fec_late_shards: self.fec_late_shards.load(l),
+            partial_shards_lost: self.partial_shards_lost.load(l),
             bytes_sent: self.bytes_sent.load(l),
             bytes_received: self.bytes_received.load(l),
             media_bytes_received: self.media_bytes_received.load(l),

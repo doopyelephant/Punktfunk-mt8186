@@ -41,6 +41,7 @@ pub(crate) struct WindowAccumulator {
     /// Counter anchors: this window is the session totals minus these.
     recovered: u64,
     late: u64,
+    holes: u64,
     received: u64,
     dropped: u64,
     bytes: u64,
@@ -82,6 +83,7 @@ impl WindowAccumulator {
             last_report: now,
             recovered: 0,
             late: 0,
+            holes: 0,
             received: 0,
             dropped: 0,
             bytes: 0,
@@ -215,6 +217,7 @@ impl WindowAccumulator {
         let st = self.stats;
         self.recovered = st.fec_recovered_shards;
         self.late = st.fec_late_shards;
+        self.holes = st.partial_shards_lost;
         self.received = st.packets_received;
         self.dropped = st.frames_dropped;
         self.bytes = wire_bytes(&st);
@@ -241,6 +244,7 @@ impl WindowAccumulator {
         let loss_ppm = crate::quic::window_loss_ppm(
             st.fec_recovered_shards.wrapping_sub(self.recovered),
             st.fec_late_shards.wrapping_sub(self.late),
+            st.partial_shards_lost.wrapping_sub(self.holes),
             st.packets_received.wrapping_sub(self.received),
         );
         // Wire throughput vs target: headers, seals and FEC parity included
@@ -304,6 +308,7 @@ impl WindowAccumulator {
         let st = self.stats;
         self.recovered = st.fec_recovered_shards;
         self.late = st.fec_late_shards;
+        self.holes = st.partial_shards_lost;
         self.received = st.packets_received;
         self.dropped = st.frames_dropped;
         self.bytes = wire_bytes(&st);

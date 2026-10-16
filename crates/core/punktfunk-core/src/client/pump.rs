@@ -367,6 +367,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         refresh_hz,
         nack: !params.frame_parts,
         on_anchors: false,
+        partial_wait: Vec::new(),
     };
     let _ = tokio::task::spawn_blocking(move || pump.run()).await;
 
