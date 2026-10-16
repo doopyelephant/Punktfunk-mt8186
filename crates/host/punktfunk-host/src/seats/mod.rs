@@ -262,6 +262,26 @@ pub(crate) fn plays_on_a_seat(fp_hex: &str) -> bool {
     any_on_a_seat(|o| crate::session_status::is_client(&o.client, fp_hex))
 }
 
+/// Ends every session on every running seat, ahead of a power action that takes the box down:
+/// a seat host doesn't hear the door's own. Blocking, as [`snapshot`].
+pub(crate) fn end_all_sessions() {
+    if !in_play() {
+        return;
+    }
+    let Ok(seats) = list() else { return };
+    std::thread::scope(|scope| {
+        for seat in &seats {
+            if seat.runtime.state == pf_seats::RuntimeState::Running {
+                scope.spawn(move || {
+                    if !end_sessions(seat) {
+                        tracing::warn!(seat = %seat.name, "seat sessions did not end before a power action");
+                    }
+                });
+            }
+        }
+    });
+}
+
 /// A seat host's own config dir, where it keeps its management token.
 fn host_dir(seat: &pf_seats::Seat) -> PathBuf {
     pf_seats::persistence::default_root()

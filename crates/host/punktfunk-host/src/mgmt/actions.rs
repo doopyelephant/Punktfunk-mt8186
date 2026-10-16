@@ -406,6 +406,11 @@ pub(crate) async fn invoke_action(
         crate::power::set_closing(true);
         crate::session_status::stop_all_quit();
         let _ = app.quit_session("host power action");
+        // Seat hosts run their own sessions and never hear this close. A process restart leaves
+        // them standing.
+        if verb != PowerVerb::Restart {
+            let _ = tokio::task::spawn_blocking(crate::seats::end_all_sessions).await;
+        }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         // Displays first: going under on a still-up display is not a transient.
         drain_displays().await;
