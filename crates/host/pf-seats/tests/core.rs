@@ -1,5 +1,5 @@
 use pf_seats::backend::{BackendError, PlatformBackend};
-use pf_seats::ipc::{Command, CommandResult, Diagnostic, ErrorCode};
+use pf_seats::ipc::{Command, CommandResult, Diagnostic, ErrorCode, SeatingStatus};
 use pf_seats::model::{CreateSeat, Ledger, RuntimeState, RuntimeStatus, Seat};
 use pf_seats::persistence::{LedgerStore, LEDGER_FILE};
 use pf_seats::service::SeatService;
@@ -474,6 +474,149 @@ impl PlatformBackend for SlowStart {
     fn reconcile(&self, seat: &Seat, status: &RuntimeStatus) {
         self.inner.reconcile(seat, status);
     }
+}
+
+/// A backend whose provision, remove, enable and disable park while the gate is shut.
+#[derive(Clone)]
+struct SlowWork {
+    inner: FakeBackend,
+    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    parked: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SlowWork {
+    fn new() -> Self {
+        Self {
+            inner: FakeBackend::default(),
+            gate: Arc::new((Mutex::new(true), std::sync::Condvar::new())),
+            parked: Arc::default(),
+        }
+    }
+
+    /// Shutting the gate also forgets who parked at it before.
+    fn set_gate(&self, open: bool) {
+        let (gate, wake) = &*self.gate;
+        *gate.lock().unwrap() = open;
+        if !open {
+            self.parked.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+        wake.notify_all();
+    }
+
+    fn park(&self) {
+        let (gate, wake) = &*self.gate;
+        let mut open = gate.lock().unwrap();
+        if !*open {
+            self.parked
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        while !*open {
+            open = wake.wait(open).unwrap();
+        }
+    }
+
+    fn wait_parked(&self) {
+        while self.parked.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+impl PlatformBackend for SlowWork {
+    fn provision(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.park();
+        self.inner.provision(seat)
+    }
+    fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.start(seat)
+    }
+    fn stop(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.stop(seat)
+    }
+    fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.park();
+        self.inner.remove(seat)
+    }
+    fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.status(seat)
+    }
+    fn enable(
+        &self,
+        _allow_rdp_from_network: bool,
+        _prepared: Vec<Diagnostic>,
+    ) -> Result<SeatingStatus, BackendError> {
+        self.park();
+        Ok(SeatingStatus {
+            enabled: true,
+            checks: Vec::new(),
+            allow_rdp_from_network: false,
+        })
+    }
+}
+
+/// Whether a `List` is answered while another command is parked in the backend.
+fn list_answers<B: PlatformBackend>(service: &Arc<SeatService<B>>) -> bool {
+    let (answer, answered) = std::sync::mpsc::channel();
+    let service = Arc::clone(service);
+    std::thread::spawn(move || {
+        let _ = answer.send(service.dispatch(Command::List).is_ok());
+    });
+    answered.recv_timeout(std::time::Duration::from_secs(5)) == Ok(true)
+}
+
+/// Create, delete and Enable keep the ledger readable while their backend work runs, and the
+/// ledger they commit afterwards is the one `List` has been keeping current.
+#[test]
+fn the_ledger_answers_while_a_seat_is_made_removed_or_seats_turn_on() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = SlowWork::new();
+    let service = Arc::new(SeatService::open(temp.path(), backend.clone()).unwrap());
+    let CommandResult::Created { seat: kept } =
+        service.dispatch(create("Kept", "pf-kept", false)).unwrap()
+    else {
+        panic!("create");
+    };
+
+    backend.set_gate(false);
+    let making = {
+        let service = Arc::clone(&service);
+        std::thread::spawn(move || service.dispatch(create("Made", "pf-made", false)))
+    };
+    backend.wait_parked();
+    assert!(list_answers(&service), "List stalled behind a create");
+    backend.set_gate(true);
+    let CommandResult::Created { seat: made } = making.join().unwrap().unwrap() else {
+        panic!("create");
+    };
+    assert_eq!(service.ledger().seats.len(), 2);
+
+    backend.set_gate(false);
+    let removing = {
+        let service = Arc::clone(&service);
+        let id = made.id.clone();
+        std::thread::spawn(move || service.dispatch(Command::Delete { id }))
+    };
+    backend.wait_parked();
+    assert!(list_answers(&service), "List stalled behind a delete");
+    backend.set_gate(true);
+    removing.join().unwrap().unwrap();
+    assert_eq!(service.ledger().seats.len(), 1);
+    assert_eq!(service.ledger().seats[0].id, kept.id);
+
+    backend.set_gate(false);
+    let turning_on = {
+        let service = Arc::clone(&service);
+        std::thread::spawn(move || {
+            service.dispatch(Command::Enable {
+                allow_rdp_from_network: false,
+                prepare: false,
+            })
+        })
+    };
+    backend.wait_parked();
+    assert!(list_answers(&service), "List stalled behind Enable");
+    backend.set_gate(true);
+    turning_on.join().unwrap().unwrap();
 }
 
 /// A `List` reconciles a seat that is at rest and leaves one that is starting: its unit is down

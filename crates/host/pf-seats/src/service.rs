@@ -7,8 +7,9 @@
 //! Runtime observations, including backend failures, are persisted. Startup
 //! reconciliation starts autostart seats and refreshes the rest. One mutex
 //! serializes lifecycle calls because four seats do not need rollback races; the
-//! ledger's own lock is never held across a start or stop, so `List` answers while
-//! a seat takes its tens of seconds to come up.
+//! ledger's own lock is never held across a backend call that takes time (a
+//! create, start, stop, delete or Enable), only for the edit and its write, so
+//! `List` answers while a seat takes its tens of seconds to come up.
 
 use crate::backend::{BackendError, PlatformBackend};
 use crate::ipc::{
@@ -24,7 +25,8 @@ pub struct SeatService<B> {
     backend: B,
     store: LedgerStore,
     ledger: Mutex<Ledger>,
-    /// Held across every create, start, stop and delete.
+    /// Held across every create, start, stop, delete, adopt, Enable and Disable. Only a call
+    /// under it adds or drops a row.
     ops: Mutex<()>,
     /// The seat a start or stop is changing; `List` reports its published state meanwhile.
     changing: Mutex<Option<SeatId>>,
@@ -75,7 +77,7 @@ impl<B: PlatformBackend> SeatService<B> {
                 } else {
                     Vec::new()
                 };
-                let _serialized = self.lock();
+                let _op = self.op();
                 self.seating(|backend| backend.enable(allow_rdp_from_network, prepared))
             }
             Command::Disable { keep_accounts } => self.disable(keep_accounts),
@@ -175,9 +177,12 @@ impl<B: PlatformBackend> SeatService<B> {
 
     fn create(&self, request: CreateSeat) -> Result<CommandResult, ApiError> {
         let _op = self.op();
-        let mut current = self.lock();
-        let mut next = current.clone();
-        let seat = next.allocate(request).map_err(ApiError::from)?;
+        // Allocated on a copy: provisioning takes minutes, and the ledger answers meanwhile.
+        let seat = self
+            .lock()
+            .clone()
+            .allocate(request)
+            .map_err(ApiError::from)?;
         if let Err(error) = self.backend.provision(&seat) {
             // An account that is not the seat's was never ours to remove.
             if error.code != "account_not_owned" {
@@ -186,7 +191,7 @@ impl<B: PlatformBackend> SeatService<B> {
             }
             return Err(ApiError::from(error));
         }
-        if let Err(error) = self.commit(&mut current, next) {
+        if let Err(error) = self.amend(|next| next.insert(seat.clone()).map_err(ApiError::from)) {
             // The account exists but no ledger row does, so delete could never reach it.
             let _ = self.backend.remove(&seat);
             return Err(error);
@@ -198,23 +203,27 @@ impl<B: PlatformBackend> SeatService<B> {
     /// has checked. A second account is refused, since the box has one owner.
     fn adopt_owner(&self, account: &str) -> Result<CommandResult, ApiError> {
         let _op = self.op();
-        let mut current = self.lock();
-        if let Some(owner) = current.owner() {
-            return if owner.account == account {
-                Ok(CommandResult::Created {
-                    seat: owner.clone(),
-                })
-            } else {
-                Err(ApiError::new(
-                    ErrorCode::Conflict,
-                    format!("the box owner is already {}", owner.account),
-                ))
-            };
-        }
-        let mut next = current.clone();
-        let seat = next.allocate_owner(account).map_err(ApiError::from)?;
+        let seat = {
+            let current = self.lock();
+            if let Some(owner) = current.owner() {
+                return if owner.account == account {
+                    Ok(CommandResult::Created {
+                        seat: owner.clone(),
+                    })
+                } else {
+                    Err(ApiError::new(
+                        ErrorCode::Conflict,
+                        format!("the box owner is already {}", owner.account),
+                    ))
+                };
+            }
+            current
+                .clone()
+                .allocate_owner(account)
+                .map_err(ApiError::from)?
+        };
         self.backend.adopt(&seat).map_err(ApiError::from)?;
-        if let Err(error) = self.commit(&mut current, next) {
+        if let Err(error) = self.amend(|next| next.insert(seat.clone()).map_err(ApiError::from)) {
             // Releasing the row removes what adopting prepared and never the account.
             let _ = self.backend.remove(&seat);
             return Err(error);
@@ -232,13 +241,7 @@ impl<B: PlatformBackend> SeatService<B> {
 
     fn change_runtime(&self, id: &SeatId, start: bool) -> Result<CommandResult, ApiError> {
         let _op = self.op();
-        let original = {
-            let current = self.lock();
-            let seat = current.seat(id).cloned().ok_or_else(|| not_found(id))?;
-            // Under the ledger lock, so a `List` either finished with the seat or skips it.
-            *self.changing.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
-            seat
-        };
+        let original = self.begin(id)?;
         if start {
             let published = self.publish_runtime(
                 id,
@@ -248,7 +251,7 @@ impl<B: PlatformBackend> SeatService<B> {
                 },
             );
             if let Err(error) = published {
-                *self.changing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                self.end();
                 return Err(error);
             }
         }
@@ -257,7 +260,7 @@ impl<B: PlatformBackend> SeatService<B> {
         } else {
             self.backend.stop(&original)
         };
-        *self.changing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.end();
         let mut current = self.lock();
         let mut next = current.clone();
         let seat = next
@@ -296,14 +299,38 @@ impl<B: PlatformBackend> SeatService<B> {
 
     fn delete(&self, id: &SeatId) -> Result<CommandResult, ApiError> {
         let _op = self.op();
-        let mut current = self.lock();
-        let seat = current.seat(id).cloned().ok_or_else(|| not_found(id))?;
-        self.backend.remove(&seat).map_err(ApiError::from)?;
-        let mut next = current.clone();
-        next.remove(id)
-            .expect("cloned ledger retains the selected seat");
-        self.commit(&mut current, next)?;
+        let seat = self.begin(id)?;
+        let removed = self.backend.remove(&seat);
+        self.end();
+        removed.map_err(ApiError::from)?;
+        self.amend(|next| next.remove(id).map(drop).ok_or_else(|| not_found(id)))?;
         Ok(CommandResult::Deleted { id: id.clone() })
+    }
+
+    /// Marks `id` as the seat a change is on and returns its row. The mark is made under the
+    /// ledger lock a `List` holds while it reads each seat, so a `List` either finishes with the
+    /// seat first or skips it.
+    fn begin(&self, id: &SeatId) -> Result<Seat, ApiError> {
+        let current = self.lock();
+        let seat = current.seat(id).cloned().ok_or_else(|| not_found(id))?;
+        *self.changing.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
+        Ok(seat)
+    }
+
+    fn end(&self) {
+        *self.changing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// `edit` applied to a copy of the ledger as it is now, then written. The ledger lock is held
+    /// for that and no longer; the seats can't change meanwhile, since the caller holds `ops`.
+    fn amend(
+        &self,
+        edit: impl FnOnce(&mut Ledger) -> Result<(), ApiError>,
+    ) -> Result<(), ApiError> {
+        let mut current = self.lock();
+        let mut next = current.clone();
+        edit(&mut next)?;
+        self.commit(&mut current, next)
     }
 
     fn seating(
@@ -328,7 +355,7 @@ impl<B: PlatformBackend> SeatService<B> {
         for id in &ids {
             self.change_runtime(id, false)?;
         }
-        let _serialized = self.lock();
+        let _op = self.op();
         self.seating(|backend| backend.disable(keep_accounts))
     }
 
