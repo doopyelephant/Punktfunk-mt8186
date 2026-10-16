@@ -307,14 +307,17 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   it can't open, as in a home not mounted yet, leaves the copy as it was. Deleting the owner's
   row deletes `library/`.
 - **Games.** `games/steamapps/` is one library every seat writes (group `punktfunk-games`, setgid,
-  default ACL). Each seat's own `compatdata`, `shadercache` and `downloading` under `seats/<id>/`
-  are bind-mounted over the shared ones, so prefixes never cross. Everything that needs the
-  binds must descend from the unit; a process started through `systemd-run --user` or a user
-  service doesn't see them. The daemon repairs the ACL mask under `games/` after a seat stops and
-  every 10 minutes, because a file created with mode `0644` is otherwise read-only to the other
-  seats. A seat other than the owner's sees an empty `/run/media`: Steam in Game Mode adopts
-  every mounted drive with a `steamapps` as a library, and a drive as mounted is the owner's
-  alone. The owner's drives reach the seat as below.
+  default ACL). `games` is sticky and closed to other users, so only the group reads the tree and
+  a seat can't replace `steamapps`. Each seat start checks the folders and replaces a link or
+  file a seat left where a bind target belongs. Each seat's own `compatdata`, `shadercache` and
+  `downloading` under `seats/<id>/` are bind-mounted over the shared ones, so prefixes never
+  cross. Everything that needs the binds must descend from the unit; a process started through
+  `systemd-run --user` or a user service doesn't see them. The daemon repairs the ACL mask under
+  `games/` after a seat stops and every 10 minutes, because a file created with mode `0644` is
+  otherwise read-only to the other seats. A mask a seat closed on purpose, as with `chmod 600`,
+  stays closed. A seat other than the owner's sees an empty `/run/media`: Steam in Game Mode
+  adopts every mounted drive with a `steamapps` as a library, and a drive as mounted is the
+  owner's alone. The owner's drives reach the seat as below.
 - **The owner's libraries.** At each start the daemon reads every library the box owner's Steam
   lists (`steamapps/libraryfolders.vdf` of the Steam a seat is cloned from) and shows each at
   `seats/<id>/libraries/<key>`, `<key>` a hash of its path. Its `steamapps` is the owner's own,
@@ -329,8 +332,10 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   `steamapps` isn't the owner's, or its filesystem takes no idmapped mount (anything but btrfs,
   ext4, xfs and f2fs). The daemon lists each shown library in both of the seat's
   `libraryfolders.vdf` copies, and drops one no longer shown and any under `/run/media`; Steam's
-  own entries and fields stay. The owner's Steam settings are never changed. Two Steam clients
-  updating one game in a shared library at once take no lock.
+  own entries and fields stay. A new seat's list names its own Steam first, then the shared games
+  folder, and each start adds the shared games folder if the list lacks it. The owner's Steam
+  settings are never changed. Two Steam clients updating one game in a shared library at once
+  take no lock.
   With **Seats update your games** off (`PUNKTFUNK_SEAT_LIBRARY_WRITABLE`, `library_writable` in
   the box's `seat-defaults.json`) the mount is read-only: a seat plays what is installed but can't
   update or install there, and its Steam can't rewrite the owner's appmanifests (it logs a failed
@@ -377,10 +382,11 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   Steam's events and FF uploads are translated. The CUSE fd and each device's fd wait in the fd
   store, so a restart of the daemon keeps the bound node and the devices on it; a stop of the
   daemon ends them until the seat restarts. Before it stops, the unit's `ExecStop=` has the
-  daemon answer every read a seat's Steam waits on, so none stays stranded in the kernel. The seat host's own pads still go through the
-  broker, and a seat host offers no pen. It needs `/dev/cuse`, which the `cuse` module autoloads
-  on first open; `doctor` reports it. The daemon makes `/dev/cuse` root's alone before each
-  seat's node, so no other user can register the name a seat binds.
+  daemon answer every read a seat's Steam waits on, so none stays stranded in the kernel. The
+  seat host's own pads still go through the broker, and a seat host offers no pen. It needs
+  `/dev/cuse`, which the `cuse` module autoloads on first open; `doctor` reports it. The daemon
+  makes `/dev/cuse` root's alone before each seat's node, so no other user can register the name
+  a seat binds.
 - **USB pads.** A seat's USB/IP pad (the virtual Deck, the Steam Controllers, the DualSense, the
   Switch 2) is served by the daemon, never by the seat. A seat that can't write vhci's `attach`
   sends a `Serve` with the pad kind, and the client pad's identity for a Steam Controller. The
