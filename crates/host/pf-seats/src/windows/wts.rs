@@ -1,11 +1,11 @@
 //! WTS discovery and exact managed-session teardown.
 //!
 //! Enumeration copies session IDs and states before releasing WTS memory, then
-//! queries each user and domain through `WTSQuerySessionInformationW`. A usable
-//! seat session must be active, non-console, local to this computer, and match
-//! the complete account name under Windows case rules. Multiple matches are an
-//! error; how long to wait for one is the supervisor's. Disconnected sessions
-//! remain visible to diagnostics but are never returned as display-capable.
+//! queries each user and domain through `WTSQuerySessionInformationW`; a session that ends
+//! between the two steps is left out. A usable seat session must be active, non-console,
+//! local to this computer, and match the complete account name under Windows case rules.
+//! Multiple matches are an error; how long to wait for one is the supervisor's. Disconnected
+//! sessions remain visible to diagnostics but are never returned as display-capable.
 //! Logoff always takes the exact session ID recorded by the supervisor.
 
 use crate::windows::util::{backend_error, computer_name, io_error, WinResult};
@@ -53,17 +53,27 @@ pub(super) fn enumerate() -> WinResult<Vec<Session>> {
 
     // SAFETY: this API takes no pointers and returns the current console session ID by value.
     let console = unsafe { WTSGetActiveConsoleSessionId() };
-    raw.into_iter()
-        .map(|(id, state)| {
-            Ok(Session {
-                id,
-                user: query_string(id, WTSUserName)?,
-                domain: query_string(id, WTSDomainName)?,
-                state,
-                console: id == console,
-            })
+    // A session that logged off since the listing has nothing to query: it is gone.
+    Ok(raw
+        .into_iter()
+        .filter_map(|(id, state)| {
+            let named = query_string(id, WTSUserName)
+                .and_then(|user| Ok((user, query_string(id, WTSDomainName)?)));
+            match named {
+                Ok((user, domain)) => Some(Session {
+                    id,
+                    user,
+                    domain,
+                    state,
+                    console: id == console,
+                }),
+                Err(error) => {
+                    tracing::debug!(%error, session = id, "session ended during enumeration");
+                    None
+                }
+            }
         })
-        .collect()
+        .collect())
 }
 
 pub(super) fn active_for_account(account: &str) -> WinResult<Option<Session>> {
