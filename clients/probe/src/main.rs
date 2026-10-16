@@ -1867,7 +1867,8 @@ fn data_plane(
     let cap_secs = seconds.unwrap_or(120);
     // Adaptive-FEC loss window: publish a fresh estimate every 750 ms for the loss relay.
     let mut last_loss_report = std::time::Instant::now();
-    let (mut last_recovered, mut last_late, mut last_received) = (0u64, 0u64, 0u64);
+    let (mut last_recovered, mut last_late, mut last_holes, mut last_received) =
+        (0u64, 0u64, 0u64, 0u64);
     loop {
         // Mirror packet-level receive counters for the speed-test reporter (reads their delta),
         // and publish a windowed loss estimate for the loss relay.
@@ -1882,6 +1883,7 @@ fn data_plane(
                     window_loss_ppm(
                         s.fec_recovered_shards.wrapping_sub(last_recovered),
                         s.fec_late_shards.wrapping_sub(last_late),
+                        s.partial_shards_lost.wrapping_sub(last_holes),
                         s.packets_received.wrapping_sub(last_received),
                     ),
                     Relaxed,
@@ -1889,6 +1891,7 @@ fn data_plane(
                 last_loss_report = std::time::Instant::now();
                 last_recovered = s.fec_recovered_shards;
                 last_late = s.fec_late_shards;
+                last_holes = s.partial_shards_lost;
                 last_received = s.packets_received;
             }
         }
