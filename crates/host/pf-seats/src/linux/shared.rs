@@ -30,6 +30,7 @@ use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Box files a seat host reads; any may not exist yet. Never the box's identity: a seat host
 /// mints its own, and clients reach it through the pin the box's `Redirect` carries.
@@ -248,6 +249,9 @@ const ACL_ACCESS: &str = "system.posix_acl_access";
 const ACL_MASK: u16 = 0x10;
 /// Folders deeper than this below `games` keep their mask: the walk holds a handle per level.
 const ACL_DEPTH: usize = 64;
+/// The buffer an ACL is read into first, and the most it grows to: the kernel's xattr limit.
+const ACL_START: usize = 1024;
+const ACL_MAX: usize = 64 * 1024;
 
 /// Re-applies `m::rwX` below the games folder, as `setfacl -R` would. A file one seat creates
 /// with mode 0644 or 0755 gets a mask of `r--` or `r-x` that cuts the group entry, so the other
@@ -255,8 +259,43 @@ const ACL_DEPTH: usize = 64;
 /// entry opened in its folder's handle without following a link, and changed through its own.
 ///
 /// Walks the whole tree each call: cheap for a normal library, slow past millions of files,
-/// where an inotify watch on `steamapps` would fix only what changed.
+/// where an inotify watch on `steamapps` would fix only what changed. So it walks on a thread of
+/// its own and returns at once, and the caller's trust copy never waits on it. A call while a walk
+/// runs asks for one more walk after it. A walk that fails is logged there.
 pub(super) fn fix_acl(state: &Path) -> Result<(), BackendError> {
+    {
+        let mut walk = ACL_WALK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(again) = walk.as_mut() {
+            *again = true;
+            return Ok(());
+        }
+        *walk = Some(false);
+    }
+    let state = state.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("seats-acl".into())
+        .spawn(move || loop {
+            if let Err(error) = repair_games(&state) {
+                tracing::warn!(%error, "games ACL mask not repaired");
+            }
+            let mut walk = ACL_WALK.lock().unwrap_or_else(|e| e.into_inner());
+            if *walk == Some(true) {
+                *walk = Some(false);
+            } else {
+                *walk = None;
+                return;
+            }
+        });
+    spawned.map(drop).map_err(|e| {
+        *ACL_WALK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        io_err("games_acl", "start the walk", e)
+    })
+}
+
+/// [`fix_acl`]'s walk: `None` while idle, `Some(asked_again)` while one runs.
+static ACL_WALK: Mutex<Option<bool>> = Mutex::new(None);
+
+fn repair_games(state: &Path) -> Result<(), BackendError> {
     let io = |what: &str, e| io_err("games_acl", what, e);
     let top = safe_open::dir(state).map_err(|e| io("open the state directory", e))?;
     let Some(games) = safe_open::dir_at(&top, "games").map_err(|e| io("open games", e))? else {
@@ -332,11 +371,14 @@ fn mask_entry(at: BorrowedFd<'_>, name: &CStr) -> std::io::Result<Option<OwnedFd
 /// Sets the mask of `fd`'s access ACL to `rw`, plus `x` when `exec`. A file with no ACL has no
 /// named entry for a mask to cut, and stays as it is.
 fn set_mask(fd: impl AsFd, exec: bool) -> std::io::Result<()> {
-    let mut buf = [0u8; 1024];
-    let len = match rustix::fs::fgetxattr(&fd, ACL_ACCESS, &mut buf[..]) {
-        Ok(len) => len,
-        Err(e) if e == Errno::NODATA => return Ok(()),
-        Err(e) => return Err(e.into()),
+    let mut buf = vec![0u8; ACL_START];
+    let len = loop {
+        match rustix::fs::fgetxattr(&fd, ACL_ACCESS, &mut buf[..]) {
+            Ok(len) => break len,
+            Err(Errno::NODATA) => return Ok(()),
+            Err(Errno::RANGE) if buf.len() < ACL_MAX => buf.resize(buf.len() * 4, 0),
+            Err(e) => return Err(e.into()),
+        }
     };
     if let Some(acl) = with_mask(&buf[..len], if exec { 7 } else { 6 }) {
         rustix::fs::fsetxattr(&fd, ACL_ACCESS, &acl, XattrFlags::REPLACE)?;
@@ -895,6 +937,11 @@ mod tests {
 
     /// An access ACL: owner `rw`, group `r`, a named group `rw`, the mask, other `r`.
     fn acl(mask: u16) -> Vec<u8> {
+        acl_with_groups(mask, 1)
+    }
+
+    /// [`acl`] with `groups` named groups.
+    fn acl_with_groups(mask: u16, groups: u32) -> Vec<u8> {
         let entry = |tag: u16, perm: u16, id: u32| {
             [
                 &tag.to_le_bytes()[..],
@@ -908,7 +955,7 @@ mod tests {
             2u32.to_le_bytes().to_vec(),
             entry(0x01, 6, none),
             entry(0x04, 4, none),
-            entry(0x08, 6, 4242),
+            (0..groups).flat_map(|n| entry(0x08, 6, 4242 + n)).collect(),
             entry(ACL_MASK, mask, none),
             entry(0x20, 4, none),
         ]
@@ -969,6 +1016,40 @@ mod tests {
         assert_eq!(mask_of(&outside.join("b")), 4);
         assert_eq!(mask_of(&games.join("sub.old")), 7, "a folder takes x");
         assert_eq!(mask_of(&games.join("sub.old/a")), 6);
+    }
+
+    /// An ACL longer than the first read buffer is repaired too, not skipped with its subtree.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_long_acl_is_repaired() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("f");
+        std::fs::write(&path, "x").unwrap();
+        let long = acl_with_groups(4, 300);
+        assert!(long.len() > ACL_START);
+        if rustix::fs::setxattr(&path, ACL_ACCESS, &long, XattrFlags::empty()).is_err() {
+            eprintln!("no POSIX ACLs under {}: skipped", temp.path().display());
+            return;
+        }
+        set_mask(std::fs::File::open(&path).unwrap(), false).unwrap();
+        let mut buf = vec![0u8; 8192];
+        let len = rustix::fs::getxattr(&path, ACL_ACCESS, &mut buf[..]).unwrap();
+        assert_eq!(&buf[..len], acl_with_groups(6, 300).as_slice());
+    }
+
+    /// `fix_acl` hands the walk to a thread and is idle again once it ends.
+    #[test]
+    fn the_acl_walk_runs_apart_and_ends() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("games")).unwrap();
+        fix_acl(temp.path()).unwrap();
+        fix_acl(temp.path()).unwrap();
+        let idle = || ACL_WALK.lock().unwrap().is_none();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !idle() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(idle());
     }
 
     /// The clone leaves the owner's sign-in with the owner: the account, the library, Steam
