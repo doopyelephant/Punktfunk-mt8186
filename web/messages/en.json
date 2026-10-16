@@ -394,6 +394,7 @@
 	"library_source_running": "Running",
 	"library_source_stopped": "Stopped",
 	"library_source_access_pending": "{title} can't read {count} of its folders",
+	"library_source_absent": "{title} isn't installed on this host",
 	"plugin_access_folders": "Folder access ({count})",
 	"plugin_access_read_only": "Read only",
 	"plugin_access_read_write": "Read and write",

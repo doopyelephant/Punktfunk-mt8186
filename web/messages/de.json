@@ -382,6 +382,7 @@
 	"library_source_running": "Läuft",
 	"library_source_stopped": "Gestoppt",
 	"library_source_access_pending": "{title} kann auf {count} Ordner nicht zugreifen",
+	"library_source_absent": "{title} ist auf diesem Host nicht installiert",
 	"plugin_access_folders": "Ordnerzugriff ({count})",
 	"plugin_access_read_only": "Nur Lesen",
 	"plugin_access_read_write": "Lesen und Schreiben",
