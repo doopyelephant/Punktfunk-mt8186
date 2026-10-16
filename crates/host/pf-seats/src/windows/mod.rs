@@ -70,7 +70,12 @@ pub struct WindowsBackend {
 pub fn seats_enabled() -> bool {
     RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(SEATS_KEY, KEY_QUERY_VALUE | KEY_WOW64_64KEY)
-        .is_ok_and(|seats| seats.get_value::<u32, _>(ENABLING).is_err())
+        .is_ok_and(|seats| finished(&seats))
+}
+
+/// A Seats key no turn-on is still filling: the ones older builds left have no `Enabling`.
+fn finished(seats: &RegKey) -> bool {
+    seats.get_value::<u32, _>(ENABLING).is_err()
 }
 
 /// Turn seats off without the supervisor, for the uninstaller once the service is gone: Remote
@@ -668,7 +673,24 @@ fn seat_diagnostic(level: DiagnosticLevel, code: &str, message: String, seat: &S
 
 #[cfg(test)]
 mod tests {
-    use super::wraps_termsrv;
+    use super::{finished, wraps_termsrv, ENABLING};
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    /// A bare key and one a turn-on finished are on; one still marked is off.
+    #[test]
+    fn a_key_marked_enabling_is_not_finished() {
+        let path = format!(r"Software\Punktfunk\SeatsTest{}", std::process::id());
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu.create_subkey(&path).unwrap();
+        assert!(finished(&key));
+        key.set_value(ENABLING, &1_u32).unwrap();
+        assert!(!finished(&key));
+        key.delete_value(ENABLING).unwrap();
+        assert!(finished(&key));
+        drop(key);
+        hkcu.delete_subkey(&path).unwrap();
+    }
 
     #[test]
     fn only_a_dll_other_than_termsrv_is_a_wrapper() {
