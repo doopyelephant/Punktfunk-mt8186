@@ -123,6 +123,9 @@ pub struct NativePairing {
     /// Live session counts plus last-out generation, keyed by lowercased fingerprint.
     /// Every admitted session counts; only a "this session" record reads the total.
     live: Mutex<Live>,
+    /// "This session" guests the startup sweep kept because they may play on a seat, and whether
+    /// a seat was seen to list them. [`Self::take_kept_at_start`] hands them out once.
+    kept_at_start: Mutex<Vec<(String, bool)>>,
 }
 
 /// Session counts and last-out generations behind one lock so a reconnect cannot
@@ -153,7 +156,14 @@ impl NativePairing {
     ) -> Result<NativePairing> {
         let store = store::TrustStore::open(store_path)?;
         let np = NativePairing::with_store(store, fixed_pin, arm_at_start);
-        np.drop_session_only_records();
+        // Only the door runs apart from its seat hosts, which keep their guests through its restart.
+        np.drop_session_only_records(|fp| {
+            if crate::seats::is_door() {
+                crate::seats::plays_on_a_seat(fp)
+            } else {
+                Some(false)
+            }
+        });
         Ok(np)
     }
 
@@ -172,19 +182,36 @@ impl NativePairing {
                 counts: HashMap::new(),
                 last_out: HashMap::new(),
             }),
+            kept_at_start: Mutex::new(Vec::new()),
         }
     }
 
-    /// A host that is starting has no live sessions, so every "this session" grant has already
-    /// ended — by a restart, an update or a crash, which is how a session usually ends. The
-    /// counter is in memory only, so without this sweep those records would outlive the guest
-    /// forever and the list would keep exactly the leftover the grant exists to prevent.
-    fn drop_session_only_records(&self) {
+    /// A host that is starting has no live sessions of its own, so a "this session" grant has
+    /// ended with the restart, an update or a crash. The counter is in memory only, so without
+    /// this sweep the record would outlive the guest.
+    ///
+    /// A guest on a seat outlives the box's host: the seat hosts end a guest whose record is
+    /// gone. `on_seat` says whether the device plays there; unless it answers `Some(false)` the
+    /// record stays, and [`Self::take_kept_at_start`] names the guest for a hold.
+    fn drop_session_only_records(&self, on_seat: impl Fn(&str) -> Option<bool>) {
         if self.store.read_only() {
             return;
         }
         for client in self.store.list() {
             if !client.until_disconnect {
+                continue;
+            }
+            let seen = on_seat(&client.fingerprint);
+            if seen != Some(false) {
+                tracing::info!(
+                    name = %client.name,
+                    fingerprint = %client.fingerprint,
+                    "kept a this-session grant: its device may still play on a seat"
+                );
+                self.kept_at_start
+                    .lock()
+                    .unwrap()
+                    .push((client.fingerprint, seen == Some(true)));
                 continue;
             }
             match self.store.remove(&client.fingerprint) {
@@ -201,6 +228,11 @@ impl NativePairing {
                 ),
             }
         }
+    }
+
+    /// The guests the startup sweep kept, with whether a seat was seen to list each, once.
+    pub fn take_kept_at_start(&self) -> Vec<(String, bool)> {
+        std::mem::take(&mut *self.kept_at_start.lock().unwrap())
     }
 
     /// Arm with a fresh PIN for `ttl`, unbound (any well-formed attempt consumes it) and with
@@ -1189,6 +1221,46 @@ mod tests {
             restarted.is_paired("ee22"),
             "an ordinary grant survives a restart"
         );
+    }
+
+    /// A guest on a seat outlives the box's host, and the seat hosts end a guest whose record is
+    /// gone. The sweep keeps the record of a device a seat lists, or one no seat could rule out,
+    /// and drops the rest.
+    #[test]
+    fn a_restart_keeps_this_session_grants_of_guests_on_a_seat() {
+        use punktfunk_core::quic::GRANT_GAMEPAD;
+        let (_temp, path) = temp();
+        {
+            let np = NativePairing::load_with(Some(path.clone()), None, false).unwrap();
+            for (name, fp) in [("On seat", "dd11"), ("Unknown", "ee22"), ("Gone", "ff33")] {
+                let access = Access {
+                    grants: GRANT_GAMEPAD,
+                    expires_unix: None,
+                    until_disconnect: true,
+                };
+                np.add_with_access(name, fp, Some(access)).unwrap();
+            }
+        }
+
+        let restarted = NativePairing::with_store(store::TrustStore::at(path, false), None, false);
+        restarted.drop_session_only_records(|fp| match fp {
+            "dd11" => Some(true),
+            "ee22" => None,
+            _ => Some(false),
+        });
+        assert!(restarted.is_paired("dd11"), "a seat lists the guest");
+        assert!(
+            restarted.is_paired("ee22"),
+            "a silent seat may hold the guest"
+        );
+        assert!(!restarted.is_paired("ff33"), "no seat has the guest");
+        let mut kept = restarted.take_kept_at_start();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [("dd11".to_string(), true), ("ee22".to_string(), false)]
+        );
+        assert!(restarted.take_kept_at_start().is_empty(), "handed out once");
     }
 
     /// The address table the admission rules read. Anything not on a network the operator

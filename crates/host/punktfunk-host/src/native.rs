@@ -250,6 +250,7 @@ pub(crate) async fn serve(
 ) -> Result<()> {
     let fingerprint = endpoint::fingerprint_of_pem(&identity.cert_pem)
         .map_err(|e| anyhow!("cert fingerprint: {e}"))?;
+    hold_guests_kept_at_start(&np);
     // Media leaves from this socket. `pkf1` stays listed for [`serve_pkf1`]: an older client
     // still pairs there, and is told to update for anything else.
     let alpns: &[&[u8]] = &[
@@ -1126,7 +1127,7 @@ pub(crate) async fn run_admitted(
     if let Some(served) = placed {
         if let (Some(guard), Some(fp)) = (session, session_fp_hex) {
             if np.is_session_only(&fp) {
-                hold_while_on_seat(guard, fp);
+                hold_while_on_seat(guard, fp, false);
             }
         }
         return Ok(served);
@@ -1758,14 +1759,26 @@ const SEAT_LANDING: std::time::Duration = std::time::Duration::from_secs(120);
 /// hangs is not serving anyone.
 const SEAT_SILENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Holds each "this session" guest the startup sweep kept, as a redirect holds its own: the guest
+/// plays on a seat of a box whose host restarted. Spawns tasks, so it runs inside the runtime.
+pub(crate) fn hold_guests_kept_at_start(np: &Arc<NativePairing>) {
+    for (fp, landed) in np.take_kept_at_start() {
+        hold_while_on_seat(np.session_started(&fp), fp, landed);
+    }
+}
+
 /// A guest on a "this session" record plays on a seat after the redirect ended the door's own
 /// session. Holds the count until it has played there and left, so the record outlasts the
-/// play and not the redirect. The grace after the last count is the usual one.
-fn hold_while_on_seat(session: crate::native_pairing::SessionCountGuard, fp: String) {
+/// play and not the redirect. The grace after the last count is the usual one. `landed` is true
+/// for a guest already seen on a seat.
+fn hold_while_on_seat(
+    session: crate::native_pairing::SessionCountGuard,
+    fp: String,
+    mut landed: bool,
+) {
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         let mut heard = started;
-        let mut landed = false;
         loop {
             tokio::time::sleep(SEAT_POLL).await;
             let fp = fp.clone();
