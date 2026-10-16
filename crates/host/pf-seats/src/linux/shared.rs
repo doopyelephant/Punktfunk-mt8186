@@ -577,6 +577,10 @@ fn sync_file(
 /// identity: a game on the seat could otherwise answer as the box. Returns whether anything
 /// changed. The door owns `box_dir` and the owner owns their own copy, so both are read and
 /// written through directory handles.
+///
+/// A file that can't be copied keeps its last good copy and the rest still follow; the first
+/// failure is the answer. A box directory that isn't there, as in a reinstall, leaves every copy
+/// as it was.
 pub(super) fn refresh_trust(
     box_dir: &Path,
     state: &Path,
@@ -590,13 +594,21 @@ pub(super) fn refresh_trust(
     for name in RETIRED {
         changed |= unlink(&dst, name).map_err(|e| io(&format!("remove the old {name}"), e))?;
     }
+    let Some(src) = src else { return Ok(changed) };
+    let mut first = None;
+    let mut note = |copied: std::io::Result<bool>, what: String| match copied {
+        Ok(did) => changed |= did,
+        Err(e) => {
+            first.get_or_insert_with(|| io(&what, e));
+        }
+    };
     for name in TRUST_FILES {
-        changed |= sync_file(src.as_ref(), &dst, name, reader, MAX_TRUST_BYTES)
-            .map_err(|e| io(&format!("copy {name}"), e))?;
+        let copied = sync_file(Some(&src), &dst, name, reader, MAX_TRUST_BYTES);
+        note(copied, format!("copy {name}"));
     }
-    changed |= sync_flat_dir(src.as_ref(), &dst, AVATARS, reader, MAX_TRUST_BYTES)
-        .map_err(|e| io("copy the avatars", e))?;
-    Ok(changed)
+    let avatars = sync_flat_dir(Some(&src), &dst, AVATARS, reader, MAX_TRUST_BYTES);
+    note(avatars, "copy the avatars".to_owned());
+    first.map_or(Ok(changed), Err)
 }
 
 /// Brings the box's library level with the owner's own in `home`, for `reader`, the door's
@@ -1327,6 +1339,46 @@ mod tests {
             std::fs::read_to_string(box_library_dir(&state).join("library.json")).unwrap(),
             "root only"
         );
+    }
+
+    /// A file the copy refuses leaves its last good copy and doesn't stop the others; a box
+    /// directory that is gone leaves every copy.
+    #[test]
+    fn a_bad_trust_file_or_a_missing_box_keeps_the_last_copies() {
+        let temp = tempfile::tempdir().unwrap();
+        let (box_dir, state) = (temp.path().join("box"), temp.path().join("state"));
+        for dir in [&box_dir, &state] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let gid = own_gid(&box_dir);
+        let reader = Reader::group(gid);
+        std::fs::write(box_dir.join("punktfunk1-paired.json"), "[1]").unwrap();
+        std::fs::write(box_dir.join("profiles.json"), "{}").unwrap();
+        assert!(refresh_trust(&box_dir, &state, &id(), reader).unwrap());
+        let trust = trust_dir(&state, &id());
+
+        // A second link makes the paired list unreadable to the copy; profiles still follow.
+        std::fs::hard_link(
+            box_dir.join("punktfunk1-paired.json"),
+            temp.path().join("backup"),
+        )
+        .unwrap();
+        std::fs::write(box_dir.join("profiles.json"), "{\"a\":1}").unwrap();
+        let error = refresh_trust(&box_dir, &state, &id(), reader).unwrap_err();
+        assert_eq!(error.code, "trust_copy");
+        assert_eq!(
+            std::fs::read_to_string(trust.join("punktfunk1-paired.json")).unwrap(),
+            "[1]"
+        );
+        assert_eq!(
+            std::fs::read_to_string(trust.join("profiles.json")).unwrap(),
+            "{\"a\":1}"
+        );
+
+        let gone = temp.path().join("gone");
+        assert!(!refresh_trust(&gone, &state, &id(), reader).unwrap());
+        assert!(trust.join("punktfunk1-paired.json").exists());
+        assert!(trust.join("profiles.json").exists());
     }
 
     /// A link in the box directory is never followed into the copy.
