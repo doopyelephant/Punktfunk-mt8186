@@ -515,7 +515,8 @@ mod tests {
     }
 
     /// A user that isn't the seat's is refused before its sessions are touched; an absent one is
-    /// not. `getent` answers for the machine's own users.
+    /// not. `getent` answers for the machine's own users, so only Linux runs it.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_foreign_user_is_refused_and_an_absent_one_is_not() {
         assert_eq!(
