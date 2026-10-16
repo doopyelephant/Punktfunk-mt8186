@@ -152,6 +152,17 @@ impl Shell {
             replaced,
             self.stats_verbosity,
         );
+        // Submit → our GPU done (latch) and GPU done → glass (floor), p50 and the window's
+        // worst: a hold after the present call lands in one of the two.
+        let ms = |us: u32| us as f32 / 1000.0;
+        let (latch_max_ms, floor_ms, floor_max_ms) =
+            st.last_snap.as_ref().map_or((0.0, 0.0, 0.0), |s| {
+                (
+                    ms(s.latch.max_us),
+                    ms(s.os_floor.p50_us),
+                    ms(s.os_floor.max_us),
+                )
+            });
         st.win.start = Instant::now();
         if st.store.is_smoothing() && st.slots.widen(st.win.misses) {
             tracing::info!(
@@ -208,6 +219,9 @@ impl Shell {
                 judder,
                 pace_ms,
                 latch_ms,
+                latch_max_ms,
+                floor_ms,
+                floor_max_ms,
                 import_us = import.p50_us,
                 submit_us = submit.p50_us,
                 submit_max_us = submit.max_us,
