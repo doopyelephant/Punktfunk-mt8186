@@ -226,7 +226,9 @@ impl PlatformBackend for WindowsBackend {
 
     /// The seat host's own directories go with the seat: its identity key, token and logs, as a
     /// Linux seat's directory does. A directory that won't go is logged; the seat is gone anyway.
+    /// An account that isn't the seat's is refused before the stop logs anything off.
     fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.accounts.ensure_owned_or_absent(seat)?;
         let _ = self.supervisor.stop(seat)?;
         self.accounts.delete(seat)?;
         for parent in ["hosts", "temp"] {

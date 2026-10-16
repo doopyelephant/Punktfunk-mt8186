@@ -10,6 +10,7 @@
 //! deletion requires the same exact marker and an explicit caller action, and takes the
 //! account's profile with it.
 
+use crate::backend::BackendError;
 use crate::model::{Seat, SeatId};
 use crate::windows::credentials::{Credential, CredentialStore};
 use crate::windows::util::{
@@ -147,13 +148,16 @@ impl AccountManager {
                 delete_account(&seat.account)?;
                 self.credentials.delete(&seat.id)
             }
-            Some(_) => Err(backend_error(
-                "account_not_owned",
-                format!(
-                    "refusing to delete local account '{}' because its marker does not match seat {}",
-                    seat.account, seat.id
-                ),
-            )),
+            Some(_) => Err(refuse_delete(seat)),
+        }
+    }
+
+    /// Refuses an account that exists without the seat's marker. One that doesn't exist passes:
+    /// there is nothing of ours to stop or delete.
+    pub(super) fn ensure_owned_or_absent(&self, seat: &Seat) -> WinResult<()> {
+        match account_comment(&seat.account)? {
+            Some(comment) if comment != marker(&seat.id) => Err(refuse_delete(seat)),
+            _ => Ok(()),
         }
     }
 
@@ -178,6 +182,16 @@ impl AccountManager {
 
 pub(super) fn marker(id: &SeatId) -> String {
     format!("Punktfunk managed seat {id}")
+}
+
+fn refuse_delete(seat: &Seat) -> BackendError {
+    backend_error(
+        "account_not_owned",
+        format!(
+            "refusing to delete local account '{}' because its marker does not match seat {}",
+            seat.account, seat.id
+        ),
+    )
 }
 
 fn require_marker(seat: &Seat) -> WinResult<()> {
