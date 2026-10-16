@@ -2054,17 +2054,28 @@ public final class Stage2Pipeline {
         let windowSize = max(64, Int(connection.shardPayload))
         return Thread {
             defer { pumpStopped.signal() }
+            // The core assembles each AU in a pool slot the dequant kernel reads as is: no copy
+            // between the wire and the GPU. Sized for the mode; a bigger AU brings a bigger pool.
+            let mode = connection.currentMode()
+            let firstPool = WaveletAccessUnitPool(
+                device: device,
+                capacity: WaveletAccessUnitPool.capacity(
+                    width: Int(mode.width), height: Int(mode.height),
+                    chroma444: connection.isChroma444))
             // Compiles the two compute kernels on the session's first frames' thread — ~tens of
             // ms, once per session. Failure = this device can't run the negotiated codec (the
             // advertisement probe should have prevented this); end the session cleanly.
             // Ring past the store: its queued frames, the render thread's, a put-back, the decode.
-            guard let decoder = MetalWaveletDecoder(
+            guard let firstPool, let decoder = MetalWaveletDecoder(
                 device: device, queue: queue, tenBit: connection.bitDepth >= 10,
-                ringDepth: max(4, ring.capacity + 3))
+                ringDepth: max(4, ring.capacity + 3), pool: firstPool)
             else {
                 if !token.isStopped { onSessionEnd?() }
                 return
             }
+            var pool = firstPool
+            connection.setAccessUnitMemory(pool)
+            defer { connection.setAccessUnitMemory(nil) }
             // Newest decoded frame index — a late partial (the reassembler's 30 ms fuse can
             // deliver one behind a newer complete frame) must not travel back in time.
             var newestIndex: UInt32?
@@ -2101,8 +2112,21 @@ public final class Stage2Pipeline {
                         // receipt→pull is the HUD's separate client-queue term, ABI v9 split).
                         let receivedNs = au.pulledNs
                         let flags = au.flags
+                        // In the pool already, or copied into a slot: an AU the core assembled
+                        // on the heap, or one a mode switch made too big for this pool — which
+                        // then gives way to one that fits, from the next frame on.
+                        var placed = au.inPlace ?? pool.stage(au.data)
+                        if placed == nil, au.byteCount > pool.capacity,
+                           let bigger = WaveletAccessUnitPool(
+                               device: device, capacity: au.byteCount * 5 / 4) {
+                            pool = bigger
+                            decoder.pool = bigger
+                            connection.setAccessUnitMemory(bigger)
+                            placed = bigger.stage(au.data)
+                        }
+                        guard let placed else { return true } // no slot free: skip the frame
                         let submitted = decoder.decode(
-                            au: au.data, chunkAligned: chunkAligned, windowSize: windowSize
+                            placed, chunkAligned: chunkAligned, windowSize: windowSize
                         ) { planes in
                             // Metal completed-handler thread — stamp + enqueue, don't block
                             // (the exact contract of the VT output callback).

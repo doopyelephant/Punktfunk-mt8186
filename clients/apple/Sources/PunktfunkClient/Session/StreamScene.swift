@@ -87,7 +87,7 @@ struct StreamScene: View {
             },
             onDial: dialSink,
             onFrame: { [meter = model.meter, queue = model.clientQueue] au in
-                meter.note(byteCount: au.data.count)
+                meter.note(byteCount: au.byteCount)
                 // Receipt and the host split are the core's; the client-queue wait
                 // (receipt → pull, both client-local) is Apple's own overlay line.
                 queue.record(
