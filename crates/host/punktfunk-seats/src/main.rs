@@ -195,6 +195,7 @@ mod linux {
         pf_seats::logging::to_stderr();
         // Adopts systemd's kept fds close-on-exec before anything here can spawn a child.
         crate::uinput::resume(pads::resume());
+        socket::ensure_door_group();
         let state = PathBuf::from(pf_seats::linux::STATE_DIR);
         let backend = LinuxBackend::open(pf_paths::config_dir(), state, steam_source)
             .map_err(|e| format!("open the seat backend: {e}"))?

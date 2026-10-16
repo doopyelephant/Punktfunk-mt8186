@@ -66,6 +66,14 @@ pub fn bind_fresh(path: &Path) -> std::io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
+/// Makes the door's group when no package has yet. A package restarts this daemon before the one
+/// that creates the group, and a socket bound without it stays closed to the door.
+pub fn ensure_door_group() {
+    if let Err(error) = accounts::ensure_group(DOOR_GROUP) {
+        tracing::warn!(%error, "door group not created");
+    }
+}
+
 /// Binds `path` for the box host: root and the door's group may connect.
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     let listener = bind_fresh(path)?;

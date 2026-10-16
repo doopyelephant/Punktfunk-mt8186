@@ -274,8 +274,10 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   it on with `services.punktfunk.seats.enable`. The SteamOS on-device build lays the same files out
   under `/opt/punktfunk` and `/etc` (`scripts/steamdeck/door.sh`).
 - **The socket.** `/run/punktfunk/seats.sock` (`0660 root:punktfunk-door`) carries the same frames
-  and commands as the Windows pipe. It answers root and the `punktfunk` user, judged by the peer's
-  credentials; any other peer is closed unanswered. `enable` answers like `seating`, and `disable` is refused: seats are on while
+  and commands as the Windows pipe. The daemon makes the `punktfunk-door` group at start when no
+  package has, so an update that restarts it first still opens the socket to the door. It answers
+  root and the `punktfunk` user, judged by the peer's credentials; any other peer is closed
+  unanswered. `enable` answers like `seating`, and `disable` is refused: seats are on while
   the daemon runs. `punktfunk-seats list`, `create <name>`, `adopt-owner <user>`,
   `start|stop|delete <id>` and `doctor` send the same requests.
 - **The user.** Its comment is `punktfunk-seat=<id>`, and the daemon touches or deletes only an
