@@ -2,11 +2,10 @@
 //! Desktop listener and its firewall scope, the seat listener, and the pinned RDP certificate.
 //!
 //! [`checks`] only reads. [`turn_on`] creates the Seats key and records there what it changed
-//! (`ListenerWasOff`, `AllowRdpFromNetwork`, `RdpRulesOpened`); [`turn_off`] undoes exactly
-//! that and deletes the
-//! key last, so a failed restore can be retried. A refusal carries one plain sentence for the
-//! operator; its cause goes to the log. The seat display driver stays in the driver store when
-//! seats go off.
+//! (`ListenerWasOff`, `AllowRdpFromNetwork`, `RdpRulesOpened`, `RdpRuleScopes`); [`turn_off`]
+//! undoes exactly that and deletes the key last, so a failed restore can be retried. A refusal
+//! carries one plain sentence for the operator; its cause goes to the log. The seat display
+//! driver stays in the driver store when seats go off.
 
 use super::util::{backend_error, WinResult};
 use super::{keeper, seats_enabled, server_edition, session_wrapper, ENABLING, SEATS_KEY};
@@ -30,6 +29,9 @@ const LISTENER_WAS_OFF: &str = "ListenerWasOff";
 const RDP_FROM_NETWORK: &str = "AllowRdpFromNetwork";
 /// The `Remote Desktop` rules [`turn_on`] enabled for the network, one name per line.
 const RDP_RULES_OPENED: &str = "RdpRulesOpened";
+/// Each `Remote Desktop` rule's `RemoteAddress` before [`turn_on`] narrowed it, `name|address`
+/// per line, for [`turn_off`] to write back.
+const RDP_RULE_SCOPES: &str = "RdpRuleScopes";
 /// The `Remote Desktop` firewall group by the resource id every Windows language shares.
 const RDP_RULE_GROUP: &str = "@FirewallAPI.dll,-28752";
 /// `Remote Desktop Services`, the Session Host role's group, and its two rules on the
@@ -218,13 +220,7 @@ pub(super) fn turn_off() -> WinResult<()> {
     };
     close_rdp_rules(&seats)?;
     if seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok() == Some(0) {
-        firewall_scope("Any").map_err(|cause| {
-            refuse(
-                "rdp_firewall",
-                "Couldn't restore Remote Desktop's firewall rules.",
-                cause,
-            )
-        })?;
+        restore_scopes(&seats)?;
     }
     if seats.get_value::<u32, _>(LISTENER_WAS_OFF).ok() == Some(1) {
         deny_listener(true).map_err(|cause| {
@@ -400,21 +396,19 @@ fn apply(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
     }
     install_driver(&dir, true)?;
     allow_listener(&seats)?;
-    // A choice made earlier narrowed the rules; allowing the network now widens them again.
+    // A choice made earlier narrowed the rules; allowing the network now puts them back.
     let narrowed = seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok() == Some(0);
-    let scope = match (allow_rdp_from_network, narrowed) {
-        (false, _) => Some(LOOPBACK),
-        (true, true) => Some("Any"),
-        (true, false) => None,
-    };
-    if let Some(scope) = scope {
-        firewall_scope(scope).map_err(|cause| {
+    record_scopes(&seats)?;
+    if !allow_rdp_from_network {
+        firewall_scope(LOOPBACK).map_err(|cause| {
             refuse(
                 "rdp_firewall",
                 "Couldn't limit Remote Desktop to this machine.",
                 cause,
             )
         })?;
+    } else if narrowed {
+        restore_scopes(&seats)?;
     }
     if allow_rdp_from_network {
         open_rdp_rules(&seats)?;
@@ -613,9 +607,93 @@ fn firewall_scope(remote: &str) -> Result<(), String> {
     }
 }
 
+/// The rules [`firewall_scope`] sets, as `name|address,address` lines: what each reaches today.
+fn scopes_script() -> String {
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         @(Get-NetFirewallRule -Name {RDS_LISTENER_RULES} -ErrorAction SilentlyContinue) + \
+         @(Get-NetFirewallRule -Group '{RDP_RULE_GROUP}') | \
+         ForEach-Object {{ '{{0}}|{{1}}' -f $_.Name, \
+         (($_ | Get-NetFirewallAddressFilter).RemoteAddress -join ',') }}; exit 0"
+    )
+}
+
+/// Note each rule's scope before the first change, so [`restore_scopes`] writes back what the
+/// operator had, even when they narrow the rules in a later turn-on. Only a key this build
+/// created notes them: on an older one the rules may be narrowed already.
+fn record_scopes(seats: &RegKey) -> WinResult<()> {
+    if seats.get_value::<u32, _>(ENABLING).is_err()
+        || seats.get_value::<String, _>(RDP_RULE_SCOPES).is_ok()
+    {
+        return Ok(());
+    }
+    let fail = |cause: String| {
+        refuse(
+            "rdp_firewall",
+            "Couldn't read Remote Desktop's firewall rules.",
+            cause,
+        )
+    };
+    let scopes = powershell_lines(&scopes_script(), QUERY_LIMIT).map_err(fail)?;
+    seats
+        .set_value(RDP_RULE_SCOPES, &scopes.join("\n"))
+        .map_err(|cause| fail(cause.to_string()))
+}
+
+/// The `(rule, addresses)` pairs [`record_scopes`] wrote. A line with no address is dropped.
+fn parse_scopes(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| line.split_once('|'))
+        .filter(|(name, remote)| !name.is_empty() && !remote.is_empty())
+        .map(|(name, remote)| (name.to_owned(), remote.to_owned()))
+        .collect()
+}
+
+/// Set each recorded rule back to its scope. A rule the record lacks, one Windows added since,
+/// opens to `Any` as Windows creates it; with no record, which an older key lacks, every rule does.
+fn restore_scopes(seats: &RegKey) -> WinResult<()> {
+    let kept = parse_scopes(
+        &seats
+            .get_value::<String, _>(RDP_RULE_SCOPES)
+            .unwrap_or_default(),
+    );
+    powershell_lines(&restore_script(&kept), QUERY_LIMIT)
+        .map(drop)
+        .map_err(|cause| {
+            refuse(
+                "rdp_firewall",
+                "Couldn't restore Remote Desktop's firewall rules.",
+                cause,
+            )
+        })
+}
+
+fn restore_script(kept: &[(String, String)]) -> String {
+    let names: Vec<String> = kept.iter().map(|(name, _)| name.clone()).collect();
+    let mut script = String::from("$ErrorActionPreference='Stop'; ");
+    for (name, remote) in kept {
+        let remote: Vec<String> = remote.split(',').map(str::to_owned).collect();
+        script += &format!(
+            "Get-NetFirewallRule -Name {} -ErrorAction SilentlyContinue | \
+             Set-NetFirewallRule -RemoteAddress {}; ",
+            ps_list(std::slice::from_ref(name)),
+            ps_list(&remote)
+        );
+    }
+    script += &format!(
+        "@(Get-NetFirewallRule -Name {RDS_LISTENER_RULES} -ErrorAction SilentlyContinue) + \
+         @(Get-NetFirewallRule -Group '{RDP_RULE_GROUP}' -ErrorAction SilentlyContinue) | \
+         Where-Object {{ @({}) -notcontains $_.Name }} | \
+         Set-NetFirewallRule -RemoteAddress Any; exit 0",
+        ps_list(&names)
+    );
+    script
+}
+
 /// Enable the `Remote Desktop` rules that are off, for an operator who lets the network reach
-/// Remote Desktop. Turning the listener on by registry enables none. The names are noted first,
-/// so a crash between the two still closes them.
+/// Remote Desktop: the inbound ones on the listener's port, as [`open_rdp_rule`] reads them. The
+/// group's other rules, such as Shadow, stay as they are. Turning the listener on by registry
+/// enables none. The names are noted first, so a crash between the two still closes them.
 fn open_rdp_rules(seats: &RegKey) -> WinResult<()> {
     let fail = |cause: String| {
         refuse(
@@ -628,7 +706,9 @@ fn open_rdp_rules(seats: &RegKey) -> WinResult<()> {
         &format!(
             "$ErrorActionPreference='Stop'; \
              Get-NetFirewallRule -Group '{RDP_RULE_GROUP}' | \
-             Where-Object {{ $_.Enabled -eq 'False' }} | ForEach-Object {{ $_.Name }}"
+             Where-Object {{ $_.Enabled -eq 'False' -and $_.Direction -eq 'Inbound' }} | \
+             Where-Object {{ ($_ | Get-NetFirewallPortFilter).LocalPort -contains '3389' }} | \
+             ForEach-Object {{ $_.Name }}"
         ),
         QUERY_LIMIT,
     )
@@ -942,6 +1022,32 @@ mod tests {
         assert_eq!(role_check("Unknown").level, DiagnosticLevel::Warning);
         assert_eq!(role_check("Available").level, DiagnosticLevel::Error);
         assert_eq!(role_check("Removed").level, DiagnosticLevel::Error);
+    }
+
+    #[test]
+    fn a_rule_goes_back_to_the_scope_it_had_and_an_unknown_one_opens() {
+        let kept = parse_scopes(
+            "RemoteDesktop-UserMode-In-TCP|10.0.5.0/255.255.255.0,LocalSubnet\n\
+             {guid-1}|Any\nno-address|\n|orphan\nnot a record",
+        );
+        assert_eq!(
+            kept,
+            [
+                (
+                    "RemoteDesktop-UserMode-In-TCP".to_owned(),
+                    "10.0.5.0/255.255.255.0,LocalSubnet".to_owned()
+                ),
+                ("{guid-1}".to_owned(), "Any".to_owned()),
+            ]
+        );
+        let script = restore_script(&kept);
+        assert!(script.contains(
+            "-Name 'RemoteDesktop-UserMode-In-TCP' -ErrorAction SilentlyContinue | \
+             Set-NetFirewallRule -RemoteAddress '10.0.5.0/255.255.255.0','LocalSubnet';"
+        ));
+        assert!(script.contains("@('RemoteDesktop-UserMode-In-TCP','{guid-1}') -notcontains"));
+        // With no record every rule opens, as before the scopes were kept.
+        assert!(restore_script(&[]).contains("@() -notcontains $_.Name"));
     }
 
     #[test]

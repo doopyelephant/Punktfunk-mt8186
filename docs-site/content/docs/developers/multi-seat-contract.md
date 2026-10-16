@@ -69,8 +69,10 @@ A failed check changes nothing: the answer is 200 with `enabled: false` and the 
 2. Installs `pf_vdisplay_seats.inf` from `staging\pfvdisplay\` beside `punktfunk-host.exe`.
 3. Turns the Remote Desktop listener on if it was off, and limits the **Remote Desktop**
    firewall rules to `127.0.0.0/8` unless `allow_rdp_from_network` is `true`, with the two
-   port 3389 rules the Session Host role adds. The service limits them again each time it
-   starts.
+   port 3389 rules the Session Host role adds. Each rule's scope is noted first, and turning
+   off writes it back. With `allow_rdp_from_network` the inbound rules on port 3389 are
+   enabled if they were off; Shadow stays as it is. The service limits them again each time
+   it starts.
 4. Adds the seat listener `punktfunk-tcp`: a copy of `RDP-Tcp` on port 3390 whose sessions load
    `pf_seat_audio.dll`, with port 3390 blocked from every address but loopback. The x64 build goes
    to `System32\punktfunk` and the x86 build to `SysWOW64\punktfunk`. Every seat start brings
