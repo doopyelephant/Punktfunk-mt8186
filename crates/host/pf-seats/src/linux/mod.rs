@@ -34,7 +34,7 @@ pub use socket::SOCKET_PATH;
 use crate::backend::{BackendError, PlatformBackend};
 use crate::ipc::{Diagnostic, DiagnosticLevel, SeatingStatus};
 use crate::model::{Ledger, RuntimeState, RuntimeStatus, Seat, SeatId};
-use crate::persistence::StoreError;
+use crate::persistence::{LedgerStore, StoreError};
 use crate::service::SeatService;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -275,11 +275,13 @@ impl LinuxBackend {
     }
 
     /// Opens the ledger in `seats` under [`STATE_DIR`] and gives the service this backend.
-    /// The ledger store closes its directory to root; seat users walk through it, so it reopens.
+    /// The ledger store closes its directory to root; seat users walk through it, so it reopens
+    /// before the ledger loads, and a ledger that won't load leaves running seats their homes.
     pub fn open_service(self) -> Result<SeatService<Self>, StoreError> {
         let root = ledger_root(&self.inner.state);
-        let service = SeatService::open(&root, self)?;
+        let store = LedgerStore::open(&root)?;
         shared::make_dir(&root, 0o711)?;
+        let service = SeatService::with_store(store, self)?;
         service.backend().reap_orphans(&service.ledger());
         Ok(service)
     }

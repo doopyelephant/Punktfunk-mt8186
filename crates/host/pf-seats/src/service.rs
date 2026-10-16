@@ -32,7 +32,12 @@ pub struct SeatService<B> {
 
 impl<B: PlatformBackend> SeatService<B> {
     pub fn open(root: impl AsRef<Path>, backend: B) -> Result<Self, StoreError> {
-        let store = LedgerStore::open(root)?;
+        Self::with_store(LedgerStore::open(root)?, backend)
+    }
+
+    /// A service over `store`, already open: the caller may reshape its root's mode before the
+    /// ledger loads.
+    pub fn with_store(store: LedgerStore, backend: B) -> Result<Self, StoreError> {
         let ledger = store.load()?;
         Ok(Self {
             backend,

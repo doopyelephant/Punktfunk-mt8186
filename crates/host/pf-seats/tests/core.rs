@@ -281,6 +281,28 @@ fn the_owner_row_is_adopted_once_and_released_by_delete() {
     assert!(backend.calls().contains(&format!("remove:{}", first.id)));
 }
 
+/// `open` closes the ledger root to its owner; `with_store` loads from a store the caller
+/// opened and leaves the root as the caller set it, even when the ledger doesn't load.
+#[cfg(unix)]
+#[test]
+fn a_service_over_an_opened_store_keeps_the_roots_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = LedgerStore::open(temp.path()).unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+    SeatService::with_store(store, FakeBackend::default()).unwrap();
+    assert_eq!(mode(temp.path()), 0o711);
+
+    let store = LedgerStore::open(temp.path()).unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+    std::fs::write(temp.path().join(LEDGER_FILE), b"{truncated").unwrap();
+    assert!(SeatService::with_store(store, FakeBackend::default()).is_err());
+    assert_eq!(mode(temp.path()), 0o711);
+}
+
 /// A backend whose provision fails with `code` after the fake made its account.
 #[derive(Clone)]
 struct FailsToProvision {
