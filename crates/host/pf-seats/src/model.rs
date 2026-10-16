@@ -227,7 +227,10 @@ impl Ledger {
             }
 
             unique(&mut ids, seat.id.as_str().to_owned(), "id")?;
-            unique(&mut names, seat.name.to_lowercase(), "name")?;
+            // The owner's row is named for their login, which no host ever announces.
+            if !seat.owner {
+                unique(&mut names, seat.name.to_lowercase(), "name")?;
+            }
             unique(&mut accounts, seat.account.to_lowercase(), "account")?;
             unique(&mut slots, seat.display_slot, "display slot")?;
             unique(&mut ports, seat.native_port, "port")?;
@@ -557,6 +560,29 @@ mod tests {
         assert_eq!(serde_json::to_value(&owner).unwrap()["owner"], true);
         let old: Seat = serde_json::from_value(wire).unwrap();
         assert!(!old.owner);
+    }
+
+    /// A profile may carry the owner's login as its name, whichever row came first.
+    #[test]
+    fn a_profile_named_like_the_owners_login_coexists_with_the_owner_row() {
+        let named = |name: &str| CreateSeat {
+            name: name.into(),
+            account: format!("pf-{}", name.to_lowercase()),
+            autostart: false,
+        };
+        let mut owner_first = Ledger::new();
+        owner_first.allocate_owner("enrico").unwrap();
+        owner_first.allocate(named("Enrico")).unwrap();
+
+        let mut profile_first = Ledger::new();
+        profile_first.allocate(named("Enrico")).unwrap();
+        profile_first.allocate_owner("enrico").unwrap();
+
+        let mut twice = owner_first.clone();
+        assert!(matches!(
+            twice.allocate(named("ENRICO")),
+            Err(ValidationError::Duplicate { kind: "name", .. })
+        ));
     }
 
     #[test]
