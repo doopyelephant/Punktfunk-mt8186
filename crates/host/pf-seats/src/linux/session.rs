@@ -14,7 +14,6 @@ use crate::backend::BackendError;
 use crate::model::{RuntimeState, RuntimeStatus, Seat, SeatId};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 /// Where each seat's environment file lives.
 pub(super) const ENV_DIR: &str = "/run/punktfunk/seats";
@@ -334,10 +333,42 @@ pub(super) fn state(account: &str) -> Result<UnitState, BackendError> {
     Ok(parse_show(&shown))
 }
 
-/// Whether something accepts TCP connections on loopback `port`: the seat host's management API.
-pub(super) fn port_open(port: u16) -> bool {
-    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    std::net::TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok()
+/// The users that own a TCP listener on `port`, from the kernel's tables: one entry per socket.
+fn listeners(port: u16) -> Vec<u32> {
+    ["/proc/net/tcp", "/proc/net/tcp6"]
+        .into_iter()
+        .filter_map(|table| std::fs::read_to_string(table).ok())
+        .flat_map(|table| listener_uids(&table, port))
+        .collect()
+}
+
+/// The owners of the `LISTEN` rows on `port` in one `/proc/net/tcp` table: the local address and
+/// port are field 1, the state field 3 (`0A`) and the owner's uid field 7.
+fn listener_uids(table: &str, port: u16) -> Vec<u32> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|row| {
+            let fields: Vec<&str> = row.split_whitespace().collect();
+            let (_, local_port) = fields.get(1)?.rsplit_once(':')?;
+            let listening = fields.get(3) == Some(&"0A");
+            if !listening || u16::from_str_radix(local_port, 16).ok()? != port {
+                return None;
+            }
+            fields.get(7)?.parse().ok()
+        })
+        .collect()
+}
+
+/// Whether anything listens on `port`, whoever it is: the seat's host could not bind it.
+pub(super) fn port_taken(port: u16) -> bool {
+    !listeners(port).is_empty()
+}
+
+/// Whether `uid` listens on `port` and nobody else does: the seat's host, not a squatter's.
+pub(super) fn port_held_by(port: u16, uid: u32) -> bool {
+    let owners = listeners(port);
+    !owners.is_empty() && owners.iter().all(|&owner| owner == uid)
 }
 
 #[cfg(test)]
@@ -534,6 +565,35 @@ mod tests {
         assert_eq!(status("").state, RuntimeState::Unknown);
         assert!(parse_show("ActiveState=activating\n").live());
         assert!(!parse_show("ActiveState=failed\n").live());
+    }
+
+    /// Only a socket in `LISTEN` on the port counts, whatever its address family or owner.
+    #[test]
+    fn the_listeners_on_a_port_are_the_listen_rows_with_that_port() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+            0: 0100007F:B8B3 00000000:0000 0A 00000000:00000000 00:00000000 00000000   975        0 111 1 0 100 0 0 10 0\n\
+            1: 0100007F:B8B4 00000000:0000 0A 00000000:00000000 00:00000000 00000000   976        0 112 1 0 100 0 0 10 0\n\
+            2: 0100007F:B8B3 0100007F:9C40 01 00000000:00000000 00:00000000 00000000   975        0 113 1 0 100 0 0 10 0\n\
+            3: 00000000:B8B3 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 114 1 0 100 0 0 10 0\n\
+            4: 00000000000000000000000001000000:B8B3 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  0 0 115 1 0 100 0 0 10 0\n";
+        assert_eq!(listener_uids(table, 0xB8B3), [975, 1000, 0]);
+        assert_eq!(listener_uids(table, 0xB8B4), [976]);
+        assert!(listener_uids(table, 0xB8B5).is_empty());
+        assert!(listener_uids("", 1).is_empty());
+        assert!(listener_uids("header\nshort row\n", 1).is_empty());
+    }
+
+    /// A listener this process owns is found by its port and held by its user, not by another.
+    /// The table is the kernel's, so this runs on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_listener_is_held_by_its_owner_alone() {
+        let socket = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let me = rustix::process::getuid().as_raw();
+        assert!(port_taken(port));
+        assert!(port_held_by(port, me));
+        assert!(!port_held_by(port, me + 1));
     }
 
     #[test]

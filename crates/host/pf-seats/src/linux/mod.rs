@@ -429,11 +429,17 @@ impl LinuxBackend {
         }
     }
 
+    /// Whether the seat's user, and nobody else, listens on the row's management port: its host,
+    /// not a squatter on the loopback.
+    fn serving(&self, seat: &Seat) -> bool {
+        let user = accounts::lookup(&seat.account).ok().flatten();
+        user.is_some_and(|user| session::port_held_by(seat.mgmt_port, user.uid))
+    }
+
     /// Whether the seat's host answers: the unit is active and the host's management port is up,
     /// and for the owner's row the runner has marked the headless host as its own.
     fn is_ready(&self, seat: &Seat) -> bool {
-        session::port_open(seat.mgmt_port)
-            && (!seat.owner || session::ready_path(&seat.account).exists())
+        self.serving(seat) && (!seat.owner || session::ready_path(&seat.account).exists())
     }
 
     /// Waits for the unit to be active and the host's management port to answer. A unit that
@@ -632,10 +638,10 @@ impl PlatformBackend for LinuxBackend {
         unit_hook(&self.inner, &seat.account, Some(passwd.uid));
         // A unit already up keeps its token: the host read it when it started.
         if !session::state(&seat.account)?.live() {
-            if session::port_open(seat.mgmt_port) {
+            if session::port_taken(seat.mgmt_port) {
                 return Err(err(
                     "port_in_use",
-                    format!("management port {} already answers", seat.mgmt_port),
+                    format!("management port {} is already in use", seat.mgmt_port),
                 ));
             }
             let token = session::mint_token();
@@ -845,7 +851,7 @@ impl LinuxBackend {
 
     fn wait_port(&self, seat: &Seat) -> Result<(), BackendError> {
         let deadline = Instant::now() + START_TIMEOUT;
-        while !session::port_open(seat.mgmt_port) {
+        while !self.serving(seat) {
             if Instant::now() >= deadline {
                 return Err(err(
                     "start_timeout",
@@ -870,7 +876,7 @@ impl LinuxBackend {
             }
             return state.runtime();
         }
-        if session::port_open(seat.mgmt_port) && owner_at_desk(&seat.account) {
+        if self.serving(seat) && owner_at_desk(&seat.account) {
             return RuntimeStatus::running();
         }
         state.runtime()
