@@ -104,6 +104,12 @@ impl PlatformBackend for FakeBackend {
         if seat.account == "ghost" {
             return Err(BackendError::new("account_missing", "no such account"));
         }
+        if seat.account == "ben" {
+            return Err(BackendError::new(
+                "owner_not_recorded",
+                "not the recorded owner",
+            ));
+        }
         Ok(())
     }
 }
@@ -352,6 +358,47 @@ fn a_failed_provision_removes_what_it_made_unless_the_account_was_not_ours() {
             "{code}"
         );
     }
+}
+
+/// A row left for an owner since changed is replaced when the backend accepts the new account,
+/// and stays, as a Conflict, when it doesn't.
+#[test]
+fn a_stale_owner_row_is_replaced_by_the_account_the_backend_accepts() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = FakeBackend::default();
+    let service = SeatService::open(temp.path(), backend.clone()).unwrap();
+    let CommandResult::Created { seat: stale } = service.dispatch(adopt("enrico")).unwrap() else {
+        panic!("adopt");
+    };
+    service.dispatch(create("Kid", "pf-kid", false)).unwrap();
+
+    let refused = service.dispatch(adopt("ben")).unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict);
+    assert_eq!(
+        service.ledger().owner().map(|s| s.id.clone()),
+        Some(stale.id.clone())
+    );
+
+    backend.clear_calls();
+    let CommandResult::Created { seat: fresh } = service.dispatch(adopt("carol")).unwrap() else {
+        panic!("adopt");
+    };
+    assert_ne!(fresh.id, stale.id);
+    let ledger = service.ledger();
+    assert_eq!(ledger.owner().map(|s| s.account.as_str()), Some("carol"));
+    assert_eq!(
+        ledger.seats.len(),
+        2,
+        "the profile stays, the stale row is gone"
+    );
+    assert_eq!(
+        backend.calls(),
+        [
+            format!("adopt:{}", fresh.id),
+            format!("remove:{}", stale.id)
+        ],
+        "the new row is adopted before the old one is released"
+    );
 }
 
 #[test]

@@ -200,30 +200,49 @@ impl<B: PlatformBackend> SeatService<B> {
     }
 
     /// The owner's row: the one that exists when it names `account`, else a new one the backend
-    /// has checked. A second account is refused, since the box has one owner.
+    /// has checked. The box has one owner, whom the backend names: a row for another account is
+    /// stale, from an owner since changed, and the new one replaces it. An account the backend
+    /// doesn't accept leaves that row and answers Conflict.
     fn adopt_owner(&self, account: &str) -> Result<CommandResult, ApiError> {
         let _op = self.op();
-        let seat = {
+        let (stale, seat) = {
             let current = self.lock();
-            if let Some(owner) = current.owner() {
-                return if owner.account == account {
-                    Ok(CommandResult::Created {
-                        seat: owner.clone(),
-                    })
-                } else {
-                    Err(ApiError::new(
-                        ErrorCode::Conflict,
-                        format!("the box owner is already {}", owner.account),
-                    ))
-                };
+            let stale = current.owner().cloned();
+            if let Some(owner) = stale.as_ref().filter(|owner| owner.account == account) {
+                return Ok(CommandResult::Created {
+                    seat: owner.clone(),
+                });
             }
-            current
-                .clone()
-                .allocate_owner(account)
-                .map_err(ApiError::from)?
+            let mut next = current.clone();
+            if let Some(owner) = &stale {
+                next.remove(&owner.id);
+            }
+            let seat = next.allocate_owner(account).map_err(ApiError::from)?;
+            (stale, seat)
         };
-        self.backend.adopt(&seat).map_err(ApiError::from)?;
-        if let Err(error) = self.amend(|next| next.insert(seat.clone()).map_err(ApiError::from)) {
+        if let Err(error) = self.backend.adopt(&seat) {
+            return Err(match &stale {
+                Some(owner) => ApiError::new(
+                    ErrorCode::Conflict,
+                    format!("the box owner is already {}: {error}", owner.account),
+                ),
+                None => ApiError::from(error),
+            });
+        }
+        // Released after the new row is adopted, so what they share stays with the new owner.
+        if let Some(owner) = &stale
+            && let Err(error) = self.backend.remove(owner)
+        {
+            let _ = self.backend.remove(&seat);
+            return Err(ApiError::from(error));
+        }
+        let replaced = self.amend(|next| {
+            if let Some(owner) = &stale {
+                next.remove(&owner.id);
+            }
+            next.insert(seat.clone()).map_err(ApiError::from)
+        });
+        if let Err(error) = replaced {
             // Releasing the row removes what adopting prepared and never the account.
             let _ = self.backend.remove(&seat);
             return Err(error);

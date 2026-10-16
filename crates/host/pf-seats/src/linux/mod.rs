@@ -667,6 +667,7 @@ impl PlatformBackend for LinuxBackend {
     }
 
     /// The owner's row takes the box's library with it: it was the door's, and the door goes too.
+    /// A row the owner's new row has replaced leaves the library, which is the new one's.
     fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
         // Before the unit is stopped: ending a stranger's sessions is not removing a seat.
         if !seat.owner {
@@ -675,9 +676,16 @@ impl PlatformBackend for LinuxBackend {
         self.stop_unit(seat)?;
         self.untrack(&seat.id);
         if seat.owner {
-            *self.inner.owner.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            shared::remove_box_library(&self.inner.state)
-                .map_err(|e| err("box_library", format!("remove the box library: {e}")))?;
+            let mut owner = self.inner.owner.lock().unwrap_or_else(|e| e.into_inner());
+            if owner
+                .as_ref()
+                .is_none_or(|owner| owner.name == seat.account)
+            {
+                *owner = None;
+                drop(owner);
+                shared::remove_box_library(&self.inner.state)
+                    .map_err(|e| err("box_library", format!("remove the box library: {e}")))?;
+            }
         }
         self.remove_files(&seat.account, &seat.id, seat.owner)
     }
