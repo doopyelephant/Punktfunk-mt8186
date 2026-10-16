@@ -1993,6 +1993,25 @@ typedef struct {
     PunktfunkHealthFinding findings[PUNKTFUNK_HEALTH_FINDINGS_MAX];
 } PunktfunkHealthReport;
 
+// One buffer the embedder lent for an AU, filled in by [`PunktfunkAuMemory::take`].
+typedef struct {
+    // Writable for `len` bytes until `release`; 4-byte aligned.
+    uint8_t *data;
+    uintptr_t len;
+    // Handed back to `release`.
+    uint64_t token;
+} PunktfunkAuStore;
+
+// How the embedder lends AU memory. `take` fills `out` with a buffer of at least `len`
+// bytes and returns true, or returns false for the heap. `release` gives a buffer back:
+// after the last [`punktfunk_connection_next_au`] pointer into it is dead, on any thread.
+// Both run on core threads and must return at once.
+typedef struct {
+    bool (*take)(void *userdata, uintptr_t len, PunktfunkAuStore *out);
+    void (*release)(void *userdata, uint64_t token);
+    void *userdata;
+} PunktfunkAuMemory;
+
 // [`punktfunk_av1_sequence_info`]'s answer: what an `av1C` record and a colour description
 // take from an AV1 sequence header. Colour codes are ITU-T H.273, 2 when none is coded.
 typedef struct {
@@ -3687,6 +3706,18 @@ void punktfunk_connection_disconnect_quit(PunktfunkConnection *c);
 // # Safety
 // `c` was returned by [`punktfunk_connect`] and is not used after this call.
 void punktfunk_connection_close(PunktfunkConnection *c);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Assemble video AUs in memory the embedder lends, from the next frame on; a null
+// `memory`, or one without `take`, goes back to the heap. The lender outlives every buffer
+// it lent: install the heap, then close the connection, before freeing it.
+//
+// # Safety
+// `c` is a valid connection handle; `memory` is null or readable for one
+// `PunktfunkAuMemory` whose callbacks keep its contract.
+PunktfunkStatus punktfunk_connection_set_au_memory(PunktfunkConnection *c,
+                                                   const PunktfunkAuMemory *memory);
 #endif
 
 // Create an HEVC reference concealer for one elementary stream (IDR first). Free with
