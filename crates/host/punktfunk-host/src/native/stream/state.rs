@@ -200,8 +200,9 @@ pub(super) struct StreamState {
     pub(super) bit_depth: u8,
     pub(super) audio_reserved_kbps: u32,
     pub(super) shard_payload: u16,
-    /// PyroWave: the wire budget is the encoder rate.
-    pub(super) budget_identity: bool,
+    /// PyroWave: parity rides each frame's head ([`EncDerive::head_only_hz`]), and an
+    /// explicit-rate stream paces at the link.
+    pub(super) pyrowave: bool,
     pub(super) streamed_wire: bool,
     pub(super) perf: bool,
     /// The display request bring-up opened with, launch included.
@@ -256,7 +257,7 @@ impl StreamState {
             audio_kbps: self.audio_reserved_kbps,
             shard_payload: self.shard_payload,
             fec_percent: fec,
-            identity: self.budget_identity,
+            head_only_hz: self.pyrowave.then_some(self.cur_mode.refresh_hz),
         }
     }
 
@@ -467,12 +468,13 @@ impl StreamState {
         );
         // `PUNKTFUNK_STREAMED_AU=0` reverts to whole-AU sends. Encoder chunking is per-AU.
         // `bitrate_kbps` is the total wire budget; only encoder opens convert via EncDerive.
-        let budget_identity = plan.codec == crate::encode::Codec::PyroWave;
+        let pyrowave = plan.codec == crate::encode::Codec::PyroWave;
+        let head_only_hz = pyrowave.then_some(mode.refresh_hz);
         let enc_derive = move |fec: u8| EncDerive {
             audio_kbps: audio_reserved_kbps,
             shard_payload,
             fec_percent: fec,
-            identity: budget_identity,
+            head_only_hz,
         };
         let streamed_wire =
             streamed_au && pf_host_config::env_on("PUNKTFUNK_STREAMED_AU").unwrap_or(true);
@@ -671,7 +673,7 @@ impl StreamState {
             bitrate_kbps: live_bitrate.clone(),
             link_kbps,
             ports,
-            link_paced: budget_identity && !bitrate_auto,
+            link_paced: pyrowave && !bitrate_auto,
             shape,
             bringup: bringup.clone(),
             wire_sock,
@@ -733,7 +735,7 @@ impl StreamState {
             bit_depth,
             audio_reserved_kbps,
             shard_payload,
-            budget_identity,
+            pyrowave,
             streamed_wire,
             perf,
             vd_params,

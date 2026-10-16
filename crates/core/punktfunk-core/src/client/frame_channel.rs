@@ -476,9 +476,9 @@ impl FrameChannel {
         self.inner.lock().unwrap().skipped_ever
     }
 
-    /// Hold every frame after `frame` until it completes or `until` passes: a NACK is out
-    /// for its missing shards, and the decoder must see it before them. An all-intra stream
-    /// holds too, or a resend landing after a newer frame would show the past. One at a time.
+    /// Hold every frame after `frame` until it arrives, whole or partial, or `until` passes: a
+    /// NACK is out for its missing shards, and the decoder must see it before them. An all-intra
+    /// stream holds too, or a resend landing after a newer frame would show the past. One at a time.
     pub(crate) fn hold(&self, frame: u32, until: Instant) -> bool {
         let mut st = self.inner.lock().unwrap();
         if st.hold.is_some() {
@@ -490,6 +490,18 @@ impl FrameChannel {
             after: Vec::new(),
         });
         true
+    }
+
+    /// The frame a NACK is out for.
+    pub(crate) fn held(&self) -> Option<u32> {
+        self.inner.lock().unwrap().hold.as_ref().map(|h| h.frame)
+    }
+
+    /// The held frame once its hold expired, still holding: an all-intra stream hands that
+    /// frame up partial, and the partial releases the frames after it in order.
+    pub(crate) fn overdue_hold(&self, now: Instant) -> Option<u32> {
+        let st = self.inner.lock().unwrap();
+        st.hold.as_ref().filter(|h| now >= h.until).map(|h| h.frame)
     }
 
     /// Let the held frames go once their hold expired: the decoder then sees the gap, and
@@ -514,9 +526,11 @@ impl FrameChannel {
     pub(crate) fn push(&self, frame: Frame) {
         let mut st = self.inner.lock().unwrap();
         if let Some(h) = st.hold.as_mut() {
-            if frame.frame_index == h.frame && frame.complete {
+            // A partial of the held frame ends the hold too: what the resend did not bring,
+            // it shows as blur.
+            if frame.frame_index == h.frame && (frame.complete || frame.part.is_none()) {
                 let h = st.hold.take().expect("checked");
-                st.filled += 1;
+                st.filled += u32::from(frame.complete);
                 st.q.push_back(frame);
                 st.q.extend(h.after);
                 drop(st);
@@ -1065,5 +1079,22 @@ mod hold_tests {
         assert!(c.expire_hold(t0 + Duration::from_millis(10)));
         assert_eq!(drain(&c), [6]);
         assert_eq!(c.take_filled(), 0);
+    }
+
+    /// An overdue hold stays until its frame arrives partial, which goes ahead of the frames
+    /// after it and counts as no fill.
+    #[test]
+    fn a_partial_of_the_held_frame_ends_the_hold_in_order() {
+        let c = FrameChannel::new();
+        let t0 = Instant::now();
+        assert!(c.hold(5, t0 + Duration::from_millis(10)));
+        assert_eq!(c.held(), Some(5));
+        c.push(frame(6, true));
+        assert_eq!(c.overdue_hold(t0), None);
+        assert_eq!(c.overdue_hold(t0 + Duration::from_millis(10)), Some(5));
+        assert_eq!(drain(&c), Vec::<u32>::new(), "overdue is not expired");
+        c.push(frame(5, false));
+        assert_eq!(drain(&c), [5, 6]);
+        assert_eq!((c.take_filled(), c.held()), (0, None));
     }
 }

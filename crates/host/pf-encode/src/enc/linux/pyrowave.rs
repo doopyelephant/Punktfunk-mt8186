@@ -575,15 +575,18 @@ impl AuArena {
         packets: &[(usize, usize)],
         bitstream: &[u8],
         wire_chunk: Option<usize>,
+        head: usize,
     ) -> Result<usize> {
-        let bound = crate::pyrowave_wire::au_bound(packets, wire_chunk);
-        self.ensure(bound).context("grow the AU return buffer")?;
-        // SAFETY: `ptr` maps `len ≥ bound` writable bytes that only this thread touches until
-        // the host is told the length, and the host reads the memfd with `pread`, not a
+        let layout = crate::pyrowave_wire::AuLayout::new(packets, wire_chunk, head);
+        self.ensure(layout.len())
+            .context("grow the AU return buffer")?;
+        // SAFETY: `ptr` maps `len ≥ layout.len()` writable bytes that only this thread touches
+        // until the host is told the length, and the host reads the memfd with `pread`, not a
         // mapping of ours.
         let out = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) };
-        crate::pyrowave_wire::build_au_into(packets, bitstream, wire_chunk, out)
-            .ok_or_else(|| anyhow::anyhow!("AU larger than its bound {bound}"))
+        layout
+            .write(packets, bitstream, out)
+            .ok_or_else(|| anyhow::anyhow!("AU larger than its mapping"))
     }
 }
 
@@ -1801,10 +1804,10 @@ impl PyroWaveEncoder {
         // One-time submit: command buffer is INVALID; next `begin` may implicitly reset.
         self.inflight.pop_front();
 
-        // Dense: boundary = whole buffer → one packet. Datagram-aligned: boundary = shard
-        // payload; packets pad so a lost shard costs only those blocks. Use `fr.cap` /
-        // `fr.wire_chunk`, not the live fields: bitrate/chunking can land mid-flight.
-        let pkts = packetize(
+        // Dense: one packet. Datagram-aligned: one packet per block, packed into shard-sized
+        // windows so a lost shard costs only its blocks. Use `fr.cap` / `fr.wire_chunk`,
+        // not the live fields: bitrate/chunking can land mid-flight.
+        let (pkts, head) = packetize(
             self.pw_encs[fr.slot],
             &mut self.bitstream,
             fr.cap,
@@ -1833,12 +1836,13 @@ impl PyroWaveEncoder {
             // The worker's return buffer: the AU is laid out in place, the frame carries
             // its length and no bytes.
             Some(arena) => {
-                let n = arena.build(&pkts, &self.bitstream, fr.wire_chunk)?;
+                let n = arena.build(&pkts, &self.bitstream, fr.wire_chunk, head)?;
                 self.arena_len = Some(n);
                 (Vec::new(), n)
             }
             None => {
-                let au = crate::pyrowave_wire::build_au(&pkts, &self.bitstream, fr.wire_chunk);
+                let au =
+                    crate::pyrowave_wire::build_au(&pkts, &self.bitstream, fr.wire_chunk, head);
                 let n = au.len();
                 (au, n)
             }

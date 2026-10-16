@@ -58,6 +58,9 @@ pub(super) struct DataPump {
     /// The newest whole frame was an anchor: the host references only frames this client
     /// confirmed, so the next frame skips a lost one and its tail asks nothing.
     pub(super) on_anchors: bool,
+    /// All-intra frames short past their parity and asking nothing: each goes up partial
+    /// once its head block is whole.
+    pub(super) partial_wait: Vec<u32>,
 }
 
 /// What one pump run carries from iteration to iteration.
@@ -204,6 +207,7 @@ impl DataPump {
             if let Some(memory) = self.shared.au_memory.lock().unwrap().take() {
                 self.session.set_au_memory(memory);
             }
+            self.session.set_partial_hold(self.shared.frames.held());
             let polled = self.session.poll_frame();
             self.ask_for_short_tails();
             let now = Instant::now();
@@ -214,8 +218,20 @@ impl DataPump {
             // The driver's clock: the drop climb, the overdue freeze and a deferred RFI.
             let frames_dropped = self.shared.frames_dropped.load(Ordering::Relaxed);
             self.recovery(super::super::RecoveryEvent::Tick { frames_dropped }, now);
-            if self.shared.frames.expire_hold(now) {
-                tracing::debug!("nack expired: the frames after it go, and their gap asks");
+            self.release_waiting_partials();
+            match self.shared.frames.overdue_hold(now) {
+                Some(frame)
+                    if self.negotiated_codec == crate::quic::CODEC_PYROWAVE
+                        && self.session.release_partial(frame, false) =>
+                {
+                    tracing::debug!(
+                        "nack expired: the frame goes up partial, then the ones after it"
+                    );
+                }
+                Some(_) if self.shared.frames.expire_hold(now) => {
+                    tracing::debug!("nack expired: the frames after it go, and their gap asks");
+                }
+                _ => {}
             }
             for _ in 0..self.shared.frames.take_filled() {
                 tracing::debug!("nack filled: the held frames go in order");
@@ -473,6 +489,7 @@ mod tests {
             refresh_hz: 60,
             nack: false,
             on_anchors: false,
+            partial_wait: Vec::new(),
         };
         (pump, ctrl_rx, fb_rx)
     }
@@ -607,6 +624,67 @@ mod tests {
 
         shared.shutdown.store(true, Ordering::SeqCst);
         pump_thread.join().unwrap();
+    }
+
+    /// A PyroWave frame short past its parity, with no NACK in reach, goes up partial ahead of
+    /// the next frame and is not a dropped one: every tenth frame loses a tail shard on a round
+    /// trip past the frame interval, and every frame reaches the decoder, in order.
+    #[test]
+    fn a_pyrowave_frame_without_its_tail_goes_up_partial() {
+        use crate::packet::USER_FLAG_CHUNK_ALIGNED;
+        use crate::transport::Transport;
+        let mode = crate::config::Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        };
+        let origin = crate::quic::wall_clock_ns();
+        let (host_tp, mut session) = idle_client_session(origin);
+        session.set_deliver_partial_frames(true);
+        let shared = Arc::new(ClientShared::new(mode));
+        let _ = shared.frames.pop(Duration::ZERO); // a decoder is attached
+        shared.rtt_us.store(40_000, Ordering::Relaxed);
+        let (mut pump, _ctrl_rx, _fb_rx) =
+            test_pump(session, shared.clone(), crate::quic::CODEC_PYROWAVE);
+        pump.nack = true;
+        let pump_thread = std::thread::spawn(move || pump.run());
+
+        let (spare, _) = crate::transport::loopback_pair(0, 0);
+        let mut host = Session::new(
+            loopback_config(crate::config::Role::Host),
+            loopback_media(origin),
+            Box::new(spare),
+        )
+        .unwrap();
+        // An 11-shard head with four parity, then 40 tail shards in blocks of 32 and 8.
+        let au = crate::pyrowave::windowed_au(1024, 11, 40);
+        let mut got = Vec::new();
+        for i in 0..40u32 {
+            let wires = host
+                .seal_frame(&au, crate::quic::wall_clock_ns(), USER_FLAG_CHUNK_ALIGNED)
+                .unwrap();
+            for (k, w) in wires.iter().enumerate() {
+                if !(i % 10 == 9 && k == 20) {
+                    host_tp.send(w).unwrap();
+                }
+            }
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while got.last().map(|&(i, _)| i) != Some(i) && Instant::now() < deadline {
+                if let FramePop::Frame(f) = shared.frames.pop(Duration::from_millis(1)) {
+                    got.push((f.frame_index, f.complete));
+                }
+            }
+            assert_eq!(
+                got.last().map(|&(i, _)| i),
+                Some(i),
+                "frame {i} before the next"
+            );
+        }
+        shared.shutdown.store(true, Ordering::SeqCst);
+        pump_thread.join().unwrap();
+        let want: Vec<(u32, bool)> = (0..40).map(|i| (i, i % 10 != 9)).collect();
+        assert_eq!(got, want, "every frame, the short ones partial, in order");
+        assert_eq!(shared.frames_dropped.load(Ordering::Relaxed), 0);
     }
 
     /// Frames short of their parity on a round trip inside a frame interval ask for their

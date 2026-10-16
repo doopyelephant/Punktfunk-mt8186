@@ -832,12 +832,15 @@ mod tests {
         let mut arena = super::super::pyrowave::AuArena::new(f.try_clone().unwrap());
         let bs: Vec<u8> = (0..3000u32).map(|i| (i * 13) as u8).collect();
         let pkts = [(0usize, 700usize), (700, 900), (1600, 20)];
-        let n = arena.build(&pkts, &bs, Some(1408)).unwrap();
+        let n = arena.build(&pkts, &bs, Some(1408), 1).unwrap();
         let mut back = vec![0u8; n];
         f.read_exact_at(&mut back, 0).unwrap();
-        assert_eq!(back, crate::pyrowave_wire::build_au(&pkts, &bs, Some(1408)));
+        assert_eq!(
+            back,
+            crate::pyrowave_wire::build_au(&pkts, &bs, Some(1408), 1)
+        );
         let big = vec![7u8; 3 << 20];
-        let n2 = arena.build(&[(0, big.len())], &big, Some(1408)).unwrap();
+        let n2 = arena.build(&[(0, big.len())], &big, Some(1408), 1).unwrap();
         assert!(n2 > big.len());
         assert!(f.metadata().unwrap().len() >= n2 as u64);
     }

@@ -60,7 +60,7 @@ const LOSS_PCT_MAX: u8 = 25;
 /// ```
 ///
 /// More parity means a lower encoder rate, never a fatter wire. Floored at
-/// [`MIN_BITRATE_KBPS`]. PyroWave bypasses this (bpp pin, Automatic off).
+/// [`MIN_BITRATE_KBPS`]. PyroWave passes the share its head-only parity takes as `fec_percent`.
 pub fn encoder_kbps_for_budget(
     budget_kbps: u32,
     audio_kbps: u32,

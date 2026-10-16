@@ -767,7 +767,7 @@ mod tests {
     }
 
     fn loss_ppm(c: &Client) -> u32 {
-        crate::quic::window_loss_ppm(c.stats.fec_recovered_shards, 0, c.stats.packets_received)
+        crate::quic::window_loss_ppm(c.stats.fec_recovered_shards, 0, 0, c.stats.packets_received)
     }
 
     /// Parity covers its block's losses or the frame dies; either way

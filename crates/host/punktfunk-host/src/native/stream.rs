@@ -466,7 +466,7 @@ fn paced_submit(
     pacer: &mut crate::send_pacing::Pacer,
     ring: &mut recovery::ResendRing,
 ) -> Result<PaceStat> {
-    pacer.begin(session.frame_wire_len(data.len()));
+    pacer.begin(session.frame_wire_len(data, flags));
     session.drain_plaintext(|_| {});
     ring.begin(frame_index);
     let sealed =
@@ -512,7 +512,7 @@ pub(crate) struct StreamCommon {
     pub(crate) counters: Arc<crate::session_status::SessionCounters>,
     pub(crate) ends: super::wiring::StreamEnds,
     pub(crate) shared: super::wiring::SessionShared,
-    /// Total wire budget (kbps): video + FEC + framing + audio reservation. PyroWave is identity.
+    /// Total wire budget (kbps): video + FEC + framing + audio reservation, PyroWave's pin too.
     pub(crate) bitrate_kbps: u32,
     pub(crate) audio_reserved_kbps: u32,
     pub(crate) shard_payload: u16,

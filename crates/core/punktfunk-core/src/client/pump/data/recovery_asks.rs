@@ -11,8 +11,9 @@ impl DataPump {
     /// round trip inside a frame interval, asks for its missing shards instead, and the
     /// frames after it wait for them. One that completed meanwhile asks nothing. The decode
     /// side's gap still arms the freeze. An all-intra frame references nothing, so it asks
-    /// only for its shards: the next frame is its recovery. A stream nobody decodes yet
-    /// starts on an IDR and asks nothing.
+    /// only for its shards, and without them goes up partial once its head is whole
+    /// ([`Self::release_waiting_partials`]). A stream nobody decodes yet starts on an IDR
+    /// and asks nothing.
     pub(super) fn ask_for_short_tails(&mut self) {
         let tails: Vec<u32> = self.session.take_short_tails().collect();
         if tails.is_empty() || !self.shared.frames.consumer_seen() {
@@ -34,11 +35,26 @@ impl DataPump {
                     continue;
                 }
             }
-            if self.on_anchors || all_intra {
+            if all_intra {
+                if self.partial_wait.len() < 8 {
+                    self.partial_wait.push(idx);
+                }
+                continue;
+            }
+            if self.on_anchors {
                 continue;
             }
             self.recovery(crate::client::RecoveryEvent::TailShort { index: idx }, now);
         }
+        self.release_waiting_partials();
+    }
+
+    /// Hand each waiting all-intra frame up partial once its head block is whole; one that
+    /// left the reassembler some other way stops waiting.
+    pub(super) fn release_waiting_partials(&mut self) {
+        let session = &mut self.session;
+        self.partial_wait
+            .retain(|&idx| session.frame_in_flight(idx) && !session.release_partial(idx, true));
     }
 
     /// Fold one of the pump's own events into the recovery driver and send what it asks.

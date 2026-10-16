@@ -138,6 +138,31 @@ fn pyrowave_smoke() {
 
 /// 24-bpp CPU payloads expand 3→4, not refuse. Channel order is load-bearing: a
 /// swapped R/B or misplaced pad moves chroma means by tens of codes.
+/// A real encoder's windowed AU leads with its level-4 head: the sealer finds it short of the
+/// whole AU, and the reordered windows still decode.
+#[test]
+#[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
+fn pyrowave_au_leads_with_its_head() {
+    let (w, h) = (1920u32, 1080u32);
+    let mut enc =
+        PyroWaveEncoder::open(w, h, 60, 200_000_000, crate::ChromaFormat::Yuv420, 8, false)
+            .expect("open");
+    enc.set_wire_chunking(1408);
+    enc.submit(&test_card(w, h, 3)).expect("submit");
+    let au = enc.poll().expect("poll").expect("AU");
+    assert!(au.chunk_aligned);
+    let windows = au.data.len() / 1408;
+    let head = punktfunk_core::pyrowave::head_shards(&au.data, 1408)
+        .expect("window 0 opens with the sequence header");
+    assert!(
+        head > 0 && head < windows / 2,
+        "{head} of {windows} windows"
+    );
+    let stream = unwindow(&au.data, 1408).expect("well-formed windows");
+    // SAFETY: test-only FFI with locally-owned buffers.
+    unsafe { decode_planes(w, h, &stream) };
+}
+
 #[test]
 #[ignore = "needs a real Vulkan 1.3 compute device (run on a GPU host, not the build box)"]
 fn pyrowave_smoke_cpu_rgb24() {

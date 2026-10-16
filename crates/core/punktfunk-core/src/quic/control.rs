@@ -244,16 +244,16 @@ pub struct ClockEcho {
 }
 
 /// A window's `loss_ppm` ([`v2::dgram::Feedback`](super::v2::dgram::Feedback)) from its
-/// session-stat deltas: the
-/// shard loss parity repaired, and nothing else.
+/// session-stat deltas: the shard loss parity repaired, and the `holes` partial frames went
+/// to the decoder with (a PyroWave tail carries no parity).
 ///
-/// Loss ≈ (recovered − late) / (received + recovered − late): late shards
+/// Loss ≈ (recovered − late + holes) / (received + recovered − late + holes): late shards
 /// reconstructed early then arrived, so they are reorder not loss (netted
 /// from both ends; saturating so a straddling window cannot go negative).
 /// Frames parity could not repair are not in here — the host reads those
 /// off the RFI asks they raise. Capped at 1e6.
-pub fn window_loss_ppm(recovered: u64, late: u64, received: u64) -> u32 {
-    let lost = recovered.saturating_sub(late);
+pub fn window_loss_ppm(recovered: u64, late: u64, holes: u64, received: u64) -> u32 {
+    let lost = recovered.saturating_sub(late).saturating_add(holes);
     let denom = received.saturating_add(lost);
     let ppm = lost
         .saturating_mul(1_000_000)
@@ -600,16 +600,18 @@ mod tests {
 
     #[test]
     fn window_loss_ppm_estimates_and_caps() {
-        assert_eq!(window_loss_ppm(0, 0, 0), 0);
-        assert_eq!(window_loss_ppm(0, 0, 1000), 0);
+        assert_eq!(window_loss_ppm(0, 0, 0, 0), 0);
+        assert_eq!(window_loss_ppm(0, 0, 0, 1000), 0);
         // 50 of 1000 = 5%.
-        assert_eq!(window_loss_ppm(50, 0, 950), 50_000);
-        assert!(window_loss_ppm(u64::MAX, 0, 1) <= 1_000_000);
+        assert_eq!(window_loss_ppm(50, 0, 0, 950), 50_000);
+        assert!(window_loss_ppm(u64::MAX, 0, 0, 1) <= 1_000_000);
         // Late shards are reorder, not loss. 20 of 1000 = 2%.
-        assert_eq!(window_loss_ppm(50, 50, 1000), 0);
-        assert_eq!(window_loss_ppm(50, 30, 980), 20_000);
+        assert_eq!(window_loss_ppm(50, 50, 0, 1000), 0);
+        assert_eq!(window_loss_ppm(50, 30, 0, 980), 20_000);
         // `late` can outrun `recovered` across a window boundary — saturate, never underflow.
-        assert_eq!(window_loss_ppm(10, 25, 1000), 0);
+        assert_eq!(window_loss_ppm(10, 25, 0, 1000), 0);
+        // A partial's holes are loss beside what parity repaired: 30 + 20 of 1000 = 5%.
+        assert_eq!(window_loss_ppm(30, 0, 20, 950), 50_000);
     }
 
     /// The message is capped and stripped where it is built, not where it is shown:

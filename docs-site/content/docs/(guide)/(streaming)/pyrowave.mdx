@@ -15,8 +15,9 @@ it; otherwise the session uses the normal codecs.
 
 - **Codec latency almost disappears.** Encode takes ~0.15 ms and decode ~0.07 ms at 1080p on an
   RTX 5070 Ti. Hardware HEVC takes one to several milliseconds on each side.
-- **Packet loss costs one frame.** No frame depends on another, so there is no keyframe request
-  and no stutter while the stream recovers.
+- **A lost packet blurs a small patch of one frame.** No frame depends on another, so there is no
+  keyframe request and no stutter while the stream recovers. Only each frame's coarsest layer,
+  whose loss would show, carries recovery data.
 - **Every frame is the same size.** The network sees a steady load instead of keyframe bursts.
 
 ## Setting it up
@@ -73,6 +74,8 @@ without comparing side by side and zooming in.
 | 2560×1440 @ 120 | ≈ 710 Mbps |
 | 3840×2160 @ 60 | ≈ 800 Mbps |
 | 3840×2160 @ 120 | ≈ 1.6 Gbps |
+
+These are what the link carries, recovery data and packet headers included.
 
 Lower values work and look softer: fewer bits never break the stream. PyroWave sends every frame
 whole and keeps its coding simple for speed, which

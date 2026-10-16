@@ -127,8 +127,8 @@ impl Packetizer {
         self.fec.fec_percent
     }
 
-    /// One AU's shard geometry: what the data pass, the parity pass and a parity thread
-    /// agree on before any of them runs.
+    /// One AU's shard geometry in uniform blocks: what the data pass, the parity pass and a
+    /// parity thread agree on before any of them runs.
     pub fn geometry(&self, frame_len: usize) -> Geometry {
         let payload = self.shard_payload;
         let total_data = frame_len.div_ceil(payload).max(1);
@@ -139,9 +139,27 @@ impl Packetizer {
             max_block,
             block_count: total_data.div_ceil(max_block).max(1),
             frame_bytes: frame_len as u32,
+            head: 0,
             fec: self.fec,
             max_total_shards: self.max_total_shards,
         }
+    }
+
+    /// [`geometry`](Self::geometry) for this AU. A windowed PyroWave AU
+    /// ([`USER_FLAG_CHUNK_ALIGNED`]) puts its head ([`crate::pyrowave::head_shards`]) in a block
+    /// of its own that carries all the frame's parity: a lost tail shard blurs one small patch
+    /// of one frame, a lost head shard up to half of it.
+    pub fn geometry_for(&self, frame: &[u8], user_flags: u32) -> Geometry {
+        let mut geo = self.geometry(frame.len());
+        if user_flags & USER_FLAG_CHUNK_ALIGNED != 0 {
+            if let Some(head) = crate::pyrowave::head_shards(frame, geo.payload) {
+                if head > 0 && head < geo.total_data && head <= geo.max_block {
+                    geo.head = head;
+                    geo.block_count = 1 + (geo.total_data - head).div_ceil(geo.max_block);
+                }
+            }
+        }
+        geo
     }
 
     /// The parity pool, for a caller that fills it off-thread with [`parity`] and hands
@@ -180,7 +198,7 @@ impl Packetizer {
             self.next_frame_index = i.wrapping_add(1);
             i
         });
-        let geo = self.geometry(frame.len());
+        let geo = self.geometry_for(frame, user_flags);
         geo.check()?;
         let mut recovery = std::mem::take(&mut self.recovery);
         let fec = parity(&geo, frame, coder, &mut recovery);
@@ -210,7 +228,7 @@ impl Packetizer {
             self.tail[..rem].copy_from_slice(&frame[full_shards * payload..]);
         }
         for b in 0..geo.block_count {
-            let first = b * geo.max_block;
+            let first = geo.block_start(b);
             for shard_index in 0..geo.data_count(b) {
                 let s = first + shard_index;
                 let body: &[u8] = if s < full_shards {
@@ -239,7 +257,7 @@ impl Packetizer {
     ) -> Result<()> {
         for b in 0..geo.block_count {
             let k = geo.data_count(b);
-            for r in 0..geo.recovery_count(k) {
+            for r in 0..geo.parity_of(b) {
                 let hdr = geo.header(pts_ns, frame_index, user_flags, b, k + r);
                 emit(&hdr, &self.recovery[b][r])?;
             }
@@ -442,6 +460,11 @@ impl Packetizer {
     }
 }
 
+/// Parity floor on a PyroWave head block ([`Packetizer::geometry_for`]): a link's burst after
+/// idle takes the first packets of a frame, and a clean link still drops ~4 in a row.
+/// cbindgen:ignore
+pub const HEAD_MIN_RECOVERY_SHARDS: usize = 4;
+
 /// One AU's shard geometry. One arithmetic for every pass, so the data thread and the
 /// parity thread cannot disagree about a block.
 #[derive(Clone, Copy, Debug)]
@@ -452,25 +475,46 @@ pub struct Geometry {
     pub block_count: usize,
     /// `frame.len()`, as the header carries it.
     pub frame_bytes: u32,
+    /// Data shards of a head block that carries all the frame's parity; the blocks after it
+    /// carry none. `0`: uniform blocks, each with its percent.
+    pub head: usize,
     fec: crate::config::FecConfig,
     max_total_shards: usize,
 }
 
 impl Geometry {
-    pub fn data_count(&self, b: usize) -> usize {
-        ((b + 1) * self.max_block).min(self.total_data) - b * self.max_block
+    /// Block `b`'s first data shard in the AU.
+    pub fn block_start(&self, b: usize) -> usize {
+        match (self.head, b) {
+            (0, b) => b * self.max_block,
+            (_, 0) => 0,
+            (head, b) => head + (b - 1) * self.max_block,
+        }
     }
 
-    pub fn recovery_count(&self, k: usize) -> usize {
-        self.fec
-            .recovery_for(k)
-            .min(self.max_total_shards.saturating_sub(k))
+    pub fn data_count(&self, b: usize) -> usize {
+        if self.head > 0 && b == 0 {
+            return self.head;
+        }
+        let start = self.block_start(b);
+        (start + self.max_block).min(self.total_data) - start
+    }
+
+    /// Parity shards block `b` carries.
+    pub fn parity_of(&self, b: usize) -> usize {
+        let k = self.data_count(b);
+        let m = match (self.head, b) {
+            (0, _) => self.fec.recovery_for(k),
+            (_, 0) if self.fec.fec_percent > 0 => {
+                self.fec.recovery_for(k).max(HEAD_MIN_RECOVERY_SHARDS)
+            }
+            _ => 0,
+        };
+        m.min(self.max_total_shards.saturating_sub(k))
     }
 
     pub fn total_recovery(&self) -> usize {
-        (0..self.block_count)
-            .map(|b| self.recovery_count(self.data_count(b)))
-            .sum()
+        (0..self.block_count).map(|b| self.parity_of(b)).sum()
     }
 
     /// Data shards plus parity.
@@ -490,14 +534,15 @@ impl Geometry {
             ));
         }
         for b in 0..self.block_count {
-            let k = self.data_count(b);
-            if k + self.recovery_count(k) > u16::MAX as usize {
+            if self.data_count(b) + self.parity_of(b) > u16::MAX as usize {
                 return Err(PunktfunkError::Unsupported("block shard count exceeds u16"));
             }
         }
         Ok(())
     }
 
+    /// A split frame's blocks are not `max_block` apart, so each states its base: a sentinel
+    /// ([`PacketHeader`]) before the final block, which carries the totals.
     fn header(
         &self,
         pts_ns: u64,
@@ -506,16 +551,25 @@ impl Geometry {
         b: usize,
         shard_index: usize,
     ) -> PacketHeader {
-        let k = self.data_count(b);
+        let (user_flags, frame_bytes, block_count) = if self.head > 0 {
+            let user_flags = user_flags | USER_FLAG_SLICE_STREAM;
+            if b + 1 < self.block_count {
+                (user_flags, (self.block_start(b) * self.payload) as u32, 0)
+            } else {
+                (user_flags, self.frame_bytes, self.block_count as u16)
+            }
+        } else {
+            (user_flags, self.frame_bytes, self.block_count as u16)
+        };
         PacketHeader {
             pts_ns,
             frame_index,
-            frame_bytes: self.frame_bytes,
+            frame_bytes,
             user_flags,
             block_index: b as u16,
-            block_count: self.block_count as u16,
-            data_shards: k as u16,
-            recovery_shards: self.recovery_count(k) as u16,
+            block_count,
+            data_shards: self.data_count(b) as u16,
+            recovery_shards: self.parity_of(b) as u16,
             shard_index: shard_index as u16,
             shard_bytes: self.payload as u16,
         }
@@ -542,7 +596,12 @@ pub fn parity(
         out.resize_with(geo.block_count, Vec::new);
     }
     for (b, parity) in out.iter_mut().enumerate().take(geo.block_count) {
-        let first = b * geo.max_block;
+        let m = geo.parity_of(b);
+        if m == 0 {
+            parity.clear();
+            continue;
+        }
+        let first = geo.block_start(b);
         let k = geo.data_count(b);
         let shards: Vec<&[u8]> = (first..first + k)
             .map(|s| {
@@ -553,7 +612,7 @@ pub fn parity(
                 }
             })
             .collect();
-        coder.encode_into(&shards, geo.recovery_count(k), parity)?;
+        coder.encode_into(&shards, m, parity)?;
     }
     Ok(())
 }

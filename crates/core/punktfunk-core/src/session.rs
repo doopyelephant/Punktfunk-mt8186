@@ -367,14 +367,17 @@ impl Session {
         })
     }
 
-    /// Bytes one AU of `frame_len` puts on the wire at the current geometry. An unsealed
+    /// Bytes `frame` sent with `user_flags` puts on the wire at the current geometry
+    /// ([`Packetizer::geometry_for`](crate::packet::Packetizer::geometry_for)). An unsealed
     /// session's packets carry the header without the tag.
-    pub fn frame_wire_len(&self, frame_len: usize) -> usize {
+    pub fn frame_wire_len(&self, frame: &[u8], user_flags: u32) -> usize {
         let header = match self.crypto {
             Some(_) => crate::packet::WIRE_OVERHEAD,
             None => crate::packet::V2_HEADER_LEN,
         };
-        self.packetizer.geometry(frame_len).wire_packets()
+        self.packetizer
+            .geometry_for(frame, user_flags)
+            .wire_packets()
             * (self.packetizer.shard_payload() + header)
     }
 
@@ -398,7 +401,7 @@ impl Session {
                 "seal_frame called on a client session",
             ));
         }
-        let geo = self.packetizer.geometry(data.len());
+        let geo = self.packetizer.geometry_for(data, user_flags);
         let pipelined =
             self.seal_two_lane && self.crypto.is_some() && geo.total_data >= 2 * SEAL_CHUNK_SHARDS;
         if pipelined && self.seal_lane.is_none() {
@@ -915,11 +918,24 @@ impl Session {
 
     // -- Client path ------------------------------------------------------
 
-    /// Client opt-in: deliver aged-out incomplete chunk-aligned frames as
-    /// [`Frame`]`{ complete: false }` instead of dropping them. A lost datagram costs a
-    /// few blocks of blur, not the frame. No effect on AUs that do not carry the flag.
+    /// Client opt-in: deliver incomplete chunk-aligned frames as [`Frame`]`{ complete: false }`
+    /// instead of dropping them: one a newer frame overtook at once, any other when its loss
+    /// window ends or [`release_partial`](Self::release_partial) lets it go. A lost datagram
+    /// costs a few blocks of blur, not the frame. No effect on AUs that do not carry the flag.
     pub fn set_deliver_partial_frames(&mut self, on: bool) {
         self.reassembler.set_deliver_partial(on);
+    }
+
+    /// The frame a NACK is out for, which a newer frame does not hand up.
+    pub fn set_partial_hold(&mut self, frame: Option<u32>) {
+        self.reassembler.set_partial_hold(frame);
+    }
+
+    /// Hand chunk-aligned frame `frame_index` up as a partial now; with `need_head`, only once
+    /// its head block is whole. The next [`poll_frame`](Self::poll_frame) returns it.
+    pub fn release_partial(&mut self, frame_index: u32, need_head: bool) -> bool {
+        self.reassembler
+            .release_partial(frame_index, need_head, &self.stats)
     }
 
     /// Client opt-in: deliver each AU's newly-contiguous prefix as [`Frame`]s with
@@ -1002,6 +1018,13 @@ impl Session {
             return Err(PunktfunkError::InvalidArg(
                 "poll_frame called on a host session",
             ));
+        }
+        // A partial released between polls goes up before anything newer is read.
+        if let Some(p) = self.reassembler.take_partial() {
+            if !self.behind_epoch(p.epoch) {
+                return Ok(stamp_received(p));
+            }
+            StatsCounters::add(&self.stats.frames_dropped, 1);
         }
         loop {
             let Some(range) = self.recv_cur.as_ref().and_then(|b| b.at(self.recv_off)) else {
@@ -1275,15 +1298,26 @@ mod wire_equivalence_tests {
                 let cfg = host_cfg(FecScheme::Gf16, fec_percent);
                 let mut piped = host_session(cfg.clone(), encrypt);
                 let mut whole = host_session(cfg, encrypt);
-                // At shard 64: 47, 2, 313 and 1 data shards; 313 is three chunks of 128.
-                let frames = [pattern(3000), pattern(100), pattern(20000), Vec::new()];
+                // At shard 64: 47, 2, 313 and 1 data shards; 313 is three chunks of 128. The
+                // last is a PyroWave AU split into a 6-shard head and 300 tail shards.
+                let frames = [
+                    pattern(3000),
+                    pattern(100),
+                    pattern(20000),
+                    Vec::new(),
+                    crate::pyrowave::windowed_au(64, 6, 300),
+                ];
                 for (i, frame) in frames.iter().enumerate() {
                     let pts = 1000 * i as u64;
-                    let want = whole.seal_frame_at(frame, pts, i as u32, i as u32).unwrap();
+                    let flags = match i {
+                        4 => crate::packet::USER_FLAG_CHUNK_ALIGNED,
+                        i => i as u32,
+                    };
+                    let want = whole.seal_frame_at(frame, pts, flags, i as u32).unwrap();
                     let mut got: Vec<Vec<u8>> = Vec::new();
                     let mut calls = 0usize;
                     piped
-                        .seal_frame_chunks_at(frame, pts, i as u32, i as u32, &mut |chunk, send| {
+                        .seal_frame_chunks_at(frame, pts, flags, i as u32, &mut |chunk, send| {
                             calls += 1;
                             let refs: Vec<&[u8]> = chunk.iter().map(|b| b.as_slice()).collect();
                             send(&refs)?;
@@ -1302,7 +1336,7 @@ mod wire_equivalence_tests {
                         assert_eq!(calls, 1, "a whole frame reaches the sink once");
                     }
                     assert_eq!(
-                        piped.frame_wire_len(frame.len()),
+                        piped.frame_wire_len(frame, flags),
                         want.iter().map(Vec::len).sum::<usize>(),
                         "frame_wire_len frame#{i}"
                     );
@@ -1310,6 +1344,146 @@ mod wire_equivalence_tests {
                 }
             }
         }
+    }
+
+    /// A windowed PyroWave AU seals as a head block with all the parity and tail blocks with
+    /// none: a lost head shard is rebuilt, a lost tail shard leaves only its window empty, and
+    /// the partial carries everything else intact.
+    #[test]
+    fn a_pyrowave_au_protects_its_head_only() {
+        use crate::packet::USER_FLAG_CHUNK_ALIGNED;
+        let mk = |role| Config {
+            role,
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 10,
+                max_data_per_block: 64,
+            },
+            shard_payload: 1024,
+            max_frame_bytes: 8 * 1024 * 1024,
+            loopback_drop_period: 0,
+        };
+        let (wire, c) = loopback_pair(0, 0);
+        let mut client = Session::new(mk(Role::Client), media(false), Box::new(c)).unwrap();
+        client.set_deliver_partial_frames(true);
+        let (spare, _) = loopback_pair(0, 0);
+        let mut host = Session::new(mk(Role::Host), media(false), Box::new(spare)).unwrap();
+
+        let au = crate::pyrowave::windowed_au(1024, 11, 190);
+        let wires = host
+            .seal_frame_at(&au, 1_000, USER_FLAG_CHUNK_ALIGNED, 0)
+            .unwrap();
+        assert_eq!(
+            wires.len(),
+            201 + 4,
+            "four head parity shards, none on the tail"
+        );
+        for (i, w) in wires.iter().enumerate() {
+            if i != 3 && i != 100 {
+                wire.send(w).unwrap();
+            }
+        }
+        // A newer frame ages the lossy one out as a partial.
+        let next = crate::pyrowave::windowed_au(1024, 11, 190);
+        for w in host
+            .seal_frame_at(&next, 200_000_000, USER_FLAG_CHUNK_ALIGNED, 1)
+            .unwrap()
+        {
+            wire.send(&w).unwrap();
+        }
+        let mut partial = None;
+        loop {
+            match client.poll_frame() {
+                Ok(f) if !f.complete => partial = Some(f),
+                Ok(f) => assert_eq!(f.frame_index, 1, "only the clean frame completes"),
+                Err(PunktfunkError::NoFrame) => break,
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        let p = partial.expect("the lossy frame arrives partial");
+        for (w, (got, sent)) in p.data.chunks(1024).zip(au.chunks(1024)).enumerate() {
+            if w == 100 {
+                assert!(got.iter().all(|&b| b == 0), "the lost tail window is empty");
+            } else {
+                assert_eq!(got, sent, "window {w}");
+            }
+        }
+    }
+
+    /// Partials go up when they can no longer complete, not a loss window later: a newer
+    /// frame's first packet hands the short one up, unless a NACK is out for it, and a frame
+    /// let go on its head waits for the head's parity. One with its head whole is a picture,
+    /// not a dropped frame; its holes count as loss.
+    #[test]
+    fn a_short_pyrowave_frame_goes_up_when_it_cannot_complete() {
+        use crate::packet::USER_FLAG_CHUNK_ALIGNED;
+        let mk = |role| Config {
+            role,
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 10,
+                max_data_per_block: 64,
+            },
+            shard_payload: 1024,
+            max_frame_bytes: 8 * 1024 * 1024,
+            loopback_drop_period: 0,
+        };
+        let (wire, c) = loopback_pair(0, 0);
+        let mut client = Session::new(mk(Role::Client), media(false), Box::new(c)).unwrap();
+        client.set_deliver_partial_frames(true);
+        let (spare, _) = loopback_pair(0, 0);
+        let mut host = Session::new(mk(Role::Host), media(false), Box::new(spare)).unwrap();
+        let au = crate::pyrowave::windowed_au(1024, 11, 40);
+        // 51 data shards, then 4 head parity; `keep` picks by wire position.
+        let mut send = |index: u32, pts_ms: u64, keep: &dyn Fn(usize) -> bool| {
+            let wires = host
+                .seal_frame_at(&au, pts_ms * 1_000_000, USER_FLAG_CHUNK_ALIGNED, index)
+                .unwrap();
+            for (i, w) in wires.iter().enumerate() {
+                if keep(i) {
+                    wire.send(w).unwrap();
+                }
+            }
+        };
+        let poll = |client: &mut Session| {
+            let mut got = Vec::new();
+            loop {
+                match client.poll_frame() {
+                    Ok(f) => got.push((f.frame_index, f.complete)),
+                    Err(PunktfunkError::NoFrame) => return got,
+                    Err(e) => panic!("unexpected: {e}"),
+                }
+            }
+        };
+
+        // A tail shard lost; the next frame, 16 ms on, hands it up before itself completes.
+        send(0, 0, &|i| i != 30);
+        assert_eq!(poll(&mut client), vec![]);
+        send(1, 16, &|_| true);
+        assert_eq!(poll(&mut client), vec![(0, false), (1, true)]);
+        let st = client.stats();
+        assert_eq!((st.frames_dropped, st.partial_shards_lost), (0, 1));
+
+        // Held for a NACK, the newer frame does not take it.
+        send(2, 33, &|i| i != 30);
+        client.set_partial_hold(Some(2));
+        send(3, 50, &|_| true);
+        assert_eq!(poll(&mut client), vec![(3, true)]);
+        assert!(client.release_partial(2, true), "its head is whole");
+        assert_eq!(poll(&mut client), vec![(2, false)]);
+
+        // A head shard lost too: let go on its head, it waits for the head's parity.
+        send(4, 66, &|i| i < 51 && i != 3 && i != 30);
+        assert_eq!(poll(&mut client), vec![]);
+        assert!(
+            !client.release_partial(4, true),
+            "the head waits for its parity"
+        );
+        send(4, 66, &|i| i >= 51);
+        assert_eq!(poll(&mut client), vec![]);
+        assert!(client.release_partial(4, true));
+        assert_eq!(poll(&mut client), vec![(4, false)]);
+        assert_eq!(client.stats().frames_dropped, 0);
     }
 
     fn pattern(len: usize) -> Vec<u8> {
