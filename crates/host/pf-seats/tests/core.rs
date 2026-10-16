@@ -830,6 +830,69 @@ fn a_failed_start_reconciles_its_seat() {
     assert!(start.is_some() && reconcile > start, "{calls:?}");
 }
 
+/// Clients that create, list, start, stop and delete at once leave exactly the seats that were
+/// created and not deleted, and the file on disk is the ledger in memory. A create, a delete and a
+/// `List` each write the ledger without the others' lock held across their backend work.
+#[test]
+fn concurrent_commands_never_lose_or_duplicate_a_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = Arc::new(SeatService::open(temp.path(), FakeBackend::default()).unwrap());
+    let made = Arc::new(Mutex::new(Vec::new()));
+    let gone = Arc::new(Mutex::new(Vec::new()));
+    let clients: Vec<_> = (0..4)
+        .map(|client| {
+            let (service, made, gone) =
+                (Arc::clone(&service), Arc::clone(&made), Arc::clone(&gone));
+            std::thread::spawn(move || {
+                for round in 0..60 {
+                    let first = service.ledger().seats.first().map(|seat| seat.id.clone());
+                    let command = match (client + round) % 5 {
+                        0 => create(
+                            &format!("S{client}-{round}"),
+                            &format!("pf-{client}-{round}"),
+                            false,
+                        ),
+                        1 => Command::List,
+                        2 => first.map_or(Command::List, |id| Command::Start { id }),
+                        3 => first.map_or(Command::List, |id| Command::Stop { id }),
+                        _ => first.map_or(Command::List, |id| Command::Delete { id }),
+                    };
+                    match service.dispatch(command) {
+                        Ok(CommandResult::Created { seat }) => made.lock().unwrap().push(seat.id),
+                        Ok(CommandResult::Deleted { id }) => gone.lock().unwrap().push(id),
+                        _ => {}
+                    }
+                }
+            })
+        })
+        .collect();
+    for client in clients {
+        client.join().unwrap();
+    }
+
+    let gone = gone.lock().unwrap();
+    let mut expected: Vec<_> = made
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|id| !gone.contains(id))
+        .cloned()
+        .collect();
+    let mut found: Vec<_> = service
+        .ledger()
+        .seats
+        .iter()
+        .map(|seat| seat.id.clone())
+        .collect();
+    expected.sort_by_key(|id| id.to_string());
+    found.sort_by_key(|id| id.to_string());
+    assert_eq!(found, expected);
+    assert_eq!(
+        LedgerStore::open(temp.path()).unwrap().load().unwrap(),
+        service.ledger()
+    );
+}
+
 #[test]
 fn the_ledger_answers_while_a_seat_starts() {
     let temp = tempfile::tempdir().unwrap();
