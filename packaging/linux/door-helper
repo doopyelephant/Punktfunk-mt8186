@@ -52,7 +52,10 @@ door_account_group() {
     getent passwd punktfunk >/dev/null || return 0
     getent group "$DOOR_GROUP" >/dev/null || groupadd --system "$DOOR_GROUP"
     [ "$(id -gn punktfunk)" = "$DOOR_GROUP" ] || usermod -g "$DOOR_GROUP" punktfunk
-    as_door find "$BOX" -xdev ! -group "$DOOR_GROUP" -exec chgrp -h "$DOOR_GROUP" {} +
+    # The door's own files only: a file another account left there, such as an updater's result,
+    # stays as it is and never stops a switch.
+    as_door find "$BOX" -xdev -user punktfunk ! -group "$DOOR_GROUP" -exec chgrp -h "$DOOR_GROUP" {} + ||
+        echo "door-helper: some files in $BOX keep their group" >&2
     if [ -d "$STATE/library" ]; then
         find "$STATE/library" -xdev ! -group "$DOOR_GROUP" -exec chgrp -h "$DOOR_GROUP" {} +
     fi
