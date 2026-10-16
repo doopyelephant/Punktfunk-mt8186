@@ -31,6 +31,8 @@ mod adpf;
 mod apply_margin;
 #[cfg(target_os = "android")]
 mod audio;
+#[cfg(target_os = "android")]
+mod audio_track;
 // `decode`'s AU intake rules, `test`-gated like `input_stall` so their table runs off-device.
 #[cfg(any(target_os = "android", test))]
 mod au_intake;

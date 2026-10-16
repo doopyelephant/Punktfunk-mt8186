@@ -28,17 +28,63 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-/// What one playback open attempt yields: the stream, plus both halves of the PCM hand-off — the
+/// What one playback open attempt yields: the output, plus both halves of the PCM hand-off — the
 /// sender the decode thread fills and the receiver that returns drained buffers for refill.
 ///
-/// A named struct rather than the tuple this used to be, because the tuple's type tripped
-/// `clippy::type_complexity` (the Android target is linted since `:kit:cargoNdkClippy`) and because
-/// the open path now carries the rung it succeeded on into the logs.
+/// A named struct rather than a tuple, because the tuple's type tripped `clippy::type_complexity`
+/// and because the open path carries the rung it succeeded on into the logs.
 struct LiveStream {
-    stream: AudioStream, // dropping it closes the AAudio stream
+    output: Output,
     tx: SyncSender<Vec<f32>>,
     free_rx: Receiver<Vec<f32>>,
     rung: OpenRung,
+}
+
+/// The device a session plays into. Dropping it closes the stream or releases the track.
+enum Output {
+    AAudio(AudioStream),
+    /// Surround below API 32, where AAudio has no speaker mask: [`crate::audio_track`].
+    Track(crate::audio_track::Track),
+}
+
+impl Output {
+    /// `(rate, channels, f32)` as granted, for [`arm`]'s check against the session.
+    fn granted(&self) -> (i32, i32, bool) {
+        match self {
+            Output::AAudio(s) => (
+                s.sample_rate(),
+                s.channel_count(),
+                s.format() == AudioFormat::PCM_Float,
+            ),
+            Output::Track(t) => (t.granted.rate_hz, t.granted.channels, true),
+        }
+    }
+
+    /// Ordered teardown before the close in `drop`: the ndk wrapper unwraps
+    /// AAudioStream_close's status, so hand the HAL a stopped stream. A track stops in its drop.
+    fn stop(&self) {
+        if let Output::AAudio(s) = self {
+            let _ = s.request_stop();
+        }
+    }
+
+    /// When the newest frame handed over plays, less now, ns; `0` before the first timestamp.
+    fn latency_ns(&self, rate_hz: u32) -> u64 {
+        let heard_at = match self {
+            Output::AAudio(s) => {
+                let Ok(ts) = s.timestamp(ndk::audio::Clockid::Monotonic) else {
+                    return 0;
+                };
+                let ahead = s.frames_written() - ts.frame_position;
+                ts.time_nanoseconds + ahead * 1_000_000_000 / i64::from(rate_hz.max(1))
+            }
+            Output::Track(t) => match t.heard_at_ns() {
+                0 => return 0,
+                at => at,
+            },
+        };
+        (heard_at - crate::sys::now_monotonic_ns()).max(0) as u64
+    }
 }
 
 /// One rung of the AAudio open ladder — a sharing mode, a performance mode and the sample rate
@@ -50,11 +96,14 @@ struct LiveStream {
 /// back: [`arm`] accepts it only when the granted rate equals the session's, so it rescues the
 /// device that refuses an explicit 48 000/96 000 while already running at it, and rejects the one
 /// that would have handed us a different rate.
+///
+/// `track` opens an `AudioTrack` at `perf` instead; `sharing` then means nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OpenRung {
     sharing: AudioSharingMode,
     perf: AudioPerformanceMode,
     rate: Option<i32>,
+    track: bool,
 }
 
 /// Why [`decode_loop`] returned — only one of them is worth reopening the device for.
@@ -212,35 +261,34 @@ impl AudioPlayback {
     }
 }
 
-/// `builder` set to the wire layout: the channel count, plus AAudio's speaker mask above stereo.
-///
-/// A count alone opens more than two channels as an index mask, with no speaker positions, so
-/// a stereo output keeps FL/FR and drops the rest. AAudio's mask bits are WASAPI's, in wire
-/// order. `AAudioStreamBuilder_setChannelMask` is API 32; below that only the count is set.
-fn with_layout(builder: AudioStreamBuilder, channels: u8) -> AudioStreamBuilder {
-    // void AAudioStreamBuilder_setChannelMask(AAudioStreamBuilder*, aaudio_channel_mask_t)  (API 32)
-    type SetChannelMaskFn = unsafe extern "C" fn(*mut c_void, u32);
+// void AAudioStreamBuilder_setChannelMask(AAudioStreamBuilder*, aaudio_channel_mask_t)  (API 32)
+type SetChannelMaskFn = unsafe extern "C" fn(*mut c_void, u32);
+
+/// `AAudioStreamBuilder_setChannelMask`, resolved once; `None` below API 32.
+fn set_channel_mask_fn() -> Option<SetChannelMaskFn> {
     static SET_MASK: OnceLock<Option<SetChannelMaskFn>> = OnceLock::new();
-    let set_mask = *SET_MASK.get_or_init(|| {
+    *SET_MASK.get_or_init(|| {
         // SAFETY: the `ndk` audio wrapper links `libaaudio.so`, so `dlopen` only bumps its
         // refcount (process-lifetime handle; null is checked). The type is the NDK header's.
-        let set = unsafe {
+        unsafe {
             let lib = libc::dlopen(c"libaaudio.so".as_ptr(), libc::RTLD_NOW);
             if lib.is_null() {
                 None
             } else {
                 crate::sym::<SetChannelMaskFn>(lib, c"AAudioStreamBuilder_setChannelMask")
             }
-        };
-        if set.is_none() {
-            log::info!(
-                "audio: no AAudio channel mask below API 32 — surround opens as channel indices"
-            );
         }
-        set
-    });
+    })
+}
+
+/// `builder` set to the wire layout: the channel count, plus AAudio's speaker mask above stereo.
+///
+/// From API 29 a count alone opens more than two channels as an index mask, with no speaker
+/// positions, so a stereo output keeps FL/FR and drops the rest. AAudio's mask bits are WASAPI's,
+/// in wire order. API 29–31 have no mask, and surround plays through [`crate::audio_track`].
+fn with_layout(builder: AudioStreamBuilder, channels: u8) -> AudioStreamBuilder {
     let builder = builder.channel_count(i32::from(channels));
-    if let (true, Some(set_mask)) = (channels > 2, set_mask) {
+    if let (true, Some(set_mask)) = (channels > 2, set_channel_mask_fn()) {
         // SAFETY: the pointer is the live builder `builder` owns. A mask set after the count wins.
         unsafe {
             set_mask(
@@ -317,9 +365,23 @@ impl Drop for AudioPlayback {
 ///
 /// `debug.punktfunk.audio_sharing` and `debug.punktfunk.audio_perf` can pin mode choices for
 /// field diagnosis. Rate cannot be overridden because it must match the wire format.
-fn open_ladder(is_tv: bool, fmt: PlaneFormat) -> Vec<OpenRung> {
+///
+/// With `track`, two `AudioTrack` rungs (LowLatency, then None) come first. The AAudio rungs
+/// after them still play the front pair on a device whose track refuses the layout.
+fn open_ladder(is_tv: bool, fmt: PlaneFormat, track: bool) -> Vec<OpenRung> {
     use AudioPerformanceMode::{LowLatency, None as PerfNone};
     use AudioSharingMode::{Exclusive, Shared};
+    let mut rungs = Vec::new();
+    if track {
+        for perf in [LowLatency, PerfNone] {
+            rungs.push(OpenRung {
+                sharing: Shared,
+                perf,
+                rate: Some(fmt.rate_hz as i32),
+                track: true,
+            });
+        }
+    }
     let mut modes: Vec<(AudioSharingMode, AudioPerformanceMode)> =
         match sysprop(c"debug.punktfunk.audio_sharing").as_deref() {
             Some("exclusive") => vec![(Exclusive, LowLatency), (Exclusive, PerfNone)],
@@ -340,13 +402,13 @@ fn open_ladder(is_tv: bool, fmt: PlaneFormat) -> Vec<OpenRung> {
         _ => {}
     }
     modes.dedup();
-    let mut rungs = Vec::with_capacity(modes.len() * 2);
     for rate in [Some(fmt.rate_hz as i32), None] {
         for &(sharing, perf) in &modes {
             rungs.push(OpenRung {
                 sharing,
                 perf,
                 rate,
+                track: false,
             });
         }
     }
@@ -364,7 +426,8 @@ struct OpenCtx<'a> {
     game_audio: bool,
     counters: &'a Arc<Counters>,
     sync: &'a Arc<punktfunk_core::audio::AudioSyncCell>,
-    /// Set by the AAudio error callback when the device disconnects — see [`supervise`].
+    /// Set by the AAudio error callback or a failed track write when the device goes — see
+    /// [`supervise`].
     disconnected: &'a Arc<AtomicBool>,
     /// The session is closing: the ladder stops between rungs, so a stop waits for one open.
     shutdown: &'a AtomicBool,
@@ -394,7 +457,23 @@ enum ArmError {
 /// session resolved — which is exactly why it still prints it: it is the field-log proof that the
 /// device really opened at the rate the `Welcome` claimed.
 fn log_started(live: &LiveStream, proven: bool) {
-    let s = &live.stream;
+    let s = match &live.output {
+        Output::AAudio(s) => s,
+        Output::Track(t) => {
+            let g = t.granted;
+            log::info!(
+                "audio: AudioTrack started rate={} ch={} perf={} buf={}/{} (asked {:?}{})",
+                g.rate_hz,
+                g.channels,
+                g.perf,
+                g.buffer_frames,
+                g.capacity_frames,
+                live.rung,
+                if proven { "" } else { ", UNPROVEN" },
+            );
+            return;
+        }
+    };
     log::info!(
         "audio: AAudio started rate={} ch={} fmt={:?} perf={:?} share={:?} burst={} buf={}/{} (asked {:?}{})",
         s.sample_rate(),
@@ -448,9 +527,7 @@ fn open_any(ladder: &[OpenRung], ctx: &OpenCtx) -> Option<LiveStream> {
                         unproven.get_or_insert(*rung);
                     }
                 }
-                // Ordered teardown before the close in `drop`: the ndk wrapper unwraps
-                // AAudioStream_close's status, so hand the HAL a stopped stream.
-                let _ = live.stream.request_stop();
+                live.output.stop();
             }
         }
     }
@@ -471,7 +548,7 @@ fn open_any(ladder: &[OpenRung], ctx: &OpenCtx) -> Option<LiveStream> {
             Some(live)
         }
         Err(_) => {
-            let _ = live.stream.request_stop();
+            live.output.stop();
             None
         }
     }
@@ -484,10 +561,10 @@ fn open_any(ladder: &[OpenRung], ctx: &OpenCtx) -> Option<LiveStream> {
 ///    into AAudio's buffer, so another layout or format is an out-of-bounds write on a realtime
 ///    thread. The NDK honours an explicit request or fails the open; this check does not trust
 ///    the HAL with a buffer length.
-/// 2. **`request_start` fails.** The caller tries the next rung.
+/// 2. **`request_start` fails.** The caller tries the next rung. A track plays from its open.
 /// 3. **The stream starts and never calls back.** `prove_pulling` catches it, giving up once
 ///    that flag is set (a closing session); the last-resort reopen in [`open_any`] passes
-///    `None`, since an unproven stream beats no stream.
+///    `None`, since an unproven stream beats no stream. A track's writes count as callbacks.
 ///
 /// The rate is held to the rung, or to the session's rate on an unspecified rung: a device that
 /// grants another rate is rejected, never resampled quietly.
@@ -497,27 +574,23 @@ fn arm(
     counters: &Counters,
     prove_pulling: Option<&AtomicBool>,
 ) -> Result<(), ArmError> {
-    let s = &live.stream;
+    let (rate, ch, float) = live.output.granted();
     let channels = fmt.channels;
     let want_rate = live.rung.rate.unwrap_or(fmt.rate_hz as i32);
-    if s.channel_count() != channels as i32
-        || s.sample_rate() != want_rate
-        || s.format() != AudioFormat::PCM_Float
-    {
+    if ch != i32::from(channels) || rate != want_rate || !float {
         return Err(ArmError::Unusable(format!(
-            "granted rate={} ch={} fmt={:?}, needed {want_rate}/{channels}/PCM_Float",
-            s.sample_rate(),
-            s.channel_count(),
-            s.format(),
+            "granted rate={rate} ch={ch} f32={float}, needed {want_rate}/{channels}/PCM_Float",
         )));
     }
-    s.request_start()
-        .map_err(|e| ArmError::Unusable(format!("request_start: {e}")))?;
-    // Lift the AAudio HW buffer off its brittle ~2-burst LowLatency default so a single late
-    // callback doesn't immediately underrun; the in-callback XRun loop grows it further if the
-    // device still glitches. set_buffer_size_in_frames clamps to capacity.
-    let burst = s.frames_per_burst().max(1);
-    let _ = s.set_buffer_size_in_frames((burst * 3).min(s.buffer_capacity_in_frames()));
+    if let Output::AAudio(s) = &live.output {
+        s.request_start()
+            .map_err(|e| ArmError::Unusable(format!("request_start: {e}")))?;
+        // Lift the AAudio HW buffer off its brittle ~2-burst LowLatency default so a single late
+        // callback doesn't immediately underrun; the in-callback XRun loop grows it further if
+        // the device still glitches. set_buffer_size_in_frames clamps to capacity.
+        let burst = s.frames_per_burst().max(1);
+        let _ = s.set_buffer_size_in_frames((burst * 3).min(s.buffer_capacity_in_frames()));
+    }
     let Some(shutdown) = prove_pulling else {
         return Ok(());
     };
@@ -537,7 +610,7 @@ fn arm(
 }
 
 /// Own the audio device for the life of the session: open it, run the decode loop against it, and
-/// open it again if AAudio disconnects.
+/// open it again if AAudio disconnects or a track's write fails.
 ///
 /// **Why a supervisor.** AAudio's contract on a disconnect (an HDMI mode switch, an AVR
 /// re-handshake, a headset unplugged, a route change) is that the stream is DEAD and the only
@@ -572,10 +645,18 @@ fn supervise(
     // consumes the target), the decode thread owns the timestamps (so it computes the target).
     // Two atomics, because the callback must not block on the thread that decodes.
     let sync: Arc<punktfunk_core::audio::AudioSyncCell> = Arc::default();
+    // API 29–31 open surround as channel indices with no mask to fix it, so an `AudioTrack`
+    // plays it. API 28 still derives the speakers from the count.
+    let api = sysprop(c"ro.build.version.sdk").and_then(|v| v.trim().parse::<u32>().ok());
+    let no_mask = fmt.channels > 2 && api >= Some(29) && set_channel_mask_fn().is_none();
+    let track = no_mask && crate::audio_track::available();
+    if no_mask && !track {
+        log::warn!("audio: no Java VM for an AudioTrack — surround opens as channel indices");
+    }
     // Either signal counts. Kotlin's `FEATURE_LEANBACK` is the authoritative one; the sysprop
     // catches a device reached through some path that did not pass the flag, and neither answering
     // simply keeps the phone ladder.
-    let ladder = open_ladder(is_tv || is_tv_device(), fmt);
+    let ladder = open_ladder(is_tv || is_tv_device(), fmt, track);
     // The one line that says what this session actually resolved — the `Welcome`'s answer, not the
     // request. A report of "hi-res is on but it sounds the same" is triaged from here: `codec=0`
     // means the host declined and the session is ordinary Opus, and the host's own log says why.
@@ -648,8 +729,8 @@ fn supervise(
             playout,
             &sync,
         );
-        let _ = live.stream.request_stop();
-        drop(live); // → AAudioStream_close
+        live.output.stop();
+        drop(live); // closes the stream, or stops and releases the track
         match exit {
             DecodeExit::Disconnected if reopen_allowed && !shutdown.load(Ordering::Relaxed) => {
                 generation += 1;
@@ -784,6 +865,13 @@ impl Render {
         AudioCallbackResult::Continue
     }
 
+    /// One `AudioTrack` write's worth: the callback's proof of life, then [`Self::fill`].
+    fn pull(&mut self, out: &mut [f32]) {
+        self.counters.callbacks.fetch_add(1, Ordering::Relaxed);
+        let frames = out.len() / self.channels.max(1);
+        self.fill(out, i32::try_from(frames).unwrap_or(i32::MAX));
+    }
+
     /// Drain the decoded chunks into the ring, run the jitter policy, and hand AAudio `out`.
     fn fill(&mut self, out: &mut [f32], num_frames: i32) {
         // Drain WITHOUT freeing on the RT thread: `drain(..)` empties each Vec but keeps its
@@ -877,7 +965,8 @@ fn log_no_configuration(fmt: PlaneFormat) {
 ///
 /// `open_stream` consumes its builder and callback, so channels, buffering, and jitter policy are
 /// rebuilt on every attempt. Invalid callback pointer/length pairs stop before a slice is formed.
-fn try_open(rung: OpenRung, ctx: &OpenCtx) -> ndk::audio::Result<LiveStream> {
+/// A `track` rung feeds the same ring to an `AudioTrack` writer instead of an AAudio callback.
+fn try_open(rung: OpenRung, ctx: &OpenCtx) -> Result<LiveStream, String> {
     let OpenCtx {
         fmt, game_audio, ..
     } = *ctx;
@@ -890,11 +979,29 @@ fn try_open(rung: OpenRung, ctx: &OpenCtx) -> ndk::audio::Result<LiveStream> {
     let (free_tx, free_rx) = sync_channel::<Vec<f32>>(RING_CHUNKS);
 
     let mut render = Render::new(ctx, rx, free_tx);
+    if rung.track {
+        let cfg = crate::audio_track::TrackConfig {
+            rate_hz: fmt.rate_hz,
+            channels,
+            low_latency: rung.perf == AudioPerformanceMode::LowLatency,
+            game_audio,
+        };
+        let fill = Box::new(move |out: &mut [f32]| render.pull(out));
+        let track = crate::audio_track::Track::open(&cfg, ctx.disconnected.clone(), fill)?;
+        return Ok(LiveStream {
+            output: Output::Track(track),
+            tx,
+            free_rx,
+            rung,
+        });
+    }
     let callback = move |s: &AudioStream, data: *mut c_void, num_frames: i32| {
         render.callback(s, data, num_frames)
     };
 
-    let builder = AudioStreamBuilder::new()?.direction(AudioDirection::Output);
+    let builder = AudioStreamBuilder::new()
+        .map_err(|e| e.to_string())?
+        .direction(AudioDirection::Output);
     // The wire order (FL FR FC LFE RL RR SL SR) is AAudio's speaker-bit order, so with the mask
     // `with_layout` sets this is an IDENTITY mapping — no permute.
     let builder = with_layout(builder, channels)
@@ -938,9 +1045,10 @@ fn try_open(rung: OpenRung, ctx: &OpenCtx) -> ndk::audio::Result<LiveStream> {
             log::warn!("audio: AAudio error (device reroute/disconnect?): {e:?}");
             cb_disconnected.store(true, Ordering::SeqCst);
         }))
-        .open_stream()?;
+        .open_stream()
+        .map_err(|e| e.to_string())?;
     Ok(LiveStream {
-        stream,
+        output: Output::AAudio(stream),
         tx,
         free_rx,
         rung,
@@ -1110,17 +1218,9 @@ impl<'a> Plane<'a> {
         }
     }
 
-    /// Device output latency past the ring, ns: when AAudio will play the newest frame it was
-    /// handed, less now. `0` until the stream reports a timestamp (it has just started).
+    /// Device output latency past the ring, ns — see [`Output::latency_ns`].
     fn output_latency_ns(&self) -> u64 {
-        let stream = &self.live.stream;
-        let Ok(ts) = stream.timestamp(ndk::audio::Clockid::Monotonic) else {
-            return 0;
-        };
-        let ahead = stream.frames_written() - ts.frame_position;
-        let heard_at =
-            ts.time_nanoseconds + ahead * 1_000_000_000 / i64::from(self.fmt.rate_hz.max(1));
-        (heard_at - crate::sys::now_monotonic_ns()).max(0) as u64
+        self.live.output.latency_ns(self.fmt.rate_hz)
     }
 
     /// Place the packet against the picture, conceal any seq gap in front of it, decode it into
