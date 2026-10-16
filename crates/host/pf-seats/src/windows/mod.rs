@@ -337,6 +337,7 @@ impl WindowsBackend {
     /// The box's rows, then each seat's. Every row is one plain sentence; a problem names the
     /// next move. `seating` adds what turning seats on checks (role, licensing, a GPU).
     fn doctor_report(&self, ledger: &Ledger) -> Vec<Diagnostic> {
+        let deadline = Instant::now() + enable::DOCTOR_BUDGET;
         let mut rows = Vec::new();
         rows.push(match windows_build() {
             Ok(build) if build >= 22621 => Diagnostic::info(
@@ -392,12 +393,12 @@ impl WindowsBackend {
             ),
         });
         rows.extend(
-            enable::checks()
+            enable::checks_until(deadline)
                 .into_iter()
                 .filter(|check| check.code != "windows_server"),
         );
         if server_edition() == Some(true) {
-            rows.extend(enable::licensing_row());
+            rows.extend(enable::licensing_row(deadline));
         }
         rows.push(match termservice_running() {
             Ok(true) => Diagnostic::info("termservice", "Remote Desktop Services is running."),

@@ -20,7 +20,7 @@ pub const KEEPER_EXE: &str = "punktfunk-seat-keeper.exe";
 pub const SEAT_LISTENER_PORT: u16 = pf_driver_proto::seat_audio::LISTENER_PORT;
 
 /// The keeper's own handshake gives up after 15 s.
-const OBSERVE_LIMIT: Duration = Duration::from_secs(20);
+pub(super) const OBSERVE_LIMIT: Duration = Duration::from_secs(20);
 
 /// The keeper beside `host_path`.
 pub fn keeper_path(host_path: &Path) -> PathBuf {

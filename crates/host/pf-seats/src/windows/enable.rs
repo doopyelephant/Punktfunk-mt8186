@@ -14,7 +14,7 @@ use crate::ipc::Diagnostic;
 use pf_paths::POWERSHELL;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use winreg::enums::{RegDisposition, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY};
 use winreg::RegKey;
 
@@ -53,6 +53,9 @@ const TRUST_RETRY: Duration = Duration::from_secs(2);
 /// pinned meanwhile. Windows answers its own state slowly for a minute after a restart, and a
 /// role install runs for minutes.
 const QUERY_LIMIT: Duration = Duration::from_secs(180);
+/// What the doctor's two PowerShell queries may take together. The client stops waiting on the
+/// doctor after five minutes, and the keeper's look and the local reads follow the queries.
+pub(super) const DOCTOR_BUDGET: Duration = Duration::from_secs(240);
 const INSTALL_LIMIT: Duration = Duration::from_secs(900);
 const TOOL_LIMIT: Duration = Duration::from_secs(300);
 /// The keeper's own handshake gives up after 15 s.
@@ -82,6 +85,12 @@ const PROBE: &str = "$ProgressPreference='SilentlyContinue'; \
 /// when not. A desktop edition runs seats only through a Remote Desktop wrapper the operator
 /// installed, a warning, and has no role or licensing to ask about.
 pub(super) fn checks() -> Vec<Diagnostic> {
+    checks_until(Instant::now() + QUERY_LIMIT)
+}
+
+/// [`checks`], its query given until `deadline`. A query the time doesn't reach reads as one that
+/// failed: the probe row says the settings couldn't be read.
+pub(super) fn checks_until(deadline: Instant) -> Vec<Diagnostic> {
     let mut checks = Vec::new();
     let server = match server_edition() {
         Some(true) => {
@@ -113,7 +122,7 @@ pub(super) fn checks() -> Vec<Diagnostic> {
             return checks;
         }
     };
-    let Some((role, [licensing, gpu])) = probe() else {
+    let Some((role, [licensing, gpu])) = probe(deadline) else {
         checks.push(Diagnostic::error(
             "probe",
             "Couldn't read this machine's Remote Desktop and graphics settings.",
@@ -330,10 +339,23 @@ const LICENSING: &str = "$ErrorActionPreference='SilentlyContinue'; \
     Where-Object { $_ }).Count; \
     '{0}|{1}' -f $days, $servers";
 
-/// How long Remote Desktop still runs without a licence server, for the doctor. Windows Server
-/// signs seats in for 120 days without one. `None` when Windows doesn't say.
-pub(super) fn licensing_row() -> Option<Diagnostic> {
-    let lines = powershell_lines(LICENSING, QUERY_LIMIT).ok()?;
+/// How long Remote Desktop still runs without a licence server, for the doctor, until `deadline`.
+/// Windows Server signs seats in for 120 days without one. `None` when Windows doesn't say; a
+/// query that fails or runs out of time is a warning.
+pub(super) fn licensing_row(deadline: Instant) -> Option<Diagnostic> {
+    let lines = time_left(deadline)
+        .ok_or_else(|| "the doctor's time is up".to_owned())
+        .and_then(|limit| powershell_lines(LICENSING, limit));
+    let lines = match lines {
+        Ok(lines) => lines,
+        Err(cause) => {
+            tracing::warn!(%cause, "remote desktop licensing not read");
+            return Some(Diagnostic::warning(
+                "rds_grace",
+                "Couldn't read how long Remote Desktop runs without a licence server. Run the check again in a few minutes.",
+            ));
+        }
+    };
     let (days, servers) = lines.last()?.split_once('|')?;
     grace_row(
         days.parse().ok(),
@@ -861,14 +883,20 @@ fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
     ))
 }
 
-fn probe() -> Option<(String, [bool; 2])> {
+/// What a query may take: up to [`QUERY_LIMIT`], and none once `deadline` has passed.
+fn time_left(deadline: Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    (!left.is_zero()).then_some(left.min(QUERY_LIMIT))
+}
+
+fn probe(deadline: Instant) -> Option<(String, [bool; 2])> {
     let output = pf_paths::run_within(
         Command::new(pf_paths::system32(POWERSHELL))
             .args(powershell_args(PROBE))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null()),
-        QUERY_LIMIT,
+        time_left(deadline)?,
     )
     .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
@@ -948,6 +976,19 @@ fn refuse(code: &str, sentence: &str, cause: impl std::fmt::Display) -> BackendE
 mod tests {
     use super::*;
     use crate::ipc::DiagnosticLevel;
+
+    /// A query gets what its deadline leaves, never more than the limit, and none after it.
+    #[test]
+    fn a_query_gets_what_the_deadline_leaves() {
+        let now = Instant::now();
+        assert_eq!(time_left(now), None);
+        assert_eq!(
+            time_left(now + Duration::from_secs(3600)),
+            Some(QUERY_LIMIT)
+        );
+        let short = time_left(now + Duration::from_secs(30)).unwrap();
+        assert!(short > Duration::from_secs(20) && short <= Duration::from_secs(30));
+    }
 
     #[test]
     fn only_an_unscoped_enabled_listener_rule_counts_as_open() {

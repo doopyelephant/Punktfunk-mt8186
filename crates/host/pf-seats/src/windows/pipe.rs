@@ -436,6 +436,14 @@ mod tests {
         }
     }
 
+    /// The doctor's queries and the keeper's look end before the client stops waiting.
+    #[test]
+    fn the_doctor_ends_before_the_client_gives_up() {
+        let doctor = super::answer_within(&Command::Doctor);
+        let work = crate::windows::enable::DOCTOR_BUDGET + crate::windows::keeper::OBSERVE_LIMIT;
+        assert!(work < doctor, "{work:?} against {doctor:?}");
+    }
+
     /// The client talks to a server that runs as LocalSystem and to no other. Run as LocalSystem
     /// this test expects the answer, run as anyone else it expects the refusal.
     #[test]
