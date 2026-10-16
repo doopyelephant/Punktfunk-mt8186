@@ -104,6 +104,16 @@ fn instance_safe(user: &str) -> bool {
         && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
 }
 
+/// Whether `id -u` printed an ordinary account's uid, the range the helper switches. A service
+/// account and a `systemd-homed` user (60001 and up) are refused there with nothing changed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
+fn ordinary_uid(printed: &str) -> bool {
+    printed
+        .trim()
+        .parse::<u32>()
+        .is_ok_and(|uid| (1000..60000).contains(&uid))
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
@@ -152,6 +162,14 @@ mod linux {
             return Some((
                 StatusCode::CONFLICT,
                 "This account's name can't be switched automatically.".into(),
+            ));
+        }
+        if on
+            && capture(Command::new("id").args(["-u", user])).is_some_and(|uid| !ordinary_uid(&uid))
+        {
+            return Some((
+                StatusCode::CONFLICT,
+                "This account can't be switched automatically.".into(),
             ));
         }
         if on && !in_update_group(Command::new("id").args(["-nG", user])) {
@@ -284,6 +302,17 @@ mod tests {
             too_long.as_str(),
         ] {
             assert!(!instance_safe(bad), "{bad:?}");
+        }
+    }
+
+    /// The helper switches ordinary accounts only; the console says so before it asks.
+    #[test]
+    fn only_an_ordinary_uid_is_switched() {
+        for good in ["1000\n", "1001", "59999\n"] {
+            assert!(ordinary_uid(good), "{good:?}");
+        }
+        for bad in ["", "root", "0\n", "999", "60000", "60001", "-1"] {
+            assert!(!ordinary_uid(bad), "{bad:?}");
         }
     }
 
