@@ -316,16 +316,10 @@ fn run_codec(
             lower: None,
         };
     };
-    // The forced TV mode switch (`is_tv` ⇒ ALWAYS strategy) is part of the experimental stack;
-    // off, every form factor gets the original soft seamless hint. ASC votes the rate on its own
-    // layer instead (the SurfaceView window shows nothing under the ASC path).
+    // ASC votes the rate on its own layer instead (the SurfaceView window shows nothing there).
     if asc.is_none()
         && mode.refresh_hz > 0
-        && !try_set_frame_rate(
-            window,
-            mode.refresh_hz as f32,
-            opts.is_tv && opts.low_latency_mode,
-        )
+        && !try_set_frame_rate(window, mode.refresh_hz as f32, opts.force_rate_switch())
     {
         log::debug!(
             "decode: set_frame_rate({} Hz) unavailable/declined (non-fatal)",
@@ -693,6 +687,7 @@ fn bring_up(
                 mode.refresh_hz,
                 priority,
                 overlay,
+                opts.force_rate_switch(),
             )
             .map(|mut a| {
                 a.set_hdr_meta(hdr_static);

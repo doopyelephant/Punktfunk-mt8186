@@ -438,8 +438,11 @@ private fun probeDisplay(context: Context, secondScreen: Boolean = true): Displa
 
 /**
  * The device's native display mode as a landscape `(width, height, hz)` — the long edge is the
- * width, since we stream a desktop. Falls back to 1920×1080@60 if no display can be read at all
- * (see [probeDisplay] for the cold-start fallback that makes that a last resort).
+ * width, since we stream a desktop. `hz` is the panel's highest refresh at its current size, from
+ * the mode TABLE: the live mode is whatever the system holds the app at, and Android 15+ holds a
+ * game at 60. A TV keeps its live HDMI mode, which the box's own setting picked.
+ * Falls back to 1920×1080@60 if no display can be read at all (see [probeDisplay] for the
+ * cold-start fallback that makes that a last resort).
  */
 fun nativeDisplayMode(
     context: Context,
@@ -450,12 +453,14 @@ fun nativeDisplayMode(
     val mode = display.mode
     val w = mode.physicalWidth
     val h = mode.physicalHeight
-    // ROUNDED, not truncated: TVs report the fractional NTSC rates over HDMI (59.94, 29.97,
-    // 23.976), and `toInt()` turns 59.94 into 59 — a rate no display mode anywhere has, which the
-    // host then serves by clamping DOWN to the highest mode it advertises at or below it. Rounding
-    // also keeps this agreeing with `Display.streamPanelFps`, which already rounds; the two
-    // describe the same panel and must not disagree.
-    val hz = kotlin.math.round(mode.refreshRate).toInt().coerceAtLeast(1)
+    val rate = if (isTvDevice(context)) {
+        mode.refreshRate
+    } else {
+        display.sameResolutionModes().maxOfOrNull { it.refreshRate } ?: mode.refreshRate
+    }
+    // ROUNDED, not truncated: 59.94 must not become 59, a rate no display mode has, which the
+    // host serves by clamping DOWN. Agrees with `Display.streamPanelFps`, which also rounds.
+    val hz = kotlin.math.round(rate).toInt().coerceAtLeast(1)
     // A picture spanning two screens is two equal halves at this screen's size
     // (design/android-dual-screen.md §3.2); the codec ceiling clamps the ask later.
     return Triple(maxOf(w, h), minOf(w, h) * (if (spanned && secondScreen) 2 else 1), hz)

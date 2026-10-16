@@ -227,13 +227,13 @@ impl AscBackend {
     /// runs the SurfaceView presenter). `window` is the SurfaceView's `ANativeWindow`; `src_w/h` the
     /// negotiated decode size; `surface_size` the LIVE view size the layer composites into;
     /// `src_crop` the part of the buffer it shows; `layers` the second window and the shown mask;
-    /// `panel_hz` the mode-table panel rate (seeds the clock);
-    /// `dataspace` the `ADataSpace` from the negotiated colour; `source_hz` the negotiated stream rate.
+    /// `panel_hz` the mode-table panel rate (seeds the clock); `dataspace` the `ADataSpace` from the
+    /// negotiated colour; `source_hz` the negotiated stream rate, which the layer votes, switching
+    /// the panel non-seamlessly when `force_switch` ([`super::DecodeOptions::force_rate_switch`]).
     ///
     /// `overlay` sets the reader's gralloc ask. `true` adds `COMPOSER_OVERLAY`, letting HWC scan
-    /// the buffer out directly instead of paying a GPU composition pass — the right default, and
-    /// what every device the presenter was tuned on allocates without blinking. It is also the one
-    /// reader parameter that can make `AMediaCodec_start` fail AFTER a clean configure: start is
+    /// the buffer out directly instead of paying a GPU composition pass: the default. It is also the
+    /// one reader parameter that can make `AMediaCodec_start` fail AFTER a clean configure: start is
     /// where ACodec dequeues (= gralloc-allocates) every codec output buffer from this reader's
     /// window, with our consumer usage OR'd into the decoder's own producer bits — and an old
     /// 32-bit OMX BSP (the Mi TV Stick's Amlogic gralloc) can refuse the combined
@@ -256,8 +256,9 @@ impl AscBackend {
         source_hz: u32,
         priority: PresentPriority,
         overlay: bool,
+        force_switch: bool,
     ) -> Option<AscBackend> {
-        let layer = Layer::create(window, surface_size, src_crop)?;
+        let layer = Layer::create(window, surface_size, src_crop, force_switch)?;
         let mut usage = ndk::hardware_buffer::HardwareBufferUsage::GPU_SAMPLED_IMAGE;
         if overlay {
             usage |= ndk::hardware_buffer::HardwareBufferUsage::COMPOSER_OVERLAY;
@@ -432,6 +433,7 @@ impl AscBackend {
                     &w,
                     self.layers.second_size.clone(),
                     self.layers.second_crop.clone(),
+                    self.layer.force_switch(),
                 )
             });
             log::info!(

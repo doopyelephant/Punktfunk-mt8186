@@ -121,6 +121,8 @@ type TxnSetBufferDataSpaceFn =
     unsafe extern "C" fn(*mut ASurfaceTransaction, *mut ASurfaceControl, i32);
 type TxnSetFrameRateFn =
     unsafe extern "C" fn(*mut ASurfaceTransaction, *mut ASurfaceControl, f32, i8);
+type TxnSetFrameRateStrategyFn =
+    unsafe extern "C" fn(*mut ASurfaceTransaction, *mut ASurfaceControl, f32, i8, i8);
 
 #[repr(C)]
 struct AColorXy {
@@ -180,6 +182,8 @@ struct Api {
     txn_set_dataspace: Option<TxnSetBufferDataSpaceFn>,
     /// `setFrameRate` is **API 30** — optional, `None` on API 29.
     txn_set_frame_rate: Option<TxnSetFrameRateFn>,
+    /// `setFrameRateWithChangeStrategy` is **API 31** — optional like `setFrameRate`.
+    txn_set_frame_rate_strategy: Option<TxnSetFrameRateStrategyFn>,
     /// The HDR10 static metadata setters (API 29), optional like `setBufferDataSpace`.
     txn_set_hdr_smpte2086: Option<TxnSetHdrSmpte2086Fn>,
     txn_set_hdr_cta861_3: Option<TxnSetHdrCta8613Fn>,
@@ -215,6 +219,10 @@ impl Api {
                 txn_set_present_time: sym(lib, c"ASurfaceTransaction_setDesiredPresentTime")?,
                 txn_set_dataspace: sym(lib, c"ASurfaceTransaction_setBufferDataSpace"),
                 txn_set_frame_rate: sym(lib, c"ASurfaceTransaction_setFrameRate"),
+                txn_set_frame_rate_strategy: sym(
+                    lib,
+                    c"ASurfaceTransaction_setFrameRateWithChangeStrategy",
+                ),
                 txn_set_hdr_smpte2086: sym(lib, c"ASurfaceTransaction_setHdrMetadata_smpte2086"),
                 txn_set_hdr_cta861_3: sym(lib, c"ASurfaceTransaction_setHdrMetadata_cta861_3"),
                 txn_set_on_complete: sym(lib, c"ASurfaceTransaction_setOnComplete")?,
@@ -355,6 +363,9 @@ pub(crate) struct Layer {
     /// view when video started): the window's own buffer geometry, the best remaining guess.
     fallback_w: i32,
     fallback_h: i32,
+    /// The frame-rate vote may switch the panel non-seamlessly
+    /// ([`super::DecodeOptions::force_rate_switch`]).
+    force_switch: bool,
     /// `true` once the first transaction has made the layer visible + set its z-order + frame rate.
     configured: bool,
 }
@@ -376,6 +387,7 @@ impl Layer {
         window: &NativeWindow,
         surface_size: Arc<AtomicU64>,
         src_crop: Arc<AtomicU64>,
+        force_switch: bool,
     ) -> Option<Layer> {
         let api = Api::resolve()?;
         // SAFETY: `window.ptr()` is the live `ANativeWindow` the decode thread owns; the name is a
@@ -402,8 +414,14 @@ impl Layer {
             src_crop,
             fallback_w,
             fallback_h,
+            force_switch,
             configured: false,
         })
+    }
+
+    /// Whether this layer's frame-rate vote may switch the panel non-seamlessly.
+    pub(crate) fn force_switch(&self) -> bool {
+        self.force_switch
     }
 
     /// The destination rectangle for this present: the live view size, or the window's buffer
@@ -467,14 +485,17 @@ impl Layer {
             if !self.configured {
                 (self.api.txn_set_visibility)(txn, sc, VISIBILITY_SHOW);
                 (self.api.txn_set_z_order)(txn, sc, 0);
-                // Declare the layer as fixed-rate video at the source rate (compatibility 1 =
-                // FIXED_SOURCE) so a compliant display aligns its refresh to it. Best-effort: an
-                // LTPO governor may still run "video" content below its own floor for power (the
-                // NP3 does — no app-side rate hint raises its render-range floor; the display's
-                // Minimum-refresh-rate system setting is the only lever there).
+                // Fixed-rate video at the source rate (compatibility 1 = FIXED_SOURCE; strategy
+                // 1 = ALWAYS). An LTPO governor may still run it below its own floor (the NP3:
+                // only its Minimum-refresh-rate system setting moves that).
                 if frame_rate > 0.0 {
-                    if let Some(f) = self.api.txn_set_frame_rate {
-                        f(txn, sc, frame_rate, 1);
+                    match (
+                        self.api.txn_set_frame_rate_strategy,
+                        self.api.txn_set_frame_rate,
+                    ) {
+                        (Some(f), _) if self.force_switch => f(txn, sc, frame_rate, 1, 1),
+                        (_, Some(f)) => f(txn, sc, frame_rate, 1),
+                        _ => {}
                     }
                 }
                 self.configured = true;
