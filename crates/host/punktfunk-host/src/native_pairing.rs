@@ -156,14 +156,9 @@ impl NativePairing {
     ) -> Result<NativePairing> {
         let store = store::TrustStore::open(store_path)?;
         let np = NativePairing::with_store(store, fixed_pin, arm_at_start);
-        // Only the door runs apart from its seat hosts, which keep their guests through its restart.
-        np.drop_session_only_records(|fp| {
-            if crate::seats::is_door() {
-                crate::seats::plays_on_a_seat(fp)
-            } else {
-                Some(false)
-            }
-        });
+        // A host with no seats answers `Some(false)`, and a seat host's read-only store never
+        // sweeps. The door, and a Windows host with seats on, ask the seat hosts.
+        np.drop_session_only_records(crate::seats::plays_on_a_seat);
         Ok(np)
     }
 
