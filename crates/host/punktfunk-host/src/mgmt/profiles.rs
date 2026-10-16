@@ -1352,10 +1352,36 @@ pub(crate) async fn proxy_profile_seat(
         );
     };
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    seat_answer(status, content_type.as_deref(), bytes)
+}
+
+/// A seat host's answer, relayed on the console's origin. Only JSON and images keep their
+/// type; the rest is served as inert bytes, so a seat cannot run a page here.
+fn seat_answer(status: StatusCode, content_type: Option<&str>, bytes: Vec<u8>) -> Response {
+    let passes = |c: &&str| {
+        let media = c
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        media == "application/json" || media.starts_with("image/")
+    };
+    let content_type = content_type
+        .filter(passes)
+        .and_then(|c| header::HeaderValue::from_str(c).ok())
+        .unwrap_or(header::HeaderValue::from_static("application/octet-stream"));
     let mut resp = (status, bytes).into_response();
-    if let Some(ct) = content_type.and_then(|c| header::HeaderValue::from_str(&c).ok()) {
-        resp.headers_mut().insert(header::CONTENT_TYPE, ct);
-    }
+    let headers = resp.headers_mut();
+    headers.insert(header::CONTENT_TYPE, content_type);
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static("sandbox"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
     resp
 }
 
@@ -1434,6 +1460,44 @@ mod tests {
         for pattern in box_only {
             assert!(proxy_refuses(pattern), "{pattern}");
         }
+    }
+
+    #[test]
+    fn a_seat_cannot_serve_a_page_from_the_console_s_origin() {
+        let served = |ct: Option<&str>| {
+            let resp = seat_answer(StatusCode::OK, ct, b"<script>1</script>".to_vec());
+            let get = |h| resp.headers()[h].to_str().unwrap().to_string();
+            (
+                get(header::CONTENT_TYPE),
+                get(header::CONTENT_SECURITY_POLICY),
+                get(header::X_CONTENT_TYPE_OPTIONS),
+            )
+        };
+        for kept in [
+            "application/json",
+            "Application/JSON; charset=utf-8",
+            "image/webp",
+        ] {
+            let (ct, csp, sniff) = served(Some(kept));
+            assert_eq!(
+                (ct.as_str(), csp.as_str(), sniff.as_str()),
+                (kept, "sandbox", "nosniff")
+            );
+        }
+        for page in [
+            "text/html",
+            "text/html; charset=utf-8",
+            "application/xhtml+xml",
+            "image",
+            "",
+        ] {
+            assert_eq!(served(Some(page)).0, "application/octet-stream", "{page}");
+        }
+        let (ct, csp, sniff) = served(None);
+        assert_eq!(
+            (ct.as_str(), csp.as_str(), sniff.as_str()),
+            ("application/octet-stream", "sandbox", "nosniff")
+        );
     }
 
     #[test]
