@@ -26,7 +26,8 @@ pub(in crate::linux) struct NegotiationInputs {
     pub hdr_cuda_ok: bool,
     /// `PUNKTFUNK_NV12`: the CUDA import emits NV12 (tiled blit or LINEAR compute CSC).
     pub nv12_env_on: bool,
-    /// The NVENC encoder converts held dmabufs itself (`ZeroCopyPolicy::nvenc_raw_dmabuf`).
+    /// The NVENC encoder converts held dmabufs itself and its convert samples a tiled layout
+    /// (`raw_lane_ok`).
     pub nvenc_raw: bool,
 }
 

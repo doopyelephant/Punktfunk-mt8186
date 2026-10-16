@@ -904,7 +904,7 @@ fn open(
     // PyroWave import it themselves. Once this identity's ladder closes it, NVENC takes CUDA
     // from the EGL/CUDA import instead. The importer is built before the pool either way: it
     // names the allocatable modifiers. One importer, one worker process.
-    let raw_lane = policy.nvenc_raw_dmabuf && signals.health.ladder().nvenc_raw_ok();
+    let raw_lane = super::raw_lane_ok(policy) && signals.health.ladder().nvenc_raw_ok();
     let mut importer = if needs_cuda_import(policy) {
         if signals.health.ladder().off(pf_zerocopy::Lane::Gpu) {
             bail!("this output's GPU import is off after repeated failures");
@@ -921,7 +921,7 @@ fn open(
     if hdr && importer.is_some() && !raw_lane && !policy.hdr_cuda_ok {
         bail!("this session's encoder takes no 10-bit PQ through the GPU importer");
     }
-    let (pool, fourcc, format, (w, h)) = build_pool(&st, importer.as_mut(), policy, hdr)?;
+    let (pool, fourcc, format, (w, h)) = build_pool(&st, importer.as_mut(), policy, hdr, raw_lane)?;
 
     let mut buffers: Vec<wl_buffer::WlBuffer> = Vec::with_capacity(pool.bos.len());
     for bo in &pool.bos {
@@ -1154,12 +1154,14 @@ impl Opened {
 }
 
 /// Intersect each constrained fourcc with its consumer list, then allocate that pool.
-/// `hdr` asks the packed 10-bit pair instead of 8-bit RGB.
+/// `hdr` asks the packed 10-bit pair instead of 8-bit RGB; `raw_lane` narrows the importer's
+/// list to what the fused convert samples.
 fn build_pool(
     st: &State,
     importer: Option<&mut pf_zerocopy::Importer>,
     policy: &crate::ZeroCopyPolicy,
     hdr: bool,
+    raw_lane: bool,
 ) -> Result<(GbmPool, u32, PixelFormat, (u32, u32))> {
     let (w, h) = st
         .size
@@ -1176,7 +1178,13 @@ fn build_pool(
         .copied()
         .map(|fourcc| {
             let mut modifiers = if let Some(i) = importer.as_deref_mut() {
-                i.supported_modifiers(fourcc)
+                let egl = i.supported_modifiers(fourcc);
+                if raw_lane {
+                    let fused = pf_zerocopy::fused_convert_modifiers(fourcc);
+                    super::raw_lane_modifiers(&egl, &fused)
+                } else {
+                    egl
+                }
             } else {
                 policy
                     .encoder_modifiers

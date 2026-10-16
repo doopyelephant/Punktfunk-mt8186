@@ -433,6 +433,47 @@ unsafe fn modifier_plane_count(
         .map(|p| p.drm_format_modifier_plane_count)
 }
 
+/// The modifiers the CUDA device imports as a one-plane SAMPLED image of `fmt`, in driver order:
+/// the check [`import_dmabuf_image`] makes before it creates the fused convert's source image.
+/// Empty when no loader, instance or NVIDIA device answers.
+pub fn sampled_import_modifiers(fmt: vk::Format) -> Vec<u64> {
+    // SAFETY: `Entry::load` dlopens the system loader, whose entry points match ash's bindings.
+    // The instance is fresh, serves only physical-device queries and is destroyed before return.
+    unsafe {
+        let Ok(entry) = ash::Entry::load() else {
+            return Vec::new();
+        };
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+        let Ok(instance) = entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&app),
+            None,
+        ) else {
+            return Vec::new();
+        };
+        let mods = cuda_physical_device(&instance)
+            .map(|pd| {
+                format_modifiers(&instance, pd, fmt)
+                    .iter()
+                    .filter(|p| p.drm_format_modifier_plane_count == 1)
+                    .map(|p| p.drm_format_modifier)
+                    .filter(|&m| {
+                        modifier_importable(
+                            &instance,
+                            pd,
+                            fmt,
+                            m,
+                            vk::ImageUsageFlags::SAMPLED,
+                            None,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        instance.destroy_instance(None);
+        mods
+    }
+}
+
 /// Whether `pd` accepts a dmabuf import of `fmt` tiled as `modifier` with `usage`, under the
 /// video profiles in `profile_list` when given. IMPORTABLE on the external properties is the
 /// whole answer.

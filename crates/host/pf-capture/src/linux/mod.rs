@@ -107,6 +107,23 @@ struct CaptureSignals {
     importer_in_process: Arc<AtomicBool>,
 }
 
+/// The NVENC raw lane may take this capture: the encoder offers it and the fused convert samples
+/// at least one tiled BGRx layout. With none, a tiled producer could only be offered LINEAR.
+fn raw_lane_ok(policy: &ZeroCopyPolicy) -> bool {
+    policy.nvenc_raw_dmabuf
+        && !pf_zerocopy::fused_convert_modifiers(pf_zerocopy::drm::XR24).is_empty()
+}
+
+/// `importable` narrowed to the modifiers the raw lane's fused convert samples, order kept.
+/// LINEAR stays.
+fn raw_lane_modifiers(importable: &[u64], fused: &[u64]) -> Vec<u64> {
+    importable
+        .iter()
+        .copied()
+        .filter(|m| *m == 0 || fused.contains(m))
+        .collect()
+}
+
 /// Producer identity plus the consumer policy whose failures must stay independent.
 fn health_identity(base: u64, policy: &ZeroCopyPolicy) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -185,3 +202,25 @@ mod pw_cursor;
 mod pw_pods;
 // Explicit sync (`SPA_META_SyncTimeline`): syncobj waits and release signals.
 mod sync_timeline;
+
+#[cfg(test)]
+mod tests {
+    use super::raw_lane_modifiers;
+
+    /// NVIDIA 595, 2560×1440 BGRx: EGL imports the compressed block-linear layout KWin's gbm
+    /// picks; the fused convert's Vulkan device samples only the plain ones.
+    #[test]
+    fn raw_lane_offer_drops_what_the_convert_cannot_sample() {
+        const PLAIN: u64 = 0x0300_0000_0060_6010;
+        const COMPRESSED: u64 = 0x0300_0000_00e0_8014;
+        let egl = [PLAIN, COMPRESSED, PLAIN + 1, 0];
+        let fused = [PLAIN + 1, PLAIN];
+        assert_eq!(raw_lane_modifiers(&egl, &fused), vec![PLAIN, PLAIN + 1, 0]);
+        assert_eq!(
+            raw_lane_modifiers(&egl, &[]),
+            vec![0],
+            "LINEAR always stays"
+        );
+        assert!(raw_lane_modifiers(&[], &fused).is_empty());
+    }
+}

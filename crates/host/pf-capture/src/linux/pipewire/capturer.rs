@@ -356,7 +356,7 @@ fn spawn_pipewire(
         native_nv12_env_on: pf_host_config::env_on("PUNKTFUNK_PIPEWIRE_NV12").unwrap_or(true),
         hdr_cuda_ok: policy.hdr_cuda_ok,
         nv12_env_on: pf_zerocopy::nv12_enabled(),
-        nvenc_raw: policy.nvenc_raw_dmabuf,
+        nvenc_raw: crate::linux::raw_lane_ok(&policy),
     });
     let vaapi_dmabuf = plan.vaapi_passthrough;
     let import_policy = plan.import_policy;
@@ -457,9 +457,15 @@ impl Capturer for PortalCapturer {
         }
     }
 
-    /// Only the virtual-output path holds one; the portal thread owns its own session.
+    /// Only the virtual-output path holds one; the portal thread owns its own session. The
+    /// taker links a new stream to the output, so this one stops first: buffers an old link
+    /// still holds when a second one joins stay lost to the producer (KWin: 120 → 30 fps).
     fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
-        self.keepalive.take()
+        let keepalive = self.keepalive.take();
+        if keepalive.is_some() {
+            self.stop_stream();
+        }
+        keepalive
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
@@ -826,17 +832,24 @@ impl PortalCapturer {
     }
 }
 
-impl Drop for PortalCapturer {
-    fn drop(&mut self) {
-        // Quit then join before keepalive drops: releases EGL/CUDA, then
-        // the virtual output. Without this `mainloop.run()` blocks until
-        // process exit. `send` errs only if the thread already exited.
+impl PortalCapturer {
+    /// Quit the PipeWire thread and join it: the stream disconnects and EGL/CUDA are released.
+    /// Without this `mainloop.run()` blocks until process exit. `send` errs only if the thread
+    /// already exited.
+    fn stop_stream(&mut self) {
         if let Some(quit) = self.quit.take() {
             let _ = quit.send(());
         }
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+}
+
+impl Drop for PortalCapturer {
+    fn drop(&mut self) {
+        // Before keepalive drops: the stream lets go of the output before the output goes.
+        self.stop_stream();
     }
 }
 
