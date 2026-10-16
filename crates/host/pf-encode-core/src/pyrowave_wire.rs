@@ -2,10 +2,11 @@
 //!
 //! Turns pyrowave's packetized bitstream into either one dense packet or a
 //! datagram-aligned windowed AU. Each `chunk`-sized window opens with a 4-byte
-//! prefix (`u16` used + `u16` kind): `WIN_PACKED` (whole packets share a window)
-//! or a `FRAG` chain (one oversized atomic packet). A lost shard zeroes its
-//! window (`used = 0`); the receiver skips it and drops any interrupted
-//! fragment chain. Padding after `used` is zeroed.
+//! prefix (`u16` used + `u16` kind): `WIN_PACKED` (whole blocks share a window,
+//! in any order: the decoder places each by its own index) or a `FRAG` chain
+//! (one oversized block). A lost shard zeroes its window (`used = 0`); the
+//! receiver skips it and drops any interrupted fragment chain. Padding after
+//! `used` is zeroed.
 //!
 //! No GPU/FFI. Tests below pin the walk. Clients parse this exact layout, so
 //! both backends emit it from here. See `design/pyrowave-codec-plan.md`.
@@ -16,11 +17,10 @@ const WIN_FRAG_FIRST: u16 = 1;
 const WIN_FRAG_CONT: u16 = 2;
 const WIN_FRAG_LAST: u16 = 3;
 
-/// Shard payload minus the window prefix, so a whole codec packet plus prefix
-/// fits one shard. Dense mode uses `dense_cap` (one packet per AU).
-pub fn packet_boundary(wire_chunk: Option<usize>, dense_cap: usize) -> usize {
-    wire_chunk.map(|c| c - WINDOW_PREFIX).unwrap_or(dense_cap)
-}
+/// Leading wavelet bands that make up an AU's head ([`AuLayout::new`]'s `head`): level 4, the
+/// LL band and the coarsest details. One lost level-4 block blurs up to 1024² pixels; a finer
+/// one, at most 512².
+pub const HEAD_BANDS: i32 = 2;
 
 /// Stamp `ycbcr_range = LIMITED`, `chroma_siting = LEFT` (and, when `bt2020_pq`,
 /// BT.2020/PQ/matrix) on the frame's 8-byte `BitstreamSequenceHeader`.
@@ -84,19 +84,19 @@ pub fn block_count_32x32(width: u32, height: u32, chroma444: bool) -> u32 {
 
 /// Deflates the per-frame rate budget by measured AU/bitstream inflation.
 ///
-/// Window packing pads most windows and adds 4-byte prefixes plus FRAG tails,
-/// so the wire is larger than the codec bitstream. The pin is a link budget,
-/// so this EMA-scales the target handed to pyrowave's rate control. Sealed-
-/// datagram framing and FEC parity are not compensated: H.26x sessions carry
-/// those on top of the configured bitrate too.
+/// Window prefixes, the gap best fit leaves and FRAG tails make the AU a little
+/// larger than the codec bitstream. The encoder's rate is what the AU may carry,
+/// so this EMA-scales the target handed to pyrowave's rate control. Seal and
+/// parity are the host's to price (`EncDerive`).
 pub struct WireBudget {
     /// EMA of AU/bitstream bytes, ×1024 fixed point.
     scale_x1024: u32,
 }
 
 impl WireBudget {
-    /// Startup prior ×1024 ≈ 1.25. EMA converges in ~a second of frames.
-    const PRIOR_X1024: u32 = 1280;
+    /// Startup prior ×1024 ≈ 1.02, what best fit leaves at 1408 B windows. EMA converges in
+    /// ~a second of frames.
+    const PRIOR_X1024: u32 = 1044;
     /// EMA weight 1/8: per-frame wobble damps; a mode change re-converges in ~16 frames.
     const EMA_SHIFT: u32 = 3;
     /// Never inflate the budget (×1.0 floor); never deflate below half (tiny bitrates window coarsely).
@@ -187,116 +187,197 @@ impl FrameBudget {
     }
 }
 
-/// Where [`build_au`] writes: a growing `Vec`, or a fixed slice for the worker's mapped
-/// return buffer. Each write reports whether it fit.
-trait AuSink {
-    fn len(&self) -> usize;
-    fn put(&mut self, bytes: &[u8]) -> bool;
-    /// Zero-fill up to `to`.
-    fn pad_to(&mut self, to: usize) -> bool;
-    fn patch(&mut self, at: usize, bytes: &[u8]);
-}
-
-impl AuSink for Vec<u8> {
-    fn len(&self) -> usize {
-        Vec::len(self)
-    }
-    fn put(&mut self, bytes: &[u8]) -> bool {
-        self.extend_from_slice(bytes);
-        true
-    }
-    fn pad_to(&mut self, to: usize) -> bool {
-        self.resize(to.max(Vec::len(self)), 0);
-        true
-    }
-    fn patch(&mut self, at: usize, bytes: &[u8]) {
-        self[at..at + bytes.len()].copy_from_slice(bytes);
-    }
-}
-
-/// A slice with a write cursor.
-struct SliceSink<'a> {
-    buf: &'a mut [u8],
-    len: usize,
-}
-
-impl AuSink for SliceSink<'_> {
-    fn len(&self) -> usize {
-        self.len
-    }
-    fn put(&mut self, bytes: &[u8]) -> bool {
-        let end = self.len + bytes.len();
-        if end > self.buf.len() {
-            return false;
-        }
-        self.buf[self.len..end].copy_from_slice(bytes);
-        self.len = end;
-        true
-    }
-    fn pad_to(&mut self, to: usize) -> bool {
-        let to = to.max(self.len);
-        if to > self.buf.len() {
-            return false;
-        }
-        self.buf[self.len..to].fill(0);
-        self.len = to;
-        true
-    }
-    fn patch(&mut self, at: usize, bytes: &[u8]) {
-        self.buf[at..at + bytes.len()].copy_from_slice(bytes);
-    }
-}
-
-/// Frame `packets` (offset, size into `bitstream`) into the wire AU.
-/// `None` copies the single dense packet; `Some(chunk)` emits whole `chunk`-sized windows.
+/// Frame `packets` (offset, size into `bitstream`) into the wire AU: [`AuLayout`] laid into a
+/// `Vec`. `None` copies the single dense packet.
 pub fn build_au(
     packets: &[(usize, usize)],
     bitstream: &[u8],
     wire_chunk: Option<usize>,
+    head: usize,
 ) -> Vec<u8> {
-    let Some(chunk) = wire_chunk else {
-        let (off, size) = packets[0];
-        return bitstream[off..off + size].to_vec();
-    };
-    let mut au: Vec<u8> = Vec::with_capacity((packets.len() + 1) * chunk);
-    let fit = build_windows(packets, bitstream, chunk, &mut au);
-    debug_assert!(fit, "a Vec sink never runs out");
+    let layout = AuLayout::new(packets, wire_chunk, head);
+    let mut au = vec![0u8; layout.len()];
+    layout.write(packets, bitstream, &mut au);
     au
 }
 
-/// [`build_au`] into `out`: the AU's length, or `None` when `out` is shorter than
-/// [`au_bound`] says it may need to be.
-pub fn build_au_into(
-    packets: &[(usize, usize)],
-    bitstream: &[u8],
-    wire_chunk: Option<usize>,
-    out: &mut [u8],
-) -> Option<usize> {
-    let Some(chunk) = wire_chunk else {
-        let (off, size) = packets[0];
-        let dst = out.get_mut(..size)?;
-        dst.copy_from_slice(&bitstream[off..off + size]);
-        return Some(size);
-    };
-    let mut sink = SliceSink { buf: out, len: 0 };
-    build_windows(packets, bitstream, chunk, &mut sink).then_some(sink.len)
+/// Where each packet of a windowed AU goes, decided before a byte moves.
+///
+/// Packets are pyrowave blocks, one each, and packet 0 is the sequence header. The first
+/// `head` packets fill the leading windows, the rest the windows after them, so the head
+/// ends on a shard boundary for the sealer's head-only parity. Each region is best fit,
+/// largest block first: window tails stay ~2 % of the AU instead of the ~20 % that
+/// in-order filling leaves. Packet 0 opens window 0, where clients read the frame's size.
+/// A block larger than a window is a FRAG chain of its own.
+pub struct AuLayout {
+    /// `0` in dense mode.
+    chunk: usize,
+    /// Per packet: its window, and its byte offset in that window's body.
+    slots: Vec<(u32, u32)>,
+    /// Per window: `used` and `kind`.
+    windows: Vec<(u16, u16)>,
+    dense_len: usize,
 }
 
-/// Bytes [`build_au`] can need for `packets`: every packet opens at most one window, an
-/// oversized one a window per fragment.
-pub fn au_bound(packets: &[(usize, usize)], wire_chunk: Option<usize>) -> usize {
-    let Some(chunk) = wire_chunk else {
-        return packets.first().map_or(0, |&(_, s)| s);
-    };
-    let payload_max = chunk.saturating_sub(WINDOW_PREFIX).max(1);
-    packets
-        .iter()
-        .map(|&(_, s)| s.div_ceil(payload_max).max(1))
-        .sum::<usize>()
-        * chunk
+impl AuLayout {
+    pub fn new(packets: &[(usize, usize)], wire_chunk: Option<usize>, head: usize) -> AuLayout {
+        let Some(chunk) = wire_chunk else {
+            return AuLayout {
+                chunk: 0,
+                slots: Vec::new(),
+                windows: Vec::new(),
+                dense_len: packets.first().map_or(0, |&(_, s)| s),
+            };
+        };
+        let payload = chunk - WINDOW_PREFIX;
+        let mut layout = AuLayout {
+            chunk,
+            slots: vec![(0, 0); packets.len()],
+            windows: Vec::new(),
+            dense_len: 0,
+        };
+        let head = head.clamp(packets.len().min(1), packets.len());
+        let mut fit = BestFit::new(payload);
+        let mut order = Vec::with_capacity(packets.len());
+        for region in [0..head, head..packets.len()] {
+            fit.clear();
+            order.clear();
+            order.extend(region);
+            order.sort_unstable_by_key(|&i| (i != 0, std::cmp::Reverse(packets[i].1), i));
+            for &i in &order {
+                let size = packets[i].1;
+                if size == 0 {
+                    continue;
+                }
+                if size > payload {
+                    layout.slots[i] = (layout.windows.len() as u32, 0);
+                    let pieces = size.div_ceil(payload);
+                    for p in 0..pieces {
+                        let take = (size - p * payload).min(payload);
+                        let kind = match p {
+                            0 => WIN_FRAG_FIRST,
+                            p if p + 1 == pieces => WIN_FRAG_LAST,
+                            _ => WIN_FRAG_CONT,
+                        };
+                        layout.windows.push((take as u16, kind));
+                    }
+                    continue;
+                }
+                let w = fit.take(size).unwrap_or_else(|| {
+                    layout.windows.push((0, WIN_PACKED));
+                    layout.windows.len() - 1
+                });
+                let used = &mut layout.windows[w].0;
+                layout.slots[i] = (w as u32, u32::from(*used));
+                *used += size as u16;
+                fit.put(w, payload - usize::from(*used));
+            }
+        }
+        layout
+    }
+
+    /// The AU's length in bytes.
+    pub fn len(&self) -> usize {
+        if self.chunk == 0 {
+            self.dense_len
+        } else {
+            self.windows.len() * self.chunk
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Lay the AU into `out`: its length, or `None` when `out` is shorter than [`Self::len`].
+    /// Every byte up to the length is written, padding included.
+    pub fn write(
+        &self,
+        packets: &[(usize, usize)],
+        bitstream: &[u8],
+        out: &mut [u8],
+    ) -> Option<usize> {
+        let len = self.len();
+        let out = out.get_mut(..len)?;
+        if self.chunk == 0 {
+            if let Some(&(off, size)) = packets.first() {
+                out.copy_from_slice(&bitstream[off..off + size]);
+            }
+            return Some(len);
+        }
+        let chunk = self.chunk;
+        let payload = chunk - WINDOW_PREFIX;
+        for (win, &(used, kind)) in out.chunks_mut(chunk).zip(&self.windows) {
+            win[..2].copy_from_slice(&used.to_le_bytes());
+            win[2..WINDOW_PREFIX].copy_from_slice(&kind.to_le_bytes());
+            win[WINDOW_PREFIX + usize::from(used)..].fill(0);
+        }
+        for (&(off, size), &(window, at)) in packets.iter().zip(&self.slots) {
+            if size == 0 {
+                continue;
+            }
+            let bytes = &bitstream[off..off + size];
+            let first = window as usize * chunk + WINDOW_PREFIX;
+            if size > payload {
+                for (p, piece) in bytes.chunks(payload).enumerate() {
+                    out[first + p * chunk..][..piece.len()].copy_from_slice(piece);
+                }
+            } else {
+                out[first + at as usize..][..size].copy_from_slice(bytes);
+            }
+        }
+        Some(len)
+    }
 }
 
-/// The strict inverse of [`build_au`]'s windowed layout: the codec packet stream, or what makes
+/// Open windows by free bytes: [`Self::take`] answers the fullest window that still holds a
+/// block, from a bitmap over the free counts.
+struct BestFit {
+    by_free: Vec<Vec<usize>>,
+    nonempty: Vec<u64>,
+}
+
+impl BestFit {
+    fn new(payload: usize) -> BestFit {
+        BestFit {
+            by_free: vec![Vec::new(); payload + 1],
+            nonempty: vec![0; (payload + 1).div_ceil(64)],
+        }
+    }
+
+    fn clear(&mut self) {
+        for (word, bits) in self.nonempty.iter_mut().enumerate() {
+            while *bits != 0 {
+                self.by_free[word * 64 + bits.trailing_zeros() as usize].clear();
+                *bits &= *bits - 1;
+            }
+        }
+    }
+
+    fn put(&mut self, window: usize, free: usize) {
+        if free > 0 {
+            self.by_free[free].push(window);
+            self.nonempty[free / 64] |= 1 << (free % 64);
+        }
+    }
+
+    fn take(&mut self, size: usize) -> Option<usize> {
+        let mut word = size / 64;
+        let mut bits = *self.nonempty.get(word)? & (u64::MAX << (size % 64));
+        while bits == 0 {
+            word += 1;
+            bits = *self.nonempty.get(word)?;
+        }
+        let free = word * 64 + bits.trailing_zeros() as usize;
+        let window = self.by_free[free].pop();
+        if self.by_free[free].is_empty() {
+            self.nonempty[word] &= !(1 << (free % 64));
+        }
+        window
+    }
+}
+
+/// The strict inverse of [`build_au`]'s windowed layout: the codec blocks in window order, or what makes
 /// `au` something `build_au` never emits. Clients parse leniently instead (a zeroed window is a
 /// lost shard); this is the encoder-side check that every window is well formed.
 #[cfg(any(test, feature = "test-support"))]
@@ -337,76 +418,6 @@ pub fn unwindow(au: &[u8], chunk: usize) -> anyhow::Result<Vec<u8>> {
     }
     ensure!(frag.is_none(), "AU ends inside a fragment chain");
     Ok(out)
-}
-
-/// The windowed layout, for either sink. `false` = the sink ran out.
-fn build_windows<S: AuSink>(
-    packets: &[(usize, usize)],
-    bitstream: &[u8],
-    chunk: usize,
-    au: &mut S,
-) -> bool {
-    let payload_max = chunk - WINDOW_PREFIX;
-    let mut open: Option<(usize, usize)> = None;
-    let close = |au: &mut S, open: &mut Option<(usize, usize)>| -> bool {
-        match open.take() {
-            Some((start, used)) => {
-                au.patch(start, &(used as u16).to_le_bytes());
-                au.patch(start + 2, &WIN_PACKED.to_le_bytes());
-                au.pad_to(start + chunk)
-            }
-            None => true,
-        }
-    };
-    for &(off, size) in packets {
-        let bytes = &bitstream[off..off + size];
-        if size <= payload_max {
-            let fits = open.is_some_and(|(_, used)| used + size <= payload_max);
-            if !fits {
-                if !close(au, &mut open) {
-                    return false;
-                }
-                let start = au.len();
-                if !au.pad_to(start + WINDOW_PREFIX) {
-                    return false;
-                }
-                open = Some((start, 0));
-            }
-            if !au.put(bytes) {
-                return false;
-            }
-            if let Some((_, used)) = open.as_mut() {
-                *used += size;
-            }
-        } else {
-            // Oversized atomic packet: a FRAG chain of full windows, never packed.
-            if !close(au, &mut open) {
-                return false;
-            }
-            let mut o = 0usize;
-            while o < size {
-                let take = (size - o).min(payload_max);
-                let kind = if o == 0 {
-                    WIN_FRAG_FIRST
-                } else if o + take == size {
-                    WIN_FRAG_LAST
-                } else {
-                    WIN_FRAG_CONT
-                };
-                let start = au.len();
-                if !au.pad_to(start + WINDOW_PREFIX) {
-                    return false;
-                }
-                au.patch(start, &(take as u16).to_le_bytes());
-                au.patch(start + 2, &kind.to_le_bytes());
-                if !au.put(&bytes[o..o + take]) || !au.pad_to(start + chunk) {
-                    return false;
-                }
-                o += take;
-            }
-        }
-    }
-    close(au, &mut open)
 }
 
 /// Per-chunk target (~3–4 chunks at 400 Mb/s 60 fps, ~833 KB).
@@ -616,63 +627,132 @@ mod tests {
     #[test]
     fn dense_is_the_single_packet() {
         let bs = (0u8..=200).collect::<Vec<u8>>();
-        let au = build_au(&[(10, 50)], &bs, None);
+        let au = build_au(&[(10, 50)], &bs, None, 0);
         assert_eq!(au, bs[10..60]);
     }
 
-    #[test]
-    fn packed_windows_pack_small_packets_and_reconstruct() {
-        let bs: Vec<u8> = (0..255u32).map(|i| i as u8).collect();
-        let packets = [(0, 20), (20, 20), (40, 100)];
-        let chunk = 64; // payload_max = 60
-        let au = build_au(&packets, &bs, Some(chunk));
-        let flat = walk(&au, chunk);
-        let mut expect = Vec::new();
-        for &(o, s) in &packets {
-            expect.extend_from_slice(&bs[o..o + s]);
+    /// A bitstream shaped like pyrowave's at `packetize(boundary = 1)`: an 8-byte sequence
+    /// header, then one packet per block, each with its header (`payload_words`, index) and
+    /// a body that names the block.
+    fn blocks(sizes: &[usize]) -> (Vec<u8>, Vec<(usize, usize)>) {
+        let mut bs = vec![0u8, 0, 0, 0x80, 0, 0, 0, 0];
+        let mut packets = vec![(0, 8)];
+        for (i, &size) in sizes.iter().enumerate() {
+            let off = bs.len();
+            bs.resize(off + size, (i % 251) as u8 + 1);
+            bs[off..off + 2].copy_from_slice(&[0, 0]);
+            bs[off + 2..off + 4].copy_from_slice(&((size / 4) as u16).to_le_bytes());
+            bs[off + 4..off + 8].copy_from_slice(&((i as u32) << 8).to_le_bytes());
+            packets.push((off, size));
         }
-        assert_eq!(flat, expect);
+        (bs, packets)
+    }
+
+    /// Block indices per window (`None` = the sequence header), read the way clients read them.
+    fn blocks_by_window(au: &[u8], chunk: usize) -> Vec<Vec<Option<u32>>> {
+        let mut chain = None;
+        au.chunks(chunk)
+            .map(|win| {
+                let used = u16::from_le_bytes([win[0], win[1]]) as usize;
+                let body = &win[WINDOW_PREFIX..WINDOW_PREFIX + used];
+                let index = |b: &[u8]| u32::from_le_bytes([b[4], b[5], b[6], b[7]]) >> 8;
+                match u16::from_le_bytes([win[2], win[3]]) {
+                    WIN_PACKED => {
+                        let (mut at, mut out) = (0, Vec::new());
+                        while at + 8 <= body.len() {
+                            let w1 = u16::from_le_bytes([body[at + 2], body[at + 3]]);
+                            if w1 & 0x8000 != 0 {
+                                out.push(None);
+                                at += 8;
+                            } else {
+                                out.push(Some(index(&body[at..])));
+                                at += usize::from(w1 & 0xfff) * 4;
+                            }
+                        }
+                        out
+                    }
+                    WIN_FRAG_FIRST => {
+                        chain = Some(index(body));
+                        vec![chain]
+                    }
+                    _ => vec![chain],
+                }
+            })
+            .collect()
+    }
+
+    /// Best fit loses no block, keeps the sequence header at the front of window 0, puts every
+    /// head block before every tail block, and leaves ~2 % of the AU as padding.
+    #[test]
+    fn blocks_pack_best_fit_with_the_head_first() {
+        let mut seed = 0x2545_f491_u32;
+        let sizes: Vec<usize> = (0..900)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (8 + (seed >> 16) as usize % 1392) & !3
+            })
+            .collect();
+        let (bs, packets) = blocks(&sizes);
+        let chunk = 1408;
+        let head = 61;
+        let au = build_au(&packets, &bs, Some(chunk), head);
+        assert_eq!(au.len() % chunk, 0);
+
+        let stream = walk(&au, chunk);
+        assert_eq!(stream[..8], bs[..8], "the sequence header opens window 0");
+        let mut seen = vec![false; sizes.len()];
+        let mut at = 8;
+        while at < stream.len() {
+            let i = (u32::from_le_bytes(stream[at + 4..at + 8].try_into().unwrap()) >> 8) as usize;
+            let (off, size) = packets[i + 1];
+            assert_eq!(
+                stream[at..at + size],
+                bs[off..off + size],
+                "block {i} intact"
+            );
+            assert!(!std::mem::replace(&mut seen[i], true), "block {i} once");
+            at += size;
+        }
+        assert!(seen.iter().all(|&s| s), "every block arrives");
+
+        let windows = blocks_by_window(&au, chunk);
+        let is_head = |b: &Option<u32>| b.is_none_or(|i| (i as usize) < head - 1);
+        let last_head = windows.iter().rposition(|w| w.iter().any(is_head)).unwrap();
+        let first_tail = windows.iter().position(|w| !w.iter().all(is_head)).unwrap();
+        assert!(
+            last_head < first_tail,
+            "head windows {last_head} before tail {first_tail}"
+        );
+
+        let raw: usize = packets.iter().map(|&(_, s)| s).sum();
+        assert!(
+            au.len() * 100 < raw * 103 + 2 * chunk * 100,
+            "{} B AU for {raw} B of blocks",
+            au.len()
+        );
     }
 
     #[test]
     fn oversized_packet_fragments_and_reassembles() {
         let bs: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         let chunk = 64; // payload_max = 60
-        let au = build_au(&[(0, 500)], &bs, Some(chunk));
+        let au = build_au(&[(0, 500)], &bs, Some(chunk), 1);
         assert_eq!(walk(&au, chunk), bs[0..500]);
     }
 
-    /// The slice target lays out the same AU as the `Vec`, inside [`au_bound`], and says so
-    /// when it cannot.
+    /// The slice writer lays out the same AU as the `Vec`, and says so when the slice is short.
     #[test]
-    fn slice_target_matches_the_vec_inside_the_bound() {
-        let bs: Vec<u8> = (0..2000u32).map(|i| (i * 7) as u8).collect();
-        type Case = (&'static [(usize, usize)], Option<usize>);
-        let cases: [Case; 4] = [
-            (
-                &[(0, 20), (20, 20), (40, 100), (140, 500), (640, 3)],
-                Some(64),
-            ),
-            (&[(0, 500)], Some(64)),
-            (&[(0, 1), (1, 1), (2, 1)], Some(1408)),
-            (&[(10, 50)], None),
-        ];
-        for (packets, chunk) in cases {
-            let want = build_au(packets, &bs, chunk);
-            let bound = au_bound(packets, chunk);
-            assert!(want.len() <= bound, "{} > bound {bound}", want.len());
-            let mut out = vec![0xAAu8; bound];
-            let n = build_au_into(packets, &bs, chunk, &mut out).expect("fits the bound");
-            assert_eq!(&out[..n], &want[..]);
+    fn slice_write_matches_the_vec() {
+        let (bs, packets) = blocks(&[1200, 2000, 40, 8, 700, 1396, 12]);
+        for (chunk, head) in [(Some(64), 2), (Some(1408), 3), (Some(1408), 0), (None, 0)] {
+            let want = build_au(&packets, &bs, chunk, head);
+            let layout = AuLayout::new(&packets, chunk, head);
+            let mut out = vec![0xAAu8; layout.len() + 100];
+            assert_eq!(layout.write(&packets, &bs, &mut out), Some(want.len()));
+            assert_eq!(&out[..want.len()], &want[..]);
             let mut short = vec![0u8; want.len().saturating_sub(1)];
-            assert_eq!(build_au_into(packets, &bs, chunk, &mut short), None);
+            assert_eq!(layout.write(&packets, &bs, &mut short), None);
         }
-    }
-
-    #[test]
-    fn boundary_reserves_the_window_prefix() {
-        assert_eq!(packet_boundary(Some(1408), 999_999), 1404);
-        assert_eq!(packet_boundary(None, 777), 777);
     }
 
     #[test]
@@ -715,7 +795,7 @@ mod tests {
     #[test]
     fn wire_budget_converges_and_deflates() {
         let mut wb = WireBudget::new();
-        assert_eq!(wb.deflate(1_024_000), 819_200);
+        assert_eq!(wb.deflate(1_024_000), 1_004_383);
         for _ in 0..64 {
             wb.observe(1000, 1300);
         }
@@ -784,7 +864,7 @@ mod tests {
         let bs: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
         let packets = [(0, 20), (20, 300), (320, 55), (375, 900), (1275, 40)];
         let chunk = 64;
-        let au = build_au(&packets, &bs, Some(chunk));
+        let au = build_au(&packets, &bs, Some(chunk), 1);
         assert!(au.len() / chunk > 4, "need several windows to cut between");
         let step = chunk_step(chunk, 3 * chunk);
         assert_eq!(step, 3 * chunk);
@@ -810,11 +890,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             "exactly one closing chunk"
         );
-        let mut expect = Vec::new();
-        for &(o, s) in &packets {
-            expect.extend_from_slice(&bs[o..o + s]);
-        }
-        assert_eq!(walk(&bytes, chunk), expect);
+        let total: usize = packets.iter().map(|&(_, s)| s).sum();
+        assert_eq!(
+            walk(&bytes, chunk).len(),
+            total,
+            "every packet byte survives"
+        );
     }
 
     /// Round down to whole windows, never to zero — a target below one window
@@ -864,7 +945,7 @@ mod tests {
     fn unwindow_refuses_a_malformed_au() {
         let bs: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         let chunk = 64;
-        let au = build_au(&[(0, 500)], &bs, Some(chunk));
+        let au = build_au(&[(0, 500)], &bs, Some(chunk), 1);
         assert_eq!(unwindow(&au, chunk).unwrap(), bs[..500]);
         assert!(
             unwindow(&au[..au.len() - chunk], chunk).is_err(),
@@ -872,7 +953,7 @@ mod tests {
         );
         assert!(unwindow(&au[chunk..], chunk).is_err(), "CONT without FIRST");
         assert!(unwindow(&au[..au.len() - 1], chunk).is_err(), "ragged tail");
-        let mut packed = build_au(&[(0, 20)], &bs, Some(chunk));
+        let mut packed = build_au(&[(0, 20)], &bs, Some(chunk), 1);
         packed[chunk - 1] = 1;
         assert!(unwindow(&packed, chunk).is_err(), "non-zero padding");
     }
@@ -888,7 +969,7 @@ mod tests {
         assert_eq!(b.rate_control(false), 833_333);
         assert_eq!(
             b.rate_control(true),
-            833_333 * 1024 / 1280,
+            833_333 * 1024 / 1044,
             "startup inflation prior"
         );
         b.retarget(0);

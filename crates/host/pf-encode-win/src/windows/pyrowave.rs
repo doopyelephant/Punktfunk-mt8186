@@ -507,14 +507,14 @@ impl PyroWaveEncoder {
         )?;
 
         let wire_chunk = self.stream.wire_chunk;
-        let pkts = packetize(
+        let (pkts, head) = packetize(
             self.pw_enc,
             &mut self.bitstream,
             self.budget.bytes + BS_SLACK,
             wire_chunk,
             self.pq,
         )?;
-        let au = pyrowave_wire::build_au(&pkts, &self.bitstream, wire_chunk);
+        let au = pyrowave_wire::build_au(&pkts, &self.bitstream, wire_chunk, head);
         if wire_chunk.is_some() {
             self.budget.observe(&pkts, au.len());
         }
