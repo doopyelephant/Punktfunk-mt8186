@@ -32,6 +32,8 @@ use accounts::AccountManager;
 pub use accounts::{seats_group_sid, SEATS_GROUP};
 use credentials::CredentialStore;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use supervisor::Supervisor;
 use util::{backend_error, io_error, require_local_system, WinResult};
 use util::{port_open, udp_port_owners};
@@ -48,6 +50,9 @@ use winreg::RegKey;
 /// Whose existence reserves display slots 12 through 15, and turns seats on unless it holds
 /// [`ENABLING`].
 const SEATS_KEY: &str = r"SOFTWARE\Punktfunk\Seats";
+/// How long the boot warm-up waits for TermService, and how often it looks.
+const TERMSERVICE_WAIT: Duration = Duration::from_secs(600);
+const TERMSERVICE_POLL: Duration = Duration::from_secs(2);
 /// A value of the Seats key while a turn-on is unfinished. A key without it is a complete one,
 /// which older builds left too.
 const ENABLING: &str = "Enabling";
@@ -153,6 +158,19 @@ impl WindowsBackend {
     /// rule has opened it since. For the service's start.
     pub fn keep_rdp_local(&self) {
         enable::keep_rdp_local();
+    }
+
+    /// With seats on, waits until TermService runs, `stop` is set or [`TERMSERVICE_WAIT`] is
+    /// up. The service starts at boot without waiting for it, and no seat starts before it.
+    pub fn wait_for_termservice(&self, stop: &AtomicBool) {
+        let deadline = Instant::now() + TERMSERVICE_WAIT;
+        while seats_enabled()
+            && !stop.load(Ordering::SeqCst)
+            && !matches!(termservice_running(), Ok(true))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(TERMSERVICE_POLL);
+        }
     }
 
     fn ensure_runtime_prerequisites(&self) -> WinResult<()> {

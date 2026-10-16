@@ -3,9 +3,10 @@
 //!
 //! Seat hosts run in the supervisor's own jobs, never the console host's, so a console relaunch
 //! leaves them running; the service stopping logs their accounts off. The pipe opens first;
-//! autostart seats then come up one at a time beside it. Without `HKLM\SOFTWARE\Punktfunk\Seats`
-//! the ledger is still served and every start answers `seats_off`. A slot that cannot open logs
-//! the reason and stays inert: seats never stop the service.
+//! autostart seats then come up one at a time beside it, once TermService runs. Without
+//! `HKLM\SOFTWARE\Punktfunk\Seats` the ledger is still served and every start answers
+//! `seats_off`. A slot that cannot open logs the reason and stays inert: seats never stop the
+//! service.
 
 use super::*;
 use pf_seats::windows::pipe::{wake, PipeServer};
@@ -41,9 +42,10 @@ impl SeatsSlot {
             }
         };
         let loop_stop = Arc::clone(&stop);
+        let loop_backend = backend.clone();
         let spawned = std::thread::Builder::new()
             .name("seats".into())
-            .spawn(move || serve(service, &loop_stop));
+            .spawn(move || serve(service, &loop_backend, &loop_stop));
         if let Err(error) = spawned {
             tracing::error!("seat supervisor thread did not start: {error}");
         }
@@ -67,7 +69,11 @@ impl SeatsSlot {
 /// The pipe until the slot stops, with autostart seats, then the seats of recent players, coming
 /// up beside it: a start takes minutes, and the console reads the seats meanwhile. A start's
 /// first failure is logged here; the supervisor logs every failure after that.
-fn serve(service: Arc<SeatService<WindowsBackend>>, stop: &Arc<AtomicBool>) {
+fn serve(
+    service: Arc<SeatService<WindowsBackend>>,
+    backend: &WindowsBackend,
+    stop: &Arc<AtomicBool>,
+) {
     let server = match PipeServer::bind(pf_seats::ipc::PIPE_NAME, Arc::clone(&service)) {
         Ok(server) => server,
         Err(error) => {
@@ -76,10 +82,10 @@ fn serve(service: Arc<SeatService<WindowsBackend>>, stop: &Arc<AtomicBool>) {
         }
     };
     {
-        let (service, stop) = (Arc::clone(&service), Arc::clone(stop));
+        let (service, backend, stop) = (Arc::clone(&service), backend.clone(), Arc::clone(stop));
         let spawned = std::thread::Builder::new()
             .name("seats-warm".into())
-            .spawn(move || warm(&service, &stop));
+            .spawn(move || warm(&service, &backend, &stop));
         if let Err(error) = spawned {
             tracing::warn!("seat warm-up did not start: {error}");
         }
@@ -88,8 +94,18 @@ fn serve(service: Arc<SeatService<WindowsBackend>>, stop: &Arc<AtomicBool>) {
     server.serve_until(stop);
 }
 
-/// Autostart seats, the seats of recent players, then the idle watch until the slot stops.
-fn warm(service: &Arc<SeatService<WindowsBackend>>, stop: &Arc<AtomicBool>) {
+/// Autostart seats, the seats of recent players, then the idle watch until the slot stops. They
+/// wait for TermService first: the service starts at boot without it, and a seat can't start
+/// before it.
+fn warm(
+    service: &Arc<SeatService<WindowsBackend>>,
+    backend: &WindowsBackend,
+    stop: &Arc<AtomicBool>,
+) {
+    backend.wait_for_termservice(stop);
+    if stop.load(Ordering::SeqCst) {
+        return;
+    }
     if let Err(error) = service.reconcile_startup() {
         tracing::warn!(code = ?error.code, "seat autostart: {}", error.message);
     }
