@@ -229,36 +229,39 @@ fn in_play() -> bool {
     is_door() || (cfg!(windows) && enabled())
 }
 
-/// Whether any device `holds` plays on a seat. A seat host that doesn't answer, or a ledger that
-/// won't load, counts as a yes: acting on a guess would cut a live stream. Blocking, as
-/// [`snapshot`].
-fn any_on_a_seat(holds: impl Fn(&Occupant) -> bool) -> bool {
+/// Whether any device `holds` plays on a seat; `None` when a seat host or the ledger can't say.
+/// Blocking, as [`snapshot`].
+fn any_on_a_seat(holds: impl Fn(&Occupant) -> bool) -> Option<bool> {
     if !in_play() {
-        return false;
+        return Some(false);
     }
-    match list() {
-        Ok(seats) => unanswered_or(&ask_hosts(&seats), holds),
-        Err(_) => true,
-    }
+    seen_on(&ask_hosts(&list().ok()?), holds)
 }
 
-fn unanswered_or(
+/// A device seen on an answering seat is a yes. Otherwise a seat that didn't answer leaves it
+/// open: it may be playing there.
+fn seen_on(
     heard: &BTreeMap<String, Option<Vec<Occupant>>>,
     holds: impl Fn(&Occupant) -> bool,
-) -> bool {
-    heard
-        .values()
-        .any(|who| who.as_ref().is_none_or(|who| who.iter().any(&holds)))
+) -> Option<bool> {
+    if heard.values().flatten().flatten().any(holds) {
+        Some(true)
+    } else if heard.values().any(Option::is_none) {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// Whether a device other than `fp_hex` streams on any seat: the host-power busy check for a
-/// box whose sessions run on seat hosts. Blocking, as [`snapshot`].
+/// box whose sessions run on seat hosts. A guess would cut a live stream, so a seat that can't
+/// say counts as a yes. Blocking, as [`snapshot`].
 pub(crate) fn other_client_on_a_seat(fp_hex: &str) -> bool {
-    any_on_a_seat(|o| !crate::session_status::is_client(&o.client, fp_hex))
+    any_on_a_seat(|o| !crate::session_status::is_client(&o.client, fp_hex)).unwrap_or(true)
 }
 
-/// Whether `fp_hex` streams on a seat. Blocking, as [`snapshot`].
-pub(crate) fn plays_on_a_seat(fp_hex: &str) -> bool {
+/// Whether `fp_hex` streams on a seat; `None` when a seat can't say. Blocking, as [`snapshot`].
+pub(crate) fn plays_on_a_seat(fp_hex: &str) -> Option<bool> {
     any_on_a_seat(|o| crate::session_status::is_client(&o.client, fp_hex))
 }
 
@@ -373,7 +376,7 @@ const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 mod tests {
-    use super::{unanswered_or, Occupant};
+    use super::{seen_on, Occupant};
     use std::collections::BTreeMap;
 
     #[test]
@@ -386,7 +389,7 @@ mod tests {
             }])
         };
         let other = |seats: &BTreeMap<String, Option<Vec<Occupant>>>| {
-            unanswered_or(seats, |o| !crate::session_status::is_client(&o.client, fp))
+            seen_on(seats, |o| !crate::session_status::is_client(&o.client, fp)).unwrap_or(true)
         };
         let mut seats = BTreeMap::new();
         seats.insert("owner".to_string(), on(&fp[..12]));
@@ -398,5 +401,24 @@ mod tests {
         assert!(other(&seats), "an anonymous client is always someone else");
         seats.insert("seat-2".to_string(), None);
         assert!(other(&seats), "a seat host that doesn't answer is busy");
+    }
+
+    /// A guest seen on one seat is there whatever the others say; one nobody saw is unknown
+    /// while a seat is silent, and gone once every seat has answered.
+    #[test]
+    fn a_silent_seat_leaves_a_guest_open_unless_it_was_seen() {
+        let fp = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let mine = |o: &Occupant| crate::session_status::is_client(&o.client, fp);
+        let on = Some(vec![Occupant {
+            client: fp[..12].into(),
+            name: None,
+        }]);
+        let mut seats = BTreeMap::new();
+        seats.insert("seat-1".to_string(), Some(vec![]));
+        assert_eq!(seen_on(&seats, mine), Some(false), "every seat answered");
+        seats.insert("seat-2".to_string(), None);
+        assert_eq!(seen_on(&seats, mine), None, "seat-2 may have it");
+        seats.insert("seat-1".to_string(), on);
+        assert_eq!(seen_on(&seats, mine), Some(true), "seen on seat-1");
     }
 }

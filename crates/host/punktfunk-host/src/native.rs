@@ -1754,21 +1754,32 @@ const SEAT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 /// picture up before it lists the session.
 const SEAT_LANDING: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long the seats may stay silent before they no longer hold a guest: a seat host that
+/// hangs is not serving anyone.
+const SEAT_SILENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A guest on a "this session" record plays on a seat after the redirect ended the door's own
 /// session. Holds the count until it has played there and left, so the record outlasts the
 /// play and not the redirect. The grace after the last count is the usual one.
 fn hold_while_on_seat(session: crate::native_pairing::SessionCountGuard, fp: String) {
     tokio::spawn(async move {
         let started = std::time::Instant::now();
+        let mut heard = started;
         let mut landed = false;
         loop {
             tokio::time::sleep(SEAT_POLL).await;
             let fp = fp.clone();
-            let here = tokio::task::spawn_blocking(move || crate::seats::plays_on_a_seat(&fp))
+            let asked = tokio::task::spawn_blocking(move || crate::seats::plays_on_a_seat(&fp));
+            let here = tokio::time::timeout(SEAT_SILENCE, asked)
                 .await
-                .unwrap_or(false);
-            landed |= here;
-            if hold_over(here, landed, started.elapsed()) {
+                .ok()
+                .and_then(Result::ok)
+                .flatten();
+            if let Some(here) = here {
+                heard = std::time::Instant::now();
+                landed |= here;
+            }
+            if hold_over(here, landed, started.elapsed(), heard.elapsed()) {
                 break;
             }
         }
@@ -1776,9 +1787,18 @@ fn hold_while_on_seat(session: crate::native_pairing::SessionCountGuard, fp: Str
     });
 }
 
-/// A redirected guest's hold ends once it is off the seat after playing there, or never came.
-fn hold_over(here: bool, landed: bool, waited: std::time::Duration) -> bool {
-    !here && (landed || waited > SEAT_LANDING)
+/// A redirected guest's hold ends once it is off the seat after playing there, or never came,
+/// or no seat has said anything for [`SEAT_SILENCE`]. `here` is `None` when a seat can't say.
+fn hold_over(
+    here: Option<bool>,
+    landed: bool,
+    waited: std::time::Duration,
+    silent: std::time::Duration,
+) -> bool {
+    match here {
+        Some(here) => !here && (landed || waited > SEAT_LANDING),
+        None => silent > SEAT_SILENCE,
+    }
 }
 
 /// The input thread, and the datagram reader that feeds it client input, mic frames and the
