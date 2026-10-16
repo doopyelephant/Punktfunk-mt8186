@@ -16,6 +16,7 @@ use crate::windows::util::{
     backend_error, computer_name, io_error, require_local_system, status_error, wide, WinResult,
 };
 use rand::Rng as _;
+use std::time::{Duration, Instant};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_ALIAS_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_MEMBER_IN_ALIAS,
@@ -141,7 +142,7 @@ impl AccountManager {
             None => self.credentials.delete(&seat.id),
             Some(comment) if comment == marker(&seat.id) => {
                 if let Some(sid) = sid_string(&seat.account) {
-                    delete_profile(&sid);
+                    delete_profile(&seat.account, &sid);
                 }
                 delete_account(&seat.account)?;
                 self.credentials.delete(&seat.id)
@@ -383,19 +384,31 @@ fn join_seats_group(account: &str) -> WinResult<()> {
     add_member(SEATS_GROUP, account)
 }
 
-/// Removes the profile of the account `sid` names, and the seat's Steam copy inside it, as
-/// `userdel -r` takes a Linux seat's home. A failure is logged: the account goes regardless.
-fn delete_profile(sid: &str) {
+/// How long a profile gets to unload its hive after the logoff before its delete gives up.
+const PROFILE_UNLOAD: Duration = Duration::from_secs(5);
+
+/// Removes the profile of `account`, which `sid` names, and the seat's Steam copy inside it, as
+/// `userdel -r` takes a Linux seat's home. The delete retries while the hive unloads. A failure
+/// is logged and the account goes regardless.
+fn delete_profile(account: &str, sid: &str) {
     let Ok(sid_w) = wide(sid, "account sid") else {
         return;
     };
-    // SAFETY: `sid_w` is a live NUL-terminated string; null path and computer name this machine.
-    let deleted = unsafe { DeleteProfileW(PCWSTR(sid_w.as_ptr()), PCWSTR::null(), PCWSTR::null()) };
-    match deleted {
-        Ok(()) => {}
-        // An account that never logged on has no profile.
-        Err(error) if error.code() == ERROR_FILE_NOT_FOUND.to_hresult() => {}
-        Err(error) => tracing::warn!(%error, "seat profile not deleted"),
+    let give_up = Instant::now() + PROFILE_UNLOAD;
+    loop {
+        // SAFETY: `sid_w` is a live NUL-terminated string; null path and computer name this machine.
+        let deleted =
+            unsafe { DeleteProfileW(PCWSTR(sid_w.as_ptr()), PCWSTR::null(), PCWSTR::null()) };
+        match deleted {
+            Ok(()) => return,
+            // An account that never logged on has no profile.
+            Err(error) if error.code() == ERROR_FILE_NOT_FOUND.to_hresult() => return,
+            Err(error) if Instant::now() >= give_up => {
+                tracing::warn!(%error, account, "seat profile not deleted");
+                return;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(250)),
+        }
     }
 }
 
