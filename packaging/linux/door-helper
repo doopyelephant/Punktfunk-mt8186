@@ -10,7 +10,9 @@
 # a command: the user must be an ordinary account in that group. `ports` is
 # punktfunk-door.service's ExecStartPre.
 #
-# Both directions are idempotent, and a run that stopped halfway converges on the next. The one
+# Both directions are idempotent, and a run that stopped halfway converges on the next. A first
+# `on` that fails before the box's ports move puts the box back, and an `off` that can't hand the
+# files home starts the door again, so neither leaves the box without a host or a console. The one
 # record of "on, and for whom" is $STATE/owner, which only root writes: `on` refuses while it names
 # someone else, and `off` runs only for the user it names. The box's files move once: `on` copies
 # the user's into /var/lib/punktfunk and marks that in $STATE/door-on, so a repeat never overwrites
@@ -168,7 +170,23 @@ wait_for_socket() {
     die "the seat supervisor did not start"
 }
 
+# A first `on` that fails puts the box back as it was: no record, mark or owner row, and the
+# supervisor off unless it was on already. The user's own files were only copied.
+undo_on() {
+    echo "door-helper: couldn't switch the door on, putting the box back" >&2
+    if systemctl is-active --quiet punktfunk-seats.service; then
+        row=$(owner_row || true)
+        [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null || true
+    fi
+    rm -f "$MARK" "$RECORD" "/run/punktfunk/seats/$user.env"
+    [ "$seats_were_up" = 1 ] || systemctl disable --now punktfunk-seats.service || true
+}
+
 door_on() {
+    fresh=0
+    [ -n "$recorded" ] || fresh=1
+    seats_were_up=0
+    if systemctl is-active --quiet punktfunk-seats.service; then seats_were_up=1; fi
     getent group punktfunk >/dev/null || groupadd --system punktfunk
     if ! getent passwd punktfunk >/dev/null; then
         shell=$(command -v nologin || echo /usr/sbin/nologin)
@@ -180,6 +198,7 @@ door_on() {
     usermod -aG punktfunk-games "$user"
     install -d -m 0711 -o root -g root "$STATE"
     legacy_mark
+    [ "$fresh" = 0 ] || trap undo_on EXIT
     printf '%s\n' "$user" >"$RECORD.tmp"
     chmod 0600 "$RECORD.tmp"
     mv -f "$RECORD.tmp" "$RECORD"
@@ -192,11 +211,12 @@ door_on() {
     systemctl enable --now punktfunk-seats.service
     wait_for_socket
     "$SEATS" adopt-owner "$user" >/dev/null
+    systemctl enable punktfunk-door.service punktfunk-web-door.service
+    trap - EXIT
     # The box's ports are the door's from here, so the user's console and host leave them first.
     # The host restarts on the owner row's contract: its own ports, and the box's identity.
     user_ctl stop punktfunk-web.service || true
     user_ctl try-restart punktfunk-host.service || true
-    systemctl enable punktfunk-door.service punktfunk-web-door.service
     systemctl restart punktfunk-door.service punktfunk-web-door.service
     echo "door on for $user"
 }
@@ -206,30 +226,44 @@ owner_row() {
     "$SEATS" list | awk '$6 == "owner=true" { print $1; exit }'
 }
 
+# The door stopped to hand its files home and they didn't arrive: it comes back as it was.
+restore_door() {
+    echo "door-helper: couldn't hand the door's files back, starting the door again" >&2
+    systemctl start --no-block punktfunk-door.service punktfunk-web-door.service || true
+}
+
 door_off() {
     systemctl stop punktfunk-web-door.service punktfunk-door.service || true
     legacy_mark
     if [ -e "$MARK" ]; then
+        trap restore_door EXIT
         for f in $FILES; do [ "$f" = web-password ] || give "$f"; done
         give_password
         give_avatars
+        trap - EXIT
+        # The files are home. A repeat must not copy the door's stale ones over the user's.
+        rm -f "$MARK"
     fi
+    # From here only forward: each step is tried, and the record stays until all of them held.
+    problems=0
     if systemctl is-active --quiet punktfunk-seats.service; then
         # Seats the door placed stop with it; their accounts and profiles stay for the next time.
         "$SEATS" list | awk '$2 == "Running" || $2 == "Starting" { print $1 }' | while read -r id; do
             "$SEATS" stop "$id" >/dev/null || true
         done
-        row=$(owner_row)
-        [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null
+        row=$(owner_row || true)
+        [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null || problems=1
     fi
     # A stopped supervisor leaves the owner's contract behind, and their host and console read it.
-    rm -f "/run/punktfunk/seats/$user.env" "$MARK" "$RECORD"
-    systemctl disable --now punktfunk-web-door.service punktfunk-door.service punktfunk-seats.service
+    rm -f "/run/punktfunk/seats/$user.env"
+    systemctl disable --now punktfunk-web-door.service punktfunk-door.service punktfunk-seats.service || problems=1
     user_ctl try-restart punktfunk-host.service || true
     # Their console comes back only if it was theirs to begin with.
     if user_ctl is-enabled --quiet punktfunk-web.service; then
         user_ctl start punktfunk-web.service || true
     fi
+    [ "$problems" = 0 ] || die "cleanup after switching off $user failed, switch it off again"
+    rm -f "$RECORD"
     echo "door off for $user"
 }
 
