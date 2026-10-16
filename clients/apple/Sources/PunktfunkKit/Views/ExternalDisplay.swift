@@ -1,9 +1,10 @@
 // An attached monitor as its own full-screen stream surface (iOS).
 //
-// iOS gives a USB-C or AirPlay monitor a non-interactive scene. While that scene holds no window,
-// iOS mirrors the phone into it: letterboxed to the phone's aspect, at the phone's refresh. A
-// session puts its picture there instead (StreamViewController), so the stream fills the monitor
-// at the monitor's own size and rate. Touch, the HUD and the ring stay on the phone.
+// iOS gives a USB-C or AirPlay monitor a non-interactive scene: before iOS 27 through the app
+// delegate, from iOS 27 only while a stream registers its scene accessory. While that scene holds
+// no window, iOS mirrors the phone into it, letterboxed. A session puts its picture there instead
+// (StreamViewController), at the monitor's own size and rate. Touch, the HUD and the ring stay on
+// the phone.
 
 #if os(iOS)
 import AVFoundation

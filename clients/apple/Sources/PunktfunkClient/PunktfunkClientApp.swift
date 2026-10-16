@@ -134,8 +134,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 #elseif os(iOS)
 final class AppDelegate: NSObject, UIApplicationDelegate {
-    /// An attached monitor's scene goes to `ExternalDisplaySceneDelegate`, so a stream can fill it
-    /// instead of the letterboxed mirror. Every other scene stays SwiftUI's.
+    /// Before iOS 27 an attached monitor's scene arrives here and goes to
+    /// `ExternalDisplaySceneDelegate`, so a stream can fill it instead of the letterboxed mirror.
+    /// iOS 27 offers it only to the stream's scene accessory. Every other scene stays SwiftUI's.
     func application(
         _ application: UIApplication,
         configurationForConnecting session: UISceneSession,
