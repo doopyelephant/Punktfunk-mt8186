@@ -8,7 +8,9 @@
 //! A cycle is one keeper and its session: sign in, pass the display gate, start the host,
 //! watch both. The gate is owed once per seat start. A host that exits starts again in the
 //! same session. A fault ends the cycle, and the next one signs in again unless the fault is
-//! permanent ([`Code::permanent`]) or a stop was asked.
+//! permanent ([`Code::permanent`]) or a stop was asked. The wait before it grows with each
+//! cycle in a row: one that ended after its session was active counts apart from one that
+//! never signed in.
 //!
 //! A [`BackendError`]'s code is a string on the wire. [`Fault::from`] is the one place it is
 //! compared: the retry rule and the console's sentence match on [`Code`].
@@ -31,14 +33,26 @@ const HOST_READY_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const START_TIMEOUT: Duration = Duration::from_secs(180);
 const FIRST_RESTART_DELAY: Duration = Duration::from_secs(1);
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(30);
-/// The wait before a seat's next cycle, and before its host starts again in one. A host that
-/// served a minute clears it, as the web console's run does.
+/// The wait before a seat's next cycle when no session was active, and before its host starts
+/// again in one. A host that served a minute clears it, as the web console's run does.
 const RESTART: Backoff = Backoff::new(
     Curve::Doubling {
         first: FIRST_RESTART_DELAY,
         cap: MAX_RESTART_DELAY,
     },
     Reset::AfterRun(Duration::from_secs(60)),
+);
+/// The longest wait after a session ended, and the session that clears the wait.
+const MAX_SESSION_RESTART_DELAY: Duration = Duration::from_secs(120);
+/// The wait before the next cycle once a session was active. A player ends their own session
+/// at will, and each end and each sign-in disturbs the other seats' displays: the wait doubles
+/// to two minutes, and only a session that lasted that long starts it over.
+const SESSION_RESTART: Backoff = Backoff::new(
+    Curve::Doubling {
+        first: FIRST_RESTART_DELAY,
+        cap: MAX_SESSION_RESTART_DELAY,
+    },
+    Reset::AfterRun(MAX_SESSION_RESTART_DELAY),
 );
 
 /// How long the worker sleeps between two looks of one kind.
@@ -346,8 +360,10 @@ pub(crate) struct State {
     answer: Option<Result<(), BackendError>>,
     stop: Option<Stop>,
     gate: Gate,
-    /// Failed cycles, for the wait before the next one.
+    /// Cycles that failed before a session was active, for the wait before the next one.
     restart: Backoff,
+    /// Cycles that ended after a session was active.
+    session_restart: Backoff,
     /// Host exits in this cycle, for the wait before the host starts again.
     host_restart: Backoff,
 }
@@ -364,6 +380,7 @@ impl State {
             stop: None,
             gate: Gate::Owed { failures: 0 },
             restart: RESTART,
+            session_restart: SESSION_RESTART,
             host_restart: RESTART,
         }
     }
@@ -499,6 +516,7 @@ impl State {
                 "RDP keeper exited before its WTS session became active",
             )
         } else if let Some(id) = probe.session {
+            self.restart.reset();
             self.session = Some(id);
             self.phase = Phase::Entering;
             vec![Action::EnterSession(id)]
@@ -572,7 +590,7 @@ impl State {
         } else if probe.ready {
             self.status = RuntimeStatus::running();
             self.answer = Some(Ok(()));
-            self.restart.started(now);
+            self.session_restart.started(now);
             self.host_restart.started(now);
             self.phase = Phase::Running;
             Vec::new()
@@ -662,7 +680,7 @@ impl State {
 
     /// The cycle is torn down: rest before another one, or finish.
     fn ended(&mut self, fault: Option<Fault>, now: Instant) -> Vec<Action> {
-        self.session = None;
+        let entered = self.session.take().is_some();
         let Some(fault) = fault else {
             return self.finish();
         };
@@ -689,8 +707,13 @@ impl State {
             self.answer = Some(Err(fault.error));
         }
         if retry {
+            let wait = if entered {
+                self.session_restart.failed(now)
+            } else {
+                self.restart.failed(now)
+            };
             self.phase = Phase::Resting {
-                until: Some(now + self.restart.failed(now)),
+                until: Some(now + wait),
             };
         } else {
             actions.extend(self.finish());
@@ -995,6 +1018,7 @@ mod tests {
         assert_eq!(START_TIMEOUT, Duration::from_secs(180));
         assert_eq!(FIRST_RESTART_DELAY, Duration::from_secs(1));
         assert_eq!(MAX_RESTART_DELAY, Duration::from_secs(30));
+        assert_eq!(MAX_SESSION_RESTART_DELAY, Duration::from_secs(120));
         let polls = [SESSION_POLL, GATE_POLL, READY_POLL, WATCH_POLL, DELAY_POLL];
         assert_eq!(
             polls.map(|poll| poll.as_millis()),
@@ -1197,14 +1221,17 @@ mod tests {
     }
 
     #[test]
-    fn both_delays_are_told_when_the_host_comes_up() {
+    fn the_session_and_host_delays_are_told_when_the_host_comes_up() {
         let mut bench = bench(At::Readying);
         let up = bench.later(Duration::from_secs(3)).now;
         assert_eq!(bench.see(READY), []);
-        let mut told = RESTART;
-        told.started(up);
-        assert_eq!(bench.state.restart, told);
-        assert_eq!(bench.state.host_restart, told);
+        let mut session = SESSION_RESTART;
+        session.started(up);
+        let mut host = RESTART;
+        host.started(up);
+        assert_eq!(bench.state.session_restart, session);
+        assert_eq!(bench.state.host_restart, host);
+        assert_eq!(bench.state.restart, RESTART);
     }
 
     #[test]
@@ -1311,31 +1338,52 @@ mod tests {
     }
 
     #[test]
-    fn the_cycle_delay_doubles_to_its_cap_until_a_host_serves_a_minute() {
+    fn the_cycle_delay_doubles_to_its_cap_until_a_session_is_active() {
         let mut bench = bench(At::SigningIn);
-        for secs in [1, 2, 4] {
+        for secs in [1, 2, 4, 8, 16, 30, 30] {
             assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
             bench.see(NOTHING);
             bench.rests(Duration::from_secs(secs));
         }
-        // A cycle whose host served less than a minute counts as a failure in a row.
-        for (_, probe, actions) in road().into_iter().skip(1) {
-            assert_eq!(bench.see(probe), actions);
-        }
-        bench.later(Duration::from_secs(59));
-        for secs in [8, 16, 30, 30] {
-            assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
-            bench.see(NOTHING);
-            bench.rests(Duration::from_secs(secs));
-        }
-        // One whose host served a minute starts the doubling over.
+        // A session that comes up starts the doubling over for the cycles that fail before one.
         assert_eq!(bench.see(SESSION), [Action::EnterSession(7)]);
-        assert_eq!(bench.see(NOTHING), start_host());
-        assert_eq!(bench.see(READY), []);
-        bench.later(Duration::from_secs(60));
+        let check = vec![Action::Announce(Stage::Display, 1), Action::StartGate];
+        assert_eq!(bench.see(NOTHING), check);
         assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
         bench.see(NOTHING);
         bench.rests(Duration::from_secs(1));
+        assert_eq!(bench.see(keeper(1)), [Action::EndCycle]);
+        bench.see(NOTHING);
+        bench.rests(Duration::from_secs(1));
+    }
+
+    /// A player can end their own session at will, so the seat waits longer after each one that
+    /// ends young: the first restart is not slowed, a session of two minutes starts over.
+    #[test]
+    fn a_session_that_ends_young_makes_the_next_cycle_wait_longer() {
+        let mut bench = bench(At::Running);
+        // How long the session lasted, and the wait after it.
+        let ends = [
+            (59, 1),
+            (59, 2),
+            (59, 4),
+            (59, 8),
+            (59, 16),
+            (59, 32),
+            (59, 64),
+            (59, 120),
+            (59, 120),
+            (120, 1),
+        ];
+        for (lasted, secs) in ends {
+            bench.later(Duration::from_secs(lasted));
+            assert_eq!(bench.see(keeper(1)), [Action::EndCycle], "{lasted} {secs}");
+            bench.see(NOTHING);
+            bench.rests(Duration::from_secs(secs));
+            assert_eq!(bench.see(SESSION), [Action::EnterSession(7)]);
+            assert_eq!(bench.see(NOTHING), start_host());
+            assert_eq!(bench.see(READY), []);
+        }
     }
 
     #[test]
