@@ -158,6 +158,9 @@ public final class StreamViewController: StreamViewControllerBase {
         view.onLayout = { [weak self] in self?.layoutMetalLayer() }
         return view
     }()
+    /// The session's monitor accessory (`UISceneAccessoryRegistration`, iOS 27+). From iOS 27 the
+    /// monitor's scene connects only while one is registered.
+    private var monitorAccessory: AnyObject?
     /// This screen's native mode at the last layout pass, and the request a change of it queued.
     private var lastNativeMode: (width: Int, height: Int, hz: Int)?
     private var screenModeWork: DispatchWorkItem?
@@ -558,6 +561,14 @@ public final class StreamViewController: StreamViewControllerBase {
         // A monitor attached before the session starts shows the picture from the first frame.
         onExternal = ExternalDisplay.shared.screen != nil
         if onExternal { ExternalDisplay.shared.show(externalVideo) }
+        // iOS 27 connects the monitor's scene only for this; `routeVideo` takes it when it lands.
+        if #available(iOS 27, *) {
+            let config = UISceneConfiguration(
+                name: nil, sessionRole: .windowExternalDisplayNonInteractive)
+            config.delegateClass = ExternalDisplaySceneDelegate.self
+            let accessory = UISceneAccessory.externalNonInteractive(sceneConfiguration: config)
+            monitorAccessory = registerSceneAccessory(accessory)
+        }
         #endif
 
         // Presenter choice + lifecycle live in SessionPresenter (shared with macOS): stage-2
@@ -745,6 +756,10 @@ public final class StreamViewController: StreamViewControllerBase {
             ExternalDisplay.shared.hide(externalVideo) // the monitor mirrors the phone again
             onExternal = false
         }
+        if #available(iOS 27, *), let accessory = monitorAccessory as? UISceneAccessoryRegistration {
+            unregisterSceneAccessory(accessory)
+        }
+        monitorAccessory = nil
         #endif
         #if os(tvOS)
         inputCapture?.stop()
