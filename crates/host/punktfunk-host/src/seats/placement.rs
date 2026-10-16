@@ -49,11 +49,17 @@ pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Place
     if plays_here(pf_paths::seat::role(), own_row) {
         return Placement::Here;
     }
-    let snap = super::snapshot();
+    // The ledger and the profile's own seat host: a hung host of another seat costs this
+    // connect nothing.
+    let snap = super::ledger();
     let Some(seat_id) = snap.row_of(&profile.os_account) else {
         return Placement::Refuse(RejectReason::SeatUnavailable);
     };
-    let occupants = snap.occupants.get(seat_id).map_or(&[][..], Vec::as_slice);
+    let occupants = snap
+        .seat(seat_id)
+        .filter(|(seat, _)| seat.runtime.state == RuntimeState::Running)
+        .and_then(|(seat, _)| super::occupants(seat))
+        .unwrap_or_default();
     let mut held = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
     held.retain(|_, (_, until)| *until > Instant::now());
     let held_by = held.get(seat_id).map(|(fp, _)| fp.as_str());
@@ -62,7 +68,7 @@ pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Place
         asker,
         snap.on,
         snap.seat(seat_id),
-        occupants,
+        &occupants,
         held_by,
     );
     if let (Placement::Redirect(_), Some(fp)) = (&placed, asker.fp) {
