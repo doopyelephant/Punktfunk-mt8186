@@ -259,38 +259,44 @@ pub(super) struct EncDerive {
     pub(super) audio_kbps: u32,
     pub(super) shard_payload: u16,
     pub(super) fec_percent: u8,
-    /// PyroWave: pin is an encoder rate; both directions are identity.
-    pub(super) identity: bool,
+    /// PyroWave at this refresh rate: parity rides the frame's head only
+    /// ([`pyrowave_parity_pct`]). `None`: every block carries `fec_percent`.
+    pub(super) head_only_hz: Option<u32>,
 }
 
 impl EncDerive {
-    /// [`encoder_bps_for_budget`] in kbps, over sealed shards.
-    pub(super) fn enc_kbps(&self, budget_kbps: u32) -> u32 {
-        if self.identity {
-            budget_kbps
-        } else {
-            let bps = encoder_bps_for_budget(
+    /// The share of the wire parity takes at `budget_kbps`, as the budget prices it.
+    fn parity_pct(&self, budget_kbps: u32) -> u8 {
+        match self.head_only_hz {
+            None => self.fec_percent,
+            Some(hz) => pyrowave_parity_pct(
                 budget_kbps,
                 self.audio_kbps,
+                self.shard_payload,
+                hz,
                 self.fec_percent,
-                self.shard_payload.into(),
-                WireFraming::Shards,
-            );
-            (bps / 1000) as u32
+            ),
         }
     }
 
+    /// [`encoder_bps_for_budget`] in kbps, over sealed shards.
+    pub(super) fn enc_kbps(&self, budget_kbps: u32) -> u32 {
+        let bps = encoder_bps_for_budget(
+            budget_kbps,
+            self.audio_kbps,
+            self.parity_pct(budget_kbps),
+            self.shard_payload.into(),
+            WireFraming::Shards,
+        );
+        (bps / 1000) as u32
+    }
+
+    /// The budget an encoder rate spends. Parity is priced at the budget the rate alone
+    /// would need; it is a few percent, so that is the budget it lands in.
     pub(super) fn budget_kbps(&self, encoder_kbps: u32) -> u32 {
-        if self.identity {
-            encoder_kbps
-        } else {
-            budget_kbps_for_encoder(
-                encoder_kbps,
-                self.audio_kbps,
-                self.fec_percent,
-                self.shard_payload,
-            )
-        }
+        let at =
+            |pct| budget_kbps_for_encoder(encoder_kbps, self.audio_kbps, pct, self.shard_payload);
+        at(self.parity_pct(at(0)))
     }
 
     /// Read-back in the request's truncated terms. The roundtrip deflates, so a read-back
@@ -308,6 +314,35 @@ impl EncDerive {
             b
         }
     }
+}
+
+/// The share of a PyroWave frame its parity takes, as a percent of the frame: the head's parity
+/// over the frame's wire shards. The head is sized at 15 % of the frame, the most level 4 measured
+/// on game frames; its parity is `fec_percent` of that, never under
+/// [`HEAD_MIN_RECOVERY_SHARDS`](punktfunk_core::packet::HEAD_MIN_RECOVERY_SHARDS).
+fn pyrowave_parity_pct(
+    budget_kbps: u32,
+    audio_kbps: u32,
+    shard_payload: u16,
+    hz: u32,
+    fec_percent: u8,
+) -> u8 {
+    if fec_percent == 0 {
+        return 0;
+    }
+    let shards = punktfunk_core::abr::budget::wire_shards_per_frame(
+        punktfunk_core::abr::budget::FrameBudget {
+            budget_kbps,
+            audio_kbps,
+            shard_payload,
+            fps: hz,
+        },
+    );
+    let head = (shards * 15).div_ceil(100);
+    let parity = (head * u32::from(fec_percent))
+        .div_ceil(100)
+        .max(punktfunk_core::packet::HEAD_MIN_RECOVERY_SHARDS as u32);
+    (parity * 100).div_ceil(shards).min(100) as u8
 }
 
 /// Audio reservation from the resolved Welcome: PCM cost, else the same
@@ -493,7 +528,7 @@ mod tests {
             audio_kbps: 576,
             shard_payload: 1408,
             fec_percent: 8,
-            identity: false,
+            head_only_hz: None,
         };
         for budget in [2349u32, 4799, 6857, 9798, 14000, 20000, 940_032] {
             let asked_enc = ed.enc_kbps(budget);
@@ -798,7 +833,7 @@ mod tests {
             audio_kbps: 512,
             shard_payload: 1408,
             fec_percent: 10,
-            identity: false,
+            head_only_hz: None,
         };
         let bps = encoder_bps_for_budget(20_000, 512, 10, 1408, WireFraming::Shards);
         assert_eq!(
@@ -821,18 +856,34 @@ mod tests {
         }
     }
 
-    /// PyroWave's wire budget is its encoder rate, so a granted ask reaches the encoder's
-    /// in-place retarget as asked, and the read-back is the ask.
+    /// PyroWave's pin is its wire budget: the encoder gets it less seal, audio and the head's
+    /// parity, a few percent where a percent on every block took 5–10. The read-back of a full
+    /// apply is the ask.
     #[test]
-    fn a_pyrowave_retarget_reaches_the_encoder_as_asked() {
-        let ed = EncDerive {
+    fn a_pyrowave_pin_prices_only_its_head_parity() {
+        let at = |fec_percent, hz| EncDerive {
             audio_kbps: 512,
             shard_payload: 1408,
-            fec_percent: 20,
-            identity: true,
+            fec_percent,
+            head_only_hz: Some(hz),
         };
-        assert_eq!(ed.enc_kbps(1_200_000), 1_200_000);
-        assert_eq!(ed.applied_budget_kbps(1_200_000, 1_200_000), 1_200_000);
+        // 4K60 at 1.6 bpp: 1126 wire shards a frame, a 169-shard head, 9 parity at 5 %.
+        let pin = 796_262;
+        let enc = at(5, 60).enc_kbps(pin);
+        let seal_only = u64::from(pin - 512) * 1408 / 1472;
+        assert!(enc as u64 * 100 >= seal_only * 99, "{enc} vs {seal_only}");
+        assert!(at(10, 60).enc_kbps(pin) < enc, "more parity, less encoder");
+        assert!(at(0, 60).enc_kbps(pin) as u64 >= seal_only);
+        // 720p60 at 1.6 bpp is 124 shards: the four-shard floor prices as 4 %.
+        assert_eq!(pyrowave_parity_pct(88_473, 512, 1408, 60, 5), 4);
+        assert_eq!(pyrowave_parity_pct(pin, 512, 1408, 60, 5), 1);
+        assert_eq!(pyrowave_parity_pct(pin, 512, 1408, 60, 50), 8);
+        for (fec, hz) in [(5, 60), (10, 120), (25, 60)] {
+            let ed = at(fec, hz);
+            let asked = ed.enc_kbps(pin);
+            assert!(ed.budget_kbps(asked) <= pin, "a roundtrip never inflates");
+            assert_eq!(ed.applied_budget_kbps(pin, asked), pin);
+        }
     }
 
     /// An RFI ask prices the report window it lands in. A report a window late closes a

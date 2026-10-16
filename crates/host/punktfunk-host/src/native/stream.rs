@@ -512,7 +512,7 @@ pub(crate) struct StreamCommon {
     pub(crate) counters: Arc<crate::session_status::SessionCounters>,
     pub(crate) ends: super::wiring::StreamEnds,
     pub(crate) shared: super::wiring::SessionShared,
-    /// Total wire budget (kbps): video + FEC + framing + audio reservation. PyroWave is identity.
+    /// Total wire budget (kbps): video + FEC + framing + audio reservation, PyroWave's pin too.
     pub(crate) bitrate_kbps: u32,
     pub(crate) audio_reserved_kbps: u32,
     pub(crate) shard_payload: u16,

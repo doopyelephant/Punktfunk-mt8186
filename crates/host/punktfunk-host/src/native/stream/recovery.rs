@@ -10,8 +10,8 @@ use super::*;
 impl StreamState {
     /// Apply adaptive FEC behind the encoder rate it implies.
     ///
-    /// A budget-identity codec, or a move that leaves the encoder rate where
-    /// it is, publishes at once. A synchronous encoder publishes when it
+    /// A move that leaves the encoder rate where it is publishes at once (on
+    /// PyroWave most do: its parity is the head's). A synchronous encoder publishes when it
     /// accepts; an asynchronous one is asked, and the parity waits in
     /// `fec.pending` until the encoder has settled no higher than the rate the
     /// parity leaves room for. A newer proposal or a moved budget asks again. A
@@ -43,7 +43,7 @@ impl StreamState {
         }
         let prev = self.enc_derive(self.fec.last).enc_kbps(self.bitrate_kbps);
         let want = self.enc_derive(requested).enc_kbps(self.bitrate_kbps);
-        if self.budget_identity || want == prev {
+        if want == prev {
             publish_fec(&self.fec.target, &mut self.fec.last, requested);
             return;
         }

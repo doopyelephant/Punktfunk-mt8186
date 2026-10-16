@@ -453,7 +453,7 @@ mod tests {
             bit_depth: 8,
             audio_reserved_kbps: 0,
             shard_payload: 1200,
-            budget_identity: false,
+            pyrowave: false,
             streamed_wire: false,
             perf: false,
             vd_params: crate::vdisplay::SessionParams {

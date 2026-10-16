@@ -610,7 +610,8 @@ pub(super) async fn negotiate(
                     audio_kbps: audio_reserved_kbps(&welcome),
                     shard_payload: welcome.shard_payload,
                     fec_percent: welcome.fec.fec_percent,
-                    identity: codec == crate::encode::Codec::PyroWave,
+                    head_only_hz: (codec == crate::encode::Codec::PyroWave)
+                        .then_some(welcome.mode.refresh_hz),
                 },
                 chroma,
                 codec,
