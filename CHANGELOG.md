@@ -16,7 +16,7 @@ short; the version-bump commit retitles it. Older sections stay as they are.
 
 ## v0.44.1
 
-29 commits since v0.44.0. ALPN `pkf2`, C ABI 55 and driver protocol floor 9 stay. Linux Own Steam
+31 commits since v0.44.0. ALPN `pkf2`, C ABI 55 and driver protocol floor 9 stay. Linux Own Steam
 profiles are retired; the API drops the `steam` seat kind and `POST /profiles` drops `desktop`.
 Deep dive: `git log v0.44.0..v0.44.1`
 
