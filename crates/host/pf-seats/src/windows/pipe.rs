@@ -118,12 +118,13 @@ pub fn wake(name: &str) {
         .open(name);
 }
 
-/// How long `command` may take to answer. A read is quick, a start waits on a seat, and
+/// How long `command` may take to answer. A read of the ledger is quick. The role query behind
+/// `Seating` and `Doctor` takes about a minute after a restart, a start waits on a seat, and
 /// turning seats on with `prepare` installs a Windows role.
 fn answer_within(command: &crate::ipc::Command) -> Duration {
     use crate::ipc::Command;
     match command {
-        Command::List | Command::Seating | Command::Doctor => Duration::from_secs(60),
+        Command::List => Duration::from_secs(60),
         Command::Enable { prepare: true, .. } => Duration::from_secs(30 * 60),
         _ => Duration::from_secs(5 * 60),
     }
@@ -412,7 +413,8 @@ mod tests {
         let id = SeatId::parse("0123456789abcdef0123456789abcdef").unwrap();
         let waits = [
             (Command::List, 60),
-            (Command::Doctor, 60),
+            (Command::Seating, 300),
+            (Command::Doctor, 300),
             (Command::Start { id }, 300),
             (
                 Command::Enable {

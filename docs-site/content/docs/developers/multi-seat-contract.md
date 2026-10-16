@@ -18,7 +18,9 @@ host restart leaves them running; stopping the service logs every seat account o
 - **The pipe.** `\\.\pipe\punktfunk-seats` admits SYSTEM and Administrators only and refuses
   remote clients. Each connection carries one request: a four-byte big-endian length, then JSON,
   64 KiB at most. Commands are `list`, `create`, `start`, `stop`, `delete`, `doctor`, `seating`,
-  `enable` and `disable`.
+  `enable` and `disable`. The console host talks only to a pipe that LocalSystem serves, since the
+  name is free while the service is down. It gives up on an answer after 60 seconds for `list`, 30
+  minutes for `enable` when it installs the role, and 5 minutes for the rest.
 - **The keeper.** `punktfunk-seat-keeper.exe`, beside `punktfunk-host.exe`, holds one seat's
   loopback RDP session open. The supervisor hands it the seat's credentials on stdin, never on the
   command line. Run `punktfunk-seat-keeper trust` from an elevated prompt once, before the first
