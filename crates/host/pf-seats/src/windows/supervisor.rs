@@ -204,7 +204,7 @@ impl Supervisor {
             .get(&key)
             .cloned();
         let Some(runtime) = runtime else {
-            wts::logoff_account_if_present(&seat.account)?;
+            self.logoff_owned(seat)?;
             return Ok(RuntimeStatus::stopped());
         };
         runtime.step(Observation::Stop);
@@ -250,6 +250,13 @@ impl Supervisor {
             super::steam::restore_registration();
         }
         Ok(RuntimeStatus::stopped())
+    }
+
+    /// Logs off `seat`'s account for a caller that holds no runtime of it, so nothing here
+    /// proved the account is the seat's. A stranger's account of that name keeps its sessions.
+    fn logoff_owned(&self, seat: &Seat) -> WinResult<()> {
+        self.accounts.ensure_owned_or_absent(seat)?;
+        wts::logoff_account_if_present(&seat.account)
     }
 
     pub(super) fn status(&self, seat: &Seat) -> RuntimeSnapshot {
@@ -672,4 +679,86 @@ fn check_ports_free(seat: &Seat) -> WinResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::SeatId;
+    use crate::windows::credentials::CredentialStore;
+    use crate::windows::util;
+    use std::path::Path;
+
+    fn seat(account: &str) -> Seat {
+        Seat {
+            id: SeatId::random(),
+            name: "test".into(),
+            account: account.into(),
+            display_slot: 12,
+            native_port: 9779,
+            mgmt_port: 47995,
+            autostart: false,
+            runtime: RuntimeStatus::stopped(),
+            owner: false,
+            fingerprint: None,
+        }
+    }
+
+    fn supervisor(dir: &Path) -> Supervisor {
+        let root = SecretRoot::open(dir).unwrap();
+        let accounts = AccountManager::new(CredentialStore::new(root.clone()));
+        Supervisor::new(
+            root,
+            accounts,
+            PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+        )
+    }
+
+    /// A local account no seat made, removed when dropped.
+    struct Stranger(String);
+
+    impl Stranger {
+        fn add(name: &str) -> Self {
+            // Fourteen characters: a longer password makes `net user` ask a question.
+            let mut random = [0_u8; 5];
+            rand::rng().fill_bytes(&mut random);
+            let password = format!("Aa1!{}", hex::encode(random));
+            let added = std::process::Command::new(pf_paths::system32("net.exe"))
+                .args(["user", name, &password, "/add", "/comment:not a seat"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                added.status.success(),
+                "net user /add: {}",
+                String::from_utf8_lossy(&added.stdout)
+            );
+            Self(name.into())
+        }
+    }
+
+    impl Drop for Stranger {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(pf_paths::system32("net.exe"))
+                .args(["user", &self.0, "/delete"])
+                .output();
+        }
+    }
+
+    /// A stop with no runtime logs off only an account that is the seat's or is not there.
+    /// It needs LocalSystem to make an account, so it runs nowhere else.
+    #[test]
+    fn a_stop_leaves_a_strangers_account_alone() {
+        if !util::is_local_system().unwrap_or(false) {
+            eprintln!("skipped: not LocalSystem");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(temp.path());
+        let name = format!("pfs{}", std::process::id());
+        let _stranger = Stranger::add(&name);
+        let refused = supervisor.stop(&seat(&name)).unwrap_err();
+        assert_eq!(refused.code, "account_not_owned");
+        assert!(supervisor.stop(&seat("pfs-absent")).is_ok());
+    }
 }

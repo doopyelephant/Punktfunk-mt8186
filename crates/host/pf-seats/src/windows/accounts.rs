@@ -148,7 +148,7 @@ impl AccountManager {
                 delete_account(&seat.account)?;
                 self.credentials.delete(&seat.id)
             }
-            Some(_) => Err(refuse_delete(seat)),
+            Some(_) => Err(not_ours(seat)),
         }
     }
 
@@ -156,7 +156,7 @@ impl AccountManager {
     /// there is nothing of ours to stop or delete.
     pub(super) fn ensure_owned_or_absent(&self, seat: &Seat) -> WinResult<()> {
         match account_comment(&seat.account)? {
-            Some(comment) if comment != marker(&seat.id) => Err(refuse_delete(seat)),
+            Some(comment) if comment != marker(&seat.id) => Err(not_ours(seat)),
             _ => Ok(()),
         }
     }
@@ -184,11 +184,11 @@ pub(super) fn marker(id: &SeatId) -> String {
     format!("Punktfunk managed seat {id}")
 }
 
-fn refuse_delete(seat: &Seat) -> BackendError {
+fn not_ours(seat: &Seat) -> BackendError {
     backend_error(
         "account_not_owned",
         format!(
-            "refusing to delete local account '{}' because its marker does not match seat {}",
+            "refusing to act on local account '{}' because its marker does not match seat {}",
             seat.account, seat.id
         ),
     )
