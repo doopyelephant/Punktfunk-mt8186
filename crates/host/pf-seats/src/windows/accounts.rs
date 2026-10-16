@@ -72,6 +72,9 @@ impl AccountManager {
         Self { credentials }
     }
 
+    /// Creates the account and its password blob, or accepts the ones a crashed provision left.
+    /// A step that fails removes what this call made, so no orphan account refuses the next
+    /// create of the same name.
     pub(super) fn provision(&self, seat: &Seat) -> WinResult<()> {
         require_local_system()?;
         let expected = marker(&seat.id);
@@ -87,13 +90,7 @@ impl AccountManager {
             }
             Some(_) => {
                 let credential = self.credentials.load(&seat.id)?;
-                verify_password(&seat.account, &credential)?;
-                add_to_rdp_users(&seat.account)?;
-                join_seats_group(&seat.account)?;
-                ensure_safe_membership(&seat.account)?;
-                ensure_no_remote_deny(&seat.account)?;
-                add_account_right(&seat.account, DENY_CONSOLE)?;
-                return Ok(());
+                return set_up_account(&seat.account, &credential);
             }
             None => {}
         }
@@ -106,34 +103,17 @@ impl AccountManager {
             self.credentials.store(&seat.id, &credential)?;
             credential
         };
-        match add_user(seat, &credential) {
-            Ok(()) => {}
-            Err(error) if error.code == "account_exists_race" => {
-                let comment = account_comment(&seat.account)?;
-                if comment.as_deref() != Some(expected.as_str()) {
-                    return Err(backend_error(
-                        "account_not_owned",
-                        format!(
-                            "local account '{}' appeared without our marker",
-                            seat.account
-                        ),
-                    ));
+        let result = add_marked_user(seat, &credential, &expected).and_then(|created| {
+            set_up_account(&seat.account, &credential).inspect_err(|_| {
+                if created {
+                    let _ = delete_account(&seat.account);
                 }
-            }
-            Err(error) => {
-                if !had_blob {
-                    let _ = self.credentials.delete(&seat.id);
-                }
-                return Err(error);
-            }
+            })
+        });
+        if result.is_err() && !had_blob {
+            let _ = self.credentials.delete(&seat.id);
         }
-
-        verify_password(&seat.account, &credential)?;
-        add_to_rdp_users(&seat.account)?;
-        join_seats_group(&seat.account)?;
-        ensure_safe_membership(&seat.account)?;
-        ensure_no_remote_deny(&seat.account)?;
-        add_account_right(&seat.account, DENY_CONSOLE)
+        result
     }
 
     /// Checks the account before a start, and puts it back in [`SEATS_GROUP`] if it is missing:
@@ -163,12 +143,7 @@ impl AccountManager {
                 if let Some(sid) = sid_string(&seat.account) {
                     delete_profile(&sid);
                 }
-                let account = wide(&seat.account, "account")?;
-                // SAFETY: account is a live NUL-terminated local name; null server selects this machine.
-                let status = unsafe { NetUserDel(PCWSTR::null(), PCWSTR(account.as_ptr())) };
-                if status != NERR_Success && status != NERR_UserNotFound {
-                    return Err(status_error("account_delete", "NetUserDel failed", status));
-                }
+                delete_account(&seat.account)?;
                 self.credentials.delete(&seat.id)
             }
             Some(_) => Err(backend_error(
@@ -215,6 +190,49 @@ fn require_marker(seat: &Seat) -> WinResult<()> {
             ),
         )),
     }
+}
+
+/// Creates the account. `true` when this call made it, `false` when it appeared meanwhile with
+/// our marker.
+fn add_marked_user(seat: &Seat, credential: &Credential, expected: &str) -> WinResult<bool> {
+    match add_user(seat, credential) {
+        Ok(()) => Ok(true),
+        Err(error) if error.code == "account_exists_race" => {
+            if account_comment(&seat.account)?.as_deref() == Some(expected) {
+                Ok(false)
+            } else {
+                Err(backend_error(
+                    "account_not_owned",
+                    format!(
+                        "local account '{}' appeared without our marker",
+                        seat.account
+                    ),
+                ))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The password, groups and rights every seat account holds. Each step is idempotent.
+fn set_up_account(account: &str, credential: &Credential) -> WinResult<()> {
+    verify_password(account, credential)?;
+    add_to_rdp_users(account)?;
+    join_seats_group(account)?;
+    ensure_safe_membership(account)?;
+    ensure_no_remote_deny(account)?;
+    add_account_right(account, DENY_CONSOLE)
+}
+
+/// Deletes the local account; one that is already gone counts as deleted.
+fn delete_account(account: &str) -> WinResult<()> {
+    let account = wide(account, "account")?;
+    // SAFETY: account is a live NUL-terminated local name; null server selects this machine.
+    let status = unsafe { NetUserDel(PCWSTR::null(), PCWSTR(account.as_ptr())) };
+    if status != NERR_Success && status != NERR_UserNotFound {
+        return Err(status_error("account_delete", "NetUserDel failed", status));
+    }
+    Ok(())
 }
 
 fn random_credential() -> WinResult<Credential> {
