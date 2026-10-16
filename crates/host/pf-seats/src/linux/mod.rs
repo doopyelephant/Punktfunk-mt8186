@@ -52,6 +52,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(90);
 const TRUST_TICK: Duration = Duration::from_secs(2);
 /// How often the games folder's ACL mask is repaired while a seat runs.
 const ACL_EVERY: Duration = Duration::from_secs(600);
+/// How long `Seating` reuses the prerequisite checks it ran.
+const CHECKS_FRESH: Duration = Duration::from_secs(10);
 
 fn err(code: &str, message: impl Into<String>) -> BackendError {
     BackendError::new(code, message)
@@ -101,6 +103,25 @@ struct Inner {
     acl_dirty: AtomicBool,
     /// What the binary runs beside a seat's unit ([`LinuxBackend::on_unit`]).
     hook: OnceLock<UnitHook>,
+    /// The prerequisite checks `Seating` last answered with, and when they ran.
+    checks: Mutex<Option<(Instant, Vec<Diagnostic>)>>,
+}
+
+/// `slot`'s checks when they ran less than [`CHECKS_FRESH`] before `now`, else what `run`
+/// answers, kept in `slot`.
+fn cached(
+    slot: &mut Option<(Instant, Vec<Diagnostic>)>,
+    now: Instant,
+    run: impl FnOnce() -> Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
+    if let Some((at, checks)) = slot.as_ref()
+        && now.duration_since(*at) < CHECKS_FRESH
+    {
+        return checks.clone();
+    }
+    let checks = run();
+    *slot = Some((now, checks.clone()));
+    checks
 }
 
 /// Runs beside a seat's unit: `Some(uid)` before the unit starts and for a seat found running,
@@ -259,6 +280,7 @@ impl LinuxBackend {
             door_gid: OnceLock::new(),
             acl_dirty: AtomicBool::new(false),
             hook: OnceLock::new(),
+            checks: Mutex::new(None),
         });
         let weak = Arc::downgrade(&inner);
         std::thread::Builder::new()
@@ -799,10 +821,14 @@ impl PlatformBackend for LinuxBackend {
         Ok(out)
     }
 
+    /// The checks are the last ones run within [`CHECKS_FRESH`]: the door asks every 2 s and
+    /// reads `enabled`, which is constant. Doctor runs them afresh.
     fn seating(&self) -> Result<SeatingStatus, BackendError> {
+        let mut slot = self.inner.checks.lock().unwrap_or_else(|e| e.into_inner());
+        let checks = cached(&mut slot, Instant::now(), || self.prerequisites());
         Ok(SeatingStatus {
             enabled: true,
-            checks: self.prerequisites(),
+            checks,
             allow_rdp_from_network: false,
         })
     }
@@ -993,6 +1019,23 @@ mod tests {
     }
 
     use super::*;
+
+    /// The checks run once, then are reused until they are `CHECKS_FRESH` old.
+    #[test]
+    fn the_seating_checks_are_reused_while_they_are_fresh() {
+        let (mut slot, start) = (None, Instant::now());
+        let mut runs = 0;
+        let mut ask = |slot: &mut _, at: Instant| {
+            cached(slot, at, || {
+                runs += 1;
+                vec![Diagnostic::info("run", runs.to_string())]
+            })
+        };
+        assert_eq!(ask(&mut slot, start)[0].message, "1");
+        assert_eq!(ask(&mut slot, start + CHECKS_FRESH / 2)[0].message, "1");
+        assert_eq!(ask(&mut slot, start + CHECKS_FRESH)[0].message, "2");
+        assert_eq!(ask(&mut slot, start + CHECKS_FRESH * 3 / 2)[0].message, "2");
+    }
 
     #[test]
     fn a_tool_is_found_on_the_path_and_a_missing_one_is_not() {
