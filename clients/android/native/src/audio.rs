@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// What one playback open attempt yields: the stream, plus both halves of the PCM hand-off — the
@@ -212,6 +212,46 @@ impl AudioPlayback {
     }
 }
 
+/// `builder` set to the wire layout: the channel count, plus AAudio's speaker mask above stereo.
+///
+/// A count alone opens more than two channels as an index mask, with no speaker positions, so
+/// a stereo output keeps FL/FR and drops the rest. AAudio's mask bits are WASAPI's, in wire
+/// order. `AAudioStreamBuilder_setChannelMask` is API 32; below that only the count is set.
+fn with_layout(builder: AudioStreamBuilder, channels: u8) -> AudioStreamBuilder {
+    // void AAudioStreamBuilder_setChannelMask(AAudioStreamBuilder*, aaudio_channel_mask_t)  (API 32)
+    type SetChannelMaskFn = unsafe extern "C" fn(*mut c_void, u32);
+    static SET_MASK: OnceLock<Option<SetChannelMaskFn>> = OnceLock::new();
+    let set_mask = *SET_MASK.get_or_init(|| {
+        // SAFETY: the `ndk` audio wrapper links `libaaudio.so`, so `dlopen` only bumps its
+        // refcount (process-lifetime handle; null is checked). The type is the NDK header's.
+        let set = unsafe {
+            let lib = libc::dlopen(c"libaaudio.so".as_ptr(), libc::RTLD_NOW);
+            if lib.is_null() {
+                None
+            } else {
+                crate::sym::<SetChannelMaskFn>(lib, c"AAudioStreamBuilder_setChannelMask")
+            }
+        };
+        if set.is_none() {
+            log::info!(
+                "audio: no AAudio channel mask below API 32 — surround opens as channel indices"
+            );
+        }
+        set
+    });
+    let builder = builder.channel_count(i32::from(channels));
+    if let (true, Some(set_mask)) = (channels > 2, set_mask) {
+        // SAFETY: the pointer is the live builder `builder` owns. A mask set after the count wins.
+        unsafe {
+            set_mask(
+                builder.as_ptr().cast(),
+                punktfunk_core::audio::wasapi_channel_mask(channels),
+            )
+        };
+    }
+    builder
+}
+
 /// Check before `Hello` whether this device plays the requested rate without resampling.
 ///
 /// Audio cannot be renegotiated mid-session, so the caller uses `false` to omit hi-res or choose
@@ -221,11 +261,12 @@ impl AudioPlayback {
 /// one plays as sent.
 ///
 /// Never starts the stream, and drops it immediately. `channels` is the requested layout because
-/// the host-resolved layout does not exist until `Welcome`.
+/// the host-resolved layout does not exist until `Welcome`. It carries playback's speaker mask:
+/// a 5.1 mask can route to another output than a bare count, at another rate.
 pub fn output_rate_is_openable(rate_hz: u32, channels: u8) -> bool {
     let built = AudioStreamBuilder::new().map(|b| {
-        b.direction(AudioDirection::Output)
-            .channel_count(punktfunk_core::audio::normalize_channels(channels) as i32)
+        let channels = punktfunk_core::audio::normalize_channels(channels);
+        with_layout(b.direction(AudioDirection::Output), channels)
             // The same f32 device format playback uses — see `try_open`. The wire depth is a wire
             // fact and never reaches AAudio, so probing at 24-bit would be probing the wrong thing.
             .format(AudioFormat::PCM_Float)
@@ -853,13 +894,10 @@ fn try_open(rung: OpenRung, ctx: &OpenCtx) -> ndk::audio::Result<LiveStream> {
         render.callback(s, data, num_frames)
     };
 
-    let builder = AudioStreamBuilder::new()?
-        .direction(AudioDirection::Output)
-        // The wire order (FL FR FC LFE RL RR SL SR) is the standard AAudio/Android channel
-        // order, so this is an IDENTITY mapping — no permute. AAudio infers the 5.1/7.1 mask
-        // from `channel_count` (the ndk crate's builder exposes no setChannelMask); the host
-        // captures + encodes in exactly this order.
-        .channel_count(channels as i32)
+    let builder = AudioStreamBuilder::new()?.direction(AudioDirection::Output);
+    // The wire order (FL FR FC LFE RL RR SL SR) is AAudio's speaker-bit order, so with the mask
+    // `with_layout` sets this is an IDENTITY mapping — no permute.
+    let builder = with_layout(builder, channels)
         // ⚠ The DEVICE format is f32 on BOTH planes, deliberately — this is not an oversight
         // left over from the Opus-only era. Core decodes each plane to interleaved f32 (libopus
         // `decode_float`; `pcm::to_f32` normalises 16/24-bit codes by their full scale), so a
