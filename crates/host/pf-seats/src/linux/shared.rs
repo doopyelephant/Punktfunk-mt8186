@@ -193,9 +193,10 @@ fn check_owned(path: &Path, forbidden: u32) -> std::io::Result<()> {
 /// through the one above it without following a link, and changed through its own handle;
 /// `setfacl` gets each as `/proc/<pid>/fd/<n>`, which names that folder whatever its path holds.
 ///
-/// `games` is sticky, so a seat can't replace `steamapps`. A link or file a seat leaves where a
-/// bind target belongs is removed. Run at each seat start: a unit's `BindPaths=` names the
-/// targets, and a planted link would send the mount somewhere else.
+/// `games` is sticky, so a seat can't replace `steamapps`, and closed to other users: only the
+/// group reads the tree. A link or file a seat leaves where a bind target belongs is removed.
+/// Run at each seat start: a unit's `BindPaths=` names the targets, and a planted link would send
+/// the mount somewhere else.
 pub(super) fn ensure_games(state: &Path, gid: u32) -> Result<(), BackendError> {
     let io = |what: &str, e| io_err("games_dir", what, e);
     let top = safe_open::dir(state).map_err(|e| io("open the state directory", e))?;
@@ -208,7 +209,7 @@ pub(super) fn ensure_games(state: &Path, gid: u32) -> Result<(), BackendError> {
     dirs.extend([steamapps, games]);
     for (i, dir) in dirs.iter().enumerate() {
         let sticky = i + 1 == dirs.len();
-        let mode = if sticky { 0o3775 } else { 0o2775 };
+        let mode = if sticky { 0o3770 } else { 0o2775 };
         std::os::unix::fs::fchown(dir, Some(0), Some(gid)).map_err(|e| io("own a folder", e))?;
         rustix::fs::fchmod(dir, Mode::from_raw_mode(mode as _))
             .map_err(|e| io("set the mode of a folder", e.into()))?;
@@ -253,10 +254,11 @@ const ACL_DEPTH: usize = 64;
 const ACL_START: usize = 1024;
 const ACL_MAX: usize = 64 * 1024;
 
-/// Re-applies `m::rwX` below the games folder, as `setfacl -R` would. A file one seat creates
-/// with mode 0644 or 0755 gets a mask of `r--` or `r-x` that cuts the group entry, so the other
-/// seats can't write it. Every seat writes in the tree, so it is walked through handles: each
-/// entry opened in its folder's handle without following a link, and changed through its own.
+/// Re-applies `m::rwX` below the games folder, as `setfacl -R` would, to a mask of `r--` or
+/// `r-x`. A file one seat creates with mode 0644 or 0755 gets such a mask, which cuts the group
+/// entry, so the other seats can't write it. Any other mask is a seat's choice and stays. Every
+/// seat writes in the tree, so it is walked through handles: each entry opened in its folder's
+/// handle without following a link, and changed through its own.
 ///
 /// Walks the whole tree each call: cheap for a normal library, slow past millions of files,
 /// where an inotify watch on `steamapps` would fix only what changed. So it walks on a thread of
@@ -368,8 +370,8 @@ fn mask_entry(at: BorrowedFd<'_>, name: &CStr) -> std::io::Result<Option<OwnedFd
     Ok(dir.then_some(fd))
 }
 
-/// Sets the mask of `fd`'s access ACL to `rw`, plus `x` when `exec`. A file with no ACL has no
-/// named entry for a mask to cut, and stays as it is.
+/// Sets the mask of `fd`'s access ACL to `rw`, plus `x` when `exec`, if it is `r--` or `r-x`. A
+/// file with no ACL has no named entry for a mask to cut, and stays as it is.
 fn set_mask(fd: impl AsFd, exec: bool) -> std::io::Result<()> {
     let mut buf = vec![0u8; ACL_START];
     let len = loop {
@@ -387,7 +389,8 @@ fn set_mask(fd: impl AsFd, exec: bool) -> std::io::Result<()> {
 }
 
 /// `acl` with its mask set to `perm`; `None` when it is no version-2 ACL, has no mask, or its
-/// mask is `perm` already.
+/// mask is not `r--` or `r-x`. Those are the group bits of a file created 0644 or 0755, and all
+/// this widens: a file a seat closed with `chmod 600` has `---` and stays closed.
 fn with_mask(acl: &[u8], perm: u16) -> Option<Vec<u8>> {
     let (version, entries) = acl.split_first_chunk::<4>()?;
     if u32::from_le_bytes(*version) != 2 || !entries.len().is_multiple_of(8) {
@@ -397,7 +400,7 @@ fn with_mask(acl: &[u8], perm: u16) -> Option<Vec<u8>> {
         .chunks_exact(8)
         .position(|e| u16::from_le_bytes([e[0], e[1]]) == ACL_MASK)?;
     let at = 4 + mask * 8 + 2;
-    if u16::from_le_bytes([acl[at], acl[at + 1]]) == perm {
+    if !matches!(u16::from_le_bytes([acl[at], acl[at + 1]]), 4 | 5) {
         return None;
     }
     let mut out = acl.to_vec();
@@ -962,12 +965,31 @@ mod tests {
         .concat()
     }
 
-    /// `m::rwX` as `setfacl` reads it, and nothing done to an ACL it can't read.
+    /// The mask of `path`'s access ACL.
+    #[cfg(target_os = "linux")]
+    fn mask_of(path: &Path) -> u16 {
+        let mut buf = vec![0u8; 8192];
+        let len = rustix::fs::getxattr(path, ACL_ACCESS, &mut buf[..]).unwrap();
+        let mut entries = buf[4..len].chunks_exact(8);
+        let mask = entries.find(|e| u16::from_le_bytes([e[0], e[1]]) == ACL_MASK);
+        mask.map(|e| u16::from_le_bytes([e[2], e[3]])).unwrap()
+    }
+
+    /// `m::rwX` as `setfacl` reads it for the group bits of a file made 0644 or 0755, and nothing
+    /// done to an ACL it can't read or to a mask a seat narrowed.
     #[test]
     fn the_acl_mask_becomes_rw_with_x_where_asked() {
         assert_eq!(with_mask(&acl(4), 6), Some(acl(6)));
         assert_eq!(with_mask(&acl(5), 7), Some(acl(7)));
         assert_eq!(with_mask(&acl(6), 6), None, "already rw");
+        assert_eq!(with_mask(&acl(7), 7), None, "already rwx");
+        for closed in 0..4 {
+            assert_eq!(
+                with_mask(&acl(closed), 7),
+                None,
+                "mask {closed} is a seat's"
+            );
+        }
         assert_eq!(with_mask(&acl(4)[..20], 6), None, "torn");
         let mut version_1 = acl(4);
         version_1[0] = 1;
@@ -979,13 +1001,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_link_swapped_in_mid_walk_is_not_followed() {
-        let mask_of = |path: &Path| {
-            let mut buf = [0u8; 1024];
-            let len = rustix::fs::getxattr(path, ACL_ACCESS, &mut buf[..]).unwrap();
-            let mut entries = buf[4..len].chunks_exact(8);
-            let mask = entries.find(|e| u16::from_le_bytes([e[0], e[1]]) == ACL_MASK);
-            mask.map(|e| u16::from_le_bytes([e[2], e[3]])).unwrap()
-        };
         let temp = tempfile::tempdir().unwrap();
         let (games, outside) = (temp.path().join("games"), temp.path().join("outside"));
         std::fs::create_dir_all(games.join("sub")).unwrap();
@@ -1016,6 +1031,27 @@ mod tests {
         assert_eq!(mask_of(&outside.join("b")), 4);
         assert_eq!(mask_of(&games.join("sub.old")), 7, "a folder takes x");
         assert_eq!(mask_of(&games.join("sub.old/a")), 6);
+    }
+
+    /// A file a seat closed with `chmod 600` stays closed through the walk; one left at `r--`
+    /// opens to the group.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_walk_leaves_a_closed_file_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let games = temp.path().join("games");
+        std::fs::create_dir(&games).unwrap();
+        for (name, mask) in [("open", 4), ("closed", 0)] {
+            let path = games.join(name);
+            std::fs::write(&path, "x").unwrap();
+            if rustix::fs::setxattr(&path, ACL_ACCESS, &acl(mask), XattrFlags::empty()).is_err() {
+                eprintln!("no POSIX ACLs under {}: skipped", temp.path().display());
+                return;
+            }
+        }
+        mask_tree(safe_open::dir(&games).unwrap()).unwrap();
+        assert_eq!(mask_of(&games.join("open")), 6);
+        assert_eq!(mask_of(&games.join("closed")), 0);
     }
 
     /// An ACL longer than the first read buffer is repaired too, not skipped with its subtree.
