@@ -7,7 +7,7 @@
 
 use super::{err, run};
 use crate::backend::BackendError;
-use crate::model::{Seat, SeatId};
+use crate::model::{Seat, SeatId, MAX_SEATS};
 use std::path::{Path, PathBuf};
 
 /// `=`, not `:`: the colon separates passwd fields and `useradd` refuses it in a comment.
@@ -157,6 +157,18 @@ pub(super) fn check_name(account: &str) -> Result<(), BackendError> {
     Err(err(
         "account_invalid",
         format!("account '{account}' isn't a lowercase Linux user name"),
+    ))
+}
+
+/// The names the door and the CLI give a seat's user: `pf-seat-1` up to the last seat. Whoever
+/// reaches the socket creates a system user, so the name is not theirs to choose.
+pub(super) fn check_seat_name(account: &str) -> Result<(), BackendError> {
+    if (1..=MAX_SEATS).any(|n| account == format!("pf-seat-{n}")) {
+        return Ok(());
+    }
+    Err(err(
+        "account_invalid",
+        format!("account '{account}' isn't a seat account, pf-seat-1 to pf-seat-{MAX_SEATS}"),
     ))
 }
 
@@ -471,6 +483,32 @@ mod tests {
     #[test]
     fn an_owner_name_is_checked_before_any_lookup() {
         assert_eq!(require_owner("-s").unwrap_err().code, "account_invalid");
+    }
+
+    /// Creating a seat takes the names the door and the CLI send and no other, even a valid one.
+    #[test]
+    fn a_seat_account_is_named_pf_seat_and_its_number() {
+        for good in ["pf-seat-1", "pf-seat-2", "pf-seat-3", "pf-seat-4"] {
+            assert!(check_seat_name(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "pf-seat-0",
+            "pf-seat-5",
+            "pf-seat-01",
+            "pf-seat-+1",
+            "pf-seat-",
+            "pf-seat",
+            "pf_seat1",
+            "www-data",
+            "_svc",
+            "xpf-seat-1",
+        ] {
+            assert_eq!(
+                check_seat_name(bad).unwrap_err().code,
+                "account_invalid",
+                "{bad}"
+            );
+        }
     }
 
     #[test]

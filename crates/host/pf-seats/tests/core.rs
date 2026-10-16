@@ -339,7 +339,11 @@ impl PlatformBackend for FailsToProvision {
 /// that was never the seat's is left alone.
 #[test]
 fn a_failed_provision_removes_what_it_made_unless_the_account_was_not_ours() {
-    for (code, removed) in [("verify_failed", true), ("account_not_owned", false)] {
+    for (code, removed) in [
+        ("verify_failed", true),
+        ("account_not_owned", false),
+        ("account_invalid", false),
+    ] {
         let temp = tempfile::tempdir().unwrap();
         let backend = FailsToProvision {
             inner: FakeBackend::default(),

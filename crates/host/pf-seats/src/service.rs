@@ -184,9 +184,9 @@ impl<B: PlatformBackend> SeatService<B> {
             .allocate(request)
             .map_err(ApiError::from)?;
         if let Err(error) = self.backend.provision(&seat) {
-            // An account that is not the seat's was never ours to remove.
-            if error.code != "account_not_owned" {
-                // It may have made the account before it failed, and no ledger row will name it.
+            // A name the backend refused, or an account that is not the seat's, made nothing of
+            // ours. Any other failure may have made the account, and no ledger row will name it.
+            if !matches!(error.code.as_str(), "account_invalid" | "account_not_owned") {
                 let _ = self.backend.remove(&seat);
             }
             return Err(ApiError::from(error));

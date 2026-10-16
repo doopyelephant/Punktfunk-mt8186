@@ -603,7 +603,7 @@ impl LinuxBackend {
 
 impl PlatformBackend for LinuxBackend {
     fn provision(&self, seat: &Seat) -> Result<(), BackendError> {
-        accounts::check_name(&seat.account)?;
+        accounts::check_seat_name(&seat.account)?;
         let state = &self.inner.state;
         let gid = accounts::ensure_group(accounts::GAMES_GROUP)?;
         shared::ensure_games(state, gid)?;
