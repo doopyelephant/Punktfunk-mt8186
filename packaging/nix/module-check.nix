@@ -455,6 +455,19 @@ let
         env.PUNKTFUNK_MGMT_BIND or null == "0.0.0.0:47991" && !(env ? RUST_LOG);
     }
     {
+      # The helper's `systemctl enable` has nowhere to write on NixOS, so the units are wired
+      # here. They start at boot only while the owner record exists: the door is off without it.
+      name = "the door's units start at boot once the owner record exists";
+      ok =
+        let
+          wired =
+            name:
+            seats.systemd.services.${name}.wantedBy == [ "multi-user.target" ]
+            && hasSys seats "${name}.service" "ConditionPathExists=/var/lib/punktfunk-seats/owner";
+        in
+        wired "punktfunk-door" && wired "punktfunk-web-door";
+    }
+    {
       # A console limited to this machine stays so when the door takes over. host.env, which
       # carries the bind on other distros, is not read: the option is the source.
       name = "the door's console binds where web.bind says, never host.env";

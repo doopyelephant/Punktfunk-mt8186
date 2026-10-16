@@ -183,7 +183,7 @@ undo_on() {
         [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null || true
     fi
     rm -f "$MARK" "$RECORD" "/run/punktfunk/seats/$user.env"
-    [ "$seats_were_up" = 1 ] || systemctl disable --now punktfunk-seats.service || true
+    [ "$seats_were_up" = 1 ] || unwire punktfunk-seats.service || true
 }
 
 door_on() {
@@ -212,10 +212,11 @@ door_on() {
         take_avatars
         : >"$MARK"
     fi
-    systemctl enable --now punktfunk-seats.service
+    wire punktfunk-seats.service
+    systemctl start punktfunk-seats.service
     wait_for_socket
     "$SEATS" adopt-owner "$user" >/dev/null
-    systemctl enable punktfunk-door.service punktfunk-web-door.service
+    wire punktfunk-door.service punktfunk-web-door.service
     trap - EXIT
     # The box's ports are the door's from here, so the user's console and host leave them first.
     # The host restarts on the owner row's contract: its own ports, and the box's identity.
@@ -229,6 +230,16 @@ door_on() {
 owner_row() {
     "$SEATS" list | awk '$6 == "owner=true" { print $1; exit }'
 }
+
+# Units that start at boot, or stop and no longer do. NixOS wires them in its configuration and its
+# unit directory can't be written, so a refused change is fine for a unit already in that state.
+wire() {
+    for unit in "$@"; do
+        systemctl enable "$unit" || systemctl is-enabled --quiet "$unit" || die "can't enable $unit"
+    done
+}
+
+unwire() { systemctl disable --now "$@" || systemctl stop "$@"; }
 
 # The door stopped to hand its files home and they didn't arrive: it comes back as it was.
 restore_door() {
@@ -260,7 +271,7 @@ door_off() {
     fi
     # A stopped supervisor leaves the owner's contract behind, and their host and console read it.
     rm -f "/run/punktfunk/seats/$user.env"
-    systemctl disable --now punktfunk-web-door.service punktfunk-door.service punktfunk-seats.service || problems=1
+    unwire punktfunk-web-door.service punktfunk-door.service punktfunk-seats.service || problems=1
     user_ctl try-restart punktfunk-host.service || true
     # Their console comes back only if it was theirs to begin with.
     if user_ctl is-enabled --quiet punktfunk-web.service; then
