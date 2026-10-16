@@ -140,7 +140,7 @@ fn grant(plugin: Option<&str>, dir: Option<&str>, flags: &[String]) -> Result<()
             }
         );
     }
-    converge_runner_roots();
+    converge_after_decision();
     println!("The plugin restarts with the new folder within a few seconds.");
     Ok(())
 }
@@ -236,7 +236,7 @@ fn revoke(plugin: Option<&str>, dir: Option<&str>, flags: &[String]) -> Result<(
     let roots = store
         .revoke(plugin, std::path::Path::new(dir))
         .with_context(|| format!("revoke the grant for '{plugin}'"))?;
-    converge_runner_roots();
+    converge_after_decision();
     println!("{plugin} may now reach:");
     for root in roots {
         println!(
@@ -557,24 +557,42 @@ pub(crate) fn publish_sandbox_override() {
 /// Give the runner every root a plugin declared or was granted: on Linux the unit's drop-in,
 /// which bwrap binds from and whose empty home hides the rest, restarting the runner when the
 /// set changed; on Windows an ACE per root for the runner's account, stripped when its plugin
-/// goes.
-pub(crate) fn converge_runner_roots() {
+/// goes. `true` when a root or ACE changed.
+pub(crate) fn converge_runner_roots() -> bool {
     // Tests never touch the operator's systemd config or a folder's ACL; macOS has no runner.
     if cfg!(test) || !(cfg!(target_os = "linux") || cfg!(windows)) || !runtime_status().installed {
-        return;
+        return false;
     }
     // Two quick decisions must not race: the later one reads the grants the earlier wrote.
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(home) = manifest::home_dir() else {
-        return;
+        return false;
     };
     let manifests = manifest::installed();
     let roots = access::AccessStore::open(pf_paths::config_dir()).runner_roots(&manifests);
     match plat::converge_runner_roots(&roots, &home, &manifests) {
-        Ok(true) => tracing::info!(roots = roots.len(), "plugin runner roots updated"),
-        Ok(false) => {}
-        Err(e) => tracing::warn!(error = %format!("{e:#}"), "plugin runner roots not updated"),
+        Ok(true) => {
+            tracing::info!(roots = roots.len(), "plugin runner roots updated");
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "plugin runner roots not updated");
+            false
+        }
+    }
+}
+
+/// [`converge_runner_roots`] after the operator grants or takes a folder. On Windows the
+/// runner restarts the plugin when the grants file changes, before the plugin's own ACE lands,
+/// so its scan still finds the folder shut; a restart once the ACE is placed rescans it.
+pub(crate) fn converge_after_decision() {
+    if converge_runner_roots() && cfg!(windows) && runtime_status().running {
+        match plat::restart_runtime() {
+            Ok(()) => tracing::info!("plugin runner restarted onto a changed folder grant"),
+            Err(e) => tracing::warn!(error = %format!("{e:#}"), "plugin runner not restarted"),
+        }
     }
 }
 

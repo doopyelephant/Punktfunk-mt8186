@@ -438,8 +438,24 @@ fn run_install(id: &str, plan: Plan, plugin_tokens: &PluginTokens) -> Result<()>
     .context("record install provenance")?;
 
     refresh_plugin_tokens(id, plugin_tokens)?;
-    restart_runner(id);
+    start_runner(id);
     Ok(())
+}
+
+/// [`restart_runner`], switching on a runner that is installed but off: an install asks for
+/// the plugin to run, and a runner left off would keep it from ever starting.
+fn start_runner(id: &str) {
+    let st = crate::plugins::runtime_status();
+    if !st.installed || st.enabled {
+        return restart_runner(id);
+    }
+    set_phase(id, "starting runner");
+    // Roots first, as a restart does: the new manifest may name paths the unit can't see yet.
+    crate::plugins::converge_runner_roots();
+    match crate::plugins::set_runtime_enabled(true) {
+        Ok(()) => log_line(id, "plugin runner switched on to start this plugin".into()),
+        Err(e) => log_line(id, format!("switch on the plugin runner: {e:#}")),
+    }
 }
 
 fn run_uninstall(

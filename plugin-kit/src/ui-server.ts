@@ -25,6 +25,33 @@ export const httpApiEnv = Layer.provideMerge(
 	FileSystem.layerNoop({}),
 );
 
+type JsonNode = { properties?: Record<string, JsonNode>; default?: unknown };
+
+/** What an empty file decodes to, or nothing when a key has no default. */
+const decodedDefaults = (schema: Schema.Top): unknown => {
+	try {
+		return Schema.decodeUnknownSync(schema as never)({});
+	} catch {
+		return undefined;
+	}
+};
+
+/** A form can show it: a JSON scalar, or a list of them. */
+const plain = (v: unknown): boolean =>
+	["boolean", "number", "string"].includes(typeof v) ||
+	(Array.isArray(v) && v.every((x) => ["number", "string"].includes(typeof x)));
+
+/** Each property's decoded default as its `default`; an object passes its keys down. */
+const fillDefaults = (node: JsonNode | undefined, value: unknown): void => {
+	if (!node?.properties || typeof value !== "object" || value === null) return;
+	for (const [key, v] of Object.entries(value)) {
+		const prop = node.properties[key];
+		if (!prop) continue;
+		if (plain(v)) prop.default = v;
+		else fillDefaults(prop, v);
+	}
+};
+
 /**
  * Derive a JSON Schema for a config schema, for the console's generic settings form.
  *
@@ -40,8 +67,8 @@ export const httpApiEnv = Layer.provideMerge(
  * * A decoding default is an **Effect**: `withDecodingDefaultKey(Effect.succeed(true), …)`. Passing
  *   a bare thunk (`() => true`) still derives a schema and still type-checks, then dies at DECODE
  *   time with "Not a valid effect" — deriving is not evidence that the schema works.
- * * Annotate every field: `.annotate({ title, description, default })`. The derivation does NOT
- *   infer `default` from `withDecodingDefaultKey`, so an un-annotated field shows no placeholder.
+ * * Annotate every field: `.annotate({ title, description })`. A key's decoding default becomes
+ *   its `default`, over any annotated one: the form shows what the plugin runs with.
  * * A *checked* schema (`Schema.Int`, or anything with `.check(...)`) keeps its annotations and
  *   constraints on the property itself; a form still merges `allOf` branches when one appears.
  * * `Schema.Literals([...])` derives a clean `enum` — prefer it over a union of strings. A union of
@@ -54,6 +81,7 @@ export const deriveConfigJsonSchema = (
 ): Record<string, unknown> | null => {
 	try {
 		const doc = Schema.toJsonSchemaDocument(schema as never);
+		fillDefaults(doc.schema as JsonNode, decodedDefaults(schema));
 		return doc as unknown as Record<string, unknown>;
 	} catch {
 		// A schema shape the derivation can't express (a transform, a recursive ref). The console

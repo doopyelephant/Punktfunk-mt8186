@@ -5,8 +5,14 @@
 use super::*;
 
 #[cfg(target_os = "linux")]
-pub(super) const LAUNCHER_UI_STORES: &[&str] =
-    &["heroic", "heroic-console", "lutris", "hydra-big-picture"];
+pub(super) const LAUNCHER_UI_STORES: &[&str] = &[
+    "heroic",
+    "heroic-console",
+    "lutris",
+    "hydra-big-picture",
+    "itch",
+    "bottles",
+];
 #[cfg(not(target_os = "linux"))]
 pub(super) const LAUNCHER_UI_STORES: &[&str] = &[];
 
@@ -36,7 +42,8 @@ pub(super) fn steam_ui_command(value: &str) -> Option<String> {
 
 /// Can this box open a known `launcher_ui` value now? Both Heroic tiles share
 /// `heroic_launch_prefix`. Plugin `detect` is only `~/.config/heroic`, which can survive
-/// uninstall — so probe the binary. Hydra needs a desktop entry that handles its link.
+/// uninstall — so probe the binary. Hydra needs a desktop entry that handles its link; itch
+/// and Bottles need their own.
 pub(super) fn launcher_ui_installed(value: &str) -> bool {
     #[cfg(target_os = "linux")]
     if matches!(value, "heroic" | "heroic-console") {
@@ -45,6 +52,10 @@ pub(super) fn launcher_ui_installed(value: &str) -> bool {
     #[cfg(target_os = "linux")]
     if value == "hydra-big-picture" {
         return hydra_big_picture().is_some();
+    }
+    #[cfg(target_os = "linux")]
+    if matches!(value, "itch" | "bottles") {
+        return app_entry_command(value).is_some();
     }
     let _ = value;
     true
@@ -97,6 +108,7 @@ fn command_for(spec: &LaunchSpec) -> Option<String> {
             // Bare `lutris` opens the window; a `lutris:rungameid/…` URI would launch a game.
             "lutris" => Some("lutris".into()),
             "hydra-big-picture" => hydra_big_picture(),
+            "itch" | "bottles" => app_entry_command(&spec.value),
             _ => None,
         },
         // The plugin sends an id; the command is whatever the installed entry says (`desktop.rs`),
@@ -145,6 +157,20 @@ pub(crate) fn heroic_command(value: &str) -> Option<String> {
 fn hydra_big_picture() -> Option<String> {
     super::desktop::mime_handler_command("x-scheme-handler/hydralauncher")
         .map(|cmd| format!("{cmd} --big-picture"))
+}
+
+/// The `Exec=` of the app's installed desktop entry, native or Flatpak: both use the reverse-DNS
+/// id. itch's own installer names its entry `itch`.
+#[cfg(target_os = "linux")]
+fn app_entry_command(value: &str) -> Option<String> {
+    let ids: &[&str] = match value {
+        "itch" => &["io.itch.itch", "itch"],
+        "bottles" => &["com.usebottles.bottles"],
+        _ => &[],
+    };
+    ids.iter()
+        .find_map(|id| super::desktop::desktop_command(id))
+        .map(|(cmd, _)| cmd)
 }
 
 #[cfg(target_os = "linux")]
@@ -324,7 +350,16 @@ mod tests {
         assert!(known_launcher_ui("heroic"));
         assert!(known_launcher_ui("heroic-console"));
         assert!(known_launcher_ui("lutris"));
+        assert!(known_launcher_ui("itch"));
+        assert!(known_launcher_ui("bottles"));
         assert!(!known_launcher_ui("gog"));
+        for v in ["itch", "bottles"] {
+            assert_eq!(
+                resolvable_launcher_ui(v),
+                app_entry_command(v).is_some(),
+                "{v}"
+            );
+        }
         // Both Heroic tiles share one probe; a miss drops both, not one dead tile.
         assert_eq!(
             resolvable_launcher_ui("heroic"),

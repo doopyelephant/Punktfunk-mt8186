@@ -548,26 +548,40 @@ pub(super) fn revoke_from(sid: &str, dir: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    /// Only an `HKLM` key becomes a named key; `HKCU` and anything malformed name nothing.
+    /// An `HKLM` key names itself once, an `HKCU` key one per loaded account, anything
+    /// malformed nothing.
     #[test]
-    fn named_key_takes_hklm_only() {
+    fn named_keys_take_the_machine_and_each_account() {
+        let sids = [
+            "S-1-5-21-1-2-3-1001".to_string(),
+            "S-1-12-1-4-5".to_string(),
+        ];
+        let named = |k| super::named_keys_for(k, &sids);
         assert_eq!(
-            super::named_key(r"HKLM\SOFTWARE\Valve\Steam").as_deref(),
-            Some(r"MACHINE\SOFTWARE\Valve\Steam")
+            named(r"HKLM\SOFTWARE\Valve\Steam"),
+            [r"MACHINE\SOFTWARE\Valve\Steam"]
         );
         assert_eq!(
-            super::named_key(r"hklm\SOFTWARE\WOW6432Node\Ubisoft").as_deref(),
-            Some(r"MACHINE\SOFTWARE\WOW6432Node\Ubisoft")
+            named(r"hklm\SOFTWARE\WOW6432Node\Ubisoft"),
+            [r"MACHINE\SOFTWARE\WOW6432Node\Ubisoft"]
+        );
+        assert_eq!(
+            named(r"HKCU\System\GameConfigStore"),
+            [
+                r"USERS\S-1-5-21-1-2-3-1001\System\GameConfigStore",
+                r"USERS\S-1-12-1-4-5\System\GameConfigStore",
+            ]
         );
         for bad in [
-            r"HKCU\Software\Valve\Steam",
             r"HKLM\",
+            r"HKCU\Software\..\..\S-1-5-18",
             r"HKLM\SOFTWARE\\Valve",
             r"HKLM\SOFTWARE\..\SAM",
             "HKLM\\SOFTWARE\\a\u{7}b",
+            r"HKU\S-1-5-18\Software",
             r"SOFTWARE\Valve",
         ] {
-            assert_eq!(super::named_key(bad), None, "{bad}");
+            assert!(named(bad).is_empty(), "{bad}");
         }
     }
 }
@@ -712,7 +726,7 @@ pub(super) fn converge_runner_roots(
         keys: manifests
             .values()
             .flat_map(|m| m.registry.iter())
-            .filter_map(|k| named_key(k))
+            .flat_map(|k| named_keys(k))
             .collect(),
     };
     let mut want = PlacedAces {
@@ -737,7 +751,7 @@ pub(super) fn converge_runner_roots(
             if m.per_account() {
                 paths.extend(profiles_root());
             }
-            let keys = m.registry.iter().filter_map(|k| named_key(k)).collect();
+            let keys = m.registry.iter().flat_map(|k| named_keys(k)).collect();
             want.grantees.insert(sid, Placed { paths, keys });
         }
     }
@@ -780,6 +794,11 @@ pub(super) fn converge_runner_roots(
                         .or_default()
                         .keys
                         .remove(key);
+                }
+                // A signed-out account's hive is unloaded and keeps its ACE: kept on record so
+                // the next converge after sign-in takes it, or holds it, as it should.
+                Err(e) if crate::windows::registry_ace::is_absent(&e) => {
+                    tracing::debug!(%sid, %key, "key ACE waits for its hive")
                 }
                 Err(e) => {
                     tracing::warn!(%sid, %key, error = %format!("{e:#}"), "key ACE not removed")
@@ -907,20 +926,48 @@ fn profiles_root() -> Option<(String, Ace)> {
         .then(|| (users.to_string_lossy().into_owned(), Ace::List))
 }
 
-/// `HKLM\SOFTWARE\…` as `SetNamedSecurityInfoW` names it: `MACHINE\SOFTWARE\…`. An `HKCU` key
-/// is one account's and gets no ACE for the service; anything else is not a key.
-fn named_key(declared: &str) -> Option<String> {
+/// A declared key as `SetNamedSecurityInfoW` names it: `HKLM\…` once as `MACHINE\…`, and
+/// `HKCU\…` as `USERS\<sid>\…` under every account whose hive is loaded, as `~` names every
+/// profile. Anything else names no key.
+fn named_keys(declared: &str) -> Vec<String> {
+    named_keys_for(declared, &user_sids())
+}
+
+fn named_keys_for(declared: &str, sids: &[String]) -> Vec<String> {
+    if let Some(rest) = key_under(declared, "HKLM\\") {
+        return vec![format!("MACHINE\\{rest}")];
+    }
+    match key_under(declared, "HKCU\\") {
+        Some(rest) => sids.iter().map(|s| format!("USERS\\{s}\\{rest}")).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// The path below `hive` (`HKLM\`), when `declared` is a clean key there.
+fn key_under<'a>(declared: &'a str, hive: &str) -> Option<&'a str> {
     let rest = declared
-        .get(..5)
-        .filter(|p| p.eq_ignore_ascii_case("HKLM\\"))
-        .map(|_| &declared[5..])?;
+        .get(..hive.len())
+        .filter(|p| p.eq_ignore_ascii_case(hive))
+        .map(|_| &declared[hive.len()..])?;
     let clean = !rest.is_empty()
         && rest.len() <= 255
         && !rest.chars().any(char::is_control)
         && rest
             .split('\\')
             .all(|c| !c.is_empty() && c != "." && c != ".." && !c.contains(['/', '*', '?']));
-    clean.then(|| format!("MACHINE\\{rest}"))
+    clean.then_some(rest)
+}
+
+/// The loaded hives of real accounts: local and domain (`S-1-5-21-…`) and Entra ID
+/// (`S-1-12-1-…`). Service and `_Classes` hives hold no launcher state.
+fn user_sids() -> Vec<String> {
+    use winreg::{enums::HKEY_USERS, RegKey};
+    RegKey::predef(HKEY_USERS)
+        .enum_keys()
+        .flatten()
+        .filter(|s| s.starts_with("S-1-5-21-") || s.starts_with("S-1-12-1-"))
+        .filter(|s| !s.ends_with("_Classes"))
+        .collect()
 }
 
 /// Stop then start: there is no `Restart-ScheduledTask`, and Start on a running task is a no-op.

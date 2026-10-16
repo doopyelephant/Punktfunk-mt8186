@@ -5,8 +5,19 @@
 use super::*;
 
 /// Each activation below was checked on a real install; an unverified one ships a dead tile.
-pub(super) const LAUNCHER_UI_STORES: &[&str] =
-    &["playnite", "epic", "gog", "xbox", "hydra-big-picture"];
+pub(super) const LAUNCHER_UI_STORES: &[&str] = &[
+    "playnite",
+    "epic",
+    "gog",
+    "xbox",
+    "hydra-big-picture",
+    "amazon",
+    "battlenet",
+    "ea",
+    "ubisoft",
+    "rockstar",
+    "itch",
+];
 
 /// The Xbox app's package identity and app id (its `AppxManifest.xml`). The publisher hash
 /// is read from AppRepository at launch, like the `xbox` kind.
@@ -39,7 +50,7 @@ pub(super) fn launcher_ui_installed(value: &str) -> bool {
         "gog" => galaxy_exe().is_some(),
         "xbox" => xbox_pfn(XBOX_APP_IDENTITY).is_some(),
         "hydra-big-picture" => hydra_exe().is_some(),
-        _ => false,
+        _ => store_client_exe(value).is_some(),
     }
 }
 
@@ -258,7 +269,7 @@ fn windows_launch_for(spec: &LaunchSpec) -> Option<WinRecipe> {
             }),
             "hydra-big-picture" => hydra_exe()
                 .map(|exe| WinRecipe::handoff(format!("\"{}\" --big-picture", exe.display()))),
-            _ => None,
+            other => store_client_exe(other).map(WinRecipe::handoff_exe),
         },
         // Operator command. `cmd.exe /c` blocks until it returns, so the pid is that command's life.
         "command" => {
@@ -367,6 +378,59 @@ fn battlenet_exe() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+/// The client a store's launcher tile opens, by `launcher_ui` value. Each forwards to a
+/// running instance, so it is a hand-off. The Amazon and itch apps install per user.
+fn store_client_exe(value: &str) -> Option<std::path::PathBuf> {
+    let file = |p: std::path::PathBuf| p.is_file().then_some(p);
+    let program_files = |rel: &str| {
+        ["ProgramFiles(x86)", "ProgramW6432", "ProgramFiles"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .find_map(|pf| file(std::path::PathBuf::from(pf).join(rel)))
+    };
+    let per_user = |rel: &str| {
+        windows_user_profiles()
+            .into_iter()
+            .find_map(|home| file(home.join(r"AppData\Local").join(rel)))
+    };
+    match value {
+        "amazon" => per_user(r"Amazon Games\App\Amazon Games.exe"),
+        "battlenet" => battlenet_exe(),
+        "ea" => program_files(r"Electronic Arts\EA Desktop\EA Desktop\EALauncher.exe"),
+        "ubisoft" => ["UbisoftConnect.exe", "upc.exe"]
+            .iter()
+            .find_map(|exe| program_files(&format!(r"Ubisoft\Ubisoft Game Launcher\{exe}"))),
+        "rockstar" => {
+            uninstall_location("Rockstar Games Launcher").and_then(|d| file(d.join("Launcher.exe")))
+        }
+        "itch" => per_user(r"itch\itch.exe"),
+        _ => None,
+    }
+}
+
+/// `InstallLocation` of the machine-wide uninstall entry named `display`, in either view.
+fn uninstall_location(display: &str) -> Option<std::path::PathBuf> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    [
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    ]
+    .iter()
+    .filter_map(|path| hklm.open_subkey_with_flags(path, KEY_READ).ok())
+    .find_map(|uninstall| {
+        uninstall.enum_keys().flatten().find_map(|name| {
+            let entry = uninstall.open_subkey_with_flags(&name, KEY_READ).ok()?;
+            let shown: String = entry.get_value("DisplayName").ok()?;
+            let location: String = entry.get_value("InstallLocation").ok()?;
+            let location = location.trim().trim_matches('"');
+            (shown == display && !location.is_empty()).then(|| std::path::PathBuf::from(location))
+        })
+    })
 }
 
 /// The Rockstar Games Launcher's `Launcher.exe` and `title`'s install folder, from the
@@ -837,8 +901,28 @@ mod tests {
     #[test]
     fn launcher_ui_knows_the_windows_launchers_and_probes_each() {
         // Vocabulary vs installed: separate so a missing launcher cannot 400 the library.
-        for v in ["playnite", "epic", "gog", "xbox", "hydra-big-picture"] {
+        for v in [
+            "playnite",
+            "epic",
+            "gog",
+            "xbox",
+            "hydra-big-picture",
+            "amazon",
+            "battlenet",
+            "ea",
+            "ubisoft",
+            "rockstar",
+            "itch",
+        ] {
             assert!(known_launcher_ui(v), "{v}");
+        }
+        // A store client the box lacks drops its tile, never the library.
+        for v in ["amazon", "battlenet", "ea", "ubisoft", "rockstar", "itch"] {
+            assert_eq!(
+                resolvable_launcher_ui(v),
+                store_client_exe(v).is_some(),
+                "{v}"
+            );
         }
         assert_eq!(
             resolvable_launcher_ui("playnite"),
