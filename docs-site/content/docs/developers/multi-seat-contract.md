@@ -379,7 +379,8 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   daemon ends them until the seat restarts. Before it stops, the unit's `ExecStop=` has the
   daemon answer every read a seat's Steam waits on, so none stays stranded in the kernel. The seat host's own pads still go through the
   broker, and a seat host offers no pen. It needs `/dev/cuse`, which the `cuse` module autoloads
-  on first open; `doctor` reports it.
+  on first open; `doctor` reports it. The daemon makes `/dev/cuse` root's alone before each
+  seat's node, so no other user can register the name a seat binds.
 - **USB pads.** A seat's USB/IP pad (the virtual Deck, the Steam Controllers, the DualSense, the
   Switch 2) is served by the daemon, never by the seat. A seat that can't write vhci's `attach`
   sends a `Serve` with the pad kind, and the client pad's identity for a Steam Controller. The

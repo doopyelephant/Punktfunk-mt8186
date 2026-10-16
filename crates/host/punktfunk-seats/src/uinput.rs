@@ -939,10 +939,31 @@ fn up(account: &str, uid: u32) {
     }
 }
 
+const CUSE: &str = "/dev/cuse";
+
+/// Whether a `/dev/cuse` with this owner and mode opens for root alone.
+fn root_only(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o077 == 0
+}
+
+/// Makes `/dev/cuse` root's alone. Whoever else can open it can register a node under the name a
+/// seat's unit binds, and the fence then hands that node to the seat's user.
+fn close_cuse(node: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(node)?;
+    if root_only(meta.uid(), meta.mode()) {
+        return Ok(());
+    }
+    tracing::warn!(node = %node.display(), "cuse node opens to other users; made root's alone");
+    std::os::unix::fs::chown(node, Some(0), Some(0))?;
+    std::fs::set_permissions(node, std::fs::Permissions::from_mode(0o600))
+}
+
 /// `account`'s CUSE device, its node handed to `uid`, `0600`. An earlier device of that name
 /// still there after two seconds fails it: the kernel refuses a twin name, and the `chown` would
 /// land on the old node.
 fn make(account: &str, uid: u32) -> io::Result<File> {
+    close_cuse(Path::new(CUSE))?;
     let devname = pf_paths::seat::uinput_devname(account);
     // One that just ended lingers until systemd drops its stored copy.
     let sysfs = Path::new("/sys/class/cuse").join(devname.replace('/', "!"));
@@ -959,7 +980,7 @@ fn make(account: &str, uid: u32) -> io::Result<File> {
     let chan = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open("/dev/cuse")?;
+        .open(CUSE)?;
     handshake(&chan, &devname)?;
     let node = Path::new("/dev").join(&devname);
     std::os::unix::fs::chown(&node, Some(uid), Some(0))?;
@@ -1581,5 +1602,14 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(200)))
             .unwrap();
         assert!(kernel.sock.recv(&mut [0u8; 64]).is_err(), "nobody reads it");
+    }
+
+    #[test]
+    fn only_a_root_owned_cuse_node_without_group_or_other_access_is_closed() {
+        assert!(root_only(0, 0o600));
+        assert!(root_only(0, 0o020_600));
+        assert!(!root_only(0, 0o660));
+        assert!(!root_only(0, 0o606));
+        assert!(!root_only(1000, 0o600));
     }
 }
