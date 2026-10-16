@@ -253,7 +253,11 @@ pub(super) fn close_home(home: &Path) -> Result<(), BackendError> {
     else {
         return Ok(());
     };
-    let above = super::safe_open::dir(parent).map_err(io)?;
+    let above = match super::safe_open::dir(parent) {
+        Ok(above) => above,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io(e)),
+    };
     let Some(dir) = super::safe_open::dir_at(&above, name).map_err(io)? else {
         return Ok(());
     };
@@ -444,6 +448,7 @@ mod tests {
         assert_eq!(mode(&home), 0o700);
 
         close_home(&seat.path().join("absent")).unwrap();
+        close_home(&seat.path().join("no-seat-dir/home")).unwrap();
 
         let target = seat.path().join("target");
         std::fs::create_dir(&target).unwrap();
