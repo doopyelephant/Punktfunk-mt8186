@@ -128,15 +128,9 @@ impl Supervisor {
         }
         let _ = rdp::load_pin(&self.root)?;
         let _ = self.accounts.credential_for_start(seat)?;
-        if let Some(session) = wts::active_for_account(&seat.account)? {
-            return Err(backend_error(
-                "wts_unmanaged_active",
-                format!(
-                    "account '{}' already has active non-console session {}",
-                    seat.account, session.id
-                ),
-            ));
-        }
+        // No runtime of ours holds this seat, so a session left on its account is an orphan of
+        // a supervisor that died. Its host would still hold the seat's ports.
+        wts::logoff_account_if_present(&seat.account)?;
         ensure_ports_free(seat)?;
 
         let runtime = {
@@ -345,7 +339,8 @@ struct Rig {
     accounts: AccountManager,
     host_path: PathBuf,
     seat: Seat,
-    /// The keeper, then the job that contains it: they drop in that order.
+    /// The keeper, then the job that contains it and the session children: they drop in that
+    /// order.
     keeper: Option<(ChildProcess, Job)>,
     /// The account's active session, which the cycle's children start in.
     session: Option<u32>,
@@ -522,6 +517,7 @@ impl Rig {
     /// seat's session. It extends the display instead of isolating it.
     fn start_gate(&mut self) -> WinResult<()> {
         let (session, launch) = self.launch()?;
+        let job = self.keeper.as_ref().map(|(_, job)| job);
         let environment = process::seat_environment(
             launch.host_root.path(),
             &self.seat,
@@ -563,6 +559,7 @@ impl Rig {
         .chain(std::iter::once(output.as_os_str().to_owned()))
         .collect::<Vec<_>>();
         let spawned = process::spawn_in_session(
+            job,
             session,
             &self.host_path,
             &arguments,
@@ -616,6 +613,7 @@ impl Rig {
     fn start_host(&mut self) -> WinResult<()> {
         let (session, launch) = self.launch()?;
         let host = process::spawn_in_session(
+            self.keeper.as_ref().map(|(_, job)| job),
             session,
             &self.host_path,
             &[OsString::from("serve")],
@@ -645,7 +643,20 @@ impl Rig {
     }
 }
 
+/// How long a logged-off session's last process gets to let go of the seat's ports.
+const PORT_RELEASE: Duration = Duration::from_secs(3);
+
 fn ensure_ports_free(seat: &Seat) -> WinResult<()> {
+    let give_up = Instant::now() + PORT_RELEASE;
+    loop {
+        match check_ports_free(seat) {
+            Err(_) if Instant::now() < give_up => std::thread::sleep(Duration::from_millis(100)),
+            result => return result,
+        }
+    }
+}
+
+fn check_ports_free(seat: &Seat) -> WinResult<()> {
     let native = seat.native_port;
     if let Some(pid) = udp_port_owners(native).first() {
         return Err(backend_error(
