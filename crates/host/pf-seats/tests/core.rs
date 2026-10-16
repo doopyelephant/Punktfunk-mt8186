@@ -53,6 +53,9 @@ impl PlatformBackend for FakeBackend {
 
     fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
         self.record("start", seat);
+        if seat.account == "wedged" {
+            return Err(BackendError::new("seat_exited", "the unit ended"));
+        }
         let status = RuntimeStatus::running();
         self.state
             .statuses
@@ -797,6 +800,34 @@ fn a_list_reconciles_a_seat_at_rest_and_never_one_that_starts() {
     starter.join().unwrap().unwrap();
     service.dispatch(Command::List).unwrap();
     assert!(backend.inner.calls().contains(&reconciled));
+}
+
+/// A start that fails is followed by a reconcile of its seat, so what the start brought up
+/// beside the unit does not wait for the next `List` to be taken back.
+#[test]
+fn a_failed_start_reconciles_its_seat() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = FakeBackend::default();
+    let service = SeatService::open(temp.path(), backend.clone()).unwrap();
+    let CommandResult::Created { seat } =
+        service.dispatch(create("Wedged", "wedged", false)).unwrap()
+    else {
+        panic!("create");
+    };
+    backend.clear_calls();
+    let failed = service
+        .dispatch(Command::Start {
+            id: seat.id.clone(),
+        })
+        .unwrap_err();
+    assert_eq!(failed.code, ErrorCode::Backend);
+    let calls = backend.calls();
+    let at = |call: String| calls.iter().position(|c| *c == call);
+    let (start, reconcile) = (
+        at(format!("start:{}", seat.id)),
+        at(format!("reconcile:{}", seat.id)),
+    );
+    assert!(start.is_some() && reconcile > start, "{calls:?}");
 }
 
 #[test]
