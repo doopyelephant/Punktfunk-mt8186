@@ -221,23 +221,27 @@ fn spots(steamapps: &Path) -> Vec<Spot> {
     out
 }
 
-/// The box's `seat_library_writable`, read from its [`DEFAULTS`] in `box_dir`: on when the box
-/// wrote none or the file is unreadable.
+/// The box's `seat_library_writable`, read from its [`DEFAULTS`] in `box_dir`. On when the box
+/// wrote none, or none that names the setting. A file that can't be read, or a value that isn't
+/// a bool, reads as off: this setting only ever narrows what a seat may do.
 fn writable(box_dir: &Path) -> bool {
-    let read = || -> std::io::Result<Option<bool>> {
+    let read = || -> std::io::Result<bool> {
         let path = box_dir.join(DEFAULTS);
         let Some((bytes, _)) = safe_open::read(&path, shared::MAX_TRUST_BYTES)? else {
-            return Ok(None);
+            return Ok(true);
         };
         let defaults: serde_json::Value = serde_json::from_slice(&bytes)?;
-        Ok(defaults["library_writable"].as_bool())
+        let object = defaults.as_object().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "not a JSON object")
+        })?;
+        Ok(object
+            .get("library_writable")
+            .is_none_or(|value| value.as_bool().unwrap_or(false)))
     };
-    read()
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, "seat defaults unreadable; the owner's libraries stay writable");
-            None
-        })
-        .unwrap_or(true)
+    read().unwrap_or_else(|error| {
+        tracing::warn!(%error, "seat defaults unreadable; the owner's libraries are read-only");
+        false
+    })
 }
 
 fn fstype(path: &Path) -> Option<String> {
@@ -803,7 +807,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&lock).unwrap(), "held");
     }
 
-    /// The box's Seat default decides; without one the libraries stay writable.
+    /// The box's Seat default decides; without one the libraries stay writable, and a file that
+    /// can't be read as the setting turns them read-only.
     #[test]
     fn the_box_s_seat_default_makes_the_libraries_read_only() {
         let temp = tempfile::tempdir().unwrap();
@@ -820,7 +825,13 @@ mod tests {
             assert_eq!(writable(temp.path()), library_writable);
         }
         std::fs::write(&path, "{}").unwrap();
-        assert!(writable(temp.path()));
+        assert!(writable(temp.path()), "no setting named");
+        for unreadable in ["", "{", "[]", r#"{"library_writable":"yes"}"#, "null"] {
+            std::fs::write(&path, unreadable).unwrap();
+            assert!(!writable(temp.path()), "{unreadable:?}");
+        }
+        std::fs::write(&path, r#"{"library_writable":null}"#).unwrap();
+        assert!(!writable(temp.path()), "a value that isn't a bool");
     }
 
     fn steam_file(home: &Path, dir: &str) -> PathBuf {
@@ -921,8 +932,8 @@ mod tests {
         let b = temp.path().to_path_buf();
         assert_eq!(
             within(move || writable(&b)),
-            Some(true),
-            "unreadable reads as writable"
+            Some(false),
+            "unreadable reads as read-only"
         );
     }
 }
