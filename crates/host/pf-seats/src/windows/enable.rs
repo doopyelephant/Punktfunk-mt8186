@@ -219,7 +219,7 @@ pub(super) fn turn_off() -> WinResult<()> {
         return Ok(());
     };
     close_rdp_rules(&seats)?;
-    if seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok() == Some(0) {
+    if narrowed(&seats) {
         restore_scopes(&seats)?;
     }
     if seats.get_value::<u32, _>(LISTENER_WAS_OFF).ok() == Some(1) {
@@ -397,7 +397,7 @@ fn apply(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
     install_driver(&dir, true)?;
     allow_listener(&seats)?;
     // A choice made earlier narrowed the rules; allowing the network now puts them back.
-    let narrowed = seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok() == Some(0);
+    let was_narrowed = narrowed(&seats);
     record_scopes(&seats)?;
     if !allow_rdp_from_network {
         firewall_scope(LOOPBACK).map_err(|cause| {
@@ -407,7 +407,7 @@ fn apply(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
                 cause,
             )
         })?;
-    } else if narrowed {
+    } else if was_narrowed {
         restore_scopes(&seats)?;
     }
     if allow_rdp_from_network {
@@ -638,6 +638,20 @@ fn record_scopes(seats: &RegKey) -> WinResult<()> {
     seats
         .set_value(RDP_RULE_SCOPES, &scopes.join("\n"))
         .map_err(|cause| fail(cause.to_string()))
+}
+
+/// The rules may be narrowed to this PC: the operator chose so, or a turn-on was cut off after
+/// noting their scopes and before noting the choice. Restoring a rule that was not narrowed
+/// writes back the scope it has.
+fn narrowed(seats: &RegKey) -> bool {
+    narrowed_by(
+        seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok(),
+        seats.get_value::<String, _>(RDP_RULE_SCOPES).is_ok(),
+    )
+}
+
+fn narrowed_by(choice: Option<u32>, scopes_noted: bool) -> bool {
+    choice.map_or(scopes_noted, |choice| choice == 0)
 }
 
 /// The `(rule, addresses)` pairs [`record_scopes`] wrote. A line with no address is dropped.
@@ -1049,6 +1063,15 @@ mod tests {
         assert!(script.contains("@('RemoteDesktop-UserMode-In-TCP','{guid-1}') -notcontains"));
         // With no record every rule opens, as before the scopes were kept.
         assert!(restore_script(&[]).contains("@() -notcontains $_.Name"));
+    }
+
+    #[test]
+    fn a_cut_off_turn_on_that_noted_the_scopes_may_have_narrowed_them() {
+        assert!(narrowed_by(Some(0), false));
+        assert!(!narrowed_by(Some(1), true));
+        assert!(narrowed_by(None, true));
+        // An older key has no record and always has the choice; a bare key has neither.
+        assert!(!narrowed_by(None, false));
     }
 
     #[test]
