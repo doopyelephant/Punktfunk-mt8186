@@ -58,14 +58,17 @@ as_door() { runuser -u punktfunk -- "$@"; }
 # then there is nothing running to change.
 user_ctl() { runuser -u "$user" -- env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user "$@" 2>/dev/null; }
 
+# $1 a file name under $BOX, written there from stdin as the door. The door owns $BOX, so root
+# never writes a path in it: a link the door plants there leads only where the door can go.
+to_door() {
+    # shellcheck disable=SC2016 # the inner shell expands $1, not this one
+    as_door sh -c 'umask 077; cat >"$1.tmp" && mv -f "$1.tmp" "$1"' sh "$BOX/$1"
+}
+
 # $1 a file name under $OWN, copied to $BOX for the door.
 take() {
     as_user test -f "$OWN/$1" || return 0
-    tmp=$(mktemp "$BOX/.door.XXXXXX")
-    as_user cat -- "$OWN/$1" >"$tmp"
-    chown punktfunk:punktfunk "$tmp"
-    chmod 0600 "$tmp"
-    mv -f "$tmp" "$BOX/$1"
+    as_user cat -- "$OWN/$1" | to_door "$1"
 }
 
 # $1 a file name under $BOX, copied back to the user. Read as the door, written as the user, so
@@ -83,11 +86,7 @@ steamos_password() { as_user test -f "$OWN/web.env" && ! as_user test -f "$OWN/w
 
 take_password() {
     steamos_password || return 0
-    tmp=$(mktemp "$BOX/.door.XXXXXX")
-    as_user cat -- "$OWN/web.env" | grep -E "$PASSWORD_LINE" >"$tmp" || true
-    chown punktfunk:punktfunk "$tmp"
-    chmod 0600 "$tmp"
-    mv -f "$tmp" "$BOX/web-password"
+    as_user cat -- "$OWN/web.env" | { grep -E "$PASSWORD_LINE" || true; } | to_door web-password
 }
 
 give_password() {
@@ -107,11 +106,7 @@ give_password() {
 PORT_LINE='^[[:space:]]*PUNKTFUNK_(MGMT_BIND|NATIVE_PORT)[[:space:]]*='
 
 take_ports() {
-    tmp=$(mktemp "$BOX/.door.XXXXXX")
-    as_user cat -- "$OWN/host.env" 2>/dev/null | grep -E "$PORT_LINE" >"$tmp" || true
-    chown punktfunk:punktfunk "$tmp"
-    chmod 0600 "$tmp"
-    mv -f "$tmp" "$BOX/host.env"
+    as_user cat -- "$OWN/host.env" 2>/dev/null | { grep -E "$PORT_LINE" || true; } | to_door host.env
 }
 
 safe_name() {
@@ -119,7 +114,7 @@ safe_name() {
 }
 
 take_avatars() {
-    install -d -m 0700 -o punktfunk -g punktfunk "$BOX/profiles"
+    as_door mkdir -p -m 0700 "$BOX/profiles"
     for name in $(as_user ls -1 -- "$OWN/profiles" 2>/dev/null); do
         safe_name "$name" && take "profiles/$name"
     done
@@ -153,7 +148,7 @@ door_on() {
         for f in $FILES; do take "$f"; done
         take_password
         take_avatars
-        : >"$MARK"
+        as_door touch "$MARK"
     fi
     take_ports
     install -d -m 0711 -o root -g root "$STATE"
