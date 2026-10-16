@@ -18,6 +18,7 @@ fn media() -> MediaV2 {
         clock_origin_ns: 0,
         keys: None,
         clock: None,
+        clear_placement: false,
     }
 }
 
