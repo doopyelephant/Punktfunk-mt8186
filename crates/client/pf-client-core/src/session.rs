@@ -1027,6 +1027,7 @@ fn pump(
         access,
         planes,
         decoder,
+        lent_au_memory: None,
         wants_decode: connector.wants_decode_latency(),
         marks_repeats: connector.host_caps2() & punktfunk_core::quic::HOST_CAP2_REPEAT_MARK != 0,
         advertised_codecs,
@@ -1037,6 +1038,7 @@ fn pump(
         ev_tx,
         params,
     };
+    p.lend_au_memory();
     let end = p.run();
     p.finish(end);
 }
@@ -1074,6 +1076,8 @@ struct Pump {
     access: crate::access::SessionAccess,
     planes: PlaneThreads,
     decoder: Decoder,
+    /// The decoder's in-place AU memory as lent to the connector; a resize can bring a new one.
+    lent_au_memory: Option<Arc<dyn punktfunk_core::au::AuMemory>>,
     /// Report decode stage to ABR only when armed. Constant for the session.
     wants_decode: bool,
     /// Host marks a re-encoded hold (`USER_FLAG_REPEAT`); an older host never sets the bit.
@@ -1213,10 +1217,11 @@ impl Pump {
                 self.au_dump = None;
             }
         }
-        match self
-            .decoder
-            .decode_frame(&frame.data, frame.flags, frame.complete)
-        {
+        let mut frame = frame;
+        let data = std::mem::take(&mut frame.data);
+        let decoded = self.decoder.decode_au(data, frame.flags, frame.complete);
+        self.lend_au_memory();
+        match decoded {
             Ok(Some(image)) => self.on_decoded(image, &frame, received_ns),
             // No output under one-in/one-out LOW_DELAY means wedged on missing
             // references with no reassembler drop. Three in a row ask for an IDR.
@@ -1234,6 +1239,24 @@ impl Pump {
             }
         }
         self.after_decode()
+    }
+
+    /// Lend the decoder's in-place AU memory to the connector when it is new: at open, and
+    /// after a resize outgrew the last ring. The reassembler then writes AUs where the
+    /// decoder reads them.
+    fn lend_au_memory(&mut self) {
+        let Some(memory) = self.decoder.au_memory() else {
+            return;
+        };
+        if self
+            .lent_au_memory
+            .as_ref()
+            .is_some_and(|lent| Arc::ptr_eq(lent, &memory))
+        {
+            return;
+        }
+        self.connector.set_au_memory(memory.clone());
+        self.lent_au_memory = Some(memory);
     }
 
     /// After a decode that keeps the session: the software demotion the presenter asked
@@ -1389,6 +1412,11 @@ impl Pump {
             reason = end.as_deref().unwrap_or("user"),
             "session ended"
         );
+        // Back to heap memory: the next decoder lends its own ring, and this one can go.
+        if self.lent_au_memory.take().is_some() {
+            self.connector
+                .set_au_memory(Arc::new(punktfunk_core::au::HeapPool::default()));
+        }
         let last = match self.codec_fallback.take() {
             Some(ev) => ev,
             None if self.not_ready => SessionEvent::HostNotReady(end.unwrap_or_default()),

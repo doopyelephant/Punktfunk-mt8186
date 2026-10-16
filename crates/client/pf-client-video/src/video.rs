@@ -916,16 +916,22 @@ impl Decoder {
     ) -> Result<Decoder> {
         // Never the native rung — see [`report_au_fault_env`].
         report_au_fault_env(false);
+        let mut rung = crate::video_pyrowave::PyroWaveDecoder::new(
+            vk,
+            width,
+            height,
+            shard_payload,
+            chroma444,
+            color,
+            hdr16,
+        )?;
+        // The presenter's device outlives every frame it is handed, as it does for the
+        // plane ring: nothing else holds it for a lent slot.
+        if let Err(e) = rung.enable_in_place(std::sync::Arc::new(())) {
+            tracing::info!(error = %format!("{e:#}"), "PyroWave AUs are copied into the decoder");
+        }
         Ok(Decoder {
-            rung: Box::new(crate::video_pyrowave::PyroWaveDecoder::new(
-                vk,
-                width,
-                height,
-                shard_payload,
-                chroma444,
-                color,
-                hdr16,
-            )?),
+            rung: Box::new(rung),
             wire_codec: punktfunk_core::quic::CODEC_PYROWAVE,
             fails: 0,
             first_fail: None,
@@ -1015,7 +1021,35 @@ impl Decoder {
         user_flags: u32,
         complete: bool,
     ) -> Result<Option<DecodedImage>> {
-        let out = self.decode_frame_inner(au, user_flags, complete);
+        self.feed(|rung| rung.decode(au, user_flags, complete), complete)
+    }
+
+    /// [`Self::decode_frame`] with the AU's own buffer: PyroWave reads it where it lies.
+    pub fn decode_au(
+        &mut self,
+        au: punktfunk_core::au::AuBuf,
+        user_flags: u32,
+        complete: bool,
+    ) -> Result<Option<DecodedImage>> {
+        self.feed(
+            move |rung| rung.decode_au(au, user_flags, complete),
+            complete,
+        )
+    }
+
+    /// Memory the rung reads AUs from in place, for the session to lend; `None` = the heap.
+    pub fn au_memory(&self) -> Option<std::sync::Arc<dyn punktfunk_core::au::AuMemory>> {
+        self.rung.au_memory()
+    }
+
+    /// Run one decode through the rung, counting a picture as a handover for the
+    /// retiring rung.
+    fn feed(
+        &mut self,
+        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<DecodedImage>>,
+        complete: bool,
+    ) -> Result<Option<DecodedImage>> {
+        let out = self.decode_frame_inner(feed, complete);
         if let (Ok(Some(_)), Some(r)) = (&out, self.retiring.as_mut()) {
             r.1 += 1;
             if r.1 >= RETIRE_HANDOVERS && r.2.elapsed() >= RETIRE_MIN_AGE {
@@ -1027,11 +1061,10 @@ impl Decoder {
 
     fn decode_frame_inner(
         &mut self,
-        au: &[u8],
-        user_flags: u32,
+        feed: impl FnOnce(&mut dyn Rung) -> Result<Option<DecodedImage>>,
         complete: bool,
     ) -> Result<Option<DecodedImage>> {
-        let result = self.rung.decode(au, user_flags, complete);
+        let result = feed(self.rung.as_mut());
         // PyroWave and the CPU rung have nothing below them: their error is the pump's.
         let Some(from) = self.rung.id().filter(|r| *r != NativeRung::Software) else {
             return result;
