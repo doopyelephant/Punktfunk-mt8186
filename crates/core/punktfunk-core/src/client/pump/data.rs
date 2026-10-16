@@ -201,6 +201,9 @@ impl DataPump {
             if let Some(window) = tick.window {
                 self.close_window(&mut lp, window, request_kbps);
             }
+            if let Some(memory) = self.shared.au_memory.lock().unwrap().take() {
+                self.session.set_au_memory(memory);
+            }
             let polled = self.session.poll_frame();
             self.ask_for_short_tails();
             let now = Instant::now();

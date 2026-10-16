@@ -27,8 +27,8 @@ pub struct AuBuf {
 
 impl AuBuf {
     /// `len` bytes of a store from `memory`, or of the heap when it has none. Contents
-    /// unspecified: the reassembler writes every byte it hands up.
-    pub(crate) fn take(memory: &dyn AuMemory, len: usize) -> AuBuf {
+    /// unspecified: the caller writes every byte it hands on.
+    pub fn take(memory: &dyn AuMemory, len: usize) -> AuBuf {
         let store = memory
             .take(len)
             .filter(|s| s.bytes().len() >= len)
@@ -39,6 +39,10 @@ impl AuBuf {
     /// The store, for a decoder that reads the AU where it lies.
     pub fn store(&self) -> &dyn AuStore {
         &*self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut dyn AuStore {
+        &mut *self.store
     }
 
     /// Grow or shrink to `len` bytes. Growth past the store moves to a larger one from
