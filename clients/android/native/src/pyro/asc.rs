@@ -79,15 +79,17 @@ pub(super) struct Draw {
 }
 
 impl AscTarget {
-    /// A layer over `window`, or `None` where `ASurfaceControl` is missing.
+    /// A layer over `window` voting `frame_rate`, or `None` where `ASurfaceControl` is missing.
+    /// `force_switch` lets the vote switch the panel non-seamlessly.
     pub(super) fn new(
         dev: &PyroDevice,
         window: &NativeWindow,
         surface_size: Arc<AtomicU64>,
         src_crop: Arc<AtomicU64>,
         frame_rate: f32,
+        force_switch: bool,
     ) -> Result<Option<AscTarget>> {
-        let Some(layer) = Layer::create(window, surface_size, src_crop) else {
+        let Some(layer) = Layer::create(window, surface_size, src_crop, force_switch) else {
             return Ok(None);
         };
         let mut done = [vk::Semaphore::null(); FRAMES];

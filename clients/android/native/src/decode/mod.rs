@@ -144,8 +144,8 @@ pub(crate) struct DecodeOptions {
     /// pipeline thread boosts, ADPF max-performance and the forced TV mode switch. Off ⇒ the same
     /// loop and presenter with plain keys and no boosts — the per-device escape hatch.
     pub low_latency_mode: bool,
-    /// TV form factor (Kotlin's `UiModeManager`): actively drive the HDMI output into the stream's
-    /// refresh mode, vs. the softer seamless hint on a phone/tablet.
+    /// TV form factor (Kotlin's `UiModeManager`): the HDMI mode switch is forced only with
+    /// low-latency mode on ([`DecodeOptions::force_rate_switch`]).
     pub is_tv: bool,
     /// ChromeOS (ARC): present through the SurfaceView, never ASurfaceControl — see
     /// [`asc_presenter::asc_backend_selected`].
@@ -183,6 +183,16 @@ pub(crate) struct DecodeOptions {
     /// Not the session's first video start: the stream is mid-flight, so the fresh decoder
     /// holds no reference picture the next P-frames lean on.
     pub restart: bool,
+}
+
+impl DecodeOptions {
+    /// Whether the stream's frame-rate vote may switch the panel non-seamlessly
+    /// (`CHANGE_FRAME_RATE_ALWAYS`). A phone or tablet always may: Android 15+ holds a game at
+    /// 60 Hz, and a seamless-only vote cannot leave a 60 Hz mode whose 120 Hz sibling sits in
+    /// another mode group. A TV only with low-latency mode on: its HDMI switch blanks the picture.
+    pub(crate) fn force_rate_switch(&self) -> bool {
+        !self.is_tv || self.low_latency_mode
+    }
 }
 
 /// The decode entry point on the `pf-decode` thread: dispatches to the codec's loop. All of

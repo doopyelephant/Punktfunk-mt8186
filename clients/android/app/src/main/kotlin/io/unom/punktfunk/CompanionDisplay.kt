@@ -121,15 +121,19 @@ internal fun PictureSurface(handle: Long, modifier: Modifier = Modifier) {
     )
 }
 
-/** Every display as one `pf.display` line: what a dual-screen device reports, for its bundle. */
+/**
+ * Every display as one `pf.display` line for the bundle: what a dual-screen device reports, and
+ * the refresh rates its mode table offers at the current resolution.
+ */
 internal fun describeDisplays(context: Context, dm: DisplayManager): String {
     val presentation = dm.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION).map { it.displayId }
     return dm.displays.joinToString(" | ") { d ->
         val m = context.createDisplayContext(d).resources.displayMetrics
+        val hz = d.sameResolutionModes().map { it.refreshRate.roundToInt() }.distinct().sorted()
         "id=${d.displayId} \"${d.name}\" ${m.widthPixels}x${m.heightPixels} dpi=${m.densityDpi} " +
             "xdpi=${m.xdpi.roundToInt()} in=${String.format(Locale.ROOT, "%.1f", d.diagonalInches(context))} " +
             "sizeless=${d.sizeless(context)} flags=0x${Integer.toHexString(d.flags)} " +
-            "presentation=${d.displayId in presentation}"
+            "presentation=${d.displayId in presentation} hz=${hz.joinToString("/")}"
     }
 }
 

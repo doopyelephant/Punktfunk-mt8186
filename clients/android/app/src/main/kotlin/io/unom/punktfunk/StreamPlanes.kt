@@ -129,13 +129,13 @@ internal class StreamPlanes(
         // size, not the buffer geometry: the layer composites in the view's space.
         NativeBridge.nativeVideoSurfaceSize(handle, view.width, view.height)
         // Some OEM builds reset the frame-rate vote on a geometry change, dropping the 120 Hz pin.
-        // The native hint's policy: ALWAYS only on the TV low-latency path, so a phone's re-hint
-        // never forces a mode flicker.
+        // ALWAYS lets a phone leave the 60 Hz Android 15+ holds a game at; a TV forces its HDMI
+        // switch only in low-latency mode. Same rule as the native `force_rate_switch`.
         if (streamHz > 0) runCatching {
             holder.surface.setFrameRate(
                 streamHz.toFloat(),
                 Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
-                if (isTv && lowLatencyMode) {
+                if (!isTv || lowLatencyMode) {
                     Surface.CHANGE_FRAME_RATE_ALWAYS
                 } else {
                     Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS

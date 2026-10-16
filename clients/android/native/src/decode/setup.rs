@@ -169,23 +169,18 @@ pub(crate) fn boost_thread_priority() {
 /// floor, so both are dlsym-resolved at runtime (a hard import of a >floor symbol makes
 /// `dlopen`/`System.load` fail on every API-28/29 device, even where this path is never hit —
 /// mirrors [`crate::adpf`]):
-///   - On a **TV** (`is_tv`): `ANativeWindow_setFrameRateWithChangeStrategy` (**API 31**) with
-///     `changeFrameRateStrategy = ALWAYS`, which actively drives the HDMI output into the matching
-///     mode (e.g. 60↔120) instead of leaving the panel at its default and judder-matching. The
-///     forced switch may blank the panel briefly — acceptable once at stream start, not wanted on a
-///     phone. Falls through to the 2-arg hint on API 30.
-///   - Otherwise: `ANativeWindow_setFrameRate` (**API 30**) — the seamless-preferred hint for
-///     phones/tablets and the universal fallback.
+///   - `always` ([`super::DecodeOptions::force_rate_switch`]):
+///     `ANativeWindow_setFrameRateWithChangeStrategy` (**API 31**) with strategy `ALWAYS`, which
+///     may switch the panel non-seamlessly (a brief blank once at stream start). Falls through to
+///     the 2-arg hint on API 30.
+///   - Otherwise: `ANativeWindow_setFrameRate` (**API 30**), the seamless-only hint.
 ///
-/// Both paths pass `compatibility = FIXED_SOURCE` (1): the stream is fixed-rate video content the
-/// client cannot re-pace, which is exactly what that value declares — `DEFAULT` (0) told the
-/// platform the app could adapt to whatever rate it picked, an invitation some OEM refresh
-/// governors accepted by simply not switching. (The window-level `preferredDisplayModeId` pin in
-/// `MainActivity.setStreamDisplayMode` is the phone-side belt to this braces.)
+/// Both pass `compatibility = FIXED_SOURCE` (1): the stream is fixed-rate video the client cannot
+/// re-pace. `DEFAULT` (0) invites an OEM governor to simply not switch.
 ///
 /// Returns `true` when the platform accepted a hint; `false` on API < 30 (symbols absent) or a
 /// decline.
-pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: bool) -> bool {
+pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, always: bool) -> bool {
     // int32_t ANativeWindow_setFrameRate(ANativeWindow*, float frameRate, int8_t compatibility)
     type SetFrameRateFn = unsafe extern "C" fn(*mut c_void, f32, i8) -> i32;
     // int32_t ANativeWindow_setFrameRateWithChangeStrategy(
@@ -201,9 +196,8 @@ pub(super) fn try_set_frame_rate(window: &NativeWindow, frame_rate: f32, is_tv: 
         }
         // ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE — fixed-rate video content.
         const FIXED_SOURCE: i8 = 1;
-        // TV: prefer the API-31 change-strategy form to force the mode switch (strategy 1 =
-        // ALWAYS). Absent on API 30 ⇒ fall through to the 2-arg hint below.
-        if is_tv {
+        // Strategy 1 = ALWAYS. Absent on API 30 ⇒ fall through to the 2-arg hint below.
+        if always {
             if let Some(set) = crate::sym::<SetFrameRateStrategyFn>(
                 lib,
                 c"ANativeWindow_setFrameRateWithChangeStrategy",
