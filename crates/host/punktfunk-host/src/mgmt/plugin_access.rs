@@ -336,22 +336,31 @@ pub(crate) async fn decide_plugin_access(
     if req.form.as_deref().is_some_and(|f| !valid_form(f)) {
         return api_error(StatusCode::BAD_REQUEST, FORM_INVALID);
     }
+    // A store call may change a folder's ACL, which walks its whole tree on Windows.
+    let store = |f: Box<dyn FnOnce(&MgmtState) -> std::io::Result<_> + Send>| {
+        let st = Arc::clone(&st);
+        blocking("plugin access", move || f(&st))
+    };
     let outcome = match (decision, req.write) {
         (Decision::Allow, Some(write)) => {
-            let path = std::path::Path::new(&req.path);
-            let dir = match path.parent() {
-                Some(parent) if path.is_file() => parent,
-                _ => path,
-            };
-            match &req.form {
-                Some(form) => st.access.hand(&plugin, dir, write, form),
-                None => st.access.grant(&plugin, dir, write, "console"),
-            }
-            .and_then(|_| st.access.snapshot_for(&plugin))
-            .map(|value| crate::plugins::access::Mutation {
-                value,
-                changed: true,
-            })
+            let (plugin, path, form) = (plugin.clone(), req.path.clone(), req.form.clone());
+            store(Box::new(move |st| {
+                let path = std::path::Path::new(&path);
+                let dir = match path.parent() {
+                    Some(parent) if path.is_file() => parent,
+                    _ => path,
+                };
+                match &form {
+                    Some(form) => st.access.hand(&plugin, dir, write, form),
+                    None => st.access.grant(&plugin, dir, write, "console"),
+                }
+                .and_then(|_| st.access.snapshot_for(&plugin))
+                .map(|value| crate::plugins::access::Mutation {
+                    value,
+                    changed: true,
+                })
+            }))
+            .await
         }
         (Decision::Allow, None) => {
             // An emulator request: the install lands first, so the grant has a folder and a
@@ -391,10 +400,23 @@ pub(crate) async fn decide_plugin_access(
                     Err(resp) => return resp,
                 }
             }
-            st.access
-                .decide(&plugin, &req.path, Decision::Allow, "console")
+            let (plugin, path) = (plugin.clone(), req.path.clone());
+            store(Box::new(move |st| {
+                st.access.decide(&plugin, &path, Decision::Allow, "console")
+            }))
+            .await
         }
-        (decision, _) => st.access.decide(&plugin, &req.path, decision, "console"),
+        (decision, _) => {
+            let (plugin, path) = (plugin.clone(), req.path.clone());
+            store(Box::new(move |st| {
+                st.access.decide(&plugin, &path, decision, "console")
+            }))
+            .await
+        }
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(resp) => return resp,
     };
     match outcome {
         Ok(m) => {
@@ -434,11 +456,21 @@ pub(crate) async fn release_plugin_access(
     if !valid_form(&req.form) {
         return api_error(StatusCode::BAD_REQUEST, FORM_INVALID);
     }
-    match st
-        .access
-        .release(&plugin, &req.form, &req.keep)
-        .and_then(|m| Ok((m.changed, st.access.snapshot_for(&plugin)?)))
-    {
+    // A grant only forms held goes with them, and its ACL with it: off the async workers.
+    let released = {
+        let (st, plugin) = (Arc::clone(&st), plugin.clone());
+        blocking("plugin access", move || {
+            st.access
+                .release(&plugin, &req.form, &req.keep)
+                .and_then(|m| Ok((m.changed, st.access.snapshot_for(&plugin)?)))
+        })
+        .await
+    };
+    let released = match released {
+        Ok(released) => released,
+        Err(resp) => return resp,
+    };
+    match released {
         Ok((changed, snap)) => {
             if changed {
                 tokio::task::spawn_blocking(crate::plugins::converge_after_decision);
