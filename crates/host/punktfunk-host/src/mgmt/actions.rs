@@ -407,9 +407,10 @@ pub(crate) async fn invoke_action(
         crate::session_status::stop_all_quit();
         let _ = app.quit_session("host power action");
         // Seat hosts run their own sessions and never hear this close. A process restart leaves
-        // them standing.
+        // them standing. A supervisor that doesn't answer must not hold the action back.
         if verb != PowerVerb::Restart {
-            let _ = tokio::task::spawn_blocking(crate::seats::end_all_sessions).await;
+            let ended = tokio::task::spawn_blocking(crate::seats::end_all_sessions);
+            let _ = tokio::time::timeout(SEATS_END_BUDGET, ended).await;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         // Displays first: going under on a still-up display is not a transient.
@@ -483,6 +484,9 @@ async fn invoke_display_next(
     });
     Json(ActionOutcome { monitor: to }).into_response()
 }
+
+/// How long a power action waits for the seats' sessions to end.
+const SEATS_END_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Wait for signaled sessions to drop their virtual displays before going under anyway.
 /// Longer than the 1.5 s handshake release grace, short enough a wedged teardown cannot
