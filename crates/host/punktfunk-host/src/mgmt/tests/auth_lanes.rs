@@ -10,7 +10,7 @@ async fn host_actions_follow_the_power_grant() {
     use punktfunk_core::quic::{GRANT_ALL_PRE_POWER, GRANT_GAMEPAD};
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-actions-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-actions.json")),
             None,
             false,
         )
@@ -95,9 +95,7 @@ async fn title_installs_follow_the_manage_grant() {
     use punktfunk_core::quic::{GRANT_ALL, GRANT_ALL_PRE_MANAGE, GRANT_GAMEPAD, GRANT_LAUNCH};
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir().join(format!("pf-mgmt-installs-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-installs.json")),
             None,
             false,
         )
@@ -169,10 +167,7 @@ async fn display_next_follows_the_live_session_not_the_power_grant() {
     let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir()
-                    .join(format!("pf-mgmt-display-next-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-display-next.json")),
             None,
             false,
         )
@@ -243,7 +238,7 @@ async fn display_next_follows_the_live_session_not_the_power_grant() {
 async fn cert_auth_is_a_read_only_allowlist() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-cert-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-cert.json")),
             None,
             false,
         )
@@ -386,7 +381,7 @@ async fn bearer_admin_is_loopback_only() {
 
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-lanlib-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-lanlib.json")),
             None,
             false,
         )

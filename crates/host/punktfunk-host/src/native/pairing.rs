@@ -179,10 +179,7 @@ mod tests {
     use std::time::Duration;
 
     fn temp(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "pf-native-ceremony-{tag}-{}.json",
-            std::process::id()
-        ))
+        crate::test_support::scratch().join(format!("pf-native-ceremony-{tag}.json"))
     }
 
     fn controller_4h() -> Access {

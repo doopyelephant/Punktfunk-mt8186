@@ -6,7 +6,7 @@ use super::*;
 async fn native_pairing_arm_show_and_unpair() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-np-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-np.json")),
             None,
             false,
         )
@@ -66,7 +66,7 @@ async fn native_pairing_arm_show_and_unpair() {
 async fn native_unpair_all_empties_the_trust_store() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-np-all-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-np-all.json")),
             None,
             false,
         )
@@ -113,7 +113,7 @@ async fn native_unpair_all_without_a_native_host_is_unavailable() {
 async fn pending_devices_approve_and_deny() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-pending-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-pending.json")),
             None,
             false,
         )
@@ -195,7 +195,7 @@ async fn patch_native_access_reflects_in_list_and_fires_watch() {
     use punktfunk_core::quic::{GRANT_GAMEPAD, GRANT_POINTER};
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-patch-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-patch.json")),
             None,
             false,
         )
@@ -305,9 +305,7 @@ async fn patch_native_access_validates_and_404s() {
     use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir().join(format!("pf-mgmt-patch-val-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-patch-val.json")),
             None,
             false,
         )
@@ -372,9 +370,7 @@ async fn patch_native_access_validates_and_404s() {
 async fn until_disconnect_alone_is_refused_rather_than_widening_access() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir().join(format!("pf-mgmt-lone-udc-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-lone-udc.json")),
             None,
             false,
         )
@@ -431,9 +427,7 @@ async fn until_disconnect_alone_is_refused_rather_than_widening_access() {
 async fn a_wan_knock_is_listed_as_wan_and_refused_by_approve() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir().join(format!("pf-mgmt-wan-knock-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-wan-knock.json")),
             None,
             false,
         )
@@ -495,10 +489,7 @@ async fn approve_with_access_pins_the_chosen_mask() {
     use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir()
-                    .join(format!("pf-mgmt-approve-acc-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-approve-acc.json")),
             None,
             false,
         )
@@ -562,7 +553,7 @@ async fn arm_with_access_ceremony_inherits_the_choice() {
     use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-arm-acc-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-arm-acc.json")),
             None,
             false,
         )
@@ -613,10 +604,7 @@ async fn arm_with_access_ceremony_inherits_the_choice() {
 async fn approve_and_arm_without_access_fields_keep_todays_behavior() {
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(
-                std::env::temp_dir()
-                    .join(format!("pf-mgmt-acc-compat-{}.json", std::process::id())),
-            ),
+            Some(crate::test_support::scratch().join("pf-mgmt-acc-compat.json")),
             None,
             false,
         )

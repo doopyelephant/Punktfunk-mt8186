@@ -365,7 +365,7 @@ async fn local_summary_takes_the_tray_token_from_loopback_only_and_is_non_sensit
     let _serial = crate::session_status::tests::REGISTRY.lock().await;
     let np = Arc::new(
         crate::native_pairing::NativePairing::load_with(
-            Some(std::env::temp_dir().join(format!("pf-mgmt-summary-{}.json", std::process::id()))),
+            Some(crate::test_support::scratch().join("pf-mgmt-summary.json")),
             None,
             false,
         )

@@ -714,8 +714,10 @@ mod tests {
 
     #[test]
     fn scale_map_roundtrips_and_rejects_junk() {
-        let path = std::env::temp_dir().join(format!("pf-scale-{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        // Its own dir: `set` hardens the parent, which must not be the shared temp root.
+        let dir = std::env::temp_dir().join(format!("pf-scale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("scale.json");
         let mut m = ScaleMap {
             path: path.clone(),
             map: Default::default(),
@@ -731,6 +733,6 @@ mod tests {
         let reread: std::collections::BTreeMap<String, f64> =
             serde_json::from_slice(&bytes).unwrap();
         assert_eq!(reread.get("k"), Some(&1.5));
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

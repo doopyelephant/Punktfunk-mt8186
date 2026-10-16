@@ -309,9 +309,7 @@ mod tests {
     use rcgen::{KeyPair, PublicKeyData as _, SigningKey as _, PKCS_ECDSA_P256_SHA256};
 
     fn store(tag: &str) -> Arc<crate::native_pairing::NativePairing> {
-        let path =
-            std::env::temp_dir().join(format!("pf-wt-auth-{tag}-{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = crate::test_support::scratch().join(format!("pf-wt-auth-{tag}.json"));
         Arc::new(crate::native_pairing::NativePairing::load_with(Some(path), None, false).unwrap())
     }
 

@@ -1275,13 +1275,7 @@ mod tests {
         use crate::native_pairing::{Access, NativePairing};
         use punktfunk_core::quic::{GRANT_ALL, GRANT_GAMEPAD};
         use std::sync::Arc;
-        let x = 0u8;
-        let p = std::env::temp_dir().join(format!(
-            "pf-gs-session-access-{}-{}.json",
-            std::process::id(),
-            &x as *const _ as usize
-        ));
-        let _ = std::fs::remove_file(&p);
+        let p = crate::test_support::scratch().join("pf-gs-session-access.json");
         let np = Arc::new(NativePairing::load_with(Some(p.clone()), None, false).unwrap());
         let now = crate::clock::unix_secs();
 

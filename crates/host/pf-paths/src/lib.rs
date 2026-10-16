@@ -178,8 +178,10 @@ fn private_dir_mode(door: bool, dir: &std::path::Path, config: &std::path::Path)
 /// Tightens an already-existing dir. Windows refuses a reparse point
 /// ([`reject_reparse_point`]): hardening a junction would harden the
 /// attacker-chosen target while the link stays theirs. Default
-/// `%ProgramData%` ACLs grant Users *create*.
+/// `%ProgramData%` ACLs grant Users *create*. Never the shared temp root:
+/// Windows would lock its owner out, so a test keeps its files in a subdir.
 pub fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    debug_assert_ne!(dir, std::env::temp_dir(), "hardening the shared temp root");
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
