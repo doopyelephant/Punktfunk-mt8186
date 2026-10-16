@@ -338,37 +338,63 @@ pub fn run_within(
     limit: std::time::Duration,
 ) -> std::io::Result<std::process::Output> {
     use std::io::Read;
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::thread::{sleep, spawn, JoinHandle};
     use std::time::{Duration, Instant};
-    fn drain(pipe: Option<impl Read + Send + 'static>) -> Option<JoinHandle<Vec<u8>>> {
+    /// How long a killed process may take to go, and how long a pipe may stay open after its
+    /// writer exited. A process stuck in the kernel outlives its kill; a grandchild keeps a pipe.
+    const GRACE: Duration = Duration::from_secs(2);
+    type Drain = (Arc<Mutex<Vec<u8>>>, JoinHandle<()>);
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> Option<Drain> {
         pipe.map(|mut pipe| {
-            spawn(move || {
-                let mut bytes = Vec::new();
-                let _ = pipe.read_to_end(&mut bytes);
-                bytes
-            })
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&bytes);
+            let reader = spawn(move || {
+                let mut chunk = [0_u8; 4096];
+                while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                    let mut sink = sink.lock().unwrap_or_else(PoisonError::into_inner);
+                    sink.extend_from_slice(&chunk[..n]);
+                }
+            });
+            (bytes, reader)
         })
+    }
+    fn wait(
+        child: &mut std::process::Child,
+        limit: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            sleep(Duration::from_millis(10));
+        }
     }
     let mut child = command.spawn()?;
     let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
-    let deadline = Instant::now() + limit;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            // The readers end with the pipes, which a grandchild may hold open: don't join them.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("no exit within {} s", limit.as_secs()),
-            ));
-        }
-        sleep(Duration::from_millis(10));
+    let Some(status) = wait(&mut child, limit)? else {
+        let _ = child.kill();
+        let _ = wait(&mut child, GRACE);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no exit within {} s", limit.as_secs()),
+        ));
     };
-    let bytes = |reader: Option<JoinHandle<Vec<u8>>>| {
-        reader.map_or_else(Vec::new, |reader| reader.join().unwrap_or_default())
+    // A pipe a grandchild still holds open is not waited on: the reader's bytes so far are all.
+    let bytes = |drain: Option<Drain>| {
+        let Some((bytes, reader)) = drain else {
+            return Vec::new();
+        };
+        let end = Instant::now() + GRACE;
+        while !reader.is_finished() && Instant::now() < end {
+            sleep(Duration::from_millis(10));
+        }
+        let mut bytes = bytes.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut *bytes)
     };
     Ok(std::process::Output {
         status,
@@ -958,6 +984,26 @@ mod tests {
             Duration::from_millis(200),
         );
         assert_eq!(hung.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A process the tool left behind holds the pipe open; the call still ends, with the output.
+    #[test]
+    fn a_grandchild_holding_the_pipe_does_not_hold_the_call() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let (program, args): (_, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "start /B ping -n 20 127.0.0.1 & echo hi"])
+        } else {
+            ("sh", &["-c", "sleep 20 & echo hi"])
+        };
+        let started = Instant::now();
+        let done = run_within(
+            Command::new(program).args(args).stdout(Stdio::piped()),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&done.stdout).contains("hi"));
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 }
