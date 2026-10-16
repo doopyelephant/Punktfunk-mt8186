@@ -495,7 +495,9 @@ it, so it moves to the row's ports at boot, logged in or not. The owner's own co
   must be in the `punktfunk-update` group, and a member switches the door for their own account
   only. The helper writes that account to `/var/lib/punktfunk-seats/owner` first. It refuses to
   switch on while the file names another account, and to switch off for any but the one it names,
-  which may have left the group since.
+  which may have left the group since. A name whose account no longer exists names no one: a
+  member's switch-on takes the door over, replacing the box's files with their own where they have
+  the same file, and a switch-off for it leaves the box's files in `/var/lib/punktfunk`.
 - **The box's ports.** The door binds the ports the owner's `host.env` names
   (`PUNKTFUNK_MGMT_BIND`, `PUNKTFUNK_NATIVE_PORT`), and its console binds where the owner's
   console did (`PUNKTFUNK_UI_BIND`, from `web.env` on SteamOS). `door-helper ports` copies those
