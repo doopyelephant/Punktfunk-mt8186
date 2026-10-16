@@ -185,11 +185,12 @@ where
 #[cfg(desktop)]
 pub struct RingLayer;
 
-/// DEBUG/TRACE from these module-path prefixes is chatter, not diagnostics.
-/// Prefix-matched on `::` boundaries so `cros_codecs::…` is gated and
+/// DEBUG/TRACE from these module-path prefixes is chatter, not diagnostics: the H.265
+/// parser's per-frame DPB bookkeeping, mDNS cache churn, TLS records, WASAPI buffer
+/// chatter. Prefix-matched on `::` boundaries so `cros_codecs::…` is gated and
 /// `cros_codecs_probe` is not. Same shape as the host's `NOISY_DEBUG_TARGETS`.
 #[cfg(desktop)]
-const NOISY_DEBUG_TARGETS: &[&str] = &["cros_codecs"];
+const NOISY_DEBUG_TARGETS: &[&str] = &["cros_codecs", "mdns_sd", "rustls", "wasapi"];
 
 #[cfg(desktop)]
 fn is_noisy_debug(target: &str) -> bool {
@@ -334,6 +335,11 @@ mod tests {
         assert!(!is_noisy_debug("cros_codecs_probe"));
         assert!(!is_noisy_debug("pf_bitstream::h265"));
         assert!(!is_noisy_debug("pf_client_core::audio"));
+        // 60 % of a field bundle's ring, evicting the session it exists to keep.
+        assert!(is_noisy_debug("mdns_sd::service_daemon"));
+        assert!(is_noisy_debug("rustls::client::hs"));
+        assert!(is_noisy_debug("wasapi"));
+        assert!(!is_noisy_debug("pf_audio::wasapi"));
     }
 
     /// Markers, not ring size: the ring is process-global.
