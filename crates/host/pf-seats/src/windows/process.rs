@@ -104,11 +104,12 @@ impl ChildProcess {
 }
 
 /// Start `punktfunk-seat-keeper.exe keep` suspended in `job`, hand it `bootstrap` on stdin,
-/// then resume it. No secret crosses argv or the environment.
+/// then resume it. Its stderr is appended to `log`. No secret crosses argv or the environment.
 pub(super) fn spawn_keeper(
     job: &Job,
     keeper: &Path,
     bootstrap: &RdpBootstrap,
+    log: &Path,
 ) -> WinResult<ChildProcess> {
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -149,6 +150,7 @@ pub(super) fn spawn_keeper(
     .map_err(|error| io_error("keeper_spawn", "open NUL failed", error))?;
     // SAFETY: `nul_raw` is fresh and transferred to one owner.
     let nul = unsafe { OwnedHandle::from_raw_handle(nul_raw.0) };
+    let log = open_log(log)?;
 
     let application = wide(keeper.as_os_str(), "keeper executable")?;
     let mut command_w = command_line(&[keeper.as_os_str().to_owned(), OsString::from("keep")])?;
@@ -158,11 +160,12 @@ pub(super) fn spawn_keeper(
         dwFlags: STARTF_USESTDHANDLES,
         hStdInput: HANDLE(read_pipe.as_raw_handle()),
         hStdOutput: HANDLE(nul.as_raw_handle()),
-        hStdError: HANDLE(nul.as_raw_handle()),
+        hStdError: HANDLE(log.as_raw_handle()),
         ..Default::default()
     };
     let mut info = PROCESS_INFORMATION::default();
-    // SAFETY: all pointers target live NUL-terminated buffers; only stdin/NUL are inheritable.
+    // SAFETY: all pointers target live NUL-terminated buffers; only stdin, NUL and the log are
+    // inheritable.
     unsafe {
         CreateProcessW(
             PCWSTR(application.as_ptr()),

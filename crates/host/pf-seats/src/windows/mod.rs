@@ -393,7 +393,10 @@ impl WindowsBackend {
             ));
         }
         rows.push(match rdp::load_pin_optional(&self.root) {
-            Ok(Some(_)) => Diagnostic::info("rdp_pin", "Remote Desktop's certificate is recorded."),
+            Ok(Some(pin)) => match rdp::require_live(&self.host_path, pin) {
+                Ok(()) => Diagnostic::info("rdp_pin", "Remote Desktop's certificate is recorded."),
+                Err(error) => Diagnostic::error("rdp_pin", error.message),
+            },
             _ => Diagnostic::error(
                 "rdp_pin",
                 "Remote Desktop's certificate isn't recorded, so seats can't sign in. \

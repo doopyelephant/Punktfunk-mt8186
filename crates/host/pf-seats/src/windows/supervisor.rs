@@ -447,6 +447,7 @@ impl Rig {
 
     fn start_keeper(&mut self) -> WinResult<()> {
         let pin = rdp::load_pin(&self.root)?;
+        rdp::require_live(&self.host_path, pin)?;
         let credential = self.accounts.credential_for_start(&self.seat)?;
         let bootstrap =
             RdpBootstrap::new(self.seat.account.clone(), credential.copy_zeroizing(), pin)
@@ -455,7 +456,13 @@ impl Rig {
                 })?;
         let job = Job::new()?;
         let keeper_exe = super::keeper::keeper_path(&self.host_path);
-        let keeper = process::spawn_keeper(&job, &keeper_exe, &bootstrap)?;
+        let log = self
+            .root
+            .open_child_dir("hosts")
+            .and_then(|hosts| hosts.open_child_dir(self.seat.id.as_str()))
+            .and_then(|root| root.child_path("host.log"))
+            .map_err(|error| io_error("seat_log", "resolve the seat log", error))?;
+        let keeper = process::spawn_keeper(&job, &keeper_exe, &bootstrap, &log)?;
         self.keeper = Some((keeper, job));
         Ok(())
     }

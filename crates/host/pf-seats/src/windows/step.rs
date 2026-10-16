@@ -67,6 +67,7 @@ pub(crate) enum Code {
     HostMissing,
     RdpPinMissing,
     RdpPinInvalid,
+    RdpPinChanged,
     LocalSystemRequired,
     Other,
 }
@@ -88,6 +89,7 @@ impl Code {
             "host_missing" => Self::HostMissing,
             "rdp_pin_missing" => Self::RdpPinMissing,
             "rdp_pin_invalid" => Self::RdpPinInvalid,
+            "rdp_pin_changed" => Self::RdpPinChanged,
             "local_system_required" => Self::LocalSystemRequired,
             _ if code.starts_with("quality_") => Self::Quality,
             _ => Self::Other,
@@ -109,6 +111,7 @@ impl Code {
             | Self::HostMissing
             | Self::RdpPinMissing
             | Self::RdpPinInvalid
+            | Self::RdpPinChanged
             | Self::LocalSystemRequired => true,
             Self::WtsTimeout
             | Self::KeeperExited
@@ -158,6 +161,7 @@ impl Fault {
             | Code::HostMissing
             | Code::RdpPinMissing
             | Code::RdpPinInvalid
+            | Code::RdpPinChanged
             | Code::LocalSystemRequired
             | Code::Other => return self.error.message.clone(),
         };
@@ -732,7 +736,7 @@ mod tests {
     const MESSAGE: &str = "the operator's message";
 
     /// Code, whether a retry is pointless, and how the console's sentence starts.
-    const CODES: [(&str, bool, &str); 27] = [
+    const CODES: [(&str, bool, &str); 28] = [
         ("wts_timeout", false, SIGN_IN),
         ("rdp_keeper_exited", false, SIGN_IN),
         ("quality_failed", true, SCREEN),
@@ -755,6 +759,7 @@ mod tests {
         ("host_missing", true, MESSAGE),
         ("rdp_pin_missing", true, MESSAGE),
         ("rdp_pin_invalid", true, MESSAGE),
+        ("rdp_pin_changed", true, MESSAGE),
         ("local_system_required", true, MESSAGE),
         ("seat_stopping", false, MESSAGE),
         ("process_wait", false, MESSAGE),

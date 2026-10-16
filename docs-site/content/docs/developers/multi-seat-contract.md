@@ -22,7 +22,10 @@ host restart leaves them running; stopping the service logs every seat account o
 - **The keeper.** `punktfunk-seat-keeper.exe`, beside `punktfunk-host.exe`, holds one seat's
   loopback RDP session open. The supervisor hands it the seat's credentials on stdin, never on the
   command line. Run `punktfunk-seat-keeper trust` from an elevated prompt once, before the first
-  seat: it records the RDP certificate the keeper will accept. Turning seats on does this too.
+  seat: it records the RDP certificate the keeper will accept. Turning seats on does this too,
+  and replaces an earlier record. Each seat start compares the certificate TermService presents
+  now with the record; a change fails the seat with `rdp_pin_changed` until seats are turned
+  off and on. The keeper's stderr goes to the seat's `host.log`.
 - **The seats group.** Every seat account is in the local group `punktfunk-seats`, rejoined at
   each start. The host denies that group on `%ProgramData%\punktfunk\ingest`, so a seat can't
   replace the owner's Playnite library. The doctor's `account` row reports the membership.
@@ -77,7 +80,7 @@ A failed check changes nothing: the answer is 200 with `enabled: false` and the 
    `pf_seat_audio.dll`, with port 3390 blocked from every address but loopback. The x64 build goes
    to `System32\punktfunk` and the x86 build to `SysWOW64\punktfunk`. Every seat start brings
    them up to date. Not on ARM64.
-5. Records the Remote Desktop certificate, as `punktfunk-seat-keeper trust` does.
+5. Records the Remote Desktop certificate, as `punktfunk-seat-keeper trust --replace` does.
 
 The keeper connects to 3390 when it listens, else to 3389. TermService opens and closes a listener
 as its key appears and goes; nothing restarts.

@@ -2,7 +2,8 @@
 //!
 //! `keep` reads its bootstrap (account, password, pin) from stdin, which only the supervisor
 //! writes, and never takes a secret on argv or from the environment. `trust [--replace]` is the
-//! elevated operator step that pins TermService's TLS leaf before any seat starts.
+//! elevated operator step that pins TermService's TLS leaf before any seat starts. `observe`
+//! prints the leaf TermService presents now and stores nothing.
 
 #[cfg(windows)]
 mod rdp;
@@ -19,8 +20,9 @@ fn main() {
         ["keep"] => rdp::keep_from_stdin(),
         ["trust"] => trust(false),
         ["trust", "--replace"] => trust(true),
+        ["observe"] => observe(),
         _ => {
-            eprintln!("usage: punktfunk-seat-keeper keep | trust [--replace]");
+            eprintln!("usage: punktfunk-seat-keeper keep | trust [--replace] | observe");
             std::process::exit(2);
         }
     };
@@ -39,6 +41,12 @@ fn trust(replace: bool) -> Result<(), pf_seats::BackendError> {
     let pin = rdp::observe_pin()?;
     keeper::store_pin(&root, pin, replace)?;
     println!("trusted RDP leaf SHA-256 {}", hex::encode(pin));
+    Ok(())
+}
+
+#[cfg(windows)]
+fn observe() -> Result<(), pf_seats::BackendError> {
+    println!("{}", hex::encode(rdp::observe_pin()?));
     Ok(())
 }
 

@@ -802,8 +802,9 @@ fn powershell_lines(script: &str, limit: Duration) -> Result<Vec<String>, String
         .collect())
 }
 
-/// Record the leaf TermService presents. The keeper observes it, since the handshake needs
-/// IronRDP, which the service doesn't link.
+/// Record the leaf TermService presents, in place of an earlier one: turning seats on is the
+/// operator's yes to the certificate as it is now. The keeper observes it, since the handshake
+/// needs IronRDP, which the service doesn't link.
 fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
     let keeper = keeper::keeper_path(host_path);
     if !keeper.is_file() {
@@ -820,7 +821,7 @@ fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
         }
         match pf_paths::run_within(
             Command::new(&keeper)
-                .arg("trust")
+                .args(["trust", "--replace"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped()),

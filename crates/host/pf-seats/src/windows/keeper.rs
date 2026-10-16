@@ -7,6 +7,8 @@
 
 use super::util::{backend_error, require_elevated_admin, WinResult};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 pub use super::rdp::store_pin;
 pub use crate::bootstrap::RdpBootstrap;
@@ -17,9 +19,30 @@ pub const KEEPER_EXE: &str = "punktfunk-seat-keeper.exe";
 /// The seat listener's loopback port, where a session also gets its pads' audio endpoints.
 pub const SEAT_LISTENER_PORT: u16 = pf_driver_proto::seat_audio::LISTENER_PORT;
 
+/// The keeper's own handshake gives up after 15 s.
+const OBSERVE_LIMIT: Duration = Duration::from_secs(20);
+
 /// The keeper beside `host_path`.
 pub fn keeper_path(host_path: &Path) -> PathBuf {
     host_path.with_file_name(KEEPER_EXE)
+}
+
+/// The leaf TermService presents now, as the keeper beside `host_path` reads it. `None` when it
+/// can't say: TermService is down or the keeper didn't run.
+pub fn live_pin(host_path: &Path) -> Option<[u8; 32]> {
+    let output = pf_paths::run_within(
+        Command::new(keeper_path(host_path))
+            .arg("observe")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+        OBSERVE_LIMIT,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    super::rdp::parse_pin(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// The id of a live or disconnected session signed in as `account`, if one exists.
