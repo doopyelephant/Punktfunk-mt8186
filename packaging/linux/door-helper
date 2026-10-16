@@ -158,6 +158,8 @@ give_password() {
 PORT_LINE='^[[:space:]]*PUNKTFUNK_(MGMT_BIND|NATIVE_PORT|UI_BIND)[[:space:]]*='
 
 take_ports() {
+    # Their files out of reach, as a home that isn't mounted yet: the last copy stays.
+    as_user test -d "$OWN" || return 0
     {
         as_user cat -- "$OWN/host.env" 2>/dev/null
         as_user cat -- "$OWN/web.env" 2>/dev/null
