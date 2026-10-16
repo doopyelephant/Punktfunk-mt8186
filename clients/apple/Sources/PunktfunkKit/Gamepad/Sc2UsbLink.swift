@@ -40,6 +40,9 @@ final class Sc2UsbLink {
     /// One opened collection went away (pad unplugged; fires once per collection when the
     /// dongle is pulled) — on `queue`.
     private let onSourceClosed: (UInt64) -> Void
+    /// macOS refused an open for want of Input Monitoring, once per refusal round — on `queue`.
+    /// The pad still plays through GameController, and its lizard keys type beside it.
+    private let onRefused: () -> Void
 
     // All state below is touched ONLY on `queue`.
     private var manager: IOHIDManager?
@@ -123,11 +126,13 @@ final class Sc2UsbLink {
     init(
         queue: DispatchQueue,
         onReport: @escaping (UInt64, [UInt8]) -> Void,
-        onSourceClosed: @escaping (UInt64) -> Void
+        onSourceClosed: @escaping (UInt64) -> Void,
+        onRefused: @escaping () -> Void
     ) {
         self.queue = queue
         self.onReport = onReport
         self.onSourceClosed = onSourceClosed
+        self.onRefused = onRefused
     }
 
     /// Whether any SC2 controller collection is attached right now — the cheap pre-flight
@@ -328,12 +333,13 @@ final class Sc2UsbLink {
         }
         let rc = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
         guard rc == kIOReturnSuccess else {
-            // Not-permitted = the Input Monitoring grant is missing (the controller interface
-            // carries the lizard keyboard collection). Park the matched device for
-            // `retryDenied` — the manager will not re-fire matching for it, so without the
-            // stash the pad stays dead until an app relaunch.
+            // Not-permitted = no Input Monitoring grant this binary matches. Park the device for
+            // `retryDenied` (the manager never re-fires matching) and tell the player once.
             let hint = rc == kIOReturnNotPermitted ? " — not permitted (Input Monitoring)" : ""
-            if rc == kIOReturnNotPermitted { denied[id] = matched }
+            if rc == kIOReturnNotPermitted {
+                if denied.isEmpty { onRefused() }
+                denied[id] = matched
+            }
             log.error(
                 "SC2 USB: open failed (0x\(String(format: "%08x", rc), privacy: .public))\(hint, privacy: .public)"
             )
