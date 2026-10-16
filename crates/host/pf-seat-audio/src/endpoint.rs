@@ -47,9 +47,10 @@ pub(crate) struct Endpoint {
     ring: OnceLock<Ring>,
     /// Frames handed out by `GetOutputDataPointer` and not yet released.
     pending: AtomicU32,
-    /// Frames released since `Start` or `Reset`.
+    /// Frames released since `Reset`.
     written: AtomicU64,
     started: AtomicBool,
+    /// The clock the frames play against, as if it began when the written frames did.
     start: AtomicI64,
     frequency: i64,
 }
@@ -169,17 +170,15 @@ impl IAudioDeviceEndpoint_Impl for Endpoint_Impl {
 }
 
 impl IAudioEndpointRT_Impl for Endpoint_Impl {
-    /// Played frames follow the clock from `Start` and never pass the frames written. The
-    /// engine pulls nothing while the position is invalid.
+    /// Played frames follow the clock and never pass the frames written. The engine pulls
+    /// nothing while the position is invalid.
     fn GetCurrentPadding(&self, padding: *mut i64, position: *mut AE_CURRENT_POSITION) {
         let written = self.written.load(Ordering::Acquire);
         let now = Endpoint::now();
         let mut played = written;
         if self.started.load(Ordering::Acquire) {
-            let ticks = (now - self.start.load(Ordering::Acquire)).max(0);
-            let elapsed = (i128::from(ticks) * i128::from(RATE) / i128::from(self.frequency))
-                .clamp(0, i128::from(u64::MAX)) as u64;
-            played = played.min(elapsed);
+            let ticks = now - self.start.load(Ordering::Acquire);
+            played = played_frames(written, ticks, self.frequency);
         }
         if !padding.is_null() {
             let queued = (written - played).saturating_mul(10_000_000) / u64::from(RATE);
@@ -263,7 +262,10 @@ impl IAudioEndpointControl_Impl for Endpoint_Impl {
             return Err(E_UNEXPECTED.into());
         }
         self.open_ring();
-        self.start.store(Endpoint::now(), Ordering::Release);
+        // The frames written before a `Stop` have played by now: the clock resumes where they end.
+        let written = self.written.load(Ordering::Acquire);
+        let begun = Endpoint::now() - ticks_for(written, self.frequency);
+        self.start.store(begun, Ordering::Release);
         self.started.store(true, Ordering::Release);
         Ok(())
     }
@@ -278,6 +280,19 @@ impl IAudioEndpointControl_Impl for Endpoint_Impl {
         self.started.store(false, Ordering::Release);
         Ok(())
     }
+}
+
+/// The frames `ticks` clock ticks have played, never more than the `written` ones.
+fn played_frames(written: u64, ticks: i64, frequency: i64) -> u64 {
+    let elapsed = i128::from(ticks.max(0)) * i128::from(RATE) / i128::from(frequency);
+    written.min(elapsed.clamp(0, i128::from(u64::MAX)) as u64)
+}
+
+/// The clock ticks `frames` frames take, rounded up so they have played once the ticks pass.
+fn ticks_for(frames: u64, frequency: i64) -> i64 {
+    let ticks =
+        (i128::from(frames) * i128::from(frequency) + i128::from(RATE) - 1) / i128::from(RATE);
+    i64::try_from(ticks).unwrap_or(i64::MAX)
 }
 
 /// The locked buffer the engine renders one period into.
@@ -422,5 +437,39 @@ impl Drop for Ring {
             });
             let _ = CloseHandle(self.mapping);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The usual QueryPerformanceCounter rate.
+    const FREQUENCY: i64 = 10_000_000;
+
+    /// A `Start` after a `Stop` leaves nothing queued, however long the endpoint had rendered.
+    #[test]
+    fn a_restart_resumes_where_the_written_frames_end() {
+        let ten_minutes = 10 * 60 * u64::from(RATE);
+        let now = 123_456_789;
+        let start = now - ticks_for(ten_minutes, FREQUENCY);
+        assert_eq!(
+            played_frames(ten_minutes, now - start, FREQUENCY),
+            ten_minutes
+        );
+        // Ten milliseconds the engine writes next play out over the next ten milliseconds.
+        let ahead = ten_minutes + u64::from(RATE) / 100;
+        assert_eq!(played_frames(ahead, now - start, FREQUENCY), ten_minutes);
+        assert_eq!(
+            played_frames(ahead, now + 100_000 - start, FREQUENCY),
+            ahead
+        );
+    }
+
+    #[test]
+    fn played_frames_never_pass_the_written_ones() {
+        assert_eq!(played_frames(100, FREQUENCY, FREQUENCY), 100);
+        assert_eq!(played_frames(100, -5, FREQUENCY), 0);
+        assert_eq!(played_frames(10, i64::MAX, FREQUENCY), 10);
     }
 }
