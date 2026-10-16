@@ -190,7 +190,7 @@ legacy_mark() {
     if [ -n "$recorded" ] && as_door test -f "$BOX/door-on"; then
         : >"$MARK"
     fi
-    as_door rm -f "$BOX/door-on"
+    as_door rm -f "$BOX/door-on" || true
 }
 
 wait_for_socket() {
@@ -276,17 +276,17 @@ restore_door() {
 }
 
 door_off() {
+    trap restore_door EXIT
     systemctl stop punktfunk-web-door.service punktfunk-door.service || true
     legacy_mark
     if [ -e "$MARK" ]; then
-        trap restore_door EXIT
         for f in $FILES; do [ "$f" = web-password ] || give "$f"; done
         give_password
         give_avatars
-        trap - EXIT
-        # The files are home. A repeat must not copy the door's stale ones over the user's.
-        rm -f "$MARK"
     fi
+    trap - EXIT
+    # The files are home. A repeat must not copy the door's stale ones over the user's.
+    rm -f "$MARK"
     # From here only forward: each step is tried, and the record stays until all of them held.
     problems=0
     if systemctl is-active --quiet punktfunk-seats.service; then
