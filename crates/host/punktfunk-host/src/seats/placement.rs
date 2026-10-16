@@ -88,12 +88,10 @@ fn plays_here(role: HostRole, own_row: bool) -> bool {
 /// Seat id → the device redirected to it and until when it holds it.
 static RESERVED: Mutex<BTreeMap<String, (String, Instant)>> = Mutex::new(BTreeMap::new());
 
-/// A profile whose seat is a ledger row of its own.
+/// A profile whose seat is a ledger row of its own: the row [`row_in`](super::row_in) names
+/// with no owner row, so the owner's profile has none.
 fn ledger_seat(account: &crate::profiles::OsAccount) -> Option<&str> {
-    match account {
-        crate::profiles::OsAccount::Seat { seat: Some(id) } => Some(id),
-        _ => None,
-    }
+    super::row_in(account, None, false)
 }
 
 /// The rule, without IO. `seat` is the profile's ledger row and its seat number, `occupants`
@@ -161,6 +159,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The door's owner row is the owner's, never a profile's own: placement reads one mapping.
+    #[test]
+    fn only_a_full_seat_has_a_ledger_row_of_its_own() {
+        use crate::profiles::OsAccount::{Operator, Seat as Full};
+        let row = "0123456789abcdef0123456789abcdef";
+        let full = Full {
+            seat: Some(row.into()),
+        };
+        assert_eq!(ledger_seat(&full), Some(row));
+        assert_eq!(ledger_seat(&Full { seat: None }), None);
+        assert_eq!(ledger_seat(&Operator), None);
+        let mut owner = seat(RuntimeState::Running);
+        owner.owner = true;
+        assert_eq!(
+            crate::seats::row_in(&Operator, Some(&owner), true),
+            Some(row)
+        );
+        assert_eq!(crate::seats::row_in(&full, Some(&owner), true), Some(row));
     }
 
     fn seat(state: RuntimeState) -> Seat {

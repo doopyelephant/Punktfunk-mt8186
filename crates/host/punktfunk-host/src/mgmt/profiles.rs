@@ -175,14 +175,13 @@ fn seat_line(st: &MgmtState, p: &Profile, seats: &Snapshot, operator: bool) -> S
         pin: None,
         kind: SeatKind::Desktop,
     };
+    if let Some(id) = seats.row_of(&p.os_account) {
+        return seated(seats, id, operator);
+    }
     if crate::seats::is_door() {
-        return match seats.row_of(&p.os_account) {
-            Some(id) => seated(seats, id, operator),
-            None => unavailable("This host has no seat for the owner yet."),
-        };
+        return unavailable("This host has no seat for the owner yet.");
     }
     match &p.os_account {
-        OsAccount::Seat { seat: Some(id), .. } => seated(seats, id, operator),
         OsAccount::Seat { .. } | OsAccount::Operator => SeatPublic {
             state: SeatState::Ready,
             detail: None,
