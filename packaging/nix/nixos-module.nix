@@ -791,6 +791,16 @@ in
         ""
         "${cfg.web.package}/bin/punktfunk-web-server"
       ];
+      # The door's console binds where `web.bind` says, as the user's does. The packaged list
+      # starts with the door's host.env copy, which would beat it: the empty entry clears the
+      # list and the rest is the packaged order.
+      systemd.services.punktfunk-web-door.environment.PUNKTFUNK_UI_BIND = cfg.web.bind;
+      systemd.services.punktfunk-web-door.serviceConfig.EnvironmentFile = [
+        ""
+        "-/var/lib/punktfunk/mgmt-token"
+        "-/var/lib/punktfunk/web-password"
+        "-/var/lib/punktfunk/mgmt-endpoint"
+      ];
       # The door's ports: the two `host.settings` keys that move them, and no other host knob.
       # The host.env lines its ExecStartPre copies win over these.
       systemd.services.punktfunk-door.path = seatPath;

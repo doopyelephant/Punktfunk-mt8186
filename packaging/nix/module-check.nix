@@ -139,6 +139,7 @@ let
       settings.RUST_LOG = "info";
       settings.PUNKTFUNK_MGMT_BIND = "0.0.0.0:47991";
     };
+    services.punktfunk.web.bind = "127.0.0.1";
     services.punktfunk.seats.enable = true;
   };
   seatsWithoutHost = evalWith { services.punktfunk.seats.enable = true; };
@@ -452,6 +453,18 @@ let
           env = seats.systemd.services.punktfunk-door.environment;
         in
         env.PUNKTFUNK_MGMT_BIND or null == "0.0.0.0:47991" && !(env ? RUST_LOG);
+    }
+    {
+      # A console limited to this machine stays so when the door takes over. host.env, which
+      # carries the bind on other distros, is not read: the option is the source.
+      name = "the door's console binds where web.bind says, never host.env";
+      ok =
+        let
+          files = seats.systemd.services.punktfunk-web-door.serviceConfig.EnvironmentFile;
+        in
+        hasSys seats "punktfunk-web-door.service" "PUNKTFUNK_UI_BIND=127.0.0.1"
+        && lib.head files == ""
+        && lib.tail files == shippedEnvFiles ../linux/punktfunk-web-door.service;
     }
     {
       # polkit reads /etc/polkit-1/rules.d; the rule is the package's file, not a copy.

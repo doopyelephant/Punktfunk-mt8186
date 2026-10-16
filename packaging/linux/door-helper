@@ -127,12 +127,16 @@ give_password() {
         sh "$OWN/web.env" "$line" "$PASSWORD_LINE"
 }
 
-# The box's ports as the owner's host.env moves them, which the door binds in its place. Taken at
-# each door start: host.env stays the owner's file, and the door never writes a port.
-PORT_LINE='^[[:space:]]*PUNKTFUNK_(MGMT_BIND|NATIVE_PORT)[[:space:]]*='
+# The box's ports as the owner's host.env moves them, which the door binds in its place, and the
+# console's bind, which the door's console keeps. SteamOS holds that bind in web.env, read last.
+# Taken at each door start: the owner's files stay theirs, and the door never writes a port.
+PORT_LINE='^[[:space:]]*PUNKTFUNK_(MGMT_BIND|NATIVE_PORT|UI_BIND)[[:space:]]*='
 
 take_ports() {
-    as_user cat -- "$OWN/host.env" 2>/dev/null | { grep -E "$PORT_LINE" || true; } | to_door host.env
+    {
+        as_user cat -- "$OWN/host.env" 2>/dev/null
+        as_user cat -- "$OWN/web.env" 2>/dev/null
+    } | { grep -E "$PORT_LINE" || true; } | to_door host.env
 }
 
 safe_name() {
