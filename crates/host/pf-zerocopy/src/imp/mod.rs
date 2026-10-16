@@ -114,6 +114,24 @@ pub fn fused_convert_available() -> bool {
     })
 }
 
+/// Tiled modifiers the fused convert can sample for packed-RGB `fourcc`; LINEAR excluded, driver
+/// order. The raw lane offers only these: a producer that fixates another (NVIDIA's compressed
+/// block-linear) would be refused on the first frame.
+///
+/// Cached per fourcc: the answer is a property of the driver, not of a session.
+pub fn fused_convert_modifiers(fourcc: u32) -> Vec<u64> {
+    static CACHE: std::sync::Mutex<Vec<(u32, Vec<u64>)>> = std::sync::Mutex::new(Vec::new());
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, m)) = cache.iter().find(|(f, _)| *f == fourcc) {
+        return m.clone();
+    }
+    let mut mods = drm::vk_format(fourcc).map_or_else(Vec::new, vkdev::sampled_import_modifiers);
+    mods.retain(|&m| m != 0);
+    mods.dedup();
+    cache.push((fourcc, mods.clone()));
+    mods
+}
+
 /// GPU RGB→NV12 before NVENC. Default ON: NVENC's internal CSC otherwise
 /// runs on the SM the game saturates. `PUNKTFUNK_NV12=0` restores RGB/BGRx.
 /// LINEAR (gamescope/Vulkan-bridge) captures ignore this.

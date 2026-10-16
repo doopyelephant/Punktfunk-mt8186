@@ -355,6 +355,7 @@ fn resolve_offer(
         importer.as_mut(),
         plan.vaapi_passthrough,
         opts.producer_is_gamescope,
+        plan.nvenc_raw,
     );
     let hdr_modifiers = hdr_modifier_offers(
         policy,

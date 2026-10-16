@@ -173,14 +173,17 @@ pub(super) fn offer_pacing(
 /// tiled seed is `ZeroCopyPolicy::encoder_modifiers`, offered only to a
 /// tiled-opted gamescope producer on VA passthrough while the refusal latch is
 /// clear; PyroWave merges its Vulkan-importable list on non-gamescope
-/// passthrough. `dmabuf_modifiers_for_producer` finalizes each list. Returns
-/// `(bgrx, bgra, extend_pyrowave)` — the flag feeds the session-start log line.
+/// passthrough. The NVENC raw lane (`nvenc_raw`) narrows the importer's lists to
+/// what its fused convert samples. `dmabuf_modifiers_for_producer` finalizes each
+/// list. Returns `(bgrx, bgra, extend_pyrowave)` — the flag feeds the
+/// session-start log line.
 pub(super) fn packed_modifier_offers(
     policy: &ZeroCopyPolicy,
     health: &pf_zerocopy::ZeroCopyHealth,
     importer: Option<&mut pf_zerocopy::Importer>,
     vaapi_passthrough: bool,
     producer_is_gamescope: bool,
+    nvenc_raw: bool,
 ) -> (Vec<u64>, Vec<u64>, bool) {
     // EGL importer answers per format; the encoder seed does too. LINEAR is appended for
     // every advertised list and remains the only gamescope choice without a proved tiled seed.
@@ -216,6 +219,12 @@ pub(super) fn packed_modifier_offers(
         (&mut modifiers, PixelFormat::Bgrx),
         (&mut modifiers_bgra, PixelFormat::Bgra),
     ] {
+        if nvenc_raw {
+            if let Some(fourcc) = pf_frame::drm_fourcc(fmt) {
+                let fused = pf_zerocopy::fused_convert_modifiers(fourcc);
+                *list = crate::linux::raw_lane_modifiers(list, &fused);
+            }
+        }
         if seed_encoder_mods || extend_pyrowave {
             if let Some(fourcc) = pf_frame::drm_fourcc(fmt) {
                 for m in encoder_modifiers_for(policy, fourcc) {
@@ -236,9 +245,9 @@ pub(super) fn packed_modifier_offers(
 }
 
 /// Packed 10-bit offers, PQ or gamescope's SDR (`want_ten_bit`). Tiled has two readers:
-/// NVENC's raw convert, and the VA encoder's own import — the latter only for
-/// `encoder_modifiers`-proved modifiers. Every other arm de-tiles into 8 bits, so tiled is
-/// offered only while one lane holds the stream. LINEAR is always appended once.
+/// NVENC's raw convert, for the modifiers it samples, and the VA encoder's own import — the
+/// latter only for `encoder_modifiers`-proved modifiers. Every other arm de-tiles into 8 bits,
+/// so tiled is offered only while one lane holds the stream. LINEAR is always appended once.
 pub(super) fn hdr_modifier_offers(
     policy: &ZeroCopyPolicy,
     health: &pf_zerocopy::ZeroCopyHealth,
@@ -268,7 +277,8 @@ pub(super) fn hdr_modifier_offers(
                 importer.as_deref_mut(),
                 map_format(fmt).and_then(pf_frame::drm_fourcc),
             ) {
-                list = i.supported_modifiers(fourcc);
+                let fused = pf_zerocopy::fused_convert_modifiers(fourcc);
+                list = crate::linux::raw_lane_modifiers(&i.supported_modifiers(fourcc), &fused);
             }
         }
         list.retain(|&m| m != 0);

@@ -356,7 +356,7 @@ fn spawn_pipewire(
         native_nv12_env_on: pf_host_config::env_on("PUNKTFUNK_PIPEWIRE_NV12").unwrap_or(true),
         hdr_cuda_ok: policy.hdr_cuda_ok,
         nv12_env_on: pf_zerocopy::nv12_enabled(),
-        nvenc_raw: policy.nvenc_raw_dmabuf,
+        nvenc_raw: crate::linux::raw_lane_ok(&policy),
     });
     let vaapi_dmabuf = plan.vaapi_passthrough;
     let import_policy = plan.import_policy;
