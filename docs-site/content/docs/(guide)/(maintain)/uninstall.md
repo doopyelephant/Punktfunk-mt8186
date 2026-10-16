@@ -37,18 +37,22 @@ pacman and the Bazzite sysext: `sh install.sh --uninstall` (fetch it with
    | Steam Deck on-device build | [See below](#steamos--steam-deck-host-on-device-build) |
    | NixOS | [See below](#nixos) |
 
-3. Clear what stays behind — the config directory, the tray's autostart entry, the two groups the
+3. Clear what stays behind — the config directory, the tray's autostart entry, the three groups the
    packages create, lingering and the unit drop-ins:
 
    ```sh
    rm -rf ~/.config/punktfunk ~/.config/systemd/user/punktfunk-*.service.d
    rm -f ~/.config/autostart/io.unom.Punktfunk.Tray.desktop
    sudo groupdel punktfunk-update
+   sudo groupdel punktfunk-door
    sudo gpasswd -d "$USER" punktfunk; sudo groupdel punktfunk
    sudo loginctl disable-linger "$USER"      # only if nothing else needs it
    ```
 
-   Drop the `punktfunk` group rather than keeping it: it can attach emulated USB devices.
+   Drop the `punktfunk` group rather than keeping it: it can attach emulated USB devices. If you
+   set up [Reachable without logging in](/docs/profiles#on-linux), turn it off under **Profiles**
+   first and run `sudo userdel punktfunk`, or `groupdel punktfunk-door` refuses: the door's user
+   holds that group.
 
 4. Close the firewall ports you opened:
 
@@ -125,7 +129,8 @@ hand, in this order.
    ```
 
    Each seat's account stays: `getent passwd | grep punktfunk-seat=` lists them for
-   `sudo userdel`, and `sudo userdel punktfunk` removes the door's.
+   `sudo userdel`, and `sudo userdel punktfunk` removes the door's. Then drop the groups it used:
+   `sudo groupdel punktfunk-door; sudo groupdel punktfunk-update; sudo groupdel punktfunk-games`.
 
 4. Remove the root-owned tuning. Don't skip it: the keep-list entry carries these files through
    every SteamOS update.
