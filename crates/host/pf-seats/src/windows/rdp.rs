@@ -19,7 +19,11 @@ const PIN_CHANGED: &str = "Remote Desktop's certificate has changed, so seats ca
 /// `rdp_pin_changed` when TermService presents a leaf other than `pin`. A leaf that can't be
 /// read passes: the keeper's own sign-in says why.
 pub(super) fn require_live(host_path: &Path, pin: [u8; 32]) -> WinResult<()> {
-    match super::keeper::live_pin(host_path) {
+    require_same(super::keeper::live_pin(host_path), pin)
+}
+
+fn require_same(live: Option<[u8; 32]>, pin: [u8; 32]) -> WinResult<()> {
+    match live {
         Some(live) if live != pin => Err(backend_error("rdp_pin_changed", PIN_CHANGED)),
         _ => Ok(()),
     }
@@ -87,7 +91,16 @@ pub(super) fn load_pin_optional(root: &SecretRoot) -> WinResult<Option<[u8; 32]>
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pin;
+    use super::{parse_pin, require_same};
+
+    /// Only a leaf that was read and differs refuses; the keeper's own check covers the rest.
+    #[test]
+    fn only_a_leaf_that_was_read_and_moved_refuses_the_start() {
+        assert!(require_same(Some([1; 32]), [1; 32]).is_ok());
+        assert!(require_same(None, [1; 32]).is_ok());
+        let moved = require_same(Some([2; 32]), [1; 32]).unwrap_err();
+        assert_eq!(moved.code, "rdp_pin_changed");
+    }
 
     #[test]
     fn the_keeper_prints_a_pin_as_64_hex_digits() {
