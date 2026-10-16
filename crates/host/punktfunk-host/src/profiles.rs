@@ -275,6 +275,12 @@ pub fn removed() -> tokio::sync::broadcast::Receiver<ProfileId> {
         .subscribe()
 }
 
+fn announce_removed(id: &str) {
+    if let Some(tx) = REMOVED.get() {
+        let _ = tx.send(id.to_string());
+    }
+}
+
 /// A stored picture.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Avatar {
@@ -495,10 +501,25 @@ impl Profiles {
                 let _ = std::fs::remove_file(pf_paths::seat_record(id));
             }
         }
-        if let Some(tx) = REMOVED.get() {
-            let _ = tx.send(id.to_string());
-        }
+        announce_removed(id);
         Ok(gone)
+    }
+
+    /// A seat host's copy follows the box's file, so a profile the box deletes never runs
+    /// [`Self::delete`] here. Sends [`removed`] for each id that left the file since `known`,
+    /// then keeps the ids as they are. A file that is empty or doesn't parse says nothing.
+    pub fn announce_removals(&self, known: &mut std::collections::HashSet<ProfileId>) {
+        let now: std::collections::HashSet<ProfileId> = {
+            let state = self.lock();
+            if state.unparsed.is_some() || state.file.profiles.is_empty() {
+                return;
+            }
+            state.file.profiles.iter().map(|p| p.id.clone()).collect()
+        };
+        for gone in known.difference(&now) {
+            announce_removed(gone);
+        }
+        *known = now;
     }
 
     /// Where a device that names no profile lands; `None` is the owner.

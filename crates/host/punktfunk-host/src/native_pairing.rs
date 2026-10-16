@@ -152,8 +152,18 @@ impl NativePairing {
         arm_at_start: bool,
     ) -> Result<NativePairing> {
         let store = store::TrustStore::open(store_path)?;
+        let np = NativePairing::with_store(store, fixed_pin, arm_at_start);
+        np.drop_session_only_records();
+        Ok(np)
+    }
+
+    fn with_store(
+        store: store::TrustStore,
+        fixed_pin: Option<String>,
+        arm_at_start: bool,
+    ) -> NativePairing {
         let refused = pf_paths::seat::pairing_refused() || store.read_only();
-        let np = NativePairing {
+        NativePairing {
             arm: arming::ArmState::new(arm_at_start && !refused, fixed_pin),
             store,
             approval: approval::ApprovalQueue::new(),
@@ -162,9 +172,7 @@ impl NativePairing {
                 counts: HashMap::new(),
                 last_out: HashMap::new(),
             }),
-        };
-        np.drop_session_only_records();
-        Ok(np)
+        }
     }
 
     /// A host that is starting has no live sessions, so every "this session" grant has already
@@ -396,6 +404,20 @@ impl NativePairing {
                 true
             }
         });
+    }
+
+    /// Whether the store is the box's file, which another process writes.
+    pub fn follows_box(&self) -> bool {
+        self.store.read_only()
+    }
+
+    /// Publishes every watched fingerprint from the store as it is now. A seat host's store is
+    /// the box's file, so its edits arrive here and not through a mutator.
+    pub fn republish_watched(&self) {
+        let watched: Vec<String> = self.access_watch.lock().unwrap().keys().cloned().collect();
+        for fp_hex in watched {
+            self.publish_current(&fp_hex);
+        }
     }
 
     pub fn list(&self) -> Vec<PairedClient> {
@@ -1576,6 +1598,42 @@ mod tests {
         assert_eq!(rx.borrow().grants, GRANT_ALL);
 
         assert!(np.subscribe("zz99").borrow().revoked);
+    }
+
+    /// A seat host's store is the box's file, edited in another process: a live subscriber hears
+    /// a narrowed grant and an unpair once the watcher republishes.
+    #[test]
+    fn a_seat_hosts_watch_hears_the_boxes_edits() {
+        use punktfunk_core::quic::GRANT_GAMEPAD;
+        let (_temp, p) = temp();
+        let box_np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
+        box_np.add("Living Room", "ff66").unwrap();
+        let seat = NativePairing::with_store(store::TrustStore::at(p.clone(), true), None, false);
+        assert!(seat.follows_box());
+        let rx = seat.subscribe("ff66");
+        assert_eq!(rx.borrow().grants, GRANT_ALL);
+
+        // A later mtime than the seat's read, whatever the filesystem's clock granularity.
+        let stamp = |secs: u64| {
+            let later = std::time::SystemTime::now() + Duration::from_secs(secs);
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(later).unwrap();
+        };
+        let narrow = Access {
+            grants: GRANT_GAMEPAD,
+            expires_unix: None,
+            until_disconnect: false,
+        };
+        box_np.set_access("ff66", narrow).unwrap();
+        stamp(5);
+        assert_eq!(rx.borrow().grants, GRANT_ALL, "nobody publishes by itself");
+        seat.republish_watched();
+        assert_eq!(rx.borrow().grants, GRANT_GAMEPAD);
+
+        box_np.remove("ff66").unwrap();
+        stamp(10);
+        seat.republish_watched();
+        assert!(rx.borrow().revoked);
     }
 
     /// Absent Moonlight record = ungoverned full control (the GameStream cert list is

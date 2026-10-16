@@ -125,7 +125,7 @@ impl TrustStore {
         Ok(TrustStore::at(path, read_only))
     }
 
-    fn at(path: PathBuf, read_only: bool) -> TrustStore {
+    pub(super) fn at(path: PathBuf, read_only: bool) -> TrustStore {
         // The box host owns its file's planted-secret check; a seat only reads it.
         let clients = if read_only {
             read_plain(&path)

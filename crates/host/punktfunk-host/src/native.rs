@@ -370,6 +370,9 @@ pub(crate) async fn serve(
     }
     let last_pairing = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     let opts = Arc::new(opts);
+    if np.follows_box() {
+        spawn_box_watch(np.clone(), profiles.clone());
+    }
 
     // Permit taken before accept: overflow waits in QUIC's backlog. `0` = unlimited.
     // Handshake + pipeline run in the spawned task so a slow client never blocks accept.
@@ -583,6 +586,21 @@ async fn stop_overdue(stop: &AtomicBool) {
 
 /// `mode_conflict = reject` close code. Distinct from transport failure (`RejectReason::Busy`).
 const REJECT_BUSY_CODE: u32 = punktfunk_core::reject::REJECT_BUSY_CLOSE_CODE;
+
+/// A seat host's pairing store and profiles are the box's files, edited in another process.
+/// Once a second its live sessions hear what changed in them: a grant narrowed, expired or
+/// revoked, and a profile removed.
+fn spawn_box_watch(np: Arc<NativePairing>, profiles: Arc<crate::profiles::Profiles>) {
+    tokio::spawn(async move {
+        let mut known = std::collections::HashSet::new();
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            np.republish_watched();
+            profiles.announce_removals(&mut known);
+        }
+    });
+}
 
 /// Ends the session as an operator stop when the console removes the profile it plays as.
 /// The end is written before the refuse, or the connection watcher would read the host's

@@ -228,6 +228,42 @@ fn a_seat_host_reads_the_box_file_and_plays_its_own_profile() {
     assert_eq!(p.resolve(None, None), Err(ProfileError::SessionUnavailable));
 }
 
+/// A profile the box deletes never runs `delete` on a seat host: the seat's watcher announces
+/// it, so a session playing as it ends.
+#[test]
+fn a_seat_host_announces_a_profile_the_box_removed() {
+    fn heard(rx: &mut tokio::sync::broadcast::Receiver<ProfileId>) -> Vec<ProfileId> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+    let sharer = "eeeeeeeeeeee".to_string();
+    let mut file = box_file();
+    file.profiles.push(seat(&sharer, "Sharer", Some("seat-a")));
+    let path = temp_dir("announce").join("profiles.json");
+    std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    let p = Profiles::load_box(path.clone(), Some("seat-a".into()));
+    let mut rx = removed();
+    let mut known = std::collections::HashSet::new();
+
+    // The first look only takes the ids.
+    p.announce_removals(&mut known);
+    assert_eq!(known.len(), 4);
+    assert!(!heard(&mut rx).contains(&sharer));
+
+    // A file that doesn't parse says nothing.
+    std::fs::write(&path, b"{").unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    let f = std::fs::File::options().write(true).open(&path).unwrap();
+    f.set_modified(later).unwrap();
+    p.announce_removals(&mut known);
+    assert_eq!(known.len(), 4);
+    assert!(!heard(&mut rx).contains(&sharer));
+
+    box_writes(&path, &box_file());
+    p.announce_removals(&mut known);
+    assert_eq!(known.len(), 3);
+    assert!(heard(&mut rx).contains(&sharer));
+}
+
 #[test]
 fn an_os_user_profile_has_no_session_yet() {
     let mut file = box_file();
