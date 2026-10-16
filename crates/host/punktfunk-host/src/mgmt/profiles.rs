@@ -1169,7 +1169,10 @@ pub(crate) struct DoorChange {
     )
 )]
 pub(crate) async fn put_door(ApiJson(input): ApiJson<DoorChange>) -> Response {
-    match blocking("switch", move || crate::door::change(input.on)).await {
+    let answer = blocking("switch", move || crate::door::change(input.on)).await;
+    // Whatever the answer, the console reads the blockers again next.
+    super::host::forget_door_probe();
+    match answer {
         Ok(Ok(crate::door::Outcome::Started)) => StatusCode::ACCEPTED.into_response(),
         Ok(Ok(crate::door::Outcome::Already)) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(refusal)) => refused(refusal),
