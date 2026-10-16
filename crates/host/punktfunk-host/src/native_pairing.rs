@@ -412,8 +412,12 @@ impl NativePairing {
     }
 
     /// Publishes every watched fingerprint from the store as it is now. A seat host's store is
-    /// the box's file, so its edits arrive here and not through a mutator.
+    /// the box's file, so its edits arrive here and not through a mutator. A file that is missing
+    /// or garbled says nothing, so a glitch in the copy doesn't end every session.
     pub fn republish_watched(&self) {
+        if !self.store.readable() {
+            return;
+        }
         let watched: Vec<String> = self.access_watch.lock().unwrap().keys().cloned().collect();
         for fp_hex in watched {
             self.publish_current(&fp_hex);
@@ -1609,6 +1613,37 @@ mod tests {
         assert!(np.subscribe("zz99").borrow().revoked);
     }
 
+    /// A later mtime than the seat's read, whatever the filesystem's clock granularity.
+    fn later_mtime(path: &std::path::Path, secs: u64) {
+        let later = std::time::SystemTime::now() + Duration::from_secs(secs);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(later).unwrap();
+    }
+
+    /// A box file that is missing or garbled says nothing: the seat's sessions stay until the
+    /// box's list reads again, and an empty list is an answer.
+    #[test]
+    fn a_seat_hosts_watch_ignores_a_box_file_it_cannot_read() {
+        let (_temp, p) = temp();
+        let box_np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
+        box_np.add("Living Room", "ff67").unwrap();
+        let seat = NativePairing::with_store(store::TrustStore::at(p.clone(), true), None, false);
+        let rx = seat.subscribe("ff67");
+
+        std::fs::write(&p, b"{").unwrap();
+        later_mtime(&p, 5);
+        seat.republish_watched();
+        assert!(!rx.borrow().revoked, "a garbled file says nothing");
+        std::fs::remove_file(&p).unwrap();
+        seat.republish_watched();
+        assert!(!rx.borrow().revoked, "a missing file says nothing");
+
+        box_np.remove("ff67").unwrap();
+        later_mtime(&p, 10);
+        seat.republish_watched();
+        assert!(rx.borrow().revoked, "an empty list is the box's answer");
+    }
+
     /// A seat host's store is the box's file, edited in another process: a live subscriber hears
     /// a narrowed grant and an unpair once the watcher republishes.
     #[test]
@@ -1622,12 +1657,7 @@ mod tests {
         let rx = seat.subscribe("ff66");
         assert_eq!(rx.borrow().grants, GRANT_ALL);
 
-        // A later mtime than the seat's read, whatever the filesystem's clock granularity.
-        let stamp = |secs: u64| {
-            let later = std::time::SystemTime::now() + Duration::from_secs(secs);
-            let f = std::fs::File::options().write(true).open(&p).unwrap();
-            f.set_modified(later).unwrap();
-        };
+        let stamp = |secs| later_mtime(&p, secs);
         let narrow = Access {
             grants: GRANT_GAMEPAD,
             expires_unix: None,

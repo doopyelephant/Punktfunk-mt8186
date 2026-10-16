@@ -75,6 +75,8 @@ struct PairedState {
     /// The box's store on a seat host: never written, re-read when its mtime moves.
     read_only: bool,
     stamp: Option<std::time::SystemTime>,
+    /// The last read of the box's file found a list. False while it is missing or garbled.
+    readable: bool,
 }
 
 fn mtime(path: &Path) -> Option<std::time::SystemTime> {
@@ -95,10 +97,12 @@ fn load(path: &Path) -> PairedClients {
 }
 
 fn read_plain(path: &Path) -> PairedClients {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    try_read(path).unwrap_or_default()
+}
+
+/// `None` when the file is missing or doesn't parse. A file with no clients is an answer.
+fn try_read(path: &Path) -> Option<PairedClients> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
 /// Owner-only so a local user cannot inject a fingerprint.
@@ -127,16 +131,17 @@ impl TrustStore {
 
     pub(super) fn at(path: PathBuf, read_only: bool) -> TrustStore {
         // The box host owns its file's planted-secret check; a seat only reads it.
-        let clients = if read_only {
-            read_plain(&path)
+        let found = if read_only {
+            try_read(&path)
         } else {
-            load(&path)
+            Some(load(&path))
         };
         TrustStore {
             paired: Mutex::new(PairedState {
                 stamp: if read_only { mtime(&path) } else { None },
                 path,
-                clients,
+                readable: found.is_some(),
+                clients: found.unwrap_or_default(),
                 read_only,
             }),
         }
@@ -146,6 +151,11 @@ impl TrustStore {
         self.paired.lock().unwrap().read_only
     }
 
+    /// Whether the file the store follows holds a list now. A store the host owns always does.
+    pub(super) fn readable(&self) -> bool {
+        self.lock().readable
+    }
+
     /// The state, re-read first on a seat host when the box's file changed, so a grant
     /// edited in the box console applies to the seat's next check.
     fn lock(&self) -> std::sync::MutexGuard<'_, PairedState> {
@@ -153,7 +163,9 @@ impl TrustStore {
         if p.read_only {
             let now = mtime(&p.path);
             if now != p.stamp {
-                p.clients = read_plain(&p.path);
+                let found = try_read(&p.path);
+                p.readable = found.is_some();
+                p.clients = found.unwrap_or_default();
                 p.stamp = now;
             }
         }
