@@ -447,7 +447,9 @@ and the profiles that share the owner's desktop on it.
 | `PUNKTFUNK_SEAT_HEADLESS` | `1`, set by the runner, not the file: the host runs in the row's headless session, not at the desk. |
 | `PUNKTFUNK_CONFIG_DIR`, `PUNKTFUNK_LIBRARY_DIR`, `PUNKTFUNK_HOST_NAME`, `PUNKTFUNK_GAMESTREAM` | Not set: the owner keeps `~/.config/punktfunk`, the library their plugins write, and their own settings. |
 
-Every row sets `PUNKTFUNK_MDNS=0`, since only the door advertises. The row's environment file is
+Every row sets `PUNKTFUNK_MDNS=0`, since only the door advertises. With the owner's GameStream
+setting on, the owner's row is the box's Moonlight host, on the owner's own pairings: the door
+can't redirect Moonlight, and a contract seat never serves it. The row's environment file is
 `/run/punktfunk/seats/<user>.env`, owned by the owner, and the owner's user `punktfunk-host` reads
 it, so it moves to the row's ports at boot, logged in or not. The owner's own console,
 `punktfunk-web.service`, doesn't start while that file exists: the door's console has the port.

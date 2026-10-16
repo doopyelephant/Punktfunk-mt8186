@@ -266,7 +266,11 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
         );
     }
     // The door places connects and streams nothing, and stock Moonlight has no redirect to follow.
-    let gamestream = pf_host_config::config().gamestream && !pf_paths::seat::role().is_door();
+    // A contract seat never serves it either, whatever its env says: the owner's row is the
+    // box's Moonlight host, on the owner's own setting and pairings.
+    let role = pf_paths::seat::role();
+    let gamestream =
+        pf_host_config::config().gamestream && !role.is_door() && !role.follows_contract();
     let native = native::NativeServe {
         webtransport_bind: pf_host_config::config()
             .webtransport
