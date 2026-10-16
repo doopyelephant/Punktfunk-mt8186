@@ -466,7 +466,7 @@ fn paced_submit(
     pacer: &mut crate::send_pacing::Pacer,
     ring: &mut recovery::ResendRing,
 ) -> Result<PaceStat> {
-    pacer.begin(session.frame_wire_len(data.len()));
+    pacer.begin(session.frame_wire_len(data, flags));
     session.drain_plaintext(|_| {});
     ring.begin(frame_index);
     let sealed =

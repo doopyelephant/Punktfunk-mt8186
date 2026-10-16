@@ -367,14 +367,17 @@ impl Session {
         })
     }
 
-    /// Bytes one AU of `frame_len` puts on the wire at the current geometry. An unsealed
+    /// Bytes `frame` sent with `user_flags` puts on the wire at the current geometry
+    /// ([`Packetizer::geometry_for`](crate::packet::Packetizer::geometry_for)). An unsealed
     /// session's packets carry the header without the tag.
-    pub fn frame_wire_len(&self, frame_len: usize) -> usize {
+    pub fn frame_wire_len(&self, frame: &[u8], user_flags: u32) -> usize {
         let header = match self.crypto {
             Some(_) => crate::packet::WIRE_OVERHEAD,
             None => crate::packet::V2_HEADER_LEN,
         };
-        self.packetizer.geometry(frame_len).wire_packets()
+        self.packetizer
+            .geometry_for(frame, user_flags)
+            .wire_packets()
             * (self.packetizer.shard_payload() + header)
     }
 
@@ -398,7 +401,7 @@ impl Session {
                 "seal_frame called on a client session",
             ));
         }
-        let geo = self.packetizer.geometry(data.len());
+        let geo = self.packetizer.geometry_for(data, user_flags);
         let pipelined =
             self.seal_two_lane && self.crypto.is_some() && geo.total_data >= 2 * SEAL_CHUNK_SHARDS;
         if pipelined && self.seal_lane.is_none() {
@@ -1275,15 +1278,26 @@ mod wire_equivalence_tests {
                 let cfg = host_cfg(FecScheme::Gf16, fec_percent);
                 let mut piped = host_session(cfg.clone(), encrypt);
                 let mut whole = host_session(cfg, encrypt);
-                // At shard 64: 47, 2, 313 and 1 data shards; 313 is three chunks of 128.
-                let frames = [pattern(3000), pattern(100), pattern(20000), Vec::new()];
+                // At shard 64: 47, 2, 313 and 1 data shards; 313 is three chunks of 128. The
+                // last is a PyroWave AU split into a 6-shard head and 300 tail shards.
+                let frames = [
+                    pattern(3000),
+                    pattern(100),
+                    pattern(20000),
+                    Vec::new(),
+                    crate::pyrowave::windowed_au(64, 6, 300),
+                ];
                 for (i, frame) in frames.iter().enumerate() {
                     let pts = 1000 * i as u64;
-                    let want = whole.seal_frame_at(frame, pts, i as u32, i as u32).unwrap();
+                    let flags = match i {
+                        4 => crate::packet::USER_FLAG_CHUNK_ALIGNED,
+                        i => i as u32,
+                    };
+                    let want = whole.seal_frame_at(frame, pts, flags, i as u32).unwrap();
                     let mut got: Vec<Vec<u8>> = Vec::new();
                     let mut calls = 0usize;
                     piped
-                        .seal_frame_chunks_at(frame, pts, i as u32, i as u32, &mut |chunk, send| {
+                        .seal_frame_chunks_at(frame, pts, flags, i as u32, &mut |chunk, send| {
                             calls += 1;
                             let refs: Vec<&[u8]> = chunk.iter().map(|b| b.as_slice()).collect();
                             send(&refs)?;
@@ -1302,12 +1316,76 @@ mod wire_equivalence_tests {
                         assert_eq!(calls, 1, "a whole frame reaches the sink once");
                     }
                     assert_eq!(
-                        piped.frame_wire_len(frame.len()),
+                        piped.frame_wire_len(frame, flags),
                         want.iter().map(Vec::len).sum::<usize>(),
                         "frame_wire_len frame#{i}"
                     );
                     whole.reclaim_wires(want);
                 }
+            }
+        }
+    }
+
+    /// A windowed PyroWave AU seals as a head block with all the parity and tail blocks with
+    /// none: a lost head shard is rebuilt, a lost tail shard leaves only its window empty, and
+    /// the partial carries everything else intact.
+    #[test]
+    fn a_pyrowave_au_protects_its_head_only() {
+        use crate::packet::USER_FLAG_CHUNK_ALIGNED;
+        let mk = |role| Config {
+            role,
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 10,
+                max_data_per_block: 64,
+            },
+            shard_payload: 1024,
+            max_frame_bytes: 8 * 1024 * 1024,
+            loopback_drop_period: 0,
+        };
+        let (wire, c) = loopback_pair(0, 0);
+        let mut client = Session::new(mk(Role::Client), media(false), Box::new(c)).unwrap();
+        client.set_deliver_partial_frames(true);
+        let (spare, _) = loopback_pair(0, 0);
+        let mut host = Session::new(mk(Role::Host), media(false), Box::new(spare)).unwrap();
+
+        let au = crate::pyrowave::windowed_au(1024, 11, 190);
+        let wires = host
+            .seal_frame_at(&au, 1_000, USER_FLAG_CHUNK_ALIGNED, 0)
+            .unwrap();
+        assert_eq!(
+            wires.len(),
+            201 + 4,
+            "four head parity shards, none on the tail"
+        );
+        for (i, w) in wires.iter().enumerate() {
+            if i != 3 && i != 100 {
+                wire.send(w).unwrap();
+            }
+        }
+        // A newer frame ages the lossy one out as a partial.
+        let next = crate::pyrowave::windowed_au(1024, 11, 190);
+        for w in host
+            .seal_frame_at(&next, 200_000_000, USER_FLAG_CHUNK_ALIGNED, 1)
+            .unwrap()
+        {
+            wire.send(&w).unwrap();
+        }
+        let mut partial = None;
+        loop {
+            match client.poll_frame() {
+                Ok(f) if !f.complete => partial = Some(f),
+                Ok(f) => assert_eq!(f.frame_index, 1, "only the clean frame completes"),
+                Err(PunktfunkError::NoFrame) => break,
+                Err(e) => panic!("unexpected: {e}"),
+            }
+        }
+        let p = partial.expect("the lossy frame arrives partial");
+        for (w, (got, sent)) in p.data.chunks(1024).zip(au.chunks(1024)).enumerate() {
+            if w == 100 {
+                assert!(got.iter().all(|&b| b == 0), "the lost tail window is empty");
+            } else {
+                assert_eq!(got, sent, "window {w}");
             }
         }
     }
