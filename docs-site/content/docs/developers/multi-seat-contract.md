@@ -464,7 +464,10 @@ it, so it moves to the row's ports at boot, logged in or not. The owner's own co
   The owner's host starts `punktfunk-door-on@<user>.service`, the door
   `punktfunk-door-off@<user>.service`; both run `door-helper`, which moves the box's files between
   the owner's `~/.config/punktfunk` and `/var/lib/punktfunk` and turns the units on or off. The user
-  must be in the `punktfunk-update` group.
+  must be in the `punktfunk-update` group, and a member switches the door for their own account
+  only. The helper writes that account to `/var/lib/punktfunk-seats/owner` first. It refuses to
+  switch on while the file names another account, and to switch off for any but the one it names,
+  which may have left the group since.
 - **The box's ports.** The door binds the ports the owner's `host.env` names
   (`PUNKTFUNK_MGMT_BIND`, `PUNKTFUNK_NATIVE_PORT`). `door-helper ports` copies those lines to
   `/var/lib/punktfunk/host.env` before each door start, so an update or a later edit reaches

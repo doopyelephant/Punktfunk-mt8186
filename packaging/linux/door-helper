@@ -10,10 +10,11 @@
 # a command: the user must be an ordinary account in that group. `ports` is
 # punktfunk-door.service's ExecStartPre.
 #
-# Both directions are idempotent, and a run that stopped halfway converges on the next. The box's
-# files move once: `on` copies the user's into /var/lib/punktfunk and records that in
-# $BOX/door-on, so a repeat never overwrites what the door has changed since; `off` copies the
-# door's back to the user and clears it.
+# Both directions are idempotent, and a run that stopped halfway converges on the next. The one
+# record of "on, and for whom" is $STATE/owner, which only root writes: `on` refuses while it names
+# someone else, and `off` runs only for the user it names. The box's files move once: `on` copies
+# the user's into /var/lib/punktfunk and marks that in $STATE/door-on, so a repeat never overwrites
+# what the door has changed since; `off` copies the door's back to the user and clears both.
 #
 # Every read and write that touches a user's home runs as that user, so a link the user plants
 # there can't make root read or overwrite anything the user couldn't.
@@ -21,10 +22,11 @@ set -eu
 export LC_ALL=C
 
 BOX=/var/lib/punktfunk
-MARK="$BOX/door-on"
-# The seat supervisor's own directory. `owner` there names the one account it adopts as the box
-# owner's row; only root writes it, so the door can't pick another.
+# The seat supervisor's own directory, root's alone. `owner` there is the one account the door is
+# on for, and the one the supervisor adopts as the box owner's row, so the door can't pick another.
 STATE=/var/lib/punktfunk-seats
+RECORD="$STATE/owner"
+MARK="$STATE/door-on"
 SEATS=/usr/libexec/punktfunk/punktfunk-seats
 GROUP=punktfunk-update
 # What the box's host keeps: identity, id, pairings, profiles, display and hook settings, and the
@@ -41,7 +43,7 @@ user=${2:-}
 case $verb in
 on | off) ;;
 # The owner the last `on` recorded; with none, the door has no ports to take.
-ports) user=$(cat "$STATE/owner" 2>/dev/null) || exit 0 ;;
+ports) user=$(cat "$RECORD" 2>/dev/null) || exit 0 ;;
 *) die "usage: door-helper on|off <user>, or door-helper ports" ;;
 esac
 [ "$(id -u)" = 0 ] || die "run as root"
@@ -56,7 +58,10 @@ passwd_row=$(getent passwd "$user") || die "no user '$user'"
 uid=$(printf '%s' "$passwd_row" | cut -d: -f3)
 home=$(printf '%s' "$passwd_row" | cut -d: -f6)
 { [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ]; } || die "'$user' is not an ordinary account"
-id -nG "$user" | tr ' ' '\n' | grep -qx "$GROUP" || die "'$user' is not in the $GROUP group"
+# The recorded owner may switch the door off after leaving the group.
+if [ "$verb" != off ]; then
+    id -nG "$user" | tr ' ' '\n' | grep -qx "$GROUP" || die "'$user' is not in the $GROUP group"
+fi
 OWN="$home/.config/punktfunk"
 
 # `ports` runs inside the door's start, which `on` waits for while it holds this lock.
@@ -64,6 +69,11 @@ if [ "$verb" != ports ]; then
     exec 9>/run/punktfunk-door.lock
     flock 9
 fi
+recorded=$(cat "$RECORD" 2>/dev/null || true)
+case $verb in
+on) [ -z "$recorded" ] || [ "$recorded" = "$user" ] || die "the door is on for $recorded: turn it off from that account first" ;;
+off) [ "$recorded" = "$user" ] || die "the door is not on for $user" ;;
+esac
 
 as_user() { runuser -u "$user" -- "$@"; }
 as_door() { runuser -u punktfunk -- "$@"; }
@@ -140,6 +150,16 @@ give_avatars() {
     done
 }
 
+# An older helper kept the mark in $BOX, where the door could write it. The mark of a recorded
+# owner moves to $STATE; any other is dropped.
+legacy_mark() {
+    getent passwd punktfunk >/dev/null || return 0
+    if [ -n "$recorded" ] && as_door test -f "$BOX/door-on"; then
+        : >"$MARK"
+    fi
+    as_door rm -f "$BOX/door-on"
+}
+
 wait_for_socket() {
     for _ in $(seq 1 30); do
         [ -S /run/punktfunk/seats.sock ] && return 0
@@ -158,16 +178,17 @@ door_on() {
     # The shared games folder's group; the owner's Steam moves games into it at their next login.
     getent group punktfunk-games >/dev/null || groupadd --system punktfunk-games
     usermod -aG punktfunk-games "$user"
+    install -d -m 0711 -o root -g root "$STATE"
+    legacy_mark
+    printf '%s\n' "$user" >"$RECORD.tmp"
+    chmod 0600 "$RECORD.tmp"
+    mv -f "$RECORD.tmp" "$RECORD"
     if [ ! -e "$MARK" ]; then
         for f in $FILES; do take "$f"; done
         take_password
         take_avatars
-        as_door touch "$MARK"
+        : >"$MARK"
     fi
-    install -d -m 0711 -o root -g root "$STATE"
-    printf '%s\n' "$user" >"$STATE/owner.tmp"
-    chmod 0600 "$STATE/owner.tmp"
-    mv -f "$STATE/owner.tmp" "$STATE/owner"
     systemctl enable --now punktfunk-seats.service
     wait_for_socket
     "$SEATS" adopt-owner "$user" >/dev/null
@@ -187,6 +208,7 @@ owner_row() {
 
 door_off() {
     systemctl stop punktfunk-web-door.service punktfunk-door.service || true
+    legacy_mark
     if [ -e "$MARK" ]; then
         for f in $FILES; do [ "$f" = web-password ] || give "$f"; done
         give_password
@@ -201,7 +223,7 @@ door_off() {
         [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null
     fi
     # A stopped supervisor leaves the owner's contract behind, and their host and console read it.
-    rm -f "/run/punktfunk/seats/$user.env" "$MARK" "$STATE/owner"
+    rm -f "/run/punktfunk/seats/$user.env" "$MARK" "$RECORD"
     systemctl disable --now punktfunk-web-door.service punktfunk-door.service punktfunk-seats.service
     user_ctl try-restart punktfunk-host.service || true
     # Their console comes back only if it was theirs to begin with.
