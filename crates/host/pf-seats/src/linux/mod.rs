@@ -314,7 +314,7 @@ impl LinuxBackend {
     /// Removes the seat accounts no ledger row names, with their directories: what a create that
     /// stopped after `useradd` left, which refuses every later create of its name. A seat that has
     /// been started keeps its account, since its files may outlive a lost ledger; so does one
-    /// whose unit is up.
+    /// whose unit is up or can't be read.
     pub fn reap_orphans(&self, ledger: &Ledger) {
         let users = match accounts::all() {
             Ok(users) => users,
@@ -323,15 +323,11 @@ impl LinuxBackend {
                 return;
             }
         };
-        for user in &users {
-            let Some(id) = accounts::marked_id(user) else {
-                continue;
-            };
-            if ledger.seat(&id).is_some() {
-                continue;
-            }
+        for (user, id) in accounts::orphans(&users, ledger, &self.inner.state) {
             let account = &user.name;
-            let started = shared::host_dir(&self.inner.state, &id).exists();
+            // The token directory exists once the seat has started; one that can't be read counts.
+            let token_dir = shared::host_dir(&self.inner.state, &id);
+            let started = !matches!(token_dir.try_exists(), Ok(false));
             let idle = session::state(account).is_ok_and(|state| !state.live());
             if started || !idle {
                 tracing::warn!(%account, seat = %id, "seat account without a ledger row kept");

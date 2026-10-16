@@ -7,7 +7,7 @@
 
 use super::{err, run};
 use crate::backend::BackendError;
-use crate::model::{Seat, SeatId, MAX_SEATS};
+use crate::model::{Ledger, Seat, SeatId, MAX_SEATS};
 use std::path::{Path, PathBuf};
 
 /// `=`, not `:`: the colon separates passwd fields and `useradd` refuses it in a comment.
@@ -192,7 +192,7 @@ pub(super) fn ensure(seat: &Seat, state: &Path) -> Result<Passwd, BackendError> 
     let seat_dir = super::shared::seat_dir(state, &seat.id);
     super::shared::make_dir(&seat_dir, 0o711)
         .map_err(|e| err("seat_dirs", format!("create {}: {e}", seat_dir.display())))?;
-    let home = seat_dir.join("home");
+    let home = seat_home(state, &seat.id);
     let comment = marker(&seat.id);
     let groups = groups.join(",");
     let home_arg = home.to_string_lossy();
@@ -214,9 +214,29 @@ pub(super) fn ensure(seat: &Seat, state: &Path) -> Result<Passwd, BackendError> 
     lookup(&seat.account)?.ok_or_else(|| err("useradd_failed", "useradd left no passwd entry"))
 }
 
+/// The home `useradd` is given for `id`'s user.
+fn seat_home(state: &Path, id: &SeatId) -> PathBuf {
+    super::shared::seat_dir(state, id).join("home")
+}
+
 /// The seat id in `passwd`'s marker, whichever seat that is.
-pub(super) fn marked_id(passwd: &Passwd) -> Option<SeatId> {
+fn marked_id(passwd: &Passwd) -> Option<SeatId> {
     SeatId::parse(passwd.gecos.strip_prefix(MARKER_PREFIX)?).ok()
+}
+
+/// The seat accounts in `users` that no row of `ledger` names, with their seat ids. A user can
+/// write a marker into their own comment, so only an account in the home `useradd` gave that seat
+/// counts: a person's account never lives there.
+pub(super) fn orphans<'a>(
+    users: &'a [Passwd],
+    ledger: &Ledger,
+    state: &Path,
+) -> Vec<(&'a Passwd, SeatId)> {
+    users
+        .iter()
+        .filter_map(|user| Some((user, marked_id(user)?)))
+        .filter(|(user, id)| ledger.seat(id).is_none() && user.home == seat_home(state, id))
+        .collect()
 }
 
 /// Closes a seat's home to every user but its own. `useradd` makes it as open as `login.defs`
@@ -450,6 +470,43 @@ mod tests {
         ] {
             assert_eq!(marked_id(&row(gecos)), None, "{gecos:?}");
         }
+    }
+
+    /// An orphan is a seat account in its own seat home that no ledger row names. A marker in a
+    /// person's comment, or in an account elsewhere, is not one.
+    #[test]
+    fn only_a_seat_account_in_its_seat_home_is_an_orphan() {
+        use crate::model::CreateSeat;
+        let state = Path::new("/var/lib/punktfunk-seats");
+        let mut ledger = Ledger::new();
+        let kept = ledger
+            .allocate(CreateSeat {
+                name: "Kept".into(),
+                account: "pf-seat-1".into(),
+                autostart: false,
+            })
+            .unwrap();
+        let (orphan, forged) = (SeatId::random(), SeatId::random());
+        let row = |name: &str, id: &SeatId, home: &Path| {
+            let gecos = marker(id);
+            parse_passwd(&format!(
+                "{name}:x:975:972:{gecos}:{}:/bin/bash",
+                home.display()
+            ))
+            .unwrap()
+        };
+        let users = [
+            row("pf-seat-1", &kept.id, &seat_home(state, &kept.id)),
+            row("pf-seat-2", &orphan, &seat_home(state, &orphan)),
+            row("alice", &forged, Path::new("/home/alice")),
+            row("pf-seat-3", &forged, &seat_home(state, &orphan)),
+            parse_passwd("bob:x:1001:1001:Bob:/home/bob:/bin/bash").unwrap(),
+        ];
+        let found: Vec<_> = orphans(&users, &ledger, state)
+            .into_iter()
+            .map(|(user, id)| (user.name.as_str(), id))
+            .collect();
+        assert_eq!(found, [("pf-seat-2", orphan)]);
     }
 
     /// The owner is a person: uid 1000 up and below the nobody range, never a seat's marked
