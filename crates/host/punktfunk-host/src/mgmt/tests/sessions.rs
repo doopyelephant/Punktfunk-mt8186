@@ -483,6 +483,30 @@ async fn stop_session_clears_runtime_state() {
     assert!(state.launch.lock().unwrap().is_none());
 }
 
+/// A seat host closes its sessions as a power action's when the door says why, and a plain
+/// stop leaves the close untyped. Nothing else in this binary sends the flag.
+#[tokio::test]
+async fn stop_session_for_power_closes_as_power() {
+    let _registry = crate::session_status::tests::REGISTRY.lock().await;
+    let app = test_app(test_state(), None);
+    let mut closing = crate::power::closing_rx();
+    let stop = |query: &str| {
+        axum::http::Request::delete(format!("/api/v1/session{query}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    for plain in ["", "?reason=other"] {
+        assert_eq!(send(&app, stop(plain)).await.0, StatusCode::NO_CONTENT);
+        assert!(!closing.has_changed().unwrap(), "{plain:?} is a plain stop");
+    }
+    assert_eq!(
+        send(&app, stop("?reason=power")).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(*closing.borrow_and_update(), "the sessions close as power");
+    crate::power::set_closing(false);
+}
+
 #[tokio::test]
 async fn idr_requires_an_active_stream() {
     // A sibling test's live native session would look like an active stream to this route.

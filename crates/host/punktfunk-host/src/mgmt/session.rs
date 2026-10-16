@@ -20,6 +20,15 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::Extension;
 use std::sync::atomic::Ordering;
 
+/// `DELETE /session` options.
+#[derive(Deserialize, utoipa::IntoParams)]
+pub(crate) struct StopQuery {
+    /// Why the host stops. `power` closes every session the way a power action does, so clients
+    /// read that the host is going down; the box's door sends it to its seat hosts. A host that
+    /// predates it, and any other value, stop plainly.
+    reason: Option<String>,
+}
+
 /// Stop the session
 ///
 /// A deliberate stop: skip keep-alive linger and apply `game_on_session_end`.
@@ -28,12 +37,20 @@ use std::sync::atomic::Ordering;
     path = "/session",
     tag = "session",
     operation_id = "stopSession",
+    params(StopQuery),
     responses(
         (status = NO_CONTENT, description = "Session stopped (or none was active)"),
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn stop_session(State(st): State<Arc<MgmtState>>) -> StatusCode {
+pub(crate) async fn stop_session(
+    State(st): State<Arc<MgmtState>>,
+    Query(q): Query<StopQuery>,
+) -> StatusCode {
+    // Set before the stop, as in a power action: the sessions read it first and close typed.
+    if q.reason.as_deref() == Some("power") {
+        crate::power::set_closing(true);
+    }
     let was_streaming = st.app.quit_session("management API stop");
     // Native sessions run off the GameStream registry; `quit_session` does not reach them.
     let native = crate::session_status::count();

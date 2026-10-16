@@ -276,7 +276,7 @@ pub(crate) fn end_all_sessions() {
         for seat in &seats {
             if seat.runtime.state == pf_seats::RuntimeState::Running {
                 scope.spawn(move || {
-                    if !end_sessions(seat) {
+                    if !end_sessions_for_power(seat) {
                         tracing::warn!(seat = %seat.name, "seat sessions did not end before a power action");
                     }
                 });
@@ -337,11 +337,22 @@ pub(crate) fn occupants(seat: &pf_seats::Seat) -> Option<Vec<Occupant>> {
 
 /// Ends every session on `seat` through its host's loopback API. `false` when it didn't answer.
 pub(crate) fn end_sessions(seat: &pf_seats::Seat) -> bool {
+    stop_on(seat, "/api/v1/session")
+}
+
+/// [`end_sessions`] for a power action: the seat host closes each session as the door's own
+/// close, so its clients read that the box is going down. A seat host that predates the
+/// reason ends them plainly.
+fn end_sessions_for_power(seat: &pf_seats::Seat) -> bool {
+    stop_on(seat, "/api/v1/session?reason=power")
+}
+
+fn stop_on(seat: &pf_seats::Seat, path: &str) -> bool {
     let Some(pin) = seat_pin(seat) else {
         return false;
     };
     crate::ctl::client::Client::seat(pin, &host_dir(seat), seat.mgmt_port, Some(STATUS_TIMEOUT))
-        .and_then(|client| client.delete("/api/v1/session"))
+        .and_then(|client| client.delete(path))
         .is_ok()
 }
 
