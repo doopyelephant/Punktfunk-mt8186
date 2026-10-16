@@ -196,7 +196,7 @@ pub enum ResolveVia {
 pub enum ProfileError {
     /// No profile has that id.
     Unknown,
-    /// A seat profile asked of another seat's host.
+    /// A profile asked of a seat host that doesn't play it.
     NotThisSeat,
     /// The profile's account needs a session broker this host does not have.
     SessionUnavailable,
@@ -734,10 +734,8 @@ impl Profiles {
                     .then(|| file.profiles.iter().find(|p| p.id == id))
                     .flatten()
                     .ok_or(ProfileError::Unknown)?;
-                if let (Some(mine), OsAccount::Seat { seat }) = (&self.seat, &found.os_account) {
-                    if seat.as_ref() != Some(mine) {
-                        return Err(ProfileError::NotThisSeat);
-                    }
+                if !self.serves(&found.os_account) {
+                    return Err(ProfileError::NotThisSeat);
                 }
                 (Some(found), ResolveVia::Asked)
             }
@@ -788,6 +786,16 @@ impl Profiles {
             home: profile.home,
             via,
         })
+    }
+
+    /// Whether this host plays a profile on `account`. A seat host plays its own row's profile;
+    /// only the owner's host also plays the box's own session.
+    fn serves(&self, account: &OsAccount) -> bool {
+        match (&self.seat, account) {
+            (None, _) => true,
+            (Some(mine), OsAccount::Seat { seat }) => seat.as_ref() == Some(mine),
+            (Some(_), _) => self.owner_host,
+        }
     }
 
     /// Stores `bytes` as `id`'s picture: PNG, JPEG or WebP by magic, at most

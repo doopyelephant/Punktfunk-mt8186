@@ -174,6 +174,11 @@ fn a_seat_host_refuses_another_seats_profile() {
         p.resolve(None, Some("bbbbbbbbbbbb")),
         Err(ProfileError::NotThisSeat)
     );
+    // The owner's session is not this seat's to play either.
+    assert_eq!(
+        p.resolve(None, Some("4f1c3a9b0e27")),
+        Err(ProfileError::NotThisSeat)
+    );
 }
 
 /// The owner's host, behind the door, plays the owner and the profiles that share the owner's
