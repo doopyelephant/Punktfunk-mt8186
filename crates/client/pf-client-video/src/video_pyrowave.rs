@@ -506,6 +506,8 @@ pub struct PyroWaveDecoder {
     inflight: [Option<AuBuf>; RING],
     /// `maxImageDimension2D`, which bounds the ring's linear images.
     max_dim: u32,
+    /// AUs [`Self::decode_au`] found in the ring and AUs it copied in, since [`Self::take_ring_counts`].
+    ring_counts: std::cell::Cell<(u32, u32)>,
 }
 
 /// Where the last decode's wall time went, in microseconds.
@@ -749,6 +751,7 @@ impl PyroWaveDecoder {
             memory: None,
             inflight: Default::default(),
             max_dim,
+            ring_counts: Default::default(),
         })
     }
 
@@ -959,6 +962,11 @@ impl PyroWaveDecoder {
             })
     }
 
+    /// `(found in the ring, copied in)` since the last call.
+    pub fn take_ring_counts(&self) -> (u32, u32) {
+        self.ring_counts.take()
+    }
+
     /// The memory to assemble AUs in, while [`Self::enable_in_place`] holds. A new `Arc` after a
     /// resize outgrew the old ring.
     pub fn au_memory(&self) -> Option<Arc<dyn AuMemory>> {
@@ -1039,6 +1047,12 @@ impl PyroWaveDecoder {
         };
         let parse_started = Instant::now();
         let len = au.len();
+        let (found, copied) = self.ring_counts.get();
+        self.ring_counts.set(if in_ring(&au) {
+            (found + 1, copied)
+        } else {
+            (found, copied + 1)
+        });
         let mut au = au;
         if !in_ring(&au) {
             let mut moved = AuBuf::take(&payload::RingMemory(ring.clone()), len);

@@ -95,15 +95,18 @@ mod imp {
                 return;
             }
             let ms = |i: usize| self.sum[i] as f64 / f64::from(self.frames) / 1000.0;
+            let (found, copied) = decoder.take_ring_counts();
             log::info!(
                 "pyro: {} frames, mean ms: wait {:.2} parse {:.2} record {:.2} gpu {:.2} \
-                 present {:.2}",
+                 present {:.2}; AUs in place {}, copied in {}",
                 self.frames,
                 ms(0),
                 ms(1),
                 ms(2),
                 ms(3),
-                ms(4)
+                ms(4),
+                found,
+                copied
             );
             for line in decoder.gpu_stage_report(true) {
                 log::info!("pyro:   {line}");
@@ -221,6 +224,7 @@ mod imp {
             log::warn!("pyro: packets are copied into the decoder ({e:#})");
             return lent;
         }
+        log::info!("pyro: the decoder reads AUs where the reassembler wrote them");
         lend(client, decoder, lent)
     }
 
