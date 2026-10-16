@@ -1,8 +1,9 @@
 //! Serialized command dispatch over a validated ledger and platform backend.
 //!
 //! Each mutation is applied to a clone, persisted with a new generation, then
-//! published in memory. Provisioning precedes the create commit, but a failed
-//! commit never deletes an account: only an explicit Delete command may do so.
+//! published in memory. Provisioning precedes the create commit; a create that
+//! fails in either removes what it made through the backend's marker-checked
+//! remove, and only an explicit Delete removes a committed seat's account.
 //! Runtime observations, including backend failures, are persisted. Startup
 //! reconciliation starts autostart seats and refreshes the rest. One mutex
 //! serializes lifecycle calls because four seats do not need rollback races; the
@@ -172,7 +173,14 @@ impl<B: PlatformBackend> SeatService<B> {
         let mut current = self.lock();
         let mut next = current.clone();
         let seat = next.allocate(request).map_err(ApiError::from)?;
-        self.backend.provision(&seat).map_err(ApiError::from)?;
+        if let Err(error) = self.backend.provision(&seat) {
+            // An account that is not the seat's was never ours to remove.
+            if error.code != "account_not_owned" {
+                // It may have made the account before it failed, and no ledger row will name it.
+                let _ = self.backend.remove(&seat);
+            }
+            return Err(ApiError::from(error));
+        }
         if let Err(error) = self.commit(&mut current, next) {
             // The account exists but no ledger row does, so delete could never reach it.
             let _ = self.backend.remove(&seat);

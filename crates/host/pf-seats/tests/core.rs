@@ -281,6 +281,57 @@ fn the_owner_row_is_adopted_once_and_released_by_delete() {
     assert!(backend.calls().contains(&format!("remove:{}", first.id)));
 }
 
+/// A backend whose provision fails with `code` after the fake made its account.
+#[derive(Clone)]
+struct FailsToProvision {
+    inner: FakeBackend,
+    code: &'static str,
+}
+
+impl PlatformBackend for FailsToProvision {
+    fn provision(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.inner.provision(seat)?;
+        Err(BackendError::new(self.code, "provision stopped part-way"))
+    }
+    fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.start(seat)
+    }
+    fn stop(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.stop(seat)
+    }
+    fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.inner.remove(seat)
+    }
+    fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.status(seat)
+    }
+}
+
+/// A create that fails after the account exists removes it, since no ledger row will; an account
+/// that was never the seat's is left alone.
+#[test]
+fn a_failed_provision_removes_what_it_made_unless_the_account_was_not_ours() {
+    for (code, removed) in [("verify_failed", true), ("account_not_owned", false)] {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = FailsToProvision {
+            inner: FakeBackend::default(),
+            code,
+        };
+        let service = SeatService::open(temp.path(), backend.clone()).unwrap();
+        let error = service
+            .dispatch(create("Desk", "pf-desk", false))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Backend);
+        assert!(service.ledger().seats.is_empty());
+        let calls = backend.inner.calls();
+        assert_eq!(
+            calls.iter().any(|call| call.starts_with("remove:")),
+            removed,
+            "{code}"
+        );
+    }
+}
+
 #[test]
 fn duplicate_create_is_a_structured_conflict() {
     let temp = tempfile::tempdir().unwrap();

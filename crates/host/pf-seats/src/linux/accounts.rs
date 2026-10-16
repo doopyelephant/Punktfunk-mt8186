@@ -161,13 +161,13 @@ pub(super) fn check_name(account: &str) -> Result<(), BackendError> {
 }
 
 /// The seat's user, created on first use. An existing user is accepted only with the seat's
-/// marker. The second value is whether this call created it.
-pub(super) fn ensure(seat: &Seat, state: &Path) -> Result<(Passwd, bool), BackendError> {
+/// marker.
+pub(super) fn ensure(seat: &Seat, state: &Path) -> Result<Passwd, BackendError> {
     if let Some(existing) = lookup(&seat.account)? {
         return if owned_by(&existing, &seat.id) {
-            Ok((existing, false))
+            Ok(existing)
         } else {
-            Err(not_owned(seat))
+            Err(not_owned(&seat.account, &seat.id))
         };
     }
     let mut groups = Vec::new();
@@ -199,9 +199,12 @@ pub(super) fn ensure(seat: &Seat, state: &Path) -> Result<(Passwd, bool), Backen
             &seat.account,
         ],
     )?;
-    let created = lookup(&seat.account)?
-        .ok_or_else(|| err("useradd_failed", "useradd left no passwd entry"))?;
-    Ok((created, true))
+    lookup(&seat.account)?.ok_or_else(|| err("useradd_failed", "useradd left no passwd entry"))
+}
+
+/// The seat id in `passwd`'s marker, whichever seat that is.
+pub(super) fn marked_id(passwd: &Passwd) -> Option<SeatId> {
+    SeatId::parse(passwd.gecos.strip_prefix(MARKER_PREFIX)?).ok()
 }
 
 /// Whether `passwd` carries a seat's marker, for any seat.
@@ -254,7 +257,7 @@ pub(super) fn require_recorded(state: &Path, account: &str) -> Result<(), Backen
 pub(super) fn require(seat: &Seat) -> Result<Passwd, BackendError> {
     match lookup(&seat.account)? {
         Some(found) if owned_by(&found, &seat.id) => Ok(found),
-        Some(_) => Err(not_owned(seat)),
+        Some(_) => Err(not_owned(&seat.account, &seat.id)),
         None => Err(err(
             "account_missing",
             format!("account '{}' doesn't exist", seat.account),
@@ -262,20 +265,29 @@ pub(super) fn require(seat: &Seat) -> Result<Passwd, BackendError> {
     }
 }
 
-/// Deletes the seat's user and home. A user without the marker is refused; one that is already
-/// gone is not an error.
-pub(super) fn delete(seat: &Seat) -> Result<(), BackendError> {
-    let Some(found) = lookup(&seat.account)? else {
+/// Refuses a user of the seat's name that isn't the seat's, before anything is done to it. An
+/// absent user is fine.
+pub(super) fn refuse_foreign(seat: &Seat) -> Result<(), BackendError> {
+    match lookup(&seat.account)? {
+        Some(found) if !owned_by(&found, &seat.id) => Err(not_owned(&seat.account, &seat.id)),
+        _ => Ok(()),
+    }
+}
+
+/// Deletes the user `account` and its home when it carries `id`'s marker. A user without the
+/// marker is refused; one that is already gone is not an error.
+pub(super) fn delete(account: &str, id: &SeatId) -> Result<(), BackendError> {
+    let Some(found) = lookup(account)? else {
         return Ok(());
     };
-    if !owned_by(&found, &seat.id) {
-        return Err(not_owned(seat));
+    if !owned_by(&found, id) {
+        return Err(not_owned(account, id));
     }
-    quiesce(&seat.account)?;
-    let removed = run("userdel_failed", "userdel", &["-r", &seat.account]);
+    quiesce(account)?;
+    let removed = run("userdel_failed", "userdel", &["-r", account]);
     // userdel exits 12 when it can't remove the home. The user is gone and the seat directory
     // is removed by path afterwards, so only a user that is still there is a failure.
-    match (removed, lookup(&seat.account)?) {
+    match (removed, lookup(account)?) {
         (Err(error), Some(_)) => Err(error),
         _ => Ok(()),
     }
@@ -305,13 +317,10 @@ pub(super) fn quiesce(account: &str) -> Result<(), BackendError> {
     ))
 }
 
-fn not_owned(seat: &Seat) -> BackendError {
+fn not_owned(account: &str, id: &SeatId) -> BackendError {
     err(
         "account_not_owned",
-        format!(
-            "account '{}' exists without the marker for seat {}",
-            seat.account, seat.id
-        ),
+        format!("account '{account}' exists without the marker for seat {id}"),
     )
 }
 
@@ -365,6 +374,24 @@ mod tests {
         assert!(!owned("punktfunk-seat=0123456789abcdef"));
         assert!(!owned("Ada Lovelace"));
         assert!(!owned(""));
+    }
+
+    /// A seat's marker names its id, whichever seat that is; anything else names none.
+    #[test]
+    fn a_marker_names_the_seat_whose_account_it_is() {
+        let row = |gecos: &str| {
+            parse_passwd(&format!("u:x:975:972:{gecos}:/var/lib/h:/bin/bash")).unwrap()
+        };
+        assert_eq!(marked_id(&row(&marker(&id()))), Some(id()));
+        for gecos in [
+            "",
+            "Ada Lovelace",
+            "punktfunk-seat=",
+            "punktfunk-seat=0123456789abcdef",
+            "punktfunk-seat=0123456789ABCDEF0123456789ABCDEF",
+        ] {
+            assert_eq!(marked_id(&row(gecos)), None, "{gecos:?}");
+        }
     }
 
     /// The owner is a person: uid 1000 up and below the nobody range, never a seat's marked

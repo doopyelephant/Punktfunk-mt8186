@@ -278,7 +278,45 @@ impl LinuxBackend {
         let root = ledger_root(&self.inner.state);
         let service = SeatService::open(&root, self)?;
         shared::make_dir(&root, 0o711)?;
+        service.backend().reap_orphans(&service.ledger());
         Ok(service)
+    }
+
+    /// Removes the seat accounts no ledger row names, with their directories: what a create that
+    /// stopped after `useradd` left, which refuses every later create of its name. A seat that has
+    /// been started keeps its account, since its files may outlive a lost ledger; so does one
+    /// whose unit is up.
+    pub fn reap_orphans(&self, ledger: &Ledger) {
+        let users = match accounts::all() {
+            Ok(users) => users,
+            Err(error) => {
+                tracing::warn!(%error, "seat accounts not listed");
+                return;
+            }
+        };
+        for user in &users {
+            let Some(id) = accounts::marked_id(user) else {
+                continue;
+            };
+            if ledger.seat(&id).is_some() {
+                continue;
+            }
+            let account = &user.name;
+            let started = shared::host_dir(&self.inner.state, &id).exists();
+            let idle = session::state(account).is_ok_and(|state| !state.live());
+            if started || !idle {
+                tracing::warn!(%account, seat = %id, "seat account without a ledger row kept");
+                continue;
+            }
+            match self.remove_files(account, &id, false) {
+                Ok(()) => {
+                    tracing::warn!(%account, seat = %id, "seat account without a ledger row removed")
+                }
+                Err(error) => {
+                    tracing::warn!(%account, seat = %id, %error, "seat account not removed")
+                }
+            }
+        }
     }
 
     /// The account of the running seat whose user is `uid`: whom the pad broker serves.
@@ -419,14 +457,14 @@ impl LinuxBackend {
         Err(failure)
     }
 
-    /// Removes what the seat's row made. The owner's account and home are theirs and stay.
-    fn remove_files(&self, seat: &Seat) -> Result<(), BackendError> {
-        if !seat.owner {
-            accounts::delete(seat)?;
+    /// Removes what a seat's row made. The owner's account and home are theirs and stay.
+    fn remove_files(&self, account: &str, id: &SeatId, owner: bool) -> Result<(), BackendError> {
+        if !owner {
+            accounts::delete(account, id)?;
         }
-        shared::remove_seat_dirs(&self.inner.state, &seat.id)?;
-        let _ = std::fs::remove_file(session::env_path(&seat.account));
-        let dropin = session::dropin_dir(&seat.account);
+        shared::remove_seat_dirs(&self.inner.state, id)?;
+        let _ = std::fs::remove_file(session::env_path(account));
+        let dropin = session::dropin_dir(account);
         if dropin.exists() {
             let _ = std::fs::remove_dir_all(dropin);
             session::daemon_reload()?;
@@ -552,14 +590,8 @@ impl PlatformBackend for LinuxBackend {
         let state = &self.inner.state;
         let gid = accounts::ensure_group(accounts::GAMES_GROUP)?;
         shared::ensure_games(state, gid)?;
-        let (passwd, created) = accounts::ensure(seat, state)?;
-        let finished = shared::ensure_seat_dirs(state, &seat.id, &passwd);
-        if let Err(error) = finished {
-            if created {
-                let _ = self.remove_files(seat);
-            }
-            return Err(error);
-        }
+        let passwd = accounts::ensure(seat, state)?;
+        shared::ensure_seat_dirs(state, &seat.id, &passwd)?;
         shared::provision_steam(state, &seat.id, &passwd, self.steam_source().as_ref());
         Ok(())
     }
@@ -623,6 +655,10 @@ impl PlatformBackend for LinuxBackend {
 
     /// The owner's row takes the box's library with it: it was the door's, and the door goes too.
     fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
+        // Before the unit is stopped: ending a stranger's sessions is not removing a seat.
+        if !seat.owner {
+            accounts::refuse_foreign(seat)?;
+        }
         self.stop_unit(seat)?;
         self.untrack(&seat.id);
         if seat.owner {
@@ -634,7 +670,7 @@ impl PlatformBackend for LinuxBackend {
             shared::remove_box_library(&self.inner.state)
                 .map_err(|e| err("box_library", format!("remove the box library: {e}")))?;
         }
-        self.remove_files(seat)
+        self.remove_files(&seat.account, &seat.id, seat.owner)
     }
 
     fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
