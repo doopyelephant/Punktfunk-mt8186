@@ -143,12 +143,14 @@ session by design, and display activation fails while its session is inactive.
   and `dualsense_usbip`, the box's own **DualSense over USB/IP** switch: a seat's DualSense is a
   USB/IP pad with a sound card exactly when the box's is.
 - **The box's trust, its own key.** The seat never writes the pairing store or profiles. A grant
-  changed in the box console applies to the seat's next check. It mints and keeps its own identity
+  changed in the box console applies to the seat's next check, and within about three seconds to
+  its live sessions: a narrowed grant takes effect, and an unpair, an expiry or a removed profile
+  ends the session. It mints and keeps its own identity
   in `PUNKTFUNK_CONFIG_DIR`, never the box's. The supervisor records its certificate's SHA-256 in
   the ledger while it runs. The box's `Redirect` carries that pin (field 7) and `enumerate` lists
   it as `seat.pin`, so a client pins the seat through the box it already trusts. A seat whose pin
   the box doesn't hold yet is unavailable. Sleep, restart and shut down are refused: the box's own
-  host is the one that does them.
+  host is the one that does them, and it ends the sessions on every seat first.
 - **The box's library, on Windows.** A Windows seat runs no plugins. It lists and launches the
   box's titles as its own user, and answers every library change with 409. Titles from sources
   that belong to one account (Playnite, Game Bar, Amazon, itch, Hydra) are left out.
@@ -156,8 +158,10 @@ session by design, and display activation fails while its session is inactive.
   below). A seat other than the owner's lists and launches only its titles that start through
   Steam, `steam_appid` with an id that fits 32 bits and `steam_ui`, with its own Steam, and
   answers every library change with 409. Every other title starts from the owner's home.
-- **One profile.** The seat serves the profile whose seat it is. A connect that names another seat
-  profile is refused as an unknown profile; one that names none plays as this seat's profile.
+- **One profile.** The seat serves the profile whose seat it is. A connect that names any other
+  profile, the owner's included, is refused as an unknown profile; one that names none plays as
+  this seat's profile. The owner's row alone also serves the owner and the profiles that share the
+  owner's desktop.
 - **One connector, one lock.** A seat host creates its virtual display on its own connector only
   and holds the mutex `Global\punktfunk-vdisplay-manager-seat-<slot>`; the console host holds
   `Global\punktfunk-vdisplay-manager`. Hosts on different connectors start independently. A second
