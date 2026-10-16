@@ -398,6 +398,7 @@
 	"plugin_access_read_only": "Read only",
 	"plugin_access_read_write": "Read and write",
 	"plugin_access_allow": "Allow",
+	"plugin_access_allowing": "Allowing…",
 	"plugin_access_dont_allow": "Don't allow",
 	"plugin_access_allow_all": "Allow all",
 	"plugin_access_confirm_title": "Allow access?",

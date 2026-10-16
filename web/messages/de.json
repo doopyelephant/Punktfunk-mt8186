@@ -386,6 +386,7 @@
 	"plugin_access_read_only": "Nur Lesen",
 	"plugin_access_read_write": "Lesen und Schreiben",
 	"plugin_access_allow": "Erlauben",
+	"plugin_access_allowing": "Wird erlaubt…",
 	"plugin_access_dont_allow": "Nicht erlauben",
 	"plugin_access_allow_all": "Alle erlauben",
 	"plugin_form_confirm_title": "Diese Ordner freigeben?",

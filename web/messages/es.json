@@ -397,6 +397,7 @@
 	"plugin_access_read_only": "Solo lectura",
 	"plugin_access_read_write": "Lectura y escritura",
 	"plugin_access_allow": "Permitir",
+	"plugin_access_allowing": "Permitiendo…",
 	"plugin_access_dont_allow": "No permitir",
 	"plugin_access_allow_all": "Permitir todo",
 	"plugin_access_ask_again": "Preguntar de nuevo",

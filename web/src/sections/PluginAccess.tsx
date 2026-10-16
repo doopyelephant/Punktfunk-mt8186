@@ -79,6 +79,7 @@ export const usePluginAccess = () => {
 			title={m.plugin_access_confirm_title()}
 			body={m.plugin_access_confirm_body()}
 			submitLabel={m.plugin_access_allow()}
+			busyLabel={m.plugin_access_allowing()}
 			failedText={m.plugin_access_decision_failed()}
 			onSubmit={async (password) => {
 				if (allowing)
