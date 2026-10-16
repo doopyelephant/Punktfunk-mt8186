@@ -333,26 +333,47 @@ pub(super) fn state(account: &str) -> Result<UnitState, BackendError> {
     Ok(parse_show(&shown))
 }
 
-/// The users that own a TCP listener on `port`, from the kernel's tables: one entry per socket.
+/// The users that own a TCP listener that answers `127.0.0.1:port`, from the kernel's tables:
+/// one entry per socket. A table that can't be read counts as empty, and is logged unless it is
+/// the IPv6 one on a kernel without IPv6.
 fn listeners(port: u16) -> Vec<u32> {
     ["/proc/net/tcp", "/proc/net/tcp6"]
         .into_iter()
-        .filter_map(|table| std::fs::read_to_string(table).ok())
+        .filter_map(|path| match std::fs::read_to_string(path) {
+            Ok(table) => Some(table),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::warn!(%error, path, "listening sockets not readable");
+                None
+            }
+        })
         .flat_map(|table| listener_uids(&table, port))
         .collect()
 }
 
-/// The owners of the `LISTEN` rows on `port` in one `/proc/net/tcp` table: the local address and
-/// port are field 1, the state field 3 (`0A`) and the owner's uid field 7.
+/// Local addresses a connect to `127.0.0.1` can reach, as `/proc/net/tcp` prints them on a
+/// little-endian machine: loopback and the wildcard, and the same two behind an IPv6 socket.
+const LOOPBACK_REACHED: [&str; 4] = [
+    "0100007F",
+    "00000000",
+    "0000000000000000FFFF00000100007F",
+    "00000000000000000000000000000000",
+];
+
+/// The owners of the `LISTEN` rows on `port` in one `/proc/net/tcp` table that answer
+/// `127.0.0.1`: the local address and port are field 1, the state field 3 (`0A`) and the owner's
+/// uid field 7. A listener on another address, `::1` included, is not in the way.
 fn listener_uids(table: &str, port: u16) -> Vec<u32> {
     table
         .lines()
         .skip(1)
         .filter_map(|row| {
             let fields: Vec<&str> = row.split_whitespace().collect();
-            let (_, local_port) = fields.get(1)?.rsplit_once(':')?;
+            let (address, local_port) = fields.get(1)?.rsplit_once(':')?;
             let listening = fields.get(3) == Some(&"0A");
-            if !listening || u16::from_str_radix(local_port, 16).ok()? != port {
+            let wanted = LOOPBACK_REACHED.contains(&address)
+                && u16::from_str_radix(local_port, 16).ok()? == port;
+            if !listening || !wanted {
                 return None;
             }
             fields.get(7)?.parse().ok()
@@ -567,7 +588,8 @@ mod tests {
         assert!(!parse_show("ActiveState=failed\n").live());
     }
 
-    /// Only a socket in `LISTEN` on the port counts, whatever its address family or owner.
+    /// Only a socket in `LISTEN` on the port that answers `127.0.0.1` counts, whatever its family
+    /// or owner; a listener on another address is not in the way.
     #[test]
     fn the_listeners_on_a_port_are_the_listen_rows_with_that_port() {
         let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
@@ -575,8 +597,11 @@ mod tests {
             1: 0100007F:B8B4 00000000:0000 0A 00000000:00000000 00:00000000 00000000   976        0 112 1 0 100 0 0 10 0\n\
             2: 0100007F:B8B3 0100007F:9C40 01 00000000:00000000 00:00000000 00000000   975        0 113 1 0 100 0 0 10 0\n\
             3: 00000000:B8B3 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 114 1 0 100 0 0 10 0\n\
-            4: 00000000000000000000000001000000:B8B3 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  0 0 115 1 0 100 0 0 10 0\n";
-        assert_eq!(listener_uids(table, 0xB8B3), [975, 1000, 0]);
+            4: 00000000000000000000000000000000:B8B3 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  0 0 115 1 0 100 0 0 10 0\n\
+            5: 0000000000000000FFFF00000100007F:B8B3 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  977 0 116 1 0 100 0 0 10 0\n\
+            6: 00000000000000000000000001000000:B8B3 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  978 0 117 1 0 100 0 0 10 0\n\
+            7: 0501A8C0:B8B3 00000000:0000 0A 00000000:00000000 00:00000000 00000000   979        0 118 1 0 100 0 0 10 0\n";
+        assert_eq!(listener_uids(table, 0xB8B3), [975, 1000, 0, 977]);
         assert_eq!(listener_uids(table, 0xB8B4), [976]);
         assert!(listener_uids(table, 0xB8B5).is_empty());
         assert!(listener_uids("", 1).is_empty());
