@@ -904,6 +904,7 @@ mod tests {
             clock_origin_ns: 0,
             keys: None,
             clock: None,
+            clear_placement: false,
         };
         let session = punktfunk_core::session::Session::new(cfg, media, transport).unwrap();
         let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(3);

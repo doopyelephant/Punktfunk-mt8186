@@ -36,7 +36,8 @@ pub struct FramePart {
 
 /// A reassembled, FEC-recovered access unit, ready to hand to the platform decoder.
 pub struct Frame {
-    pub data: Vec<u8>,
+    /// The AU's bytes, in the memory the session assembles in ([`crate::au`]).
+    pub data: crate::au::AuBuf,
     pub frame_index: u32,
     pub pts_ns: u64,
     pub flags: u32,
@@ -71,6 +72,9 @@ pub struct MediaV2 {
     /// Host: the session clock video pts leave in. Its origin is `clock_origin_ns`. `None`
     /// on a receiver, and on a sender whose pts are already wire time.
     pub clock: Option<std::sync::Arc<crate::quic::v2::clock::SessionClock>>,
+    /// Sealed packets carry the whole header in the clear, so a receiver opens each shard
+    /// straight into its frame ([`FEATURE_CLEAR_PLACEMENT`](crate::quic::v2::registry::FEATURE_CLEAR_PLACEMENT)).
+    pub clear_placement: bool,
 }
 
 /// One end of a stream. Built for a single [`Role`]; the other role's methods return
@@ -99,13 +103,10 @@ pub struct Session {
     stats: StatsCounters,
     /// Monotonic wire sequence, also the AES-GCM nonce counter.
     next_seq: u64,
-    /// Client recv ring, reused across [`poll_frame`](Self::poll_frame). Filled by one
-    /// `recvmmsg`, consumed across calls (`recv_idx`..`recv_count`). Allocated on first
-    /// client poll so host sessions do not carry it.
-    recv_scratch: Vec<Vec<u8>>,
-    recv_lens: Vec<usize>,
-    recv_count: usize,
-    recv_idx: usize,
+    /// Client: the received batch being consumed, decrypted in place datagram by datagram
+    /// across [`poll_frame`](Self::poll_frame) calls from byte `recv_off`.
+    recv_cur: Option<crate::transport::RecvBatch>,
+    recv_off: usize,
     /// Host send pool. `seal_frame` seals in place here; the caller sends then returns the
     /// buffers via [`reclaim_wires`](Self::reclaim_wires). After warmup each keeps its capacity.
     wire_pool: Vec<Vec<u8>>,
@@ -201,10 +202,16 @@ use seal::{
 };
 pub use seal::{SealSink, SendFn};
 
-/// Datagrams per client `recvmmsg` (the reused ring). 128 keeps the syscall rate
-/// ≤ ~3.4k/s at ~430k pkt/s (~4.8 Gbps) and drains the kernel buffer deeper per pump;
-/// cost is `RECV_BATCH × RECV_BUF` (~256 KB, client sessions only).
-const RECV_BATCH: usize = 128;
+/// Batches [`Session::flush_backlog`] discards at most: a line-rate sender cannot pin it.
+const FLUSH_BATCHES: usize = 128 * 1024;
+
+/// How a received packet was opened.
+enum Opened {
+    /// In place in the received buffer: the packet is this range of it.
+    InPlace(std::ops::Range<usize>),
+    /// Straight into its frame's slot: a shard of this many bytes.
+    Placed(usize),
+}
 
 impl Session {
     /// [`crate::packet::encode_v2`] headers both ways, sealed under `media.keys` when it has
@@ -212,10 +219,13 @@ impl Session {
     pub fn new(config: Config, media: MediaV2, transport: Box<dyn Transport>) -> Result<Session> {
         config.validate()?;
         let coder = coder_for(config.fec.scheme);
-        let crypto = media
-            .keys
-            .as_ref()
-            .map(|keys| std::sync::Arc::new(SessionCrypto::media(keys, config.role)));
+        let crypto = media.keys.as_ref().map(|keys| {
+            std::sync::Arc::new(SessionCrypto::media(
+                keys,
+                config.role,
+                media.clear_placement,
+            ))
+        });
         let replay = crypto.is_some().then(ReplayWindow::new);
         let packetizer = Packetizer::new(&config);
         let reassembler = Reassembler::new(
@@ -239,10 +249,8 @@ impl Session {
             reassembler,
             stats: StatsCounters::default(),
             next_seq: 0,
-            recv_scratch: Vec::new(),
-            recv_lens: Vec::new(),
-            recv_count: 0,
-            recv_idx: 0,
+            recv_cur: None,
+            recv_off: 0,
             wire_pool: Vec::new(),
             // Read once at construct; set `PUNKTFUNK_PERF` before connecting.
             perf: (crate::env_on("PUNKTFUNK_PERF") == Some(true)).then(PumpPerf::default),
@@ -815,8 +823,7 @@ impl Session {
         self.next_seq = seq.wrapping_add(1);
         buf[1..V2_CLEAR_LEN].copy_from_slice(&(seq as u32).to_le_bytes());
         if let Some(c) = &self.crypto {
-            let (aad, rest) = buf.split_at_mut(V2_CLEAR_LEN);
-            c.seal_media(seq, aad, rest)?;
+            c.seal_wire(seq, &mut buf)?;
         }
         Ok(buf)
     }
@@ -983,6 +990,11 @@ impl Session {
         false
     }
 
+    /// Client: assemble access units in `memory` from the next frame on ([`crate::au`]).
+    pub fn set_au_memory(&mut self, memory: std::sync::Arc<dyn crate::au::AuMemory>) {
+        self.reassembler.set_memory(memory);
+    }
+
     /// Client: drain the transport until a whole access unit is recovered, or no more
     /// packets are pending ([`PunktfunkError::NoFrame`]).
     pub fn poll_frame(&mut self) -> Result<Frame> {
@@ -991,25 +1003,17 @@ impl Session {
                 "poll_frame called on a host session",
             ));
         }
-        if self.recv_scratch.is_empty() {
-            // Max datagram + 1: an oversized read fills the buffer and we drop it below.
-            self.recv_scratch = (0..RECV_BATCH)
-                .map(|_| vec![0u8; MAX_DATAGRAM_BYTES + 1])
-                .collect();
-            self.recv_lens = vec![0usize; RECV_BATCH];
-        }
         loop {
-            if self.recv_idx >= self.recv_count {
+            let Some(range) = self.recv_cur.as_ref().and_then(|b| b.at(self.recv_off)) else {
                 let t0 = self.perf.is_some().then(std::time::Instant::now);
-                self.recv_count = self
-                    .transport
-                    .recv_batch(&mut self.recv_scratch, &mut self.recv_lens)?;
+                // Dropping the spent batch hands its buffer back to the demux.
+                self.recv_cur = self.transport.recv_owned()?;
+                self.recv_off = 0;
                 if let (Some(p), Some(t0)) = (self.perf.as_mut(), t0) {
                     p.recv_ns += t0.elapsed().as_nanos() as u64;
                     p.batches += 1;
                 }
-                self.recv_idx = 0;
-                if self.recv_count == 0 {
+                if self.recv_cur.is_none() {
                     // Idle wire: hand over an aged-out partial if one is waiting (it only gets staler).
                     if let Some(p) = self.reassembler.take_partial() {
                         if !self.behind_epoch(p.epoch) {
@@ -1019,27 +1023,29 @@ impl Session {
                     }
                     return Err(PunktfunkError::NoFrame);
                 }
-            }
-            let i = self.recv_idx;
-            self.recv_idx += 1;
-            let len = self.recv_lens[i];
-            // recvmmsg truncates and caps `msg_len` at the buffer size: drop rather than
-            // hand up a truncated packet (same contract as scalar `recv`'s `n >= RECV_BUF`).
+                continue;
+            };
+            self.recv_off = range.end;
+            let len = range.len();
+            // A read that filled its buffer may be truncated: drop it rather than hand it up.
             if len > MAX_DATAGRAM_BYTES {
                 continue;
             }
-            // Open in place in the ring: plaintext at [8..8+n] behind the seq prefix; a
-            // probe datagram is the packet. Field-precise borrows keep the `recv_scratch`
-            // slice alive across replay/reassembly. Short / undecryptable `continue`s skip
-            // decrypt accounting (exception path, not line rate).
+            let Some(batch) = self.recv_cur.as_mut() else {
+                continue;
+            };
+            // A data shard whose clear header names a slot already in flight opens straight
+            // into it; anything else opens in place in the received buffer and is copied by
+            // the reassembler. A probe datagram is the packet. Short or undecryptable
+            // `continue`s skip decrypt accounting (exception path, not line rate).
             let t_dec = self.perf.is_some().then(std::time::Instant::now);
-            let (pkt_range, seq) = match &self.crypto {
+            let (opened, seq) = match &self.crypto {
                 Some(c) => {
-                    use crate::packet::V2_CLEAR_LEN;
+                    use crate::packet::{V2_CLEAR_LEN, V2_HEADER_LEN};
                     if len < crate::packet::WIRE_OVERHEAD {
                         continue;
                     }
-                    let wire = &mut self.recv_scratch[i][..len];
+                    let wire = batch.bytes_mut(range.clone());
                     let low = u32::from_le_bytes(wire[1..V2_CLEAR_LEN].try_into().unwrap());
                     let reference = self.replay.as_ref().map_or(0, |w| w.reference());
                     let seq = crate::packet::expand_seq(reference, low);
@@ -1047,13 +1053,24 @@ impl Session {
                         StatsCounters::add(&self.stats.packets_dropped, 1);
                         continue;
                     }
-                    let (aad, rest) = wire.split_at_mut(V2_CLEAR_LEN);
-                    match c.open_media(seq, aad, rest) {
-                        Ok(n) => (0..V2_CLEAR_LEN + n, Some(seq)),
+                    let body = len - crate::crypto::TAG_LEN - c.clear_len();
+                    let slot = if c.clear_len() == V2_HEADER_LEN {
+                        self.reassembler.data_slot(&wire[..V2_HEADER_LEN], body)
+                    } else {
+                        None
+                    };
+                    let opened = match slot {
+                        Some(slot) => c
+                            .open_wire_into(seq, wire, slot)
+                            .map(|()| Opened::Placed(body)),
+                        None => c.open_wire(seq, wire).map(|n| Opened::InPlace(0..n)),
+                    };
+                    match opened {
+                        Ok(o) => (o, Some(seq)),
                         Err(_) => continue,
                     }
                 }
-                None => (0..len, None),
+                None => (Opened::InPlace(0..len), None),
             };
             if let (Some(p), Some(t)) = (self.perf.as_mut(), t_dec) {
                 p.decrypt_ns += t.elapsed().as_nanos() as u64;
@@ -1066,17 +1083,29 @@ impl Session {
                     continue;
                 }
             }
-            let pkt = &self.recv_scratch[i][pkt_range];
+            let wire = batch.bytes(range);
+            let (pkt_len, placed) = match &opened {
+                Opened::InPlace(r) => (r.len(), false),
+                Opened::Placed(body) => (crate::packet::V2_HEADER_LEN + body, true),
+            };
             StatsCounters::add(&self.stats.packets_received, 1);
-            StatsCounters::add(&self.stats.bytes_received, pkt.len() as u64);
+            StatsCounters::add(&self.stats.bytes_received, pkt_len as u64);
             let t_push = self.perf.is_some().then(std::time::Instant::now);
-            let pushed = self
-                .reassembler
-                .push(pkt, self.coder.as_ref(), &self.stats)?;
+            let pushed = match opened {
+                Opened::InPlace(r) => {
+                    self.reassembler
+                        .push(&wire[r], self.coder.as_ref(), &self.stats)?
+                }
+                Opened::Placed(body) => {
+                    self.reassembler
+                        .push_placed(wire, body, self.coder.as_ref(), &self.stats)?
+                }
+            };
             if let (Some(p), Some(t)) = (self.perf.as_mut(), t_push) {
                 p.reasm_ns += t.elapsed().as_nanos() as u64;
                 // Datagrams that reached the reassembler (replay-rejected ones do not).
                 p.packets += 1;
+                p.placed += u64::from(placed);
             }
             if let Some(frame) = pushed {
                 // Prefix parts are not completions: only the delivery that closes the AU,
@@ -1102,31 +1131,28 @@ impl Session {
         }
     }
 
-    /// Client: discard the pending receive backlog (current recv ring plus the kernel
-    /// socket buffer) and reset the reassembler. Returns datagrams thrown away
-    /// (`packets_dropped`). The receive path has no other skip-ahead: packets arrive in
-    /// order, and consume-at-arrival-rate never shrinks a standing queue. 1024 batches
-    /// (≈131k datagrams at the 128-deep ring) only cap a line-rate sender outrunning the loop.
+    /// Client: discard the pending receive backlog (the current batch plus every queued one)
+    /// and reset the reassembler. Returns datagrams thrown away (`packets_dropped`). The
+    /// receive path has no other skip-ahead: packets arrive in order, and
+    /// consume-at-arrival-rate never shrinks a standing queue. [`FLUSH_BATCHES`] only caps a
+    /// line-rate sender outrunning the loop.
     pub fn flush_backlog(&mut self) -> Result<u64> {
         if self.config.role != Role::Client {
             return Err(PunktfunkError::InvalidArg(
                 "flush_backlog called on a host session",
             ));
         }
-        // Undelivered tail of the current ring is backlog too.
-        let mut flushed = self.recv_count.saturating_sub(self.recv_idx) as u64;
-        self.recv_count = 0;
-        self.recv_idx = 0;
-        if !self.recv_scratch.is_empty() {
-            for _ in 0..1024 {
-                let n = self
-                    .transport
-                    .recv_batch(&mut self.recv_scratch, &mut self.recv_lens)?;
-                if n == 0 {
-                    break;
-                }
-                flushed += n as u64;
-            }
+        // The undelivered tail of the current batch is backlog too.
+        let mut flushed = self
+            .recv_cur
+            .take()
+            .map_or(0, |b| b.remaining(self.recv_off)) as u64;
+        self.recv_off = 0;
+        for _ in 0..FLUSH_BATCHES {
+            let Some(batch) = self.transport.recv_owned()? else {
+                break;
+            };
+            flushed += batch.remaining(0) as u64;
         }
         self.reassembler.reset();
         StatsCounters::add(&self.stats.packets_dropped, flushed);
@@ -1139,7 +1165,6 @@ mod wire_equivalence_tests {
     use super::*;
     use crate::config::{FecConfig, FecScheme};
     use crate::crypto::MediaSuite;
-    use crate::packet::V2_CLEAR_LEN;
     use crate::transport::loopback_pair;
 
     fn host_cfg(scheme: FecScheme, fec_percent: u8) -> Config {
@@ -1163,6 +1188,7 @@ mod wire_equivalence_tests {
             clock_origin_ns: 0,
             keys: sealed.then(|| media_keys(MediaSuite::Aes128Gcm)),
             clock: None,
+            clear_placement: false,
         }
     }
 
@@ -1189,8 +1215,7 @@ mod wire_equivalence_tests {
             let mut wire = Vec::new();
             stage_wire(&mut wire, &sess.stamp, None, seq, sealed, hdr, body);
             if let Some(c) = &sess.crypto {
-                let (aad, rest) = wire.split_at_mut(V2_CLEAR_LEN);
-                c.seal_media(seq, aad, rest).unwrap();
+                c.seal_wire(seq, &mut wire).unwrap();
             }
             wires.push(wire);
         }
@@ -1325,9 +1350,26 @@ mod wire_equivalence_tests {
         );
     }
 
+    /// AU memory that holds a previous AU's bytes, as a reused buffer does.
+    struct DirtyMemory;
+    struct DirtyStore(Vec<u8>);
+    impl crate::au::AuStore for DirtyStore {
+        fn bytes(&self) -> &[u8] {
+            &self.0
+        }
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.0
+        }
+    }
+    impl crate::au::AuMemory for DirtyMemory {
+        fn take(&self, len: usize) -> Option<Box<dyn crate::au::AuStore>> {
+            Some(Box::new(DirtyStore(vec![0xAA; len])))
+        }
+    }
+
     /// A chunk-aligned frame that loses shards past FEC is delivered once it ages out
-    /// (`complete: false`, survivors at exact offsets, holes zero-filled). Unflagged AUs
-    /// still drop, even with the opt-in on.
+    /// (`complete: false`, survivors at exact offsets, holes zero-filled even in reused
+    /// memory). Unflagged AUs still drop, even with the opt-in on.
     #[test]
     fn partial_delivery_of_chunk_aligned_frames() {
         use crate::packet::USER_FLAG_CHUNK_ALIGNED;
@@ -1346,6 +1388,7 @@ mod wire_equivalence_tests {
         let mut host = Session::new(mk(Role::Host), media(false), Box::new(h)).unwrap();
         let mut client = Session::new(mk(Role::Client), media(false), Box::new(c)).unwrap();
         client.set_deliver_partial_frames(true);
+        client.set_au_memory(std::sync::Arc::new(DirtyMemory));
 
         let frame = pattern(8 * 1024);
         host.submit_frame(&frame, 1_000, USER_FLAG_CHUNK_ALIGNED)
@@ -1546,7 +1589,16 @@ mod wire_equivalence_tests {
     }
 
     fn v2_pair_keyed(drop_period: u32, keys: Option<MediaKeys>) -> (Session, Session) {
-        v2_pair_with(drop_period, keys, None)
+        v2_pair_with(drop_period, keys, None, false)
+    }
+
+    /// Sealed under `suite`, the header in the clear when `clear`.
+    fn v2_pair_sealed(
+        drop_period: u32,
+        suite: crate::crypto::MediaSuite,
+        clear: bool,
+    ) -> (Session, Session) {
+        v2_pair_with(drop_period, Some(media_keys(suite)), None, clear)
     }
 
     /// `clock` is the host's alone; the client reads wire time against its origin.
@@ -1554,6 +1606,7 @@ mod wire_equivalence_tests {
         drop_period: u32,
         keys: Option<MediaKeys>,
         clock: Option<std::sync::Arc<crate::quic::v2::clock::SessionClock>>,
+        clear_placement: bool,
     ) -> (Session, Session) {
         let mk = |role: Role| {
             let mut c = host_cfg(FecScheme::Gf16, 25);
@@ -1567,6 +1620,7 @@ mod wire_equivalence_tests {
                 .map_or(1_700_000_000_000_000_000, |c| c.origin_ns()),
             keys,
             clock: None,
+            clear_placement,
         };
         let (ht, ct) = loopback_pair(drop_period, 0);
         let host_media = MediaV2 {
@@ -1598,7 +1652,7 @@ mod wire_equivalence_tests {
     #[test]
     fn v2_frames_carry_the_host_session_clock() {
         let clock = std::sync::Arc::new(crate::quic::v2::clock::SessionClock::new());
-        let (mut host, mut client) = v2_pair_with(0, None, Some(clock.clone()));
+        let (mut host, mut client) = v2_pair_with(0, None, Some(clock.clone()), false);
         for len in [100, 8 * 512 + 1] {
             let pts = crate::quic::wall_clock_ns();
             host.submit_frame(&pattern(len), pts, 0).unwrap();
@@ -1691,9 +1745,8 @@ mod wire_equivalence_tests {
     /// which has seen the originals' neighbours, and the reassembler places them by header.
     #[test]
     fn a_resealed_packet_completes_a_short_frame() {
-        use crate::crypto::MediaSuite;
-        for suite in [MediaSuite::Aes128Gcm, MediaSuite::ChaCha20Poly1305] {
-            let (mut host, mut client) = v2_pair_keyed(0, Some(media_keys(suite)));
+        for (suite, clear) in suites_and_modes() {
+            let (mut host, mut client) = v2_pair_sealed(0, suite, clear);
             host.tap_plaintext(true);
             let src = pattern(40 * 512 + 9);
             let wires = host.seal_frame(&src, 1_700_000_000_000_000_000, 0).unwrap();
@@ -1714,7 +1767,7 @@ mod wire_equivalence_tests {
             let refs: Vec<&[u8]> = resent.iter().map(Vec::as_slice).collect();
             host.send_sealed(&refs).unwrap();
             let f = client.poll_frame().expect("the resend completes the frame");
-            assert_eq!(f.data, src, "{suite:?}");
+            assert_eq!(f.data, src, "{suite:?} clear {clear}");
             assert!(!client.frame_in_flight(0), "a completed frame asks nothing");
             // Parity covered two of the three; the rest land after the frame and are late.
             assert!(client.poll_frame().is_err());
@@ -1730,9 +1783,8 @@ mod wire_equivalence_tests {
     /// unsealed one: the tag, no sequence prefix.
     #[test]
     fn v2_sealed_frames_cross_under_both_suites() {
-        use crate::crypto::MediaSuite;
-        for suite in [MediaSuite::Aes128Gcm, MediaSuite::ChaCha20Poly1305] {
-            let (mut host, mut client) = v2_pair_keyed(0, Some(media_keys(suite)));
+        for (suite, clear) in suites_and_modes() {
+            let (mut host, mut client) = v2_pair_sealed(0, suite, clear);
             for i in 0..6usize {
                 let src = pattern(i * 3000 + 1);
                 host.submit_frame(&src, 1_700_000_000_000_000_000 + i as u64 * 1000, 0)
@@ -1740,7 +1792,7 @@ mod wire_equivalence_tests {
                 assert_eq!(
                     client.poll_frame().unwrap().data,
                     src,
-                    "{suite:?} frame {i}"
+                    "{suite:?} clear {clear} frame {i}"
                 );
             }
             let wires = host.seal_frame(&pattern(100), 0, 0).unwrap();
@@ -1755,27 +1807,80 @@ mod wire_equivalence_tests {
     /// straddles a key change opens on both sides of it.
     #[test]
     fn v2_sealed_wire_resists_tamper_and_replay_across_a_key_change() {
-        let (mut host, mut client) =
-            v2_pair_keyed(0, Some(media_keys(crate::crypto::MediaSuite::Aes128Gcm)));
-        host.next_seq = crate::crypto::MEDIA_KEY_PACKETS - 3;
-        let src = pattern(20 * 512);
+        for clear in [false, true] {
+            let (mut host, mut client) =
+                v2_pair_sealed(0, crate::crypto::MediaSuite::Aes128Gcm, clear);
+            host.next_seq = crate::crypto::MEDIA_KEY_PACKETS - 3;
+            let src = pattern(20 * 512);
+            let wires = host.seal_frame(&src, 1_700_000_000_000_000_000, 0).unwrap();
+            assert!(wires.len() > 6, "the frame must straddle the key change");
+            let mut tampered = wires[0].clone();
+            tampered[0] = crate::packet::V2_STREAM_PROBE;
+            let refs: Vec<&[u8]> = std::iter::once(tampered.as_slice())
+                .chain(wires.iter().map(|w| w.as_slice()))
+                .chain(std::iter::once(wires[1].as_slice()))
+                .collect();
+            host.send_sealed(&refs).unwrap();
+            let f = client.poll_frame().unwrap();
+            assert_eq!(f.data, src, "clear {clear}");
+            assert!(matches!(client.poll_frame(), Err(PunktfunkError::NoFrame)));
+            assert_eq!(client.stats().packets_received as usize, wires.len());
+            assert!(
+                client.stats().packets_dropped >= 1,
+                "the replayed packet is dropped"
+            );
+        }
+    }
+
+    /// Both suites, each with the header sealed and in the clear.
+    fn suites_and_modes() -> impl Iterator<Item = (crate::crypto::MediaSuite, bool)> {
+        use crate::crypto::MediaSuite;
+        [MediaSuite::Aes128Gcm, MediaSuite::ChaCha20Poly1305]
+            .into_iter()
+            .flat_map(|s| [(s, false), (s, true)])
+    }
+
+    /// With the header in the clear, every data shard after its block's first opens straight
+    /// into the frame; sealed, none can.
+    #[test]
+    fn clear_placement_opens_shards_into_their_frame() {
+        for (suite, clear) in suites_and_modes() {
+            let (mut host, mut client) = v2_pair_sealed(0, suite, clear);
+            client.perf = Some(PumpPerf::default());
+            let src = pattern(40 * 512 + 9);
+            host.submit_frame(&src, 1_700_000_000_000_000_000, 0)
+                .unwrap();
+            assert_eq!(
+                client.poll_frame().unwrap().data,
+                src,
+                "{suite:?} clear {clear}"
+            );
+            let p = client.take_pump_perf().unwrap();
+            if clear {
+                // 41 data shards in blocks of 8: one copy opens each of the 6 blocks.
+                assert_eq!(p.placed, 41 - 6, "{suite:?}");
+            } else {
+                assert_eq!(p.placed, 0, "{suite:?}");
+            }
+        }
+    }
+
+    /// A forged packet whose clear header names an empty slot of a frame in flight fails its
+    /// tag there: the slot stays unclaimed and the real shard fills it.
+    #[test]
+    fn a_forged_clear_header_cannot_claim_a_slot() {
+        let (mut host, mut client) = v2_pair_sealed(0, crate::crypto::MediaSuite::Aes128Gcm, true);
+        let src = pattern(8 * 512);
         let wires = host.seal_frame(&src, 1_700_000_000_000_000_000, 0).unwrap();
-        assert!(wires.len() > 6, "the frame must straddle the key change");
-        let mut tampered = wires[0].clone();
-        tampered[0] = crate::packet::V2_STREAM_PROBE;
-        let refs: Vec<&[u8]> = std::iter::once(tampered.as_slice())
-            .chain(wires.iter().map(|w| w.as_slice()))
-            .chain(std::iter::once(wires[1].as_slice()))
+        // Packet 1 relabelled as shard 5 (`shard u16` at bytes 22..24): its tag no longer fits.
+        let mut forged = wires[1].clone();
+        forged[22..24].copy_from_slice(&5u16.to_le_bytes());
+        let refs: Vec<&[u8]> = std::iter::once(wires[0].as_slice())
+            .chain(std::iter::once(forged.as_slice()))
+            .chain(wires[1..].iter().map(|w| w.as_slice()))
             .collect();
         host.send_sealed(&refs).unwrap();
-        let f = client.poll_frame().unwrap();
-        assert_eq!(f.data, src);
-        assert!(matches!(client.poll_frame(), Err(PunktfunkError::NoFrame)));
-        assert_eq!(client.stats().packets_received as usize, wires.len());
-        assert!(
-            client.stats().packets_dropped >= 1,
-            "the replayed packet is dropped"
-        );
+        assert_eq!(client.poll_frame().unwrap().data, src);
     }
 
     /// The index leads, the pattern counts on from it, and a frame too short for the
@@ -1790,13 +1895,15 @@ mod wire_equivalence_tests {
     /// A packet number far past the newest is dropped before any key is derived for it.
     #[test]
     fn v2_implausible_packet_numbers_are_dropped_unopened() {
-        let (mut host, mut client) =
-            v2_pair_keyed(0, Some(media_keys(crate::crypto::MediaSuite::Aes128Gcm)));
-        host.next_seq = 3 * crate::crypto::MEDIA_KEY_PACKETS;
-        host.submit_frame(&pattern(700), 1_700_000_000_000_000_000, 0)
-            .unwrap();
-        assert!(matches!(client.poll_frame(), Err(PunktfunkError::NoFrame)));
-        assert!(client.stats().packets_dropped >= 2);
-        assert_eq!(client.stats().packets_received, 0);
+        for clear in [false, true] {
+            let (mut host, mut client) =
+                v2_pair_sealed(0, crate::crypto::MediaSuite::Aes128Gcm, clear);
+            host.next_seq = 3 * crate::crypto::MEDIA_KEY_PACKETS;
+            host.submit_frame(&pattern(700), 1_700_000_000_000_000_000, 0)
+                .unwrap();
+            assert!(matches!(client.poll_frame(), Err(PunktfunkError::NoFrame)));
+            assert!(client.stats().packets_dropped >= 2);
+            assert_eq!(client.stats().packets_received, 0);
+        }
     }
 }

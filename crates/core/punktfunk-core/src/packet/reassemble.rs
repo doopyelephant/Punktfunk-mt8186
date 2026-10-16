@@ -15,6 +15,7 @@
 //! [`crate::stats::Stats::fec_late_shards`].
 
 use super::*;
+use crate::au::{AuBuf, AuMemory};
 use crate::config::Config;
 use crate::error::Result;
 use crate::fec::ErasureCoder;
@@ -78,9 +79,9 @@ struct FrameBuf {
     next_part_block: u16,
     /// AU shard offset of the next prefix part (`next_part_block`'s start).
     delivered_shards: usize,
-    /// Whole data region, zeroed. Shards copy to their final offset; FEC writes only
-    /// the holes. On completion this Vec is [`Frame::data`] (truncated to `frame_bytes`).
-    buf: Vec<u8>,
+    /// Whole data region. Shards copy to their final offset; FEC writes only the holes;
+    /// a partial zeroes what never arrived. On completion it is [`Frame::data`].
+    buf: AuBuf,
     blocks: HashMap<u16, BlockState>,
     /// Blocks reconstructed into `buf`. A failed block never counts; the frame ages out.
     blocks_ok: usize,
@@ -241,6 +242,8 @@ pub struct Reassembler {
     shard_delay_ns: Vec<i64>,
     /// Video frames whose tail arrived short, oldest first ([`Self::take_short_tails`]).
     short_tails: Vec<u32>,
+    /// Where frame buffers come from ([`Self::set_memory`]).
+    memory: std::sync::Arc<dyn AuMemory>,
 }
 
 impl Reassembler {
@@ -259,6 +262,7 @@ impl Reassembler {
             in_flight_bytes: 0,
             shard_delay_ns: Vec::with_capacity(SHARD_DELAY_SAMPLES),
             short_tails: Vec::new(),
+            memory: std::sync::Arc::new(crate::au::HeapPool::default()),
         }
     }
 
@@ -298,6 +302,11 @@ impl Reassembler {
         self.pending_partial.take()
     }
 
+    /// Assemble frames in `memory` from the next frame on.
+    pub fn set_memory(&mut self, memory: std::sync::Arc<dyn AuMemory>) {
+        self.memory = memory;
+    }
+
     /// Ingest one already-decrypted packet. The AU when its last block completes, else `None`.
     ///
     /// Malformed or non-video: drop, never fatal — must not abort `poll_frame`. A
@@ -310,7 +319,59 @@ impl Reassembler {
     ) -> Result<Option<Frame>> {
         let pushed = decode_v2(pkt, self.clock_origin_ns, &mut self.pts_ref_us)
             .ok_or(Dropped)
-            .and_then(|(hdr, epoch, body)| self.push_inner(hdr, epoch, body, coder, stats));
+            .and_then(|(hdr, epoch, body)| {
+                self.push_inner(hdr, epoch, body.len(), Some(body), coder, stats)
+            });
+        Ok(pushed.unwrap_or_else(|Dropped| {
+            StatsCounters::add(&stats.packets_dropped, 1);
+            None
+        }))
+    }
+
+    /// The empty slot a data shard with this clear `header` opens into, or `None` when it must
+    /// take [`Self::push`]: its frame or block is not in flight yet, the geometry differs, or
+    /// the shard is parity or already here. Reads only, because the header is not yet
+    /// authenticated; a failed open leaves the slot unmarked.
+    pub fn data_slot(&mut self, header: &[u8], body_len: usize) -> Option<&mut [u8]> {
+        let mut pts_ref = self.pts_ref_us;
+        let (hdr, epoch) = decode_v2_header(header, body_len, self.clock_origin_ns, &mut pts_ref)?;
+        let g = firewall(&hdr, body_len, &self.limits)?;
+        if g.shard_index >= g.data_shards {
+            return None;
+        }
+        let win = if hdr.user_flags & (FLAG_PROBE as u32) != 0 {
+            &mut self.probe
+        } else {
+            &mut self.video
+        };
+        let f = win.frames.get_mut(&hdr.frame_index)?;
+        let b = f.blocks.get(&hdr.block_index)?;
+        if f.shard_bytes != g.shard_bytes
+            || f.epoch != epoch
+            || b.done
+            || b.data_shards != g.data_shards
+            || b.recovery_shards != g.recovery_shards
+            || b.base_shard != g.base_shard
+            || b.have_data[g.shard_index]
+        {
+            return None;
+        }
+        let off = (b.base_shard + g.shard_index) * g.shard_bytes;
+        f.buf.get_mut(off..off + g.shard_bytes)
+    }
+
+    /// [`Self::push`] for a shard opened into its [`Self::data_slot`] and authenticated:
+    /// `header` is the packet's clear header and the shard is already in place.
+    pub fn push_placed(
+        &mut self,
+        header: &[u8],
+        body_len: usize,
+        coder: &dyn ErasureCoder,
+        stats: &StatsCounters,
+    ) -> Result<Option<Frame>> {
+        let pushed = decode_v2_header(header, body_len, self.clock_origin_ns, &mut self.pts_ref_us)
+            .ok_or(Dropped)
+            .and_then(|(hdr, epoch)| self.push_inner(hdr, epoch, body_len, None, coder, stats));
         Ok(pushed.unwrap_or_else(|Dropped| {
             StatsCounters::add(&stats.packets_dropped, 1);
             None
@@ -318,17 +379,19 @@ impl Reassembler {
     }
 
     /// [`Self::push`] past the header decode, with every counted drop as `Err(Dropped)`.
+    /// `body` is `None` for a shard already opened into its slot.
     fn push_inner(
         &mut self,
         hdr: PacketHeader,
         epoch: u8,
-        body: &[u8],
+        body_len: usize,
+        body: Option<&[u8]>,
         coder: &dyn ErasureCoder,
         stats: &StatsCounters,
     ) -> std::result::Result<Option<Frame>, Dropped> {
         let lim = self.limits;
-        let g = firewall(&hdr, body.len(), &lim).ok_or(Dropped)?;
-        let body = &body[..g.shard_bytes];
+        let g = firewall(&hdr, body_len, &lim).ok_or(Dropped)?;
+        let body = body.map(|b| &b[..g.shard_bytes]);
 
         // Split so the window, pool, and in-flight budget can be touched while a
         // frame entry is mutably borrowed.
@@ -345,6 +408,7 @@ impl Reassembler {
             in_flight_bytes,
             shard_delay_ns,
             short_tails,
+            memory,
         } = self;
         let parts = *deliver_parts;
 
@@ -359,7 +423,7 @@ impl Reassembler {
             StatsCounters::add(&stats.probe_packets_received, 1);
             StatsCounters::add(
                 &stats.probe_bytes_received,
-                (super::V2_HEADER_LEN + body.len()) as u64,
+                (super::V2_HEADER_LEN + g.shard_bytes) as u64,
             );
             let _ = stats.probe_first_arrival_ns.compare_exchange(
                 0,
@@ -415,6 +479,10 @@ impl Reassembler {
         let frame = match win.frames.entry(hdr.frame_index) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
+                // A shard opened in place needs the frame it was opened into.
+                if body.is_none() {
+                    return Err(Dropped);
+                }
                 // Several max-size frames already in flight. Dropping this packet
                 // is milder than the loss window killing the frame moments later.
                 charge(in_flight_bytes, buf_len, &lim)?;
@@ -434,7 +502,7 @@ impl Reassembler {
                     epoch,
                     next_part_block: 0,
                     delivered_shards: 0,
-                    buf: vec![0; buf_len],
+                    buf: AuBuf::take(&**memory, buf_len),
                     blocks: HashMap::new(),
                     blocks_ok: 0,
                     short_tail: false,
@@ -474,7 +542,7 @@ impl Reassembler {
         // Re-check the budget: growth commits memory too.
         if buf_len > frame.buf.len() {
             charge(in_flight_bytes, buf_len - frame.buf.len(), &lim)?;
-            frame.buf.resize(buf_len, 0);
+            frame.buf.resize(buf_len, &**memory);
         }
 
         {
@@ -490,6 +558,9 @@ impl Reassembler {
             let block = match blocks.entry(hdr.block_index) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
+                    if body.is_none() {
+                        return Err(Dropped);
+                    }
                     // Block state is sized from header shard counts — same in-flight budget
                     // as the frame buffer, or a slice-streamed frame mints unmetered state.
                     let cost = block_state_bytes(g.data_shards, g.recovery_shards);
@@ -518,6 +589,9 @@ impl Reassembler {
                 return Err(Dropped);
             }
             if block.done {
+                if body.is_none() {
+                    return Err(Dropped);
+                }
                 // Late original after reconstruct (`!have_data`): net out of
                 // `fec_recovered_shards`. Covers multi-block frames still in flight.
                 // `have_data` = duplicate; a failed reconstruct never counted missing.
@@ -544,11 +618,17 @@ impl Reassembler {
                     if off + shard_bytes > buf.len() {
                         return Err(Dropped);
                     }
-                    buf[off..off + shard_bytes].copy_from_slice(body);
+                    // `None`: opened straight into this slot already.
+                    if let Some(body) = body {
+                        buf[off..off + shard_bytes].copy_from_slice(body);
+                    }
                     block.have_data[g.shard_index] = true;
                     block.data_received += 1;
                 }
             } else {
+                let Some(body) = body else {
+                    return Err(Dropped);
+                };
                 let slot = g.shard_index - g.data_shards;
                 if block.recovery[slot].is_none() {
                     // Parity is a heap buffer sized from the wire. Meter it or a
@@ -966,6 +1046,24 @@ fn pin_totals(frame: &mut FrameBuf, g: &Geom) -> Pin {
     Pin::Keep
 }
 
+/// Zero every shard of `f` that neither arrived nor was rebuilt: frame memory is reused, so
+/// a hole holds a previous AU's bytes until a partial hands it up.
+fn zero_holes(f: &mut FrameBuf) {
+    let sb = f.shard_bytes;
+    let mut have = vec![false; f.buf.len() / sb];
+    for b in f.blocks.values() {
+        let rebuilt = b.done && b.reconstructed;
+        for (i, &h) in b.have_data.iter().enumerate() {
+            if let Some(slot) = have.get_mut(b.base_shard + i) {
+                *slot |= h || rebuilt;
+            }
+        }
+    }
+    for (i, _) in have.iter().enumerate().filter(|(_, h)| !**h) {
+        f.buf[i * sb..(i + 1) * sb].fill(0);
+    }
+}
+
 /// A slice-streamed frame's blocks tile `0..total_data`, each starting where the last
 /// ended. Bases were range-checked on arrival, but a gap or overlap would still hand up
 /// wrong bytes marked complete, with no loss counter moving.
@@ -997,7 +1095,7 @@ impl FrameBuf {
             if lo == 0 {
                 (self.buf, Some(part))
             } else {
-                (self.buf[lo..].to_vec(), Some(part))
+                (self.buf[lo..].to_vec().into(), Some(part))
             }
         } else {
             (self.buf, None)
@@ -1043,7 +1141,7 @@ impl FrameBuf {
             self.delivered_shards * self.shard_bytes,
         );
         Some(Frame {
-            data: self.buf[lo..hi].to_vec(),
+            data: self.buf[lo..hi].to_vec().into(),
             frame_index,
             pts_ns: self.pts_ns,
             flags: self.user_flags,
@@ -1101,12 +1199,14 @@ impl ReassemblyWindow {
                 completed.insert(idx, Done::of(f));
                 *in_flight_bytes -= frame_cost(f);
                 // Chunk-aligned: the buffer is already the consumer shape (received
-                // at final offsets, zeros in holes). Newest-wins. Still counted dropped.
+                // at final offsets), once the holes read zero. Newest-wins. Still counted
+                // dropped.
                 if let Some(sink) = partial_sink.as_deref_mut() {
                     // `frame_bytes > 0` also excludes an unpinned streamed frame
                     // (total still the 0 sentinel): truncate-to-0 would emit empty.
                     if f.user_flags & USER_FLAG_CHUNK_ALIGNED != 0 && f.frame_bytes > 0 {
-                        let mut buf = std::mem::take(&mut f.buf);
+                        zero_holes(f);
+                        let mut buf = std::mem::replace(&mut f.buf, Vec::new().into());
                         buf.truncate(f.frame_bytes);
                         let newer = sink
                             .as_ref()
@@ -1179,7 +1279,7 @@ mod reset_tests {
             0,
         );
         r.pending_partial = Some(Frame {
-            data: vec![0u8; 64],
+            data: vec![0u8; 64].into(),
             frame_index: 7,
             pts_ns: 1,
             flags: 0,

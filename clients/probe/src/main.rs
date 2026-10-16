@@ -641,6 +641,7 @@ async fn session(mut args: Args) -> Result<()> {
             clock_origin_ns: server.clock_origin_ns,
             keys: Some(keys),
             clock: None,
+            clear_placement: false,
         },
     );
     let clock_offset_ns = clock(&mut send, &mut recv, args.clock_resync).await?;

@@ -224,6 +224,10 @@ pub const FEATURE_PAD_WRITES: u32 = 33;
 /// Both ends: the client reads `ServerHello`'s profile echo and follows a `Redirect`, and the
 /// host resolves `ClientHello`'s profile. A host redirects only a client that sets it.
 pub const FEATURE_PROFILES: u32 = 34;
+/// Both ends: a sealed media packet leaves its whole 30-byte header in the clear, bound as
+/// associated data, so the receiver opens each shard straight into its frame. Without it only
+/// the tag and packet number are clear.
+pub const FEATURE_CLEAR_PLACEMENT: u32 = 35;
 
 #[cfg(test)]
 mod tests {
@@ -258,6 +262,7 @@ mod tests {
         ("FEATURE_STREAM_CONFIG", FEATURE_STREAM_CONFIG),
         ("FEATURE_PAD_WRITES", FEATURE_PAD_WRITES),
         ("FEATURE_PROFILES", FEATURE_PROFILES),
+        ("FEATURE_CLEAR_PLACEMENT", FEATURE_CLEAR_PLACEMENT),
     ];
 
     /// Every close and stop code either wire uses: v1's live on, and v2 adds its own.

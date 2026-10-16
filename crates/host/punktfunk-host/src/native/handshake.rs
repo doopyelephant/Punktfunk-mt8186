@@ -565,7 +565,8 @@ pub(super) async fn negotiate(
         punktfunk_core::quic::v2::features::FeatureSet::default()
             .with(punktfunk_core::quic::v2::registry::FEATURE_STREAM_CONFIG)
             .with(punktfunk_core::quic::v2::registry::FEATURE_PAD_WRITES)
-            .with(punktfunk_core::quic::v2::registry::FEATURE_PROFILES),
+            .with(punktfunk_core::quic::v2::registry::FEATURE_PROFILES)
+            .with(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT),
     );
     let server_hello = ServerHello {
         welcome,

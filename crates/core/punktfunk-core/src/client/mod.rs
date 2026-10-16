@@ -1201,6 +1201,12 @@ impl NativeClient {
         acc.count += 1;
     }
 
+    /// Assemble video AUs in `memory` from the next frame on: a decoder that reads the AU where
+    /// it lies lends its own ([`crate::au`]). Frames already assembled keep their memory.
+    pub fn set_au_memory(&self, memory: Arc<dyn crate::au::AuMemory>) {
+        *self.shared.au_memory.lock().unwrap() = Some(memory);
+    }
+
     /// Whether [`report_decode_us`](Self::report_decode_us) is used (Automatic). Constant for
     /// the session.
     pub fn wants_decode_latency(&self) -> bool {

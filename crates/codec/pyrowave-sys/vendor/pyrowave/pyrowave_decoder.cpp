@@ -33,6 +33,13 @@ struct Decoder::Impl final : public WaveletBuffers
 
 	std::vector<uint32_t> dequant_offset_buffer_cpu;
 	std::vector<uint32_t> payload_data_cpu;
+	// PUNKTFUNK (patch 0011): see Decoder::set_payload_memory. A wrapped image has no
+	// default view, so the views sit beside it.
+	uint8_t *in_place_base = nullptr;
+	VkDeviceSize in_place_size = 0;
+	VkDeviceSize in_place_reserve = 0;
+	bool pushing_in_place = false;
+	ImageViewHandle linear_views[3];
 	int decoded_blocks = 0;
 	int total_blocks_in_sequence = 0;
 	uint32_t last_seq = UINT32_MAX;
@@ -53,9 +60,11 @@ struct Decoder::Impl final : public WaveletBuffers
 	void init_block_meta() override;
 	void clear();
 
-	void upload_payload(CommandBuffer &cmd);
+	bool upload_payload(CommandBuffer &cmd);
 
 	void check_linear_texture_support();
+	bool set_payload_memory(uint64_t buffer, uint64_t size, uint64_t copy_reserve, void *host,
+	                        const uint64_t linear[3], uint32_t rows);
 };
 
 Decoder::Decoder()
@@ -67,14 +76,25 @@ Decoder::~Decoder()
 {
 }
 
-void Decoder::Impl::upload_payload(CommandBuffer &cmd)
+bool Decoder::Impl::upload_payload(CommandBuffer &cmd)
 {
 	VkDeviceSize required_size = payload_data_cpu.size() * sizeof(uint32_t);
 
 	// Avoid edge case OOB access without robustness on the payload buffer during dequant.
 	VkDeviceSize required_size_padded = required_size + 16;
 
-	if (!payload_data || required_size_padded > payload_data->get_create_info().size)
+	// PUNKTFUNK (patch 0011): the caller's memory is never reallocated. In-place packets are
+	// already in it; copies land in its reserved head and must fit.
+	if (in_place_base)
+	{
+		if (required_size_padded > in_place_reserve)
+		{
+			LOGE("Copied payload (%llu bytes) overflows the reserved head.\n",
+			     static_cast<unsigned long long>(required_size));
+			return false;
+		}
+	}
+	else if (!payload_data || required_size_padded > payload_data->get_create_info().size)
 	{
 		BufferCreateInfo bufinfo;
 		bufinfo.size = std::max<VkDeviceSize>(64 * 1024, required_size_padded * 2);
@@ -124,6 +144,7 @@ void Decoder::Impl::upload_payload(CommandBuffer &cmd)
 
 	if (!payload_data_cpu.empty())
 		memcpy(cmd.update_buffer(*payload_data, 0, required_size), payload_data_cpu.data(), required_size);
+	return true;
 }
 
 bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
@@ -132,7 +153,10 @@ bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
 	if (offset == UINT32_MAX)
 	{
 		decoded_blocks++;
-		offset = payload_data_cpu.size();
+		// PUNKTFUNK (patch 0011): an in-place packet is addressed where it lies.
+		offset = pushing_in_place ?
+		         uint32_t((reinterpret_cast<const uint8_t *>(header) - in_place_base) / sizeof(uint32_t)) :
+		         uint32_t(payload_data_cpu.size());
 	}
 	else
 	{
@@ -146,6 +170,9 @@ bool Decoder::Impl::decode_packet(const BitstreamHeader *header)
 		LOGE("payload_words is not large enough.\n");
 		return false;
 	}
+
+	if (pushing_in_place)
+		return true;
 
 	payload_data_cpu.insert(
 			payload_data_cpu.end(),
@@ -360,7 +387,14 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 				cmd.set_storage_texture(0, 0, *component_layer_views[component][level]);
 				cmd.set_storage_buffer(0, 1, *dequant_offset_buffer);
 
-				if (payload_r8_image && payload_r16_image && payload_r32_image)
+				if (linear_views[0])
+				{
+					// PUNKTFUNK (patch 0011): the caller's linear images.
+					cmd.set_texture(0, 2, *linear_views[2]);
+					cmd.set_texture(0, 3, *linear_views[1]);
+					cmd.set_texture(0, 4, *linear_views[0]);
+				}
+				else if (payload_r8_image && payload_r16_image && payload_r32_image)
 				{
 					cmd.set_texture(0, 2, payload_r32_image->get_view());
 					cmd.set_texture(0, 3, payload_r16_image->get_view());
@@ -879,7 +913,11 @@ bool Decoder::Impl::decode(CommandBuffer &cmd, const ViewBuffers &views)
 {
 	cmd.begin_region("Decode uploads");
 	{
-		upload_payload(cmd);
+		if (!upload_payload(cmd))
+		{
+			cmd.end_region();
+			return false;
+		}
 
 		memcpy(cmd.update_buffer(*dequant_offset_buffer, 0,
 		                         dequant_offset_buffer_cpu.size() * sizeof(dequant_offset_buffer_cpu.front())),
@@ -1002,6 +1040,100 @@ void Decoder::Impl::check_linear_texture_support()
 		LOGI("Using linear textures instead of texel buffers.\n");
 }
 
+// PUNKTFUNK (patch 0011): see Decoder::set_payload_memory. On failure the decoder keeps no
+// caller handle and rebuilds its own payload on the next decode.
+bool Decoder::Impl::set_payload_memory(uint64_t buffer, uint64_t size, uint64_t copy_reserve, void *host,
+                                       const uint64_t linear[3], uint32_t rows)
+{
+	payload_r8_image.reset();
+	payload_r16_image.reset();
+	payload_r32_image.reset();
+	payload_u8_view.reset();
+	payload_u16_view.reset();
+	payload_u32_view.reset();
+	for (auto &v : linear_views)
+		v.reset();
+	payload_data.reset();
+	in_place_base = nullptr;
+	need_image_transition = true;
+
+	if (!buffer || !host || copy_reserve + 16 > size)
+		return false;
+
+	BufferCreateInfo info = {};
+	info.size = size;
+	info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+	             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+	             VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+	info.domain = BufferDomain::Device;
+	payload_data = device->wrap_buffer(info, (VkBuffer)(uintptr_t)buffer, false);
+	if (!payload_data)
+		return false;
+
+	if (use_readonly_texel_buffer && linear[0] && linear[1] && linear[2])
+	{
+		const struct
+		{
+			VkFormat fmt;
+			uint32_t width;
+			ImageHandle *out;
+		} reqs[] = {
+			{ VK_FORMAT_R8_UINT, 4096, &payload_r8_image },
+			{ VK_FORMAT_R16_UINT, 2048, &payload_r16_image },
+			{ VK_FORMAT_R32_UINT, 1024, &payload_r32_image }
+		};
+
+		for (int i = 0; i < 3; i++)
+		{
+			auto image_info = ImageCreateInfo::immutable_2d_image(reqs[i].width, rows, reqs[i].fmt);
+			image_info.domain = ImageDomain::LinearHost;
+			image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+			image_info.layout = ImageLayout::General;
+			*reqs[i].out = device->wrap_image(image_info, (VkImage)(uintptr_t)linear[i]);
+			if (!*reqs[i].out)
+				break;
+
+			ImageViewCreateInfo view_info = {};
+			view_info.image = reqs[i].out->get();
+			view_info.format = reqs[i].fmt;
+			view_info.view_type = VK_IMAGE_VIEW_TYPE_2D;
+			view_info.layers = 1;
+			view_info.levels = 1;
+			view_info.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+			linear_views[i] = device->create_image_view(view_info);
+			if (!linear_views[i])
+				break;
+		}
+
+		if (!linear_views[0] || !linear_views[1] || !linear_views[2])
+		{
+			payload_r8_image.reset();
+			payload_r16_image.reset();
+			payload_r32_image.reset();
+			for (auto &v : linear_views)
+				v.reset();
+		}
+	}
+
+	if (use_readonly_texel_buffer && !linear_views[0])
+	{
+		BufferViewCreateInfo view_info = {};
+		view_info.buffer = payload_data.get();
+		view_info.range = VK_WHOLE_SIZE;
+		view_info.format = VK_FORMAT_R8_UINT;
+		payload_u8_view = device->create_buffer_view(view_info);
+		view_info.format = VK_FORMAT_R16_UINT;
+		payload_u16_view = device->create_buffer_view(view_info);
+		view_info.format = VK_FORMAT_R32_UINT;
+		payload_u32_view = device->create_buffer_view(view_info);
+	}
+
+	in_place_base = static_cast<uint8_t *>(host);
+	in_place_size = size;
+	in_place_reserve = copy_reserve;
+	return true;
+}
+
 bool Decoder::init(Vulkan::Device *device, int width, int height, ChromaSubsampling chroma_, bool fragment_path_)
 {
 	auto ops = device->get_device_features().vk11_props.subgroupSupportedOperations;
@@ -1054,6 +1186,28 @@ void Decoder::clear()
 bool Decoder::push_packet(const void *data, size_t size)
 {
 	return impl->push_packet(data, size);
+}
+
+bool Decoder::set_payload_memory(uint64_t buffer, uint64_t size, uint64_t copy_reserve, void *host,
+                                 const uint64_t linear[3], uint32_t rows)
+{
+	return impl->set_payload_memory(buffer, size, copy_reserve, host, linear, rows);
+}
+
+bool Decoder::push_packet_in_place(const void *data, size_t size)
+{
+	auto *p = static_cast<const uint8_t *>(data);
+	auto *base = impl->in_place_base;
+	if (!base || p < base + impl->in_place_reserve || size > impl->in_place_size ||
+	    VkDeviceSize(p - base) > impl->in_place_size - size || ((p - base) & 3) != 0)
+	{
+		LOGE("In-place packet lies outside the payload memory.\n");
+		return false;
+	}
+	impl->pushing_in_place = true;
+	bool ret = impl->push_packet(data, size);
+	impl->pushing_in_place = false;
+	return ret;
 }
 
 bool Decoder::decode(Vulkan::CommandBuffer &cmd, const ViewBuffers &views)

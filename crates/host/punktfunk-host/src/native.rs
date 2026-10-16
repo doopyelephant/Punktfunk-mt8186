@@ -1557,7 +1557,8 @@ pub(crate) async fn run_admitted(
         .and_then(crate::library::audio_sessions_for)
         .map(|policy| crate::session_status::apply_audio_policy(policy, &client_label));
     let result: Result<()> = async {
-        let (transport, wire_sock, media) = bind_data_plane(data_plane, &bringup)?;
+        let clear = features.has(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT);
+        let (transport, wire_sock, media) = bind_data_plane(data_plane, &bringup, clear)?;
         let session = Session::new(welcome.session_config(Role::Host), media, transport)
             .map_err(|e| anyhow!("host session: {e:?}"))?;
         let common = StreamCommon {
@@ -2392,7 +2393,12 @@ type BoundPlane = (
 /// framing. A browser's video rides its WebTransport datagrams, unsealed inside that
 /// encryption; a native session's leaves from the endpoint's socket toward the connection's
 /// validated address, keyed from its exporter.
-fn bind_data_plane(data_plane: DataPlane, bringup: &crate::bringup::Trace) -> Result<BoundPlane> {
+/// `clear_placement`: the client agreed to read sealed packets by their clear header.
+fn bind_data_plane(
+    data_plane: DataPlane,
+    bringup: &crate::bringup::Trace,
+    clear_placement: bool,
+) -> Result<BoundPlane> {
     bringup.mark("punch_done");
     match data_plane {
         DataPlane::Web(plane) => {
@@ -2401,6 +2407,7 @@ fn bind_data_plane(data_plane: DataPlane, bringup: &crate::bringup::Trace) -> Re
                 clock_origin_ns: v2.clock.origin_ns(),
                 keys: None,
                 clock: Some(v2.clock.clone()),
+                clear_placement: false,
             };
             Ok((Box::new(plane), None, media))
         }
@@ -2419,6 +2426,7 @@ fn bind_data_plane(data_plane: DataPlane, bringup: &crate::bringup::Trace) -> Re
                 clock_origin_ns: v2.clock.origin_ns(),
                 keys: Some(keys),
                 clock: Some(v2.clock.clone()),
+                clear_placement,
             };
             Ok((Box::new(sender), v2.media_socket.try_clone().ok(), media))
         }

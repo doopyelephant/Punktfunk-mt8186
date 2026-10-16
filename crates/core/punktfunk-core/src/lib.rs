@@ -20,6 +20,8 @@
 
 /// cbindgen:ignore
 pub mod abr;
+/// cbindgen:ignore
+pub mod au;
 pub mod audio;
 #[cfg(feature = "quic")]
 pub mod client;

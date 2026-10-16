@@ -50,7 +50,7 @@ struct OutputReady {
 /// Events the async decode loop reacts to. The codec's async-notify callbacks (which run on its
 /// internal looper thread) push the codec ones; the feeder thread pushes `Au`. Each carries only
 /// owned/`Copy` data so the callback closures satisfy the `Send` bound and never touch the codec.
-pub(super) enum DecodeEvent {
+pub(crate) enum DecodeEvent {
     /// A received access unit core admitted, ready to queue into the decoder. The `u32` is
     /// the gap ahead of it from [`NativeClient::recovery_on_au`] (0 = none): the receiver rule
     /// and the ladder's loss mark key on it. Core armed the freeze and asked at the report.

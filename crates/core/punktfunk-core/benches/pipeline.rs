@@ -44,6 +44,7 @@ fn media() -> MediaV2 {
         clock_origin_ns: 0,
         keys: Some(MediaKeys::derive(&[7; 32], MediaSuite::Aes128Gcm)),
         clock: None,
+        clear_placement: true,
     }
 }
 
@@ -61,8 +62,8 @@ fn bench_crypto(c: &mut Criterion) {
         ("_chacha20", MediaSuite::ChaCha20Poly1305),
     ] {
         let keys = MediaKeys::derive(&[7; 32], suite);
-        let host = SessionCrypto::media(&keys, Role::Host);
-        let client = SessionCrypto::media(&keys, Role::Client);
+        let host = SessionCrypto::media(&keys, Role::Host, false);
+        let client = SessionCrypto::media(&keys, Role::Client, false);
         let mut sealed = vec![0xABu8; SHARD + TAG_LEN];
         host.seal_media(0, &AAD, &mut sealed).unwrap();
 

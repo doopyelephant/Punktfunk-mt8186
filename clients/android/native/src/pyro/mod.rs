@@ -20,17 +20,20 @@
 //! nor the Vulkan 1.3 device this needs. [`available`] answers for the whole lane.
 
 #[cfg(all(target_os = "android", target_pointer_width = "64"))]
+mod asc;
+#[cfg(all(target_os = "android", target_pointer_width = "64"))]
 mod device;
 #[cfg(all(target_os = "android", target_pointer_width = "64"))]
 mod present;
 
 #[cfg(all(target_os = "android", target_pointer_width = "64"))]
 mod imp {
-    use super::{device::PyroDevice, present::Present};
+    use super::{asc, device::PyroDevice, present::Present};
     use anyhow::{anyhow, Result};
     use ndk::native_window::NativeWindow;
     use pf_client_video::video_color::ColorDesc;
     use pf_client_video::video_pyrowave::{DecodeTimeline, PyroWaveDecoder};
+    use punktfunk_core::au::AuMemory;
     use punktfunk_core::client::NativeClient;
     use punktfunk_core::error::PunktfunkError;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -92,15 +95,18 @@ mod imp {
                 return;
             }
             let ms = |i: usize| self.sum[i] as f64 / f64::from(self.frames) / 1000.0;
+            let (found, copied) = decoder.take_ring_counts();
             log::info!(
                 "pyro: {} frames, mean ms: wait {:.2} parse {:.2} record {:.2} gpu {:.2} \
-                 present {:.2}",
+                 present {:.2}; AUs in place {}, copied in {}",
                 self.frames,
                 ms(0),
                 ms(1),
                 ms(2),
                 ms(3),
-                ms(4)
+                ms(4),
+                found,
+                copied
             );
             for line in decoder.gpu_stage_report(true) {
                 log::info!("pyro:   {line}");
@@ -206,6 +212,38 @@ mod imp {
         )
     }
 
+    /// Have `decoder` read AUs where the session assembles them, and lend its ring to the
+    /// session. A device without the memory for it keeps copying. Returns what the session holds.
+    fn read_in_place(
+        client: &NativeClient,
+        decoder: &mut PyroWaveDecoder,
+        dev: &Arc<PyroDevice>,
+        lent: Option<Arc<dyn AuMemory>>,
+    ) -> Option<Arc<dyn AuMemory>> {
+        if let Err(e) = decoder.enable_in_place(dev.clone()) {
+            log::warn!("pyro: packets are copied into the decoder ({e:#})");
+            return lent;
+        }
+        log::info!("pyro: the decoder reads AUs where the reassembler wrote them");
+        lend(client, decoder, lent)
+    }
+
+    /// Hand the session `decoder`'s ring when it is not the one it already holds: a resize can
+    /// outgrow the old one.
+    fn lend(
+        client: &NativeClient,
+        decoder: &PyroWaveDecoder,
+        lent: Option<Arc<dyn AuMemory>>,
+    ) -> Option<Arc<dyn AuMemory>> {
+        match decoder.au_memory() {
+            Some(m) if !lent.as_ref().is_some_and(|l| Arc::ptr_eq(l, &m)) => {
+                client.set_au_memory(m.clone());
+                Some(m)
+            }
+            _ => lent,
+        }
+    }
+
     /// The lane's entry point on the `pf-decode` thread. Runs until `shutdown` is set, the
     /// session closes, or bring-up fails — the last of which is terminal for video: nothing
     /// else on this client decodes PyroWave, and the host already negotiated it.
@@ -216,7 +254,10 @@ mod imp {
         stats: Arc<crate::stats::VideoStats>,
         opts: DecodeOptions,
     ) {
-        if let Err(e) = run_inner(&client, &window, &shutdown, &stats, &opts) {
+        let result = run_inner(&client, &window, &shutdown, &stats, &opts);
+        // Back to heap memory: the next lane lends its own ring, and this one can go.
+        client.set_au_memory(Arc::new(punktfunk_core::au::HeapPool::default()));
+        if let Err(e) = result {
             if shutdown.load(Ordering::Relaxed) {
                 // Teardown, not a fault: Kotlin sets the flag and releases the Surface in the
                 // same breath, so whatever we were mid-call on lost its window under us.
@@ -242,13 +283,32 @@ mod imp {
         opts: &DecodeOptions,
     ) -> Result<()> {
         crate::decode::boost_thread_priority();
-        let dev = PyroDevice::new(PyroDevice::open_surface(window)?)?;
+        // Shared: a payload-ring slot still lent to the session keeps the device alive.
+        let dev = Arc::new(PyroDevice::new(PyroDevice::open_surface(window)?)?);
         stats.set_decoder(&decoder_label(&dev.vkd.device_name), false);
         let smooth = opts.present_priority == 1;
-        let mut present = Present::new(&dev, smooth)?;
+        // The compositor takes our buffers where it can: no acquire, its own scaling. The
+        // swapchain stays for the smoothness intent (FIFO), ChromeOS and drivers without import.
+        let asc = if !smooth && dev.buffers && crate::decode::asc_backend_selected(opts.chromeos) {
+            asc::AscTarget::new(
+                &dev,
+                window,
+                opts.surface_size.clone(),
+                opts.src_crop.clone(),
+                client.mode().refresh_hz as f32,
+            )
+            .unwrap_or_else(|e| {
+                log::warn!("pyro: presenting through the swapchain ({e:#})");
+                None
+            })
+        } else {
+            None
+        };
+        let mut present = Present::new(&dev, smooth, asc)?;
 
         let mut mode = client.mode();
         let mut decoder = open_decoder(client, &dev, mode)?;
+        let mut lent = read_in_place(client, &mut decoder, &dev, None);
         // Declared after the decoder, so it is joined first on every exit.
         let retire = Retire::spawn(stats.clone())?;
         let depth = if client.bit_depth >= 10 { 10 } else { 8 };
@@ -303,6 +363,7 @@ mod imp {
                 drop(decoder);
                 mode = now_mode;
                 decoder = open_decoder(client, &dev, mode)?;
+                lent = read_in_place(client, &mut decoder, &dev, lent);
                 split = SplitWindow::default();
             }
 
@@ -338,7 +399,7 @@ mod imp {
             let pulled_ns = if want_stamps { now_realtime_ns() } else { 0 };
 
             let aligned = frame.flags & punktfunk_core::packet::USER_FLAG_CHUNK_ALIGNED != 0;
-            let decoded = match decoder.decode_frame(&frame.data, aligned, frame.complete) {
+            let decoded = match decoder.decode_au(frame.data, aligned, frame.complete) {
                 Ok(d) => d,
                 Err(e) => {
                     // Not recoverable by asking for anything: an intra-only frame that the
@@ -349,6 +410,7 @@ mod imp {
             let Some(picture) = decoded else {
                 continue; // packets accumulated, frame not complete yet
             };
+            lent = lend(client, &decoder, lent);
             // Submitted, not done: the present below follows it on the same queue, and the
             // retire thread notices when it finishes.
             let submitted = Instant::now();
@@ -368,7 +430,9 @@ mod imp {
                 opts.src_crop.load(std::sync::atomic::Ordering::Relaxed),
             );
             present.follow(opts.surface_size.load(Ordering::Relaxed))?;
-            let shown = present.show(picture.views, crop, picture.color, depth, msb_packed)?;
+            let size = (picture.width, picture.height);
+            let shown =
+                present.show(picture.views, crop, picture.color, depth, msb_packed, size)?;
             if !shown {
                 continue; // swapchain was out of date; it has been rebuilt
             }

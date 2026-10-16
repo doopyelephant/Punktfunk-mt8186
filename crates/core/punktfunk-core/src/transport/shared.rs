@@ -11,7 +11,7 @@
 //! address on the first authenticated packet from a new one and validates it afterwards, so
 //! media follows a migration before QUIC has confirmed it.
 
-use super::Transport;
+use super::{BufPool, RecvBatch, Transport};
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
 use std::collections::VecDeque;
 use std::io::IoSliceMut;
@@ -28,7 +28,7 @@ pub fn is_media(first_byte: u8) -> bool {
     first_byte & 0xC0 == 0
 }
 
-/// Media packets the client queues for the session; past this it drops the newest, as a full
+/// Media batches the client queues for the session; past this it drops the newest, as a full
 /// socket buffer would.
 const MEDIA_QUEUE: usize = 8192;
 /// QUIC packets queued for quinn; quinn drains them on every wake.
@@ -36,6 +36,8 @@ const QUIC_QUEUE: usize = 1024;
 /// Datagrams one read takes, and the buffer each needs with GRO.
 const BATCH: usize = 32;
 const READ_BUF: usize = 64 * 1024;
+/// Receive buffers out at once, read and queued, in bytes: 512 with GRO, ~3600 datagrams without.
+const POOL_BYTES: usize = 32 * 1024 * 1024;
 /// How long the reader waits before it looks at its stop flag again.
 const WAIT: Duration = Duration::from_millis(100);
 
@@ -108,7 +110,7 @@ impl Drop for ClientSocket {
 /// The session side of the client's shared socket: media packets, in arrival order.
 pub struct ClientMedia {
     /// One reader, the session's pump; the lock is never contended.
-    rx: Mutex<Receiver<Vec<u8>>>,
+    rx: Mutex<Receiver<RecvBatch>>,
     stats: Arc<SharedStats>,
     socket: Arc<UdpSocket>,
 }
@@ -138,11 +140,19 @@ pub fn client_socket(bind: SocketAddr) -> std::io::Result<(Arc<ClientSocket>, Cl
     }));
     let stats = Arc::new(SharedStats::default());
     let (tx, rx) = sync_channel(MEDIA_QUEUE);
+    // Without GRO a read is one datagram, so the buffer is one datagram's worth.
+    let size = if state.gro_segments() > 1 {
+        READ_BUF
+    } else {
+        crate::packet::MAX_DATAGRAM_BYTES + 1
+    };
+    let pool = BufPool::new(size, (POOL_BYTES / size).max(2 * BATCH));
     let reader = Reader {
         socket: socket.clone(),
         state: state.clone(),
         quic: quic.clone(),
         media: tx,
+        pool,
         stats: stats.clone(),
     };
     // As urgent as the pump it feeds: a descheduled reader is socket drops the link never had.
@@ -171,13 +181,20 @@ struct Reader {
     socket: Arc<UdpSocket>,
     state: Arc<UdpSocketState>,
     quic: Arc<Mutex<QuicQueue>>,
-    media: SyncSender<Vec<u8>>,
+    media: SyncSender<RecvBatch>,
+    pool: Arc<BufPool>,
     stats: Arc<SharedStats>,
 }
 
 impl Reader {
     fn run(self) {
-        let mut bufs = vec![vec![0u8; READ_BUF]; BATCH];
+        let mut bufs: Vec<Vec<u8>> = (0..BATCH)
+            .map(|_| {
+                self.pool
+                    .take()
+                    .expect("the pool holds at least two batches")
+            })
+            .collect();
         let mut meta = [RecvMeta::default(); BATCH];
         while !self.stats.stop.load(Ordering::Relaxed) {
             match super::udp::wait_readable(&self.socket, WAIT) {
@@ -204,34 +221,55 @@ impl Reader {
                     }
                 };
                 drop(slices);
-                self.route(&bufs[..n], &meta[..n]);
+                self.route(&mut bufs[..n], &meta[..n]);
             }
         }
     }
 
-    /// Each datagram (each GRO segment) by its first byte.
-    fn route(&self, bufs: &[Vec<u8>], meta: &[RecvMeta]) {
+    /// Each datagram (each GRO segment) by its first byte. A buffer holding only the host's
+    /// media goes to the session whole, as read; QUIC and a mixed buffer's media are copied.
+    fn route(&self, bufs: &mut [Vec<u8>], meta: &[RecvMeta]) {
         let mut to_quinn = Vec::new();
-        for (buf, m) in bufs.iter().zip(meta) {
-            for seg in buf[..m.len].chunks(m.stride.max(1)) {
-                if !is_media(seg[0]) {
-                    to_quinn.push((
-                        seg.to_vec(),
-                        RecvMeta {
-                            len: seg.len(),
-                            stride: seg.len(),
-                            ..*m
-                        },
-                    ));
-                } else if !self.stats.is_host(m.addr) {
-                    self.stats.foreign.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    match self.media.try_send(seg.to_vec()) {
-                        Ok(()) => self.stats.media.fetch_add(1, Ordering::Relaxed),
-                        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                            self.stats.media_dropped.fetch_add(1, Ordering::Relaxed)
-                        }
-                    };
+        for (buf, m) in bufs.iter_mut().zip(meta) {
+            let stride = m.stride.max(1);
+            let segs = &buf[..m.len];
+            let total = segs.chunks(stride).count();
+            let media = segs.chunks(stride).filter(|s| is_media(s[0])).count();
+            for seg in segs.chunks(stride).filter(|s| !is_media(s[0])) {
+                to_quinn.push((
+                    seg.to_vec(),
+                    RecvMeta {
+                        len: seg.len(),
+                        stride: seg.len(),
+                        ..*m
+                    },
+                ));
+            }
+            if media == 0 {
+                continue;
+            }
+            if !self.stats.is_host(m.addr) {
+                self.stats
+                    .foreign
+                    .fetch_add(media as u64, Ordering::Relaxed);
+                continue;
+            }
+            if media < total {
+                for seg in segs.chunks(stride).filter(|s| is_media(s[0])) {
+                    self.hand_over(RecvBatch::single(seg.to_vec()), 1);
+                }
+                continue;
+            }
+            match self.pool.take() {
+                Some(fresh) => {
+                    let full = std::mem::replace(buf, fresh);
+                    self.hand_over(self.pool.lend(full, m.len, stride), media);
+                }
+                // Every buffer is read or queued: the session is behind, as with a full queue.
+                None => {
+                    self.stats
+                        .media_dropped
+                        .fetch_add(media as u64, Ordering::Relaxed);
                 }
             }
         }
@@ -250,6 +288,17 @@ impl Reader {
         if let Some(w) = q.waker.take() {
             w.wake();
         }
+    }
+
+    /// Queue `batch` (`datagrams` of media) for the session, or count them dropped.
+    fn hand_over(&self, batch: RecvBatch, datagrams: usize) {
+        let counter = match self.media.try_send(batch) {
+            Ok(()) => &self.stats.media,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                &self.stats.media_dropped
+            }
+        };
+        counter.fetch_add(datagrams as u64, Ordering::Relaxed);
     }
 }
 
@@ -331,28 +380,18 @@ impl Transport for ClientMedia {
     }
 
     fn recv(&self) -> std::io::Result<Option<Vec<u8>>> {
+        Err(std::io::Error::other(
+            "punktfunk/2 media is read in batches (recv_owned)",
+        ))
+    }
+
+    fn recv_owned(&self) -> std::io::Result<Option<RecvBatch>> {
         Ok(self
             .rx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .try_recv()
             .ok())
-    }
-
-    fn recv_batch(&self, out: &mut [Vec<u8>], lens: &mut [usize]) -> std::io::Result<usize> {
-        let rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
-        let mut n = 0;
-        while n < out.len().min(lens.len()) {
-            let Ok(pkt) = rx.try_recv() else {
-                break;
-            };
-            // A packet longer than the slot reads as full, which the session drops as oversized.
-            let len = pkt.len().min(out[n].len());
-            out[n][..len].copy_from_slice(&pkt[..len]);
-            lens[n] = len;
-            n += 1;
-        }
-        Ok(n)
     }
 }
 
@@ -587,17 +626,17 @@ mod tests {
             }
         });
         let mut seen = vec![false; N];
-        let mut out = vec![vec![0u8; 9217]; 64];
-        let mut lens = vec![0usize; 64];
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut got = 0;
         while got < N && std::time::Instant::now() < deadline {
-            let n = media.recv_batch(&mut out, &mut lens).unwrap();
-            if n == 0 {
+            let Some(batch) = media.recv_owned().unwrap() else {
                 tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            for i in 0..n {
-                let p = &out[i][..lens[i]];
+                continue;
+            };
+            let mut off = 0;
+            while let Some(r) = batch.at(off) {
+                off = r.end;
+                let p = batch.bytes(r);
                 assert!(is_media(p[0]), "a QUIC packet reached the media queue");
                 assert_eq!(p.len(), 1100);
                 let idx = u64::from_le_bytes(p[1..9].try_into().unwrap()) as usize;
@@ -636,9 +675,33 @@ mod tests {
             stranger.send_to(&[0x01; 200], to).unwrap();
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let mut out = vec![vec![0u8; 9217]; 16];
-        let mut lens = vec![0usize; 16];
-        assert_eq!(media.recv_batch(&mut out, &mut lens).unwrap(), 0);
+        assert!(media.recv_owned().unwrap().is_none());
         assert_eq!(media.stats().foreign.load(Ordering::Relaxed), 10);
+    }
+
+    /// A lent buffer comes back on drop, and the pool never allocates past its bound.
+    #[test]
+    fn lent_buffers_return_and_stay_bounded() {
+        let pool = BufPool::new(16, 2);
+        let a = pool.take().unwrap();
+        let b = pool.take().unwrap();
+        assert!(pool.take().is_none(), "two buffers is the bound");
+        let batch = pool.lend(a, 10, 4);
+        assert_eq!(
+            (batch.at(0), batch.at(8), batch.at(10)),
+            (Some(0..4), Some(8..10), None)
+        );
+        assert_eq!(batch.remaining(4), 2);
+        drop(batch);
+        assert_eq!(
+            pool.take().map(|v| v.len()),
+            Some(16),
+            "the dropped batch's buffer"
+        );
+        drop(b);
+        assert!(
+            pool.take().is_none(),
+            "a buffer dropped outside a batch is gone for good"
+        );
     }
 }

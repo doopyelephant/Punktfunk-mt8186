@@ -99,14 +99,27 @@ pub fn decode_v2<'a>(
     clock_origin_ns: u64,
     pts_ref_us: &mut Option<i64>,
 ) -> Option<(PacketHeader, u8, &'a [u8])> {
-    let h = pkt.get(..V2_HEADER_LEN)?;
-    let (tag, body) = (h[0], &pkt[V2_HEADER_LEN..]);
+    let body = pkt.get(V2_HEADER_LEN..)?;
+    let (hdr, epoch) = decode_v2_header(pkt, body.len(), clock_origin_ns, pts_ref_us)?;
+    Some((hdr, epoch, body))
+}
+
+/// [`decode_v2`] from the header alone: `h` starts with the 30 header bytes and the shard
+/// after it is `body_len` bytes, wherever it is.
+pub fn decode_v2_header(
+    h: &[u8],
+    body_len: usize,
+    clock_origin_ns: u64,
+    pts_ref_us: &mut Option<i64>,
+) -> Option<(PacketHeader, u8)> {
+    let h = h.get(..V2_HEADER_LEN)?;
+    let tag = h[0];
     if tag & 0xF0 != 0 || tag > V2_STREAM_PROBE {
         return None;
     }
     let u16_at = |o: usize| u16::from_le_bytes([h[o], h[o + 1]]);
     let u32_at = |o: usize| u32::from_le_bytes([h[o], h[o + 1], h[o + 2], h[o + 3]]);
-    let shard_bytes = u16::try_from(body.len()).ok()?;
+    let shard_bytes = u16::try_from(body_len).ok()?;
     let (flags, block, base, k) = (u16_at(6), u16_at(16), u32_at(18), u16_at(24));
     let sb = u64::from(shard_bytes);
     let (block_count, frame_bytes) = if flags & V2_LAST_BLOCK != 0 {
@@ -146,7 +159,7 @@ pub fn decode_v2<'a>(
         shard_index: u16_at(22),
         shard_bytes,
     };
-    Some((hdr, h[5], body))
+    Some((hdr, h[5]))
 }
 
 /// The packet number nearest `reference` whose low half is `low`.

@@ -417,6 +417,7 @@ impl DataPump {
                     decrypt_ms = p.decrypt_ns / 1_000_000,
                     reasm_ms = p.reasm_ns / 1_000_000,
                     packets = p.packets,
+                    placed = p.placed,
                     batches = p.batches,
                     pkts_per_batch = p.packets.checked_div(p.batches).unwrap_or(0),
                     decrypt_ns_pkt = per_pkt_ns(p.decrypt_ns),

@@ -257,7 +257,7 @@ impl Drop for ScHandle {
 /// One presented transaction's real feedback, posted from the completion callback (a binder thread)
 /// into the decode loop's event channel. The loop matches `seq` to the buffer it retired and frees
 /// it once `prev_release_fence` signals.
-pub(super) struct PresentComplete {
+pub(crate) struct PresentComplete {
     /// The presenter's monotonically increasing submit sequence for this transaction.
     pub seq: u64,
     /// SurfaceFlinger's latch instant for this frame (`CLOCK_MONOTONIC` ns) — the truthful present
@@ -342,7 +342,7 @@ unsafe extern "C" fn on_complete(context: *mut c_void, stats: *mut ASurfaceTrans
 
 /// One `ASurfaceControl` layer, a child of a SurfaceView's window, that the presenter composites
 /// decoded buffers onto. Owns nothing thread-shared; lives on and is dropped by the decode loop.
-pub(super) struct Layer {
+pub(crate) struct Layer {
     api: Api,
     sc: Arc<ScHandle>,
     /// The SurfaceView's LIVE pixel size, packed by `pack_surface_size` and re-read before every
@@ -372,7 +372,7 @@ impl Layer {
     /// screen hides the system bars and switches on cutout drawing a frame or two after
     /// `surfaceCreated`, and each one grows it. An empty `surface_size` (Kotlin hadn't measured the
     /// view yet) falls back to the buffer size as the best remaining guess.
-    pub(super) fn create(
+    pub(crate) fn create(
         window: &NativeWindow,
         surface_size: Arc<AtomicU64>,
         src_crop: Arc<AtomicU64>,
@@ -485,7 +485,7 @@ impl Layer {
     /// Take the layer off the screen; the next [`present`] that includes it shows it again.
     /// Dropping it does not hide it: a released child stays on display as long as its parent
     /// does, over whatever layer replaced it.
-    pub(super) fn hide(&mut self) {
+    pub(crate) fn hide(&mut self) {
         // SAFETY: a fresh transaction or null, this layer's live `sc`, applied and deleted once.
         unsafe {
             let txn = (self.api.txn_create)();
@@ -511,7 +511,7 @@ impl Layer {
 /// HDR10 volume for SurfaceFlinger's tone-mapper. `frame_rate` votes once per layer (`0.0`
 /// skips). `false` means the caller still owns the buffer and fence.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn present(
+pub(crate) fn present(
     layers: &mut [&mut Layer],
     buffer: &HardwareBuffer,
     src_w: i32,

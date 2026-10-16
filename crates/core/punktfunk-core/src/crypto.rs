@@ -155,16 +155,47 @@ impl Cipher {
             Cipher::ChaCha20Poly1305(c) => c.open_in_place(nonce, aad, ciphertext, tag),
         }
     }
+
+    /// Open `ciphertext` into `out` (same length). On failure `out` is unspecified.
+    fn open_into(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        ciphertext: &[u8],
+        out: &mut [u8],
+        tag: &[u8; TAG_LEN],
+    ) -> Result<()> {
+        match self {
+            Cipher::Aes128Gcm(c) => {
+                let io = aes_gcm::aead::inout::InOutBuf::new(ciphertext, out)
+                    .map_err(|_| PunktfunkError::BadPacket)?;
+                c.decrypt_inout_detached((&nonce).into(), aad, io, tag.into())
+                    .map_err(|_| PunktfunkError::Crypto)
+            }
+            // No out-of-place open on this backend: the copy is the one the in-place path makes.
+            Cipher::ChaCha20Poly1305(c) => {
+                if out.len() != ciphertext.len() {
+                    return Err(PunktfunkError::BadPacket);
+                }
+                out.copy_from_slice(ciphertext);
+                c.open_in_place(nonce, aad, out, tag)
+            }
+        }
+    }
 }
 
 /// A session's media AEAD: this role seals with its own direction's keys and opens the peer's.
 pub struct SessionCrypto {
     send: MediaDir,
     recv: MediaDir,
+    /// Leading bytes of every packet left in the clear and bound as AAD.
+    clear: usize,
 }
 
 impl SessionCrypto {
-    pub fn media(keys: &MediaKeys, role: Role) -> Self {
+    /// `clear_placement`: the whole v2 header rides in the clear
+    /// ([`FEATURE_CLEAR_PLACEMENT`](crate::quic::v2::registry::FEATURE_CLEAR_PLACEMENT)).
+    pub fn media(keys: &MediaKeys, role: Role, clear_placement: bool) -> Self {
         let (send, recv) = match role {
             Role::Host => (keys.host_to_client, keys.client_to_host),
             Role::Client => (keys.client_to_host, keys.host_to_client),
@@ -172,7 +203,46 @@ impl SessionCrypto {
         SessionCrypto {
             send: MediaDir::new(keys.suite, send),
             recv: MediaDir::new(keys.suite, recv),
+            clear: if clear_placement {
+                crate::packet::V2_HEADER_LEN
+            } else {
+                crate::packet::V2_CLEAR_LEN
+            },
         }
+    }
+
+    /// Leading bytes of a packet that are not sealed.
+    pub fn clear_len(&self) -> usize {
+        self.clear
+    }
+
+    /// Seal `wire` (`header ‖ body ‖ TAG_LEN scratch`) as packet `seq`; its clear prefix is the AAD.
+    pub fn seal_wire(&self, seq: u64, wire: &mut [u8]) -> Result<()> {
+        let at = self.clear.min(wire.len());
+        let (aad, rest) = wire.split_at_mut(at);
+        self.seal_media(seq, aad, rest)
+    }
+
+    /// Open `wire` (`header ‖ sealed ‖ tag`) in place; the opened packet's length, header
+    /// included. On failure the sealed part is unspecified.
+    pub fn open_wire(&self, seq: u64, wire: &mut [u8]) -> Result<usize> {
+        let at = self.clear.min(wire.len());
+        let (aad, rest) = wire.split_at_mut(at);
+        Ok(at + self.open_media(seq, aad, rest)?)
+    }
+
+    /// Open `wire`'s sealed body into `out`, which must be exactly that long; `wire` is left
+    /// as received. On failure `out` is unspecified.
+    pub fn open_wire_into(&self, seq: u64, wire: &[u8], out: &mut [u8]) -> Result<()> {
+        if wire.len() < self.clear + TAG_LEN {
+            return Err(PunktfunkError::BadPacket);
+        }
+        let (aad, rest) = wire.split_at(self.clear);
+        let (ciphertext, tag) = rest.split_at(rest.len() - TAG_LEN);
+        let tag: &[u8; TAG_LEN] = tag.try_into().map_err(|_| PunktfunkError::Crypto)?;
+        let key = self.recv.key(seq);
+        key.cipher
+            .open_into(media_nonce(&key.iv, seq), aad, ciphertext, out, tag)
     }
 
     /// Seal `buf` (`plaintext ‖ TAG_LEN scratch`) as packet `seq`, binding `aad`, the packet's
@@ -392,8 +462,8 @@ mod tests {
         for suite in [MediaSuite::Aes128Gcm, MediaSuite::ChaCha20Poly1305] {
             let keys = MediaKeys::derive(&[9; 32], suite);
             assert_ne!(keys.host_to_client, keys.client_to_host);
-            let host = SessionCrypto::media(&keys, Role::Host);
-            let client = SessionCrypto::media(&keys, Role::Client);
+            let host = SessionCrypto::media(&keys, Role::Host, false);
+            let client = SessionCrypto::media(&keys, Role::Client, false);
             let aad = [0u8, 1, 2, 3, 4];
             let msg = b"one shard of video".to_vec();
             for seq in [

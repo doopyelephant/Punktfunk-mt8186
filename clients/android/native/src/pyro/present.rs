@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// Frames the CPU may record ahead of the GPU. Two is the whole budget this lane wants: the
 /// decoder already runs one frame ahead, so a deeper pipeline would only park finished
 /// pictures in front of the panel.
-const FRAMES: usize = 2;
+pub(super) const FRAMES: usize = 2;
 
 /// How long to wait for a free swapchain image before giving up on this picture.
 ///
@@ -50,6 +50,8 @@ struct SwapRes {
 pub(super) struct Present<'d> {
     device: ash::Device,
     queue: vk::Queue,
+    /// The queue family, which hands a drawn buffer to the compositor's.
+    qf: u32,
     queue_lock: Arc<QueueLock>,
     surface_i: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
@@ -72,17 +74,24 @@ pub(super) struct Present<'d> {
     frame: usize,
     /// The view's live size as last read ([`Present::follow`]), packed; `0` = not known yet.
     followed: u64,
+    /// Present through `ASurfaceControl` instead of the swapchain ([`super::asc`]).
+    asc: Option<super::asc::AscTarget>,
     _dev: PhantomData<&'d super::device::PyroDevice>,
 }
 
 impl<'d> Present<'d> {
-    /// Build the render pass, pipeline and first swapchain for `dev`'s surface.
+    /// Build the render pass, pipeline and first swapchain for `dev`'s surface, or with `asc`
+    /// draw into its buffers and build no swapchain.
     ///
     /// `smooth` picks FIFO over MAILBOX: the same "presentation intent" the MediaCodec
     /// backends take from the settings, expressed in the only actuator a swapchain has.
     /// MAILBOX shows the newest picture and discards what it overtook — the latency intent
     /// — where FIFO queues every one onto the panel's own cadence.
-    pub(super) fn new(dev: &'d super::device::PyroDevice, smooth: bool) -> Result<Present<'d>> {
+    pub(super) fn new(
+        dev: &'d super::device::PyroDevice,
+        smooth: bool,
+        asc: Option<super::asc::AscTarget>,
+    ) -> Result<Present<'d>> {
         let surface = dev.base.surface;
         let surface_i = ash::khr::surface::Instance::new(&dev.base.entry, &dev.base.instance);
         let swap_d = ash::khr::swapchain::Device::new(&dev.base.instance, &dev.device);
@@ -100,7 +109,10 @@ impl<'d> Present<'d> {
             })
             .or_else(|| formats.first())
             .ok_or_else(|| anyhow!("surface offers no formats"))?;
-        let (format, color_space) = (format.format, format.color_space);
+        let (format, color_space) = match asc {
+            Some(_) => (super::asc::FORMAT, vk::ColorSpaceKHR::SRGB_NONLINEAR),
+            None => (format.format, format.color_space),
+        };
         // SAFETY: as above.
         let modes =
             unsafe { surface_i.get_physical_device_surface_present_modes(dev.pdev, surface) }?;
@@ -110,7 +122,14 @@ impl<'d> Present<'d> {
             vk::PresentModeKHR::FIFO // always supported
         };
 
-        let render_pass = build_render_pass(&dev.device, format)?;
+        // A buffer the compositor takes is handed over in GENERAL; a swapchain image in
+        // PRESENT_SRC.
+        let final_layout = if asc.is_some() {
+            vk::ImageLayout::GENERAL
+        } else {
+            vk::ImageLayout::PRESENT_SRC_KHR
+        };
+        let render_pass = build_render_pass(&dev.device, format, final_layout)?;
         let sampler = build_sampler(&dev.device)?;
         let (set_layout, pipeline_layout, pipeline) =
             build_pipeline(&dev.device, render_pass, sampler)?;
@@ -177,6 +196,7 @@ impl<'d> Present<'d> {
         let mut p = Present {
             device: dev.device.clone(),
             queue: dev.queue,
+            qf: dev.qf,
             queue_lock: dev.vkd.queue_lock.clone(),
             surface_i,
             surface,
@@ -204,17 +224,21 @@ impl<'d> Present<'d> {
             },
             frame: 0,
             followed: 0,
+            asc,
             _dev: PhantomData,
         };
-        p.rebuild_swapchain(color_space)?;
+        if p.asc.is_none() {
+            p.rebuild_swapchain(color_space)?;
+        }
         Ok(p)
     }
 
     /// Follow the view's live size, `packed` by `pack_surface_size`. Android's WSI never
     /// reports a resize as out of date: it keeps the old buffers and SurfaceFlinger scales
-    /// them, so the size Kotlin reports is the signal.
+    /// them, so the size Kotlin reports is the signal. An `ASurfaceControl` layer reads the
+    /// size itself on every present.
     pub(super) fn follow(&mut self, packed: u64) -> Result<()> {
-        if packed == self.followed {
+        if packed == self.followed || self.asc.is_some() {
             return Ok(());
         }
         self.followed = packed;
@@ -350,11 +374,11 @@ impl<'d> Present<'d> {
         Ok(())
     }
 
-    /// Draw one decoded frame and present it.
+    /// Draw one decoded `size` frame and present it.
     ///
-    /// `Ok(false)` means the swapchain went out of date and was rebuilt — the picture was
-    /// dropped, and the caller simply decodes the next one. Only a real device error is an
-    /// `Err`, and that ends the lane.
+    /// `Ok(false)` means the picture was dropped: the swapchain went out of date and was
+    /// rebuilt, or every buffer was still the compositor's. The caller simply decodes the next
+    /// one. Only a real device error is an `Err`, and that ends the lane.
     pub(super) fn show(
         &mut self,
         views: [u64; 3],
@@ -362,6 +386,7 @@ impl<'d> Present<'d> {
         color: ColorDesc,
         depth: u8,
         msb_packed: bool,
+        size: (u32, u32),
     ) -> Result<bool> {
         let frame = self.frame;
         let fence = self.fences[frame];
@@ -370,6 +395,9 @@ impl<'d> Present<'d> {
             self.device
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(|e| anyhow!("wait_for_fences: {e}"))?;
+        }
+        if self.asc.is_some() {
+            return self.show_asc(views, color, depth, msb_packed, size);
         }
         // SAFETY: the semaphore is unsignalled — its previous acquire was consumed by the
         // submit whose fence we just waited on.
@@ -393,34 +421,10 @@ impl<'d> Present<'d> {
             Err(e) => return Err(anyhow!("acquire_next_image: {e}")),
         };
 
-        // Bind this frame's planes. Safe to rewrite the set: the fence above proves the
-        // submit that last read it has completed. The decode may still be running; it sits
-        // ahead on this queue and its closing barrier orders our sampling after its writes,
-        // in GENERAL, so no transition.
-        let set = self.sets[frame];
-        let infos: Vec<vk::DescriptorImageInfo> = views
-            .iter()
-            .map(|&v| {
-                vk::DescriptorImageInfo::default()
-                    .sampler(self.sampler)
-                    .image_view(vk::ImageView::from_raw(v))
-                    .image_layout(vk::ImageLayout::GENERAL)
-            })
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = (0..3)
-            .map(|i| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(std::slice::from_ref(&infos[i]))
-            })
-            .collect();
-        // SAFETY: `writes` borrows `infos`, both live for the call; the set is idle.
-        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
-
+        self.bind_planes(frame, views);
         let cmd = self.cmds[frame];
         let fb = self.swap.framebuffers[index as usize];
+        let extent = self.swap.extent;
         // SAFETY: the buffer is not in flight (fence waited) and the pool allows reset.
         unsafe {
             self.device
@@ -430,7 +434,8 @@ impl<'d> Present<'d> {
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )?;
-            self.record(cmd, fb, crop, color, depth, msb_packed);
+            let viewport = crop_viewport(crop, extent);
+            self.record(cmd, fb, extent, viewport, color, depth, msb_packed, None);
             self.device.end_command_buffer(cmd)?;
         }
 
@@ -481,20 +486,138 @@ impl<'d> Present<'d> {
         }
     }
 
-    /// The render pass: clear the whole image, draw the fitted triangle.
+    /// Draw into an `ASurfaceControl` buffer: the whole picture (the layer crops and scales),
+    /// handed to the compositor's queue family, fenced by an exported semaphore.
+    fn show_asc(
+        &mut self,
+        views: [u64; 3],
+        color: ColorDesc,
+        depth: u8,
+        msb_packed: bool,
+        (width, height): (u32, u32),
+    ) -> Result<bool> {
+        let frame = self.frame;
+        let fence = self.fences[frame];
+        let draw = {
+            let Some(asc) = self.asc.as_mut() else {
+                return Ok(false);
+            };
+            asc.drain();
+            if asc.outgrown(width, height) {
+                {
+                    let _q = self.queue_lock.guard();
+                    // SAFETY: idling is the precondition for destroying the old buffers.
+                    unsafe { self.device.device_wait_idle() }?;
+                }
+                // SAFETY: the device is idle and the render pass draws `asc::FORMAT`.
+                unsafe { asc.rebuild(self.render_pass, width, height) }?;
+            }
+            match asc.next_draw() {
+                Some(d) => d,
+                None => return Ok(false),
+            }
+        };
+        self.bind_planes(frame, views);
+        let cmd = self.cmds[frame];
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: width as f32,
+            height: height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        // SAFETY: the buffer is not in flight (fence waited) and the pool allows reset.
+        unsafe {
+            self.device
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+            self.device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            self.record(
+                cmd,
+                draw.fb,
+                draw.extent,
+                viewport,
+                color,
+                depth,
+                msb_packed,
+                Some(draw.image),
+            );
+            self.device.end_command_buffer(cmd)?;
+        }
+        let done = self.asc.as_ref().map(|a| a.done(frame)).unwrap_or_default();
+        let wait: Vec<vk::Semaphore> = draw.wait.into_iter().collect();
+        let stages = vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT; wait.len()];
+        let signal = [done];
+        let cmds = [cmd];
+        let submit = vk::SubmitInfo::default()
+            .wait_semaphores(&wait)
+            .wait_dst_stage_mask(&stages)
+            .command_buffers(&cmds)
+            .signal_semaphores(&signal);
+        {
+            let _q = self.queue_lock.guard();
+            // SAFETY: the fence is unsignalled (waited and reset here), every handle is owned
+            // here, and the submit's borrows outlive the call.
+            unsafe {
+                self.device.reset_fences(&[fence])?;
+                self.device.queue_submit(self.queue, &[submit], fence)?;
+            }
+        }
+        self.frame = (frame + 1) % FRAMES;
+        match self.asc.as_mut() {
+            Some(asc) => asc.present(draw.slot, frame),
+            None => Ok(false),
+        }
+    }
+
+    /// Bind `frame`'s planes. Safe to rewrite the set: the frame's fence proves the submit that
+    /// last read it has completed. The decode may still be running; it sits ahead on this
+    /// queue and its closing barrier orders our sampling after its writes, in GENERAL.
+    fn bind_planes(&self, frame: usize, views: [u64; 3]) {
+        let set = self.sets[frame];
+        let infos: Vec<vk::DescriptorImageInfo> = views
+            .iter()
+            .map(|&v| {
+                vk::DescriptorImageInfo::default()
+                    .sampler(self.sampler)
+                    .image_view(vk::ImageView::from_raw(v))
+                    .image_layout(vk::ImageLayout::GENERAL)
+            })
+            .collect();
+        let writes: Vec<vk::WriteDescriptorSet> = (0..3)
+            .map(|i| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&infos[i]))
+            })
+            .collect();
+        // SAFETY: `writes` borrows `infos`, both live for the call; the set is idle.
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+    }
+
+    /// The render pass: clear `extent`, draw the triangle into `viewport`. With `foreign`, the
+    /// image then goes to the compositor's queue family.
     ///
     /// # Safety
-    /// `cmd` is recording and `fb` belongs to the current swapchain.
+    /// `cmd` is recording and `fb` is a live framebuffer of `extent` on this render pass.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn record(
         &self,
         cmd: vk::CommandBuffer,
         fb: vk::Framebuffer,
-        crop: [f32; 4],
+        extent: vk::Extent2D,
+        viewport: vk::Viewport,
         color: ColorDesc,
         depth: u8,
         msb_packed: bool,
+        foreign: Option<vk::Image>,
     ) {
-        let extent = self.swap.extent;
         let clear = [vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [0.0, 0.0, 0.0, 1.0],
@@ -525,8 +648,7 @@ impl<'d> Present<'d> {
             );
             self.device
                 .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-            self.device
-                .cmd_set_viewport(cmd, 0, &[crop_viewport(crop, extent)]);
+            self.device.cmd_set_viewport(cmd, 0, &[viewport]);
             self.device.cmd_set_scissor(
                 cmd,
                 0,
@@ -552,6 +674,30 @@ impl<'d> Present<'d> {
             );
             self.device.cmd_draw(cmd, 3, 1, 0, 0);
             self.device.cmd_end_render_pass(cmd);
+            if let Some(image) = foreign {
+                let release = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(self.qf)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                    .image(image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        level_count: 1,
+                        layer_count: 1,
+                        ..Default::default()
+                    });
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[release],
+                );
+            }
         }
     }
 
@@ -618,6 +764,8 @@ impl Drop for Present<'_> {
             // SAFETY: idling is the precondition for destroying objects submitted work uses.
             let _ = unsafe { self.device.device_wait_idle() };
         }
+        // Its framebuffers name the render pass destroyed below.
+        drop(self.asc.take());
         let current = self.swap.swapchain;
         // SAFETY: the device is idle, and every handle here was created on it by this struct.
         unsafe {
@@ -657,16 +805,20 @@ fn crop_viewport([left, top, right, bottom]: [f32; 4], surface: vk::Extent2D) ->
     }
 }
 
-/// One subpass writing the swapchain image: cleared on load (the letterbox bars), left in
-/// PRESENT_SRC so no explicit transition is recorded.
-fn build_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::RenderPass> {
+/// One subpass writing the target image: cleared on load (the letterbox bars), left in
+/// `final_layout` (PRESENT_SRC for a swapchain) so no explicit transition is recorded.
+fn build_render_pass(
+    device: &ash::Device,
+    format: vk::Format,
+    final_layout: vk::ImageLayout,
+) -> Result<vk::RenderPass> {
     let attachment = [vk::AttachmentDescription::default()
         .format(format)
         .samples(vk::SampleCountFlags::TYPE_1)
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+        .final_layout(final_layout)];
     let color_ref = [vk::AttachmentReference::default()
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
