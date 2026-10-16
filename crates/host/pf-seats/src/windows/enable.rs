@@ -47,6 +47,14 @@ const PACKAGE: [&str; 3] = [
 /// The RDP listener takes a moment to come up after `fDenyTSConnections` flips.
 const TRUST_ATTEMPTS: u32 = 3;
 const TRUST_RETRY: Duration = Duration::from_secs(2);
+/// How long a tool may run before it counts as hung and is killed. A permit of the pipe is
+/// pinned meanwhile. Windows answers its own state slowly for a minute after a restart, and a
+/// role install runs for minutes.
+const QUERY_LIMIT: Duration = Duration::from_secs(180);
+const INSTALL_LIMIT: Duration = Duration::from_secs(900);
+const TOOL_LIMIT: Duration = Duration::from_secs(300);
+/// The keeper's own handshake gives up after 15 s.
+const KEEPER_LIMIT: Duration = Duration::from_secs(60);
 /// The role's install state, then licensing and a GPU as `0`/`1` flags, on the last line. A role
 /// the cmdlet can't read is `Unknown`, after the cmdlet's error. `Available`, a role not
 /// installed, is the state enum's zero and false in PowerShell, so the state is tested against
@@ -157,7 +165,7 @@ pub(super) fn prepare() -> Vec<Diagnostic> {
     if server_edition() != Some(true) {
         return Vec::new();
     }
-    let lines = match powershell_lines(PREPARE) {
+    let lines = match powershell_lines(PREPARE, INSTALL_LIMIT) {
         Ok(lines) => lines,
         Err(cause) => {
             tracing::warn!(%cause, "remote desktop setup did not complete");
@@ -329,7 +337,7 @@ const LICENSING: &str = "$ErrorActionPreference='SilentlyContinue'; \
 /// How long Remote Desktop still runs without a licence server, for the doctor. Windows Server
 /// signs seats in for 120 days without one. `None` when Windows doesn't say.
 pub(super) fn licensing_row() -> Option<Diagnostic> {
-    let lines = powershell_lines(LICENSING).ok()?;
+    let lines = powershell_lines(LICENSING, QUERY_LIMIT).ok()?;
     let (days, servers) = lines.last()?.split_once('|')?;
     grace_row(
         days.parse().ok(),
@@ -604,11 +612,14 @@ fn open_rdp_rules(seats: &RegKey) -> WinResult<()> {
             cause,
         )
     };
-    let off = powershell_lines(&format!(
-        "$ErrorActionPreference='Stop'; \
-         Get-NetFirewallRule -Group '{RDP_RULE_GROUP}' | \
-         Where-Object {{ $_.Enabled -eq 'False' }} | ForEach-Object {{ $_.Name }}"
-    ))
+    let off = powershell_lines(
+        &format!(
+            "$ErrorActionPreference='Stop'; \
+             Get-NetFirewallRule -Group '{RDP_RULE_GROUP}' | \
+             Where-Object {{ $_.Enabled -eq 'False' }} | ForEach-Object {{ $_.Name }}"
+        ),
+        QUERY_LIMIT,
+    )
     .map_err(fail)?;
     if off.is_empty() {
         return Ok(());
@@ -620,10 +631,13 @@ fn open_rdp_rules(seats: &RegKey) -> WinResult<()> {
     seats
         .set_value(RDP_RULES_OPENED, &opened.join("\n"))
         .map_err(|cause| fail(cause.to_string()))?;
-    powershell_lines(&format!(
-        "$ErrorActionPreference='Stop'; Enable-NetFirewallRule -Name {}",
-        ps_list(&off)
-    ))
+    powershell_lines(
+        &format!(
+            "$ErrorActionPreference='Stop'; Enable-NetFirewallRule -Name {}",
+            ps_list(&off)
+        ),
+        QUERY_LIMIT,
+    )
     .map(drop)
     .map_err(fail)
 }
@@ -642,11 +656,14 @@ fn close_rdp_rules(seats: &RegKey) -> WinResult<()> {
             cause,
         )
     };
-    powershell_lines(&format!(
-        "$ErrorActionPreference='Stop'; \
-         Get-NetFirewallRule -Name {} -ErrorAction SilentlyContinue | Disable-NetFirewallRule",
-        ps_list(&opened)
-    ))
+    powershell_lines(
+        &format!(
+            "$ErrorActionPreference='Stop'; \
+             Get-NetFirewallRule -Name {} -ErrorAction SilentlyContinue | Disable-NetFirewallRule",
+            ps_list(&opened)
+        ),
+        QUERY_LIMIT,
+    )
     .map_err(fail)?;
     match seats.delete_value(RDP_RULES_OPENED) {
         Err(cause) if cause.kind() != std::io::ErrorKind::NotFound => Err(fail(cause.to_string())),
@@ -670,14 +687,18 @@ fn ps_list(names: &[String]) -> String {
         .join(",")
 }
 
-/// A PowerShell script's non-empty output lines. `Err` when it fails or doesn't launch.
-fn powershell_lines(script: &str) -> Result<Vec<String>, String> {
-    let output = Command::new(pf_paths::system32(POWERSHELL))
-        .args(powershell_args(script))
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
+/// A PowerShell script's non-empty output lines. `Err` when it fails, doesn't launch or runs
+/// past `limit`.
+fn powershell_lines(script: &str, limit: Duration) -> Result<Vec<String>, String> {
+    let output = pf_paths::run_within(
+        Command::new(pf_paths::system32(POWERSHELL))
+            .args(powershell_args(script))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+        limit,
+    )
+    .map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(format!("powershell exited {:?}", output.status.code()));
     }
@@ -705,11 +726,14 @@ fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
         if attempt > 0 {
             std::thread::sleep(TRUST_RETRY);
         }
-        match Command::new(&keeper)
-            .arg("trust")
-            .stdin(Stdio::null())
-            .output()
-        {
+        match pf_paths::run_within(
+            Command::new(&keeper)
+                .arg("trust")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            KEEPER_LIMIT,
+        ) {
             Ok(output) if output.status.success() => return Ok(()),
             // STATUS_DLL_NOT_FOUND: a fresh Windows Server has no Visual C++ runtime.
             Ok(output) if output.status.code() == Some(0xC000_0135_u32 as i32) => {
@@ -731,12 +755,15 @@ fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
 }
 
 fn probe() -> Option<(String, [bool; 2])> {
-    let output = Command::new(pf_paths::system32(POWERSHELL))
-        .args(powershell_args(PROBE))
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let output = pf_paths::run_within(
+        Command::new(pf_paths::system32(POWERSHELL))
+            .args(powershell_args(PROBE))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+        QUERY_LIMIT,
+    )
+    .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     tracing::debug!(output = %text.trim(), "seat prerequisite probe");
     parse_probe(&text)
@@ -780,16 +807,20 @@ fn powershell_args(script: &str) -> [&str; 6] {
     ]
 }
 
-/// A System32 tool's exit code, output discarded. `None` when it did not launch.
+/// A System32 tool's exit code, output discarded. `None` when it did not launch or ran past
+/// [`TOOL_LIMIT`].
 pub(super) fn run(tool: &str, args: &[&str]) -> Option<i32> {
-    Command::new(pf_paths::system32(tool))
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?
-        .code()
+    pf_paths::run_within(
+        Command::new(pf_paths::system32(tool))
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        TOOL_LIMIT,
+    )
+    .ok()?
+    .status
+    .code()
 }
 
 fn check(ok: bool, code: &str, met: &str, unmet: &str) -> Diagnostic {
