@@ -361,11 +361,15 @@ impl LinuxBackend {
 
     /// Writes the owner's files again at supervisor start: `/run` is empty after a boot, and the
     /// owner's own host would otherwise start on the box's ports, in the door's way. A host
-    /// already up restarts onto new files; at boot none is up yet.
+    /// already up restarts onto new files; at boot none is up yet. The row is tracked, as
+    /// [`PlatformBackend::adopt`] tracks it, for as long as it exists.
     pub fn prepare_owners(&self, ledger: &Ledger) {
         for seat in ledger.seats.iter().filter(|s| s.owner) {
-            let prepared = accounts::require_owner(&seat.account)
-                .and_then(|passwd| self.prepare_owner(seat, &passwd));
+            let prepared = accounts::require_owner(&seat.account).and_then(|passwd| {
+                let fresh = self.prepare_owner(seat, &passwd)?;
+                self.track(&seat.id, Tracked::of(seat, &passwd));
+                Ok(fresh)
+            });
             match prepared {
                 Ok(true) => user_host(&seat.account, "try-restart"),
                 Ok(false) => {}
