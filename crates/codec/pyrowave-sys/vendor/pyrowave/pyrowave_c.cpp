@@ -1617,6 +1617,17 @@ struct pyrowave_decoder_opaque
 	ChromaSubsampling chroma = {};
 	int width = 0;
 	int height = 0;
+	// PUNKTFUNK: plane views per output set the caller rotates through, wrapped once and
+	// kept. Stable views keep Granite's framebuffer cache hitting; fresh ones made and
+	// destroyed a framebuffer every frame. A set past the last slot replaces the oldest.
+	struct CachedViews
+	{
+		ImageHandle images[3];
+		ImageViewHandle views[3];
+		pyrowave_image_view key[3] = {};
+	};
+	CachedViews view_sets[4];
+	unsigned next_view_set = 0;
 };
 
 bool pyrowave_decoder_device_prefers_fragment_path(pyrowave_device device)
@@ -1711,6 +1722,38 @@ bool pyrowave_decoder_decode_is_ready_with_sideband(pyrowave_decoder decoder, bo
 	                                        active_block_mask, word_count);
 }
 
+// PUNKTFUNK: the decoder's plane views for these planes, from the cache or wrapped now.
+static bool cached_decoder_views(pyrowave_decoder decoder, const pyrowave_gpu_buffers *buffers,
+                                 ViewBuffers &views)
+{
+	pyrowave_decoder_opaque::CachedViews *set = nullptr;
+	for (auto &cached : decoder->view_sets)
+	{
+		bool same = bool(cached.views[0]);
+		for (int i = 0; same && i < 3; i++)
+			same = same_plane(cached.key[i], buffers->planes[i]);
+		if (same)
+			set = &cached;
+	}
+	if (!set)
+	{
+		WrappedViewBuffers fresh = {};
+		if (!fresh.wrap(decoder->device, buffers,
+		                decoder->fragment_path ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_STORAGE_BIT))
+			return false;
+		set = &decoder->view_sets[decoder->next_view_set++ % 4];
+		for (int i = 0; i < 3; i++)
+		{
+			set->images[i] = std::move(fresh.wrapped_images[i]);
+			set->views[i] = std::move(fresh.image_views[i]);
+			set->key[i] = buffers->planes[i];
+		}
+	}
+	for (int i = 0; i < 3; i++)
+		views.planes[i] = set->views[i].get();
+	return true;
+}
+
 pyrowave_result
 pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
                                    const pyrowave_gpu_sync_operation *acquire,
@@ -1724,8 +1767,8 @@ pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
 	auto *device = decoder->device;
 	device->next_frame_context();
 
-	WrappedViewBuffers views = {};
-	if (!views.wrap(device, buffers, decoder->fragment_path ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_STORAGE_BIT))
+	ViewBuffers views = {};
+	if (!cached_decoder_views(decoder, buffers, views))
 		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
 
 	// Just use normal graphics queue here since the result will likely be consumed there.

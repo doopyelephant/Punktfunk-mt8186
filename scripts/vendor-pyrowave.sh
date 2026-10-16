@@ -146,6 +146,9 @@ number is never reused.
   0011-decoder-in-place-payload.patch — the decoder reads packets from a
     buffer the caller owns and wrote them into (set_payload_memory,
     push_packet_in_place) instead of copying each packet twice and uploading it.
+  0012-decoder-cached-plane-views.patch — the decoder keeps the plane views of
+    the four output sets a client rotates through, so the fragment path's
+    framebuffers come from Granite's cache instead of being made every frame.
 
 Retired (upstream carries the fix):
   0006 external-memory consume-on-success-only — Granite b6cffd5c (2026-09-23)
