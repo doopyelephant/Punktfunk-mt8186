@@ -396,7 +396,7 @@ fn service(library: &LibraryShared) -> ServiceState {
         discovered: HashMap::new(),
         probed: Arc::default(),
         probe_inflight: Arc::default(),
-        last_probe: Instant::now(),
+        last_probe: Some(Instant::now()),
         wake_cancel: None,
         pair_gen: Arc::default(),
         rescan: None,
