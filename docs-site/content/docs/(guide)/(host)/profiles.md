@@ -34,9 +34,11 @@ running. **Remove** deletes the profile's Windows account and its files too.
 ### What a seat can do
 
 A seat's desktop is one virtual screen at its player's resolution. It never shows, turns off or
-powers down a monitor of this machine, and a second device on the same seat shares the screen.
-Only the owner's desktop follows **Displays**; of a device's display settings, only **Largest
-screen this device gets** and the scale follow it onto a seat.
+powers down a monitor of this machine. A second device on the same seat shares the screen when
+its **A second device connects** is **Shares the screen**, and is told the seat is busy
+otherwise. Only the owner's desktop follows **Displays**; of a device's display settings, only
+**Largest screen this device gets**, the scale and **A second device connects** follow it onto a
+seat.
 
 Every seat shares one set of **Seats** settings on **Host**, shown while seats are on:
 

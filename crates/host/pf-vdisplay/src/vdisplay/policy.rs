@@ -353,11 +353,13 @@ impl ClientOverlay {
         *self == ClientOverlay::default()
     }
 
-    /// What follows this device onto a seat: its cap and its scale.
+    /// What follows this device onto a seat: its cap, its scale, and whether it shares an
+    /// occupied screen (`on_a_seat`).
     pub fn seat_part(self) -> ClientOverlay {
         ClientOverlay {
             max_mode: self.max_mode,
             scale: self.scale,
+            mode_conflict: self.mode_conflict.map(on_a_seat),
             ..ClientOverlay::default()
         }
     }
@@ -742,19 +744,16 @@ pub struct DisplayPolicyStore {
     contract: bool,
 }
 
-/// The box's `clients` map on a seat host. The box console writes it; the seat re-reads the
-/// box's file when its mtime moves, so an overlay edited there applies to the seat's next
-/// connect.
+/// The box's display policy on a seat host. The box console writes it; the seat re-reads the
+/// box's file when its mtime moves, so a change made there applies to the seat's next connect.
 struct BoxOverlays {
     path: PathBuf,
-    cache: Mutex<(
-        Option<std::time::SystemTime>,
-        BTreeMap<String, ClientOverlay>,
-    )>,
+    cache: Mutex<(Option<std::time::SystemTime>, DisplayPolicy)>,
 }
 
 impl BoxOverlays {
-    fn current(&self) -> BTreeMap<String, ClientOverlay> {
+    /// The box's whole policy: its overlays, and the second-device rule a contract seat takes.
+    fn current(&self) -> DisplayPolicy {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let stamp = std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
@@ -763,7 +762,6 @@ impl BoxOverlays {
             cache.1 = std::fs::read(&self.path)
                 .ok()
                 .and_then(|bytes| DisplayPolicyStore::parse(&self.path, &bytes))
-                .map(|p| p.clients)
                 .unwrap_or_default();
             cache.0 = stamp;
         }
@@ -800,7 +798,7 @@ impl DisplayPolicyStore {
     fn with_box_overlays(mut self, box_file: Option<PathBuf>) -> Self {
         self.box_overlays = box_file.map(|path| BoxOverlays {
             path,
-            cache: Mutex::new((None, BTreeMap::new())),
+            cache: Mutex::new((None, DisplayPolicy::default())),
         });
         self
     }
@@ -810,13 +808,16 @@ impl DisplayPolicyStore {
         self
     }
 
-    /// The contract with the box's per-device cap and scale: those follow a device onto any
-    /// desktop. The rest of an overlay is the owner's desktop's, and never reaches a seat.
+    /// The contract with what follows a device from the box ([`ClientOverlay::seat_part`]). The
+    /// box's own second-device rule applies to a device with none, so a device the door refuses
+    /// for an occupied seat is refused here too, when it dials the seat itself.
     fn contract_policy(&self) -> DisplayPolicy {
         let mut policy = seat_contract();
         if let Some(b) = &self.box_overlays {
-            policy.clients = b
-                .current()
+            let boxed = b.current();
+            policy.mode_conflict = on_a_seat(boxed.effective().mode_conflict);
+            policy.clients = boxed
+                .clients
                 .into_iter()
                 .map(|(fp, o)| (fp, o.seat_part()))
                 .filter(|(_, o)| !o.is_empty())
@@ -827,7 +828,7 @@ impl DisplayPolicyStore {
 
     fn with_box_clients(&self, mut policy: DisplayPolicy) -> DisplayPolicy {
         if let Some(b) = &self.box_overlays {
-            policy.clients = b.current();
+            policy.clients = b.current().clients;
         }
         policy
     }
@@ -1079,10 +1080,20 @@ pub fn prefs() -> &'static DisplayPolicyStore {
     })
 }
 
+/// A second device on a seat's one screen shares it, or is refused: a seat has no screen to
+/// give it, nor an occupant it may stop. The door decides the same before it redirects.
+fn on_a_seat(conflict: ModeConflict) -> ModeConflict {
+    match conflict {
+        ModeConflict::Join => ModeConflict::Join,
+        ModeConflict::Separate | ModeConflict::Steal | ModeConflict::Reject => ModeConflict::Reject,
+    }
+}
+
 /// A seat's desktop (`design/web-console-structure-2026-10.md` §2.1): one virtual screen, the
-/// seat's own. It never mirrors, keeps lit or powers off a real monitor, never routes a game to
-/// a session of its own, and a second device shares the occupant's screen. Linger, topology and
-/// identity stay the unconfigured host's, as they always were on a seat.
+/// seat's own. It never mirrors, keeps lit or powers off a real monitor, and never routes a game
+/// to a session of its own. A second device shares the occupant's screen when the box would let
+/// it join, and is refused otherwise (`contract_policy`). Linger, topology
+/// and identity stay the unconfigured host's, as they always were on a seat.
 pub fn seat_contract() -> DisplayPolicy {
     DisplayPolicy {
         mode_conflict: ModeConflict::Join,
@@ -1728,8 +1739,9 @@ mod tests {
         );
     }
 
-    /// A contract seat never reads its own file, takes only a device's cap and scale from the
-    /// box, refuses every write, and stays unconfigured for linger, topology and identity.
+    /// A contract seat never reads its own file, takes only a device's cap, scale and
+    /// second-device rule from the box, refuses every write, and stays unconfigured for linger,
+    /// topology and identity.
     #[test]
     fn a_contract_seat_ignores_its_file_and_the_owners_policy() {
         let dir = std::env::temp_dir().join(format!("pf-disp-contract-{}", std::process::id()));
@@ -1761,14 +1773,55 @@ mod tests {
         let p = seat.get();
         assert_eq!(p.capture_monitor_for(Some("aa")), None);
         assert!(!p.ddc_power_off && !p.pnp_disable_monitors && p.keep_monitors.is_empty());
+        // The box gives "aa" its own screen, which a seat has none of.
         assert_eq!(
             p.effective_for(Some("aa")).mode_conflict,
-            ModeConflict::Join
+            ModeConflict::Reject
         );
         assert_eq!(p.cap_mode(Some("aa"), (3840, 2160, 120)), (1920, 1080, 60));
         assert!(seat.configured().is_none());
         assert!(seat.set(DisplayPolicy::default()).is_err());
         assert!(seat.update(|_| true).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A device dialing a seat directly gets the door's answer: it shares an occupied seat only
+    /// when the box joins it, by its own overlay or the box's rule, and is refused otherwise.
+    #[test]
+    fn a_contract_seat_joins_only_the_devices_the_box_joins() {
+        let dir = std::env::temp_dir().join(format!("pf-disp-occupied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let seat_on = |name: &str, boxed: &DisplayPolicy| {
+            let box_file = dir.join(name);
+            std::fs::write(&box_file, serde_json::to_vec(boxed).unwrap()).unwrap();
+            DisplayPolicyStore::load_from(dir.join("seat.json"))
+                .with_box_overlays(Some(box_file))
+                .with_contract(true)
+                .get()
+        };
+        let overlay = |conflict| ClientOverlay {
+            mode_conflict: Some(conflict),
+            ..ClientOverlay::default()
+        };
+        let mut boxed = DisplayPolicy::default();
+        boxed
+            .clients
+            .insert("joiner".into(), overlay(ModeConflict::Join));
+        boxed
+            .clients
+            .insert("stealer".into(), overlay(ModeConflict::Steal));
+        let conflict = |p: &DisplayPolicy, fp| p.effective_for(Some(fp)).mode_conflict;
+
+        let p = seat_on("separate.json", &boxed);
+        assert_eq!(conflict(&p, "joiner"), ModeConflict::Join);
+        assert_eq!(conflict(&p, "stealer"), ModeConflict::Reject);
+        assert_eq!(conflict(&p, "anyone"), ModeConflict::Reject);
+
+        boxed.mode_conflict = ModeConflict::Join;
+        let p = seat_on("join.json", &boxed);
+        assert_eq!(conflict(&p, "anyone"), ModeConflict::Join);
+        assert_eq!(conflict(&p, "stealer"), ModeConflict::Reject);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

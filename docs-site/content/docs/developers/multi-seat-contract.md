@@ -126,11 +126,13 @@ session by design, and display activation fails while its session is inactive.
 
 - **The seat contract, not a display policy.** A seat that is not the owner's own reads no
   `display-settings.json` of its own. Its desktop is one virtual screen at the occupant's mode: it
-  never mirrors, keeps lit, powers off or PnP-disables a real monitor, never routes a game to a
-  session of its own, and a second device shares the occupant's screen. Of a device's display
-  settings in the box console only the largest mode and the scale follow it onto a seat. Linger,
-  topology and identity are the unconfigured host's. `GET /display/settings` lists nothing in
-  `enforced` and only `max_mode` and `scale` per device; every display or session settings write
+  never mirrors, keeps lit, powers off or PnP-disables a real monitor, and never routes a game to
+  a session of its own. A second device shares the occupant's screen when the box would join it,
+  by its own `mode_conflict` or the box's, and is refused as busy otherwise, as the door refuses
+  it before a redirect. Of a device's display settings in the box console, the largest mode, the
+  scale and that rule follow it onto a seat. Linger, topology and identity are the unconfigured
+  host's. `GET /display/settings` lists nothing in `enforced` and only `max_mode`, `scale` and
+  `mode_conflict` per device; every display or session settings write
   answers 409.
 - **The Seat defaults.** The box writes `seat-defaults.json` into its config directory at start and
   after each settings change: `end_on_game_exit` (a seat's stream ends when its game exits) and
