@@ -715,21 +715,24 @@ impl SteamSource {
     }
 }
 
-/// The Steam a new seat is cloned from: the lowest-uid ordinary user that has one, read as that
-/// user. A box with several Steam users picks the first; `--steam-source` names another.
+/// `user`'s Steam install, read as `user`.
+pub(super) fn steam_source_of(user: &Passwd) -> Option<SteamSource> {
+    Some(SteamSource {
+        root: steam_root_of(&user.home)?,
+        uid: user.uid,
+        gid: user.gid,
+    })
+}
+
+/// The Steam a new seat is cloned from when no owner row names one: the lowest-uid ordinary user
+/// that has one, read as that user. `--steam-source` names another.
 pub(super) fn find_steam_source(users: &[Passwd]) -> Option<SteamSource> {
     let mut ordinary: Vec<&Passwd> = users
         .iter()
         .filter(|u| (1000..60000).contains(&u.uid) && !u.gecos.starts_with("punktfunk-seat="))
         .collect();
     ordinary.sort_by_key(|u| u.uid);
-    ordinary.into_iter().find_map(|u| {
-        Some(SteamSource {
-            root: steam_root_of(&u.home)?,
-            uid: u.uid,
-            gid: u.gid,
-        })
-    })
+    ordinary.into_iter().find_map(steam_source_of)
 }
 
 /// A Steam under the seat's home, cloned from `source` when there is one, and a library list that
@@ -1232,6 +1235,12 @@ mod tests {
             })
         );
         assert_eq!(find_steam_source(&users[..2]), None);
+        // The owner's row names its user, whose uid is not the lowest.
+        assert_eq!(
+            steam_source_of(&users[2]).map(|source| source.uid),
+            Some(1002)
+        );
+        assert_eq!(steam_source_of(&users[3]), None, "an owner without a Steam");
     }
 
     /// A link where the box's avatar folder should be is refused, and nothing behind it is

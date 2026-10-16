@@ -88,12 +88,13 @@ struct Inner {
     box_dir: PathBuf,
     /// [`STATE_DIR`].
     state: PathBuf,
-    /// The Steam to clone into a new seat; `None` looks for the owner's at provision time.
+    /// The Steam `--steam-source` names; `None` follows the owner row ([`LinuxBackend::steam_source`]).
     steam_source: Option<PathBuf>,
     /// Seats whose unit is up.
     running: Mutex<HashMap<SeatId, Tracked>>,
-    /// The box owner's home, once their row is known: where the box's library comes from.
-    owner_home: Mutex<Option<PathBuf>>,
+    /// The box owner's account, once their row is known: whose home the box's library comes
+    /// from and whose Steam a seat clones.
+    owner: Mutex<Option<accounts::Passwd>>,
     /// The `punktfunk` group's gid, once looked up: the door reads the box's library through it.
     door_gid: OnceLock<u32>,
     /// A seat stopped since the ACL mask was last repaired.
@@ -217,10 +218,11 @@ fn door_reader(inner: &Inner) -> Option<shared::Reader> {
 /// whether anything changed.
 fn refresh_box_library(inner: &Inner) -> Result<bool, BackendError> {
     let home = inner
-        .owner_home
+        .owner
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clone();
+        .as_ref()
+        .map(|owner| owner.home.clone());
     let Some(home) = home else { return Ok(false) };
     match door_reader(inner) {
         Some(reader) => shared::refresh_box_library(&home, &inner.state, reader),
@@ -253,7 +255,7 @@ impl LinuxBackend {
             state,
             steam_source,
             running: Mutex::new(HashMap::new()),
-            owner_home: Mutex::new(None),
+            owner: Mutex::new(None),
             door_gid: OnceLock::new(),
             acl_dirty: AtomicBool::new(false),
             hook: OnceLock::new(),
@@ -346,9 +348,20 @@ impl LinuxBackend {
             .remove(id);
     }
 
+    /// The Steam a seat clones and shows: `--steam-source` when given, else the box owner's, as
+    /// their row records them. Only a box with no owner row looks for the lowest-uid user's.
     fn steam_source(&self) -> Option<shared::SteamSource> {
-        match &self.inner.steam_source {
-            Some(root) => shared::SteamSource::owned(root.clone()),
+        if let Some(root) = &self.inner.steam_source {
+            return shared::SteamSource::owned(root.clone());
+        }
+        let owner = self
+            .inner
+            .owner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match owner {
+            Some(owner) => shared::steam_source_of(&owner),
             None => shared::find_steam_source(&accounts::all().ok()?),
         }
     }
@@ -364,11 +377,7 @@ impl LinuxBackend {
     fn prepare_owner(&self, seat: &Seat, passwd: &accounts::Passwd) -> Result<bool, BackendError> {
         let reader = Tracked::of(seat, passwd).reader;
         shared::refresh_trust(&self.inner.box_dir, &self.inner.state, &seat.id, reader)?;
-        *self
-            .inner
-            .owner_home
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(passwd.home.clone());
+        *self.inner.owner.lock().unwrap_or_else(|e| e.into_inner()) = Some(passwd.clone());
         if let Err(error) = refresh_box_library(&self.inner) {
             tracing::warn!(account = %seat.account, %error, "box library not copied");
         }
@@ -664,11 +673,7 @@ impl PlatformBackend for LinuxBackend {
         self.stop_unit(seat)?;
         self.untrack(&seat.id);
         if seat.owner {
-            *self
-                .inner
-                .owner_home
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = None;
+            *self.inner.owner.lock().unwrap_or_else(|e| e.into_inner()) = None;
             shared::remove_box_library(&self.inner.state)
                 .map_err(|e| err("box_library", format!("remove the box library: {e}")))?;
         }
