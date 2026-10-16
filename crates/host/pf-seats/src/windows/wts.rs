@@ -1,4 +1,4 @@
-//! WTS discovery and exact managed-session teardown.
+//! WTS discovery and managed-session teardown.
 //!
 //! Enumeration copies session IDs and states before releasing WTS memory, then
 //! queries each user and domain through `WTSQuerySessionInformationW`; a session that ends
@@ -6,7 +6,8 @@
 //! local to this computer, and match the complete account name under Windows case rules.
 //! Multiple matches are an error; how long to wait for one is the supervisor's. Disconnected
 //! sessions remain visible to diagnostics but are never returned as display-capable.
-//! Logoff always takes the exact session ID recorded by the supervisor.
+//! Logoff looks the account's session up when it runs, never by an ID recorded earlier: Windows
+//! reuses freed IDs.
 
 use crate::windows::util::{backend_error, computer_name, io_error, WinResult};
 use windows::core::PWSTR;
@@ -87,16 +88,18 @@ pub(super) fn any_for_account(account: &str) -> WinResult<Option<Session>> {
     one_account_session(account, false)
 }
 
+/// Logs off every session of `account`, whatever its state. None is success.
 pub(super) fn logoff_account_if_present(account: &str) -> WinResult<()> {
-    if let Some(session) = one_account_session(account, false)? {
+    for session in sessions_of(account, false)? {
         logoff(session.id)?;
     }
     Ok(())
 }
 
-fn one_account_session(account: &str, active_only: bool) -> WinResult<Option<Session>> {
+/// The non-console local sessions of `account`, and only the active ones when `active_only`.
+fn sessions_of(account: &str, active_only: bool) -> WinResult<Vec<Session>> {
     let machine = computer_name()?;
-    let matches: Vec<_> = enumerate()?
+    Ok(enumerate()?
         .into_iter()
         .filter(|session| {
             (!active_only || session.state == WTSActive)
@@ -104,10 +107,14 @@ fn one_account_session(account: &str, active_only: bool) -> WinResult<Option<Ses
                 && session.user.eq_ignore_ascii_case(account)
                 && (session.domain.is_empty() || session.domain.eq_ignore_ascii_case(&machine))
         })
-        .collect();
+        .collect())
+}
+
+fn one_account_session(account: &str, active_only: bool) -> WinResult<Option<Session>> {
+    let mut matches = sessions_of(account, active_only)?;
     match matches.len() {
         0 => Ok(None),
-        1 => Ok(matches.into_iter().next()),
+        1 => Ok(matches.pop()),
         count => Err(backend_error(
             "wts_ambiguous",
             format!("{count} non-console local sessions match account '{account}'"),
@@ -115,8 +122,8 @@ fn one_account_session(account: &str, active_only: bool) -> WinResult<Option<Ses
     }
 }
 
-pub(super) fn logoff(session_id: u32) -> WinResult<()> {
-    // SAFETY: the caller supplies the exact recorded local WTS session ID; no memory is shared.
+fn logoff(session_id: u32) -> WinResult<()> {
+    // SAFETY: the ID comes from an enumeration made moments ago; no memory is shared.
     unsafe { WTSLogoffSession(None, session_id, true) }
         .map_err(|error| io_error("wts_logoff", "WTSLogoffSession failed", error))
 }

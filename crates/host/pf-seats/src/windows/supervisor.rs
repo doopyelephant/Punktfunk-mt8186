@@ -8,7 +8,7 @@
 //!
 //! Start blocks until the keeper's session is active, the same-session SDR quality gate
 //! has passed and the host holds both ports. A cycle that ends closes the keeper's job
-//! and logs off only the session it recorded. Explicit stop is idempotent and waits for
+//! and logs off the account's session. Explicit stop is idempotent and waits for
 //! that teardown to finish.
 
 use crate::bootstrap::RdpBootstrap;
@@ -347,7 +347,7 @@ struct Rig {
     seat: Seat,
     /// The keeper, then the job that contains it: they drop in that order.
     keeper: Option<(ChildProcess, Job)>,
-    /// The account's session, which the end of the cycle logs off.
+    /// The account's active session, which the cycle's children start in.
     session: Option<u32>,
     launch: Option<Launch>,
     gate: Option<GateRun>,
@@ -628,7 +628,8 @@ impl Rig {
     }
 
     /// End the cycle in this order: the host and the gate, the keeper and its job, then
-    /// the session. A session child ends when its handle drops.
+    /// the account's session. A session child ends when its handle drops. The session is found
+    /// by account: Windows reuses the id this cycle recorded.
     fn end_cycle(&mut self) {
         self.host = None;
         if let (Some(gate), Some(launch)) = (self.gate.take(), &self.launch) {
@@ -637,8 +638,9 @@ impl Rig {
         }
         self.launch = None;
         self.keeper = None;
-        if let Some(session) = self.session.take() {
-            let _ = wts::logoff(session);
+        self.session = None;
+        if let Err(error) = wts::logoff_account_if_present(&self.seat.account) {
+            tracing::warn!(seat = %self.seat.id, %error, "seat session not logged off");
         }
     }
 }
