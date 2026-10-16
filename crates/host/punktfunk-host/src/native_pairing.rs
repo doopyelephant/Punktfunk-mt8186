@@ -452,6 +452,11 @@ impl NativePairing {
         }
     }
 
+    /// Whether `fp_hex` holds a "this session" record, which ends with its last session.
+    pub fn is_session_only(&self, fp_hex: &str) -> bool {
+        self.store.get(fp_hex).is_some_and(|c| c.until_disconnect)
+    }
+
     /// Live sessions for `fp_hex` right now.
     #[cfg(test)]
     pub fn live_sessions(&self, fp_hex: &str) -> u32 {
@@ -485,6 +490,10 @@ impl NativePairing {
     /// this waiter share the `live` lock so a reconnect cannot land between the live
     /// check and the remove. Lock order is live → store → watch.
     async fn drop_session_only_after_grace(&self, fp_hex: &str, last_out: u64) {
+        // A seat host reads the box's store; the box drops the record.
+        if self.store.read_only() {
+            return;
+        }
         tokio::time::sleep(RECONNECT_GRACE).await;
         let removed = {
             let live = self.live.lock().unwrap();

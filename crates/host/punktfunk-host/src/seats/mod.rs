@@ -257,6 +257,11 @@ pub(crate) fn other_client_on_a_seat(fp_hex: &str) -> bool {
     any_on_a_seat(|o| !crate::session_status::is_client(&o.client, fp_hex))
 }
 
+/// Whether `fp_hex` streams on a seat. Blocking, as [`snapshot`].
+pub(crate) fn plays_on_a_seat(fp_hex: &str) -> bool {
+    any_on_a_seat(|o| crate::session_status::is_client(&o.client, fp_hex))
+}
+
 /// A seat host's own config dir, where it keeps its management token.
 fn host_dir(seat: &pf_seats::Seat) -> PathBuf {
     pf_seats::persistence::default_root()

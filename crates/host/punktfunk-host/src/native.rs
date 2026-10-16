@@ -1103,7 +1103,7 @@ pub(crate) async fn run_admitted(
         deadline_unix,
         watch: access_watch,
         at_unix: admit_unix,
-        session: _session,
+        session,
     } = admit(host, session_fp_hex.as_deref(), &conn, &first).await?;
     // Before anything is built for it: an unknown profile closes with no display touched.
     let resolved = match profiles.resolve(session_fp_hex.as_deref(), first.profile.as_deref()) {
@@ -1124,6 +1124,11 @@ pub(crate) async fn run_admitted(
     let placed = place_profile(&conn, &mut send, session_fp_hex.clone(), &first, &resolved).await?;
     profiles.touch(&resolved.id);
     if let Some(served) = placed {
+        if let (Some(guard), Some(fp)) = (session, session_fp_hex) {
+            if np.is_session_only(&fp) {
+                hold_while_on_seat(guard, fp);
+            }
+        }
         return Ok(served);
     }
     let profile_ref = crate::events::ProfileRef {
@@ -1740,6 +1745,40 @@ async fn place_profile(
             anyhow::bail!("seat refused: {reason}");
         }
     }
+}
+
+/// How often a redirected guest's seat is asked whether it still plays there.
+const SEAT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a redirected guest has to show up on its seat: it dials, then the seat brings the
+/// picture up before it lists the session.
+const SEAT_LANDING: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A guest on a "this session" record plays on a seat after the redirect ended the door's own
+/// session. Holds the count until it has played there and left, so the record outlasts the
+/// play and not the redirect. The grace after the last count is the usual one.
+fn hold_while_on_seat(session: crate::native_pairing::SessionCountGuard, fp: String) {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut landed = false;
+        loop {
+            tokio::time::sleep(SEAT_POLL).await;
+            let fp = fp.clone();
+            let here = tokio::task::spawn_blocking(move || crate::seats::plays_on_a_seat(&fp))
+                .await
+                .unwrap_or(false);
+            landed |= here;
+            if hold_over(here, landed, started.elapsed()) {
+                break;
+            }
+        }
+        drop(session);
+    });
+}
+
+/// A redirected guest's hold ends once it is off the seat after playing there, or never came.
+fn hold_over(here: bool, landed: bool, waited: std::time::Duration) -> bool {
+    !here && (landed || waited > SEAT_LANDING)
 }
 
 /// The input thread, and the datagram reader that feeds it client input, mic frames and the
