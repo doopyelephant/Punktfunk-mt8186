@@ -300,8 +300,9 @@ struct RetiredRing {
 }
 
 /// One decode-output plane in device-local memory: STORAGE (compute decode, the native
-/// lane's chroma pass) + SAMPLED (presenter CSC), plus COLOR_ATTACHMENT when the
-/// `fragment` iDWT draws into it. No such memory type is an error.
+/// lane's chroma pass) + SAMPLED (presenter CSC) + TRANSFER_SRC (the native lane's luma
+/// copy), plus COLOR_ATTACHMENT when the `fragment` iDWT draws into it. No such memory
+/// type is an error.
 ///
 /// # Safety
 ///
@@ -314,7 +315,9 @@ unsafe fn make_plane(
     fmt: vk::Format,
     fragment: bool,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
-    let mut usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+    let mut usage = vk::ImageUsageFlags::STORAGE
+        | vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::TRANSFER_SRC;
     if fragment {
         usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
     }
