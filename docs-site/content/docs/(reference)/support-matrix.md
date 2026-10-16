@@ -143,7 +143,8 @@ Each session gets its own display at the client's resolution and refresh rate �
 
 HEVC 4:4:4 means an NVIDIA host, or pick PyroWave. Asking for 4:4:4 is a client setting, off by
 default, on the Linux, Windows and Apple clients; Android has none, and GameStream sessions are
-always 4:2:0. See [Client settings](/docs/client-settings#video).
+4:2:0 except [PyroWave from a Moonlight fork](/docs/pyrowave#from-a-moonlight-client). See
+[Client settings](/docs/client-settings#video).
 
 ### How the host picks a backend
 
@@ -188,7 +189,7 @@ decoders, with openh264 and rav1d as the software floor on the desktop.
 | Steam Deck (Decky) | as Linux desktop ⁵ | H.264, HEVC, AV1 ² | ✅ | ⚠️ ⁴ |
 | macOS · iOS · tvOS | VideoToolbox; Metal for PyroWave ⁶ | H.264, HEVC, AV1 ⁶ | ⚠️ ⁷ | ⚠️ ⁸ |
 | Android · Android TV | MediaCodec; Vulkan for PyroWave ⁹ | H.264, HEVC, AV1 ¹⁰ | ⚠️ ⁷ | ❌ |
-| Moonlight | your Moonlight app's | negotiated | ⚠️ ¹¹ | ❌ |
+| Moonlight | your Moonlight app's | negotiated | ⚠️ ¹¹ | ⚠️ ¹³ |
 | LG webOS · browser | ❓ ¹² | ❓ | ❓ | ❓ |
 
 1. Linux tries Vulkan Video first wherever it decodes the codec, then VAAPI (skipped on NVIDIA),
@@ -222,6 +223,8 @@ decoders, with openh264 and rav1d as the software floor on the desktop.
 10. H.264 and HEVC are assumed; AV1 is probed.
 11. The host offers HDR to Moonlight only when it can deliver it. See [Moonlight](/docs/moonlight).
 12. Separate repositories; ask those projects.
+13. PyroWave only, from a Moonlight fork that asks for it. See
+    [PyroWave](/docs/pyrowave#from-a-moonlight-client).
 
 ## Clients and features
 

@@ -686,6 +686,7 @@ mod session_tests {
                 packet_size: 1024,
                 bitrate_kbps: 20_000,
                 codec: crate::encode::Codec::H265,
+                chroma: crate::encode::ChromaFormat::Yuv420,
                 min_fec: 0,
                 hdr: false,
                 slices: 1, // no-request default; hardware decoders get single-slice AUs

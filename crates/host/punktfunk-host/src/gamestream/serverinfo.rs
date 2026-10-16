@@ -93,8 +93,8 @@ fn host_mac(reached: Option<std::net::IpAddr>) -> Option<String> {
 
 /// `<ServerCodecModeSupport>`: SDR baseline ([`base_codec_mode_support`]) plus each
 /// codec's 10-bit bit the host can actually deliver ([`apply_hdr`] /
-/// [`crate::gamestream::host_hdr_capable`]). Moonlight offers its HDR toggle only
-/// when a 10-bit bit is set.
+/// [`crate::gamestream::host_hdr_capable`]), plus PyroWave's profiles where its encoder
+/// exists ([`pyrowave_modes`]). Moonlight offers its HDR toggle only when a 10-bit bit is set.
 pub(super) fn codec_mode_support() -> u32 {
     use crate::encode::Codec;
     let hdr = crate::gamestream::host_hdr_capable();
@@ -102,7 +102,31 @@ pub(super) fn codec_mode_support() -> u32 {
         base_codec_mode_support(),
         hdr && crate::encode::can_encode_10bit(Codec::H265),
         hdr && crate::encode::can_encode_10bit(Codec::Av1),
+    ) | pyrowave_modes(
+        // The native plane's PyroWave bit: built in and not on the software backend.
+        crate::encode::host_wire_caps() & punktfunk_core::quic::CODEC_PYROWAVE != 0,
+        pf_host_config::config().four_four_four,
+        hdr && crate::encode::can_encode_10bit(Codec::PyroWave),
     )
+}
+
+/// Pure so tests can pin the PyroWave bits without a GPU. `chroma_444` is the host's 4:4:4
+/// policy row.
+fn pyrowave_modes(available: bool, chroma_444: bool, ten_bit: bool) -> u32 {
+    if !available {
+        return 0;
+    }
+    let mut m = super::SCM_PYROWAVE;
+    if chroma_444 {
+        m |= super::SCM_PYROWAVE_444;
+    }
+    if ten_bit {
+        m |= super::SCM_PYROWAVE_HDR10;
+        if chroma_444 {
+            m |= super::SCM_PYROWAVE_HDR10_444;
+        }
+    }
+    m
 }
 
 /// Pure so tests can pin HDR layering without a GPU.
@@ -204,6 +228,29 @@ mod tests {
         assert_eq!(
             apply_hdr(SCM_H264 | SCM_HEVC, true, true),
             SCM_H264 | SCM_HEVC | SCM_HEVC_MAIN10
+        );
+    }
+
+    /// HDR10 needs 10-bit capability, 4:4:4 the host's policy; 8-bit 4:2:0 rides on
+    /// availability alone.
+    #[test]
+    fn pyrowave_modes_layer_hdr10_on_availability() {
+        use crate::gamestream::{
+            SCM_PYROWAVE, SCM_PYROWAVE_444, SCM_PYROWAVE_HDR10, SCM_PYROWAVE_HDR10_444,
+        };
+        assert_eq!(pyrowave_modes(false, true, true), 0);
+        assert_eq!(pyrowave_modes(true, false, false), SCM_PYROWAVE);
+        assert_eq!(
+            pyrowave_modes(true, true, false),
+            SCM_PYROWAVE | SCM_PYROWAVE_444
+        );
+        assert_eq!(
+            pyrowave_modes(true, false, true),
+            SCM_PYROWAVE | SCM_PYROWAVE_HDR10
+        );
+        assert_eq!(
+            pyrowave_modes(true, true, true),
+            SCM_PYROWAVE | SCM_PYROWAVE_444 | SCM_PYROWAVE_HDR10 | SCM_PYROWAVE_HDR10_444
         );
     }
 

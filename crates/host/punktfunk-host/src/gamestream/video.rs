@@ -77,13 +77,23 @@ fn next_iv() -> [u8; 12] {
     iv
 }
 
+/// Largest access unit the wire addresses at `packet_size`: [`MAX_FEC_BLOCKS`] blocks of
+/// [`MAX_DATA_SHARDS_PER_BLOCK`] data shards. The packetizer drops a larger one.
+pub fn max_frame_bytes(packet_size: usize) -> usize {
+    MAX_FEC_BLOCKS * MAX_DATA_SHARDS_PER_BLOCK * payload_per_shard(packet_size) - FRAME_HEADER
+}
+
+/// `pps` divides in `packetize`; 0 panics. Tiny `packet_size` (≤16) underflows or yields
+/// pps==0. `stream_config` already rejects that; `.max(1)` cannot panic.
+fn payload_per_shard(packet_size: usize) -> usize {
+    (packet_size + 16).saturating_sub(SHARD_HEADER).max(1)
+}
+
 impl VideoPacketizer {
     pub fn new(packet_size: usize, fec_percentage: u8, min_fec: u8) -> Self {
         VideoPacketizer {
             packet_size,
-            // `pps` divides in `packetize`; 0 panics. Tiny `packet_size` (≤16) underflows or
-            // yields pps==0. `stream_config` already rejects that; `.max(1)` cannot panic.
-            payload_per_shard: (packet_size + 16).saturating_sub(SHARD_HEADER).max(1),
+            payload_per_shard: payload_per_shard(packet_size),
             fec_percentage: fec_percentage as usize,
             min_fec: min_fec as usize,
             frame_index: 0,
@@ -442,9 +452,13 @@ mod tests {
         let au = vec![0u8; (MAX_FEC_BLOCKS * MAX_DATA_SHARDS_PER_BLOCK + 1) * pps];
         assert!(pk.packetize(&au, FrameType::Idr, 0, None).is_empty());
 
-        // Just inside the limit still ships, and every block stays addressable.
+        // `max_frame_bytes` is the boundary: one byte over drops, the limit itself ships with
+        // every block addressable.
         let mut pk = VideoPacketizer::new(64, 20, 2);
-        let au = vec![0u8; MAX_FEC_BLOCKS * MAX_DATA_SHARDS_PER_BLOCK * pps - FRAME_HEADER];
+        let au = vec![0u8; max_frame_bytes(64) + 1];
+        assert!(pk.packetize(&au, FrameType::Idr, 0, None).is_empty());
+        let mut pk = VideoPacketizer::new(64, 20, 2);
+        let au = vec![0u8; max_frame_bytes(64)];
         let pkts = pk.packetize(&au, FrameType::Idr, 0, None);
         assert!(!pkts.is_empty());
         for p in &pkts {

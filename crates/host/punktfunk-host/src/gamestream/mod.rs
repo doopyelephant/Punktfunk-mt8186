@@ -158,6 +158,21 @@ pub const SCM_HEVC_MAIN10: u32 = 0x0000_0200;
 pub const SCM_AV1_MAIN8: u32 = 0x0001_0000;
 #[cfg_attr(not(feature = "gamestream"), allow(dead_code, reason = "compat plane"))]
 pub const SCM_AV1_MAIN10: u32 = 0x0002_0000;
+/// PyroWave profile bits of the GameStream PyroWave extension Moonlight forks speak: 8-bit
+/// 4:2:0, 8-bit 4:4:4, 10-bit 4:2:0 and 10-bit 4:4:4. Clients select PyroWave only on an
+/// explicit user choice.
+#[cfg_attr(not(feature = "gamestream"), allow(dead_code, reason = "compat plane"))]
+pub const SCM_PYROWAVE: u32 = 0x0080_0000;
+#[cfg_attr(not(feature = "gamestream"), allow(dead_code, reason = "compat plane"))]
+pub const SCM_PYROWAVE_444: u32 = 0x0100_0000;
+#[cfg_attr(not(feature = "gamestream"), allow(dead_code, reason = "compat plane"))]
+pub const SCM_PYROWAVE_HDR10: u32 = 0x0200_0000;
+#[cfg_attr(not(feature = "gamestream"), allow(dead_code, reason = "compat plane"))]
+pub const SCM_PYROWAVE_HDR10_444: u32 = 0x0400_0000;
+/// First 8 hex digits of the vendored pyrowave commit (`pyrowave-sys/vendor/pyrowave/
+/// PUNKTFUNK-VENDOR.txt`). The bitstream has no version field; clients compare this.
+#[cfg_attr(not(feature = "gamestream"), allow(dead_code, reason = "compat plane"))]
+pub const PYROWAVE_BITSTREAM_ID: &str = "c0b997f8";
 /// SDR baseline: H.264 + HEVC Main + AV1 Main 8-bit. HEVC Main10 is layered at runtime by
 /// `serverinfo::codec_mode_support` only when [`host_hdr_capable`] is true — a non-HDR host
 /// must not advertise a mode it cannot produce. 4:4:4 stays off; stock Moonlight is 4:2:0.

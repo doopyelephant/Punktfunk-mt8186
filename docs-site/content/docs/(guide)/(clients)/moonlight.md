@@ -68,7 +68,8 @@ An `apps.json` in the host's config directory replaces that list, **Desktop** in
 
 ## Tips
 
-- **Codec:** HEVC is a good default; AV1 works if your client decodes it.
+- **Codec:** HEVC is a good default; AV1 works if your client decodes it. A Moonlight fork with
+  [PyroWave](/docs/pyrowave#from-a-moonlight-client) can use it on a wired link.
 - **HDR:** Moonlight offers HDR only when the host can [capture and encode it](/docs/hdr#the-chain).
   Pick HEVC or AV1; H.264 stays SDR.
 - **Bitrate:** the number covers video and error correction together. Start moderate and raise it.

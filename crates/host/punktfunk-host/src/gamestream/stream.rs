@@ -37,6 +37,8 @@ pub struct StreamConfig {
     pub packet_size: usize,
     pub bitrate_kbps: u32,
     pub codec: Codec,
+    /// 4:4:4 only for a PyroWave client that asked (`chromaSamplingType=1`); else 4:2:0.
+    pub chroma: encode::ChromaFormat,
     /// Client's `x-nv-vqos[0].fec.minRequiredFecPackets` — parity floor per FEC block.
     pub min_fec: u8,
     /// Client asked for HDR (`dynamicRangeMode != 0`) and the host can deliver it.
@@ -191,7 +193,7 @@ pub fn start(
                         ..crate::session_status::SessionControls::open()
                     },
                     bit_depth: if cfg.hdr { 10 } else { 8 },
-                    chroma: crate::encode::ChromaFormat::Yuv420,
+                    chroma: cfg.chroma,
                     counters: counters.clone(),
                     // The launch owner's address: what the console pairs with a native
                     // session sharing the same client.
@@ -840,15 +842,15 @@ fn gs_capture_output(
     Ok(capturer)
 }
 
-/// Shared [`SessionPlan`](crate::session_plan::SessionPlan) at this plane's shape: 4:2:0 (stock
-/// Moonlight cannot decode 4:4:4), depth 10 only with HDR, no cursor-forward (GameStream has no
-/// client cursor channel), and exactly the slices the client asked for: a TV decoder wedges on
-/// more.
+/// Shared [`SessionPlan`](crate::session_plan::SessionPlan) at this plane's shape: 4:2:0 unless
+/// PyroWave negotiated 4:4:4 (stock Moonlight cannot decode it), depth 10 only with HDR, no
+/// cursor-forward (GameStream has no client cursor channel), and exactly the slices the client
+/// asked for: a TV decoder wedges on more.
 fn gs_session_plan(cfg: &StreamConfig, cursor_blend: bool) -> crate::session_plan::SessionPlan {
     crate::session_plan::SessionPlan::resolve(
         if cfg.hdr { 10 } else { 8 },
         cfg.hdr,
-        encode::ChromaFormat::Yuv420,
+        cfg.chroma,
         cfg.codec,
         cursor_blend,
         false,
@@ -1321,7 +1323,7 @@ fn stream_body(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
-    let enc_bps = gs_encoder_bps(cfg.bitrate_kbps, fec_pct, cfg.packet_size);
+    let enc_bps = gs_encoder_bps(&cfg, cfg.bitrate_kbps, fec_pct);
     // Compositors emit on damage; re-encode the last frame or a static desktop starves the client.
     let target_fps = cfg.fps.clamp(1, 240);
     let frame_interval = Duration::from_secs_f64(1.0 / target_fps as f64);
@@ -2061,11 +2063,7 @@ impl GsLoop<'_> {
         if !self.adapt.step(lost_delta) {
             return;
         }
-        let new_enc = gs_encoder_bps(
-            self.adapt.budget_kbps,
-            self.adapt.fec_pct,
-            self.cfg.packet_size,
-        );
+        let new_enc = gs_encoder_bps(&self.cfg, self.adapt.budget_kbps, self.adapt.fec_pct);
         if self.video.enc.reconfigure_bitrate(new_enc) {
             self.enc_bps = new_enc;
             self.fec_pct_live
@@ -2090,15 +2088,21 @@ impl GsLoop<'_> {
 }
 
 /// [`encoder_bps_for_budget`] under the client's wire budget, `packetSize + 16 − 32` payload
-/// bytes a packet. No audio reservation: Moonlight's bitrate is video-only.
-fn gs_encoder_bps(bitrate_kbps: u32, fec_pct: u8, packet_size: usize) -> u64 {
-    encoder_bps_for_budget(
+/// bytes a packet. No audio reservation: Moonlight's bitrate is video-only. PyroWave codes
+/// every frame to rate ÷ fps, so its rate stops where a frame would outgrow the wire.
+fn gs_encoder_bps(cfg: &StreamConfig, bitrate_kbps: u32, fec_pct: u8) -> u64 {
+    let bps = encoder_bps_for_budget(
         bitrate_kbps,
         0,
         fec_pct,
-        (packet_size + 16).saturating_sub(32),
+        (cfg.packet_size + 16).saturating_sub(32),
         WireFraming::Moonlight,
-    )
+    );
+    if cfg.codec != Codec::PyroWave {
+        return bps;
+    }
+    let frame_cap = super::video::max_frame_bytes(cfg.packet_size) as u64;
+    bps.min(frame_cap * 8 * u64::from(cfg.fps.max(1)))
 }
 
 /// `PUNKTFUNK_GAMESTREAM_ADAPT` off pins the GameStream plane's loss adaptation off — FEC
@@ -2342,6 +2346,7 @@ mod tests {
             packet_size: 1392,
             bitrate_kbps: 20_000,
             codec: Codec::H265,
+            chroma: encode::ChromaFormat::Yuv420,
             min_fec: 0,
             hdr,
             slices,
@@ -2365,7 +2370,8 @@ mod tests {
     #[test]
     fn encoder_rate_fits_inside_the_wire_budget() {
         // 20 Mbps, 20 % FEC, packetSize 1392: enc = 20e6 × 1376/1408 × 100/120.
-        let enc = gs_encoder_bps(20_000, 20, 1392);
+        let hevc = cfg(1, false);
+        let enc = gs_encoder_bps(&hevc, 20_000, 20);
         assert_eq!(enc, 16_287_878);
         let wire = enc * 1408 / 1376 * 120 / 100;
         assert!(wire <= 20_000_000, "wire {wire} exceeds the 20 Mbps budget");
@@ -2373,8 +2379,26 @@ mod tests {
             wire >= 19_800_000,
             "wire {wire} leaves more than 1 % of the budget unused"
         );
-        assert_eq!(gs_encoder_bps(20_000, 0, 1392), 20_000_000 * 1376 / 1408);
-        assert_eq!(gs_encoder_bps(0, 20, 1392), 500_000);
+        assert_eq!(gs_encoder_bps(&hevc, 20_000, 0), 20_000_000 * 1376 / 1408);
+        assert_eq!(gs_encoder_bps(&hevc, 0, 20), 500_000);
+    }
+
+    /// PyroWave's frame is rate ÷ fps, so its rate stops at the largest frame the wire carries
+    /// (1 Gbps at 60 fps would drop every frame); H.26x keeps the whole budget.
+    #[test]
+    fn pyrowave_rate_stops_at_the_wire_frame_ceiling() {
+        let hevc = cfg(1, false);
+        let pyro = StreamConfig {
+            codec: Codec::PyroWave,
+            ..hevc
+        };
+        let cap = super::super::video::max_frame_bytes(1392) as u64 * 8 * 60;
+        assert_eq!(gs_encoder_bps(&pyro, 1_000_000, 20), cap);
+        assert!(gs_encoder_bps(&hevc, 1_000_000, 20) > cap);
+        assert_eq!(
+            gs_encoder_bps(&pyro, 20_000, 20),
+            gs_encoder_bps(&hevc, 20_000, 20)
+        );
     }
 
     /// FEC climbs fast and decays slow; budget de-rates only under sustained loss.

@@ -246,6 +246,10 @@ fn handle_request(req: &Request, state: &Arc<AppState>, peer: Option<SocketAddr>
                 );
                 return response_status("415 Unsupported Media Type", &req.cseq, &[], None);
             }
+            if let Some(why) = pyrowave_refusal(&map, super::serverinfo::codec_mode_support()) {
+                tracing::warn!(why, "RTSP ANNOUNCE — refused PyroWave");
+                return response_status("400 Bad Request", &req.cseq, &[], None);
+            }
             match stream_config(&map) {
                 Some(cfg) => {
                     tracing::info!(?cfg, "RTSP ANNOUNCE — negotiated stream config");
@@ -580,6 +584,14 @@ fn describe_sdp(codecs: u32) -> String {
     if codecs & super::SCM_AV1_MAIN8 != 0 {
         lines.push("a=rtpmap:98 AV1/90000".into());
     }
+    // Capability marker only; no RTP payload type 99 is ever sent.
+    if codecs & super::SCM_PYROWAVE != 0 {
+        lines.push("a=rtpmap:99 PYROWAVE/90000".into());
+        lines.push(format!(
+            "a=x-ss-pyrowave.bitstream:{}",
+            super::PYROWAVE_BITSTREAM_ID
+        ));
+    }
     // Client takes the first `surround-params=<channelCount>` as normal and
     // a second as HQ, so normal must precede HQ. Stereo lines are Sunshine
     // parity; 2-channel clients hardcode 21101. See `audio::surround_params`.
@@ -630,12 +642,21 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         .or_else(|| parse_u("x-nv-vqos[0].bw.maximumBitrateKbps").filter(|&b| b > 0))
         .unwrap_or(20_000)
         .min(MAX_BITRATE_KBPS);
-    // moonlight-common-c SdpGenerator.c: 0=H264, 1=HEVC, 2=AV1.
+    // moonlight-common-c SdpGenerator.c: 0=H264, 1=HEVC, 2=AV1; 3=PyroWave (Moonlight forks).
     let codec = match map.get("x-nv-vqos[0].bitStreamFormat").map(|s| s.trim()) {
         Some("1") => Codec::H265,
         Some("2") => Codec::Av1,
+        Some("3") => Codec::PyroWave,
         _ => Codec::H264,
     };
+    // Stock Moonlight cannot decode 4:4:4; only PyroWave clients ask for it here, and
+    // `pyrowave_refusal` already turned away a 4:4:4 ask this host cannot serve.
+    let chroma =
+        if codec == Codec::PyroWave && parse_u("x-ss-video[0].chromaSamplingType") == Some(1) {
+            crate::encode::ChromaFormat::Yuv444
+        } else {
+            crate::encode::ChromaFormat::Yuv420
+        };
     // Moonlight sets `dynamicRangeMode != 0` when it saw Main10 and the user
     // enabled HDR. Honor only if `host_hdr_capable`; otherwise 8-bit SDR.
     let hdr_requested = parse_u("x-nv-video[0].dynamicRangeMode").unwrap_or(0) != 0;
@@ -770,11 +791,48 @@ fn stream_config(map: &HashMap<String, String>) -> Option<StreamConfig> {
         packet_size,
         bitrate_kbps,
         codec,
+        chroma,
         min_fec,
         hdr,
         slices,
         encrypt_video,
     })
+}
+
+/// Why a PyroWave ANNOUNCE (`bitStreamFormat=3`) cannot be served, or `None`. The driver
+/// emits record-framed AUs only, so a client must parse record framing; length-prefixed
+/// clients and the retired compression/Hybrid transports are refused. The client's decoder
+/// is fixed at the chroma it asked for, so a 4:4:4 ask the host cannot serve is refused too:
+/// 4:2:0 in its place would decode nothing.
+fn pyrowave_refusal(map: &HashMap<String, String>, host_codecs: u32) -> Option<&'static str> {
+    if map.get("x-nv-vqos[0].bitStreamFormat").map(|s| s.trim()) != Some("3") {
+        return None;
+    }
+    let parse_u = |k: &str| map.get(k).and_then(|s| s.trim().parse::<u32>().ok());
+    if host_codecs & super::SCM_PYROWAVE == 0 {
+        return Some("this host does not encode PyroWave");
+    }
+    let record_framing = map.contains_key("x-ss-video[0].pyrowaveAdaptiveFec")
+        || parse_u("x-ss-video[0].pyrowaveFeatures").unwrap_or(0) & 0x1 != 0;
+    if !record_framing {
+        return Some("client does not parse PyroWave record framing");
+    }
+    if parse_u("x-ss-video[0].pyrowaveCompression").unwrap_or(0) != 0
+        || parse_u("x-ss-video[0].pyrowaveHybrid").unwrap_or(0) != 0
+    {
+        return Some("PyroWave compression/Hybrid transports are not supported");
+    }
+    if parse_u("x-ss-video[0].chromaSamplingType") == Some(1) {
+        if host_codecs & super::SCM_PYROWAVE_444 == 0 {
+            return Some("4:4:4 is off on this host");
+        }
+        let width = parse_u("x-nv-video[0].clientViewportWd").unwrap_or(0);
+        let height = parse_u("x-nv-video[0].clientViewportHt").unwrap_or(0);
+        if !crate::encode::pyrowave_mode_fits_rdo(width, height, true) {
+            return Some("this mode is too large for PyroWave 4:4:4");
+        }
+    }
+    None
 }
 
 /// ANNOUNCE → [`audio::AudioParams`]. moonlight-common-c `SdpGenerator.c`:
@@ -883,6 +941,7 @@ mod tests {
             (Some("0"), Codec::H264),
             (Some("1"), Codec::H265),
             (Some("2"), Codec::Av1),
+            (Some("3"), Codec::PyroWave),
             (None, Codec::H264),
         ] {
             let map = match fmt {
@@ -894,6 +953,94 @@ mod tests {
             assert_eq!((cfg.width, cfg.height, cfg.fps), (1920, 1080, 120));
             assert_eq!(cfg.bitrate_kbps, 40_000);
         }
+    }
+
+    /// 4:4:4 only for PyroWave; stock Moonlight HEVC stays 4:2:0 whatever it sends.
+    #[test]
+    fn announce_pyrowave_chroma() {
+        use crate::encode::ChromaFormat;
+        let pw444 = announce(&[
+            ("x-nv-vqos[0].bitStreamFormat", "3"),
+            ("x-ss-video[0].chromaSamplingType", "1"),
+        ]);
+        assert_eq!(stream_config(&pw444).unwrap().chroma, ChromaFormat::Yuv444);
+        let pw420 = announce(&[("x-nv-vqos[0].bitStreamFormat", "3")]);
+        assert_eq!(stream_config(&pw420).unwrap().chroma, ChromaFormat::Yuv420);
+        let hevc444 = announce(&[
+            ("x-nv-vqos[0].bitStreamFormat", "1"),
+            ("x-ss-video[0].chromaSamplingType", "1"),
+        ]);
+        assert_eq!(
+            stream_config(&hevc444).unwrap().chroma,
+            ChromaFormat::Yuv420
+        );
+    }
+
+    /// Clients reject a mismatched ID, so a vendor bump must move the advertised one.
+    #[test]
+    fn pyrowave_bitstream_id_tracks_vendored_commit() {
+        let vendor =
+            include_str!("../../../../codec/pyrowave-sys/vendor/pyrowave/PUNKTFUNK-VENDOR.txt");
+        let commit = vendor
+            .lines()
+            .find_map(|l| l.strip_prefix("pyrowave:"))
+            .map(str::trim)
+            .expect("PUNKTFUNK-VENDOR.txt names the pyrowave commit");
+        assert!(commit.starts_with(super::super::PYROWAVE_BITSTREAM_ID));
+    }
+
+    #[test]
+    fn announce_pyrowave_refusals() {
+        use super::super::{SCM_H264, SCM_PYROWAVE, SCM_PYROWAVE_444};
+        let host = SCM_H264 | SCM_PYROWAVE;
+        let record = announce(&[
+            ("x-nv-vqos[0].bitStreamFormat", "3"),
+            ("x-ss-video[0].pyrowaveFeatures", "1"),
+        ]);
+        assert_eq!(pyrowave_refusal(&record, host), None);
+        let adaptive_fec = announce(&[
+            ("x-nv-vqos[0].bitStreamFormat", "3"),
+            ("x-ss-video[0].pyrowaveAdaptiveFec", "0"),
+        ]);
+        assert_eq!(pyrowave_refusal(&adaptive_fec, host), None);
+        assert!(
+            pyrowave_refusal(&record, SCM_H264).is_some(),
+            "host without PyroWave"
+        );
+        let length_prefixed = announce(&[("x-nv-vqos[0].bitStreamFormat", "3")]);
+        assert!(pyrowave_refusal(&length_prefixed, host).is_some());
+        let compressed = announce(&[
+            ("x-nv-vqos[0].bitStreamFormat", "3"),
+            ("x-ss-video[0].pyrowaveFeatures", "1"),
+            ("x-ss-video[0].pyrowaveCompression", "1"),
+        ]);
+        assert!(pyrowave_refusal(&compressed, host).is_some());
+        let hevc = announce(&[("x-nv-vqos[0].bitStreamFormat", "1")]);
+        assert_eq!(pyrowave_refusal(&hevc, SCM_H264), None);
+
+        let ask_444 = |w: &str, h: &str| {
+            announce(&[
+                ("x-nv-vqos[0].bitStreamFormat", "3"),
+                ("x-ss-video[0].pyrowaveFeatures", "1"),
+                ("x-ss-video[0].chromaSamplingType", "1"),
+                ("x-nv-video[0].clientViewportWd", w),
+                ("x-nv-video[0].clientViewportHt", h),
+            ])
+        };
+        let host_444 = host | SCM_PYROWAVE_444;
+        assert!(
+            pyrowave_refusal(&ask_444("1920", "1080"), host).is_some(),
+            "4:4:4 policy off"
+        );
+        assert!(
+            pyrowave_refusal(&ask_444("7680", "4320"), host_444).is_some(),
+            "8K 4:4:4 overflows the rate controller's block index"
+        );
+        // A build without the PyroWave encoder fits no mode.
+        assert_eq!(
+            pyrowave_refusal(&ask_444("1920", "1080"), host_444).is_none(),
+            crate::encode::pyrowave_mode_fits_rdo(1920, 1080, true)
+        );
     }
 
     /// `configuredBitrateKbps` wins over the legacy max (Moonlight floors that
@@ -1243,6 +1390,13 @@ mod tests {
             "HEVC indicator"
         );
         assert!(sdp.contains("a=rtpmap:98 AV1/90000"), "AV1 indicator");
+        assert!(!sdp.contains("PYROWAVE"), "no PyroWave without its bit");
+        let pw = describe_sdp(super::super::SCM_H264 | super::super::SCM_PYROWAVE);
+        assert!(pw.contains("a=rtpmap:99 PYROWAVE/90000"));
+        assert!(pw.contains(&format!(
+            "a=x-ss-pyrowave.bitstream:{}",
+            super::super::PYROWAVE_BITSTREAM_ID
+        )));
         for params in [
             "21101",       // stereo; 2-channel clients hardcode this
             "642012453",   // 5.1 normal, pre-rotated for GFE-order swap

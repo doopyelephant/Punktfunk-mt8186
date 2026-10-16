@@ -37,6 +37,17 @@ The Apple and Android apps and the controller UI list it only when the device ca
 A session whose host or device can't run it falls back to HEVC. The
 [stats overlay](/docs/stats) names `PyroWave` as the codec while it runs.
 
+## From a Moonlight client
+
+A host that supports PyroWave also offers it to Moonlight forks that support it: pick it in the
+fork's codec setting.
+
+- The fork's bitrate sets the rate, up to the largest frame a Moonlight stream can carry. That
+  limit binds at 60 fps and high bitrates.
+- 4:4:4 needs **Full color 4:4:4** on in the
+  [host settings](/docs/configuration#settings-in-the-web-console). The host refuses a 4:4:4
+  request it can't serve, 8K-class modes included, because the fork can't decode 4:2:0 instead.
+
 ## Bits per pixel
 
 PyroWave has no quality setting of its own: its encoder fills each frame's byte budget exactly.
