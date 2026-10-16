@@ -227,6 +227,7 @@ impl LatchClock {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn anchor_ns(&self) -> u64 {
         self.anchor_ns
     }
@@ -489,9 +490,17 @@ pub(crate) struct SourcePacer {
 }
 
 impl SourcePacer {
+    /// The hold covers the late tail as well as the MAD; `PUNKTFUNK_PACE_TAIL=0` keeps it
+    /// at the MAD alone (the A/B, and the way out on a link that reads otherwise).
     pub(crate) fn new() -> SourcePacer {
+        SourcePacer::with_policy(pf_client_core::env_on("PUNKTFUNK_PACE_TAIL") != Some(false))
+    }
+
+    pub(crate) fn with_policy(tail_cushion: bool) -> SourcePacer {
+        let mut clock = CadenceClock::new(CadenceTuning::snapping());
+        clock.set_tail_cushion(tail_cushion);
         SourcePacer {
-            clock: CadenceClock::new(CadenceTuning::snapping()),
+            clock,
             mode: PaceMode::Snap,
         }
     }
@@ -1209,6 +1218,29 @@ mod tests {
         assert!(
             !p.paces_latency(),
             "a fixed verdict returns the latency intent to arrival"
+        );
+    }
+
+    /// `PUNKTFUNK_PACE_TAIL=1` reaches the clock: a late frame widens the hold.
+    #[test]
+    fn the_tail_policy_widens_the_hold_after_a_late_frame() {
+        let mut tail = SourcePacer::with_policy(true);
+        let mut plain = SourcePacer::with_policy(false);
+        for p in [&mut tail, &mut plain] {
+            fold(p, true, 200);
+            let k = 200u64;
+            p.due_ns(
+                true,
+                SRC_PTS0 + k * SRC_P as u64,
+                SRC_READY0 + k * SRC_P as u64 + 5_000_000,
+                SRC_P,
+            );
+        }
+        assert!(
+            tail.health().cushion_ns > plain.health().cushion_ns + 3_000_000,
+            "tail {} vs plain {}",
+            tail.health().cushion_ns,
+            plain.health().cushion_ns
         );
     }
 

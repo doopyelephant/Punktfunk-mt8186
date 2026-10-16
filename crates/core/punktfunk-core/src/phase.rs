@@ -164,6 +164,8 @@ pub struct CadenceHealth {
     pub skew_ns: i64,
     pub jitter_ns: i64,
     pub cushion_ns: i64,
+    /// Decaying maximum of late arrival past the offset; the tail cushion's input.
+    pub tail_ns: i64,
 }
 
 /// Type-2 playout: due time is `src_pts + offset + cushion` on the source
@@ -184,6 +186,11 @@ pub struct CadenceClock {
     skew_ns: i64,
     /// EMA of |residual|, the cushion's input.
     mad_ns: i64,
+    /// Decaying maximum of late arrival (positive residual): a link whose jitter has a
+    /// long tail needs the hold sized from the tail, not the typical frame.
+    tail_ns: i64,
+    /// Cushion covers `tail_ns` too, not only a multiple of the MAD.
+    tail_cushion: bool,
     /// `None` until the first sample anchors the loop.
     last_pts_ns: Option<u64>,
     /// Last interval seen, so [`cushion_ns`](Self::cushion_ns) can apply its ceiling.
@@ -198,10 +205,17 @@ impl CadenceClock {
             offset_ns: 0,
             skew_ns: 0,
             mad_ns: 0,
+            tail_ns: 0,
+            tail_cushion: false,
             last_pts_ns: None,
             frame_interval_ns: 0,
             health: CadenceHealth::default(),
         }
+    }
+
+    /// Size the cushion from the late tail as well as the MAD.
+    pub fn set_tail_cushion(&mut self, on: bool) {
+        self.tail_cushion = on;
     }
 
     /// Re-anchor on the next sample. Call on known discontinuities: codec
@@ -255,6 +269,12 @@ impl CadenceClock {
                 .saturating_add(shr_toward_zero(err, self.tuning.skew_shift));
             let dev = err.abs() - self.mad_ns;
             self.mad_ns += shr_toward_zero(dev, self.tuning.jitter_shift);
+            // Adopt a later arrival at once; forget it over ~128 frames.
+            if err > self.tail_ns {
+                self.tail_ns = err;
+            } else {
+                self.tail_ns -= self.tail_ns >> 7;
+            }
         } else {
             self.offset_ns = raw;
             self.skew_ns = 0;
@@ -287,9 +307,13 @@ impl CadenceClock {
 
     /// Ceiling of one frame interval is an invariant, not a tunable: past a
     /// whole frame the source cannot supply that smoothness — deepen the buffer.
+    /// With the tail cushion, the hold also covers the latest late arrival plus the floor.
     pub fn cushion_ns(&self) -> i64 {
         let den = self.tuning.cushion_den.max(1) as i64;
-        let want = self.mad_ns.saturating_mul(self.tuning.cushion_num as i64) / den;
+        let mut want = self.mad_ns.saturating_mul(self.tuning.cushion_num as i64) / den;
+        if self.tail_cushion {
+            want = want.max(self.tail_ns.saturating_add(self.tuning.cushion_floor_ns));
+        }
         let ceiling = if self.frame_interval_ns > 0 {
             self.frame_interval_ns
         } else {
@@ -304,6 +328,7 @@ impl CadenceClock {
         h.skew_ns = self.skew_ns;
         h.jitter_ns = self.mad_ns;
         h.cushion_ns = self.cushion_ns();
+        h.tail_ns = self.tail_ns;
         h
     }
 
@@ -311,6 +336,7 @@ impl CadenceClock {
         self.health.offset_ns = self.offset_ns;
         self.health.skew_ns = self.skew_ns;
         self.health.jitter_ns = self.mad_ns;
+        self.health.tail_ns = self.tail_ns;
     }
 }
 
@@ -710,6 +736,44 @@ mod tests {
                 "due spacing {d_due} must follow the source's {d_pts}"
             );
         }
+    }
+
+    /// A link whose arrivals are mostly tight but occasionally late: the MAD cushion leaves
+    /// those frames late; the tail cushion covers the latest of them, then lets go.
+    #[test]
+    fn the_tail_cushion_covers_the_late_tail_and_decays() {
+        let mut c = settled(400, 300_000);
+        c.set_tail_cushion(true);
+        let before = c.cushion_ns();
+        let k = 400;
+        // One frame 6 ms late on a 0.3 ms link.
+        c.due_ns(pts_at(k), pts_at(k) as i64 + DOMAIN + DELAY + 6_000_000, P);
+        let h = c.health();
+        assert!(
+            h.tail_ns > 5_000_000,
+            "tail {} must adopt the late frame",
+            h.tail_ns
+        );
+        assert!(
+            c.cushion_ns() >= h.tail_ns && c.cushion_ns() > before,
+            "cushion {} must cover the tail {}",
+            c.cushion_ns(),
+            h.tail_ns
+        );
+        for i in 1..600 {
+            c.due_ns(pts_at(k + i), pts_at(k + i) as i64 + DOMAIN + DELAY, P);
+        }
+        assert!(
+            c.health().tail_ns < 100_000,
+            "a quiet link forgets the tail, {} left",
+            c.health().tail_ns
+        );
+        let mut off = settled(400, 300_000);
+        off.due_ns(pts_at(k), pts_at(k) as i64 + DOMAIN + DELAY + 6_000_000, P);
+        assert!(
+            off.cushion_ns() < 3_000_000,
+            "off, the MAD cushion stays small"
+        );
     }
 
     #[test]

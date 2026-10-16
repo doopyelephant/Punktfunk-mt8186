@@ -74,6 +74,7 @@ impl StreamState {
             cadence: CadenceProbe::new(),
             mode_period_ns: 1_000_000_000 / u64::from(native_refresh_hz.max(1)),
             slots: Default::default(),
+            aimed: std::collections::VecDeque::with_capacity(16),
             busy_on: crate::vk::BusyOn::Fence,
             last_displayed_ns: 0,
             last_shown_pts_ns: 0,
