@@ -642,22 +642,35 @@ impl PlatformBackend for LinuxBackend {
         if seat.owner {
             return Ok(self.owner_status(seat, &state));
         }
-        if state.live() {
-            let known = self
-                .inner
-                .running
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains_key(&seat.id);
-            if !known && let Some(passwd) = accounts::lookup(&seat.account)? {
-                self.track(&seat.id, Tracked::of(seat, &passwd));
-                unit_hook(&self.inner, &seat.account, Some(passwd.uid));
-            }
-        } else {
-            self.untrack(&seat.id);
-            unit_hook(&self.inner, &seat.account, None);
-        }
         Ok(state.runtime())
+    }
+
+    /// A unit found up is tracked and gets its proxy; one that is down loses both. A unit between
+    /// the two, stopping, keeps them: a restart rebuilds its namespace on the same proxy.
+    /// The owner's row stays tracked from its adoption.
+    fn reconcile(&self, seat: &Seat, status: &RuntimeStatus) {
+        if seat.owner {
+            return;
+        }
+        match status.state {
+            RuntimeState::Running | RuntimeState::Starting => {
+                let known = self
+                    .inner
+                    .running
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&seat.id);
+                if !known && let Ok(passwd) = accounts::require(seat) {
+                    self.track(&seat.id, Tracked::of(seat, &passwd));
+                    unit_hook(&self.inner, &seat.account, Some(passwd.uid));
+                }
+            }
+            RuntimeState::Stopping => {}
+            _ => {
+                self.untrack(&seat.id);
+                unit_hook(&self.inner, &seat.account, None);
+            }
+        }
     }
 
     /// A root-owned copy of the certificate the seat's host serves from `~/.config/punktfunk`,

@@ -15,7 +15,12 @@ pub trait PlatformBackend: Send + Sync + 'static {
     fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError>;
     fn stop(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError>;
     fn remove(&self, seat: &Seat) -> Result<(), BackendError>;
+    /// A pure read of `seat`'s state.
     fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError>;
+
+    /// Brings what runs beside `seat`'s unit level with `status`, a reading just taken. The
+    /// service calls it only for a seat that no start, stop or delete is changing.
+    fn reconcile(&self, _seat: &Seat, _status: &RuntimeStatus) {}
 
     fn doctor(&self, _ledger: &Ledger) -> Result<Vec<Diagnostic>, BackendError> {
         Ok(Vec::new())

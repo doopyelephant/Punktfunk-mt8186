@@ -101,10 +101,7 @@ impl<B: PlatformBackend> SeatService<B> {
             let mut current = self.lock();
             let mut next = current.clone();
             for seat in next.seats.iter_mut().filter(|seat| !seat.autostart) {
-                seat.runtime = self
-                    .backend
-                    .status(seat)
-                    .unwrap_or_else(|error| RuntimeStatus::failed(error.to_string()));
+                seat.runtime = self.observe(seat);
                 self.learn_pin(seat);
             }
             let ids = next
@@ -127,13 +124,26 @@ impl<B: PlatformBackend> SeatService<B> {
         first.map_or(Ok(()), Err)
     }
 
+    /// `seat`'s state as its backend reads it, after the backend has brought what runs beside
+    /// the unit level with it.
+    fn observe(&self, seat: &Seat) -> RuntimeStatus {
+        match self.backend.status(seat) {
+            Ok(status) => {
+                self.backend.reconcile(seat, &status);
+                status
+            }
+            Err(error) => RuntimeStatus::failed(error.to_string()),
+        }
+    }
+
     fn list(&self) -> Result<CommandResult, ApiError> {
+        let mut current = self.lock();
+        // Read under the ledger lock, which a change takes to mark its seat before its backend runs.
         let changing = self
             .changing
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut current = self.lock();
         let mut next = current.clone();
         for seat in &mut next.seats {
             if changing.as_ref() == Some(&seat.id) {
@@ -146,10 +156,7 @@ impl<B: PlatformBackend> SeatService<B> {
                 }
                 continue;
             }
-            seat.runtime = self
-                .backend
-                .status(seat)
-                .unwrap_or_else(|error| RuntimeStatus::failed(error.to_string()));
+            seat.runtime = self.observe(seat);
             self.learn_pin(seat);
         }
         if next != *current {
@@ -212,9 +219,13 @@ impl<B: PlatformBackend> SeatService<B> {
 
     fn change_runtime(&self, id: &SeatId, start: bool) -> Result<CommandResult, ApiError> {
         let _op = self.op();
-        let original = self.lock().seat(id).cloned().ok_or_else(|| not_found(id))?;
-        // Marked before the publish: a `List` in between would read the backend's old state.
-        *self.changing.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
+        let original = {
+            let current = self.lock();
+            let seat = current.seat(id).cloned().ok_or_else(|| not_found(id))?;
+            // Under the ledger lock, so a `List` either finished with the seat or skips it.
+            *self.changing.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
+            seat
+        };
         if start {
             let published = self.publish_runtime(
                 id,

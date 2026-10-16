@@ -91,6 +91,10 @@ impl PlatformBackend for FakeBackend {
             .unwrap_or_default())
     }
 
+    fn reconcile(&self, seat: &Seat, _status: &RuntimeStatus) {
+        self.record("reconcile", seat);
+    }
+
     fn doctor(&self, _ledger: &Ledger) -> Result<Vec<Diagnostic>, BackendError> {
         Ok(vec![Diagnostic::info("fake", "fake backend is healthy")])
     }
@@ -394,6 +398,51 @@ impl PlatformBackend for SlowStart {
     fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
         self.inner.status(seat)
     }
+    fn reconcile(&self, seat: &Seat, status: &RuntimeStatus) {
+        self.inner.reconcile(seat, status);
+    }
+}
+
+/// A `List` reconciles a seat that is at rest and leaves one that is starting: its unit is down
+/// until the start brings it up, and reading that as a stopped seat would tear its proxy down.
+#[test]
+fn a_list_reconciles_a_seat_at_rest_and_never_one_that_starts() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = SlowStart::default();
+    let service = Arc::new(SeatService::open(temp.path(), backend.clone()).unwrap());
+    let CommandResult::Created { seat } =
+        service.dispatch(create("Desk", "pf-desk", false)).unwrap()
+    else {
+        panic!("create");
+    };
+    let reconciled = format!("reconcile:{}", seat.id);
+    service.dispatch(Command::List).unwrap();
+    assert!(backend.inner.calls().contains(&reconciled));
+
+    let starter = {
+        let service = Arc::clone(&service);
+        let id = seat.id.clone();
+        std::thread::spawn(move || service.dispatch(Command::Start { id }))
+    };
+    loop {
+        let CommandResult::List { seats } = service.dispatch(Command::List).unwrap() else {
+            panic!("list");
+        };
+        if seats[0].runtime.state == RuntimeState::Starting {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    backend.inner.clear_calls();
+    service.dispatch(Command::List).unwrap();
+    assert!(!backend.inner.calls().contains(&reconciled));
+
+    let (open, wake) = &*backend.gate;
+    *open.lock().unwrap() = true;
+    wake.notify_all();
+    starter.join().unwrap().unwrap();
+    service.dispatch(Command::List).unwrap();
+    assert!(backend.inner.calls().contains(&reconciled));
 }
 
 #[test]
