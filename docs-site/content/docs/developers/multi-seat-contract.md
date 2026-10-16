@@ -376,7 +376,8 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   `punktfunk-seat:<account>/steam/<n>`, whatever the seat asked, so the fence takes it. A 32-bit
   Steam's events and FF uploads are translated. The CUSE fd and each device's fd wait in the fd
   store, so a restart of the daemon keeps the bound node and the devices on it; a stop of the
-  daemon ends them until the seat restarts. The seat host's own pads still go through the
+  daemon ends them until the seat restarts. Before it stops, the unit's `ExecStop=` has the
+  daemon answer every read a seat's Steam waits on, so none stays stranded in the kernel. The seat host's own pads still go through the
   broker, and a seat host offers no pen. It needs `/dev/cuse`, which the `cuse` module autoloads
   on first open; `doctor` reports it.
 - **USB pads.** A seat's USB/IP pad (the virtual Deck, the Steam Controllers, the DualSense, the
