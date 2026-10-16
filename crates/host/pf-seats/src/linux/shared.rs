@@ -767,24 +767,42 @@ impl SteamSource {
     }
 }
 
-/// `user`'s Steam install, read as `user`.
+/// `user`'s Steam install, read as `user`. `~/.steam/steam` is the user's to point anywhere, so a
+/// root another user owns is no source of theirs: root would read and mount that user's libraries.
 pub(super) fn steam_source_of(user: &Passwd) -> Option<SteamSource> {
-    Some(SteamSource {
-        root: steam_root_of(&user.home)?,
-        uid: user.uid,
-        gid: user.gid,
-    })
+    owned_source_of(user, stat_owner)
 }
 
 /// The Steam a new seat is cloned from when no owner row names one: the lowest-uid ordinary user
 /// that has one, read as that user. `--steam-source` names another.
 pub(super) fn find_steam_source(users: &[Passwd]) -> Option<SteamSource> {
+    find_source(users, stat_owner)
+}
+
+fn stat_owner(root: &Path) -> Option<u32> {
+    std::fs::metadata(root).ok().map(|meta| meta.uid())
+}
+
+/// [`steam_source_of`] with `owner` naming who owns a Steam root.
+fn owned_source_of(user: &Passwd, owner: impl Fn(&Path) -> Option<u32>) -> Option<SteamSource> {
+    let root = steam_root_of(&user.home)?;
+    (owner(&root) == Some(user.uid)).then_some(SteamSource {
+        root,
+        uid: user.uid,
+        gid: user.gid,
+    })
+}
+
+/// [`find_steam_source`] with `owner` naming who owns a Steam root.
+fn find_source(users: &[Passwd], owner: impl Fn(&Path) -> Option<u32>) -> Option<SteamSource> {
     let mut ordinary: Vec<&Passwd> = users
         .iter()
         .filter(|u| (1000..60000).contains(&u.uid) && !u.gecos.starts_with("punktfunk-seat="))
         .collect();
     ordinary.sort_by_key(|u| u.uid);
-    ordinary.into_iter().find_map(steam_source_of)
+    ordinary
+        .into_iter()
+        .find_map(|u| owned_source_of(u, &owner))
 }
 
 /// A Steam under the seat's home, cloned from `source` when there is one, and a library list that
@@ -1377,8 +1395,9 @@ mod tests {
     #[test]
     fn the_steam_source_is_the_lowest_ordinary_user_with_a_steam() {
         let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
         let user = |name: &str, uid: u32, gecos: &str, with_steam: bool| {
-            let home = temp.path().join(name);
+            let home = base.join(name);
             if with_steam {
                 std::fs::create_dir_all(home.join(".local/share/Steam")).unwrap();
             }
@@ -1397,21 +1416,36 @@ mod tests {
             user("bare", 1000, "", false),
             user("early", 1001, "", true),
         ];
-        assert_eq!(
-            find_steam_source(&users),
-            Some(SteamSource {
-                root: temp.path().join("early/.local/share/Steam"),
-                uid: 1001,
-                gid: 1001,
-            })
-        );
-        assert_eq!(find_steam_source(&users[..2]), None);
+        // Whoever's home holds the root owns it, as on disk.
+        let owner = |root: &Path| {
+            let home = users.iter().find(|u| root.starts_with(&u.home));
+            home.map(|u| u.uid)
+        };
+        let early = SteamSource {
+            root: base.join("early/.local/share/Steam"),
+            uid: 1001,
+            gid: 1001,
+        };
+        assert_eq!(find_source(&users, owner), Some(early.clone()));
+        assert_eq!(find_source(&users[..2], owner), None);
         // The owner's row names its user, whose uid is not the lowest.
         assert_eq!(
-            steam_source_of(&users[2]).map(|source| source.uid),
+            owned_source_of(&users[2], owner).map(|source| source.uid),
             Some(1002)
         );
-        assert_eq!(steam_source_of(&users[3]), None, "an owner without a Steam");
+        assert_eq!(
+            owned_source_of(&users[3], owner),
+            None,
+            "an owner without a Steam"
+        );
+
+        // The lowest user links their Steam to another user's: not their source, so the next
+        // user with a Steam of their own is. The owner's row gets the same answer.
+        let linked = users[3].home.join(".steam");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&early.root, linked.join("steam")).unwrap();
+        assert_eq!(find_source(&users, owner), Some(early));
+        assert_eq!(owned_source_of(&users[3], owner), None);
     }
 
     /// A link where the box's avatar folder should be is refused, and nothing behind it is
