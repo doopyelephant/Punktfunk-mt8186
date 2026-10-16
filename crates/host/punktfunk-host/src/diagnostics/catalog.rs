@@ -711,8 +711,8 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// The door opens no device and sits outside the `punktfunk` group on purpose, so a check on that
-/// group says nothing about it and its remedy would undo the separation.
+/// The door opens no device and sits outside the `punktfunk` and `input` groups on purpose, so a
+/// check on a device group says nothing about it and its remedy would undo the separation.
 fn door_opens_none(id: &str, door: bool) -> Option<HostCheck> {
     door.then(|| HostCheck::inapplicable(id, "The door opens no device."))
 }
@@ -942,6 +942,9 @@ fn session_predates(
 
 fn uinput_access() -> HostCheck {
     let id = ids::UINPUT_ACCESS;
+    if let Some(check) = door_opens_none(id, pf_paths::seat::role().is_door()) {
+        return check;
+    }
     match crate::inject::uinput_probe() {
         UinputVerdict::Inapplicable => HostCheck::inapplicable(
             id,
