@@ -591,6 +591,7 @@ impl PlatformBackend for LinuxBackend {
         let gid = accounts::ensure_group(accounts::GAMES_GROUP)?;
         shared::ensure_games(state, gid)?;
         let passwd = accounts::ensure(seat, state)?;
+        accounts::close_home(&passwd.home)?;
         shared::ensure_seat_dirs(state, &seat.id, &passwd)?;
         shared::provision_steam(state, &seat.id, &passwd, self.steam_source().as_ref());
         Ok(())
@@ -611,6 +612,7 @@ impl PlatformBackend for LinuxBackend {
         }
         let (box_dir, state) = (&self.inner.box_dir, &self.inner.state);
         let passwd = accounts::require(seat)?;
+        accounts::close_home(&passwd.home)?;
         shared::ensure_seat_dirs(state, &seat.id, &passwd)?;
         let reader = shared::Reader::group(passwd.gid);
         shared::refresh_trust(box_dir, state, &seat.id, reader)?;

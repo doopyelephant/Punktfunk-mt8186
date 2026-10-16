@@ -207,6 +207,28 @@ pub(super) fn marked_id(passwd: &Passwd) -> Option<SeatId> {
     SeatId::parse(passwd.gecos.strip_prefix(MARKER_PREFIX)?).ok()
 }
 
+/// Closes a seat's home to every user but its own. `useradd` makes it as open as `login.defs`
+/// says, `0755` on Debian, and the seat directory above it is `0711` for every seat user. An
+/// absent home is left as it is; a link is refused.
+pub(super) fn close_home(home: &Path) -> Result<(), BackendError> {
+    let io = |e: std::io::Error| {
+        err(
+            "seat_dirs",
+            format!("close the home {}: {e}", home.display()),
+        )
+    };
+    let (Some(parent), Some(name)) = (home.parent(), home.file_name().and_then(|n| n.to_str()))
+    else {
+        return Ok(());
+    };
+    let above = super::safe_open::dir(parent).map_err(io)?;
+    let Some(dir) = super::safe_open::dir_at(&above, name).map_err(io)? else {
+        return Ok(());
+    };
+    let closed = rustix::fs::fchmod(&dir, rustix::fs::Mode::from_raw_mode(0o700 as _));
+    closed.map_err(|e| io(e.into()))
+}
+
 /// Whether `passwd` carries a seat's marker, for any seat.
 pub(super) fn is_seat(passwd: &Passwd) -> bool {
     passwd.gecos.starts_with(MARKER_PREFIX)
@@ -374,6 +396,30 @@ mod tests {
         assert!(!owned("punktfunk-seat=0123456789abcdef"));
         assert!(!owned("Ada Lovelace"));
         assert!(!owned(""));
+    }
+
+    /// A home `useradd` left at the distro's mode closes to its user; a link in its place is
+    /// refused, and the directory it points at keeps its mode.
+    #[test]
+    fn a_seat_home_closes_to_its_user_and_never_through_a_link() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let seat = tempfile::tempdir().unwrap();
+        let home = seat.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+        close_home(&home).unwrap();
+        assert_eq!(mode(&home), 0o700);
+
+        close_home(&seat.path().join("absent")).unwrap();
+
+        let target = seat.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let linked = seat.path().join("linked");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        assert!(close_home(&linked).is_err());
+        assert_eq!(mode(&target), 0o755);
     }
 
     /// A seat's marker names its id, whichever seat that is; anything else names none.
