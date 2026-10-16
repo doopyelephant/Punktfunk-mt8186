@@ -60,9 +60,15 @@ pub(super) fn computer_name() -> WinResult<String> {
 }
 
 pub(super) fn is_local_system() -> WinResult<bool> {
+    // SAFETY: the current-process pseudo-handle needs no close and stays valid.
+    process_is_local_system(unsafe { GetCurrentProcess() })
+}
+
+/// Whether `process` runs as LocalSystem. The handle needs `PROCESS_QUERY_LIMITED_INFORMATION`.
+pub(super) fn process_is_local_system(process: HANDLE) -> WinResult<bool> {
     let mut raw_token = HANDLE::default();
-    // SAFETY: the current-process pseudo-handle stays valid; `raw_token` receives one owned handle.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) }
+    // SAFETY: `process` is a live process handle; `raw_token` receives one owned handle.
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw_token) }
         .map_err(|error| io_error("identity", "OpenProcessToken failed", error))?;
     // SAFETY: `raw_token` is fresh and has no other owner; this transfers ownership once.
     let token = unsafe { OwnedHandle::from_raw_handle(raw_token.0) };

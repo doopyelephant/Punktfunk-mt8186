@@ -5,10 +5,11 @@
 //! `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a process that created the name first makes
 //! [`PipeServer::bind`] fail instead of answering clients in the supervisor's place. The pipe
 //! mode refuses remote clients. [`wake`] ends a wait so the loop can see its stop flag;
-//! [`request`] is the client the console host calls, and gives up on an answer that takes
-//! too long.
+//! [`request`] is the client the console host calls. It talks only to a server that runs as
+//! LocalSystem, since the name has no owner while the service is down, and it gives up on an
+//! answer that takes too long.
 
-use super::util::{io_error, wide, WinResult};
+use super::util::{io_error, process_is_local_system, wide, WinResult};
 use crate::backend::PlatformBackend;
 use crate::service::SeatService;
 use pf_paths_win::SecurityAttributes;
@@ -16,15 +17,16 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use windows::core::PCWSTR;
+use windows::core::{Owned, PCWSTR};
 use windows::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     FlushFileBuffers, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
+use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::System::IO::CancelIoEx;
 
 /// Requests served at once. A connection past it is closed unanswered.
@@ -134,15 +136,45 @@ pub fn request(
     command: crate::ipc::Command,
 ) -> Result<crate::ipc::CommandResult, crate::ipc::ApiError> {
     let answer = answer_within(&command);
-    exchange(open(name)?, command, answer)
+    exchange(connect(name)?, command, answer)
+}
+
+/// The pipe's client end, once its server is the service. A local user can create the name
+/// while the service is down and answer in its place.
+fn connect(name: &str) -> Result<std::fs::File, crate::ipc::ApiError> {
+    let file = open(name)?;
+    match served_by_system(&file) {
+        Ok(true) => Ok(file),
+        Ok(false) => Err(transport(
+            "check the seats pipe's server",
+            &"it does not run as LocalSystem",
+        )),
+        Err(error) => Err(transport("check the seats pipe's server", &error)),
+    }
+}
+
+/// Whether the process serving `file` runs as LocalSystem, as the service does.
+fn served_by_system(file: &std::fs::File) -> WinResult<bool> {
+    let mut pid = 0_u32;
+    // SAFETY: the pipe handle is live inside `file` and `pid` is a writable out-parameter.
+    unsafe { GetNamedPipeServerProcessId(HANDLE(file.as_raw_handle()), &mut pid) }
+        .map_err(|error| io_error("seats_pipe", "read the pipe server's process", error))?;
+    // SAFETY: opens the server's process for a token query; the handle is closed on drop.
+    let server = unsafe {
+        Owned::new(
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                .map_err(|error| io_error("seats_pipe", "open the pipe server's process", error))?,
+        )
+    };
+    process_is_local_system(*server)
 }
 
 fn transport(what: &str, error: &dyn std::fmt::Display) -> crate::ipc::ApiError {
     crate::ipc::ApiError::new(crate::ipc::ErrorCode::Transport, format!("{what}: {error}"))
 }
 
-/// The pipe's client end. The server has one instance waiting at a time, so a connect that
-/// lands between two retries for up to two seconds.
+/// The pipe's client end, whoever serves it. The server has one instance waiting at a time, so
+/// a connect that lands between two retries for up to two seconds.
 fn open(name: &str) -> Result<std::fs::File, crate::ipc::ApiError> {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
@@ -400,5 +432,35 @@ mod tests {
         for (command, seconds) in waits {
             assert_eq!(answer_within(&command).as_secs(), seconds, "{command:?}");
         }
+    }
+
+    /// The client talks to a server that runs as LocalSystem and to no other. Run as LocalSystem
+    /// this test expects the answer, run as anyone else it expects the refusal.
+    #[test]
+    fn the_client_trusts_only_a_system_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = Arc::new(SeatService::open(temp.path(), crate::UnsupportedBackend).unwrap());
+        let name = name("trust");
+        let server = PipeServer::bind(&name, service).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stop = Arc::clone(&stop);
+        let serving = std::thread::spawn(move || server.serve_until(&loop_stop));
+
+        let system = crate::windows::util::is_local_system().unwrap();
+        let answer = request(&name, Command::List);
+        if system {
+            assert!(
+                matches!(answer, Ok(CommandResult::List { .. })),
+                "{answer:?}"
+            );
+        } else {
+            let error = answer.unwrap_err();
+            assert_eq!(error.code, ErrorCode::Transport);
+            assert!(error.message.contains("LocalSystem"), "{error:?}");
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        wake(&name);
+        serving.join().unwrap();
     }
 }
