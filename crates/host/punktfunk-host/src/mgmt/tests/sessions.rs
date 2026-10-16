@@ -504,6 +504,16 @@ async fn stop_session_for_power_closes_as_power() {
         StatusCode::NO_CONTENT
     );
     assert!(*closing.borrow_and_update(), "the sessions close as power");
+    // Nothing resets the flag on a seat host. A session that starts afterwards reads no close,
+    // and a second power stop still reaches every session.
+    let mut later = crate::power::closing_rx();
+    assert!(!later.has_changed().unwrap(), "a new session is not closed");
+    assert_eq!(
+        send(&app, stop("?reason=power")).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(closing.has_changed().unwrap() && later.has_changed().unwrap());
+    assert!(*later.borrow_and_update(), "the second stop closes typed");
     crate::power::set_closing(false);
 }
 
