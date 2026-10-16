@@ -62,6 +62,13 @@ impl AuBuf {
     }
 }
 
+impl Default for AuBuf {
+    /// Empty, on the heap: what `mem::take` leaves in a frame.
+    fn default() -> AuBuf {
+        Vec::new().into()
+    }
+}
+
 impl From<Vec<u8>> for AuBuf {
     fn from(v: Vec<u8>) -> AuBuf {
         let len = v.len();

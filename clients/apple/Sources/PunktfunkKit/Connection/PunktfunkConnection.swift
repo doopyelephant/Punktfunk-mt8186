@@ -32,7 +32,19 @@ private let statusClosed: Int32 = PUNKTFUNK_STATUS_CLOSED.rawValue
 
 /// One reassembled, FEC-recovered, decrypted access unit (Annex-B HEVC from the host).
 public struct AccessUnit: Sendable {
+    /// The AU's bytes: a copy, or with `inPlace` a view of the lender's slot that holds until
+    /// the next pull.
     public let data: Data
+    /// Where the AU lies in memory the embedder lent (`setAccessUnitMemory`): the lender's
+    /// token for the slot and the byte offset from the lender's base. The decoder reads it
+    /// there until the lender frees the slot.
+    public struct InPlace: Sendable {
+        public let token: UInt64
+        public let offset: Int
+        public let count: Int
+    }
+    public let inPlace: InPlace?
+    public var byteCount: Int { inPlace?.count ?? data.count }
     public let ptsNs: UInt64
     public let frameIndex: UInt32
     public let flags: UInt32
@@ -52,9 +64,10 @@ public struct AccessUnit: Sendable {
     /// the synthetic probe AUs and decode tests, where the split is meaningless.
     public init(
         data: Data, ptsNs: UInt64, frameIndex: UInt32, flags: UInt32,
-        receivedNs: Int64, pulledNs: Int64? = nil
+        receivedNs: Int64, pulledNs: Int64? = nil, inPlace: InPlace? = nil
     ) {
         self.data = data
+        self.inPlace = inPlace
         self.ptsNs = ptsNs
         self.frameIndex = frameIndex
         self.flags = flags
@@ -68,6 +81,43 @@ public struct AccessUnit: Sendable {
             data: data, ptsNs: ptsNs, frameIndex: frameIndex, flags: flags,
             receivedNs: receivedNs, pulledNs: pulledNs)
     }
+}
+
+/// Memory the core assembles access units in, one slot per AU, so a decoder reads each AU
+/// where it was written. `take` and `release` run on core threads and must return at once;
+/// `locate` runs on the pump thread.
+public protocol AccessUnitMemory: AnyObject {
+    /// A writable buffer of at least `count` bytes and its token, or nil for the heap.
+    func take(_ count: Int) -> (base: UnsafeMutableRawPointer, count: Int, token: UInt64)?
+    /// The core is done with the buffer `token` names.
+    func release(_ token: UInt64)
+    /// The slot `pointer` lies in and its byte offset from the lender's base, or nil for
+    /// memory that is not the lender's.
+    func locate(_ pointer: UnsafeRawPointer) -> (token: UInt64, offset: Int)?
+}
+
+/// The lender behind the C callbacks' `userdata`.
+private final class AccessUnitMemoryBox {
+    let memory: AccessUnitMemory
+    init(_ memory: AccessUnitMemory) { self.memory = memory }
+}
+
+private let accessUnitTake:
+    @convention(c) (UnsafeMutableRawPointer?, UInt, UnsafeMutablePointer<PunktfunkAuStore>?) -> Bool = {
+        userdata, count, out in
+        guard let userdata, let out else { return false }
+        let memory = Unmanaged<AccessUnitMemoryBox>.fromOpaque(userdata).takeUnretainedValue().memory
+        guard let slot = memory.take(Int(count)) else { return false }
+        out.pointee = PunktfunkAuStore(
+            data: slot.base.assumingMemoryBound(to: UInt8.self), len: UInt(slot.count),
+            token: slot.token)
+        return true
+    }
+
+private let accessUnitRelease: @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Void = {
+    userdata, token in
+    guard let userdata else { return }
+    Unmanaged<AccessUnitMemoryBox>.fromOpaque(userdata).takeUnretainedValue().memory.release(token)
 }
 
 /// One Opus audio packet (48 kHz stereo, 5 ms frames) — decode with AVAudioConverter
@@ -293,6 +343,10 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Held across the blocking next_au call; close() takes it (same plane-lock → abiLock
     /// order as the pullers) so it can never free the handle under an in-flight poll.
     private let pumpLock = NSLock()
+    /// The lender `setAccessUnitMemory` installed, for `nextAU` to place pulls. Under `pumpLock`.
+    private var accessUnitMemory: AccessUnitMemory?
+    /// Every lender ever installed, retained until `close()` ends the core's calls into them.
+    private var accessUnitMemoryBoxes: [Unmanaged<AccessUnitMemoryBox>] = []
     /// Same role for the audio drain thread (its own plane in the core).
     private let audioLock = NSLock()
     /// Same role for the feedback drain thread (rumble + HID-output — two core planes,
@@ -1541,7 +1595,16 @@ public final class PunktfunkConnection: @unchecked Sendable {
             punktfunk_connection_next_au(h, &frame, timeoutMs)
         } decode: {
             guard let base = frame.data, frame.len > 0 else { return nil }
-            let data = Data(bytes: base, count: Int(frame.len)) // copy: ptr valid only until next call
+            let count = Int(frame.len)
+            // In lent memory the AU stays where it is and `data` views it: the view holds until
+            // the next pull, and a sample made over the slot holds the slot past that. Anything
+            // else is copied out, as the pointer is only valid until the next call.
+            let inPlace = accessUnitMemory?.locate(UnsafeRawPointer(base)).map {
+                AccessUnit.InPlace(token: $0.token, offset: $0.offset, count: count)
+            }
+            let data = inPlace == nil
+                ? Data(bytes: base, count: count)
+                : Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base), count: count, deallocator: .none)
             let pulledNs = realtimeNowNs()
             // Receipt = the core's reassembly-completion stamp (ABI v9); the pull instant is
             // kept separately so the client-queue wait is its own measured term. 0 would mean a
@@ -1551,7 +1614,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
             return AccessUnit(
                 data: data, ptsNs: frame.pts_ns,
                 frameIndex: frame.frame_index, flags: frame.flags,
-                receivedNs: receivedNs, pulledNs: pulledNs)
+                receivedNs: receivedNs, pulledNs: pulledNs, inPlace: inPlace)
         }
     }
 
@@ -1944,6 +2007,33 @@ public final class PunktfunkConnection: @unchecked Sendable {
         if let h {
             punktfunk_connection_close(h) // joins the connection's internal Rust threads
         }
+        // Joined: no core thread can call a lender any more.
+        pumpLock.lock()
+        accessUnitMemory = nil
+        accessUnitMemoryBoxes.forEach { $0.release() }
+        accessUnitMemoryBoxes.removeAll()
+        pumpLock.unlock()
+    }
+
+    /// Assemble access units in `memory` from the next frame on (nil: the heap). The core
+    /// writes into its slots on its own threads, and `nextAU` then names the slot instead of
+    /// copying. From the pump thread, between pulls.
+    public func setAccessUnitMemory(_ memory: AccessUnitMemory?) {
+        pumpLock.lock()
+        defer { pumpLock.unlock() }
+        let installed = withLiveHandle(or: false) { h -> Bool in
+            guard let memory else { return punktfunk_connection_set_au_memory(h, nil) == statusOK }
+            let box = Unmanaged.passRetained(AccessUnitMemoryBox(memory))
+            var callbacks = PunktfunkAuMemory(
+                take: accessUnitTake, release: accessUnitRelease, userdata: box.toOpaque())
+            guard punktfunk_connection_set_au_memory(h, &callbacks) == statusOK else {
+                box.release()
+                return false
+            }
+            accessUnitMemoryBoxes.append(box)
+            return true
+        }
+        accessUnitMemory = installed ? memory : nil
     }
 
     /// Send one Opus mic frame (48 kHz) to the host, where it feeds a virtual

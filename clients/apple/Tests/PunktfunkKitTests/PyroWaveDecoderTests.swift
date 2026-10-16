@@ -17,6 +17,23 @@ import XCTest
 
 @testable import PunktfunkKit
 
+extension WaveletBitstream {
+    /// `parse` of a standalone AU: copied into scratch memory whose word 0 is the AU's start,
+    /// with the stitch area right after it (4-byte aligned).
+    static func parse(au: Data, chunkAligned: Bool, windowSize: Int) -> ParsedWaveletFrame? {
+        let stitchAt = (au.count + 3) & ~3
+        var scratch = [UInt8](repeating: 0, count: stitchAt + 64 * 1024)
+        return scratch.withUnsafeMutableBytes { raw -> ParsedWaveletFrame? in
+            au.copyBytes(to: raw)
+            return parse(
+                base: raw.baseAddress!.assumingMemoryBound(to: UInt8.self), count: au.count,
+                wordBase: 0,
+                stitch: UnsafeMutableRawBufferPointer(rebasing: raw[stitchAt...]),
+                stitchWordBase: stitchAt / 4, chunkAligned: chunkAligned, windowSize: windowSize)
+        }
+    }
+}
+
 final class PyroWaveParserTests: XCTestCase {
     // 256x144 → aligned 256x160; block space identical to the committed fixtures.
     private let width = 256
@@ -96,10 +113,12 @@ final class PyroWaveParserTests: XCTestCase {
         XCTAssertEqual(frame.layout.width, width)
         XCTAssertEqual(frame.totalBlocks, 4)
         XCTAssertEqual(frame.decodedBlocks, 3)
-        XCTAssertEqual(frame.offsets[0], 0)
-        XCTAssertEqual(frame.offsets[3], 2) // u32 words: each header-only packet is 2 words
+        // Offsets are where the packets lie: u32 words after the 2-word SOF, each header-only
+        // packet 2 words; the duplicate at word 6 is ignored.
+        XCTAssertEqual(frame.offsets[0], 2)
+        XCTAssertEqual(frame.offsets[3], 4)
+        XCTAssertEqual(frame.offsets[layout.blockCount32 - 1], 8)
         XCTAssertEqual(frame.offsets[1], UInt32.max)
-        XCTAssertEqual(frame.payload.count, 6)
         XCTAssertFalse(frame.bt2020)
         XCTAssertFalse(frame.fullRange) // range bit 1 = LIMITED
     }
@@ -139,9 +158,11 @@ final class PyroWaveParserTests: XCTestCase {
         let frame = try XCTUnwrap(
             WaveletBitstream.parse(au: Data(au), chunkAligned: true, windowSize: size))
         XCTAssertEqual(frame.decodedBlocks, 3)
-        XCTAssertEqual(frame.offsets[0], 0)
-        XCTAssertEqual(frame.offsets[2], 2)
-        XCTAssertEqual(frame.offsets[1], 4)
+        // Packed packets are read where they lie (window prefix 4 B, the SOF 8 B); the FRAG
+        // chain is stitched into the area after the AU's five windows.
+        XCTAssertEqual(frame.offsets[0], 3)
+        XCTAssertEqual(frame.offsets[1], UInt32(4 * size + 4) / 4)
+        XCTAssertEqual(frame.offsets[2], UInt32(5 * size) / 4)
     }
 
     func testBrokenFragChainIsDiscarded() throws {

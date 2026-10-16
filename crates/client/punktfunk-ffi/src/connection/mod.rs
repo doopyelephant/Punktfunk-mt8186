@@ -18,6 +18,9 @@ mod clipboard;
 
 mod control;
 
+mod au_memory;
+
+pub use au_memory::*;
 pub use clipboard::*;
 pub use connect::*;
 pub use control::*;
