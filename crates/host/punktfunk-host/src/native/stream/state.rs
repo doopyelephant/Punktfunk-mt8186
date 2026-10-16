@@ -142,6 +142,9 @@ pub(super) struct StreamState {
     /// `Some(joined)` on the seat's own session, which follows the seat's mode.
     #[cfg(target_os = "linux")]
     pub(super) seat_join: Option<bool>,
+    /// The session's place among the seat's followers, left when it ends.
+    #[cfg(target_os = "linux")]
+    pub(super) following: Option<crate::seats::session_switch::Following>,
     pub(super) send: super::send::SendThread,
     pub(super) live_session: crate::session_status::LiveSessionGuard,
     pub(super) send_spread_us: Arc<AtomicU32>,
@@ -865,6 +868,8 @@ impl StreamState {
             _watcher: None,
             #[cfg(target_os = "linux")]
             seat_join: follows_seat.then_some(join_live),
+            #[cfg(target_os = "linux")]
+            following: None,
             game_life,
         })
     }
@@ -878,13 +883,24 @@ impl StreamState {
             let (session_tx, session_rx) = std::sync::mpsc::channel::<SessionSwitch>();
             self.session_rx = session_rx;
             let life = self.life.clone();
-            crate::seats::session_switch::follow(Box::new(move |game| {
+            let catch_up = session_tx.clone();
+            let (following, game) = crate::seats::session_switch::follow(Box::new(move |game| {
                 if joined {
                     life.end(crate::events::SessionEndReason::HostEnded);
                     return false;
                 }
                 session_tx.send(SessionSwitch::seat(game)).is_ok()
             }));
+            self.following = Some(following);
+            // A switch while this session was starting went by unheard.
+            let built_in_game = self.compositor == crate::vdisplay::Compositor::Gamescope;
+            if game != built_in_game {
+                if joined {
+                    self.life.end(crate::events::SessionEndReason::HostEnded);
+                } else {
+                    let _ = catch_up.send(SessionSwitch::seat(game));
+                }
+            }
             return;
         }
         if !(session_watch_enabled() && pf_host_config::config().compositor.is_none()) {

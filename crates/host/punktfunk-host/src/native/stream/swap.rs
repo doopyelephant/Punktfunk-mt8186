@@ -392,6 +392,8 @@ mod tests {
             _watcher: None,
             #[cfg(target_os = "linux")]
             seat_join: None,
+            #[cfg(target_os = "linux")]
+            following: None,
             live_session: crate::session_status::register(
                 crate::session_status::Registration::fake("swap-test"),
             ),
