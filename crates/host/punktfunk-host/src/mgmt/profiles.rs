@@ -337,22 +337,52 @@ fn drop_seat(id: &str) -> Result<(), Refusal> {
     }
 }
 
+/// Seats with a wake thread running: a second wake for one has nothing to add.
+static WAKING: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// A seat's place in [`WAKING`], held until the wake ends or its thread is gone.
+struct Waking(String);
+
+impl Waking {
+    fn claim(id: &str) -> Option<Self> {
+        let mut waking = WAKING.lock().unwrap_or_else(|e| e.into_inner());
+        waking.insert(id.to_string()).then(|| Self(id.to_string()))
+    }
+}
+
+impl Drop for Waking {
+    fn drop(&mut self) {
+        WAKING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
+/// Whether a seat in `state` wants a start. A `Stopping` seat does: the supervisor runs the
+/// start after the stop.
+fn needs_start(state: &RuntimeState) -> bool {
+    !matches!(state, RuntimeState::Running | RuntimeState::Starting)
+}
+
 /// Starts a stopped seat in the background: a first logon takes tens of seconds, and the
 /// caller answers with the seat as it is now, `starting`.
 fn start_seat(id: &str) {
     let Ok(id) = pf_seats::SeatId::parse(id) else {
         return;
     };
+    let Some(waking) = Waking::claim(id.as_str()) else {
+        return;
+    };
     let spawned = std::thread::Builder::new()
         .name("seat-wake".into())
         .spawn(move || {
+            let _waking = waking;
             let seats = crate::seats::snapshot();
-            let idle = seats.seat(id.as_str()).is_some_and(|(s, _)| {
-                matches!(
-                    s.runtime.state,
-                    RuntimeState::Stopped | RuntimeState::Failed | RuntimeState::Unknown
-                )
-            });
+            let idle = seats
+                .seat(id.as_str())
+                .is_some_and(|(s, _)| needs_start(&s.runtime.state));
             if !idle || !seats.on {
                 return;
             }
@@ -1315,12 +1345,7 @@ pub(crate) async fn proxy_profile_seat(
     };
     // The owner's session starts on demand: the console asked for its library, and nobody has
     // logged in to make it.
-    if row.owner
-        && matches!(
-            row.runtime.state,
-            RuntimeState::Stopped | RuntimeState::Failed | RuntimeState::Unknown
-        )
-    {
+    if row.owner && needs_start(&row.runtime.state) {
         start_seat(&seat);
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1502,6 +1527,26 @@ mod tests {
             (ct.as_str(), csp.as_str(), sniff.as_str()),
             ("application/octet-stream", "sandbox", "nosniff")
         );
+    }
+
+    #[test]
+    fn a_seat_wakes_once_at_a_time_and_a_stopping_one_wakes_too() {
+        let first = Waking::claim("wake-test-seat").expect("nothing is waking it");
+        assert!(Waking::claim("wake-test-seat").is_none());
+        assert!(Waking::claim("wake-test-other").is_some());
+        drop(first);
+        assert!(Waking::claim("wake-test-seat").is_some());
+
+        for state in [
+            RuntimeState::Stopped,
+            RuntimeState::Stopping,
+            RuntimeState::Failed,
+            RuntimeState::Unknown,
+        ] {
+            assert!(needs_start(&state), "{state:?}");
+        }
+        assert!(!needs_start(&RuntimeState::Running));
+        assert!(!needs_start(&RuntimeState::Starting));
     }
 
     #[test]
