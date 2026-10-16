@@ -289,7 +289,12 @@ pub(super) fn share(
         }
     };
     let read_only = !writable(box_dir);
-    let libraries = find(&steam::library_paths(&vdf), owner.0, fstype)
+    let found = find(&steam::library_paths(&vdf), owner.0, fstype);
+    let orphans = orphans(&shared::seat_dir(state, id).join("private"), &found);
+    if !orphans.is_empty() {
+        tracing::info!(seat = %id, ?orphans, "private folders of libraries no longer listed");
+    }
+    let libraries = found
         .into_iter()
         .map(|mut library| {
             if read_only {
@@ -314,6 +319,34 @@ pub(super) fn share(
         read_only,
         libraries,
     })
+}
+
+/// The keys under `private` that none of `libraries` carries: prefixes and caches of a library
+/// the owner's Steam no longer lists, or whose drive is away. They are kept, never deleted.
+fn orphans(private: &Path, libraries: &[Library]) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(private)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|key| libraries.iter().all(|library| &library.key != key))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Removes `id`'s stage folders, the mount points its unit mounted the libraries at. `rmdir`
+/// only: a mount still up fails with `EBUSY` and stays, so no library is emptied through one.
+pub(super) fn remove_stage(id: &SeatId) {
+    remove_empty_dirs(&Path::new(STAGE_ROOT).join(id.as_str()));
+}
+
+/// `root` and the folders directly in it, each only if empty.
+fn remove_empty_dirs(root: &Path) {
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let _ = std::fs::remove_dir(entry.path());
+    }
+    let _ = std::fs::remove_dir(root);
 }
 
 /// Every directory a library's binds name, and the seat's copy of each of its [`Spot`]s, before
@@ -645,6 +678,34 @@ mod tests {
             reason(&prefixes_elsewhere, uid, "btrfs"),
             Err("a folder a seat keeps its own of is a link or a file")
         );
+    }
+
+    /// A seat's private folders for a library it no longer sees are named, not touched; the
+    /// stage goes empty folder by empty folder, and a folder holding anything stays.
+    #[test]
+    fn a_library_the_seat_lost_is_named_and_its_stage_goes() {
+        let temp = tempfile::tempdir().unwrap();
+        let private = temp.path().join("private");
+        for key in ["00aa", "11bb", "22cc"] {
+            std::fs::create_dir_all(private.join(key).join("compatdata")).unwrap();
+        }
+        let library = |key: &str| Library {
+            steamapps: PathBuf::from("/x/steamapps"),
+            key: key.into(),
+            spots: Vec::new(),
+        };
+        assert_eq!(orphans(&private, &[library("11bb")]), ["00aa", "22cc"]);
+        assert!(orphans(&temp.path().join("gone"), &[]).is_empty());
+        assert!(private.join("00aa/compatdata").exists());
+
+        let stage = temp.path().join("stage");
+        std::fs::create_dir_all(stage.join("00aa")).unwrap();
+        std::fs::create_dir_all(stage.join("11bb")).unwrap();
+        std::fs::write(stage.join("11bb/mounted"), "x").unwrap();
+        remove_empty_dirs(&stage);
+        assert!(!stage.join("00aa").exists());
+        assert!(stage.join("11bb/mounted").exists(), "not recursive");
+        remove_empty_dirs(&temp.path().join("gone"));
     }
 
     #[test]

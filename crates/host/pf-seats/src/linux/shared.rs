@@ -425,8 +425,10 @@ pub(super) fn ensure_seat_dirs(
     Ok(())
 }
 
-/// Removes the seat's directories, its trust copy and its token. Missing ones are fine.
+/// Removes the seat's directories, its trust copy, its token and its library stage. Missing ones
+/// are fine.
 pub(super) fn remove_seat_dirs(state: &Path, id: &SeatId) -> Result<(), BackendError> {
+    super::libraries::remove_stage(id);
     for dir in [
         seat_dir(state, id),
         trust_dir(state, id),
