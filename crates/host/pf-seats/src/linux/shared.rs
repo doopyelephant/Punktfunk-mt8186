@@ -65,9 +65,6 @@ const LIBRARY_METADATA: &str = "library-metadata";
 /// A big catalog with descriptions runs to tens of megabytes; past this it is not ours.
 const MAX_LIBRARY_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Steam top-level entries a seat does not inherit: the owner's account, library and logs.
-const CLONE_SKIP: &[&str] = &["config", "userdata", "appcache", "steamapps", "logs"];
-
 /// Steam's launcher script. A clone carries it and a self-bootstrapped Steam does too, so its
 /// presence says the seat already has an install.
 const STEAM_MARKER: &str = ".local/share/Steam/steam.sh";
@@ -680,11 +677,6 @@ fn safe_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// Top-level Steam entries the seat does not get.
-fn excluded_from_clone(name: &str) -> bool {
-    CLONE_SKIP.contains(&name) || name.ends_with(".vdf")
-}
-
 /// The box owner's Steam install: `~/.steam/steam`, else `~/.local/share/Steam`.
 fn steam_root_of(home: &Path) -> Option<PathBuf> {
     let linked = home.join(".steam/steam");
@@ -830,8 +822,9 @@ fn clone_install(
     std::fs::rename(stage, dst).map_err(|e| io("move the copy into place", e))
 }
 
-/// The top-level entries of `src` a seat inherits. Its folder must be its user's own: one it
-/// links elsewhere would have root list a directory that user can't.
+/// The top-level entries of `src` a seat inherits, all but [`crate::steam::skipped`]. Its folder
+/// must be its user's own: one it links elsewhere would have root list a directory that user
+/// can't.
 fn clone_names(src: &SteamSource) -> std::io::Result<Vec<String>> {
     let dir = safe_open::dir(&src.root)?;
     if rustix::fs::fstat(&dir)?.st_uid != src.uid {
@@ -842,7 +835,7 @@ fn clone_names(src: &SteamSource) -> std::io::Result<Vec<String>> {
     }
     let mut out: Vec<String> = names(&dir)?
         .into_iter()
-        .filter(|name| !excluded_from_clone(name))
+        .filter(|name| !crate::steam::skipped(name))
         .collect();
     out.sort();
     Ok(out)
@@ -963,6 +956,8 @@ mod tests {
         assert_eq!(mask_of(&games.join("sub.old/a")), 6);
     }
 
+    /// The clone leaves the owner's sign-in with the owner: the account, the library, Steam
+    /// Guard's machine token and the caches.
     #[test]
     fn the_account_and_the_library_stay_with_the_owner() {
         for skipped in [
@@ -971,10 +966,14 @@ mod tests {
             "appcache",
             "steamapps",
             "logs",
+            "dumps",
+            "depotcache",
+            "ssfn1234567890",
+            "clientregistry.blob",
             "local.vdf",
             "loginusers.vdf",
         ] {
-            assert!(excluded_from_clone(skipped), "{skipped}");
+            assert!(crate::steam::skipped(skipped), "{skipped}");
         }
         for kept in [
             "ubuntu12_32",
@@ -983,8 +982,27 @@ mod tests {
             "package",
             "compatibilitytools.d",
         ] {
-            assert!(!excluded_from_clone(kept), "{kept}");
+            assert!(!crate::steam::skipped(kept), "{kept}");
         }
+    }
+
+    #[test]
+    fn a_clone_lists_what_a_seat_inherits() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        for dir in ["ubuntu12_32", "dumps", "steamapps"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
+        }
+        for file in ["steam.sh", "ssfn42", "clientregistry.blob", "registry.vdf"] {
+            std::fs::write(root.join(file), "x").unwrap();
+        }
+        let meta = std::fs::metadata(&root).unwrap();
+        let source = SteamSource {
+            root,
+            uid: meta.uid(),
+            gid: meta.gid(),
+        };
+        assert_eq!(clone_names(&source).unwrap(), ["steam.sh", "ubuntu12_32"]);
     }
 
     #[test]

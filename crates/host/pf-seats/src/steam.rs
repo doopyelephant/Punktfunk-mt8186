@@ -9,8 +9,9 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Top-level entries of a Windows install that a copy leaves behind: the box's sign-ins, library,
-/// caches and logs, and Steam Guard's sentry files.
+/// Top-level entries of a Steam install that a seat's copy leaves behind, on Windows and Linux:
+/// the box's sign-ins, library, caches and logs, and Steam Guard's sentry files. Names compare
+/// without case.
 pub fn skipped(name: &str) -> bool {
     const DIRS: [&str; 7] = [
         "config",
