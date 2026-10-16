@@ -71,13 +71,33 @@ pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Place
         &occupants,
         held_by,
     );
-    if let (Placement::Redirect(_), Some(fp)) = (&placed, asker.fp) {
-        held.insert(
-            seat_id.to_string(),
-            (fp.to_string(), Instant::now() + RESERVE),
-        );
+    if matches!(placed, Placement::Redirect(_)) {
+        PLACED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(seat_id.to_string(), Instant::now());
+        if let Some(fp) = asker.fp {
+            held.insert(
+                seat_id.to_string(),
+                (fp.to_string(), Instant::now() + RESERVE),
+            );
+        }
     }
     placed
+}
+
+/// Seat id → when a device was last redirected to it.
+static PLACED: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMap::new());
+
+/// When a device was last redirected to `seat_id`. A seat's idle clock starts no earlier: a
+/// player who lands and leaves between two of its checks still counts.
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) fn last_placed(seat_id: &str) -> Option<Instant> {
+    PLACED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(seat_id)
+        .copied()
 }
 
 /// Whether the host that was asked plays the profile itself. A seat host does: resolving the

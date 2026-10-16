@@ -128,6 +128,15 @@ pub(crate) fn keep_warm(sup: &dyn Supervisor) {
     }
 }
 
+/// When a seat's idle clock starts: now if someone is on it, else no earlier than the last
+/// device the door sent there, who may land and leave between two checks.
+fn idle_since(since: Instant, now: Instant, busy: bool, placed: Option<Instant>) -> Instant {
+    if busy {
+        return now;
+    }
+    placed.map_or(since, |placed| since.max(placed))
+}
+
 /// Stops a running seat once nobody has played on it for [`idle_stop`]. A seat whose host
 /// doesn't answer counts as busy: stopping it would be a guess.
 pub(crate) fn stop_idle(sup: &dyn Supervisor, stop: &AtomicBool) {
@@ -151,9 +160,8 @@ pub(crate) fn stop_idle(sup: &dyn Supervisor, stop: &AtomicBool) {
             }
             let busy = super::occupants(&seat).is_none_or(|o| !o.is_empty());
             let since = busy_at.entry(id.clone()).or_insert(now);
-            if busy {
-                *since = now;
-            } else if now.duration_since(*since) >= limit {
+            *since = idle_since(*since, now, busy, super::placement::last_placed(&id));
+            if !busy && now.duration_since(*since) >= limit {
                 tracing::info!(seat = %id, name = %seat.name, idle_min = limit.as_secs() / 60, "idle seat stopped");
                 if let Err(error) = sup.stop(seat.id) {
                     tracing::warn!(code = ?error.code, "idle seat did not stop: {}", error.message);
@@ -207,6 +215,23 @@ mod tests {
         p.os_account = account;
         p.last_used_unix = last_used;
         p
+    }
+
+    /// A device redirected since the last check keeps the seat from stopping at once, even
+    /// when it has already left; one placed long ago changes nothing.
+    #[test]
+    fn a_fresh_placement_restarts_the_idle_clock() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(4 * 3600);
+        let limit = Duration::from_secs(3600);
+        let idle = |placed| now.duration_since(idle_since(start, now, false, placed)) >= limit;
+        assert!(idle(None), "nobody came: stop");
+        assert!(idle(Some(start)), "an old placement");
+        assert!(
+            !idle(Some(now - Duration::from_secs(60))),
+            "a device just placed"
+        );
+        assert_eq!(idle_since(start, now, true, None), now, "busy restarts it");
     }
 
     const OWNER: &str = "0123456789abcdef0123456789abcdef";

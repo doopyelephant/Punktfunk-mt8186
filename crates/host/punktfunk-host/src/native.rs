@@ -1120,10 +1120,10 @@ pub(crate) async fn run_admitted(
         }
     };
     tracing::info!(profile = %resolved.id, name = %resolved.display_name, via = ?resolved.via, "profile");
+    // A refusal ends the connect here and leaves the profile's last-used time alone.
+    let placed = place_profile(&conn, &mut send, session_fp_hex.clone(), &first, &resolved).await?;
     profiles.touch(&resolved.id);
-    if let Some(served) =
-        place_profile(&conn, &mut send, session_fp_hex.clone(), &first, &resolved).await?
-    {
+    if let Some(served) = placed {
         return Ok(served);
     }
     let profile_ref = crate::events::ProfileRef {
