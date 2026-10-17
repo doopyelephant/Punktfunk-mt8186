@@ -12,7 +12,9 @@
 // `super::*` is the point of the child-module shape. `vk_util` is a crate-root sibling, so
 // `crate::` — not the parent-relative `super::` the parent uses.
 use super::*;
-use crate::vk_util::{ext_advertised, find_mem, find_mem_preferring, make_plain_image, make_view};
+use crate::vk_util::{
+    ext_advertised, find_mem_preferring, find_readback_mem, make_plain_image, make_view,
+};
 use anyhow::{bail, Result};
 use ash::vk;
 use pf_zerocopy::vkdev::VkImageAlloc;
@@ -654,19 +656,17 @@ unsafe fn make_frame_common(
         None,
     )?;
     let bs_req = device.get_buffer_memory_requirements(f.bs.buffer);
+    let (bs_type, bs_coherent) = find_readback_mem(mem_props, bs_req.memory_type_bits)?;
+    f.bs_coherent = bs_coherent;
     f.bs.memory = device.allocate_memory(
         &vk::MemoryAllocateInfo::default()
             .allocation_size(bs_req.size)
-            .memory_type_index(find_mem(
-                mem_props,
-                bs_req.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )?),
+            .memory_type_index(bs_type),
         None,
     )?;
     device.bind_buffer_memory(f.bs.buffer, f.bs.memory, 0)?;
-    // Map once for the slot's lifetime; `read_slot` copies AUs out of coherent memory.
-    // `vkFreeMemory` unmaps at teardown.
+    // Map once for the slot's lifetime; `read_slot` copies AUs out of it, invalidating first
+    // when the type is not coherent. `vkFreeMemory` unmaps at teardown.
     f.bs_ptr =
         BsPtr(
             device.map_memory(f.bs.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
