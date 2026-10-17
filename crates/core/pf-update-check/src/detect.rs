@@ -254,7 +254,9 @@ pub fn update_command(kind: InstallKind, product: Product) -> String {
         }
         (InstallKind::Flatpak, _) => "flatpak update --user io.unom.punktfunk".into(),
         // The signed feed carries the host image only; the client sysext is a local rebuild.
-        (InstallKind::Sysext, Product::Host) => "sudo punktfunk-sysext update".into(),
+        (InstallKind::Sysext, Product::Host) => "sudo punktfunk-sysext update   (an image you \
+             built with packaging/arch/build-sysext.sh: rebuild it the same way)"
+            .into(),
         (InstallKind::Sysext, Product::Client) => {
             "rebuild the client sysext: bash packaging/arch/build-sysext.sh <new .pkg.tar.zst> \
              && sudo cp punktfunk-client.raw /var/lib/extensions/ && sudo systemd-sysext refresh"
