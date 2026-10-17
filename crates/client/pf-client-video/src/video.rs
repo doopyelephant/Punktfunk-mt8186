@@ -576,6 +576,8 @@ pub struct Decoder {
     /// one again: the two native rungs demote onto each other and could otherwise
     /// bounce the session.
     ran: Vec<NativeRung>,
+    /// The resolved decoder preference the ladder was walked for; a new format walks it again.
+    choice: String,
 }
 
 /// Consecutive decode errors before hardware demotion. A lone transient re-requests an IDR and stays.
@@ -643,6 +645,39 @@ fn native_vaapi_codec(wire: u8) -> Option<pf_vaapi::Codec> {
         punktfunk_core::quic::CODEC_AV1 => Some(pf_vaapi::Codec::Av1),
         _ => None,
     }
+}
+
+/// The ladder's first rung that opens for `wire` and `stream` under `choice`, else the CPU rung.
+/// `?` can carry `NoSoftwareRung` (HEVC with no hardware), typed to the pump
+/// ([`last_rung_verdict`]).
+fn first_rung(
+    choice: &str,
+    wire: u8,
+    stream: StreamFormat,
+    vk: Option<&VulkanDecodeDevice>,
+) -> Result<Box<dyn Rung>> {
+    for step in ladder(Os::HOST, choice, wire, vk) {
+        let rung = match step {
+            Step::Try(rung) | Step::Pin(rung) => rung,
+            Step::Note(note) => {
+                log_note(note, choice, wire, vk);
+                continue;
+            }
+        };
+        match build_rung(rung, wire, stream, vk) {
+            Ok(built) => return Ok(built),
+            // A pin's failure warns: it must not be quieter than auto's, which only informs.
+            Err(e) if matches!(step, Step::Pin(_)) => {
+                tracing::warn!(reason = %format!("{e:#}"),
+                    "{} init failed — demoting to the standard ladder", rung.name());
+            }
+            Err(e) => {
+                tracing::info!(reason = %format!("{e:#}"),
+                    "{} unavailable — continuing down the ladder", rung.name());
+            }
+        }
+    }
+    Ok(Box::new(SoftwareDecoder::new(wire)?))
 }
 
 /// Build `rung` for `wire` on the presenter's device and log it active. Pin, auto and
@@ -830,47 +865,38 @@ impl Decoder {
                  same hardware path"
             );
         }
-        let done = |rung: Box<dyn Rung>| {
-            // One exit every rung leaves through, so a session that never
-            // reaches the native constructor still reports `PUNKTFUNK_AU_FAULT`.
-            report_au_fault_env(rung.id() == Some(NativeRung::Vulkan));
-            log_rung(rung.as_ref(), wire);
-            Ok(Decoder {
-                ran: rung.id().into_iter().collect(),
-                retiring: None,
-                rung,
-                wire_codec: wire,
-                fails: 0,
-                first_fail: None,
-                want_keyframe: false,
-                delivered: false,
-                vk: vk.cloned(),
-                stream,
-            })
-        };
-        for step in ladder(Os::HOST, &choice, wire, vk) {
-            let rung = match step {
-                Step::Try(rung) | Step::Pin(rung) => rung,
-                Step::Note(note) => {
-                    log_note(note, &choice, wire, vk);
-                    continue;
-                }
-            };
-            match build_rung(rung, wire, stream, vk) {
-                Ok(built) => return done(built),
-                // A pin's failure warns: it must not be quieter than auto's, which only informs.
-                Err(e) if matches!(step, Step::Pin(_)) => {
-                    tracing::warn!(reason = %format!("{e:#}"),
-                        "{} init failed — demoting to the standard ladder", rung.name());
-                }
-                Err(e) => {
-                    tracing::info!(reason = %format!("{e:#}"),
-                        "{} unavailable — continuing down the ladder", rung.name());
-                }
-            }
-        }
-        // `?` can carry `NoSoftwareRung` (HEVC with no hardware). Stays typed to the pump ([`last_rung_verdict`]).
-        done(Box::new(SoftwareDecoder::new(wire)?))
+        let rung = first_rung(&choice, wire, stream, vk)?;
+        // One exit every rung leaves through, so a session that never reaches the native
+        // constructor still reports `PUNKTFUNK_AU_FAULT`.
+        report_au_fault_env(rung.id() == Some(NativeRung::Vulkan));
+        log_rung(rung.as_ref(), wire);
+        Ok(Decoder {
+            ran: rung.id().into_iter().collect(),
+            retiring: None,
+            rung,
+            wire_codec: wire,
+            fails: 0,
+            first_fail: None,
+            want_keyframe: false,
+            delivered: false,
+            vk: vk.cloned(),
+            stream,
+            choice,
+        })
+    }
+
+    /// The host changed the stream's codec or picture shape at the frame about to decode:
+    /// walk the ladder again for `wire` and `stream` and install its first rung that opens,
+    /// as a connect would. A Vulkan rung retires as on a demotion; the rungs run so far were
+    /// another format's. `Err` is the typed refusal when nothing can decode it.
+    pub fn reformat(&mut self, wire: u8, stream: StreamFormat) -> Result<()> {
+        let rung = first_rung(&self.choice, wire, stream, self.vk.as_ref())?;
+        log_rung(rung.as_ref(), wire);
+        (self.wire_codec, self.stream) = (wire, stream);
+        self.ran.clear();
+        self.install(rung);
+        self.want_keyframe = false;
+        Ok(())
     }
 
     /// Wait for a Vulkan-Video GPU decode (timeline). `false` declines the
@@ -943,6 +969,7 @@ impl Decoder {
             stream: StreamFormat::SDR_420_8,
             ran: Vec::new(),
             retiring: None,
+            choice: String::new(),
         })
     }
 
@@ -1126,6 +1153,23 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::video_caps::tests::decode_device;
+
+    /// A new format rebuilds onto a rung for its codec. One nothing here decodes leaves the
+    /// decoder as it was, with the typed refusal the pump turns into a codec ask.
+    #[test]
+    fn a_new_format_rebuilds_the_decoder_or_leaves_it() {
+        use punktfunk_core::quic::{CODEC_H264, CODEC_HEVC};
+        if std::env::var_os("PUNKTFUNK_DECODER").is_some() {
+            return;
+        }
+        let sdr = StreamFormat::SDR_420_8;
+        let mut d = Decoder::new(CODEC_H264, "software", None, sdr).expect("software H.264");
+        let e = d.reformat(CODEC_HEVC, sdr).expect_err("no software HEVC");
+        assert!(e.downcast_ref::<NoSoftwareRung>().is_some(), "{e:#}");
+        assert_eq!(d.wire_codec, CODEC_H264, "the old decoder stays");
+        d.reformat(CODEC_H264, sdr).expect("software H.264 again");
+        assert_eq!(d.wire_codec, CODEC_H264);
+    }
 
     /// DXGI packs the four Device Manager fields high to low, 16 bits each.
     #[test]

@@ -644,6 +644,8 @@ fn dial(
         client_caps: client_caps(params, plan.pad_audio_on),
         // Slice-progressive delivery: off — every rung here is fed whole AUs.
         frame_parts: false,
+        // `Pump::on_frame` rebuilds the decoder on a frame in a new format.
+        rebuilds_decoder: true,
         launch: params.launch.clone(),
         profile: params.profile.clone(),
         // Host's trust-store label. Without it every no-PIN "request access" knock
@@ -720,20 +722,18 @@ fn open_decoder(
     // Decoder for the host-resolved codec and picture shape (never assume HEVC).
     // Native rungs probe the device at construction, so a 4:4:4 or Main 10 this GPU
     // cannot decode refuses before the rung is chosen instead of error-streaking.
-    let stream_format = crate::video::StreamFormat {
-        chroma_format_idc: connector.chroma_format,
-        bit_depth: connector.bit_depth,
-    };
+    let format = connector.video_format();
+    let stream_format = stream_format_of(&format);
     tracing::info!(
-        codec = crate::video::wire_codec_name(connector.codec),
-        welcome_codec = connector.codec,
+        codec = crate::video::wire_codec_name(format.codec),
+        welcome_codec = format.codec,
         "negotiated video codec"
     );
     // A negotiated PyroWave session decodes on the presenter's device — reachable
     // only through the explicit preference above, so failing here is failing an
     // opted-in experiment.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
-    let built = if connector.codec == punktfunk_core::quic::CODEC_PYROWAVE {
+    let built = if format.codec == punktfunk_core::quic::CODEC_PYROWAVE {
         let mode = connector.mode();
         // Wavelet bitstream has no VUI: Welcome colour signalling is the session's
         // colour contract, and the resolved chroma sizes the plane ring.
@@ -758,11 +758,19 @@ fn open_decoder(
             )),
         }
     } else {
-        Decoder::new(connector.codec, decoder, vulkan, stream_format)
+        Decoder::new(format.codec, decoder, vulkan, stream_format)
     };
     #[cfg(not(all(any(target_os = "linux", windows), feature = "pyrowave")))]
-    let built = Decoder::new(connector.codec, decoder, vulkan, stream_format);
+    let built = Decoder::new(format.codec, decoder, vulkan, stream_format);
     built
+}
+
+/// The picture shape a decoder for `format` is built for.
+fn stream_format_of(format: &punktfunk_core::quic::VideoFormat) -> crate::video::StreamFormat {
+    crate::video::StreamFormat {
+        chroma_format_idc: format.chroma_format,
+        bit_depth: format.bit_depth,
+    }
 }
 
 /// [`crate::video::amd_vulkan_hdr_driver_notice`] for this session, AMD only. The driver
@@ -1043,6 +1051,8 @@ fn pump(
         total_frames: 0,
         dec_path: "",
         codec_fallback: None,
+        codec_ask: None,
+        asked_off: 0,
         not_ready: false,
         debug_reconfig,
         pump_start,
@@ -1066,6 +1076,10 @@ fn pump(
 }
 
 /// What the pump does after one AU.
+/// How long a codec ask may go unanswered before the session redials without the codec. A
+/// rebuild at the host is a pipeline swap: hundreds of milliseconds.
+const CODEC_ASK_WAIT: Duration = Duration::from_secs(3);
+
 enum Pass {
     /// Run the end-of-pass drains, then pull the next frame.
     Drain,
@@ -1090,6 +1104,11 @@ struct Pump {
     /// Set when the ladder ran out of rungs. `Some` is the only way the pump ends
     /// with a retry attached.
     codec_fallback: Option<SessionEvent>,
+    /// The host was asked for another codec instead: the redial that follows if it refuses or
+    /// sends nothing new within [`CODEC_ASK_WAIT`], and when it was asked.
+    codec_ask: Option<(SessionEvent, Instant)>,
+    /// Every codec this session asked the host off, so a redial never asks for one again.
+    asked_off: u8,
     /// Set when the host refused setup before any frame while it may still be waking.
     not_ready: bool,
     /// The `PUNKTFUNK_DEBUG_RECONFIGURE` switch still to send, and when.
@@ -1124,6 +1143,9 @@ impl Pump {
             }
             self.debug_reconfigure();
             self.on_access_update();
+            if self.codec_ask_settled() {
+                return None;
+            }
             // A decode still on the GPU is polled every half millisecond and handed on the
             // moment its pixels are done. 50 ms bounds a wedged one.
             let decoder = &mut self.decoder;
@@ -1217,6 +1239,21 @@ impl Pump {
     /// One AU off the wire: order it, decode it, then demote or ask for a keyframe as
     /// the decoder says.
     fn on_frame(&mut self, frame: Frame) -> Pass {
+        if let Some(format) = frame.new_format {
+            self.codec_ask = None;
+            if let Err(e) = self
+                .decoder
+                .reformat(format.codec, stream_format_of(&format))
+            {
+                return match exhausted(&e, format.codec, self.advertised_codecs) {
+                    Some(ev) => self.fall_back(ev),
+                    None => Pass::End(Some(format!("video decoder: {e}"))),
+                };
+            }
+        } else if self.codec_ask.is_some() {
+            // The decoder ran out for this codec; its frames wait out the host's answer.
+            return Pass::Skip;
+        }
         // Reassembly completion, stamped by the core session as the AU crossed
         // `poll_frame`. Stamping here at the pull would fold pre-decode queue
         // wait into `host+network` (client backlog looking like network).
@@ -1251,9 +1288,9 @@ impl Pump {
             Err(e) => {
                 // Last rung gone for this codec. Feeding more AUs would freeze the
                 // screen forever. End; the terminal event carries the retry.
-                if let Some(ev) = exhausted(&e, self.connector.codec, self.advertised_codecs) {
-                    self.codec_fallback = Some(ev);
-                    return Pass::End(None);
+                let codec = self.connector.video_format().codec;
+                if let Some(ev) = exhausted(&e, codec, self.advertised_codecs) {
+                    return self.fall_back(ev);
                 }
                 // Survivable (loss until the next IDR/RFI) — keep feeding.
                 tracing::debug!(error = %e, "decode error (recovering)");
@@ -1261,6 +1298,48 @@ impl Pump {
             }
         }
         self.after_decode()
+    }
+
+    /// The ladder ran out for this codec. Ask the host for another and keep the session, so a
+    /// decoder fallback costs a rebuild, not a reconnect; without format epochs, or with an
+    /// ask already out, end with the redial `ev` carries.
+    fn fall_back(&mut self, mut ev: SessionEvent) -> Pass {
+        if let SessionEvent::CodecFallback {
+            exclude_codecs,
+            retry_caps,
+            ..
+        } = &mut ev
+        {
+            *exclude_codecs |= self.asked_off;
+            *retry_caps &= !self.asked_off;
+            if self.codec_ask.is_none()
+                && self.connector.request_codec_change(*exclude_codecs).is_ok()
+            {
+                tracing::warn!(
+                    excluded = *exclude_codecs,
+                    "decode ladder exhausted — asking the host for another codec"
+                );
+                self.asked_off |= *exclude_codecs;
+                self.codec_ask = Some((ev, Instant::now()));
+                return Pass::Skip;
+            }
+        }
+        self.codec_fallback = Some(ev);
+        Pass::End(None)
+    }
+
+    /// An ask the host refused, or left unanswered past [`CODEC_ASK_WAIT`], ends the session
+    /// with its redial. `true` = end now.
+    fn codec_ask_settled(&mut self) -> bool {
+        let Some((_, asked)) = &self.codec_ask else {
+            return false;
+        };
+        if self.connector.codec_refused() == 0 && asked.elapsed() < CODEC_ASK_WAIT {
+            return false;
+        }
+        tracing::warn!("the host did not move to another codec — reconnecting without it");
+        self.codec_fallback = self.codec_ask.take().map(|(ev, _)| ev);
+        true
     }
 
     /// Lend the decoder's in-place AU memory to the connector when it is new: at open, and
@@ -1289,13 +1368,13 @@ impl Pump {
         // demotion never fires.
         if self.params.force_software.swap(false, Ordering::Relaxed) {
             if let Err(e) = self.decoder.force_software() {
-                // No software rung (HEVC, PyroWave): reconnect without the codec, as
-                // the decode arm does, or the next Hello asks for it again.
-                self.codec_fallback = exhausted(&e, self.connector.codec, self.advertised_codecs);
-                return Pass::End(match self.codec_fallback {
-                    Some(_) => None,
-                    None => Some(format!("software decoder rebuild: {e}")),
-                });
+                // No software rung (HEVC, PyroWave): another codec, as the decode arm
+                // asks, or the next Hello asks for this one again.
+                let codec = self.connector.video_format().codec;
+                return match exhausted(&e, codec, self.advertised_codecs) {
+                    Some(ev) => self.fall_back(ev),
+                    None => Pass::End(Some(format!("software decoder rebuild: {e}"))),
+                };
             }
         }
         // Infinite GOP has no periodic keyframe, so a rebuilt or erroring decoder
