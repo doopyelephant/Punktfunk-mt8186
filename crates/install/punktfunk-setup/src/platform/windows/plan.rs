@@ -446,6 +446,9 @@ fn enabled(state: TaskState) -> Option<bool> {
     }
 }
 
+/// The tray's toast AUMID before the `io.` prefix. Install and uninstall both delete it.
+const LEGACY_TRAY_AUMID: &str = r"HKLM\SOFTWARE\Classes\AppUserModelId\unom.punktfunk.tray";
+
 fn registry_steps(facts: &WinFacts, choices: &WinChoices, app: &str) -> Vec<WinAction> {
     // The host owns the tray's `Run` value: its `settings set` stores the choice, where the
     // console can change it, and writes or deletes the value to match.
@@ -457,7 +460,8 @@ fn registry_steps(facts: &WinFacts, choices: &WinChoices, app: &str) -> Vec<WinA
         &choices.tray_autostart.to_string(),
     ])];
     // Toast AUMID; must stay in lockstep with `punktfunk-tray/src/win.rs`.
-    let aumid = r"HKLM\SOFTWARE\Classes\AppUserModelId\unom.punktfunk.tray";
+    let aumid = r"HKLM\SOFTWARE\Classes\AppUserModelId\io.unom.punktfunk.tray";
+    steps.push(run_lenient(&["reg", "delete", LEGACY_TRAY_AUMID, "/f"]));
     steps.push(run(&[
         "reg",
         "add",
@@ -680,9 +684,10 @@ fn host_uninstall(facts: &WinFacts, choices: &WinChoices) -> WinPlan {
             run_lenient(&[
                 "reg",
                 "delete",
-                r"HKLM\SOFTWARE\Classes\AppUserModelId\unom.punktfunk.tray",
+                r"HKLM\SOFTWARE\Classes\AppUserModelId\io.unom.punktfunk.tray",
                 "/f",
             ]),
+            run_lenient(&["reg", "delete", LEGACY_TRAY_AUMID, "/f"]),
             run_lenient(&[
                 "reg",
                 "delete",

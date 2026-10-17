@@ -25,13 +25,13 @@ use windows::Win32::winuser::{
 
 /// The single-instance mutex. Named per the design; deliberately not `Global\` — one shell per
 /// user session is the rule, and a second desktop user gets their own.
-const MUTEX_NAME: windows::core::PCWSTR = windows::core::w!("unom.punktfunk.client");
+const MUTEX_NAME: windows::core::PCWSTR = windows::core::w!("io.unom.punktfunk.client");
 
 /// Tags our `WM_COPYDATA` so a stray message from anything else is ignored rather than parsed.
 const COPYDATA_URL: usize = 0x7066_0001; // 'pf' + 1
 
 /// Window class of the primary's message-only receiver; later instances find it by this name.
-const RECEIVER_CLASS: windows::core::PCWSTR = windows::core::w!("unom.punktfunk.deeplink");
+const RECEIVER_CLASS: windows::core::PCWSTR = windows::core::w!("io.unom.punktfunk.deeplink");
 
 /// URLs delivered by another instance, waiting for the app's poll to pick them up. A queue
 /// rather than a single slot: two shortcuts double-clicked in quick succession are two links,

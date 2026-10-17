@@ -30,7 +30,7 @@
   IgnorableNamespaces="uap uap5 rescap">
 
   <Identity
-    Name="unom.Punktfunk"
+    Name="io.unom.punktfunk"
     Publisher="{PUBLISHER}"
     Version="{VERSION}"
     ProcessorArchitecture="{ARCH}" />

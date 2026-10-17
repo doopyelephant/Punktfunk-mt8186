@@ -200,7 +200,7 @@ Removing a client doesn't unpair it: unpair the device in the host's
 | Linux Flatpak | `flatpak uninstall --user --delete-data io.unom.punktfunk` | A `~/.config/punktfunk` an older version used, if any; the Flatpak remote (`flatpak remotes --user`, then `flatpak remote-delete --user <name>`) |
 | Linux packages | `sudo apt purge punktfunk-client`, `sudo dnf remove punktfunk-client` or `sudo pacman -Rns punktfunk-client`; drop the repo as for hosts | `~/.config/punktfunk` |
 | Windows installer | **Punktfunk** in **Settings → Apps → Installed apps**, or `& "$env:LOCALAPPDATA\Programs\Punktfunk\unins000.exe" /VERYSILENT`. Portable zip: delete the folder | `%APPDATA%\punktfunk` |
-| Windows MSIX | `Get-AppxPackage unom.Punktfunk \| Remove-AppxPackage` | `%APPDATA%\punktfunk`, if present |
+| Windows MSIX | `Get-AppxPackage *unom.punktfunk \| Remove-AppxPackage` | `%APPDATA%\punktfunk`, if present |
 | macOS | Quit it and drag it from **Applications** to the Trash | — |
 | iPhone, iPad, Apple TV | Delete the app; if you joined the beta, stop testing in **TestFlight** | — |
 | Android, Android TV | Uninstall from Google Play or **Settings → Apps**; leave the testing program on the Play listing if you joined canary | — |
