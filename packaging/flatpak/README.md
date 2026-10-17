@@ -121,7 +121,7 @@ is involved; HEVC decodes on the GPU's own driver, and there is deliberately no 
 rung (see the manifest header). A bundled
 **SDL3 3.4.18** module (pinned to match `sdl3-sys 0.7.2+SDL-3.4.18`), and finish-args for Wayland +
 `--device=all` (GPU/VAAPI render node + evdev + the hidraw char-devices SDL3 needs for DualSense)
-+ `--socket=pulseaudio` (PipeWire-pulse: playback + mic) + `--share=network`. Alongside it:
++ the native `pipewire-0` socket (playback + mic) + `--share=network`. Alongside it:
 `io.unom.punktfunk.desktop`, `io.unom.punktfunk.metainfo.xml`, `io.unom.punktfunk.svg` (all
 installed by the manifest). No `vulkan-headers` module: it existed for `pf-ffvk`'s bindgen over
 FFmpeg's `hwcontext_vulkan.h`, and ash generates its own bindings and dlopens the loader.

@@ -21,14 +21,10 @@ finish-args:
   # GPU render node for Vulkan Video and VAAPI decode, evdev pads, and the hidraw nodes
   # SDL's HIDAPI needs for DualSense touchpad, motion, triggers and lightbar.
   - --device=all
-  - --filesystem=/run/udev:ro
-  # Audio and microphone use the native PipeWire protocol; pulseaudio is the fallback.
+  # Audio and microphone use the native PipeWire protocol.
   - --filesystem=xdg-run/pipewire-0
-  - --socket=pulseaudio
   # QUIC streaming and mDNS host discovery.
   - --share=network
-  # Pairing identity, known hosts and settings, shared with a native install of the client.
-  - --filesystem=~/.config/punktfunk:create
   # HDR under gamescope: the bundled WSI layer reaches gamescope over its own socket and
   # only activates when this variable names it.
   - --env=ENABLE_GAMESCOPE_WSI=1
