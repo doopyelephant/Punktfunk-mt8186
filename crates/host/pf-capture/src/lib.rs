@@ -208,6 +208,14 @@ pub trait Capturer: Send {
     /// errors surface at the following `try_latest`.
     fn wait_arrival(&mut self, _deadline: std::time::Instant) {}
 
+    /// A handle that ends a running [`wait_arrival`](Self::wait_arrival) now, with no
+    /// frame, so the loop ticks on the frame it has. For the control task: a client's
+    /// recovery ask goes out at once instead of after the next arrival. `None` (default)
+    /// leaves the ask for the next tick.
+    fn arrival_poke(&self) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
+
     /// Gate expensive per-frame work so the capturer can stay alive between
     /// streams. The portal skips the de-pad copy while inactive and flushes
     /// its frame mailbox on `false`. `&mut self`: the mailbox flush cannot share.

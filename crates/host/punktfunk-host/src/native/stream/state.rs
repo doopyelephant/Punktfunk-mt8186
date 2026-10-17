@@ -116,6 +116,9 @@ pub(super) struct StreamState {
     /// [`crate::native::wiring::SessionShared::acked`] and `lossy_window`.
     pub(super) acked: Arc<AtomicU64>,
     pub(super) lossy_window: Arc<AtomicBool>,
+    /// [`crate::native::wiring::SessionShared::arrival_poke`]: the running capturer's, for
+    /// the control task.
+    pub(super) arrival_poke: crate::native::wiring::ArrivalPoke,
     pub(super) kf_gate: super::recovery::KeyframeGate,
     pub(super) recovery_cadence: pf_frame::metronome::Metronome,
     pub(super) ir_wave_pos: u32,
@@ -403,6 +406,7 @@ impl StreamState {
                             lossy_window,
                             ramp_open,
                             cursor_client_draws,
+                            arrival_poke,
                         },
                     mut bitrate_kbps,
                     audio_reserved_kbps,
@@ -778,6 +782,7 @@ impl StreamState {
             wire_rekeys,
             live_mode,
             force_idr,
+            arrival_poke,
             capture_health,
             health_published_at: now,
             vd,
@@ -923,6 +928,7 @@ impl StreamState {
         let _session_span = tracing::info_span!("session", id = self.live_session.id).entered();
         self.life.enter(crate::lifecycle::Phase::Streaming);
         self.spawn_session_watcher();
+        self.publish_arrival_poke();
         let result = self.tick_loop();
         self.finish(result.is_ok());
         result

@@ -392,6 +392,7 @@ pub(super) async fn run(task: Task) {
                 lossy_window,
                 ramp_open,
                 cursor_client_draws,
+                arrival_poke,
             },
         clip_enabled,
         clip,
@@ -509,6 +510,7 @@ pub(super) async fn run(task: Task) {
                         if keyframe_tx.send(()).is_err() {
                             break;
                         }
+                        poke_capture(&arrival_poke);
                     } else if let Some((first, last)) = fb.invalidate {
                         // Encode loop falls back to a coalesced IDR when the range
                         // is too old or the encoder has no RFI.
@@ -522,6 +524,7 @@ pub(super) async fn run(task: Task) {
                         if rfi_tx.send((first, last)).is_err() {
                             break;
                         }
+                        poke_capture(&arrival_poke);
                     } else if let Some(n) = fb.nack {
                         let queued = resend
                             .lock()
@@ -1126,6 +1129,14 @@ async fn offer_edge(
 /// A blocking pad create or the 200 ms "owned elsewhere" wait stalls the input thread; a
 /// release outlasts both. Longer, and the session is gone anyway.
 const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Fire the stream loop's capture poke, so a recovery ask goes out this tick, not the next.
+fn poke_capture(poke: &super::wiring::ArrivalPoke) {
+    let poke = poke.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(poke) = poke {
+        poke();
+    }
+}
 
 #[cfg(test)]
 mod tests {
