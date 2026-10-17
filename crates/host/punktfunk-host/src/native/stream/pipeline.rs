@@ -463,9 +463,10 @@ impl VideoOpen {
 /// Open the session's encoder for `frame` — framed for a joiner, or at the client's `negotiated`
 /// size when a larger head is mirrored (`session_plan::open_encoder_fitted`) — with the plan's
 /// chunking, slice ceiling and the capturer's ring depth applied, and return the framing it
-/// encodes. `bitrate_bps` is asked for that size. An IDD-push source gets the driver's encoder
-/// instead, its wire-index domain continuing at `wire_seq_base` (the loop's `au_seq`). Both
-/// stream loops open here: GameStream's plan carries the client's own slice count.
+/// encodes. `bitrate_bps` is asked for that size; depth and HDR are what the source composes now
+/// (`session_plan::live_depth`). An IDD-push source gets the driver's encoder instead, its
+/// wire-index domain continuing at `wire_seq_base` (the loop's `au_seq`). Both stream loops open
+/// here: GameStream's plan carries the client's own slice count.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_session_encoder(
     plan: &crate::session_plan::SessionPlan,
@@ -530,6 +531,8 @@ fn open_session_encoder_with(
             )
         });
     }
+    let (hdr, bit_depth) =
+        crate::session_plan::live_depth(plan.hdr, capturer.hdr_meta().is_some(), bit_depth);
     let (mut enc, framed) = crate::session_plan::open_encoder_fitted(
         frame,
         negotiated,
@@ -544,7 +547,7 @@ fn open_session_encoder_with(
                 bitrate_bps: bitrate_bps(width, height),
                 cuda: frame.is_cuda(),
                 bit_depth,
-                hdr: plan.hdr,
+                hdr,
                 chroma: plan.chroma,
                 cursor_blend: plan.cursor_blend,
                 slices: plan.slices,
@@ -814,11 +817,24 @@ mod tests {
         }
     }
 
+    /// A synthetic source lit HDR.
+    struct Lit(crate::capture::SyntheticCapturer);
+
+    impl crate::capture::Capturer for Lit {
+        fn next_frame(&mut self) -> Result<crate::capture::CapturedFrame> {
+            self.0.next_frame()
+        }
+        fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
+            Some(pf_frame::hdr::generic_hdr10())
+        }
+    }
+
     /// Native opens a 4:4:4 HDR session at its own depth and a rate per encoded size;
     /// GameStream a 4:2:0 one at the client's slice count, the frame's depth and one rate.
+    /// Over a source gone SDR the HDR session opens 8-bit SDR.
     #[test]
     fn both_loops_open_the_encoder_their_plan_names() {
-        let mut cap = crate::capture::SyntheticCapturer::new(64, 32, 60);
+        let mut cap = Lit(crate::capture::SyntheticCapturer::new(64, 32, 60));
         let frame = cap.next_frame().expect("a synthetic frame");
         let want =
             |plan: &crate::session_plan::SessionPlan, hz, bitrate_bps, bit_depth| VideoOpen {
@@ -869,6 +885,24 @@ mod tests {
         let gamestream = plan(crate::encode::ChromaFormat::Yuv420, false, 4);
         let asked = open(&gamestream, 60, |_, _| 16_287_878, 8);
         assert_eq!(asked, [want(&gamestream, 60, 16_287_878, 8)]);
+
+        let sdr = crate::capture::SyntheticCapturer::new(64, 32, 60);
+        let (_, _) = open_session_encoder_with(
+            &native,
+            &sdr,
+            &frame,
+            (64, 32),
+            120,
+            |w, h| u64::from(w * h),
+            10,
+            None,
+            1,
+            |v| {
+                assert_eq!((v.hdr, v.bit_depth), (false, 8), "an SDR source");
+                Ok(Box::new(NullEnc))
+            },
+        )
+        .expect("an encoder");
     }
 
     #[test]

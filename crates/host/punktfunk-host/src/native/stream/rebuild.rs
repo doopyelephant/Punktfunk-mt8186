@@ -426,13 +426,6 @@ impl StreamState {
                 self.swap_pipeline(Next::Pipeline(pipe), SwapReason::Format);
                 self.adopt_built_bitrate(kbps);
                 self.next = std::time::Instant::now();
-                crate::session_status::set_format(
-                    self.live_session.id,
-                    codec,
-                    hdr,
-                    bit_depth,
-                    chroma,
-                );
                 trace.finish("pipeline_rebuilt");
                 announce_pipeline_gap(&self.gap_tx, trace.total_slot().load(Ordering::Relaxed));
                 let _ = self.format_result_tx.send(Some(codec));

@@ -397,6 +397,15 @@ fn resolve_encoder() -> EncoderBackend {
     }
 }
 
+/// The HDR flag and depth an encoder opens at, and an epoch says, for a session negotiated at
+/// `plan_hdr`/`bit_depth` whose source composes HDR now or not. An HDR session on a source
+/// gone SDR (Windows HDR switched off, a head re-lit SDR) encodes 8-bit SDR until it is lit
+/// again; a driver's pool refuses every surface not in the format it opened for.
+pub(crate) fn live_depth(plan_hdr: bool, source_hdr: bool, bit_depth: u8) -> (bool, u8) {
+    let hdr = plan_hdr && source_hdr;
+    (hdr, if plan_hdr && !hdr { 8 } else { bit_depth })
+}
+
 /// Whether a session opened now streams a pinned physical head instead of a virtual display.
 pub(crate) fn mirrored() -> bool {
     pf_vdisplay::mirrors_pinned()
@@ -481,6 +490,16 @@ mod tests {
     use crate::encode::{ChromaFormat, Codec};
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use pf_vdisplay::Compositor;
+
+    /// An encoder opens for what the source composes: an HDR session on an SDR source is 8-bit
+    /// SDR, 10-bit SDR stays 10-bit, and an SDR session never turns HDR.
+    #[test]
+    fn an_encoder_opens_for_what_the_source_composes() {
+        assert_eq!(live_depth(true, true, 10), (true, 10));
+        assert_eq!(live_depth(true, false, 10), (false, 8));
+        assert_eq!(live_depth(false, false, 10), (false, 10));
+        assert_eq!(live_depth(false, true, 8), (false, 8));
+    }
 
     /// The plan keeps the client's count: a GameStream ask above the native default survives.
     #[test]
