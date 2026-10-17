@@ -7,6 +7,8 @@ use crate::quic::{ClipControl, ClipOffer, ProbeRequest, Welcome};
 /// borrows across branches do not compile.
 pub(crate) enum CtrlRequest {
     Mode(Mode),
+    /// A codec ask: these `CODEC_*` bits can't be decoded here.
+    Codec(u8),
     Probe(ProbeRequest),
     ProbeShaped(crate::quic::ProbeShaped),
     /// The pump's [`BitrateController`] sends this (kbps) when bitrate is Automatic.

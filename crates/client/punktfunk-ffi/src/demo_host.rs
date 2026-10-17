@@ -439,6 +439,7 @@ async fn control_loop(
             let answer = Reconfigured {
                 accepted: true,
                 mode,
+                exclude_codecs: 0,
             };
             v2io::send(&mut send, &answer).await?;
         }

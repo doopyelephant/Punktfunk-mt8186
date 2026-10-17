@@ -333,6 +333,7 @@ fn tell(
         None => d.corrects.then_some(Tell::Correct(Reconfigured {
             accepted: true,
             mode: d.mode,
+            exclude_codecs: 0,
         })),
     }
 }
@@ -657,7 +658,11 @@ pub(super) async fn run(task: Task) {
                         last_accepted_switch = Some(now);
                         tracing::info!(mode = ?req.mode, "mode switch accepted");
                     }
-                    let ack = Reconfigured { accepted: ok, mode: active };
+                    let ack = Reconfigured {
+                        accepted: ok,
+                        mode: active,
+                        exclude_codecs: 0,
+                    };
                     if v2io::send(&mut ctrl_send, &ack).await.is_err() {
                         break;
                     }
@@ -1213,7 +1218,8 @@ mod tests {
             tell(&mut none, &d(2, 800, true)),
             Some(Tell::Correct(Reconfigured {
                 accepted: true,
-                mode: mode(800)
+                mode: mode(800),
+                exclude_codecs: 0,
             }))
         );
     }

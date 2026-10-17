@@ -790,8 +790,11 @@ pub struct PunktfunkConnectOpts {
     /// ([`punktfunk_pyrowave_kbps`]). `0`, which a shorter prefix defaults to, leaves the
     /// host's own.
     pub pyrowave_bpp_x100: u16,
+    /// `PUNKTFUNK_REFORMAT_*` bits: what this caller rebuilds when the host changes the stream's
+    /// format mid-session. `0`, which a shorter prefix defaults to, keeps the format fixed.
+    pub reformat: u8,
     /// Always `0`. Fills what would otherwise be padding.
-    pub reserved4: [u8; 6],
+    pub reserved4: [u8; 5],
     /// Called once, on the connecting thread, when the host answers that its operator is
     /// deciding about this device: show "waiting for approval". The connect then waits for the
     /// host's verdict, up to ten minutes, not `timeout_ms`. Null: `timeout_ms` stands.
@@ -799,6 +802,12 @@ pub struct PunktfunkConnectOpts {
     /// Handed back to `on_pending` untouched.
     pub on_pending_ctx: *mut std::os::raw::c_void,
 }
+
+/// [`PunktfunkConnectOpts::reformat`]: this caller rebuilds its decoder on a frame flagged
+/// [`FRAME_NEW_FORMAT`](punktfunk_core::packet::FRAME_NEW_FORMAT), from the codec, colour and
+/// chroma getters read right after it.
+#[cfg(feature = "quic")]
+pub const PUNKTFUNK_REFORMAT_VIDEO: u8 = 1;
 
 // No tail padding (append contract). On grow: freeze `CONNECT_OPTS_MIN_SIZE`, update these sizes.
 // `video_fit` sits in the byte v35–v40 callers zeroed as `reserved0`.
@@ -812,6 +821,7 @@ const _: () = {
             && offset_of!(PunktfunkConnectOpts, delivery_flags) == 121
             && offset_of!(PunktfunkConnectOpts, profile_id) == 128
             && offset_of!(PunktfunkConnectOpts, pyrowave_bpp_x100) == 136
+            && offset_of!(PunktfunkConnectOpts, reformat) == 138
             && offset_of!(PunktfunkConnectOpts, on_pending) == 144
     );
     #[cfg(target_pointer_width = "32")]
@@ -821,6 +831,7 @@ const _: () = {
             && offset_of!(PunktfunkConnectOpts, delivery_flags) == 85
             && offset_of!(PunktfunkConnectOpts, profile_id) == 92
             && offset_of!(PunktfunkConnectOpts, pyrowave_bpp_x100) == 96
+            && offset_of!(PunktfunkConnectOpts, reformat) == 98
             && offset_of!(PunktfunkConnectOpts, on_pending) == 104
     );
 };
@@ -862,7 +873,8 @@ impl Default for PunktfunkConnectOpts {
             reserved2: [0; 6],
             profile_id: ptr::null(),
             pyrowave_bpp_x100: 0,
-            reserved4: [0; 6],
+            reformat: 0,
+            reserved4: [0; 5],
             on_pending: None,
             on_pending_ctx: ptr::null_mut(),
         }
@@ -1158,6 +1170,7 @@ unsafe fn connect_params(
         preset,
         profile,
         probe_only: o.delivery_flags & punktfunk_core::quic::EXT_DELIVERY_PROBE_ONLY != 0,
+        rebuilds_decoder: o.reformat & PUNKTFUNK_REFORMAT_VIDEO != 0,
         on_pending: o.on_pending.map(|f| {
             let hook = PendingHook(f, o.on_pending_ctx as usize);
             std::sync::Arc::new(move || hook.call()) as std::sync::Arc<dyn Fn() + Send + Sync>

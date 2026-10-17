@@ -48,6 +48,12 @@ pub const USER_FLAG_SLICE_STREAM: u32 = 0x80;
 /// older host, zero means unknown, not all-active.
 pub const USER_FLAG_REPEAT: u32 = 0x100;
 
+/// Frame `flags` bit core sets on a frame it hands out, never on the wire (v2 masks user flags
+/// to `0x7FFF`): the stream's format changed at this frame
+/// ([`Frame::new_format`](crate::session::Frame::new_format)). Rebuild the decoder from the
+/// connection's codec, colour and chroma before decoding it.
+pub const FRAME_NEW_FORMAT: u32 = 0x1_0000;
+
 /// Widest lost-frame range (`last - first`, wrapping) RFI may repair; wider
 /// goes to the keyframe path on both ends. 256 frames is >1 s even at 240 Hz,
 /// past any encoder DPB (NVENC 5 frames; AMD LTR ~1 s). A request this wide

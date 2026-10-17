@@ -305,6 +305,13 @@
 // hosts that do not know the bit ignore it.
 #define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PunktfunkConnectOpts::reformat`]: this caller rebuilds its decoder on a frame flagged
+// [`FRAME_NEW_FORMAT`](punktfunk_core::packet::FRAME_NEW_FORMAT), from the codec, colour and
+// chroma getters read right after it.
+#define PUNKTFUNK_REFORMAT_VIDEO 1
+#endif
+
 // Controller mouse is off: the pad plays. Equals `PadMouseMode::Off`.
 #define PUNKTFUNK_PAD_MOUSE_OFF 0
 
@@ -603,6 +610,12 @@
 // [`HOST_CAP2_REPEAT_MARK`](crate::quic::HOST_CAP2_REPEAT_MARK) — against an
 // older host, zero means unknown, not all-active.
 #define PUNKTFUNK_USER_FLAG_REPEAT 256
+
+// Frame `flags` bit core sets on a frame it hands out, never on the wire (v2 masks user flags
+// to `0x7FFF`): the stream's format changed at this frame
+// ([`Frame::new_format`](crate::session::Frame::new_format)). Rebuild the decoder from the
+// connection's codec, colour and chroma before decoding it.
+#define PUNKTFUNK_FRAME_NEW_FORMAT 65536
 
 // Widest lost-frame range (`last - first`, wrapping) RFI may repair; wider
 // goes to the keyframe path on both ends. 256 frames is >1 s even at 240 Hz,
@@ -1634,8 +1647,11 @@ typedef struct {
     // ([`punktfunk_pyrowave_kbps`]). `0`, which a shorter prefix defaults to, leaves the
     // host's own.
     uint16_t pyrowave_bpp_x100;
+    // `PUNKTFUNK_REFORMAT_*` bits: what this caller rebuilds when the host changes the stream's
+    // format mid-session. `0`, which a shorter prefix defaults to, keeps the format fixed.
+    uint8_t reformat;
     // Always `0`. Fills what would otherwise be padding.
-    uint8_t reserved4[6];
+    uint8_t reserved4[5];
     // Called once, on the connecting thread, when the host answers that its operator is
     // deciding about this device: show "waiting for approval". The connect then waits for the
     // host's verdict, up to ten minutes, not `timeout_ms`. Null: `timeout_ms` stands.
@@ -3037,8 +3053,8 @@ PunktfunkStatus punktfunk_connection_next_host_timing(PunktfunkConnection *c,
 // Resolved colour signalling + encode bit depth. Each out pointer is filled when
 // non-NULL: `primaries`/`transfer`/`matrix` are CICP (BT.709 = 1; BT.2020 = 9;
 // PQ = 16, HLG = 18; BT.2020-NCL = 9), `full_range` 0/1, `bit_depth` 8 or 10.
-// Transfer 16/18 is HDR — drain [`punktfunk_connection_next_hdr_meta`]. Fixed
-// until a reconfigure.
+// Transfer 16/18 is HDR — drain [`punktfunk_connection_next_hdr_meta`]. The format of the
+// newest frame `next_au` handed out: it moves on a frame flagged `PUNKTFUNK_FRAME_NEW_FORMAT`.
 //
 // # Safety
 // `c` is a valid connection handle; each out pointer is NULL or writable for its scalar.
@@ -3053,7 +3069,7 @@ PunktfunkStatus punktfunk_connection_color_info(PunktfunkConnection *c,
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Resolved chroma as HEVC `chroma_format_idc`: `1` = 4:2:0, `3` = 4:4:4.
 // `*out` is filled when non-NULL. In-band SPS is authoritative; this lets the
-// embedder pre-size the decoder. Fixed until a reconfigure.
+// embedder pre-size the decoder. Moves with [`punktfunk_connection_color_info`].
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -3063,7 +3079,8 @@ PunktfunkStatus punktfunk_connection_chroma_format(PunktfunkConnection *c, uint8
 #if defined(PUNKTFUNK_FEATURE_QUIC)
 // Host-resolved video codec: [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] /
 // [`PUNKTFUNK_CODEC_AV1`]. Build the decoder from this (never assume HEVC).
-// `*out` is filled when non-NULL. A host that did not negotiate reports HEVC.
+// `*out` is filled when non-NULL. A host that did not negotiate reports HEVC. Moves with
+// [`punktfunk_connection_color_info`].
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.

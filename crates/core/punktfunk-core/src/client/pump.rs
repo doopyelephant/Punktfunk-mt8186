@@ -368,6 +368,8 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         nack: !params.frame_parts,
         on_anchors: false,
         partial_wait: Vec::new(),
+        held: std::collections::VecDeque::new(),
+        held_since: None,
     };
     let _ = tokio::task::spawn_blocking(move || pump.run()).await;
 

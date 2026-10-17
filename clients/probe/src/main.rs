@@ -1070,10 +1070,11 @@ fn spawn_remode(mut rs: CtlTx, mut rr: CtlRx, new_mode: Mode, after_secs: u32) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(after_secs as u64)).await;
         tracing::info!(?new_mode, "requesting mid-stream mode switch");
-        if v2io::send(&mut rs, &Reconfigure { mode: new_mode })
-            .await
-            .is_err()
-        {
+        let ask = Reconfigure {
+            mode: new_mode,
+            exclude_codecs: 0,
+        };
+        if v2io::send(&mut rs, &ask).await.is_err() {
             tracing::error!("Reconfigure write failed");
             return;
         }

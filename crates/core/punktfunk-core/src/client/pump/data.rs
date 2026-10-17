@@ -61,7 +61,17 @@ pub(super) struct DataPump {
     /// All-intra frames short past their parity and asking nothing: each goes up partial
     /// once its head block is whole.
     pub(super) partial_wait: Vec<u32>,
+    /// Frames of an epoch whose config has not arrived, oldest first ([`Self::hand_on`]).
+    pub(super) held: std::collections::VecDeque<Frame>,
+    /// When the oldest of them started waiting.
+    pub(super) held_since: Option<Instant>,
 }
+
+/// How long a frame waits for its epoch's config. The host sends the config before the
+/// epoch's first packet, so a wait is the two paths' skew, well under this.
+const HOLD_FOR: Duration = Duration::from_millis(250);
+/// Frames that wait at most. 16 is 67 ms at 240 Hz, longer than the paths' skew.
+const HOLD_MAX: usize = 16;
 
 /// What one pump run carries from iteration to iteration.
 struct PumpLoop {
@@ -219,6 +229,7 @@ impl DataPump {
             let frames_dropped = self.shared.frames_dropped.load(Ordering::Relaxed);
             self.recovery(super::super::RecoveryEvent::Tick { frames_dropped }, now);
             self.release_waiting_partials();
+            self.release_held(now);
             match self.shared.frames.overdue_hold(now) {
                 Some(frame)
                     if self.negotiated_codec == crate::quic::CODEC_PYROWAVE
@@ -337,7 +348,64 @@ impl DataPump {
         } else if self.jump_to_live(lp, &frame, is_au, clock_offset_ns) {
             return; // this frame is the stale past
         }
-        self.shared.frames.push(frame);
+        self.hand_on(frame);
+    }
+
+    /// Queue `frame` for the decoder. Under format epochs a frame whose epoch has no config
+    /// yet waits, and the frames after it with it, so a decoder is never fed a codec or depth
+    /// it was not built for. Everything before this point already counted the frame.
+    fn hand_on(&mut self, frame: Frame) {
+        let ready = self.held.is_empty()
+            && self
+                .shared
+                .anchor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ready(frame.epoch);
+        if ready {
+            self.shared.frames.push(frame);
+            return;
+        }
+        self.held_since.get_or_insert_with(Instant::now);
+        self.held.push_back(frame);
+        self.release_held(Instant::now());
+    }
+
+    /// Hand on each waiting frame whose epoch's config is in. Past [`HOLD_FOR`] or
+    /// [`HOLD_MAX`] the rest go too, decoding as the newest configured epoch: a lost config
+    /// costs a decode error and a keyframe, not a frozen stream.
+    fn release_held(&mut self, now: Instant) {
+        let Some(since) = self.held_since else {
+            return;
+        };
+        let expired = now.duration_since(since) >= HOLD_FOR || self.held.len() > HOLD_MAX;
+        let mut ready = 0;
+        {
+            let mut anchor = self.shared.anchor.lock().unwrap_or_else(|e| e.into_inner());
+            for f in &self.held {
+                if !anchor.ready(f.epoch) {
+                    if !expired {
+                        break;
+                    }
+                    tracing::warn!(
+                        epoch = f.epoch,
+                        waited_ms = now.duration_since(since).as_millis() as u64,
+                        frames = self.held.len(),
+                        "no config arrived for this epoch — its frames go on in the last format"
+                    );
+                    anchor.assume(f.epoch);
+                }
+                ready += 1;
+            }
+        }
+        for f in self.held.drain(..ready) {
+            self.shared.frames.push(f);
+        }
+        self.held_since = match (self.held.is_empty(), ready) {
+            (true, _) => None,
+            (false, 0) => Some(since),
+            (false, _) => Some(now),
+        };
     }
 
     /// Feed one frame's delay to ABR and the standing-latency floor, then to
@@ -405,7 +473,9 @@ impl DataPump {
     /// keyframe the next frame decodes from. Returns `(datagrams, AUs)`.
     fn shed_backlog(&mut self) -> (u64, usize) {
         let flushed = self.session.flush_backlog().unwrap_or(0);
-        let dropped = self.shared.frames.clear();
+        let dropped = self.shared.frames.clear() + self.held.len();
+        self.held.clear();
+        self.held_since = None;
         self.shared.ask_keyframe();
         (flushed, dropped)
     }
@@ -490,8 +560,77 @@ mod tests {
             nack: false,
             on_anchors: false,
             partial_wait: Vec::new(),
+            held: std::collections::VecDeque::new(),
+            held_since: None,
         };
         (pump, ctrl_rx, fb_rx)
+    }
+
+    fn frame_of(epoch: u8, index: u32) -> Frame {
+        Frame {
+            data: Vec::new().into(),
+            frame_index: index,
+            pts_ns: 0,
+            flags: 0,
+            epoch,
+            complete: true,
+            part: None,
+            received_ns: 0,
+            new_format: None,
+        }
+    }
+
+    /// Under format epochs a frame of an epoch with no config waits, the frames behind it with
+    /// it, and all go in order once the config is in. Past the bound they go in the last format.
+    #[test]
+    fn a_frame_waits_for_its_epochs_config_then_goes_in_order() {
+        use crate::quic::{VideoFormat, CODEC_H264, CODEC_HEVC};
+        let (_host_tp, session) = idle_client_session(0);
+        let shared = Arc::new(ClientShared::new(crate::config::Mode::default()));
+        {
+            let mut a = shared.anchor.lock().unwrap();
+            (a.on, a.formats) = (true, true);
+            a.book(
+                0,
+                VideoFormat {
+                    codec: CODEC_HEVC,
+                    ..VideoFormat::default()
+                },
+            );
+        }
+        let (mut pump, _ctrl, _fb) = test_pump(session, shared.clone(), CODEC_HEVC);
+        pump.hand_on(frame_of(0, 1));
+        pump.hand_on(frame_of(1, 2));
+        pump.hand_on(frame_of(1, 3));
+        assert_eq!(shared.frames.depth(), 1, "epoch 1 has no config yet");
+
+        let cfg = crate::quic::v2::msg::StreamConfig {
+            epoch: 1,
+            codec: CODEC_H264,
+            ..Default::default()
+        };
+        shared.anchor.lock().unwrap().config(cfg);
+        pump.release_held(Instant::now());
+        assert_eq!(shared.frames.depth(), 3);
+
+        pump.hand_on(frame_of(2, 4));
+        assert_eq!(shared.frames.depth(), 3);
+        pump.release_held(Instant::now() + HOLD_FOR);
+        assert_eq!(shared.frames.depth(), 4, "the bound lets it go");
+        let assumed = shared.anchor.lock().unwrap().format(2).map(|f| f.codec);
+        assert_eq!(assumed, Some(CODEC_H264), "in the newest configured format");
+    }
+
+    /// Without format epochs nothing waits.
+    #[test]
+    fn without_format_epochs_no_frame_waits() {
+        let (_host_tp, session) = idle_client_session(0);
+        let shared = Arc::new(ClientShared::new(crate::config::Mode::default()));
+        shared.anchor.lock().unwrap().on = true;
+        let (mut pump, _ctrl, _fb) = test_pump(session, shared.clone(), crate::quic::CODEC_HEVC);
+        pump.hand_on(frame_of(5, 1));
+        assert_eq!(shared.frames.depth(), 1);
+        assert!(pump.held.is_empty());
     }
 
     /// The first RFI the pump sends within `wait`, skipping its reports.

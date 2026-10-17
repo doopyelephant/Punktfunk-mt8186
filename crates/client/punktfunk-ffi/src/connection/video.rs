@@ -264,8 +264,8 @@ pub unsafe extern "C" fn punktfunk_connection_next_host_timing(
 /// Resolved colour signalling + encode bit depth. Each out pointer is filled when
 /// non-NULL: `primaries`/`transfer`/`matrix` are CICP (BT.709 = 1; BT.2020 = 9;
 /// PQ = 16, HLG = 18; BT.2020-NCL = 9), `full_range` 0/1, `bit_depth` 8 or 10.
-/// Transfer 16/18 is HDR — drain [`punktfunk_connection_next_hdr_meta`]. Fixed
-/// until a reconfigure.
+/// Transfer 16/18 is HDR — drain [`punktfunk_connection_next_hdr_meta`]. The format of the
+/// newest frame `next_au` handed out: it moves on a frame flagged `PUNKTFUNK_FRAME_NEW_FORMAT`.
 ///
 /// # Safety
 /// `c` is a valid connection handle; each out pointer is NULL or writable for its scalar.
@@ -280,14 +280,14 @@ pub unsafe extern "C" fn punktfunk_connection_color_info(
     bit_depth: *mut u8,
 ) -> PunktfunkStatus {
     with_conn!(c => {
-        let color = c.inner.color;
+        let f = c.inner.video_format();
         // SAFETY: the caller passes each out-param null or writable for one value.
         unsafe {
-            put(primaries, color.primaries);
-            put(transfer, color.transfer);
-            put(matrix, color.matrix);
-            put(full_range, color.full_range);
-            put(bit_depth, c.inner.bit_depth);
+            put(primaries, f.color.primaries);
+            put(transfer, f.color.transfer);
+            put(matrix, f.color.matrix);
+            put(full_range, f.color.full_range);
+            put(bit_depth, f.bit_depth);
         }
         PunktfunkStatus::Ok
     })
@@ -295,7 +295,7 @@ pub unsafe extern "C" fn punktfunk_connection_color_info(
 
 /// Resolved chroma as HEVC `chroma_format_idc`: `1` = 4:2:0, `3` = 4:4:4.
 /// `*out` is filled when non-NULL. In-band SPS is authoritative; this lets the
-/// embedder pre-size the decoder. Fixed until a reconfigure.
+/// embedder pre-size the decoder. Moves with [`punktfunk_connection_color_info`].
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -305,12 +305,13 @@ pub unsafe extern "C" fn punktfunk_connection_chroma_format(
     c: *mut PunktfunkConnection,
     out: *mut u8,
 ) -> PunktfunkStatus {
-    conn_out!(c, out => c.inner.chroma_format)
+    conn_out!(c, out => c.inner.video_format().chroma_format)
 }
 
 /// Host-resolved video codec: [`PUNKTFUNK_CODEC_H264`] / [`PUNKTFUNK_CODEC_HEVC`] /
 /// [`PUNKTFUNK_CODEC_AV1`]. Build the decoder from this (never assume HEVC).
-/// `*out` is filled when non-NULL. A host that did not negotiate reports HEVC.
+/// `*out` is filled when non-NULL. A host that did not negotiate reports HEVC. Moves with
+/// [`punktfunk_connection_color_info`].
 ///
 /// # Safety
 /// `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -320,7 +321,7 @@ pub unsafe extern "C" fn punktfunk_connection_codec(
     c: *mut PunktfunkConnection,
     out: *mut u8,
 ) -> PunktfunkStatus {
-    conn_out!(c, out => c.inner.codec)
+    conn_out!(c, out => c.inner.video_format().codec)
 }
 
 /// Negotiated wire shard payload (Welcome, bytes). Parse-window size of a

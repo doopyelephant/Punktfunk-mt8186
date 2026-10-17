@@ -136,7 +136,12 @@ pub unsafe extern "C" fn punktfunk_connection_next_au(
                         len: f.data.len(),
                         frame_index: f.frame_index,
                         pts_ns: f.pts_ns,
-                        flags: f.flags,
+                        flags: f.flags
+                            | if f.new_format.is_some() {
+                                punktfunk_core::packet::FRAME_NEW_FORMAT
+                            } else {
+                                0
+                            },
                         received_ns: f.received_ns,
                     };
                 }

@@ -83,8 +83,14 @@ pub(crate) struct ClientShared {
     pub(crate) local_ip: Mutex<Option<std::net::IpAddr>>,
     /// The `punktfunk/2` session id the host issued, kept for a resume if the link is lost.
     pub(crate) v2_session: Mutex<Option<[u8; 16]>>,
-    /// Moves [`Self::mode`] at the first frame of each configured epoch.
-    pub(crate) anchor: Mutex<super::pump::anchor::ModeAnchor>,
+    /// Moves [`Self::mode`] at the first frame of each configured epoch, and books each
+    /// epoch's video format.
+    pub(crate) anchor: Mutex<super::pump::anchor::EpochAnchor>,
+    /// The format of the newest frame handed to the embedder: the Welcome's, then each
+    /// [`crate::session::Frame::new_format`].
+    pub(crate) video_format: Mutex<crate::quic::VideoFormat>,
+    /// `CODEC_*` bits of the last codec ask the host refused; `0` while none was.
+    pub(crate) codec_refused: AtomicU8,
     /// Live encoder target (kbps): the Welcome seed, then every `BitrateChanged` ack.
     pub(crate) live_bitrate_kbps: AtomicU32,
     /// [`crate::hud::RateCut`] code the pump publishes each window; `0` = no standing cut.
@@ -162,6 +168,8 @@ impl ClientShared {
             local_ip: Mutex::default(),
             v2_session: Mutex::default(),
             anchor: Mutex::default(),
+            video_format: Mutex::default(),
+            codec_refused: AtomicU8::new(0),
             live_bitrate_kbps: AtomicU32::new(0),
             rate_cut: AtomicU8::new(0),
             quality_floor_kbps: AtomicU32::new(0),

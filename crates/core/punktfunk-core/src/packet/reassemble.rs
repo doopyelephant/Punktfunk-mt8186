@@ -1137,6 +1137,7 @@ fn hand_up_partial(
             complete: false,
             part: None,
             received_ns: 0, // stamped by Session::poll_frame at the session boundary
+            new_format: None,
         });
     }
     head_whole(f)
@@ -1209,6 +1210,7 @@ impl FrameBuf {
             complete: true,
             part,
             received_ns: 0, // stamped by Session::poll_frame at the session boundary
+            new_format: None,
         }
     }
 
@@ -1253,6 +1255,7 @@ impl FrameBuf {
                 last: false,
             }),
             received_ns: 0, // stamped by Session::poll_frame at the session boundary
+            new_format: None,
         })
     }
 }
@@ -1372,6 +1375,7 @@ mod reset_tests {
             complete: false,
             part: None,
             received_ns: 0,
+            new_format: None,
         });
         r.reset();
         assert!(
