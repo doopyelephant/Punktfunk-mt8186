@@ -137,6 +137,9 @@ pub(crate) struct DecodeOptions {
     /// The decoder Kotlin ranked from `MediaCodecList` (`VideoDecoders.pickDecoder`). `None`/empty ⇒
     /// let the platform resolve the default decoder for the MIME.
     pub decoder_name: Option<String>,
+    /// The MIME Kotlin ranked `decoder_name` for: a codec the host moved to later takes the
+    /// platform's default ([`DecodeOptions::decoder_for`]).
+    pub decoder_mime: &'static str,
     /// Whether Kotlin found the chosen decoder advertises `FEATURE_LowLatency` (queryable only via
     /// the Java `CodecCapabilities` API) — surfaced on the HUD next to the decoder name.
     pub ll_feature: bool,
@@ -193,6 +196,24 @@ impl DecodeOptions {
     pub(crate) fn force_rate_switch(&self) -> bool {
         !self.is_tv || self.low_latency_mode
     }
+
+    /// The decoder to create for `mime` ([`ranked_for`]).
+    pub(crate) fn decoder_for(&self, mime: &str) -> Option<&str> {
+        let name = ranked_for(self.decoder_name.as_deref(), self.decoder_mime, mime);
+        if name.is_none() && self.decoder_name.is_some() {
+            log::info!(
+                "decode: {mime} takes the platform's default decoder (the ranked pick was for {})",
+                self.decoder_mime
+            );
+        }
+        name
+    }
+}
+
+/// Kotlin's pick `name`, ranked for `ranked`, when `mime` is that MIME; else the platform's
+/// default, which low-latency mode off always takes.
+fn ranked_for<'a>(name: Option<&'a str>, ranked: &str, mime: &str) -> Option<&'a str> {
+    name.filter(|_| mime == ranked)
 }
 
 /// The decode entry point on the `pf-decode` thread: dispatches to the codec's loop. All of
@@ -213,4 +234,18 @@ pub fn run(
         return;
     }
     run_async(client, window, shutdown, stats, opts);
+}
+
+#[cfg(test)]
+mod ranked_tests {
+    use super::ranked_for;
+
+    /// A codec the host moved to after the pick never gets a decoder ranked for another MIME.
+    #[test]
+    fn a_pick_names_only_the_mime_it_was_ranked_for() {
+        let pick = Some("c2.qti.hevc.decoder.low_latency");
+        assert_eq!(ranked_for(pick, "video/hevc", "video/hevc"), pick);
+        assert_eq!(ranked_for(pick, "video/hevc", "video/avc"), None);
+        assert_eq!(ranked_for(None, "video/hevc", "video/hevc"), None);
+    }
 }

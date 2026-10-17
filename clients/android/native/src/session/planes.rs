@@ -72,6 +72,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeStartVideo(
         );
         let opts = crate::decode::DecodeOptions {
             decoder_name: decoder,
+            decoder_mime: crate::decode::codec_mime(client.video_format().codec),
             ll_feature,
             low_latency_mode,
             is_tv,
@@ -280,7 +281,7 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoMime<'
         let Some(h) = SESSIONS.get(handle) else {
             return env.new_string("");
         };
-        env.new_string(crate::decode::codec_mime(h.client.codec))
+        env.new_string(crate::decode::codec_mime(h.client.video_format().codec))
     })
     .resolve::<LogErrorAndDefault>()
 }
@@ -304,7 +305,9 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeVideoCodecL
         } else {
             SESSIONS.get(handle)
         };
-        env.new_string(session.map_or("", |h| crate::decode::codec_label(h.client.codec)))
+        env.new_string(session.map_or("", |h| {
+            crate::decode::codec_label(h.client.video_format().codec)
+        }))
     })
     .resolve::<LogErrorAndDefault>()
 }

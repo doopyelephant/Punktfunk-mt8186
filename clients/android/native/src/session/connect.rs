@@ -611,6 +611,8 @@ fn connect(req: ConnectRequest) -> jlong {
         // on-glass experiment): AU prefixes then arrive as `Frame::part` pieces and the decode
         // loop feeds them with BUFFER_FLAG_PARTIAL_FRAME.
         frame_parts,
+        // The decode loop rebuilds its codec on a frame in a new format (`RunEnd::Reformat`).
+        rebuilds_decoder: true,
         launch, // a store-qualified library id to boot into a game, or None for the desktop
         name: device_name, // Kotlin's Build.MODEL — the host's approval-list / trust-store label
         pin,    // Some → Crypto on host-fp mismatch
