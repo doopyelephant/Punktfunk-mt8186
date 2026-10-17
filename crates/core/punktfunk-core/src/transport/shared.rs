@@ -637,14 +637,21 @@ mod tests {
         );
     }
 
-    async fn pair() -> (
+    type Pair = (
         quinn::Endpoint,
         std::net::UdpSocket,
         quinn::Endpoint,
         ClientMedia,
         quinn::Connection,
         quinn::Connection,
-    ) {
+    );
+
+    async fn pair() -> Pair {
+        pair_with(|host| host).await
+    }
+
+    /// A host and a client that dials `dial(host)`: the host itself, or a proxy in front of it.
+    async fn pair_with(dial: impl FnOnce(SocketAddr) -> SocketAddr) -> Pair {
         use crate::quic::endpoint;
         let (cert, key) = endpoint::generate_identity().unwrap();
         let (server, socket) = endpoint::server_shared(
@@ -655,7 +662,7 @@ mod tests {
             &[crate::quic::v2::registry::ALPN, b"pkf1"],
         )
         .unwrap();
-        let addr = server.local_addr().unwrap();
+        let addr = dial(server.local_addr().unwrap());
         let (client, _) =
             endpoint::client_shared(None, None, &[crate::quic::v2::registry::ALPN, b"pkf1"]);
         let (client, media) = client.unwrap();
@@ -769,6 +776,175 @@ mod tests {
         // A connected socket's kernel drops them before the demux counts them.
         let counted = if cfg!(target_vendor = "apple") { 0 } else { 10 };
         assert_eq!(media.stats().foreign.load(Ordering::Relaxed), counted);
+    }
+
+    /// A NAT between client and host whose outside address changes on [`Self::rebind`]. The
+    /// client always talks to `front`; the host sees `backs[0]`, then `backs[1]`. Once rebound,
+    /// what the host sends to the old address is dropped, as by a NAT that forgot it.
+    struct RebindingProxy {
+        front: SocketAddr,
+        backs: [SocketAddr; 2],
+        rebound: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl RebindingProxy {
+        fn start(host: SocketAddr) -> RebindingProxy {
+            let bind = |a: &str| {
+                let s = UdpSocket::bind(a).unwrap();
+                s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+                super::super::grow_socket_buffers(&s);
+                Arc::new(s)
+            };
+            let front = bind("127.0.0.1:0");
+            // A new IP where the OS has one (Linux answers on all of 127/8): quinn then restarts
+            // MTU discovery. Elsewhere a new port, which quinn treats as a NAT rebind.
+            let second = UdpSocket::bind("127.0.0.2:0")
+                .map(|_| "127.0.0.2:0")
+                .unwrap_or("127.0.0.1:0");
+            let backs = [bind("127.0.0.1:0"), bind(second)];
+            let rebound = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let client: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
+            let mut buf = vec![0u8; 65536];
+            let (f, b, r, s, c) = (
+                front.clone(),
+                backs.clone(),
+                rebound.clone(),
+                stop.clone(),
+                client.clone(),
+            );
+            std::thread::spawn(move || {
+                while !s.load(Ordering::Relaxed) {
+                    if let Ok((n, from)) = f.recv_from(&mut buf) {
+                        *c.lock().unwrap() = Some(from);
+                        let out = &b[r.load(Ordering::Relaxed) as usize];
+                        let _ = out.send_to(&buf[..n], host);
+                    }
+                }
+            });
+            for (i, back) in backs.iter().enumerate() {
+                let (f, back, r, s, c) = (
+                    front.clone(),
+                    back.clone(),
+                    rebound.clone(),
+                    stop.clone(),
+                    client.clone(),
+                );
+                let mut buf = vec![0u8; 65536];
+                std::thread::spawn(move || {
+                    while !s.load(Ordering::Relaxed) {
+                        let Ok((n, _)) = back.recv_from(&mut buf) else {
+                            continue;
+                        };
+                        let live = r.load(Ordering::Relaxed) as usize == i;
+                        if let (true, Some(to)) = (live, *c.lock().unwrap()) {
+                            let _ = f.send_to(&buf[..n], to);
+                        }
+                    }
+                });
+            }
+            RebindingProxy {
+                front: front.local_addr().unwrap(),
+                backs: backs.map(|s| s.local_addr().unwrap()),
+                rebound,
+                stop,
+            }
+        }
+
+        fn rebind(&self) {
+            self.rebound.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl Drop for RebindingProxy {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Media sent to the client, `count` packets tagged from `first`, until each one left.
+    /// Paced at 20 packets a millisecond: the proxy's socket buffer is a default one.
+    fn send_media(sender: &MediaSender, first: usize, count: usize) {
+        for i in first..first + count {
+            let mut p = vec![0x01u8; 1000];
+            p[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+            while !sender.send(&p).unwrap() {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            if i % 20 == 19 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Tags of the media that reaches the client within `wait`, stopping at `want`.
+    async fn receive_media(media: &ClientMedia, want: usize, wait: Duration) -> Vec<usize> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut tags = Vec::new();
+        while tags.len() < want && std::time::Instant::now() < deadline {
+            let Some(batch) = media.recv_owned().unwrap() else {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                continue;
+            };
+            let mut off = 0;
+            while let Some(r) = batch.at(off) {
+                off = r.end;
+                let p = batch.bytes(r);
+                tags.push(u64::from_le_bytes(p[1..9].try_into().unwrap()) as usize);
+            }
+        }
+        tags
+    }
+
+    /// A client whose address moves mid-session keeps its stream: the host learns the new
+    /// address from the client's next packet, media follows it with no reconnect, and the
+    /// client counts nothing as foreign.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn media_follows_a_client_that_moves() {
+        let mut proxy = None;
+        let (_server, socket, _client, media, host_conn, client_conn) = pair_with(|host| {
+            let p = RebindingProxy::start(host);
+            let front = p.front;
+            proxy = Some(p);
+            front
+        })
+        .await;
+        let proxy = proxy.unwrap();
+        let sender = MediaSender::new(&socket, host_conn.clone()).unwrap();
+        assert_eq!(canonical(sender.path().0), proxy.backs[0]);
+        send_media(&sender, 0, 100);
+        assert_eq!(
+            receive_media(&media, 100, Duration::from_secs(5))
+                .await
+                .len(),
+            100
+        );
+
+        proxy.rebind();
+        client_conn.send_datagram(vec![7u8; 8].into()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while canonical(host_conn.remote_address()) != proxy.backs[1] {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the host never saw the move"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(canonical(sender.path().0), proxy.backs[1]);
+
+        send_media(&sender, 100, 300);
+        let tags = receive_media(&media, 300, Duration::from_secs(5)).await;
+        assert_eq!(tags.len(), 300, "every packet after the move arrives");
+        assert!(tags.iter().all(|&t| (100..400).contains(&t)));
+        assert_eq!(media.stats().foreign.load(Ordering::Relaxed), 0);
+        host_conn.send_datagram(vec![9u8; 8].into()).unwrap();
+        let down = tokio::time::timeout(Duration::from_secs(2), client_conn.read_datagram()).await;
+        assert!(
+            matches!(down, Ok(Ok(_))),
+            "QUIC still crosses after the move"
+        );
+        assert!(host_conn.close_reason().is_none() && client_conn.close_reason().is_none());
     }
 
     /// A lent buffer comes back on drop, and the pool never allocates past its bound.
