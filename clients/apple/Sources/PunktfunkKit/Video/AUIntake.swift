@@ -18,12 +18,15 @@ struct AUIntake {
         let step: AUPumpState.Step
         /// The AU carries parameter sets (an IDR).
         let idr: Bool
+        /// The stream's format changed at this AU: the sink rebuilds its decoder first.
+        let newFormat: Bool
     }
 
     private(set) var pump = AUPumpState()
     private let connection: PunktfunkConnection
     /// The decoder reads the RPS itself, so a lost reference is concealed in the bitstream first.
-    private let concealer: HevcConcealer?
+    /// HEVC only; a new format builds it again.
+    private var concealer: HevcConcealer?
     private var wasUnrecoverable = false
     /// When the current wait for parameter sets began, for the resume log.
     private var awaitingSince = Date.distantPast
@@ -60,6 +63,15 @@ struct AUIntake {
         // the concealer sees it: the concealer mirrors the decoder's DPB.
         let arrival = connection.recoveryOnFrame(au.frameIndex)
         onFrame?(au)
+        if au.newFormat {
+            // The old codec's parameter sets and reference state end here: wait for this
+            // format's own IDR, which this AU usually is.
+            concealer = connection.videoCodec == .hevc ? HevcConcealer() : nil
+            pump.requireIDR()
+            intakeLog.notice(
+                "video: the host changed the stream format — rebuilding the decoder for \(String(describing: connection.videoCodec), privacy: .public)"
+            )
+        }
         if !arrival.admit { return nil }
         let concealed = conceal(&au)
         let idrFormat = connection.videoCodec.formatDescription(fromKeyframe: au.data)
@@ -78,7 +90,7 @@ struct AUIntake {
                 "video: received AUs but no decodable format (missing/unparsed parameter sets) — requesting an IDR until one seeds it"
             )
         }
-        return Intake(au: au, step: step, idr: idrFormat != nil)
+        return Intake(au: au, step: step, idr: idrFormat != nil, newFormat: au.newFormat)
     }
 
     /// The sink lost its decoder state: wait for the next IDR's parameter sets. Stamps the wait
