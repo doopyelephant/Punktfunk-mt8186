@@ -307,6 +307,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         conn.clone(),
         planes.datagram,
         encode_lat.clone(),
+        shared.clone(),
     ));
 
     // Bulk clip bytes only; metadata rides the control task. Always spawned: a

@@ -102,6 +102,67 @@ pub(crate) fn mark(shared: &super::super::ClientShared, f: &mut crate::session::
     }
 }
 
+/// The desktop audio stream's format, moved by an `AudioConfig` at its `first_seq`. The audio
+/// datagram names its codec by tag but carries no epoch, so the sequence anchors the change.
+#[derive(Debug, Default)]
+pub(crate) struct AudioAnchor {
+    /// `FEATURE_AUDIO_EPOCH` is in force.
+    pub(crate) on: bool,
+    /// The format packets are handed out in; `None` before the handshake.
+    pub(crate) live: Option<crate::audio::plane::PlaneFormat>,
+    /// The next format and the first sequence it covers.
+    pending: Option<(u32, crate::audio::plane::PlaneFormat)>,
+}
+
+/// What becomes of one desktop audio packet.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AudioAdmit {
+    /// Hand it on as it is.
+    Pass,
+    /// Hand it on marked: it opens this format.
+    New(crate::audio::plane::PlaneFormat),
+    /// Its codec is not the live format's and no config for it has come yet.
+    Drop,
+}
+
+impl AudioAnchor {
+    /// An `AudioConfig` for the desktop stream arrived.
+    pub(crate) fn config(&mut self, cfg: &crate::quic::v2::msg::AudioConfig) {
+        let format = crate::audio::plane::PlaneFormat::from_welcome(
+            cfg.codec,
+            cfg.rate_hz,
+            cfg.bits,
+            cfg.channels,
+            u32::from(cfg.frame_us),
+            cfg.layout,
+        );
+        self.pending = Some((cfg.first_seq, format));
+    }
+
+    /// Packet `seq` arrived carrying `codec` (`AUDIO_CODEC_*`, from its tag).
+    pub(crate) fn admit(&mut self, seq: u32, codec: u8) -> AudioAdmit {
+        if !self.on {
+            return AudioAdmit::Pass;
+        }
+        let pcm = |c: u8| c == crate::quic::AUDIO_CODEC_PCM;
+        if let Some((first, format)) = self.pending {
+            if seq.wrapping_sub(first) < u32::MAX / 2 {
+                self.pending = None;
+                self.live = Some(format);
+                return if pcm(format.codec) == pcm(codec) {
+                    AudioAdmit::New(format)
+                } else {
+                    AudioAdmit::Drop
+                };
+            }
+        }
+        match self.live {
+            Some(live) if pcm(live.codec) != pcm(codec) => AudioAdmit::Drop,
+            _ => AudioAdmit::Pass,
+        }
+    }
+}
+
 /// Point the mode slot at `mode`. A change tells the pump, which resets mode-scoped ABR state.
 pub(super) fn apply(slot: &Mutex<Mode>, events: &PumpTx, mode: Mode) {
     let mut m = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -222,6 +283,54 @@ mod tests {
         assert_eq!(marked(1), Some(CODEC_H264));
         assert_eq!(marked(1), None, "marked once");
         assert_eq!(shared.video_format.lock().unwrap().codec, CODEC_H264);
+    }
+
+    /// An audio config moves the format at its first sequence; a packet of another codec before
+    /// it is dropped, never decoded as the old one.
+    #[test]
+    fn an_audio_config_moves_the_format_at_its_first_seq() {
+        use crate::quic::{AUDIO_CODEC_OPUS, AUDIO_CODEC_PCM};
+        let pcm =
+            crate::audio::plane::PlaneFormat::from_welcome(AUDIO_CODEC_PCM, 96_000, 24, 2, 2000, 0);
+        let mut a = AudioAnchor {
+            on: true,
+            live: Some(pcm),
+            ..AudioAnchor::default()
+        };
+        assert_eq!(a.admit(9, AUDIO_CODEC_PCM), AudioAdmit::Pass);
+        assert_eq!(
+            a.admit(10, AUDIO_CODEC_OPUS),
+            AudioAdmit::Drop,
+            "no config yet"
+        );
+        a.config(&crate::quic::v2::msg::AudioConfig {
+            codec: AUDIO_CODEC_OPUS,
+            rate_hz: 48_000,
+            channels: 2,
+            first_seq: 10,
+            ..Default::default()
+        });
+        assert_eq!(
+            a.admit(9, AUDIO_CODEC_PCM),
+            AudioAdmit::Pass,
+            "before first_seq"
+        );
+        let AudioAdmit::New(f) = a.admit(11, AUDIO_CODEC_OPUS) else {
+            panic!("the first packet at or after first_seq opens the format")
+        };
+        assert_eq!((f.codec, f.rate_hz), (AUDIO_CODEC_OPUS, 48_000));
+        assert_eq!(a.admit(12, AUDIO_CODEC_OPUS), AudioAdmit::Pass);
+        assert_eq!(
+            a.admit(13, AUDIO_CODEC_PCM),
+            AudioAdmit::Drop,
+            "the old codec is gone"
+        );
+        a.on = false;
+        assert_eq!(
+            a.admit(14, AUDIO_CODEC_PCM),
+            AudioAdmit::Pass,
+            "off: nothing moves"
+        );
     }
 
     #[test]

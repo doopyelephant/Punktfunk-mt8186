@@ -777,6 +777,30 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// so `frameCount` answers "how many samples did I get", not "how long is one frame".
     public private(set) var resolvedAudioFrameUs: UInt16 = UInt16(PUNKTFUNK_AUDIO_FRAME_MS * 1000)
 
+    /// What the audio `nextAudioPcm` hands back is in now: the `resolvedAudio*` values until it
+    /// throws `PUNKTFUNK_STATUS_AUDIO_FORMAT`, which says the host moved the format at the next
+    /// frame. Read live from the core; the connect-time values once the session closed.
+    public struct AudioFormat: Sendable, Equatable {
+        public var channels: UInt8
+        public var rateHz: UInt32
+        public var frameUs: UInt16
+    }
+
+    public var audioFormat: AudioFormat {
+        let opened = AudioFormat(
+            channels: resolvedAudioChannels, rateHz: resolvedAudioRateHz,
+            frameUs: resolvedAudioFrameUs)
+        return withLiveHandle(or: opened) { h in
+            var channels = opened.channels, rate = opened.rateHz, frameUs = opened.frameUs
+            _ = punktfunk_connection_audio_channels(h, &channels)
+            _ = punktfunk_connection_audio_sample_rate(h, &rate)
+            _ = punktfunk_connection_audio_frame_us(h, &frameUs)
+            return AudioFormat(
+                channels: channels, rateHz: rate,
+                frameUs: frameUs == 0 ? opened.frameUs : frameUs)
+        }
+    }
+
     /// True when this session resolved the LOSSLESS `0xD3` plane (`HOST_CAP_AUDIO_HIRES`) rather
     /// than Opus — the one honest answer to "is this bit-exact?", which the rate and depth alone
     /// cannot give (48 kHz/16-bit is a legal resolution on both planes).
@@ -1175,6 +1199,8 @@ public final class PunktfunkConnection: @unchecked Sendable {
         opts.delivery_flags = deliveryFlags
         opts.audio_rate_hz = wantsHiRes ? audioRateHz : 0
         opts.audio_bits = wantsHiRes ? audioBits : 0
+        // The drain reopens playback when `nextAudioPcm` reports a new audio format.
+        opts.reformat |= UInt8(PUNKTFUNK_REFORMAT_AUDIO)
         opts.video_codecs = videoCodecs
         opts.preferred_codec = preferredCodec
         opts.client_caps = clientCaps

@@ -6,11 +6,12 @@ use super::*;
 
 /// Demux host datagrams onto `planes` until the connection closes. `encode_lat` is the ABR
 /// encode accumulator, fed here and not from the host-timing plane, which is overlay-lossy
-/// and embedder-drained.
+/// and embedder-drained. `shared` holds the audio anchor each desktop audio packet passes.
 pub(super) async fn run(
     conn: ClientConn,
     planes: DatagramTx,
     encode_lat: Arc<Mutex<super::super::frame_channel::EncodeLatAcc>>,
+    shared: Arc<ClientShared>,
 ) {
     // Per-pad seq gate for v2 rumble: a reorder must not restart a stopped motor.
     // v1 has no seq and bypasses (the host's periodic re-send is the only heal).
@@ -20,16 +21,32 @@ pub(super) async fn run(
     let mut audio_red = crate::audio::AudioRedRecovery::new();
     // One seq space for every audio plane: a late or duplicate packet never reaches a decoder.
     let mut audio_seq = crate::audio::AudioSeqGate::new();
+    // Under audio epochs a packet passes, opens a new format, or waits out its config.
+    let admit = |seq: u32, codec: u8| {
+        shared
+            .audio_anchor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .admit(seq, codec)
+    };
     while let Ok(d) = conn.read_datagram().await {
         match d.first() {
             Some(&crate::quic::AUDIO_MAGIC) => {
                 if let Some((seq, pts_ns, opus)) =
                     crate::quic::decode_audio_datagram(&d).filter(|&(seq, ..)| audio_seq.fresh(seq))
                 {
+                    let Some(new_format) = admitted(admit(seq, crate::quic::AUDIO_CODEC_OPUS))
+                    else {
+                        continue;
+                    };
+                    // Keeps the RED anchor current, so a later `0xD2` never re-inserts a frame
+                    // this plane already delivered.
+                    audio_red.recover_before(seq, false);
                     let _ = planes.audio.try_send(AudioPacket {
                         seq,
                         pts_ns,
                         data: opus.to_vec(),
+                        new_format,
                     });
                 }
             }
@@ -37,19 +54,26 @@ pub(super) async fn run(
                 if let Some((seq, pts_ns, opus, prev)) = crate::quic::decode_audio_red_datagram(&d)
                     .filter(|&(seq, ..)| audio_seq.fresh(seq))
                 {
-                    if audio_red.recover_before(seq, prev.is_some()) {
+                    let Some(new_format) = admitted(admit(seq, crate::quic::AUDIO_CODEC_OPUS))
+                    else {
+                        continue;
+                    };
+                    // A new format starts here: its predecessor was another plane's.
+                    if new_format.is_none() && audio_red.recover_before(seq, prev.is_some()) {
                         // Copy is the previous protocol frame: seq-1, pts minus one FRAME_MS.
                         let _ = planes.audio.try_send(AudioPacket {
                             seq: seq.wrapping_sub(1),
                             pts_ns: pts_ns
                                 .saturating_sub(crate::audio::FRAME_MS as u64 * 1_000_000),
                             data: prev.unwrap_or_default().to_vec(),
+                            new_format: None,
                         });
                     }
                     let _ = planes.audio.try_send(AudioPacket {
                         seq,
                         pts_ns,
                         data: opus.to_vec(),
+                        new_format,
                     });
                 }
             }
@@ -108,10 +132,16 @@ pub(super) async fn run(
                 if let Some((seq, pts_ns, pcm)) = crate::quic::decode_audio_pcm_datagram(&d)
                     .filter(|&(seq, ..)| audio_seq.fresh(seq))
                 {
+                    let Some(new_format) = admitted(admit(seq, crate::quic::AUDIO_CODEC_PCM))
+                    else {
+                        continue;
+                    };
+                    audio_red.recover_before(seq, false);
                     let _ = planes.audio.try_send(AudioPacket {
                         seq,
                         pts_ns,
                         data: pcm.to_vec(),
+                        new_format,
                     });
                 }
             }
@@ -140,6 +170,15 @@ pub(super) async fn run(
     }
 }
 
+/// An admitted packet's mark, `None` for a packet that waits out its config.
+fn admitted(admit: super::anchor::AudioAdmit) -> Option<Option<crate::audio::plane::PlaneFormat>> {
+    match admit {
+        super::anchor::AudioAdmit::Pass => Some(None),
+        super::anchor::AudioAdmit::New(format) => Some(Some(format)),
+        super::anchor::AudioAdmit::Drop => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +199,7 @@ mod tests {
             Arc::new(Mutex::new(
                 super::super::frame_channel::EncodeLatAcc::default(),
             )),
+            Arc::new(ClientShared::new(crate::config::Mode::default())),
         ));
 
         // Size from this connection's `max_datagram_size`: the plane is never fragmented,

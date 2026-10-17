@@ -52,7 +52,10 @@ pub enum PunktfunkStatus {
     NullPointer = -8,
     Timeout = -9,
     Closed = -10,
-    // -11..-19 reserved. The -20 block mirrors `RejectReason` one-to-one
+    /// `next_audio_pcm`: the host changed the audio format at the next packet. Reopen the player
+    /// from the audio getters, which read the new format, then pull again.
+    AudioFormat = -11,
+    // -12..-19 reserved. The -20 block mirrors `RejectReason` one-to-one
     // so FFI callers can switch on the host's reason.
     RejectedNotArmed = -20,
     RejectedBoundOther = -21,

@@ -1345,6 +1345,12 @@ pub(crate) async fn run_admitted(
     // The client's feedback datagrams, datagram reader → control task. Unbounded: a client sends
     // a few per report window.
     let (feedback_tx, feedback_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The audio thread's `AudioConfig`s, onto the control stream. Only a client that reopens
+    // its player gets one.
+    let (audio_config_tx, audio_config_rx) = tokio::sync::mpsc::unbounded_channel();
+    let audio_epochs = features
+        .has(punktfunk_core::quic::v2::registry::FEATURE_AUDIO_EPOCH)
+        .then_some(audio_config_tx);
     tokio::spawn(control::run(control::Task {
         ctrl_send,
         ctrl_recv,
@@ -1407,6 +1413,7 @@ pub(crate) async fn run_admitted(
         session_grants: session_grants.clone(),
         access_rx,
         audio_rx,
+        audio_config_rx,
         pad_rx,
         launch_outcome_rx,
         peer: peer.ip(),
@@ -1527,6 +1534,7 @@ pub(crate) async fn run_admitted(
         &audio_sink,
         &controls,
         &counters,
+        audio_epochs,
     );
 
     if welcome.color.is_hdr() {
@@ -1918,6 +1926,9 @@ fn spawn_audio_plane(
     published: &Arc<std::sync::Mutex<Option<String>>>,
     controls: &crate::session_status::SessionControls,
     counters: &Arc<crate::session_status::SessionCounters>,
+    audio_epochs: Option<
+        tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::v2::msg::AudioConfig>,
+    >,
 ) -> Option<std::thread::JoinHandle<()>> {
     if matches!(
         source,
@@ -1962,6 +1973,7 @@ fn spawn_audio_plane(
                 tap_from,
                 muted,
                 counters,
+                audio_epochs,
             )
         })
         .map_err(|e| tracing::warn!(error = %e, "audio thread spawn failed — session continues without audio"))

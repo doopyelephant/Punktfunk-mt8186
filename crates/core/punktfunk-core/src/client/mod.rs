@@ -589,6 +589,10 @@ pub struct ConnectParams {
     /// Only then may the host change codec, depth, colour or chroma mid-stream
     /// ([`crate::quic::v2::registry::FEATURE_FORMAT_EPOCH`]).
     pub rebuilds_decoder: bool,
+    /// This embedder reopens its audio decoder and player on a packet whose
+    /// [`AudioPacket::new_format`] is `Some`. Only then may the host change the audio format
+    /// mid-stream ([`crate::quic::v2::registry::FEATURE_AUDIO_EPOCH`]).
+    pub reopens_audio: bool,
     /// Store-qualified library id to launch (`steam:570`).
     pub launch: Option<String>,
     /// [`crate::quic::Hello::name`], usually [`device_name`]. `None` knocks as "device abcd1234".
@@ -645,6 +649,7 @@ impl ConnectParams {
             client_caps: 0,
             frame_parts: false,
             rebuilds_decoder: false,
+            reopens_audio: false,
             launch: None,
             name: None,
             pin: None,
@@ -888,6 +893,16 @@ impl NativeClient {
         self.ctrl_tx
             .try_send(CtrlRequest::Codec(exclude))
             .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// The desktop audio format the newest packet from [`next_audio`](Self::next_audio) is in:
+    /// the Welcome's until a packet's [`AudioPacket::new_format`] moves it.
+    pub fn audio_format(&self) -> crate::audio::plane::PlaneFormat {
+        self.shared
+            .audio_out
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| crate::audio::plane::PlaneFormat::of(self))
     }
 
     /// `CODEC_*` bits of the codec ask the host refused, `0` while none was. The stream is
@@ -1223,10 +1238,11 @@ impl NativeClient {
         }
         s.chroma_444 = f.chroma_format == crate::quic::CHROMA_IDC_444;
         s.auto_rate = self.wants_decode;
-        s.audio_lossless = self.audio_codec == crate::quic::AUDIO_CODEC_PCM;
-        s.audio_rate_hz = self.audio_sample_rate_hz;
-        s.audio_bits = self.audio_bits;
-        s.audio_channels = self.audio_channels;
+        let a = self.audio_format();
+        s.audio_lossless = a.is_pcm();
+        s.audio_rate_hz = a.rate_hz;
+        s.audio_bits = a.bits;
+        s.audio_channels = a.channels;
         s.extras.push(crate::hud::Extra {
             role: crate::hud::Role::Muted,
             ..crate::hud::Extra::detail(self.link_line())
@@ -1475,7 +1491,11 @@ impl NativeClient {
 
     /// Next audio packet. Drain on a dedicated thread — packets arrive every 5 ms.
     pub fn next_audio(&self, timeout: Duration) -> Result<AudioPacket> {
-        pull(&self.planes.audio, timeout)
+        let pkt = pull(&self.planes.audio, timeout)?;
+        if let Some(format) = pkt.new_format {
+            *self.shared.audio_out.lock().unwrap() = Some(format);
+        }
+        Ok(pkt)
     }
 
     /// Mute this client's own speakers. Nothing leaves for the host: it keeps encoding, and a

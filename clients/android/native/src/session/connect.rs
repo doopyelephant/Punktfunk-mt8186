@@ -551,6 +551,8 @@ fn connect(req: ConnectRequest) -> jlong {
         gamepad: GamepadPref::from_u8(gamepad_pref),
         bitrate_kbps, // 0 = host default
         pyrowave_bpp_x100,
+        // The audio supervisor reopens its device on a packet in a new format.
+        reopens_audio: true,
         video_caps: video_caps(hdr_enabled, ten_bit_sdr, multi_slice_ok),
         audio_channels,
         // The audio format this session ASKS for (resolved above). A non-default pair is what

@@ -268,15 +268,83 @@ impl Pacer {
     }
 }
 
-/// Desktop capture → the session's resolved plane (Opus on `AUDIO_MAGIC`/`AUDIO_RED_MAGIC`,
-/// or PCM on `AUDIO_PCM_MAGIC`) at negotiated `channels` (2 / 6 = 5.1 / 8 = 7.1, wire order
-/// FL FR FC LFE RL RR SL SR). Capturer comes from and returns to [`AudioCapSlot`] through a
-/// [`CaptureLease`]; [`Pacer`] decides when each frame leaves.
-///
-/// `plane` is the format `Welcome` stated — read back by the caller, never recomputed, so
-/// the promised wire and the sent wire cannot disagree.
+/// How one plane's run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaneEnd {
+    /// The session stopped, or the plane cannot go on.
+    Done,
+    /// A lossless plane's capture left the rate it promised.
+    RateLost,
+}
+
+/// [`run_plane`] on the session's plane. A lossless plane whose capture loses its rate runs on
+/// as 48 kHz Opus when the client reopens on an `AudioConfig` (`audio_epochs`, which carries
+/// it to the control stream before the first such datagram); else it ends, video going on.
+/// `seq` runs on across the switch: the config anchors there.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn audio_thread(
+    conn: super::link::SessionLink,
+    stop: Arc<AtomicBool>,
+    audio_cap: AudioCapSlot,
+    channels: u8,
+    budget: punktfunk_core::audio::AudioBudget,
+    plane: super::handshake::AudioPlane,
+    sink: Option<String>,
+    tap: bool,
+    published: Arc<std::sync::Mutex<Option<String>>>,
+    tap_from: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    muted: Arc<AtomicBool>,
+    counters: Arc<crate::session_status::SessionCounters>,
+    audio_epochs: Option<
+        tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::v2::msg::AudioConfig>,
+    >,
+) {
+    counters.note_audio_started();
+    let (mut plane, mut seq, mut epoch) = (plane, 0u32, 0u8);
+    loop {
+        let end = run_plane(
+            conn.clone(),
+            stop.clone(),
+            audio_cap.clone(),
+            channels,
+            budget,
+            plane,
+            sink.clone(),
+            tap,
+            published.clone(),
+            tap_from.clone(),
+            muted.clone(),
+            counters.clone(),
+            &mut seq,
+        );
+        let Some(tx) = audio_epochs.as_ref().filter(|_| end == PlaneEnd::RateLost) else {
+            return;
+        };
+        plane = plane.opus_fallback();
+        epoch = epoch.wrapping_add(1);
+        tracing::info!(
+            first_seq = seq,
+            "the lossless plane's capture changed rate — the session goes on as 48 kHz Opus"
+        );
+        if tx
+            .send(plane.config(channels, epoch, seq, budget.redundancy))
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// Desktop capture → `plane` (Opus on `AUDIO_MAGIC`/`AUDIO_RED_MAGIC`, or PCM on
+/// `AUDIO_PCM_MAGIC`) at negotiated `channels` (2 / 6 = 5.1 / 8 = 7.1, wire order
+/// FL FR FC LFE RL RR SL SR). Capturer comes from and returns to [`AudioCapSlot`] through a
+/// [`CaptureLease`]; [`Pacer`] decides when each frame leaves. `seq` is the wire sequence,
+/// left where this run stopped.
+///
+/// `plane` starts as the format `Welcome` stated — read back by the caller, never
+/// recomputed, so the promised wire and the sent wire cannot disagree.
+#[allow(clippy::too_many_arguments)]
+fn run_plane(
     conn: super::link::SessionLink,
     stop: Arc<AtomicBool>,
     audio_cap: AudioCapSlot,
@@ -301,8 +369,8 @@ pub(super) fn audio_thread(
     // Session totals for the summary. The per-window `SendStats` below keeps resetting; these
     // do not, because the thread outlives the summary that wants them.
     counters: Arc<crate::session_status::SessionCounters>,
-) {
-    counters.note_audio_started();
+    seq_io: &mut u32,
+) -> PlaneEnd {
     use crate::audio::SAMPLE_RATE;
     const FRAME_MS: usize = 5;
     /// Fade at each edge of a capture hole, in µs. 1 ms is a slope, not an edge, and too
@@ -362,7 +430,7 @@ pub(super) fn audio_thread(
             Err(e) => {
                 tracing::warn!(error = %e, "opus encoder init failed — session continues without audio");
                 lease.park(&audio_cap);
-                return;
+                return PlaneEnd::Done;
             }
         }
     };
@@ -390,8 +458,9 @@ pub(super) fn audio_thread(
     } else {
         Vec::new()
     };
-    // Survives reopens so the client sees a gap, not a restart.
-    let mut seq: u32 = 0;
+    // Survives reopens and a plane switch, so the client sees a gap, not a restart.
+    let mut seq: u32 = *seq_io;
+    let mut rate_lost = false;
     let mut pacer = Pacer::new(
         frame_us,
         frame_len,
@@ -473,6 +542,7 @@ pub(super) fn audio_thread(
                      against the capture path as it now is, and resolves either the real rate or \
                      Opus 48 kHz"
                 );
+                rate_lost = true;
                 break 'session;
             }
             rate_mismatch_warned.call_once(|| {
@@ -703,6 +773,12 @@ pub(super) fn audio_thread(
         }
     }
     lease.park(&audio_cap);
+    *seq_io = seq;
+    if rate_lost {
+        PlaneEnd::RateLost
+    } else {
+        PlaneEnd::Done
+    }
 }
 
 #[cfg(test)]

@@ -312,6 +312,12 @@
 #define PUNKTFUNK_REFORMAT_VIDEO 1
 #endif
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// [`PunktfunkConnectOpts::reformat`]: this caller reopens its audio player when
+// `punktfunk_connection_next_audio_pcm` returns `PUNKTFUNK_STATUS_AUDIO_FORMAT`.
+#define PUNKTFUNK_REFORMAT_AUDIO 2
+#endif
+
 // Controller mouse is off: the pad plays. Equals `PadMouseMode::Off`.
 #define PUNKTFUNK_PAD_MOUSE_OFF 0
 
@@ -1277,6 +1283,9 @@ enum PunktfunkStatus
     PUNKTFUNK_STATUS_NULL_POINTER = -8,
     PUNKTFUNK_STATUS_TIMEOUT = -9,
     PUNKTFUNK_STATUS_CLOSED = -10,
+    // `next_audio_pcm`: the host changed the audio format at the next packet. Reopen the player
+    // from the audio getters, which read the new format, then pull again.
+    PUNKTFUNK_STATUS_AUDIO_FORMAT = -11,
     PUNKTFUNK_STATUS_REJECTED_NOT_ARMED = -20,
     PUNKTFUNK_STATUS_REJECTED_BOUND_OTHER = -21,
     PUNKTFUNK_STATUS_REJECTED_RATE_LIMITED = -22,
@@ -2728,7 +2737,8 @@ PunktfunkStatus punktfunk_connection_audio_mute(PunktfunkConnection *c, uint8_t 
 // Host-resolved audio channel count: `2` (stereo), `6` (5.1) or `8` (7.1).
 // `*out` is filled when non-NULL. Raw `0xC9` Opus is encoded for this layout
 // ([`punktfunk_core::audio::layout_for`]); or use [`punktfunk_connection_next_audio_pcm`].
-// Fixed until a reconfigure.
+// It and the other audio getters read the newest packet's format, which moves only where
+// `next_audio_pcm` returned `PUNKTFUNK_STATUS_AUDIO_FORMAT`.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is NULL or writable for one `u8`.
@@ -2754,7 +2764,7 @@ PunktfunkStatus punktfunk_connection_audio_bits(PunktfunkConnection *c, uint8_t 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Resolved frame length in µs (ladder has sub-ms rungs). `0` = use
+// Resolved frame length in µs (ladder has sub-ms rungs); Opus is
 // `PUNKTFUNK_AUDIO_FRAME_MS × 1000`. On 44.1 kHz this is a nominal length, not a
 // duration — size rings from it, advance clocks from samples / rate.
 // Not derivable from `next_audio_pcm`'s `frame_count` (that includes concealment).
@@ -2785,6 +2795,8 @@ int64_t punktfunk_redial_delay_ms(uint8_t end_reason, uint32_t attempt);
 // call; size the ring from [`punktfunk_connection_audio_sample_rate`]. Seq-gap
 // concealment is prepended in the same buffer. Quiet-wire droughts:
 // [`punktfunk_connection_audio_plc`]. Mutually exclusive with `next_audio`.
+// `PUNKTFUNK_STATUS_AUDIO_FORMAT`, only under `PUNKTFUNK_REFORMAT_AUDIO`: the next packet is
+// in a new format; reopen the player from the audio getters and call again.
 //
 // # Safety
 // `c` is a valid connection handle; `out` is writable. At most one audio puller.

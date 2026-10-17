@@ -52,18 +52,23 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
 
 /// What this client offers. A format epoch is the embedder's promise to rebuild its decoder,
 /// so core offers it only when the embedder made it.
-fn client_features(rebuilds_decoder: bool) -> crate::quic::v2::features::FeatureSet {
+fn client_features(
+    rebuilds_decoder: bool,
+    reopens_audio: bool,
+) -> crate::quic::v2::features::FeatureSet {
     use crate::quic::v2::registry;
-    let base = crate::quic::v2::features::FeatureSet::default()
+    let mut set = crate::quic::v2::features::FeatureSet::default()
         .with(registry::FEATURE_STREAM_CONFIG)
         .with(registry::FEATURE_PAD_WRITES)
         .with(registry::FEATURE_PROFILES)
         .with(registry::FEATURE_CLEAR_PLACEMENT);
     if rebuilds_decoder {
-        base.with(registry::FEATURE_FORMAT_EPOCH)
-    } else {
-        base
+        set = set.with(registry::FEATURE_FORMAT_EPOCH);
     }
+    if reopens_audio {
+        set = set.with(registry::FEATURE_AUDIO_EPOCH);
+    }
+    set
 }
 
 /// Take a `Redirect` once: the next dial goes to its address and port with the same
@@ -241,7 +246,7 @@ async fn dial(
             } else {
                 vec![MediaSuite::Aes128Gcm]
             },
-            features: client_features(p.rebuilds_decoder),
+            features: client_features(p.rebuilds_decoder, p.reopens_audio),
             profile: p.profile.clone(),
             access_only: false,
         };
@@ -316,6 +321,18 @@ async fn dial(
             anchor.book(0, crate::quic::VideoFormat::of_welcome(&welcome));
         }
         *args.shared.video_format.lock().unwrap() = crate::quic::VideoFormat::of_welcome(&welcome);
+        {
+            let mut audio = args.shared.audio_anchor.lock().unwrap();
+            audio.on = server.features.has(registry::FEATURE_AUDIO_EPOCH);
+            audio.live = Some(crate::audio::plane::PlaneFormat::from_welcome(
+                welcome.audio_codec,
+                welcome.audio_rate_hz,
+                welcome.audio_bits,
+                welcome.audio_channels,
+                u32::from(welcome.audio_frame_us),
+                welcome.audio_layout,
+            ));
+        }
         let cfg = welcome.session_config(Role::Client);
         let media_v2 = crate::session::MediaV2 {
             clock_origin_ns: server.clock_origin_ns,

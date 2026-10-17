@@ -93,6 +93,37 @@ impl AudioPlane {
         self.codec == punktfunk_core::quic::AUDIO_CODEC_PCM
     }
 
+    /// What a lossless plane falls back to when its capture loses the promised rate: 48 kHz
+    /// Opus in the same coupling, which the capturer resamples to.
+    pub(super) fn opus_fallback(self) -> AudioPlane {
+        AudioPlane {
+            layout: self.layout,
+            ..AudioPlane::opus()
+        }
+    }
+
+    /// This plane as the desktop stream's `AudioConfig` from `first_seq` on.
+    pub(super) fn config(
+        self,
+        channels: u8,
+        epoch: u8,
+        first_seq: u32,
+        redundant: bool,
+    ) -> punktfunk_core::quic::v2::msg::AudioConfig {
+        punktfunk_core::quic::v2::msg::AudioConfig {
+            stream: 0,
+            epoch,
+            codec: self.codec,
+            rate_hz: self.rate_hz,
+            bits: self.bits,
+            channels,
+            layout: self.layout.wire(),
+            frame_us: self.frame_us,
+            redundant,
+            first_seq,
+        }
+    }
+
     /// Read the plane back off the sent [`Welcome`]. Recomputing it would let encoder and client drift.
     pub(super) fn from_welcome(w: &Welcome) -> AudioPlane {
         AudioPlane {
@@ -570,7 +601,8 @@ pub(super) async fn negotiate(
             .with(punktfunk_core::quic::v2::registry::FEATURE_PAD_WRITES)
             .with(punktfunk_core::quic::v2::registry::FEATURE_PROFILES)
             .with(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT)
-            .with(punktfunk_core::quic::v2::registry::FEATURE_FORMAT_EPOCH),
+            .with(punktfunk_core::quic::v2::registry::FEATURE_FORMAT_EPOCH)
+            .with(punktfunk_core::quic::v2::registry::FEATURE_AUDIO_EPOCH),
     );
     let server_hello = ServerHello {
         welcome,
@@ -1259,6 +1291,39 @@ async fn negotiate_audio_plane(
 mod tests {
     use super::*;
     use punktfunk_core::audio::pcm;
+
+    /// A lossless plane falls back to 48 kHz Opus in its own coupling, and its config anchors at
+    /// the sequence the first Opus datagram takes.
+    #[test]
+    fn a_lossless_plane_falls_back_to_opus_in_its_coupling() {
+        use punktfunk_core::audio::AudioLayout;
+        use punktfunk_core::quic::{AUDIO_CODEC_OPUS, AUDIO_CODEC_PCM};
+        let lossless = AudioPlane {
+            codec: AUDIO_CODEC_PCM,
+            rate_hz: 96_000,
+            bits: pcm::BITS_24,
+            frame_us: 2000,
+            layout: AudioLayout::Standard,
+        };
+        let opus = lossless.opus_fallback();
+        assert_eq!(
+            (opus.codec, opus.rate_hz, opus.frame_us, opus.layout),
+            (AUDIO_CODEC_OPUS, 48_000, 0, AudioLayout::Standard)
+        );
+        let cfg = opus.config(6, 1, 700, false);
+        assert_eq!(
+            (
+                cfg.stream,
+                cfg.epoch,
+                cfg.codec,
+                cfg.rate_hz,
+                cfg.channels,
+                cfg.first_seq
+            ),
+            (0, 1, AUDIO_CODEC_OPUS, 48_000, 6, 700)
+        );
+        assert_eq!(cfg.layout, AudioLayout::Standard.wire());
+    }
 
     /// HDR takes 4:2:0 over Linux's 8-bit 4:4:4 on the H.26x path; without HDR the chroma
     /// stands. PyroWave's own 4:4:4 CSC is 10-bit, so HDR never costs it chroma.

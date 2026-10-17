@@ -637,6 +637,8 @@ fn dial(
         // Legacy coupling: this client decodes either, and only NDL-class sinks need the other.
         audio_layout: punktfunk_core::audio::AudioLayout::Legacy,
         video_fit: params.video_fit,
+        // The audio thread reopens its plane on a packet in a new format.
+        reopens_audio: true,
         video_codecs: plan.advertised_codecs,
         preferred_codec: plan.preferred,
         // Env hatch wins so an A/B run can pin an exact peak (`PUNKTFUNK_CLIENT_PEAK_NITS`).
@@ -1686,15 +1688,49 @@ fn codec_fallback_event(
 /// on `next_audio` (the plane's single consumer). Decoded chunks are Vecs recycled
 /// from the player's pool — steady state allocates nothing. A muted stream still
 /// decodes and still queues, in silence: the device never closes, so a toggle costs
-/// neither a click nor a resync. Best-effort: setup failure logs and the session
-/// streams video-only. Exits on stop or a closed plane.
+/// neither a click nor a resync. A format the host moves to mid-stream reopens decoder and
+/// player at its first packet ([`play_audio`]). Best-effort: setup failure logs and the
+/// session streams video-only. Exits on stop or a closed plane.
 fn spawn_audio(
     connector: Arc<NativeClient>,
     stop: Arc<AtomicBool>,
 ) -> Option<std::thread::JoinHandle<()>> {
-    // Decoder + playback from the host-resolved format, never the request. Opening
-    // the device from the request is the failure a clamping host would trigger.
-    let fmt = punktfunk_core::audio::plane::PlaneFormat::of(&connector);
+    std::thread::Builder::new()
+        .name("punktfunk-audio-rx".into())
+        .spawn(move || {
+            // Best-effort priority for the decode leg. Lateness is absorbed by the
+            // ring, but a thread descheduled past ring depth is a drought. Refusal
+            // leaves the thread as it was (`audio_rt`).
+            crate::audio_rt::boost_and_log("punktfunk-audio-rx");
+            let mut fmt = connector.audio_format();
+            let mut first = None;
+            while let Some(next) = play_audio(&connector, &stop, fmt, first.take()) {
+                fmt = next
+                    .new_format
+                    .expect("a plane ends only on a marked packet");
+                first = Some(next);
+            }
+            tracing::debug!("audio pull thread exited");
+        })
+        .map_err(|e| tracing::warn!(error = %e, "audio thread start failed — audio disabled"))
+        .ok()
+}
+
+/// One audio format's decoder, player and pull loop, from the host-resolved `fmt`, never the
+/// request. `first` is the packet that opened this format, played before anything is pulled.
+/// `Some` = a packet in another format arrived: the next plane opens with it. `None` = the
+/// session ended, or this format cannot play.
+fn play_audio(
+    connector: &NativeClient,
+    stop: &AtomicBool,
+    fmt: punktfunk_core::audio::plane::PlaneFormat,
+    first: Option<punktfunk_core::client::AudioPacket>,
+) -> Option<punktfunk_core::client::AudioPacket> {
+    let mut first = first.map(|pkt| punktfunk_core::client::AudioPacket {
+        new_format: None,
+        ..pkt
+    });
+    // Opening the device from the request is the failure a clamping host would trigger.
     // A codec this client does not speak is refused out loud. `ServerHello`
     // takes `audio_codec` verbatim — folding an unknown id onto Opus would
     // Opus-decode a `0xD3` payload (noise) or wait forever for `0xC9` (silence).
@@ -1759,149 +1795,145 @@ fn spawn_audio(
     // Pull-loop tick, one protocol frame. Rounded up so a sub-millisecond rung can
     // never round to a zero-length timeout and spin.
     let frame_ms = (frame_us as u64).div_ceil(1000).max(1);
-    std::thread::Builder::new()
-        .name("punktfunk-audio-rx".into())
-        .spawn(move || {
-            // Best-effort priority for the decode leg. Lateness is absorbed by the
-            // ring, but a thread descheduled past ring depth is a drought. Refusal
-            // leaves the thread as it was (`audio_rt`).
-            crate::audio_rt::boost_and_log("punktfunk-audio-rx");
-            let mut pcm = vec![0f32; scratch];
-            // Every frame reaches the device through here. A muted stream queues silence of
-            // the same length, so the ring keeps its cadence and unmute lands in step — the
-            // frame still decoded, so there is no decoder state to rebuild.
-            let queue = |player: &audio::AudioPlayer, pcm: &[f32]| {
-                let mut buf = player.take_buffer();
-                if connector.audio_muted() {
-                    buf.resize(pcm.len(), 0.0);
-                } else {
-                    buf.extend_from_slice(pcm);
+    let mut pcm = vec![0f32; scratch];
+    // Every frame reaches the device through here. A muted stream queues silence of
+    // the same length, so the ring keeps its cadence and unmute lands in step — the
+    // frame still decoded, so there is no decoder state to rebuild.
+    let queue = |player: &audio::AudioPlayer, pcm: &[f32]| {
+        let mut buf = player.take_buffer();
+        if connector.audio_muted() {
+            buf.resize(pcm.len(), 0.0);
+        } else {
+            buf.extend_from_slice(pcm);
+        }
+        player.push(buf);
+    };
+    let mut gaps = playout.gaps();
+    // Last decoded frame per channel: the PLC unit, 0 until something decodes.
+    let mut frame_samples = 0usize;
+    let mut av = playout.sync();
+    if !av_sync_enabled {
+        tracing::info!("A/V sync disabled by PUNKTFUNK_NO_AV_SYNC");
+    }
+    // Drought concealment. A seq gap is concealed when a later packet
+    // arrives; when the wire goes quiet nothing arrives to reveal it.
+    let mut drought = playout.drought();
+    let mut last_packet = std::time::Instant::now();
+    // Playback vitals ~every 10 s on wall clock, plus a one-shot quantum
+    // line the first time the callback has published one.
+    let mut last_vitals = std::time::Instant::now();
+    let mut quantum_logged = false;
+    while !stop.load(Ordering::SeqCst) {
+        if !quantum_logged && vitals.quantum_known() {
+            quantum_logged = true;
+            let v = vitals.snapshot();
+            tracing::info!(
+                requested_frames = v.requested_frames,
+                capacity_frames = v.capacity_frames,
+                write_frames = v.write_frames,
+                // From the session's rate, not from 48: a 96 kHz quantum
+                // divided by 48 reads as twice the latency it is.
+                write_ms = v.write_frames / (rate_hz / 1000).max(1),
+                rate_hz,
+                "audio playback quantum"
+            );
+        }
+        if last_vitals.elapsed() >= Duration::from_secs(10) {
+            last_vitals = std::time::Instant::now();
+            let v = vitals.snapshot();
+            tracing::debug!(
+                buffer_ms = v.buffer_ms,
+                target_ms = v.target_ms,
+                underruns = v.underruns,
+                drift_sheds = v.sheds,
+                // Sync-driven deepening, one duplicated crossfaded frame each.
+                drift_inserts = v.inserts,
+                callbacks = v.callbacks,
+                // Concealment next to the underruns it prevented: a healthy
+                // `underruns` bought with climbing `plc_ms` is a link in trouble.
+                plc_ms = sync_cell.plc_ms(),
+                "audio playback"
+            );
+        }
+        // Wait at most one frame while there is a stream to protect. Before
+        // anything has decoded, a session whose host never sends audio keeps
+        // the long timeout rather than waking 200 times a second to do nothing.
+        let wait_ms = if frame_samples > 0 { frame_ms } else { 100 };
+        let pulled = match first.take() {
+            Some(pkt) => Ok(pkt),
+            None => connector.next_audio(Duration::from_millis(wait_ms)),
+        };
+        match pulled {
+            // The host moved the format: this plane ends and the next opens with it.
+            Ok(pkt) if pkt.new_format.is_some() => return Some(pkt),
+            Ok(pkt) => {
+                // Place this frame against the picture before it is queued:
+                // `buffered_ahead` is everything that must still play first.
+                let depth = sync_cell.depth();
+                // Published even with sync off — ring depth is what makes a
+                // "too much latency" report triageable.
+                buffer_ms_out.store(fmt.samples_ms(depth), Ordering::Relaxed);
+                if av_sync_enabled {
+                    let ve2e = video_e2e.load(Ordering::Relaxed);
+                    let o = punktfunk_core::audio::AvSyncObservation {
+                        pts_ns: pkt.pts_ns,
+                        now_local_ns: punktfunk_core::client::now_realtime_ns(),
+                        clock_offset_ns: connector.clock_offset_now_ns(),
+                        buffered_ahead: depth,
+                        output_latency_ns: sync_cell.output_latency_ns(),
+                        // 0 = nothing on the glass yet; no reference, no correction.
+                        video_e2e_ns: (ve2e > 0).then_some(ve2e),
+                    };
+                    av.observe(o);
+                    sync_cell.set_target(av.desired_depth(depth));
+                    av_offset_out.store(av.offset_ms() as i64, Ordering::Relaxed);
                 }
-                player.push(buf);
-            };
-            let mut gaps = playout.gaps();
-            // Last decoded frame per channel: the PLC unit, 0 until something decodes.
-            let mut frame_samples = 0usize;
-            let mut av = playout.sync();
-            if !av_sync_enabled {
-                tracing::info!("A/V sync disabled by PUNKTFUNK_NO_AV_SYNC");
-            }
-            // Drought concealment. A seq gap is concealed when a later packet
-            // arrives; when the wire goes quiet nothing arrives to reveal it.
-            let mut drought = playout.drought();
-            let mut last_packet = std::time::Instant::now();
-            // Playback vitals ~every 10 s on wall clock, plus a one-shot quantum
-            // line the first time the callback has published one.
-            let mut last_vitals = std::time::Instant::now();
-            let mut quantum_logged = false;
-            while !stop.load(Ordering::SeqCst) {
-                if !quantum_logged && vitals.quantum_known() {
-                    quantum_logged = true;
-                    let v = vitals.snapshot();
-                    tracing::info!(
-                        requested_frames = v.requested_frames,
-                        capacity_frames = v.capacity_frames,
-                        write_frames = v.write_frames,
-                        // From the session's rate, not from 48: a 96 kHz quantum
-                        // divided by 48 reads as twice the latency it is.
-                        write_ms = v.write_frames / (rate_hz / 1000).max(1),
-                        rate_hz,
-                        "audio playback quantum"
-                    );
-                }
-                if last_vitals.elapsed() >= Duration::from_secs(10) {
-                    last_vitals = std::time::Instant::now();
-                    let v = vitals.snapshot();
-                    tracing::debug!(
-                        buffer_ms = v.buffer_ms,
-                        target_ms = v.target_ms,
-                        underruns = v.underruns,
-                        drift_sheds = v.sheds,
-                        // Sync-driven deepening, one duplicated crossfaded frame each.
-                        drift_inserts = v.inserts,
-                        callbacks = v.callbacks,
-                        // Concealment next to the underruns it prevented: a healthy
-                        // `underruns` bought with climbing `plc_ms` is a link in trouble.
-                        plc_ms = sync_cell.plc_ms(),
-                        "audio playback"
-                    );
-                }
-                // Wait at most one frame while there is a stream to protect. Before
-                // anything has decoded, a session whose host never sends audio keeps
-                // the long timeout rather than waking 200 times a second to do nothing.
-                let wait_ms = if frame_samples > 0 { frame_ms } else { 100 };
-                match connector.next_audio(Duration::from_millis(wait_ms)) {
-                    Ok(pkt) => {
-                        // Place this frame against the picture before it is queued:
-                        // `buffered_ahead` is everything that must still play first.
-                        let depth = sync_cell.depth();
-                        // Published even with sync off — ring depth is what makes a
-                        // "too much latency" report triageable.
-                        buffer_ms_out.store(fmt.samples_ms(depth), Ordering::Relaxed);
-                        if av_sync_enabled {
-                            let ve2e = video_e2e.load(Ordering::Relaxed);
-                            let o = punktfunk_core::audio::AvSyncObservation {
-                                pts_ns: pkt.pts_ns,
-                                now_local_ns: punktfunk_core::client::now_realtime_ns(),
-                                clock_offset_ns: connector.clock_offset_now_ns(),
-                                buffered_ahead: depth,
-                                output_latency_ns: sync_cell.output_latency_ns(),
-                                // 0 = nothing on the glass yet; no reference, no correction.
-                                video_e2e_ns: (ve2e > 0).then_some(ve2e),
-                            };
-                            av.observe(o);
-                            sync_cell.set_target(av.desired_depth(depth));
-                            av_offset_out.store(av.offset_ms() as i64, Ordering::Relaxed);
-                        }
-                        last_packet = std::time::Instant::now();
-                        // Anything the drought path already covered is audio the stream
-                        // now has; concealing it again would insert samples it never
-                        // carried and push everything after them later.
-                        let already = drought.packet();
-                        // Conceal a seq gap before decoding the arrival. Opus interpolates
-                        // from decoder state; PCM repeats-and-fades — lossless has nothing
-                        // to interpolate from. Gap arithmetic is codec-independent.
-                        for _ in 0..gaps.missing_before(pkt.seq).saturating_sub(already) {
-                            match dec.conceal(frame_samples, &mut pcm) {
-                                Ok(n) if n > 0 => queue(&player, &pcm[..n * ch]),
-                                _ => break,
-                            }
-                        }
-                        match dec.decode(&pkt.data, &mut pcm) {
-                            // Empty payload: the last frame stays the concealment unit.
-                            Ok(0) => {}
-                            Ok(n) => {
-                                frame_samples = n;
-                                queue(&player, &pcm[..n * ch]);
-                            }
-                            // Opus: corrupt packet. PCM: not a whole number of samples
-                            // at the negotiated depth. Either way the frame is lost.
-                            Err(e) => tracing::debug!(
-                                error = %e,
-                                bytes = pkt.data.len(),
-                                "audio decode failed"
-                            ),
-                        }
+                last_packet = std::time::Instant::now();
+                // Anything the drought path already covered is audio the stream
+                // now has; concealing it again would insert samples it never
+                // carried and push everything after them later.
+                let already = drought.packet();
+                // Conceal a seq gap before decoding the arrival. Opus interpolates
+                // from decoder state; PCM repeats-and-fades — lossless has nothing
+                // to interpolate from. Gap arithmetic is codec-independent.
+                for _ in 0..gaps.missing_before(pkt.seq).saturating_sub(already) {
+                    match dec.conceal(frame_samples, &mut pcm) {
+                        Ok(n) if n > 0 => queue(&player, &pcm[..n * ch]),
+                        _ => break,
                     }
-                    Err(PunktfunkError::NoFrame) => {
-                        // Nothing on the wire. If the ring is draining, conceal at one
-                        // frame per tick — this arm fires every frame time, the rate
-                        // the callback drains at. `frame_samples` is 0 until first decode.
-                        let depth_ms = fmt.samples_ms(sync_cell.depth());
-                        if frame_samples > 0 && drought.conceal(last_packet.elapsed(), depth_ms) {
-                            if let Ok(n @ 1..) = dec.conceal(frame_samples, &mut pcm) {
-                                queue(&player, &pcm[..n * ch]);
-                            }
-                            sync_cell.publish_plc_ms(drought.total_ms());
-                        }
+                }
+                match dec.decode(&pkt.data, &mut pcm) {
+                    // Empty payload: the last frame stays the concealment unit.
+                    Ok(0) => {}
+                    Ok(n) => {
+                        frame_samples = n;
+                        queue(&player, &pcm[..n * ch]);
                     }
-                    Err(_) => break,
+                    // Opus: corrupt packet. PCM: not a whole number of samples
+                    // at the negotiated depth. Either way the frame is lost.
+                    Err(e) => tracing::debug!(
+                        error = %e,
+                        bytes = pkt.data.len(),
+                        "audio decode failed"
+                    ),
                 }
             }
-            tracing::debug!("audio pull thread exited");
-        })
-        .map_err(|e| tracing::warn!(error = %e, "audio thread start failed — audio disabled"))
-        .ok()
+            Err(PunktfunkError::NoFrame) => {
+                // Nothing on the wire. If the ring is draining, conceal at one
+                // frame per tick — this arm fires every frame time, the rate
+                // the callback drains at. `frame_samples` is 0 until first decode.
+                let depth_ms = fmt.samples_ms(sync_cell.depth());
+                if frame_samples > 0 && drought.conceal(last_packet.elapsed(), depth_ms) {
+                    if let Ok(n @ 1..) = dec.conceal(frame_samples, &mut pcm) {
+                        queue(&player, &pcm[..n * ch]);
+                    }
+                    sync_cell.publish_plc_ms(drought.total_ms());
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// `PUNKTFUNK_DEBUG_RECONFIGURE`: `WxH@HZ:SECS` → request that mode SECS seconds in.

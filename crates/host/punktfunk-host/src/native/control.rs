@@ -298,6 +298,8 @@ pub(super) struct Task {
     /// Operator mute for this session (mgmt `PUT /session/{id}/audio`), so the client
     /// can name the silence rather than conceal a gap.
     pub(super) audio_rx: tokio::sync::mpsc::UnboundedReceiver<punktfunk_core::quic::AudioState>,
+    /// The audio thread's format changes, each before its first datagram.
+    pub(super) audio_config_rx: tokio::sync::mpsc::UnboundedReceiver<v2msg::AudioConfig>,
     /// OS pad slots this session holds, from the input thread. The client names the
     /// player it is from this; wire indices are per client and say nothing about it.
     /// And the feature reports Steam set on them, for the physical pads.
@@ -433,6 +435,7 @@ pub(super) async fn run(task: Task) {
         session_grants,
         mut access_rx,
         mut audio_rx,
+        mut audio_config_rx,
         mut pad_rx,
         mut launch_outcome_rx,
         peer,
@@ -458,6 +461,8 @@ pub(super) async fn run(task: Task) {
     let mut access_closed = false;
     // Same closed-channel discipline: the mute lane outlives nothing of its own.
     let mut audio_closed = false;
+    // The audio thread drops its config sender when it ends; so does a client without epochs.
+    let mut audio_config_closed = false;
     // Pad slots end with the input thread.
     let mut pad_slots_closed = false;
     // Same again. The launch site drops its sender when the session ends.
@@ -971,6 +976,12 @@ pub(super) async fn run(task: Task) {
                 // perpetually ready and would spin `select!`.
                 let Some(state) = state else { audio_closed = true; continue };
                 if v2io::send(&mut ctrl_send, &state).await.is_err() {
+                    break;
+                }
+            }
+            cfg = audio_config_rx.recv(), if !audio_config_closed => {
+                let Some(cfg) = cfg else { audio_config_closed = true; continue };
+                if v2io::send(&mut ctrl_send, &cfg).await.is_err() {
                     break;
                 }
             }

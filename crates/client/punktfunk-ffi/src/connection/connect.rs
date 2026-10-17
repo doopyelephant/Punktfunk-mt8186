@@ -809,6 +809,11 @@ pub struct PunktfunkConnectOpts {
 #[cfg(feature = "quic")]
 pub const PUNKTFUNK_REFORMAT_VIDEO: u8 = 1;
 
+/// [`PunktfunkConnectOpts::reformat`]: this caller reopens its audio player when
+/// `punktfunk_connection_next_audio_pcm` returns `PUNKTFUNK_STATUS_AUDIO_FORMAT`.
+#[cfg(feature = "quic")]
+pub const PUNKTFUNK_REFORMAT_AUDIO: u8 = 2;
+
 // No tail padding (append contract). On grow: freeze `CONNECT_OPTS_MIN_SIZE`, update these sizes.
 // `video_fit` sits in the byte v35–v40 callers zeroed as `reserved0`.
 #[cfg(feature = "quic")]
@@ -1171,6 +1176,7 @@ unsafe fn connect_params(
         profile,
         probe_only: o.delivery_flags & punktfunk_core::quic::EXT_DELIVERY_PROBE_ONLY != 0,
         rebuilds_decoder: o.reformat & PUNKTFUNK_REFORMAT_VIDEO != 0,
+        reopens_audio: o.reformat & PUNKTFUNK_REFORMAT_AUDIO != 0,
         on_pending: o.on_pending.map(|f| {
             let hook = PendingHook(f, o.on_pending_ctx as usize);
             std::sync::Arc::new(move || hook.call()) as std::sync::Arc<dyn Fn() + Send + Sync>

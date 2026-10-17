@@ -149,6 +149,17 @@ impl ControlTask {
                         } else {
                             tracing::warn!(active = ?ack.mode, "host rejected mode switch");
                         }
+                    } else if let Some(cfg) = decode::<v2msg::AudioConfig>(ty, &body)
+                        .ok()
+                        .filter(|c| c.stream == 0)
+                    {
+                        tracing::info!(
+                            codec = cfg.codec,
+                            rate_hz = cfg.rate_hz,
+                            first_seq = cfg.first_seq,
+                            "the host changes the audio format"
+                        );
+                        shared.audio_anchor.lock().unwrap_or_else(|e| e.into_inner()).config(&cfg);
                     } else if let Ok(cfg) = decode::<v2msg::StreamConfig>(ty, &body) {
                         let host = crate::quic::HostLink::of(&cfg);
                         if std::mem::replace(&mut *shared.host_link.lock().unwrap(), host) != host {
