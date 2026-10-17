@@ -162,8 +162,10 @@ pub fn client_socket(bind: SocketAddr) -> std::io::Result<(Arc<ClientSocket>, Cl
     }));
     let stats = Arc::new(SharedStats::default());
     let (tx, rx) = sync_channel(MEDIA_QUEUE);
-    // Without GRO a read is one datagram, so the buffer is one datagram's worth.
-    let size = if state.gro_segments() > 1 {
+    // Without GRO a read is one datagram, so the buffer is one datagram's worth. Windows
+    // reports 64 segments whether or not URO is on, and nothing turns URO on.
+    let coalesced = !cfg!(windows) && state.gro_segments() > 1;
+    let size = if coalesced {
         READ_BUF
     } else {
         crate::packet::MAX_DATAGRAM_BYTES + 1
