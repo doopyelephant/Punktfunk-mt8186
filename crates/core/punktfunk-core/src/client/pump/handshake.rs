@@ -150,7 +150,7 @@ async fn dial(
     tracing::info!("connected");
     // The host streams as soon as it has `Start`, so its address is whitelisted for media
     // before the handshake. Later is the opening IDR.
-    media.stats().set_host(conn.remote_address());
+    media.set_host(conn.remote_address());
     // Inner future so a failure can read `conn.close_reason()`: a typed application
     // close is `Rejected`, not the generic transport error the failed read produces.
     let handshake = async {

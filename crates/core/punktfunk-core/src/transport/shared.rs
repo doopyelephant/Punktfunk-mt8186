@@ -5,6 +5,7 @@
 //! Client: [`client_socket`] starts a native thread that owns every read. QUIC packets go to
 //! quinn through the [`ClientSocket`] it returns; media from the host's address goes to the
 //! session through [`ClientMedia`], a bounded queue. Video never enters an async runtime.
+//! On Apple the socket connects to the host once it is known ([`ClientMedia::set_host`]).
 //!
 //! Host: [`MediaSender`] sends media on a clone of the endpoint's socket, toward the
 //! connection's current address and from the address the client dialed. quinn moves that
@@ -60,7 +61,7 @@ pub struct SharedStats {
 
 impl SharedStats {
     /// Accept media from `host` only. Until it is set, every media packet is foreign.
-    pub fn set_host(&self, host: SocketAddr) {
+    fn set_host(&self, host: SocketAddr) {
         *self.host.lock().unwrap_or_else(|e| e.into_inner()) = Some(canonical(host));
     }
 
@@ -85,12 +86,16 @@ struct QuicQueue {
     waker: Option<Waker>,
 }
 
+/// The host the socket is connected to. A connected socket refuses an addressed send.
+type Peer = Arc<Mutex<Option<SocketAddr>>>;
+
 /// The quinn side of the client's shared socket.
 pub struct ClientSocket {
     socket: Arc<UdpSocket>,
     state: Arc<UdpSocketState>,
     quic: Arc<Mutex<QuicQueue>>,
     stats: Arc<SharedStats>,
+    peer: Peer,
 }
 
 impl std::fmt::Debug for ClientSocket {
@@ -113,11 +118,28 @@ pub struct ClientMedia {
     rx: Mutex<Receiver<RecvBatch>>,
     stats: Arc<SharedStats>,
     socket: Arc<UdpSocket>,
+    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
+    peer: Peer,
 }
 
 impl ClientMedia {
     pub fn stats(&self) -> &Arc<SharedStats> {
         &self.stats
+    }
+
+    /// Accept media from `host` only. On Apple the socket also connects to it: XNU sheds an
+    /// unconnected UDP socket's datagrams past ~150k a second (1.7 Gbit/s of video), uncounted.
+    pub fn set_host(&self, host: SocketAddr) {
+        let host = canonical(host);
+        self.stats.set_host(host);
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut peer = self.peer.lock().unwrap_or_else(|e| e.into_inner());
+            match self.socket.connect(host) {
+                Ok(()) => *peer = Some(host),
+                Err(e) => tracing::warn!(error = %e, "shared socket stays unconnected"),
+            }
+        }
     }
 
     /// The shared socket, for its buffer and drop figures. Never read from it: the demux
@@ -147,6 +169,7 @@ pub fn client_socket(bind: SocketAddr) -> std::io::Result<(Arc<ClientSocket>, Cl
         crate::packet::MAX_DATAGRAM_BYTES + 1
     };
     let pool = BufPool::new(size, (POOL_BYTES / size).max(2 * BATCH));
+    let peer = Peer::default();
     let reader = Reader {
         socket: socket.clone(),
         state: state.clone(),
@@ -168,11 +191,13 @@ pub fn client_socket(bind: SocketAddr) -> std::io::Result<(Arc<ClientSocket>, Cl
             state,
             quic,
             stats: stats.clone(),
+            peer: peer.clone(),
         }),
         ClientMedia {
             rx: Mutex::new(rx),
             stats,
             socket,
+            peer,
         },
     ))
 }
@@ -324,13 +349,39 @@ impl quinn::UdpPoller for RetrySoon {
 
 use std::future::Future;
 
+/// `transmit` on a socket connected to `peer`: unaddressed, one datagram per segment, no ECN
+/// mark (quinn's validation then stops asking for one). Any error but `WouldBlock` is a lost
+/// packet and connects again, which picks the source address afresh after a roam.
+fn send_connected(socket: &UdpSocket, peer: SocketAddr, t: &Transmit) -> std::io::Result<()> {
+    let segment = t.segment_size.unwrap_or(t.contents.len()).max(1);
+    for datagram in t.contents.chunks(segment) {
+        match socket.send(datagram) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(e),
+            Err(e) => {
+                tracing::debug!(error = %e, "shared socket send");
+                let _ = socket.connect(peer);
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 impl quinn::AsyncUdpSocket for ClientSocket {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
         Box::pin(RetrySoon(None))
     }
 
+    /// Held across the send: [`ClientMedia::set_host`] connects under the same lock.
     fn try_send(&self, transmit: &Transmit) -> std::io::Result<()> {
-        self.state.send((&*self.socket).into(), transmit)
+        let peer = self.peer.lock().unwrap_or_else(|e| e.into_inner());
+        match *peer {
+            Some(p) if canonical(transmit.destination) == p => {
+                send_connected(&self.socket, p, transmit)
+            }
+            _ => self.state.send((&*self.socket).into(), transmit),
+        }
     }
 
     fn poll_recv(
@@ -581,7 +632,7 @@ mod tests {
         });
         let client_conn = client.connect(addr, "punktfunk").unwrap().await.unwrap();
         let host_conn = accept.await.unwrap();
-        media.stats().set_host(addr);
+        media.set_host(addr);
         (server, socket, client, media, host_conn, client_conn)
     }
 
@@ -654,9 +705,15 @@ mod tests {
         {
             datagrams += 1;
         }
+        client_conn.send_datagram(vec![7u8; 8].into()).unwrap();
+        let up = tokio::time::timeout(Duration::from_secs(2), host_conn.read_datagram()).await;
         let st = media.stats();
         assert_eq!(got, N, "every media packet arrives on loopback");
         assert!(datagrams > 250, "QUIC datagrams kept flowing: {datagrams}");
+        assert!(
+            matches!(up, Ok(Ok(_))),
+            "QUIC leaves the client after set_host"
+        );
         assert_eq!(st.foreign.load(Ordering::Relaxed), 0);
         assert_eq!(st.media_dropped.load(Ordering::Relaxed), 0);
         assert!(st.quic.load(Ordering::Relaxed) > 0);
@@ -676,7 +733,9 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(media.recv_owned().unwrap().is_none());
-        assert_eq!(media.stats().foreign.load(Ordering::Relaxed), 10);
+        // A connected socket's kernel drops them before the demux counts them.
+        let counted = if cfg!(target_vendor = "apple") { 0 } else { 10 };
+        assert_eq!(media.stats().foreign.load(Ordering::Relaxed), counted);
     }
 
     /// A lent buffer comes back on drop, and the pool never allocates past its bound.
