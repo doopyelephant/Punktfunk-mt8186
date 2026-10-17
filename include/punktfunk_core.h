@@ -813,7 +813,7 @@
 #define PUNKTFUNK_HOST_CAP2_EXT 4
 
 // [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host serves
-// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is punched,
+// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is bound,
 // before its pipeline exists and without the one-per-10 s spacing, until the first video
 // frame leaves. That window is what the client's bring-up ramp measures the link in; a
 // client that does not see the bit bursts beside live video as before.
@@ -825,9 +825,9 @@
 
 // [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads
 // [`InputEdge`](super::control::InputEdge) off the control stream. Toward this bit the
-// client sends every key press and release there, where QUIC resends what the network
-// drops; a lost `KeyUp` on the datagram plane otherwise holds the key until its next edge.
-// Motion, scroll and pads stay datagrams. Without the bit every event is a datagram, as before.
+// client sends every key and mouse-button press and release there, where QUIC resends what
+// the network drops; a lost release on the datagram plane otherwise holds it until its next
+// edge. Motion, scroll and pads stay datagrams. Without the bit every event is a datagram.
 #define PUNKTFUNK_HOST_CAP2_INPUT_EDGES 64
 
 // [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
@@ -1043,6 +1043,11 @@
 // QUIC application close: dedicated-session game process exited. Sibling of
 // [`QUIT_CLOSE_CODE`]; clients that ignore it still end the session.
 #define PUNKTFUNK_APP_EXITED_CLOSE_CODE 82
+
+// QUIC application close: the client moved onto a path too small for this session's video,
+// and the session cannot re-key its shard size. A client reads it as a lost connection and
+// redials; the new session is sized for the new path.
+#define PUNKTFUNK_PATH_SHRANK_CLOSE_CODE 115
 
 // Longest [`Hello`] device name (UTF-8 bytes). Truncated on encode, rejected on decode.
 #define PUNKTFUNK_HELLO_NAME_MAX 64
