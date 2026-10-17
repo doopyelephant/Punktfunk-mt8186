@@ -424,19 +424,14 @@ impl StreamState {
                  counted here, so the picture is black and every keyframe we force is \
                  wasted. The control plane is healthy (this report arrived on it), so \
                  the session looks alive: audio, input and the library keep working. \
-                 READ THE 'data plane bound' LINE ABOVE — it says which leg failed, \
-                 and this line cannot. `punched=false`: the client's hole-punch never \
-                 arrived, so inbound UDP to this host's per-session data port is \
-                 blocked — open it (the ports are ephemeral, so the rule must be \
-                 program-scoped, not port-scoped). `punched=true`: inbound is FINE and \
-                 the failure is on the return leg — compare that line's `local=` \
-                 source address against the host address this client dialed, because \
-                 its data socket is connected and its kernel silently drops video from \
-                 any other source. If those match, the datagrams left this host \
-                 correctly and the client either never received them (a hop on the \
-                 path) or received them and could not open them: this counter is \
-                 incremented AFTER decrypt and replay checks, so a session whose every \
-                 datagram failed to open reports exactly this same zero"
+                 Video leaves the same UDP socket toward the same address as control, \
+                 so a hop is treating the two differently: one that drops full-size \
+                 datagrams (the 'wire MTU' lines say what the path carries), or one \
+                 that drops the video DSCP mark (PUNKTFUNK_DSCP=0 turns it off to \
+                 test). The client may also have received the datagrams and could not \
+                 open them: this counter is incremented AFTER decrypt and replay \
+                 checks, so a session whose every datagram failed to open reports \
+                 exactly this same zero"
             );
         } else if let Some(ppm) = self
             .counters

@@ -584,7 +584,7 @@ pub(super) async fn negotiate(
     bringup.mark("welcome");
 
     // Display prep now: mode is final in Welcome; nothing in create→encoder needs Start or
-    // the punched socket. Windows only — Linux binds launch before create (gamescope nests the
+    // the bound data plane. Windows only — Linux binds launch before create (gamescope nests the
     // command), which must not run if Start never arrives.
     let prep: Option<super::stream::PrepHandle> = match (source, compositor) {
         (Punktfunk1Source::Virtual, Some(comp)) if cfg!(target_os = "windows") => {
@@ -917,7 +917,7 @@ fn welcome_host_caps2(source: Punktfunk1Source) -> u8 {
         }
         // Invites the client's `Start` extension block, which is where it names itself.
         | punktfunk_core::quic::HOST_CAP2_EXT
-        // The virtual path punches its data plane two to three seconds before its
+        // The virtual path binds its data plane two to three seconds before its
         // pipeline exists, and serves the client's bring-up ramp in that gap. The
         // rate-following source holds its first frame back for the same span
         // (`--bringup-ms`) so the rig measures the ramp the way a display session

@@ -157,7 +157,7 @@ pub const HOST_CAP2_EXT: u8 = 0x04;
 pub const HOST_CAP2_SCROLL: u8 = 0x08;
 
 /// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host serves
-/// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is punched,
+/// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is bound,
 /// before its pipeline exists and without the one-per-10 s spacing, until the first video
 /// frame leaves. That window is what the client's bring-up ramp measures the link in; a
 /// client that does not see the bit bursts beside live video as before.

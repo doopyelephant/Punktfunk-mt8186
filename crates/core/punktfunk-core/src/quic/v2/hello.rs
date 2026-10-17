@@ -49,7 +49,7 @@ pub struct ClientHello {
     pub preset: Option<SessionPreset>,
     /// What this client's OS says about its end of the path. The default is unknown.
     pub link: LinkFacts,
-    /// A diagnostic session: serve probes from the punched data plane, never build a pipeline.
+    /// A diagnostic session: serve probes from the bound data plane, never build a pipeline.
     pub probe_only: bool,
     /// The player's PyroWave quality in hundredths of a bit per pixel; `0` leaves the host's.
     pub pyrowave_bpp_x100: u16,

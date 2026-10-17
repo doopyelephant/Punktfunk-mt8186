@@ -594,7 +594,7 @@ pub struct ConnectParams {
     /// unchanged. `None` names none.
     pub preset: Option<crate::quic::SessionPreset>,
     /// A diagnostic session ([`crate::quic::EXT_DELIVERY_PROBE_ONLY`]): the host serves probes
-    /// from the punched data plane and never builds a pipeline.
+    /// from the bound data plane and never builds a pipeline.
     pub probe_only: bool,
     /// The profile to play as: a host profile id. `None` lets the host choose
     /// ([`NativeClient::profile`] says which it did).
@@ -730,7 +730,7 @@ impl NativeClient {
             match ready_rx.recv_timeout(READY_POLL) {
                 Ok(Ok(t)) => break t,
                 Ok(Err(e)) => {
-                    // Stops what the handshake already started, such as the data punch.
+                    // Stops what the handshake already started.
                     shared.shutdown.store(true, Ordering::SeqCst);
                     return Err(e);
                 }
