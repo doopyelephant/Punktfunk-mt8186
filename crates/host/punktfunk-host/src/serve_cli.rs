@@ -277,8 +277,6 @@ pub(crate) fn prepare_serve(args: ServeArgs) -> Result<(mgmt::Options, native::N
             .then_some(args.webtransport_bind),
         ..args.native
     };
-    // A launcher rewrite can drop a granted folder's ACE; re-apply them each boot.
-    crate::plugins::converge_grants();
     Ok((opts, native, gamestream))
 }
 

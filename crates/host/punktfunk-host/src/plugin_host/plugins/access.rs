@@ -455,18 +455,20 @@ fn replace(path: &Path, body: &[u8]) -> io::Result<()> {
     }
 }
 
-/// The ACL half of a grant, mapped into `io::Error` for the store's signatures. Runs only
-/// once a grant is certain to be recorded — a cap refusal never leaves an unrecorded ACE.
-fn apply_acl(dir: &Path, write: bool) -> io::Result<()> {
+/// The ACL half of a grant, mapped into `io::Error` for the store's signatures: the runner's
+/// ACE, and `plugin`'s package ACE when named. Runs only once a grant is certain to be
+/// recorded — a cap refusal never leaves an unrecorded ACE.
+fn apply_acl(plugin: Option<&str>, dir: &Path, write: bool) -> io::Result<()> {
     #[cfg(test)]
     ACL_CALLS.with(|calls| calls.set(calls.get() + 1));
-    super::grant_acl(dir, write)
+    super::grant_acl(plugin, dir, write)
 }
 
-/// Match the ACL on `path` to the grants left after one came off. Every Windows plugin is the
-/// same principal, so the ACE goes only when no plugin holds the folder, and a write ACE falls
-/// back to read when only read grants remain. Best-effort: the record is already written.
-fn settle_acl(access: &BTreeMap<String, PluginAccess>, path: &str) {
+/// Match the ACL on `path` to the grants left after `plugin`'s came off. Every Windows plugin
+/// shares the runner's account, so its ACE goes, with `plugin`'s package ACE, only when no
+/// plugin holds the folder, and a write ACE falls back to read when only read grants remain.
+/// Best-effort: the record is already written.
+fn settle_acl(access: &BTreeMap<String, PluginAccess>, plugin: &str, path: &str) {
     let held: Vec<bool> = access
         .values()
         .flat_map(|a| a.grants.iter())
@@ -477,9 +479,9 @@ fn settle_acl(access: &BTreeMap<String, PluginAccess>, path: &str) {
     let result = if held.is_empty() {
         #[cfg(test)]
         ACL_REMOVES.with(|calls| calls.set(calls.get() + 1));
-        super::revoke_acl(dir)
+        super::revoke_acl(plugin, dir)
     } else {
-        apply_acl(dir, held.contains(&true))
+        apply_acl(None, dir, held.contains(&true))
     };
     if let Err(e) = result {
         tracing::warn!(path, error = %e, "revoked folder keeps its runner ACE");
@@ -957,7 +959,7 @@ impl AccessStore {
                         "the grant limit is reached",
                     ));
                 }
-                apply_acl(Path::new(&row.path), row.write)?;
+                apply_acl(Some(id), Path::new(&row.path), row.write)?;
                 if let Some(rows) = pending_all.get_mut(id) {
                     rows.retain(|p| !same_path(&p.path, &stored_path));
                 }
@@ -1017,7 +1019,7 @@ impl AccessStore {
             self.write_access(&access)?;
         }
         if ungranted {
-            settle_acl(&access, &stored_path);
+            settle_acl(&access, id, &stored_path);
         }
         if pending_changed {
             self.write_pending(&pending_all)?;
@@ -1194,7 +1196,7 @@ impl AccessStore {
         if changed {
             self.write_access(&access)?;
             for path in &gone {
-                settle_acl(&access, path);
+                settle_acl(&access, id, path);
             }
         }
         Ok(Mutation {
@@ -1241,7 +1243,7 @@ impl AccessStore {
             (Some(i), Some(_)) => write || entry.grants[i].write,
             _ => write,
         };
-        apply_acl(&canonical, write)?;
+        apply_acl(Some(id), &canonical, write)?;
         match (existing, form) {
             (Some(i), Some(form)) => {
                 let g = &mut entry.grants[i];
@@ -1300,7 +1302,7 @@ impl AccessStore {
         };
         if changed {
             self.write_access(&access)?;
-            settle_acl(&access, &stored);
+            settle_acl(&access, id, &stored);
         }
         Ok(grants)
     }
