@@ -710,14 +710,15 @@ const CODECS: [(&str, &str); 5] = [
 /// The PS5's: Videodec2 decodes H.264 and HEVC, the GPU PyroWave, and nothing decodes AV1.
 const CODECS_PS5: [(&str, &str); 4] = [CODECS[0], CODECS[1], CODECS[2], CODECS[4]];
 
-/// The codecs this platform decodes. The TV's NDL pipeline takes H.264 and HEVC only:
-/// no AV1 (never presented a picture) and no PyroWave (no Vulkan presentation). A Samsung set
-/// is the same pair: its WebCodecs says yes to AV1 without ever having been measured on one.
+/// The codecs this platform decodes. The TV's NDL pipeline takes H.264, HEVC and AV1, but no
+/// PyroWave (no Vulkan presentation). A Samsung set takes H.264 and HEVC: its WebCodecs says
+/// yes to AV1 without ever having been measured on one.
 pub(super) fn codecs(
     platform: crate::platform::Platform,
 ) -> &'static [(&'static str, &'static str)] {
     match platform {
-        crate::platform::Platform::WebOS | crate::platform::Platform::Tizen => &CODECS[..3],
+        crate::platform::Platform::WebOS => &CODECS[..4],
+        crate::platform::Platform::Tizen => &CODECS[..3],
         crate::platform::Platform::Ps5 => &CODECS_PS5,
         _ => &CODECS,
     }
