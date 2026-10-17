@@ -1288,6 +1288,11 @@ impl ReassemblyWindow {
             _ => (frame_index, pts_ns),
         };
         self.newest_frame = Some((newest, newest_pts));
+        // Every verdict below hangs off `newest`, which only a newer frame moves: a shard of a
+        // frame already seen changes nothing.
+        if !opened {
+            return;
+        }
 
         let completed = &mut self.completed;
         let partial_on = partial_sink.is_some();
