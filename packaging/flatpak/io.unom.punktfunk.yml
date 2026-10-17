@@ -35,7 +35,7 @@
 # decoder exists — so an HEVC session on a box whose GPU cannot decode HEVC reconnects on a
 # codec this client can finish (pf-client-core's `last_rung_verdict`) instead of falling back
 # to software. That is a refusal by design, not a packaging gap.
-app-id: io.unom.Punktfunk
+app-id: io.unom.punktfunk
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
@@ -335,24 +335,24 @@ modules:
       - install -Dm0755 target/release/punktfunk-client ${FLATPAK_DEST}/bin/punktfunk-client
       - install -Dm0755 target/release/punktfunk-session ${FLATPAK_DEST}/bin/punktfunk-session
       # The headless CLI (design/client-architecture-split.md §4) — reachable as
-      # `flatpak run --command=punktfunk io.unom.Punktfunk …`.
+      # `flatpak run --command=punktfunk io.unom.punktfunk …`.
       - install -Dm0755 target/release/punktfunk ${FLATPAK_DEST}/bin/punktfunk
       # Desktop entry (renamed to the app id; Exec is the in-sandbox binary).
-      - install -Dm0644 packaging/flatpak/io.unom.Punktfunk.desktop
-          ${FLATPAK_DEST}/share/applications/io.unom.Punktfunk.desktop
+      - install -Dm0644 packaging/flatpak/io.unom.punktfunk.desktop
+          ${FLATPAK_DEST}/share/applications/io.unom.punktfunk.desktop
       # Second launcher, straight into the gamepad console (`--browse`) — the couch entry
       # point. Shared with the deb/rpm/arch (there is nothing sandbox-specific about it);
       # flatpak's export rewrites Exec into `flatpak run --command=punktfunk-client …`.
-      - install -Dm0644 packaging/linux/io.unom.Punktfunk.Console.desktop
-          ${FLATPAK_DEST}/share/applications/io.unom.Punktfunk.Console.desktop
+      - install -Dm0644 packaging/linux/io.unom.punktfunk.console.desktop
+          ${FLATPAK_DEST}/share/applications/io.unom.punktfunk.console.desktop
       # AppStream metainfo (required for a well-formed flatpak / Software listings).
-      - install -Dm0644 packaging/flatpak/io.unom.Punktfunk.metainfo.xml
-          ${FLATPAK_DEST}/share/metainfo/io.unom.Punktfunk.metainfo.xml
+      - install -Dm0644 packaging/flatpak/io.unom.punktfunk.metainfo.xml
+          ${FLATPAK_DEST}/share/metainfo/io.unom.punktfunk.metainfo.xml
       # Scalable icon named for the app id (GNOME runtime renders SVG via librsvg).
       # One icon source for every Linux packaging (it used to live under packaging/flatpak,
       # which is why the deb/rpm/arch entries shipped a stock `video-display` instead).
-      - install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg
-          ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg
+      - install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.punktfunk.svg
+          ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.unom.punktfunk.svg
     sources:
       # The repo checkout. For a Flathub/published build, replace with a pinned git source:
       #   - type: git

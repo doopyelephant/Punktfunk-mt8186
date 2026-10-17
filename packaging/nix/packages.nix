@@ -194,15 +194,15 @@ in
         install -Dm0644 scripts/60-punktfunk-dualsense.conf "$out/share/wireplumber/wireplumber.conf.d/60-punktfunk-dualsense.conf"
 
         # KWin Desktop-mode authorization (zkde_screencast + fake_input). Point Exec at the store binary.
-        install -Dm0644 packaging/linux/io.unom.Punktfunk.Host.desktop \
-          "$out/share/applications/io.unom.Punktfunk.Host.desktop"
-        substituteInPlace "$out/share/applications/io.unom.Punktfunk.Host.desktop" \
+        install -Dm0644 packaging/linux/io.unom.punktfunk.host.desktop \
+          "$out/share/applications/io.unom.punktfunk.host.desktop"
+        substituteInPlace "$out/share/applications/io.unom.punktfunk.host.desktop" \
           --replace-fail "/usr/bin/punktfunk-host" "$out/bin/punktfunk-host"
 
         # The tray's launcher + hicolor status icons. The host writes its per-user autostart entry.
-        install -Dm0644 packaging/linux/io.unom.Punktfunk.StartHost.desktop \
-          "$out/share/applications/io.unom.Punktfunk.StartHost.desktop"
-        substituteInPlace "$out/share/applications/io.unom.Punktfunk.StartHost.desktop" \
+        install -Dm0644 packaging/linux/io.unom.punktfunk.starthost.desktop \
+          "$out/share/applications/io.unom.punktfunk.starthost.desktop"
+        substituteInPlace "$out/share/applications/io.unom.punktfunk.starthost.desktop" \
           --replace-fail "/usr/bin/punktfunk-tray" "$out/bin/punktfunk-tray"
         for sz in 22x22 48x48; do
           for png in packaging/linux/icons/hicolor/$sz/apps/*.png; do
@@ -355,13 +355,15 @@ in
         install -Dm0644 scripts/70-punktfunk-client.rules "$out/lib/udev/rules.d/70-punktfunk-client.rules"
 
         # The app icon the desktop entry (and the About dialog) name.
-        install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg \
-          "$out/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg"
+        install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.punktfunk.svg \
+          "$out/share/icons/hicolor/scalable/apps/io.unom.punktfunk.svg"
+        # The CamelCase icon name, which desktop entries users already have still name.
+        ln -s io.unom.punktfunk.svg "$out/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg"
 
         # Desktop launcher — point Exec at the store binary (wrapped below).
-        install -Dm0644 packaging/linux/io.unom.Punktfunk.desktop \
-          "$out/share/applications/io.unom.Punktfunk.desktop"
-        substituteInPlace "$out/share/applications/io.unom.Punktfunk.desktop" \
+        install -Dm0644 packaging/linux/io.unom.punktfunk.desktop \
+          "$out/share/applications/io.unom.punktfunk.desktop"
+        substituteInPlace "$out/share/applications/io.unom.punktfunk.desktop" \
           --replace-fail "Exec=punktfunk-client" "Exec=$out/bin/punktfunk-client"
       '';
 

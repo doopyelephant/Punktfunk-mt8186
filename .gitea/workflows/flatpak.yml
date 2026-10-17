@@ -53,8 +53,8 @@ on:
       - 'crates/codec/pyrowave-sys/**'
       - 'crates/core/**'
       - 'packaging/flatpak/**'
-      - 'packaging/linux/io.unom.Punktfunk.Console.desktop'
-      - 'packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg'
+      - 'packaging/linux/io.unom.punktfunk.console.desktop'
+      - 'packaging/linux/icons/hicolor/scalable/apps/io.unom.punktfunk.svg'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/ci/pf-version.sh'
@@ -68,8 +68,11 @@ on:
 env:
   REGISTRY: git.unom.io
   OWNER: unom
-  APP_ID: io.unom.Punktfunk
-  MANIFEST: packaging/flatpak/io.unom.Punktfunk.yml
+  APP_ID: io.unom.punktfunk
+  # The CamelCase id the client shipped under. Its refs stay published, end-of-life with a rebase
+  # onto APP_ID, so `flatpak update` moves an old install instead of failing on a missing ref.
+  LEGACY_APP_ID: io.unom.Punktfunk
+  MANIFEST: packaging/flatpak/io.unom.punktfunk.yml
   PACKAGE: punktfunk-client-flatpak     # generic-registry package name
   REPO_URL: https://flatpak.unom.io   # shared unom OSTree repo (reusable across unom apps)
   DEPLOY_DIR: unom-flatpak             # ~/<dir> on unom-1 (compose + ./site tree)
@@ -259,7 +262,7 @@ jobs:
             "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/$GEN_REF/cargo/flatpak-cargo-generator.py"
           echo "$GEN_SHA  /tmp/flatpak-cargo-generator.py" | sha256sum -c - \
             || { echo "::error::flatpak-cargo-generator.py sha256 mismatch at $GEN_REF"; exit 1; }
-          # The manifest prune runs inside the sandbox (io.unom.Punktfunk.yml); its self-test
+          # The manifest prune runs inside the sandbox (io.unom.punktfunk.yml); its self-test
           # here fails the job before flatpak-builder spends its minutes.
           python3 packaging/flatpak/prune-windows-toml.py --self-test
           python3 packaging/flatpak/prune-windows-lock.py Cargo.lock /tmp/Cargo.flatpak.lock
@@ -271,7 +274,7 @@ jobs:
         # `flatpak build-update-repo` regenerates the repo SUMMARY from whatever refs are in the
         # LOCAL repo, and the rsync publishes it (without --delete). A fresh single-branch local
         # repo therefore produces a single-branch summary that CLOBBERS the other channel on the
-        # server — the exact bug that made `app/io.unom.Punktfunk/x86_64/stable` unresolvable
+        # server — the exact bug that made `app/io.unom.punktfunk/x86_64/stable` unresolvable
         # ("No such ref") after a canary main-push overwrote the post-release summary, even though
         # the stable commit's objects were still on disk. Fix: seed every published channel, of
         # every arch, into the local repo first; the build below then only ADDS this run's commit
@@ -304,7 +307,7 @@ jobs:
           # clobber the other channel (the bug described above).
           if bash scripts/ci/retry.sh 5 curl -fsS -o /dev/null "$REPO_URL/repo/summary"; then
             for ref in $(bash scripts/ci/retry.sh 5 ostree --repo="$PWD/repo" remote refs unom); do
-              case "$ref" in unom:app/$APP_ID/*) ;; *) continue ;; esac
+              case "$ref" in unom:app/$APP_ID/* | unom:app/$LEGACY_APP_ID/*) ;; *) continue ;; esac
               bash scripts/ci/retry.sh 5 ostree --repo="$PWD/repo" pull --mirror --depth=0 \
                 unom "${ref#unom:}"
             done
@@ -411,7 +414,7 @@ jobs:
           # here is commit-pinned (see the manifest), so "don't update" is a semantic no-op.
           # Anything genuinely missing still downloads, so a cold state dir self-heals.
           #
-          # --default-branch=$FLATPAK_BRANCH pins the ref to app/io.unom.Punktfunk/<arch>/<branch>
+          # --default-branch=$FLATPAK_BRANCH pins the ref to app/io.unom.punktfunk/<arch>/<branch>
           # (canary or stable) so the matching hosted .flatpakref resolves deterministically
           # (manifest sets no branch).
           flatpak-builder --user --force-clean --disable-rofiles-fuse \
@@ -488,13 +491,25 @@ jobs:
             for ref in $REFS; do
               case "$ref" in
                 "unom:app/$APP_ID/${{ matrix.arch }}/$FLATPAK_BRANCH") continue ;;
-                unom:app/$APP_ID/*) ;;
+                unom:app/$APP_ID/* | unom:app/$LEGACY_APP_ID/*) ;;
                 *) continue ;;
               esac
               bash scripts/ci/retry.sh 5 ostree --repo="$PWD/repo" pull --mirror --depth=0 \
                 unom "${ref#unom:}"
             done
           fi
+          # Marked after the re-pull, which would reset a ref to the remote's commit. A ref that
+          # already carries the marker keeps its commit, so this writes once per legacy ref.
+          for dir in "$PWD/repo/refs/heads/app/$LEGACY_APP_ID/${{ matrix.arch }}"/*; do
+            [ -e "$dir" ] || continue
+            ref="app/$LEGACY_APP_ID/${{ matrix.arch }}/${dir##*/}"
+            if ostree --repo="$PWD/repo" show --print-metadata-key=ostree.endoflife-rebase "$ref" \
+              >/dev/null 2>&1; then
+              continue
+            fi
+            flatpak build-commit-from --src-ref="$ref" --end-of-life-rebase="$LEGACY_APP_ID=$APP_ID" \
+              --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME" "$PWD/repo" "$ref"
+          done
           flatpak build-update-repo --generate-static-deltas \
             --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME" "$PWD/repo"
           # The regenerated summary advertises exactly these refs — must include EVERY channel that
@@ -532,7 +547,10 @@ jobs:
           EOF
           }
           write_ref "${APP_ID}.flatpakref"        stable "Punktfunk"
-          write_ref "${APP_ID}.Canary.flatpakref" canary "Punktfunk (Canary)"
+          write_ref "${APP_ID}.canary.flatpakref" canary "Punktfunk (Canary)"
+          # The CamelCase file names old links and docs use, installing APP_ID.
+          write_ref "${LEGACY_APP_ID}.flatpakref"        stable "Punktfunk"
+          write_ref "${LEGACY_APP_ID}.Canary.flatpakref" canary "Punktfunk (Canary)"
           cat > site/index.html <<EOF
           <!doctype html><meta charset=utf-8><title>unom flatpak repo</title>
           <h1>unom Flatpak repository</h1>
@@ -541,7 +559,7 @@ jobs:
           <pre>flatpak install --user $REPO_URL/${APP_ID}.flatpakref
           flatpak run $APP_ID</pre>
           <p><b>Canary</b> (latest main build, unstable):</p>
-          <pre>flatpak install --user $REPO_URL/${APP_ID}.Canary.flatpakref</pre>
+          <pre>flatpak install --user $REPO_URL/${APP_ID}.canary.flatpakref</pre>
           <p>Or add the whole remote: <code>flatpak remote-add --user --if-not-exists unom $REPO_URL/unom.flatpakrepo</code></p>
           EOF
           # 3) Ship to unom-1 and (re)start the static server. rsync WITHOUT --delete keeps old
@@ -561,7 +579,8 @@ jobs:
           # All idempotent, so a dropped dial or a stalled session just retries.
           bash scripts/ci/retry.sh 5 $SSH "$DEST" "mkdir -p ~/$DEPLOY_DIR/site/repo"
           bash scripts/ci/retry.sh 5 rsync -az --info=stats1 -e "$SSH" repo/ "$DEST:$DEPLOY_DIR/site/repo/"
-          bash scripts/ci/retry.sh 5 rsync -az -e "$SSH" site/unom.flatpakrepo "site/${APP_ID}.flatpakref" "site/${APP_ID}.Canary.flatpakref" site/index.html "$DEST:$DEPLOY_DIR/site/"
+          bash scripts/ci/retry.sh 5 rsync -az -e "$SSH" site/unom.flatpakrepo "site/${APP_ID}.flatpakref" "site/${APP_ID}.canary.flatpakref" \
+            "site/${LEGACY_APP_ID}.flatpakref" "site/${LEGACY_APP_ID}.Canary.flatpakref" site/index.html "$DEST:$DEPLOY_DIR/site/"
           bash scripts/ci/retry.sh 5 rsync -az -e "$SSH" packaging/flatpak/server/compose.production.yml packaging/flatpak/server/Caddyfile "$DEST:$DEPLOY_DIR/"
           bash scripts/ci/retry.sh 5 $SSH "$DEST" "cd ~/$DEPLOY_DIR && docker compose -f compose.production.yml up -d"
           echo "deployed → $REPO_URL/${APP_ID}.flatpakref"

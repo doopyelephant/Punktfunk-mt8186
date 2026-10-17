@@ -302,15 +302,15 @@ setup_webapp() {
   step "App menu"
   have omarchy-webapp-install || { warn "omarchy-webapp-install not found — skipping"; return 0; }
   # The icon is an ICON NAME, not a path — the desktop spec resolves it through the icon theme, and
-  # the scalable `io.unom.Punktfunk` the host package ships scales to whatever size the launcher
+  # the scalable `io.unom.punktfunk` the host package ships scales to whatever size the launcher
   # asks for. Passing a path to a file that did not exist is how the first version produced an
   # entry with a blank `Icon=` and no picture in the launcher.
   # ⚠ `omarchy-webapp-install` takes an icon URL and derives a name with `${ref%.*}` + slugify, so a
-  # DOTTED theme name comes out mangled — `io.unom.Punktfunk` became `Icon=io-unom`, which resolves
+  # DOTTED theme name comes out mangled — `io.unom.punktfunk` became `Icon=io-unom`, which resolves
   # to nothing. Their tool is built for downloading a site's favicon; ours is already installed by
   # the package. So let it create the entry, then set the two lines we own (below), which is what
   # we already do for Exec.
-  local icon=io.unom.Punktfunk
+  local icon=io.unom.punktfunk
   find /usr/share/icons -name "${icon}.*" -print -quit 2>/dev/null | grep -q . \
     || icon=punktfunk-tray   # older package: the tray mark is the only one installed
   # Migrate a pre-rename install: an entry with the OLD name is ours only when it lives in the

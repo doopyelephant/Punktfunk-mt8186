@@ -27,8 +27,8 @@ These links are the **stable** channel. For builds of `main`, see [Release Chann
 Works on any distro with Flatpak:
 
 ```sh
-flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
-flatpak run io.unom.Punktfunk
+flatpak install --user https://flatpak.unom.io/io.unom.punktfunk.flatpakref
+flatpak run io.unom.punktfunk
 ```
 
 Update with `flatpak update`, **without `sudo`**: `sudo` only updates system installs and skips this
@@ -55,7 +55,7 @@ For Gaming Mode, install the [Decky plugin](/docs/steam-deck). It uses the Flatp
 install that too, in Desktop Mode:
 
 ```sh
-flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
+flatpak install --user https://flatpak.unom.io/io.unom.punktfunk.flatpakref
 ```
 
 ## Windows

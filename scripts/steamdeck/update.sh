@@ -151,8 +151,9 @@ if [ -f "$HOST_ENV" ] && ! grep -q '^RADV_PERFTEST=' "$HOST_ENV"; then
     ok "host.env: added RADV_PERFTEST=video_encode"
 fi
 mkdir -p "$HOME/.local/share/applications"
-sed "s|^Exec=.*|Exec=$TARGET_DIR/release/punktfunk-host|" "$SRC/packaging/linux/io.unom.Punktfunk.Host.desktop" \
-    > "$HOME/.local/share/applications/io.unom.Punktfunk.Host.desktop"
+rm -f "$HOME/.local/share/applications/io.unom.Punktfunk.Host.desktop"  # the CamelCase name
+sed "s|^Exec=.*|Exec=$TARGET_DIR/release/punktfunk-host|" "$SRC/packaging/linux/io.unom.punktfunk.host.desktop" \
+    > "$HOME/.local/share/applications/io.unom.punktfunk.host.desktop"
 ok "KWin desktop-capture authorization refreshed"
 
 # The system tuning install.sh applies, from this checkout's files (lib.sh). A stock Deck needs a

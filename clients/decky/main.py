@@ -54,8 +54,11 @@ from pathlib import Path
 
 import decky
 
-# Flatpak application id of the GTK client (packaging/flatpak/io.unom.Punktfunk.yml).
-APP_ID = "io.unom.Punktfunk"
+# Flatpak application id of the GTK client (packaging/flatpak/io.unom.punktfunk.yml).
+APP_ID = "io.unom.punktfunk"
+# The id before the lowercase rename. A Deck still on it is driven under it until its next client
+# update, which the remote's end-of-life marker turns into a rebase onto APP_ID.
+LEGACY_APP_ID = "io.unom.Punktfunk"
 
 def _runner_path() -> str:
     """Absolute path to the launch wrapper shipped with the plugin (bin/punktfunkrun.sh)."""
@@ -394,7 +397,9 @@ def _native_client() -> str | None:
 def _flatpak_ref() -> dict | None:
     """The INSTALLED client flatpak resolved to a SCOPE and a BRANCH, or None when there is none.
 
-    ``{"scope": "--user"|"--system", "branch": "canary", "arch": "aarch64", "ref": "io.unom.Punktfunk//canary"}``.
+    ``{"scope": "--user"|"--system", "branch": "canary", "arch": "aarch64", "app_id": APP_ID,
+    "ref": "io.unom.punktfunk//canary"}``. ``app_id`` is :data:`LEGACY_APP_ID` only when that is
+    all the box has.
 
     The arch is read off the installed tree, not `os.uname()`: Decky's Python can be an x86_64
     process on an aarch64 SteamOS (Steam Frame).
@@ -402,7 +407,7 @@ def _flatpak_ref() -> dict | None:
     ⭐⭐ **Naming no branch is not a shorthand for "the only one".** flatpak refuses an ambiguous
     ref rather than guessing at one, and the ambiguity does not need two branches *installed*:
     the punktfunk remote publishes `stable` AND `canary`, so an unqualified
-    ``flatpak remote-info <origin> io.unom.Punktfunk`` errors with "Multiple branches available"
+    ``flatpak remote-info <origin> io.unom.punktfunk`` errors with "Multiple branches available"
     on a Deck that has exactly one. That error is why the client update check silently answered
     "up to date" on every Deck — so every query downstream now names the ref in full.
 
@@ -418,29 +423,35 @@ def _flatpak_ref() -> dict | None:
     """
     if not _flatpak():
         return None
-    for root, scope in (
+    scopes = (
         (Path(decky.DECKY_USER_HOME) / ".local" / "share" / "flatpak", "--user"),
         (Path("/var/lib/flatpak"), "--system"),
-    ):
-        try:
-            found = sorted(
-                (p.parent.name, p.name) for p in (root / "app" / APP_ID).glob("*/*")
-                if (p / "active").exists()
-            )
-        except OSError:
-            continue  # not installed in this scope
-        if not found:
-            continue
-        arch = found[0][0]
-        branches = [b for a, b in found if a == arch]
-        branch = "stable" if "stable" in branches else branches[0]
-        if len(branches) > 1:
-            decky.logger.warning(
-                "%s is installed on %d branches (%s) — using %s, the one `flatpak run` resolves "
-                "to; uninstall the others so the client you launch is the client we update",
-                APP_ID, len(branches), ", ".join(branches), branch,
-            )
-        return {"scope": scope, "branch": branch, "arch": arch, "ref": f"{APP_ID}//{branch}"}
+    )
+    for app_id in (APP_ID, LEGACY_APP_ID):
+        for root, scope in scopes:
+            try:
+                found = sorted(
+                    (p.parent.name, p.name) for p in (root / "app" / app_id).glob("*/*")
+                    if (p / "active").exists()
+                )
+            except OSError:
+                continue  # not installed in this scope
+            if not found:
+                continue
+            arch = found[0][0]
+            branches = [b for a, b in found if a == arch]
+            branch = "stable" if "stable" in branches else branches[0]
+            if len(branches) > 1:
+                decky.logger.warning(
+                    "%s is installed on %d branches (%s) — using %s, the one `flatpak run` "
+                    "resolves to; uninstall the others so the client you launch is the client "
+                    "we update",
+                    app_id, len(branches), ", ".join(branches), branch,
+                )
+            return {
+                "scope": scope, "branch": branch, "arch": arch, "app_id": app_id,
+                "ref": f"{app_id}//{branch}",
+            }
     return None
 
 
@@ -475,7 +486,9 @@ def _client_argv() -> list[str] | None:
     if forced != "flatpak" and not ref and native:
         return [native]
     if ref:
-        return [_flatpak(), "run", f"--arch={ref['arch']}", f"--branch={ref['branch']}", APP_ID]
+        return [
+            _flatpak(), "run", f"--arch={ref['arch']}", f"--branch={ref['branch']}", ref["app_id"],
+        ]
     return [native] if native else None
 
 
@@ -800,6 +813,7 @@ def _ctl_sockets() -> list[Path]:
     run = Path(f"/run/user/{uid}")
     return [
         run / "app" / APP_ID / "punktfunk-session-ctl.sock",
+        run / "app" / LEGACY_APP_ID / "punktfunk-session-ctl.sock",
         run / "punktfunk-session-ctl.sock",
     ]
 
@@ -1092,7 +1106,7 @@ class Plugin:
         native = bool(prefix) and prefix[0] != _flatpak()
         return {
             "runner": path,
-            "app_id": APP_ID,
+            "app_id": (_flatpak_ref() or {}).get("app_id", APP_ID),
             "exists": Path(path).exists(),
             "client_kind": "native" if native else ("flatpak" if prefix else "none"),
             "client_bin": prefix[0] if native else "",
@@ -1107,7 +1121,7 @@ class Plugin:
         if not prefix:
             return {"ok": False, "error": "client-not-found"}
         if prefix[0] == _flatpak():
-            argv = [prefix[0], "kill", APP_ID]
+            argv = [prefix[0], "kill", prefix[-1]]  # the app id is last, see _client_argv
         else:
             # -x: whole-name match, so this can only ever hit the client itself.
             killer = shutil.which("pkill") or "/usr/bin/pkill"
@@ -1257,6 +1271,12 @@ class Plugin:
         if rc != 0:
             decky.logger.warning("flatpak client update failed (rc=%s): %s", rc, out[-400:])
             return {"ok": False, "updated": False, "error": "update-failed"}
+        # An end-of-life rebase leaves the old ref uninstalled, so its commit cannot be compared.
+        moved = _flatpak_ref()
+        if moved and moved["app_id"] != ref["app_id"]:
+            decky.logger.info("flatpak client rebased: %s -> %s", ref["ref"], moved["ref"])
+            _update_cache["data"] = None
+            return {"ok": True, "updated": True}
         _, after = await _flatpak_capture(["info", scope, full], timeout=10.0)
         after_commit = _field_from(after, "Commit")
         updated = bool(before_commit and after_commit and before_commit != after_commit)

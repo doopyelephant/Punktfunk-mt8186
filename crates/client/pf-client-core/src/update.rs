@@ -50,7 +50,7 @@ pub enum Apply {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Applier {
-    /// The caller runs `flatpak update --user io.unom.Punktfunk`.
+    /// The caller runs `flatpak update --user io.unom.punktfunk`.
     Flatpak,
     /// `punktfunk-client --apply-update` drives the packaged root helper.
     Helper,
@@ -331,7 +331,7 @@ pub fn apply(current: &str) -> ApplyOutcome {
         Applier::Flatpak => {
             return ApplyOutcome::failed(
                 "a flatpak client updates from outside its sandbox — run `flatpak update --user \
-                 io.unom.Punktfunk` (the Decky plugin does this for you)",
+                 io.unom.punktfunk` (the Decky plugin does this for you)",
             )
         }
         Applier::None => {

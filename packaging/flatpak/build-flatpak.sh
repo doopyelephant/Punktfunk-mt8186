@@ -30,8 +30,8 @@ set -euo pipefail
 ROOTDIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOTDIR"
 
-APP_ID="io.unom.Punktfunk"
-MANIFEST="packaging/flatpak/io.unom.Punktfunk.yml"
+APP_ID="io.unom.punktfunk"
+MANIFEST="packaging/flatpak/io.unom.punktfunk.yml"
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo 0.0.1-dev)}"
 VERSION="${VERSION#v}"
 # `flatpak --default-arch` reports flatpak's own name for this machine (x86_64 / aarch64).

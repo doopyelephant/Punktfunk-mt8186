@@ -99,7 +99,7 @@ link; the native speed test and jumbo frames are Punktfunk-app only.
 ## Scripting: the `punktfunk` CLI
 
 `punktfunk` is the client without a window. It ships with every Linux package and the Windows
-installer. Under the Flatpak, run it as `flatpak run --command=punktfunk io.unom.Punktfunk`.
+installer. Under the Flatpak, run it as `flatpak run --command=punktfunk io.unom.punktfunk`.
 
 ```sh
 punktfunk discover                            # hosts advertising on this network

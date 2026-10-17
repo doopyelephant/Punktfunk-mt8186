@@ -7,7 +7,7 @@
 # previous image; with the archives present it only checks their digests.
 #
 # Bump the pins with skia-safe in crates/client/pf-console-ui/Cargo.toml. Same archives and sums as
-# packaging/flatpak/io.unom.Punktfunk.yml.
+# packaging/flatpak/io.unom.punktfunk.yml.
 #
 # Usage: sh ci/skia-binaries.sh <target-triple>...
 set -e

@@ -6,7 +6,7 @@
 //!
 //! The global is restricted: KWin advertises it only to a client whose `.desktop` lists it
 //! under `X-KDE-Wayland-Interfaces` (matched by `/proc/<pid>/exe` → `Exec=`). Packages ship
-//! `io.unom.Punktfunk.Host.desktop` for that. The host binary must carry no file capability and
+//! `io.unom.punktfunk.host.desktop` for that. The host binary must carry no file capability and
 //! must still be the file at its path ([`screencast_withheld`] names which one broke).
 //! Headless tests use `KWIN_WAYLAND_NO_PERMISSION_CHECKS=1`. `createVirtualOutput` needs the
 //! DRM backend, or VirtualBackend since KWin 6.5.6.
@@ -1512,7 +1512,7 @@ fn screencast_withheld() -> anyhow::Error {
     anyhow!(
         "{WITHHELD} ({}) — KWin grants it only to a binary whose path is the Exec= of an \
          installed .desktop listing it in X-KDE-Wayland-Interfaces \
-         (io.unom.Punktfunk.Host.desktop){}",
+         (io.unom.punktfunk.host.desktop){}",
         exe.display(),
         identity_hint(replaced, permitted)
     )

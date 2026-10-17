@@ -7,7 +7,7 @@ Comment=Controller-driven couch interface — browse hosts and stream with a gam
 # expects). A couch UI is fullscreen; the session fullscreens itself on the Deck and under
 # gamescope anyway.
 Exec=punktfunk-client --browse --fullscreen
-Icon=io.unom.Punktfunk
+Icon=io.unom.punktfunk
 Terminal=false
 Categories=Network;Game;
 Keywords=streaming;remote;game;gamepad;controller;couch;console;bigpicture;

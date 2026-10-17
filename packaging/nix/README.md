@@ -141,7 +141,7 @@ GPU driver. `nix fmt` formats the `.nix` files.
   session `--no-default-features --features pyrowave`. Everything streams; only the optional
   on-glass stats overlay and the console are absent. The GTK shell builds without its `console`
   feature too, so it shows no Console button, and this build does **not** install
-  `io.unom.Punktfunk.Console.desktop`.
+  `io.unom.punktfunk.console.desktop`.
 
 - **Commit `flake.lock`.** It pins nixpkgs, crane, rust-overlay and bun2nix.
 

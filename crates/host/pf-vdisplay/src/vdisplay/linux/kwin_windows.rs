@@ -2,7 +2,7 @@
 //! Xwayland alike, with the pid that owns it.
 //!
 //! The global is restricted like `zkde_screencast`: KWin advertises it only to a client whose
-//! `.desktop` lists it under `X-KDE-Wayland-Interfaces` (`io.unom.Punktfunk.Host.desktop`). A host
+//! `.desktop` lists it under `X-KDE-Wayland-Interfaces` (`io.unom.punktfunk.host.desktop`). A host
 //! installed before that line shipped sees no global until the session restarts.
 //!
 //! One short connection per read: bind, collect the windows KWin announces on bind, ask each for its

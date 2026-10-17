@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- AppStream metainfo for the punktfunk Linux client flatpak. Validate with the appstream
      check of ghcr.io/flathub-infra/flatpak-builder-lint. The component id MUST equal the flatpak app-id; the <launchable> MUST name the installed
-     desktop file (io.unom.Punktfunk.desktop). Each stable tag adds a <release> on top. -->
+     desktop file (io.unom.punktfunk.desktop). Each stable tag adds a <release> on top. -->
 <component type="desktop-application">
-  <id>io.unom.Punktfunk</id>
+  <id>io.unom.punktfunk</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT OR Apache-2.0</project_license>
   <name>Punktfunk</name>
@@ -27,7 +27,7 @@
     </ul>
   </description>
 
-  <launchable type="desktop-id">io.unom.Punktfunk.desktop</launchable>
+  <launchable type="desktop-id">io.unom.punktfunk.desktop</launchable>
 
   <screenshots>
     <screenshot type="default">

@@ -85,7 +85,7 @@ default `pf2`), `PUNKTFUNK_MGMT_PORT` (writes `PUNKTFUNK_MGMT_BIND` to `host.env
   package): wrapper `~/.local/bin/punktfunk-scripting`, pinned `bun` in
   `~/.local/lib/punktfunk-scripting/`, bundle in `~/.local/share/punktfunk-scripting/`.
 - **Status tray:** `~/.local/bin/punktfunk-tray`, started at login by
-  `~/.config/autostart/io.unom.Punktfunk.Tray.desktop`, which the host writes from its **Tray
+  `~/.config/autostart/io.unom.punktfunk.tray.desktop`, which the host writes from its **Tray
   autostart** setting; the **Punktfunk Host** launcher in
   `~/.local/share/applications/`, and its icons under `~/.local/share/icons/hicolor/`.
 - **HDR gamescope:** `~/.local/bin/punktfunk-gamescope` (gamescope + the `pipewire-hdr` patches,

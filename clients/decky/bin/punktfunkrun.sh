@@ -20,7 +20,7 @@
 #   PF_REQUEST_ACCESS  non-empty = ask the host's operator to admit this device instead of
 #                      pairing with a PIN. The connect PARKS until somebody approves it.
 #   PF_BROWSE  non-empty = open the client's console home instead of streaming
-#   PF_APPID   flatpak app id                        (default io.unom.Punktfunk)
+#   PF_APPID   flatpak app id                        (default io.unom.punktfunk)
 #   PF_FLATPAK override the flatpak binary path      (default: `flatpak` on PATH)
 #   PF_CLIENT_BIN  absolute path of a NATIVE client  (optional; set by the plugin when it
 #                  resolved a non-flatpak install — then the client is run directly and
@@ -40,8 +40,14 @@
 # chmod), so the launch path must never depend on +x. Keep this script POSIX-sh clean.
 set -u
 
-APPID="${PF_APPID:-io.unom.Punktfunk}"
+APPID="${PF_APPID:-io.unom.punktfunk}"
 FLATPAK="${PF_FLATPAK:-flatpak}"
+# A Deck still on the CamelCase id runs that until its next client update rebases it.
+if [ -z "${PF_APPID:-}" ] && [ -z "${PF_CLIENT_BIN:-}" ] \
+    && ! "$FLATPAK" info "$APPID" >/dev/null 2>&1 \
+    && "$FLATPAK" info io.unom.Punktfunk >/dev/null 2>&1; then
+    APPID=io.unom.Punktfunk
+fi
 
 # The client is not always the flatpak: a sysext, a .deb/.rpm, an AUR build or a nix profile
 # installs a native `punktfunk-client` with the CLI as its sibling, and the plugin passes the

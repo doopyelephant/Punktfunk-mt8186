@@ -241,16 +241,19 @@ fi
 
 # KWin authorization for Desktop-Mode streaming (and mid-stream Game↔Desktop switches): KWin
 # resolves a connecting client's /proc/<pid>/exe against a .desktop `Exec=` and only then grants
-# the restricted Wayland globals it lists (see packaging/linux/io.unom.Punktfunk.Host.desktop).
+# the restricted Wayland globals it lists (see packaging/linux/io.unom.punktfunk.host.desktop).
 # Exec must therefore be THIS install's binary path, not the packaged /usr/bin one. KWin reads
 # grants at session start — after first install, restart the Desktop session (Game Mode and back).
-DESKTOP_DST="$HOME/.local/share/applications/io.unom.Punktfunk.Host.desktop"
+DESKTOP_DST="$HOME/.local/share/applications/io.unom.punktfunk.host.desktop"
+DESKTOP_OLD="$HOME/.local/share/applications/io.unom.Punktfunk.Host.desktop"
 # First-time install of the grant: KWin only reads it at session start, so a fresh login is required
-# before Desktop-mode capture works. A re-run that just rewrites it needs no relogin.
-[ -f "$DESKTOP_DST" ] || NEED_RELOGIN=1
+# before Desktop-mode capture works. A re-run that just rewrites it, under either name, needs none.
+[ -f "$DESKTOP_DST" ] || [ -f "$DESKTOP_OLD" ] || NEED_RELOGIN=1
+# Removed before the write: on a case-insensitive disk the two names are one file.
+rm -f "$DESKTOP_OLD"
 mkdir -p "$HOME/.local/share/applications"
-sed "s|^Exec=.*|Exec=$BIN|" "$SRC/packaging/linux/io.unom.Punktfunk.Host.desktop" > "$DESKTOP_DST"
-ok "KWin desktop-capture authorization (io.unom.Punktfunk.Host.desktop → $BIN)"
+sed "s|^Exec=.*|Exec=$BIN|" "$SRC/packaging/linux/io.unom.punktfunk.host.desktop" > "$DESKTOP_DST"
+ok "KWin desktop-capture authorization (io.unom.punktfunk.host.desktop → $BIN)"
 
 # KDE Desktop-mode INPUT: a normal Plasma login lacks the RemoteDesktop portal grant the host's libei
 # input path needs, so it would pop an "Allow remote control?" dialog a headless host can't answer.

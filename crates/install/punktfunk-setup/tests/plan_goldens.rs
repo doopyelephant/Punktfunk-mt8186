@@ -45,6 +45,7 @@ fn fresh(id: &str, family: Family) -> Facts {
         docs_page: format!("https://docs.punktfunk.unom.io/docs/{docs}"),
         host_punt: None,
         has_flatpak_client: false,
+        legacy_flatpak_client: false,
         rpm_group: (family == Family::Dnf).then(|| "fedora-44".to_string()),
         floor: None,
         couch_box: id == "bazzite" || id == "nobara",
@@ -477,7 +478,7 @@ fn uninstall_sweeps_a_flatpak_client_too() {
     let cmds = plan_for(&facts, &un).commands();
     assert!(
         cmds.iter()
-            .any(|c| c == "flatpak uninstall --user io.unom.Punktfunk"),
+            .any(|c| c == "flatpak uninstall --user io.unom.punktfunk"),
         "the flatpak client was left behind: {cmds:?}"
     );
     let mut bare = installed("debian", Family::Apt, Channel::Stable);
@@ -486,6 +487,41 @@ fn uninstall_sweeps_a_flatpak_client_too() {
         .commands()
         .iter()
         .any(|c| c.contains("flatpak")));
+}
+
+/// A client still under the CamelCase id is swept by that id, and never reinstalled beside
+/// itself: its next update rebases it.
+#[test]
+fn a_legacy_flatpak_client_is_swept_and_not_doubled() {
+    let mut facts = installed("debian", Family::Apt, Channel::Stable);
+    facts.legacy_flatpak_client = true;
+    let un = Pins {
+        action: Action::Uninstall,
+        ..pins()
+    };
+    let cmds = plan_for(&facts, &un).commands();
+    assert!(
+        cmds.iter()
+            .any(|c| c == "flatpak uninstall --user io.unom.Punktfunk"),
+        "{cmds:?}"
+    );
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| c == "flatpak uninstall --user io.unom.punktfunk"),
+        "{cmds:?}"
+    );
+
+    let mut client_only = fresh("voidlinux", Family::Flatpak);
+    client_only.legacy_flatpak_client = true;
+    let client = Pins {
+        client: true,
+        ..pins()
+    };
+    assert!(!plan_for(&client_only, &client)
+        .commands()
+        .iter()
+        .any(|c| c.starts_with("flatpak install")));
 }
 
 #[test]
