@@ -70,6 +70,8 @@ mod sys;
 // Ungated: pure `jni` + `punktfunk_core::wol` (no Android framework), so it links
 // into the host workspace build too. Kotlin only ever calls it on device.
 mod wol;
+// Ungated like `wol`: pure `jni` + `punktfunk_core::client::mgmt`.
+mod mgmt;
 // Ungated like `wol`: pure `jni` + `punktfunk_core::client` (the reachability probe). Kotlin calls
 // it off the main thread to light saved-host "online" pips independently of mDNS.
 mod probe;

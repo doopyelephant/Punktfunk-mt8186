@@ -20,6 +20,8 @@ mod control;
 
 mod au_memory;
 
+mod mgmt;
+
 pub use au_memory::*;
 pub use clipboard::*;
 pub use connect::*;
@@ -28,6 +30,8 @@ pub use control::*;
 pub use host::*;
 #[cfg(feature = "quic")]
 pub use input::*;
+#[cfg(feature = "quic")]
+pub use mgmt::*;
 pub use pad::*;
 #[cfg(feature = "quic")]
 pub use planes::*;

@@ -522,6 +522,7 @@ private suspend fun loadLibrary(
             fpHex = host.fpHex,
             macs = host.mac,
             autoWake = autoWake,
+            streamPort = host.port,
             isCancelled = { !isActive },
             onWaking = {
                 if (cached != null) {

@@ -3750,6 +3750,41 @@ PunktfunkStatus punktfunk_connection_set_au_memory(PunktfunkConnection *c,
                                                    const PunktfunkAuMemory *memory);
 #endif
 
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// One management request over the stream port: dial `host:port` as this device's identity,
+// refuse any host but `pin_sha256`, send `method` `path` with `body`, and block for the reply,
+// dialling for at most `timeout_ms`. On `OK` the reply's HTTP status is in `status_out` and its
+// body in `body_out`/`body_len_out`; free that with [`punktfunk_mgmt_body_free`]. `CRYPTO`: the
+// host is not the pinned one, so do not retry it over HTTPS. Any other failure: the host may
+// still answer on its management port.
+//
+// # Safety
+// `host`/`client_cert_pem`/`client_key_pem`/`method`/`path` are NUL-terminated UTF-8;
+// `pin_sha256` is valid for 32 bytes; `body` is NULL or valid for `body_len` bytes; the three
+// out-pointers are writable.
+PunktfunkStatus punktfunk_mgmt_request(const char *host,
+                                       uint16_t port,
+                                       const char *client_cert_pem,
+                                       const char *client_key_pem,
+                                       const uint8_t *pin_sha256,
+                                       const char *method,
+                                       const char *path,
+                                       const uint8_t *body,
+                                       uintptr_t body_len,
+                                       uint32_t timeout_ms,
+                                       uint16_t *status_out,
+                                       uint8_t **body_out,
+                                       uintptr_t *body_len_out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// Free a reply body from [`punktfunk_mgmt_request`]. NULL is a no-op.
+//
+// # Safety
+// `body`/`len` are exactly what one `punktfunk_mgmt_request` wrote, freed once.
+void punktfunk_mgmt_body_free(uint8_t *body, uintptr_t len);
+#endif
+
 // Create an HEVC reference concealer for one elementary stream (IDR first). Free with
 // [`punktfunk_h265_concealer_free`]. Never returns NULL.
 PunktfunkH265Concealer *punktfunk_h265_concealer_new(void);

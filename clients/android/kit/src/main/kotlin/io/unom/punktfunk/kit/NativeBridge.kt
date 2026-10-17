@@ -192,6 +192,21 @@ object NativeBridge {
     external fun nativeWakeOnLan(macsCsv: String, lastIp: String): Boolean
 
     /**
+     * `GET path` over the host's stream port as this device, refusing any host but [pinHex]: the
+     * reply's status, a newline, then its body. Null when the port carried nothing, so HTTPS may.
+     * Blocking; never on the main thread.
+     */
+    external fun nativeMgmtGet(
+        host: String,
+        port: Int,
+        certPem: String,
+        keyPem: String,
+        pinHex: String,
+        path: String,
+        timeoutMs: Int,
+    ): String?
+
+    /**
      * Bounded QUIC reachability probe to [host]:[port] (mDNS-independent): the lowercase-hex
      * SHA-256 of the certificate that answered within [timeoutMs], or `null` if nothing did.
      * Lets a saved host reached over a routed network (Tailscale/VPN/another subnet) — which
