@@ -314,6 +314,9 @@ fn connect_spawn(
                 crate::shell_window::restore();
             }
             match event {
+                // A plain connect the host parked for its operator: the same waiting screen
+                // request-access shows, whose Cancel kills the child.
+                SpawnEvent::AwaitingApproval => ss.call(Screen::RequestAccess),
                 SpawnEvent::Ready => {
                     // A pin trusted on first use is saved unpaired. A failed save waits on the
                     // status line, which a clean exit leaves for the host list.
@@ -403,6 +406,8 @@ pub(crate) fn open_console(
                 ss.call(Screen::Stream);
             }
             SpawnEvent::Stats(s) => *shared.stats.lock().unwrap() = Some(*s),
+            // The console's own window shows the approval wait.
+            SpawnEvent::AwaitingApproval => {}
             SpawnEvent::Exited(outcome) => {
                 crate::shell_window::restore();
                 // A quit from the library or Disconnect returns silently.
@@ -589,6 +594,11 @@ pub(crate) fn request_access_page(
             .on_click(move || {
                 if let Some(c) = ctx.shared.cancel.lock().unwrap().as_ref() {
                     c.store(true, Ordering::SeqCst);
+                }
+                // A plain connect the host parked waits here too; its child ends with it.
+                let session = ctx.shared.session.lock().unwrap();
+                if session.is_running() {
+                    session.kill();
                 }
                 ss.call(Screen::Hosts);
             })

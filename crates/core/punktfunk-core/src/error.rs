@@ -27,10 +27,11 @@ pub enum PunktfunkError {
     #[error("session closed")]
     Closed,
     /// Host turned this connection away with a typed
-    /// [`crate::reject::RejectReason`]. Distinct from transport
-    /// ([`Self::Io`] / [`Self::Timeout`]) and a failed PIN ([`Self::Crypto`]).
+    /// [`crate::reject::RejectReason`], and the sentence it sent with it: empty when it had
+    /// none, and already sanitized. Distinct from transport ([`Self::Io`] / [`Self::Timeout`])
+    /// and a failed PIN ([`Self::Crypto`]).
     #[error("rejected by host: {0}")]
-    Rejected(crate::reject::RejectReason),
+    Rejected(crate::reject::RejectReason, String),
 }
 
 pub type Result<T> = core::result::Result<T, PunktfunkError>;
@@ -85,7 +86,7 @@ impl PunktfunkError {
             PunktfunkError::Io(_) => PunktfunkStatus::Io,
             PunktfunkError::Timeout => PunktfunkStatus::Timeout,
             PunktfunkError::Closed => PunktfunkStatus::Closed,
-            PunktfunkError::Rejected(r) => {
+            PunktfunkError::Rejected(r, _) => {
                 use crate::reject::RejectReason as R;
                 match r {
                     R::PairingNotArmed => PunktfunkStatus::RejectedNotArmed,

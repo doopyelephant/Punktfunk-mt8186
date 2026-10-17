@@ -90,15 +90,13 @@ impl FeatureSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quic::{
-        CLIENT_CAP_EXT, HOST_CAP2_INPUT_EDGES, HOST_CAP_AUDIO_HIRES, VIDEO_CAP_MULTI_SLICE,
-    };
+    use crate::quic::{HOST_CAP2_INPUT_EDGES, HOST_CAP_AUDIO_HIRES, VIDEO_CAP_MULTI_SLICE};
 
     #[test]
     fn v1_bytes_round_trip_in_place() {
-        let c = FeatureSet::client(VIDEO_CAP_MULTI_SLICE | 0x01, CLIENT_CAP_EXT);
+        let c = FeatureSet::client(VIDEO_CAP_MULTI_SLICE | 0x01, 0x40);
         let h = FeatureSet::host(HOST_CAP_AUDIO_HIRES, HOST_CAP2_INPUT_EDGES);
-        assert_eq!((c.video_caps(), c.client_caps()), (0x81, CLIENT_CAP_EXT));
+        assert_eq!((c.video_caps(), c.client_caps()), (0x81, 0x40));
         assert_eq!(
             (h.host_caps(), h.host_caps2()),
             (HOST_CAP_AUDIO_HIRES, HOST_CAP2_INPUT_EDGES)

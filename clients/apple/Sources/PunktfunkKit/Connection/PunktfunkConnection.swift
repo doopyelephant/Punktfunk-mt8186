@@ -20,6 +20,7 @@
 // close, the pull methods throw `.closed` and the threads unwind on their own.
 
 import Foundation
+import Network
 import PunktfunkCore
 import PunktfunkShared
 
@@ -140,8 +141,9 @@ public enum PunktfunkClientError: Error {
     case status(Int32)
     /// The host deliberately turned the attempt away and said why (its typed QUIC
     /// application close) — distinct from `.connectFailed` (unreachable/timeout) so the UI
-    /// can show the stated reason instead of blaming the network.
-    case rejected(HostRejection)
+    /// can show the stated reason instead of blaming the network. `said` is the host's own
+    /// sentence when it sent one, which outranks the typed reason's wording.
+    case rejected(HostRejection, said: String? = nil)
 }
 
 /// Why a host turned a connect/pair attempt away — decoded from the
@@ -257,6 +259,12 @@ func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) 
     return s.withCString { body($0) }
 }
 
+/// A connect's `onPending`, carried through the C callback's context pointer.
+private final class PendingCallback {
+    let call: @Sendable () -> Void
+    init(_ call: @escaping @Sendable () -> Void) { self.call = call }
+}
+
 public extension PunktfunkConnection {
     /// Whether the Wake-on-LAN broadcast path is usable on this platform/build. macOS can always
     /// broadcast (its App Sandbox network entitlements cover it). iOS/tvOS need the managed
@@ -343,6 +351,8 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Held across the blocking next_au call; close() takes it (same plane-lock → abiLock
     /// order as the pullers) so it can never free the handle under an in-flight poll.
     private let pumpLock = NSLock()
+    /// The device's network path, watched from the end of init until close(): see `pathChanged()`.
+    private let pathMonitor = NWPathMonitor()
     /// The lender `setAccessUnitMemory` installed, for `nextAU` to place pulls. Under `pumpLock`.
     private var accessUnitMemory: AccessUnitMemory?
     /// Every lender ever installed, retained until `close()` ends the core's calls into them.
@@ -1078,7 +1088,10 @@ public final class PunktfunkConnection: @unchecked Sendable {
         timeoutMs: UInt32 = 10_000,
         // `deliveryProbeOnly` dials a network check's probes-only session; 0 streams.
         deliveryFlags: UInt8 = 0,
-        settings: EffectiveSettings = EffectiveSettings(defaults: .standard)
+        settings: EffectiveSettings = EffectiveSettings(defaults: .standard),
+        // Called once, on this thread, when the host answers that its operator is deciding about
+        // this device; the connect then waits for that verdict instead of `timeoutMs`.
+        onPending: (@Sendable () -> Void)? = nil
     ) throws {
         self.settings = settings
         _ = Self.abiVersionGate // version-equality guard — fail loudly before the first C call
@@ -1124,7 +1137,16 @@ public final class PunktfunkConnection: @unchecked Sendable {
         opts.client_caps = clientCaps
         opts.video_fit = videoFit
         opts.timeout_ms = timeoutMs
-        let dialed = host.withCString { cs in
+        // The callback runs inside the connect call below, so the box only has to outlive it.
+        let pending = onPending.map(PendingCallback.init)
+        if let pending {
+            opts.on_pending = { ctx in
+                guard let ctx else { return }
+                Unmanaged<PendingCallback>.fromOpaque(ctx).takeUnretainedValue().call()
+            }
+            opts.on_pending_ctx = Unmanaged.passUnretained(pending).toOpaque()
+        }
+        let dialed = withExtendedLifetime(pending) { host.withCString { cs in
             withOptionalCString(identity?.certPEM) { cert in
                 withOptionalCString(identity?.keyPEM) { key in
                     withOptionalCString(launchID) { launch in
@@ -1159,10 +1181,14 @@ public final class PunktfunkConnection: @unchecked Sendable {
                     }
                 }
             }
-        }
+        } }
         guard let opened = dialed else {
             if let rejection = HostRejection(status: connectStatus) {
-                throw PunktfunkClientError.rejected(rejection)
+                // The host's own sentence, read on this thread right after the refusal.
+                var said = [CChar](repeating: 0, count: 512)
+                let ok = punktfunk_connect_refusal(&said, UInt(said.count)) == statusOK
+                let text = ok ? String(cString: said) : ""
+                throw PunktfunkClientError.rejected(rejection, said: text.isEmpty ? nil : text)
             }
             throw PunktfunkClientError.connectFailed
         }
@@ -1238,6 +1264,20 @@ public final class PunktfunkConnection: @unchecked Sendable {
         var mgmt: UInt16 = 0
         _ = punktfunk_connection_mgmt_port(opened, &mgmt)
         hostMgmtPort = mgmt
+        // Every update with a route nudges the core, the first included: a nudge is one datagram.
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            if path.status == .satisfied { self?.pathChanged() }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "punktfunk.path", qos: .userInitiated))
+    }
+
+    /// The device's network path changed. The core re-picks the socket's source address and
+    /// shows the host where this device now is, so a roam heals within a round trip instead of
+    /// a keep-alive. Silently dropped after close.
+    public func pathChanged() {
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_path_changed(h)
+        }
     }
 
     /// A bandwidth speed-test measurement (see `startSpeedTest`). Partial until `done`.
@@ -1985,6 +2025,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Close the connection and free the handle. Safe from any thread, idempotent; waits
     /// for in-flight pulls (≤ their timeouts) before tearing down.
     public func close() {
+        pathMonitor.cancel()
         abiLock.lock()
         closeRequested = true
         abiLock.unlock()
@@ -2404,6 +2445,13 @@ public final class PunktfunkConnection: @unchecked Sendable {
         /// Is this an ordinary outcome rather than something to alarm the user about? `.none`
         /// counts as normal: no evidence of trouble is not evidence of it.
         public var isNormal: Bool { self != .hostError && self != .lost }
+
+        /// How long to wait before redial `attempt` (0-based) of a session that ended this way,
+        /// on the schedule every client shares; nil means stay ended. Only `.lost` redials.
+        public func redialDelay(attempt: UInt32) -> Duration? {
+            let ms = punktfunk_redial_delay_ms(rawValue, attempt)
+            return ms < 0 ? nil : .milliseconds(ms)
+        }
     }
 
     /// Why this session ended. Only meaningful once it HAS ended (a plane threw `.closed`, or

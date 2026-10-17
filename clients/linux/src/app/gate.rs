@@ -297,6 +297,31 @@ pub fn approval_dialog(
 /// operator approves it in the console, under a cancelable "waiting" dialog. Approval
 /// saves the host as paired and never starts a stream.
 ///
+/// The "Waiting for Approval" dialog over `window`, filed in `waiting_slot`; its Cancel runs
+/// `on_cancel`. `close()` emits the close response, so whoever closes it disconnects the
+/// handler first ([`super::connect::Flight::close_waiting`]).
+pub(super) fn present_waiting(
+    window: &adw::ApplicationWindow,
+    waiting_slot: &WaitingSlot,
+    host_name: &str,
+    on_cancel: impl Fn() + 'static,
+) -> adw::AlertDialog {
+    let waiting = adw::AlertDialog::new(
+        Some("Waiting for Approval"),
+        Some(&format!(
+            "Approve “{}” in {host_name}’s console or web UI.\n\nThis device is paired once you \
+             approve it.",
+            glib::host_name(),
+        )),
+    );
+    waiting.add_responses(&[("cancel", "Cancel")]);
+    waiting.set_close_response("cancel");
+    let handler = waiting.connect_response(Some("cancel"), move |_, _| on_cancel());
+    waiting.present(Some(window));
+    *waiting_slot.borrow_mut() = Some((waiting.clone(), handler));
+    waiting
+}
+
 /// The pin is the advertised fingerprint (defence against an impostor while we wait), so a
 /// manually-typed host, which has none, pairs with a PIN instead.
 fn request_access(
@@ -314,25 +339,12 @@ fn request_access(
         return;
     };
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let waiting = adw::AlertDialog::new(
-        Some("Waiting for Approval"),
-        Some(&format!(
-            "Approve “{}” in {}’s console or web UI.\n\nThis device is paired once you approve it.",
-            glib::host_name(),
-            req.host.name
-        )),
-    );
-    waiting.add_responses(&[("cancel", "Cancel")]);
-    waiting.set_close_response("cancel");
-    let handler = {
+    let waiting = {
         let cancel = cancel.clone();
-        waiting.connect_response(Some("cancel"), move |_, _| {
+        present_waiting(window, &waiting_slot, &req.host.name, move || {
             cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         })
     };
-    waiting.present(Some(window));
-    // `close()` emits the close response, so the answer below disconnects before closing.
-    *waiting_slot.borrow_mut() = Some((waiting.clone(), handler));
 
     let (tx, rx) = async_channel::bounded(1);
     let (host, port) = (req.host.addr.clone(), req.host.port);

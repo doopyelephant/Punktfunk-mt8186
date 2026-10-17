@@ -867,6 +867,8 @@ impl ResolvedSpec {
 pub enum SessionEvent {
     /// First frame presented — the stream is up.
     Ready,
+    /// `{"awaiting_approval":true}`: the host parked the dial for its operator.
+    AwaitingApproval,
     /// One `stats-json:` window, once a second.
     Stats(Box<punktfunk_core::hud::StatsSnapshot>),
     Error(SessionError),
@@ -905,6 +907,9 @@ pub fn parse_session_line(line: &str) -> Option<SessionEvent> {
     if v.get("ready").and_then(|r| r.as_bool()) == Some(true) {
         return Some(SessionEvent::Ready);
     }
+    if v.get("awaiting_approval").and_then(|r| r.as_bool()) == Some(true) {
+        return Some(SessionEvent::AwaitingApproval);
+    }
     if let Some(msg) = v.get("error").and_then(|m| m.as_str()) {
         return Some(SessionEvent::Error(SessionError {
             msg: msg.to_string(),
@@ -939,6 +944,7 @@ pub mod exit {
 /// One line the session writes on stdout; [`parse_session_line`] reads each back.
 pub enum SessionLine<'a> {
     Ready,
+    AwaitingApproval,
     /// `trust_rejected: None` leaves the field out, which readers take as `false`.
     Error {
         msg: &'a str,
@@ -962,6 +968,7 @@ impl SessionLine<'_> {
         use serde_json::json;
         match self {
             SessionLine::Ready => json!({ "ready": true }).to_string(),
+            SessionLine::AwaitingApproval => json!({ "awaiting_approval": true }).to_string(),
             SessionLine::Error {
                 msg,
                 trust_rejected,
@@ -1925,6 +1932,10 @@ mod tests {
         let parse = |l: SessionLine| parse_session_line(&l.render());
         assert_eq!(SessionLine::Ready.render(), r#"{"ready":true}"#);
         assert_eq!(parse(SessionLine::Ready), Some(SessionEvent::Ready));
+        assert_eq!(
+            parse(SessionLine::AwaitingApproval),
+            Some(SessionEvent::AwaitingApproval)
+        );
         let pin = SessionLine::Error {
             msg: "pin \"x\"\n\tno",
             trust_rejected: Some(true),

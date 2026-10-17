@@ -16,8 +16,7 @@ use std::sync::{Arc, Mutex};
 
 /// Cells [`NativeClient`] and the worker's tasks share, one `Arc` per dial.
 ///
-/// `clock_offset` and `shutdown` stay `Arc`s: embedders and the data-punch thread hold
-/// those cells on their own.
+/// `clock_offset` and `shutdown` stay `Arc`s: embedders hold those cells on their own.
 pub(crate) struct ClientShared {
     pub(crate) frames: FrameChannel,
     pub(crate) shutdown: Arc<AtomicBool>,
@@ -58,6 +57,10 @@ pub(crate) struct ClientShared {
     pub(crate) feedback: Mutex<super::recovery::FeedbackOut>,
     /// Where feedback datagrams leave: the session's connection, from when the pump has one.
     pub(crate) feedback_tx: std::sync::OnceLock<FeedbackTx>,
+    /// Re-picks the shared socket's source address after the device's path changed.
+    pub(crate) reconnect: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// The host answered `Pending`: its operator is deciding about this device.
+    pub(crate) pending: AtomicBool,
     /// Keyframe asks sent; the pump drains them per report window as the ABR recovery signal.
     pub(crate) recovery_kf: AtomicU32,
     /// This device's end of the path, as the dial read it.
@@ -146,6 +149,8 @@ impl ClientShared {
             host_link: Mutex::default(),
             feedback: Mutex::default(),
             feedback_tx: std::sync::OnceLock::new(),
+            reconnect: std::sync::OnceLock::new(),
+            pending: AtomicBool::new(false),
             recovery_kf: AtomicU32::new(0),
             client_link: Mutex::default(),
             link: Mutex::new((crate::abr::LINK_FLOOR_KBPS, crate::abr::LinkSource::Floor)),

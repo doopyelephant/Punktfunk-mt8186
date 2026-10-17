@@ -190,7 +190,7 @@ pub(super) struct HostCfg {
     /// (`HOST_CAP2_RAMP`). An older host answers the first one and rejects
     /// every step behind it.
     pub ramp: bool,
-    /// Display, capture and encoder bring-up: the gap between the punch and
+    /// Display, capture and encoder bring-up: the gap between the bound data plane and
     /// the first video frame, which is what the ramp measures the link in.
     pub bringup_ms: u64,
     /// `false` = a host that advertises the ramp and then answers no step.

@@ -169,6 +169,7 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
             let games = match library::fetch_games(
                 &target.host.addr,
                 target.host.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT),
+                target.host.port,
                 &identity,
                 pin,
             ) {

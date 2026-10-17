@@ -24,6 +24,12 @@ object NativeBridge {
      */
     external fun nativeConnect(requestJson: String): Long
 
+    /**
+     * True while the dial [nativeConnect] is blocked on has been parked by the host for its
+     * operator's approval. The dial then waits for the verdict; show the approval wait.
+     */
+    external fun nativeDialPending(): Boolean
+
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */
     external fun nativeHostFingerprint(handle: Long): String
 
@@ -47,6 +53,9 @@ object NativeBridge {
      * ending. Cheap (one atomic load); UI-safe.
      */
     external fun nativeEndReason(handle: Long): Int
+
+    /** Milliseconds before redial [attempt] of a session that ended with [endReason]; -1 = stay ended. */
+    external fun nativeRedialDelayMs(endReason: Int, attempt: Int): Long
 
     /**
      * The session's live access state as `[grants, remainingSecs, updateSeq]`, or `null` on a `0`
@@ -123,6 +132,9 @@ object NativeBridge {
      */
     external fun nativeTakeLastError(): String
 
+    /** The host's own sentence with the last refusal, cleared on read; "" when it said none. */
+    external fun nativeTakeLastSaid(): String
+
     /**
      * Signal a **deliberate** user disconnect on [handle] before [nativeClose]: the session closes
      * with `QUIT_CLOSE_CODE` so the host tears it down immediately instead of holding the keep-alive
@@ -178,6 +190,21 @@ object NativeBridge {
      * blocking socket sends); run it on a background dispatcher.
      */
     external fun nativeWakeOnLan(macsCsv: String, lastIp: String): Boolean
+
+    /**
+     * `GET path` over the host's stream port as this device, refusing any host but [pinHex]: the
+     * reply's status, a newline, then its body. Null when the port carried nothing, so HTTPS may.
+     * Blocking; never on the main thread.
+     */
+    external fun nativeMgmtGet(
+        host: String,
+        port: Int,
+        certPem: String,
+        keyPem: String,
+        pinHex: String,
+        path: String,
+        timeoutMs: Int,
+    ): String?
 
     /**
      * Bounded QUIC reachability probe to [host]:[port] (mDNS-independent): the lowercase-hex
@@ -575,6 +602,9 @@ object NativeBridge {
     /** Live natural-scroll toggle, applied once at the core's outbound seam. False on a dead session. */
     external fun nativeSetInvertScroll(handle: Long, invert: Boolean): Boolean
 
+    /** The default network or its addresses changed: the host follows a roam within a round trip. */
+    external fun nativePathChanged(handle: Long): Boolean
+
     /**
      * Whether this stream holds the screen awake right now: always with [keepAwake] (the "Keep
      * screen awake" setting) on, else only while the player's input is recent, so the device's
@@ -910,7 +940,8 @@ object NativeBridge {
 
     /**
      * Where the session the console asked for stands: 0 connecting, 1 streaming, 2 failed([message]),
-     * 3 ended ([message] = the abnormal reason, or "" for a clean end), 4 reconnecting([message]).
+     * 3 ended ([message] = the abnormal reason, or "" for a clean end), 4 reconnecting([message]),
+     * 5 failed as profile-unknown([message]), 6 awaiting the host operator's approval.
      */
     external fun nativeConsoleSessionPhase(handle: Long, phase: Int, message: String)
 

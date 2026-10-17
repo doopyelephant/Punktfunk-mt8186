@@ -774,7 +774,7 @@ impl ServiceState {
         spawn_fetch(
             self.library.clone(),
             addr,
-            mgmt,
+            (port, mgmt),
             self.identity.clone(),
             fp_hex,
             macs,
@@ -1570,7 +1570,8 @@ fn save_preset(id: String, name: String, overrides: serde_json::Value) {
 }
 
 /// Fetch the library off the service thread, then stream poster art into the shared
-/// model as results land (the renderer drains `push_art` per frame).
+/// model as results land (the renderer drains `push_art` per frame). `(port, mgmt)`: the
+/// stream port the management tunnel tries first, then the HTTPS port.
 ///
 /// Three things happen before the host is ever asked, and the order is the point:
 /// 1. the CACHED catalog goes up immediately, marked stale — a library is the screen a player
@@ -1585,7 +1586,7 @@ fn save_preset(id: String, name: String, overrides: serde_json::Value) {
 fn spawn_fetch(
     shared: LibraryShared,
     addr: String,
-    mgmt: u16,
+    (port, mgmt): (u16, u16),
     identity: (String, String),
     fp_hex: String,
     macs: Vec<String>,
@@ -1631,7 +1632,7 @@ fn spawn_fetch(
             let mut last_err = None;
             let mut fetched = None;
             loop {
-                match library::fetch_games(&addr, mgmt, &identity, pin) {
+                match library::fetch_games(&addr, mgmt, port, &identity, pin) {
                     Ok(games) => {
                         fetched = Some(games);
                         break;

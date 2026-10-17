@@ -4,7 +4,7 @@
     SPDX-FileCopyrightText: 2015 Martin Gräßlin
     SPDX-License-Identifier: LGPL-2.1-or-later
   </copyright>
-  <interface name="org_kde_kwin_fake_input" version="4">
+  <interface name="org_kde_kwin_fake_input" version="6">
     <description summary="Fake input manager">
       This interface allows other processes to provide fake input events.
       Purpose is on the one hand side to provide testing facilities like XTest
@@ -67,6 +67,17 @@
     <request name="keyboard_key" since="4">
       <description summary="keyboard key event"/>
       <arg name="button" type="uint" summary="evdev key code"/>
+      <arg name="state" type="uint" summary="key state, 0 released, 1 pressed"/>
+    </request>
+    <request name="destroy" type="destructor" since="5">
+      <description summary="destroy the fake input device"/>
+    </request>
+    <request name="keyboard_keysym" since="6">
+      <description summary="keyboard keysym event">
+        The compositor resolves the keysym in the session layout, holding the
+        modifiers its level needs.
+      </description>
+      <arg name="keysym" type="uint" summary="xkb keysym"/>
       <arg name="state" type="uint" summary="key state, 0 released, 1 pressed"/>
     </request>
   </interface>

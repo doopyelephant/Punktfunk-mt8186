@@ -111,9 +111,11 @@ export const HostStrip: FC<{
 							))}
 						</Facts>
 						<Facts label={m.host_ports()}>
+							{/* Only the ports this host serves now: GameStream's only with it on. */}
 							{Object.entries(h.ports).map(([k, v]) => (
 								<Badge key={k} variant="outline" className="tabular-nums">
-									{k.toUpperCase()} {v as number}
+									{k.toUpperCase()}{" "}
+									{Array.isArray(v) ? v.join(", ") : String(v)}
 								</Badge>
 							))}
 						</Facts>

@@ -2,6 +2,7 @@ package io.unom.punktfunk.kit.library
 
 import io.unom.punktfunk.kit.security.KnownHost
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -107,6 +108,14 @@ class LibraryClientTest {
         onWaking = { run.wakingCalls++ },
         sleep = { run.slept += it },
     )
+
+    /** A stream-port reply splits at its first newline; a line with no status is not one. */
+    @Test
+    fun a_stream_reply_splits_at_its_first_newline() {
+        assertEquals(200 to "{\"a\":\n1}", LibraryClient.streamReply("200\n{\"a\":\n1}"))
+        assertEquals(404 to "", LibraryClient.streamReply("404\n"))
+        assertNull(LibraryClient.streamReply("nope"))
+    }
 
     /**
      * No packet without auto-wake on and a MAC to send to, and nothing may say "waking". A packet

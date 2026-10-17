@@ -16,6 +16,11 @@ public struct MgmtTarget: @unchecked Sendable {
     let identity: SecIdentity
     /// SHA-256 of the host's certificate; the transport refuses any other.
     public let pin: Data
+    /// The stream port, where a host answers management without TCP. 0: not known.
+    let streamPort: UInt16
+    /// This device's identity as PEM, for the stream port's handshake.
+    let certPEM: String
+    let keyPEM: String
 
     /// The target for `host` as `identity`. `port` overrides the saved management port; nil or 0
     /// keeps it. An unpaired host fails here rather than at the transport, so every caller gets
@@ -34,7 +39,9 @@ public struct MgmtTarget: @unchecked Sendable {
             return .failure(.keychain)
         }
         let mgmt = port.flatMap { $0 > 0 ? $0 : nil } ?? host.effectiveMgmtPort
-        return .success(MgmtTarget(address: host.address, port: mgmt, identity: secIdentity, pin: pin))
+        return .success(MgmtTarget(
+            address: host.address, port: mgmt, identity: secIdentity, pin: pin,
+            streamPort: host.port, certPEM: identity.certPEM, keyPEM: identity.keyPEM))
     }
 }
 

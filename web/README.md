@@ -28,7 +28,7 @@ bun run dev               # http://localhost:47992
 Start a host with the management API up:
 
 ```sh
-# from the repo root — `serve` brings up the native punktfunk/1 plane + the mgmt API (the console
+# from the repo root — `serve` brings up the native punktfunk/2 plane + the mgmt API (the console
 # only needs the mgmt API; add --gamestream too if you also want the Moonlight surface):
 WAYLAND_DISPLAY=wayland-kde XDG_CURRENT_DESKTOP=KDE \
   cargo run -rp punktfunk-host -- serve

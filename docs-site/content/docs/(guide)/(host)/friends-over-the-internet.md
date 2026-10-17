@@ -15,7 +15,9 @@ may do; this page only gets them to the host.
 | A phone, tablet, Apple TV, or no Steam | [Tailscale machine sharing](#tailscale) |
 | Anything, and you run your own router | [Port forwarding](#port-forwarding): not recommended, the only path that exposes the host to the internet |
 
-Every path opens one port: UDP `9777` carries the stream, video and audio included.
+Every path opens one port: UDP `9777` carries the stream, video and audio included. With
+[seats](/docs/profiles#what-a-seat-can-do) on, open UDP `9777`–`9782`: a host that places your
+friend on a seat sends them to that seat's port.
 
 ## Porthole
 

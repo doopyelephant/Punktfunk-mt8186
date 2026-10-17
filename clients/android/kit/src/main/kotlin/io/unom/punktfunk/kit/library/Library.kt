@@ -509,9 +509,17 @@ object LibraryClient {
         return Walk.Done(games)
     }
 
+    /** How long a dial over the stream port waits before HTTPS takes over. */
+    internal const val STREAM_WAIT_MS = 3_000
+
+    /** One reply from [NativeBridge.nativeMgmtGet]: its status and body. */
+    internal fun streamReply(line: String): Pair<Int, String>? =
+        line.substringBefore('\n').toIntOrNull()?.let { it to line.substringAfter('\n', "") }
+
     /**
-     * The host's catalog, walked by `GET /api/v1/library/page` at [mgmtBase] and authenticated
-     * by mTLS. A host older than the paged route refuses it on this lane, so `GET
+     * The host's catalog, walked by `GET /api/v1/library/page`: over [streamPort] first, so a
+     * host whose TCP 47990 is closed still answers, then at [mgmtBase] over HTTPS. Both
+     * authenticate by mTLS. A host older than the paged route refuses it on this lane, so `GET
      * /api/v1/library` answers whole instead. [fpHex] is the pinned host-cert SHA-256 (64 hex,
      * from the paired [io.unom.punktfunk.kit.security.KnownHost]); a blank value means the host
      * was never paired. A refusal maps through [refused]. BLOCKING — call from a background
@@ -523,11 +531,22 @@ object LibraryClient {
         certPem: String,
         keyPem: String,
         fpHex: String,
+        streamPort: Int = 0,
     ): LibraryResult {
         if (fpHex.isBlank()) {
             return LibraryResult.Unauthorized(
                 "connect to this host once first — pairing is what lets it show its games",
             )
+        }
+        if (streamPort > 0) {
+            val viaStream = { path: String ->
+                NativeBridge.nativeMgmtGet(address, streamPort, certPem, keyPem, fpHex, path, STREAM_WAIT_MS)
+                    ?.let(::streamReply) ?: error("the stream port carried nothing")
+            }
+            val walked = runCatching {
+                walkPages(mgmtBase(address, mgmtPort)) { cursor -> viaStream(pagePath(cursor)) }
+            }.getOrNull()
+            if (walked is Walk.Done) return LibraryResult.Ok(walked.games.launchersFirst())
         }
         val client = try {
             mtlsHttpClient(certPem, keyPem, address, fpHex)
@@ -681,11 +700,12 @@ object LibraryClient {
         fpHex: String,
         macs: List<String>,
         autoWake: Boolean,
+        streamPort: Int = 0,
         isCancelled: () -> Boolean = { false },
         onWaking: () -> Unit = {},
     ): LibraryResult? = acrossWake(
         waking = autoWake && macs.isNotEmpty(),
-        fetch = { fetch(address, mgmtPort, certPem, keyPem, fpHex) },
+        fetch = { fetch(address, mgmtPort, certPem, keyPem, fpHex, streamPort) },
         wake = { NativeBridge.nativeWakeOnLan(macs.joinToString(","), address) },
         isCancelled = isCancelled,
         onWaking = onWaking,
