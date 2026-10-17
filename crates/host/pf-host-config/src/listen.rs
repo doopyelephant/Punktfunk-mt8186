@@ -20,6 +20,7 @@ const MGMT_BIND_ENV: &str = "PUNKTFUNK_MGMT_BIND";
 const NATIVE_PORT_ENV: &str = "PUNKTFUNK_NATIVE_PORT";
 const BROWSER_ENV: &str = "PUNKTFUNK_WEBTRANSPORT";
 const BROWSER_PORT_ENV: &str = "PUNKTFUNK_WEBTRANSPORT_PORT";
+const GAMESTREAM_ENV: &str = "PUNKTFUNK_GAMESTREAM";
 
 /// What `serve` binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +131,14 @@ pub fn browser_port_from_host_env(text: &str, row: bool) -> Option<u16> {
     on.then(|| pick(flag, env(BROWSER_PORT_ENV), BROWSER_PORT).unwrap_or(BROWSER_PORT))
 }
 
+/// Whether the Windows service's next host serves GameStream. `row` is the `gamestream` row as
+/// the caller resolves it; a `--gamestream` flag, then a `PUNKTFUNK_GAMESTREAM` line, outrank it.
+pub fn gamestream_from_host_env(text: &str, row: bool) -> bool {
+    let line = pf_paths::env_file::get(text, GAMESTREAM_ENV)
+        .and_then(|v| crate::registry::parse_bool(&v.trim().to_ascii_lowercase()));
+    host_cmd(text).any(|w| w == "--gamestream" || w == "--moonlight") || line.unwrap_or(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +188,23 @@ mod tests {
             native_port("PUNKTFUNK_NATIVE_PORT=9800\nPUNKTFUNK_HOST_CMD=serve --gamestream\n"),
             9800
         );
+    }
+
+    /// GameStream's rules exist only while `serve` would serve it.
+    #[test]
+    fn the_gamestream_rule_follows_the_setting() {
+        let on = gamestream_from_host_env;
+        assert!(!on("", false));
+        assert!(on("", true));
+        assert!(
+            !on("PUNKTFUNK_GAMESTREAM=0\n", true),
+            "the line outranks the row"
+        );
+        assert!(on("PUNKTFUNK_GAMESTREAM=maybe\n", true));
+        assert!(on(
+            "PUNKTFUNK_GAMESTREAM=0\nPUNKTFUNK_HOST_CMD=serve --moonlight\n",
+            false
+        ));
     }
 
     /// The browser plane's rule exists only while the plane is on, at the port `serve` binds.
