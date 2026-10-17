@@ -73,6 +73,13 @@ pub trait Transport: Send + Sync {
     fn recv_owned(&self) -> std::io::Result<Option<RecvBatch>> {
         Ok(self.recv()?.map(RecvBatch::single))
     }
+
+    /// [`recv_owned`](Self::recv_owned) after waiting up to `timeout` for datagrams to
+    /// arrive. The default sleeps the whole timeout, then polls once.
+    fn wait_owned(&self, timeout: std::time::Duration) -> std::io::Result<Option<RecvBatch>> {
+        std::thread::sleep(timeout);
+        self.recv_owned()
+    }
 }
 
 /// Received datagrams in one buffer: `buf[..len]`, one every `stride` bytes, the last possibly

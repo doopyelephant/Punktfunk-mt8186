@@ -1011,6 +1011,16 @@ impl Session {
         self.reassembler.set_memory(memory);
     }
 
+    /// Client, idle wire: wait up to `timeout` for datagrams, which the next
+    /// [`poll_frame`](Self::poll_frame) reads. `true` when some arrived.
+    pub fn wait_packets(&mut self, timeout: std::time::Duration) -> Result<bool> {
+        if self.recv_cur.is_none() {
+            self.recv_cur = self.transport.wait_owned(timeout)?;
+            self.recv_off = 0;
+        }
+        Ok(self.recv_cur.is_some())
+    }
+
     /// Client: drain the transport until a whole access unit is recovered, or no more
     /// packets are pending ([`PunktfunkError::NoFrame`]).
     pub fn poll_frame(&mut self) -> Result<Frame> {
@@ -1218,6 +1228,35 @@ mod wire_equivalence_tests {
     fn host_session(cfg: Config, sealed: bool) -> Session {
         let (h, _c) = loopback_pair(0, 0);
         Session::new(cfg, media(sealed), Box::new(h)).unwrap()
+    }
+
+    #[test]
+    fn wait_packets_sleeps_an_idle_wire_and_hands_the_next_poll_its_datagrams() {
+        let mk = |role| Config {
+            role,
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 0,
+                max_data_per_block: 64,
+            },
+            shard_payload: 1024,
+            max_frame_bytes: 8 * 1024 * 1024,
+            loopback_drop_period: 0,
+        };
+        let (h, c) = loopback_pair(0, 0);
+        let mut host = Session::new(mk(Role::Host), media(false), Box::new(h)).unwrap();
+        let mut client = Session::new(mk(Role::Client), media(false), Box::new(c)).unwrap();
+        let wait = std::time::Duration::from_millis(1);
+        let t0 = std::time::Instant::now();
+        assert!(!client.wait_packets(wait).unwrap());
+        assert!(
+            t0.elapsed() >= wait,
+            "the idle wait is the loopback's sleep"
+        );
+        host.submit_frame(&[7u8; 200], 1_000, 0).unwrap();
+        assert!(client.wait_packets(wait).unwrap());
+        let f = client.poll_frame().unwrap();
+        assert!(f.data.len() == 200 && f.data.iter().all(|&b| b == 7));
     }
 
     /// Reference wire path: every packet collected first, then each staged and sealed on its
