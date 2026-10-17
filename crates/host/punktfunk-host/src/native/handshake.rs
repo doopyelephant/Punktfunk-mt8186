@@ -417,8 +417,11 @@ pub(super) async fn negotiate(
         "audio channels"
     );
 
-    let (bit_depth, session_hdr, chroma) =
-        negotiate_video_format(&hello, codec, compositor, gamescope_route.as_ref()).await?;
+    let (bit_depth, session_hdr, chroma) = negotiate_video_format(
+        FormatFacts::of(&hello, compositor, gamescope_route.as_ref()),
+        codec,
+    )
+    .await?;
 
     // After depth + chroma: PyroWave Automatic is a ~bpp pin that scales with both, at the
     // client's quality when it sent one.
@@ -566,7 +569,8 @@ pub(super) async fn negotiate(
             .with(punktfunk_core::quic::v2::registry::FEATURE_STREAM_CONFIG)
             .with(punktfunk_core::quic::v2::registry::FEATURE_PAD_WRITES)
             .with(punktfunk_core::quic::v2::registry::FEATURE_PROFILES)
-            .with(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT),
+            .with(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT)
+            .with(punktfunk_core::quic::v2::registry::FEATURE_FORMAT_EPOCH),
     );
     let server_hello = ServerHello {
         welcome,
@@ -985,148 +989,187 @@ async fn negotiate_compositor(
     Ok((compositor, gamescope_route))
 }
 
-/// Bit depth, HDR verdict, and chroma, each gated by host, client, codec, source, and GPU probes.
-async fn negotiate_video_format(
-    hello: &Hello,
-    codec: crate::encode::Codec,
-    compositor: Option<crate::vdisplay::Compositor>,
-    gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
-) -> Result<(u8, bool, crate::encode::ChromaFormat)> {
-    // 10-bit only when host, client, codec, capture, and GPU all allow it. Resolved before
-    // Welcome so `color` matches the stream (a can't-10-bit GPU yields 8-bit SDR).
-    let host_wants_10bit = pf_host_config::config().ten_bit;
-    let client_supports_10bit = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
-    // `VIDEO_CAP_HDR` is BT.2020 PQ. `VIDEO_CAP_10BIT` alone is 10-bit SDR (Main10, display untouched).
-    let client_wants_hdr = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_HDR != 0;
-    // Source-aware: Linux HDR depends on the compositor just resolved. Gamescope and direct
-    // capture fold in `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no
-    // twin here: that latch is per-source and this gate already used this session's source.
-    let capture_supports_hdr =
-        crate::capture::capturer_supports_hdr_for(compositor, gamescope_route);
-    // An 8-bit desktop's SDR-10 only widens: a colour pass per frame for no source detail, and
-    // the operator opts in (`sdr10_widen`). Our gamescope composites 10-bit SDR itself, and
-    // Windows 11 24H2 composes the virtual display in SDR wide colour (`sdr10_source`); neither
-    // needs the opt-in. Either way the backend must write the 10 bits. Linux non-PyroWave 4:4:4
-    // is clamped to 8-bit below.
-    let sdr10_widen = pf_host_config::row_bool("PUNKTFUNK_10BIT_SDR_WIDEN");
-    let sdr10_source = crate::capture::capturer_delivers_sdr10_for(compositor, gamescope_route);
-    let sdr10_chain_ok = (sdr10_widen || sdr10_source)
-        && codec_carries_sdr10(codec, sdr10_source)
-        && crate::encode::backend_carries_sdr10(codec);
-    let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
-    // Probe may open a tiny encoder; spawn_blocking, short-circuited behind the cheap gates.
-    let gpu_can_10bit =
-        if host_wants_10bit && client_supports_10bit && codec.supports_10bit() && depth_reachable {
-            tokio::task::spawn_blocking(move || crate::encode::can_encode_10bit(codec))
-                .await
-                .context("10-bit capability probe task")?
+/// What the depth, HDR and chroma rule reads about the client and the source, kept for the
+/// session so a codec change re-runs the handshake's rule for the new codec.
+#[derive(Clone)]
+pub(super) struct FormatFacts {
+    pub(super) video_caps: u8,
+    pub(super) mode: punktfunk_core::Mode,
+    pub(super) compositor: Option<crate::vdisplay::Compositor>,
+    pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
+}
+
+impl FormatFacts {
+    pub(super) fn of(
+        hello: &Hello,
+        compositor: Option<crate::vdisplay::Compositor>,
+        gamescope_route: Option<&crate::vdisplay::GamescopeRoute>,
+    ) -> FormatFacts {
+        FormatFacts {
+            video_caps: hello.video_caps,
+            mode: hello.mode,
+            compositor,
+            gamescope_route: gamescope_route.cloned(),
+        }
+    }
+
+    /// Bit depth, HDR verdict, and chroma for `codec`, each gated by host, client, codec,
+    /// source, and GPU probes. Blocks on the probes.
+    pub(super) fn resolve(
+        &self,
+        codec: crate::encode::Codec,
+    ) -> (u8, bool, crate::encode::ChromaFormat) {
+        let (compositor, gamescope_route) = (self.compositor, self.gamescope_route.as_ref());
+        // 10-bit only when host, client, codec, capture, and GPU all allow it. Resolved before
+        // Welcome so `color` matches the stream (a can't-10-bit GPU yields 8-bit SDR).
+        let host_wants_10bit = pf_host_config::config().ten_bit;
+        let client_supports_10bit = self.video_caps & punktfunk_core::quic::VIDEO_CAP_10BIT != 0;
+        // `VIDEO_CAP_HDR` is BT.2020 PQ. `VIDEO_CAP_10BIT` alone is 10-bit SDR (Main10, display
+        // untouched).
+        let client_wants_hdr = self.video_caps & punktfunk_core::quic::VIDEO_CAP_HDR != 0;
+        // Source-aware: Linux HDR depends on the compositor just resolved. Gamescope and direct
+        // capture fold in `hdr_capture_failed(VirtualOutput)`; GameStream's rtsp.rs check has no
+        // twin here: that latch is per-source and this gate already used this session's source.
+        let capture_supports_hdr =
+            crate::capture::capturer_supports_hdr_for(compositor, gamescope_route);
+        // An 8-bit desktop's SDR-10 only widens: a colour pass per frame for no source detail, and
+        // the operator opts in (`sdr10_widen`). Our gamescope composites 10-bit SDR itself, and
+        // Windows 11 24H2 composes the virtual display in SDR wide colour (`sdr10_source`); neither
+        // needs the opt-in. Either way the backend must write the 10 bits. Linux non-PyroWave 4:4:4
+        // is clamped to 8-bit below.
+        let sdr10_widen = pf_host_config::row_bool("PUNKTFUNK_10BIT_SDR_WIDEN");
+        let sdr10_source = crate::capture::capturer_delivers_sdr10_for(compositor, gamescope_route);
+        let sdr10_chain_ok = (sdr10_widen || sdr10_source)
+            && codec_carries_sdr10(codec, sdr10_source)
+            && crate::encode::backend_carries_sdr10(codec);
+        let depth_reachable = (client_wants_hdr && capture_supports_hdr) || sdr10_chain_ok;
+        // Probe may open a tiny encoder: short-circuited behind the cheap gates.
+        let gpu_can_10bit = if host_wants_10bit
+            && client_supports_10bit
+            && codec.supports_10bit()
+            && depth_reachable
+        {
+            crate::encode::can_encode_10bit(codec)
         } else {
             false
         };
-    let bit_depth: u8 = if gpu_can_10bit { 10 } else { 8 };
-    // Colour label, capturer mandate, and vdisplay HDR all read this, never `bit_depth >= 10`
-    // (10-bit without it is SDR: BT.709 VUI, display untouched).
-    let session_hdr = gpu_can_10bit && client_wants_hdr && capture_supports_hdr;
-    tracing::info!(
-        bit_depth,
-        session_hdr,
-        host_wants_10bit,
-        client_supports_10bit,
-        client_wants_hdr,
-        capture_supports_hdr,
-        sdr10_widen,
-        sdr10_source,
-        sdr10_chain_ok,
-        codec = ?codec,
-        gpu_can_10bit,
-        client_video_caps = hello.video_caps,
-        "encode bit depth"
-    );
+        let bit_depth: u8 = if gpu_can_10bit { 10 } else { 8 };
+        // Colour label, capturer mandate, and vdisplay HDR all read this, never `bit_depth >= 10`
+        // (10-bit without it is SDR: BT.709 VUI, display untouched).
+        let session_hdr = gpu_can_10bit && client_wants_hdr && capture_supports_hdr;
+        tracing::info!(
+            bit_depth,
+            session_hdr,
+            host_wants_10bit,
+            client_supports_10bit,
+            client_wants_hdr,
+            capture_supports_hdr,
+            sdr10_widen,
+            sdr10_source,
+            sdr10_chain_ok,
+            codec = ?codec,
+            gpu_can_10bit,
+            client_video_caps = self.video_caps,
+            "encode bit depth"
+        );
 
-    // 4:4:4 only when host, client, ingest chain, and GPU all allow it. Resolved before
-    // Welcome so the client sizes its decoder from what we will actually emit.
-    let host_wants_444 = pf_host_config::config().four_four_four;
-    let client_supports_444 = hello.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
-    // Ingest chain, not capturer: Windows 4:4:4 needs direct-NVENC RGB ingest (AMF cannot;
-    // QSV/ffmpeg has no RGB 4:4:4 wiring). PyroWave does its own RGB→YCbCr; its gate is
-    // `can_encode_444`. HDR does not cost chroma (HEVC Main 4:4:4 10).
-    let ingest_chain_supports_444 = codec == crate::encode::Codec::PyroWave
-        || crate::capture::capturer_supports_444(crate::encode::resolved_backend_ingests_rgb_444());
-    // Probe opens a tiny encoder; spawn_blocking, short-circuited. A negative latches until
-    // restart — a GPU either supports HEVC 4:4:4 or it does not.
-    let gpu_supports_444 = if matches!(
-        codec,
-        crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
-    ) && host_wants_444
-        && client_supports_444
-        && ingest_chain_supports_444
-    {
-        tokio::task::spawn_blocking(move || crate::encode::can_encode_444(codec))
-            .await
-            .context("4:4:4 capability probe task")?
-    } else {
-        false
-    };
-    // Client asked (VIDEO_CAP_444) but we still resolve 4:2:0: name the losing gate.
-    if host_wants_444 && client_supports_444 && !gpu_supports_444 {
-        let reason = if !matches!(
+        // 4:4:4 only when host, client, ingest chain, and GPU all allow it. Resolved before
+        // Welcome so the client sizes its decoder from what we will actually emit.
+        let host_wants_444 = pf_host_config::config().four_four_four;
+        let client_supports_444 = self.video_caps & punktfunk_core::quic::VIDEO_CAP_444 != 0;
+        // Ingest chain, not capturer: Windows 4:4:4 needs direct-NVENC RGB ingest (AMF cannot;
+        // QSV/ffmpeg has no RGB 4:4:4 wiring). PyroWave does its own RGB→YCbCr; its gate is
+        // `can_encode_444`. HDR does not cost chroma (HEVC Main 4:4:4 10).
+        let ingest_chain_supports_444 = codec == crate::encode::Codec::PyroWave
+            || crate::capture::capturer_supports_444(
+                crate::encode::resolved_backend_ingests_rgb_444(),
+            );
+        // Probe opens a tiny encoder, short-circuited. A negative latches until
+        // restart — a GPU either supports HEVC 4:4:4 or it does not.
+        let gpu_supports_444 = if matches!(
             codec,
             crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
-        ) {
-            "the negotiated codec only carries 4:2:0 — 4:4:4 needs HEVC or PyroWave"
-        } else if !ingest_chain_supports_444 {
-            "this host's encoder backend can't ingest full chroma — 4:4:4 needs direct \
-             NVENC (NVIDIA) or the PyroWave codec"
+        ) && host_wants_444
+            && client_supports_444
+            && ingest_chain_supports_444
+        {
+            crate::encode::can_encode_444(codec)
         } else {
-            "the GPU declined the 4:4:4 encode profile probe"
+            false
         };
-        tracing::info!(reason, "4:4:4 requested but the session negotiates 4:2:0");
-    }
-    let chroma = if gpu_supports_444 {
-        crate::encode::ChromaFormat::Yuv444
-    } else {
-        crate::encode::ChromaFormat::Yuv420
-    };
-    // PyroWave RDO packs the block index in 16 bits; ~8K 4:4:4 overflows. Downgrade to 4:2:0
-    // before Welcome.
-    let chroma = if codec == crate::encode::Codec::PyroWave
-        && chroma.is_444()
-        && !crate::encode::pyrowave_mode_fits_rdo(hello.mode.width, hello.mode.height, true)
-    {
-        tracing::warn!(
-            mode = %format_args!("{}x{}", hello.mode.width, hello.mode.height),
-            "PyroWave 4:4:4 at this mode exceeds the rate controller's block-index range — \
-             negotiating 4:2:0"
+        // Client asked (VIDEO_CAP_444) but we still resolve 4:2:0: name the losing gate.
+        if host_wants_444 && client_supports_444 && !gpu_supports_444 {
+            let reason = if !matches!(
+                codec,
+                crate::encode::Codec::H265 | crate::encode::Codec::PyroWave
+            ) {
+                "the negotiated codec only carries 4:2:0 — 4:4:4 needs HEVC or PyroWave"
+            } else if !ingest_chain_supports_444 {
+                "this host's encoder backend can't ingest full chroma — 4:4:4 needs direct \
+                 NVENC (NVIDIA) or the PyroWave codec"
+            } else {
+                "the GPU declined the 4:4:4 encode profile probe"
+            };
+            tracing::info!(reason, "4:4:4 requested but the session negotiates 4:2:0");
+        }
+        let chroma = if gpu_supports_444 {
+            crate::encode::ChromaFormat::Yuv444
+        } else {
+            crate::encode::ChromaFormat::Yuv420
+        };
+        // PyroWave RDO packs the block index in 16 bits; ~8K 4:4:4 overflows. Downgrade to 4:2:0
+        // before Welcome.
+        let chroma = if codec == crate::encode::Codec::PyroWave
+            && chroma.is_444()
+            && !crate::encode::pyrowave_mode_fits_rdo(self.mode.width, self.mode.height, true)
+        {
+            tracing::warn!(
+                mode = %format_args!("{}x{}", self.mode.width, self.mode.height),
+                "PyroWave 4:4:4 at this mode exceeds the rate controller's block-index range — \
+                 negotiating 4:2:0"
+            );
+            crate::encode::ChromaFormat::Yuv420
+        } else {
+            chroma
+        };
+        #[cfg(target_os = "linux")]
+        let chroma = linux_chroma_under_hdr(chroma, session_hdr, codec);
+        tracing::info!(
+            chroma = ?chroma,
+            host_wants_444,
+            client_supports_444,
+            ingest_chain_supports_444,
+            "encode chroma"
         );
-        crate::encode::ChromaFormat::Yuv420
-    } else {
-        chroma
-    };
-    #[cfg(target_os = "linux")]
-    let chroma = linux_chroma_under_hdr(chroma, session_hdr, codec);
-    tracing::info!(
-        chroma = ?chroma,
-        host_wants_444,
-        client_supports_444,
-        ingest_chain_supports_444,
-        "encode chroma"
-    );
 
-    // Linux 4:4:4 on the H.26x path is CPU swscale → 8-bit `YUV444P`; a 10-bit SDR session
-    // would silently encode 8-bit (HDR already took 4:2:0 above). PyroWave's own 4:4:4 CSC
-    // is shader-native and 10-bit, so the clamp skips it. Windows NVENC keeps 10.
-    #[cfg(target_os = "linux")]
-    let bit_depth: u8 =
-        if chroma.is_444() && bit_depth == 10 && codec != crate::encode::Codec::PyroWave {
+        // Linux 4:4:4 on the H.26x path is CPU swscale → 8-bit `YUV444P`; a 10-bit SDR session
+        // would silently encode 8-bit (HDR already took 4:2:0 above). PyroWave's own 4:4:4 CSC
+        // is shader-native and 10-bit, so the clamp skips it. Windows NVENC keeps 10.
+        #[cfg(target_os = "linux")]
+        let bit_depth: u8 = if chroma.is_444()
+            && bit_depth == 10
+            && codec != crate::encode::Codec::PyroWave
+        {
             tracing::info!("4:4:4 on the Linux path encodes 8-bit YUV444P — resolving bit depth 8");
             8
         } else {
             bit_depth
         };
-    // Follows the depth clamp: an 8-bit stream is never labelled HDR.
-    let session_hdr = session_hdr && bit_depth == 10;
+        // Follows the depth clamp: an 8-bit stream is never labelled HDR.
+        let session_hdr = session_hdr && bit_depth == 10;
 
-    Ok((bit_depth, session_hdr, chroma))
+        (bit_depth, session_hdr, chroma)
+    }
+}
+
+/// [`FormatFacts::resolve`] off the runtime: its probes may open a tiny encoder.
+async fn negotiate_video_format(
+    facts: FormatFacts,
+    codec: crate::encode::Codec,
+) -> Result<(u8, bool, crate::encode::ChromaFormat)> {
+    tokio::task::spawn_blocking(move || facts.resolve(codec))
+        .await
+        .context("video format probe task")
 }
 
 /// Linux 4:4:4 on the H.26x path is 8-bit, so it cannot carry HDR. A client that asked for

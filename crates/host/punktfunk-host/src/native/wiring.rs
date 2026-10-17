@@ -7,13 +7,19 @@
 use super::*;
 use crate::native::bitrate::EncoderCeiling;
 
-/// The mode epoch `epoch` delivers, from the stream thread. `corrects`: it is not what the client
-/// was last told, so a client without `StreamConfig` gets a second `Reconfigured`.
+/// The mode and video format epoch `epoch` delivers, from the stream thread. `corrects`: the mode
+/// is not what the client was last told, so a client without `StreamConfig` gets a second
+/// `Reconfigured`.
 pub(crate) struct Delivered {
     pub(crate) mode: punktfunk_core::Mode,
+    pub(crate) format: punktfunk_core::quic::VideoFormat,
     pub(crate) epoch: u8,
     pub(crate) corrects: bool,
 }
+
+/// The stream thread's answer to a codec ask: the codec it now encodes, or `None` when the
+/// rebuild failed and the old pipeline streams on.
+pub(crate) type FormatOutcome = Option<crate::encode::Codec>;
 
 /// Values the control task and the stream thread both read or write. A clone shares them.
 #[derive(Clone)]
@@ -72,6 +78,9 @@ pub(crate) type ResendFn = Box<dyn Fn(u32, Vec<u16>) -> bool + Send>;
 /// The control task's halves.
 pub(crate) struct ControlEnds {
     pub(crate) reconfig_tx: std::sync::mpsc::Sender<punktfunk_core::Mode>,
+    /// A codec ask the control task vetted; [`FormatOutcome`] comes back on `format_result_rx`.
+    pub(crate) format_tx: std::sync::mpsc::Sender<crate::encode::Codec>,
+    pub(crate) format_result_rx: tokio::sync::mpsc::UnboundedReceiver<FormatOutcome>,
     pub(crate) keyframe_tx: std::sync::mpsc::Sender<()>,
     /// LTR-RFI: the encode loop prefers `invalidate_ref_frames` over a full IDR when it can.
     pub(crate) rfi_tx: std::sync::mpsc::Sender<(u32, u32)>,
@@ -92,6 +101,8 @@ pub(crate) struct ControlEnds {
 /// The stream thread's halves.
 pub(crate) struct StreamEnds {
     pub(crate) reconfig: std::sync::mpsc::Receiver<punktfunk_core::Mode>,
+    pub(crate) format_rx: std::sync::mpsc::Receiver<crate::encode::Codec>,
+    pub(crate) format_result_tx: tokio::sync::mpsc::UnboundedSender<FormatOutcome>,
     pub(crate) keyframe: std::sync::mpsc::Receiver<()>,
     /// Lost-frame range `(first, last)`.
     pub(crate) rfi: std::sync::mpsc::Receiver<(u32, u32)>,
@@ -139,6 +150,8 @@ impl SessionWiring {
         ports: crate::send_pacing::Ports,
     ) -> SessionWiring {
         let (reconfig_tx, reconfig) = std::sync::mpsc::channel();
+        let (format_tx, format_rx) = std::sync::mpsc::channel();
+        let (format_result_tx, format_result_rx) = tokio::sync::mpsc::unbounded_channel();
         let (keyframe_tx, keyframe) = std::sync::mpsc::channel();
         let (rfi_tx, rfi) = std::sync::mpsc::channel();
         let (bitrate_tx, bitrate_rx) = std::sync::mpsc::channel();
@@ -159,6 +172,8 @@ impl SessionWiring {
         SessionWiring {
             control: ControlEnds {
                 reconfig_tx,
+                format_tx,
+                format_result_rx,
                 keyframe_tx,
                 rfi_tx,
                 bitrate_tx,
@@ -173,6 +188,8 @@ impl SessionWiring {
             },
             stream: StreamEnds {
                 reconfig,
+                format_rx,
+                format_result_tx,
                 keyframe,
                 rfi,
                 bitrate_rx,

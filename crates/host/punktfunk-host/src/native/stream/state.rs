@@ -251,6 +251,39 @@ pub(super) struct StreamState {
         tokio::sync::mpsc::UnboundedSender<crate::native::wiring::Delivered>,
     pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
     pub(super) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    /// A codec ask the control task vetted, and where its outcome goes.
+    pub(super) format_rx: std::sync::mpsc::Receiver<crate::encode::Codec>,
+    pub(super) format_result_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::native::wiring::FormatOutcome>,
+    /// What the handshake's depth, HDR and chroma rule read, for a codec change to re-run it.
+    pub(super) format_facts: super::super::handshake::FormatFacts,
+}
+
+/// The video format `plan` encodes at `bit_depth`, as a `StreamConfig` names it.
+pub(super) fn format_of(
+    plan: &crate::session_plan::SessionPlan,
+    bit_depth: u8,
+) -> punktfunk_core::quic::VideoFormat {
+    video_format(plan.codec, bit_depth, plan.hdr, plan.chroma)
+}
+
+/// The colour is the HDR verdict, not the depth: 10-bit SDR is BT.709.
+pub(in crate::native) fn video_format(
+    codec: crate::encode::Codec,
+    bit_depth: u8,
+    hdr: bool,
+    chroma: crate::encode::ChromaFormat,
+) -> punktfunk_core::quic::VideoFormat {
+    punktfunk_core::quic::VideoFormat {
+        codec: crate::encode::codec_to_wire(codec),
+        bit_depth,
+        color: if hdr {
+            punktfunk_core::quic::ColorInfo::HDR10_BT2020_PQ
+        } else {
+            punktfunk_core::quic::ColorInfo::SDR_BT709
+        },
+        chroma_format: crate::encode::chroma_idc(chroma),
+    }
 }
 
 impl StreamState {
@@ -339,6 +372,7 @@ impl StreamState {
             .reconfig_result_tx
             .send(crate::native::wiring::Delivered {
                 mode,
+                format: format_of(&self.plan, self.bit_depth),
                 epoch: self.epoch,
                 corrects,
             });
@@ -375,6 +409,8 @@ impl StreamState {
                     ends:
                         StreamEnds {
                             reconfig,
+                            format_rx,
+                            format_result_tx,
                             keyframe,
                             rfi,
                             bitrate_rx,
@@ -422,6 +458,7 @@ impl StreamState {
                 },
             compositor,
             gamescope_route,
+            format_facts,
             bitrate_auto,
             conn,
             cursor_forward,
@@ -625,6 +662,7 @@ impl StreamState {
             if actual != mode {
                 let _ = reconfig_result_tx.send(crate::native::wiring::Delivered {
                     mode: actual,
+                    format: format_of(&plan, bit_depth),
                     epoch: 0,
                     corrects: true,
                 });
@@ -773,6 +811,9 @@ impl StreamState {
             reconfig_result_tx,
             retarget_tx,
             gap_tx,
+            format_rx,
+            format_result_tx,
+            format_facts,
             send: super::send::SendThread::new(frame_tx, send_thread),
             send_spread_us,
             wire_rekeys,
@@ -932,6 +973,7 @@ impl StreamState {
         while !self.life.stopping() && std::time::Instant::now() < self.deadline {
             self.on_session_switch();
             self.on_mode_switch();
+            self.on_format_change();
             self.on_topology_reassert()?;
             self.on_fec_moved();
             self.on_bitrate_request();

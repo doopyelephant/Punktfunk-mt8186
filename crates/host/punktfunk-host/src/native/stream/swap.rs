@@ -1,13 +1,13 @@
 //! The one pipeline swap. A stream replaces its encoder, and often its capture with it, on a
 //! session switch, a mode switch, a topology re-assert, a capture loss, a source that changed
-//! size, and a bitrate the encoder cannot take in place. Each path builds the replacement and
-//! hands it to [`StreamState::swap_pipeline`] with its [`SwapReason`].
+//! size, a bitrate the encoder cannot take in place, and a codec ask. Each path builds the
+//! replacement and hands it to [`StreamState::swap_pipeline`] with its [`SwapReason`].
 //!
-//! The swap owns what restarts with an encoder: the stream epoch, the in-flight set, the
-//! watchdog, the IDR clock, the pipelined escalation, the encoder ceiling, the retarget state,
-//! `enc_src`, and the display lease the new pipeline replaced. What a reason leaves alone is a
-//! method of [`SwapReason`] and is decided nowhere else. A site keeps its mode, its rate and
-//! what it tells the client.
+//! The swap owns what restarts with an encoder: the stream epoch and telling the client of it,
+//! the in-flight set, the watchdog, the IDR clock, the pipelined escalation, the encoder
+//! ceiling, the retarget state, `enc_src`, and the display lease the new pipeline replaced. What
+//! a reason leaves alone is a method of [`SwapReason`] and is decided nowhere else. A site keeps
+//! its mode, its rate and any correction it owes the client.
 //!
 //! Pinned by `each_swap_restarts_what_its_reason_says`, one row per site.
 
@@ -29,6 +29,8 @@ pub(super) enum SwapReason {
     SourceMode,
     /// A rate the encoder cannot take in place.
     Bitrate,
+    /// The client's codec ask: another codec, and with it often another depth or colour.
+    Format,
 }
 
 impl SwapReason {
@@ -38,9 +40,13 @@ impl SwapReason {
         self != SwapReason::Bitrate
     }
 
-    /// The geometry is new whatever the frames say: the encoder's limits are unknown again.
-    fn new_geometry(self) -> bool {
-        matches!(self, SwapReason::ModeSwitch | SwapReason::SourceMode)
+    /// A new geometry or a new codec, whatever the frames say: the encoder's limits are
+    /// unknown again.
+    fn limits_unknown(self) -> bool {
+        matches!(
+            self,
+            SwapReason::ModeSwitch | SwapReason::SourceMode | SwapReason::Format
+        )
     }
 
     /// The new encoder has been handed no rate and no FEC ask: `on_fec_moved` asks again. A
@@ -64,7 +70,10 @@ impl SwapReason {
     /// not make to it too.
     fn rereads_enc_src(self) -> bool {
         match self {
-            SwapReason::ModeSwitch | SwapReason::TopologyReassert | SwapReason::SourceMode => true,
+            SwapReason::ModeSwitch
+            | SwapReason::TopologyReassert
+            | SwapReason::SourceMode
+            | SwapReason::Format => true,
             SwapReason::SessionSwitch | SwapReason::CaptureLost | SwapReason::Bitrate => false,
         }
     }
@@ -103,7 +112,7 @@ impl StreamState {
             Next::Encoder { resized, .. } => resized.as_ref().map(|(frame, _)| frame),
         };
         let source_moved = opens_on.is_some_and(|f| enc_src_of(f) != enc_src_of(&self.frame));
-        if source_moved || why.new_geometry() {
+        if source_moved || why.limits_unknown() {
             self.encoder_ceiling
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -139,6 +148,11 @@ impl StreamState {
         }
         // The new encoder opened on an IDR: the keyframe cooldown counts from it.
         self.clock.last_forced_idr = Some(std::time::Instant::now());
+        // Every epoch is told, before its first frame encodes; a site that corrects the mode
+        // tells again.
+        if why.moves_epoch() {
+            self.tell_delivered(self.delivered_mode(), false);
+        }
     }
 
     /// The capture side of a built pipeline, then its encoder. A new capturer numbers its
@@ -277,6 +291,8 @@ mod tests {
     /// order is drop order: the state goes before the runtime its connection lives on.
     struct Fake {
         st: StreamState,
+        /// What the swap told the control task.
+        told: tokio::sync::mpsc::UnboundedReceiver<crate::native::wiring::Delivered>,
         _client: quinn::Connection,
         _endpoints: (quinn::Endpoint, quinn::Endpoint),
         _rt: tokio::runtime::Runtime,
@@ -327,6 +343,7 @@ mod tests {
         let mut watchdog = crate::encode_recovery::EncoderWatchdog::new();
         watchdog.spend(INTERVAL);
         let (frame_tx, _) = std::sync::mpsc::sync_channel(1);
+        let (told_tx, told) = tokio::sync::mpsc::unbounded_channel();
         let st = StreamState {
             deadline: now + Duration::from_secs(60),
             next: now,
@@ -499,12 +516,21 @@ mod tests {
             rfi: std::sync::mpsc::channel().1,
             bitrate_rx: std::sync::mpsc::channel().1,
             session_rx: std::sync::mpsc::channel().1,
-            reconfig_result_tx: tokio::sync::mpsc::unbounded_channel().0,
+            reconfig_result_tx: told_tx,
             retarget_tx: tokio::sync::mpsc::unbounded_channel().0,
             gap_tx: tokio::sync::mpsc::unbounded_channel().0,
+            format_rx: std::sync::mpsc::channel().1,
+            format_result_tx: tokio::sync::mpsc::unbounded_channel().0,
+            format_facts: crate::native::handshake::FormatFacts {
+                video_caps: 0,
+                mode,
+                compositor: None,
+                gamescope_route: None,
+            },
         };
         Fake {
             st,
+            told,
             _client: client_conn,
             _endpoints: (server, client),
             _rt: rt,
@@ -518,6 +544,7 @@ mod tests {
         use crate::events::SessionEndReason;
         let Fake {
             st,
+            told: _,
             _client,
             _endpoints,
             _rt,
@@ -641,6 +668,17 @@ mod tests {
             retired: None,
         },
         Row {
+            site: "codec change",
+            why: SwapReason::Format,
+            next: || pipeline(SMALL),
+            source_moved_first: false,
+            epoch_moved: true,
+            ceiling_cleared: true,
+            retarget_forgotten: true,
+            enc_src_reread: true,
+            retired: Some(1),
+        },
+        Row {
             site: "bitrate",
             why: SwapReason::Bitrate,
             next: || encoder(None),
@@ -677,6 +715,16 @@ mod tests {
             );
             assert!(st.clock.last_forced_idr.is_some(), "{site}: IDR clock");
             assert_eq!(st.epoch != 7, row.epoch_moved, "{site}: epoch");
+            let mut tells = 0;
+            while let Ok(d) = session.told.try_recv() {
+                assert_eq!(d.epoch, st.epoch, "{site}: the epoch it tells");
+                tells += 1;
+            }
+            assert_eq!(
+                tells,
+                usize::from(row.epoch_moved),
+                "{site}: told once per epoch"
+            );
             let (_, ceiling) = st.encoder_ceiling.lock().unwrap().resolve(50_000);
             assert_eq!(
                 ceiling == AckReason::Granted,

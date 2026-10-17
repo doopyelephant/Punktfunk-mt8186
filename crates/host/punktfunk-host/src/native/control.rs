@@ -244,6 +244,13 @@ pub(super) struct Task {
     pub(super) anchored: bool,
     pub(super) codec: crate::encode::Codec,
     pub(super) live_reconfig_ok: bool,
+    /// The client's decodable codecs, its preference and what this source encodes: what a
+    /// codec ask picks among.
+    pub(super) client_codecs: u8,
+    pub(super) preferred_codec: u8,
+    pub(super) host_codecs: u8,
+    /// The client rebuilds its decoder on a format epoch, and this session owns its capture.
+    pub(super) format_change_ok: bool,
     pub(super) adaptive_fec: bool,
     pub(super) session_bitrate_kbps: u32,
     /// Automatic bitrate, so the shared-path governor may move this session. A
@@ -318,15 +325,16 @@ enum Tell {
     Correct(Reconfigured),
 }
 
-/// A config for an epoch or mode the client does not hold yet, else a correction when the
-/// client was told something else. `stream_config` is what the client holds.
+/// A config for an epoch, mode or format the client does not hold yet, else a correction when
+/// the client was told another mode. `stream_config` is what the client holds.
 fn tell(
     stream_config: &mut Option<v2msg::StreamConfig>,
     d: &super::wiring::Delivered,
 ) -> Option<Tell> {
     match stream_config {
-        Some(cfg) if (cfg.epoch, cfg.mode) != (d.epoch, d.mode) => {
+        Some(cfg) if (cfg.epoch, cfg.mode, cfg.format()) != (d.epoch, d.mode, d.format) => {
             (cfg.epoch, cfg.mode) = (d.epoch, d.mode);
+            cfg.set_format(d.format);
             Some(Tell::Config(*cfg))
         }
         Some(_) => None,
@@ -336,6 +344,26 @@ fn tell(
             exclude_codecs: 0,
         })),
     }
+}
+
+/// The codec a codec ask moves to: the client's preference among what it has left that this
+/// host encodes, never PyroWave, whose wire framing is another shape. `None` keeps the stream.
+fn next_codec(
+    current: crate::encode::Codec,
+    left: u8,
+    host: u8,
+    preferred: u8,
+) -> Option<crate::encode::Codec> {
+    if current == crate::encode::Codec::PyroWave {
+        return None;
+    }
+    // `resolve_codec` reads an empty set as an older client's HEVC; here it is nothing left.
+    let left = left & !punktfunk_core::quic::CODEC_PYROWAVE;
+    if left == 0 {
+        return None;
+    }
+    let bit = punktfunk_core::quic::resolve_codec(left, host, preferred)?;
+    Some(crate::encode::codec_from_wire(bit)).filter(|to| *to != current)
 }
 
 /// Ends when the control stream closes or a data-plane channel drops.
@@ -348,8 +376,12 @@ pub(super) async fn run(task: Task) {
         initial_mode,
         stream_config: initial_config,
         anchored,
-        codec,
+        mut codec,
         live_reconfig_ok,
+        client_codecs,
+        preferred_codec,
+        host_codecs,
+        format_change_ok,
         adaptive_fec,
         session_bitrate_kbps,
         bitrate_automatic,
@@ -364,6 +396,8 @@ pub(super) async fn run(task: Task) {
         ends:
             super::wiring::ControlEnds {
                 reconfig_tx,
+                format_tx,
+                mut format_result_rx,
                 keyframe_tx,
                 rfi_tx,
                 bitrate_tx,
@@ -459,6 +493,8 @@ pub(super) async fn run(task: Task) {
     // coalesces a resize drag; 500 ms is half the client's 1 s self-limit.
     const MIN_SWITCH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     let mut last_accepted_switch: Option<std::time::Instant> = None;
+    // Codecs this session's client asked off, and the ask the stream thread has not answered.
+    let (mut excluded, mut asked) = (0u8, 0u8);
     let mut probe_spacing = ProbeSpacing::default();
     // An RFI ask is a frame parity could not repair; the report that
     // closes the window carries only what parity did repair.
@@ -626,6 +662,36 @@ pub(super) async fn run(task: Task) {
                 let Ok((ty, body)) = frame else { break };
                 if let Some(ev) = v2msg::decode_input_event(ty, &body) {
                     offer_edge(ev, &session_grants, &input_tx, &counters, &mut denied).await;
+                } else if let Some(req) = v2msg::decode::<Reconfigure>(ty, &body)
+                    .ok()
+                    .filter(|r| r.exclude_codecs != 0)
+                {
+                    let to = (format_change_ok && asked == 0)
+                        .then(|| {
+                            excluded |= req.exclude_codecs;
+                            let left = client_codecs & !excluded;
+                            next_codec(codec, left, host_codecs, preferred_codec)
+                        })
+                        .flatten();
+                    match to {
+                        Some(to) if format_tx.send(to).is_ok() => {
+                            asked = req.exclude_codecs;
+                            tracing::info!(from = ?codec, ?to, "codec change accepted — rebuilding");
+                        }
+                        _ => {
+                            tracing::info!(?codec, excluded = req.exclude_codecs,
+                                "codec change refused (no other codec, PyroWave, a shared \
+                                 capture, or one already pending)");
+                            let ack = Reconfigured {
+                                accepted: false,
+                                mode: active,
+                                exclude_codecs: req.exclude_codecs,
+                            };
+                            if v2io::send(&mut ctrl_send, &ack).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                 } else if let Ok(req) = v2msg::decode::<Reconfigure>(ty, &body) {
                     let now = std::time::Instant::now();
                     // Same bound as the handshake: `> 0` alone acked a mode that cannot land.
@@ -992,11 +1058,24 @@ pub(super) async fn run(task: Task) {
             _ = link_tick.tick() => {
                 emit_link(&mut link, &counters, &fec_target, &live_bitrate, &stats, peer);
             }
+            outcome = format_result_rx.recv() => {
+                // A yes reached the client as the new epoch's config already.
+                let Some(outcome) = outcome else { break };
+                let ack = Reconfigured {
+                    accepted: outcome.is_some(),
+                    mode: active,
+                    exclude_codecs: std::mem::take(&mut asked),
+                };
+                if v2io::send(&mut ctrl_send, &ack).await.is_err() {
+                    break;
+                }
+            }
             delivered = reconfig_result_rx.recv() => {
-                // Keep `active` truthful for later rejection echoes, and an
-                // Automatic PyroWave session's bounds on the mode it encodes.
+                // Keep `active` truthful for later rejection echoes, an Automatic PyroWave
+                // session's bounds on the mode it encodes, and the codec a mode is checked for.
                 let Some(d) = delivered else { break };
                 active = d.mode;
+                codec = crate::encode::codec_from_wire(d.format.codec);
                 if pyrowave_pin.automatic {
                     (pyrowave_pin.floor, pyrowave_pin.kbps) = pyrowave_bounds(&d.mode);
                 }
@@ -1197,6 +1276,7 @@ mod tests {
         };
         let d = |epoch, width, corrects| Delivered {
             mode: mode(width),
+            format: Default::default(),
             epoch,
             corrects,
         };
@@ -1205,6 +1285,7 @@ mod tests {
             mode: mode(1280),
             ..Default::default()
         });
+        held.as_mut().unwrap().set_format(Default::default());
         assert_eq!(tell(&mut held, &d(0, 1280, true)), None, "a failed rebuild");
         let Some(Tell::Config(cfg)) = tell(&mut held, &d(1, 1920, false)) else {
             panic!("a new epoch is configured")
@@ -1222,6 +1303,71 @@ mod tests {
                 exclude_codecs: 0,
             }))
         );
+    }
+
+    /// A format change is told even at the same epoch and mode; the same format twice is not.
+    #[test]
+    fn a_new_format_is_a_config() {
+        use super::super::wiring::Delivered;
+        use punktfunk_core::quic::{VideoFormat, CODEC_H264, CODEC_HEVC};
+        let d = |codec| Delivered {
+            mode: Default::default(),
+            format: VideoFormat {
+                codec,
+                ..VideoFormat::default()
+            },
+            epoch: 3,
+            corrects: false,
+        };
+        let mut held = Some(v2msg::StreamConfig {
+            epoch: 3,
+            codec: CODEC_HEVC,
+            ..Default::default()
+        });
+        let Some(Tell::Config(cfg)) = tell(&mut held, &d(CODEC_H264)) else {
+            panic!("a new format is configured")
+        };
+        assert_eq!(cfg.codec, CODEC_H264);
+        assert_eq!(tell(&mut held, &d(CODEC_H264)), None, "already held");
+    }
+
+    /// A codec ask takes the client's preference among what it has left, never PyroWave, and
+    /// never off PyroWave.
+    #[test]
+    fn a_codec_ask_moves_to_the_preferred_codec_left() {
+        use crate::encode::Codec;
+        use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
+        let all = CODEC_H264 | CODEC_HEVC | CODEC_AV1 | CODEC_PYROWAVE;
+        let left = CODEC_H264 | CODEC_HEVC | CODEC_PYROWAVE;
+        assert_eq!(
+            next_codec(Codec::Av1, left, all, CODEC_HEVC),
+            Some(Codec::H265)
+        );
+        assert_eq!(
+            next_codec(Codec::Av1, left, all, CODEC_PYROWAVE),
+            Some(Codec::H265),
+            "a PyroWave preference is skipped"
+        );
+        assert_eq!(
+            next_codec(Codec::H265, CODEC_H264, all, 0),
+            Some(Codec::H264)
+        );
+        assert_eq!(
+            next_codec(Codec::H264, CODEC_H264, all, 0),
+            None,
+            "nothing new left"
+        );
+        assert_eq!(
+            next_codec(Codec::H264, 0, all, 0),
+            None,
+            "nothing left at all"
+        );
+        assert_eq!(
+            next_codec(Codec::H265, CODEC_AV1, CODEC_H264, 0),
+            None,
+            "host can't"
+        );
+        assert_eq!(next_codec(Codec::PyroWave, CODEC_H264, all, 0), None);
     }
 
     const ON: ClipControl = ClipControl {

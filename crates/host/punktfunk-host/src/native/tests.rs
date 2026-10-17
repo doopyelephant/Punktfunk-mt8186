@@ -693,6 +693,46 @@ fn the_stream_config_carries_the_hosts_link_facts() {
     host.join().unwrap().unwrap();
 }
 
+/// A client that rebuilds its decoder asks off its codec; the host answers with a new epoch and
+/// the first frame of it carries the new codec. With nothing left to move to, the ask is refused
+/// and the stream stays.
+#[test]
+fn a_codec_ask_moves_the_stream_to_another_codec_on_a_new_epoch() {
+    use punktfunk_core::quic::{CODEC_H264, CODEC_HEVC};
+    let _registry = crate::session_status::tests::registry_lock();
+    let _serial = SESSION_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let (client, host) = synthetic_session(19789, Punktfunk1Source::Synthetic, |p| {
+        punktfunk_core::client::ConnectParams {
+            video_codecs: CODEC_H264 | CODEC_HEVC,
+            rebuilds_decoder: true,
+            ..p
+        }
+    });
+    let first = client.video_format().codec;
+    client
+        .request_codec_change(first)
+        .expect("format epochs are in force");
+    let moved = (0..240)
+        .find_map(|_| {
+            client
+                .next_frame(std::time::Duration::from_secs(2))
+                .ok()
+                .and_then(|f| f.new_format)
+        })
+        .expect("a frame in the new format");
+    assert_ne!(moved.codec, first);
+    assert_eq!(client.video_format(), moved);
+
+    client.request_codec_change(moved.codec).unwrap();
+    assert!(
+        wait_for(|| client.codec_refused() == moved.codec),
+        "no codec is left to move to"
+    );
+    assert_eq!(client.video_format(), moved);
+    drop(client);
+    host.join().unwrap().unwrap();
+}
+
 /// A keyframe ask leaves as a feedback datagram and the host answers it: the synthetic
 /// source's IDR is ten ordinary frames.
 #[test]
