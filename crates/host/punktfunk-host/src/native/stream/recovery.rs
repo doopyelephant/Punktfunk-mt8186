@@ -250,6 +250,11 @@ impl StreamState {
                 .capture_health
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = self.capturer.health();
+            // A client that roamed shares a path with whoever is at its new address now.
+            crate::session_status::refresh_peer(
+                self.live_session.id,
+                self.conn.remote_address().ip(),
+            );
         }
         if let Some(outage) = self.capturer.take_recovered_outage() {
             let outage_ms = outage.as_millis().min(u32::MAX as u128) as u32;
