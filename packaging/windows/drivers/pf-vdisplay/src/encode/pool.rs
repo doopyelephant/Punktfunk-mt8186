@@ -340,9 +340,10 @@ impl Pool {
                 }
                 None => return self.drop_one(),
             };
-            // Keep a clean plate whenever the blend could turn on: a flip over a still desktop
-            // has no other picture to draw the pointer onto.
-            let plate = self.cursor.blends() || self.cursor.armed();
+            // Only a blend needs the plate here: a flip over a still desktop re-blends the
+            // stash, which `retain` plates while armed, and one over a moving desktop draws the
+            // pointer on its next compose. A plate on every composed frame cost a full copy.
+            let plate = self.cursor.blends();
             let passed =
                 bridge::<d3d::ID3D11Texture2D>(tex).and_then(|src| st.targets.pass(&src, i, plate));
             if passed.is_err() {
