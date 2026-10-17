@@ -38,6 +38,13 @@ impl Shell {
         let estimated = self.presenter.glass_estimated();
         let grid_known = self.presenter.present_timing_active() && !estimated;
         let mut to_present = st.pick(now_ns, grid_known);
+        // The latch the pick aimed this frame at (0: due-time or arrival presents).
+        let target_ns =
+            if to_present.is_some() && st.store.is_smoothing() && !st.pacer.free_running() {
+                st.slots.last_target_ns()
+            } else {
+                0
+            };
         // FIFO glass budget: one undisplayed present in flight, so the swapchain's
         // own FIFO can never become a standing queue. Only FIFO modes queue. The
         // estimate counts only while the panel runs at its mode rate, where that queue
@@ -93,6 +100,10 @@ impl Shell {
                     self.presenter.note_presented(pts_ns, decoded_ns);
                     st.gate.note_present(now_ns);
                     st.win.out_max = st.win.out_max.max(self.presenter.presents_outstanding());
+                    st.aimed.push_back((pts_ns, target_ns));
+                    while st.aimed.len() > 16 {
+                        st.aimed.pop_front();
+                    }
                 } else {
                     st.note_submitted(pts_ns, decoded_ns);
                 }
@@ -152,6 +163,17 @@ impl Shell {
             replaced,
             self.stats_verbosity,
         );
+        // Submit → our GPU done (latch) and GPU done → glass (floor), p50 and the window's
+        // worst: a hold after the present call lands in one of the two.
+        let ms = |us: u32| us as f32 / 1000.0;
+        let (latch_max_ms, floor_ms, floor_max_ms) =
+            st.last_snap.as_ref().map_or((0.0, 0.0, 0.0), |s| {
+                (
+                    ms(s.latch.max_us),
+                    ms(s.os_floor.p50_us),
+                    ms(s.os_floor.max_us),
+                )
+            });
         st.win.start = Instant::now();
         if st.store.is_smoothing() && st.slots.widen(st.win.misses) {
             tracing::info!(
@@ -159,6 +181,9 @@ impl Shell {
                 misses = st.win.misses,
                 "smoothness slot margin widened (measured latch misses)"
             );
+        }
+        if st.store.is_smoothing() {
+            st.slots.note_window(st.win.misses, st.win.early);
         }
         // The 1 Hz presenter line, always: the field bundle's only record of where a
         // frame went after decode and how evenly the glass stepped.
@@ -202,12 +227,17 @@ impl Shell {
                 gated,
                 forced,
                 misses = st.win.misses,
+                // Frames shown before the latch they were aimed at: the lead is long.
+                early = st.win.early,
                 out_max = st.win.out_max,
                 steps = ?st.win.steps,
                 busy = ?st.win.busy,
                 judder,
                 pace_ms,
                 latch_ms,
+                latch_max_ms,
+                floor_ms,
+                floor_max_ms,
                 import_us = import.p50_us,
                 submit_us = submit.p50_us,
                 submit_max_us = submit.max_us,
@@ -220,11 +250,14 @@ impl Shell {
                 // The output's own vblank spacing where a waiter measures it; 0 elsewhere.
                 refresh_us = self.presenter.measured_refresh_ns().unwrap_or(0) / 1000,
                 margin_us = st.slots.margin_ns() / 1000,
+                // Submit lead ahead of the aimed latch (smoothing on a grid).
+                lead_us = st.slots.lead_ns(st.clock.period_ns()) / 1000,
                 // Cadence loop's current hold and the jitter it is sized from,
                 // plus frames whose due time had already passed when they arrived.
                 // Cumulative/instantaneous, not window sums like the counters above.
                 cushion_us = cadence_health.cushion_ns / 1000,
                 jitter_us = cadence_health.jitter_ns / 1000,
+                tail_us = cadence_health.tail_ns / 1000,
                 late = cadence_health.late,
                 "presenter window"
             );
@@ -266,14 +299,34 @@ impl StreamState {
                     s.displayed_ns,
                 );
             }
-            // Latch miss: glass later than one panel period past submit plus
-            // the lead we already applied. Store evictions happen whenever
-            // the stream out-runs the panel and say nothing about the latch.
-            if self.store.is_smoothing()
-                && s.displayed_ns.saturating_sub(s.submitted_ns) > period + self.slots.margin_ns()
-            {
-                self.win.misses += 1;
+            // Latch miss: the frame landed past the slot it was aimed at (half a period
+            // of stamp slack). Without an aim, past one period plus the lead from submit.
+            // Store evictions happen whenever the stream out-runs the panel and say
+            // nothing about the latch.
+            let target_ns = self
+                .aimed
+                .iter()
+                .position(|&(pts, _)| pts == s.pts_ns)
+                .and_then(|i| self.aimed.remove(i))
+                .map_or(0, |(_, t)| t);
+            if self.store.is_smoothing() {
+                let missed = if target_ns > 0 {
+                    s.displayed_ns > target_ns + period / 2
+                } else {
+                    s.displayed_ns.saturating_sub(s.submitted_ns) > period + self.slots.margin_ns()
+                };
+                self.win.misses += u32::from(missed);
+                // Landed before its aim: the lead is longer than this compositor needs.
+                self.win.early +=
+                    u32::from(target_ns > 0 && s.displayed_ns + period / 2 < target_ns);
             }
+            tracing::trace!(
+                pts_ns = s.pts_ns,
+                displayed_ns = s.displayed_ns,
+                target_ns,
+                submitted_ns = s.submitted_ns,
+                "frame glass"
+            );
             if self.last_displayed_ns != 0 && period > 0 {
                 let steps =
                     (s.displayed_ns.saturating_sub(self.last_displayed_ns) + period / 2) / period;
@@ -354,6 +407,8 @@ impl StreamState {
     /// One frame out: latency takes the newest whenever the glass gate allows;
     /// smoothness serves the frame whose due time has come. `grid_known`: on-glass
     /// stamps feed the latch clock; without them the due time itself is the target.
+    /// A paced intent on a grid (smoothing, or latency when asked) aims each frame's
+    /// due time at a latch slot, one frame per slot.
     pub(super) fn pick(&mut self, now_ns: u64, grid_known: bool) -> Option<Paced> {
         self.pacer.follow(
             self.cadence.verdict(),
@@ -361,21 +416,20 @@ impl StreamState {
             self.store.is_smoothing(),
         );
         self.store.set_paced(self.pacer.paces_latency());
-        if self.store.is_smoothing() {
-            if self.pacer.free_running() {
-                // Variable refresh, measured: the panel refreshes when we present, so
-                // there is no grid to aim at and the due time is the target.
-                self.store.take(|p| p.due_ns <= now_ns as i64)
-            } else {
-                let (clock, store) = (&self.clock, &mut self.store);
-                self.slots.pick(
-                    now_ns,
-                    |after| clock.next_slot_after(after),
-                    |slot| store.take(|p| p.due_ns < slot as i64),
-                )
-            }
+        let paced = self.store.is_smoothing() || self.pacer.paces_latency();
+        if paced && !self.pacer.free_running() {
+            let (clock, store) = (&self.clock, &mut self.store);
+            let front_due = store.front().map(|p| p.due_ns.max(0) as u64);
+            self.slots.pick(
+                now_ns,
+                clock.period_ns(),
+                front_due,
+                |after| clock.next_slot_after(after),
+                || store.take(|_| true),
+            )
         } else {
-            // Arrival-driven; a paced store (measured VRR) holds the newest for its due time.
+            // Due-time presents (measured VRR: the panel refreshes when we present, so
+            // there is no grid to aim at); arrival-driven when nothing paces.
             self.store.take(|p| p.due_ns <= now_ns as i64)
         }
     }
@@ -576,6 +630,8 @@ pub(super) struct PresentWindow {
     /// This window's latch misses (glass later than one panel period past submit plus
     /// the applied lead). Adaptive margin's error signal.
     misses: u32,
+    /// This window's frames shown before the latch they were aimed at.
+    early: u32,
     out_max: usize,
     /// Consecutive on-glass spacings this window, in whole panel periods: `[0, 1, 2, 3, 4, 5+]`.
     /// The mode is the expected step; everything else is judder.
@@ -605,6 +661,7 @@ impl PresentWindow {
             present_us: Vec::with_capacity(256),
             start: Instant::now(),
             misses: 0,
+            early: 0,
             out_max: 0,
             steps: [0; 6],
             busy: [0; 2],
@@ -645,6 +702,7 @@ impl PresentWindow {
 
     fn reset_counts(&mut self) {
         self.misses = 0;
+        self.early = 0;
         self.out_max = 0;
         self.steps = [0; 6];
         self.busy = [0; 2];
@@ -801,18 +859,9 @@ impl StreamState {
         let Some(p) = self.store.front() else {
             return TICK;
         };
-        // Free-running presents at the due time. Snapping presents once the aimed slot
-        // is the next one still reachable (one period minus submit lead). Before the
-        // first on-glass stamp there is no grid; `next_slot_after` answers "one period
-        // from now" — mirror that or opening frames wait a refresh they never owed.
-        let lead_ns = self.clock.period_ns() as i64 + self.slots.margin_ns() as i64;
-        let wake_ns = if self.pacer.free_running() {
-            p.due_ns
-        } else if self.clock.anchor_ns() == 0 {
-            p.due_ns - lead_ns
-        } else {
-            self.clock.next_slot_after(p.due_ns.max(0) as u64) as i64 - lead_ns
-        };
+        // A paced frame goes out at its due time, free-running or snapping alike: the
+        // snap decides which latch it is aimed at, never an earlier present.
+        let wake_ns = p.due_ns;
         // Short waits sleep in slices ([`wait_event`](super::wait_event)), so the floor is
         // what a due time may slip by.
         const FLOOR: Duration = Duration::from_micros(200);

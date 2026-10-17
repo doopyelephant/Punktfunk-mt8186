@@ -1,20 +1,32 @@
-//! The smoothness drain's slot pick: one present per panel latch slot, aimed a margin
-//! ahead of now. Pure; `StreamState::pick` hands it the latch clock and the frame store.
-//! The margin starts at 0, since a fixed lead is display tax, and widens one step per
-//! window whose measured latch misses demand it.
+//! The paced drain's slot pick: a frame goes out at its due time, never before, aimed at
+//! the first latch its compositor can still make — one frame per slot. Pure;
+//! `StreamState::pick` hands it the latch clock and the frame store.
+//!
+//! The lead is what the compositor needs between a present and the latch it lands on.
+//! It starts at a whole period plus a margin and learns: a frame that lands past its aim
+//! lengthens it, a window of frames landing before their aim shortens it. The aim is
+//! bookkeeping for the ledger and the learner; the present instant stays the due time.
 //!
 //! Pinned by the table test below.
 
-/// Slot-pick margin: 0.5 ms step, 2.5 ms cap.
+/// Slot-pick margin: 0.5 ms step, 8 ms cap (KWin on NVIDIA wants a period and a half).
 pub(crate) const MARGIN_STEP_NS: u64 = 500_000;
-pub(crate) const MARGIN_MAX_NS: u64 = 2_500_000;
+pub(crate) const MARGIN_MAX_NS: u64 = 8_000_000;
+
+/// Learned lead: a window of early landings shortens it by this much; a slip gives four
+/// steps back. The lead never drops under [`LEAD_MIN_NS`].
+const SHRINK_STEP_NS: u64 = 250_000;
+/// 2 ms: our own submit plus a fast compositor's latch.
+const LEAD_MIN_NS: u64 = 2_000_000;
 
 #[derive(Default)]
 pub(crate) struct SlotPick {
-    /// Submit lead the next reachable slot is reckoned from.
+    /// Lead past the whole period, widened by missed slots.
     margin_ns: u64,
     /// The latch slot the last vended frame was aimed at.
     last_slot_ns: u64,
+    /// How much under a whole period the lead runs, earned by early landings.
+    shrink_ns: u64,
 }
 
 impl SlotPick {
@@ -22,24 +34,49 @@ impl SlotPick {
         self.margin_ns
     }
 
-    /// The frame for the first latch still reachable from `now_ns`. `slot_after` is the
-    /// latch clock's first slot after a time; `take` vends the store's frame due before a
-    /// slot. A frame due before that slot cannot be shown sooner by waiting; one due after
-    /// it would land a slot early. Two frames due before one slot would go back to back,
-    /// and MAILBOX would show one for nothing while the next slot went empty.
+    /// The latch the last vended frame was aimed at; 0 before the first.
+    pub(crate) fn last_target_ns(&self) -> u64 {
+        self.last_slot_ns
+    }
+
+    /// What the compositor needs between a present and the latch it lands on.
+    pub(crate) fn lead_ns(&self, period_ns: u64) -> u64 {
+        period_ns - self.shrink_ns.min(period_ns.saturating_sub(LEAD_MIN_NS)) + self.margin_ns
+    }
+
+    /// The latch a frame presented at `due_ns` lands on: the first at least a lead after
+    /// it, or the slot after the last vended one — two frames never share a slot.
+    fn target_ns(&self, due_ns: u64, period_ns: u64, slot_after: impl FnOnce(u64) -> u64) -> u64 {
+        let t = slot_after(
+            due_ns
+                .saturating_add(self.lead_ns(period_ns))
+                .saturating_sub(1),
+        );
+        if t <= self.last_slot_ns {
+            self.last_slot_ns + period_ns
+        } else {
+            t
+        }
+    }
+
+    /// Vend the front frame (due at `front_due_ns`) at its due time. `slot_after` is the
+    /// latch clock's first slot after a time; `take` pops the store.
     pub(crate) fn pick<T>(
         &mut self,
         now_ns: u64,
+        period_ns: u64,
+        front_due_ns: Option<u64>,
         slot_after: impl FnOnce(u64) -> u64,
-        take: impl FnOnce(u64) -> Option<T>,
+        take: impl FnOnce() -> Option<T>,
     ) -> Option<T> {
-        let slot = slot_after(now_ns.saturating_add(self.margin_ns));
-        if slot == self.last_slot_ns {
+        let due = front_due_ns?;
+        if now_ns < due {
             return None;
         }
-        let taken = take(slot);
+        let target = self.target_ns(due, period_ns, slot_after);
+        let taken = take();
         if taken.is_some() {
-            self.last_slot_ns = slot;
+            self.last_slot_ns = target;
         }
         taken
     }
@@ -54,9 +91,30 @@ impl SlotPick {
         true
     }
 
-    /// A new panel: the margin was sized by the old one's misses.
+    /// A window closed: `misses` frames landed past their aimed latch, `early` before it.
+    /// Whichever side dominates moves the lead its way: four steps longer, one step
+    /// shorter. A window split between the two says the aim sits on a latch and the
+    /// stamps straddle it; nothing moves.
+    pub(crate) fn note_window(&mut self, misses: u32, early: u32) {
+        if misses > early.saturating_mul(2) {
+            if self.shrink_ns > 0 {
+                self.shrink_ns = self.shrink_ns.saturating_sub(4 * SHRINK_STEP_NS);
+            } else {
+                self.margin_ns = (self.margin_ns + MARGIN_STEP_NS).min(MARGIN_MAX_NS);
+            }
+        } else if early > misses.saturating_mul(2) {
+            if self.margin_ns > 0 {
+                self.margin_ns = self.margin_ns.saturating_sub(MARGIN_STEP_NS);
+            } else {
+                self.shrink_ns += SHRINK_STEP_NS;
+            }
+        }
+    }
+
+    /// A new panel: the lead was sized by the old one's compositor.
     pub(crate) fn reset_margin(&mut self) {
         self.margin_ns = 0;
+        self.shrink_ns = 0;
     }
 }
 
@@ -73,58 +131,89 @@ mod tests {
         (t / PERIOD + 1) * PERIOD
     }
 
-    /// (case, widen steps, frames' due times in ms, picks as (now ms, vended due ms))
-    type Row = (
-        &'static str,
-        u32,
-        &'static [u64],
-        &'static [(u64, Option<u64>)],
-    );
-
+    /// A frame is never presented before its due time, whatever the grid says.
     #[test]
-    fn one_present_per_latch_slot() {
-        let table: &[Row] = &[
-            (
-                "b5917027b: a second frame due before the same slot waits for the next",
-                0,
-                &[1, 2],
-                &[(0, Some(1)), (1, None), (9, None), (10, Some(2))],
-            ),
-            (
-                "an empty take leaves the slot open",
-                0,
-                &[15],
-                &[(0, None), (5, None), (10, Some(15))],
-            ),
-            (
-                "the margin aims at the slot after the submit lead",
-                5,
-                &[12],
-                &[(8, Some(12))],
-            ),
-            (
-                "no margin: that frame waits a slot",
-                0,
-                &[12],
-                &[(8, None), (10, Some(12))],
-            ),
-        ];
-        for &(case, steps, due, picks) in table {
-            let mut s = SlotPick::default();
-            for _ in 0..steps {
-                s.widen(3);
-            }
-            let mut store: VecDeque<u64> = due.iter().map(|d| d * MS).collect();
-            for &(now, want) in picks {
-                let got = s.pick(now * MS, slot_after, |slot| {
-                    store
-                        .front()
-                        .is_some_and(|&d| d < slot)
-                        .then(|| store.pop_front())?
-                });
-                assert_eq!(got, want.map(|d| d * MS), "{case}: pick at {now} ms");
-            }
+    fn a_frame_goes_out_at_its_due_time_never_before() {
+        let mut s = SlotPick::default();
+        let mut store: VecDeque<u64> = [12 * MS, 29 * MS].into();
+        // (now ms, vended due ms)
+        for (now, want) in [
+            (0, None),
+            (11, None),
+            (12, Some(12)),
+            (20, None),
+            (29, Some(29)),
+        ] {
+            let front = store.front().copied();
+            let got = s.pick(now * MS, PERIOD, front, slot_after, || store.pop_front());
+            assert_eq!(got, want.map(|d: u64| d * MS), "pick at {now} ms");
         }
+    }
+
+    /// The aim is the first latch at least a lead after the due time, and two frames
+    /// never share one: the second aims a slot later.
+    #[test]
+    fn the_aim_is_the_first_latch_a_lead_after_due_one_per_slot() {
+        let mut s = SlotPick::default();
+        assert_eq!(s.lead_ns(PERIOD), PERIOD, "a whole period to start with");
+        let mut store: VecDeque<u64> = [12 * MS, 13 * MS, 41 * MS].into();
+        s.pick(12 * MS, PERIOD, store.front().copied(), slot_after, || {
+            store.pop_front()
+        });
+        assert_eq!(
+            s.last_target_ns(),
+            30 * MS,
+            "due 12 + lead 10 = 22 → the latch at 30"
+        );
+        s.pick(13 * MS, PERIOD, store.front().copied(), slot_after, || {
+            store.pop_front()
+        });
+        assert_eq!(
+            s.last_target_ns(),
+            40 * MS,
+            "the slot after the one just taken"
+        );
+        s.pick(41 * MS, PERIOD, store.front().copied(), slot_after, || {
+            store.pop_front()
+        });
+        assert_eq!(
+            s.last_target_ns(),
+            60 * MS,
+            "due 41 + 10 = 51 → 60; exactly on a latch counts"
+        );
+    }
+
+    /// Early landings shorten the lead a step per window down to half a period; one
+    /// slip gives four steps back; missed slots widen the margin past the period.
+    #[test]
+    fn the_lead_learns_from_where_frames_land() {
+        let mut s = SlotPick::default();
+        for _ in 0..8 {
+            s.note_window(0, 3);
+        }
+        assert_eq!(s.lead_ns(PERIOD), 8 * MS);
+        s.note_window(1, 0);
+        assert_eq!(s.lead_ns(PERIOD), 9 * MS, "a slip costs 1 ms");
+        for _ in 0..40 {
+            s.note_window(0, 1);
+        }
+        assert_eq!(s.lead_ns(PERIOD), LEAD_MIN_NS, "never under the floor");
+        s.note_window(0, 0);
+        assert_eq!(
+            s.lead_ns(PERIOD),
+            LEAD_MIN_NS,
+            "a window with no evidence changes nothing"
+        );
+        s.reset_margin();
+        assert_eq!(s.lead_ns(PERIOD), PERIOD);
+        for _ in 0..20 {
+            s.widen(3);
+        }
+        assert_eq!(
+            s.lead_ns(PERIOD),
+            PERIOD + MARGIN_MAX_NS,
+            "misses widen up to the cap"
+        );
     }
 
     #[test]
@@ -137,14 +226,17 @@ mod tests {
             (3, true, 500),
             (9, true, 1_000),
             (3, true, 1_500),
-            (3, true, 2_000),
-            (3, true, 2_500),
-            (40, false, 2_500),
+            (40, true, 2_000),
         ];
         for &(misses, widened, margin_us) in table {
             assert_eq!(s.widen(misses), widened, "{misses} misses");
             assert_eq!(s.margin_ns(), margin_us * 1000, "{misses} misses");
         }
+        for _ in 0..20 {
+            s.widen(3);
+        }
+        assert_eq!(s.margin_ns(), MARGIN_MAX_NS);
+        assert!(!s.widen(3), "capped");
         s.reset_margin();
         assert_eq!(s.margin_ns(), 0);
     }

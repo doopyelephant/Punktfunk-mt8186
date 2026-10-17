@@ -405,6 +405,8 @@ struct StreamState {
     mode_period_ns: u64,
     /// Smoothing: one present per latch slot, aimed a measured margin ahead.
     slots: crate::slot_pick::SlotPick,
+    /// `(pts, aimed latch)` of presents awaiting their glass stamp; 0 = not slot-aimed.
+    aimed: std::collections::VecDeque<(u64, u64)>,
     /// What the held frame waits on. The fence paces the loop itself (the presenter waits
     /// it for a millisecond per pass), so the pass turns straight around and drains the
     /// channel first: a newer frame replaces the held one instead of queuing behind it.
