@@ -206,6 +206,19 @@ impl PunktfunkEndReason {
     pub fn is_normal(self) -> bool {
         !matches!(self, Self::HostError | Self::Lost)
     }
+
+    /// How long to wait before redial `attempt` (0-based) of a session that ended this way;
+    /// `None` once the schedule is spent, and for every ending but [`Self::Lost`]: a host
+    /// that closed the session meant it. Every shell redials on this one schedule.
+    pub fn redial_delay(self, attempt: u32) -> Option<Duration> {
+        const SCHEDULE_S: [u64; 5] = [0, 1, 2, 4, 8];
+        if self != Self::Lost {
+            return None;
+        }
+        SCHEDULE_S
+            .get(attempt as usize)
+            .map(|&s| Duration::from_secs(s))
+    }
 }
 
 #[cfg(feature = "quic")]
@@ -1930,6 +1943,31 @@ fn expires_in_secs(deadline_unix: Option<u64>, now_unix: u64) -> u32 {
             .unwrap_or(u32::MAX)
             .max(1)
     })
+}
+
+#[cfg(test)]
+mod redial_tests {
+    use super::PunktfunkEndReason;
+
+    /// Only a lost connection redials, five times, with the waits growing.
+    #[test]
+    fn only_a_lost_session_redials() {
+        let lost = PunktfunkEndReason::Lost;
+        let waits: Vec<u64> = (0..)
+            .map_while(|a| lost.redial_delay(a))
+            .map(|d| d.as_secs())
+            .collect();
+        assert_eq!(waits, [0, 1, 2, 4, 8]);
+        for other in [
+            PunktfunkEndReason::None,
+            PunktfunkEndReason::Local,
+            PunktfunkEndReason::GameExited,
+            PunktfunkEndReason::HostEnded,
+            PunktfunkEndReason::HostError,
+        ] {
+            assert_eq!(other.redial_delay(0), None);
+        }
+    }
 }
 
 #[cfg(test)]

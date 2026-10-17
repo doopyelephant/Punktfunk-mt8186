@@ -840,6 +840,8 @@ struct ContentView: View {
     /// during the delegated-approval wait (that has its own "Waiting for approval" prompt, so the
     /// takeover must not stack over it) and, of course, when idle or streaming.
     private var connectingOverlayName: String? {
+        // A lost session waiting out its redial keeps the takeover between its dials.
+        if model.phase == .idle, let redial = model.redial { return redial.host.displayName }
         // A launch dial has the launch hold instead — that says which GAME is coming, and stacking
         // "Connecting to <host>" on top of it would be two takeovers for one act.
         guard awaitingApproval == nil, model.launchHold == nil,

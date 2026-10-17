@@ -45,6 +45,7 @@ object SessionFactory {
         preset: StreamPreset?,
         store: KnownHostStore,
         mgmtPort: Int,
+        redial: DialSpec? = null,
     ): ActiveSession {
         if (record != null) store.learnMgmtPort(record, mgmtPort)
         return ActiveSession(
@@ -53,6 +54,7 @@ object SessionFactory {
             clipboardSync = record?.clipboardSync ?: false,
             presetName = preset?.name,
             hostId = record?.id,
+            redial = redial,
         )
     }
 

@@ -2740,6 +2740,13 @@ PunktfunkStatus punktfunk_connection_end_reason(PunktfunkConnection *c, uint8_t 
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
+// Milliseconds to wait before redial `attempt` (0-based) of a session that ended with
+// `end_reason` (`PUNKTFUNK_END_REASON_*`); `-1` means stay ended. Only `LOST` redials, on
+// one schedule every client shares. The redial reuses the dial that started the session.
+int64_t punktfunk_redial_delay_ms(uint8_t end_reason, uint32_t attempt);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
 // Decode the next audio frame in-core to interleaved f32. Both planes share this
 // call; size the ring from [`punktfunk_connection_audio_sample_rate`]. Seq-gap
 // concealment is prepended in the same buffer. Quiet-wire droughts:

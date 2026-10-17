@@ -35,7 +35,7 @@ use pf_client_core::session::{self, DecodeFacts, SessionEvent, SessionHandle, Se
 use pf_client_core::trust::{MouseMode, PresentPriority, StatsVerbosity, TouchMode};
 use pf_client_core::video::VulkanDecodeDevice;
 use pf_client_core::video::{DecodeHealth, DecodedFrame, DecodedImage};
-use punktfunk_core::client::NativeClient;
+use punktfunk_core::client::{NativeClient, PunktfunkEndReason};
 use punktfunk_core::config::{CompositorPref, Mode};
 use punktfunk_core::hud::{self, HudLine, StatsSnapshot};
 use punktfunk_core::quic::HdrMeta;
@@ -357,6 +357,9 @@ struct StreamState {
     /// User canceled this connect: skip capture/attach on a late `Connected` and
     /// route its end back silently.
     canceled: bool,
+    /// Redials of a lost session this stream is: 0 for a plain dial, and again once it
+    /// connects. A loss, or a failed redial, dials attempt `redials` next.
+    redials: u32,
     ready_announced: bool,
     mode_line: String,
     /// Settings preset this session resolved; `None` = global defaults, nothing shown.

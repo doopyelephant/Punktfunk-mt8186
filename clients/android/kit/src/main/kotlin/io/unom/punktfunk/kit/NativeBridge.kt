@@ -48,6 +48,9 @@ object NativeBridge {
      */
     external fun nativeEndReason(handle: Long): Int
 
+    /** Milliseconds before redial [attempt] of a session that ended with [endReason]; -1 = stay ended. */
+    external fun nativeRedialDelayMs(endReason: Int, attempt: Int): Long
+
     /**
      * The session's live access state as `[grants, remainingSecs, updateSeq]`, or `null` on a `0`
      * handle. `grants` is a [SessionAccess] bitmask; `remainingSecs` counts down to the access

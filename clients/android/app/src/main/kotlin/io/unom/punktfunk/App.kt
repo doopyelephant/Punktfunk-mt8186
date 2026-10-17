@@ -30,6 +30,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -57,6 +58,7 @@ import io.unom.punktfunk.console.SkiaConsole
 import io.unom.punktfunk.console.SkiaConsoleShell
 import io.unom.punktfunk.models.LibraryReturn
 import io.unom.punktfunk.models.Tab
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -249,6 +251,51 @@ fun App(forceGamepadUi: Boolean = false) {
         reopenLibrary = null
     }
 
+    // A lost session dials the same host again on the schedule every client shares; the host
+    // resumes the session it still holds. The connect modal stays up between dials and Cancel
+    // stops them. A refusal or a spent schedule ends it with a toast.
+    val redialScope = rememberCoroutineScope()
+    var redialing by remember { mutableStateOf<Pair<String, Job>?>(null) }
+    val redialServices = remember { HostServices(KnownHostStore(context), JniHostNative(context)) }
+    fun redial(spec: DialSpec, name: String) {
+        val job = redialScope.launch {
+            var attempt = 0
+            while (true) {
+                val wait = SessionEndReason.LOST.redialDelayMs(attempt++)
+                if (wait == null) {
+                    Toast.makeText(
+                        context,
+                        "Lost the connection to $name — the host may be asleep. Wake it to reconnect.",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    break
+                }
+                delay(wait)
+                val record = redialServices.store.resolve(spec.pinHex, spec.host, spec.port)
+                when (val dialed = redialServices.dial(spec, record, name)) {
+                    is HostServices.Connected -> {
+                        owner.open(dialed.session)
+                        break
+                    }
+                    is HostServices.Failed -> if (!dialed.unreachable) {
+                        Toast.makeText(
+                            context,
+                            ConnectErrors.connectMessage(dialed.token, requestAccess = false),
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        break
+                    }
+                    HostServices.Cancelled -> break
+                }
+            }
+            redialing = null
+        }
+        redialing = name to job
+    }
+    redialing?.let { (name, job) ->
+        ConnectModal(ConnectPhase.Connecting(name), onCancel = { job.cancel(); redialing = null }, onRetry = {})
+    }
+
     AnimatedContent(
         targetState = session,
         transitionSpec = {
@@ -271,11 +318,18 @@ fun App(forceGamepadUi: Boolean = false) {
                     } else {
                         null
                     }
+                val redialSpec = active.redial.takeIf { reason == SessionEndReason.LOST }
                 // The console keeps its stack across the stream and wants to know how the session
                 // ended — a clean end is no toast, an abnormal one says why (the desktop shell's
-                // exact contract).
-                if (skiaConsole) SkiaConsole.sessionEnded(abnormalEndMessage(reason))
+                // exact contract). A redial says it itself.
+                if (skiaConsole) {
+                    SkiaConsole.sessionEnded(abnormalEndMessage(reason).takeIf { redialSpec == null })
+                }
                 owner.end(active.handle)
+                if (redialSpec != null) {
+                    val name = active.hostId?.let { redialServices.store.byId(it)?.name } ?: redialSpec.host
+                    redial(redialSpec, name)
+                }
             }
             // The console: the same Skia shell the Linux/Windows session binary shows, drawn by
             // native onto a SurfaceView (design/android-skia-console-port.md). `gamepadUi` already

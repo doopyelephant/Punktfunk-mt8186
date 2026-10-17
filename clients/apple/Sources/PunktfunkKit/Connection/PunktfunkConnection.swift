@@ -2422,6 +2422,13 @@ public final class PunktfunkConnection: @unchecked Sendable {
         /// Is this an ordinary outcome rather than something to alarm the user about? `.none`
         /// counts as normal: no evidence of trouble is not evidence of it.
         public var isNormal: Bool { self != .hostError && self != .lost }
+
+        /// How long to wait before redial `attempt` (0-based) of a session that ended this way,
+        /// on the schedule every client shares; nil means stay ended. Only `.lost` redials.
+        public func redialDelay(attempt: UInt32) -> Duration? {
+            let ms = punktfunk_redial_delay_ms(rawValue, attempt)
+            return ms < 0 ? nil : .milliseconds(ms)
+        }
     }
 
     /// Why this session ended. Only meaningful once it HAS ended (a plane threw `.closed`, or

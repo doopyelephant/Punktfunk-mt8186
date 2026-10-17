@@ -750,6 +750,23 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
     })
 }
 
+/// `NativeBridge.nativeRedialDelayMs(endReason, attempt)` — milliseconds before redial `attempt`
+/// (0-based) of a session that ended with `endReason`, on the schedule every client shares; `-1`
+/// means stay ended. Only a lost connection redials.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRedialDelayMs(
+    _env: EnvUnowned,
+    _this: JObject,
+    end_reason: jint,
+    attempt: jint,
+) -> jlong {
+    jni_guard(-1, || {
+        punktfunk_core::client::PunktfunkEndReason::from_u8(end_reason as u8)
+            .redial_delay(attempt.max(0) as u32)
+            .map_or(-1, |d| d.as_millis() as jlong)
+    })
+}
+
 /// `NativeBridge.nativePair(host, port, certPem, keyPem, pin, name): String` — run the SPAKE2 PIN
 /// ceremony, presenting our persistent identity. On success returns the host's verified fingerprint
 /// (64-hex) to persist + pin; on any failure (wrong PIN / MITM / host reject / unreachable) returns

@@ -99,6 +99,9 @@ pub struct SessionParams {
     /// When a not-ready host stops being dialed again. `None` on a first dial; the embedder
     /// sets it on the re-dial, and a pump that finds it set pauses 2 s before dialing.
     pub settle_until: Option<Instant>,
+    /// How long the pump waits before it dials. A redial after [`SessionEvent::Lost`] waits
+    /// out `PunktfunkEndReason::redial_delay`; zero on any other dial.
+    pub redial_wait: Duration,
     /// Presenter raises this when hardware frames cannot be displayed. The pump demotes
     /// to software and re-requests a keyframe. Decode still succeeds in that state, so
     /// without this the stream stays black.
@@ -226,6 +229,7 @@ impl SessionParams {
             connect_timeout: dial.connect_timeout,
             auto_wake: settings.auto_wake,
             settle_until: None,
+            redial_wait: Duration::ZERO,
             force_software: probes.force_software,
             preset,
             preset_id,
@@ -277,6 +281,10 @@ pub enum SessionEvent {
         refused: Option<punktfunk_core::reject::RejectReason>,
     },
     Ended(Option<String>),
+    /// The link died mid-session (`PunktfunkEndReason::Lost`). Terminal like [`Self::Ended`],
+    /// whose sentence it carries; the embedder redials on `PunktfunkEndReason::redial_delay`'s
+    /// schedule, and one that does not ends as for [`Self::Ended`].
+    Lost(Option<String>),
     /// The host answered but couldn't start the stream, before any frame, while
     /// [`SessionParams::waking`] held. Terminal; the embedder dials again on the same params
     /// with `settle_until` set [`WAKE_SETTLE`] after the first one. Carries the host's words.
@@ -941,11 +949,13 @@ fn pump(
         advertised_codecs,
         ..
     } = plan;
-    if params.settle_until.is_some() {
-        let until = Instant::now() + REDIAL_PAUSE;
-        while Instant::now() < until && !stop.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    let pause = match params.settle_until {
+        Some(_) => REDIAL_PAUSE.max(params.redial_wait),
+        None => params.redial_wait,
+    };
+    let until = Instant::now() + pause;
+    while Instant::now() < until && !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(20));
     }
     let connector = match dial(&params, &stop, &plan) {
         Ok(c) => c,
@@ -1417,9 +1427,12 @@ impl Pump {
             self.connector
                 .set_au_memory(Arc::new(punktfunk_core::au::HeapPool::default()));
         }
+        let lost = self.connector.end_reason() == punktfunk_core::client::PunktfunkEndReason::Lost
+            && self.connector.end_reject().is_none();
         let last = match self.codec_fallback.take() {
             Some(ev) => ev,
             None if self.not_ready => SessionEvent::HostNotReady(end.unwrap_or_default()),
+            None if lost => SessionEvent::Lost(end),
             None => SessionEvent::Ended(end),
         };
         end_session(

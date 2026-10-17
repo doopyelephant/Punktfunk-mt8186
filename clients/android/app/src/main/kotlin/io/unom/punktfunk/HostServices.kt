@@ -203,8 +203,10 @@ class HostServices(val store: KnownHostStore, private val native: HostNative) {
                 pinned = true
             }
         }
+        // A redial is pinned to the identity this session proved.
+        val redial = spec.copy(pinHex = spec.pinHex.ifEmpty { native.fingerprint(handle) })
         val session = SessionFactory.afterDial(
-            handle, dialed, spec.settings, spec.preset, store, native.mgmtPort(handle),
+            handle, dialed, spec.settings, spec.preset, store, native.mgmtPort(handle), redial,
         )
         return Connected(session, dialed, pinned)
     }
