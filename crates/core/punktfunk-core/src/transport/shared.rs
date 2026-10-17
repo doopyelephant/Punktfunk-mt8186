@@ -446,6 +446,12 @@ impl Transport for ClientMedia {
     }
 }
 
+/// `PUNKTFUNK_GSO` set to anything but `0`: the offload is pinned on for an A/B, and a loss
+/// guard must stand down or it downshifts the run it is measuring.
+pub fn offload_pinned() -> bool {
+    std::env::var_os("PUNKTFUNK_GSO").is_some_and(|v| v != "0")
+}
+
 /// `PUNKTFUNK_GSO=0`: the operator's off switch; GSO is on wherever the path has it.
 fn gso_allowed() -> bool {
     static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -467,6 +473,9 @@ pub struct MediaSender {
     conn: quinn::Connection,
     v6_socket: bool,
     staging: Mutex<Vec<u8>>,
+    /// Send offload for this session; the host's loss guard clears it for good
+    /// ([`Self::set_offload_switch`]).
+    offload: Arc<AtomicBool>,
 }
 
 impl MediaSender {
@@ -483,10 +492,17 @@ impl MediaSender {
             conn,
             v6_socket,
             staging: Mutex::new(Vec::new()),
+            offload: Arc::new(AtomicBool::new(true)),
         };
         let (to, _) = sender.path();
         sender._qos = super::set_media_qos_to(&sender.socket, to, super::MediaClass::Video);
         Ok(sender)
+    }
+
+    /// Share the offload switch: `false` sends every packet on its own, as `PUNKTFUNK_GSO=0`
+    /// does, for the rest of the session.
+    pub fn set_offload_switch(&mut self, switch: Arc<AtomicBool>) {
+        self.offload = switch;
     }
 
     /// Where the next packet goes and from which local address: the connection's current path.
@@ -546,11 +562,12 @@ impl Transport for MediaSender {
     /// Runs of equal-size packets leave as one offloaded send, each run within the platform's
     /// segment limit and under the UDP payload bound of either IP family; the last packet of a
     /// run may be shorter. An oversize run is `EMSGSIZE`, which quinn-udp reports as sent.
-    /// With `PUNKTFUNK_GSO=0` packets leave one by one.
+    /// With `PUNKTFUNK_GSO=0`, or once the session's loss guard cleared the switch, packets
+    /// leave one by one.
     fn send_gso(&self, packets: &[&[u8]]) -> std::io::Result<usize> {
         const GSO_MAX_PAYLOAD: usize = 65535 - 40 - 8;
         let max = self.state.max_gso_segments();
-        if !gso_allowed() || max <= 1 {
+        if !gso_allowed() || !self.offload.load(Ordering::Relaxed) || max <= 1 {
             return self.send_batch(packets);
         }
         let (to, from) = self.path();

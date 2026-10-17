@@ -1578,7 +1578,8 @@ pub(crate) async fn run_admitted(
         .map(|policy| crate::session_status::apply_audio_policy(policy, &client_label));
     let result: Result<()> = async {
         let clear = features.has(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT);
-        let (transport, wire_sock, media) = bind_data_plane(data_plane, &bringup, clear)?;
+        let (transport, wire_sock, media) =
+            bind_data_plane(data_plane, &bringup, clear, shared.offload_switch.clone())?;
         let session = Session::new(welcome.session_config(Role::Host), media, transport)
             .map_err(|e| anyhow!("host session: {e:?}"))?;
         let common = StreamCommon {
@@ -2484,6 +2485,7 @@ fn bind_data_plane(
     data_plane: DataPlane,
     bringup: &crate::bringup::Trace,
     clear_placement: bool,
+    offload: Arc<AtomicBool>,
 ) -> Result<BoundPlane> {
     bringup.mark("punch_done");
     match data_plane {
@@ -2503,11 +2505,12 @@ fn bind_data_plane(
                 .ok_or_else(|| anyhow!("punktfunk/2 session reached media with no suite"))?;
             let keys = endpoint::media_keys(&v2.conn, &v2.session_id, suite)
                 .ok_or_else(|| anyhow!("punktfunk/2 media keys: exporter refused"))?;
-            let sender = punktfunk_core::transport::shared::MediaSender::new(
+            let mut sender = punktfunk_core::transport::shared::MediaSender::new(
                 &v2.media_socket,
                 v2.conn.clone(),
             )
             .context("punktfunk/2 media sender")?;
+            sender.set_offload_switch(offload);
             let media = punktfunk_core::session::MediaV2 {
                 clock_origin_ns: v2.clock.origin_ns(),
                 keys: Some(keys),

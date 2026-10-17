@@ -403,6 +403,7 @@ impl StreamState {
                             lossy_window,
                             ramp_open,
                             cursor_client_draws,
+                            offload_switch: _,
                         },
                     mut bitrate_kbps,
                     audio_reserved_kbps,

@@ -392,6 +392,7 @@ pub(super) async fn run(task: Task) {
                 lossy_window,
                 ramp_open,
                 cursor_client_draws,
+                offload_switch,
             },
         clip_enabled,
         clip,
@@ -462,6 +463,12 @@ pub(super) async fn run(task: Task) {
     // An RFI ask is a frame parity could not repair; the report that
     // closes the window carries only what parity did repair.
     let mut unrecovered = UnrecoveredRun::default();
+    // `None` when `PUNKTFUNK_GSO` pins the offload on: an A/B run must not downshift itself.
+    let mut offload_guard =
+        (!punktfunk_core::transport::shared::offload_pinned()).then_some(OffloadGuard {
+            switch: offload_switch,
+            over: 0,
+        });
     // The link's loss over a horizon one report window cannot see, which is
     // what sizes parity against the frame this session's budget buys.
     let mut fec_horizon = punktfunk_core::abr::budget::LossHorizon::default();
@@ -534,6 +541,10 @@ pub(super) async fn run(task: Task) {
                     }
                 }
                 if take_newer(fb.window, &mut last_window, u32::MAX) {
+                    // Before FEC: the send mode is not FEC's business, pinned or adaptive.
+                    if let Some(g) = offload_guard.as_mut() {
+                        g.on_report(fb.loss_ppm);
+                    }
                     let unrecovered_run = unrecovered.report(std::time::Instant::now());
                     if unrecovered_run > 0
                         || punktfunk_core::abr::shows_loss_shape(fb.head, fb.mid, fb.tail, fb.sock_drops)
@@ -1127,10 +1138,89 @@ async fn offer_edge(
 /// release outlasts both. Longer, and the session is gone anyway.
 const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Reported loss at which send offload is suspected of costing delivered throughput. 0.4 % is
+/// what the 2026-07-14 Linux GSO A/B produced at a rate `sendmmsg` carried clean; under it the
+/// offload is not the discriminator.
+const OFFLOAD_LOSS_PPM: u32 = 4_000;
+/// Windows over [`OFFLOAD_LOSS_PPM`] before the downshift (~1.5 s), so one Wi-Fi scan or BT
+/// coexistence burst cannot strip the offload.
+const OFFLOAD_LOSS_WINDOWS: u8 = 2;
+
+/// One-way guard on UDP send offload (Linux GSO, Windows USO). The offload hands the kernel
+/// super-buffers that leave at NIC line rate; where the path's bottleneck sits below that,
+/// the train overruns a queue the one-packet sends did not. Nothing on the host predicts that
+/// path, so the client's own loss reports decide, and the verdict is sticky for the session:
+/// the send mode never oscillates mid-stream.
+struct OffloadGuard {
+    /// Cleared to downshift; the media sender reads it per send.
+    switch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    over: u8,
+}
+
+impl OffloadGuard {
+    /// One report window. Built only when the offload is not pinned by `PUNKTFUNK_GSO`.
+    fn on_report(&mut self, loss_ppm: u32) {
+        if loss_ppm < OFFLOAD_LOSS_PPM {
+            self.over = 0;
+            return;
+        }
+        self.over = self.over.saturating_add(1);
+        // `swap` is the once-only latch: only the transition logs.
+        if self.over >= OFFLOAD_LOSS_WINDOWS
+            && self
+                .switch
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                loss_ppm,
+                windows = self.over,
+                "UDP send offload looks to be costing delivered throughput on this path — \
+                 every packet leaves on its own for the rest of the session (PUNKTFUNK_GSO=1 \
+                 pins it on)"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use punktfunk_core::quic::ProbeRequest;
+
+    #[test]
+    fn offload_guard_downshifts_only_on_sustained_loss() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mk = || {
+            let switch = std::sync::Arc::new(AtomicBool::new(true));
+            (
+                OffloadGuard {
+                    switch: switch.clone(),
+                    over: 0,
+                },
+                switch,
+            )
+        };
+        // Loss under the threshold never downshifts, however long it runs.
+        let (mut g, sw) = mk();
+        for _ in 0..100 {
+            g.on_report(OFFLOAD_LOSS_PPM - 1);
+        }
+        assert!(sw.load(Ordering::Relaxed));
+        // One window over is not enough; the second takes the offload away.
+        let (mut g, sw) = mk();
+        g.on_report(OFFLOAD_LOSS_PPM);
+        assert!(sw.load(Ordering::Relaxed));
+        g.on_report(OFFLOAD_LOSS_PPM);
+        assert!(!sw.load(Ordering::Relaxed));
+        // A clean window between two bad ones resets the run: an isolated burst is no verdict.
+        let (mut g, sw) = mk();
+        g.on_report(OFFLOAD_LOSS_PPM);
+        g.on_report(0);
+        g.on_report(OFFLOAD_LOSS_PPM);
+        assert!(sw.load(Ordering::Relaxed));
+        g.on_report(OFFLOAD_LOSS_PPM);
+        assert!(!sw.load(Ordering::Relaxed));
+    }
     use punktfunk_core::quic::{
         CLIP_FLAG_FILES, CLIP_POLICY_FILES, CLIP_POLICY_TEXT, CLIP_REASON_BACKEND_UNAVAILABLE,
         CLIP_REASON_NOT_PERMITTED, CLIP_REASON_NO_FILES, CLIP_REASON_OK,
