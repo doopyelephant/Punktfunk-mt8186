@@ -5,7 +5,8 @@
 //! Client: [`client_socket`] starts a native thread that owns every read. QUIC packets go to
 //! quinn through the [`ClientSocket`] it returns; media from the host's address goes to the
 //! session through [`ClientMedia`], a bounded queue. Video never enters an async runtime.
-//! On Apple the socket connects to the host once it is known ([`ClientMedia::set_host`]).
+//! On Apple the socket connects to the host once it is known ([`ClientMedia::set_host`]), and
+//! again after a second of silence or a path change ([`ClientMedia::reconnector`]).
 //!
 //! Host: [`MediaSender`] sends media on a clone of the endpoint's socket, toward the
 //! connection's current address and from the address the client dialed. quinn moves that
@@ -41,6 +42,9 @@ const READ_BUF: usize = 64 * 1024;
 const POOL_BYTES: usize = 32 * 1024 * 1024;
 /// How long the reader waits before it looks at its stop flag again.
 const WAIT: Duration = Duration::from_millis(100);
+/// Empty waits in a row that read as a dead path: one second. A live host sends media, audio
+/// or a keep-alive well inside it.
+const SILENT_WAITS: u32 = 10;
 
 /// The client socket's counters, and the flag that stops its reader.
 #[derive(Debug, Default)]
@@ -118,8 +122,19 @@ pub struct ClientMedia {
     rx: Mutex<Receiver<RecvBatch>>,
     stats: Arc<SharedStats>,
     socket: Arc<UdpSocket>,
-    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     peer: Peer,
+}
+
+/// Connect the socket to its host again, so XNU picks the source address afresh after a roam;
+/// a connected socket otherwise keeps the old one until a send fails. A no-op before the host
+/// is known, and off Apple, where the socket stays unconnected and routes every send.
+fn reconnect(socket: &UdpSocket, peer: &Peer) {
+    let peer = peer.lock().unwrap_or_else(|e| e.into_inner());
+    if let (true, Some(host)) = (cfg!(target_vendor = "apple"), *peer) {
+        if let Err(e) = socket.connect(host) {
+            tracing::debug!(error = %e, "shared socket reconnect");
+        }
+    }
 }
 
 impl ClientMedia {
@@ -140,6 +155,12 @@ impl ClientMedia {
                 Err(e) => tracing::warn!(error = %e, "shared socket stays unconnected"),
             }
         }
+    }
+
+    /// Re-picks the socket's source address, for a caller that learns the path changed.
+    pub fn reconnector(&self) -> impl Fn() + Send + Sync + 'static {
+        let (socket, peer) = (self.socket.clone(), self.peer.clone());
+        move || reconnect(&socket, &peer)
     }
 
     /// The shared socket, for its buffer and drop figures. Never read from it: the demux
@@ -177,6 +198,7 @@ pub fn client_socket(bind: SocketAddr) -> std::io::Result<(Arc<ClientSocket>, Cl
         media: tx,
         pool,
         stats: stats.clone(),
+        peer: peer.clone(),
     };
     // As urgent as the pump it feeds: a descheduled reader is socket drops the link never had.
     std::thread::Builder::new()
@@ -209,9 +231,12 @@ struct Reader {
     media: SyncSender<RecvBatch>,
     pool: Arc<BufPool>,
     stats: Arc<SharedStats>,
+    peer: Peer,
 }
 
 impl Reader {
+    /// Reads until stopped. A second of silence from a known host reconnects the socket,
+    /// since on Apple an interface that stays up but carries nothing never fails a send.
     fn run(self) {
         let mut bufs: Vec<Vec<u8>> = (0..BATCH)
             .map(|_| {
@@ -221,10 +246,18 @@ impl Reader {
             })
             .collect();
         let mut meta = [RecvMeta::default(); BATCH];
+        let mut silent = 0u32;
         while !self.stats.stop.load(Ordering::Relaxed) {
             match super::udp::wait_readable(&self.socket, WAIT) {
-                Ok(true) => {}
-                Ok(false) => continue,
+                Ok(true) => silent = 0,
+                Ok(false) => {
+                    silent += 1;
+                    if silent == SILENT_WAITS {
+                        reconnect(&self.socket, &self.peer);
+                        silent = 0;
+                    }
+                    continue;
+                }
                 Err(e) => {
                     tracing::debug!(error = %e, "shared socket wait");
                     std::thread::sleep(WAIT);

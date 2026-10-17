@@ -20,6 +20,7 @@
 // close, the pull methods throw `.closed` and the threads unwind on their own.
 
 import Foundation
+import Network
 import PunktfunkCore
 import PunktfunkShared
 
@@ -343,6 +344,8 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Held across the blocking next_au call; close() takes it (same plane-lock → abiLock
     /// order as the pullers) so it can never free the handle under an in-flight poll.
     private let pumpLock = NSLock()
+    /// The device's network path, watched from the end of init until close(): see `pathChanged()`.
+    private let pathMonitor = NWPathMonitor()
     /// The lender `setAccessUnitMemory` installed, for `nextAU` to place pulls. Under `pumpLock`.
     private var accessUnitMemory: AccessUnitMemory?
     /// Every lender ever installed, retained until `close()` ends the core's calls into them.
@@ -1238,6 +1241,20 @@ public final class PunktfunkConnection: @unchecked Sendable {
         var mgmt: UInt16 = 0
         _ = punktfunk_connection_mgmt_port(opened, &mgmt)
         hostMgmtPort = mgmt
+        // Every update with a route nudges the core, the first included: a nudge is one datagram.
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            if path.status == .satisfied { self?.pathChanged() }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "punktfunk.path", qos: .userInitiated))
+    }
+
+    /// The device's network path changed. The core re-picks the socket's source address and
+    /// shows the host where this device now is, so a roam heals within a round trip instead of
+    /// a keep-alive. Silently dropped after close.
+    public func pathChanged() {
+        withLiveHandle(or: ()) { h in
+            _ = punktfunk_connection_path_changed(h)
+        }
     }
 
     /// A bandwidth speed-test measurement (see `startSpeedTest`). Partial until `done`.
@@ -1985,6 +2002,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Close the connection and free the handle. Safe from any thread, idempotent; waits
     /// for in-flight pulls (≤ their timeouts) before tearing down.
     public func close() {
+        pathMonitor.cancel()
         abiLock.lock()
         closeRequested = true
         abiLock.unlock()

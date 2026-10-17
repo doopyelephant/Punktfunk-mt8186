@@ -58,6 +58,8 @@ pub(crate) struct ClientShared {
     pub(crate) feedback: Mutex<super::recovery::FeedbackOut>,
     /// Where feedback datagrams leave: the session's connection, from when the pump has one.
     pub(crate) feedback_tx: std::sync::OnceLock<FeedbackTx>,
+    /// Re-picks the shared socket's source address after the device's path changed.
+    pub(crate) reconnect: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Keyframe asks sent; the pump drains them per report window as the ABR recovery signal.
     pub(crate) recovery_kf: AtomicU32,
     /// This device's end of the path, as the dial read it.
@@ -146,6 +148,7 @@ impl ClientShared {
             host_link: Mutex::default(),
             feedback: Mutex::default(),
             feedback_tx: std::sync::OnceLock::new(),
+            reconnect: std::sync::OnceLock::new(),
             recovery_kf: AtomicU32::new(0),
             client_link: Mutex::default(),
             link: Mutex::new((crate::abr::LINK_FLOOR_KBPS, crate::abr::LinkSource::Floor)),

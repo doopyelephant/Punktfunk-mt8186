@@ -847,6 +847,17 @@ impl NativeClient {
         Ok(())
     }
 
+    /// The device's network path changed: an interface came up, went down or took over the
+    /// default route. Re-picks the socket's source address and sends the host a copy of the
+    /// last feedback, so it follows a roam within a round trip instead of a keep-alive.
+    pub fn path_changed(&self) {
+        if let Some(reconnect) = self.shared.reconnect.get() {
+            reconnect();
+        }
+        let fb = self.shared.feedback.lock().unwrap().again();
+        self.shared.send_feedback(&fb);
+    }
+
     /// Recover `[first_frame, last_frame]` by RFI instead of a full IDR. Capable hosts emit a
     /// P-frame tagged [`crate::packet::USER_FLAG_RECOVERY_ANCHOR`]; others force an IDR
     /// ([`request_keyframe`](Self::request_keyframe)). Prefer on loss; keyframe is the backstop

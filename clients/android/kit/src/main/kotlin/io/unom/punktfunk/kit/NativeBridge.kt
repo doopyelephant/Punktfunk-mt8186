@@ -575,6 +575,9 @@ object NativeBridge {
     /** Live natural-scroll toggle, applied once at the core's outbound seam. False on a dead session. */
     external fun nativeSetInvertScroll(handle: Long, invert: Boolean): Boolean
 
+    /** The default network or its addresses changed: the host follows a roam within a round trip. */
+    external fun nativePathChanged(handle: Long): Boolean
+
     /**
      * Whether this stream holds the screen awake right now: always with [keepAwake] (the "Keep
      * screen awake" setting) on, else only while the player's input is recent, so the device's
