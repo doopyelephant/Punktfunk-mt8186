@@ -318,6 +318,11 @@ pub struct VkDecoder<C: VkCodec> {
 }
 
 impl<C: VkCodec> VkDecoder<C> {
+    /// The device, for a [`super::waiter::DoneWaiter`]. Valid while this decoder lives.
+    pub fn ash_device(&self) -> ash::Device {
+        self.dev.ash().clone()
+    }
+
     /// Decoder over a wrapped device. Sessions and pools are built lazily from
     /// the first AU (their shape is the stream's, not the device's).
     pub(crate) fn with_codec(dev: DecodeDevice, lock: Box<dyn QueueLock>, codec: C) -> Self {

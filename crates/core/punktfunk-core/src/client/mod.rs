@@ -1395,6 +1395,12 @@ impl NativeClient {
         }
     }
 
+    /// Return the consumer from [`Self::next_frame`] with `NoFrame` now, or at its next
+    /// call: a hardware decode it submitted is complete. Any thread may call this.
+    pub fn kick_frame_wait(&self) {
+        self.shared.frames.kick();
+    }
+
     /// Next audio packet. Drain on a dedicated thread — packets arrive every 5 ms.
     pub fn next_audio(&self, timeout: Duration) -> Result<AudioPacket> {
         pull(&self.planes.audio, timeout)

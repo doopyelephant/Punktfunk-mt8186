@@ -1027,6 +1027,8 @@ fn pump(
         access,
         planes,
         decoder,
+        #[cfg(target_os = "linux")]
+        fd_wake: None,
         lent_au_memory: None,
         wants_decode: connector.wants_decode_latency(),
         marks_repeats: connector.host_caps2() & punktfunk_core::quic::HOST_CAP2_REPEAT_MARK != 0,
@@ -1076,6 +1078,9 @@ struct Pump {
     access: crate::access::SessionAccess,
     planes: PlaneThreads,
     decoder: Decoder,
+    /// The sync_file waiter's inbox (`run`); a VAAPI decode's fence goes there at submit.
+    #[cfg(target_os = "linux")]
+    fd_wake: Option<std::sync::mpsc::Sender<std::os::fd::OwnedFd>>,
     /// The decoder's in-place AU memory as lent to the connector; a resize can bring a new one.
     lent_au_memory: Option<Arc<dyn punktfunk_core::au::AuMemory>>,
     /// Report decode stage to ABR only when armed. Constant for the session.
@@ -1096,14 +1101,35 @@ impl Pump {
     /// user reads. Each pass ends with the host-timing drain and the 1-second window,
     /// unless its AU was dropped before decode. Loss recovery ticks in core's own pump.
     fn run(&mut self) -> Option<String> {
+        let wake = self.connector.clone();
+        self.decoder
+            .set_decode_wake(Arc::new(move || wake.kick_frame_wait()));
+        #[cfg(target_os = "linux")]
+        {
+            // VAAPI's decode fence is a sync_file: one thread polls each in turn and kicks.
+            let (tx, rx) = std::sync::mpsc::channel::<std::os::fd::OwnedFd>();
+            let wake = self.connector.clone();
+            let spawned = std::thread::Builder::new()
+                .name("pf-decode-done".into())
+                .spawn(move || {
+                    use std::os::fd::AsFd as _;
+                    while let Ok(fd) = rx.recv() {
+                        let _ = pf_dmabuf::fence::wait_sync_file(fd.as_fd(), 50);
+                        wake.kick_frame_wait();
+                    }
+                });
+            if spawned.is_ok() {
+                self.fd_wake = Some(tx);
+            }
+        }
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 return None;
             }
             self.debug_reconfigure();
             self.on_access_update();
-            // A decode still on the GPU is polled every half millisecond and handed on the
-            // moment its pixels are done. 50 ms bounds a wedged one.
+            // A decode still on the GPU is handed on the moment its pixels are done: its
+            // waiter kicks `next_frame`, so no poll runs here. 50 ms bounds a wedged one.
             let decoder = &mut self.decoder;
             let done = self.in_flight.take_if(|p| {
                 hw_done_now(decoder, &p.hw) || now_ns().saturating_sub(p.received_ns) > 50_000_000
@@ -1111,14 +1137,8 @@ impl Pump {
             if let Some(p) = done {
                 hand_on(p, &self.frame_tx, &self.connector, self.wants_decode);
             }
-            // Otherwise 20 ms: audio has its own thread, so this only bounds stop-flag
-            // responsiveness.
-            let frame_wait = if self.in_flight.is_some() {
-                Duration::from_micros(500)
-            } else {
-                Duration::from_millis(20)
-            };
-            match self.connector.next_frame(frame_wait) {
+            // 20 ms: audio has its own thread, so this only bounds stop-flag responsiveness.
+            match self.connector.next_frame(Duration::from_millis(20)) {
                 Ok(frame) => match self.on_frame(frame) {
                     Pass::Drain => {}
                     Pass::Skip => continue,
@@ -1327,13 +1347,19 @@ impl Pump {
             // are ready (presenter write-back is `+ 1`).
             DecodedImage::NativeVk(f) => HwDone::Timeline(f.semaphore, f.semaphore_value),
             // VAAPI ships the decode's write fence as a sync_file; a dup
-            // outlives the frame's move to the presenter.
+            // outlives the frame's move to the presenter, and one more goes to the waiter.
             #[cfg(target_os = "linux")]
-            DecodedImage::NativeDmabuf(d) => d
-                .sync_fds
-                .first()
-                .and_then(|fd| fd.try_clone().ok())
-                .map_or(HwDone::Cpu, HwDone::SyncFile),
+            DecodedImage::NativeDmabuf(d) => {
+                match d.sync_fds.first().and_then(|fd| fd.try_clone().ok()) {
+                    Some(fd) => {
+                        if let (Some(tx), Ok(dup)) = (&self.fd_wake, fd.try_clone()) {
+                            let _ = tx.send(dup);
+                        }
+                        HwDone::SyncFile(fd)
+                    }
+                    None => HwDone::Cpu,
+                }
+            }
             _ => HwDone::Cpu,
         };
         let next = InFlight {
