@@ -89,6 +89,16 @@ impl AbrShare {
             .is_none_or(|at| now.saturating_duration_since(at) >= after)
     }
 
+    /// What the last report window lost on the wire, parts per million of what left the host:
+    /// counted from packets the client received, so FEC never hides it. `None` until a window
+    /// that opened while streaming.
+    pub fn wire_loss_ppm(&self) -> Option<u32> {
+        let offered = u64::from(self.offered_kbps.load(Ordering::Relaxed));
+        let delivered = u64::from(self.delivered_kbps.load(Ordering::Relaxed)).min(offered);
+        (self.streaming.load(Ordering::Relaxed) && offered > 0)
+            .then(|| ((offered - delivered) * 1_000_000 / offered) as u32)
+    }
+
     /// The ceiling this session is running under. `0` = none.
     pub fn share_kbps(&self) -> u32 {
         self.share_kbps.load(Ordering::Relaxed)
@@ -231,6 +241,21 @@ mod tests {
     ) -> [(LiveSessionGuard, Arc<SessionCounters>, Arc<AtomicU32>); N] {
         let peer = peer.parse().unwrap();
         kbps.map(|k| fake_member("member", peer, k))
+    }
+
+    /// Wire loss reads off the last window, only once it opened while streaming; a client
+    /// that counted more than the host sent is no loss.
+    #[test]
+    fn wire_loss_reads_the_last_streaming_window() {
+        let share = AbrShare::default();
+        let now = std::time::Instant::now();
+        assert_eq!(share.wire_loss_ppm(), None);
+        share.publish(now, true, 20_000, 0, false);
+        assert_eq!(share.wire_loss_ppm(), None);
+        share.publish(now, true, 20_000, 5_000, true);
+        assert_eq!(share.wire_loss_ppm(), Some(750_000));
+        share.publish(now, true, 20_000, 21_000, true);
+        assert_eq!(share.wire_loss_ppm(), Some(0));
     }
 
     fn both_clocks() -> punktfunk_core::abr::governor::Clocks {

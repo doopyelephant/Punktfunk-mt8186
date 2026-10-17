@@ -438,6 +438,21 @@ impl StreamState {
                  incremented AFTER decrypt and replay checks, so a session whose every \
                  datagram failed to open reports exactly this same zero"
             );
+        } else if let Some(ppm) = self
+            .counters
+            .share
+            .wire_loss_ppm()
+            .filter(|&p| p >= 900_000)
+        {
+            tracing::warn!(
+                period_s = format!("{:.1}", period.as_secs_f64()),
+                wire_loss_ppm = ppm,
+                "client keyframe recoveries come while the path has STOPPED CARRYING VIDEO — \
+                 the client's last report window counted under a tenth of the packets this \
+                 host sent, though video did arrive earlier in the session. A client that \
+                 moved onto a path that drops full-size datagrams, or a hop that started \
+                 blocking them, does this; the 'wire MTU' lines say whether the host saw it move"
+            );
         } else if matches_client_recovery_cooldown(period) {
             if client_rx == u32::MAX {
                 tracing::warn!(
