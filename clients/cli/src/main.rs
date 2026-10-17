@@ -965,7 +965,13 @@ from the config directory for a true factory reset."
         }
         // The port this host actually serves its library on — learned from its advert and saved,
         // falling back to 47990. Reaching for the constant here is what broke a moved port.
-        match library::fetch_games(&host.addr, host.effective_mgmt_port(), &identity, pin) {
+        match library::fetch_games(
+            &host.addr,
+            host.effective_mgmt_port(),
+            host.port,
+            &identity,
+            pin,
+        ) {
             Ok(games) => {
                 if has(args, "--json") {
                     let rows: Vec<serde_json::Value> = games
@@ -1305,6 +1311,9 @@ from the config directory for a true factory reset."
         let mut failure: Option<orchestrate::SessionError> = None;
         while let Ok(ev) = rx.recv() {
             match ev {
+                SessionEvent::AwaitingApproval => {
+                    eprintln!("waiting for the host's operator to approve this device")
+                }
                 SessionEvent::Ready => {
                     eprintln!("streaming");
                     // The pin we connected WITH, not one re-derived from the store: the record

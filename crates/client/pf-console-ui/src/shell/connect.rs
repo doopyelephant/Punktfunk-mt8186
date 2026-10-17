@@ -476,6 +476,13 @@ impl Shell {
         }
     }
 
+    /// The host parked the connect for its operator: the card says "Waiting for approval".
+    pub(crate) fn session_awaiting_approval(&mut self) {
+        if let Some(c) = self.connect.card_mut() {
+            c.request_access = true;
+        }
+    }
+
     /// Client is redialing on its own (codec fallback). Raise the connecting
     /// modal: nothing sends `Launch` for this retry, so without it the shell
     /// is not streaming, not connecting, and a live pump is behind the

@@ -157,7 +157,7 @@ build() {
 }
 
 package_punktfunk-host() {
-  pkgdesc="Low-latency desktop/game streaming HOST (Moonlight-compatible + punktfunk/1)"
+  pkgdesc="Low-latency desktop/game streaming HOST (Moonlight-compatible + punktfunk/2)"
   # NVENC + GPU EGL/CUDA come from the NVIDIA driver (nvidia-utils) — kept an optdepend, never a
   # hard dep, exactly as the RPM (__requires_exclude libcuda) and deb (shlibdeps filter) do.
   # The host captures the sink monitor through NATIVE PipeWire (pf-audio) — it never

@@ -78,7 +78,7 @@ pub fn pair_error_message(err: &punktfunk_core::PunktfunkError) -> String {
     use punktfunk_core::PunktfunkError as E;
     match err {
         E::Crypto => "Wrong PIN — check the PIN on the host's Pairing page and try again.".into(),
-        E::Rejected(reason) => connect_reject_message(*reason),
+        E::Rejected(reason, said) => reject_message(*reason, Some(said)),
         E::Timeout => "The host didn't answer. Is it running and reachable?".into(),
         E::Io(_) => {
             "Couldn't reach the host — check that this device and the host are on the same \

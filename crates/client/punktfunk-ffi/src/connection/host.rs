@@ -181,7 +181,9 @@ pub unsafe extern "C" fn punktfunk_connection_end_reject(
 ) -> PunktfunkStatus {
     with_conn!(c => {
         let value = match c.inner.end_reject() {
-            Some(reason) => punktfunk_core::error::PunktfunkError::Rejected(reason).status() as i32,
+            Some(reason) => {
+                punktfunk_core::error::PunktfunkError::Rejected(reason, String::new()).status() as i32
+            }
             None => 0,
         };
         // SAFETY: the caller passes `status` null or writable for one value.

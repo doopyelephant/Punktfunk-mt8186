@@ -250,6 +250,11 @@ impl StreamState {
                 .capture_health
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = self.capturer.health();
+            // A client that roamed shares a path with whoever is at its new address now.
+            crate::session_status::refresh_peer(
+                self.live_session.id,
+                self.conn.remote_address().ip(),
+            );
         }
         if let Some(outage) = self.capturer.take_recovered_outage() {
             let outage_ms = outage.as_millis().min(u32::MAX as u128) as u32;
@@ -419,19 +424,29 @@ impl StreamState {
                  counted here, so the picture is black and every keyframe we force is \
                  wasted. The control plane is healthy (this report arrived on it), so \
                  the session looks alive: audio, input and the library keep working. \
-                 READ THE 'data plane bound' LINE ABOVE — it says which leg failed, \
-                 and this line cannot. `punched=false`: the client's hole-punch never \
-                 arrived, so inbound UDP to this host's per-session data port is \
-                 blocked — open it (the ports are ephemeral, so the rule must be \
-                 program-scoped, not port-scoped). `punched=true`: inbound is FINE and \
-                 the failure is on the return leg — compare that line's `local=` \
-                 source address against the host address this client dialed, because \
-                 its data socket is connected and its kernel silently drops video from \
-                 any other source. If those match, the datagrams left this host \
-                 correctly and the client either never received them (a hop on the \
-                 path) or received them and could not open them: this counter is \
-                 incremented AFTER decrypt and replay checks, so a session whose every \
-                 datagram failed to open reports exactly this same zero"
+                 Video leaves the same UDP socket toward the same address as control, \
+                 so a hop is treating the two differently: one that drops full-size \
+                 datagrams (the 'wire MTU' lines say what the path carries), or one \
+                 that drops the video DSCP mark (PUNKTFUNK_DSCP=0 turns it off to \
+                 test). The client may also have received the datagrams and could not \
+                 open them: this counter is incremented AFTER decrypt and replay \
+                 checks, so a session whose every datagram failed to open reports \
+                 exactly this same zero"
+            );
+        } else if let Some(ppm) = self
+            .counters
+            .share
+            .wire_loss_ppm()
+            .filter(|&p| p >= 900_000)
+        {
+            tracing::warn!(
+                period_s = format!("{:.1}", period.as_secs_f64()),
+                wire_loss_ppm = ppm,
+                "client keyframe recoveries come while the path has STOPPED CARRYING VIDEO — \
+                 the client's last report window counted under a tenth of the packets this \
+                 host sent, though video did arrive earlier in the session. A client that \
+                 moved onto a path that drops full-size datagrams, or a hop that started \
+                 blocking them, does this; the 'wire MTU' lines say whether the host saw it move"
             );
         } else if matches_client_recovery_cooldown(period) {
             if client_rx == u32::MAX {

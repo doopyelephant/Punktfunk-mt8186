@@ -90,6 +90,7 @@ public final class ConsoleBridge {
     /// Where the session the console asked for stands.
     public enum Phase: UInt8 {
         case connecting = 0, streaming = 1, failed = 2, ended = 3, reconnecting = 4
+        case awaitingApproval = 6
     }
 
     /// `nil` when the options JSON or Skia's Metal context fails; the log says which.

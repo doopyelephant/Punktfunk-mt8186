@@ -12,7 +12,8 @@ async fn host_info_reports_identity_and_ports() {
     // `os` is the icon-walk chain; `os_name` is the human label. Both copied from Host.
     assert_eq!(body["os"], "linux/arch/steamos");
     assert_eq!(body["os_name"], "SteamOS");
-    assert_eq!(body["ports"]["http"], HTTP_PORT);
+    // GameStream's ports only with GameStream on, which a test host is not.
+    assert_eq!(body["ports"]["http"], serde_json::Value::Null);
     assert_eq!(body["ports"]["mgmt"], DEFAULT_PORT);
     // Assert against `host_wire_caps`, not a fixed set. HEVC serializes as "hevc", never "h265".
     use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};

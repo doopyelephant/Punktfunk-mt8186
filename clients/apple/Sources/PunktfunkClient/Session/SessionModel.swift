@@ -185,6 +185,23 @@ final class SessionModel: ObservableObject {
     /// Every window's dialing or live host. A host replaces a second session from this device,
     /// so a connect to one already live elsewhere would end that window's stream.
     private static var activeHosts: [ObjectIdentifier: StoredHost.ID] = [:]
+
+    /// One connect's arguments, kept so a lost session can dial them again, and which redial
+    /// attempt that is.
+    struct Redial {
+        var host: StoredHost
+        let effective: EffectiveSettings
+        let gamepad: PunktfunkConnection.GamepadType
+        let launchID: String?
+        let profileID: String?
+        let shelf: LibraryTarget?
+        var attempt: UInt32 = 0
+    }
+    /// The last connect's arguments.
+    private var lastDial: Redial?
+    /// A lost session waiting to dial again, or dialing: the connect overlay stays up for it.
+    /// Cleared once a redial streams, fails for good, or the user cancels.
+    @Published private(set) var redial: Redial?
     /// The library entry this session was launched with (`connect(launchID:)`), or nil if the user
     /// just connected to the host's desktop. Kept because where the client should go when the
     /// session ends depends on where it came FROM: a title launched out of the library belongs back
@@ -253,6 +270,8 @@ final class SessionModel: ObservableObject {
     /// index; a remote's Back and a captured Steam Controller carry none.
     var onRingChord: ((UInt32?) -> Void)?
     var onRingNav: ((RingNav) -> Void)?
+    /// A connect the host parked for its operator: the view shows the approval wait.
+    var onAwaitingApproval: ((StoredHost) -> Void)?
 
     /// The ring is up: the pad belongs to it (flushed on the host, edges become navigation).
     func setRingOpen(_ open: Bool) {
@@ -394,6 +413,9 @@ final class SessionModel: ObservableObject {
         }
         connectSeq += 1
         let attempt = connectSeq
+        lastDial = Redial(
+            host: host, effective: effective, gamepad: gamepad, launchID: launchID,
+            profileID: profileID, shelf: shelf)
         phase = .connecting
         activeHost = host
         launchedTitleID = launchID
@@ -475,7 +497,14 @@ final class SessionModel: ObservableObject {
                 // it (~180 s) — outwait that window so a slow approval still lands here. Normal
                 // connects keep the snappy default.
                 timeoutMs: requestAccess ? 185_000 : 10_000,
-                settings: effective) }
+                settings: effective,
+                onPending: { [weak self] in
+                    Task { @MainActor in
+                        guard let self, self.connectSeq == attempt, self.phase == .connecting
+                        else { return }
+                        self.onAwaitingApproval?(host)
+                    }
+                }) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 // The user may have abandoned this attempt (window closed, another host
@@ -507,7 +536,7 @@ final class SessionModel: ObservableObject {
                     // next session, and on tvOS it makes the host grid unfocusable behind it.
                     self.revealStream()
                     // true: the caller re-dials and says what it ends in.
-                    if case PunktfunkClientError.rejected(.profileUnknown) = error,
+                    if case PunktfunkClientError.rejected(.profileUnknown, _) = error,
                        onProfileUnknown?() == true {
                         return
                     }
@@ -515,6 +544,7 @@ final class SessionModel: ObservableObject {
                         error, hostName: host.displayName, pinned: pin != nil,
                         requestAccess: requestAccess, callerRecovers: onUnreachable != nil)
                     {
+                        self.redial = nil
                         self.errorMessage = message
                     } else {
                         // The caller owns recovery (wake-and-retry); its overlay explains it.
@@ -541,6 +571,7 @@ final class SessionModel: ObservableObject {
             + "gamepad=\(conn.resolvedGamepad.rawValue) mgmt=\(conn.hostMgmtPort)"
         sessionLog.info("\(landed, privacy: .public)")
         if trusted {
+            redial = nil
             connection = conn
             noteTouchFallback(conn)
             startStatsTimer()
@@ -827,6 +858,7 @@ final class SessionModel: ObservableObject {
     /// keep-alive linger; `sessionEnded()` (a host-ended / dropped session) passes `false` to
     /// leave the linger intact.
     func disconnect(deliberate: Bool = true) {
+        if deliberate { redial = nil }
         if connection != nil {
             let line = "disconnect \(activeHost?.displayName ?? "-") deliberate=\(deliberate) phase=\(phase)"
             sessionLog.info("\(line, privacy: .public)")
@@ -894,7 +926,17 @@ final class SessionModel: ObservableObject {
         let endLine = "session ended by \(name) reason=\(reason) "
             + "rejection=\(rejection.map { String(describing: $0) } ?? "-")"
         sessionLog.info("\(endLine, privacy: .public)")
+        // The streamed session proved the host's identity, so its redial is pinned to it.
+        let lostDial = lastDial.map { plan -> Redial in
+            var plan = plan
+            plan.host.pinnedSHA256 = conn.hostFingerprint
+            return plan
+        }
         disconnect(deliberate: false) // host/network ended it — keep the linger for a reconnect
+        if reason == .lost, rejection == nil, let lostDial {
+            redialAfterLoss(lostDial)
+            return
+        }
         if let rejection {
             // The host's sentence, else the shared typed-rejection wording
             // ("Your access to this host has expired…").
@@ -920,6 +962,30 @@ final class SessionModel: ObservableObject {
             // No verdict (an older core, or the close raced the read): keep the wording this path
             // has always used rather than inventing one.
             errorMessage = "Session ended by \(name)"
+        }
+    }
+
+    /// Dial a lost session again on the schedule every client shares, with the dial that started
+    /// it; the host resumes the session it still holds. A redial that can't reach the host is the
+    /// next attempt, and a spent schedule says the connection is lost.
+    private func redialAfterLoss(_ plan: Redial) {
+        guard let wait = PunktfunkConnection.SessionEndReason.lost.redialDelay(attempt: plan.attempt)
+        else {
+            redial = nil
+            errorMessage = "Lost the connection to \(plan.host.displayName)"
+            return
+        }
+        var next = plan
+        next.attempt += 1
+        redial = next
+        sessionLog.info("connection lost — redial \(next.attempt) after \(wait, privacy: .public)")
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: wait)
+            guard let self, self.redial?.attempt == next.attempt, self.phase == .idle else { return }
+            self.connect(
+                to: next.host, effective: next.effective, gamepad: next.gamepad,
+                launchID: next.launchID, profileID: next.profileID, shelf: next.shelf,
+                onUnreachable: { [weak self] in self?.redialAfterLoss(next) })
         }
     }
 

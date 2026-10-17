@@ -226,12 +226,9 @@ internal fun SessionWatchEffect(
                             "Your access to this host has expired.",
                             Toast.LENGTH_LONG,
                         ).show()
+                    // The redial says what happens next; this only says why the picture went.
                     reason == SessionEndReason.LOST ->
-                        Toast.makeText(
-                            context,
-                            "Connection lost — the host may be asleep. Wake it to reconnect.",
-                            Toast.LENGTH_LONG,
-                        ).show()
+                        Toast.makeText(context, "Lost the connection — reconnecting.", Toast.LENGTH_SHORT).show()
                     reason == SessionEndReason.HOST_ERROR ->
                         Toast.makeText(
                             context,

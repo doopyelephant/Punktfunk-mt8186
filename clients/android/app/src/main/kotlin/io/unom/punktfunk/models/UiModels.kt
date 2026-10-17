@@ -106,6 +106,8 @@ data class ActiveSession(
      * poster until the host reports the game running. Null for a desktop connect or a launcher tile.
      */
     val launchHold: LaunchHold? = null,
+    /** The dial that started this session, for a redial after the connection is lost. */
+    val redial: io.unom.punktfunk.DialSpec? = null,
 )
 
 /**

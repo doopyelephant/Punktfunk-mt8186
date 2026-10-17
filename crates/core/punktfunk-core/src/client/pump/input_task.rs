@@ -36,8 +36,8 @@ pub(super) struct MouseArgs {
     pub(super) client: Arc<ClientShared>,
     /// Host advertised `HOST_CAP2_SCROLL`: normalized events go out unchanged.
     pub(super) normalized_scroll: bool,
-    /// The control stream's writer, toward a host that reads key edges there
-    /// (`HOST_CAP2_INPUT_EDGES`). `None` keeps every event on the datagram plane.
+    /// The control stream's writer, toward a host that reads key and mouse-button edges
+    /// there (`HOST_CAP2_INPUT_EDGES`). `None` keeps every event on the datagram plane.
     pub(super) edges: Option<tokio::sync::mpsc::Sender<CtrlRequest>>,
 }
 
@@ -55,7 +55,7 @@ fn send_input(conn: &ClientConn, out: &mut ScrollOutput, args: &MouseArgs, ev: I
     if !granted(&args.client.access_grants, ev) {
         return;
     }
-    // A key edge goes reliable when the host reads it there. A full control queue means
+    // An edge goes reliable when the host reads it there. A full control queue means
     // the control task is wedged; the datagram is then the better bet than a stall.
     if let Some(ctrl) = args.edges.as_ref().filter(|_| is_edge(ev.kind)) {
         if ctrl.try_send(CtrlRequest::InputEdge(ev)).is_ok() {
@@ -65,9 +65,15 @@ fn send_input(conn: &ClientConn, out: &mut ScrollOutput, args: &MouseArgs, ev: I
     let _ = conn.send_datagram(ev.encode().to_vec());
 }
 
-/// The kinds whose loss sticks: a release the network drops holds the key.
+/// The kinds whose loss sticks: a release the network drops holds the key or button.
 fn is_edge(kind: InputKind) -> bool {
-    matches!(kind, InputKind::KeyDown | InputKind::KeyUp)
+    matches!(
+        kind,
+        InputKind::KeyDown
+            | InputKind::KeyUp
+            | InputKind::MouseButtonDown
+            | InputKind::MouseButtonUp
+    )
 }
 
 /// Whether the live grants cover `ev`'s [`crate::quic::classify`] class.
@@ -443,13 +449,13 @@ mod tests {
         }
     }
 
-    /// Toward a host that reads them, key edges leave on the control stream and nothing
-    /// else does; a closed control lane falls back to the datagram.
+    /// Toward a host that reads them, key and mouse-button edges leave on the control stream
+    /// and nothing else does; a closed control lane falls back to the datagram.
     #[tokio::test]
-    async fn key_edges_take_the_control_stream_when_the_host_reads_them() {
+    async fn edges_take_the_control_stream_when_the_host_reads_them() {
         let (_server, _client, client_conn, host_conn) = loopback().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel(4);
+        let (ctrl_tx, mut ctrl_rx) = tokio::sync::mpsc::channel(8);
         let client = client(crate::quic::GRANT_ALL);
         let args = MouseArgs {
             edges: Some(ctrl_tx),
@@ -457,8 +463,19 @@ mod tests {
         };
         let task = tokio::spawn(run(client_conn, rx, no_touch(), true, false, args));
 
+        let click = InputEvent {
+            kind: InputKind::MouseButtonDown,
+            code: 1,
+            ..key_down(0)
+        };
+        let release = InputEvent {
+            kind: InputKind::MouseButtonUp,
+            ..click
+        };
         tx.send(key_down(0x41)).unwrap();
         tx.send(key_up(0x41)).unwrap();
+        tx.send(click).unwrap();
+        tx.send(release).unwrap();
         tx.send(InputEvent {
             kind: InputKind::MouseMove,
             _pad: [0; 3],
@@ -468,10 +485,10 @@ mod tests {
             flags: 0,
         })
         .unwrap();
-        for want in [key_down(0x41), key_up(0x41)] {
+        for want in [key_down(0x41), key_up(0x41), click, release] {
             match ctrl_rx.recv().await {
                 Some(CtrlRequest::InputEdge(ev)) => assert_eq!(ev, want),
-                _ => panic!("a key edge on the control lane"),
+                _ => panic!("an edge on the control lane"),
             }
         }
         let motion = next_event(&host_conn, &[]).await;
@@ -480,7 +497,7 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(150), host_conn.read_datagram())
                 .await
                 .is_err(),
-            "no key edge as a datagram"
+            "no edge as a datagram"
         );
 
         drop(ctrl_rx);

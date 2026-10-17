@@ -122,6 +122,7 @@ internal fun SkiaConsole.fetchLibrary(c: JSONObject, refreshOnly: Boolean) {
             addr, mgmt, id.certPem, id.privateKeyPem, fp,
             macs = kh?.mac.orEmpty(),
             autoWake = autoWake,
+            streamPort = c.optInt("port"),
             isCancelled = { gen != fetchGen.get() },
             onWaking = { state.launch { if (gen == fetchGen.get()) NativeBridge.nativeConsoleLibraryStale(handle, 1) } },
         )

@@ -24,6 +24,8 @@ export CARGO_HOME=${CARGO_HOME:-/cargohome}
 BIN=$CARGO_TARGET_DIR/release
 HOST_IP=10.77.0.1
 CLIENT_IP=10.77.0.2
+# Where a roam profile moves the client (REBIND_AT).
+CLIENT_IP_MOVED=10.77.0.3
 PORT=9777
 # A fresh PIN per run: nothing to check in, and the ceremony is the real one.
 PIN=$(shuf -i 1000-9999 -n 1)
@@ -36,6 +38,7 @@ cleanup() {
   set +e
   [ -n "${HOST_PID:-}" ] && kill "$HOST_PID" 2>/dev/null
   [ -n "${WANDER_PID:-}" ] && kill "$WANDER_PID" 2>/dev/null
+  [ -n "${REBIND_PID:-}" ] && kill "$REBIND_PID" 2>/dev/null
   ip netns pids h 2>/dev/null | xargs -r kill 2>/dev/null
   ip netns pids c 2>/dev/null | xargs -r kill 2>/dev/null
   ip netns del h 2>/dev/null
@@ -212,6 +215,22 @@ run_probe() {
     --link "$ACHIEVABLE_KBPS:$RATE_KBIT" --profile "$PROFILE" \
     > "$OUT/$PROFILE-$n.log" 2>&1
 }
+# The roam: the client's address moves and the path may shrink with it. The new address is
+# added first; promote_secondaries keeps it when the old primary goes.
+if [ "$REBIND_AT" != 0 ]; then
+  (
+    sleep "$REBIND_AT"
+    echo "[rig] client moves to $CLIENT_IP_MOVED at ${REBIND_AT}s (mtu $REBIND_MTU, 0 = unchanged)"
+    ip netns exec c sysctl -qw net.ipv4.conf.vc.promote_secondaries=1
+    ip -n c addr add $CLIENT_IP_MOVED/24 dev vc
+    ip -n c addr del $CLIENT_IP/24 dev vc
+    if [ "$REBIND_MTU" != 0 ]; then
+      ip -n c link set vc mtu "$REBIND_MTU"
+      ip -n h link set vh mtu "$REBIND_MTU"
+    fi
+  ) &
+  REBIND_PID=$!
+fi
 for n in $(seq "$PROBES"); do
   run_probe "$n" &
 done
@@ -251,6 +270,21 @@ for n in $(seq "$PROBES"); do
           d[1] * f, d[2] * f, d[3] * f, d[4] * f }'
 done
 echo "trajectories: $OUT/$PROFILE-*.jsonl   host log: $OUT/$PROFILE-host.log"
+
+# ---- the roam ---------------------------------------------------------------
+# What the host's MTU watch did, and the delivered rate per window around the move: a
+# frozen picture reads as a run of zeros, a heal as the rate coming back.
+if [ "$REBIND_AT" != 0 ]; then
+  echo
+  echo "== roam at ${REBIND_AT}s (mtu $REBIND_MTU, 0 = unchanged) =="
+  clean "$OUT/$PROFILE-host.log" | grep 'wire MTU' | sed 's/^/host  /'
+  grep -h '^{"t_ms"' "$OUT/$PROFILE-1.jsonl" | tr -d '{}"' | awk -F'[:,]' \
+    -v from=$(( (REBIND_AT - 5) * 1000 )) -v to=$(( (REBIND_AT + 20) * 1000 )) '
+    { for (i = 1; i <= NF; i += 2) v[$i] = $(i+1)
+      if (v["t_ms"] >= from && v["t_ms"] <= to) printf "%.1fs:%d ", v["t_ms"] / 1000, v["delivered_kbps"] }
+    END { print "" }' | sed 's/^/kbps  /'
+  clean "$OUT/$PROFILE-1.log" | grep -i -m3 'lost\|session ended' | sed 's/^/probe /' || true
+fi
 
 # ---- the ramp guard ---------------------------------------------------------
 # A ramp step the HOST could not fill reads as a floor under the link, never a wall, and the

@@ -541,7 +541,7 @@ fn a_library_fetch_a_newer_fetch_outlived_writes_nothing() {
         spawn_fetch(
             svc.library.clone(),
             LOOPBACK.into(),
-            port,
+            (0, port),
             svc.identity.clone(),
             fp('a'),
             Vec::new(),
