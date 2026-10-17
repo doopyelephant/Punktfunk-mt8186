@@ -209,7 +209,7 @@
 
 #define PUNKTFUNK_GAMEPAD_BTN_MISC1 2097152
 
-// Connect to a `punktfunk/1` host at `width`x`height`@`refresh_hz`. Blocks up to
+// Connect to a `punktfunk/2` host at `width`x`height`@`refresh_hz`. Blocks up to
 // `timeout_ms`. NULL on failure. Same as [`punktfunk_connect_ex`] with
 // `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
 //
@@ -1477,7 +1477,7 @@ typedef struct JitterTuning JitterTuning;
 typedef struct LocalRecovery LocalRecovery;
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// Live `punktfunk/1` connection (QUIC control + UDP data, pumped on internal threads).
+// Live `punktfunk/2` connection (one QUIC connection and its media, pumped on internal threads).
 // One puller thread per plane; never two threads on the same plane.
 typedef struct PunktfunkConnection PunktfunkConnection;
 #endif

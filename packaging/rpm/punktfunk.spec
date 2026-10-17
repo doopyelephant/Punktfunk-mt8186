@@ -24,7 +24,7 @@ Name:           punktfunk
 # A plain `rpmbuild` (or COPR) with no defines builds 0.3.0-1.
 Version:        %{?pf_version}%{!?pf_version:0.3.0}
 Release:        %{?pf_release}%{!?pf_release:1}%{?dist}
-Summary:        Low-latency desktop/game streaming host (Moonlight-compatible + punktfunk/1)
+Summary:        Low-latency desktop/game streaming host (Moonlight-compatible + punktfunk/2)
 
 License:        MIT OR Apache-2.0
 URL:            https://git.unom.io/unom/punktfunk
@@ -148,14 +148,14 @@ Requires:       punktfunk-seats%{?_isa} = %{version}-%{release}
 %description
 punktfunk is a Linux-first, low-latency desktop and game streaming host. It speaks
 the Moonlight/GameStream protocol (pair a stock Moonlight client) and its own native
-punktfunk/1 protocol (GF(2^16) Leopard FEC + AES-GCM, mid-stream mode renegotiation,
+punktfunk/2 protocol (GF(2^16) Leopard FEC + AES-GCM, mid-stream mode renegotiation,
 client microphone passthrough). Each session gets a virtual output at the client's
 exact resolution and refresh via a per-compositor backend (KWin, gamescope, Mutter,
 Sway/wlroots), captured zero-copy (dmabuf -> CUDA -> NVENC) and split-encoded above
 ~1 Gpix/s. Input (mouse/keyboard/gamepads) is injected back into the session.
 
 %package client
-Summary:        Low-latency desktop/game streaming client (punktfunk/1, GTK4)
+Summary:        Low-latency desktop/game streaming client (punktfunk/2, GTK4)
 # Audio playback / mic capture want the PipeWire daemon; degrade gracefully without it.
 Recommends:     pipewire
 Recommends:     wireplumber

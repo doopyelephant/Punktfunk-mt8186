@@ -248,7 +248,7 @@ in
       '';
 
       meta = meta // {
-        description = "Low-latency desktop/game streaming host (Moonlight-compatible + native punktfunk/1)";
+        description = "Low-latency desktop/game streaming host (Moonlight-compatible + native punktfunk/2)";
         mainProgram = "punktfunk-host";
       };
     }
@@ -386,7 +386,7 @@ in
       '';
 
       meta = meta // {
-        description = "Native Linux punktfunk/1 streaming client (GTK4 shell + Vulkan session)";
+        description = "Native Linux punktfunk/2 streaming client (GTK4 shell + Vulkan session)";
         mainProgram = "punktfunk-client";
       };
     }

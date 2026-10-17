@@ -40,7 +40,7 @@ pub use video::*;
 #[cfg(feature = "quic")]
 use crate::*;
 
-/// Live `punktfunk/1` connection (QUIC control + UDP data, pumped on internal threads).
+/// Live `punktfunk/2` connection (one QUIC connection and its media, pumped on internal threads).
 /// One puller thread per plane; never two threads on the same plane.
 #[cfg(feature = "quic")]
 pub struct PunktfunkConnection {
@@ -508,7 +508,7 @@ pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE3: u32 = 0x0004_0000;
 pub const PUNKTFUNK_GAMEPAD_BTN_PADDLE4: u32 = 0x0008_0000;
 pub const PUNKTFUNK_GAMEPAD_BTN_MISC1: u32 = 0x0020_0000;
 
-/// Connect to a `punktfunk/1` host at `width`x`height`@`refresh_hz`. Blocks up to
+/// Connect to a `punktfunk/2` host at `width`x`height`@`refresh_hz`. Blocks up to
 /// `timeout_ms`. NULL on failure. Same as [`punktfunk_connect_ex`] with
 /// `compositor = PUNKTFUNK_COMPOSITOR_AUTO`.
 ///

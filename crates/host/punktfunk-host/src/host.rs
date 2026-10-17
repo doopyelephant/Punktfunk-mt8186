@@ -213,7 +213,7 @@ impl AppState {
 
 /// Run the host (blocks).
 ///
-/// Native punktfunk/1 (QUIC on `native.port`) and the management API always run and
+/// Native punktfunk/2 (QUIC on `native.port`) and the management API always run and
 /// share one [`crate::native_pairing`] handle. `gamestream` additionally brings up
 /// nvhttp pairing, RTSP, ENet control, and `_nvstream` mDNS. Those planes pair over
 /// plain HTTP and can reuse GCM nonces, so they are opt-in (`serve --gamestream`)
@@ -334,7 +334,7 @@ pub fn serve(
             "GameStream/Moonlight compat ENABLED (--gamestream): its pairing runs over plain HTTP and \
              its legacy control encryption can reuse GCM nonces (security-review #5/#9) — an on-path \
              LAN attacker could MITM pairing or recover input. Enable only on a TRUSTED network; prefer \
-             the native punktfunk/1 plane + clients for untrusted/WAN use."
+             the native punktfunk/2 plane + clients for untrusted/WAN use."
         );
     }
     if let Some(bind) = native.webtransport_bind {
@@ -395,7 +395,7 @@ pub fn serve(
                 let _advert = crate::gamestream::start(&state, native.mdns)?;
                 tracing::info!(
                     port = native.port,
-                    "unified host: GameStream/Moonlight compat + native punktfunk/1 (QUIC)"
+                    "unified host: GameStream/Moonlight compat + native punktfunk/2 (QUIC)"
                 );
                 tokio::try_join!(
                     crate::gamestream::nvhttp::run(state.clone()),
@@ -423,7 +423,7 @@ pub fn serve(
         } else {
             tracing::info!(
                 port = native.port,
-                "secure host: native punktfunk/1 (QUIC) + management API \
+                "secure host: native punktfunk/2 (QUIC) + management API \
                  (GameStream OFF — pass --gamestream for stock-Moonlight compat)"
             );
             tokio::try_join!(

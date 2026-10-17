@@ -1,5 +1,5 @@
 # punktfunk streaming host — systemd USER unit. Runs the SECURE native-only host by default
-# (punktfunk/1 clients + the management API; no plain-HTTP pairing / legacy GCM nonce reuse —
+# (punktfunk/2 clients + the management API; no plain-HTTP pairing / legacy GCM nonce reuse —
 # security-review #5/#9). Stock-Moonlight (GameStream) compat is OPT-IN: turn on GameStream
 # under Host → Settings in the web console and restart — no unit editing needed. Only do that
 # on a TRUSTED LAN; the compat planes need their extra ports too.

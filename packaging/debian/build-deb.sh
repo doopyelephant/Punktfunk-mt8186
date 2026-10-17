@@ -264,10 +264,10 @@ Homepage: https://git.unom.io/unom/punktfunk
 Depends: $DEPENDS
 Recommends: $RECOMMENDS
 Suggests: $SUGGESTS
-Description: Low-latency desktop/game streaming host (Moonlight + punktfunk/1)
+Description: Low-latency desktop/game streaming host (Moonlight + punktfunk/2)
  punktfunk is a Linux-first, low-latency desktop and game streaming host. It speaks
  the Moonlight/GameStream protocol (pair a stock Moonlight client) and its own native
- punktfunk/1 protocol (GF(2^16) Leopard FEC + AES-GCM, mid-stream mode renegotiation,
+ punktfunk/2 protocol (GF(2^16) Leopard FEC + AES-GCM, mid-stream mode renegotiation,
  client microphone passthrough). Each session gets a virtual output at the client's
  exact resolution and refresh via a per-compositor backend (KWin, gamescope, Mutter,
  Sway/wlroots), captured zero-copy (dmabuf -> CUDA -> NVENC). Input (mouse, keyboard,

@@ -34,8 +34,8 @@ monitors.
   [PyroWave](https://docs.punktfunk.unom.io/docs/pyrowave) — an intra-only wavelet codec run as
   Vulkan compute — spends bandwidth to cut codec latency by an order of magnitude, and every frame
   is a keyframe, so loss costs one frame instead of a recovery round-trip.
-- **Two protocols, one process.** `punktfunk/1` is the native plane: QUIC control, a GF(2¹⁶)
-  Leopard-RS FEC + AES-GCM data plane that breaks the ~1 Gbps FEC wall, mid-stream mode
+- **Two protocols, one process.** `punktfunk/2` is the native plane: QUIC on one UDP port, with a
+  GF(2¹⁶) Leopard-RS FEC + AES-GCM media plane that breaks the ~1 Gbps FEC wall, mid-stream mode
   renegotiation. `serve --gamestream` additionally serves any
   [Moonlight](https://moonlight-stream.org/) client — opt-in, trusted-LAN only, because GameStream
   has inherent on-path weaknesses.

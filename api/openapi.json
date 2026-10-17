@@ -17274,7 +17274,7 @@
     },
     {
       "name": "native",
-      "description": "Native punktfunk/1 pairing: arm a window, display the host PIN, manage paired devices"
+      "description": "Native pairing: arm a window, display the host PIN, manage paired devices"
     },
     {
       "name": "session",

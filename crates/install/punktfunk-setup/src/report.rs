@@ -141,7 +141,7 @@ pub fn verify(
             .probe("ss", &["-lun"])
             .is_some_and(|o| o.ok() && o.stdout.contains(":9777 "));
         if listening {
-            ui.ok("listening on UDP 9777 (punktfunk/1)");
+            ui.ok("listening on UDP 9777 (punktfunk/2)");
         } else {
             ui.warn(
                 "nothing on UDP 9777 yet — give it a second, then: journalctl --user -u punktfunk-host -e",
