@@ -24,6 +24,12 @@ object NativeBridge {
      */
     external fun nativeConnect(requestJson: String): Long
 
+    /**
+     * True while the dial [nativeConnect] is blocked on has been parked by the host for its
+     * operator's approval. The dial then waits for the verdict; show the approval wait.
+     */
+    external fun nativeDialPending(): Boolean
+
     /** 64-hex SHA-256 of the cert the host presented on [handle]; valid after a successful connect. */
     external fun nativeHostFingerprint(handle: Long): String
 
@@ -125,6 +131,9 @@ object NativeBridge {
      * WHY instead of the old catch-all that blamed the PIN for dead network paths.
      */
     external fun nativeTakeLastError(): String
+
+    /** The host's own sentence with the last refusal, cleared on read; "" when it said none. */
+    external fun nativeTakeLastSaid(): String
 
     /**
      * Signal a **deliberate** user disconnect on [handle] before [nativeClose]: the session closes
@@ -916,7 +925,8 @@ object NativeBridge {
 
     /**
      * Where the session the console asked for stands: 0 connecting, 1 streaming, 2 failed([message]),
-     * 3 ended ([message] = the abnormal reason, or "" for a clean end), 4 reconnecting([message]).
+     * 3 ended ([message] = the abnormal reason, or "" for a clean end), 4 reconnecting([message]),
+     * 5 failed as profile-unknown([message]), 6 awaiting the host operator's approval.
      */
     external fun nativeConsoleSessionPhase(handle: Long, phase: Int, message: String)
 

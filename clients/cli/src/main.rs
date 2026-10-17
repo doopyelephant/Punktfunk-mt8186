@@ -1305,6 +1305,9 @@ from the config directory for a true factory reset."
         let mut failure: Option<orchestrate::SessionError> = None;
         while let Ok(ev) = rx.recv() {
             match ev {
+                SessionEvent::AwaitingApproval => {
+                    eprintln!("waiting for the host's operator to approve this device")
+                }
                 SessionEvent::Ready => {
                     eprintln!("streaming");
                     // The pin we connected WITH, not one re-derived from the store: the record

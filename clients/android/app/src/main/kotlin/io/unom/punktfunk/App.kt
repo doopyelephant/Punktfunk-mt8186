@@ -280,7 +280,7 @@ fun App(forceGamepadUi: Boolean = false) {
                     is HostServices.Failed -> if (!dialed.unreachable) {
                         Toast.makeText(
                             context,
-                            ConnectErrors.connectMessage(dialed.token, requestAccess = false),
+                            dialed.said.ifEmpty { ConnectErrors.connectMessage(dialed.token, requestAccess = false) },
                             Toast.LENGTH_LONG,
                         ).show()
                         break

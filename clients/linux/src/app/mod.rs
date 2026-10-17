@@ -172,6 +172,8 @@ pub enum AppMsg {
     /// End the running stream the way its window does.
     Disconnect,
     Toast(String),
+    /// A plain connect the host parked for its operator: show the waiting dialog.
+    AwaitingApproval(ConnectRequest),
 }
 
 pub struct AppInit {
@@ -591,6 +593,20 @@ impl SimpleComponent for AppModel {
                 }
             }
             AppMsg::Toast(msg) => self.toast(&msg),
+            AppMsg::AwaitingApproval(req) => {
+                // A request for access already shows it.
+                if self.flight.waiting.borrow().is_none() {
+                    if let connect::Slot::Session(child) = &self.flight.slot {
+                        let child = child.clone();
+                        gate::present_waiting(
+                            &self.window,
+                            &self.flight.waiting,
+                            &req.host.name,
+                            move || child.terminate(DISCONNECT_GRACE),
+                        );
+                    }
+                }
+            }
         }
     }
 }

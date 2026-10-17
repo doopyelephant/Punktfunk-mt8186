@@ -332,7 +332,7 @@ fun LibraryScreen(
                 }
                 Toast.makeText(
                     context,
-                    ConnectErrors.connectMessage(token, requestAccess = false),
+                    dialed.said.ifEmpty { ConnectErrors.connectMessage(token, requestAccess = false) },
                     Toast.LENGTH_LONG,
                 ).show()
             }

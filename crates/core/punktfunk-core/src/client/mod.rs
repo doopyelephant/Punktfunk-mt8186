@@ -601,7 +601,15 @@ pub struct ConnectParams {
     /// Abort while blocked: a request-access knock parks ~185 s. Never alias the session's
     /// `shutdown` onto it; that races the end reason. `None` = uncancelable.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Called once, on the connecting thread, when the host answers that its operator is
+    /// deciding about this device. From then the dial waits for the host's verdict, up to
+    /// [`APPROVAL_WAIT`], not `timeout`; `cancel` still ends it. `None`: `timeout` stands.
+    pub on_pending: Option<Arc<dyn Fn() + Send + Sync>>,
 }
+
+/// Longest a dial waits on an operator once the host said it is asking. The host answers
+/// sooner: approval, a refusal, or its own timeout.
+pub const APPROVAL_WAIT: Duration = Duration::from_secs(10 * 60);
 
 impl ConnectParams {
     /// A plain dial to `host:port` at (up to) `mode`, giving up after `timeout`.
@@ -634,6 +642,7 @@ impl ConnectParams {
             profile: None,
             timeout,
             cancel: None,
+            on_pending: None,
         }
     }
 }
@@ -662,6 +671,7 @@ impl NativeClient {
             .store(params.probe_only, Ordering::Relaxed);
 
         let cancel = params.cancel.take();
+        let on_pending = params.on_pending.take();
         let (timeout, bitrate_kbps, requested_gamepad) =
             (params.timeout, params.bitrate_kbps, params.gamepad);
         // RED is core-decided; HIRES is not. See `advertised_client_caps`.
@@ -704,8 +714,16 @@ impl NativeClient {
 
         // Poll so `cancel` can abort; a parked request-access handshake has nothing to wake on.
         const READY_POLL: Duration = Duration::from_millis(50);
-        let deadline = std::time::Instant::now() + timeout;
+        let mut deadline = std::time::Instant::now() + timeout;
+        let mut told_pending = false;
         let negotiated = loop {
+            if !told_pending && shared.pending.load(Ordering::Relaxed) {
+                told_pending = true;
+                if let Some(hook) = &on_pending {
+                    hook();
+                    deadline = deadline.max(std::time::Instant::now() + APPROVAL_WAIT);
+                }
+            }
             match ready_rx.recv_timeout(READY_POLL) {
                 Ok(Ok(t)) => break t,
                 Ok(Err(e)) => {

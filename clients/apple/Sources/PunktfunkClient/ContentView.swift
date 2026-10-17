@@ -323,6 +323,13 @@ struct ContentView: View {
         }
         .animation(.easeInOut(duration: 0.3), value: model.launchHold)
         .onAppear {
+            // A plain connect the host parked for its operator gets the request-access wait.
+            let approval = $awaitingApproval
+            model.onAwaitingApproval = { host in
+                if approval.wrappedValue == nil {
+                    approval.wrappedValue = ApprovalRequest(host: host, advertisedFingerprint: nil)
+                }
+            }
             DemoMode.resume(in: store)
             autoConnectIfAsked()
             // An intent that ran before this window subscribed. Ahead of the start screen,
@@ -904,7 +911,7 @@ struct ContentView: View {
             requestAccess: flow.consoleRequestAccess,
             requestAccessDiscovered: flow.requestAccessDiscovered,
             launchTitle: { launch($0, $1, profile: .send($2)) }, connectShelf: connectFromShelf,
-            wakeOnly: { flow.wakeOnly($0) })
+            wakeOnly: { flow.wakeOnly($0) }, awaitingApproval: awaitingApproval != nil)
     }
 
     #if !os(macOS)

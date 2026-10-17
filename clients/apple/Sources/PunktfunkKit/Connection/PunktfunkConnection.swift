@@ -141,8 +141,9 @@ public enum PunktfunkClientError: Error {
     case status(Int32)
     /// The host deliberately turned the attempt away and said why (its typed QUIC
     /// application close) — distinct from `.connectFailed` (unreachable/timeout) so the UI
-    /// can show the stated reason instead of blaming the network.
-    case rejected(HostRejection)
+    /// can show the stated reason instead of blaming the network. `said` is the host's own
+    /// sentence when it sent one, which outranks the typed reason's wording.
+    case rejected(HostRejection, said: String? = nil)
 }
 
 /// Why a host turned a connect/pair attempt away — decoded from the
@@ -256,6 +257,12 @@ public enum HostRejection: Sendable {
 func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> R) -> R {
     guard let s else { return body(nil) }
     return s.withCString { body($0) }
+}
+
+/// A connect's `onPending`, carried through the C callback's context pointer.
+private final class PendingCallback {
+    let call: @Sendable () -> Void
+    init(_ call: @escaping @Sendable () -> Void) { self.call = call }
 }
 
 public extension PunktfunkConnection {
@@ -1081,7 +1088,10 @@ public final class PunktfunkConnection: @unchecked Sendable {
         timeoutMs: UInt32 = 10_000,
         // `deliveryProbeOnly` dials a network check's probes-only session; 0 streams.
         deliveryFlags: UInt8 = 0,
-        settings: EffectiveSettings = EffectiveSettings(defaults: .standard)
+        settings: EffectiveSettings = EffectiveSettings(defaults: .standard),
+        // Called once, on this thread, when the host answers that its operator is deciding about
+        // this device; the connect then waits for that verdict instead of `timeoutMs`.
+        onPending: (@Sendable () -> Void)? = nil
     ) throws {
         self.settings = settings
         _ = Self.abiVersionGate // version-equality guard — fail loudly before the first C call
@@ -1127,7 +1137,16 @@ public final class PunktfunkConnection: @unchecked Sendable {
         opts.client_caps = clientCaps
         opts.video_fit = videoFit
         opts.timeout_ms = timeoutMs
-        let dialed = host.withCString { cs in
+        // The callback runs inside the connect call below, so the box only has to outlive it.
+        let pending = onPending.map(PendingCallback.init)
+        if let pending {
+            opts.on_pending = { ctx in
+                guard let ctx else { return }
+                Unmanaged<PendingCallback>.fromOpaque(ctx).takeUnretainedValue().call()
+            }
+            opts.on_pending_ctx = Unmanaged.passUnretained(pending).toOpaque()
+        }
+        let dialed = withExtendedLifetime(pending) { host.withCString { cs in
             withOptionalCString(identity?.certPEM) { cert in
                 withOptionalCString(identity?.keyPEM) { key in
                     withOptionalCString(launchID) { launch in
@@ -1162,10 +1181,14 @@ public final class PunktfunkConnection: @unchecked Sendable {
                     }
                 }
             }
-        }
+        } }
         guard let opened = dialed else {
             if let rejection = HostRejection(status: connectStatus) {
-                throw PunktfunkClientError.rejected(rejection)
+                // The host's own sentence, read on this thread right after the refusal.
+                var said = [CChar](repeating: 0, count: 512)
+                let ok = punktfunk_connect_refusal(&said, UInt(said.count)) == statusOK
+                let text = ok ? String(cString: said) : ""
+                throw PunktfunkClientError.rejected(rejection, said: text.isEmpty ? nil : text)
             }
             throw PunktfunkClientError.connectFailed
         }

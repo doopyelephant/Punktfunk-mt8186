@@ -434,6 +434,14 @@ impl Shell {
                 break;
             }
             match ev {
+                // The host parked the dial for its operator: the parent shell and the console
+                // both show the approval wait.
+                SessionEvent::AwaitingApproval => {
+                    emit(SessionLine::AwaitingApproval);
+                    if let Some(o) = self.overlay.as_mut() {
+                        o.session_phase(SessionPhase::AwaitingApproval);
+                    }
+                }
                 SessionEvent::Connected {
                     connector,
                     mode,

@@ -1633,8 +1633,14 @@ typedef struct {
     // ([`punktfunk_pyrowave_kbps`]). `0`, which a shorter prefix defaults to, leaves the
     // host's own.
     uint16_t pyrowave_bpp_x100;
-    // Always `0`. Fills what would otherwise be tail padding.
+    // Always `0`. Fills what would otherwise be padding.
     uint8_t reserved4[6];
+    // Called once, on the connecting thread, when the host answers that its operator is
+    // deciding about this device: show "waiting for approval". The connect then waits for the
+    // host's verdict, up to ten minutes, not `timeout_ms`. Null: `timeout_ms` stands.
+    void (*on_pending)(void *ctx);
+    // Handed back to `on_pending` untouched.
+    void *on_pending_ctx;
 } PunktfunkConnectOpts;
 #endif
 
@@ -2498,6 +2504,17 @@ PunktfunkConnection *punktfunk_connect_ex12(const char *host,
                                             const char *device_name,
                                             uint32_t timeout_ms,
                                             int32_t *status_out);
+#endif
+
+#if defined(PUNKTFUNK_FEATURE_QUIC)
+// The sentence the host sent when it refused the last connect on this thread, for a caller
+// holding a `PUNKTFUNK_STATUS_REJECTED_*` status: a host can name what only it knows, such as
+// who holds the seat. Empty when it said nothing. Read on the connecting thread, right after
+// the failed connect. `INVALID_ARG` when `out` is null or `cap` too small for it and a NUL.
+//
+// # Safety
+// `out` is null or writable for `cap` bytes.
+PunktfunkStatus punktfunk_connect_refusal(char *out, uintptr_t cap);
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)

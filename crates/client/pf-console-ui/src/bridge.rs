@@ -409,7 +409,8 @@ pub fn key_code(code: u8) -> Option<Key> {
 pub const PHASE_PROFILE_GONE: u8 = 5;
 
 /// 0 connecting, 1 streaming, 2 failed, 3 ended (an empty `message` is a clean end),
-/// 4 reconnecting, [`PHASE_PROFILE_GONE`] failed as `profile-unknown`.
+/// 4 reconnecting, [`PHASE_PROFILE_GONE`] failed as `profile-unknown`, 6 awaiting the host
+/// operator's approval.
 pub fn phase_code(code: u8, message: &str) -> Option<SessionPhase<'_>> {
     Some(match code {
         0 => SessionPhase::Connecting,
@@ -417,6 +418,7 @@ pub fn phase_code(code: u8, message: &str) -> Option<SessionPhase<'_>> {
         2 | PHASE_PROFILE_GONE => SessionPhase::Failed(message),
         3 => SessionPhase::Ended((!message.is_empty()).then_some(message)),
         4 => SessionPhase::Reconnecting(message),
+        6 => SessionPhase::AwaitingApproval,
         _ => return None,
     })
 }
@@ -528,6 +530,7 @@ mod tests {
                 "failed" => matches!(p, Some(SessionPhase::Failed("m"))),
                 "ended" => matches!(p, Some(SessionPhase::Ended(Some("m")))),
                 "reconnecting" => matches!(p, Some(SessionPhase::Reconnecting("m"))),
+                "awaiting_approval" => matches!(p, Some(SessionPhase::AwaitingApproval)),
                 "profile_gone" => {
                     code == usize::from(PHASE_PROFILE_GONE)
                         && matches!(p, Some(SessionPhase::Failed("m")))

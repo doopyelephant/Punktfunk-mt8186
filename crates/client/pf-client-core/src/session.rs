@@ -267,6 +267,8 @@ pub struct DecodeFacts {
 }
 
 pub enum SessionEvent {
+    /// The host is asking its operator about this device; the dial waits for the answer.
+    AwaitingApproval,
     Connected {
         connector: Arc<NativeClient>,
         mode: Mode,
@@ -590,11 +592,13 @@ fn client_caps(params: &SessionParams, pad_audio_on: bool) -> u8 {
         | bit(params.keep_host_audio, CLIENT_CAP_KEEP_HOST_AUDIO)
 }
 
-/// Dial the host. `Err` is the terminal event the pump sends instead of `Connected`.
+/// Dial the host. `Err` is the terminal event the pump sends instead of `Connected`; a host
+/// that parks the dial for its operator raises [`SessionEvent::AwaitingApproval`] on `ev_tx`.
 fn dial(
     params: &SessionParams,
     stop: &Arc<AtomicBool>,
     plan: &ConnectPlan,
+    ev_tx: &async_channel::Sender<SessionEvent>,
 ) -> Result<Arc<NativeClient>, SessionEvent> {
     // Lossless opt-in, filtered by what this box can play. `CLIENT_CAP_AUDIO_HIRES`
     // means capable *and* the user turned it on — advertising without being able to
@@ -656,6 +660,12 @@ fn dial(
         // it this parks the pump for the whole budget (185 s on a request-access
         // connect the host holds pending) and cancel cannot be answered until return.
         cancel: Some(stop.clone()),
+        on_pending: Some({
+            let ev_tx = ev_tx.clone();
+            Arc::new(move || {
+                let _ = ev_tx.try_send(SessionEvent::AwaitingApproval);
+            })
+        }),
         ..ConnectParams::new(
             &params.host,
             params.port,
@@ -667,13 +677,13 @@ fn dial(
     .map_err(|e| {
         let trust_rejected = matches!(e, PunktfunkError::Crypto);
         let refused = match e {
-            PunktfunkError::Rejected(reason) => Some(reason),
+            PunktfunkError::Rejected(reason, _) => Some(reason),
             _ => None,
         };
         let not_ready = params.waking()
             && matches!(
                 e,
-                PunktfunkError::Rejected(punktfunk_core::reject::RejectReason::SetupFailed)
+                PunktfunkError::Rejected(punktfunk_core::reject::RejectReason::SetupFailed, _)
             );
         let msg = match e {
             PunktfunkError::Crypto => {
@@ -683,7 +693,9 @@ fn dial(
             PunktfunkError::Timeout => "Connection timed out".to_string(),
             // Host said why it turned us away — show that verbatim: "denied on the
             // host" and "timed out" call for different next steps.
-            PunktfunkError::Rejected(reason) => crate::trust::connect_reject_message(reason),
+            PunktfunkError::Rejected(reason, said) => {
+                crate::trust::reject_message(reason, Some(&said))
+            }
             other => {
                 tracing::warn!(error = %other, "connect failed");
                 "The host didn't answer".to_string()
@@ -957,7 +969,7 @@ fn pump(
     while Instant::now() < until && !stop.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let connector = match dial(&params, &stop, &plan) {
+    let connector = match dial(&params, &stop, &plan, &ev_tx) {
         Ok(c) => c,
         Err(failed) => {
             let _ = ev_tx.send_blocking(failed);

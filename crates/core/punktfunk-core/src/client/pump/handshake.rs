@@ -126,6 +126,7 @@ async fn dial(
                 if endpoint::refused_alpn(&e) {
                     return Err(PunktfunkError::Rejected(
                         crate::reject::RejectReason::WireVersionMismatch,
+                        String::new(),
                     ));
                 }
                 // Only TimedOut (host never answered) is retryable.
@@ -245,6 +246,9 @@ async fn dial(
                 Redirect::TYPE => return Ok(Step::Redirected(Redirect::from_body(&body)?)),
                 registry::MSG_PENDING if !std::mem::replace(&mut waiting, true) => {
                     tracing::info!("the host is waiting for this device to be approved");
+                    args.shared
+                        .pending
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 _ => {}
             }
@@ -372,7 +376,7 @@ async fn dial(
                     .await;
             }
             Err(match reject_from_close(&conn) {
-                Some((r, _)) => PunktfunkError::Rejected(r),
+                Some((r, said)) => PunktfunkError::Rejected(r, said),
                 None => e,
             })
         }

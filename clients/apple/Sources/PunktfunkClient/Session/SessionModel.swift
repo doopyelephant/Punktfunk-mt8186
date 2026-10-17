@@ -270,6 +270,8 @@ final class SessionModel: ObservableObject {
     /// index; a remote's Back and a captured Steam Controller carry none.
     var onRingChord: ((UInt32?) -> Void)?
     var onRingNav: ((RingNav) -> Void)?
+    /// A connect the host parked for its operator: the view shows the approval wait.
+    var onAwaitingApproval: ((StoredHost) -> Void)?
 
     /// The ring is up: the pad belongs to it (flushed on the host, edges become navigation).
     func setRingOpen(_ open: Bool) {
@@ -495,7 +497,14 @@ final class SessionModel: ObservableObject {
                 // it (~180 s) — outwait that window so a slow approval still lands here. Normal
                 // connects keep the snappy default.
                 timeoutMs: requestAccess ? 185_000 : 10_000,
-                settings: effective) }
+                settings: effective,
+                onPending: { [weak self] in
+                    Task { @MainActor in
+                        guard let self, self.connectSeq == attempt, self.phase == .connecting
+                        else { return }
+                        self.onAwaitingApproval?(host)
+                    }
+                }) }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 // The user may have abandoned this attempt (window closed, another host
@@ -527,7 +536,7 @@ final class SessionModel: ObservableObject {
                     // next session, and on tvOS it makes the host grid unfocusable behind it.
                     self.revealStream()
                     // true: the caller re-dials and says what it ends in.
-                    if case PunktfunkClientError.rejected(.profileUnknown) = error,
+                    if case PunktfunkClientError.rejected(.profileUnknown, _) = error,
                        onProfileUnknown?() == true {
                         return
                     }

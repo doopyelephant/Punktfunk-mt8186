@@ -49,6 +49,9 @@ interface HostNative {
 
     /** The token of the last failed connect or pairing, cleared on read. */
     fun lastError(): String
+
+    /** What the host said with the last refusal, cleared on read; empty when it said none. */
+    fun lastSaid(): String = ""
     fun close(handle: Long)
 
     /** The fingerprint the host on [handle] presented; empty when none. */
@@ -82,6 +85,7 @@ interface HostNative {
 class JniHostNative(private val context: Context) : HostNative {
     override suspend fun connect(spec: DialSpec): Long = connectToHost(context, spec)
     override fun lastError(): String = NativeBridge.nativeTakeLastError()
+    override fun lastSaid(): String = NativeBridge.nativeTakeLastSaid()
     override fun close(handle: Long) = NativeBridge.nativeClose(handle)
     override fun fingerprint(handle: Long): String = NativeBridge.nativeHostFingerprint(handle)
     override fun mgmtPort(handle: Long): Int = NativeBridge.nativeHostMgmtPort(handle)
@@ -145,7 +149,7 @@ class HostServices(val store: KnownHostStore, private val native: HostNative) {
     data class Connected(val session: ActiveSession, val record: KnownHost?, val pinned: Boolean) : Dialed
 
     /** No session: [token] is the native cause (`""` when none was given). */
-    data class Failed(val token: String) : Opened, Dialed {
+    data class Failed(val token: String, val said: String = "") : Opened, Dialed {
         /** Nothing typed came back: the host may be asleep or off the path. */
         val unreachable: Boolean get() = token == "timeout" || token == "io" || token.isEmpty()
     }
@@ -173,7 +177,7 @@ class HostServices(val store: KnownHostStore, private val native: HostNative) {
             if (handle != 0L) withContext(Dispatchers.IO) { native.close(handle) }
             return Cancelled
         }
-        return if (handle != 0L) Open(handle) else Failed(native.lastError())
+        return if (handle != 0L) Open(handle) else Failed(native.lastError(), native.lastSaid())
     }
 
     /**

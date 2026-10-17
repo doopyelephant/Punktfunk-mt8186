@@ -93,6 +93,8 @@ pub enum PointerInput {
 /// Browse-mode lifecycle. OSD/HUD ignore these.
 pub enum SessionPhase<'a> {
     Connecting,
+    /// The host is asking its operator about this device; the connect waits on that.
+    AwaitingApproval,
     Streaming,
     /// Browse returns to the library with this message.
     Failed(&'a str),

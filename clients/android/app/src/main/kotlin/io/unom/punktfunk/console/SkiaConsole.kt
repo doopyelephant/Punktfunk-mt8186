@@ -22,6 +22,7 @@ import io.unom.punktfunk.HostRecords
 import io.unom.punktfunk.HostServices
 import io.unom.punktfunk.JniHostNative
 import io.unom.punktfunk.ProfilesAnswer
+import io.unom.punktfunk.PENDING_POLL_MS
 import io.unom.punktfunk.PresetStore
 import io.unom.punktfunk.REQUEST_ACCESS_TIMEOUT_MS
 import io.unom.punktfunk.Settings
@@ -765,8 +766,14 @@ object SkiaConsole {
         )
         // A host the dial saves by what it presented is named by its advert, else its address.
         val name = services.discovered.firstOrNull { it.host == addr && it.port == port }?.name ?: addr
+        // A dial the host parks for its operator narrates the approval wait (phase 6).
+        val watch = state.launch {
+            while (!NativeBridge.nativeDialPending()) kotlinx.coroutines.delay(PENDING_POLL_MS)
+            NativeBridge.nativeConsoleSessionPhase(handle, 6, "")
+        }
         state.launch {
             val dialed = services.dial(spec, kh, name, requestAccess, ticket)
+            watch.cancel()
             if (dialed is HostServices.Cancelled) return@launch
             dial = null
             if (dialed is HostServices.Connected) {
@@ -801,7 +808,7 @@ object SkiaConsole {
                 // 5: the console forgets the pick and asks the box's list once more.
                 NativeBridge.nativeConsoleSessionPhase(
                     handle, if (token == "profile-unknown") 5 else 2,
-                    ConnectErrors.connectMessage(token, requestAccess),
+                    dialed.said.ifEmpty { ConnectErrors.connectMessage(token, requestAccess) },
                 )
                 resumeDiscovery()
             }
