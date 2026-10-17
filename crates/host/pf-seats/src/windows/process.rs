@@ -575,8 +575,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// A child in another session ends when its job closes, as it must when the service dies.
-    /// It needs LocalSystem and a session beside 0, so it runs nowhere else.
+    /// It needs a LocalSystem allowed to start a process in the console session, which a CI
+    /// runner's service context is not, so it runs on demand with `--ignored`.
     #[test]
+    #[ignore = "needs LocalSystem that may start a process in the console session"]
     fn a_job_ends_a_child_in_another_session() {
         if !util::is_local_system().unwrap_or(false) {
             eprintln!("skipped: not LocalSystem");
