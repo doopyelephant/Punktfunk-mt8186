@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 mod control;
 pub(crate) mod frame_channel;
 pub mod health;
+pub mod mgmt;
 mod pad_mouse;
 mod pad_touch;
 mod pairing;

@@ -767,6 +767,60 @@ mod tests {
         );
     }
 
+    /// Core's blocking client tunnel against this one: a request arrives with the client's
+    /// certificate and its reply comes back whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_core_client_tunnel_reaches_the_router() {
+        use punktfunk_core::client::mgmt::MgmtTunnel;
+        use punktfunk_core::quic::endpoint;
+        use punktfunk_core::quic::v2::{io, registry};
+        let router = Router::new().route(
+            "/api/v1/whoami",
+            get(
+                |axum::Extension(fp): axum::Extension<PeerCertFingerprint>| async move {
+                    fp.0.unwrap_or_else(|| "none".into())
+                },
+            ),
+        );
+        let (cert, key) = endpoint::generate_identity().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (server, _media) = endpoint::server_shared(
+            loopback,
+            &cert,
+            &key,
+            Duration::from_secs(8),
+            &[registry::ALPN],
+        )
+        .unwrap();
+        let bind = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (tx, mut rx) = conn.accept_bi().await.unwrap();
+            assert_eq!(
+                io::read_stream_type(&mut rx).await.unwrap(),
+                registry::STREAM_MANAGEMENT
+            );
+            let _ = tunnel_quic(conn, (tx, rx), router, bind).await;
+        });
+        let (me_cert, me_key) = endpoint::generate_identity().unwrap();
+        let mine = hex::encode(endpoint::fingerprint_of_pem(&me_cert).unwrap());
+        let reply = tokio::task::spawn_blocking(move || {
+            let tunnel = MgmtTunnel::open(
+                "127.0.0.1",
+                bind.port(),
+                (&me_cert, &me_key),
+                None,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            tunnel.request("GET", "/api/v1/whoami", b"").unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body, mine.as_bytes());
+    }
+
     fn parse_reply(all: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
         let len = u32::from_be_bytes(all[..4].try_into().unwrap()) as usize;
         let reply: serde_json::Value = serde_json::from_slice(&all[4..4 + len]).unwrap();
