@@ -224,15 +224,17 @@ impl PunktfunkEndReason {
 
 #[cfg(feature = "quic")]
 impl From<&quinn::ConnectionError> for PunktfunkEndReason {
-    /// Map a QUIC close. Host app codes: `APP_EXITED` → GameExited, `0` → HostEnded.
-    /// Any other application code is unnamed and treated as `HostError` (visible) rather
-    /// than a clean host end. Transport-level failures are `Lost`.
+    /// Map a QUIC close. Host app codes: `APP_EXITED` → GameExited, `PATH_SHRANK` → Lost
+    /// (a redial heals it), `0` → HostEnded. Any other application code is unnamed and
+    /// treated as `HostError` (visible) rather than a clean host end. Transport-level
+    /// failures are `Lost`.
     fn from(e: &quinn::ConnectionError) -> Self {
         match e {
             quinn::ConnectionError::LocallyClosed => Self::Local,
             quinn::ConnectionError::ApplicationClosed(ac) => {
                 match u32::try_from(u64::from(ac.error_code)) {
                     Ok(crate::quic::APP_EXITED_CLOSE_CODE) => Self::GameExited,
+                    Ok(crate::quic::PATH_SHRANK_CLOSE_CODE) => Self::Lost,
                     Ok(0) => Self::HostEnded,
                     _ => Self::HostError,
                 }
@@ -1962,6 +1964,33 @@ fn expires_in_secs(deadline_unix: Option<u64>, now_unix: u64) -> u32 {
             .unwrap_or(u32::MAX)
             .max(1)
     })
+}
+
+#[cfg(all(test, feature = "quic"))]
+mod end_reason_tests {
+    use super::PunktfunkEndReason;
+
+    fn closed_with(code: u32) -> PunktfunkEndReason {
+        let e = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(code),
+            reason: Default::default(),
+        });
+        PunktfunkEndReason::from(&e)
+    }
+
+    /// A path too small for the stream redials like a dropped connection.
+    #[test]
+    fn a_shrunk_path_reads_as_lost() {
+        assert_eq!(
+            closed_with(crate::quic::PATH_SHRANK_CLOSE_CODE),
+            PunktfunkEndReason::Lost
+        );
+        assert_eq!(
+            closed_with(crate::quic::APP_EXITED_CLOSE_CODE),
+            PunktfunkEndReason::GameExited
+        );
+        assert_eq!(closed_with(0x6B), PunktfunkEndReason::HostError);
+    }
 }
 
 #[cfg(test)]

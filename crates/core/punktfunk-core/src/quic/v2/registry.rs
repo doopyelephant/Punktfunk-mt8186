@@ -274,6 +274,10 @@ mod tests {
         ("QUIT_CLOSE_CODE", crate::quic::QUIT_CLOSE_CODE),
         ("APP_EXITED_CLOSE_CODE", crate::quic::APP_EXITED_CLOSE_CODE),
         (
+            "PATH_SHRANK_CLOSE_CODE",
+            crate::quic::PATH_SHRANK_CLOSE_CODE,
+        ),
+        (
             "PAIR_NOT_ARMED_CLOSE_CODE",
             crate::reject::PAIR_NOT_ARMED_CLOSE_CODE,
         ),

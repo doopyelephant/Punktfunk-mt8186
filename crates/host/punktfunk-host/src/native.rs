@@ -1264,12 +1264,12 @@ pub(crate) async fn run_admitted(
         && codec != crate::encode::Codec::PyroWave
         && matches!(data_plane, DataPlane::Shared(_)))
     .then_some(wire_mtu::ShardReneg {
-        client_ceiling: hello.max_shard_payload,
         change_tx: shard.change_tx,
         ack_rx: shard.ack_rx,
         apply_tx: shard.apply_tx,
     });
-    // Path-MTU watch: clamp for the next session, and heal/grow this one if the driver exists.
+    // Path-MTU watch for the connection's life: clamp for the next session, and heal/grow
+    // this one if the driver exists, including after the client moves.
     wire_mtu::spawn_watch(
         conn.clone(),
         welcome.shard_payload as usize,
