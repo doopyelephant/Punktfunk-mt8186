@@ -35,7 +35,7 @@
 # decoder exists — so an HEVC session on a box whose GPU cannot decode HEVC reconnects on a
 # codec this client can finish (pf-client-core's `last_rung_verdict`) instead of falling back
 # to software. That is a refusal by design, not a packaging gap.
-app-id: io.unom.punktfunk
+id: io.unom.punktfunk
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk

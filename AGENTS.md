@@ -65,6 +65,12 @@ Do not add a player-facing setting without the maintainer's yes. First make it a
 the OS, or fix the detection. Automatic means automatic; never override what the player picked.
 Rules and examples: `docs/settings.md`.
 
+## Identifiers
+
+Reverse-DNS IDs are lowercase `io.unom.punktfunk`, with a lowercase suffix. Adding or renaming an
+app, bundle, package or service ID: read `docs/identifiers.md` first, for platform conventions and
+the IDs that never change.
+
 ## Feature requests
 
 New features do not belong on `git.unom.io`. Discuss a feature, a design proposal or a
