@@ -22,6 +22,8 @@ use std::process::Command;
 pub(crate) const RUNNER_DATA_DIR: &str = "plugin-run";
 
 pub mod access;
+#[cfg(any(test, target_os = "windows"))]
+mod ace_plan;
 pub mod manifest;
 #[cfg(target_os = "windows")]
 mod windows;
@@ -402,10 +404,15 @@ pub(crate) fn set_runtime_enabled(enabled: bool) -> Result<()> {
     }
 }
 
-/// The ACL half of a grant, as `io::Error` for [`access::AccessStore`]. POSIX needs none:
-/// the runner is the operator's own user unit.
-pub(crate) fn grant_acl(dir: &std::path::Path, write: bool) -> std::io::Result<()> {
-    plat::grant(dir, write).map_err(|e| std::io::Error::other(e.to_string()))
+/// The ACL half of a grant, as `io::Error` for [`access::AccessStore`]: the runner's account,
+/// and `plugin`'s package when it is named, in one walk of the folder. POSIX needs none: the
+/// runner is the operator's own user unit.
+pub(crate) fn grant_acl(
+    plugin: Option<&str>,
+    dir: &std::path::Path,
+    write: bool,
+) -> std::io::Result<()> {
+    plat::grant(plugin, dir, write).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// A managed emulator runs in the player's session and, portable, writes beside its exe: on
@@ -425,9 +432,10 @@ pub(crate) fn open_for_players(dir: &std::path::Path) {
 #[cfg(not(windows))]
 pub(crate) fn open_for_players(_dir: &std::path::Path) {}
 
-/// Take the runner's ACE off a folder no plugin holds any more. POSIX has none to take.
-pub(crate) fn revoke_acl(dir: &std::path::Path) -> std::io::Result<()> {
-    plat::revoke(dir).map_err(|e| std::io::Error::other(e.to_string()))
+/// Take the runner's ACE and `plugin`'s package ACE off a folder no plugin holds any more, in
+/// one walk. POSIX has none to take.
+pub(crate) fn revoke_acl(plugin: &str, dir: &std::path::Path) -> std::io::Result<()> {
+    plat::revoke(plugin, dir).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Windows: the runner grants `plugins enable` applies, which a fresh install never ran.
@@ -478,30 +486,6 @@ pub(crate) fn converge_runner_data_dir(dir: &std::path::Path) -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     let _ = dir;
     Ok(())
-}
-
-/// Re-apply every recorded grant's ACL at `serve`. A launcher rewrite can drop the ACE its
-/// grant depended on; a failure warns and the rest still converge. No-op off Windows.
-pub(crate) fn converge_grants() {
-    #[cfg(target_os = "windows")]
-    {
-        let store = access::AccessStore::open(pf_paths::config_dir());
-        match store.snapshot() {
-            Ok(snapshots) => {
-                for s in snapshots {
-                    for g in s.grants {
-                        if let Err(e) = plat::grant(std::path::Path::new(&g.path), g.write) {
-                            tracing::warn!(plugin = %s.plugin, path = %g.path, error = %e,
-                                "plugin grant ACL could not be re-applied");
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "plugin grants could not be read for ACL convergence")
-            }
-        }
-    }
 }
 
 /// Restart so the runner rediscovers units. `false` when it is off — not an error;
@@ -584,16 +568,23 @@ pub(crate) fn converge_runner_roots() -> bool {
     }
 }
 
-/// [`converge_runner_roots`] after the operator grants or takes a folder. On Windows the
-/// runner restarts the plugin when the grants file changes, before the plugin's own ACE lands,
-/// so its scan still finds the folder shut; a restart once the ACE is placed rescans it.
+/// [`converge_runner_roots`] after the operator grants or takes a folder. On Windows a grant
+/// places its plugin's ACE before the grants file changes, so the runner's own restart of that
+/// plugin finds the folder open. Only an ACE this converge had to place itself — a package the
+/// grant could not name — lands after that restart, so then the runner restarts once more.
 pub(crate) fn converge_after_decision() {
-    if converge_runner_roots() && cfg!(windows) && runtime_status().running {
+    #[cfg(windows)]
+    plat::take_walked();
+    let changed = converge_runner_roots();
+    #[cfg(windows)]
+    if changed && plat::take_walked() && runtime_status().running {
         match plat::restart_runtime() {
             Ok(()) => tracing::info!("plugin runner restarted onto a changed folder grant"),
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "plugin runner not restarted"),
         }
     }
+    #[cfg(not(windows))]
+    let _ = changed;
 }
 
 #[cfg(test)]
