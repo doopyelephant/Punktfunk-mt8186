@@ -14545,20 +14545,20 @@
       },
       "PortMap": {
         "type": "object",
-        "description": "Ports a client needs. Moonlight derives stream ports from HTTP; a control pane should not.",
+        "description": "Ports a client needs. Moonlight derives stream ports from HTTP; a control pane should not.\nA port the host does not serve right now is left out.",
         "required": [
-          "mgmt",
-          "http",
-          "https",
-          "rtsp",
-          "video",
-          "control",
-          "audio"
+          "mgmt"
         ],
         "properties": {
           "audio": {
             "type": "integer",
             "format": "int32",
+            "minimum": 0
+          },
+          "browser": {
+            "type": "integer",
+            "format": "int32",
+            "description": "UDP: the browser client's plane, while it is on.",
             "minimum": 0
           },
           "control": {
@@ -14569,7 +14569,7 @@
           "http": {
             "type": "integer",
             "format": "int32",
-            "description": "nvhttp plain HTTP (serverinfo, pairing).",
+            "description": "nvhttp plain HTTP (serverinfo, pairing). This and the five below: GameStream only.",
             "minimum": 0
           },
           "https": {
@@ -14583,10 +14583,25 @@
             "format": "int32",
             "minimum": 0
           },
+          "native": {
+            "type": "integer",
+            "format": "int32",
+            "description": "UDP: the native stream port. Video, audio, control and the paired-device library.",
+            "minimum": 0
+          },
           "rtsp": {
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          },
+          "seats": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "UDP: each seat's stream port, while seats are on."
           },
           "video": {
             "type": "integer",
