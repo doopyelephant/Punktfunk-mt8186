@@ -53,6 +53,7 @@ on:
       - 'crates/codec/pyrowave-sys/**'
       - 'crates/core/**'
       - 'packaging/flatpak/**'
+      - 'packaging/linux/io.unom.punktfunk.desktop'
       - 'packaging/linux/io.unom.punktfunk.console.desktop'
       - 'packaging/linux/icons/hicolor/scalable/apps/io.unom.punktfunk.svg'
       - 'Cargo.toml'

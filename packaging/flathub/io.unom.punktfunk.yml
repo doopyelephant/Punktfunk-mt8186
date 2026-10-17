@@ -147,7 +147,7 @@ modules:
       - install -Dm755 target/release/punktfunk-client -t ${FLATPAK_DEST}/bin
       - install -Dm755 target/release/punktfunk-session -t ${FLATPAK_DEST}/bin
       - install -Dm755 target/release/punktfunk -t ${FLATPAK_DEST}/bin
-      - install -Dm644 packaging/flatpak/io.unom.punktfunk.desktop -t ${FLATPAK_DEST}/share/applications
+      - install -Dm644 packaging/linux/io.unom.punktfunk.desktop -t ${FLATPAK_DEST}/share/applications
       - install -Dm644 packaging/linux/io.unom.punktfunk.console.desktop -t ${FLATPAK_DEST}/share/applications
       - install -Dm644 packaging/flatpak/io.unom.punktfunk.metainfo.xml -t ${FLATPAK_DEST}/share/metainfo
       - install -Dm644 packaging/linux/icons/hicolor/scalable/apps/io.unom.punktfunk.svg

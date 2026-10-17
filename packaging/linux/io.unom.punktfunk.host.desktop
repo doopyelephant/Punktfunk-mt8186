@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Punktfunk Host
+Name=Punktfunk Host service
 Comment=punktfunk streaming host — KWin virtual-output / input authorization
 Exec=/usr/bin/punktfunk-host
 Terminal=false

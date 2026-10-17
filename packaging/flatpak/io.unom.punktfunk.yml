@@ -327,8 +327,8 @@ modules:
       # The headless CLI (design/client-architecture-split.md §4) — reachable as
       # `flatpak run --command=punktfunk io.unom.punktfunk …`.
       - install -Dm0755 target/release/punktfunk ${FLATPAK_DEST}/bin/punktfunk
-      # Desktop entry (renamed to the app id; Exec is the in-sandbox binary).
-      - install -Dm0644 packaging/flatpak/io.unom.punktfunk.desktop
+      # Desktop entry, shared with the native packages; flatpak's export rewrites its Exec.
+      - install -Dm0644 packaging/linux/io.unom.punktfunk.desktop
           ${FLATPAK_DEST}/share/applications/io.unom.punktfunk.desktop
       # Second launcher, straight into the gamepad console (`--browse`) — the couch entry
       # point. Shared with the deb/rpm/arch (there is nothing sandbox-specific about it);
