@@ -3,7 +3,7 @@
 
 /// `$var` when it holds an absolute path, else `$HOME/<fallback>`. The XDG base-dir spec
 /// ignores an empty or relative value. `None` with neither, so a caller never picks the cwd.
-#[cfg(all(desktop, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 pub(crate) fn xdg_home(var: &str, fallback: &str) -> Option<std::path::PathBuf> {
     std::env::var_os(var)
         .map(std::path::PathBuf::from)

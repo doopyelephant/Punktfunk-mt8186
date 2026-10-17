@@ -359,12 +359,10 @@ def _flatpak() -> str | None:
 
 # --- which client is installed -------------------------------------------------------------
 #
-# The flatpak is the Deck's usual client, but it is not the only one: a sysext, a .deb/.rpm, an
-# AUR build, a nix profile and a hand-built binary all install a NATIVE `punktfunk-client`, and
-# on those the plugin used to be dead in the water — every headless call went through
-# `flatpak run io.unom.Punktfunk` and simply failed. Both kinds keep identity, known-hosts and
-# settings in the same ~/.config/punktfunk (the flatpak's sandbox HOME resolves to the real
-# home), so nothing else in this file has to care which one answered.
+# The flatpak is the Deck's usual client, but a sysext, a .deb/.rpm, an AUR build, a nix profile
+# and a hand-built binary all install a NATIVE `punktfunk-client` instead. Every call goes
+# through the one client found, which owns its identity, known-hosts and settings (the
+# flatpak's under ~/.var/app), so nothing else in this file cares which one answered.
 NATIVE_BIN = "punktfunk-client"
 # The headless CLI — the door this backend does almost everything through (discover, hosts,
 # pair, trust). Shipped beside the GTK client in every package since v0.22.0: /app/bin in the
