@@ -249,6 +249,26 @@ pub(crate) fn find_mem_preferring(
     find_mem(mp, bits, prefer).or_else(|_| find_mem(mp, bits, vk::MemoryPropertyFlags::empty()))
 }
 
+/// Memory type for a buffer the CPU reads back every frame (the encode bitstream), and whether
+/// it is coherent. Cached first: RADV lists write-combined GTT before cached GTT, and plain
+/// loads from write-combined memory run at a few hundred MB/s. A cached type without
+/// coherence needs `vkInvalidateMappedMemoryRanges` before each read.
+#[cfg_attr(not(feature = "vulkan-encode"), allow(dead_code))]
+pub(crate) fn find_readback_mem(
+    mp: &vk::PhysicalDeviceMemoryProperties,
+    bits: u32,
+) -> Result<(u32, bool)> {
+    use vk::MemoryPropertyFlags as F;
+    find_mem(
+        mp,
+        bits,
+        F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED,
+    )
+    .map(|i| (i, true))
+    .or_else(|_| find_mem(mp, bits, F::HOST_VISIBLE | F::HOST_CACHED).map(|i| (i, false)))
+    .or_else(|_| find_mem(mp, bits, F::HOST_VISIBLE | F::HOST_COHERENT).map(|i| (i, true)))
+}
+
 pub(crate) fn pixel_to_vk(fmt: PixelFormat) -> Option<vk::Format> {
     match fmt {
         PixelFormat::Bgrx | PixelFormat::Bgra => Some(vk::Format::B8G8R8A8_UNORM),
@@ -707,6 +727,29 @@ mod tests {
         assert_eq!(find_mem_preferring(&mp, 0b011, local).unwrap(), 0);
         assert_eq!(find_mem_preferring(&mp, 0b010, local).unwrap(), 1);
         assert!(find_mem_preferring(&mp, 0, local).is_err());
+    }
+
+    #[test]
+    fn readback_memory_prefers_cached_over_write_combined() {
+        use vk::MemoryPropertyFlags as F;
+        // RADV PHOENIX order: VRAM, VRAM, GTT write-combined, BAR, BAR, GTT cached.
+        let mut mp = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 6,
+            ..Default::default()
+        };
+        mp.memory_types[0].property_flags = F::DEVICE_LOCAL;
+        mp.memory_types[1].property_flags = F::DEVICE_LOCAL;
+        mp.memory_types[2].property_flags = F::HOST_VISIBLE | F::HOST_COHERENT;
+        mp.memory_types[3].property_flags = F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT;
+        mp.memory_types[4].property_flags = F::DEVICE_LOCAL | F::HOST_VISIBLE | F::HOST_COHERENT;
+        mp.memory_types[5].property_flags = F::HOST_VISIBLE | F::HOST_COHERENT | F::HOST_CACHED;
+        assert_eq!(find_readback_mem(&mp, 0b111111).unwrap(), (5, true));
+        // Without the cached type, today's write-combined pick.
+        assert_eq!(find_readback_mem(&mp, 0b011111).unwrap(), (2, true));
+        // A cached type that is not coherent still wins, and says so.
+        mp.memory_types[5].property_flags = F::HOST_VISIBLE | F::HOST_CACHED;
+        assert_eq!(find_readback_mem(&mp, 0b111111).unwrap(), (5, false));
+        assert!(find_readback_mem(&mp, 0b000011).is_err());
     }
 
     #[test]
