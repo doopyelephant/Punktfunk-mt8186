@@ -10,8 +10,8 @@
 //!
 //! Host: [`MediaSender`] sends media on a clone of the endpoint's socket, toward the
 //! connection's current address and from the address the client dialed. quinn moves that
-//! address on the first authenticated packet from a new one and validates it afterwards, so
-//! media follows a migration before QUIC has confirmed it.
+//! address on the first authenticated packet from a new one and validates it afterwards. Media
+//! follows a port-only rebind at once and a new IP once validation has had time to finish.
 
 use super::{BufPool, RecvBatch, Transport};
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
@@ -82,6 +82,16 @@ fn canonical(a: SocketAddr) -> SocketAddr {
             None => a,
         },
         v4 => v4,
+    }
+}
+
+/// `a` as a socket of the other family sends to it: IPv4 v4-mapped on an IPv6 socket.
+fn mapped(a: SocketAddr, v6_socket: bool) -> SocketAddr {
+    match a {
+        SocketAddr::V4(v4) if v6_socket => {
+            SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+        }
+        other => other,
     }
 }
 
@@ -493,13 +503,33 @@ fn gso_allowed() -> bool {
 
 /// The host's media sender on a connection's shared socket.
 pub struct MediaSender {
-    /// The video mark toward this peer. Before `socket`: a Windows flow leaves before it closes.
-    _qos: Option<super::QosFlow>,
+    /// Before `socket`: a Windows flow leaves before it closes.
+    route: Mutex<Route>,
     socket: UdpSocket,
     state: UdpSocketState,
     conn: quinn::Connection,
     v6_socket: bool,
     staging: Mutex<Vec<u8>>,
+}
+
+/// Where media goes, and the move it is waiting out.
+struct Route {
+    to: SocketAddr,
+    /// The address quinn moved to and when, while media waits for it to validate.
+    moving: Option<(SocketAddr, std::time::Instant)>,
+    /// The video mark toward `to`. A Windows flow is bound to one destination.
+    qos: Option<super::QosFlow>,
+}
+
+/// Whether media to a client that moved `from` → `to`, `waited` ago, still waits for the new
+/// address to validate. Only a new IP waits: a port-only NAT rebind has no third party to hit.
+fn still_validating(from: SocketAddr, to: SocketAddr, waited: Duration, hold: Duration) -> bool {
+    from.ip() != to.ip() && waited < hold
+}
+
+/// quinn's path validation timer, 3 × PTO, with PTO taken as RTT plus the 25 ms ack delay.
+fn validation_hold(rtt: Duration) -> Duration {
+    3 * (rtt + Duration::from_millis(25))
 }
 
 impl MediaSender {
@@ -509,29 +539,50 @@ impl MediaSender {
         let socket = socket.try_clone()?;
         let state = UdpSocketState::new((&socket).into())?;
         let v6_socket = socket.local_addr()?.is_ipv6();
-        let mut sender = MediaSender {
-            _qos: None,
+        let to = mapped(canonical(conn.remote_address()), v6_socket);
+        let qos = super::set_media_qos_to(&socket, to, super::MediaClass::Video);
+        Ok(MediaSender {
+            route: Mutex::new(Route {
+                to,
+                moving: None,
+                qos,
+            }),
             socket,
             state,
             conn,
             v6_socket,
             staging: Mutex::new(Vec::new()),
-        };
-        let (to, _) = sender.path();
-        sender._qos = super::set_media_qos_to(&sender.socket, to, super::MediaClass::Video);
-        Ok(sender)
+        })
     }
 
-    /// Where the next packet goes and from which local address: the connection's current path.
-    fn path(&self) -> (SocketAddr, Option<IpAddr>) {
-        let to = canonical(self.conn.remote_address());
-        let to = match to {
-            SocketAddr::V4(v4) if self.v6_socket => {
-                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+    /// Where the next packet goes and from which local address, or `None` while it is held.
+    /// quinn moves `remote_address()` on the first authenticated packet from a new address and
+    /// validates it afterwards; its own sends are capped against amplification and media is
+    /// not. So media follows a new IP only after [`validation_hold`], and the mark moves with it.
+    fn path(&self) -> Option<(SocketAddr, Option<IpAddr>)> {
+        let seen = mapped(canonical(self.conn.remote_address()), self.v6_socket);
+        let mut r = self.route.lock().unwrap_or_else(|e| e.into_inner());
+        if seen == r.to {
+            r.moving = None;
+        } else {
+            let now = std::time::Instant::now();
+            let since = match r.moving {
+                Some((addr, since)) if addr == seen => since,
+                _ => {
+                    r.moving = Some((seen, now));
+                    now
+                }
+            };
+            let hold = validation_hold(self.conn.rtt());
+            if still_validating(r.to, seen, now.duration_since(since), hold) {
+                return None;
             }
-            other => other,
-        };
-        (to, self.conn.local_ip())
+            r.moving = None;
+            r.qos = None;
+            r.qos = super::set_media_qos_to(&self.socket, seen, super::MediaClass::Video);
+            r.to = seen;
+        }
+        Some((r.to, self.conn.local_ip()))
     }
 
     fn transmit(
@@ -554,9 +605,12 @@ impl MediaSender {
     }
 }
 
+/// A held packet counts as sent: it is lost on the way, as on a link that dropped it.
 impl Transport for MediaSender {
     fn send(&self, packet: &[u8]) -> std::io::Result<bool> {
-        let (to, from) = self.path();
+        let Some((to, from)) = self.path() else {
+            return Ok(true);
+        };
         match self.transmit(to, from, packet, None) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
@@ -565,7 +619,9 @@ impl Transport for MediaSender {
     }
 
     fn send_batch(&self, packets: &[&[u8]]) -> std::io::Result<usize> {
-        let (to, from) = self.path();
+        let Some((to, from)) = self.path() else {
+            return Ok(packets.len());
+        };
         for (i, p) in packets.iter().enumerate() {
             match self.transmit(to, from, p, None) {
                 Ok(()) => {}
@@ -586,7 +642,9 @@ impl Transport for MediaSender {
         if !gso_allowed() || max <= 1 {
             return self.send_batch(packets);
         }
-        let (to, from) = self.path();
+        let Some((to, from)) = self.path() else {
+            return Ok(packets.len());
+        };
         let mut staging = self.staging.lock().unwrap_or_else(|e| e.into_inner());
         let mut sent = 0;
         while sent < packets.len() {
@@ -912,7 +970,7 @@ mod tests {
         .await;
         let proxy = proxy.unwrap();
         let sender = MediaSender::new(&socket, host_conn.clone()).unwrap();
-        assert_eq!(canonical(sender.path().0), proxy.backs[0]);
+        assert_eq!(canonical(sender.path().unwrap().0), proxy.backs[0]);
         send_media(&sender, 0, 100);
         assert_eq!(
             receive_media(&media, 100, Duration::from_secs(5))
@@ -931,7 +989,14 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        assert_eq!(canonical(sender.path().0), proxy.backs[1]);
+        // A new IP holds media for the validation window; a port-only rebind does not.
+        let held = sender.path().is_none();
+        assert_eq!(held, proxy.backs[0].ip() != proxy.backs[1].ip());
+        while sender.path().is_none() {
+            assert!(std::time::Instant::now() < deadline, "media never followed");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(canonical(sender.path().unwrap().0), proxy.backs[1]);
 
         send_media(&sender, 100, 300);
         let tags = receive_media(&media, 300, Duration::from_secs(5)).await;
@@ -945,6 +1010,19 @@ mod tests {
             "QUIC still crosses after the move"
         );
         assert!(host_conn.close_reason().is_none() && client_conn.close_reason().is_none());
+    }
+
+    /// Only a new IP waits for validation, and only for the hold.
+    #[test]
+    fn only_a_new_ip_waits_for_validation() {
+        let a: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let rebound: SocketAddr = "10.0.0.2:6000".parse().unwrap();
+        let moved: SocketAddr = "10.0.1.7:5000".parse().unwrap();
+        let hold = validation_hold(Duration::from_millis(10));
+        assert_eq!(hold, Duration::from_millis(105));
+        assert!(!still_validating(a, rebound, Duration::ZERO, hold));
+        assert!(still_validating(a, moved, Duration::from_millis(100), hold));
+        assert!(!still_validating(a, moved, hold, hold));
     }
 
     /// A lent buffer comes back on drop, and the pool never allocates past its bound.
