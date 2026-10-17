@@ -5,8 +5,9 @@
 //! owns only per-instance state. It opens one hardened secret root, takes the
 //! host executable from its caller, and delegates each portable command. The
 //! `HKLM\SOFTWARE\Punktfunk\Seats` key is the switch, which `enable` writes
-//! and removes: without it no seat starts. Doctor reports prerequisite and ownership evidence but never infers
-//! HDR or IDD health from static configuration.
+//! and removes: without it no seat starts, and a turn-on that did not finish leaves
+//! it marked `Enabling`, which reads as off. Doctor reports prerequisite and ownership evidence
+//! but never infers HDR or IDD health from static configuration.
 
 mod accounts;
 mod credentials;
@@ -31,6 +32,9 @@ use accounts::AccountManager;
 pub use accounts::{seats_group_sid, SEATS_GROUP};
 use credentials::CredentialStore;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use supervisor::Supervisor;
 use util::{backend_error, io_error, require_local_system, WinResult};
 use util::{port_open, udp_port_owners};
@@ -44,8 +48,15 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY};
 use winreg::RegKey;
 
-/// Whose existence turns seats on and reserves display slots 12 through 15.
+/// Whose existence reserves display slots 12 through 15, and turns seats on unless it holds
+/// [`ENABLING`].
 const SEATS_KEY: &str = r"SOFTWARE\Punktfunk\Seats";
+/// How long the boot warm-up waits for TermService, and how often it looks.
+const TERMSERVICE_WAIT: Duration = Duration::from_secs(600);
+const TERMSERVICE_POLL: Duration = Duration::from_secs(2);
+/// A value of the Seats key while a turn-on is unfinished. A key without it is a complete one,
+/// which older builds left too.
+const ENABLING: &str = "Enabling";
 
 #[derive(Clone)]
 pub struct WindowsBackend {
@@ -53,13 +64,21 @@ pub struct WindowsBackend {
     host_path: PathBuf,
     accounts: AccountManager,
     supervisor: Supervisor,
+    /// Set by a stop, cleared by the next start: a start reads it between its steps.
+    stopped: Arc<AtomicBool>,
 }
 
-/// Whether the seats key exists, read through the 64-bit registry view.
+/// Whether seats are on: the Seats key exists and no turn-on is unfinished, read through the
+/// 64-bit registry view.
 pub fn seats_enabled() -> bool {
     RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(SEATS_KEY, KEY_QUERY_VALUE | KEY_WOW64_64KEY)
-        .is_ok()
+        .is_ok_and(|seats| finished(&seats))
+}
+
+/// A Seats key no turn-on is still filling: the ones older builds left have no `Enabling`.
+fn finished(seats: &RegKey) -> bool {
+    seats.get_value::<u32, _>(ENABLING).is_err()
 }
 
 /// Turn seats off without the supervisor, for the uninstaller once the service is gone: Remote
@@ -136,6 +155,7 @@ impl WindowsBackend {
             host_path,
             accounts,
             supervisor,
+            stopped: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -149,12 +169,37 @@ impl WindowsBackend {
         enable::keep_rdp_local();
     }
 
+    /// With seats on, waits until TermService runs, `stop` is set or [`TERMSERVICE_WAIT`] is
+    /// up. The service starts at boot without waiting for it, and no seat starts before it.
+    pub fn wait_for_termservice(&self, stop: &AtomicBool) {
+        let deadline = Instant::now() + TERMSERVICE_WAIT;
+        while seats_enabled()
+            && !stop.load(Ordering::SeqCst)
+            && !matches!(termservice_running(), Ok(true))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(TERMSERVICE_POLL);
+        }
+    }
+
+    /// Ends the start in flight once a stop has reached it, between two of its steps. The
+    /// service tells the start's caller the seat was stopped.
+    fn unless_stopped(&self) -> WinResult<()> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(backend_error(
+                "seat_stopped",
+                "the seat was stopped while it started",
+            ));
+        }
+        Ok(())
+    }
+
     fn ensure_runtime_prerequisites(&self) -> WinResult<()> {
         require_local_system()?;
         if !seats_enabled() {
             return Err(backend_error(
                 "seats_off",
-                r"HKLM\SOFTWARE\Punktfunk\Seats is missing; seats are off on this host",
+                r"HKLM\SOFTWARE\Punktfunk\Seats is missing or unfinished; seats are off on this host",
             ));
         }
         if !termservice_running()? {
@@ -174,15 +219,18 @@ impl PlatformBackend for WindowsBackend {
     }
 
     fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.stopped.store(false, Ordering::SeqCst);
         self.ensure_runtime_prerequisites()?;
         // An uninstall deletes the seat display driver and an upgrade only stages the new one:
         // without it the seat logs on to Microsoft's adapter and never streams.
         enable::ensure_driver(&self.host_path)?;
+        self.unless_stopped()?;
         // An upgrade's new enumerator reaches the listener here. Without it the seat still
         // starts, on `RDP-Tcp`, with Remote Audio and no pad audio.
         if let Err(cause) = seat_listener::ensure(&self.host_path) {
             tracing::warn!(%cause, "seat listener not ready — seats start without pad audio");
         }
+        self.unless_stopped()?;
         // The box's shared Steam shortcuts start a seat's own copy on a seat.
         match self.root.open_child_dir("temp") {
             Ok(temp) => steam::wrap_box_shortcuts(&self.host_path, temp.path()),
@@ -192,12 +240,15 @@ impl PlatformBackend for WindowsBackend {
     }
 
     fn stop(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.stopped.store(true, Ordering::SeqCst);
         self.supervisor.stop(seat)
     }
 
     /// The seat host's own directories go with the seat: its identity key, token and logs, as a
     /// Linux seat's directory does. A directory that won't go is logged; the seat is gone anyway.
+    /// An account that isn't the seat's is refused before the stop logs anything off.
     fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.accounts.ensure_owned_or_absent(seat)?;
         let _ = self.supervisor.stop(seat)?;
         self.accounts.delete(seat)?;
         for parent in ["hosts", "temp"] {
@@ -216,6 +267,13 @@ impl PlatformBackend for WindowsBackend {
 
     fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
         Ok(self.supervisor.status(seat).status)
+    }
+
+    /// Before TermService runs there is no session to find, and the look waits for it.
+    fn reconcile(&self, seat: &Seat, _status: &RuntimeStatus) {
+        if termservice_running().unwrap_or(false) {
+            self.supervisor.sweep_leftovers(seat);
+        }
     }
 
     fn doctor(&self, ledger: &Ledger) -> Result<Vec<Diagnostic>, BackendError> {
@@ -279,6 +337,7 @@ impl WindowsBackend {
     /// The box's rows, then each seat's. Every row is one plain sentence; a problem names the
     /// next move. `seating` adds what turning seats on checks (role, licensing, a GPU).
     fn doctor_report(&self, ledger: &Ledger) -> Vec<Diagnostic> {
+        let deadline = Instant::now() + enable::DOCTOR_BUDGET;
         let mut rows = Vec::new();
         rows.push(match windows_build() {
             Ok(build) if build >= 22621 => Diagnostic::info(
@@ -334,12 +393,12 @@ impl WindowsBackend {
             ),
         });
         rows.extend(
-            enable::checks()
+            enable::checks_until(deadline)
                 .into_iter()
                 .filter(|check| check.code != "windows_server"),
         );
         if server_edition() == Some(true) {
-            rows.extend(enable::licensing_row());
+            rows.extend(enable::licensing_row(deadline));
         }
         rows.push(match termservice_running() {
             Ok(true) => Diagnostic::info("termservice", "Remote Desktop Services is running."),
@@ -387,7 +446,10 @@ impl WindowsBackend {
             ));
         }
         rows.push(match rdp::load_pin_optional(&self.root) {
-            Ok(Some(_)) => Diagnostic::info("rdp_pin", "Remote Desktop's certificate is recorded."),
+            Ok(Some(pin)) => match rdp::require_live(&self.host_path, pin) {
+                Ok(()) => Diagnostic::info("rdp_pin", "Remote Desktop's certificate is recorded."),
+                Err(error) => Diagnostic::error("rdp_pin", error.message),
+            },
             _ => Diagnostic::error(
                 "rdp_pin",
                 "Remote Desktop's certificate isn't recorded, so seats can't sign in. \
@@ -641,7 +703,51 @@ fn seat_diagnostic(level: DiagnosticLevel, code: &str, message: String, seat: &S
 
 #[cfg(test)]
 mod tests {
-    use super::wraps_termsrv;
+    use super::{finished, wraps_termsrv, WindowsBackend, ENABLING};
+    use crate::backend::PlatformBackend as _;
+    use crate::model::{RuntimeStatus, Seat, SeatId};
+    use std::path::PathBuf;
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    /// A bare key and one a turn-on finished are on; one still marked is off.
+    #[test]
+    fn a_key_marked_enabling_is_not_finished() {
+        let path = format!(r"Software\Punktfunk\SeatsTest{}", std::process::id());
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu.create_subkey(&path).unwrap();
+        assert!(finished(&key));
+        key.set_value(ENABLING, &1_u32).unwrap();
+        assert!(!finished(&key));
+        key.delete_value(ENABLING).unwrap();
+        assert!(finished(&key));
+        drop(key);
+        hkcu.delete_subkey(&path).unwrap();
+    }
+
+    /// A stop ends the start in flight at its next step.
+    #[test]
+    fn a_stop_ends_the_start_in_flight_between_its_steps() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend =
+            WindowsBackend::open(temp.path(), PathBuf::from(r"C:\Windows\System32\cmd.exe"))
+                .unwrap();
+        let seat = Seat {
+            id: SeatId::random(),
+            name: "test".into(),
+            account: "pfs-absent".into(),
+            display_slot: 12,
+            native_port: 9779,
+            mgmt_port: 47995,
+            autostart: false,
+            runtime: RuntimeStatus::stopped(),
+            owner: false,
+            fingerprint: None,
+        };
+        assert!(backend.unless_stopped().is_ok());
+        backend.stop(&seat).unwrap();
+        assert_eq!(backend.unless_stopped().unwrap_err().code, "seat_stopped");
+    }
 
     #[test]
     fn only_a_dll_other_than_termsrv_is_a_wrapper() {

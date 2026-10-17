@@ -6,5 +6,8 @@
 # pf-dm-helper's polkit action authorizes. It is not 'input': writing attach materialises an
 # arbitrary emulated USB device. Nobody is added; joining is the opt-in.
 g punktfunk -
+# The door's own group (punktfunk-door.service). The door runs as the `punktfunk` user, whose
+# primary group is this one, so it never holds the attach nodes or passes pf-dm-helper.
+g punktfunk-door -
 # Members may start the update units through polkit (49-punktfunk-*update.rules). Shipped empty.
 g punktfunk-update -

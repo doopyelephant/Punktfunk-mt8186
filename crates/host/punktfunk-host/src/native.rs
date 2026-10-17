@@ -250,6 +250,7 @@ pub(crate) async fn serve(
 ) -> Result<()> {
     let fingerprint = endpoint::fingerprint_of_pem(&identity.cert_pem)
         .map_err(|e| anyhow!("cert fingerprint: {e}"))?;
+    hold_guests_kept_at_start(&np);
     // Media leaves from this socket. `pkf1` stays listed for [`serve_pkf1`]: an older client
     // still pairs there, and is told to update for anything else.
     let alpns: &[&[u8]] = &[
@@ -370,6 +371,9 @@ pub(crate) async fn serve(
     }
     let last_pairing = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     let opts = Arc::new(opts);
+    if np.follows_box() {
+        spawn_box_watch(np.clone(), profiles.clone());
+    }
 
     // Permit taken before accept: overflow waits in QUIC's backlog. `0` = unlimited.
     // Handshake + pipeline run in the spawned task so a slow client never blocks accept.
@@ -583,6 +587,21 @@ async fn stop_overdue(stop: &AtomicBool) {
 
 /// `mode_conflict = reject` close code. Distinct from transport failure (`RejectReason::Busy`).
 const REJECT_BUSY_CODE: u32 = punktfunk_core::reject::REJECT_BUSY_CLOSE_CODE;
+
+/// A seat host's pairing store and profiles are the box's files, edited in another process.
+/// Once a second its live sessions hear what changed in them: a grant narrowed, expired or
+/// revoked, and a profile removed.
+fn spawn_box_watch(np: Arc<NativePairing>, profiles: Arc<crate::profiles::Profiles>) {
+    tokio::spawn(async move {
+        let mut known = std::collections::HashSet::new();
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            np.republish_watched();
+            profiles.announce_removals(&mut known);
+        }
+    });
+}
 
 /// Ends the session as an operator stop when the console removes the profile it plays as.
 /// The end is written before the refuse, or the connection watcher would read the host's
@@ -1085,7 +1104,7 @@ pub(crate) async fn run_admitted(
         deadline_unix,
         watch: access_watch,
         at_unix: admit_unix,
-        session: _session,
+        session,
     } = admit(host, session_fp_hex.as_deref(), &conn, &first).await?;
     // Before anything is built for it: an unknown profile closes with no display touched.
     let resolved = match profiles.resolve(session_fp_hex.as_deref(), first.profile.as_deref()) {
@@ -1102,10 +1121,15 @@ pub(crate) async fn run_admitted(
         }
     };
     tracing::info!(profile = %resolved.id, name = %resolved.display_name, via = ?resolved.via, "profile");
+    // A refusal ends the connect here and leaves the profile's last-used time alone.
+    let placed = place_profile(&conn, &mut send, session_fp_hex.clone(), &first, &resolved).await?;
     profiles.touch(&resolved.id);
-    if let Some(served) =
-        place_profile(&conn, &mut send, session_fp_hex.clone(), &first, &resolved).await?
-    {
+    if let Some(served) = placed {
+        if let (Some(guard), Some(fp)) = (session, session_fp_hex) {
+            if np.is_session_only(&fp) {
+                hold_while_on_seat(guard, fp, false);
+            }
+        }
         return Ok(served);
     }
     let profile_ref = crate::events::ProfileRef {
@@ -1721,6 +1745,72 @@ async fn place_profile(
             close_rejected(conn, reason).await;
             anyhow::bail!("seat refused: {reason}");
         }
+    }
+}
+
+/// How often a redirected guest's seat is asked whether it still plays there.
+const SEAT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a redirected guest has to show up on its seat: it dials, then the seat brings the
+/// picture up before it lists the session.
+const SEAT_LANDING: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long the seats may stay silent before they no longer hold a guest: a seat host that
+/// hangs is not serving anyone.
+const SEAT_SILENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Holds each "this session" guest the startup sweep kept, as a redirect holds its own: the guest
+/// plays on a seat of a box whose host restarted. Spawns tasks, so it runs inside the runtime.
+pub(crate) fn hold_guests_kept_at_start(np: &Arc<NativePairing>) {
+    for (fp, landed) in np.take_kept_at_start() {
+        hold_while_on_seat(np.session_started(&fp), fp, landed);
+    }
+}
+
+/// A guest on a "this session" record plays on a seat after the redirect ended the door's own
+/// session. Holds the count until it has played there and left, so the record outlasts the
+/// play and not the redirect. The grace after the last count is the usual one. `landed` is true
+/// for a guest already seen on a seat.
+fn hold_while_on_seat(
+    session: crate::native_pairing::SessionCountGuard,
+    fp: String,
+    mut landed: bool,
+) {
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut heard = started;
+        loop {
+            tokio::time::sleep(SEAT_POLL).await;
+            let fp = fp.clone();
+            let asked = tokio::task::spawn_blocking(move || crate::seats::plays_on_a_seat(&fp));
+            let here = tokio::time::timeout(SEAT_SILENCE, asked)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten();
+            if let Some(here) = here {
+                heard = std::time::Instant::now();
+                landed |= here;
+            }
+            if hold_over(here, landed, started.elapsed(), heard.elapsed()) {
+                break;
+            }
+        }
+        drop(session);
+    });
+}
+
+/// A redirected guest's hold ends once it is off the seat after playing there, or never came,
+/// or no seat has said anything for [`SEAT_SILENCE`]. `here` is `None` when a seat can't say.
+fn hold_over(
+    here: Option<bool>,
+    landed: bool,
+    waited: std::time::Duration,
+    silent: std::time::Duration,
+) -> bool {
+    match here {
+        Some(here) => !here && (landed || waited > SEAT_LANDING),
+        None => silent > SEAT_SILENCE,
     }
 }
 

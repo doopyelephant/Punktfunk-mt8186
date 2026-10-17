@@ -106,7 +106,8 @@ fn bind_label(choices: &Choices) -> String {
 pub fn uninstall_outro(ui: &dyn Reporter) {
     ui.blank();
     ui.line("  Removed. Left on purpose: ~/.config/punktfunk (identity, pairings, host.env, plugins — a reinstall");
-    ui.line("  picks them up), the punktfunk / punktfunk-update groups, and any firewall rules you opened.");
+    ui.line("  picks them up), the punktfunk, punktfunk-door and punktfunk-update groups, and any firewall");
+    ui.line("  rules you opened.");
     ui.line(&format!(
         "  The one-command cleanups for each are on {DOCS}/uninstall#linux-hosts"
     ));

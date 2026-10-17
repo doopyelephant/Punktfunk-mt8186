@@ -49,11 +49,17 @@ pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Place
     if plays_here(pf_paths::seat::role(), own_row) {
         return Placement::Here;
     }
-    let snap = super::snapshot();
+    // The ledger and the profile's own seat host: a hung host of another seat costs this
+    // connect nothing.
+    let snap = super::ledger();
     let Some(seat_id) = snap.row_of(&profile.os_account) else {
         return Placement::Refuse(RejectReason::SeatUnavailable);
     };
-    let occupants = snap.occupants.get(seat_id).map_or(&[][..], Vec::as_slice);
+    let occupants = snap
+        .seat(seat_id)
+        .filter(|(seat, _)| seat.runtime.state == RuntimeState::Running)
+        .and_then(|(seat, _)| super::occupants(seat))
+        .unwrap_or_default();
     let mut held = RESERVED.lock().unwrap_or_else(|e| e.into_inner());
     held.retain(|_, (_, until)| *until > Instant::now());
     let held_by = held.get(seat_id).map(|(fp, _)| fp.as_str());
@@ -62,16 +68,36 @@ pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Place
         asker,
         snap.on,
         snap.seat(seat_id),
-        occupants,
+        &occupants,
         held_by,
     );
-    if let (Placement::Redirect(_), Some(fp)) = (&placed, asker.fp) {
-        held.insert(
-            seat_id.to_string(),
-            (fp.to_string(), Instant::now() + RESERVE),
-        );
+    if matches!(placed, Placement::Redirect(_)) {
+        PLACED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(seat_id.to_string(), Instant::now());
+        if let Some(fp) = asker.fp {
+            held.insert(
+                seat_id.to_string(),
+                (fp.to_string(), Instant::now() + RESERVE),
+            );
+        }
     }
     placed
+}
+
+/// Seat id → when a device was last redirected to it.
+static PLACED: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMap::new());
+
+/// When a device was last redirected to `seat_id`. A seat's idle clock starts no earlier: a
+/// player who lands and leaves between two of its checks still counts.
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) fn last_placed(seat_id: &str) -> Option<Instant> {
+    PLACED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(seat_id)
+        .copied()
 }
 
 /// Whether the host that was asked plays the profile itself. A seat host does: resolving the
@@ -88,12 +114,10 @@ fn plays_here(role: HostRole, own_row: bool) -> bool {
 /// Seat id → the device redirected to it and until when it holds it.
 static RESERVED: Mutex<BTreeMap<String, (String, Instant)>> = Mutex::new(BTreeMap::new());
 
-/// A profile whose seat is a ledger row of its own.
+/// A profile whose seat is a ledger row of its own: the row [`row_in`](super::row_in) names
+/// with no owner row, so the owner's profile has none.
 fn ledger_seat(account: &crate::profiles::OsAccount) -> Option<&str> {
-    match account {
-        crate::profiles::OsAccount::Seat { seat: Some(id) } => Some(id),
-        _ => None,
-    }
+    super::row_in(account, None, false)
 }
 
 /// The rule, without IO. `seat` is the profile's ledger row and its seat number, `occupants`
@@ -161,6 +185,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The door's owner row is the owner's, never a profile's own: placement reads one mapping.
+    #[test]
+    fn only_a_full_seat_has_a_ledger_row_of_its_own() {
+        use crate::profiles::OsAccount::{Operator, Seat as Full};
+        let row = "0123456789abcdef0123456789abcdef";
+        let full = Full {
+            seat: Some(row.into()),
+        };
+        assert_eq!(ledger_seat(&full), Some(row));
+        assert_eq!(ledger_seat(&Full { seat: None }), None);
+        assert_eq!(ledger_seat(&Operator), None);
+        let mut owner = seat(RuntimeState::Running);
+        owner.owner = true;
+        assert_eq!(
+            crate::seats::row_in(&Operator, Some(&owner), true),
+            Some(row)
+        );
+        assert_eq!(crate::seats::row_in(&full, Some(&owner), true), Some(row));
     }
 
     fn seat(state: RuntimeState) -> Seat {

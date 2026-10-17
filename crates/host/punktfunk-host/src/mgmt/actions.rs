@@ -289,7 +289,8 @@ fn log_denial_once(fp: &str, action: &str, device: &str) {
 /// Id-only, empty body: nothing in the request reaches the privileged path. Power actions
 /// answer `202`, end every session (typed HostPower close), wait ~1 s so this response
 /// flushes, then act; paired-cert callers need Host power and are `409` while another
-/// device's session is live, the admin console never is. One power action at a time.
+/// device's session is live or a seat host doesn't answer, the admin console never is. One
+/// power action at a time.
 /// `display.next` answers `200` with the monitor now streamed and ends nothing; a paired
 /// cert needs a live session of its own.
 #[utoipa::path(
@@ -303,7 +304,7 @@ fn log_denial_once(fp: &str, action: &str, device: &str) {
         (status = ACCEPTED, description = "Accepted — sessions are being ended and the action follows in about a second"),
         (status = FORBIDDEN, description = "This caller's access does not include this action (no Host power grant, or no live session of its own for `display.next`)", body = ApiError),
         (status = NOT_FOUND, description = "Unknown action id", body = ApiError),
-        (status = CONFLICT, description = "Refused: an action is already in flight, another device's session is live (cert lane), or the platform said no (a foreign sleep inhibitor, a second local user, a single monitor, …)", body = ApiError),
+        (status = CONFLICT, description = "Refused: an action is already in flight, another device's session is live or a seat host doesn't answer (cert lane), or the platform said no (a foreign sleep inhibitor, a second local user, a single monitor, …)", body = ApiError),
         (status = NOT_IMPLEMENTED, description = "This host platform has no executor for it (macOS host)", body = ApiError),
         (status = INTERNAL_SERVER_ERROR, description = "`display.next` could not store the new monitor", body = ApiError),
         (status = UNAUTHORIZED, description = "Missing or invalid credentials", body = ApiError),
@@ -368,7 +369,8 @@ pub(crate) async fn invoke_action(
         if others_native || gamestream || on_seat {
             return api_error(
                 StatusCode::CONFLICT,
-                "Another device is streaming from this host right now",
+                "Another device is streaming from this host, or a seat that isn't answering might \
+                 be. Try again in a moment.",
             );
         }
     }
@@ -406,6 +408,12 @@ pub(crate) async fn invoke_action(
         crate::power::set_closing(true);
         crate::session_status::stop_all_quit();
         let _ = app.quit_session("host power action");
+        // Seat hosts run their own sessions and never hear this close. A process restart leaves
+        // them standing. A supervisor that doesn't answer must not hold the action back.
+        if verb != PowerVerb::Restart {
+            let ended = tokio::task::spawn_blocking(crate::seats::end_all_sessions);
+            let _ = tokio::time::timeout(SEATS_END_BUDGET, ended).await;
+        }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         // Displays first: going under on a still-up display is not a transient.
         drain_displays().await;
@@ -478,6 +486,9 @@ async fn invoke_display_next(
     });
     Json(ActionOutcome { monitor: to }).into_response()
 }
+
+/// How long a power action waits for the seats' sessions to end.
+const SEATS_END_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Wait for signaled sessions to drop their virtual displays before going under anyway.
 /// Longer than the 1.5 s handshake release grace, short enough a wedged teardown cannot

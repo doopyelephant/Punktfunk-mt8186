@@ -1,9 +1,10 @@
 //! The supervisor's Unix socket, open to root and the `punktfunk` user only.
 //!
 //! One request per connection, framed as on the Windows pipe ([`crate::ipc::answer`]). The
-//! socket file is `0660 root:punktfunk`, but the gate is the kernel's record of who connected
-//! (`SO_PEERCRED`): a peer that is neither root nor the `punktfunk` user is closed unanswered. A
-//! leftover socket from a crashed supervisor is replaced; a live one makes [`bind`] fail.
+//! socket file is `0660 root:punktfunk-door`, the door user's own group, but the gate is the
+//! kernel's record of who connected (`SO_PEERCRED`): a peer that is neither root nor the
+//! `punktfunk` user is closed unanswered. A leftover socket from a crashed supervisor is
+//! replaced; a live one makes [`bind`] fail.
 
 use super::accounts;
 use crate::backend::PlatformBackend;
@@ -18,6 +19,10 @@ use std::time::Duration;
 
 /// Where the daemon listens and the box host connects.
 pub const SOCKET_PATH: &str = "/run/punktfunk/seats.sock";
+
+/// The door user's primary group, which reads this socket and the box's library. Not
+/// `punktfunk`, the group of the vhci attach nodes.
+pub const DOOR_GROUP: &str = "punktfunk-door";
 
 /// Requests served at once. A connection past it is closed unanswered.
 const MAX_CONNECTIONS: usize = 8;
@@ -61,11 +66,19 @@ pub fn bind_fresh(path: &Path) -> std::io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
-/// Binds `path` for the box host: root and the `punktfunk` group may connect.
+/// Makes the door's group when no package has yet. A package restarts this daemon before the one
+/// that creates the group, and a socket bound without it stays closed to the door.
+pub fn ensure_door_group() {
+    if let Err(error) = accounts::ensure_group(DOOR_GROUP) {
+        tracing::warn!(%error, "door group not created");
+    }
+}
+
+/// Binds `path` for the box host: root and the door's group may connect.
 pub fn bind(path: &Path) -> std::io::Result<UnixListener> {
     let listener = bind_fresh(path)?;
     // The group may connect; peer credentials decide who is served. Without the group only root.
-    let group = accounts::group_gid("punktfunk").ok().flatten();
+    let group = accounts::group_gid(DOOR_GROUP).ok().flatten();
     match group {
         Some(gid) => {
             std::os::unix::fs::chown(path, Some(0), Some(gid))?;

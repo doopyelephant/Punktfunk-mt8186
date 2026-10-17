@@ -51,6 +51,7 @@ mod linux {
         \x20 seating                     whether seats are on\n\
         \x20 fence                       udev's IMPORT{program}: whose a seat's pad is\n\
         \x20 ungate                      open the vhci gate and the box's hidraw (ExecStopPost)\n\
+        \x20 drain                       answer the seats' waiting uinput reads (ExecStop)\n\
         \x20 serve-usb                   a seat's USB pad server, which the supervisor starts\n";
 
     pub fn main() -> ExitCode {
@@ -98,6 +99,9 @@ mod linux {
                 crate::vhci::ungate();
                 pads::unbind();
                 return Ok(());
+            }
+            "drain" => {
+                return crate::uinput::ask_to_drain().map_err(|e| format!("drain: {e}"));
             }
             "serve-usb" => {
                 pf_seats::logging::to_stderr();
@@ -195,6 +199,8 @@ mod linux {
         pf_seats::logging::to_stderr();
         // Adopts systemd's kept fds close-on-exec before anything here can spawn a child.
         crate::uinput::resume(pads::resume());
+        socket::ensure_door_group();
+        crate::uinput::listen_for_drain();
         let state = PathBuf::from(pf_seats::linux::STATE_DIR);
         let backend = LinuxBackend::open(pf_paths::config_dir(), state, steam_source)
             .map_err(|e| format!("open the seat backend: {e}"))?

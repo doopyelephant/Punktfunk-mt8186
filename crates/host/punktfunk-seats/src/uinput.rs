@@ -694,6 +694,21 @@ impl<U: Uinput> Proxy<U> {
         })
     }
 
+    /// A restart is coming: ends every blocking read still waiting with `EINTR`. The kernel
+    /// keeps a read this process took in processing until it is answered, and the next supervisor
+    /// can't name it; its caller reads again, and the new request waits for the next supervisor.
+    fn drain(&mut self) {
+        let waiting: Vec<u64> = self
+            .opens
+            .values_mut()
+            .flat_map(|open| open.reads.drain(..))
+            .map(|(unique, _)| unique)
+            .collect();
+        for unique in waiting {
+            self.send(&cuse::error(unique, EINTR));
+        }
+    }
+
     /// `fh`'s device turned readable: answers the reads waiting on it, then wakes its poller.
     fn wake(&mut self, fh: u64) {
         let Some(open) = self.opens.get_mut(&fh) else {
@@ -742,7 +757,9 @@ impl<U: Uinput> Proxy<U> {
 }
 
 /// Serves `proxy` until `stop`'s peer hangs up or the kernel ends the device, then takes its
-/// fds out of systemd's store; dropping them removes the node and destroys every device.
+/// fds out of systemd's store; dropping them removes the node and destroys every device. A byte
+/// on `stop` is [`Proxy::drain`]: the proxy answers its waiting reads and reads no more requests,
+/// and leaves its fds in the store for the supervisor that follows.
 fn serve<U: Uinput>(mut proxy: Proxy<U>, stop: UnixStream) {
     let mut buf = vec![0u8; CHANNEL_BUF];
     loop {
@@ -783,6 +800,11 @@ fn serve<U: Uinput>(mut proxy: Proxy<U>, stop: UnixStream) {
             )
         };
         if stopped {
+            let mut byte = [0u8; 1];
+            if (&stop).read(&mut byte).is_ok_and(|n| n == 1) {
+                proxy.drain();
+                return;
+            }
             break;
         }
         if requests {
@@ -816,6 +838,63 @@ impl Handle {
         drop(self.stop);
         let _ = self.thread.join();
     }
+
+    /// Has the proxy answer its waiting reads and stop, and waits for it.
+    fn drain(self) {
+        let _ = (&self.stop).write_all(b"d");
+        let _ = self.thread.join();
+    }
+}
+
+/// Where `punktfunk-seats drain` reaches the running supervisor: root's alone.
+const DRAIN_SOCKET: &str = "/run/punktfunk/uinput-drain.sock";
+/// How long the unit's `ExecStop=` waits for the supervisor to answer.
+const DRAIN_WAIT: Duration = Duration::from_secs(5);
+
+/// Listens on [`DRAIN_SOCKET`] for the unit's `ExecStop=`: each root connection drains every
+/// proxy before the stop signal ends the process. The proxies hold reads the kernel counts as in
+/// processing, and a signal handler would need `unsafe`.
+pub fn listen_for_drain() {
+    let bound = pf_seats::linux::socket::bind_fresh(Path::new(DRAIN_SOCKET)).and_then(|listener| {
+        std::fs::set_permissions(DRAIN_SOCKET, std::fs::Permissions::from_mode(0o600))?;
+        Ok(listener)
+    });
+    let listener = match bound {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::warn!(%error, "seat uinput drain socket not bound");
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name("seat-drain".into())
+        .spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let root = pf_seats::linux::socket::peer_uid(&stream).is_ok_and(|uid| uid == 0);
+                if root {
+                    drain_all();
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "seat uinput drain thread did not start");
+    }
+}
+
+fn drain_all() {
+    let all = std::mem::take(&mut *proxies());
+    for (account, handle) in all {
+        handle.drain();
+        tracing::info!(account, "seat uinput proxy drained");
+    }
+}
+
+/// `punktfunk-seats drain`: returns once the running supervisor has answered the reads its
+/// proxies hold. Fails when none is listening.
+pub fn ask_to_drain() -> io::Result<()> {
+    let mut stream = UnixStream::connect(DRAIN_SOCKET)?;
+    stream.set_read_timeout(Some(DRAIN_WAIT))?;
+    stream.read_to_end(&mut Vec::new()).map(drop)
 }
 
 static PROXIES: LazyLock<Mutex<HashMap<String, Handle>>> = LazyLock::new(Mutex::default);
@@ -860,10 +939,31 @@ fn up(account: &str, uid: u32) {
     }
 }
 
+const CUSE: &str = "/dev/cuse";
+
+/// Whether a `/dev/cuse` with this owner and mode opens for root alone.
+fn root_only(uid: u32, mode: u32) -> bool {
+    uid == 0 && mode & 0o077 == 0
+}
+
+/// Makes `/dev/cuse` root's alone. Whoever else can open it can register a node under the name a
+/// seat's unit binds, and the fence then hands that node to the seat's user.
+fn close_cuse(node: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(node)?;
+    if root_only(meta.uid(), meta.mode()) {
+        return Ok(());
+    }
+    tracing::warn!(node = %node.display(), "cuse node opens to other users; made root's alone");
+    std::os::unix::fs::chown(node, Some(0), Some(0))?;
+    std::fs::set_permissions(node, std::fs::Permissions::from_mode(0o600))
+}
+
 /// `account`'s CUSE device, its node handed to `uid`, `0600`. An earlier device of that name
 /// still there after two seconds fails it: the kernel refuses a twin name, and the `chown` would
 /// land on the old node.
 fn make(account: &str, uid: u32) -> io::Result<File> {
+    close_cuse(Path::new(CUSE))?;
     let devname = pf_paths::seat::uinput_devname(account);
     // One that just ended lingers until systemd drops its stored copy.
     let sysfs = Path::new("/sys/class/cuse").join(devname.replace('/', "!"));
@@ -880,7 +980,7 @@ fn make(account: &str, uid: u32) -> io::Result<File> {
     let chan = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open("/dev/cuse")?;
+        .open(CUSE)?;
     handshake(&chan, &devname)?;
     let node = Path::new("/dev").join(&devname);
     std::os::unix::fs::chown(&node, Some(uid), Some(0))?;
@@ -1454,5 +1554,62 @@ mod tests {
 
         drop(stop);
         thread.join().unwrap();
+    }
+
+    /// A drain answers the reads a proxy holds with `EINTR` and reads nothing more: what the
+    /// kernel queues afterwards waits for the next supervisor.
+    #[test]
+    fn a_drained_proxy_ends_its_waiting_reads_and_takes_no_more() {
+        let (theirs, ours) = pad_broker::relay_pair().unwrap();
+        let mut kernel = Kernel {
+            sock: theirs,
+            unique: 0,
+        };
+        kernel
+            .sock
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (queues, queued) = mpsc::channel::<UnixDatagram>();
+        let opener = Box::new(move || {
+            let (queue, push) = UnixDatagram::pair()?;
+            queue.set_nonblocking(true)?;
+            queues.send(push).unwrap();
+            Ok(Fake {
+                queue,
+                log: Arc::default(),
+            })
+        });
+        // The fd store's copy: the connection outlives the proxy.
+        let _stored = ours.try_clone().unwrap();
+        let proxy = Proxy::new(File::from(ours), "pf-seat-1", opener, Vec::new());
+        let (stop, theirs) = UnixStream::pair().unwrap();
+        let thread = std::thread::spawn(move || serve(proxy, theirs));
+
+        assert_eq!(kernel.ask(cuse::FUSE_OPEN, &[0; 8]).0, 0);
+        let _push = queued.recv().unwrap();
+        let first = kernel.read(32, 0);
+        let second = kernel.read(32, 0);
+        assert_eq!(kernel.ask(46, &[0; 24]).0, -ENOSYS, "both reads were taken");
+
+        (&stop).write_all(b"d").unwrap();
+        let ended = [kernel.answer(first).0, kernel.answer(second).0];
+        assert_eq!(ended, [-EINTR, -EINTR]);
+        thread.join().unwrap();
+
+        kernel.send(46, &[0; 24]);
+        kernel
+            .sock
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        assert!(kernel.sock.recv(&mut [0u8; 64]).is_err(), "nobody reads it");
+    }
+
+    #[test]
+    fn only_a_root_owned_cuse_node_without_group_or_other_access_is_closed() {
+        assert!(root_only(0, 0o600));
+        assert!(root_only(0, 0o020_600));
+        assert!(!root_only(0, 0o660));
+        assert!(!root_only(0, 0o606));
+        assert!(!root_only(1000, 0o600));
     }
 }

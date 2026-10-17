@@ -121,10 +121,13 @@ function useSessionActions(active: number): SessionActions {
 				}))
 			)
 				return;
-			stopAll.mutate(undefined, {
-				onSuccess: invalidate,
-				onError: failed(m.action_stop_failed()),
-			});
+			stopAll.mutate(
+				{},
+				{
+					onSuccess: invalidate,
+					onError: failed(m.action_stop_failed()),
+				},
+			);
 		},
 		onIdr: (row) =>
 			row.id != null
@@ -334,7 +337,7 @@ export const SectionHome: FC = () => {
 				if (row) actions.onStop(row);
 				return;
 			}
-			stop.mutate(undefined, { onError: failed(m.action_stop_failed()) });
+			stop.mutate({}, { onError: failed(m.action_stop_failed()) });
 			return;
 		}
 		const waiting = games.filter(unstreamed).length;

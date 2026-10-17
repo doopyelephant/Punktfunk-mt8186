@@ -1932,3 +1932,18 @@ fn expired_record_knocks_into_pending_and_reapproval_regrants() {
     let _ = std::fs::remove_file(&store);
     host.join().unwrap().unwrap();
 }
+
+/// A redirected "this session" guest keeps its record while it plays on the seat. The hold
+/// outlasts the dial and the picture bring-up, and ends when the guest has left, or never came,
+/// or the seats have said nothing for too long.
+#[test]
+fn a_redirected_guest_is_held_until_it_leaves_the_seat() {
+    let s = std::time::Duration::from_secs;
+    let over = |here, landed, waited, silent| hold_over(here, landed, s(waited), s(silent));
+    assert!(!over(Some(false), false, 10, 0), "still dialing in");
+    assert!(!over(Some(true), true, 600, 0), "playing");
+    assert!(over(Some(false), true, 600, 0), "left after playing");
+    assert!(over(Some(false), false, 121, 0), "never came");
+    assert!(!over(None, true, 600, 5), "a seat that blinked");
+    assert!(over(None, true, 600, 61), "a seat that hangs");
+}

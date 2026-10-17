@@ -221,23 +221,27 @@ fn spots(steamapps: &Path) -> Vec<Spot> {
     out
 }
 
-/// The box's `seat_library_writable`, read from its [`DEFAULTS`] in `box_dir`: on when the box
-/// wrote none or the file is unreadable.
+/// The box's `seat_library_writable`, read from its [`DEFAULTS`] in `box_dir`. On when the box
+/// wrote none, or none that names the setting. A file that can't be read, or a value that isn't
+/// a bool, reads as off: this setting only ever narrows what a seat may do.
 fn writable(box_dir: &Path) -> bool {
-    let read = || -> std::io::Result<Option<bool>> {
+    let read = || -> std::io::Result<bool> {
         let path = box_dir.join(DEFAULTS);
         let Some((bytes, _)) = safe_open::read(&path, shared::MAX_TRUST_BYTES)? else {
-            return Ok(None);
+            return Ok(true);
         };
         let defaults: serde_json::Value = serde_json::from_slice(&bytes)?;
-        Ok(defaults["library_writable"].as_bool())
+        let object = defaults.as_object().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "not a JSON object")
+        })?;
+        Ok(object
+            .get("library_writable")
+            .is_none_or(|value| value.as_bool().unwrap_or(false)))
     };
-    read()
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, "seat defaults unreadable; the owner's libraries stay writable");
-            None
-        })
-        .unwrap_or(true)
+    read().unwrap_or_else(|error| {
+        tracing::warn!(%error, "seat defaults unreadable; the owner's libraries are read-only");
+        false
+    })
 }
 
 fn fstype(path: &Path) -> Option<String> {
@@ -285,7 +289,12 @@ pub(super) fn share(
         }
     };
     let read_only = !writable(box_dir);
-    let libraries = find(&steam::library_paths(&vdf), owner.0, fstype)
+    let found = find(&steam::library_paths(&vdf), owner.0, fstype);
+    let orphans = orphans(&shared::seat_dir(state, id).join("private"), &found);
+    if !orphans.is_empty() {
+        tracing::info!(seat = %id, ?orphans, "private folders of libraries no longer listed");
+    }
+    let libraries = found
         .into_iter()
         .map(|mut library| {
             if read_only {
@@ -310,6 +319,34 @@ pub(super) fn share(
         read_only,
         libraries,
     })
+}
+
+/// The keys under `private` that none of `libraries` carries: prefixes and caches of a library
+/// the owner's Steam no longer lists, or whose drive is away. They are kept, never deleted.
+fn orphans(private: &Path, libraries: &[Library]) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(private)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|key| libraries.iter().all(|library| &library.key != key))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Removes `id`'s stage folders, the mount points its unit mounted the libraries at. `rmdir`
+/// only: a mount still up fails with `EBUSY` and stays, so no library is emptied through one.
+pub(super) fn remove_stage(id: &SeatId) {
+    remove_empty_dirs(&Path::new(STAGE_ROOT).join(id.as_str()));
+}
+
+/// `root` and the folders directly in it, each only if empty.
+fn remove_empty_dirs(root: &Path) {
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let _ = std::fs::remove_dir(entry.path());
+    }
+    let _ = std::fs::remove_dir(root);
 }
 
 /// Every directory a library's binds name, and the seat's copy of each of its [`Spot`]s, before
@@ -453,14 +490,20 @@ pub(super) fn unit_lines(state: &Path, id: &SeatId, shares: &Shares) -> String {
     out
 }
 
-/// Lists `libraries` in the seat's Steam and drops the ones it no longer has, and any folder
-/// under `/run/media`, which a seat never sees. Steam's own entries stay as written. Never fails
-/// the start: an unlisted library is one the seat's Steam doesn't offer.
+/// Lists the shared games folder and `libraries` in the seat's Steam and drops the ones it no
+/// longer has, and any folder under `/run/media`, which a seat never sees. Steam's own entries
+/// stay as written, and a folder missing from the list goes last: Steam reads entry `0` as its
+/// own install and drops a folder listed there. Never fails the start: an unlisted library is
+/// one the seat's Steam doesn't offer.
 pub(super) fn register(state: &Path, id: &SeatId, seat: &Passwd, libraries: &[Library]) {
     let ours = libraries_dir(state, id);
-    let wanted: Vec<String> = libraries
-        .iter()
-        .map(|l| root_dir(state, id, &l.key).to_string_lossy().into_owned())
+    let games = shared::games_dir(state).to_string_lossy().into_owned();
+    let wanted: Vec<String> = std::iter::once(games)
+        .chain(
+            libraries
+                .iter()
+                .map(|l| root_dir(state, id, &l.key).to_string_lossy().into_owned()),
+        )
         .collect();
     let managed =
         |path: &str| Path::new(path).starts_with(&ours) || path.starts_with("/run/media/");
@@ -637,6 +680,34 @@ mod tests {
         );
     }
 
+    /// A seat's private folders for a library it no longer sees are named, not touched; the
+    /// stage goes empty folder by empty folder, and a folder holding anything stays.
+    #[test]
+    fn a_library_the_seat_lost_is_named_and_its_stage_goes() {
+        let temp = tempfile::tempdir().unwrap();
+        let private = temp.path().join("private");
+        for key in ["00aa", "11bb", "22cc"] {
+            std::fs::create_dir_all(private.join(key).join("compatdata")).unwrap();
+        }
+        let library = |key: &str| Library {
+            steamapps: PathBuf::from("/x/steamapps"),
+            key: key.into(),
+            spots: Vec::new(),
+        };
+        assert_eq!(orphans(&private, &[library("11bb")]), ["00aa", "22cc"]);
+        assert!(orphans(&temp.path().join("gone"), &[]).is_empty());
+        assert!(private.join("00aa/compatdata").exists());
+
+        let stage = temp.path().join("stage");
+        std::fs::create_dir_all(stage.join("00aa")).unwrap();
+        std::fs::create_dir_all(stage.join("11bb")).unwrap();
+        std::fs::write(stage.join("11bb/mounted"), "x").unwrap();
+        remove_empty_dirs(&stage);
+        assert!(!stage.join("00aa").exists());
+        assert!(stage.join("11bb/mounted").exists(), "not recursive");
+        remove_empty_dirs(&temp.path().join("gone"));
+    }
+
     #[test]
     fn a_library_listed_twice_is_shown_once() {
         let temp = tempfile::tempdir().unwrap();
@@ -803,7 +874,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&lock).unwrap(), "held");
     }
 
-    /// The box's Seat default decides; without one the libraries stay writable.
+    /// The box's Seat default decides; without one the libraries stay writable, and a file that
+    /// can't be read as the setting turns them read-only.
     #[test]
     fn the_box_s_seat_default_makes_the_libraries_read_only() {
         let temp = tempfile::tempdir().unwrap();
@@ -820,15 +892,21 @@ mod tests {
             assert_eq!(writable(temp.path()), library_writable);
         }
         std::fs::write(&path, "{}").unwrap();
-        assert!(writable(temp.path()));
+        assert!(writable(temp.path()), "no setting named");
+        for unreadable in ["", "{", "[]", r#"{"library_writable":"yes"}"#, "null"] {
+            std::fs::write(&path, unreadable).unwrap();
+            assert!(!writable(temp.path()), "{unreadable:?}");
+        }
+        std::fs::write(&path, r#"{"library_writable":null}"#).unwrap();
+        assert!(!writable(temp.path()), "a value that isn't a bool");
     }
 
     fn steam_file(home: &Path, dir: &str) -> PathBuf {
         home.join(".local/share/Steam").join(dir).join(LIST)
     }
 
-    /// Both of the seat's lists gain the box's libraries and lose a stale drive; Steam's own
-    /// entry stays, and an absent copy stays absent.
+    /// Both of the seat's lists gain the shared games folder and the box's libraries after
+    /// Steam's own entry, and lose a stale drive; an absent copy stays absent.
     #[test]
     fn the_seat_s_lists_name_the_box_s_libraries() {
         let temp = tempfile::tempdir().unwrap();
@@ -859,6 +937,7 @@ mod tests {
         );
         let after = steam::library_folders_vdf(&[
             own.clone(),
+            "/b/games".to_owned(),
             "/b/seats/0123456789abcdef0123456789abcdef/libraries/00aa".to_owned(),
         ]);
         for dir in ["steamapps", "config"] {
@@ -872,7 +951,17 @@ mod tests {
         register(Path::new("/b"), &id(), &seat, &[]);
         assert!(!steam_file(&home, "config").exists());
         let text = std::fs::read_to_string(steam_file(&home, "steamapps")).unwrap();
-        assert_eq!(steam::library_paths(&text), [own]);
+        assert_eq!(steam::library_paths(&text), [own.as_str(), "/b/games"]);
+
+        // Steam wrote its own list back without the games folder, which it drops at entry 0.
+        std::fs::write(
+            steam_file(&home, "steamapps"),
+            steam::library_folders_vdf(std::slice::from_ref(&own)),
+        )
+        .unwrap();
+        register(Path::new("/b"), &id(), &seat, &[]);
+        let text = std::fs::read_to_string(steam_file(&home, "steamapps")).unwrap();
+        assert_eq!(steam::library_paths(&text), [own.as_str(), "/b/games"]);
     }
 
     /// Root never follows a link the seat planted on the way to its lists.
@@ -921,8 +1010,8 @@ mod tests {
         let b = temp.path().to_path_buf();
         assert_eq!(
             within(move || writable(&b)),
-            Some(true),
-            "unreadable reads as writable"
+            Some(false),
+            "unreadable reads as read-only"
         );
     }
 }

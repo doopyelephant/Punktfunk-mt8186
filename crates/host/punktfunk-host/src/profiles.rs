@@ -196,7 +196,7 @@ pub enum ResolveVia {
 pub enum ProfileError {
     /// No profile has that id.
     Unknown,
-    /// A seat profile asked of another seat's host.
+    /// A profile asked of a seat host that doesn't play it.
     NotThisSeat,
     /// The profile's account needs a session broker this host does not have.
     SessionUnavailable,
@@ -273,6 +273,12 @@ pub fn removed() -> tokio::sync::broadcast::Receiver<ProfileId> {
     REMOVED
         .get_or_init(|| tokio::sync::broadcast::channel(16).0)
         .subscribe()
+}
+
+fn announce_removed(id: &str) {
+    if let Some(tx) = REMOVED.get() {
+        let _ = tx.send(id.to_string());
+    }
 }
 
 /// A stored picture.
@@ -363,6 +369,18 @@ impl Profiles {
         default_profile(&self.lock().file).map(|p| p.id.clone())
     }
 
+    /// The name [`create`](Self::create) would take `input` under, or what it would refuse. The
+    /// caller asks before it makes a seat's account for the profile.
+    pub fn vet_create(&self, input: &ProfileCreate) -> Result<String, EditError> {
+        let name = clean_name(&input.display_name)
+            .ok_or_else(|| EditError::Invalid("a profile needs a name".into()))?;
+        if let Some(accent) = &input.accent {
+            valid_accent(accent.clone())?;
+        }
+        refuse_new(&self.lock().file, &name)?;
+        Ok(name)
+    }
+
     /// `seat` is the ledger row the profile's desktop runs on, which the caller makes for
     /// `input.seat`; `None` shares the owner's desktop.
     pub fn create(&self, input: ProfileCreate, seat: Option<String>) -> Result<Profile, EditError> {
@@ -371,12 +389,7 @@ impl Profiles {
         let accent = input.accent.map(valid_accent).transpose()?;
         let mut made = None;
         self.edit(|file| {
-            if file.profiles.len() >= PROFILES_MAX {
-                return Err(EditError::Full);
-            }
-            if name_taken(&file.profiles, &name, None) {
-                return Err(EditError::NameTaken);
-            }
+            refuse_new(file, &name)?;
             let now = now_unix();
             let os_account = match &seat {
                 Some(row) => OsAccount::Seat {
@@ -488,10 +501,25 @@ impl Profiles {
                 let _ = std::fs::remove_file(pf_paths::seat_record(id));
             }
         }
-        if let Some(tx) = REMOVED.get() {
-            let _ = tx.send(id.to_string());
-        }
+        announce_removed(id);
         Ok(gone)
+    }
+
+    /// A seat host's copy follows the box's file, so a profile the box deletes never runs
+    /// [`Self::delete`] here. Sends [`removed`] for each id that left the file since `known`,
+    /// then keeps the ids as they are. A file that is empty or doesn't parse says nothing.
+    pub fn announce_removals(&self, known: &mut std::collections::HashSet<ProfileId>) {
+        let now: std::collections::HashSet<ProfileId> = {
+            let state = self.lock();
+            if state.unparsed.is_some() || state.file.profiles.is_empty() {
+                return;
+            }
+            state.file.profiles.iter().map(|p| p.id.clone()).collect()
+        };
+        for gone in known.difference(&now) {
+            announce_removed(gone);
+        }
+        *known = now;
     }
 
     /// Where a device that names no profile lands; `None` is the owner.
@@ -727,10 +755,8 @@ impl Profiles {
                     .then(|| file.profiles.iter().find(|p| p.id == id))
                     .flatten()
                     .ok_or(ProfileError::Unknown)?;
-                if let (Some(mine), OsAccount::Seat { seat }) = (&self.seat, &found.os_account) {
-                    if seat.as_ref() != Some(mine) {
-                        return Err(ProfileError::NotThisSeat);
-                    }
+                if !self.serves(&found.os_account) {
+                    return Err(ProfileError::NotThisSeat);
                 }
                 (Some(found), ResolveVia::Asked)
             }
@@ -781,6 +807,16 @@ impl Profiles {
             home: profile.home,
             via,
         })
+    }
+
+    /// Whether this host plays a profile on `account`. A seat host plays its own row's profile;
+    /// only the owner's host also plays the box's own session.
+    fn serves(&self, account: &OsAccount) -> bool {
+        match (&self.seat, account) {
+            (None, _) => true,
+            (Some(mine), OsAccount::Seat { seat }) => seat.as_ref() == Some(mine),
+            (Some(_), _) => self.owner_host,
+        }
     }
 
     /// Stores `bytes` as `id`'s picture: PNG, JPEG or WebP by magic, at most
@@ -966,6 +1002,17 @@ pub fn clean_name(raw: &str) -> Option<String> {
         .collect();
     let name = name.trim_end().to_string();
     (!name.is_empty()).then_some(name)
+}
+
+/// Why `file` takes no new profile called `name`.
+fn refuse_new(file: &ProfilesFile, name: &str) -> Result<(), EditError> {
+    if file.profiles.len() >= PROFILES_MAX {
+        return Err(EditError::Full);
+    }
+    if name_taken(&file.profiles, name, None) {
+        return Err(EditError::NameTaken);
+    }
+    Ok(())
 }
 
 fn name_taken(profiles: &[Profile], name: &str, except: Option<&str>) -> bool {

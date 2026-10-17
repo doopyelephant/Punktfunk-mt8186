@@ -9,6 +9,7 @@
 
 use crate::update::detect::InstallKind;
 use axum::http::StatusCode;
+use pf_seats::model::MAX_ACCOUNT_LEN;
 
 /// A refusal: the status and its sentence for the operator.
 pub(crate) type Refusal = (StatusCode, String);
@@ -90,17 +91,27 @@ fn unit(on: bool, user: &str) -> String {
     )
 }
 
-/// A user name `systemctl` takes as an instance and the helper accepts: lowercase letters,
-/// digits, `_`, `-` and `.`, starting with a letter or `_`. Anything else is not started.
+/// A user name the seat supervisor adopts as the owner, which the helper checks the same way:
+/// lowercase letters, digits, `_` and `-`, starting with a letter or `_`, at most
+/// [`MAX_ACCOUNT_LEN`] long. Anything else is not started.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
 fn instance_safe(user: &str) -> bool {
     let mut bytes = user.bytes();
-    bytes
-        .next()
-        .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
-        && bytes.all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.')
-        })
+    user.len() <= MAX_ACCOUNT_LEN
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+}
+
+/// Whether `id -u` printed an ordinary account's uid, the range the helper switches. A service
+/// account and a `systemd-homed` user (60001 and up) are refused there with nothing changed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
+fn ordinary_uid(printed: &str) -> bool {
+    printed
+        .trim()
+        .parse::<u32>()
+        .is_ok_and(|uid| (1000..60000).contains(&uid))
 }
 
 #[cfg(target_os = "linux")]
@@ -151,6 +162,14 @@ mod linux {
             return Some((
                 StatusCode::CONFLICT,
                 "This account's name can't be switched automatically.".into(),
+            ));
+        }
+        if on
+            && capture(Command::new("id").args(["-u", user])).is_some_and(|uid| !ordinary_uid(&uid))
+        {
+            return Some((
+                StatusCode::CONFLICT,
+                "This account can't be switched automatically.".into(),
             ));
         }
         if on && !in_update_group(Command::new("id").args(["-nG", user])) {
@@ -255,20 +274,45 @@ mod tests {
     #[test]
     fn the_unit_names_the_user_and_the_direction() {
         assert_eq!(unit(true, "enrico"), "punktfunk-door-on@enrico.service");
-        assert_eq!(unit(false, "j.doe"), "punktfunk-door-off@j.doe.service");
+        assert_eq!(unit(false, "j_doe"), "punktfunk-door-off@j_doe.service");
     }
 
     /// The instance is data the helper re-checks, but nothing odd reaches `systemctl`: a user
-    /// name with a slash, a space, an `@` or a leading dash is not started.
+    /// name with a slash, a space, an `@` or a leading dash is not started. The supervisor
+    /// refuses a `.` and a name past [`MAX_ACCOUNT_LEN`], so neither starts a switch it would
+    /// abandon half way.
     #[test]
     fn only_a_plain_user_name_is_started() {
-        for good in ["enrico", "_svc", "a1", "j.doe", "a-b_c"] {
+        let longest = "a".repeat(MAX_ACCOUNT_LEN);
+        for good in ["enrico", "_svc", "a1", "a-b_c", longest.as_str()] {
             assert!(instance_safe(good), "{good}");
         }
+        let too_long = "a".repeat(MAX_ACCOUNT_LEN + 1);
         for bad in [
-            "", "Enrico", "1abc", "-x", "a b", "a/b", "a@b", "a\u{e9}", ".x",
+            "",
+            "Enrico",
+            "1abc",
+            "-x",
+            "a b",
+            "a/b",
+            "a@b",
+            "a\u{e9}",
+            ".x",
+            "j.doe",
+            too_long.as_str(),
         ] {
             assert!(!instance_safe(bad), "{bad:?}");
+        }
+    }
+
+    /// The helper switches ordinary accounts only; the console says so before it asks.
+    #[test]
+    fn only_an_ordinary_uid_is_switched() {
+        for good in ["1000\n", "1001", "59999\n"] {
+            assert!(ordinary_uid(good), "{good:?}");
+        }
+        for bad in ["", "root", "0\n", "999", "60000", "60001", "-1"] {
+            assert!(!ordinary_uid(bad), "{bad:?}");
         }
     }
 

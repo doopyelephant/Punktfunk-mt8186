@@ -23,6 +23,9 @@ TimeoutStartSec=90
 # ledger included, is /var/lib/punktfunk-seats.
 Environment=PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk
 ExecStart=/usr/libexec/punktfunk/punktfunk-seats serve --socket /run/punktfunk/seats.sock
+# A seat's blocking uinput reads sit in this process until answered; the stop signal would
+# strand them in the kernel. This answers them first.
+ExecStop=-/usr/libexec/punktfunk/punktfunk-seats drain
 # No seat attaches while the supervisor is down, so its stop opens the vhci gate once no seat
 # holds a port, and gives the box's hidraw nodes back their distro modes.
 ExecStopPost=-/usr/libexec/punktfunk/punktfunk-seats ungate

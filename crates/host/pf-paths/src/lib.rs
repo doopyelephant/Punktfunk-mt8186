@@ -9,9 +9,9 @@
 //! SYSTEM/Administrators DACL on Windows. [`replace_file`] / [`replace_secret_file`] /
 //! [`replace_users_readable_file`] are the one temp-and-rename writer for stores; the last
 //! is for the two files every local account may read, `mgmt-endpoint` and `tray-token`.
-//! [`system32`] is how a privileged process names a Windows system tool; [`remove_device`]
-//! runs one. [`seat`] is the Windows multi-seat marker. [`tray_autostart`] is the tray's
-//! per-user autostart entry on Linux.
+//! [`system32`] is how a privileged process names a Windows system tool; [`run_within`] runs
+//! one that may hang, and [`remove_device`] runs another. [`seat`] is the Windows multi-seat
+//! marker. [`tray_autostart`] is the tray's per-user autostart entry on Linux.
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
@@ -286,12 +286,13 @@ pub fn restrict_existing_secret_file(path: &std::path::Path) {
         return;
     }
     let icacls = system32("icacls.exe");
-    let _ = std::process::Command::new(&icacls)
-        .arg(path.as_os_str())
-        .args(["/setowner", "*S-1-5-32-544"]) // BUILTIN\Administrators
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let _ = icacls_status(
+        std::process::Command::new(&icacls)
+            .arg(path.as_os_str())
+            .args(["/setowner", "*S-1-5-32-544"]) // BUILTIN\Administrators
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    );
     if let Err(e) = restrict_to_system_admins(path) {
         tracing::warn!(path = %path.display(), error = %e, "icacls hardening did not succeed");
     }
@@ -328,6 +329,89 @@ fn system_root() -> String {
 
 /// Windows PowerShell under System32, for [`system32`].
 pub const POWERSHELL: &str = r"WindowsPowerShell\v1.0\powershell.exe";
+
+/// Run `command` to its end, or kill it after `limit` and fail with `TimedOut`. Stdout and
+/// stderr come back when the caller piped them. A system tool can hang, and
+/// `Command::output` waits on it forever.
+pub fn run_within(
+    command: &mut std::process::Command,
+    limit: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::thread::{sleep, spawn, JoinHandle};
+    use std::time::{Duration, Instant};
+    /// How long a killed process may take to go, and how long a pipe may stay open after its
+    /// writer exited. A process stuck in the kernel outlives its kill; a grandchild keeps a pipe.
+    const GRACE: Duration = Duration::from_secs(2);
+    type Drain = (Arc<Mutex<Vec<u8>>>, JoinHandle<()>);
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> Option<Drain> {
+        pipe.map(|mut pipe| {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&bytes);
+            let reader = spawn(move || {
+                let mut chunk = [0_u8; 4096];
+                while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                    let mut sink = sink.lock().unwrap_or_else(PoisonError::into_inner);
+                    sink.extend_from_slice(&chunk[..n]);
+                }
+            });
+            (bytes, reader)
+        })
+    }
+    fn wait(
+        child: &mut std::process::Child,
+        limit: Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let deadline = Instant::now() + limit;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            sleep(Duration::from_millis(10));
+        }
+    }
+    let mut child = command.spawn()?;
+    let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
+    let Some(status) = wait(&mut child, limit)? else {
+        let _ = child.kill();
+        let _ = wait(&mut child, GRACE);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no exit within {} s", limit.as_secs()),
+        ));
+    };
+    // A pipe a grandchild still holds open is not waited on: the reader's bytes so far are all.
+    let bytes = |drain: Option<Drain>| {
+        let Some((bytes, reader)) = drain else {
+            return Vec::new();
+        };
+        let end = Instant::now() + GRACE;
+        while !reader.is_finished() && Instant::now() < end {
+            sleep(Duration::from_millis(10));
+        }
+        let mut bytes = bytes.lock().unwrap_or_else(PoisonError::into_inner);
+        std::mem::take(&mut *bytes)
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: bytes(stdout),
+        stderr: bytes(stderr),
+    })
+}
+
+/// An `icacls` run is over within this, or it is hung: a first hardening walks a tree.
+#[cfg(windows)]
+const ICACLS_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// `command`'s exit status, within [`ICACLS_LIMIT`]. Its output is discarded by the caller.
+#[cfg(windows)]
+fn icacls_status(command: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    run_within(command, ICACLS_LIMIT).map(|output| output.status)
+}
 
 /// `pnputil /remove-device` by absolute path: an uninstaller must not depend on `%PATH%`.
 /// `Err` carries pnputil's exit status and message, or why it did not run.
@@ -369,33 +453,35 @@ fn restrict_dir_to_system_admins(dir: &std::path::Path, deep: bool) {
     if deep {
         own.args(["/T", "/C", "/Q"]); // recurse, continue on error, quiet
     }
-    let _ = own
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let _ = icacls_status(
+        own.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    );
     // `/inheritance:r` drops inherited ACEs only. A planted dir keeps an explicit
     // `Everyone:(F)` through it, so reset the dir's own ACL first (not `/T`: the
     // plugin runner's grants live on children and are re-applied only by `enable`).
-    let _ = std::process::Command::new(&icacls)
-        .arg(dir.as_os_str())
-        .args(["/reset", "/C", "/Q"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let _ = icacls_status(
+        std::process::Command::new(&icacls)
+            .arg(dir.as_os_str())
+            .args(["/reset", "/C", "/Q"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    );
     // Do not grant OWNER `(OI)(CI)(F)` — WRITE_DAC comes back on every child
     // the attacker already owned. SYSTEM and Administrators cover writers here.
-    let status = std::process::Command::new(&icacls)
-        .arg(dir.as_os_str())
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(OI)(CI)(F)", // NT AUTHORITY\SYSTEM
-            "/grant:r",
-            "*S-1-5-32-544:(OI)(CI)(F)", // BUILTIN\Administrators
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    let status = icacls_status(
+        std::process::Command::new(&icacls)
+            .arg(dir.as_os_str())
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)(F)", // NT AUTHORITY\SYSTEM
+                "/grant:r",
+                "*S-1-5-32-544:(OI)(CI)(F)", // BUILTIN\Administrators
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    );
     match status {
         Ok(s) if s.success() => {}
         _ => tracing::warn!(
@@ -542,10 +628,11 @@ fn grant_users_read(path: &std::path::Path, deny: Option<&str>) -> std::io::Resu
     if let Some(principal) = deny {
         icacls.args(["/deny", &format!("{principal}:(R)")]);
     }
-    let status = icacls
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
+    let status = icacls_status(
+        icacls
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )?;
     if status.success() {
         return Ok(());
     }
@@ -594,20 +681,21 @@ impl Drop for TmpFile {
 #[cfg(windows)]
 fn restrict_to_system_admins(path: &std::path::Path) -> std::io::Result<()> {
     let icacls = system32("icacls.exe");
-    let status = std::process::Command::new(icacls)
-        .arg(path.as_os_str())
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            "*S-1-5-18:(F)", // NT AUTHORITY\SYSTEM
-            "/grant:r",
-            "*S-1-5-32-544:(F)", // BUILTIN\Administrators
-            "/grant:r",
-            "*S-1-3-4:(F)", // OWNER RIGHTS
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
+    let status = icacls_status(
+        std::process::Command::new(icacls)
+            .arg(path.as_os_str())
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(F)", // NT AUTHORITY\SYSTEM
+                "/grant:r",
+                "*S-1-5-32-544:(F)", // BUILTIN\Administrators
+                "/grant:r",
+                "*S-1-3-4:(F)", // OWNER RIGHTS
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )?;
     if status.success() {
         return Ok(());
     }
@@ -863,5 +951,59 @@ mod tests {
         assert_eq!(names(&dir), ["blocked.json", "store.json"]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tool_that_outlasts_its_limit_is_killed() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let (program, args): (_, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "echo hi"])
+        } else {
+            ("echo", &["hi"])
+        };
+        let done = run_within(
+            Command::new(program).args(args).stdout(Stdio::piped()),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(done.status.success());
+        assert_eq!(String::from_utf8_lossy(&done.stdout).trim(), "hi");
+
+        let (program, args): (_, &[&str]) = if cfg!(windows) {
+            ("ping", &["-n", "30", "127.0.0.1"])
+        } else {
+            ("sleep", &["30"])
+        };
+        let started = Instant::now();
+        let hung = run_within(
+            Command::new(program)
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+            Duration::from_millis(200),
+        );
+        assert_eq!(hung.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A process the tool left behind holds the pipe open; the call still ends, with the output.
+    #[test]
+    fn a_grandchild_holding_the_pipe_does_not_hold_the_call() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let (program, args): (_, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "start /B ping -n 20 127.0.0.1 & echo hi"])
+        } else {
+            ("sh", &["-c", "sleep 20 & echo hi"])
+        };
+        let started = Instant::now();
+        let done = run_within(
+            Command::new(program).args(args).stdout(Stdio::piped()),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&done.stdout).contains("hi"));
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

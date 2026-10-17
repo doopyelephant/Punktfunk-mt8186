@@ -711,8 +711,17 @@ fn command_output(program: &str, args: &[&str]) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
+/// The door opens no device and sits outside the `punktfunk` and `input` groups on purpose, so a
+/// check on a device group says nothing about it and its remedy would undo the separation.
+fn door_opens_none(id: &str, door: bool) -> Option<HostCheck> {
+    door.then(|| HostCheck::inapplicable(id, "The door opens no device."))
+}
+
 fn takeover_privilege() -> HostCheck {
     let id = ids::TAKEOVER_PRIVILEGE;
+    if let Some(check) = door_opens_none(id, pf_paths::seat::role().is_door()) {
+        return check;
+    }
     match crate::vdisplay::takeover_privilege_verdict() {
         TakeoverVerdict::Inapplicable { why } => {
             HostCheck::inapplicable(id, takeover_inapplicable_reason(why))
@@ -804,6 +813,9 @@ fn usbip_gate_open() -> bool {
 fn virtual_deck_vhci() -> HostCheck {
     let id = ids::VIRTUAL_DECK_VHCI;
     let group = PUNKTFUNK_GROUP;
+    if let Some(check) = door_opens_none(id, pf_paths::seat::role().is_door()) {
+        return check;
+    }
     match crate::inject::vhci_probe() {
         VhciVerdict::Inapplicable { why } => HostCheck::inapplicable(id, why),
         VhciVerdict::Ok => HostCheck::ok(id, "USB/IP pads can attach."),
@@ -930,6 +942,9 @@ fn session_predates(
 
 fn uinput_access() -> HostCheck {
     let id = ids::UINPUT_ACCESS;
+    if let Some(check) = door_opens_none(id, pf_paths::seat::role().is_door()) {
+        return check;
+    }
     match crate::inject::uinput_probe() {
         UinputVerdict::Inapplicable => HostCheck::inapplicable(
             id,
@@ -1094,6 +1109,15 @@ fn capture(cmd: &mut Command) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A door is told nothing about devices it never opens; any other host is probed.
+    #[test]
+    fn the_door_skips_the_group_checks() {
+        let skipped = door_opens_none(ids::VIRTUAL_DECK_VHCI, true).expect("the door skips");
+        assert_eq!(skipped.status, CheckStatus::Inapplicable);
+        assert!(skipped.remedy.is_none());
+        assert!(door_opens_none(ids::VIRTUAL_DECK_VHCI, false).is_none());
+    }
 
     /// The doctor must probe the sandbox the runner actually builds.
     #[cfg(target_os = "linux")]

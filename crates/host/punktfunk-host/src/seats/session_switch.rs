@@ -9,7 +9,7 @@
 //! The mode is kept in the config dir for the next start.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use zbus::fdo;
 
@@ -22,7 +22,8 @@ static GAME: AtomicBool = AtomicBool::new(false);
 
 /// A live session of the seat's: told each new mode, `false` once the session is gone.
 pub(crate) type Follower = Box<dyn Fn(bool) -> bool + Send>;
-static FOLLOWERS: Mutex<Vec<Follower>> = Mutex::new(Vec::new());
+static FOLLOWERS: Mutex<Vec<(u64, Follower)>> = Mutex::new(Vec::new());
+static NEXT_FOLLOWER: AtomicU64 = AtomicU64::new(0);
 
 /// The input backend the runner picked for the seat's desktop, read before any session runs.
 static DESKTOP_INPUT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -37,12 +38,26 @@ fn has_desktop() -> bool {
     pf_host_config::config().compositor.as_deref() == Some("kwin")
 }
 
-/// Live sessions follow every switch until they end.
-pub(crate) fn follow(follower: Follower) {
-    FOLLOWERS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(follower);
+/// A session's place among the followers. Dropping it, at the session's end, leaves.
+pub(crate) struct Following(u64);
+
+impl Drop for Following {
+    fn drop(&mut self) {
+        FOLLOWERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(id, _)| *id != self.0);
+    }
+}
+
+/// Live sessions follow every switch until they end. Returns the mode now: a session built in
+/// the other one missed a switch in between, and catches up.
+pub(crate) fn follow(follower: Follower) -> (Following, bool) {
+    let id = NEXT_FOLLOWER.fetch_add(1, Ordering::Relaxed);
+    let mut followers = FOLLOWERS.lock().unwrap_or_else(|e| e.into_inner());
+    followers.push((id, follower));
+    // Read under the lock: a switch that lands after this is told, one before it is seen here.
+    (Following(id), GAME.load(Ordering::Relaxed))
 }
 
 /// The injector for `compositor` on a seat. Its desktop keeps the backend the runner picked.
@@ -133,7 +148,7 @@ impl SessionManagement {
         }
         crate::vdisplay::registry::set_seat_game_mode(game);
         let mut followers = FOLLOWERS.lock().unwrap_or_else(|e| e.into_inner());
-        followers.retain(|follow| follow(game));
+        followers.retain(|(_, follow)| follow(game));
         tracing::info!(mode, sessions = followers.len(), "seat: switched mode");
         drop(followers);
         if !game {
@@ -228,7 +243,7 @@ mod tests {
             .await
             .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
-        follow(Box::new(move |game| tx.send(game).is_ok()));
+        let (following, _) = follow(Box::new(move |game| tx.send(game).is_ok()));
 
         proxy.call_method("SwitchToGameMode", &()).await.unwrap();
         assert_eq!(rx.try_recv(), Ok(true));
@@ -253,5 +268,12 @@ mod tests {
             .call_method("SwitchToLoginMode", &("tv",))
             .await
             .is_err());
+
+        // A session that starts now is told the mode it missed, and leaves when it ends.
+        let (late, game) = follow(Box::new(|_| true));
+        assert!(!game, "the desktop, after the last switch");
+        drop((late, following));
+        proxy.call_method("SwitchToGameMode", &()).await.unwrap();
+        assert!(rx.try_recv().is_err(), "an ended session is not told");
     }
 }

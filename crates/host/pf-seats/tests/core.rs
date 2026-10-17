@@ -1,5 +1,5 @@
 use pf_seats::backend::{BackendError, PlatformBackend};
-use pf_seats::ipc::{Command, CommandResult, Diagnostic, ErrorCode};
+use pf_seats::ipc::{Command, CommandResult, Diagnostic, ErrorCode, SeatingStatus};
 use pf_seats::model::{CreateSeat, Ledger, RuntimeState, RuntimeStatus, Seat};
 use pf_seats::persistence::{LedgerStore, LEDGER_FILE};
 use pf_seats::service::SeatService;
@@ -53,6 +53,9 @@ impl PlatformBackend for FakeBackend {
 
     fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
         self.record("start", seat);
+        if seat.account == "wedged" {
+            return Err(BackendError::new("seat_exited", "the unit ended"));
+        }
         let status = RuntimeStatus::running();
         self.state
             .statuses
@@ -91,6 +94,10 @@ impl PlatformBackend for FakeBackend {
             .unwrap_or_default())
     }
 
+    fn reconcile(&self, seat: &Seat, _status: &RuntimeStatus) {
+        self.record("reconcile", seat);
+    }
+
     fn doctor(&self, _ledger: &Ledger) -> Result<Vec<Diagnostic>, BackendError> {
         Ok(vec![Diagnostic::info("fake", "fake backend is healthy")])
     }
@@ -99,6 +106,12 @@ impl PlatformBackend for FakeBackend {
         self.record("adopt", seat);
         if seat.account == "ghost" {
             return Err(BackendError::new("account_missing", "no such account"));
+        }
+        if seat.account == "ben" {
+            return Err(BackendError::new(
+                "owner_not_recorded",
+                "not the recorded owner",
+            ));
         }
         Ok(())
     }
@@ -277,6 +290,124 @@ fn the_owner_row_is_adopted_once_and_released_by_delete() {
     assert!(backend.calls().contains(&format!("remove:{}", first.id)));
 }
 
+/// `open` closes the ledger root to its owner; `with_store` loads from a store the caller
+/// opened and leaves the root as the caller set it, even when the ledger doesn't load.
+#[cfg(unix)]
+#[test]
+fn a_service_over_an_opened_store_keeps_the_roots_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = LedgerStore::open(temp.path()).unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+    SeatService::with_store(store, FakeBackend::default()).unwrap();
+    assert_eq!(mode(temp.path()), 0o711);
+
+    let store = LedgerStore::open(temp.path()).unwrap();
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
+    std::fs::write(temp.path().join(LEDGER_FILE), b"{truncated").unwrap();
+    assert!(SeatService::with_store(store, FakeBackend::default()).is_err());
+    assert_eq!(mode(temp.path()), 0o711);
+}
+
+/// A backend whose provision fails with `code` after the fake made its account.
+#[derive(Clone)]
+struct FailsToProvision {
+    inner: FakeBackend,
+    code: &'static str,
+}
+
+impl PlatformBackend for FailsToProvision {
+    fn provision(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.inner.provision(seat)?;
+        Err(BackendError::new(self.code, "provision stopped part-way"))
+    }
+    fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.start(seat)
+    }
+    fn stop(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.stop(seat)
+    }
+    fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.inner.remove(seat)
+    }
+    fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.status(seat)
+    }
+}
+
+/// A create that fails after the account exists removes it, since no ledger row will; an account
+/// that was never the seat's is left alone.
+#[test]
+fn a_failed_provision_removes_what_it_made_unless_the_account_was_not_ours() {
+    for (code, removed) in [
+        ("verify_failed", true),
+        ("account_not_owned", false),
+        ("account_invalid", false),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = FailsToProvision {
+            inner: FakeBackend::default(),
+            code,
+        };
+        let service = SeatService::open(temp.path(), backend.clone()).unwrap();
+        let error = service
+            .dispatch(create("Desk", "pf-desk", false))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Backend);
+        assert!(service.ledger().seats.is_empty());
+        let calls = backend.inner.calls();
+        assert_eq!(
+            calls.iter().any(|call| call.starts_with("remove:")),
+            removed,
+            "{code}"
+        );
+    }
+}
+
+/// A row left for an owner since changed is replaced when the backend accepts the new account,
+/// and stays, as a Conflict, when it doesn't.
+#[test]
+fn a_stale_owner_row_is_replaced_by_the_account_the_backend_accepts() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = FakeBackend::default();
+    let service = SeatService::open(temp.path(), backend.clone()).unwrap();
+    let CommandResult::Created { seat: stale } = service.dispatch(adopt("enrico")).unwrap() else {
+        panic!("adopt");
+    };
+    service.dispatch(create("Kid", "pf-kid", false)).unwrap();
+
+    let refused = service.dispatch(adopt("ben")).unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict);
+    assert_eq!(
+        service.ledger().owner().map(|s| s.id.clone()),
+        Some(stale.id.clone())
+    );
+
+    backend.clear_calls();
+    let CommandResult::Created { seat: fresh } = service.dispatch(adopt("carol")).unwrap() else {
+        panic!("adopt");
+    };
+    assert_ne!(fresh.id, stale.id);
+    let ledger = service.ledger();
+    assert_eq!(ledger.owner().map(|s| s.account.as_str()), Some("carol"));
+    assert_eq!(
+        ledger.seats.len(),
+        2,
+        "the profile stays, the stale row is gone"
+    );
+    assert_eq!(
+        backend.calls(),
+        [
+            format!("adopt:{}", fresh.id),
+            format!("remove:{}", stale.id)
+        ],
+        "the new row is adopted before the old one is released"
+    );
+}
+
 #[test]
 fn duplicate_create_is_a_structured_conflict() {
     let temp = tempfile::tempdir().unwrap();
@@ -394,6 +525,372 @@ impl PlatformBackend for SlowStart {
     fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
         self.inner.status(seat)
     }
+    fn reconcile(&self, seat: &Seat, status: &RuntimeStatus) {
+        self.inner.reconcile(seat, status);
+    }
+}
+
+/// A backend whose provision, remove, enable and disable park while the gate is shut.
+#[derive(Clone)]
+struct SlowWork {
+    inner: FakeBackend,
+    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    parked: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SlowWork {
+    fn new() -> Self {
+        Self {
+            inner: FakeBackend::default(),
+            gate: Arc::new((Mutex::new(true), std::sync::Condvar::new())),
+            parked: Arc::default(),
+        }
+    }
+
+    /// Shutting the gate also forgets who parked at it before.
+    fn set_gate(&self, open: bool) {
+        let (gate, wake) = &*self.gate;
+        *gate.lock().unwrap() = open;
+        if !open {
+            self.parked.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+        wake.notify_all();
+    }
+
+    fn park(&self) {
+        let (gate, wake) = &*self.gate;
+        let mut open = gate.lock().unwrap();
+        if !*open {
+            self.parked
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        while !*open {
+            open = wake.wait(open).unwrap();
+        }
+    }
+
+    fn wait_parked(&self) {
+        while self.parked.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+impl PlatformBackend for SlowWork {
+    fn provision(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.park();
+        self.inner.provision(seat)
+    }
+    fn start(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.start(seat)
+    }
+    fn stop(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.stop(seat)
+    }
+    fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.park();
+        self.inner.remove(seat)
+    }
+    fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.status(seat)
+    }
+    fn enable(
+        &self,
+        _allow_rdp_from_network: bool,
+        _prepared: Vec<Diagnostic>,
+    ) -> Result<SeatingStatus, BackendError> {
+        self.park();
+        Ok(SeatingStatus {
+            enabled: true,
+            checks: Vec::new(),
+            allow_rdp_from_network: false,
+        })
+    }
+}
+
+/// Whether a `List` is answered while another command is parked in the backend.
+fn list_answers<B: PlatformBackend>(service: &Arc<SeatService<B>>) -> bool {
+    let (answer, answered) = std::sync::mpsc::channel();
+    let service = Arc::clone(service);
+    std::thread::spawn(move || {
+        let _ = answer.send(service.dispatch(Command::List).is_ok());
+    });
+    answered.recv_timeout(std::time::Duration::from_secs(5)) == Ok(true)
+}
+
+/// Create, delete and Enable keep the ledger readable while their backend work runs, and the
+/// ledger they commit afterwards is the one `List` has been keeping current.
+#[test]
+fn the_ledger_answers_while_a_seat_is_made_removed_or_seats_turn_on() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = SlowWork::new();
+    let service = Arc::new(SeatService::open(temp.path(), backend.clone()).unwrap());
+    let CommandResult::Created { seat: kept } =
+        service.dispatch(create("Kept", "pf-kept", false)).unwrap()
+    else {
+        panic!("create");
+    };
+
+    backend.set_gate(false);
+    let making = {
+        let service = Arc::clone(&service);
+        std::thread::spawn(move || service.dispatch(create("Made", "pf-made", false)))
+    };
+    backend.wait_parked();
+    assert!(list_answers(&service), "List stalled behind a create");
+    backend.set_gate(true);
+    let CommandResult::Created { seat: made } = making.join().unwrap().unwrap() else {
+        panic!("create");
+    };
+    assert_eq!(service.ledger().seats.len(), 2);
+
+    backend.set_gate(false);
+    let removing = {
+        let service = Arc::clone(&service);
+        let id = made.id.clone();
+        std::thread::spawn(move || service.dispatch(Command::Delete { id }))
+    };
+    backend.wait_parked();
+    assert!(list_answers(&service), "List stalled behind a delete");
+    backend.set_gate(true);
+    removing.join().unwrap().unwrap();
+    assert_eq!(service.ledger().seats.len(), 1);
+    assert_eq!(service.ledger().seats[0].id, kept.id);
+
+    backend.set_gate(false);
+    let turning_on = {
+        let service = Arc::clone(&service);
+        std::thread::spawn(move || {
+            service.dispatch(Command::Enable {
+                allow_rdp_from_network: false,
+                prepare: false,
+            })
+        })
+    };
+    backend.wait_parked();
+    assert!(list_answers(&service), "List stalled behind Enable");
+    backend.set_gate(true);
+    turning_on.join().unwrap().unwrap();
+}
+
+/// A start that waits for a stop to end it, as a seat's unit does.
+#[derive(Clone, Default)]
+struct StopEndsStart {
+    inner: FakeBackend,
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    stopped: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl PlatformBackend for StopEndsStart {
+    fn provision(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.inner.provision(seat)
+    }
+    fn start(&self, _seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (stopped, wake) = &*self.stopped;
+        let mut stopped = stopped.lock().unwrap();
+        while !*stopped {
+            stopped = wake.wait(stopped).unwrap();
+        }
+        Err(BackendError::new("seat_exited", "the unit ended"))
+    }
+    fn stop(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        let (stopped, wake) = &*self.stopped;
+        *stopped.lock().unwrap() = true;
+        wake.notify_all();
+        self.inner.stop(seat)
+    }
+    fn remove(&self, seat: &Seat) -> Result<(), BackendError> {
+        self.inner.remove(seat)
+    }
+    fn status(&self, seat: &Seat) -> Result<RuntimeStatus, BackendError> {
+        self.inner.status(seat)
+    }
+}
+
+/// A stop reaches a seat mid-start at once rather than queueing behind it; the start answers
+/// that it was stopped, and the seat ends up stopped, not failed.
+#[test]
+fn a_stop_reaches_a_seat_that_is_starting() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = StopEndsStart::default();
+    let service = Arc::new(SeatService::open(temp.path(), backend.clone()).unwrap());
+    let CommandResult::Created { seat } =
+        service.dispatch(create("Desk", "pf-desk", false)).unwrap()
+    else {
+        panic!("create");
+    };
+    let starter = {
+        let service = Arc::clone(&service);
+        let id = seat.id.clone();
+        std::thread::spawn(move || service.dispatch(Command::Start { id }))
+    };
+    while !backend.entered.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let (answer, answered) = std::sync::mpsc::channel();
+    {
+        let service = Arc::clone(&service);
+        let id = seat.id.clone();
+        std::thread::spawn(move || {
+            let _ = answer.send(service.dispatch(Command::Stop { id }));
+        });
+    }
+    let stopped = answered
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the stop queued behind the start");
+    assert!(matches!(
+        stopped,
+        Ok(CommandResult::Stopped { ref seat }) if seat.runtime.state == RuntimeState::Stopped
+    ));
+    let started = starter.join().unwrap().unwrap_err();
+    assert_eq!(started.code, ErrorCode::Conflict);
+    assert_eq!(
+        service.ledger().seats[0].runtime.state,
+        RuntimeState::Stopped
+    );
+    let stops = backend
+        .inner
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("stop:"))
+        .count();
+    assert_eq!(stops, 2, "once to end the start, once in turn");
+}
+
+/// A `List` reconciles a seat that is at rest and leaves one that is starting: its unit is down
+/// until the start brings it up, and reading that as a stopped seat would tear its proxy down.
+#[test]
+fn a_list_reconciles_a_seat_at_rest_and_never_one_that_starts() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = SlowStart::default();
+    let service = Arc::new(SeatService::open(temp.path(), backend.clone()).unwrap());
+    let CommandResult::Created { seat } =
+        service.dispatch(create("Desk", "pf-desk", false)).unwrap()
+    else {
+        panic!("create");
+    };
+    let reconciled = format!("reconcile:{}", seat.id);
+    service.dispatch(Command::List).unwrap();
+    assert!(backend.inner.calls().contains(&reconciled));
+
+    let starter = {
+        let service = Arc::clone(&service);
+        let id = seat.id.clone();
+        std::thread::spawn(move || service.dispatch(Command::Start { id }))
+    };
+    loop {
+        let CommandResult::List { seats } = service.dispatch(Command::List).unwrap() else {
+            panic!("list");
+        };
+        if seats[0].runtime.state == RuntimeState::Starting {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    backend.inner.clear_calls();
+    service.dispatch(Command::List).unwrap();
+    assert!(!backend.inner.calls().contains(&reconciled));
+
+    let (open, wake) = &*backend.gate;
+    *open.lock().unwrap() = true;
+    wake.notify_all();
+    starter.join().unwrap().unwrap();
+    service.dispatch(Command::List).unwrap();
+    assert!(backend.inner.calls().contains(&reconciled));
+}
+
+/// A start that fails is followed by a reconcile of its seat, so what the start brought up
+/// beside the unit does not wait for the next `List` to be taken back.
+#[test]
+fn a_failed_start_reconciles_its_seat() {
+    let temp = tempfile::tempdir().unwrap();
+    let backend = FakeBackend::default();
+    let service = SeatService::open(temp.path(), backend.clone()).unwrap();
+    let CommandResult::Created { seat } =
+        service.dispatch(create("Wedged", "wedged", false)).unwrap()
+    else {
+        panic!("create");
+    };
+    backend.clear_calls();
+    let failed = service
+        .dispatch(Command::Start {
+            id: seat.id.clone(),
+        })
+        .unwrap_err();
+    assert_eq!(failed.code, ErrorCode::Backend);
+    let calls = backend.calls();
+    let at = |call: String| calls.iter().position(|c| *c == call);
+    let (start, reconcile) = (
+        at(format!("start:{}", seat.id)),
+        at(format!("reconcile:{}", seat.id)),
+    );
+    assert!(start.is_some() && reconcile > start, "{calls:?}");
+}
+
+/// Clients that create, list, start, stop and delete at once leave exactly the seats that were
+/// created and not deleted, and the file on disk is the ledger in memory. A create, a delete and a
+/// `List` each write the ledger without the others' lock held across their backend work.
+#[test]
+fn concurrent_commands_never_lose_or_duplicate_a_row() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = Arc::new(SeatService::open(temp.path(), FakeBackend::default()).unwrap());
+    let made = Arc::new(Mutex::new(Vec::new()));
+    let gone = Arc::new(Mutex::new(Vec::new()));
+    let clients: Vec<_> = (0..4)
+        .map(|client| {
+            let (service, made, gone) =
+                (Arc::clone(&service), Arc::clone(&made), Arc::clone(&gone));
+            std::thread::spawn(move || {
+                for round in 0..60 {
+                    let first = service.ledger().seats.first().map(|seat| seat.id.clone());
+                    let command = match (client + round) % 5 {
+                        0 => create(
+                            &format!("S{client}-{round}"),
+                            &format!("pf-{client}-{round}"),
+                            false,
+                        ),
+                        1 => Command::List,
+                        2 => first.map_or(Command::List, |id| Command::Start { id }),
+                        3 => first.map_or(Command::List, |id| Command::Stop { id }),
+                        _ => first.map_or(Command::List, |id| Command::Delete { id }),
+                    };
+                    match service.dispatch(command) {
+                        Ok(CommandResult::Created { seat }) => made.lock().unwrap().push(seat.id),
+                        Ok(CommandResult::Deleted { id }) => gone.lock().unwrap().push(id),
+                        _ => {}
+                    }
+                }
+            })
+        })
+        .collect();
+    for client in clients {
+        client.join().unwrap();
+    }
+
+    let gone = gone.lock().unwrap();
+    let mut expected: Vec<_> = made
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|id| !gone.contains(id))
+        .cloned()
+        .collect();
+    let mut found: Vec<_> = service
+        .ledger()
+        .seats
+        .iter()
+        .map(|seat| seat.id.clone())
+        .collect();
+    expected.sort_by_key(|id| id.to_string());
+    found.sort_by_key(|id| id.to_string());
+    assert_eq!(found, expected);
+    assert_eq!(
+        LedgerStore::open(temp.path()).unwrap().load().unwrap(),
+        service.ledger()
+    );
 }
 
 #[test]

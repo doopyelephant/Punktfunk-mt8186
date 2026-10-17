@@ -51,7 +51,7 @@
           "actions"
         ],
         "summary": "Invoke a host action",
-        "description": "Id-only, empty body: nothing in the request reaches the privileged path. Power actions\nanswer `202`, end every session (typed HostPower close), wait ~1 s so this response\nflushes, then act; paired-cert callers need Host power and are `409` while another\ndevice's session is live, the admin console never is. One power action at a time.\n`display.next` answers `200` with the monitor now streamed and ends nothing; a paired\ncert needs a live session of its own.",
+        "description": "Id-only, empty body: nothing in the request reaches the privileged path. Power actions\nanswer `202`, end every session (typed HostPower close), wait ~1 s so this response\nflushes, then act; paired-cert callers need Host power and are `409` while another\ndevice's session is live or a seat host doesn't answer, the admin console never is. One\npower action at a time.\n`display.next` answers `200` with the monitor now streamed and ends nothing; a paired\ncert needs a live session of its own.",
         "operationId": "invokeAction",
         "parameters": [
           {
@@ -109,7 +109,7 @@
             }
           },
           "409": {
-            "description": "Refused: an action is already in flight, another device's session is live (cert lane), or the platform said no (a foreign sleep inhibitor, a second local user, a single monitor, …)",
+            "description": "Refused: an action is already in flight, another device's session is live or a seat host doesn't answer (cert lane), or the platform said no (a foreign sleep inhibitor, a second local user, a single monitor, …)",
             "content": {
               "application/json": {
                 "schema": {
@@ -6890,6 +6890,20 @@
         "summary": "Stop the session",
         "description": "A deliberate stop: skip keep-alive linger and apply `game_on_session_end`.",
         "operationId": "stopSession",
+        "parameters": [
+          {
+            "name": "reason",
+            "in": "query",
+            "description": "Why the host stops. `power` closes every session the way a power action does, so clients\nread that the host is going down; the box's door sends it to its seat hosts. A host that\npredates it, and any other value, stop plainly.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "responses": {
           "204": {
             "description": "Session stopped (or none was active)"
@@ -12615,7 +12629,7 @@
               "string",
               "null"
             ],
-            "description": "Why turning the door on would be refused here, as the operator's next move: the files a\nchannel installs it with are missing, or the account isn't in `punktfunk-update`. `null`\nwhen it would start, and on the door itself."
+            "description": "Why turning the door on would be refused here, as the operator's next move: the files a\nchannel installs it with are missing, or the account isn't in `punktfunk-update`. `null`\nwhen it would start, on the door itself and on a seat host, and for every lane but the\nadmin one. The answer is up to 30 s old; a switch request drops it."
           },
           "fingerprint": {
             "type": [

@@ -2,21 +2,20 @@
 //! Desktop listener and its firewall scope, the seat listener, and the pinned RDP certificate.
 //!
 //! [`checks`] only reads. [`turn_on`] creates the Seats key and records there what it changed
-//! (`ListenerWasOff`, `AllowRdpFromNetwork`, `RdpRulesOpened`); [`turn_off`] undoes exactly
-//! that and deletes the
-//! key last, so a failed restore can be retried. A refusal carries one plain sentence for the
-//! operator; its cause goes to the log. The seat display driver stays in the driver store when
-//! seats go off.
+//! (`ListenerWasOff`, `AllowRdpFromNetwork`, `RdpRulesOpened`, `RdpRuleScopes`); [`turn_off`]
+//! undoes exactly that and deletes the key last, so a failed restore can be retried. A refusal
+//! carries one plain sentence for the operator; its cause goes to the log. The seat display
+//! driver stays in the driver store when seats go off.
 
 use super::util::{backend_error, WinResult};
-use super::{keeper, seats_enabled, server_edition, session_wrapper, SEATS_KEY};
+use super::{keeper, seats_enabled, server_edition, session_wrapper, ENABLING, SEATS_KEY};
 use crate::backend::BackendError;
 use crate::ipc::Diagnostic;
 use pf_paths::POWERSHELL;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
-use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY};
+use std::time::{Duration, Instant};
+use winreg::enums::{RegDisposition, HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY};
 use winreg::RegKey;
 
 /// The role's state while it is installed and waits on a restart, as [`PROBE`] names it.
@@ -30,6 +29,9 @@ const LISTENER_WAS_OFF: &str = "ListenerWasOff";
 const RDP_FROM_NETWORK: &str = "AllowRdpFromNetwork";
 /// The `Remote Desktop` rules [`turn_on`] enabled for the network, one name per line.
 const RDP_RULES_OPENED: &str = "RdpRulesOpened";
+/// Each `Remote Desktop` rule's `RemoteAddress` before [`turn_on`] narrowed it, `name|address`
+/// per line, for [`turn_off`] to write back.
+const RDP_RULE_SCOPES: &str = "RdpRuleScopes";
 /// The `Remote Desktop` firewall group by the resource id every Windows language shares.
 const RDP_RULE_GROUP: &str = "@FirewallAPI.dll,-28752";
 /// `Remote Desktop Services`, the Session Host role's group, and its two rules on the
@@ -47,6 +49,17 @@ const PACKAGE: [&str; 3] = [
 /// The RDP listener takes a moment to come up after `fDenyTSConnections` flips.
 const TRUST_ATTEMPTS: u32 = 3;
 const TRUST_RETRY: Duration = Duration::from_secs(2);
+/// How long a tool may run before it counts as hung and is killed. A permit of the pipe is
+/// pinned meanwhile. Windows answers its own state slowly for a minute after a restart, and a
+/// role install runs for minutes.
+const QUERY_LIMIT: Duration = Duration::from_secs(180);
+/// What the doctor's two PowerShell queries may take together. The client stops waiting on the
+/// doctor after five minutes, and the keeper's look and the local reads follow the queries.
+pub(super) const DOCTOR_BUDGET: Duration = Duration::from_secs(240);
+const INSTALL_LIMIT: Duration = Duration::from_secs(900);
+const TOOL_LIMIT: Duration = Duration::from_secs(300);
+/// The keeper's own handshake gives up after 15 s.
+const KEEPER_LIMIT: Duration = Duration::from_secs(60);
 /// The role's install state, then licensing and a GPU as `0`/`1` flags, on the last line. A role
 /// the cmdlet can't read is `Unknown`, after the cmdlet's error. `Available`, a role not
 /// installed, is the state enum's zero and false in PowerShell, so the state is tested against
@@ -72,6 +85,12 @@ const PROBE: &str = "$ProgressPreference='SilentlyContinue'; \
 /// when not. A desktop edition runs seats only through a Remote Desktop wrapper the operator
 /// installed, a warning, and has no role or licensing to ask about.
 pub(super) fn checks() -> Vec<Diagnostic> {
+    checks_until(Instant::now() + QUERY_LIMIT)
+}
+
+/// [`checks`], its query given until `deadline`. A query the time doesn't reach reads as one that
+/// failed: the probe row says the settings couldn't be read.
+pub(super) fn checks_until(deadline: Instant) -> Vec<Diagnostic> {
     let mut checks = Vec::new();
     let server = match server_edition() {
         Some(true) => {
@@ -103,7 +122,7 @@ pub(super) fn checks() -> Vec<Diagnostic> {
             return checks;
         }
     };
-    let Some((role, [licensing, gpu])) = probe() else {
+    let Some((role, [licensing, gpu])) = probe(deadline) else {
         checks.push(Diagnostic::error(
             "probe",
             "Couldn't read this machine's Remote Desktop and graphics settings.",
@@ -157,7 +176,7 @@ pub(super) fn prepare() -> Vec<Diagnostic> {
     if server_edition() != Some(true) {
         return Vec::new();
     }
-    let lines = match powershell_lines(PREPARE) {
+    let lines = match powershell_lines(PREPARE, INSTALL_LIMIT) {
         Ok(lines) => lines,
         Err(cause) => {
             tracing::warn!(%cause, "remote desktop setup did not complete");
@@ -190,8 +209,8 @@ pub(super) fn prepare() -> Vec<Diagnostic> {
     rows
 }
 
-/// Turn seats on. A failure after the Seats key exists on a machine that had none puts the
-/// machine back, so `enabled` never reports a half-done switch.
+/// Turn seats on. A failure where seats were off puts the machine back, and a crash leaves the
+/// Seats key marked [`ENABLING`], so `enabled` never reports a half-done switch.
 pub(super) fn turn_on(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
     let fresh = !seats_enabled();
     let done = apply(host_path, allow_rdp_from_network);
@@ -209,14 +228,8 @@ pub(super) fn turn_off() -> WinResult<()> {
         return Ok(());
     };
     close_rdp_rules(&seats)?;
-    if seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok() == Some(0) {
-        firewall_scope("Any").map_err(|cause| {
-            refuse(
-                "rdp_firewall",
-                "Couldn't restore Remote Desktop's firewall rules.",
-                cause,
-            )
-        })?;
+    if narrowed(&seats) {
+        restore_scopes(&seats)?;
     }
     if seats.get_value::<u32, _>(LISTENER_WAS_OFF).ok() == Some(1) {
         deny_listener(true).map_err(|cause| {
@@ -326,10 +339,23 @@ const LICENSING: &str = "$ErrorActionPreference='SilentlyContinue'; \
     Where-Object { $_ }).Count; \
     '{0}|{1}' -f $days, $servers";
 
-/// How long Remote Desktop still runs without a licence server, for the doctor. Windows Server
-/// signs seats in for 120 days without one. `None` when Windows doesn't say.
-pub(super) fn licensing_row() -> Option<Diagnostic> {
-    let lines = powershell_lines(LICENSING).ok()?;
+/// How long Remote Desktop still runs without a licence server, for the doctor, until `deadline`.
+/// Windows Server signs seats in for 120 days without one. `None` when Windows doesn't say; a
+/// query that fails or runs out of time is a warning.
+pub(super) fn licensing_row(deadline: Instant) -> Option<Diagnostic> {
+    let lines = time_left(deadline)
+        .ok_or_else(|| "the doctor's time is up".to_owned())
+        .and_then(|limit| powershell_lines(LICENSING, limit));
+    let lines = match lines {
+        Ok(lines) => lines,
+        Err(cause) => {
+            tracing::warn!(%cause, "remote desktop licensing not read");
+            return Some(Diagnostic::warning(
+                "rds_grace",
+                "Couldn't read how long Remote Desktop runs without a licence server. Run the check again in a few minutes.",
+            ));
+        }
+    };
     let (days, servers) = lines.last()?.split_once('|')?;
     grace_row(
         days.parse().ok(),
@@ -381,26 +407,30 @@ fn apply(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
             dir.display(),
         ));
     }
-    let (seats, _) = RegKey::predef(HKEY_LOCAL_MACHINE)
+    let (seats, disposition) = RegKey::predef(HKEY_LOCAL_MACHINE)
         .create_subkey_with_flags(SEATS_KEY, KEY_READ | KEY_SET_VALUE | KEY_WOW64_64KEY)
         .map_err(|cause| refuse("seats_key", "Couldn't turn seats on.", cause))?;
+    // A new key reads as off until the last step; a finished one stays on while it is redone.
+    if disposition == RegDisposition::REG_CREATED_NEW_KEY {
+        seats
+            .set_value(ENABLING, &1_u32)
+            .map_err(|cause| refuse("seats_key", "Couldn't turn seats on.", cause))?;
+    }
     install_driver(&dir, true)?;
     allow_listener(&seats)?;
-    // A choice made earlier narrowed the rules; allowing the network now widens them again.
-    let narrowed = seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok() == Some(0);
-    let scope = match (allow_rdp_from_network, narrowed) {
-        (false, _) => Some(LOOPBACK),
-        (true, true) => Some("Any"),
-        (true, false) => None,
-    };
-    if let Some(scope) = scope {
-        firewall_scope(scope).map_err(|cause| {
+    // A choice made earlier narrowed the rules; allowing the network now puts them back.
+    let was_narrowed = narrowed(&seats);
+    record_scopes(&seats)?;
+    if !allow_rdp_from_network {
+        firewall_scope(LOOPBACK).map_err(|cause| {
             refuse(
                 "rdp_firewall",
                 "Couldn't limit Remote Desktop to this machine.",
                 cause,
             )
         })?;
+    } else if was_narrowed {
+        restore_scopes(&seats)?;
     }
     if allow_rdp_from_network {
         open_rdp_rules(&seats)?;
@@ -413,7 +443,13 @@ fn apply(host_path: &Path, allow_rdp_from_network: bool) -> WinResult<()> {
     if let Err(cause) = super::seat_listener::ensure(host_path) {
         tracing::warn!(%cause, "seat listener not ready — seats start without pad audio");
     }
-    trust_rdp_certificate(host_path)
+    trust_rdp_certificate(host_path)?;
+    match seats.delete_value(ENABLING) {
+        Err(cause) if cause.kind() != std::io::ErrorKind::NotFound => {
+            Err(refuse("seats_key", "Couldn't turn seats on.", cause))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// `{app}\staging\pfvdisplay`: the packages setup leaves beside the host for the console.
@@ -593,9 +629,107 @@ fn firewall_scope(remote: &str) -> Result<(), String> {
     }
 }
 
+/// The rules [`firewall_scope`] sets, as `name|address,address` lines: what each reaches today.
+fn scopes_script() -> String {
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         @(Get-NetFirewallRule -Name {RDS_LISTENER_RULES} -ErrorAction SilentlyContinue) + \
+         @(Get-NetFirewallRule -Group '{RDP_RULE_GROUP}') | \
+         ForEach-Object {{ '{{0}}|{{1}}' -f $_.Name, \
+         (($_ | Get-NetFirewallAddressFilter).RemoteAddress -join ',') }}; exit 0"
+    )
+}
+
+/// Note each rule's scope before the first change, so [`restore_scopes`] writes back what the
+/// operator had, even when they narrow the rules in a later turn-on. Only a key this build
+/// created notes them: on an older one the rules may be narrowed already.
+fn record_scopes(seats: &RegKey) -> WinResult<()> {
+    if seats.get_value::<u32, _>(ENABLING).is_err()
+        || seats.get_value::<String, _>(RDP_RULE_SCOPES).is_ok()
+    {
+        return Ok(());
+    }
+    let fail = |cause: String| {
+        refuse(
+            "rdp_firewall",
+            "Couldn't read Remote Desktop's firewall rules.",
+            cause,
+        )
+    };
+    let scopes = powershell_lines(&scopes_script(), QUERY_LIMIT).map_err(fail)?;
+    seats
+        .set_value(RDP_RULE_SCOPES, &scopes.join("\n"))
+        .map_err(|cause| fail(cause.to_string()))
+}
+
+/// The rules may be narrowed to this PC: the operator chose so, or a turn-on was cut off after
+/// noting their scopes and before noting the choice. Restoring a rule that was not narrowed
+/// writes back the scope it has.
+fn narrowed(seats: &RegKey) -> bool {
+    narrowed_by(
+        seats.get_value::<u32, _>(RDP_FROM_NETWORK).ok(),
+        seats.get_value::<String, _>(RDP_RULE_SCOPES).is_ok(),
+    )
+}
+
+fn narrowed_by(choice: Option<u32>, scopes_noted: bool) -> bool {
+    choice.map_or(scopes_noted, |choice| choice == 0)
+}
+
+/// The `(rule, addresses)` pairs [`record_scopes`] wrote. A line with no address is dropped.
+fn parse_scopes(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| line.split_once('|'))
+        .filter(|(name, remote)| !name.is_empty() && !remote.is_empty())
+        .map(|(name, remote)| (name.to_owned(), remote.to_owned()))
+        .collect()
+}
+
+/// Set each recorded rule back to its scope. A rule the record lacks, one Windows added since,
+/// opens to `Any` as Windows creates it; with no record, which an older key lacks, every rule does.
+fn restore_scopes(seats: &RegKey) -> WinResult<()> {
+    let kept = parse_scopes(
+        &seats
+            .get_value::<String, _>(RDP_RULE_SCOPES)
+            .unwrap_or_default(),
+    );
+    powershell_lines(&restore_script(&kept), QUERY_LIMIT)
+        .map(drop)
+        .map_err(|cause| {
+            refuse(
+                "rdp_firewall",
+                "Couldn't restore Remote Desktop's firewall rules.",
+                cause,
+            )
+        })
+}
+
+fn restore_script(kept: &[(String, String)]) -> String {
+    let names: Vec<String> = kept.iter().map(|(name, _)| name.clone()).collect();
+    let mut script = String::from("$ErrorActionPreference='Stop'; ");
+    for (name, remote) in kept {
+        let remote: Vec<String> = remote.split(',').map(str::to_owned).collect();
+        script += &format!(
+            "Get-NetFirewallRule -Name {} -ErrorAction SilentlyContinue | \
+             Set-NetFirewallRule -RemoteAddress {}; ",
+            ps_list(std::slice::from_ref(name)),
+            ps_list(&remote)
+        );
+    }
+    script += &format!(
+        "@(Get-NetFirewallRule -Name {RDS_LISTENER_RULES} -ErrorAction SilentlyContinue) + \
+         @(Get-NetFirewallRule -Group '{RDP_RULE_GROUP}' -ErrorAction SilentlyContinue) | \
+         Where-Object {{ @({}) -notcontains $_.Name }} | \
+         Set-NetFirewallRule -RemoteAddress Any; exit 0",
+        ps_list(&names)
+    );
+    script
+}
+
 /// Enable the `Remote Desktop` rules that are off, for an operator who lets the network reach
-/// Remote Desktop. Turning the listener on by registry enables none. The names are noted first,
-/// so a crash between the two still closes them.
+/// Remote Desktop: the inbound ones on the listener's port, as [`open_rdp_rule`] reads them. The
+/// group's other rules, such as Shadow, stay as they are. Turning the listener on by registry
+/// enables none. The names are noted first, so a crash between the two still closes them.
 fn open_rdp_rules(seats: &RegKey) -> WinResult<()> {
     let fail = |cause: String| {
         refuse(
@@ -604,11 +738,16 @@ fn open_rdp_rules(seats: &RegKey) -> WinResult<()> {
             cause,
         )
     };
-    let off = powershell_lines(&format!(
-        "$ErrorActionPreference='Stop'; \
-         Get-NetFirewallRule -Group '{RDP_RULE_GROUP}' | \
-         Where-Object {{ $_.Enabled -eq 'False' }} | ForEach-Object {{ $_.Name }}"
-    ))
+    let off = powershell_lines(
+        &format!(
+            "$ErrorActionPreference='Stop'; \
+             Get-NetFirewallRule -Group '{RDP_RULE_GROUP}' | \
+             Where-Object {{ $_.Enabled -eq 'False' -and $_.Direction -eq 'Inbound' }} | \
+             Where-Object {{ ($_ | Get-NetFirewallPortFilter).LocalPort -contains '3389' }} | \
+             ForEach-Object {{ $_.Name }}"
+        ),
+        QUERY_LIMIT,
+    )
     .map_err(fail)?;
     if off.is_empty() {
         return Ok(());
@@ -620,10 +759,13 @@ fn open_rdp_rules(seats: &RegKey) -> WinResult<()> {
     seats
         .set_value(RDP_RULES_OPENED, &opened.join("\n"))
         .map_err(|cause| fail(cause.to_string()))?;
-    powershell_lines(&format!(
-        "$ErrorActionPreference='Stop'; Enable-NetFirewallRule -Name {}",
-        ps_list(&off)
-    ))
+    powershell_lines(
+        &format!(
+            "$ErrorActionPreference='Stop'; Enable-NetFirewallRule -Name {}",
+            ps_list(&off)
+        ),
+        QUERY_LIMIT,
+    )
     .map(drop)
     .map_err(fail)
 }
@@ -642,11 +784,14 @@ fn close_rdp_rules(seats: &RegKey) -> WinResult<()> {
             cause,
         )
     };
-    powershell_lines(&format!(
-        "$ErrorActionPreference='Stop'; \
-         Get-NetFirewallRule -Name {} -ErrorAction SilentlyContinue | Disable-NetFirewallRule",
-        ps_list(&opened)
-    ))
+    powershell_lines(
+        &format!(
+            "$ErrorActionPreference='Stop'; \
+             Get-NetFirewallRule -Name {} -ErrorAction SilentlyContinue | Disable-NetFirewallRule",
+            ps_list(&opened)
+        ),
+        QUERY_LIMIT,
+    )
     .map_err(fail)?;
     match seats.delete_value(RDP_RULES_OPENED) {
         Err(cause) if cause.kind() != std::io::ErrorKind::NotFound => Err(fail(cause.to_string())),
@@ -670,14 +815,18 @@ fn ps_list(names: &[String]) -> String {
         .join(",")
 }
 
-/// A PowerShell script's non-empty output lines. `Err` when it fails or doesn't launch.
-fn powershell_lines(script: &str) -> Result<Vec<String>, String> {
-    let output = Command::new(pf_paths::system32(POWERSHELL))
-        .args(powershell_args(script))
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
+/// A PowerShell script's non-empty output lines. `Err` when it fails, doesn't launch or runs
+/// past `limit`.
+fn powershell_lines(script: &str, limit: Duration) -> Result<Vec<String>, String> {
+    let output = pf_paths::run_within(
+        Command::new(pf_paths::system32(POWERSHELL))
+            .args(powershell_args(script))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+        limit,
+    )
+    .map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(format!("powershell exited {:?}", output.status.code()));
     }
@@ -689,8 +838,9 @@ fn powershell_lines(script: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Record the leaf TermService presents. The keeper observes it, since the handshake needs
-/// IronRDP, which the service doesn't link.
+/// Record the leaf TermService presents, in place of an earlier one: turning seats on is the
+/// operator's yes to the certificate as it is now. The keeper observes it, since the handshake
+/// needs IronRDP, which the service doesn't link.
 fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
     let keeper = keeper::keeper_path(host_path);
     if !keeper.is_file() {
@@ -705,11 +855,14 @@ fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
         if attempt > 0 {
             std::thread::sleep(TRUST_RETRY);
         }
-        match Command::new(&keeper)
-            .arg("trust")
-            .stdin(Stdio::null())
-            .output()
-        {
+        match pf_paths::run_within(
+            Command::new(&keeper)
+                .args(["trust", "--replace"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            KEEPER_LIMIT,
+        ) {
             Ok(output) if output.status.success() => return Ok(()),
             // STATUS_DLL_NOT_FOUND: a fresh Windows Server has no Visual C++ runtime.
             Ok(output) if output.status.code() == Some(0xC000_0135_u32 as i32) => {
@@ -730,13 +883,22 @@ fn trust_rdp_certificate(host_path: &Path) -> WinResult<()> {
     ))
 }
 
-fn probe() -> Option<(String, [bool; 2])> {
-    let output = Command::new(pf_paths::system32(POWERSHELL))
-        .args(powershell_args(PROBE))
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+/// What a query may take: up to [`QUERY_LIMIT`], and none once `deadline` has passed.
+fn time_left(deadline: Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    (!left.is_zero()).then_some(left.min(QUERY_LIMIT))
+}
+
+fn probe(deadline: Instant) -> Option<(String, [bool; 2])> {
+    let output = pf_paths::run_within(
+        Command::new(pf_paths::system32(POWERSHELL))
+            .args(powershell_args(PROBE))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+        time_left(deadline)?,
+    )
+    .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     tracing::debug!(output = %text.trim(), "seat prerequisite probe");
     parse_probe(&text)
@@ -780,16 +942,20 @@ fn powershell_args(script: &str) -> [&str; 6] {
     ]
 }
 
-/// A System32 tool's exit code, output discarded. `None` when it did not launch.
+/// A System32 tool's exit code, output discarded. `None` when it did not launch or ran past
+/// [`TOOL_LIMIT`].
 pub(super) fn run(tool: &str, args: &[&str]) -> Option<i32> {
-    Command::new(pf_paths::system32(tool))
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?
-        .code()
+    pf_paths::run_within(
+        Command::new(pf_paths::system32(tool))
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+        TOOL_LIMIT,
+    )
+    .ok()?
+    .status
+    .code()
 }
 
 fn check(ok: bool, code: &str, met: &str, unmet: &str) -> Diagnostic {
@@ -810,6 +976,19 @@ fn refuse(code: &str, sentence: &str, cause: impl std::fmt::Display) -> BackendE
 mod tests {
     use super::*;
     use crate::ipc::DiagnosticLevel;
+
+    /// A query gets what its deadline leaves, never more than the limit, and none after it.
+    #[test]
+    fn a_query_gets_what_the_deadline_leaves() {
+        let now = Instant::now();
+        assert_eq!(time_left(now), None);
+        assert_eq!(
+            time_left(now + Duration::from_secs(3600)),
+            Some(QUERY_LIMIT)
+        );
+        let short = time_left(now + Duration::from_secs(30)).unwrap();
+        assert!(short > Duration::from_secs(20) && short <= Duration::from_secs(30));
+    }
 
     #[test]
     fn only_an_unscoped_enabled_listener_rule_counts_as_open() {
@@ -899,6 +1078,41 @@ mod tests {
         assert_eq!(role_check("Unknown").level, DiagnosticLevel::Warning);
         assert_eq!(role_check("Available").level, DiagnosticLevel::Error);
         assert_eq!(role_check("Removed").level, DiagnosticLevel::Error);
+    }
+
+    #[test]
+    fn a_rule_goes_back_to_the_scope_it_had_and_an_unknown_one_opens() {
+        let kept = parse_scopes(
+            "RemoteDesktop-UserMode-In-TCP|10.0.5.0/255.255.255.0,LocalSubnet\n\
+             {guid-1}|Any\nno-address|\n|orphan\nnot a record",
+        );
+        assert_eq!(
+            kept,
+            [
+                (
+                    "RemoteDesktop-UserMode-In-TCP".to_owned(),
+                    "10.0.5.0/255.255.255.0,LocalSubnet".to_owned()
+                ),
+                ("{guid-1}".to_owned(), "Any".to_owned()),
+            ]
+        );
+        let script = restore_script(&kept);
+        assert!(script.contains(
+            "-Name 'RemoteDesktop-UserMode-In-TCP' -ErrorAction SilentlyContinue | \
+             Set-NetFirewallRule -RemoteAddress '10.0.5.0/255.255.255.0','LocalSubnet';"
+        ));
+        assert!(script.contains("@('RemoteDesktop-UserMode-In-TCP','{guid-1}') -notcontains"));
+        // With no record every rule opens, as before the scopes were kept.
+        assert!(restore_script(&[]).contains("@() -notcontains $_.Name"));
+    }
+
+    #[test]
+    fn a_cut_off_turn_on_that_noted_the_scopes_may_have_narrowed_them() {
+        assert!(narrowed_by(Some(0), false));
+        assert!(!narrowed_by(Some(1), true));
+        assert!(narrowed_by(None, true));
+        // An older key has no record and always has the choice; a bare key has neither.
+        assert!(!narrowed_by(None, false));
     }
 
     #[test]

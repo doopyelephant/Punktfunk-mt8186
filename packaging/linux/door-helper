@@ -3,27 +3,40 @@
 #
 #   door-helper on  <user>   the box's host runs as the punktfunk system user from boot
 #   door-helper off <user>   the user's own host serves the box again
+#   door-helper ports        the recorded owner's ports, copied before each door start
 #
 # Started by punktfunk-door-on@<user>.service and punktfunk-door-off@<user>.service, which
 # 49-punktfunk-door.rules lets members of `punktfunk-update` start. The instance name is data, not
-# a command: the user must be an ordinary account in that group.
+# a command: the user must be an ordinary account in that group. `ports` is
+# punktfunk-door.service's ExecStartPre.
 #
-# Both directions are idempotent, and a run that stopped halfway converges on the next. The box's
-# files move once: `on` copies the user's into /var/lib/punktfunk and records that in
-# $BOX/door-on, so a repeat never overwrites what the door has changed since; `off` copies the
-# door's back to the user and clears it.
+# Both directions are idempotent, and a run that stopped halfway converges on the next. A first
+# `on` that fails before the box's ports move puts the box back, and an `off` that can't hand the
+# files home starts the door again, so neither leaves the box without a host or a console. The one
+# record of "on, and for whom" is $STATE/owner, which only root writes: `on` refuses while it names
+# someone else, and `off` runs only for the user it names. A record whose account is gone names no
+# one: `on` from another member takes the door over, and `off` for it switches the door off with
+# the files left in $BOX. A miss proves that only on a box whose accounts are all local; a failed
+# lookup or a directory service refuses. The box's files move once: `on` copies
+# the user's into /var/lib/punktfunk and marks that in $STATE/door-on, so a repeat never overwrites
+# what the door has changed since; `off` copies the door's back to the user and clears both.
 #
 # Every read and write that touches a user's home runs as that user, so a link the user plants
 # there can't make root read or overwrite anything the user couldn't.
 set -eu
+export LC_ALL=C
 
 BOX=/var/lib/punktfunk
-MARK="$BOX/door-on"
-# The seat supervisor's own directory. `owner` there names the one account it adopts as the box
-# owner's row; only root writes it, so the door can't pick another.
+# The seat supervisor's own directory, root's alone. `owner` there is the one account the door is
+# on for, and the one the supervisor adopts as the box owner's row, so the door can't pick another.
 STATE=/var/lib/punktfunk-seats
+RECORD="$STATE/owner"
+MARK="$STATE/door-on"
 SEATS=/usr/libexec/punktfunk/punktfunk-seats
 GROUP=punktfunk-update
+# The door user's primary group. Never `punktfunk`, which owns the usbip attach nodes and passes
+# pf-dm-helper: the door opens no device.
+DOOR_GROUP=punktfunk-door
 # What the box's host keeps: identity, id, pairings, profiles, display and hook settings, and the
 # console's password hash. `profiles/` holds the avatars.
 FILES="native-cert.pem native-key.pem uniqueid punktfunk1-paired.json profiles.json display-settings.json hooks.json web-password"
@@ -33,39 +46,126 @@ die() {
     exit 1
 }
 
+as_door() { runuser -u punktfunk -- "$@"; }
+
+# The door's account sits in its own group. One an older helper made has `punktfunk` for its
+# primary group and moves, with the files that group owned: the door's directory, which the door
+# changes itself, and the library copy, which is root's. Safe to repeat.
+door_account_group() {
+    getent passwd punktfunk >/dev/null || return 0
+    getent group "$DOOR_GROUP" >/dev/null || groupadd --system "$DOOR_GROUP"
+    [ "$(id -gn punktfunk)" = "$DOOR_GROUP" ] || usermod -g "$DOOR_GROUP" punktfunk
+    # The door's own files only: a file another account left there, such as an updater's result,
+    # stays as it is and never stops a switch.
+    as_door find "$BOX" -xdev -user punktfunk ! -group "$DOOR_GROUP" -exec chgrp -h "$DOOR_GROUP" {} + ||
+        echo "door-helper: some files in $BOX keep their group" >&2
+    if [ -d "$STATE/library" ]; then
+        find "$STATE/library" -xdev ! -group "$DOOR_GROUP" -exec chgrp -h "$DOOR_GROUP" {} +
+    fi
+}
+
 verb=${1:-}
 user=${2:-}
-case $verb in on | off) ;; *) die "usage: door-helper on|off <user>" ;; esac
+case $verb in
+on | off) ;;
+# Every door start. The account moves whoever the owner is, then the owner the last `on`
+# recorded gives the ports; with none, the door has none to take.
+ports)
+    [ "$(id -u)" = 0 ] || die "run as root"
+    door_account_group || echo "door-helper: couldn't move the door's account to $DOOR_GROUP" >&2
+    user=$(cat "$RECORD" 2>/dev/null) || exit 0
+    ;;
+*) die "usage: door-helper on|off <user>, or door-helper ports" ;;
+esac
 [ "$(id -u)" = 0 ] || die "run as root"
+# The name rule of the seat supervisor, which adopting the owner enforces (pf-seats): lowercase
+# letters, digits, `_` and `-`, starting with a letter or `_`, at most 20 characters.
 case $user in
-'' | *[!a-z0-9_.-]* | [!a-z_]*) die "'$user' is not a user name" ;;
+'' | *[!a-z0-9_-]* | [!a-z_]*) die "'$user' is not a user name the seats accept" ;;
+esac
+[ "${#user}" -le 20 ] || die "'$user' is longer than the seats accept"
+
+# Whether $1's account is gone, for a name that did not resolve. `getent` exits 2 both for a name
+# that is not there and for a directory service that is not answering, so only a box whose passwd
+# sources all sit on it can call a miss "gone". Any other status, or a source that may have been
+# silent, ends the run: nothing is taken over or switched off on a guess.
+account_is_gone() {
+    status=0
+    getent passwd "$1" >/dev/null || status=$?
+    case $status in
+    0) return 1 ;;
+    2) ;;
+    *) die "can't look up '$1': getent exited $status" ;;
+    esac
+    awk '
+        { sub(/#.*/, "") }
+        $1 == "passwd:" {
+            seen = 1
+            for (i = 2; i <= NF; i++)
+                if ($i !~ /^(files|compat|systemd|altfiles|extrausers|mymachines)$/ &&
+                    $i !~ /^\[?!?[A-Za-z]+=[A-Za-z]+\]?$/) other = 1
+        }
+        END { exit !seen || other }
+    ' /etc/nsswitch.conf 2>/dev/null || die "can't tell if '$1' is gone: its accounts may come from a directory service"
+}
+
+gone=0
+uid=
+OWN=
+if passwd_row=$(getent passwd "$user"); then
+    uid=$(printf '%s' "$passwd_row" | cut -d: -f3)
+    home=$(printf '%s' "$passwd_row" | cut -d: -f6)
+    { [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ]; } || die "'$user' is not an ordinary account"
+    # The recorded owner may switch the door off after leaving the group.
+    if [ "$verb" != off ]; then
+        id -nG "$user" | tr ' ' '\n' | grep -qx "$GROUP" || die "'$user' is not in the $GROUP group"
+    fi
+    OWN="$home/.config/punktfunk"
+elif [ "$verb" = off ] && account_is_gone "$user"; then
+    # Only the record, read under the lock, says whether this is the owner whose account is gone.
+    gone=1
+else
+    die "no user '$user'"
+fi
+
+# `ports` runs inside the door's start, which `on` waits for while it holds this lock.
+if [ "$verb" != ports ]; then
+    exec 9>/run/punktfunk-door.lock
+    flock 9
+fi
+recorded=$(cat "$RECORD" 2>/dev/null || true)
+gone_owner=
+case $verb in
+on)
+    if [ -n "$recorded" ] && [ "$recorded" != "$user" ]; then
+        account_is_gone "$recorded" || die "the door is on for $recorded: turn it off from that account first"
+        gone_owner=$recorded
+        echo "door-helper: $recorded is gone, the door passes to $user" >&2
+    fi
+    ;;
+off) [ "$recorded" = "$user" ] || die "the door is not on for $user" ;;
 esac
 
-passwd_row=$(getent passwd "$user") || die "no user '$user'"
-uid=$(printf '%s' "$passwd_row" | cut -d: -f3)
-home=$(printf '%s' "$passwd_row" | cut -d: -f6)
-{ [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ]; } || die "'$user' is not an ordinary account"
-id -nG "$user" | tr ' ' '\n' | grep -qx "$GROUP" || die "'$user' is not in the $GROUP group"
-OWN="$home/.config/punktfunk"
-
-exec 9>/run/punktfunk-door.lock
-flock 9
-
 as_user() { runuser -u "$user" -- "$@"; }
-as_door() { runuser -u punktfunk -- "$@"; }
 
 # The user's systemd manager, when they have one. A user with no login and no linger has none, and
 # then there is nothing running to change.
-user_ctl() { runuser -u "$user" -- env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user "$@" 2>/dev/null; }
+user_ctl() {
+    [ "$gone" = 0 ] || return 1
+    runuser -u "$user" -- env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user "$@" 2>/dev/null
+}
+
+# $1 a file name under $BOX, written there from stdin as the door. The door owns $BOX, so root
+# never writes a path in it: a link the door plants there leads only where the door can go.
+to_door() {
+    # shellcheck disable=SC2016 # the inner shell expands $1, not this one
+    as_door sh -c 'umask 077; cat >"$1.tmp" && mv -f "$1.tmp" "$1"' sh "$BOX/$1"
+}
 
 # $1 a file name under $OWN, copied to $BOX for the door.
 take() {
     as_user test -f "$OWN/$1" || return 0
-    tmp=$(mktemp "$BOX/.door.XXXXXX")
-    as_user cat -- "$OWN/$1" >"$tmp"
-    chown punktfunk:punktfunk "$tmp"
-    chmod 0600 "$tmp"
-    mv -f "$tmp" "$BOX/$1"
+    as_user cat -- "$OWN/$1" | to_door "$1"
 }
 
 # $1 a file name under $BOX, copied back to the user. Read as the door, written as the user, so
@@ -83,11 +183,7 @@ steamos_password() { as_user test -f "$OWN/web.env" && ! as_user test -f "$OWN/w
 
 take_password() {
     steamos_password || return 0
-    tmp=$(mktemp "$BOX/.door.XXXXXX")
-    as_user cat -- "$OWN/web.env" | grep -E "$PASSWORD_LINE" >"$tmp" || true
-    chown punktfunk:punktfunk "$tmp"
-    chmod 0600 "$tmp"
-    mv -f "$tmp" "$BOX/web-password"
+    as_user cat -- "$OWN/web.env" | { grep -E "$PASSWORD_LINE" || true; } | to_door web-password
 }
 
 give_password() {
@@ -102,16 +198,18 @@ give_password() {
         sh "$OWN/web.env" "$line" "$PASSWORD_LINE"
 }
 
-# The box's ports as the owner's host.env moves them, which the door binds in its place. Taken on
-# every run: host.env stays the owner's file, and the door never writes a port.
-PORT_LINE='^[[:space:]]*PUNKTFUNK_(MGMT_BIND|NATIVE_PORT)[[:space:]]*='
+# The box's ports as the owner's host.env moves them, which the door binds in its place, and the
+# console's bind, which the door's console keeps. SteamOS holds that bind in web.env, read last.
+# Taken at each door start: the owner's files stay theirs, and the door never writes a port.
+PORT_LINE='^[[:space:]]*PUNKTFUNK_(MGMT_BIND|NATIVE_PORT|UI_BIND)[[:space:]]*='
 
 take_ports() {
-    tmp=$(mktemp "$BOX/.door.XXXXXX")
-    as_user cat -- "$OWN/host.env" 2>/dev/null | grep -E "$PORT_LINE" >"$tmp" || true
-    chown punktfunk:punktfunk "$tmp"
-    chmod 0600 "$tmp"
-    mv -f "$tmp" "$BOX/host.env"
+    # Their files out of reach, as a home that isn't mounted yet: the last copy stays.
+    as_user test -d "$OWN" || return 0
+    {
+        as_user cat -- "$OWN/host.env" 2>/dev/null
+        as_user cat -- "$OWN/web.env" 2>/dev/null
+    } | { grep -E "$PORT_LINE" || true; } | to_door host.env
 }
 
 safe_name() {
@@ -119,7 +217,7 @@ safe_name() {
 }
 
 take_avatars() {
-    install -d -m 0700 -o punktfunk -g punktfunk "$BOX/profiles"
+    as_door mkdir -p -m 0700 "$BOX/profiles"
     for name in $(as_user ls -1 -- "$OWN/profiles" 2>/dev/null); do
         safe_name "$name" && take "profiles/$name"
     done
@@ -131,6 +229,16 @@ give_avatars() {
     done
 }
 
+# An older helper kept the mark in $BOX, where the door could write it. The mark of a recorded
+# owner moves to $STATE; any other is dropped.
+legacy_mark() {
+    getent passwd punktfunk >/dev/null || return 0
+    if [ -n "$recorded" ] && as_door test -f "$BOX/door-on"; then
+        : >"$MARK"
+    fi
+    as_door rm -f "$BOX/door-on" || true
+}
+
 wait_for_socket() {
     for _ in $(seq 1 30); do
         [ -S /run/punktfunk/seats.sock ] && return 0
@@ -139,35 +247,57 @@ wait_for_socket() {
     die "the seat supervisor did not start"
 }
 
+# A first `on` that fails puts the box back as it was: no record, mark or owner row, and the
+# supervisor off unless it was on already. The user's own files were only copied.
+undo_on() {
+    echo "door-helper: couldn't switch the door on, putting the box back" >&2
+    if systemctl is-active --quiet punktfunk-seats.service; then
+        row=$(owner_row || true)
+        [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null || true
+    fi
+    rm -f "$MARK" "$RECORD" "/run/punktfunk/seats/$user.env"
+    [ "$seats_were_up" = 1 ] || unwire punktfunk-seats.service || true
+}
+
 door_on() {
-    getent group punktfunk >/dev/null || groupadd --system punktfunk
+    fresh=0
+    [ -n "$recorded" ] || fresh=1
+    seats_were_up=0
+    if systemctl is-active --quiet punktfunk-seats.service; then seats_were_up=1; fi
+    getent group "$DOOR_GROUP" >/dev/null || groupadd --system "$DOOR_GROUP"
     if ! getent passwd punktfunk >/dev/null; then
         shell=$(command -v nologin || echo /usr/sbin/nologin)
-        useradd --system --no-user-group --gid punktfunk --home-dir "$BOX" --shell "$shell" punktfunk
+        useradd --system --no-user-group --gid "$DOOR_GROUP" --home-dir "$BOX" --shell "$shell" punktfunk
     fi
-    install -d -m 0711 -o punktfunk -g punktfunk "$BOX"
+    install -d -m 0711 -o punktfunk -g "$DOOR_GROUP" "$BOX"
+    door_account_group
     # The shared games folder's group; the owner's Steam moves games into it at their next login.
     getent group punktfunk-games >/dev/null || groupadd --system punktfunk-games
     usermod -aG punktfunk-games "$user"
+    install -d -m 0711 -o root -g root "$STATE"
+    legacy_mark
+    # A gone owner's files stay in $BOX; this member's replace them where they have the same file.
+    [ -z "$gone_owner" ] || rm -f "$MARK"
+    [ "$fresh" = 0 ] || trap undo_on EXIT
+    printf '%s\n' "$user" >"$RECORD.tmp"
+    chmod 0600 "$RECORD.tmp"
+    mv -f "$RECORD.tmp" "$RECORD"
     if [ ! -e "$MARK" ]; then
         for f in $FILES; do take "$f"; done
         take_password
         take_avatars
         : >"$MARK"
     fi
-    take_ports
-    install -d -m 0711 -o root -g root "$STATE"
-    printf '%s\n' "$user" >"$STATE/owner.tmp"
-    chmod 0600 "$STATE/owner.tmp"
-    mv -f "$STATE/owner.tmp" "$STATE/owner"
-    systemctl enable --now punktfunk-seats.service
+    wire punktfunk-seats.service
+    systemctl start punktfunk-seats.service
     wait_for_socket
     "$SEATS" adopt-owner "$user" >/dev/null
+    wire punktfunk-door.service punktfunk-web-door.service
+    trap - EXIT
     # The box's ports are the door's from here, so the user's console and host leave them first.
     # The host restarts on the owner row's contract: its own ports, and the box's identity.
     user_ctl stop punktfunk-web.service || true
     user_ctl try-restart punktfunk-host.service || true
-    systemctl enable punktfunk-door.service punktfunk-web-door.service
     systemctl restart punktfunk-door.service punktfunk-web-door.service
     echo "door on for $user"
 }
@@ -177,30 +307,61 @@ owner_row() {
     "$SEATS" list | awk '$6 == "owner=true" { print $1; exit }'
 }
 
+# Units that start at boot, or stop and no longer do. NixOS wires them in its configuration and its
+# unit directory can't be written, so a refused change is fine for a unit already in that state.
+wire() {
+    for unit in "$@"; do
+        systemctl enable "$unit" || systemctl is-enabled --quiet "$unit" || die "can't enable $unit"
+    done
+}
+
+unwire() { systemctl disable --now "$@" || systemctl stop "$@"; }
+
+# The door stopped to hand its files home and they didn't arrive: it comes back as it was.
+restore_door() {
+    echo "door-helper: couldn't hand the door's files back, starting the door again" >&2
+    systemctl start --no-block punktfunk-door.service punktfunk-web-door.service || true
+}
+
 door_off() {
+    trap restore_door EXIT
     systemctl stop punktfunk-web-door.service punktfunk-door.service || true
-    if [ -e "$MARK" ]; then
+    legacy_mark
+    if [ "$gone" = 1 ]; then
+        echo "door-helper: $user is gone, the door's files stay in $BOX" >&2
+    elif [ -e "$MARK" ]; then
         for f in $FILES; do [ "$f" = web-password ] || give "$f"; done
         give_password
         give_avatars
     fi
+    trap - EXIT
+    # The files are home. A repeat must not copy the door's stale ones over the user's.
+    rm -f "$MARK"
+    # From here only forward: each step is tried, and the record stays until all of them held.
+    problems=0
     if systemctl is-active --quiet punktfunk-seats.service; then
         # Seats the door placed stop with it; their accounts and profiles stay for the next time.
         "$SEATS" list | awk '$2 == "Running" || $2 == "Starting" { print $1 }' | while read -r id; do
             "$SEATS" stop "$id" >/dev/null || true
         done
-        row=$(owner_row)
-        [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null
+        row=$(owner_row || true)
+        [ -z "$row" ] || "$SEATS" delete "$row" >/dev/null || problems=1
     fi
     # A stopped supervisor leaves the owner's contract behind, and their host and console read it.
-    rm -f "/run/punktfunk/seats/$user.env" "$MARK" "$STATE/owner"
-    systemctl disable --now punktfunk-web-door.service punktfunk-door.service punktfunk-seats.service
+    rm -f "/run/punktfunk/seats/$user.env"
+    unwire punktfunk-web-door.service punktfunk-door.service punktfunk-seats.service || problems=1
     user_ctl try-restart punktfunk-host.service || true
     # Their console comes back only if it was theirs to begin with.
     if user_ctl is-enabled --quiet punktfunk-web.service; then
         user_ctl start punktfunk-web.service || true
     fi
+    [ "$problems" = 0 ] || die "cleanup after switching off $user failed, switch it off again"
+    rm -f "$RECORD"
     echo "door off for $user"
 }
 
-if [ "$verb" = on ]; then door_on; else door_off; fi
+case $verb in
+on) door_on ;;
+off) door_off ;;
+ports) take_ports ;;
+esac

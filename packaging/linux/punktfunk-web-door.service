@@ -12,7 +12,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=punktfunk
-Group=punktfunk
+Group=punktfunk-door
 RuntimeDirectory=punktfunk-web-door
 Environment=PUNKTFUNK_CONFIG_DIR=/var/lib/punktfunk
 Environment=PORT=47992
@@ -21,6 +21,9 @@ Environment=PUNKTFUNK_UI_TLS_KEY=/var/lib/punktfunk/key.pem
 Environment=PUNKTFUNK_UI_SECURE=1
 # The door writes these on its first start; the console can't serve without them, so wait.
 ExecStartPre=/bin/sh -c 'until [ -s /var/lib/punktfunk/mgmt-token ] && [ -s /var/lib/punktfunk/native-key.pem ]; do sleep 1; done'
+# The owner's console bind, which door-helper copies with the ports. First, so the files below
+# win any key they share. Without it the console answers on every interface.
+EnvironmentFile=-/var/lib/punktfunk/host.env
 EnvironmentFile=-/var/lib/punktfunk/mgmt-token
 EnvironmentFile=-/var/lib/punktfunk/web-password
 EnvironmentFile=-/var/lib/punktfunk/mgmt-endpoint
@@ -30,6 +33,7 @@ RestartSec=2
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
+ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 LockPersonality=yes

@@ -203,10 +203,10 @@ pub(crate) fn display_settings_state() -> DisplaySettingsState {
         client_enforced.push("scale".into());
     }
     // A contract seat has nothing to set: the contract fixes its desktop, and only a device's
-    // cap and scale follow the device here.
+    // cap, scale and second-device rule follow the device here.
     if store.follows_contract() {
         enforced.clear();
-        client_enforced.retain(|f| f == "max_mode" || f == "scale");
+        client_enforced.retain(|f| matches!(f.as_str(), "max_mode" | "scale" | "mode_conflict"));
     }
     // Overlays ride their own field, never `settings`. The console PUTs `settings`
     // back whole, and the PUT refuses a body carrying `clients` — so leaving them

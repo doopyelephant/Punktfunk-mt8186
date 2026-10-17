@@ -30,6 +30,11 @@ export function isPublicPath(pathname: string): boolean {
  * than throwing, so a bad path degrades to "does not match the canonical form" instead of a 500.
  */
 export function normalizePath(pathname: string): string {
+	return `/${normalizeSegments(pathname).join("/")}`;
+}
+
+/** The decoded segments `normalizePath` joins. A segment can hold a `/` it decoded from `%2F`. */
+export function normalizeSegments(pathname: string): string[] {
 	const out: string[] = [];
 	for (const raw of pathname.split("/")) {
 		let seg = raw;
@@ -45,7 +50,7 @@ export function normalizePath(pathname: string): string {
 		}
 		out.push(seg);
 	}
-	return `/${out.join("/")}`;
+	return out;
 }
 
 /** Validate a post-login redirect target: a same-origin path only. Resolves `next` against a

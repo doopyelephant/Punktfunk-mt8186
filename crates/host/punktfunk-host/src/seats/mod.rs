@@ -50,7 +50,8 @@ pub(crate) fn enabled() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        matches!(call(Command::Seating), Ok(CommandResult::Seating { status }) if status.enabled)
+        // The ledger is the cheap question; `Seating` also runs the prerequisite checks.
+        list().is_ok()
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
@@ -134,54 +135,170 @@ pub(crate) fn is_door() -> bool {
 /// How long a snapshot answers for the box: a picker polls every 2 s.
 const FRESH: Duration = Duration::from_secs(2);
 
-static LAST: Mutex<Option<(Instant, Arc<Snapshot>)>> = Mutex::new(None);
+struct Cache {
+    /// Bumped by [`invalidate`]: a read that began before it is not kept.
+    epoch: u64,
+    last: Option<(Instant, Arc<Snapshot>)>,
+}
+
+static LAST: Mutex<Cache> = Mutex::new(Cache {
+    epoch: 0,
+    last: None,
+});
+
+/// The ledger and whether seats are on, with no seat host asked who plays there.
+pub(crate) fn ledger() -> Snapshot {
+    if !(cfg!(windows) || is_door()) {
+        return Snapshot::default();
+    }
+    let listed = list();
+    // Linux seats are on whenever the supervisor answers.
+    let on = if cfg!(windows) {
+        enabled()
+    } else {
+        listed.is_ok()
+    };
+    let seats = listed.unwrap_or_else(|e| {
+        tracing::debug!(code = ?e.code, "seats ledger did not load: {}", e.message);
+        Vec::new()
+    });
+    Snapshot {
+        on,
+        single_session: single_session(),
+        seats,
+        occupants: BTreeMap::new(),
+    }
+}
 
 /// The seats as they are now, at most [`FRESH`] old. Blocking: call it off the async workers.
+///
+/// No lock is held while the supervisor and the seat hosts answer, so a hung one delays the
+/// callers that read afresh and nobody else. Two stale readers each ask: one shared read is
+/// for when that costs.
 pub(crate) fn snapshot() -> Arc<Snapshot> {
     if !(cfg!(windows) || is_door()) {
         return Arc::default();
     }
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((at, snap)) = last.as_ref() {
-        if at.elapsed() < FRESH {
-            return Arc::clone(snap);
+    let epoch = {
+        let cache = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, snap)) = cache.last.as_ref() {
+            if at.elapsed() < FRESH {
+                return Arc::clone(snap);
+            }
         }
-    }
-    let seats = list().unwrap_or_else(|e| {
-        tracing::debug!(code = ?e.code, "seats ledger did not load: {}", e.message);
-        Vec::new()
-    });
-    let occupants = seats
-        .iter()
-        .filter(|s| s.runtime.state == pf_seats::RuntimeState::Running)
-        .filter_map(|s| Some((s.id.as_str().to_string(), occupants(s)?)))
+        cache.epoch
+    };
+    let mut snap = ledger();
+    snap.occupants = ask_hosts(&snap.seats)
+        .into_iter()
+        .filter_map(|(id, who)| Some((id, who?)))
         .collect();
-    let snap = Arc::new(Snapshot {
-        on: enabled(),
-        single_session: single_session(),
-        seats,
-        occupants,
-    });
-    *last = Some((Instant::now(), Arc::clone(&snap)));
+    let snap = Arc::new(snap);
+    let mut cache = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.epoch == epoch {
+        cache.last = Some((Instant::now(), Arc::clone(&snap)));
+    }
     snap
 }
 
 /// The next [`snapshot`] reads afresh: a seat was just started or stopped.
 pub(crate) fn invalidate() {
-    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let mut cache = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    cache.epoch += 1;
+    cache.last = None;
+}
+
+/// Who plays on each running seat, `None` where its host didn't answer. The hosts are asked at
+/// once: a hung one costs one timeout, not one per seat.
+fn ask_hosts(seats: &[pf_seats::Seat]) -> BTreeMap<String, Option<Vec<Occupant>>> {
+    std::thread::scope(|scope| {
+        let asked: Vec<_> = seats
+            .iter()
+            .filter(|s| s.runtime.state == pf_seats::RuntimeState::Running)
+            .map(|s| (s.id.as_str().to_string(), scope.spawn(move || occupants(s))))
+            .collect();
+        asked
+            .into_iter()
+            .map(|(id, asked)| (id, asked.join().ok().flatten()))
+            .collect()
+    })
+}
+
+/// Whether this host has seats to ask: a Linux door, or Windows with seats turned on.
+fn in_play() -> bool {
+    is_door() || (cfg!(windows) && enabled())
+}
+
+/// Whether any device `holds` plays on a seat; `None` when a seat host or the ledger can't say.
+/// Blocking, as [`snapshot`].
+fn any_on_a_seat(holds: impl Fn(&Occupant) -> bool) -> Option<bool> {
+    if !in_play() {
+        return Some(false);
+    }
+    seen_on(&ask_hosts(&list().ok()?), holds)
+}
+
+/// A device seen on an answering seat is a yes. Otherwise a seat that didn't answer leaves it
+/// open: it may be playing there.
+fn seen_on(
+    heard: &BTreeMap<String, Option<Vec<Occupant>>>,
+    holds: impl Fn(&Occupant) -> bool,
+) -> Option<bool> {
+    if heard.values().flatten().flatten().any(holds) {
+        Some(true)
+    } else if heard.values().any(Option::is_none) {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// Whether a device other than `fp_hex` streams on any seat: the host-power busy check for a
-/// box whose sessions run on seat hosts. Blocking, as [`snapshot`].
+/// box whose sessions run on seat hosts. A guess would cut a live stream, so a seat that can't
+/// say counts as a yes. Blocking, as [`snapshot`].
 pub(crate) fn other_client_on_a_seat(fp_hex: &str) -> bool {
-    someone_else(&snapshot().occupants, fp_hex)
+    any_on_a_seat(|o| !crate::session_status::is_client(&o.client, fp_hex)).unwrap_or(true)
 }
 
-fn someone_else(occupants: &BTreeMap<String, Vec<Occupant>>, fp_hex: &str) -> bool {
-    occupants
-        .values()
+/// Whether `fp_hex` streams on a seat; `None` when a seat can't say. Blocking, as [`snapshot`].
+pub(crate) fn plays_on_a_seat(fp_hex: &str) -> Option<bool> {
+    any_on_a_seat(|o| crate::session_status::is_client(&o.client, fp_hex))
+}
+
+/// [`plays_on_a_seat`], `None` once `deadline` has passed. A supervisor that accepts and never
+/// answers would hold a caller for minutes, and the startup sweep is one.
+pub(crate) fn plays_on_a_seat_by(fp_hex: &str, deadline: Instant) -> Option<bool> {
+    if !in_play() {
+        return Some(false);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let fp = fp_hex.to_owned();
+    std::thread::spawn(move || {
+        let _ = tx.send(plays_on_a_seat(&fp));
+    });
+    rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
         .flatten()
-        .any(|o| !crate::session_status::is_client(&o.client, fp_hex))
+}
+
+/// Ends every session on every running seat, ahead of a power action that takes the box down:
+/// a seat host doesn't hear the door's own. Blocking, as [`snapshot`].
+pub(crate) fn end_all_sessions() {
+    if !in_play() {
+        return;
+    }
+    let Ok(seats) = list() else { return };
+    std::thread::scope(|scope| {
+        for seat in &seats {
+            if seat.runtime.state == pf_seats::RuntimeState::Running {
+                scope.spawn(move || {
+                    if !end_sessions_for_power(seat) {
+                        tracing::warn!(seat = %seat.name, "seat sessions did not end before a power action");
+                    }
+                });
+            }
+        }
+    });
 }
 
 /// A seat host's own config dir, where it keeps its management token.
@@ -205,7 +322,7 @@ pub(crate) struct Occupant {
 }
 
 /// Loopback is local: a seat that does not answer in this long is not serving.
-const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+const STATUS_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Who streams on `seat` right now, from its host's loopback `/status`. `None` when the seat
 /// host does not answer.
@@ -236,11 +353,22 @@ pub(crate) fn occupants(seat: &pf_seats::Seat) -> Option<Vec<Occupant>> {
 
 /// Ends every session on `seat` through its host's loopback API. `false` when it didn't answer.
 pub(crate) fn end_sessions(seat: &pf_seats::Seat) -> bool {
+    stop_on(seat, "/api/v1/session")
+}
+
+/// [`end_sessions`] for a power action: the seat host closes each session as the door's own
+/// close, so its clients read that the box is going down. A seat host that predates the
+/// reason ends them plainly.
+fn end_sessions_for_power(seat: &pf_seats::Seat) -> bool {
+    stop_on(seat, "/api/v1/session?reason=power")
+}
+
+fn stop_on(seat: &pf_seats::Seat, path: &str) -> bool {
     let Some(pin) = seat_pin(seat) else {
         return false;
     };
     crate::ctl::client::Client::seat(pin, &host_dir(seat), seat.mgmt_port, Some(STATUS_TIMEOUT))
-        .and_then(|client| client.delete("/api/v1/session"))
+        .and_then(|client| client.delete(path))
         .is_ok()
 }
 
@@ -275,26 +403,49 @@ const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 mod tests {
-    use super::{someone_else, Occupant};
+    use super::{seen_on, Occupant};
     use std::collections::BTreeMap;
 
     #[test]
     fn only_the_callers_own_seat_sessions_leave_the_box_free() {
         let fp = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-        let on = |client: &str| Occupant {
-            client: client.into(),
-            name: None,
+        let on = |client: &str| {
+            Some(vec![Occupant {
+                client: client.into(),
+                name: None,
+            }])
+        };
+        let other = |seats: &BTreeMap<String, Option<Vec<Occupant>>>| {
+            seen_on(seats, |o| !crate::session_status::is_client(&o.client, fp)).unwrap_or(true)
         };
         let mut seats = BTreeMap::new();
-        seats.insert("owner".to_string(), vec![on(&fp[..12])]);
-        seats.insert("seat-1".to_string(), vec![]);
-        assert!(!someone_else(&seats, fp), "the caller's own stream");
-        seats.insert("seat-2".to_string(), vec![on("112233445566")]);
-        assert!(someone_else(&seats, fp), "another device on a seat");
-        seats.insert("seat-2".to_string(), vec![on("192.168.1.50")]);
-        assert!(
-            someone_else(&seats, fp),
-            "an anonymous client is always someone else"
-        );
+        seats.insert("owner".to_string(), on(&fp[..12]));
+        seats.insert("seat-1".to_string(), Some(vec![]));
+        assert!(!other(&seats), "the caller's own stream");
+        seats.insert("seat-2".to_string(), on("112233445566"));
+        assert!(other(&seats), "another device on a seat");
+        seats.insert("seat-2".to_string(), on("192.168.1.50"));
+        assert!(other(&seats), "an anonymous client is always someone else");
+        seats.insert("seat-2".to_string(), None);
+        assert!(other(&seats), "a seat host that doesn't answer is busy");
+    }
+
+    /// A guest seen on one seat is there whatever the others say; one nobody saw is unknown
+    /// while a seat is silent, and gone once every seat has answered.
+    #[test]
+    fn a_silent_seat_leaves_a_guest_open_unless_it_was_seen() {
+        let fp = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let mine = |o: &Occupant| crate::session_status::is_client(&o.client, fp);
+        let on = Some(vec![Occupant {
+            client: fp[..12].into(),
+            name: None,
+        }]);
+        let mut seats = BTreeMap::new();
+        seats.insert("seat-1".to_string(), Some(vec![]));
+        assert_eq!(seen_on(&seats, mine), Some(false), "every seat answered");
+        seats.insert("seat-2".to_string(), None);
+        assert_eq!(seen_on(&seats, mine), None, "seat-2 may have it");
+        seats.insert("seat-1".to_string(), on);
+        assert_eq!(seen_on(&seats, mine), Some(true), "seen on seat-1");
     }
 }

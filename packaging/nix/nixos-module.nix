@@ -781,8 +781,8 @@ in
       };
 
       # The door ("Reachable without logging in"). Its host and console units name /usr/bin; the
-      # leading empty ExecStart clears the packaged one. The packaged ExecStart of both helper
-      # templates is already the store path.
+      # leading empty ExecStart clears the packaged one. The door's ExecStartPre and both helper
+      # templates already name the store path.
       systemd.services.punktfunk-door.serviceConfig.ExecStart = [
         ""
         "${cfg.host.package}/bin/punktfunk-host serve --door"
@@ -791,12 +791,47 @@ in
         ""
         "${cfg.web.package}/bin/punktfunk-web-server"
       ];
+      # The door's console binds where `web.bind` says, as the user's does. The packaged list
+      # starts with the door's host.env copy, which would beat it: the empty entry clears the
+      # list and the rest is the packaged order.
+      systemd.services.punktfunk-web-door.environment.PUNKTFUNK_UI_BIND = cfg.web.bind;
+      systemd.services.punktfunk-web-door.serviceConfig.EnvironmentFile = [
+        ""
+        "-/var/lib/punktfunk/mgmt-token"
+        "-/var/lib/punktfunk/web-password"
+        "-/var/lib/punktfunk/mgmt-endpoint"
+      ];
+      # The units name no install target, which the helper's `systemctl enable` would add, and
+      # NixOS's unit directory is read-only. They are wanted at boot instead, once the owner
+      # record says the door is on.
+      systemd.services.punktfunk-door = {
+        wantedBy = [ "multi-user.target" ];
+        unitConfig.ConditionPathExists = "/var/lib/punktfunk-seats/owner";
+      };
+      systemd.services.punktfunk-web-door = {
+        wantedBy = [ "multi-user.target" ];
+        unitConfig.ConditionPathExists = "/var/lib/punktfunk-seats/owner";
+      };
+      # The door's ports: the two `host.settings` keys that move them, and no other host knob.
+      # The host.env lines its ExecStartPre copies win over these.
+      systemd.services.punktfunk-door.path = seatPath;
+      systemd.services.punktfunk-door.environment = lib.mapAttrs (_: renderVal) (
+        lib.filterAttrs (
+          name: _:
+          builtins.elem name [
+            "PUNKTFUNK_MGMT_BIND"
+            "PUNKTFUNK_NATIVE_PORT"
+          ]
+        ) cfg.host.settings
+      );
       systemd.services."punktfunk-door-on@".path = seatPath;
       systemd.services."punktfunk-door-off@".path = seatPath;
 
       # Members of this group may start the helper templates; the helper refuses anyone else. The
       # polkit rule is the package's own file, which other distros read from /usr/share.
       users.groups.punktfunk-update = { };
+      # The door user's own group, in place of `punktfunk`, which owns the usbip attach nodes.
+      users.groups.punktfunk-door = { };
       security.polkit.enable = mkDefault true;
       environment.etc."polkit-1/rules.d/49-punktfunk-door.rules".source =
         "${cfg.seats.package}/share/polkit-1/rules.d/49-punktfunk-door.rules";

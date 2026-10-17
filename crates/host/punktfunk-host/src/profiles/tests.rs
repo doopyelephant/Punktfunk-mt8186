@@ -75,6 +75,42 @@ fn box_file() -> ProfilesFile {
 }
 
 #[test]
+fn a_profile_create_would_refuse_is_vetted_before_its_seat_is_made() {
+    let (p, _) = store("vet", &box_file(), None);
+    let new = |name: &str| ProfileCreate {
+        display_name: name.into(),
+        accent: None,
+        home: None,
+        seat: true,
+    };
+    assert_eq!(p.vet_create(&new("  New\u{7}Kid  ")).unwrap(), "NewKid");
+    assert_eq!(
+        p.vet_create(&new(&"x".repeat(80))).unwrap().len(),
+        DISPLAY_NAME_MAX
+    );
+    assert!(matches!(
+        p.vet_create(&new("kid")),
+        Err(EditError::NameTaken)
+    ));
+    assert!(matches!(
+        p.vet_create(&new(" \u{7} ")),
+        Err(EditError::Invalid(_))
+    ));
+    let red = ProfileCreate {
+        accent: Some("red".into()),
+        ..new("Fresh")
+    };
+    assert!(matches!(p.vet_create(&red), Err(EditError::Invalid(_))));
+
+    let mut full = box_file();
+    full.profiles = (0..PROFILES_MAX)
+        .map(|i| profile(&format!("{i:012x}"), &format!("P{i}"), OsAccount::Operator))
+        .collect();
+    let (p, _) = store("vet-full", &full, None);
+    assert!(matches!(p.vet_create(&new("Fresh")), Err(EditError::Full)));
+}
+
+#[test]
 fn no_ask_from_a_device_with_an_old_seat_lands_in_that_profile() {
     let (p, _) = store("legacy", &box_file(), None);
     let r = p.resolve(Some(DEVICE), None).unwrap();
@@ -138,6 +174,11 @@ fn a_seat_host_refuses_another_seats_profile() {
         p.resolve(None, Some("bbbbbbbbbbbb")),
         Err(ProfileError::NotThisSeat)
     );
+    // The owner's session is not this seat's to play either.
+    assert_eq!(
+        p.resolve(None, Some("4f1c3a9b0e27")),
+        Err(ProfileError::NotThisSeat)
+    );
 }
 
 /// The owner's host, behind the door, plays the owner and the profiles that share the owner's
@@ -185,6 +226,42 @@ fn a_seat_host_reads_the_box_file_and_plays_its_own_profile() {
     // The box removes the seat's profile: the seat plays for nobody.
     box_writes(&path, &box_file());
     assert_eq!(p.resolve(None, None), Err(ProfileError::SessionUnavailable));
+}
+
+/// A profile the box deletes never runs `delete` on a seat host: the seat's watcher announces
+/// it, so a session playing as it ends.
+#[test]
+fn a_seat_host_announces_a_profile_the_box_removed() {
+    fn heard(rx: &mut tokio::sync::broadcast::Receiver<ProfileId>) -> Vec<ProfileId> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+    let sharer = "eeeeeeeeeeee".to_string();
+    let mut file = box_file();
+    file.profiles.push(seat(&sharer, "Sharer", Some("seat-a")));
+    let path = temp_dir("announce").join("profiles.json");
+    std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    let p = Profiles::load_box(path.clone(), Some("seat-a".into()));
+    let mut rx = removed();
+    let mut known = std::collections::HashSet::new();
+
+    // The first look only takes the ids.
+    p.announce_removals(&mut known);
+    assert_eq!(known.len(), 4);
+    assert!(!heard(&mut rx).contains(&sharer));
+
+    // A file that doesn't parse says nothing.
+    std::fs::write(&path, b"{").unwrap();
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    let f = std::fs::File::options().write(true).open(&path).unwrap();
+    f.set_modified(later).unwrap();
+    p.announce_removals(&mut known);
+    assert_eq!(known.len(), 4);
+    assert!(!heard(&mut rx).contains(&sharer));
+
+    box_writes(&path, &box_file());
+    p.announce_removals(&mut known);
+    assert_eq!(known.len(), 3);
+    assert!(heard(&mut rx).contains(&sharer));
 }
 
 #[test]

@@ -2,9 +2,9 @@
 //!
 //! Every seat cycle owns one unnamed `KILL_ON_JOB_CLOSE` job for its keeper,
 //! which starts suspended, enters the job and only then resumes. The quality gate
-//! and host run in the seat's session, which a session-0 job cannot hold, so they
-//! end when their [`ChildProcess`] drops and when the cycle logs the session off. The RDP
-//! bootstrap travels through one inherited anonymous stdin pipe, never argv or
+//! and host run in the seat's session and join the cycle's job too, so they end with the
+//! service as well as when their [`ChildProcess`] drops and when the cycle logs the session
+//! off. The RDP bootstrap travels through one inherited anonymous stdin pipe, never argv or
 //! environment. Session children use a duplicated LocalSystem primary token
 //! retargeted with `TokenSessionId` and the `winsta0\default` desktop. Host
 //! environment construction uses an allow-listed system base plus exact seat
@@ -33,7 +33,9 @@ use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_ALWAYS, OPEN_EXISTING,
 };
-use windows::Win32::System::JobObjects::{AssignProcessToJobObject, JOB_OBJECT_LIMIT};
+use windows::Win32::System::JobObjects::{
+    AssignProcessToJobObject, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CreateProcessAsUserW, CreateProcessW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
@@ -47,8 +49,12 @@ pub(super) struct Job {
 
 impl Job {
     pub(super) fn new() -> WinResult<Self> {
-        let handle = pf_paths_win::kill_on_close_job(JOB_OBJECT_LIMIT(0))
-            .map_err(|error| io_error("job_create", "create the kill-on-close job", error))?;
+        // The host's own children (games, Steam) stay out: they end with the session logoff,
+        // which gives them a graceful exit that a job's kill does not.
+        let handle = pf_paths_win::kill_on_close_job(
+            JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+        )
+        .map_err(|error| io_error("job_create", "create the kill-on-close job", error))?;
         Ok(Self { handle })
     }
 
@@ -104,11 +110,12 @@ impl ChildProcess {
 }
 
 /// Start `punktfunk-seat-keeper.exe keep` suspended in `job`, hand it `bootstrap` on stdin,
-/// then resume it. No secret crosses argv or the environment.
+/// then resume it. Its stderr is appended to `log`. No secret crosses argv or the environment.
 pub(super) fn spawn_keeper(
     job: &Job,
     keeper: &Path,
     bootstrap: &RdpBootstrap,
+    log: &Path,
 ) -> WinResult<ChildProcess> {
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -149,6 +156,7 @@ pub(super) fn spawn_keeper(
     .map_err(|error| io_error("keeper_spawn", "open NUL failed", error))?;
     // SAFETY: `nul_raw` is fresh and transferred to one owner.
     let nul = unsafe { OwnedHandle::from_raw_handle(nul_raw.0) };
+    let log = open_log(log)?;
 
     let application = wide(keeper.as_os_str(), "keeper executable")?;
     let mut command_w = command_line(&[keeper.as_os_str().to_owned(), OsString::from("keep")])?;
@@ -158,11 +166,12 @@ pub(super) fn spawn_keeper(
         dwFlags: STARTF_USESTDHANDLES,
         hStdInput: HANDLE(read_pipe.as_raw_handle()),
         hStdOutput: HANDLE(nul.as_raw_handle()),
-        hStdError: HANDLE(nul.as_raw_handle()),
+        hStdError: HANDLE(log.as_raw_handle()),
         ..Default::default()
     };
     let mut info = PROCESS_INFORMATION::default();
-    // SAFETY: all pointers target live NUL-terminated buffers; only stdin/NUL are inheritable.
+    // SAFETY: all pointers target live NUL-terminated buffers; only stdin, NUL and the log are
+    // inheritable.
     unsafe {
         CreateProcessW(
             PCWSTR(application.as_ptr()),
@@ -236,9 +245,9 @@ fn finish_keeper_spawn(
 }
 
 /// Start `executable` in session `session_id` as LocalSystem, its stdout and stderr appended to
-/// `log`. It runs outside the cycle's job, which lives in session 0; the returned handle
-/// terminates it on drop.
+/// `log`, and in `job` when there is one. The returned handle terminates it on drop.
 pub(super) fn spawn_in_session(
+    job: Option<&Job>,
     session_id: u32,
     executable: &Path,
     arguments: &[OsString],
@@ -283,7 +292,7 @@ pub(super) fn spawn_in_session(
         )
     }
     .map_err(|error| io_error("process_spawn", "CreateProcessAsUserW failed", error))?;
-    finish_suspended_spawn(info)
+    finish_suspended_spawn(info, job)
 }
 
 /// A log past this size moves to `<log>.old` at the next spawn, so a crash loop can't fill the disk.
@@ -321,11 +330,20 @@ fn open_log(path: &Path) -> WinResult<OwnedHandle> {
     Ok(unsafe { OwnedHandle::from_raw_handle(raw.0) })
 }
 
-fn finish_suspended_spawn(info: PROCESS_INFORMATION) -> WinResult<ChildProcess> {
+fn finish_suspended_spawn(info: PROCESS_INFORMATION, job: Option<&Job>) -> WinResult<ChildProcess> {
     // SAFETY: successful process creation returned two distinct owned handles; transfer each once.
     let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess.0) };
     // SAFETY: this is the distinct initial-thread handle and is transferred once.
     let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread.0) };
+    if let Some(job) = job {
+        // SAFETY: job and suspended process handles are live; assignment completes synchronously.
+        let assigned =
+            unsafe { AssignProcessToJobObject(job.raw(), HANDLE(process.as_raw_handle())) };
+        // A refusal leaves the handle's drop and the logoff to end the child.
+        if let Err(error) = assigned {
+            tracing::warn!(%error, "seat child not in the cycle's job");
+        }
+    }
     // SAFETY: the initial thread is live and suspended exactly once by CREATE_SUSPENDED.
     if unsafe { ResumeThread(HANDLE(thread.as_raw_handle())) } == u32::MAX {
         // SAFETY: process handle remains live and the process must not escape suspended.
@@ -548,4 +566,64 @@ fn append_quoted(output: &mut Vec<u16>, value: &OsStr) -> WinResult<()> {
     output.extend(std::iter::repeat_n(b'\\' as u16, slashes * 2));
     output.push(b'"' as u16);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::windows::{util, wts};
+    use std::time::{Duration, Instant};
+
+    /// A child in another session ends when its job closes, as it must when the service dies.
+    /// It needs a LocalSystem allowed to start a process in the console session, which a CI
+    /// runner's service context is not, so it runs on demand with `--ignored`.
+    #[test]
+    #[ignore = "needs LocalSystem that may start a process in the console session"]
+    fn a_job_ends_a_child_in_another_session() {
+        if !util::is_local_system().unwrap_or(false) {
+            eprintln!("skipped: not LocalSystem");
+            return;
+        }
+        let Some(session) = wts::enumerate()
+            .unwrap()
+            .into_iter()
+            .find(|session| session.console)
+        else {
+            eprintln!("skipped: no console session");
+            return;
+        };
+        let root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let system32 = Path::new(&root).join("System32");
+        let mut environment: Vec<u16> = OsStr::new("SystemRoot=")
+            .encode_wide()
+            .chain(OsStr::new(&root).encode_wide())
+            .collect();
+        environment.extend([0, 0]);
+        let temp = tempfile::tempdir().unwrap();
+
+        let job = Job::new().unwrap();
+        let child = spawn_in_session(
+            Some(&job),
+            session.id,
+            &system32.join("PING.EXE"),
+            &[
+                OsString::from("-n"),
+                OsString::from("120"),
+                OsString::from("127.0.0.1"),
+            ],
+            &environment,
+            &system32,
+            &temp.path().join("child.log"),
+        )
+        .unwrap();
+        assert_eq!(child.exit_code().unwrap(), None, "the child runs");
+        eprintln!("child {} runs in session {}", child.pid(), session.id);
+
+        drop(job);
+        let give_up = Instant::now() + Duration::from_secs(5);
+        while child.exit_code().unwrap().is_none() {
+            assert!(Instant::now() < give_up, "the job left its child running");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }

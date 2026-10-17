@@ -29,7 +29,8 @@ a gamescope game survives the sleep. If a wake then shows a black screen, click 
 The host refuses with the reason:
 
 - **Another device is streaming.** A guest can't pull the host out from under someone else's
-  session. Your own session never blocks you, and the console is never blocked.
+  session. Your own session never blocks you, and the console is never blocked. On a box with
+  seats, a seat that doesn't answer counts as streaming.
 - **The system said no.** A Linux host respects other programs' sleep inhibitors and refuses while
   another user is logged in locally. A machine that can't sleep lists **Sleep host** as
   unavailable, with the reason.

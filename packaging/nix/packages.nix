@@ -289,14 +289,13 @@ in
         install -Dm0755 packaging/linux/door-helper "$out/libexec/punktfunk/door-helper"
         substituteInPlace "$out/libexec/punktfunk/door-helper" \
           --replace-fail /usr/libexec/punktfunk "$out/libexec/punktfunk"
-        for f in punktfunk-door-on@.service punktfunk-door-off@.service; do
+        for f in punktfunk-door.service punktfunk-door-on@.service punktfunk-door-off@.service; do
           install -Dm0644 "packaging/linux/$f" "$out/lib/systemd/system/$f"
           substituteInPlace "$out/lib/systemd/system/$f" \
             --replace-fail /usr/libexec/punktfunk "$out/libexec/punktfunk"
         done
-        for f in punktfunk-door.service punktfunk-web-door.service; do
-          install -Dm0644 "packaging/linux/$f" "$out/lib/systemd/system/$f"
-        done
+        install -Dm0644 packaging/linux/punktfunk-web-door.service \
+          "$out/lib/systemd/system/punktfunk-web-door.service"
         install -Dm0644 packaging/linux/49-punktfunk-door.rules \
           "$out/share/polkit-1/rules.d/49-punktfunk-door.rules"
         # seat-session seeds the portal grant and the virtual speaker from these two files. They

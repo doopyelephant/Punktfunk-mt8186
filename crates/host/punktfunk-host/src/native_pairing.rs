@@ -123,6 +123,9 @@ pub struct NativePairing {
     /// Live session counts plus last-out generation, keyed by lowercased fingerprint.
     /// Every admitted session counts; only a "this session" record reads the total.
     live: Mutex<Live>,
+    /// "This session" guests the startup sweep kept because they may play on a seat, and whether
+    /// a seat was seen to list them. [`Self::take_kept_at_start`] hands them out once.
+    kept_at_start: Mutex<Vec<(String, bool)>>,
 }
 
 /// Session counts and last-out generations behind one lock so a reconnect cannot
@@ -152,8 +155,21 @@ impl NativePairing {
         arm_at_start: bool,
     ) -> Result<NativePairing> {
         let store = store::TrustStore::open(store_path)?;
+        let np = NativePairing::with_store(store, fixed_pin, arm_at_start);
+        // A host with no seats answers `Some(false)`, and a seat host's read-only store never
+        // sweeps. The door, and a Windows host with seats on, ask the seat hosts for 10 s at most.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        np.drop_session_only_records(|fp| crate::seats::plays_on_a_seat_by(fp, deadline));
+        Ok(np)
+    }
+
+    fn with_store(
+        store: store::TrustStore,
+        fixed_pin: Option<String>,
+        arm_at_start: bool,
+    ) -> NativePairing {
         let refused = pf_paths::seat::pairing_refused() || store.read_only();
-        let np = NativePairing {
+        NativePairing {
             arm: arming::ArmState::new(arm_at_start && !refused, fixed_pin),
             store,
             approval: approval::ApprovalQueue::new(),
@@ -162,21 +178,36 @@ impl NativePairing {
                 counts: HashMap::new(),
                 last_out: HashMap::new(),
             }),
-        };
-        np.drop_session_only_records();
-        Ok(np)
+            kept_at_start: Mutex::new(Vec::new()),
+        }
     }
 
-    /// A host that is starting has no live sessions, so every "this session" grant has already
-    /// ended — by a restart, an update or a crash, which is how a session usually ends. The
-    /// counter is in memory only, so without this sweep those records would outlive the guest
-    /// forever and the list would keep exactly the leftover the grant exists to prevent.
-    fn drop_session_only_records(&self) {
+    /// A host that is starting has no live sessions of its own, so a "this session" grant has
+    /// ended with the restart, an update or a crash. The counter is in memory only, so without
+    /// this sweep the record would outlive the guest.
+    ///
+    /// A guest on a seat outlives the box's host: the seat hosts end a guest whose record is
+    /// gone. `on_seat` says whether the device plays there; unless it answers `Some(false)` the
+    /// record stays, and [`Self::take_kept_at_start`] names the guest for a hold.
+    fn drop_session_only_records(&self, on_seat: impl Fn(&str) -> Option<bool>) {
         if self.store.read_only() {
             return;
         }
         for client in self.store.list() {
             if !client.until_disconnect {
+                continue;
+            }
+            let seen = on_seat(&client.fingerprint);
+            if seen != Some(false) {
+                tracing::info!(
+                    name = %client.name,
+                    fingerprint = %client.fingerprint,
+                    "kept a this-session grant: its device may still play on a seat"
+                );
+                self.kept_at_start
+                    .lock()
+                    .unwrap()
+                    .push((client.fingerprint, seen == Some(true)));
                 continue;
             }
             match self.store.remove(&client.fingerprint) {
@@ -193,6 +224,11 @@ impl NativePairing {
                 ),
             }
         }
+    }
+
+    /// The guests the startup sweep kept, with whether a seat was seen to list each, once.
+    pub fn take_kept_at_start(&self) -> Vec<(String, bool)> {
+        std::mem::take(&mut *self.kept_at_start.lock().unwrap())
     }
 
     /// Arm with a fresh PIN for `ttl`, unbound (any well-formed attempt consumes it) and with
@@ -398,6 +434,24 @@ impl NativePairing {
         });
     }
 
+    /// Whether the store is the box's file, which another process writes.
+    pub fn follows_box(&self) -> bool {
+        self.store.read_only()
+    }
+
+    /// Publishes every watched fingerprint from the store as it is now. A seat host's store is
+    /// the box's file, so its edits arrive here and not through a mutator. A file that is missing
+    /// or garbled says nothing, so a glitch in the copy doesn't end every session.
+    pub fn republish_watched(&self) {
+        if !self.store.readable() {
+            return;
+        }
+        let watched: Vec<String> = self.access_watch.lock().unwrap().keys().cloned().collect();
+        for fp_hex in watched {
+            self.publish_current(&fp_hex);
+        }
+    }
+
     pub fn list(&self) -> Vec<PairedClient> {
         self.store.list()
     }
@@ -428,6 +482,11 @@ impl NativePairing {
             np: self.clone(),
             fp_hex: fp_hex.to_ascii_lowercase(),
         }
+    }
+
+    /// Whether `fp_hex` holds a "this session" record, which ends with its last session.
+    pub fn is_session_only(&self, fp_hex: &str) -> bool {
+        self.store.get(fp_hex).is_some_and(|c| c.until_disconnect)
     }
 
     /// Live sessions for `fp_hex` right now.
@@ -463,6 +522,10 @@ impl NativePairing {
     /// this waiter share the `live` lock so a reconnect cannot land between the live
     /// check and the remove. Lock order is live → store → watch.
     async fn drop_session_only_after_grace(&self, fp_hex: &str, last_out: u64) {
+        // A seat host reads the box's store; the box drops the record.
+        if self.store.read_only() {
+            return;
+        }
         tokio::time::sleep(RECONNECT_GRACE).await;
         let removed = {
             let live = self.live.lock().unwrap();
@@ -1156,6 +1219,46 @@ mod tests {
         );
     }
 
+    /// A guest on a seat outlives the box's host, and the seat hosts end a guest whose record is
+    /// gone. The sweep keeps the record of a device a seat lists, or one no seat could rule out,
+    /// and drops the rest.
+    #[test]
+    fn a_restart_keeps_this_session_grants_of_guests_on_a_seat() {
+        use punktfunk_core::quic::GRANT_GAMEPAD;
+        let (_temp, path) = temp();
+        {
+            let np = NativePairing::load_with(Some(path.clone()), None, false).unwrap();
+            for (name, fp) in [("On seat", "dd11"), ("Unknown", "ee22"), ("Gone", "ff33")] {
+                let access = Access {
+                    grants: GRANT_GAMEPAD,
+                    expires_unix: None,
+                    until_disconnect: true,
+                };
+                np.add_with_access(name, fp, Some(access)).unwrap();
+            }
+        }
+
+        let restarted = NativePairing::with_store(store::TrustStore::at(path, false), None, false);
+        restarted.drop_session_only_records(|fp| match fp {
+            "dd11" => Some(true),
+            "ee22" => None,
+            _ => Some(false),
+        });
+        assert!(restarted.is_paired("dd11"), "a seat lists the guest");
+        assert!(
+            restarted.is_paired("ee22"),
+            "a silent seat may hold the guest"
+        );
+        assert!(!restarted.is_paired("ff33"), "no seat has the guest");
+        let mut kept = restarted.take_kept_at_start();
+        kept.sort();
+        assert_eq!(
+            kept,
+            [("dd11".to_string(), true), ("ee22".to_string(), false)]
+        );
+        assert!(restarted.take_kept_at_start().is_empty(), "handed out once");
+    }
+
     /// The address table the admission rules read. Anything not on a network the operator
     /// already let the peer onto is WAN, and an address we could not read is WAN too.
     #[test]
@@ -1576,6 +1679,68 @@ mod tests {
         assert_eq!(rx.borrow().grants, GRANT_ALL);
 
         assert!(np.subscribe("zz99").borrow().revoked);
+    }
+
+    /// A later mtime than the seat's read, whatever the filesystem's clock granularity.
+    fn later_mtime(path: &std::path::Path, secs: u64) {
+        let later = std::time::SystemTime::now() + Duration::from_secs(secs);
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(later).unwrap();
+    }
+
+    /// A box file that is missing or garbled says nothing: the seat's sessions stay until the
+    /// box's list reads again, and an empty list is an answer.
+    #[test]
+    fn a_seat_hosts_watch_ignores_a_box_file_it_cannot_read() {
+        let (_temp, p) = temp();
+        let box_np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
+        box_np.add("Living Room", "ff67").unwrap();
+        let seat = NativePairing::with_store(store::TrustStore::at(p.clone(), true), None, false);
+        let rx = seat.subscribe("ff67");
+
+        std::fs::write(&p, b"{").unwrap();
+        later_mtime(&p, 5);
+        seat.republish_watched();
+        assert!(!rx.borrow().revoked, "a garbled file says nothing");
+        std::fs::remove_file(&p).unwrap();
+        seat.republish_watched();
+        assert!(!rx.borrow().revoked, "a missing file says nothing");
+
+        box_np.remove("ff67").unwrap();
+        later_mtime(&p, 10);
+        seat.republish_watched();
+        assert!(rx.borrow().revoked, "an empty list is the box's answer");
+    }
+
+    /// A seat host's store is the box's file, edited in another process: a live subscriber hears
+    /// a narrowed grant and an unpair once the watcher republishes.
+    #[test]
+    fn a_seat_hosts_watch_hears_the_boxes_edits() {
+        use punktfunk_core::quic::GRANT_GAMEPAD;
+        let (_temp, p) = temp();
+        let box_np = NativePairing::load_with(Some(p.clone()), None, false).unwrap();
+        box_np.add("Living Room", "ff66").unwrap();
+        let seat = NativePairing::with_store(store::TrustStore::at(p.clone(), true), None, false);
+        assert!(seat.follows_box());
+        let rx = seat.subscribe("ff66");
+        assert_eq!(rx.borrow().grants, GRANT_ALL);
+
+        let stamp = |secs| later_mtime(&p, secs);
+        let narrow = Access {
+            grants: GRANT_GAMEPAD,
+            expires_unix: None,
+            until_disconnect: false,
+        };
+        box_np.set_access("ff66", narrow).unwrap();
+        stamp(5);
+        assert_eq!(rx.borrow().grants, GRANT_ALL, "nobody publishes by itself");
+        seat.republish_watched();
+        assert_eq!(rx.borrow().grants, GRANT_GAMEPAD);
+
+        box_np.remove("ff66").unwrap();
+        stamp(10);
+        seat.republish_watched();
+        assert!(rx.borrow().revoked);
     }
 
     /// Absent Moonlight record = ungoverned full control (the GameStream cert list is

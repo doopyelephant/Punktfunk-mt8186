@@ -8,8 +8,9 @@
 //!
 //! Start blocks until the keeper's session is active, the same-session SDR quality gate
 //! has passed and the host holds both ports. A cycle that ends closes the keeper's job
-//! and logs off only the session it recorded. Explicit stop is idempotent and waits for
-//! that teardown to finish.
+//! and logs off the account's session. Explicit stop is idempotent and waits for
+//! that teardown to finish. A service that died leaves the sessions of children that broke
+//! away from the job; the first look at each seat logs them off.
 
 use crate::bootstrap::RdpBootstrap;
 use crate::model::{RuntimeStatus, Seat};
@@ -21,7 +22,7 @@ use crate::windows::rdp;
 use crate::windows::util::{backend_error, io_error, port_open, udp_port_owners, WinResult};
 use crate::windows::wts;
 use rand::Rng as _;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -36,6 +37,8 @@ pub(super) struct Supervisor {
     accounts: AccountManager,
     host_path: PathBuf,
     runtimes: Arc<Mutex<HashMap<String, Arc<Runtime>>>>,
+    /// The seats whose account [`Self::sweep_leftovers`] has looked at.
+    swept: Arc<Mutex<HashSet<String>>>,
 }
 
 struct Runtime {
@@ -88,6 +91,7 @@ impl Supervisor {
             accounts,
             host_path,
             runtimes: Arc::new(Mutex::new(HashMap::new())),
+            swept: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -128,15 +132,9 @@ impl Supervisor {
         }
         let _ = rdp::load_pin(&self.root)?;
         let _ = self.accounts.credential_for_start(seat)?;
-        if let Some(session) = wts::active_for_account(&seat.account)? {
-            return Err(backend_error(
-                "wts_unmanaged_active",
-                format!(
-                    "account '{}' already has active non-console session {}",
-                    seat.account, session.id
-                ),
-            ));
-        }
+        // No runtime of ours holds this seat, so a session left on its account is an orphan of
+        // a supervisor that died. Its host would still hold the seat's ports.
+        wts::logoff_account_if_present(&seat.account)?;
         ensure_ports_free(seat)?;
 
         let runtime = {
@@ -210,7 +208,7 @@ impl Supervisor {
             .get(&key)
             .cloned();
         let Some(runtime) = runtime else {
-            wts::logoff_account_if_present(&seat.account)?;
+            self.logoff_owned(seat)?;
             return Ok(RuntimeStatus::stopped());
         };
         runtime.step(Observation::Stop);
@@ -256,6 +254,46 @@ impl Supervisor {
             super::steam::restore_registration();
         }
         Ok(RuntimeStatus::stopped())
+    }
+
+    /// Logs off `seat`'s account for a caller that holds no runtime of it, so nothing here
+    /// proved the account is the seat's. A stranger's account of that name keeps its sessions.
+    fn logoff_owned(&self, seat: &Seat) -> WinResult<usize> {
+        self.accounts.ensure_owned_or_absent(seat)?;
+        wts::logoff_account_if_present(&seat.account)
+    }
+
+    /// Logs off what a service that died left in `seat`'s account: a child that broke away from
+    /// the job outlives it, in a disconnected session. The first look at a seat this process
+    /// doesn't run does it, and the service's ledger lock keeps a start from overlapping it.
+    pub(super) fn sweep_leftovers(&self, seat: &Seat) {
+        if !self.claim_sweep(seat) {
+            return;
+        }
+        match self.logoff_owned(seat) {
+            Ok(0) => {}
+            Ok(sessions) => {
+                tracing::info!(seat = %seat.id, sessions, "leftover seat session logged off");
+            }
+            Err(cause) => {
+                tracing::warn!(seat = %seat.id, %cause, "leftover seat session not logged off");
+            }
+        }
+    }
+
+    /// `true` once per seat, and only while no runtime of ours holds it.
+    fn claim_sweep(&self, seat: &Seat) -> bool {
+        let held = self
+            .runtimes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .contains_key(seat.id.as_str());
+        !held
+            && self
+                .swept
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(seat.id.to_string())
     }
 
     pub(super) fn status(&self, seat: &Seat) -> RuntimeSnapshot {
@@ -345,9 +383,10 @@ struct Rig {
     accounts: AccountManager,
     host_path: PathBuf,
     seat: Seat,
-    /// The keeper, then the job that contains it: they drop in that order.
+    /// The keeper, then the job that contains it and the session children: they drop in that
+    /// order.
     keeper: Option<(ChildProcess, Job)>,
-    /// The account's session, which the end of the cycle logs off.
+    /// The account's active session, which the cycle's children start in.
     session: Option<u32>,
     launch: Option<Launch>,
     gate: Option<GateRun>,
@@ -447,6 +486,7 @@ impl Rig {
 
     fn start_keeper(&mut self) -> WinResult<()> {
         let pin = rdp::load_pin(&self.root)?;
+        rdp::require_live(&self.host_path, pin)?;
         let credential = self.accounts.credential_for_start(&self.seat)?;
         let bootstrap =
             RdpBootstrap::new(self.seat.account.clone(), credential.copy_zeroizing(), pin)
@@ -455,7 +495,13 @@ impl Rig {
                 })?;
         let job = Job::new()?;
         let keeper_exe = super::keeper::keeper_path(&self.host_path);
-        let keeper = process::spawn_keeper(&job, &keeper_exe, &bootstrap)?;
+        let log = self
+            .root
+            .open_child_dir("hosts")
+            .and_then(|hosts| hosts.open_child_dir(self.seat.id.as_str()))
+            .and_then(|root| root.child_path("host.log"))
+            .map_err(|error| io_error("seat_log", "resolve the seat log", error))?;
+        let keeper = process::spawn_keeper(&job, &keeper_exe, &bootstrap, &log)?;
         self.keeper = Some((keeper, job));
         Ok(())
     }
@@ -515,6 +561,7 @@ impl Rig {
     /// seat's session. It extends the display instead of isolating it.
     fn start_gate(&mut self) -> WinResult<()> {
         let (session, launch) = self.launch()?;
+        let job = self.keeper.as_ref().map(|(_, job)| job);
         let environment = process::seat_environment(
             launch.host_root.path(),
             &self.seat,
@@ -556,6 +603,7 @@ impl Rig {
         .chain(std::iter::once(output.as_os_str().to_owned()))
         .collect::<Vec<_>>();
         let spawned = process::spawn_in_session(
+            job,
             session,
             &self.host_path,
             &arguments,
@@ -609,6 +657,7 @@ impl Rig {
     fn start_host(&mut self) -> WinResult<()> {
         let (session, launch) = self.launch()?;
         let host = process::spawn_in_session(
+            self.keeper.as_ref().map(|(_, job)| job),
             session,
             &self.host_path,
             &[OsString::from("serve")],
@@ -621,7 +670,8 @@ impl Rig {
     }
 
     /// End the cycle in this order: the host and the gate, the keeper and its job, then
-    /// the session. A session child ends when its handle drops.
+    /// the account's session. A session child ends when its handle drops. The session is found
+    /// by account: Windows reuses the id this cycle recorded.
     fn end_cycle(&mut self) {
         self.host = None;
         if let (Some(gate), Some(launch)) = (self.gate.take(), &self.launch) {
@@ -630,13 +680,27 @@ impl Rig {
         }
         self.launch = None;
         self.keeper = None;
-        if let Some(session) = self.session.take() {
-            let _ = wts::logoff(session);
+        self.session = None;
+        if let Err(error) = wts::logoff_account_if_present(&self.seat.account) {
+            tracing::warn!(seat = %self.seat.id, %error, "seat session not logged off");
         }
     }
 }
 
+/// How long a logged-off session's last process gets to let go of the seat's ports.
+const PORT_RELEASE: Duration = Duration::from_secs(3);
+
 fn ensure_ports_free(seat: &Seat) -> WinResult<()> {
+    let give_up = Instant::now() + PORT_RELEASE;
+    loop {
+        match check_ports_free(seat) {
+            Err(_) if Instant::now() < give_up => std::thread::sleep(Duration::from_millis(100)),
+            result => return result,
+        }
+    }
+}
+
+fn check_ports_free(seat: &Seat) -> WinResult<()> {
     let native = seat.native_port;
     if let Some(pid) = udp_port_owners(native).first() {
         return Err(backend_error(
@@ -652,4 +716,108 @@ fn ensure_ports_free(seat: &Seat) -> WinResult<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::SeatId;
+    use crate::windows::credentials::CredentialStore;
+    use crate::windows::util;
+    use std::path::Path;
+
+    fn seat(account: &str) -> Seat {
+        Seat {
+            id: SeatId::random(),
+            name: "test".into(),
+            account: account.into(),
+            display_slot: 12,
+            native_port: 9779,
+            mgmt_port: 47995,
+            autostart: false,
+            runtime: RuntimeStatus::stopped(),
+            owner: false,
+            fingerprint: None,
+        }
+    }
+
+    fn supervisor(dir: &Path) -> Supervisor {
+        let root = SecretRoot::open(dir).unwrap();
+        let accounts = AccountManager::new(CredentialStore::new(root.clone()));
+        Supervisor::new(
+            root,
+            accounts,
+            PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+        )
+    }
+
+    /// A local account no seat made, removed when dropped.
+    struct Stranger(String);
+
+    impl Stranger {
+        fn add(name: &str) -> Self {
+            // Fourteen characters: a longer password makes `net user` ask a question.
+            let mut random = [0_u8; 5];
+            rand::rng().fill_bytes(&mut random);
+            let password = format!("Aa1!{}", hex::encode(random));
+            let added = std::process::Command::new(pf_paths::system32("net.exe"))
+                .args(["user", name, &password, "/add", "/comment:not a seat"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                added.status.success(),
+                "net user /add: {}",
+                String::from_utf8_lossy(&added.stdout)
+            );
+            Self(name.into())
+        }
+    }
+
+    impl Drop for Stranger {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(pf_paths::system32("net.exe"))
+                .args(["user", &self.0, "/delete"])
+                .output();
+        }
+    }
+
+    /// A stop with no runtime logs off only an account that is the seat's or is not there.
+    /// It needs LocalSystem to make an account, so it runs nowhere else.
+    #[test]
+    fn a_stop_leaves_a_strangers_account_alone() {
+        if !util::is_local_system().unwrap_or(false) {
+            eprintln!("skipped: not LocalSystem");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(temp.path());
+        let name = format!("pfs{}", std::process::id());
+        let _stranger = Stranger::add(&name);
+        let refused = supervisor.stop(&seat(&name)).unwrap_err();
+        assert_eq!(refused.code, "account_not_owned");
+        assert!(supervisor.stop(&seat("pfs-absent")).is_ok());
+    }
+
+    /// The sweep looks at a seat once, and not while a runtime of ours holds it.
+    #[test]
+    fn a_seat_is_swept_once_and_not_while_it_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let supervisor = supervisor(temp.path());
+        let idle = seat("pfs-idle");
+        assert!(supervisor.claim_sweep(&idle));
+        assert!(!supervisor.claim_sweep(&idle));
+
+        let running = seat("pfs-running");
+        let runtime = Arc::new(Runtime::new(running.account.clone()));
+        let key = running.id.to_string();
+        supervisor
+            .runtimes
+            .lock()
+            .unwrap()
+            .insert(key.clone(), runtime);
+        assert!(!supervisor.claim_sweep(&running));
+        supervisor.runtimes.lock().unwrap().remove(&key);
+        assert!(supervisor.claim_sweep(&running));
+    }
 }
