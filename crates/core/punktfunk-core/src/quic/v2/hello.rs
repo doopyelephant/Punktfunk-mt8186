@@ -502,7 +502,7 @@ mod tests {
                     max_cll: p[3],
                     max_fall: p[2],
                 }),
-                // `CLIENT_CAP_EXT`'s neighbour 0x80 is the last free bit; any byte works.
+                // Any byte works: an unknown bit rides through.
                 client_caps: c.1,
                 max_shard_payload: c.2,
                 audio_rate_hz: c.3,
@@ -704,7 +704,7 @@ mod tests {
                 video_codecs: CODEC_HEVC,
                 preferred_codec: 0,
                 display_hdr: None,
-                client_caps: CLIENT_CAP_EXT,
+                client_caps: 0x40,
                 max_shard_payload: 1408,
                 audio_rate_hz: crate::audio::SAMPLE_RATE_HZ,
                 audio_bits: crate::audio::pcm::BITS_16,

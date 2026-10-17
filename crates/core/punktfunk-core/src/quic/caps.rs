@@ -122,10 +122,6 @@ pub const CLIENT_CAP_AUDIO_HIRES: u8 = 0x10;
 /// host-global wiring, so any live session that asked wins until it ends.
 pub const CLIENT_CAP_KEEP_HOST_AUDIO: u8 = 0x20;
 
-/// [`Hello::client_caps`]: every client sets it; it gates nothing on `punktfunk/2`.
-/// `0x80` is the last free `client_caps` bit.
-pub const CLIENT_CAP_EXT: u8 = 0x40;
-
 /// [`Welcome::host_caps`]: the session is on the lossless audio plane
 /// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). A wire statement, not
 /// an offer: the client must open from
@@ -352,7 +348,8 @@ mod tests {
                 ("CLIENT_CAP_PAD_AUDIO", CLIENT_CAP_PAD_AUDIO),
                 ("CLIENT_CAP_AUDIO_HIRES", CLIENT_CAP_AUDIO_HIRES),
                 ("CLIENT_CAP_KEEP_HOST_AUDIO", CLIENT_CAP_KEEP_HOST_AUDIO),
-                ("CLIENT_CAP_EXT", CLIENT_CAP_EXT),
+                // Retired: older clients still set it, so the bit stays spent. 0x80 is free.
+                ("retired CLIENT_CAP_EXT", 0x40),
             ],
         ),
         (

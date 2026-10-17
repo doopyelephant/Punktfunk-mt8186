@@ -784,10 +784,6 @@
 // host-global wiring, so any live session that asked wins until it ends.
 #define PUNKTFUNK_CLIENT_CAP_KEEP_HOST_AUDIO 32
 
-// [`Hello::client_caps`]: every client sets it; it gates nothing on `punktfunk/2`.
-// `0x80` is the last free `client_caps` bit.
-#define PUNKTFUNK_CLIENT_CAP_EXT 64
-
 // [`Welcome::host_caps`]: the session is on the lossless audio plane
 // ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). A wire statement, not
 // an offer: the client must open from
