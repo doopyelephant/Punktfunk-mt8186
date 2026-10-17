@@ -1346,6 +1346,61 @@ mod wire_equivalence_tests {
         }
     }
 
+    /// Time to the first and the last packet of a sealed frame at the wire shard size, the
+    /// chunk pipeline against the whole-frame seal. A timing, not a check:
+    /// `cargo test -p punktfunk-core --release --features quic --lib -- --ignored seal_latency --nocapture`
+    /// Each chunk hand-off parks and wakes a thread: below the [`SEAL_CHUNK_SHARDS`] floor
+    /// the pipeline's last packet leaves later than the whole seal's, not earlier.
+    #[test]
+    #[ignore = "prints a timing"]
+    fn seal_latency_chunked_against_whole() {
+        let cfg = Config {
+            role: Role::Host,
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 20,
+                max_data_per_block: 64,
+            },
+            shard_payload: 1408,
+            max_frame_bytes: 8 * 1024 * 1024,
+            loopback_drop_period: 0,
+        };
+        let frame = pattern(512 * 1024);
+        let n = 500u32;
+        let mut chunked = host_session(cfg.clone(), true);
+        let (mut first, mut last) = (0u128, 0u128);
+        for i in 0..n {
+            let t0 = std::time::Instant::now();
+            let mut t_first = None;
+            chunked
+                .seal_frame_chunks_at(&frame, u64::from(i), 0, i, &mut |chunk, send| {
+                    t_first.get_or_insert_with(|| t0.elapsed());
+                    let refs: Vec<&[u8]> = chunk.iter().map(|b| b.as_slice()).collect();
+                    send(&refs).map(|_| ())
+                })
+                .unwrap();
+            last += t0.elapsed().as_nanos();
+            first += t_first.expect("the sink ran").as_nanos();
+        }
+        let per = |ns: u128| ns as f64 / 1000.0 / f64::from(n);
+        println!(
+            "chunked: first packet {:.1} us, last {:.1} us",
+            per(first),
+            per(last)
+        );
+        let mut whole = host_session(cfg, true);
+        let mut total = 0u128;
+        for i in 0..n {
+            let t0 = std::time::Instant::now();
+            let wires = whole.seal_frame_at(&frame, u64::from(i), 0, i).unwrap();
+            let refs: Vec<&[u8]> = wires.iter().map(|b| b.as_slice()).collect();
+            whole.send_sealed(&refs).unwrap();
+            total += t0.elapsed().as_nanos();
+            whole.reclaim_wires(wires);
+        }
+        println!("whole: first and last packet {:.1} us", per(total));
+    }
+
     /// A windowed PyroWave AU seals as a head block with all the parity and tail blocks with
     /// none: a lost head shard is rebuilt, a lost tail shard leaves only its window empty, and
     /// the partial carries everything else intact.
