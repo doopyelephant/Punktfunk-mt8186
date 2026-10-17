@@ -634,7 +634,7 @@ async fn session(mut args: Args) -> Result<()> {
     let suite = server.suite.context("unsealed native media")?;
     let keys =
         endpoint::media_keys(&quic, &server.session_id, suite).context("native media keys")?;
-    shared.stats().set_host(quic.remote_address());
+    shared.set_host(quic.remote_address());
     let media = (
         shared,
         punktfunk_core::session::MediaV2 {
