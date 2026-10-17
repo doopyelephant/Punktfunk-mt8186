@@ -1439,8 +1439,8 @@ impl Feeder {
 /// The `pf-decode-feed` thread: block on the connector for the next access unit so the async loop
 /// never has to. Drops what core refuses, stamps `last_gap_ns` on a loss gap, stamps receipt for
 /// the decode stage (the connector already noted it for the overlay), then hands the AU to the
-/// loop via the event channel. Exits when `shutdown` is set, the session closes, or the loop's
-/// receiver is gone.
+/// loop via the event channel. Registers with ADPF: a stall here is a late frame. Exits when
+/// `shutdown` is set, the session closes, or the loop's receiver is gone.
 fn feeder_loop(
     client: Arc<NativeClient>,
     stats: Arc<crate::stats::VideoStats>,
@@ -1450,6 +1450,7 @@ fn feeder_loop(
     ev_tx: mpsc::Sender<DecodeEvent>,
     last_gap_ns: Arc<AtomicI64>,
 ) {
+    client.register_hot_thread();
     let mut refused = None;
     while !shutdown.load(Ordering::Relaxed) {
         match client.next_frame(Duration::from_millis(5)) {
