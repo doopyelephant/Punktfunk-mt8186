@@ -16,7 +16,8 @@
 //! ([`Head`], [`Reply`]). Nothing here parses HTTP, so there is no parser to smuggle past.
 //!
 //! A native `punktfunk/2` connection whose streams are typed management ([`serve_quic`]) gets the
-//! same router and the same authority, each request after its stream type.
+//! same router, each request after its stream type. Its requests carry the client certificate its
+//! handshake proved, so a paired device has the authority it has over HTTPS with that certificate.
 
 use super::Serving;
 use crate::https::{LocalAddr, PeerAddr, PeerCertFingerprint};
@@ -156,7 +157,7 @@ pub(crate) async fn tunnel(
             Err(_) => continue,
         };
         let permit = streams.clone().try_acquire_owned().ok();
-        tokio::spawn(answer(permit, rx, tx, router.clone(), peer, local));
+        tokio::spawn(answer(permit, rx, tx, router.clone(), peer, local, None));
     }
 }
 
@@ -191,8 +192,10 @@ pub(crate) async fn tunnel_quic(
 ) -> Result<()> {
     use punktfunk_core::quic::v2::{io, registry};
     let peer = conn.remote_address();
+    // The certificate the QUIC handshake proved, as the HTTPS listener reads its own.
+    let fingerprint = punktfunk_core::quic::endpoint::peer_fingerprint(&conn).map(hex::encode);
     let streams = Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS));
-    tracing::info!(%peer, "management connection open");
+    tracing::info!(%peer, paired_lane = fingerprint.is_some(), "management connection open");
     let mut next = Some((first, true));
     loop {
         let ((mut tx, mut rx), typed) = match next.take() {
@@ -210,6 +213,7 @@ pub(crate) async fn tunnel_quic(
         };
         let permit = streams.clone().try_acquire_owned().ok();
         let router = router.clone();
+        let fingerprint = fingerprint.clone();
         tokio::spawn(async move {
             if !typed {
                 let ty = tokio::time::timeout(REQUEST_TIMEOUT, io::read_stream_type(&mut rx)).await;
@@ -219,13 +223,13 @@ pub(crate) async fn tunnel_quic(
                     return;
                 }
             }
-            answer(permit, rx, tx, router, peer, local).await;
+            answer(permit, rx, tx, router, peer, local, fingerprint).await;
         });
     }
 }
 
 /// One stream's request answered: refused without a `permit` (the in-flight cap), timed out,
-/// or dispatched.
+/// or dispatched with the client certificate its connection proved, if any.
 async fn answer<R, W>(
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     mut rx: R,
@@ -233,13 +237,14 @@ async fn answer<R, W>(
     router: Router,
     peer: SocketAddr,
     local: SocketAddr,
+    fingerprint: Option<String>,
 ) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let response = match permit {
         Some(_held) => match tokio::time::timeout(REQUEST_TIMEOUT, read_request(&mut rx)).await {
-            Ok(Ok((head, body))) => dispatch(&router, peer, local, head, body).await,
+            Ok(Ok((head, body))) => dispatch(&router, peer, local, fingerprint, head, body).await,
             Ok(Err(refusal)) => refusal,
             Err(_) => api_error(
                 StatusCode::REQUEST_TIMEOUT,
@@ -295,12 +300,14 @@ async fn read_request<R: AsyncRead + Unpin>(rx: &mut R) -> Result<(Head, Vec<u8>
 /// Refused here, before the router: a method other than `GET` or `POST`, a path outside
 /// `/api/v1/` or under `/api/v1/local/` (the position-authenticated lane, which a LAN peer must
 /// never reach), and any header a browser's `fetch` could not have sent. What passes is
-/// stamped like a request off the plain listener — the peer, the bound address, no client
-/// certificate — so `require_auth` judges it as the LAN request it is.
+/// stamped like a request off the HTTPS listener — the peer, the bound address, and the client
+/// certificate its connection proved (`fingerprint`, hex), never one a request could name — so
+/// `require_auth` judges it as that request.
 pub(crate) async fn dispatch(
     router: &Router,
     peer: SocketAddr,
     local: SocketAddr,
+    fingerprint: Option<String>,
     head: Head,
     body: Vec<u8>,
 ) -> Response {
@@ -338,7 +345,8 @@ pub(crate) async fn dispatch(
     };
     req.extensions_mut().insert(PeerAddr(peer));
     req.extensions_mut().insert(LocalAddr(local));
-    req.extensions_mut().insert(PeerCertFingerprint(None));
+    req.extensions_mut()
+        .insert(PeerCertFingerprint(fingerprint));
     let status_of = |r: &Response| r.status().as_u16();
     let response = router.clone().oneshot(req).await.expect("infallible");
     tracing::debug!(%peer, method = %head.m, path = %head.p, status = status_of(&response), "tunnelled");
@@ -565,7 +573,7 @@ mod tests {
             .map(|(n, v)| (n.to_string(), v.to_string()))
             .collect(),
         };
-        let res = dispatch(&router, lan, plane, head, Vec::new()).await;
+        let res = dispatch(&router, lan, plane, None, head, Vec::new()).await;
         assert_eq!(res.status(), StatusCode::OK);
         let body = res.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(
@@ -578,7 +586,7 @@ mod tests {
             p: "/api/v1/seen".into(),
             h: vec![("authorization".into(), "Bearer\r\nX: y".into())],
         };
-        let res = dispatch(&router, lan, plane, bad, Vec::new()).await;
+        let res = dispatch(&router, lan, plane, None, bad, Vec::new()).await;
         assert_eq!(
             res.status(),
             StatusCode::BAD_REQUEST,
@@ -686,12 +694,22 @@ mod tests {
     }
 
     /// A native client on a `punktfunk/2` management connection: the first stream and a later
-    /// one are answered, and a stream of another type is stopped unanswered.
+    /// one are answered, a stream of another type is stopped unanswered, and every request
+    /// carries the certificate the client's handshake proved.
     #[tokio::test]
     async fn a_native_client_reaches_the_router_over_a_management_connection() {
         use punktfunk_core::quic::endpoint;
         use punktfunk_core::quic::v2::{io, registry};
-        let router = Router::new().route("/api/v1/health", get(|| async { "ok" }));
+        let router = Router::new()
+            .route("/api/v1/health", get(|| async { "ok" }))
+            .route(
+                "/api/v1/whoami",
+                get(
+                    |axum::Extension(fp): axum::Extension<PeerCertFingerprint>| async move {
+                        fp.0.unwrap_or_else(|| "none".into())
+                    },
+                ),
+            );
         let (cert, key) = endpoint::generate_identity().unwrap();
         let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (server, _media) = endpoint::server_shared(
@@ -710,27 +728,41 @@ mod tests {
             assert_eq!(ty, registry::STREAM_MANAGEMENT);
             let _ = tunnel_quic(conn, (tx, rx), router, bind).await;
         });
-        let (client, _) = endpoint::client_shared(None, None, &[registry::ALPN]);
+        let (me_cert, me_key) = endpoint::generate_identity().unwrap();
+        let (client, _) =
+            endpoint::client_shared(None, Some((&me_cert, &me_key)), &[registry::ALPN]);
         let (client, _media) = client.unwrap();
         let conn = client.connect(bind, "punktfunk").unwrap().await.unwrap();
-        let call = |ty: u64| {
+        let call = |ty: u64, path: &'static str| {
             let conn = conn.clone();
             async move {
                 let (mut tx, mut rx) = conn.open_bi().await.unwrap();
                 io::write_stream_type(&mut tx, ty).await.unwrap();
-                tx.write_all(&frame(r#"{"m":"GET","p":"/api/v1/health"}"#, b""))
-                    .await
-                    .unwrap();
+                let head = format!(r#"{{"m":"GET","p":"{path}"}}"#);
+                tx.write_all(&frame(&head, b"")).await.unwrap();
                 let _ = tx.finish();
                 rx.read_to_end(1 << 20).await.map(|all| parse_reply(&all))
             }
         };
         for _ in 0..2 {
-            let (status, _, body) = call(registry::STREAM_MANAGEMENT).await.unwrap();
+            let (status, _, body) = call(registry::STREAM_MANAGEMENT, "/api/v1/health")
+                .await
+                .unwrap();
             assert_eq!((status, body.as_slice()), (200, b"ok".as_slice()));
         }
+        let (_, _, seen) = call(registry::STREAM_MANAGEMENT, "/api/v1/whoami")
+            .await
+            .unwrap();
+        let mine = hex::encode(endpoint::fingerprint_of_pem(&me_cert).unwrap());
+        assert_eq!(
+            seen,
+            mine.as_bytes(),
+            "the handshake's certificate, as HTTPS reads it"
+        );
         assert!(
-            call(registry::STREAM_TRANSFER).await.is_err(),
+            call(registry::STREAM_TRANSFER, "/api/v1/health")
+                .await
+                .is_err(),
             "a stream of another type is stopped"
         );
     }
