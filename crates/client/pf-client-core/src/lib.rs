@@ -155,7 +155,7 @@ pub mod library_layout;
 // Linux only: Windows ships inside the host installer, macOS through `clients/apple`.
 #[cfg(all(desktop, target_os = "linux"))]
 pub mod update;
-// OS clipboard bridge (`design/clipboard-and-file-transfer.md`). Session clients; Windows-real, stub elsewhere.
+// OS clipboard bridge for the session client (`design/clipboard-and-file-transfer.md`): Win32 or SDL3.
 #[cfg(desktop)]
 pub mod clipboard;
 // The decode ladder lives in pf-client-video; these keep the `video` and `video_*` paths.
