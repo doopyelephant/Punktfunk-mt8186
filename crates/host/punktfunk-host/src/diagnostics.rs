@@ -12,7 +12,7 @@
 //! Served by `mgmt/diagnostics.rs` on the authenticated admin lane. The unauthenticated
 //! loopback summary is counts only ([`Diagnostics::attention_counts`]).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{OnceLock, RwLock};
 use utoipa::ToSchema;
@@ -38,7 +38,7 @@ pub mod ids {
 
 /// Probe result. `Inapplicable` is not `Ok`: "never on this box" and "works here" are different
 /// answers on the troubleshooting page.
-#[derive(Serialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
     Ok,
@@ -55,7 +55,7 @@ impl CheckStatus {
 
 /// Weight of a non-ok status. Orthogonal to [`CheckStatus`]: a check can `warn` about something
 /// `critical` (degraded, not dead). The console sorts by both.
-#[derive(Serialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Info,
@@ -75,7 +75,7 @@ impl Severity {
 
 /// Operator action. Copy-paste only: the host is unprivileged and does not run the command.
 /// Joining `punktfunk` is opt-in — write on the vhci `attach` node materialises arbitrary USB.
-#[derive(Serialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
 pub struct Remedy {
     /// English fallback. The console overrides it by check id.
     pub text: String,
@@ -87,7 +87,7 @@ pub struct Remedy {
 
 /// Origin of a verdict. `Event` is for live feeds (push on transition); v1 emits `Startup` and
 /// `Refresh` only.
-#[derive(Serialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckSource {
     Startup,
@@ -96,7 +96,7 @@ pub enum CheckSource {
 }
 
 /// One health verdict — the wire shape.
-#[derive(Serialize, ToSchema, Clone, Debug)]
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct HostCheck {
     /// Console i18n key. See [`ids`].
     pub id: String,
@@ -195,13 +195,42 @@ impl HostCheck {
 }
 
 /// The `GET /diagnostics` body.
-#[derive(Serialize, ToSchema, Clone, Debug)]
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
 pub struct DiagnosticsReport {
     /// Last probe run, unix seconds.
     pub ran_at_unix: u64,
     /// Every registered check, worst-first, including `ok` and `inapplicable`. The console decides
     /// what to hide.
     pub checks: Vec<HostCheck>,
+}
+
+impl DiagnosticsReport {
+    /// One report from two hosts on one box: per id the verdict that says more (a problem over
+    /// `ok`, `ok` over `inapplicable`), and `other`'s on a tie.
+    pub fn merged(self, other: DiagnosticsReport) -> DiagnosticsReport {
+        let weight = |c: &HostCheck| match c.status {
+            CheckStatus::Inapplicable => 0,
+            CheckStatus::Ok => 1,
+            CheckStatus::Warn => 2,
+            CheckStatus::Fail => 3,
+        };
+        let mut by_id: BTreeMap<String, HostCheck> =
+            self.checks.into_iter().map(|c| (c.id.clone(), c)).collect();
+        for check in other.checks {
+            if by_id
+                .get(&check.id)
+                .is_none_or(|kept| weight(kept) <= weight(&check))
+            {
+                by_id.insert(check.id.clone(), check);
+            }
+        }
+        let mut checks: Vec<HostCheck> = by_id.into_values().collect();
+        checks.sort_by(|a, b| a.order_key().cmp(&b.order_key()));
+        DiagnosticsReport {
+            ran_at_unix: self.ran_at_unix.max(other.ran_at_unix),
+            checks,
+        }
+    }
 }
 
 type Probe = Box<dyn Fn() -> HostCheck + Send + Sync>;
@@ -346,6 +375,39 @@ mod tests {
             command: None,
             relogin_required: false,
         })
+    }
+
+    /// The door's report merged with the owner's: the owner's verdict where the door has none to
+    /// give, the door's own problem where the owner is fine, and every id either one names.
+    #[test]
+    fn a_merged_report_keeps_what_each_host_saw() {
+        let report = |checks| DiagnosticsReport {
+            ran_at_unix: 1,
+            checks,
+        };
+        let door = report(vec![
+            HostCheck::inapplicable("plugin_sandbox", "The door runs no plugins."),
+            fail("restart_pending"),
+            HostCheck::ok("server_conflict", "door"),
+            HostCheck::ok("door_only", "fine"),
+        ]);
+        let owner = report(vec![
+            fail("plugin_sandbox"),
+            HostCheck::ok("restart_pending", "fine"),
+            HostCheck::ok("server_conflict", "owner"),
+            HostCheck::inapplicable("owner_only", "n/a"),
+        ]);
+        let merged = door.merged(owner);
+        let get = |id: &str| merged.checks.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(get("plugin_sandbox").status, CheckStatus::Fail);
+        assert_eq!(get("restart_pending").status, CheckStatus::Fail);
+        assert_eq!(
+            get("server_conflict").summary,
+            "owner",
+            "a tie is the owner's"
+        );
+        assert_eq!(merged.checks.len(), 5);
+        assert_eq!(merged.checks[0].status, CheckStatus::Fail, "worst first");
     }
 
     #[test]
