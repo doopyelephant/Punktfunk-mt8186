@@ -123,8 +123,15 @@ fn frames(reader: impl std::io::BufRead) -> impl Iterator<Item = (String, String
     })
 }
 
-/// Hands each of this door's own events to the owner's host, for the owner's hooks. A host
-/// that is stopped or silent misses it: nothing waits, and nothing wakes the owner for a hook.
+/// The one relayed kind that wakes a stopped owner's session: someone is waiting on an answer.
+const WAKES: &str = "pairing.pending";
+
+/// How long a knock waits for the owner's host to come up before its hooks are skipped.
+const WAKE_WAIT: Duration = Duration::from_secs(120);
+
+/// Hands each of this door's own events to the owner's host, for the owner's hooks. A knock
+/// wakes a stopped owner's session and waits for its host; any other event a stopped or silent
+/// host misses.
 pub(crate) async fn relay_to_owner() {
     let mut rx = crate::events::bus().subscribe_live();
     loop {
@@ -139,28 +146,45 @@ pub(crate) async fn relay_to_owner() {
         let Ok(body) = serde_json::to_vec(&serde_json::json!({ "event": ev })) else {
             continue;
         };
+        let wakes = ev.kind.name() == WAKES;
         tokio::task::spawn_blocking(move || {
-            let ledger = super::ledger();
-            let Some(owner) = ledger.owner() else {
-                return;
-            };
-            if owner.runtime.state != pf_seats::RuntimeState::Running {
-                return;
-            }
-            let call = crate::mgmt::owner::Forwarded {
-                method: "POST".into(),
-                target: "events/relay".into(),
-                content_type: Some("application/json".into()),
-                body,
-                device: None,
-                stream: false,
-                start: false,
-            };
-            if super::forward(owner, call).is_none() {
-                tracing::debug!(
-                    kind = ev.kind.name(),
-                    "event not relayed to the owner's host"
-                );
+            let deadline = std::time::Instant::now() + WAKE_WAIT;
+            let mut asked = false;
+            loop {
+                let ledger = super::ledger();
+                let Some(owner) = ledger.owner() else { return };
+                if owner.runtime.state == pf_seats::RuntimeState::Running {
+                    let call = crate::mgmt::owner::Forwarded {
+                        method: "POST".into(),
+                        target: "events/relay".into(),
+                        content_type: Some("application/json".into()),
+                        body,
+                        device: None,
+                        stream: false,
+                        start: false,
+                    };
+                    if super::forward(owner, call).is_none() {
+                        tracing::debug!(
+                            kind = ev.kind.name(),
+                            "event not relayed to the owner's host"
+                        );
+                    }
+                    return;
+                }
+                if !wakes || std::time::Instant::now() >= deadline {
+                    return;
+                }
+                if !asked {
+                    asked = true;
+                    let started = super::call(pf_seats::ipc::Command::Start {
+                        id: owner.id.clone(),
+                    });
+                    if let Err(error) = started {
+                        tracing::warn!(code = ?error.code, "owner's session did not start for a knock: {}", error.message);
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(5));
             }
         });
     }
