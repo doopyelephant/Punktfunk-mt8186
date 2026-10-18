@@ -28,6 +28,7 @@ use crate::pic_h265::PlanToVkH265Error;
 use crate::session::SessionError;
 
 pub(crate) mod core;
+pub mod waiter;
 
 /// 5 s: longer than a real decode, finite against a wedged driver. Matches the
 /// encoder fence budget so session recovery is never parked forever.

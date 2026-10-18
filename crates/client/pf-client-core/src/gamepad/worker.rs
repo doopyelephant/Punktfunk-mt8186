@@ -415,8 +415,13 @@ impl Slot {
     }
 }
 
+/// The event a rumble update pushes to end the worker's wait; it carries nothing.
+struct RumbleWake;
+
 pub(super) struct Worker {
     subsystem: sdl3::GamepadSubsystem,
+    /// Handed to each attached session: a rumble update ends the event wait at once.
+    rumble_wake: Arc<dyn Fn() + Send + Sync>,
     pads_out: Arc<Mutex<Vec<PadInfo>>>,
     active_out: Arc<Mutex<Option<PadInfo>>>,
     /// Open only while a session is attached; opening grabs hardware.
@@ -1256,6 +1261,7 @@ impl Worker {
         loop {
             match ctl.try_recv() {
                 Ok(Ctl::Attach(c)) => {
+                    c.set_rumble_wake(self.rumble_wake.clone());
                     self.attached = Some(c);
                     self.reset_chord();
 
@@ -1780,6 +1786,8 @@ impl Worker {
     ) -> Worker {
         Worker {
             subsystem,
+            // A caller-pumped worker keeps this: its owner's loop drains rumble at its tick.
+            rumble_wake: Arc::new(|| {}),
             pads_out,
             active_out,
             slots: Vec::new(),
@@ -1826,6 +1834,13 @@ pub(super) fn run(
     let sdl = sdl3::init().map_err(|e| e.to_string())?;
     let subsystem = sdl.gamepad().map_err(|e| e.to_string())?;
     let mut pump = sdl.event_pump().map_err(|e| e.to_string())?;
+    // A rumble update pushes an event from the demux thread, so the wait below ends at
+    // once instead of at its timeout; the pass then drains the commands.
+    let events = sdl.event().map_err(|e| e.to_string())?;
+    events
+        .register_custom_event::<RumbleWake>()
+        .map_err(|e| e.to_string())?;
+    let sender = events.event_sender();
 
     let mut w = Worker::new(
         subsystem,
@@ -1836,6 +1851,9 @@ pub(super) fn run(
         menu_tx.clone(),
         chord_tx.clone(),
     );
+    w.rumble_wake = Arc::new(move || {
+        let _ = sender.push_custom_event(RumbleWake);
+    });
 
     loop {
         if !w.drain_ctl(ctl) {

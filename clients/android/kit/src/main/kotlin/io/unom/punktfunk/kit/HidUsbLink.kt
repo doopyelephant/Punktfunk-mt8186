@@ -12,6 +12,7 @@ import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.hardware.usb.UsbRequest
 import android.os.Build
+import android.os.Process
 import android.util.Log
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeoutException
@@ -269,6 +270,9 @@ class HidUsbLink(
      * never blocks on EP0, so input keeps flowing while a control transfer is in flight.
      */
     private fun readLoop(conn: UsbDeviceConnection, claims: List<Claim>) {
+        // The system's own input reader runs here; a default-priority thread queues behind
+        // the decoder's and the UI's work for the wake that carries a button edge.
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
         val live = claims.filter { c ->
             val req = UsbRequest()
             if (!req.initialize(conn, c.epIn)) {

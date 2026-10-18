@@ -405,6 +405,9 @@ struct FrameQueue {
     hold: Option<Hold>,
     /// Holds released by their frame completing, since the last [`FrameChannel::take_filled`].
     filled: u32,
+    /// A [`FrameChannel::kick`] no [`FrameChannel::pop`] has consumed: the next pop returns
+    /// at once instead of waiting, so a kick between two pops is never lost.
+    kicked: bool,
 }
 
 /// [`FrameChannel::hold`]: the frame a NACK is out for, how long it may take, and the
@@ -433,10 +436,18 @@ impl FrameChannel {
                 skipped_ever: 0,
                 hold: None,
                 filled: 0,
+                kicked: false,
             }),
             ready: Condvar::new(),
             consumer_seen: AtomicBool::new(false),
         }
+    }
+
+    /// Wake a waiting [`Self::pop`] with `Timeout`, or make the next one return at once: a
+    /// hardware decode finished, and the consumer has work besides frames.
+    pub(crate) fn kick(&self) {
+        self.inner.lock().unwrap().kicked = true;
+        self.ready.notify_one();
     }
 
     /// Whether anything has ever popped. False = no decoder yet: the pump holds
@@ -592,8 +603,9 @@ impl FrameChannel {
     pub(crate) fn pop(&self, timeout: Duration) -> FramePop {
         self.consumer_seen.store(true, Ordering::Relaxed);
         let mut st = self.inner.lock().unwrap();
-        if st.q.is_empty() && !st.closed {
+        if st.q.is_empty() && !st.closed && !std::mem::take(&mut st.kicked) {
             st = self.ready.wait_timeout(st, timeout).unwrap().0;
+            st.kicked = false;
         }
         if st.all_intra && st.q.len() > 1 {
             st.skipped_total += (st.q.len() - 1) as u64;
@@ -617,6 +629,36 @@ mod frame_channel_tests {
     use super::{FrameChannel, FramePop, FRAME_QUEUE_HARD_CAP, PREROLL_AUS};
     use crate::session::Frame;
     use std::time::Duration;
+
+    #[test]
+    fn a_kick_returns_the_next_pop_at_once_and_wakes_a_waiting_one() {
+        let ch = FrameChannel::new();
+        ch.kick();
+        let t0 = std::time::Instant::now();
+        assert!(matches!(ch.pop(Duration::from_secs(1)), FramePop::Timeout));
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "a pending kick is consumed"
+        );
+        let t0 = std::time::Instant::now();
+        assert!(matches!(
+            ch.pop(Duration::from_millis(20)),
+            FramePop::Timeout
+        ));
+        assert!(t0.elapsed() >= Duration::from_millis(20), "and only once");
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                ch.kick();
+            });
+            let t0 = std::time::Instant::now();
+            assert!(matches!(ch.pop(Duration::from_secs(5)), FramePop::Timeout));
+            assert!(
+                t0.elapsed() < Duration::from_secs(1),
+                "a kick wakes a waiting pop"
+            );
+        });
+    }
 
     fn frame(i: u32) -> Frame {
         Frame {

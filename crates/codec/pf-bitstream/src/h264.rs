@@ -451,6 +451,8 @@ impl H264Planner {
             let nalu_offset = cursor.position() as usize;
             let range = (nalu_offset - nalu.offset)..(nalu_offset + nalu.size);
             debug_assert_eq!(&au[range.clone()], nalu.data.as_ref());
+            // Past this payload, or the next `Nalu::next` scans it a second time.
+            cursor.set_position(range.end as u64);
 
             match nalu.header.type_ {
                 NaluType::Sps => {

@@ -191,6 +191,13 @@ impl StreamState {
             self.lease = lease;
             self.restamp = panel_tick_ns.map(super::encode::SourceStamps::new);
         }
+        self.publish_arrival_poke();
+    }
+
+    /// The running capturer's arrival poke, for the control task. A stale handle after a
+    /// swap only pokes a capturer that is gone.
+    pub(super) fn publish_arrival_poke(&self) {
+        *self.arrival_poke.lock().unwrap_or_else(|e| e.into_inner()) = self.capturer.arrival_poke();
     }
 
     /// A fresh encoder retrieves synchronously. The session's pipelined escalation carries onto
@@ -374,6 +381,7 @@ mod tests {
             loss_mode: Default::default(),
             acked: Default::default(),
             lossy_window: Default::default(),
+            arrival_poke: Default::default(),
             kf_gate: Default::default(),
             recovery_cadence: pf_frame::metronome::Metronome::new(),
             ir_wave_pos: 0,

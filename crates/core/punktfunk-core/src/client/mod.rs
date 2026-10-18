@@ -1489,6 +1489,12 @@ impl NativeClient {
         }
     }
 
+    /// Return the consumer from [`Self::next_frame`] with `NoFrame` now, or at its next
+    /// call: a hardware decode it submitted is complete. Any thread may call this.
+    pub fn kick_frame_wait(&self) {
+        self.shared.frames.kick();
+    }
+
     /// Next audio packet. Drain on a dedicated thread — packets arrive every 5 ms.
     pub fn next_audio(&self, timeout: Duration) -> Result<AudioPacket> {
         let pkt = pull(&self.planes.audio, timeout)?;
@@ -1562,6 +1568,13 @@ impl NativeClient {
             Ok(None) => Err(PunktfunkError::NoFrame),
             Err(rumble::Closed) => Err(PunktfunkError::Closed),
         }
+    }
+
+    /// Run `wake` on the demux thread as each rumble update lands, for a poller that blocks
+    /// on something other than [`Self::next_rumble_command`] and then drains it with a zero
+    /// timeout. A scheduled follow-up (a ramp step, a backstop) still waits for that poll.
+    pub fn set_rumble_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.planes.rumble_sched.set_wake(wake);
     }
 
     /// Actuator quirks for wire pad `pad` (at attach). Default = well-behaved; only decaying

@@ -33,6 +33,8 @@ ureq-tls = ["tls", "dep:ureq"]
 serde = ["dep:serde"]
 # Optional native backend for armv7 SIMD; preserves the RFC 8439 wire format.
 chacha-aws-lc-rs = ["dep:aws-lc-rs"]
+# Optional native AES-128-GCM (VAES on x86 hosts); same wire format. Off for wasm and armv7.
+aes-aws-lc-rs = ["dep:aws-lc-rs"]
 
 [dependencies]
 reed-solomon-simd = "3.1"      # GF(2^16) Leopard-RS, SIMD, O(n log n) — the wall-breaker (P2)
