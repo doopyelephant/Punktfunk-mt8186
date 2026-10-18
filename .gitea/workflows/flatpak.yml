@@ -63,6 +63,7 @@ on:
       # can only be proven by a real run, and there is no other trigger that would give it one.
       - '.gitea/workflows/flatpak.yml'
       - 'scripts/ci/flatpak-deps-present.sh'
+      - 'scripts/ci/flatpak-legacy-refs.sh'
     tags: ['v*']
   workflow_dispatch:
 
@@ -499,18 +500,10 @@ jobs:
                 unom "${ref#unom:}"
             done
           fi
-          # Marked after the re-pull, which would reset a ref to the remote's commit. A ref that
-          # already carries the marker keeps its commit, so this writes once per legacy ref.
-          for dir in "$PWD/repo/refs/heads/app/$LEGACY_APP_ID/${{ matrix.arch }}"/*; do
-            [ -e "$dir" ] || continue
-            ref="app/$LEGACY_APP_ID/${{ matrix.arch }}/${dir##*/}"
-            if ostree --repo="$PWD/repo" show --print-metadata-key=ostree.endoflife-rebase "$ref" \
-              >/dev/null 2>&1; then
-              continue
-            fi
-            flatpak build-commit-from --src-ref="$ref" --end-of-life-rebase="$LEGACY_APP_ID=$APP_ID" \
-              --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME" "$PWD/repo" "$ref"
-          done
+          # After the re-pull, which would reset a ref to the remote's commit. A legacy ref rebases
+          # onto the new id only where that arch and branch has published.
+          bash scripts/ci/flatpak-legacy-refs.sh "$PWD/repo" unom "$APP_ID" "$LEGACY_APP_ID" \
+            "$KEYID" "$GNUPGHOME"
           flatpak build-update-repo --generate-static-deltas \
             --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME" "$PWD/repo"
           # The regenerated summary advertises exactly these refs — must include EVERY channel that
@@ -534,10 +527,18 @@ jobs:
           # published channel, not just this run's). The stable ref resolves for good once any
           # release has built the `stable` branch. A box installs ONE; `flatpak update` then tracks
           # that channel's branch.
+          # A channel installs the new id once it has published one, and its legacy refs until then.
+          channel_id() {  # <branch>
+            if ls -d "$PWD/repo/refs/heads/app/$APP_ID"/*/"$1" >/dev/null 2>&1; then
+              echo "$APP_ID"
+            else
+              echo "$LEGACY_APP_ID"
+            fi
+          }
           write_ref() {  # <filename> <branch> <title>
             cat > "site/$1" <<EOF
           [Flatpak Ref]
-          Name=$APP_ID
+          Name=$(channel_id "$2")
           Branch=$2
           Url=$REPO_URL/repo/
           Title=$3
@@ -549,7 +550,7 @@ jobs:
           }
           write_ref "${APP_ID}.flatpakref"        stable "Punktfunk"
           write_ref "${APP_ID}.canary.flatpakref" canary "Punktfunk (Canary)"
-          # The CamelCase file names old links and docs use, installing APP_ID.
+          # The CamelCase file names old links and docs use.
           write_ref "${LEGACY_APP_ID}.flatpakref"        stable "Punktfunk"
           write_ref "${LEGACY_APP_ID}.Canary.flatpakref" canary "Punktfunk (Canary)"
           cat > site/index.html <<EOF
@@ -558,7 +559,7 @@ jobs:
           <p>Install the Punktfunk Linux client (auto-adds Flathub for the GNOME runtime, then tracks updates).</p>
           <p><b>Stable</b> (recommended — only moves on releases):</p>
           <pre>flatpak install --user $REPO_URL/${APP_ID}.flatpakref
-          flatpak run $APP_ID</pre>
+          flatpak run $(channel_id stable)</pre>
           <p><b>Canary</b> (latest main build, unstable):</p>
           <pre>flatpak install --user $REPO_URL/${APP_ID}.canary.flatpakref</pre>
           <p>Or add the whole remote: <code>flatpak remote-add --user --if-not-exists unom $REPO_URL/unom.flatpakrepo</code></p>
