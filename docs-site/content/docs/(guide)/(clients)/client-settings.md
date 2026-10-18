@@ -59,6 +59,7 @@ Android. Most settings can differ per [preset](/docs/presets-and-links); the exc
 | **Video decoder**, **GPU** | Automatic | The decoder and graphics card this device uses. Change them only to debug; `PUNKTFUNK_DECODER` [overrides](/docs/configuration#client-side-native-clients) the decoder. | Linux, Windows. **GPU**: Windows, and Linux with more than one GPU. |
 | **Low-latency mode** | On | Asks the decoder and system for their low-latency paths. Turn it off if a device misbehaves. | Android |
 | **Keep screen awake** | On | Off, a stream keeps the screen awake only while you play: five minutes after your last key, touch or controller input, this device's own screen saver or sleep takes over. | Linux, Windows, Android, Apple |
+| **Screen** | Window | Where the picture shows: this window, a curved screen, or docked in the environment. If the environment can't take the picture, it stays in the window. | Apple Vision Pro |
 
 **Test network speed…** in a host card's menu measures the link — what it carries, then loss and
 jitter at half of that, a rate the link holds — and suggests a bitrate (Android: **Network speed
@@ -77,6 +78,7 @@ the rate instead of **Bitrate**.
 | **Keep host audio playing** | Off | Off, the host goes quiet while you stream. On, its own speakers keep playing too. With several clients, one asking is enough. | All |
 | **Stream microphone** | Off | Sends this device's microphone to the host. **Ctrl+Alt+Shift+V** [mutes it](/docs/input#muting-your-microphone). | All but Apple TV |
 | **Echo cancellation** | On | Keeps the host's audio, playing from your speakers, out of the microphone. Turn it off if your microphone does its own processing. See [Why do I hear myself](/docs/echo). | All but Apple TV |
+| **Spatial audio** | On | On, the sound comes from the window. Off plays the game's own mix straight to your ears. | Apple Vision Pro |
 | **Speaker**, **Microphone** | System default | Which output plays the stream and which input feeds the microphone. | Linux, Windows, Mac (plus **Microphone channel**) |
 
 ## Input

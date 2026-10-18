@@ -63,6 +63,9 @@ pub struct Device {
     pub system_keyboard: bool,
     /// A TV: no clipboard to copy to, no phone sensors ([`crate::shell::ConsoleOptions::tv`]).
     pub tv: bool,
+    /// Windows in a room ([`crate::shell::ConsoleOptions::spatial`]): the spatial audio and
+    /// screen rows.
+    pub spatial: bool,
     /// Host has a fallback UI ([`crate::shell::ConsoleOptions::fallback_ui`]); gates the
     /// console-off row.
     pub fallback_ui: bool,
@@ -109,6 +112,7 @@ impl Device {
             native_mode: None,
             system_keyboard: false,
             tv: false,
+            spatial: false,
             fallback_ui: false,
             pyrowave_ok: true,
             av1_ok: true,

@@ -274,6 +274,11 @@ struct ContentView: View {
                 LandscapeLock.streaming = up
             }
             #endif
+            #if os(visionOS)
+            // The Home sits on the system glass; a stream is a square-cornered rectangle, like
+            // the monitor it shows.
+            .glassBackgroundEffect(displayMode: model.phase == .streaming ? .never : .always)
+            #endif
     }
 
     /// The confirmed link's action: exactly what a `.known` (id-referenced) link would have done,

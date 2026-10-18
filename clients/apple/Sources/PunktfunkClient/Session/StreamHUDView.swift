@@ -292,6 +292,12 @@ struct StreamBadgeStack: View {
                 AccessWarningBadge(text: notice, icon: "exclamationmark.triangle")
                     .transition(Self.pop)
             }
+            if captureEnabled, model.notices.dockRefused.isShown {
+                AccessWarningBadge(
+                    text: "The environment couldn't take the picture — it stays in the window.",
+                    icon: "exclamationmark.triangle"
+                ).transition(Self.pop)
+            }
             #if !os(tvOS)
             // The access chip rides the stats tier for a LIMITED session only; a
             // full-and-permanent one never mounts it. tvOS states it in the stats overlay.
@@ -312,6 +318,7 @@ struct StreamBadgeStack: View {
         .animation(.easeOut(duration: 0.2), value: model.notices.micMute.value)
         .animation(.easeOut(duration: 0.2), value: model.notices.accessWarning.value)
         .animation(.easeOut(duration: 0.2), value: model.notices.launch.value)
+        .animation(.easeOut(duration: 0.2), value: model.notices.dockRefused.isShown)
         .animation(.easeOut(duration: 0.2), value: model.notices.accessLimited)
         .animation(.easeOut(duration: 0.2), value: statsVerbosity)
         .animation(.easeOut(duration: 0.2), value: model.notices.motionUnreachable.value)

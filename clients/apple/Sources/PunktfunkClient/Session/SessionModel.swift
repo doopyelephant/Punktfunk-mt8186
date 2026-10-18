@@ -807,6 +807,11 @@ final class SessionModel: ObservableObject {
 
     /// The host's launch line, once per verdict, on its own clock so it never hides the access
     /// warning.
+    /// The environment did not take the docked picture; it stays in the window.
+    func noteDockRefused() {
+        flash(\.dockRefused, true, for: SessionNotices.launchSeconds)
+    }
+
     private func showLaunchNotice(_ text: String) {
         notices.launchShown = text
         flash(\.launch, text, for: SessionNotices.launchSeconds)
@@ -1149,6 +1154,7 @@ final class SessionModel: ObservableObject {
             // uplink at all — a capture the host would only drop is pure privacy downside.
             micEnabled: settings.micEnabled && conn.canUseMic,
             echoCancel: settings.echoCancel,
+            spatialAudio: settings.spatialAudio,
             // The A/V sync reference: the presenter's own capture→on-glass meter. The stage-1
             // fallback stamps nothing, so the loop then declines to correct.
             videoLatency: endToEnd)

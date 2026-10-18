@@ -312,6 +312,7 @@ mod scene {
             tv: !matches!(platform, Platform::Desktop),
             tizen: false,
             system_keyboard: false,
+            spatial: false,
             av1_ok: true,
             pyrowave_ok: true,
             profiles: false,

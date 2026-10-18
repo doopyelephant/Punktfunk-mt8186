@@ -18,6 +18,11 @@ struct StreamScene: View {
     @Binding var showTouchExit: Bool
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.statsScalePct) private var statsScalePct = 100
+    #if os(visionOS)
+    @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+    #endif
 
     /// The ring this platform draws. macOS takes the DESKTOP default (no soft keyboard, no
     /// on-screen pad), tvOS the TV one (no touch, keyboard or microphone slot), iOS the touch
@@ -110,8 +115,46 @@ struct StreamScene: View {
             endToEndMeter: model.endToEnd
         )
         #if os(visionOS)
+        .dock(DockStage.shared.feed(for: conn))
+        .curve(CurveStage.shared.target(for: conn))
+        .overlay {
+            if let feed = DockStage.shared.feed(for: conn) {
+                ZStack {
+                    DockPlayer(
+                        feed: feed, mode: conn.currentMode(),
+                        onRefused: { [weak model] in model?.noteDockRefused() })
+                    ScreenPlaceholder(
+                        title: "Streaming in the environment", systemImage: "sparkles.tv",
+                        connection: conn, endStream: { [weak model] in model?.disconnect() })
+                }
+            } else if CurveStage.shared.target(for: conn) != nil {
+                ScreenPlaceholder(
+                    title: "Streaming on the curved screen", systemImage: "pano",
+                    connection: conn, endStream: { [weak model] in model?.disconnect() })
+            }
+        }
+        // A streaming session follows the stored Screen; the ornament's menu moves it too.
+        .onChange(
+            of: model.phase == .streaming ? StreamScreen(name: screen) : nil, initial: true
+        ) { _, wanted in
+            CurveStage.shared.register(conn, model: model, ring: ring)
+            showScreen(wanted, for: conn)
+        }
+        // The curve has its own volume, opened and closed with it.
+        .onChange(of: CurveStage.shared.target(for: conn) != nil) { _, curved in
+            guard let id = CurveStage.shared.session(for: conn)?.id else { return }
+            if curved {
+                openWindow(id: CurveScene.sceneID, value: id)
+            } else {
+                dismissWindow(id: CurveScene.sceneID, value: id)
+            }
+        }
+        .onDisappear {
+            DockStage.shared.ended(conn)
+            CurveStage.shared.ended(conn)
+        }
         .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
-            StreamOrnament(quickActions: { ring.toggleCentred() })
+            StreamOrnament(connection: conn, quickActions: { ring.toggleCentred() })
         }
         #endif
         .overlay(alignment: placement.alignment) {
@@ -119,7 +162,7 @@ struct StreamScene: View {
             // morphs to the new tier. The `.transition` fires only on off↔on, a scale-up
             // from the HUD's corner. The ZStack is the stable host `.animation` watches.
             ZStack {
-                if captureEnabled && statsVerbosity != .off {
+                if captureEnabled && statsVerbosity != .off && overlaysHere(conn) {
                     StreamHUDView(
                         model: model, connection: conn, placement: placement,
                         verbosity: statsVerbosity,
@@ -133,7 +176,8 @@ struct StreamScene: View {
         }
         .overlay(alignment: .bottom) {
             StreamBadgeStack(
-                model: model, captureEnabled: captureEnabled, statsVerbosity: statsVerbosity)
+                model: model, captureEnabled: captureEnabled && overlaysHere(conn),
+                statsVerbosity: statsVerbosity)
         }
         #if os(iOS) || os(visionOS)
         // Touch has no menu or ⌘D: while the HUD shows no Disconnect (compact, off) a
@@ -141,7 +185,7 @@ struct StreamScene: View {
         // stream costs ~a refresh of latency; compact composites a pill anyway. The
         // virtual controller carries its own ring button, so the discs leave while it is up.
         .overlay(alignment: .topLeading) {
-            if captureEnabled, !model.virtualPadShown,
+            if captureEnabled, overlaysHere(conn), !model.virtualPadShown,
                statsVerbosity == .compact || (statsVerbosity == .off && showTouchExit) {
                 HStack(spacing: 10) {
                     // Opens the quick-action ring (End stream is a slot inside, behind
@@ -178,7 +222,7 @@ struct StreamScene: View {
         // their fingers first and every other finger falls through; below the ring, whose
         // scrim owns every finger while it is up. Mounted only while shown (tenet 1).
         .overlay {
-            if padOverPicture, captureEnabled, model.virtualPadShown,
+            if padOverPicture, captureEnabled, overlaysHere(conn), model.virtualPadShown,
                    let pad = model.virtualPad {
                 VirtualPadLayer(config: OverlayConfig.parse(model.settings.overlayActions).pad,
                                 wire: pad, openRing: { [ring] at in ring.openAt(at) })
@@ -189,7 +233,7 @@ struct StreamScene: View {
         // disc, the pad's ring button, the remote's Back, the Mac's chord or the Vision
         // Pro's ornament. Mounted only while open — a closed overlay costs nothing.
         .overlay {
-            if captureEnabled, ring.visible {
+            if captureEnabled, ring.visible, overlaysHere(conn) {
                 RingOverlay(state: ring, cfg: ringConfig, actions: model.ringActions(conn, ring: ring))
             }
         }
@@ -269,6 +313,16 @@ struct StreamScene: View {
     #else
     private var dialSink: ((DialEvent) -> Void)? { nil }
     #endif
+
+    /// The picture shows in this window, so its overlays draw here; on a curve they float
+    /// there instead.
+    private func overlaysHere(_ conn: PunktfunkConnection) -> Bool {
+        #if os(visionOS)
+        return CurveStage.shared.target(for: conn) == nil
+        #else
+        return true
+        #endif
+    }
 
     #if os(iOS) || os(visionOS)
     /// One touch-control disc: an SF Symbol on a floating glass disc over the frame (26+,

@@ -97,6 +97,18 @@ struct PunktfunkClientApp: App {
         #elseif !os(tvOS)
         .commands { StreamCommands() }
         #endif
+        #if os(visionOS)
+        // No system glass or corner clip: ContentView draws the glass only where it belongs.
+        .windowStyle(.plain)
+        #endif
+        #if os(visionOS)
+        // A session's curved screen, by the id `CurveStage` gave it.
+        WindowGroup("Curved screen", id: CurveScene.sceneID, for: UUID.self) { $id in
+            CurveScene(id: id)
+        }
+        .windowStyle(.volumetric)
+        .defaultSize(width: 1.6, height: 0.9, depth: 0.25, in: .meters)
+        #endif
         #if os(macOS)
         // A host's page, one window per host.
         WindowGroup("Host", id: MacHostWindow.sceneID, for: StoredHost.ID.self) { $hostID in

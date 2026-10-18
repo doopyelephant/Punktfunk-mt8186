@@ -72,6 +72,7 @@ public struct EffectiveSettings: Equatable, Sendable {
     public var micUID = SettingDefault.micUID
     public var micChannel = SettingDefault.micChannel
     public var pointerCapture = SettingDefault.pointerCapture
+    public var spatialAudio = SettingDefault.spatialAudio
     /// The preset this resolution came from, when one applied — the HUD names it so "which
     /// preset am I on?" is answerable mid-session, and the one-off/binding distinction never has
     /// to be guessed from the settings themselves.
@@ -138,6 +139,7 @@ public struct EffectiveSettings: Equatable, Sendable {
         micUID = str(DefaultsKey.micUID, micUID)
         micChannel = int(DefaultsKey.micChannel, micChannel)
         pointerCapture = bool(DefaultsKey.pointerCapture, pointerCapture)
+        spatialAudio = bool(DefaultsKey.spatialAudio, spatialAudio)
     }
 
     /// The stats tier as stored, migrating the pre-tier `hudEnabled` bool: written once, here,

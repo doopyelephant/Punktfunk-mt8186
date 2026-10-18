@@ -409,6 +409,20 @@ extension SettingsView {
                     options: VideoFit.allCases.map { (label: $0.label, tag: $0.rawValue) },
                     selection: scoped(SettingsFields.videoFit))
             }
+            #if os(visionOS)
+            // Where this headset shows the picture (tier G).
+            if !inPresetScope {
+                described(
+                    "Where the picture shows: this window, a curved screen, or docked in the "
+                        + "environment."
+                ) {
+                    settingPicker(
+                        "Screen",
+                        options: StreamScreen.allCases.map { (label: $0.label, tag: $0.rawValue) },
+                        selection: $screen)
+                }
+            }
+            #endif
             #if os(tvOS)
             tvBitrateRow
             #else
@@ -1181,6 +1195,15 @@ extension SettingsView {
             described("This device's microphone feeds the host's virtual mic.",
                       field: "mic_enabled") {
                 Toggle("Stream microphone", isOn: scoped(SettingsFields.micEnabled))
+            }
+            #endif
+            #if os(visionOS)
+            // Where this headset plays the sound (tier G).
+            if !inPresetScope {
+                described("On, the sound comes from the window. Off plays the game's own mix "
+                          + "straight to your ears.") {
+                    Toggle("Spatial audio", isOn: $spatialAudio)
+                }
             }
             #endif
             #if os(macOS)

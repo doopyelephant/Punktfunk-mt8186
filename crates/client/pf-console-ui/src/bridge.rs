@@ -36,6 +36,9 @@ pub struct CreateOptions {
     /// console never draws its tray: an Apple TV's, where iPhone typing works.
     #[serde(default)]
     pub system_keyboard: bool,
+    /// A Vision Pro: windows in a room ([`ConsoleOptions::spatial`]).
+    #[serde(default)]
+    pub spatial: bool,
     /// Whether a real AV1 decoder exists, as the host's codec list answers it. Absent means
     /// don't claim the device lacks it, so the codec row stays unmarked.
     #[serde(default = "yes")]
@@ -87,6 +90,7 @@ impl CreateOptions {
             version: None,
             system_keyboard: self.system_keyboard,
             tv: self.tv,
+            spatial: self.spatial,
             fallback_ui: self.fallback_ui,
             pyrowave_ok: self.pyrowave_ok,
             av1_ok: self.av1_ok,
