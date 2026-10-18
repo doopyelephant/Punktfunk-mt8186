@@ -174,6 +174,10 @@ public final class StreamViewController: StreamViewControllerBase {
     /// could not close the ring.
     private var ringHoldsPointer = false
     #endif
+    #if os(visionOS)
+    /// The scene `fitWindowToPicture` restricted; `stop()` hands it back free-resizing.
+    private weak var fittedScene: UIWindowScene?
+    #endif
 
     /// Reads whether the scene's pointer is actually locked right now; nil = state
     /// unavailable (no scene yet, or pre-availability). Only while this is true does GCMouse
@@ -751,6 +755,10 @@ public final class StreamViewController: StreamViewControllerBase {
         streamView.currentHostMode = nil
         matchFollower = nil
         #endif
+        #if os(visionOS)
+        fittedScene?.requestGeometryUpdate(.Vision(resizingRestrictions: .freeform))
+        fittedScene = nil
+        #endif
         #if os(iOS)
         if onExternal {
             ExternalDisplay.shared.hide(externalVideo) // the monitor mirrors the phone again
@@ -892,14 +900,38 @@ public final class StreamViewController: StreamViewControllerBase {
     /// A new decoded size landed (a scene/mode resize's new IDR, or the first frame): push it to the
     /// presenter's aspect-fit and re-layout NOW. A resize-END triggers no `viewDidLayoutSubviews`, so
     /// this is what makes the metal sublayer track the new content aspect instead of stretching the
-    /// new frame into the pre-resize box. Deduped so a same-size repeat is a no-op. Main thread.
+    /// new frame into the pre-resize box. On visionOS the window then takes the picture's shape.
+    /// Deduped so a same-size repeat is a no-op. Main thread.
     private func noteDecodedContentSize(width: Int, height: Int) {
         let size = CGSize(width: width, height: height)
         guard size.width > 0, size.height > 0, size != lastDecodedContentSize else { return }
         lastDecodedContentSize = size
         presenter.setContentSize(size)
         layoutMetalLayer()
+        #if os(visionOS)
+        fitWindowToPicture(size)
+        #endif
     }
+
+    #if os(visionOS)
+    /// The window takes the picture's shape: a fixed mode need not match the window, and a bar is
+    /// picture no one sees. Match window drives the mode from the window instead, so it resizes
+    /// free. A new shape keeps the window's width.
+    private func fitWindowToPicture(_ picture: CGSize) {
+        guard let window = view.window, let scene = window.windowScene else { return }
+        let prefs = UIWindowScene.GeometryPreferences.Vision()
+        if connection?.settings.matchWindow == true {
+            prefs.resizingRestrictions = .freeform
+        } else {
+            let width = window.bounds.width
+            let height = (width * picture.height / picture.width).rounded()
+            if abs(window.bounds.height - height) > 1 { prefs.size = CGSize(width: width, height: height) }
+            prefs.resizingRestrictions = .uniform
+        }
+        scene.requestGeometryUpdate(prefs)
+        fittedScene = scene
+    }
+    #endif
 
     #if os(iOS) || os(visionOS)
     #if os(iOS)

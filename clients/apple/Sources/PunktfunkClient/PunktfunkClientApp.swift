@@ -97,6 +97,10 @@ struct PunktfunkClientApp: App {
         #elseif !os(tvOS)
         .commands { StreamCommands() }
         #endif
+        #if os(visionOS)
+        // No system glass or corner clip: ContentView draws the glass only where it belongs.
+        .windowStyle(.plain)
+        #endif
         #if os(macOS)
         // A host's page, one window per host.
         WindowGroup("Host", id: MacHostWindow.sceneID, for: StoredHost.ID.self) { $hostID in
