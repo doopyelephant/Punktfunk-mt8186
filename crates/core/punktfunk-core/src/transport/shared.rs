@@ -5,12 +5,13 @@
 //! Client: [`client_socket`] starts a native thread that owns every read. QUIC packets go to
 //! quinn through the [`ClientSocket`] it returns; media from the host's address goes to the
 //! session through [`ClientMedia`], a bounded queue. Video never enters an async runtime.
-//! On Apple the socket connects to the host once it is known ([`ClientMedia::set_host`]).
+//! On Apple the socket connects to the host once it is known ([`ClientMedia::set_host`]), and
+//! again after a second of silence or a path change ([`ClientMedia::reconnector`]).
 //!
 //! Host: [`MediaSender`] sends media on a clone of the endpoint's socket, toward the
 //! connection's current address and from the address the client dialed. quinn moves that
-//! address on the first authenticated packet from a new one and validates it afterwards, so
-//! media follows a migration before QUIC has confirmed it.
+//! address on the first authenticated packet from a new one and validates it afterwards. Media
+//! follows a port-only rebind at once and a new IP once validation has had time to finish.
 
 use super::{BufPool, RecvBatch, Transport};
 use quinn::udp::{RecvMeta, Transmit, UdpSocketState};
@@ -41,6 +42,9 @@ const READ_BUF: usize = 64 * 1024;
 const POOL_BYTES: usize = 32 * 1024 * 1024;
 /// How long the reader waits before it looks at its stop flag again.
 const WAIT: Duration = Duration::from_millis(100);
+/// Empty waits in a row that read as a dead path: one second. A live host sends media, audio
+/// or a keep-alive well inside it.
+const SILENT_WAITS: u32 = 10;
 
 /// The client socket's counters, and the flag that stops its reader.
 #[derive(Debug, Default)]
@@ -81,6 +85,16 @@ fn canonical(a: SocketAddr) -> SocketAddr {
     }
 }
 
+/// `a` as a socket of the other family sends to it: IPv4 v4-mapped on an IPv6 socket.
+fn mapped(a: SocketAddr, v6_socket: bool) -> SocketAddr {
+    match a {
+        SocketAddr::V4(v4) if v6_socket => {
+            SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+        }
+        other => other,
+    }
+}
+
 struct QuicQueue {
     packets: VecDeque<(Vec<u8>, RecvMeta)>,
     waker: Option<Waker>,
@@ -118,8 +132,19 @@ pub struct ClientMedia {
     rx: Mutex<Receiver<RecvBatch>>,
     stats: Arc<SharedStats>,
     socket: Arc<UdpSocket>,
-    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     peer: Peer,
+}
+
+/// Connect the socket to its host again, so XNU picks the source address afresh after a roam;
+/// a connected socket otherwise keeps the old one until a send fails. A no-op before the host
+/// is known, and off Apple, where the socket stays unconnected and routes every send.
+fn reconnect(socket: &UdpSocket, peer: &Peer) {
+    let peer = peer.lock().unwrap_or_else(|e| e.into_inner());
+    if let (true, Some(host)) = (cfg!(target_vendor = "apple"), *peer) {
+        if let Err(e) = socket.connect(host) {
+            tracing::debug!(error = %e, "shared socket reconnect");
+        }
+    }
 }
 
 impl ClientMedia {
@@ -142,6 +167,12 @@ impl ClientMedia {
         }
     }
 
+    /// Re-picks the socket's source address, for a caller that learns the path changed.
+    pub fn reconnector(&self) -> impl Fn() + Send + Sync + 'static {
+        let (socket, peer) = (self.socket.clone(), self.peer.clone());
+        move || reconnect(&socket, &peer)
+    }
+
     /// The shared socket, for its buffer and drop figures. Never read from it: the demux
     /// thread owns its receive side.
     pub fn try_clone_socket(&self) -> std::io::Result<UdpSocket> {
@@ -162,8 +193,10 @@ pub fn client_socket(bind: SocketAddr) -> std::io::Result<(Arc<ClientSocket>, Cl
     }));
     let stats = Arc::new(SharedStats::default());
     let (tx, rx) = sync_channel(MEDIA_QUEUE);
-    // Without GRO a read is one datagram, so the buffer is one datagram's worth.
-    let size = if state.gro_segments() > 1 {
+    // Without GRO a read is one datagram, so the buffer is one datagram's worth. Windows
+    // reports 64 segments whether or not URO is on, and nothing turns URO on.
+    let coalesced = !cfg!(windows) && state.gro_segments() > 1;
+    let size = if coalesced {
         READ_BUF
     } else {
         crate::packet::MAX_DATAGRAM_BYTES + 1
@@ -177,6 +210,7 @@ pub fn client_socket(bind: SocketAddr) -> std::io::Result<(Arc<ClientSocket>, Cl
         media: tx,
         pool,
         stats: stats.clone(),
+        peer: peer.clone(),
     };
     // As urgent as the pump it feeds: a descheduled reader is socket drops the link never had.
     std::thread::Builder::new()
@@ -209,9 +243,12 @@ struct Reader {
     media: SyncSender<RecvBatch>,
     pool: Arc<BufPool>,
     stats: Arc<SharedStats>,
+    peer: Peer,
 }
 
 impl Reader {
+    /// Reads until stopped. A second of silence from a known host reconnects the socket,
+    /// since on Apple an interface that stays up but carries nothing never fails a send.
     fn run(self) {
         let mut bufs: Vec<Vec<u8>> = (0..BATCH)
             .map(|_| {
@@ -221,10 +258,18 @@ impl Reader {
             })
             .collect();
         let mut meta = [RecvMeta::default(); BATCH];
+        let mut silent = 0u32;
         while !self.stats.stop.load(Ordering::Relaxed) {
             match super::udp::wait_readable(&self.socket, WAIT) {
-                Ok(true) => {}
-                Ok(false) => continue,
+                Ok(true) => silent = 0,
+                Ok(false) => {
+                    silent += 1;
+                    if silent == SILENT_WAITS {
+                        reconnect(&self.socket, &self.peer);
+                        silent = 0;
+                    }
+                    continue;
+                }
                 Err(e) => {
                     tracing::debug!(error = %e, "shared socket wait");
                     std::thread::sleep(WAIT);
@@ -444,6 +489,26 @@ impl Transport for ClientMedia {
             .try_recv()
             .ok())
     }
+
+    fn wait_owned(&self, timeout: std::time::Duration) -> std::io::Result<Option<RecvBatch>> {
+        use std::sync::mpsc::RecvTimeoutError as E;
+        let rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+        match rx.recv_timeout(timeout) {
+            Ok(batch) => Ok(Some(batch)),
+            Err(E::Timeout) => Ok(None),
+            // The demux is gone: a bare return here would spin the pump until it notices.
+            Err(E::Disconnected) => {
+                std::thread::sleep(timeout);
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// `PUNKTFUNK_GSO` set to anything but `0`: the offload is pinned on for an A/B, and a loss
+/// guard must stand down or it downshifts the run it is measuring.
+pub fn offload_pinned() -> bool {
+    std::env::var_os("PUNKTFUNK_GSO").is_some_and(|v| v != "0")
 }
 
 /// `PUNKTFUNK_GSO=0`: the operator's off switch; GSO is on wherever the path has it.
@@ -460,13 +525,36 @@ fn gso_allowed() -> bool {
 
 /// The host's media sender on a connection's shared socket.
 pub struct MediaSender {
-    /// The video mark toward this peer. Before `socket`: a Windows flow leaves before it closes.
-    _qos: Option<super::QosFlow>,
+    /// Before `socket`: a Windows flow leaves before it closes.
+    route: Mutex<Route>,
     socket: UdpSocket,
     state: UdpSocketState,
     conn: quinn::Connection,
     v6_socket: bool,
     staging: Mutex<Vec<u8>>,
+    /// Send offload for this session; the host's loss guard clears it for good
+    /// ([`Self::set_offload_switch`]).
+    offload: Arc<AtomicBool>,
+}
+
+/// Where media goes, and the move it is waiting out.
+struct Route {
+    to: SocketAddr,
+    /// The address quinn moved to and when, while media waits for it to validate.
+    moving: Option<(SocketAddr, std::time::Instant)>,
+    /// The video mark toward `to`. A Windows flow is bound to one destination.
+    qos: Option<super::QosFlow>,
+}
+
+/// Whether media to a client that moved `from` → `to`, `waited` ago, still waits for the new
+/// address to validate. Only a new IP waits: a port-only NAT rebind has no third party to hit.
+fn still_validating(from: SocketAddr, to: SocketAddr, waited: Duration, hold: Duration) -> bool {
+    from.ip() != to.ip() && waited < hold
+}
+
+/// quinn's path validation timer, 3 × PTO, with PTO taken as RTT plus the 25 ms ack delay.
+fn validation_hold(rtt: Duration) -> Duration {
+    3 * (rtt + Duration::from_millis(25))
 }
 
 impl MediaSender {
@@ -476,29 +564,57 @@ impl MediaSender {
         let socket = socket.try_clone()?;
         let state = UdpSocketState::new((&socket).into())?;
         let v6_socket = socket.local_addr()?.is_ipv6();
-        let mut sender = MediaSender {
-            _qos: None,
+        let to = mapped(canonical(conn.remote_address()), v6_socket);
+        let qos = super::set_media_qos_to(&socket, to, super::MediaClass::Video);
+        Ok(MediaSender {
+            route: Mutex::new(Route {
+                to,
+                moving: None,
+                qos,
+            }),
             socket,
             state,
             conn,
             v6_socket,
             staging: Mutex::new(Vec::new()),
-        };
-        let (to, _) = sender.path();
-        sender._qos = super::set_media_qos_to(&sender.socket, to, super::MediaClass::Video);
-        Ok(sender)
+            offload: Arc::new(AtomicBool::new(true)),
+        })
     }
 
-    /// Where the next packet goes and from which local address: the connection's current path.
-    fn path(&self) -> (SocketAddr, Option<IpAddr>) {
-        let to = canonical(self.conn.remote_address());
-        let to = match to {
-            SocketAddr::V4(v4) if self.v6_socket => {
-                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+    /// Share the offload switch: `false` sends every packet on its own, as `PUNKTFUNK_GSO=0`
+    /// does, for the rest of the session.
+    pub fn set_offload_switch(&mut self, switch: Arc<AtomicBool>) {
+        self.offload = switch;
+    }
+
+    /// Where the next packet goes and from which local address, or `None` while it is held.
+    /// quinn moves `remote_address()` on the first authenticated packet from a new address and
+    /// validates it afterwards; its own sends are capped against amplification and media is
+    /// not. So media follows a new IP only after [`validation_hold`], and the mark moves with it.
+    fn path(&self) -> Option<(SocketAddr, Option<IpAddr>)> {
+        let seen = mapped(canonical(self.conn.remote_address()), self.v6_socket);
+        let mut r = self.route.lock().unwrap_or_else(|e| e.into_inner());
+        if seen == r.to {
+            r.moving = None;
+        } else {
+            let now = std::time::Instant::now();
+            let since = match r.moving {
+                Some((addr, since)) if addr == seen => since,
+                _ => {
+                    r.moving = Some((seen, now));
+                    now
+                }
+            };
+            let hold = validation_hold(self.conn.rtt());
+            if still_validating(r.to, seen, now.duration_since(since), hold) {
+                return None;
             }
-            other => other,
-        };
-        (to, self.conn.local_ip())
+            r.moving = None;
+            r.qos = None;
+            r.qos = super::set_media_qos_to(&self.socket, seen, super::MediaClass::Video);
+            r.to = seen;
+        }
+        Some((r.to, self.conn.local_ip()))
     }
 
     fn transmit(
@@ -521,9 +637,12 @@ impl MediaSender {
     }
 }
 
+/// A held packet counts as sent: it is lost on the way, as on a link that dropped it.
 impl Transport for MediaSender {
     fn send(&self, packet: &[u8]) -> std::io::Result<bool> {
-        let (to, from) = self.path();
+        let Some((to, from)) = self.path() else {
+            return Ok(true);
+        };
         match self.transmit(to, from, packet, None) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
@@ -532,7 +651,9 @@ impl Transport for MediaSender {
     }
 
     fn send_batch(&self, packets: &[&[u8]]) -> std::io::Result<usize> {
-        let (to, from) = self.path();
+        let Some((to, from)) = self.path() else {
+            return Ok(packets.len());
+        };
         for (i, p) in packets.iter().enumerate() {
             match self.transmit(to, from, p, None) {
                 Ok(()) => {}
@@ -546,14 +667,17 @@ impl Transport for MediaSender {
     /// Runs of equal-size packets leave as one offloaded send, each run within the platform's
     /// segment limit and under the UDP payload bound of either IP family; the last packet of a
     /// run may be shorter. An oversize run is `EMSGSIZE`, which quinn-udp reports as sent.
-    /// With `PUNKTFUNK_GSO=0` packets leave one by one.
+    /// With `PUNKTFUNK_GSO=0`, or once the session's loss guard cleared the switch, packets
+    /// leave one by one.
     fn send_gso(&self, packets: &[&[u8]]) -> std::io::Result<usize> {
         const GSO_MAX_PAYLOAD: usize = 65535 - 40 - 8;
         let max = self.state.max_gso_segments();
-        if !gso_allowed() || max <= 1 {
+        if !gso_allowed() || !self.offload.load(Ordering::Relaxed) || max <= 1 {
             return self.send_batch(packets);
         }
-        let (to, from) = self.path();
+        let Some((to, from)) = self.path() else {
+            return Ok(packets.len());
+        };
         let mut staging = self.staging.lock().unwrap_or_else(|e| e.into_inner());
         let mut sent = 0;
         while sent < packets.len() {
@@ -604,14 +728,21 @@ mod tests {
         );
     }
 
-    async fn pair() -> (
+    type Pair = (
         quinn::Endpoint,
         std::net::UdpSocket,
         quinn::Endpoint,
         ClientMedia,
         quinn::Connection,
         quinn::Connection,
-    ) {
+    );
+
+    async fn pair() -> Pair {
+        pair_with(|host| host).await
+    }
+
+    /// A host and a client that dials `dial(host)`: the host itself, or a proxy in front of it.
+    async fn pair_with(dial: impl FnOnce(SocketAddr) -> SocketAddr) -> Pair {
         use crate::quic::endpoint;
         let (cert, key) = endpoint::generate_identity().unwrap();
         let (server, socket) = endpoint::server_shared(
@@ -622,7 +753,7 @@ mod tests {
             &[crate::quic::v2::registry::ALPN, b"pkf1"],
         )
         .unwrap();
-        let addr = server.local_addr().unwrap();
+        let addr = dial(server.local_addr().unwrap());
         let (client, _) =
             endpoint::client_shared(None, None, &[crate::quic::v2::registry::ALPN, b"pkf1"]);
         let (client, media) = client.unwrap();
@@ -736,6 +867,195 @@ mod tests {
         // A connected socket's kernel drops them before the demux counts them.
         let counted = if cfg!(target_vendor = "apple") { 0 } else { 10 };
         assert_eq!(media.stats().foreign.load(Ordering::Relaxed), counted);
+    }
+
+    /// A NAT between client and host whose outside address changes on [`Self::rebind`]. The
+    /// client always talks to `front`; the host sees `backs[0]`, then `backs[1]`. Once rebound,
+    /// what the host sends to the old address is dropped, as by a NAT that forgot it.
+    struct RebindingProxy {
+        front: SocketAddr,
+        backs: [SocketAddr; 2],
+        rebound: Arc<AtomicBool>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl RebindingProxy {
+        fn start(host: SocketAddr) -> RebindingProxy {
+            let bind = |a: &str| {
+                let s = UdpSocket::bind(a).unwrap();
+                s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+                super::super::grow_socket_buffers(&s);
+                Arc::new(s)
+            };
+            let front = bind("127.0.0.1:0");
+            // A new IP where the OS has one (Linux answers on all of 127/8): quinn then restarts
+            // MTU discovery. Elsewhere a new port, which quinn treats as a NAT rebind.
+            let second = UdpSocket::bind("127.0.0.2:0")
+                .map(|_| "127.0.0.2:0")
+                .unwrap_or("127.0.0.1:0");
+            let backs = [bind("127.0.0.1:0"), bind(second)];
+            let rebound = Arc::new(AtomicBool::new(false));
+            let stop = Arc::new(AtomicBool::new(false));
+            let client: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
+            let mut buf = vec![0u8; 65536];
+            let (f, b, r, s, c) = (
+                front.clone(),
+                backs.clone(),
+                rebound.clone(),
+                stop.clone(),
+                client.clone(),
+            );
+            std::thread::spawn(move || {
+                while !s.load(Ordering::Relaxed) {
+                    if let Ok((n, from)) = f.recv_from(&mut buf) {
+                        *c.lock().unwrap() = Some(from);
+                        let out = &b[r.load(Ordering::Relaxed) as usize];
+                        let _ = out.send_to(&buf[..n], host);
+                    }
+                }
+            });
+            for (i, back) in backs.iter().enumerate() {
+                let (f, back, r, s, c) = (
+                    front.clone(),
+                    back.clone(),
+                    rebound.clone(),
+                    stop.clone(),
+                    client.clone(),
+                );
+                let mut buf = vec![0u8; 65536];
+                std::thread::spawn(move || {
+                    while !s.load(Ordering::Relaxed) {
+                        let Ok((n, _)) = back.recv_from(&mut buf) else {
+                            continue;
+                        };
+                        let live = r.load(Ordering::Relaxed) as usize == i;
+                        if let (true, Some(to)) = (live, *c.lock().unwrap()) {
+                            let _ = f.send_to(&buf[..n], to);
+                        }
+                    }
+                });
+            }
+            RebindingProxy {
+                front: front.local_addr().unwrap(),
+                backs: backs.map(|s| s.local_addr().unwrap()),
+                rebound,
+                stop,
+            }
+        }
+
+        fn rebind(&self) {
+            self.rebound.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl Drop for RebindingProxy {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Media sent to the client, `count` packets tagged from `first`, until each one left.
+    /// Paced at 20 packets a millisecond: the proxy's socket buffer is a default one.
+    fn send_media(sender: &MediaSender, first: usize, count: usize) {
+        for i in first..first + count {
+            let mut p = vec![0x01u8; 1000];
+            p[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+            while !sender.send(&p).unwrap() {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            if i % 20 == 19 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    /// Tags of the media that reaches the client within `wait`, stopping at `want`.
+    async fn receive_media(media: &ClientMedia, want: usize, wait: Duration) -> Vec<usize> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut tags = Vec::new();
+        while tags.len() < want && std::time::Instant::now() < deadline {
+            let Some(batch) = media.recv_owned().unwrap() else {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                continue;
+            };
+            let mut off = 0;
+            while let Some(r) = batch.at(off) {
+                off = r.end;
+                let p = batch.bytes(r);
+                tags.push(u64::from_le_bytes(p[1..9].try_into().unwrap()) as usize);
+            }
+        }
+        tags
+    }
+
+    /// A client whose address moves mid-session keeps its stream: the host learns the new
+    /// address from the client's next packet, media follows it with no reconnect, and the
+    /// client counts nothing as foreign.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn media_follows_a_client_that_moves() {
+        let mut proxy = None;
+        let (_server, socket, _client, media, host_conn, client_conn) = pair_with(|host| {
+            let p = RebindingProxy::start(host);
+            let front = p.front;
+            proxy = Some(p);
+            front
+        })
+        .await;
+        let proxy = proxy.unwrap();
+        let sender = MediaSender::new(&socket, host_conn.clone()).unwrap();
+        assert_eq!(canonical(sender.path().unwrap().0), proxy.backs[0]);
+        send_media(&sender, 0, 100);
+        assert_eq!(
+            receive_media(&media, 100, Duration::from_secs(5))
+                .await
+                .len(),
+            100
+        );
+
+        proxy.rebind();
+        client_conn.send_datagram(vec![7u8; 8].into()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while canonical(host_conn.remote_address()) != proxy.backs[1] {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the host never saw the move"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // A new IP holds media for the validation window; a port-only rebind does not.
+        let held = sender.path().is_none();
+        assert_eq!(held, proxy.backs[0].ip() != proxy.backs[1].ip());
+        while sender.path().is_none() {
+            assert!(std::time::Instant::now() < deadline, "media never followed");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(canonical(sender.path().unwrap().0), proxy.backs[1]);
+
+        send_media(&sender, 100, 300);
+        let tags = receive_media(&media, 300, Duration::from_secs(5)).await;
+        assert_eq!(tags.len(), 300, "every packet after the move arrives");
+        assert!(tags.iter().all(|&t| (100..400).contains(&t)));
+        assert_eq!(media.stats().foreign.load(Ordering::Relaxed), 0);
+        host_conn.send_datagram(vec![9u8; 8].into()).unwrap();
+        let down = tokio::time::timeout(Duration::from_secs(2), client_conn.read_datagram()).await;
+        assert!(
+            matches!(down, Ok(Ok(_))),
+            "QUIC still crosses after the move"
+        );
+        assert!(host_conn.close_reason().is_none() && client_conn.close_reason().is_none());
+    }
+
+    /// Only a new IP waits for validation, and only for the hold.
+    #[test]
+    fn only_a_new_ip_waits_for_validation() {
+        let a: SocketAddr = "10.0.0.2:5000".parse().unwrap();
+        let rebound: SocketAddr = "10.0.0.2:6000".parse().unwrap();
+        let moved: SocketAddr = "10.0.1.7:5000".parse().unwrap();
+        let hold = validation_hold(Duration::from_millis(10));
+        assert_eq!(hold, Duration::from_millis(105));
+        assert!(!still_validating(a, rebound, Duration::ZERO, hold));
+        assert!(still_validating(a, moved, Duration::from_millis(100), hold));
+        assert!(!still_validating(a, moved, hold, hold));
     }
 
     /// A lent buffer comes back on drop, and the pool never allocates past its bound.

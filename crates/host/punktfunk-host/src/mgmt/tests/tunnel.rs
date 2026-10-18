@@ -60,7 +60,11 @@ async fn a_tunnelled_request_is_the_lan_peer_it_came_from() {
     let admin = [("authorization", "Bearer test-secret")];
     let via = |head: Head| {
         let app = app.clone();
-        async move { dispatch(&app, lan, plane, head, Vec::new()).await.status() }
+        async move {
+            dispatch(&app, lan, plane, None, head, Vec::new())
+                .await
+                .status()
+        }
     };
 
     assert_eq!(
@@ -120,7 +124,7 @@ async fn a_tunnelled_device_token_reads_the_library_and_no_more() {
             h,
         };
         async move {
-            let res = dispatch(&app, lan, plane, head, body).await;
+            let res = dispatch(&app, lan, plane, None, head, body).await;
             let status = res.status();
             let bytes = res.into_body().collect().await.unwrap().to_bytes();
             let json = serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -180,6 +184,44 @@ async fn a_tunnelled_device_token_reads_the_library_and_no_more() {
     );
     let (status, _) = call("GET", "/api/v1/clients", bearer, vec![]).await;
     assert_ne!(status, StatusCode::OK);
+}
+
+/// A native management connection's proven certificate is the HTTPS client certificate: a
+/// paired one reads the library with no token, and buys no more than that lane. A stranger's,
+/// or none, reads nothing.
+#[tokio::test]
+async fn a_paired_certificate_on_a_native_tunnel_reads_the_library() {
+    use crate::webtransport::mgmt::{dispatch, Head};
+    let path = crate::test_support::scratch().join("pf-mgmt-native-tunnel.json");
+    let np =
+        Arc::new(crate::native_pairing::NativePairing::load_with(Some(path), None, false).unwrap());
+    let fp = "ab".repeat(32);
+    np.add("Phone", &fp).unwrap();
+    let app = test_app_native(test_state(), np);
+    let lan: std::net::SocketAddr = "192.168.5.80:40100".parse().unwrap();
+    let plane: std::net::SocketAddr = "0.0.0.0:9777".parse().unwrap();
+    let via = |cert: Option<String>, p: &str| {
+        let app = app.clone();
+        let head = Head {
+            m: "GET".into(),
+            p: p.into(),
+            h: vec![],
+        };
+        async move {
+            dispatch(&app, lan, plane, cert, head, Vec::new())
+                .await
+                .status()
+        }
+    };
+    let library = "/api/v1/library/page?limit=50";
+    assert_eq!(via(Some(fp.clone()), library).await, StatusCode::OK);
+    assert_ne!(via(Some("cd".repeat(32)), library).await, StatusCode::OK);
+    assert_ne!(via(None, library).await, StatusCode::OK);
+    assert_ne!(
+        via(Some(fp), "/api/v1/native/clients").await,
+        StatusCode::OK,
+        "a paired device never reaches the admin lane"
+    );
 }
 
 /// The browser's whole route into the management API: challenge, sign, exchange, then use the

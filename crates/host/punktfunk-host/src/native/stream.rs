@@ -402,7 +402,7 @@ fn service_burst(
     }
 }
 
-/// A diagnostic session (`EXT_DELIVERY_PROBE_ONLY`): the punched data plane serves every
+/// A diagnostic session (`EXT_DELIVERY_PROBE_ONLY`): the bound data plane serves every
 /// probe in full and nothing else — no display, encoder, launch or seat — until the client
 /// closes, [`PROBE_ONLY_MAX`] passes, or the probes have cost [`PROBE_ONLY_BYTES`]. Past the
 /// byte cap the rest are declined; the per-request clamps still apply to each.
@@ -496,7 +496,7 @@ fn pace_sealed(
     result.map_err(|e| anyhow!("send_sealed: {e:?}"))
 }
 
-/// What every stream source takes from its session: the punched session, its schedule, the
+/// What every stream source takes from its session: the bound session, its schedule, the
 /// stream thread's [`StreamEnds`], the [`SessionShared`] values and the session's identity.
 /// [`SessionContext`] and [`SynthAbrContext`] both carry one.
 ///

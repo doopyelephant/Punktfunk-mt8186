@@ -101,6 +101,23 @@ pub unsafe extern "C" fn punktfunk_connection_request_keyframe(
     })
 }
 
+/// The device's network path changed: call from the platform's path monitor when an
+/// interface comes up, goes down or takes over the default route. The host then follows
+/// a roam within a round trip instead of the next keep-alive.
+///
+/// # Safety
+/// `c` is a valid connection handle.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connection_path_changed(
+    c: *const PunktfunkConnection,
+) -> PunktfunkStatus {
+    with_conn!(c => {
+        c.inner.path_changed();
+        PunktfunkStatus::Ok
+    })
+}
+
 /// Ask the host to recover `[first_frame, last_frame]` by RFI (P-frame tagged
 /// `USER_FLAG_RECOVERY_ANCHOR`) instead of a full IDR. Throttle; keyframe is the backstop.
 ///

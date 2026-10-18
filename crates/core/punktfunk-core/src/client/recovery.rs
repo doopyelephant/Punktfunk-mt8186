@@ -729,6 +729,12 @@ impl FeedbackOut {
         Some(self.stamp())
     }
 
+    /// What the last datagram said, again: the host acts on its numbers once, so a copy only
+    /// shows it where the client is.
+    pub(crate) fn again(&self) -> Feedback {
+        self.stamp()
+    }
+
     /// The last closed window, the link rate and the shape.
     fn levels(&self) -> Feedback {
         Feedback {

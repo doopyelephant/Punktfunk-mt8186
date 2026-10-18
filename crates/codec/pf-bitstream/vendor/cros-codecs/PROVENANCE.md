@@ -350,5 +350,10 @@ this crate with overflow checks off, as it ships: 26, 28, 30 and 31 abort a rele
     `a_frame_obu_after_a_failed_header_is_parsed_on_its_own` in `pf-bitstream`.
     **Report upstream — not yet filed.**
 
+32. `src/codec/h264/nalu.rs` — `find_start_code` uses `memchr::memmem::find` (a new
+    `memchr = "2"` dependency, already in the workspace tree) instead of a scalar
+    `windows(3).position`: the scan runs once per byte of every AU on every client.
+    Not a defect; not for upstream.
+
 Re-sync procedure: fetch the AOSP tree, re-apply this trim, diff `codec/` +
 `bitstream_utils.rs` (expect near-zero conflicts), update the commit pin above.

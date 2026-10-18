@@ -1027,6 +1027,7 @@ version = "0.0.5"
 dependencies = [
  "env_logger",
  "log",
+ "memchr",
  "serde_json",
 ]
 

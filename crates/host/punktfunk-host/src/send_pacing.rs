@@ -527,6 +527,8 @@ pub(crate) struct CaptureCredit {
     /// it had only partly banked; the owed fraction is repaid before the next grab.
     credit: f32,
     last: Instant,
+    /// Repeat ticks since the last fresh frame; past [`IDLE_REPEATS`] the keep-alive backs off.
+    idle: u32,
 }
 
 impl CaptureCredit {
@@ -538,6 +540,7 @@ impl CaptureCredit {
         CaptureCredit {
             credit: Self::CAP,
             last: now,
+            idle: 0,
         }
     }
 
@@ -554,14 +557,29 @@ impl CaptureCredit {
 
     pub(crate) fn charge(&mut self) {
         self.credit -= 1.0;
+        self.idle = 0;
+    }
+
+    /// A tick that repeated the last frame: nothing arrived before the keep-alive ran out.
+    pub(crate) fn note_repeat(&mut self) {
+        self.idle = self.idle.saturating_add(1);
     }
 }
+
+/// Repeats at the keep-alive cadence before the idle backoff, about 190 ms at 120 Hz: on CBR
+/// they sharpen a still picture.
+pub(crate) const IDLE_REPEATS: u32 = 15;
 
 /// How long past `next` the arrival wait runs before a repeat goes out: half an interval
 /// with no measured source cadence, else until 1.25× the source period after the last
 /// submit. A steady slower source gets no repeat between its own frames; a stalled one
-/// re-sends after that same wait.
-fn keepalive_wait(interval: Duration, src_period_ns: Option<u64>) -> Duration {
+/// re-sends after that same wait. After [`IDLE_REPEATS`] repeats in a row the wait is three
+/// intervals: a still desktop re-encodes at a quarter of the rate, under every VRR floor, and
+/// the first real frame ends the wait at once.
+fn keepalive_wait(interval: Duration, src_period_ns: Option<u64>, idle_repeats: u32) -> Duration {
+    if idle_repeats >= IDLE_REPEATS {
+        return interval * 3;
+    }
     let half = interval.mul_f32(0.5);
     match src_period_ns {
         Some(p) => Duration::from_nanos(p)
@@ -616,8 +634,10 @@ pub(crate) fn wait_next_tick(
             if let Some(d) = earliest.checked_duration_since(Instant::now()) {
                 std::thread::sleep(d);
             }
+        } else {
+            credit.note_repeat();
         }
-        capturer.wait_arrival(*next + keepalive_wait(interval, src_period_ns));
+        capturer.wait_arrival(*next + keepalive_wait(interval, src_period_ns, credit.idle));
     } else if owed_aus(frame, enc, *next).is_none() {
         return sleep_to_grid(next);
     }
@@ -1150,10 +1170,33 @@ mod tests {
     #[test]
     fn a_slower_steady_source_outlives_the_keepalive() {
         let i = Duration::from_micros(8_333);
-        assert_eq!(keepalive_wait(i, None), i.mul_f32(0.5));
-        assert_eq!(keepalive_wait(i, Some(i.as_nanos() as u64)), i.mul_f32(0.5));
-        let two = keepalive_wait(i, Some(2 * i.as_nanos() as u64));
+        assert_eq!(keepalive_wait(i, None, 0), i.mul_f32(0.5));
+        assert_eq!(
+            keepalive_wait(i, Some(i.as_nanos() as u64), 0),
+            i.mul_f32(0.5)
+        );
+        let two = keepalive_wait(i, Some(2 * i.as_nanos() as u64), 0);
         assert!(two > i.mul_f32(1.4) && two < i.mul_f32(1.6), "{two:?}");
+    }
+
+    /// A still desktop keeps the sharpening repeats, then waits three intervals a repeat
+    /// until a fresh frame is charged.
+    #[test]
+    fn an_idle_desktop_backs_off_after_the_sharpening_repeats() {
+        let i = Duration::from_micros(8_333);
+        assert_eq!(keepalive_wait(i, None, IDLE_REPEATS - 1), i.mul_f32(0.5));
+        assert_eq!(keepalive_wait(i, None, IDLE_REPEATS), i * 3);
+        assert_eq!(
+            keepalive_wait(i, Some(i.as_nanos() as u64), IDLE_REPEATS + 9),
+            i * 3
+        );
+        let mut credit = CaptureCredit::new(Instant::now());
+        for _ in 0..IDLE_REPEATS {
+            credit.note_repeat();
+        }
+        assert_eq!(credit.idle, IDLE_REPEATS);
+        credit.charge();
+        assert_eq!(credit.idle, 0);
     }
 
     #[test]

@@ -10,6 +10,7 @@ edition = "2021"
 
 [dependencies]
 log = "0.4"
+memchr = "2"
 
 # Upstream's in-tree unit tests (kept — they are the conformance goldens) want these.
 [dev-dependencies]

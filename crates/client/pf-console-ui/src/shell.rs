@@ -536,6 +536,7 @@ impl Shell {
         use pf_client_core::console::SessionPhase;
         match phase {
             SessionPhase::Connecting => {}
+            SessionPhase::AwaitingApproval => self.session_awaiting_approval(),
             SessionPhase::Streaming => self.session_streaming(),
             SessionPhase::Failed(msg) => self.session_failed(msg),
             SessionPhase::Ended(reason) => self.session_ended(reason),

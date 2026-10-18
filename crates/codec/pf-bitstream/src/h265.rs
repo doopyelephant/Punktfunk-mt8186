@@ -496,6 +496,8 @@ impl H265Planner {
             let range = (nalu_offset - nalu.offset)..(nalu_offset + nalu.size);
             debug_assert_eq!(&au[range.clone()], nalu.data.as_ref());
             consumed_end = range.end;
+            // Past this payload, or the next `Nalu::next` scans it a second time.
+            cursor.set_position(range.end as u64);
 
             // Hosts emit single-layer only. nuh_layer_id > 0 is an enhancement
             // layer; half-decoding the base of an unknown stream is silent loss.

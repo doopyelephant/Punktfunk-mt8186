@@ -26,6 +26,7 @@
 import CryptoKit
 import Foundation
 import Network
+import PunktfunkCore
 import Security
 
 enum MgmtTransportError: Error, Sendable {
@@ -100,6 +101,47 @@ enum MgmtTransport {
     static func unbracketed(_ host: String) -> String {
         guard host.hasPrefix("["), host.hasSuffix("]"), host.count > 2 else { return host }
         return String(host.dropFirst().dropLast())
+    }
+}
+
+extension MgmtTransport {
+    /// How long a dial over the stream port waits before HTTPS takes over.
+    static let tunnelWaitMs: UInt32 = 3000
+
+    /// `GET path` over the host's stream port, which needs no TCP 47990. Throws `pinMismatch`
+    /// for a host that is not the pinned one, `connection` when the port carried nothing.
+    static func tunnelGet(_ path: String, to target: MgmtTarget) async throws -> HTTPResponse {
+        try await withCheckedThrowingContinuation { done in
+            // The call blocks for a dial; it must not hold a cooperative thread.
+            DispatchQueue.global(qos: .userInitiated).async {
+                done.resume(with: Result { try tunnelGetBlocking(path, to: target) })
+            }
+        }
+    }
+
+    private static func tunnelGetBlocking(
+        _ path: String, to target: MgmtTarget
+    ) throws -> HTTPResponse {
+        guard target.pin.count == 32 else { throw MgmtTransportError.pinMismatch }
+        var status: UInt16 = 0
+        var body: UnsafeMutablePointer<UInt8>?
+        var len: UInt = 0
+        let rc = target.pin.withUnsafeBytes { pin in
+            punktfunk_mgmt_request(
+                unbracketed(target.address), target.streamPort, target.certPEM, target.keyPEM,
+                pin.bindMemory(to: UInt8.self).baseAddress, "GET", path, nil, 0, tunnelWaitMs,
+                &status, &body, &len)
+        }
+        defer { punktfunk_mgmt_body_free(body, len) }
+        switch rc {
+        case PUNKTFUNK_STATUS_OK.rawValue:
+            let data = body.map { Data(bytes: $0, count: Int(len)) } ?? Data()
+            return HTTPResponse(status: Int(status), headers: [:], body: data)
+        case PUNKTFUNK_STATUS_CRYPTO.rawValue:
+            throw MgmtTransportError.pinMismatch
+        default:
+            throw MgmtTransportError.connection("stream port status \(rc)")
+        }
     }
 }
 

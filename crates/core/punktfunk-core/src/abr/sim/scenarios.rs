@@ -18,7 +18,7 @@ use crate::quic::{CODEC_H264, CODEC_HEVC};
 const WEBOS_PROBE_KBPS: u32 = 320_000;
 
 /// Display, capture and encoder bring-up. Windows measured
-/// `punch_done+1848 … first_packet+4815`; the ramp lives in that gap.
+/// `plane_bound+1848 … first_packet+4815`; the ramp lives in that gap.
 const BRINGUP_MS: u64 = 2_500;
 
 /// The same scenario against a host that serves the bring-up ramp: video

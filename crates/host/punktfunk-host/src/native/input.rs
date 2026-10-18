@@ -5,7 +5,7 @@
 //! mixed controller kinds to uinput/UHID (Linux) or XUSB/UMDF (Windows). Rumble and
 //! HID-output pump on the same thread.
 //!
-//! Pin `PUNKTFUNK_RUMBLE_ENVELOPE=0`, `PUNKTFUNK_RUMBLE_TTL_MS`, `PUNKTFUNK_XBOX_BACKEND=xusb`.
+//! Pin `PUNKTFUNK_RUMBLE_TTL_MS`, `PUNKTFUNK_XBOX_BACKEND=xusb`.
 //! Evidence: `design/gamescope-multiuser.md`, `design/rumble-envelope-plan.md`,
 //! `design/trigger-rumble-plane.md`, `design/pen-tablet-input.md`.
 
@@ -743,30 +743,19 @@ fn rumble_silent(lv: RumbleLevels) -> bool {
     lv == (0, 0, 0, 0)
 }
 
-/// One 0xCA rumble datagram. `envelope_on` selects v3 (default) or v1
-/// (`PUNKTFUNK_RUMBLE_ENVELOPE=0`). Best-effort, like every side-plane datagram.
+/// One 0xCA rumble datagram, always v3. Best-effort, like every side-plane datagram.
 ///
-/// v3 is unconditional while the envelope is on — not "only if a trigger is
-/// non-zero". A history-dependent wire form is a sequence bug; pre-v3 clients
-/// read the 10-byte prefix and ignore the tail.
-///
-/// The v1 hatch has no trigger tail. "Trigger rumble stopped" is an expected
-/// symptom of the hatch — do not bisect a trigger bug into it.
-fn rumble_datagram(envelope_on: bool, pad: u16, lv: RumbleLevels, seq: u8, ttl_ms: u16) -> Vec<u8> {
+/// v3 is unconditional — not "only if a trigger is non-zero". A history-dependent wire
+/// form is a sequence bug; pre-v3 clients read the 10-byte prefix and ignore the tail.
+fn rumble_datagram(pad: u16, lv: RumbleLevels, seq: u8, ttl_ms: u16) -> Vec<u8> {
     let (low, high, lt, rt) = lv;
-    if envelope_on {
-        punktfunk_core::quic::encode_rumble_datagram_v3(pad, low, high, seq, ttl_ms, lt, rt)
-            .to_vec()
-    } else {
-        punktfunk_core::quic::encode_rumble_datagram(pad, low, high).to_vec()
-    }
+    punktfunk_core::quic::encode_rumble_datagram_v3(pad, low, high, seq, ttl_ms, lt, rt).to_vec()
 }
 
 /// Per-pad 0xCA rumble leases. Rumble is v3 (`[level][seq][ttl_ms][trigger levels]`):
 /// an active level renews every `ttl × 3/10` and an abandoned one expires client-side
 /// (`design/rumble-envelope-plan.md`, `design/trigger-rumble-plane.md`). Four motors
-/// share one `seq` and one TTL. `PUNKTFUNK_RUMBLE_ENVELOPE=0` reverts to v1 plus a flat
-/// 500 ms refresh, which drops trigger rumble ([`rumble_datagram`]).
+/// share one `seq` and one TTL.
 struct RumbleLeases {
     lv: [RumbleLevels; MAX_WIRE_PADS],
     seen: [bool; MAX_WIRE_PADS],
@@ -774,7 +763,6 @@ struct RumbleLeases {
     /// by [`Self::clear`]: the client's gate has no reset (`client/pump/datagram_task.rs`).
     seq: [u8; MAX_WIRE_PADS],
     stop_burst: [u8; MAX_WIRE_PADS],
-    envelope_on: bool,
     ttl_ms: u16,
     every: std::time::Duration,
     last: std::time::Instant,
@@ -787,26 +775,18 @@ impl RumbleLeases {
             .and_then(|s| s.parse::<u16>().ok())
             .map(|v| v.clamp(RUMBLE_TTL_FLOOR_MS, RUMBLE_TTL_CEIL_MS))
             .unwrap_or(RUMBLE_TTL_MS);
-        RumbleLeases::new(
-            pf_host_config::env_on("PUNKTFUNK_RUMBLE_ENVELOPE").unwrap_or(true),
-            ttl_ms,
-            std::time::Instant::now(),
-        )
+        RumbleLeases::new(ttl_ms, std::time::Instant::now())
     }
 
     /// Renew at 30 % of TTL (≈120 ms at 400) so 2–3 renewals cover the lease.
-    fn new(envelope_on: bool, ttl_ms: u16, now: std::time::Instant) -> RumbleLeases {
-        let every = if envelope_on {
-            std::time::Duration::from_millis((ttl_ms as u64 * 3 / 10).max(RUMBLE_RENEW_FLOOR_MS))
-        } else {
-            std::time::Duration::from_millis(500)
-        };
+    fn new(ttl_ms: u16, now: std::time::Instant) -> RumbleLeases {
+        let every =
+            std::time::Duration::from_millis((ttl_ms as u64 * 3 / 10).max(RUMBLE_RENEW_FLOOR_MS));
         RumbleLeases {
             lv: [(0, 0, 0, 0); MAX_WIRE_PADS],
             seen: [false; MAX_WIRE_PADS],
             seq: [0; MAX_WIRE_PADS],
             stop_burst: [0; MAX_WIRE_PADS],
-            envelope_on,
             ttl_ms,
             every,
             last: now,
@@ -819,7 +799,7 @@ impl RumbleLeases {
         let idx = pad as usize;
         if idx >= MAX_WIRE_PADS {
             // Out of range (backends never emit this): forwarded ungated.
-            return rumble_datagram(self.envelope_on, pad, lv, 0, self.ttl_ms);
+            return rumble_datagram(pad, lv, 0, self.ttl_ms);
         }
         let (silent, prev) = (rumble_silent(lv), self.lv[idx]);
         // Silent→active once per buzz, with the triggers, so "host never saw trigger
@@ -845,11 +825,11 @@ impl RumbleLeases {
         };
         // Any of the four motors → live TTL. See `rumble_silent`.
         let ttl = if silent { 0 } else { self.ttl_ms };
-        rumble_datagram(self.envelope_on, pad, lv, self.seq[idx], ttl)
+        rumble_datagram(pad, lv, self.seq[idx], ttl)
     }
 
     /// Once per interval: renew each active lease (bump `seq`, fresh TTL), drain a stop
-    /// burst, then go quiet. v1 re-sends every seen pad's handles instead.
+    /// burst, then go quiet.
     fn tick(&mut self, now: std::time::Instant, mut send: impl FnMut(Vec<u8>)) {
         if now.saturating_duration_since(self.last) < self.every {
             return;
@@ -857,10 +837,6 @@ impl RumbleLeases {
         self.last = now;
         for i in (0..MAX_WIRE_PADS).filter(|&i| self.seen[i]) {
             let lv = self.lv[i];
-            if !self.envelope_on {
-                send(rumble_datagram(false, i as u16, lv, 0, 0));
-                continue;
-            }
             let silent = rumble_silent(lv);
             if silent {
                 if self.stop_burst[i] == 0 {
@@ -870,7 +846,7 @@ impl RumbleLeases {
             }
             self.seq[i] = self.seq[i].wrapping_add(1);
             let ttl = if silent { 0 } else { self.ttl_ms };
-            send(rumble_datagram(true, i as u16, lv, self.seq[i], ttl));
+            send(rumble_datagram(i as u16, lv, self.seq[i], ttl));
         }
     }
 
@@ -1740,7 +1716,7 @@ mod tests {
     /// stored value (up to 128 sends).
     #[test]
     fn rumble_seq_survives_a_removal_so_the_client_gate_accepts() {
-        let mut leases = RumbleLeases::new(true, RUMBLE_TTL_MS, std::time::Instant::now());
+        let mut leases = RumbleLeases::new(RUMBLE_TTL_MS, std::time::Instant::now());
         let mut gate: Option<u8> = None;
         for i in 0..100u16 {
             assert!(deliver(
@@ -1762,7 +1738,7 @@ mod tests {
         );
 
         // Non-vacuity: a counter restarted at 0 is rejected for the whole forward window.
-        let mut restarted = RumbleLeases::new(true, RUMBLE_TTL_MS, std::time::Instant::now());
+        let mut restarted = RumbleLeases::new(RUMBLE_TTL_MS, std::time::Instant::now());
         let mut stranded = Some(100u8);
         assert!(
             (0..100u16).all(|i| !deliver(&restarted.on_level(0, (i + 1, 0, 0, 0)), &mut stranded)),
@@ -1777,7 +1753,7 @@ mod tests {
         use punktfunk_core::quic::decode_rumble_envelope;
         use std::time::Duration;
         let t0 = std::time::Instant::now();
-        let mut leases = RumbleLeases::new(true, 400, t0);
+        let mut leases = RumbleLeases::new(400, t0);
         assert_eq!(leases.every, Duration::from_millis(120));
         let tick = |leases: &mut RumbleLeases, at: Duration| {
             let mut out = Vec::new();
@@ -1807,16 +1783,6 @@ mod tests {
             }
         }
         assert_eq!(zeros, RUMBLE_STOP_BURST, "stop burst");
-
-        // The v1 hatch re-sends every seen pad's handles on its flat 500 ms clock.
-        let mut v1 = RumbleLeases::new(false, 400, t0);
-        v1.on_level(0, (7, 8, 9, 10));
-        let mut sent = Vec::new();
-        v1.tick(t0 + Duration::from_millis(500), |d| sent.push(d));
-        assert_eq!(
-            sent,
-            [punktfunk_core::quic::encode_rumble_datagram(0, 7, 8).to_vec()]
-        );
     }
 
     /// A rumble that drives only the impulse triggers must still get a live TTL
@@ -1826,7 +1792,7 @@ mod tests {
     /// the client silences on arrival with no error.
     #[test]
     fn a_trigger_only_rumble_gets_a_live_ttl() {
-        let mut leases = RumbleLeases::new(true, RUMBLE_TTL_MS, std::time::Instant::now());
+        let mut leases = RumbleLeases::new(RUMBLE_TTL_MS, std::time::Instant::now());
         let d = leases.on_level(0, (0, 0, 0x8000, 0));
         let u = punktfunk_core::quic::decode_rumble_envelope(&d).expect("v3 envelope decodes");
         assert_eq!(

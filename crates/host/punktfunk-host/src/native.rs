@@ -1264,12 +1264,12 @@ pub(crate) async fn run_admitted(
         && codec != crate::encode::Codec::PyroWave
         && matches!(data_plane, DataPlane::Shared(_)))
     .then_some(wire_mtu::ShardReneg {
-        client_ceiling: hello.max_shard_payload,
         change_tx: shard.change_tx,
         ack_rx: shard.ack_rx,
         apply_tx: shard.apply_tx,
     });
-    // Path-MTU watch: clamp for the next session, and heal/grow this one if the driver exists.
+    // Path-MTU watch for the connection's life: clamp for the next session, and heal/grow
+    // this one if the driver exists, including after the client moves.
     wire_mtu::spawn_watch(
         conn.clone(),
         welcome.shard_payload as usize,
@@ -1578,7 +1578,8 @@ pub(crate) async fn run_admitted(
         .map(|policy| crate::session_status::apply_audio_policy(policy, &client_label));
     let result: Result<()> = async {
         let clear = features.has(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT);
-        let (transport, wire_sock, media) = bind_data_plane(data_plane, &bringup, clear)?;
+        let (transport, wire_sock, media) =
+            bind_data_plane(data_plane, &bringup, clear, shared.offload_switch.clone())?;
         let session = Session::new(welcome.session_config(Role::Host), media, transport)
             .map_err(|e| anyhow!("host session: {e:?}"))?;
         let common = StreamCommon {
@@ -2047,7 +2048,7 @@ fn run_source(
         Punktfunk1Source::Virtual => {
             let ctx = display(common);
             match prep {
-                // Display prep started at Welcome: hand it the post-punch context.
+                // Display prep started at Welcome: hand it the bound plane's context.
                 Some((ctx_tx, prep_thread)) => match ctx_tx.send(ctx) {
                     Ok(()) => match prep_thread.join() {
                         Ok(r) => r,
@@ -2484,8 +2485,9 @@ fn bind_data_plane(
     data_plane: DataPlane,
     bringup: &crate::bringup::Trace,
     clear_placement: bool,
+    offload: Arc<AtomicBool>,
 ) -> Result<BoundPlane> {
-    bringup.mark("punch_done");
+    bringup.mark("plane_bound");
     match data_plane {
         DataPlane::Web(plane) => {
             let v2 = plane.v2().clone();
@@ -2503,11 +2505,12 @@ fn bind_data_plane(
                 .ok_or_else(|| anyhow!("punktfunk/2 session reached media with no suite"))?;
             let keys = endpoint::media_keys(&v2.conn, &v2.session_id, suite)
                 .ok_or_else(|| anyhow!("punktfunk/2 media keys: exporter refused"))?;
-            let sender = punktfunk_core::transport::shared::MediaSender::new(
+            let mut sender = punktfunk_core::transport::shared::MediaSender::new(
                 &v2.media_socket,
                 v2.conn.clone(),
             )
             .context("punktfunk/2 media sender")?;
+            sender.set_offload_switch(offload);
             let media = punktfunk_core::session::MediaV2 {
                 clock_origin_ns: v2.clock.origin_ns(),
                 keys: Some(keys),

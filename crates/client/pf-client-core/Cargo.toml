@@ -192,5 +192,9 @@ pyrowave = ["pf-client-video?/pyrowave"]
 [build-dependencies]
 cfg_aliases = "0.2"
 
+# x86 desktops open every packet with aws-lc-rs's VAES kernels: 250 ns a packet against 520.
+[target.'cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))'.dependencies]
+punktfunk-core = { path = "../../core/punktfunk-core", features = ["aes-aws-lc-rs"] }
+
 [lints]
 workspace = true

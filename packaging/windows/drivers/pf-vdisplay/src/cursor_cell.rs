@@ -31,7 +31,7 @@ pub struct CursorCell {
     pub image: Mutex<Option<CursorImage>>,
     blend: AtomicBool,
     /// A worker runs under a declared hardware cursor, so the blend can turn on at any moment.
-    /// The pool keeps a clean plate of every composed frame while this holds.
+    /// The pool plates the still-desktop stash and a session's first frame while this holds.
     armed: AtomicBool,
     /// The host's SDR-white scale for an FP16 frame, as `f32` bits; 0 until the first publish.
     pub sdr_white_scale: AtomicU32,
@@ -48,7 +48,7 @@ impl CursorCell {
         self.blend.load(Ordering::Relaxed)
     }
 
-    /// A worker runs under a declared hardware cursor: the pool keeps a clean plate.
+    /// A worker runs under a declared hardware cursor: the stash and the first frame get a plate.
     pub fn armed(&self) -> bool {
         self.armed.load(Ordering::Relaxed)
     }

@@ -394,7 +394,8 @@ impl Overlay for SkiaOverlay {
         match &phase {
             SessionPhase::Streaming => self.streaming_since = Some(Instant::now()),
             SessionPhase::Ended(_) | SessionPhase::Reconnecting(_) => self.streaming_since = None,
-            SessionPhase::Connecting | SessionPhase::Failed(_) => {}
+            SessionPhase::Connecting | SessionPhase::AwaitingApproval | SessionPhase::Failed(_) => {
+            }
         }
         // An open ring is the ended stream's. Left up, it masks the next stream's pad.
         if matches!(phase, SessionPhase::Ended(_) | SessionPhase::Failed(_)) {

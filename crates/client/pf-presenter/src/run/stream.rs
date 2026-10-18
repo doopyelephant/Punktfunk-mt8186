@@ -51,6 +51,7 @@ impl StreamState {
             cursor: crate::cursor_model::CursorModel::new(Instant::now()),
             force_software,
             canceled: false,
+            redials: 0,
             ready_announced: false,
             mode_line: String::new(),
             fp_hex: String::new(),
@@ -382,9 +383,9 @@ pub(super) fn cycle_pad_mouse(c: &NativeClient, ring_opener: Option<u8>) {
 }
 
 impl Shell {
-    /// Drain the pump's session events. A browse stream ending, a codec fallback or a
-    /// not-ready host replaces `stream` mid-drain, so each event re-borrows it and a
-    /// terminal one stops the drain. `Break` is a single-mode stream ending the loop.
+    /// Drain the pump's session events. A browse stream ending, a codec fallback, a lost
+    /// link or a not-ready host replaces `stream` mid-drain, so each event re-borrows it and
+    /// a terminal one stops the drain. `Break` is a single-mode stream ending the loop.
     pub(super) fn drain_session_events(
         &mut self,
         stream: &mut Option<StreamState>,
@@ -393,12 +394,62 @@ impl Shell {
             let Ok(ev) = st.handle.events.try_recv() else {
                 break;
             };
+            // A lost link dials the same host again on the shared schedule, and a redial
+            // that fails to dial is the next attempt. The redial carries the lost session's
+            // resume id. A spent schedule, or a cancel, ends the stream as before.
+            let lost = match &ev {
+                SessionEvent::Lost(_) => true,
+                SessionEvent::Failed {
+                    trust_rejected: false,
+                    refused: None,
+                    ..
+                } => st.redials > 0,
+                _ => false,
+            };
+            let wait = PunktfunkEndReason::Lost.redial_delay(st.redials);
+            if let Some(wait) = wait.filter(|_| lost && !st.canceled) {
+                let attempt = st.redials + 1;
+                tracing::info!(
+                    attempt,
+                    wait_ms = wait.as_millis() as u64,
+                    "connection lost — dialing the host again"
+                );
+                if matches!(ev, SessionEvent::Lost(_)) {
+                    self.release_stream(st);
+                }
+                let mut params = st.params.clone();
+                if let Some(c) = &st.connector {
+                    params.mode = c.mode();
+                }
+                params.redial_wait = wait;
+                let force_software = Arc::new(AtomicBool::new(false));
+                params.force_software = force_software.clone();
+                self.end_stream(
+                    stream,
+                    SessionPhase::Reconnecting("Lost the connection — reconnecting."),
+                );
+                let mut next = self.start_stream(params, force_software);
+                next.redials = attempt;
+                *stream = Some(next);
+                break;
+            }
             match ev {
+                // The host parked the dial for its operator: the parent shell and the console
+                // both show the approval wait.
+                SessionEvent::AwaitingApproval => {
+                    emit(SessionLine::AwaitingApproval);
+                    if let Some(o) = self.overlay.as_mut() {
+                        o.session_phase(SessionPhase::AwaitingApproval);
+                    }
+                }
                 SessionEvent::Connected {
                     connector,
                     mode,
                     fingerprint,
-                } => self.on_connected(st, connector, mode, fingerprint),
+                } => {
+                    st.redials = 0;
+                    self.on_connected(st, connector, mode, fingerprint)
+                }
                 SessionEvent::DecodeFacts(f) => st.facts = f,
                 // Welcome advert first, then every mid-session AccessUpdate. Re-gate live
                 // capture: a removed POINTER/KEYBOARD bit releases the lock it backed;
@@ -453,7 +504,7 @@ impl Shell {
                     self.end_stream(stream, phase);
                     break;
                 }
-                SessionEvent::Ended(reason) => {
+                SessionEvent::Ended(reason) | SessionEvent::Lost(reason) => {
                     self.release_stream(st);
                     if !self.browse {
                         return ControlFlow::Break(Outcome::Ended(reason));

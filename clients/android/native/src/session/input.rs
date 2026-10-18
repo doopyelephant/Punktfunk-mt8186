@@ -145,6 +145,23 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeSetInvertSc
     })
 }
 
+/// `NativeBridge.nativePathChanged(handle)` — the default network or its addresses changed. The
+/// core shows the host where this device is now, so a roam heals within a round trip. `false`
+/// when the session is gone.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativePathChanged(
+    _env: EnvUnowned,
+    _this: JObject,
+    handle: jlong,
+) -> jboolean {
+    jni_guard(false, || {
+        SESSIONS.get(handle).is_some_and(|h| {
+            h.client.path_changed();
+            true
+        })
+    })
+}
+
 /// `NativeBridge.nativeSendTouch(handle, id, kind, x, y, surfaceWidth, surfaceHeight)` — one REAL
 /// touchscreen transition (`kind`: 0=down 1=move 2=up), for the touch-passthrough input mode. `id`
 /// distinguishes fingers (reusable after up); coordinates are pixels on the client's touch

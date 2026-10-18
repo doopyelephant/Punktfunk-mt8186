@@ -407,6 +407,7 @@ impl StreamState {
                             ramp_open,
                             cursor_client_draws,
                             arrival_poke,
+                            offload_switch: _,
                         },
                     mut bitrate_kbps,
                     audio_reserved_kbps,
@@ -461,7 +462,7 @@ impl StreamState {
         // The raw flags, for the display, the prep retries and the threads that poll one.
         let stop = life.stop_flag().clone();
         let quit = life.quit_flag().clone();
-        // The data plane is punched and idle until the send thread starts.
+        // The data plane is bound and idle until the send thread starts.
         // Answer the client's bring-up ramp on it meanwhile: it measures the
         // link with no video to damage, and hands both back below.
         let ramp = ramp::RampServer::start(

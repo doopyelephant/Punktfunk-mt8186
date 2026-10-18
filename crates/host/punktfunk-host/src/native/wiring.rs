@@ -54,9 +54,9 @@ pub(crate) struct SessionShared {
     /// A report window showed loss. The stream loop takes it and holds the encoder on
     /// confirmed references until ten seconds past the last.
     pub(crate) lossy_window: Arc<AtomicBool>,
-    /// The bring-up ramp's window: probe requests are served on the punched data plane without
+    /// The bring-up ramp's window: probe requests are served on the bound data plane without
     /// the control task's spacing until the send thread takes the session (`stream::ramp`).
-    /// Open from the handshake, because the client asks as soon as it has punched.
+    /// Open from the handshake, because the client asks as soon as its session starts.
     pub(crate) ramp_open: Arc<AtomicBool>,
     /// `true` = the client draws the cursor (exclude + forward), `false` = the host composites.
     /// Stays `true`, and inert, for a session without the cursor cap.
@@ -64,6 +64,9 @@ pub(crate) struct SessionShared {
     /// The capturer's arrival poke ([`pf_capture::Capturer::arrival_poke`]), set by the
     /// stream loop for each capturer it runs; the control task fires it with a recovery ask.
     pub(crate) arrival_poke: ArrivalPoke,
+    /// UDP send offload for the media sender. The control task's loss guard clears it once
+    /// for the session; a cleared switch sends every packet on its own.
+    pub(crate) offload_switch: Arc<AtomicBool>,
 }
 
 /// [`SessionShared::acked`] before the client confirmed a frame.
@@ -205,6 +208,7 @@ impl SessionWiring {
                 fec_requested,
                 link_kbps: Arc::new(AtomicU32::new(0)),
                 arrival_poke: Arc::new(std::sync::Mutex::new(None)),
+                offload_switch: Arc::new(AtomicBool::new(true)),
                 shape: Arc::new(AtomicU8::new(0)),
                 ports,
                 resend: Arc::default(),

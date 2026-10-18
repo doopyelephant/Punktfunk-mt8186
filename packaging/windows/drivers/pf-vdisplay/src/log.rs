@@ -92,9 +92,13 @@ pub(crate) fn file_log_enabled() -> bool {
 /// A driver knob: the process environment first, then the MACHINE environment in the registry
 /// (where `setx /M` writes). WUDFHost inherits its environment from the SCM at boot and the SCM
 /// never refreshes it, so a `setx /M` set today is invisible to `std::env` until a reboot; the
-/// registry read makes a device restart enough.
+/// registry read makes a device restart enough. An empty value is no value: `setx /M NAME ""`
+/// leaves one behind, and a knob read as present turns on.
 pub(crate) fn knob(name: &str) -> Option<String> {
-    std::env::var(name).ok().or_else(|| machine_env(name))
+    std::env::var(name)
+        .ok()
+        .or_else(|| machine_env(name))
+        .filter(|v| !v.trim().is_empty())
 }
 
 /// Read a MACHINE environment variable from the registry (see [`knob`]).

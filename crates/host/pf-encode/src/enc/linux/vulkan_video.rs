@@ -988,6 +988,8 @@ struct Frame {
     ts_written: bool,
     bs: VkBufferAlloc,
     bs_ptr: BsPtr,
+    /// False when `bs` sits in cached, non-coherent memory: `read_slot` invalidates first.
+    bs_coherent: bool,
     // Unaligned RGB-direct only ([`RgbDirect::padded`]): ALIGNED BGRA encode-src.
     pad: VkImageAlloc,
     csc_set: vk::DescriptorSet, // Y/UV fixed; binding 0 (RGB) rewritten each use
@@ -3783,6 +3785,13 @@ impl VulkanVideoEncoder {
         let f = &self.frames[slot];
         let p = f.bs_ptr.0;
         debug_assert!(!p.is_null(), "bs persistent mapping missing");
+        if !f.bs_coherent {
+            // Offset 0 + WHOLE_SIZE needs no `nonCoherentAtomSize` rounding.
+            dev.invalidate_mapped_memory_ranges(&[vk::MappedMemoryRange::default()
+                .memory(f.bs.memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE)])?;
+        }
         let prefix: &[u8] = if f.keyframe {
             &self.header
         } else {
