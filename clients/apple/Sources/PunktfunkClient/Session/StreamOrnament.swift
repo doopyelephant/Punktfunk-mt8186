@@ -1,11 +1,14 @@
-// visionOS: the controls hung below a stream window.
+// visionOS: the controls hung below a stream window. They show for a session's first seconds,
+// then rest invisible until the player looks at where they hang.
 
 #if os(visionOS)
 import SwiftUI
 
-/// The stream window's controls, below it.
+/// The stream window's controls, below it. A look is the only reveal: a pinch on the picture is
+/// the host's click. The system draws the hover state, so the rest state costs no input.
 struct StreamOrnament: View {
     let quickActions: () -> Void
+    @State private var resting = false
 
     var body: some View {
         HStack(spacing: 12) {
@@ -17,6 +20,14 @@ struct StreamOrnament: View {
         .labelStyle(.iconOnly)
         .padding(12)
         .glassBackgroundEffect()
+        .contentShape(.hoverEffect, .rect(cornerRadius: 24))
+        .hoverEffect { effect, active, _ in
+            effect.animation(.smooth(duration: 0.25)) { $0.opacity(active || !resting ? 1 : 0) }
+        }
+        .task {
+            try? await Task.sleep(for: .seconds(6))
+            resting = true
+        }
     }
 }
 
