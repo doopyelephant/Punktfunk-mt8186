@@ -412,7 +412,10 @@ extension SettingsView {
             #if os(visionOS)
             // Where this headset shows the picture (tier G).
             if !inPresetScope {
-                described("Where the picture shows: this window, or docked in the environment.") {
+                described(
+                    "Where the picture shows: this window, a curved screen, or docked in the "
+                        + "environment."
+                ) {
                     settingPicker(
                         "Screen",
                         options: StreamScreen.allCases.map { (label: $0.label, tag: $0.rawValue) },

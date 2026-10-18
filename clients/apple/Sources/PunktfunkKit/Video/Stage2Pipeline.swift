@@ -1283,6 +1283,13 @@ public final class Stage2Pipeline {
     /// after clock resynchronization.
     ///
     /// A stopped pipeline is permanent; construct a new instance for another session.
+    #if os(visionOS)
+    /// Draw into the curved screen instead of the layer. Before `start`. Main thread.
+    func setCurve(_ curve: CurveTarget?) {
+        presenter.curve = curve
+    }
+    #endif
+
     public func start(
         connection: PunktfunkConnection,
         onFrame: (@Sendable (AccessUnit) -> Void)?,

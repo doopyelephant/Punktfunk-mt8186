@@ -369,8 +369,8 @@ public final class MetalVideoPresenter {
     /// `pf_frag` into `sdr10Drawable`: the SDR shader, wider attachment.
     private let pipelineSDR10: MTLRenderPipelineState
     private let pipelineHDR: MTLRenderPipelineState
-    /// tvOS only: the in-shader PQ→SDR tone-map fallback (pf_frag_hdr_tv → bgra8), used whenever
-    /// the display is composited without HDR headroom — see `setDisplayHeadroom`. nil elsewhere.
+    /// The in-shader PQ→SDR tone-map (pf_frag_hdr_tv → bgra8): tvOS without display headroom
+    /// (see `setDisplayHeadroom`), and visionOS's curved screen. nil elsewhere.
     private let pipelineHDRToneMap: MTLRenderPipelineState?
     /// PyroWave's 3-plane SDR path (pf_frag_planar → bgra8) — see `renderPlanar`.
     private let pipelinePlanar: MTLRenderPipelineState
@@ -423,6 +423,19 @@ public final class MetalVideoPresenter {
     /// bare reference-white anchor (an out-of-order race otherwise: `setHdrMeta` and the flip both write
     /// `edrMetadata`). Render-thread confined (drained from `pendingHdrMeta` at the top of `render`).
     private var lastHdrMeta: PunktfunkConnection.HdrMeta?
+    #if os(visionOS)
+    /// The curved screen while a session shows there: frames draw into its queue in place of
+    /// the layer, in SDR. Set before the render thread starts.
+    var curve: CurveTarget?
+    #endif
+    /// HDR frames tone-map to SDR in the shader: the curved screen's material shows no EDR.
+    private var onCurve: Bool {
+        #if os(visionOS)
+        return curve != nil
+        #else
+        return false
+        #endif
+    }
 
     /// Cross-thread staging, all under `stagingLock`: the pump thread parks a fresh 0xCE grade in
     /// `pendingHdrMeta` and the main thread parks the layout-derived drawable pixel size in
@@ -504,7 +517,7 @@ public final class MetalVideoPresenter {
                 name: linear ? "pf_frag_hdr_linear" : "pf_frag_hdr")
             hdr.colorAttachments[0].pixelFormat = hdrDrawable
             pipelineHDR = try device.makeRenderPipelineState(descriptor: hdr)
-            #if os(tvOS)
+            #if os(tvOS) || os(visionOS)
             // tvOS carries BOTH HDR pipelines: PQ passthrough when the display is composited
             // with HDR headroom, the in-shader tone-map (→ the 8-bit SDR config) when it isn't.
             // See setDisplayHeadroom / configureColor.
@@ -623,7 +636,7 @@ public final class MetalVideoPresenter {
     /// SDR uses the sRGB-tagged 8-bit drawable, or `sdr10Drawable` when `tenBitSDR` (a 10-bit
     /// session — HDR outranks it, an HDR frame never lands on the SDR-10 drawable).
     public func configure(hdr: Bool, tenBitSDR: Bool = false) {
-        let wide = tenBitSDR && !hdr
+        let wide = tenBitSDR && !hdr && !onCurve
         #if os(tvOS)
         // Reconfigure on an HDR flip AND on a passthrough↔tone-map flip: the display's headroom
         // changes when the AVDisplayManager mode switch (requested at session start) completes —
@@ -643,7 +656,7 @@ public final class MetalVideoPresenter {
         tenBitSDRActive = wide
         #endif
         didConfigureColor = true
-        configureColor(hdr: hdr, tenBitSDR: wide)
+        configureColor(hdr: hdr && !onCurve, tenBitSDR: wide)
     }
 
     /// Park the display's current EDR headroom (a MAIN-thread `UIScreen` read, pushed by
@@ -900,7 +913,8 @@ public final class MetalVideoPresenter {
         let hdrPipeline = hdrPassthroughActive ? pipelineHDR : (pipelineHDRToneMap ?? pipelineHDR)
         let pipeline = hdrActive ? hdrPipeline : (tenBitSDRActive ? pipelineSDR10 : pipelineSDR)
         #else
-        let pipeline = hdrActive ? pipelineHDR : (tenBitSDRActive ? pipelineSDR10 : pipelineSDR)
+        let hdrPipeline = onCurve ? (pipelineHDRToneMap ?? pipelineHDR) : pipelineHDR
+        let pipeline = hdrActive ? hdrPipeline : (tenBitSDRActive ? pipelineSDR10 : pipelineSDR)
         #endif
         let decodedSize = CGSize(
             width: CVPixelBufferGetWidth(pixelBuffer), height: CVPixelBufferGetHeight(pixelBuffer))
@@ -943,7 +957,7 @@ public final class MetalVideoPresenter {
         #if os(tvOS)
         let planarPassthrough = hdrActive && hdrPassthroughActive
         #else
-        let planarPassthrough = hdrActive
+        let planarPassthrough = hdrActive && !onCurve
         #endif
         let planarPipeline: MTLRenderPipelineState =
             planes.pq
@@ -995,15 +1009,15 @@ public final class MetalVideoPresenter {
         if let providedDrawable, providedDrawable.texture.pixelFormat != layerFormat {
             return false // config outran the vend (HDR flip) — a later vend has the new format
         }
-        guard let drawable = providedDrawable ?? layer.nextDrawable(),
+        guard let target = presentTarget(provided: providedDrawable, decodedSize: decodedSize),
               let commandBuffer = queue.makeCommandBuffer()
         else { return false }
         let (lumaTexture, uvRects) = lumaForTarget(
-            luma, target: drawable.texture, commandBuffer: commandBuffer)
+            luma, target: target.texture, commandBuffer: commandBuffer)
         var rects = uvRects
 
         let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = drawable.texture
+        pass.colorAttachments[0].texture = target.texture
         pass.colorAttachments[0].loadAction = .dontCare // the fullscreen triangle writes every pixel
         pass.colorAttachments[0].storeAction = .store
         guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
@@ -1024,12 +1038,16 @@ public final class MetalVideoPresenter {
             #else
             // Registered BEFORE present. presentedTime is CACurrentMediaTime-based; 0 means the
             // system never put this drawable on glass (dropped) — report nil, the caller falls
-            // back to its display-link estimate.
-            drawable.addPresentedHandler { d in
-                onPresented(
-                    d.presentedTime > 0
-                        ? Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: d.presentedTime)
-                        : nil)
+            // back to its display-link estimate. The curve reports none: done is its stamp.
+            if let drawable = target.drawable {
+                drawable.addPresentedHandler { d in
+                    onPresented(
+                        d.presentedTime > 0
+                            ? Stage2Pipeline.realtimeNs(forDisplayLinkTimestamp: d.presentedTime)
+                            : nil)
+                }
+            } else {
+                commandBuffer.addCompletedHandler { _ in onPresented(nil) }
             }
             #endif
         }
@@ -1041,14 +1059,40 @@ public final class MetalVideoPresenter {
                 onGPUTime(cb.gpuEndTime - cb.gpuStartTime)
             }
         }
-        // An absolute link target is the fixed-grid path; without one, present when the GPU finishes.
-        if let presentAtMediaTime {
-            commandBuffer.present(drawable, atTime: presentAtMediaTime)
-        } else {
-            commandBuffer.present(drawable)
-        }
+        target.present(commandBuffer, presentAtMediaTime)
         commandBuffer.commit()
         return true
+    }
+
+    /// Where one frame draws: a layer drawable, or the curved screen's.
+    private struct PresentTarget {
+        let texture: MTLTexture
+        /// The layer's drawable, for its on-glass stamp; nil on the curve.
+        let drawable: CAMetalDrawable?
+        let present: (MTLCommandBuffer, CFTimeInterval?) -> Void
+    }
+
+    /// The drawable this frame draws into. The curve takes the frame's own size; it shows the
+    /// whole picture whatever the window's layout. RENDER THREAD.
+    private func presentTarget(provided: CAMetalDrawable?, decodedSize: CGSize) -> PresentTarget? {
+        #if os(visionOS)
+        if let curve {
+            guard let frame = curve.next(size: decodedSize) else { return nil }
+            return PresentTarget(texture: frame.view, drawable: nil) { commandBuffer, _ in
+                commandBuffer.present(frame.drawable)
+            }
+        }
+        #endif
+        guard let drawable = provided ?? layer.nextDrawable() else { return nil }
+        // An absolute link target is the fixed-grid path; without one, present when the GPU
+        // finishes.
+        return PresentTarget(texture: drawable.texture, drawable: drawable) { commandBuffer, at in
+            if let at {
+                commandBuffer.present(drawable, atTime: at)
+            } else {
+                commandBuffer.present(drawable)
+            }
+        }
     }
 
     /// Luma to bind for a draw into `target`, with the UV rects that sample it. The plane itself

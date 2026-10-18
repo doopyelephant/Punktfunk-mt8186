@@ -216,6 +216,18 @@ final class SessionPresenter {
         restartPresentation()
     }
 
+    #if os(visionOS)
+    /// The curved screen while a volume shows the picture.
+    private(set) var curve: CurveTarget?
+
+    /// Draw into `target`, or back into the layer with nil. Costs one IDR. Main thread.
+    func setCurve(_ target: CurveTarget?) {
+        guard target !== curve else { return }
+        curve = target
+        restartPresentation()
+    }
+    #endif
+
     private var pump: StreamPump?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
@@ -326,6 +338,10 @@ final class SessionPresenter {
             selectedPacing, priority: priority, videoLayerCompatible: !connection.isChroma444)
         let dock = dock.flatMap { DockFeed.supports(connection) ? $0 : nil }
         if dock != nil { pacing = .decoded }
+        #if os(visionOS)
+        // The curve's queue vends its own drawables: frames draw on arrival.
+        if curve != nil { pacing = .arrival }
+        #endif
         #if os(macOS)
         let vsyncPaced = priority != .latency && pacing == .arrival
         let adaptiveSlotPaced = Self.adaptiveSlotPaced(
@@ -357,6 +373,9 @@ final class SessionPresenter {
             }
             stage2 = pipeline
             pipeline.setDirectPossible(directPossible)
+            #if os(visionOS)
+            pipeline.setCurve(curve)
+            #endif
             // The ordinary link supplies the vsync grid, retries transient Metal drawable misses,
             // and polls which decoded IOSurface reached glass. Frame arrival remains the render
             // trigger. Deadline pacing owns its drawable-vending CAMetalDisplayLink instead.

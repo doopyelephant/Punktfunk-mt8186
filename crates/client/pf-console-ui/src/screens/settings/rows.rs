@@ -24,7 +24,8 @@ pub enum RowId {
     RenderScale,
     /// `trust::Settings::video_fit`: bars, crop or stretch when the stream's shape differs.
     VideoFit,
-    /// Where a Vision Pro shows the picture: its window, or docked in the environment.
+    /// Where a Vision Pro shows the picture: its window, a curved screen, or docked in the
+    /// environment.
     /// Device-local, under [`device_keys::SCREEN`].
     Screen,
     Bitrate,
@@ -224,7 +225,11 @@ pub(super) const GAMEPAD_UI_MODE_KEY: &str = "gamepad_ui_mode";
 
 /// Stored [`GAMEPAD_UI_MODE_KEY`] values (`GamepadUi.kt`).
 /// The Vision Pro's `visionos.screen` values, as its own Settings names them.
-const SCREENS: [(&str, &str); 2] = [("window", "Window"), ("environment", "Environment")];
+const SCREENS: [(&str, &str); 3] = [
+    ("window", "Window"),
+    ("curved", "Curved"),
+    ("environment", "Environment"),
+];
 const GAMEPAD_UI_MODES: [(&str, &str); 2] =
     [("connected", "With a controller"), ("always", "Always")];
 
@@ -1694,7 +1699,10 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             "Stops the host's audio, playing from this device's speakers, being picked up \
              and sent back. Turn it off if your microphone already runs its own processing."
         }
-        RowId::Screen => "Where the picture shows: this window, or docked in the environment.",
+        RowId::Screen => {
+            "Where the picture shows: this window, a curved screen, or docked in the \
+             environment."
+        }
         RowId::SpatialAudio => {
             "On, the sound comes from the window. Off plays the game's own mix straight to \
              your ears."

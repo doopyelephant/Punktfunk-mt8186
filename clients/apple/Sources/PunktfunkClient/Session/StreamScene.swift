@@ -20,6 +20,8 @@ struct StreamScene: View {
     @AppStorage(DefaultsKey.statsScalePct) private var statsScalePct = 100
     #if os(visionOS)
     @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
+    @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
     #endif
 
     /// The ring this platform draws. macOS takes the DESKTOP default (no soft keyboard, no
@@ -114,25 +116,43 @@ struct StreamScene: View {
         )
         #if os(visionOS)
         .dock(DockStage.shared.feed(for: conn))
+        .curve(CurveStage.shared.target(for: conn))
         .overlay {
             if let feed = DockStage.shared.feed(for: conn) {
                 ZStack {
                     DockPlayer(
                         feed: feed, mode: conn.currentMode(),
                         onRefused: { [weak model] in model?.noteDockRefused() })
-                    InDockPlaceholder(
+                    ScreenPlaceholder(
+                        title: "Streaming in the environment", systemImage: "sparkles.tv",
                         connection: conn, endStream: { [weak model] in model?.disconnect() })
                 }
+            } else if CurveStage.shared.target(for: conn) != nil {
+                ScreenPlaceholder(
+                    title: "Streaming on the curved screen", systemImage: "pano",
+                    connection: conn, endStream: { [weak model] in model?.disconnect() })
             }
         }
         // A streaming session follows the stored Screen; the ornament's menu moves it too.
         .onChange(
-            of: model.phase == .streaming && StreamScreen(name: screen) == .environment,
-            initial: true
-        ) { _, docked in
-            if docked { DockStage.shared.enter(conn) } else { DockStage.shared.leave(conn) }
+            of: model.phase == .streaming ? StreamScreen(name: screen) : nil, initial: true
+        ) { _, wanted in
+            CurveStage.shared.register(conn, model: model, ring: ring)
+            showScreen(wanted, for: conn)
         }
-        .onDisappear { DockStage.shared.ended(conn) }
+        // The curve has its own volume, opened and closed with it.
+        .onChange(of: CurveStage.shared.target(for: conn) != nil) { _, curved in
+            guard let id = CurveStage.shared.session(for: conn)?.id else { return }
+            if curved {
+                openWindow(id: CurveScene.sceneID, value: id)
+            } else {
+                dismissWindow(id: CurveScene.sceneID, value: id)
+            }
+        }
+        .onDisappear {
+            DockStage.shared.ended(conn)
+            CurveStage.shared.ended(conn)
+        }
         .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
             StreamOrnament(connection: conn, quickActions: { ring.toggleCentred() })
         }

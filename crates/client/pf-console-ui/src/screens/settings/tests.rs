@@ -1569,7 +1569,7 @@ fn spatial_rows_are_the_headsets_alone() {
     assert!(adjust(RowId::Screen, 1, true, ctx));
     assert_eq!(
         extra_str(ctx.settings, device_keys::SCREEN, "window"),
-        "environment"
+        "curved"
     );
 }
 
