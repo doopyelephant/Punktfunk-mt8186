@@ -1457,7 +1457,12 @@ public final class SessionAudio: @unchecked Sendable {
             log.error("no usable input device — mic uplink disabled")
             return nil
         }
-        let uplink = MicUplink(pinned: micChannel >= 1 ? micChannel - 1 : nil)
+        #if os(macOS)
+        let skip = AudioDevices.loopbackInputChannels(forUID: micUID)
+        #else
+        let skip: [Int] = []
+        #endif
+        let uplink = MicUplink(pinned: micChannel >= 1 ? micChannel - 1 : nil, skip: skip)
         engine.attach(uplink.node)
         // nil follows the bus. A format read a moment ago can be stale by now, and a stale one
         // raises.
@@ -1473,16 +1478,18 @@ public final class SessionAudio: @unchecked Sendable {
         }
 
         // A pro interface has the mic on one of N inputs, and a converter's downmix takes
-        // channels 0 and 1. So the uplink folds to mono itself: 0 sums every channel, n ≥ 1
-        // pins 1-based input channel n.
+        // channels 0 and 1. So the uplink folds to mono itself: 0 sums every channel but the
+        // device's loopback inputs, n ≥ 1 pins 1-based input channel n.
         let inChannels = Int(inFormat.channelCount)
         if micChannel > inChannels {
             log.warning(
                 "mic channel \(micChannel) out of range (device has \(inChannels)) — mixing all")
         }
+        let skipped = skip.filter { $0 < inChannels }.count
+        let mixed = skipped < inChannels ? inChannels - skipped : inChannels
         let channelPlan = (1...inChannels).contains(micChannel)
             ? "channel \(micChannel)/\(inChannels)"
-            : (inChannels > 1 ? "mix \(inChannels)ch→mono" : "mono")
+            : (inChannels > 1 ? "mix \(mixed)/\(inChannels)ch→mono" : "mono")
 
         // The device being recorded, its format and the fold, once per session. A UID that
         // fell back to the default, or a wrong channel, reads here and not as silence at the
@@ -1673,12 +1680,14 @@ public final class SessionAudio: @unchecked Sendable {
     /// Fold `channels` of input (`floatChannelData` layout: `interleaved` → one buffer strided by
     /// channel count; else one buffer per channel) down to a single mono bus in `out` (`frames`
     /// long). `pinned` (0-based, must be `< channels`) copies exactly that channel — the fix for a
-    /// mic on one input of a multi-channel interface; `nil` sums every channel, clamped to
-    /// [-1, 1], so a lone hot channel still passes at full level instead of the silent 0/1 the
-    /// default N→stereo downmix would grab. Pure + `internal` for unit testing the index math.
+    /// mic on one input of a multi-channel interface. Otherwise every channel not in `skip` is
+    /// summed, clamped to [-1, 1], so a lone hot channel still passes at full level instead of
+    /// the silent 0/1 the default N→stereo downmix would grab. `skip` is the device's loopback
+    /// inputs: a copy of what the Mac plays, which would send the stream back up as the mic. A
+    /// `skip` covering every channel is ignored. Pure + `internal` for unit testing the index math.
     static func foldToMono(
         input: UnsafePointer<UnsafeMutablePointer<Float>>, frames: Int, channels: Int,
-        interleaved: Bool, pinned: Int?, out: UnsafeMutablePointer<Float>
+        interleaved: Bool, pinned: Int?, skip: [Int] = [], out: UnsafeMutablePointer<Float>
     ) {
         if let ch = pinned, ch < channels {
             if interleaved {
@@ -1688,22 +1697,20 @@ public final class SessionAudio: @unchecked Sendable {
                 let d = input[ch]
                 for i in 0..<frames { out[i] = d[i] }
             }
-        } else if interleaved {
-            let d = input[0]
-            for i in 0..<frames {
-                var s: Float = 0
-                for c in 0..<channels { s += d[i * channels + c] }
-                out[i] = max(-1, min(1, s))
-            }
-        } else {
-            let d0 = input[0]
-            for i in 0..<frames { out[i] = d0[i] }
-            for c in 1..<channels {
+            return
+        }
+        let all = (0..<channels).allSatisfy { skip.contains($0) }
+        out.update(repeating: 0, count: frames)
+        for c in 0..<channels where all || !skip.contains(c) {
+            if interleaved {
+                let d = input[0]
+                for i in 0..<frames { out[i] += d[i * channels + c] }
+            } else {
                 let d = input[c]
                 for i in 0..<frames { out[i] += d[i] }
             }
-            if channels > 1 { for i in 0..<frames { out[i] = max(-1, min(1, out[i])) } }
         }
+        if channels > 1 { for i in 0..<frames { out[i] = max(-1, min(1, out[i])) } }
     }
     #endif
 
