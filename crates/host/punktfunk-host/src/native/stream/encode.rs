@@ -483,6 +483,7 @@ impl StreamState {
                 cap_ns
             },
             epoch: self.epoch,
+            stream: 0,
             flags,
             frame_index: self.clock.au_seq,
             encode_us: d.encode_us,
@@ -830,6 +831,7 @@ impl StreamState {
                 meta: AuMeta {
                     capture_ns: cap_ns,
                     epoch: self.epoch,
+                    stream: 0,
                     flags,
                     frame_index: self.clock.au_seq,
                     encode_us,

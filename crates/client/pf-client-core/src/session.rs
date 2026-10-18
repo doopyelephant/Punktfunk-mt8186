@@ -128,6 +128,9 @@ pub struct SessionParams {
     /// Hold the screen awake for the whole stream; off, only while the player's input is recent
     /// ([`punktfunk_core::client::holds_screen_awake`]).
     pub keep_awake: bool,
+    /// Every monitor the stream shows, the window's first; empty for one. Further screens'
+    /// frames come through [`start_screen`].
+    pub screens: Vec<punktfunk_core::quic::v2::msg::Screen>,
 }
 
 /// Host, pin, launch, and budget for one dial.
@@ -240,6 +243,7 @@ impl SessionParams {
             stats_scale: punktfunk_core::hud::stats_scale(settings.stats_scale_pct),
             exit_hint: settings.exit_hint,
             keep_awake: settings.keep_awake,
+            screens: Vec::new(),
         }
     }
 
@@ -664,6 +668,7 @@ fn dial(
         // it this parks the pump for the whole budget (185 s on a request-access
         // connect the host holds pending) and cancel cannot be answered until return.
         cancel: Some(stop.clone()),
+        screens: params.screens.clone(),
         on_pending: Some({
             let ev_tx = ev_tx.clone();
             Arc::new(move || {
@@ -721,29 +726,42 @@ fn open_decoder(
     vulkan: Option<&crate::video::VulkanDecodeDevice>,
     connector: &NativeClient,
 ) -> anyhow::Result<Decoder> {
-    // Decoder for the host-resolved codec and picture shape (never assume HEVC).
-    // Native rungs probe the device at construction, so a 4:4:4 or Main 10 this GPU
-    // cannot decode refuses before the rung is chosen instead of error-streaking.
     let format = connector.video_format();
-    let stream_format = stream_format_of(&format);
     tracing::info!(
         codec = crate::video::wire_codec_name(format.codec),
         welcome_codec = format.codec,
         "negotiated video codec"
     );
+    open_decoder_for(&format, connector.mode(), decoder, vulkan, connector)
+}
+
+/// Decoder for the host-resolved codec and picture shape (never assume HEVC). Native rungs
+/// probe the device at construction, so a 4:4:4 or Main 10 this GPU cannot decode refuses
+/// before the rung is chosen instead of error-streaking.
+#[cfg_attr(
+    not(all(any(target_os = "linux", windows), feature = "pyrowave")),
+    allow(unused_variables)
+)]
+fn open_decoder_for(
+    format: &punktfunk_core::quic::VideoFormat,
+    mode: punktfunk_core::config::Mode,
+    decoder: &str,
+    vulkan: Option<&crate::video::VulkanDecodeDevice>,
+    connector: &NativeClient,
+) -> anyhow::Result<Decoder> {
+    let stream_format = stream_format_of(format);
     // A negotiated PyroWave session decodes on the presenter's device — reachable
     // only through the explicit preference above, so failing here is failing an
     // opted-in experiment.
     #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
     let built = if format.codec == punktfunk_core::quic::CODEC_PYROWAVE {
-        let mode = connector.mode();
-        // Wavelet bitstream has no VUI: Welcome colour signalling is the session's
+        // Wavelet bitstream has no VUI: the format's colour signalling is the stream's
         // colour contract, and the resolved chroma sizes the plane ring.
         let color = crate::video::ColorDesc {
-            primaries: connector.color.primaries,
-            transfer: connector.color.transfer,
-            matrix: connector.color.matrix,
-            full_range: connector.color.full_range != 0,
+            primaries: format.color.primaries,
+            transfer: format.color.transfer,
+            matrix: format.color.matrix,
+            full_range: format.color.full_range != 0,
         };
         match vulkan {
             Some(vk) => Decoder::new_pyrowave(
@@ -751,9 +769,9 @@ fn open_decoder(
                 mode.width,
                 mode.height,
                 connector.shard_payload as usize,
-                connector.chroma_format == punktfunk_core::quic::CHROMA_IDC_444,
+                format.chroma_format == punktfunk_core::quic::CHROMA_IDC_444,
                 color,
-                connector.bit_depth >= 10,
+                format.bit_depth >= 10,
             ),
             None => Err(anyhow::anyhow!(
                 "pyrowave session without a presenter device"
@@ -951,6 +969,149 @@ fn hand_on(
     connector.hud().note_decode_us(us, false);
     if wants_decode {
         connector.report_decode_us(us.min(u32::MAX as u64) as u32);
+    }
+}
+
+/// How `image`'s decode signals that its pixels are done.
+fn hw_done_of(image: &DecodedImage) -> HwDone {
+    match image {
+        // Native rung: decode signals `semaphore_value` when pixels
+        // are ready (presenter write-back is `+ 1`).
+        DecodedImage::NativeVk(f) => HwDone::Timeline(f.semaphore, f.semaphore_value),
+        // VAAPI ships the decode's write fence as a sync_file; a dup outlives the frame's move
+        // to the presenter.
+        #[cfg(target_os = "linux")]
+        DecodedImage::NativeDmabuf(d) => d
+            .sync_fds
+            .first()
+            .and_then(|fd| fd.try_clone().ok())
+            .map_or(HwDone::Cpu, HwDone::SyncFile),
+        _ => HwDone::Cpu,
+    }
+}
+
+/// A further screen's decode ([`start_screen`]): its pictures, newest wins, and the thread to
+/// join before the presenter's device goes, as for [`SessionHandle::thread`].
+pub struct ScreenDecode {
+    pub frames: async_channel::Receiver<DecodedFrame>,
+    pub stop: Arc<AtomicBool>,
+    pub thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ScreenDecode {
+    /// Stop the decode and wait it out.
+    pub fn close(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ScreenDecode {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Decode screen `screen` (1 or more) of `connector`'s session on a thread of its own, on the
+/// device of the window that shows it. It ends with the session, when the host drops the
+/// screen, or at [`ScreenDecode::close`]. The first screen's pump keeps the HUD and the ABR.
+pub fn start_screen(
+    connector: Arc<NativeClient>,
+    screen: u8,
+    decoder: String,
+    vulkan: Option<crate::video::VulkanDecodeDevice>,
+) -> ScreenDecode {
+    let (frame_tx, frame_rx) = async_channel::bounded(2);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_w = stop.clone();
+    let thread = std::thread::Builder::new()
+        .name(format!("pf-screen-{screen}"))
+        .spawn(move || {
+            screen_pump(
+                &connector,
+                screen,
+                &decoder,
+                vulkan.as_ref(),
+                &frame_tx,
+                &stop_w,
+            )
+        })
+        .map_err(|e| tracing::warn!(error = %e, screen, "screen decode thread did not start"))
+        .ok();
+    ScreenDecode {
+        frames: frame_rx,
+        stop,
+        thread,
+    }
+}
+
+/// Pull, decode and hand on one further screen's frames. A decoder opens at the first frame
+/// and at each new format; a lost picture asks the host for a keyframe on that screen alone.
+fn screen_pump(
+    connector: &NativeClient,
+    screen: u8,
+    pref: &str,
+    vulkan: Option<&crate::video::VulkanDecodeDevice>,
+    frame_tx: &async_channel::Sender<DecodedFrame>,
+    stop: &AtomicBool,
+) {
+    let mut decoder: Option<Decoder> = None;
+    let mut current = None;
+    // A window opened mid-stream starts at a keyframe that names the format.
+    connector.request_screen_keyframe(screen);
+    while !stop.load(Ordering::SeqCst) {
+        let frame = match connector.next_screen_frame(screen, Duration::from_millis(20)) {
+            Ok(frame) => frame,
+            Err(PunktfunkError::NoFrame) => continue,
+            Err(_) => return,
+        };
+        let changed = frame
+            .new_format
+            .filter(|f| decoder.is_none() || current != Some(*f));
+        if let Some(format) = changed {
+            let kept = format.codec != punktfunk_core::quic::CODEC_PYROWAVE
+                && decoder
+                    .as_mut()
+                    .is_some_and(|d| d.reformat(format.codec, stream_format_of(&format)).is_ok());
+            if !kept {
+                let mode = connector
+                    .screen_layout()
+                    .1
+                    .iter()
+                    .find(|s| s.index == screen)
+                    .map_or_else(|| connector.mode(), |s| s.mode);
+                decoder = open_decoder_for(&format, mode, pref, vulkan, connector)
+                    .map_err(|e| {
+                        tracing::warn!(error = %format!("{e:#}"), screen, "screen decoder did not open")
+                    })
+                    .ok();
+            }
+            current = decoder.as_ref().map(|_| format);
+        }
+        let Some(dec) = decoder.as_mut() else {
+            continue;
+        };
+        match dec.decode_au(frame.data, frame.flags, frame.complete) {
+            Ok(Some(image)) => {
+                wait_hw_done(dec, &hw_done_of(&image));
+                let _ = frame_tx.force_send(DecodedFrame {
+                    pts_ns: frame.pts_ns,
+                    decoded_ns: now_ns(),
+                    repeat: false,
+                    image,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, screen, "screen decode error (asking for a keyframe)");
+                connector.request_screen_keyframe(screen);
+            }
+        }
+        if dec.take_keyframe_request() {
+            connector.request_screen_keyframe(screen);
+        }
     }
 }
 
@@ -1445,26 +1606,14 @@ impl Pump {
         // own fence completes, so the presenter never waits on a decode; the
         // next AU is submitted meanwhile, so the decoder always has a picture
         // queued behind the one it is working on.
-        let hw_fence = match &image {
-            // Native rung: decode signals `semaphore_value` when pixels
-            // are ready (presenter write-back is `+ 1`).
-            DecodedImage::NativeVk(f) => HwDone::Timeline(f.semaphore, f.semaphore_value),
-            // VAAPI ships the decode's write fence as a sync_file; a dup
-            // outlives the frame's move to the presenter, and one more goes to the waiter.
-            #[cfg(target_os = "linux")]
-            DecodedImage::NativeDmabuf(d) => {
-                match d.sync_fds.first().and_then(|fd| fd.try_clone().ok()) {
-                    Some(fd) => {
-                        if let (Some(tx), Ok(dup)) = (&self.fd_wake, fd.try_clone()) {
-                            let _ = tx.send(dup);
-                        }
-                        HwDone::SyncFile(fd)
-                    }
-                    None => HwDone::Cpu,
-                }
+        let hw_fence = hw_done_of(&image);
+        // One more dup of a VAAPI fence goes to the waiter that kicks the pump.
+        #[cfg(target_os = "linux")]
+        if let (HwDone::SyncFile(fd), Some(tx)) = (&hw_fence, &self.fd_wake) {
+            if let Ok(dup) = fd.try_clone() {
+                let _ = tx.send(dup);
             }
-            _ => HwDone::Cpu,
-        };
+        }
         let next = InFlight {
             hw: hw_fence,
             received_ns,

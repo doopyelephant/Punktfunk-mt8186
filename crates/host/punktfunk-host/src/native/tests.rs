@@ -1456,6 +1456,7 @@ async fn raw_session(
         features: Default::default(),
         profile: None,
         access_only: false,
+        screens: Vec::new(),
     };
     v2io::send(&mut send, &hello).await.expect("ClientHello");
     let welcome = loop {

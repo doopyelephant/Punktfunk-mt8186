@@ -63,6 +63,10 @@ pub const MSG_SET_BITRATE: u64 = 0x24;
 pub const MSG_BITRATE_CHANGED: u64 = 0x25;
 /// `host → client`: the host rebuilt its pipeline and nothing flowed for a while.
 pub const MSG_PIPELINE_GAP: u64 = 0x26;
+/// `host → client`: the screens the host built and the stream each rides (`ScreenLayout`).
+pub const MSG_SCREEN_LAYOUT: u64 = 0x28;
+/// `client → host`: the screens the client shows now (`Screens`). Under [`FEATURE_SCREENS`].
+pub const MSG_SCREENS: u64 = 0x29;
 /// `client → host`: a bandwidth probe, smooth or shaped.
 pub const MSG_PROBE_REQUEST: u64 = 0x2B;
 /// `host → client`: the probe's counts.
@@ -132,6 +136,8 @@ pub const FRAMES: &[(&str, u64, usize)] = &[
     ("MSG_SET_BITRATE", MSG_SET_BITRATE, 256),
     ("MSG_BITRATE_CHANGED", MSG_BITRATE_CHANGED, 256),
     ("MSG_PIPELINE_GAP", MSG_PIPELINE_GAP, 256),
+    ("MSG_SCREEN_LAYOUT", MSG_SCREEN_LAYOUT, 1024),
+    ("MSG_SCREENS", MSG_SCREENS, 1024),
     ("MSG_PROBE_REQUEST", MSG_PROBE_REQUEST, 256),
     ("MSG_PROBE_RESULT", MSG_PROBE_RESULT, 256),
     ("MSG_PHASE_REPORT", MSG_PHASE_REPORT, 256),
@@ -236,6 +242,9 @@ pub const FEATURE_FORMAT_EPOCH: u32 = 36;
 /// Both ends: an `AudioConfig` may change codec, rate or channels from its `first_seq` on, and
 /// the client reopens its player there. Set only when the embedder said it reopens.
 pub const FEATURE_AUDIO_EPOCH: u32 = 37;
+/// Both ends: the client shows more than one screen. Its `ClientHello` lists them, the host
+/// streams each past the first on a stream id of its own and says so in a `ScreenLayout`.
+pub const FEATURE_SCREENS: u32 = 38;
 
 #[cfg(test)]
 mod tests {
@@ -273,6 +282,7 @@ mod tests {
         ("FEATURE_CLEAR_PLACEMENT", FEATURE_CLEAR_PLACEMENT),
         ("FEATURE_FORMAT_EPOCH", FEATURE_FORMAT_EPOCH),
         ("FEATURE_AUDIO_EPOCH", FEATURE_AUDIO_EPOCH),
+        ("FEATURE_SCREENS", FEATURE_SCREENS),
     ];
 
     /// Every close and stop code either wire uses: v1's live on, and v2 adds its own.

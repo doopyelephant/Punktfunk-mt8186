@@ -1,0 +1,435 @@
+//! Screens past the first: a borderless fullscreen window each, on the client monitor it
+//! stands for, with a presenter and a decoder of its own. The host draws the pointer into
+//! their pictures, so the local one hides over them.
+
+use super::events::finger_to_frame;
+use super::*;
+use crate::touch::Abs;
+use pf_client_core::session::ScreenDecode;
+use punktfunk_core::quic::v2::msg::{Screen, SCREENS_MAX};
+use sdl3::rect::Rect;
+use sdl3::video::{Display, Window};
+
+/// The client's monitors as the stream's screens: the window's display first at `mode`, each
+/// other at its own native mode. Empty when SDL cannot say.
+pub(super) fn client_screens(
+    video: &sdl3::VideoSubsystem,
+    window: &Window,
+    mode: Mode,
+) -> Vec<(Screen, Display)> {
+    let (Ok(first), Ok(displays)) = (window.get_display(), video.displays()) else {
+        return Vec::new();
+    };
+    let Ok(origin) = first.get_bounds() else {
+        return Vec::new();
+    };
+    let primary = video.get_primary_display().ok();
+    let mut out = vec![(
+        Screen {
+            mode,
+            primary: primary == Some(first),
+            ..Default::default()
+        },
+        first,
+    )];
+    for d in displays.into_iter().filter(|d| *d != first) {
+        let (Ok(bounds), Ok(m)) = (d.get_bounds(), d.get_mode()) else {
+            continue;
+        };
+        if out.len() == SCREENS_MAX {
+            break;
+        }
+        let (x, y) = offset_px(origin, bounds, mode);
+        out.push((
+            Screen {
+                index: out.len() as u8,
+                mode: native_mode(m.w, m.h, m.pixel_density, m.refresh_rate),
+                x,
+                y,
+                primary: primary == Some(d),
+                ..Default::default()
+            },
+            d,
+        ));
+    }
+    out
+}
+
+/// Where `at` sits from `origin`, both in desktop coordinates, in the pixels of `mode` shown
+/// on `origin`: the first screen's picture is the unit the host places the others in.
+fn offset_px(origin: Rect, at: Rect, mode: Mode) -> (i32, i32) {
+    let px = |d: i32, pixels: u32, span: u32| {
+        (i64::from(d) * i64::from(pixels) / i64::from(span.max(1))) as i32
+    };
+    (
+        px(at.x() - origin.x(), mode.width, origin.width()),
+        px(at.y() - origin.y(), mode.height, origin.height()),
+    )
+}
+
+/// What a present did with a screen's picture; a busy one comes back owned.
+enum Took {
+    Shown,
+    Stale,
+    Busy(Option<DecodedImage>),
+}
+
+fn took(presented: Presented<'_>) -> Took {
+    match presented {
+        Presented::Shown => Took::Shown,
+        Presented::Stale => Took::Stale,
+        Presented::Busy(input, _) => Took::Busy(match input {
+            #[cfg(target_os = "linux")]
+            FrameInput::Dmabuf(d) => Some(DecodedImage::NativeDmabuf(d)),
+            #[cfg(windows)]
+            FrameInput::D3d11(d) => Some(DecodedImage::D3d11(d)),
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
+            FrameInput::PyroWave(f) => Some(DecodedImage::PyroWave(f)),
+            FrameInput::NativeVk(v) => Some(DecodedImage::NativeVk(v)),
+            FrameInput::Cpu(_) | FrameInput::Redraw => None,
+        }),
+    }
+}
+
+/// One further screen's window. Field order is drop order: the decode, which submits to the
+/// presenter's device, then the presenter, then its window.
+struct ScreenWindow {
+    index: u8,
+    decode: ScreenDecode,
+    /// The newest picture, kept while the swapchain has no image for it.
+    held: Option<DecodedFrame>,
+    /// A present failed: said once, then the window keeps trying quietly.
+    failing: bool,
+    /// The newest picture's size: absolute input over the window maps onto it.
+    video: Option<(u32, u32)>,
+    presenter: Presenter,
+    window: Window,
+}
+
+impl ScreenWindow {
+    fn open(
+        video: &sdl3::VideoSubsystem,
+        display: Display,
+        index: u8,
+        connector: &Arc<NativeClient>,
+        decoder: &str,
+        opts: &SessionOpts,
+    ) -> Result<ScreenWindow> {
+        let b = display
+            .get_bounds()
+            .map_err(|e| anyhow::anyhow!("display bounds: {e}"))?;
+        let title = format!("{} · {}", opts.window_title, index + 1);
+        let window = video
+            .window(&title, b.width(), b.height())
+            .position(b.x(), b.y())
+            .borderless()
+            .vulkan()
+            .high_pixel_density()
+            .fullscreen()
+            .build()
+            .context("SDL window")?;
+        let exts = window
+            .vulkan_instance_extensions()
+            .map_err(|e| anyhow::anyhow!("vulkan instance extensions: {e}"))?;
+        let mut presenter = Presenter::new(
+            &window,
+            &exts,
+            crate::vk::PresentPref {
+                vsync: opts.vsync,
+                fullscreen: true,
+                ..Default::default()
+            },
+        )
+        .context("vulkan presenter")?;
+        presenter.set_video_fit(opts.video_fit);
+        presenter.present(&window, FrameInput::Redraw, None)?;
+        let decode = session::start_screen(
+            connector.clone(),
+            index,
+            decoder.to_owned(),
+            presenter.vulkan_decode(),
+        );
+        tracing::info!(
+            screen = index,
+            w = b.width(),
+            h = b.height(),
+            "screen window open"
+        );
+        Ok(ScreenWindow {
+            index,
+            decode,
+            held: None,
+            failing: false,
+            video: None,
+            presenter,
+            window,
+        })
+    }
+
+    /// Show the newest picture, or the one the swapchain had no image for last time.
+    fn present(&mut self) -> Result<()> {
+        while let Ok(frame) = self.decode.frames.try_recv() {
+            self.held = Some(frame);
+        }
+        let Some(frame) = self.held.take() else {
+            return Ok(());
+        };
+        self.video = Some(frame.image.dimensions());
+        let DecodedFrame {
+            pts_ns,
+            decoded_ns,
+            repeat,
+            image,
+        } = frame;
+        let (p, w) = (&mut self.presenter, &self.window);
+        let took = match image {
+            DecodedImage::Cpu(c) => match took(p.present(w, FrameInput::Cpu(&c), None)?) {
+                Took::Busy(_) => Took::Busy(Some(DecodedImage::Cpu(c))),
+                t => t,
+            },
+            #[cfg(target_os = "linux")]
+            DecodedImage::NativeDmabuf(d) => took(p.present(w, FrameInput::Dmabuf(d), None)?),
+            #[cfg(windows)]
+            DecodedImage::D3d11(d) => took(p.present(w, FrameInput::D3d11(d), None)?),
+            #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
+            DecodedImage::PyroWave(f) => took(p.present(w, FrameInput::PyroWave(f), None)?),
+            DecodedImage::NativeVk(v) => took(p.present(w, FrameInput::NativeVk(v), None)?),
+        };
+        match took {
+            // The swapchain had no image for it: it goes again next pass.
+            Took::Busy(Some(image)) => {
+                self.held = Some(DecodedFrame {
+                    pts_ns,
+                    decoded_ns,
+                    repeat,
+                    image,
+                })
+            }
+            Took::Stale => self.presenter.recreate_swapchain(&self.window)?,
+            Took::Shown | Took::Busy(None) => {}
+        }
+        Ok(())
+    }
+
+    fn on_window_event(&mut self, event: WindowEvent) -> Result<()> {
+        match event {
+            WindowEvent::PixelSizeChanged(..) | WindowEvent::Resized(..) => {
+                self.presenter.recreate_swapchain(&self.window)?;
+                self.presenter
+                    .present(&self.window, FrameInput::Redraw, None)?;
+            }
+            WindowEvent::Exposed => {
+                self.presenter
+                    .present(&self.window, FrameInput::Redraw, None)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// A present failure leaves this window's last picture up; the stream goes on.
+    fn note(&mut self, done: Result<()>) {
+        match done {
+            Ok(()) => self.failing = false,
+            Err(e) if !self.failing => {
+                self.failing = true;
+                tracing::warn!(screen = self.index, error = %format!("{e:#}"), "screen window present failed");
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+impl Drop for ScreenWindow {
+    /// As [`StreamState::shutdown`]: let go of the picture, join the decode, then idle.
+    fn drop(&mut self) {
+        self.held = None;
+        self.presenter.drop_video();
+        self.decode.close();
+        self.presenter.wait_idle();
+    }
+}
+
+/// The stream's further screens: the monitor each asked one stands for, and a window for each
+/// the host built.
+#[derive(Default)]
+pub(super) struct ScreenWindows {
+    displays: Vec<(u8, Display)>,
+    windows: Vec<ScreenWindow>,
+    /// The host layout the windows follow; `0` before any.
+    layout_gen: u32,
+}
+
+impl ScreenWindows {
+    /// Keep `planned`'s monitors for the screens it asks; the ask itself, for the host.
+    pub(super) fn plan(&mut self, planned: &[(Screen, Display)]) -> Vec<Screen> {
+        self.displays = planned.iter().map(|(s, d)| (s.index, *d)).collect();
+        // A screen may now stand for another monitor: reopen every window on the next pass.
+        self.windows.clear();
+        self.layout_gen = 0;
+        planned.iter().map(|(s, _)| *s).collect()
+    }
+
+    /// The screen whose window `window_id` is.
+    pub(super) fn screen_of(&self, window_id: u32) -> Option<u8> {
+        self.windows
+            .iter()
+            .find(|w| w.window.id() == window_id)
+            .map(|w| w.index)
+    }
+
+    /// A window event of screen `screen`'s window.
+    pub(super) fn on_window_event(&mut self, screen: u8, event: WindowEvent) {
+        if let Some(w) = self.windows.iter_mut().find(|w| w.index == screen) {
+            let done = w.on_window_event(event);
+            w.note(done);
+        }
+    }
+
+    /// Window position `(x, y)` over screen `screen`'s window as a point of its picture.
+    pub(super) fn abs_at(&self, screen: u8, fit: VideoFit, x: f32, y: f32) -> Option<Abs> {
+        let w = self.windows.iter().find(|w| w.index == screen)?;
+        let (lw, lh) = w.window.size();
+        Some(finger_to_frame(
+            fit,
+            w.window.size_in_pixels(),
+            w.video?,
+            x / lw.max(1) as f32,
+            y / lh.max(1) as f32,
+        ))
+    }
+
+    /// Open a window for each screen the host's newest layout adds, close the ones it dropped,
+    /// and show each one's newest picture.
+    fn tick(
+        &mut self,
+        video: &sdl3::VideoSubsystem,
+        connector: &Arc<NativeClient>,
+        decoder: &str,
+        opts: &SessionOpts,
+    ) {
+        let (newest, layout) = connector.screen_layout();
+        if newest != self.layout_gen {
+            self.layout_gen = newest;
+            self.windows
+                .retain(|w| layout.iter().any(|s| s.index == w.index));
+            for s in layout.iter().filter(|s| s.index > 0) {
+                let open = self.windows.iter().any(|w| w.index == s.index);
+                let display = self.displays.iter().find(|(i, _)| *i == s.index);
+                let (false, Some(&(_, display))) = (open, display) else {
+                    continue;
+                };
+                match ScreenWindow::open(video, display, s.index, connector, decoder, opts) {
+                    Ok(w) => self.windows.push(w),
+                    Err(e) => tracing::warn!(
+                        screen = s.index,
+                        error = %format!("{e:#}"),
+                        "screen window did not open"
+                    ),
+                }
+            }
+        }
+        for w in &mut self.windows {
+            let done = w.present();
+            w.note(done);
+        }
+    }
+}
+
+impl Shell {
+    /// Per pass: the further screens' windows, and the local cursor hidden over them while the
+    /// host's pointer is drawn into their pictures.
+    pub(super) fn screens_tick(&mut self, st: &mut StreamState) {
+        let Some(connector) = st.connector.clone() else {
+            return;
+        };
+        st.screens
+            .tick(&self.sdl_video, &connector, &st.params.decoder, &self.opts);
+        let desktop = st
+            .capture
+            .as_ref()
+            .is_some_and(|cap| cap.captured() && cap.desktop());
+        if desktop && self.over_screen(st) && self.mouse.is_cursor_showing() {
+            self.mouse.show_cursor(false);
+        }
+    }
+
+    /// Desktop-model motion over a further screen's window: an absolute move on that screen.
+    pub(super) fn on_screen_motion(
+        &mut self,
+        stream: &mut Option<StreamState>,
+        screen: u8,
+        x: f32,
+        y: f32,
+    ) {
+        let Some(st) = stream.as_mut() else {
+            return;
+        };
+        st.cursor.user_moved(Instant::now());
+        let abs = st.screens.abs_at(screen, self.opts.video_fit, x, y);
+        if let (Some(cap), Some(abs)) = (st.capture.as_mut(), abs) {
+            if cap.desktop() {
+                cap.on_motion_abs_on(screen, abs);
+            }
+        }
+    }
+
+    /// The pointer is over one of the further screens' windows.
+    pub(super) fn over_screen(&self, st: &StreamState) -> bool {
+        self.mouse
+            .focused_window_id()
+            .and_then(|id| st.screens.screen_of(id))
+            .is_some()
+    }
+
+    /// The client's monitors changed: ask the host for the screens they make now.
+    pub(super) fn replan_screens(&mut self, st: &mut StreamState) {
+        let Some(connector) = st.connector.as_ref() else {
+            return;
+        };
+        let planned = client_screens(&self.sdl_video, &self.window, connector.mode());
+        let ask = st.screens.plan(&planned);
+        tracing::info!(
+            screens = ask.len(),
+            "client monitors changed — asking for screens"
+        );
+        let _ = connector.request_screens(ask);
+    }
+
+    /// The screens a stream starting at `mode` asks for: every client monitor when
+    /// [`SessionOpts::all_screens`] is on and there is more than one, else none.
+    pub(super) fn plan_screens(&self, screens: &mut ScreenWindows, mode: Mode) -> Vec<Screen> {
+        if !self.opts.all_screens {
+            return Vec::new();
+        }
+        let planned = client_screens(&self.sdl_video, &self.window, mode);
+        if planned.len() < 2 {
+            return Vec::new();
+        }
+        screens.plan(&planned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A monitor to the right of a HiDPI first screen sits one picture-width over.
+    #[test]
+    fn a_monitor_sits_in_the_first_pictures_pixels() {
+        let first = Rect::new(0, 0, 2560, 1440);
+        let mode = Mode {
+            width: 5120,
+            height: 2880,
+            refresh_hz: 60,
+        };
+        assert_eq!(
+            offset_px(first, Rect::new(2560, 0, 1920, 1080), mode),
+            (5120, 0)
+        );
+        assert_eq!(
+            offset_px(first, Rect::new(-1920, 360, 1920, 1080), mode),
+            (-3840, 720)
+        );
+    }
+}

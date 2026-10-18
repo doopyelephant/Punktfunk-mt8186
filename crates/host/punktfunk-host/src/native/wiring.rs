@@ -21,6 +21,46 @@ pub(crate) struct Delivered {
 /// rebuild failed and the old pipeline streams on.
 pub(crate) type FormatOutcome = Option<crate::encode::Codec>;
 
+/// What the screens past the first tell the client, on the control stream.
+pub(crate) enum ScreenTell {
+    /// One epoch of a further screen's stream, before its first packet.
+    Config(punktfunk_core::quic::v2::msg::StreamConfig),
+    /// Every screen built, after any change.
+    Layout(Vec<punktfunk_core::quic::v2::msg::Screen>),
+}
+
+/// What the control task and the screen loops share about the screens past the first.
+pub(crate) struct ScreenWire {
+    /// A keyframe the client asked of a stream ([`Feedback::stream`]), by stream id.
+    ///
+    /// [`Feedback::stream`]: punktfunk_core::quic::v2::dgram::Feedback::stream
+    keyframe: [AtomicBool; 16],
+    /// The first screen's share of the video, per mille.
+    pub(crate) primary_share: std::sync::atomic::AtomicU16,
+}
+
+impl ScreenWire {
+    pub(crate) fn new() -> Self {
+        ScreenWire {
+            keyframe: std::array::from_fn(|_| AtomicBool::new(false)),
+            primary_share: std::sync::atomic::AtomicU16::new(super::bitrate::SHARE_ALL),
+        }
+    }
+
+    pub(crate) fn ask_keyframe(&self, stream: u8) {
+        if let Some(f) = self.keyframe.get(usize::from(stream)) {
+            f.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a keyframe of `stream` was asked since the last take.
+    pub(crate) fn take_keyframe(&self, stream: u8) -> bool {
+        self.keyframe
+            .get(usize::from(stream))
+            .is_some_and(|f| f.swap(false, Ordering::Relaxed))
+    }
+}
+
 /// Values the control task and the stream thread both read or write. A clone shares them.
 #[derive(Clone)]
 pub(crate) struct SessionShared {
@@ -73,6 +113,8 @@ pub(crate) struct SessionShared {
     /// UDP send offload for the media sender. The control task's loss guard clears it once
     /// for the session; a cleared switch sends every packet on its own.
     pub(crate) offload_switch: Arc<AtomicBool>,
+    /// Screens past the first: their keyframe asks and the first screen's share of the video.
+    pub(crate) screens: Arc<ScreenWire>,
 }
 
 /// [`SessionShared::acked`] before the client confirmed a frame.
@@ -105,6 +147,9 @@ pub(crate) struct ControlEnds {
     pub(crate) shard_ack_tx: tokio::sync::mpsc::UnboundedSender<u16>,
     pub(crate) cursor_shape_rx:
         tokio::sync::watch::Receiver<Option<punktfunk_core::quic::CursorShape>>,
+    /// The client's `Screens`, to the stream thread.
+    pub(crate) screens_tx: std::sync::mpsc::Sender<Vec<punktfunk_core::quic::v2::msg::Screen>>,
+    pub(crate) screen_tell_rx: tokio::sync::mpsc::UnboundedReceiver<ScreenTell>,
 }
 
 /// The stream thread's halves.
@@ -132,6 +177,8 @@ pub(crate) struct StreamEnds {
     /// drained, so a stalled peer can't grow the host.
     pub(crate) cursor_shape_tx:
         tokio::sync::watch::Sender<Option<punktfunk_core::quic::CursorShape>>,
+    pub(crate) screens_rx: std::sync::mpsc::Receiver<Vec<punktfunk_core::quic::v2::msg::Screen>>,
+    pub(crate) screen_tell_tx: tokio::sync::mpsc::UnboundedSender<ScreenTell>,
 }
 
 /// The wire-MTU watcher's halves of shard renegotiation ([`wire_mtu::ShardReneg`]). A session
@@ -173,6 +220,8 @@ impl SessionWiring {
         let (change_tx, shard_change_rx) = tokio::sync::mpsc::unbounded_channel();
         let (shard_ack_tx, ack_rx) = tokio::sync::mpsc::unbounded_channel();
         let (apply_tx, shard_rx) = std::sync::mpsc::channel();
+        let (screens_tx, screens_rx) = std::sync::mpsc::channel();
+        let (screen_tell_tx, screen_tell_rx) = tokio::sync::mpsc::unbounded_channel();
         let fec_target = Arc::new(AtomicU8::new(welcome.fec.fec_percent));
         let fec_requested = match source {
             Punktfunk1Source::SyntheticAbr(_) => fec_target.clone(),
@@ -194,6 +243,8 @@ impl SessionWiring {
                 shard_change_rx,
                 shard_ack_tx,
                 cursor_shape_rx,
+                screens_tx,
+                screen_tell_rx,
             },
             stream: StreamEnds {
                 reconfig,
@@ -209,6 +260,8 @@ impl SessionWiring {
                 retarget_tx,
                 gap_tx,
                 cursor_shape_tx,
+                screens_rx,
+                screen_tell_tx,
             },
             shard: ShardEnds {
                 change_tx,
@@ -235,6 +288,7 @@ impl SessionWiring {
                     welcome.host_caps2 & punktfunk_core::quic::HOST_CAP2_RAMP != 0,
                 )),
                 cursor_client_draws: Arc::new(AtomicBool::new(true)),
+                screens: Arc::new(ScreenWire::new()),
             },
         }
     }

@@ -168,6 +168,13 @@ pub struct WlrootsInjector {
     bound_output: Option<u32>,
     /// Aim generation [`Self::retarget`] last read the socket for an unbound name.
     lookup_gen: u64,
+    /// A pointer per further screen that saw absolute input, bound to that screen's output:
+    /// the protocol has no re-aim, and re-making one pointer per move would drop a held button
+    /// mid-drag between screens.
+    screens: Vec<ScreenPointer>,
+    /// The screen whose pointer moved last, `0` the first: buttons, scroll and relative motion
+    /// go there.
+    active: u8,
     /// What `pointer` and `keyboard` hold. Released before either goes; the compositor will not.
     plan: Plan,
     keyboard: ZwpVirtualKeyboardV1,
@@ -178,6 +185,16 @@ pub struct WlrootsInjector {
     text: Option<TextKeyboard>,
     /// Scroll lowering, legacy and normalized; holds the sub-detent residue.
     scroll: ScrollMapper,
+}
+
+/// One further screen's pointer ([`WlrootsInjector::screens`]).
+struct ScreenPointer {
+    screen: u8,
+    pointer: ZwlrVirtualPointerV1,
+    /// Registry global of its output; `None` maps over the whole layout.
+    bound: Option<u32>,
+    /// Screens generation it last read the socket for an unbound name.
+    lookup_gen: u64,
 }
 
 /// Distinct chars before the text keymap restarts. Keycodes start at 9; xkb max is 255.
@@ -289,6 +306,8 @@ impl WlrootsInjector {
             pointer,
             bound_output,
             lookup_gen: aim.generation,
+            screens: Vec::new(),
+            active: 0,
             plan: Plan::default(),
             keyboard,
             xkb_state,
@@ -349,6 +368,68 @@ impl WlrootsInjector {
         self.bound_output = to;
     }
 
+    /// The pointer of further screen `screen`, bound to its output and made on first use;
+    /// `None` without the pointer manager or seat.
+    fn screen_pointer(&mut self, screen: u8) -> Option<&ZwlrVirtualPointerV1> {
+        let generation = crate::aim().screens_generation;
+        let target = crate::stream_target_for(screen);
+        let at = self.screens.iter().position(|p| p.screen == screen);
+        if self.globals.lacks(&target) && at.map(|i| self.screens[i].lookup_gen) != Some(generation)
+        {
+            for _ in 0..2 {
+                if self.queue.roundtrip(&mut self.globals).is_err() {
+                    break;
+                }
+            }
+            if let Some(i) = at {
+                self.screens[i].lookup_gen = generation;
+            }
+        }
+        let output = self.globals.resolve(&target);
+        let bound = output.map(|o| o.global);
+        if let Some(i) = at.filter(|&i| self.screens[i].bound == bound) {
+            return Some(&self.screens[i].pointer);
+        }
+        let output = output.map(|o| o.proxy.clone());
+        let (mgr, seat) = (
+            self.globals.pointer_mgr.clone()?,
+            self.globals.seat.clone()?,
+        );
+        let pointer = mgr.create_virtual_pointer_with_output(
+            Some(&seat),
+            output.as_ref(),
+            &self.queue.handle(),
+            (),
+        );
+        tracing::info!(screen, output = ?target.name, "wlroots virtual pointer made for a further screen");
+        let made = ScreenPointer {
+            screen,
+            pointer,
+            bound,
+            lookup_gen: generation,
+        };
+        let i = match at {
+            Some(i) => {
+                std::mem::replace(&mut self.screens[i], made)
+                    .pointer
+                    .destroy();
+                i
+            }
+            None => {
+                self.screens.push(made);
+                self.screens.len() - 1
+            }
+        };
+        Some(&self.screens[i].pointer)
+    }
+
+    /// The pointer that moved last ([`Self::active`]).
+    fn current(&self) -> &ZwlrVirtualPointerV1 {
+        (self.screens.iter())
+            .find(|p| p.screen == self.active)
+            .map_or(&self.pointer, |p| &p.pointer)
+    }
+
     /// Read the socket, dispatch, flush. `dispatch_pending` does not read, so
     /// without `read()` a `wl_output` created after `open` is never seen and
     /// protocol errors sit unread. `WouldBlock` is the idle case, not an error.
@@ -377,12 +458,12 @@ impl WlrootsInjector {
         (crate::monotonic_us() / 1_000) as u32
     }
 
-    /// Release every button `pointer` holds, unframed. `true` when there was one.
+    /// Release every button the current pointer holds, unframed. `true` when there was one.
     fn release_buttons(&mut self, t: u32) -> bool {
         let mut any = false;
         for op in self.plan.lift(false, true) {
             if let Op::Button { evdev, .. } = op {
-                self.pointer
+                self.current()
                     .button(t, evdev, wl_pointer::ButtonState::Released);
                 any = true;
             }
@@ -394,10 +475,19 @@ impl WlrootsInjector {
     fn emit(&mut self, t: u32, op: Op) -> Result<()> {
         match op {
             Op::Motion { dx, dy } => {
-                self.pointer.motion(t, dx.into(), dy.into());
-                self.pointer.frame();
+                self.current().motion(t, dx.into(), dy.into());
+                self.current().frame();
+            }
+            Op::Absolute(abs) if abs.screen != 0 => {
+                let (x, y) = abs.in_extent();
+                if let Some(p) = self.screen_pointer(abs.screen) {
+                    p.motion_absolute(t, x, y, abs.w, abs.h);
+                    p.frame();
+                    self.active = abs.screen;
+                }
             }
             Op::Absolute(abs) => {
+                self.active = 0;
                 self.retarget();
                 let t = self.now_ms(); // `retarget` may have consumed time releasing buttons
                 let (x, y) = abs.in_extent();
@@ -410,8 +500,8 @@ impl WlrootsInjector {
                 } else {
                     wl_pointer::ButtonState::Released
                 };
-                self.pointer.button(t, evdev, st);
-                self.pointer.frame();
+                self.current().button(t, evdev, st);
+                self.current().frame();
             }
             Op::Key { evdev, down } => {
                 self.keyboard.key(t, evdev.into(), down.into());
@@ -495,29 +585,29 @@ impl WlrootsInjector {
                 wl_pointer::Axis::VerticalScroll
             }
         };
+        let pointer = self.current();
         for op in ops {
             match op {
                 ScrollOp::AxisSource(src) => {
-                    self.pointer.axis_source(match src {
+                    pointer.axis_source(match src {
                         AxisSource::Wheel => wl_pointer::AxisSource::Wheel,
                         AxisSource::Finger => wl_pointer::AxisSource::Finger,
                     });
                 }
                 ScrollOp::Continuous { horizontal, value } => {
-                    self.pointer.axis(t, axis(horizontal), value);
+                    pointer.axis(t, axis(horizontal), value);
                 }
                 ScrollOp::DiscreteDetents {
                     horizontal,
                     value,
                     detents,
                 } => {
-                    self.pointer
-                        .axis_discrete(t, axis(horizontal), value, detents);
+                    pointer.axis_discrete(t, axis(horizontal), value, detents);
                 }
                 ScrollOp::Stop { horizontal, .. } => {
-                    self.pointer.axis_stop(t, axis(horizontal));
+                    pointer.axis_stop(t, axis(horizontal));
                 }
-                ScrollOp::Frame => self.pointer.frame(),
+                ScrollOp::Frame => pointer.frame(),
                 // ei/Win32 vocabulary; a wlr plan never emits it.
                 ScrollOp::Discrete120 { .. } => {}
             }
@@ -542,7 +632,10 @@ impl Drop for WlrootsInjector {
         self.release_buttons(t);
         let ops = self.scroll.cancel_all();
         self.emit_scroll_ops(t, ops);
-        self.pointer.frame();
+        self.current().frame();
+        for p in self.screens.drain(..) {
+            p.pointer.destroy();
+        }
         let _ = self.conn.flush();
     }
 }

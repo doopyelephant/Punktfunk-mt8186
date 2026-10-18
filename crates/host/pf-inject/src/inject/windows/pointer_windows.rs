@@ -127,8 +127,8 @@ const WIN_PEN_PRESSURE_MAX: u32 = 1024;
 /// Map a normalized [0,1] pair onto the STREAMED output's rect ([`crate::stream_target`])
 /// — the same surface SendInput absolute mouse uses. Mapping over the whole virtual
 /// desktop is only right when they coincide (Exclusive topology; the no-target fallback).
-fn to_screen(x: f32, y: f32) -> POINT {
-    let (px, py) = crate::stream_target::map_normalized(x as f64, y as f64);
+fn to_screen(screen: u8, x: f32, y: f32) -> POINT {
+    let (px, py) = crate::stream_target::map_normalized(screen, x as f64, y as f64);
     POINT { x: px, y: py }
 }
 
@@ -376,7 +376,7 @@ fn inject_pen(sh: &mut PenShared, edge: POINTER_FLAGS, is_new: bool) {
         rotation = (st.roll_deg % 360) as u32;
         pen_mask |= PEN_MASK_ROTATION;
     }
-    let pt = to_screen(st.x, st.y);
+    let pt = to_screen(0, st.x, st.y);
     let info = POINTER_TYPE_INFO {
         r#type: PT_PEN,
         Anonymous: POINTER_TYPE_INFO_0 {
@@ -434,6 +434,8 @@ struct Contact {
     slot: u32,
     x: f32,
     y: f32,
+    /// The screen of the session the finger is on ([`InputEvent::screen`]).
+    screen: u8,
 }
 
 fn free_slot(contacts: &[Contact]) -> u32 {
@@ -512,7 +514,10 @@ impl SyntheticTouch {
         match ev.kind {
             InputKind::TouchDown => {
                 match s.contacts.iter().position(|c| c.id == ev.code) {
-                    Some(i) => (s.contacts[i].x, s.contacts[i].y) = (x, y),
+                    Some(i) => {
+                        (s.contacts[i].x, s.contacts[i].y, s.contacts[i].screen) =
+                            (x, y, ev.screen())
+                    }
                     None if s.contacts.len() < MAX_CONTACTS => {
                         let slot = free_slot(&s.contacts);
                         s.contacts.push(Contact {
@@ -520,6 +525,7 @@ impl SyntheticTouch {
                             slot,
                             x,
                             y,
+                            screen: ev.screen(),
                         })
                     }
                     None => return, // beyond the platform max — drop, never evict a live finger
@@ -529,7 +535,8 @@ impl SyntheticTouch {
             InputKind::TouchMove => {
                 match s.contacts.iter().position(|c| c.id == ev.code) {
                     Some(i) => {
-                        (s.contacts[i].x, s.contacts[i].y) = (x, y);
+                        (s.contacts[i].x, s.contacts[i].y, s.contacts[i].screen) =
+                            (x, y, ev.screen());
                         inject_touch_frame(s, None);
                     }
                     // A move for an unknown id (its DOWN was dropped/lost): synthesize the
@@ -541,6 +548,7 @@ impl SyntheticTouch {
                             slot,
                             x,
                             y,
+                            screen: ev.screen(),
                         });
                         inject_touch_frame(s, Some((ev.code, POINTER_FLAG_DOWN)));
                     }
@@ -589,7 +597,7 @@ fn inject_touch_frame(sh: &mut TouchShared, edge: Option<(u32, POINTER_FLAGS)>) 
                 }
             }
         }
-        let pt = to_screen(c.x, c.y);
+        let pt = to_screen(c.screen, c.x, c.y);
         frame.push(POINTER_TYPE_INFO {
             r#type: PT_TOUCH,
             Anonymous: POINTER_TYPE_INFO_0 {

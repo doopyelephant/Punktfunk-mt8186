@@ -1369,6 +1369,7 @@ pub(crate) async fn run_admitted(
         input_tx: input_tx.clone(),
         initial_mode: hello.mode,
         stream_config: v2msg::StreamConfig {
+            stream: 0,
             epoch: 0,
             mode: welcome.mode,
             codec: welcome.codec,
@@ -1667,6 +1668,9 @@ pub(crate) async fn run_admitted(
             );
             let format_facts =
                 handshake::FormatFacts::of(&hello, compositor, gamescope_route.as_ref());
+            let screens = features
+                .has(punktfunk_core::quic::v2::registry::FEATURE_SCREENS)
+                .then(|| first.screens.clone());
             move |common| SessionContext {
                 common,
                 compositor: compositor
@@ -1706,6 +1710,7 @@ pub(crate) async fn run_admitted(
                 inj_session_tx,
                 #[cfg(target_os = "linux")]
                 follows_seat,
+                screens,
             }
         };
         // Explicit-rate PyroWave: the client's ramp closes with one lower pin.

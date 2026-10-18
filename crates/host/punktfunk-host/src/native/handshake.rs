@@ -595,15 +595,23 @@ pub(super) async fn negotiate(
     });
     let session = conn.v2_session();
     session.settle(suite);
-    let features = first.features.intersect(
-        punktfunk_core::quic::v2::features::FeatureSet::default()
-            .with(punktfunk_core::quic::v2::registry::FEATURE_STREAM_CONFIG)
-            .with(punktfunk_core::quic::v2::registry::FEATURE_PAD_WRITES)
-            .with(punktfunk_core::quic::v2::registry::FEATURE_PROFILES)
-            .with(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT)
-            .with(punktfunk_core::quic::v2::registry::FEATURE_FORMAT_EPOCH)
-            .with(punktfunk_core::quic::v2::registry::FEATURE_AUDIO_EPOCH),
-    );
+    let mut offered = punktfunk_core::quic::v2::features::FeatureSet::default()
+        .with(punktfunk_core::quic::v2::registry::FEATURE_STREAM_CONFIG)
+        .with(punktfunk_core::quic::v2::registry::FEATURE_PAD_WRITES)
+        .with(punktfunk_core::quic::v2::registry::FEATURE_PROFILES)
+        .with(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT)
+        .with(punktfunk_core::quic::v2::registry::FEATURE_FORMAT_EPOCH)
+        .with(punktfunk_core::quic::v2::registry::FEATURE_AUDIO_EPOCH);
+    // Further screens only where this session builds displays of its own on a compositor with
+    // more than one output: not gamescope, not a joiner or a mirror.
+    if matches!(source, Punktfunk1Source::Virtual)
+        && compositor.is_some_and(|c| c != crate::vdisplay::Compositor::Gamescope)
+        && joined.is_none()
+        && !crate::session_plan::mirrored()
+    {
+        offered = offered.with(punktfunk_core::quic::v2::registry::FEATURE_SCREENS);
+    }
+    let features = first.features.intersect(offered);
     let server_hello = ServerHello {
         welcome,
         session_id: session.session_id,
@@ -648,6 +656,8 @@ pub(super) async fn negotiate(
                     fec_percent: welcome.fec.fec_percent,
                     head_only_hz: (codec == crate::encode::Codec::PyroWave)
                         .then_some(welcome.mode.refresh_hz),
+                    // Further screens build after Welcome and take their shares then.
+                    share_permille: super::bitrate::SHARE_ALL,
                 },
                 chroma,
                 codec,

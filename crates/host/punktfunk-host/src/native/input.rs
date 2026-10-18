@@ -1291,10 +1291,13 @@ pub(super) fn input_thread(
                         // Track press/release so a mid-press disconnect can be undone below.
                         held.note(&ev);
                         let mut ev = ev;
-                        reframe_input(
-                            &mut ev,
-                            &frame_map.lock().unwrap_or_else(|e| e.into_inner()),
-                        );
+                        // The framing is the first screen's encoder's; the others are not cropped.
+                        if ev.screen() == 0 {
+                            reframe_input(
+                                &mut ev,
+                                &frame_map.lock().unwrap_or_else(|e| e.into_inner()),
+                            );
+                        }
                         // Host-lifetime injector. Send error = service gone; input is lossy.
                         let _ = inj_tx.send(ev);
                     }

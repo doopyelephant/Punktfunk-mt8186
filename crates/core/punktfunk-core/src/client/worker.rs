@@ -133,6 +133,8 @@ pub(crate) struct ClientShared {
     /// AU memory the embedder installed and the pump has not yet handed its session
     /// ([`NativeClient::set_au_memory`](super::NativeClient::set_au_memory)).
     pub(crate) au_memory: Mutex<Option<Arc<dyn crate::au::AuMemory>>>,
+    /// Screens past the first: their lanes and the host's layout.
+    pub(crate) screens: super::screens::Screens,
 }
 
 impl ClientShared {
@@ -193,6 +195,7 @@ impl ClientShared {
             end_reject_code: AtomicU32::new(0),
             end_reject_said: std::sync::OnceLock::new(),
             au_memory: Mutex::default(),
+            screens: Default::default(),
         }
     }
 

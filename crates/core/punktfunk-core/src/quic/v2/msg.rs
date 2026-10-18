@@ -352,6 +352,9 @@ impl V2Message for ClipOffer {
 /// say.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StreamConfig {
+    /// The video stream this config is for: 0 the first screen, then the one each further
+    /// screen rides ([`ScreenLayout`]). Epochs count per stream.
+    pub stream: u8,
     pub epoch: u8,
     pub mode: Mode,
     /// One `CODEC_*` bit.
@@ -372,7 +375,91 @@ pub struct StreamConfig {
 
 v2_message!(StreamConfig = reg::MSG_STREAM_CONFIG,
     { 1 => epoch, 2 => mode, 3 => codec, 4 => bit_depth, 5 => color, 6 => chroma_format,
-      7 => host_iface_kind, 8 => host_link_mbps, 9 => host_sndbuf_kb, 10 => host_forced_shape });
+      7 => host_iface_kind, 8 => host_link_mbps, 9 => host_sndbuf_kb, 10 => host_forced_shape,
+      11 => stream });
+
+/// Screens one session carries at most, the first included.
+pub const SCREENS_MAX: usize = 4;
+/// Bytes of one [`Screen`] on the wire.
+const SCREEN_LEN: usize = 20;
+
+/// One screen of a session. In a `ClientHello` or [`Screens`] it is a monitor the client shows,
+/// placed in the client's pixels beside screen 0; in a [`ScreenLayout`], a display the host
+/// built, placed on the host's desktop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Screen {
+    /// 0 is the screen `Hello.mode` describes.
+    pub index: u8,
+    /// The video stream it rides ([`crate::packet::screen_stream`]); 0 in an ask.
+    pub stream: u8,
+    pub mode: Mode,
+    /// Top-left of the screen.
+    pub x: i32,
+    pub y: i32,
+    /// The client's primary monitor.
+    pub primary: bool,
+}
+
+/// `index u8 ‖ stream u8 ‖ flags u8 ‖ 0 ‖ width u16 ‖ height u16 ‖ refresh u16 ‖ 0 u16 ‖ x i32 ‖
+/// y i32` per screen, at most [`SCREENS_MAX`], as one value.
+impl FieldValue for Vec<Screen> {
+    fn put(&self, f: Fields, tag: u64) -> Fields {
+        let mut b = Vec::with_capacity(self.len() * SCREEN_LEN);
+        for s in self.iter().take(SCREENS_MAX) {
+            let dim = |v: u32| (v.min(u32::from(u16::MAX)) as u16).to_le_bytes();
+            b.extend_from_slice(&[s.index, s.stream, u8::from(s.primary), 0]);
+            b.extend_from_slice(&dim(s.mode.width));
+            b.extend_from_slice(&dim(s.mode.height));
+            b.extend_from_slice(&dim(s.mode.refresh_hz));
+            b.extend_from_slice(&[0, 0]);
+            b.extend_from_slice(&s.x.to_le_bytes());
+            b.extend_from_slice(&s.y.to_le_bytes());
+        }
+        f.bytes(tag, &b)
+    }
+    fn get(v: &[u8]) -> Result<Self> {
+        if v.len() % SCREEN_LEN != 0 || v.len() / SCREEN_LEN > SCREENS_MAX {
+            return Err(PunktfunkError::InvalidArg("bad screen list"));
+        }
+        Ok(v.chunks_exact(SCREEN_LEN)
+            .map(|r| {
+                let u16_at = |o: usize| u32::from(u16::from_le_bytes([r[o], r[o + 1]]));
+                let i32_at = |o: usize| i32::from_le_bytes([r[o], r[o + 1], r[o + 2], r[o + 3]]);
+                Screen {
+                    index: r[0],
+                    stream: r[1],
+                    primary: r[2] & 1 != 0,
+                    mode: Mode {
+                        width: u16_at(4),
+                        height: u16_at(6),
+                        refresh_hz: u16_at(8),
+                    },
+                    x: i32_at(12),
+                    y: i32_at(16),
+                }
+            })
+            .collect())
+    }
+}
+
+/// `host → client`, before the first packet of any stream past the first and after every
+/// change: each screen the host built, screen 0 included. A screen the host could not build
+/// is absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScreenLayout {
+    pub screens: Vec<Screen>,
+}
+
+v2_message!(ScreenLayout = reg::MSG_SCREEN_LAYOUT, { 1 => screens });
+
+/// `client → host`: every screen the client shows now, screen 0 first. Screen 0's mode still
+/// moves by `Reconfigure`; this adds, drops and resizes the others.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Screens {
+    pub screens: Vec<Screen>,
+}
+
+v2_message!(Screens = reg::MSG_SCREENS, { 1 => screens });
 
 impl StreamConfig {
     /// What a decoder for this epoch is built for.
@@ -612,6 +699,7 @@ mod tests {
             total_size: 1 << 40,
         });
         round_trip(StreamConfig {
+            stream: 0,
             epoch: 4,
             mode,
             codec: CODEC_AV1,
@@ -623,6 +711,38 @@ mod tests {
             host_sndbuf_kb: 4_096,
             host_forced_shape: 2,
         });
+        round_trip(StreamConfig {
+            stream: 2,
+            epoch: 1,
+            mode,
+            ..Default::default()
+        });
+        let screens = vec![
+            Screen {
+                index: 0,
+                stream: 0,
+                mode,
+                x: 0,
+                y: 0,
+                primary: true,
+            },
+            Screen {
+                index: 1,
+                stream: 2,
+                mode: Mode {
+                    width: 2560,
+                    height: 1440,
+                    refresh_hz: 60,
+                },
+                x: -2560,
+                y: -300,
+                primary: false,
+            },
+        ];
+        round_trip(ScreenLayout {
+            screens: screens.clone(),
+        });
+        round_trip(Screens { screens });
         round_trip(AudioConfig {
             stream: 0,
             epoch: 1,
@@ -675,6 +795,37 @@ mod tests {
                 0x02, 0x05, 0x00, 0x06, 0x00, 0x07, 0x00
             ]
         );
+        assert_eq!(
+            ScreenLayout {
+                screens: vec![Screen {
+                    index: 1,
+                    stream: 2,
+                    mode: Mode {
+                        width: 1920,
+                        height: 1080,
+                        refresh_hz: 60,
+                    },
+                    x: 1920,
+                    y: 0,
+                    primary: false,
+                }],
+            }
+            .encode_v2(),
+            [
+                0x28, 0x16, 0x01, 0x14, 0x01, 0x02, 0x00, 0x00, 0x80, 0x07, 0x38, 0x04, 0x3C, 0x00,
+                0x00, 0x00, 0x80, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            ]
+        );
+    }
+
+    /// A screen list past [`SCREENS_MAX`] or with a torn record does not decode.
+    #[test]
+    fn a_bad_screen_list_does_not_decode() {
+        let list = |n: usize| Fields::new().bytes(1, &vec![0u8; n]).into_body();
+        let at_bound = Screens::from_body(&list(SCREEN_LEN * SCREENS_MAX)).unwrap();
+        assert_eq!(at_bound.screens.len(), SCREENS_MAX);
+        assert!(Screens::from_body(&list(SCREEN_LEN * (SCREENS_MAX + 1))).is_err());
+        assert!(Screens::from_body(&list(SCREEN_LEN - 1)).is_err());
     }
 
     #[test]

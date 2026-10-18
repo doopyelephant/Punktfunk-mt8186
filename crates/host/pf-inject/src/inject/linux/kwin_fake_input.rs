@@ -382,15 +382,18 @@ impl KwinFakeInjector {
             .iter()
             .filter_map(|o| o.geo.facts())
             .collect();
-        let (lx, ly, lw, lh) =
-            match head_pick::pick(&heads, &crate::stream_target(), Some((abs.w, abs.h))) {
-                Some(i) => {
-                    let h = heads[i];
-                    let (x, y) = (f64::from(h.x), f64::from(h.y));
-                    (x, y, f64::from(h.logical_w), f64::from(h.logical_h))
-                }
-                None => (0.0, 0.0, f64::from(abs.w), f64::from(abs.h)),
-            };
+        let (lx, ly, lw, lh) = match head_pick::pick(
+            &heads,
+            &crate::stream_target_for(abs.screen),
+            Some((abs.w, abs.h)),
+        ) {
+            Some(i) => {
+                let h = heads[i];
+                let (x, y) = (f64::from(h.x), f64::from(h.y));
+                (x, y, f64::from(h.logical_w), f64::from(h.logical_h))
+            }
+            None => (0.0, 0.0, f64::from(abs.w), f64::from(abs.h)),
+        };
         let (nx, ny) = abs.normalized();
         (lx + nx * lw, ly + ny * lh)
     }

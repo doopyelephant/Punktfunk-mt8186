@@ -22,6 +22,7 @@ mod rebuild;
 mod recovery;
 #[cfg(target_os = "windows")]
 mod resize;
+mod screens;
 mod send;
 mod session_watch;
 mod state;
@@ -467,7 +468,7 @@ fn service_probes(
 
 /// Seal one AU and send it on the session's [`Pacer`](crate::send_pacing::Pacer): every
 /// group on the clock at the link rate. Chunks go out as they are sealed, so the first
-/// packet leaves after one chunk, not the frame.
+/// packet leaves after one chunk, not the frame. `ring` keeps its plaintext for a NACK.
 fn paced_submit(
     session: &mut Session,
     data: &[u8],
@@ -475,11 +476,13 @@ fn paced_submit(
     flags: u32,
     frame_index: u32,
     pacer: &mut crate::send_pacing::Pacer,
-    ring: &mut recovery::ResendRing,
+    mut ring: Option<&mut recovery::ResendRing>,
 ) -> Result<PaceStat> {
     pacer.begin(session.frame_wire_len(data, flags));
     session.drain_plaintext(|_| {});
-    ring.begin(frame_index);
+    if let Some(r) = ring.as_deref_mut() {
+        r.begin(frame_index);
+    }
     let sealed =
         session.seal_frame_chunks_at(data, pts_ns, flags, frame_index, &mut |chunk, send| {
             let mut refs: Vec<&[u8]> = chunk.iter().map(|w| w.as_slice()).collect();
@@ -488,7 +491,10 @@ fn paced_submit(
         });
     let (stat, sock_ns) = pacer.finish();
     session.note_sock_ns(sock_ns);
-    session.drain_plaintext(|p| ring.note(p));
+    match ring {
+        Some(r) => session.drain_plaintext(|p| r.note(p)),
+        None => session.drain_plaintext(|_| {}),
+    }
     sealed.map_err(|e| anyhow!("seal_frame: {e:?}"))?;
     Ok(stat)
 }
@@ -608,6 +614,8 @@ pub(super) struct SessionContext {
     /// The seat's own session: it follows the seat's Game Mode switch (`seats/session_switch.rs`).
     #[cfg(target_os = "linux")]
     pub(super) follows_seat: bool,
+    /// The client's screens when the session negotiated them, screen 0 first; `None` without.
+    pub(super) screens: Option<Vec<punktfunk_core::quic::v2::msg::Screen>>,
 }
 
 /// The virtual-display session: bring up, then tick until the client leaves.

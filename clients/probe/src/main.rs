@@ -159,6 +159,25 @@ struct Args {
     /// the headless validator for the host answering `ClockProbe` at any time (what the native
     /// clients' mid-stream re-sync relies on). Aborts the session when the re-probe fails.
     clock_resync: bool,
+    /// `--screens N` (2–4) — ask for N screens of `--mode` side by side and count each one's
+    /// frames; screen k's go to `<out>.s<stream>`. 1 asks for none.
+    screens: u8,
+}
+
+/// The screens `--screens` asks for: `--mode` each, left to right; empty for one.
+fn screens_ask(args: &Args) -> Vec<punktfunk_core::quic::v2::msg::Screen> {
+    if args.screens < 2 {
+        return Vec::new();
+    }
+    (0..args.screens)
+        .map(|i| punktfunk_core::quic::v2::msg::Screen {
+            index: i,
+            mode: args.mode,
+            x: i32::from(i) * args.mode.width as i32,
+            primary: i == 0,
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// The control stream's halves; `punktfunk/2`'s cross the translation edges.
@@ -375,6 +394,10 @@ fn parse_argv(argv: Vec<String>) -> Args {
         cursor_capture: argv.iter().any(|a| a == "--cursor-capture"),
         cursor_nochannel: argv.iter().any(|a| a == "--cursor-nochannel"),
         cursor_channel: argv.iter().any(|a| a == "--cursor-channel"),
+        screens: get("--screens")
+            .and_then(|s| s.parse::<u8>().ok())
+            .unwrap_or(1)
+            .clamp(1, punktfunk_core::quic::v2::msg::SCREENS_MAX as u8),
     }
 }
 
@@ -629,6 +652,11 @@ async fn session(mut args: Args) -> Result<()> {
             Err(e) => return Err(e),
         },
     };
+    // Screens past the first: their keyframe asks leave on this connection.
+    let screen_asks = server
+        .features
+        .has(punktfunk_core::quic::v2::registry::FEATURE_SCREENS)
+        .then(|| quic.clone());
     let welcome = server.welcome;
     // Media on the dialing socket, under keys from the connection's exporter.
     let suite = server.suite.context("unsealed native media")?;
@@ -698,6 +726,7 @@ async fn session(mut args: Args) -> Result<()> {
             clock_offset_ns,
             dp_counters,
             host_timing_rx,
+            screen_asks,
         )
     })
     .await?;
@@ -885,13 +914,8 @@ async fn handshake(
             // the probe accepts a mid-session shard change (and jumbo growth) up to the
             // receive ceiling — and it's exactly the tool to measure both.
             max_shard_payload: punktfunk_core::config::max_shard_payload() as u16,
-            // `0`/`0` is UNSPECIFIED. For the shipping clients that distinction decides the
-            // capability bit — `advertised_client_caps` sets it when either field is non-zero,
-            // because it keys on "the caller specified a format", so that 48 kHz/16-bit (the
-            // cheapest lossless rung) is not the one format nobody can request. This `Hello` is
-            // hand-built and does not use that helper, so here the two are set together above and
-            // the sentinel is about honesty rather than mechanism: an inert format on the wire
-            // invites exactly the misreading that a rate alone asks for something.
+            // `0`/`0` is UNSPECIFIED. This hand-built `Hello` sets the cap bit and the format
+            // together, so no inert format reaches the wire to read as a request.
             audio_rate_hz: args.audio_format.map(|(r, _)| r).unwrap_or(0),
             audio_bits: args.audio_format.map(|(_, b)| b).unwrap_or(0),
         },
@@ -905,15 +929,19 @@ async fn handshake(
         suites: extra.suites,
         // A host answers a `Redirect` only to a client that says it follows one.
         features: {
-            let none = punktfunk_core::quic::v2::features::FeatureSet::default();
+            use punktfunk_core::quic::v2::registry::{FEATURE_PROFILES, FEATURE_SCREENS};
+            let mut set = punktfunk_core::quic::v2::features::FeatureSet::default();
             if args.as_profile.is_some() {
-                none.with(punktfunk_core::quic::v2::registry::FEATURE_PROFILES)
-            } else {
-                none
+                set = set.with(FEATURE_PROFILES);
             }
+            if args.screens > 1 {
+                set = set.with(FEATURE_SCREENS);
+            }
+            set
         },
         profile: args.as_profile.clone(),
         access_only: false,
+        screens: screens_ask(args),
     };
     v2io::send(send, &hello).await?;
     // `Pending` repeats while the host asks its console about this probe.
@@ -1048,8 +1076,35 @@ async fn control_plane(
         spawn_cursor_test(conn, send, recv, args.cursor_capture, args.cursor_channel);
     } else {
         spawn_loss_relay(conn.conn.clone(), send, counters, link_kbps);
+        spawn_screen_log(recv);
     }
     Ok(())
+}
+
+/// Log what the host says about screens past the first: each layout and each stream's config.
+fn spawn_screen_log(mut recv: CtlRx) {
+    use punktfunk_core::quic::v2::msg::{ScreenLayout, StreamConfig};
+    tokio::spawn(async move {
+        while let Ok((ty, body)) = recv.read_frame().await {
+            if let Ok(layout) = decode::<ScreenLayout>(ty, &body) {
+                for s in &layout.screens {
+                    tracing::info!(
+                        screen = s.index,
+                        stream = s.stream,
+                        mode = %format!("{}x{}@{}", s.mode.width, s.mode.height, s.mode.refresh_hz),
+                        x = s.x,
+                        y = s.y,
+                        "host screen layout"
+                    );
+                }
+            } else if let Some(cfg) = decode::<StreamConfig>(ty, &body)
+                .ok()
+                .filter(|c| c.stream != 0)
+            {
+                tracing::info!(stream = cfg.stream, epoch = cfg.epoch, mode = ?cfg.mode, codec = cfg.codec, "screen stream config");
+            }
+        }
+    });
 }
 
 /// `--remode`: after a delay, ask the host to switch modes on the still-open control stream.
@@ -1817,6 +1872,85 @@ fn spawn_datagram_rx(
 /// each AU, verifies or dumps it, and reports capture→received latency and the host/network
 /// split.
 #[allow(clippy::too_many_arguments)]
+/// Frames of the screens past the first, per stream: counted, written beside `--out`, and a
+/// keyframe asked on the first frame after a gap.
+#[derive(Default)]
+struct ScreenTally {
+    streams: std::collections::BTreeMap<u8, StreamTally>,
+}
+
+#[derive(Default)]
+struct StreamTally {
+    frames: u32,
+    keyframes: u32,
+    gaps: u32,
+    last_index: Option<u32>,
+    asks: u16,
+    bytes: u64,
+    sink: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl ScreenTally {
+    fn note(
+        &mut self,
+        frame: &punktfunk_core::session::Frame,
+        out: Option<&str>,
+        asks: Option<&quinn::Connection>,
+    ) -> Result<()> {
+        let t = self.streams.entry(frame.stream).or_default();
+        if t.sink.is_none() {
+            if let Some(path) = out {
+                let path = format!("{path}.s{}", frame.stream);
+                let file =
+                    std::fs::File::create(&path).with_context(|| format!("create {path}"))?;
+                t.sink = Some(std::io::BufWriter::new(file));
+            }
+        }
+        let gap = t
+            .last_index
+            .is_some_and(|last| frame.frame_index.wrapping_sub(last) != 1);
+        t.last_index = Some(frame.frame_index);
+        let key = frame.flags & u32::from(punktfunk_core::packet::FLAG_SOF) != 0;
+        if gap && !key {
+            t.gaps += 1;
+            t.asks = t.asks.wrapping_add(1).max(1);
+            let fb = Feedback {
+                stream: frame.stream,
+                ask: t.asks,
+                keyframe: true,
+                ..Default::default()
+            };
+            if let Some(conn) = asks {
+                let _ = conn.send_datagram(fb.encode().into());
+            }
+        }
+        t.frames += 1;
+        t.keyframes += u32::from(key);
+        t.bytes += frame.data.len() as u64;
+        if let Some(s) = t.sink.as_mut() {
+            s.write_all(&frame.data).context("write screen AU")?;
+        }
+        Ok(())
+    }
+
+    fn report(&mut self) {
+        for (stream, t) in &mut self.streams {
+            if let Some(s) = t.sink.as_mut() {
+                s.flush().ok();
+            }
+            tracing::info!(
+                stream,
+                frames = t.frames,
+                keyframes = t.keyframes,
+                gaps = t.gaps,
+                mb = t.bytes / 1_000_000,
+                "screen stream complete"
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn data_plane(
     welcome: Welcome,
     (shared, media): (
@@ -1828,6 +1962,8 @@ fn data_plane(
     clock_offset_ns: Option<i64>,
     counters: Arc<Counters>,
     host_timing_rx: std::sync::mpsc::Receiver<punktfunk_core::quic::HostTiming>,
+    // Some when the host took screens: further screens' keyframe asks leave here.
+    screen_asks: Option<quinn::Connection>,
 ) -> Result<()> {
     let cfg = welcome.session_config(Role::Client);
     let expected = welcome.frames;
@@ -1838,6 +1974,8 @@ fn data_plane(
     let skew_corrected = clock_offset_ns.is_some();
     let mut session =
         Session::new(cfg, media, Box::new(shared)).map_err(|e| anyhow!("client session: {e:?}"))?;
+    session.set_screens(screen_asks.is_some());
+    let mut screens = ScreenTally::default();
     let mut sink = match &out_path {
         Some(p) => Some(std::io::BufWriter::new(
             std::fs::File::create(p).with_context(|| format!("create {p}"))?,
@@ -1917,6 +2055,10 @@ fn data_plane(
                 if frame.flags & FLAG_PROBE as u32 != 0 {
                     continue;
                 }
+                if frame.stream != punktfunk_core::packet::V2_STREAM_VIDEO {
+                    screens.note(&frame, out_path.as_deref(), screen_asks.as_ref())?;
+                    continue;
+                }
                 bytes += frame.data.len() as u64;
                 // capture→received: our receive instant in the host clock (now + offset)
                 // minus the host's capture pts. offset is 0 same-host / old host.
@@ -1975,6 +2117,7 @@ fn data_plane(
     if let Some(mut s) = sink {
         s.flush().ok();
     }
+    screens.report();
 
     // PUNKTFUNK_PERF: cumulative receive-path stage split for the whole run — where the
     // receive core's time went (kernel drain vs AES-GCM open vs reassembly+FEC). This is

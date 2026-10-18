@@ -872,9 +872,14 @@ impl EiState {
         }
     }
 
-    /// [`abs_point`] with this session's stream target and output hint.
+    /// [`abs_point`] with the stream target of the sample's screen and the output hint.
     fn map_abs(&self, regions: &[reis::event::Region], abs: &Abs) -> (f32, f32) {
-        abs_point(regions, &crate::stream_target(), self.output_hint, abs)
+        abs_point(
+            regions,
+            &crate::stream_target_for(abs.screen),
+            self.output_hint,
+            abs,
+        )
     }
 
     /// Emit `op` on device `idx` in its own frame. `false` when the device lacks the interface.
@@ -1021,6 +1026,7 @@ mod tests {
             y: 540,
             w: 1920,
             h: 1080,
+            screen: 0,
         };
         let none = StreamTarget::default();
         let head = [region(1920, 0, 3840, 2160, None)];

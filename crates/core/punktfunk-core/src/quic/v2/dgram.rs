@@ -177,12 +177,16 @@ pub struct Feedback {
     /// The newest frame the client completed, and the sixteen before it as bits (bit `i`
     /// is frame `last − 1 − i`). Rides with the levels, without an ask.
     pub acked: Option<(u32, u16)>,
+    /// The video stream the ask names frames of; `0` the first screen's. Another screen's
+    /// datagram carries its keyframe ask only: the window and levels are the first screen's.
+    pub stream: u8,
 }
 
 impl Feedback {
     pub fn encode(&self) -> Vec<u8> {
         let nz = |f: Fields, tag, v: u32| f.when(v != 0, |f| f.u32(tag, v));
         let f = Fields::new()
+            .when(self.stream != 0, |f| f.u8(18, self.stream))
             .when(self.window != 0, |f| {
                 let f = f
                     .u32(1, self.window)
@@ -237,6 +241,7 @@ impl Feedback {
                 15 => set_once(&mut acked_mask, u16_of(v)?)?,
                 16 => fb.shape = u8_of(v)?,
                 17 => set_once(&mut nack_frame, u32_of(v)?)?,
+                18 => fb.stream = u8_of(v)?,
                 _ => {}
             }
         }
@@ -464,6 +469,12 @@ mod tests {
             },
             Feedback {
                 acked: Some((7_000, 0b1011)),
+                ..Default::default()
+            },
+            Feedback {
+                stream: 2,
+                ask: 3,
+                keyframe: true,
                 ..Default::default()
             },
             Feedback {

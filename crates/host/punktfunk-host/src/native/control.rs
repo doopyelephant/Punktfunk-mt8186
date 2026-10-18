@@ -411,6 +411,8 @@ pub(super) async fn run(task: Task) {
                 mut shard_change_rx,
                 shard_ack_tx,
                 mut cursor_shape_rx,
+                screens_tx,
+                mut screen_tell_rx,
             },
         shared:
             super::wiring::SessionShared {
@@ -431,6 +433,7 @@ pub(super) async fn run(task: Task) {
                 cursor_client_draws,
                 arrival_poke,
                 offload_switch,
+                screens,
             },
         clip_enabled,
         clip,
@@ -463,6 +466,8 @@ pub(super) async fn run(task: Task) {
     let mut access_closed = false;
     // Same closed-channel discipline: the mute lane outlives nothing of its own.
     let mut audio_closed = false;
+    // The stream thread's screen configs and layouts end with it.
+    let mut screen_tell_closed = false;
     // The audio thread drops its config sender when it ends; so does a client without epochs.
     let mut audio_config_closed = false;
     // Pad slots end with the input thread.
@@ -541,6 +546,14 @@ pub(super) async fn run(task: Task) {
             fb = feedback_rx.recv() => {
                 // The datagram reader ends with the connection.
                 let Some(fb) = fb else { break };
+                // A further screen's datagram carries its keyframe ask and nothing of the first
+                // screen's window. Its loop coalesces repeats.
+                if fb.stream != punktfunk_core::packet::V2_STREAM_VIDEO {
+                    if fb.keyframe {
+                        screens.ask_keyframe(fb.stream);
+                    }
+                    continue;
+                }
                 if fb.link_kbps != 0 && link_kbps.swap(fb.link_kbps, Ordering::Relaxed) != fb.link_kbps {
                     tracing::info!(link_kbps = fb.link_kbps, "client's link rate");
                 }
@@ -759,6 +772,11 @@ pub(super) async fn run(task: Task) {
                         && input_tx.try_send(super::input::ClientInput::PadIdentity(id)).is_err()
                     {
                         tracing::warn!("pad identity dropped: input queue full");
+                    }
+                } else if let Ok(req) = v2msg::decode::<v2msg::Screens>(ty, &body) {
+                    tracing::info!(screens = ?req.screens, "client screens");
+                    if screens_tx.send(req.screens).is_err() {
+                        break;
                     }
                 } else if let Ok(req) = v2msg::decode::<SetBitrate>(ty, &body) {
                     link.note_bitrate_ask(
@@ -996,6 +1014,20 @@ pub(super) async fn run(task: Task) {
             cfg = audio_config_rx.recv(), if !audio_config_closed => {
                 let Some(cfg) = cfg else { audio_config_closed = true; continue };
                 if v2io::send(&mut ctrl_send, &cfg).await.is_err() {
+                    break;
+                }
+            }
+            tell = screen_tell_rx.recv(), if !screen_tell_closed => {
+                // Same closed-mpsc rule: the stream thread holds the sender and ends first.
+                let sent = match tell {
+                    None => { screen_tell_closed = true; continue }
+                    Some(super::wiring::ScreenTell::Config(cfg)) => v2io::send(&mut ctrl_send, &cfg).await,
+                    Some(super::wiring::ScreenTell::Layout(built)) => {
+                        tracing::info!(screens = ?built, "screen layout");
+                        v2io::send(&mut ctrl_send, &v2msg::ScreenLayout { screens: built }).await
+                    }
+                };
+                if sent.is_err() {
                     break;
                 }
             }

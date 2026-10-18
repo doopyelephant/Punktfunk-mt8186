@@ -44,6 +44,9 @@ pub struct Frame {
     /// Config generation the host stamped (`punktfunk/2`): the `StreamConfig` this frame
     /// decodes under. Always 0 on `punktfunk/1`.
     pub epoch: u8,
+    /// The video stream it rode ([`crate::packet::screen_stream`]): 0 for the first screen.
+    /// Epochs count per stream.
+    pub stream: u8,
     /// `false` when the frame aged out of the loss window with shards missing and the
     /// session opted in ([`Session::set_deliver_partial_frames`]). Only chunk-aligned AUs
     /// ([`crate::packet::USER_FLAG_CHUNK_ALIGNED`]); missing ranges are zero-filled in place.
@@ -241,6 +244,7 @@ impl Session {
             stamp: V2Stamp {
                 seq: 0,
                 epoch: 0,
+                stream: 0,
                 clock_origin_ns: media.clock_origin_ns,
                 max_data_per_block: config.fec.max_data_per_block,
             },
@@ -276,6 +280,18 @@ impl Session {
     /// that announces it.
     pub fn set_epoch(&mut self, epoch: u8) {
         self.stamp.epoch = epoch;
+    }
+
+    /// Host: stamp `stream` on every video packet from the next frame on
+    /// ([`crate::packet::screen_stream`]). Probe filler keeps its own.
+    pub fn set_stream(&mut self, stream: u8) {
+        self.stamp.stream = stream;
+    }
+
+    /// Client: take frames of every screen's stream, each in its own index space, besides the
+    /// first ([`crate::quic::v2::registry::FEATURE_SCREENS`]).
+    pub fn set_screens(&mut self, on: bool) {
+        self.reassembler.set_screens(on);
     }
 
     /// Drain receive-path stage timings since the last call (window semantics: the pump
@@ -1146,6 +1162,10 @@ impl Session {
                 p.placed += u64::from(placed);
             }
             if let Some(frame) = pushed {
+                // Another screen's frame counts its epochs apart; its lane judges them.
+                if frame.stream > crate::packet::V2_STREAM_PROBE {
+                    return Ok(stamp_received(frame));
+                }
                 // Prefix parts are not completions: only the delivery that closes the AU,
                 // or parts would multiply the completion rate.
                 if frame.complete {
@@ -1937,6 +1957,53 @@ mod wire_equivalence_tests {
 
     fn media_keys(suite: crate::crypto::MediaSuite) -> MediaKeys {
         MediaKeys::derive(&[0x42; 32], suite)
+    }
+
+    /// Two screens interleave on one session, sealed or not, header clear or not: each frame
+    /// comes back on its stream with its own index and epoch. Without screens the second is dropped.
+    #[test]
+    fn v2_screens_interleave_on_their_own_streams() {
+        let origin = 1_700_000_000_000_000_000u64;
+        let send = |host: &mut Session, stream: u8, epoch: u8, index: u32, len: usize| {
+            host.set_stream(stream);
+            host.set_epoch(epoch);
+            let pts = origin + u64::from(index + 1) * 1_000_000;
+            let wires = host.seal_frame_at(&pattern(len), pts, 0, index).unwrap();
+            let refs: Vec<&[u8]> = wires.iter().map(|w| w.as_slice()).collect();
+            host.send_sealed(&refs).unwrap();
+        };
+        let suite = crate::crypto::MediaSuite::Aes128Gcm;
+        for (pair, screens) in [
+            (v2_pair(0), true),
+            (v2_pair_sealed(0, suite, true), true),
+            (v2_pair_sealed(0, suite, false), false),
+        ] {
+            let (mut host, mut client) = pair;
+            client.set_screens(screens);
+            let second = crate::packet::screen_stream(1);
+            // The same indexes on both streams, and the second screen's epoch behind the first's.
+            for i in 0..4u32 {
+                send(&mut host, 0, 3, i, 2000 + i as usize);
+                send(&mut host, second, 0, i, 700);
+            }
+            let mut got = Vec::new();
+            while let Ok(f) = client.poll_frame() {
+                assert_eq!(f.data, pattern(f.data.len()));
+                got.push((f.stream, f.frame_index, f.epoch, f.data.len()));
+            }
+            let first: Vec<_> = (0..4u32).map(|i| (0, i, 3, 2000 + i as usize)).collect();
+            let other: Vec<_> = (0..4u32).map(|i| (second, i, 0, 700)).collect();
+            let want: Vec<_> = if screens {
+                first
+                    .iter()
+                    .zip(&other)
+                    .flat_map(|(a, b)| [*a, *b])
+                    .collect()
+            } else {
+                first
+            };
+            assert_eq!(got, want, "screens {screens}");
+        }
     }
 
     /// Whole frames of every shape cross the `punktfunk/2` wire byte-identical, with their

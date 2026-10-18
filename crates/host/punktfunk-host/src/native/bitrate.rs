@@ -262,7 +262,13 @@ pub(super) struct EncDerive {
     /// PyroWave at this refresh rate: parity rides the frame's head only
     /// ([`pyrowave_parity_pct`]). `None`: every block carries `fec_percent`.
     pub(super) head_only_hz: Option<u32>,
+    /// This encoder's share of the session's video, per mille: [`SHARE_ALL`] alone, less while
+    /// further screens' encoders split the budget with it.
+    pub(super) share_permille: u16,
 }
+
+/// [`EncDerive::share_permille`] of a session with one screen.
+pub(super) const SHARE_ALL: u16 = 1000;
 
 impl EncDerive {
     /// The share of the wire parity takes at `budget_kbps`, as the budget prices it.
@@ -279,7 +285,7 @@ impl EncDerive {
         }
     }
 
-    /// [`encoder_bps_for_budget`] in kbps, over sealed shards.
+    /// [`encoder_bps_for_budget`] in kbps, over sealed shards: this encoder's share of it.
     pub(super) fn enc_kbps(&self, budget_kbps: u32) -> u32 {
         let bps = encoder_bps_for_budget(
             budget_kbps,
@@ -288,14 +294,16 @@ impl EncDerive {
             self.shard_payload.into(),
             WireFraming::Shards,
         );
-        (bps / 1000) as u32
+        let share = u64::from(self.share_permille.min(SHARE_ALL));
+        ((bps / 1000) * share / u64::from(SHARE_ALL)).max(u64::from(MIN_BITRATE_KBPS)) as u32
     }
 
     /// The budget an encoder rate spends. Parity is priced at the budget the rate alone
     /// would need; it is a few percent, so that is the budget it lands in.
     pub(super) fn budget_kbps(&self, encoder_kbps: u32) -> u32 {
-        let at =
-            |pct| budget_kbps_for_encoder(encoder_kbps, self.audio_kbps, pct, self.shard_payload);
+        let share = u64::from(self.share_permille.clamp(1, SHARE_ALL));
+        let whole = (u64::from(encoder_kbps) * u64::from(SHARE_ALL) / share) as u32;
+        let at = |pct| budget_kbps_for_encoder(whole, self.audio_kbps, pct, self.shard_payload);
         at(self.parity_pct(at(0)))
     }
 
@@ -521,6 +529,28 @@ mod tests {
         }
     }
 
+    /// A screen at a quarter of the video encodes a quarter of the whole's rate, floored at
+    /// the minimum, and its full read-back is the session's budget.
+    #[test]
+    fn a_share_of_the_video_is_that_share_of_the_encoder_rate() {
+        let whole = EncDerive {
+            audio_kbps: 512,
+            shard_payload: 1408,
+            fec_percent: 10,
+            head_only_hz: None,
+            share_permille: SHARE_ALL,
+        };
+        let quarter = EncDerive {
+            share_permille: 250,
+            ..whole
+        };
+        let budget = 40_000;
+        assert_eq!(quarter.enc_kbps(budget), whole.enc_kbps(budget) / 4);
+        assert_eq!(quarter.enc_kbps(1), MIN_BITRATE_KBPS);
+        let asked = quarter.enc_kbps(budget);
+        assert_eq!(quarter.applied_budget_kbps(budget, asked), budget);
+    }
+
     #[test]
     fn full_apply_readback_is_the_request_not_the_deflated_roundtrip() {
         // A roundtrip that lost only truncation must report the full request, not a phantom ceiling.
@@ -529,6 +559,7 @@ mod tests {
             shard_payload: 1408,
             fec_percent: 8,
             head_only_hz: None,
+            share_permille: SHARE_ALL,
         };
         for budget in [2349u32, 4799, 6857, 9798, 14000, 20000, 940_032] {
             let asked_enc = ed.enc_kbps(budget);
@@ -834,6 +865,7 @@ mod tests {
             shard_payload: 1408,
             fec_percent: 10,
             head_only_hz: None,
+            share_permille: SHARE_ALL,
         };
         let bps = encoder_bps_for_budget(20_000, 512, 10, 1408, WireFraming::Shards);
         assert_eq!(
@@ -866,6 +898,7 @@ mod tests {
             shard_payload: 1408,
             fec_percent,
             head_only_hz: Some(hz),
+            share_permille: SHARE_ALL,
         };
         // 4K60 at 1.6 bpp: 1126 wire shards a frame, a 169-shard head, 9 parity at 5 %.
         let pin = 796_262;

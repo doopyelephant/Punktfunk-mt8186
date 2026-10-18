@@ -45,6 +45,7 @@ mod resume;
 pub mod sc1_ble;
 /// cbindgen:ignore
 pub mod sc2;
+mod screens;
 use crate::rumble;
 mod worker;
 
@@ -611,6 +612,9 @@ pub struct ConnectParams {
     /// The profile to play as: a host profile id. `None` lets the host choose
     /// ([`NativeClient::profile`] says which it did).
     pub profile: Option<String>,
+    /// Every screen this embedder shows, screen 0 first with `mode`'s size; empty for one.
+    /// Screens past the first arrive on [`NativeClient::next_screen_frame`].
+    pub screens: Vec<crate::quic::v2::msg::Screen>,
     /// Handshake budget. The dial re-dials inside it, so a waking host is not a failure.
     pub timeout: Duration,
     /// Abort while blocked: a request-access knock parks ~185 s. Never alias the session's
@@ -657,6 +661,7 @@ impl ConnectParams {
             preset: None,
             probe_only: false,
             profile: None,
+            screens: Vec::new(),
             timeout,
             cancel: None,
             on_pending: None,
@@ -1493,6 +1498,56 @@ impl NativeClient {
     /// call: a hardware decode it submitted is complete. Any thread may call this.
     pub fn kick_frame_wait(&self) {
         self.shared.frames.kick();
+    }
+
+    /// The screens the host built, screen 0 included, and a generation that moves with each
+    /// change; generation 0 before the host said. A screen it could not build is absent.
+    pub fn screen_layout(&self) -> (u32, Vec<crate::quic::v2::msg::Screen>) {
+        self.shared.screens.layout()
+    }
+
+    /// Next whole AU of screen `screen` (1 or more), the first of each format with
+    /// [`Frame::new_format`] set. `NoFrame` on timeout, also before the host opened that
+    /// screen; `Closed` once the session ended or the host dropped the screen.
+    pub fn next_screen_frame(&self, screen: u8, timeout: Duration) -> Result<Frame> {
+        let lane = (screen > 0)
+            .then(|| {
+                self.shared
+                    .screens
+                    .lane(crate::packet::screen_stream(screen))
+            })
+            .flatten();
+        let Some(lane) = lane else {
+            if self.shared.shutdown.load(Ordering::SeqCst) {
+                return Err(PunktfunkError::Closed);
+            }
+            std::thread::sleep(timeout.min(Duration::from_millis(20)));
+            return Err(PunktfunkError::NoFrame);
+        };
+        match lane.frames.pop(timeout) {
+            FramePop::Frame(f) => Ok(f),
+            FramePop::Timeout => Err(PunktfunkError::NoFrame),
+            FramePop::Closed => Err(PunktfunkError::Closed),
+        }
+    }
+
+    /// Screen `screen`'s decoder cannot go on, or is new: its frames wait for a keyframe, which
+    /// the pump asks the host for, and that frame names its format.
+    pub fn request_screen_keyframe(&self, screen: u8) {
+        if screen > 0 {
+            self.shared
+                .screens
+                .want_key(crate::packet::screen_stream(screen));
+        }
+    }
+
+    /// Show these screens from now on, screen 0 first: the host adds, drops and resizes the
+    /// others and answers with a new [`Self::screen_layout`]. Screen 0's size still moves by
+    /// [`Self::request_mode`]. A host or dial without screens ignores it.
+    pub fn request_screens(&self, screens: Vec<crate::quic::v2::msg::Screen>) -> Result<()> {
+        self.ctrl_tx
+            .try_send(CtrlRequest::Screens(screens))
+            .map_err(|_| PunktfunkError::Closed)
     }
 
     /// Next audio packet. Drain on a dedicated thread — packets arrive every 5 ms.

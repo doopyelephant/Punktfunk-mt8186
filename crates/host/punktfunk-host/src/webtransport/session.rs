@@ -411,6 +411,7 @@ mod tests {
             features: Default::default(),
             profile: None,
             access_only: false,
+            screens: Vec::new(),
         }
         .encode_v2()
     }

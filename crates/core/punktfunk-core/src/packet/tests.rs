@@ -52,6 +52,7 @@ impl Rig {
             stamp: V2Stamp {
                 seq: 0,
                 epoch: 0,
+                stream: 0,
                 clock_origin_ns: 0,
                 max_data_per_block: limits.max_data_shards as u16,
             },

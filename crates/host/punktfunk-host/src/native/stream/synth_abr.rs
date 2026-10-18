@@ -494,6 +494,7 @@ pub(crate) fn synthetic_abr_stream(ctx: SynthAbrContext) -> Result<()> {
                 meta: AuMeta {
                     capture_ns: now_ns(),
                     epoch: 0,
+                    stream: 0,
                     flags,
                     frame_index: au_seq,
                     // A plausible encode: half a frame budget, which is what a GPU that is not
