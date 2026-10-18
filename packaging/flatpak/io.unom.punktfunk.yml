@@ -35,7 +35,7 @@
 # decoder exists — so an HEVC session on a box whose GPU cannot decode HEVC reconnects on a
 # codec this client can finish (pf-client-core's `last_rung_verdict`) instead of falling back
 # to software. That is a refusal by design, not a packaging gap.
-app-id: io.unom.Punktfunk
+id: io.unom.punktfunk
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
@@ -71,30 +71,20 @@ finish-args:
   # private tmpfs, so no --filesystem grant reaches the first. `overlay_focus` dials its
   # ABSTRACT socket instead, which `--share=network` below leaves open. Do not unshare it.
   # --- GPU + all input devices ---
-  # --device=all (not just --device=dri): covers the GPU render node (VAAPI HEVC decode + GL),
-  # evdev joysticks, AND the hidraw CHAR devices SDL3's HIDAPI needs for DualSense touchpad/
-  # motion/adaptive-triggers/lightbar. flatpak cannot bind individual /dev/hidrawN via
-  # --filesystem (they are char devices — "unsupported type 0o20000"), and there is no granular
-  # --device=hidraw; --device=all is what game/emulator flatpaks (RetroArch, Dolphin) use. We
-  # self-host via the Gitea generic registry — NOT Flathub — so its --device=all review rule
-  # does not apply.
+  # --device=all covers the GPU render node, evdev pads and the hidraw char devices SDL's HIDAPI
+  # needs for DualSense touchpad, motion, triggers and lightbar. No narrower device class has
+  # hidraw, and flatpak cannot bind a char device by path. SDL finds pads without udev in a
+  # sandbox: it watches /dev instead.
   - --device=all
-  - --filesystem=/run/udev:ro        # SDL/HIDAPI enumerates devices via udev
-  # --- audio: the client speaks the NATIVE PipeWire protocol (audio.rs `pw connect`), NOT the
-  #     PulseAudio shim — so it needs the real `pipewire-0` socket in the sandbox. With only
-  #     --socket=pulseaudio the sandbox has just `pulse/native`, no `pipewire-0`, and playback +
-  #     mic both die with "pw connect (is PipeWire running in this session?)" (observed live on the
-  #     Deck in Gaming Mode). We bind the native socket via --filesystem=xdg-run/pipewire-0 (NOT
-  #     --socket=pipewire: this flatpak-builder toolchain rejects it as an "Unknown socket type",
-  #     and the Deck's flatpak 1.16 override CLI does too — the filesystem bind is the portable
-  #     form, validated on-Deck to make pipewire-0 appear + the client register its audio node).
-  #     --socket=pulseaudio stays as a fallback for any pulse-only path. ---
+  # --- audio: playback and the mic speak the native PipeWire protocol, so the sandbox needs the
+  #     real `pipewire-0` socket. The filesystem bind is the form both flatpak-builder and the
+  #     Deck's flatpak 1.16 accept; `--socket=pipewire` is rejected by both. ---
   - --filesystem=xdg-run/pipewire-0
-  - --socket=pulseaudio
   # --- network: QUIC control and media + mDNS discovery (_punktfunk._udp) ---
   - --share=network
-  # --- persistent client identity / pairing store (shared with punktfunk-probe) ---
-  - --filesystem=~/.config/punktfunk:create   # client-{cert,key}.pem, known-hosts, settings
+  # --- the folder older builds kept the pairing in. Read-only: the client copies its client-*
+  #     files into its own config dir under ~/.var/app on first start. ---
+  - --filesystem=~/.config/punktfunk:ro
   # --- HDR under gamescope (Steam Deck Game Mode) ---
   # A flatpak's Vulkan loader can't see the host's gamescope WSI layer, so without help the SDL3
   # surface never offers the HDR10 (ST.2084) colorspace and the presenter silently tone-maps
@@ -335,24 +325,24 @@ modules:
       - install -Dm0755 target/release/punktfunk-client ${FLATPAK_DEST}/bin/punktfunk-client
       - install -Dm0755 target/release/punktfunk-session ${FLATPAK_DEST}/bin/punktfunk-session
       # The headless CLI (design/client-architecture-split.md §4) — reachable as
-      # `flatpak run --command=punktfunk io.unom.Punktfunk …`.
+      # `flatpak run --command=punktfunk io.unom.punktfunk …`.
       - install -Dm0755 target/release/punktfunk ${FLATPAK_DEST}/bin/punktfunk
-      # Desktop entry (renamed to the app id; Exec is the in-sandbox binary).
-      - install -Dm0644 packaging/flatpak/io.unom.Punktfunk.desktop
-          ${FLATPAK_DEST}/share/applications/io.unom.Punktfunk.desktop
+      # Desktop entry, shared with the native packages; flatpak's export rewrites its Exec.
+      - install -Dm0644 packaging/linux/io.unom.punktfunk.desktop
+          ${FLATPAK_DEST}/share/applications/io.unom.punktfunk.desktop
       # Second launcher, straight into the gamepad console (`--browse`) — the couch entry
       # point. Shared with the deb/rpm/arch (there is nothing sandbox-specific about it);
       # flatpak's export rewrites Exec into `flatpak run --command=punktfunk-client …`.
-      - install -Dm0644 packaging/linux/io.unom.Punktfunk.Console.desktop
-          ${FLATPAK_DEST}/share/applications/io.unom.Punktfunk.Console.desktop
+      - install -Dm0644 packaging/linux/io.unom.punktfunk.console.desktop
+          ${FLATPAK_DEST}/share/applications/io.unom.punktfunk.console.desktop
       # AppStream metainfo (required for a well-formed flatpak / Software listings).
-      - install -Dm0644 packaging/flatpak/io.unom.Punktfunk.metainfo.xml
-          ${FLATPAK_DEST}/share/metainfo/io.unom.Punktfunk.metainfo.xml
+      - install -Dm0644 packaging/flatpak/io.unom.punktfunk.metainfo.xml
+          ${FLATPAK_DEST}/share/metainfo/io.unom.punktfunk.metainfo.xml
       # Scalable icon named for the app id (GNOME runtime renders SVG via librsvg).
       # One icon source for every Linux packaging (it used to live under packaging/flatpak,
       # which is why the deb/rpm/arch entries shipped a stock `video-display` instead).
-      - install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg
-          ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.unom.Punktfunk.svg
+      - install -Dm0644 packaging/linux/icons/hicolor/scalable/apps/io.unom.punktfunk.svg
+          ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.unom.punktfunk.svg
     sources:
       # The repo checkout. For a Flathub/published build, replace with a pinned git source:
       #   - type: git

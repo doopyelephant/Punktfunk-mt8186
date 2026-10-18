@@ -183,7 +183,7 @@ pub fn run(args: crate::Args) -> anyhow::Result<()> {
     // the notify icon exists. Unregistered (dev) degrades to default attribution, not an error.
     // SAFETY: static nul-terminated literal.
     unsafe {
-        let _ = SetCurrentProcessExplicitAppUserModelID(w!("unom.punktfunk.tray"));
+        let _ = SetCurrentProcessExplicitAppUserModelID(w!("io.unom.punktfunk.tray"));
     }
 
     // Before the first popup: opt menus into the system dark mode.

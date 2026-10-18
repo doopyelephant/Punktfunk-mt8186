@@ -28,8 +28,9 @@ It carries no FFmpeg: since M10 the client decodes on the user's own GPU drivers
 VAAPI) with openh264 + rav1d as the CPU floor, so the runtime's `codecs-extra` extension — and the
 encumbered-codec question it answered — no longer enter into it.
 
-App id: **`io.unom.Punktfunk`** (matches the Apple bundle id family and the Decky plugin's
-flatpak fallback).
+App id: **`io.unom.punktfunk`**, the same string as the Apple bundle id and the Android
+application id. The old `io.unom.Punktfunk` refs stay published, end-of-life with a rebase onto
+it, so `flatpak update` moves an existing install.
 
 ## Install
 
@@ -109,7 +110,7 @@ the LAN, so it pulls the builder from the LAN registry and uses ci-core's cache 
 
 ## Manifest
 
-[`io.unom.Punktfunk.yml`](io.unom.Punktfunk.yml). Runtime `org.gnome.Platform//50`
+[`io.unom.punktfunk.yml`](io.unom.punktfunk.yml). Runtime `org.gnome.Platform//50`
 (GTK 4.20 + libadwaita 1.8 ≥ the crate floors of v4_16 / v1_5), built on freedesktop-sdk 25.08,
 with two build-time SDK extensions: `org.freedesktop.Sdk.Extension.rust-stable` (→ //25.08,
 **rustc 1.96** — the GTK4 dep chain, e.g. pango-sys 0.22, needs ≥ 1.92, which the EOL GNOME-48 /
@@ -120,8 +121,8 @@ is involved; HEVC decodes on the GPU's own driver, and there is deliberately no 
 rung (see the manifest header). A bundled
 **SDL3 3.4.18** module (pinned to match `sdl3-sys 0.7.2+SDL-3.4.18`), and finish-args for Wayland +
 `--device=all` (GPU/VAAPI render node + evdev + the hidraw char-devices SDL3 needs for DualSense)
-+ `--socket=pulseaudio` (PipeWire-pulse: playback + mic) + `--share=network`. Alongside it:
-`io.unom.Punktfunk.desktop`, `io.unom.Punktfunk.metainfo.xml`, `io.unom.Punktfunk.svg` (all
++ the native `pipewire-0` socket (playback + mic) + `--share=network`. Alongside it:
+`io.unom.punktfunk.desktop`, `io.unom.punktfunk.metainfo.xml`, `io.unom.punktfunk.svg` (all
 installed by the manifest). No `vulkan-headers` module: it existed for `pf-ffvk`'s bindgen over
 FFmpeg's `hwcontext_vulkan.h`, and ash generates its own bindings and dlopens the loader.
 `cargo-sources.json` (the offline crate cache) is a pure function of
@@ -148,7 +149,7 @@ from `Cargo.lock` and self-corrects; this tarball is the only hand-maintained pi
 
 The OSTree repo flatpak-builder produces is GPG-signed in CI and rsynced to unom-1, where a tiny
 static **Caddy container** (`server/compose.production.yml` + `server/Caddyfile`, port **3230**)
-serves the `./site` tree (`repo/` + `unom.flatpakrepo` + `io.unom.Punktfunk.flatpakref` +
+serves the `./site` tree (`repo/` + `unom.flatpakrepo` + `io.unom.punktfunk.flatpakref` +
 `index.html`). The edge Caddy on home-reverse-proxy-1 fronts it at `https://flatpak.unom.io`.
 The CI deploy step **no-ops until the secret + infra exist**, so it won't redden builds mid-setup.
 

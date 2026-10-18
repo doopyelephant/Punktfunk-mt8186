@@ -15,7 +15,7 @@ its own. In Desktop Mode, run the app directly. Both share one identity and one 
 2. Install the Punktfunk client, in Desktop Mode:
 
    ```sh
-   flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref
+   flatpak install --user https://flatpak.unom.io/io.unom.punktfunk.flatpakref
    ```
 
    A native `punktfunk-client` (a sysext, a distro package, your own build) works too. With both
@@ -156,7 +156,7 @@ Panel → **About** → **Recreate library shortcut**.
 4. To remove the client too, in Desktop Mode:
 
    ```sh
-   flatpak uninstall --user --delete-data io.unom.Punktfunk
+   flatpak uninstall --user --delete-data io.unom.punktfunk
    ```
 
    Delete `~/.config/punktfunk` as well to forget this Deck's identity and saved hosts.

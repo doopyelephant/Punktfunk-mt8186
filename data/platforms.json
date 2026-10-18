@@ -199,7 +199,7 @@
       "docs": "/docs/install-client#linux-desktop-flatpak",
       "floor": "Any distro with Flatpak; native packages on Ubuntu 26.04, Fedora 43 and Arch, or newer",
       "install": [
-        "flatpak install --user https://flatpak.unom.io/io.unom.Punktfunk.flatpakref"
+        "flatpak install --user https://flatpak.unom.io/io.unom.punktfunk.flatpakref"
       ]
     },
     {

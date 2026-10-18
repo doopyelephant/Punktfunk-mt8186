@@ -25,7 +25,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 /// Must match the WinUI shell (`clients/windows/src/main.rs`) or the two windows stop grouping.
-const APP_USER_MODEL_ID: *const u16 = w!("unom.punktfunk.client");
+const APP_USER_MODEL_ID: *const u16 = w!("io.unom.punktfunk.client");
 
 /// Unpackaged runs only. Call before any window exists; later calls do not re-tag existing windows.
 pub(crate) fn set_app_user_model_id() {

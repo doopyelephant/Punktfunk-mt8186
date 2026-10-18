@@ -1,4 +1,4 @@
-//! The status tray's per-user autostart entry, `~/.config/autostart/io.unom.Punktfunk.Tray.desktop`.
+//! The status tray's per-user autostart entry, `~/.config/autostart/io.unom.punktfunk.tray.desktop`.
 //!
 //! The host writes it from the `tray_autostart` setting. The tray's "Start at log-in" item and
 //! the desktop's own startup settings change it too. An entry is off when it is missing, or
@@ -7,7 +7,11 @@
 use std::path::{Path, PathBuf};
 
 /// The file name. A same-named file in the system autostart folder would be shadowed by this one.
-pub const ENTRY_FILE: &str = "io.unom.Punktfunk.Tray.desktop";
+pub const ENTRY_FILE: &str = "io.unom.punktfunk.tray.desktop";
+
+/// The CamelCase name older hosts wrote. [`entry_path`] adopts it, so the user's on/off choice
+/// carries over and no second tray starts.
+const LEGACY_FILE: &str = "io.unom.Punktfunk.Tray.desktop";
 
 /// The tray beside `exe`, by absolute path: a session need not have `~/.local/bin` on `PATH`.
 /// A Nix store path changes with every build, so there the profile's `PATH` finds the bare name.
@@ -41,11 +45,20 @@ Categories=Network;Utility;
     )
 }
 
-/// `$XDG_CONFIG_HOME/autostart/` + [`ENTRY_FILE`].
+/// `$XDG_CONFIG_HOME/autostart/` + [`ENTRY_FILE`], after [`adopt_legacy`] in that folder.
 pub fn entry_path() -> PathBuf {
-    crate::xdg_home("XDG_CONFIG_HOME", ".config")
-        .join("autostart")
-        .join(ENTRY_FILE)
+    adopt_legacy(&crate::xdg_home("XDG_CONFIG_HOME", ".config").join("autostart"))
+}
+
+/// [`ENTRY_FILE`] in `dir`. A [`LEGACY_FILE`] there is renamed onto it, which never deletes
+/// an entry: on a case-insensitive filesystem the two names are one file. Best-effort.
+fn adopt_legacy(dir: &Path) -> PathBuf {
+    let path = dir.join(ENTRY_FILE);
+    let legacy = dir.join(LEGACY_FILE);
+    if legacy.exists() {
+        let _ = std::fs::rename(&legacy, &path);
+    }
+    path
 }
 
 /// `Some(on)` when the entry exists, `None` when it does not.
@@ -96,6 +109,23 @@ pub fn is_enabled(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The legacy entry keeps its text under the new name, and only the new name is left.
+    #[test]
+    fn the_legacy_entry_is_adopted() {
+        let dir = std::env::temp_dir().join(format!("pf-tray-autostart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(LEGACY_FILE), "Hidden=true").unwrap();
+        let path = adopt_legacy(&dir);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Hidden=true");
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [ENTRY_FILE]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_written_entry_is_on() {

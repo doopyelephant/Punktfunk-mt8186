@@ -30,8 +30,9 @@ fi
 
 install -Dm0755 "$BUILT" "$TRAY"
 # `Exec=` expands no variables, so the launcher names this install's absolute path.
-sed "s|/usr/bin/punktfunk-tray|$TRAY|" "$LINUX/io.unom.Punktfunk.StartHost.desktop" \
-    | install -Dm0644 /dev/stdin "$HOME/.local/share/applications/io.unom.Punktfunk.StartHost.desktop"
+rm -f "$HOME/.local/share/applications/io.unom.Punktfunk.StartHost.desktop"  # the CamelCase name
+sed "s|/usr/bin/punktfunk-tray|$TRAY|" "$LINUX/io.unom.punktfunk.starthost.desktop" \
+    | install -Dm0644 /dev/stdin "$HOME/.local/share/applications/io.unom.punktfunk.starthost.desktop"
 for png in "$LINUX"/icons/hicolor/*/apps/punktfunk-tray*.png; do
     install -Dm0644 "$png" "$HOME/.local/share/icons/${png#"$LINUX"/icons/}"
 done

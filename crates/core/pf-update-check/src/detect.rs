@@ -58,7 +58,7 @@ pub const OSTREE_BOOTED: &str = "/run/ostree-booted";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallKind {
     WindowsInstaller,
-    /// Client only — the sandboxed GTK app (`io.unom.Punktfunk`).
+    /// Client only — the sandboxed GTK app (`io.unom.punktfunk`).
     Flatpak,
     Sysext,
     RpmOstree,
@@ -252,9 +252,11 @@ pub fn update_command(kind: InstallKind, product: Product) -> String {
         (InstallKind::WindowsInstaller, _) => {
             "winget upgrade unom.PunktfunkHost   (or re-run the newer installer)".into()
         }
-        (InstallKind::Flatpak, _) => "flatpak update --user io.unom.Punktfunk".into(),
+        (InstallKind::Flatpak, _) => "flatpak update --user io.unom.punktfunk".into(),
         // The signed feed carries the host image only; the client sysext is a local rebuild.
-        (InstallKind::Sysext, Product::Host) => "sudo punktfunk-sysext update".into(),
+        (InstallKind::Sysext, Product::Host) => "sudo punktfunk-sysext update   (an image you \
+             built with packaging/arch/build-sysext.sh: rebuild it the same way)"
+            .into(),
         (InstallKind::Sysext, Product::Client) => {
             "rebuild the client sysext: bash packaging/arch/build-sysext.sh <new .pkg.tar.zst> \
              && sudo cp punktfunk-client.raw /var/lib/extensions/ && sudo systemd-sysext refresh"

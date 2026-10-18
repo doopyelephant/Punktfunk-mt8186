@@ -100,8 +100,9 @@ door_install() {
         sudo install -m 0644 "$SRC/scripts/headless/$f" "$share/headless/$f"
     done
     # A seat's KWin grants capture to the host its .desktop names; XDG_DATA_DIRS below finds it.
-    sed "s|^Exec=.*|Exec=$PF_COPY/punktfunk-host|" "$SRC/packaging/linux/io.unom.Punktfunk.Host.desktop" \
-        | sudo install -m 0644 /dev/stdin "$share/applications/io.unom.Punktfunk.Host.desktop"
+    sudo rm -f "$share/applications/io.unom.Punktfunk.Host.desktop"  # the CamelCase name
+    sed "s|^Exec=.*|Exec=$PF_COPY/punktfunk-host|" "$SRC/packaging/linux/io.unom.punktfunk.host.desktop" \
+        | sudo install -m 0644 /dev/stdin "$share/applications/io.unom.punktfunk.host.desktop"
     for f in punktfunk-seats.service punktfunk-seat@.service punktfunk-door.service \
         punktfunk-web-door.service punktfunk-door-on@.service punktfunk-door-off@.service; do
         door_paths "$SRC/packaging/linux/$f" | sudo install -m 0644 /dev/stdin "/etc/systemd/system/$f"

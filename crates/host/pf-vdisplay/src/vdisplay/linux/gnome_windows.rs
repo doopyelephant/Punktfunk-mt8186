@@ -18,8 +18,8 @@ const UUID: &str = "punktfunk-windows@unom.io";
 const METADATA: &str = include_str!("../../../gnome-shell/punktfunk-windows@unom.io/metadata.json");
 const EXTENSION: &str = include_str!("../../../gnome-shell/punktfunk-windows@unom.io/extension.js");
 
-const BUS_NAME: &str = "io.unom.Punktfunk.Shell";
-const OBJECT_PATH: &str = "/io/unom/Punktfunk/Shell";
+const BUS_NAME: &str = "io.unom.punktfunk.shell";
+const OBJECT_PATH: &str = "/io/unom/punktfunk/shell";
 
 /// One read, connect to reply. The lease watcher asks every second.
 const READ_BUDGET: Duration = Duration::from_millis(800);

@@ -7,7 +7,8 @@
 #
 # Usage:  bash build-sysext.sh [--gamescope <punktfunk-gamescope-*.pkg.tar.zst>] \
 #                              <punktfunk-{host,client}-*.pkg.tar.zst>
-# Output: <pkgname>.raw   (e.g. punktfunk-client.raw)
+# Output: punktfunk.raw for the host, the name the Bazzite image and the update check use, or
+#         punktfunk-client.raw for the client.
 #
 # --gamescope folds the HDR-capable gamescope companion package (packaging/gamescope) into a HOST
 # image as /usr/bin/punktfunk-gamescope — what lets the gamescope backend stream 10-bit BT.2020 PQ
@@ -50,6 +51,9 @@ NAME="$(basename "$PKG" | sed -E 's/-[0-9].*//')"
 if [ -n "$GAMESCOPE" ] && [ "$NAME" != "punktfunk-host" ]; then
   echo "--gamescope only makes sense for a punktfunk-host image (got: $NAME)" >&2; exit 1
 fi
+# The image name, which systemd-sysext requires extension-release.<name> to match.
+IMAGE="$NAME"
+[ "$NAME" = punktfunk-host ] && IMAGE=punktfunk
 
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
@@ -82,7 +86,7 @@ pf_stage_sysctl_unit "$STAGE"
 # (SteamOS, Arch, Bazzite); ARCHITECTURE pins it to x86-64 so it's never merged on the wrong arch.
 # EXTENSION_RELOAD_MANAGER makes systemd load the image's sysctl unit after the merge.
 install -d "$STAGE/usr/lib/extension-release.d"
-cat > "$STAGE/usr/lib/extension-release.d/extension-release.$NAME" <<EOF
+cat > "$STAGE/usr/lib/extension-release.d/extension-release.$IMAGE" <<EOF
 ID=_any
 ARCHITECTURE=x86-64
 EXTENSION_RELOAD_MANAGER=1
@@ -93,11 +97,14 @@ EOF
 # which is a pacing loss and nothing more.
 pf_seal_caps "$STAGE" "A pacman payload carries no capabilities, so something else granted it."
 
-OUT="$NAME.raw"
+OUT="$IMAGE.raw"
 rm -f "$OUT"
 mksquashfs "$STAGE" "$OUT" -all-root -noappend -quiet
 echo "built $OUT"
 echo "  install:  sudo cp $OUT /var/lib/extensions/ && sudo systemctl enable --now systemd-sysext"
+if [ "$IMAGE" = punktfunk ]; then
+  echo "  replaces: /var/lib/extensions/punktfunk-host.raw from an older build; delete it first"
+fi
 if [ "$NAME" = "punktfunk-host" ]; then
   echo "  then:     systemctl --user enable --now punktfunk-host"
 else

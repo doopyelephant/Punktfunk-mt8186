@@ -6,11 +6,11 @@ import Gio from 'gi://Gio';
 import Meta from 'gi://Meta';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const BUS_NAME = 'io.unom.Punktfunk.Shell';
-const OBJECT_PATH = '/io/unom/Punktfunk/Shell';
+const BUS_NAME = 'io.unom.punktfunk.shell';
+const OBJECT_PATH = '/io/unom/punktfunk/shell';
 const IFACE = `
 <node>
-  <interface name="io.unom.Punktfunk.Shell">
+  <interface name="io.unom.punktfunk.shell">
     <method name="ListWindows">
       <arg type="a(usbbs)" direction="out" name="windows"/>
     </method>

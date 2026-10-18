@@ -94,8 +94,8 @@ cd packaging/arch && PF_SRCDIR="$(git rev-parse --show-toplevel)" makepkg -f --h
 # 2. turn it into a sysext .raw (extracts the packages' /usr into an image + extension-release);
 #    --gamescope folds the HDR build into a HOST image (verified by its +pfhdr banner)
 bash build-sysext.sh --gamescope ../gamescope/punktfunk-gamescope-*.pkg.tar.zst punktfunk-host-*.pkg.tar.zst
-# 3. on the box:
-sudo cp punktfunk-host.raw /var/lib/extensions/
+# 3. on the box (the host image is punktfunk.raw; delete an older punktfunk-host.raw first):
+sudo cp punktfunk.raw /var/lib/extensions/
 sudo systemctl enable --now systemd-sysext      # merges it
 systemctl --user enable --now punktfunk-host     # the user unit is now under /usr/lib
 ```

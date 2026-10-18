@@ -13,7 +13,7 @@
 #   KWin hands out its restricted Wayland protocols (zkde_screencast_unstable_v1, which mints our
 #   virtual output, and org_kde_kwin_fake_input, which injects input) only to a client it can
 #   IDENTIFY, by resolving that client's /proc/<pid>/exe and matching it against an installed
-#   .desktop's Exec= (ours is io.unom.Punktfunk.Host.desktop). The kernel refuses that readlink to
+#   .desktop's Exec= (ours is io.unom.punktfunk.host.desktop). The kernel refuses that readlink to
 #   any reader whose effective set is not a superset of the target's PERMITTED set
 #   (cap_ptrace_access_check), and KWin holds no capabilities. So the moment this binary carries a
 #   capability it becomes unidentifiable: KWin's executablePath() is empty, nothing matches, the

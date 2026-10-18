@@ -1,6 +1,6 @@
 //! Client identity, known-hosts (pinned fingerprints), and the store they share.
 //!
-//! Identity PEMs live in `~/.config/punktfunk/` (Linux) or `%APPDATA%\punktfunk`
+//! Identity PEMs live in `$XDG_CONFIG_HOME/punktfunk/` (Linux) or `%APPDATA%\punktfunk`
 //! (Windows). A non-empty `PUNKTFUNK_CONFIG_DIR` overrides that directory; an
 //! empty value does not. `punktfunk-probe` reads this same directory, so a box
 //! pairs once. On Windows the WinUI shell re-exports this module
@@ -87,9 +87,10 @@ pub(crate) fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T
 
 /// Directory for the client identity, known hosts, and settings.
 ///
-/// A non-empty `PUNKTFUNK_CONFIG_DIR` wins over `~/.config/punktfunk` (`HOME`)
-/// or `%APPDATA%\punktfunk`. An empty value is ignored. The OS default is read
-/// only when no override is set.
+/// A non-empty `PUNKTFUNK_CONFIG_DIR` wins over the OS default: Linux takes
+/// `$XDG_CONFIG_HOME/punktfunk` (`~/.config/punktfunk` when unset), so a Flatpak
+/// lands in its own `~/.var/app` dir; other Unix `~/.config/punktfunk`; Windows
+/// `%APPDATA%\punktfunk`. An empty override is ignored.
 pub fn config_dir() -> Result<PathBuf> {
     let env = std::env::var_os("PUNKTFUNK_CONFIG_DIR");
     if let Some(dir) = resolve_config_dir(env.as_deref()) {
@@ -99,18 +100,72 @@ pub fn config_dir() -> Result<PathBuf> {
 }
 
 /// OS default for [`config_dir`]. Missing `HOME` or `APPDATA` keeps its context
-/// string. Not called when an override already won.
+/// string. Not called when an override already won. The first Linux call adopts
+/// the client files of a legacy `~/.config/punktfunk` the XDG dir lacks.
 fn os_config_base() -> Result<PathBuf> {
     #[cfg(windows)]
     {
         let appdata = std::env::var("APPDATA").context("APPDATA unset")?;
         Ok(PathBuf::from(appdata).join("punktfunk"))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        let dir = crate::paths::xdg_home("XDG_CONFIG_HOME", ".config")
+            .context("HOME unset")?
+            .join("punktfunk");
+        static ADOPTED: std::sync::Once = std::sync::Once::new();
+        ADOPTED.call_once(|| {
+            if let Some(home) = std::env::var_os("HOME") {
+                adopt_legacy(&PathBuf::from(home).join(".config/punktfunk"), &dir);
+            }
+        });
+        Ok(dir)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let home = std::env::var("HOME").context("HOME unset")?;
         Ok(PathBuf::from(home).join(".config/punktfunk"))
     }
+}
+
+/// Copy the `client-*` files of `legacy` that `dir` lacks. A Flatpak used to share
+/// the host's `~/.config/punktfunk`, and a native box may set `XDG_CONFIG_HOME`
+/// after pairing; either way the identity and pins carry over. Copies, so the
+/// legacy dir stays usable by an older build. Lock and temp files stay behind.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn adopt_legacy(legacy: &Path, dir: &Path) {
+    if legacy == dir {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(legacy) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let text = name.to_string_lossy();
+        if !text.starts_with("client-") || text.ends_with(".lock") || text.contains(".tmp-") {
+            continue;
+        }
+        let to = dir.join(&name);
+        if to.exists() {
+            continue;
+        }
+        if let Err(e) = adopt_one(&entry.path(), dir, &to) {
+            tracing::warn!(from = %entry.path().display(), error = %e, "legacy client file not adopted");
+        }
+    }
+}
+
+/// One file of [`adopt_legacy`]. The dir is 0700 before anything lands in it, and
+/// `fs::copy` keeps the source mode, so a 0600 key stays 0600.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn adopt_one(from: &Path, dir: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::copy(from, to)?;
+    tracing::info!(from = %from.display(), to = %to.display(), "adopted legacy client file");
+    Ok(())
 }
 
 /// A non-empty `PUNKTFUNK_CONFIG_DIR`, or `None` when the OS default applies.
@@ -257,6 +312,48 @@ mod tests {
             let raw = OsStr::from_bytes(b"/from-env/\xff");
             assert_eq!(resolve_config_dir(Some(raw)).unwrap().as_os_str(), raw);
         }
+    }
+
+    /// The XDG dir takes the legacy dir's client files, keeps its own, and leaves
+    /// locks, temp files and other products' files behind. The key stays 0600.
+    #[cfg(unix)]
+    #[test]
+    fn adopting_the_legacy_dir_copies_only_missing_client_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::presets::tests::scratch_dir("adopt-legacy");
+        let (legacy, dir) = (root.join("legacy"), root.join("xdg/punktfunk"));
+        std::fs::create_dir_all(&legacy).unwrap();
+        for (name, body) in [
+            ("client-cert.pem", "cert"),
+            ("client-key.pem", "key"),
+            ("client-known-hosts.json", "old pins"),
+            ("client-known-hosts.json.lock", ""),
+            ("client-gtk-settings.json.tmp-7", "half"),
+            ("host.env", "host"),
+        ] {
+            std::fs::write(legacy.join(name), body).unwrap();
+        }
+        let key = legacy.join("client-key.pem");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("client-known-hosts.json"), "new pins").unwrap();
+
+        adopt_legacy(&legacy, &dir);
+
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+        assert_eq!(read("client-cert.pem").as_deref(), Some("cert"));
+        assert_eq!(read("client-known-hosts.json").as_deref(), Some("new pins"));
+        for left in [
+            "client-known-hosts.json.lock",
+            "client-gtk-settings.json.tmp-7",
+            "host.env",
+        ] {
+            assert_eq!(read(left), None, "{left} must stay behind");
+        }
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.join("client-key.pem")), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A UTF-8 BOM must load, not fall back to `Default`. serde refuses `EF BB BF`

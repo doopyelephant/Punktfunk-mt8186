@@ -164,7 +164,9 @@ pub fn build(facts: &Facts, choices: &Choices) -> Plan {
     if choices.action == Action::Uninstall {
         let mut steps = backend.uninstall(facts);
         // The family sweep cannot see a flatpak client.
-        if facts.has_flatpak_client && facts.family != Family::Flatpak {
+        if (facts.has_flatpak_client || facts.legacy_flatpak_client)
+            && facts.family != Family::Flatpak
+        {
             steps.extend(platform::backend(Family::Flatpak).uninstall(facts));
         }
         plan.push(
@@ -341,10 +343,14 @@ fn install_phase(
     choices.components.host && facts.family.installs_console()
 }
 
-/// The user-scope flatpak for a family with no `punktfunk-client`, unless it is already there.
-/// Planned before the host steps: SteamOS's on-device build is the step that ends the run.
+/// The user-scope flatpak for a family with no `punktfunk-client`, unless it is already there
+/// under either id. Planned before the host steps: SteamOS's on-device build ends the run.
 fn flatpak_client(facts: &Facts, choices: &Choices) -> Vec<Step> {
-    if choices.components.client && !facts.family.has_native_client() && !facts.has_flatpak_client {
+    if choices.components.client
+        && !facts.family.has_native_client()
+        && !facts.has_flatpak_client
+        && !facts.legacy_flatpak_client
+    {
         platform::backend(Family::Flatpak).install(facts, choices)
     } else {
         vec![]

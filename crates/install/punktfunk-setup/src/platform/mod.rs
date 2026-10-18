@@ -12,7 +12,7 @@ pub mod windows;
 use std::sync::OnceLock;
 
 use crate::choices::Choices;
-use crate::facts::{Channel, Facts, Family, DOCS, FLATPAK_APP};
+use crate::facts::{Channel, Facts, Family, DOCS, FLATPAK_APP, LEGACY_FLATPAK_APP};
 use crate::plan::{switch_pkgs, Level, Step, StepAction};
 use crate::seam::{BasePaths, CommandRunner};
 
@@ -599,8 +599,18 @@ impl PkgBackend for Flatpak {
         self.install(facts, choices)
     }
 
-    fn uninstall(&self, _facts: &Facts) -> Vec<Step> {
-        vec![Step::run(format!("flatpak uninstall --user {FLATPAK_APP}"))]
+    /// The client under whichever id the box has. A box with neither still names
+    /// [`FLATPAK_APP`], so the leg is never empty.
+    fn uninstall(&self, facts: &Facts) -> Vec<Step> {
+        let current = facts.has_flatpak_client || !facts.legacy_flatpak_client;
+        [
+            (current, FLATPAK_APP),
+            (facts.legacy_flatpak_client, LEGACY_FLATPAK_APP),
+        ]
+        .into_iter()
+        .filter(|(present, _)| *present)
+        .map(|(_, id)| Step::run(format!("flatpak uninstall --user {id}")))
+        .collect()
     }
 
     fn current_channel(&self, _paths: &BasePaths, _run: &dyn CommandRunner) -> Option<Channel> {

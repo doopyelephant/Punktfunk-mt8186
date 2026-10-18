@@ -56,6 +56,7 @@ fn box_of(id: &str, pretty: &str, version: &str, family: Family, docs: &str) -> 
         rpm_group: (family == Family::Dnf).then(|| "fedora-44".to_string()),
         floor: None,
         has_flatpak_client: false,
+        legacy_flatpak_client: false,
         couch_box: id == "bazzite" || id == "nobara",
         graphical_seat: true,
         desktop_sessions: true,

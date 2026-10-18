@@ -58,7 +58,7 @@ pf-client-core = { path = "../pf-client-core", default-features = false }
 # 🛑 Check the log for `DOWNLOAD AND INSTALL SUCCEEDED` on every bump: the fallback is a
 # from-source Skia build that turns a 2-minute CI leg into hours.
 #
-# 🛑 Half the bump is by hand: packaging/flatpak/io.unom.Punktfunk.yml pins the archives by
+# 🛑 Half the bump is by hand: packaging/flatpak/io.unom.punktfunk.yml pins the archives by
 # URL + sha256 (the sandbox is offline) and nothing derives them from this line. A stale pin
 # unpacks the old bindings.rs under the new crate and fails to compile (that is how #193 shipped).
 skia-safe = { version = "0.153", features = ["textlayout"] }
