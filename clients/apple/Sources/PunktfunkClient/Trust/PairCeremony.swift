@@ -60,10 +60,10 @@ final class PairCeremony: ObservableObject {
                 case .failure(PunktfunkClientError.wrongPIN):
                     self.errorText = "Wrong PIN — check the host's web console (port 47992) "
                         + "and try again."
-                case .failure(PunktfunkClientError.rejected(let rejection)):
+                case .failure(PunktfunkClientError.rejected(let rejection, let said)):
                     // The host answered and said why (not armed / rate-limited / armed for
                     // another device) — show that instead of the guessing-game fallback.
-                    self.errorText = rejection.userMessage
+                    self.errorText = said ?? rejection.userMessage
                 case .failure(is ClientIdentityStore.IdentityError):
                     self.errorText = "Can't store this Mac's identity in the Keychain, so the "
                         + "pairing would not survive a relaunch. Unlock the login "

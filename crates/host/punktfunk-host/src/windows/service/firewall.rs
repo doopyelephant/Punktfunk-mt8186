@@ -71,14 +71,14 @@ pub(crate) fn run_netsh(args: &[String]) -> bool {
     run_quiet("netsh", &borrowed)
 }
 
-/// The UDP rule's ports: GameStream 47998-48010, native, each seat's native port (the box
-/// redirects a client to its seat there), mDNS 5353.
+/// The UDP rule's ports: native, each seat's native port (the box redirects a client to its
+/// seat there), mDNS 5353.
 fn udp_ports(native_port: u16) -> String {
     let seats = pf_seats::model::DEFAULT_NATIVE_PORTS.map(|p| p.to_string());
-    format!("47998-48010,{native_port},{},5353", seats.join(","))
+    format!("{native_port},{},5353", seats.join(","))
 }
 
-/// Inbound streaming + mgmt rules, and the browser plane's ([`sync_browser_rule`]). Best-effort;
+/// Inbound streaming + mgmt rules, and the optional planes' ([`sync_plane_rules`]). Best-effort;
 /// never fails the install. Scoped by [`firewall_profile_arg`] and this executable
 /// ([`fw_add_rule_args`]). The mgmt port is deliberate: `serve` binds mgmt/library to all
 /// interfaces; off-loopback `mgmt::require_auth` is read-only to a paired client cert, so
@@ -98,10 +98,10 @@ pub(super) fn add_firewall_rules(allow_public: bool) {
         }
     };
     // Mgmt/library (LAN read-only, paired-cert) on the port host.env gives `serve`; `--mgmt-bind`
-    // lands there first. GameStream 47984/47989/48010.
+    // lands there first.
     let host_env = std::fs::read_to_string(host_env_path()).unwrap_or_default();
     let listen = pf_host_config::listen::ListenPlan::from_host_env(&host_env);
-    let tcp = format!("47984,47989,48010,{}", listen.mgmt.port());
+    let tcp = listen.mgmt.port().to_string();
     let udp = udp_ports(listen.native_port);
     let rules = [("TCP", "TCP", tcp.as_str()), ("UDP", "UDP", udp.as_str())];
     for (suffix, proto, ports) in rules {
@@ -123,7 +123,7 @@ pub(super) fn add_firewall_rules(allow_public: bool) {
             eprintln!("warning: firewall rule '{name}' not added (add it manually if needed)");
         }
     }
-    sync_browser_rule(exe.as_deref());
+    sync_plane_rules(exe.as_deref());
     // Print only when scoping actually happened: with no exe path the rules are still wide open.
     if exe.is_some() {
         println!(
@@ -155,7 +155,12 @@ pub(super) fn remove_firewall_rules() {
             &format!("name={FW_DATA_PLANE_RULE}"),
         ],
     );
-    for name in ["Punktfunk TCP", "Punktfunk UDP", FW_BROWSER_RULE] {
+    for name in [
+        "Punktfunk TCP",
+        "Punktfunk UDP",
+        FW_BROWSER_RULE,
+        FW_GAMESTREAM_RULE,
+    ] {
         // netsh matches rule names case-insensitively, so this also reaps the old lowercase names.
         let _ = run_quiet(
             "netsh",
@@ -173,30 +178,46 @@ pub(super) fn remove_firewall_rules() {
 /// The browser plane's UDP rule.
 const FW_BROWSER_RULE: &str = "Punktfunk Browser";
 
-/// Make the browser plane's rule match what the next host serves: present while the plane is
-/// on, scoped like the others, and absent while it is off. The console's toggle applies at a
-/// host restart, so the service runs this before each host start. Best-effort.
-pub(super) fn sync_browser_rule(exe: Option<&std::path::Path>) {
-    let rule = format!("name={FW_BROWSER_RULE}");
-    let _ = run_quiet(
-        "netsh",
-        &["advfirewall", "firewall", "delete", "rule", &rule],
-    );
+/// GameStream's TCP and UDP rules, under one name.
+const FW_GAMESTREAM_RULE: &str = "Punktfunk GameStream";
+
+/// The rules the optional planes need while on: `(name, protocol, ports)`.
+fn plane_rules(
+    browser: Option<u16>,
+    gamestream: bool,
+) -> Vec<(&'static str, &'static str, String)> {
+    let mut rules = Vec::new();
+    if let Some(port) = browser {
+        rules.push((FW_BROWSER_RULE, "UDP", port.to_string()));
+    }
+    if gamestream {
+        rules.push((FW_GAMESTREAM_RULE, "TCP", "47984,47989,48010".into()));
+        rules.push((FW_GAMESTREAM_RULE, "UDP", "47998-48010".into()));
+    }
+    rules
+}
+
+/// Make the browser plane's and GameStream's rules match what the next host serves: present
+/// while on, scoped like the others, absent while off. The console's toggles apply at a host
+/// restart, so the service runs this before each host start. Best-effort.
+pub(super) fn sync_plane_rules(exe: Option<&std::path::Path>) {
+    for name in [FW_BROWSER_RULE, FW_GAMESTREAM_RULE] {
+        let rule = format!("name={name}");
+        let _ = run_quiet(
+            "netsh",
+            &["advfirewall", "firewall", "delete", "rule", &rule],
+        );
+    }
     let host_env = std::fs::read_to_string(host_env_path()).unwrap_or_default();
-    let row = pf_host_config::resolve_now().config.webtransport;
-    let Some(port) = pf_host_config::listen::browser_port_from_host_env(&host_env, row) else {
-        return;
-    };
+    let config = pf_host_config::resolve_now().config;
+    let browser =
+        pf_host_config::listen::browser_port_from_host_env(&host_env, config.webtransport);
+    let gamestream = pf_host_config::listen::gamestream_from_host_env(&host_env, config.gamestream);
     let profile = firewall_profile_arg(fw_public_marker().exists());
-    let ports = port.to_string();
-    if !run_netsh(&fw_add_rule_args(
-        FW_BROWSER_RULE,
-        "UDP",
-        Some(&ports),
-        exe,
-        profile,
-    )) {
-        tracing::warn!(port, "browser plane firewall rule not added");
+    for (name, proto, ports) in plane_rules(browser, gamestream) {
+        if !run_netsh(&fw_add_rule_args(name, proto, Some(&ports), exe, profile)) {
+            tracing::warn!(rule = name, ports, "firewall rule not added");
+        }
     }
 }
 
@@ -282,11 +303,25 @@ mod firewall_tests {
     #[test]
     fn the_udp_rule_opens_every_seat_port() {
         let rule = |host_env: &str| udp_ports(ListenPlan::from_host_env(host_env).native_port);
-        assert_eq!(rule(""), "47998-48010,9777,9779,9780,9781,9782,5353");
+        assert_eq!(rule(""), "9777,9779,9780,9781,9782,5353");
         assert_eq!(
             rule("PUNKTFUNK_NATIVE_PORT=9800\n"),
-            "47998-48010,9800,9779,9780,9781,9782,5353"
+            "9800,9779,9780,9781,9782,5353"
         );
+    }
+
+    /// GameStream's ports open only while GameStream is on.
+    #[test]
+    fn gamestream_ports_open_only_while_it_is_on() {
+        let names = |gs| {
+            plane_rules(None, gs)
+                .into_iter()
+                .map(|r| r.0)
+                .collect::<Vec<_>>()
+        };
+        assert!(names(false).is_empty());
+        assert_eq!(names(true), [FW_GAMESTREAM_RULE, FW_GAMESTREAM_RULE]);
+        assert_eq!(plane_rules(Some(9778), false)[0].2, "9778");
     }
 
     /// Missing executable → port-only rule, not no rule. A looser rule still streams; none is black.

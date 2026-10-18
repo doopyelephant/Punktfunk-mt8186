@@ -2,14 +2,12 @@
 //!
 //! Audio, input state and the host's events keep their encodings: the payload is one datagram
 //! of the existing vocabulary, its own tag byte included, and the kind must agree with that tag.
-//! Feedback and clock samples are tagged fields. Feedback is the client's whole receive state:
-//! it numbers its report window and its ask, and a host acts on each once however often the
-//! client repeats it.
+//! Feedback is tagged fields: the client's whole receive state. It numbers its report window
+//! and its ask, and a host acts on each once however often the client repeats it.
 
 use super::field::*;
 use super::registry::*;
 use crate::error::Result;
-use crate::quic::{ClockEcho, ClockProbe};
 
 /// One received datagram. Payloads borrow the buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,8 +19,6 @@ pub enum Dgram<'a> {
     /// One input event or rich-input datagram.
     InputState(&'a [u8]),
     Feedback(Feedback),
-    ClockProbe(ClockProbe),
-    ClockEcho(ClockEcho),
     /// Rumble, HID output, cursor state, host timing or HDR metadata, as its own datagram.
     HostEvent(&'a [u8]),
 }
@@ -85,7 +81,6 @@ pub fn decode(b: &[u8]) -> Option<Dgram<'_>> {
     match kind {
         DGRAM_MEDIA => Some(Dgram::Media(payload)),
         DGRAM_FEEDBACK => Feedback::from_fields(payload).ok().map(Dgram::Feedback),
-        DGRAM_CLOCK => clock_from_fields(payload).ok().flatten(),
         _ => {
             if !inner_tags(kind).contains(payload.first()?) {
                 return None;
@@ -337,41 +332,6 @@ impl RetiredFeedback {
     }
 }
 
-/// A probe carries `t1` (1); an echo adds the host's receive and send times (2, 3).
-pub fn encode_clock_probe(p: &ClockProbe) -> Vec<u8> {
-    encode(DGRAM_CLOCK, &Fields::new().u64(1, p.t1_ns).into_body())
-}
-
-pub fn encode_clock_echo(e: &ClockEcho) -> Vec<u8> {
-    let f = Fields::new()
-        .u64(1, e.t1_ns)
-        .u64(2, e.t2_ns)
-        .u64(3, e.t3_ns);
-    encode(DGRAM_CLOCK, &f.into_body())
-}
-
-fn clock_from_fields(body: &[u8]) -> Result<Option<Dgram<'static>>> {
-    let (mut t1, mut t2, mut t3) = (None, None, None);
-    let mut r = FieldReader::new(body);
-    while let Some((tag, v)) = r.next_field()? {
-        match tag {
-            1 => set_once(&mut t1, u64_of(v)?)?,
-            2 => set_once(&mut t2, u64_of(v)?)?,
-            3 => set_once(&mut t3, u64_of(v)?)?,
-            _ => {}
-        }
-    }
-    Ok(match (t1, t2, t3) {
-        (Some(t1_ns), None, None) => Some(Dgram::ClockProbe(ClockProbe { t1_ns })),
-        (Some(t1_ns), Some(t2_ns), Some(t3_ns)) => Some(Dgram::ClockEcho(ClockEcho {
-            t1_ns,
-            t2_ns,
-            t3_ns,
-        })),
-        _ => None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,16 +491,9 @@ mod tests {
         assert!(ask(NACK_MAX, true).is_some());
         assert_eq!(ask(NACK_MAX + 1, true), None);
         assert_eq!(ask(2, false), None);
-        let p = ClockProbe { t1_ns: 5 };
-        assert_eq!(decode(&encode_clock_probe(&p)), Some(Dgram::ClockProbe(p)));
-        let e = ClockEcho {
-            t1_ns: 5,
-            t2_ns: 6,
-            t3_ns: 7,
-        };
-        assert_eq!(decode(&encode_clock_echo(&e)), Some(Dgram::ClockEcho(e)));
-        let half = encode(DGRAM_CLOCK, &Fields::new().u64(2, 1).into_body());
-        assert_eq!(decode(&half), None);
+        // The clock kind stays reserved and nothing reads it.
+        let probe = encode(DGRAM_CLOCK, &Fields::new().u64(1, 5).into_body());
+        assert_eq!(decode(&probe), None);
     }
 
     proptest! {

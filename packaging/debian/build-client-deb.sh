@@ -180,7 +180,7 @@ Priority: optional
 Homepage: https://git.unom.io/unom/punktfunk
 Depends: $SHDEPS
 Recommends: $RECOMMENDS
-Description: Low-latency desktop/game streaming client (punktfunk/1, GTK4)
+Description: Low-latency desktop/game streaming client (punktfunk/2, GTK4)
  The native Linux client for punktfunk, a Linux-first low-latency desktop and
  game streaming stack. Discovers hosts on the LAN (mDNS), trusts them via
  certificate pinning with a SPAKE2 PIN pairing ceremony, and streams HEVC video

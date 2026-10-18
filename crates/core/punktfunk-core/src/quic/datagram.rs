@@ -117,8 +117,7 @@ pub fn decode_audio_pcm_datagram(b: &[u8]) -> Option<(u32, u64, &[u8])> {
 }
 
 /// Legacy rumble v1. Level-triggered — persists until superseded; the host re-sends as loss heal.
-/// New hosts emit [`encode_rumble_datagram_v3`]; this remains the old-host wire
-/// (`PUNKTFUNK_RUMBLE_ENVELOPE=0` drops to it).
+/// Hosts emit [`encode_rumble_datagram_v3`]; clients still read this from an old host.
 pub fn encode_rumble_datagram(pad: u16, low: u16, high: u16) -> [u8; 7] {
     let mut b = [0u8; 7];
     b[0] = RUMBLE_MAGIC;

@@ -685,6 +685,20 @@ pub fn register(reg: Registration) -> LiveSessionGuard {
     }
 }
 
+/// Follow session `id`'s client to `peer`, its address now. Path sharing and the rate
+/// governor's groups read the registry, so a roamed session stops splitting the path it left.
+pub fn refresh_peer(id: u64, peer: std::net::IpAddr) {
+    let peer = peer.to_canonical();
+    let mut reg = registry();
+    let Some(s) = reg.iter_mut().find(|s| s.id == id) else {
+        return;
+    };
+    if s.peer != Some(peer) {
+        tracing::info!(session = id, from = ?s.peer, to = %peer, "client moved to a new address");
+        s.peer = Some(peer);
+    }
+}
+
 /// Drops the registry entry for this session (any video-loop scope exit).
 pub struct LiveSessionGuard {
     /// Same id `/status` reports; the video loop's log span names it.
@@ -1116,6 +1130,29 @@ pub(crate) mod tests {
             .unwrap()
             .shared_path_with
             .is_empty());
+    }
+
+    /// A session whose client roamed groups with whoever is at its new address, and leaves
+    /// the one it was at.
+    #[test]
+    fn a_roamed_session_regroups() {
+        let _registry = registry_lock();
+        let home: std::net::IpAddr = "203.0.113.77".parse().unwrap();
+        let away: std::net::IpAddr = "198.51.100.9".parse().unwrap();
+        let (a, _) = fake_at("phone", false, Some(home));
+        let (b, _) = fake_at("pc", false, Some(home));
+        let (c, _) = fake_at("tv", false, Some(away));
+        refresh_peer(a.id, "::ffff:198.51.100.9".parse().unwrap());
+        let rows = snapshot();
+        let with = |id| {
+            rows.iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .shared_path_with
+                .clone()
+        };
+        assert_eq!(with(a.id), vec![c.id]);
+        assert!(with(b.id).is_empty());
     }
 
     /// The owner of a live display may switch its monitor; a joiner watching it, a device with

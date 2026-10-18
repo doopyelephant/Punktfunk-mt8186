@@ -7,6 +7,7 @@ use jni::sys::{jboolean, jint, jlong};
 use jni::EnvUnowned;
 use punktfunk_core::client::{ConnectParams, NativeClient};
 use punktfunk_core::config::{CompositorPref, GamepadPref, Mode};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,20 +19,47 @@ use super::{hex, jni_guard, lock_recover, parse_hex32, SessionHandle, SESSIONS};
 /// — the moko0878-class support threads). The app runs one attempt at a time, so one slot
 /// suffices; a stale token is harmless (it is taken immediately after the failed call).
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
+/// What the host said with that failure's refusal, beside its token; empty when it said nothing.
+static LAST_SAID: Mutex<String> = Mutex::new(String::new());
+/// The dial `nativeConnect` is blocked on was parked by the host for its operator.
+static DIAL_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Stable token for a failed pair/connect cause, matched by Kotlin (`ConnectErrors.kt`):
 /// a typed host rejection yields its `RejectReason::as_str()` token ("not-armed", "denied",
 /// "approval-timeout", …); transport-level causes map to "crypto" / "timeout" / "io" / "error".
 fn note_error(e: &punktfunk_core::error::PunktfunkError) {
     use punktfunk_core::error::PunktfunkError as E;
-    let token = match e {
-        E::Rejected(r) => r.as_str(),
-        E::Crypto => "crypto",
-        E::Timeout => "timeout",
-        E::Io(_) => "io",
-        _ => "error",
+    let (token, said) = match e {
+        E::Rejected(r, said) => (r.as_str(), said.as_str()),
+        E::Crypto => ("crypto", ""),
+        E::Timeout => ("timeout", ""),
+        E::Io(_) => ("io", ""),
+        _ => ("error", ""),
     };
     *lock_recover(&LAST_ERROR) = token.to_string();
+    *lock_recover(&LAST_SAID) = said.to_string();
+}
+
+/// `NativeBridge.nativeTakeLastSaid(): String` — the host's own sentence with the most recent
+/// refusal, cleared on read (`""` when it said none). Read beside `nativeTakeLastError`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeTakeLastSaid<'local>(
+    mut env: EnvUnowned<'local>,
+    _this: JObject<'local>,
+) -> JString<'local> {
+    let said = std::mem::take(&mut *lock_recover(&LAST_SAID));
+    env.with_env(|env| env.new_string(said))
+        .resolve::<LogErrorAndDefault>()
+}
+
+/// `NativeBridge.nativeDialPending(): Boolean` — the dial `nativeConnect` is blocked on was
+/// parked by the host for its operator's approval; it now waits for that verdict.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeDialPending(
+    _env: EnvUnowned,
+    _this: JObject,
+) -> jboolean {
+    DIAL_PENDING.load(Ordering::Relaxed)
 }
 
 /// `NativeBridge.nativeTakeLastError(): String` — the machine token of the most recent failed
@@ -593,9 +621,13 @@ fn connect(req: ConnectRequest) -> jlong {
         // (the host parks the connection until the operator approves the device — see ConnectScreen).
         // No `cancel`: Kotlin drops the result (`Dial.cancelled`) rather than abort the dial — its
         // connect runs on a pool thread, so a parked one costs a thread, not a stuck UI.
+        on_pending: Some(Arc::new(|| DIAL_PENDING.store(true, Ordering::Relaxed))),
         ..ConnectParams::new(&host, port, mode, Duration::from_millis(timeout_ms))
     };
-    match NativeClient::connect(params) {
+    DIAL_PENDING.store(false, Ordering::Relaxed);
+    let dialed = NativeClient::connect(params);
+    DIAL_PENDING.store(false, Ordering::Relaxed);
+    match dialed {
         Ok(client) => {
             let client = Arc::new(client);
             let handle = SessionHandle {
@@ -747,6 +779,23 @@ pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeEndReason(
             .get(handle)
             .map(|session| session.client.end_reason() as jint)
             .unwrap_or(0)
+    })
+}
+
+/// `NativeBridge.nativeRedialDelayMs(endReason, attempt)` — milliseconds before redial `attempt`
+/// (0-based) of a session that ended with `endReason`, on the schedule every client shares; `-1`
+/// means stay ended. Only a lost connection redials.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_io_unom_punktfunk_kit_NativeBridge_nativeRedialDelayMs(
+    _env: EnvUnowned,
+    _this: JObject,
+    end_reason: jint,
+    attempt: jint,
+) -> jlong {
+    jni_guard(-1, || {
+        punktfunk_core::client::PunktfunkEndReason::from_u8(end_reason as u8)
+            .redial_delay(attempt.max(0) as u32)
+            .map_or(-1, |d| d.as_millis() as jlong)
     })
 }
 

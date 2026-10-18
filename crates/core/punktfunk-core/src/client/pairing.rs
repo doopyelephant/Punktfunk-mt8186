@@ -86,6 +86,7 @@ impl NativeClient {
                     .map_err(|e| match endpoint::refused_alpn(&e) {
                         true => PunktfunkError::Rejected(
                             crate::reject::RejectReason::WireVersionMismatch,
+                            String::new(),
                         ),
                         false => PunktfunkError::Io(std::io::Error::other(e.to_string())),
                     })?;
@@ -103,7 +104,7 @@ impl NativeClient {
                             .await;
                         }
                         Err(match reject_from_close(&conn) {
-                            Some((r, _)) => PunktfunkError::Rejected(r),
+                            Some((r, said)) => PunktfunkError::Rejected(r, said),
                             None => e,
                         })
                     }
@@ -160,6 +161,7 @@ impl NativeClient {
                         } else if endpoint::refused_alpn(&e) {
                             PunktfunkError::Rejected(
                                 crate::reject::RejectReason::WireVersionMismatch,
+                            String::new(),
                             )
                         } else {
                             PunktfunkError::Io(std::io::Error::other(e.to_string()))
@@ -183,7 +185,7 @@ impl NativeClient {
                             return Ok(host_fp);
                         }
                         Err(match reject_from_close(&conn) {
-                            Some((r, _)) => PunktfunkError::Rejected(r),
+                            Some((r, said)) => PunktfunkError::Rejected(r, said),
                             None => e,
                         })
                     }

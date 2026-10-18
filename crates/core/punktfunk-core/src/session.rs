@@ -1011,6 +1011,16 @@ impl Session {
         self.reassembler.set_memory(memory);
     }
 
+    /// Client, idle wire: wait up to `timeout` for datagrams, which the next
+    /// [`poll_frame`](Self::poll_frame) reads. `true` when some arrived.
+    pub fn wait_packets(&mut self, timeout: std::time::Duration) -> Result<bool> {
+        if self.recv_cur.is_none() {
+            self.recv_cur = self.transport.wait_owned(timeout)?;
+            self.recv_off = 0;
+        }
+        Ok(self.recv_cur.is_some())
+    }
+
     /// Client: drain the transport until a whole access unit is recovered, or no more
     /// packets are pending ([`PunktfunkError::NoFrame`]).
     pub fn poll_frame(&mut self) -> Result<Frame> {
@@ -1220,6 +1230,35 @@ mod wire_equivalence_tests {
         Session::new(cfg, media(sealed), Box::new(h)).unwrap()
     }
 
+    #[test]
+    fn wait_packets_sleeps_an_idle_wire_and_hands_the_next_poll_its_datagrams() {
+        let mk = |role| Config {
+            role,
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 0,
+                max_data_per_block: 64,
+            },
+            shard_payload: 1024,
+            max_frame_bytes: 8 * 1024 * 1024,
+            loopback_drop_period: 0,
+        };
+        let (h, c) = loopback_pair(0, 0);
+        let mut host = Session::new(mk(Role::Host), media(false), Box::new(h)).unwrap();
+        let mut client = Session::new(mk(Role::Client), media(false), Box::new(c)).unwrap();
+        let wait = std::time::Duration::from_millis(1);
+        let t0 = std::time::Instant::now();
+        assert!(!client.wait_packets(wait).unwrap());
+        assert!(
+            t0.elapsed() >= wait,
+            "the idle wait is the loopback's sleep"
+        );
+        host.submit_frame(&[7u8; 200], 1_000, 0).unwrap();
+        assert!(client.wait_packets(wait).unwrap());
+        let f = client.poll_frame().unwrap();
+        assert!(f.data.len() == 200 && f.data.iter().all(|&b| b == 7));
+    }
+
     /// Reference wire path: every packet collected first, then each staged and sealed on its
     /// own. Shares session state with `seal_frame` and nothing else, so the equality pin is real.
     fn seal_one_by_one(sess: &mut Session, frame: &[u8], pts_ns: u64, flags: u32) -> Vec<Vec<u8>> {
@@ -1344,6 +1383,61 @@ mod wire_equivalence_tests {
                 }
             }
         }
+    }
+
+    /// Time to the first and the last packet of a sealed frame at the wire shard size, the
+    /// chunk pipeline against the whole-frame seal. A timing, not a check:
+    /// `cargo test -p punktfunk-core --release --features quic --lib -- --ignored seal_latency --nocapture`
+    /// Each chunk hand-off parks and wakes a thread: below the [`SEAL_CHUNK_SHARDS`] floor
+    /// the pipeline's last packet leaves later than the whole seal's, not earlier.
+    #[test]
+    #[ignore = "prints a timing"]
+    fn seal_latency_chunked_against_whole() {
+        let cfg = Config {
+            role: Role::Host,
+            fec: FecConfig {
+                scheme: FecScheme::Gf16,
+                fec_percent: 20,
+                max_data_per_block: 64,
+            },
+            shard_payload: 1408,
+            max_frame_bytes: 8 * 1024 * 1024,
+            loopback_drop_period: 0,
+        };
+        let frame = pattern(512 * 1024);
+        let n = 500u32;
+        let mut chunked = host_session(cfg.clone(), true);
+        let (mut first, mut last) = (0u128, 0u128);
+        for i in 0..n {
+            let t0 = std::time::Instant::now();
+            let mut t_first = None;
+            chunked
+                .seal_frame_chunks_at(&frame, u64::from(i), 0, i, &mut |chunk, send| {
+                    t_first.get_or_insert_with(|| t0.elapsed());
+                    let refs: Vec<&[u8]> = chunk.iter().map(|b| b.as_slice()).collect();
+                    send(&refs).map(|_| ())
+                })
+                .unwrap();
+            last += t0.elapsed().as_nanos();
+            first += t_first.expect("the sink ran").as_nanos();
+        }
+        let per = |ns: u128| ns as f64 / 1000.0 / f64::from(n);
+        println!(
+            "chunked: first packet {:.1} us, last {:.1} us",
+            per(first),
+            per(last)
+        );
+        let mut whole = host_session(cfg, true);
+        let mut total = 0u128;
+        for i in 0..n {
+            let t0 = std::time::Instant::now();
+            let wires = whole.seal_frame_at(&frame, u64::from(i), 0, i).unwrap();
+            let refs: Vec<&[u8]> = wires.iter().map(|b| b.as_slice()).collect();
+            whole.send_sealed(&refs).unwrap();
+            total += t0.elapsed().as_nanos();
+            whole.reclaim_wires(wires);
+        }
+        println!("whole: first and last packet {:.1} us", per(total));
     }
 
     /// A windowed PyroWave AU seals as a head block with all the parity and tail blocks with

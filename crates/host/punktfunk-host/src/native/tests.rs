@@ -1030,6 +1030,8 @@ fn delegated_approval_admits_after_knock() {
             "no Hello name → fingerprint-derived label, got {:?}",
             pend.name
         );
+        // Past the client's own 2 s dial timeout.
+        std::thread::sleep(std::time::Duration::from_millis(2500));
         np_approve
             .approve_pending(pend.id, Some("Approved Device"), None)
             .unwrap()
@@ -1037,15 +1039,24 @@ fn delegated_approval_admits_after_knock() {
             .expect("pending id must approve");
     });
 
-    // One connect that parks until approved, then streams. Timeout covers park + approver poll.
-    // No Hello name: assert the fingerprint-derived label. TOFU: approval, not a PIN,
-    // authorizes this client.
+    // One connect that parks until approved, then streams. The client hears the host's
+    // `Pending` and waits past its own 2 s dial timeout for the verdict. No Hello name: assert
+    // the fingerprint-derived label. TOFU: approval, not a PIN, authorizes this client.
+    let told = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let told_hook = told.clone();
     let client = NativeClient::connect(ConnectParams {
         identity: Some((cert, key)),
-        ..ConnectParams::new("127.0.0.1", 19779, mode, std::time::Duration::from_secs(15))
+        on_pending: Some(std::sync::Arc::new(move || {
+            told_hook.store(true, std::sync::atomic::Ordering::SeqCst)
+        })),
+        ..ConnectParams::new("127.0.0.1", 19779, mode, std::time::Duration::from_secs(2))
     })
     .expect("approved mid-park → session admitted with no reconnect");
     approver.join().unwrap();
+    assert!(
+        told.load(std::sync::atomic::Ordering::SeqCst),
+        "the client heard the host's Pending"
+    );
     assert!(
         np.is_paired(&expected_fp),
         "approval must pin the knocking fingerprint"
@@ -1707,7 +1718,7 @@ fn launch_refused_without_grant_but_session_admitted() {
     });
     match refused {
         Ok(_) => panic!("a launch without the grant must be refused"),
-        Err(punktfunk_core::PunktfunkError::Rejected(r)) => assert_eq!(
+        Err(punktfunk_core::PunktfunkError::Rejected(r, _)) => assert_eq!(
             r,
             punktfunk_core::reject::RejectReason::LaunchNotPermitted,
             "the refusal must carry the typed launch reason"
@@ -1782,7 +1793,7 @@ fn a_profile_is_resolved_in_the_handshake() {
     drop(owner);
     match dial(Some("ffffffffffff")) {
         Ok(_) => panic!("an unknown profile must be refused"),
-        Err(punktfunk_core::PunktfunkError::Rejected(r)) => {
+        Err(punktfunk_core::PunktfunkError::Rejected(r, _)) => {
             assert_eq!(r, punktfunk_core::reject::RejectReason::ProfileUnknown)
         }
         Err(other) => panic!("expected a typed rejection, got {other:?}"),

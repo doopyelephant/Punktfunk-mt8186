@@ -305,16 +305,82 @@ fn body_of(
         .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))
 }
 
-/// The host's catalog, walked by `GET /api/v1/library/page`. A host older than that route
-/// refuses it on this lane, so `GET /api/v1/library` answers whole instead. 401/403 from
-/// both → [`LibraryError::NotPaired`]; pin failure → [`LibraryError::PinMismatch`].
+/// How long the stream port gets to answer a management connection before HTTPS is asked.
+#[cfg(desktop)]
+const TUNNEL_WAIT: Duration = Duration::from_secs(3);
+
+/// The catalog over the stream port's management tunnel, which needs no TCP 47990. `None`
+/// when the tunnel did not answer for this device; only a pin failure is a verdict.
+#[cfg(desktop)]
+fn fetch_over_tunnel(
+    addr: &str,
+    stream_port: u16,
+    identity: &(String, String),
+    pin: Option<[u8; 32]>,
+) -> Option<Result<Vec<GameEntry>, LibraryError>> {
+    use punktfunk_core::client::mgmt::MgmtTunnel;
+    let id = (identity.0.as_str(), identity.1.as_str());
+    let tunnel = match MgmtTunnel::open(addr, stream_port, id, pin, TUNNEL_WAIT) {
+        Ok(t) => t,
+        Err(punktfunk_core::PunktfunkError::Crypto) => return Some(Err(LibraryError::PinMismatch)),
+        Err(e) => {
+            tracing::debug!(error = %e, "library tunnel did not open — asking HTTPS");
+            return None;
+        }
+    };
+    let walked = walk_pages(
+        |cursor| {
+            let mut path = format!("/api/v1/library/page?limit={PAGE_LIMIT}");
+            if let Some(c) = cursor {
+                path.push_str("&cursor=");
+                path.push_str(&query_value(c));
+            }
+            match tunnel.request("GET", &path, b"") {
+                Ok(r) if r.status == 200 => Ok(String::from_utf8_lossy(&r.body).into_owned()),
+                Ok(r) => Err(LibraryError::Http(r.status)),
+                Err(e) => Err(LibraryError::Unreachable(e.to_string())),
+            }
+        },
+        LibraryError::Unreachable,
+    );
+    // A host before this one answers its tunnel with no client certificate: HTTPS decides.
+    walked
+        .inspect_err(|e| tracing::debug!(error = %e, "library tunnel refused — asking HTTPS"))
+        .ok()
+        .map(Ok)
+}
+
+/// `s` percent-encoded for a query value.
+#[cfg(desktop)]
+fn query_value(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// The host's catalog, walked by `GET /api/v1/library/page`: over the stream port's management
+/// tunnel when `stream_port` is known (non-zero), else, or when that does not answer, over
+/// HTTPS on `mgmt_port`. A host older than the paged route refuses it on that lane, so
+/// `GET /api/v1/library` answers whole instead. 401/403 from both → [`LibraryError::NotPaired`];
+/// pin failure → [`LibraryError::PinMismatch`].
 #[cfg(desktop)]
 pub fn fetch_games(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
 ) -> Result<Vec<GameEntry>, LibraryError> {
+    if stream_port != 0 {
+        if let Some(fetched) = fetch_over_tunnel(addr, stream_port, identity, pin) {
+            return fetched;
+        }
+    }
     let agent = agent(identity, pin)?;
     let base = base_url(addr, mgmt_port);
     let bad_reply = LibraryError::Unreachable;
@@ -1221,6 +1287,14 @@ pub(crate) fn classify(e: ureq::Error) -> LibraryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host's opaque cursor survives the query string whatever it holds.
+    #[cfg(desktop)]
+    #[test]
+    fn a_cursor_is_percent_encoded() {
+        assert_eq!(query_value("a1-_.~"), "a1-_.~");
+        assert_eq!(query_value("b+c/d=&é"), "b%2Bc%2Fd%3D%26%C3%A9");
+    }
 
     /// The newest request is served first, and a full queue drops its oldest.
     #[cfg(desktop)]

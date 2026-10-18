@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 mod control;
 pub(crate) mod frame_channel;
 pub mod health;
+pub mod mgmt;
 mod pad_mouse;
 mod pad_touch;
 mod pairing;
@@ -206,19 +207,34 @@ impl PunktfunkEndReason {
     pub fn is_normal(self) -> bool {
         !matches!(self, Self::HostError | Self::Lost)
     }
+
+    /// How long to wait before redial `attempt` (0-based) of a session that ended this way;
+    /// `None` once the schedule is spent, and for every ending but [`Self::Lost`]: a host
+    /// that closed the session meant it. Every shell redials on this one schedule.
+    pub fn redial_delay(self, attempt: u32) -> Option<Duration> {
+        const SCHEDULE_S: [u64; 5] = [0, 1, 2, 4, 8];
+        if self != Self::Lost {
+            return None;
+        }
+        SCHEDULE_S
+            .get(attempt as usize)
+            .map(|&s| Duration::from_secs(s))
+    }
 }
 
 #[cfg(feature = "quic")]
 impl From<&quinn::ConnectionError> for PunktfunkEndReason {
-    /// Map a QUIC close. Host app codes: `APP_EXITED` → GameExited, `0` → HostEnded.
-    /// Any other application code is unnamed and treated as `HostError` (visible) rather
-    /// than a clean host end. Transport-level failures are `Lost`.
+    /// Map a QUIC close. Host app codes: `APP_EXITED` → GameExited, `PATH_SHRANK` → Lost
+    /// (a redial heals it), `0` → HostEnded. Any other application code is unnamed and
+    /// treated as `HostError` (visible) rather than a clean host end. Transport-level
+    /// failures are `Lost`.
     fn from(e: &quinn::ConnectionError) -> Self {
         match e {
             quinn::ConnectionError::LocallyClosed => Self::Local,
             quinn::ConnectionError::ApplicationClosed(ac) => {
                 match u32::try_from(u64::from(ac.error_code)) {
                     Ok(crate::quic::APP_EXITED_CLOSE_CODE) => Self::GameExited,
+                    Ok(crate::quic::PATH_SHRANK_CLOSE_CODE) => Self::Lost,
                     Ok(0) => Self::HostEnded,
                     _ => Self::HostError,
                 }
@@ -578,7 +594,7 @@ pub struct ConnectParams {
     /// unchanged. `None` names none.
     pub preset: Option<crate::quic::SessionPreset>,
     /// A diagnostic session ([`crate::quic::EXT_DELIVERY_PROBE_ONLY`]): the host serves probes
-    /// from the punched data plane and never builds a pipeline.
+    /// from the bound data plane and never builds a pipeline.
     pub probe_only: bool,
     /// The profile to play as: a host profile id. `None` lets the host choose
     /// ([`NativeClient::profile`] says which it did).
@@ -588,7 +604,15 @@ pub struct ConnectParams {
     /// Abort while blocked: a request-access knock parks ~185 s. Never alias the session's
     /// `shutdown` onto it; that races the end reason. `None` = uncancelable.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Called once, on the connecting thread, when the host answers that its operator is
+    /// deciding about this device. From then the dial waits for the host's verdict, up to
+    /// [`APPROVAL_WAIT`], not `timeout`; `cancel` still ends it. `None`: `timeout` stands.
+    pub on_pending: Option<Arc<dyn Fn() + Send + Sync>>,
 }
+
+/// Longest a dial waits on an operator once the host said it is asking. The host answers
+/// sooner: approval, a refusal, or its own timeout.
+pub const APPROVAL_WAIT: Duration = Duration::from_secs(10 * 60);
 
 impl ConnectParams {
     /// A plain dial to `host:port` at (up to) `mode`, giving up after `timeout`.
@@ -621,6 +645,7 @@ impl ConnectParams {
             profile: None,
             timeout,
             cancel: None,
+            on_pending: None,
         }
     }
 }
@@ -649,6 +674,7 @@ impl NativeClient {
             .store(params.probe_only, Ordering::Relaxed);
 
         let cancel = params.cancel.take();
+        let on_pending = params.on_pending.take();
         let (timeout, bitrate_kbps, requested_gamepad) =
             (params.timeout, params.bitrate_kbps, params.gamepad);
         // RED is core-decided; HIRES is not. See `advertised_client_caps`.
@@ -691,12 +717,20 @@ impl NativeClient {
 
         // Poll so `cancel` can abort; a parked request-access handshake has nothing to wake on.
         const READY_POLL: Duration = Duration::from_millis(50);
-        let deadline = std::time::Instant::now() + timeout;
+        let mut deadline = std::time::Instant::now() + timeout;
+        let mut told_pending = false;
         let negotiated = loop {
+            if !told_pending && shared.pending.load(Ordering::Relaxed) {
+                told_pending = true;
+                if let Some(hook) = &on_pending {
+                    hook();
+                    deadline = deadline.max(std::time::Instant::now() + APPROVAL_WAIT);
+                }
+            }
             match ready_rx.recv_timeout(READY_POLL) {
                 Ok(Ok(t)) => break t,
                 Ok(Err(e)) => {
-                    // Stops what the handshake already started, such as the data punch.
+                    // Stops what the handshake already started.
                     shared.shutdown.store(true, Ordering::SeqCst);
                     return Err(e);
                 }
@@ -845,6 +879,17 @@ impl NativeClient {
     pub fn request_keyframe(&self) -> Result<()> {
         self.recovery_step(RecoveryEvent::NeedKeyframe, false);
         Ok(())
+    }
+
+    /// The device's network path changed: an interface came up, went down or took over the
+    /// default route. Re-picks the socket's source address and sends the host a copy of the
+    /// last feedback, so it follows a roam within a round trip instead of a keep-alive.
+    pub fn path_changed(&self) {
+        if let Some(reconnect) = self.shared.reconnect.get() {
+            reconnect();
+        }
+        let fb = self.shared.feedback.lock().unwrap().again();
+        self.shared.send_feedback(&fb);
     }
 
     /// Recover `[first_frame, last_frame]` by RFI instead of a full IDR. Capable hosts emit a
@@ -1395,6 +1440,12 @@ impl NativeClient {
         }
     }
 
+    /// Return the consumer from [`Self::next_frame`] with `NoFrame` now, or at its next
+    /// call: a hardware decode it submitted is complete. Any thread may call this.
+    pub fn kick_frame_wait(&self) {
+        self.shared.frames.kick();
+    }
+
     /// Next audio packet. Drain on a dedicated thread — packets arrive every 5 ms.
     pub fn next_audio(&self, timeout: Duration) -> Result<AudioPacket> {
         pull(&self.planes.audio, timeout)
@@ -1464,6 +1515,13 @@ impl NativeClient {
             Ok(None) => Err(PunktfunkError::NoFrame),
             Err(rumble::Closed) => Err(PunktfunkError::Closed),
         }
+    }
+
+    /// Run `wake` on the demux thread as each rumble update lands, for a poller that blocks
+    /// on something other than [`Self::next_rumble_command`] and then drains it with a zero
+    /// timeout. A scheduled follow-up (a ramp step, a backstop) still waits for that poll.
+    pub fn set_rumble_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.planes.rumble_sched.set_wake(wake);
     }
 
     /// Actuator quirks for wire pad `pad` (at attach). Default = well-behaved; only decaying
@@ -1919,6 +1977,58 @@ fn expires_in_secs(deadline_unix: Option<u64>, now_unix: u64) -> u32 {
             .unwrap_or(u32::MAX)
             .max(1)
     })
+}
+
+#[cfg(all(test, feature = "quic"))]
+mod end_reason_tests {
+    use super::PunktfunkEndReason;
+
+    fn closed_with(code: u32) -> PunktfunkEndReason {
+        let e = quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(code),
+            reason: Default::default(),
+        });
+        PunktfunkEndReason::from(&e)
+    }
+
+    /// A path too small for the stream redials like a dropped connection.
+    #[test]
+    fn a_shrunk_path_reads_as_lost() {
+        assert_eq!(
+            closed_with(crate::quic::PATH_SHRANK_CLOSE_CODE),
+            PunktfunkEndReason::Lost
+        );
+        assert_eq!(
+            closed_with(crate::quic::APP_EXITED_CLOSE_CODE),
+            PunktfunkEndReason::GameExited
+        );
+        assert_eq!(closed_with(0x6B), PunktfunkEndReason::HostError);
+    }
+}
+
+#[cfg(test)]
+mod redial_tests {
+    use super::PunktfunkEndReason;
+
+    /// Only a lost connection redials, five times, with the waits growing.
+    #[test]
+    fn only_a_lost_session_redials() {
+        let lost = PunktfunkEndReason::Lost;
+        let waits: Vec<u64> = (0..)
+            .map_while(|a| lost.redial_delay(a))
+            .map(|d| d.as_secs())
+            .collect();
+        assert_eq!(waits, [0, 1, 2, 4, 8]);
+        for other in [
+            PunktfunkEndReason::None,
+            PunktfunkEndReason::Local,
+            PunktfunkEndReason::GameExited,
+            PunktfunkEndReason::HostEnded,
+            PunktfunkEndReason::HostError,
+        ] {
+            assert_eq!(other.redial_delay(0), None);
+        }
+    }
 }
 
 #[cfg(test)]

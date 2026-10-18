@@ -83,7 +83,12 @@ public enum AnnexB {
             var i = 0
             var start = -1
             while i + 2 < count {
-                if base[i] == 0, base[i + 1] == 0, base[i + 2] == 1 {
+                // A code ends in 01: a third byte above 1 rules out a code starting at any
+                // of these three positions, so the walk skips them. Most payload bytes do.
+                let third = base[i + 2]
+                if third > 1 {
+                    i += 3
+                } else if third == 1, base[i] == 0, base[i + 1] == 0 {
                     var codeStart = i
                     while codeStart > 0, base[codeStart - 1] == 0 {
                         codeStart -= 1

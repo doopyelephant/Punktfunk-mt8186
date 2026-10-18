@@ -14,6 +14,8 @@ use std::process::Command;
 
 /// One event from the session child.
 pub(crate) enum SpawnEvent {
+    /// The host is asking its operator about this device; the child keeps waiting.
+    AwaitingApproval,
     /// The child presented its first frame (its window is up and streaming).
     Ready,
     /// One stats window for the session status page.
@@ -96,6 +98,7 @@ fn spawn(
     let cancel = slot.clone();
     orchestrate::spawn_child(cmd, spec_path, Some(slot), crate::logfile::Tee, move |ev| {
         match ev {
+            SessionEvent::AwaitingApproval => on_event(SpawnEvent::AwaitingApproval),
             SessionEvent::Ready => on_event(SpawnEvent::Ready),
             SessionEvent::Stats(s) => on_event(SpawnEvent::Stats(s)),
             SessionEvent::Error(e) => error = Some(e),

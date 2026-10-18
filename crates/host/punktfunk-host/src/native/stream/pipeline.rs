@@ -34,7 +34,7 @@ pub(super) fn panel_tick_ns(display_hz: u32, stream_hz: u32) -> Option<u64> {
     (display_hz > stream_hz).then(|| 1_000_000_000 / u64::from(display_hz))
 }
 
-/// Display + pipeline built on the prep thread while Start RTT and hole-punch are in flight.
+/// Display + pipeline built on the prep thread while the Start round trip is in flight.
 pub(in crate::native) struct PreparedDisplay {
     pub(super) vd: Box<dyn crate::vdisplay::VirtualDisplay>,
     pub(super) pipeline: Pipeline,
@@ -220,7 +220,7 @@ pub(in crate::native) fn prepare_display(
 }
 
 /// Run [`prepare_display`] on the thread that becomes the stream thread once Start delivers its
-/// [`SessionContext`]. A dropped sender (handshake abort, punch failure) drops what was built,
+/// [`SessionContext`]. A dropped sender (handshake abort, a data plane that failed to bind) drops what was built,
 /// which hands the monitor to keep-alive like a normal session end. `None` when the thread
 /// does not spawn: bring-up then builds inline. Compiled on every host; only Windows calls it.
 pub(in crate::native) fn spawn_display_prep(

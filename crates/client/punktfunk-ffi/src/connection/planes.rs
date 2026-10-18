@@ -309,6 +309,17 @@ pub unsafe extern "C" fn punktfunk_connection_end_reason(
     conn_out!(c, out => c.inner.end_reason() as u8)
 }
 
+/// Milliseconds to wait before redial `attempt` (0-based) of a session that ended with
+/// `end_reason` (`PUNKTFUNK_END_REASON_*`); `-1` means stay ended. Only `LOST` redials, on
+/// one schedule every client shares. The redial reuses the dial that started the session.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub extern "C" fn punktfunk_redial_delay_ms(end_reason: u8, attempt: u32) -> i64 {
+    punktfunk_core::client::PunktfunkEndReason::from_u8(end_reason)
+        .redial_delay(attempt)
+        .map_or(-1, |d| d.as_millis() as i64)
+}
+
 /// One decoded audio frame from [`punktfunk_connection_next_audio_pcm`]: interleaved
 /// f32 in wire order `FL FR FC LFE RL RR SL SR` (first `channels` of it). `samples`
 /// points at `frame_count * channels` floats and borrows until the next PCM call.

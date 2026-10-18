@@ -38,6 +38,8 @@ struct ConsoleHomeView: View {
     /// A Back the console did not take. On a TV the press is the system's, so nothing is bound
     /// while the console sits at its root and this never fires there.
     var onQuit: () -> Void = {}
+    /// The host parked the connect for its operator; the console draws the wait.
+    var awaitingApproval = false
 
     @State private var console: ConsoleModel?
 
@@ -56,6 +58,9 @@ struct ConsoleHomeView: View {
                     discovery: discovery, power: .shared, nowPlaying: .shared)
             }
             .onChange(of: model.phase) { was, now in report(from: was, to: now) }
+            .onChange(of: awaitingApproval) { _, now in
+                if now, model.phase == .connecting { console?.session(.awaitingApproval) }
+            }
             .onChange(of: model.errorMessage) { _, message in
                 // The app's "Connection failed" alert stays down while the console is up, so the
                 // console says it — on the card that asked for the connect.

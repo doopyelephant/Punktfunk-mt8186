@@ -575,8 +575,9 @@ public enum LibraryClient {
         return games
     }
 
-    /// The host's catalog, walked by `GET /api/v1/library/page`. A host older than the paged
-    /// route refuses it on this lane, so `GET /api/v1/library` answers whole instead.
+    /// The host's catalog, walked by `GET /api/v1/library/page`: over the stream port first, so a
+    /// host whose TCP 47990 is closed still answers, then over HTTPS. A host older than the
+    /// paged route refuses it on this lane, so `GET /api/v1/library` answers whole instead.
     public static func fetch(_ target: MgmtTarget) async throws -> [GameEntry] {
         guard let base = URL(
             string: "\(baseURL(address: target.address, port: target.port))/api/v1/library")
@@ -586,12 +587,25 @@ public enum LibraryClient {
             try expectOK(response)
             return response.body
         }
+        let tunnelled: (String) async throws -> Data = { path in
+            let response = try await MgmtTransport.tunnelGet(path, to: target)
+            try expectOK(response)
+            return response.body
+        }
         var games: [GameEntry]
-        do {
-            games = try await walkPages { cursor in try await body(pagePath(cursor: cursor)) }
-        } catch LibraryError.unauthorized, LibraryError.http(404) {
-            games = try JSONDecoder().decode(
-                [GameEntry].self, from: try await body("/api/v1/library"))
+        if target.streamPort > 0,
+            let walked = try? await walkPages({ cursor in
+                try await tunnelled(pagePath(cursor: cursor))
+            })
+        {
+            games = walked
+        } else {
+            do {
+                games = try await walkPages { cursor in try await body(pagePath(cursor: cursor)) }
+            } catch LibraryError.unauthorized, LibraryError.http(404) {
+                games = try JSONDecoder().decode(
+                    [GameEntry].self, from: try await body("/api/v1/library"))
+            }
         }
         // Art the host serves arrives as host-relative proxy paths (`/api/v1/library/art/...`).
         // Resolve them against THIS host, so every consumer sees absolute URLs.

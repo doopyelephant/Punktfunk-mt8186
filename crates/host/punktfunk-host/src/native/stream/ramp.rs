@@ -1,6 +1,6 @@
 //! Serving the client's bring-up ramp on the idle data plane.
 //!
-//! The data `Session` is built the moment the client's punch lands and then
+//! The data `Session` is built the moment the data plane binds and then
 //! sits untouched for the two to three seconds `StreamState::new` spends on
 //! the display, the pipeline and the launch. [`RampServer`] borrows it for
 //! that gap on its own thread, answers the short `ProbeRequest`s the client's

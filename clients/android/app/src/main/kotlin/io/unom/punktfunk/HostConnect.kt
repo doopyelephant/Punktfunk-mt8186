@@ -29,6 +29,9 @@ const val CONNECT_TIMEOUT_MS = 10_000
  */
 const val REQUEST_ACCESS_TIMEOUT_MS = 185_000
 
+/** How often a dial in flight checks whether the host parked it for its operator. */
+const val PENDING_POLL_MS = 250L
+
 /** The session [HostServices.dial] hands every shell once a dial lands. */
 object SessionFactory {
     /**
@@ -45,6 +48,7 @@ object SessionFactory {
         preset: StreamPreset?,
         store: KnownHostStore,
         mgmtPort: Int,
+        redial: DialSpec? = null,
     ): ActiveSession {
         if (record != null) store.learnMgmtPort(record, mgmtPort)
         return ActiveSession(
@@ -53,6 +57,7 @@ object SessionFactory {
             clipboardSync = record?.clipboardSync ?: false,
             presetName = preset?.name,
             hostId = record?.id,
+            redial = redial,
         )
     }
 

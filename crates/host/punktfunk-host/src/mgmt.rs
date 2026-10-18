@@ -213,7 +213,7 @@ pub(crate) struct MgmtState {
     identity_fingerprint: Option<[u8; 32]>,
 }
 
-/// `native` is the shared punktfunk/1 pairing handle when the unified host
+/// `native` is the shared native pairing handle when the unified host
 /// runs the native QUIC server.
 pub async fn run(
     state: Arc<AppState>,
@@ -648,7 +648,7 @@ pub fn openapi_json() -> String {
         (name = "display", description = "Virtual-display management policy: lifecycle (keep-alive), topology (primary/exclusive), conflict handling, identity, and layout"),
         (name = "clients", description = "Paired Moonlight client management"),
         (name = "pairing", description = "Pairing PIN delivery (the out-of-band half of the GameStream pairing handshake)"),
-        (name = "native", description = "Native punktfunk/1 pairing: arm a window, display the host PIN, manage paired devices"),
+        (name = "native", description = "Native pairing: arm a window, display the host PIN, manage paired devices"),
         (name = "session", description = "Active streaming session control"),
         (name = "library", description = "Game library: the titles each installed library plugin syncs, plus user-curated custom entries"),
         (name = "profiles", description = "The people on this box: the list a client's picker shows, their pictures, and the console's edits"),

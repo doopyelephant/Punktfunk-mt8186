@@ -7,7 +7,7 @@ import android.hardware.display.DisplayManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
-import android.os.Looper
+import android.os.HandlerThread
 import android.os.SystemClock
 import android.util.Log
 import android.view.Display
@@ -179,11 +179,13 @@ internal class StreamWindow(
     }
 
     /**
-     * The Wi-Fi link read once a second on the main thread, logged through the native ring
-     * ([WifiLinkLog]) so a field bundle can tell a radio problem from a stream one. Stops in [detach].
+     * The Wi-Fi link read once a second, logged through the native ring ([WifiLinkLog]) so a
+     * field bundle can tell a radio problem from a stream one. Its own thread: `connectionInfo`
+     * is a binder call, and the main thread is the stream's input path. Stops in [detach].
      */
     private val wifiLinkLog = WifiLinkLog()
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val wifiThread = HandlerThread("pf-wifi-link").apply { start() }
+    private val wifiHandler = Handler(wifiThread.looper)
     private val pollWifiLink = object : Runnable {
         override fun run() {
             val link = wifiManager?.readLink() ?: return
@@ -194,7 +196,7 @@ internal class StreamWindow(
                     )
                 }
             }
-            mainHandler.postDelayed(this, 1_000)
+            wifiHandler.postDelayed(this, 1_000)
         }
     }
 
@@ -224,7 +226,7 @@ internal class StreamWindow(
                 Log.w("punktfunk", "WifiLock acquire failed — power save stays ON: $lock", e)
             }
         }
-        mainHandler.post(pollWifiLink)
+        wifiHandler.post(pollWifiLink)
         // HDMI Auto Low-Latency Mode: ask the display to drop its post-processing (game mode) —
         // the biggest panel-side latency win on the TV boxes. No-op where ALLM isn't supported. API
         // 30+. Part of the experimental low-latency stack.
@@ -329,6 +331,6 @@ internal class StreamWindow(
                 ?.setGameState(GameState(false, GameState.MODE_NONE))
         }
         wifiLocks.forEach { runCatching { if (it.isHeld) it.release() } }
-        mainHandler.removeCallbacks(pollWifiLink)
+        wifiThread.quitSafely()
     }
 }

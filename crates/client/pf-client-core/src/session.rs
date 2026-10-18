@@ -99,6 +99,9 @@ pub struct SessionParams {
     /// When a not-ready host stops being dialed again. `None` on a first dial; the embedder
     /// sets it on the re-dial, and a pump that finds it set pauses 2 s before dialing.
     pub settle_until: Option<Instant>,
+    /// How long the pump waits before it dials. A redial after [`SessionEvent::Lost`] waits
+    /// out `PunktfunkEndReason::redial_delay`; zero on any other dial.
+    pub redial_wait: Duration,
     /// Presenter raises this when hardware frames cannot be displayed. The pump demotes
     /// to software and re-requests a keyframe. Decode still succeeds in that state, so
     /// without this the stream stays black.
@@ -226,6 +229,7 @@ impl SessionParams {
             connect_timeout: dial.connect_timeout,
             auto_wake: settings.auto_wake,
             settle_until: None,
+            redial_wait: Duration::ZERO,
             force_software: probes.force_software,
             preset,
             preset_id,
@@ -263,6 +267,8 @@ pub struct DecodeFacts {
 }
 
 pub enum SessionEvent {
+    /// The host is asking its operator about this device; the dial waits for the answer.
+    AwaitingApproval,
     Connected {
         connector: Arc<NativeClient>,
         mode: Mode,
@@ -277,6 +283,10 @@ pub enum SessionEvent {
         refused: Option<punktfunk_core::reject::RejectReason>,
     },
     Ended(Option<String>),
+    /// The link died mid-session (`PunktfunkEndReason::Lost`). Terminal like [`Self::Ended`],
+    /// whose sentence it carries; the embedder redials on `PunktfunkEndReason::redial_delay`'s
+    /// schedule, and one that does not ends as for [`Self::Ended`].
+    Lost(Option<String>),
     /// The host answered but couldn't start the stream, before any frame, while
     /// [`SessionParams::waking`] held. Terminal; the embedder dials again on the same params
     /// with `settle_until` set [`WAKE_SETTLE`] after the first one. Carries the host's words.
@@ -582,11 +592,13 @@ fn client_caps(params: &SessionParams, pad_audio_on: bool) -> u8 {
         | bit(params.keep_host_audio, CLIENT_CAP_KEEP_HOST_AUDIO)
 }
 
-/// Dial the host. `Err` is the terminal event the pump sends instead of `Connected`.
+/// Dial the host. `Err` is the terminal event the pump sends instead of `Connected`; a host
+/// that parks the dial for its operator raises [`SessionEvent::AwaitingApproval`] on `ev_tx`.
 fn dial(
     params: &SessionParams,
     stop: &Arc<AtomicBool>,
     plan: &ConnectPlan,
+    ev_tx: &async_channel::Sender<SessionEvent>,
 ) -> Result<Arc<NativeClient>, SessionEvent> {
     // Lossless opt-in, filtered by what this box can play. `CLIENT_CAP_AUDIO_HIRES`
     // means capable *and* the user turned it on — advertising without being able to
@@ -648,6 +660,12 @@ fn dial(
         // it this parks the pump for the whole budget (185 s on a request-access
         // connect the host holds pending) and cancel cannot be answered until return.
         cancel: Some(stop.clone()),
+        on_pending: Some({
+            let ev_tx = ev_tx.clone();
+            Arc::new(move || {
+                let _ = ev_tx.try_send(SessionEvent::AwaitingApproval);
+            })
+        }),
         ..ConnectParams::new(
             &params.host,
             params.port,
@@ -659,13 +677,13 @@ fn dial(
     .map_err(|e| {
         let trust_rejected = matches!(e, PunktfunkError::Crypto);
         let refused = match e {
-            PunktfunkError::Rejected(reason) => Some(reason),
+            PunktfunkError::Rejected(reason, _) => Some(reason),
             _ => None,
         };
         let not_ready = params.waking()
             && matches!(
                 e,
-                PunktfunkError::Rejected(punktfunk_core::reject::RejectReason::SetupFailed)
+                PunktfunkError::Rejected(punktfunk_core::reject::RejectReason::SetupFailed, _)
             );
         let msg = match e {
             PunktfunkError::Crypto => {
@@ -675,7 +693,9 @@ fn dial(
             PunktfunkError::Timeout => "Connection timed out".to_string(),
             // Host said why it turned us away — show that verbatim: "denied on the
             // host" and "timed out" call for different next steps.
-            PunktfunkError::Rejected(reason) => crate::trust::connect_reject_message(reason),
+            PunktfunkError::Rejected(reason, said) => {
+                crate::trust::reject_message(reason, Some(&said))
+            }
             other => {
                 tracing::warn!(error = %other, "connect failed");
                 "The host didn't answer".to_string()
@@ -941,13 +961,15 @@ fn pump(
         advertised_codecs,
         ..
     } = plan;
-    if params.settle_until.is_some() {
-        let until = Instant::now() + REDIAL_PAUSE;
-        while Instant::now() < until && !stop.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+    let pause = match params.settle_until {
+        Some(_) => REDIAL_PAUSE.max(params.redial_wait),
+        None => params.redial_wait,
+    };
+    let until = Instant::now() + pause;
+    while Instant::now() < until && !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(20));
     }
-    let connector = match dial(&params, &stop, &plan) {
+    let connector = match dial(&params, &stop, &plan, &ev_tx) {
         Ok(c) => c,
         Err(failed) => {
             let _ = ev_tx.send_blocking(failed);
@@ -1027,6 +1049,8 @@ fn pump(
         access,
         planes,
         decoder,
+        #[cfg(target_os = "linux")]
+        fd_wake: None,
         lent_au_memory: None,
         wants_decode: connector.wants_decode_latency(),
         marks_repeats: connector.host_caps2() & punktfunk_core::quic::HOST_CAP2_REPEAT_MARK != 0,
@@ -1076,6 +1100,9 @@ struct Pump {
     access: crate::access::SessionAccess,
     planes: PlaneThreads,
     decoder: Decoder,
+    /// The sync_file waiter's inbox (`run`); a VAAPI decode's fence goes there at submit.
+    #[cfg(target_os = "linux")]
+    fd_wake: Option<std::sync::mpsc::Sender<std::os::fd::OwnedFd>>,
     /// The decoder's in-place AU memory as lent to the connector; a resize can bring a new one.
     lent_au_memory: Option<Arc<dyn punktfunk_core::au::AuMemory>>,
     /// Report decode stage to ABR only when armed. Constant for the session.
@@ -1096,14 +1123,35 @@ impl Pump {
     /// user reads. Each pass ends with the host-timing drain and the 1-second window,
     /// unless its AU was dropped before decode. Loss recovery ticks in core's own pump.
     fn run(&mut self) -> Option<String> {
+        let wake = self.connector.clone();
+        self.decoder
+            .set_decode_wake(Arc::new(move || wake.kick_frame_wait()));
+        #[cfg(target_os = "linux")]
+        {
+            // VAAPI's decode fence is a sync_file: one thread polls each in turn and kicks.
+            let (tx, rx) = std::sync::mpsc::channel::<std::os::fd::OwnedFd>();
+            let wake = self.connector.clone();
+            let spawned = std::thread::Builder::new()
+                .name("pf-decode-done".into())
+                .spawn(move || {
+                    use std::os::fd::AsFd as _;
+                    while let Ok(fd) = rx.recv() {
+                        let _ = pf_dmabuf::fence::wait_sync_file(fd.as_fd(), 50);
+                        wake.kick_frame_wait();
+                    }
+                });
+            if spawned.is_ok() {
+                self.fd_wake = Some(tx);
+            }
+        }
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 return None;
             }
             self.debug_reconfigure();
             self.on_access_update();
-            // A decode still on the GPU is polled every half millisecond and handed on the
-            // moment its pixels are done. 50 ms bounds a wedged one.
+            // A decode still on the GPU is handed on the moment its pixels are done: its
+            // waiter kicks `next_frame`, so no poll runs here. 50 ms bounds a wedged one.
             let decoder = &mut self.decoder;
             let done = self.in_flight.take_if(|p| {
                 hw_done_now(decoder, &p.hw) || now_ns().saturating_sub(p.received_ns) > 50_000_000
@@ -1111,14 +1159,8 @@ impl Pump {
             if let Some(p) = done {
                 hand_on(p, &self.frame_tx, &self.connector, self.wants_decode);
             }
-            // Otherwise 20 ms: audio has its own thread, so this only bounds stop-flag
-            // responsiveness.
-            let frame_wait = if self.in_flight.is_some() {
-                Duration::from_micros(500)
-            } else {
-                Duration::from_millis(20)
-            };
-            match self.connector.next_frame(frame_wait) {
+            // 20 ms: audio has its own thread, so this only bounds stop-flag responsiveness.
+            match self.connector.next_frame(Duration::from_millis(20)) {
                 Ok(frame) => match self.on_frame(frame) {
                     Pass::Drain => {}
                     Pass::Skip => continue,
@@ -1327,13 +1369,19 @@ impl Pump {
             // are ready (presenter write-back is `+ 1`).
             DecodedImage::NativeVk(f) => HwDone::Timeline(f.semaphore, f.semaphore_value),
             // VAAPI ships the decode's write fence as a sync_file; a dup
-            // outlives the frame's move to the presenter.
+            // outlives the frame's move to the presenter, and one more goes to the waiter.
             #[cfg(target_os = "linux")]
-            DecodedImage::NativeDmabuf(d) => d
-                .sync_fds
-                .first()
-                .and_then(|fd| fd.try_clone().ok())
-                .map_or(HwDone::Cpu, HwDone::SyncFile),
+            DecodedImage::NativeDmabuf(d) => {
+                match d.sync_fds.first().and_then(|fd| fd.try_clone().ok()) {
+                    Some(fd) => {
+                        if let (Some(tx), Ok(dup)) = (&self.fd_wake, fd.try_clone()) {
+                            let _ = tx.send(dup);
+                        }
+                        HwDone::SyncFile(fd)
+                    }
+                    None => HwDone::Cpu,
+                }
+            }
             _ => HwDone::Cpu,
         };
         let next = InFlight {
@@ -1417,9 +1465,12 @@ impl Pump {
             self.connector
                 .set_au_memory(Arc::new(punktfunk_core::au::HeapPool::default()));
         }
+        let lost = self.connector.end_reason() == punktfunk_core::client::PunktfunkEndReason::Lost
+            && self.connector.end_reject().is_none();
         let last = match self.codec_fallback.take() {
             Some(ev) => ev,
             None if self.not_ready => SessionEvent::HostNotReady(end.unwrap_or_default()),
+            None if lost => SessionEvent::Lost(end),
             None => SessionEvent::Ended(end),
         };
         end_session(
