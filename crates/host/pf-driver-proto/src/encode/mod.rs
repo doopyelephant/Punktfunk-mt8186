@@ -619,9 +619,10 @@ pub fn offer_slot(
 
 /// Whether a session's encoder reads the acquired surface itself instead of a copy of it.
 /// Only a `composed` input ([`EncodeInput::composed`]) can: every other kind needs its
-/// converter. On by default for AMF and QSV, where the copy runs on the 3D engine a game
-/// renders on. `knob` is `PFVD_POOL_BYPASS`: `0` turns it off, any other value turns it on
-/// for every backend.
+/// converter. On by default for AMF, QSV and NVENC: the copy runs on the 3D engine a game
+/// renders on, and on an RTX 4090 at 4K120 under full load it held the frame 2.7 ms longer
+/// before the encoder saw it. `knob` is `PFVD_POOL_BYPASS`: `0` turns it off, any other
+/// value turns it on for every backend.
 ///
 /// The driver's pool is Windows-only; the rule lives here so it is covered everywhere.
 #[must_use]
@@ -630,7 +631,7 @@ pub fn zero_copy(backend: u32, composed: bool, knob: Option<&str>) -> bool {
         && match knob.map(str::trim) {
             Some("0") => false,
             Some(_) => true,
-            None => matches!(backend, backend::AMF | backend::QSV),
+            None => matches!(backend, backend::AMF | backend::QSV | backend::NVENC),
         }
 }
 
@@ -947,13 +948,17 @@ mod tests {
     }
 
     #[test]
-    fn zero_copy_defaults_to_amf_and_qsv() {
-        use super::backend::{AMF, NVENC, QSV};
+    fn zero_copy_defaults_to_amf_qsv_and_nvenc() {
+        use super::backend::{AMF, MEDIA_FOUNDATION, NVENC, QSV};
         assert!(zero_copy(AMF, true, None));
         assert!(zero_copy(QSV, true, None));
-        assert!(!zero_copy(NVENC, true, None));
+        assert!(zero_copy(NVENC, true, None));
+        assert!(
+            !zero_copy(MEDIA_FOUNDATION, true, None),
+            "unmeasured: the copy stays"
+        );
         assert!(!zero_copy(AMF, true, Some("0")));
-        assert!(zero_copy(NVENC, true, Some("1")));
+        assert!(zero_copy(MEDIA_FOUNDATION, true, Some("1")));
         assert!(!zero_copy(AMF, false, Some("1")), "a converter kind");
     }
 
