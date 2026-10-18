@@ -43,7 +43,8 @@ seat.
 Every seat shares one set of **Seats** settings on **Host**, shown while seats are on:
 
 - **Seats kept warm**: the seats of the most recent players start with the host.
-- **Stop an idle seat after**: 240 minutes by default; 0 never stops one.
+- **Stop an idle seat after**: 240 minutes by default; 0 never stops one. Your own seat never
+  stops for this: it runs your plugins.
 - **End a seat's stream when its game exits**: off keeps streaming the seat's desktop.
 - **Highest mode per seat**, such as `2560x1440@120`: a device's own cap outranks it.
 - **Seats update your games** (Linux): off, seats play the games you installed but can't update
