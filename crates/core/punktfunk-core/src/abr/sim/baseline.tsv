@@ -23,14 +23,14 @@ slow_start_spent	0	1	0	2	5	0	0	1000	e21ad91d
 wifi_tv_probe_damage	0	3	0	0	4	0	0	1000	f50234f8
 wifi_loss_heavy	70	99999	120	120	1	0	0	1000	47f8c93f
 wifi_loss_severe	76	99999	120	970	1	0	0	1000	5e50d09a
-decoder_knee	0	3	15	0	3	0	0	1000	0a161eab
+decoder_knee	0	3	15	0	3	0	0	1000	cb2a11dc
 starved_client	80	1	46	14586	399	0	0	1000	523cb97a
 idle_then_motion	0	3	0	6	5	0	0	1000	ea6b71af
 host_never_acks	0	99999	0	0	0	0	0	1000	37e3e450
 unknown_refresh	0	99999	35	0	1	0	0	1000	0a161839
 wifi_tv_probe_stalled	0	3	0	0	4	0	0	1000	69733130
-decoder_headroom	0	3	17	0	5	0	0	1000	f278847c
-decoder_overrun	88	3	35	0	1	0	0	1000	4233e47d
+decoder_headroom	0	3	12	0	5	0	0	1000	d65838e4
+decoder_overrun	0	3	2	0	8	0	0	1000	91853220
 encoder_stalled	0	3	0	0	5	0	0	1000	ea6b71af
 unknown_refresh_knee	0	99999	35	0	1	0	0	1000	2a478f15
 host_rebuild_stall	0	1	0	0	4	0	0	1000	9c97699d

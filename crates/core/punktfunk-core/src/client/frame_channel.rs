@@ -210,6 +210,9 @@ pub(crate) struct Trip {
     pub(crate) clock: bool,
     /// The queue sat at [`QUEUE_HIGH`] for [`STANDING_TIME`] and still does.
     pub(crate) queue: bool,
+    /// The queue tripped while its frames arrived on time, as an armed clock run that has
+    /// seen delays judged them: the decoder fell behind, not the link.
+    pub(crate) decoder: bool,
 }
 
 /// What a jump-to-live's flush found.
@@ -235,6 +238,8 @@ pub(crate) struct JumpToLive {
     /// Consecutive clock-only flushes that found no local backlog.
     noop_clock_flushes: u32,
     clock_armed: bool,
+    /// An AU has carried a delay, so the clock run can tell a late link from a slow decoder.
+    clock_fed: bool,
     /// Flushes that found a real backlog. Under a pinned rate nothing else
     /// lowers the load, so this is the "can't keep up" count.
     real_sheds: u32,
@@ -251,6 +256,7 @@ impl JumpToLive {
             last_flush: None,
             noop_clock_flushes: 0,
             clock_armed: true,
+            clock_fed: false,
             real_sheds: 0,
             preroll_draining: true,
             resync_wanted: false,
@@ -281,6 +287,7 @@ impl JumpToLive {
         is_au: bool,
         depth: usize,
     ) -> Option<Trip> {
+        self.clock_fed |= lat_ns > 0;
         if self.clock_armed && lat_ns > FLUSH_LATENCY.as_nanos() as i128 {
             self.stale_since.get_or_insert(now);
         } else if is_au {
@@ -297,9 +304,12 @@ impl JumpToLive {
         };
         // Still high NOW: a run in the hysteresis band (a clump mid-drain)
         // must not fire on elapsed time alone.
+        let clock = ran(self.stale_since, FLUSH_AFTER);
+        let queue = depth >= QUEUE_HIGH && ran(self.standing_since, STANDING_TIME);
         let trip = Trip {
-            clock: ran(self.stale_since, FLUSH_AFTER),
-            queue: depth >= QUEUE_HIGH && ran(self.standing_since, STANDING_TIME),
+            clock,
+            queue,
+            decoder: queue && !clock && self.clock_armed && self.clock_fed,
         };
         if !(trip.clock || trip.queue) || !self.claim_flush(now) {
             return None;
@@ -966,7 +976,8 @@ mod jump_to_live_tests {
             trip,
             Some(Trip {
                 clock: true,
-                queue: false
+                queue: false,
+                decoder: false
             })
         );
         // The run restarts; a second trip waits out the shared cooldown.
@@ -1001,7 +1012,8 @@ mod jump_to_live_tests {
             trip,
             Some(Trip {
                 clock: false,
-                queue: true
+                queue: true,
+                decoder: false
             })
         );
         // Back at QUEUE_LOW the run is gone.
@@ -1009,6 +1021,37 @@ mod jump_to_live_tests {
         j.observe(t1, 0, true, QUEUE_HIGH);
         j.observe(t1 + MS, 0, true, QUEUE_LOW);
         assert_eq!(j.observe(t1 + STANDING_TIME, 0, true, QUEUE_HIGH), None);
+    }
+
+    /// A queue whose frames arrived on time is the decoder's, but only where the clock run
+    /// could have seen a late link: fed with delays and armed.
+    #[test]
+    fn a_queue_with_on_time_frames_is_the_decoders() {
+        let on_time = 20_000_000;
+        let trip = |j: &mut JumpToLive, lat_ns| {
+            let t0 = Instant::now();
+            j.observe(t0, lat_ns, true, QUEUE_HIGH);
+            j.observe(t0 + STANDING_TIME, lat_ns, true, QUEUE_HIGH)
+                .expect("the queue run trips")
+        };
+        assert!(trip(&mut live(), on_time).decoder);
+        assert!(
+            !trip(&mut live(), 0).decoder,
+            "no delays: a late link is invisible"
+        );
+        let mut disarmed = live();
+        let clock = Trip {
+            clock: true,
+            queue: false,
+            decoder: false,
+        };
+        disarmed.after_flush(clock, 0, 0);
+        disarmed.after_flush(clock, 0, 0);
+        disarmed.last_flush = None;
+        assert!(
+            !trip(&mut disarmed, on_time).decoder,
+            "a disarmed clock run sees nothing"
+        );
     }
 
     #[test]
@@ -1028,6 +1071,7 @@ mod jump_to_live_tests {
         let clock = Trip {
             clock: true,
             queue: false,
+            decoder: false,
         };
         let mut j = live();
         assert_eq!(j.after_flush(clock, 0, 0), Shed::Noop { disarmed: false });
@@ -1049,6 +1093,7 @@ mod jump_to_live_tests {
         let clock = Trip {
             clock: true,
             queue: false,
+            decoder: false,
         };
         let mut j = live();
         assert_eq!(j.after_flush(clock, 0, 0), Shed::Noop { disarmed: false });
@@ -1060,6 +1105,7 @@ mod jump_to_live_tests {
         let both = Trip {
             clock: true,
             queue: true,
+            decoder: false,
         };
         assert_eq!(j.after_flush(both, 0, 0), Shed::Real { sheds: 3 });
         // The real shed broke the no-op run: the next no-op is a first again.

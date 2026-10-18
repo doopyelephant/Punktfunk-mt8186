@@ -484,6 +484,11 @@ impl BitrateController {
         }
     }
 
+    /// Whether a refresh is known, so the decode headroom driver can judge the decoder.
+    pub(crate) fn has_frame_budget(&self) -> bool {
+        self.frame_budget_us.is_some()
+    }
+
     /// The decoder's answer to a step in flight. One it did not answer gives
     /// the rate back and withholds the decode verdict: the cuts it named were
     /// not the rate's either.
@@ -734,6 +739,10 @@ impl BitrateController {
         }
         if let Some(kbps) = self.judge_headroom(w, &v) {
             return Some(kbps);
+        }
+        // A window whose decode queue was shed is no reason to climb.
+        if w.backlog {
+            return None;
         }
         self.climb(w)
     }

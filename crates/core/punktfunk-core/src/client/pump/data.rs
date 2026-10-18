@@ -441,10 +441,17 @@ impl DataPump {
         let Some(trip) = lp.jump.observe(Instant::now(), lat_ns, is_au, depth) else {
             return false;
         };
-        lp.abr.on_flush(); // SEVERE: the link cannot hold the rate
+        // A late link is the rate's to answer; a queue of on-time frames is the decoder's,
+        // which its headroom driver answers.
+        if trip.decoder {
+            lp.abr.on_decoder_backlog();
+        } else {
+            lp.abr.on_flush();
+        }
         let (flushed, dropped) = self.shed_backlog();
         tracing::warn!(
             behind_ms = if trip.clock { lat_ns / 1_000_000 } else { -1 },
+            decoder = trip.decoder,
             queue_depth = depth,
             flushed_datagrams = flushed,
             dropped_frames = dropped,

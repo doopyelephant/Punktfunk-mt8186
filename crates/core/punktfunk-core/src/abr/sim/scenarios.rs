@@ -2647,6 +2647,7 @@ mod tests {
             "leaver" => shared_leaver(),
             "c6" => wifi_tv_probe_damage(),
             "knee" => decoder_knee(),
+            "overrun" => decoder_overrun(),
             "starved" => starved_client(),
             "unknown" => unknown_refresh(),
             "idle" => idle_then_motion(),

@@ -382,6 +382,16 @@ impl Driver {
         self.window.on_flush();
     }
 
+    /// A jump-to-live over a queue of on-time frames: the decoder fell behind, not the link.
+    /// With no refresh known nothing judges decoder headroom, so it stays a flush.
+    pub fn on_decoder_backlog(&mut self) {
+        if self.abr.has_frame_budget() {
+            self.window.on_decoder_backlog();
+        } else {
+            self.window.on_flush();
+        }
+    }
+
     /// The host rebuilt its pipeline. The window in flight describes the gap,
     /// not the link — drop it. A gap that straddled a boundary already fed the
     /// previous window; holding every window back would be a permanent lag.

@@ -65,7 +65,8 @@ pub struct DelayTrend {
 /// `actual_kbps` is the wire rate (headers, seals and FEC parity included,
 /// probe filler netted out, audio reservation added) so it lives in the same
 /// domain as the target. `dropped` counts unrecoverable frames, `flushed` is
-/// a jump-to-live, `recovery_kf` the decode-recovery keyframe asks.
+/// a jump-to-live, `backlog` one over a queue the decoder left with the link on
+/// time, `recovery_kf` the decode-recovery keyframe asks.
 ///
 /// `owd_mean_us` is the completed-AU delay the rolling baseline is built from;
 /// `delay` is the same quantity over arriving shards, which stays present when
@@ -82,6 +83,7 @@ pub struct WindowSample {
     pub encode_mean_us: Option<i64>,
     pub actual_kbps: u32,
     pub flushed: bool,
+    pub backlog: bool,
     pub recovery_kf: u32,
     pub activity: WindowActivity,
     /// Shards that never arrived, by their place in the frame: the first twelve data
@@ -110,6 +112,7 @@ impl WindowSample {
             encode_mean_us: None,
             actual_kbps: 0,
             flushed: false,
+            backlog: false,
             recovery_kf: 0,
             activity: WindowActivity::Unmarked,
             head: 0,
