@@ -133,6 +133,8 @@ pub struct ClientMedia {
     stats: Arc<SharedStats>,
     socket: Arc<UdpSocket>,
     peer: Peer,
+    /// The uplink's QoS mark, held for the host's lifetime (a dropped Windows flow unmarks).
+    qos: Mutex<Option<super::QosFlow>>,
 }
 
 /// Connect the socket to its host again, so XNU picks the source address afresh after a roam;
@@ -152,11 +154,15 @@ impl ClientMedia {
         &self.stats
     }
 
-    /// Accept media from `host` only. On Apple the socket also connects to it: XNU sheds an
-    /// unconnected UDP socket's datagrams past ~150k a second (1.7 Gbit/s of video), uncounted.
+    /// Accept media from `host` only, and mark what goes up to it (input, acks, the mic) as
+    /// audio-class QoS, the same rule as the host's own marks: private peers, unless forced.
+    /// On Apple the socket also connects to it: XNU sheds an unconnected UDP socket's datagrams
+    /// past ~150k a second (1.7 Gbit/s of video), uncounted.
     pub fn set_host(&self, host: SocketAddr) {
         let host = canonical(host);
         self.stats.set_host(host);
+        *self.qos.lock().unwrap_or_else(|e| e.into_inner()) =
+            super::set_media_qos_to(&self.socket, host, super::MediaClass::Audio);
         #[cfg(target_vendor = "apple")]
         {
             let mut peer = self.peer.lock().unwrap_or_else(|e| e.into_inner());
@@ -232,6 +238,7 @@ pub fn client_socket(bind: SocketAddr) -> std::io::Result<(Arc<ClientSocket>, Cl
             stats,
             socket,
             peer,
+            qos: Mutex::new(None),
         },
     ))
 }
@@ -277,21 +284,29 @@ impl Reader {
                 }
             }
             loop {
-                let mut slices: Vec<IoSliceMut<'_>> =
-                    bufs.iter_mut().map(|b| IoSliceMut::new(b)).collect();
-                let n = match self
-                    .state
-                    .recv((&*self.socket).into(), &mut slices, &mut meta)
-                {
-                    Ok(n) => n,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "shared socket read");
-                        break;
+                let n = {
+                    let mut next = bufs.iter_mut();
+                    let mut slices: [IoSliceMut<'_>; BATCH] = std::array::from_fn(|_| {
+                        IoSliceMut::new(next.next().expect("BATCH buffers"))
+                    });
+                    match self
+                        .state
+                        .recv((&*self.socket).into(), &mut slices, &mut meta)
+                    {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "shared socket read");
+                            break;
+                        }
                     }
                 };
-                drop(slices);
                 self.route(&mut bufs[..n], &meta[..n]);
+                // A short batch emptied the socket: the wait above returns at once if more
+                // arrived meanwhile, so the read that would only say `WouldBlock` is skipped.
+                if n < quinn::udp::BATCH_SIZE.min(BATCH) {
+                    break;
+                }
             }
         }
     }
