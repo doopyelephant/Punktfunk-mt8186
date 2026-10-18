@@ -27,6 +27,28 @@ import os
 import AVKit // AVDisplayManager — the per-session display-mode (HDR10/refresh) request
 #endif
 
+#if os(visionOS)
+/// One pinch on the curved screen, in host-mode pixels.
+struct CurvePinch {
+    /// A wire contact id no finger in the window takes while the picture is on the curve.
+    static let touchID: UInt32 = 15
+    /// Travel under this many host pixels, under `tapSeconds`, is a click, not a drag.
+    static let tapSlop: CGFloat = 16
+    static let tapSeconds: CFTimeInterval = 0.35
+    let route: TouchInputMode
+    let start: CGPoint
+    var last: CGPoint
+    let at: CFTimeInterval
+    /// Sub-pixel travel not yet sent.
+    var carry = CGPoint.zero
+
+    func isTap(at end: CGPoint) -> Bool {
+        hypot(end.x - start.x, end.y - start.y) < Self.tapSlop
+            && CACurrentMediaTime() - at < Self.tapSeconds
+    }
+}
+#endif
+
 /// Same diagnostic switch as InputCapture (PUNKTFUNK_INPUT_DEBUG=1): on iOS we log the
 /// resolved pointer-lock state each time capture engages, so the user can see whether the
 /// scene actually locked (GCMouse only delivers deltas while it did) or whether we're on
@@ -718,16 +740,17 @@ public final class StreamViewController: StreamViewControllerBase {
         #endif
         #if os(visionOS)
         // Several windows can stream at once and none is "in front": input follows the window
-        // the player last pinched into. Another app window's scene taking it (a host list being
-        // typed into) releases this one; this scene's ornaments do not.
+        // or curved screen the player last pinched into. Another app window's scene taking it
+        // (a host list being typed into) releases this one; this scene's ornaments do not.
         observers.append(NotificationCenter.default.addObserver(
             forName: UIWindow.didBecomeKeyNotification, object: nil, queue: .main
         ) { [weak self] note in
             guard let self, let window = note.object as? UIWindow else { return }
-            if window === self.view.window {
+            if window === self.view.window || window === self.presenter.curve?.window {
                 self.setCaptured(true)
             } else if let scene = window.windowScene, scene !== self.view.window?.windowScene,
-                      scene.session.role == .windowApplication {
+                      [.windowApplication, .windowApplicationVolumetric]
+                          .contains(scene.session.role) {
                 self.setCaptured(false)
             }
         })
@@ -963,6 +986,7 @@ public final class StreamViewController: StreamViewControllerBase {
     /// Draw the picture on a curved screen, or back here with nil. Main thread.
     func setCurve(_ target: CurveTarget?) {
         guard target !== presenter.curve else { return }
+        target?.pointer = self
         presenter.setCurve(target)
         if connection != nil { layoutMetalLayer() }
     }
@@ -1262,6 +1286,10 @@ final class StreamLayerUIView: UIView {
         mouse.onDial = { [weak self] event in self?.onDial?(event) }
         return mouse
     }()
+    #if os(visionOS)
+    /// The curved screen's pinch in progress, latched to the route it started in.
+    var curve: CurvePinch?
+    #endif
     /// The finger route latched at gesture start — a Settings change mid-gesture applies to
     /// the NEXT touch, so one gesture never splits across input models.
     private var fingerRoute: TouchInputMode?
@@ -1607,6 +1635,72 @@ final class StreamLayerUIView: UIView {
     }
     #endif
 }
+
+#if os(visionOS)
+extension StreamViewController: CurvePointerSink {
+    public func curvePointer(u: Double, v: Double, phase: CurvePointerPhase) {
+        if phase == .began, captureEnabled { setCaptured(true) }
+        streamView.curvePointer(u: u, v: v, phase: phase)
+    }
+}
+
+extension StreamLayerUIView {
+    /// A pinch on the curved screen, in the session's touch model like a finger here: touch
+    /// is one wire contact, pointer moves the cursor and holds the left button, and trackpad
+    /// drags the cursor by the pinch's travel or, short and still, clicks where it is.
+    func curvePointer(u: Double, v: Double, phase: CurvePointerPhase) {
+        guard let mode = currentHostMode?(), mode.width > 0, mode.height > 0 else { return }
+        let point = CGPoint(
+            x: (u * mode.width).clamped(to: 0...(mode.width - 1)),
+            y: (v * mode.height).clamped(to: 0...(mode.height - 1)))
+        let host = HostPoint(
+            x: Int32(point.x.rounded()), y: Int32(point.y.rounded()),
+            w: UInt32(mode.width), h: UInt32(mode.height))
+        if phase == .began {
+            var route = TouchInputMode.current(settings)
+            if route == .touch, !touchPassthroughEnabled { route = .trackpad }
+            curve = CurvePinch(route: route, start: point, last: point, at: CACurrentMediaTime())
+        }
+        guard var pinch = curve else { return }
+        switch pinch.route {
+        case .touch:
+            switch phase {
+            case .began:
+                onTouchEvent?(.touchDown(
+                    id: CurvePinch.touchID, x: host.x, y: host.y,
+                    surfaceWidth: host.w, surfaceHeight: host.h))
+            case .moved:
+                onTouchEvent?(.touchMove(
+                    id: CurvePinch.touchID, x: host.x, y: host.y,
+                    surfaceWidth: host.w, surfaceHeight: host.h))
+            case .ended:
+                onTouchEvent?(.touchUp(id: CurvePinch.touchID))
+            }
+        case .pointer:
+            onTouchEvent?(.mouseMoveAbs(
+                x: host.x, y: host.y, surfaceWidth: host.w, surfaceHeight: host.h))
+            if phase != .moved { onTouchEvent?(.mouseButton(1, down: phase == .began)) }
+        case .trackpad:
+            pinch.carry.x += point.x - pinch.last.x
+            pinch.carry.y += point.y - pinch.last.y
+            pinch.last = point
+            let dx = pinch.carry.x.rounded(.towardZero), dy = pinch.carry.y.rounded(.towardZero)
+            if dx != 0 || dy != 0 {
+                onTouchEvent?(.mouseMove(dx: Int32(dx), dy: Int32(dy)))
+                pinch.carry.x -= dx
+                pinch.carry.y -= dy
+            }
+            if phase == .ended, pinch.isTap(at: point) {
+                onTouchEvent?(.mouseButton(1, down: true))
+                onTouchEvent?(.mouseButton(1, down: false))
+            }
+        case .off:
+            break
+        }
+        curve = phase == .ended ? nil : pinch
+    }
+}
+#endif
 
 #if os(iOS) || os(visionOS)
 // The soft keyboard's output → wire key events. UIKeyInput is deliberately minimal (no

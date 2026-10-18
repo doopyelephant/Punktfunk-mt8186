@@ -5,6 +5,7 @@ import CoreGraphics
 import Metal
 import Observation
 import RealityKit
+import UIKit
 
 /// The curved screen's picture. The Metal presenter draws each frame into this queue's next
 /// drawable in place of its layer's, and RealityKit shows the newest at the panel's rate. The
@@ -18,6 +19,11 @@ public final class CurveTarget: @unchecked Sendable {
     public private(set) var texture: TextureResource?
     /// Main actor: the picture's width over its height, once a frame has landed.
     public private(set) var aspect: Double?
+
+    /// Main actor: the session's stream view; a pinch on the curve goes there.
+    @ObservationIgnored public weak var pointer: (any CurvePointerSink)?
+    /// Main actor: the volume's window. Keyed, it keeps this session's keyboard and mouse.
+    @ObservationIgnored public weak var window: UIWindow?
 
     @ObservationIgnored private let lock = NSLock()
     @ObservationIgnored private var queue: TextureResource.DrawableQueue?
@@ -73,5 +79,17 @@ public final class CurveTarget: @unchecked Sendable {
         else { return nil }
         return try? TextureResource(image: image, options: .init(semantic: .color))
     }
+}
+
+/// What a pinch on the curved screen is doing.
+public enum CurvePointerPhase: Sendable {
+    case began, moved, ended
+}
+
+/// The session's stream view, taking the curve's pinches as its own.
+@MainActor
+public protocol CurvePointerSink: AnyObject {
+    /// A pinch at picture coordinates `u`, `v`: 0…1 from the top left.
+    func curvePointer(u: Double, v: Double, phase: CurvePointerPhase)
 }
 #endif

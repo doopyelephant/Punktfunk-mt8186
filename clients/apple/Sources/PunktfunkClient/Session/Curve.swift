@@ -70,8 +70,10 @@ struct CurveScene: View {
     @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
-        if let id, let session = CurveStage.shared.session(id), let target = session.target {
-            CurveScreen(target: target)
+        if let id, let session = CurveStage.shared.session(id), let target = session.target,
+           let model = session.model {
+            CurveScreen(
+                target: target, model: model, ring: session.ring, connection: session.connection)
                 .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
                     StreamOrnament(
                         connection: session.connection,
@@ -84,40 +86,187 @@ struct CurveScene: View {
     }
 }
 
-/// The picture on a cylinder segment as wide as the volume, bowed away from the viewer.
+/// What the window draws over the picture, re-homed on the curve as attachments.
+fileprivate enum CurveOverlay: String, CaseIterable {
+    case hud, badges, ring, resize
+}
+
+/// The picture on a cylinder segment as wide as the volume, bowed away from the viewer. A pinch
+/// on it reaches the host through the session's stream view, a two-hand twist turns the ring,
+/// and the window's overlays float just in front of it.
 private struct CurveScreen: View {
     let target: CurveTarget
+    @ObservedObject var model: SessionModel
+    @ObservedObject var ring: RingState
+    let connection: PunktfunkConnection
+    @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
+    @AppStorage(DefaultsKey.statsScalePct) private var statsScalePct = 100
     @Environment(\.physicalMetrics) private var metrics
-    /// The shape the screen's mesh was last built for.
-    @State private var built = Built()
+    /// The shape the screen's mesh was last built for, and the pinch in progress.
+    @State private var state = CurveState()
+    /// Each overlay's laid-out size in points, for placing it on the curve.
+    @State private var sizes: [CurveOverlay: CGSize] = [:]
 
-    final class Built {
+    final class CurveState {
         var shape: CurveShape?
+        var pinching = false
     }
+
+    /// The ring's frame on the curve: its scrim and the wheel inside it.
+    private static let ringSide: CGFloat = 720
+    /// The window picture width, in points, whose overlay proportions the curve keeps.
+    private static let referenceWidth: CGFloat = 1280
+    /// The twist that commits the ring, as on a touchscreen.
+    private static let commitDegrees: Double = 30
 
     var body: some View {
         GeometryReader3D { proxy in
             let box = metrics.convert(proxy.size, to: .meters)
             let texture = target.texture, aspect = target.aspect
-            RealityView { content in
-                content.add(ModelEntity())
-            } update: { content in
-                guard let screen = content.entities.first as? ModelEntity,
-                      let texture, let aspect
+            let placement = HUDPlacement(rawValue: hudPlacement) ?? .topTrailing
+            let extents = sizes.mapValues { metrics.convert($0, to: .meters) }
+            let pointWidth = Float(metrics.convert(Self.referenceWidth, to: .meters))
+            RealityView { content, attachments in
+                let screen = ModelEntity()
+                screen.components.set(InputTargetComponent())
+                content.add(screen)
+                for overlay in CurveOverlay.allCases {
+                    if let entity = attachments.entity(for: overlay) { screen.addChild(entity) }
+                }
+            } update: { content, attachments in
+                guard let screen = content.entities.first as? ModelEntity, let texture, let aspect
                 else { return }
                 let shape = CurveShape(
                     box: SIMD3(Float(box.width), Float(box.height), Float(box.depth)),
                     aspect: Float(aspect))
-                guard shape != built.shape, let mesh = try? shape.mesh() else { return }
-                var material = UnlitMaterial(applyPostProcessToneMap: false)
-                material.color = .init(tint: .white, texture: .init(texture))
-                screen.model = ModelComponent(mesh: mesh, materials: [material])
-                screen.position = [0, 0, shape.front]
-                built.shape = shape
+                if shape != state.shape, let mesh = try? shape.mesh() {
+                    var material = UnlitMaterial(applyPostProcessToneMap: false)
+                    material.color = .init(tint: .white, texture: .init(texture))
+                    screen.model = ModelComponent(mesh: mesh, materials: [material])
+                    screen.position = [0, 0, shape.front]
+                    state.shape = shape
+                    Task { @MainActor in
+                        guard let collision = try? await ShapeResource.generateStaticMesh(from: mesh),
+                              state.shape == shape
+                        else { return }
+                        screen.components.set(CollisionComponent(shapes: [collision]))
+                    }
+                }
+                // The overlays keep the size they have over a window picture this wide.
+                let scale = 2 * shape.halfChord / pointWidth
+                for overlay in CurveOverlay.allCases {
+                    guard let entity = attachments.entity(for: overlay) else { continue }
+                    let size = extents[overlay] ?? .zero
+                    entity.scale = SIMD3(repeating: scale)
+                    entity.position = shape.position(
+                        of: overlay, size: SIMD2(Float(size.width), Float(size.height)) * scale,
+                        placement: placement)
+                }
+            } attachments: {
+                Attachment(id: CurveOverlay.hud) {
+                    if model.phase == .streaming, model.statsVerbosity != .off {
+                        StreamHUDView(
+                            model: model, connection: connection, placement: placement,
+                            verbosity: model.statsVerbosity,
+                            scale: Double(min(max(statsScalePct, 75), 200)) / 100)
+                            .measured { sizes[.hud] = $0 }
+                    }
+                }
+                Attachment(id: CurveOverlay.badges) {
+                    StreamBadgeStack(
+                        model: model, captureEnabled: true, statsVerbosity: model.statsVerbosity)
+                        .measured { sizes[.badges] = $0 }
+                }
+                Attachment(id: CurveOverlay.ring) {
+                    if ring.visible {
+                        RingOverlay(
+                            state: ring,
+                            cfg: OverlayConfig.parse(model.settings.overlayActions),
+                            actions: model.ringActions(connection, ring: ring))
+                            .frame(width: Self.ringSide, height: Self.ringSide)
+                    }
+                }
+                Attachment(id: CurveOverlay.resize) {
+                    if model.resizing {
+                        ResizeIndicatorView(active: true)
+                            .measured { sizes[.resize] = $0 }
+                    }
+                }
             }
+            .environment(\.inAttachment, true)
+            .gesture(pinch)
+            .simultaneousGesture(twist)
         }
+        .background(WindowProbe { target.window = $0 })
         .volumeBaseplateVisibility(.hidden)
         .supportedVolumeViewpoints(.front)
+    }
+
+    /// One pinch, held or tapped, on the screen: the session's touch model takes it from there.
+    private var pinch: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .targetedToAnyEntity()
+            .onChanged { value in
+                send(value, phase: state.pinching ? .moved : .began)
+                state.pinching = true
+            }
+            .onEnded { value in
+                send(value, phase: .ended)
+                state.pinching = false
+            }
+    }
+
+    private func send(_ value: EntityTargetValue<DragGesture.Value>, phase: CurvePointerPhase) {
+        guard let shape = state.shape, value.entity.components.has(ModelComponent.self) else { return }
+        let local = value.convert(value.location3D, from: .local, to: value.entity)
+        let uv = shape.uv(at: local)
+        target.pointer?.curvePointer(u: Double(uv.x), v: Double(uv.y), phase: phase)
+    }
+
+    /// Two hands turning the screen: the ring's dial, opened at its own frame's centre.
+    private var twist: some Gesture {
+        RotateGesture3D(constrainedToAxis: .z)
+            .targetedToAnyEntity()
+            .onChanged { value in
+                let degrees = value.rotation.angle.degrees
+                ring.handle(.turn(
+                    progress: min(abs(degrees) / Self.commitDegrees, 1),
+                    clockwise: degrees < 0,
+                    at: CGPoint(x: Self.ringSide / 2, y: Self.ringSide / 2)))
+            }
+            .onEnded { value in
+                let committed = abs(value.rotation.angle.degrees) >= Self.commitDegrees
+                ring.handle(committed ? .commit : .cancel)
+            }
+    }
+}
+
+private extension View {
+    /// Report this view's laid-out size.
+    func measured(_ report: @escaping (CGSize) -> Void) -> some View {
+        onGeometryChange(for: CGSize.self, of: { $0.size }, action: report)
+    }
+}
+
+/// Hands back the UIWindow the volume's content lands in.
+private struct WindowProbe: UIViewRepresentable {
+    let found: (UIWindow?) -> Void
+
+    func makeUIView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.found = found
+        return view
+    }
+
+    func updateUIView(_ view: ProbeView, context: Context) {}
+
+    final class ProbeView: UIView {
+        var found: ((UIWindow?) -> Void)?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            found?(window)
+        }
     }
 }
 
@@ -151,6 +300,43 @@ struct CurveShape: Equatable {
         halfAngle = shape.halfAngle
         height = shape.length / aspect
         front = box.z / 2 - Self.margin
+    }
+
+    var halfChord: Float { radius * sin(halfAngle) }
+
+    /// The surface's z at `x` in the screen's own space: 0 at the edges, minus the sag at the
+    /// centre.
+    func surfaceZ(atX x: Float) -> Float {
+        radius * cos(halfAngle) - sqrt(max(radius * radius - x * x, 0))
+    }
+
+    /// Picture coordinates, 0…1 from the top left, of a point on the screen in its own space.
+    func uv(at point: SIMD3<Float>) -> SIMD2<Float> {
+        let angle = atan2(point.x, radius * cos(halfAngle) - point.z)
+        let u = (angle / halfAngle + 1) / 2
+        let v = 0.5 - point.y / height
+        return [min(max(u, 0), 1), min(max(v, 0), 1)]
+    }
+
+    /// Where an overlay `size` metres across floats: the HUD in its corner, the rest on the
+    /// centre line, each 2 cm in front of the surface at its outer edge.
+    fileprivate func position(
+        of overlay: CurveOverlay, size: SIMD2<Float>, placement: HUDPlacement
+    ) -> SIMD3<Float> {
+        let inset: Float = 0.02, lift: Float = 0.02
+        var x: Float = 0, y: Float = 0
+        switch overlay {
+        case .hud:
+            let trailing = placement == .topTrailing || placement == .bottomTrailing
+            let top = placement == .topLeading || placement == .topTrailing
+            x = (trailing ? 1 : -1) * max(halfChord - size.x / 2 - inset, 0)
+            y = (top ? 1 : -1) * max(height / 2 - size.y / 2 - inset, 0)
+        case .badges:
+            y = -max(height / 2 - size.y / 2 - inset, 0)
+        case .ring, .resize:
+            break
+        }
+        return [x, y, surfaceZ(atX: min(abs(x) + size.x / 2, halfChord)) + lift]
     }
 
     private static func arc(chord: Float, sag: Float) -> (radius: Float, halfAngle: Float, length: Float) {
