@@ -397,5 +397,10 @@ pyrowave = ["pf-encode/pyrowave"]
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+# x86 hosts seal every packet with aws-lc-rs's VAES kernels: 236 ns a packet against 500 on a
+# Zen 4. wasm and armv7 keep RustCrypto; the wire is the same.
+[target.'cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))'.dependencies]
+punktfunk-core = { path = "../../core/punktfunk-core", features = ["aes-aws-lc-rs"] }
+
 [lints]
 workspace = true
