@@ -485,8 +485,11 @@ owner's session; the door runs no hooks. The two sets are disjoint, so nothing c
 around. A knock while the owner's session is stopped fires no hook.
 
 `display-settings.json` and `hooks.json` are the owner's host's alone: `door-helper` copies
-neither, the supervisor copies the display policy with the library (`library/`), the door
-reads it there for its second-device rule, and each seat's trust copy takes it from there.
+neither, the owner's host writes the per-device overlays too, the supervisor copies the policy
+with the library (`library/`), the door reads it there for its second-device rule, and each
+seat's trust copy takes it from there. Overlays and hooks the door's own directory still holds
+go to the owner's host once it answers, under what it already has, and are set aside as
+`*.handed-over`.
 `host.restart` on the door restarts the owner's host, then the door itself; both stop and
 their units start them over.
 

@@ -357,6 +357,8 @@ pub fn serve(
         if pf_paths::seat::role().is_door() {
             crate::seats::events::fan_in();
             tokio::spawn(crate::seats::events::relay_to_owner());
+            #[cfg(target_os = "linux")]
+            crate::door::hand_over_leftovers();
         } else {
             tokio::spawn(crate::hooks::runner());
         }
