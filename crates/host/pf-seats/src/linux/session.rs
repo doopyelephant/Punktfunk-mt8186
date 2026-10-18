@@ -91,7 +91,13 @@ pub(super) fn mint_token() -> String {
 /// The owner's row keeps the owner's own config directory, library, host name and GameStream
 /// setting: it is the owner's host, behind the door. `PUNKTFUNK_SEAT_OWNER` tells the runner and
 /// the host so. Every other seat plays the box's library, from its trust copy.
-pub(super) fn render_env(seat: &Seat, home: &Path, state: &Path, token: &str) -> String {
+pub(super) fn render_env(
+    seat: &Seat,
+    home: &Path,
+    state: &Path,
+    token: &str,
+    browser: &Browser,
+) -> String {
     let trust = shared::trust_dir(state, &seat.id)
         .to_string_lossy()
         .into_owned();
@@ -127,6 +133,19 @@ pub(super) fn render_env(seat: &Seat, home: &Path, state: &Path, token: &str) ->
         rows.push(("PUNKTFUNK_GAMESTREAM", "0".to_owned()));
     }
     rows.push(("PUNKTFUNK_MDNS", "0".to_owned()));
+    // Off unless the box streams to browsers: an owner whose own setting has it on would
+    // otherwise bind the door's port.
+    let port = seat.browser_port().filter(|_| browser.on);
+    rows.push((
+        "PUNKTFUNK_WEBTRANSPORT",
+        if port.is_some() { "1" } else { "0" }.to_owned(),
+    ));
+    if let Some(port) = port {
+        rows.push(("PUNKTFUNK_WEBTRANSPORT_PORT", port.to_string()));
+        if !browser.origins.is_empty() {
+            rows.push(("PUNKTFUNK_WEBTRANSPORT_ORIGINS", browser.origins.join(",")));
+        }
+    }
     let mut out: String = rows.iter().map(|(key, value)| quoted(key, value)).collect();
     out.push_str(&token_line(token));
     out
@@ -201,6 +220,36 @@ pub(super) fn write_if_changed(path: &Path, contents: &str, mode: u32) -> std::i
     Ok(true)
 }
 
+/// The box's browser streaming as its Seat defaults hand it on (`pf_host_config::seat_defaults`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Browser {
+    pub on: bool,
+    pub origins: Vec<String>,
+}
+
+/// [`Browser`] from the box's Seat defaults in `box_dir`. Off when the box wrote none, or one
+/// that can't be read: a browser plane is a port nobody asked to open.
+pub(super) fn browser(box_dir: &Path) -> Browser {
+    let read = || -> std::io::Result<Option<Browser>> {
+        let path = box_dir.join("seat-defaults.json");
+        let Some((bytes, _)) = super::safe_open::read(&path, super::shared::MAX_TRUST_BYTES)?
+        else {
+            return Ok(None);
+        };
+        let v: serde_json::Value = serde_json::from_slice(&bytes)?;
+        Ok(Some(Browser {
+            on: v["browser"].as_bool().unwrap_or(false),
+            origins: v["browser_origins"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o.as_str().map(str::to_string))
+                .collect(),
+        }))
+    };
+    read().ok().flatten().unwrap_or_default()
+}
+
 /// Writes the environment file for `seat`. It holds a secret: root reads it before the unit drops
 /// privileges, nobody else. The owner's user unit reads it too, so it is the owner's, `0600`.
 pub(super) fn write_env(
@@ -209,10 +258,11 @@ pub(super) fn write_env(
     state: &Path,
     token: &str,
     owner: Option<(u32, u32)>,
+    browser: &Browser,
 ) -> Result<(), BackendError> {
     let io = |what: &str, error: std::io::Error| err("session_files", format!("{what}: {error}"));
     let path = env_path(&seat.account);
-    write_if_changed(&path, &render_env(seat, home, state, token), 0o600)
+    write_if_changed(&path, &render_env(seat, home, state, token, browser), 0o600)
         .map_err(|e| io("write the seat environment file", e))?;
     if let Some((uid, gid)) = owner {
         std::os::unix::fs::chown(&path, Some(uid), Some(gid))
@@ -231,9 +281,10 @@ pub(super) fn write_unit_files(
     token: &str,
     owner: Option<(u32, u32)>,
     shares: Option<&libraries::Shares>,
+    browser: &Browser,
 ) -> Result<(), BackendError> {
     let io = |what: &str, error: std::io::Error| err("session_files", format!("{what}: {error}"));
-    write_env(seat, home, state, token, owner)?;
+    write_env(seat, home, state, token, owner, browser)?;
     let (name, contents) = if seat.owner {
         ("class.conf", render_class().to_owned())
     } else {
@@ -431,6 +482,7 @@ mod tests {
             Path::new("/home/enrico"),
             Path::new("/var/lib/punktfunk-seats"),
             "ab12",
+            &Browser::default(),
         );
         assert_eq!(
             text,
@@ -442,6 +494,7 @@ mod tests {
              PUNKTFUNK_NATIVE_PORT=\"9779\"\n\
              PUNKTFUNK_MGMT_BIND=\"127.0.0.1:47995\"\n\
              PUNKTFUNK_MDNS=\"0\"\n\
+             PUNKTFUNK_WEBTRANSPORT=\"0\"\n\
              PUNKTFUNK_MGMT_TOKEN=ab12\n"
         );
         assert!(!text.contains("CONFIG_DIR"));
@@ -457,6 +510,7 @@ mod tests {
             Path::new("/var/lib/punktfunk-seats/seats/0123456789abcdef0123456789abcdef/home"),
             Path::new("/var/lib/punktfunk-seats"),
             "ab12",
+            &Browser::default(),
         );
         assert_eq!(
             text,
@@ -471,7 +525,66 @@ mod tests {
              PUNKTFUNK_HOST_NAME=\"Mara\"\n\
              PUNKTFUNK_GAMESTREAM=\"0\"\n\
              PUNKTFUNK_MDNS=\"0\"\n\
+             PUNKTFUNK_WEBTRANSPORT=\"0\"\n\
              PUNKTFUNK_MGMT_TOKEN=ab12\n"
+        );
+    }
+
+    /// With the box streaming to browsers each seat runs its own plane on its own port, under the
+    /// box's origins.
+    #[test]
+    fn a_seat_streams_to_browsers_on_its_own_port_when_the_box_does() {
+        let browser = Browser {
+            on: true,
+            origins: vec!["https://box:47992".into(), "https://web.example".into()],
+        };
+        let text = render_env(
+            &seat("Mara"),
+            Path::new("/h"),
+            Path::new("/b"),
+            "ab12",
+            &browser,
+        );
+        assert!(text.contains("PUNKTFUNK_WEBTRANSPORT=\"1\"\n"));
+        assert!(text.contains("PUNKTFUNK_WEBTRANSPORT_PORT=\"9783\"\n"));
+        assert!(text.contains(
+            "PUNKTFUNK_WEBTRANSPORT_ORIGINS=\"https://box:47992,https://web.example\"\n"
+        ));
+        let off = render_env(
+            &seat("Mara"),
+            Path::new("/h"),
+            Path::new("/b"),
+            "ab12",
+            &Browser::default(),
+        );
+        assert!(off.contains("PUNKTFUNK_WEBTRANSPORT=\"0\"\n"));
+        assert!(!off.contains("PUNKTFUNK_WEBTRANSPORT_PORT"));
+    }
+
+    /// The box's Seat defaults name its browser plane; a box that wrote none streams to none.
+    #[test]
+    fn the_box_s_browser_plane_reads_from_its_seat_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(browser(dir.path()), Browser::default());
+        let defaults = pf_host_config::seat_defaults::SeatDefaults {
+            end_on_game_exit: true,
+            max_mode: None,
+            library_writable: true,
+            dualsense_usbip: false,
+            browser: true,
+            browser_origins: vec!["https://box:47992".into()],
+        };
+        std::fs::write(
+            dir.path().join(pf_host_config::seat_defaults::FILE),
+            defaults.to_json().to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            browser(dir.path()),
+            Browser {
+                on: true,
+                origins: vec!["https://box:47992".into()],
+            }
         );
     }
 
@@ -484,13 +597,14 @@ mod tests {
             Path::new("/h"),
             Path::new("/b"),
             "ab12",
+            &Browser::default(),
         );
         let line = text
             .lines()
             .find(|l| l.starts_with("PUNKTFUNK_HOST_NAME="))
             .unwrap();
         assert_eq!(line, r#"PUNKTFUNK_HOST_NAME="A \"B\" \\ $HOME 100%""#);
-        assert_eq!(text.lines().count(), 12);
+        assert_eq!(text.lines().count(), 13);
     }
 
     /// The token line is the exact form the box's client parses, and every mint differs.

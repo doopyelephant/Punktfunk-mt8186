@@ -887,6 +887,8 @@ mod tests {
                 max_mode: None,
                 library_writable,
                 dualsense_usbip: false,
+                browser: false,
+                browser_origins: Vec::new(),
             };
             std::fs::write(&path, defaults.to_json().to_string()).unwrap();
             assert_eq!(writable(temp.path()), library_writable);

@@ -519,7 +519,7 @@ let
       name = "seats open the seat ports with the host's";
       ok = lib.elem {
         from = 9779;
-        to = 9782;
+        to = 9786;
       } seats.networking.firewall.allowedUDPPortRanges;
     }
     {

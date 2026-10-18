@@ -36,6 +36,8 @@ pub(crate) struct Asker<'a> {
     pub follows_redirects: bool,
     /// Its overlay on the box joins a live session instead of refusing.
     pub joins: bool,
+    /// A browser: it lands on the seat's browser plane, not its native port.
+    pub browser: bool,
 }
 
 /// Where `profile` plays for `asker`. Blocking (the supervisor's pipe and the seat's loopback
@@ -71,6 +73,10 @@ pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Place
         &occupants,
         held_by,
     );
+    let placed = match (placed, snap.seat(seat_id)) {
+        (Placement::Redirect(to), Some((seat, _))) if asker.browser => with_browser_plane(to, seat),
+        (placed, _) => placed,
+    };
     if matches!(placed, Placement::Redirect(_)) {
         PLACED
             .lock()
@@ -84,6 +90,29 @@ pub(crate) fn place(profile: &crate::profiles::Resolved, asker: &Asker) -> Place
         }
     }
     placed
+}
+
+/// `to` with the certificate hash `seat`'s browser plane serves under, which the browser pins
+/// and binds its credential to. A seat whose plane doesn't answer on the port the redirect names,
+/// as one started before the box streamed to browsers, is unavailable.
+fn with_browser_plane(mut to: Redirect, seat: &Seat) -> Placement {
+    let call = crate::mgmt::owner::Forwarded::get("webtransport".into());
+    let plane = match super::forward(seat, call) {
+        Some(crate::mgmt::owner::Answer::Reply(200, _, body)) => {
+            serde_json::from_slice::<serde_json::Value>(&body).ok()
+        }
+        _ => None,
+    };
+    let hash = plane
+        .filter(|p| p["port"].as_u64() == Some(u64::from(to.port)))
+        .and_then(|p| p["cert_hash_sha256"].as_str().map(str::to_ascii_lowercase));
+    match hash {
+        Some(hash) => {
+            to.cert_hash = hash;
+            Placement::Redirect(to)
+        }
+        None => Placement::Refuse(RejectReason::SeatUnavailable),
+    }
 }
 
 /// Seat id → when a device was last redirected to it.
@@ -155,14 +184,23 @@ fn decide(
     if (other.is_some() || held_by_other) && !asker.joins {
         return Placement::Refuse(RejectReason::SeatOccupied);
     }
+    let port = if asker.browser {
+        match seat.browser_port() {
+            Some(port) => port,
+            None => return Placement::Refuse(RejectReason::SeatUnavailable),
+        }
+    } else {
+        seat.native_port
+    };
     Placement::Redirect(Redirect {
         addr: String::new(),
-        port: seat.native_port,
+        port,
         profile: profile_id.to_string(),
         seat_no,
         seat_name: seat.name.clone(),
         occupant: other.and_then(|o| o.name.clone()).unwrap_or_default(),
         pin,
+        cert_hash: String::new(),
     })
 }
 
@@ -264,7 +302,29 @@ mod tests {
             fp: Some(ME),
             follows_redirects: follows,
             joins,
+            browser: false,
         }
+    }
+
+    /// A browser lands on its seat's browser plane; a seat with no browser port has none to
+    /// send it to.
+    #[test]
+    fn a_browser_goes_to_its_seat_s_browser_plane() {
+        let browser = Asker {
+            browser: true,
+            ..asker(true, false)
+        };
+        let mut s = seat(RuntimeState::Running);
+        s.native_port = 9780;
+        let Placement::Redirect(r) = decide("kid", &browser, true, on(&s), &[], None) else {
+            panic!("a running seat is redirected to");
+        };
+        assert_eq!((r.port, r.pin.as_str()), (9784, PIN));
+        s.native_port = 9778;
+        assert_eq!(
+            decide("kid", &browser, true, on(&s), &[], None),
+            Placement::Refuse(RejectReason::SeatUnavailable)
+        );
     }
 
     fn on(seat: &Seat) -> Option<(&Seat, u8)> {

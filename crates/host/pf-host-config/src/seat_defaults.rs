@@ -24,6 +24,10 @@ pub struct SeatDefaults {
     pub library_writable: bool,
     /// A seat's DualSense is a USB/IP device with a real sound card, as the box's is.
     pub dualsense_usbip: bool,
+    /// The box streams to browsers, so each seat runs a browser plane of its own.
+    pub browser: bool,
+    /// The browser origins the box admits, which each seat's plane admits too.
+    pub browser_origins: Vec<String>,
 }
 
 impl SeatDefaults {
@@ -33,6 +37,8 @@ impl SeatDefaults {
             max_mode: config.seat_max_mode.clone(),
             library_writable: config.seat_library_writable,
             dualsense_usbip: config.dualsense_usbip,
+            browser: config.webtransport,
+            browser_origins: config.webtransport_origins.clone(),
         }
     }
 
@@ -42,6 +48,8 @@ impl SeatDefaults {
             "max_mode": self.max_mode,
             "library_writable": self.library_writable,
             "dualsense_usbip": self.dualsense_usbip,
+            "browser": self.browser,
+            "browser_origins": self.browser_origins,
         })
     }
 
@@ -56,6 +64,13 @@ impl SeatDefaults {
                 .map(str::to_string),
             library_writable: v["library_writable"].as_bool().unwrap_or(true),
             dualsense_usbip: v["dualsense_usbip"].as_bool().unwrap_or(false),
+            browser: v["browser"].as_bool().unwrap_or(false),
+            browser_origins: v["browser_origins"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o.as_str().map(str::to_string))
+                .collect(),
         }
     }
 }
@@ -109,6 +124,8 @@ mod tests {
             max_mode: Some("2560x1440@120".into()),
             library_writable: false,
             dualsense_usbip: true,
+            browser: true,
+            browser_origins: vec!["https://box:47992".into()],
         };
         assert_eq!(SeatDefaults::from_json(&d.to_json()), d);
         assert_eq!(
@@ -118,6 +135,8 @@ mod tests {
                 max_mode: None,
                 library_writable: true,
                 dualsense_usbip: false,
+                browser: false,
+                browser_origins: Vec::new(),
             }
         );
     }

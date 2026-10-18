@@ -1763,6 +1763,7 @@ async fn place_profile(
     let follows = first
         .features
         .has(punktfunk_core::quic::v2::registry::FEATURE_PROFILES);
+    let browser = conn.is_web();
     let who = resolved.clone();
     let placed = tokio::task::spawn_blocking(move || {
         let joins = crate::vdisplay::policy::prefs()
@@ -1774,6 +1775,7 @@ async fn place_profile(
             fp: fp.as_deref(),
             follows_redirects: follows,
             joins,
+            browser,
         };
         place(&who, &asker)
     })

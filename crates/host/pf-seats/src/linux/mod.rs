@@ -427,7 +427,8 @@ impl LinuxBackend {
             shared::token_owner(door.as_ref()),
         )?;
         let owner = Some((passwd.uid, passwd.gid));
-        session::write_unit_files(seat, &passwd.home, state, token, owner, None)
+        let browser = session::browser(&self.inner.box_dir);
+        session::write_unit_files(seat, &passwd.home, state, token, owner, None, &browser)
     }
 
     /// Writes the owner's files again at supervisor start: `/run` is empty after a boot, and the
@@ -700,7 +701,16 @@ impl PlatformBackend for LinuxBackend {
             let shares = libraries::share(box_dir, state, &seat.id, &passwd, root);
             let shown = shares.as_ref().map_or(&[][..], |s| s.libraries.as_slice());
             libraries::register(state, &seat.id, &passwd, shown);
-            session::write_unit_files(seat, &passwd.home, state, &token, None, shares.as_ref())?;
+            let browser = session::browser(box_dir);
+            session::write_unit_files(
+                seat,
+                &passwd.home,
+                state,
+                &token,
+                None,
+                shares.as_ref(),
+                &browser,
+            )?;
             self.stopped_since(asked)?;
             let _ = run("systemctl_failed", "systemctl", &["reset-failed", &unit]);
             run("systemctl_failed", "systemctl", &["start", &unit])?;
