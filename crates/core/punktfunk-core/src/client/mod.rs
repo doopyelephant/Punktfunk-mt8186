@@ -1531,6 +1531,16 @@ impl NativeClient {
         }
     }
 
+    /// Screen `screen`'s decoder cannot go on, or is new: its frames wait for a keyframe, which
+    /// the pump asks the host for, and that frame names its format.
+    pub fn request_screen_keyframe(&self, screen: u8) {
+        if screen > 0 {
+            self.shared
+                .screens
+                .want_key(crate::packet::screen_stream(screen));
+        }
+    }
+
     /// Show these screens from now on, screen 0 first: the host adds, drops and resizes the
     /// others and answers with a new [`Self::screen_layout`]. Screen 0's size still moves by
     /// [`Self::request_mode`]. A host or dial without screens ignores it.

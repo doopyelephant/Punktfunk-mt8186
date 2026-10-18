@@ -12,6 +12,28 @@ impl Shell {
         stream: &mut Option<StreamState>,
         event: Event,
     ) -> Result<ControlFlow<Outcome>> {
+        // A further screen's window keeps its window events and pointer moves; keys, buttons
+        // and focus are the session's wherever they land.
+        let screen = event
+            .get_window_id()
+            .and_then(|id| stream.as_ref()?.screens.screen_of(id));
+        if let Some(screen) = screen {
+            match event {
+                Event::Window { win_event, .. }
+                    if !matches!(win_event, WindowEvent::FocusLost | WindowEvent::FocusGained) =>
+                {
+                    if let Some(st) = stream.as_mut() {
+                        st.screens.on_window_event(screen, win_event);
+                    }
+                    return Ok(ControlFlow::Continue(()));
+                }
+                Event::MouseMotion { x, y, .. } => {
+                    self.on_screen_motion(stream, screen, x, y);
+                    return Ok(ControlFlow::Continue(()));
+                }
+                _ => {}
+            }
+        }
         // Console UI sees input first: a consumed event never reaches capture/forwarding.
         if let Some(o) = self.overlay.as_mut() {
             if o.handle_event(&event) {
@@ -20,7 +42,11 @@ impl Shell {
             }
             // Mouse/touch: console hit-tests in its own pixel space. Consumed while
             // the console is up; ignored while streaming (those belong to `Capture`).
-            if let Some(input) = overlay_pointer(&event, &self.window) {
+            let input = screen
+                .is_none()
+                .then(|| overlay_pointer(&event, &self.window))
+                .flatten();
+            if let Some(input) = input {
                 if o.handle_pointer(input) {
                     self.scroll_routing.consumed(&event);
                     return Ok(ControlFlow::Continue(()));
@@ -48,6 +74,15 @@ impl Shell {
                 }
                 if let Some(st) = stream.as_mut() {
                     st.relearn_grid(&self.window);
+                }
+            }
+            // A monitor came, went or moved: the screens follow the client's monitors.
+            Event::Display {
+                display_event: DisplayEvent::Added | DisplayEvent::Removed | DisplayEvent::Moved,
+                ..
+            } if self.opts.all_screens => {
+                if let Some(st) = stream.as_mut() {
+                    self.replan_screens(st);
                 }
             }
             // Windows never auto-repeats injected input, so a held key needs these.
@@ -517,11 +552,14 @@ impl Shell {
             let p = video_fit::place(self.opts.video_fit, self.window.size_in_pixels(), video);
             p.scale_x.min(p.scale_y) as f32 / cursor_surface_scale(&self.window)
         });
+        // Over a further screen's window the host's pointer is in the picture.
+        let over_screen = self.over_screen(st);
         if let (Some(chan), Some(c)) = (st.cursor_chan.as_mut(), st.connector.as_ref()) {
-            let desktop_active = st
-                .capture
-                .as_ref()
-                .is_some_and(|cap| cap.captured() && cap.desktop());
+            let desktop_active = !over_screen
+                && st
+                    .capture
+                    .as_ref()
+                    .is_some_and(|cap| cap.captured() && cap.desktop());
             chan.pump(c, &self.mouse, desktop_active, cursor_scale);
         }
         let hint_state = st.cursor_chan.as_ref().and_then(|ch| ch.state());

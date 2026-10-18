@@ -83,8 +83,9 @@ pub struct Capture {
     /// Relative motion not yet on the wire, summed per loop iteration. Fractional: a slow
     /// touchpad moves less than a pixel per event, and the remainder carries to the next send.
     pending_rel: (f32, f32),
-    /// Desktop-model position not yet on the wire, latest-wins per loop iteration.
-    pending_abs: Option<Abs>,
+    /// Desktop-model position not yet on the wire and the screen it lands on, latest-wins per
+    /// loop iteration.
+    pending_abs: Option<(u8, Abs)>,
     /// See [`Self::last_abs`].
     last_abs: Option<(i32, i32)>,
     /// Never true unless `abs_ok`.
@@ -322,15 +323,16 @@ impl Capture {
                 0,
             );
         }
-        if let Some(a) = self.pending_abs.take() {
-            send(
-                &self.connector,
-                InputKind::MouseMoveAbs,
-                0,
-                a.x,
-                a.y,
-                Self::touch_flags(a.w, a.h),
-            );
+        if let Some((screen, a)) = self.pending_abs.take() {
+            let event = InputEvent {
+                kind: InputKind::MouseMoveAbs,
+                _pad: [0; 3],
+                code: 0,
+                x: a.x,
+                y: a.y,
+                flags: Self::touch_flags(a.w, a.h),
+            };
+            let _ = self.connector.send_input(&event.on_screen(screen));
         }
     }
 
@@ -344,9 +346,17 @@ impl Capture {
     /// Frame position under the video fit: the desktop model's motion, or a warped
     /// pointer under capture. Latest-wins: intermediates add nothing (deltas must sum).
     pub fn on_motion_abs(&mut self, abs: Abs) {
+        self.on_motion_abs_on(0, abs);
+    }
+
+    /// [`Self::on_motion_abs`] over screen `screen`'s picture. Only the first screen's moves
+    /// are [`Self::last_abs`]: the cursor follow is that screen's.
+    pub fn on_motion_abs_on(&mut self, screen: u8, abs: Abs) {
         if self.captured && self.abs_ok {
-            self.last_abs = Some((abs.x, abs.y));
-            self.pending_abs = Some(abs);
+            if screen == 0 {
+                self.last_abs = Some((abs.x, abs.y));
+            }
+            self.pending_abs = Some((screen, abs));
         }
     }
 

@@ -260,6 +260,16 @@ impl Screens {
         st.ask(now)
     }
 
+    /// The embedder's decoder for `stream` lost its picture, or is new: drop to the next
+    /// keyframe, ask for it, and name its format again.
+    pub(crate) fn want_key(&self, stream: u8) {
+        if let Some(lane) = self.lane(stream) {
+            let mut st = lane.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.awaiting_key = true;
+            st.live = None;
+        }
+    }
+
     /// Each pump turn: held frames whose wait ran out, and the asks still owed.
     pub(crate) fn tick(&self, now: Instant) -> Vec<Feedback> {
         let lanes: Vec<Arc<Lane>> = (self.lanes.lock().unwrap_or_else(|e| e.into_inner()))
@@ -378,6 +388,28 @@ mod tests {
             s.tick(now + ASK_EVERY * 3).is_empty(),
             "the keyframe ended the ask"
         );
+    }
+
+    /// A new decoder's ask drops to the next keyframe, and that frame names the format again.
+    #[test]
+    fn a_wanted_key_names_the_format_again() {
+        let s = on();
+        let now = Instant::now();
+        s.config(cfg(2, 0));
+        s.on_frame(frame(2, 0, 0, true), now);
+        assert_eq!(popped(&s, 2), [0]);
+        s.want_key(2);
+        assert_eq!(s.tick(now).len(), 1, "asks");
+        s.on_frame(frame(2, 0, 1, false), now);
+        s.on_frame(frame(2, 0, 2, true), now);
+        let lane = s.lane(2).unwrap();
+        let super::super::frame_channel::FramePop::Frame(key) =
+            lane.frames.pop(Duration::from_millis(1))
+        else {
+            panic!("the keyframe went on");
+        };
+        assert_eq!(key.frame_index, 2);
+        assert!(key.new_format.is_some());
     }
 
     /// Screens off: another stream's frames go nowhere.

@@ -91,6 +91,7 @@ impl StreamState {
             shown_mode: None,
             resize_overlay: ResizeIndicator::default(),
             last_video: None,
+            screens: Default::default(),
             params: retry_params,
         }
     }
@@ -100,6 +101,7 @@ impl StreamState {
     /// first, so the decoder's teardown gets it back instead of freeing it under a redraw.
     /// The pump notices `stop` within its 20 ms receive timeout.
     pub(super) fn shutdown(mut self, presenter: &mut Presenter) {
+        self.screens = Default::default();
         self.handle.stop.store(true, Ordering::SeqCst);
         presenter.drop_video();
         if let Some(t) = self.handle.thread.take() {
@@ -690,13 +692,17 @@ impl Shell {
                 self.opts.render_scale_max_dim,
             );
         }
-        StreamState::new(
+        let mut screens = screens::ScreenWindows::default();
+        params.screens = self.plan_screens(&mut screens, params.mode);
+        let mut st = StreamState::new(
             params,
             force_software,
             self.sdl_events.event_sender(),
             self.present_priority,
             self.native.refresh_hz,
-        )
+        );
+        st.screens = screens;
+        st
     }
 
     /// Hand back what a connected stream held: the pads, then the capture.
