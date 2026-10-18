@@ -70,6 +70,7 @@ export const SeatScope: FC<{ page: SeatPage; children: ReactNode }> = ({
 				ownerName={
 					profiles.data?.find((p) => p.owner)?.display_name ?? m.seat_box()
 				}
+				ownerId={profiles.data?.find((p) => p.owner)?.id}
 				door={door}
 				pick={store}
 			>

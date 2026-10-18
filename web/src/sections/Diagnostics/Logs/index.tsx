@@ -82,6 +82,15 @@ export const SectionLogs: FC = () => {
 	const [selected, setSelected] = useState<Set<string>>(
 		() => new Set([HOST_SOURCE, PLUGINS_SOURCE]),
 	);
+	// On a door the owner's host streams and runs the plugins: its log opens selected too.
+	const ownerId = profiles.data?.find((p) => p.owner)?.id;
+	const ownerSeat =
+		info.data?.door === true
+			? seats.find((s) => s.id === ownerId)?.id
+			: undefined;
+	useEffect(() => {
+		if (ownerSeat) setSelected((s) => new Set(s).add(seatSource(ownerSeat)));
+	}, [ownerSeat]);
 	const [shareMode, setShareMode] = useState<ShareMode | null>(null);
 	const [exporting, setExporting] = useState(false);
 
@@ -176,9 +185,9 @@ export const SectionLogs: FC = () => {
 					generatedAt: new Date(),
 					checks: diagnostics.data?.checks ?? [],
 					checksUnavailable: checksUnsupported,
-					// The full host buffer, not `rows` — the export is "everything", and what the
-					// viewer is filtered to has no bearing on that.
-					rows: fromHost,
+					// The full host buffer and each selected seat's, not `rows` — the export is
+					// "everything", and what the viewer is filtered to has no bearing on that.
+					rows: mergeRows([fromHost, fromSeats]),
 					bundles,
 				}),
 				diagnosticsFilename(new Date()),

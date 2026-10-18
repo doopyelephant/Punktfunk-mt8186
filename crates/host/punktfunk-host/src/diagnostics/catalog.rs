@@ -102,9 +102,16 @@ fn runner_stopped(id: &str, why: &str, start: &str) -> HostCheck {
 
 /// Plugins run in their own sandbox, or the runner stops: a box that cannot build one says so
 /// here rather than quietly running third-party code with the operator's whole account.
+/// The door runs no plugins, and its own unit refuses bwrap a fresh `/proc`: it never probes.
 #[cfg(target_os = "linux")]
 fn plugin_sandbox() -> HostCheck {
     let id = ids::PLUGIN_SANDBOX;
+    if pf_paths::seat::role().is_door() {
+        return HostCheck::inapplicable(
+            id,
+            "The door runs no plugins. The owner's host runs them.",
+        );
+    }
     let status = crate::plugins::runtime_status();
     if !status.installed {
         return HostCheck::inapplicable(id, "The plugin runner is not installed on this host.");

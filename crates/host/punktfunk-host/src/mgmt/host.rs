@@ -580,6 +580,20 @@ async fn door_unavailable(lane: AuthLane) -> Option<String> {
         .unwrap_or_default()
 }
 
+/// Whether the owner's host behind this door serves Moonlight, for the console's pairing card:
+/// the door never does, and the owner's row may. Never starts the owner's session.
+async fn owner_gamestream(st: &MgmtState, lane: AuthLane) -> bool {
+    if lane != AuthLane::Admin {
+        return false;
+    }
+    st.owner_call("GET", "host", None, false)
+        .await
+        .ok_body()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .and_then(|v| v.get("gamestream")?.as_bool())
+        .unwrap_or(false)
+}
+
 /// Drops the remembered blockers, so the next read asks again. A door switch request changes what
 /// they are: the operator fixes one, or the switch starts.
 pub(super) fn forget_door_probe() {
@@ -630,7 +644,7 @@ pub(crate) async fn get_host_info(
     })
     .await
     .unwrap_or_default();
-    let gs = st.gamestream_enabled;
+    let gs = st.gamestream_enabled || owner_gamestream(&st, lane).await;
     Json(HostInfo {
         hostname: h.hostname.clone(),
         uniqueid: h.uniqueid.clone(),
@@ -661,7 +675,7 @@ pub(crate) async fn get_host_info(
             .map(|(_, codec)| codec)
             .collect()
         },
-        gamestream: st.gamestream_enabled,
+        gamestream: gs,
         door: pf_paths::seat::role().is_door(),
         door_unavailable,
         fingerprint: st.identity_fingerprint.map(hex::encode),
@@ -678,6 +692,98 @@ pub(crate) async fn get_host_info(
             audio: gs.then_some(AUDIO_PORT),
         },
     })
+}
+
+/// `own` as this host answers, or on a door with every seat's sessions, games and downloads
+/// in it: the door streams nothing, so without them a client sees no game to resume and the
+/// console no session. `caller` is the device asking on the cert lane, which sees the others'
+/// rows without their identity, as on one host.
+async fn with_seats(st: &MgmtState, own: RuntimeStatus, caller: Option<String>) -> Response {
+    if st.door.is_none() {
+        return Json(own).into_response();
+    }
+    let snapshot = st.seats_snapshot().await;
+    let seats: Vec<&serde_json::Value> = snapshot
+        .seats
+        .iter()
+        .filter_map(|seat| snapshot.statuses.get(seat.id.as_str()))
+        .collect();
+    let Ok(own) = serde_json::to_value(own) else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "status did not serialize",
+        );
+    };
+    Json(merged_status(own, &seats, caller.as_deref())).into_response()
+}
+
+/// [`with_seats`] on the wire shapes: `seats` in ledger order, `caller` the device's fingerprint.
+fn merged_status(
+    mut own: serde_json::Value,
+    seats: &[&serde_json::Value],
+    caller: Option<&str>,
+) -> serde_json::Value {
+    use serde_json::Value;
+    let mine = |row: &Value| {
+        caller.is_none_or(|fp| {
+            row.get("client")
+                .and_then(Value::as_str)
+                .is_some_and(|c| !c.is_empty() && fp.starts_with(c))
+        })
+    };
+    for seat in seats {
+        for key in ["sessions", "games"] {
+            let rows = seat
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if rows.is_empty() {
+                continue;
+            }
+            // A list the door left out as empty is empty, not absent.
+            if !own[key].is_array() {
+                own[key] = Value::Array(Vec::new());
+            }
+            let Some(into) = own[key].as_array_mut() else {
+                continue;
+            };
+            for mut row in rows {
+                if !mine(&row) {
+                    if let Some(o) = row.as_object_mut() {
+                        o.insert("client".into(), Value::String(String::new()));
+                        o.remove("client_name");
+                        o.remove("profile");
+                    }
+                }
+                into.push(row);
+            }
+        }
+        if let Some(rows) = seat.get("downloads").and_then(Value::as_array) {
+            if !rows.is_empty() && !own["downloads"].is_array() {
+                own["downloads"] = Value::Array(Vec::new());
+            }
+            if let Some(into) = own["downloads"].as_array_mut() {
+                into.extend(rows.iter().cloned());
+            }
+        }
+        for flag in ["video_streaming", "audio_streaming"] {
+            if seat.get(flag).and_then(Value::as_bool) == Some(true) {
+                own[flag] = Value::Bool(true);
+            }
+        }
+        // One representative, as on one host: the door's own first, else the first seat's.
+        if own["session"].is_null() && !seat["session"].is_null() {
+            for key in ["session", "stream", "session_id"] {
+                if let Some(v) = seat.get(key) {
+                    own[key] = v.clone();
+                }
+            }
+        }
+    }
+    let count = own["sessions"].as_array().map_or(0, Vec::len);
+    own["active_sessions"] = Value::from(count as u64);
+    own
 }
 
 /// A compositor backend and whether it is usable now.
@@ -744,7 +850,7 @@ pub(crate) async fn get_status(
     State(st): State<Arc<MgmtState>>,
     Extension(lane): Extension<AuthLane>,
     device: Option<Extension<PairedDevice>>,
-) -> Json<RuntimeStatus> {
+) -> Response {
     let ender = super::session::GameEnder::of(&st, lane, device.as_ref().map(|d| d.0 .0.as_str()));
     let gs_launch = *st.app.launch.lock().unwrap_or_else(|e| e.into_inner());
     // Stream slot is GameStream-featured only; a native-only build has no compat-plane stream.
@@ -842,7 +948,7 @@ pub(crate) async fn get_status(
             last_resize_ms: (s.last_resize_ms > 0).then_some(s.last_resize_ms),
         })
     });
-    Json(RuntimeStatus {
+    let status = RuntimeStatus {
         video_streaming: gs_video || !native.is_empty(),
         audio_streaming: gs_audio || !native.is_empty(),
         pin_pending: gs_pin_pending(&st),
@@ -899,7 +1005,8 @@ pub(crate) async fn get_status(
                 .unwrap_or(0)
         }),
         audio: audio_wiring(),
-    })
+    };
+    with_seats(&st, status, caller.map(str::to_string)).await
 }
 
 /// Loopback tray summary

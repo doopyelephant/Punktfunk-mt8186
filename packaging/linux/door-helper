@@ -37,9 +37,10 @@ GROUP=punktfunk-update
 # The door user's primary group. Never `punktfunk`, which owns the usbip attach nodes and passes
 # pf-dm-helper: the door opens no device.
 DOOR_GROUP=punktfunk-door
-# What the box's host keeps: identity, id, pairings, profiles, display and hook settings, and the
-# console's password hash. `profiles/` holds the avatars.
-FILES="native-cert.pem native-key.pem uniqueid punktfunk1-paired.json profiles.json display-settings.json hooks.json web-password"
+# What the box's host keeps: identity, id, pairings, profiles and the console's password hash.
+# `profiles/` holds the avatars. The display policy and the hooks stay the owner's host's: the
+# door passes their every read and write there, and the seat supervisor copies the policy.
+FILES="native-cert.pem native-key.pem uniqueid punktfunk1-paired.json profiles.json web-password"
 
 die() {
     echo "door-helper: $*" >&2

@@ -54,6 +54,9 @@ fn every_route_is_classified_for_the_plugin_and_cert_lanes() {
         // the cert lane — no streaming client asks what colour the desktop is.
         ("GET", "/api/v1/host/theme", true, false),
         ("GET", "/api/v1/events", true, false),
+        // The door's hand-off of its own events to the owner's host: the door holds that host's
+        // admin token, and nothing else has a reason to put an event on another host's bus.
+        ("POST", "/api/v1/events/relay", false, false),
         // Unredacted host tracing (webhook URLs, hook command lines). Plugin access would void `/hooks`.
         ("GET", "/api/v1/logs", false, false),
         // Diagnostics name the host user, groups, and device nodes. Both lanes denied.
@@ -507,4 +510,251 @@ fn openapi_document_is_complete_and_checked_in() {
         "api/openapi.json is stale — regenerate with: \
          cargo run -p punktfunk-host -- openapi > api/openapi.json"
     );
+}
+
+/// Every live route has a side on a door: the door's own, or the owner's host's. A new route
+/// is the owner's host's until a row here says otherwise, and the table in `mgmt::owner`
+/// names nothing the document doesn't have.
+#[test]
+fn every_route_has_a_side_on_the_door() {
+    use crate::mgmt::owner::{classify, template_matches, Verdict, DOOR};
+    use axum::http::Method;
+
+    // (method, path, door): `door` is what the door answers itself.
+    const EXPECTED: &[(&str, &str, bool)] = &[
+        // Open routes, and what the door merges with the owner's host's answer.
+        ("GET", "/api/v1/health", true),
+        ("GET", "/api/v1/webtransport", true),
+        ("POST", "/api/v1/auth/device/challenge", true),
+        ("POST", "/api/v1/auth/device/token", true),
+        ("GET", "/api/v1/local/summary", true),
+        ("GET", "/api/v1/host", true),
+        ("GET", "/api/v1/host/settings", true),
+        ("PATCH", "/api/v1/host/settings", true),
+        ("GET", "/api/v1/status", true),
+        ("GET", "/api/v1/diagnostics", true),
+        ("POST", "/api/v1/diagnostics/refresh", true),
+        // What streams, encodes and runs plugins: the owner's host's.
+        ("GET", "/api/v1/compositors", false),
+        ("GET", "/api/v1/host/theme", false),
+        ("GET", "/api/v1/host/audio/apps", false),
+        ("GET", "/api/v1/gpus", false),
+        ("PUT", "/api/v1/gpus/preference", false),
+        ("GET", "/api/v1/display/settings", false),
+        ("PUT", "/api/v1/display/settings", false),
+        ("GET", "/api/v1/display/state", false),
+        ("GET", "/api/v1/display/monitors", false),
+        ("POST", "/api/v1/display/release", false),
+        ("PUT", "/api/v1/display/layout", false),
+        ("GET", "/api/v1/display/presets", false),
+        ("POST", "/api/v1/display/presets", false),
+        ("PUT", "/api/v1/display/presets/{id}", false),
+        ("DELETE", "/api/v1/display/presets/{id}", false),
+        ("GET", "/api/v1/display/clients/{fingerprint}", false),
+        ("PUT", "/api/v1/display/clients/{fingerprint}", false),
+        ("DELETE", "/api/v1/display/clients/{fingerprint}", false),
+        ("GET", "/api/v1/hooks", false),
+        ("PUT", "/api/v1/hooks", false),
+        ("GET", "/api/v1/stats/capture/live", false),
+        ("POST", "/api/v1/stats/capture/start", false),
+        ("GET", "/api/v1/stats/capture/status", false),
+        ("POST", "/api/v1/stats/capture/stop", false),
+        ("GET", "/api/v1/stats/recordings", false),
+        ("GET", "/api/v1/stats/recordings/{id}", false),
+        ("DELETE", "/api/v1/stats/recordings/{id}", false),
+        // Sessions run on the seats; the owner's host is where a bare call lands.
+        ("DELETE", "/api/v1/session", false),
+        ("DELETE", "/api/v1/session/{id}", false),
+        ("PUT", "/api/v1/session/{id}/access", false),
+        ("PUT", "/api/v1/session/{id}/audio", false),
+        ("POST", "/api/v1/session/{id}/idr", false),
+        ("GET", "/api/v1/session/{id}/pads", false),
+        ("PUT", "/api/v1/session/{id}/player", false),
+        ("POST", "/api/v1/session/idr", false),
+        ("GET", "/api/v1/session/last", false),
+        ("GET", "/api/v1/session/settings", false),
+        ("PUT", "/api/v1/session/settings", false),
+        ("POST", "/api/v1/game/end", false),
+        // Moonlight is the owner's row's: the door never serves it.
+        ("GET", "/api/v1/pair", false),
+        ("POST", "/api/v1/pair/pin", false),
+        ("GET", "/api/v1/clients", false),
+        ("DELETE", "/api/v1/clients", false),
+        ("DELETE", "/api/v1/clients/{fingerprint}", false),
+        ("PATCH", "/api/v1/clients/{fingerprint}", false),
+        // Pairing, placement and the box's files: the door's.
+        ("GET", "/api/v1/native/pair", true),
+        ("DELETE", "/api/v1/native/pair", true),
+        ("POST", "/api/v1/native/pair/arm", true),
+        ("GET", "/api/v1/native/clients", true),
+        ("DELETE", "/api/v1/native/clients", true),
+        ("DELETE", "/api/v1/native/clients/{fingerprint}", true),
+        ("PATCH", "/api/v1/native/clients/{fingerprint}", true),
+        ("GET", "/api/v1/native/pending", true),
+        ("POST", "/api/v1/native/pending/{id}/approve", true),
+        ("POST", "/api/v1/native/pending/{id}/deny", true),
+        ("GET", "/api/v1/profiles", true),
+        ("POST", "/api/v1/profiles", true),
+        ("PUT", "/api/v1/profiles/default", true),
+        ("GET", "/api/v1/profiles/doctor", true),
+        ("PUT", "/api/v1/profiles/door", true),
+        ("GET", "/api/v1/profiles/enumerate", true),
+        ("GET", "/api/v1/profiles/seating", true),
+        ("PUT", "/api/v1/profiles/seating", true),
+        ("PUT", "/api/v1/profiles/{id}", true),
+        ("DELETE", "/api/v1/profiles/{id}", true),
+        ("GET", "/api/v1/profiles/{id}/avatar", true),
+        ("PUT", "/api/v1/profiles/{id}/avatar", true),
+        ("DELETE", "/api/v1/profiles/{id}/avatar", true),
+        ("POST", "/api/v1/profiles/{id}/start", true),
+        ("POST", "/api/v1/profiles/{id}/stop", true),
+        ("POST", "/api/v1/profiles/{id}/end", true),
+        ("POST", "/api/v1/profiles/{id}/wake", true),
+        ("GET", "/api/v1/actions", true),
+        ("POST", "/api/v1/actions/{id}", true),
+        ("GET", "/api/v1/update/status", true),
+        ("POST", "/api/v1/update/check", true),
+        ("POST", "/api/v1/update/apply", true),
+        ("GET", "/api/v1/client-logs", true),
+        ("POST", "/api/v1/client-logs", true),
+        ("GET", "/api/v1/client-logs/{id}", true),
+        ("DELETE", "/api/v1/client-logs/{id}", true),
+        ("GET", "/api/v1/logs", true),
+        ("GET", "/api/v1/events", true),
+        ("POST", "/api/v1/events/relay", true),
+        // The library: its copy is what every client reads from the door; its writes, its
+        // sources and its downloads are the owner's host's.
+        ("GET", "/api/v1/library", true),
+        ("GET", "/api/v1/library/page", true),
+        ("GET", "/api/v1/library/art/{id}/{kind}", true),
+        ("GET", "/api/v1/library/custom/{id}", false),
+        ("POST", "/api/v1/library/custom", false),
+        ("PUT", "/api/v1/library/custom/{id}", false),
+        ("DELETE", "/api/v1/library/custom/{id}", false),
+        ("PUT", "/api/v1/library/hidden/{id}", false),
+        ("PUT", "/api/v1/library/picks/{id}", false),
+        ("GET", "/api/v1/library/metadata", false),
+        ("PUT", "/api/v1/library/metadata", false),
+        ("PUT", "/api/v1/library/metadata/{source}", false),
+        ("DELETE", "/api/v1/library/metadata/{source}", false),
+        ("GET", "/api/v1/library/scanners", false),
+        ("PUT", "/api/v1/library/scanners/{id}", false),
+        ("PUT", "/api/v1/library/provider/{provider}", false),
+        ("DELETE", "/api/v1/library/provider/{provider}", false),
+        ("PUT", "/api/v1/library/provider/{provider}/running", false),
+        (
+            "PUT",
+            "/api/v1/library/provider/{provider}/downloads",
+            false,
+        ),
+        ("POST", "/api/v1/library/install/{id}", false),
+        ("DELETE", "/api/v1/library/install/{id}", false),
+        ("POST", "/api/v1/library/install/{id}/pause", false),
+        ("POST", "/api/v1/library/install/{id}/cancel", false),
+        ("GET", "/api/v1/downloads", false),
+        // Plugins, their store and the emulators run in the owner's session.
+        ("GET", "/api/v1/plugins", false),
+        ("PUT", "/api/v1/plugins/{id}", false),
+        ("DELETE", "/api/v1/plugins/{id}", false),
+        ("GET", "/api/v1/plugins/{id}/ui-credential", false),
+        ("GET", "/api/v1/plugins/{id}/ui/attach", false),
+        ("POST", "/api/v1/plugins/logs", false),
+        ("GET", "/api/v1/plugin-access", false),
+        ("GET", "/api/v1/plugin-access/requests", false),
+        ("POST", "/api/v1/plugin-access/requests", false),
+        ("POST", "/api/v1/plugin-access/{plugin}/decide", false),
+        ("POST", "/api/v1/plugin-access/{plugin}/release", false),
+        ("GET", "/api/v1/store/catalog", false),
+        ("GET", "/api/v1/store/installed", false),
+        ("POST", "/api/v1/store/install", false),
+        ("POST", "/api/v1/store/uninstall", false),
+        ("GET", "/api/v1/store/jobs", false),
+        ("GET", "/api/v1/store/jobs/{id}", false),
+        ("POST", "/api/v1/store/refresh", false),
+        ("GET", "/api/v1/store/runtime", false),
+        ("POST", "/api/v1/store/runtime", false),
+        ("GET", "/api/v1/store/sources", false),
+        ("PUT", "/api/v1/store/sources/{name}", false),
+        ("DELETE", "/api/v1/store/sources/{name}", false),
+        ("GET", "/api/v1/emulators", false),
+        ("GET", "/api/v1/emulators/catalog", false),
+        ("POST", "/api/v1/emulators/{id}/adopt", false),
+        ("POST", "/api/v1/emulators/{id}/content", false),
+        ("GET", "/api/v1/emulators/{id}/firmware", false),
+        ("POST", "/api/v1/emulators/{id}/install", false),
+        ("POST", "/api/v1/emulators/{id}/prepare", false),
+        ("POST", "/api/v1/emulators/{id}/remove", false),
+        ("GET", "/api/v1/emulators/{id}/saves", false),
+        ("POST", "/api/v1/emulators/{id}/saves/export", false),
+        ("POST", "/api/v1/emulators/{id}/saves/import", false),
+    ];
+    // Outside the document: the seat proxy is the door's, a plugin's page the owner's host's.
+    const UNLISTED: &[(&str, &str, bool)] = &[
+        ("GET", "/api/v1/profiles/{id}/proxy/{rest}", true),
+        ("GET", "/api/v1/plugins/{id}/ui/", false),
+        ("GET", "/api/v1/plugins/{id}/ui/{rest}", false),
+    ];
+
+    let doc: serde_json::Value = serde_json::from_str(&openapi_json()).unwrap();
+    let mut live: Vec<(String, String)> = Vec::new();
+    for (path, ops) in doc["paths"].as_object().unwrap() {
+        for method in ops.as_object().unwrap().keys() {
+            live.push((method.to_uppercase(), path.clone()));
+        }
+    }
+    let expect = |method: &str, path: &str| {
+        EXPECTED
+            .iter()
+            .chain(UNLISTED)
+            .find(|(m, p, _)| *m == method && *p == path)
+            .map(|(_, _, door)| *door)
+    };
+    for (method, path) in &live {
+        let door = expect(method, path)
+            .unwrap_or_else(|| panic!("{method} {path} has no row: whose is it on a door?"));
+        let rest = path.strip_prefix("/api/v1/").unwrap();
+        let want = if door {
+            Verdict::Door
+        } else {
+            Verdict::Forward
+        };
+        assert_eq!(
+            classify(&Method::from_bytes(method.as_bytes()).unwrap(), rest),
+            want,
+            "{method} {path}"
+        );
+    }
+    for (method, path, _) in EXPECTED {
+        assert!(
+            live.iter().any(|(m, p)| m == method && p == path),
+            "{method} {path} is in the table and not in the document"
+        );
+    }
+    for (method, path, door) in UNLISTED {
+        let rest = path.strip_prefix("/api/v1/").unwrap();
+        let want = if *door {
+            Verdict::Door
+        } else {
+            Verdict::Forward
+        };
+        assert_eq!(
+            classify(&Method::from_bytes(method.as_bytes()).unwrap(), rest),
+            want
+        );
+    }
+    let all: Vec<&str> = live
+        .iter()
+        .map(|(_, p)| p.strip_prefix("/api/v1/").unwrap())
+        .chain(
+            UNLISTED
+                .iter()
+                .map(|(_, p, _)| p.strip_prefix("/api/v1/").unwrap()),
+        )
+        .collect();
+    for (_, template) in DOOR {
+        assert!(
+            all.iter().any(|rest| template_matches(template, rest)),
+            "the door's table names {template}, which no route has"
+        );
+    }
 }

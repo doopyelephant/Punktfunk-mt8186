@@ -33,6 +33,12 @@ pub struct HostEvent {
     /// Unix milliseconds — the [`crate::log_capture::LogEntry`] convention.
     pub ts_ms: u64,
     pub schema: u32,
+    /// On a door, the profile whose host raised it: a seat's event, on the door's bus for the
+    /// console. Absent on the host's own.
+    // `value_type`: a nullable string inside the flattened union breaks the SDK generator.
+    #[schema(value_type = String, required = false)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
     /// Flattened as `"kind": "stream.started"` plus payload fields.
     #[serde(flatten)]
     pub kind: EventKind,
@@ -710,12 +716,18 @@ impl EventBus {
     /// Fire-and-forget. No receivers is fine — the ring still records for later catch-up.
     /// Returns the event as sent, for a caller that hands it on.
     pub fn emit(&self, kind: EventKind) -> HostEvent {
+        self.emit_from(kind, None)
+    }
+
+    /// [`Self::emit`] of an event `seat`'s host raised ([`HostEvent::seat`]).
+    pub fn emit_from(&self, kind: EventKind, seat: Option<String>) -> HostEvent {
         let ts_ms = crate::clock::unix_ms();
         let mut ring = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let ev = HostEvent {
             seq: ring.next_seq,
             ts_ms,
             schema: SCHEMA_VERSION,
+            seat,
             kind,
         };
         ring.next_seq += 1;
@@ -884,6 +896,7 @@ mod tests {
             seq: 4182,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::StreamStarted {
                 stream: StreamRef {
                     mode: mode_str(3840, 2160, 120),
@@ -906,6 +919,7 @@ mod tests {
             seq: 1,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::ClientDisconnected {
                 client: ClientRef {
                     name: "Deck".into(),
@@ -926,6 +940,7 @@ mod tests {
             seq: 2,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::HostStopping,
         };
         assert_eq!(
@@ -937,6 +952,7 @@ mod tests {
             seq: 3,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::PluginsChanged {
                 id: "rom-manager".into(),
             },
@@ -950,6 +966,7 @@ mod tests {
             seq: 5,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::GameRunning {
                 game: GameRefPayload {
                     app: Some("steam:570".into()),
@@ -973,6 +990,7 @@ mod tests {
             seq: 5,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::GameLaunching {
                 game: GameRefPayload {
                     app: Some("steam:570".into()),
@@ -999,6 +1017,7 @@ mod tests {
             seq: 6,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::GameExited {
                 game: GameRefPayload {
                     app: None,
@@ -1024,6 +1043,7 @@ mod tests {
             seq: 7,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::SessionEnded {
                 session: SessionRef {
                     id: 3,
@@ -1090,6 +1110,7 @@ mod tests {
             seq: 8,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::SessionEnded {
                 session: SessionRef {
                     id: 4,
@@ -1148,6 +1169,7 @@ mod tests {
             seq: 8,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::AccessGranted {
                 device: device.clone(),
                 grants: 1, // GRANT_GAMEPAD — controller-only
@@ -1164,6 +1186,7 @@ mod tests {
             seq: 9,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::AccessChanged {
                 device: device.clone(),
                 grants: 63,
@@ -1191,6 +1214,7 @@ mod tests {
             seq: 10,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::ActionInvoked {
                 id: "power.sleep".into(),
                 device: Some(DeviceRef {
@@ -1221,6 +1245,7 @@ mod tests {
             seq: 11,
             ts_ms: 0,
             schema: 1,
+            seat: None,
             kind: EventKind::ActionInvoked {
                 id: "power.sleep".into(),
                 device: Some(DeviceRef {
@@ -1283,6 +1308,7 @@ mod tests {
             seq: 7,
             ts_ms: 3,
             schema: 1,
+            seat: None,
             kind: EventKind::PairingPending {
                 device: DeviceRef {
                     name: "iPad Pro".into(),

@@ -20,6 +20,8 @@ export interface SeatScopeValue {
 	seat: SeatChoice | null;
 	seats: SeatChoice[];
 	ownerName: string;
+	/** The owner's profile id, which is their seat's on a door. */
+	ownerId?: string;
 	/** The box is a door: it has no library of its own, so every pick is a seat. */
 	door?: boolean;
 	pick: (id: string | null) => void;
@@ -30,6 +32,17 @@ export const SeatScopeContext = createContext<SeatScopeValue | null>(null);
 /** The seat the page in view shows; `null` is the box's own, and outside the three pages. */
 export const useSeat = (): SeatChoice | null =>
 	useContext(SeatScopeContext)?.seat ?? null;
+
+/**
+ * True when the page's plugins are the ones the console reaches: the box's own, and behind a door
+ * the owner's, whose host the door asks for them. Another seat's plugins are out of its reach.
+ */
+export const usePluginsReachable = (): boolean => {
+	const scope = useContext(SeatScopeContext);
+	return (
+		!scope?.seat || (scope.door === true && scope.seat.id === scope.ownerId)
+	);
+};
 
 /**
  * True for a profile whose desktop runs its own host. On a door every profile plays on a seat, and
@@ -72,6 +85,10 @@ function bind<O extends object>(
 }
 
 const clients = new Map<string, QueryClient>();
+
+/** The cache of seat `id`, when a page has opened it; a seat nobody looked at holds nothing. */
+export const seatClientIfAny = (id: string): QueryClient | undefined =>
+	clients.get(id);
 
 /**
  * The cache of seat `id`, whose every query and mutation goes to that seat's host.

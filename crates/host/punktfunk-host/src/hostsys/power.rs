@@ -41,8 +41,19 @@ fn host_unit(cgroup: &str) -> Option<String> {
     })
 }
 
+/// The door's unit restarts it (`Restart=always`), and a seat's runner starts its host over
+/// whenever it exits: both restart by stopping.
+#[cfg(target_os = "linux")]
+fn restarts_by_stopping() -> bool {
+    let role = pf_paths::seat::role();
+    role.is_door() || role.is_seat_host()
+}
+
 #[cfg(target_os = "linux")]
 fn restart_probe() -> Availability {
+    if restarts_by_stopping() {
+        return Availability::yes();
+    }
     match std::fs::read_to_string("/proc/self/cgroup")
         .ok()
         .as_deref()
@@ -57,6 +68,10 @@ fn restart_probe() -> Availability {
 
 #[cfg(target_os = "linux")]
 fn restart_act() -> Result<(), String> {
+    if restarts_by_stopping() {
+        // Its own stop signal: the handler gives the box back, then exits.
+        return crate::native::stop_self();
+    }
     let unit = std::fs::read_to_string("/proc/self/cgroup")
         .ok()
         .as_deref()
@@ -106,8 +121,8 @@ impl Availability {
 /// What `verb` can do on this host. A seat host never does any of it: sleeping or restarting
 /// would take every other seat down, so the box's own host is the one executor.
 pub fn probe(verb: PowerVerb) -> Availability {
-    if pf_paths::seat::role().is_seat_host() {
-        return Availability::no("A seat can't sleep, restart or shut down the host.");
+    if pf_paths::seat::role().is_seat_host() && verb != PowerVerb::Restart {
+        return Availability::no("A seat can't sleep or shut down the host.");
     }
     os_probe(verb)
 }

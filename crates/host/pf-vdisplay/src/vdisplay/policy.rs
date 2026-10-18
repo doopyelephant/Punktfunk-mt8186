@@ -742,6 +742,8 @@ pub struct DisplayPolicyStore {
     box_overlays: Option<BoxOverlays>,
     /// A seat that follows the contract: [`seat_contract`] instead of any stored policy.
     contract: bool,
+    /// The door: the owner's host's policy as the supervisor copies it, never a file of its own.
+    follows: bool,
 }
 
 /// The box's display policy on a seat host. The box console writes it; the seat re-reads the
@@ -791,6 +793,23 @@ impl DisplayPolicyStore {
             write: Mutex::new(()),
             box_overlays: None,
             contract: false,
+            follows: false,
+        }
+    }
+
+    /// The door's store: the owner's policy at `copy`, re-read when the supervisor's copy
+    /// moves. Nothing here writes it; the door passes every write to the owner's host.
+    pub fn following(copy: PathBuf) -> Self {
+        DisplayPolicyStore {
+            path: copy.clone(),
+            cur: Mutex::new(None),
+            write: Mutex::new(()),
+            box_overlays: Some(BoxOverlays {
+                path: copy,
+                cache: Mutex::new((None, DisplayPolicy::default())),
+            }),
+            contract: false,
+            follows: true,
         }
     }
 
@@ -955,7 +974,17 @@ impl DisplayPolicyStore {
         if self.contract {
             return self.contract_policy();
         }
+        if self.follows {
+            return self.followed().unwrap_or_default();
+        }
         self.with_box_clients(self.cur.lock().unwrap().clone().unwrap_or_default())
+    }
+
+    /// The owner's policy the door follows, `None` while the supervisor has no copy.
+    fn followed(&self) -> Option<DisplayPolicy> {
+        let owner = self.box_overlays.as_ref()?;
+        std::fs::metadata(&owner.path).ok()?;
+        Some(owner.current())
     }
 
     /// Console-configured policy, or `None` if no file. `None` ⇒ leave
@@ -964,6 +993,9 @@ impl DisplayPolicyStore {
     pub fn configured(&self) -> Option<DisplayPolicy> {
         if self.contract {
             return None;
+        }
+        if self.follows {
+            return self.followed();
         }
         let policy = self.cur.lock().unwrap().clone()?;
         Some(self.with_box_clients(policy))
@@ -1050,6 +1082,9 @@ impl DisplayPolicyStore {
         if self.contract {
             anyhow::bail!("a seat's display follows the seat contract");
         }
+        if self.follows {
+            anyhow::bail!("the door's display policy is the owner's host's");
+        }
         Ok(())
     }
 
@@ -1072,12 +1107,24 @@ impl DisplayPolicyStore {
 pub fn prefs() -> &'static DisplayPolicyStore {
     static STORE: OnceLock<DisplayPolicyStore> = OnceLock::new();
     STORE.get_or_init(|| {
+        if pf_paths::seat::role().is_door() {
+            if let Some(dir) = pf_paths::seat::box_library_dir() {
+                return DisplayPolicyStore::following(dir.join("display-settings.json"));
+            }
+        }
+        let role = pf_paths::seat::role();
         DisplayPolicyStore::load_from(pf_paths::config_dir().join("display-settings.json"))
-            .with_box_overlays(
-                pf_paths::seat::trust_dir().map(|dir| dir.join("display-settings.json")),
-            )
-            .with_contract(pf_paths::seat::role().follows_contract())
+            .with_box_overlays(box_overlays_file(role, pf_paths::seat::trust_dir()))
+            .with_contract(role.follows_contract())
     })
+}
+
+/// Where a host reads the box's per-device overlays from: a contract seat, its trust copy. The
+/// owner's host keeps them in its own file, which is the box's, so it writes them too.
+fn box_overlays_file(role: pf_paths::seat::HostRole, trust: Option<PathBuf>) -> Option<PathBuf> {
+    role.follows_contract()
+        .then_some(trust?)
+        .map(|dir| dir.join("display-settings.json"))
 }
 
 /// A second device on a seat's one screen shares it, or is refused: a seat has no screen to
@@ -1410,6 +1457,25 @@ pub fn delete_custom_preset(id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A contract seat reads the box's overlays from its trust copy; the owner's host writes
+    /// its own, which become the box's.
+    #[test]
+    fn only_a_contract_seat_takes_its_overlays_from_the_trust_copy() {
+        use pf_paths::seat::{HostRole, SeatRole};
+        let trust = Some(PathBuf::from("/trust"));
+        assert_eq!(
+            box_overlays_file(HostRole::Seat(SeatRole::Contract), trust.clone()),
+            Some(PathBuf::from("/trust/display-settings.json"))
+        );
+        for role in [
+            HostRole::Seat(SeatRole::Owner),
+            HostRole::Seat(SeatRole::OwnerHeadless),
+            HostRole::Plain,
+        ] {
+            assert_eq!(box_overlays_file(role, trust.clone()), None, "{role:?}");
+        }
+    }
 
     #[test]
     fn custom_preset_serde_roundtrips_and_defaults_game_session() {

@@ -63,6 +63,10 @@ const LIBRARY_FILES: [&str; 5] = [
 /// One table per metadata source, a flat folder beside the library files.
 const LIBRARY_METADATA: &str = "library-metadata";
 
+/// The owner's host's file that the door and every seat read beside the library: the display
+/// policy, whose one writer is the owner's host. Copied with the library, into the same dir.
+const OWNER_POLICY: &str = "display-settings.json";
+
 /// A big catalog with descriptions runs to tens of megabytes; past this it is not ours.
 const MAX_LIBRARY_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -600,6 +604,8 @@ pub(super) fn refresh_trust(
         changed |= unlink(&dst, name).map_err(|e| io(&format!("remove the old {name}"), e))?;
     }
     let Some(src) = src else { return Ok(changed) };
+    // The display policy is the owner's, by way of the library copy, not the door's.
+    let owner = open_source(&box_library_dir(state)).map_err(|e| io("open the box library", e))?;
     let mut first = None;
     let mut note = |copied: std::io::Result<bool>, what: String| match copied {
         Ok(did) => changed |= did,
@@ -608,7 +614,12 @@ pub(super) fn refresh_trust(
         }
     };
     for name in TRUST_FILES {
-        let copied = sync_file(Some(&src), &dst, name, reader, MAX_TRUST_BYTES);
+        let from = if name == OWNER_POLICY {
+            owner.as_ref()
+        } else {
+            Some(&src)
+        };
+        let copied = sync_file(from, &dst, name, reader, MAX_TRUST_BYTES);
         note(copied, format!("copy {name}"));
     }
     let avatars = sync_flat_dir(Some(&src), &dst, AVATARS, reader, MAX_TRUST_BYTES);
@@ -634,7 +645,11 @@ pub(super) fn refresh_box_library(
     };
     let dst =
         open_copy(&box_library_dir(state), reader).map_err(|e| io("open the library copy", e))?;
-    sync_library(Some(&src), &dst, reader).map_err(|e| io("copy the owner's library", e))
+    let mut changed =
+        sync_library(Some(&src), &dst, reader).map_err(|e| io("copy the owner's library", e))?;
+    changed |= sync_file(Some(&src), &dst, OWNER_POLICY, reader, MAX_TRUST_BYTES)
+        .map_err(|e| io("copy the owner's display policy", e))?;
+    Ok(changed)
 }
 
 /// Brings the box's library in a seat's trust copy level with [`box_library_dir`]: the seat's
@@ -1344,6 +1359,47 @@ mod tests {
         assert!(!copy.exists());
         assert!(refresh_seat_library(&state, &id(), reader).unwrap());
         assert!(!trust.join("library.json").exists());
+    }
+
+    /// The owner's display policy travels with the library: into the copy the door reads, and
+    /// from there into a seat's trust copy, never from the door's own directory.
+    #[test]
+    fn the_owner_s_display_policy_reaches_the_door_and_the_seats() {
+        let temp = tempfile::tempdir().unwrap();
+        let (home, state, box_dir) = (
+            temp.path().join("home"),
+            temp.path().join("state"),
+            temp.path().join("box"),
+        );
+        let config = home.join(".config/punktfunk");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&box_dir).unwrap();
+        std::fs::write(config.join("library.json"), "{}").unwrap();
+        std::fs::write(
+            config.join("display-settings.json"),
+            r#"{"preset":"shared"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            box_dir.join("display-settings.json"),
+            r#"{"preset":"door"}"#,
+        )
+        .unwrap();
+        let reader = Reader::group(own_gid(&home));
+        assert!(refresh_box_library(&home, &state, reader).unwrap());
+        let copy = box_library_dir(&state).join("display-settings.json");
+        assert_eq!(
+            std::fs::read_to_string(&copy).unwrap(),
+            r#"{"preset":"shared"}"#
+        );
+
+        assert!(refresh_trust(&box_dir, &state, &id(), reader).unwrap());
+        let trust = trust_dir(&state, &id()).join("display-settings.json");
+        assert_eq!(
+            std::fs::read_to_string(&trust).unwrap(),
+            r#"{"preset":"shared"}"#
+        );
     }
 
     /// An owner's config folder that isn't there, as in a home not mounted yet, keeps the copy

@@ -104,6 +104,7 @@ mod tests {
             seq: 1,
             ts_ms: 0,
             schema: crate::events::SCHEMA_VERSION,
+            seat: None,
             kind: EventKind::GameLaunching {
                 game: GameRefPayload {
                     app: Some("steam:570".into()),

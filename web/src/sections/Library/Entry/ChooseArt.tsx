@@ -14,7 +14,7 @@ import {
 	useSourceStatus,
 } from "@/api/metadata";
 import { usePlugins } from "@/api/plugins";
-import { useSeat } from "@/api/seat";
+import { usePluginsReachable } from "@/api/seat";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -51,11 +51,11 @@ export const ChooseArtDialog: FC<{
 	const nameOf = useSourceNames();
 	const [pasted, setPasted] = useState("");
 	const running = new Set((plugins.data ?? []).map((p) => p.id));
-	const seat = useSeat();
-	// An Art & Metadata source answers from the box's own plugin runner.
-	const sources = seat
-		? []
-		: (list.data ?? []).filter((s) => s.enabled && running.has(s.id));
+	const reachable = usePluginsReachable();
+	// An Art & Metadata source answers from a plugin runner the console reaches.
+	const sources = reachable
+		? (list.data ?? []).filter((s) => s.enabled && running.has(s.id))
+		: [];
 	const usePasted = (e: FormEvent) => {
 		e.preventDefault();
 		if (isHttpUrl(pasted.trim())) onPick(pasted.trim());

@@ -342,9 +342,12 @@ EOF
 }
 
 # A console left running after the merge serves the old build's asset names, which /usr no longer has.
-# SUDO_USER is the person who ran this. The in-console updater runs it from a root unit without one
-# and restarts all three itself once the helper returns. try-restart leaves an opted-out runner off.
+# The door's units restart as the RPM's do. SUDO_USER is the person who ran this. The in-console
+# updater runs it from a root unit without one and restarts all three itself once the helper returns.
+# try-restart leaves an opted-out runner off.
 restart_user_units() {
+  systemctl --no-block try-restart punktfunk-seats.service punktfunk-door.service \
+    punktfunk-web-door.service 2>/dev/null || :
   if [ -n "${SUDO_USER:-}" ] \
      && systemctl --user -M "$SUDO_USER@" try-restart punktfunk-web.service punktfunk-host.service; then
     systemctl --user -M "$SUDO_USER@" try-restart punktfunk-scripting.service 2>/dev/null || true

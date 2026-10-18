@@ -344,3 +344,146 @@ mod tests {
         assert_eq!(unavailable().as_deref(), Some(LINUX_ONLY));
     }
 }
+
+/// The door keeps no display policy or hooks of its own. Any its directory holds are the owner's
+/// console edits: once the owner's host answers, each per-device overlay it lacks and each hook
+/// it lacks goes there, and the door's file is set aside. Runs for the door's lifetime, until
+/// nothing is left.
+#[cfg(target_os = "linux")]
+pub(crate) fn hand_over_leftovers() {
+    let spawned = std::thread::Builder::new()
+        .name("door-leftovers".into())
+        .spawn(|| {
+            let dir = pf_paths::config_dir();
+            while !hand_over(&dir) {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "door leftovers not handed over");
+    }
+}
+
+/// One try at [`hand_over_leftovers`]: `true` once nothing is left to hand over.
+#[cfg(target_os = "linux")]
+fn hand_over(dir: &std::path::Path) -> bool {
+    let display = dir.join("display-settings.json");
+    let hooks = dir.join("hooks.json");
+    if !display.exists() && !hooks.exists() {
+        return true;
+    }
+    let ledger = crate::seats::ledger();
+    let Some(owner) = ledger.owner() else {
+        return false;
+    };
+    if owner.runtime.state != pf_seats::RuntimeState::Running {
+        return false;
+    }
+    let call = |method: &str, target: String, body: Option<Vec<u8>>| {
+        let mut call = crate::mgmt::owner::Forwarded::get(target);
+        call.method = method.into();
+        if let Some(body) = body {
+            call.content_type = Some("application/json".into());
+            call.body = body;
+        }
+        match crate::seats::forward(owner, call)? {
+            crate::mgmt::owner::Answer::Reply(status, _, body) if (200..300).contains(&status) => {
+                Some(body)
+            }
+            _ => None,
+        }
+    };
+    if display.exists() {
+        let leftover = read_json(&display);
+        let overlays = leftover["clients"].as_object().cloned().unwrap_or_default();
+        for (fp, overlay) in overlays {
+            let target = format!("display/clients/{fp}");
+            let Some(have) = call("GET", target.clone(), None) else {
+                return false;
+            };
+            let have: serde_json::Value = serde_json::from_slice(&have).unwrap_or_default();
+            if have.as_object().is_some_and(|o| !o.is_empty()) {
+                continue;
+            }
+            if call("PUT", target, Some(overlay.to_string().into_bytes())).is_none() {
+                return false;
+            }
+        }
+        set_aside(&display);
+    }
+    if hooks.exists() {
+        let leftover: crate::hooks::HooksConfig =
+            serde_json::from_value(read_json(&hooks)).unwrap_or_default();
+        let Some(have) = call("GET", "hooks".into(), None) else {
+            return false;
+        };
+        let have: crate::hooks::HooksConfig = serde_json::from_slice(&have).unwrap_or_default();
+        let merged = merged_hooks(have.clone(), leftover);
+        if merged.hooks.len() != have.hooks.len() {
+            let body = serde_json::to_vec(&merged).unwrap_or_default();
+            if call("PUT", "hooks".into(), Some(body)).is_none() {
+                return false;
+            }
+        }
+        set_aside(&hooks);
+    }
+    true
+}
+
+/// `have` with each hook of `extra` it lacks after it, in `extra`'s order.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "Linux only"))]
+fn merged_hooks(
+    mut have: crate::hooks::HooksConfig,
+    extra: crate::hooks::HooksConfig,
+) -> crate::hooks::HooksConfig {
+    let same = |a: &crate::hooks::HookEntry, b: &crate::hooks::HookEntry| {
+        serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+    };
+    for hook in extra.hooks {
+        if !have.hooks.iter().any(|h| same(h, &hook)) {
+            have.hooks.push(hook);
+        }
+    }
+    have
+}
+
+#[cfg(target_os = "linux")]
+fn read_json(path: &std::path::Path) -> serde_json::Value {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// `path` renamed beside itself, so the door never hands it over twice and nothing is lost.
+#[cfg(target_os = "linux")]
+fn set_aside(path: &std::path::Path) {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(".handed-over");
+    if let Err(error) = std::fs::rename(path, &aside) {
+        tracing::warn!(path = %path.display(), %error, "door leftover not set aside");
+    }
+}
+
+#[cfg(test)]
+mod leftover_tests {
+    use super::merged_hooks;
+    use crate::hooks::HooksConfig;
+
+    /// The owner's hooks stay first; the door's add only what the owner lacks.
+    #[test]
+    fn the_door_s_hooks_join_the_owner_s_without_duplicates() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<HooksConfig>(v).unwrap();
+        let owner = parse(serde_json::json!({"hooks": [
+            {"on": "stream.started", "run": "notify-send hi"},
+        ]}));
+        let door = parse(serde_json::json!({"hooks": [
+            {"on": "stream.started", "run": "notify-send hi"},
+            {"on": "pairing.pending", "webhook": "https://example.com/knock"},
+        ]}));
+        let merged = merged_hooks(owner, door);
+        assert_eq!(merged.hooks.len(), 2);
+        assert_eq!(merged.hooks[0].on, "stream.started");
+        assert_eq!(merged.hooks[1].on, "pairing.pending");
+    }
+}

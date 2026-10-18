@@ -76,16 +76,17 @@ yours included.
 
 What turning it on does:
 
-- **Files move.** The host's identity, pairings, profiles, display and hook settings, and the
-  console password are copied to `/var/lib/punktfunk`, owned by a `punktfunk` system user that
-  runs the host from then on. Paired clients keep working: the fingerprint is the same.
+- **Files move.** The host's identity, pairings, profiles and the console password are copied
+  to `/var/lib/punktfunk`, owned by a `punktfunk` system user that runs the host from then on.
+  Display settings and hooks stay yours. Paired clients keep working: the fingerprint is the same.
 - **You become a seat.** Your own `punktfunk-host` moves to the first seat's ports and serves
   your library, plugins and Steam from your own home. The console reaches it from **Library**,
   **Game sources** and **Plugins**; the page's title, **Anna's library ▾**, picks another seat's.
 - **The monitor wins.** When you log in at the machine, the background session ends within a few
   seconds and your own session hosts you. Streams on the background session end, and the client
   reconnects. Nothing on your monitor is closed.
-- **The console is the door's.** It listens on the same port with the same password.
+- **The console is the door's.** It listens on the same port with the same password. Host
+  settings, Displays, Automation, Plugins and Health checks show your own host, which streams.
 - **Seats see your games.** Every seat shows your Steam libraries: its Steam plays, updates and
   runs Proton from them while the files stay yours. A library on a filesystem other than btrfs,
   ext4, xfs or f2fs stays hidden from seats. New games a seat installs go to

@@ -44,6 +44,7 @@ fn the_published_port_is_the_one_a_reader_dials() {
 mod auth_lanes;
 mod clients;
 mod display;
+mod door;
 mod events;
 mod library;
 mod native_pairing;
@@ -157,7 +158,35 @@ fn unstamped_app(state: Arc<AppState>, token: Option<&str>, box_library: bool) -
         // No browser plane: the default, and the one that must emit no CORS headers.
         false,
         box_library,
+        None,
     )
+}
+
+/// A door: the app passes calls on to `seats`, pairs devices in `np` when given one.
+fn test_app_door(
+    state: Arc<AppState>,
+    np: Option<Arc<crate::native_pairing::NativePairing>>,
+    seats: Arc<dyn crate::mgmt::owner::Seats>,
+) -> Router {
+    let stats = state.stats.clone();
+    from_loopback(app(
+        state,
+        Some("test-secret".to_string()),
+        Some("plugin-secret".to_string()),
+        shared_plugin_tokens(test_plugin_tokens()),
+        Some(TRAY_TOKEN.to_string()),
+        DEFAULT_PORT,
+        np,
+        stats,
+        test_client_logs_dir(),
+        test_access_dir(),
+        false,
+        Some([0x5a; 32]),
+        false,
+        // The door reads the box's library copy, as a seat does.
+        true,
+        Some(seats),
+    ))
 }
 
 /// A host that is serving browsers. Only the CORS lane differs, and it differs entirely.
@@ -178,6 +207,7 @@ fn test_app_browser(state: Arc<AppState>) -> Router {
         None,
         true,
         false,
+        None,
     ))
 }
 
@@ -200,6 +230,7 @@ fn test_app_native(state: Arc<AppState>, np: Arc<crate::native_pairing::NativePa
         Some([0x5a; 32]),
         false,
         false,
+        None,
     ))
 }
 
@@ -408,5 +439,6 @@ fn test_app_access(state: Arc<AppState>, access_dir: &std::path::Path) -> Router
         None,
         false,
         false,
+        None,
     ))
 }

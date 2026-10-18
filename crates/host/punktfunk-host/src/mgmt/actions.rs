@@ -404,7 +404,15 @@ pub(crate) async fn invoke_action(
     // anonymous sessions; the compat plane tears down on its own path.
     let id_owned: String = builtin.id.into();
     let app = st.app.clone();
+    let shared = st.clone();
     tokio::spawn(async move {
+        // A restart-class setting may be the owner's host's: on a door, that host restarts
+        // first. Its runner starts it over; nothing waits on it.
+        if verb == PowerVerb::Restart {
+            let _ = shared
+                .owner_call("POST", "actions/host.restart", None, false)
+                .await;
+        }
         crate::power::set_closing(true);
         crate::session_status::stop_all_quit();
         let _ = app.quit_session("host power action");
