@@ -318,9 +318,13 @@ pub struct VkDecoder<C: VkCodec> {
 }
 
 impl<C: VkCodec> VkDecoder<C> {
-    /// The device, for a [`super::waiter::DoneWaiter`]. Valid while this decoder lives.
-    pub fn ash_device(&self) -> ash::Device {
-        self.dev.ash().clone()
+    /// A [`super::waiter::DoneWaiter`] on this decoder's device; `None` when its thread
+    /// did not start. The caller drops it before the decoder.
+    pub fn done_waiter(
+        &self,
+        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Option<super::waiter::DoneWaiter> {
+        super::waiter::DoneWaiter::spawn(self.dev.ash().clone(), wake)
     }
 
     /// Decoder over a wrapped device. Sessions and pools are built lazily from
