@@ -36,8 +36,8 @@ pub fn flatten(modes: &[Mode]) -> impl Iterator<Item = ModeItem> + '_ {
 }
 
 /// How many distinct resolutions a monitor's advertised list may accumulate (the requested
-/// head + history + the built-in fallbacks). Bounds the union growth across many resizes.
-pub const MODE_LIST_CAP: usize = 12;
+/// head + the host's extras + history). Bounds the union growth across many resizes.
+pub const MODE_LIST_CAP: usize = 24;
 
 /// Append `from`'s modes to `into`, skipping resolutions already there, capped at
 /// [`MODE_LIST_CAP`] — the accumulate half of the driver's mode-union semantics. The OS pins
@@ -61,20 +61,36 @@ pub fn union_modes(into: &mut Vec<Mode>, from: &[Mode]) {
 }
 
 /// The list a monitor advertises: the requested mode first, then — for a host only — the
-/// fallbacks and whatever the monitor already offered.
+/// `extras` that fit inside it, at its refresh rates, and whatever the monitor already offered.
+/// A larger extra is skipped: a game that picks the biggest mode would outgrow the stream.
+/// Zero entries are unused slots.
 ///
 /// A seat rides a remote-session adapter, which IddCx obliges to declare `USE_SMALLEST_MODE`,
 /// so the OS drives the monitor at the SMALLEST mode on the list. A seat therefore offers
-/// exactly what the client asked for: one fallback, or one stale larger entry surviving a
+/// exactly what the client asked for: one extra, or one stale larger entry surviving a
 /// resize, pins that seat to the wrong resolution.
 ///
 /// `history` is the monitor's current list on a re-advertise, empty at create. The OS pins the
 /// settable set at arrival, so a host's list may only grow — [`union_modes`] caps that growth.
 #[must_use]
-pub fn advertised_modes(requested: Mode, seat: bool, history: &[Mode]) -> Vec<Mode> {
+pub fn advertised_modes(
+    requested: Mode,
+    seat: bool,
+    extras: &[[u32; 2]],
+    history: &[Mode],
+) -> Vec<Mode> {
+    let fit: Vec<Mode> = extras
+        .iter()
+        .filter(|&&[w, h]| w > 0 && h > 0 && w <= requested.width && h <= requested.height)
+        .map(|&[width, height]| Mode {
+            width,
+            height,
+            refresh_rates: requested.refresh_rates.clone(),
+        })
+        .collect();
     let mut modes = vec![requested];
     if !seat {
-        modes.extend(default_modes());
+        union_modes(&mut modes, &fit);
     }
     accumulate_modes(&mut modes, seat, history);
     modes
@@ -89,23 +105,6 @@ pub fn accumulate_modes(into: &mut Vec<Mode>, seat: bool, history: &[Mode]) {
     if !seat {
         union_modes(into, history);
     }
-}
-
-/// Fallback modes appended after the requested mode, so a topology change still has options.
-#[must_use]
-pub fn default_modes() -> Vec<Mode> {
-    vec![
-        Mode {
-            width: 1920,
-            height: 1080,
-            refresh_rates: vec![60, 120],
-        },
-        Mode {
-            width: 1280,
-            height: 720,
-            refresh_rates: vec![60],
-        },
-    ]
 }
 
 /// The numbers of a `DISPLAYCONFIG_VIDEO_SIGNAL_INFO`, without the OS struct. Both sync
@@ -228,18 +227,31 @@ mod tests {
         }
     }
 
+    /// A 4K120 stream offers the extras that fit, at 120 Hz, in the host's order. The larger
+    /// one, the repeat of the head, and the unused zero slot all drop out.
     #[test]
-    fn default_modes_lead_with_1080p_then_720p() {
-        let d = default_modes();
+    fn extras_fit_inside_the_request_at_its_refresh() {
+        let asked = mode(3840, 2160, &[120]);
+        let extras = [
+            [5120, 2880],
+            [2560, 1440],
+            [3840, 2160],
+            [0, 0],
+            [1920, 1080],
+        ];
+        let host = advertised_modes(asked.clone(), false, &extras, &[]);
         assert_eq!(
-            d,
-            vec![mode(1920, 1080, &[60, 120]), mode(1280, 720, &[60])]
+            host,
+            vec![asked, mode(2560, 1440, &[120]), mode(1920, 1080, &[120])]
         );
         // flatten walks resolutions in list order, refresh rates within each.
-        let flat: Vec<_> = flatten(&d)
+        let flat: Vec<_> = flatten(&host)
             .map(|i| (i.width, i.height, i.refresh_rate))
             .collect();
-        assert_eq!(flat, [(1920, 1080, 60), (1920, 1080, 120), (1280, 720, 60)]);
+        assert_eq!(
+            flat,
+            [(3840, 2160, 120), (2560, 1440, 120), (1920, 1080, 120)]
+        );
     }
 
     /// The `USE_SMALLEST_MODE` rule: the OS drives a seat at the smallest advertised mode, so a
@@ -247,20 +259,21 @@ mod tests {
     #[test]
     fn a_seat_advertises_only_what_the_client_asked_for() {
         let asked = mode(2560, 1440, &[120]);
+        let extras = [[1280, 720]];
         let history = vec![mode(3840, 2160, &[60]), mode(1024, 768, &[60])];
 
-        let seat = advertised_modes(asked.clone(), true, &history);
+        let seat = advertised_modes(asked.clone(), true, &extras, &history);
         assert_eq!(seat, vec![asked.clone()], "a seat offers one mode");
         let smallest = flatten(&seat)
             .min_by_key(|i| i.width * i.height)
             .expect("a non-empty list");
         assert_eq!((smallest.width, smallest.height), (2560, 1440));
 
-        // A host keeps the request first, then the fallbacks, then its history — and 1024x768
+        // A host keeps the request first, then the extras, then its history — and 1024x768
         // proves the history really does ride along.
-        let host = advertised_modes(asked.clone(), false, &history);
+        let host = advertised_modes(asked.clone(), false, &extras, &history);
         assert_eq!(host[0], asked);
-        assert!(host.contains(&mode(1280, 720, &[60])), "fallbacks");
+        assert!(host.contains(&mode(1280, 720, &[120])), "extras");
         assert!(host.contains(&mode(1024, 768, &[60])), "history");
         assert!(
             host.len() <= MODE_LIST_CAP,
@@ -269,16 +282,21 @@ mod tests {
         );
     }
 
-    /// Create passes no history; the seat rule still holds and the host still gets its fallbacks.
+    /// Create passes no history; the seat rule still holds and an old host's all-zero extras
+    /// leave the request alone.
     #[test]
     fn advertised_modes_without_history_is_the_create_path() {
         let asked = mode(800, 600, &[60]);
         assert_eq!(
-            advertised_modes(asked.clone(), true, &[]),
+            advertised_modes(asked.clone(), true, &[[640, 480]], &[]),
             vec![asked.clone()]
         );
-        let host = advertised_modes(asked.clone(), false, &[]);
-        assert_eq!(host, [vec![asked], default_modes()].concat());
+        let host = advertised_modes(asked.clone(), false, &[[640, 480]], &[]);
+        assert_eq!(host, vec![asked.clone(), mode(640, 480, &[60])]);
+        assert_eq!(
+            advertised_modes(asked.clone(), false, &[[0, 0]; 16], &[]),
+            vec![asked]
+        );
     }
 
     #[test]

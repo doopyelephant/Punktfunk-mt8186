@@ -257,6 +257,22 @@ const WINDOWS: &[&str] = &["windows"];
 const LINUX_WINDOWS: &[&str] = &["linux", "windows"];
 /// Row `pyrowave_bpp`'s default: Themaister's clean point for 4:2:0, 200 Mbps at 1080p60.
 pub const PYROWAVE_BPP: f64 = 1.6;
+/// Row `vdisplay_resolutions`' default: common 16:9, 16:10 and 21:9 sizes, largest first.
+pub const VDISPLAY_RESOLUTIONS: &[&str] = &[
+    "3840x2160",
+    "3440x1440",
+    "2560x1600",
+    "2560x1440",
+    "2560x1080",
+    "1920x1200",
+    "1920x1080",
+    "1680x1050",
+    "1600x900",
+    "1440x900",
+    "1366x768",
+    "1280x800",
+    "1280x720",
+];
 pub(crate) const TRI: Kind = Kind::Enum(&["auto", "on", "off"]);
 const TRI_SPELLINGS: &[(&str, &str)] = &[
     ("1", "on"),
@@ -470,6 +486,9 @@ pub static SETTINGS: &[Setting] = &[
     row("max_fps", "PUNKTFUNK_MAX_FPS", Kind::Int { min: 0, max: 240, unit: "fps" }, D::Int(0), Video, NextSession, "Game frame limit", "gamescope").only(LINUX),
     // 0 is the host's pick per compositor (`HostConfig::vdisplay_hz_mult_for`); 1 is off.
     row("vdisplay_hz_mult", "PUNKTFUNK_VDISPLAY_HZ_MULT", Kind::Int { min: 0, max: 4, unit: "×" }, D::Int(0), Video, NextSession, "Display refresh multiple", "configuration").advanced().only(LINUX_WINDOWS),
+    // `WIDTHxHEIGHT` sizes the virtual display offers beside the stream's own. The driver skips
+    // any larger than the stream; ADD carries the first 16.
+    row("vdisplay_resolutions", "PUNKTFUNK_VDISPLAY_RESOLUTIONS", Kind::List, D::List(VDISPLAY_RESOLUTIONS), Video, NextSession, "Extra resolutions", "configuration").advanced().only(WINDOWS),
     row("portal_cursor_mode", "PUNKTFUNK_PORTAL_CURSOR_MODE", Kind::Enum(&["auto", "embedded", "metadata", "hidden"]), D::Str("auto"), Video, NextSession, "Cursor capture", "configuration")
         .advanced()
         .only(LINUX)

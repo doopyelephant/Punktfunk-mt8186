@@ -125,6 +125,7 @@ fn present_seat_display(stop: HANDLE) {
             max_frame_avg_nits: 0,
             min_luminance_millinits: 0,
             hw_cursor: 0,
+            extra_modes: Default::default(),
         },
     );
     dbglog!(

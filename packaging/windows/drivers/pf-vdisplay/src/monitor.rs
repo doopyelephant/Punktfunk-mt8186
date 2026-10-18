@@ -104,7 +104,7 @@ pub struct Monitor {
     arrival: OnceLock<Arrival>,
     /// `CREATING`, `ARRIVED` or `DEPARTED`; see [`Monitor::claim_departure`].
     state: AtomicU8,
-    /// Advertised modes (requested mode first, then the proto's fallbacks).
+    /// Advertised modes (requested mode first, then the host's extras and history).
     modes: Mutex<Vec<Mode>>,
     /// The live swap-chain drain worker; dropping it joins the thread.
     swap: Mutex<Option<SwapChainProcessor>>,
@@ -730,7 +730,8 @@ pub fn set_cursor_forward(owner: u32, target_id: u32, enable: bool) -> bool {
 pub const SEAT_PLACEHOLDER_OWNER: u32 = 0;
 pub const SEAT_PLACEHOLDER_SESSION: u64 = 0;
 
-/// `IOCTL_ADD`: create + arrive `owner`'s virtual monitor at the requested mode, named by
+/// `IOCTL_ADD`: create + arrive `owner`'s virtual monitor at the requested mode (plus the
+/// host's extra sizes, [`vdisplay::advertised_modes`]), named by
 /// `req.preferred_monitor_id` (the host's per-client stable id; `0` = lowest free) and
 /// advertising the client display's luminance volume in its EDID (all-zero = the built-in
 /// defaults). Returns `(monitor_id, target_id, adapter_luid_low, adapter_luid_high)` for the
@@ -774,6 +775,7 @@ pub fn create_monitor(
             refresh_rates: vec![refresh],
         },
         crate::adapter::is_seat_role(),
+        &req.extra_modes,
         &[],
     );
     let monitor = registry::insert(owner, session_id, hw_cursor, preferred_id, modes);
@@ -880,7 +882,8 @@ pub fn create_monitor(
 /// push the target list to the OS via `IddCxMonitorUpdateModes2` — the in-place mid-stream
 /// resize. No departure: OS identity, drain worker and encode session all survive.
 ///
-/// The list is a union — new mode first, every previously advertised mode kept (deduped, capped
+/// The list is a union — new mode first, every previously advertised mode (the ADD's extras
+/// included) kept (deduped, capped
 /// at [`vdisplay::MODE_LIST_CAP`]) — because the OS pins a monitor's settable set at arrival, so
 /// a replacement could only lose settable modes; the union pays off at the next same-id
 /// re-arrival, where the registry's mode history makes every previously used mode settable.
@@ -913,6 +916,7 @@ pub fn update_monitor_modes(
                 refresh_rates: vec![refresh],
             },
             crate::adapter::is_seat_role(),
+            &[],
             &modes,
         );
         (

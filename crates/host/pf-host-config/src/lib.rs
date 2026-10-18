@@ -339,6 +339,9 @@ pub struct HostConfig {
     /// rate; the stream stays at the session rate. At most 4; `0` (unset) is
     /// [`Self::vdisplay_hz_mult_for`]'s automatic choice per compositor.
     pub vdisplay_hz_mult: u32,
+    /// Row `vdisplay_resolutions` — `(width, height)` the Windows virtual display offers beside
+    /// the session's own, so a game can run below the stream size.
+    pub vdisplay_resolutions: Vec<(u32, u32)>,
     /// `PUNKTFUNK_GAMESCOPE_VRR=0` — opt out of adaptive sync. Default on: capable
     /// gamescope gets `--adaptive-sync` + `--framerate-limit` at the game rate so
     /// it paints on the game's commit. Inert on stock gamescope (`adaptive_sync_args`).
@@ -471,7 +474,23 @@ impl HostConfig {
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
         self.audio_voice_apps = parse_voice_apps(Some(&apps.join(",")));
+        let sizes: Vec<&str> = get("vdisplay_resolutions")
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        self.vdisplay_resolutions = parse_resolutions(&sizes);
     }
+}
+
+/// `["2560x1440", ...]` → `[(2560, 1440), ...]`, in order. A typo costs its own entry.
+fn parse_resolutions(items: &[&str]) -> Vec<(u32, u32)> {
+    items
+        .iter()
+        .filter_map(|s| {
+            let (w, h) = s.trim().split_once(['x', 'X'])?;
+            Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+        })
+        .collect()
 }
 
 /// `"60, 90,120"` → `[60, 90, 120]`, sorted and deduped. Junk and out-of-range
@@ -590,6 +609,19 @@ mod tests {
         assert_eq!(parse_refresh_rates(Some("60,abc,120")), vec![60, 120]);
         // 0 is not a refresh rate; 1920 is a width.
         assert_eq!(parse_refresh_rates(Some("0,60,1920")), vec![60]);
+    }
+
+    #[test]
+    fn resolution_list_parses_and_tolerates_junk() {
+        assert_eq!(
+            parse_resolutions(&["2560x1440", " 1920X1080 ", "1440p", "x720", "800x"]),
+            vec![(2560, 1440), (1920, 1080)]
+        );
+        // The default list is all well-formed.
+        assert_eq!(
+            parse_resolutions(registry::VDISPLAY_RESOLUTIONS).len(),
+            registry::VDISPLAY_RESOLUTIONS.len()
+        );
     }
 
     #[test]
