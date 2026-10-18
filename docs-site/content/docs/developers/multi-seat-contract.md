@@ -463,6 +463,17 @@ there names a file in the owner's home, which the door can't read, so it asks th
 for it over that host's loopback API. While that host is down the cover answers 404; asking for
 one never starts the owner's session.
 
+The console's calls about the host that streams go to the owner's host the same way, on the
+admin lane only: `gpus`, `session/settings`, `display/*` except `display/clients`, `hooks`,
+`stats/capture` and `stats/recordings`, `host/audio/apps`, Moonlight's `pair` and `clients`,
+`plugins`, a plugin's `ui-credential` and `ui/`, and `plugin-access`. The door also keeps the
+display policy and hooks it forwards: its second-device rule and pairing hooks read them.
+`host/settings` serves the door's own rows (`host_name`, `mdns`, `webtransport`,
+`webtransport_origins`, the Seat defaults, `update_*`) and the owner's host's others.
+`diagnostics` merges the two reports and `GET /host` reports the owner's `gamestream`; neither
+starts the owner's session. Any other call starts a stopped one and answers 503; a host that
+doesn't answer is 502.
+
 The box owner is a seat like any other. `adopt-owner <user>` adds a ledger row for an ordinary
 account that exists (uid 1000 up, never a seat's), and only for the one `door-helper on` recorded
 in `/var/lib/punktfunk-seats/owner`. Any other account, or any while nothing is recorded, answers

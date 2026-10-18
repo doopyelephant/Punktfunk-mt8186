@@ -85,7 +85,8 @@ What turning it on does:
 - **The monitor wins.** When you log in at the machine, the background session ends within a few
   seconds and your own session hosts you. Streams on the background session end, and the client
   reconnects. Nothing on your monitor is closed.
-- **The console is the door's.** It listens on the same port with the same password.
+- **The console is the door's.** It listens on the same port with the same password. Host
+  settings, Displays, Automation, Plugins and Health checks show your own host, which streams.
 - **Seats see your games.** Every seat shows your Steam libraries: its Steam plays, updates and
   runs Proton from them while the files stay yours. A library on a filesystem other than btrfs,
   ext4, xfs or f2fs stays hidden from seats. New games a seat installs go to

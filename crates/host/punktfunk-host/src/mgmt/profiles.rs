@@ -368,13 +368,13 @@ impl Drop for Waking {
 
 /// Whether a seat in `state` wants a start. A `Stopping` seat does: the supervisor runs the
 /// start after the stop.
-fn needs_start(state: &RuntimeState) -> bool {
+pub(super) fn needs_start(state: &RuntimeState) -> bool {
     !matches!(state, RuntimeState::Running | RuntimeState::Starting)
 }
 
 /// Starts a stopped seat in the background: a first logon takes tens of seconds, and the
 /// caller answers with the seat as it is now, `starting`.
-fn start_seat(id: &str) {
+pub(super) fn start_seat(id: &str) {
     let Ok(id) = pf_seats::SeatId::parse(id) else {
         return;
     };

@@ -580,6 +580,23 @@ async fn door_unavailable(lane: AuthLane) -> Option<String> {
         .unwrap_or_default()
 }
 
+/// Whether the owner's host behind this door serves Moonlight, for the console's pairing card:
+/// the door never does, and the owner's row may. Never starts the owner's session.
+async fn owner_gamestream(lane: AuthLane) -> bool {
+    if lane != AuthLane::Admin || !crate::seats::is_door() {
+        return false;
+    }
+    match super::owner::call("GET", "host".into(), None, Vec::new(), false).await {
+        super::owner::Answer::Reply(200, _, body) => {
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("gamestream")?.as_bool())
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 /// Drops the remembered blockers, so the next read asks again. A door switch request changes what
 /// they are: the operator fixes one, or the switch starts.
 pub(super) fn forget_door_probe() {
@@ -630,7 +647,7 @@ pub(crate) async fn get_host_info(
     })
     .await
     .unwrap_or_default();
-    let gs = st.gamestream_enabled;
+    let gs = st.gamestream_enabled || owner_gamestream(lane).await;
     Json(HostInfo {
         hostname: h.hostname.clone(),
         uniqueid: h.uniqueid.clone(),
@@ -661,7 +678,7 @@ pub(crate) async fn get_host_info(
             .map(|(_, codec)| codec)
             .collect()
         },
-        gamestream: st.gamestream_enabled,
+        gamestream: gs,
         door: pf_paths::seat::role().is_door(),
         door_unavailable,
         fingerprint: st.identity_fingerprint.map(hex::encode),

@@ -44,6 +44,7 @@ mod hooks;
 mod host;
 mod library;
 mod native;
+mod owner;
 #[cfg(windows)]
 mod pipes;
 mod plugin_access;
@@ -365,8 +366,10 @@ fn app(
         config_dir,
     });
     let (api_routes, api) = api_router_parts();
-    // Auth wraps the library guard: a caller without a credential gets 401, never the 409.
+    // Auth wraps the library guard and the door's forward to the owner: a caller without a
+    // credential gets 401, never the 409, and only the lane auth stamped is ever forwarded.
     let routed = api_routes
+        .route_layer(middleware::from_fn(owner::to_the_owner))
         .route_layer(middleware::from_fn(move |req: Request, next: Next| {
             library::box_library_is_read_only(box_library, req, next)
         }))
