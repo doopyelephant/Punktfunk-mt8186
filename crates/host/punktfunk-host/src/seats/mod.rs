@@ -331,6 +331,34 @@ pub(crate) fn token_of(seat: &pf_seats::Seat) -> Option<String> {
     crate::mgmt_token::read_persisted(&host_dir(seat))
 }
 
+/// A seat host whose binary an update replaced restarts once nobody plays on it: its runner
+/// starts the new one. The door and a user host are restarted by their own units.
+#[cfg(target_os = "linux")]
+pub(crate) fn restart_when_replaced() {
+    let spawned = std::thread::Builder::new()
+        .name("seat-exe-watch".into())
+        .spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(60));
+            let link = std::fs::read_link("/proc/self/exe").unwrap_or_default();
+            let idle = crate::session_status::snapshot().is_empty()
+                && crate::session_status::games().is_empty();
+            if replaced(&link) && idle {
+                tracing::info!("host binary replaced by an update: restarting while idle");
+                let _ = crate::native::stop_self();
+                return;
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "seat binary watch did not start");
+    }
+}
+
+/// Whether `/proc/self/exe` names a file an update unlinked.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn replaced(link: &std::path::Path) -> bool {
+    link.to_string_lossy().ends_with(" (deleted)")
+}
+
 /// The seat host's certificate pin from the ledger, `None` until the supervisor learned it.
 fn seat_pin(seat: &pf_seats::Seat) -> Option<[u8; 32]> {
     punktfunk_core::fp::parse_hex32(seat.fingerprint.as_deref()?)
@@ -478,6 +506,15 @@ fn tail_body(mut body: Box<dyn std::io::Read + Send>) -> axum::body::Body {
 mod tests {
     use super::{seen_on, Occupant};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn an_unlinked_binary_reads_as_replaced() {
+        use std::path::Path;
+        assert!(super::replaced(Path::new(
+            "/usr/bin/punktfunk-host (deleted)"
+        )));
+        assert!(!super::replaced(Path::new("/usr/bin/punktfunk-host")));
+    }
 
     #[test]
     fn only_the_callers_own_seat_sessions_leave_the_box_free() {

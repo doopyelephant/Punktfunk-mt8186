@@ -363,6 +363,10 @@ pub fn serve(
                 crate::door::publish_owner_key();
             }
         } else {
+            #[cfg(target_os = "linux")]
+            if pf_paths::seat::role().is_seat_host() {
+                crate::seats::restart_when_replaced();
+            }
             tokio::spawn(crate::hooks::runner());
         }
         // A Linux seat answers "Return to Gaming Mode" itself, so the box's login is never asked.
