@@ -3,7 +3,7 @@ import Section from "@unom/ui/section";
 import { Plus } from "lucide-react";
 import { type FC, useState } from "react";
 import { useGetPluginAccess } from "@/api/gen/plugin-access/plugin-access";
-import { useSeat } from "@/api/seat";
+import { usePluginsReachable } from "@/api/seat";
 import { SeatScope, SeatTitle } from "@/components/seat-scope";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -46,7 +46,7 @@ const Library: FC = () => {
 	// Which provider (if any) the games are narrowed to.
 	const [providerFilter, setProviderFilter] = useState<string | null>(null);
 	const nameOf = useSourceNames();
-	const seat = useSeat();
+	const reachable = usePluginsReachable();
 	// Folder and install requests wait under Sources; the tab says so while Games is open.
 	const access = useGetPluginAccess();
 	const waiting = (access.data ?? []).reduce(
@@ -93,8 +93,8 @@ const Library: FC = () => {
 								// Narrowing is a question about the games: answer it where they are.
 								if (provider) setTab("games");
 							}}
-							// Art & Metadata sources are the box's plugins; a seat has no say in them.
-							metadata={seat ? undefined : <MetadataSourcesSection />}
+							// Art & Metadata sources are plugins: only those the console reaches.
+							metadata={reachable ? <MetadataSourcesSection /> : undefined}
 						/>
 					</TabsContent>
 				</Tabs>

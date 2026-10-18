@@ -11,7 +11,7 @@ import {
 	refusalText,
 } from "@/api/pluginSurface";
 import { gamePlugins, usePlugins } from "@/api/plugins";
-import { useSeat } from "@/api/seat";
+import { usePluginsReachable } from "@/api/seat";
 import { PasswordConfirmDialog } from "@/components/password-confirm";
 import {
 	type JsonObject,
@@ -68,9 +68,9 @@ async function loadSection(plugin: string, entry: string): Promise<Loaded> {
 /** A tab per plugin with a section for this entry. A plugin that answers "none" adds no tab. */
 export function usePluginTabs(entryId: string | null): PluginTabSpec[] {
 	const { data } = usePlugins();
-	const seat = useSeat();
-	// A plugin's section is read from the box's own plugin runner.
-	const plugins = entryId && !seat ? gamePlugins(data) : [];
+	const reachable = usePluginsReachable();
+	// A plugin's section is read from a plugin runner the console reaches.
+	const plugins = entryId && reachable ? gamePlugins(data) : [];
 	const results = useQueries({
 		queries: plugins.map((p) => ({
 			queryKey: sectionKey(p.id, entryId ?? ""),

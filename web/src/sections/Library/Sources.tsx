@@ -13,7 +13,7 @@ import type { PluginAccessSnapshot } from "@/api/gen/model/pluginAccessSnapshot"
 import type { ScannerInfo } from "@/api/gen/model/scannerInfo";
 import { useGetPluginCatalog } from "@/api/gen/store/store";
 import { usePlugins } from "@/api/plugins";
-import { useSeat } from "@/api/seat";
+import { usePluginsReachable } from "@/api/seat";
 import { useInstallPlugin } from "@/api/store";
 import { useDialogs } from "@/components/dialogs";
 import { ROW_GAP, Stagger } from "@/components/stagger";
@@ -39,7 +39,7 @@ export const SourcesSection: FC<{
 	/** The provider currently filtered to in the grid, or null for "everything". */
 	activeFilter: string | null;
 	onFilter: (provider: string | null) => void;
-	/** Art & metadata: the box's, absent on a seat. */
+	/** Art & metadata: absent on a seat whose plugins the console can't reach. */
 	metadata?: ReactNode;
 }> = ({ activeFilter, onFilter, metadata }) => {
 	const qc = useQueryClient();
@@ -378,7 +378,7 @@ const SourceRow: FC<{
 	onPurge,
 }) => {
 	const isPlugin = source.origin === "plugin";
-	const seat = useSeat();
+	const reachable = usePluginsReachable();
 	const [accessOpen, setAccessOpen] = useState(accessInitiallyOpen);
 	const meta = [
 		isPlugin &&
@@ -412,8 +412,8 @@ const SourceRow: FC<{
 									: m.library_provider_filter(),
 								onSelect: onFilter,
 							},
-							// The form is the box's plugin; a seat has none to open.
-							!seat && {
+							// The form is a plugin the console reaches; another seat's is not.
+							reachable && {
 								label: m.library_source_settings(),
 								icon: <Settings2 />,
 								iconOnly: true,
