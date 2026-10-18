@@ -103,6 +103,16 @@ struct Monitor {
     /// Device whose acquire created this monitor. Its `keep_alive` overlay decides
     /// the linger at release ([`linger_for`]); `None` follows the host.
     client_fp: Option<[u8; 32]>,
+    /// A further screen of a client, held beside its first ([`VirtualDisplayManager::place_beside`]).
+    beside: Option<Beside>,
+}
+
+/// Where a further screen's monitor sits: `offset` from the monitor of client `anchor`, as the
+/// client's own monitors sit.
+#[derive(Clone, Copy, Debug)]
+struct Beside {
+    anchor: Option<[u8; 32]>,
+    offset: (i32, i32),
 }
 
 impl Monitor {
@@ -1249,7 +1259,25 @@ impl VirtualDisplayManager {
                 width,
             })
             .collect();
-        let placements = arrange(&members, &layout_policy);
+        let mut placements = arrange(&members, &layout_policy);
+        // A further screen holds its offset from its client's first, wherever that one went.
+        for i in 0..ordered.len() {
+            let Some(b) = inner.slots.get(&ordered[i].0).and_then(|s| s.mon.beside) else {
+                continue;
+            };
+            let at = ordered.iter().position(|&(slot, ..)| {
+                inner
+                    .slots
+                    .get(&slot)
+                    .is_some_and(|s| s.mon.client_fp == b.anchor)
+            });
+            if let Some(j) = at {
+                placements[i] = crate::layout::Placement {
+                    x: placements[j].x + b.offset.0,
+                    y: placements[j].y + b.offset.1,
+                };
+            }
+        }
         let positions: Vec<(CcdTargetKey, i32, i32)> = ordered
             .iter()
             .zip(&placements)
@@ -1422,6 +1450,7 @@ impl VirtualDisplayManager {
             cursor_excluded: added.cursor_excluded,
             // `acquire` records the creating device.
             client_fp: None,
+            beside: None,
         })
     }
 
@@ -1849,6 +1878,7 @@ impl VirtualDisplayManager {
             // declare registry is ground truth.
             cursor_excluded: added.cursor_excluded,
             client_fp: old.client_fp,
+            beside: old.beside,
         });
         match rollback_err {
             None => ReAdd::Arrived(mon),
@@ -2427,6 +2457,30 @@ pub(crate) struct ManagedInfo {
 }
 
 impl VirtualDisplayManager {
+    /// Hold client `fp`'s monitor at `offset` from client `anchor`'s, in this arrangement and
+    /// every later one; `None` leaves it where the layout puts it. Where `fp`'s monitor sits
+    /// now, `None` without one.
+    pub(crate) fn place_beside(
+        &self,
+        fp: [u8; 32],
+        anchor: Option<[u8; 32]>,
+        offset: Option<(i32, i32)>,
+    ) -> Option<(i32, i32)> {
+        let mut inner = self.state.lock().unwrap();
+        let slot = *inner
+            .slots
+            .iter()
+            .find(|(_, s)| s.mon.client_fp == Some(fp))?
+            .0;
+        if let Some(offset) = offset {
+            if let Some(s) = inner.slots.get_mut(&slot) {
+                s.mon.beside = Some(Beside { anchor, offset });
+            }
+            self.apply_group_layout(&mut inner);
+        }
+        inner.slots.get(&slot).map(|s| s.mon.position)
+    }
+
     /// Snapshot managed slots in acquire (generation) order. Empty when none live.
     pub(crate) fn snapshot(&self) -> Vec<ManagedInfo> {
         let inner = self.state.lock().unwrap();
@@ -2481,6 +2535,15 @@ impl VirtualDisplayManager {
 }
 
 /// Snapshot managed slots. Empty when no backend has initialised yet.
+/// [`VirtualDisplayManager::place_beside`] on the process manager.
+pub fn place_beside(
+    fp: [u8; 32],
+    anchor: Option<[u8; 32]>,
+    offset: Option<(i32, i32)>,
+) -> Option<(i32, i32)> {
+    vdm().place_beside(fp, anchor, offset)
+}
+
 pub(crate) fn snapshot() -> Vec<ManagedInfo> {
     VDM.get()
         .map(VirtualDisplayManager::snapshot)
@@ -2620,6 +2683,7 @@ mod tests {
                 position: (0, 0),
                 generation,
                 client_fp: None,
+                beside: None,
             };
             let life = lifecycle::State::Active { refs: 1 };
             inner.slots.insert(target_id, Slot { mon, life });

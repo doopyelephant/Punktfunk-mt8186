@@ -141,7 +141,22 @@ pub struct HyprlandDisplay {
     hdr: bool,
     /// The client panel's volume, the HDR head's mastering target when known.
     client_hdr: Option<pf_frame::HdrMeta>,
+    /// The last `create`'s head and its rule, which [`apply_position`] re-issues at a place.
+    ///
+    /// [`apply_position`]: VirtualDisplay::apply_position
+    placed: Option<Placed>,
 }
+
+/// One head's monitor rule: name, mode, colour, and the place a reload re-applies.
+struct Placed {
+    name: String,
+    mode: Mode,
+    colour: Option<HdrRule>,
+    at: Position,
+}
+
+/// Where a head sits on the desktop; `None` lets Hyprland place it (`auto`).
+type Position = std::sync::Arc<std::sync::Mutex<Option<(i32, i32)>>>;
 
 impl Drop for HyprlandDisplay {
     fn drop(&mut self) {
@@ -168,6 +183,7 @@ impl HyprlandDisplay {
             join_live: false,
             hdr: false,
             client_hdr: None,
+            placed: None,
         })
     }
 
@@ -238,6 +254,17 @@ pub fn probe() -> Result<()> {
 }
 
 impl VirtualDisplay for HyprlandDisplay {
+    /// Re-issue the last head's rule at `(x, y)`; a config reload keeps the place.
+    fn apply_position(&mut self, x: i32, y: i32) {
+        let Some(p) = self.placed.as_ref() else {
+            return;
+        };
+        *p.at.lock().unwrap_or_else(|e| e.into_inner()) = Some((x, y));
+        if let Err(e) = set_monitor_rule(&p.name, p.mode, p.colour, Some((x, y))) {
+            tracing::warn!(output = %p.name, x, y, error = %format!("{e:#}"), "hyprland: head did not move");
+        }
+    }
+
     /// The trait calls this before every `create`, which is what lets the per-device
     /// topology be resolved from inside it (§6.1).
     fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
@@ -400,8 +427,15 @@ impl VirtualDisplay for HyprlandDisplay {
         if let Some(prev) = self.replace_output(&name) {
             adopt_active_workspace(&prev, &name);
         }
+        let at = Position::default();
+        self.placed = Some(Placed {
+            name: name.clone(),
+            mode,
+            colour,
+            at: at.clone(),
+        });
         let output_keepalive = OutputKeepalive {
-            _reload: watch_config_reloads(name.clone(), mode, colour),
+            _reload: watch_config_reloads(name.clone(), mode, colour, at),
             _output: output,
         };
         let keepalive: Box<dyn Send> = match direct_cast {
@@ -507,6 +541,7 @@ fn watch_config_reloads(
     name: String,
     mode: Mode,
     colour: Option<HdrRule>,
+    at: Position,
 ) -> Option<ReloadWatcher> {
     let path = event_socket_path()?;
     let sock = match UnixStream::connect(&path) {
@@ -547,7 +582,8 @@ fn watch_config_reloads(
                 output = %name, w = mode.width, h = mode.height,
                 "hyprland: config reloaded — re-applying the streamed head's monitor rule"
             );
-            if let Err(e) = set_monitor_rule(&name, mode, colour) {
+            let place = *at.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = set_monitor_rule(&name, mode, colour, place) {
                 // Errors only when the head has no framebuffer — gone after a
                 // reload (teardown, or compositor restart). Stop.
                 tracing::warn!(
@@ -1446,9 +1482,9 @@ fn monitor_format(name: &str) -> Option<String> {
 /// handshake, and this session ends at its first HDR capture with the reconnect advice.
 fn apply_monitor_rule(name: &str, mode: Mode, colour: Option<HdrRule>) -> Result<Option<HdrRule>> {
     let Some(rule) = colour else {
-        return set_monitor_rule(name, mode, None).map(|()| None);
+        return set_monitor_rule(name, mode, None, None).map(|()| None);
     };
-    let lit = match set_monitor_rule(name, mode, Some(rule)) {
+    let lit = match set_monitor_rule(name, mode, Some(rule), None) {
         Ok(()) => monitor_format(name).is_some_and(|f| ten_bit_format(&f)),
         Err(e) => {
             tracing::debug!(output = %name, error = %format!("{e:#}"), "HDR monitor rule rejected");
@@ -1464,7 +1500,7 @@ fn apply_monitor_rule(name: &str, mode: Mode, colour: Option<HdrRule>) -> Result
          offers SDR until it restarts"
     );
     pf_frame::hdr::note_hdr_capture_failed(pf_frame::hdr::HdrSource::VirtualOutput);
-    set_monitor_rule(name, mode, None).map(|()| None)
+    set_monitor_rule(name, mode, None, None).map(|()| None)
 }
 
 /// Set the client's exact mode on `name`, both config eras.
@@ -1475,17 +1511,23 @@ fn apply_monitor_rule(name: &str, mode: Mode, colour: Option<HdrRule>) -> Result
 /// confirm the output adopted the mode — some forms print `ok` for a command
 /// they ignored. A headless output starts at 0×0; if neither form yields a
 /// usable size, the compositor could not back the mode. `colour` appends the
-/// HDR keys to both forms.
-fn set_monitor_rule(name: &str, mode: Mode, colour: Option<HdrRule>) -> Result<()> {
+/// HDR keys to both forms; `at` places the head, `None` lets Hyprland (`auto`).
+fn set_monitor_rule(
+    name: &str,
+    mode: Mode,
+    colour: Option<HdrRule>,
+    at: Option<(i32, i32)>,
+) -> Result<()> {
     let hz = mode.refresh_hz.max(1);
+    let pos = at.map_or_else(|| "auto".to_string(), |(x, y)| format!("{x}x{y}"));
     let spec = format!(
-        "{name},{}x{}@{hz},auto,1{}",
+        "{name},{}x{}@{hz},{pos},1{}",
         mode.width,
         mode.height,
         colour.map(|c| c.hyprlang()).unwrap_or_default()
     );
     let lua = format!(
-        "hl.monitor{{ output = \"{name}\", mode = \"{}x{}@{hz}\", position = \"auto\", scale = 1{} }}",
+        "hl.monitor{{ output = \"{name}\", mode = \"{}x{}@{hz}\", position = \"{pos}\", scale = 1{} }}",
         mode.width,
         mode.height,
         colour.map(|c| c.lua()).unwrap_or_default()

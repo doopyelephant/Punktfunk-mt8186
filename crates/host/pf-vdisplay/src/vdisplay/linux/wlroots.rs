@@ -106,6 +106,8 @@ pub struct WlrootsDisplay {
     handoff_cast: bool,
     /// `mode_conflict: join` admitted this session.
     join_live: bool,
+    /// The last `create`'s head, which [`apply_position`](VirtualDisplay::apply_position) moves.
+    last_output: Option<String>,
 }
 
 /// A parked ScreenCast of `name`: node, portal fd, and the guard that closes it.
@@ -133,6 +135,7 @@ impl WlrootsDisplay {
             pending_cast: None,
             handoff_cast: false,
             join_live: false,
+            last_output: None,
         })
     }
 
@@ -155,6 +158,15 @@ pub fn is_available() -> bool {
 }
 
 impl VirtualDisplay for WlrootsDisplay {
+    fn apply_position(&mut self, x: i32, y: i32) {
+        let Some(name) = self.last_output.as_deref() else {
+            return;
+        };
+        if let Err(e) = swaymsg(&["output", name, "position", &x.to_string(), &y.to_string()]) {
+            tracing::warn!(output = %name, x, y, error = %format!("{e:#}"), "sway: head did not move");
+        }
+    }
+
     /// The trait calls this before every `create`, which is what lets the per-device
     /// topology be resolved from inside it (§6.1).
     fn set_client_identity(&mut self, fingerprint: Option<[u8; 32]>) {
@@ -273,6 +285,7 @@ impl VirtualDisplay for WlrootsDisplay {
             }
         };
         let name = output.name.clone();
+        self.last_output = Some(name.clone());
 
         // Client mode is also the refresh clock; without it the output produces no frames.
         let m = format!(
