@@ -415,8 +415,9 @@ impl SettingsScreen {
                     ListMsg::None => pulse,
                 };
             }
-            // A remote has no Y: its OK types a rate, as a click does.
-            RowId::Bitrate if matches!(msg, ListMsg::Activate) => {
+            // A remote has no Y: its OK types a rate, as a click does. PyroWave's quality is the
+            // rate, so there OK flips Automatic and Fixed.
+            RowId::Bitrate if matches!(msg, ListMsg::Activate) && !pyrowave_rate(ctx) => {
                 self.typing = Some((Typing::Bitrate, String::new()));
                 return Some(MenuPulse::Confirm);
             }
@@ -589,7 +590,7 @@ impl ScreenView for SettingsScreen {
         // Y opens the typed bitrate, size or scale.
         if ev == MenuEvent::Secondary {
             let typing = match ids.get(self.list.cursor) {
-                Some(RowId::Bitrate) => Typing::Bitrate,
+                Some(RowId::Bitrate) if !pyrowave_rate(ctx) => Typing::Bitrate,
                 Some(RowId::Resolution) => Typing::Width,
                 Some(RowId::RenderScale) => Typing::Scale,
                 _ => return None,
@@ -657,7 +658,7 @@ impl ScreenView for SettingsScreen {
                 Hint::new(HintKey::Confirm, "Open"),
                 Hint::new(HintKey::Back, "Done"),
             ],
-            Some(RowId::Bitrate) => vec![
+            Some(RowId::Bitrate) if !pyrowave_rate(ctx) => vec![
                 Hint::new(HintKey::Adjust, "Adjust"),
                 Hint::new(HintKey::Confirm, "Custom rate"),
                 Hint::new(HintKey::Back, "Done"),

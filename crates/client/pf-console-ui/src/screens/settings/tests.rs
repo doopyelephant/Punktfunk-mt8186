@@ -808,8 +808,9 @@ fn av1_reads_unsupported_without_a_hardware_decoder() {
     );
 }
 
-/// Under PyroWave the quality stands where Bitrate stood, priced at the stream's mode, and
-/// steps a tenth at a time inside its bounds. The stored bitrate is kept for the other codecs.
+/// Under PyroWave the quality stands in for Bitrate's rate, priced at the stream's mode, and
+/// steps a tenth at a time inside its bounds. Bitrate stays as Automatic or Fixed, and the
+/// stored rate is kept for the other codecs until the player flips it.
 #[test]
 fn pyrowave_quality_takes_the_bitrate_rows_place() {
     let mut settings = Settings {
@@ -823,7 +824,9 @@ fn pyrowave_quality_takes_the_bitrate_rows_place() {
     };
     let library = crate::library::LibraryShared::default();
     let mut ctx = Ctx::test(&mut settings, &library);
-    assert!(!row_applies(RowId::Bitrate, &ctx));
+    assert!(row_applies(RowId::Bitrate, &ctx));
+    let spec = row_spec(RowId::Bitrate, &ctx, &[], &Default::default());
+    assert_eq!(spec.value.as_deref(), Some("Fixed"));
     assert!(row_applies(RowId::PyroWaveQuality, &ctx));
     assert!(
         changed(&[RowId::PyroWaveQuality], &ctx).is_empty(),
@@ -853,6 +856,25 @@ fn pyrowave_quality_takes_the_bitrate_rows_place() {
     assert!(!row_applies(RowId::PyroWaveQuality, &ctx));
     assert_eq!(ctx.settings.bitrate_kbps, 80_000, "the stored rate is kept");
     assert!(adjust(RowId::Bitrate, 1, false, &mut ctx));
+
+    ctx.settings.codec = "pyrowave".into();
+    assert!(adjust(RowId::Bitrate, -1, false, &mut ctx));
+    assert_eq!(ctx.settings.bitrate_kbps, 0);
+    let spec = row_spec(RowId::Bitrate, &ctx, &[], &Default::default());
+    assert_eq!(spec.value.as_deref(), Some("Automatic"));
+    assert!(
+        !adjust(RowId::Bitrate, -1, false, &mut ctx),
+        "Automatic is the bottom"
+    );
+    assert!(adjust(RowId::Bitrate, 1, false, &mut ctx));
+    assert_eq!(
+        ctx.settings.bitrate_kbps,
+        pf_client_core::settings::PYROWAVE_FIXED_KBPS
+    );
+    assert_eq!(
+        detail(RowId::Bitrate, &ctx),
+        pf_client_core::settings::PYROWAVE_BITRATE_HINT
+    );
 }
 
 #[test]

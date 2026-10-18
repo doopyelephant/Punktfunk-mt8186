@@ -608,10 +608,13 @@ extension SettingsView {
     }
 
     #if !os(tvOS)
-    /// The automatic-bitrate toggle + manual slider (and the >1 Gbps warning) rows. None under
-    /// PyroWave: its quality row stands in, and the stored rate waits for the next codec.
+    /// The automatic-bitrate toggle + manual slider (and the >1 Gbps warning) rows. Under
+    /// PyroWave only the toggle: its quality row stands in for the slider, and the stored rate
+    /// waits for the next codec.
     @ViewBuilder private var bitrateRows: some View {
-        if !pyroWaveRate {
+        if pyroWaveRate {
+            pyrowaveAutomaticRow
+        } else {
             described("Uses the host's default, 20 Mbps. Off to set it yourself.",
                 field: "bitrate_kbps") {
                 Toggle("Automatic bitrate", isOn: automaticBitrate)
@@ -636,9 +639,11 @@ extension SettingsView {
     }
     #else
     /// The TV's bitrate: a list of steps plus a typed rate, where the touch and desktop forms have
-    /// a switch and a slider. None under PyroWave, whose quality row stands in.
+    /// a switch and a slider. Under PyroWave only the switch, beside the quality row's rates.
     @ViewBuilder private var tvBitrateRow: some View {
-        if !pyroWaveRate {
+        if pyroWaveRate {
+            pyrowaveAutomaticRow
+        } else {
             described(effective.bitrateKbps > 1_000_000
                 ? Self.gigabitWarning : "Automatic uses the host's default, 20 Mbps.",
                 field: "bitrate_kbps") {
@@ -666,6 +671,15 @@ extension SettingsView {
         }
     }
     #endif
+
+    /// Automatic under PyroWave: on, the session steps its quality down while the link falls
+    /// short; off, any fixed rate pins it at the quality row's.
+    private var pyrowaveAutomaticRow: some View {
+        described("Lowers PyroWave quality while the network falls short; off always streams at "
+            + "your quality.", field: "bitrate_kbps") {
+            Toggle("Automatic bitrate", isOn: automaticBitrate)
+        }
+    }
 
     /// The codec is PyroWave and this device decodes it: the session's rate is its quality's.
     var pyroWaveRate: Bool {
