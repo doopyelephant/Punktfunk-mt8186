@@ -60,6 +60,8 @@ pub(super) struct BuildRequest {
     pub(super) client_hdr: Option<pf_frame::HdrMeta>,
     /// The loop's `au_seq`: a driver encoder's wire index continues there.
     pub(super) wire_seq_base: u32,
+    /// The session's screen this build shows, `0` the first ([`super::screens`]).
+    pub(super) screen: u8,
 }
 
 /// The session a Welcome-time [`prepare_display`] builds for, as the handshake settled it.
@@ -214,6 +216,7 @@ pub(in crate::native) fn prepare_display(
         plan,
         client_hdr,
         wire_seq_base: 0,
+        screen: 0,
     };
     let pipeline = build_pipeline_with_retry(&mut vd, &req, quit, stop, None, 8, Some(trace))?;
     Ok(PreparedDisplay { vd, pipeline })
@@ -635,6 +638,7 @@ fn attach_pipeline(
         plan,
         client_hdr,
         wire_seq_base,
+        screen,
     } = *req;
     #[cfg(target_os = "linux")]
     let reused_gen = vout.reused_gen;
@@ -680,6 +684,7 @@ fn attach_pipeline(
             kwin: cursor_id0_hides,
             gamescope: producer_is_gamescope,
             stream_hz: effective_hz,
+            screen,
         },
     )
     .context("capture virtual output")?;

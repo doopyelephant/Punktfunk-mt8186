@@ -422,6 +422,9 @@ mod tests {
             live_session: crate::session_status::register(
                 crate::session_status::Registration::fake("swap-test"),
             ),
+            screens: None,
+            applied_share: crate::native::bitrate::SHARE_ALL,
+            screen_wire: Arc::new(crate::native::wiring::ScreenWire::new()),
             send: super::super::send::SendThread::new(
                 Arc::new(frame_tx),
                 std::thread::spawn(|| {}),

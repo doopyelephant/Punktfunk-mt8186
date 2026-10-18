@@ -244,6 +244,7 @@ pub fn run(opts: Options) -> Result<()> {
                     kwin: compositor == crate::vdisplay::Compositor::Kwin,
                     gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
                     stream_hz: opts.fps,
+                    screen: 0,
                 },
             )
             .context("capture virtual output")?

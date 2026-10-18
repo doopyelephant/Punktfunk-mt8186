@@ -148,6 +148,12 @@ pub(super) struct StreamState {
     /// The session's place among the seat's followers, left when it ends.
     #[cfg(target_os = "linux")]
     pub(super) following: Option<crate::seats::session_switch::Following>,
+    /// Screens past the first, when the session negotiated them. Before `send`: their loops
+    /// hold senders the send thread waits out.
+    pub(super) screens: Option<super::screens::ScreenSet>,
+    /// The first screen's share of the video, as its encoder last took it.
+    pub(super) applied_share: u16,
+    pub(super) screen_wire: Arc<crate::native::wiring::ScreenWire>,
     pub(super) send: super::send::SendThread,
     pub(super) live_session: crate::session_status::LiveSessionGuard,
     pub(super) send_spread_us: Arc<AtomicU32>,
@@ -301,6 +307,34 @@ impl StreamState {
             shard_payload: self.shard_payload,
             fec_percent: fec,
             head_only_hz: self.pyrowave.then_some(self.cur_mode.refresh_hz),
+            share_permille: self.screen_wire.primary_share.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Follow the further screens: the client's list, their layout, and the first screen's
+    /// share of the video, which its encoder retargets to in place.
+    pub(super) fn on_screens(&mut self) {
+        let (mode, first_gen) = (self.delivered_mode(), self.cur_display_gen);
+        if let Some(set) = self.screens.as_mut() {
+            set.poll(mode, first_gen);
+        }
+        let share = self.screen_wire.primary_share.load(Ordering::Relaxed);
+        if share == self.applied_share {
+            return;
+        }
+        self.applied_share = share;
+        let kbps = self.enc_now().enc_kbps(self.bitrate_kbps);
+        if self.enc.reconfigure_bitrate(u64::from(kbps) * 1000) {
+            tracing::info!(
+                share_permille = share,
+                encoder_kbps = kbps,
+                "first screen's share of the video moved"
+            );
+        } else {
+            tracing::info!(
+                share_permille = share,
+                "first screen's share moves at its next rate change"
+            );
         }
     }
 
@@ -325,6 +359,7 @@ impl StreamState {
             plan: self.plan,
             client_hdr: self.client_hdr,
             wire_seq_base: self.clock.au_seq,
+            screen: 0,
         }
     }
 
@@ -436,6 +471,8 @@ impl StreamState {
                             retarget_tx,
                             gap_tx,
                             cursor_shape_tx,
+                            screens_rx,
+                            screen_tell_tx,
                         },
                     shared:
                         SessionShared {
@@ -456,6 +493,7 @@ impl StreamState {
                             cursor_client_draws,
                             arrival_poke,
                             offload_switch: _,
+                            screens: screen_wire,
                         },
                     mut bitrate_kbps,
                     audio_reserved_kbps,
@@ -507,6 +545,7 @@ impl StreamState {
             inj_session_tx,
             #[cfg(target_os = "linux")]
             follows_seat,
+            screens,
         } = ctx;
         // The raw flags, for the display, the prep retries and the threads that poll one.
         let stop = life.stop_flag().clone();
@@ -532,6 +571,8 @@ impl StreamState {
             shard_payload,
             fec_percent: fec,
             head_only_hz,
+            // Further screens build after this one and move its share then.
+            share_permille: crate::native::bitrate::SHARE_ALL,
         };
         let streamed_wire =
             streamed_au && pf_host_config::env_on("PUNKTFUNK_STREAMED_AU").unwrap_or(true);
@@ -635,6 +676,7 @@ impl StreamState {
                     plan,
                     client_hdr,
                     wire_seq_base: 0,
+                    screen: 0,
                 };
                 let pipe = build_pipeline_with_retry(
                     &mut vd,
@@ -754,6 +796,24 @@ impl StreamState {
             timing_conn,
             probe_seq,
         )?;
+        // Screens past the first build on threads of their own, now the send thread takes frames.
+        let screens = screens.map(|asked| {
+            let base = super::screens::ScreenBase {
+                compositor,
+                params: vd_params.clone(),
+                plan,
+                bit_depth,
+                enc_of: enc_derive(fec_target.load(Ordering::Relaxed)),
+                fec_target: fec_target.clone(),
+                live_bitrate: live_bitrate.clone(),
+                send: frame_tx.clone(),
+                tell: screen_tell_tx,
+                wire: screen_wire.clone(),
+                life: life.clone(),
+                first: Arc::default(),
+            };
+            super::screens::ScreenSet::new(base, screens_rx, asked)
+        });
 
         let capture_health: Arc<std::sync::Mutex<Option<pf_capture::CaptureHealth>>> =
             Arc::new(std::sync::Mutex::new(None));
@@ -831,6 +891,9 @@ impl StreamState {
             format_rx,
             format_result_tx,
             format_facts,
+            screens,
+            applied_share: crate::native::bitrate::SHARE_ALL,
+            screen_wire,
             send: super::send::SendThread::new(frame_tx, send_thread),
             send_spread_us,
             wire_rekeys,
@@ -992,6 +1055,7 @@ impl StreamState {
         while !self.life.stopping() && std::time::Instant::now() < self.deadline {
             self.on_session_switch();
             self.on_mode_switch();
+            self.on_screens();
             self.on_format_change();
             self.on_topology_reassert()?;
             self.on_fec_moved();
@@ -1027,6 +1091,9 @@ impl StreamState {
         self.life.enter(crate::lifecycle::Phase::Ending);
         if clean {
             self.drain();
+        }
+        if let Some(set) = self.screens.as_mut() {
+            set.shutdown();
         }
         self.send.join();
         // Source against wire: `source_seq` is what DWM composed into the driver's pool,

@@ -639,6 +639,7 @@ fn open_gs_mirror_source(
             kwin: compositor == crate::vdisplay::Compositor::Kwin,
             gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
             stream_hz: cfg.fps,
+            screen: 0,
         },
     )
     .context("attach a capturer to the mirrored monitor")
@@ -826,6 +827,7 @@ fn gs_capture_output(
             kwin: compositor == crate::vdisplay::Compositor::Kwin,
             gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
             stream_hz: cfg.fps,
+            screen: 0,
         },
     )
     .context("capture virtual output")?;

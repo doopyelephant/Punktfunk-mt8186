@@ -140,7 +140,8 @@ fn head_extent(mode: Option<(u32, u32, u32)>) -> Option<(u16, u16)> {
 /// resolved encoder — Linux uses it to seed the gamescope tiled offer, other
 /// platforms ignore it. `kwin`/`gamescope` carry PipeWire producer contracts
 /// node ids and remote fds cannot reveal. `stream_hz` is the wire rate, which a display
-/// created at a multiple of it cannot tell the capture.
+/// created at a multiple of it cannot tell the capture. `screen` is the session's screen the
+/// output shows, `0` the first: absolute input for it aims at this head.
 pub(crate) struct VirtualCaptureRequest {
     pub output: OutputFormat,
     pub codec: Option<crate::encode::Codec>,
@@ -148,6 +149,37 @@ pub(crate) struct VirtualCaptureRequest {
     pub kwin: bool,
     pub gamescope: bool,
     pub stream_hz: u32,
+    pub screen: u8,
+}
+
+/// Aim absolute input for screen `screen` at the head its capture attached to: the first
+/// screen's by name and with a warp, a further one's into its own slot.
+#[cfg(target_os = "linux")]
+fn aim_at_head(screen: u8, name: Option<String>, extent: Option<(u16, u16)>) {
+    if screen == 0 {
+        // The extent goes first: the output bumps the aim generation, and a warp that reads it
+        // must find this head's size.
+        crate::inject::set_stream_extent(extent);
+        crate::inject::set_stream_output(name);
+    } else {
+        crate::inject::set_screen_head(screen, name, extent);
+    }
+}
+
+/// [`aim_at_head`] by CCD target.
+#[cfg(target_os = "windows")]
+fn aim_at_target(
+    screen: u8,
+    key: pf_win_display::win_display::CcdTargetKey,
+    extent: Option<(u16, u16)>,
+) {
+    if screen == 0 {
+        crate::inject::set_stream_extent(extent);
+        crate::inject::set_stream_target(Some(key));
+    } else {
+        crate::inject::set_screen_head(screen, None, extent);
+        crate::inject::set_screen_target(screen, Some(key));
+    }
 }
 
 /// A live output's metadata without its keepalive: what [`capture_virtual_output`] needs to
@@ -222,6 +254,7 @@ pub fn capture_virtual_output(
         kwin,
         gamescope,
         stream_hz,
+        screen,
     } = request;
     // Portal negotiates its own pixel format, so `want.gpu` gates GPU zero-copy
     // (this path is always the portal; `CaptureBackend` is Windows-only dispatch)
@@ -233,10 +266,12 @@ pub fn capture_virtual_output(
 
     // Aim absolute input at THIS head: EXTEND backends sit beside the operator's
     // screens. `None` (Mutter/gamescope) CLEARS a stale name, e.g. after a Game-Mode
-    // switch Hyprland → gamescope has removed `PF-…`. The extent goes first: the output bumps
-    // the aim generation, and a warp that reads it must find this head's size.
-    crate::inject::set_stream_extent(head_extent(vout.preferred_mode));
-    crate::inject::set_stream_output(vout.output_name.clone().or(vout.input_output.clone()));
+    // switch Hyprland → gamescope has removed `PF-…`.
+    aim_at_head(
+        screen,
+        vout.output_name.clone().or(vout.input_output.clone()),
+        head_extent(vout.preferred_mode),
+    );
     // The encoder modifier probe keys on bit depth: HDR and 10-bit SDR both ride
     // the packed 10-bit fourccs.
     let bit_depth = if want.hdr || want.ten_bit_sdr { 10 } else { 8 };
@@ -415,10 +450,11 @@ pub fn capture_virtual_output(
         gamescope: _gamescope,
         // The driver paces its own encodes (`pf_frame::pace`).
         stream_hz,
+        screen,
     } = request;
     // A monitor this host did not create is captured by a worker; the driver has no part in it.
     if vout.ownership == crate::vdisplay::DisplayOwnership::External {
-        return capture_external_output(vout, want, stream_hz);
+        return capture_external_output(vout, want, stream_hz, screen);
     }
     let target = vout.win_capture.clone().ok_or_else(|| {
         anyhow::anyhow!(
@@ -429,13 +465,12 @@ pub fn capture_virtual_output(
     // Aim the injectors' absolute mapping (pen/touch/abs-mouse) at THIS display: the wire
     // normalizes over the streamed frame, and mapping it over the whole virtual desktop is wrong
     // the moment a physical monitor shares the desktop (Extend topology, or an Exclusive isolate
-    // degraded to the keep-physicals fallback) — the pen-offset field bug. Extent first, as on
-    // Linux: the target bumps the aim generation.
-    crate::inject::set_stream_extent(head_extent(vout.preferred_mode));
-    crate::inject::set_stream_target(Some(pf_win_display::win_display::CcdTargetKey::new(
-        target.adapter_luid,
-        target.target_id,
-    )));
+    // degraded to the keep-physicals fallback) — the pen-offset field bug.
+    aim_at_target(
+        screen,
+        pf_win_display::win_display::CcdTargetKey::new(target.adapter_luid, target.target_id),
+        head_extent(vout.preferred_mode),
+    );
     let pref = vout.preferred_mode;
     let keep = vout.keepalive;
     // Resolve the pf-vdisplay control device once and wrap its cursor IOCTLs for the
@@ -502,6 +537,7 @@ fn capture_external_output(
     vout: crate::vdisplay::VirtualOutput,
     want: OutputFormat,
     stream_hz: u32,
+    screen: u8,
 ) -> Result<Box<dyn Capturer>> {
     use anyhow::Context as _;
     let target = vout
@@ -513,8 +549,7 @@ fn capture_external_output(
         .target(key)
         .and_then(|t| t.hdr)
         .unwrap_or(false);
-    crate::inject::set_stream_extent(head_extent(vout.preferred_mode));
-    crate::inject::set_stream_target(Some(key));
+    aim_at_target(screen, key, head_extent(vout.preferred_mode));
     let worker = crate::windows::capture_worker::spawn().context("start the capture worker")?;
     let source = pf_capture::WgcSource {
         gdi_name: target.gdi_name,
@@ -658,6 +693,7 @@ pub fn capture_virtual_output(
         kwin: _kwin,
         gamescope: _gamescope,
         stream_hz: _stream_hz,
+        screen: _screen,
     } = request;
     anyhow::bail!("virtual-output capture requires Linux or Windows")
 }
@@ -704,6 +740,7 @@ mod live_tests {
                 kwin: false,
                 gamescope: false,
                 stream_hz: 60,
+                screen: 0,
             },
         )
         .expect("open the IDD-push capturer");
@@ -827,6 +864,7 @@ mod live_tests {
                 kwin: false,
                 gamescope: false,
                 stream_hz: 60,
+                screen: 0,
             },
         )
         .expect("open the IDD-push capturer");

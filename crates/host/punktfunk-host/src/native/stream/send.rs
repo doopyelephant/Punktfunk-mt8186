@@ -17,6 +17,9 @@ pub(super) struct AuMeta {
     pub(super) flags: u32,
     /// [`super::state::StreamState::epoch`] when this AU was encoded.
     pub(super) epoch: u8,
+    /// The video stream it rides ([`punktfunk_core::packet::screen_stream`]): 0 the first
+    /// screen's, whose AUs alone the NACK ring, host timing and the perf window see.
+    pub(super) stream: u8,
     /// Predicted at submit as `au_seq + inflight`; stamped on the wire so RFI stays 1:1 across rebuilds.
     pub(super) frame_index: u32,
     pub(super) encode_us: u32,
@@ -396,6 +399,7 @@ pub(super) fn send_loop(
         ring: ResendRing::default(),
         link: None,
         streamed: None,
+        deferred: std::collections::VecDeque::new(),
         burst: None,
         perf_line: PerfLine::new(&stats),
         wire,
@@ -415,7 +419,7 @@ pub(super) fn send_loop(
         };
         match frame_rx.recv_timeout(wait) {
             Ok(send_msg) => {
-                if !lp.step(send_msg) {
+                if !lp.step(send_msg) || !lp.drain_deferred() {
                     break;
                 }
             }
@@ -451,12 +455,29 @@ struct SendLoop {
     /// The `L` last paced at, logged when it moves.
     link: Option<crate::send_pacing::LinkRate>,
     streamed: Option<punktfunk_core::packet::StreamedAu>,
+    /// Further screens' frames that came while a streamed AU was open: the pacer holds one
+    /// frame from its first chunk to its last.
+    deferred: std::collections::VecDeque<FrameMsg>,
     burst: Option<ProbeBurst>,
     perf_line: PerfLine,
     wire: WireLine,
 }
 
 impl SendLoop {
+    /// Send what [`Self::deferred`] holds once no streamed AU is open. `false` when a send
+    /// failed and the stream ends.
+    fn drain_deferred(&mut self) -> bool {
+        while self.streamed.is_none() {
+            let Some(f) = self.deferred.pop_front() else {
+                break;
+            };
+            if !self.step(SendMsg::Frame(f)) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Between AUs: the probe burst's next filler, or a new burst the client asked for.
     fn service_probe(&mut self) {
         // Never mid-AU: a burst spliced between streamed chunks would push the tail past its deadline.
@@ -512,10 +533,17 @@ impl SendLoop {
     /// failed and the stream ends.
     fn step(&mut self, send_msg: SendMsg) -> bool {
         use crate::send_pacing as sp;
-        if let SendMsg::Resend { frame, shards } = send_msg {
-            self.resend(frame, &shards);
-            return true;
-        }
+        let send_msg = match send_msg {
+            SendMsg::Resend { frame, shards } => {
+                self.resend(frame, &shards);
+                return true;
+            }
+            SendMsg::Frame(f) if f.meta.stream != 0 && self.streamed.is_some() => {
+                self.deferred.push_back(f);
+                return true;
+            }
+            other => other,
+        };
         let stats = &self.stats;
         let bitrate_kbps = stats.bitrate_kbps.load(Ordering::Relaxed);
         let reported = stats.link_kbps.load(Ordering::Relaxed);
@@ -544,10 +572,16 @@ impl SendLoop {
                 "pacing at the link rate"
             );
         }
-        // A new epoch takes effect at the AU that carries it, never mid-AU.
+        // A new epoch and stream take effect at the AU that carries them, never mid-AU.
         match &send_msg {
-            SendMsg::Frame(f) => self.session.set_epoch(f.meta.epoch),
-            SendMsg::Chunk(c) if c.first => self.session.set_epoch(c.meta.epoch),
+            SendMsg::Frame(f) => {
+                self.session.set_epoch(f.meta.epoch);
+                self.session.set_stream(f.meta.stream);
+            }
+            SendMsg::Chunk(c) if c.first => {
+                self.session.set_epoch(c.meta.epoch);
+                self.session.set_stream(c.meta.stream);
+            }
             SendMsg::Chunk(_) | SendMsg::Resend { .. } => {}
         }
         let outcome = match send_msg {
@@ -564,7 +598,8 @@ impl SendLoop {
                     },
                 m.frame_index,
                 &mut self.pacer,
-                &mut self.ring,
+                // A further screen's frames are not NACKed: its lane asks for a keyframe.
+                (m.stream == 0).then_some(&mut self.ring),
             )
             .map(|stat| Some((m, stat))),
             SendMsg::Chunk(c) => handle_chunk(
@@ -609,8 +644,12 @@ impl SendLoop {
         }
     }
 
-    /// An AU is on the wire: the bring-up mark, host timing, the spread EWMA and the windows.
+    /// An AU is on the wire: the bring-up mark, host timing, the spread EWMA and the windows,
+    /// each the first screen's alone.
     fn sent(&mut self, m: &AuMeta, stat: &PaceStat) {
+        if m.stream != 0 {
+            return;
+        }
         let probe = m.flags & FLAG_PROBE as u32 != 0;
         if !probe {
             self.stats.bringup.finish("first_packet");
@@ -806,7 +845,7 @@ impl PerfLine {
 #[cfg(test)]
 mod tests {
     use super::{
-        send_loop, AuMeta, FrameMsg, PaceStat, PerfWindow, SendMsg, SendStats, SendThread,
+        send_loop, AuMeta, ChunkMsg, FrameMsg, PaceStat, PerfWindow, SendMsg, SendStats, SendThread,
     };
     use punktfunk_core::transport::Transport;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -962,6 +1001,7 @@ mod tests {
             meta: AuMeta {
                 capture_ns: 0,
                 epoch: 0,
+                stream: 0,
                 flags: 0,
                 frame_index: index,
                 encode_us: 0,
@@ -1022,6 +1062,70 @@ mod tests {
         assert_eq!(m.resend_pkts, 2);
     }
 
+    /// A further screen's frame sent while a streamed AU is open leaves after that AU's last
+    /// packet, on its own stream, and stays out of the NACK ring.
+    #[test]
+    fn a_further_screens_frame_waits_out_an_open_streamed_au() {
+        let (host_tp, client_tp) = punktfunk_core::transport::loopback_pair(0, 0);
+        let (frame_tx, stop, _, thread) =
+            spawn_loop(Box::new(host_tp), crate::send_pacing::Shape::Auto);
+        let meta = |stream| match frame(1) {
+            SendMsg::Frame(f) => AuMeta { stream, ..f.meta },
+            _ => unreachable!(),
+        };
+        let chunk = |first, last| {
+            SendMsg::Chunk(ChunkMsg {
+                data: vec![5u8; 4 * 1024],
+                first,
+                last,
+                meta: meta(0),
+            })
+        };
+        frame_tx.send(chunk(true, false)).unwrap();
+        frame_tx
+            .send(SendMsg::Frame(FrameMsg {
+                data: vec![7u8; 2048],
+                meta: meta(2),
+            }))
+            .unwrap();
+        frame_tx.send(chunk(false, true)).unwrap();
+        frame_tx
+            .send(SendMsg::Resend {
+                frame: 1,
+                shards: vec![0],
+            })
+            .unwrap();
+        let mut tags = Vec::new();
+        let mut quiet = std::time::Instant::now();
+        while quiet.elapsed() < std::time::Duration::from_millis(200) {
+            match client_tp.recv().unwrap() {
+                Some(p) => {
+                    tags.push(p[0]);
+                    quiet = std::time::Instant::now();
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(frame_tx);
+        thread.join().unwrap();
+        let first = tags
+            .iter()
+            .position(|&t| t == 2)
+            .expect("the screen's frame went out");
+        let last = tags.iter().rposition(|&t| t == 2).unwrap();
+        assert!(
+            first > 0 && tags[..first].iter().all(|&t| t == 0),
+            "{tags:?}"
+        );
+        assert!(tags[first..=last].iter().all(|&t| t == 2), "{tags:?}");
+        assert_eq!(
+            tags[last + 1..],
+            [0],
+            "the resend is the first screen's shard"
+        );
+    }
+
     /// A host AU feeds the host stages and a driver AU the driver's. A repeat never counts
     /// toward the queue stage, and a probe never toward capture → sent.
     #[test]
@@ -1029,6 +1133,7 @@ mod tests {
         let meta = AuMeta {
             capture_ns: 0,
             epoch: 0,
+            stream: 0,
             flags: 0,
             frame_index: 0,
             encode_us: 900,
