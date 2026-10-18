@@ -233,11 +233,28 @@ pub(in crate::native) fn spawn_display_prep(
     std::thread::Builder::new()
         .name("punktfunk1-stream".into())
         .spawn(move || -> Result<()> {
-            let prepared = prepare_display(prep, &quit, &stop, &trace);
-            let Ok(ctx) = ctx_rx.recv() else {
-                return Ok(());
-            };
-            virtual_stream(ctx, Some(prepared?))
+            let done = AtomicBool::new(false);
+            std::thread::scope(|s| {
+                // Start lands while the display builds: its plane serves the client's ramp
+                // meanwhile. A failed spawn drops `ctx_rx`, and the caller builds inline.
+                let done = &done;
+                let ramp = std::thread::Builder::new()
+                    .name("punktfunk-ramp".into())
+                    .spawn_scoped(s, move || {
+                        let mut ctx = ctx_rx.recv().ok()?;
+                        super::ramp::serve_while_prepping(&mut ctx.common, done);
+                        Some(ctx)
+                    })?;
+                let prepared = prepare_display(prep, &quit, &stop, &trace);
+                done.store(true, Ordering::SeqCst);
+                let ctx = ramp
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("the bring-up ramp thread panicked"))?;
+                match ctx {
+                    Some(ctx) => virtual_stream(ctx, Some(prepared?)),
+                    None => Ok(()),
+                }
+            })
         })
         .map(|handle| (ctx_tx, handle))
         .map_err(|e| {

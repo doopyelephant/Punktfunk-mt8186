@@ -69,16 +69,18 @@ impl RampServer {
             .spawn({
                 let done = done.clone();
                 let open = open.clone();
+                let mut session = session;
                 move || {
                     serve(
-                        session,
-                        probe_rx,
+                        &mut session,
+                        &probe_rx,
                         &probe_result_tx,
                         &done,
                         &stop,
                         &open,
                         fit_pin,
-                    )
+                    );
+                    (session, probe_rx)
                 }
             })
             .map_err(|e| tracing::warn!(error = %e, "bring-up ramp thread not started"))
@@ -135,14 +137,14 @@ impl Drop for RampServer {
 /// for [`PIN_FIT_IDLE_GRACE`] after the last result, bounded by
 /// [`PIN_FIT_MAX_GRACE`] from first ready.
 fn serve(
-    mut session: Session,
-    probe_rx: ProbeReceiver,
+    session: &mut Session,
+    probe_rx: &ProbeReceiver,
     probe_result_tx: &tokio::sync::mpsc::UnboundedSender<ProbeResult>,
     done: &AtomicBool,
     stop: &AtomicBool,
     open: &AtomicBool,
     fit_pin: bool,
-) -> (Session, ProbeReceiver) {
+) {
     let mut served = 0u32;
     let mut ready_at: Option<std::time::Instant> = None;
     let mut quiet_since: Option<std::time::Instant> = None;
@@ -171,7 +173,7 @@ fn serve(
                 let result = match ProbeBurst::begin(req, true) {
                     Some(burst) => {
                         served += 1;
-                        burst.run(&mut session, stop)
+                        burst.run(session, stop)
                     }
                     None => declined(),
                 };
@@ -191,7 +193,26 @@ fn serve(
             "served the client's bring-up ramp while the pipeline built"
         );
     }
-    (session, probe_rx)
+}
+
+/// The ramp window of a display prepared at Welcome (Windows). Start binds the plane seconds
+/// before the prepared display is ready, and `StreamState::new` opens its own window only after
+/// it, so the ramp is served from Start until `done`. `open` stays set for that second window,
+/// which closes it at the hand-over.
+pub(super) fn serve_while_prepping(common: &mut StreamCommon, done: &AtomicBool) {
+    if !common.probe_seq || !common.shared.ramp_open.load(Ordering::SeqCst) {
+        return;
+    }
+    let stop = common.life.stop_flag().clone();
+    serve(
+        &mut common.session,
+        &common.ends.probe_rx,
+        &common.ends.probe_result_tx,
+        done,
+        &stop,
+        &common.shared.ramp_open,
+        false,
+    );
 }
 
 #[cfg(test)]
@@ -502,5 +523,61 @@ mod tests {
         let started = std::time::Instant::now();
         drop(ramp);
         assert!(started.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    /// The Welcome-prep window borrows the plane: a step the client sent before it opened is
+    /// answered, and `open` stays set for the window `StreamState::new` opens next.
+    #[test]
+    fn a_borrowed_window_answers_a_queued_step_and_leaves_the_ramp_open() {
+        let (_client, mut session) = loopback_host();
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        let (res_tx, mut res_rx) = tokio::sync::mpsc::unbounded_channel();
+        req_tx
+            .send(
+                ProbeRequest {
+                    target_kbps: 5_000,
+                    duration_ms: 25,
+                }
+                .into(),
+            )
+            .expect("the receiver is alive");
+        let (open, done, stop) = (
+            AtomicBool::new(true),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        );
+        let (open_ref, done_ref, stop_ref, res_ref) = (&open, &done, &stop, &res_tx);
+        let result = std::thread::scope(|s| {
+            let window = s.spawn(move || {
+                serve(
+                    &mut session,
+                    &req_rx,
+                    res_ref,
+                    done_ref,
+                    stop_ref,
+                    open_ref,
+                    false,
+                )
+            });
+            let started = std::time::Instant::now();
+            let result = loop {
+                if let Ok(r) = res_rx.try_recv() {
+                    break Some(r);
+                }
+                if started.elapsed() > std::time::Duration::from_secs(5) {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            done.store(true, Ordering::SeqCst);
+            window.join().expect("the window returns once done");
+            result
+        });
+        let result = result.expect("the queued step is answered");
+        assert!(
+            result.bytes_sent > 0,
+            "a step that sent nothing measures nothing"
+        );
+        assert!(open.load(Ordering::SeqCst), "the next window still serves");
     }
 }
