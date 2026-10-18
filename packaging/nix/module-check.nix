@@ -399,6 +399,18 @@ let
       ok = hasSys seats "punktfunk-seat@.service" "X-RestartIfChanged=false";
     }
     {
+      # The owner's row runs its host from seat-session, so it takes the module's settings and
+      # the gamestream flag from a file only the owner's branch reads, and every seat encodes
+      # through the capped worker.
+      name = "seats hand the owner's row the module's settings and every seat the capped worker";
+      ok =
+        let
+          env = seats.systemd.services."punktfunk-seat@".environment;
+        in
+        lib.hasSuffix "-punktfunk-owner.env" env.PUNKTFUNK_OWNER_ENV
+        && lib.hasSuffix "/punktfunk-encode-worker" env.PUNKTFUNK_ENCODE_WORKER;
+    }
+    {
       name = "seats refuses a box with no host";
       ok = lib.any (lib.hasInfix "seats needs services.punktfunk.host.enable") (
         failedAssertions seatsWithoutHost

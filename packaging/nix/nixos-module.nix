@@ -59,6 +59,13 @@ let
 
   hostSettingsFile = pkgs.writeText "punktfunk-host.env" (renderEnv cfg.host.settings);
 
+  # The owner's row runs the owner's host from seat-session, not from the user unit, so it takes
+  # the same settings and the `gamestream` flag as a file: seat-session sources it for the owner
+  # alone (PUNKTFUNK_OWNER_ENV), so a seat of its own never sees them.
+  ownerSettingsFile = pkgs.writeText "punktfunk-owner.env" (
+    renderEnv (cfg.host.settings // lib.optionalAttrs cfg.host.gamestream { PUNKTFUNK_GAMESTREAM = true; })
+  );
+
   # WHICH users' `systemd --user` instances may run these units — and why they need saying at all.
   #
   # `systemd.user.*` installs into EVERY user's manager; there is no per-user form of it in NixOS.
@@ -238,7 +245,9 @@ in
         example = "/run/secrets/punktfunk-host.env";
         description = ''
           Extra `EnvironmentFile` layered AFTER `settings` (its values win), for values that must
-          not reach the store. Loaded optionally (a missing file does not fail the unit). The host
+          not reach the store. Loaded optionally (a missing file does not fail the unit). With
+          seats on, the owner's background session reads it as the owner, so keep it readable by
+          them there. The host
           keeps its own credentials in `~/.config/punktfunk/`, owner-only, and takes them out of its
           environment at startup so the games and hooks it launches cannot inherit them.
         '';
@@ -776,6 +785,15 @@ in
         path = seatPath;
         # seat-session starts this host; the packaged default is /usr/bin/punktfunk-host.
         environment.PUNKTFUNK_HOST_BIN = "${cfg.host.package}/bin/punktfunk-host";
+        # The owner's settings and `environmentFile`, for the owner's row only (see
+        # ownerSettingsFile). An `environmentFile` the owner can't read is skipped there.
+        environment.PUNKTFUNK_OWNER_ENV = concatStringsSep " " (
+          [ "${ownerSettingsFile}" ] ++ optional (cfg.host.environmentFile != null) (toString cfg.host.environmentFile)
+        );
+        # Every seat's host encodes: the capped worker and the WSI layer, as the user unit has them.
+        environment.PUNKTFUNK_ENCODE_WORKER = "${config.security.wrapperDir}/punktfunk-encode-worker";
+        environment.PUNKTFUNK_GAMESCOPE_WSI_LAYER_DIR = mkIf cfg.host.gamescopeHdr
+          "${cfg.host.gamescopePackage}/lib/punktfunk/vulkan/implicit_layer.d";
         # A switch must not end a seat's session. Seats survive an update on every other package.
         restartIfChanged = false;
       };
