@@ -1,6 +1,6 @@
 //! Splits a receive hole into its two causes: no datagram reached the socket, or this
-//! thread stopped asking. The receive loop polls every ~300 µs, so the longest poll-to-poll
-//! interval inside a silence is how long the client itself was away.
+//! thread stopped asking. The receive loop wakes on every datagram, else within 1 ms, so
+//! the longest poll-to-poll interval inside a silence is how long the client itself was away.
 //!
 //! [`IngressWindow`] is the periodic `wire ingress` line beside it: what arrived, what FEC
 //! repaired, what was lost, and the longest silence, including the ones below the warning floor.

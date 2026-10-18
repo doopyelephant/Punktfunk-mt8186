@@ -487,6 +487,20 @@ impl Transport for ClientMedia {
             .try_recv()
             .ok())
     }
+
+    fn wait_owned(&self, timeout: std::time::Duration) -> std::io::Result<Option<RecvBatch>> {
+        use std::sync::mpsc::RecvTimeoutError as E;
+        let rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+        match rx.recv_timeout(timeout) {
+            Ok(batch) => Ok(Some(batch)),
+            Err(E::Timeout) => Ok(None),
+            // The demux is gone: a bare return here would spin the pump until it notices.
+            Err(E::Disconnected) => {
+                std::thread::sleep(timeout);
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// `PUNKTFUNK_GSO=0`: the operator's off switch; GSO is on wherever the path has it.

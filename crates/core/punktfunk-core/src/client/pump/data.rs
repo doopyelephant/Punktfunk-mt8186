@@ -239,7 +239,12 @@ impl DataPump {
             }
             match polled {
                 Ok(frame) => self.on_frame(&mut lp, frame, clock_offset_ns, probe_active),
-                Err(PunktfunkError::NoFrame) => std::thread::sleep(Duration::from_micros(300)),
+                // Idle wire: a datagram wakes this at once; 1 ms bounds the timers above.
+                Err(PunktfunkError::NoFrame) => {
+                    if self.session.wait_packets(Duration::from_millis(1)).is_err() {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
