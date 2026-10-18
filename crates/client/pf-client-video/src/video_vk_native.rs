@@ -223,11 +223,15 @@ impl Codec {
         }
     }
 
-    fn ash_device(&self) -> ash::Device {
+    /// A completion waiter on this decoder's device (this crate names no `ash` type).
+    fn done_waiter(
+        &self,
+        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> Option<pf_vkdecode::decoder::waiter::DoneWaiter> {
         match self {
-            Codec::H264(d) => d.ash_device(),
-            Codec::H265(d) => d.ash_device(),
-            Codec::Av1(d) => d.ash_device(),
+            Codec::H264(d) => d.done_waiter(wake),
+            Codec::H265(d) => d.done_waiter(wake),
+            Codec::Av1(d) => d.done_waiter(wake),
         }
     }
 
@@ -933,7 +937,7 @@ impl NativeVulkanDecoder {
     /// the whole bitstream ring, so the pump waits each AU at once rather than one behind.
     /// Wake the pump as each shipped decode completes: the `Rung` hook, with the thread.
     pub(crate) fn set_decode_wake(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
-        self.waiter = pf_vkdecode::decoder::waiter::DoneWaiter::spawn(self.dec.ash_device(), wake);
+        self.waiter = self.dec.done_waiter(wake);
     }
 
     pub(crate) fn boosted(&self) -> bool {
