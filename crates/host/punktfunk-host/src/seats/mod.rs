@@ -325,6 +325,12 @@ fn host_dir(seat: &pf_seats::Seat) -> PathBuf {
         .join(seat.id.as_str())
 }
 
+/// The management token `seat`'s host was started with, as the supervisor left it for the door.
+#[cfg(target_os = "linux")]
+pub(crate) fn token_of(seat: &pf_seats::Seat) -> Option<String> {
+    crate::mgmt_token::read_persisted(&host_dir(seat))
+}
+
 /// The seat host's certificate pin from the ledger, `None` until the supervisor learned it.
 fn seat_pin(seat: &pf_seats::Seat) -> Option<[u8; 32]> {
     punktfunk_core::fp::parse_hex32(seat.fingerprint.as_deref()?)

@@ -345,6 +345,48 @@ mod tests {
     }
 }
 
+/// The key the door's console also accepts a console handoff under: the owner's host's token,
+/// which the owner's own `ctl console-url` signs with. Never a contract seat's, whose user can
+/// read their own. Kept level with the owner's row for the door's lifetime; absent without one.
+#[cfg(target_os = "linux")]
+pub(crate) const OWNER_KEY_FILE: &str = "owner-handoff-key";
+
+/// Keeps [`OWNER_KEY_FILE`] in the door's directory level with the owner's row's token.
+#[cfg(target_os = "linux")]
+pub(crate) fn publish_owner_key() {
+    let spawned = std::thread::Builder::new()
+        .name("door-owner-key".into())
+        .spawn(|| {
+            let path = pf_paths::config_dir().join(OWNER_KEY_FILE);
+            let mut last: Option<String> = None;
+            loop {
+                let token = crate::seats::ledger()
+                    .owner()
+                    .and_then(crate::seats::token_of);
+                if token != last {
+                    let written = match &token {
+                        Some(token) => pf_paths::replace_secret_file(&path, token.as_bytes()),
+                        None => std::fs::remove_file(&path).or_else(|e| {
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                Ok(())
+                            } else {
+                                Err(e)
+                            }
+                        }),
+                    };
+                    match written {
+                        Ok(()) => last = token,
+                        Err(error) => tracing::warn!(%error, "owner's handoff key not written"),
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "owner's handoff key not kept");
+    }
+}
+
 /// The door keeps no display policy or hooks of its own. Any its directory holds are the owner's
 /// console edits: once the owner's host answers, each per-device overlay it lacks and each hook
 /// it lacks goes there, and the door's file is set aside. Runs for the door's lifetime, until

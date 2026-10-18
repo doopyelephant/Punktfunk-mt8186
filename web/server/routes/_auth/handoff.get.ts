@@ -8,7 +8,7 @@ import {
 	useSession,
 } from "h3";
 import { type SessionData, sessionConfig, sessionEpoch } from "../../util/auth";
-import { verifyHandoff } from "../../util/handoff";
+import { ownerHandoffKeys, verifyHandoff } from "../../util/handoff";
 import { mgmtToken } from "../../util/mgmt";
 
 /** Tickets already redeemed, so a captured one cannot be replayed inside its TTL. Process-lifetime
@@ -27,9 +27,10 @@ export default defineEventHandler(async (event) => {
 		});
 	}
 
+	// On a door the owner's own host signs too: its `ctl console-url` holds that host's token.
 	const verdict = await verifyHandoff(
 		String(getQuery(event).t ?? ""),
-		key,
+		[key, ...ownerHandoffKeys()],
 		redeemed,
 	);
 	if (!verdict.ok) {

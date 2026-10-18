@@ -358,7 +358,10 @@ pub fn serve(
             crate::seats::events::fan_in();
             tokio::spawn(crate::seats::events::relay_to_owner());
             #[cfg(target_os = "linux")]
-            crate::door::hand_over_leftovers();
+            {
+                crate::door::hand_over_leftovers();
+                crate::door::publish_owner_key();
+            }
         } else {
             tokio::spawn(crate::hooks::runner());
         }
