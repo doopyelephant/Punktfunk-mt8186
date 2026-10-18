@@ -200,6 +200,9 @@ pub struct ConsoleOptions {
     pub system_keyboard: bool,
     /// A TV (Apple TV, Android TV): rows for a clipboard or a phone's sensors do nothing.
     pub tv: bool,
+    /// A headset whose windows stand in a room (Apple Vision Pro): its audio can be placed
+    /// there and its picture shown on more than a flat window.
+    pub spatial: bool,
     /// Host has another UI when the console is off (phone/tablet touch shell).
     /// False on desktop and Android TV — offering "off" would strand the user.
     pub fallback_ui: bool,
@@ -242,6 +245,7 @@ impl ConsoleOptions {
             version: None,
             system_keyboard,
             tv: false,
+            spatial: false,
             fallback_ui: false,
             // The desktop probe reads the session's Vulkan device, which the console does
             // not own yet. A GPU that runs this shell is a Vulkan 1.3 one, so it is yes.
@@ -438,6 +442,7 @@ impl Shell {
                 native_mode: None,
                 system_keyboard: opts.system_keyboard,
                 tv: opts.tv,
+                spatial: opts.spatial,
                 fallback_ui: opts.fallback_ui,
                 pyrowave_ok: opts.pyrowave_ok,
                 av1_ok: opts.av1_ok,

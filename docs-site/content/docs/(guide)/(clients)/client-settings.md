@@ -77,6 +77,7 @@ the rate instead of **Bitrate**.
 | **Keep host audio playing** | Off | Off, the host goes quiet while you stream. On, its own speakers keep playing too. With several clients, one asking is enough. | All |
 | **Stream microphone** | Off | Sends this device's microphone to the host. **Ctrl+Alt+Shift+V** [mutes it](/docs/input#muting-your-microphone). | All but Apple TV |
 | **Echo cancellation** | On | Keeps the host's audio, playing from your speakers, out of the microphone. Turn it off if your microphone does its own processing. See [Why do I hear myself](/docs/echo). | All but Apple TV |
+| **Spatial audio** | On | On, the sound comes from the window. Off plays the game's own mix straight to your ears. | Apple Vision Pro |
 | **Speaker**, **Microphone** | System default | Which output plays the stream and which input feeds the microphone. | Linux, Windows, Mac (plus **Microphone channel**) |
 
 ## Input

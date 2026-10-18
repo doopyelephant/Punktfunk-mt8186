@@ -1149,6 +1149,7 @@ final class SessionModel: ObservableObject {
             // uplink at all — a capture the host would only drop is pure privacy downside.
             micEnabled: settings.micEnabled && conn.canUseMic,
             echoCancel: settings.echoCancel,
+            spatialAudio: settings.spatialAudio,
             // The A/V sync reference: the presenter's own capture→on-glass meter. The stage-1
             // fallback stamps nothing, so the loop then declines to correct.
             videoLatency: endToEnd)

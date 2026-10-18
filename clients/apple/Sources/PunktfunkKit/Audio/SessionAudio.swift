@@ -117,6 +117,7 @@ public final class SessionAudio: @unchecked Sendable {
         let micChannel: Int
         let micEnabled: Bool
         let echoCancel: Bool
+        let spatialAudio: Bool
     }
     /// Watches the hardware for us (see `AudioDeviceWatcher`). Guarded by `stateLock`.
     private var deviceWatcher: AudioDeviceWatcher?
@@ -182,7 +183,7 @@ public final class SessionAudio: @unchecked Sendable {
     @MainActor
     public func start(
         speakerUID: String, micUID: String, micChannel: Int, micEnabled: Bool, echoCancel: Bool,
-        videoLatency: LatencyMeter? = nil
+        spatialAudio: Bool = SettingDefault.spatialAudio, videoLatency: LatencyMeter? = nil
     ) {
         self.videoLatency = videoLatency // before any dispatch below — startDrain reads it
         // Before any engine exists: the recovery watches the hardware, not the engines, and the
@@ -190,7 +191,7 @@ public final class SessionAudio: @unchecked Sendable {
         stateLock.lock()
         startConfig = StartConfig(
             speakerUID: speakerUID, micUID: micUID, micChannel: micChannel,
-            micEnabled: micEnabled, echoCancel: echoCancel)
+            micEnabled: micEnabled, echoCancel: echoCancel, spatialAudio: spatialAudio)
         stateLock.unlock()
         installDeviceChangeRecovery(micEnabled: micEnabled)
         #if os(macOS)
@@ -297,6 +298,20 @@ public final class SessionAudio: @unchecked Sendable {
             // mix with on the box anyway.
             try session.setCategory(.playback, mode: .default)
             #endif
+            #if os(visionOS)
+            // The room places app audio at its window; off, the game's own mix goes straight to
+            // the ears.
+            stateLock.lock()
+            let spatialAudio = startConfig?.spatialAudio ?? SettingDefault.spatialAudio
+            stateLock.unlock()
+            try? session.setIntendedSpatialExperience(
+                spatialAudio
+                    ? .headTracked(soundStageSize: .automatic, anchoringStrategy: .automatic)
+                    : .bypassed)
+            let spatial = spatialAudio ? "head_tracked" : "bypassed"
+            #else
+            let spatial = "none"
+            #endif
             // Asked for on every branch, mic on or off. The hardware IO buffer is one shared,
             // device-wide setting: a session that asks for nothing runs at whatever iOS or another
             // mixing app chose (85 ms seen), and the ring's floor is this quantum plus one packet.
@@ -334,7 +349,8 @@ public final class SessionAudio: @unchecked Sendable {
                 out_ch=\(session.outputNumberOfChannels)/\(session.maximumOutputNumberOfChannels) \
                 wire_ch=\(wireChannels) \
                 route=\(session.currentRoute.outputs.first?.portType.rawValue ?? "none") \
-                input=\(session.currentRoute.inputs.first?.portType.rawValue ?? "none")
+                input=\(session.currentRoute.inputs.first?.portType.rawValue ?? "none") \
+                spatial=\(spatial)
                 """)
             // The ring cannot hold less than quantum + one packet, so a grant far above the
             // request IS the audio delay — said at connect, with what is known to cause it.

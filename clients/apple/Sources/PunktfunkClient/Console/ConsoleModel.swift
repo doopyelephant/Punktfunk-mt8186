@@ -252,6 +252,7 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
             // off switch always has somewhere to land.
             "fallback_ui": true,
             "tv": isTV,
+            "spatial": isVision,
             // tvOS types through its own keyboard, where iPhone typing and dictation live.
             "system_keyboard": isTV,
             "av1_ok": AV1.hardwareDecodeSupported,
@@ -276,6 +277,14 @@ final class ConsoleModel: ObservableObject, ConsoleViewDelegate {
 
     private static var isTV: Bool {
         #if os(tvOS)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    private static var isVision: Bool {
+        #if os(visionOS)
         return true
         #else
         return false

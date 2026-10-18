@@ -49,6 +49,7 @@
     { "key": "keep_host_audio", "label": "Keep host audio playing", "category": "audio", "advanced": true },
     { "key": "echo_cancel", "label": "Echo cancellation", "category": "audio", "advanced": true },
     { "key": "audio_route", "label": "Audio processing", "category": "audio", "advanced": true },
+    { "key": "spatial_audio", "label": "Spatial audio", "category": "audio", "advanced": false },
 
     { "key": "touch_mode", "label": "Touch input", "category": "input", "advanced": false },
     { "key": "mouse_mode", "label": "Mouse input", "category": "input", "advanced": false },

@@ -172,6 +172,7 @@ fn catalog_key(id: RowId) -> Option<&'static str> {
         RowId::PadType => "gamepad",
         RowId::PadRumble => "pad_rumble",
         RowId::PhoneRumble => "rumble_on_phone",
+        RowId::SpatialAudio => "spatial_audio",
         RowId::PhoneGyro => "gyro_on_phone",
         RowId::PadForward => "gamepad_forwarding",
         RowId::Pad => "forward_pad",
@@ -1367,6 +1368,7 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::ReduceUiResolution,
             RowId::SecondScreen,
             RowId::LowLatency,
+            RowId::SpatialAudio,
             RowId::AudioRoute,
             RowId::CursorGestures,
             RowId::Controllers,
@@ -1392,6 +1394,7 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::Vsync,
             RowId::AllowVrr,
             RowId::Decoder,
+            RowId::SpatialAudio,
             RowId::AudioRoute,
             RowId::Shortcuts,
             RowId::CursorGestures,
@@ -1518,6 +1521,40 @@ fn android_rows_live_in_extra() {
         after.extra = before.extra.clone();
         assert_eq!(after, before);
     }
+}
+
+/// Only a Vision Pro has a room to place the sound in; the switch is its own key, on until
+/// written.
+#[test]
+fn spatial_audio_is_the_headsets_alone() {
+    let mut settings = Settings::default();
+    let library = crate::library::LibraryShared::default();
+    let phone = crate::screens::Device {
+        platform: crate::platform::Platform::Apple,
+        ..crate::screens::Device::test()
+    };
+    let headset = crate::screens::Device {
+        spatial: true,
+        ..phone.clone()
+    };
+    assert!(!row_applies(
+        RowId::SpatialAudio,
+        &Ctx {
+            device: &phone,
+            ..Ctx::test(&mut settings, &library)
+        }
+    ));
+    let ctx = &mut Ctx {
+        device: &headset,
+        ..Ctx::test(&mut settings, &library)
+    };
+    assert!(row_applies(RowId::SpatialAudio, ctx));
+    assert!(extra_bool(ctx.settings, device_keys::SPATIAL_AUDIO, true));
+    assert!(adjust(RowId::SpatialAudio, 1, true, ctx));
+    assert_eq!(
+        ctx.settings.extra.get("visionos.spatial_audio"),
+        Some(&serde_json::Value::Bool(false))
+    );
 }
 
 /// A Mac's tab offers the picker instead of the toggle; its preset editor keeps the toggle,
@@ -1656,7 +1693,7 @@ fn every_row_has_exactly_one_tab() {
             seen.push(*id);
         }
     }
-    assert_eq!(seen.len(), 70, "{seen:?}");
+    assert_eq!(seen.len(), 71, "{seen:?}");
     assert!(
         !seen.contains(&RowId::AdvancedChanged),
         "built per tab, never listed"

@@ -183,6 +183,7 @@ public enum ConsoleSettings {
         .bool("android.rumble_on_phone", DefaultsKey.rumbleOnDevice, SettingDefault.rumbleOnDevice),
         .bool("android.gyro_on_phone", DefaultsKey.gyroFromDevice, SettingDefault.gyroFromDevice),
         .bool("android.sc2_capture", DefaultsKey.sc2Capture, SettingDefault.sc2Capture),
+        .bool("visionos.spatial_audio", DefaultsKey.spatialAudio, SettingDefault.spatialAudio),
     ]
 
     // MARK: - the two that differ

@@ -1169,6 +1169,15 @@ extension SettingsView {
                 Toggle("Stream microphone", isOn: scoped(SettingsFields.micEnabled))
             }
             #endif
+            #if os(visionOS)
+            // Where this headset plays the sound (tier G).
+            if !inPresetScope {
+                described("On, the sound comes from the window. Off plays the game's own mix "
+                          + "straight to your ears.") {
+                    Toggle("Spatial audio", isOn: $spatialAudio)
+                }
+            }
+            #endif
             #if os(macOS)
             if !inPresetScope {
                 Picker("Microphone", selection: $micUID) {
