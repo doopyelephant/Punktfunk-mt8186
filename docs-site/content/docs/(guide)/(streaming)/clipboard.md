@@ -49,10 +49,9 @@ A `PUNKTFUNK_CLIPBOARD` line in `host.env` overrides step 1 and locks it in the 
 - **Leaving the app on iPhone or iPad** ends the stream. A host copy you haven't pasted, up to
   8 MiB, is brought over first so you can paste it in another app.
 - **One transfer is at most 64 MiB.**
-- **Passwords stay put on Mac, iPhone, iPad, Windows and Linux.** A copy a password manager marks
-  as secret is never sent. On Linux that takes a manager that marks copies the KDE way, such as
-  KeePassXC. Android and the host don't filter, so a password copied on the host reaches your
-  client.
+- **Passwords stay put on every client.** A copy a password manager marks as secret is never
+  sent. On Linux that takes a manager that marks copies the KDE way, such as KeePassXC. The host
+  doesn't filter, so a password copied on the host reaches your client.
 - **No client sends files yet**, so **Text** and **Text and files** behave the same.
 - **Moonlight has no clipboard.** It exists only in Punktfunk sessions.
 
@@ -87,8 +86,7 @@ lacks **Clipboard**.
 
 ### A copied password doesn't arrive
 
-Intended: the Mac, iPhone, iPad, Windows and Linux clients never send a copy a password manager
-marks as secret.
+Intended: no client sends a copy a password manager marks as secret.
 
 ### An image copied on Windows doesn't arrive on the host
 
