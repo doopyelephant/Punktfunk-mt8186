@@ -248,6 +248,9 @@ impl DataPump {
                 tracing::debug!("nack filled: the held frames go in order");
                 self.session.note_nack(true);
             }
+            for ask in self.shared.screens.tick(now) {
+                self.shared.send_feedback(&ask);
+            }
             match polled {
                 Ok(frame) => self.on_frame(&mut lp, frame, clock_offset_ns, probe_active),
                 // Idle wire: a datagram wakes this at once; 1 ms bounds the timers above.
@@ -261,6 +264,7 @@ impl DataPump {
         }
         // Wake a consumer blocked in `next_frame` with Closed, not a timeout.
         self.shared.frames.close();
+        self.shared.screens.close();
     }
 
     /// One polled frame. Probe filler is skipped, a frame with no decoder
@@ -274,6 +278,12 @@ impl DataPump {
     ) {
         if frame.flags & FLAG_PROBE as u32 != 0 {
             return; // speed-test filler, not video — measured via the counters above
+        }
+        if frame.stream != crate::packet::V2_STREAM_VIDEO {
+            if let Some(ask) = self.shared.screens.on_frame(frame, Instant::now()) {
+                self.shared.send_feedback(&ask);
+            }
+            return;
         }
         self.shared
             .feedback
@@ -585,6 +595,7 @@ mod tests {
             pts_ns: 0,
             flags: 0,
             epoch,
+            stream: 0,
             complete: true,
             part: None,
             received_ns: 0,

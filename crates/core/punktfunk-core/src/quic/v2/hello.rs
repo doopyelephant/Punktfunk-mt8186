@@ -64,6 +64,9 @@ pub struct ClientHello {
     /// Ask for access only: the host closes with [`crate::reject::ACCESS_GRANTED_CLOSE_CODE`]
     /// once this device may connect, and starts no session. An older host streams instead.
     pub access_only: bool,
+    /// Every screen this client shows, screen 0 first and matching `hello.mode`; empty for
+    /// one. Under [`reg::FEATURE_SCREENS`].
+    pub screens: Vec<super::msg::Screen>,
 }
 
 impl V2Message for ClientHello {
@@ -133,6 +136,7 @@ impl V2Message for ClientHello {
             })
             .when(profile.is_some(), |f| f.str(23, profile.unwrap_or("")))
             .when(self.access_only, |f| f.u8(26, 1))
+            .when(!self.screens.is_empty(), |f| self.screens.put(f, 27))
     }
 
     fn from_body(body: &[u8]) -> Result<Self> {
@@ -161,6 +165,7 @@ impl V2Message for ClientHello {
         let mut pyrowave_bpp_x100 = 0u16;
         let mut features = FeatureSet::default();
         let (mut profile, mut access_only) = (None, false);
+        let mut screens = Vec::new();
         let mut seen = Vec::new();
         let mut r = FieldReader::new(body);
         while let Some((tag, v)) = r.next_field()? {
@@ -214,6 +219,7 @@ impl V2Message for ClientHello {
                         .unwrap_or(0)
                 }
                 26 => access_only = v.first() == Some(&1),
+                27 => screens = <Vec<super::msg::Screen> as FieldValue>::get(v).unwrap_or_default(),
                 _ => {}
             }
         }
@@ -238,6 +244,7 @@ impl V2Message for ClientHello {
             features,
             profile,
             access_only,
+            screens,
         })
     }
 }
@@ -600,7 +607,7 @@ mod tests {
         /// changes nothing.
         #[test]
         fn hellos_settle_after_one_trip(h in hello_strategy(), w in welcome_strategy()) {
-            let ch = ClientHello { hello: h, client_label: None, abr_features: 0, preset: None, link: LinkFacts::default(), probe_only: false, pyrowave_bpp_x100: 0, resume: None, suites: vec![], features: FeatureSet::default(), profile: None, access_only: false };
+            let ch = ClientHello { hello: h, client_label: None, abr_features: 0, preset: None, link: LinkFacts::default(), probe_only: false, pyrowave_bpp_x100: 0, resume: None, suites: vec![], features: FeatureSet::default(), profile: None, access_only: false, screens: vec![] };
             let once = ClientHello::from_body(&ch.fields().into_body()).unwrap();
             let twice = ClientHello::from_body(&once.fields().into_body()).unwrap();
             prop_assert_eq!(twice, once);
@@ -725,6 +732,7 @@ mod tests {
             features: FeatureSet::default().with(reg::FEATURE_STREAM_CONFIG),
             profile: None,
             access_only: false,
+            screens: vec![],
         };
         // The bytes on the wire are pinned: a change here is a wire change.
         let frame: String = ch.encode_v2().iter().map(|b| format!("{b:02x}")).collect();
@@ -737,6 +745,30 @@ mod tests {
         );
         let back = ClientHello::from_body(&ch.fields().into_body()).unwrap();
         assert_eq!(back, ch);
+
+        // Screens ride along; a torn list reads as one screen, never a failed handshake.
+        let two = ClientHello {
+            screens: vec![
+                super::super::msg::Screen {
+                    mode: ch.hello.mode,
+                    primary: true,
+                    ..Default::default()
+                },
+                super::super::msg::Screen {
+                    index: 1,
+                    mode: ch.hello.mode,
+                    x: 1920,
+                    ..Default::default()
+                },
+            ],
+            ..ch.clone()
+        };
+        assert_eq!(
+            ClientHello::from_body(&two.fields().into_body()).unwrap(),
+            two
+        );
+        let torn = ch.fields().bytes(27, &[1, 2, 3]).into_body();
+        assert!(ClientHello::from_body(&torn).unwrap().screens.is_empty());
 
         let sh = ServerHello {
             welcome: ServerHello::from_body(&Fields::new().bytes(1, &[0; 16]).into_body())

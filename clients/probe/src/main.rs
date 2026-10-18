@@ -914,6 +914,7 @@ async fn handshake(
         },
         profile: args.as_profile.clone(),
         access_only: false,
+        screens: Vec::new(),
     };
     v2io::send(send, &hello).await?;
     // `Pending` repeats while the host asks its console about this probe.

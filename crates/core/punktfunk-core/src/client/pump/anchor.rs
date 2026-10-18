@@ -269,6 +269,7 @@ mod tests {
                 pts_ns: 0,
                 flags: 0,
                 epoch,
+                stream: 0,
                 complete: true,
                 part: None,
                 received_ns: 0,

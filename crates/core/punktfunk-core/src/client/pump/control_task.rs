@@ -104,6 +104,7 @@ impl ControlTask {
                         CtrlRequest::CursorRender(m) => m.encode_v2(),
                         CtrlRequest::InputEdge(ev) => v2msg::encode_input_event(&ev),
                         CtrlRequest::PadIdentity(id) => id.encode_v2(),
+                        CtrlRequest::Screens(screens) => v2msg::Screens { screens }.encode_v2(),
                     };
                     if v2io::write_frame(&mut ctrl_send, &frame).await.is_err() {
                         break;
@@ -160,6 +161,14 @@ impl ControlTask {
                             "the host changes the audio format"
                         );
                         shared.audio_anchor.lock().unwrap_or_else(|e| e.into_inner()).config(&cfg);
+                    } else if let Some(cfg) = decode::<v2msg::StreamConfig>(ty, &body)
+                        .ok()
+                        .filter(|c| c.stream != crate::packet::V2_STREAM_VIDEO)
+                    {
+                        shared.screens.config(cfg);
+                    } else if let Ok(layout) = decode::<v2msg::ScreenLayout>(ty, &body) {
+                        tracing::info!(screens = ?layout.screens, "host screen layout");
+                        shared.screens.set_layout(layout.screens);
                     } else if let Ok(cfg) = decode::<v2msg::StreamConfig>(ty, &body) {
                         let host = crate::quic::HostLink::of(&cfg);
                         if std::mem::replace(&mut *shared.host_link.lock().unwrap(), host) != host {

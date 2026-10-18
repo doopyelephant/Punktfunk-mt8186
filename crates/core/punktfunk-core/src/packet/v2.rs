@@ -23,6 +23,25 @@ pub const WIRE_OVERHEAD: usize = V2_HEADER_LEN + crate::crypto::TAG_LEN;
 pub const V2_STREAM_VIDEO: u8 = 0;
 /// Stream id of speed-test filler, in its own frame-index space.
 pub const V2_STREAM_PROBE: u8 = 1;
+
+/// The stream screen `screen` rides: the first is the video stream, the rest follow the probe.
+pub fn screen_stream(screen: u8) -> u8 {
+    if screen == 0 {
+        V2_STREAM_VIDEO
+    } else {
+        screen + 1
+    }
+}
+
+/// The screen stream `stream` carries; `None` for the probe and for ids past the tag's four bits.
+pub fn stream_screen(stream: u8) -> Option<u8> {
+    match stream {
+        V2_STREAM_VIDEO => Some(0),
+        V2_STREAM_PROBE => None,
+        s if s < 16 => Some(s - 1),
+        _ => None,
+    }
+}
 /// `flags` bit 15: this block ends the frame and `pad` counts.
 pub const V2_LAST_BLOCK: u16 = 0x8000;
 // A user flag at bit 15 or above would read as the last-block bit.
@@ -42,6 +61,9 @@ pub struct V2Stamp {
     /// The full packet number. The low half goes on the wire; the nonce takes all of it.
     pub seq: u64,
     pub epoch: u8,
+    /// The video stream the frame rides ([`screen_stream`]). Probe filler takes
+    /// [`V2_STREAM_PROBE`] whatever this says.
+    pub stream: u8,
     /// The host instant `pts_us = 0` stands for, Unix ns.
     pub clock_origin_ns: u64,
     /// The session's full block size, which places a uniform frame's blocks.
@@ -71,7 +93,7 @@ pub fn encode_v2(hdr: &PacketHeader, s: &V2Stamp) -> [u8; V2_HEADER_LEN] {
     let stream = if hdr.user_flags & u32::from(FLAG_PROBE) != 0 {
         V2_STREAM_PROBE
     } else {
-        V2_STREAM_VIDEO
+        s.stream & 0x0F
     };
     let flags = (hdr.user_flags & 0x7FFF) as u16 | if last { V2_LAST_BLOCK } else { 0 };
     let pts_us = (hdr.pts_ns as i64 - s.clock_origin_ns as i64).div_euclid(1000) as u32;
@@ -91,30 +113,31 @@ pub fn encode_v2(hdr: &PacketHeader, s: &V2Stamp) -> [u8; V2_HEADER_LEN] {
     b
 }
 
-/// One received v2 packet: its header in `punktfunk/1`'s slice-stream form, its epoch and its
-/// shard. `None` on a tag, stream or size this build does not accept. `pts_ref_us` is the
-/// newest capture time seen, which unwraps the 32-bit field; the first packet seeds it.
+/// One received v2 packet: its header in `punktfunk/1`'s slice-stream form, its epoch, its
+/// stream and its shard. `None` on a tag or size this build does not accept; the receiver
+/// decides which streams it takes. `pts_ref_us` is the newest capture time seen, which unwraps
+/// the 32-bit field; the first packet seeds it.
 pub fn decode_v2<'a>(
     pkt: &'a [u8],
     clock_origin_ns: u64,
     pts_ref_us: &mut Option<i64>,
-) -> Option<(PacketHeader, u8, &'a [u8])> {
+) -> Option<(PacketHeader, u8, u8, &'a [u8])> {
     let body = pkt.get(V2_HEADER_LEN..)?;
-    let (hdr, epoch) = decode_v2_header(pkt, body.len(), clock_origin_ns, pts_ref_us)?;
-    Some((hdr, epoch, body))
+    let (hdr, epoch, stream) = decode_v2_header(pkt, body.len(), clock_origin_ns, pts_ref_us)?;
+    Some((hdr, epoch, stream, body))
 }
 
 /// [`decode_v2`] from the header alone: `h` starts with the 30 header bytes and the shard
-/// after it is `body_len` bytes, wherever it is.
+/// after it is `body_len` bytes, wherever it is. Returns the header, epoch and stream.
 pub fn decode_v2_header(
     h: &[u8],
     body_len: usize,
     clock_origin_ns: u64,
     pts_ref_us: &mut Option<i64>,
-) -> Option<(PacketHeader, u8)> {
+) -> Option<(PacketHeader, u8, u8)> {
     let h = h.get(..V2_HEADER_LEN)?;
     let tag = h[0];
-    if tag & 0xF0 != 0 || tag > V2_STREAM_PROBE {
+    if tag & 0xF0 != 0 {
         return None;
     }
     let u16_at = |o: usize| u16::from_le_bytes([h[o], h[o + 1]]);
@@ -159,7 +182,7 @@ pub fn decode_v2_header(
         shard_index: u16_at(22),
         shard_bytes,
     };
-    Some((hdr, h[5]))
+    Some((hdr, h[5], tag))
 }
 
 /// The packet number nearest `reference` whose low half is `low`.
@@ -181,6 +204,7 @@ mod tests {
         V2Stamp {
             seq,
             epoch: 3,
+            stream: 0,
             clock_origin_ns: 1_700_000_000_000_000_000,
             max_data_per_block: 8,
         }
@@ -219,8 +243,8 @@ mod tests {
             for (i, (h, body)) in out.iter().enumerate() {
                 let mut pkt = encode_v2(h, &stamp(i as u64)).to_vec();
                 pkt.extend_from_slice(body);
-                let (d, epoch, shard) = decode_v2(&pkt, origin, &mut pts_ref).unwrap();
-                assert_eq!((epoch, d.frame_index, d.pts_ns), (3, 9, pts));
+                let (d, epoch, stream, shard) = decode_v2(&pkt, origin, &mut pts_ref).unwrap();
+                assert_eq!((epoch, stream, d.frame_index, d.pts_ns), (3, 0, 9, pts));
                 assert_eq!(d.user_flags, 0x20 | USER_FLAG_SLICE_STREAM);
                 if d.shard_index < d.data_shards && d.block_count != 0 {
                     closed = Some(d.frame_bytes);
@@ -249,15 +273,43 @@ mod tests {
             user_flags: u32::from(FLAG_PROBE),
             ..PacketHeader::default()
         };
-        let mut pkt = encode_v2(&h, &stamp(0)).to_vec();
+        // A screen's stream on the stamp never moves probe filler off its own.
+        let screen = V2Stamp {
+            stream: screen_stream(1),
+            ..stamp(0)
+        };
+        let mut pkt = encode_v2(&h, &screen).to_vec();
         pkt.extend_from_slice(&[0; 16]);
         assert_eq!(pkt[0], V2_STREAM_PROBE);
         let mut r = None;
         assert!(decode_v2(&pkt, 0, &mut r).unwrap().0.user_flags & u32::from(FLAG_PROBE) != 0);
-        for tag in [0x02u8, 0x10, 0x40, 0xC0] {
+        for tag in [0x10u8, 0x40, 0xC0] {
             pkt[0] = tag;
             assert!(decode_v2(&pkt, 0, &mut r).is_none(), "tag {tag:#x}");
         }
+    }
+
+    /// A screen's frame carries its stream and reads back as video, not probe.
+    #[test]
+    fn a_screen_rides_its_own_stream() {
+        let h = PacketHeader {
+            shard_bytes: 16,
+            data_shards: 1,
+            block_count: 1,
+            user_flags: u32::from(FLAG_PIC),
+            ..PacketHeader::default()
+        };
+        let s = V2Stamp {
+            stream: screen_stream(1),
+            ..stamp(0)
+        };
+        let mut pkt = encode_v2(&h, &s).to_vec();
+        pkt.extend_from_slice(&[0; 16]);
+        let (d, _, stream, _) = decode_v2(&pkt, 0, &mut None).unwrap();
+        assert_eq!((stream, stream_screen(stream)), (2, Some(1)));
+        assert_eq!(d.user_flags & u32::from(FLAG_PROBE), 0);
+        assert_eq!(stream_screen(V2_STREAM_PROBE), None);
+        assert_eq!(stream_screen(screen_stream(0)), Some(0));
     }
 
     #[test]

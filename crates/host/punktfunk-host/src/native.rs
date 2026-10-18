@@ -1369,6 +1369,7 @@ pub(crate) async fn run_admitted(
         input_tx: input_tx.clone(),
         initial_mode: hello.mode,
         stream_config: v2msg::StreamConfig {
+            stream: 0,
             epoch: 0,
             mode: welcome.mode,
             codec: welcome.codec,

@@ -28,6 +28,8 @@ pub(crate) enum CtrlRequest {
     InputEdge(crate::input::InputEvent),
     /// A captured Steam Controller 2's identity, ahead of its arrival.
     PadIdentity(crate::quic::PadIdentity),
+    /// The screens the embedder shows now, screen 0 first.
+    Screens(Vec<crate::quic::v2::msg::Screen>),
 }
 
 /// Handshake snapshot the worker reports to [`NativeClient::connect`]: the host's offer as sent,

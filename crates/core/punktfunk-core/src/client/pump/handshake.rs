@@ -51,10 +51,11 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
 }
 
 /// What this client offers. A format epoch is the embedder's promise to rebuild its decoder,
-/// so core offers it only when the embedder made it.
+/// and screens its promise to show them, so core offers each only when the embedder made it.
 fn client_features(
     rebuilds_decoder: bool,
     reopens_audio: bool,
+    shows_screens: bool,
 ) -> crate::quic::v2::features::FeatureSet {
     use crate::quic::v2::registry;
     let mut set = crate::quic::v2::features::FeatureSet::default()
@@ -67,6 +68,9 @@ fn client_features(
     }
     if reopens_audio {
         set = set.with(registry::FEATURE_AUDIO_EPOCH);
+    }
+    if shows_screens {
+        set = set.with(registry::FEATURE_SCREENS);
     }
     set
 }
@@ -246,9 +250,10 @@ async fn dial(
             } else {
                 vec![MediaSuite::Aes128Gcm]
             },
-            features: client_features(p.rebuilds_decoder, p.reopens_audio),
+            features: client_features(p.rebuilds_decoder, p.reopens_audio, !p.screens.is_empty()),
             profile: p.profile.clone(),
             access_only: false,
+            screens: p.screens.clone(),
         };
         v2io::send(&mut send, &hello).await?;
         // The hello carried the resume id, so the entry is spent now, not by a dial that died.
@@ -352,6 +357,9 @@ async fn dial(
         if p.frame_parts && welcome.codec != crate::quic::CODEC_PYROWAVE {
             session.set_deliver_frame_parts(true);
         }
+        let screens = server.features.has(registry::FEATURE_SCREENS);
+        args.shared.screens.set_on(screens);
+        session.set_screens(screens);
         Ok::<_, PunktfunkError>(Step::Session(Box::new((
             session,
             send,

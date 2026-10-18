@@ -62,7 +62,7 @@ fn send_input(conn: &ClientConn, out: &mut ScrollOutput, args: &MouseArgs, ev: I
             return;
         }
     }
-    let _ = conn.send_datagram(ev.encode().to_vec());
+    let _ = conn.send_datagram(ev.wire());
 }
 
 /// The kinds whose loss sticks: a release the network drops holds the key or button.
@@ -85,7 +85,7 @@ fn granted(grants: &AtomicU32, ev: InputEvent) -> bool {
 /// Send `ev` as a datagram when the live grants cover it.
 fn send_granted(conn: &ClientConn, grants: &AtomicU32, ev: InputEvent) {
     if granted(grants, ev) {
-        let _ = conn.send_datagram(ev.encode().to_vec());
+        let _ = conn.send_datagram(ev.wire());
     }
 }
 
