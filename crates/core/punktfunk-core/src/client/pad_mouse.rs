@@ -222,6 +222,7 @@ pub(super) fn scroll_event(
         phase,
         axis,
         delta,
+        axis_units: false,
     }
     .to_event()
 }

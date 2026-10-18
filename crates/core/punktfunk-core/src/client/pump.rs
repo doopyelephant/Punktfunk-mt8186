@@ -218,6 +218,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
     // Normalized scroll only toward HOST_CAP2_SCROLL; an older host gets each
     // event converted once at the outbound seam instead.
     let normalized_scroll = welcome.host_caps2 & crate::quic::HOST_CAP2_SCROLL != 0;
+    let scroll_axis_units = negotiated.scroll_axis_units;
     let _ = ready_tx.send(Ok(negotiated));
 
     // Snapshots only toward GAMEPAD_STATE. Flags 8/9 only toward PAD_AUDIO — an
@@ -236,6 +237,7 @@ pub(super) async fn run_pump(args: WorkerArgs) {
         input_task::MouseArgs {
             client: shared.clone(),
             normalized_scroll,
+            scroll_axis_units,
             edges: reliable_edges.then(|| ctrl_tx.clone()),
         },
     ));

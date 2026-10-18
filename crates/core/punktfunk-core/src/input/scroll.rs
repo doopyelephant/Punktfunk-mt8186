@@ -4,10 +4,11 @@
 //!
 //! `delta` is signed Q24.8 in the source's own unit: 120-per-detent ("v120") for
 //! [`ScrollSource::Wheel`]/[`ScrollSource::Unknown`], device-independent pixels
-//! ("DIP") for every other source. Positive is up on the vertical axis and right
-//! on the horizontal, matching the legacy [`InputKind::MouseScroll`] convention.
-//! `code` picks the axis (0 = vertical, 1 = horizontal); `y` stays 0; `flags`
-//! carries the source in its low byte and the phase in bits 8–15.
+//! ("DIP") for every other source, or compositor axis units where `flags` bit 16
+//! says so. Positive is up on the vertical axis and right on the horizontal,
+//! matching the legacy [`InputKind::MouseScroll`] convention. `code` picks the
+//! axis (0 = vertical, 1 = horizontal); `y` stays 0; `flags` carries the source
+//! in its low byte, the phase in bits 8–15 and [`SCROLL_FLAG_AXIS_UNITS`].
 //!
 //! [`ScrollOutput`] is the final outbound gate: a host that advertised
 //! `HOST_CAP2_SCROLL` receives the event unchanged (modulo the invert toggle);
@@ -22,6 +23,15 @@ pub const SCROLL_SCALE: f64 = 256.0;
 /// Device-independent pixels one wheel detent spans. Converts DIP to v120 at
 /// `DIP * 120 / 60 = DIP * 2`.
 pub const SCROLL_DIP_PER_DETENT: f64 = 60.0;
+
+/// `flags` bit 16 on a Finger or Continuous event: `delta` is in a Wayland
+/// compositor's axis units, as the client's own apps read them, not DIP. Sent
+/// only under `FEATURE_SCROLL_AXIS_UNITS`.
+pub const SCROLL_FLAG_AXIS_UNITS: u32 = 1 << 16;
+
+/// Compositor axis units one wheel detent spans: Qt reads 10 as a click
+/// (`angleDelta = value × 12`).
+pub const SCROLL_AXIS_UNITS_PER_DETENT: f64 = 10.0;
 
 /// What produced the distance. `flags` low byte.
 #[repr(C)]
@@ -70,6 +80,8 @@ pub enum ScrollUnits {
     V120,
     /// Device-independent pixels (one detent = [`SCROLL_DIP_PER_DETENT`]).
     Dip,
+    /// Compositor axis units (one detent = [`SCROLL_AXIS_UNITS_PER_DETENT`]).
+    Axis,
 }
 
 /// One normalized scroll event, decoded out of the [`InputEvent`] field packing.
@@ -81,30 +93,38 @@ pub struct ScrollEvent {
     pub axis: u32,
     /// Signed Q24.8 delta in [`Self::units`]; 0 on a stop.
     pub delta: i32,
+    /// [`SCROLL_FLAG_AXIS_UNITS`]: `delta` is compositor axis units, not DIP.
+    pub axis_units: bool,
 }
 
 impl ScrollEvent {
     /// Pack into the fixed 18-byte event.
     pub fn to_event(&self) -> InputEvent {
+        let units = if self.axis_units {
+            SCROLL_FLAG_AXIS_UNITS
+        } else {
+            0
+        };
         InputEvent {
             kind: InputKind::Scroll,
             _pad: [0; 3],
             code: self.axis,
             x: self.delta,
             y: 0,
-            flags: (self.source as u32) | ((self.phase as u32) << 8),
+            flags: (self.source as u32) | ((self.phase as u32) << 8) | units,
         }
     }
 
     /// Decode and validate. `None` on a wrong tag or any malformed body:
-    /// axis > 1, `y` ≠ 0, flags outside the low 16 bits, an out-of-range source
-    /// or phase, a stop carrying distance, a wheel with a phase, or a momentum
-    /// phase from a source that cannot glide.
+    /// axis > 1, `y` ≠ 0, flags above bit 16, an out-of-range source or phase,
+    /// a stop carrying distance, a wheel with a phase, a momentum phase from a
+    /// source that cannot glide, or axis units on anything but a finger or a
+    /// continuous surface.
     pub fn from_event(ev: &InputEvent) -> Option<ScrollEvent> {
         if ev.kind != InputKind::Scroll {
             return None;
         }
-        if ev.code > 1 || ev.y != 0 || ev.flags & !0xffff != 0 {
+        if ev.code > 1 || ev.y != 0 || ev.flags & !(0xffff | SCROLL_FLAG_AXIS_UNITS) != 0 {
             return None;
         }
         let source = match (ev.flags & 0xff) as u8 {
@@ -132,10 +152,15 @@ impl ScrollEvent {
             phase,
             axis: ev.code,
             delta: ev.x,
+            axis_units: ev.flags & SCROLL_FLAG_AXIS_UNITS != 0,
         };
         // A stop carries no distance: capture splits any final displacement
         // into a movement phase before the close.
         if se.is_stop() && se.delta != 0 {
+            return None;
+        }
+        // Only a Wayland pointer axis reports in compositor units.
+        if se.axis_units && !matches!(source, ScrollSource::Finger | ScrollSource::Continuous) {
             return None;
         }
         // Detent counters carry no gesture state.
@@ -180,6 +205,8 @@ impl ScrollEvent {
     pub fn units(&self) -> ScrollUnits {
         if self.is_wheel() {
             ScrollUnits::V120
+        } else if self.axis_units {
+            ScrollUnits::Axis
         } else {
             ScrollUnits::Dip
         }
@@ -235,6 +262,7 @@ impl ScrollAccumulator {
             phase,
             axis,
             delta: 0,
+            axis_units: false,
         }
         .to_event();
         ScrollEvent::from_event(&probe)?;
@@ -266,6 +294,7 @@ impl ScrollAccumulator {
                 phase,
                 axis,
                 delta: q,
+                axis_units: false,
             }
             .to_event(),
         )
@@ -286,6 +315,8 @@ impl ScrollAccumulator {
 pub struct ScrollOutput {
     /// Host advertised `HOST_CAP2_SCROLL`.
     normalized: bool,
+    /// The session runs `FEATURE_SCROLL_AXIS_UNITS`.
+    axis_units: bool,
     /// Unsent fraction per axis, in legacy `x` units (v120; DIP ×12).
     rem: [f64; 2],
     /// Source of the last converted delta per axis; a switch clears `rem`.
@@ -293,18 +324,25 @@ pub struct ScrollOutput {
 }
 
 impl ScrollOutput {
-    /// `normalized` = the host advertised `HOST_CAP2_SCROLL` in `Welcome`.
-    pub fn new(normalized: bool) -> Self {
+    /// `normalized` = the host advertised `HOST_CAP2_SCROLL` in `Welcome`;
+    /// `axis_units` = the session runs `FEATURE_SCROLL_AXIS_UNITS`.
+    pub fn new(normalized: bool, axis_units: bool) -> Self {
         ScrollOutput {
             normalized,
+            axis_units,
             rem: [0.0; 2],
             last: [None; 2],
         }
     }
 
     /// Next wire event, or `None` when nothing goes out: a malformed normalized
-    /// event, a dropped phase, or a zero converted delta.
-    pub fn prepare(&mut self, event: InputEvent, invert: bool) -> Option<InputEvent> {
+    /// event, a dropped phase, or a zero converted delta. Toward a host without
+    /// the feature an axis-unit delta goes out unmarked, as the DIP it was sent
+    /// as before.
+    pub fn prepare(&mut self, mut event: InputEvent, invert: bool) -> Option<InputEvent> {
+        if event.kind == InputKind::Scroll && !self.axis_units {
+            event.flags &= !SCROLL_FLAG_AXIS_UNITS;
+        }
         let mut event = match event.kind {
             InputKind::Scroll => {
                 let se = ScrollEvent::from_event(&event)?;
@@ -341,7 +379,7 @@ impl ScrollOutput {
         // see `PRECISE_PX_PER_DETENT`).
         let total = match se.units() {
             ScrollUnits::V120 => f64::from(se.delta) / SCROLL_SCALE + self.rem[a],
-            ScrollUnits::Dip => {
+            ScrollUnits::Dip | ScrollUnits::Axis => {
                 f64::from(se.delta) / SCROLL_SCALE * (120.0 / PRECISE_PX_PER_DETENT) + self.rem[a]
             }
         };
@@ -377,8 +415,49 @@ mod tests {
             phase,
             axis,
             delta,
+            axis_units: false,
         }
         .to_event()
+    }
+
+    fn axis_ev(source: ScrollSource, delta: i32) -> InputEvent {
+        let e = ev(source, ScrollPhase::Update, 0, delta);
+        InputEvent {
+            flags: e.flags | SCROLL_FLAG_AXIS_UNITS,
+            ..e
+        }
+    }
+
+    #[test]
+    fn axis_units_roundtrip_on_a_finger_or_continuous_surface() {
+        for source in [ScrollSource::Finger, ScrollSource::Continuous] {
+            let e = axis_ev(source, 7 * 256);
+            let se = InputEvent::decode(&e.encode())
+                .and_then(|back| ScrollEvent::from_event(&back))
+                .unwrap();
+            assert!(se.axis_units);
+            assert_eq!(se.units(), ScrollUnits::Axis);
+            assert_eq!(se.to_event(), e);
+        }
+        for source in [ScrollSource::Touch, ScrollSource::Controller] {
+            assert!(ScrollEvent::from_event(&axis_ev(source, 256)).is_none());
+        }
+        let e = axis_ev(ScrollSource::Finger, 256);
+        let above = InputEvent {
+            flags: e.flags | 1 << 17,
+            ..e
+        };
+        assert!(ScrollEvent::from_event(&above).is_none());
+    }
+
+    #[test]
+    fn axis_units_go_out_unmarked_without_the_feature() {
+        let e = axis_ev(ScrollSource::Finger, 10 * 256);
+        assert_eq!(ScrollOutput::new(true, true).prepare(e, false), Some(e));
+        assert_eq!(
+            out(true).prepare(e, false),
+            Some(ev(ScrollSource::Finger, ScrollPhase::Update, 0, 10 * 256))
+        );
     }
 
     #[test]
@@ -629,7 +708,7 @@ mod tests {
     }
 
     fn out(normalized: bool) -> ScrollOutput {
-        ScrollOutput::new(normalized)
+        ScrollOutput::new(normalized, false)
     }
 
     #[test]

@@ -36,6 +36,8 @@ pub(super) struct MouseArgs {
     pub(super) client: Arc<ClientShared>,
     /// Host advertised `HOST_CAP2_SCROLL`: normalized events go out unchanged.
     pub(super) normalized_scroll: bool,
+    /// The session runs `FEATURE_SCROLL_AXIS_UNITS`: axis-unit scroll keeps its mark.
+    pub(super) scroll_axis_units: bool,
     /// The control stream's writer, toward a host that reads key and mouse-button edges
     /// there (`HOST_CAP2_INPUT_EDGES`). `None` keeps every event on the datagram plane.
     pub(super) edges: Option<tokio::sync::mpsc::Sender<CtrlRequest>>,
@@ -199,7 +201,8 @@ pub(super) async fn run(
     // One seam for every outbound input event: Scroll stays whole toward a
     // normalized host, converts once to MouseScroll against an older one, and
     // the live invert flag applies to both plus controller-mouse output.
-    let mut scroll_out = ScrollOutput::new(mouse_args.normalized_scroll);
+    let mut scroll_out =
+        ScrollOutput::new(mouse_args.normalized_scroll, mouse_args.scroll_axis_units);
     let mut mouse_tick = tokio::time::interval(TICK);
     mouse_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Unset while no stick is deflected, so a fresh push starts from one nominal tick.
@@ -438,6 +441,7 @@ mod tests {
         MouseArgs {
             client: client.clone(),
             normalized_scroll: true,
+            scroll_axis_units: false,
             edges: None,
         }
     }
