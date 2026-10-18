@@ -61,6 +61,10 @@ public struct AccessUnit: Sendable {
     /// so a client-side standing backlog can never masquerade as network latency again.
     public let pulledNs: Int64
 
+    /// The stream's format changed at this AU: rebuild the decoder for the connection's codec,
+    /// colour, depth and chroma, which already read the new one, before decoding it.
+    public var newFormat: Bool { flags & UInt32(PUNKTFUNK_FRAME_NEW_FORMAT) != 0 }
+
     /// `pulledNs` defaults to `receivedNs` (zero queue wait) for callers with no pull instant —
     /// the synthetic probe AUs and decode tests, where the split is meaningless.
     public init(
@@ -675,21 +679,52 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// (20 000) when 0 was requested. `0` = an older host that didn't report it.
     public private(set) var resolvedBitrateKbps: UInt32 = 0
 
-    /// The colour signalling the host actually encodes with (CICP code points): `colorPrimaries`
+    /// What the stream decodes as: the codec, CICP colour, depth and chroma of the newest AU
+    /// `nextAU` handed out. The connect-time format until an AU with `newFormat` moves it, read
+    /// live from the core; the last connect-time value once the session closed.
+    public struct StreamFormat: Sendable, Equatable {
+        public var primaries: UInt8 = 1
+        public var transfer: UInt8 = 1
+        public var matrix: UInt8 = 1
+        public var fullRange = false
+        public var bitDepth: UInt8 = 8
+        public var chromaFormat: UInt8 = 1
+    }
+
+    /// The format the session opened with, for the getters below once the handle is gone.
+    private var openedFormat = StreamFormat()
+    private var openedCodec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
+
+    /// The live format (see `StreamFormat`).
+    public var streamFormat: StreamFormat {
+        withLiveHandle(or: openedFormat) { Self.readFormat($0) }
+    }
+
+    private static func readFormat(_ h: OpaquePointer) -> StreamFormat {
+        var prim: UInt8 = 1, trc: UInt8 = 1, mtx: UInt8 = 1, fullRange: UInt8 = 0, depth: UInt8 = 8
+        _ = punktfunk_connection_color_info(h, &prim, &trc, &mtx, &fullRange, &depth)
+        var chroma: UInt8 = 1
+        _ = punktfunk_connection_chroma_format(h, &chroma)
+        return StreamFormat(
+            primaries: prim, transfer: trc, matrix: mtx, fullRange: fullRange != 0,
+            bitDepth: depth, chromaFormat: chroma)
+    }
+
+    /// The colour signalling the host encodes with now (CICP code points): `colorPrimaries`
     /// (1=BT.709, 9=BT.2020), `colorTransfer` (1=BT.709, 16=PQ, 18=HLG), `colorMatrix`
     /// (1=BT.709, 9=BT.2020-NCL), `colorFullRange`. BT.709 limited SDR for an older host. Configure
     /// the decoder/presenter from these; mastering metadata arrives via `nextHdrMeta`.
-    public private(set) var colorPrimaries: UInt8 = 1
-    public private(set) var colorTransfer: UInt8 = 1
-    public private(set) var colorMatrix: UInt8 = 1
-    public private(set) var colorFullRange: Bool = false
+    public var colorPrimaries: UInt8 { streamFormat.primaries }
+    public var colorTransfer: UInt8 { streamFormat.transfer }
+    public var colorMatrix: UInt8 { streamFormat.matrix }
+    public var colorFullRange: Bool { streamFormat.fullRange }
     /// Encoded bit depth (8 or 10).
-    public private(set) var bitDepth: UInt8 = 8
-    /// The chroma subsampling the host resolved for this session, as the HEVC `chroma_format_idc`:
-    /// `1` = 4:2:0 (every pre-4:4:4 host, and the back-compat default) or `3` = full-chroma 4:4:4
-    /// (only when this client advertised `videoCap444` *and* the host could open a real 4:4:4
-    /// encoder). Drive the decoder's requested pixel format from this. See `isChroma444`.
-    public private(set) var chromaFormat: UInt8 = 1
+    public var bitDepth: UInt8 { streamFormat.bitDepth }
+    /// The chroma subsampling the host encodes now, as the HEVC `chroma_format_idc`: `1` = 4:2:0
+    /// (every pre-4:4:4 host, and the back-compat default) or `3` = full-chroma 4:4:4 (only when
+    /// this client advertised `videoCap444` *and* the host could open a real 4:4:4 encoder).
+    /// Drive the decoder's requested pixel format from this. See `isChroma444`.
+    public var chromaFormat: UInt8 { streamFormat.chromaFormat }
     /// Convenience: the resolved stream is full-chroma 4:4:4 (`chroma_format_idc == 3`).
     public var isChroma444: Bool { chromaFormat == 3 }
     /// True when the negotiated stream is HDR (PQ or HLG transfer) — drive an HDR present path and
@@ -745,6 +780,30 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// so `frameCount` answers "how many samples did I get", not "how long is one frame".
     public private(set) var resolvedAudioFrameUs: UInt16 = UInt16(PUNKTFUNK_AUDIO_FRAME_MS * 1000)
 
+    /// What the audio `nextAudioPcm` hands back is in now: the `resolvedAudio*` values until it
+    /// throws `PUNKTFUNK_STATUS_AUDIO_FORMAT`, which says the host moved the format at the next
+    /// frame. Read live from the core; the connect-time values once the session closed.
+    public struct AudioFormat: Sendable, Equatable {
+        public var channels: UInt8
+        public var rateHz: UInt32
+        public var frameUs: UInt16
+    }
+
+    public var audioFormat: AudioFormat {
+        let opened = AudioFormat(
+            channels: resolvedAudioChannels, rateHz: resolvedAudioRateHz,
+            frameUs: resolvedAudioFrameUs)
+        return withLiveHandle(or: opened) { h in
+            var channels = opened.channels, rate = opened.rateHz, frameUs = opened.frameUs
+            _ = punktfunk_connection_audio_channels(h, &channels)
+            _ = punktfunk_connection_audio_sample_rate(h, &rate)
+            _ = punktfunk_connection_audio_frame_us(h, &frameUs)
+            return AudioFormat(
+                channels: channels, rateHz: rate,
+                frameUs: frameUs == 0 ? opened.frameUs : frameUs)
+        }
+    }
+
     /// True when this session resolved the LOSSLESS `0xD3` plane (`HOST_CAP_AUDIO_HIRES`) rather
     /// than Opus — the one honest answer to "is this bit-exact?", which the rate and depth alone
     /// cannot give (48 kHz/16-bit is a legal resolution on both planes).
@@ -752,11 +811,17 @@ public final class PunktfunkConnection: @unchecked Sendable {
         hostCaps & UInt8(PUNKTFUNK_HOST_CAP_AUDIO_HIRES) != 0
     }
 
-    /// The video codec the host resolved for this session (`Welcome.codec`, `PUNKTFUNK_CODEC_*`):
-    /// `2` = HEVC (default / older host), `1` = H.264, `4` = AV1, `8` = PyroWave (only when this
-    /// client opted in). Build the decoder from THIS. The resolved value honors the client's
-    /// `preferredCodec` when the host could emit it.
-    public private(set) var resolvedCodec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
+    /// The video codec the host encodes now (`PUNKTFUNK_CODEC_*`): `2` = HEVC (default / older
+    /// host), `1` = H.264, `4` = AV1, `8` = PyroWave (only when this client opted in). Build the
+    /// decoder from THIS. It honours the client's `preferredCodec` when the host could emit it,
+    /// and moves with `streamFormat`.
+    public var resolvedCodec: UInt8 {
+        withLiveHandle(or: openedCodec) { h in
+            var codec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
+            _ = punktfunk_connection_codec(h, &codec)
+            return codec
+        }
+    }
 
     /// The session's negotiated wire shard payload (`Welcome.shard_payload`, bytes) — the
     /// parse-window size for `USER_FLAG_CHUNK_ALIGNED` PyroWave AUs (plan §4.4). Other codecs
@@ -1130,11 +1195,15 @@ public final class PunktfunkConnection: @unchecked Sendable {
         opts.gamepad = gamepad.rawValue
         opts.bitrate_kbps = bitrateKbps
         opts.pyrowave_bpp_x100 = settings.pyrowaveBppX100
+        // The stage-2 pump rebuilds its decoder on an AU flagged `newFormat`.
+        opts.reformat = UInt8(PUNKTFUNK_REFORMAT_VIDEO)
         opts.video_caps = videoCaps
         opts.audio_channels = audioChannels
         opts.delivery_flags = deliveryFlags
         opts.audio_rate_hz = wantsHiRes ? audioRateHz : 0
         opts.audio_bits = wantsHiRes ? audioBits : 0
+        // The drain reopens playback when `nextAudioPcm` reports a new audio format.
+        opts.reformat |= UInt8(PUNKTFUNK_REFORMAT_AUDIO)
         opts.video_codecs = videoCodecs
         opts.preferred_codec = preferredCodec
         opts.client_caps = clientCaps
@@ -1218,16 +1287,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         var br: UInt32 = 0
         _ = punktfunk_connection_bitrate(opened, &br)
         resolvedBitrateKbps = br
-        var prim: UInt8 = 1, trc: UInt8 = 1, mtx: UInt8 = 1, fullRange: UInt8 = 0, depth: UInt8 = 8
-        _ = punktfunk_connection_color_info(opened, &prim, &trc, &mtx, &fullRange, &depth)
-        colorPrimaries = prim
-        colorTransfer = trc
-        colorMatrix = mtx
-        colorFullRange = fullRange != 0
-        bitDepth = depth
-        var cf: UInt8 = 1
-        _ = punktfunk_connection_chroma_format(opened, &cf)
-        chromaFormat = cf
+        openedFormat = Self.readFormat(opened)
         var ac: UInt8 = 2
         _ = punktfunk_connection_audio_channels(opened, &ac)
         resolvedAudioChannels = ac
@@ -1249,9 +1309,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         resolvedAudioFrameUs = frameUs == 0
             ? UInt16(PUNKTFUNK_AUDIO_FRAME_MS * 1000)
             : frameUs
-        var codec: UInt8 = 2 // PUNKTFUNK_CODEC_HEVC
-        _ = punktfunk_connection_codec(opened, &codec)
-        resolvedCodec = codec
+        _ = punktfunk_connection_codec(opened, &openedCodec)
         var shard: UInt32 = 1408
         _ = punktfunk_connection_shard_payload(opened, &shard)
         shardPayload = shard

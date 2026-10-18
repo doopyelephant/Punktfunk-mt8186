@@ -228,6 +228,14 @@ pub const FEATURE_PROFILES: u32 = 34;
 /// associated data, so the receiver opens each shard straight into its frame. Without it only
 /// the tag and packet number are clear.
 pub const FEATURE_CLEAR_PLACEMENT: u32 = 35;
+/// Both ends, beside [`FEATURE_STREAM_CONFIG`]: an epoch's `StreamConfig` may change codec, bit
+/// depth, colour or chroma, and the client rebuilds its decoder at that epoch's first frame. The
+/// client sets it only when its embedder said it rebuilds; a `Reconfigure` may then ask for
+/// another codec.
+pub const FEATURE_FORMAT_EPOCH: u32 = 36;
+/// Both ends: an `AudioConfig` may change codec, rate or channels from its `first_seq` on, and
+/// the client reopens its player there. Set only when the embedder said it reopens.
+pub const FEATURE_AUDIO_EPOCH: u32 = 37;
 
 #[cfg(test)]
 mod tests {
@@ -263,6 +271,8 @@ mod tests {
         ("FEATURE_PAD_WRITES", FEATURE_PAD_WRITES),
         ("FEATURE_PROFILES", FEATURE_PROFILES),
         ("FEATURE_CLEAR_PLACEMENT", FEATURE_CLEAR_PLACEMENT),
+        ("FEATURE_FORMAT_EPOCH", FEATURE_FORMAT_EPOCH),
+        ("FEATURE_AUDIO_EPOCH", FEATURE_AUDIO_EPOCH),
     ];
 
     /// Every close and stop code either wire uses: v1's live on, and v2 adds its own.

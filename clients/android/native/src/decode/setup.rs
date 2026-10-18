@@ -251,7 +251,7 @@ pub(super) fn android_hdr_static_info(m: &punktfunk_core::quic::HdrMeta) -> [u8;
 /// regardless — this adds the luminance the tone-mapper needs. `None` on an SDR session.
 /// The newest entry, not the first: the host follows its generic baseline with the source's grade.
 pub(super) fn hdr_static(client: &NativeClient) -> Option<punktfunk_core::quic::HdrMeta> {
-    if !client.color.is_hdr() {
+    if !client.video_format().color.is_hdr() {
         return None;
     }
     match client.latest_hdr_meta(Duration::from_millis(250)) {

@@ -240,6 +240,10 @@ pub struct AudioPacket {
     /// Opus: one decoder frame. PCM: interleaved LE integers for
     /// [`crate::audio::pcm::to_f32`]. Empty is a DTX silence marker (Opus).
     pub data: Vec<u8>,
+    /// `Some` on the first packet of a new audio format: reopen the decoder and player for it
+    /// before this packet. Only under
+    /// [`FEATURE_AUDIO_EPOCH`](crate::quic::v2::registry::FEATURE_AUDIO_EPOCH).
+    pub new_format: Option<crate::audio::plane::PlaneFormat>,
 }
 
 #[cfg(test)]

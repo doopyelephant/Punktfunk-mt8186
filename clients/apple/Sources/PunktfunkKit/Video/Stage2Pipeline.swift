@@ -1991,7 +1991,7 @@ public final class Stage2Pipeline {
             // Hardware-only backstop (4:4:4, AV1): 3 s in which every decode fails means this device
             // can't decode the mode at all, e.g. past a resolution ceiling. End instead of looping on
             // black. Timed, not counted: after a failure only IDRs reach the decoder.
-            let hardwareOnly = connection.isChroma444 || connection.videoCodec == .av1
+            var hardwareOnly = connection.isChroma444 || connection.videoCodec == .av1
             var failingSinceNs: UInt64?
             // Every iteration drains its own autorelease pool: this thread has no runloop, so
             // autoreleased VT/CM temporaries would otherwise accumulate until session end.
@@ -2007,6 +2007,16 @@ public final class Stage2Pipeline {
                             onFrame: onFrame, onDecodedSize: onDecodedSize, onHdrMeta: onHdrMeta)
                         else { return true }
                         let au = ready.au
+                        if ready.newFormat {
+                            // Built for the format the connection reads now; the session the
+                            // decoder held was the old one's.
+                            decoder.setChroma444(connection.isChroma444)
+                            decoder.setCodec(connection.videoCodec)
+                            decoder.setBitDepth(connection.bitDepth)
+                            decoder.reset()
+                            hardwareOnly = connection.isChroma444 || connection.videoCodec == .av1
+                            failingSinceNs = nil
+                        }
                         // A delta between a loss and its re-anchor references the lost picture. Fed
                         // to VideoToolbox it poisons the session — every later non-IDR AU, the anchor
                         // too, comes back kVTVideoDecoderBadDataErr. Withheld, the anchor decodes.

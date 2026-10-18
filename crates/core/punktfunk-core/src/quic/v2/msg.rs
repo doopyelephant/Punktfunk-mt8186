@@ -179,8 +179,9 @@ v2_message!(AuthResponse = reg::MSG_AUTH_RESPONSE, { 1 => device_key, 2 => signa
 v2_message!(Refused = reg::MSG_REFUSED, { 1 => code, 2 => reason },
     check |m| m.reason.len() <= REFUSED_REASON_MAX);
 
-v2_message!(Reconfigure = reg::MSG_RECONFIGURE, { 1 => mode });
-v2_message!(Reconfigured = reg::MSG_RECONFIGURED, { 1 => accepted, 2 => mode });
+v2_message!(Reconfigure = reg::MSG_RECONFIGURE, { 1 => mode, 2 => exclude_codecs });
+v2_message!(Reconfigured = reg::MSG_RECONFIGURED,
+    { 1 => accepted, 2 => mode, 3 => exclude_codecs });
 v2_message!(SetBitrate = reg::MSG_SET_BITRATE, { 1 => bitrate_kbps });
 v2_message!(PipelineGap = reg::MSG_PIPELINE_GAP, { 1 => gap_ms });
 v2_message!(ProbeShaped = reg::MSG_PROBE_REQUEST,
@@ -373,6 +374,25 @@ v2_message!(StreamConfig = reg::MSG_STREAM_CONFIG,
     { 1 => epoch, 2 => mode, 3 => codec, 4 => bit_depth, 5 => color, 6 => chroma_format,
       7 => host_iface_kind, 8 => host_link_mbps, 9 => host_sndbuf_kb, 10 => host_forced_shape });
 
+impl StreamConfig {
+    /// What a decoder for this epoch is built for.
+    pub fn format(&self) -> VideoFormat {
+        VideoFormat {
+            codec: self.codec,
+            bit_depth: self.bit_depth,
+            color: ColorInfo::from_cicp(self.color),
+            chroma_format: self.chroma_format,
+        }
+    }
+
+    pub fn set_format(&mut self, f: VideoFormat) {
+        self.codec = f.codec;
+        self.bit_depth = f.bit_depth;
+        self.color = f.color.cicp();
+        self.chroma_format = f.chroma_format;
+    }
+}
+
 /// `host → client`, before the first datagram of epoch `epoch` on audio stream `stream`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AudioConfig {
@@ -387,11 +407,13 @@ pub struct AudioConfig {
     pub frame_us: u16,
     /// Each datagram carries the previous frame too.
     pub redundant: bool,
+    /// The first audio `seq` under this config. The datagram carries no epoch, so this anchors it.
+    pub first_seq: u32,
 }
 
 v2_message!(AudioConfig = reg::MSG_AUDIO_CONFIG,
     { 1 => stream, 2 => epoch, 3 => codec, 4 => rate_hz, 5 => bits, 6 => channels, 7 => layout,
-      8 => frame_us, 9 => redundant });
+      8 => frame_us, 9 => redundant, 10 => first_seq });
 
 impl FieldValue for [u8; 4] {
     fn put(&self, f: Fields, tag: u64) -> Fields {
@@ -497,10 +519,23 @@ mod tests {
             occupant: "Ben's Apple TV".into(),
             pin: "ab".repeat(32),
         });
-        round_trip(Reconfigure { mode });
+        round_trip(Reconfigure {
+            mode,
+            exclude_codecs: 0,
+        });
+        round_trip(Reconfigure {
+            mode,
+            exclude_codecs: CODEC_HEVC | CODEC_AV1,
+        });
         round_trip(Reconfigured {
             accepted: true,
             mode,
+            exclude_codecs: 0,
+        });
+        round_trip(Reconfigured {
+            accepted: false,
+            mode,
+            exclude_codecs: CODEC_HEVC,
         });
         round_trip(SetBitrate {
             bitrate_kbps: 80_000,
@@ -598,6 +633,7 @@ mod tests {
             layout: 0,
             frame_us: 2000,
             redundant: false,
+            first_seq: 7_000,
         });
     }
 

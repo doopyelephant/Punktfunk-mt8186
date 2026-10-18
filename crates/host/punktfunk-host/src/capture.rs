@@ -533,15 +533,6 @@ fn capture_external_output(
     .context("WGC capture open (no fallback)")
 }
 
-/// The driver encoder's HDR flag and depth for a session negotiated at `plan_hdr`/`bit_depth`.
-/// The driver's pool refuses every surface not in the format it opened for, so an HDR session
-/// whose display composes SDR (HDR switched off, advanced colour refused) opens 8-bit SDR.
-#[cfg(any(target_os = "windows", test))]
-fn driver_depth(plan_hdr: bool, display_hdr: bool, bit_depth: u8) -> (bool, u8) {
-    let hdr = plan_hdr && display_hdr;
-    (hdr, if plan_hdr && !hdr { 8 } else { bit_depth })
-}
-
 /// Open the in-driver encoder for an IDD-push session: the plan as the driver numbers it, at the
 /// depth the display composes now, the resolved Windows backend ahead of any fallback rung, the
 /// two IOCTL senders over the manager's control handle, and the `pf_gpu` session record. The
@@ -575,7 +566,8 @@ pub fn open_driver_encoder(
         },
     };
     // The capturer reports HDR metadata exactly while the display composes FP16.
-    let (hdr, bit_depth) = driver_depth(plan.hdr, capturer.hdr_meta().is_some(), bit_depth);
+    let (hdr, bit_depth) =
+        crate::session_plan::live_depth(plan.hdr, capturer.hdr_meta().is_some(), bit_depth);
     // Media Foundation is the second rung for an H.26x session a missing `amfrt64.dll` or a
     // declined native open would otherwise end, but only inside its 8-bit 4:2:0 ceiling: the
     // plan is already negotiated here, so a wider one would open and then refuse every frame.
@@ -929,18 +921,5 @@ mod live_tests {
         }
         drop(cap);
         drop(vd);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::driver_depth;
-
-    #[test]
-    fn driver_encoder_opens_for_what_the_display_composes() {
-        assert_eq!(driver_depth(true, true, 10), (true, 10));
-        assert_eq!(driver_depth(true, false, 10), (false, 8));
-        assert_eq!(driver_depth(false, false, 10), (false, 10)); // 10-bit SDR
-        assert_eq!(driver_depth(false, true, 8), (false, 8));
     }
 }

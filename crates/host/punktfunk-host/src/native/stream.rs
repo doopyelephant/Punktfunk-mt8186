@@ -51,8 +51,8 @@ use self::state::StreamState;
 pub(super) use self::synth_abr::{synthetic_abr_stream, SynthAbrContext};
 pub use self::synth_abr::{Content, KeyframeAnswer, SynthAbrShape, DEFAULT_IDR_PCT};
 
-/// Test frames at 60 Hz. The frames have no size, so an accepted mode switch is delivered as
-/// the next epoch, the way a rebuilt pipeline delivers one.
+/// Test frames at 60 Hz. The frames have no size, so an accepted mode switch or codec ask is
+/// delivered as the next epoch, the way a rebuilt pipeline delivers one.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn synthetic_stream(
     session: &mut Session,
@@ -62,6 +62,7 @@ pub(super) fn synthetic_stream(
     fec_target: &AtomicU8,
     timing_conn: Option<&super::link::SessionLink>,
     probe_seq: bool,
+    (mut mode, mut format): (punktfunk_core::Mode, punktfunk_core::quic::VideoFormat),
 ) -> Result<()> {
     let (probe_rx, probe_result_tx) = (&ends.probe_rx, &ends.probe_result_tx);
     let interval = std::time::Duration::from_millis(1000 / 60);
@@ -70,14 +71,24 @@ pub(super) fn synthetic_stream(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        if let Some(mode) = ends.reconfig.try_iter().last() {
+        let asked_mode = ends.reconfig.try_iter().last();
+        let asked_codec = ends.format_rx.try_iter().last();
+        if asked_mode.is_some() || asked_codec.is_some() {
             epoch = epoch.wrapping_add(1);
             session.set_epoch(epoch);
+            mode = asked_mode.unwrap_or(mode);
+            if let Some(codec) = asked_codec {
+                format.codec = crate::encode::codec_to_wire(codec);
+            }
             let _ = ends.reconfig_result_tx.send(super::wiring::Delivered {
                 mode,
+                format,
                 epoch,
                 corrects: false,
             });
+            if asked_codec.is_some() {
+                let _ = ends.format_result_tx.send(asked_codec);
+            }
         }
         apply_fec_target(session, fec_target);
         service_probes(session, stop, probe_rx, probe_result_tx, probe_seq);
@@ -534,6 +545,14 @@ pub(crate) struct StreamCommon {
     pub(crate) chroma: crate::encode::ChromaFormat,
 }
 
+impl StreamCommon {
+    /// The mode and video format the Welcome promised.
+    pub(crate) fn opened_as(&self) -> (punktfunk_core::Mode, punktfunk_core::quic::VideoFormat) {
+        let format = state::video_format(self.codec, self.bit_depth, self.hdr, self.chroma);
+        (self.mode, format)
+    }
+}
+
 /// Owned per-session inputs for [`virtual_stream`]: the [`StreamCommon`] plus what a display
 /// needs. The whole context moves onto the stream thread.
 pub(super) struct SessionContext {
@@ -541,6 +560,8 @@ pub(super) struct SessionContext {
     pub(super) compositor: crate::vdisplay::Compositor,
     /// Per-instance, not via `PUNKTFUNK_GAMESCOPE_NODE` — two sessions must not overwrite each other.
     pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
+    /// What the handshake's format rule read, re-run for a codec change.
+    pub(super) format_facts: super::handshake::FormatFacts,
     /// `Hello::bitrate_kbps == 0`. A mode switch re-resolves PyroWave's pin either way, and an
     /// Automatic rate is held inside the new bounds. Another codec's explicit rate stays.
     pub(super) bitrate_auto: bool,

@@ -79,7 +79,16 @@ impl ControlTask {
                 req = ctrl_rx.recv() => {
                     let Some(req) = req else { break }; // client dropped
                     let frame = match req {
-                        CtrlRequest::Mode(m) => Reconfigure { mode: m }.encode_v2(),
+                        CtrlRequest::Mode(m) => Reconfigure {
+                            mode: m,
+                            exclude_codecs: 0,
+                        }
+                        .encode_v2(),
+                        CtrlRequest::Codec(exclude) => Reconfigure {
+                            mode: *mode_slot.lock().unwrap_or_else(|e| e.into_inner()),
+                            exclude_codecs: exclude,
+                        }
+                        .encode_v2(),
                         CtrlRequest::Probe(p) => crate::quic::ProbeShaped::from(p).encode_v2(),
                         CtrlRequest::ProbeShaped(p) => p.encode_v2(),
                         CtrlRequest::SetBitrate(k) => SetBitrate { bitrate_kbps: k }.encode_v2(),
@@ -118,7 +127,18 @@ impl ControlTask {
                 }
                 frame = ctrl_recv.read_frame() => {
                     let Ok((ty, body)) = frame else { break }; // stream closed
-                    if let Ok(ack) = decode::<Reconfigured>(ty, &body) {
+                    if let Some(ack) = decode::<Reconfigured>(ty, &body)
+                        .ok()
+                        .filter(|a| a.exclude_codecs != 0)
+                    {
+                        // A codec answer: a yes arrives as the new epoch's config and frames.
+                        if ack.accepted {
+                            tracing::info!(excluded = ack.exclude_codecs, "host accepted codec change");
+                        } else {
+                            tracing::warn!(excluded = ack.exclude_codecs, "host refused codec change");
+                            shared.codec_refused.store(ack.exclude_codecs, Ordering::Relaxed);
+                        }
+                    } else if let Ok(ack) = decode::<Reconfigured>(ty, &body) {
                         // An anchored host says what it delivers in a `StreamConfig` instead.
                         if ack.accepted && !anchor.lock().unwrap_or_else(|e| e.into_inner()).on {
                             *mode_slot.lock().unwrap_or_else(|e| e.into_inner()) = ack.mode;
@@ -129,6 +149,17 @@ impl ControlTask {
                         } else {
                             tracing::warn!(active = ?ack.mode, "host rejected mode switch");
                         }
+                    } else if let Some(cfg) = decode::<v2msg::AudioConfig>(ty, &body)
+                        .ok()
+                        .filter(|c| c.stream == 0)
+                    {
+                        tracing::info!(
+                            codec = cfg.codec,
+                            rate_hz = cfg.rate_hz,
+                            first_seq = cfg.first_seq,
+                            "the host changes the audio format"
+                        );
+                        shared.audio_anchor.lock().unwrap_or_else(|e| e.into_inner()).config(&cfg);
                     } else if let Ok(cfg) = decode::<v2msg::StreamConfig>(ty, &body) {
                         let host = crate::quic::HostLink::of(&cfg);
                         if std::mem::replace(&mut *shared.host_link.lock().unwrap(), host) != host {

@@ -318,13 +318,16 @@ pub struct NativeClient {
     /// clock. `0` = old host or synced clocks. Ongoing math should read
     /// [`clock_offset_now_ns`](Self::clock_offset_now_ns).
     pub clock_offset_ns: i64,
-    /// Encode bit depth: `8`, or `10` for Main10/HDR. `8` for an older host.
+    /// Encode bit depth at connect: `8`, or `10` for Main10/HDR. `8` for an older host.
+    /// [`video_format`](Self::video_format) follows it mid-session.
     pub bit_depth: u8,
-    /// Host colour signalling for decoder/presenter. [`ColorInfo::SDR_BT709`] for an older
-    /// host. HDR mastering arrives via [`NativeClient::next_hdr_meta`].
+    /// Host colour signalling at connect. [`ColorInfo::SDR_BT709`] for an older host. HDR
+    /// mastering arrives via [`NativeClient::next_hdr_meta`]; [`video_format`](Self::video_format)
+    /// follows the colour mid-session.
     pub color: ColorInfo,
-    /// HEVC `chroma_format_idc` ([`quic::CHROMA_IDC_420`] or [`quic::CHROMA_IDC_444`]). SPS
-    /// is authoritative; this pre-sizes the decoder. `420` for an older host.
+    /// HEVC `chroma_format_idc` at connect ([`quic::CHROMA_IDC_420`] or
+    /// [`quic::CHROMA_IDC_444`]). SPS is authoritative; this pre-sizes the decoder. `420` for an
+    /// older host. [`video_format`](Self::video_format) follows it mid-session.
     pub chroma_format: u8,
     /// Host-resolved channels: `2` / `6` / `8`. Build the Opus decoder from this via
     /// [`crate::audio::layout_for`], never from the request. Omitted → `2`.
@@ -350,7 +353,8 @@ pub struct NativeClient {
     /// from the request, and refuse audio on `None` rather than pair channels wrongly. `0` for
     /// an older host.
     pub audio_layout: u8,
-    /// Host-resolved video codec. Build the decoder from THIS; do not assume HEVC.
+    /// Host-resolved video codec at connect. Build the decoder from THIS; do not assume HEVC.
+    /// Under [`ConnectParams::rebuilds_decoder`] it can move: [`video_format`](Self::video_format).
     pub codec: u8,
 }
 
@@ -581,6 +585,14 @@ pub struct ConnectParams {
     pub client_caps: u8,
     /// AU prefixes as [`Frame`]s with `part = Some`. Only for a decoder that takes parts.
     pub frame_parts: bool,
+    /// This embedder rebuilds its decoder on a frame whose [`Frame::new_format`] is `Some`.
+    /// Only then may the host change codec, depth, colour or chroma mid-stream
+    /// ([`crate::quic::v2::registry::FEATURE_FORMAT_EPOCH`]).
+    pub rebuilds_decoder: bool,
+    /// This embedder reopens its audio decoder and player on a packet whose
+    /// [`AudioPacket::new_format`] is `Some`. Only then may the host change the audio format
+    /// mid-stream ([`crate::quic::v2::registry::FEATURE_AUDIO_EPOCH`]).
+    pub reopens_audio: bool,
     /// Store-qualified library id to launch (`steam:570`).
     pub launch: Option<String>,
     /// [`crate::quic::Hello::name`], usually [`device_name`]. `None` knocks as "device abcd1234".
@@ -636,6 +648,8 @@ impl ConnectParams {
             display_hdr: None,
             client_caps: 0,
             frame_parts: false,
+            rebuilds_decoder: false,
+            reopens_audio: false,
             launch: None,
             name: None,
             pin: None,
@@ -860,6 +874,41 @@ impl NativeClient {
         self.ctrl_tx
             .try_send(CtrlRequest::Mode(mode))
             .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// The format the newest frame from [`next_frame`](Self::next_frame) decodes as: the
+    /// Welcome's until a frame's [`Frame::new_format`] moves it.
+    pub fn video_format(&self) -> crate::quic::VideoFormat {
+        *self.shared.video_format.lock().unwrap()
+    }
+
+    /// The decoder can't take these `CODEC_*` bits: ask the host to stream on in another codec,
+    /// from a new epoch, without a reconnect. The answer is a frame whose [`Frame::new_format`]
+    /// names the new codec, or a [`codec_refused`](Self::codec_refused).
+    /// [`PunktfunkError::Unsupported`] when the session has no format epochs.
+    pub fn request_codec_change(&self, exclude: u8) -> Result<()> {
+        if !self.shared.anchor.lock().unwrap().formats {
+            return Err(PunktfunkError::Unsupported("format epochs"));
+        }
+        self.ctrl_tx
+            .try_send(CtrlRequest::Codec(exclude))
+            .map_err(|_| PunktfunkError::Closed)
+    }
+
+    /// The desktop audio format the newest packet from [`next_audio`](Self::next_audio) is in:
+    /// the Welcome's until a packet's [`AudioPacket::new_format`] moves it.
+    pub fn audio_format(&self) -> crate::audio::plane::PlaneFormat {
+        self.shared
+            .audio_out
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| crate::audio::plane::PlaneFormat::of(self))
+    }
+
+    /// `CODEC_*` bits of the codec ask the host refused, `0` while none was. The stream is
+    /// unchanged: reconnect without those codecs.
+    pub fn codec_refused(&self) -> u8 {
+        self.shared.codec_refused.load(Ordering::Relaxed)
     }
 
     /// Who draws the pointer: `true` = client (host forwards shape/state, excludes it from
@@ -1181,20 +1230,19 @@ impl NativeClient {
         let mut s = self.hud.drain(&self.hud_counters());
         let m = self.mode();
         (s.width, s.height, s.refresh_hz) = (m.width, m.height, m.refresh_hz);
-        s.codec = crate::hud::codec_label(self.codec).into();
-        s.bit_depth = self.bit_depth;
-        if matches!(
-            self.color.transfer,
-            crate::quic::ColorInfo::TRC_PQ | crate::quic::ColorInfo::TRC_HLG
-        ) {
+        let f = self.video_format();
+        s.codec = crate::hud::codec_label(f.codec).into();
+        s.bit_depth = f.bit_depth;
+        if f.color.is_hdr() {
             s.hdr = crate::hud::Hdr::Hdr;
         }
-        s.chroma_444 = self.chroma_format == crate::quic::CHROMA_IDC_444;
+        s.chroma_444 = f.chroma_format == crate::quic::CHROMA_IDC_444;
         s.auto_rate = self.wants_decode;
-        s.audio_lossless = self.audio_codec == crate::quic::AUDIO_CODEC_PCM;
-        s.audio_rate_hz = self.audio_sample_rate_hz;
-        s.audio_bits = self.audio_bits;
-        s.audio_channels = self.audio_channels;
+        let a = self.audio_format();
+        s.audio_lossless = a.is_pcm();
+        s.audio_rate_hz = a.rate_hz;
+        s.audio_bits = a.bits;
+        s.audio_channels = a.channels;
         s.extras.push(crate::hud::Extra {
             role: crate::hud::Role::Muted,
             ..crate::hud::Extra::detail(self.link_line())
@@ -1427,7 +1475,8 @@ impl NativeClient {
     /// One thread per plane; `&self` is for sharing across planes, not two consumers of one.
     pub fn next_frame(&self, timeout: Duration) -> Result<Frame> {
         match self.shared.frames.pop(timeout) {
-            FramePop::Frame(f) => {
+            FramePop::Frame(mut f) => {
+                pump::anchor::mark(&self.shared, &mut f);
                 let completes_au = f.part.as_ref().is_none_or(|p| p.last);
                 self.hud
                     .note_received(f.pts_ns, f.received_ns, f.data.len(), completes_au);
@@ -1448,7 +1497,11 @@ impl NativeClient {
 
     /// Next audio packet. Drain on a dedicated thread — packets arrive every 5 ms.
     pub fn next_audio(&self, timeout: Duration) -> Result<AudioPacket> {
-        pull(&self.planes.audio, timeout)
+        let pkt = pull(&self.planes.audio, timeout)?;
+        if let Some(format) = pkt.new_format {
+            *self.shared.audio_out.lock().unwrap() = Some(format);
+        }
+        Ok(pkt)
     }
 
     /// Mute this client's own speakers. Nothing leaves for the host: it keeps encoding, and a

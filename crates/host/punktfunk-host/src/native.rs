@@ -1219,15 +1219,17 @@ pub(crate) async fn run_admitted(
     // Live reconfigure is off for gamescope (resize must not relaunch the title),
     // `identity: per-client-mode` (resize would resolve a different slot), a monitor
     // mirror (physical head ignores the requested mode) and a `join` session (the mode
-    // is the owner's). Synthetic stays on. Captured once here.
+    // is the owner's). Synthetic stays on. Captured once here, the mirror pin too: a console
+    // change mid-session must not change this session's answer.
+    let mirrored = crate::session_plan::mirrored();
     let live_reconfig_ok = {
         let per_client_mode_identity = crate::vdisplay::policy::prefs()
             .configured_effective()
             .is_some_and(|e| e.identity == crate::vdisplay::policy::Identity::PerClientMode);
-        // Pin at bring-up; a console change mid-session must not change this session's answer.
-        let mirrored = crate::session_plan::mirrored();
         reconfig_allowed(compositor, per_client_mode_identity, mirrored || join_live)
     };
+    // A mirror and a `join` session share another session's capture: their format stays.
+    let format_change_ok = !(mirrored || join_live);
     // `Copy` so the control task's `async move` and SessionContext both keep it.
     let codec = crate::encode::codec_from_wire(welcome.codec);
     tracing::info!(
@@ -1343,6 +1345,12 @@ pub(crate) async fn run_admitted(
     // The client's feedback datagrams, datagram reader → control task. Unbounded: a client sends
     // a few per report window.
     let (feedback_tx, feedback_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The audio thread's `AudioConfig`s, onto the control stream. Only a client that reopens
+    // its player gets one.
+    let (audio_config_tx, audio_config_rx) = tokio::sync::mpsc::unbounded_channel();
+    let audio_epochs = features
+        .has(punktfunk_core::quic::v2::registry::FEATURE_AUDIO_EPOCH)
+        .then_some(audio_config_tx);
     tokio::spawn(control::run(control::Task {
         ctrl_send,
         ctrl_recv,
@@ -1369,6 +1377,22 @@ pub(crate) async fn run_admitted(
         anchored: features.has(punktfunk_core::quic::v2::registry::FEATURE_STREAM_CONFIG),
         codec,
         live_reconfig_ok,
+        // `0` is an older client's byte: it decodes HEVC.
+        client_codecs: match hello.video_codecs {
+            0 => punktfunk_core::quic::CODEC_HEVC,
+            set => set,
+        },
+        preferred_codec: hello.preferred_codec,
+        // The synthetic source encodes test frames under any codec it is told.
+        host_codecs: if source == Punktfunk1Source::Synthetic {
+            punktfunk_core::quic::CODEC_H264
+                | punktfunk_core::quic::CODEC_HEVC
+                | punktfunk_core::quic::CODEC_AV1
+        } else {
+            crate::encode::host_wire_caps()
+        },
+        format_change_ok: format_change_ok
+            && features.has(punktfunk_core::quic::v2::registry::FEATURE_FORMAT_EPOCH),
         adaptive_fec,
         session_bitrate_kbps,
         // Automatic, so negotiable: the governor may move it. PyroWave's floor still binds.
@@ -1389,6 +1413,7 @@ pub(crate) async fn run_admitted(
         session_grants: session_grants.clone(),
         access_rx,
         audio_rx,
+        audio_config_rx,
         pad_rx,
         launch_outcome_rx,
         peer: peer.ip(),
@@ -1509,6 +1534,7 @@ pub(crate) async fn run_admitted(
         &audio_sink,
         &controls,
         &counters,
+        audio_epochs,
     );
 
     if welcome.color.is_hdr() {
@@ -1628,11 +1654,14 @@ pub(crate) async fn run_admitted(
                 planes.inj_session_tx.clone(),
                 plays_seat_mode(),
             );
+            let format_facts =
+                handshake::FormatFacts::of(&hello, compositor, gamescope_route.as_ref());
             move |common| SessionContext {
                 common,
                 compositor: compositor
                     .expect("the Virtual source resolves a compositor during the handshake"),
                 gamescope_route,
+                format_facts,
                 bitrate_auto: hello.bitrate_kbps == 0,
                 pyrowave_bpp,
                 cursor_forward,
@@ -1898,6 +1927,9 @@ fn spawn_audio_plane(
     published: &Arc<std::sync::Mutex<Option<String>>>,
     controls: &crate::session_status::SessionControls,
     counters: &Arc<crate::session_status::SessionCounters>,
+    audio_epochs: Option<
+        tokio::sync::mpsc::UnboundedSender<punktfunk_core::quic::v2::msg::AudioConfig>,
+    >,
 ) -> Option<std::thread::JoinHandle<()>> {
     if matches!(
         source,
@@ -1942,6 +1974,7 @@ fn spawn_audio_plane(
                 tap_from,
                 muted,
                 counters,
+                audio_epochs,
             )
         })
         .map_err(|e| tracing::warn!(error = %e, "audio thread spawn failed — session continues without audio"))
@@ -2025,15 +2058,19 @@ fn run_source(
             &common.shared.fec_target,
             common.probe_seq,
         ),
-        Punktfunk1Source::Synthetic => synthetic_stream(
-            &mut common.session,
-            frames,
-            common.life.stop_flag(),
-            &common.ends,
-            &common.shared.fec_target,
-            common.timing_conn.as_ref(),
-            common.probe_seq,
-        ),
+        Punktfunk1Source::Synthetic => {
+            let opened_as = common.opened_as();
+            synthetic_stream(
+                &mut common.session,
+                frames,
+                common.life.stop_flag(),
+                &common.ends,
+                &common.shared.fec_target,
+                common.timing_conn.as_ref(),
+                common.probe_seq,
+                opened_as,
+            )
+        }
         Punktfunk1Source::SyntheticAbr(shape) => synthetic_abr_stream(SynthAbrContext {
             common,
             content: shape.content,

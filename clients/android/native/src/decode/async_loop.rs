@@ -190,6 +190,9 @@ enum RunEnd {
         clean: bool,
         lower: Option<usize>,
     },
+    /// The host changed the stream's format at this frame: the next codec is built for it and
+    /// takes the frame first.
+    Reformat(Box<Frame>),
 }
 
 /// The decode thread's body (see [`run`]): one [`run_codec`] per codec. A codec that dies or
@@ -213,6 +216,7 @@ pub(super) fn run_async(
     // Monotonic ns of the feeder's last loss gap (each one fires an RFI ask); 0 = none yet.
     let last_gap_ns = Arc::new(AtomicI64::new(0));
     let (mut rebuilds, mut after_gap) = (0u32, 0u32);
+    let mut carry: Option<Box<Frame>> = None;
     loop {
         match run_codec(
             &client,
@@ -220,12 +224,22 @@ pub(super) fn run_async(
             &shutdown,
             &stats,
             &opts,
-            rebuilt,
+            rebuilt && carry.is_none(),
             &mut stale,
             &last_gap_ns,
             floor.rung(),
+            carry.take(),
         ) {
             RunEnd::Stopped => return,
+            RunEnd::Reformat(frame) => {
+                log::info!(
+                    "decode: the host changed the stream format — rebuilding the decoder for {}",
+                    codec_mime(client.video_format().codec)
+                );
+                // Another codec's failures say nothing about this one's rungs.
+                (barren, floor) = (0, RungFloor::default());
+                carry = Some(frame);
+            }
             RunEnd::Failed {
                 rendered,
                 clean,
@@ -281,7 +295,8 @@ pub(super) fn run_async(
 /// stale buffer index. `rebuilt`: a previous codec failed, so this one waits for a keyframe.
 /// `stale`: a failed run's layer, hidden at this run's first present; a failed run that
 /// presented leaves its own layer there. `last_gap_ns`: where the feeder stamps each loss gap,
-/// for the rebuild log. `floor`: the ladder rung bring-up starts at.
+/// for the rebuild log. `floor`: the ladder rung bring-up starts at. `carry`: the first frame
+/// of a new format, which ended the last run and is fed first.
 #[allow(clippy::too_many_arguments)]
 fn run_codec(
     client: &Arc<NativeClient>,
@@ -293,6 +308,7 @@ fn run_codec(
     stale: &mut Option<Layer>,
     last_gap_ns: &Arc<AtomicI64>,
     floor: usize,
+    carry: Option<Box<Frame>>,
 ) -> RunEnd {
     let mode = client.mode();
     // The event channel: the callbacks + feeder push, this loop pulls. `Sender` is `Send`, so the
@@ -378,10 +394,17 @@ fn run_codec(
     // reference error, and reference errors can hang a hardware decoder. None reach this one.
     // A session's first decoder needs no ask: the stream opens on an IDR.
     let await_keyframe = rebuilt || opts.restart;
-    let class = admission(client.codec, &ctx.codec.name().unwrap_or_default());
+    let class = admission(
+        client.video_format().codec,
+        &ctx.codec.name().unwrap_or_default(),
+    );
     let mut state = State::new(asc, presenter, Intake::new(class, await_keyframe));
     if await_keyframe {
         client.recovery_lost();
+    }
+    if let Some(mut frame) = carry {
+        frame.new_format = None; // this codec is the one built for it
+        state.dispatch(client, DecodeEvent::Au(*frame, 0), &mut Pass::default());
     }
 
     // `ev_tx` moves into the feeder: from here only it and the codec callbacks keep the channel up.
@@ -397,7 +420,11 @@ fn run_codec(
     // when the pump, audio and feeder threads have registered their tids too.
     client.register_hot_thread();
 
-    while !shutdown.load(Ordering::Relaxed) && !state.fatal && !state.wedged {
+    while !shutdown.load(Ordering::Relaxed)
+        && !state.fatal
+        && !state.wedged
+        && state.reformat.is_none()
+    {
         // Block for the next event (idle wait — excluded from the work tally). The short timeout
         // drives loss-recovery housekeeping when the pipeline is momentarily quiet.
         let ev0 = match ev_rx.recv_timeout(Duration::from_millis(5)) {
@@ -556,6 +583,7 @@ fn teardown(
         fatal,
         wedged,
         unclean,
+        reformat,
         ..
     } = state;
     if let Some(mut p) = presenter {
@@ -581,6 +609,13 @@ fn teardown(
     // The feeder stops last: while a hung codec is slow to stop, it keeps the receive queue drained.
     feeder.stop_and_join();
     log::info!("decode: stopped (async, fed={fed} rendered={rendered} discarded={discarded})");
+    if let Some(frame) = reformat.filter(|_| !shutdown.load(Ordering::Relaxed)) {
+        // The last old-format picture stays up until the new codec presents.
+        if rendered > 0 {
+            *stale = layer;
+        }
+        return RunEnd::Reformat(Box::new(frame));
+    }
     if (fatal || wedged) && !shutdown.load(Ordering::Relaxed) {
         if rendered > 0 {
             *stale = layer;
@@ -623,7 +658,7 @@ fn bring_up(
     floor: usize,
 ) -> Option<(MediaCodec, Option<AscBackend>, Option<usize>)> {
     let mode = client.mode();
-    let mime = codec_mime(client.codec);
+    let mime = codec_mime(client.video_format().codec);
     // Fetched ONCE, ahead of the ladder, so a retry rung never pays the wait again.
     let hdr_static = hdr_static(client);
     let priority = PresentPriority::resolve(opts.present_priority, opts.smooth_buffer);
@@ -649,7 +684,7 @@ fn bring_up(
                 keys_label(keys)
             );
         }
-        let Some(mut codec) = create_codec(mime, opts.decoder_name.as_deref()) else {
+        let Some(mut codec) = create_codec(mime, opts.decoder_for(mime)) else {
             log::error!("decode: no {mime} decoder on this device");
             return None;
         };
@@ -683,7 +718,7 @@ fn bring_up(
                 opts.src_crop.clone(),
                 opts.layers.clone(),
                 opts.panel_hz,
-                color_dataspace(&client.color),
+                color_dataspace(&client.video_format().color),
                 mode.refresh_hz,
                 priority,
                 overlay,
@@ -851,6 +886,8 @@ struct State {
     /// The codec was fed past a loss or reported an error: a failure after this may be the
     /// stream's, not the configuration's ([`RungFloor`]).
     unclean: bool,
+    /// The first frame of a new format: this run ends and the next codec takes it.
+    reformat: Option<Frame>,
 }
 
 /// The receiver rule's decoder class for this session ([`Intake`]): AV1 only, strict on the
@@ -919,6 +956,7 @@ impl State {
             intake,
             loss_open: false,
             unclean: false,
+            reformat: None,
         }
     }
 
@@ -926,6 +964,10 @@ impl State {
     fn dispatch(&mut self, client: &NativeClient, ev: DecodeEvent, pass: &mut Pass) {
         match ev {
             DecodeEvent::Au(f, gap) => {
+                if f.new_format.is_some() {
+                    self.reformat = Some(f);
+                    return;
+                }
                 if gap > 0 {
                     self.loss_open = true;
                 }
@@ -1017,7 +1059,7 @@ impl State {
             if let Some(a) = self.asc.as_mut() {
                 a.poll_fences(ctx.offset(), &ctx.stats, &ctx.video_e2e);
                 // The host re-sends the source's grade on capture start and keyframes.
-                if ctx.client.color.is_hdr() {
+                if ctx.client.video_format().color.is_hdr() {
                     a.set_hdr_meta(ctx.client.latest_hdr_meta(Duration::ZERO));
                 }
             }
@@ -1481,8 +1523,11 @@ fn feeder_loop(
                         g.pop_front(); // stale — codec never echoed it back
                     }
                 }
-                if ev_tx.send(DecodeEvent::Au(frame, gap)).is_err() {
-                    break; // the decode loop is gone
+                // A new format ends this codec: what follows waits in core for the next one's
+                // feeder.
+                let reformat = frame.new_format.is_some();
+                if ev_tx.send(DecodeEvent::Au(frame, gap)).is_err() || reformat {
+                    break; // the decode loop is gone, or is ending for the new format
                 }
             }
             Err(PunktfunkError::NoFrame) => {} // timeout — re-check shutdown and poll again

@@ -50,6 +50,27 @@ pub(super) async fn connect_and_handshake(args: &WorkerArgs) -> Result<Handshake
     }
 }
 
+/// What this client offers. A format epoch is the embedder's promise to rebuild its decoder,
+/// so core offers it only when the embedder made it.
+fn client_features(
+    rebuilds_decoder: bool,
+    reopens_audio: bool,
+) -> crate::quic::v2::features::FeatureSet {
+    use crate::quic::v2::registry;
+    let mut set = crate::quic::v2::features::FeatureSet::default()
+        .with(registry::FEATURE_STREAM_CONFIG)
+        .with(registry::FEATURE_PAD_WRITES)
+        .with(registry::FEATURE_PROFILES)
+        .with(registry::FEATURE_CLEAR_PLACEMENT);
+    if rebuilds_decoder {
+        set = set.with(registry::FEATURE_FORMAT_EPOCH);
+    }
+    if reopens_audio {
+        set = set.with(registry::FEATURE_AUDIO_EPOCH);
+    }
+    set
+}
+
 /// Take a `Redirect` once: the next dial goes to its address and port with the same
 /// `ClientHello`, pinned to the certificate it names; an empty pin keeps the one dialed with.
 /// A second one on the same connect is a host that can't place this client, not a seat.
@@ -165,7 +186,6 @@ async fn dial(
             .local_ip()
             .map(crate::transport::ifinfo::link_facts)
             .unwrap_or_default();
-        use crate::quic::v2::features::FeatureSet;
         use crate::quic::v2::hello::{ClientHello, Ready, ServerHello};
         use crate::quic::v2::{io as v2io, msg::V2Message, registry};
         v2io::write_stream_type(&mut send, registry::STREAM_CONTROL).await?;
@@ -226,11 +246,7 @@ async fn dial(
             } else {
                 vec![MediaSuite::Aes128Gcm]
             },
-            features: FeatureSet::default()
-                .with(registry::FEATURE_STREAM_CONFIG)
-                .with(registry::FEATURE_PAD_WRITES)
-                .with(registry::FEATURE_PROFILES)
-                .with(registry::FEATURE_CLEAR_PLACEMENT),
+            features: client_features(p.rebuilds_decoder, p.reopens_audio),
             profile: p.profile.clone(),
             access_only: false,
         };
@@ -298,8 +314,25 @@ async fn dial(
         *args.shared.client_link.lock().unwrap() = link;
         tracing::info!(kind = link.kind, mbps = link.mbps, "this end's link facts");
         *args.shared.v2_session.lock().unwrap() = Some(server.session_id);
-        args.shared.anchor.lock().unwrap().on =
-            server.features.has(registry::FEATURE_STREAM_CONFIG);
+        {
+            let mut anchor = args.shared.anchor.lock().unwrap();
+            anchor.on = server.features.has(registry::FEATURE_STREAM_CONFIG);
+            anchor.formats = anchor.on && server.features.has(registry::FEATURE_FORMAT_EPOCH);
+            anchor.book(0, crate::quic::VideoFormat::of_welcome(&welcome));
+        }
+        *args.shared.video_format.lock().unwrap() = crate::quic::VideoFormat::of_welcome(&welcome);
+        {
+            let mut audio = args.shared.audio_anchor.lock().unwrap();
+            audio.on = server.features.has(registry::FEATURE_AUDIO_EPOCH);
+            audio.live = Some(crate::audio::plane::PlaneFormat::from_welcome(
+                welcome.audio_codec,
+                welcome.audio_rate_hz,
+                welcome.audio_bits,
+                welcome.audio_channels,
+                u32::from(welcome.audio_frame_us),
+                welcome.audio_layout,
+            ));
+        }
         let cfg = welcome.session_config(Role::Client);
         let media_v2 = crate::session::MediaV2 {
             clock_origin_ns: server.clock_origin_ns,

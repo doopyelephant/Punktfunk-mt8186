@@ -94,7 +94,8 @@ struct LiveSession {
     started: std::time::Instant,
     /// Host wall clock at registration; [`started`](Self::started) cannot give one.
     started_unix: i64,
-    /// 8 or 10, and the encoder's chroma. Fixed for the session.
+    /// 8 or 10, and the encoder's chroma. A codec change moves them with `codec` and `hdr`
+    /// ([`set_format`]).
     bit_depth: u8,
     chroma: ChromaFormat,
     /// What the video loop counted, stored once at its tail ([`record_tally`]).
@@ -696,6 +697,14 @@ pub fn refresh_peer(id: u64, peer: std::net::IpAddr) {
     if s.peer != Some(peer) {
         tracing::info!(session = id, from = ?s.peer, to = %peer, "client moved to a new address");
         s.peer = Some(peer);
+    }
+}
+
+/// A codec change rebuilt session `id`'s pipeline: `/status` and its summary name what it
+/// encodes now.
+pub fn set_format(id: u64, codec: Codec, hdr: bool, bit_depth: u8, chroma: ChromaFormat) {
+    if let Some(s) = registry().iter_mut().find(|s| s.id == id) {
+        (s.codec, s.hdr, s.bit_depth, s.chroma) = (codec, hdr, bit_depth, chroma);
     }
 }
 

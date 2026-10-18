@@ -382,6 +382,63 @@ impl StreamState {
         self.seen_reassert_gen = crate::windows::idd::topology_reassert_gen();
     }
 
+    /// The client's codec ask, vetted by the control task: re-run the handshake's depth, HDR and
+    /// chroma rule for the new codec and rebuild at the current mode, the way a mode switch
+    /// does, since capture's format follows codec and depth. The swap tells the new epoch; the
+    /// control task acks from the outcome. A failed rebuild keeps the old plan and pipeline.
+    pub(super) fn on_format_change(&mut self) {
+        let Some(codec) = self.format_rx.try_iter().last() else {
+            return;
+        };
+        let (bit_depth, hdr, chroma) = self.format_facts.resolve(codec);
+        let (old_plan, old_depth) = (self.plan, self.bit_depth);
+        self.plan = super::pipeline::resolve_plan(
+            bit_depth,
+            hdr,
+            chroma,
+            codec,
+            self.plan.cursor_forward,
+            self.plan.slices > 1,
+            self.compositor,
+            self.vd_params.route.as_ref(),
+            self.plan.pyrowave_bpp,
+            usize::from(self.shard_payload),
+            self.plan.reframe_to,
+            self.vd_params.join_live,
+        );
+        self.bit_depth = bit_depth;
+        tracing::info!(from = ?old_plan.codec, to = ?codec, bit_depth, hdr, ?chroma,
+            "rebuilding the pipeline for a codec change");
+        let trace = crate::bringup::Trace::start("format", self.resize_ms.clone());
+        self.close_open_frame();
+        let req = self.build_request(self.cur_mode, self.bitrate_kbps);
+        let built = build_pipeline(
+            &mut self.vd,
+            &req,
+            self.life.quit_flag(),
+            self.cur_display_gen,
+            None,
+            Some(trace.as_ref()),
+        );
+        match built {
+            Ok(pipe) => {
+                let kbps = pipe.bitrate_kbps;
+                self.swap_pipeline(Next::Pipeline(pipe), SwapReason::Format);
+                self.adopt_built_bitrate(kbps);
+                self.next = std::time::Instant::now();
+                trace.finish("pipeline_rebuilt");
+                announce_pipeline_gap(&self.gap_tx, trace.total_slot().load(Ordering::Relaxed));
+                let _ = self.format_result_tx.send(Some(codec));
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), ?codec,
+                    "codec-change rebuild failed — staying on the current codec");
+                (self.plan, self.bit_depth) = (old_plan, old_depth);
+                let _ = self.format_result_tx.send(None);
+            }
+        }
+    }
+
     /// Only Windows IDD-push has a topology watchdog to follow.
     #[cfg(not(target_os = "windows"))]
     pub(super) fn on_topology_reassert(&mut self) -> Result<()> {

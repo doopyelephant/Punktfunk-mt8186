@@ -670,6 +670,7 @@ mod frame_channel_tests {
             complete: true,
             part: None,
             received_ns: 0,
+            new_format: None,
         }
     }
 
@@ -1080,6 +1081,7 @@ mod hold_tests {
             complete,
             part: None,
             received_ns: 0,
+            new_format: None,
         }
     }
 

@@ -254,6 +254,43 @@ pub(super) struct StreamState {
         tokio::sync::mpsc::UnboundedSender<crate::native::wiring::Delivered>,
     pub(super) retarget_tx: tokio::sync::mpsc::UnboundedSender<(u32, AckReason)>,
     pub(super) gap_tx: tokio::sync::mpsc::UnboundedSender<u32>,
+    /// A codec ask the control task vetted, and where its outcome goes.
+    pub(super) format_rx: std::sync::mpsc::Receiver<crate::encode::Codec>,
+    pub(super) format_result_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::native::wiring::FormatOutcome>,
+    /// What the handshake's depth, HDR and chroma rule read, for a codec change to re-run it.
+    pub(super) format_facts: super::super::handshake::FormatFacts,
+}
+
+/// The video format `plan` encodes at `bit_depth` over `capturer` now, as a `StreamConfig` names
+/// it: an HDR session whose source composes SDR is 8-bit BT.709 (`session_plan::live_depth`).
+pub(super) fn format_of(
+    plan: &crate::session_plan::SessionPlan,
+    capturer: &dyn crate::capture::Capturer,
+    bit_depth: u8,
+) -> punktfunk_core::quic::VideoFormat {
+    let (hdr, bit_depth) =
+        crate::session_plan::live_depth(plan.hdr, capturer.hdr_meta().is_some(), bit_depth);
+    video_format(plan.codec, bit_depth, hdr, plan.chroma)
+}
+
+/// The colour is the HDR verdict, not the depth: 10-bit SDR is BT.709.
+pub(in crate::native) fn video_format(
+    codec: crate::encode::Codec,
+    bit_depth: u8,
+    hdr: bool,
+    chroma: crate::encode::ChromaFormat,
+) -> punktfunk_core::quic::VideoFormat {
+    punktfunk_core::quic::VideoFormat {
+        codec: crate::encode::codec_to_wire(codec),
+        bit_depth,
+        color: if hdr {
+            punktfunk_core::quic::ColorInfo::HDR10_BT2020_PQ
+        } else {
+            punktfunk_core::quic::ColorInfo::SDR_BT709
+        },
+        chroma_format: crate::encode::chroma_idc(chroma),
+    }
 }
 
 impl StreamState {
@@ -336,12 +373,21 @@ impl StreamState {
         self.tell_delivered(actual, actual != asked);
     }
 
-    /// Tell the control task what the current epoch delivers.
+    /// Tell the control task what the current epoch delivers, and `/status` what it encodes.
     pub(super) fn tell_delivered(&self, mode: punktfunk_core::Mode, corrects: bool) {
+        let format = format_of(&self.plan, &*self.capturer, self.bit_depth);
+        crate::session_status::set_format(
+            self.live_session.id,
+            self.plan.codec,
+            format.color.is_hdr(),
+            format.bit_depth,
+            self.plan.chroma,
+        );
         let _ = self
             .reconfig_result_tx
             .send(crate::native::wiring::Delivered {
                 mode,
+                format,
                 epoch: self.epoch,
                 corrects,
             });
@@ -378,6 +424,8 @@ impl StreamState {
                     ends:
                         StreamEnds {
                             reconfig,
+                            format_rx,
+                            format_result_tx,
                             keyframe,
                             rfi,
                             bitrate_rx,
@@ -427,6 +475,7 @@ impl StreamState {
                 },
             compositor,
             gamescope_route,
+            format_facts,
             bitrate_auto,
             conn,
             cursor_forward,
@@ -630,6 +679,7 @@ impl StreamState {
             if actual != mode {
                 let _ = reconfig_result_tx.send(crate::native::wiring::Delivered {
                     mode: actual,
+                    format: format_of(&plan, &*capturer, bit_depth),
                     epoch: 0,
                     corrects: true,
                 });
@@ -778,6 +828,9 @@ impl StreamState {
             reconfig_result_tx,
             retarget_tx,
             gap_tx,
+            format_rx,
+            format_result_tx,
+            format_facts,
             send: super::send::SendThread::new(frame_tx, send_thread),
             send_spread_us,
             wire_rekeys,
@@ -939,6 +992,7 @@ impl StreamState {
         while !self.life.stopping() && std::time::Instant::now() < self.deadline {
             self.on_session_switch();
             self.on_mode_switch();
+            self.on_format_change();
             self.on_topology_reassert()?;
             self.on_fec_moved();
             self.on_bitrate_request();
@@ -1353,6 +1407,30 @@ fn window_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An epoch says what the source composes: an HDR session over an SDR capture is 8-bit
+    /// BT.709, an SDR session is what it negotiated.
+    #[test]
+    fn an_epoch_tells_the_format_the_source_composes() {
+        use crate::encode::{ChromaFormat, Codec};
+        use punktfunk_core::quic::ColorInfo;
+        let sdr = crate::capture::SyntheticCapturer::new(16, 16, 60);
+        let plan = |hdr| {
+            crate::session_plan::SessionPlan::resolve(
+                10,
+                hdr,
+                ChromaFormat::Yuv420,
+                Codec::H265,
+                false,
+                false,
+                1,
+            )
+        };
+        let f = format_of(&plan(true), &sdr, 10);
+        assert_eq!((f.bit_depth, f.color), (8, ColorInfo::SDR_BT709));
+        let f = format_of(&plan(false), &sdr, 10);
+        assert_eq!((f.bit_depth, f.color), (10, ColorInfo::SDR_BT709));
+    }
 
     /// Native passes the connection's fingerprint and address; GameStream the paired
     /// certificate's fingerprint, if read, and the launch owner's address, if bound.

@@ -856,8 +856,9 @@ fn open(
         })?
         .clone();
 
-    // The output's colour comes first: an HDR session has nothing to capture on an SDR head,
-    // and the `wp_color_management_output_v1` stays bound to see the head re-lit.
+    // The output's colour comes first. An HDR session on a head lit SDR captures SDR, with no
+    // `hdr_meta`, so its encoder and the client follow; the `wp_color_management_output_v1`
+    // stays bound to see the head re-lit.
     let color = match st.color_mgr.clone() {
         Some(mgr) => fetch_output_color(&conn, &mut queue, &mut st, &qh, &mgr, &output, &wake_r)?,
         None => None,
@@ -867,12 +868,15 @@ fn open(
     let hdr = match (want_hdr, color) {
         (false, _) => false,
         (true, Some(c)) if c.is_hdr10() => true,
-        (true, Some(c)) => bail!(
-            "output {output_name} is not lit in HDR (primaries {} / transfer {}) — the \
-             session negotiated BT.2020 PQ",
-            c.primaries,
-            c.tf
-        ),
+        (true, Some(c)) => {
+            tracing::info!(
+                output = output_name,
+                primaries = c.primaries,
+                transfer = c.tf,
+                "output is lit SDR under an HDR session — capturing SDR until it is re-lit"
+            );
+            false
+        }
         (true, None) => bail!(
             "compositor describes no colour for output {output_name} (no \
              wp_color_management_v1) — HDR capture needs it"

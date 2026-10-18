@@ -304,11 +304,50 @@ impl ColorInfo {
     pub fn is_hdr(&self) -> bool {
         self.transfer == Self::TRC_PQ || self.transfer == Self::TRC_HLG
     }
+
+    /// `[primaries, transfer, matrix, full_range]`, the order a `StreamConfig` carries.
+    pub fn cicp(&self) -> [u8; 4] {
+        [self.primaries, self.transfer, self.matrix, self.full_range]
+    }
+
+    pub fn from_cicp([primaries, transfer, matrix, full_range]: [u8; 4]) -> ColorInfo {
+        ColorInfo {
+            primaries,
+            transfer,
+            matrix,
+            full_range,
+        }
+    }
 }
 
 impl Default for ColorInfo {
     fn default() -> Self {
         Self::SDR_BT709
+    }
+}
+
+/// What a video decoder is built for. It moves only at an epoch whose `StreamConfig` says so,
+/// and only toward a client in [`FEATURE_FORMAT_EPOCH`](super::v2::registry::FEATURE_FORMAT_EPOCH).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VideoFormat {
+    /// One `CODEC_*` bit.
+    pub codec: u8,
+    /// `8`, or `10` for Main10 and 10-bit AV1.
+    pub bit_depth: u8,
+    pub color: ColorInfo,
+    /// HEVC `chroma_format_idc`: [`CHROMA_IDC_420`] or [`CHROMA_IDC_444`].
+    pub chroma_format: u8,
+}
+
+impl VideoFormat {
+    /// The format the session opened with.
+    pub fn of_welcome(w: &super::Welcome) -> VideoFormat {
+        VideoFormat {
+            codec: w.codec,
+            bit_depth: w.bit_depth,
+            color: w.color,
+            chroma_format: w.chroma_format,
+        }
     }
 }
 

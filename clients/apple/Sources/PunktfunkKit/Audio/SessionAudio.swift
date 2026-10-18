@@ -3,7 +3,7 @@
 // Host → speaker: a drain thread pulls decoded audio off its plane in the core (nextAudioPcm)
 // into a jitter ring, and an AVAudioSourceNode plays the ring. An underrun plays silence and
 // re-primes. The ring, the A/V sync loop and the render format are built from the NEGOTIATED
-// rate and channel count (`connection.resolvedAudioRateHz`), never from 48 kHz stereo: the
+// rate and channel count (`connection.audioFormat`), never from 48 kHz stereo: the
 // lossless plane carries other rates and surround (design/hi-res-audio.md §9).
 //
 // Mic → host: `MicUplink` folds each IO quantum to mono, and a worker resamples to 48 kHz,
@@ -226,7 +226,7 @@ public final class SessionAudio: @unchecked Sendable {
     /// Everything that turns samples into time — the ring's ms ⇄ sample conversion, the A/V sync
     /// loop's, and the `AVAudioFormat` the render graph is built at — is denominated in this,
     /// because it is what `nextAudioPcm` hands back.
-    private var wireRateHz: Int { Int(connection.resolvedAudioRateHz) }
+    private var wireRateHz: Int { Int(connection.audioFormat.rateHz) }
 
     /// How much audio one datagram carries, in MICROSECONDS — `Welcome`'s resolved
     /// `audio_frame_us`. 5 000 on every Opus session; on the lossless plane the host sizes it so
@@ -234,7 +234,7 @@ public final class SessionAudio: @unchecked Sendable {
     /// 96 kHz/24-bit stereo, and shorter again for surround (a 5.1 frame carries three times the
     /// samples, so it drops to roughly 1 000–1 500). Microseconds because the ladder has
     /// sub-millisecond rungs (`AudioRing.setFrameUs`).
-    private var wireFrameUs: Int { Int(connection.resolvedAudioFrameUs) }
+    private var wireFrameUs: Int { Int(connection.audioFormat.frameUs) }
 
     /// The same figure rounded UP to whole milliseconds, for the one consumer that can only express
     /// itself in them: the drain thread's poll timeout. Rounding up rather than down keeps it "at
@@ -310,7 +310,7 @@ public final class SessionAudio: @unchecked Sendable {
             // nothing is offered the route's default — 2 on HDMI — and the mixer then folds a
             // negotiated 5.1 to stereo without a word. Best-effort like the rest: a stereo
             // route answers 2.
-            let wireChannels = Int(connection.resolvedAudioChannels)
+            let wireChannels = Int(connection.audioFormat.channels)
             if wireChannels > 2 {
                 try? session.setPreferredOutputNumberOfChannels(wireChannels)
             }
@@ -1051,8 +1051,8 @@ public final class SessionAudio: @unchecked Sendable {
     {
         // Build the playback layout from the host-RESOLVED channel count (never the request):
         // 2 = stereo / 6 = 5.1 / 8 = 7.1, canonical wire order FL FR FC LFE RL RR SL SR. Same rule
-        // for the rate — `resolvedAudioRateHz`, never the 96 kHz this client may have asked for.
-        let channels = Int(connection.resolvedAudioChannels)
+        // for the rate — `audioFormat.rateHz`, never the 96 kHz this client may have asked for.
+        let channels = Int(connection.audioFormat.channels)
         let rateHz = wireRateHz
         // One second of capacity at the session's format. The de-jitter depth is the ring's
         // `JitterPolicy`, not a prefill passed in here.
@@ -1142,7 +1142,7 @@ public final class SessionAudio: @unchecked Sendable {
         // 0 = the node has no device yet (a start that is about to fail) — nothing to compare.
         guard deviceRate > 0 else { return }
         let outChannels = Int(outFormat.channelCount)
-        let wireChannels = Int(connection.resolvedAudioChannels)
+        let wireChannels = Int(connection.audioFormat.channels)
         let mixerChannels = Int(engine.mainMixerNode.outputFormat(forBus: 0).channelCount)
         if mixerChannels < wireChannels, outChannels >= wireChannels {
             log.warning("""
@@ -1239,7 +1239,7 @@ public final class SessionAudio: @unchecked Sendable {
         // nil disarms the loop entirely — no reference, no correction (see `videoLatency`).
         let videoLatency = syncEnabled ? self.videoLatency : nil
         if !syncEnabled { log.info("A/V sync disabled by PUNKTFUNK_NO_AV_SYNC") }
-        let channels = Int(connection.resolvedAudioChannels)
+        let channels = Int(connection.audioFormat.channels)
         let rateHz = wireRateHz
         // Read on the caller's thread, not inside the closure: `self` is deliberately not captured
         // by the drain thread (it holds the connection strongly and self not at all — see
@@ -1249,7 +1249,31 @@ public final class SessionAudio: @unchecked Sendable {
         AudioDrain.start(
             connection: connection, flag: flag, done: drainDone, ring: ring,
             videoLatency: videoLatency, channels: channels, rateHz: rateHz,
-            frameUs: frameUs, frameMS: frameMS)
+            frameUs: frameUs, frameMS: frameMS,
+            onFormat: { [weak self] in self?.audioFormatChanged() })
+    }
+
+    /// The host moved the audio format and the drain ended on it. The ring and the render
+    /// graph are the old format's, so this is the one rebuild that does NOT keep the ring:
+    /// the engines come back with a new one, and a new drain, at the format the connection
+    /// reads now. Runs on `engineQueue`, like every rebuild.
+    private func audioFormatChanged() {
+        engineQueue.async { [weak self] in
+            guard let self, !self.flag.isStopped else { return }
+            // The ended drain's signal, so `stop()` waits for the new one.
+            _ = self.drainDone.wait(timeout: .now() + .milliseconds(400))
+            self.stateLock.lock()
+            let config = self.startConfig
+            self.drainStarted = false
+            self.ring = nil
+            self.stateLock.unlock()
+            guard let config else { return }
+            self.tearDownEngines()
+            self.startEngines(
+                speakerUID: config.speakerUID, micUID: config.micUID,
+                micChannel: config.micChannel, micEnabled: config.micEnabled,
+                echoCancel: config.echoCancel)
+        }
     }
 
     // MARK: - Mic (mic → host)

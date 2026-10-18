@@ -551,6 +551,8 @@ fn connect(req: ConnectRequest) -> jlong {
         gamepad: GamepadPref::from_u8(gamepad_pref),
         bitrate_kbps, // 0 = host default
         pyrowave_bpp_x100,
+        // The audio supervisor reopens its device on a packet in a new format.
+        reopens_audio: true,
         video_caps: video_caps(hdr_enabled, ten_bit_sdr, multi_slice_ok),
         audio_channels,
         // The audio format this session ASKS for (resolved above). A non-default pair is what
@@ -611,6 +613,8 @@ fn connect(req: ConnectRequest) -> jlong {
         // on-glass experiment): AU prefixes then arrive as `Frame::part` pieces and the decode
         // loop feeds them with BUFFER_FLAG_PARTIAL_FRAME.
         frame_parts,
+        // The decode loop rebuilds its codec on a frame in a new format (`RunEnd::Reformat`).
+        rebuilds_decoder: true,
         launch, // a store-qualified library id to boot into a game, or None for the desktop
         name: device_name, // Kotlin's Build.MODEL — the host's approval-list / trust-store label
         pin,    // Some → Crypto on host-fp mismatch

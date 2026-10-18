@@ -120,6 +120,9 @@ enum DecodeExit {
     /// negotiated rate or the host named a coupling this build does not know. Reopening the
     /// DEVICE would not change that, so it is not a reason to walk the ladder again.
     Fatal,
+    /// The host changed the audio format; the packet that opens it waits in the caller's slot
+    /// for a device opened at it.
+    Reformat,
 }
 
 /// Decoded-chunk hand-off depth: 64 frames of slack (matches the core's AUDIO_QUEUE).
@@ -247,7 +250,7 @@ impl AudioPlayback {
         // Everything about the format comes from what the host RESOLVED, never from what this
         // device asked for: the channel count (2 = stereo / 6 = 5.1 / 8 = 7.1, canonical wire
         // order FL FR FC LFE RL RR SL SR), the plane, the rate, the depth and the frame duration.
-        let fmt = PlaneFormat::of(&client);
+        let fmt = client.audio_format();
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
         let join = std::thread::Builder::new()
@@ -636,6 +639,32 @@ fn supervise(
     // 33. Done once for the thread, not once per generation — it is the same thread throughout.
     client.register_hot_thread();
     boost_audio_thread("audio");
+    let (mut fmt, mut first) = (fmt, None);
+    while let Some(next) = supervise_format(&client, game_audio, is_tv, fmt, shutdown, first.take())
+    {
+        fmt = next
+            .new_format
+            .expect("a format ends only on a marked packet");
+        log::info!("audio: the host changed the audio format — reopening the device for it");
+        first = Some(next);
+    }
+}
+
+/// One audio format's device ladder and its reopen-on-disconnect generations. `first` is the
+/// packet that opened this format, fed before anything is pulled. `Some` = a packet in another
+/// format arrived, for the next format's device.
+fn supervise_format(
+    client: &Arc<NativeClient>,
+    game_audio: bool,
+    is_tv: bool,
+    fmt: PlaneFormat,
+    shutdown: &AtomicBool,
+    first: Option<punktfunk_core::client::AudioPacket>,
+) -> Option<punktfunk_core::client::AudioPacket> {
+    let mut carry = first.map(|pkt| punktfunk_core::client::AudioPacket {
+        new_format: None,
+        ..pkt
+    });
     let playout = AudioPlayout {
         tuning: punktfunk_core::audio::JitterTuning::AAUDIO,
         format: fmt,
@@ -699,7 +728,7 @@ fn supervise(
                 reopen_attempt = 0;
                 live
             }
-            None if shutdown.load(Ordering::Relaxed) => return,
+            None if shutdown.load(Ordering::Relaxed) => return None,
             // A reopen that lands in the middle of the very route change that caused the
             // disconnect finds no usable device and would otherwise disable audio permanently —
             // the exact outcome this supervisor exists to prevent. An HDMI mode switch or an AVR
@@ -714,20 +743,21 @@ fn supervise(
             }
             None => {
                 log_no_configuration(fmt);
-                return;
+                return None;
             }
         };
         if generation > 0 {
             log::info!("audio: reopened after disconnect (generation {generation})");
         }
         let exit = decode_loop(
-            &client,
+            client,
             &live,
             shutdown,
             &disconnected,
             &counters,
             playout,
             &sync,
+            &mut carry,
         );
         live.output.stop();
         drop(live); // closes the stream, or stops and releases the track
@@ -742,6 +772,7 @@ fn supervise(
                 break;
             }
             DecodeExit::Shutdown | DecodeExit::SessionClosed | DecodeExit::Fatal => break,
+            DecodeExit::Reformat => break,
         }
     }
     log::info!(
@@ -752,6 +783,7 @@ fn supervise(
         counters.underruns.load(Ordering::Relaxed),
         generation + 1,
     );
+    carry.filter(|pkt| pkt.new_format.is_some())
 }
 
 /// What the decoded-frame counter is called in the log lines. Kept plane-specific rather than
@@ -1062,6 +1094,7 @@ fn try_open(rung: OpenRung, ctx: &OpenCtx) -> Result<LiveStream, String> {
 /// Runs on the supervisor's thread and returns when the session ends, the playback is dropped, or
 /// the device disconnects — [`DecodeExit`] says which, because only one of them is worth reopening
 /// the device for.
+#[allow(clippy::too_many_arguments)]
 fn decode_loop(
     client: &Arc<NativeClient>,
     live: &LiveStream,
@@ -1070,6 +1103,7 @@ fn decode_loop(
     counters: &Counters,
     playout: AudioPlayout,
     sync: &punktfunk_core::audio::AudioSyncCell,
+    carry: &mut Option<punktfunk_core::client::AudioPacket>,
 ) -> DecodeExit {
     let fmt = playout.format;
     let mut plane = match Plane::new(client, live, counters, playout, sync) {
@@ -1085,7 +1119,15 @@ fn decode_loop(
         if disconnected.load(Ordering::Relaxed) {
             return DecodeExit::Disconnected;
         }
-        let step = match client.next_audio(tick) {
+        let pulled = match carry.take() {
+            Some(pkt) => Ok(pkt),
+            None => client.next_audio(tick),
+        };
+        let step = match pulled {
+            Ok(pkt) if pkt.new_format.is_some() => {
+                *carry = Some(pkt);
+                return DecodeExit::Reformat;
+            }
             Ok(pkt) => plane.on_packet(&pkt),
             Err(PunktfunkError::NoFrame) => plane.on_quiet(),
             Err(_) => return DecodeExit::SessionClosed,

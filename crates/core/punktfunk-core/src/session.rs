@@ -57,6 +57,11 @@ pub struct Frame {
     /// leaves 0 (it has no clock). Do not stamp at the pre-decode pull — that folds queue
     /// wait into apparent network latency.
     pub received_ns: u64,
+    /// `Some` on the first frame handed out under a format other than the one before it: build
+    /// the decoder for this format before decoding this frame. Set by
+    /// [`NativeClient::next_frame`](crate::client::NativeClient::next_frame), only under
+    /// [`FEATURE_FORMAT_EPOCH`](crate::quic::v2::registry::FEATURE_FORMAT_EPOCH).
+    pub new_format: Option<crate::quic::VideoFormat>,
 }
 
 /// What a session takes beyond [`Config`] ([`Session::new`]). `Default` is unsealed with capture

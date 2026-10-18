@@ -12,18 +12,24 @@ use crate::config::Mode;
 /// Host answers [`Reconfigured`]. On accept it rebuilds output + encoder; the
 /// data plane is unchanged. The first new-mode frame is an IDR with in-band
 /// parameter sets — that is all a decoder needs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `exclude_codecs` non-zero is a codec ask instead, and `mode` is ignored: drop these
+/// `CODEC_*` bits and stream on in another codec, from a new epoch. Only under
+/// [`FEATURE_FORMAT_EPOCH`](super::v2::registry::FEATURE_FORMAT_EPOCH).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Reconfigure {
     pub mode: Mode,
+    pub exclude_codecs: u8,
 }
 
 /// `host → client` answer to [`Reconfigure`]. `accepted = false`: request
 /// rejected (encoder limits); `mode` is the still-active one. `true`: `mode`
-/// is being switched to live.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// is being switched to live. `exclude_codecs` echoes a codec ask; `0` answers a mode switch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Reconfigured {
     pub accepted: bool,
     pub mode: Mode,
+    pub exclude_codecs: u8,
 }
 
 /// `host → client`: sealed shard payload changes mid-session
