@@ -57,6 +57,22 @@ pub(super) struct ChunkMsg {
     pub(super) meta: AuMeta,
 }
 
+impl ChunkMsg {
+    /// A whole AU in one chunk goes out as a [`SendMsg::Frame`]: that sealer sends after one
+    /// seal chunk and computes parity beside the paced data. The streamed one seals the
+    /// whole chunk before its first packet.
+    pub(super) fn into_msg(self) -> SendMsg {
+        if self.first && self.last {
+            SendMsg::Frame(FrameMsg {
+                data: self.data,
+                meta: self.meta,
+            })
+        } else {
+            SendMsg::Chunk(self)
+        }
+    }
+}
+
 /// Open at `first`, seal+pace completed FEC blocks, close at `last`. `None` mid-AU. One
 /// frame on the pacer from the first chunk to the last.
 fn handle_chunk(
@@ -69,12 +85,6 @@ fn handle_chunk(
 ) -> Result<Option<(AuMeta, PaceStat)>> {
     let m = c.meta;
     if c.first {
-        if open.take().is_some() {
-            // Rebuild forfeits the in-flight AU; sentinel packets are already on the wire.
-            tracing::warn!(
-                "streamed AU abandoned mid-flight (encoder rebuild) — client ages it out"
-            );
-        }
         // USER_FLAG_SLICE_STREAM only toward a client that negotiated streamed AUs AND multi-slice.
         let flags = m.flags
             | if slice_wire {
@@ -545,10 +555,17 @@ impl SendLoop {
             );
         }
         // A new epoch takes effect at the AU that carries it, never mid-AU.
-        match &send_msg {
-            SendMsg::Frame(f) => self.session.set_epoch(f.meta.epoch),
-            SendMsg::Chunk(c) if c.first => self.session.set_epoch(c.meta.epoch),
-            SendMsg::Chunk(_) | SendMsg::Resend { .. } => {}
+        let opens = match &send_msg {
+            SendMsg::Frame(f) => Some(f.meta.epoch),
+            SendMsg::Chunk(c) if c.first => Some(c.meta.epoch),
+            SendMsg::Chunk(_) | SendMsg::Resend { .. } => None,
+        };
+        if let Some(epoch) = opens {
+            self.session.set_epoch(epoch);
+            // A streamed AU whose tail never came is forfeit; its sentinels are already out.
+            if self.streamed.take().is_some() {
+                tracing::warn!("streamed AU abandoned mid-flight — client ages it out");
+            }
         }
         let outcome = match send_msg {
             SendMsg::Frame(FrameMsg { data, meta: m }) => paced_submit(
@@ -806,7 +823,7 @@ impl PerfLine {
 #[cfg(test)]
 mod tests {
     use super::{
-        send_loop, AuMeta, FrameMsg, PaceStat, PerfWindow, SendMsg, SendStats, SendThread,
+        send_loop, AuMeta, ChunkMsg, FrameMsg, PaceStat, PerfWindow, SendMsg, SendStats, SendThread,
     };
     use punktfunk_core::transport::Transport;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -974,6 +991,41 @@ mod tests {
                 driver: None,
             },
         })
+    }
+
+    /// An AU handed over as one chunk takes the whole-AU sealer: all 40 data shards, then
+    /// the parity. The streamed sealer sends block 0's parity after its 32 data shards.
+    #[test]
+    fn a_whole_au_in_one_chunk_sends_its_data_first() {
+        let (host_tp, client_tp) = punktfunk_core::transport::loopback_pair(0, 0);
+        let (frame_tx, stop, _, thread) =
+            spawn_loop(Box::new(host_tp), crate::send_pacing::Shape::Auto);
+        let SendMsg::Frame(f) = frame(5) else {
+            unreachable!()
+        };
+        let chunk = ChunkMsg {
+            data: vec![3u8; 40 * 1024],
+            first: true,
+            last: true,
+            meta: f.meta,
+        };
+        frame_tx.send(chunk.into_msg()).unwrap();
+        let mut got = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while got.len() < 50 && std::time::Instant::now() < deadline {
+            match client_tp.recv().unwrap() {
+                Some(p) => got.push(p),
+                None => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(frame_tx);
+        thread.join().unwrap();
+        // 32 + 8 data shards, 8 + 2 parity.
+        assert_eq!(got.len(), 50);
+        let is_data =
+            |p: &[u8]| u16::from_le_bytes([p[22], p[23]]) < u16::from_le_bytes([p[24], p[25]]);
+        assert!(got[..40].iter().all(|p| is_data(p)));
     }
 
     /// A client's NACK on the send thread: the frame went out whole, then the shards the

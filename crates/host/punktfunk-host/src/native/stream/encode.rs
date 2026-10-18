@@ -496,8 +496,9 @@ impl StreamState {
         }
     }
 
-    /// Stream one AU's chunks as they land. `Au` = a whole AU went out (the caller polls again
-    /// while owed frames remain); `Nothing` = the encoder has no more output this tick.
+    /// Stream one AU's chunks as they land; an AU in one chunk goes out whole. `Au` = a whole
+    /// AU went out (the caller polls again while owed frames remain); `Nothing` = the encoder
+    /// has no more output this tick.
     fn poll_chunked(&mut self, st: &Stamps, resend_meta: &mut bool) -> Polled {
         let t_wait = std::time::Instant::now();
         let mut first_chunk_us = 0u32;
@@ -550,7 +551,7 @@ impl StreamState {
                 last,
                 meta,
             };
-            if !self.send.send(SendMsg::Chunk(msg), || self.leaving()) {
+            if !self.send.send(msg.into_msg(), || self.leaving()) {
                 return Polled::SendGone;
             }
             if last {
