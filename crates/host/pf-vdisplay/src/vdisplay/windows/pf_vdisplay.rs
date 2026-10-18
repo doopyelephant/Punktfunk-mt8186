@@ -828,6 +828,12 @@ impl VdisplayDriver for PfVdisplayDriver {
                 "pf-vdisplay ADD: advertising the client display's HDR volume in the monitor EDID"
             );
         }
+        // A driver that predates the tail reads only the prefix and keeps its own fallbacks.
+        let mut extra_modes = [[0; 2]; control::MAX_EXTRA_MODES];
+        let sizes = &pf_host_config::config().vdisplay_resolutions;
+        for (slot, &(w, h)) in extra_modes.iter_mut().zip(sizes) {
+            *slot = [w, h];
+        }
         let add = control::AddRequest {
             session_id,
             width: mode.width,
@@ -840,6 +846,7 @@ impl VdisplayDriver for PfVdisplayDriver {
             // v5: driver declares an IddCx hardware cursor (DWM stops compositing the pointer).
             // Zero toward older drivers is harmless — host sets this only when proto ≥ 5.
             hw_cursor: hw_cursor as u32,
+            extra_modes,
         };
         // Opt-in; non-fatal: the driver reports the real render LUID in the shared header.
         if let Some(luid) = render_luid {

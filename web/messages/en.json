@@ -1119,6 +1119,8 @@
 	"setting_max_fps_hint": "Caps how fast the game renders, not the stream. 0 means no limit.",
 	"setting_vdisplay_hz_mult": "Display refresh multiple",
 	"setting_vdisplay_hz_mult_hint": "Runs the virtual display faster than the stream so a late frame still shows. 0 is automatic, 1 is off.",
+	"setting_vdisplay_resolutions": "Extra resolutions",
+	"setting_vdisplay_resolutions_hint": "Sizes a game or Windows can switch the virtual display to, like 2560x1440. Sizes larger than the stream are left out.",
 	"setting_audio_output_mode": "Where audio plays",
 	"setting_audio_output_mode_client_only": "Device only",
 	"setting_audio_output_mode_host_and_client": "Device and host",

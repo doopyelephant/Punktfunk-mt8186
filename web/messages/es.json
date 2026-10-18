@@ -1110,6 +1110,8 @@
 	"setting_max_fps_hint": "Limita la velocidad a la que renderiza el juego, no la transmisión. 0 significa sin límite.",
 	"setting_vdisplay_hz_mult": "Múltiplo de refresco de pantalla",
 	"setting_vdisplay_hz_mult_hint": "La pantalla virtual va más rápido que la transmisión para que un fotograma tardío aún se muestre. 0 es automático, 1 desactivado.",
+	"setting_vdisplay_resolutions": "Resoluciones adicionales",
+	"setting_vdisplay_resolutions_hint": "Tamaños a los que un juego o Windows puede cambiar la pantalla virtual, como 2560x1440. Se omiten los mayores que la transmisión.",
 	"setting_audio_output_mode": "Dónde se reproduce el audio",
 	"setting_audio_output_mode_client_only": "Solo dispositivo",
 	"setting_audio_output_mode_host_and_client": "Dispositivo y host",

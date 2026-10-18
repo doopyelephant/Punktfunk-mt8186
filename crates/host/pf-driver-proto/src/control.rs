@@ -107,7 +107,13 @@ pub struct AddRequest {
     /// Non-zero = declare an IddCx hardware cursor: DWM excludes the pointer from the frame.
     /// Occupies the old tail `_reserved` at offset 36: an old driver ignores it (stays composited).
     pub hw_cursor: u32,
+    /// More sizes to offer, `[width, height]`, each at `refresh_hz`. A zero entry is unused, so
+    /// an old host's missing tail offers none.
+    pub extra_modes: [[u32; 2]; MAX_EXTRA_MODES],
 }
+
+/// How many [`AddRequest::extra_modes`] one ADD carries.
+pub const MAX_EXTRA_MODES: usize = 16;
 
 /// [`AddRequest`] size before the luminance tail — prefix an old driver reads / old host sends.
 pub const ADD_REQUEST_LEGACY_SIZE: usize = 24;
@@ -243,7 +249,6 @@ pub struct EncodeProbeReply {
 const _: () = {
     use core::mem::{offset_of, size_of};
 
-    assert!(size_of::<AddRequest>() == 40);
     assert!(offset_of!(AddRequest, session_id) == 0);
     assert!(offset_of!(AddRequest, width) == 8);
     assert!(offset_of!(AddRequest, height) == 12);
@@ -255,7 +260,8 @@ const _: () = {
     assert!(offset_of!(AddRequest, min_luminance_millinits) == 32);
     // Former tail `_reserved` — same offset, same total size (rename-only).
     assert!(offset_of!(AddRequest, hw_cursor) == 36);
-    assert!(size_of::<AddRequest>() == 40);
+    assert!(offset_of!(AddRequest, extra_modes) == 40);
+    assert!(size_of::<AddRequest>() == 40 + 8 * MAX_EXTRA_MODES);
 
     assert!(size_of::<AddReply>() == 24);
     assert!(offset_of!(AddReply, adapter_luid_low) == 0);
@@ -320,17 +326,23 @@ mod tests {
             max_frame_avg_nits: 400,
             min_luminance_millinits: 50, // 0.05 nits
             hw_cursor: 1,
+            extra_modes: {
+                let mut m = [[0; 2]; MAX_EXTRA_MODES];
+                m[0] = [2560, 1440];
+                m
+            },
         };
         let bytes = bytemuck::bytes_of(&req);
-        assert_eq!(bytes.len(), 40);
+        assert_eq!(bytes.len(), size_of::<AddRequest>());
         assert_eq!(*bytemuck::from_bytes::<AddRequest>(bytes), req);
         // preferred_monitor_id occupies the old `_reserved` slot at offset 20.
         assert_eq!(bytes[20..24], 7u32.to_le_bytes());
         // Luminance tail rides after the legacy boundary; a zero-filled tail decodes as unknown.
         assert_eq!(bytes[24..28], 800u32.to_le_bytes());
-        let mut legacy = [0u8; 40];
+        assert_eq!(bytes[40..44], 2560u32.to_le_bytes());
+        let mut legacy = [0u8; size_of::<AddRequest>()];
         legacy[..ADD_REQUEST_LEGACY_SIZE].copy_from_slice(&bytes[..ADD_REQUEST_LEGACY_SIZE]);
-        // `pod_read_unaligned`, not `from_bytes`: `legacy` is `[u8; 40]` (align 1) but
+        // `pod_read_unaligned`, not `from_bytes`: `legacy` is a byte array (align 1) but
         // `AddRequest` is align 8. `from_bytes` panics unless the buffer happens to be 8-aligned.
         let old = bytemuck::pod_read_unaligned::<AddRequest>(&legacy);
         assert_eq!(old.preferred_monitor_id, 7);
@@ -342,6 +354,7 @@ mod tests {
             ),
             (0, 0, 0)
         );
+        assert_eq!(old.extra_modes, [[0; 2]; MAX_EXTRA_MODES]);
 
         let reply = AddReply {
             adapter_luid_low: 0x1234_5678,
