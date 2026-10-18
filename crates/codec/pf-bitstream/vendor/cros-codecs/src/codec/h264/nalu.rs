@@ -102,9 +102,7 @@ where
 {
     fn find_start_code(data: &mut Cursor<&'a [u8]>, offset: usize) -> Option<usize> {
         // discard all zeroes until the start code pattern is found
-        data.get_ref()[offset..]
-            .windows(3)
-            .position(|window| window == [0x00, 0x00, 0x01])
+        memchr::memmem::find(&data.get_ref()[offset..], &[0x00, 0x00, 0x01])
     }
 
     pub fn into_owned(self) -> Nalu<'static, U> {
