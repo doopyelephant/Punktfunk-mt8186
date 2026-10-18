@@ -483,10 +483,10 @@ pub(super) fn runner_command() -> Result<(std::path::PathBuf, Vec<String>)> {
     Ok((bun, vec![runner.to_string_lossy().into_owned()]))
 }
 
-/// The runner's account, and `plugin`'s package with the sandbox on, may reach one directory
-/// the operator owns: both ACEs in one walk of its tree, which the next converge adopts rather
-/// than walking again. LocalService holds no ACE inside a user profile, so without this a
-/// launcher installed there reads as not installed.
+/// The runner's account, and `plugin`'s files capability with the sandbox on, may reach one
+/// directory the operator owns: both ACEs in one walk of its tree, which the next converge
+/// adopts rather than walking again. LocalService holds no ACE inside a user profile, so
+/// without this a launcher installed there reads as not installed.
 pub(super) fn grant(plugin: Option<&str>, dir: &std::path::Path, write: bool) -> Result<()> {
     let ace = if write { Ace::Modify } else { Ace::Read };
     let sids = decision_sids(plugin);
@@ -504,15 +504,11 @@ pub(super) fn revoke(plugin: &str, dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// The runner's SID, and `plugin`'s package SID with the sandbox on, without icacls' `*`.
+/// The runner's SID, and `plugin`'s files capability with the sandbox on, without icacls' `*`.
 fn decision_sids(plugin: Option<&str>) -> Vec<String> {
     let mut sids = vec![LOCAL_SERVICE_SID.trim_start_matches('*').to_string()];
     if let Some(id) = plugin.filter(|_| !runner_sandbox_off()) {
-        match crate::windows::app_container::package_sid(id) {
-            Ok(sid) => sids.push(sid),
-            // The converge places the package's ACE on its own pass.
-            Err(e) => tracing::warn!(plugin = %id, error = %format!("{e:#}"), "no package SID"),
-        }
+        sids.push(crate::windows::app_container::files_capability_sid(id));
     }
     sids
 }
@@ -687,8 +683,8 @@ mod tests {
         let path = dir.to_string_lossy().into_owned();
         let deep = dir.join("d19").join("f19").to_string_lossy().into_owned();
         let runner = super::LOCAL_SERVICE_SID.trim_start_matches('*').to_string();
-        // Any well-formed package SID: an ACE needs no registered package.
-        let pkg = "S-1-15-2-1-2-3-4-5-6-7".to_string();
+        // Any well-formed capability SID: an ACE needs no container that holds it.
+        let pkg = "S-1-15-3-1024-1-2-3-4-5-6-7-8".to_string();
         let walks = || WALKS.with(std::cell::Cell::get);
         let aces = |ace: Ace| PlacedAces {
             grantees: [&runner, &pkg]
@@ -731,7 +727,7 @@ mod tests {
         assert_eq!(walks() - start, 0);
         assert!(adopted == want);
 
-        // An installer stripped the package's ACE: the recheck sees it and walks once.
+        // An installer stripped the capability's ACE: the recheck sees it and walks once.
         super::revoke_sids(&dir, std::slice::from_ref(&pkg)).unwrap();
         let start = walks();
         let mut healed = want.clone();
@@ -888,9 +884,10 @@ pub(super) fn recheck_next() {
 
 /// Every directory a plugin declared or was granted carries an ACE for the runner's account,
 /// read or Modify, and every `HKLM` key it declared a read; what a gone plugin placed is
-/// stripped. With the sandbox on, the plugin's package gets the same plus its code, state and
-/// inbox: a container passes only an ACE its account and its package both hold, so a root in a
-/// user profile needs both. A root under the host's own profile is nobody's `~` and gets
+/// stripped. With the sandbox on, the plugin's files capability gets the same plus its code,
+/// state and inbox: a container passes only an ACE its account and its capability both hold, so
+/// a root in a user profile needs both. An ACE an older host placed for the package SID is in
+/// the record and comes off here. A root under the host's own profile is nobody's `~` and gets
 /// nothing; a directory that does not exist yet waits for the next start. After
 /// [`recheck_next`] it checks every ACE again: an installer that rewrites a folder or key drops
 /// the ACE while the file still lists it.
@@ -918,13 +915,7 @@ pub(super) fn converge_runner_roots(
     if !runner_sandbox_off() {
         let store = access::AccessStore::open(pf_paths::config_dir());
         for (id, m) in manifests {
-            let sid = match crate::windows::app_container::package_sid(id) {
-                Ok(sid) => sid,
-                Err(e) => {
-                    tracing::warn!(plugin = %id, error = %format!("{e:#}"), "no package SID");
-                    continue;
-                }
-            };
+            let sid = crate::windows::app_container::files_capability_sid(id);
             let mut paths = root_aces(&store.plugin_roots(id, m), &home);
             paths.extend(package_dirs(id));
             if m.per_account() {
@@ -1139,7 +1130,7 @@ fn root_aces(
         .collect()
 }
 
-/// What a plugin's package needs beyond its roots: the runtime, the runner bundle and the
+/// What a plugin's container needs beyond its roots: the runtime, the runner bundle and the
 /// plugin tree it loads code from, its own state, and its inbox when it has one.
 fn package_dirs(id: &str) -> std::collections::BTreeMap<String, Ace> {
     let cfg = pf_paths::config_dir();

@@ -456,7 +456,7 @@ fn replace(path: &Path, body: &[u8]) -> io::Result<()> {
 }
 
 /// The ACL half of a grant, mapped into `io::Error` for the store's signatures: the runner's
-/// ACE, and `plugin`'s package ACE when named. Runs only once a grant is certain to be
+/// ACE, and `plugin`'s capability ACE when named. Runs only once a grant is certain to be
 /// recorded — a cap refusal never leaves an unrecorded ACE.
 fn apply_acl(plugin: Option<&str>, dir: &Path, write: bool) -> io::Result<()> {
     #[cfg(test)]
@@ -465,7 +465,7 @@ fn apply_acl(plugin: Option<&str>, dir: &Path, write: bool) -> io::Result<()> {
 }
 
 /// Match the ACL on `path` to the grants left after `plugin`'s came off. Every Windows plugin
-/// shares the runner's account, so its ACE goes, with `plugin`'s package ACE, only when no
+/// shares the runner's account, so its ACE goes, with `plugin`'s capability ACE, only when no
 /// plugin holds the folder, and a write ACE falls back to read when only read grants remain.
 /// Best-effort: the record is already written.
 fn settle_acl(access: &BTreeMap<String, PluginAccess>, plugin: &str, path: &str) {
@@ -1084,7 +1084,7 @@ impl AccessStore {
     }
 
     /// [`Self::runner_roots`] for one plugin: what its manifest declares plus its own grants,
-    /// which is what its own account or package gets an ACE for.
+    /// which is what its own account or capability gets an ACE for.
     #[cfg_attr(not(windows), allow(dead_code, reason = "Windows grants per plugin"))]
     pub fn plugin_roots(&self, id: &str, manifest: &PluginManifest) -> Vec<RunnerRoot> {
         let access = {
