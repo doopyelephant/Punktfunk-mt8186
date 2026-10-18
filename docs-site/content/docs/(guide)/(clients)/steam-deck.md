@@ -30,8 +30,9 @@ its own. In Desktop Mode, run the app directly. Both share one identity and one 
 2. Open the **Developer** tab and choose **Install Plugin from URL**.
 3. Paste `https://unom.io/pf-decky` and confirm.
 
-The **Punktfunk** panel appears right away. That link is the stable channel; for canary builds or a
-pinned version, see [Release Channels](/docs/channels).
+The **Punktfunk** panel appears right away. That link is the stable channel. For canary builds,
+paste `https://unom.io/pf-decky-canary` instead. To pin a version, see
+[Release Channels](/docs/channels).
 
 ## Use it
 
