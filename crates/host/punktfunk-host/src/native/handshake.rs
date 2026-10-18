@@ -601,7 +601,8 @@ pub(super) async fn negotiate(
         .with(punktfunk_core::quic::v2::registry::FEATURE_PROFILES)
         .with(punktfunk_core::quic::v2::registry::FEATURE_CLEAR_PLACEMENT)
         .with(punktfunk_core::quic::v2::registry::FEATURE_FORMAT_EPOCH)
-        .with(punktfunk_core::quic::v2::registry::FEATURE_AUDIO_EPOCH);
+        .with(punktfunk_core::quic::v2::registry::FEATURE_AUDIO_EPOCH)
+        .with(punktfunk_core::quic::v2::registry::FEATURE_SCROLL_AXIS_UNITS);
     // Further screens only where this session builds displays of its own on a compositor with
     // more than one output: not gamescope, not a joiner or a mirror.
     if matches!(source, Punktfunk1Source::Virtual)

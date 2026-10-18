@@ -24,7 +24,8 @@
 use std::time::{Duration, Instant};
 
 use punktfunk_core::input::scroll::{
-    ScrollEvent, ScrollPhase, ScrollSource, ScrollUnits, SCROLL_DIP_PER_DETENT, SCROLL_SCALE,
+    ScrollEvent, ScrollPhase, ScrollSource, ScrollUnits, SCROLL_AXIS_UNITS_PER_DETENT,
+    SCROLL_DIP_PER_DETENT, SCROLL_SCALE,
 };
 use punktfunk_core::input::{InputEvent, InputKind, PRECISE_PX_PER_DETENT, SCROLL_FLAG_PRECISE};
 
@@ -252,6 +253,7 @@ pub fn from_legacy(ev: &InputEvent) -> Option<InputEvent> {
             phase: ScrollPhase::None,
             axis: u32::from(ev.code == 1),
             delta: (units * SCROLL_SCALE) as i32, // `as` saturates
+            axis_units: false,
         }
         .to_event(),
     )
@@ -405,11 +407,12 @@ impl ScrollMapper {
 
     /// Whole v120 clicks the click-counter backends owe this axis now: wheel
     /// units pass through, DIP re-prices at [`SCROLL_DIP_PER_DETENT`] per
-    /// detent.
+    /// detent and compositor axis units at [`SCROLL_AXIS_UNITS_PER_DETENT`].
     fn clicks_v120(&mut self, a: usize, se: &ScrollEvent) -> i32 {
         let v = match se.units() {
             ScrollUnits::V120 => delta_units(se),
             ScrollUnits::Dip => delta_units(se) * (120.0 / SCROLL_DIP_PER_DETENT),
+            ScrollUnits::Axis => delta_units(se) * (120.0 / SCROLL_AXIS_UNITS_PER_DETENT),
         };
         self.take_v120(a, v)
     }
@@ -549,11 +552,12 @@ impl ScrollMapper {
             return Vec::new(); // no stop primitive; the glide is the app's own
         }
         // A sourceless axis is read by every toolkit as 10 units per click,
-        // so v120 goes at 10/120 and DIP at 10 per [`SCROLL_DIP_PER_DETENT`].
-        // It takes a double, so nothing truncates early.
+        // so v120 goes at 10/120, DIP at 10 per [`SCROLL_DIP_PER_DETENT`] and
+        // axis units as they are. It takes a double, so nothing truncates early.
         let v = match se.units() {
             ScrollUnits::V120 => delta_units(&se) * (10.0 / 120.0),
             ScrollUnits::Dip => delta_units(&se) * (10.0 / SCROLL_DIP_PER_DETENT),
+            ScrollUnits::Axis => delta_units(&se) * (10.0 / SCROLL_AXIS_UNITS_PER_DETENT),
         };
         if v == 0.0 {
             return Vec::new();
@@ -579,6 +583,7 @@ mod tests {
             phase,
             axis,
             delta: (delta * SCROLL_SCALE) as i32,
+            axis_units: false,
         }
         .to_event()
     }
@@ -1335,6 +1340,41 @@ mod tests {
             horizontal: V,
             value: -10.0
         }));
+    }
+
+    #[test]
+    fn axis_units_count_ten_a_click_where_the_host_counts_clicks() {
+        use punktfunk_core::input::scroll::SCROLL_FLAG_AXIS_UNITS;
+        // A Wayland touchpad's 10 units are one click to Qt: a whole detent on
+        // Windows and KWin, untouched where the host passes the distance on.
+        let e = ev(ScrollSource::Finger, ScrollPhase::Update, 0, 10.0);
+        let ten = [InputEvent {
+            flags: e.flags | SCROLL_FLAG_AXIS_UNITS,
+            ..e
+        }];
+        assert!(
+            plan(ScrollBackend::Windows, &ten).contains(&ScrollOp::Discrete120 {
+                horizontal: V,
+                value: 120
+            })
+        );
+        for backend in [ScrollBackend::Kwin, ScrollBackend::Libei] {
+            let ops = plan(backend, &ten);
+            assert!(
+                ops.contains(&ScrollOp::Continuous {
+                    horizontal: V,
+                    value: -10.0
+                }),
+                "{backend:?}: {ops:?}"
+            );
+        }
+        // Unmarked, the same 10 is DIP: a sixth of a detent.
+        assert!(
+            plan(ScrollBackend::Windows, &[e]).contains(&ScrollOp::Discrete120 {
+                horizontal: V,
+                value: 20
+            })
+        );
     }
 
     #[test]

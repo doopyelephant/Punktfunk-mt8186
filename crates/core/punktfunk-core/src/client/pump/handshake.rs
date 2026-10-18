@@ -62,7 +62,8 @@ fn client_features(
         .with(registry::FEATURE_STREAM_CONFIG)
         .with(registry::FEATURE_PAD_WRITES)
         .with(registry::FEATURE_PROFILES)
-        .with(registry::FEATURE_CLEAR_PLACEMENT);
+        .with(registry::FEATURE_CLEAR_PLACEMENT)
+        .with(registry::FEATURE_SCROLL_AXIS_UNITS);
     if rebuilds_decoder {
         set = set.with(registry::FEATURE_FORMAT_EPOCH);
     }
@@ -370,6 +371,7 @@ async fn dial(
                 clock_offset_ns,
                 clock_rtt_ns,
                 profile: server.profile.clone(),
+                scroll_axis_units: server.features.has(registry::FEATURE_SCROLL_AXIS_UNITS),
             },
         ))))
     };

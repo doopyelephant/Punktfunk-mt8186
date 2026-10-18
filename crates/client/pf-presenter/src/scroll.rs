@@ -6,7 +6,9 @@
 //! wl_pointer promises all of a scroll event's fields land before `frame`, so
 //! nothing crosses the wire mid-frame.
 
-use punktfunk_core::input::scroll::{ScrollAccumulator, ScrollPhase, ScrollSource};
+use punktfunk_core::input::scroll::{
+    ScrollAccumulator, ScrollPhase, ScrollSource, SCROLL_FLAG_AXIS_UNITS,
+};
 use punktfunk_core::input::InputEvent;
 
 /// `wl_pointer.axis_source`, reduced to what the wire vocabulary carries.
@@ -17,9 +19,9 @@ pub enum NativeAxisSource {
     #[default]
     Unknown,
     Wheel,
-    /// Touchpad two-finger scroll — axis values are surface-px ≈ DIP.
+    /// Touchpad two-finger scroll, in the compositor's axis units.
     Finger,
-    /// Dial / tilt / other uninterruptible continuous surface.
+    /// Dial / tilt / other uninterruptible continuous surface, in axis units.
     Continuous,
 }
 
@@ -190,7 +192,13 @@ impl WaylandScrollFrame {
             NativeAxisSource::Finger => ScrollSource::Finger,
             NativeAxisSource::Continuous => ScrollSource::Continuous,
         };
-        self.acc.event(source, phase, axis, delta)
+        let mut ev = self.acc.event(source, phase, axis, delta)?;
+        // A distance goes out as the axis units this desktop's apps read, so a
+        // host that counts clicks counts them as Qt does.
+        if matches!(src, NativeAxisSource::Finger | NativeAxisSource::Continuous) {
+            ev.flags |= SCROLL_FLAG_AXIS_UNITS;
+        }
+        Some(ev)
     }
 }
 
@@ -322,7 +330,8 @@ mod tests {
         let se = decode(&out[0]);
         assert_eq!(se.source, ScrollSource::Finger);
         assert_eq!(se.phase, ScrollPhase::Begin);
-        assert_eq!(se.delta, q(10.0), "surface-px are DIP: {se:?}");
+        assert_eq!(se.delta, q(10.0), "axis units pass as they are: {se:?}");
+        assert!(se.axis_units);
 
         f.axis(0, -5.0);
         let out = f.frame();
@@ -389,6 +398,7 @@ mod tests {
         assert_eq!(se.source, ScrollSource::Wheel);
         assert_eq!(se.phase, ScrollPhase::None);
         assert_eq!(se.delta, q(120.0));
+        assert!(!se.axis_units);
     }
 
     #[test]

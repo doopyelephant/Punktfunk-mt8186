@@ -245,6 +245,10 @@ pub const FEATURE_AUDIO_EPOCH: u32 = 37;
 /// Both ends: the client shows more than one screen. Its `ClientHello` lists them, the host
 /// streams each past the first on a stream id of its own and says so in a `ScreenLayout`.
 pub const FEATURE_SCREENS: u32 = 38;
+/// Both ends: a finger or continuous scroll may carry
+/// [`SCROLL_FLAG_AXIS_UNITS`](crate::input::scroll::SCROLL_FLAG_AXIS_UNITS), and a host that
+/// injects wheel clicks counts it at Qt's 10 units a click instead of 60 DIP.
+pub const FEATURE_SCROLL_AXIS_UNITS: u32 = 39;
 
 #[cfg(test)]
 mod tests {

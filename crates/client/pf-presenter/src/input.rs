@@ -52,6 +52,7 @@ impl Act {
                     phase,
                     axis,
                     delta,
+                    axis_units: false,
                 }
                 .to_event();
                 Some((ev.kind, ev.code, ev.x, ev.y, ev.flags))
@@ -285,6 +286,7 @@ impl Capture {
                     phase: ScrollPhase::Cancel,
                     axis: axis as u32,
                     delta: 0,
+                    axis_units: false,
                 }
                 .to_event();
                 send(&self.connector, ev.kind, ev.code, ev.x, ev.y, ev.flags);

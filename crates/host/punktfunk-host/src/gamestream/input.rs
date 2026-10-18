@@ -197,6 +197,7 @@ fn scroll_ev(axis: u32, v120: i16) -> InputEvent {
         phase: ScrollPhase::None,
         axis,
         delta: i32::from(v120) * SCROLL_SCALE as i32,
+        axis_units: false,
     }
     .to_event()
 }
@@ -319,6 +320,7 @@ mod tests {
                 phase: ScrollPhase::None,
                 axis: 0,
                 delta: 120 * SCROLL_SCALE as i32,
+                axis_units: false,
             }
             .to_event()
         );
@@ -339,6 +341,7 @@ mod tests {
                 phase: ScrollPhase::None,
                 axis: SCROLL_HORIZONTAL,
                 delta: -120 * SCROLL_SCALE as i32,
+                axis_units: false,
             }
             .to_event()
         );

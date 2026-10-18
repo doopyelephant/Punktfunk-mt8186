@@ -39,6 +39,9 @@ exclude = [
     "ScrollOutput",
     "ScrollUnits",
     "ScrollEvent",
+    # Wayland axis units come from the Linux presenter only; no C embedder sends them.
+    "SCROLL_FLAG_AXIS_UNITS",
+    "SCROLL_AXIS_UNITS_PER_DETENT",
     # The ABI mirror `PUNKTFUNK_HOST_CAP2_SCROLL` already emits the
     # constant; exporting the core one too would duplicate the `#define`.
     "HOST_CAP2_SCROLL",
