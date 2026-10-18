@@ -252,6 +252,8 @@ pub struct Reassembler {
     short_tails: Vec<u32>,
     /// Where frame buffers come from ([`Self::set_memory`]).
     memory: std::sync::Arc<dyn AuMemory>,
+    /// Further screens' frame buffers: the lent memory is the first screen's decoder's.
+    screen_memory: crate::au::HeapPool,
 }
 
 impl Reassembler {
@@ -274,6 +276,7 @@ impl Reassembler {
             shard_delay_ns: Vec::with_capacity(SHARD_DELAY_SAMPLES),
             short_tails: Vec::new(),
             memory: std::sync::Arc::new(crate::au::HeapPool::default()),
+            screen_memory: crate::au::HeapPool::default(),
         }
     }
 
@@ -494,8 +497,10 @@ impl Reassembler {
             shard_delay_ns,
             short_tails,
             memory,
+            screen_memory,
         } = self;
         let parts = *deliver_parts && !screen;
+        let memory: &dyn AuMemory = if screen { screen_memory } else { &**memory };
 
         // Probe filler reassembles in its own window so its indexes never move the
         // video loss window or count as `frames_dropped`.
@@ -601,7 +606,7 @@ impl Reassembler {
                     epoch,
                     next_part_block: 0,
                     delivered_shards: 0,
-                    buf: AuBuf::take(&**memory, buf_len),
+                    buf: AuBuf::take(memory, buf_len),
                     blocks: HashMap::new(),
                     blocks_ok: 0,
                     short_tail: false,
@@ -641,7 +646,7 @@ impl Reassembler {
         // Re-check the budget: growth commits memory too.
         if buf_len > frame.buf.len() {
             charge(in_flight_bytes, buf_len - frame.buf.len(), &lim)?;
-            frame.buf.resize(buf_len, &**memory);
+            frame.buf.resize(buf_len, memory);
         }
 
         {
