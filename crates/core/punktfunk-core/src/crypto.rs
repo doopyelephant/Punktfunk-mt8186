@@ -75,6 +75,8 @@ mod aws_lc {
         }
 
         /// No out-of-place open on this backend: the copy is the one the in-place path makes.
+        /// AES opens through here; `Cipher` copies for ChaCha itself.
+        #[cfg(feature = "aes-aws-lc-rs")]
         pub fn open_into(
             &self,
             nonce: [u8; 12],
