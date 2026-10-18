@@ -2103,6 +2103,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         cursorLock.unlock()
         clipboardLock.unlock()
         statsLock.unlock()
+        hdrLock.unlock()
         feedbackLock.unlock()
         audioLock.unlock()
         pumpLock.unlock()
