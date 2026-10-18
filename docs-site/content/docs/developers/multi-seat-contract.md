@@ -482,7 +482,15 @@ the profile whose host raised them, so the console sees sessions, games, library
 changes where they happen. The door's own (`pairing.*`, `access.*`, `host.*`, `action.*`,
 `update.*`) go to the owner's host's `POST /events/relay`, whose hooks run them in the
 owner's session; the door runs no hooks. The two sets are disjoint, so nothing comes back
-around. A knock while the owner's session is stopped fires no hook.
+around. A knock (`pairing.pending`) wakes a stopped owner's session and reaches its host once
+that host answers, within two minutes; any other door event a stopped owner's host misses.
+
+The door's console also accepts a console handoff signed with the owner's host's token, the one
+the owner's own `ctl console-url` holds: the door keeps it in `owner-handoff-key` in its own
+directory, level with the owner's row, and never a contract seat's, whose user can read their
+own. The owner's row never stops for being idle: it runs the plugins and keeps the library. A
+seat host whose binary an update replaced restarts once nobody plays on it, and its runner
+starts the new one.
 
 `display-settings.json` and `hooks.json` are the owner's host's alone: `door-helper` copies
 neither, the owner's host writes the per-device overlays too, the supervisor copies the policy

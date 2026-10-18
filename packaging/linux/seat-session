@@ -89,19 +89,22 @@ EOF
     return 0
 }
 
-# The owner's settings (host.env), under the seat contract: the contract's variables keep the
-# values the supervisor wrote.
+# The owner's settings, under the seat contract: the files PUNKTFUNK_OWNER_ENV names (a NixOS
+# module's settings, which its user unit takes as EnvironmentFile), then host.env. The contract's
+# variables keep the values the supervisor wrote. A file the owner can't read is skipped.
 load_owner_settings() {
-    local file="$HOME/.config/punktfunk/host.env" key
+    local file key extra=()
     local -A keep=()
-    [[ -r "$file" ]] || return 0
+    read -ra extra <<<"${PUNKTFUNK_OWNER_ENV:-}"
     for key in PUNKTFUNK_SEAT_SESSION PUNKTFUNK_SEAT_ID PUNKTFUNK_SEAT_OWNER PUNKTFUNK_TRUST_DIR \
         PUNKTFUNK_PAIRING PUNKTFUNK_NATIVE_PORT PUNKTFUNK_MGMT_BIND PUNKTFUNK_MDNS; do
         keep[$key]="${!key-}"
     done
     set -a
-    # shellcheck disable=SC1090
-    . "$file" 2>/dev/null
+    for file in "${extra[@]}" "$HOME/.config/punktfunk/host.env"; do
+        # shellcheck disable=SC1090
+        [[ -r "$file" ]] && . "$file" 2>/dev/null
+    done
     set +a
     for key in "${!keep[@]}"; do
         export "$key=${keep[$key]}"

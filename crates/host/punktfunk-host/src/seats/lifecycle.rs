@@ -138,7 +138,8 @@ fn idle_since(since: Instant, now: Instant, busy: bool, placed: Option<Instant>)
 }
 
 /// Stops a running seat once nobody has played on it for [`idle_stop`]. A seat whose host
-/// doesn't answer counts as busy: stopping it would be a guess.
+/// doesn't answer counts as busy: stopping it would be a guess. The owner's row is the box's
+/// host, which runs the plugins and keeps the library, so it never idles out.
 pub(crate) fn stop_idle(sup: &dyn Supervisor, stop: &AtomicBool) {
     let Some(limit) = idle_stop() else { return };
     let mut busy_at: HashMap<String, Instant> = HashMap::new();
@@ -152,7 +153,7 @@ pub(crate) fn stop_idle(sup: &dyn Supervisor, stop: &AtomicBool) {
             waited += Duration::from_secs(1);
         }
         let now = Instant::now();
-        for seat in sup.seats() {
+        for seat in sup.seats().into_iter().filter(|s| !s.owner) {
             let id = seat.id.as_str().to_string();
             if seat.runtime.state != RuntimeState::Running {
                 busy_at.remove(&id);
