@@ -13,8 +13,8 @@ what changed, the [release notes](https://git.unom.io/unom/punktfunk/releases).
   so their loss recovery and 10-bit paths get the most field fixes.
 - **Latency under load.** Frame pacing on every client, holding the frame rate when the link
   degrades, and overlapping encode and send within a frame at high resolutions.
-- **Finishing the clipboard.** The Linux client's side of the bridge, and file transfer, which no
-  client offers yet. See [Shared clipboard](/docs/clipboard).
+- **Finishing the clipboard.** File transfer, which no client offers yet. See
+  [Shared clipboard](/docs/clipboard).
 - **Console parity with the apps.** A speed test and a bitrate setting in the web console.
 - **A desktop per person.** Windows Server seats behind [profiles](/docs/profiles): each person
   streams a signed-in desktop of their own while someone else plays.

@@ -1,18 +1,18 @@
-//! OS-clipboard bridge for the spawned session client.
+//! OS-clipboard bridge for the spawned session client: Win32 on Windows, the
+//! session window's SDL3 clipboard on Linux.
 //!
 //! Protocol and fetch streams live in `punktfunk_core::clipboard`. This
-//! thread talks to the pasteboard. Evidence: `design/clipboard-and-file-transfer.md`.
+//! thread talks to the OS clipboard. Evidence: `design/clipboard-and-file-transfer.md`.
 //!
 //! Local copies announce a format list (`clip_offer`); bytes cross only on
-//! `FetchRequest`. Remote offers are fetched and placed as real bytes —
-//! delayed rendering needs a clipboard-owning window and its own message
-//! pump, which this thread is not. [`EAGER_FETCH_CAP`] skips a payload too
-//! large to pull for a paste that may never happen.
+//! `FetchRequest`. Remote offers are fetched and placed as real bytes: lazy
+//! placement needs a clipboard-owning window pumping on this thread (Win32), or
+//! a network fetch on the presenter's thread (SDL). [`EAGER_FETCH_CAP`] skips a
+//! payload too large to pull for a paste that may never happen.
 //!
-//! After our `SetClipboardData`, that sequence number is ignored, or each
-//! side re-offers the other's apply. A clipboard marked
-//! `ExcludeClipboardContentFromMonitorProcessing` is never announced or
-//! served. `run` is a no-op without `HOST_CAP_CLIPBOARD`.
+//! After our own write, that sequence number is ignored, or each side re-offers
+//! the other's apply. A copy a password manager marks secret is never announced
+//! or served. `run` is a no-op without `HOST_CAP_CLIPBOARD`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -30,8 +30,14 @@ const MIME_PNG: &str = "image/png";
 /// 4 MiB. Eager remote fetches above this are skipped; the paste may never happen.
 const EAGER_FETCH_CAP: u64 = 4 << 20;
 
-/// 400 ms. Spec floor between offers is 100 ms; this stays ahead of copy→paste.
-const POLL: Duration = Duration::from_millis(400);
+/// How often the local clipboard is checked. Win32: 400 ms, ahead of copy→paste (the spec
+/// floor between offers is 100 ms). Linux: every pass, an atomic load. Wayland shows a copy
+/// only when the window gains focus, and the offer must beat the first paste.
+const POLL: Duration = if cfg!(target_os = "linux") {
+    Duration::ZERO
+} else {
+    Duration::from_millis(400)
+};
 
 /// 120 ms. Bounds how long `stop` waits; Win32 is polled on [`POLL`], not this.
 const EVENT_WAIT: Duration = Duration::from_millis(120);
@@ -48,6 +54,9 @@ pub fn run(client: Arc<NativeClient>, stop: Arc<AtomicBool>) {
         return;
     }
     tracing::info!("shared clipboard enabled");
+    // SDL reports clipboard changes only as events; the watch counts them.
+    #[cfg(target_os = "linux")]
+    let _watch = os::Watch::install();
 
     let mut state = State {
         // Seed the live sequence without offering: a pre-session clipboard is not a copy for this stream.
@@ -63,7 +72,7 @@ pub fn run(client: Arc<NativeClient>, stop: Arc<AtomicBool>) {
             Err(punktfunk_core::error::PunktfunkError::NoFrame) => {}
             Err(_) => break,
         }
-        // Poll Win32 on [`POLL`], not every wait. This wait is short so teardown is not delayed.
+        // Check the OS clipboard on [`POLL`]. This wait is short so teardown is not delayed.
         let now = Instant::now();
         if now >= next_poll {
             poll_local(&client, &mut state);
@@ -435,24 +444,277 @@ mod os {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 mod os {
-    //! Stub. Sequence stays 0; get/set fail. The session loop still runs.
-    use anyhow::{bail, Result};
+    //! The session window's SDL3 clipboard: `wl_data_device` on Wayland, selections on X11.
+    //!
+    //! SDL's clipboard belongs to the main thread, where the presenter pumps events. Reads and
+    //! writes run there through `SDL_RunOnMainThread`; this thread waits on a channel, never on
+    //! SDL, because `end_session` joins it. Changes arrive only as events: an event watch
+    //! counts them and keeps the mime list. SDL drops the Wayland/X11 echo of its own
+    //! selection and reports `SDL_SetClipboardData` synchronously, inside `set`, so the
+    //! counter already includes our write when `set` returns.
+
+    use super::{MIME_PNG, MIME_TEXT};
+    use anyhow::{anyhow, bail, Result};
+    use sdl3::sys::clipboard::{
+        SDL_GetClipboardData, SDL_GetClipboardText, SDL_SetClipboardData, SDL_SetClipboardText,
+    };
+    use sdl3::sys::error::SDL_GetError;
+    use sdl3::sys::events::{
+        SDL_AddEventWatch, SDL_Event, SDL_RemoveEventWatch, SDL_EVENT_CLIPBOARD_UPDATE,
+    };
+    use sdl3::sys::init::{SDL_RunOnMainThread, SDL_WasInit, SDL_INIT_VIDEO};
+    use sdl3::sys::stdinc::{SDL_free, SDL_strlen};
+    use std::ffi::{c_char, c_void, CStr, CString};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{mpsc, Mutex, PoisonError};
+    use std::time::Duration;
+
+    /// SDL's text getter reads any of these as UTF-8.
+    const TEXT_MIMES: [&str; 5] = [MIME_TEXT, "text/plain", "TEXT", "UTF8_STRING", "STRING"];
+    /// Read back verbatim: Wayland and X11 name these as the wire does.
+    const PASSTHROUGH: [&str; 5] = ["text/html", "text/rtf", MIME_PNG, "image/jpeg", "image/gif"];
+    /// KeePassXC and other KDE-aware password managers add this to a secret copy.
+    const SECRET_HINT: &str = "x-kde-passwordManagerHint";
+    /// 1 s. A posted call runs within one presenter pass; past this the session is ending.
+    const MAIN_WAIT: Duration = Duration::from_secs(1);
+
+    /// Clipboard changes seen by the watch, ours included.
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    /// Mime types of the clipboard at the last change.
+    static MIMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// The installed event watch; removed on drop.
+    pub struct Watch;
+    impl Watch {
+        pub fn install() -> Watch {
+            // SAFETY: `on_event` takes no userdata and reads only the event SDL hands it;
+            // adding a watch is safe from any thread.
+            unsafe { SDL_AddEventWatch(Some(on_event), std::ptr::null_mut()) };
+            Watch
+        }
+    }
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            // SAFETY: removes the pair `install` added; safe from any thread.
+            unsafe { SDL_RemoveEventWatch(Some(on_event), std::ptr::null_mut()) };
+        }
+    }
+
+    /// Runs on the thread that pushes the event: the main thread for clipboard updates.
+    unsafe extern "C" fn on_event(_: *mut c_void, event: *mut SDL_Event) -> bool {
+        // SAFETY: SDL passes a valid event for the duration of the call; every variant
+        // starts with its type.
+        let ty = unsafe { (*event).r#type };
+        if ty != SDL_EVENT_CLIPBOARD_UPDATE.0 {
+            return true;
+        }
+        // SAFETY: the type says this is the clipboard variant.
+        let clip = unsafe { &(*event).clipboard };
+        let count = usize::try_from(clip.num_mime_types).unwrap_or(0);
+        let mut mimes = Vec::with_capacity(count);
+        for i in 0..count {
+            if clip.mime_types.is_null() {
+                break;
+            }
+            // SAFETY: `mime_types` holds `num_mime_types` entries, valid during this call.
+            let p = unsafe { *clip.mime_types.add(i) };
+            if !p.is_null() {
+                // SAFETY: each non-null entry is a NUL-terminated string, valid during this call.
+                mimes.push(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
+            }
+        }
+        *MIMES.lock().unwrap_or_else(PoisonError::into_inner) = mimes;
+        SEQ.fetch_add(1, Ordering::SeqCst);
+        true
+    }
 
     pub fn sequence_number() -> u32 {
-        0
+        SEQ.load(Ordering::SeqCst)
     }
+
     pub fn is_concealed() -> bool {
-        false
+        concealed(&MIMES.lock().unwrap_or_else(PoisonError::into_inner))
     }
+
     pub fn available_kinds() -> Vec<(&'static str, u64)> {
-        Vec::new()
+        let mimes = MIMES.lock().unwrap_or_else(PoisonError::into_inner);
+        wire_kinds(&mimes).into_iter().map(|m| (m, 0)).collect()
     }
-    pub fn get(_mime: &str) -> Result<Vec<u8>> {
-        bail!("clipboard unsupported on this platform")
+
+    fn concealed(mimes: &[String]) -> bool {
+        mimes.iter().any(|m| m == SECRET_HINT)
     }
-    pub fn set(_mime: &str, _bytes: &[u8]) -> Result<()> {
-        bail!("clipboard unsupported on this platform")
+
+    /// The wire mimes this clipboard can serve, text first.
+    fn wire_kinds(mimes: &[String]) -> Vec<&'static str> {
+        let has = |want: &str| mimes.iter().any(|m| m == want);
+        let text = TEXT_MIMES.into_iter().any(has).then_some(MIME_TEXT);
+        text.into_iter()
+            .chain(PASSTHROUGH.into_iter().filter(|m| has(m)))
+            .collect()
+    }
+
+    pub fn get(mime: &str) -> Result<Vec<u8>> {
+        let mime = CString::new(mime)?;
+        on_main(move || read(&mime))?
+    }
+
+    pub fn set(mime: &str, bytes: &[u8]) -> Result<()> {
+        let payload = match mime {
+            // `SDL_SetClipboardText` takes a C string; a NUL would cut it short.
+            MIME_TEXT => Payload::Text(CString::new(
+                String::from_utf8_lossy(bytes).replace('\0', ""),
+            )?),
+            MIME_PNG => Payload::Png(bytes.to_vec()),
+            other => bail!("unsupported clipboard format {other}"),
+        };
+        on_main(move || write(payload))?
+    }
+
+    enum Payload {
+        Text(CString),
+        Png(Vec<u8>),
+    }
+
+    fn read(mime: &CStr) -> Result<Vec<u8>> {
+        video_up()?;
+        let mut size = 0usize;
+        let ptr: *mut c_void = if mime.to_bytes() == MIME_TEXT.as_bytes() {
+            // SAFETY: main thread, video up; SDL returns an owned NUL-terminated string.
+            let text = unsafe { SDL_GetClipboardText() };
+            if !text.is_null() {
+                // SAFETY: non-null and NUL-terminated, per SDL.
+                size = unsafe { SDL_strlen(text) };
+            }
+            text.cast()
+        } else {
+            // SAFETY: main thread, video up; `mime` outlives the call and `size` is writable.
+            unsafe { SDL_GetClipboardData(mime.as_ptr(), &mut size) }
+        };
+        if ptr.is_null() {
+            bail!("clipboard has no {}", mime.to_string_lossy());
+        }
+        // SAFETY: SDL hands back `size` readable bytes that we own until `SDL_free`.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size) }.to_vec();
+        // SAFETY: the buffer SDL allocated above, freed once.
+        unsafe { SDL_free(ptr) };
+        if bytes.is_empty() {
+            bail!("clipboard {} is empty", mime.to_string_lossy());
+        }
+        Ok(bytes)
+    }
+
+    fn write(payload: Payload) -> Result<()> {
+        video_up()?;
+        let ok = match payload {
+            // SAFETY: main thread, video up; SDL copies the string before returning.
+            Payload::Text(text) => unsafe { SDL_SetClipboardText(text.as_ptr()) },
+            Payload::Png(bytes) => {
+                let mimes: [*const c_char; 1] = [c"image/png".as_ptr()];
+                let data = Box::into_raw(Box::new(bytes));
+                // SAFETY: main thread, video up. SDL copies the mime list and owns `data` from
+                // this call on, success or not, and frees it once through `release`.
+                unsafe {
+                    SDL_SetClipboardData(
+                        Some(serve),
+                        Some(release),
+                        data.cast(),
+                        mimes.as_ptr(),
+                        mimes.len(),
+                    )
+                }
+            }
+        };
+        if !ok {
+            bail!("clipboard set: {}", sdl_error());
+        }
+        Ok(())
+    }
+
+    /// SDL asks for the bytes when an app pastes.
+    unsafe extern "C" fn serve(
+        userdata: *mut c_void,
+        _mime: *const c_char,
+        size: *mut usize,
+    ) -> *const c_void {
+        // SAFETY: `userdata` is the buffer boxed in `write`, alive until `release`.
+        let bytes = unsafe { &*userdata.cast::<Vec<u8>>() };
+        // SAFETY: SDL passes a writable size.
+        unsafe { *size = bytes.len() };
+        bytes.as_ptr().cast()
+    }
+
+    /// SDL is done with the buffer: replaced, cleared or shut down.
+    unsafe extern "C" fn release(userdata: *mut c_void) {
+        // SAFETY: SDL calls this once per buffer `write` boxed, after its last `serve`.
+        drop(unsafe { Box::from_raw(userdata.cast::<Vec<u8>>()) });
+    }
+
+    type Job = Box<dyn FnOnce() + Send>;
+
+    /// Run `f` on SDL's main thread and wait up to [`MAIN_WAIT`] for its answer.
+    fn on_main<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let job: Job = Box::new(move || {
+            let _ = tx.send(f());
+        });
+        let job = Box::into_raw(Box::new(job));
+        // Not `wait_complete`: if the main thread is joining us, both would wait forever.
+        // SAFETY: `trampoline` takes ownership of `job` and runs it once.
+        if !unsafe { SDL_RunOnMainThread(Some(trampoline), job.cast(), false) } {
+            // SAFETY: SDL refused, so `trampoline` never runs and `job` is still ours.
+            drop(unsafe { Box::from_raw(job) });
+            bail!("main-thread call: {}", sdl_error());
+        }
+        rx.recv_timeout(MAIN_WAIT)
+            .map_err(|_| anyhow!("main thread did not answer"))
+    }
+
+    unsafe extern "C" fn trampoline(userdata: *mut c_void) {
+        // SAFETY: `userdata` is the boxed job `on_main` leaked; SDL runs this once.
+        let job = unsafe { Box::from_raw(userdata.cast::<Job>()) };
+        job();
+    }
+
+    fn video_up() -> Result<()> {
+        // SAFETY: a flag query; reads no pointer.
+        if unsafe { SDL_WasInit(SDL_INIT_VIDEO) }.0 == 0 {
+            bail!("SDL video is not up");
+        }
+        Ok(())
+    }
+
+    fn sdl_error() -> String {
+        // SAFETY: SDL returns this thread's NUL-terminated error string, never null.
+        unsafe { CStr::from_ptr(SDL_GetError()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn list(m: &[&str]) -> Vec<String> {
+            m.iter().map(|s| s.to_string()).collect()
+        }
+
+        #[test]
+        fn wire_kinds_maps_text_variants_and_keeps_wire_names() {
+            let x11 = list(&["TARGETS", "UTF8_STRING", "STRING", "text/html"]);
+            assert_eq!(wire_kinds(&x11), [MIME_TEXT, "text/html"]);
+            let image = list(&["image/png", "image/bmp", "image/gif"]);
+            assert_eq!(wire_kinds(&image), [MIME_PNG, "image/gif"]);
+            assert!(wire_kinds(&list(&["application/x-kde-cutselection"])).is_empty());
+        }
+
+        #[test]
+        fn secret_hint_conceals() {
+            let secret = list(&["text/plain;charset=utf-8", SECRET_HINT]);
+            assert!(concealed(&secret));
+            assert!(!concealed(&list(&["text/plain;charset=utf-8"])));
+        }
     }
 }

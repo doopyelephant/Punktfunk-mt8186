@@ -308,7 +308,7 @@ Keyboard chords, and what each host can type, are in [Input](/docs/input).
 
 | Client | HDR | 4:4:4 | Surround 5.1 / 7.1 | Microphone | Clipboard | Stats overlay |
 |---|---|---|---|---|---|---|
-| Linux desktop | ✅ ¹ | ⚠️ ² | ✅ ³ | ✅ | ❌ ⁴ | ✅ |
+| Linux desktop | ✅ ¹ | ⚠️ ² | ✅ ³ | ✅ | ⚠️ ⁴ | ✅ |
 | Windows desktop | ✅ ¹ | ⚠️ ² | ✅ ³ | ✅ | ⚠️ ⁵ | ✅ |
 | macOS | ⚠️ ⁶ | ⚠️ ⁷ | ✅ ³ | ✅ | ✅ ⁸ | ✅ |
 | iPhone · iPad | ⚠️ ⁶ | ⚠️ ⁷ | ✅ ³ | ✅ | ✅ ⁸ | ✅ |
@@ -321,7 +321,8 @@ Keyboard chords, and what each host can type, are in [Input](/docs/input).
    PyroWave. HEVC 4:4:4 needs an NVIDIA host. A Windows host combines it with HDR; a Linux host
    keeps HDR and drops to 4:2:0, except with PyroWave. The stats overlay shows what you got.
 3. The host rounds the request to stereo, 5.1 or 7.1 and says so before the first frame.
-4. The switch is there, but the Linux client's side of the clipboard isn't built: nothing crosses.
+4. Text and PNG images; an incoming image over 4 MiB is skipped. To the host also HTML, RTF,
+   JPEG and GIF.
 5. Text and PNG images; an incoming image over 4 MiB is skipped.
 6. Probed against your display — see note 7 under [Client decode](#client-decode).
 7. Opt-in and probed. HEVC 4:4:4 needs an NVIDIA host; PyroWave works on any.
