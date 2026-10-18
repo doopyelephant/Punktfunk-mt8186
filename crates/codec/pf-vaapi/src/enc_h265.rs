@@ -81,7 +81,9 @@ impl HevcFeatures {
         }
     }
 
-    /// ffmpeg's fallback when a driver advertises nothing: 32×32 CTB, 16×16 CB.
+    /// ffmpeg's fallback when a driver advertises nothing, AMP aside: 32×32 CTB, 8×8 CB,
+    /// transform depth 3. Gen9 iHD codes splits that fine whatever the SPS allows, so a
+    /// coarser SPS makes its stream undecodable.
     pub fn guessed() -> Self {
         Self {
             amp: false,
@@ -91,11 +93,11 @@ impl HevcFeatures {
             transform_skip: false,
             cu_qp_delta: true,
             log2_ctb_minus3: 2,
-            log2_min_cb_minus3: 1,
+            log2_min_cb_minus3: 0,
             log2_min_tb_minus2: 0,
             log2_max_tb_minus2: 3,
-            max_transform_hierarchy_depth_inter: 0,
-            max_transform_hierarchy_depth_intra: 0,
+            max_transform_hierarchy_depth_inter: 3,
+            max_transform_hierarchy_depth_intra: 3,
             gpb: false,
         }
     }

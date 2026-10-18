@@ -816,7 +816,7 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         // The clients whose presenters place the picture through `video_fit`.
         RowId::VideoFit => &[Desktop, Android, Apple],
         // The clients whose dial sends `pyrowave_bpp`.
-        RowId::PyroWaveQuality => &[Desktop, Android, Apple],
+        RowId::PyroWaveQuality => &[Desktop, Android, Apple, Ps5],
         // Offered wherever there is a second UI to fall back to: Android's touch home,
         // webOS's cursor shell. `row_applies` still needs `fallback_ui` from the host.
         RowId::GamepadUi | RowId::GamepadUiMode => &[Android, WebOS, Apple],

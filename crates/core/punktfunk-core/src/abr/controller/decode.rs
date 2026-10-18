@@ -211,8 +211,10 @@ impl DecodeKnee {
     /// Decode headroom on a clean loaded full-rate window that carries the
     /// signal, the bands: park at [`DECODE_HOLD_PCT`], retreat a notch at
     /// [`DECODE_RETREAT_PCT`]. `Some` is a rate to request. Loss, flush and
-    /// starvation are the link's story, a low-fps window's mean overstates
-    /// the load, and a step still being judged owns the question.
+    /// starvation are the link's story, a low-fps window's mean overstates the
+    /// load, and a step still being judged owns the question. A window whose
+    /// decode queue was shed is read whatever its frame count, and a stood-down
+    /// driver re-arms only on a run with no shed queue in it.
     pub(super) fn judge_headroom(
         &mut self,
         w: &WindowSample,
@@ -221,14 +223,18 @@ impl DecodeKnee {
         rate: Rate,
     ) -> Option<u32> {
         let mean_us = v.decode_mean_us?;
-        if budget_us <= 0 || v.bad || v.quiet || v.starved || !full_rate(w, budget_us) {
+        // A shed queue thins the window's frames; its mean is still the decoder's.
+        let loaded = w.backlog || full_rate(w, budget_us);
+        if budget_us <= 0 || v.bad || v.quiet || v.starved || !loaded {
             return None;
         }
         if self.probe.is_some() {
             return None;
         }
         if self.headroom.disarmed() {
-            if self.headroom.note_clean() {
+            if w.backlog {
+                self.headroom.note_bad();
+            } else if self.headroom.note_clean() {
                 tracing::debug!(
                     after_windows = self.headroom.reprobe_after(),
                     "adaptive bitrate: re-arming the decode headroom driver after a clean run"

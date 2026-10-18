@@ -378,25 +378,22 @@ impl ScreenView for PairScreen {
 
         let status_y = f64::from(rect.bottom) - tray_h - status_h + 6.0 * k;
         if self.busy {
-            crate::theme::spinner(
-                canvas,
-                ui,
-                cx - 70.0 * k,
-                status_y + 8.0 * k,
-                7.0 * k,
-                ctx.t,
-            );
             let waiting = match self.requesting {
                 true => "Approve this device in the host's console",
                 false => "Pairing… confirm the PIN on the host",
             };
+            // Spinner, gap and label centred as one line.
+            let (r, gap, size) = (7.0 * k, 10.0 * k, 13.0 * k);
+            let label_w = f64::from(fonts.measure(waiting, W::Regular, size));
+            let left = cx - (2.0 * r + gap + label_w) / 2.0;
+            crate::theme::spinner(canvas, ui, left + r, status_y + 8.0 * k, r, ctx.t);
             fonts.centered(
                 canvas,
                 waiting,
                 W::Regular,
-                13.0 * k,
+                size,
                 ui.fg(0.55),
-                cx + 10.0 * k,
+                left + 2.0 * r + gap + label_w / 2.0,
                 status_y,
                 f64::from(rect.width()) * 0.6,
             );

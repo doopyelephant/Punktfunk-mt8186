@@ -427,6 +427,7 @@ mod tests {
                 encode_mean_us: None,
                 actual_kbps: rate_kbps * 9 / 10,
                 flushed: false,
+                backlog: false,
                 recovery_kf: 0,
                 activity: punktfunk_core::abr::WindowActivity::Active(30),
                 head: 0,

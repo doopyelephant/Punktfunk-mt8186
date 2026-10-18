@@ -545,16 +545,20 @@ impl Client {
     }
 
     /// The client's jump-to-live over this frame's delay and the decode
-    /// backlog, in frames at the refresh rate. A flush is ABR's severe `flushed`.
+    /// backlog, in frames at the refresh rate, routed as the pump routes it.
     fn note_latency(&mut self, owd_ms: i64, now_ms: u64) {
         let backlog = (self.decode_free_at_ms.saturating_sub(now_ms)
             * u64::from(self.cfg.refresh_hz.max(1))
             / 1_000) as usize;
         let now = self.base + Duration::from_millis(now_ms);
         let lat_ns = i128::from(owd_ms) * 1_000_000;
-        if self.jump.observe(now, lat_ns, true, backlog).is_some() {
+        if let Some(trip) = self.jump.observe(now, lat_ns, true, backlog) {
             self.decode_free_at_ms = now_ms;
-            self.abr.on_flush();
+            if trip.decoder {
+                self.abr.on_decoder_backlog();
+            } else {
+                self.abr.on_flush();
+            }
             self.awaiting_idr = true;
         }
     }

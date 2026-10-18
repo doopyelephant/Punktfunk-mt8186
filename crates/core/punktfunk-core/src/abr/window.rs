@@ -72,6 +72,7 @@ pub(crate) struct WindowAccumulator {
     /// Windows whose keyframe asks are still the burst's ([`probe_aftermath`]).
     aftermath_left: u32,
     flushed: bool,
+    backlog: bool,
     discard: bool,
 }
 
@@ -106,6 +107,7 @@ impl WindowAccumulator {
             recovery_kf: 0,
             aftermath_left: 0,
             flushed: false,
+            backlog: false,
             discard: false,
         }
     }
@@ -190,6 +192,11 @@ impl WindowAccumulator {
         self.flushed = true;
     }
 
+    /// A jump-to-live the decoder caused: its headroom's to answer, not the link's.
+    pub(crate) fn on_decoder_backlog(&mut self) {
+        self.backlog = true;
+    }
+
     /// This window describes something other than the link.
     pub(crate) fn discard(&mut self) {
         self.discard = true;
@@ -227,6 +234,7 @@ impl WindowAccumulator {
         self.discard = true;
         self.aftermath_left = PROBE_AFTERMATH_WINDOWS;
         self.flushed = false;
+        self.backlog = false;
     }
 
     /// The byte anchor alone. Video that landed under a suppressed report tick
@@ -287,6 +295,7 @@ impl WindowAccumulator {
             encode_mean_us: mean(self.encode_sum_us, self.encode_count),
             actual_kbps,
             flushed: self.flushed,
+            backlog: self.backlog,
             recovery_kf,
             activity: activity(self.marks_repeats, self.au_frames, self.au_repeats),
             head: self.positions.head,
@@ -329,6 +338,7 @@ impl WindowAccumulator {
         self.encode_count = 0;
         self.recovery_kf = 0;
         self.flushed = false;
+        self.backlog = false;
     }
 }
 

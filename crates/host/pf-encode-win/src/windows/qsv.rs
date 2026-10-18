@@ -333,6 +333,8 @@ struct EncodeConfig {
     /// CO2 intra-refresh wave instead of LTR (mutually exclusive).
     intra_refresh: bool,
     hdr_meta: Option<pf_frame::HdrMeta>,
+    /// VDEnc, the fixed-function encoder. Gen9 has it for AVC only.
+    low_power: bool,
 }
 
 fn codec_id(codec: Codec) -> u32 {
@@ -355,7 +357,11 @@ fn build_params(cfg: &EncodeConfig) -> ParamSet {
     };
     let mfx = mfx_of(&mut par);
     mfx.CodecId = codec_id(cfg.codec);
-    mfx.LowPower = vpl::MFX_CODINGOPTION_ON as u16;
+    mfx.LowPower = if cfg.low_power {
+        vpl::MFX_CODINGOPTION_ON
+    } else {
+        vpl::MFX_CODINGOPTION_OFF
+    } as u16;
     mfx.CodecProfile = match (cfg.codec, cfg.ten_bit) {
         (Codec::H264, _) => vpl::MFX_PROFILE_AVC_HIGH as u16,
         (Codec::H265, false) => vpl::MFX_PROFILE_HEVC_MAIN as u16,
@@ -905,6 +911,8 @@ pub struct QsvEncoder {
     fail_submit_at: Option<i64>,
     /// Stall recovery since the last AU, cleared in `poll`.
     stall: Stall,
+    /// Ask for VDEnc; cleared once Init refuses it and opens without.
+    low_power: bool,
 }
 
 // SAFETY: raw VPL handles are not auto-`Send`, and none is thread-affine. Every call on this
@@ -979,6 +987,7 @@ impl QsvEncoder {
             #[cfg(test)]
             fail_submit_at: None,
             stall: Stall::Clear,
+            low_power: true,
         })
     }
 
@@ -1007,13 +1016,15 @@ impl QsvEncoder {
             hdr: self.hdr,
             intra_refresh: intra_refresh_requested(),
             hdr_meta: self.hdr_meta,
+            low_power: self.low_power,
         }
     }
 
     /// Query-gate LTR/IR, Init, then size the bitstream pool from `BufferSizeInKB`. Also
-    /// returns the `FrameInfo` the encoder took, which surfaces of ours must carry.
+    /// returns the `FrameInfo` the encoder took, which surfaces of ours must carry. A runtime
+    /// that refuses VDEnc for this codec (HEVC on Gen9) gets the whole sequence again without it.
     fn init_encode(
-        &self,
+        &mut self,
         session: vpl::mfxSession,
     ) -> Result<(bool, bool, usize, vpl::mfxFrameInfo)> {
         let cfg = self.encode_config();
@@ -1049,6 +1060,19 @@ impl QsvEncoder {
         // Warnings (corrected params, partial acceleration) are logged but accepted.
         // SAFETY: `session` is live; `set` (params + ext chain) outlives the synchronous call.
         let sts = unsafe { vpl::MFXVideoENCODE_Init(session, &mut set.par) };
+        if sts == vpl::MFX_ERR_UNSUPPORTED && self.low_power {
+            self.low_power = false;
+            let full = self.init_encode(session);
+            match &full {
+                Ok(_) => tracing::info!(
+                    codec = ?self.codec,
+                    "QSV low-power encoder unsupported for this codec — using the full encoder"
+                ),
+                // The refusal may be the allocator's; the caller's retry asks for VDEnc again.
+                Err(_) => self.low_power = true,
+            }
+            return full;
+        }
         vpl_ok(sts, "MFXVideoENCODE_Init")?;
         if sts > vpl::MFX_ERR_NONE {
             tracing::debug!(status = sts_name(sts), "QSV Init returned a warning");
@@ -2002,27 +2026,31 @@ fn probe_query(codec: Codec, ten_bit: bool, adapter_luid: Option<LUID>) -> bool 
     let Ok((_loader, session, _api)) = opened else {
         return false;
     };
-    let cfg = EncodeConfig {
-        codec,
-        input: if ten_bit {
-            PixelFormat::P010
-        } else {
-            PixelFormat::Nv12
-        },
-        width: 640,
-        height: 480,
-        fps: 30,
-        bitrate_bps: 4_000_000,
-        ten_bit,
-        hdr: ten_bit,
-        intra_refresh: false,
-        hdr_meta: None,
-    };
-    let mut q_in = build_params(&cfg);
-    let mut q_out = build_params(&cfg);
-    // SAFETY: session is live; both param blocks + ext chains outlive the synchronous call.
-    let sts = unsafe { vpl::MFXVideoENCODE_Query(session.0, &mut q_in.par, &mut q_out.par) };
-    sts >= vpl::MFX_ERR_NONE
+    // With VDEnc or without, as `init_encode` opens it.
+    [true, false].into_iter().any(|low_power| {
+        let cfg = EncodeConfig {
+            codec,
+            input: if ten_bit {
+                PixelFormat::P010
+            } else {
+                PixelFormat::Nv12
+            },
+            width: 640,
+            height: 480,
+            fps: 30,
+            bitrate_bps: 4_000_000,
+            ten_bit,
+            hdr: ten_bit,
+            intra_refresh: false,
+            hdr_meta: None,
+            low_power,
+        };
+        let mut q_in = build_params(&cfg);
+        let mut q_out = build_params(&cfg);
+        // SAFETY: session is live; both param blocks + ext chains outlive the synchronous call.
+        let sts = unsafe { vpl::MFXVideoENCODE_Query(session.0, &mut q_in.par, &mut q_out.par) };
+        sts >= vpl::MFX_ERR_NONE
+    })
 }
 
 #[cfg(test)]
