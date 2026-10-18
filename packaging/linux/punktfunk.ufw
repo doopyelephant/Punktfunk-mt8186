@@ -18,12 +18,13 @@
 #
 # 9778/udp is browser streaming (console: Browser streaming). Nothing listens
 # there until it is switched on, and the console switch cannot open a firewall.
-# 9779-9782/udp are the seats a door (Reachable without logging in) redirects a client to.
+# 9779-9782/udp are the seats a door (Reachable without logging in) redirects a client to,
+# 9783-9786/udp the same seats' browser streaming.
 
 [punktfunk-native]
 title=punktfunk host (native punktfunk/2)
 description=punktfunk/2 native streaming: QUIC control plane + browser streaming + seats + mDNS auto-discovery + mgmt/library API (HTTPS + mTLS)
-ports=9777/udp|9778:9782/udp|5353/udp|47990/tcp
+ports=9777/udp|9778:9786/udp|5353/udp|47990/tcp
 
 [punktfunk-gamestream]
 title=punktfunk host (GameStream/Moonlight)

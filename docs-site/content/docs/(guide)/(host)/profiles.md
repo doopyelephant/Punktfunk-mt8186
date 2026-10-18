@@ -86,6 +86,9 @@ What turning it on does:
 - **The monitor wins.** When you log in at the machine, the background session ends within a few
   seconds and your own session hosts you. Streams on the background session end, and the client
   reconnects. Nothing on your monitor is closed.
+- **Browsers play on seats too.** With **Browser streaming** on, a browser lands on its profile's
+  desktop as an app does: each seat streams to browsers on its own port, UDP 9783–9786. A seat
+  that was running when you turned it on takes it when it next starts.
 - **The console is the door's.** It listens on the same port with the same password. Host
   settings, Displays, Automation, Plugins and Health checks show your own host, which streams.
 - **Seats see your games.** Every seat shows your Steam libraries: its Steam plays, updates and

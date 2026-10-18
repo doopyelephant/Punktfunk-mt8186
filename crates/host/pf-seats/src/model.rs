@@ -27,6 +27,9 @@ pub const CONSOLE_MGMT_PORT: u16 = 47990;
 /// After the browser plane's 9778.
 pub const DEFAULT_NATIVE_PORTS: [u16; MAX_SEATS] = [9779, 9780, 9781, 9782];
 pub const DEFAULT_MGMT_PORTS: [u16; MAX_SEATS] = [47995, 47996, 47997, 47998];
+/// Each seat's browser plane, beside its native port: the seat whose native port is the n-th of
+/// [`DEFAULT_NATIVE_PORTS`] streams to browsers on the n-th of these.
+pub const DEFAULT_BROWSER_PORTS: [u16; MAX_SEATS] = [9783, 9784, 9785, 9786];
 /// `LM20_UNLEN`: NetUserAdd rejects longer SAM account names.
 pub const MAX_ACCOUNT_LEN: usize = 20;
 /// Bytes of backend error text a seat's runtime status keeps.
@@ -159,6 +162,17 @@ pub struct Seat {
     /// host has minted an identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+}
+
+impl Seat {
+    /// The UDP port this seat's browser plane listens on: its native port's place in the pool.
+    /// `None` for a native port from outside it, which no seat is given.
+    pub fn browser_port(&self) -> Option<u16> {
+        let at = DEFAULT_NATIVE_PORTS
+            .iter()
+            .position(|&p| p == self.native_port)?;
+        Some(DEFAULT_BROWSER_PORTS[at])
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -473,6 +487,34 @@ mod tests {
         seat.runtime = status;
         ledger.seats = vec![seat];
         assert!(ledger.validate().is_ok());
+    }
+
+    /// A seat's browser port follows its native port, and no pool shares a port with another or
+    /// with the console host's own.
+    #[test]
+    fn a_seat_s_browser_port_sits_beside_its_native_port() {
+        let mut ledger = Ledger::new();
+        let first = ledger.allocate(request(1)).unwrap();
+        let second = ledger.allocate(request(2)).unwrap();
+        assert_eq!(first.browser_port(), Some(9783));
+        assert_eq!(second.browser_port(), Some(9784));
+        let off_pool = Seat {
+            native_port: 19779,
+            ..first
+        };
+        assert_eq!(off_pool.browser_port(), None);
+        let mut all: Vec<u16> = DEFAULT_NATIVE_PORTS
+            .iter()
+            .chain(&DEFAULT_MGMT_PORTS)
+            .chain(&DEFAULT_BROWSER_PORTS)
+            .chain(&RESERVED_PORTS)
+            .chain(&[pf_host_config::listen::BROWSER_PORT])
+            .copied()
+            .collect();
+        let count = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), count, "a port in two pools");
     }
 
     #[test]

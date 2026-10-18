@@ -260,7 +260,8 @@ in
           Open the host's inbound ports. Native punktfunk always: UDP 9777 (QUIC control and
           media), 9778 (browser streaming) + 5353 (mDNS), TCP 47990 (mgmt API). With
           `gamestream = true` also TCP 47984/47989/48010 and UDP 47998/47999/48000. With
-          `services.punktfunk.seats.enable` also UDP 9779-9782, the seats a door redirects to.
+          `services.punktfunk.seats.enable` also UDP 9779-9786, the seats a door redirects to and
+          their browser streaming.
         '';
       };
 
@@ -854,11 +855,12 @@ in
       environment.etc."polkit-1/rules.d/49-punktfunk-door.rules".source =
         "${cfg.seats.package}/share/polkit-1/rules.d/49-punktfunk-door.rules";
 
-      # The seats a door redirects a client to. The xml and ufw openers carry the same range.
+      # The seats a door redirects a client to, then their browser planes. The xml and ufw
+      # openers carry the same range.
       networking.firewall.allowedUDPPortRanges = mkIf cfg.host.openFirewall [
         {
           from = 9779;
-          to = 9782;
+          to = 9786;
         }
       ];
     })

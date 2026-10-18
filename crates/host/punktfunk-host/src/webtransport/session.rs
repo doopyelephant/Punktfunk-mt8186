@@ -620,6 +620,7 @@ mod tests {
             seat_name: "Seat 1".into(),
             occupant: String::new(),
             pin: String::new(),
+            cert_hash: "cd".repeat(32),
         };
         let host = crate::native::redirect(&link, &mut tx, &to);
         let read = async {
