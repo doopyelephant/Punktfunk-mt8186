@@ -490,6 +490,7 @@ fn over_budget() -> Option<String> {
 }
 
 /// A display's desktop origin, from the registry the console reads.
+#[cfg(not(target_os = "windows"))]
 fn position_of(display_gen: Option<u64>) -> Option<(i32, i32)> {
     let generation = display_gen?;
     crate::vdisplay::registry::snapshot()
