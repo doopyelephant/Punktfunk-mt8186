@@ -1030,6 +1030,25 @@ pub(super) fn decoder_headroom() -> Scenario {
     sc
 }
 
+/// A decoder over its budget at every rate: H.264 at 4K120 on a PS5 takes 9-17 ms a
+/// picture against 8.3 ms, at 20 Mbit/s as at 2. Its queue is shed every two seconds
+/// whatever the rate, so the rate is not the lever, and a cut buys only a worse picture.
+pub(super) fn decoder_overrun() -> Scenario {
+    let mut sc = decoder_knee();
+    sc.name = "decoder_overrun";
+    sc.seed = 0x7A_6700;
+    let s = &mut sc.sessions[0];
+    s.host.fps = 120;
+    s.client.refresh_hz = 120;
+    s.client.decode = DecodeCfg {
+        base_us: 9_000,
+        jitter_us: 8_000,
+        knee_kbps: u32::MAX,
+        us_per_mbps: 0,
+    };
+    sc
+}
+
 /// A link that falls out from under the session: 245 Mbps to 2.5, with a
 /// 400 ms buffer in front of it. Every window after it is starved, and the
 /// frames that do arrive arrive late.
@@ -1555,6 +1574,7 @@ pub(super) fn all() -> Vec<Scenario> {
         unknown_refresh(),
         wifi_tv_probe_stalled(),
         decoder_headroom(),
+        decoder_overrun(),
         encoder_stalled(),
         unknown_refresh_knee(),
         host_rebuild_stall(),
