@@ -34,11 +34,15 @@ struct State {
     queried: Option<Instant>,
 }
 
-static STATE: Mutex<State> = Mutex::new(State {
+const NO_TARGET: State = State {
     target: None,
     rect: None,
     queried: None,
-});
+};
+
+/// One slot per screen of the session, the first at 0 ([`crate::EXTRA_SCREENS`] more).
+static STATE: Mutex<[State; 1 + crate::EXTRA_SCREENS]> =
+    Mutex::new([NO_TARGET, NO_TARGET, NO_TARGET, NO_TARGET]);
 
 /// Publish the streamed output (its CCD target id) that absolute input maps into, at capture
 /// bring-up, then bump the aim generation: whoever sees the new generation finds this target.
@@ -47,22 +51,36 @@ static STATE: Mutex<State> = Mutex::new(State {
 /// bring-up wins for every session's absolute input; per-session routing needs source-tagged
 /// input events (parallel-displays plan).
 pub fn set_stream_target(target: Option<pf_win_display::win_display::CcdTargetKey>) {
-    {
-        let mut st = STATE.lock().unwrap();
-        if st.target != target {
-            tracing::info!(?target, "absolute-input stream target set");
-            st.target = target;
-            st.rect = None;
-            st.queried = None;
-        }
-    }
+    set_slot(0, target);
     crate::publish_aim(true, |_| {});
 }
 
-/// Cached streamed-output rect. `None` = no target / never resolved
-/// (callers fall back to the whole virtual desktop).
-fn stream_rect() -> Option<Rect> {
-    let mut st = STATE.lock().unwrap();
+/// [`set_stream_target`] for further screen `screen` (1 or more), with no warp: the pointer
+/// stays where the first screen put it.
+pub fn set_screen_target(screen: u8, target: Option<pf_win_display::win_display::CcdTargetKey>) {
+    if screen > 0 {
+        set_slot(usize::from(screen), target);
+    }
+}
+
+fn set_slot(i: usize, target: Option<pf_win_display::win_display::CcdTargetKey>) {
+    let mut slots = STATE.lock().unwrap();
+    let Some(st) = slots.get_mut(i) else {
+        return;
+    };
+    if st.target != target {
+        tracing::info!(screen = i, ?target, "absolute-input stream target set");
+        st.target = target;
+        st.rect = None;
+        st.queried = None;
+    }
+}
+
+/// Cached rect of screen `screen`'s output. `None` = no target / never resolved (callers fall
+/// back to the first screen's, then the whole virtual desktop).
+fn stream_rect(screen: u8) -> Option<Rect> {
+    let mut slots = STATE.lock().unwrap();
+    let st = slots.get_mut(usize::from(screen))?;
     let target = st.target?;
     let fresh = st.queried.is_some_and(|at| at.elapsed() < RECT_TTL);
     if !fresh {
@@ -89,8 +107,14 @@ fn stream_rect() -> Option<Rect> {
     st.rect
 }
 
-pub(crate) fn map_normalized(nx: f64, ny: f64) -> (i32, i32) {
-    map_into(stream_rect().unwrap_or_else(virtual_desktop_rect), nx, ny)
+/// `[0,1]²` of screen `screen`'s picture onto its desktop rect.
+pub(crate) fn map_normalized(screen: u8, nx: f64, ny: f64) -> (i32, i32) {
+    let rect = (screen > 0)
+        .then(|| stream_rect(screen))
+        .flatten()
+        .or_else(|| stream_rect(0))
+        .unwrap_or_else(virtual_desktop_rect);
+    map_into(rect, nx, ny)
 }
 
 /// `[0,1]²` over `(x, y, w, h)`. Inclusive edges: 1.0 lands on the last pixel.

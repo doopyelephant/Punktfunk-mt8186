@@ -157,6 +157,9 @@ impl AbsoluteAnchor {
     }
 }
 
+/// Screens past the first a session's absolute input may land on ([`set_screen_head`]).
+pub const EXTRA_SCREENS: usize = 3;
+
 /// Where absolute input aims, as the host published it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AimState {
@@ -164,17 +167,25 @@ pub(crate) struct AimState {
     pub target: head_pick::StreamTarget,
     /// Capture bring-ups so far, unchanged head included: a new session owes a warp too.
     pub generation: u64,
+    /// The heads of the screens past the first, screen `i + 1` at `i`; no anchor.
+    pub screens: [head_pick::StreamTarget; EXTRA_SCREENS],
+    /// Moves with each of those heads, and owes no warp.
+    pub screens_generation: u64,
 }
+
+const NO_HEAD: head_pick::StreamTarget = head_pick::StreamTarget {
+    name: None,
+    extent: None,
+    anchor: None,
+};
 
 /// One lock, so a reader sees one aim. `RwLock` not env: the injector is host-lifetime behind
 /// a channel, so a session reaches it only through typed process state. See `SESSION_BACKEND`.
 static AIM: std::sync::RwLock<AimState> = std::sync::RwLock::new(AimState {
-    target: head_pick::StreamTarget {
-        name: None,
-        extent: None,
-        anchor: None,
-    },
+    target: NO_HEAD,
     generation: 0,
+    screens: [NO_HEAD; EXTRA_SCREENS],
+    screens_generation: 0,
 });
 
 /// The aim in one read.
@@ -199,6 +210,53 @@ pub fn set_stream_extent(mode: Option<(u16, u16)>) {
     publish_aim(false, |t| t.extent = mode);
 }
 
+/// Host-only, at a further screen's capture bring-up: the head screen `screen` (1 or more)
+/// streams, by output name where the compositor names one, and its mode. No warp: the pointer
+/// stays where the first screen put it.
+pub fn set_screen_head(screen: u8, name: Option<String>, extent: Option<(u16, u16)>) {
+    AIM.write()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_screen(screen, name, extent);
+}
+
+impl AimState {
+    fn set_screen(&mut self, screen: u8, name: Option<String>, extent: Option<(u16, u16)>) {
+        let Some(i) = usize::from(screen)
+            .checked_sub(1)
+            .filter(|&i| i < EXTRA_SCREENS)
+        else {
+            return;
+        };
+        if self.screens[i].name != name {
+            tracing::info!(screen, output = ?name, "absolute-input screen output set");
+        }
+        self.screens[i] = head_pick::StreamTarget {
+            name,
+            extent,
+            anchor: None,
+        };
+        self.screens_generation += 1;
+    }
+
+    fn target_for(&self, screen: u8) -> head_pick::StreamTarget {
+        usize::from(screen)
+            .checked_sub(1)
+            .and_then(|i| self.screens.get(i))
+            .filter(|t| t.name.is_some() || t.extent.is_some())
+            .cloned()
+            .unwrap_or_else(|| self.target.clone())
+    }
+}
+
+/// The head screen `screen` aims at: the first screen's for screen 0 and for one never
+/// published, so input for a screen the host lost still lands on a streamed head.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn stream_target_for(screen: u8) -> head_pick::StreamTarget {
+    AIM.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .target_for(screen)
+}
+
 #[cfg(test)]
 mod aim_tests {
     /// A bring-up's head and its generation land in one write, so one read sees both.
@@ -210,6 +268,25 @@ mod aim_tests {
         assert!(aim.generation > before);
         assert_eq!(aim.target.extent, Some((1234, 567)));
         super::set_stream_extent(None);
+    }
+
+    /// A further screen's head is its own, owes no warp, and an unpublished one is the first's.
+    #[test]
+    fn a_screen_head_is_its_own_and_owes_no_warp() {
+        let mut aim = super::AimState::default();
+        aim.target.name = Some("Virtual-a".into());
+        aim.set_screen(2, Some("Virtual-b".into()), Some((2560, 1440)));
+        assert_eq!((aim.generation, aim.screens_generation), (0, 1), "no warp");
+        let t = aim.target_for(2);
+        assert_eq!(
+            (t.name.as_deref(), t.extent),
+            (Some("Virtual-b"), Some((2560, 1440)))
+        );
+        assert_eq!(aim.target_for(3), aim.target);
+        assert_eq!(aim.target_for(0), aim.target);
+        aim.set_screen(9, Some("ignored".into()), None);
+        aim.set_screen(2, None, None);
+        assert_eq!(aim.target_for(2), aim.target);
     }
 }
 
@@ -231,12 +308,6 @@ pub fn set_absolute_anchor(anchor: Option<AbsoluteAnchor>) {
 
 pub fn absolute_anchor() -> Option<AbsoluteAnchor> {
     aim().target.anchor
-}
-
-/// The session's output name, the streamed mode and the host-wide anchor, in one read.
-#[cfg(target_os = "linux")]
-pub(crate) fn stream_target() -> head_pick::StreamTarget {
-    aim().target
 }
 
 /// Backend the live session resolved to. Host writes this from `pf_vdisplay::input_backend_id`
@@ -996,7 +1067,7 @@ pub mod pen;
 #[path = "inject/windows/stream_target.rs"]
 pub mod stream_target;
 #[cfg(target_os = "windows")]
-pub use stream_target::set_stream_target;
+pub use stream_target::{set_screen_target, set_stream_target};
 /// Streamed compositor output (by name) that absolute coordinates map into — counterpart
 /// of Windows `stream_target`. Published at capture bring-up; wlroots binds its pointer to
 /// that `wl_output`.

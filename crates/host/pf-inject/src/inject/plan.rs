@@ -16,13 +16,15 @@ use punktfunk_core::input::{InputEvent, InputKind};
 /// mapped as 1.0 that lands one pixel past the head, on the neighbouring monitor.
 pub(crate) const ABS_EDGE: f32 = 1.0 - 1.0 / 65536.0;
 
-/// An absolute sample (pointer or touch): client pixels on a `w×h` surface, both nonzero.
+/// An absolute sample (pointer or touch): client pixels on a `w×h` surface, both nonzero, on
+/// screen `screen` of the session ([`InputEvent::screen`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Abs {
     pub x: i32,
     pub y: i32,
     pub w: u32,
     pub h: u32,
+    pub screen: u8,
 }
 
 impl Abs {
@@ -35,6 +37,7 @@ impl Abs {
             y: ev.y,
             w,
             h,
+            screen: ev.screen(),
         })
     }
 
@@ -236,6 +239,7 @@ mod tests {
             y: 20,
             w: 100,
             h: 50,
+            screen: 0,
         };
         let rows: Vec<(&str, Vec<InputEvent>, Vec<Op>)> = vec![
             (
@@ -361,6 +365,7 @@ mod tests {
             y: 1080,
             w: 1920,
             h: 1080,
+            screen: 0,
         };
         assert_eq!(edge.in_extent(), (1919, 1079));
         let (nx, ny) = edge.normalized();

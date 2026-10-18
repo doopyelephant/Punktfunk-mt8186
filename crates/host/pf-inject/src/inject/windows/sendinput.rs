@@ -305,7 +305,7 @@ fn abs_desktop_px(event: &InputEvent) -> Option<(i32, i32)> {
     }
     let cx = (event.x.clamp(0, w as i32)) as f64 / w as f64;
     let cy = (event.y.clamp(0, h as i32)) as f64 / h as f64;
-    Some(crate::stream_target::map_normalized(cx, cy))
+    Some(crate::stream_target::map_normalized(event.screen(), cx, cy))
 }
 
 /// Wire button 1..=5 (left, middle, right, X1, X2) → HID button bit (primary, secondary,
