@@ -60,6 +60,9 @@ final class AudioDeviceSwitchTests: XCTestCase {
         guard let original = AudioDevices.defaultOutputDevice() else {
             throw XCTSkip("no default output device")
         }
+        try XCTSkipIf(
+            AudioDevices.isRunningSomewhere(original),
+            "something is playing on the default output — moving it would hop that audio")
         let others = AudioDevices.outputs()
             .compactMap { AudioDevices.deviceID(forUID: $0.uid) }
             .filter { $0 != original }
