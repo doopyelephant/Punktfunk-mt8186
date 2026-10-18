@@ -305,6 +305,9 @@ impl RumbleEngine {
 pub(crate) struct RumbleShared {
     inner: Mutex<SharedState>,
     cv: Condvar,
+    /// Runs on the demux thread after each wire update, for a poller that blocks elsewhere
+    /// (the desktop's SDL event wait) instead of in [`Self::next_command`].
+    wake: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[cfg(feature = "quic")]
@@ -333,6 +336,15 @@ impl RumbleFeed {
             .wire_update(Instant::now(), pad, low, high, lt, rt, ttl_ms);
         drop(g);
         self.0.cv.notify_all();
+        let wake = self
+            .0
+            .wake
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(wake) = wake {
+            wake();
+        }
     }
 }
 
@@ -353,7 +365,13 @@ impl RumbleShared {
                 closed: false,
             }),
             cv: Condvar::new(),
+            wake: Mutex::new(None),
         }
+    }
+
+    /// Run `wake` on each wire update, for a poller that waits elsewhere.
+    pub(crate) fn set_wake(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        *self.wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake);
     }
 
     pub(crate) fn set_quirks(&self, pad: u16, q: ActuatorQuirks) {

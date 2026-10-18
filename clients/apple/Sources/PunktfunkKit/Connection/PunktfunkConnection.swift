@@ -2,9 +2,9 @@
 //
 // Threading contract (mirrors the C header): each plane has one puller thread. Video pulls
 // nextAU() and nextHdrMeta(); audio pulls nextAudioPcm()/audioPlc(); feedback pulls
-// nextRumbleCommand() and nextHidOutput() in turn, under the lock nextHdrMeta() shares; cursor
-// pulls nextCursorShape()/nextCursorState(); nextClipboard() and nextHostTiming() each have
-// their own. The core keeps per-plane borrow
+// nextRumbleCommand() and nextHidOutput() in turn; cursor
+// pulls nextCursorShape()/nextCursorState(); nextClipboard(), nextHostTiming() and nextHdrMeta()
+// each have their own. The core keeps per-plane borrow
 // slots, so the planes never alias. send() is enqueue-only and safe alongside all of them.
 // A borrowed pointer is valid only until the next call of the same kind, so every puller
 // copies into an owned value.
@@ -362,6 +362,9 @@ public final class PunktfunkConnection: @unchecked Sendable {
     /// Same role for the feedback drain thread (rumble + HID-output — two core planes,
     /// drained sequentially by one thread).
     private let feedbackLock = NSLock()
+    /// Same role for the HDR metadata pull, which the video pump drains every frame with a
+    /// zero timeout: on its own lock a blocking feedback pull never starves it.
+    private let hdrLock = NSLock()
     /// Same role for the host-timing (0xCF) puller — its own plane in the core, drained
     /// non-blockingly by the app's 1 s stats tick (never contends with the blocking pullers).
     private let statsLock = NSLock()
@@ -1940,12 +1943,11 @@ public final class PunktfunkConnection: @unchecked Sendable {
     }
 
     /// Pull the next static HDR metadata update; nil on timeout, throws `.closed` once the session
-    /// ended. The video pump drains it with timeout 0: it shares the feedback thread's lock with
-    /// `nextRumbleCommand`/`nextHidOutput`, and a blocking poll there starves the other side.
+    /// ended. The video pump drains it with timeout 0 every frame, on its own lock.
     /// Only an HDR stream sends it, and a game can enter HDR mid-session.
     public func nextHdrMeta(timeoutMs: UInt32 = 0) throws -> HdrMeta? {
         var out = PunktfunkHdrMeta()
-        return try poll(feedbackLock) { h in
+        return try poll(hdrLock) { h in
             punktfunk_connection_next_hdr_meta(h, &out, timeoutMs)
         } decode: {
             // The fixed C `uint16_t[3]` arrays import as tuples — copy them out.
@@ -2032,6 +2034,7 @@ public final class PunktfunkConnection: @unchecked Sendable {
         pumpLock.lock() // pullers exit at their next poll boundary, releasing these
         audioLock.lock()
         feedbackLock.lock()
+        hdrLock.lock()
         statsLock.lock()
         clipboardLock.lock()
         cursorLock.lock()

@@ -1517,6 +1517,13 @@ impl NativeClient {
         }
     }
 
+    /// Run `wake` on the demux thread as each rumble update lands, for a poller that blocks
+    /// on something other than [`Self::next_rumble_command`] and then drains it with a zero
+    /// timeout. A scheduled follow-up (a ramp step, a backstop) still waits for that poll.
+    pub fn set_rumble_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.planes.rumble_sched.set_wake(wake);
+    }
+
     /// Actuator quirks for wire pad `pad` (at attach). Default = well-behaved; only decaying
     /// actuators need a keepalive.
     pub fn set_rumble_quirks(&self, pad: u16, quirks: ActuatorQuirks) {
