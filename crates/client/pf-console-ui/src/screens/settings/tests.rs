@@ -679,7 +679,7 @@ fn echo_cancellation_follows_the_microphone() {
     assert!(ctx.settings.echo_cancel);
 }
 
-/// The TV's codec row wraps from H.264 back to Automatic: no AV1, no PyroWave.
+/// The TV's codec row wraps from AV1 back to Automatic: no PyroWave.
 #[test]
 fn webos_offers_only_the_codecs_ndl_decodes() {
     let mut settings = Settings {
@@ -697,15 +697,17 @@ fn webos_offers_only_the_codecs_ndl_decodes() {
         ..Ctx::test(&mut settings, &library)
     };
     assert!(adjust(RowId::Codec, 1, true, &mut ctx));
+    assert_eq!(ctx.settings.codec, "av1");
+    assert!(adjust(RowId::Codec, 1, true, &mut ctx));
     assert_eq!(ctx.settings.codec, "auto");
     let desktop = crate::screens::Device::test();
     let mut ctx = Ctx {
         device: &desktop,
         ..ctx
     };
-    ctx.settings.codec = "h264".into();
+    ctx.settings.codec = "av1".into();
     assert!(adjust(RowId::Codec, 1, true, &mut ctx));
-    assert_eq!(ctx.settings.codec, "av1");
+    assert_eq!(ctx.settings.codec, "pyrowave");
 }
 
 /// A GPU without the codec's compute set says so on the row, in both places a user
