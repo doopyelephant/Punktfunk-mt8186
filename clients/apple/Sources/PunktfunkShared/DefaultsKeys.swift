@@ -106,6 +106,8 @@ public enum DefaultsKey {
     /// visionOS: the room places the stream's audio at its window (on, the platform's own
     /// default); off plays the game's mix straight to the ears. This device's, never a preset's.
     public static let spatialAudio = "punktfunk.spatialAudio"
+    /// visionOS: where the picture shows (`StreamScreen`). This device's, never a preset's.
+    public static let screen = "punktfunk.screen"
     /// Echo cancellation for the mic uplink (on by default): playback + capture share ONE
     /// audio engine so the system voice processor can subtract what this device is playing
     /// from what its mic hears — without it a loudspeaker client feeds the game audio straight
@@ -372,6 +374,7 @@ public enum SettingDefault {
     public static let audioFormat = AudioFormatChoice.opus.rawValue
     public static let micEnabled = false
     public static let spatialAudio = true
+    public static let screen = StreamScreen.window.rawValue
     public static let echoCancel = true
     public static let keepHostAudio = false
     public static let touchMode = "trackpad"

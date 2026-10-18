@@ -119,6 +119,7 @@ mod tests {
         ("sc2_capture", "Apple only"),
         ("ds_capture", "Android and webOS only"),
         ("spatial_audio", "a Vision Pro's room"),
+        ("screen", "a Vision Pro's room"),
     ];
 
     /// Rows with no catalog entry: this device's own pickers.

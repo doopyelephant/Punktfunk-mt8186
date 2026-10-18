@@ -2,11 +2,14 @@
 // then rest invisible until the player looks at where they hang.
 
 #if os(visionOS)
+import PunktfunkKit
 import SwiftUI
 
 /// The stream window's controls, below it. A look is the only reveal: a pinch on the picture is
 /// the host's click. The system draws the hover state, so the rest state costs no input.
 struct StreamOrnament: View {
+    /// The session the Screen menu moves; nil draws the ornament without it.
+    var connection: PunktfunkConnection?
     let quickActions: () -> Void
     @State private var resting = false
 
@@ -15,6 +18,7 @@ struct StreamOrnament: View {
             Button(action: quickActions) {
                 Label("Quick Actions", systemImage: "ellipsis.circle")
             }
+            if let connection { ScreenMenu(connection: connection) }
             NewWindowButton()
         }
         .labelStyle(.iconOnly)

@@ -18,6 +18,9 @@ struct StreamScene: View {
     @Binding var showTouchExit: Bool
     @AppStorage(DefaultsKey.hudPlacement) private var hudPlacement = HUDPlacement.topTrailing.rawValue
     @AppStorage(DefaultsKey.statsScalePct) private var statsScalePct = 100
+    #if os(visionOS)
+    @AppStorage(DefaultsKey.screen) private var screen = SettingDefault.screen
+    #endif
 
     /// The ring this platform draws. macOS takes the DESKTOP default (no soft keyboard, no
     /// on-screen pad), tvOS the TV one (no touch, keyboard or microphone slot), iOS the touch
@@ -110,8 +113,28 @@ struct StreamScene: View {
             endToEndMeter: model.endToEnd
         )
         #if os(visionOS)
+        .dock(DockStage.shared.feed(for: conn))
+        .overlay {
+            if let feed = DockStage.shared.feed(for: conn) {
+                ZStack {
+                    DockPlayer(
+                        feed: feed, mode: conn.currentMode(),
+                        onRefused: { [weak model] in model?.noteDockRefused() })
+                    InDockPlaceholder(
+                        connection: conn, endStream: { [weak model] in model?.disconnect() })
+                }
+            }
+        }
+        // A streaming session follows the stored Screen; the ornament's menu moves it too.
+        .onChange(
+            of: model.phase == .streaming && StreamScreen(name: screen) == .environment,
+            initial: true
+        ) { _, docked in
+            if docked { DockStage.shared.enter(conn) } else { DockStage.shared.leave(conn) }
+        }
+        .onDisappear { DockStage.shared.ended(conn) }
         .ornament(attachmentAnchor: .scene(.bottom), contentAlignment: .top) {
-            StreamOrnament(quickActions: { ring.toggleCentred() })
+            StreamOrnament(connection: conn, quickActions: { ring.toggleCentred() })
         }
         #endif
         .overlay(alignment: placement.alignment) {

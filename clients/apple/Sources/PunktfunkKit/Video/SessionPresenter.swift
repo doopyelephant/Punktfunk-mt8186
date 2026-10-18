@@ -206,6 +206,16 @@ final class SessionPresenter {
         #endif
     }
 
+    /// The dock's feed while a visionOS environment shows the picture.
+    private(set) var dock: DockFeed?
+
+    /// Hand the session's frames to `feed` too, or stop with nil. Costs one IDR. Main thread.
+    func setDock(_ feed: DockFeed?) {
+        guard feed !== dock else { return }
+        dock = feed
+        restartPresentation()
+    }
+
     private var pump: StreamPump?
     private var stage2: Stage2Pipeline?
     private var stage2Link: CADisplayLink?
@@ -253,7 +263,8 @@ final class SessionPresenter {
     /// Start the resolved presenter for `connection`.
     ///
     /// Stage-1 sends compressed samples to `baseLayer`; tvOS's decoded path sends it VideoToolbox
-    /// output. Metal paths leave that layer idle and overlay their own CAMetalLayer. The supplied
+    /// output, and a visionOS dock's feed gets the same output. Metal paths leave that layer idle
+    /// and overlay their own CAMetalLayer. The supplied
     /// display-link factory tracks the hosting display for ordinary pacing and decoded-frame
     /// metering; deadline pacing owns a CAMetalDisplayLink instead.
     ///
@@ -311,8 +322,10 @@ final class SessionPresenter {
             bufferSetting: connection.settings.smoothBuffer)
         // Direct video presentation is the zero-buffer latency path. A user who asks for a
         // smoothness buffer keeps the existing deadline engine, where FrameStore owns that buffer.
-        let pacing = Self.effectivePacing(
+        var pacing = Self.effectivePacing(
             selectedPacing, priority: priority, videoLayerCompatible: !connection.isChroma444)
+        let dock = dock.flatMap { DockFeed.supports(connection) ? $0 : nil }
+        if dock != nil { pacing = .decoded }
         #if os(macOS)
         let vsyncPaced = priority != .latency && pacing == .arrival
         let adaptiveSlotPaced = Self.adaptiveSlotPaced(
@@ -325,6 +338,7 @@ final class SessionPresenter {
            let pipeline = Stage2Pipeline(
                endToEndMeter: endToEndMeter,
                videoRenderer: pacing == .decoded ? baseLayer.sampleBufferRenderer : nil,
+               dockFeed: dock,
                pacing: pacing,
                gateDepth: Self.gateDepth(
                    env: ProcessInfo.processInfo.environment["PUNKTFUNK_GATE_DEPTH"]),

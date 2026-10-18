@@ -42,6 +42,7 @@
     { "key": "decoder", "label": "Video decoder", "category": "display", "advanced": true },
     { "key": "low_latency", "label": "Low-latency mode", "category": "display", "advanced": true },
     { "key": "keep_awake", "label": "Keep screen awake", "category": "display", "advanced": true },
+    { "key": "screen", "label": "Screen", "category": "display", "advanced": false },
 
     { "key": "audio_channels", "label": "Audio channels", "category": "audio", "advanced": false },
     { "key": "mic_enabled", "label": "Stream microphone", "category": "audio", "advanced": false },

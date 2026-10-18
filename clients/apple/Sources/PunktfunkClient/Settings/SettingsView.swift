@@ -77,6 +77,7 @@ struct SettingsView: View {
     @AppStorage(DefaultsKey.statsVerbosity) var statsVerbosityRaw = StatsVerbosity.current.rawValue
     @AppStorage(DefaultsKey.hudPlacement) var hudPlacement = SettingDefault.hudPlacement
     @AppStorage(DefaultsKey.spatialAudio) var spatialAudio = SettingDefault.spatialAudio
+    @AppStorage(DefaultsKey.screen) var screen = SettingDefault.screen
     @AppStorage(DefaultsKey.advancedStats) var advancedStats = SettingDefault.advancedStats
     @AppStorage(DefaultsKey.statsScalePct) var statsScalePct = SettingDefault.statsScalePct
     @AppStorage(DefaultsKey.exitHint) var exitHint = SettingDefault.exitHint

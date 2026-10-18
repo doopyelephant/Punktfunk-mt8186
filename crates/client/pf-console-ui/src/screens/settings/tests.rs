@@ -173,6 +173,7 @@ fn catalog_key(id: RowId) -> Option<&'static str> {
         RowId::PadRumble => "pad_rumble",
         RowId::PhoneRumble => "rumble_on_phone",
         RowId::SpatialAudio => "spatial_audio",
+        RowId::Screen => "screen",
         RowId::PhoneGyro => "gyro_on_phone",
         RowId::PadForward => "gamepad_forwarding",
         RowId::Pad => "forward_pad",
@@ -1366,6 +1367,7 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
             RowId::GamepadUi,
             RowId::GamepadUiMode,
             RowId::ReduceUiResolution,
+            RowId::Screen,
             RowId::SecondScreen,
             RowId::LowLatency,
             RowId::SpatialAudio,
@@ -1388,6 +1390,7 @@ fn platform_row_split_hides_only_the_other_platforms_concepts() {
         vec![
             RowId::FullscreenMode,
             RowId::Fullscreen,
+            RowId::Screen,
             RowId::Chroma444,
             // TenBitSdr is NOT here: MediaCodec decodes Main10 from the SPS and the depth
             // asks nothing of the panel, so Android obeys it.
@@ -1523,10 +1526,10 @@ fn android_rows_live_in_extra() {
     }
 }
 
-/// Only a Vision Pro has a room to place the sound in; the switch is its own key, on until
-/// written.
+/// Only a Vision Pro has a room to place the sound and the picture in; each row is its own
+/// key, the platform's default until written.
 #[test]
-fn spatial_audio_is_the_headsets_alone() {
+fn spatial_rows_are_the_headsets_alone() {
     let mut settings = Settings::default();
     let library = crate::library::LibraryShared::default();
     let phone = crate::screens::Device {
@@ -1537,6 +1540,13 @@ fn spatial_audio_is_the_headsets_alone() {
         spatial: true,
         ..phone.clone()
     };
+    assert!(!row_applies(
+        RowId::Screen,
+        &Ctx {
+            device: &phone,
+            ..Ctx::test(&mut settings, &library)
+        }
+    ));
     assert!(!row_applies(
         RowId::SpatialAudio,
         &Ctx {
@@ -1554,6 +1564,12 @@ fn spatial_audio_is_the_headsets_alone() {
     assert_eq!(
         ctx.settings.extra.get("visionos.spatial_audio"),
         Some(&serde_json::Value::Bool(false))
+    );
+    assert!(row_applies(RowId::Screen, ctx));
+    assert!(adjust(RowId::Screen, 1, true, ctx));
+    assert_eq!(
+        extra_str(ctx.settings, device_keys::SCREEN, "window"),
+        "environment"
     );
 }
 
@@ -1693,7 +1709,7 @@ fn every_row_has_exactly_one_tab() {
             seen.push(*id);
         }
     }
-    assert_eq!(seen.len(), 71, "{seen:?}");
+    assert_eq!(seen.len(), 72, "{seen:?}");
     assert!(
         !seen.contains(&RowId::AdvancedChanged),
         "built per tab, never listed"

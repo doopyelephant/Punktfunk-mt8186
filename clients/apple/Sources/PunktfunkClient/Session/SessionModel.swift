@@ -807,6 +807,11 @@ final class SessionModel: ObservableObject {
 
     /// The host's launch line, once per verdict, on its own clock so it never hides the access
     /// warning.
+    /// The environment did not take the docked picture; it stays in the window.
+    func noteDockRefused() {
+        flash(\.dockRefused, true, for: SessionNotices.launchSeconds)
+    }
+
     private func showLaunchNotice(_ text: String) {
         notices.launchShown = text
         flash(\.launch, text, for: SessionNotices.launchSeconds)

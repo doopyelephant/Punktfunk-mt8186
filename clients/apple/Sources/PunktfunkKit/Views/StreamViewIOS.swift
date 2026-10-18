@@ -45,6 +45,9 @@ public struct StreamView: UIViewControllerRepresentable {
     private let onResizeTarget: ((UInt32, UInt32) -> Void)?
     private let onDecodedSize: (@Sendable (Int, Int) -> Void)?
     private let endToEndMeter: LatencyMeter?
+    #if os(visionOS)
+    private var dockFeed: DockFeed?
+    #endif
 
     /// `onDisconnectRequest` (main queue) is the captured-state ⌃⌥⇧D from an iPad keyboard,
     /// as on the macOS StreamView; released, the Stream menu's key equivalent disconnects.
@@ -74,8 +77,20 @@ public struct StreamView: UIViewControllerRepresentable {
         self.endToEndMeter = endToEndMeter
     }
 
+    #if os(visionOS)
+    /// Hand every decoded frame to `feed` too while it is set.
+    public func dock(_ feed: DockFeed?) -> StreamView {
+        var view = self
+        view.dockFeed = feed
+        return view
+    }
+    #endif
+
     public func makeUIViewController(context: Context) -> StreamViewController {
         let controller = StreamViewController()
+        #if os(visionOS)
+        controller.setDock(dockFeed)
+        #endif
         controller.onCaptureChange = onCaptureChange
         controller.onDisconnectRequest = onDisconnectRequest
         controller.onDial = onDial
@@ -95,6 +110,9 @@ public struct StreamView: UIViewControllerRepresentable {
         controller.endToEndMeter = endToEndMeter
         controller.onResizeTarget = onResizeTarget
         controller.onDecodedSize = onDecodedSize
+        #if os(visionOS)
+        controller.setDock(dockFeed)
+        #endif
         if controller.connection !== connection {
             controller.start(connection: connection, onFrame: onFrame, onSessionEnd: onSessionEnd)
         }
@@ -787,7 +805,8 @@ public final class StreamViewController: StreamViewControllerBase {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
         #if os(iOS) || os(visionOS)
-        if !onExternal { noteMatchWindowSize() }
+        // The dock's screen is not the window's size, so Match window sits it out.
+        if !onExternal, presenter.dock == nil { noteMatchWindowSize() }
         #if os(iOS)
         noteScreen()
         #endif
@@ -914,6 +933,13 @@ public final class StreamViewController: StreamViewControllerBase {
     }
 
     #if os(visionOS)
+    /// Hand the picture to the dock's feed too, or stop with nil. Main thread.
+    func setDock(_ feed: DockFeed?) {
+        guard feed !== presenter.dock else { return }
+        presenter.setDock(feed)
+        if connection != nil { layoutMetalLayer() }
+    }
+
     /// The window takes the picture's shape: a fixed mode need not match the window, and a bar is
     /// picture no one sees. Match window drives the mode from the window instead, so it resizes
     /// free. A new shape keeps the window's width.

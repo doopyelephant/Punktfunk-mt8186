@@ -24,6 +24,9 @@ pub enum RowId {
     RenderScale,
     /// `trust::Settings::video_fit`: bars, crop or stretch when the stream's shape differs.
     VideoFit,
+    /// Where a Vision Pro shows the picture: its window, or docked in the environment.
+    /// Device-local, under [`device_keys::SCREEN`].
+    Screen,
     Bitrate,
     /// `trust::Settings::pyrowave_bpp`, shown as the rate it needs. In Bitrate's place while
     /// the codec is PyroWave.
@@ -198,6 +201,7 @@ pub(super) mod device_keys {
     pub const SAFE_AREA_MODE: &str = "android.safe_area_mode";
     /// The Vision Pro's own rows, under the prefix that client writes.
     pub const SPATIAL_AUDIO: &str = "visionos.spatial_audio";
+    pub const SCREEN: &str = "visionos.screen";
 }
 
 /// The `Settings::extra` keys the webOS rows share with that client (`services::store::shared`),
@@ -219,6 +223,8 @@ pub(super) const GAMEPAD_UI_KEY: &str = "gamepad_ui_enabled";
 pub(super) const GAMEPAD_UI_MODE_KEY: &str = "gamepad_ui_mode";
 
 /// Stored [`GAMEPAD_UI_MODE_KEY`] values (`GamepadUi.kt`).
+/// The Vision Pro's `visionos.screen` values, as its own Settings names them.
+const SCREENS: [(&str, &str); 2] = [("window", "Window"), ("environment", "Environment")];
 const GAMEPAD_UI_MODES: [(&str, &str); 2] =
     [("connected", "With a controller"), ("always", "Always")];
 
@@ -394,6 +400,7 @@ impl RowId {
                 Extra::Choice(webos_keys::AUDIO_ROUTE, "software", &WEBOS_AUDIO_ROUTES)
             }
             RowId::HostSort => Extra::Choice(home::HOST_SORT_KEY, "added", &home::HOST_SORTS),
+            RowId::Screen => Extra::Choice(device_keys::SCREEN, "window", &SCREENS),
             RowId::GamepadUiMode => {
                 Extra::Choice(GAMEPAD_UI_MODE_KEY, "connected", &GAMEPAD_UI_MODES)
             }
@@ -481,6 +488,7 @@ pub(super) const TABS: [(&str, &[RowId]); 7] = [
             RowId::Bitrate,
             RowId::PyroWaveQuality,
             RowId::VideoFit,
+            RowId::Screen,
             RowId::SecondScreen,
             RowId::Hdr,
             RowId::PresentPriority,
@@ -811,8 +819,8 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
         // Apple asks before it captures a Steam Controller 2 (`sc2Capture`); Android captures
         // one whenever it is present.
         RowId::Sc2Passthrough => &[Apple],
-        // A room to place the sound in: the Vision Pro alone (`row_applies`).
-        RowId::SpatialAudio => &[Apple],
+        // A room to place the sound and the picture in: the Vision Pro alone (`row_applies`).
+        RowId::SpatialAudio | RowId::Screen => &[Apple],
         // The weak-GPU row. On Android it also shrinks the surface; webOS's compositor
         // already hands a 1080p buffer, so there it is the cheaper backdrop alone.
         RowId::ReduceUiResolution => &[Android, WebOS],
@@ -957,7 +965,7 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
         }
         // A Mac window has no background session; Android and the other Apple devices do.
         RowId::BackgroundKeepAlive => !is_mac(ctx),
-        RowId::SpatialAudio => ctx.device.spatial,
+        RowId::SpatialAudio | RowId::Screen => ctx.device.spatial,
         RowId::BackgroundTimeout => {
             !is_mac(ctx) && RowId::BackgroundKeepAlive.extra_on(ctx.settings)
         }
@@ -1119,7 +1127,7 @@ pub(super) fn row_icon(id: RowId) -> &'static str {
         | RowId::Controllers => "gamepad-2",
         RowId::SystemButtons | RowId::GuideGesture => "house",
         RowId::PhoneGyro => "rotate-cw",
-        RowId::SecondScreen => "monitor",
+        RowId::SecondScreen | RowId::Screen => "monitor",
         RowId::Touch | RowId::CursorGestures => "pointer",
         RowId::Mouse => "mouse",
         RowId::QuickActions => "ellipsis",
@@ -1505,6 +1513,7 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
         ),
         RowId::ExitHint => (None, "Exit hint", extra()),
         RowId::HostSort => (None, "Host order", extra()),
+        RowId::Screen => (None, "Screen", extra()),
         RowId::HostGrouping => (
             None,
             "Group hosts by",
@@ -1685,6 +1694,7 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             "Stops the host's audio, playing from this device's speakers, being picked up \
              and sent back. Turn it off if your microphone already runs its own processing."
         }
+        RowId::Screen => "Where the picture shows: this window, or docked in the environment.",
         RowId::SpatialAudio => {
             "On, the sound comes from the window. Off plays the game's own mix straight to \
              your ears."
@@ -2196,6 +2206,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
         | RowId::GamepadUi
         | RowId::BackgroundKeepAlive
         | RowId::HostSort
+        | RowId::Screen
         | RowId::GamepadUiMode => id.extra().and_then(|e| e.step(s, delta, wrap)),
         RowId::StatsPosition => {
             let at = HudCorner::ALL

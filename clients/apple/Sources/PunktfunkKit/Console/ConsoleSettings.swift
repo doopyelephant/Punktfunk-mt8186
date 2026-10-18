@@ -184,6 +184,7 @@ public enum ConsoleSettings {
         .bool("android.gyro_on_phone", DefaultsKey.gyroFromDevice, SettingDefault.gyroFromDevice),
         .bool("android.sc2_capture", DefaultsKey.sc2Capture, SettingDefault.sc2Capture),
         .bool("visionos.spatial_audio", DefaultsKey.spatialAudio, SettingDefault.spatialAudio),
+        .string("visionos.screen", DefaultsKey.screen, SettingDefault.screen),
     ]
 
     // MARK: - the two that differ

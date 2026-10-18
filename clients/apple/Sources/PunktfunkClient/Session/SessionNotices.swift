@@ -55,6 +55,8 @@ struct SessionNotices {
     var accessWarning = Flash<String>()
     /// The host's line for a launch that did not give the player their game.
     var launch = Flash<String>()
+    /// The environment refused the docked picture, which stays in the window.
+    var dockRefused = Flash<Bool>()
     /// The last launch line shown, so one verdict is raised once.
     var launchShown: String?
 
@@ -80,5 +82,6 @@ struct SessionNotices {
         touchFallback.clear()
         accessWarning.clear()
         launch.clear()
+        dockRefused.clear()
     }
 }

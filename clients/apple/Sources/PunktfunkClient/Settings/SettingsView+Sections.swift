@@ -409,6 +409,17 @@ extension SettingsView {
                     options: VideoFit.allCases.map { (label: $0.label, tag: $0.rawValue) },
                     selection: scoped(SettingsFields.videoFit))
             }
+            #if os(visionOS)
+            // Where this headset shows the picture (tier G).
+            if !inPresetScope {
+                described("Where the picture shows: this window, or docked in the environment.") {
+                    settingPicker(
+                        "Screen",
+                        options: StreamScreen.allCases.map { (label: $0.label, tag: $0.rawValue) },
+                        selection: $screen)
+                }
+            }
+            #endif
             #if os(tvOS)
             tvBitrateRow
             #else

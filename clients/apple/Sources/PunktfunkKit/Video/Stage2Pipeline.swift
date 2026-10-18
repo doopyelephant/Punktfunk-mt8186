@@ -343,6 +343,7 @@ public enum PresentPacing: Sendable, Equatable {
 /// uncompressed sample adds no copy or second decode. Backpressure drops the frame instead of
 /// building a queue; the next decoder callback supplies a fresher image. Display-link polling maps
 /// the renderer's current IOSurface ID back to its capture/decode stamp for on-glass metrics.
+/// `feed` gets every surface ahead of that backpressure and never throttles or meters the stream.
 /// The renderer owns each sample after enqueue. Sendable because AVSampleBufferVideoRenderer
 /// explicitly permits background-thread enqueueing.
 final class DecodedVideoSink: @unchecked Sendable {
@@ -355,11 +356,13 @@ final class DecodedVideoSink: @unchecked Sendable {
     }
 
     private let renderer: AVSampleBufferVideoRenderer
+    private let feed: DockFeed?
     private let lock = NSLock()
     private var stamps: [IOSurfaceID: Stamp] = [:]
 
-    init(renderer: AVSampleBufferVideoRenderer) {
+    init(renderer: AVSampleBufferVideoRenderer, feed: DockFeed? = nil) {
         self.renderer = renderer
+        self.feed = feed
     }
 
     func reset() {
@@ -372,6 +375,7 @@ final class DecodedVideoSink: @unchecked Sendable {
     @discardableResult
     func submit(_ frame: ReadyFrame) -> Bool {
         guard case .video(let pixelBuffer, _) = frame.image else { return false }
+        feed?.put(pixelBuffer)
         if renderer.requiresFlushToResumeDecoding || renderer.status == .failed { reset() }
         guard renderer.isReadyForMoreMediaData,
               let sample = Self.immediateSample(pixelBuffer)
@@ -1174,12 +1178,14 @@ public final class Stage2Pipeline {
     /// overlay's stamps reach the core through the connection. Metering never gates the
     /// presenter choice. Returns nil if Metal can't be set up (headless / no GPU) — caller
     /// falls back to the stage-1 presenter. `pacing` also selects the decoded video sink when its
-    /// `videoRenderer` is supplied. `gateDepth` bounds glass presents; `vsyncPaced` schedules
+    /// `videoRenderer` is supplied; `dockFeed` gets each of its surfaces. `gateDepth` bounds glass
+    /// presents; `vsyncPaced` schedules
     /// macOS smoothness, while `adaptiveSlotPaced` schedules latency onto the ordinary
     /// display-link grid.
     public init?(
         endToEndMeter: LatencyMeter?,
         videoRenderer: AVSampleBufferVideoRenderer? = nil,
+        dockFeed: DockFeed? = nil,
         pacing: PresentPacing = .arrival,
         gateDepth: Int = 1,
         storePolicy: FrameStorePolicy = .newestWins,
@@ -1189,7 +1195,7 @@ public final class Stage2Pipeline {
         let decodedSink: DecodedVideoSink?
         if pacing == .decoded {
             guard let videoRenderer else { return nil }
-            decodedSink = DecodedVideoSink(renderer: videoRenderer)
+            decodedSink = DecodedVideoSink(renderer: videoRenderer, feed: dockFeed)
         } else {
             decodedSink = nil
         }

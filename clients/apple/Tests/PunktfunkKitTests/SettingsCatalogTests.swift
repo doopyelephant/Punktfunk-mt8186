@@ -20,6 +20,7 @@ final class SettingsCatalogTests: XCTestCase {
         "gyro_on_phone": "android.gyro_on_phone",
         "sc2_capture": "android.sc2_capture",
         "spatial_audio": "visionos.spatial_audio",
+        "screen": "visionos.screen",
     ]
 
     func testEveryCatalogueKeyIsStoredOrAbsent() throws {
