@@ -405,8 +405,8 @@ pub(crate) fn set_runtime_enabled(enabled: bool) -> Result<()> {
 }
 
 /// The ACL half of a grant, as `io::Error` for [`access::AccessStore`]: the runner's account,
-/// and `plugin`'s package when it is named, in one walk of the folder. POSIX needs none: the
-/// runner is the operator's own user unit.
+/// and `plugin`'s files capability when it is named, in one walk of the folder. POSIX needs
+/// none: the runner is the operator's own user unit.
 pub(crate) fn grant_acl(
     plugin: Option<&str>,
     dir: &std::path::Path,
@@ -432,7 +432,7 @@ pub(crate) fn open_for_players(dir: &std::path::Path) {
 #[cfg(not(windows))]
 pub(crate) fn open_for_players(_dir: &std::path::Path) {}
 
-/// Take the runner's ACE and `plugin`'s package ACE off a folder no plugin holds any more, in
+/// Take the runner's ACE and `plugin`'s capability ACE off a folder no plugin holds any more, in
 /// one walk. POSIX has none to take.
 pub(crate) fn revoke_acl(plugin: &str, dir: &std::path::Path) -> std::io::Result<()> {
     plat::revoke(plugin, dir).map_err(|e| std::io::Error::other(e.to_string()))

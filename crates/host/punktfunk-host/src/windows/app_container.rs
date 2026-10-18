@@ -1,6 +1,7 @@
 //! One AppContainer per plugin, `punktfunk.plugin.<id>`. The package SID is a function of the
 //! name, so the host (SYSTEM) derives it for a pipe's DACL while the runner's account creates
-//! the profile and spawns inside it; a token's package SID says who dialed a pipe.
+//! the profile and spawns inside it; a token's package SID says who dialed a pipe. Folder and
+//! key ACEs name the plugin's files capability instead ([`files_capability_sid`]).
 //!
 //! The spawned process inherits this one's stdio and dies with it: the job is kill-on-close
 //! and this process holds the only handle, so a runner that kills the helper kills the plugin.
@@ -62,8 +63,27 @@ pub(crate) fn package_sid(id: &str) -> Result<String> {
     sid_string(sid)
 }
 
+/// The capability that carries `id`'s folder and key ACEs, as `S-1-15-3-1024-…`: what
+/// `DeriveCapabilitySidsFromName` returns for the profile name. Never the package SID: a
+/// package ACE without `ALL APPLICATION PACKAGES` stops Chromium's sandboxed GPU process
+/// loading the DLLs under it, so a granted Steam or Epic folder would break that launcher.
+pub(crate) fn files_capability_sid(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let name: Vec<u8> = profile_name(id)
+        .to_ascii_uppercase()
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let parts: Vec<String> = Sha256::digest(&name)
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]).to_string())
+        .collect();
+    format!("S-1-15-3-1024-{}", parts.join("-"))
+}
+
 /// Run `program args…` inside the plugin's container and return its exit code. The profile is
-/// created for this account on first use. stdio is inherited.
+/// created for this account on first use. stdio is inherited. The token holds the manifest's
+/// network capabilities and the plugin's files capability.
 pub(crate) fn spawn(id: &str, network: bool, program: &Path, args: &[String]) -> Result<u32> {
     let name = wide(&profile_name(id));
     // SAFETY: `name` is NUL-terminated; a SID that comes back is `FreeSid`'d below.
@@ -89,7 +109,10 @@ pub(crate) fn spawn(id: &str, network: bool, program: &Path, args: &[String]) ->
     let _package = FreeOnDrop(package);
     let mut caps: Vec<SID_AND_ATTRIBUTES> = Vec::new();
     let mut cap_sids: Vec<Owned<HLOCAL>> = Vec::new();
-    for cap in capabilities(network) {
+    let files = files_capability_sid(id);
+    let mut wanted: Vec<&str> = capabilities(network);
+    wanted.push(&files);
+    for cap in wanted {
         let text = wide(cap);
         let mut sid = PSID::default();
         // SAFETY: `text` is NUL-terminated; `sid` is a LocalAlloc'd SID `Owned` frees after the
@@ -329,6 +352,20 @@ fn quote_arg(arg: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The value `DeriveCapabilitySidsFromName("punktfunk.plugin.steam")` returns on Windows 11.
+    #[test]
+    fn files_capability_matches_windows_derivation() {
+        assert_eq!(
+            super::files_capability_sid("steam"),
+            "S-1-15-3-1024-42683659-3768873154-1845156914-1956267154-3147658828-1401593325-\
+             3221848847-3511828927"
+        );
+        assert_ne!(
+            super::files_capability_sid("steam"),
+            super::files_capability_sid("epic")
+        );
+    }
+
     #[test]
     fn arguments_round_trip_the_windows_rules() {
         assert_eq!(super::quote_arg("plain"), "plain");
