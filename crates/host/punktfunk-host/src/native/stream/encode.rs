@@ -355,18 +355,18 @@ impl StreamState {
         };
         let owed = crate::send_pacing::owed_aus(&self.frame, &mut *self.enc, au_wait);
         let depth = if owed.is_some() { 1 } else { depth };
+        // Every backend gets the floor, the pixel-less driver encoder too: without it the
+        // driver's AMF/QSV/NVENC keep referencing frames the client never confirmed.
+        let floor = self.loss_mode.floor(
+            self.lossy_window.swap(false, Ordering::Relaxed),
+            self.acked.load(Ordering::Relaxed),
+            wire_index,
+            t_submit,
+        );
+        self.enc.set_reference_floor(floor);
         let submitted = match owed {
             Some(_) => Ok(()),
-            None => {
-                let floor = self.loss_mode.floor(
-                    self.lossy_window.swap(false, Ordering::Relaxed),
-                    self.acked.load(Ordering::Relaxed),
-                    wire_index,
-                    t_submit,
-                );
-                self.enc.set_reference_floor(floor);
-                self.enc.submit_indexed(&self.frame, wire_index)
-            }
+            None => self.enc.submit_indexed(&self.frame, wire_index),
         };
         if let Err(e) = submitted {
             let backoff = on_submit_error(&mut self.clock.watchdog, e, self.interval, || {
