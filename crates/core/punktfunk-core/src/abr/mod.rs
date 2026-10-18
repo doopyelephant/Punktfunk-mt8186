@@ -367,9 +367,13 @@ impl Driver {
         self.window.on_decode_latency(sum_us, count);
     }
 
-    /// The window's host encode-stage total and its sample count.
+    /// The window's host encode-stage total and its sample count. PyroWave's is
+    /// dropped: its encode time is per pixel, not per bit, so a rise is never the
+    /// rate's and a notch that seems to follow only follows the content.
     pub fn on_encode_latency(&mut self, sum_us: u64, count: u32) {
-        self.window.on_encode_latency(sum_us, count);
+        if self.codec != crate::quic::CODEC_PYROWAVE {
+            self.window.on_encode_latency(sum_us, count);
+        }
     }
 
     /// Decode-recovery keyframe asks that went out.
@@ -1189,6 +1193,34 @@ mod tests {
         assert!(off.iter().all(|w| w.0 > floor));
         assert_eq!(off[2].1, Some(floor));
         assert_eq!(off[3].1, None, "the fourth clears it");
+    }
+
+    /// PyroWave's encode time does not follow its rate, so a host encode rise costs an
+    /// Automatic session no notch: 2 ms for ten clean windows, then 30 ms against a
+    /// 16.7 ms budget, and no ask goes under the running rate.
+    #[test]
+    fn automatic_pyrowave_never_cuts_on_encode_time() {
+        let at = Instant::now();
+        let mut d = pyrowave_driver(at, Some(500_000));
+        let mut st = Stats::default();
+        let mut asks = Vec::new();
+        for ms in 1..40 * 750u64 {
+            st.packets_received += 170;
+            st.bytes_received += 250_000;
+            d.on_stats(&st);
+            if ms % 16 == 0 {
+                st.frames_completed += 1;
+                d.on_au(false);
+                d.on_encode_latency(if ms < 10 * 750 { 2_000 } else { 30_000 }, 1);
+            }
+            for a in d.tick(at + std::time::Duration::from_millis(ms)).actions {
+                if let Action::SetBitrate(kbps) = a {
+                    d.on_ack(kbps, Some(crate::quic::AckReason::Granted));
+                    asks.push(kbps);
+                }
+            }
+        }
+        assert!(asks.iter().all(|&kbps| kbps >= 2_000_000), "{asks:?}");
     }
 
     /// A `Pinned` ack leaves a PyroWave session without a controller: an explicit-rate
