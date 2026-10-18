@@ -61,6 +61,9 @@ pub(crate) struct SessionShared {
     /// `true` = the client draws the cursor (exclude + forward), `false` = the host composites.
     /// Stays `true`, and inert, for a session without the cursor cap.
     pub(crate) cursor_client_draws: Arc<AtomicBool>,
+    /// UDP send offload for the media sender. The control task's loss guard clears it once
+    /// for the session; a cleared switch sends every packet on its own.
+    pub(crate) offload_switch: Arc<AtomicBool>,
 }
 
 /// [`SessionShared::acked`] before the client confirmed a frame.
@@ -198,6 +201,7 @@ impl SessionWiring {
                 fec_target,
                 fec_requested,
                 link_kbps: Arc::new(AtomicU32::new(0)),
+                offload_switch: Arc::new(AtomicBool::new(true)),
                 shape: Arc::new(AtomicU8::new(0)),
                 ports,
                 resend: Arc::default(),
