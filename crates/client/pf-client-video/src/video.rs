@@ -553,6 +553,8 @@ pub struct Decoder {
     /// The presenter can re-sample its last picture until a new one displaces it, so its
     /// pools outlive the swap ([`RETIRE_HANDOVERS`]).
     retiring: Option<(Box<dyn Rung>, u32, std::time::Instant)>,
+    /// [`Self::set_decode_wake`]'s callback, re-armed on every rung the pump installs.
+    wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Negotiated `quic::CODEC_*` bit. Every rung map and the software refusal
     /// key on it, so a demotion rebuilds for the same codec.
     wire_codec: u8,
@@ -838,6 +840,7 @@ impl Decoder {
             Ok(Decoder {
                 ran: rung.id().into_iter().collect(),
                 retiring: None,
+                wake: None,
                 rung,
                 wire_codec: wire,
                 fails: 0,
@@ -943,6 +946,7 @@ impl Decoder {
             stream: StreamFormat::SDR_420_8,
             ran: Vec::new(),
             retiring: None,
+            wake: None,
         })
     }
 
@@ -954,9 +958,19 @@ impl Decoder {
 
     /// Swap the rung in and reset the old one's health. One place so a call
     /// site cannot forget [`Self::ran`] and loop the ladder.
+    /// Run `wake` off the pump's thread as each hardware decode completes, so the pump
+    /// can block for the next AU and the pixels at once ([`Rung::set_decode_wake`]).
+    pub fn set_decode_wake(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.rung.set_decode_wake(wake.clone());
+        self.wake = Some(wake);
+    }
+
     fn install(&mut self, rung: Box<dyn Rung>) {
         self.ran.extend(rung.id());
         let old = std::mem::replace(&mut self.rung, rung);
+        if let Some(wake) = &self.wake {
+            self.rung.set_decode_wake(wake.clone());
+        }
         if old.id() == Some(NativeRung::Vulkan) {
             self.retiring = Some((old, 0, std::time::Instant::now()));
         }

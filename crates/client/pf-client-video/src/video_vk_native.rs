@@ -223,6 +223,14 @@ impl Codec {
         }
     }
 
+    fn ash_device(&self) -> ash::Device {
+        match self {
+            Codec::H264(d) => d.ash_device(),
+            Codec::H265(d) => d.ash_device(),
+            Codec::Av1(d) => d.ash_device(),
+        }
+    }
+
     /// Bounded host wait on the decode-complete timeline (pump's sampled decode-latency).
     fn wait_decoded(&self, frame: &DecodedVkFrame, timeout_ns: u64) -> bool {
         match self {
@@ -522,6 +530,9 @@ const _: () = assert!(
 );
 
 pub(crate) struct NativeVulkanDecoder {
+    /// Wakes the pump as each shipped decode completes. Before `dec`: its drop joins the
+    /// wait before the device goes.
+    waiter: Option<pf_vkdecode::decoder::waiter::DoneWaiter>,
     dec: Codec,
     /// Cloned into every shipped guard. `Option` so teardown can drop this sender;
     /// then `release_rx` reports Disconnected once the last guard is gone.
@@ -699,6 +710,7 @@ impl NativeVulkanDecoder {
             }
         });
         Ok(NativeVulkanDecoder {
+            waiter: None,
             dec,
             release_tx: Some(release_tx),
             release_rx,
@@ -903,6 +915,9 @@ impl NativeVulkanDecoder {
                 token,
             ),
         );
+        if let Some(w) = &self.waiter {
+            w.arm(&frame);
+        }
         self.outstanding.push(Shipped {
             seq,
             frame,
@@ -916,6 +931,11 @@ impl NativeVulkanDecoder {
 
     /// Intel on i915: the decode wait is the media clock boost, and its GEM wait covers
     /// the whole bitstream ring, so the pump waits each AU at once rather than one behind.
+    /// Wake the pump as each shipped decode completes: the `Rung` hook, with the thread.
+    pub(crate) fn set_decode_wake(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.waiter = pf_vkdecode::decoder::waiter::DoneWaiter::spawn(self.dec.ash_device(), wake);
+    }
+
     pub(crate) fn boosted(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -996,7 +1016,10 @@ impl NativeVulkanDecoder {
         // Decides which kind of `Failed` this is ([`StatusVerdicts`]), never whether to drop.
         let status_queries = self.dec.status_queries();
         let Self {
-            dec, outstanding, ..
+            dec,
+            outstanding,
+            waiter,
+            ..
         } = self;
         for s in outstanding.iter_mut() {
             if s.resolved {
@@ -1057,6 +1080,10 @@ impl NativeVulkanDecoder {
             if !(s.released && s.resolved) {
                 return true;
             }
+            // A pool's last release destroys its semaphores: not under the waiter.
+            if let Some(w) = waiter.as_ref() {
+                w.settle(&s.frame);
+            }
             match dec.release_frame(&s.frame, s.presented) {
                 Ok(()) => {}
                 // Stale-generation frames release into the graveyard (rebuild retires
@@ -1072,6 +1099,8 @@ impl NativeVulkanDecoder {
 
 impl Drop for NativeVulkanDecoder {
     fn drop(&mut self) {
+        // Join the decode wait first: nothing below may destroy a semaphore under it.
+        drop(self.waiter.take());
         // Run loop drops the presenter's retired frame before joining this pump, so
         // tokens are in-channel or imminent. Bound below is that hand-off, not GPU work.
         // Frames never handed to the pump release unsampled.
