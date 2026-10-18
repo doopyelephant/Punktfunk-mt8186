@@ -36,7 +36,7 @@ pub fn display(b: &mut Build) {
 
     // The one form-level note, not repeated on every row.
     let picture = p.group("Picture", "Display changes apply from the next session.");
-    let (bitrate_field, bitrate) = bitrate_row();
+    let (bitrate_field, show_pyrowave_bitrate) = bitrate_row(b);
     b.put(&mut p, Some(&picture), bitrate_field);
     let fit = b.choice(&spec::VIDEO_FIT, VIDEO_FIT_LABELS);
     caption_follows(&fit, VIDEO_FIT_CAPTIONS);
@@ -80,11 +80,11 @@ pub fn display(b: &mut Build) {
     let (quality_field, show_quality) = pyrowave_quality_row(b);
     {
         let w = codec.widget().clone();
-        // PyroWave sets its own rate: its quality stands in for Bitrate.
+        // PyroWave sets its own rate: its quality stands in for Bitrate's, Automatic stays.
         codec.connect_changed(move |i| {
             set_row_subtitle(&w, codec_caption(i));
             let pyrowave = *at(CODECS, i) == "pyrowave";
-            bitrate.set_visible(!pyrowave);
+            show_pyrowave_bitrate(pyrowave);
             show_quality(pyrowave);
         });
     }
@@ -376,16 +376,49 @@ fn size_row(title: &str, min: u32) -> adw::SpinRow {
     row
 }
 
-/// 1 Mbit/s per step: the rungs that matter on a thin link are 3, 4, 6.
-fn bitrate_row() -> (Field, adw::SpinRow) {
+/// 1 Mbit/s per step: the rungs that matter on a thin link are 3, 4, 6. Under PyroWave the
+/// quality row stands in for the rate and Bitrate offers Automatic or Fixed, which only move
+/// the spin between 0 and a fixed rate. The returned closure swaps the two rows.
+fn bitrate_row(b: &Build) -> (Field, Rc<dyn Fn(bool)>) {
+    use pf_client_core::settings::{PYROWAVE_BITRATE_HINT, PYROWAVE_FIXED_KBPS};
     let row = adw::SpinRow::with_range(0.0, 3000.0, 1.0);
     row.set_title(spec::BITRATE.title);
     row.set_subtitle(spec::BITRATE.caption);
+    let auto = b.choice(&spec::BITRATE, &["Automatic", "Fixed"]);
+    set_row_subtitle(auto.widget(), PYROWAVE_BITRATE_HINT);
+    auto.widget().set_visible(false);
+    {
+        let r = row.clone();
+        auto.connect_changed(move |i| {
+            let fixed = i == 1;
+            if fixed == (r.value() == 0.0) {
+                r.set_value(if fixed {
+                    f64::from(PYROWAVE_FIXED_KBPS) / 1000.0
+                } else {
+                    0.0
+                });
+            }
+        });
+        let a = auto.clone();
+        row.connect_value_notify(move |r| {
+            let fixed = u32::from(r.value() != 0.0);
+            if a.selected() != fixed {
+                a.set_selected(fixed);
+            }
+        });
+    }
+    let show: Rc<dyn Fn(bool)> = {
+        let (row, auto) = (row.clone(), auto.widget().clone());
+        Rc::new(move |pyrowave| {
+            row.set_visible(!pyrowave);
+            auto.set_visible(pyrowave);
+        })
+    };
     let r = row.clone();
     let field = Field::new(
         &spec::BITRATE,
         &row,
-        vec![row.clone().upcast()],
+        vec![row.clone().upcast(), auto.widget().clone().upcast()],
         {
             let r = r.clone();
             move |s| r.set_value(f64::from(s.bitrate_kbps) / 1000.0)
@@ -399,7 +432,7 @@ fn bitrate_row() -> (Field, adw::SpinRow) {
             r.connect_value_notify(move |_| f());
         },
     );
-    (field, row)
+    (field, show)
 }
 
 /// PyroWave quality: a slider from 0.5 to 2 bits per pixel by tenths that never shows them.

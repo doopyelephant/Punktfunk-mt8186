@@ -906,7 +906,7 @@ pub fn row_on(id: RowId, platform: crate::platform::Platform) -> bool {
 
 /// The codec setting is PyroWave on a device that decodes it and dials its quality: the
 /// session's rate is the quality's, not Bitrate's.
-fn pyrowave_rate(ctx: &Ctx) -> bool {
+pub(super) fn pyrowave_rate(ctx: &Ctx) -> bool {
     ctx.settings.codec == "pyrowave"
         && ctx.device.pyrowave_ok
         && row_on(RowId::PyroWaveQuality, ctx.device.platform)
@@ -917,8 +917,8 @@ fn pyrowave_rate(ctx: &Ctx) -> bool {
 /// Echo cancel and pad rows dim under a parent switch so the relationship stays
 /// visible. Smoothness buffer is a knob on one of two intents — under Lowest
 /// latency the quantity does not exist, so the row is dropped. It sits directly
-/// below the intent row so the cursor is never on a row that vanishes. Bitrate and
-/// PyroWave quality trade places with the codec.
+/// below the intent row so the cursor is never on a row that vanishes. PyroWave quality
+/// comes and goes with the codec; Bitrate stays, as Automatic or Fixed under PyroWave.
 pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
     let apple = ctx.device.platform == crate::platform::Platform::Apple;
     match id {
@@ -931,8 +931,6 @@ pub fn row_applies(id: RowId, ctx: &Ctx) -> bool {
             !ctx.device.tv
         }
         RowId::SmoothBuffer => ctx.settings.present_priority == "smooth",
-        // PyroWave sets its own rate, so its quality stands where Bitrate stood.
-        RowId::Bitrate => !pyrowave_rate(ctx),
         RowId::PyroWaveQuality => pyrowave_rate(ctx),
         // Needs `fallback_ui`; otherwise off strands the user with no UI.
         RowId::GamepadUi => ctx.device.fallback_ui,
@@ -1347,6 +1345,8 @@ fn row_spec_base(id: RowId, ctx: &Ctx, presets: &[(String, String)]) -> RowSpec 
             "Bitrate",
             if s.bitrate_kbps == 0 {
                 "Automatic".into()
+            } else if pyrowave_rate(ctx) {
+                "Fixed".into()
             } else {
                 bitrate_label(s.bitrate_kbps)
             },
@@ -1600,10 +1600,8 @@ pub fn detail(id: RowId, ctx: &Ctx) -> &'static str {
             "When the stream's shape differs from this window. Fit shows the whole picture \
              with black bars, Crop to fill cuts the edges off, Stretch to fill distorts it."
         }
-        RowId::PyroWaveQuality => {
-            "Higher is sharper and needs a faster wired link. On a weak network the stream \
-             sends less on its own."
-        }
+        RowId::PyroWaveQuality => "Higher is sharper and needs a faster wired link.",
+        RowId::Bitrate if pyrowave_rate(ctx) => pf_client_core::settings::PYROWAVE_BITRATE_HINT,
         RowId::Bitrate => {
             "Automatic adapts to the network as you play. Press to type a fixed rate, up to \
              2 Gbps."
@@ -1960,6 +1958,7 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
     let platform = ctx.device.platform;
     let fams = families(ctx.device.screen);
     let window = has_window(ctx.device);
+    let pyrowave = pyrowave_rate(ctx);
     let s = &mut *ctx.settings;
     match id {
         RowId::Resolution => {
@@ -2022,6 +2021,12 @@ pub fn adjust(id: RowId, delta: i32, wrap: bool, ctx: &mut Ctx) -> bool {
                 .position(|(v, _)| *v == VideoFit::from_name(&s.video_fit).name());
             step_option(cur, VIDEO_FITS.len(), delta, wrap)
                 .map(|i| s.video_fit = VIDEO_FITS[i].0.to_string())
+        }
+        // Automatic or Fixed: the quality row stands in for the rate.
+        RowId::Bitrate if pyrowave => {
+            let rates = [0, pf_client_core::settings::PYROWAVE_FIXED_KBPS];
+            step_option(Some(usize::from(s.bitrate_kbps != 0)), 2, delta, wrap)
+                .map(|i| s.bitrate_kbps = rates[i])
         }
         RowId::Bitrate => {
             // Off-ladder must not snap to Automatic (index 0). Step to the neighbour

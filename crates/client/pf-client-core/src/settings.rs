@@ -394,6 +394,15 @@ pub const FULLSCREEN_ALWAYS_KEY: &str = "fullscreen_always";
 pub const GAMEPAD_UI_KEY: &str = "gamepad_ui_enabled";
 pub const GAMEPAD_UI_MODE_KEY: &str = "gamepad_ui_mode";
 
+/// Bitrate's hint under PyroWave, where the row offers Automatic or Fixed and the quality row
+/// stands in for the rate. Fixed stores any non-zero rate; the host pins it at the quality.
+pub const PYROWAVE_BITRATE_HINT: &str =
+    "Automatic lowers PyroWave quality while the network falls short; Fixed always streams at \
+     your quality.";
+/// The rate Fixed stores under PyroWave, kbps. The host pins the session at the quality, so
+/// only "not zero" counts; another codec reads it as Bitrate's fixed rate.
+pub const PYROWAVE_FIXED_KBPS: u32 = 20_000;
+
 /// When the controller-optimized UI (the console) takes over the desktop layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GamepadUi {

@@ -917,8 +917,8 @@ private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, con
 
     // The GPU probe, not a MediaCodec one — PyroWave decodes as Vulkan compute.
     val pyrowaveCapable = remember { VideoDecoders.pyrowaveCapable() }
-    // PyroWave sets its own rate: its quality, after the codec row, stands in for Bitrate. The
-    // stored rate is kept for the other codecs.
+    // PyroWave sets its own rate: its quality, after the codec row, stands in for Bitrate's, and
+    // Bitrate offers Automatic or Fixed. The stored rate is kept for the other codecs.
     val pyrowaveOn = s.codec == "pyrowave" && pyrowaveCapable
     // HDR is only meaningful on a panel that can present HDR10; on an SDR display the toggle is
     // disabled (and HDR is never advertised) so the host doesn't send PQ the panel mis-tone-maps.
@@ -938,7 +938,18 @@ private fun DisplaySettings(s: Settings, update: (String, Settings) -> Unit, con
         // Custom is read from the stored rate, like the resolution above; the flag only keeps the
         // field open between picking "Custom…" and typing a number.
         val showCustomBitrate = !pyrowaveOn && (customBitratePicked || s.isCustomBitrate())
-        if (!pyrowaveOn) {
+        if (pyrowaveOn) {
+            val fixed = PyroWaveQuality.FIXED_KBPS
+            SettingDropdown(
+                label = "Bitrate",
+                options = listOf(0 to "Automatic", fixed to "Fixed"),
+                selected = if (s.bitrateKbps == 0) 0 else fixed,
+                field = "bitrate_kbps",
+                caption = PyroWaveQuality.BITRATE_HINT,
+            ) { kbps ->
+                if ((kbps == 0) != (s.bitrateKbps == 0)) update("bitrate_kbps", s.copy(bitrateKbps = kbps))
+            }
+        } else {
             SettingDropdown(
                 label = "Bitrate",
                 options = BITRATE_OPTIONS + (CUSTOM_BITRATE to

@@ -21,6 +21,14 @@ object PyroWaveQuality {
     private const val KIND_WIFI = 2
     private const val KIND_OTHER = 3
 
+    /** Bitrate under PyroWave offers Automatic or Fixed; Fixed stores this. The host pins the
+     *  session at the quality, so only "not zero" counts. Core's `PYROWAVE_FIXED_KBPS`. */
+    const val FIXED_KBPS = 20_000
+
+    /** Core's `PYROWAVE_BITRATE_HINT`, Bitrate's caption under PyroWave. */
+    const val BITRATE_HINT = "Automatic lowers PyroWave quality while the network falls short; " +
+        "Fixed always streams at your quality."
+
     /** [bpp] on the nearest tenth inside [RANGE]. */
     fun snapped(bpp: Double): Double = (bpp.coerceIn(0.5, 2.0) * 10).roundToInt() / 10.0
 
