@@ -26,8 +26,8 @@ cd "$(dirname "$0")/.." || exit 2
 DIR=crates/core/punktfunk-core/src/abr
 TEST="cargo test -p punktfunk-core --features quic --lib abr::"
 BACKUP=$(mktemp -d)
-cp "$DIR"/*.rs "$BACKUP/"
-restore() { cp "$BACKUP"/*.rs "$DIR/"; }
+cp -R "$DIR/." "$BACKUP/"
+restore() { cp -R "$BACKUP/." "$DIR/"; }
 trap 'restore; rm -rf "$BACKUP"' EXIT INT TERM
 
 # Constants whose mutation the simulator cannot see, with the reason.
@@ -138,8 +138,8 @@ printf '%s\n' "$MUTATIONS" | while IFS='|' read -r name from to; do
     restore
     # The declaration is a substring of its line (the visibility prefix is
     # not in the table), and carries no sed metacharacter.
-    file=$(grep -lF "$from" "$DIR"/*.rs | head -1)
-    [ -n "$file" ] && sed "s|$from|$to|" "$BACKUP/$(basename "$file")" > "$file"
+    file=$(grep -rlF --include='*.rs' "$from" "$DIR" | head -1)
+    [ -n "$file" ] && sed "s|$from|$to|" "$BACKUP/${file#"$DIR"/}" > "$file"
     if [ -z "$file" ] || ! grep -qF "$to" "$file"; then
         printf '::error::%-31s the mutation did not apply — the constant moved\n' "$name"
         echo "APPLY-FAILED $name" >> "$BACKUP.green"
