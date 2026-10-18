@@ -9,9 +9,11 @@
 
 import { Copy, Pause, Play } from "lucide-react";
 import { type FC, useEffect, useState } from "react";
-import { useGetStatus } from "@/api/gen/host/host";
+import { useGetHostInfo, useGetStatus } from "@/api/gen/host/host";
 import type { PadFrame } from "@/api/gen/model/padFrame";
 import type { SessionRow } from "@/api/gen/model/sessionRow";
+import { useListProfiles } from "@/api/gen/profiles/profiles";
+import { isFullSeat } from "@/api/seat";
 import { QueryState } from "@/components/query-state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -69,7 +71,18 @@ const SessionPads: FC<{ sessions: (SessionRow & { id: number })[] }> = ({
 	const [chosen, setChosen] = useState(first?.id);
 	const session = sessions.find((s) => s.id === chosen) ?? first;
 	const [paused, setPaused] = useState(false);
-	const feed = usePadFeed(session?.id, paused);
+	// On a door the session runs on a seat's host: its pads stream from there, through the box.
+	const host = useGetHostInfo();
+	const profiles = useListProfiles({ query: { retry: false } });
+	const seatOf = (s: SessionRow | undefined): string | null => {
+		const profile = profiles.data?.find((p) => p.id === s?.profile?.id);
+		return host.data?.door === true &&
+			profile &&
+			isFullSeat(profile, host.data.os, true)
+			? profile.id
+			: null;
+	};
+	const feed = usePadFeed(session?.id, paused, seatOf(session));
 	if (!session) return null;
 
 	return (

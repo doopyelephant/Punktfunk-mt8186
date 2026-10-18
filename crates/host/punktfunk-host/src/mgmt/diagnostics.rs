@@ -21,15 +21,9 @@ use crate::diagnostics::{CheckSource, DiagnosticsReport};
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn get_diagnostics() -> Json<DiagnosticsReport> {
-    Json(
-        with_owner(
-            crate::diagnostics::registry().report(),
-            "GET",
-            "diagnostics",
-        )
-        .await,
-    )
+pub(crate) async fn get_diagnostics(State(st): State<Arc<MgmtState>>) -> Json<DiagnosticsReport> {
+    let own = crate::diagnostics::registry().report();
+    Json(with_owner(&st, own, "GET", "diagnostics").await)
 }
 
 /// Re-run every probe
@@ -46,7 +40,9 @@ pub(crate) async fn get_diagnostics() -> Json<DiagnosticsReport> {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn refresh_diagnostics() -> Json<DiagnosticsReport> {
+pub(crate) async fn refresh_diagnostics(
+    State(st): State<Arc<MgmtState>>,
+) -> Json<DiagnosticsReport> {
     // Probes `stat` sysfs and shell out to `id`; NSS on a remote directory can block.
     let report = tokio::task::spawn_blocking(|| {
         let reg = crate::diagnostics::registry();
@@ -55,27 +51,21 @@ pub(crate) async fn refresh_diagnostics() -> Json<DiagnosticsReport> {
     })
     .await
     .unwrap_or_else(|_| crate::diagnostics::registry().report());
-    Json(with_owner(report, "POST", "diagnostics/refresh").await)
+    Json(with_owner(&st, report, "POST", "diagnostics/refresh").await)
 }
 
 /// `own`, merged on a door with what the owner's host answers to `method` `path`. The door opens
 /// no device and runs no plugin, so the owner's host is where those checks mean anything. The
 /// door's alone while that host is down; asking never starts the owner's session.
 async fn with_owner(
+    st: &MgmtState,
     own: DiagnosticsReport,
-    method: &'static str,
-    path: &'static str,
+    method: &str,
+    path: &str,
 ) -> DiagnosticsReport {
-    if !crate::seats::is_door() {
-        return own;
-    }
-    match super::owner::call(method, path.into(), None, Vec::new(), false).await {
-        super::owner::Answer::Reply(200, _, body) => {
-            match serde_json::from_slice::<DiagnosticsReport>(&body) {
-                Ok(owner) => own.merged(owner),
-                Err(_) => own,
-            }
-        }
-        _ => own,
+    let body = st.owner_call(method, path, None, false).await.ok_body();
+    match body.and_then(|b| serde_json::from_slice::<DiagnosticsReport>(&b).ok()) {
+        Some(owner) => own.merged(owner),
+        None => own,
     }
 }

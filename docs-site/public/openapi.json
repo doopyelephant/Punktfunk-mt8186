@@ -2361,6 +2361,51 @@
         }
       }
     },
+    "/api/v1/events/relay": {
+      "post": {
+        "tags": [
+          "events"
+        ],
+        "summary": "Relay an event from the box's door",
+        "description": "The door pairs and places, so `pairing.*`, `access.*`, `host.*`, `action.*` and `update.*`\nhappen there; this host's hooks run on them from here. Admin lane only: the door holds this\nhost's token. The event joins this host's bus as new.",
+        "operationId": "relayEvent",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RelayedEvent"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "The event is on this host's bus"
+          },
+          "400": {
+            "description": "Not a host event",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/game/end": {
       "post": {
         "tags": [
@@ -12550,6 +12595,10 @@
                 "format": "int32",
                 "minimum": 0
               },
+              "seat": {
+                "type": "string",
+                "description": "On a door, the profile whose host raised it: a seat's event, on the door's bus for the\nconsole. Absent on the host's own."
+              },
               "seq": {
                 "type": "integer",
                 "format": "int64",
@@ -15092,6 +15141,19 @@
               "$ref": "#/components/schemas/SessionSummary"
             },
             "description": "Newest first. Bounded in memory and lost on a host restart — this is the last\nfew sessions, not a history."
+          }
+        }
+      },
+      "RelayedEvent": {
+        "type": "object",
+        "description": "One event as another host's `GET /events` framed it. Wrapped, because a tagged union is no\nrequest body for every client generator.",
+        "required": [
+          "event"
+        ],
+        "properties": {
+          "event": {
+            "type": "object",
+            "description": "A `HostEvent`, as the `data:` of one frame."
           }
         }
       },

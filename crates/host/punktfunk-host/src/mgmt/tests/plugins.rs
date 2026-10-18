@@ -64,6 +64,7 @@ async fn a_refreshed_plugin_token_takes_effect_live() {
         None,
         false,
         false,
+        None,
     ));
     *tokens
         .write()

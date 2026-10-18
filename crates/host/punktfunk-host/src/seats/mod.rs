@@ -6,6 +6,7 @@
 //! reach: a user's own host never lists seats. Elsewhere there is none, every call answers so,
 //! and no connect is placed.
 
+pub(crate) mod events;
 #[cfg(any(windows, target_os = "linux"))]
 pub(crate) mod lifecycle;
 pub(crate) mod placement;
@@ -92,6 +93,8 @@ pub(crate) struct Snapshot {
     pub seats: Vec<pf_seats::Seat>,
     /// Seat id → who streams there, for each running seat whose host answered.
     pub occupants: BTreeMap<String, Vec<Occupant>>,
+    /// Seat id → its host's `/status` as it answered, for the same seats.
+    pub statuses: BTreeMap<String, serde_json::Value>,
 }
 
 impl Snapshot {
@@ -167,6 +170,7 @@ pub(crate) fn ledger() -> Snapshot {
         single_session: single_session(),
         seats,
         occupants: BTreeMap::new(),
+        statuses: BTreeMap::new(),
     }
 }
 
@@ -189,9 +193,14 @@ pub(crate) fn snapshot() -> Arc<Snapshot> {
         cache.epoch
     };
     let mut snap = ledger();
-    snap.occupants = ask_hosts(&snap.seats)
+    snap.statuses = ask_hosts(&snap.seats)
         .into_iter()
-        .filter_map(|(id, who)| Some((id, who?)))
+        .filter_map(|(id, status)| Some((id, status?)))
+        .collect();
+    snap.occupants = snap
+        .statuses
+        .iter()
+        .map(|(id, status)| (id.clone(), occupants_in(status)))
         .collect();
     let snap = Arc::new(snap);
     let mut cache = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -208,20 +217,28 @@ pub(crate) fn invalidate() {
     cache.last = None;
 }
 
-/// Who plays on each running seat, `None` where its host didn't answer. The hosts are asked at
+/// Each running seat's `/status`, `None` where its host didn't answer. The hosts are asked at
 /// once: a hung one costs one timeout, not one per seat.
-fn ask_hosts(seats: &[pf_seats::Seat]) -> BTreeMap<String, Option<Vec<Occupant>>> {
+fn ask_hosts(seats: &[pf_seats::Seat]) -> BTreeMap<String, Option<serde_json::Value>> {
     std::thread::scope(|scope| {
         let asked: Vec<_> = seats
             .iter()
             .filter(|s| s.runtime.state == pf_seats::RuntimeState::Running)
-            .map(|s| (s.id.as_str().to_string(), scope.spawn(move || occupants(s))))
+            .map(|s| (s.id.as_str().to_string(), scope.spawn(move || status_of(s))))
             .collect();
         asked
             .into_iter()
             .map(|(id, asked)| (id, asked.join().ok().flatten()))
             .collect()
     })
+}
+
+/// [`ask_hosts`] read as who plays where.
+fn ask_who(seats: &[pf_seats::Seat]) -> BTreeMap<String, Option<Vec<Occupant>>> {
+    ask_hosts(seats)
+        .into_iter()
+        .map(|(id, status)| (id, status.as_ref().map(occupants_in)))
+        .collect()
 }
 
 /// Whether this host has seats to ask: a Linux door, or Windows with seats turned on.
@@ -235,7 +252,7 @@ fn any_on_a_seat(holds: impl Fn(&Occupant) -> bool) -> Option<bool> {
     if !in_play() {
         return Some(false);
     }
-    seen_on(&ask_hosts(&list().ok()?), holds)
+    seen_on(&ask_who(&list().ok()?), holds)
 }
 
 /// A device seen on an answering seat is a yes. Otherwise a seat that didn't answer leaves it
@@ -324,9 +341,8 @@ pub(crate) struct Occupant {
 /// Loopback is local: a seat that does not answer in this long is not serving.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Who streams on `seat` right now, from its host's loopback `/status`. `None` when the seat
-/// host does not answer.
-pub(crate) fn occupants(seat: &pf_seats::Seat) -> Option<Vec<Occupant>> {
+/// `seat`'s host's loopback `/status`. `None` when the seat host does not answer.
+fn status_of(seat: &pf_seats::Seat) -> Option<serde_json::Value> {
     let client = crate::ctl::client::Client::seat(
         seat_pin(seat)?,
         &host_dir(seat),
@@ -334,21 +350,31 @@ pub(crate) fn occupants(seat: &pf_seats::Seat) -> Option<Vec<Occupant>> {
         Some(STATUS_TIMEOUT),
     )
     .ok()?;
-    let status = client.get("/api/v1/status").ok()?;
-    let rows = status.get("sessions")?.as_array()?;
-    Some(
-        rows.iter()
-            .filter_map(|row| {
-                Some(Occupant {
-                    client: row.get("client")?.as_str()?.to_string(),
-                    name: row
-                        .get("client_name")
-                        .and_then(|n| n.as_str())
-                        .map(str::to_string),
-                })
+    client.get("/api/v1/status").ok()
+}
+
+/// Who streams on a seat, as its `/status` lists them.
+pub(crate) fn occupants_in(status: &serde_json::Value) -> Vec<Occupant> {
+    status
+        .get("sessions")
+        .and_then(|rows| rows.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some(Occupant {
+                client: row.get("client")?.as_str()?.to_string(),
+                name: row
+                    .get("client_name")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_string),
             })
-            .collect(),
-    )
+        })
+        .collect()
+}
+
+/// Who streams on `seat` right now. `None` when the seat host does not answer.
+pub(crate) fn occupants(seat: &pf_seats::Seat) -> Option<Vec<Occupant>> {
+    status_of(seat).as_ref().map(occupants_in)
 }
 
 /// Ends every session on `seat` through its host's loopback API. `false` when it didn't answer.
@@ -372,34 +398,75 @@ fn stop_on(seat: &pf_seats::Seat, path: &str) -> bool {
         .is_ok()
 }
 
-/// A seat host's API, for the console's proxy: `path_and_query` under `/api/v1/`. `None` when
-/// the seat host doesn't answer.
+/// `call` on `seat`'s host's API, for the door and the console's proxy. `None` when the seat
+/// host doesn't answer. A tail has no deadline: it ends when the caller lets go.
 pub(crate) fn forward(
     seat: &pf_seats::Seat,
-    method: &str,
-    path_and_query: &str,
-    content_type: Option<&str>,
-    body: Vec<u8>,
-) -> Option<(u16, Option<String>, Vec<u8>)> {
-    let client = crate::ctl::client::Client::seat(
-        seat_pin(seat)?,
-        &host_dir(seat),
-        seat.mgmt_port,
-        Some(PROXY_TIMEOUT),
-    )
-    .ok()?;
-    client
-        .raw(
-            method,
-            &format!("/api/v1/{path_and_query}"),
-            content_type,
-            body,
-        )
-        .ok()
+    call: crate::mgmt::owner::Forwarded,
+) -> Option<crate::mgmt::owner::Answer> {
+    use crate::mgmt::owner::Answer;
+    let timeout = (!call.stream).then_some(PROXY_TIMEOUT);
+    let client =
+        crate::ctl::client::Client::seat(seat_pin(seat)?, &host_dir(seat), seat.mgmt_port, timeout)
+            .ok()?;
+    let path = format!("/api/v1/{}", call.target);
+    let sent = client.send(
+        &call.method,
+        &path,
+        call.content_type.as_deref(),
+        call.device.as_deref(),
+        call.body,
+    );
+    let (status, content_type, body) = sent.ok()?;
+    if call.stream {
+        return Some(Answer::Stream(status, content_type, tail_body(body)));
+    }
+    let bytes = crate::ctl::client::read_capped(body, crate::ctl::client::RAW_BODY_LIMIT).ok()?;
+    Some(Answer::Reply(status, content_type, bytes))
+}
+
+/// `path` (under `/api/v1/`) on `seat`'s host as it arrives, for as long as both sides keep
+/// it. `None` when the seat host doesn't answer, or answers with anything but a `200`.
+pub(crate) fn tail(seat: &pf_seats::Seat, path: &str) -> Option<Box<dyn std::io::Read + Send>> {
+    let client =
+        crate::ctl::client::Client::seat(seat_pin(seat)?, &host_dir(seat), seat.mgmt_port, None)
+            .ok()?;
+    let (status, _, body) = client
+        .send("GET", &format!("/api/v1/{path}"), None, None, Vec::new())
+        .ok()?;
+    (status == 200).then_some(body)
 }
 
 /// A proxied library page with art can take a while on a cold seat.
 const PROXY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `body` as it arrives, on a thread of its own: a reader that blocks must not hold a worker.
+/// Dropping the body ends the read, and with it the connection.
+fn tail_body(mut body: Box<dyn std::io::Read + Send>) -> axum::body::Body {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+    std::thread::Builder::new()
+        .name("seat-tail".into())
+        .spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                let sent = match body.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => tx.blocking_send(Ok(axum::body::Bytes::copy_from_slice(&buf[..n]))),
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        break;
+                    }
+                };
+                if sent.is_err() {
+                    break;
+                }
+            }
+        })
+        .ok();
+    axum::body::Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    }))
+}
 
 #[cfg(test)]
 mod tests {

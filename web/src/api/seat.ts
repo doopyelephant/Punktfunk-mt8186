@@ -86,6 +86,10 @@ function bind<O extends object>(
 
 const clients = new Map<string, QueryClient>();
 
+/** The cache of seat `id`, when a page has opened it; a seat nobody looked at holds nothing. */
+export const seatClientIfAny = (id: string): QueryClient | undefined =>
+	clients.get(id);
+
 /**
  * The cache of seat `id`, whose every query and mutation goes to that seat's host.
  *

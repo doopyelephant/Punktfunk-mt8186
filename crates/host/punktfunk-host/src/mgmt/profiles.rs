@@ -1405,33 +1405,47 @@ pub(crate) async fn proxy_profile_seat(
             "The owner's session is starting. Try again in a moment.",
         );
     }
-    let target = seat_target(&rest, uri.query());
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let method = method.as_str().to_string();
-    let forwarded = blocking("seat", move || {
-        crate::seats::forward(
-            &row,
-            &method,
-            &target,
-            content_type.as_deref(),
-            body.to_vec(),
-        )
-    });
+    let call = super::owner::Forwarded {
+        method: method.as_str().to_string(),
+        target: seat_target(&rest, uri.query()),
+        content_type: headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string),
+        body: body.to_vec(),
+        device: None,
+        stream: super::owner::tail(&rest),
+        start: false,
+    };
+    let forwarded = blocking("seat", move || crate::seats::forward(&row, call));
     let answer = match forwarded.await {
-        Ok(answer) => answer,
+        Ok(Some(answer)) => answer,
+        Ok(None) => {
+            return api_error(
+                StatusCode::BAD_GATEWAY,
+                "The seat didn't answer. Start it, then try again.",
+            )
+        }
         Err(resp) => return resp,
     };
-    let Some((status, content_type, bytes)) = answer else {
-        return api_error(
-            StatusCode::BAD_GATEWAY,
-            "The seat didn't answer. Start it, then try again.",
-        );
-    };
-    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-    seat_answer(status, content_type.as_deref(), bytes)
+    match answer {
+        super::owner::Answer::Reply(status, content_type, bytes) => seat_answer(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            content_type.as_deref(),
+            bytes,
+        ),
+        // A tail is the seat host's own event frames: text, never a page.
+        super::owner::Answer::Stream(status, _, body) => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut resp = (status, body).into_response();
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("text/event-stream"),
+            );
+            resp
+        }
+        other => other.into_response(),
+    }
 }
 
 /// A seat host's answer, relayed on the console's origin. Only JSON and images keep their
@@ -1493,6 +1507,7 @@ mod tests {
             single_session: false,
             seats: vec![seat],
             occupants,
+            statuses: Default::default(),
         }
     }
 

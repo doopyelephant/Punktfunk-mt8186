@@ -281,7 +281,25 @@ pub(crate) async fn require_auth(
     };
     let presented = bearer(&req);
     match presented {
-        Some(token) if token_eq(token, expected) => forward(req, next, AuthLane::Admin).await,
+        Some(token) if token_eq(token, expected) => match vouched(&req) {
+            // The door, holding this host's token, calls for a device it placed here: the
+            // device's own lane, under the device's own pairing as this host holds it.
+            Some(fp) => {
+                let paired = st
+                    .native
+                    .as_ref()
+                    .is_some_and(|n| n.effective(&fp, crate::clock::unix_secs()).is_some());
+                if paired && cert_may_access(req.method(), req.uri().path()) {
+                    forward_device(req, next, fp).await
+                } else {
+                    api_error(
+                        StatusCode::UNAUTHORIZED,
+                        "the vouched device is not paired here, or may not reach this route",
+                    )
+                }
+            }
+            None => forward(req, next, AuthLane::Admin).await,
+        },
         // Same loopback confinement. Checked AFTER the admin token so equal tokens
         // (operator misconfiguration) degrade to full access, never to a lockout.
         Some(token)
@@ -320,6 +338,15 @@ pub(crate) async fn require_auth(
             "missing or invalid credentials (a paired device, or a bearer token)",
         ),
     }
+}
+
+/// A device the admin caller vouches for: the door, passing on a call a device made to it.
+pub(crate) const VOUCH_HEADER: &str = "x-punktfunk-device";
+
+/// The vouched device's fingerprint, when the request carries one that could be a fingerprint.
+fn vouched(req: &Request) -> Option<String> {
+    let fp = req.headers().get(VOUCH_HEADER)?.to_str().ok()?.trim();
+    (fp.len() == 64 && fp.bytes().all(|b| b.is_ascii_hexdigit())).then(|| fp.to_ascii_lowercase())
 }
 
 /// The `Authorization: Bearer` value, if there is one. Every lane that takes a token reads it

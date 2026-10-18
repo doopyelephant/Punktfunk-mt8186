@@ -90,6 +90,42 @@ fn sse_event(ev: &crate::events::HostEvent) -> Event {
         .data(serde_json::to_string(ev).unwrap_or_else(|_| "{}".to_string()))
 }
 
+/// One event as another host's `GET /events` framed it. Wrapped, because a tagged union is no
+/// request body for every client generator.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct RelayedEvent {
+    /// A `HostEvent`, as the `data:` of one frame.
+    #[schema(value_type = Object)]
+    event: serde_json::Value,
+}
+
+/// Relay an event from the box's door
+///
+/// The door pairs and places, so `pairing.*`, `access.*`, `host.*`, `action.*` and `update.*`
+/// happen there; this host's hooks run on them from here. Admin lane only: the door holds this
+/// host's token. The event joins this host's bus as new.
+#[utoipa::path(
+    post,
+    path = "/events/relay",
+    tag = "events",
+    operation_id = "relayEvent",
+    request_body = RelayedEvent,
+    responses(
+        (status = ACCEPTED, description = "The event is on this host's bus"),
+        (status = BAD_REQUEST, description = "Not a host event", body = ApiError),
+        (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
+    )
+)]
+pub(crate) async fn relay_event(ApiJson(body): ApiJson<RelayedEvent>) -> Response {
+    match serde_json::from_value::<crate::events::HostEvent>(body.event) {
+        Ok(ev) => {
+            crate::events::emit(ev.kind);
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(e) => api_error(StatusCode::BAD_REQUEST, &format!("not a host event: {e}")),
+    }
+}
+
 /// Dropping the SSE body drops `_slot` and the broadcast receiver (cap + subscription).
 struct StreamState {
     pending: VecDeque<Event>,

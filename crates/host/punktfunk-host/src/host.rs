@@ -351,8 +351,15 @@ pub fn serve(
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let native_opts = crate::native::native_serve_opts(&native);
         // Hook runner consumes the live event tail for the host's lifetime. Spawned
-        // before `host.started` so operator hooks observe the full lifecycle.
-        tokio::spawn(crate::hooks::runner());
+        // before `host.started` so operator hooks observe the full lifecycle. A door runs
+        // none: its events reach the owner's host, whose hooks run in the owner's session,
+        // and the seats' events reach the door's bus for the console.
+        if pf_paths::seat::role().is_door() {
+            crate::seats::events::fan_in();
+            tokio::spawn(crate::seats::events::relay_to_owner());
+        } else {
+            tokio::spawn(crate::hooks::runner());
+        }
         // A Linux seat answers "Return to Gaming Mode" itself, so the box's login is never asked.
         #[cfg(target_os = "linux")]
         crate::seats::session_switch::spawn();

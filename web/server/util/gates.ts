@@ -12,6 +12,7 @@ import removePost, {
 } from "../routes/api/v1/emulators/[id]/remove.post";
 import exportPost from "../routes/api/v1/emulators/[id]/saves/export.post";
 import importPost from "../routes/api/v1/emulators/[id]/saves/import.post";
+import relayPost from "../routes/api/v1/events/relay.post";
 import hooksPut from "../routes/api/v1/hooks.put";
 import settingsPatch, {
 	when as touchesPlane,
@@ -113,6 +114,7 @@ export const GATES: readonly Route[] = [
 	gated("POST", "emulators/{id}/saves/export", exportPost),
 	gated("POST", "emulators/{id}/saves/import", importPost),
 	open("POST", "game/end", STEERS),
+	refused("POST", "events/relay", relayPost),
 	open("PUT", "gpus/preference", SETTING),
 	gated("PUT", "hooks", hooksPut),
 	onlyWhen(touchesPlane, gated("PATCH", "host/settings", settingsPatch)),

@@ -307,7 +307,8 @@ system-range user, `pf-seat-<n>`, with a logind session of its own, a headless c
   `punktfunk` user (root without one), so the box host reaches the seat's loopback API. Every seat
   user shares `punktfunk-games`, so no secret relies on group read.
 - **The trust copy.** The seat reads `trust/<id>/`, not the box directory:
-  `punktfunk1-paired.json`, `profiles.json`, `display-settings.json`, `seat-defaults.json` and
+  `punktfunk1-paired.json`, `profiles.json`, `display-settings.json` (from the library copy,
+  the owner's), `seat-defaults.json` and
   `profiles/`,
   `root:<seat user>` `0640`. The daemon recopies a file within 2 seconds of its change while the
   seat runs. The box's key never crosses, and a copy left by an older install is removed. A seat
@@ -463,16 +464,31 @@ there names a file in the owner's home, which the door can't read, so it asks th
 for it over that host's loopback API. While that host is down the cover answers 404; asking for
 one never starts the owner's session.
 
-The console's calls about the host that streams go to the owner's host the same way, on the
-admin lane only: `gpus`, `session/settings`, `display/*` except `display/clients`, `hooks`,
-`stats/capture` and `stats/recordings`, `host/audio/apps`, Moonlight's `pair` and `clients`,
-`plugins`, a plugin's `ui-credential` and `ui/`, and `plugin-access`. The door also keeps the
-display policy and hooks it forwards: its second-device rule and pairing hooks read them.
-`host/settings` serves the door's own rows (`host_name`, `mdns`, `webtransport`,
-`webtransport_origins`, the Seat defaults, `update_*`) and the owner's host's others.
-`diagnostics` merges the two reports and `GET /host` reports the owner's `gamestream`; neither
-starts the owner's session. Any other call starts a stopped one and answers 503; a host that
-doesn't answer is 502.
+The door answers only its own: the open routes, pairing (`native/*`), `profiles/*`, power
+(`actions/*`), `update/*`, `client-logs/*`, its `logs` and `events`, the library copy's reads
+(`library`, `library/page`, `library/art/*`), and what it merges with the owner's host:
+`host` (the owner's `gamestream`), `host/settings` (its own rows are `host_name`, `mdns`,
+`webtransport`, `webtransport_origins`, the Seat defaults and `update_*`), `status` (every
+seat's sessions, games and downloads) and `diagnostics`. Every other admin call goes to the
+owner's host the way covers do, a dot segment never, and the table is checked against the API
+document (`every_route_has_a_side_on_the_door`). A device's `game/end` and `library/install/*`
+go to the seat it plays on, as that device: the door's call carries `X-Punktfunk-Device`,
+which a seat host honours only with its admin token and only for a device paired there. A
+call starts a stopped seat and answers 503, except `host`, `status` and `diagnostics`, which
+wake nobody; a host that doesn't answer is 502. `events` and `session/*/pads` stream.
+
+Events cross the same way. Each running seat's events join the door's bus with `seat` naming
+the profile whose host raised them, so the console sees sessions, games, library and plugin
+changes where they happen. The door's own (`pairing.*`, `access.*`, `host.*`, `action.*`,
+`update.*`) go to the owner's host's `POST /events/relay`, whose hooks run them in the
+owner's session; the door runs no hooks. The two sets are disjoint, so nothing comes back
+around. A knock while the owner's session is stopped fires no hook.
+
+`display-settings.json` and `hooks.json` are the owner's host's alone: `door-helper` copies
+neither, the supervisor copies the display policy with the library (`library/`), the door
+reads it there for its second-device rule, and each seat's trust copy takes it from there.
+`host.restart` on the door restarts the owner's host, then the door itself; both stop and
+their units start them over.
 
 The box owner is a seat like any other. `adopt-owner <user>` adds a ledger row for an ordinary
 account that exists (uid 1000 up, never a seat's), and only for the one `door-helper on` recorded

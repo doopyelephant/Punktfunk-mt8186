@@ -264,8 +264,8 @@ pub(crate) async fn get_playing_apps() -> Json<PlayingApps> {
         (status = UNAUTHORIZED, description = "Missing or invalid bearer token", body = ApiError),
     )
 )]
-pub(crate) async fn get_host_settings() -> Response {
-    answer().await
+pub(crate) async fn get_host_settings(State(st): State<Arc<MgmtState>>) -> Response {
+    answer(&st).await
 }
 
 /// What the door acts on itself: its name and discovery, its browser plane, the seats and the
@@ -284,13 +284,13 @@ fn door_row(id: &str) -> bool {
 }
 
 /// This host's state; on a door, its own rows and the owner's host's others.
-async fn answer() -> Response {
+async fn answer(st: &MgmtState) -> Response {
     let own = state(seats_on().await);
-    if !crate::seats::is_door() {
+    if st.door.is_none() {
         return Json(own).into_response();
     }
-    match super::owner::call("GET", "host/settings".into(), None, Vec::new(), true).await {
-        super::owner::Answer::NoOwner => Json(own).into_response(),
+    match st.owner_call("GET", "host/settings", None, true).await {
+        super::owner::Answer::NoSeat => Json(own).into_response(),
         super::owner::Answer::Reply(200, _, body) => match with_owner_rows(own, &body) {
             Some(merged) => Json(merged).into_response(),
             None => api_error(
@@ -362,33 +362,39 @@ fn with_owner_rows(own: HostSettingsState, owner: &[u8]) -> Option<Value> {
         (status = INTERNAL_SERVER_ERROR, description = "The settings file could not be written", body = ApiError),
     )
 )]
-pub(crate) async fn patch_host_settings(ApiJson(patch): ApiJson<HostSettingsPatch>) -> Response {
+pub(crate) async fn patch_host_settings(
+    State(st): State<Arc<MgmtState>>,
+    ApiJson(patch): ApiJson<HostSettingsPatch>,
+) -> Response {
+    let door = st.door.is_some();
     let (patch, owner): (
         serde_json::Map<String, Value>,
         serde_json::Map<String, Value>,
     ) = patch
         .0
         .into_iter()
-        .partition(|(id, _)| !crate::seats::is_door() || door_row(id));
+        .partition(|(id, _)| !door || door_row(id));
     if !owner.is_empty() {
         let body = Value::Object(owner.clone()).to_string().into_bytes();
-        let json = Some("application/json".to_string());
-        match super::owner::call("PATCH", "host/settings".into(), json, body, true).await {
+        match st
+            .owner_call("PATCH", "host/settings", Some(body), true)
+            .await
+        {
             super::owner::Answer::Reply(200, ..) => {}
             // No owner row: the door is the box's host, as before it.
-            super::owner::Answer::NoOwner => {
-                return save(patch.into_iter().chain(owner).collect()).await
+            super::owner::Answer::NoSeat => {
+                return save(&st, patch.into_iter().chain(owner).collect()).await
             }
             other => return other.into_response(),
         }
     }
-    save(patch).await
+    save(&st, patch).await
 }
 
 /// Store `patch` in this host's own file, then answer with the state.
-async fn save(patch: serde_json::Map<String, Value>) -> Response {
+async fn save(st: &MgmtState, patch: serde_json::Map<String, Value>) -> Response {
     if patch.is_empty() {
-        return answer().await;
+        return answer(st).await;
     }
     if let Some(id) = patch
         .keys()
@@ -418,7 +424,7 @@ async fn save(patch: serde_json::Map<String, Value>) -> Response {
     crate::diagnostics::registry().set(crate::diagnostics::catalog::restart_pending());
     crate::events::emit(crate::events::EventKind::SettingsChanged { ids });
     write_seat_defaults();
-    answer().await
+    answer(st).await
 }
 
 /// Hands every seat the box's Seat defaults: at start, and after each settings write.

@@ -1086,6 +1086,7 @@ mod tests {
             seq: 7,
             ts_ms: 1_700_000_000_000,
             schema: 1,
+            seat: None,
             kind: EventKind::StreamStarted {
                 stream: StreamRef {
                     mode: "2560x1440@120".into(),
@@ -1159,6 +1160,7 @@ mod tests {
             seq: 1,
             ts_ms: 0,
             schema: crate::events::SCHEMA_VERSION,
+            seat: None,
             kind: crate::events::EventKind::HostStopping,
         };
         let t = Instant::now();

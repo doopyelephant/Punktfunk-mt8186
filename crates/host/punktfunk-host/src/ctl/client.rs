@@ -64,7 +64,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// One-shot verbs. `watch` passes `None` (long-lived by design).
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// A proxied answer's ceiling: library art is the largest thing a seat host serves.
-const RAW_BODY_LIMIT: u64 = 64 << 20;
+pub const RAW_BODY_LIMIT: u64 = 64 << 20;
+
+/// All of `body`, refused past `limit` bytes.
+pub fn read_capped(body: impl std::io::Read, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    body.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::other(format!("body over {limit} bytes")));
+    }
+    Ok(bytes)
+}
 
 pub struct Client {
     agent: ureq::Agent,
@@ -175,13 +186,16 @@ impl Client {
 
     /// One request passed through as bytes, for the console's proxy to a seat host. The answer
     /// keeps its status and content type, so a refusal reads as the seat host's own.
-    pub fn raw(
+    /// `method` `path` with the body left for the caller to read, as it arrives. `device` is a
+    /// paired device this caller vouches for: the host answers as it would that device.
+    pub fn send(
         &self,
         method: &str,
         path: &str,
         content_type: Option<&str>,
+        device: Option<&str>,
         body: Vec<u8>,
-    ) -> Result<(u16, Option<String>, Vec<u8>)> {
+    ) -> Result<(u16, Option<String>, Box<dyn std::io::Read + Send>)> {
         let mut req = ureq::http::Request::builder()
             .method(method)
             .uri(self.url(path))
@@ -189,10 +203,13 @@ impl Client {
         if let Some(ct) = content_type {
             req = req.header("Content-Type", ct);
         }
+        if let Some(fp) = device {
+            req = req.header(crate::mgmt::auth::VOUCH_HEADER, fp);
+        }
         let req = req
             .body(body)
             .map_err(|e| Failure::usage(format!("{path}: {e}")))?;
-        let mut resp = self
+        let resp = self
             .agent
             .run(req)
             .map_err(|e| self.transport_failure(e, path))?;
@@ -202,13 +219,11 @@ impl Client {
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let bytes = resp
-            .body_mut()
-            .with_config()
-            .limit(RAW_BODY_LIMIT)
-            .read_to_vec()
-            .map_err(|e| Failure::api(format!("{path}: read the answer: {e}")))?;
-        Ok((status, content_type, bytes))
+        Ok((
+            status,
+            content_type,
+            Box::new(resp.into_body().into_reader()),
+        ))
     }
 
     /// Raw GET body, left unread so `watch` can consume SSE frames as they arrive.

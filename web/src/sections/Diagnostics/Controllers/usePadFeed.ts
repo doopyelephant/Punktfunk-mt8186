@@ -8,6 +8,7 @@
 // frame as it lands, so a tap between two paints is still recorded.
 
 import { useEffect, useRef, useState } from "react";
+import { seatUrl } from "@/api/fetcher";
 import type { PadFrame } from "@/api/gen/model/padFrame";
 import {
 	anchorOf,
@@ -36,6 +37,8 @@ const EMPTY: PadFeedState = {
 export function usePadFeed(
 	sessionId: number | undefined,
 	paused: boolean,
+	/** The seat whose host holds the session, when it is not the box's own. */
+	seat: string | null = null,
 ): PadFeedState {
 	const [state, setState] = useState<PadFeedState>(EMPTY);
 	// Read inside the frame handler, so pausing does not tear down the stream.
@@ -67,7 +70,9 @@ export function usePadFeed(
 			if (!painting) painting = requestAnimationFrame(paint);
 		};
 
-		const es = new EventSource(`/api/v1/session/${sessionId}/pads`);
+		const es = new EventSource(
+			seatUrl(`/api/v1/session/${sessionId}/pads`, seat),
+		);
 		es.addEventListener("open", () => {
 			connected = true;
 			schedule();
@@ -107,7 +112,7 @@ export function usePadFeed(
 			if (painting) cancelAnimationFrame(painting);
 			setState(EMPTY);
 		};
-	}, [sessionId]);
+	}, [sessionId, seat]);
 
 	return state;
 }
