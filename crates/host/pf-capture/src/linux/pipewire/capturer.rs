@@ -17,7 +17,7 @@ use super::plan::{
     gpu_import, negotiation_plan, ImportOutcome, ImportPolicy, ImportState, NegotiationInputs,
 };
 use super::queue::{wait_ready, FrameQueue};
-use super::thread::pipewire_thread;
+use super::thread::{pipewire_thread, PwCtl};
 use super::CaptureOpts;
 use crate::linux::portal::portal_thread;
 use crate::linux::{drain_edges, health_identity, xfixes_cursor, CaptureSignals};
@@ -39,6 +39,8 @@ pub struct PortalCapturer {
     /// Wakeup only — the queue holds the frames, so a coalesced edge loses
     /// nothing. Sender dies with the PipeWire thread (`Disconnected`).
     wake: Receiver<()>,
+    /// Set by [`Capturer::arrival_poke`]; `wait_ready` takes it and returns with no frame.
+    poked: Arc<std::sync::atomic::AtomicBool>,
     /// Arrival to take, per frame (`PUNKTFUNK_PERF`).
     fence_wait: FenceWaitStats,
     signals: CaptureSignals,
@@ -68,7 +70,7 @@ pub struct PortalCapturer {
     node_id: u32,
     /// `Drop` sends this. Without it `mainloop.run()` blocks until process
     /// exit (leaks the thread and EGL/CUDA). `Option` so `Drop` can take it.
-    quit: Option<::pipewire::channel::Sender<()>>,
+    quit: Option<::pipewire::channel::Sender<PwCtl>>,
     /// Joined in `Drop` after `quit` so the importer/CUDA is gone before
     /// the next pipeline builds.
     join: Option<thread::JoinHandle<()>>,
@@ -258,7 +260,7 @@ struct PwHandles {
     import_policy: ImportPolicy,
     /// Held frames pass through as dmabufs: the NVENC encoder converts them itself.
     raw_for_encoder: bool,
-    quit: ::pipewire::channel::Sender<()>,
+    quit: ::pipewire::channel::Sender<PwCtl>,
     join: thread::JoinHandle<()>,
 }
 
@@ -275,6 +277,7 @@ impl PwHandles {
         PortalCapturer {
             queue: self.queue,
             wake: self.wake,
+            poked: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fence_wait: Default::default(),
             signals: self.signals,
             resent_acked: 0,
@@ -326,7 +329,7 @@ fn spawn_pipewire(
     )));
     let signals_cb = signals.clone();
     // Receiver attaches to the loop; sender fires in `Drop`.
-    let (quit_tx, quit_rx) = ::pipewire::channel::channel::<()>();
+    let (quit_tx, quit_rx) = ::pipewire::channel::channel::<PwCtl>();
     let zerocopy = allow_zerocopy && pf_zerocopy::enabled();
     // HDR cannot ride SHM: FORCE_SHM drops the HDR offer (SDR, loudly).
     // Shared parser, not `== "1"` — a bare compare ignored `true`/`on`/`yes`.
@@ -453,8 +456,16 @@ impl Capturer for PortalCapturer {
         // this wait never triggers a paint. It returns on a finished render, not on an
         // arrival: the producer sends a buffer before it has painted it.
         if !self.signals.broken.load(Ordering::Relaxed) {
-            let _ = wait_ready(&self.queue, &self.wake, deadline);
+            let _ = wait_ready(&self.queue, &self.wake, &self.poked, deadline);
         }
+    }
+
+    fn arrival_poke(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let (poked, ctl) = (self.poked.clone(), self.quit.clone()?);
+        Some(Arc::new(move || {
+            poked.store(true, Ordering::Relaxed);
+            let _ = ctl.send(PwCtl::Poke);
+        }))
     }
 
     /// Only the virtual-output path holds one; the portal thread owns its own session. The
@@ -642,7 +653,7 @@ impl PortalCapturer {
             let slice = Duration::from_millis(500)
                 .min(deadline.saturating_duration_since(std::time::Instant::now()));
             let until = std::time::Instant::now() + slice;
-            let end = if !wait_ready(&self.queue, &self.wake, until) {
+            let end = if !wait_ready(&self.queue, &self.wake, &self.poked, until) {
                 RecvTimeoutError::Disconnected
             } else if std::time::Instant::now() >= deadline {
                 RecvTimeoutError::Timeout
@@ -838,7 +849,7 @@ impl PortalCapturer {
     /// already exited.
     fn stop_stream(&mut self) {
         if let Some(quit) = self.quit.take() {
-            let _ = quit.send(());
+            let _ = quit.send(PwCtl::Quit);
         }
         if let Some(join) = self.join.take() {
             let _ = join.join();

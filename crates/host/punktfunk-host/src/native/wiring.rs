@@ -61,6 +61,9 @@ pub(crate) struct SessionShared {
     /// `true` = the client draws the cursor (exclude + forward), `false` = the host composites.
     /// Stays `true`, and inert, for a session without the cursor cap.
     pub(crate) cursor_client_draws: Arc<AtomicBool>,
+    /// The capturer's arrival poke ([`pf_capture::Capturer::arrival_poke`]), set by the
+    /// stream loop for each capturer it runs; the control task fires it with a recovery ask.
+    pub(crate) arrival_poke: ArrivalPoke,
     /// UDP send offload for the media sender. The control task's loss guard clears it once
     /// for the session; a cleared switch sends every packet on its own.
     pub(crate) offload_switch: Arc<AtomicBool>,
@@ -71,6 +74,9 @@ pub(crate) const NONE_ACKED: u64 = u64::MAX;
 
 /// [`SessionShared::resend`].
 pub(crate) type ResendFn = Box<dyn Fn(u32, Vec<u16>) -> bool + Send>;
+
+/// [`SessionShared::arrival_poke`]: the running capturer's poke, `None` without one.
+pub(crate) type ArrivalPoke = Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
 /// The control task's halves.
 pub(crate) struct ControlEnds {
@@ -201,6 +207,7 @@ impl SessionWiring {
                 fec_target,
                 fec_requested,
                 link_kbps: Arc::new(AtomicU32::new(0)),
+                arrival_poke: Arc::new(std::sync::Mutex::new(None)),
                 offload_switch: Arc::new(AtomicBool::new(true)),
                 shape: Arc::new(AtomicU8::new(0)),
                 ports,

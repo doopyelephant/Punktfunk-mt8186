@@ -33,6 +33,14 @@ use std::sync::mpsc::SyncSender;
 /// pool slot until then, not a frame.
 const UNDELIVERED_SWEEP: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// What the capturer sends its loop thread.
+pub(in crate::linux) enum PwCtl {
+    /// Stop the loop; the thread unwinds.
+    Quit,
+    /// Raise a wake edge with no frame behind it: the consumer's arrival wait ends now.
+    Poke,
+}
+
 /// The PipeWire loop thread for one capture session: connects, resolves the [`Offer`],
 /// negotiates, and runs `.process` until `quit_rx`, `broken`, or disconnect.
 #[allow(clippy::too_many_arguments)]
@@ -48,7 +56,7 @@ pub(in crate::linux) fn pipewire_thread(
     // `want_444`/`want_hdr` pick the pod family; `expect_exact_dims` arms the birth-mode gate.
     opts: CaptureOpts,
     preferred: Option<(u32, u32, u32)>,
-    quit_rx: pw::channel::Receiver<()>,
+    quit_rx: pw::channel::Receiver<PwCtl>,
     // Encode-backend facts from the facade — never re-derived here.
     policy: ZeroCopyPolicy,
 ) -> Result<()> {
@@ -62,10 +70,19 @@ pub(in crate::linux) fn pipewire_thread(
     let quit_loop = mainloop.clone();
     let _quit_attach = quit_rx.attach(mainloop.loop_(), {
         let quit_seen = quit_seen.clone();
-        move |()| {
-            tracing::debug!("pipewire: quit signal received — stopping capture loop");
-            quit_seen.set(true);
-            quit_loop.quit();
+        // This clone dies with the thread, like the one `.process` holds: the consumer
+        // still sees the channel close when the loop ends.
+        let poke_wake = wake.clone();
+        move |ctl| match ctl {
+            PwCtl::Quit => {
+                tracing::debug!("pipewire: quit signal received — stopping capture loop");
+                quit_seen.set(true);
+                quit_loop.quit();
+            }
+            // A full channel already holds an edge; the consumer wakes either way.
+            PwCtl::Poke => {
+                let _ = poke_wake.try_send(());
+            }
         }
     });
     let context = pw::context::ContextRc::new(&mainloop, None).context("pw Context")?;
