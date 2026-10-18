@@ -520,10 +520,20 @@ pub(crate) async fn serve(
 #[cfg_attr(windows, allow(dead_code, reason = "the signal handler is Unix only"))]
 const SHUTDOWN_RESTORE_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Catch `SIGTERM`/`SIGINT`, give the box back, then exit. `exit(0)` runs no destructor, so
-/// this is where the audio defaults, every display's topology restore and output, and a Game
-/// Mode takeover are undone. Crash-restore lives in `$XDG_RUNTIME_DIR`, which logind removes
-/// with the user manager. Blocking, under [`SHUTDOWN_RESTORE_GRACE`].
+/// A stop asked from inside: `host.restart` on a host its unit or runner starts over.
+static STOP: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Stops this host as its stop signal would: the box is given back first.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn stop_self() -> Result<(), String> {
+    STOP.notify_one();
+    Ok(())
+}
+
+/// Catch `SIGTERM`/`SIGINT` or [`stop_self`], give the box back, then exit. `exit(0)` runs no
+/// destructor, so this is where the audio defaults, every display's topology restore and
+/// output, and a Game Mode takeover are undone. Crash-restore lives in `$XDG_RUNTIME_DIR`,
+/// which logind removes with the user manager. Blocking, under [`SHUTDOWN_RESTORE_GRACE`].
 fn install_shutdown_restore() {
     #[cfg(unix)]
     tokio::spawn(async {
@@ -541,6 +551,7 @@ fn install_shutdown_restore() {
         let sig = tokio::select! {
             _ = term.recv() => "SIGTERM",
             _ = int.recv() => "SIGINT",
+            _ = STOP.notified() => "host.restart",
         };
         tracing::info!(
             signal = sig,
