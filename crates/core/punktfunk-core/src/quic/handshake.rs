@@ -78,6 +78,11 @@ pub const QUIT_CLOSE_CODE: u32 = 0x51;
 /// [`QUIT_CLOSE_CODE`]; clients that ignore it still end the session.
 pub const APP_EXITED_CLOSE_CODE: u32 = 0x52;
 
+/// QUIC application close: the client moved onto a path too small for this session's video,
+/// and the session cannot re-key its shard size. A client reads it as a lost connection and
+/// redials; the new session is sized for the new path.
+pub const PATH_SHRANK_CLOSE_CODE: u32 = 0x73;
+
 /// Longest [`Hello`] device name (UTF-8 bytes). Truncated on encode, rejected on decode.
 pub const HELLO_NAME_MAX: usize = 64;
 

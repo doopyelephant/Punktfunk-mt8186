@@ -87,8 +87,8 @@ public struct ConnectOffer: Equatable, Sendable {
         _ error: Error, hostName: String, pinned: Bool, requestAccess: Bool,
         callerRecovers: Bool
     ) -> String? {
-        if case PunktfunkClientError.rejected(let rejection) = error {
-            return "\(hostName): \(rejection.userMessage)"
+        if case PunktfunkClientError.rejected(let rejection, let said) = error {
+            return "\(hostName): \(said ?? rejection.userMessage)"
         }
         if callerRecovers, !requestAccess { return nil }
         if requestAccess {

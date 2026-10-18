@@ -841,6 +841,7 @@ impl LibraryPage {
         }
         let (sender, identity) = (self.view.sender.clone(), self.identity.clone());
         let (addr, port, fp) = (shelf.req.host.addr, shelf.mgmt_port, shelf.req.host.fp_hex);
+        let stream_port = shelf.req.host.port;
         std::thread::Builder::new()
             .name("punktfunk-library".into())
             .spawn(move || {
@@ -855,7 +856,7 @@ impl LibraryPage {
                         return;
                     }
                 }
-                let fetched = library::fetch_games(&addr, port, &identity, pin);
+                let fetched = library::fetch_games(&addr, port, stream_port, &identity, pin);
                 if let (Some(fp), Ok(games)) = (&fp, &fetched) {
                     // `store` keeps the last real catalog over an empty answer.
                     pf_client_core::library_cache::store(fp, games);

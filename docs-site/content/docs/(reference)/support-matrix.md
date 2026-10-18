@@ -342,8 +342,9 @@ Either side can be the reason one of these didn't happen:
   the client. Only the Apple app greys **Share Clipboard** out when the host hasn't offered it.
 - **Pen input** — the host offers it only with a usable `/dev/uinput` (Linux) or Windows 10 1809+.
   Without it, clients turn pen into touch.
-- **Committed text (IME)** — the Windows host and the wlroots backend (sway, scroll, Hyprland, niri)
-  type any text. KDE, GNOME and gamescope fall back to key presses, which can't express every character.
+- **Committed text (IME)** — the Windows host, the wlroots backend (sway, scroll, Hyprland, niri)
+  and KDE Plasma 6.6+ type any text; Plasma 6.5 types what the host's layout has. GNOME, gamescope
+  and older KDE fall back to US key positions, so a symbol can come out as another one there.
 - **Client-drawn cursor** — needs the client in desktop mouse mode and a host that carries the
   cursor separately ([table](#input-cursor-and-hdr)). Then the host stops drawing the pointer into
   the video.

@@ -8,6 +8,9 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
 import android.os.Build
 import android.text.InputType
 import android.util.Log
@@ -226,6 +229,18 @@ fun StreamScreen(
     // Seed once per handle; the in-stream control must survive recomposition.
     LaunchedEffect(handle) {
         NativeBridge.nativeSetInvertScroll(handle, ui.invertScroll)
+    }
+    // A roam: the default network or its addresses changed. The socket already follows it; the
+    // nudge tells the host now instead of at the next datagram.
+    DisposableEffect(handle) {
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val watch = object : ConnectivityManager.NetworkCallback() {
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                NativeBridge.nativePathChanged(handle)
+            }
+        }
+        runCatching { cm?.registerDefaultNetworkCallback(watch) }
+        onDispose { runCatching { cm?.unregisterNetworkCallback(watch) } }
     }
     // The companion panel (design/android-dual-screen.md): a second screen below the picture —
     // the lower half of a hinge with room for it, else a small second display — carries pages the

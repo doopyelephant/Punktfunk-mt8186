@@ -5,6 +5,7 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.discovery.DiscoveredHost
 import io.unom.punktfunk.kit.discovery.HostDiscovery
 import io.unom.punktfunk.kit.link.DeepLinkResult
@@ -22,6 +23,7 @@ import io.unom.punktfunk.models.PendingTrust
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -40,6 +42,9 @@ private class RequestAccessState(val target: PendingTrust) {
  */
 private class ConnectAttempt(val hostName: String) {
     val ticket = HostServices.Ticket()
+
+    /** The host parked this dial for its operator: the approval wait replaces "Connecting…". */
+    var awaitingApproval by mutableStateOf(false)
 }
 
 /**
@@ -126,10 +131,11 @@ internal class ConnectController(
     private var awaiting by mutableStateOf<RequestAccessState?>(null)
 
     /** The host a plain dial is connecting to, for the overlay's "Connecting…" phase. */
-    val connectingHostName: String? get() = attempt?.hostName
+    val connectingHostName: String? get() = attempt?.takeUnless { it.awaitingApproval }?.hostName
 
-    /** The host a request-access connect waits on, for "Waiting for approval…". */
-    val awaitingHostName: String? get() = awaiting?.target?.name
+    /** The host a request-access connect, or a parked plain dial, waits on: "Waiting for approval…". */
+    val awaitingHostName: String?
+        get() = awaiting?.target?.name ?: attempt?.takeIf { it.awaitingApproval }?.hostName
 
     fun refreshHosts() {
         savedHosts = knownHostStore.all()
@@ -217,7 +223,15 @@ internal class ConnectController(
             )
             // By this dial's pin (the address may also name the other OS of a dual-boot box); with
             // no saved record, a TOFU dial pins what the host presented, unpaired.
+            // A dial the host parks for its operator turns the overlay into the approval wait.
+            val watch = launch {
+                while (!thisAttempt.awaitingApproval) {
+                    delay(PENDING_POLL_MS)
+                    if (NativeBridge.nativeDialPending()) thisAttempt.awaitingApproval = true
+                }
+            }
             val dialed = services.dial(spec, record, name, ticket = thisAttempt.ticket)
+            watch.cancel()
             // Cancelled mid-dial: cancelConnect already returned the UI and resumed the browse,
             // and the just-opened session closed silently.
             if (dialed is HostServices.Cancelled) return@launch
@@ -248,7 +262,7 @@ internal class ConnectController(
                 } else {
                     // A typed host rejection (busy / versions differ / pairing required) means the
                     // host is awake — waking it would be nonsense; show the stated reason instead.
-                    status = ConnectErrors.connectMessage(token, requestAccess = false)
+                    status = dialed.said.ifEmpty { ConnectErrors.connectMessage(token, requestAccess = false) }
                     if (token == "profile-unknown") refreshHosts()
                 }
             }
@@ -373,6 +387,7 @@ internal class ConnectController(
 
     /** Cancel on "Waiting for approval…": the UI returns at once and the answer is dropped. */
     fun cancelApproval() {
+        if (awaiting == null) return cancelConnect()
         awaiting?.cancelled?.set(true)
         awaiting = null
         connecting = false

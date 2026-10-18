@@ -790,8 +790,14 @@ pub struct PunktfunkConnectOpts {
     /// ([`punktfunk_pyrowave_kbps`]). `0`, which a shorter prefix defaults to, leaves the
     /// host's own.
     pub pyrowave_bpp_x100: u16,
-    /// Always `0`. Fills what would otherwise be tail padding.
+    /// Always `0`. Fills what would otherwise be padding.
     pub reserved4: [u8; 6],
+    /// Called once, on the connecting thread, when the host answers that its operator is
+    /// deciding about this device: show "waiting for approval". The connect then waits for the
+    /// host's verdict, up to ten minutes, not `timeout_ms`. Null: `timeout_ms` stands.
+    pub on_pending: Option<unsafe extern "C" fn(ctx: *mut std::os::raw::c_void)>,
+    /// Handed back to `on_pending` untouched.
+    pub on_pending_ctx: *mut std::os::raw::c_void,
 }
 
 // No tail padding (append contract). On grow: freeze `CONNECT_OPTS_MIN_SIZE`, update these sizes.
@@ -801,19 +807,21 @@ const _: () = {
     use core::mem::{offset_of, size_of};
     #[cfg(target_pointer_width = "64")]
     assert!(
-        size_of::<PunktfunkConnectOpts>() == 144
+        size_of::<PunktfunkConnectOpts>() == 160
             && offset_of!(PunktfunkConnectOpts, video_fit) == 100
             && offset_of!(PunktfunkConnectOpts, delivery_flags) == 121
             && offset_of!(PunktfunkConnectOpts, profile_id) == 128
             && offset_of!(PunktfunkConnectOpts, pyrowave_bpp_x100) == 136
+            && offset_of!(PunktfunkConnectOpts, on_pending) == 144
     );
     #[cfg(target_pointer_width = "32")]
     assert!(
-        size_of::<PunktfunkConnectOpts>() == 104
+        size_of::<PunktfunkConnectOpts>() == 112
             && offset_of!(PunktfunkConnectOpts, video_fit) == 72
             && offset_of!(PunktfunkConnectOpts, delivery_flags) == 85
             && offset_of!(PunktfunkConnectOpts, profile_id) == 92
             && offset_of!(PunktfunkConnectOpts, pyrowave_bpp_x100) == 96
+            && offset_of!(PunktfunkConnectOpts, on_pending) == 104
     );
 };
 
@@ -855,7 +863,51 @@ impl Default for PunktfunkConnectOpts {
             profile_id: ptr::null(),
             pyrowave_bpp_x100: 0,
             reserved4: [0; 6],
+            on_pending: None,
+            on_pending_ctx: ptr::null_mut(),
         }
+    }
+}
+
+#[cfg(feature = "quic")]
+thread_local! {
+    /// The sentence the host sent with the last connect it refused on this thread.
+    static REFUSAL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// The sentence the host sent when it refused the last connect on this thread, for a caller
+/// holding a `PUNKTFUNK_STATUS_REJECTED_*` status: a host can name what only it knows, such as
+/// who holds the seat. Empty when it said nothing. Read on the connecting thread, right after
+/// the failed connect. `INVALID_ARG` when `out` is null or `cap` too small for it and a NUL.
+///
+/// # Safety
+/// `out` is null or writable for `cap` bytes.
+#[cfg(feature = "quic")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn punktfunk_connect_refusal(
+    out: *mut std::os::raw::c_char,
+    cap: usize,
+) -> PunktfunkStatus {
+    crate::guard(|| {
+        let said = REFUSAL.with(|r| r.borrow().clone());
+        // SAFETY: the caller passes `out` null or writable for `cap` bytes.
+        match unsafe { crate::write_cstr(out, cap, &said) } {
+            true => PunktfunkStatus::Ok,
+            false => PunktfunkStatus::InvalidArg,
+        }
+    })
+}
+
+/// A caller's `on_pending` and its context, carried to the connecting thread that calls it.
+#[cfg(feature = "quic")]
+struct PendingHook(unsafe extern "C" fn(*mut std::os::raw::c_void), usize);
+
+#[cfg(feature = "quic")]
+impl PendingHook {
+    fn call(&self) {
+        // SAFETY: the caller's contract on `PunktfunkConnectOpts::on_pending`: the function
+        // takes back the context it registered, on the thread inside the connect call.
+        unsafe { (self.0)(self.1 as *mut std::os::raw::c_void) }
     }
 }
 
@@ -999,6 +1051,11 @@ unsafe fn connect_ex_impl(
             }
             Err(e) => {
                 set_status(e.status());
+                let said = match &e {
+                    punktfunk_core::error::PunktfunkError::Rejected(_, said) => said.clone(),
+                    _ => String::new(),
+                };
+                REFUSAL.with(|r| *r.borrow_mut() = said);
                 std::ptr::null_mut()
             }
         }
@@ -1101,6 +1158,10 @@ unsafe fn connect_params(
         preset,
         profile,
         probe_only: o.delivery_flags & punktfunk_core::quic::EXT_DELIVERY_PROBE_ONLY != 0,
+        on_pending: o.on_pending.map(|f| {
+            let hook = PendingHook(f, o.on_pending_ctx as usize);
+            std::sync::Arc::new(move || hook.call()) as std::sync::Arc<dyn Fn() + Send + Sync>
+        }),
         // The rest stays default: Legacy coupling (embedders decode what the host answers),
         // no display volume, whole AUs (`PunktfunkFrame` cannot tell a part), no abort.
         ..punktfunk_core::client::ConnectParams::new(
@@ -1445,6 +1506,36 @@ mod tests {
     }
 
     /// The quality reaches the dial as asked; the row's rate and warning come from core.
+    /// `on_pending` reaches the dial, and calling it hands the caller its context back.
+    #[test]
+    fn connect_opts_carry_the_pending_callback() {
+        unsafe extern "C" fn mark(ctx: *mut std::os::raw::c_void) {
+            // SAFETY: the test registers a live `AtomicU32` as the context.
+            let n = unsafe { &*ctx.cast::<std::sync::atomic::AtomicU32>() };
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let o = PunktfunkConnectOpts {
+            host: c"127.0.0.1".as_ptr(),
+            on_pending: Some(mark),
+            on_pending_ctx: std::ptr::addr_of!(calls).cast_mut().cast(),
+            ..Default::default()
+        };
+        // SAFETY: every pointer field is null, a C-string literal, or `calls`, live here.
+        let p = unsafe { connect_params(&o) }.unwrap();
+        (p.on_pending.expect("the callback is carried"))();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let none = PunktfunkConnectOpts {
+            host: c"127.0.0.1".as_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: as above.
+        assert!(unsafe { connect_params(&none) }
+            .unwrap()
+            .on_pending
+            .is_none());
+    }
+
     #[test]
     fn connect_opts_carry_the_pyrowave_quality() {
         let o = PunktfunkConnectOpts {

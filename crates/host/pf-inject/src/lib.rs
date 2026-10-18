@@ -360,18 +360,22 @@ pub fn default_backend() -> Backend {
 }
 
 /// Whether this backend can type committed text ([`InputKind::TextInput`], `HOST_CAP_TEXT_INPUT`).
-/// Windows always (`KEYEVENTF_UNICODE`). Linux only on wlroots (Unicode virtual keyboard);
-/// KWin/libei/gamescope can only press host-layout keycodes. Welcome-time cap; a mid-session
-/// switch away from a capable backend drops text events (input is lossy by design).
+/// Windows always (`KEYEVENTF_UNICODE`). Linux on wlroots (Unicode virtual keyboard) and on KWin
+/// with `keyboard_keysym`; libei and gamescope can only press host-layout keycodes. Welcome-time
+/// cap; a mid-session switch away from a capable backend drops text events (input is lossy).
 #[cfg(target_os = "windows")]
 pub fn text_input_supported() -> bool {
     true
 }
 
-/// Linux types text only through the wlroots virtual-keyboard backend.
+/// Linux types text through the wlroots virtual keyboard and KWin 6.5+ keysyms.
 #[cfg(target_os = "linux")]
 pub fn text_input_supported() -> bool {
-    matches!(default_backend(), Backend::WlrVirtual)
+    match default_backend() {
+        Backend::WlrVirtual => true,
+        Backend::KwinFakeInput => kwin_fake_input::keysym_supported(),
+        Backend::Libei | Backend::GamescopeEi => false,
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]

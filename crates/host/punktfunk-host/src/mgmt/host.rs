@@ -70,17 +70,41 @@ pub(crate) struct HostInfo {
 }
 
 /// Ports a client needs. Moonlight derives stream ports from HTTP; a control pane should not.
+/// A port the host does not serve right now is left out.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct PortMap {
     mgmt: u16,
-    /// nvhttp plain HTTP (serverinfo, pairing).
-    http: u16,
+    /// UDP: the native stream port. Video, audio, control and the paired-device library.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    native: Option<u16>,
+    /// UDP: the browser client's plane, while it is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    browser: Option<u16>,
+    /// UDP: each seat's stream port, while seats are on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    seats: Vec<u16>,
+    /// nvhttp plain HTTP (serverinfo, pairing). This and the five below: GameStream only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    http: Option<u16>,
     /// nvhttp mutual-TLS HTTPS (post-pairing).
-    https: u16,
-    rtsp: u16,
-    video: u16,
-    control: u16,
-    audio: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    https: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    rtsp: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    video: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    control: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = u16, required = false)]
+    audio: Option<u16>,
 }
 
 /// Wire token is the stack's canonical codec name (`Codec::label`). `H265` serializes as `"hevc"`, not `"h265"`.
@@ -596,6 +620,17 @@ pub(crate) async fn get_host_info(
 ) -> Json<HostInfo> {
     let h = &st.app.host;
     let door_unavailable = door_unavailable(lane).await;
+    // The ledger asks the seat supervisor: off the async workers.
+    let seats = tokio::task::spawn_blocking(|| {
+        let ledger = crate::seats::ledger();
+        match ledger.on {
+            true => ledger.seats.iter().map(|s| s.native_port).collect(),
+            false => Vec::new(),
+        }
+    })
+    .await
+    .unwrap_or_default();
+    let gs = st.gamestream_enabled;
     Json(HostInfo {
         hostname: h.hostname.clone(),
         uniqueid: h.uniqueid.clone(),
@@ -632,12 +667,15 @@ pub(crate) async fn get_host_info(
         fingerprint: st.identity_fingerprint.map(hex::encode),
         ports: PortMap {
             mgmt: st.port,
-            http: h.http_port,
-            https: h.https_port,
-            rtsp: RTSP_PORT,
-            video: VIDEO_PORT,
-            control: CONTROL_PORT,
-            audio: AUDIO_PORT,
+            native: st.app.native_port.get().copied(),
+            browser: crate::webtransport::published().map(|p| p.port),
+            seats,
+            http: gs.then_some(h.http_port),
+            https: gs.then_some(h.https_port),
+            rtsp: gs.then_some(RTSP_PORT),
+            video: gs.then_some(VIDEO_PORT),
+            control: gs.then_some(CONTROL_PORT),
+            audio: gs.then_some(AUDIO_PORT),
         },
     })
 }

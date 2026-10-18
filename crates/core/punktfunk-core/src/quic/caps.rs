@@ -122,10 +122,6 @@ pub const CLIENT_CAP_AUDIO_HIRES: u8 = 0x10;
 /// host-global wiring, so any live session that asked wins until it ends.
 pub const CLIENT_CAP_KEEP_HOST_AUDIO: u8 = 0x20;
 
-/// [`Hello::client_caps`]: every client sets it; it gates nothing on `punktfunk/2`.
-/// `0x80` is the last free `client_caps` bit.
-pub const CLIENT_CAP_EXT: u8 = 0x40;
-
 /// [`Welcome::host_caps`]: the session is on the lossless audio plane
 /// ([`AUDIO_PCM_MAGIC`](super::datagram::AUDIO_PCM_MAGIC), `0xD3`). A wire statement, not
 /// an offer: the client must open from
@@ -161,7 +157,7 @@ pub const HOST_CAP2_EXT: u8 = 0x04;
 pub const HOST_CAP2_SCROLL: u8 = 0x08;
 
 /// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host serves
-/// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is punched,
+/// [`ProbeRequest`](crate::quic::ProbeRequest)s from the moment the data plane is bound,
 /// before its pipeline exists and without the one-per-10 s spacing, until the first video
 /// frame leaves. That window is what the client's bring-up ramp measures the link in; a
 /// client that does not see the bit bursts beside live video as before.
@@ -173,9 +169,9 @@ pub const HOST_CAP2_DELIVERY: u8 = 0x20;
 
 /// [`Welcome::host_caps2`](crate::quic::Welcome::host_caps2): the host reads
 /// [`InputEdge`](super::control::InputEdge) off the control stream. Toward this bit the
-/// client sends every key press and release there, where QUIC resends what the network
-/// drops; a lost `KeyUp` on the datagram plane otherwise holds the key until its next edge.
-/// Motion, scroll and pads stay datagrams. Without the bit every event is a datagram, as before.
+/// client sends every key and mouse-button press and release there, where QUIC resends what
+/// the network drops; a lost release on the datagram plane otherwise holds it until its next
+/// edge. Motion, scroll and pads stay datagrams. Without the bit every event is a datagram.
 pub const HOST_CAP2_INPUT_EDGES: u8 = 0x40;
 
 /// [`Hello::video_codecs`]: H.264 / AVC. The software encode path emits H.264, so a client
@@ -352,7 +348,8 @@ mod tests {
                 ("CLIENT_CAP_PAD_AUDIO", CLIENT_CAP_PAD_AUDIO),
                 ("CLIENT_CAP_AUDIO_HIRES", CLIENT_CAP_AUDIO_HIRES),
                 ("CLIENT_CAP_KEEP_HOST_AUDIO", CLIENT_CAP_KEEP_HOST_AUDIO),
-                ("CLIENT_CAP_EXT", CLIENT_CAP_EXT),
+                // Retired: older clients still set it, so the bit stays spent. 0x80 is free.
+                ("retired CLIENT_CAP_EXT", 0x40),
             ],
         ),
         (

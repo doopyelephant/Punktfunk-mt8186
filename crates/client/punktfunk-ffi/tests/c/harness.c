@@ -31,21 +31,23 @@ static PunktfunkConfig make_config(uint32_t role, uint32_t drop_period) {
 int main(void) {
     printf("punktfunk C ABI harness (abi_version=%u)\n", punktfunk_abi_version());
 
-    /* PunktfunkConnectOpts: the C compiler agrees with Rust's const-asserted layout, 144 bytes on
-     * 64-bit and 104 on 32-bit with no tail padding, so an appended field never lands in bytes an
+    /* PunktfunkConnectOpts: the C compiler agrees with Rust's const-asserted layout, 160 bytes on
+     * 64-bit and 112 on 32-bit with no tail padding, so an appended field never lands in bytes an
      * older caller's sizeof covered. The size-prefix guard rejects an undersized struct as a
      * status, not a read. The staticlib this links always carries quic. */
 #ifdef PUNKTFUNK_FEATURE_QUIC
-    if (sizeof(PunktfunkConnectOpts) != (sizeof(void *) == 8 ? 144u : 104u)
+    if (sizeof(PunktfunkConnectOpts) != (sizeof(void *) == 8 ? 160u : 112u)
         || offsetof(PunktfunkConnectOpts, video_fit) != (sizeof(void *) == 8 ? 100u : 72u)
         || offsetof(PunktfunkConnectOpts, delivery_flags) != (sizeof(void *) == 8 ? 121u : 85u)
         || offsetof(PunktfunkConnectOpts, profile_id) != (sizeof(void *) == 8 ? 128u : 92u)
-        || offsetof(PunktfunkConnectOpts, pyrowave_bpp_x100) != (sizeof(void *) == 8 ? 136u : 96u)) {
-        fprintf(stderr, "FAIL: PunktfunkConnectOpts is %zu bytes, video_fit at %zu, delivery_flags at %zu, profile_id at %zu, pyrowave_bpp_x100 at %zu\n",
+        || offsetof(PunktfunkConnectOpts, pyrowave_bpp_x100) != (sizeof(void *) == 8 ? 136u : 96u)
+        || offsetof(PunktfunkConnectOpts, on_pending) != (sizeof(void *) == 8 ? 144u : 104u)) {
+        fprintf(stderr, "FAIL: PunktfunkConnectOpts is %zu bytes, video_fit at %zu, delivery_flags at %zu, profile_id at %zu, pyrowave_bpp_x100 at %zu, on_pending at %zu\n",
                 sizeof(PunktfunkConnectOpts), offsetof(PunktfunkConnectOpts, video_fit),
                 offsetof(PunktfunkConnectOpts, delivery_flags),
                 offsetof(PunktfunkConnectOpts, profile_id),
-                offsetof(PunktfunkConnectOpts, pyrowave_bpp_x100));
+                offsetof(PunktfunkConnectOpts, pyrowave_bpp_x100),
+                offsetof(PunktfunkConnectOpts, on_pending));
         return 1;
     }
     /* The PyroWave quality row's rate and warning: 4K120 at 1.6 bits per pixel on an unknown link. */
