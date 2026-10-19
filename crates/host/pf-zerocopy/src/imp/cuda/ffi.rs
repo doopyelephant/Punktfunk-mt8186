@@ -356,11 +356,16 @@ pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
                     .or_else(|_| lib.get(b"cuIpcOpenMemHandle\0"))
                     .ok()?,
                 cuIpcCloseMemHandle: *lib.get(b"cuIpcCloseMemHandle\0").ok()?,
-                cuGraphicsEGLRegisterImage: lib.get(b"cuGraphicsEGLRegisterImage\0").ok().map(|f| *f),
+                cuGraphicsEGLRegisterImage: lib
+                    .get(b"cuGraphicsEGLRegisterImage\0")
+                    .ok()
+                    .as_deref()
+                    .copied(),
                 cuGraphicsResourceGetMappedEglFrame: lib
                     .get(b"cuGraphicsResourceGetMappedEglFrame\0")
                     .ok()
-                    .map(|f| *f),
+                    .as_deref()
+                    .copied(),
             };
             std::mem::forget(lib); // leak the mapping so the fn pointers stay process-lifetime
             Some(api)
