@@ -573,6 +573,7 @@ mod tests {
             dualsense_usbip: false,
             browser: true,
             browser_origins: vec!["https://box:47992".into()],
+            background_input: false,
         };
         std::fs::write(
             dir.path().join(pf_host_config::seat_defaults::FILE),

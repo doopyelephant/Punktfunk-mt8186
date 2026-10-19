@@ -287,6 +287,7 @@ mod tests {
         ("FEATURE_FORMAT_EPOCH", FEATURE_FORMAT_EPOCH),
         ("FEATURE_AUDIO_EPOCH", FEATURE_AUDIO_EPOCH),
         ("FEATURE_SCREENS", FEATURE_SCREENS),
+        ("FEATURE_SCROLL_AXIS_UNITS", FEATURE_SCROLL_AXIS_UNITS),
     ];
 
     /// Every close and stop code either wire uses: v1's live on, and v2 adds its own.

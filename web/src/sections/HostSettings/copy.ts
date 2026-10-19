@@ -303,6 +303,10 @@ export const SETTING_COPY: Record<string, Copy> = {
 		label: m.setting_seat_library_writable,
 		hint: m.setting_seat_library_writable_hint,
 	},
+	seat_background_input: {
+		label: m.setting_seat_background_input,
+		hint: m.setting_seat_background_input_hint,
+	},
 	tray_autostart: {
 		label: m.setting_tray_autostart,
 		hint: m.setting_tray_autostart_hint,
