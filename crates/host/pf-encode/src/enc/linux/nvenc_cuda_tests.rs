@@ -2524,3 +2524,482 @@ fn nvenc_cuda_chunked_poll_fallback_whole_au() {
     let au = enc.poll().expect("poll").expect("AU");
     assert!(au.keyframe && !au.data.is_empty());
 }
+
+/// A LINEAR dma-buf holding `bytes`, exported from its own Vulkan device the way gamescope
+/// shares a screencast buffer. Lives until this drops.
+struct LinearDmabuf {
+    fd: std::os::fd::OwnedFd,
+    _vk: (ash::Entry, ash::Instance, ash::Device),
+}
+
+impl LinearDmabuf {
+    fn new(bytes: &[u8]) -> LinearDmabuf {
+        use ash::vk;
+        use pf_zerocopy::vkdev::{memory_type, MappedMemory};
+        // SAFETY: test fixture over raw Vulkan handles it creates; the device outlives the fd's
+        // users because the struct keeps it.
+        unsafe {
+            let entry = ash::Entry::load().expect("load libvulkan");
+            let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+            let instance = entry
+                .create_instance(
+                    &vk::InstanceCreateInfo::default().application_info(&app),
+                    None,
+                )
+                .expect("instance");
+            let phys = instance
+                .enumerate_physical_devices()
+                .expect("devices")
+                .into_iter()
+                .find(|&p| instance.get_physical_device_properties(p).vendor_id == 0x10DE)
+                .expect("an NVIDIA device");
+            let mp = instance.get_physical_device_memory_properties(phys);
+            let exts = [
+                ash::khr::external_memory_fd::NAME.as_ptr(),
+                ash::ext::external_memory_dma_buf::NAME.as_ptr(),
+            ];
+            let prio = [1.0f32];
+            let qci = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(0)
+                .queue_priorities(&prio)];
+            let device = instance
+                .create_device(
+                    phys,
+                    &vk::DeviceCreateInfo::default()
+                        .queue_create_infos(&qci)
+                        .enabled_extension_names(&exts),
+                    None,
+                )
+                .expect("device");
+            let size = bytes.len() as u64;
+            let buffer = |usage, export: bool| {
+                let mut ext = vk::ExternalMemoryBufferCreateInfo::default()
+                    .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+                let mut info = vk::BufferCreateInfo::default().size(size).usage(usage);
+                if export {
+                    info = info.push_next(&mut ext);
+                }
+                let buf = device.create_buffer(&info, None).expect("buffer");
+                let req = device.get_buffer_memory_requirements(buf);
+                let flags = if export {
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL
+                } else {
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+                };
+                let mut exp = vk::ExportMemoryAllocateInfo::default()
+                    .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+                let mut alloc = vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(
+                        memory_type(&mp, req.memory_type_bits, flags).expect("type"),
+                    );
+                if export {
+                    alloc = alloc.push_next(&mut exp);
+                }
+                let mem = device.allocate_memory(&alloc, None).expect("memory");
+                device.bind_buffer_memory(buf, mem, 0).expect("bind");
+                (buf, mem)
+            };
+            let (dst, dst_mem) = buffer(vk::BufferUsageFlags::TRANSFER_DST, true);
+            let (src, src_mem) = buffer(vk::BufferUsageFlags::TRANSFER_SRC, false);
+            MappedMemory::map(&device, src_mem, bytes.len())
+                .expect("map staging")
+                .copy_from_slice(bytes);
+            let pool = device
+                .create_command_pool(&vk::CommandPoolCreateInfo::default(), None)
+                .expect("pool");
+            let cmd = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(pool)
+                        .command_buffer_count(1),
+                )
+                .expect("cmd")[0];
+            device
+                .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+                .expect("begin");
+            device.cmd_copy_buffer(cmd, src, dst, &[vk::BufferCopy::default().size(size)]);
+            device.end_command_buffer(cmd).expect("end");
+            let cmds = [cmd];
+            let queue = device.get_device_queue(0, 0);
+            device
+                .queue_submit(
+                    queue,
+                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                    vk::Fence::null(),
+                )
+                .expect("submit");
+            device.queue_wait_idle(queue).expect("wait");
+            let fd = ash::khr::external_memory_fd::Device::new(&instance, &device)
+                .get_memory_fd(
+                    &vk::MemoryGetFdInfoKHR::default()
+                        .memory(dst_mem)
+                        .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
+                )
+                .expect("export dma-buf");
+            LinearDmabuf {
+                fd: std::os::fd::FromRawFd::from_raw_fd(fd),
+                _vk: (entry, instance, device),
+            }
+        }
+    }
+
+    /// One captured frame over this buffer, held the way the capture holds it.
+    fn frame(
+        &self,
+        fmt: PixelFormat,
+        fourcc: &[u8; 4],
+        w: u32,
+        h: u32,
+        stride: u32,
+        i: u32,
+    ) -> CapturedFrame {
+        CapturedFrame {
+            provenance: Default::default(),
+            width: w,
+            height: h,
+            pts_ns: u64::from(i) * 16_666_667,
+            format: fmt,
+            payload: FramePayload::Dmabuf(pf_frame::DmabufFrame {
+                fd: self.fd.try_clone().expect("dup"),
+                fourcc: u32::from_le_bytes(*fourcc),
+                modifier: 0,
+                plane1: None,
+                offset: 0,
+                stride,
+                hold: Some(std::sync::Arc::new(())),
+                health: pf_zerocopy::zero_copy_health(0x5002),
+                rebuild: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            cursor: None,
+        }
+    }
+}
+
+/// The first picture of `stream` as raw `pix_fmt` bytes, through ffmpeg.
+fn decode_first(stream: &[u8], name: &str, pix_fmt: &str) -> Vec<u8> {
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, stream).expect("write the stream");
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", pix_fmt, "-"])
+        .output()
+        .expect("run ffmpeg");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// Encode `frames` of one LINEAR buffer through the in-place lane and return the stream.
+/// Asserts the lane took them: a mapped buffer, never the worker.
+fn encode_in_place(
+    dmabuf: &LinearDmabuf,
+    frame: impl Fn(u32) -> CapturedFrame,
+    depth: u8,
+    hdr: bool,
+    chroma: ChromaFormat,
+    frames: u32,
+) -> (NvencCudaEncoder, Vec<u8>) {
+    pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+    let first = frame(0);
+    let mut enc = NvencCudaEncoder::open(
+        Codec::H265,
+        first.format,
+        first.width,
+        first.height,
+        60,
+        80_000_000,
+        false,
+        depth,
+        hdr,
+        chroma,
+        false,
+        1,
+    )
+    .expect("open NVENC CUDA session");
+    let mut stream = Vec::new();
+    for i in 0..frames {
+        enc.submit_indexed(&frame(i), i).expect("submit in place");
+        while let Some(au) = enc.poll().expect("poll") {
+            stream.extend_from_slice(&au.data);
+        }
+    }
+    let _ = dmabuf;
+    assert!(enc.direct_wanted, "the in-place lane latched off");
+    assert!(
+        enc.direct.as_ref().is_some_and(|d| !d.bufs.is_empty()),
+        "no buffer was encoded in place"
+    );
+    assert!(enc.worker.is_none(), "a frame went through the worker");
+    (enc, stream)
+}
+
+fn close(got: u32, want: u32, tol: u32, what: &str) {
+    assert!(
+        got.abs_diff(want) <= tol,
+        "{what}: got {got}, want {want} ±{tol}"
+    );
+}
+
+/// Hardware: a producer NV12 encodes in place, chroma read from right below the luma or below
+/// padding rows (the producer's `plane1`). Padding holds 255, so a misread chroma shows.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver and ffmpeg"]
+fn nvenc_cuda_in_place_nv12() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let left = |x: u32| x < W / 2;
+    for pad in [0u32, 16] {
+        let mut bytes = Vec::new();
+        for _ in 0..H {
+            bytes.extend((0..W).map(|x| if left(x) { 40u8 } else { 200 }));
+        }
+        bytes.extend(std::iter::repeat_n(255u8, (W * pad) as usize));
+        for _ in 0..H / 2 {
+            bytes.extend((0..W).map(|x| match (left(x), x % 2) {
+                (true, 0) => 100u8,
+                (true, _) => 160,
+                (false, 0) => 160,
+                (false, _) => 100,
+            }));
+        }
+        let buf = LinearDmabuf::new(&bytes);
+        let frame = |i| {
+            let mut f = buf.frame(PixelFormat::Nv12, b"NV12", W, H, W, i);
+            if let FramePayload::Dmabuf(d) = &mut f.payload {
+                d.plane1 = Some((W * (H + pad), W));
+            }
+            f
+        };
+        let (enc, stream) = encode_in_place(&buf, frame, 8, false, ChromaFormat::Yuv420, 3);
+        assert_eq!(
+            enc.s.buffer_fmt,
+            nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12
+        );
+        let out = decode_first(&stream, "in-place-nv12.h265", "nv12");
+        let (y, uv) = out.split_at((W * H) as usize);
+        let at = |x: u32, row: u32| (row * W + x) as usize;
+        let what = |s: &str| format!("pad {pad}: {s}");
+        close(u32::from(y[at(W / 4, H / 2)]), 40, 3, &what("left luma"));
+        close(
+            u32::from(y[at(3 * W / 4, H - 1)]),
+            200,
+            3,
+            &what("right luma, last row"),
+        );
+        close(
+            u32::from(uv[at((W / 4) & !1, 0)]),
+            100,
+            3,
+            &what("left U, first row"),
+        );
+        close(
+            u32::from(uv[at(((W / 4) & !1) + 1, H / 4)]),
+            160,
+            3,
+            &what("left V"),
+        );
+        close(
+            u32::from(uv[at((3 * W / 4) & !1, H / 2 - 1)]),
+            160,
+            3,
+            &what("right U, last row"),
+        );
+    }
+}
+
+/// Hardware: a producer P010 (HDR, or gamescope's 10-bit SDR) encodes in place as Main10.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver with 10-bit encode, and ffmpeg"]
+fn nvenc_cuda_in_place_p010() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let sample = |v: u16| (v << 6).to_le_bytes();
+    let mut bytes = Vec::new();
+    for _ in 0..H {
+        bytes.extend((0..W).flat_map(|x| sample(if x < W / 2 { 160 } else { 800 })));
+    }
+    for _ in 0..H / 2 {
+        bytes.extend((0..W).flat_map(|x| sample(if x % 2 == 0 { 400 } else { 640 })));
+    }
+    let buf = LinearDmabuf::new(&bytes);
+    for hdr in [true, false] {
+        let (enc, stream) = encode_in_place(
+            &buf,
+            |i| buf.frame(PixelFormat::P010, b"P010", W, H, W * 2, i),
+            10,
+            hdr,
+            ChromaFormat::Yuv420,
+            3,
+        );
+        assert_eq!(
+            enc.s.buffer_fmt,
+            nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV420_10BIT
+        );
+        assert_eq!((enc.s.bit_depth, enc.s.hdr), (10, hdr));
+        let out = decode_first(&stream, "in-place-p010.h265", "p010le");
+        let px = |i: usize| u32::from(u16::from_le_bytes([out[2 * i], out[2 * i + 1]]) >> 6);
+        let luma = (W * H) as usize;
+        close(px((H / 2 * W + W / 4) as usize), 160, 4, "left luma");
+        close(px((H / 2 * W + 3 * W / 4) as usize), 800, 4, "right luma");
+        close(px(luma + (H / 4 * W + 200) as usize), 400, 4, "U");
+        close(px(luma + (H / 4 * W + 201) as usize), 640, 4, "V");
+    }
+}
+
+/// Hardware: packed 8-bit RGB encodes in place as 4:4:4. One-pixel red/blue columns survive
+/// only at full chroma; 4:2:0 would blur both to purple.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver with HEVC 4:4:4, and ffmpeg"]
+fn nvenc_cuda_in_place_444_rgb() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let bytes: Vec<u8> = (0..H)
+        .flat_map(|_| {
+            (0..W).flat_map(|x| {
+                if x % 2 == 0 {
+                    [0u8, 0, 255, 255]
+                } else {
+                    [255, 0, 0, 255]
+                }
+            })
+        })
+        .collect();
+    let buf = LinearDmabuf::new(&bytes);
+    let (enc, stream) = encode_in_place(
+        &buf,
+        |i| buf.frame(PixelFormat::Bgrx, b"XR24", W, H, W * 4, i),
+        8,
+        false,
+        ChromaFormat::Yuv444,
+        3,
+    );
+    assert_eq!(
+        enc.s.buffer_fmt,
+        nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
+    );
+    assert!(enc.caps().chroma_444, "the session must encode 4:4:4");
+    let rgb = decode_first(&stream, "in-place-444.h265", "rgb24");
+    let at = |x: u32| ((H / 2 * W + x) * 3) as usize;
+    let (red, blue) = (&rgb[at(100)..at(100) + 3], &rgb[at(101)..at(101) + 3]);
+    assert!(
+        red[0] > 200 && red[2] < 60,
+        "even column is not red: {red:?}"
+    );
+    assert!(
+        blue[2] > 200 && blue[0] < 60,
+        "odd column is not blue: {blue:?}"
+    );
+}
+
+/// Hardware: packed 10-bit (gamescope's HDR fallback) encodes in place, at 4:2:0 and 4:4:4.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver with 10-bit HEVC 4:4:4, and ffmpeg"]
+fn nvenc_cuda_in_place_packed_10bit() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let px = |r: u32, g: u32, b: u32| (b | g << 10 | r << 20).to_le_bytes();
+    let bytes: Vec<u8> = (0..H)
+        .flat_map(|_| {
+            (0..W).flat_map(move |x| {
+                if x < W / 2 {
+                    px(800, 200, 100)
+                } else {
+                    px(100, 500, 900)
+                }
+            })
+        })
+        .collect();
+    let buf = LinearDmabuf::new(&bytes);
+    for chroma in [ChromaFormat::Yuv420, ChromaFormat::Yuv444] {
+        let (enc, stream) = encode_in_place(
+            &buf,
+            |i| buf.frame(PixelFormat::X2Rgb10, b"XR30", W, H, W * 4, i),
+            10,
+            true,
+            chroma,
+            3,
+        );
+        assert_eq!(
+            enc.s.buffer_fmt,
+            nv::NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB10
+        );
+        assert_eq!((enc.s.bit_depth, enc.s.hdr), (10, true));
+        assert_eq!(enc.caps().chroma_444, chroma.is_444());
+        let rgb = decode_first(&stream, "in-place-rgb10.h265", "rgb48le");
+        let ch = |x: u32, c: u32| {
+            let i = (((H / 2 * W + x) * 3 + c) * 2) as usize;
+            u32::from(u16::from_le_bytes([rgb[i], rgb[i + 1]]) >> 6)
+        };
+        for (x, want) in [(W / 4, [800, 200, 100]), (3 * W / 4, [100, 500, 900])] {
+            for (c, &want) in want.iter().enumerate() {
+                close(
+                    ch(x, c as u32),
+                    want,
+                    24,
+                    &format!("{chroma:?} x={x} channel {c}"),
+                );
+            }
+        }
+    }
+}
+
+/// Hardware: a repeat of a buffer whose encodes are still in flight takes a registration of
+/// its own. NVENC hands a doubly mapped registration one mapping, which the first retire
+/// would unmap under the second.
+#[test]
+#[ignore = "requires an NVIDIA GPU + driver"]
+fn nvenc_cuda_in_place_repeats_in_flight() {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+    let buf = LinearDmabuf::new(&vec![128u8; (W * H * 3 / 2) as usize]);
+    pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
+    let mut enc = NvencCudaEncoder::open(
+        Codec::H265,
+        PixelFormat::Nv12,
+        W,
+        H,
+        60,
+        20_000_000,
+        false,
+        8,
+        false,
+        ChromaFormat::Yuv420,
+        false,
+        1,
+    )
+    .expect("open NVENC CUDA session");
+    assert!(enc.set_pipelined(true), "pipelined retrieve refused");
+    let (mut aus, n) = (0, 24u32);
+    for i in 0..n {
+        enc.submit_indexed(&buf.frame(PixelFormat::Nv12, b"NV12", W, H, W, i), i)
+            .expect("submit");
+        while let Some(_au) = enc.poll().expect("poll") {
+            aus += 1;
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while aus < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "only {aus} of {n} AUs came back"
+        );
+        match enc.poll().expect("drain") {
+            Some(_) => aus += 1,
+            None => std::thread::sleep(std::time::Duration::from_millis(2)),
+        }
+    }
+    let regs = enc
+        .direct
+        .as_ref()
+        .map_or(0, |d| d.bufs.values().map(|b| b.regs.len()).sum());
+    assert!(
+        regs > 1,
+        "repeats in flight shared one registration ({regs})"
+    );
+    println!("in-place repeats: {aus} AUs over {regs} registrations of one buffer");
+}

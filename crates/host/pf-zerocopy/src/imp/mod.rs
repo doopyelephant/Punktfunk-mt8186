@@ -13,6 +13,7 @@
 
 pub mod client;
 pub mod cuda;
+pub mod direct;
 pub mod drm;
 pub mod egl;
 pub mod gbm;
@@ -29,6 +30,7 @@ pub mod vulkan;
 pub mod worker;
 
 pub use cuda::DeviceBuffer;
+pub use direct::{DirectImporter, Mapping, Span};
 pub use egl::{DmabufPlane, EglImporter};
 pub use ladder::{step, Evidence, Ladder, Lane, Refusal};
 pub use proto::{ConvertOut, ConvertSrc, CursorRect, ImportKind};
@@ -86,6 +88,12 @@ pub fn enabled() -> bool {
 /// hands the encoder the held dmabuf and the worker's fused pass writes the slot directly.
 pub fn nvenc_raw_enabled() -> bool {
     flag_opt("PUNKTFUNK_NVENC_RAW").unwrap_or(true)
+}
+
+/// `PUNKTFUNK_NVENC_DIRECT=0` keeps a LINEAR raw frame on the worker's copy. Default on: NVENC
+/// encodes the producer's buffer in place ([`direct`]).
+pub fn nvenc_direct_enabled() -> bool {
+    flag_opt("PUNKTFUNK_NVENC_DIRECT").unwrap_or(true)
 }
 
 /// Can this box run the fused convert at all? Asks a worker to export the convert timeline,

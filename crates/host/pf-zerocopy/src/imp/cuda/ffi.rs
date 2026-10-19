@@ -87,6 +87,24 @@ pub struct CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
 
 pub const CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: c_uint = 1;
 
+/// `CUeglFrame` (`cudaEGL.h`): a mapped `EGLImage`, as arrays or as pitched planes.
+#[repr(C)]
+pub struct CUeglFrame {
+    pub planes: [*mut c_void; 3], // union { CUarray pArray[3]; void *pPitch[3]; }
+    pub width: c_uint,
+    pub height: c_uint,
+    pub depth: c_uint,
+    pub pitch: c_uint,
+    pub plane_count: c_uint,
+    pub num_channels: c_uint,
+    pub frame_type: c_uint,
+    pub egl_color_format: c_uint,
+    pub cu_format: c_uint,
+}
+
+/// `CU_EGL_FRAME_TYPE_PITCH`: `planes` are device pointers, not arrays.
+pub const CU_EGL_FRAME_TYPE_PITCH: c_uint = 1;
+
 /// `CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC` (`cuda.h`, 64-bit). Same union flatten as the
 /// memory desc; fd types read the first 4 bytes. No `size` — a semaphore has none.
 #[repr(C)]
@@ -162,6 +180,11 @@ const _: () = {
     assert!(size_of::<CUDA_EXTERNAL_MEMORY_BUFFER_DESC>() == 88);
     assert!(offset_of!(CUDA_EXTERNAL_MEMORY_BUFFER_DESC, size) == 8);
     assert!(offset_of!(CUDA_EXTERNAL_MEMORY_BUFFER_DESC, flags) == 16);
+
+    // union(24)+nine c_uint(36) = 60, tail-padded to 8.
+    assert!(size_of::<CUeglFrame>() == 64);
+    assert!(offset_of!(CUeglFrame, pitch) == 36);
+    assert!(offset_of!(CUeglFrame, frame_type) == 48);
 
     // type(4)+pad(4)+union(16)+flags(4)+reserved[16](64) = 96. No `size` — a semaphore has none.
     assert!(size_of::<CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC>() == 96);
@@ -256,6 +279,12 @@ pub(crate) struct CudaApi {
     cuIpcGetMemHandle: unsafe extern "C" fn(*mut CUipcMemHandle, CUdeviceptr) -> CUresult,
     cuIpcOpenMemHandle: unsafe extern "C" fn(*mut CUdeviceptr, CUipcMemHandle, c_uint) -> CUresult,
     cuIpcCloseMemHandle: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
+    /// EGL interop. Optional so a driver without it still loads the rest of the table.
+    cuGraphicsEGLRegisterImage:
+        Option<unsafe extern "C" fn(*mut CUgraphicsResource, *mut c_void, c_uint) -> CUresult>,
+    cuGraphicsResourceGetMappedEglFrame: Option<
+        unsafe extern "C" fn(*mut CUeglFrame, CUgraphicsResource, c_uint, c_uint) -> CUresult,
+    >,
 }
 // `Send`/`Sync` need no `unsafe impl`: every field is a bare fn pointer, already both.
 // Addresses stay valid because `cuda_api` `forget`s the `Library`.
@@ -327,6 +356,11 @@ pub(crate) fn cuda_api() -> Option<&'static CudaApi> {
                     .or_else(|_| lib.get(b"cuIpcOpenMemHandle\0"))
                     .ok()?,
                 cuIpcCloseMemHandle: *lib.get(b"cuIpcCloseMemHandle\0").ok()?,
+                cuGraphicsEGLRegisterImage: lib.get(b"cuGraphicsEGLRegisterImage\0").ok().map(|f| *f),
+                cuGraphicsResourceGetMappedEglFrame: lib
+                    .get(b"cuGraphicsResourceGetMappedEglFrame\0")
+                    .ok()
+                    .map(|f| *f),
             };
             std::mem::forget(lib); // leak the mapping so the fn pointers stay process-lifetime
             Some(api)
@@ -425,6 +459,34 @@ forward! {
     cuIpcGetMemHandle(handle: *mut CUipcMemHandle, dptr: CUdeviceptr);
     cuIpcOpenMemHandle(dptr: *mut CUdeviceptr, handle: CUipcMemHandle, flags: c_uint);
     cuIpcCloseMemHandle(dptr: CUdeviceptr);
+}
+
+/// `cuGraphicsEGLRegisterImage`; [`CU_ERROR_NOT_LOADED`] when the driver lacks it.
+pub(crate) unsafe fn cuGraphicsEGLRegisterImage(
+    resource: *mut CUgraphicsResource,
+    image: *mut c_void,
+    flags: c_uint,
+) -> CUresult {
+    match cuda_api().and_then(|a| a.cuGraphicsEGLRegisterImage) {
+        // SAFETY: the live dlopen'd symbol, typed to its `cudaEGL.h` signature; the caller
+        // upholds the driver-API contract.
+        Some(f) => unsafe { f(resource, image, flags) },
+        None => CU_ERROR_NOT_LOADED,
+    }
+}
+
+/// `cuGraphicsResourceGetMappedEglFrame`; [`CU_ERROR_NOT_LOADED`] when the driver lacks it.
+pub(crate) unsafe fn cuGraphicsResourceGetMappedEglFrame(
+    frame: *mut CUeglFrame,
+    resource: CUgraphicsResource,
+    index: c_uint,
+    mip_level: c_uint,
+) -> CUresult {
+    match cuda_api().and_then(|a| a.cuGraphicsResourceGetMappedEglFrame) {
+        // SAFETY: as `cuGraphicsEGLRegisterImage`.
+        Some(f) => unsafe { f(frame, resource, index, mip_level) },
+        None => CU_ERROR_NOT_LOADED,
+    }
 }
 
 #[inline]

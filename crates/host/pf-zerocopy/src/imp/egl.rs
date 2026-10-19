@@ -2,13 +2,12 @@
 //! (`EGL_LINUX_DMA_BUF_EXT`). The DRM modifier is mandatory — NVIDIA buffers are tiled; omitting
 //! it is `EGL_BAD_MATCH` or a corrupt image.
 //!
-//! Desktop NVIDIA cannot register a dmabuf `EGLImage` with CUDA (`cuGraphicsEGLRegisterImage` is
-//! Tegra-only; `cuGraphicsGLRegisterImage` rejects EGLImage-backed textures). Bind the image to a
-//! GL texture (`glEGLImageTargetTexture2DOES`), blit into an immutable `GL_RGBA8` (or NV12 / YUV444
-//! convert targets), register that texture, then device-copy into an owned [`DeviceBuffer`] so the
-//! dmabuf can return to the compositor immediately.
+//! Tiled dmabufs de-tile through GL: bind the image to a texture (`glEGLImageTargetTexture2DOES`),
+//! blit into an immutable `GL_RGBA8` (or NV12 / YUV444 convert targets), register that texture,
+//! then device-copy into an owned [`DeviceBuffer`] so the dmabuf can return to the compositor
+//! immediately. LINEAR dmabufs go through [`super::vulkan`], or [`super::direct`] for NVENC.
 //!
-//! Pin: `picks_the_nvidia_node_not_the_first_one`. LINEAR dmabufs go through [`super::vulkan`].
+//! Pin: `picks_the_nvidia_node_not_the_first_one`.
 
 #![allow(non_upper_case_globals)]
 
@@ -20,14 +19,14 @@ use khronos_egl as egl;
 use std::os::raw::{c_int, c_void};
 
 // Not in khronos-egl: EGL_EXT_image_dma_buf_import(_modifiers) and the GBM platform enum.
-const EGL_LINUX_DMA_BUF_EXT: egl::Enum = 0x3270;
+pub(super) const EGL_LINUX_DMA_BUF_EXT: egl::Enum = 0x3270;
 const EGL_PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
-const EGL_LINUX_DRM_FOURCC_EXT: egl::Attrib = 0x3271;
-const EGL_DMA_BUF_PLANE0_FD_EXT: egl::Attrib = 0x3272;
-const EGL_DMA_BUF_PLANE0_OFFSET_EXT: egl::Attrib = 0x3273;
-const EGL_DMA_BUF_PLANE0_PITCH_EXT: egl::Attrib = 0x3274;
-const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: egl::Attrib = 0x3443;
-const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: egl::Attrib = 0x3444;
+pub(super) const EGL_LINUX_DRM_FOURCC_EXT: egl::Attrib = 0x3271;
+pub(super) const EGL_DMA_BUF_PLANE0_FD_EXT: egl::Attrib = 0x3272;
+pub(super) const EGL_DMA_BUF_PLANE0_OFFSET_EXT: egl::Attrib = 0x3273;
+pub(super) const EGL_DMA_BUF_PLANE0_PITCH_EXT: egl::Attrib = 0x3274;
+pub(super) const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: egl::Attrib = 0x3443;
+pub(super) const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: egl::Attrib = 0x3444;
 
 #[path = "egl/gl.rs"]
 mod gl;
@@ -348,7 +347,56 @@ pub struct DmabufPlane {
     pub stride: u32,
 }
 
-type Egl = egl::DynamicInstance<egl::EGL1_5>;
+pub(super) type Egl = egl::DynamicInstance<egl::EGL1_5>;
+
+/// libEGL, an initialized GBM `EGLDisplay` on the NVIDIA render node, and that node. The
+/// display has dma-buf import with modifiers.
+pub(super) fn gbm_display() -> Result<(Egl, egl::Display, GbmDevice, std::path::PathBuf)> {
+    // GBM on the NVIDIA render node so the EGLDisplay shares the DRM device CUDA-GL interop
+    // uses. The EGL *device* platform does not — `cuGraphicsGLRegisterImage` rejects those textures.
+    let node = nvidia_render_node();
+    let render_node = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&node)
+        .with_context(|| format!("open {} for GBM", node.display()))?;
+    let gbm = GbmDevice::open(render_node)
+        .with_context(|| format!("open the GBM device on {}", node.display()))?;
+
+    // SAFETY: `Egl::load_required` dlopens libEGL and binds EGL 1.5 entry points matching
+    // the `khronos_egl` `EGL1_5` ABI. No Rust memory is passed; later use is through the
+    // safe wrappers.
+    let egl: Egl =
+        unsafe { Egl::load_required() }.context("load libEGL (EGL 1.5 dynamic instance)")?;
+    // SAFETY: `gbm.as_ptr()` is the live `gbm_device*` just created; `EGL_PLATFORM_GBM_KHR`
+    // is the platform enum that pairs with a GBM device as native display. `&[ATTRIB_NONE]`
+    // is a terminated empty attrib list borrowed for this call; EGL does not retain it.
+    let display = unsafe {
+        egl.get_platform_display(
+            EGL_PLATFORM_GBM_KHR,
+            gbm.as_ptr() as egl::NativeDisplayType,
+            &[egl::ATTRIB_NONE],
+        )
+    }
+    .with_context(|| format!("eglGetPlatformDisplay(GBM) on {}", node.display()))?;
+    egl.initialize(display).context("eglInitialize")?;
+
+    let exts = egl
+        .query_string(Some(display), egl::EXTENSIONS)
+        .context("query EGL extensions")?
+        .to_string_lossy()
+        .into_owned();
+    ensure!(
+        exts.contains("EGL_EXT_image_dma_buf_import"),
+        "EGL lacks EGL_EXT_image_dma_buf_import"
+    );
+    ensure!(
+        exts.contains("EGL_EXT_image_dma_buf_import_modifiers"),
+        "EGL lacks EGL_EXT_image_dma_buf_import_modifiers (needed for NVIDIA tiled dmabufs)"
+    );
+
+    Ok((egl, display, gbm, node))
+}
 
 /// Headless GBM EGLDisplay plus a surfaceless desktop-GL context. Lives on the capture thread;
 /// the GL context is made current there once and never released.
@@ -383,51 +431,9 @@ impl EglImporter {
     /// Open a headless EGLDisplay on the NVIDIA GBM device. Creates the shared CUDA context so
     /// later `import` is hot-path only.
     pub fn new() -> Result<EglImporter> {
-        // GBM on the NVIDIA render node so the EGLDisplay shares the DRM device CUDA-GL interop
-        // uses. The EGL *device* platform does not — `cuGraphicsGLRegisterImage` rejects those textures.
-        let node = nvidia_render_node();
-        let render_node = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&node)
-            .with_context(|| format!("open {} for GBM", node.display()))?;
-        let gbm = GbmDevice::open(render_node)
-            .with_context(|| format!("open the GBM device on {}", node.display()))?;
+        let (egl, display, gbm, node) = gbm_display()?;
 
-        // SAFETY: `Egl::load_required` dlopens libEGL and binds EGL 1.5 entry points matching
-        // the `khronos_egl` `EGL1_5` ABI. No Rust memory is passed; later use is through the
-        // safe wrappers.
-        let egl: Egl =
-            unsafe { Egl::load_required() }.context("load libEGL (EGL 1.5 dynamic instance)")?;
-        // SAFETY: `gbm.as_ptr()` is the live `gbm_device*` just created; `EGL_PLATFORM_GBM_KHR`
-        // is the platform enum that pairs with a GBM device as native display. `&[ATTRIB_NONE]`
-        // is a terminated empty attrib list borrowed for this call; EGL does not retain it.
-        let display = unsafe {
-            egl.get_platform_display(
-                EGL_PLATFORM_GBM_KHR,
-                gbm.as_ptr() as egl::NativeDisplayType,
-                &[egl::ATTRIB_NONE],
-            )
-        }
-        .with_context(|| format!("eglGetPlatformDisplay(GBM) on {}", node.display()))?;
-        egl.initialize(display).context("eglInitialize")?;
-
-        let exts = egl
-            .query_string(Some(display), egl::EXTENSIONS)
-            .context("query EGL extensions")?
-            .to_string_lossy()
-            .into_owned();
-        ensure!(
-            exts.contains("EGL_EXT_image_dma_buf_import"),
-            "EGL lacks EGL_EXT_image_dma_buf_import"
-        );
-        ensure!(
-            exts.contains("EGL_EXT_image_dma_buf_import_modifiers"),
-            "EGL lacks EGL_EXT_image_dma_buf_import_modifiers (needed for NVIDIA tiled dmabufs)"
-        );
-
-        // Surfaceless desktop-GL so we can bind the dmabuf EGLImage to a texture.
-        // `cuGraphicsEGLRegisterImage` is Tegra-only; desktop CUDA interop goes through GL.
+        // Surfaceless desktop-GL so we can bind the dmabuf EGLImage to a texture for the de-tile.
         egl.bind_api(egl::OPENGL_API)
             .context("eglBindAPI(OpenGL)")?;
         // Default SURFACE_TYPE is WINDOW_BIT; a headless display has none. Ask pbuffer first

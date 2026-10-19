@@ -35,9 +35,9 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use pf_frame::{CapturedFrame, DmabufFrame, FramePayload};
 use pf_zerocopy::cuda::{self, InputSurface};
 use pf_zerocopy::vkslot::{SlotFormat, VkSlotBlend, VkSlotRef};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::ptr;
 use std::sync::mpsc;
 
@@ -387,6 +387,74 @@ fn source_hold(frame: &CapturedFrame) -> Option<pf_frame::FrameHold> {
     }
 }
 
+/// Encodes a buffer may sit idle before its mapping is released. Far above any in-flight
+/// depth, so nothing pending still reads it.
+const DIRECT_IDLE: u64 = 600;
+
+/// The span NVENC reads a LINEAR raw frame from in place, and the chroma's byte offset from
+/// the luma (0 for packed RGB). `None` leaves the frame to the worker: tiled, a format NVENC
+/// does not take as is, or chroma that is not below the luma at the luma's stride.
+fn direct_span(captured: &CapturedFrame, d: &DmabufFrame) -> Option<(pf_zerocopy::Span, u32)> {
+    use pf_frame::PixelFormat as F;
+    if d.modifier != 0 {
+        return None;
+    }
+    let (w, h) = (captured.width, captured.height);
+    let (row_bytes, rows, chroma) = match captured.format {
+        F::Nv12 | F::P010 => {
+            // A producer may pad the luma: the view runs on to the chroma's last row.
+            let (off1, stride1) = chroma_plane(captured, d)?;
+            let chroma = off1.checked_sub(d.offset)?;
+            if stride1 != d.stride || u64::from(chroma) < u64::from(d.stride) * u64::from(h) {
+                return None;
+            }
+            let bytes = if captured.format == F::P010 { 2 } else { 1 };
+            let end = u64::from(chroma) + u64::from(d.stride) * u64::from(h.div_ceil(2));
+            let rows = u32::try_from(end.div_ceil(u64::from(d.stride))).ok()?;
+            (w * bytes, rows, chroma)
+        }
+        F::Bgrx | F::Bgra | F::X2Rgb10 | F::X2Bgr10 => (w * 4, h, 0),
+        _ => return None,
+    };
+    let span = pf_zerocopy::Span {
+        offset: d.offset,
+        stride: d.stride,
+        row_bytes,
+        rows,
+    };
+    Some((span, chroma))
+}
+
+/// NVENC's input format for a frame it reads in place: the producer's own layout.
+fn direct_buffer_format(fmt: pf_frame::PixelFormat) -> Option<nv::NV_ENC_BUFFER_FORMAT> {
+    use nv::NV_ENC_BUFFER_FORMAT as N;
+    use pf_frame::PixelFormat as F;
+    Some(match fmt {
+        F::Nv12 => N::NV_ENC_BUFFER_FORMAT_NV12,
+        F::P010 => N::NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
+        F::Bgrx | F::Bgra => N::NV_ENC_BUFFER_FORMAT_ARGB,
+        F::X2Rgb10 => N::NV_ENC_BUFFER_FORMAT_ARGB10,
+        F::X2Bgr10 => N::NV_ENC_BUFFER_FORMAT_ABGR10,
+        _ => return None,
+    })
+}
+
+/// One producer buffer mapped into CUDA, and its registrations on the live session. NVENC
+/// gives a registration mapped twice one handle, which the first retire unmaps, so a repeat
+/// whose last encode is still in flight takes a registration of its own.
+struct DirectBuf {
+    mapping: pf_zerocopy::Mapping,
+    /// `(registration, encode count at its last use)`.
+    regs: Vec<(nv::NV_ENC_REGISTERED_PTR, u64)>,
+    last_used: u64,
+}
+
+/// The in-place lane: producer buffers by `(dmabuf identity, span)`.
+struct Direct {
+    importer: pf_zerocopy::DirectImporter,
+    bufs: HashMap<((u64, u64), pf_zerocopy::Span, u32), DirectBuf>,
+}
+
 struct RingSlot {
     surface: SlotSurface,
     reg: nv::NV_ENC_REGISTERED_PTR,
@@ -545,6 +613,16 @@ pub struct NvencCudaEncoder {
     /// A teardown left the retrieve thread in the driver ([`Self::abandon`]): this encoder
     /// opens no further session.
     dead: bool,
+    /// LINEAR raw frames encode in place ([`pf_zerocopy::direct`]). Off after a failure; the
+    /// worker's copy takes over.
+    direct_wanted: bool,
+    direct: Option<Direct>,
+    /// A LINEAR frame the lane turned down has been logged.
+    direct_refusal_logged: bool,
+    /// Encodes queued on any session. `pending` holds the latest `pending().len()` of them.
+    encoded: u64,
+    /// The last fused convert's worker round trip, for the sampled submit split.
+    rpc_us: u64,
 }
 
 /// How long a teardown waits for the retrieve thread. On a live driver each queued lock
@@ -614,6 +692,11 @@ impl NvencCudaEncoder {
             io_stream: ptr::null_mut(),
             stream_ordered: false,
             dead: false,
+            direct_wanted: pf_zerocopy::nvenc_raw_enabled() && pf_zerocopy::nvenc_direct_enabled(),
+            direct: None,
+            direct_refusal_logged: false,
+            encoded: 0,
+            rpc_us: 0,
         })
     }
 
@@ -688,7 +771,8 @@ impl NvencCudaEncoder {
 
     /// The retrieve thread is stuck in the driver and the session went with it
     /// ([`NvSession::stop_within`]). The wedged encode may still read its registered input,
-    /// so the ring and the Vulkan slots behind it are leaked too, and no session opens again.
+    /// so the ring, the Vulkan slots and the in-place mappings are leaked too, and no session
+    /// opens again.
     fn abandon(&mut self) {
         tracing::error!(
             limit_s = RETRIEVE_STOP_LIMIT.as_secs(),
@@ -697,6 +781,7 @@ impl NvencCudaEncoder {
         );
         std::mem::forget(std::mem::take(&mut self.ring));
         std::mem::forget(self.vk_blend.take());
+        std::mem::forget(self.direct.take());
         self.dead = true;
     }
 
@@ -717,6 +802,12 @@ impl NvencCudaEncoder {
         }
         for slot in &self.ring {
             let _ = (api().unregister_resource)(self.s.handle(), slot.reg);
+        }
+        // The mappings outlive the session; their registrations do not.
+        for buf in self.direct.iter_mut().flat_map(|d| d.bufs.values_mut()) {
+            for (reg, _) in buf.regs.drain(..) {
+                let _ = (api().unregister_resource)(self.s.handle(), reg);
+            }
         }
         if let Some(w) = self.worker.as_mut() {
             w.forget_slots();
@@ -1027,12 +1118,21 @@ impl NvencCudaEncoder {
         }
     }
 
-    /// The slot layout a raw dmabuf session encodes: YUV444 for a 4:4:4 session, NVENC's
-    /// packed 10-bit for an HDR capture, NV12 or P010 for a producer's own (copied, not
-    /// converted), else NV12 (`PUNKTFUNK_NV12`) or packed ARGB. A 10-bit SDR session keeps
-    /// packed ARGB: NVENC widens only packed RGB to 10 bits.
-    fn raw_buffer_format(&self, fmt: pf_frame::PixelFormat) -> nv::NV_ENC_BUFFER_FORMAT {
+    /// The slot layout a raw dmabuf session encodes: the producer's own when NVENC reads it in
+    /// place ([`Self::direct_input`]), YUV444 for a 4:4:4 session, NVENC's packed 10-bit for an
+    /// HDR capture, NV12 or P010 for a producer's own (copied, not converted), else NV12
+    /// (`PUNKTFUNK_NV12`) or packed ARGB. A 10-bit SDR session keeps packed ARGB: NVENC widens
+    /// only packed RGB to 10 bits.
+    fn raw_buffer_format(
+        &self,
+        captured: &CapturedFrame,
+        d: &DmabufFrame,
+    ) -> nv::NV_ENC_BUFFER_FORMAT {
         use nv::NV_ENC_BUFFER_FORMAT as F;
+        if let Some((_, fmt)) = self.direct_input(captured, d) {
+            return fmt;
+        }
+        let fmt = captured.format;
         if self.s.chroma_444 {
             return F::NV_ENC_BUFFER_FORMAT_YUV444;
         }
@@ -1112,7 +1212,10 @@ impl NvencCudaEncoder {
                 return Ok(());
             }
         }
-        let value = match self.convert_raw_inner(captured, d, fmt, target, src_size) {
+        let rpc = std::time::Instant::now();
+        let converted = self.convert_raw_inner(captured, d, fmt, target, src_size);
+        self.rpc_us = rpc.elapsed().as_micros() as u64;
+        let value = match converted {
             Ok(v) => {
                 d.health.note_raw_import_ok();
                 v
@@ -1365,6 +1468,38 @@ impl NvencCudaEncoder {
         // Two-thread backpressure: block on the oldest completion so this slot is free before
         // reuse. Cap-deep instead of 1.
         self.s.wait_below(async_inflight_cap())?;
+        if let Source::Dmabuf(d) = src {
+            // A visible pointer is blended into a slot; the producer's buffer is not ours to draw on.
+            let pointer = captured.cursor.as_ref().is_some_and(|c| c.visible);
+            let input = self.direct_input(captured, d);
+            if input.is_none()
+                && self.direct_wanted
+                && d.modifier == 0
+                && !self.direct_refusal_logged
+            {
+                self.direct_refusal_logged = true;
+                tracing::info!(
+                    format = ?captured.format,
+                    height = captured.height,
+                    offset = d.offset,
+                    stride = d.stride,
+                    plane1 = ?d.plane1,
+                    "NVENC cannot read this LINEAR frame in place — the worker copies it"
+                );
+            }
+            if let Some((span, _)) = input.filter(|_| !pointer) {
+                let Err(e) = self.encode_direct(captured, d, span) else {
+                    return Ok(());
+                };
+                self.direct_wanted = false;
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "NVENC in-place input failed — this encoder goes back to the worker's copy"
+                );
+                // The input format can change with the lane, which rebuilds the session.
+                return self.submit_device(captured, src);
+            }
+        }
         let slot = self.s.slot();
         // `PUNKTFUNK_PERF` submit split (~1 line / 2 s at 60 fps). Host `submit_us` folds
         // copy/blend/map/pic; this splits them.
@@ -1391,17 +1526,152 @@ impl NvencCudaEncoder {
         // before this encode) and is not overwritten until POOL submits later, by which time
         // this encode was polled.
         let times = unsafe { self.s.encode(input) }?;
+        self.encoded += 1;
         if sample {
             tracing::info!(
                 copy_us = t_copy.as_micros() as u64,
+                rpc_us = self.rpc_us,
                 blend_us = t_blend.as_micros() as u64,
                 map_us = times.map.as_micros() as u64,
                 pic_us = times.pic.as_micros() as u64,
-                "NVENC submit split (sampled): copy=input D2D copy blend=cursor map=map_input \
+                "NVENC submit split (sampled): copy=input D2D copy rpc=worker round trip \
+                 blend=cursor map=map_input pic=encode_picture launch"
+            );
+        }
+        Ok(())
+    }
+
+    /// Where and as what NVENC reads this raw frame in place, or `None` for the worker's lane.
+    /// A 4:4:4 session takes only packed RGB this way: NVENC converts it to full chroma.
+    fn direct_input(
+        &self,
+        captured: &CapturedFrame,
+        d: &DmabufFrame,
+    ) -> Option<((pf_zerocopy::Span, u32), nv::NV_ENC_BUFFER_FORMAT)> {
+        if !self.direct_wanted || self.reframe.is_some() {
+            return None;
+        }
+        let fmt = direct_buffer_format(captured.format)?;
+        let planar = matches!(
+            captured.format,
+            pf_frame::PixelFormat::Nv12 | pf_frame::PixelFormat::P010
+        );
+        if self.s.chroma_444 && planar {
+            return None;
+        }
+        Some((direct_span(captured, d)?, fmt))
+    }
+
+    /// Encode a LINEAR producer buffer in place: NVENC reads the compositor's memory through
+    /// this buffer's registration. No copy, no worker round trip.
+    fn encode_direct(
+        &mut self,
+        captured: &CapturedFrame,
+        d: &DmabufFrame,
+        (span, chroma): (pf_zerocopy::Span, u32),
+    ) -> Result<()> {
+        let sample = pf_host_config::config().perf && self.frames % 120 == 0;
+        self.frames += 1;
+        let t0 = std::time::Instant::now();
+        let reg = self.direct_reg(d, span, chroma)?;
+        let t_reg = t0.elapsed();
+        let input = EncodeInput {
+            reg,
+            pitch: span.stride,
+            event: ptr::null_mut(),
+            pts_ns: captured.pts_ns,
+            hold: source_hold(captured),
+        };
+        // SAFETY: the session is open (`ensure_session`) and `reg` is registered on it over this
+        // frame's buffer. The hold keeps the producer off that buffer until the AU is retrieved,
+        // and no in-flight encode maps `reg` (`direct_reg`).
+        let times = unsafe { self.s.encode(input) }?;
+        self.encoded += 1;
+        if sample {
+            tracing::info!(
+                reg_us = t_reg.as_micros() as u64,
+                map_us = times.map.as_micros() as u64,
+                pic_us = times.pic.as_micros() as u64,
+                "NVENC submit split (sampled, in place): reg=buffer lookup map=map_input \
                  pic=encode_picture launch"
             );
         }
         Ok(())
+    }
+
+    /// A registration of this buffer on the live session that no in-flight encode maps. The
+    /// buffer is mapped and registered on first sight; buffers idle [`DIRECT_IDLE`] encodes go.
+    fn direct_reg(
+        &mut self,
+        d: &DmabufFrame,
+        span: pf_zerocopy::Span,
+        chroma: u32,
+    ) -> Result<nv::NV_ENC_REGISTERED_PTR> {
+        let id = pf_zerocopy::fd_identity(d.fd.as_fd()).context("fstat the dma-buf")?;
+        let (now, enc) = (self.encoded, self.s.handle());
+        // `pending` holds the latest encodes and retires the oldest first.
+        let busy_from = now.saturating_sub(self.s.pending().len() as u64);
+        let (width, height, fmt) = (self.s.width, self.s.height, self.s.buffer_fmt);
+        if self.direct.is_none() {
+            self.direct = Some(Direct {
+                importer: pf_zerocopy::DirectImporter::new().context("in-place import display")?,
+                bufs: HashMap::new(),
+            });
+            tracing::info!(
+                format = ?fmt,
+                stride = span.stride,
+                "NVENC encodes the producer's buffer in place (no copy, no worker round trip)"
+            );
+        }
+        let Direct { importer, bufs } = self.direct.as_mut().expect("set above");
+        bufs.retain(|_, b| {
+            let idle = now.saturating_sub(b.last_used) >= DIRECT_IDLE;
+            if idle {
+                for (reg, _) in b.regs.drain(..) {
+                    // SAFETY: a registration on the open session that nothing in flight maps:
+                    // its last use is further back than any pending encode.
+                    let _ = unsafe { (api().unregister_resource)(enc, reg) };
+                }
+            }
+            !idle
+        });
+        let buf = match bufs.entry((id, span, chroma)) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => e.insert(DirectBuf {
+                mapping: importer.map(d.fd.as_fd(), span)?,
+                regs: Vec::new(),
+                last_used: now,
+            }),
+        };
+        buf.last_used = now;
+        if let Some(r) = buf.regs.iter_mut().find(|(_, used)| *used < busy_from) {
+            r.1 = now;
+            return Ok(r.0);
+        }
+        let mut rr = nv::NV_ENC_REGISTER_RESOURCE {
+            version: nv::NV_ENC_REGISTER_RESOURCE_VER,
+            resourceType: nv::NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+            width,
+            height,
+            pitch: span.stride,
+            resourceToRegister: buf.mapping.ptr as *mut c_void,
+            bufferFormat: fmt,
+            bufferUsage: nv::NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
+            ..Default::default()
+        };
+        // Padded planes: `chromaOffsetIn` (the 12.1 bindings' `reserved1[0]`), read only by
+        // struct version 5. A driver that refuses it fails the register and the lane.
+        if chroma != 0 && u64::from(chroma) != u64::from(span.stride) * u64::from(height) {
+            rr.version = nv::NVENCAPI_VERSION | (5 << 16) | (0x7 << 28);
+            rr.reserved1[0] = chroma;
+        }
+        // SAFETY: `enc` is the open session, and `rr` names a live mapping of `span.rows` rows
+        // at `span.stride`: a `width`×`height` frame of `fmt`, planes included.
+        unsafe { (api().register_resource)(enc, &mut rr) }
+            .nv_ok()
+            .map_err(|e| nvenc_status::call_err("register_resource (in place)", e))?;
+        buf.regs.push((rr.registeredResource, now));
+        Ok(rr.registeredResource)
     }
 
     /// Open the session for this capture, first tearing down one whose size or format
@@ -1409,7 +1679,7 @@ impl NvencCudaEncoder {
     fn ensure_session(&mut self, captured: &CapturedFrame, src: Source<'_>) -> Result<()> {
         let new_fmt = match src {
             Source::Cuda(b) => buffer_format(b, captured.format),
-            Source::Dmabuf(_) => self.raw_buffer_format(captured.format),
+            Source::Dmabuf(d) => self.raw_buffer_format(captured, d),
         };
         let input = (captured.width, captured.height);
         let inited = self.s.inited();
@@ -1429,6 +1699,10 @@ impl NvencCudaEncoder {
             // SAFETY: encode thread, the session open, previous frame already polled — nothing
             // mid-encode. Cached ring/bitstreams/pending belong to this session.
             unsafe { self.teardown() };
+            // The producer's buffers went with the old size or format.
+            if let Some(d) = self.direct.as_mut() {
+                d.bufs.clear();
+            }
         }
         if self.s.inited() {
             return cuda::make_current().context("cuCtxSetCurrent (encode thread)");
