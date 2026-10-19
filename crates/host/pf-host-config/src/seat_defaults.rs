@@ -28,6 +28,8 @@ pub struct SeatDefaults {
     pub browser: bool,
     /// The browser origins the box admits, which each seat's plane admits too.
     pub browser_origins: Vec<String>,
+    /// Every app a Windows seat starts reads GameInput in the background.
+    pub background_input: bool,
 }
 
 impl SeatDefaults {
@@ -39,6 +41,7 @@ impl SeatDefaults {
             dualsense_usbip: config.dualsense_usbip,
             browser: config.webtransport,
             browser_origins: config.webtransport_origins.clone(),
+            background_input: config.seat_background_input,
         }
     }
 
@@ -50,6 +53,7 @@ impl SeatDefaults {
             "dualsense_usbip": self.dualsense_usbip,
             "browser": self.browser,
             "browser_origins": self.browser_origins,
+            "background_input": self.background_input,
         })
     }
 
@@ -71,6 +75,7 @@ impl SeatDefaults {
                 .flatten()
                 .filter_map(|o| o.as_str().map(str::to_string))
                 .collect(),
+            background_input: v["background_input"].as_bool().unwrap_or(false),
         }
     }
 }
@@ -126,6 +131,7 @@ mod tests {
             dualsense_usbip: true,
             browser: true,
             browser_origins: vec!["https://box:47992".into()],
+            background_input: true,
         };
         assert_eq!(SeatDefaults::from_json(&d.to_json()), d);
         assert_eq!(
@@ -137,6 +143,7 @@ mod tests {
                 dualsense_usbip: false,
                 browser: false,
                 browser_origins: Vec::new(),
+                background_input: false,
             }
         );
     }
