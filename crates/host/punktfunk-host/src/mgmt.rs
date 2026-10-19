@@ -236,6 +236,8 @@ pub async fn run(
     crate::update::reconcile_at_boot();
     crate::plugin_host::channel::remember_runtime();
     settings::write_seat_defaults();
+    #[cfg(target_os = "windows")]
+    crate::windows::background_input::start();
     // The tray has no supervisor — HKLM `Run` is a sign-in trigger — so
     // `StopTrays` and a crash leave no icon until the next logon.
     #[cfg(target_os = "windows")]

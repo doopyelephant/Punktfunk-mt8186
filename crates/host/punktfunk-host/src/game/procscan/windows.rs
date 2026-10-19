@@ -250,7 +250,7 @@ fn same_path(image: &Path, want: &Path) -> bool {
 
 /// Case-insensitive prefix, with a separator after the directory so
 /// `…\Games\X` does not match `…\Games\XY\game.exe`.
-fn under_dir(image: &Path, dir: &Path) -> bool {
+pub(crate) fn under_dir(image: &Path, dir: &Path) -> bool {
     let (i, d) = (wide_lower(image), wide_lower(dir));
     let Some(rest) = i.strip_prefix(d.as_str()) else {
         return false;

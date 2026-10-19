@@ -424,6 +424,11 @@ async fn save(st: &MgmtState, patch: serde_json::Map<String, Value>) -> Response
     crate::diagnostics::registry().set(crate::diagnostics::catalog::restart_pending());
     crate::events::emit(crate::events::EventKind::SettingsChanged { ids });
     write_seat_defaults();
+    // Seats read their copy within a tick; a grant made in that tick stays until the box restarts.
+    #[cfg(target_os = "windows")]
+    if patch.contains_key("seat_background_input") {
+        crate::windows::background_input::apply();
+    }
     answer(st).await
 }
 

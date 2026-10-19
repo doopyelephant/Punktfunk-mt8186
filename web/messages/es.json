@@ -1245,6 +1245,8 @@
 	"setting_seat_max_mode_hint": "Como 2560x1440@120. El límite del propio dispositivo tiene prioridad; en blanco es sin límite.",
 	"setting_seat_library_writable": "Los puestos pueden actualizar tus juegos",
 	"setting_seat_library_writable_hint": "Desactivado: los puestos juegan a tus títulos instalados pero no pueden actualizarlos ni instalar en tus carpetas.",
+	"setting_seat_background_input": "Los puestos conservan sus mandos",
+	"setting_seat_background_input_hint": "Para juegos que leen los mandos con Microsoft GameInput y los pierden cuando otra persona en este PC cambia de aplicación. Cada aplicación que inicia un puesto recibe el mando también en segundo plano, igual que la misma aplicación usada directamente en este PC. Reinicia un juego que ya esté abierto.",
 	"setting_tray_autostart": "Inicio automático en bandeja del sistema",
 	"setting_tray_autostart_hint": "Inicia el icono de estado junto al reloj al iniciar sesión.",
 	"library_search_placeholder": "Buscar juegos",

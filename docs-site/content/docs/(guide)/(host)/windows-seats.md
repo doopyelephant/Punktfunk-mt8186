@@ -154,6 +154,13 @@ pick the profile.
 That Steam was started as the PC's own, from `steam.exe` itself. Start Steam from the **Steam**
 icon on the desktop or in the Start menu, or from punktfunk's library.
 
+### A game on a seat loses its controller
+
+The game reads controllers through Microsoft GameInput, which gives them to one app on the whole
+PC: the one that came to the front last, on any seat or on the PC itself. Turn on **Seats keep
+their controllers** under **Settings** → **Seats**, then restart the game. Every app a seat starts
+then keeps its controller in the background, and so does the same app played on the PC directly.
+
 ### A seat has no sound
 
 Steam's audio drivers aren't on this PC: Steam is missing, or was installed and never opened.
