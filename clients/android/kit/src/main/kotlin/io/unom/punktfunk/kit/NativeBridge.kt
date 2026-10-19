@@ -98,12 +98,26 @@ object NativeBridge {
     ): String
 
     /**
-     * The native client's recent log ring rendered as one text bundle, oldest first,
-     * prefixed by [header] (this app's identity line) — the body for "Send logs to host"
-     * (`POST /api/v1/client-logs` over the same mTLS client the library fetch uses).
-     * Never empty; cheap (string copy, no I/O).
+     * The native client's log rendered as one text bundle, oldest first, prefixed by [header]
+     * (this app's identity line) — the body for "Send logs to host" (`POST /api/v1/client-logs`
+     * over the same mTLS client the library fetch uses). It is the newest 768 KiB of the file
+     * [nativeOpenLogFile] opened, earlier runs included, or the in-memory ring when none is open.
+     * Never empty; reads the file, so call it off the main thread.
      */
     external fun nativeRenderLogs(header: String): String
+
+    /** Keep every native log line in [dir]`/client.log` from now on, rotated at 768 KiB. */
+    external fun nativeOpenLogFile(dir: String)
+
+    /** Each line of [text] as an ERROR `pf.crash` line in the log, on disk before this returns. */
+    external fun nativeLogCrash(text: String)
+
+    /**
+     * How the previous run ended: [summary] (`ApplicationExitInfo.toString()`) as one log line,
+     * then, by [reason], the crashing thread of a native crash's tombstone or the main thread of
+     * an ANR from [trace] (its `traceInputStream`, empty when Android kept none).
+     */
+    external fun nativeLogExit(summary: String, reason: Int, trace: ByteArray)
 
     /**
      * One `pf.wifi` line in the log ring above: why it was written, then the Wi-Fi link's signal
