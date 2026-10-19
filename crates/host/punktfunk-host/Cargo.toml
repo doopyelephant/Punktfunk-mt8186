@@ -10,7 +10,7 @@ repository.workspace = true
 
 [dependencies]
 # Managed emulators: install, detect, remove. Pinned to a commit until it is on crates.io.
-hermir = { git = "https://github.com/unom-io/hermir", rev = "6fdf0fa7bbef8b23e78ac1b967cba3c2db0f8b6e" }
+hermir = { git = "https://github.com/unom-io/hermir", rev = "1b2d20f95a599a765e9dc44cb4928fc14e9625b1" }
 # `ureq-tls` is for `ctl`: ureq's own `TlsConfig` has no hook for a custom certificate verifier,
 # so the pinned operator client hands rustls a `ClientConfig` through core's shared glue — the same
 # path the tray and the desktop client already take. `quic` brings `tls` (and `PinVerify`) with it.
