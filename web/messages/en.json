@@ -1255,7 +1255,7 @@
 	"setting_seat_library_writable": "Seats update your games",
 	"setting_seat_library_writable_hint": "Off: seats play your installed games but can't update them or install into your libraries.",
 	"setting_seat_background_input": "Seats keep their controllers",
-	"setting_seat_background_input_hint": "For games that read controllers through Microsoft GameInput, which drop them when anyone else on this PC switches apps. Every app a seat starts keeps controller input in the background, and so does the same app played on this PC directly. Restart a game that is already running.",
+	"setting_seat_background_input_hint": "For games that drop the controller when someone else on this PC switches apps. Restart a running game.",
 	"setting_tray_autostart": "Tray autostart",
 	"setting_tray_autostart_hint": "Starts the status icon next to the clock at sign-in.",
 	"library_search_placeholder": "Search games",
