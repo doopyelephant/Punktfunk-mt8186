@@ -2001,8 +2001,9 @@ mod tests {
         }
     }
 
-    /// No GPU and no store. Host, launch, clipboard, timeout, bitrate, and codec
-    /// come from the plan. Caps are the wire bits, not whatever the helper returns.
+    /// No GPU and no store. Host, launch, clipboard, timeout, bitrate, codec, the ring and
+    /// the window's settings come from the plan. Caps are the wire bits, not whatever the
+    /// helper returns.
     #[test]
     fn session_params_carry_the_plan_without_a_gpu() {
         let h = host(
@@ -2022,6 +2023,10 @@ mod tests {
                 pyrowave_bpp: 1.2,
                 codec: "av1".into(),
                 enable_444: true,
+                overlay_actions: r#"{"v":2,"ring":["stats"]}"#.into(),
+                vsync: false,
+                invert_scroll: true,
+                fullscreen_on_stream: true,
                 ..Default::default()
             },
             wake: false,
@@ -2056,6 +2061,12 @@ mod tests {
         );
         assert_eq!(params.bitrate_kbps, plan.settings.bitrate_kbps);
         assert_ne!(plan.settings.bitrate_kbps, Settings::default().bitrate_kbps);
+        assert_eq!(params.overlay_actions, plan.settings.overlay_actions);
+        assert!(!params.vsync && params.invert_scroll && params.fullscreen);
+        assert_eq!(
+            params.render_scale_max_dim, 8192,
+            "the av1 ceiling, not H.264's"
+        );
         assert_eq!(params.pyrowave_bpp_x100, 120);
         assert_eq!(params.preferred_codec, punktfunk_core::quic::CODEC_AV1);
         assert_ne!(plan.settings.codec, Settings::default().codec);

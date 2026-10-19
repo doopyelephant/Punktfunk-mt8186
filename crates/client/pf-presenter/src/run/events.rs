@@ -266,7 +266,7 @@ impl Shell {
                 )?;
                 // Match-window: restamp the debounce. The request fires once
                 // ~400 ms pass with no further size events, never per drag-frame.
-                if self.opts.match_window.is_some() {
+                if self.opts.match_window {
                     if let Some(st) = stream.as_mut() {
                         st.resize_pending = Some(Instant::now());
                     }
