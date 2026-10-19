@@ -310,6 +310,7 @@ class MainActivity : ComponentActivity() {
     private var sc2MoveFocus: ((androidx.compose.ui.focus.FocusDirection) -> Boolean)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        CrashLog.install(applicationContext)
         super.onCreate(savedInstanceState)
         // A URL may never preempt a live session (design/client-deep-links.md §3.2). With
         // `launchMode = standard` a link normally arrives as a NEW activity instance in a new task
