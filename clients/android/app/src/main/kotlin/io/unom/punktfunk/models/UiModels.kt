@@ -121,6 +121,7 @@ data class LaunchHold(
     val mgmtPort: Int,
     val fpHex: String,
     val sourceRect: Rect? = null,
+    val streamPort: Int = 0,
 )
 
 /**

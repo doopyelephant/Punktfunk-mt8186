@@ -799,7 +799,8 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-running".into())
             .spawn(move || {
-                let status = library::fetch_status(&addr, mgmt, &identity, pin);
+                let port = stream_port(&fp_hex);
+                let status = library::fetch_status(&addr, mgmt, port, &identity, pin);
                 if shared.fetch_epoch() == epoch {
                     shared.set_downloads(&status.downloads, status.grants);
                     shared.set_running(&status.games);
@@ -816,7 +817,8 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-profiles".into())
             .spawn(move || {
-                let answer = match profiles::fetch_enumerate(&addr, mgmt, &identity, pin) {
+                let port = stream_port(&fp_hex);
+                let answer = match profiles::fetch_enumerate(&addr, mgmt, port, &identity, pin) {
                     Ok(Some(listed)) => ProfilesAnswer::Listed(listed),
                     Ok(None) => ProfilesAnswer::NoProfiles,
                     Err(e) => {
@@ -836,7 +838,8 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-wake-seat".into())
             .spawn(move || {
-                if let Err(e) = profiles::wake(&addr, mgmt, &identity, pin, &id) {
+                let port = stream_port(&fp_hex);
+                if let Err(e) = profiles::wake(&addr, mgmt, port, &identity, pin, &id) {
                     tracing::info!(%addr, error = %e, "profile seat did not wake");
                 }
             })
@@ -856,7 +859,7 @@ impl ServiceState {
                     "punktfunk-session",
                     &host_name,
                     &addr,
-                    mgmt,
+                    (mgmt, stream_port(&fp_hex)),
                     &identity,
                     &fp_hex,
                 ));
@@ -938,8 +941,9 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-hostaction".into())
             .spawn(move || {
+                let port = stream_port(&fp_hex);
                 console.set_notice(pf_client_core::host_actions::run(
-                    &host_name, &addr, mgmt, &identity, &fp_hex, &action_id, &label,
+                    &host_name, &addr, mgmt, port, &identity, &fp_hex, &action_id, &label,
                 ));
             })
             .ok();
@@ -965,10 +969,11 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-endgame".into())
             .spawn(move || {
-                let outcome = library::end_game(&addr, mgmt, &identity, pin, &app_id);
+                let port = stream_port(&fp_hex);
+                let outcome = library::end_game(&addr, mgmt, port, &identity, pin, &app_id);
                 tracing::info!(app = %app_id, ?outcome, "end game");
                 console.set_notice(outcome.notice(&title));
-                let running = library::fetch_running(&addr, mgmt, &identity, pin);
+                let running = library::fetch_running(&addr, mgmt, port, &identity, pin);
                 if shared.fetch_epoch() == epoch {
                     shared.set_running(&running);
                 }
@@ -993,10 +998,12 @@ impl ServiceState {
         std::thread::Builder::new()
             .name("punktfunk-install".into())
             .spawn(move || {
-                let outcome = library::change_install(&addr, mgmt, &identity, pin, &app_id, action);
+                let port = stream_port(&fp_hex);
+                let outcome =
+                    library::change_install(&addr, mgmt, port, &identity, pin, &app_id, action);
                 tracing::info!(app = %app_id, ?action, ?outcome, "title install");
                 console.set_notice(outcome.notice(action, &title));
-                let status = library::fetch_status(&addr, mgmt, &identity, pin);
+                let status = library::fetch_status(&addr, mgmt, port, &identity, pin);
                 if shared.fetch_epoch() == epoch {
                     if outcome == library::InstallOutcome::Done
                         && action == library::InstallAction::Remove
@@ -1313,8 +1320,8 @@ impl ServiceState {
     fn refresh_host_state(&self, rows: &[HostRow]) {
         for r in rows {
             if r.paired && r.online && r.pin.is_none() {
-                pf_client_core::host_actions::refresh(&r.addr, r.mgmt_port, &r.fp_hex);
-                library::refresh_running(&r.addr, r.mgmt_port, &r.fp_hex);
+                pf_client_core::host_actions::refresh(&r.addr, r.mgmt_port, r.port, &r.fp_hex);
+                library::refresh_running(&r.addr, r.mgmt_port, r.port, &r.fp_hex);
             }
         }
     }
@@ -1570,6 +1577,14 @@ fn save_preset(id: String, name: String, overrides: serde_json::Value) {
     }
 }
 
+/// The stream port of the saved host `fp_hex` pins, where its management API answers without
+/// TCP. 0 with no such record: HTTPS alone. Reads the hosts file, so call it on a worker.
+fn stream_port(fp_hex: &str) -> u16 {
+    trust::KnownHosts::load()
+        .find_by_fp(fp_hex)
+        .map_or(0, |h| h.port)
+}
+
 /// Fetch the library off the service thread, then stream poster art into the shared
 /// model as results land (the renderer drains `push_art` per frame). `(port, mgmt)`: the
 /// stream port the management tunnel tries first, then the HTTPS port.
@@ -1704,13 +1719,14 @@ fn spawn_fetch(
                 // What the host has up right now, so a title the player can return to says so.
                 // Deliberately after the catalog — a slow `/status` must not hold the titles
                 // back — and never fatal: an older host answers nothing and every badge stays off.
-                let running = library::fetch_running(&addr, mgmt, &identity, pin);
+                let running = library::fetch_running(&addr, mgmt, port, &identity, pin);
                 if mine() {
                     shared.set_running(&running);
                 }
             }
             if !jobs.is_empty() {
-                let rx = library::spawn_art_fetch(base, identity, pin, jobs);
+                let api = library::HostApi::new(&addr, mgmt, port, &identity, pin);
+                let rx = library::spawn_art_fetch(api, jobs);
                 while let Ok((id, bytes)) = rx.recv_blocking() {
                     if !mine() {
                         return;

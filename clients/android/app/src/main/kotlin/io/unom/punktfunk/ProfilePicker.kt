@@ -70,8 +70,8 @@ object HostProfiles {
     private const val TAG = "HostProfiles"
 
     /** A host without the route has no profiles; a refusal or no answer is [ProfilesAnswer.Failed]. */
-    fun fetch(identity: ClientIdentity, addr: String, mgmtPort: Int, fpHex: String): ProfilesAnswer {
-        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, PROFILES_WAIT_MS) { base ->
+    fun fetch(identity: ClientIdentity, addr: String, mgmtPort: Int, fpHex: String, streamPort: Int = 0): ProfilesAnswer {
+        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, PROFILES_WAIT_MS, streamPort) { base ->
             Request.Builder().url("$base/api/v1/profiles/enumerate").get().build()
         }
         return when {
@@ -83,8 +83,8 @@ object HostProfiles {
     }
 
     /** Starts a stopped seat. `enumerate` says whether it came up, so a failure is only logged. */
-    fun wake(identity: ClientIdentity, addr: String, mgmtPort: Int, fpHex: String, id: String) {
-        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, PROFILES_WAIT_MS) { base ->
+    fun wake(identity: ClientIdentity, addr: String, mgmtPort: Int, fpHex: String, id: String, streamPort: Int = 0) {
+        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, PROFILES_WAIT_MS, streamPort) { base ->
             Request.Builder().url("$base/api/v1/profiles/$id/wake")
                 .post(ByteArray(0).toRequestBody(null, 0, 0)).build()
         }
@@ -122,7 +122,7 @@ class ProfileWait(val title: String) {
 /** Whether [host] still lists profile [id], by a fresh answer. */
 suspend fun stillListed(identity: ClientIdentity, host: KnownHost, id: String): Boolean =
     withContext(Dispatchers.IO) {
-        HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex)
+        HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex, host.port)
     }.let { it is ProfilesAnswer.Listed && it.rows.any { r -> r.id == id } }
 
 /** The one redial a seat host's `profile-unknown` earns, for every touch connect. */
@@ -166,7 +166,7 @@ suspend fun chooseProfile(
     if (host == null || !host.paired || host.fpHex.isEmpty()) return ProfileChoice.Dial(link)
     val saved = store.byId(host.id)?.asProfile ?: host.asProfile
     val answer = withContext(Dispatchers.IO) {
-        HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex)
+        HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex, host.port)
     }
     val listed = when (answer) {
         is ProfilesAnswer.Listed -> answer.rows.takeIf { it.isNotEmpty() }
@@ -206,13 +206,13 @@ private suspend fun gateSeat(
                 SeatGate.Dial -> return ProfileChoice.Dial(id)
                 is SeatGate.Refuse -> return ProfileChoice.Refused(g.line)
                 SeatGate.Wake -> withContext(Dispatchers.IO) {
-                    HostProfiles.wake(identity, host.address, host.effectiveMgmtPort, host.fpHex, row.id)
+                    HostProfiles.wake(identity, host.address, host.effectiveMgmtPort, host.fpHex, row.id, host.port)
                 }
                 is SeatGate.Wait -> w.detail = g.detail
             }
             if (withTimeoutOrNull(SEAT_POLL_MS) { w.cancelled.await() } != null) return ProfileChoice.Cancelled
             val answer = withContext(Dispatchers.IO) {
-                HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex)
+                HostProfiles.fetch(identity, host.address, host.effectiveMgmtPort, host.fpHex, host.port)
             }
             if (w.cancelled.isCompleted) return ProfileChoice.Cancelled
             val rows = (answer as? ProfilesAnswer.Listed)?.rows ?: continue

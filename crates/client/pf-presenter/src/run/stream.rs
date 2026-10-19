@@ -355,14 +355,14 @@ pub(super) fn ring_facts(
         mgmt_port: c.mgmt_port(),
         fp_hex: st.fp_hex.clone(),
         host_name: opts.window_title.clone(),
-        streamed_game: streamed_game(&st.params.host, c.mgmt_port(), &st.fp_hex),
+        streamed_game: streamed_game(&st.params.host, (c.mgmt_port(), st.params.port), &st.fp_hex),
     }
 }
 
 /// The game this device launched that this stream plays, from the running cache. Keeps
 /// the cache fresh too: [`pf_client_core::library::refresh_running`] is TTL-gated.
-fn streamed_game(addr: &str, mgmt_port: u16, fp_hex: &str) -> Option<(String, String)> {
-    pf_client_core::library::refresh_running(addr, mgmt_port, fp_hex);
+fn streamed_game(addr: &str, (mgmt, port): (u16, u16), fp_hex: &str) -> Option<(String, String)> {
+    pf_client_core::library::refresh_running(addr, mgmt, port, fp_hex);
     pf_client_core::library::running(fp_hex)
         .into_iter()
         .find(|g| g.streamed_here())
@@ -604,8 +604,9 @@ impl Shell {
         st.fp_hex = pf_client_core::trust::hex(&fingerprint);
         // Pre-fetch the ring's host-action slots here, never when it opens.
         let host_addr = st.params.host.clone();
-        pf_client_core::host_actions::refresh(&host_addr, c.mgmt_port(), &st.fp_hex);
-        pf_client_core::library::refresh_running(&host_addr, c.mgmt_port(), &st.fp_hex);
+        let ports = (c.mgmt_port(), st.params.port);
+        pf_client_core::host_actions::refresh(&host_addr, ports.0, ports.1, &st.fp_hex);
+        pf_client_core::library::refresh_running(&host_addr, ports.0, ports.1, &st.fp_hex);
         // The resolved rate — a `0 = native` request becomes a real number
         // here, last moment before frames start arriving.
         st.source_interval_ns = frame_interval_ns(m.refresh_hz, self.native.refresh_hz);
@@ -899,6 +900,7 @@ impl Shell {
                 let Some(c) = &st.connector else { return };
                 let (tx, rx) = std::sync::mpsc::channel();
                 let (addr, mgmt, fp) = (st.params.host.clone(), c.mgmt_port(), st.fp_hex.clone());
+                let port = st.params.port;
                 std::thread::Builder::new()
                     .name("punktfunk-endgame".into())
                     .spawn(move || {
@@ -906,6 +908,7 @@ impl Shell {
                             Ok(id) => pf_client_core::library::end_game(
                                 &addr,
                                 mgmt,
+                                port,
                                 &id,
                                 pf_client_core::trust::parse_hex32(&fp),
                                 &app_id,

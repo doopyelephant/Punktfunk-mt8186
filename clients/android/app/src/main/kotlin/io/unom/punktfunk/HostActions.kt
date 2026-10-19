@@ -52,8 +52,8 @@ object HostActions {
      * What this host lets this device do to it (`GET /api/v1/actions`). Only the PERMITTED rows
      * come back: what a device may not invoke is not its business to render.
      */
-    fun list(identity: ClientIdentity, addr: String, mgmtPort: Int, fpHex: String): List<Action> {
-        val reply = mgmtCall(identity, addr, mgmtPort, fpHex) { base ->
+    fun list(identity: ClientIdentity, addr: String, mgmtPort: Int, fpHex: String, streamPort: Int = 0): List<Action> {
+        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, streamPort = streamPort) { base ->
             Request.Builder().url("$base/api/v1/actions").get().build()
         }
         if (reply !is MgmtReply.Answer || !reply.ok) return emptyList()
@@ -90,8 +90,9 @@ object HostActions {
         hostName: String,
         actionId: String,
         label: String,
+        streamPort: Int = 0,
     ): String {
-        val reply = mgmtCall(identity, addr, mgmtPort, fpHex) { base ->
+        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, streamPort = streamPort) { base ->
             Request.Builder()
                 .url("$base/api/v1/actions/$actionId")
                 // Empty body by design: the id is the whole request, and no request field ever

@@ -204,7 +204,7 @@ fun ConnectScreen(
                 // Stamp BEFORE the request, so a slow host cannot make every lap ask again.
                 hostActionsAt = hostActionsAt + (kh.fpHex to now)
                 val found = withContext(Dispatchers.IO) {
-                    HostActions.list(id, kh.address, kh.effectiveMgmtPort, kh.fpHex)
+                    HostActions.list(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.port)
                 }
                 hostActions = hostActions + (kh.fpHex to found)
             }
@@ -283,7 +283,7 @@ fun ConnectScreen(
         scope.launch {
             ctl.notice = withContext(Dispatchers.IO) {
                 HostActions.invoke(
-                    id, kh.address, kh.effectiveMgmtPort, kh.fpHex, name, a.id, a.label,
+                    id, kh.address, kh.effectiveMgmtPort, kh.fpHex, name, a.id, a.label, kh.port,
                 )
             }
         }
@@ -306,7 +306,7 @@ fun ConnectScreen(
         switching = kh to null
         scope.launch {
             val answer = withContext(Dispatchers.IO) {
-                HostProfiles.fetch(id, kh.address, kh.effectiveMgmtPort, kh.fpHex)
+                HostProfiles.fetch(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.port)
             }
             if (switching?.first?.id == kh.id) switching = kh to answer
         }

@@ -316,7 +316,7 @@ fun LibraryScreen(
                         launchHold = game.takeUnless { it.isLauncher || it.isDesktop }?.let {
                             LaunchHold(
                                 it, host.address, host.effectiveMgmtPort, host.fpHex,
-                                sourceRect = TileFrames.rect(it.id),
+                                sourceRect = TileFrames.rect(it.id), streamPort = host.port,
                             )
                         },
                     ),
@@ -387,7 +387,7 @@ fun LibraryScreen(
         scope.launch {
             val outcome = withContext(Dispatchers.IO) {
                 LibraryClient.endGame(
-                    ready.identity, host.address, host.effectiveMgmtPort, host.fpHex, game.id,
+                    ready.identity, host.address, host.effectiveMgmtPort, host.fpHex, game.id, host.port,
                 )
             }
             if (outcome.gameGone) {
@@ -405,7 +405,7 @@ fun LibraryScreen(
             val status = withContext(Dispatchers.IO) {
                 LibraryClient.fetchStatus(
                     host.address, host.effectiveMgmtPort, ready.identity.certPem,
-                    ready.identity.privateKeyPem, host.fpHex,
+                    ready.identity.privateKeyPem, host.fpHex, host.port,
                 )
             }
             (state as? LibState.Ready)?.let { state = it.withStatus(status) }
@@ -417,6 +417,7 @@ fun LibraryScreen(
             val outcome = withContext(Dispatchers.IO) {
                 LibraryClient.changeInstall(
                     ready.identity, host.address, host.effectiveMgmtPort, host.fpHex, game.id, action,
+                    host.port,
                 )
             }
             if (outcome == InstallOutcome.Done && action == InstallAction.Remove) {
@@ -547,6 +548,7 @@ private suspend fun loadLibrary(
                     certPem = identity.certPem,
                     keyPem = identity.privateKeyPem,
                     fpHex = host.fpHex,
+                    streamPort = host.port,
                 )
             }
             set(LibState.Ready(res.games, loader, identity).withStatus(status))
@@ -578,7 +580,7 @@ private suspend fun loadLibrary(
 private suspend fun prepareLoader(context: Context, host: KnownHost): Pair<ClientIdentity, ImageLoader>? =
     withContext(Dispatchers.IO) {
         val id = IdentityHolder.shared(context).await() ?: return@withContext null
-        val loader = runCatching { posterLoader(context, id, host.address, host.fpHex) }.getOrNull()
+        val loader = runCatching { posterLoader(context, id, host.address, host.fpHex, host.port) }.getOrNull()
             ?: return@withContext null
         id to loader
     }

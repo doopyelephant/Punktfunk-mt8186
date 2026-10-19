@@ -221,7 +221,8 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
 
             // After the titles: a slow `/status` must not hold the shelf back.
             let mgmt = target.host.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
-            for g in library::fetch_running(&target.host.addr, mgmt, &identity, pin) {
+            let port = target.host.port;
+            for g in library::fetch_running(&target.host.addr, mgmt, port, &identity, pin) {
                 if let Some(id) = g.app_id.clone().filter(|_| g.is_up()) {
                     *state.running.entry(id).or_default() |= g.endable;
                 }
@@ -233,7 +234,8 @@ pub(crate) fn start_fetch(ctx: &Arc<AppCtx>, set_library: &AsyncSetState<Library
             if jobs.is_empty() {
                 return;
             }
-            let rx = library::spawn_art_fetch(base, identity, pin, jobs);
+            let api = library::HostApi::new(&target.host.addr, mgmt, port, &identity, pin);
+            let rx = library::spawn_art_fetch(api, jobs);
             while let Ok((id, bytes)) = rx.recv_blocking() {
                 if shared.library_gen.load(Ordering::SeqCst) != generation {
                     return; // superseded — stop touching state (and the cache is shared anyway)
@@ -696,8 +698,8 @@ pub(crate) fn library_page(props: &LibraryProps, cx: &mut RenderCx) -> Element {
                             .as_deref()
                             .and_then(crate::trust::parse_hex32);
                         let mgmt = target.host.mgmt_port.unwrap_or(library::DEFAULT_MGMT_PORT);
-                        let outcome =
-                            library::end_game(&target.host.addr, mgmt, &ctx2.identity, pin, &id);
+                        let (addr, port) = (&target.host.addr, target.host.port);
+                        let outcome = library::end_game(addr, mgmt, port, &ctx2.identity, pin, &id);
                         tracing::info!(app = %id, ?outcome, "end game");
                         se.call(EndGameUi {
                             ask: None,

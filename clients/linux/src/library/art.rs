@@ -5,13 +5,10 @@
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
-use pf_client_core::library::{ArtJob, ArtPool, GameEntry};
+use pf_client_core::library::{ArtJob, ArtPool, GameEntry, HostApi};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-
-/// Where a shelf's art comes from: the host's base URL, this device's identity, the host's pin.
-pub type Source = (String, (String, String), Option<[u8; 32]>);
 
 /// Decoded posters kept, in bytes. About 700 tiles at 1x, 180 at 2x.
 const BUDGET: usize = 192 << 20;
@@ -62,16 +59,16 @@ pub struct Art {
 impl Art {
     /// A new shelf: stop the old pool and start one for `source`. Textures stay, keyed by title
     /// id, which a store qualifies per host.
-    pub fn reset(self: &Rc<Self>, source: Option<Source>) {
+    pub fn reset(self: &Rc<Self>, source: Option<HostApi>) {
         self.pool.take();
         self.waiting.borrow_mut().clear();
         self.asked.borrow_mut().clear();
         self.missing.borrow_mut().clear();
-        let Some((base, identity, pin)) = source else {
+        let Some(api) = source else {
             return;
         };
-        *self.base.borrow_mut() = base.clone();
-        let (pool, rx) = ArtPool::start(base, identity, pin, decode);
+        *self.base.borrow_mut() = api.base();
+        let (pool, rx) = ArtPool::start(api, decode);
         *self.pool.borrow_mut() = Some(pool);
         let art = Rc::downgrade(self);
         glib::spawn_future_local(async move {

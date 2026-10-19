@@ -109,12 +109,14 @@ class LibraryClientTest {
         sleep = { run.slept += it },
     )
 
-    /** A stream-port reply splits at its first newline; a line with no status is not one. */
+    /** A stream-port reply is two bytes of status, then a body that may be binary. */
     @Test
-    fun a_stream_reply_splits_at_its_first_newline() {
-        assertEquals(200 to "{\"a\":\n1}", LibraryClient.streamReply("200\n{\"a\":\n1}"))
-        assertEquals(404 to "", LibraryClient.streamReply("404\n"))
-        assertNull(LibraryClient.streamReply("nope"))
+    fun a_stream_reply_is_its_status_then_its_body() {
+        val (code, body) = tunnelReply(byteArrayOf(0x01, 0x94.toByte(), 0x00, 0xff.toByte()))!!
+        assertEquals(404, code)
+        assertEquals(listOf<Byte>(0x00, 0xff.toByte()), body.toList())
+        assertEquals(200, tunnelReply(byteArrayOf(0x00, 0xc8.toByte()))?.first)
+        assertNull(tunnelReply(byteArrayOf(0x01)))
     }
 
     /**

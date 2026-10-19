@@ -474,7 +474,7 @@ fun StreamScreen(
             hostRecord?.let { kh ->
                 scope.launch(Dispatchers.IO) {
                     (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
-                        HostActions.invoke(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.name, act.id, act.label)
+                        HostActions.invoke(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.name, act.id, act.label, kh.port)
                     }
                 }
             }
@@ -506,7 +506,7 @@ fun StreamScreen(
                 scope.launch {
                     val outcome = withContext(Dispatchers.IO) {
                         (IdentityStore(context).load() as? IdentityLoad.Ok)?.identity?.let { id ->
-                            LibraryClient.endGame(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, appId)
+                            LibraryClient.endGame(id, kh.address, kh.effectiveMgmtPort, kh.fpHex, appId, kh.port)
                         } ?: GameEnd.Failed("this device has no identity yet")
                     }
                     // Gone either way: leave as End stream does. A refusal keeps the stream.

@@ -92,7 +92,7 @@ internal fun pinTitleShortcut(
 ): String? {
     val bytes = identity?.let { me ->
         runCatching {
-            fetchArt(posters, posterHttp(context, me, host.address, host.fpHex), offline = false)
+            fetchArt(posters, posterHttp(context, me, host.address, host.fpHex, host.port), offline = false)
         }.getOrNull()
     }
     val art = bytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }

@@ -265,7 +265,8 @@ mod session_main {
         let mgmt = host.map_or(pf_client_core::library::DEFAULT_MGMT_PORT, |h| {
             h.effective_mgmt_port()
         });
-        match pf_client_core::profiles::fetch_enumerate(addr, mgmt, identity, Some(pin)) {
+        let port = host.map_or(0, |h| h.port);
+        match pf_client_core::profiles::fetch_enumerate(addr, mgmt, port, identity, Some(pin)) {
             Ok(Some(listed)) => {
                 pf_client_core::profiles::find(&listed, &wanted).map_or(wanted, |p| p.id.clone())
             }
