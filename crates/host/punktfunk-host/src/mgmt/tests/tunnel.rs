@@ -87,8 +87,13 @@ async fn a_tunnelled_request_is_the_lan_peer_it_came_from() {
         "the position-authenticated lane is refused by the tunnel itself"
     );
     assert_eq!(
-        via(head("DELETE", "/api/v1/clients", &admin)).await,
+        via(head("PUT", "/api/v1/clients", &admin)).await,
         StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert_eq!(
+        via(head("DELETE", "/api/v1/clients", &admin)).await,
+        StatusCode::UNAUTHORIZED,
+        "DELETE reaches the router, whose auth still refuses a LAN admin bearer"
     );
     assert_eq!(
         via(head("GET", "/api/docs", &[])).await,
