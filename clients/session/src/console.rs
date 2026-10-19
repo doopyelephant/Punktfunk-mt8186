@@ -158,13 +158,9 @@ pub fn run(target: Option<&str>) -> u8 {
     // `--json-status`: a shell parent is reading stdout (the WinUI shell hides itself on
     // `{"ready":true}` and restores on exit) — plain CLI/gamescope runs stay silent.
     let json_status = arg_flag("--json-status");
+    // Seeds the window only. Every launch re-resolves settings and the preset binding, and the
+    // presenter adopts that launch's `SessionParams`: no setting waits for a console restart.
     let settings_at_start = trust::Settings::load();
-    // The console window and its input models are built once from the global defaults and live
-    // across launches, so the presentation-tier fields below (touch and mouse model, shortcut
-    // inhibit, match-window, render scale) latch here and no per-host preset can move them.
-    // What the host is told (mode, bitrate, codec, audio, pad) re-resolves per launch and honors
-    // the binding; anything else off this snapshot must ride `SessionParams` like the stats tier.
-    let latched_mouse = settings_at_start.mouse_mode();
 
     // Request-access hand-off: the launch handler stamps this when it starts a delegated-approval
     // connect; `on_connected` reads it once the host lets us in and persists the host as PAIRED,
@@ -180,15 +176,11 @@ pub fn run(target: Option<&str>) -> u8 {
         ),
         fullscreen: fullscreen_mode(),
         window_pos: window_pos(),
-        // Seeds the loop only — every launch carries its own freshly resolved tier.
         stats_verbosity: stats_tier(&settings_at_start),
         touch_mode: settings_at_start.touch_mode(),
         mouse_mode: settings_at_start.mouse_mode(),
         invert_scroll: settings_at_start.invert_scroll,
         inhibit_shortcuts: settings_at_start.inhibit_shortcuts,
-        overlay_actions: settings_at_start.overlay_actions.clone(),
-        // Presentation-tier like the rows above: latched at console start, a per-host
-        // preset cannot move it in this mode (the documented P4 gap).
         present_priority: settings_at_start.present_priority(),
         vsync: settings_at_start.vsync,
         allow_vrr: settings_at_start.allow_vrr,
@@ -214,11 +206,10 @@ pub fn run(target: Option<&str>) -> u8 {
         })),
         overlay: Some(Box::new(overlay)),
         window_size: crate::session_main::window_size(&settings_at_start),
-        // Latched at console start (like the stats tier above): toggling Match window in
-        // the console's settings screen applies from the next console launch.
+        match_window: settings_at_start.match_window,
         // The console owns its own window across every launch, and no parent is listening to
         // its stdout, so it keeps persisting the size itself.
-        match_window: crate::session_main::match_window(&settings_at_start, true),
+        on_window_size: crate::session_main::on_window_size(true),
         render_scale: settings_at_start.render_scale,
         render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings_at_start.codec),
         video_fit: punktfunk_core::video_fit::VideoFit::from_name(&settings_at_start.video_fit),
@@ -279,10 +270,6 @@ pub fn run(target: Option<&str>) -> u8 {
                         force_software,
                         vulkan,
                     );
-                    // cursor_forward tells the host the client draws the pointer, true only in
-                    // desktop mouse mode — so it follows the latched mode, not this launch's
-                    // preset. Otherwise the host composites no cursor and the stream shows none.
-                    params.cursor_forward = latched_mouse == trust::MouseMode::Desktop;
                     params.profile = profile;
                     if request_access {
                         // The host PARKS the connect until the operator approves — outlast its

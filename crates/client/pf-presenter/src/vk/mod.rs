@@ -298,6 +298,8 @@ pub struct Presenter {
     /// Latest ST.2086/CLL metadata (0xCE plane). Pushed while HDR10 is live; until the
     /// first datagram, a generic HDR10 baseline is pushed instead.
     hdr_meta: Option<punktfunk_core::quic::HdrMeta>,
+    /// The intent `present_mode` was picked from, device facts resolved.
+    pref: PresentPref,
     present_mode: vk::PresentModeKHR,
     swapchain: vk::SwapchainKHR,
     images: Vec<vk::Image>,

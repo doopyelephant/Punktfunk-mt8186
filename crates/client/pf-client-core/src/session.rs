@@ -128,6 +128,25 @@ pub struct SessionParams {
     /// Hold the screen awake for the whole stream; off, only while the player's input is recent
     /// ([`punktfunk_core::client::holds_screen_awake`]).
     pub keep_awake: bool,
+    /// Quick-action ring blob this launch resolved; empty = the platform default. Per launch
+    /// like the tier, so a browse-mode presenter shows a ring edited between streams.
+    pub overlay_actions: String,
+    /// The window's settings as this launch resolved them, presentation-only like the tier.
+    /// A browse-mode presenter adopts them at each launch; the console outlives every stream.
+    pub touch_mode: crate::trust::TouchMode,
+    pub mouse_mode: crate::trust::MouseMode,
+    pub invert_scroll: bool,
+    pub inhibit_shortcuts: bool,
+    pub present_priority: crate::trust::PresentPriority,
+    pub vsync: bool,
+    pub allow_vrr: bool,
+    /// Enter fullscreen as this stream starts. Never leaves it.
+    pub fullscreen: bool,
+    /// Stream mode follows the window.
+    pub match_window: bool,
+    pub render_scale: f64,
+    /// This launch's codec ceiling for the render-scale clamp.
+    pub render_scale_max_dim: u32,
     /// Every monitor the stream shows, the window's first; empty for one. Further screens'
     /// frames come through [`start_screen`].
     pub screens: Vec<punktfunk_core::quic::v2::msg::Screen>,
@@ -243,6 +262,18 @@ impl SessionParams {
             stats_scale: punktfunk_core::hud::stats_scale(settings.stats_scale_pct),
             exit_hint: settings.exit_hint,
             keep_awake: settings.keep_awake,
+            overlay_actions: settings.overlay_actions.clone(),
+            touch_mode: settings.touch_mode(),
+            mouse_mode: settings.mouse_mode(),
+            invert_scroll: settings.invert_scroll,
+            inhibit_shortcuts: settings.inhibit_shortcuts,
+            present_priority: settings.present_priority(),
+            vsync: settings.vsync,
+            allow_vrr: settings.allow_vrr,
+            fullscreen: settings.fullscreen_on_stream || settings.fullscreen_always(),
+            match_window: settings.match_window,
+            render_scale: settings.render_scale,
+            render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings.codec),
             screens: Vec::new(),
         }
     }
