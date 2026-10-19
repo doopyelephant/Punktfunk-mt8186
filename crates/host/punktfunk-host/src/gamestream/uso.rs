@@ -141,6 +141,14 @@ pub(super) fn send_uso_all(
     }
 }
 
+/// A full send buffer: this packet is lost, the client is still there. Narrower than
+/// [`is_transient_io`]: a refused or reset send still means the client is gone.
+/// `WSAENOBUFS` has no stable `ErrorKind`, so it is matched raw.
+pub(super) fn is_buffer_full(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock || (cfg!(windows) && e.raw_os_error() == Some(10055))
+    // WSAENOBUFS
+}
+
 /// Lossy drop, not a failed send. `WouldBlock` is a full kernel buffer.
 /// Connected-UDP `ConnectionRefused`/`ConnectionReset` are stale ICMP. Winsock's
 /// no-buffer and unreachable/down codes have no stable `ErrorKind`, so they are
@@ -231,6 +239,20 @@ mod tests {
         }
         for k in [ErrorKind::PermissionDenied, ErrorKind::AddrInUse] {
             assert!(!is_transient_io(&Error::from(k)), "{k:?} must stay fatal");
+        }
+    }
+
+    #[test]
+    fn a_full_buffer_drops_the_packet_but_a_gone_client_stays_fatal() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_buffer_full(&Error::from(ErrorKind::WouldBlock)));
+        #[cfg(windows)]
+        assert!(is_buffer_full(&Error::from_raw_os_error(10055)));
+        for k in [ErrorKind::ConnectionRefused, ErrorKind::ConnectionReset] {
+            assert!(
+                !is_buffer_full(&Error::from(k)),
+                "{k:?} must end the session"
+            );
         }
     }
 
