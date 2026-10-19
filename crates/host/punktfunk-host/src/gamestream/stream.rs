@@ -953,13 +953,18 @@ fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
 }
 
 /// Windows USO: equal-size packets of a paced burst go in one `WSASendMsg`. Remainder
-/// (USO off, mixed sizes, or the frame's short last packet) is a per-packet `send`.
+/// (USO off, mixed sizes, the frame's short last packet, or what a full buffer cut off) is a
+/// per-packet `send`. A packet the full buffer refuses is lost, and the session goes on.
 #[cfg(target_os = "windows")]
 fn sendmmsg_all(sock: &UdpSocket, pkts: &[Vec<u8>]) -> std::io::Result<()> {
     let refs: Vec<&[u8]> = pkts.iter().map(|p| p.as_slice()).collect();
     let n = super::uso::send_uso_all(sock, &refs)?;
     for p in &pkts[n..] {
-        sock.send(p)?;
+        if let Err(e) = sock.send(p)
+            && !super::uso::is_buffer_full(&e)
+        {
+            return Err(e);
+        }
     }
     Ok(())
 }
