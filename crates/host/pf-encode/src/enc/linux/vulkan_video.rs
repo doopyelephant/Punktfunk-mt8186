@@ -3865,6 +3865,9 @@ impl VulkanVideoEncoder {
             // The slot never entered `in_flight`: the retry takes it again, or the one after
             // next would land on a slot whose fence is still pending.
             self.ring = slot;
+            // A cursor upload recorded before the failure never ran; the next frame on this
+            // slot uploads again rather than blending the previous bitmap.
+            self.frames[slot].cursor.forget();
             return Err(e);
         }
         self.in_flight.push_back(slot);
