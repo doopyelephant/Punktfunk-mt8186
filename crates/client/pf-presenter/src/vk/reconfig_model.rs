@@ -466,7 +466,7 @@ mod tests {
                 with(|r| r.owner = LANE_FRESH),
             ),
             (
-                "09662c046: a refused HDR10 swapchain costs HDR, not the session",
+                "d86625476: a refused HDR10 swapchain costs HDR, not the session",
                 with(hdr),
                 Input::HdrRefused,
                 Plan::Flip { on: false },
@@ -523,7 +523,7 @@ mod tests {
                 base(),
             ),
             (
-                "a resize under the lane records the size for the resume",
+                "ada44712a: a resize under the lane records the size for the resume",
                 with(|r| r.owner = LANE_PQ),
                 Input::Resize { extent: (0, 0) },
                 Plan::Skip,
@@ -540,7 +540,7 @@ mod tests {
                 base(),
             ),
             (
-                "0a46be83c: a full stamp queue rebuilds without the timing flag",
+                "0a46be83c: a full stamp queue rebuilds; the shell disarmed the engine",
                 base(),
                 Input::QueueFull,
                 Plan::Rebuild,

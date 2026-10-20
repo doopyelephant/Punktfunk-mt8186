@@ -968,6 +968,7 @@ impl Presenter {
             cmd_buf,
             staging: None,
             video: None,
+            owner: crate::reconfig_model::Owner::Swapchain,
             state: crate::swapchain_state::SwapchainState::new(),
             present_timer,
             present_id2,

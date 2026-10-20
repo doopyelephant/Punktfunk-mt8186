@@ -18,6 +18,7 @@
 
 use super::gpu::*;
 use super::present_timing::SLICE_NS;
+use super::reconfig::Input;
 use super::{
     BusyOn, DirectLast, DirectSrc, FrameInput, Held, Presented, Presenter, Retired, VideoImage,
 };
@@ -25,7 +26,7 @@ use crate::csc::csc_rows;
 #[cfg(target_os = "linux")]
 use crate::dmabuf::{self, HwFrame};
 use crate::overlay::OverlayFrame;
-use crate::swapchain_state::Entry;
+use crate::reconfig_model::Plan;
 use anyhow::{Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
@@ -201,25 +202,21 @@ impl Presenter {
         input: FrameInput<'a>,
         overlay: Option<&OverlayFrame>,
     ) -> Result<Presented<'a>> {
-        if self.extent.width == 0 || self.extent.height == 0 {
-            return Ok(Presented::Shown); // minimized: not Stale (Stale recreates)
-        }
         // A redraw carrying an overlay the lane cannot show needs the swapchain, or the
         // console never appears after a stream that ended on the lane.
-        let lane_shows_it = overlay.is_none() || !self.overlay_blocks_native;
-        match self
-            .state
-            .enter(matches!(input, FrameInput::Redraw) && lane_shows_it)
-        {
-            Entry::Draw => {}
-            Entry::Skip => return Ok(Presented::Shown),
-            // Only the Linux lane takes the window.
-            Entry::Resume => {
-                #[cfg(target_os = "linux")]
-                if !self.resume_swapchain(window)? {
-                    return Ok(Presented::Shown); // minimized: the lane keeps the window
-                }
-            }
+        let entry = match input {
+            FrameInput::Redraw => Input::Redraw {
+                overlay_blocked: overlay.is_some() && self.overlay_blocks_native,
+            },
+            _ => Input::RealFrame,
+        };
+        match self.decide(entry) {
+            // A minimized window, or a redraw the lane shows: not Stale (Stale recreates).
+            Plan::Drop => return Ok(Presented::Shown),
+            // Only the Linux lane takes the window; minimized, the lane keeps it.
+            #[cfg(target_os = "linux")]
+            Plan::Resume if !self.resume_swapchain(window)? => return Ok(Presented::Shown),
+            _ => {}
         }
         // A rebuild that failed past its create left the targets short of the images: build
         // again before an acquire can index past them.

@@ -16,6 +16,8 @@ use crate::csc::CscPass;
 #[cfg(target_os = "linux")]
 use crate::dmabuf::HwFrame;
 use crate::overlay::SharedDevice;
+#[cfg(target_os = "linux")]
+use crate::reconfig_model::{Input, Plan};
 use ash::vk;
 #[cfg(target_os = "linux")]
 use pf_client_core::video::DmabufFrame;
@@ -316,7 +318,9 @@ pub struct Presenter {
     cmd_buf: vk::CommandBuffer,
     staging: Option<Staging>,
     video: Option<VideoImage>,
-    /// Who owns the window, the submit in flight, the held image, the stamp asks.
+    /// Who presents into the window. Only `Presenter::decide` writes it.
+    owner: crate::reconfig_model::Owner,
+    /// The submit in flight, the held image, the stamp asks.
     state: crate::swapchain_state::SwapchainState,
     /// On-glass timing from present-wait, either generation. `None` without it; the run
     /// loop then keeps its submit-time display stamp (or the vblank waiter's estimate).
@@ -499,6 +503,7 @@ impl Presenter {
         crate::swapchain_state::Clocks {
             waiter: self.present_timer.is_some(),
             vblank: self.vblank_active(),
+            lane: self.owner.native_last(),
         }
     }
 
@@ -577,7 +582,7 @@ impl Presenter {
         use crate::wl_native::{Outcome, SlotState};
         self.poll_native_releases();
         let view = (self.extent.width, self.extent.height);
-        let suspended = self.state.suspended();
+        let suspended = self.owner.suspended();
         if self.flip_holds_swapchain() {
             return Outcome::Declined(d);
         }
@@ -621,7 +626,7 @@ impl Presenter {
             _ => return Outcome::Declined(d),
         }
         if !suspended {
-            if let Err(e) = self.suspend_swapchain() {
+            if let Err(e) = self.hand_to_lane() {
                 tracing::warn!(error = %format!("{e:#}"), "native scanout: swapchain suspend failed");
                 return Outcome::Declined(d);
             }
@@ -638,7 +643,7 @@ impl Presenter {
             return Outcome::Dropped;
         };
         if lane.commit_vaapi(d, meta, pts_ns, decoded_ns, point) {
-            self.state.native_shown(pq);
+            self.decide(Input::Shown { pq });
             Outcome::Shown
         } else {
             if let Some(t) = self.vaapi_sync.get_mut(&key) {
@@ -745,12 +750,20 @@ impl Presenter {
         self.surface = vk::SurfaceKHR::null();
         self.images.clear();
         self.retired_hw = None; // queue drained above: its reads are done
-        self.state.suspend();
+        self.decide(Input::Suspended);
         if let Some(lane) = self.native.as_mut() {
             lane.take_window();
         }
         tracing::info!("native scanout: the lane owns the window, swapchain suspended");
         Ok(())
+    }
+
+    /// The lane takes the window. `LaneTakes` always plans `Suspend`, which needs no window.
+    #[cfg(target_os = "linux")]
+    fn hand_to_lane(&mut self) -> anyhow::Result<()> {
+        let plan = self.decide(Input::LaneTakes);
+        debug_assert_eq!(plan, Plan::Suspend);
+        self.suspend_swapchain()
     }
 
     /// Take the window back from the native lane: a new Vulkan surface on SDL's window and
@@ -760,7 +773,7 @@ impl Presenter {
     fn resume_swapchain(&mut self, window: &sdl3::video::Window) -> anyhow::Result<bool> {
         let (pw, ph) = window.size_in_pixels();
         if pw == 0 || ph == 0 {
-            return Ok(false); // `enter` left the owner on the lane
+            return Ok(false); // the owner stays on the lane
         }
         // The lane's surface objects go first: the swapchain makes its own. A retired lane
         // never takes the window again, so its exported images go back too.
@@ -775,20 +788,19 @@ impl Presenter {
         let surface = unsafe { window.vulkan_create_surface(self.instance.handle()) }
             .map_err(|e| anyhow::anyhow!("SDL_Vulkan_CreateSurface: {e}"))?;
         self.surface = surface;
-        self.state.resume();
         self.overlay_hide_native();
         // The pref may have moved while the lane held the window (`set_present_pref`).
         let pinned = self.knobs.present_mode.as_deref();
         let built =
             setup::pick_present_mode(&self.surface_i, self.pdev, surface, self.pref, pinned)
                 .and_then(|mode| {
-                    self.present_mode = mode;
+                    self.decide(Input::Resumed { mode });
                     self.recreate_swapchain(window)
                 });
         if let Err(e) = built {
-            // The owner moved before a swapchain stood: back to the lane, or the next frame
-            // acquires from a null swapchain.
-            self.suspend_swapchain()?;
+            // No swapchain stands: the lane keeps the window, or the next frame acquires
+            // from a null swapchain.
+            self.hand_to_lane()?;
             return Err(e);
         }
         tracing::info!("native scanout: the swapchain takes the window back");
@@ -1066,14 +1078,14 @@ impl Presenter {
         let Some(slot) = ring.free_slot(|k| lane.slot_state(k) == SlotState::Free) else {
             // Every buffer on screen or still importing: skip the frame, or let the swapchain
             // draw it while the lane is not in charge yet.
-            return if self.state.suspended() {
+            return if self.owner.suspended() {
                 RingSlot::Drop
             } else {
                 RingSlot::Decline
             };
         };
-        if !self.state.suspended() {
-            if let Err(e) = self.suspend_swapchain() {
+        if !self.owner.suspended() {
+            if let Err(e) = self.hand_to_lane() {
                 tracing::warn!(error = %format!("{e:#}"), "native scanout: swapchain suspend failed");
                 return RingSlot::Decline;
             }
@@ -1101,7 +1113,7 @@ impl Presenter {
         let hold = Box::new(ring.hold(slot));
         let key = ring.key(slot);
         if lane.commit(key, color, self.hdr_meta, hold, pts_ns, decoded_ns, point) {
-            self.state.native_shown(color.is_pq());
+            self.decide(Input::Shown { pq: color.is_pq() });
             true
         } else {
             ring.uncommit(slot);
@@ -1149,7 +1161,7 @@ impl Presenter {
             || !lane.overlay_supported()
             || fourcc.is_none()
             || self.overlay_refused == Some(shape);
-        if self.overlay_blocks_native || !self.state.native_last() {
+        if self.overlay_blocks_native || !self.owner.native_last() {
             lane.overlay_hide();
             self.overlay_shown = None;
             return;
@@ -1346,7 +1358,7 @@ impl Presenter {
     /// window's buffer, else the swapchain mode, which can differ from the request when the
     /// surface does not offer it.
     pub(crate) fn present_mode_name(&self) -> &'static str {
-        if self.state.native_last() {
+        if self.owner.native_last() {
             return "native";
         }
         match self.present_mode {
