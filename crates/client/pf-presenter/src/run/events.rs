@@ -60,6 +60,18 @@ impl Shell {
                 }
                 return Ok(ControlFlow::Break(Outcome::Ended(None)));
             }
+            // The main window's close button: SDL raises `Quit` only for the last window,
+            // so with further screens open this event is all there is.
+            Event::Window {
+                win_event: WindowEvent::CloseRequested,
+                window_id,
+                ..
+            } if window_id == self.window.id() => {
+                if let Some(st) = stream {
+                    st.request_quit();
+                }
+                return Ok(ControlFlow::Break(Outcome::Ended(None)));
+            }
             Event::Window { win_event, .. } => self.on_window_event(stream, win_event)?,
             // The panel's rate changed under the window (60 ↔ 165 Hz in the OS
             // settings): no window event fires, and the grid describes the old rate.
