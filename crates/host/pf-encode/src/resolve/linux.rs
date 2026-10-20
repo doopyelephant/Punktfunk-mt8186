@@ -3,6 +3,7 @@
 //! must agree with it.
 
 use super::*;
+use pf_frame::PixelFormat;
 
 pub use crate::vk_util::anv_video_encode_flag;
 
