@@ -10,7 +10,7 @@
 // Off Windows only the tests read this module.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
-use crate::au_reader::{AuReader, Taken};
+use crate::windows::au_reader::{AuReader, Taken};
 use anyhow::{bail, Context, Result};
 use pf_driver_proto::encode::au;
 use pf_encode_core::{AuChunk, EncodedFrame};
@@ -239,8 +239,8 @@ impl<'a> AuAssembly<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::au_reader::producer::{section, Producer};
-    use crate::au_reader::AuView;
+    use crate::windows::au_reader::producer::{section, Producer};
+    use crate::windows::au_reader::AuView;
     use pf_driver_proto::section::SectionView;
 
     const WHOLE: u32 = au::AU_FIRST | au::AU_LAST;

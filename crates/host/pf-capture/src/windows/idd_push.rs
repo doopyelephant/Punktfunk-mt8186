@@ -9,10 +9,10 @@
 //! live in [`pf_driver_proto`] — both sides `use` it, so drift is a compile error.
 
 use super::dxgi::WinCaptureTarget;
-use super::{CapturedFrame, Capturer, PixelFormat};
-use crate::cursor_state::CursorModel;
-use crate::cursor_witness::CursorWitness;
-use crate::pixelless::DeliveryGate;
+use crate::windows::cursor_state::CursorModel;
+use crate::windows::cursor_witness::CursorWitness;
+use crate::windows::pixelless::DeliveryGate;
+use crate::{CapturedFrame, Capturer, PixelFormat};
 use anyhow::{bail, Context, Result};
 use pf_driver_proto::section::SectionView;
 use pf_paths_win::SecurityAttributes;
@@ -204,7 +204,7 @@ use cursor_model::deliver_cursor_channel;
 mod descriptor;
 #[path = "idd_push/display.rs"]
 mod display;
-// Stall reporting over `crate::stall_model`, plus DxgKrnl ETW and micro-probes as evidence.
+// Stall reporting over `windows::stall_model`, plus DxgKrnl ETW and micro-probes as evidence.
 #[path = "idd_push/dxgkrnl_etw.rs"]
 mod dxgkrnl_etw;
 #[path = "idd_push/probes.rs"]
@@ -223,7 +223,7 @@ mod clock_boost;
 // In-driver encode: the AU section, `SET_ENCODE`, and the `Encoder` proxy over `ENCODE_CTL`.
 #[path = "idd_push/driver_encode.rs"]
 pub(crate) mod driver_encode;
-use crate::stall_model::{StallEvidence, StallWatch};
+use crate::windows::stall_model::{StallEvidence, StallWatch};
 use channel::ChannelBroker;
 use descriptor::{DescriptorPoller, DisplayDescriptor};
 
@@ -331,7 +331,7 @@ pub struct IddPushCapturer {
     max_hb_age_us: u64,
     /// Damage witness for [`StallEvidence::cursor_moved_px`] and the recovery
     /// classifier. user32 only, never the display-config lock; the rule itself is
-    /// [`crate::cursor_witness`].
+    /// [`crate::windows::cursor_witness`].
     cursor: CursorWitness,
     /// Micro-probe singleton; `None` unless [`diag_dir`] is on. A missing window reads as
     /// never-stalled, so a report never invents a leg.

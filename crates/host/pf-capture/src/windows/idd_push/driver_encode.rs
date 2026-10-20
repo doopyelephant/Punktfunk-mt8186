@@ -4,12 +4,12 @@
 //!
 //! Sealing and handle duplication follow `open.rs` / `channel.rs`: unnamed, SYSTEM-only DACL,
 //! duplicated into WUDFHost by a [`ChannelBroker`], adopt-on-success. The reader over the
-//! mapped section is [`crate::au_reader`]; the chunks and access units it assembles are
-//! [`crate::au_assembly`].
+//! mapped section is [`crate::windows::au_reader`]; the chunks and access units it assembles are
+//! [`crate::windows::au_assembly`].
 
 use super::*;
-use crate::au_assembly::{AuAssembly, AuDump, Clocks};
-use crate::au_reader::{AuReader, AuView};
+use crate::windows::au_assembly::{AuAssembly, AuDump, Clocks};
+use crate::windows::au_reader::{AuReader, AuView};
 use crate::{DriverEndpoint, EncodeCtlSender, SetEncodeSender};
 use pf_driver_proto::encode::{self, au, EncodeCtlRequest, SetEncodeRequest};
 use pf_encode_win::{AuChunk, EncodedFrame, Encoder, EncoderCaps};

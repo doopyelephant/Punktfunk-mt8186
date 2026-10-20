@@ -10,8 +10,8 @@
 //! restart the ladder's first rung runs.
 
 use super::*;
-use crate::cursor_state::Event;
-use crate::pixelless;
+use crate::windows::cursor_state::Event;
+use crate::windows::pixelless;
 
 impl IddPushCapturer {
     /// QPC ticks per second, read once. `0` when the call failed; every span then reads 0.

@@ -1,4 +1,4 @@
-//! Runs [`crate::cursor_state`] against the driver and the two shape sources.
+//! Runs [`crate::windows::cursor_state`] against the driver and the two shape sources.
 //!
 //! The model decides which source the client's shape is read from, and what the
 //! driver's forward flag is across the secure desktop, a client's ask and a
@@ -8,8 +8,8 @@
 //! The model's table test is the contract; nothing here decides.
 
 use super::*;
-use crate::cursor_raster::with_section_shape;
-use crate::cursor_state::{Action, Event, Source};
+use crate::windows::cursor_raster::with_section_shape;
+use crate::windows::cursor_state::{Action, Event, Source};
 use cursor::SECTION_SERIAL_TAG;
 
 impl IddPushCapturer {

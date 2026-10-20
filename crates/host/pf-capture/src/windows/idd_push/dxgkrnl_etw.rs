@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use crate::stall_model::EtwWindowCounts;
+use crate::windows::stall_model::EtwWindowCounts;
 
 use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS};
@@ -590,7 +590,7 @@ impl Drop for EtwWatch {
     }
 }
 
-// The module only compiles on Windows (lib.rs gates `mod windows`), so plain `cfg(test)` here
+// The module only compiles on Windows (`windows/mod.rs` gates `mod idd_push`), so `cfg(test)` here
 // already means "Windows tests" — and [`count_window`] itself is pure tick math, no session.
 #[cfg(test)]
 mod tests {

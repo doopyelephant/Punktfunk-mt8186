@@ -7,7 +7,7 @@
 //! `design/idd-push-security.md`.
 
 use super::*;
-use crate::cursor_state::Opening;
+use crate::windows::cursor_state::Opening;
 
 /// `SECURITY_ATTRIBUTES` for the unnamed AU section and its event: SDDL
 /// `D:P(A;;GA;;;SY)`, protected, `bInheritHandle: false`. The cursor section takes the

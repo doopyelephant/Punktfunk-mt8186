@@ -9,7 +9,7 @@
 //! session 0: the HDR desktop's SDR-white scale.
 
 use super::*;
-use crate::cursor_raster::ShapeClass;
+use crate::windows::cursor_raster::ShapeClass;
 use pf_driver_proto::cursor::{
     shape_extent, shape_rgba, CursorShm, ShapeRgba, CURSOR_MAGIC, CURSOR_SHAPE_OFFSET,
     CURSOR_SHM_SIZE, CURSOR_TYPE_ALPHA,

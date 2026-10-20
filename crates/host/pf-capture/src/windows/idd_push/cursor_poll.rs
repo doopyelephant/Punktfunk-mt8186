@@ -15,7 +15,7 @@
 //! contracts live in `cursor_raster.rs`; design in `design/remote-desktop-sweep.md`.
 
 use super::*;
-use crate::cursor_raster::{
+use crate::windows::cursor_raster::{
     alpha_is_empty, compose_overlay, masked_color_to_rgba, mono_planes_to_rgba, Shape, ShapeClass,
 };
 use windows::Win32::Graphics::Gdi::{

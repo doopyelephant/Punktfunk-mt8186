@@ -87,7 +87,7 @@ pub fn capturer_supports_hdr() -> bool {
 /// until a session on this host finds wide colour refused.
 #[cfg(target_os = "windows")]
 pub fn capturer_delivers_sdr10() -> bool {
-    crate::idd_push::wcg_available()
+    crate::windows::idd_push::wcg_available()
 }
 #[cfg(not(target_os = "windows"))]
 pub fn capturer_delivers_sdr10() -> bool {
@@ -260,6 +260,6 @@ pub fn open_idd_push(
     keepalive: Box<dyn Send>,
     opts: IddPushOpts,
 ) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
-    crate::idd_push::IddPushCapturer::open(target, preferred, keepalive, opts)
+    crate::windows::idd_push::IddPushCapturer::open(target, preferred, keepalive, opts)
         .map(|c| Box::new(c) as Box<dyn Capturer>)
 }

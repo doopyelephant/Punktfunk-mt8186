@@ -5,7 +5,7 @@
 //! `PUNKTFUNK_IDD_DIAG` turned them on; they name no class.
 
 use super::*;
-use crate::stall_model::{attribute, Stall, StallEvidence, StallVerdict, StallWatch};
+use crate::windows::stall_model::{attribute, Stall, StallEvidence, StallVerdict, StallWatch};
 
 /// Driver GPU-priority lever (`PFVD_NO_RT_GPU` opt-out; default REALTIME).
 /// Reads this process's env; WUDFHost resolves the same variable. An env

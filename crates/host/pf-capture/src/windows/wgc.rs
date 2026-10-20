@@ -28,9 +28,11 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
 };
 
-use crate::idd_push::driver_encode::{open_remote_encoder, DriverEncodeParams, HandleTarget};
-use crate::pixelless::{self, DeliveryGate};
-use crate::worker_link::{Link, Message, Peer};
+use crate::windows::idd_push::driver_encode::{
+    open_remote_encoder, DriverEncodeParams, HandleTarget,
+};
+use crate::windows::pixelless::{self, DeliveryGate};
+use crate::windows::worker_link::{Link, Message, Peer};
 use crate::{CapturedFrame, Capturer, EncodeCtlSender, PixelFormat, SetEncodeSender};
 
 /// How long the worker has to say hello. A process's first lines of `main`.

@@ -4,14 +4,11 @@
 //!
 //! Capture identity ([`WinCaptureTarget`], [`D3d11Frame`], [`pack_luid`],
 //! [`make_device`]) lives in `pf-frame` so capture, encode, and pf-vdisplay share
-//! one type without a crate cycle. This module re-exports them so `crate::dxgi::*`
+//! one type without a crate cycle. This module re-exports them so `crate::windows::dxgi::*`
 //! still resolves. There is no capturer here.
 
 pub use pf_frame::dxgi::{make_device, pack_luid, D3d11Frame, PyroFrameShare, WinCaptureTarget};
 
-// `#[path]`: this file is itself reached through a `#[path]` from `lib.rs`, so a
-// bare `mod selftest;` would resolve to `windows/selftest.rs`.
-#[path = "dxgi/selftest.rs"]
 mod selftest;
 pub use selftest::{hdr_p010_convert_bars_on_luid, hdr_p010_selftest_at};
 
@@ -110,7 +107,7 @@ fn set_dpi_awareness() {
 /// No DXGI factory exists yet: [`install_gpu_pref_hook`]'s contract.
 #[cfg(target_arch = "x86_64")]
 unsafe fn patch_hybrid_query() {
-    use crate::win32u_stub::{is_syscall_stub, jump_to, PATCH_LEN};
+    use crate::windows::win32u_stub::{is_syscall_stub, jump_to, PATCH_LEN};
     use windows::core::s;
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
     use windows::Win32::System::Memory::{

@@ -7,7 +7,7 @@
 //!
 //! Drive it with `spike --source synthetic-nv12`.
 
-use crate::dxgi::{make_device, D3d11Frame};
+use crate::windows::dxgi::{make_device, D3d11Frame};
 use crate::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{Context, Result};
 use pf_frame::d3d11_map::MappedSubresource;
