@@ -137,6 +137,24 @@ const IDENTITY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// re-sends a lost arrival twice, 100 ms apart.
 const ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// When a pad's identity wait started, once it declared `resolved` over `previous`. The first
+/// declaration of an identity kind starts it, even when the session default already is one; a
+/// re-declare keeps the clock it started; any other kind has no wait.
+fn identity_wait_after(
+    previous: GamepadPref,
+    resolved: GamepadPref,
+    first_declaration: bool,
+    since: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    match (takes_identity(previous), takes_identity(resolved)) {
+        (false, true) => Some(now),
+        (true, true) if first_declaration => Some(now),
+        (true, true) => since,
+        (_, false) => None,
+    }
+}
+
 /// The kinds whose virtual pad answers as the physical one a client captured: both Steam
 /// Controllers.
 fn takes_identity(kind: GamepadPref) -> bool {
@@ -245,16 +263,13 @@ impl Pads {
                 "gamepad kind declared (per-pad)"
             );
         }
-        // The wait starts on the first declaration of an identity kind, even when the session
-        // default already is one; a re-declare keeps the clock it started.
-        match (takes_identity(self.kinds[idx]), takes_identity(resolved)) {
-            (false, true) => self.identity_since[idx] = Some(std::time::Instant::now()),
-            (true, true) if self.declared[idx].is_none() => {
-                self.identity_since[idx] = Some(std::time::Instant::now())
-            }
-            (_, false) => self.identity_since[idx] = None,
-            (true, true) => {}
-        }
+        self.identity_since[idx] = identity_wait_after(
+            self.kinds[idx],
+            resolved,
+            self.declared[idx].is_none(),
+            self.identity_since[idx],
+            std::time::Instant::now(),
+        );
         self.kinds[idx] = resolved;
         self.declared[idx] = Some(kind);
     }
@@ -1703,18 +1718,18 @@ mod tests {
 
     /// A session whose default is a Steam Controller still waits for each pad's identity:
     /// the first declaration starts the clock, a re-declare keeps it.
-    #[cfg(target_os = "linux")]
     #[test]
     fn a_steam_controller_default_still_waits_for_its_identity() {
-        let mut pads = Pads::new(GamepadPref::SteamController2, PadIdentity::anonymous());
-        pads.set_kind(1, GamepadPref::SteamController2);
-        let started = pads.identity_since[1].expect("the identity wait started");
-        pads.set_kind(1, GamepadPref::SteamController2);
+        use GamepadPref::{SteamController2 as Sc2, Xbox360};
+        let (t0, t1) = (std::time::Instant::now(), std::time::Instant::now());
+        assert_eq!(identity_wait_after(Sc2, Sc2, true, None, t1), Some(t1));
         assert_eq!(
-            pads.identity_since[1],
-            Some(started),
-            "a re-declare kept the clock"
+            identity_wait_after(Sc2, Sc2, false, Some(t0), t1),
+            Some(t0),
+            "re-declare"
         );
+        assert_eq!(identity_wait_after(Xbox360, Sc2, false, None, t1), Some(t1));
+        assert_eq!(identity_wait_after(Sc2, Xbox360, true, Some(t0), t1), None);
     }
 
     /// A frame that beats its pad's arrival does not build the session default: the pad waits
