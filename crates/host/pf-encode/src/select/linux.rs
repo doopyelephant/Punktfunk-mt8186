@@ -741,6 +741,15 @@ fn narrow_to_openable(backend: LinuxBackend, probed: Option<CodecSupport>) -> Co
                 av1: built,
             }
         }
+        // An nvenc pin likewise: its probe arm is compiled out with the feature.
+        LinuxBackend::Nvenc => {
+            let built = cfg!(feature = "nvenc");
+            CodecSupport {
+                h264: built,
+                h265: built,
+                av1: built,
+            }
+        }
         _ => CodecSupport {
             h264: true,
             h265: true,
@@ -834,6 +843,10 @@ mod tests {
                 cfg!(feature = "vulkan-encode")
             )
         );
+        // An nvenc pin advertises only what this build can open.
+        let built = cfg!(feature = "nvenc");
+        let nv = narrow_to_openable(Nvenc, None);
+        assert_eq!((nv.h264, nv.h265, nv.av1), (built, built, built));
         // openh264 is H.264 whatever a GPU probe says.
         let sw = narrow_to_openable(Software, Some(caps(true, true, true)));
         assert_eq!((sw.h264, sw.h265, sw.av1), (true, false, false));
