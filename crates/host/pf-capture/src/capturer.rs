@@ -348,9 +348,8 @@ pub type CursorChannelSender = std::sync::Arc<
 pub type CursorForwardSender = std::sync::Arc<dyn Fn(bool) -> Result<()> + Send + Sync>;
 
 /// v7 in-driver encode open (`IOCTL_SET_ENCODE`) — same facade contract as
-/// [`CursorChannelSender`]: the driver adopts the request's handle values iff the
+/// `CursorChannelSender`: the driver adopts the request's handle values iff the
 /// IOCTL succeeds. Once per encoder generation.
-#[cfg(target_os = "windows")]
 pub type SetEncodeSender = std::sync::Arc<
     dyn Fn(
             &pf_driver_proto::encode::SetEncodeRequest,
@@ -361,6 +360,5 @@ pub type SetEncodeSender = std::sync::Arc<
 
 /// v7 one-shot encoder control (`IOCTL_ENCODE_CTL`): the `Encoder` calls the
 /// stream loop makes, forwarded by the driver proxy.
-#[cfg(target_os = "windows")]
 pub type EncodeCtlSender =
     std::sync::Arc<dyn Fn(&pf_driver_proto::encode::EncodeCtlRequest) -> Result<()> + Send + Sync>;

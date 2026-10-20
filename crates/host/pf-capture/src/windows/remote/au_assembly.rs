@@ -4,23 +4,23 @@
 //! records the progress clocks the supervisor reads and goes to the AU dump when one is open.
 //!
 //! Pure over the reader, a [`Clocks`] and a wait, so the same code drains the driver's section
-//! on Windows and a `Vec` in the tests. The section, its event and the control IOCTLs are the
-//! proxy's (`idd_push/driver_encode.rs`).
+//! on Windows and a `Vec` in the tests. The section, its event and the control calls are the
+//! proxy's (`encoder.rs`).
 
-// Off Windows only the tests read this module.
-#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
-
-use crate::windows::au_reader::{AuReader, Taken};
+use super::au_reader::{AuReader, Taken};
 use anyhow::{bail, Context, Result};
 use pf_driver_proto::encode::au;
 use pf_encode_core::{AuChunk, EncodedFrame};
 use pf_frame::health::DriverSplit;
 use std::time::{Duration, Instant};
 
-/// The clocks a taken chunk is stamped against: wall time for the wire's `pts_ns`, and the
-/// QPC domain the driver's slot stamps are in.
+/// The clocks a remote source runs on: its monotonic now, wall time for the wire's `pts_ns`,
+/// and the QPC domain the driver's slot stamps are in. One value per source, so a test runs
+/// the whole session on a virtual clock.
 #[derive(Clone, Copy)]
 pub(crate) struct Clocks {
+    /// The source's, its supervisor's and the proxy's telemetry's now.
+    pub now: fn() -> Instant,
     /// Now, in epoch nanoseconds.
     pub now_ns: fn() -> u64,
     /// Age of a QPC stamp in µs; 0 when the stamp is ahead.
@@ -105,7 +105,7 @@ impl AuDump {
 /// dump.
 pub(crate) struct AuAssembly<'a> {
     pub(crate) reader: AuReader<'a>,
-    clocks: Clocks,
+    pub(crate) clocks: Clocks,
     /// The last taken chunk's `wire_seq` / `source_seq`: AU progress, the supervisor's second
     /// ground-truth clock (`progress`).
     pub(crate) last_wire_seq: u32,
@@ -239,8 +239,8 @@ impl<'a> AuAssembly<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::windows::au_reader::producer::{section, Producer};
-    use crate::windows::au_reader::AuView;
+    use crate::windows::remote::au_reader::producer::{section, Producer};
+    use crate::windows::remote::au_reader::AuView;
     use pf_driver_proto::section::SectionView;
 
     const WHOLE: u32 = au::AU_FIRST | au::AU_LAST;
@@ -261,6 +261,7 @@ mod tests {
     }
 
     const CLOCKS: Clocks = Clocks {
+        now: Instant::now,
         now_ns,
         qpc_age_us,
         qpc_ticks_us,

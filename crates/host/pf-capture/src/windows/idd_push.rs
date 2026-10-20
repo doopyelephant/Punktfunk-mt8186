@@ -1,40 +1,32 @@
 //! Host-side IDD-push capture: the driver encodes, so this side owns no pixels.
 //!
 //! The driver's swap-chain worker passes each composed frame through its encode
-//! pool into a sealed AU section ([`driver_encode`]); this capturer owns the
-//! session's display identity — mode, HDR, cursor channel, health — and reports
-//! the driver's frame cadence as pixel-less [`CapturedFrame`]s so the stream loop
-//! keeps its geometry and pacing. Driver:
+//! pool into a sealed AU section ([`crate::windows::remote::encoder`]); this capturer owns
+//! the session's display identity — mode, HDR, cursor channel — and wraps the
+//! [`RemoteSource`] that reports the driver's frame cadence as pixel-less
+//! [`CapturedFrame`]s and supervises it. Driver:
 //! `packaging/windows/drivers/pf-vdisplay/src/encode/`. Layout and status codes
 //! live in [`pf_driver_proto`] — both sides `use` it, so drift is a compile error.
 
 use crate::knobs::Knobs;
 use crate::windows::cursor_state::CursorModel;
 use crate::windows::cursor_witness::CursorWitness;
-use crate::windows::pixelless::DeliveryGate;
+use crate::windows::remote::section::{MappedSection, SECTION_MAP_RW};
+use crate::windows::remote::source::RemoteSource;
 use crate::{CapturedFrame, Capturer, PixelFormat};
 use anyhow::{bail, Context, Result};
-use pf_driver_proto::section::SectionView;
 use pf_frame::dxgi::WinCaptureTarget;
-use pf_paths_win::SecurityAttributes;
 use pf_win_display::open_wudfhost;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use windows::core::PCWSTR;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{
     DuplicateHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
-    HANDLE, INVALID_HANDLE_VALUE, POINT, WAIT_OBJECT_0,
-};
-use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-
-use windows::Win32::System::Memory::{
-    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_ALL_ACCESS,
-    MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
+    HANDLE, POINT, WAIT_OBJECT_0,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, OpenProcess, WaitForSingleObject, PROCESS_SET_INFORMATION,
+    GetCurrentProcess, OpenProcess, WaitForSingleObject, PROCESS_SET_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
@@ -50,18 +42,6 @@ pub(crate) fn wcg_available() -> bool {
         && *BUILD.get_or_init(pf_win_display::os_build) >= pf_win_display::WCG_MIN_BUILD
 }
 
-/// Map-only on the driver's section duplicate. No OWNER / `WRITE_DAC` / DELETE.
-const SECTION_MAP_RW: u32 = 0x0004 | 0x0002;
-/// Driver only `SetEvent`s; host keeps `SYNCHRONIZE` on its own handle.
-const EVENT_MODIFY_STATE: u32 = 0x0002;
-
-fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
 /// Where the access-unit dump goes while [`Knobs::idd_diag`] is on: this capturer's full
 /// diagnostics.
 pub(super) fn diag_dir() -> Option<&'static std::path::Path> {
@@ -72,96 +52,6 @@ pub(super) fn diag_dir() -> Option<&'static std::path::Path> {
 /// dumps every access unit to disk.
 pub(super) fn flow_watch() -> bool {
     Knobs::process().idd_flow
-}
-
-/// A file mapping and its view of `len` bytes. Drop unmaps, then [`OwnedHandle`] closes.
-///
-/// The driver writes the same bytes, so this side reaches them only through the accessors:
-/// each checks its range and reads or writes an atomic. Every accessor panics out of range.
-struct MappedSection {
-    handle: OwnedHandle,
-    /// What `Drop` unmaps.
-    base: MEMORY_MAPPED_VIEW_ADDRESS,
-    /// Copied out only by [`Self::share`]; its `'static` ends with `Drop`.
-    view: SectionView<'static>,
-}
-
-// SAFETY: `!Send` only through the view pointers. The mapping is process-wide, so its one
-// owner may use, unmap and close it from any thread; the driver's concurrent writes arrive
-// through the section's atomics. Not `Sync`.
-unsafe impl Send for MappedSection {}
-
-impl MappedSection {
-    /// A pagefile-backed section of `len` bytes, mapped read/write. Windows hands its pages
-    /// over zeroed. `sa` is its DACL; `None` takes the process default.
-    fn create(len: usize, sa: Option<&SecurityAttributes>, what: &str) -> Result<Self> {
-        let size = u32::try_from(len).with_context(|| format!("size the {what} section"))?;
-        // SAFETY: `sa` outlives the call, and the handle it returns is new and owned from here.
-        let handle = unsafe {
-            let map = CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                sa.map(SecurityAttributes::as_ptr),
-                PAGE_READWRITE,
-                0,
-                size,
-                PCWSTR::null(),
-            )
-            .with_context(|| format!("create the {what} section"))?;
-            OwnedHandle::from_raw_handle(map.0 as _)
-        };
-        // SAFETY: a live section handle of `len` bytes; a refused map returns null.
-        let base = unsafe {
-            MapViewOfFile(
-                HANDLE(handle.as_raw_handle()),
-                FILE_MAP_ALL_ACCESS,
-                0,
-                0,
-                len,
-            )
-        };
-        if base.Value.is_null() {
-            return Err(windows::core::Error::from_thread())
-                .with_context(|| format!("map the {what} section"));
-        }
-        // SAFETY: `base` is a new page-aligned read/write mapping of `len` bytes. Only `Drop`
-        // unmaps it, after the last access, and no Rust reference points into it.
-        let view = unsafe { SectionView::from_raw(base.Value.cast(), len) };
-        Ok(Self { handle, base, view })
-    }
-
-    /// Bytes mapped.
-    fn len(&self) -> usize {
-        self.view.len()
-    }
-
-    /// The 4-aligned word at `off`, as the atomic both sides treat it as.
-    fn word32(&self, off: usize) -> &AtomicU32 {
-        self.view.atomic_u32(off)
-    }
-
-    /// Copy `dst.len()` bytes out from `off`. The driver may be writing them: the caller's
-    /// sequence check decides whether the copy is whole.
-    fn read_bytes(&self, off: usize, dst: &mut [u8]) {
-        self.view.read_bytes(off, dst);
-    }
-
-    /// The view itself, for a reader that lives beside this section in one owner.
-    ///
-    /// # Safety
-    /// The copy, and every reference taken through it, must be gone before `self` drops.
-    // unsafe-fn-no-op-ok: the contract is the mapping's lifetime, checked by every accessor.
-    unsafe fn share(&self) -> SectionView<'static> {
-        self.view
-    }
-}
-
-impl Drop for MappedSection {
-    fn drop(&mut self) {
-        // SAFETY: `base` is the live `MapViewOfFile` mapping; unmap before `handle` closes.
-        unsafe {
-            let _ = UnmapViewOfFile(self.base);
-        }
-    }
 }
 
 // The frame-delivery endpoint: `try_consume` and the `Capturer` surface.
@@ -190,23 +80,15 @@ mod dxgkrnl_etw;
 mod probes;
 #[path = "idd_push/stall.rs"]
 mod stall;
-// Live health classification + the staged-recovery ladder (immunity plan WP12/WP13).
-#[path = "idd_push/recovery.rs"]
-mod recovery;
-// The capturer end of that ladder: the classifier inputs and the rungs it runs here.
+// This capturer's end of the recovery ladder: the classifier inputs and the rungs it runs here.
 #[path = "idd_push/health.rs"]
 mod health;
-// Full GPU clocks on NVIDIA for as long as the driver's NVENC session is open.
-#[path = "idd_push/clock_boost.rs"]
-mod clock_boost;
-// In-driver encode: the AU section, `SET_ENCODE`, and the `Encoder` proxy over `ENCODE_CTL`.
-#[path = "idd_push/driver_encode.rs"]
-pub(crate) mod driver_encode;
 use crate::windows::stall_model::{StallEvidence, StallWatch};
-use channel::ChannelBroker;
+use channel::{ChannelBroker, IddTransport};
 use descriptor::{DescriptorPoller, DisplayDescriptor};
 
-/// The session's virtual display: its mode, its cursor channel, and its health.
+/// The session's virtual display: its mode, its cursor channel, and the remote source that
+/// delivers and supervises it.
 ///
 /// Frames carry no pixels — the driver encodes them — so a delivery is only the
 /// news that the driver's pool took a new composed frame, which is what the
@@ -217,24 +99,12 @@ pub struct IddPushCapturer {
     target_id: u32,
     /// Complete CCD identity (adapter LUID + target id) for every display-global helper.
     ccd: pf_win_display::win_display::CcdTargetKey,
-    /// Monotonic count of NEW source images the driver reported (`FrameOrigin::Source` only).
-    source_seq: u64,
-    /// The freshness test, over the driver's source counter and the delivered size and format.
-    /// The in-place resize waits for a delivery at the new size with the encoder untouched.
-    delivery: DeliveryGate<(u32, u32, PixelFormat)>,
-    /// Health classifier + staged-recovery ladder over this capturer's clocks (WP12/WP13).
-    recovery: recovery::Supervisor,
-    /// A closed episode's measured outage, until the stream loop takes it (WP14).
-    recovered_outage: Option<Duration>,
-    /// A rung the stream loop's actuator runs, until `events` hands it over.
-    pending_stage: Option<pf_frame::recovery::Stage>,
-    /// A typed end the ladder decided off the capture path; `try_consume` returns it next.
-    pending_fault: Option<anyhow::Error>,
-    /// The session encoder's clocks from the loop's last `Supervised::observe` — the only view
-    /// this side has of the driver's frame and access-unit progress.
-    encoder: Option<pf_frame::health::EncoderTelemetry>,
-    /// Handle-duplication into WUDFHost, and the driver-death probe.
-    broker: ChannelBroker,
+    /// The delivery gate, the supervisor and the encoder's telemetry, over the driver's
+    /// transport. The in-place resize waits for a delivery at the new size with the encoder
+    /// untouched.
+    remote: RemoteSource<IddTransport>,
+    /// Handle duplication into WUDFHost for the cursor channel; the transport shares it.
+    broker: Arc<ChannelBroker>,
     /// Hardware-cursor shm (`Some` = delivered). The driver publishes into it and blends
     /// from it; this side reads it for the client's own pointer.
     cursor_shared: Option<cursor::CursorShared>,
@@ -250,9 +120,6 @@ pub struct IddPushCapturer {
     /// Kept so a re-arrived monitor can be handed the cursor channel again. The driver's worker
     /// does not survive a re-arrival, and the composite render model has no other shape source.
     cursor_sender: Option<crate::CursorChannelSender>,
-    /// `IOCTL_SET_ENCODE` and `IOCTL_ENCODE_CTL`, for [`crate::RemoteEncoder::open`].
-    set_encode: crate::SetEncodeSender,
-    encode_ctl: crate::EncodeCtlSender,
     /// Who draws the pointer, whether the secure desktop has the declare stood down, and
     /// which source the client's shape is read from.
     cursor_model: CursorModel,
@@ -297,16 +164,6 @@ pub struct IddPushCapturer {
     /// A presentation restart is in flight; if no frame resumes past the window,
     /// `try_consume` drops the session (recover-or-drop, no DDA).
     recovering_since: Option<Instant>,
-    /// Last fresh driver frame. A dead WUDFHost and an idle desktop both stop
-    /// advancing the driver's source counter.
-    last_fresh: Instant,
-    /// Last drain-worker progress: frames the pool TOOK plus frames it DROPPED, and when that
-    /// total last moved. Takes alone freeze while the worker is healthy, so this is the clock
-    /// the classifier reads ([`Self::recovery_tick`]).
-    drain_seq: u64,
-    last_drain: Instant,
-    /// One 0 ms wait per second, and only while stale.
-    last_liveness: Instant,
     /// Multi-hundred-ms DWM holes during active flow; warns when they turn metronomic.
     stall_watch: StallWatch,
     /// The stalest drain heartbeat (µs) seen since the last fresh frame.

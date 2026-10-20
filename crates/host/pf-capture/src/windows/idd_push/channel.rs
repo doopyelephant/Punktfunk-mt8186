@@ -1,4 +1,5 @@
-//! Handle-duplication broker for the driver's sealed sections.
+//! The host's channel to the driver: the WUDFHost handle-duplication broker, and
+//! [`IddTransport`], the remote source's edge into the driver.
 //!
 //! The AU and cursor sections are unnamed. The driver reaches them only through
 //! handles this broker duplicates into its WUDFHost, delivered as bare values by
@@ -6,6 +7,18 @@
 //! Evidence: `design/idd-push-security.md`.
 
 use super::*;
+use crate::windows::remote::section;
+use crate::windows::remote::transport::{
+    HandleTarget, Planted, RemoteEndpoint, Transport, TransportEvent,
+};
+use crate::{EncodeCtlSender, EncoderSite, SetEncodeSender};
+use pf_driver_proto::encode::{SetEncodeReply, SetEncodeRequest};
+
+/// A dead WUDFHost and an idle desktop both stop the source counter, so the death probe runs
+/// only past this much staleness.
+const STALE: Duration = Duration::from_secs(2);
+/// At most one 0 ms wait per this.
+const PROBE_EVERY: Duration = Duration::from_secs(1);
 
 /// On IOCTL success the driver owns (and closes) the duplicates; on any failure the
 /// deliverer reaps what it planted ([`Self::close_remote`]).
@@ -94,7 +107,7 @@ impl ChannelBroker {
 
     /// Close a handle VALUE in the WUDFHost table. `DUPLICATE_CLOSE_SOURCE` with no
     /// target closes the source; the result is ignored.
-    pub(super) fn close_remote(&self, value: u64) {
+    fn close_remote(&self, value: u64) {
         if value == 0 {
             return;
         }
@@ -112,5 +125,99 @@ impl ChannelBroker {
                 DUPLICATE_CLOSE_SOURCE,
             );
         }
+    }
+}
+
+impl HandleTarget for ChannelBroker {
+    fn plant(&self, bytes: usize) -> Result<Planted> {
+        section::plant(
+            &|h, a| self.dup_into(h, a),
+            &|v| self.close_remote(v),
+            bytes,
+        )
+    }
+
+    fn close_remote(&self, value: u64) {
+        ChannelBroker::close_remote(self, value);
+    }
+}
+
+/// The driver's side of the remote source: its WUDFHost, and the two IOCTLs the host sends.
+pub(super) struct IddTransport {
+    broker: Arc<ChannelBroker>,
+    target_id: u32,
+    /// The display's CCD key, as the log lines name it.
+    name: String,
+    set_encode: SetEncodeSender,
+    encode_ctl: EncodeCtlSender,
+    /// The last driver-death probe.
+    probed: Instant,
+}
+
+impl IddTransport {
+    pub(super) fn new(
+        broker: Arc<ChannelBroker>,
+        ccd: pf_win_display::win_display::CcdTargetKey,
+        set_encode: SetEncodeSender,
+        encode_ctl: EncodeCtlSender,
+    ) -> Self {
+        Self {
+            broker,
+            target_id: ccd.target_id,
+            name: ccd.to_string(),
+            set_encode,
+            encode_ctl,
+            probed: Instant::now(),
+        }
+    }
+}
+
+impl Transport for IddTransport {
+    fn endpoint(&self) -> RemoteEndpoint {
+        RemoteEndpoint {
+            site: EncoderSite::Driver,
+            target_id: self.target_id,
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn handles(&self) -> &dyn HandleTarget {
+        &*self.broker
+    }
+
+    /// Every open re-raises WUDFHost's GPU scheduling class: the driver's encoder submits its
+    /// work there, so the host's own class covers none of it.
+    fn set_encode(&self, req: &SetEncodeRequest) -> Result<SetEncodeReply> {
+        self.broker.raise_gpu_priority();
+        (self.set_encode)(req)
+    }
+
+    fn encode_ctl(&self) -> EncodeCtlSender {
+        self.encode_ctl.clone()
+    }
+
+    fn secure_desktop(&self) -> bool {
+        pf_win_display::secure_desktop()
+    }
+
+    /// Probe while stale so the driver cycle fires instead of the session streaming nothing.
+    fn poll(&mut self, now: Instant, last_fresh: Instant) -> Result<Vec<TransportEvent>> {
+        if now.saturating_duration_since(last_fresh) <= STALE
+            || now.saturating_duration_since(self.probed) <= PROBE_EVERY
+        {
+            return Ok(Vec::new());
+        }
+        self.probed = now;
+        if self.broker.driver_alive() {
+            return Ok(Vec::new());
+        }
+        tracing::warn!(
+            wudf_pid = self.broker.wudf_pid,
+            "IDD push: the pf-vdisplay WUDFHost is gone — firing the driver cycle"
+        );
+        Ok(vec![TransportEvent::DriverGone])
     }
 }

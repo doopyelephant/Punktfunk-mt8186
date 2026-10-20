@@ -1,55 +1,76 @@
 //! The frame-delivery endpoint: one tick of the capture loop, and the
 //! [`Capturer`] surface the stream loop drives.
 //!
-//! [`IddPushCapturer::try_consume`] runs the pollers, walks the recovery ladder
-//! and then reports the driver's frame cadence as a pixel-less
-//! [`CapturedFrame`] — the driver owns the pixels, so a delivery is only the
-//! news that its encode pool took a new composed frame, and `Ok(None)` means
-//! the desktop composed nothing. The role impls add the loop's control points:
-//! encoder telemetry in, recovery stages out as events, the in-place resize and
-//! presentation restart, the cursor, and the driver's encoder.
+//! [`IddPushCapturer::try_consume`] runs the display's pollers around the remote source's
+//! phases — the driver-death watch, the recovery ladder, the delivery gate — and reports the
+//! driver's frame cadence as a pixel-less [`CapturedFrame`]: the driver owns the pixels, so a
+//! delivery is only the news that its encode pool took a new composed frame, and `Ok(None)`
+//! means the desktop composed nothing. The role impls add the loop's control points: encoder
+//! telemetry in, recovery stages out as events, the in-place resize and presentation restart,
+//! the cursor, and the driver's encoder.
 
 use super::*;
 use crate::windows::cursor_state::Event;
-use crate::windows::pixelless;
+use crate::windows::remote::source::{first_frame, Geometry};
+use health::IddRungs;
+
+/// Make the OS present to `ccd` again at its current mode, and open the recover-or-drop window
+/// in `recovering_since`. `false`: unrecoverable in place.
+pub(super) fn restart_presentation(
+    ccd: pf_win_display::win_display::CcdTargetKey,
+    target_id: u32,
+    (width, height): (u32, u32),
+    recovering_since: &mut Option<Instant>,
+) -> bool {
+    // A target with no ACTIVE path cannot be recovered in place (immunity plan WP10 item 7):
+    // a same-mode reset would attach to a known-inactive display. Fail fast — on a FRESH
+    // snapshot only; a last-known-good one is not evidence either way.
+    let snap = pf_win_display::display_events::snapshot_or_query();
+    if snap.is_fresh() && !snap.target(ccd).is_some_and(|t| t.active) {
+        tracing::warn!(
+            target = %ccd,
+            "IDD push: same-mode recovery refused — the target has no active display path \
+             (topology removed it); a topology recovery must precede a presentation restart"
+        );
+        return false;
+    }
+    // The eviction's topology commit leaves DWM not presenting to this display, so the
+    // driver's drain worker acquires nothing. CDS_RESET forces a real mode-set at the
+    // CURRENT mode — the same lever bring-up's ADD path relies on.
+    match pf_win_display::win_display::resolve_gdi_name(ccd) {
+        Some(gdi) => {
+            if !pf_win_display::win_display::force_mode_reset(&gdi) {
+                tracing::warn!(
+                    target_id,
+                    "IDD push: presentation-restart mode reset failed"
+                );
+                return false;
+            }
+        }
+        None => {
+            tracing::warn!(
+                target_id,
+                "IDD push: no GDI name for the presentation-restart mode reset"
+            );
+            return false;
+        }
+    }
+    tracing::info!(
+        target_id,
+        mode = format!("{width}x{height}"),
+        "IDD push: same-mode presentation restart"
+    );
+    recovering_since.get_or_insert_with(Instant::now);
+    true
+}
 
 impl IddPushCapturer {
-    /// QPC ticks per second, read once. `0` when the call failed; every span then reads 0.
-    fn qpc_freq() -> u64 {
-        static FREQ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        *FREQ.get_or_init(|| {
-            let mut f = 0i64;
-            // SAFETY: plain FFI; `f` is a valid local out-param. Frequency is fixed at boot.
-            let _ = unsafe { QueryPerformanceFrequency(&mut f) };
-            f.max(0) as u64
-        })
-    }
-
-    /// A span of QPC ticks in µs (QPC is system-wide, so two driver stamps subtract).
-    pub(super) fn qpc_ticks_us(ticks: u64) -> u64 {
-        match Self::qpc_freq() {
-            0 => 0,
-            freq => ticks.saturating_mul(1_000_000) / freq,
-        }
-    }
-
-    /// Age of a driver QPC stamp in µs. 0 if the stamp is ahead.
-    pub(super) fn qpc_age_us(stamp: u64) -> u64 {
-        let mut now = 0i64;
-        // SAFETY: plain FFI; `now` is a valid local out-param.
-        if unsafe { QueryPerformanceCounter(&mut now) }.is_err() {
-            return 0;
-        }
-        Self::qpc_ticks_us((now as u64).saturating_sub(stamp))
-    }
-
-    /// One tick: pollers, recovery, then the driver's frame cadence. A delivery carries no
-    /// pixels (the driver encodes them) — its geometry, format and provenance are what the
-    /// stream loop consumes, and `Ok(None)` means the desktop composed nothing since the last.
+    /// One tick: the display's pollers, the remote source's phases, then the driver's frame
+    /// cadence. A delivery carries no pixels (the driver encodes them) — its geometry, format
+    /// and provenance are what the stream loop consumes, and `Ok(None)` means the desktop
+    /// composed nothing since the last.
     fn try_consume(&mut self) -> Result<Option<CapturedFrame>> {
-        if let Some(e) = self.pending_fault.take() {
-            return Err(e);
-        }
+        self.remote.take_fault()?;
         // Secure-desktop first: UAC/Winlogon may produce no frames until this edge.
         self.poll_secure_desktop();
         // Witness before any early return so every gap shape accumulates cursor motion.
@@ -60,47 +81,38 @@ impl IddPushCapturer {
         // restart's own mode commit composes a frame; the ladder's deadlines govern an episode.
         if let Some(since) = self.recovering_since
             && since.elapsed() > Duration::from_secs(3)
-            && !self.recovery.owns_episode()
+            && !self.remote.owns_episode()
         {
             bail!(
                 "IDD-push: the display was restarted in place and no frame followed within 3s \
                  — dropping the session so the client reconnects"
             );
         }
-        // A dead WUDFHost and an idle desktop both stop advancing the source counter. Probe
-        // while stale so the driver cycle fires instead of the session streaming nothing.
-        if self.last_fresh.elapsed() > Duration::from_secs(2)
-            && self.last_liveness.elapsed() > Duration::from_secs(1)
-        {
-            self.last_liveness = Instant::now();
-            if !self.broker.driver_alive() {
-                tracing::warn!(
-                    wudf_pid = self.broker.wudf_pid,
-                    "IDD push: the pf-vdisplay WUDFHost is gone — firing the driver cycle"
-                );
-                self.pending_stage = Some(pf_frame::recovery::Stage::DriverCycle);
-                return Ok(None);
-            }
-        }
-        // Staged recovery — after the driver-death watch, so an episode means the WUDFHost is
+        // The driver-death watch. Then staged recovery, so an episode means the WUDFHost is
         // ALIVE and the presentation path is what stopped.
+        if self.remote.poll()? {
+            return Ok(None);
+        }
         self.recovery_tick()?;
         // Stall-attribution evidence: the STALEST the driver's drain heartbeat ever reads
         // between fresh frames. A heartbeat that goes quiet for the hole convicts the worker
         // (starved/dead WUDFHost); one that stays fresh through it indicts the compose path.
-        if let Some(age) = self.heartbeat_age() {
+        if let Some(age) = self.remote.heartbeat_age() {
             self.max_hb_age_us = self.max_hb_age_us.max(age.as_micros() as u64);
         }
-        let geometry = (self.width, self.height, self.out_format());
-        let source = self.encoder.map(|t| (t.opened_at, t.source_seq));
-        if !self.delivery.admit(source, geometry) {
+        let geometry = Geometry {
+            width: self.width,
+            height: self.height,
+            format: self.out_format(),
+        };
+        if !self.remote.admit(geometry) {
             return Ok(None);
         }
         let now = Instant::now();
+        let encoder = self.remote.telemetry();
         // The newest access unit's OS present stamp against the moment the host took it: the
         // ground-truth clock that tells "DWM stopped presenting" from "we were late".
-        let arrival_ms = self
-            .encoder
+        let arrival_ms = encoder
             .and_then(|t| t.present_to_arrival)
             .map(|d| d.as_millis() as u64);
         if self.recovering_since.take().is_some() {
@@ -121,8 +133,7 @@ impl IddPushCapturer {
             let evidence = StallEvidence {
                 // `None` until the drain worker's first heartbeat: an age of 0 would acquit
                 // a worker that never ran.
-                max_heartbeat_age_ms: self
-                    .encoder
+                max_heartbeat_age_ms: encoder
                     .and_then(|t| t.drain_heartbeat)
                     .map(|_| self.max_hb_age_us / 1_000),
                 // Same window as the report's OS-event correlation (gap + cause lead-in).
@@ -167,48 +178,27 @@ impl IddPushCapturer {
                 "IDD push: present flow"
             );
         }
-        // A recovery episode closes only on the budgeted count of NEW source frames.
-        if let Some((summary, outage)) = self.recovery.source_frame(now) {
-            tracing::info!(
-                target = %self.ccd,
-                ?summary,
-                outage_ms = outage.as_millis() as u64,
-                "IDD push: recovery episode closed"
-            );
-            self.recovered_outage = Some(outage);
-        }
-        self.last_fresh = now;
+        let frame = self.remote.deliver(now);
         self.max_hb_age_us = 0;
         // Pending sample is the ending frame's move — discarded, never folded.
         self.cursor.fresh_frame();
-        self.source_seq += 1;
-        let (width, height, format) = geometry;
-        Ok(Some(pixelless::frame(
-            self.source_seq,
-            width,
-            height,
-            format,
-        )))
+        Ok(Some(frame))
     }
 }
 
 impl Capturer for IddPushCapturer {
     fn next_frame(&mut self, _budget: crate::FirstFrame) -> Result<CapturedFrame> {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(f) = self.try_consume()? {
-                return Ok(f);
-            }
-            if Instant::now() > deadline {
-                bail!(
-                    "no IDD-push frame within 20s (target {}) — the driver's encode pool took no \
-                     composed frame: the swap-chain was never assigned, the display is powered \
-                     off, or DWM composes nothing for it",
-                    self.target_id
-                );
-            }
-            std::thread::sleep(Duration::from_millis(4));
-        }
+        let target_id = self.target_id;
+        first_frame(
+            || self.try_consume(),
+            || {
+                anyhow::anyhow!(
+                    "no IDD-push frame within 20s (target {target_id}) — the driver's encode \
+                     pool took no composed frame: the swap-chain was never assigned, the \
+                     display is powered off, or DWM composes nothing for it"
+                )
+            },
+        )
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
@@ -216,13 +206,7 @@ impl Capturer for IddPushCapturer {
     }
 
     fn events(&mut self) -> Vec<crate::SourceEvent> {
-        use crate::SourceEvent;
-        let stage = self.pending_stage.take().map(SourceEvent::RunStage);
-        let outage = self
-            .recovered_outage
-            .take()
-            .map(SourceEvent::RecoveredOutage);
-        stage.into_iter().chain(outage).collect()
+        self.remote.events()
     }
 
     fn colour(&self) -> crate::ColourFacts {
@@ -290,56 +274,22 @@ impl crate::DisplayControl for IddPushCapturer {
     }
 
     fn restart_presentation(&mut self) -> bool {
-        // A target with no ACTIVE path cannot be recovered in place (immunity plan WP10 item 7):
-        // a same-mode reset would attach to a known-inactive display. Fail fast — on a FRESH
-        // snapshot only; a last-known-good one is not evidence either way.
-        let snap = pf_win_display::display_events::snapshot_or_query();
-        if snap.is_fresh() && !snap.target(self.ccd).is_some_and(|t| t.active) {
-            tracing::warn!(
-                target = %self.ccd,
-                "IDD push: same-mode recovery refused — the target has no active display path \
-                 (topology removed it); a topology recovery must precede a presentation restart"
-            );
-            return false;
-        }
-        // The eviction's topology commit leaves DWM not presenting to this display, so the
-        // driver's drain worker acquires nothing. CDS_RESET forces a real mode-set at the
-        // CURRENT mode — the same lever bring-up's ADD path relies on.
-        match pf_win_display::win_display::resolve_gdi_name(self.ccd) {
-            Some(gdi) => {
-                if !pf_win_display::win_display::force_mode_reset(&gdi) {
-                    tracing::warn!(
-                        target_id = self.target_id,
-                        "IDD push: presentation-restart mode reset failed"
-                    );
-                    return false;
-                }
-            }
-            None => {
-                tracing::warn!(
-                    target_id = self.target_id,
-                    "IDD push: no GDI name for the presentation-restart mode reset"
-                );
-                return false;
-            }
-        }
-        tracing::info!(
-            target_id = self.target_id,
-            mode = format!("{}x{}", self.width, self.height),
-            "IDD push: same-mode presentation restart"
-        );
-        self.recovering_since.get_or_insert_with(Instant::now);
-        true
+        restart_presentation(
+            self.ccd,
+            self.target_id,
+            (self.width, self.height),
+            &mut self.recovering_since,
+        )
     }
 }
 
 impl crate::Supervised for IddPushCapturer {
     fn observe(&mut self, t: Option<pf_frame::health::EncoderTelemetry>) {
-        self.encoder = t;
+        self.remote.observe(t);
     }
 
     fn health(&self) -> crate::CaptureHealth {
-        self.recovery.report(Instant::now(), self.encoder.as_ref())
+        self.remote.health()
     }
 
     fn stage_done(
@@ -347,43 +297,23 @@ impl crate::Supervised for IddPushCapturer {
         stage: pf_frame::recovery::Stage,
         outcome: pf_frame::recovery::StageOutcome,
     ) {
-        use pf_frame::recovery::{Stage, StageOutcome};
-        let step = self.finish_stage(stage, outcome);
-        if let Err(e) = self.drive(step) {
-            self.pending_fault = Some(e);
-            return;
-        }
-        // A driver cycle, applied or not, ends this capturer: the WUDFHost its encoder points at
-        // is gone either way, and the driver-death watch fires the cycle outside any episode, so
-        // nothing else bounds a reload that keeps failing.
-        if matches!(stage, Stage::DriverCycle) {
-            let applied = matches!(outcome, StageOutcome::Applied);
-            self.pending_fault = Some(anyhow::anyhow!(
-                "IDD-push: the pf-vdisplay driver cycle {} — ending the capturer so the session \
-                 rebuilds its virtual output",
-                if applied {
-                    "reloaded the adapter"
-                } else {
-                    "FAILED (adapter not reloaded)"
-                }
-            ));
-        }
+        let mut rungs = IddRungs {
+            ccd: self.ccd,
+            target_id: self.target_id,
+            mode: (self.width, self.height),
+            recovering_since: &mut self.recovering_since,
+        };
+        self.remote.stage_done_with(stage, outcome, &mut rungs);
     }
 }
 
 impl crate::RemoteEncoder for IddPushCapturer {
     fn site(&self) -> crate::EncoderSite {
-        crate::EncoderSite::Driver
+        self.remote.site()
     }
 
     fn open(&self, params: &crate::DriverEncodeParams) -> Result<Box<dyn pf_encode_core::Encoder>> {
-        super::driver_encode::open_driver_encoder(
-            self.target_id,
-            self.broker.wudf_pid,
-            params,
-            self.set_encode.clone(),
-            self.encode_ctl.clone(),
-        )
+        self.remote.open(params)
     }
 }
 

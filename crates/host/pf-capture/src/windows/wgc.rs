@@ -3,9 +3,9 @@
 //!
 //! [`WorkerLink`] is the host's end of one worker: its process handle, and the two pipes of
 //! [`pf_driver_proto::worker`] behind a [`Link`], which checks and bounds everything the
-//! worker sends. [`WgcCapturer`] is pixel-less like the IDD-push capturer — the worker owns
-//! the pixels and the encoder, and publishes into the same AU section the driver does, so
-//! its [`RemoteEncoder`](crate::RemoteEncoder) hands the stream loop the same proxy.
+//! worker sends. [`WorkerTransport`] is the remote source's edge over it: the worker owns the
+//! pixels and the encoder, and publishes into the same AU section the driver does, so the
+//! source and its encoder proxy are the driver's own.
 //!
 //! Evidence: `design/windows-wgc-capture.md` §4.3, §4.7, §4.13.
 
@@ -19,7 +19,6 @@ use anyhow::{bail, Context, Result};
 use bytemuck::Pod;
 use pf_driver_proto::encode as wire;
 use pf_driver_proto::worker::{self as proto, kind};
-use pf_encode_core::Encoder;
 use windows::Win32::Foundation::{
     DuplicateHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS, DUPLICATE_SAME_ACCESS,
     HANDLE, WAIT_OBJECT_0,
@@ -28,12 +27,16 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
 };
 
-use crate::windows::idd_push::driver_encode::{open_remote_encoder, HandleTarget};
-use crate::windows::pixelless::{self, DeliveryGate};
-use crate::windows::worker_link::{Link, Message, Peer};
-use crate::{
-    CapturedFrame, Capturer, DriverEncodeParams, EncodeCtlSender, PixelFormat, SetEncodeSender,
+use crate::windows::remote::encoder::nul_tag;
+use crate::windows::remote::link::{Link, Message, Peer};
+use crate::windows::remote::qpc;
+use crate::windows::remote::section;
+use crate::windows::remote::source::{Geometry, RemoteSource};
+use crate::windows::remote::supervisor::Supervision;
+use crate::windows::remote::transport::{
+    HandleTarget, Planted, RemoteEndpoint, Transport, TransportEvent,
 };
+use crate::{Capturer, EncodeCtlSender, EncoderSite, PixelFormat};
 
 /// How long the worker has to say hello. A process's first lines of `main`.
 const HELLO_BOUND: Duration = Duration::from_secs(5);
@@ -162,23 +165,7 @@ impl WorkerLink {
     fn event(&self) -> Option<Message> {
         self.link.event()
     }
-}
 
-impl Drop for WorkerLink {
-    fn drop(&mut self) {
-        self.link.close();
-        // SAFETY: `process` is this link's live handle; a bounded wait only reads its state.
-        let exited = unsafe {
-            WaitForSingleObject(self.process(), EXIT_BOUND.as_millis() as u32) == WAIT_OBJECT_0
-        };
-        if !exited {
-            tracing::warn!(pid = self.pid, "capture worker did not exit — ending it");
-            self.kill();
-        }
-    }
-}
-
-impl HandleTarget for WorkerLink {
     fn dup_into(&self, h: BorrowedHandle<'_>, access: Option<u32>) -> Result<u64> {
         let mut out = HANDLE::default();
         let (desired, options) = match access {
@@ -222,37 +209,32 @@ impl HandleTarget for WorkerLink {
     }
 }
 
-/// Open the worker's encoder and hand back the stream loop's [`Encoder`]: the driver's proxy,
-/// its two senders writing to the pipe instead of a device. `target_id` names the monitor in the
-/// request and the logs. The worker owns both duplicated handles from the moment the request is
-/// written, whatever it answers.
-fn open_worker_encoder(
-    worker: &Arc<WorkerLink>,
-    target_id: u32,
-    params: &DriverEncodeParams,
-) -> Result<Box<dyn Encoder>> {
-    let link = worker.clone();
-    let set_encode: SetEncodeSender = Arc::new(move |req: &wire::SetEncodeRequest| {
-        link.request(kind::SET_ENCODE, req, OPEN_BOUND)
-    });
-    let link = worker.clone();
-    let encode_ctl: EncodeCtlSender = Arc::new(move |req: &wire::EncodeCtlRequest| {
-        let bound = if req.op == wire::ENCODE_CTL_RESET {
-            OPEN_BOUND
-        } else {
-            CTL_BOUND
+impl Drop for WorkerLink {
+    fn drop(&mut self) {
+        self.link.close();
+        // SAFETY: `process` is this link's live handle; a bounded wait only reads its state.
+        let exited = unsafe {
+            WaitForSingleObject(self.process(), EXIT_BOUND.as_millis() as u32) == WAIT_OBJECT_0
         };
-        let reply: proto::CtlReply = link.request(kind::ENCODE_CTL, req, bound)?;
-        if reply.status != proto::CTL_OK {
-            bail!(
-                "capture worker refused control op {}: status {}",
-                req.op,
-                reply.status
-            );
+        if !exited {
+            tracing::warn!(pid = self.pid, "capture worker did not exit — ending it");
+            self.kill();
         }
-        Ok(())
-    });
-    open_remote_encoder(&**worker, target_id, params, set_encode, encode_ctl)
+    }
+}
+
+impl HandleTarget for WorkerLink {
+    fn plant(&self, bytes: usize) -> Result<Planted> {
+        section::plant(
+            &|h, a| self.dup_into(h, a),
+            &|v| self.close_remote(v),
+            bytes,
+        )
+    }
+
+    fn close_remote(&self, value: u64) {
+        WorkerLink::close_remote(self, value);
+    }
 }
 
 /// The monitor a worker captures, as the host's display inventory names it now.
@@ -270,9 +252,96 @@ fn side(v: u32) -> Option<u32> {
     (1..=MAX_SIDE).contains(&v).then_some(v)
 }
 
-fn stage_tag(stage: &[u8; 16]) -> String {
-    let end = stage.iter().position(|&b| b == 0).unwrap_or(stage.len());
-    String::from_utf8_lossy(&stage[..end]).into_owned()
+/// The remote source's edge into one worker: its pipes for the encoder's requests, and its
+/// events for the source's news. The worker owns both duplicated handles from the moment the
+/// request is written, whatever it answers.
+struct WorkerTransport {
+    link: Arc<WorkerLink>,
+    source: WgcSource,
+    /// The source's size as the worker last reported it.
+    size: (u32, u32),
+}
+
+impl Transport for WorkerTransport {
+    fn endpoint(&self) -> RemoteEndpoint {
+        RemoteEndpoint {
+            site: EncoderSite::Worker,
+            target_id: self.source.target_id,
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.source.gdi_name
+    }
+
+    fn handles(&self) -> &dyn HandleTarget {
+        &*self.link
+    }
+
+    fn set_encode(&self, req: &wire::SetEncodeRequest) -> Result<wire::SetEncodeReply> {
+        self.link.request(kind::SET_ENCODE, req, OPEN_BOUND)
+    }
+
+    /// The control calls as pipe requests: a reset gets the open's bound, every other op is
+    /// answered at once.
+    fn encode_ctl(&self) -> EncodeCtlSender {
+        let link = self.link.clone();
+        Arc::new(move |req: &wire::EncodeCtlRequest| {
+            let bound = if req.op == wire::ENCODE_CTL_RESET {
+                OPEN_BOUND
+            } else {
+                CTL_BOUND
+            };
+            let reply: proto::CtlReply = link.request(kind::ENCODE_CTL, req, bound)?;
+            if reply.status != proto::CTL_OK {
+                bail!(
+                    "capture worker refused control op {}: status {}",
+                    req.op,
+                    reply.status
+                );
+            }
+            Ok(())
+        })
+    }
+
+    fn secure_desktop(&self) -> bool {
+        pf_win_display::secure_desktop()
+    }
+
+    /// The worker's exit, then its events. A gone source or a reply that is not a size ends
+    /// the source.
+    fn poll(&mut self, _now: Instant, _last_fresh: Instant) -> Result<Vec<TransportEvent>> {
+        if let Some(code) = self.link.exit_code() {
+            bail!("capture worker exited (code {code})");
+        }
+        let mut news = Vec::new();
+        while let Some((frame, body)) = self.link.event() {
+            match frame.kind {
+                kind::SOURCE_CHANGED => {
+                    let changed = proto::body::<proto::SourceChanged>(&body)
+                        .and_then(|c| Some((side(c.width)?, side(c.height)?)));
+                    let Some((width, height)) = changed else {
+                        bail!("capture worker reported a source change that is not a size");
+                    };
+                    tracing::info!(
+                        gdi = %self.source.gdi_name,
+                        from = format!("{}x{}", self.size.0, self.size.1),
+                        to = format!("{width}x{height}"),
+                        "capture worker: the source changed size"
+                    );
+                    self.size = (width, height);
+                    news.push(TransportEvent::Resized { width, height });
+                }
+                kind::SOURCE_GONE => bail!("capture source {} is gone", self.source.gdi_name),
+                other => tracing::debug!(kind = other, "capture worker: unknown event"),
+            }
+        }
+        Ok(news)
+    }
+
+    fn alive(&self) -> bool {
+        self.link.exit_code().is_none()
+    }
 }
 
 /// Open `source` in `worker` and hand back its capturer. `want_hdr` is the session's: the
@@ -307,7 +376,7 @@ pub fn open_wgc(
             source.gdi_name,
             reply.status,
             reply.error as u32,
-            stage_tag(&reply.stage)
+            nul_tag(&reply.stage)
         );
     }
     let asked = if fp16 {
@@ -336,180 +405,29 @@ pub fn open_wgc(
         worker_pid = link.pid(),
         "capture worker: source open"
     );
-    Ok(Box::new(WgcCapturer {
-        link,
-        source,
-        width,
-        height,
-        fp16,
-        encoder: None,
-        delivery: DeliveryGate::new(),
-        frames: 0,
-        last_fresh: Instant::now(),
-        _keepalive: keepalive,
-    }))
-}
-
-/// The stream loop's [`Capturer`] for a worker session. A delivery carries no pixels: it is
-/// the news that the worker's pool took a new frame, read off the encoder's own section.
-struct WgcCapturer {
-    link: Arc<WorkerLink>,
-    source: WgcSource,
-    width: u32,
-    height: u32,
-    /// The capture is FP16 scRGB and the stream HDR.
-    fp16: bool,
-    /// The session encoder's clocks, handed over once per loop tick.
-    encoder: Option<pf_frame::health::EncoderTelemetry>,
-    /// The freshness test, over the worker's source counter and the delivered size.
-    delivery: DeliveryGate<(u32, u32)>,
-    frames: u64,
-    /// When the worker's pool last took a frame, for the health surface.
-    last_fresh: Instant,
-    _keepalive: Box<dyn Send>,
-}
-
-impl WgcCapturer {
-    /// One tick: the worker's exit and events, then its frame cadence. `Ok(None)` means the
-    /// desktop changed nothing since the last delivery.
-    fn try_consume(&mut self) -> Result<Option<CapturedFrame>> {
-        if let Some(code) = self.link.exit_code() {
-            bail!("capture worker exited (code {code})");
-        }
-        while let Some((frame, body)) = self.link.event() {
-            match frame.kind {
-                kind::SOURCE_CHANGED => {
-                    let changed = proto::body::<proto::SourceChanged>(&body)
-                        .and_then(|c| Some((side(c.width)?, side(c.height)?)));
-                    let Some((width, height)) = changed else {
-                        bail!("capture worker reported a source change that is not a size");
-                    };
-                    tracing::info!(
-                        gdi = %self.source.gdi_name,
-                        from = format!("{}x{}", self.width, self.height),
-                        to = format!("{width}x{height}"),
-                        "capture worker: the source changed size"
-                    );
-                    (self.width, self.height) = (width, height);
-                }
-                kind::SOURCE_GONE => bail!("capture source {} is gone", self.source.gdi_name),
-                other => tracing::debug!(kind = other, "capture worker: unknown event"),
-            }
-        }
-        let source = self.encoder.map(|t| (t.opened_at, t.source_seq));
-        if !self.delivery.admit(source, (self.width, self.height)) {
-            return Ok(None);
-        }
-        self.frames += 1;
-        self.last_fresh = Instant::now();
-        let format = if self.fp16 {
-            PixelFormat::P010
-        } else {
-            PixelFormat::Nv12
-        };
-        Ok(Some(pixelless::frame(
-            self.frames,
-            self.width,
-            self.height,
+    // The capture is FP16 scRGB and the stream HDR, or BGRA8 and SDR, for the session's life.
+    let format = if fp16 {
+        PixelFormat::P010
+    } else {
+        PixelFormat::Nv12
+    };
+    Ok(Box::new(RemoteSource::new(
+        WorkerTransport {
+            link,
+            source,
+            size: (width, height),
+        },
+        Geometry {
+            width,
+            height,
             format,
-        )))
-    }
-}
-
-impl Capturer for WgcCapturer {
-    fn next_frame(&mut self, _budget: crate::FirstFrame) -> Result<CapturedFrame> {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(f) = self.try_consume()? {
-                return Ok(f);
-            }
-            if Instant::now() > deadline {
-                bail!(
-                    "no frame of {} within 20s — the capture worker's pool took none",
-                    self.source.gdi_name
-                );
-            }
-            std::thread::sleep(Duration::from_millis(4));
-        }
-    }
-
-    fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        self.try_consume()
-    }
-
-    fn is_alive(&self) -> bool {
-        self.link.exit_code().is_none()
-    }
-
-    /// BT.2020 PQ while the capture is FP16, with the generic HDR10 volume the driver path
-    /// sends.
-    fn colour(&self) -> crate::ColourFacts {
-        crate::ColourFacts {
-            hdr_meta: self.fp16.then(pf_frame::hdr::generic_hdr10),
-            sdr_fp16: false,
-        }
-    }
-
-    fn supervised(&mut self) -> Option<&mut dyn crate::Supervised> {
-        Some(self)
-    }
-
-    fn remote_encoder(&self) -> Option<&dyn crate::RemoteEncoder> {
-        Some(self)
-    }
-}
-
-impl crate::Supervised for WgcCapturer {
-    fn observe(&mut self, t: Option<pf_frame::health::EncoderTelemetry>) {
-        self.encoder = t;
-    }
-
-    /// The operator surface's view. The capture delivers only what changes, so a quiet source
-    /// is `idle`, never a stall, and no recovery rung hangs off this. Under the secure desktop
-    /// the capture keeps showing the desktop without the prompt: that state is named.
-    fn health(&self) -> crate::CaptureHealth {
-        use pf_driver_proto::encode::au;
-        let enc = self.encoder.as_ref();
-        let source_gap = self.last_fresh.elapsed();
-        let class = if pf_win_display::secure_desktop() {
-            "secure_desktop"
-        } else if source_gap > IDLE_AFTER {
-            "idle"
-        } else {
-            "healthy"
-        };
-        crate::CaptureHealth {
-            class,
-            stall_class: None,
-            source_gap,
-            evidence: None,
-            present_to_arrival: enc.and_then(|e| e.present_to_arrival),
-            late_frames: false,
-            encoder_state: enc.map(|e| match e.state {
-                au::ENCODER_CLOSED => "closed",
-                au::ENCODER_OPEN => "open",
-                au::ENCODER_ENCODING => "encoding",
-                _ => "wedged",
-            }),
-            backend_opened: enc.map(|e| e.backend),
-            detached: 0,
-            published_total: enc.map_or(0, |e| e.published_total),
-            dropped_total: enc.map_or(0, |e| e.dropped_total),
-            source_seq: enc.map_or(0, |e| e.source_seq),
-            current_stage: None,
-            last_episode: None,
-            episodes_suppressed: 0,
-            cooldown_remaining: None,
-        }
-    }
-}
-
-impl crate::RemoteEncoder for WgcCapturer {
-    fn site(&self) -> crate::EncoderSite {
-        crate::EncoderSite::Worker
-    }
-
-    fn open(&self, params: &DriverEncodeParams) -> Result<Box<dyn Encoder>> {
-        open_worker_encoder(&self.link, self.source.target_id, params)
-    }
+        },
+        // The capture delivers only what changes, so a quiet source is idle, never a stall,
+        // and no recovery rung hangs off it.
+        Supervision::Classify {
+            idle_after: IDLE_AFTER,
+        },
+        qpc::CLOCKS,
+        keepalive,
+    )))
 }

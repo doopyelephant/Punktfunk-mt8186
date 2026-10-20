@@ -1,23 +1,15 @@
 //! One-shot IDD-push construction: display depth, the WUDFHost duplication
-//! broker, and the cursor opt-in.
+//! broker, the remote source over it, and the cursor opt-in.
 //!
-//! [`shared_object_sa`] is here too, shared with the AU section's own create. Steady-state
-//! capture (`try_consume`, pollers, `Capturer`) lives in `capturer`. A `#[path]` child sees
-//! the parent's private items through `use super::*`. Evidence:
+//! Steady-state capture (`try_consume`, pollers, `Capturer`) lives in `capturer`. A
+//! `#[path]` child sees the parent's private items through `use super::*`. Evidence:
 //! `design/idd-push-security.md`.
 
 use super::*;
 use crate::windows::cursor_state::Opening;
-
-/// `SECURITY_ATTRIBUTES` for the unnamed AU section and its event: SDDL
-/// `D:P(A;;GA;;;SY)`, protected, `bInheritHandle: false`. The cursor section takes the
-/// process default instead.
-///
-/// The driver never opens by name; it receives duplicated handles (access travels
-/// with the handle). See `design/idd-push-security.md`.
-pub(super) fn shared_object_sa() -> Result<SecurityAttributes> {
-    SecurityAttributes::new("D:P(A;;GA;;;SY)").context("build SDDL for IDD-push shared objects")
-}
+use crate::windows::remote::qpc;
+use crate::windows::remote::source::Geometry;
+use crate::windows::remote::supervisor::Supervision;
 
 impl IddPushCapturer {
     /// Open the IDD-push capturer. Success attaches `keepalive` (the capturer
@@ -162,7 +154,7 @@ impl IddPushCapturer {
             Self::pin_wcg(ccd, target.target_id, ten_bit_sdr && super::wcg_available())
         };
         // The duplication target for the AU and cursor sections, and the driver-death probe.
-        let broker = ChannelBroker::open(target.wudf_pid)?;
+        let broker = Arc::new(ChannelBroker::open(target.wudf_pid)?);
 
         // CursorShm create + deliver. Non-fatal: without it the driver never
         // declares a hardware cursor, so this session has no pointer to forward
@@ -249,13 +241,19 @@ impl IddPushCapturer {
         let mut me = Self {
             target_id: target.target_id,
             ccd,
-            source_seq: 0,
-            delivery: DeliveryGate::new(),
-            recovery: super::recovery::Supervisor::new(Instant::now()),
-            recovered_outage: None,
-            pending_stage: None,
-            pending_fault: None,
-            encoder: None,
+            // The format is a placeholder: the tick hands the source its geometry before the
+            // first delivery.
+            remote: RemoteSource::new(
+                IddTransport::new(broker.clone(), ccd, set_encode, encode_ctl),
+                Geometry {
+                    width: w,
+                    height: h,
+                    format: PixelFormat::Nv12,
+                },
+                Supervision::Ladder,
+                qpc::CLOCKS,
+                Box::new(()),
+            ),
             broker,
             width: w,
             height: h,
@@ -281,10 +279,6 @@ impl IddPushCapturer {
             pending_desc: None,
             pending_desc_gen: 0,
             recovering_since: None,
-            last_fresh: Instant::now(),
-            drain_seq: 0,
-            last_drain: Instant::now(),
-            last_liveness: Instant::now(),
             stall_watch: StallWatch::new(),
             max_hb_age_us: 0,
             cursor: CursorWitness::new(Instant::now()),
@@ -297,8 +291,6 @@ impl IddPushCapturer {
             shape_from_section: None,
             cursor_forward,
             cursor_sender,
-            set_encode,
-            encode_ctl,
             cursor_model,
             sdr_white_scale: 2.5,
             sdr_white_logged: false,

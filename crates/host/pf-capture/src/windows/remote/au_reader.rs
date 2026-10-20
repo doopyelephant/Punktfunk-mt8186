@@ -5,10 +5,7 @@
 //!
 //! Pure over a mapped [`AuView`], so the same code reads the driver's section on Windows and
 //! a `Vec` in the tests. Section creation, `SET_ENCODE`, and the `Encoder` proxy
-//! are `idd_push/driver_encode.rs`.
-
-// Off Windows only the tests read this module.
-#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
+//! are `encoder.rs`.
 
 use pf_driver_proto::encode::au::{self, AuHeader, AuSlot};
 use pf_driver_proto::encode::FrameToken;

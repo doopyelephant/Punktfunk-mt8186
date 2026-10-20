@@ -7,9 +7,6 @@
 //!
 //! Pure, so the gate's rule has tests on every target.
 
-// Off Windows only the tests read this module.
-#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
-
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat, Provenance};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
