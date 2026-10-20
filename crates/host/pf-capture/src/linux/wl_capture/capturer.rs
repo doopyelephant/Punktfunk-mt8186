@@ -42,6 +42,7 @@ impl WlCapturer {
         keepalive: Box<dyn Send>,
         policy: ZeroCopyPolicy,
         want_hdr: bool,
+        knobs: crate::knobs::Knobs,
     ) -> std::result::Result<WlCapturer, (anyhow::Error, Box<dyn Send>)> {
         let slot: FrameSlot = Arc::new(std::sync::Mutex::new(None));
         use std::hash::{Hash, Hasher};
@@ -50,7 +51,14 @@ impl WlCapturer {
         let identity = health_identity(hash.finish() | (1 << 63), &policy);
         let signals = CaptureSignals::new(pf_zerocopy::zero_copy_health(identity));
         signals.active.store(true, Ordering::Relaxed);
-        let h = match spawn(output_name.clone(), policy, want_hdr, slot, signals) {
+        let h = match spawn(
+            output_name.clone(),
+            policy,
+            want_hdr,
+            knobs.header_pts,
+            slot,
+            signals,
+        ) {
             Ok(h) => h,
             Err(e) => return Err((e, keepalive)),
         };

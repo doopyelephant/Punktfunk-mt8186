@@ -104,12 +104,9 @@ fn apply(set: SetSleepMode, device: &ID3D11Device, on: bool) -> i32 {
 pub(super) struct ClockBoost((u32, i32));
 
 impl ClockBoost {
-    /// Hold the boost on the adapter with `luid`. `None` unless `PUNKTFUNK_NVENC_CLOCK_BOOST`
-    /// asks for it, and when the box has no NVAPI or the driver declines.
+    /// Hold the boost on the adapter with `luid`. `None` when the box has no NVAPI or the
+    /// driver declines.
     pub(super) fn hold(luid: LUID) -> Option<Self> {
-        if pf_host_config::env_on("PUNKTFUNK_NVENC_CLOCK_BOOST") != Some(true) {
-            return None;
-        }
         let set = set_sleep_mode()?;
         let key = (luid.LowPart, luid.HighPart);
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());

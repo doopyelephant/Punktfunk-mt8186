@@ -171,13 +171,10 @@ pub(super) fn pool_ask(pool_min: i32, pool_max: Option<i32>, raw_lane: bool) -> 
     pool_max.map_or(deep, |max| deep.min(max).max(pool_min))
 }
 
-/// `PUNKTFUNK_ZEROCOPY_HOLD=0` restores immediate requeue (racy). On the raw passthrough it
-/// never publishes an unheld dmabuf: `try_defer` returns `None` there and the frame takes the
-/// safe CPU fallback instead. Use `env_on`; a bare `== "0"` is the trap `PUNKTFUNK_FORCE_SHM`
-/// already hit.
+/// [`Knobs::zerocopy_hold`](crate::knobs::Knobs::zerocopy_hold): off, `try_defer` returns
+/// `None` and the raw passthrough takes the CPU fallback.
 pub(super) fn zerocopy_hold_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| pf_host_config::env_on("PUNKTFUNK_ZEROCOPY_HOLD").unwrap_or(true))
+    crate::knobs::Knobs::process().zerocopy_hold
 }
 
 /// Which buffers are withheld, each under a per-hold generation.

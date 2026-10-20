@@ -5,15 +5,13 @@
 //! `PUNKTFUNK_IDD_DIAG` turned them on; they name no class.
 
 use super::*;
+use crate::knobs::Knobs;
 use crate::windows::stall_model::{attribute, Stall, StallEvidence, StallVerdict, StallWatch};
 
-/// Driver GPU-priority lever (`PFVD_NO_RT_GPU` opt-out; default REALTIME).
-/// Reads this process's env; WUDFHost resolves the same variable. An env
-/// edited after either process started is stale until restart. Rides every
-/// stall-triage line so an A/B is interpretable; lowering priority masks
-/// this class at most.
+/// Driver GPU-priority lever ([`Knobs::no_rt_gpu`]; default REALTIME). Rides every
+/// stall-triage line so an A/B is interpretable; lowering priority masks this class at most.
 pub(super) fn rt_gpu_driver_posture() -> &'static str {
-    if std::env::var_os("PFVD_NO_RT_GPU").is_some() {
+    if Knobs::process().no_rt_gpu {
         "off (PFVD_NO_RT_GPU)"
     } else {
         "REALTIME (default)"
@@ -21,15 +19,7 @@ pub(super) fn rt_gpu_driver_posture() -> &'static str {
 }
 
 pub(super) fn rt_gpu_host_posture() -> &'static str {
-    match std::env::var("PUNKTFUNK_GPU_PRIORITY_CLASS")
-        .ok()
-        .as_deref()
-    {
-        Some("off") => "off",
-        Some("normal") => "normal",
-        Some("high") => "high",
-        _ => "REALTIME (default)",
-    }
+    Knobs::process().gpu_priority_class
 }
 
 impl StallWatch {

@@ -94,7 +94,7 @@ impl FastSyntheticCapturer {
             height,
             frame_idx: 0,
             buf: vec![0u8; width as usize * height as usize * 4],
-            noise: pf_host_config::env_on("PUNKTFUNK_SYNTH_NOISE") == Some(true),
+            noise: crate::knobs::Knobs::from_env().synth_noise,
             rng: 0x9e3779b97f4a7c15,
         }
     }

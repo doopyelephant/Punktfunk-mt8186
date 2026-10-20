@@ -13,56 +13,14 @@
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 
 mod capturer;
+mod knobs;
 mod open;
 mod synthetic;
 pub use capturer::*;
+#[cfg(target_os = "linux")]
+pub use knobs::direct_capture;
 pub use open::*;
 pub use synthetic::{FastSyntheticCapturer, SyntheticCapturer};
-
-/// Whether to ask a KWin output for delivery on its own frame signal.
-///
-/// KWin schedules each screencast frame on a QTimer whose wait it rounds *up* to a whole
-/// millisecond, so an 8.333 ms frame is scheduled at 9 and the cadence jitters against the
-/// real refresh. Unpaced, KWin up to 6.7 gets no ceiling and delivers on its damage
-/// signal; KWin 6.8 (millihertz offer) gets the stream rate as its ceiling and paces the
-/// cast at it. `PUNKTFUNK_KWIN_PACED=1` asks every KWin for the stream rate.
-pub fn unpaced_capture() -> bool {
-    !pf_host_config::row_bool("PUNKTFUNK_KWIN_PACED")
-}
-
-/// Offer PipeWire explicit sync (`SPA_META_SyncTimeline`) on the dmabuf lane.
-///
-/// A producer that takes it hands over a fence at each buffer's acquire point and waits on
-/// the release point this side signals, instead of finishing the GPU itself. KWin on NVIDIA
-/// `glFinish()`es its compositor thread per cast frame otherwise — ~9 ms under a game's
-/// load, the whole 120 → 111 fps gap. `PUNKTFUNK_EXPLICIT_SYNC=0` keeps the implicit path.
-pub fn explicit_sync() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_EXPLICIT_SYNC").unwrap_or(true)
-}
-
-/// Whether to capture a compositor's output directly with `ext-image-copy-capture-v1`
-/// instead of going through the xdg ScreenCast portal.
-///
-/// The portal is a second clock in the path: xdg-desktop-portal-hyprland re-requests each
-/// frame on a millisecond timer with a 6 ms floor, which halves the rate at 165 Hz and
-/// adds ~3 ms to every frame's age. Capturing the protocol ourselves removes both.
-/// `PUNKTFUNK_DIRECT_CAPTURE=0` keeps the portal.
-#[cfg(target_os = "linux")]
-pub fn direct_capture() -> bool {
-    pf_host_config::row_bool("PUNKTFUNK_DIRECT_CAPTURE")
-}
-
-/// Whether a virtual output may be driven as a PipeWire lazy driver.
-///
-/// A producer that emits RequestProcess (Mutter ≥ 49 virtual monitors) paints only in a
-/// graph cycle the consumer starts, so the encode loop's slot is the one tick: no
-/// compositor timer to beat against, no throttle to lose frames in, no extra render.
-/// Producers without it are never driven. `PUNKTFUNK_LAZY_CAPTURE=0` restores the
-/// producer-driven stream.
-#[cfg(target_os = "linux")]
-pub fn lazy_capture() -> bool {
-    pf_host_config::row_bool("PUNKTFUNK_LAZY_CAPTURE")
-}
 
 // The per-source HDR latch lives in pf-frame so pf-vdisplay reads it without this crate.
 #[cfg(target_os = "linux")]

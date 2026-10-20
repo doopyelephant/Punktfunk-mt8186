@@ -32,7 +32,7 @@ use std::sync::mpsc::SyncSender;
 
 /// Named bools: four adjacent same-typed args transpose silently and
 /// negotiate the wrong pod family (black screen).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct CaptureOpts {
     /// `false` forces CPU mmap even when `PUNKTFUNK_ZEROCOPY` is set — the
     /// session plan does that when 4:4:4 has no zero-copy convert (`SessionPlan::output_format`).
@@ -67,14 +67,16 @@ struct CaptureOpts {
     pool_max: Option<i32>,
     /// Offer `maxFramerate = 0/1` so KWin records on its own frame signal
     /// rather than a millisecond-rounded timer. KWin only; see
-    /// [`crate::unpaced_capture`].
+    /// [`Knobs::kwin_paced`](crate::knobs::Knobs::kwin_paced).
     unpaced: bool,
     /// Drive the producer as a PipeWire lazy driver when it emits RequestProcess
     /// (Mutter ≥ 49 virtual monitors): it then paints when it asks, one paint per
-    /// wire interval at most. See [`crate::lazy_capture`].
+    /// wire interval at most. See [`Knobs::lazy_capture`](crate::knobs::Knobs::lazy_capture).
     lazy: bool,
     /// The wire rate ([`crate::VirtualOutputOpts::stream_hz`]); `0` = unknown.
     stream_hz: u32,
+    /// Resolved at open; the thread reads the rest of its switches here.
+    knobs: crate::knobs::Knobs,
 }
 
 fn map_format(f: VideoFormat) -> Option<PixelFormat> {

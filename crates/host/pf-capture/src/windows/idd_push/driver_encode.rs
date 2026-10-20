@@ -8,6 +8,7 @@
 //! [`crate::windows::au_assembly`].
 
 use super::*;
+use crate::knobs::Knobs;
 use crate::windows::au_assembly::{AuAssembly, AuDump, Clocks};
 use crate::windows::au_reader::{AuReader, AuView};
 use crate::{DriverEndpoint, EncodeCtlSender, SetEncodeSender};
@@ -217,6 +218,7 @@ pub(crate) fn open_remote_encoder(
     set_encode: SetEncodeSender,
     encode_ctl: EncodeCtlSender,
 ) -> Result<Box<dyn Encoder>> {
+    let knobs = Knobs::from_env();
     let heap = au::heap_bytes_for(params.bitrate_kbps, params.fps);
     let section = AuSection::create(heap, params.wire_seq_base)?;
     let section_v = broker.dup_into(section.section.handle.as_handle(), Some(SECTION_MAP_RW))?;
@@ -326,6 +328,7 @@ pub(crate) fn open_remote_encoder(
         _clock_boost: (reply.backend_opened == encode::backend::NVENC)
             .then(pf_gpu::selected_gpu)
             .flatten()
+            .filter(|_| knobs.nvenc_clock_boost)
             .and_then(|gpu| clock_boost::ClockBoost::hold(gpu.info.luid())),
     }))
 }

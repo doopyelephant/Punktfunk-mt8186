@@ -19,6 +19,7 @@ use super::plan::{
 use super::queue::{wait_ready, FrameQueue};
 use super::thread::{pipewire_thread, PwCtl};
 use super::CaptureOpts;
+use crate::knobs::Knobs;
 use crate::linux::portal::portal_thread;
 use crate::linux::{drain_edges, health_identity, xfixes_cursor, CaptureSignals};
 use crate::{CapturedFrame, Capturer, FramePayload, ZeroCopyPolicy};
@@ -134,6 +135,7 @@ impl PortalCapturer {
         want_hdr: bool,
         want_metadata_cursor: bool,
         policy: ZeroCopyPolicy,
+        knobs: Knobs,
     ) -> Result<PortalCapturer> {
         let (setup_tx, setup_rx) = std::sync::mpsc::channel::<Result<(OwnedFd, u32), String>>();
         let (quit_tx, quit_rx) = tokio::sync::oneshot::channel::<()>();
@@ -187,6 +189,7 @@ impl PortalCapturer {
                 // A monitor mirror paints on the panel's own vblank; nothing to drive.
                 lazy: false,
                 stream_hz: 0,
+                knobs,
             },
             policy,
         )?
@@ -202,6 +205,7 @@ impl PortalCapturer {
         preferred_mode: Option<(u32, u32, u32)>,
         keepalive: Box<dyn Send>,
         opts: crate::VirtualOutputOpts,
+        knobs: Knobs,
     ) -> Result<PortalCapturer> {
         let kwin = opts.producer == crate::Producer::Kwin;
         let capture = CaptureOpts {
@@ -219,9 +223,10 @@ impl PortalCapturer {
                 crate::POOL_MIN
             },
             pool_max: kwin.then_some(crate::KWIN_POOL_MAX),
-            unpaced: kwin && crate::unpaced_capture(),
-            lazy: crate::lazy_capture(),
+            unpaced: kwin && !knobs.kwin_paced,
+            lazy: knobs.lazy_capture,
             stream_hz: opts.stream_hz,
+            knobs,
         };
         tracing::info!(
             node_id,
@@ -332,8 +337,7 @@ fn spawn_pipewire(
     let (quit_tx, quit_rx) = ::pipewire::channel::channel::<PwCtl>();
     let zerocopy = allow_zerocopy && pf_zerocopy::enabled();
     // HDR cannot ride SHM: FORCE_SHM drops the HDR offer (SDR, loudly).
-    // Shared parser, not `== "1"` — a bare compare ignored `true`/`on`/`yes`.
-    let force_shm = pf_host_config::env_on("PUNKTFUNK_FORCE_SHM").unwrap_or(false);
+    let force_shm = opts.knobs.force_shm;
     let want_hdr = if want_hdr && force_shm {
         tracing::warn!(
             "HDR capture requested but PUNKTFUNK_FORCE_SHM=1 — the SHM path is 8-bit only; \
@@ -355,10 +359,9 @@ fn spawn_pipewire(
         pyrowave_session: policy.pyrowave_session,
         native_nv12_session: policy.native_nv12_session,
         ladder: signals.health.ladder(),
-        // Default ON; `=0` (any falsy spelling, shared parser) restores packed RGB.
-        native_nv12_env_on: pf_host_config::env_on("PUNKTFUNK_PIPEWIRE_NV12").unwrap_or(true),
+        native_nv12_knob: opts.knobs.pipewire_nv12,
         hdr_cuda_ok: policy.hdr_cuda_ok,
-        nv12_env_on: pf_zerocopy::nv12_enabled(),
+        nv12_knob: pf_zerocopy::nv12_enabled(),
         nvenc_raw: crate::linux::raw_lane_ok(&policy),
     });
     let vaapi_dmabuf = plan.vaapi_passthrough;

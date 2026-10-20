@@ -752,11 +752,13 @@ struct WlHandles {
 }
 
 /// Spawn the capture thread for `output_name`. `want_hdr` asks for the output's packed
-/// 10-bit buffer and fails unless its description is BT.2020 PQ.
+/// 10-bit buffer and fails unless its description is BT.2020 PQ; `header_pts` is
+/// [`Knobs::header_pts`](crate::knobs::Knobs::header_pts).
 fn spawn(
     output_name: String,
     policy: crate::ZeroCopyPolicy,
     want_hdr: bool,
+    header_pts: bool,
     slot: FrameSlot,
     signals: CaptureSignals,
 ) -> Result<WlHandles> {
@@ -772,6 +774,7 @@ fn spawn(
                     &output_name,
                     policy,
                     want_hdr,
+                    header_pts,
                     slot,
                     wake_tx,
                     &signals,
@@ -826,6 +829,7 @@ fn run(
     output_name: &str,
     policy: crate::ZeroCopyPolicy,
     want_hdr: bool,
+    header_pts: bool,
     slot: FrameSlot,
     wake: SyncSender<()>,
     signals: &CaptureSignals,
@@ -835,7 +839,7 @@ fn run(
     match open(output_name, &policy, want_hdr, signals) {
         Ok(opened) => {
             let _ = started.send(Ok(opened.hdr_meta));
-            pump(opened, &slot, &wake, signals, quit)
+            pump(opened, &slot, &wake, signals, quit, header_pts)
         }
         Err(e) => {
             let _ = started.send(Err(e));
@@ -1082,6 +1086,7 @@ fn pump(
     wake: &SyncSender<()>,
     signals: &CaptureSignals,
     quit: &AtomicBool,
+    header_pts: bool,
 ) -> Result<()> {
     let (w, h) = o.size;
     let mut frame: Option<(CaptureFrame, usize)> = None;
@@ -1090,8 +1095,6 @@ fn pump(
     // the portal path's provenance window.
     let mut rt_minus_mono_ns = super::pipewire::realtime_minus_monotonic_ns();
     let mut repaired = std::time::Instant::now();
-    // `PUNKTFUNK_CAPTURE_HDR_PTS=0` keeps the wire on delivery stamps, as on the portal path.
-    let header_pts = pf_host_config::env_on("PUNKTFUNK_CAPTURE_HDR_PTS").unwrap_or(true);
     while !quit.load(Ordering::Relaxed) && !o.st.stopped {
         // Arm whenever nothing is outstanding and a buffer is free. A returned buffer
         // wakes the poll below, so this runs the moment the encoder lets go.

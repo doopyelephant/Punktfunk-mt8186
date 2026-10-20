@@ -21,11 +21,11 @@ pub(in crate::linux) struct NegotiationInputs {
     pub native_nv12_session: bool,
     /// What this capture identity has learned: lanes off, offers refused.
     pub ladder: pf_zerocopy::Ladder,
-    pub native_nv12_env_on: bool,
+    pub native_nv12_knob: bool,
     /// Encoder can ingest packed 10-bit PQ CUDA. Only direct-SDK NVENC can.
     pub hdr_cuda_ok: bool,
     /// `PUNKTFUNK_NV12`: the CUDA import emits NV12 (tiled blit or LINEAR compute CSC).
-    pub nv12_env_on: bool,
+    pub nv12_knob: bool,
     /// The NVENC encoder converts held dmabufs itself and its convert samples a tiled layout
     /// (`raw_lane_ok`).
     pub nvenc_raw: bool,
@@ -116,7 +116,7 @@ pub(in crate::linux) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPla
     let nvenc_raw = build_importer && i.nvenc_raw && !i.force_shm && i.ladder.nvenc_raw_ok();
     // NVENC's raw lane copies a producer NV12 or P010 into its slot.
     let planar_lane = (i.backend_is_vaapi && vaapi_passthrough) || nvenc_raw;
-    let native_planar = i.native_nv12_env_on
+    let native_planar = i.native_nv12_knob
         && !i.ladder.refused(Refusal::Planar)
         && i.native_nv12_session
         && planar_lane
@@ -128,7 +128,7 @@ pub(in crate::linux) fn negotiation_plan(i: NegotiationInputs) -> NegotiationPla
     NegotiationPlan {
         build_importer,
         import_policy: ImportPolicy {
-            nv12: i.nv12_env_on,
+            nv12: i.nv12_knob,
             yuv444: i.want_444,
         },
         nvenc_raw,
@@ -643,9 +643,9 @@ mod tests {
             pyrowave_session: false,
             native_nv12_session: false,
             ladder: Ladder::default(),
-            native_nv12_env_on: true,
+            native_nv12_knob: true,
             hdr_cuda_ok: true,
-            nv12_env_on: true,
+            nv12_knob: true,
             nvenc_raw: false,
         }
     }

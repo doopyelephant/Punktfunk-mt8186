@@ -124,7 +124,7 @@ pub(in crate::linux) fn pipewire_thread(
     let (requeue_tx, requeue_rx) = pw::channel::channel::<()>();
     // Explicit sync needs a dmabuf lane and a DRM node that serves syncobjs; whether a buffer
     // then carries sync points is the producer's call at negotiation.
-    let sync = (crate::explicit_sync() && (opts.want_hdr || offer.want_dmabuf))
+    let sync = (opts.knobs.explicit_sync && (opts.want_hdr || offer.want_dmabuf))
         .then(SyncDevice::open)
         .flatten()
         .map(std::sync::Arc::new);
@@ -178,7 +178,7 @@ pub(in crate::linux) fn pipewire_thread(
         pts: crate::pts_provenance::PtsProvenance::new(),
         pts_reported: std::time::Instant::now(),
         rt_minus_mono_ns: realtime_minus_monotonic_ns(),
-        hdr_pts_enabled: pf_host_config::env_on("PUNKTFUNK_CAPTURE_HDR_PTS").unwrap_or(true),
+        hdr_pts_enabled: opts.knobs.header_pts,
         pool: PoolCensus::default(),
         passthrough_fallbacks: PassthroughFallbacks::default(),
         cursor: CursorState::new(opts.cursor_id0_hides),
@@ -250,11 +250,7 @@ pub(in crate::linux) fn pipewire_thread(
         timer
     });
 
-    // `PUNKTFUNK_PW_FIXED_POD="WxH"`: one fixed format, to bisect against a producer's EnumFormat.
-    let fixed_pod: Option<(u32, u32)> = std::env::var("PUNKTFUNK_PW_FIXED_POD")
-        .ok()
-        .and_then(|v| v.split_once('x').map(|(w, h)| (w.parse(), h.parse())))
-        .and_then(|(w, h)| Some((w.ok()?, h.ok()?)));
+    let fixed_pod = opts.knobs.fixed_pod;
     if let Some((fw, fh)) = fixed_pod {
         tracing::info!(
             fw,
@@ -1225,6 +1221,7 @@ mod tests {
             unpaced: false,
             lazy: false,
             stream_hz: 0,
+            knobs: Default::default(),
         }
     }
 

@@ -1,6 +1,8 @@
 //! What the host opens a source with: the request structs, the `open_*` entry points, and
 //! what each platform's sources can deliver before one is open.
 
+#[cfg(target_os = "linux")]
+use crate::knobs::Knobs;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::Capturer;
 #[cfg(target_os = "linux")]
@@ -123,6 +125,7 @@ pub fn open_portal_monitor(
         want_hdr && !hdr_capture_failed(HdrSource::PortalMonitor),
         want_metadata_cursor,
         policy,
+        Knobs::from_env(),
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
@@ -133,8 +136,8 @@ pub fn open_portal_monitor(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Producer {
     /// KWin: rewrites `SPA_META_Cursor` every buffer (`id == 0` hides the pointer), serves
-    /// pools of [`KWIN_POOL_MIN`] to [`KWIN_POOL_MAX`], and records unpaced while
-    /// [`unpaced_capture`](crate::unpaced_capture) holds.
+    /// pools of [`KWIN_POOL_MIN`] to [`KWIN_POOL_MAX`], and records unpaced unless
+    /// `PUNKTFUNK_KWIN_PACED` asks for the stream rate.
     Kwin,
     /// gamescope: no cursor metadata, a gated tiled modifier offer, and the only HDR producer.
     Gamescope,
@@ -188,6 +191,7 @@ pub fn open_virtual_output(
         preferred_mode,
         keepalive,
         VirtualOutputOpts { want_hdr, ..opts },
+        Knobs::from_env(),
     )
     .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
@@ -208,7 +212,7 @@ pub fn open_direct_output(
     policy: ZeroCopyPolicy,
     want_hdr: bool,
 ) -> std::result::Result<Box<dyn Capturer>, (anyhow::Error, Box<dyn Send>)> {
-    crate::linux::WlCapturer::open(output_name, keepalive, policy, want_hdr)
+    crate::linux::WlCapturer::open(output_name, keepalive, policy, want_hdr, Knobs::from_env())
         .map(|c| Box::new(c) as Box<dyn Capturer>)
 }
 

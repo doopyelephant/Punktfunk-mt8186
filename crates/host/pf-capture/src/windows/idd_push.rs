@@ -8,6 +8,7 @@
 //! `packaging/windows/drivers/pf-vdisplay/src/encode/`. Layout and status codes
 //! live in [`pf_driver_proto`] — both sides `use` it, so drift is a compile error.
 
+use crate::knobs::Knobs;
 use crate::windows::cursor_state::CursorModel;
 use crate::windows::cursor_witness::CursorWitness;
 use crate::windows::pixelless::DeliveryGate;
@@ -61,38 +62,16 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// `PUNKTFUNK_IDD_DIAG` — the gate for this capturer's full diagnostics: the micro-probe engine,
-/// the DxgKrnl ETW session and the access-unit dump. All three are off in a normal session,
-/// because standing fence/scanline/DWM traffic and an ETW session alter the very path a
-/// disturbance report describes.
-///
-/// `1` puts the dump beside the driver log (`%SystemRoot%\Temp`); any other non-empty value is
-/// the directory it goes in. Read once per process, so an env edited mid-session is stale.
+/// Where the access-unit dump goes while [`Knobs::idd_diag`] is on: this capturer's full
+/// diagnostics.
 pub(super) fn diag_dir() -> Option<&'static std::path::Path> {
-    static DIAG: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    DIAG.get_or_init(|| {
-        let raw = std::env::var("PUNKTFUNK_IDD_DIAG").ok()?;
-        match raw.trim() {
-            "" | "0" | "off" | "false" => None,
-            "1" | "on" | "true" => {
-                let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-                Some(std::path::PathBuf::from(root).join("Temp"))
-            }
-            path => Some(std::path::PathBuf::from(path)),
-        }
-    })
-    .as_deref()
+    Knobs::process().idd_diag.as_deref()
 }
 
-/// `PUNKTFUNK_IDD_FLOW` — the DxgKrnl ETW session alone, printing a present-flow line every ten
-/// seconds. For a field host: [`diag_dir`] also dumps every access unit to disk. Read once per
-/// process.
+/// [`Knobs::idd_flow`]: the DxgKrnl ETW session alone. For a field host: [`diag_dir`] also
+/// dumps every access unit to disk.
 pub(super) fn flow_watch() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("PUNKTFUNK_IDD_FLOW")
-            .is_ok_and(|v| !matches!(v.trim(), "" | "0" | "off" | "false"))
-    })
+    Knobs::process().idd_flow
 }
 
 /// A file mapping and its view of `len` bytes. Drop unmaps, then [`OwnedHandle`] closes.
