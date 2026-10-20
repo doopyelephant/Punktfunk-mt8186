@@ -576,8 +576,15 @@ fn duration_qpc(d: Duration, freq: i64) -> i64 {
 
 impl Drop for EtwWatch {
     fn drop(&mut self) {
-        // The STOP ends the session and unblocks ProcessTrace.
-        stop_session(Some(self.session));
+        // Once the last `Arc` is gone, `acquire` may start a same-name session; its `start`
+        // stops this one by name, and ETW can reuse this handle value. So STOP by handle only
+        // while `WATCH` still names this watch. `acquire` never drops one: no deadlock.
+        let current = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+        if std::ptr::eq(current.as_ptr(), self) {
+            // The STOP ends the session and unblocks ProcessTrace.
+            stop_session(Some(self.session));
+        }
+        drop(current);
         // SAFETY: `self.consumer` is the live handle this watch owns, closed exactly once here.
         let _ = unsafe { CloseTrace(self.consumer) };
     }
