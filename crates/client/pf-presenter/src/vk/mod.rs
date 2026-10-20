@@ -188,6 +188,7 @@ enum DirectSrc {
 
 /// Premultiplied-alpha quad blended over the swapchain image after the video blit.
 /// Recorded only when an overlay frame arrives.
+#[derive(Default)]
 struct OverlayPipe {
     render_pass: vk::RenderPass,
     set_layout: vk::DescriptorSetLayout,

@@ -13,6 +13,7 @@ pub use pf_client_core::video::csc_rows;
 
 /// Pass objects except the per-video-size framebuffer (that lives with the video
 /// image). No device handle is stored; [`CscPass::destroy`] runs from the presenter's `Drop`.
+#[derive(Default)]
 pub struct CscPass {
     pub render_pass: vk::RenderPass,
     pub set_layout: vk::DescriptorSetLayout,
@@ -252,6 +253,7 @@ impl CscPass {
 /// 33 MB per frame, most of an iGPU's present cost. Pipelines reuse the two CSC layouts, so
 /// their descriptor sets and push constants bind unchanged; the passes fit the overlay's
 /// per-image framebuffers. `clear` paints the letterbox first, `keep` skips that fill.
+#[derive(Default)]
 pub struct DirectPass {
     pub clear: vk::RenderPass,
     pub keep: vk::RenderPass,

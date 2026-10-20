@@ -66,6 +66,7 @@ impl Mid {
     }
 }
 
+#[derive(Default)]
 pub struct ScalePass {
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
