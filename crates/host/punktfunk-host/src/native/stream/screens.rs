@@ -466,15 +466,33 @@ fn run_screen(base: ScreenBase, run: ScreenRun) {
             y,
             primary: false,
         }));
+        let sent_before = au_seq;
         match stream_screen(&base, &run, pipe, epoch, &mut au_seq) {
             Ended::Stop => break,
             Ended::Rebuild => {
-                lost += 1;
+                lost = losses_in_a_row(lost, au_seq != sent_before);
                 epoch = epoch.wrapping_add(1);
             }
         }
     }
+    if lost > MAX_REBUILDS {
+        tracing::warn!(
+            screen = run.index,
+            lost,
+            "screen's capture was lost again after each rebuild — the screen is left out"
+        );
+    }
     run.set_built(None);
+}
+
+/// The loss count after a capture loss: a pipeline that `delivered` a frame was a recovery,
+/// so this loss starts a new row.
+fn losses_in_a_row(lost: u32, delivered: bool) -> u32 {
+    if delivered {
+        1
+    } else {
+        lost + 1
+    }
 }
 
 /// Over the host's `max_displays` with this screen, live and pinned displays counted.
@@ -658,6 +676,21 @@ fn hand_to_send(base: &ScreenBase, run: &ScreenRun, msg: FrameMsg) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A screen that streamed between its losses keeps healing; only losses with no frame
+    /// between them run out the count.
+    #[test]
+    fn a_screen_gives_up_only_on_losses_in_a_row() {
+        let mut lost = 0;
+        for _ in 0..3 * MAX_REBUILDS {
+            lost = losses_in_a_row(lost, true);
+        }
+        assert_eq!(lost, 1, "recovered losses were counted against the screen");
+        for _ in 0..MAX_REBUILDS {
+            lost = losses_in_a_row(lost, false);
+        }
+        assert!(lost > MAX_REBUILDS);
+    }
 
     fn mode(width: u32, height: u32, refresh_hz: u32) -> punktfunk_core::Mode {
         punktfunk_core::Mode {
