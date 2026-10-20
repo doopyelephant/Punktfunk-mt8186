@@ -2613,14 +2613,18 @@ impl VulkanVideoEncoder {
         )?;
         let ecmds = [cmd];
         let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
-        dev.queue_submit(
+        if let Err(e) = dev.queue_submit(
             self.encode_queue,
             &[vk::SubmitInfo::default()
                 .command_buffers(&ecmds)
                 .wait_semaphores(&sems)
                 .wait_dst_stage_mask(&wait_stages)],
             fence,
-        )?;
+        ) {
+            // The compute batch is queued and signals `csc_sem` with no waiter.
+            self.consume_signal(csc_sem);
+            return Err(e.into());
+        }
         self.post_submit_bookkeeping(slot, frame.pts_ns, wire, plan, setup_idx, poc);
         Ok(())
     }
@@ -3816,6 +3820,22 @@ impl VulkanVideoEncoder {
             recovery_close: f.recovery_close,
             chunk_aligned: false,
         })
+    }
+
+    /// Unsignal `sem` with an empty wait-only batch: a compute batch whose encode submit
+    /// failed leaves it signalled, and the slot's next encode would signal it again
+    /// (VUID-vkQueueSubmit-pSignalSemaphores-00067). A failure here is a lost device,
+    /// which `reset` reports.
+    unsafe fn consume_signal(&self, sem: vk::Semaphore) {
+        let sems = [sem];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let _ = self.device.queue_submit(
+            self.encode_queue,
+            &[vk::SubmitInfo::default()
+                .wait_semaphores(&sems)
+                .wait_dst_stage_mask(&stages)],
+            vk::Fence::null(),
+        );
     }
 
     /// Acquire a free ring slot (drain the oldest if full), record+submit without waiting.
