@@ -15,6 +15,7 @@ impl StreamState {
         wake: sdl3::event::EventSender,
         priority: PresentPriority,
         native_refresh_hz: u32,
+        knobs: &crate::knobs::Knobs,
     ) -> StreamState {
         let preset = params.preset.clone();
         // Rate we asked for, until Welcome resolves it. No frames flow before that,
@@ -71,7 +72,7 @@ impl StreamState {
             forwarder_drops,
             mode_period_ns: clock.period_ns(),
             clock,
-            pacer: SourcePacer::new(),
+            pacer: SourcePacer::new(knobs.pace_tail, knobs.vrr_pace),
             source_interval_ns,
             gate: PresentGate::default(),
             cadence: CadenceProbe::new(),
@@ -708,6 +709,7 @@ impl Shell {
             self.sdl_events.event_sender(),
             self.present_priority,
             self.native.refresh_hz,
+            &self.knobs,
         );
         st.screens = screens;
         st

@@ -327,6 +327,8 @@ struct Shell {
     osd_scale_pref: f32,
     /// `false` under `PUNKTFUNK_PRESENTER=arrival`: no glass gate, no presenter window line.
     pacing_active: bool,
+    /// Read once at open; each stream's pacer and each further screen's presenter take theirs.
+    knobs: crate::knobs::Knobs,
     present_priority: PresentPriority,
     presenter: Presenter,
     scroll_routing: crate::scroll_routing::ScrollRouting,

@@ -28,11 +28,6 @@ use wayland_protocols::wp::presentation_time::client::{
 
 const CLOCK_MONOTONIC: u32 = 1;
 
-/// On unless `PUNKTFUNK_SURFACE_FEEDBACK=0`: one feedback object per present.
-pub fn enabled() -> bool {
-    pf_client_core::env_on("PUNKTFUNK_SURFACE_FEEDBACK") != Some(false)
-}
-
 /// One present the compositor answered: the id the presenter gave it, and when the
 /// compositor says it reached the screen (session clock), `None` for a discard.
 pub struct Sample {

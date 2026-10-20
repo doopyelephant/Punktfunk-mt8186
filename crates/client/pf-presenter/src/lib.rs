@@ -33,6 +33,9 @@ pub(crate) mod dmabuf;
 pub mod input;
 #[cfg(any(target_os = "linux", windows))]
 pub mod keymap_sdl;
+// The env knobs, read once per open: built on every platform, used by `run` and `vk`.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+mod knobs;
 #[cfg(any(target_os = "linux", windows))]
 pub mod overlay;
 #[cfg(any(target_os = "linux", windows))]
