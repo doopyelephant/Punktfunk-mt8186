@@ -245,6 +245,7 @@ async fn dial(
             link,
             probe_only: p.probe_only,
             pyrowave_bpp_x100: p.pyrowave_bpp_x100,
+            slices: p.slices,
             resume: crate::client::resume::peek(host, port),
             suites: if wants_chacha {
                 vec![MediaSuite::ChaCha20Poly1305, MediaSuite::Aes128Gcm]

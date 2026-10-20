@@ -71,7 +71,7 @@ pub(in crate::native) struct DisplayPrep {
     pub(in crate::native) client_identity: Option<[u8; 32]>,
     pub(in crate::native) client_hdr: Option<pf_frame::HdrMeta>,
     pub(in crate::native) cursor_forward: bool,
-    pub(in crate::native) multi_slice: bool,
+    pub(in crate::native) slices: u32,
     pub(in crate::native) bitrate_kbps: u32,
     pub(in crate::native) bitrate_auto: bool,
     pub(in crate::native) bit_depth: u8,
@@ -87,7 +87,7 @@ pub(in crate::native) struct DisplayPrep {
 
 /// A virtual-display session's plan on `compositor`, `pyrowave_bpp` the session's. Bring-up
 /// and the Welcome-time prep both resolve here, so a prepared pipeline is built from the plan
-/// its session runs. `multi_slice` names no count, so it takes the host's default.
+/// its session runs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn resolve_plan(
     bit_depth: u8,
@@ -95,7 +95,7 @@ pub(super) fn resolve_plan(
     chroma: crate::encode::ChromaFormat,
     codec: crate::encode::Codec,
     cursor_forward: bool,
-    multi_slice: bool,
+    slices: u32,
     compositor: crate::vdisplay::Compositor,
     route: Option<&crate::vdisplay::GamescopeRoute>,
     pyrowave_bpp: f64,
@@ -117,11 +117,7 @@ pub(super) fn resolve_plan(
             route,
         ),
         cursor_forward,
-        if multi_slice {
-            crate::session_plan::DEFAULT_SLICES
-        } else {
-            1
-        },
+        slices,
     );
     // After resolve: a self-painting gamescope node would otherwise get a second XFixes pointer.
     plan.gamescope_cursor = crate::session_plan::gamescope_cursor_for(
@@ -155,7 +151,7 @@ pub(in crate::native) fn prepare_display(
         client_identity,
         client_hdr,
         cursor_forward,
-        multi_slice,
+        slices,
         bitrate_kbps,
         bitrate_auto,
         bit_depth,
@@ -174,7 +170,7 @@ pub(in crate::native) fn prepare_display(
         chroma,
         codec,
         cursor_forward,
-        multi_slice,
+        slices,
         compositor,
         None,
         pyrowave_bpp,

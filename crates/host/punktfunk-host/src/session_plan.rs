@@ -122,19 +122,30 @@ pub struct SessionPlan {
     /// widening an 8-bit capture. Set only via [`sdr10_native_for`]; `false` everywhere else.
     pub sdr10_native: bool,
     /// H.264/HEVC slices per frame the client takes: GameStream's `videoEncoderSlicesPerFrame`,
-    /// [`DEFAULT_SLICES`] toward a native
-    /// [`VIDEO_CAP_MULTI_SLICE`](punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE) client, else 1
-    /// (TV-SoC decoders wedge on multi-slice frames). Applied to every encoder this plan opens
-    /// so slicing cannot change shape across a rebuild.
+    /// a native client's [`client_slices`]. 1 for a client that never asked (TV-SoC decoders
+    /// wedge on multi-slice frames). Applied to every encoder this plan opens so slicing cannot
+    /// change shape across a rebuild.
     pub slices: u32,
     /// A joiner's own view and fit: the encoder frames the owner's picture for it. `None`
     /// streams the source as captured, or a mirrored head fitted to the negotiated size.
     pub reframe_to: Option<(punktfunk_core::video_fit::VideoFit, (u32, u32))>,
 }
 
-/// Slices per frame toward a client that takes multi-slice frames but names no count: the
-/// native handshake carries one bit. GameStream names its own.
+/// Slices per frame toward a native client that takes multi-slice frames but names no count.
 pub const DEFAULT_SLICES: u32 = 4;
+
+/// Slices per frame a native client takes: 1 without
+/// [`VIDEO_CAP_MULTI_SLICE`](punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE), else its
+/// `ClientHello` ask, else [`DEFAULT_SLICES`]. An ask past 32 (NVENC's limit) is no ask.
+pub fn client_slices(video_caps: u8, asked: u8) -> u32 {
+    if video_caps & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE == 0 {
+        return 1;
+    }
+    match u32::from(asked) {
+        n @ 1..=32 => n,
+        _ => DEFAULT_SLICES,
+    }
+}
 
 impl SessionPlan {
     /// `hdr` is the handshake verdict, not derived from depth: 10-bit SDR exists. PyroWave's
@@ -490,6 +501,17 @@ mod tests {
     use crate::encode::{ChromaFormat, Codec};
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use pf_vdisplay::Compositor;
+
+    /// The multi-slice bit gates the ask; no ask or an impossible one takes the default.
+    #[test]
+    fn a_native_client_gets_the_slices_it_asks_for() {
+        use punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE as MULTI;
+        assert_eq!(client_slices(0, 8), 1);
+        assert_eq!(client_slices(MULTI, 0), DEFAULT_SLICES);
+        assert_eq!(client_slices(MULTI, 8), 8);
+        assert_eq!(client_slices(MULTI, 1), 1);
+        assert_eq!(client_slices(MULTI, 33), DEFAULT_SLICES);
+    }
 
     /// An encoder opens for what the source composes: an HDR session on an SDR source is 8-bit
     /// SDR, 10-bit SDR stays 10-bit, and an SDR session never turns HDR.

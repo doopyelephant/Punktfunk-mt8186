@@ -497,10 +497,12 @@ impl NvencD3d11Encoder {
             let s = &self.s;
             tracing::info!(
                 // `split_mode` is the final mode (post-fallback) and `engines` the ceiling it was
-                // chosen from — either alone is ambiguous. `subframe` because AUTO + sub-frame
-                // is a single-engine combination that reads like a split in a log.
+                // chosen from — either alone is ambiguous. `slices` is the count opened, not the
+                // client's ask. `subframe` because AUTO + sub-frame is a single-engine
+                // combination that reads like a split in a log.
                 split_mode = s.split_mode,
                 engines = s.encoder_engines,
+                slices = s.slices,
                 subframe = s.subframe_on,
                 preset = %format_args!("P{}", s.preset),
                 "NVENC D3D11 session: {}x{}@{} {}-bit{} {} Mbps {:?}",

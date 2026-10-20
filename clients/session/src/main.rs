@@ -449,17 +449,12 @@ mod session_main {
     /// The Match-window hook (design/midstream-resolution-resize.md D1/D2): each resize-end's
     /// logical size goes out as a `window` line and the spawner persists it.
     /// `persist_locally` is for a hand-run session, where nobody reads stdout.
-    pub(crate) fn match_window(
-        settings: &trust::Settings,
-        persist_locally: bool,
-    ) -> Option<Box<dyn FnMut(u32, u32)>> {
-        settings.match_window.then(|| {
-            Box::new(move |w: u32, h: u32| {
-                emit(SessionLine::Window { w, h });
-                if persist_locally {
-                    pf_client_core::orchestrate::persist_window_size(w, h);
-                }
-            }) as Box<dyn FnMut(u32, u32)>
+    pub(crate) fn on_window_size(persist_locally: bool) -> Box<dyn FnMut(u32, u32)> {
+        Box::new(move |w: u32, h: u32| {
+            emit(SessionLine::Window { w, h });
+            if persist_locally {
+                pf_client_core::orchestrate::persist_window_size(w, h);
+            }
         })
     }
 
@@ -956,7 +951,6 @@ mod session_main {
             mouse_mode: settings.mouse_mode(),
             invert_scroll: settings.invert_scroll,
             inhibit_shortcuts: settings.inhibit_shortcuts,
-            overlay_actions: settings.overlay_actions.clone(),
             present_priority: settings.present_priority(),
             vsync: settings.vsync,
             allow_vrr: settings.allow_vrr,
@@ -979,8 +973,9 @@ mod session_main {
             #[cfg(not(feature = "ui"))]
             overlay: None,
             window_size: window_size(&settings),
+            match_window: settings.match_window,
             // A spawned session (spec mode) reports its window; a hand-run one persists it.
-            match_window: match_window(&settings, spec.is_none()),
+            on_window_size: on_window_size(spec.is_none()),
             render_scale: settings.render_scale,
             render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings.codec),
             video_fit: punktfunk_core::video_fit::VideoFit::from_name(&settings.video_fit),

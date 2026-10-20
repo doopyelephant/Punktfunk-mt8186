@@ -238,7 +238,7 @@ impl Shell {
     /// Resize the window to `mode` within the display's usable area, before the stream
     /// starts. Match-window and fullscreen keep the size they own.
     pub(super) fn size_to_stream(&mut self, mode: Mode) {
-        if self.fullscreen || self.opts.match_window.is_some() {
+        if self.fullscreen || self.opts.match_window {
             return;
         }
         let Ok(area) = self

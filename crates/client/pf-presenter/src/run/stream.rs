@@ -330,7 +330,7 @@ pub(super) fn ring_facts(
     let m = c.mode();
     let target = pad_mouse_target(c, ring_opener);
     RingFacts {
-        overlay_actions: opts.overlay_actions.clone(),
+        overlay_actions: st.params.overlay_actions.clone(),
         touch_mode: st
             .capture
             .as_ref()
@@ -685,7 +685,7 @@ impl Shell {
         mut params: SessionParams,
         force_software: Arc<AtomicBool>,
     ) -> StreamState {
-        if self.opts.match_window.is_some() {
+        if self.opts.match_window {
             apply_match_window(
                 &mut params,
                 &self.window,
@@ -704,6 +704,41 @@ impl Shell {
         );
         st.screens = screens;
         st
+    }
+
+    /// Take the settings this console launch resolved: the console outlives every stream, and
+    /// the player may change them between two. Not in `start_stream`: a retry rebuilds from a
+    /// clone of these params and would undo a stats chord the player just made.
+    fn adopt_launch(&mut self, p: &SessionParams) {
+        self.stats_verbosity = p.stats_verbosity;
+        if self.pacing_active {
+            self.present_priority = p.present_priority;
+        }
+        let o = &mut self.opts;
+        o.touch_mode = p.touch_mode;
+        o.mouse_mode = p.mouse_mode;
+        o.invert_scroll = p.invert_scroll;
+        o.inhibit_shortcuts = p.inhibit_shortcuts;
+        o.vsync = p.vsync;
+        o.allow_vrr = p.allow_vrr;
+        o.match_window = p.match_window;
+        o.render_scale = p.render_scale;
+        o.render_scale_max_dim = p.render_scale_max_dim;
+        o.video_fit = p.video_fit;
+        self.presenter.set_video_fit(p.video_fit);
+        if p.fullscreen && !self.fullscreen {
+            self.fullscreen = true;
+            if let Err(e) = self.window.set_fullscreen(true) {
+                tracing::warn!(error = %e, "fullscreen did not engage");
+            }
+        }
+        let fullscreen = self.fullscreen;
+        if let Err(e) =
+            self.presenter
+                .set_present_pref(&self.window, p.vsync, p.allow_vrr, fullscreen)
+        {
+            tracing::warn!(error = %format!("{e:#}"), "present mode did not change");
+        }
     }
 
     /// Hand back what a connected stream held: the pads, then the capture.
@@ -776,11 +811,6 @@ impl Shell {
                     ) {
                         ActionOutcome::Handled => {}
                         ActionOutcome::Start(params) => {
-                            // Adopt the tier this launch resolved. The console outlives
-                            // every stream. Not in `StreamState::new`: a codec-fallback
-                            // retry rebuilds from a clone of these params and would snap
-                            // the overlay back, undoing a chord the user had just made.
-                            self.stats_verbosity = params.stats_verbosity;
                             // A live pump here would be detached by the assignment —
                             // `StreamState` has no `Drop`, so its thread would keep
                             // decoding onto the shared Vulkan device. Every other
@@ -792,6 +822,7 @@ impl Shell {
                                 );
                                 prev.shutdown(&mut self.presenter);
                             }
+                            self.adopt_launch(&params);
                             *stream = Some(self.start_stream(*params, force_software));
                             if let Some(o) = self.overlay.as_mut() {
                                 o.session_phase(SessionPhase::Connecting);
@@ -820,11 +851,11 @@ impl Shell {
         // HUD/title follow the live mode slot on any accepted switch — also when the
         // match-window follower is off (another trigger, or a host-side rollback).
         hud_mode_tick(st, &mut self.window, &self.opts.window_title);
-        if let Some(persist) = self.opts.match_window.as_mut() {
+        if self.opts.match_window {
             resize_tick(
                 st,
                 &mut self.window,
-                persist.as_mut(),
+                self.opts.on_window_size.as_mut(),
                 self.opts.render_scale,
                 self.opts.render_scale_max_dim,
             );

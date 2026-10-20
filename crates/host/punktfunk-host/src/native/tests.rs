@@ -1451,6 +1451,7 @@ async fn raw_session(
         link: Default::default(),
         probe_only: false,
         pyrowave_bpp_x100: 0,
+        slices: 0,
         resume: None,
         suites: Vec::new(),
         features: Default::default(),

@@ -436,7 +436,7 @@ impl StreamState {
             ctx.common.chroma,
             ctx.common.codec,
             ctx.cursor_forward,
-            ctx.multi_slice,
+            ctx.slices,
             ctx.compositor,
             ctx.gamescope_route.as_ref(),
             ctx.pyrowave_bpp,
@@ -518,7 +518,7 @@ impl StreamState {
             conn,
             cursor_forward,
             streamed_au,
-            multi_slice,
+            slices,
             launch,
             launch_target,
             launch_claim,
@@ -577,7 +577,7 @@ impl StreamState {
         let streamed_wire =
             streamed_au && pf_host_config::env_on("PUNKTFUNK_STREAMED_AU").unwrap_or(true);
         let slice_wire = streamed_wire
-            && multi_slice
+            && slices > 1
             && pf_host_config::env_on("PUNKTFUNK_SLICE_STREAM").unwrap_or(true);
         let cursor_fwd = cursor_forward.then(super::super::cursor_fwd::CursorForwarder::new);
         if cursor_forward {

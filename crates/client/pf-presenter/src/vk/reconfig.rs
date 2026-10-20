@@ -1,6 +1,6 @@
 //! Swapchain recreate, resize, and SDR↔HDR10 flip.
 
-use super::setup::pick_formats;
+use super::setup::{pick_formats, pick_present_mode};
 use super::{OverlayPipe, Presenter};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
@@ -24,6 +24,31 @@ fn kmsdrm_swapchain_hint() -> String {
 }
 
 impl Presenter {
+    /// Re-pick the present mode for new V-Sync, VRR and fullscreen state. The swapchain is
+    /// rebuilt only when the mode changes; call it between streams.
+    pub fn set_present_pref(
+        &mut self,
+        window: &sdl3::video::Window,
+        vsync: bool,
+        allow_vrr: bool,
+        fullscreen: bool,
+    ) -> Result<()> {
+        let p = &self.pref;
+        if (p.vsync, p.allow_vrr, p.fullscreen) == (vsync, allow_vrr, fullscreen) {
+            return Ok(());
+        }
+        self.pref.vsync = vsync;
+        self.pref.allow_vrr = allow_vrr;
+        self.pref.fullscreen = fullscreen;
+        let mode = pick_present_mode(&self.surface_i, self.pdev, self.surface, self.pref)?;
+        if mode == self.present_mode {
+            return Ok(());
+        }
+        tracing::info!(present_mode = ?mode, vsync, allow_vrr, fullscreen, "present mode");
+        self.present_mode = mode;
+        self.recreate_swapchain(window)
+    }
+
     /// Replace the swapchain at the window's current size. A zero-size (minimized) window
     /// keeps the old swapchain and any image already acquired from it.
     pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {

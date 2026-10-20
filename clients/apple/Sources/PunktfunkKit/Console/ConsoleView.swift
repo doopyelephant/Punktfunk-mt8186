@@ -18,6 +18,17 @@ import AppKit
 public typealias ConsolePlatformView = NSView
 #endif
 
+/// The console layer's format: 10-bit like the video's SDR drawable, since the backdrop's
+/// gradients band in 8. Skia rates every Mac as GPU family 1, where it renders into RGB10A2
+/// but not BGR10A2. `PUNKTFUNK_SDR10_DRAWABLE=8` keeps BGRA8 everywhere.
+let consoleDrawable: MTLPixelFormat = {
+    #if os(macOS)
+    return sdr10Drawable == .bgr10a2Unorm ? .rgb10a2Unorm : sdr10Drawable
+    #else
+    return sdr10Drawable
+    #endif
+}()
+
 /// What the view hands back to its owner. The view itself knows nothing about hosts.
 @MainActor
 public protocol ConsoleViewDelegate: AnyObject {
@@ -61,9 +72,7 @@ public final class ConsoleMetalView: ConsolePlatformView {
         #endif
         let metal = metalLayer
         metal.device = device
-        // 10-bit like the video's SDR drawable: the backdrop's gradients band in 8. Skia wraps
-        // the texture as BGRA1010102, or BGRA8888 under the `PUNKTFUNK_SDR10_DRAWABLE=8` lever.
-        metal.pixelFormat = sdr10Drawable
+        metal.pixelFormat = consoleDrawable
         // Skia reads back while blending, so the drawable cannot be write-only.
         metal.framebufferOnly = false
         metal.isOpaque = true

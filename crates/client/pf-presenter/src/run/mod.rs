@@ -60,6 +60,9 @@ use stream::ResizeIndicator;
 /// port (`0` = none advertised).
 pub type ConnectedFn = Box<dyn FnMut([u8; 32], u16)>;
 
+/// The input, present and sizing fields seed the window. Browse mode replaces them with
+/// each launch's [`SessionParams`] values, so a setting changed in the console applies to the
+/// next stream.
 pub struct SessionOpts {
     pub window_title: String,
     pub fullscreen: bool,
@@ -68,7 +71,7 @@ pub struct SessionOpts {
     pub window_pos: Option<(i32, i32)>,
     /// OSD tier at start; also gates stdout `stats:` lines. Ctrl+Alt+Shift+S cycles live.
     pub stats_verbosity: StatsVerbosity,
-    /// Latched per session. A mouse-only client leaves the default and never sees a finger.
+    /// Per stream. A mouse-only client leaves the default and never sees a finger.
     pub touch_mode: TouchMode,
     /// `Capture` (pointer lock + relative) or `Desktop` (uncaptured absolute). Ctrl+Alt+Shift+M
     /// flips it live; hosts without absolute injection (gamescope) stay captured.
@@ -78,8 +81,6 @@ pub struct SessionOpts {
     /// Applies in both mouse models; desktop mode's unlocked pointer clicking another window
     /// is the way back. See [`apply_capture`](shell::apply_capture).
     pub inhibit_shortcuts: bool,
-    /// Quick-action ring blob; empty = the platform default ring.
-    pub overlay_actions: String,
     /// `Latency` = newest-wins arrival pacing; `Smooth { buffer }` = FIFO one frame per latch
     /// slot. `PUNKTFUNK_PRESENTER=arrival` forces the latency drain without a rebuild.
     pub present_priority: PresentPriority,
@@ -99,10 +100,11 @@ pub struct SessionOpts {
     /// then resizes to the stream. Match-window passes the persisted last size so the first
     /// connect's mode already matches the glass.
     pub window_size: Option<(u32, u32)>,
-    /// `Some` = stream mode follows the window: start params use physical pixels, a mid-session
-    /// resize sends a debounced `Reconfigure`. The callback gets logical size at each resize-end
-    /// for persist. `None` = never auto-resize.
-    pub match_window: Option<Box<dyn FnMut(u32, u32)>>,
+    /// Stream mode follows the window: start params use physical pixels, a mid-session resize
+    /// sends a debounced `Reconfigure`. Off = never auto-resize.
+    pub match_window: bool,
+    /// Gets the logical size at each Match-window resize-end, for persist.
+    pub on_window_size: Box<dyn FnMut(u32, u32)>,
     /// Multiplier on the window pixel size under Match-window. `> 1` supersamples; `1.0` is
     /// native pixels. See [`punktfunk_core::render_scale`].
     pub render_scale: f64,

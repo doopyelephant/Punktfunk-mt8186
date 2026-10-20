@@ -950,6 +950,7 @@ impl Presenter {
             hdr_downgrade_warned: false,
             hdr_metadata_d,
             hdr_meta: None,
+            pref,
             present_mode,
             swapchain: vk::SwapchainKHR::null(),
             images: Vec::new(),
@@ -1681,8 +1682,8 @@ pub struct PresentPref {
     /// Device enabled `VK_EXT_present_mode_fifo_latest_ready`; the mode may be requested.
     /// Set during device creation, never by callers.
     pub fifo_latest_ready: bool,
-    /// Session started fullscreen. Mode is chosen once at swapchain creation; F11
-    /// mid-session does not re-pick.
+    /// The window is fullscreen as the stream starts. Re-picked at each console launch
+    /// ([`Presenter::set_present_pref`]); F11 mid-stream does not re-pick.
     pub fullscreen: bool,
 }
 
@@ -1751,7 +1752,7 @@ fn fullscreen_exclusive_opt_in() -> bool {
 
 /// Resolve the present mode. `PUNKTFUNK_PRESENT_MODE` pins one; otherwise the first
 /// entry of [`present_mode_chain`] the surface offers.
-fn pick_present_mode(
+pub(super) fn pick_present_mode(
     surface_i: &ash::khr::surface::Instance,
     pdev: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,

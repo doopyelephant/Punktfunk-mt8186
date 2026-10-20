@@ -29,6 +29,13 @@ use std::time::{Duration, Instant};
 /// A frame at most this often once the console is idle.
 const IDLE_FRAME: Duration = Duration::from_micros(33_333);
 
+/// What a layer's texture can wrap as: BGR10A2Unorm, RGB10A2Unorm (the Mac's), BGRA8Unorm.
+const COLOR_TYPES: [ColorType; 3] = [
+    ColorType::BGRA1010102,
+    ColorType::RGBA1010102,
+    ColorType::BGRA8888,
+];
+
 /// Safe-area insets in texture pixels.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -111,7 +118,8 @@ struct Shell {
     /// When the last frame was drawn, and at what size.
     drawn: Option<(Instant, u32, u32)>,
     /// The colour type the layer's texture last wrapped as. Swift owns the format; Skia
-    /// refuses a mismatch, so a refused wrap flips to the other once and sticks.
+    /// refuses a mismatch, so a refused wrap tries [`COLOR_TYPES`] and sticks with the one
+    /// that takes.
     color_type: ColorType,
 }
 
@@ -252,13 +260,13 @@ pub unsafe extern "C" fn punktfunk_console_free(c: *mut PunktfunkConsole) {
     })
 }
 
-/// Draw one frame into `mtl_texture` (BGR10A2 or BGRA8, `width`×`height`) and submit it to the queue.
+/// Draw one frame into `mtl_texture` (`width`×`height`) and submit it to the queue.
 /// `scale` is design units per pixel; `0` takes the shell's own formula. `false` = nothing
 /// drawn (idle, or the texture could not be wrapped): present nothing.
 ///
 /// # Safety
 /// `c` is live. `mtl_texture` is an `id<MTLTexture>` from the console's device, render-target
-/// usable, BGRA8Unorm, at least `width`×`height`.
+/// usable, BGR10A2Unorm, RGB10A2Unorm or BGRA8Unorm, at least `width`×`height`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_console_frame(
     c: *const PunktfunkConsole,
@@ -295,12 +303,8 @@ pub unsafe extern "C" fn punktfunk_console_frame(
         // the render target lives.
         let info = unsafe { mtl::TextureInfo::new(mtl_texture as _) };
         let target = gpu::backend_render_targets::make_mtl((width as i32, height as i32), &info);
-        let other = |ct| match ct {
-            ColorType::BGRA1010102 => ColorType::BGRA8888,
-            _ => ColorType::BGRA1010102,
-        };
         let mut wrapped = None;
-        for ct in [shell.color_type, other(shell.color_type)] {
+        for ct in std::iter::once(shell.color_type).chain(COLOR_TYPES) {
             wrapped = gpu::surfaces::wrap_backend_render_target(
                 &mut shell.context,
                 &target,
