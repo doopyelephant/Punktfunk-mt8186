@@ -1,17 +1,22 @@
-//! Vulkan session presenter: SDL3 window + ash swapchain over the shared session
-//! pump. Captures input on the `ui_stream` state machine and prints the unified
-//! stats window on stdout. No UI toolkit in the crate graph.
+//! The Vulkan session presenter for Linux and Windows: an SDL3 window and an ash swapchain
+//! over the shared session pump, with input capture, the console overlay and the stats line.
 //!
-//! Three frame paths, all placed by `video_fit`: software (`CpuPlanarFrame` — I420 planes
-//! staged into three R8 images, then the same CICP-driven CSC pass as hardware),
-//! Vulkan Video (the decoder's VkImage on this device), and on Linux VAAPI
-//! (NV12 dmabuf imported per-plane — `dmabuf.rs`). Missing import extensions,
-//! or an import/present failure streak, demote the decoder via the pump's
-//! `force_software` contract, same as the GTK presenter.
+//! The shell: `run/` (the session loop, events, the paced drain, restarts, further screens).
+//! The Vulkan shell: `vk/` (bring-up, the targets, the frame, the glass clock and three of its
+//! instruments; `wl_feedback` is the fourth), the passes `csc` and `scale`, the imports
+//! `dmabuf` (Linux) and `d3d11` (Windows). The models: `vk/reconfig_model`, `vk/glass`'s
+//! lifecycle, `run/pace_step`, `run/restart`, `run/route`, `present_pace`, `slot_pick`,
+//! `swapchain_state`, `cursor_model`, `scroll`, `touch`. The env: `knobs`. The lane:
+//! `wl_native` puts a dma-buf on the window itself (Linux), fed by `vk/export_ring`. Input:
+//! `input`, `keymap_sdl`, `scroll_routing`, `wayland_scroll`; `cursor` draws the host's
+//! pointer. The console draws through `overlay::Overlay`; `wl_side` and `win32` are glue.
 //!
-//! Linux and Windows. `dmabuf` is Linux-only (no DRM-PRIME on Windows);
-//! `d3d11` is the Windows counterpart (D3D11VA shared-texture import). Decode
-//! chain there is Vulkan → D3D11VA → software.
+//! Model and shell: a model is an enum state, a pure `step` over plain values and a table
+//! of named rows; the shell samples, calls `step` and performs the answer. A transition is
+//! decided in its model, never inline in the shell.
+//! Knobs: only `knobs::read`, called once at `Shell::open`, reads a `PUNKTFUNK_*` variable;
+//! everything else takes a `Knobs` field.
+//! Vulkan: the contract below holds at every site; a site that needs more proves it there.
 
 // VULKAN CONTRACT. CREATE/ALLOCATE: this type owns the live device; CreateInfo
 // outlives the call; Drop destroys the handle. RECORD: into a buffer we own and
