@@ -366,7 +366,8 @@ impl StreamState {
     }
 
     /// A rebuild's [`BuildRequest`] at `mode` and `bitrate_kbps`: this session's plan, encode
-    /// resolution, depth and HDR metadata, the derivation in force now, and the loop's wire index.
+    /// resolution, depth and HDR metadata, the derivation in force now at `mode`'s refresh (a
+    /// PyroWave frame's head parity is per frame), and the loop's wire index.
     pub(super) fn build_request(
         &self,
         mode: punktfunk_core::Mode,
@@ -377,7 +378,10 @@ impl StreamState {
             bitrate_kbps,
             bitrate_auto: self.bitrate_auto,
             bit_depth: self.bit_depth,
-            enc_of: self.enc_now(),
+            enc_of: EncDerive {
+                head_only_hz: self.pyrowave.then_some(mode.refresh_hz),
+                ..self.enc_now()
+            },
             plan: self.plan,
             encoder: self.encoder.clone(),
             client_hdr: self.client_hdr,
@@ -590,15 +594,6 @@ impl StreamState {
         // `PUNKTFUNK_STREAMED_AU=0` reverts to whole-AU sends. Encoder chunking is per-AU.
         // `bitrate_kbps` is the total wire budget; only encoder opens convert via EncDerive.
         let pyrowave = plan.codec == crate::encode::Codec::PyroWave;
-        let head_only_hz = pyrowave.then_some(mode.refresh_hz);
-        let enc_derive = move |fec: u8| EncDerive {
-            audio_kbps: audio_reserved_kbps,
-            shard_payload,
-            fec_percent: fec,
-            head_only_hz,
-            // Further screens build after this one and move its share then.
-            share_permille: crate::native::bitrate::SHARE_ALL,
-        };
         let streamed_wire =
             streamed_au && pf_host_config::env_on("PUNKTFUNK_STREAMED_AU").unwrap_or(true);
         let slice_wire = streamed_wire
@@ -662,6 +657,16 @@ impl StreamState {
             bit_depth,
             "punktfunk/1 virtual display"
         );
+        // After adoption: PyroWave's parity rides each frame's head, at the mode built.
+        let head_only_hz = pyrowave.then_some(mode.refresh_hz);
+        let enc_derive = move |fec: u8| EncDerive {
+            audio_kbps: audio_reserved_kbps,
+            shard_payload,
+            fec_percent: fec,
+            head_only_hz,
+            // Further screens build after this one and move its share then.
+            share_permille: crate::native::bitrate::SHARE_ALL,
+        };
         // Every display this session opens starts from this request; a rebuild swaps in its
         // own cursor and route, and drops the launch.
         let vd_params = crate::vdisplay::SessionParams {
@@ -1517,6 +1522,20 @@ fn window_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A PyroWave rebuild prices its head parity at the refresh it builds at, not the one the
+    /// session ran before the switch.
+    #[test]
+    fn a_rebuild_prices_parity_at_the_mode_it_builds() {
+        let mut f = super::super::swap::tests::fake();
+        f.st.pyrowave = true;
+        let to = punktfunk_core::Mode {
+            refresh_hz: f.st.cur_mode.refresh_hz * 2,
+            ..f.st.cur_mode
+        };
+        let req = f.st.build_request(to, f.st.bitrate_kbps);
+        assert_eq!(req.enc_of.head_only_hz, Some(to.refresh_hz));
+    }
 
     /// An epoch says what the source composes: an HDR session over an SDR capture is 8-bit
     /// BT.709, an SDR session is what it negotiated.
