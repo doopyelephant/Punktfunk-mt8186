@@ -179,6 +179,7 @@ pub(super) fn resize_tick(
     persist: &mut dyn FnMut(u32, u32),
     render_scale: f64,
     max_dim: u32,
+    fullscreen: bool,
 ) {
     let Some(c) = &st.connector else {
         return; // not connected yet — the pending stamp survives until we are
@@ -199,9 +200,12 @@ pub(super) fn resize_tick(
         ResizeAction::Wait => {}
         ResizeAction::Settled(target) => {
             // Persist the window's logical size for the next launch even when no request
-            // goes out (e.g. resized back to the streamed size).
-            let (lw, lh) = window.size();
-            persist(lw, lh);
+            // goes out (e.g. resized back to the streamed size). Not a fullscreen size: the
+            // next windowed start would open at the display's.
+            if !fullscreen {
+                let (lw, lh) = window.size();
+                persist(lw, lh);
+            }
             let Some((w, h)) = target else { return };
             tracing::info!(w, h, "window resized — requesting mode switch");
             if c.request_mode(Mode {
@@ -862,6 +866,7 @@ impl Shell {
                 self.opts.on_window_size.as_mut(),
                 self.opts.render_scale,
                 self.opts.render_scale_max_dim,
+                self.fullscreen,
             );
         }
         // A switch the host rejected/capped never delivers the exact target frame —
