@@ -1,6 +1,6 @@
 //! The paced drain's slot pick: a frame goes out at its due time, never before, aimed at
 //! the first latch its compositor can still make — one frame per slot. Pure;
-//! `StreamState::pick` hands it the latch clock and the frame store.
+//! `PaceState::step` hands it the latch clock and the frame store.
 //!
 //! The lead is what the compositor needs between a present and the latch it lands on.
 //! It starts at a whole period plus a margin and learns: a frame that lands past its aim

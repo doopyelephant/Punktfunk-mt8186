@@ -78,12 +78,9 @@ impl StreamState {
             cadence: CadenceProbe::new(),
             slots: Default::default(),
             aimed: std::collections::VecDeque::with_capacity(16),
-            busy_on: crate::vk::BusyOn::Fence,
-            gate_parked: false,
-            slot_mark: 0,
+            pace: Default::default(),
             last_displayed_ns: 0,
             last_shown_pts_ns: 0,
-            busy_retry: false,
             newest_turn: 0,
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             pyro_latency_forced: false,
