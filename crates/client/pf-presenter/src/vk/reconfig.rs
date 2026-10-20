@@ -1,9 +1,24 @@
-//! Swapchain recreate, resize, and SDR↔HDR10 flip.
+//! The reconfig model's performers: [`Presenter::apply`] runs the plan
+//! `vk/reconfig_model.rs` decided — the swapchain's rebuild, the SDR↔HDR10 flip, the
+//! present-mode pick, the lane's suspend and resume.
 
 use super::setup::{pick_formats, pick_present_mode, PresentPref};
 use super::{OverlayPipe, Presenter};
+use crate::reconfig_model::{self as model, Plan};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
+
+/// The model over this presenter's Vulkan types.
+type Reconfig = model::Reconfig<vk::SurfaceFormatKHR, vk::PresentModeKHR>;
+pub(super) type Input = model::Input<vk::SurfaceFormatKHR, vk::PresentModeKHR>;
+
+/// What a performed plan leaves the frame that asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Applied {
+    Done,
+    /// The frame draws nothing: minimized, or a redraw the lane shows.
+    Dropped,
+}
 
 /// NVIDIA proprietary still fails `vkCreateSwapchainKHR` after a successful
 /// enumerate — it wants `vkAcquireDrmDisplayEXT`, which SDL's KMSDRM surface
@@ -24,6 +39,78 @@ fn kmsdrm_swapchain_hint(drm_card: Option<&str>) -> String {
 }
 
 impl Presenter {
+    /// Step the reconfig model on `input` and commit the state it answers. The caller
+    /// performs the plan.
+    pub(super) fn decide(&mut self, input: Input) -> Plan {
+        let (next, plan) = model::step(&self.reconfig(), input);
+        self.commit(next);
+        plan
+    }
+
+    fn reconfig(&self) -> Reconfig {
+        let p = self.pref;
+        Reconfig {
+            owner: self.owner,
+            hdr_active: self.hdr_active,
+            format: self.format,
+            hdr10: self.hdr10_format,
+            pref: model::Pref {
+                vsync: p.vsync,
+                allow_vrr: p.allow_vrr,
+                fullscreen: p.fullscreen,
+            },
+            present_mode: self.present_mode,
+            extent: (self.extent.width, self.extent.height),
+        }
+    }
+
+    fn commit(&mut self, r: Reconfig) {
+        self.owner = r.owner;
+        self.hdr_active = r.hdr_active;
+        self.format = r.format;
+        self.hdr10_format = r.hdr10;
+        self.pref = PresentPref {
+            vsync: r.pref.vsync,
+            allow_vrr: r.pref.allow_vrr,
+            fullscreen: r.pref.fullscreen,
+            ..self.pref
+        };
+        self.present_mode = r.present_mode;
+        self.extent = vk::Extent2D {
+            width: r.extent.0,
+            height: r.extent.1,
+        };
+    }
+
+    /// Step the model on `input`, then perform its plan.
+    pub(super) fn reconfigure(
+        &mut self,
+        input: Input,
+        window: &sdl3::video::Window,
+    ) -> Result<Applied> {
+        let plan = self.decide(input);
+        self.apply(plan, window)
+    }
+
+    /// Perform `plan`. A performer feeds the model what only Vulkan answers.
+    pub(super) fn apply(&mut self, plan: Plan, window: &sdl3::video::Window) -> Result<Applied> {
+        match plan {
+            Plan::Skip => {}
+            Plan::Drop => return Ok(Applied::Dropped),
+            Plan::PickMode(pref) => return self.pick_mode(window, pref),
+            Plan::Flip { on } => return self.set_hdr_mode(window, on),
+            Plan::Rebuild => self.rebuild_swapchain(window)?,
+            #[cfg(target_os = "linux")]
+            Plan::Resume => return self.resume_swapchain(window),
+            #[cfg(target_os = "linux")]
+            Plan::Suspend => self.suspend_swapchain()?,
+            // Only the Linux lane takes the window.
+            #[cfg(not(target_os = "linux"))]
+            Plan::Resume | Plan::Suspend => {}
+        }
+        Ok(Applied::Done)
+    }
+
     /// Re-pick the present mode for new V-Sync, VRR and fullscreen state. The swapchain is
     /// rebuilt only when the mode changes; call it between streams.
     pub fn set_present_pref(
@@ -33,44 +120,45 @@ impl Presenter {
         allow_vrr: bool,
         fullscreen: bool,
     ) -> Result<()> {
-        let p = &self.pref;
-        if (p.vsync, p.allow_vrr, p.fullscreen) == (vsync, allow_vrr, fullscreen) {
-            return Ok(());
-        }
-        let pref = PresentPref {
+        let pref = model::Pref {
             vsync,
             allow_vrr,
             fullscreen,
-            ..self.pref
         };
-        // The lane owns the window: no surface to ask. `resume_swapchain` picks the mode
-        // against the surface it makes.
-        if self.state.suspended() {
-            self.pref = pref;
-            return Ok(());
-        }
-        // The pref lands with its mode: a failed pick must not make the next call a no-op.
-        let pinned = self.knobs.present_mode.as_deref();
-        let mode = pick_present_mode(&self.surface_i, self.pdev, self.surface, pref, pinned)?;
-        self.pref = pref;
-        if mode == self.present_mode {
-            return Ok(());
-        }
-        tracing::info!(present_mode = ?mode, vsync, allow_vrr, fullscreen, "present mode");
-        self.present_mode = mode;
-        self.recreate_swapchain(window)
+        self.reconfigure(Input::SetPref(pref), window).map(drop)
     }
 
-    /// Replace the swapchain at the window's current size. A zero-size (minimized) window
-    /// keeps the old swapchain and any image already acquired from it.
-    pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
-        // The native lane owns the window: no surface to size. The next frame through the
-        // swapchain path makes both again at the size recorded here.
-        if self.state.suspended() {
-            let (width, height) = window.size_in_pixels();
-            self.extent = vk::Extent2D { width, height };
-            return Ok(());
+    /// `PickMode`: ask the surface for `pref`'s mode. A failed pick commits nothing.
+    fn pick_mode(&mut self, window: &sdl3::video::Window, pref: model::Pref) -> Result<Applied> {
+        let asked = PresentPref {
+            vsync: pref.vsync,
+            allow_vrr: pref.allow_vrr,
+            fullscreen: pref.fullscreen,
+            ..self.pref
+        };
+        let pinned = self.knobs.present_mode.as_deref();
+        let mode = pick_present_mode(&self.surface_i, self.pdev, self.surface, asked, pinned)?;
+        let plan = self.decide(Input::Picked { pref, mode });
+        if plan == Plan::Rebuild {
+            tracing::info!(present_mode = ?mode, vsync = pref.vsync, allow_vrr = pref.allow_vrr,
+                fullscreen = pref.fullscreen, "present mode");
         }
+        self.apply(plan, window)
+    }
+
+    /// The window may have a new size: rebuild the swapchain at it. While the native lane
+    /// owns the window only the size is kept, for the resume.
+    pub fn recreate_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
+        let (width, height) = window.size_in_pixels();
+        let resize = Input::Resize {
+            extent: (width, height),
+        };
+        self.reconfigure(resize, window).map(drop)
+    }
+
+    /// `Rebuild`: replace the swapchain at the window's current size. A zero-size
+    /// (minimized) window keeps the old swapchain and any image already acquired from it.
+    fn rebuild_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
         self.quiesce_own()?;
         // SAFETY: `pdev` and `surface` are live handles owned by this presenter.
         #[cfg_attr(not(windows), allow(unused_mut))]
@@ -248,7 +336,7 @@ impl Presenter {
     /// description; not a PQ stream tone-mapped onto SDR by us. User-facing "HDR"
     /// indicators should report this, not stream signalling.
     pub fn hdr_active(&self) -> bool {
-        self.hdr_active || self.state.native_pq()
+        self.hdr_active || self.owner.native_pq()
     }
 
     /// The swapchain holds 10 bits a channel (SDR or HDR10): an overlay drawn in 8 would band.
@@ -259,7 +347,7 @@ impl Presenter {
         )
     }
 
-    /// Drop back to the SDR swapchain. No-op unless HDR10 is live.
+    /// Drop back to the SDR swapchain while HDR10 is live on a swapchain with a size.
     ///
     /// Console UI is SDR and composites into whatever swapchain the last
     /// stream left. [`Presenter::present`] only flips on a frame with colour
@@ -267,22 +355,11 @@ impl Presenter {
     /// PQ session the UI would otherwise write into the HDR10 swapchain and
     /// sRGB mid-tones would emit as PQ code points.
     pub fn leave_hdr(&mut self, window: &sdl3::video::Window) -> Result<()> {
-        if !self.hdr_active {
-            return Ok(());
+        let plan = self.decide(Input::LeaveHdr);
+        if plan != Plan::Skip {
+            tracing::info!("stream over — leaving HDR10 so the console UI composites as SDR");
         }
-        // The lane owns the window: no swapchain to flip, no surface to ask. The next real
-        // frame resumes the swapchain and `follow_hdr` flips it.
-        if self.state.suspended() {
-            return Ok(());
-        }
-        // Do not flip while minimized: `recreate_swapchain` keeps the old
-        // swapchain at zero extent, but `set_hdr_mode` would already have
-        // rebuilt CSC/overlay against SDR, mismatched to live HDR10 images.
-        if self.extent.width == 0 || self.extent.height == 0 {
-            return Ok(());
-        }
-        tracing::info!("stream over — leaving HDR10 so the console UI composites as SDR");
-        self.set_hdr_mode(window, false)
+        self.apply(plan, window).map(drop)
     }
 
     /// Host ST.2086 + content-light from the 0xCE plane.
@@ -339,11 +416,11 @@ impl Presenter {
         unsafe { ext.set_hdr_metadata(&[self.swapchain], &[md]) };
         tracing::debug!(from_host = self.hdr_meta.is_some(), "HDR metadata pushed");
     }
-    /// SDR↔HDR10 flip. The video intermediate ([`super::VIDEO_FORMAT`]) keeps its format; only
-    /// its content, mapped for the old mode, is dropped. A driver that refuses the HDR10
-    /// swapchain it advertised loses `hdr10_format` for good: back to SDR, where PQ frames
-    /// tone-map.
-    pub(super) fn set_hdr_mode(&mut self, window: &sdl3::video::Window, on: bool) -> Result<()> {
+    /// `Flip`: SDR↔HDR10. The passes come first, then `Flipped` lands the format and the
+    /// swapchain follows. The video intermediate ([`super::VIDEO_FORMAT`]) keeps its format;
+    /// only its content, mapped for the old mode, is dropped. A driver that refuses the HDR10
+    /// swapchain it advertised feeds `HdrRefused`: back to SDR for good, where PQ tone-maps.
+    fn set_hdr_mode(&mut self, window: &sdl3::video::Window, on: bool) -> Result<Applied> {
         let target = if on {
             self.hdr10_format.expect("caller checked availability")
         } else {
@@ -358,7 +435,7 @@ impl Presenter {
         // The overlay, scale and direct passes render into the swapchain format. Build all
         // three first, then swap: a failed create leaves the old set whole, on one format.
         // The old views are only in our cmd bufs — the fence quiesce above makes the
-        // destroy safe; the swapchain rides `recreate_swapchain` below.
+        // destroy safe; the swapchain follows in the rebuild below.
         let mut new_pipe = OverlayPipe::new(&self.device, target.format, on)?;
         let mut new_scale = match crate::scale::ScalePass::new(&self.device, target.format) {
             Ok(s) => s,
@@ -387,14 +464,12 @@ impl Presenter {
         if let Some(h) = self.retired_hw.as_mut() {
             h.direct = None;
         }
-        self.format = target;
-        self.hdr_active = on;
-        match self.recreate_swapchain(window) {
+        let flipped = Input::Flipped { on, format: target };
+        match self.reconfigure(flipped, window) {
             Err(e) if on => {
                 tracing::warn!(error = %format!("{e:#}"),
                     "HDR10 swapchain refused — staying SDR and tone-mapping PQ");
-                self.hdr10_format = None;
-                self.set_hdr_mode(window, false)
+                self.reconfigure(Input::HdrRefused, window)
             }
             r => r,
         }

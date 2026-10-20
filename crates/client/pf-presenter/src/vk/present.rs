@@ -18,6 +18,7 @@
 
 use super::gpu::*;
 use super::present_timing::SLICE_NS;
+use super::reconfig::{Applied, Input};
 use super::{
     BusyOn, DirectLast, DirectSrc, FrameInput, Held, Presented, Presenter, Retired, VideoImage,
 };
@@ -25,7 +26,6 @@ use crate::csc::csc_rows;
 #[cfg(target_os = "linux")]
 use crate::dmabuf::{self, HwFrame};
 use crate::overlay::OverlayFrame;
-use crate::swapchain_state::Entry;
 use anyhow::{Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
@@ -88,6 +88,27 @@ impl Lane<'_> {
             #[cfg(all(any(target_os = "linux", windows), feature = "pyrowave"))]
             Lane::Pyro(f) => Some((f.width, f.height)),
         }
+    }
+}
+
+/// The class of a present error, a context marker in its `anyhow` chain. `Window`: the
+/// surface, the swapchain or the compositor failed, not the frame; it says nothing about
+/// the decoder. Untagged errors are the frame's lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PresentError {
+    Window,
+}
+
+impl std::fmt::Display for PresentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("present to the window")
+    }
+}
+
+impl PresentError {
+    /// `e` carries the `Window` marker anywhere in its chain.
+    pub(crate) fn is_window(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<PresentError>() == Some(&PresentError::Window)
     }
 }
 
@@ -201,30 +222,24 @@ impl Presenter {
         input: FrameInput<'a>,
         overlay: Option<&OverlayFrame>,
     ) -> Result<Presented<'a>> {
-        if self.extent.width == 0 || self.extent.height == 0 {
-            return Ok(Presented::Shown); // minimized: not Stale (Stale recreates)
-        }
         // A redraw carrying an overlay the lane cannot show needs the swapchain, or the
         // console never appears after a stream that ended on the lane.
-        let lane_shows_it = overlay.is_none() || !self.overlay_blocks_native;
-        match self
-            .state
-            .enter(matches!(input, FrameInput::Redraw) && lane_shows_it)
-        {
-            Entry::Draw => {}
-            Entry::Skip => return Ok(Presented::Shown),
-            // Only the Linux lane takes the window.
-            Entry::Resume => {
-                #[cfg(target_os = "linux")]
-                if !self.resume_swapchain(window)? {
-                    return Ok(Presented::Shown); // minimized: the lane keeps the window
-                }
-            }
+        let entry = match input {
+            FrameInput::Redraw => Input::Redraw {
+                overlay_blocked: overlay.is_some() && self.overlay_blocks_native,
+            },
+            _ => Input::RealFrame,
+        };
+        // Minimized, or a redraw the lane shows: not Stale (Stale recreates).
+        let entered = self.reconfigure(entry, window);
+        if entered.context(PresentError::Window)? == Applied::Dropped {
+            return Ok(Presented::Shown);
         }
         // A rebuild that failed past its create left the targets short of the images: build
         // again before an acquire can index past them.
         if self.render_sems.len() != self.images.len() {
-            self.recreate_swapchain(window)?;
+            self.recreate_swapchain(window)
+                .context(PresentError::Window)?;
             return Ok(Presented::Stale);
         }
         let input = match self.glass_gate(window, input)? {
@@ -245,7 +260,8 @@ impl Presenter {
             if let Lane::Dmabuf(f) = lane {
                 drop(f);
             }
-            self.recreate_swapchain(window)?;
+            self.reconfigure(Input::OutOfDate, window)
+                .context(PresentError::Window)?;
             return Ok(Presented::Stale);
         };
         self.retire(&lane);
@@ -315,7 +331,7 @@ impl Presenter {
             // The non-blocking probe runs only without a present waiter: no swapchain lock.
             // SAFETY: `swapchain`/`acquire_sem` are owned. No image is held, so every wait
             // on `acquire_sem` is complete: a present's by its fence (checked above), a
-            // discarded image's by `recreate_swapchain`'s queue drain.
+            // discarded image's by the rebuild's queue drain.
             match unsafe {
                 self.swap_d.acquire_next_image(
                     self.swapchain,
@@ -330,17 +346,23 @@ impl Presenter {
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
                 | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
-                    self.recreate_swapchain(window)?;
+                    self.reconfigure(Input::OutOfDate, window)
+                        .context(PresentError::Window)?;
                     return Ok(ControlFlow::Break(Presented::Stale));
                 }
-                Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
+                Err(e) => {
+                    return Err(e)
+                        .context("vkAcquireNextImageKHR")
+                        .context(PresentError::Window)
+                }
             }
         }
         Ok(ControlFlow::Continue(input))
     }
 
-    /// HDR follows this frame's PQ flag before any work. No HDR10 surface → PQ stays on
-    /// the SDR swapchain; CSC shader mode 1 tonemaps. A `Redraw` changes nothing.
+    /// HDR follows this frame's PQ flag before any work (the model's `Follow`). No HDR10
+    /// surface → PQ stays on the SDR swapchain; CSC shader mode 1 tonemaps. A `Redraw`
+    /// changes nothing.
     fn follow_hdr(&mut self, window: &sdl3::video::Window, input: &FrameInput) -> Result<()> {
         let pq = match input {
             FrameInput::Redraw => return Ok(()),
@@ -362,11 +384,7 @@ impl Presenter {
                  usually means the gamescope Vulkan WSI layer is not visible in the sandbox."
             );
         }
-        let want = pq && self.hdr10_format.is_some();
-        if want != self.hdr_active {
-            self.set_hdr_mode(window, want)?;
-        }
-        Ok(())
+        self.reconfigure(Input::Follow { pq }, window).map(drop)
     }
 
     /// One frame in flight: wait the last submit's fence, which covers the command buffer,
@@ -424,7 +442,11 @@ impl Presenter {
             Ok(r) => r,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
             | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => return Ok(None),
-            Err(e) => return Err(e).context("vkAcquireNextImageKHR"),
+            Err(e) => {
+                return Err(e)
+                    .context("vkAcquireNextImageKHR")
+                    .context(PresentError::Window)
+            }
         };
         self.state.acquired = Some(index);
         self.last_acquire_us = started.elapsed().as_micros() as u32;
@@ -1332,7 +1354,7 @@ impl Presenter {
         }
         let present_started = std::time::Instant::now();
         // Same queue external-sync as the submit. Scoped tightly: OUT_OF_DATE
-        // re-enters the lock via `recreate_swapchain`'s queue drain. The swapchain
+        // re-enters the lock via the rebuild's queue drain. The swapchain
         // guard comes first, so a waiter slice never holds off decode submits.
         let present_res = {
             let _swapchain = self.present_timer.as_ref().map(|t| t.swapchain_guard());
@@ -1366,15 +1388,19 @@ impl Presenter {
                     t.disarm();
                 }
                 self.state.timing_armed = false;
-                self.recreate_swapchain(window)?;
+                self.reconfigure(Input::QueueFull, window)
+                    .context(PresentError::Window)?;
                 Ok(Presented::Stale)
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR)
             | Err(vk::Result::ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) => {
-                self.recreate_swapchain(window)?;
+                self.reconfigure(Input::OutOfDate, window)
+                    .context(PresentError::Window)?;
                 Ok(Presented::Stale)
             }
-            Err(e) => Err(e).context("vkQueuePresentKHR"),
+            Err(e) => Err(e)
+                .context("vkQueuePresentKHR")
+                .context(PresentError::Window),
         }
     }
 
@@ -1671,6 +1697,18 @@ fn csc_depth_packing_or_8bit(raw: RawVkFormat) -> (u8, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loop reads the marker under whatever context is added on the way up.
+    #[test]
+    fn a_window_error_keeps_its_class_through_the_chain() {
+        let tagged = Err::<(), _>(vk::Result::ERROR_SURFACE_LOST_KHR)
+            .context("vkAcquireNextImageKHR")
+            .context(PresentError::Window)
+            .context("hardware present");
+        assert!(PresentError::is_window(&tagged.unwrap_err()));
+        let lane = Err::<(), _>(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY).context("import");
+        assert!(!PresentError::is_window(&lane.unwrap_err()));
+    }
 
     /// 8-bit math on a 10-bit `3PACK16` picture expands range and the PQ curve wrong.
     #[test]
