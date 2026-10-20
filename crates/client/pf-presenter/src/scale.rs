@@ -6,7 +6,7 @@
 //! destination rect and clears the bars. Whole-number scales on both axes never get
 //! here: a NEAREST blit is exact and costs nothing extra.
 
-use crate::csc::{build_fullscreen_pipeline, color_pass};
+use crate::csc::{build_fullscreen_pipeline, color_pass, fill_or_destroy};
 use crate::vk::gpu::image_with_memory;
 use anyhow::{Context as _, Result};
 use ash::vk;
@@ -97,10 +97,15 @@ fn kernel_id(k: Kernel) -> i32 {
 
 impl ScalePass {
     /// `out_format` is the swapchain's. The output pass comes from `csc::color_pass`, so the
-    /// overlay's per-image framebuffers serve it.
+    /// overlay's per-image framebuffers serve it. A failed step destroys what was made.
     pub fn new(device: &ash::Device, out_format: vk::Format) -> Result<ScalePass> {
+        let fill = |p: &mut ScalePass| p.fill(device, out_format);
+        fill_or_destroy(device, fill, |p, d| p.destroy(d))
+    }
+
+    fn fill(&mut self, device: &ash::Device, out_format: vk::Format) -> Result<()> {
         // SAFETY: CREATE per the crate contract.
-        let sampler = unsafe {
+        self.sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::NEAREST)
@@ -110,7 +115,7 @@ impl ScalePass {
                 None,
             )
         }?;
-        let samplers = [sampler];
+        let samplers = [self.sampler];
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -118,18 +123,18 @@ impl ScalePass {
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .immutable_samplers(&samplers)];
         // SAFETY: CREATE per the crate contract.
-        let set_layout = unsafe {
+        self.set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                 None,
             )
         }?;
-        let set_layouts = [set_layout];
+        let set_layouts = [self.set_layout];
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .size(std::mem::size_of::<Params>() as u32)];
         // SAFETY: CREATE per the crate contract.
-        let pipeline_layout = unsafe {
+        self.pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&set_layouts)
@@ -141,7 +146,7 @@ impl ScalePass {
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(2)];
         // SAFETY: CREATE per the crate contract.
-        let desc_pool = unsafe {
+        self.desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(2)
@@ -149,24 +154,25 @@ impl ScalePass {
                 None,
             )
         }?;
-        let two_layouts = [set_layout, set_layout];
+        let two_layouts = [self.set_layout, self.set_layout];
         // SAFETY: ALLOCATE per the crate contract; the pool holds two sets.
         let sets = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(desc_pool)
+                    .descriptor_pool(self.desc_pool)
                     .set_layouts(&two_layouts),
             )
         }?;
+        (self.set_src, self.set_mid) = (sets[0], sets[1]);
 
-        let mid_pass = color_pass(
+        self.mid_pass = color_pass(
             device,
             MID_FORMAT,
             vk::AttachmentLoadOp::DONT_CARE,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         )?;
-        let out_pass = color_pass(
+        self.out_pass = color_pass(
             device,
             out_format,
             vk::AttachmentLoadOp::CLEAR,
@@ -174,23 +180,11 @@ impl ScalePass {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         )?;
         let frag = pf_client_core::video_csc_spv::SCALE_FRAG;
-        let mid_pipeline =
-            build_fullscreen_pipeline(device, mid_pass, pipeline_layout, frag, false)?;
-        let out_pipeline =
-            build_fullscreen_pipeline(device, out_pass, pipeline_layout, frag, false)?;
-        Ok(ScalePass {
-            set_layout,
-            pipeline_layout,
-            sampler,
-            desc_pool,
-            set_src: sets[0],
-            set_mid: sets[1],
-            mid_pass,
-            mid_pipeline,
-            out_pass,
-            out_pipeline,
-            mid: None,
-        })
+        self.mid_pipeline =
+            build_fullscreen_pipeline(device, self.mid_pass, self.pipeline_layout, frag, false)?;
+        self.out_pipeline =
+            build_fullscreen_pipeline(device, self.out_pass, self.pipeline_layout, frag, false)?;
+        Ok(())
     }
 
     /// Size the intermediate for `p` (device-local memory from `mem_props`) and bind `src`
