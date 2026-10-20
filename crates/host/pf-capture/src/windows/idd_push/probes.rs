@@ -279,6 +279,10 @@ fn enumerate_hardware_adapters() -> Vec<(String, IDXGIAdapter1)> {
 /// Engine-liveness: CopyResource + fence wait. Wait latency is the sample.
 /// Device-create failure (display-only / indirect) leaves this adapter absent.
 fn fence_probe_loop(inner: &Inner, idx: usize, label: &str, adapter: &IDXGIAdapter1) {
+    // Before the setup: its event is closed only once the loop below exits.
+    let Some((_, probe)) = inner.fences.get(idx) else {
+        return;
+    };
     let Some((context, ctx4, fence, event, (a, b))) = fence_probe_setup(adapter) else {
         tracing::debug!(
             adapter = label,
@@ -287,9 +291,6 @@ fn fence_probe_loop(inner: &Inner, idx: usize, label: &str, adapter: &IDXGIAdapt
         return;
     };
     let mut value = 0u64;
-    let Some((_, probe)) = inner.fences.get(idx) else {
-        return;
-    };
     while !inner.stop.load(Ordering::Relaxed) {
         value += 1;
         probe.measure(|| {
