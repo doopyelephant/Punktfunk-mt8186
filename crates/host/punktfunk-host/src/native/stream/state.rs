@@ -53,6 +53,20 @@ pub(super) struct AuClock {
     pub(super) last_forced_idr: Option<std::time::Instant>,
 }
 
+impl AuClock {
+    /// The encoder was rebuilt in place, as a swap rebuilds one: what it owed is gone, a frame
+    /// whose tail never came is closed on the wire (the next AU is a new frame, or the client
+    /// sees the off-by-one `close_open_frame` exists for), and its forced IDR starts the
+    /// keyframe cooldown, so the client's echo of the same freeze forces no second one.
+    pub(super) fn after_reset(&mut self) {
+        self.inflight.clear();
+        if std::mem::take(&mut self.wire_frame_open) {
+            self.au_seq = self.au_seq.wrapping_add(1);
+        }
+        self.last_forced_idr = Some(std::time::Instant::now());
+    }
+}
+
 /// The escalation `adapt_to_cadence` makes when encode cannot hold cadence: the encoder's
 /// pipelined retrieve, wound back after a clean run.
 pub(super) struct Pipelining {

@@ -184,13 +184,17 @@ impl StreamState {
         if self.perf {
             self.st_cap.push(cap_us);
         }
+        let mut was_reset = false;
         run_parked_stage(
             &mut *self.capturer,
             &mut self.asks,
             &mut *self.enc,
             &mut self.clock.watchdog,
-            || self.clock.inflight.clear(),
+            || was_reset = true,
         );
+        if was_reset {
+            self.clock.after_reset();
+        }
         let mut repeat = false;
         match cap_result {
             Ok(Some(f)) => self.on_frame(f, t_cap),
@@ -363,9 +367,13 @@ impl StreamState {
             None => self.enc.submit_indexed(&self.frame, wire_index),
         };
         if let Err(e) = submitted {
+            let mut was_reset = false;
             let backoff = on_submit_error(&mut self.clock.watchdog, e, self.interval, || {
-                reset_stalled_encoder(&mut *self.enc, || self.clock.inflight.clear())
+                reset_stalled_encoder(&mut *self.enc, || was_reset = true)
             })?;
+            if was_reset {
+                self.clock.after_reset();
+            }
             self.next = std::time::Instant::now() + backoff;
             std::thread::sleep(backoff);
             return Ok(Flow::Continue);
@@ -648,9 +656,13 @@ impl StreamState {
             (None, Some(why)) => why,
             (None, None) => return Ok(()),
         };
+        let mut was_reset = false;
         let recovered = self.clock.watchdog.recover(self.interval, || {
-            reset_stalled_encoder(&mut *self.enc, || self.clock.inflight.clear())
+            reset_stalled_encoder(&mut *self.enc, || was_reset = true)
         });
+        if was_reset {
+            self.clock.after_reset();
+        }
         let Some(backoff) = recovered else {
             return Err(poll_err.unwrap_or_else(|| anyhow!("{why}")))
                 .context("encoder stalled — in-place rebuild unavailable or exhausted");
@@ -888,6 +900,29 @@ enum Polled {
 
 #[cfg(test)]
 mod tests {
+    /// An in-place reset closes a frame the wire had open and stamps the keyframe cooldown,
+    /// as a swap does.
+    #[test]
+    fn an_in_place_reset_closes_the_open_frame() {
+        let mut f = super::super::swap::tests::fake();
+        f.st.enc = Box::new(Resets);
+        f.st.clock.wire_frame_open = true;
+        let au_seq = f.st.clock.au_seq;
+        f.st.check_encode_stall(Some(anyhow::anyhow!("poll failed")))
+            .expect("one reset of the budget");
+        assert_eq!(
+            f.st.clock.au_seq,
+            au_seq + 1,
+            "the open frame was not closed"
+        );
+        assert!(!f.st.clock.wire_frame_open);
+        assert!(f.st.clock.inflight.is_empty());
+        assert!(
+            f.st.clock.last_forced_idr.is_some(),
+            "the reset's IDR is not on the clock"
+        );
+    }
+
     /// An encoder whose in-place reset always works.
     struct Resets;
 
