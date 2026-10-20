@@ -9,10 +9,10 @@ use crate::encode_recovery::{
 use crate::stats_recorder::DriverSample;
 
 // ~20 net behind-frames (≈0.3 s) escalates; warmup skips the first ~1 s of bring-up.
-const DEPTH_ESCALATE: u32 = 20;
-const DEPTH_BEHIND_CAP: u32 = 60;
-const DEPTH_WARMUP_FRAMES: u64 = 60;
-const DEPTH_DEGRADE: u32 = 10;
+const ESCALATE_BEHIND_SCORE: u32 = 20;
+const BEHIND_SCORE_CAP: u32 = 60;
+const CADENCE_WARMUP_FRAMES: u64 = 60;
+const DEGRADE_BEHIND_SCORE: u32 = 10;
 // ~5 s clean at 120 fps earns one wind-back. Backoff 1 → 5 → 25 min; never a permanent latch.
 const DEESCALATE_CLEAN_FRAMES: u32 = 600;
 pub(super) const DEESCALATE_BACKOFF_START: std::time::Duration = std::time::Duration::from_secs(60);
@@ -39,8 +39,8 @@ fn mark_recovery_boundary(ir_wave_pos: &mut u32, is_keyframe: bool, period: u32)
     }
 }
 
-/// On by default. `PUNKTFUNK_IDD_ADAPTIVE=0` skips `adapt_depth`: no cadence verdict for the ABR
-/// climb gate, and the encoder never escalates to pipelined retrieve.
+/// On by default. `PUNKTFUNK_IDD_ADAPTIVE=0` skips `adapt_to_cadence`: no cadence verdict for
+/// the ABR climb gate, and the encoder never escalates to pipelined retrieve.
 fn idd_adaptive_enabled() -> bool {
     crate::send_pacing::env_once!(
         bool,
@@ -439,7 +439,7 @@ impl StreamState {
     }
 
     /// Fold this poll's elapsed time into the tick's longest submit+poll chain —
-    /// the backend-neutral pressure input `adapt_depth` reads. Driver-owned AUs
+    /// the backend-neutral pressure input `adapt_to_cadence` reads. Driver-owned AUs
     /// carry no host submit, so they never count.
     fn note_encode_chain(&mut self, st: &Stamps, t_wait: std::time::Instant) {
         if st.owed {
@@ -664,13 +664,13 @@ impl StreamState {
     /// clean run with a growing backoff; pipelined retrieve is judged on a full-budget chain
     /// (see [`encode_chain_pressure`]). Also publishes the cadence verdict the ABR climb gate
     /// reads.
-    pub(super) fn adapt_depth(&mut self) {
+    pub(super) fn adapt_to_cadence(&mut self) {
         if !idd_adaptive_enabled() {
             return;
         }
         let p = &mut self.pipelining;
         p.depth_frames += 1;
-        if p.depth_frames <= DEPTH_WARMUP_FRAMES {
+        if p.depth_frames <= CADENCE_WARMUP_FRAMES {
             return;
         }
         let budget = cadence_budget(self.interval, self.src_period_ns);
@@ -679,12 +679,12 @@ impl StreamState {
             encode_chain_pressure(budget, self.encode_chain_ns, p.pipelined_active);
         let behind = schedule_behind || encode_pressure;
         p.behind_score = if behind {
-            (p.behind_score + 1).min(DEPTH_BEHIND_CAP)
+            (p.behind_score + 1).min(BEHIND_SCORE_CAP)
         } else {
             p.behind_score.saturating_sub(1)
         };
         let escalated = p.pipelined_active || p.deescalating;
-        let degraded = encode_behind_cadence(escalated, p.behind_score, DEPTH_DEGRADE);
+        let degraded = encode_behind_cadence(escalated, p.behind_score, DEGRADE_BEHIND_SCORE);
         self.cadence_degraded.store(degraded, Ordering::Relaxed);
         self.cadence_behind_score
             .store(p.behind_score, Ordering::Relaxed);
@@ -735,7 +735,7 @@ impl StreamState {
                 p.depth_frames = 0;
                 p.ahead_run = 0;
             }
-        } else if p.behind_score >= DEPTH_ESCALATE && !p.pipeline_asked {
+        } else if p.behind_score >= ESCALATE_BEHIND_SCORE && !p.pipeline_asked {
             p.pipeline_asked = true;
             p.pipelined_active = self.enc.set_pipelined(true);
             if p.pipelined_active {

@@ -53,8 +53,8 @@ pub(super) struct AuClock {
     pub(super) last_forced_idr: Option<std::time::Instant>,
 }
 
-/// The escalation `adapt_depth` makes when encode cannot hold cadence: the encoder's pipelined
-/// retrieve, wound back after a clean run.
+/// The escalation `adapt_to_cadence` makes when encode cannot hold cadence: the encoder's
+/// pipelined retrieve, wound back after a clean run.
 pub(super) struct Pipelining {
     pub(super) behind_score: u32,
     pub(super) depth_frames: u64,
@@ -1079,7 +1079,7 @@ impl StreamState {
                 Flow::Continue => continue,
                 Flow::Break => break,
             }
-            self.adapt_depth();
+            self.adapt_to_cadence();
             self.sleep_to_next(t_cap, repeat);
         }
         Ok(())
