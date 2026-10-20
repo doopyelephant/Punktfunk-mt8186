@@ -2002,10 +2002,13 @@ impl Encoder for PyroWaveEncoder {
                 },
             };
             for i in 0..SLOTS {
-                pw::pyrowave_encoder_destroy(self.pw_encs[i]);
-                // Null immediately: create below is fallible. `pyrowave_encoder_destroy` is
-                // a plain `delete` with no null check, so `Drop` on a stale handle is a
-                // double free.
+                // Null after an earlier rebuild failed on this slot. `pyrowave_encoder_destroy`
+                // reads `encoder->device` with no null check.
+                if !self.pw_encs[i].is_null() {
+                    pw::pyrowave_encoder_destroy(self.pw_encs[i]);
+                }
+                // Null immediately: create below is fallible, and `Drop` on a stale handle
+                // is a double free.
                 self.pw_encs[i] = std::ptr::null_mut();
                 let mut enc: pw::pyrowave_encoder = std::ptr::null_mut();
                 let r = pw::pyrowave_encoder_create(&einfo, &mut enc);
