@@ -465,9 +465,6 @@ impl Shell {
         let Some(st) = stream.as_mut() else {
             return;
         };
-        if r.keep_mic_muted {
-            tracing::info!("mic mute not carried: the next session starts unmuted");
-        }
         if r.release {
             self.release_stream(st);
         }
@@ -506,6 +503,10 @@ impl Shell {
         self.end_stream(stream, SessionPhase::Reconnecting(r.phase));
         let mut next = self.start_stream(params, force_software);
         next.redials = redials;
+        // The player's mute rides along: its uplink reads the flag once it runs.
+        if r.keep_mic_muted {
+            next.handle.mic.set_muted(true);
+        }
         *stream = Some(next);
     }
 

@@ -372,7 +372,8 @@ pub fn codec_fallbacks() -> u64 {
 /// In-stream microphone mute, shared by the embedder's toggle and the capture
 /// callback. Two flags: `live` is raised only once the uplink is running, so the
 /// indicator tracks a real mute surface. Per session and never persisted — a mute
-/// is a moment, not a preference; every new session starts unmuted.
+/// is a moment, not a preference; a session the player starts begins unmuted, and
+/// a dial the client makes on the player's behalf carries the mute through [`Self::set_muted`].
 #[derive(Clone, Default)]
 pub struct MicControl {
     muted: Arc<AtomicBool>,
@@ -397,6 +398,12 @@ impl MicControl {
         let next = !self.muted.load(Ordering::Relaxed);
         self.muted.store(next, Ordering::Relaxed);
         Some(next)
+    }
+
+    /// The mute a redial carries in: written before the uplink runs, read by it once it
+    /// does. `muted` keeps reporting `false` until then, as the indicator should.
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
     }
 
     fn flag(&self) -> Arc<AtomicBool> {
@@ -2345,6 +2352,21 @@ mod tests {
         mic.set_live(false);
         assert!(!mic.muted());
         assert_eq!(mic.toggle(), None);
+    }
+
+    /// A redial carries the player's mute in before its uplink runs; the uplink reads it.
+    #[test]
+    fn a_carried_mute_waits_for_the_uplink() {
+        let mic = MicControl::default();
+        mic.set_muted(true);
+        assert!(!mic.muted(), "nothing live, nothing to show");
+        assert!(
+            mic.flag().load(Ordering::Relaxed),
+            "but the uplink will read it"
+        );
+        mic.set_live(true);
+        assert!(mic.muted());
+        assert_eq!(mic.toggle(), Some(false), "the player can still unmute");
     }
 
     fn mode_1080p() -> Mode {

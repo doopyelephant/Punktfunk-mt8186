@@ -38,7 +38,7 @@ pub(crate) struct Restart<'a> {
     pub release: bool,
     /// Dial at the mode the connector ended on: a mid-session reconfigure lives only there.
     pub connector_mode: bool,
-    /// The player had the mic muted. `MicControl` takes no initial state, so it is only logged.
+    /// The player had the mic muted: the next session starts with it, before its uplink runs.
     pub keep_mic_muted: bool,
     /// The console's `Reconnecting` line.
     pub phase: &'a str,
