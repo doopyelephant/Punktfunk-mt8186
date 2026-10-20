@@ -196,7 +196,10 @@ impl ScreenSet {
             }
             !done
         });
-        if self.loops.len() != before {
+        // Shares go by pixel rate, so a first screen that changed mode moves them as a screen
+        // joining or leaving does.
+        let first_moved = self.told.first().is_some_and(|f| f.mode != first_mode);
+        if self.loops.len() != before || first_moved {
             self.reshare(first_mode);
         }
         self.tell_layout(first_mode);
