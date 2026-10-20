@@ -406,6 +406,50 @@ mod tests {
         assert_eq!(asm.reader.freed_unread, 0);
     }
 
+    /// A chunk over half the heap wraps to its start and ends past the open chunk's end, so
+    /// heap order would take its successor first, close the AU on it and free the chunk
+    /// unread. The publish stamp keeps the order.
+    #[test]
+    fn a_wrapped_chunk_over_half_the_heap_keeps_its_place() {
+        let mut buf = section();
+        let mem = SectionView::over(&mut buf);
+        let mut drv = Producer::init(mem, 1, 0);
+        let mut asm = assembly(mem, 0);
+        drv.publish(&vec![0xEE; 600 * 1024], 0, 0, 0, WHOLE);
+        assert!(asm.poll(&mut no_wait).unwrap().is_some());
+        let head = vec![0x11; 100 * 1024];
+        let big = vec![0x22; 750 * 1024];
+        let first = drv.publish(&head, 1, 1, 0, au::AU_FIRST);
+        let head_end = drv.slot_offset(first) + head.len() as u32;
+        let mut placed = None;
+        let f = asm
+            .poll(&mut |_| {
+                if placed.is_none() {
+                    placed = Some((
+                        drv.publish(&big, 1, 1, 0, 0),
+                        drv.publish(b"tail", 1, 1, 0, au::AU_LAST),
+                    ));
+                }
+            })
+            .unwrap()
+            .unwrap();
+        let (wrapped, tail) = placed.unwrap();
+        assert_eq!(
+            drv.slot_offset(wrapped) as usize,
+            au::HEAP_OFFSET,
+            "wrapped"
+        );
+        assert!(
+            drv.slot_offset(tail) >= head_end,
+            "the tail sits past the head"
+        );
+        let want = [head.as_slice(), &big, b"tail"].concat();
+        assert_eq!(f.data.len(), want.len(), "a hole");
+        assert!(f.data == want, "out of order");
+        assert!(asm.poll(&mut no_wait).unwrap().is_none());
+        assert_eq!(asm.reader.freed_unread, 0);
+    }
+
     /// A `RESET` mid-AU restarts the domain past the half-read unit, which already spent its
     /// index on the wire; the superseded encoder's leftovers never reach it.
     #[test]

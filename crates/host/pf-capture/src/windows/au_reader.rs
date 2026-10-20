@@ -18,8 +18,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const STATE: usize = offset_of!(AuSlot, state);
 
-/// `(distance ahead of next_wire_seq, rank inside the access unit, heap distance)`.
-type OrderKey = (u32, u8, u32);
+/// `(distance ahead of next_wire_seq, rank inside the access unit, publish stamp or heap
+/// distance)`.
+type OrderKey = (u32, u8, u64);
 
 /// One mapped v7 section, alive for the view's lifetime. Header and slot words are only ever
 /// touched through aligned atomics, because the driver writes the same bytes; the heap is read
@@ -166,10 +167,11 @@ impl std::fmt::Display for AuFault {
 impl std::error::Error for AuFault {}
 
 /// Walks published slots out of an [`AuView`] in `wire_seq` order. Chunks of one access unit
-/// share a `wire_seq`; the FIRST chunk goes first, then heap order from the previous chunk's
-/// end (the heap is a bump allocator that wraps). A slot behind `next_wire_seq`, or a chunk of
-/// an access unit whose FIRST was never taken, is freed unread: after a `RESET` the domain
-/// restarts where the host says, and a superseded encoder's leftovers must not reach the wire.
+/// share a `wire_seq`; the FIRST chunk goes first, then the rest by the driver's publish stamp,
+/// or in heap order from the previous chunk's end from a driver that stamps none. A slot behind
+/// `next_wire_seq`, or a chunk of an access unit whose FIRST was never taken, is freed unread:
+/// after a `RESET` the domain restarts where the host says, and a superseded encoder's
+/// leftovers must not reach the wire.
 pub(crate) struct AuReader<'a> {
     view: AuView<'a>,
     /// The `wire_seq` the next access unit carries; `SET_ENCODE` and `RESET` set it.
@@ -233,16 +235,19 @@ impl<'a> AuReader<'a> {
         (rel < 1 << 31).then_some(rel)
     }
 
-    /// Ordering of a candidate slot: access unit first, then FIRST before the rest, then heap
-    /// order from the open access unit's end so a wrapped bump allocation still sorts last.
-    fn order_key(&self, rel: u32, first: bool, offset: u32) -> OrderKey {
-        if first {
+    /// Ordering of a candidate slot: access unit first, then FIRST before the rest, then the
+    /// open access unit's chunks in publish order. The driver's stamp gives that order across
+    /// any wrap. Heap order from the open chunk's end stands in for a driver that stamps none;
+    /// a wrapped chunk that ends past that end defeats it.
+    fn order_key(&self, rel: u32, s: &AuSlot) -> OrderKey {
+        if s.flags & au::AU_FIRST != 0 {
             return (rel, 0, 0);
         }
         match self.open_au {
-            Some((_, end)) if rel == 0 && offset >= end => (rel, 1, offset - end),
-            Some(_) if rel == 0 => (rel, 2, offset),
-            _ => (rel, 3, offset),
+            Some(_) if rel == 0 && s.qpc_published != 0 => (rel, 1, s.qpc_published),
+            Some((_, end)) if rel == 0 && s.offset >= end => (rel, 2, u64::from(s.offset - end)),
+            Some(_) if rel == 0 => (rel, 3, u64::from(s.offset)),
+            _ => (rel, 4, u64::from(s.offset)),
         }
     }
 
@@ -291,7 +296,7 @@ impl<'a> AuReader<'a> {
                 self.free_unread(i);
                 continue;
             };
-            let key = self.order_key(rel, s.flags & au::AU_FIRST != 0, s.offset);
+            let key = self.order_key(rel, &s);
             if pick.as_ref().is_none_or(|p| key < p.0) {
                 pick = Some((key, i, s));
             }
@@ -400,6 +405,8 @@ pub(crate) mod producer {
         publishes: u32,
         /// Chunks since the open access unit's FIRST: each is stamped one QPC tick after the last.
         chunk: u64,
+        /// `false` is a driver that predates the submit and publish stamps: both stay `0`.
+        pub(crate) stamps: bool,
     }
 
     impl<'a> Producer<'a> {
@@ -428,6 +435,7 @@ pub(crate) mod producer {
                 ring: HeapRing::new(au::HEAP_OFFSET as u32, heap_len),
                 publishes: 0,
                 chunk: 0,
+                stamps: true,
             }
         }
 
@@ -465,11 +473,15 @@ pub(crate) mod producer {
             } else {
                 self.chunk + 1
             };
-            w64(offset_of!(AuSlot, qpc_submit), qpc_pts.saturating_add(7));
-            w64(
-                offset_of!(AuSlot, qpc_published),
-                qpc_pts.saturating_add(11 + self.chunk),
-            );
+            let stamp = |at: u64| {
+                if self.stamps {
+                    qpc_pts.saturating_add(at)
+                } else {
+                    0
+                }
+            };
+            w64(offset_of!(AuSlot, qpc_submit), stamp(7));
+            w64(offset_of!(AuSlot, qpc_published), stamp(11 + self.chunk));
             self.view
                 .slot32(i, STATE)
                 .store(au::PUBLISHED, Ordering::Release);
@@ -570,11 +582,19 @@ mod tests {
         assert_eq!((rd.freed_unread, rd.gaps), (0, 0));
     }
 
+    /// Stamped or not: a driver that writes no publish stamp is read in heap order.
     #[test]
-    fn chunks_of_one_access_unit_keep_heap_order_across_a_wrap() {
+    fn chunks_of_one_access_unit_keep_their_order_across_a_wrap() {
+        for stamps in [true, false] {
+            chunks_keep_their_order_across_a_wrap(stamps);
+        }
+    }
+
+    fn chunks_keep_their_order_across_a_wrap(stamps: bool) {
         let mut buf = section();
         let mem = SectionView::over(&mut buf);
         let mut prod = Producer::init(mem, 1, 0);
+        prod.stamps = stamps;
         let mut rd = reader(mem, 0);
         // Leave the heap 4 bytes short of full so the third chunk wraps to its start.
         let heap = rd.view().header().heap_bytes as usize;
