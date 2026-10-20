@@ -14,12 +14,12 @@ impl OverlayPipe {
     /// step destroys what was made.
     pub(super) fn new(device: &ash::Device, format: vk::Format, pq: bool) -> Result<OverlayPipe> {
         let fill = |p: &mut OverlayPipe| p.fill(device, format, pq);
-        fill_or_destroy(device, fill, |p, d| p.destroy(d))
+        fill_or_destroy(device, fill, Self::destroy)
     }
 
     fn fill(&mut self, device: &ash::Device, format: vk::Format, pq: bool) -> Result<()> {
         // This pass owns the last layout transition on overlay frames (LOAD, end PRESENT-ready).
-        self.render_pass = color_pass(
+        self.pass.render_pass = color_pass(
             device,
             format,
             vk::AttachmentLoadOp::LOAD,
@@ -29,7 +29,7 @@ impl OverlayPipe {
         .context("overlay render pass")?;
 
         // SAFETY: `device` is live; CreateInfo is a local that outlives the call.
-        self.sampler = unsafe {
+        self.pass.sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::LINEAR)
@@ -40,7 +40,7 @@ impl OverlayPipe {
                 None,
             )
         }?;
-        let samplers = [self.sampler];
+        let samplers = [self.pass.sampler];
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -48,15 +48,15 @@ impl OverlayPipe {
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .immutable_samplers(&samplers)];
         // SAFETY: `device` is live; `bindings` and `samplers` outlive the call.
-        self.set_layout = unsafe {
+        self.pass.set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                 None,
             )
         }?;
-        let set_layouts = [self.set_layout];
+        let set_layouts = [self.pass.set_layout];
         // SAFETY: `device` is live; `set_layouts` outlives the call.
-        self.pipeline_layout = unsafe {
+        self.pass.pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts),
                 None,
@@ -66,7 +66,7 @@ impl OverlayPipe {
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)];
         // SAFETY: `device` is live; `pool_sizes` outlives the call.
-        self.desc_pool = unsafe {
+        self.pass.desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(1)
@@ -78,14 +78,14 @@ impl OverlayPipe {
         self.desc_set = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(self.desc_pool)
+                    .descriptor_pool(self.pass.desc_pool)
                     .set_layouts(&set_layouts),
             )
         }?[0];
-        self.pipeline = build_fullscreen_pipeline(
+        self.pass.pipeline = build_fullscreen_pipeline(
             device,
-            self.render_pass,
-            self.pipeline_layout,
+            self.pass.render_pass,
+            self.pass.pipeline_layout,
             if pq {
                 pf_client_core::video_csc_spv::OVERLAY_PQ_FRAG
             } else {
@@ -96,17 +96,9 @@ impl OverlayPipe {
         Ok(())
     }
 
+    /// [`Pass::destroy`](super::gpu::Pass::destroy): the set goes with the pool.
     pub(super) fn destroy(&mut self, device: &ash::Device) {
-        // SAFETY: these objects are owned here; the GPU is idle for them (fence/queue-wait
-        // on this path, or the swapchain already retired).
-        unsafe {
-            device.destroy_pipeline(self.pipeline, None);
-            device.destroy_pipeline_layout(self.pipeline_layout, None);
-            device.destroy_descriptor_pool(self.desc_pool, None);
-            device.destroy_descriptor_set_layout(self.set_layout, None);
-            device.destroy_sampler(self.sampler, None);
-            device.destroy_render_pass(self.render_pass, None);
-        }
+        self.pass.destroy(device);
     }
 }
 
@@ -143,11 +135,11 @@ impl OverlayTargets {
             }?;
             self.views.push(view);
             let attachments = [view];
-            // SAFETY: `view` and `pipe.render_pass` are live; CreateInfo outlives the call.
+            // SAFETY: `view` and `pipe.pass.render_pass` are live; CreateInfo outlives the call.
             let fb = unsafe {
                 device.create_framebuffer(
                     &vk::FramebufferCreateInfo::default()
-                        .render_pass(pipe.render_pass)
+                        .render_pass(pipe.pass.render_pass)
                         .attachments(&attachments)
                         .width(extent.width)
                         .height(extent.height)

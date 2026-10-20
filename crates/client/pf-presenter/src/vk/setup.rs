@@ -922,8 +922,8 @@ impl Presenter {
         b.made.direct = crate::csc::DirectPass::new(
             &device,
             format.format,
-            b.made.csc.pipeline_layout,
-            b.made.csc_planar.pipeline_layout,
+            b.made.csc.pass.pipeline_layout,
+            b.made.csc_planar.pass.pipeline_layout,
         )?;
         frame_sync(&device, qfi, caps.timeline_semaphore, &mut b.made)?;
 

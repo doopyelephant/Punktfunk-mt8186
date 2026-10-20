@@ -1,6 +1,6 @@
 //! Video-image, CPU-plane and staging-buffer rebuilds.
 
-use super::gpu::image_with_memory;
+use super::gpu::{destroy_image_with_memory, image_with_memory};
 use super::{CpuPlanes, Presenter, Staging, VideoImage};
 use anyhow::{Context as _, Result};
 use ash::vk;
@@ -21,17 +21,11 @@ fn plane_staging_offsets(f: &CpuPlanarFrame) -> ([usize; 3], usize) {
 }
 
 impl CpuPlanes {
-    /// Null handles are a no-op, so [`Presenter::rebuild_cpu_planes`] can
-    /// unwind a build that failed part-way.
+    /// Only once the GPU is done with them (the fence or queue wait on this path). Null handles
+    /// are a no-op, so [`Presenter::rebuild_cpu_planes`] can unwind a build that failed part-way.
     pub(super) fn destroy(self, device: &ash::Device) {
-        // SAFETY: handles owned by `self`. GPU idle: fence/queue-wait on this
-        // path, or the swapchain already retired.
-        unsafe {
-            for i in 0..3 {
-                device.destroy_image_view(self.views[i], None);
-                device.destroy_image(self.images[i], None);
-                device.free_memory(self.memory[i], None);
-            }
+        for i in 0..3 {
+            destroy_image_with_memory(device, (self.images[i], self.memory[i], self.views[i]));
         }
     }
 }
@@ -41,12 +35,8 @@ impl VideoImage {
     pub(super) fn destroy(self, device: &ash::Device) {
         // SAFETY: handles owned by `self`. GPU idle: fence/queue-wait on this
         // path, or never submitted.
-        unsafe {
-            device.destroy_framebuffer(self.framebuffer, None);
-            device.destroy_image_view(self.view, None);
-            device.destroy_image(self.image, None);
-            device.free_memory(self.memory, None);
-        }
+        unsafe { device.destroy_framebuffer(self.framebuffer, None) };
+        destroy_image_with_memory(device, (self.image, self.memory, self.view));
     }
 }
 
@@ -210,12 +200,12 @@ impl Presenter {
         };
         // View + framebuffer always: Vulkan Video needs the CSC pass on every device.
         let attachments = [view];
-        // SAFETY: `device` is live; `view`/`csc.render_pass` are owned here;
+        // SAFETY: `device` is live; `view`/`csc.pass.render_pass` are owned here;
         // create-info is a local that outlives the call.
         let framebuffer = unsafe {
             self.device.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
-                    .render_pass(self.csc.render_pass)
+                    .render_pass(self.csc.pass.render_pass)
                     .attachments(&attachments)
                     .width(width)
                     .height(height)
