@@ -213,7 +213,9 @@ pub(super) fn external_acquire_barrier(
 }
 
 /// UNDEFINED old-layout still preserves contents on externally-bound memory
-/// (VAAPI dmabuf). The hop is FOREIGN → ours, not a discard.
+/// (VAAPI dmabuf). The hop is FOREIGN → ours, not a discard. Both stages are
+/// FRAGMENT_SHADER as in [`native_layer_barrier`]: the submit waits the decode
+/// sync file there, and a TOP_OF_PIPE hop would run while the decoder still writes.
 #[cfg(target_os = "linux")]
 pub(super) fn foreign_acquire_barrier(
     device: &ash::Device,
@@ -236,7 +238,7 @@ pub(super) fn foreign_acquire_barrier(
     unsafe {
         device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::DependencyFlags::empty(),
             &[],
