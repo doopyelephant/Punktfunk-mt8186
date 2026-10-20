@@ -4,6 +4,7 @@
 #[cfg(target_os = "windows")]
 pub mod gpu_pref;
 #[cfg(target_os = "windows")]
+#[path = "idd/mod.rs"]
 pub(crate) mod idd_push;
 // What the win32u GPU-preference patch writes, and the one head it may write over. Pure
 // byte tables, so the test runs on every target.
@@ -20,14 +21,18 @@ mod cursor_witness;
 mod cursor_state;
 // The IDD-push display depth pin: which depth the display holds, and when a change re-opens
 // the driver's encoder. Pure over the colour seam, so its table runs on every target.
-#[path = "idd_push/depth_pin.rs"]
+#[path = "idd/depth_pin.rs"]
 mod depth_pin;
 // The IDD-push open as a plan of steps, and the display's half run over the colour seam. Pure
 // but for the seam, so a test per session kind runs on every target.
-#[path = "idd_push/open_plan.rs"]
+#[path = "idd/open_plan.rs"]
 mod open_plan;
+// The IDD-push tick: the wrapper's order around the remote source's phases. Pure, so its
+// table of past tick defects runs on every target.
+#[path = "idd/tick.rs"]
+mod tick;
 // The IDD-push stall model: holes in DWM delivery and their verdicts. Pure over `Instant`s,
-// so its tests run on every target; `idd_push/stall.rs` writes the report.
+// so its tests run on every target; `idd/stall.rs` writes the report.
 mod stall_model;
 // The GDI cursor poller's planes-to-RGBA rasterisers, pure over `&[u8]` for the same reason.
 mod cursor_raster;

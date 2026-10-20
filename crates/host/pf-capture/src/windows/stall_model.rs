@@ -7,7 +7,7 @@
 //! (the cursor never moved) are real delivery gaps but stay out of the beat.
 //!
 //! Pure over `Instant`s and the driver's telemetry, so its tests run on every target.
-//! `idd_push/stall.rs` writes the report, which reads the OS display events.
+//! `idd/stall.rs` writes the report, which reads the OS display events.
 
 // Off Windows only the tests read this module.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -192,7 +192,7 @@ pub(crate) fn attribute(gap: Duration, evidence: &StallEvidence) -> StallVerdict
 ///
 /// Reported stalls feed a [`pf_frame::metronome::Metronome`] after the verdict
 /// so periodic DWM holes self-diagnose. Encode/network causes stay with the
-/// recovery-cadence detector. [`Self::report`], in `idd_push/stall.rs`, logs.
+/// recovery-cadence detector. [`Self::report`], in `idd/stall.rs`, logs.
 pub(crate) struct StallWatch {
     /// Last [`Self::RECENT`] fresh-frame instants — activity-gate history.
     recent: std::collections::VecDeque<Instant>,

@@ -15,7 +15,7 @@ pub(crate) mod au_reader;
 pub(crate) mod delivery;
 pub(crate) mod encoder;
 #[cfg(test)]
-mod fake;
+pub(crate) mod fake;
 pub(crate) mod link;
 pub(crate) mod source;
 pub(crate) mod supervisor;

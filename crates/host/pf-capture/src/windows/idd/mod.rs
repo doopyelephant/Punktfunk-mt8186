@@ -38,8 +38,8 @@ pub(crate) fn wcg_available() -> bool {
         && *BUILD.get_or_init(pf_win_display::os_build) >= pf_win_display::WCG_MIN_BUILD
 }
 
-/// Where the access-unit dump goes while [`Knobs::idd_diag`] is on: this capturer's full
-/// diagnostics.
+/// `Some` while [`Knobs::idd_diag`] runs this capturer's full diagnostics: the probes, the ETW
+/// session and the encoder's access-unit dump, which goes in this directory.
 pub(super) fn diag_dir() -> Option<&'static std::path::Path> {
     Knobs::process().idd_diag.as_deref()
 }
@@ -51,35 +51,23 @@ pub(super) fn flow_watch() -> bool {
 }
 
 // The frame-delivery endpoint: `try_consume` and the `Capturer` surface.
-#[path = "idd_push/capturer.rs"]
 mod capturer;
-#[path = "idd_push/channel.rs"]
 mod channel;
 // Construction: adapter, HDR, cursor opt-in.
-#[path = "idd_push/cursor.rs"]
 mod cursor;
-#[path = "idd_push/cursor_model.rs"]
 mod cursor_model;
-#[path = "idd_push/cursor_poll.rs"]
 mod cursor_poll;
-#[path = "idd_push/open.rs"]
 mod open;
 use cursor_model::deliver_cursor_channel;
-#[path = "idd_push/descriptor.rs"]
 mod descriptor;
-#[path = "idd_push/display.rs"]
 mod display;
 // Stall reporting over `windows::stall_model`, plus DxgKrnl ETW and micro-probes as evidence.
-#[path = "idd_push/dxgkrnl_etw.rs"]
 mod dxgkrnl_etw;
-#[path = "idd_push/probes.rs"]
 mod probes;
-#[path = "idd_push/stall.rs"]
 mod stall;
 // This capturer's end of the recovery ladder: the classifier inputs and the rungs it runs here.
-#[path = "idd_push/health.rs"]
 mod health;
-use crate::windows::stall_model::{StallEvidence, StallWatch};
+use crate::windows::tick::Tick;
 use channel::{ChannelBroker, IddTransport};
 use descriptor::DescriptorPoller;
 
@@ -136,16 +124,11 @@ pub struct IddPushCapturer {
     want_444: bool,
     /// Off-thread CCD snapshot; the capture loop never runs those queries inline.
     desc_poller: DescriptorPoller,
-    /// A presentation restart is in flight; if no frame resumes past the window,
-    /// `try_consume` drops the session (recover-or-drop, no DDA).
-    recovering_since: Option<Instant>,
-    /// Multi-hundred-ms DWM holes during active flow; warns when they turn metronomic.
-    stall_watch: StallWatch,
-    /// The stalest drain heartbeat (µs) seen since the last fresh frame.
-    max_hb_age_us: u64,
-    /// Damage witness for [`StallEvidence::cursor_moved_px`] and the recovery
-    /// classifier. user32 only, never the display-config lock; the rule itself is
-    /// [`crate::windows::cursor_witness`].
+    /// What the tick keeps between the remote source's phases: the recover-or-drop window, the
+    /// heartbeat maximum and the stall watch.
+    tick: Tick,
+    /// Damage witness for the stall report and the recovery classifier. user32 only, never the
+    /// display-config lock; the rule itself is [`crate::windows::cursor_witness`].
     cursor: CursorWitness,
     /// Micro-probe singleton; `None` unless [`diag_dir`] is on. A missing window reads as
     /// never-stalled, so a report never invents a leg.

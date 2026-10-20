@@ -111,9 +111,7 @@ impl IddPushCapturer {
             depth,
             colour,
             want_444,
-            recovering_since: None,
-            stall_watch: StallWatch::new(),
-            max_hb_age_us: 0,
+            tick: Tick::new(),
             cursor: CursorWitness::new(Instant::now()),
             probes: steps.diagnostics.probes().then(super::probes::acquire),
             etw: (steps.diagnostics.etw())

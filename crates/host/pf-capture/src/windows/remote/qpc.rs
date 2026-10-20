@@ -23,7 +23,7 @@ fn now_ns() -> u64 {
 }
 
 /// QPC ticks per second, read once. `0` when the call failed; every span then reads 0.
-fn freq() -> u64 {
+pub(crate) fn freq() -> u64 {
     static FREQ: OnceLock<u64> = OnceLock::new();
     *FREQ.get_or_init(|| {
         let mut f = 0i64;

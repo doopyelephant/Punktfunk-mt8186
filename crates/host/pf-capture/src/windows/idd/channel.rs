@@ -9,14 +9,9 @@
 use super::*;
 use crate::windows::remote::broker::RemoteProcess;
 use crate::windows::remote::transport::{HandleTarget, RemoteEndpoint, Transport, TransportEvent};
+use crate::windows::tick::driver_probe_due;
 use crate::{EncodeCtlSender, EncoderSite, SetEncodeSender};
 use pf_driver_proto::encode::{SetEncodeReply, SetEncodeRequest};
-
-/// A dead WUDFHost and an idle desktop both stop the source counter, so the death probe runs
-/// only past this much staleness.
-const STALE: Duration = Duration::from_secs(2);
-/// At most one 0 ms wait per this.
-const PROBE_EVERY: Duration = Duration::from_secs(1);
 
 /// On IOCTL success the driver owns (and closes) the duplicates; on any failure the
 /// deliverer reaps what it planted ([`Self::close_remote_public`]).
@@ -139,11 +134,10 @@ impl Transport for IddTransport {
         pf_win_display::secure_desktop()
     }
 
-    /// Probe while stale so the driver cycle fires instead of the session streaming nothing.
+    /// Probe while stale ([`driver_probe_due`]) so the driver cycle fires instead of the session
+    /// streaming nothing.
     fn poll(&mut self, now: Instant, last_fresh: Instant) -> Result<Vec<TransportEvent>> {
-        if now.saturating_duration_since(last_fresh) <= STALE
-            || now.saturating_duration_since(self.probed) <= PROBE_EVERY
-        {
+        if !driver_probe_due(now, last_fresh, self.probed) {
             return Ok(Vec::new());
         }
         self.probed = now;

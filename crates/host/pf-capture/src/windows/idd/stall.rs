@@ -22,6 +22,40 @@ pub(super) fn rt_gpu_host_posture() -> &'static str {
     Knobs::process().gpu_priority_class
 }
 
+impl IddPushCapturer {
+    /// Report a hole the tick found, with the probe and ETW windows over it. `now` is the
+    /// frame that ended it. ETW prose takes a 300 ms lead-in (the cause lands just before); its
+    /// counts take the gap only, as presents from healthy flow would falsely acquit.
+    pub(super) fn report_stall(
+        &mut self,
+        gap: Duration,
+        now: Instant,
+        max_heartbeat_age_ms: Option<u64>,
+        cursor_moved_px: Option<u32>,
+    ) {
+        let (etw, etw_counts) = self
+            .etw
+            .as_ref()
+            .and_then(|w| {
+                now.checked_sub(gap)
+                    .map(|from| w.window_report(from, now, Duration::from_millis(300)))
+            })
+            .unzip();
+        let evidence = StallEvidence {
+            max_heartbeat_age_ms,
+            // Same window as the report's OS-event correlation (gap + cause lead-in).
+            probes: now
+                .checked_sub(gap + Duration::from_millis(300))
+                .zip(self.probes.as_deref())
+                .map(|(from, p)| p.window(from, now)),
+            etw,
+            etw_counts,
+            cursor_moved_px,
+        };
+        self.tick.stall_watch.report(&Stall { gap }, now, &evidence);
+    }
+}
+
 impl StallWatch {
     /// Log a stall, correlate OS display events, and name the cause once the
     /// cadence is metronomic.

@@ -327,7 +327,7 @@ pub(crate) fn params(width: u32, height: u32, hdr: bool, wire_seq_base: u32) -> 
 /// Whole sessions over the fake: the stream loop's sequence each tick — the encoder's clocks
 /// in, the source's tick, then every access unit the encoder owes — through the far side's
 /// resizes, colour changes, wedges and resets.
-mod sessions {
+pub(crate) mod sessions {
     use super::*;
     use crate::windows::remote::source::{Geometry, Local, NoRungs, RemoteSource};
     use crate::windows::remote::supervisor::Supervision;
@@ -351,16 +351,16 @@ mod sessions {
     type Tick = (Option<(u32, u32)>, Vec<(String, bool)>);
 
     /// The stream loop's side of one session.
-    struct Loop {
-        src: RemoteSource<FakeTransport>,
-        far: Arc<Mutex<FarSide>>,
+    pub(crate) struct Loop {
+        pub(crate) src: RemoteSource<FakeTransport>,
+        pub(crate) far: Arc<Mutex<FarSide>>,
         enc: Option<Box<dyn Encoder>>,
         /// Wire indexes handed out so far: the next encoder's base.
         au_seq: u32,
     }
 
     impl Loop {
-        fn new(site: EncoderSite, supervision: Supervision, geometry: Geometry) -> Self {
+        pub(crate) fn new(site: EncoderSite, supervision: Supervision, geometry: Geometry) -> Self {
             let (transport, far) = transport(site);
             let src = RemoteSource::new(
                 transport,
@@ -377,13 +377,13 @@ mod sessions {
             }
         }
 
-        fn far(&self) -> MutexGuard<'_, FarSide> {
+        pub(crate) fn far(&self) -> MutexGuard<'_, FarSide> {
             lock(&self.far)
         }
 
         /// One tick: `tick` stands for the source's own (`try_latest`) or the IDD wrapper's
         /// composition of the same phases.
-        fn run(
+        pub(crate) fn run(
             &mut self,
             tick: impl FnOnce(&mut RemoteSource<FakeTransport>) -> Result<Option<CapturedFrame>>,
         ) -> Result<Tick> {
@@ -410,7 +410,7 @@ mod sessions {
 
         /// Open the encoder for `geometry` at the loop's next wire index. The old proxy drops
         /// after its replacement opened, as the loop's rebuild drops it.
-        fn open(&mut self, geometry: Geometry) {
+        pub(crate) fn open(&mut self, geometry: Geometry) {
             let hdr = geometry.format == PixelFormat::P010;
             let params = params(geometry.width, geometry.height, hdr, self.au_seq);
             let remote = self.src.remote_encoder().expect("a remote encoder");

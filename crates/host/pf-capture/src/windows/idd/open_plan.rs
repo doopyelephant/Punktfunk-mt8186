@@ -3,7 +3,7 @@
 //!
 //! [`plan_open`] turns what the session asked ([`OpenAsk`]) and what the host knows before
 //! the open ([`DisplayFacts`]) into [`OpenStep`]s. [`run_colour`] runs the display's steps
-//! over `DisplayColour`, with their 250 ms settle loops and log lines; `idd_push/open.rs` runs
+//! over `DisplayColour`, with their 250 ms settle loops and log lines; `idd/open.rs` runs
 //! the rest (the broker, the cursor channel, the diagnostics) and builds the capturer.
 //!
 //! Pure but for the seam, so a test per session kind runs the plan over a scripted display
