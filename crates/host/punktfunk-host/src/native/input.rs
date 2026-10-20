@@ -905,6 +905,12 @@ impl WirePads {
         Some(idx)
     }
 
+    /// Open every pad's seq gate. A client stamps a seq on each refresh even while its sends
+    /// are filtered, so after a gamepad grant comes back its seq can sit anywhere ahead.
+    fn forget_seqs(&mut self) {
+        self.seq = [None; MAX_WIRE_PADS];
+    }
+
     /// Whether `snap` moves the pad: newer than the gate, and its first state or another one.
     fn changes(&self, snap: &punktfunk_core::input::GamepadSnapshot) -> bool {
         let idx = snap.pad as usize;
@@ -1199,7 +1205,11 @@ pub(super) fn input_thread(
         // of what it holds now, or a key, button or stick stays down for the session.
         let now_granted = grants.load(Ordering::Relaxed);
         let lost = granted & !now_granted;
+        let gained = now_granted & !granted;
         granted = now_granted;
+        if gained & punktfunk_core::quic::GRANT_GAMEPAD != 0 {
+            wire.forget_seqs();
+        }
         if lost != 0 {
             use punktfunk_core::quic::{GRANT_GAMEPAD, GRANT_KEYBOARD, GRANT_POINTER};
             let ups = held.release_classes(lost & GRANT_KEYBOARD != 0, lost & GRANT_POINTER != 0);
@@ -1747,6 +1757,32 @@ mod tests {
         };
         assert_eq!(wire.snapshot(replug, true), Some(1));
         assert_eq!(wire.attached().collect::<Vec<_>>(), [1]);
+    }
+
+    /// The client's seq moved on while the gamepad grant was off; once it is back, the
+    /// next snapshot lands wherever that seq now is.
+    #[test]
+    fn a_regained_grant_opens_the_seq_gate() {
+        use punktfunk_core::input::GamepadSnapshot;
+        let mut wire = WirePads::default();
+        let beacon = |seq| GamepadSnapshot {
+            pad: 0,
+            seq,
+            ..Default::default()
+        };
+        assert_eq!(wire.snapshot(beacon(1), true), Some(0));
+        // 20 s of 10 Hz refreshes the host never saw.
+        let later = GamepadSnapshot {
+            buttons: 1,
+            ..beacon(1u8.wrapping_add(200))
+        };
+        assert_eq!(
+            wire.snapshot(later, true),
+            None,
+            "read as older than the gate"
+        );
+        wire.forget_seqs();
+        assert_eq!(wire.snapshot(later, true), Some(0));
     }
 
     /// A parked controller's beacon and gyro are not a person: only input that moves
