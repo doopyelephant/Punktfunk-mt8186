@@ -105,7 +105,16 @@ impl Presenter {
             Plan::Skip => {}
             Plan::Drop => return Ok(Applied::Dropped),
             Plan::PickMode(pref) => return self.pick_mode(window, pref),
-            Plan::Flip { on } => return self.set_hdr_mode(window, on),
+            // Minimized (a zero surface extent SDL never reports): the rebuild after the
+            // flip would keep the old swapchain under the new passes. The flip waits; the
+            // restore's resize rebuilds and the next tick asks again.
+            Plan::Flip { on } => {
+                let (_, extent) = self.surface_extent(window)?;
+                if extent.width == 0 || extent.height == 0 {
+                    return Ok(Applied::Dropped);
+                }
+                return self.set_hdr_mode(window, on);
+            }
             Plan::Rebuild => return self.rebuild_swapchain(window),
             #[cfg(target_os = "linux")]
             Plan::Resume => return self.resume_swapchain(window),
