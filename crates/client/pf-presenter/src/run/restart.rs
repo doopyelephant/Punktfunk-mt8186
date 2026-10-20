@@ -4,10 +4,9 @@
 //! with that codec excluded. [`restart_for`] decides from the event and [`RestartFacts`];
 //! `Shell::restart` in `stream.rs` performs it. `None` ends the stream as the event says.
 //! The table test pins every branch.
-#![cfg_attr(not(test), allow(dead_code))]
 
-use pf_client_core::session::{SessionEvent, WAKE_SETTLE};
-use punktfunk_core::client::PunktfunkEndReason;
+use super::session::WAKE_SETTLE;
+use super::{PunktfunkEndReason, SessionEvent, StreamState};
 use std::time::{Duration, Instant};
 
 /// How the stream's host is dialled again.
@@ -49,7 +48,21 @@ pub(crate) struct RestartFacts {
     pub now: Instant,
 }
 
-/// The restart `ev` calls for, or `None` when the stream ends as `ev` says.
+impl RestartFacts {
+    pub(super) fn of(st: &StreamState) -> RestartFacts {
+        RestartFacts {
+            redials: st.redials,
+            canceled: st.canceled,
+            keep_mic_muted: st.handle.mic.muted(),
+            settle_until: st.params.settle_until,
+            exclude_codecs: st.params.exclude_codecs,
+            now: Instant::now(),
+        }
+    }
+}
+
+/// The restart `ev` calls for, or `None` when the stream ends as `ev` says. Single and browse
+/// mode restart alike: single has no console to fall back to.
 pub(crate) fn restart_for<'a>(ev: &'a SessionEvent, f: &RestartFacts) -> Option<Restart<'a>> {
     match ev {
         // A failed dial counts only as a redial's next attempt.
