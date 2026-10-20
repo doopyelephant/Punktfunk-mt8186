@@ -142,6 +142,9 @@ fn output_for(monitor: isize) -> Option<IDXGIOutput> {
     None
 }
 
+/// 1 ms: no panel refreshes faster, so an answer inside it is no vblank.
+const MIN_VBLANK_NS: u64 = 1_000_000;
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     monitor: isize,
@@ -164,15 +167,24 @@ fn run(
     let mut spans: Vec<u64> = Vec::with_capacity(REFRESH_SPANS);
     while !stop.load(Ordering::Acquire) {
         // SAFETY: a COM call on the live output; it blocks until the monitor's next vblank.
-        let waited = output
+        let answered = output
             .as_ref()
             .is_some_and(|o| unsafe { o.WaitForVBlank() }.is_ok());
-        if !waited {
+        if !answered {
             // Output gone (mode change, undock) until a retarget: keep the queue moving.
             output = None;
             std::thread::sleep(Duration::from_millis(16));
         }
         let vblank_ns = pf_client_core::session::now_ns();
+        // An answer inside a millisecond (a sleeping or duplicated output) is no vblank: it
+        // would spin this boosted thread and read a microsecond "refresh".
+        let instant = answered
+            && last_vblank_ns != 0
+            && vblank_ns.saturating_sub(last_vblank_ns) < MIN_VBLANK_NS;
+        if instant {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let waited = answered && !instant;
         if !waited {
             spans.clear();
             refresh_ns.store(0, Ordering::Relaxed);
@@ -184,7 +196,7 @@ fn run(
                 spans.clear();
             }
         }
-        last_vblank_ns = if waited { vblank_ns } else { 0 };
+        last_vblank_ns = if answered { vblank_ns } else { 0 };
         // Presents handed over during the wait are candidates for this vblank too.
         loop {
             match rx.try_recv() {
