@@ -534,4 +534,92 @@ mod sessions {
             ("encoder_reset", "applied")
         );
     }
+
+    /// The worker's session, classify-only, through the source's own `try_latest`: a stalled
+    /// encoder or a quiet mirror never raises a rung, and the worker's exit ends the source.
+    #[test]
+    fn a_worker_session_runs_over_the_same_fake() {
+        let hd = geometry(1920, 1080, PixelFormat::Nv12);
+        let classify = Supervision::Classify {
+            idle_after: Duration::from_secs(2),
+        };
+        let mut s = Loop::new(EncoderSite::Worker, classify, hd);
+        let latest = |s: &mut RemoteSource<FakeTransport>| s.try_latest();
+        // The first frame within the source's own wait; the open plants one section.
+        let first = s.src.next_frame(crate::FirstFrame::Default).unwrap();
+        assert_eq!((first.width, first.height), (1920, 1080));
+        assert_eq!(
+            s.src.remote_encoder().map(|r| r.site()),
+            Some(EncoderSite::Worker)
+        );
+        s.open(hd);
+        assert_eq!(s.far().set_encodes.len(), 1);
+        s.far().frame(true);
+        assert_eq!(
+            s.run(latest).unwrap(),
+            (Some((1920, 1080)), vec![au("au0", true)])
+        );
+
+        // Frames flow and the encoder publishes nothing for 20 s: the ladder's encoder stall,
+        // which classify-only never names.
+        for _ in 0..80 {
+            clock::advance(STEP);
+            s.far().compose();
+            assert_eq!(s.run(latest).unwrap(), (Some((1920, 1080)), vec![]));
+            assert_eq!(s.class(), "healthy");
+            assert!(s.events().is_empty());
+        }
+        // A still desktop: healthy under 2 s, idle past it, never stalled.
+        let mut classes = Vec::new();
+        for _ in 0..16 {
+            clock::advance(STEP);
+            assert_eq!(s.run(latest).unwrap(), (None, vec![]));
+            classes.push(s.class());
+        }
+        assert_eq!(classes[..7], ["healthy"; 7]);
+        assert_eq!(classes[7..], ["idle"; 9]);
+        assert!(s.events().is_empty());
+
+        // The worker reports a new size: it is delivered over the still desktop, and the
+        // re-opened encoder's fresh section is no news until its pool takes a frame.
+        let resized = TransportEvent::Resized {
+            width: 2560,
+            height: 1440,
+        };
+        s.far().news.push_back(Ok(vec![resized]));
+        assert_eq!(s.run(latest).unwrap().0, Some((2560, 1440)));
+        s.open(geometry(2560, 1440, PixelFormat::Nv12));
+        assert_eq!(s.run(latest).unwrap().0, None);
+        assert!(s.src.colour().hdr_meta.is_none());
+
+        // The secure desktop is named first.
+        s.far().secure = true;
+        clock::advance(STEP);
+        s.run(latest).unwrap();
+        assert_eq!(s.class(), "secure_desktop");
+        s.far().secure = false;
+
+        // A loop-side reset keeps the wire order and opens no episode.
+        assert!(s.enc.as_mut().unwrap().reset());
+        let reset = s.far().ctls.last().copied().unwrap();
+        assert_eq!((reset.op, reset.arg0), (encode::ENCODE_CTL_RESET, 1));
+        let mut read = Vec::new();
+        for _ in 0..2 {
+            clock::advance(STEP);
+            s.far().frame(false);
+            read.extend(s.run(latest).unwrap().1);
+        }
+        assert_eq!(read, [au("au1", false), au("au2", false)]);
+        let health = s.src.health();
+        assert!(health.current_stage.is_none() && health.last_episode.is_none());
+        assert!(s.events().is_empty());
+
+        // The worker exits: the source says so between ticks and ends at the next one.
+        s.far().exited = true;
+        let exited = anyhow::anyhow!("capture worker exited (code 1)");
+        s.far().news.push_back(Err(exited));
+        assert!(!s.src.is_alive());
+        let err = s.run(latest).unwrap_err();
+        assert!(format!("{err:#}").contains("capture worker exited (code 1)"));
+    }
 }
