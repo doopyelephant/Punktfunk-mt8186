@@ -537,7 +537,6 @@ mod tests {
             format_result_tx: tokio::sync::mpsc::unbounded_channel().0,
             format_facts: crate::native::handshake::FormatFacts {
                 video_caps: 0,
-                mode,
                 compositor: None,
                 gamescope_route: None,
             },

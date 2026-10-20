@@ -391,7 +391,9 @@ impl StreamState {
         let Some(codec) = self.format_rx.try_iter().last() else {
             return;
         };
-        let (bit_depth, hdr, chroma) = self.format_facts.resolve(codec, &self.encoder);
+        let (bit_depth, hdr, chroma) =
+            self.format_facts
+                .resolve(codec, &self.encoder, self.cur_mode);
         let (old_plan, old_depth) = (self.plan, self.bit_depth);
         self.plan = super::pipeline::resolve_plan(
             &self.encoder,

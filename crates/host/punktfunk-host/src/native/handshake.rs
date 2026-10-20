@@ -459,6 +459,7 @@ pub(super) async fn negotiate(
         FormatFacts::of(&hello, compositor, gamescope_route.as_ref()),
         codec,
         encoder.clone(),
+        hello.mode,
     )
     .await?;
 
@@ -1054,7 +1055,6 @@ async fn negotiate_compositor(
 #[derive(Clone)]
 pub(super) struct FormatFacts {
     pub(super) video_caps: u8,
-    pub(super) mode: punktfunk_core::Mode,
     pub(super) compositor: Option<crate::vdisplay::Compositor>,
     pub(super) gamescope_route: Option<crate::vdisplay::GamescopeRoute>,
 }
@@ -1067,18 +1067,20 @@ impl FormatFacts {
     ) -> FormatFacts {
         FormatFacts {
             video_caps: hello.video_caps,
-            mode: hello.mode,
             compositor,
             gamescope_route: gamescope_route.cloned(),
         }
     }
 
-    /// Bit depth, HDR verdict, and chroma for `codec`, each gated by host, client, codec,
-    /// source, and `encoder`, the session's resolution. Blocks on its probes.
+    /// Bit depth, HDR verdict, and chroma for `codec` at `mode`, each gated by host, client,
+    /// codec, source, and `encoder`, the session's resolution. `mode` is the one the pipeline
+    /// opens at: the Hello's at the handshake, the live one on a codec change. Blocks on its
+    /// probes.
     pub(super) fn resolve(
         &self,
         codec: crate::encode::Codec,
         encoder: &crate::encode::Resolved,
+        mode: punktfunk_core::Mode,
     ) -> (u8, bool, crate::encode::ChromaFormat) {
         let (compositor, gamescope_route) = (self.compositor, self.gamescope_route.as_ref());
         // 10-bit only when host, client, codec, capture, and GPU all allow it. Resolved before
@@ -1180,10 +1182,10 @@ impl FormatFacts {
         // before Welcome.
         let chroma = if codec == crate::encode::Codec::PyroWave
             && chroma.is_444()
-            && !crate::encode::pyrowave_mode_fits_rdo(self.mode.width, self.mode.height, true)
+            && !crate::encode::pyrowave_mode_fits_rdo(mode.width, mode.height, true)
         {
             tracing::warn!(
-                mode = %format_args!("{}x{}", self.mode.width, self.mode.height),
+                mode = %format_args!("{}x{}", mode.width, mode.height),
                 "PyroWave 4:4:4 at this mode exceeds the rate controller's block-index range — \
                  negotiating 4:2:0"
             );
@@ -1226,8 +1228,9 @@ async fn negotiate_video_format(
     facts: FormatFacts,
     codec: crate::encode::Codec,
     encoder: Arc<crate::encode::Resolved>,
+    mode: punktfunk_core::Mode,
 ) -> Result<(u8, bool, crate::encode::ChromaFormat)> {
-    tokio::task::spawn_blocking(move || facts.resolve(codec, &encoder))
+    tokio::task::spawn_blocking(move || facts.resolve(codec, &encoder, mode))
         .await
         .context("video format probe task")
 }
