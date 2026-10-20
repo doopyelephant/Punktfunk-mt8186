@@ -7,12 +7,12 @@
 //! when it already fits and otherwise writes into a scratch buffer reused across frames, so a
 //! CPU frame allocates only when it outgrows the last one. 24-bit pixels gain an opaque pad
 //! byte; formats the stage does not lay out (10-bit packed, YUV) pass through for the backend
-//! to take or refuse.
+//! to take or refuse. A packed payload short of its frame is refused before any device copy.
 //!
 //! Each row of `stage_table` names the layout it pins. Design: `design/pf-encode-overhaul.md`
 //! §4.5.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 
 /// The channel order a backend stages.
@@ -49,6 +49,22 @@ impl CpuIngest {
         let FramePayload::Cpu(bytes) = &frame.payload else {
             bail!("stage a CPU frame: the payload holds no CPU pixels");
         };
+        // A short payload would leave the last frame's tail in a backend's staging buffer.
+        if !matches!(
+            frame.format,
+            PixelFormat::Nv12 | PixelFormat::P010 | PixelFormat::Yuv444
+        ) {
+            let px = u64::from(frame.width) * u64::from(frame.height);
+            let need = px.saturating_mul(frame.format.bytes_per_pixel() as u64);
+            ensure!(
+                bytes.len() as u64 >= need,
+                "CPU frame {}x{} {:?} needs {need} bytes, got {}",
+                frame.width,
+                frame.height,
+                frame.format,
+                bytes.len()
+            );
+        }
         let bgra = target == Target::BFirst;
         let (fmt, bytes) = normalize_cpu_rgb(frame.format, bytes, &mut self.scratch, bgra);
         Ok(Staging {
@@ -176,10 +192,22 @@ mod tests {
                 )),
             ),
             (
-                "a short payload stages its whole pixels",
+                "refuse a short 24-bit payload",
                 frame(P::Rgb, (2, 1), &[1, 2, 3, 4, 5]),
                 Target::AsCaptured,
-                Some((P::Rgbx, vec![1, 2, 3, FF], 8, false)),
+                None,
+            ),
+            (
+                "refuse a short 32-bit payload, even one it would borrow",
+                frame(P::Bgrx, (2, 2), &[0; 12]),
+                Target::BFirst,
+                None,
+            ),
+            (
+                "leave a YUV payload's size to the backend",
+                frame(P::Nv12, (2, 2), &[0; 6]),
+                Target::BFirst,
+                Some((P::Nv12, vec![0; 6], 8, true)),
             ),
             (
                 "a frame without CPU pixels is refused",
