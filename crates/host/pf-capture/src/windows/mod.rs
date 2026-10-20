@@ -22,6 +22,10 @@ mod cursor_state;
 // the driver's encoder. Pure over the colour seam, so its table runs on every target.
 #[path = "idd_push/depth_pin.rs"]
 mod depth_pin;
+// The IDD-push open as a plan of steps, and the display's half run over the colour seam. Pure
+// but for the seam, so a test per session kind runs on every target.
+#[path = "idd_push/open_plan.rs"]
+mod open_plan;
 // The IDD-push stall model: holes in DWM delivery and their verdicts. Pure over `Instant`s,
 // so its tests run on every target; `idd_push/stall.rs` writes the report.
 mod stall_model;

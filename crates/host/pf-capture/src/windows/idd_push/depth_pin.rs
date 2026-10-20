@@ -10,8 +10,8 @@
 //! The open and a re-arrival settle their pins for up to 250 ms: [`settle`], [`reassert_hdr`]
 //! and [`pin_wcg`] run those loops over the seam, and [`hdr_at_open`], [`hdr_reasserted`] and
 //! [`wcg_verdict`] decide what they settled at. All of it compiles on every target, so the
-//! table below and the scripted display (`fake`) run on Linux and the Mac. A row per depth
-//! defect that reached a user.
+//! table below and the scripted display (`fake`) run on Linux and the Mac. A row per behaviour,
+//! named for its fix where one exists; a new depth defect adds its row first.
 
 // Off Windows only the tests read this module.
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -264,7 +264,8 @@ impl DepthPin {
         vec![PinAction::ReopenEncoder { from, to: now }]
     }
 
-    fn descriptor(&self, (width, height): (u32, u32)) -> DisplayDescriptor {
+    /// What the display composes at `mode`, as the descriptor poller reports it.
+    pub(crate) fn descriptor(&self, (width, height): (u32, u32)) -> DisplayDescriptor {
         DisplayDescriptor {
             hdr: self.composed.hdr,
             wcg: self.composed.wcg,
@@ -449,7 +450,7 @@ pub(crate) mod fake {
     pub(crate) struct FakeColour(Mutex<State>);
 
     impl FakeColour {
-        /// An SDR display at no readable mode, every write taking.
+        /// A display composing `mode`, every write taking.
         pub(crate) fn new(mode: ColorMode) -> FakeColour {
             let script = Script {
                 mode: Some(mode),
