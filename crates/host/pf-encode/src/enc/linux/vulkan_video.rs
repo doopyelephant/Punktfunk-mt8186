@@ -3040,14 +3040,18 @@ impl VulkanVideoEncoder {
                 vk::Fence::null(),
             )?;
             let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
-            dev.queue_submit(
+            if let Err(e) = dev.queue_submit(
                 self.encode_queue,
                 &[vk::SubmitInfo::default()
                     .command_buffers(&ecmds)
                     .wait_semaphores(&sems)
                     .wait_dst_stage_mask(&wait_stages)],
                 fence,
-            )?;
+            ) {
+                // The compute batch is queued and signals `csc_sem` with no waiter.
+                self.encode_submit_failed(slot);
+                return Err(e.into());
+            }
         } else {
             dev.queue_submit(
                 self.encode_queue,
