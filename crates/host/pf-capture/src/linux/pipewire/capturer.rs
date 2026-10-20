@@ -21,7 +21,9 @@ use super::thread::{pipewire_thread, PwCtl};
 use super::CaptureOpts;
 use crate::knobs::Knobs;
 use crate::linux::portal::portal_thread;
-use crate::linux::{drain_edges, health_identity, xfixes_cursor, CaptureSignals};
+use crate::linux::{
+    drain_edges, health_identity, xfixes_cursor, CaptureSignals, Negotiation, StreamStatus,
+};
 use crate::{CapturedFrame, Capturer, FramePayload, ZeroCopyPolicy};
 use anyhow::{anyhow, Context, Result};
 use std::os::fd::OwnedFd;
@@ -255,7 +257,7 @@ impl PortalCapturer {
             xfixes_cursor::XFixesCursorSource::spawn(
                 targets,
                 Arc::clone(&capturer.signals.cursor_live),
-                Arc::clone(&capturer.signals.frame_size),
+                Arc::clone(&capturer.signals.negotiation),
             )
         });
         Ok(capturer)
@@ -425,7 +427,7 @@ impl Capturer for PortalCapturer {
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        if self.signals.broken.load(Ordering::Relaxed) {
+        if self.signals.status() == StreamStatus::Broken {
             return Err(anyhow!(
                 "zero-copy GPU import lost (node {}): the import worker died, or a tiled or \
                  planar offer failed — rebuilding capture",
@@ -439,7 +441,7 @@ impl Capturer for PortalCapturer {
         if producer_gone && latest.is_none() {
             return Err(anyhow!("PipeWire capture thread ended"));
         }
-        if latest.is_some() || self.signals.streaming.load(Ordering::Relaxed) {
+        if latest.is_some() || self.signals.status().is_streaming() {
             self.stall_since = None;
             return Ok(latest);
         }
@@ -459,13 +461,11 @@ impl Capturer for PortalCapturer {
         Ok(latest)
     }
 
-    /// Sticky terminal states, no frame consumed. Thread-exited is otherwise
-    /// indistinguishable from idle (`streaming` keeps its last value). A
-    /// static desktop stays `Streaming` (no buffers) and is not reported dead.
+    /// `Streaming` on a running loop thread, no frame consumed. A thread that exited keeps
+    /// its last status, so the join handle decides. A static desktop stays `Streaming` (no
+    /// buffers) and is not reported dead.
     fn is_alive(&self) -> bool {
-        !self.signals.broken.load(Ordering::Relaxed)
-            && self.signals.streaming.load(Ordering::Relaxed)
-            && self.join.as_ref().is_some_and(|j| !j.is_finished())
+        self.signals.status().is_streaming() && self.join.as_ref().is_some_and(|j| !j.is_finished())
     }
 
     /// A re-sent buffer since the last call: the frame encoded from the earlier read may be
@@ -481,17 +481,14 @@ impl Capturer for PortalCapturer {
         }
     }
 
-    /// [`pf_frame::hdr::generic_hdr10`] once 10-bit PQ negotiated. Neither Linux producer
+    /// [`pf_frame::hdr::generic_hdr10`] once 10-bit PQ is fixated. Neither Linux producer
     /// exposes mastering through the screencast (Mutter has none; gamescope's
     /// `VK_EXT_hdr_metadata` stops at the compositor). The native loop prefers the client's
     /// volume when sent (`Hello::display_hdr`).
     fn colour(&self) -> crate::ColourFacts {
+        let hdr = self.signals.negotiation().fixated.is_some_and(|f| f.hdr);
         crate::ColourFacts {
-            hdr_meta: self
-                .signals
-                .hdr_negotiated
-                .load(Ordering::Relaxed)
-                .then(pf_frame::hdr::generic_hdr10),
+            hdr_meta: hdr.then(pf_frame::hdr::generic_hdr10),
             sdr_fp16: false,
         }
     }
@@ -510,7 +507,7 @@ impl crate::Feed for PortalCapturer {
         // A driven producer paints on its own requests (`pacer::Pacer`), so
         // this wait never triggers a paint. It returns on a finished render, not on an
         // arrival: the producer sends a buffer before it has painted it.
-        if !self.signals.broken.load(Ordering::Relaxed) {
+        if self.signals.status() != StreamStatus::Broken {
             let _ = wait_ready(&self.queue, &self.wake, &self.poked, deadline);
         }
     }
@@ -594,19 +591,18 @@ pub(super) enum TimeoutOffer {
 }
 
 fn classify_first_frame_timeout(
-    negotiated: bool,
+    negotiation: Negotiation,
     hdr_offer: bool,
     vaapi_dmabuf: bool,
-    gpu_dmabuf_offer: bool,
     zerocopy_forced: bool,
 ) -> TimeoutOffer {
-    if negotiated {
+    if negotiation.fixated.is_some() {
         TimeoutOffer::NoBuffers
     } else if hdr_offer {
         TimeoutOffer::Hdr
     } else if vaapi_dmabuf && !zerocopy_forced {
         TimeoutOffer::RawDmabuf
-    } else if gpu_dmabuf_offer && !zerocopy_forced {
+    } else if negotiation.gpu_offer && !zerocopy_forced {
         TimeoutOffer::GpuDmabuf
     } else {
         TimeoutOffer::NoFormat
@@ -642,7 +638,7 @@ impl PortalCapturer {
         let started = std::time::Instant::now();
         let deadline = started + budget;
         loop {
-            if self.signals.broken.load(Ordering::Relaxed) {
+            if self.signals.status() == StreamStatus::Broken {
                 return Err(anyhow!(
                     "zero-copy GPU import lost (node {}): the import worker died, or a tiled or \
                      planar offer failed — rebuilding capture",
@@ -656,7 +652,7 @@ impl PortalCapturer {
                 return Ok(f);
             }
             // Judged like an expired wait, over the time actually spent.
-            if self.signals.errored.load(Ordering::Relaxed) {
+            if self.signals.status() == StreamStatus::Errored {
                 let spent = started.elapsed();
                 return self.next_frame_timed_out(RecvTimeoutError::Timeout, spent, verdict);
             }
@@ -771,10 +767,9 @@ impl PortalCapturer {
         match err {
             RecvTimeoutError::Timeout => {
                 let offer = classify_first_frame_timeout(
-                    self.signals.negotiated.load(Ordering::Relaxed),
+                    self.signals.negotiation(),
                     self.hdr_offer,
                     self.vaapi_dmabuf,
-                    self.signals.gpu_dmabuf_offer.load(Ordering::Relaxed),
                     pf_zerocopy::zerocopy_forced(),
                 );
                 let convicted = timeout_convicts(offer, verdict);
@@ -877,6 +872,7 @@ impl Drop for PortalCapturer {
 #[cfg(test)]
 mod first_frame_timeout_tests {
     use super::{classify_first_frame_timeout, timeout_convicts, TimeoutOffer, TimeoutVerdict};
+    use crate::linux::{Fixated, Negotiation};
 
     #[test]
     fn a_provisional_expiry_convicts_no_offer_whatever_was_on_the_table() {
@@ -922,37 +918,38 @@ mod first_frame_timeout_tests {
         ));
     }
 
+    /// Each verdict outranks every one after it: with its own cause and every later cause
+    /// present, it is the one named. HDR outranks the dmabuf arms — it is the offer that failed.
     #[test]
     fn classification_mirrors_the_negotiation_state_precedence() {
-        assert_eq!(
-            classify_first_frame_timeout(true, true, true, true, false),
-            TimeoutOffer::NoBuffers
-        );
-        // HDR outranks the dmabuf arms — it is the offer that failed.
-        assert_eq!(
-            classify_first_frame_timeout(false, true, true, true, false),
-            TimeoutOffer::Hdr
-        );
-        assert_eq!(
-            classify_first_frame_timeout(false, false, true, true, false),
-            TimeoutOffer::RawDmabuf
-        );
-        assert_eq!(
-            classify_first_frame_timeout(false, false, false, true, false),
-            TimeoutOffer::GpuDmabuf
-        );
-        assert_eq!(
-            classify_first_frame_timeout(false, false, false, false, false),
-            TimeoutOffer::NoFormat
-        );
+        use TimeoutOffer::*;
+        let order = [NoBuffers, Hdr, RawDmabuf, GpuDmabuf, NoFormat];
+        let fixated = Fixated {
+            hdr: false,
+            size: (1, 1),
+        };
+        for (rank, &want) in order.iter().enumerate() {
+            let cause = |offer| order[rank..].contains(&offer);
+            let negotiation = Negotiation {
+                gpu_offer: cause(GpuDmabuf),
+                fixated: cause(NoBuffers).then_some(fixated),
+            };
+            let got =
+                classify_first_frame_timeout(negotiation, cause(Hdr), cause(RawDmabuf), false);
+            assert_eq!(got, want);
+        }
     }
 
     #[test]
     fn a_forced_zerocopy_keeps_both_dmabuf_arms_erroring_loudly_instead_of_implicated() {
         // `PUNKTFUNK_ZEROCOPY=1` is the operator insisting on the path —
         // timeout falls through to the generic diagnosis and never latches.
+        let offered = Negotiation {
+            gpu_offer: true,
+            fixated: None,
+        };
         assert_eq!(
-            classify_first_frame_timeout(false, false, true, true, true),
+            classify_first_frame_timeout(offered, false, true, true),
             TimeoutOffer::NoFormat
         );
     }
@@ -962,7 +959,7 @@ mod first_frame_timeout_tests {
 #[cfg(test)]
 mod status_reader_tests {
     use super::{PortalCapturer, TimeoutVerdict};
-    use crate::linux::CaptureSignals;
+    use crate::linux::{CaptureSignals, StreamStatus};
     use crate::{CapturedFrame, Capturer, Feed, FramePayload, PixelFormat};
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::sync::mpsc::{channel, sync_channel, Sender, SyncSender};
@@ -990,16 +987,23 @@ mod status_reader_tests {
     /// Leave `s` as the loop thread's writes leave it at `at`.
     fn settle(s: &CaptureSignals, at: At, hdr: bool) {
         use At::*;
-        let fixated = !matches!(at, Fresh | ErroredUnfixated | StreamingUnfixated);
-        let streaming = matches!(at, Streaming | Driving | Broken | StreamingUnfixated);
-        let errored = matches!(at, ErroredUnfixated | Errored | BrokenErrored);
-        s.negotiated.store(fixated, Relaxed);
-        s.hdr_negotiated.store(fixated && hdr, Relaxed);
-        s.streaming.store(streaming, Relaxed);
-        s.driving.store(matches!(at, Driving), Relaxed);
-        s.errored.store(errored, Relaxed);
-        s.broken
-            .store(matches!(at, Broken | BrokenErrored), Relaxed);
+        let idle = StreamStatus::Streaming { driving: false };
+        if !matches!(at, Fresh | ErroredUnfixated | StreamingUnfixated) {
+            s.fixate(crate::linux::Fixated { hdr, size: (1, 1) });
+        }
+        let reports: &[StreamStatus] = match at {
+            Fresh | Fixated => &[],
+            Streaming | Broken | StreamingUnfixated => &[idle],
+            Driving => &[StreamStatus::Streaming { driving: true }],
+            Paused => &[idle, StreamStatus::Paused],
+            ErroredUnfixated | Errored | BrokenErrored => &[StreamStatus::Errored],
+        };
+        for &r in reports {
+            s.report(r);
+        }
+        if matches!(at, Broken | BrokenErrored) {
+            s.mark_broken();
+        }
     }
 
     /// A capturer at `at` with an empty queue. Fields drop in order: the parked loop thread

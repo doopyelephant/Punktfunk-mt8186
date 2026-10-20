@@ -788,10 +788,10 @@ fn spawn(
                         tracing::debug!(error = %format!("{e:#}"), "direct wayland capture stopped during teardown");
                     } else {
                         tracing::error!(error = %format!("{e:#}"), "direct wayland capture failed");
-                        signals.broken.store(true, Ordering::Relaxed);
+                        signals.mark_broken();
                     }
                 }
-                signals.streaming.store(false, Ordering::Relaxed);
+                signals.report(super::StreamStatus::Paused);
             }
         })
         .context("spawn wayland capture thread")?;
@@ -880,7 +880,7 @@ struct Opened {
 /// Bind the globals, read the output's colour, start the session and build the pool, up to
 /// each buffer wrapped as a `wl_buffer`. Every failure keeps the portal path.
 ///
-/// The streaming and negotiated signals are stored before this returns: the opener must not
+/// `Streaming` and the fixated format are stored before this returns: the opener must not
 /// see a capturer that is not streaming yet.
 fn open(
     output_name: &str,
@@ -1037,12 +1037,8 @@ fn open(
         wake_w,
     });
 
-    signals.streaming.store(true, Ordering::Relaxed);
-    signals.negotiated.store(true, Ordering::Relaxed);
-    signals.hdr_negotiated.store(hdr, Ordering::Relaxed);
-    signals
-        .frame_size
-        .store((u64::from(w) << 32) | u64::from(h), Ordering::Relaxed);
+    signals.report(super::StreamStatus::Streaming { driving: false });
+    signals.fixate(super::Fixated { hdr, size: (w, h) });
     let hdr_meta = color.filter(|_| hdr).map(|c| c.hdr_meta());
     tracing::info!(
         output = output_name,

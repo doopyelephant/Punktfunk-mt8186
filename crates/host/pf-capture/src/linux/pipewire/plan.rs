@@ -439,7 +439,7 @@ pub(in crate::linux) fn gpu_import(
                 "tiled 10-bit dmabuf reached the CUDA import — capture rebuilds on LINEAR"
             );
         }
-        signals.broken.store(true, Ordering::Relaxed);
+        signals.mark_broken();
         return ImportOutcome::Dropped;
     }
     let mut kind = import_kind(
@@ -496,7 +496,7 @@ pub(in crate::linux) fn gpu_import(
                 ImportFailure::LoseStream => {
                     tracing::error!(error = %format!("{e:#}"), dead,
                         "tiled GPU import lost — failing this capture for rebuild");
-                    signals.broken.store(true, Ordering::Relaxed);
+                    signals.mark_broken();
                     ImportOutcome::Dropped
                 }
                 ImportFailure::DropFrame => {

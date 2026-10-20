@@ -1,7 +1,9 @@
 //! [`WlCapturer`]: the encode loop's end of the direct capture thread in [`super`].
 
 use super::spawn;
-use crate::linux::{drain_edges, health_identity, wait_for_frame, CaptureSignals, FrameSlot};
+use crate::linux::{
+    drain_edges, health_identity, wait_for_frame, CaptureSignals, FrameSlot, StreamStatus,
+};
 use crate::{CapturedFrame, Capturer, Feed, FirstFrame, ZeroCopyPolicy};
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,7 +88,7 @@ impl WlCapturer {
             if let Some(f) = self.take_frame() {
                 return Ok(f);
             }
-            if self.signals.broken.load(Ordering::Relaxed) {
+            if self.signals.status() == StreamStatus::Broken {
                 return Err(anyhow!(
                     "direct wayland capture failed on output {}",
                     self.output_name
@@ -101,11 +103,13 @@ impl WlCapturer {
                 ));
             };
             // The thread owns the sender: disconnected means it ended, a panic included,
-            // which never clears `streaming`. A failure set `broken`, which the loop reports.
+            // which leaves the status `Streaming`. A failure is `Broken`, which the loop reports.
             let ended = match self.wake.recv_timeout(left.min(Duration::from_millis(500))) {
                 Ok(()) => false,
-                Err(RecvTimeoutError::Disconnected) => !self.signals.broken.load(Ordering::Relaxed),
-                Err(RecvTimeoutError::Timeout) => !self.signals.streaming.load(Ordering::Relaxed),
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.signals.status() != StreamStatus::Broken
+                }
+                Err(RecvTimeoutError::Timeout) => !self.signals.status().is_streaming(),
             };
             if ended {
                 return self
@@ -126,7 +130,7 @@ impl Capturer for WlCapturer {
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        if self.signals.broken.load(Ordering::Relaxed) {
+        if self.signals.status() == StreamStatus::Broken {
             return Err(anyhow!(
                 "direct wayland capture lost on output {} — rebuilding capture",
                 self.output_name
@@ -143,7 +147,7 @@ impl Capturer for WlCapturer {
     }
 
     fn is_alive(&self) -> bool {
-        !self.signals.broken.load(Ordering::Relaxed)
+        self.signals.status() != StreamStatus::Broken
             && self.join.as_ref().is_some_and(|j| !j.is_finished())
     }
 
@@ -161,7 +165,7 @@ impl Capturer for WlCapturer {
 
 impl Feed for WlCapturer {
     fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        wait_for_frame(&self.slot, &self.wake, &self.signals.broken, deadline);
+        wait_for_frame(&self.slot, &self.wake, &self.signals, deadline);
     }
 
     fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
@@ -180,7 +184,7 @@ impl Drop for WlCapturer {
 
 #[cfg(test)]
 mod wl_capturer_tests {
-    use super::{CaptureSignals, Capturer, WlCapturer};
+    use super::{CaptureSignals, Capturer, StreamStatus, WlCapturer};
     use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::sync_channel;
     use std::sync::Arc;
@@ -220,10 +224,15 @@ mod wl_capturer_tests {
         Broken,
     }
 
+    /// Leave `s` as `open` and the thread's end leave it at `at`.
     fn settle(s: &CaptureSignals, at: At) {
-        use std::sync::atomic::Ordering::Relaxed;
-        s.streaming.store(matches!(at, At::Streaming), Relaxed);
-        s.broken.store(matches!(at, At::Broken), Relaxed);
+        s.report(StreamStatus::Streaming { driving: false });
+        if matches!(at, At::Broken) {
+            s.mark_broken();
+        }
+        if !matches!(at, At::Streaming) {
+            s.report(StreamStatus::Paused);
+        }
     }
 
     /// A capturer at `at` with an empty slot. Fields drop in order: the parked thread ends

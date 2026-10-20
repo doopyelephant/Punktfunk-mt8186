@@ -10,6 +10,7 @@ use super::queue::{RenderFence, RENDER_GUARD};
 use super::UserData;
 use crate::linux::pw_cursor::composite_cursor;
 use crate::linux::sync_timeline::{plane_count, StreamBuffers, SyncPoints};
+use crate::linux::StreamStatus;
 use crate::{CapturedFrame, FramePayload, PixelFormat};
 use pf_dmabuf::{ReadMap, Share};
 use pipewire as pw;
@@ -165,12 +166,12 @@ fn handle_passthrough_fallback(ud: &mut UserData, reason: PassthroughFallback) -
                     reason.as_str()
                 );
             }
-            ud.signals.broken.store(true, Ordering::Relaxed);
+            ud.signals.mark_broken();
             false
         }
         PassthroughFallbackAction::DropPlanarAndRebuild => {
             ud.signals.health.refuse(pf_zerocopy::Refusal::Planar);
-            ud.signals.broken.store(true, Ordering::Relaxed);
+            ud.signals.mark_broken();
             false
         }
     }
@@ -283,7 +284,7 @@ pub(super) fn consume_frame(
         return;
     }
     // GPU import lost: skip per-frame work until the rebuild tears this stream down.
-    if ud.signals.broken.load(Ordering::Relaxed) {
+    if ud.signals.status() == StreamStatus::Broken {
         return;
     }
     // Read before `datas` below borrows the same array mutably.
@@ -654,7 +655,7 @@ fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
                  capture rebuilds on LINEAR"
             );
         }
-        ud.signals.broken.store(true, Ordering::Relaxed);
+        ud.signals.mark_broken();
         return true;
     }
     let datas = &*a.datas;
@@ -691,7 +692,7 @@ fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
     if matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010) {
         let health = &ud.signals.health;
         if health.note_raw_import_failure(ud.modifier, "producer NV12 without a hold") {
-            ud.signals.broken.store(true, Ordering::Relaxed);
+            ud.signals.mark_broken();
         }
         return true;
     }

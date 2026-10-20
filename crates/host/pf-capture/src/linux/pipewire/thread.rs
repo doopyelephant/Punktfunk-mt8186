@@ -17,7 +17,7 @@ use crate::linux::pw_pods::{
     SPA_VIDEO_TRANSFER_SMPTE2084,
 };
 use crate::linux::sync_timeline::{hand_back, StreamBuffers, SyncDevice};
-use crate::linux::CaptureSignals;
+use crate::linux::{CaptureSignals, Fixated, StreamStatus};
 use crate::ZeroCopyPolicy;
 use anyhow::{Context, Result};
 use pipewire as pw;
@@ -112,10 +112,7 @@ pub(in crate::linux) fn pipewire_thread(
     let mut offer = resolve_offer(&plan, &policy, &signals.health, &opts);
     // Latch must fire only for an offer actually made — `plan.build_importer` cannot know
     // the importer constructed.
-    signals.gpu_dmabuf_offer.store(
-        offer.want_dmabuf && !plan.vaapi_passthrough && !opts.want_hdr,
-        Ordering::Relaxed,
-    );
+    signals.offer_gpu(offer.want_dmabuf && !plan.vaapi_passthrough && !opts.want_hdr);
     log_resolved_arm(&offer, &plan, &policy, &signals.health, &opts);
 
     // Holds on published frames park their release from whichever thread drops last and wake
@@ -673,11 +670,11 @@ fn on_state_changed(
     // `Streaming` with no buffers is a static desktop. Anything else means the source
     // went away; `try_latest` turns a sustained non-Streaming state into capture-loss
     // so the encode loop rebuilds instead of freezing on the last frame.
-    ud.signals.streaming.store(streaming, Ordering::Relaxed);
-    ud.signals.driving.store(driving, Ordering::Relaxed);
-    if matches!(new, pw::stream::StreamState::Error(_)) {
-        ud.signals.errored.store(true, Ordering::Relaxed);
-    }
+    ud.signals.report(match new {
+        pw::stream::StreamState::Streaming => StreamStatus::Streaming { driving },
+        pw::stream::StreamState::Error(_) => StreamStatus::Errored,
+        _ => StreamStatus::Paused,
+    });
     if let Some(p) = &ud.pacer {
         p.on_streaming(driving);
     }
@@ -725,8 +722,8 @@ fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
     }
     // A fresh struct per pod: the parser writes only the properties a pod carries, so one
     // without `modifier` or `transferFunction` must not inherit the last format's. On `Err`
-    // the format before stays and `negotiated` is not set: a malformed first pod times out
-    // as "no accepted format", not as a format mismatch.
+    // the format before stays and nothing is fixated: a malformed first pod times out as
+    // "no accepted format", not as a format mismatch.
     let mut info = VideoInfoRaw::default();
     if let Err(e) = info.parse(param) {
         tracing::error!(
@@ -737,7 +734,6 @@ fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
         return;
     }
     ud.info = info;
-    ud.signals.negotiated.store(true, Ordering::Relaxed);
     // Renegotiation replaces the pool: cached per-buffer imports key on buffers
     // that no longer exist, and a recycled fd/inode must not resolve to a stale import.
     if let Some(imp) = ud
@@ -750,18 +746,16 @@ fn on_param_changed(ud: &mut UserData, id: u32, param: Option<&Pod>) {
         imp.clear_cache();
     }
     let sz = ud.info.size();
-    // Gamescope cursor source scales root→frame (`xfixes_cursor::scale_to_frame`).
-    ud.signals.frame_size.store(
-        (u64::from(sz.width) << 32) | u64::from(sz.height),
-        Ordering::Relaxed,
-    );
     ud.format = map_format(ud.info.format());
     ud.modifier = ud.info.modifier();
     // A 10-bit format is HDR only when the producer fixated PQ on it: gamescope offers its
     // 10-bit formats under BT.709 too (`sdr10_native`).
     let hdr = ud.format.is_some_and(|f| f.is_ten_bit())
         && ud.info.transfer_function() == SPA_VIDEO_TRANSFER_SMPTE2084;
-    ud.signals.hdr_negotiated.store(hdr, Ordering::Relaxed);
+    ud.signals.fixate(Fixated {
+        hdr,
+        size: (sz.width, sz.height),
+    });
     tracing::info!(
         width = sz.width,
         height = sz.height,
@@ -1141,11 +1135,15 @@ fn install_pacer<'l>(
     let heartbeat = {
         let p = pacer.clone();
         loop_.add_timer(move |_| {
-            // Re-read the role: PipeWire may assign the driver after the Streaming edge.
+            // Re-read the role: PipeWire may assign the driver after the Streaming edge. The
+            // producer's report, not the broken latch: the pacer follows the stream.
+            let StreamStatus::Streaming { driving: was } = signals.reported() else {
+                return;
+            };
             // SAFETY: the stream outlives this timer source (dropped before it).
-            let driving = signals.streaming.load(Ordering::Relaxed)
-                && unsafe { pw::sys::pw_stream_is_driving(p.stream.get()) };
-            if driving != signals.driving.swap(driving, Ordering::Relaxed) {
+            let driving = unsafe { pw::sys::pw_stream_is_driving(p.stream.get()) };
+            if driving != was {
+                signals.report(StreamStatus::Streaming { driving });
                 p.on_streaming(driving);
             }
             if driving {
@@ -1310,7 +1308,7 @@ mod callbacks {
     use super::{
         on_add_buffer, on_param_changed, on_process, on_remove_buffer, realtime_minus_monotonic_ns,
         serialize_pod, video_raw, CaptureSignals, CursorState, DamageGate, Extent, ImportState,
-        Pacing, PassthroughFallbacks, Pod, PoolCensus, StreamBuffers, UserData,
+        Pacing, PassthroughFallbacks, Pod, PoolCensus, StreamBuffers, StreamStatus, UserData,
         SPA_VIDEO_TRANSFER_SMPTE2084,
     };
     use crate::linux::pipewire::hold::{DeferredRequeue, HoldBook};
@@ -1701,7 +1699,7 @@ mod callbacks {
         rig.allocate(&pool);
         rig.process(&pool[..1]);
         assert!(rig.take().is_none(), "no scrambled frame");
-        assert!(rig.ud.signals.broken.load(Relaxed));
+        assert_eq!(rig.ud.signals.status(), StreamStatus::Broken);
         assert!(rig.ud.signals.health.hdr_tiled_refused());
     }
 
@@ -1755,7 +1753,10 @@ mod callbacks {
         assert_eq!(tight[8..], pixels(20)[12..]);
 
         rig.negotiate(VideoFormat::RGB, (2, 1), 0);
-        assert_eq!(rig.ud.signals.frame_size.load(Relaxed), (2 << 32) | 1);
+        assert_eq!(
+            rig.ud.signals.negotiation().fixated.map(|f| f.size),
+            Some((2, 1))
+        );
         rig.process(&[padded]);
         let frame = rig.take().expect("a frame");
         let FramePayload::Cpu(tight) = &frame.payload else {
@@ -1776,7 +1777,7 @@ mod callbacks {
             let pod = format_pod(VideoFormat::xBGR_210LE, (2, 2), Some(0), Some(transfer));
             let id = ParamType::Format.as_raw();
             on_param_changed(&mut rig.ud, id, Pod::from_bytes(&pod));
-            rig.ud.signals.hdr_negotiated.load(Relaxed)
+            rig.ud.signals.negotiation().fixated.is_some_and(|f| f.hdr)
         };
         assert!(fixate(SPA_VIDEO_TRANSFER_SMPTE2084));
         assert!(!fixate(spa_sys::SPA_VIDEO_TRANSFER_BT709));
@@ -1792,7 +1793,7 @@ mod callbacks {
             let pod = format_pod(VideoFormat::xBGR_210LE, (2, 2), modifier, transfer);
             let id = ParamType::Format.as_raw();
             on_param_changed(&mut rig.ud, id, Pod::from_bytes(&pod));
-            let hdr = rig.ud.signals.hdr_negotiated.load(Relaxed);
+            let hdr = rig.ud.signals.negotiation().fixated.is_some_and(|f| f.hdr);
             (rig.ud.modifier, rig.ud.info.transfer_function(), hdr)
         };
         let pq = SPA_VIDEO_TRANSFER_SMPTE2084;
@@ -1831,7 +1832,7 @@ mod callbacks {
         assert!(matches!(&frame.payload, FramePayload::Cpu(p) if p.len() == 16));
         assert_eq!(rig.ud.passthrough_fallbacks.frames, 1);
         assert_eq!(rig.back(), [memory]);
-        assert!(!rig.ud.signals.broken.load(Relaxed));
+        assert_ne!(rig.ud.signals.status(), StreamStatus::Broken);
     }
 
     /// Tiled bytes read as linear are a scrambled picture, so a tiled session has no
@@ -1847,7 +1848,7 @@ mod callbacks {
             assert!(rig.take().is_none());
             assert_eq!(rig.back(), [memory]);
         }
-        assert!(rig.ud.signals.broken.load(Relaxed));
+        assert_eq!(rig.ud.signals.status(), StreamStatus::Broken);
         assert!(rig.ud.signals.health.passthrough_tiled_refused());
         let read = rig.ud.passthrough_fallbacks.frames;
         assert_eq!(read, 1, "a broken capture reads no more buffers");
@@ -1888,7 +1889,7 @@ mod callbacks {
         let buffers = ParamType::Buffers.as_raw();
         on_param_changed(&mut unnegotiated.ud, buffers, Pod::from_bytes(&pod));
         on_param_changed(&mut unnegotiated.ud, ParamType::Format.as_raw(), None);
-        assert!(!unnegotiated.ud.signals.negotiated.load(Relaxed));
+        assert_eq!(unnegotiated.ud.signals.negotiation().fixated, None);
 
         for (what, mut rig, buf) in [
             ("corrupted", negotiated(VideoFormat::BGRx), corrupted),
