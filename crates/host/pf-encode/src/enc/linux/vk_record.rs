@@ -1,7 +1,12 @@
-//! The per-frame record of the Vulkan Video encoder: the source acquire (dmabuf import, CPU
-//! staging, the padded copy), the compute CSC, the HEVC and AV1 coding commands, the submits
-//! and the DPB bookkeeping after them. `enqueue` in the parent calls `record_submit` once per
-//! frame with a free ring slot.
+//! The per-frame record of the Vulkan Video encoder, in stages with one job each:
+//! `plan_coding` (the frame's references), `acquire_source` (the native import, an RGB-direct
+//! arm, or the CSC's input in an open compute batch), `record_csc`, `record_coding` (HEVC or
+//! AV1), `submit`, then the DPB bookkeeping. `enqueue` in the parent calls `record_submit` once
+//! per frame with a free ring slot.
+//!
+//! A failed stage returns its error to `enqueue`, which hands the slot back with the frame's
+//! armed loss and forgets its cursor upload (the ring's `Return` and `ForgetCursor`). Only the
+//! CSC arm records a fallible step into a begun batch, so only it resets one on error.
 //!
 //! A `#[path]` child of `vulkan_video.rs`, so it sees the parent's private items (`Frame`,
 //! `OpenSpec`, the encoder's fields) without widening them. Design:
@@ -12,36 +17,80 @@
 
 use super::*;
 
+/// The frame's references, planned before anything records.
+struct CodingPlan {
+    frame: FramePlan,
+    is_idr: bool,
+    /// An error-resilient anchor. A confirmed reference is anchor-tagged only: the client
+    /// decoded it and holds its CDFs.
+    recovery: bool,
+    ref_slot: usize,
+    setup_idx: usize,
+    poc: i32,
+}
+
+/// What `acquire_source` leaves for the next stage.
+enum SourceAcquire {
+    /// The slot's compute batch is recording with the RGB source in it; the CSC comes next.
+    Csc(CscSource),
+    /// The encode reads this source; there is no CSC.
+    Encode(EncodeSource),
+}
+
+/// The CSC's input in the slot's open compute batch.
+struct CscSource {
+    rgb_view: vk::ImageView,
+    /// The imported dmabuf the CSC samples, handed back to its producer after the dispatch.
+    imported: Option<vk::Image>,
+    /// The cursor blend as `[origin_x, origin_y, size_w, size_h]`; size 0 skips it.
+    cursor_pc: [i32; 4],
+}
+
+/// The picture the encode reads and how its batch acquires it.
+struct EncodeSource {
+    img: vk::Image,
+    view: vk::ImageView,
+    acquire: SrcAcquire,
+    /// The slot's compute batch writes the source, so the encode waits on `csc_sem`.
+    compute: bool,
+}
+
 impl VulkanVideoEncoder {
-    /// Record CSC + encode (+ RFI) into ring `slot` and submit without waiting. Fence is polled
-    /// later (`read_slot`). `slot` must be free (prior submission already read back).
+    /// Record `frame` into ring `slot` and submit it without waiting; `read_slot` reads the AU
+    /// once the slot's fence signals. `slot` must be free (its last AU already read).
     pub(super) unsafe fn record_submit(
         &mut self,
         slot: usize,
         frame: &CapturedFrame,
         wire: i64,
     ) -> Result<()> {
-        let (w, h_px) = (self.width, self.height);
-        // Copy this slot's handles (Copy) so later `&mut self` helpers don't alias `self.frames`.
-        let compute_cmd = self.frames[slot].compute_cmd;
-        let cmd = self.frames[slot].cmd;
-        let csc_sem = self.frames[slot].csc_sem;
-        let fence = self.frames[slot].fence;
-        let query_pool = self.frames[slot].query_pool;
-        let ts_pool = self.frames[slot].ts_pool;
-        let bs_buf = self.frames[slot].bs.buffer;
-        let csc_set = self.frames[slot].csc_set;
-        let y_img = self.frames[slot].y.image;
-        let uv_img = self.frames[slot].uv.image;
-        let nv12_src = self.frames[slot].nv12.image;
-        let nv12_view = self.frames[slot].nv12.view;
-        let direct_planes = self.frames[slot].direct_planes;
+        let plan = self.plan_coding();
+        let src = match self.acquire_source(slot, frame)? {
+            SourceAcquire::Csc(csc) => self.record_csc(slot, &csc)?,
+            SourceAcquire::Encode(src) => src,
+        };
+        self.record_coding(slot, &src, &plan)?;
+        self.submit(slot, src.compute)?;
+        self.post_submit_bookkeeping(
+            slot,
+            frame.pts_ns,
+            wire,
+            plan.frame,
+            plan.setup_idx,
+            plan.poc,
+        );
+        Ok(())
+    }
 
+    /// Plan the frame's references against the slot table as it stands. Takes the armed loss
+    /// and sets this frame's wave; bookkeeping advances the wave once the frame is queued.
+    fn plan_coding(&mut self) -> CodingPlan {
         // A pending rate stays pending through recording: begin-coding declares the rate the
         // session has installed, and bookkeeping promotes the new one after (VUID-08254).
 
-        // An armed loss resolves here, against the slot table as it stands: the taint sweep
-        // ran at the report. A confirmed reference is looked up only when no loss is armed.
+        // An armed loss resolves here: the taint sweep ran at the report. The armed loss and
+        // the wave are restored by the caller (`Return`) when the record fails, so the retry
+        // plans the same frame. A confirmed reference is looked up only when no loss is armed.
         let armed = self.pending_loss.take();
         let floor = self.reference_floor;
         let refs = match (armed, floor) {
@@ -64,9 +113,6 @@ impl VulkanVideoEncoder {
         };
         let plan = plan_frame(state, pending, &self.recovery_policy());
         let is_idr = plan.refs == FrameRef::Idr;
-        // `recovery` is error-resilient; a confirmed reference is anchor-tagged only, since
-        // the client decoded it and holds its CDFs.
-        let recovery = plan.refs == FrameRef::Anchor;
         let ref_slot = match (plan.refs, anchor, confirmed) {
             (FrameRef::Anchor, Some((s, _)), _) | (FrameRef::Acked, _, Some((s, _))) => s,
             _ => self.prev_slot,
@@ -87,18 +133,183 @@ impl VulkanVideoEncoder {
         if !is_idr && setup_idx == ref_slot {
             setup_idx = (setup_idx + 1) % DPB_SLOTS as usize;
         }
+        CodingPlan {
+            frame: plan,
+            is_idr,
+            recovery: plan.refs == FrameRef::Anchor,
+            ref_slot,
+            setup_idx,
+            poc,
+        }
+    }
 
+    /// The encode source for the session's mode: the native planar import, the CSC's input,
+    /// or an RGB-direct arm. EFC converts inline and cannot composite (`open` refuses RGB-direct
+    /// for a cursor-blend session); only its padded copy and CPU upload use the compute queue.
+    unsafe fn acquire_source(
+        &mut self,
+        slot: usize,
+        frame: &CapturedFrame,
+    ) -> Result<SourceAcquire> {
         if self.spec.native_nv12 {
-            self.record_submit_native(slot, frame, is_idr, recovery, ref_slot, setup_idx, poc)?;
-            self.post_submit_bookkeeping(slot, frame.pts_ns, wire, plan, setup_idx, poc);
-            return Ok(());
+            return self.acquire_native(frame).map(SourceAcquire::Encode);
         }
-        if self.rgb.is_some() {
-            self.record_submit_rgb(slot, frame, is_idr, recovery, ref_slot, setup_idx, poc)?;
-            self.post_submit_bookkeeping(slot, frame.pts_ns, wire, plan, setup_idx, poc);
-            return Ok(());
+        if self.rgb.is_none() {
+            return self.acquire_csc(slot, frame).map(SourceAcquire::Csc);
         }
+        let compute_cmd = self.frames[slot].compute_cmd;
+        let ts_pool = self.frames[slot].ts_pool;
+        let padded = self.rgb.as_ref().is_some_and(|r| r.padded);
+        // Only the padded Dmabuf arm records timestamps (`record_pad_blit`); CPU-upload writes none.
+        self.frames[slot].ts_written = false;
+        let src = match &frame.payload {
+            FramePayload::Dmabuf(d) if !padded => {
+                // Imported buffer must cover the declared source extent (aligned coded extent,
+                // or render size in true-extent mode). A mismatch takes the encoder-rebuild
+                // path instead of letting EFC read past the allocation.
+                let (need_w, need_h) = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
+                    (self.spec.width, self.spec.height)
+                } else {
+                    (self.width, self.height)
+                };
+                if frame.width != need_w || frame.height != need_h {
+                    bail!(
+                        "vulkan-encode (rgb-direct): frame {}x{} does not cover the declared \
+                         source extent {}x{} — refusing an out-of-bounds encode source",
+                        frame.width,
+                        frame.height,
+                        need_w,
+                        need_h
+                    );
+                }
+                let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
+                let acquire = if fresh {
+                    SrcAcquire::DmabufFresh
+                } else {
+                    SrcAcquire::DmabufCached
+                };
+                EncodeSource {
+                    img,
+                    view,
+                    acquire,
+                    compute: false,
+                }
+            }
+            FramePayload::Dmabuf(d) => {
+                // Unaligned: blit into per-slot ALIGNED staging and edge-duplicate. Encode
+                // reads staging, never the capture buffer.
+                if frame.width != self.spec.width || frame.height != self.spec.height {
+                    bail!(
+                        "vulkan-encode (rgb-direct/padded): frame {}x{} != mode {}x{} — \
+                         refusing a mismatched blit source",
+                        frame.width,
+                        frame.height,
+                        self.spec.width,
+                        self.spec.height
+                    );
+                }
+                let (img, _view, fresh) = self.import_cached(d, frame.width, frame.height)?;
+                let pad_img = self.frames[slot].pad.image;
+                let pad_view = self.frames[slot].pad.view;
+                self.record_pad_blit(
+                    &self.device,
+                    compute_cmd,
+                    img,
+                    fresh,
+                    pad_img,
+                    ts_pool,
+                    &[(vk::ImageAspectFlags::COLOR, 1)],
+                )?;
+                self.frames[slot].ts_written = self.ts_period_ns > 0.0;
+                // Staging ends in GENERAL; `csc_sem` orders the hand-off ([`SrcAcquire::CscGeneral`]).
+                EncodeSource {
+                    img: pad_img,
+                    view: pad_view,
+                    acquire: SrcAcquire::CscGeneral,
+                    compute: true,
+                }
+            }
+            FramePayload::Cpu(bytes) => {
+                // `begin_command_buffer` is after the fallible staging, so no reset-on-error
+                // wrap. `compute_cmd` is only the staging→image copy; encode waits on `csc_sem`.
+                let view = self.stage_cpu(slot, frame, bytes)?;
+                self.device.begin_command_buffer(
+                    compute_cmd,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )?;
+                let img = self.record_cpu_copy(slot, compute_cmd, (self.width, self.height));
+                self.device.end_command_buffer(compute_cmd)?;
+                EncodeSource {
+                    img,
+                    view,
+                    acquire: SrcAcquire::CpuUpload,
+                    compute: true,
+                }
+            }
+            _ => bail!(
+                "vulkan-encode (rgb-direct): unsupported FramePayload (need Dmabuf or Cpu RGB)"
+            ),
+        };
+        Ok(SourceAcquire::Encode(src))
+    }
 
+    /// The native planar arm: the producer's visible-size NV12/P010 buffer is the encode source.
+    /// Safe at every mode because native sessions run true-size headers (see
+    /// [`OpenSpec::native_nv12`]). No compositing stage: the session plan negotiates native NV12
+    /// only when `!cursor_blend`.
+    unsafe fn acquire_native(&mut self, frame: &CapturedFrame) -> Result<EncodeSource> {
+        let want = self.spec.native_fmt;
+        if frame.format != want {
+            bail!(
+                "vulkan-encode (native planar): negotiated {want:?} but received {:?}",
+                frame.format
+            );
+        }
+        if frame.width != self.spec.width || frame.height != self.spec.height {
+            bail!(
+                "vulkan-encode (native planar): frame {}x{} != mode {}x{}",
+                frame.width,
+                frame.height,
+                self.spec.width,
+                self.spec.height
+            );
+        }
+        if frame.width % 2 != 0 || frame.height % 2 != 0 {
+            bail!("vulkan-encode (native planar): 4:2:0 frame dimensions must be even");
+        }
+        let FramePayload::Dmabuf(d) = &frame.payload else {
+            bail!("vulkan-encode (native planar): producer frame is not a DMA-BUF");
+        };
+        if d.fourcc != pf_frame::drm_fourcc(want).expect("planar FourCC") {
+            bail!(
+                "vulkan-encode (native planar): DMA-BUF FourCC {:#x} does not match {want:?}",
+                d.fourcc
+            );
+        }
+        if d.modifier != 0 {
+            bail!(
+                "vulkan-encode (native planar): only LINEAR is supported, got modifier {:#x}",
+                d.modifier
+            );
+        }
+        let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
+        let acquire = if fresh {
+            SrcAcquire::DmabufFresh
+        } else {
+            SrcAcquire::DmabufCached
+        };
+        Ok(EncodeSource {
+            img,
+            view,
+            acquire,
+            compute: false,
+        })
+    }
+
+    /// The CSC arm: begins the slot's compute batch with the timestamp, the cursor upload and
+    /// the RGB source (a dmabuf acquired for the shader, or the CPU upload) for `record_csc`.
+    unsafe fn acquire_csc(&mut self, slot: usize, frame: &CapturedFrame) -> Result<CscSource> {
         // Shader samples with clamped 1:1 texelFetch, so a mismatch silently streams a
         // cropped/edge-padded picture. Refuse into the encoder-rebuild path instead. A reframed
         // session needs only a capture that holds its crop.
@@ -117,6 +328,8 @@ impl VulkanVideoEncoder {
             );
         }
         let dev = self.device.clone(); // handle clone so `&mut self` helpers still work
+        let compute_cmd = self.frames[slot].compute_cmd;
+        let ts_pool = self.frames[slot].ts_pool;
         dev.begin_command_buffer(
             compute_cmd,
             &vk::CommandBufferBeginInfo::default()
@@ -124,8 +337,8 @@ impl VulkanVideoEncoder {
         )?;
         // Fallible prefix in one closure whose error arm resets `compute_cmd`. Leaving it
         // RECORDING makes the next `begin` violate VUID-vkBeginCommandBuffer-commandBuffer-00049.
-        // Never PENDING here: nothing is submitted until stage 4, so the reset is legal.
-        let prefix = (|| -> Result<([i32; 4], vk::ImageView, Option<vk::Image>)> {
+        // Never PENDING here: nothing is submitted until `submit`, so the reset is legal.
+        let prefix = (|| -> Result<CscSource> {
             self.frames[slot].ts_written = false;
             if self.ts_period_ns > 0.0 {
                 dev.cmd_reset_query_pool(compute_cmd, ts_pool, 0, 2);
@@ -143,10 +356,9 @@ impl VulkanVideoEncoder {
             let (rgb_view, imported) = match &frame.payload {
                 FramePayload::Dmabuf(d) => {
                     let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-                    // EXCLUSIVE sharing: fresh or cached, acquire the image from the
-                    // foreign producer family for this compute read (UNDEFINED on a
-                    // fresh import preserves modifier-tiled bytes; a cached one sits
-                    // in GENERAL where the release below left it). `Frame::src_hold`
+                    // EXCLUSIVE sharing: acquire the image from the foreign producer family for
+                    // this compute read, fresh (UNDEFINED preserves modifier-tiled bytes) or
+                    // cached (GENERAL, where `record_csc`'s release left it). `Frame::src_hold`
                     // covers content stability, not queue ownership.
                     let acq = imported_acquire_barrier(
                         img,
@@ -164,56 +376,10 @@ impl VulkanVideoEncoder {
                     (view, Some(img))
                 }
                 FramePayload::Cpu(bytes) => {
-                    // Expand 24-bpp 3→4 first (`normalize_cpu_rgb`); `ensure_cpu_rgb` padding does
-                    // 4-bpp index math on the raw bytes.
-                    let mut scratch = std::mem::take(&mut self.cpu_expand);
-                    let (norm_fmt, norm_bytes) =
-                        normalize_cpu_rgb(frame.format, bytes, &mut scratch, false);
-                    let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
-                    let view = match fmt {
-                        Ok(f) => {
-                            self.ensure_cpu_rgb(slot, f, norm_bytes, frame.width, frame.height)
-                        }
-                        Err(e) => Err(e),
-                    };
-                    self.cpu_expand = scratch;
-                    let view = view?;
-                    let img = self.frames[slot].cpu_img.unwrap().0.image;
-                    let stage = self.frames[slot].cpu_stage.unwrap().0.buffer;
-                    let to_dst = vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                        .src_access_mask(vk::AccessFlags2::NONE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .image(img)
-                        .subresource_range(color_range(0));
-                    dev.cmd_pipeline_barrier2(
-                        compute_cmd,
-                        &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]),
-                    );
-                    dev.cmd_copy_buffer_to_image(
-                        compute_cmd,
-                        stage,
-                        img,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &[vk::BufferImageCopy::default()
-                            .image_subresource(
-                                vk::ImageSubresourceLayers::default()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .layer_count(1),
-                            )
-                            // Staging is tightly packed and the image is source-sized; an
-                            // aligned-size extent here shears rows.
-                            .image_extent(vk::Extent3D {
-                                width: frame.width,
-                                height: frame.height,
-                                depth: 1,
-                            })],
-                    );
+                    let view = self.stage_cpu(slot, frame, bytes)?;
+                    // Staging is tightly packed and the image is source-sized; an aligned-size
+                    // extent here shears rows.
+                    let img = self.record_cpu_copy(slot, compute_cmd, (frame.width, frame.height));
                     let to_read = vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
                         .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
@@ -233,253 +399,95 @@ impl VulkanVideoEncoder {
                 }
                 _ => bail!("vulkan-encode: unsupported FramePayload (need Dmabuf or Cpu RGB)"),
             };
-            Ok((cursor_pc, rgb_view, imported))
+            Ok(CscSource {
+                rgb_view,
+                imported,
+                cursor_pc,
+            })
         })();
-        let (cursor_pc, rgb_view, imported) = match prefix {
-            Ok(v) => v,
-            Err(e) => {
-                // RECORDING (never submitted yet); pool allows reset. The reset discards any
-                // cursor upload recorded here, so the slot forgets it had one.
-                let _ = dev.reset_command_buffer(compute_cmd, vk::CommandBufferResetFlags::empty());
-                self.frames[slot].cursor.forget();
-                return Err(e);
-            }
-        };
-        // A reframed session converts the scaled crop; the cursor went in at source size.
-        let (cursor_pc, rgb_view) = match &self.reframe {
-            Some(r) => (
-                [0; 4],
-                r.record(
-                    &dev,
-                    compute_cmd,
-                    slot,
-                    self.sampler,
-                    rgb_view,
-                    self.frames[slot].cursor.img.view,
-                    cursor_pc,
-                ),
-            ),
-            None => (cursor_pc, rgb_view),
-        };
-        bind_rgb(&dev, self.sampler, csc_set, rgb_view);
+        if prefix.is_err() {
+            // RECORDING (never submitted yet); the pool allows the reset. A cursor upload the
+            // reset discards is forgotten by the caller (`ForgetCursor`).
+            let _ = dev.reset_command_buffer(compute_cmd, vk::CommandBufferResetFlags::empty());
+        }
+        prefix
+    }
 
-        // GENERAL for the CSC's targets, prior contents discarded: the picture itself when its
-        // planes are written directly, else Y/UV scratch plus the picture as the copies' dst.
-        let to_general = |img, dst_stage, dst_access| {
-            vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(dst_stage)
-                .dst_access_mask(dst_access)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(img)
-                .subresource_range(color_range(0))
+    /// Stage a CPU payload in the slot's upload buffer, 24-bpp expanded 3→4 first
+    /// (`ensure_cpu_rgb` pads with 4-bpp index math). Host-side only; returns the image's view.
+    unsafe fn stage_cpu(
+        &mut self,
+        slot: usize,
+        frame: &CapturedFrame,
+        bytes: &[u8],
+    ) -> Result<vk::ImageView> {
+        // The CPU channel order follows the session picture format: RGB-direct encodes the
+        // upload as its `pictureFormat`, which followed the first frame
+        // (VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207). The CSC samples either order.
+        let bgra = self.rgb.is_some() && self.spec.src_rgb_fmt == vk::Format::B8G8R8A8_UNORM;
+        let mut scratch = std::mem::take(&mut self.cpu_expand);
+        let (norm_fmt, norm_bytes) = normalize_cpu_rgb(frame.format, bytes, &mut scratch, bgra);
+        let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
+        let view = match fmt {
+            Ok(f) => self.ensure_cpu_rgb(slot, f, norm_bytes, frame.width, frame.height),
+            Err(e) => Err(e),
         };
-        let pre = if direct_planes {
-            vec![to_general(
-                nv12_src,
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_WRITE,
-            )]
-        } else {
-            vec![
-                to_general(
-                    y_img,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::SHADER_WRITE,
-                ),
-                to_general(
-                    uv_img,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::SHADER_WRITE,
-                ),
-                to_general(
-                    nv12_src,
-                    vk::PipelineStageFlags2::ALL_TRANSFER,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                ),
-            ]
-        };
+        self.cpu_expand = scratch;
+        view
+    }
+
+    /// Record the copy of the slot's staged CPU payload into its upload image, `width` ×
+    /// `height`, into `compute_cmd`, which is recording. Returns the image, in TRANSFER_DST.
+    unsafe fn record_cpu_copy(
+        &self,
+        slot: usize,
+        compute_cmd: vk::CommandBuffer,
+        (width, height): (u32, u32),
+    ) -> vk::Image {
+        let dev = &self.device;
+        let img = self.frames[slot]
+            .cpu_img
+            .expect("ensure_cpu_rgb built it")
+            .0
+            .image;
+        let stage = self.frames[slot]
+            .cpu_stage
+            .expect("ensure_cpu_rgb built it")
+            .0
+            .buffer;
+        let to_dst = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(img)
+            .subresource_range(color_range(0));
         dev.cmd_pipeline_barrier2(
             compute_cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&pre),
+            &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]),
         );
-
-        dev.cmd_bind_pipeline(compute_cmd, vk::PipelineBindPoint::COMPUTE, self.csc_pipe);
-        dev.cmd_bind_descriptor_sets(
+        dev.cmd_copy_buffer_to_image(
             compute_cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            self.csc_layout,
-            0,
-            &[csc_set],
-            &[],
+            stage,
+            img,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })],
         );
-        let mut pc_bytes = [0u8; 16];
-        for (i, v) in cursor_pc.iter().enumerate() {
-            pc_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
-        }
-        dev.cmd_push_constants(
-            compute_cmd,
-            self.csc_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            &pc_bytes,
-        );
-        dev.cmd_dispatch(compute_cmd, (w / 2).div_ceil(8), (h_px / 2).div_ceil(8), 1);
-
-        if !direct_planes {
-            // Y/UV shader-write → transfer-read (stay GENERAL); then copy into nv12 planes.
-            let yuv_rd = |img| {
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::GENERAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(img)
-                    .subresource_range(color_range(0))
-            };
-            dev.cmd_pipeline_barrier2(
-                compute_cmd,
-                &vk::DependencyInfo::default()
-                    .image_memory_barriers(&[yuv_rd(y_img), yuv_rd(uv_img)]),
-            );
-            let plane_copy = |src_aspect, dst_aspect, ew, eh| {
-                vk::ImageCopy::default()
-                    .src_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(src_aspect)
-                            .layer_count(1),
-                    )
-                    .dst_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(dst_aspect)
-                            .layer_count(1),
-                    )
-                    .extent(vk::Extent3D {
-                        width: ew,
-                        height: eh,
-                        depth: 1,
-                    })
-            };
-            dev.cmd_copy_image(
-                compute_cmd,
-                y_img,
-                vk::ImageLayout::GENERAL,
-                nv12_src,
-                vk::ImageLayout::GENERAL,
-                &[plane_copy(
-                    vk::ImageAspectFlags::COLOR,
-                    vk::ImageAspectFlags::PLANE_0,
-                    w,
-                    h_px,
-                )],
-            );
-            dev.cmd_copy_image(
-                compute_cmd,
-                uv_img,
-                vk::ImageLayout::GENERAL,
-                nv12_src,
-                vk::ImageLayout::GENERAL,
-                &[plane_copy(
-                    vk::ImageAspectFlags::COLOR,
-                    vk::ImageAspectFlags::PLANE_1,
-                    w / 2,
-                    h_px / 2,
-                )],
-            );
-        }
-        if self.ts_period_ns > 0.0 {
-            dev.cmd_write_timestamp2(
-                compute_cmd,
-                vk::PipelineStageFlags2::ALL_COMMANDS,
-                ts_pool,
-                1,
-            );
-        }
-        // Hand the imported source back to the producer family: the slot fence covers this
-        // batch, so the producer may rewrite the dmabuf once the fence signals.
-        if let Some(img) = imported {
-            let rel = imported_release_barrier(
-                img,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                self.compute_family,
-                self.foreign_qfi,
-                vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_READ,
-            );
-            dev.cmd_pipeline_barrier2(
-                compute_cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&[rel]),
-            );
-        }
-        dev.end_command_buffer(compute_cmd)?;
-
-        if self.spec.codec == Codec::Av1 {
-            self.record_coding_av1(
-                &dev,
-                cmd,
-                query_pool,
-                bs_buf,
-                nv12_src,
-                nv12_view,
-                SrcAcquire::CscGeneral,
-                is_idr,
-                recovery,
-                ref_slot,
-                setup_idx,
-                poc,
-            )?;
-        } else {
-            self.record_coding_h265(
-                &dev,
-                cmd,
-                query_pool,
-                bs_buf,
-                nv12_src,
-                nv12_view,
-                SrcAcquire::CscGeneral,
-                is_idr,
-                ref_slot,
-                setup_idx,
-                poc,
-            )?;
-        }
-
-        // Compute signals `csc_sem`; encode waits it and signals `fence`. Per-slot cmd/sem/fence
-        // make ring frames independent; DPB barrier orders N's reconstruct-write before N+1's read.
-        dev.reset_fences(&[fence])?;
-        let ccmds = [compute_cmd];
-        let sems = [csc_sem];
-        dev.queue_submit(
-            self.compute_queue,
-            &[vk::SubmitInfo::default()
-                .command_buffers(&ccmds)
-                .signal_semaphores(&sems)],
-            vk::Fence::null(),
-        )?;
-        let ecmds = [cmd];
-        let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
-        if let Err(e) = dev.queue_submit(
-            self.encode_queue,
-            &[vk::SubmitInfo::default()
-                .command_buffers(&ecmds)
-                .wait_semaphores(&sems)
-                .wait_dst_stage_mask(&wait_stages)],
-            fence,
-        ) {
-            // The compute batch is queued and signals `csc_sem` with no waiter.
-            self.encode_submit_failed(slot);
-            return Err(e.into());
-        }
-        self.post_submit_bookkeeping(slot, frame.pts_ns, wire, plan, setup_idx, poc);
-        Ok(())
+        img
     }
 
     /// Copy the visible frame into aligned staging plus edge-duplicate into 64×16 padding
@@ -631,281 +639,298 @@ impl VulkanVideoEncoder {
         Ok(())
     }
 
-    /// Import the producer's visible-size NV12/P010 buffer as the encode source. Safe at every
-    /// mode because native sessions run true-size headers (see [`OpenSpec::native_nv12`]).
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn record_submit_native(
-        &mut self,
-        slot: usize,
-        frame: &CapturedFrame,
-        is_idr: bool,
-        recovery: bool,
-        ref_slot: usize,
-        setup_idx: usize,
-        poc: i32,
-    ) -> Result<()> {
-        let want = self.spec.native_fmt;
-        if frame.format != want {
-            bail!(
-                "vulkan-encode (native planar): negotiated {want:?} but received {:?}",
-                frame.format
-            );
-        }
-        if frame.width != self.spec.width || frame.height != self.spec.height {
-            bail!(
-                "vulkan-encode (native planar): frame {}x{} != mode {}x{}",
-                frame.width,
-                frame.height,
-                self.spec.width,
-                self.spec.height
-            );
-        }
-        if frame.width % 2 != 0 || frame.height % 2 != 0 {
-            bail!("vulkan-encode (native planar): 4:2:0 frame dimensions must be even");
-        }
-        let FramePayload::Dmabuf(d) = &frame.payload else {
-            bail!("vulkan-encode (native planar): producer frame is not a DMA-BUF");
+    /// Record the CSC into the slot's open compute batch and end it: the host's reframe when
+    /// set, the RGB → 4:2:0 dispatch with the cursor blend, the copies into the picture's
+    /// planes unless the CSC writes them directly, the imported source's release. The picture
+    /// is the encode source.
+    unsafe fn record_csc(&self, slot: usize, csc: &CscSource) -> Result<EncodeSource> {
+        let dev = &self.device;
+        let (w, h_px) = (self.width, self.height);
+        let compute_cmd = self.frames[slot].compute_cmd;
+        let ts_pool = self.frames[slot].ts_pool;
+        let csc_set = self.frames[slot].csc_set;
+        let y_img = self.frames[slot].y.image;
+        let uv_img = self.frames[slot].uv.image;
+        let nv12_src = self.frames[slot].nv12.image;
+        let nv12_view = self.frames[slot].nv12.view;
+        let direct_planes = self.frames[slot].direct_planes;
+        // A reframed session converts the scaled crop; the cursor went in at source size.
+        let (cursor_pc, rgb_view) = match &self.reframe {
+            Some(r) => (
+                [0; 4],
+                r.record(
+                    dev,
+                    compute_cmd,
+                    slot,
+                    self.sampler,
+                    csc.rgb_view,
+                    self.frames[slot].cursor.img.view,
+                    csc.cursor_pc,
+                ),
+            ),
+            None => (csc.cursor_pc, csc.rgb_view),
         };
-        if d.fourcc != pf_frame::drm_fourcc(want).expect("planar FourCC") {
-            bail!(
-                "vulkan-encode (native planar): DMA-BUF FourCC {:#x} does not match {want:?}",
-                d.fourcc
-            );
-        }
-        if d.modifier != 0 {
-            bail!(
-                "vulkan-encode (native planar): only LINEAR is supported, got modifier {:#x}",
-                d.modifier
-            );
-        }
-        // No compositing stage: session plan negotiates native NV12 only when `!cursor_blend`.
-        let dev = self.device.clone();
-        let cmd = self.frames[slot].cmd;
-        let fence = self.frames[slot].fence;
-        let query_pool = self.frames[slot].query_pool;
-        let bs_buf = self.frames[slot].bs.buffer;
-        let (src_img, src_view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-        let acquire = if fresh {
-            SrcAcquire::DmabufFresh
-        } else {
-            SrcAcquire::DmabufCached
+        bind_rgb(dev, self.sampler, csc_set, rgb_view);
+
+        // GENERAL for the CSC's targets, prior contents discarded: the picture itself when its
+        // planes are written directly, else Y/UV scratch plus the picture as the copies' dst.
+        let to_general = |img, dst_stage, dst_access| {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                .src_access_mask(vk::AccessFlags2::NONE)
+                .dst_stage_mask(dst_stage)
+                .dst_access_mask(dst_access)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(img)
+                .subresource_range(color_range(0))
         };
-        if self.spec.codec == Codec::Av1 {
-            self.record_coding_av1(
-                &dev, cmd, query_pool, bs_buf, src_img, src_view, acquire, is_idr, recovery,
-                ref_slot, setup_idx, poc,
-            )?;
+        let pre = if direct_planes {
+            vec![to_general(
+                nv12_src,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+            )]
         } else {
-            self.record_coding_h265(
-                &dev, cmd, query_pool, bs_buf, src_img, src_view, acquire, is_idr, ref_slot,
-                setup_idx, poc,
-            )?;
+            vec![
+                to_general(
+                    y_img,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_WRITE,
+                ),
+                to_general(
+                    uv_img,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_WRITE,
+                ),
+                to_general(
+                    nv12_src,
+                    vk::PipelineStageFlags2::ALL_TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                ),
+            ]
+        };
+        dev.cmd_pipeline_barrier2(
+            compute_cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&pre),
+        );
+
+        dev.cmd_bind_pipeline(compute_cmd, vk::PipelineBindPoint::COMPUTE, self.csc_pipe);
+        dev.cmd_bind_descriptor_sets(
+            compute_cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            self.csc_layout,
+            0,
+            &[csc_set],
+            &[],
+        );
+        let mut pc_bytes = [0u8; 16];
+        for (i, v) in cursor_pc.iter().enumerate() {
+            pc_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
         }
-        dev.reset_fences(&[fence])?;
-        let ecmds = [cmd];
-        dev.queue_submit(
-            self.encode_queue,
-            &[vk::SubmitInfo::default().command_buffers(&ecmds)],
-            fence,
-        )?;
-        Ok(())
+        dev.cmd_push_constants(
+            compute_cmd,
+            self.csc_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            &pc_bytes,
+        );
+        dev.cmd_dispatch(compute_cmd, (w / 2).div_ceil(8), (h_px / 2).div_ceil(8), 1);
+
+        if !direct_planes {
+            self.record_plane_copies(compute_cmd, y_img, uv_img, nv12_src);
+        }
+        if self.ts_period_ns > 0.0 {
+            dev.cmd_write_timestamp2(
+                compute_cmd,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                ts_pool,
+                1,
+            );
+        }
+        // Hand the imported source back to the producer family: the slot fence covers this
+        // batch, so the producer may rewrite the dmabuf once the fence signals.
+        if let Some(img) = csc.imported {
+            let rel = imported_release_barrier(
+                img,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                self.compute_family,
+                self.foreign_qfi,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_READ,
+            );
+            dev.cmd_pipeline_barrier2(
+                compute_cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&[rel]),
+            );
+        }
+        dev.end_command_buffer(compute_cmd)?;
+        Ok(EncodeSource {
+            img: nv12_src,
+            view: nv12_view,
+            acquire: SrcAcquire::CscGeneral,
+            compute: true,
+        })
     }
 
-    /// RGB-direct twin of [`record_submit`]'s source/encode/submit. No compute CSC: VCN EFC
-    /// converts inline. Only the CPU path touches the compute queue (staging copy, semaphore-ordered).
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn record_submit_rgb(
-        &mut self,
+    /// Copy the CSC's Y/UV scratch into the picture's two planes once the shader writes are
+    /// readable. Every image stays GENERAL.
+    unsafe fn record_plane_copies(
+        &self,
+        compute_cmd: vk::CommandBuffer,
+        y_img: vk::Image,
+        uv_img: vk::Image,
+        nv12_src: vk::Image,
+    ) {
+        let dev = &self.device;
+        let (w, h_px) = (self.width, self.height);
+        let yuv_rd = |img| {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(img)
+                .subresource_range(color_range(0))
+        };
+        dev.cmd_pipeline_barrier2(
+            compute_cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&[yuv_rd(y_img), yuv_rd(uv_img)]),
+        );
+        let plane_copy = |src_aspect, dst_aspect, ew, eh| {
+            vk::ImageCopy::default()
+                .src_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(src_aspect)
+                        .layer_count(1),
+                )
+                .dst_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(dst_aspect)
+                        .layer_count(1),
+                )
+                .extent(vk::Extent3D {
+                    width: ew,
+                    height: eh,
+                    depth: 1,
+                })
+        };
+        dev.cmd_copy_image(
+            compute_cmd,
+            y_img,
+            vk::ImageLayout::GENERAL,
+            nv12_src,
+            vk::ImageLayout::GENERAL,
+            &[plane_copy(
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageAspectFlags::PLANE_0,
+                w,
+                h_px,
+            )],
+        );
+        dev.cmd_copy_image(
+            compute_cmd,
+            uv_img,
+            vk::ImageLayout::GENERAL,
+            nv12_src,
+            vk::ImageLayout::GENERAL,
+            &[plane_copy(
+                vk::ImageAspectFlags::COLOR,
+                vk::ImageAspectFlags::PLANE_1,
+                w / 2,
+                h_px / 2,
+            )],
+        );
+    }
+
+    /// Record the slot's encode batch for the session's codec.
+    unsafe fn record_coding(
+        &self,
         slot: usize,
-        frame: &CapturedFrame,
-        is_idr: bool,
-        recovery: bool,
-        ref_slot: usize,
-        setup_idx: usize,
-        poc: i32,
+        src: &EncodeSource,
+        plan: &CodingPlan,
     ) -> Result<()> {
-        let dev = self.device.clone();
+        let cmd = self.frames[slot].cmd;
+        let query_pool = self.frames[slot].query_pool;
+        let bs_buf = self.frames[slot].bs.buffer;
+        if self.spec.codec == Codec::Av1 {
+            self.record_coding_av1(
+                &self.device,
+                cmd,
+                query_pool,
+                bs_buf,
+                src.img,
+                src.view,
+                src.acquire,
+                plan.is_idr,
+                plan.recovery,
+                plan.ref_slot,
+                plan.setup_idx,
+                plan.poc,
+            )
+        } else {
+            self.record_coding_h265(
+                &self.device,
+                cmd,
+                query_pool,
+                bs_buf,
+                src.img,
+                src.view,
+                src.acquire,
+                plan.is_idr,
+                plan.ref_slot,
+                plan.setup_idx,
+                plan.poc,
+            )
+        }
+    }
+
+    /// Queue the slot's batches. With a compute batch, compute signals `csc_sem` and the encode
+    /// waits it; the encode signals the slot's fence. Per-slot cmd/sem/fence make ring frames
+    /// independent; the DPB barrier orders N's reconstruct-write before N+1's read.
+    unsafe fn submit(&mut self, slot: usize, compute: bool) -> Result<()> {
         let compute_cmd = self.frames[slot].compute_cmd;
         let cmd = self.frames[slot].cmd;
         let csc_sem = self.frames[slot].csc_sem;
         let fence = self.frames[slot].fence;
-        let query_pool = self.frames[slot].query_pool;
-        let bs_buf = self.frames[slot].bs.buffer;
-        let ts_pool = self.frames[slot].ts_pool;
-        // EFC cannot composite; `open` refuses RGB-direct for cursor-blend sessions.
-        let padded = self.rgb.as_ref().is_some_and(|r| r.padded);
-        // Only the padded Dmabuf arm records timestamps (`record_pad_blit`); CPU-upload writes none.
-        self.frames[slot].ts_written = false;
-        let (src_img, src_view, acquire, compute_active) = match &frame.payload {
-            FramePayload::Dmabuf(d) if !padded => {
-                // Imported buffer must cover the declared source extent (aligned coded extent,
-                // or render size in true-extent mode). A mismatch takes the encoder-rebuild
-                // path instead of letting EFC read past the allocation.
-                let (need_w, need_h) = if self.rgb.as_ref().is_some_and(|r| r.true_extent) {
-                    (self.spec.width, self.spec.height)
-                } else {
-                    (self.width, self.height)
-                };
-                if frame.width != need_w || frame.height != need_h {
-                    bail!(
-                        "vulkan-encode (rgb-direct): frame {}x{} does not cover the declared \
-                         source extent {}x{} — refusing an out-of-bounds encode source",
-                        frame.width,
-                        frame.height,
-                        need_w,
-                        need_h
-                    );
-                }
-                let (img, view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-                let acq = if fresh {
-                    SrcAcquire::DmabufFresh
-                } else {
-                    SrcAcquire::DmabufCached
-                };
-                (img, view, acq, false)
-            }
-            FramePayload::Dmabuf(d) => {
-                // Unaligned: blit into per-slot ALIGNED staging and edge-duplicate. Encode
-                // reads staging, never the capture buffer.
-                if frame.width != self.spec.width || frame.height != self.spec.height {
-                    bail!(
-                        "vulkan-encode (rgb-direct/padded): frame {}x{} != mode {}x{} — \
-                         refusing a mismatched blit source",
-                        frame.width,
-                        frame.height,
-                        self.spec.width,
-                        self.spec.height
-                    );
-                }
-                let (img, _view, fresh) = self.import_cached(d, frame.width, frame.height)?;
-                let pad_img = self.frames[slot].pad.image;
-                let pad_view = self.frames[slot].pad.view;
-                self.record_pad_blit(
-                    &dev,
-                    compute_cmd,
-                    img,
-                    fresh,
-                    pad_img,
-                    ts_pool,
-                    &[(vk::ImageAspectFlags::COLOR, 1)],
-                )?;
-                self.frames[slot].ts_written = self.ts_period_ns > 0.0;
-                // Staging ends in GENERAL; `csc_sem` orders the hand-off ([`SrcAcquire::CscGeneral`]).
-                (pad_img, pad_view, SrcAcquire::CscGeneral, true)
-            }
-            FramePayload::Cpu(bytes) => {
-                // Expand 24-bpp 3→4 before 4-bpp staging math, in the session's channel
-                // order: VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207 wants the encode source in
-                // `pictureFormat`, which followed the first frame (R-first stays R-first).
-                // `begin_command_buffer` is after the fallible steps, so no reset-on-error wrap.
-                let mut scratch = std::mem::take(&mut self.cpu_expand);
-                let bgra = self.spec.src_rgb_fmt == vk::Format::B8G8R8A8_UNORM;
-                let (norm_fmt, norm_bytes) =
-                    normalize_cpu_rgb(frame.format, bytes, &mut scratch, bgra);
-                let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
-                let view = match fmt {
-                    Ok(f) => self.ensure_cpu_rgb(slot, f, norm_bytes, frame.width, frame.height),
-                    Err(e) => Err(e),
-                };
-                self.cpu_expand = scratch;
-                let view = view?;
-                let img = self.frames[slot]
-                    .cpu_img
-                    .expect("ensure_cpu_rgb built it")
-                    .0
-                    .image;
-                let stage = self.frames[slot]
-                    .cpu_stage
-                    .expect("ensure_cpu_rgb built it")
-                    .0
-                    .buffer;
-                // `compute_cmd` is only the staging→image copy; encode waits on `csc_sem`.
-                dev.begin_command_buffer(
-                    compute_cmd,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )?;
-                let to_dst = vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                    .src_access_mask(vk::AccessFlags2::NONE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(img)
-                    .subresource_range(color_range(0));
-                dev.cmd_pipeline_barrier2(
-                    compute_cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[to_dst]),
-                );
-                dev.cmd_copy_buffer_to_image(
-                    compute_cmd,
-                    stage,
-                    img,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::BufferImageCopy::default()
-                        .image_subresource(
-                            vk::ImageSubresourceLayers::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .layer_count(1),
-                        )
-                        .image_extent(vk::Extent3D {
-                            width: self.width,
-                            height: self.height,
-                            depth: 1,
-                        })],
-                );
-                dev.end_command_buffer(compute_cmd)?;
-                (img, view, SrcAcquire::CpuUpload, true)
-            }
-            _ => bail!(
-                "vulkan-encode (rgb-direct): unsupported FramePayload (need Dmabuf or Cpu RGB)"
-            ),
-        };
-        if self.spec.codec == Codec::Av1 {
-            self.record_coding_av1(
-                &dev, cmd, query_pool, bs_buf, src_img, src_view, acquire, is_idr, recovery,
-                ref_slot, setup_idx, poc,
-            )?;
-        } else {
-            self.record_coding_h265(
-                &dev, cmd, query_pool, bs_buf, src_img, src_view, acquire, is_idr, ref_slot,
-                setup_idx, poc,
-            )?;
-        }
-        dev.reset_fences(&[fence])?;
+        self.device.reset_fences(&[fence])?;
         let ecmds = [cmd];
-        if compute_active {
-            let ccmds = [compute_cmd];
-            let sems = [csc_sem];
-            dev.queue_submit(
-                self.compute_queue,
-                &[vk::SubmitInfo::default()
-                    .command_buffers(&ccmds)
-                    .signal_semaphores(&sems)],
-                vk::Fence::null(),
-            )?;
-            let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
-            if let Err(e) = dev.queue_submit(
-                self.encode_queue,
-                &[vk::SubmitInfo::default()
-                    .command_buffers(&ecmds)
-                    .wait_semaphores(&sems)
-                    .wait_dst_stage_mask(&wait_stages)],
-                fence,
-            ) {
-                // The compute batch is queued and signals `csc_sem` with no waiter.
-                self.encode_submit_failed(slot);
-                return Err(e.into());
-            }
-        } else {
-            dev.queue_submit(
+        if !compute {
+            self.device.queue_submit(
                 self.encode_queue,
                 &[vk::SubmitInfo::default().command_buffers(&ecmds)],
                 fence,
             )?;
+            return Ok(());
+        }
+        let ccmds = [compute_cmd];
+        let sems = [csc_sem];
+        self.device.queue_submit(
+            self.compute_queue,
+            &[vk::SubmitInfo::default()
+                .command_buffers(&ccmds)
+                .signal_semaphores(&sems)],
+            vk::Fence::null(),
+        )?;
+        let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        if let Err(e) = self.device.queue_submit(
+            self.encode_queue,
+            &[vk::SubmitInfo::default()
+                .command_buffers(&ecmds)
+                .wait_semaphores(&sems)
+                .wait_dst_stage_mask(&wait_stages)],
+            fence,
+        ) {
+            // The compute signal is consumed on a failed encode submit: the queued compute
+            // batch signals `csc_sem` with no waiter.
+            self.encode_submit_failed(slot);
+            return Err(e.into());
         }
         Ok(())
     }
