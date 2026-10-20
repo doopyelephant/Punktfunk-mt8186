@@ -229,7 +229,13 @@ impl Presenter {
         if self.extent.width == 0 || self.extent.height == 0 {
             return Ok(Presented::Shown); // minimized: not Stale (Stale recreates)
         }
-        match self.state.enter(matches!(input, FrameInput::Redraw)) {
+        // A redraw carrying an overlay the lane cannot show needs the swapchain, or the
+        // console never appears after a stream that ended on the lane.
+        let lane_shows_it = overlay.is_none() || !self.overlay_blocks_native;
+        match self
+            .state
+            .enter(matches!(input, FrameInput::Redraw) && lane_shows_it)
+        {
             Entry::Draw => {}
             Entry::Skip => return Ok(Presented::Shown),
             // Only the Linux lane takes the window.
