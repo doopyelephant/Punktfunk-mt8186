@@ -1,12 +1,14 @@
 //! The PipeWire consumer, confined to its own thread (the PW types are `!Send`).
 //!
 //! [`capturer`] is the front end the encode loop holds, [`plan`] resolves the zero-copy
-//! negotiation, [`offers`] builds the modifier offers, [`thread`] runs the stream, [`consume`]
-//! turns one buffer into a frame, [`queue`] keeps the frames until their renders finish,
-//! [`ledger`] tracks each pool buffer and keeps a published one from the producer until encode
-//! lets go, and [`pacer`] drives a lazy producer.
+//! negotiation, [`config`] carries what the stream decides before its thread, [`offers`]
+//! builds the modifier offers, [`thread`] runs the stream, [`consume`] turns one buffer into a
+//! frame, [`queue`] keeps the frames until their renders finish, [`ledger`] tracks each pool
+//! buffer and keeps a published one from the producer until encode lets go, and [`pacer`]
+//! drives a lazy producer.
 
 mod capturer;
+mod config;
 mod consume;
 mod ledger;
 mod offers;

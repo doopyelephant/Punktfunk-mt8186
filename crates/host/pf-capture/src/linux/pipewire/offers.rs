@@ -1,9 +1,12 @@
 //! What the stream offers the producer: its probed traits, the pacing, and the dmabuf
-//! modifier lists per format.
+//! modifier lists per format. The probe and [`DeviceModifiers::ask`] put questions to the
+//! producer and the GPU; the offers are pure over their answers.
 
+use super::config::StreamConfig;
 use super::map_format;
 use crate::linux::pw_pods::{offer_framerate_denom, Pacing, HDR_FORMAT_ORDER};
 use crate::{PixelFormat, ZeroCopyPolicy};
+use pf_zerocopy::{Ladder, Refusal};
 use pipewire as pw;
 use pw::spa::param::video::VideoFormat;
 
@@ -169,6 +172,53 @@ pub(super) fn offer_pacing(
     }
 }
 
+/// What the GPU side answers for the offer: the importer's importable modifiers and those the
+/// fused convert samples. A list the offer does not read is never asked for.
+#[derive(Debug, Default)]
+pub(super) struct DeviceModifiers {
+    /// The importer constructed.
+    pub(super) importer: bool,
+    /// The importer's BGRx and BGRA lists; empty without one.
+    pub(super) packed: [Vec<u64>; 2],
+    /// The fused convert's BGRx and BGRA lists, on the raw lane.
+    pub(super) packed_fused: Option<[Vec<u64>; 2]>,
+    /// `(importer, fused convert)` per [`HDR_FORMAT_ORDER`] format, where tiled 10-bit can go
+    /// out for the raw convert.
+    pub(super) ten_bit: Option<[(Vec<u64>, Vec<u64>); 2]>,
+}
+
+impl DeviceModifiers {
+    /// Ask `importer` for its packed lists, the fused convert for its packed lists on the raw
+    /// lane, and both for the 10-bit pair where tiled 10-bit can go out (`hdr_tiled_raw`). A
+    /// remote importer answers over IPC; a failed answer is an empty list.
+    pub(super) fn ask(
+        importer: Option<&mut pf_zerocopy::Importer>,
+        nvenc_raw: bool,
+        hdr_tiled_raw: bool,
+    ) -> DeviceModifiers {
+        let packed =
+            [PixelFormat::Bgrx, PixelFormat::Bgra].map(|f| pf_frame::drm_fourcc(f).unwrap());
+        let mut lists = DeviceModifiers {
+            importer: importer.is_some(),
+            ..DeviceModifiers::default()
+        };
+        if let Some(i) = importer {
+            lists.packed = packed.map(|fourcc| i.supported_modifiers(fourcc));
+            lists.ten_bit = hdr_tiled_raw.then(|| {
+                HDR_FORMAT_ORDER.map(|fmt| match map_format(fmt).and_then(pf_frame::drm_fourcc) {
+                    Some(fourcc) => (
+                        i.supported_modifiers(fourcc),
+                        pf_zerocopy::fused_convert_modifiers(fourcc),
+                    ),
+                    None => Default::default(),
+                })
+            });
+        }
+        lists.packed_fused = nvenc_raw.then(|| packed.map(pf_zerocopy::fused_convert_modifiers));
+        lists
+    }
+}
+
 /// BGRx/BGRA dmabuf offers. Importer lists per format; the direct-import lane's
 /// tiled seed is `ZeroCopyPolicy::encoder_modifiers`, offered only to a
 /// tiled-opted gamescope producer on VA passthrough while the refusal latch is
@@ -178,26 +228,21 @@ pub(super) fn offer_pacing(
 /// list. Returns `(bgrx, bgra, extend_pyrowave)` — the flag feeds the
 /// session-start log line.
 pub(super) fn packed_modifier_offers(
-    policy: &ZeroCopyPolicy,
-    health: &pf_zerocopy::ZeroCopyHealth,
-    importer: Option<&mut pf_zerocopy::Importer>,
-    vaapi_passthrough: bool,
-    producer_is_gamescope: bool,
-    nvenc_raw: bool,
+    cfg: &StreamConfig,
+    ladder: &Ladder,
+    lists: &DeviceModifiers,
 ) -> (Vec<u64>, Vec<u64>, bool) {
+    let policy = &cfg.policy;
+    let (vaapi_passthrough, nvenc_raw) = (cfg.plan.vaapi_passthrough, cfg.plan.nvenc_raw);
+    let producer_is_gamescope = cfg.opts.producer_is_gamescope;
     // EGL importer answers per format; the encoder seed does too. LINEAR is appended for
     // every advertised list and remains the only gamescope choice without a proved tiled seed.
-    let advertise = importer.is_some() || vaapi_passthrough;
-    let mut modifiers = Vec::new();
-    let mut modifiers_bgra = Vec::new();
-    if let Some(i) = importer {
-        modifiers = i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgrx).unwrap());
-        modifiers_bgra = i.supported_modifiers(pf_frame::drm_fourcc(PixelFormat::Bgra).unwrap());
-    }
+    let advertise = lists.importer || vaapi_passthrough;
+    let [mut modifiers, mut modifiers_bgra] = lists.packed.clone();
     // The direct-import lane's tiled offer comes from what the session encoder
     // proved (`ZeroCopyPolicy::encoder_modifiers`), per fourcc. A refused tiled
     // offer or a non-gamescope producer keeps the importer's list alone.
-    let tiled_refused = health.passthrough_tiled_refused();
+    let tiled_refused = ladder.refused(Refusal::Tiled);
     // PyroWave imports through Vulkan, not libva. Its per-fourcc lists come from the
     // facade so capture never calls `encode`; gamescope has its separately gated seed. A
     // refused tiled offer leaves LINEAR, or the rebuild would be offered the same tiles.
@@ -215,14 +260,16 @@ pub(super) fn packed_modifier_offers(
             );
         }
     }
-    for (list, fmt) in [
+    for (i, (list, fmt)) in [
         (&mut modifiers, PixelFormat::Bgrx),
         (&mut modifiers_bgra, PixelFormat::Bgra),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         if nvenc_raw {
-            if let Some(fourcc) = pf_frame::drm_fourcc(fmt) {
-                let fused = pf_zerocopy::fused_convert_modifiers(fourcc);
-                *list = crate::linux::raw_lane_modifiers(list, &fused);
+            if let Some(fused) = &lists.packed_fused {
+                *list = crate::linux::raw_lane_modifiers(list, &fused[i]);
             }
         }
         if seed_encoder_mods || extend_pyrowave {
@@ -244,41 +291,33 @@ pub(super) fn packed_modifier_offers(
     (modifiers, modifiers_bgra, extend_pyrowave)
 }
 
-/// Packed 10-bit offers, PQ or gamescope's SDR (`want_ten_bit`). Tiled has two readers:
-/// NVENC's raw convert, for the modifiers it samples, and the VA encoder's own import — the
-/// latter only for `encoder_modifiers`-proved modifiers. Every other arm de-tiles into 8 bits,
-/// so tiled is offered only while one lane holds the stream. LINEAR is always appended once.
+/// Packed 10-bit offers, PQ or gamescope's SDR ([`StreamConfig::ten_bit`]). Tiled has two
+/// readers: NVENC's raw convert, for the modifiers it samples, and the VA encoder's own import —
+/// the latter only for `encoder_modifiers`-proved modifiers. Every other arm de-tiles into 8
+/// bits, so tiled is offered only while one lane holds the stream. LINEAR is always appended
+/// once.
 pub(super) fn hdr_modifier_offers(
-    policy: &ZeroCopyPolicy,
-    health: &pf_zerocopy::ZeroCopyHealth,
-    importer: Option<&mut pf_zerocopy::Importer>,
-    want_ten_bit: bool,
-    vaapi_passthrough: bool,
-    producer_is_gamescope: bool,
-    nvenc_raw: bool,
+    cfg: &StreamConfig,
+    ladder: &Ladder,
+    lists: &DeviceModifiers,
 ) -> Vec<(VideoFormat, Vec<u64>)> {
-    let mut importer = importer;
-    let hdr_tiled_raw =
-        want_ten_bit && policy.gamescope_tiled && nvenc_raw && !health.hdr_tiled_refused();
-    let hdr_tiled_direct = want_ten_bit
-        && vaapi_passthrough
-        && producer_is_gamescope
+    let policy = &cfg.policy;
+    let hdr_tiled_raw = cfg.hdr_tiled_raw(ladder);
+    let hdr_tiled_direct = cfg.ten_bit()
+        && cfg.plan.vaapi_passthrough
+        && cfg.opts.producer_is_gamescope
         && policy.gamescope_tiled
-        && !health.passthrough_tiled_refused();
+        && !ladder.refused(Refusal::Tiled);
     let mut hdr_modifiers: Vec<(VideoFormat, Vec<u64>)> = Vec::new();
-    for fmt in HDR_FORMAT_ORDER {
+    for (i, fmt) in HDR_FORMAT_ORDER.into_iter().enumerate() {
         let mut list = Vec::new();
         if hdr_tiled_direct {
             if let Some(fourcc) = map_format(fmt).and_then(pf_frame::drm_fourcc) {
                 list = encoder_modifiers_for(policy, fourcc);
             }
         } else if hdr_tiled_raw {
-            if let (Some(i), Some(fourcc)) = (
-                importer.as_deref_mut(),
-                map_format(fmt).and_then(pf_frame::drm_fourcc),
-            ) {
-                let fused = pf_zerocopy::fused_convert_modifiers(fourcc);
-                list = crate::linux::raw_lane_modifiers(&i.supported_modifiers(fourcc), &fused);
+            if let Some((importable, fused)) = lists.ten_bit.as_ref().map(|t| &t[i]) {
+                list = crate::linux::raw_lane_modifiers(importable, fused);
             }
         }
         list.retain(|&m| m != 0);
