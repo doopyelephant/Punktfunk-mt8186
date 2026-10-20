@@ -18,8 +18,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const STATE: usize = offset_of!(AuSlot, state);
 
-/// `(distance ahead of next_wire_seq, rank inside the access unit, heap distance)`.
-type OrderKey = (u32, u8, u32);
+/// `(distance ahead of next_wire_seq, rank inside the access unit, publish stamp or heap
+/// distance)`.
+type OrderKey = (u32, u8, u64);
 
 /// One mapped v7 section, alive for the view's lifetime. Header and slot words are only ever
 /// touched through aligned atomics, because the driver writes the same bytes; the heap is read
@@ -166,10 +167,11 @@ impl std::fmt::Display for AuFault {
 impl std::error::Error for AuFault {}
 
 /// Walks published slots out of an [`AuView`] in `wire_seq` order. Chunks of one access unit
-/// share a `wire_seq`; the FIRST chunk goes first, then heap order from the previous chunk's
-/// end (the heap is a bump allocator that wraps). A slot behind `next_wire_seq`, or a chunk of
-/// an access unit whose FIRST was never taken, is freed unread: after a `RESET` the domain
-/// restarts where the host says, and a superseded encoder's leftovers must not reach the wire.
+/// share a `wire_seq`; the FIRST chunk goes first, then the rest by the driver's publish stamp,
+/// or in heap order from the previous chunk's end from a driver that stamps none. A slot behind
+/// `next_wire_seq`, or a chunk of an access unit whose FIRST was never taken, is freed unread:
+/// after a `RESET` the domain restarts where the host says, and a superseded encoder's
+/// leftovers must not reach the wire.
 pub(crate) struct AuReader<'a> {
     view: AuView<'a>,
     /// The `wire_seq` the next access unit carries; `SET_ENCODE` and `RESET` set it.
@@ -183,6 +185,9 @@ pub(crate) struct AuReader<'a> {
     pub(crate) freed_unread: u64,
     /// Access units the driver skipped: `next_wire_seq` jumped over them.
     pub(crate) gaps: u64,
+    /// Runs after a scan reads slot `i`: where a test lands a driver publish mid-pass.
+    #[cfg(test)]
+    pub(crate) after_slot: Option<Box<dyn FnMut(usize) + Send + 'a>>,
 }
 
 impl<'a> AuReader<'a> {
@@ -195,6 +200,8 @@ impl<'a> AuReader<'a> {
             au_repeat: false,
             freed_unread: 0,
             gaps: 0,
+            #[cfg(test)]
+            after_slot: None,
         }
     }
 
@@ -233,16 +240,19 @@ impl<'a> AuReader<'a> {
         (rel < 1 << 31).then_some(rel)
     }
 
-    /// Ordering of a candidate slot: access unit first, then FIRST before the rest, then heap
-    /// order from the open access unit's end so a wrapped bump allocation still sorts last.
-    fn order_key(&self, rel: u32, first: bool, offset: u32) -> OrderKey {
-        if first {
+    /// Ordering of a candidate slot: access unit first, then FIRST before the rest, then the
+    /// open access unit's chunks in publish order. The driver's stamp gives that order across
+    /// any wrap. Heap order from the open chunk's end stands in for a driver that stamps none;
+    /// a wrapped chunk that ends past that end defeats it.
+    fn order_key(&self, rel: u32, s: &AuSlot) -> OrderKey {
+        if s.flags & au::AU_FIRST != 0 {
             return (rel, 0, 0);
         }
         match self.open_au {
-            Some((_, end)) if rel == 0 && offset >= end => (rel, 1, offset - end),
-            Some(_) if rel == 0 => (rel, 2, offset),
-            _ => (rel, 3, offset),
+            Some(_) if rel == 0 && s.qpc_published != 0 => (rel, 1, s.qpc_published),
+            Some((_, end)) if rel == 0 && s.offset >= end => (rel, 2, u64::from(s.offset - end)),
+            Some(_) if rel == 0 => (rel, 3, u64::from(s.offset)),
+            _ => (rel, 4, u64::from(s.offset)),
         }
     }
 
@@ -284,6 +294,10 @@ impl<'a> AuReader<'a> {
         let mut pick: Option<(OrderKey, usize, AuSlot)> = None;
         for i in 0..au::AU_SLOTS as usize {
             let s = self.view.slot(i);
+            #[cfg(test)]
+            if let Some(hook) = self.after_slot.as_mut() {
+                hook(i);
+            }
             if s.state != au::PUBLISHED {
                 continue;
             }
@@ -291,7 +305,7 @@ impl<'a> AuReader<'a> {
                 self.free_unread(i);
                 continue;
             };
-            let key = self.order_key(rel, s.flags & au::AU_FIRST != 0, s.offset);
+            let key = self.order_key(rel, &s);
             if pick.as_ref().is_none_or(|p| key < p.0) {
                 pick = Some((key, i, s));
             }
@@ -303,9 +317,10 @@ impl<'a> AuReader<'a> {
     /// PUBLISHED → READING for the copy and back to FREE (Release) before this returns.
     ///
     /// A pass is not a snapshot: a slot the driver published before the one a pass found is
-    /// only guaranteed visible after that later slot's Acquire load. So a pass whose best slot
-    /// is not the expected next chunk is repeated once before it is read as a skipped access
-    /// unit (adopted) or a chunk without its FIRST (freed unread).
+    /// only guaranteed visible after that later slot's Acquire load. So a chunk of the open
+    /// access unit is taken only from a second pass, which sees every chunk published before
+    /// it; and a pass whose best slot is not the expected next chunk is repeated once before it
+    /// is read as a skipped access unit (adopted) or a chunk without its FIRST (freed unread).
     pub(crate) fn take_next(&mut self) -> Result<Option<Taken>, AuFault> {
         if !self.published_for_us() {
             return Ok(None);
@@ -316,7 +331,8 @@ impl<'a> AuReader<'a> {
                 return Ok(None);
             };
             let first = s.flags & au::AU_FIRST != 0;
-            if rel == 0 && (first || self.open_au.is_some()) {
+            let expected = rel == 0 && (first || self.open_au.is_some());
+            if expected && (pass == 1 || self.open_au.is_none()) {
                 chosen = Some((i, s));
                 break;
             }
@@ -380,18 +396,28 @@ impl<'a> AuReader<'a> {
     }
 }
 
-/// Test-side writer: what the driver's encode thread does to a section, minus the encoder.
+/// The fake driver: what the driver's encode thread does to a section, minus the encoder.
+/// Placement is the driver's own [`HeapRing`]; then the heap bytes, the slot record and a
+/// [`FrameToken`] in `latest`, in that order, as `pf-encode-session`'s `drive.rs` publishes.
 #[cfg(test)]
 pub(crate) mod producer {
     use super::*;
+    use pf_driver_proto::encode::au::HeapRing;
+
+    /// An 8-aligned section of the smallest legal size.
+    pub(crate) fn section() -> Vec<u64> {
+        vec![0u64; au::section_bytes(au::HEAP_MIN_BYTES) as usize / 8]
+    }
 
     pub(crate) struct Producer<'a> {
         view: AuView<'a>,
         generation: u32,
-        heap_off: u32,
-        heap_len: u32,
-        bump: u32,
+        ring: HeapRing,
         publishes: u32,
+        /// Chunks since the open access unit's FIRST: each is stamped one QPC tick after the last.
+        chunk: u64,
+        /// `false` is a driver that predates the submit and publish stamps: both stay `0`.
+        pub(crate) stamps: bool,
     }
 
     impl<'a> Producer<'a> {
@@ -417,15 +443,15 @@ pub(crate) mod producer {
             Self {
                 view,
                 generation,
-                heap_off: au::HEAP_OFFSET as u32,
-                heap_len,
-                bump: 0,
+                ring: HeapRing::new(au::HEAP_OFFSET as u32, heap_len),
                 publishes: 0,
+                chunk: 0,
+                stamps: true,
             }
         }
 
-        /// One chunk into the first FREE slot; `None` when all sixteen are unread (the driver
-        /// skips a pool slot here; the test waits instead).
+        /// One chunk into the slot and heap range the ring picks; `None` when no slot is free
+        /// or every placement overlaps bytes the host still holds (the driver drops at the pool).
         pub(crate) fn try_publish(
             &mut self,
             data: &[u8],
@@ -434,16 +460,10 @@ pub(crate) mod producer {
             qpc_pts: u64,
             flags: u32,
         ) -> Option<usize> {
-            let i = (0..au::AU_SLOTS as usize)
-                .find(|&i| self.view.slot32(i, STATE).load(Ordering::Acquire) == au::FREE)?;
+            let states =
+                std::array::from_fn(|i| self.view.slot32(i, STATE).load(Ordering::Acquire));
             let len = data.len() as u32;
-            if self.bump + len > self.heap_len {
-                self.bump = 0;
-            }
-            let off = self.heap_off + self.bump;
-            self.bump += len;
-            // `off..off+len` is inside the heap and no slot names it (the bump only wraps past
-            // sixteen live chunks in these tests).
+            let (i, off) = self.ring.take(len, &states)?;
             self.view.mem.copy_from_slice(off as usize, data);
             let w = |f: usize, v: u32| self.view.slot32(i, f).store(v, Ordering::Relaxed);
             w(offset_of!(AuSlot, offset), off);
@@ -457,12 +477,22 @@ pub(crate) mod producer {
                     .store(v, Ordering::Relaxed)
             };
             w64(offset_of!(AuSlot, qpc_pts), qpc_pts);
-            // Fixed offsets past the present stamp: what a driver's submit and publish look like.
-            w64(offset_of!(AuSlot, qpc_submit), qpc_pts.saturating_add(7));
-            w64(
-                offset_of!(AuSlot, qpc_published),
-                qpc_pts.saturating_add(11),
-            );
+            // A driver submits an access unit once and publishes its chunks in order: fixed
+            // offsets past the present stamp, one tick further per chunk.
+            self.chunk = if flags & au::AU_FIRST != 0 {
+                0
+            } else {
+                self.chunk + 1
+            };
+            let stamp = |at: u64| {
+                if self.stamps {
+                    qpc_pts.saturating_add(at)
+                } else {
+                    0
+                }
+            };
+            w64(offset_of!(AuSlot, qpc_submit), stamp(7));
+            w64(offset_of!(AuSlot, qpc_published), stamp(11 + self.chunk));
             self.view
                 .slot32(i, STATE)
                 .store(au::PUBLISHED, Ordering::Release);
@@ -471,6 +501,7 @@ pub(crate) mod producer {
             Some(i)
         }
 
+        /// [`Self::try_publish`] where the test has left room for it.
         pub(crate) fn publish(
             &mut self,
             data: &[u8],
@@ -479,12 +510,8 @@ pub(crate) mod producer {
             qpc_pts: u64,
             flags: u32,
         ) -> usize {
-            loop {
-                if let Some(i) = self.try_publish(data, wire_seq, source_seq, qpc_pts, flags) {
-                    return i;
-                }
-                std::thread::yield_now();
-            }
+            self.try_publish(data, wire_seq, source_seq, qpc_pts, flags)
+                .expect("a free slot and an unheld heap range")
         }
 
         /// Overwrite `latest` with a token of `generation` — a superseded encoder's publish.
@@ -502,18 +529,18 @@ pub(crate) mod producer {
         pub(crate) fn slot_state(&self, i: usize) -> u32 {
             self.view.slot32(i, STATE).load(Ordering::Acquire)
         }
+
+        /// Where slot `i`'s bytes sit, section-relative.
+        pub(crate) fn slot_offset(&self, i: usize) -> u32 {
+            self.view.slot(i).offset
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::producer::Producer;
+    use super::producer::{section, Producer};
     use super::*;
-
-    /// An 8-aligned section of the smallest legal size.
-    fn section() -> Vec<u64> {
-        vec![0u64; au::section_bytes(au::HEAP_MIN_BYTES) as usize / 8]
-    }
 
     fn reader(mem: SectionView<'_>, wire_seq_base: u32) -> AuReader<'_> {
         AuReader::new(AuView::new(mem), wire_seq_base)
@@ -566,11 +593,19 @@ mod tests {
         assert_eq!((rd.freed_unread, rd.gaps), (0, 0));
     }
 
+    /// Stamped or not: a driver that writes no publish stamp is read in heap order.
     #[test]
-    fn chunks_of_one_access_unit_keep_heap_order_across_a_wrap() {
+    fn chunks_of_one_access_unit_keep_their_order_across_a_wrap() {
+        for stamps in [true, false] {
+            chunks_keep_their_order_across_a_wrap(stamps);
+        }
+    }
+
+    fn chunks_keep_their_order_across_a_wrap(stamps: bool) {
         let mut buf = section();
         let mem = SectionView::over(&mut buf);
         let mut prod = Producer::init(mem, 1, 0);
+        prod.stamps = stamps;
         let mut rd = reader(mem, 0);
         // Leave the heap 4 bytes short of full so the third chunk wraps to its start.
         let heap = rd.view().header().heap_bytes as usize;
@@ -581,11 +616,7 @@ mod tests {
         prod.publish(&filler, 1, 1, 1, au::AU_FIRST);
         prod.publish(b"mid", 1, 1, 1, 0);
         prod.publish(b"tail", 1, 1, 1, au::AU_LAST);
-        assert_eq!(
-            rd.view().slot(2).offset as usize,
-            au::HEAP_OFFSET,
-            "wrapped"
-        );
+        assert_eq!(prod.slot_offset(3) as usize, au::HEAP_OFFSET, "wrapped");
         assert_eq!(rd.ready_aus(), 1);
         let mut chunks = Vec::new();
         while let Some(t) = rd.take_next().unwrap() {
@@ -596,6 +627,33 @@ mod tests {
             vec![(au::AU_FIRST, filler.len()), (0, 3), (au::AU_LAST, 4)]
         );
         assert!(!rd.mid_au() && rd.next_wire_seq() == 2);
+    }
+
+    /// The driver publishes an open access unit's next two chunks after the scan has passed
+    /// the first one's slot and before it reaches the second's. The second is not taken
+    /// ahead of the first, which would close the unit and free the first unread.
+    #[test]
+    fn a_chunk_published_behind_the_scan_is_not_overtaken() {
+        let mut buf = section();
+        let mem = SectionView::over(&mut buf);
+        let mut prod = Producer::init(mem, 1, 0);
+        let mut rd = reader(mem, 0);
+        assert_eq!(prod.publish(b"head", 0, 1, 0, au::AU_FIRST), 0);
+        assert!(rd.take_next().unwrap().unwrap().data == b"head" && rd.mid_au());
+        let mut published = false;
+        rd.after_slot = Some(Box::new(move |i| {
+            if i == 1 && !published {
+                published = true;
+                assert_eq!(prod.publish(b"mid", 0, 1, 0, 0), 1);
+                assert_eq!(prod.publish(b"tail", 0, 1, 0, au::AU_LAST), 2);
+            }
+        }));
+        let mut got = Vec::new();
+        while let Some(t) = rd.take_next().unwrap() {
+            got.push(t.data);
+        }
+        assert_eq!(got, [b"mid".to_vec(), b"tail".to_vec()]);
+        assert_eq!((rd.freed_unread, rd.next_wire_seq()), (0, 1));
     }
 
     /// A re-encode carries its predecessor's source sequence and reads as a repeat; a chunk

@@ -651,6 +651,9 @@ mod win32u_stub;
 // The AU section's reader half. Pure over a mapped view, so its tests run on every target.
 #[path = "windows/au_reader.rs"]
 mod au_reader;
+// The driver-encode proxy's chunk and AU assembly over that reader. Pure for the same reason.
+#[path = "windows/au_assembly.rs"]
+mod au_assembly;
 // The recovery classifier's cursor-damage witness. Pure over `(now, kicked, position)` for the
 // same reason: the rule that decides whether a silent desktop resets gets tests on every target.
 #[path = "windows/cursor_witness.rs"]

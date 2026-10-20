@@ -4,10 +4,12 @@
 //!
 //! Sealing and handle duplication follow `open.rs` / `channel.rs`: unnamed, SYSTEM-only DACL,
 //! duplicated into WUDFHost by a [`ChannelBroker`], adopt-on-success. The reader over the
-//! mapped section is [`crate::au_reader`].
+//! mapped section is [`crate::au_reader`]; the chunks and access units it assembles are
+//! [`crate::au_assembly`].
 
 use super::*;
-use crate::au_reader::{AuReader, AuView, Taken};
+use crate::au_assembly::{AuAssembly, AuDump, Clocks};
+use crate::au_reader::{AuReader, AuView};
 use crate::{DriverEndpoint, EncodeCtlSender, SetEncodeSender};
 use pf_driver_proto::encode::{self, au, EncodeCtlRequest, SetEncodeRequest};
 use pf_encode_win::{AuChunk, EncodedFrame, Encoder, EncoderCaps};
@@ -106,59 +108,12 @@ fn caps_from_wire(w: &encode::EncoderCapsWire) -> EncoderCaps {
     }
 }
 
-/// A driver `qpc_pts` as the wire's epoch-nanosecond `pts_ns`: now minus the stamp's age.
-/// `0` (no stamp) reads as now.
-fn pts_from_qpc(qpc: u64) -> u64 {
-    if qpc == 0 {
-        return now_ns();
-    }
-    now_ns().saturating_sub(IddPushCapturer::qpc_age_us(qpc).saturating_mul(1000))
-}
-
-/// Access units to disk while [`diag_dir`] is on, in the framing the S5 encode probe wrote —
-/// `[u32 len][u64 pts_ns][u8 keyframe][bytes]` per chunk — so a field failure replays through
-/// the same corpus tooling. A write error drops the dump; the stream never fails for it.
-struct AuDump(std::io::BufWriter<std::fs::File>);
-
-impl AuDump {
-    /// One file per encoder open, named by pid, target and open count, so neither two
-    /// sessions nor a re-open share one.
-    fn create(target_id: u32) -> Option<Self> {
-        static OPENS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = diag_dir()?;
-        let open = OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = dir.join(format!(
-            "pfvd-au-{}-{target_id}-{open}.bin",
-            std::process::id()
-        ));
-        match std::fs::File::create(&path) {
-            Ok(f) => {
-                tracing::info!(path = %path.display(), "driver encode: dumping access units");
-                Some(Self(std::io::BufWriter::new(f)))
-            }
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "driver encode: no AU dump");
-                None
-            }
-        }
-    }
-
-    /// Append one chunk; `false` means the caller drops the dump.
-    fn write(&mut self, c: &AuChunk) -> bool {
-        use std::io::Write;
-        let r = self
-            .0
-            .write_all(&(c.data.len() as u32).to_le_bytes())
-            .and_then(|()| self.0.write_all(&c.pts_ns.to_le_bytes()))
-            .and_then(|()| self.0.write_all(&[u8::from(c.keyframe)]))
-            .and_then(|()| self.0.write_all(&c.data));
-        if let Err(e) = r {
-            tracing::warn!(error = %e, "driver encode: AU dump write failed — dump disabled");
-            return false;
-        }
-        true
-    }
-}
+/// The proxy's clocks: wall time, and the QPC the driver stamps its slots in.
+const CLOCKS: Clocks = Clocks {
+    now_ns,
+    qpc_age_us: IddPushCapturer::qpc_age_us,
+    qpc_ticks_us: IddPushCapturer::qpc_ticks_us,
+};
 
 /// The mapped AU section and its ready event, alive for the encoder's life. The driver holds
 /// its own duplicates; dropping this unmaps and closes only the host's handles.
@@ -206,7 +161,7 @@ impl AuSection {
     /// The reader's window on this section. The proxy owns both and drops the reader first.
     fn view(&self) -> AuView<'static> {
         // SAFETY: the reader and every reference it takes die before this section unmaps,
-        // because the proxy declares `reader` ahead of `section`.
+        // because the proxy declares `au` (which owns the reader) ahead of `section`.
         AuView::new(unsafe { self.section.share() })
     }
 
@@ -348,7 +303,11 @@ pub(crate) fn open_remote_encoder(
         "driver encode: encoder open, AU section adopted"
     );
     Ok(Box::new(EncoderProxy {
-        reader: AuReader::new(view, params.wire_seq_base),
+        au: AuAssembly::new(
+            AuReader::new(view, params.wire_seq_base),
+            CLOCKS,
+            diag_dir().and_then(|dir| AuDump::create(dir, target_id)),
+        ),
         section,
         target_id,
         ctl: encode_ctl,
@@ -361,12 +320,6 @@ pub(crate) fn open_remote_encoder(
         floor_refused: false,
         wire_chunk: params.wire_chunk_bytes as usize,
         wire_chunk_warned: false,
-        last_wire_seq: 0,
-        last_source_seq: 0,
-        au_repeat: false,
-        last_arrival: None,
-        last_split: None,
-        dump: AuDump::create(target_id),
         opened_at: Instant::now(),
         backend: backend_name(reply.backend_opened),
         // Opt-in: without it the card sits in its idle clocks under a stream.
@@ -375,21 +328,6 @@ pub(crate) fn open_remote_encoder(
             .flatten()
             .and_then(|gpu| clock_boost::ClockBoost::hold(gpu.info.luid())),
     }))
-}
-
-/// The driver's stamps on one slot as a split. `None` from a driver that wrote none (a zero
-/// submit) or stamps out of order. A present stamp of `0`, or one past the submit (a head that
-/// names the vblank the frame is for), leaves the pool wait unmeasured rather than negative.
-fn driver_split(t: &Taken) -> Option<pf_frame::health::DriverSplit> {
-    if t.qpc_submit == 0 || t.qpc_published < t.qpc_submit {
-        return None;
-    }
-    let span = |ticks: u64| Duration::from_micros(IddPushCapturer::qpc_ticks_us(ticks));
-    Some(pf_frame::health::DriverSplit {
-        pool: (t.qpc_pts != 0 && t.qpc_submit >= t.qpc_pts).then(|| span(t.qpc_submit - t.qpc_pts)),
-        encode: span(t.qpc_published - t.qpc_submit),
-        ipc: Duration::from_micros(IddPushCapturer::qpc_age_us(t.qpc_published)),
-    })
 }
 
 /// How long a refused HDR metadata update waits before it is sent again: the loop calls
@@ -402,7 +340,7 @@ const HDR_META_RETRY: Duration = Duration::from_secs(1);
 /// `ENCODE_CTL`; `set_hdr_meta` only on a change, since the loop repeats it every tick, and
 /// after a refusal no sooner than [`HDR_META_RETRY`].
 pub struct EncoderProxy {
-    reader: AuReader<'static>,
+    au: AuAssembly<'static>,
     section: AuSection,
     target_id: u32,
     ctl: EncodeCtlSender,
@@ -422,18 +360,6 @@ pub struct EncoderProxy {
     /// Decided at `SET_ENCODE`; a later `set_wire_chunking` that differs is logged once.
     wire_chunk: usize,
     wire_chunk_warned: bool,
-    /// The last taken chunk's `wire_seq` / `source_seq`: AU progress, the supervisor's second
-    /// ground-truth clock (`progress`).
-    last_wire_seq: u32,
-    last_source_seq: u32,
-    /// The access unit being taken re-encodes its predecessor's source frame.
-    au_repeat: bool,
-    /// Age of the last taken chunk's `qpc_pts` when the host took it — present→arrival.
-    last_arrival: Option<Duration>,
-    /// The driver's own split of that span, when its slot carried the stamps.
-    last_split: Option<pf_frame::health::DriverSplit>,
-    /// Bitstream capture while `PUNKTFUNK_IDD_DIAG` is on; dropped on the first write error.
-    dump: Option<AuDump>,
     /// Stands in for `last_au_qpc` until the first publish, so a never-producing encoder is
     /// silent from a known instant rather than invisible. Also this proxy's identity.
     opened_at: Instant,
@@ -460,10 +386,6 @@ impl Drop for EncoderProxy {
 }
 
 impl EncoderProxy {
-    /// A slice never takes this long; past it the access unit is truncated and the loop's
-    /// stall path resets the encoder.
-    const CHUNK_WAIT: Duration = Duration::from_millis(500);
-
     fn ctl(&self, op: u32, arg0: u32, arg1: u32, payload: [u8; 28]) -> Result<()> {
         (self.ctl)(&EncodeCtlRequest {
             target_id: self.target_id,
@@ -488,45 +410,17 @@ impl EncoderProxy {
         }
     }
 
-    /// One taken slot as a wire chunk, recording the progress clocks on the way through:
-    /// the sequence pair the supervisor reads as encoder progress, and how old the OS present
-    /// stamp already is — the ground truth for "late, not missing". The diagnostic dump takes
-    /// its copy here, so a chunked session writes the same bytes in the same order.
-    fn chunk(&mut self, t: Taken) -> AuChunk {
-        self.last_wire_seq = t.wire_seq;
-        self.au_repeat = t.repeat;
-        self.last_source_seq = t.source_seq;
-        self.last_arrival =
-            (t.qpc_pts != 0).then(|| Duration::from_micros(IddPushCapturer::qpc_age_us(t.qpc_pts)));
-        self.last_split = driver_split(&t);
-        let chunk = AuChunk {
-            data: t.data,
-            pts_ns: pts_from_qpc(t.qpc_pts),
-            keyframe: t.flags & au::AU_KEYFRAME != 0,
-            recovery_anchor: t.flags & au::AU_RECOVERY_ANCHOR != 0,
-            recovery_point: t.flags & au::AU_RECOVERY_POINT != 0,
-            recovery_close: t.flags & au::AU_RECOVERY_CLOSE != 0,
-            chunk_aligned: t.flags & au::AU_CHUNK_ALIGNED != 0,
-            first: t.flags & au::AU_FIRST != 0,
-            last: t.flags & au::AU_LAST != 0,
-        };
-        if self.dump.as_mut().is_some_and(|d| !d.write(&chunk)) {
-            self.dump = None;
-        }
-        chunk
-    }
-
     /// The header telemetry the driver keeps (`encoder_state`, `detached`, `last_au_qpc`,
     /// `drain_heartbeat_qpc`, `source_seq`, …); [`Encoder::telemetry`] is its supervisor cut.
     pub fn snapshot(&self) -> au::AuHeader {
-        self.reader.view().header()
+        self.au.reader.view().header()
     }
 
     /// `(wire_seq, source_seq)` of the last chunk taken: AU progress against the header's
     /// `source_seq`, the "encoder wedged" signal (§2.5) the supervisor reads from Phase 4 on.
     #[allow(dead_code)]
     pub fn progress(&self) -> (u32, u32) {
-        (self.last_wire_seq, self.last_source_seq)
+        (self.au.last_wire_seq, self.au.last_source_seq)
     }
 }
 
@@ -614,36 +508,7 @@ impl Encoder for EncoderProxy {
     }
 
     fn poll(&mut self) -> Result<Option<EncodedFrame>> {
-        // Whole access units: chunks concatenate in order until LAST closes it. A FIRST
-        // mid-assembly means the driver dropped this AU's tail and moved on: the prefix is
-        // discarded and the next AU starts over, as `poll_chunked` does for the streamed wire.
-        let start = |c: AuChunk| EncodedFrame {
-            data: c.data,
-            pts_ns: c.pts_ns,
-            keyframe: c.keyframe,
-            recovery_anchor: c.recovery_anchor,
-            recovery_point: c.recovery_point,
-            recovery_close: c.recovery_close,
-            chunk_aligned: c.chunk_aligned,
-        };
-        let Some(first) = self.poll_chunk()? else {
-            return Ok(None);
-        };
-        let mut last = first.last;
-        let mut frame = start(first);
-        while !last {
-            let c = self
-                .poll_chunk()?
-                .context("driver encode: access unit ended without its LAST chunk")?;
-            last = c.last;
-            if c.first {
-                frame = start(c);
-            } else {
-                frame.data.extend_from_slice(&c.data);
-                frame.keyframe |= c.keyframe;
-            }
-        }
-        Ok(Some(frame))
+        self.au.poll(&mut |ms| self.section.wait(ms))
     }
 
     fn set_pipelined(&mut self, _on: bool) -> bool {
@@ -661,28 +526,7 @@ impl Encoder for EncoderProxy {
     }
 
     fn poll_chunk(&mut self) -> Result<Option<AuChunk>> {
-        // Non-blocking between access units; inside one, the next chunk is owed and waited for.
-        let deadline = self
-            .reader
-            .mid_au()
-            .then(|| Instant::now() + Self::CHUNK_WAIT);
-        loop {
-            if let Some(t) = self.reader.take_next()? {
-                return Ok(Some(self.chunk(t)));
-            }
-            let Some(deadline) = deadline else {
-                return Ok(None);
-            };
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                bail!(
-                    "driver encode: no further chunk of wire frame {} within {:?}",
-                    self.reader.next_wire_seq(),
-                    Self::CHUNK_WAIT
-                );
-            }
-            self.section.wait(left.as_millis().clamp(1, 16) as u32);
-        }
+        self.au.poll_chunk(&mut |ms| self.section.wait(ms))
     }
 
     /// The classifier's two clocks straight from the AU header: the drain worker's heartbeat and
@@ -705,9 +549,9 @@ impl Encoder for EncoderProxy {
             source_seq: h.source_seq,
             dropped_total: h.dropped_total,
             drain_heartbeat: stamp(h.drain_heartbeat_qpc),
-            present_to_arrival: self.last_arrival,
-            driver_split: self.last_split,
-            au_repeat: self.au_repeat,
+            present_to_arrival: self.au.last_arrival,
+            driver_split: self.au.last_split,
+            au_repeat: self.au.au_repeat,
             state: h.encoder_state,
             backend: self.backend,
         })
@@ -715,7 +559,7 @@ impl Encoder for EncoderProxy {
 
     fn ready_aus(&mut self, deadline: Instant) -> Option<usize> {
         loop {
-            let n = self.reader.ready_aus();
+            let n = self.au.reader.ready_aus();
             if n > 0 {
                 return Some(n);
             }
@@ -728,17 +572,11 @@ impl Encoder for EncoderProxy {
     }
 
     fn reset(&mut self) -> bool {
-        // The domain restarts where this reader stands, so the loop's `au_seq` keeps matching.
-        // A half-read AU already spent its index on the wire: the loop closes that frame at
-        // the next FIRST, so the domain restarts past it.
-        let base = self
-            .reader
-            .next_wire_seq()
-            .wrapping_add(u32::from(self.reader.mid_au()));
+        let base = self.au.reset_base();
         if !self.ctl_logged("reset", encode::ENCODE_CTL_RESET, base, 0) {
             return false;
         }
-        self.reader.rebase(base);
+        self.au.reader.rebase(base);
         true
     }
 
