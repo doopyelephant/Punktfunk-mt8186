@@ -3823,7 +3823,9 @@ impl VulkanVideoEncoder {
         self.switch_for_cursor(frame)?;
         // If every slot is outstanding, block on the oldest (the round-robin `ring` cursor).
         while self.in_flight.len() >= self.frames.len() {
-            let slot = self.in_flight.pop_front().unwrap();
+            // Popped only once its fence signalled: a slot that timed out stays in flight, so
+            // `reset()` bounds its wait on this fence too.
+            let slot = self.in_flight.front().copied().unwrap();
             // Bounded, not `u64::MAX`: this is the stall-watchdog thread. An infinite wait
             // against a wedged GPU parks the only path that can `reset()`.
             match self.device.wait_for_fences(
@@ -3839,6 +3841,7 @@ impl VulkanVideoEncoder {
                 ),
                 Err(e) => return Err(e.into()),
             }
+            self.in_flight.pop_front();
             self.frames[slot].src_hold = None;
             let done = self.read_slot(slot)?;
             self.pending.push_back(done);
