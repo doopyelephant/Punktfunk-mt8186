@@ -23,10 +23,10 @@ pub(crate) fn setup_guard(
     if capture != crate::session_plan::CaptureBackend::IddPush {
         return Ok(None);
     }
-    let slot = crate::vdisplay::manager::slot_id_for(identity, size).context(REJECTED_SLOT)?;
-    Ok(Some(
-        crate::vdisplay::manager::vdm().begin_idd_setup(slot, stop.clone()),
-    ))
+    crate::vdisplay::manager::vdm()
+        .begin_idd_setup(identity, size, stop.clone())
+        .context(REJECTED_SLOT)
+        .map(Some)
 }
 
 /// The v5 IddCx hardware-cursor channel is up: the client may draw the pointer itself.
