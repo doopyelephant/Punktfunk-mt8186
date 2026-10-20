@@ -399,7 +399,7 @@
 //
 // The wire is versioned by ALPN, not by this. Pin the integer in `punktfunk-ffi`
 // (`abi_version_is_pinned`). Per-bump notes live in `CHANGELOG.md`.
-#define PUNKTFUNK_ABI_VERSION 57
+#define PUNKTFUNK_ABI_VERSION 58
 
 // This client silenced its own speakers (`client::NativeClient::set_audio_muted`). The host
 // keeps sending, so a session joined to the same sink still hears the game.
@@ -3785,17 +3785,18 @@ PunktfunkStatus punktfunk_connection_set_au_memory(PunktfunkConnection *c,
 #endif
 
 #if defined(PUNKTFUNK_FEATURE_QUIC)
-// One management request over the stream port: dial `host:port` as this device's identity,
-// refuse any host but `pin_sha256`, send `method` `path` with `body`, and block for the reply,
-// dialling for at most `timeout_ms`. On `OK` the reply's HTTP status is in `status_out` and its
-// body in `body_out`/`body_len_out`; free that with [`punktfunk_mgmt_body_free`]. `CRYPTO`: the
-// host is not the pinned one, so do not retry it over HTTPS. Any other failure: the host may
-// still answer on its management port.
+// One management request over the stream port, as this device's identity, refusing any host
+// but `pin_sha256`: `method` `path` with `body`, sent as `content_type` unless that is NULL.
+// Blocks for the reply. One connection per host serves every call; a new one is dialled for at
+// most `timeout_ms`. On `OK` the reply's HTTP status is in `status_out` and its body in
+// `body_out`/`body_len_out`; free that with [`punktfunk_mgmt_body_free`]. `CRYPTO`: the host is
+// not the pinned one, so do not retry it over HTTPS. Any other failure: the host may still
+// answer on its management port.
 //
 // # Safety
-// `host`/`client_cert_pem`/`client_key_pem`/`method`/`path` are NUL-terminated UTF-8;
-// `pin_sha256` is valid for 32 bytes; `body` is NULL or valid for `body_len` bytes; the three
-// out-pointers are writable.
+// `host`/`client_cert_pem`/`client_key_pem`/`method`/`path` are NUL-terminated UTF-8, and so
+// is `content_type` unless NULL; `pin_sha256` is valid for 32 bytes; `body` is NULL or valid
+// for `body_len` bytes; the three out-pointers are writable.
 PunktfunkStatus punktfunk_mgmt_request(const char *host,
                                        uint16_t port,
                                        const char *client_cert_pem,
@@ -3803,6 +3804,7 @@ PunktfunkStatus punktfunk_mgmt_request(const char *host,
                                        const uint8_t *pin_sha256,
                                        const char *method,
                                        const char *path,
+                                       const char *content_type,
                                        const uint8_t *body,
                                        uintptr_t body_len,
                                        uint32_t timeout_ms,

@@ -23,7 +23,7 @@ impl AppModel {
                     "punktfunk-client",
                     &req.host.name,
                     &req.host.addr,
-                    mgmt,
+                    (mgmt, req.host.port),
                     &identity,
                     req.host.fp_hex.as_deref().unwrap_or_default(),
                 );
@@ -85,6 +85,7 @@ impl AppModel {
                     &req.host.name,
                     &req.host.addr,
                     mgmt,
+                    req.host.port,
                     &identity,
                     req.host.fp_hex.as_deref().unwrap_or_default(),
                     &action_id,

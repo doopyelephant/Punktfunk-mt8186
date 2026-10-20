@@ -558,8 +558,8 @@ impl HostsPage {
                 continue;
             }
             let mgmt = self.mgmt_port(&k.fp_hex, &k.addr, k.port);
-            pf_client_core::host_actions::refresh(&k.addr, mgmt, &k.fp_hex);
-            pf_client_core::library::refresh_running(&k.addr, mgmt, &k.fp_hex);
+            pf_client_core::host_actions::refresh(&k.addr, mgmt, k.port, &k.fp_hex);
+            pf_client_core::library::refresh_running(&k.addr, mgmt, k.port, &k.fp_hex);
         }
     }
 

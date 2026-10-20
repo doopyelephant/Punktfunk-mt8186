@@ -1,8 +1,8 @@
 //! Game-library client for the host management REST API:
-//! `GET https://<host>:<mgmt>/api/v1/library/page`, walked to the end, plus the
-//! per-title art proxy.
+//! `GET /api/v1/library/page`, walked to the end, plus the per-title art proxy. Every call
+//! rides the stream port's management tunnel first and HTTPS on `<mgmt>` second ([`HostApi`]).
 //!
-//! Auth is mTLS: the client presents the persistent identity paired over QUIC;
+//! Auth is mTLS on both: the client presents the persistent identity paired over QUIC;
 //! paired certs may read the library routes (no bearer token). The host cert is
 //! checked against the pinned SHA-256 fingerprint (`KnownHost::fp_hex`), not a CA.
 //!
@@ -294,60 +294,142 @@ pub fn walk_pages<E>(
     Ok(games)
 }
 
-#[cfg(desktop)]
-fn body_of(
-    answer: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
-) -> Result<String, LibraryError> {
-    answer
-        .map_err(classify)?
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))
-}
-
 /// How long the stream port gets to answer a management connection before HTTPS is asked.
 #[cfg(desktop)]
 const TUNNEL_WAIT: Duration = Duration::from_secs(3);
 
-/// The catalog over the stream port's management tunnel, which needs no TCP 47990. `None`
-/// when the tunnel did not answer for this device; only a pin failure is a verdict.
+/// A management answer: its status and body.
 #[cfg(desktop)]
-fn fetch_over_tunnel(
-    addr: &str,
-    stream_port: u16,
-    identity: &(String, String),
-    pin: Option<[u8; 32]>,
-) -> Option<Result<Vec<GameEntry>, LibraryError>> {
-    use punktfunk_core::client::mgmt::MgmtTunnel;
-    let id = (identity.0.as_str(), identity.1.as_str());
-    let tunnel = match MgmtTunnel::open(addr, stream_port, id, pin, TUNNEL_WAIT) {
-        Ok(t) => t,
-        Err(punktfunk_core::PunktfunkError::Crypto) => return Some(Err(LibraryError::PinMismatch)),
-        Err(e) => {
-            tracing::debug!(error = %e, "library tunnel did not open — asking HTTPS");
-            return None;
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
+}
+
+#[cfg(desktop)]
+impl Reply {
+    /// The body of a 2xx; 401/403 → [`LibraryError::NotPaired`], anything else `Http`.
+    pub(crate) fn ok(self) -> Result<Vec<u8>, LibraryError> {
+        match self.status {
+            200..=299 => Ok(self.body),
+            401 | 403 => Err(LibraryError::NotPaired),
+            code => Err(LibraryError::Http(code)),
         }
-    };
-    let walked = walk_pages(
-        |cursor| {
-            let mut path = format!("/api/v1/library/page?limit={PAGE_LIMIT}");
-            if let Some(c) = cursor {
-                path.push_str("&cursor=");
-                path.push_str(&query_value(c));
+    }
+}
+
+/// A paired host's management API as this device: over the stream port's tunnel when
+/// `stream_port` is known (non-zero), which needs no TCP 47990, else over HTTPS on `mgmt_port`.
+#[cfg(desktop)]
+#[derive(Clone)]
+pub struct HostApi {
+    pub addr: String,
+    pub mgmt_port: u16,
+    pub stream_port: u16,
+    pub identity: (String, String),
+    pub pin: Option<[u8; 32]>,
+}
+
+#[cfg(desktop)]
+impl HostApi {
+    pub fn new(
+        addr: &str,
+        mgmt_port: u16,
+        stream_port: u16,
+        identity: &(String, String),
+        pin: Option<[u8; 32]>,
+    ) -> HostApi {
+        HostApi {
+            addr: addr.to_string(),
+            mgmt_port,
+            stream_port,
+            identity: identity.clone(),
+            pin,
+        }
+    }
+
+    /// `https://addr:mgmt_port`, the origin host-relative art resolves against.
+    pub fn base(&self) -> String {
+        base_url(&self.addr, self.mgmt_port)
+    }
+
+    /// `method` `path` with `body` as (content type, bytes), over the tunnel and then over
+    /// HTTPS with `https`. The tunnel's answer stands, except 401 and 403: a host that predates
+    /// stamping the client certificate on its tunnel refuses the paired lane there. Its refusal
+    /// stands only when HTTPS can't be reached either.
+    pub(crate) fn call(
+        &self,
+        https: &ureq::Agent,
+        method: &str,
+        path: &str,
+        body: Option<(&str, &[u8])>,
+    ) -> Result<Reply, LibraryError> {
+        let mut refused = None;
+        if self.stream_port != 0 {
+            let req = punktfunk_core::client::mgmt::Request {
+                method,
+                path,
+                content_type: body.map(|b| b.0),
+                body: body.map_or(&[], |b| b.1),
+            };
+            let id = (self.identity.0.as_str(), self.identity.1.as_str());
+            let (addr, port) = (&self.addr, self.stream_port);
+            match punktfunk_core::client::mgmt::request(addr, port, id, self.pin, TUNNEL_WAIT, &req)
+            {
+                Ok(r) => {
+                    let reply = Reply {
+                        status: r.status,
+                        body: r.body,
+                    };
+                    if !matches!(reply.status, 401 | 403) {
+                        return Ok(reply);
+                    }
+                    refused = Some(reply);
+                }
+                Err(punktfunk_core::PunktfunkError::Crypto) => {
+                    return Err(LibraryError::PinMismatch)
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, path, "stream port did not answer — asking HTTPS")
+                }
             }
-            match tunnel.request("GET", &path, b"") {
-                Ok(r) if r.status == 200 => Ok(String::from_utf8_lossy(&r.body).into_owned()),
-                Ok(r) => Err(LibraryError::Http(r.status)),
-                Err(e) => Err(LibraryError::Unreachable(e.to_string())),
-            }
-        },
-        LibraryError::Unreachable,
-    );
-    // A host before this one answers its tunnel with no client certificate: HTTPS decides.
-    walked
-        .inspect_err(|e| tracing::debug!(error = %e, "library tunnel refused — asking HTTPS"))
-        .ok()
-        .map(Ok)
+        }
+        match (self.https(https, method, path, body), refused) {
+            (Err(LibraryError::Unreachable(_)), Some(refused)) => Ok(refused),
+            (answer, _) => answer,
+        }
+    }
+
+    fn https(
+        &self,
+        https: &ureq::Agent,
+        method: &str,
+        path: &str,
+        body: Option<(&str, &[u8])>,
+    ) -> Result<Reply, LibraryError> {
+        let unreachable = |e: &dyn std::fmt::Display| LibraryError::Unreachable(e.to_string());
+        let mut req = ureq::http::Request::builder()
+            .method(method)
+            .uri(format!("{}{path}", self.base()));
+        if let Some((content_type, _)) = body {
+            req = req.header("Content-Type", content_type);
+        }
+        let req = req
+            .body(body.map_or(&[][..], |b| b.1))
+            .map_err(|e| unreachable(&e))?;
+        let req = https
+            .configure_request(req)
+            .http_status_as_error(false)
+            .build();
+        let mut resp = https.run(req).map_err(classify)?;
+        let status = resp.status().as_u16();
+        let body = resp
+            .body_mut()
+            .with_config()
+            .limit(ART_MAX_BYTES)
+            .read_to_vec()
+            .map_err(|e| LibraryError::Unreachable(format!("read body: {e}")))?;
+        Ok(Reply { status, body })
+    }
 }
 
 /// `s` percent-encoded for a query value.
@@ -363,11 +445,9 @@ fn query_value(s: &str) -> String {
         .collect()
 }
 
-/// The host's catalog, walked by `GET /api/v1/library/page`: over the stream port's management
-/// tunnel when `stream_port` is known (non-zero), else, or when that does not answer, over
-/// HTTPS on `mgmt_port`. A host older than the paged route refuses it on that lane, so
-/// `GET /api/v1/library` answers whole instead. 401/403 from both → [`LibraryError::NotPaired`];
-/// pin failure → [`LibraryError::PinMismatch`].
+/// The host's catalog, walked by `GET /api/v1/library/page` over [`HostApi`]'s lanes. A host
+/// older than the paged route refuses it, so `GET /api/v1/library` answers whole instead.
+/// 401/403 → [`LibraryError::NotPaired`]; pin failure → [`LibraryError::PinMismatch`].
 #[cfg(desktop)]
 pub fn fetch_games(
     addr: &str,
@@ -376,29 +456,27 @@ pub fn fetch_games(
     identity: &(String, String),
     pin: Option<[u8; 32]>,
 ) -> Result<Vec<GameEntry>, LibraryError> {
-    if stream_port != 0 {
-        if let Some(fetched) = fetch_over_tunnel(addr, stream_port, identity, pin) {
-            return fetched;
-        }
-    }
-    let agent = agent(identity, pin)?;
-    let base = base_url(addr, mgmt_port);
+    let https = agent(identity, pin)?;
+    let api = HostApi::new(addr, mgmt_port, stream_port, identity, pin);
+    let get = |path: &str| {
+        let body = api.call(&https, "GET", path, None)?.ok()?;
+        Ok(String::from_utf8_lossy(&body).into_owned())
+    };
     let bad_reply = LibraryError::Unreachable;
     let paged = walk_pages(
         |cursor| {
-            let page = agent
-                .get(format!("{base}/api/v1/library/page"))
-                .query("limit", PAGE_LIMIT.to_string());
-            body_of(match cursor {
-                Some(c) => page.query("cursor", c).call(),
-                None => page.call(),
-            })
+            let mut path = format!("/api/v1/library/page?limit={PAGE_LIMIT}");
+            if let Some(c) = cursor {
+                path.push_str("&cursor=");
+                path.push_str(&query_value(c));
+            }
+            get(&path)
         },
         bad_reply,
     );
     match paged {
         Err(LibraryError::NotPaired | LibraryError::Http(404)) => {
-            let body = body_of(agent.get(format!("{base}/api/v1/library")).call())?;
+            let body = get("/api/v1/library")?;
             serde_json::from_str(&body).map_err(|e| bad_reply(format!("bad JSON: {e}")))
         }
         walked => walked,
@@ -676,46 +754,26 @@ impl InstallOutcome {
 pub fn change_install(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
     app_id: &str,
     action: InstallAction,
 ) -> InstallOutcome {
-    let agent = match agent(identity, pin) {
+    let https = match agent(identity, pin) {
         Ok(a) => a,
         Err(e) => return InstallOutcome::Failed(e.to_string()),
     };
-    let url = format!(
-        "{}/api/v1/library/install/{}",
-        base_url(addr, mgmt_port),
-        path_segment(app_id)
-    );
+    let api = HostApi::new(addr, mgmt_port, stream_port, identity, pin);
+    let path = format!("/api/v1/library/install/{}", path_segment(app_id));
     let reply = match action {
-        InstallAction::Install | InstallAction::Resume => agent
-            .post(&url)
-            .config()
-            .http_status_as_error(false)
-            .build()
-            .send_empty(),
-        InstallAction::Pause => agent
-            .post(format!("{url}/pause"))
-            .config()
-            .http_status_as_error(false)
-            .build()
-            .send_empty(),
-        InstallAction::Remove => agent
-            .delete(&url)
-            .config()
-            .http_status_as_error(false)
-            .build()
-            .call(),
+        InstallAction::Install | InstallAction::Resume => api.call(&https, "POST", &path, None),
+        InstallAction::Pause => api.call(&https, "POST", &format!("{path}/pause"), None),
+        InstallAction::Remove => api.call(&https, "DELETE", &path, None),
     };
     match reply {
-        Ok(mut r) => {
-            let body = r.body_mut().read_to_string().unwrap_or_default();
-            InstallOutcome::from_reply(r.status().as_u16(), &body)
-        }
-        Err(e) => InstallOutcome::Failed(classify(e).to_string()),
+        Ok(r) => InstallOutcome::from_reply(r.status, &String::from_utf8_lossy(&r.body)),
+        Err(e) => InstallOutcome::Failed(e.to_string()),
     }
 }
 
@@ -806,24 +864,21 @@ impl GameEnd {
 pub fn end_game(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
     app_id: &str,
 ) -> GameEnd {
-    let agent = match agent(identity, pin) {
+    let https = match agent(identity, pin) {
         Ok(a) => a,
         Err(e) => return GameEnd::Failed(e.to_string()),
     };
-    let url = format!("{}/api/v1/game/end", base_url(addr, mgmt_port));
+    let api = HostApi::new(addr, mgmt_port, stream_port, identity, pin);
     let body = serde_json::json!({ "app_id": app_id, "streaming": true }).to_string();
-    match agent
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .send(body)
-    {
-        Ok(_) => GameEnd::Ended,
-        Err(ureq::Error::StatusCode(code)) => GameEnd::from_status(code),
-        Err(e) => GameEnd::Failed(classify(e).to_string()),
+    let json = Some(("application/json", body.as_bytes()));
+    match api.call(&https, "POST", "/api/v1/game/end", json) {
+        Ok(r) => GameEnd::from_status(r.status),
+        Err(e) => GameEnd::Failed(e.to_string()),
     }
 }
 
@@ -849,21 +904,19 @@ pub struct HostStatus {
 pub(crate) fn get_json<T: serde::de::DeserializeOwned + Default>(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
     path: &str,
 ) -> T {
-    let Ok(agent) = agent(identity, pin) else {
+    let Ok(https) = agent(identity, pin) else {
         return T::default();
     };
-    let url = format!("{}{path}", base_url(addr, mgmt_port));
-    let Ok(mut resp) = agent.get(&url).call() else {
-        return T::default();
-    };
-    let Ok(body) = resp.body_mut().read_to_string() else {
-        return T::default();
-    };
-    serde_json::from_str(&body).unwrap_or_default()
+    let api = HostApi::new(addr, mgmt_port, stream_port, identity, pin);
+    match api.call(&https, "GET", path, None).and_then(Reply::ok) {
+        Ok(body) => serde_json::from_slice(&body).unwrap_or_default(),
+        Err(_) => T::default(),
+    }
 }
 
 /// `GET /api/v1/status` `games[]`. Best-effort: older host, unreachable, or
@@ -873,10 +926,11 @@ pub(crate) fn get_json<T: serde::de::DeserializeOwned + Default>(
 pub fn fetch_running(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
 ) -> Vec<RunningGame> {
-    fetch_status(addr, mgmt_port, identity, pin).games
+    fetch_status(addr, mgmt_port, stream_port, identity, pin).games
 }
 
 /// `GET /api/v1/status`. Best-effort, as [`fetch_running`].
@@ -884,10 +938,12 @@ pub fn fetch_running(
 pub fn fetch_status(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
 ) -> HostStatus {
-    get_json::<HostStatus>(addr, mgmt_port, identity, pin, "/api/v1/status")
+    let path = "/api/v1/status";
+    get_json::<HostStatus>(addr, mgmt_port, stream_port, identity, pin, path)
 }
 
 /// A process-wide list per host fingerprint, so every tile, shelf and menu reading it
@@ -903,9 +959,9 @@ pub(crate) struct FpCache<T> {
 #[cfg(desktop)]
 type FpEntries<T> = std::collections::HashMap<String, (Instant, Vec<T>)>;
 
-/// A best-effort mgmt GET: address, mgmt port, identity, pin.
+/// A best-effort mgmt GET: address, mgmt port, stream port, identity, pin.
 #[cfg(desktop)]
-type FpFetch<T> = fn(&str, u16, &(String, String), Option<[u8; 32]>) -> Vec<T>;
+type FpFetch<T> = fn(&str, u16, u16, &(String, String), Option<[u8; 32]>) -> Vec<T>;
 
 #[cfg(desktop)]
 impl<T: Clone + Send + 'static> FpCache<T> {
@@ -932,12 +988,13 @@ impl<T: Clone + Send + 'static> FpCache<T> {
             .unwrap_or_default()
     }
 
-    /// Spawn `fetch` unless the entry is still inside the TTL, keeping the rows `keep`
-    /// passes. The identity is loaded on the worker so callers need not thread it through.
+    /// Spawn `fetch` against `addr` on (mgmt port, stream port) unless the entry is still inside
+    /// the TTL, keeping the rows `keep` passes. The identity is loaded on the worker so callers
+    /// need not thread it through.
     pub(crate) fn refresh(
         &'static self,
         addr: &str,
-        mgmt_port: u16,
+        (mgmt_port, stream_port): (u16, u16),
         fp_hex: &str,
         fetch: FpFetch<T>,
         keep: fn(&T) -> bool,
@@ -963,7 +1020,7 @@ impl<T: Clone + Send + 'static> FpCache<T> {
                     return;
                 };
                 let pin = crate::trust::parse_hex32(&fp_hex);
-                let found: Vec<T> = fetch(&addr, mgmt_port, &identity, pin)
+                let found: Vec<T> = fetch(&addr, mgmt_port, stream_port, &identity, pin)
                     .into_iter()
                     .filter(keep)
                     .collect();
@@ -1004,8 +1061,9 @@ pub fn now_playing(fp_hex: &str) -> String {
 /// Ask the host what it has up unless [`RUNNING_TTL`] says the last answer still
 /// stands. Idempotent; call it on whatever tick a shell already refreshes host rows on.
 #[cfg(desktop)]
-pub fn refresh_running(addr: &str, mgmt_port: u16, fp_hex: &str) {
-    RUNNING.refresh(addr, mgmt_port, fp_hex, fetch_running, RunningGame::is_up);
+pub fn refresh_running(addr: &str, mgmt_port: u16, stream_port: u16, fp_hex: &str) {
+    let ports = (mgmt_port, stream_port);
+    RUNNING.refresh(addr, ports, fp_hex, fetch_running, RunningGame::is_up);
 }
 
 /// What this host last said it has up, from the [`refresh_running`] cache.
@@ -1028,24 +1086,24 @@ pub fn invalidate_running(fp_hex: &str) {
 #[cfg(desktop)]
 pub(crate) const ART_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Host-origin URLs (`base` prefix) use the pinned mTLS agent; the art proxy
-/// requires the paired cert. Any other origin (custom-entry CDN) uses ureq's
-/// default agent: webpki trust, no client cert.
+/// Host-origin URLs (under [`HostApi::base`]) go over `api` with the pinned mTLS agent; the art
+/// proxy requires the paired cert. Any other origin (custom-entry CDN) uses ureq's default
+/// agent: webpki trust, no client cert.
 #[cfg(desktop)]
-pub fn fetch_art(pinned: &ureq::Agent, base: &str, url: &str) -> Result<Vec<u8>, LibraryError> {
-    let mut resp = if url.starts_with(base) {
-        pinned.get(url).call()
-    } else {
-        // Default ureq agent uses the process rustls provider. Install it here;
-        // several binaries link this crate and may not have done so.
-        punktfunk_core::tls::install_default_provider();
-        ureq::get(url)
-            .config()
-            .timeout_global(Some(Duration::from_secs(10)))
-            .build()
-            .call()
+pub fn fetch_art(api: &HostApi, pinned: &ureq::Agent, url: &str) -> Result<Vec<u8>, LibraryError> {
+    let base = api.base();
+    if let Some(path) = url.strip_prefix(&base).filter(|p| p.starts_with('/')) {
+        return api.call(pinned, "GET", path, None)?.ok();
     }
-    .map_err(classify)?;
+    // Default ureq agent uses the process rustls provider. Install it here;
+    // several binaries link this crate and may not have done so.
+    punktfunk_core::tls::install_default_provider();
+    let mut resp = ureq::get(url)
+        .config()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .call()
+        .map_err(classify)?;
     // ureq 3's default body cap is below a legitimate Steam hero; raise it.
     resp.body_mut()
         .with_config()
@@ -1064,9 +1122,7 @@ const ART_WORKERS: usize = 3;
 /// Consumer decodes textures on the main loop, cached bytes included.
 #[cfg(desktop)]
 pub fn spawn_art_fetch(
-    base: String,
-    identity: (String, String),
-    pin: Option<[u8; 32]>,
+    api: HostApi,
     jobs: VecDeque<(String, Vec<String>)>,
 ) -> async_channel::Receiver<(String, Vec<u8>)> {
     let queue = Arc::new(Mutex::new(jobs));
@@ -1074,12 +1130,11 @@ pub fn spawn_art_fetch(
     for _ in 0..ART_WORKERS {
         let queue = queue.clone();
         let tx = tx.clone();
-        let base = base.clone();
-        let identity = identity.clone();
+        let api = api.clone();
         std::thread::Builder::new()
             .name("punktfunk-lib-art".into())
             .spawn(move || {
-                let Ok(agent) = agent(&identity, pin) else {
+                let Ok(agent) = agent(&api.identity, api.pin) else {
                     return;
                 };
                 loop {
@@ -1092,7 +1147,7 @@ pub fn spawn_art_fetch(
                     }
                     let job = queue.lock().unwrap().pop_front();
                     let Some((id, candidates)) = job else { break };
-                    let bytes = resolve_art(&agent, &base, &id, &candidates, || tx.is_closed());
+                    let bytes = resolve_art(&api, &agent, &id, &candidates, || tx.is_closed());
                     // Receiver dropped (page popped): stop fetching.
                     if let Some(bytes) = bytes {
                         if tx.send_blocking((id, bytes)).is_err() {
@@ -1111,8 +1166,8 @@ pub fn spawn_art_fetch(
 /// asked between requests, so a closed page stops the walk.
 #[cfg(desktop)]
 fn resolve_art(
+    api: &HostApi,
     agent: &ureq::Agent,
-    base: &str,
     id: &str,
     candidates: &[String],
     gone: impl Fn() -> bool,
@@ -1124,7 +1179,7 @@ fn resolve_art(
         if gone() {
             return None;
         }
-        match fetch_art(agent, base, url) {
+        match fetch_art(api, agent, url) {
             Ok(bytes) => {
                 crate::art_cache::store(url, &bytes);
                 return Some(bytes);
@@ -1170,9 +1225,10 @@ impl<H> ArtQueue<H> {
     }
 }
 
-/// Posters on demand for one host: jobs arrive as posters are drawn, and each worker keeps its
-/// one connection for the pool's life. `decode` runs on the worker, so the thread that draws
-/// only wraps finished pixels. Dropping the pool stops the workers.
+/// Posters on demand for one host: jobs arrive as posters are drawn. The workers share the
+/// host's stream-port connection, and each keeps one HTTPS connection for the pool's life.
+/// `decode` runs on the worker, so the thread that draws only wraps finished pixels. Dropping
+/// the pool stops the workers.
 #[cfg(desktop)]
 pub struct ArtPool<H> {
     shared: Arc<(Mutex<ArtQueue<H>>, std::sync::Condvar)>,
@@ -1180,12 +1236,10 @@ pub struct ArtPool<H> {
 
 #[cfg(desktop)]
 impl<H: Send + 'static> ArtPool<H> {
-    /// Start the workers. Each result is the job's id and its decoded poster, `None` when no
-    /// candidate loaded or decoded.
+    /// Start the workers against `api`. Each result is the job's id and its decoded poster,
+    /// `None` when no candidate loaded or decoded.
     pub fn start<T: Send + 'static>(
-        base: String,
-        identity: (String, String),
-        pin: Option<[u8; 32]>,
+        api: HostApi,
         decode: impl Fn(Vec<u8>, &H) -> Option<T> + Send + Sync + 'static,
     ) -> (ArtPool<H>, async_channel::Receiver<(String, Option<T>)>) {
         let shared = Arc::new((
@@ -1198,17 +1252,12 @@ impl<H: Send + 'static> ArtPool<H> {
         let (tx, rx) = async_channel::unbounded();
         let decode = Arc::new(decode);
         for _ in 0..ART_WORKERS {
-            let (shared, tx, base, identity, decode) = (
-                shared.clone(),
-                tx.clone(),
-                base.clone(),
-                identity.clone(),
-                decode.clone(),
-            );
+            let (shared, tx, api, decode) =
+                (shared.clone(), tx.clone(), api.clone(), decode.clone());
             let spawned = std::thread::Builder::new()
                 .name("punktfunk-lib-art".into())
                 .spawn(move || {
-                    let Ok(agent) = agent(&identity, pin) else {
+                    let Ok(agent) = agent(&api.identity, api.pin) else {
                         return;
                     };
                     let gone = || tx.is_closed() || shared.0.lock().unwrap().closed;
@@ -1225,7 +1274,7 @@ impl<H: Send + 'static> ArtPool<H> {
                                 queue = shared.1.wait(queue).unwrap();
                             }
                         };
-                        let bytes = resolve_art(&agent, &base, &job.id, &job.candidates, gone);
+                        let bytes = resolve_art(&api, &agent, &job.id, &job.candidates, gone);
                         let decoded = bytes.and_then(|b| decode(b, &job.hint));
                         if tx.send_blocking((job.id, decoded)).is_err() {
                             return;

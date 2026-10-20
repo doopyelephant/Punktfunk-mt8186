@@ -40,7 +40,7 @@ object SendLogs {
         toHost(
             context, identity,
             addr = host.address, mgmtPort = host.effectiveMgmtPort, fpHex = host.fpHex,
-            hostName = host.name.ifBlank { host.address },
+            hostName = host.name.ifBlank { host.address }, streamPort = host.port,
         )
 
     /**
@@ -54,8 +54,9 @@ object SendLogs {
         mgmtPort: Int,
         fpHex: String,
         hostName: String,
+        streamPort: Int = 0,
     ): String {
-        val reply = mgmtCall(identity, addr, mgmtPort, fpHex) { base ->
+        val reply = mgmtCall(identity, addr, mgmtPort, fpHex, streamPort = streamPort) { base ->
             val body = NativeBridge.nativeRenderLogs(header(context))
             Request.Builder()
                 .url("$base/api/v1/client-logs")

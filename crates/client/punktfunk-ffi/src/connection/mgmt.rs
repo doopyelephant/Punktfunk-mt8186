@@ -3,17 +3,18 @@
 #[cfg(feature = "quic")]
 use crate::*;
 
-/// One management request over the stream port: dial `host:port` as this device's identity,
-/// refuse any host but `pin_sha256`, send `method` `path` with `body`, and block for the reply,
-/// dialling for at most `timeout_ms`. On `OK` the reply's HTTP status is in `status_out` and its
-/// body in `body_out`/`body_len_out`; free that with [`punktfunk_mgmt_body_free`]. `CRYPTO`: the
-/// host is not the pinned one, so do not retry it over HTTPS. Any other failure: the host may
-/// still answer on its management port.
+/// One management request over the stream port, as this device's identity, refusing any host
+/// but `pin_sha256`: `method` `path` with `body`, sent as `content_type` unless that is NULL.
+/// Blocks for the reply. One connection per host serves every call; a new one is dialled for at
+/// most `timeout_ms`. On `OK` the reply's HTTP status is in `status_out` and its body in
+/// `body_out`/`body_len_out`; free that with [`punktfunk_mgmt_body_free`]. `CRYPTO`: the host is
+/// not the pinned one, so do not retry it over HTTPS. Any other failure: the host may still
+/// answer on its management port.
 ///
 /// # Safety
-/// `host`/`client_cert_pem`/`client_key_pem`/`method`/`path` are NUL-terminated UTF-8;
-/// `pin_sha256` is valid for 32 bytes; `body` is NULL or valid for `body_len` bytes; the three
-/// out-pointers are writable.
+/// `host`/`client_cert_pem`/`client_key_pem`/`method`/`path` are NUL-terminated UTF-8, and so
+/// is `content_type` unless NULL; `pin_sha256` is valid for 32 bytes; `body` is NULL or valid
+/// for `body_len` bytes; the three out-pointers are writable.
 #[cfg(feature = "quic")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn punktfunk_mgmt_request(
@@ -24,6 +25,7 @@ pub unsafe extern "C" fn punktfunk_mgmt_request(
     pin_sha256: *const u8,
     method: *const std::os::raw::c_char,
     path: *const std::os::raw::c_char,
+    content_type: *const std::os::raw::c_char,
     body: *const u8,
     body_len: usize,
     timeout_ms: u32,
@@ -40,10 +42,17 @@ pub unsafe extern "C" fn punktfunk_mgmt_request(
                 opt_cstr(client_key_pem),
                 opt_cstr(method),
                 opt_cstr(path),
+                opt_cstr(content_type),
             )
         };
-        let (Ok(Some(host)), Ok(Some(cert)), Ok(Some(key)), Ok(Some(method)), Ok(Some(path))) =
-            strs
+        let (
+            Ok(Some(host)),
+            Ok(Some(cert)),
+            Ok(Some(key)),
+            Ok(Some(method)),
+            Ok(Some(path)),
+            Ok(content_type),
+        ) = strs
         else {
             return PunktfunkStatus::NullPointer;
         };
@@ -62,14 +71,14 @@ pub unsafe extern "C" fn punktfunk_mgmt_request(
             n => unsafe { std::slice::from_raw_parts(body, n) },
         };
         let wait = std::time::Duration::from_millis(u64::from(timeout_ms));
-        let reply = punktfunk_core::client::mgmt::MgmtTunnel::open(
-            host,
-            port,
-            (cert, key),
-            Some(pin),
-            wait,
-        )
-        .and_then(|t| t.request(method, path, sent));
+        let req = punktfunk_core::client::mgmt::Request {
+            method,
+            path,
+            content_type,
+            body: sent,
+        };
+        let reply =
+            punktfunk_core::client::mgmt::request(host, port, (cert, key), Some(pin), wait, &req);
         let reply = match reply {
             Ok(r) => r,
             Err(e) => return e.status(),
@@ -121,6 +130,7 @@ mod tests {
                 std::ptr::null(),
                 s.as_ptr(),
                 s.as_ptr(),
+                std::ptr::null(),
                 std::ptr::null(),
                 0,
                 1,
