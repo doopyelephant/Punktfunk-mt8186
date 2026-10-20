@@ -10,6 +10,8 @@ mod pad;
 
 mod video;
 
+mod screens;
+
 mod input;
 
 mod host;
@@ -35,6 +37,8 @@ pub use mgmt::*;
 pub use pad::*;
 #[cfg(feature = "quic")]
 pub use planes::*;
+#[cfg(feature = "quic")]
+pub use screens::*;
 pub use video::*;
 
 #[cfg(feature = "quic")]
@@ -47,6 +51,9 @@ pub struct PunktfunkConnection {
     inner: punktfunk_core::client::NativeClient,
     /// Last `next_au` payload. Pointer valid until the next video pull.
     last: std::sync::Mutex<Option<punktfunk_core::session::Frame>>,
+    /// Last `next_screen_au` payload of screens 1 to 3. Each pointer valid until that screen's
+    /// next pull.
+    last_screens: std::sync::Mutex<[Option<punktfunk_core::session::Frame>; 3]>,
     /// Last `next_audio` payload. Independent of the video slot.
     last_audio: std::sync::Mutex<Option<punktfunk_core::client::AudioPacket>>,
     /// In-core PCM decode. Returned pointer valid until the next PCM call.
