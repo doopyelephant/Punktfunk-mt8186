@@ -413,6 +413,12 @@ impl Engine {
         self.outstanding() + 2 < QUEUE as usize
     }
 
+    /// Forget the stamps asked for: a swapchain made without the timing flag answers none,
+    /// and the waiter polls only while some are outstanding.
+    pub(crate) fn disarm(&self) {
+        self.asked.store(0, Ordering::Release);
+    }
+
     /// Presents asked for a stamp whose result has not been read.
     pub(crate) fn outstanding(&self) -> usize {
         self.asked.load(Ordering::Acquire)

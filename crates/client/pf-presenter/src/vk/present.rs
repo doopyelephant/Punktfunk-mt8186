@@ -1373,7 +1373,11 @@ impl Presenter {
             // a swapchain whose queue is empty.
             Err(super::timing_ext::QUEUE_FULL) => {
                 tracing::warn!("present stamp queue full; presenting without stamps");
-                self.timing = None;
+                // The waiter polls while stamps are outstanding: forget them, or it asks a
+                // swapchain made without the timing flag.
+                if let Some(t) = self.timing.take() {
+                    t.disarm();
+                }
                 self.state.timing_armed = false;
                 self.recreate_swapchain(window)?;
                 Ok(Presented::Stale)
