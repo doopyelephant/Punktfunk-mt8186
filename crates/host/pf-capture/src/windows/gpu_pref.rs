@@ -1,11 +1,6 @@
-//! Windows capture GPU mechanics: the win32u GPU-preference hook.
-//!
-//! Capture identity ([`WinCaptureTarget`], [`D3d11Frame`], [`pack_luid`],
-//! [`make_device`]) lives in `pf-frame` so capture, encode, and pf-vdisplay share
-//! one type without a crate cycle. This module re-exports them so `crate::windows::dxgi::*`
-//! still resolves. There is no capturer here.
-
-pub use pf_frame::dxgi::{make_device, pack_luid, D3d11Frame, PyroFrameShare, WinCaptureTarget};
+//! The win32u GPU-preference hook a hybrid-GPU box needs before DXGI starts, and the
+//! per-monitor DPI awareness it sets beside it: [`install_gpu_pref_hook`]. The bytes it
+//! writes are `win32u_stub`'s, tested on every target.
 
 #[cfg(target_arch = "x86_64")]
 use std::ffi::c_void;

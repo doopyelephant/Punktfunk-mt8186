@@ -7,10 +7,10 @@
 //!
 //! Drive it with `spike --source synthetic-nv12`.
 
-use crate::windows::dxgi::{make_device, D3d11Frame};
 use crate::{CapturedFrame, Capturer, FramePayload, PixelFormat};
 use anyhow::{Context, Result};
 use pf_frame::d3d11_map::MappedSubresource;
+use pf_frame::dxgi::{make_device, D3d11Frame};
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BIND_SHADER_RESOURCE,
     D3D11_CPU_ACCESS_WRITE, D3D11_MAP_WRITE, D3D11_TEXTURE2D_DESC, D3D11_USAGE,

@@ -89,7 +89,7 @@ pub use self::windows::wgc::{
     open_wgc, open_worker_encoder, WgcSource, WorkerEndpoint, WorkerProcess,
 };
 #[cfg(target_os = "windows")]
-pub use self::windows::{dxgi, synthetic_nv12};
+pub use self::windows::{gpu_pref, synthetic_nv12};
 #[cfg(target_os = "linux")]
 #[path = "linux/mod.rs"]
 mod linux;

@@ -19,7 +19,7 @@ pub use pf_frame::PixelFormat;
 pub use pf_capture::FastSyntheticCapturer;
 pub use pf_capture::{capturer_supports_444, Capturer, SyntheticCapturer};
 #[cfg(target_os = "windows")]
-pub use pf_capture::{dxgi, synthetic_nv12};
+pub use pf_capture::{gpu_pref, synthetic_nv12};
 
 /// What the session's encoder proved it can import, per capture fourcc. SDR
 /// asks the packed-RGB pair, HDR the packed 10-bit pair; empty verdicts carry

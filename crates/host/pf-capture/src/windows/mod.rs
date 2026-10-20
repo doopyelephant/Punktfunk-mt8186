@@ -2,7 +2,7 @@
 //! so its tests run on Linux CI; a source is `cfg(windows)`.
 
 #[cfg(target_os = "windows")]
-pub mod dxgi;
+pub mod gpu_pref;
 #[cfg(target_os = "windows")]
 pub(crate) mod idd_push;
 // What the win32u GPU-preference patch writes, and the one head it may write over. Pure

@@ -8,13 +8,13 @@
 //! `packaging/windows/drivers/pf-vdisplay/src/encode/`. Layout and status codes
 //! live in [`pf_driver_proto`] — both sides `use` it, so drift is a compile error.
 
-use super::dxgi::WinCaptureTarget;
 use crate::windows::cursor_state::CursorModel;
 use crate::windows::cursor_witness::CursorWitness;
 use crate::windows::pixelless::DeliveryGate;
 use crate::{CapturedFrame, Capturer, PixelFormat};
 use anyhow::{bail, Context, Result};
 use pf_driver_proto::section::SectionView;
+use pf_frame::dxgi::WinCaptureTarget;
 use pf_paths_win::SecurityAttributes;
 use pf_win_display::open_wudfhost;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
