@@ -29,8 +29,8 @@ mod cursor_model;
 pub(crate) mod d3d11;
 #[cfg(target_os = "linux")]
 pub(crate) mod dmabuf;
-// The glass instruments' lifecycle: built (and tested) on every platform, performed by `vk`.
-#[allow(dead_code)]
+// The glass clock; its lifecycle and rank are built (and tested) on every platform.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 #[path = "vk/glass.rs"]
 mod glass;
 #[cfg(any(target_os = "linux", windows))]

@@ -161,9 +161,10 @@ impl Presenter {
     /// (minimized) window keeps the old targets and any image already acquired from them.
     ///
     /// The order is the contract: quiesce our submit, retire the acquired image, idle the
-    /// queue, drain the present waiter; then the create retires the old swapchain, the new
-    /// targets are built whole, and only then are the old ones destroyed. A failed build
-    /// leaves the old targets in place, their swapchain retired.
+    /// queue, retire the swapchain from the glass clock; then the create retires the old
+    /// swapchain, the new targets are built whole, only then are the old ones destroyed, and
+    /// the clock arms on the new one. A failed build leaves the old targets in place, their
+    /// swapchain retired and unarmed.
     fn rebuild_swapchain(&mut self, window: &sdl3::video::Window) -> Result<()> {
         self.quiesce_own()?;
         let (caps, extent) = self.surface_extent(window)?;
@@ -193,13 +194,9 @@ impl Presenter {
         // SAFETY: the drains above cover our cmd bufs, the presentation engine's semaphore
         // waits and the last waiter: nothing still names the old targets.
         unsafe { old.destroy(&self.device, &self.swap_d) };
-        let swapchain = self.targets.swapchain;
-        // SAFETY: `swapchain` was created above; the waiter is drained, so this thread is
-        // its only user.
-        self.state.timing_armed = self
-            .timing
-            .as_ref()
-            .is_some_and(|t| unsafe { t.arm(swapchain) });
+        // SAFETY: the swapchain was created above, and `drain_targets` retired the last one
+        // from the glass clock.
+        unsafe { self.glass.created(self.targets.swapchain) };
         tracing::debug!(
             width = extent.width,
             height = extent.height,
@@ -250,9 +247,10 @@ impl Presenter {
         Ok((caps, extent))
     }
 
-    /// After [`Presenter::quiesce_own`]: retire the acquired image, idle the queue, drain the
-    /// present waiter. Then nothing in flight names the targets, and a fence wait alone
-    /// proves only our submit (VUID-vkDestroySemaphore-05149, VUID-vkDestroySwapchainKHR-01282).
+    /// After [`Presenter::quiesce_own`]: retire the acquired image, idle the queue, retire the
+    /// swapchain from the glass clock (the waiter drains). Then nothing in flight names the
+    /// targets, and a fence wait alone proves only our submit (VUID-vkDestroySemaphore-05149,
+    /// VUID-vkDestroySwapchainKHR-01282).
     pub(super) fn drain_targets(&mut self, why: &str) -> Result<()> {
         {
             let _q = self.queue_lock.guard();
@@ -267,14 +265,7 @@ impl Presenter {
             unsafe { self.device.queue_wait_idle(self.queue) }
                 .with_context(|| format!("vkQueueWaitIdle ({why})"))?;
         }
-        // `oldSwapchain` is externally synchronised: the driver may retire it under a parked
-        // `vkWaitForPresentKHR`. Bounded by the waiter's 250 ms cap.
-        if let Some(t) = &self.present_timer {
-            t.drain();
-        }
-        // The last present belonged to the dying swapchain. `note_presented` is the only
-        // producer and shares this thread, so nothing enqueues before the destroy.
-        self.last_presented = None;
+        self.glass.retire();
         Ok(())
     }
 
@@ -291,10 +282,10 @@ impl Presenter {
         }
         // Present-id2/present-wait2 are asked for per swapchain, and so are engine stamps.
         let mut flags = vk::SwapchainCreateFlagsKHR::empty();
-        if self.present_id2 {
+        if self.glass.id2() {
             flags |= super::setup::present_wait2::SWAPCHAIN_FLAGS;
         }
-        if self.timing.is_some() {
+        if self.glass.stamps() {
             flags |= super::timing_ext::SWAPCHAIN_FLAG;
         }
         let format = self.targets.format;

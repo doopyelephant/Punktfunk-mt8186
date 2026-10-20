@@ -983,34 +983,25 @@ impl Presenter {
             video: None,
             owner: crate::reconfig_model::Owner::Swapchain,
             state: crate::swapchain_state::SwapchainState::new(),
-            present_timer: m.present_timer,
-            present_id2,
-            timing,
-            #[cfg(windows)]
-            vblank_timer: m.vblank_timer,
+            glass: {
+                let glass = crate::glass::GlassClock::new(timing, m.present_timer, present_id2);
+                #[cfg(windows)]
+                let glass = glass.with_vblank(m.vblank_timer);
+                #[cfg(target_os = "linux")]
+                let glass = glass.with_feedback(if knobs.surface_feedback {
+                    crate::wl_feedback::SurfaceFeedback::new(window).unwrap_or_else(|e| {
+                        tracing::warn!(error = %format!("{e:#}"), "surface feedback unavailable");
+                        None
+                    })
+                } else {
+                    None
+                });
+                glass
+            },
             #[cfg(windows)]
             fse,
-            next_present_id: 0,
-            last_presented: None,
             video_fit: Default::default(),
             placement_logged: None,
-            #[cfg(target_os = "linux")]
-            feedback: if knobs.surface_feedback {
-                crate::wl_feedback::SurfaceFeedback::new(window).unwrap_or_else(|e| {
-                    tracing::warn!(error = %format!("{e:#}"), "surface feedback unavailable");
-                    None
-                })
-            } else {
-                None
-            },
-            #[cfg(target_os = "linux")]
-            scanout: (0, 0),
-            #[cfg(target_os = "linux")]
-            scanout_reported: false,
-            #[cfg(target_os = "linux")]
-            compositor_stamps: std::collections::HashMap::new(),
-            #[cfg(target_os = "linux")]
-            held: Vec::new(),
             #[cfg(target_os = "linux")]
             native: if crate::wl_native::enabled() {
                 crate::wl_native::NativeLane::new(window, native_timelines).unwrap_or_else(|e| {
