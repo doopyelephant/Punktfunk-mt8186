@@ -77,10 +77,11 @@ impl EncoderCeiling {
     }
 
     /// What the encoder made of an ask of `want`. Short is the ceiling, again;
-    /// taking the whole ask is the ceiling gone.
+    /// taking a whole ask above the ceiling is the ceiling gone. A whole ask under
+    /// it is no evidence either way.
     pub(super) fn note_applied(&mut self, want: u32, applied: u32) {
         if applied >= want {
-            if self.cap.kbps().is_some() {
+            if self.cap.kbps().is_some_and(|cap| applied > cap) {
                 tracing::info!(
                     applied_kbps = applied,
                     "the encoder took the whole rate — dropping the ceiling it refused before"
@@ -599,6 +600,19 @@ mod tests {
         assert_eq!(c.resolve(400_000), (400_000, AckReason::Granted));
         c.note_applied(400_000, 400_000);
         assert_eq!(c.resolve(8_000_000), (8_000_000, AckReason::Granted));
+    }
+
+    /// A rate under the ceiling, taken whole, says nothing about the ceiling: an ABR dip
+    /// keeps it and its back-off clock.
+    #[test]
+    fn a_full_apply_under_the_ceiling_keeps_it() {
+        let mut c = EncoderCeiling::new();
+        c.note_applied(400_000, 300_000);
+        let wait = c.wait();
+        assert_eq!(c.resolve(250_000), (250_000, AckReason::Granted));
+        c.note_applied(250_000, 250_000);
+        assert_eq!(c.resolve(400_000), (300_000, AckReason::EncoderLimit));
+        assert_eq!(c.wait(), wait);
     }
 
     /// The encoder that refused a rate is gone (a mode switch, a rebuild on a
