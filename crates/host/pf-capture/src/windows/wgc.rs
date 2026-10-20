@@ -5,7 +5,7 @@
 //! [`pf_driver_proto::worker`] behind a [`Link`], which checks and bounds everything the
 //! worker sends. [`WgcCapturer`] is pixel-less like the IDD-push capturer — the worker owns
 //! the pixels and the encoder, and publishes into the same AU section the driver does, so
-//! [`open_worker_encoder`] hands the stream loop the same proxy.
+//! its [`RemoteEncoder`](crate::RemoteEncoder) hands the stream loop the same proxy.
 //!
 //! Evidence: `design/windows-wgc-capture.md` §4.3, §4.7, §4.13.
 
@@ -28,12 +28,12 @@ use windows::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
 };
 
-use crate::windows::idd_push::driver_encode::{
-    open_remote_encoder, DriverEncodeParams, HandleTarget,
-};
+use crate::windows::idd_push::driver_encode::{open_remote_encoder, HandleTarget};
 use crate::windows::pixelless::{self, DeliveryGate};
 use crate::windows::worker_link::{Link, Message, Peer};
-use crate::{CapturedFrame, Capturer, EncodeCtlSender, PixelFormat, SetEncodeSender};
+use crate::{
+    CapturedFrame, Capturer, DriverEncodeParams, EncodeCtlSender, PixelFormat, SetEncodeSender,
+};
 
 /// How long the worker has to say hello. A process's first lines of `main`.
 const HELLO_BOUND: Duration = Duration::from_secs(5);
@@ -222,26 +222,20 @@ impl HandleTarget for WorkerLink {
     }
 }
 
-/// Where a worker session's encoder opens ([`Capturer::worker_endpoint`]): the worker, and the
-/// monitor's display target for the request and the logs.
-#[derive(Clone)]
-pub struct WorkerEndpoint {
-    pub link: Arc<WorkerLink>,
-    pub target_id: u32,
-}
-
 /// Open the worker's encoder and hand back the stream loop's [`Encoder`]: the driver's proxy,
-/// its two senders writing to the pipe instead of a device. The worker owns both duplicated
-/// handles from the moment the request is written, whatever it answers.
-pub fn open_worker_encoder(
-    endpoint: &WorkerEndpoint,
+/// its two senders writing to the pipe instead of a device. `target_id` names the monitor in the
+/// request and the logs. The worker owns both duplicated handles from the moment the request is
+/// written, whatever it answers.
+fn open_worker_encoder(
+    worker: &Arc<WorkerLink>,
+    target_id: u32,
     params: &DriverEncodeParams,
 ) -> Result<Box<dyn Encoder>> {
-    let link = endpoint.link.clone();
+    let link = worker.clone();
     let set_encode: SetEncodeSender = Arc::new(move |req: &wire::SetEncodeRequest| {
         link.request(kind::SET_ENCODE, req, OPEN_BOUND)
     });
-    let link = endpoint.link.clone();
+    let link = worker.clone();
     let encode_ctl: EncodeCtlSender = Arc::new(move |req: &wire::EncodeCtlRequest| {
         let bound = if req.op == wire::ENCODE_CTL_RESET {
             OPEN_BOUND
@@ -258,13 +252,7 @@ pub fn open_worker_encoder(
         }
         Ok(())
     });
-    open_remote_encoder(
-        &*endpoint.link,
-        endpoint.target_id,
-        params,
-        set_encode,
-        encode_ctl,
-    )
+    open_remote_encoder(&**worker, target_id, params, set_encode, encode_ctl)
 }
 
 /// The monitor a worker captures, as the host's display inventory names it now.
@@ -429,7 +417,7 @@ impl WgcCapturer {
 }
 
 impl Capturer for WgcCapturer {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
+    fn next_frame(&mut self, _budget: crate::FirstFrame) -> Result<CapturedFrame> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(f) = self.try_consume()? {
@@ -455,18 +443,31 @@ impl Capturer for WgcCapturer {
 
     /// BT.2020 PQ while the capture is FP16, with the generic HDR10 volume the driver path
     /// sends.
-    fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
-        self.fp16.then(pf_frame::hdr::generic_hdr10)
+    fn colour(&self) -> crate::ColourFacts {
+        crate::ColourFacts {
+            hdr_meta: self.fp16.then(pf_frame::hdr::generic_hdr10),
+            sdr_fp16: false,
+        }
     }
 
-    fn observe_encoder(&mut self, t: Option<pf_frame::health::EncoderTelemetry>) {
+    fn supervised(&mut self) -> Option<&mut dyn crate::Supervised> {
+        Some(self)
+    }
+
+    fn remote_encoder(&self) -> Option<&dyn crate::RemoteEncoder> {
+        Some(self)
+    }
+}
+
+impl crate::Supervised for WgcCapturer {
+    fn observe(&mut self, t: Option<pf_frame::health::EncoderTelemetry>) {
         self.encoder = t;
     }
 
     /// The operator surface's view. The capture delivers only what changes, so a quiet source
     /// is `idle`, never a stall, and no recovery rung hangs off this. Under the secure desktop
     /// the capture keeps showing the desktop without the prompt: that state is named.
-    fn health(&self) -> Option<crate::CaptureHealth> {
+    fn health(&self) -> crate::CaptureHealth {
         use pf_driver_proto::encode::au;
         let enc = self.encoder.as_ref();
         let source_gap = self.last_fresh.elapsed();
@@ -477,7 +478,7 @@ impl Capturer for WgcCapturer {
         } else {
             "healthy"
         };
-        Some(crate::CaptureHealth {
+        crate::CaptureHealth {
             class,
             stall_class: None,
             source_gap,
@@ -499,13 +500,16 @@ impl Capturer for WgcCapturer {
             last_episode: None,
             episodes_suppressed: 0,
             cooldown_remaining: None,
-        })
+        }
+    }
+}
+
+impl crate::RemoteEncoder for WgcCapturer {
+    fn site(&self) -> crate::EncoderSite {
+        crate::EncoderSite::Worker
     }
 
-    fn worker_endpoint(&self) -> Option<WorkerEndpoint> {
-        Some(WorkerEndpoint {
-            link: self.link.clone(),
-            target_id: self.source.target_id,
-        })
+    fn open(&self, params: &DriverEncodeParams) -> Result<Box<dyn Encoder>> {
+        open_worker_encoder(&self.link, self.source.target_id, params)
     }
 }

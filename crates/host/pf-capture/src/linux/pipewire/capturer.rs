@@ -40,12 +40,12 @@ pub struct PortalCapturer {
     /// Wakeup only — the queue holds the frames, so a coalesced edge loses
     /// nothing. Sender dies with the PipeWire thread (`Disconnected`).
     wake: Receiver<()>,
-    /// Set by [`Capturer::arrival_poke`]; `wait_ready` takes it and returns with no frame.
+    /// Set by [`crate::Feed::arrival_poke`]; `wait_ready` takes it and returns with no frame.
     poked: Arc<std::sync::atomic::AtomicBool>,
     /// Arrival to take, per frame (`PUNKTFUNK_PERF`).
     fence_wait: FenceWaitStats,
     signals: CaptureSignals,
-    /// `signals.resent` as of the last [`Capturer::take_reference_risk`].
+    /// `signals.resent` as of the last [`Capturer::events`].
     resent_acked: u64,
     /// First drop out of `Streaming` with no frame. Grace for a transient
     /// renegotiation; cleared on a frame or when `Streaming` again.
@@ -243,15 +243,22 @@ impl PortalCapturer {
         // Virtual outputs are SDR-only except a gamescope node from our
         // `pipewire-hdr` build — the host checks before Welcome
         // (`capture::capturer_supports_hdr_for`).
-        Ok(
+        let mut capturer =
             spawn_pipewire(remote_fd, node_id, preferred_mode, capture, opts.policy)?
                 .into_capturer(
                     node_id,
                     Some(keepalive),
                     None,
                     crate::HdrSource::VirtualOutput,
-                ),
-        )
+                );
+        capturer._gs_cursor = opts.gamescope_cursor.and_then(|targets| {
+            xfixes_cursor::XFixesCursorSource::spawn(
+                targets,
+                Arc::clone(&capturer.signals.cursor_live),
+                Arc::clone(&capturer.signals.frame_size),
+            )
+        });
+        Ok(capturer)
     }
 }
 
@@ -405,81 +412,16 @@ fn spawn_pipewire(
 const FIRST_FRAME_BUDGET: Duration = Duration::from_secs(10);
 
 impl Capturer for PortalCapturer {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
-        self.frame_within(FIRST_FRAME_BUDGET, TimeoutVerdict::Conclusive)
-    }
-
-    fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
-        // Includes cursor-only buffers. Gamescope fills this via XFixes.
-        self.signals
-            .cursor_live
-            .lock()
-            .ok()
-            .and_then(|slot| slot.clone())
-    }
-
-    fn set_cursor_forward(&mut self, _on: bool) {
-        // Either way the host places the pointer from `cursor()`: forwarded, or on the frame
-        // for the encoder blend.
-        self.signals
-            .host_places_cursor
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn attach_gamescope_cursor(&mut self, targets: crate::GamescopeCursorTargets) {
-        // Gamescope paints no `SPA_META_Cursor`. Idempotent: do not `spawn`
-        // before dropping the old source (two publishers, or a `None` spawn
-        // destroying a working reader).
-        if self._gs_cursor.is_some() {
-            return;
+    fn next_frame(&mut self, budget: crate::FirstFrame) -> Result<CapturedFrame> {
+        use crate::FirstFrame;
+        match budget {
+            FirstFrame::Default => {
+                self.frame_within(FIRST_FRAME_BUDGET, TimeoutVerdict::Conclusive)
+            }
+            FirstFrame::Within(b) => self.frame_within(b, TimeoutVerdict::Conclusive),
+            // Truncated first attempt: expiry re-runs the schedule, does not convict an offer.
+            FirstFrame::Provisional(b) => self.frame_within(b, TimeoutVerdict::Provisional),
         }
-        self._gs_cursor = xfixes_cursor::XFixesCursorSource::spawn(
-            targets,
-            Arc::clone(&self.signals.cursor_live),
-            Arc::clone(&self.signals.frame_size),
-        );
-    }
-
-    fn next_frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
-        self.frame_within(budget, TimeoutVerdict::Conclusive)
-    }
-
-    fn next_frame_within_provisional(&mut self, budget: Duration) -> Result<CapturedFrame> {
-        // Truncated first attempt: expiry re-runs the schedule, does not
-        // convict an offer (`TimeoutVerdict`).
-        self.frame_within(budget, TimeoutVerdict::Provisional)
-    }
-
-    fn supports_arrival_wait(&self) -> bool {
-        true
-    }
-
-    fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        // A driven producer paints on its own requests (`pacer::Pacer`), so
-        // this wait never triggers a paint. It returns on a finished render, not on an
-        // arrival: the producer sends a buffer before it has painted it.
-        if !self.signals.broken.load(Ordering::Relaxed) {
-            let _ = wait_ready(&self.queue, &self.wake, &self.poked, deadline);
-        }
-    }
-
-    fn arrival_poke(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
-        let (poked, ctl) = (self.poked.clone(), self.quit.clone()?);
-        Some(Arc::new(move || {
-            poked.store(true, Ordering::Relaxed);
-            let _ = ctl.send(PwCtl::Poke);
-        }))
-    }
-
-    /// Only the virtual-output path holds one; the portal thread owns its own session. The
-    /// taker links a new stream to the output, so this one stops first: buffers an old link
-    /// still holds when a second one joins stay lost to the producer (KWin: 120 → 30 fps).
-    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
-        let keepalive = self.keepalive.take();
-        if keepalive.is_some() {
-            self.stop_stream();
-        }
-        keepalive
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
@@ -517,6 +459,70 @@ impl Capturer for PortalCapturer {
         Ok(latest)
     }
 
+    /// Sticky terminal states, no frame consumed. Thread-exited is otherwise
+    /// indistinguishable from idle (`streaming` keeps its last value). A
+    /// static desktop stays `Streaming` (no buffers) and is not reported dead.
+    fn is_alive(&self) -> bool {
+        !self.signals.broken.load(Ordering::Relaxed)
+            && self.signals.streaming.load(Ordering::Relaxed)
+            && self.join.as_ref().is_some_and(|j| !j.is_finished())
+    }
+
+    /// A re-sent buffer since the last call: the frame encoded from the earlier read may be
+    /// torn, so the loop refreshes the reference with one IDR.
+    fn events(&mut self) -> Vec<crate::SourceEvent> {
+        let n = self.signals.resent.load(Ordering::Relaxed);
+        let risk = n != self.resent_acked;
+        self.resent_acked = n;
+        if risk {
+            vec![crate::SourceEvent::ReferenceRisk]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// [`pf_frame::hdr::generic_hdr10`] once 10-bit PQ negotiated. Neither Linux producer
+    /// exposes mastering through the screencast (Mutter has none; gamescope's
+    /// `VK_EXT_hdr_metadata` stops at the compositor). The native loop prefers the client's
+    /// volume when sent (`Hello::display_hdr`).
+    fn colour(&self) -> crate::ColourFacts {
+        crate::ColourFacts {
+            hdr_meta: self
+                .signals
+                .hdr_negotiated
+                .load(Ordering::Relaxed)
+                .then(pf_frame::hdr::generic_hdr10),
+            sdr_fp16: false,
+        }
+    }
+
+    fn feed(&mut self) -> Option<&mut dyn crate::Feed> {
+        Some(self)
+    }
+
+    fn cursor(&mut self) -> Option<&mut dyn crate::CursorSource> {
+        Some(self)
+    }
+}
+
+impl crate::Feed for PortalCapturer {
+    fn wait_arrival(&mut self, deadline: std::time::Instant) {
+        // A driven producer paints on its own requests (`pacer::Pacer`), so
+        // this wait never triggers a paint. It returns on a finished render, not on an
+        // arrival: the producer sends a buffer before it has painted it.
+        if !self.signals.broken.load(Ordering::Relaxed) {
+            let _ = wait_ready(&self.queue, &self.wake, &self.poked, deadline);
+        }
+    }
+
+    fn arrival_poke(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let (poked, ctl) = (self.poked.clone(), self.quit.clone()?);
+        Some(Arc::new(move || {
+            poked.store(true, Ordering::Relaxed);
+            let _ = ctl.send(PwCtl::Poke);
+        }))
+    }
+
     fn set_active(&mut self, active: bool) {
         self.signals.active.store(active, Ordering::Relaxed);
         if !active {
@@ -532,33 +538,34 @@ impl Capturer for PortalCapturer {
         }
     }
 
-    /// Sticky terminal states, no frame consumed. Thread-exited is otherwise
-    /// indistinguishable from idle (`streaming` keeps its last value). A
-    /// static desktop stays `Streaming` (no buffers) and is not reported dead.
-    fn is_alive(&self) -> bool {
-        !self.signals.broken.load(Ordering::Relaxed)
-            && self.signals.streaming.load(Ordering::Relaxed)
-            && self.join.as_ref().is_some_and(|j| !j.is_finished())
+    /// Only the virtual-output path holds one; the portal thread owns its own session. The
+    /// taker links a new stream to the output, so this one stops first: buffers an old link
+    /// still holds when a second one joins stay lost to the producer (KWin: 120 → 30 fps).
+    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
+        let keepalive = self.keepalive.take();
+        if keepalive.is_some() {
+            self.stop_stream();
+        }
+        keepalive
     }
+}
 
-    /// A re-sent buffer since the last call: the frame encoded from the earlier read may be
-    /// torn, so the loop refreshes the reference with one IDR.
-    fn take_reference_risk(&mut self) -> bool {
-        let n = self.signals.resent.load(Ordering::Relaxed);
-        let risk = n != self.resent_acked;
-        self.resent_acked = n;
-        risk
-    }
-
-    /// [`pf_frame::hdr::generic_hdr10`] once 10-bit PQ negotiated. Neither Linux producer
-    /// exposes mastering through the screencast (Mutter has none; gamescope's
-    /// `VK_EXT_hdr_metadata` stops at the compositor). The native loop prefers the client's
-    /// volume when sent (`Hello::display_hdr`).
-    fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
+impl crate::CursorSource for PortalCapturer {
+    fn overlay(&mut self) -> Option<pf_frame::CursorOverlay> {
+        // Includes cursor-only buffers. Gamescope fills this via XFixes.
         self.signals
-            .hdr_negotiated
-            .load(Ordering::Relaxed)
-            .then(pf_frame::hdr::generic_hdr10)
+            .cursor_live
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    fn set_forward(&mut self, _client_draws: bool) {
+        // Either way the host places the pointer from `overlay()`: forwarded, or on the frame
+        // for the encoder blend.
+        self.signals
+            .host_places_cursor
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

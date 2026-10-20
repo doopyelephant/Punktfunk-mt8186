@@ -153,7 +153,7 @@ impl IddPushCapturer {
         use pf_frame::recovery::{Stage, StageOutcome};
         Some(match stage {
             Stage::PresentationReset => {
-                if self.restart_presentation_in_place() {
+                if crate::DisplayControl::restart_presentation(self) {
                     StageOutcome::Applied
                 } else {
                     StageOutcome::Failed

@@ -13,9 +13,9 @@ use crate::windows::cursor_state::{Action, Event, Source};
 use cursor::SECTION_SERIAL_TAG;
 
 impl IddPushCapturer {
-    /// Overlay source for [`Capturer::cursor`] and the shape the client draws: the poller's
-    /// position and visibility with the section's OS-rendered shape when it holds one of the
-    /// cursor's class ([`with_section_shape`]); the section alone once the poller is gone.
+    /// Overlay source for [`crate::CursorSource::overlay`] and the shape the client draws: the
+    /// poller's position and visibility with the section's OS-rendered shape when it holds one
+    /// of the cursor's class ([`with_section_shape`]); the section alone once the poller is gone.
     pub(super) fn live_cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
         let alive = self.cursor_poll.as_ref().is_some_and(|p| p.alive());
         match self.cursor_model.source(alive) {

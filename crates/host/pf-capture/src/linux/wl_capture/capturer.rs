@@ -2,7 +2,7 @@
 
 use super::spawn;
 use crate::linux::{drain_edges, health_identity, wait_for_frame, CaptureSignals, FrameSlot};
-use crate::{CapturedFrame, Capturer, ZeroCopyPolicy};
+use crate::{CapturedFrame, Capturer, Feed, FirstFrame, ZeroCopyPolicy};
 use anyhow::{anyhow, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -79,12 +79,8 @@ impl WlCapturer {
     }
 }
 
-impl Capturer for WlCapturer {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
-        self.next_frame_within(Duration::from_secs(10))
-    }
-
-    fn next_frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
+impl WlCapturer {
+    fn frame_within(&mut self, budget: Duration) -> Result<CapturedFrame> {
         let deadline = std::time::Instant::now() + budget;
         loop {
             if let Some(f) = self.take_frame() {
@@ -118,13 +114,15 @@ impl Capturer for WlCapturer {
             }
         }
     }
+}
 
-    fn supports_arrival_wait(&self) -> bool {
-        true
-    }
-
-    fn wait_arrival(&mut self, deadline: std::time::Instant) {
-        wait_for_frame(&self.slot, &self.wake, &self.signals.broken, deadline);
+impl Capturer for WlCapturer {
+    /// No offer to convict: a provisional budget is only a shorter wait.
+    fn next_frame(&mut self, budget: FirstFrame) -> Result<CapturedFrame> {
+        match budget {
+            FirstFrame::Default => self.frame_within(Duration::from_secs(10)),
+            FirstFrame::Within(b) | FirstFrame::Provisional(b) => self.frame_within(b),
+        }
     }
 
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
@@ -144,21 +142,30 @@ impl Capturer for WlCapturer {
         Ok(latest)
     }
 
-    fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
-        self.signals.cursor_live.lock().ok().and_then(|c| c.clone())
-    }
-
     fn is_alive(&self) -> bool {
         !self.signals.broken.load(Ordering::Relaxed)
             && self.join.as_ref().is_some_and(|j| !j.is_finished())
     }
 
-    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
-        self.keepalive.take()
+    fn colour(&self) -> crate::ColourFacts {
+        crate::ColourFacts {
+            hdr_meta: self.hdr_meta,
+            sdr_fp16: false,
+        }
     }
 
-    fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
-        self.hdr_meta
+    fn feed(&mut self) -> Option<&mut dyn Feed> {
+        Some(self)
+    }
+}
+
+impl Feed for WlCapturer {
+    fn wait_arrival(&mut self, deadline: std::time::Instant) {
+        wait_for_frame(&self.slot, &self.wake, &self.signals.broken, deadline);
+    }
+
+    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
+        self.keepalive.take()
     }
 }
 

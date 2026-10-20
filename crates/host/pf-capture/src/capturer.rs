@@ -1,11 +1,17 @@
-//! The source contract the stream loops hold: [`Capturer`], its fault and health types,
-//! and the host-built closures a Windows source sends through.
+//! The source contract the stream loops hold: [`Capturer`], the roles a source may expose, the
+//! events it raises, and the host-built closures a Windows source sends through.
+//!
+//! Every source implements the core. A feed, a cursor, display control, supervision and a
+//! remote encoder are roles, each reached through an accessor that defaults to `None`. A method
+//! that one kind of source needs belongs on a role, never on the core: `docs/adr/0001`.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use pf_frame::CapturedFrame;
-
-#[cfg(target_os = "windows")]
-use crate::WorkerEndpoint;
+use pf_frame::health::EncoderTelemetry;
+use pf_frame::recovery::{Stage, StageOutcome};
+use pf_frame::{CapturedFrame, CursorOverlay, HdrMeta};
 
 /// A FATAL capture fault: retrying `try_latest` cannot help — the caller must rebuild the
 /// capture attachment or fail the session. Carried inside the `anyhow::Error` a capture call
@@ -97,198 +103,222 @@ impl std::fmt::Display for DisplayStillAlive {
     }
 }
 
-/// Produces frames without blocking the compositor. The Linux portal publishes
-/// into a one-deep overwriting slot (drop-oldest): a stalled consumer still
-/// sees the freshest frame.
+/// What a stream loop holds. A pixel source hands it pixels; a remote-encoder source hands it
+/// the news that an encoder it does not run took a frame (`FramePayload::Pixelless`).
 pub trait Capturer: Send {
-    fn next_frame(&mut self) -> Result<CapturedFrame>;
+    /// A frame within `budget`, blocking. The loop takes an attach's first frame this way; a
+    /// synthetic source answers every call.
+    fn next_frame(&mut self, budget: FirstFrame) -> Result<CapturedFrame>;
 
-    /// Hand the virtual output's keepalive back so a capture-only rebuild can re-attach to the
-    /// live output. `None` when this capturer holds none, or already gave it up; the output is
-    /// then released when the capturer drops, as before.
-    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
-        None
-    }
-
-    /// [`next_frame`](Self::next_frame) with a caller-chosen first-frame budget.
-    /// A PipeWire stream can sit in `Streaming` with no buffer; retry shortens
-    /// the first wait instead of blocking the default. Backends without an
-    /// internal wait budget ignore it (the default delegates).
-    fn next_frame_within(&mut self, _budget: std::time::Duration) -> Result<CapturedFrame> {
-        self.next_frame()
-    }
-
-    /// [`next_frame_within`](Self::next_frame_within) whose expiry is retry, not
-    /// a capture verdict. Must not latch process-wide HDR/dmabuf-only downgrades:
-    /// a cold start can outlive the short window and still accept every offer.
-    /// Backends that latch nothing from a timeout just delegate.
-    fn next_frame_within_provisional(
-        &mut self,
-        budget: std::time::Duration,
-    ) -> Result<CapturedFrame> {
-        self.next_frame_within(budget)
-    }
-
-    /// Non-blocking: the freshest frame since the last call, or `None` so the
-    /// caller reuses its last frame and holds a steady output rate. Default
-    /// produces a frame each call; the portal drains without blocking.
+    /// Non-blocking: the freshest frame since the last call, or `None` so the loop repeats its
+    /// last frame and holds its output rate. Default: a new frame each call.
     fn try_latest(&mut self) -> Result<Option<CapturedFrame>> {
-        self.next_frame().map(Some)
+        self.next_frame(FirstFrame::Default).map(Some)
     }
 
-    /// Whether [`wait_arrival`](Self::wait_arrival) is usable. `false` (default)
-    /// keeps the encode loop on its fixed-cadence tick.
-    fn supports_arrival_wait(&self) -> bool {
-        false
-    }
-
-    /// Block until a frame is ready for [`try_latest`](Self::try_latest) or
-    /// `deadline` passes. Must not consume the frame. Only called when
-    /// [`supports_arrival_wait`](Self::supports_arrival_wait) is `true`;
-    /// errors surface at the following `try_latest`.
-    fn wait_arrival(&mut self, _deadline: std::time::Instant) {}
-
-    /// A handle that ends a running [`wait_arrival`](Self::wait_arrival) now, with no
-    /// frame, so the loop ticks on the frame it has. For the control task: a client's
-    /// recovery ask goes out at once instead of after the next arrival. `None` (default)
-    /// leaves the ask for the next tick.
-    fn arrival_poke(&self) -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
-        None
-    }
-
-    /// Gate expensive per-frame work so the capturer can stay alive between
-    /// streams. The portal skips the de-pad copy while inactive and flushes
-    /// its frame mailbox on `false`. `&mut self`: the mailbox flush cannot share.
-    fn set_active(&mut self, _active: bool) {}
-
-    /// Whether this capturer can still produce frames. A pool must consult this
-    /// before reuse: zero-copy poison, a dead PipeWire thread, or a source that
-    /// never returns to `Streaming` makes every later call fail. Default `true`.
+    /// Whether this source can still produce frames, without consuming one. A pool consults it
+    /// before reuse: a poisoned import or a dead producer fails every later call.
     fn is_alive(&self) -> bool {
         true
     }
 
-    /// Live cursor out-of-band from frames (Windows IddCx hardware-cursor
-    /// channel). Preferred over `CapturedFrame::cursor`: pointer-only moves
-    /// produce no frame, so a frame-attached overlay goes stale. Default `None`.
-    fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
+    /// What the loop must act on since the last call, oldest first.
+    fn events(&mut self) -> Vec<SourceEvent> {
+        Vec::new()
+    }
+
+    /// The colour the source delivers now. Live: an HDR flip or a regrade changes it.
+    fn colour(&self) -> ColourFacts {
+        ColourFacts::default()
+    }
+
+    /// [`Feed`]: PipeWire and direct Wayland capture.
+    fn feed(&mut self) -> Option<&mut dyn Feed> {
         None
     }
 
-    /// Cursor-render flip: `true` keeps the pointer out of the video (client
-    /// draws it); `false` puts it back in. A declared IddCx hardware cursor is
-    /// irrevocable — DWM cannot take the job back. On Linux either call means
-    /// the host places [`cursor`](Self::cursor), so a CPU copy stops baking it.
-    /// Default no-op.
-    fn set_cursor_forward(&mut self, _on: bool) {}
-
-    /// Attach a gamescope cursor source. gamescope paints no `SPA_META_Cursor`,
-    /// so [`cursor`](Self::cursor) stays empty unless the portal reads nested
-    /// Xwaylands (one per `--xwayland-count`) over X11. Called once, after build.
-    #[cfg(target_os = "linux")]
-    fn attach_gamescope_cursor(&mut self, _targets: GamescopeCursorTargets) {}
-
-    /// Static HDR mastering metadata (SMPTE ST.2086 + CLL) when the capturer can
-    /// read it (Windows `IDXGIOutput6::GetDesc1`), or a generic HDR10 block once
-    /// an HDR stream is negotiated (Linux exposes no real mastering volume).
-    /// Forwarded to the encoder (SEI) and the client (`0xCE`). May change if regraded.
-    fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
+    /// [`CursorSource`]: PipeWire and IDD-push.
+    fn cursor(&mut self) -> Option<&mut dyn CursorSource> {
         None
     }
 
-    /// The display composes FP16 under an SDR transfer (Windows SDR wide colour), so an SDR
-    /// stream's encoder reads FP16. Default `false`.
-    fn composes_sdr_fp16(&self) -> bool {
-        false
-    }
-
-    // `capture_target_id` and `resize_output` are one operation split in half:
-    // `Some` from the id promises resize works; resize without the id cannot
-    // check the reconfigured display is still this capturer's. Both defaults decline.
-
-    /// OS display-target id this capturer is bound to (Windows IDD-push). Resize
-    /// uses it to verify the reconfigured display is still this one. In-place
-    /// resize keeps the target; a re-arrival fallback mints a new one. `None`
-    /// = no such identity.
-    fn capture_target_id(&self) -> Option<u32> {
+    /// [`DisplayControl`]: IDD-push.
+    fn display(&mut self) -> Option<&mut dyn DisplayControl> {
         None
     }
 
-    /// Host-initiated output resize after the session handler has committed the
-    /// new mode. Resize the capture surface now: no descriptor-poll debounce,
-    /// no teardown. `true` handled; `false` rebuilds.
-    fn resize_output(&mut self, _width: u32, _height: u32) -> bool {
-        false
-    }
-
-    /// Make the OS present to this display again at the current mode. An
-    /// exclusive-topology eviction leaves the target active but unpresented, so the
-    /// descriptor never changes and the two-strike debounce never trips. `true`
-    /// handled; `false` unrecoverable.
-    fn restart_presentation_in_place(&mut self) -> bool {
-        false
-    }
-
-    /// A staged-recovery episode closed on new source frames since the last
-    /// call: the measured local outage, from the last source frame before the
-    /// stall to the frame that proved recovery. The stream loop forces an IDR
-    /// and announces the gap. `None` = nothing recovered.
-    fn take_recovered_outage(&mut self) -> Option<std::time::Duration> {
+    /// [`Supervised`]: IDD-push and WGC.
+    fn supervised(&mut self) -> Option<&mut dyn Supervised> {
         None
     }
 
-    /// Since the last call, the frame the encoder last read may be torn (a
-    /// producer re-sent a buffer this side still held). The stream loop
-    /// answers with one IDR. Default: never.
-    fn take_reference_risk(&mut self) -> bool {
-        false
-    }
-
-    /// Live capture health for the operator surface (WP18). `None` = this
-    /// capturer does not classify (Linux portal, synthetic sources).
-    fn health(&self) -> Option<CaptureHealth> {
-        None
-    }
-
-    /// The session encoder's own clocks (`Encoder::telemetry`), handed over
-    /// once per loop tick before `try_latest` so the supervisor classifies the
-    /// encode leg on them. Default: ignored.
-    fn observe_encoder(&mut self, _t: Option<pf_frame::health::EncoderTelemetry>) {}
-
-    /// A recovery rung whose actuator the stream loop owns because the
-    /// encoder does (`EncoderReset`) or the display manager does
-    /// (`DriverCycle`). The loop runs it and answers with [`Self::stage_done`].
-    /// Default: never.
-    fn take_pending_stage(&mut self) -> Option<pf_frame::recovery::Stage> {
-        None
-    }
-
-    /// The loop-owned actuator for `stage` finished with `outcome`.
-    fn stage_done(
-        &mut self,
-        _stage: pf_frame::recovery::Stage,
-        _outcome: pf_frame::recovery::StageOutcome,
-    ) {
-    }
-
-    /// The monitor and WUDFHost an in-driver encoder opens against
-    /// ([`open_driver_encoder`](crate::open_driver_encoder)). `None` = not an IDD-push source.
-    #[cfg(target_os = "windows")]
-    fn driver_endpoint(&self) -> Option<DriverEndpoint> {
-        None
-    }
-
-    /// The capture worker this session's encoder opens in
-    /// ([`open_worker_encoder`](crate::open_worker_encoder)). `None` = the source is not a
-    /// worker's.
-    #[cfg(target_os = "windows")]
-    fn worker_endpoint(&self) -> Option<WorkerEndpoint> {
+    /// [`RemoteEncoder`]: IDD-push and WGC.
+    fn remote_encoder(&self) -> Option<&dyn RemoteEncoder> {
         None
     }
 }
 
+/// How long [`Capturer::next_frame`] may wait, and what its expiry means. A remote-encoder or
+/// synthetic source has no offer to convict and waits its own way whatever is asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstFrame {
+    /// The source's full wait: 10 s for a Linux pixel source, 20 s for a remote encoder.
+    Default,
+    /// At most this long; expiry judges the offer as `Default`'s does.
+    Within(Duration),
+    /// At most this long, and expiry convicts no offer: a cold producer can outlive a short
+    /// first attempt and still accept every offer, so no HDR or dmabuf downgrade latches.
+    Provisional(Duration),
+}
+
+/// What a source asks of the loop, drained by [`Capturer::events`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceEvent {
+    /// The frame the encoder last read may be torn: the producer re-sent a buffer this side
+    /// still held. The loop answers with one IDR.
+    ReferenceRisk,
+    /// A staged-recovery episode closed on new source frames: the local outage, from the last
+    /// frame before the stall to the one that proved recovery. The loop forces an IDR and
+    /// announces the gap.
+    RecoveredOutage(Duration),
+    /// A recovery rung whose actuator the loop owns, because it owns the encoder
+    /// (`EncoderReset`) or the display manager does (`DriverCycle`). The loop runs it and
+    /// answers through [`Supervised::stage_done`].
+    RunStage(Stage),
+}
+
+/// The colour a source delivers, as a value the loop reads at encoder open and every tick.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColourFacts {
+    /// Static HDR mastering metadata while the source delivers PQ, `None` for SDR. Direct
+    /// Wayland capture sends the output's own volume; every other source the generic HDR10
+    /// block, as neither OS exposes a real one through capture.
+    pub hdr_meta: Option<HdrMeta>,
+    /// The display composes FP16 under an SDR transfer (Windows SDR wide colour), so an SDR
+    /// stream's encoder reads FP16.
+    pub sdr_fp16: bool,
+}
+
+/// A source whose producer runs on its own thread into a mailbox: PipeWire and direct Wayland
+/// capture. The loop paces on its arrivals instead of a fixed tick, pauses it between streams,
+/// and takes back the output it holds for a capture-only rebuild.
+pub trait Feed {
+    /// Block until a frame is ready for [`Capturer::try_latest`] or `deadline` passes. Never
+    /// consumes the frame; an error surfaces at the following `try_latest`.
+    fn wait_arrival(&mut self, deadline: Instant);
+
+    /// A handle that ends a running [`Self::wait_arrival`] now, with no frame, so a recovery
+    /// ask from the control task goes out at once. `None`: the ask waits for the next tick.
+    fn arrival_poke(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
+
+    /// Gate the producer's per-frame work. A PipeWire stream drops every buffer until `true`;
+    /// `false` also flushes the mailbox, so a pooled source never hands the next stream the
+    /// last one's frame. Default: always active.
+    fn set_active(&mut self, _active: bool) {}
+
+    /// The output's keepalive, so a capture-only rebuild re-attaches to the live output.
+    /// `None` when the feed holds none or gave it up; the output then goes with the source.
+    fn take_keepalive(&mut self) -> Option<Box<dyn Send>> {
+        None
+    }
+}
+
+/// A source that sees the pointer apart from its frames: PipeWire (`SPA_META_Cursor`, or
+/// XFixes on gamescope) and IDD-push (the IddCx hardware-cursor channel). The loop forwards the
+/// overlay to a client that draws the pointer, or puts it on the frame for the encoder blend.
+pub trait CursorSource {
+    /// The live pointer. Preferred over `CapturedFrame::cursor`: a pointer-only move produces
+    /// no frame, so a frame's overlay goes stale.
+    fn overlay(&mut self) -> Option<CursorOverlay>;
+
+    /// `true`: the client draws the pointer, so it stays out of the video; `false`: back in. A
+    /// declared IddCx hardware cursor is irrevocable. On Linux either call means the host
+    /// places the pointer, so a CPU copy stops baking it in.
+    fn set_forward(&mut self, client_draws: bool);
+}
+
+/// The captured display is the host's to mode-set in place: IDD-push. The native loop resizes
+/// and restores presentation through it instead of rebuilding the pipeline.
+pub trait DisplayControl {
+    /// The OS display target this source is bound to. A resize that lands on another target
+    /// (a re-arrival) is a rebuild.
+    fn target_id(&self) -> u32;
+
+    /// Adopt the mode the session handler already committed: no descriptor debounce, no
+    /// teardown. `false`: rebuild.
+    fn resize(&mut self, width: u32, height: u32) -> bool;
+
+    /// Make the OS present to this display again at its current mode, after an exclusive
+    /// topology left it active but unpresented. `false`: unrecoverable in place.
+    fn restart_presentation(&mut self) -> bool;
+}
+
+/// A source a supervisor classifies: IDD-push (classify, and run the recovery ladder) and WGC
+/// (classify only: a quiet mirror is idle, never a stall). The loop feeds it the encoder's
+/// clocks each tick, publishes its health, and answers the rungs it raises.
+pub trait Supervised {
+    /// The session encoder's clocks, once per tick before `try_latest`.
+    fn observe(&mut self, telemetry: Option<EncoderTelemetry>);
+
+    /// Live health for the operator surface.
+    fn health(&self) -> CaptureHealth;
+
+    /// The loop-owned actuator for a [`SourceEvent::RunStage`] finished with `outcome`. A
+    /// source that runs no ladder raises none.
+    fn stage_done(&mut self, _stage: Stage, _outcome: StageOutcome) {}
+}
+
+/// The source's encoder runs in another process behind an AU section: the pf-vdisplay driver
+/// in WUDFHost (IDD-push) or the capture worker (WGC). The loop opens its encoder here, never a
+/// local backend.
+pub trait RemoteEncoder {
+    /// Where the encoder runs, for the session record's label.
+    fn site(&self) -> EncoderSite;
+
+    /// Open the encoder for `params` and hand back the loop's proxy. No fallback follows: a
+    /// refused open ends the session (the driver's own refusal is `DriverEncodeOpenError`).
+    fn open(&self, params: &DriverEncodeParams) -> Result<Box<dyn pf_encode_core::Encoder>>;
+}
+
+/// The process a [`RemoteEncoder`] encodes in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncoderSite {
+    Driver,
+    Worker,
+}
+
+/// What the host asks a [`RemoteEncoder`] to open — the session plan as `SET_ENCODE` numbers it.
+#[derive(Clone, Copy, Debug)]
+pub struct DriverEncodeParams {
+    /// 1 H264, 2 HEVC, 3 AV1, 4 PyroWave.
+    pub codec: u32,
+    /// `0` 4:2:0, `1` 4:4:4.
+    pub chroma: u32,
+    pub bit_depth: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_kbps: u32,
+    pub hdr: bool,
+    pub hdr_meta: Option<HdrMeta>,
+    /// The display composes FP16 for this SDR stream (SDR wide colour):
+    /// [`pf_driver_proto::encode::SET_ENCODE_FLAG_SDR_FP16`].
+    pub sdr_fp16: bool,
+    /// H.264/HEVC slices per frame the client takes:
+    /// [`pf_driver_proto::encode::SetEncodeRequest::slices`].
+    pub slices: u32,
+    /// Slice-chunk target; `0` = whole access units.
+    pub wire_chunk_bytes: u32,
+    /// Ordered preference, 0-terminated: 1 NVENC, 2 AMF, 3 QSV, 4 PyroWave.
+    pub backends: [u32; 4],
+    /// First `wire_seq` the driver stamps — the host's current `au_seq`.
+    pub wire_seq_base: u32,
+}
+
 /// Discovers gamescope's nested Xwayland cursor targets — `(DISPLAY, XAUTHORITY)`,
-/// one per `--xwayland-count` — for [`Capturer::attach_gamescope_cursor`].
+/// one per `--xwayland-count` — for [`crate::VirtualOutputOpts::gamescope_cursor`].
 ///
 /// A closure, re-run on a slow cadence: gamescope creates a second Xwayland for
 /// the game but advertises only the first in any child's environ, so a one-shot
@@ -334,12 +364,3 @@ pub type SetEncodeSender = std::sync::Arc<
 #[cfg(target_os = "windows")]
 pub type EncodeCtlSender =
     std::sync::Arc<dyn Fn(&pf_driver_proto::encode::EncodeCtlRequest) -> Result<()> + Send + Sync>;
-
-/// Where an in-driver encoder is opened: the monitor's driver target and the WUDFHost the AU
-/// section is duplicated into ([`Capturer::driver_endpoint`]).
-#[cfg(target_os = "windows")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DriverEndpoint {
-    pub target_id: u32,
-    pub wudf_pid: u32,
-}

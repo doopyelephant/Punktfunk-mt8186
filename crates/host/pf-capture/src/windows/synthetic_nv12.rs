@@ -81,7 +81,7 @@ impl SyntheticNv12Capturer {
 }
 
 impl Capturer for SyntheticNv12Capturer {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
+    fn next_frame(&mut self, _budget: crate::FirstFrame) -> Result<CapturedFrame> {
         let pts_ns = self.frame_idx * 1_000_000_000 / self.fps.max(1) as u64;
         let (w, h) = (self.width as usize, self.height as usize);
         {

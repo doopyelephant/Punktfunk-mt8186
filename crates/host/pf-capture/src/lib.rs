@@ -39,13 +39,9 @@ mod pts_provenance;
 
 mod windows;
 #[cfg(target_os = "windows")]
-pub use self::windows::idd_push::driver_encode::{
-    open_driver_encoder, DriverEncodeOpenError, DriverEncodeParams,
-};
+pub use self::windows::idd_push::driver_encode::DriverEncodeOpenError;
 #[cfg(target_os = "windows")]
-pub use self::windows::wgc::{
-    open_wgc, open_worker_encoder, WgcSource, WorkerEndpoint, WorkerProcess,
-};
+pub use self::windows::wgc::{open_wgc, WgcSource, WorkerProcess};
 #[cfg(target_os = "windows")]
 pub use self::windows::{gpu_pref, synthetic_nv12};
 #[cfg(target_os = "linux")]

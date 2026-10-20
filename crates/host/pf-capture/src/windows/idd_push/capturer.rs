@@ -5,9 +5,9 @@
 //! and then reports the driver's frame cadence as a pixel-less
 //! [`CapturedFrame`] — the driver owns the pixels, so a delivery is only the
 //! news that its encode pool took a new composed frame, and `Ok(None)` means
-//! the desktop composed nothing. The trait impl adds the loop's control points:
-//! encoder telemetry in, recovery stages out, and the in-place presentation
-//! restart the ladder's first rung runs.
+//! the desktop composed nothing. The role impls add the loop's control points:
+//! encoder telemetry in, recovery stages out as events, the in-place resize and
+//! presentation restart, the cursor, and the driver's encoder.
 
 use super::*;
 use crate::windows::cursor_state::Event;
@@ -193,15 +193,7 @@ impl IddPushCapturer {
 }
 
 impl Capturer for IddPushCapturer {
-    fn cursor(&mut self) -> Option<pf_frame::CursorOverlay> {
-        self.live_cursor()
-    }
-
-    fn set_cursor_forward(&mut self, on: bool) {
-        self.cursor_event(Event::ClientDraws(on));
-    }
-
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
+    fn next_frame(&mut self, _budget: crate::FirstFrame) -> Result<CapturedFrame> {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(f) = self.try_consume()? {
@@ -223,21 +215,58 @@ impl Capturer for IddPushCapturer {
         self.try_consume()
     }
 
-    fn hdr_meta(&self) -> Option<pf_frame::HdrMeta> {
+    fn events(&mut self) -> Vec<crate::SourceEvent> {
+        use crate::SourceEvent;
+        let stage = self.pending_stage.take().map(SourceEvent::RunStage);
+        let outage = self
+            .recovered_outage
+            .take()
+            .map(SourceEvent::RecoveredOutage);
+        stage.into_iter().chain(outage).collect()
+    }
+
+    fn colour(&self) -> crate::ColourFacts {
         // BT.2020 PQ while HDR. The driver does not forward IDDCX_HDR10_METADATA;
         // send the same generic HDR10 baseline as the native 0xCE path.
-        self.display_hdr.then(pf_frame::hdr::generic_hdr10)
+        crate::ColourFacts {
+            hdr_meta: self.display_hdr.then(pf_frame::hdr::generic_hdr10),
+            sdr_fp16: self.display_wcg && !self.display_hdr,
+        }
     }
 
-    fn composes_sdr_fp16(&self) -> bool {
-        self.display_wcg && !self.display_hdr
+    fn cursor(&mut self) -> Option<&mut dyn crate::CursorSource> {
+        Some(self)
     }
 
-    fn capture_target_id(&self) -> Option<u32> {
-        Some(self.target_id)
+    fn display(&mut self) -> Option<&mut dyn crate::DisplayControl> {
+        Some(self)
     }
 
-    fn resize_output(&mut self, width: u32, height: u32) -> bool {
+    fn supervised(&mut self) -> Option<&mut dyn crate::Supervised> {
+        Some(self)
+    }
+
+    fn remote_encoder(&self) -> Option<&dyn crate::RemoteEncoder> {
+        Some(self)
+    }
+}
+
+impl crate::CursorSource for IddPushCapturer {
+    fn overlay(&mut self) -> Option<pf_frame::CursorOverlay> {
+        self.live_cursor()
+    }
+
+    fn set_forward(&mut self, client_draws: bool) {
+        self.cursor_event(Event::ClientDraws(client_draws));
+    }
+}
+
+impl crate::DisplayControl for IddPushCapturer {
+    fn target_id(&self) -> u32 {
+        self.target_id
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> bool {
         // The session already committed the new mode. Adopt it now — no two-strike debounce
         // (that stays for external HDR/game mode-sets); the loop's next frame carries the new
         // geometry, which re-opens the driver's encoder.
@@ -260,58 +289,7 @@ impl Capturer for IddPushCapturer {
         true
     }
 
-    fn take_recovered_outage(&mut self) -> Option<Duration> {
-        self.recovered_outage.take()
-    }
-
-    fn health(&self) -> Option<crate::CaptureHealth> {
-        Some(self.recovery.report(Instant::now(), self.encoder.as_ref()))
-    }
-
-    fn observe_encoder(&mut self, t: Option<pf_frame::health::EncoderTelemetry>) {
-        self.encoder = t;
-    }
-
-    fn take_pending_stage(&mut self) -> Option<pf_frame::recovery::Stage> {
-        self.pending_stage.take()
-    }
-
-    fn stage_done(
-        &mut self,
-        stage: pf_frame::recovery::Stage,
-        outcome: pf_frame::recovery::StageOutcome,
-    ) {
-        use pf_frame::recovery::{Stage, StageOutcome};
-        let step = self.finish_stage(stage, outcome);
-        if let Err(e) = self.drive(step) {
-            self.pending_fault = Some(e);
-            return;
-        }
-        // A driver cycle, applied or not, ends this capturer: the WUDFHost its encoder points at
-        // is gone either way, and the driver-death watch fires the cycle outside any episode, so
-        // nothing else bounds a reload that keeps failing.
-        if matches!(stage, Stage::DriverCycle) {
-            let applied = matches!(outcome, StageOutcome::Applied);
-            self.pending_fault = Some(anyhow::anyhow!(
-                "IDD-push: the pf-vdisplay driver cycle {} — ending the capturer so the session \
-                 rebuilds its virtual output",
-                if applied {
-                    "reloaded the adapter"
-                } else {
-                    "FAILED (adapter not reloaded)"
-                }
-            ));
-        }
-    }
-
-    fn driver_endpoint(&self) -> Option<crate::DriverEndpoint> {
-        Some(crate::DriverEndpoint {
-            target_id: self.target_id,
-            wudf_pid: self.broker.wudf_pid,
-        })
-    }
-
-    fn restart_presentation_in_place(&mut self) -> bool {
+    fn restart_presentation(&mut self) -> bool {
         // A target with no ACTIVE path cannot be recovered in place (immunity plan WP10 item 7):
         // a same-mode reset would attach to a known-inactive display. Fail fast — on a FRESH
         // snapshot only; a last-known-good one is not evidence either way.
@@ -352,6 +330,60 @@ impl Capturer for IddPushCapturer {
         );
         self.recovering_since.get_or_insert_with(Instant::now);
         true
+    }
+}
+
+impl crate::Supervised for IddPushCapturer {
+    fn observe(&mut self, t: Option<pf_frame::health::EncoderTelemetry>) {
+        self.encoder = t;
+    }
+
+    fn health(&self) -> crate::CaptureHealth {
+        self.recovery.report(Instant::now(), self.encoder.as_ref())
+    }
+
+    fn stage_done(
+        &mut self,
+        stage: pf_frame::recovery::Stage,
+        outcome: pf_frame::recovery::StageOutcome,
+    ) {
+        use pf_frame::recovery::{Stage, StageOutcome};
+        let step = self.finish_stage(stage, outcome);
+        if let Err(e) = self.drive(step) {
+            self.pending_fault = Some(e);
+            return;
+        }
+        // A driver cycle, applied or not, ends this capturer: the WUDFHost its encoder points at
+        // is gone either way, and the driver-death watch fires the cycle outside any episode, so
+        // nothing else bounds a reload that keeps failing.
+        if matches!(stage, Stage::DriverCycle) {
+            let applied = matches!(outcome, StageOutcome::Applied);
+            self.pending_fault = Some(anyhow::anyhow!(
+                "IDD-push: the pf-vdisplay driver cycle {} — ending the capturer so the session \
+                 rebuilds its virtual output",
+                if applied {
+                    "reloaded the adapter"
+                } else {
+                    "FAILED (adapter not reloaded)"
+                }
+            ));
+        }
+    }
+}
+
+impl crate::RemoteEncoder for IddPushCapturer {
+    fn site(&self) -> crate::EncoderSite {
+        crate::EncoderSite::Driver
+    }
+
+    fn open(&self, params: &crate::DriverEncodeParams) -> Result<Box<dyn pf_encode_core::Encoder>> {
+        super::driver_encode::open_driver_encoder(
+            self.target_id,
+            self.broker.wudf_pid,
+            params,
+            self.set_encode.clone(),
+            self.encode_ctl.clone(),
+        )
     }
 }
 

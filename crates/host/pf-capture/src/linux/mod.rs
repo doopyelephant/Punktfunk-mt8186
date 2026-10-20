@@ -80,7 +80,7 @@ struct CaptureSignals {
     errored: Arc<AtomicBool>,
     /// Buffers the producer sent again while this capture still held them (PipeWire < 1.6,
     /// no `node.reliable`). Each is re-held under a new generation; the count rides the
-    /// provenance line, and [`Capturer::take_reference_risk`] turns a step into one IDR.
+    /// provenance line, and [`crate::SourceEvent::ReferenceRisk`] turns a step into one IDR.
     resent: Arc<std::sync::atomic::AtomicU64>,
     hdr_negotiated: Arc<AtomicBool>,
     /// Thread actually advertised the EGL→CUDA dmabuf-only offer. `plan.build_importer`
@@ -91,7 +91,7 @@ struct CaptureSignals {
     /// buffers that never become frames. Gamescope XFixes publishes here too.
     cursor_live: Arc<std::sync::Mutex<Option<pf_frame::CursorOverlay>>>,
     /// The host forwards or blends [`Self::cursor_live`] itself, so the CPU copy must not
-    /// bake the pointer into its pixels as well. Set by [`Capturer::set_cursor_forward`].
+    /// bake the pointer into its pixels as well. Set by [`crate::CursorSource::set_forward`].
     host_places_cursor: Arc<AtomicBool>,
     /// Packed `(w << 32) | h`; `0` until `param_changed`. Gamescope cursor
     /// maps root-space into frame space (`-w/-h` vs `-W/-H` are independent).

@@ -11,37 +11,10 @@ use super::*;
 use crate::knobs::Knobs;
 use crate::windows::au_assembly::{AuAssembly, AuDump, Clocks};
 use crate::windows::au_reader::{AuReader, AuView};
-use crate::{DriverEndpoint, EncodeCtlSender, SetEncodeSender};
+use crate::{DriverEncodeParams, EncodeCtlSender, SetEncodeSender};
 use pf_driver_proto::encode::{self, au, EncodeCtlRequest, SetEncodeRequest};
 use pf_encode_core::{AuChunk, EncodedFrame, Encoder, EncoderCaps};
 use std::mem::offset_of;
-
-/// What the host asks the driver to open — the session plan as `SET_ENCODE` numbers it.
-#[derive(Clone, Copy, Debug)]
-pub struct DriverEncodeParams {
-    /// 1 H264, 2 HEVC, 3 AV1, 4 PyroWave.
-    pub codec: u32,
-    /// `0` 4:2:0, `1` 4:4:4.
-    pub chroma: u32,
-    pub bit_depth: u32,
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-    pub bitrate_kbps: u32,
-    pub hdr: bool,
-    pub hdr_meta: Option<pf_frame::HdrMeta>,
-    /// The display composes FP16 for this SDR stream (SDR wide colour):
-    /// [`encode::SET_ENCODE_FLAG_SDR_FP16`].
-    pub sdr_fp16: bool,
-    /// H.264/HEVC slices per frame the client takes: [`SetEncodeRequest::slices`].
-    pub slices: u32,
-    /// Slice-chunk target; `0` = whole access units.
-    pub wire_chunk_bytes: u32,
-    /// Ordered preference, 0-terminated: 1 NVENC, 2 AMF, 3 QSV, 4 PyroWave.
-    pub backends: [u32; 4],
-    /// First `wire_seq` the driver stamps — the host's current `au_seq`.
-    pub wire_seq_base: u32,
-}
 
 /// `SET_ENCODE` answered with no encoder open: the driver's failure domain, the backend's raw
 /// code, its stage tag, and the list it walked. No fallback follows; the session ends here.
@@ -193,19 +166,20 @@ impl HandleTarget for ChannelBroker {
     }
 }
 
-/// Open the driver's encoder for `endpoint` and hand back the stream loop's [`Encoder`].
-/// Every open re-raises the WUDFHost's GPU scheduling class, which a driver reload resets.
-/// Structured failure: [`DriverEncodeOpenError`] when the driver walked the list and none
-/// opened, else the delivery error. There is no fallback.
-pub fn open_driver_encoder(
-    endpoint: DriverEndpoint,
+/// Open the driver's encoder for monitor `target_id` in WUDFHost `wudf_pid` and hand back the
+/// stream loop's [`Encoder`]. Every open re-raises the WUDFHost's GPU scheduling class, which a
+/// driver reload resets. Structured failure: [`DriverEncodeOpenError`] when the driver walked
+/// the list and none opened, else the delivery error. There is no fallback.
+pub(crate) fn open_driver_encoder(
+    target_id: u32,
+    wudf_pid: u32,
     params: &DriverEncodeParams,
     set_encode: SetEncodeSender,
     encode_ctl: EncodeCtlSender,
 ) -> Result<Box<dyn Encoder>> {
-    let broker = ChannelBroker::open(endpoint.wudf_pid)?;
+    let broker = ChannelBroker::open(wudf_pid)?;
     broker.raise_gpu_priority();
-    open_remote_encoder(&broker, endpoint.target_id, params, set_encode, encode_ctl)
+    open_remote_encoder(&broker, target_id, params, set_encode, encode_ctl)
 }
 
 /// [`open_driver_encoder`] against any [`HandleTarget`]: create the section, plant its two

@@ -57,6 +57,8 @@ impl IddPushCapturer {
             cursor_sender,
             cursor_forward,
             forwards_to_client,
+            set_encode,
+            encode_ctl,
         } = opts;
         let (pw, ph, _hz) = preferred
             .context("IDD push needs the negotiated mode (WxH) to size the encoder's input")?;
@@ -295,6 +297,8 @@ impl IddPushCapturer {
             shape_from_section: None,
             cursor_forward,
             cursor_sender,
+            set_encode,
+            encode_ctl,
             cursor_model,
             sdr_white_scale: 2.5,
             sdr_white_logged: false,

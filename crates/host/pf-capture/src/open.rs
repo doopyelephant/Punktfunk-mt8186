@@ -8,7 +8,7 @@ use crate::Capturer;
 #[cfg(target_os = "linux")]
 use crate::{hdr_capture_failed, HdrSource};
 #[cfg(target_os = "windows")]
-use crate::{CursorChannelSender, CursorForwardSender};
+use crate::{CursorChannelSender, CursorForwardSender, EncodeCtlSender, SetEncodeSender};
 #[cfg(target_os = "linux")]
 use anyhow::Result;
 
@@ -171,6 +171,9 @@ pub struct VirtualOutputOpts {
     /// The wire rate; the output may run at a multiple of it. `0` derives it from the output's
     /// refresh and the configured multiple.
     pub stream_hz: u32,
+    /// Read the pointer from gamescope's nested Xwaylands: its node carries no
+    /// `SPA_META_Cursor`. `None` everywhere else.
+    pub gamescope_cursor: Option<crate::GamescopeCursorTargets>,
 }
 
 /// Linux capturer for an existing virtual output's PipeWire node. `keepalive` owns the output.
@@ -253,6 +256,10 @@ pub struct IddPushOpts {
     /// The session negotiated a pointer the client draws (`HOST_CAP_CURSOR`). Off, the
     /// pointer reaches the wire only through the driver pool's blend.
     pub forwards_to_client: bool,
+    /// `IOCTL_SET_ENCODE` and `IOCTL_ENCODE_CTL`, which the source's
+    /// [`RemoteEncoder`](crate::RemoteEncoder) opens and drives the driver's encoder through.
+    pub set_encode: SetEncodeSender,
+    pub encode_ctl: EncodeCtlSender,
 }
 
 /// Windows IDD direct-push capturer on a pf-vdisplay target. On failure `keepalive` is handed

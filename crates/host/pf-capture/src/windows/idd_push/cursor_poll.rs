@@ -66,13 +66,10 @@ impl CursorPoller {
     /// the overlay is frame-relative, and a pointer outside the rect is
     /// `visible: false` (per-output, matching shm and the Linux portal).
     ///
-    /// A SEED, not the value: the poll thread re-queries the rect on its [`Self::REATTACH`] cadence.
-    /// It used to be captured once here and used forever for BOTH the desktop→frame offset and the
-    /// `in_rect` test, while both mid-session mode-change paths (`resize_output` and
-    /// `poll_display_hdr`) keep the same poller — so after an in-place resize the
-    /// pointer was clipped to the OLD rect and offset by a stale origin. Re-querying on the poll
-    /// thread is what keeps the CCD call off the capture/encode thread, which is the whole reason
-    /// this poller exists (see `DescriptorPoller`).
+    /// A SEED, not the value: the poll thread re-queries the rect on its [`Self::REATTACH`]
+    /// cadence, because both mid-session mode changes (`DisplayControl::resize`,
+    /// `poll_display_hdr`) keep this poller. The query runs on the poll thread to keep the CCD
+    /// call off the capture thread (see `DescriptorPoller`).
     pub(super) fn spawn(
         ccd: pf_win_display::win_display::CcdTargetKey,
         rect: (i32, i32, i32, i32),

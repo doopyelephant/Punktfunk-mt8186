@@ -226,11 +226,11 @@ pub struct IddPushCapturer {
     recovery: recovery::Supervisor,
     /// A closed episode's measured outage, until the stream loop takes it (WP14).
     recovered_outage: Option<Duration>,
-    /// A rung the stream loop's actuator runs, until it takes it (`take_pending_stage`).
+    /// A rung the stream loop's actuator runs, until `events` hands it over.
     pending_stage: Option<pf_frame::recovery::Stage>,
     /// A typed end the ladder decided off the capture path; `try_consume` returns it next.
     pending_fault: Option<anyhow::Error>,
-    /// The session encoder's clocks from the loop's last `observe_encoder` — the only view
+    /// The session encoder's clocks from the loop's last `Supervised::observe` — the only view
     /// this side has of the driver's frame and access-unit progress.
     encoder: Option<pf_frame::health::EncoderTelemetry>,
     /// Handle-duplication into WUDFHost, and the driver-death probe.
@@ -250,6 +250,9 @@ pub struct IddPushCapturer {
     /// Kept so a re-arrived monitor can be handed the cursor channel again. The driver's worker
     /// does not survive a re-arrival, and the composite render model has no other shape source.
     cursor_sender: Option<crate::CursorChannelSender>,
+    /// `IOCTL_SET_ENCODE` and `IOCTL_ENCODE_CTL`, for [`crate::RemoteEncoder::open`].
+    set_encode: crate::SetEncodeSender,
+    encode_ctl: crate::EncodeCtlSender,
     /// Who draws the pointer, whether the secure desktop has the declare stood down, and
     /// which source the client's shape is read from.
     cursor_model: CursorModel,

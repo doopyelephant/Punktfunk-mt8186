@@ -1,7 +1,7 @@
 //! Sources with no display behind them: a moving BGRx pattern, and a cheap one that keeps
 //! up at 5K.
 
-use crate::Capturer;
+use crate::{Capturer, FirstFrame};
 use anyhow::Result;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 
@@ -32,7 +32,7 @@ impl SyntheticCapturer {
 }
 
 impl Capturer for SyntheticCapturer {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
+    fn next_frame(&mut self, _budget: FirstFrame) -> Result<CapturedFrame> {
         let w = self.width as usize;
         let h = self.height as usize;
         let bpp = Self::BPP;
@@ -101,7 +101,7 @@ impl FastSyntheticCapturer {
 }
 
 impl Capturer for FastSyntheticCapturer {
-    fn next_frame(&mut self) -> Result<CapturedFrame> {
+    fn next_frame(&mut self, _budget: FirstFrame) -> Result<CapturedFrame> {
         if self.noise {
             // Reseed from the frame index so consecutive frames share no
             // structure — large P-frames, not just the keyframe.
