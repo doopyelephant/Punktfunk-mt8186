@@ -33,15 +33,14 @@ use wayland_client::{Connection, EventQueue, QueueHandle};
 
 // The wayland-scanner modules, and the state every callback writes.
 mod protocol;
-// The frame loop's model. Test-only until the pump steps it.
-#[cfg(test)]
+// The frame loop's model: what each compositor event does to the frame out.
 mod frame_loop;
 // Client-allocated dmabufs, and the free list a dropped hold returns them to.
 mod pool;
 // Connect, bind, read the output's colour, start the session, build the pool; the HDR probes.
 mod session;
 pub(crate) use session::{hdr_capture_globals, output_is_hdr10};
-// The frame loop.
+// The frame loop's shell: poll, dispatch, step the model, do what it says.
 mod pump;
 // The encode loop's end of the thread `spawn` starts.
 mod capturer;
@@ -130,6 +129,7 @@ fn spawn(
 
 /// The capture thread's body. A setup failure goes to the opener through `started`, which
 /// falls back to the portal; a failure once streaming ends the loop and marks it broken.
+/// `Ok` goes out only after `open` stored the status and the format the opener reads.
 #[allow(clippy::too_many_arguments)]
 fn run(
     output_name: &str,
@@ -154,9 +154,9 @@ fn run(
     }
 }
 
-/// A capture session ready to stream: what [`session::open`] set up and [`pump::pump`] drives. Fields drop
-/// in declaration order: the buffers and the pool before the importer, every proxy before
-/// the connection.
+/// A capture session ready to stream: what [`session::open`] set up and [`pump::pump`]
+/// drives. Fields drop in declaration order: the buffers and the pool before the importer,
+/// every proxy before the connection.
 struct Opened {
     /// Buffers the encoder does not hold; a returned one writes to `wake_r`.
     free: Arc<FreeList>,

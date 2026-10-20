@@ -2,6 +2,7 @@
 //! [`State`] every callback writes: the globals, the session's constraints, the output's
 //! colour description, and each frame's events.
 
+use super::frame_loop::Event;
 use anyhow::Result;
 use pf_frame::HdrMeta;
 use wayland_client::protocol::{wl_buffer, wl_callback, wl_output, wl_registry, wl_shm};
@@ -93,7 +94,8 @@ pub(super) use src_proto::ext_image_capture_source_v1::ExtImageCaptureSourceV1 a
 pub(super) use src_proto::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1 as OutputSourceManager;
 
 /// Everything the Wayland callbacks mutate, in one place: `wayland-client` dispatches
-/// against a single state value.
+/// against a single state value. The setup reads its flags; the frame loop steps on
+/// [`Self::events`].
 pub(super) struct State {
     // Globals, bound once.
     pub(super) source_mgr: Option<OutputSourceManager>,
@@ -108,6 +110,7 @@ pub(super) struct State {
     /// `(fourcc, modifiers)` in the order advertised.
     pub(super) dmabuf_formats: Vec<(u32, Vec<u64>)>,
     pub(super) constraints_done: bool,
+    /// The session stopped. The setup's waits end on it; the frame loop reads it at its top.
     pub(super) stopped: bool,
     /// The compositor marked a `create_immed` buffer failed.
     pub(super) import_failed: bool,
@@ -119,18 +122,12 @@ pub(super) struct State {
     pub(super) desc_failed: Option<String>,
     pub(super) color_pending: OutputColor,
     pub(super) color_done: bool,
-    /// The output was re-lit in another encoding: the pool's depth may be wrong now.
-    pub(super) color_changed: bool,
 
-    // Per-frame.
-    /// Set by `ready`; the loop publishes and re-arms.
-    pub(super) ready: bool,
-    pub(super) failed: Option<u32>,
-    /// Compositor's presentation stamp for the frame in flight, ns.
+    /// Compositor's presentation stamp for the frame in flight, ns. Its `ready` takes it.
     pub(super) presented_ns: Option<u64>,
-
-    /// A renegotiation (the session re-sends constraints) invalidates the pool.
-    pub(super) resized: bool,
+    /// What the frame loop steps on, in arrival order. The loop drains it after each dispatch;
+    /// events from the setup's round trips wait for the first.
+    pub(super) events: Vec<Event>,
 }
 
 impl State {
@@ -262,7 +259,7 @@ impl Dispatch<CmOutput, ()> for State {
     ) {
         // The interface's only event.
         let CmOutputEvent::ImageDescriptionChanged = event;
-        st.color_changed = true;
+        st.events.push(Event::ColourChanged);
     }
 }
 
@@ -391,7 +388,7 @@ impl Dispatch<CaptureSession, ()> for State {
             SessionEvent::BufferSize { width, height } => {
                 if st.constraints_done && st.size != Some((width, height)) {
                     // A second constraint batch is a mode change: the pool no longer fits.
-                    st.resized = true;
+                    st.events.push(Event::Resized);
                 }
                 st.size = Some((width, height));
             }
@@ -425,13 +422,14 @@ impl Dispatch<CaptureFrame, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            FrameEvent::Ready => st.ready = true,
-            FrameEvent::Failed { reason } => {
-                st.failed = Some(match reason {
-                    WEnum::Value(v) => v as u32,
-                    WEnum::Unknown(v) => v,
-                });
-            }
+            // `presentation_time` comes before `ready`, so the frame's stamp is in by now.
+            FrameEvent::Ready => st.events.push(Event::Ready {
+                presented: st.presented_ns.take(),
+            }),
+            FrameEvent::Failed { reason } => st.events.push(Event::Failed(match reason {
+                WEnum::Value(v) => v as u32,
+                WEnum::Unknown(v) => v,
+            })),
             FrameEvent::PresentationTime {
                 tv_sec_hi,
                 tv_sec_lo,
@@ -466,11 +464,8 @@ pub(super) fn new_state() -> Result<State> {
         desc_failed: None,
         color_pending: OutputColor::default(),
         color_done: false,
-        color_changed: false,
-        ready: false,
-        failed: None,
         presented_ns: None,
-        resized: false,
+        events: Vec::new(),
     })
 }
 

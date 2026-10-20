@@ -365,7 +365,8 @@ pub(super) fn open(
         all_params.push(params);
     }
     // A refused import comes back later: as a fatal protocol error, or `failed` on the
-    // params. Both must land here, while the caller can still fall back to the portal.
+    // params. Both must land here, before the status below, while the caller can still fall
+    // back to the portal.
     queue
         .roundtrip(&mut st)
         .context("import the capture dmabufs")?;
