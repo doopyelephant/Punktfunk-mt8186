@@ -360,6 +360,8 @@ pub(super) struct Negotiated {
     pub(super) probe_only: bool,
     /// PyroWave's bits per pixel for this session: the client's quality, else the host's.
     pub(super) pyrowave_bpp: f64,
+    /// H.264/HEVC slices per frame ([`crate::session_plan::client_slices`]).
+    pub(super) slices: u32,
     /// This host's end of the path, for every `StreamConfig`.
     pub(super) host_link: punktfunk_core::quic::HostLink,
     pub(super) compositor: Option<crate::vdisplay::Compositor>,
@@ -457,6 +459,7 @@ pub(super) async fn negotiate(
     // After depth + chroma: PyroWave Automatic is a ~bpp pin that scales with both, at the
     // client's quality when it sent one.
     let pyrowave_bpp = session_pyrowave_bpp(first.pyrowave_bpp_x100);
+    let slices = crate::session_plan::client_slices(hello.video_caps, first.slices);
     let bitrate_kbps = resolve_bitrate_kbps_for(
         codec,
         hello.bitrate_kbps,
@@ -641,9 +644,8 @@ pub(super) async fn negotiate(
                 // Read back off Welcome so the prepared display and session wiring cannot
                 // disagree.
                 cursor_forward: welcome.host_caps & punktfunk_core::quic::HOST_CAP_CURSOR != 0,
-                // Same bit SessionContext reads; a different slice count would change the
-                // wire mid-flow.
-                multi_slice: hello.video_caps & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE != 0,
+                // The count SessionContext reads; a different one would change the wire mid-flow.
+                slices,
                 bitrate_kbps,
                 // The build may re-resolve if the source delivers a different size.
                 bitrate_auto: hello.bitrate_kbps == 0,
@@ -692,6 +694,7 @@ pub(super) async fn negotiate(
         client_link: first.link,
         probe_only: first.probe_only,
         pyrowave_bpp,
+        slices,
         host_link,
         compositor,
         gamescope_route,

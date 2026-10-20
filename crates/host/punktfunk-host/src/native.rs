@@ -1181,6 +1181,7 @@ pub(crate) async fn run_admitted(
         client_link,
         probe_only,
         pyrowave_bpp,
+        slices,
         host_link,
         compositor,
         gamescope_route,
@@ -1682,7 +1683,7 @@ pub(crate) async fn run_admitted(
                 cursor_forward,
                 // Sentinel-headed streamed blocks: ship early FEC while the AU tail still encodes.
                 streamed_au: hello.video_caps & punktfunk_core::quic::VIDEO_CAP_STREAMED_AU != 0,
-                multi_slice: hello.video_caps & punktfunk_core::quic::VIDEO_CAP_MULTI_SLICE != 0,
+                slices,
                 conn,
                 launch: launch_command,
                 launch_target,

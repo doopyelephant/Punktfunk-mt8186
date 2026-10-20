@@ -576,8 +576,9 @@ pub(super) struct SessionContext {
     pub(super) conn: super::link::SessionLink,
     pub(super) cursor_forward: bool,
     pub(super) streamed_au: bool,
-    /// `false` = single-slice. TV-SoC decoders (Amlogic) wedge on multi-slice.
-    pub(super) multi_slice: bool,
+    /// H.264/HEVC slices per frame; 1 = single-slice. TV-SoC decoders (Amlogic) wedge on
+    /// multi-slice.
+    pub(super) slices: u32,
     pub(super) launch: Option<String>,
     pub(super) launch_target: Option<crate::library::LaunchTarget>,
     /// This session's launch record, claimed before prep and the launch hold.

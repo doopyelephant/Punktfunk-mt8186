@@ -253,6 +253,7 @@ async fn knock_once(conn: &quinn::Connection, name: &str) -> Result<()> {
         link: Default::default(),
         probe_only: false,
         pyrowave_bpp_x100: 0,
+        slices: 0,
         resume: None,
         suites: vec![crate::crypto::MediaSuite::Aes128Gcm],
         features: Default::default(),
