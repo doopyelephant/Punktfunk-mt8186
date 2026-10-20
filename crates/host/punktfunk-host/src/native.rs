@@ -78,6 +78,9 @@ use stream::{
 mod wiring;
 pub use stream::{Content, KeyframeAnswer, SynthAbrShape, DEFAULT_IDR_PCT};
 use wiring::SessionWiring;
+/// Every `PUNKTFUNK_*` read of the plane.
+mod knobs;
+pub(crate) use knobs::HostKnobs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Punktfunk1Source {
@@ -200,29 +203,11 @@ pub(crate) struct NativeServe {
 /// NVENC session cap (high-res split-encode holds two). Overflow waits in the accept queue.
 pub(crate) const DEFAULT_MAX_CONCURRENT: usize = 4;
 
-/// `PUNKTFUNK_IDLE_TIMEOUT_MS`; `None` (unset/invalid/zero) = core default (8 s). Clamped
-/// downstream to ≥1 s with a keep-alive that scales, so a live session never false-closes.
-pub(crate) fn idle_timeout_from_env() -> Option<std::time::Duration> {
-    pf_host_config::knob("PUNKTFUNK_IDLE_TIMEOUT_MS")
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&ms| ms > 0)
-        .map(std::time::Duration::from_millis)
-}
-
-/// `PUNKTFUNK_SOURCE=software`: a software-encoded test picture instead of a display, so a
-/// headless box with the management API can prove a client end to end. Anything else is the
-/// display.
-fn source_from_env() -> Punktfunk1Source {
-    match std::env::var("PUNKTFUNK_SOURCE").as_deref() {
-        Ok("software") => Punktfunk1Source::Software,
-        _ => Punktfunk1Source::Virtual,
-    }
-}
-
 pub(crate) fn native_serve_opts(cfg: &NativeServe) -> Punktfunk1Options {
+    let knobs = HostKnobs::get();
     Punktfunk1Options {
         port: cfg.port,
-        source: source_from_env(),
+        source: knobs.source,
         seconds: 7 * 24 * 3600, // 7 days: a cap, not a cut of a live stream
         frames: 0,
         max_sessions: 0,
@@ -231,7 +216,7 @@ pub(crate) fn native_serve_opts(cfg: &NativeServe) -> Punktfunk1Options {
         allow_pairing: false,
         pairing_pin: None,
         paired_store: None,
-        idle_timeout: idle_timeout_from_env(),
+        idle_timeout: knobs.idle_timeout,
         mdns: cfg.mdns,
     }
 }
@@ -392,6 +377,7 @@ pub(crate) async fn serve(
             np: np.clone(),
             profiles: profiles.clone(),
             stats: stats.clone(),
+            knobs: HostKnobs::get(),
         };
         let (bind, sem) = (plane.bind, sem.clone());
         tokio::spawn(async move {
@@ -919,6 +905,7 @@ async fn serve_session(
         np: np_arc.clone(),
         profiles: profiles.clone(),
         stats,
+        knobs: HostKnobs::get(),
     };
     let data_plane = DataPlane::Shared(
         conn.v2()
@@ -1055,6 +1042,7 @@ pub(crate) struct SessionHost {
     /// Resolves each connect's profile before anything is built for it.
     pub(crate) profiles: Arc<crate::profiles::Profiles>,
     pub(crate) stats: Arc<StatsRecorder>,
+    pub(crate) knobs: &'static HostKnobs,
 }
 
 impl SessionHost {
@@ -1086,6 +1074,7 @@ impl SessionHost {
             np,
             profiles,
             stats: StatsRecorder::new(crate::stats_recorder::default_dir()),
+            knobs: HostKnobs::get(),
         }
     }
 }
@@ -1120,8 +1109,9 @@ pub(crate) async fn run_admitted(
         np,
         profiles,
         stats,
+        knobs: host_knobs,
     } = host;
-    let (opts, np, stats) = (opts.as_ref(), np.as_ref(), stats.clone());
+    let (opts, np, stats, host_knobs) = (opts.as_ref(), np.as_ref(), stats.clone(), *host_knobs);
     let (inj_tx, mic_tx) = (inj_tx.clone(), mic_tx.clone());
     let (mut send, mut recv) = (send, recv);
     let peer = conn.remote_address();
@@ -1704,6 +1694,7 @@ pub(crate) async fn run_admitted(
                 gamescope_route,
                 format_facts,
                 encoder,
+                host_knobs,
                 bitrate_auto: hello.bitrate_kbps == 0,
                 pyrowave_bpp,
                 cursor_forward,

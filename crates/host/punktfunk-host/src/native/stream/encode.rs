@@ -39,15 +39,6 @@ fn mark_recovery_boundary(ir_wave_pos: &mut u32, is_keyframe: bool, period: u32)
     }
 }
 
-/// On by default. `PUNKTFUNK_IDD_ADAPTIVE=0` skips `adapt_to_cadence`: no cadence verdict for
-/// the ABR climb gate, and the encoder never escalates to pipelined retrieve.
-fn idd_adaptive_enabled() -> bool {
-    crate::send_pacing::env_once!(
-        bool,
-        pf_host_config::env_on("PUNKTFUNK_IDD_ADAPTIVE").unwrap_or(true)
-    )
-}
-
 /// Escalated sessions flag on any net behind-frame; being escalated alone does not latch a cap.
 fn encode_behind_cadence(escalated: bool, behind_score: u32, degrade_at: u32) -> bool {
     behind_score >= degrade_at || (escalated && behind_score > 0)
@@ -683,12 +674,12 @@ impl StreamState {
     /// Pipelined-retrieve escalation on a sustained behind-cadence score, wound back after a
     /// clean run with a growing backoff; pipelined retrieve is judged on a full-budget chain
     /// (see [`encode_chain_pressure`]). Also publishes the cadence verdict the ABR climb gate
-    /// reads.
+    /// reads. With `PUNKTFUNK_IDD_ADAPTIVE` off it does neither.
     pub(super) fn adapt_to_cadence(&mut self) {
-        if !idd_adaptive_enabled() {
+        let p = &mut self.pipelining;
+        if !p.adaptive {
             return;
         }
-        let p = &mut self.pipelining;
         p.depth_frames += 1;
         if p.depth_frames <= CADENCE_WARMUP_FRAMES {
             return;

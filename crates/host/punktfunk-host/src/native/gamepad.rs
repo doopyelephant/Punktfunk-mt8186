@@ -368,7 +368,7 @@ fn degrade_missing_driver_identity(chosen: GamepadPref) -> GamepadPref {
 
 /// Build Xbox-family pads as HID ([`crate::inject::xbox_windows`]) instead of XUSB
 /// ([`crate::inject::gamepad`]). Windows only; decided once per process by [`xbox_backend_hid`]
-/// and logged.
+/// from the process's [`HostKnobs::xbox_backend`], and logged.
 ///
 /// XUSB registers only `GUID_DEVINTERFACE_XUSB` — no HID collection — so Steam, DirectInput,
 /// `joy.cpl`, and WGI/GameInput never see it. HID plus inbox `xinputhid` is a superset, but
@@ -380,12 +380,12 @@ fn degrade_missing_driver_identity(chosen: GamepadPref) -> GamepadPref {
 pub(crate) fn windows_xbox_hid() -> bool {
     static HID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *HID.get_or_init(|| {
-        let env = std::env::var("PUNKTFUNK_XBOX_BACKEND").ok();
+        let env = HostKnobs::get().xbox_backend.as_deref();
         let xinputhid = crate::inject::xbox_windows::xinputhid_registered();
-        let hid = xbox_backend_hid(env.as_deref(), xinputhid);
+        let hid = xbox_backend_hid(env, xinputhid);
         tracing::info!(
             backend = if hid { "hid" } else { "xusb" },
-            env = env.as_deref().unwrap_or(""),
+            env = env.unwrap_or(""),
             xinputhid,
             "virtual Xbox pad backend"
         );

@@ -70,6 +70,8 @@ impl AuClock {
 /// The escalation `adapt_to_cadence` makes when encode cannot hold cadence: the encoder's
 /// pipelined retrieve, wound back after a clean run.
 pub(super) struct Pipelining {
+    /// `PUNKTFUNK_IDD_ADAPTIVE`: off, `adapt_to_cadence` does nothing.
+    pub(super) adaptive: bool,
     pub(super) behind_score: u32,
     pub(super) depth_frames: u64,
     pub(super) pipeline_asked: bool,
@@ -567,6 +569,7 @@ impl StreamState {
             gamescope_route,
             format_facts,
             encoder,
+            host_knobs,
             bitrate_auto,
             conn,
             cursor_forward,
@@ -1012,7 +1015,7 @@ impl StreamState {
             composite_log: super::cursor::CompositeLog::default(),
             last_rfi: None,
             owed_idr: false,
-            loss_mode: Default::default(),
+            loss_mode: super::recovery::LossMode::new(host_knobs.acked_refs),
             acked,
             lossy_window,
             kf_gate: super::recovery::KeyframeGate::default(),
@@ -1024,6 +1027,7 @@ impl StreamState {
             st_queue: Vec::new(),
             driver_dropped,
             pipelining: Pipelining {
+                adaptive: host_knobs.idd_adaptive,
                 behind_score: 0,
                 depth_frames: 0,
                 pipeline_asked: false,

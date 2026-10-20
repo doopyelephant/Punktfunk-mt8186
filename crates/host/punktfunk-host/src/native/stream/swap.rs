@@ -398,6 +398,7 @@ pub(super) mod tests {
             st_queue: Vec::new(),
             driver_dropped: Default::default(),
             pipelining: Pipelining {
+                adaptive: true,
                 behind_score: 0,
                 depth_frames: 0,
                 pipeline_asked: true,

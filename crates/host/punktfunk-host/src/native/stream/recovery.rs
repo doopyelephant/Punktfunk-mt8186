@@ -714,25 +714,14 @@ pub(super) enum KeyframeVerdict {
 /// How long the encoder stays on confirmed references past the last window that showed loss.
 const LOSS_MODE_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// `PUNKTFUNK_ACKED_REFS`: `on` holds confirmed references all session, `off` never takes
-/// them, unset follows the link.
-fn acked_refs_forced() -> Option<bool> {
-    crate::send_pacing::env_once!(
-        Option<bool>,
-        match std::env::var("PUNKTFUNK_ACKED_REFS").as_deref() {
-            Ok("on") => Some(true),
-            Ok("off") => Some(false),
-            _ => None,
-        }
-    )
-}
-
 /// While the link loses packets the encoder references only frames the client confirmed
 /// ([`crate::encode::Encoder::set_reference_floor`]), so a lost frame is skipped, not
 /// repaired. On with a lossy report window, off [`LOSS_MODE_HOLD`] past the last. Each
 /// switch is logged, with the mean reference distance on the way off.
 #[derive(Default)]
 pub(super) struct LossMode {
+    /// `PUNKTFUNK_ACKED_REFS`: `Some` holds the mode all session, `None` follows the link.
+    forced: Option<bool>,
     seen: Option<std::time::Instant>,
     on: bool,
     frames: u64,
@@ -740,12 +729,20 @@ pub(super) struct LossMode {
 }
 
 impl LossMode {
+    pub(super) fn new(forced: Option<bool>) -> LossMode {
+        LossMode {
+            forced,
+            ..LossMode::default()
+        }
+    }
+
     pub(super) fn is_on(&self) -> bool {
         self.on
     }
 
     /// The confirmed frames frame `wire` may reference, given whether a lossy window arrived
-    /// since the last frame and what the client confirmed (`last << 16 | mask`).
+    /// since the last frame and what the client confirmed (`last << 16 | mask`). A forced
+    /// mode ignores the link.
     pub(super) fn floor(
         &mut self,
         lossy: bool,
@@ -756,7 +753,7 @@ impl LossMode {
         if lossy {
             self.seen = Some(now);
         }
-        let on = acked_refs_forced().unwrap_or_else(|| {
+        let on = self.forced.unwrap_or_else(|| {
             self.seen
                 .is_some_and(|t| now.duration_since(t) < LOSS_MODE_HOLD)
         });
