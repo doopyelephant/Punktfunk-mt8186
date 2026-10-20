@@ -97,6 +97,8 @@ impl IddPushCapturer {
     /// Turn SDR wide colour on or off and settle like the HDR pin (≤ 250 ms). Returns whether the
     /// display composes wide colour now. A refused `want` latches [`super::WCG_REFUSED`]: this
     /// session widens its 8-bit desktop, and later handshakes stop offering a 10-bit SDR source.
+    /// Only a mode read back as something else is a refusal: a path not yet active after a
+    /// re-arrival reads as no mode. Wide colour that takes clears the latch.
     pub(super) fn pin_wcg(
         ccd: pf_win_display::win_display::CcdTargetKey,
         target_id: u32,
@@ -114,6 +116,9 @@ impl IddPushCapturer {
         }
         let got = is_wcg();
         if got == want {
+            if want {
+                super::WCG_REFUSED.store(false, Ordering::Relaxed);
+            }
             tracing::info!(
                 target_id,
                 want_wcg = want,
@@ -121,12 +126,15 @@ impl IddPushCapturer {
                 "IDD push: SDR wide colour set on the virtual display"
             );
         } else if want {
-            super::WCG_REFUSED.store(true, Ordering::Relaxed);
+            let mode = color_mode(ccd);
+            if mode.is_some() {
+                super::WCG_REFUSED.store(true, Ordering::Relaxed);
+            }
             tracing::warn!(
                 target_id,
                 set_wcg_returned = set,
                 supported = wcg_supported(ccd),
-                mode = ?color_mode(ccd),
+                mode = ?mode,
                 "IDD push: Windows refused SDR wide colour on the virtual display — this 10-bit \
                  SDR session widens its 8-bit desktop, and later sessions negotiate 8-bit unless \
                  Allow 10-bit SDR is on"
