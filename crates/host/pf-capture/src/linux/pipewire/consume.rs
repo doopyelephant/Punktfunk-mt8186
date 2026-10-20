@@ -298,6 +298,10 @@ pub(super) fn consume_frame(
         } else if let Some(len) = supported_data_plane_count(plane_count(spa_buf)) {
             std::slice::from_raw_parts_mut((*spa_buf).datas as *mut pw::spa::buffer::Data, len)
         } else {
+            warn_once(
+                "the producer's buffers carry a plane count this capture does not read (one or \
+                 two) — frames dropped",
+            );
             &mut []
         }
     };
