@@ -1461,6 +1461,18 @@ pub(super) fn announce_pipeline_gap(gap: &tokio::sync::mpsc::UnboundedSender<u32
     let _ = gap.send(gap_ms);
 }
 
+/// [`announce_pipeline_gap`] for a stall that began at `t0`: every rebuild the loop sits in,
+/// failed ones too, since a failed build stalls the stream as long.
+pub(super) fn announce_gap_since(
+    gap: &tokio::sync::mpsc::UnboundedSender<u32>,
+    t0: std::time::Instant,
+) {
+    announce_pipeline_gap(
+        gap,
+        t0.elapsed().as_millis().min(u128::from(u32::MAX)) as u32,
+    );
+}
+
 /// Where this session's lease looks for the game's window: the compositor's own window list,
 /// gamescope's focused-app atom for a Steam title, or the Windows desktop. `None` when gamescope
 /// runs something other than a Steam title.

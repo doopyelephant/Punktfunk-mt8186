@@ -11,7 +11,7 @@ use super::pipeline::{
     build_pipeline, build_pipeline_with_retry, is_permanent_build_error, open_session_encoder,
     Pipeline,
 };
-use super::state::{announce_pipeline_gap, StreamState};
+use super::state::{announce_gap_since, announce_pipeline_gap, StreamState};
 use super::swap::{Next, SwapReason};
 use super::*;
 use crate::encode_recovery::{
@@ -233,6 +233,7 @@ impl StreamState {
         }
         tracing::info!(from = self.compositor.id(), to = sw.compositor.id(), kind = ?sw.kind,
             "session switch — rebuilding backend in place");
+        let t0 = std::time::Instant::now();
         // Being the only writer proves nothing: `setenv` races every concurrent `getenv` in the process.
         if let Some(env) = sw.env {
             crate::vdisplay::apply_session_env(&crate::vdisplay::ActiveSession {
@@ -298,6 +299,7 @@ impl StreamState {
                         settle_portal_cursor(&*self.vd, &mut self.metadata_composite);
                 }
                 self.next = std::time::Instant::now();
+                announce_gap_since(&self.gap_tx, t0);
                 tracing::info!(
                     compositor = self.compositor.id(),
                     "session switch — backend rebuilt, stream continues"
@@ -312,6 +314,7 @@ impl StreamState {
                 };
                 self.plan = old_plan;
                 (self.gamescope_composite, self.metadata_composite) = old_composite;
+                announce_gap_since(&self.gap_tx, t0);
                 tracing::warn!(error = %chain, kind,
                     "session-switch rebuild failed — staying on the current backend");
             }
@@ -331,6 +334,7 @@ impl StreamState {
             return;
         };
         tracing::info!(?new_mode, "rebuilding pipeline for mode switch");
+        let t0 = std::time::Instant::now();
         let resize_trace = crate::bringup::Trace::start("resize", self.resize_ms.clone());
         let mode_bitrate = if self.plan.codec == crate::encode::Codec::PyroWave {
             let running = self.bitrate_auto.then_some(self.bitrate_kbps);
@@ -363,6 +367,7 @@ impl StreamState {
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), ?new_mode,
                         "mode-switch rebuild failed — staying on the current mode");
+                    announce_gap_since(&self.gap_tx, t0);
                     self.tell_delivered(self.delivered_mode(), true);
                     false
                 }
@@ -417,6 +422,7 @@ impl StreamState {
         self.bit_depth = bit_depth;
         tracing::info!(from = ?old_plan.codec, to = ?codec, bit_depth, hdr, ?chroma,
             "rebuilding the pipeline for a codec change");
+        let t0 = std::time::Instant::now();
         let trace = crate::bringup::Trace::start("format", self.resize_ms.clone());
         self.close_open_frame();
         let req = self.build_request(self.cur_mode, self.bitrate_kbps);
@@ -441,6 +447,7 @@ impl StreamState {
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), ?codec,
                     "codec-change rebuild failed — staying on the current codec");
+                announce_gap_since(&self.gap_tx, t0);
                 (self.plan, self.bit_depth) = (old_plan, old_depth);
                 let _ = self.format_result_tx.send(None);
             }
@@ -533,6 +540,7 @@ impl StreamState {
         )?;
         // The QUIC keepalive holds the connection: the client stays frozen on the last frame
         // and resumes, no reconnect.
+        let t0 = std::time::Instant::now();
         let budget = RebuildBudget::start();
         if pf_host_config::config().compositor.is_some() {
             let active = crate::vdisplay::detect_active_session();
@@ -559,6 +567,7 @@ impl StreamState {
         self.adopt_built_bitrate(built);
         self.enc.request_keyframe();
         self.next = std::time::Instant::now();
+        announce_gap_since(&self.gap_tx, t0);
         tracing::info!(
             compositor = self.compositor.id(),
             "capture loss: pipeline rebuilt — stream resumes"
@@ -642,6 +651,7 @@ impl StreamState {
     /// client. `Ok(false)` = the reopen failed and the tick is spent on the backoff.
     pub(super) fn follow_source_mode(&mut self) -> Result<bool> {
         let to = (self.frame.format, self.frame.width, self.frame.height);
+        let t0 = std::time::Instant::now();
         let followed = follow_source_mode(
             self,
             self.enc_src,
@@ -698,6 +708,7 @@ impl StreamState {
             resized: None,
         };
         self.swap_pipeline(next, SwapReason::SourceMode);
+        announce_gap_since(&self.gap_tx, t0);
         // The delivered mode is the session's now: a rebuild or topology re-assert
         // reopens at it instead of forcing the display back to the client's ask.
         self.cur_mode = actual;
