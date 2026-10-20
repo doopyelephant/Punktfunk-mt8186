@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 mod events;
 mod pace;
+mod restart;
 mod screens;
 mod shell;
 mod stream;
