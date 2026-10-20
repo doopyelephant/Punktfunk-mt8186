@@ -936,11 +936,14 @@ impl NativeLane {
         if self.dead || (color.is_pq() && !(self.hdr_capable() && self.scans_out())) {
             return false;
         }
-        if self.color_repr.is_some() {
-            let (c, r) = representation(color);
-            if !self.state.repr_pairs.contains(&(c as u32, r as u32)) {
-                return false;
-            }
+        // Matrix and range go through `wp_color_representation_v1`; without it the
+        // compositor applies its own default, and the lane cannot claim the colour.
+        if self.color_repr.is_none() {
+            return false;
+        }
+        let (c, r) = representation(color);
+        if !self.state.repr_pairs.contains(&(c as u32, r as u32)) {
+            return false;
         }
         let (vw, vh) = (u64::from(view.0), u64::from(view.1));
         let (fw, fh) = (u64::from(frame.0), u64::from(frame.1));
