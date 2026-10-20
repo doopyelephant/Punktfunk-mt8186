@@ -108,11 +108,12 @@ pub(crate) fn restart_for<'a>(ev: &'a SessionEvent, f: &RestartFacts) -> Option<
             phase: "The host isn't ready to stream yet — trying again.",
         }),
         // Widened, never replaced: a second fallback must not re-offer what the first ruled out.
+        // A cancelled stream never dials again, whatever ends it.
         SessionEvent::CodecFallback {
             exclude_codecs,
             msg,
             ..
-        } => Some(Restart {
+        } if !f.canceled => Some(Restart {
             dial: Dial::Fallback {
                 exclude: f.exclude_codecs | exclude_codecs,
             },
@@ -284,10 +285,10 @@ mod tests {
                 fallback(0b110),
             ),
             (
-                "a cancelled stream's codec fallback dials again",
+                "a cancelled stream's codec fallback ends",
                 &codec,
                 cancelled(0),
-                fallback(0b010),
+                None,
             ),
             (
                 "a muted mic rides the restart",
