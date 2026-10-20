@@ -18,6 +18,11 @@
 			<key>ProfileName</key>
 			<string>MicroGamepad</string>
 		</dict>
+		<!-- visionOS hands PlayStation VR2 Sense controllers only to an app that names this. -->
+		<dict>
+			<key>ProfileName</key>
+			<string>SpatialGamepad</string>
+		</dict>
 	</array>
 	<key>NSBonjourServices</key>
 	<array>
