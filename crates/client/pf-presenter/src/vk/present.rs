@@ -181,7 +181,7 @@ impl Presenter {
         p: &punktfunk_core::video_fit::Placement,
         path: &'static str,
     ) {
-        let key = (self.extent, width, height, path);
+        let key = (self.targets.extent, width, height, path);
         if self.placement_logged == Some(key) {
             return;
         }
@@ -194,7 +194,7 @@ impl Presenter {
                 tracing::$level!(
                     fit = self.video_fit.name(),
                     path,
-                    view = ?(self.extent.width, self.extent.height),
+                    view = ?(self.targets.extent.width, self.targets.extent.height),
                     frame = ?(width, height),
                     dst = ?(p.dst_x, p.dst_y, p.dst_w, p.dst_h),
                     src = ?(p.src_x, p.src_y, p.src_w, p.src_h),
@@ -234,13 +234,6 @@ impl Presenter {
         let entered = self.reconfigure(entry, window);
         if entered.context(PresentError::Window)? == Applied::Dropped {
             return Ok(Presented::Shown);
-        }
-        // A rebuild that failed past its create left the targets short of the images: build
-        // again before an acquire can index past them.
-        if self.render_sems.len() != self.images.len() {
-            self.recreate_swapchain(window)
-                .context(PresentError::Window)?;
-            return Ok(Presented::Stale);
         }
         let input = match self.glass_gate(window, input)? {
             ControlFlow::Continue(input) => input,
@@ -334,7 +327,7 @@ impl Presenter {
             // discarded image's by the rebuild's queue drain.
             match unsafe {
                 self.swap_d.acquire_next_image(
-                    self.swapchain,
+                    self.targets.swapchain,
                     0,
                     self.acquire_sem,
                     vk::Fence::null(),
@@ -426,7 +419,7 @@ impl Presenter {
                     // call, a discarded image's by `recreate_swapchain`'s queue drain.
                     let r = unsafe {
                         self.swap_d.acquire_next_image(
-                            self.swapchain,
+                            self.targets.swapchain,
                             timeout,
                             self.acquire_sem,
                             vk::Fence::null(),
@@ -526,11 +519,11 @@ impl Presenter {
         let source = self.video.as_ref().map(|v| (v.image, v.width, v.height));
         #[cfg(windows)]
         let source = slot.map(|(f, w, h)| (f.image, w, h)).or(source);
-        let view = (self.extent.width, self.extent.height);
+        let view = (self.targets.extent.width, self.targets.extent.height);
         let placement = source
             .map(|(_, w, h)| punktfunk_core::video_fit::place(self.video_fit, view, (w, h)))
             .filter(|p| !p.is_empty());
-        let targets_ready = self.overlay_pipe.framebuffers.len() == self.images.len();
+        let targets_ready = self.targets.overlay.framebuffers.len() == self.targets.images.len();
         let filtered = match (placement, &self.video) {
             (Some(p), Some(v)) if !from_slot && targets_ready && crate::scale::needs_filter(&p) => {
                 self.scale
@@ -553,11 +546,11 @@ impl Presenter {
             {
                 let covered = p.dst_x == 0
                     && p.dst_y == 0
-                    && p.dst_w == self.extent.width
-                    && p.dst_h == self.extent.height;
+                    && p.dst_w == self.targets.extent.width
+                    && p.dst_h == self.targets.extent.height;
                 Some(CscTarget::Direct {
-                    framebuffer: self.overlay_pipe.framebuffers[index as usize],
-                    surface: self.extent,
+                    framebuffer: self.targets.overlay.framebuffers[index as usize],
+                    surface: self.targets.extent,
                     rect: vk::Rect2D {
                         offset: vk::Offset2D {
                             x: p.dst_x as i32,
@@ -965,8 +958,8 @@ impl Presenter {
                     self.cmd_buf,
                     (v.width, v.height),
                     &p,
-                    self.overlay_pipe.framebuffers[plan.index as usize],
-                    self.extent,
+                    self.targets.overlay.framebuffers[plan.index as usize],
+                    self.targets.extent,
                 )
             };
             barrier(
@@ -978,7 +971,7 @@ impl Presenter {
             );
             return vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
         }
-        let swap_image = self.images[plan.index as usize];
+        let swap_image = self.targets.images[plan.index as usize];
         barrier(
             &self.device,
             self.cmd_buf,
@@ -993,8 +986,8 @@ impl Presenter {
             (Some(_), Some(p))
                 if p.dst_x == 0
                     && p.dst_y == 0
-                    && p.dst_w == self.extent.width
-                    && p.dst_h == self.extent.height
+                    && p.dst_w == self.targets.extent.width
+                    && p.dst_h == self.targets.extent.height
         );
         if !covered {
             // SAFETY: `cmd_buf` is recording (`# Safety` above); the swapchain image was
@@ -1083,8 +1076,8 @@ impl Presenter {
         swap_layout: vk::ImageLayout,
     ) {
         let index = plan.index as usize;
-        let swap_image = self.images[index];
-        let Some(o) = overlay.filter(|_| index < self.overlay_pipe.framebuffers.len()) else {
+        let swap_image = self.targets.images[index];
+        let Some(o) = overlay.filter(|_| index < self.targets.overlay.framebuffers.len()) else {
             barrier(
                 &self.device,
                 self.cmd_buf,
@@ -1112,7 +1105,7 @@ impl Presenter {
         );
         let full = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
-            extent: self.extent,
+            extent: self.targets.extent,
         };
         // SAFETY: `cmd_buf` is recording (`# Safety` above); the pipe, its framebuffer for
         // `index` and its set are owned here, and the set points at `overlay`.
@@ -1121,7 +1114,7 @@ impl Presenter {
                 self.cmd_buf,
                 &vk::RenderPassBeginInfo::default()
                     .render_pass(self.overlay_pipe.render_pass)
-                    .framebuffer(self.overlay_pipe.framebuffers[index])
+                    .framebuffer(self.targets.overlay.framebuffers[index])
                     .render_area(full),
                 vk::SubpassContents::INLINE,
             );
@@ -1136,8 +1129,8 @@ impl Presenter {
                 &[vk::Viewport {
                     x: 0.0,
                     y: 0.0,
-                    width: self.extent.width as f32,
-                    height: self.extent.height as f32,
+                    width: self.targets.extent.width as f32,
+                    height: self.targets.extent.height as f32,
                     min_depth: 0.0,
                     max_depth: 1.0,
                 }],
@@ -1170,7 +1163,7 @@ impl Presenter {
         plan: &FramePlan,
         native_wait: Option<(vk::Semaphore, u64)>,
     ) -> Result<()> {
-        let render_sem = self.render_sems[plan.index as usize];
+        let render_sem = self.targets.render_sems[plan.index as usize];
         let cmd_bufs = [self.cmd_buf];
         let mut wait_sems = vec![self.acquire_sem];
         // The swapchain image is written by the blit (transfer) or by the direct,
@@ -1309,9 +1302,9 @@ impl Presenter {
         index: u32,
         #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] redraw: bool,
     ) -> Result<Presented<'static>> {
-        let swapchains = [self.swapchain];
+        let swapchains = [self.targets.swapchain];
         let indices = [index];
-        let present_sems = [self.render_sems[index as usize]];
+        let present_sems = [self.targets.render_sems[index as usize]];
         // Monotonic present id for `PresentTimer`'s `vkWaitForPresentKHR`.
         let ids = [self.next_present_id + 1];
         let mut pid_info = vk::PresentIdKHR::default().present_ids(&ids);
@@ -1370,7 +1363,7 @@ impl Presenter {
             Ok(_) => {
                 // A failed present's id may never signal — claim it only on Ok.
                 if self.glass_active() {
-                    self.last_presented = Some((self.swapchain, self.next_present_id));
+                    self.last_presented = Some((self.targets.swapchain, self.next_present_id));
                 }
                 self.state.timing_asked = asked;
                 if let Some(t) = self.timing.as_ref().filter(|_| asked) {

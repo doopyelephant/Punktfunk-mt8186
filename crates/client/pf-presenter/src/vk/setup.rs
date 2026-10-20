@@ -949,7 +949,6 @@ impl Presenter {
             last_acquire_us: 0,
             last_present_us: 0,
             queue_lock,
-            format,
             hdr10_format,
             hdr_active: false,
             hdr_downgrade_warned: false,
@@ -957,10 +956,10 @@ impl Presenter {
             hdr_meta: None,
             pref,
             present_mode,
-            swapchain: vk::SwapchainKHR::null(),
-            images: Vec::new(),
-            extent: vk::Extent2D::default(),
-            render_sems: Vec::new(),
+            targets: super::targets::Targets {
+                format,
+                ..Default::default()
+            },
             acquire_sem,
             done_sem,
             fence,
