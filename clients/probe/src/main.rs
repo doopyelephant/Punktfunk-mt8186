@@ -56,6 +56,10 @@ struct Args {
     pad_audio_test: bool,
     /// `--pads N` — how many pads `--pad-audio-test` declares, 1 to 4.
     pads: u8,
+    /// `--pad-soak SECS` — drive pad 0 with moving snapshots for SECS; RT carries a frame counter.
+    pad_soak: Option<u64>,
+    /// `--pad-hz N` — `--pad-soak` send rate, default 125.
+    pad_hz: u32,
     /// `--quit` — close the connection with the deliberate-quit code (`QUIT_CLOSE_CODE`) at end of
     /// stream, so the host tears its virtual display down immediately (skips keep-alive linger). A
     /// bare exit closes with code 0 → the host lingers for a reconnect. Tests the #2 quit path.
@@ -307,6 +311,11 @@ fn parse_argv(argv: Vec<String>) -> Args {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1)
             .clamp(1, PAD_AUDIO_PADS as u8),
+        pad_soak: get("--pad-soak").and_then(|s| s.parse().ok()),
+        pad_hz: get("--pad-hz")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(125)
+            .clamp(1, 1000),
         quit: argv.iter().any(|a| a == "--quit"),
         seconds: get("--seconds").and_then(|s| s.parse().ok()),
         pin,
@@ -692,6 +701,9 @@ async fn session(mut args: Args) -> Result<()> {
     }
     if args.pad_audio_test {
         spawn_pad_audio_test(&conn, args.pads);
+    }
+    if let Some(secs) = args.pad_soak {
+        spawn_pad_soak(&conn, secs, args.pad_hz);
     }
     // Closed-flag for the blocking receive loop.
     {
@@ -1623,6 +1635,45 @@ fn spawn_touch_test(conn: &Wire, mode: Mode) {
 /// DualSense), then drive its touchpad (drag a finger across) + motion (gyro wobble) over the
 /// 0xCC plane. Proves the rich client→host path; the 0xCD feedback is logged by the receive
 /// loop below. Requires the host on the DualSense backend (`PUNKTFUNK_GAMEPAD=dualsense`).
+/// Pad 0 as a player holds it: every stick and trigger moves each frame and A taps once a
+/// second, as `GamepadState` snapshots. RT counts frames, so a reader can tell lost from late.
+fn spawn_pad_soak(conn: &Wire, secs: u64, hz: u32) {
+    let conn2 = conn.clone();
+    tokio::spawn(async move {
+        use punktfunk_core::input::{gamepad::BTN_A, GamepadSnapshot};
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tracing::info!(secs, hz, "pad-soak: driving pad 0");
+        let mut tick =
+            tokio::time::interval(std::time::Duration::from_micros(1_000_000 / u64::from(hz)));
+        let t0 = std::time::Instant::now();
+        let (mut seq, mut sent) = (0u8, 0u64);
+        while t0.elapsed().as_secs() < secs {
+            tick.tick().await;
+            let t = t0.elapsed().as_secs_f64();
+            let w = std::f64::consts::TAU * t;
+            let stick = |x: f64| (30000.0 * x) as i16;
+            seq = seq.wrapping_add(1);
+            let snap = GamepadSnapshot {
+                pad: 0,
+                seq,
+                buttons: if t % 1.0 < 0.1 { BTN_A } else { 0 },
+                left_trigger: (127.0 + 127.0 * (w / 0.7).sin()) as u8,
+                right_trigger: sent as u8,
+                ls_x: stick((w / 2.0).sin()),
+                ls_y: stick((w / 1.7).cos()),
+                rs_x: stick((w / 1.3).sin()),
+                rs_y: stick((w / 0.9).cos()),
+            };
+            let _ = conn2.send_datagram(snap.to_event().encode().to_vec());
+            sent += 1;
+            if sent % (u64::from(hz) * 10) == 0 {
+                tracing::info!(sent, "pad-soak: snapshots sent");
+            }
+        }
+        tracing::info!(sent, "pad-soak: done");
+    });
+}
+
 fn spawn_rich_input_test(conn: &Wire) {
     let conn2 = conn.clone();
     tokio::spawn(async move {

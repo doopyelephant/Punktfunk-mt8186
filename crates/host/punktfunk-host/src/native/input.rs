@@ -1195,13 +1195,8 @@ pub(super) fn input_thread(
             pads.feedback_poll_interval()
         };
         let arrived = rx.recv_timeout(poll);
-        if let Some(w) = pad_uplink.take_window(std::time::Instant::now()) {
-            tracing::info!(
-                updates = w.updates,
-                lost = w.lost,
-                max_gap_ms = w.max_gap_ms,
-                "controller uplink"
-            );
+        for w in pad_uplink.take_window(std::time::Instant::now()) {
+            w.log();
         }
         // Any arrival, before grant tests: a denied event still means a person is
         // here, so drop a standing suspend veto (`sleep_inhibit`).
@@ -1263,6 +1258,7 @@ pub(super) fn input_thread(
                                 );
                             }
                             if let Some(idx) = wire.snapshot(snap) {
+                                pad_uplink.note_change(idx);
                                 pads.apply_wire(&wire, idx, &pad_feed);
                             }
                         }
@@ -1367,6 +1363,10 @@ pub(super) fn input_thread(
     pad_streams.stop_all();
     // One line per motion pad, at `info`: the question is asked from a log after the fact.
     motion_cadence.log_summary();
+    // A player stops a session soon after the pad dies: its last partial window is the evidence.
+    for w in pad_uplink.drain(std::time::Instant::now()) {
+        w.log();
+    }
 }
 
 #[cfg(test)]
