@@ -18,7 +18,8 @@ impl StreamState {
     /// refusal keeps the previous FEC and is logged once per proposal.
     pub(super) fn on_fec_moved(&mut self) {
         let requested = self.fec.requested.load(Ordering::Acquire);
-        if let Some((fec, want)) = self.fec.pending.take() {
+        let discarded = self.fec.pending.take();
+        if let Some((fec, want)) = discarded {
             if fec == requested && want == self.enc_derive(fec).enc_kbps(self.bitrate_kbps) {
                 if !self.enc.retarget_settled() {
                     self.fec.pending = Some((fec, want));
@@ -39,6 +40,25 @@ impl StreamState {
             }
         }
         if requested == self.fec.last {
+            // The proposal came back to the applied FEC before the encoder settled the one it
+            // was asked for: ask it back to the applied FEC's rate, or it stays on the other.
+            if let Some((_, asked)) = discarded {
+                let back = self.enc_derive(requested).enc_kbps(self.bitrate_kbps);
+                if asked != back {
+                    let moved = fec_retarget(
+                        self.enc.bitrate_retarget_is_synchronous(),
+                        |bps| self.enc.reconfigure_bitrate(bps),
+                        u64::from(back) * 1000,
+                        &self.fec.target,
+                        &self.fec.requested,
+                        &mut self.fec.last,
+                        requested,
+                    );
+                    if matches!(moved, FecMove::Pending) {
+                        self.fec.pending = Some((requested, back));
+                    }
+                }
+            }
             return;
         }
         let prev = self.enc_derive(self.fec.last).enc_kbps(self.bitrate_kbps);
@@ -974,6 +994,47 @@ mod tests {
         fn request_keyframe(&mut self) {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// An asynchronous encoder that records the rates it is asked for.
+    struct Retargets(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
+
+    impl crate::encode::Encoder for Retargets {
+        fn submit(&mut self, _frame: &crate::capture::CapturedFrame) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self) -> anyhow::Result<Option<crate::encode::EncodedFrame>> {
+            Ok(None)
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn reconfigure_bitrate(&mut self, bps: u64) -> bool {
+            self.0.lock().unwrap().push(bps);
+            true
+        }
+        fn bitrate_retarget_is_synchronous(&self) -> bool {
+            false
+        }
+    }
+
+    /// A FEC proposal that comes back to the applied one before the encoder settled the ask
+    /// puts the encoder back on the applied FEC's rate.
+    #[test]
+    fn a_reverted_fec_proposal_asks_the_encoder_back() {
+        let mut f = super::super::swap::tests::fake();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        f.st.enc = Box::new(Retargets(asked.clone()));
+        let applied = f.st.fec.last;
+        f.st.fec.requested.store(applied, Ordering::Release);
+        f.st.on_fec_moved();
+        let back = f.st.enc_derive(applied).enc_kbps(f.st.bitrate_kbps);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [u64::from(back) * 1000],
+            "left on the abandoned rate"
+        );
+        assert_eq!(f.st.fec.pending, Some((applied, back)));
     }
 
     /// A downward rate the encoder could not be rebuilt at leaves the session on its old rate,
