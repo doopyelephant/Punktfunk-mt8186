@@ -37,6 +37,17 @@ pub unsafe fn packetize(
     if n == 0 || (wire_chunk.is_none() && n != 1) {
         bail!("pyrowave: unexpected packet count {n} at boundary {boundary}");
     }
+    // `pyrowave_encoder_packetize` ignores `cap` in release builds (`(void)size`). Dense mode
+    // is bounded by the check above; a datagram-aligned AU must fit `cap` as one packet too.
+    if wire_chunk.is_some() {
+        let mut whole: usize = 0;
+        // SAFETY: the caller's contract; `whole` outlives the call.
+        let r = unsafe { pw::pyrowave_encoder_compute_num_packets(enc, cap, &mut whole) };
+        pw_check(r, "compute_num_packets")?;
+        if whole != 1 {
+            bail!("pyrowave: AU exceeds its {cap}-byte buffer ({whole} packets at that boundary)");
+        }
+    }
     let mut packets = vec![pw::pyrowave_packet { offset: 0, size: 0 }; n];
     let mut out_n: usize = 0;
     // SAFETY: the caller's contract; `packets` holds the `n` entries the encoder asked for and
