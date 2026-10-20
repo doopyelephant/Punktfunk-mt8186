@@ -63,10 +63,12 @@ final class CurveStage {
 }
 
 /// The volume a curved session shows its picture in. It closes itself once the session leaves
-/// the curve, and closing it brings the picture back to the session's window.
+/// the curve, and closing it brings the picture back to the session's window. With the session's
+/// window gone too, a Home window opens in its place.
 struct CurveScene: View {
     static let sceneID = "curve"
     let id: UUID?
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {
@@ -81,8 +83,28 @@ struct CurveScene: View {
                 }
                 .onDisappear { CurveStage.shared.leave(session.connection) }
         } else {
-            Color.clear.onAppear { dismissWindow() }
+            Color.clear.task {
+                // The app's last window cannot close itself: the Home must be up before this
+                // goes. A window closing right now can still read as on screen for a moment.
+                try? await Task.sleep(for: .milliseconds(500))
+                if !Self.anotherWindowShows {
+                    openWindow(id: PunktfunkClientApp.mainSceneID)
+                    for _ in 0..<30 where !Self.anotherWindowShows {
+                        try? await Task.sleep(for: .milliseconds(100))
+                    }
+                }
+                dismissWindow()
+            }
         }
+    }
+
+    /// Another of the app's windows is on screen besides this volume.
+    private static var anotherWindowShows: Bool {
+        UIApplication.shared.connectedScenes.filter {
+            $0 is UIWindowScene
+                && ($0.activationState == .foregroundActive
+                    || $0.activationState == .foregroundInactive)
+        }.count > 1
     }
 }
 
