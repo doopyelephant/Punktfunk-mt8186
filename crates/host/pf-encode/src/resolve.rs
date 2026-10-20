@@ -80,6 +80,13 @@ fn encoder_pref() -> String {
     pf_host_config::config().encoder_pref.clone()
 }
 
+/// The console's Vulkan encoding row (`PUNKTFUNK_VULKAN_ENCODE`, default on): Vulkan Video
+/// HEVC/AV1 on AMD/Intel, falling back to VAAPI on a failed open. Off is the VAAPI hatch. It
+/// applies at the next session, so it keys every verdict that depends on it.
+fn vulkan_row() -> bool {
+    pf_host_config::row_bool("PUNKTFUNK_VULKAN_ENCODE")
+}
+
 /// `probe()` once per `key`, outside the lock. Concurrent first calls may both probe; the last
 /// insert wins.
 fn probe_cached<K: Eq + Hash, V: Copy>(
@@ -161,14 +168,13 @@ pub fn can_encode_10bit(codec: Codec) -> bool {
         return cfg!(target_os = "windows") || cfg!(feature = "pyrowave");
     }
     // The Vulkan encoding row decides what Linux AMD/Intel opens, per session.
-    let vulkan = pf_host_config::row_bool("PUNKTFUNK_VULKAN_ENCODE");
     static CACHE: ProbeCache<(String, &'static str, bool, String), bool> = OnceLock::new();
     probe_cached(
         &CACHE,
         (
             pf_gpu::selection_key(),
             codec.label(),
-            vulkan,
+            vulkan_row(),
             encoder_pref(),
         ),
         || {

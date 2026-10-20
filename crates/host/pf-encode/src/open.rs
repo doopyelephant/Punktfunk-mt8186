@@ -1,17 +1,17 @@
 //! Opening a session's encoder: the checks every backend shares, the per-OS ladder in
 //! [`crate::resolve`], and the live-session record every opened encoder carries.
 
+use crate::env_knobs::Knobs;
 use crate::{
     validate_dimensions, Acked, AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps,
 };
 use anyhow::Result;
 use pf_frame::{CapturedFrame, PixelFormat};
 
-/// Open a hardware encoder for `format` and mode. NVENC on NVIDIA, VAAPI on
-/// AMD/Intel. `cuda` is GPU frames (`AV_PIX_FMT_CUDA`) from the NVIDIA
-/// zero-copy path; otherwise packed RGB/BGR CPU frames. The caller derives
-/// `cuda` from the first captured frame. Linux auto-detects; override with
-/// `PUNKTFUNK_ENCODER=auto|nvenc|vaapi`.
+/// Open the encoder the Encoder row resolves to (`auto` picks by GPU) for `format` and mode.
+/// `cuda` is GPU frames from the NVIDIA zero-copy path, derived by the caller from the first
+/// captured frame; otherwise packed RGB/BGR CPU frames. The crate's env knobs are read here,
+/// once per open.
 #[allow(clippy::too_many_arguments)]
 pub fn open_video(
     codec: Codec,
@@ -44,6 +44,7 @@ pub fn open_video(
         chroma,
         cursor_blend,
         slices,
+        knobs: Knobs::from_env(),
     })?;
     // Open-time fallback (Vulkan→VAAPI) and gamescope (no embedded cursor) still
     // reach here. `open_video` cannot re-plan capture, so a warning is all it does.
@@ -185,7 +186,7 @@ pub const MIN_BITRATE_BPS: u64 = 500_000;
 
 /// What a session asks [`open_video`] for, as one value the per-OS openers read. Only Linux
 /// direct-SDK NVENC reads every field; other builds leave some unread.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 #[cfg_attr(not(all(target_os = "linux", feature = "nvenc")), allow(dead_code))]
 pub(crate) struct OpenParams {
     pub(crate) codec: Codec,
@@ -202,6 +203,8 @@ pub(crate) struct OpenParams {
     pub(crate) chroma: ChromaFormat,
     pub(crate) cursor_blend: bool,
     pub(crate) slices: u32,
+    /// The environment, read once for this open.
+    pub(crate) knobs: Knobs,
 }
 
 /// Open the platform encoder. The display label is the branch that opened

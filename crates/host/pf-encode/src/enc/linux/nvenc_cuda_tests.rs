@@ -231,6 +231,7 @@ fn nvenc_cuda_smoke_rfi_anchor() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -312,6 +313,7 @@ fn nvenc_cuda_wave_soak() {
         ChromaFormat::Yuv420,
         false,
         1,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     soak.run(
@@ -376,6 +378,7 @@ fn nvenc_cuda_hdr10_packed_rgb() {
             ChromaFormat::Yuv420,
             false,
             4,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
 
@@ -465,6 +468,7 @@ fn nvenc_cuda_reframe_crops_and_scales() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     assert!(enc.caps().crops_input && enc.caps().downscales_input);
@@ -579,6 +583,7 @@ fn nvenc_cuda_cpu_frame_blends_the_cursor() {
         ChromaFormat::Yuv420,
         true,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     let cursor = pf_frame::CursorOverlay {
@@ -646,7 +651,7 @@ fn nvenc_cuda_hdr10_cursor_blend() {
     const W: u32 = 1280;
     const H: u32 = 720;
     pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
-    if !stream_ordered_requested() || async_retrieve_requested() {
+    if !Knobs::from_env().nvenc_stream_ordered || async_retrieve_requested() {
         println!("skipped: stream-ordered submit disabled by env");
         return;
     }
@@ -663,6 +668,7 @@ fn nvenc_cuda_hdr10_cursor_blend() {
         ChromaFormat::Yuv420,
         true, // Vulkan slot ring + 10-bit blend
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     let cursor = |serial: u64, x: i32, y: i32| pf_frame::CursorOverlay {
@@ -745,6 +751,7 @@ fn nvenc_cuda_sdr10_from_eight_bit_capture() {
             ChromaFormat::Yuv420,
             false,
             4,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA SDR-10 session");
         let mut stream = Vec::new();
@@ -805,6 +812,7 @@ fn nvenc_cuda_sdr10_from_eight_bit_capture() {
             chroma,
             false,
             4,
+            &Knobs::from_env(),
         )
         .expect("open planar SDR-10 session");
         let mut aus = 0usize;
@@ -857,6 +865,7 @@ fn nvenc_cuda_yuv444() {
         ChromaFormat::Yuv444,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA 4:4:4 session");
 
@@ -904,6 +913,7 @@ fn nvenc_cuda_reconfigure_no_idr() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     crate::smoke_pattern::reconfigure_no_idr(
@@ -944,6 +954,7 @@ fn nvenc_cuda_split_reconfigure_in_place() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -1077,6 +1088,7 @@ fn nvenc_cuda_split_reconfigure_takes_effect() {
             ChromaFormat::Yuv420,
             false,
             4,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
 
@@ -1203,6 +1215,7 @@ fn nvenc_cuda_split_subframe_pair_reconfigure() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -1325,6 +1338,7 @@ fn nvenc_cuda_auto_split_with_subframe() {
             ChromaFormat::Yuv420,
             false,
             4,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
         let mut times = Vec::new();
@@ -1425,6 +1439,7 @@ fn nvenc_cuda_split_hardware_max() {
             ChromaFormat::Yuv420,
             false,
             4,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
         let mut times = Vec::new();
@@ -1514,6 +1529,7 @@ fn nvenc_cuda_split_arbitration_converges() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -1607,6 +1623,7 @@ fn nvenc_cuda_main10_split_ab() {
             ChromaFormat::Yuv420,
             false,
             4,
+            &Knobs::from_env(),
         )
         .expect("open NVENC CUDA session");
         let (mut times, mut bytes) = (Vec::new(), Vec::new());
@@ -1705,6 +1722,7 @@ fn nvenc_cuda_bits_per_frame_curve() {
                 ChromaFormat::Yuv420,
                 false,
                 4,
+                &Knobs::from_env(),
             )
             .expect("open NVENC CUDA session");
             let (mut times, mut bytes) = (Vec::new(), Vec::new());
@@ -1755,6 +1773,7 @@ fn rfi_declines_impossible_ranges() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     ) else {
         eprintln!("skipping rfi_declines_impossible_ranges: NVENC unavailable (no NVIDIA driver)");
         return;
@@ -1782,6 +1801,7 @@ fn open_h265() -> NvencCudaEncoder {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA encoder")
 }
@@ -1816,6 +1836,7 @@ fn nvenc_cuda_codec_switch_reopen() {
             ChromaFormat::Yuv420,
             false,
             4,
+            &Knobs::from_env(),
         )
         .expect("open");
         for f in 0..4u32 {
@@ -1850,6 +1871,7 @@ fn nvenc_cuda_h264_shows_each_picture_in_its_own_au() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -1988,7 +2010,7 @@ fn nvenc_cuda_stream_ordered_arms() {
     const H: u32 = 360;
     pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
     // Operator opt-out / two-thread mode: skip, don't fail.
-    if !stream_ordered_requested() || async_retrieve_requested() {
+    if !Knobs::from_env().nvenc_stream_ordered || async_retrieve_requested() {
         println!("skipped: stream-ordered submit disabled by env");
         return;
     }
@@ -2005,6 +2027,7 @@ fn nvenc_cuda_stream_ordered_arms() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     let frame = nv12_frame(W, H, 0);
@@ -2047,7 +2070,7 @@ fn nvenc_cuda_stuck_fused_wait_releases() {
     const H: u32 = 360;
     set_env("PUNKTFUNK_ZEROCOPY_INPROC", "1");
     pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
-    if !stream_ordered_requested() || async_retrieve_requested() {
+    if !Knobs::from_env().nvenc_stream_ordered || async_retrieve_requested() {
         println!("skipped: stream-ordered submit disabled by env");
         return;
     }
@@ -2064,6 +2087,7 @@ fn nvenc_cuda_stuck_fused_wait_releases() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     enc.submit_indexed(&nv12_frame(W, H, 0), 0).expect("submit");
@@ -2108,7 +2132,7 @@ fn nvenc_cuda_cursor_blend_stream_ordered() {
     const H: u32 = 720;
     pf_zerocopy::cuda::make_current().expect("shared CUDA context current");
     // Operator opt-out / two-thread mode: skip, don't fail.
-    if !stream_ordered_requested() || async_retrieve_requested() {
+    if !Knobs::from_env().nvenc_stream_ordered || async_retrieve_requested() {
         println!("skipped: stream-ordered submit disabled by env");
         return;
     }
@@ -2125,6 +2149,7 @@ fn nvenc_cuda_cursor_blend_stream_ordered() {
         ChromaFormat::Yuv420,
         true, // Vulkan slot ring + blend
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     let cursor = |serial: u64, x: i32, y: i32| pf_frame::CursorOverlay {
@@ -2201,6 +2226,7 @@ fn nvenc_cuda_pipelined_escalation() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     for i in 0..3u32 {
@@ -2276,6 +2302,7 @@ fn nvenc_cuda_subframe_slice_probe() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -2359,6 +2386,7 @@ fn nvenc_cuda_chunked_poll_end_to_end() {
         ChromaFormat::Yuv420,
         false,
         4,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
 
@@ -2453,6 +2481,7 @@ fn nvenc_cuda_single_slice_client_ceiling() {
         ChromaFormat::Yuv420,
         false,
         1, // client never advertised multi-slice
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     for i in 0..4u32 {
@@ -2719,6 +2748,7 @@ fn encode_in_place(
         chroma,
         false,
         1,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     let mut stream = Vec::new();
@@ -2971,6 +3001,7 @@ fn nvenc_cuda_in_place_repeats_in_flight() {
         ChromaFormat::Yuv420,
         false,
         1,
+        &Knobs::from_env(),
     )
     .expect("open NVENC CUDA session");
     assert!(enc.set_pipelined(true), "pipelined retrieve refused");

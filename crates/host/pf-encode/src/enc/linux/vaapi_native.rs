@@ -23,6 +23,7 @@ use pf_vaapi::vpp;
 use pf_zerocopy::gbm::{GbmBo, GbmDevice, GBM_BO_USE_RENDERING};
 
 use super::{ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
+use crate::env_knobs::Knobs;
 use crate::rfi::{
     self, plan_slot_recovery, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, WaveMark,
 };
@@ -76,6 +77,7 @@ impl NativeVaapiEncoder {
         chroma: ChromaFormat,
         // BT.2020 PQ vs BT.709. Independent of depth: 10-bit SDR is Main10 under BT.709.
         hdr: bool,
+        knobs: &Knobs,
     ) -> Result<Self> {
         ensure!(!chroma.is_444(), "the native VAAPI encoder is 4:2:0 only");
         let ten_bit = bit_depth == 10;
@@ -125,9 +127,10 @@ impl NativeVaapiEncoder {
             pipelined: false,
             repack: Vec::new(),
             crop: None,
-            dump: std::env::var("PUNKTFUNK_VAAPI_DUMP")
-                .ok()
-                .and_then(|p| std::fs::File::create(&p).ok()),
+            dump: knobs
+                .vaapi_dump
+                .as_deref()
+                .and_then(|p| std::fs::File::create(p).ok()),
         };
         this.open_session()?;
         tracing::info!(
@@ -200,6 +203,7 @@ fn probe_capture_modifier(node: &std::path::Path, fourcc: u32, modifier: u64) ->
         8,
         ChromaFormat::Yuv420,
         false,
+        &Knobs::from_env(),
     ) else {
         return false;
     };
@@ -766,6 +770,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            &Knobs::from_env(),
         )
         .expect("open");
         assert!(enc.caps().supports_rfi);
@@ -841,9 +846,18 @@ mod tests {
     /// `cargo test -p pf-encode native_vaapi_wave -- --ignored --nocapture`
     fn run_wave_smoke(codec: Codec, ext: &str) {
         let (w, h) = (256u32, 256u32);
-        let mut enc =
-            NativeVaapiEncoder::open(codec, w, h, 60, 4_000_000, 8, ChromaFormat::Yuv420, false)
-                .expect("open");
+        let mut enc = NativeVaapiEncoder::open(
+            codec,
+            w,
+            h,
+            60,
+            4_000_000,
+            8,
+            ChromaFormat::Yuv420,
+            false,
+            &Knobs::from_env(),
+        )
+        .expect("open");
         const WAVE_START: usize = 3;
         // `PF_WAVE_SPOIL=1`: two frames into the wave a frame inside its sweep is lost, so
         // it closes unmarked and the wave queued behind it carries the start and close.
@@ -1009,6 +1023,7 @@ mod tests {
             8,
             ChromaFormat::Yuv420,
             false,
+            &Knobs::from_env(),
         )
         .expect("open");
         for i in 0..5u32 {

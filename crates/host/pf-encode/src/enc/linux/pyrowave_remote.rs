@@ -16,6 +16,7 @@
 //! `grep` finds every rung.
 
 use super::worker::{self, FromWorker, PriorityOutcome, ToWorker, WireCursor};
+use crate::env_knobs::Knobs;
 use crate::pyrowave_wire::AuStream;
 use crate::{AuChunk, ChromaFormat, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, Context, Result};
@@ -40,7 +41,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Session parameters, so an in-process fallback can open mid-session with the same values.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Params {
     width: u32,
     height: u32,
@@ -49,6 +50,8 @@ struct Params {
     /// Negotiated stream depth (8 or 10) and the BT.2020 PQ flag.
     bit_depth: u8,
     hdr: bool,
+    /// The knobs the session opened with; a respawn and the fallback reuse them.
+    knobs: Knobs,
 }
 
 enum Fail {
@@ -285,9 +288,9 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
         chroma444: p.chroma.is_444(),
         bit_depth: p.bit_depth,
         hdr: p.hdr,
-        // Resolved here and forwarded. The worker strips this variable from its own environment,
+        // The host's intent, forwarded. The worker strips this variable from its own environment,
         // so the operator's knob cannot silently mean something different across the boundary.
-        priority_intent: std::env::var("PYROWAVE_QUEUE_PRIORITY").ok(),
+        priority_intent: p.knobs.queue_priority.clone(),
     };
     // Naming the handshake is load-bearing. A worker that dies during startup races this send:
     // win, and death is the EOF the recv reads; lose, and send takes EPIPE. One cause, one
@@ -348,6 +351,7 @@ fn handshake(mut link: Link, p: &Params, bitrate_bps: u64) -> Result<Handshake> 
 ///
 /// The one seam Linux `open_video` PyroWave arms go through. Not wired into Windows: that
 /// platform has no such worker.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open_preferring_worker(
     width: u32,
     height: u32,
@@ -356,6 +360,7 @@ pub(crate) fn open_preferring_worker(
     chroma: ChromaFormat,
     bit_depth: u8,
     hdr: bool,
+    knobs: &Knobs,
 ) -> Result<Box<dyn Encoder>> {
     let params = Params {
         width,
@@ -364,6 +369,7 @@ pub(crate) fn open_preferring_worker(
         chroma,
         bit_depth,
         hdr,
+        knobs: knobs.clone(),
     };
     let inline = || -> Result<Box<dyn Encoder>> {
         super::pyrowave::PyroWaveEncoder::open(
@@ -374,6 +380,7 @@ pub(crate) fn open_preferring_worker(
             chroma,
             bit_depth,
             hdr,
+            knobs,
         )
         .map(|e| Box::new(e) as Box<dyn Encoder>)
     };
@@ -493,6 +500,7 @@ impl RemotePyroWave {
                 self.params.chroma,
                 self.params.bit_depth,
                 self.params.hdr,
+                &self.params.knobs,
             )
             .context("open the in-process PyroWave encoder after leaving the worker")?;
             // Replay: the boundary changes the AU bytes, so a fallback that forgot it would ship
@@ -834,6 +842,7 @@ mod tests {
             chroma: ChromaFormat::Yuv420,
             bit_depth: 8,
             hdr: false,
+            knobs: Knobs::from_env(),
         }
     }
 
@@ -1013,6 +1022,7 @@ mod tests {
                 chroma: ChromaFormat::Yuv420,
                 bit_depth: 8,
                 hdr: false,
+                knobs: Knobs::from_env(),
             },
             bitrate_bps: 5_000_000,
             worker_path: PathBuf::from("/usr/bin/punktfunk-encode-worker"),

@@ -31,6 +31,7 @@ use super::nvenc_session::{
 };
 use super::nvenc_status;
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
+use crate::env_knobs::Knobs;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use pf_frame::{CapturedFrame, DmabufFrame, FramePayload};
 use pf_zerocopy::cuda::{self, InputSurface};
@@ -225,12 +226,6 @@ fn load_api() -> std::result::Result<EncodeApi, String> {
         std::mem::forget(lib); // mapping must outlive the copied fn pointers (process)
         Ok(api)
     }
-}
-
-/// Stream-ordered submit (default on; `PUNKTFUNK_NVENC_STREAM_ORDERED=0` = blocking copies).
-/// Sync retrieve only, and only while `pending` is empty — see [`Encoder::submit`].
-fn stream_ordered_requested() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_NVENC_STREAM_ORDERED") != Some(false)
 }
 
 /// A dead convert worker waits this long before the lane spawns another. A crash loop would
@@ -610,6 +605,9 @@ pub struct NvencCudaEncoder {
     io_stream: *mut *mut c_void,
     /// Stream-ordered submit armed (sync retrieve). Per-frame gate also requires `pending` empty.
     stream_ordered: bool,
+    /// The operator allows stream-ordered submit ([`Knobs::nvenc_stream_ordered`]); off is
+    /// blocking copies.
+    stream_ordered_allowed: bool,
     /// A teardown left the retrieve thread in the driver ([`Self::abandon`]): this encoder
     /// opens no further session.
     dead: bool,
@@ -636,10 +634,9 @@ const RETRIEVE_STOP_LIMIT: std::time::Duration = std::time::Duration::from_secs(
 unsafe impl Send for NvencCudaEncoder {}
 
 impl NvencCudaEncoder {
-    /// Same signature as `super::NvencEncoder::open`. `format`/`cuda` are advisory: real input
-    /// comes from the first captured frame, and its depth follows that frame — a 10-bit session
-    /// whose capture is 8-bit must encode and label 8-bit. `hdr` is the session's colour, which
-    /// a 10-bit input carries.
+    /// `format`/`cuda` are advisory: real input comes from the first captured frame, and its
+    /// depth follows that frame — a 10-bit session whose capture is 8-bit must encode and label
+    /// 8-bit. `hdr` is the session's colour, which a 10-bit input carries.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         codec: Codec,
@@ -654,6 +651,7 @@ impl NvencCudaEncoder {
         chroma: ChromaFormat,
         cursor_blend: bool,
         slices: u32,
+        knobs: &Knobs,
     ) -> Result<Self> {
         // Fail here, not as an opaque session error on the first frame.
         let api = try_api().map_err(|e| anyhow!("NVENC (Linux direct) unavailable: {e}"))?;
@@ -691,6 +689,7 @@ impl NvencCudaEncoder {
             want_sync: false,
             io_stream: ptr::null_mut(),
             stream_ordered: false,
+            stream_ordered_allowed: knobs.nvenc_stream_ordered,
             dead: false,
             direct_wanted: pf_zerocopy::nvenc_raw_enabled() && pf_zerocopy::nvenc_direct_enabled(),
             direct: None,
@@ -1092,7 +1091,7 @@ impl NvencCudaEncoder {
     /// `enc` is this encoder's open session. The boxed `CUstream` is freed once: by `teardown`
     /// after destroy, or here when the driver rejects it.
     unsafe fn bind_io_streams(&mut self, enc: *mut c_void) {
-        if !self.s.retrieving() && stream_ordered_requested() {
+        if !self.s.retrieving() && self.stream_ordered_allowed {
             let stream = cuda::copy_stream_handle();
             if !stream.is_null() {
                 // Driver takes `CUstream` pointers — box; `teardown` frees after destroy.

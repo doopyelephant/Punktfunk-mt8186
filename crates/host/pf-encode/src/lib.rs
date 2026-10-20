@@ -17,6 +17,7 @@ pub use pf_encode_core::*;
 #[cfg(target_os = "windows")]
 pub use pf_encode_win::*;
 
+mod env_knobs;
 mod open;
 mod resolve;
 pub use open::*;
