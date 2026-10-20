@@ -19,9 +19,10 @@ use super::vk_csc::{bind_rgb, csc_layout, CursorPlane};
 use super::vk_ring::{Action, Observation, Ring};
 use super::vk_util::{
     color_range, find_mem_preferring, import_failure_feeds_latch, imported_acquire_barrier,
-    imported_release_barrier, make_host_buffer, make_plain_image, make_view, normalize_cpu_rgb,
-    pixel_to_vk, readback_invalidate_size, reject_dmabuf, ImportCache,
+    imported_release_barrier, make_host_buffer, make_plain_image, make_view, pixel_to_vk,
+    readback_invalidate_size, reject_dmabuf, ImportCache,
 };
+use crate::cpu_ingest::CpuIngest;
 use crate::env_knobs::Knobs;
 use crate::rfi::{
     plan_frame, FramePlan, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, Wave,
@@ -1087,8 +1088,8 @@ pub struct VulkanVideoEncoder {
     /// `PUNKTFUNK_PERF` timestamp period (ns). 0.0 = disabled or unsupported.
     ts_period_ns: f64,
     perf_at: std::time::Instant,
-    /// Reused 3→4 expansion buffer for 24-bpp CPU payloads (`vk_util::normalize_cpu_rgb`).
-    cpu_expand: Vec<u8>,
+    /// Lays out CPU payloads for the staging buffer; its scratch is reused across frames.
+    cpu_ingest: CpuIngest,
     /// RGB-direct (EFC) config. `Some` ⇒ picture format is BGRA, VCN does CSC; `None` ⇒ compute
     /// CSC. Fixed per session (picture format is baked into the video session).
     rgb: Option<RgbDirect>,
@@ -1817,7 +1818,7 @@ impl VulkanVideoEncoder {
             quality_level,
             ts_period_ns,
             perf_at: std::time::Instant::now(),
-            cpu_expand: Vec::new(),
+            cpu_ingest: CpuIngest::default(),
             rgb: rgb_cfg,
             reframe: None,
             intra_refresh,

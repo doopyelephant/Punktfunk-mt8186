@@ -16,6 +16,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::*;
+use crate::cpu_ingest::Target;
 
 /// The frame's references, planned before anything records.
 struct CodingPlan {
@@ -229,10 +230,10 @@ impl VulkanVideoEncoder {
                     compute: true,
                 }
             }
-            FramePayload::Cpu(bytes) => {
+            FramePayload::Cpu(_) => {
                 // `begin_command_buffer` is after the fallible staging, so no reset-on-error
                 // wrap. `compute_cmd` is only the staging→image copy; encode waits on `csc_sem`.
-                let view = self.stage_cpu(slot, frame, bytes)?;
+                let view = self.stage_cpu(slot, frame)?;
                 self.device.begin_command_buffer(
                     compute_cmd,
                     &vk::CommandBufferBeginInfo::default()
@@ -375,8 +376,8 @@ impl VulkanVideoEncoder {
                     );
                     (view, Some(img))
                 }
-                FramePayload::Cpu(bytes) => {
-                    let view = self.stage_cpu(slot, frame, bytes)?;
+                FramePayload::Cpu(_) => {
+                    let view = self.stage_cpu(slot, frame)?;
                     // Staging is tightly packed and the image is source-sized; an aligned-size
                     // extent here shears rows.
                     let img = self.record_cpu_copy(slot, compute_cmd, (frame.width, frame.height));
@@ -413,26 +414,24 @@ impl VulkanVideoEncoder {
         prefix
     }
 
-    /// Stage a CPU payload in the slot's upload buffer, 24-bpp expanded 3→4 first
-    /// (`ensure_cpu_rgb` pads with 4-bpp index math). Host-side only; returns the image's view.
-    unsafe fn stage_cpu(
-        &mut self,
-        slot: usize,
-        frame: &CapturedFrame,
-        bytes: &[u8],
-    ) -> Result<vk::ImageView> {
+    /// Stage a CPU frame in the slot's upload buffer as 4-byte pixels ([`CpuIngest`];
+    /// `ensure_cpu_rgb` pads with 4-bpp index math). Host-side only; returns the image's view.
+    unsafe fn stage_cpu(&mut self, slot: usize, frame: &CapturedFrame) -> Result<vk::ImageView> {
         // The CPU channel order follows the session picture format: RGB-direct encodes the
         // upload as its `pictureFormat`, which followed the first frame
         // (VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207). The CSC samples either order.
-        let bgra = self.rgb.is_some() && self.spec.src_rgb_fmt == vk::Format::B8G8R8A8_UNORM;
-        let mut scratch = std::mem::take(&mut self.cpu_expand);
-        let (norm_fmt, norm_bytes) = normalize_cpu_rgb(frame.format, bytes, &mut scratch, bgra);
-        let fmt = pixel_to_vk(norm_fmt).context("unsupported CPU pixel format");
-        let view = match fmt {
-            Ok(f) => self.ensure_cpu_rgb(slot, f, norm_bytes, frame.width, frame.height),
-            Err(e) => Err(e),
+        let target = if self.rgb.is_some() && self.spec.src_rgb_fmt == vk::Format::B8G8R8A8_UNORM {
+            Target::BFirst
+        } else {
+            Target::AsCaptured
         };
-        self.cpu_expand = scratch;
+        // Out while `ensure_cpu_rgb` borrows `self`.
+        let mut ingest = std::mem::take(&mut self.cpu_ingest);
+        let view = ingest.stage(frame, target).and_then(|staged| {
+            let fmt = pixel_to_vk(staged.fmt).context("unsupported CPU pixel format")?;
+            self.ensure_cpu_rgb(slot, fmt, staged.bytes, frame.width, frame.height)
+        });
+        self.cpu_ingest = ingest;
         view
     }
 

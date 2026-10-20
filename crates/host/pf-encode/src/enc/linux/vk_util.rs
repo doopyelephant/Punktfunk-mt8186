@@ -295,48 +295,6 @@ pub(crate) fn pixel_to_vk(fmt: PixelFormat) -> Option<vk::Format> {
     }
 }
 
-/// Expand packed 24-bpp CPU RGB into `scratch` (caller-owned, reused) as 4-bpp
-/// with pad 0xFF: no 24-bpp VkFormat is reliably sampleable.
-///
-/// `bgra_target = false` keeps channel order (CSC views match). `true` forces
-/// B,G,R,X because VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08207 requires the
-/// encode source to match the session `pictureFormat` (`B8G8R8A8_UNORM`).
-///
-/// Payloads are tightly packed (`FramePayload::Cpu`); a truncated source
-/// yields a truncated output — upload paths bound-check the bytes.
-pub(crate) fn normalize_cpu_rgb<'a>(
-    fmt: PixelFormat,
-    bytes: &'a [u8],
-    scratch: &'a mut Vec<u8>,
-    bgra_target: bool,
-) -> (PixelFormat, &'a [u8]) {
-    let (bpp, r, g, b) = match fmt {
-        PixelFormat::Rgb => (3usize, 0usize, 1usize, 2usize),
-        PixelFormat::Bgr => (3, 2, 1, 0),
-        PixelFormat::Rgbx | PixelFormat::Rgba => (4, 0, 1, 2),
-        PixelFormat::Bgrx | PixelFormat::Bgra => (4, 2, 1, 0),
-        _ => return (fmt, bytes),
-    };
-    if bpp == 4 && (!bgra_target || b == 0) {
-        return (fmt, bytes); // 4-bpp already in session order: borrow
-    }
-    let px = bytes.len() / bpp;
-    scratch.clear();
-    scratch.resize(px * 4, 0xFF);
-    let (dr, dg, db) = if bgra_target { (2, 1, 0) } else { (r, g, b) };
-    for (dst, src) in scratch.chunks_exact_mut(4).zip(bytes.chunks_exact(bpp)) {
-        dst[dr] = src[r];
-        dst[dg] = src[g];
-        dst[db] = src[b];
-    }
-    let out_fmt = if bgra_target || b == 0 {
-        PixelFormat::Bgrx
-    } else {
-        PixelFormat::Rgbx
-    };
-    (out_fmt, scratch.as_slice())
-}
-
 pub(crate) unsafe fn make_view(
     device: &ash::Device,
     image: vk::Image,
@@ -784,29 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_cpu_rgb_expands_24bpp_and_borrows_4bpp() {
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Rgb, &[1, 2, 3, 4, 5, 6], &mut scratch, false);
-        assert_eq!(f, PixelFormat::Rgbx);
-        assert_eq!(b, &[1, 2, 3, 0xFF, 4, 5, 6, 0xFF]);
-
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Bgr, &[9, 8, 7], &mut scratch, false);
-        assert_eq!(f, PixelFormat::Bgrx);
-        assert_eq!(b, &[9, 8, 7, 0xFF]);
-
-        // 5 bytes = one pixel + a 2-byte remainder that must be dropped.
-        let mut scratch = Vec::new();
-        let (_, b) = normalize_cpu_rgb(PixelFormat::Rgb, &[1, 2, 3, 4, 5], &mut scratch, false);
-        assert_eq!(b, &[1, 2, 3, 0xFF]);
-
-        let src = [10u8, 20, 30, 40];
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Bgrx, &src, &mut scratch, false);
-        assert_eq!(f, PixelFormat::Bgrx);
-        assert!(std::ptr::eq(b.as_ptr(), src.as_ptr()));
-        assert!(scratch.is_empty());
-
+    fn pixel_to_vk_maps_the_staged_orders() {
         assert_eq!(
             pixel_to_vk(PixelFormat::Rgbx),
             Some(vk::Format::R8G8B8A8_UNORM)
@@ -815,32 +751,6 @@ mod tests {
             pixel_to_vk(PixelFormat::Bgrx),
             Some(vk::Format::B8G8R8A8_UNORM)
         );
-    }
-
-    #[test]
-    fn normalize_cpu_rgb_forces_bgra_for_the_encode_source() {
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Rgb, &[1, 2, 3], &mut scratch, true);
-        assert_eq!(f, PixelFormat::Bgrx);
-        assert_eq!(b, &[3, 2, 1, 0xFF]);
-
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Bgr, &[9, 8, 7], &mut scratch, true);
-        assert_eq!(f, PixelFormat::Bgrx);
-        assert_eq!(b, &[9, 8, 7, 0xFF]);
-
-        // R-first 4-bpp: swap; source alpha replaced by the 0xFF pad.
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Rgbx, &[1, 2, 3, 4], &mut scratch, true);
-        assert_eq!(f, PixelFormat::Bgrx);
-        assert_eq!(b, &[3, 2, 1, 0xFF]);
-
-        let src = [10u8, 20, 30, 40];
-        let mut scratch = Vec::new();
-        let (f, b) = normalize_cpu_rgb(PixelFormat::Bgra, &src, &mut scratch, true);
-        assert_eq!(f, PixelFormat::Bgra);
-        assert!(std::ptr::eq(b.as_ptr(), src.as_ptr()));
-        assert!(scratch.is_empty());
     }
 
     #[test]

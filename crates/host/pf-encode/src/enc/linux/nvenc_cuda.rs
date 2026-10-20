@@ -31,6 +31,7 @@ use super::nvenc_session::{
 };
 use super::nvenc_status;
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
+use crate::cpu_ingest::{CpuIngest, Target};
 use crate::cursor_cache::{CursorCache, Key, Verdict};
 use crate::env_knobs::Knobs;
 use crate::nvenc_lane::{
@@ -571,6 +572,8 @@ pub struct NvencCudaEncoder {
     lane: State,
     /// Device copy of the last CPU frame, reused while the size and layout hold.
     upload: Option<cuda::DeviceBuffer>,
+    /// Lays out the CPU frame `upload` takes; its scratch is reused across frames.
+    ingest: CpuIngest,
     ring: Vec<RingSlot>,
     /// Lifetime submit count (never reset) — `PUNKTFUNK_PERF` sample cadence.
     frames: u64,
@@ -666,6 +669,7 @@ impl NvencCudaEncoder {
             facts,
             lane: State::new(&facts),
             upload: None,
+            ingest: CpuIngest::default(),
             ring: Vec::new(),
             frames: 0,
             vk_blend: None,
@@ -1420,17 +1424,16 @@ impl NvencCudaEncoder {
         }
     }
 
-    /// CPU pixels into a reused pitched device buffer: BGRA-order 32-bit as is, RGBA-order
-    /// swizzled, 24-bit repacked, NV12 as two planes. Synchronous on this thread's copy stream,
-    /// behind the previous frame's queued slot copy out of the same buffer, so the reuse never
-    /// overwrites a copy in flight. Moving either copy to another stream breaks that.
+    /// CPU pixels into a reused pitched device buffer: packed RGB staged B-first
+    /// ([`CpuIngest`]), NV12 as two planes. Synchronous on this thread's copy stream, behind the
+    /// previous frame's queued slot copy out of the same buffer, so the reuse never overwrites a
+    /// copy in flight. Moving either copy to another stream breaks that.
     fn upload_cpu(
         &mut self,
         captured: &CapturedFrame,
         pixels: &[u8],
     ) -> Result<cuda::DeviceBuffer> {
         use pf_frame::PixelFormat as P;
-        use std::borrow::Cow;
         let (w, h) = (captured.width, captured.height);
         cuda::make_current().context("cuCtxSetCurrent (CPU upload)")?;
         let nv12 = captured.format == P::Nv12;
@@ -1452,31 +1455,14 @@ impl NvencCudaEncoder {
             }
             return Ok(buf);
         }
-        let packed: Cow<[u8]> = match captured.format {
-            P::Bgra | P::Bgrx | P::X2Rgb10 | P::X2Bgr10 | P::Rgb10a2 => Cow::Borrowed(pixels),
-            P::Rgba | P::Rgbx => Cow::Owned(
-                pixels
-                    .chunks_exact(4)
-                    .flat_map(|px| [px[2], px[1], px[0], px[3]])
-                    .collect(),
-            ),
-            P::Bgr => Cow::Owned(
-                pixels
-                    .chunks_exact(3)
-                    .flat_map(|px| [px[0], px[1], px[2], 255])
-                    .collect(),
-            ),
-            P::Rgb => Cow::Owned(
-                pixels
-                    .chunks_exact(3)
-                    .flat_map(|px| [px[2], px[1], px[0], 255])
-                    .collect(),
-            ),
+        let staged = self.ingest.stage(captured, Target::BFirst)?;
+        match staged.fmt {
+            P::Bgra | P::Bgrx | P::X2Rgb10 | P::X2Bgr10 | P::Rgb10a2 => {}
             other => bail!("Linux direct-NVENC cannot upload a {other:?} CPU frame"),
-        };
+        }
         // SAFETY: `buf` is a live 4-byte allocation of `w`×`h` at `pitch` (checked or allocated
         // above); the context is current (above).
-        unsafe { cuda::write_plane_from_host(buf.ptr, buf.pitch, &packed, w * 4, h)? };
+        unsafe { cuda::write_plane_from_host(buf.ptr, buf.pitch, staged.bytes, staged.row, h)? };
         Ok(buf)
     }
 
