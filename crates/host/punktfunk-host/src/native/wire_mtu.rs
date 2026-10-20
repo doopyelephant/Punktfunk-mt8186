@@ -307,7 +307,7 @@ fn grow_to(
 /// Each settle files a path verdict for the next session and, with a [`ShardReneg`] driver,
 /// shrinks the live wire to fit or grows it (ack-gated). A client move that restarts quinn's
 /// discovery shrinks video to the restart floor at once; the next settle grows it back toward
-/// the session's start shard. A session without a driver that no longer fits after a move
+/// the session's start shard. A session without a driver whose video does not fit the path
 /// closes with [`PATH_SHRANK_CLOSE_CODE`], and the client redials at a size that fits.
 pub(super) fn spawn_watch(
     conn: super::link::SessionLink,
@@ -434,7 +434,10 @@ impl Watch {
         }
     }
 
-    /// Shrink this session to fit `settled` if it does not. `false` once the session is ended.
+    /// Shrink this session to fit `settled` if it does not. A session with no re-key driver
+    /// that still does not fit after [`SHRANK_CONFIRM`] is ended, whether the client moved or
+    /// the first settle found the path small: the learned clamp sizes its redial. `false` once
+    /// the session is ended.
     async fn fit(&mut self, addr: SocketAddr, settled: u16, moved: bool) -> bool {
         let peer = addr.ip();
         let ceiling = video_datagram_udp_ceiling() as u16;
@@ -474,9 +477,6 @@ impl Watch {
             self.shrink(settled, peer, "fit the measured path");
             return true;
         }
-        if !moved {
-            return true;
-        }
         tokio::time::sleep(SHRANK_CONFIRM).await;
         if self.conn.close_reason().is_some() {
             return false;
@@ -487,15 +487,15 @@ impl Watch {
             return true;
         }
         tracing::warn!(peer = %peer, discovered_udp_mtu = settled, shard_payload = self.current,
-            "wire MTU: the client moved onto a path this session's video does not fit, and \
-             this session cannot be re-keyed — ending it so the client reconnects at a size \
-             that fits");
-        self.conn
-            .refuse(
-                PATH_SHRANK_CLOSE_CODE,
-                "The network path changed and this stream can't be resized.",
-            )
-            .await;
+            moved,
+            "wire MTU: this session's video does not fit the client's path, and this session \
+             cannot be re-keyed — ending it so the client reconnects at a size that fits");
+        let why = if moved {
+            "The network path changed and this stream can't be resized."
+        } else {
+            "This network path can't carry the stream at its packet size."
+        };
+        self.conn.refuse(PATH_SHRANK_CLOSE_CODE, why).await;
         false
     }
 
