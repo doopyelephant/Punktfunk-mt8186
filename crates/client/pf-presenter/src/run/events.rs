@@ -104,8 +104,10 @@ impl Shell {
                 repeat: true,
                 ..
             } => {
-                if let Some(cap) = capture_mut(stream) {
-                    cap.on_key_repeat(sc);
+                if !self.ring_was_open {
+                    if let Some(cap) = capture_mut(stream) {
+                        cap.on_key_repeat(sc);
+                    }
                 }
             }
             Event::KeyDown {
@@ -312,9 +314,10 @@ impl Shell {
         Ok(())
     }
 
-    /// A first press: one of the loop's own chords, else a key for the host. Super stays
-    /// local while shortcut capture is off: the local shell acts on it, so forwarding it
-    /// opens the host's launcher as well. Its up and repeats follow the down.
+    /// A first press: one of the loop's own chords, else a key for the host — none while
+    /// the ring is up, which takes the keys it maps and covers the game. Super stays local
+    /// while shortcut capture is off: the local shell acts on it, so forwarding it opens
+    /// the host's launcher as well. Its up and repeats follow the down.
     fn on_key_down(
         &mut self,
         stream: &mut Option<StreamState>,
@@ -324,6 +327,9 @@ impl Shell {
     ) {
         let Some(chord) = chord_of(keycode, sc, keymod) else {
             if !self.opts.inhibit_shortcuts && matches!(sc, Scancode::LGui | Scancode::RGui) {
+                return;
+            }
+            if self.ring_was_open {
                 return;
             }
             if let Some(cap) = capture_mut(stream) {
