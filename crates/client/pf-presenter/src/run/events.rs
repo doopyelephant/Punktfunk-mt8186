@@ -137,9 +137,13 @@ impl Shell {
                     cap.on_button_up(mouse_btn);
                 }
             }
-            Event::MouseWheel { x, y, .. } => {
+            Event::MouseWheel {
+                window_id, x, y, ..
+            } => {
                 // The overlay consumes SDL wheels before native/fallback routing.
-                self.scroll_routing.wheel(capture_mut(stream), x, y);
+                let on_primary = window_id == self.window.id();
+                self.scroll_routing
+                    .wheel(capture_mut(stream), on_primary, x, y);
             }
             Event::FingerDown {
                 touch_id,

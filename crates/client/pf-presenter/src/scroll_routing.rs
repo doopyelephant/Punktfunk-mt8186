@@ -73,8 +73,10 @@ impl ScrollRouting {
         self.blocked = true;
     }
 
-    pub(crate) fn wheel(&self, capture: Option<&mut Capture>, dx: f32, dy: f32) {
-        if self.native_active || self.blocked || !self.captured_before {
+    /// An SDL wheel event. The native path takes the wheel over the primary window's
+    /// surface only; a further screen's window has nothing but this.
+    pub(crate) fn wheel(&self, capture: Option<&mut Capture>, on_primary: bool, dx: f32, dy: f32) {
+        if (self.native_active && on_primary) || self.blocked || !self.captured_before {
             return;
         }
         if let Some(capture) = capture {
