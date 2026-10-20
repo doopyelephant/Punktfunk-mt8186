@@ -64,38 +64,36 @@ struct ActionList {
 pub fn fetch_actions(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
 ) -> Vec<ActionInfo> {
-    crate::library::get_json::<ActionList>(addr, mgmt_port, identity, pin, "/api/v1/actions")
+    let path = "/api/v1/actions";
+    crate::library::get_json::<ActionList>(addr, mgmt_port, stream_port, identity, pin, path)
         .actions
 }
 
 /// `POST /api/v1/actions/{id}` with an empty body.
 ///
-/// `Ok(())` is 202 Accepted: the host then ends every session and acts ~1 s later.
-/// 4xx becomes [`crate::library::LibraryError::Http`]; other failures go through [`crate::library::classify`].
+/// `Ok(())` is 202 Accepted (any 2xx): the host then ends every session and acts ~1 s later.
+/// Any other status becomes [`crate::library::LibraryError::Http`].
 #[cfg(desktop)]
 pub fn invoke(
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     pin: Option<[u8; 32]>,
     action_id: &str,
 ) -> Result<(), crate::library::LibraryError> {
-    use crate::library::LibraryError;
-    let agent = crate::library::agent(identity, pin)?;
+    use crate::library::{HostApi, LibraryError};
+    let https = crate::library::agent(identity, pin)?;
+    let api = HostApi::new(addr, mgmt_port, stream_port, identity, pin);
     // Empty body: no request field reaches the privileged path. Do not percent-encode; ids are `[a-z.]`.
-    let url = format!(
-        "{}/api/v1/actions/{action_id}",
-        crate::library::base_url(addr, mgmt_port)
-    );
-    match agent.post(&url).send_empty() {
-        Ok(_) => Ok(()),
-        Err(ureq::Error::StatusCode(code)) if (400..500).contains(&code) => {
-            Err(LibraryError::Http(code))
-        }
-        Err(e) => Err(crate::library::classify(e)),
+    let path = format!("/api/v1/actions/{action_id}");
+    match api.call(&https, "POST", &path, None)?.status {
+        200..=299 => Ok(()),
+        code => Err(LibraryError::Http(code)),
     }
 }
 
@@ -103,10 +101,12 @@ pub fn invoke(
 /// host said about itself is about to be wrong. A 202 is the last word, so there is
 /// nothing to poll.
 #[cfg(desktop)]
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     host_name: &str,
     addr: &str,
     mgmt_port: u16,
+    stream_port: u16,
     identity: &(String, String),
     fp_hex: &str,
     action_id: &str,
@@ -114,7 +114,7 @@ pub fn run(
 ) -> String {
     invalidate(fp_hex);
     let pin = crate::trust::parse_hex32(fp_hex);
-    match invoke(addr, mgmt_port, identity, pin, action_id) {
+    match invoke(addr, mgmt_port, stream_port, identity, pin, action_id) {
         Ok(()) => {
             tracing::info!(host = %host_name, action = %action_id, "host action accepted");
             format!("{host_name}: {label} — on its way")
@@ -146,10 +146,10 @@ pub fn cached(fp_hex: &str) -> Vec<ActionInfo> {
 /// Ask the host for its rows unless [`TTL`] says the last answer still stands.
 /// Idempotent; call it on any shell tick.
 #[cfg(desktop)]
-pub fn refresh(addr: &str, mgmt_port: u16, fp_hex: &str) {
+pub fn refresh(addr: &str, mgmt_port: u16, stream_port: u16, fp_hex: &str) {
     ACTIONS.refresh(
         addr,
-        mgmt_port,
+        (mgmt_port, stream_port),
         fp_hex,
         fetch_actions,
         ActionInfo::offerable,

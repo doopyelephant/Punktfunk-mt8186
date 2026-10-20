@@ -822,9 +822,11 @@ impl LibraryPage {
         if new_shelf {
             self.view.games.borrow_mut().clear();
             self.view.running.borrow_mut().clear();
-            self.view.art.reset(Some((
-                library::base_url(&shelf.req.host.addr, shelf.mgmt_port),
-                self.identity.clone(),
+            self.view.art.reset(Some(library::HostApi::new(
+                &shelf.req.host.addr,
+                shelf.mgmt_port,
+                shelf.req.host.port,
+                &self.identity,
                 pin,
             )));
         }
@@ -865,7 +867,11 @@ impl LibraryPage {
                     return;
                 }
                 send(Loaded::Running(library::fetch_running(
-                    &addr, port, &identity, pin,
+                    &addr,
+                    port,
+                    stream_port,
+                    &identity,
+                    pin,
                 )));
             })
             .expect("spawn library thread");
@@ -1028,6 +1034,7 @@ impl LibraryPage {
             let (sender, id, identity, title) =
                 (sender.clone(), id.clone(), identity.clone(), title.clone());
             let (addr, port) = (shelf.req.host.addr.clone(), shelf.mgmt_port);
+            let stream_port = shelf.req.host.port;
             let pin = shelf
                 .req
                 .host
@@ -1037,8 +1044,8 @@ impl LibraryPage {
             std::thread::Builder::new()
                 .name("punktfunk-endgame".into())
                 .spawn(move || {
-                    let outcome = library::end_game(&addr, port, &identity, pin, &id);
-                    let running = library::fetch_running(&addr, port, &identity, pin);
+                    let outcome = library::end_game(&addr, port, stream_port, &identity, pin, &id);
+                    let running = library::fetch_running(&addr, port, stream_port, &identity, pin);
                     let _ = sender.send(LibraryMsg::Ended(generation, outcome, title, running));
                 })
                 .expect("spawn end-game thread");

@@ -853,6 +853,7 @@ fn saved_cards<'a>(
             &k.addr,
             k.mgmt_port
                 .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT),
+            k.port,
             &k.fp_hex,
         );
     }
@@ -1184,6 +1185,7 @@ fn run_host_action(svc: &Svc, target: &Target, a: &pf_client_core::host_actions:
                     .host
                     .mgmt_port
                     .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT),
+                target.host.port,
                 &identity,
                 target.host.fp_hex.as_deref().unwrap_or_default(),
                 &action_id,
@@ -1206,10 +1208,13 @@ fn send_logs(svc: &Svc, target: &Target) {
                 "punktfunk-client",
                 &target.host.name,
                 &target.host.addr,
-                target
-                    .host
-                    .mgmt_port
-                    .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT),
+                (
+                    target
+                        .host
+                        .mgmt_port
+                        .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT),
+                    target.host.port,
+                ),
                 &identity,
                 target.host.fp_hex.as_deref().unwrap_or_default(),
             ));

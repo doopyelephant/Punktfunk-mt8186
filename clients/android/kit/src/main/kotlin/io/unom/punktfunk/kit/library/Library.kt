@@ -4,12 +4,16 @@ import android.util.Log
 import io.unom.punktfunk.kit.NativeBridge
 import io.unom.punktfunk.kit.SessionAccess
 import io.unom.punktfunk.kit.security.ClientIdentity
-import okhttp3.Cache
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
@@ -509,21 +513,13 @@ object LibraryClient {
         return Walk.Done(games)
     }
 
-    /** How long a dial over the stream port waits before HTTPS takes over. */
-    internal const val STREAM_WAIT_MS = 3_000
-
-    /** One reply from [NativeBridge.nativeMgmtGet]: its status and body. */
-    internal fun streamReply(line: String): Pair<Int, String>? =
-        line.substringBefore('\n').toIntOrNull()?.let { it to line.substringAfter('\n', "") }
-
     /**
-     * The host's catalog, walked by `GET /api/v1/library/page`: over [streamPort] first, so a
-     * host whose TCP 47990 is closed still answers, then at [mgmtBase] over HTTPS. Both
-     * authenticate by mTLS. A host older than the paged route refuses it on this lane, so `GET
-     * /api/v1/library` answers whole instead. [fpHex] is the pinned host-cert SHA-256 (64 hex,
-     * from the paired [io.unom.punktfunk.kit.security.KnownHost]); a blank value means the host
-     * was never paired. A refusal maps through [refused]. BLOCKING — call from a background
-     * dispatcher.
+     * The host's catalog, walked by `GET /api/v1/library/page` over [mtlsHttpClient]'s lanes:
+     * [streamPort] first, then [mgmtBase] over HTTPS. A host older than the paged route refuses
+     * it, so `GET /api/v1/library` answers whole instead. [fpHex] is the pinned host-cert
+     * SHA-256 (64 hex, from the paired [io.unom.punktfunk.kit.security.KnownHost]); a blank value
+     * means the host was never paired. A refusal maps through [refused]. BLOCKING — call from a
+     * background dispatcher.
      */
     fun fetch(
         address: String,
@@ -538,18 +534,8 @@ object LibraryClient {
                 "connect to this host once first — pairing is what lets it show its games",
             )
         }
-        if (streamPort > 0) {
-            val viaStream = { path: String ->
-                NativeBridge.nativeMgmtGet(address, streamPort, certPem, keyPem, fpHex, path, STREAM_WAIT_MS)
-                    ?.let(::streamReply) ?: error("the stream port carried nothing")
-            }
-            val walked = runCatching {
-                walkPages(mgmtBase(address, mgmtPort)) { cursor -> viaStream(pagePath(cursor)) }
-            }.getOrNull()
-            if (walked is Walk.Done) return LibraryResult.Ok(walked.games.launchersFirst())
-        }
         val client = try {
-            mtlsHttpClient(certPem, keyPem, address, fpHex)
+            mtlsHttpClient(certPem, keyPem, address, fpHex, streamPort)
         } catch (e: Exception) {
             Log.w(TAG, "mTLS client for $address", e)
             return LibraryResult.Error("couldn't set up a secure connection to the host")
@@ -593,7 +579,8 @@ object LibraryClient {
         certPem: String,
         keyPem: String,
         fpHex: String,
-    ): List<RunningGame> = fetchStatus(address, mgmtPort, certPem, keyPem, fpHex).games
+        streamPort: Int = 0,
+    ): List<RunningGame> = fetchStatus(address, mgmtPort, certPem, keyPem, fpHex, streamPort).games
 
     /**
      * `GET /api/v1/status`: the launched titles and the host's downloads, kept apart because a
@@ -606,10 +593,11 @@ object LibraryClient {
         certPem: String,
         keyPem: String,
         fpHex: String,
+        streamPort: Int = 0,
     ): HostStatus {
         if (fpHex.isBlank()) return HostStatus()
         return try {
-            val client = mtlsHttpClient(certPem, keyPem, address, fpHex)
+            val client = mtlsHttpClient(certPem, keyPem, address, fpHex, streamPort)
             val req = Request.Builder().url("${mgmtBase(address, mgmtPort)}/api/v1/status").build()
             client.newCall(req).execute().use { resp ->
                 if (resp.code != 200) return HostStatus()
@@ -624,11 +612,18 @@ object LibraryClient {
      * `POST /api/v1/game/end` for one title, live session included (`streaming`). The host ends it
      * only if this device launched it. BLOCKING; call from IO.
      */
-    fun endGame(id: ClientIdentity, address: String, mgmtPort: Int, fpHex: String, appId: String): GameEnd {
+    fun endGame(
+        id: ClientIdentity,
+        address: String,
+        mgmtPort: Int,
+        fpHex: String,
+        appId: String,
+        streamPort: Int = 0,
+    ): GameEnd {
         if (fpHex.isBlank() || appId.isBlank()) return GameEnd.Failed("this host isn't paired")
         val body = JSONObject().put("app_id", appId).put("streaming", true)
         return when (
-            val reply = mgmtCall(id, address, mgmtPort, fpHex) { base ->
+            val reply = mgmtCall(id, address, mgmtPort, fpHex, streamPort = streamPort) { base ->
                 Request.Builder().url("$base/api/v1/game/end")
                     .post(body.toString().toRequestBody("application/json".toMediaType()))
                     .build()
@@ -650,13 +645,14 @@ object LibraryClient {
         fpHex: String,
         appId: String,
         action: InstallAction,
+        streamPort: Int = 0,
     ): InstallOutcome {
         if (fpHex.isBlank() || appId.isBlank()) return InstallOutcome.Failed("this host isn't paired")
         val path = "/api/v1/library/install/" +
             java.net.URLEncoder.encode(appId, "UTF-8").replace("+", "%20").replace("%3A", ":")
         val empty = ByteArray(0).toRequestBody(null)
         return when (
-            val reply = mgmtCall(id, address, mgmtPort, fpHex) { base ->
+            val reply = mgmtCall(id, address, mgmtPort, fpHex, streamPort = streamPort) { base ->
                 when (action) {
                     InstallAction.Install, InstallAction.Resume -> Request.Builder().url(base + path).post(empty)
                     InstallAction.Pause -> Request.Builder().url("$base$path/pause").post(empty)
@@ -859,9 +855,10 @@ sealed interface MgmtReply {
 }
 
 /**
- * One request to a paired host's management API over [mtlsHttpClient]. [build] gets the
- * [mgmtBase] URL. [callTimeoutMs] caps the whole call; zero leaves the client's own timeouts.
- * The exception behind [MgmtReply.Unreachable] goes to the log, never to a person. BLOCKING.
+ * One request to a paired host's management API over [mtlsHttpClient], [streamPort] first. [build]
+ * gets the [mgmtBase] URL. [callTimeoutMs] caps the whole call; zero leaves the client's own
+ * timeouts. The exception behind [MgmtReply.Unreachable] goes to the log, never to a person.
+ * BLOCKING.
  */
 fun mgmtCall(
     id: ClientIdentity,
@@ -869,9 +866,10 @@ fun mgmtCall(
     mgmtPort: Int,
     fpHex: String,
     callTimeoutMs: Long = 0,
+    streamPort: Int = 0,
     build: (base: String) -> Request,
 ): MgmtReply = try {
-    var client = mtlsHttpClient(id.certPem, id.privateKeyPem, addr, fpHex)
+    var client = mtlsHttpClient(id.certPem, id.privateKeyPem, addr, fpHex, streamPort)
     if (callTimeoutMs > 0) client = client.newBuilder().callTimeout(callTimeoutMs, TimeUnit.MILLISECONDS).build()
     client.newCall(build(mgmtBase(addr, mgmtPort))).execute().use { MgmtReply.Answer.of(it.code, it.body.string()) }
 } catch (e: Exception) {
@@ -891,18 +889,63 @@ fun mgmtCall(
  * certificate for any name is accepted for the host. The host's own cert is self-signed with no
  * matching SAN, so it can never satisfy the default verifier; the pin is its only credential.
  *
- * [cache]: an HTTP cache the client honours (`Cache-Control` / `ETag`, which the host's art proxy
- * sends). One instance per directory: OkHttp forbids two on the same path.
+ * [streamPort] > 0: every request to [host] tries the host's stream port first ([StreamPortFirst]),
+ * which needs no TCP 47990.
  *
  * One connection pool per identity, host and pin, shared by every caller: a pool per call leaves
  * each connection idle for five minutes, and the host drops a peer's 33rd connection.
  */
-fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String, cache: Cache? = null): OkHttpClient {
+fun mtlsHttpClient(certPem: String, keyPem: String, host: String, fpHex: String, streamPort: Int = 0): OkHttpClient {
     val base = mtlsClients.computeIfAbsent("$host|${fpHex.lowercase()}|$certPem") {
         buildMtlsClient(certPem, keyPem, host, fpHex)
     }
-    return if (cache == null) base else base.newBuilder().cache(cache).build()
+    if (streamPort <= 0) return base
+    return base.newBuilder().addInterceptor(StreamPortFirst(host, streamPort, certPem, keyPem, fpHex)).build()
 }
+
+/** How long a dial over the stream port waits before HTTPS takes over. */
+internal const val STREAM_WAIT_MS = 3_000
+
+/**
+ * Sends each request to the pinned [host] over its stream port ([NativeBridge.nativeMgmtRequest])
+ * before HTTPS. The stream port's answer stands, except 401 and 403: a host that predates
+ * stamping the client certificate on its tunnel refuses the paired lane there. That refusal
+ * stands only when HTTPS can't be reached either. Any other origin passes straight through.
+ */
+private class StreamPortFirst(
+    private val host: String,
+    private val streamPort: Int,
+    private val certPem: String,
+    private val keyPem: String,
+    private val fpHex: String,
+) : Interceptor {
+    private val pinnedHost = urlHost(host)
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val req = chain.request()
+        if (req.url.host != pinnedHost) return chain.proceed(req)
+        val body = Buffer().also { req.body?.writeTo(it) }.readByteArray()
+        val path = req.url.encodedPath + (req.url.encodedQuery?.let { "?$it" } ?: "")
+        val contentType = req.body?.contentType()?.toString().orEmpty()
+        val tunnelled = NativeBridge.nativeMgmtRequest(
+            host, streamPort, certPem, keyPem, fpHex, req.method, path, contentType, body, STREAM_WAIT_MS,
+        )?.let(::tunnelReply)?.let { (code, bytes) ->
+            Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(code).message("")
+                .body(bytes.toResponseBody()).build()
+        }
+        if (tunnelled != null && tunnelled.code != 401 && tunnelled.code != 403) return tunnelled
+        return try {
+            chain.proceed(req).also { tunnelled?.close() }
+        } catch (e: java.io.IOException) {
+            tunnelled ?: throw e
+        }
+    }
+}
+
+/** A [NativeBridge.nativeMgmtRequest] reply: two bytes of big-endian status, then the body. */
+internal fun tunnelReply(reply: ByteArray): Pair<Int, ByteArray>? =
+    if (reply.size < 2) null
+    else (((reply[0].toInt() and 0xff) shl 8) or (reply[1].toInt() and 0xff)) to reply.copyOfRange(2, reply.size)
 
 private val mtlsClients = java.util.concurrent.ConcurrentHashMap<String, OkHttpClient>()
 

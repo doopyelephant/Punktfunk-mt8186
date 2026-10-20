@@ -38,7 +38,7 @@ use wtransport::{Connection, VarInt};
 /// A request head: the JSON a page writes after the length prefix.
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct Head {
-    /// Method. `GET` or `POST`; the page sends no other.
+    /// Method: `GET`, `POST` or `DELETE`.
     pub(crate) m: String,
     /// Path and query as `fetch` would send them: `/api/v1/library/page?limit=50`.
     pub(crate) p: String,
@@ -297,9 +297,9 @@ async fn read_request<R: AsyncRead + Unpin>(rx: &mut R) -> Result<(Head, Vec<u8>
 
 /// One request into the router, as the LAN peer it came from.
 ///
-/// Refused here, before the router: a method other than `GET` or `POST`, a path outside
-/// `/api/v1/` or under `/api/v1/local/` (the position-authenticated lane, which a LAN peer must
-/// never reach), and any header a browser's `fetch` could not have sent. What passes is
+/// Refused here, before the router: a method other than `GET`, `POST` or `DELETE`, a path
+/// outside `/api/v1/` or under `/api/v1/local/` (the position-authenticated lane, which a LAN
+/// peer must never reach), and any header a browser's `fetch` could not have sent. What passes is
 /// stamped like a request off the HTTPS listener — the peer, the bound address, and the client
 /// certificate its connection proved (`fingerprint`, hex), never one a request could name — so
 /// `require_auth` judges it as that request.
@@ -314,10 +314,11 @@ pub(crate) async fn dispatch(
     let method = match head.m.as_str() {
         "GET" => Method::GET,
         "POST" => Method::POST,
+        "DELETE" => Method::DELETE,
         _ => {
             return api_error(
                 StatusCode::METHOD_NOT_ALLOWED,
-                "the tunnel carries GET and POST only",
+                "the tunnel carries GET, POST and DELETE only",
             )
         }
     };
@@ -648,7 +649,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body, b"echo:the page's log");
 
-        let (status, _, _) = call(&page, r#"{"m":"DELETE","p":"/api/v1/health"}"#, b"").await;
+        let (status, _, _) = call(&page, r#"{"m":"PUT","p":"/api/v1/health"}"#, b"").await;
         assert_eq!(status, 405);
 
         // Sixteen streams opened and left without FIN hold every slot; the seventeenth is told
@@ -767,21 +768,29 @@ mod tests {
         );
     }
 
-    /// Core's blocking client tunnel against this one: a request arrives with the client's
-    /// certificate and its reply comes back whole.
+    /// Core's blocking client against this tunnel: requests arrive with the client's certificate
+    /// and content type, DELETE included, every reply comes back whole, and one connection
+    /// serves them all — the server here accepts only one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_core_client_tunnel_reaches_the_router() {
-        use punktfunk_core::client::mgmt::MgmtTunnel;
+        use axum::Json;
+        use punktfunk_core::client::mgmt;
         use punktfunk_core::quic::endpoint;
         use punktfunk_core::quic::v2::{io, registry};
-        let router = Router::new().route(
-            "/api/v1/whoami",
-            get(
-                |axum::Extension(fp): axum::Extension<PeerCertFingerprint>| async move {
-                    fp.0.unwrap_or_else(|| "none".into())
-                },
-            ),
-        );
+        let router = Router::new()
+            .route(
+                "/api/v1/whoami",
+                get(
+                    |axum::Extension(fp): axum::Extension<PeerCertFingerprint>| async move {
+                        fp.0.unwrap_or_else(|| "none".into())
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/echo",
+                post(|Json(v): Json<serde_json::Value>| async move { v.to_string() })
+                    .delete(|| async { "gone" }),
+            );
         let (cert, key) = endpoint::generate_identity().unwrap();
         let loopback: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (server, _media) = endpoint::server_shared(
@@ -804,21 +813,42 @@ mod tests {
         });
         let (me_cert, me_key) = endpoint::generate_identity().unwrap();
         let mine = hex::encode(endpoint::fingerprint_of_pem(&me_cert).unwrap());
-        let reply = tokio::task::spawn_blocking(move || {
-            let tunnel = MgmtTunnel::open(
-                "127.0.0.1",
-                bind.port(),
-                (&me_cert, &me_key),
-                None,
-                Duration::from_secs(5),
-            )
-            .unwrap();
-            tunnel.request("GET", "/api/v1/whoami", b"").unwrap()
+        let replies = tokio::task::spawn_blocking(move || {
+            let call = |method, path, content_type, body: &[u8]| {
+                let req = mgmt::Request {
+                    method,
+                    path,
+                    content_type,
+                    body,
+                };
+                let wait = Duration::from_secs(5);
+                let reply = mgmt::request(
+                    "127.0.0.1",
+                    bind.port(),
+                    (&me_cert, &me_key),
+                    None,
+                    wait,
+                    &req,
+                )
+                .unwrap();
+                (reply.status, String::from_utf8(reply.body).unwrap())
+            };
+            [
+                call("GET", "/api/v1/whoami", None, b""),
+                call(
+                    "POST",
+                    "/api/v1/echo",
+                    Some("application/json"),
+                    br#"{"a":1}"#,
+                ),
+                call("DELETE", "/api/v1/echo", None, b""),
+            ]
         })
         .await
         .unwrap();
-        assert_eq!(reply.status, 200);
-        assert_eq!(reply.body, mine.as_bytes());
+        assert_eq!(replies[0], (200, mine));
+        assert_eq!(replies[1], (200, r#"{"a":1}"#.to_string()));
+        assert_eq!(replies[2], (200, "gone".to_string()));
     }
 
     fn parse_reply(all: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {

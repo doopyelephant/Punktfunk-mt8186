@@ -153,7 +153,7 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
     LaunchedEffect(hold) {
         val (id, art) = withContext(Dispatchers.IO) {
             IdentityHolder.shared(context).await()?.let { me ->
-                runCatching { me to posterLoader(context, me, hold.address, hold.fpHex) }.getOrNull()
+                runCatching { me to posterLoader(context, me, hold.address, hold.fpHex, hold.streamPort) }.getOrNull()
             }
         } ?: run {
             onShow()
@@ -164,7 +164,7 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
         while (isActive) {
             val status = withContext(Dispatchers.IO) {
                 LibraryClient.fetchStatus(
-                    hold.address, hold.mgmtPort, id.certPem, id.privateKeyPem, hold.fpHex,
+                    hold.address, hold.mgmtPort, id.certPem, id.privateKeyPem, hold.fpHex, hold.streamPort,
                 )
             }
             val game = status.games.firstOrNull { it.appId == hold.game.id }
@@ -431,7 +431,7 @@ fun LaunchHoldOverlay(hold: LaunchHold, onRetry: () -> Unit, onShow: () -> Unit)
                             } else {
                                 withContext(Dispatchers.IO) {
                                     LibraryClient.endGame(
-                                        id, hold.address, hold.mgmtPort, hold.fpHex, hold.game.id,
+                                        id, hold.address, hold.mgmtPort, hold.fpHex, hold.game.id, hold.streamPort,
                                     )
                                 }
                             }

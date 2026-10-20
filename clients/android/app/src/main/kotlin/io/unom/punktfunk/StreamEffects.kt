@@ -263,7 +263,7 @@ internal fun rememberHostActions(handle: Long, host: KnownHost?): State<List<Hos
         } ?: return@LaunchedEffect
         while (true) {
             actions.value = withContext(Dispatchers.IO) {
-                HostActions.list(identity, kh.address, kh.effectiveMgmtPort, kh.fpHex)
+                HostActions.list(identity, kh.address, kh.effectiveMgmtPort, kh.fpHex, kh.port)
             }
             delay(300_000)
         }
@@ -287,7 +287,7 @@ internal fun rememberStreamedGame(handle: Long, host: KnownHost?, ringOpen: Bool
         } ?: return@LaunchedEffect
         game.value = withContext(Dispatchers.IO) {
             LibraryClient.fetchRunning(
-                kh.address, kh.effectiveMgmtPort, identity.certPem, identity.privateKeyPem, kh.fpHex,
+                kh.address, kh.effectiveMgmtPort, identity.certPem, identity.privateKeyPem, kh.fpHex, kh.port,
             )
         }.firstOrNull { it.streamedHere }
     }

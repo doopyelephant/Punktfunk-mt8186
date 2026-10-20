@@ -206,19 +206,23 @@ object NativeBridge {
     external fun nativeWakeOnLan(macsCsv: String, lastIp: String): Boolean
 
     /**
-     * `GET path` over the host's stream port as this device, refusing any host but [pinHex]: the
-     * reply's status, a newline, then its body. Null when the port carried nothing, so HTTPS may.
-     * Blocking; never on the main thread.
+     * `method path` with [body] over the host's stream port as this device, refusing any host
+     * but [pinHex]. An empty [contentType] sends none. The reply as two bytes of big-endian
+     * status, then its body; null when the port carried nothing, so HTTPS may. One connection
+     * per host serves every call. Blocking; never on the main thread.
      */
-    external fun nativeMgmtGet(
+    external fun nativeMgmtRequest(
         host: String,
         port: Int,
         certPem: String,
         keyPem: String,
         pinHex: String,
+        method: String,
         path: String,
+        contentType: String,
+        body: ByteArray,
         timeoutMs: Int,
-    ): String?
+    ): ByteArray?
 
     /**
      * Bounded QUIC reachability probe to [host]:[port] (mDNS-independent): the lowercase-hex

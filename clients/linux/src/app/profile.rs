@@ -63,7 +63,8 @@ impl AppModel {
         let (identity, out) = (self.identity.clone(), sender.input_sender().clone());
         let pin = trust::parse_hex32(&fp_hex);
         std::thread::spawn(move || {
-            let listed = profiles::fetch_within(&req.host.addr, mgmt, &identity, pin, ASK_BUDGET);
+            let (addr, port) = (&req.host.addr, req.host.port);
+            let listed = profiles::fetch_within(addr, mgmt, port, &identity, pin, ASK_BUDGET);
             let _ = out.send(done(req, fp_hex, listed));
         });
     }
@@ -261,9 +262,9 @@ impl AppModel {
         let mgmt = self.mgmt_port(&fp_hex);
         let (identity, pin) = (self.identity.clone(), trust::parse_hex32(&fp_hex));
         let (out, flag) = (sender.input_sender().clone(), stop.clone());
-        let (addr, watched) = (req.host.addr.clone(), row.clone());
+        let (addr, port, watched) = (req.host.addr.clone(), req.host.port, row.clone());
         std::thread::spawn(move || {
-            profiles::watch_seat(&addr, mgmt, &identity, pin, &watched, &flag, |row| {
+            profiles::watch_seat(&addr, mgmt, port, &identity, pin, &watched, &flag, |row| {
                 let stop = flag.clone();
                 out.send(AppMsg::SeatPolled { stop, row }).is_ok()
             });

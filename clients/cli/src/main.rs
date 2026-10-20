@@ -1025,6 +1025,7 @@ from the config directory for a true factory reset."
         let outcome = library::end_game(
             &host.addr,
             host.effective_mgmt_port(),
+            host.port,
             &identity,
             Some(pin),
             &game,
@@ -1092,11 +1093,11 @@ from the config directory for a true factory reset."
             eprintln!("client identity: {e:#}");
             CONNECT_FAILED
         })?;
-        profiles::fetch_enumerate(&host.addr, host.effective_mgmt_port(), &identity, Some(pin))
-            .map_err(|e| {
-                eprintln!("profiles: {e}");
-                CONNECT_FAILED
-            })
+        let mgmt = host.effective_mgmt_port();
+        profiles::fetch_enumerate(&host.addr, mgmt, host.port, &identity, Some(pin)).map_err(|e| {
+            eprintln!("profiles: {e}");
+            CONNECT_FAILED
+        })
     }
 
     /// Write `pick` as the saved profile of record `id`, in the store as it is under its

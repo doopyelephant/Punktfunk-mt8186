@@ -107,7 +107,8 @@ fn fetch(
         .host
         .mgmt_port
         .unwrap_or(pf_client_core::library::DEFAULT_MGMT_PORT);
-    profiles::fetch_within(&target.host.addr, mgmt, &ctx.identity, pin, FETCH_CUTOFF)
+    let (addr, port) = (&target.host.addr, target.host.port);
+    profiles::fetch_within(addr, mgmt, port, &ctx.identity, pin, FETCH_CUTOFF)
 }
 
 fn open(ctx: &AppCtx, ask: PickerAsk) {
@@ -211,6 +212,7 @@ pub(crate) fn seat_then(
             profiles::watch_seat(
                 &target.host.addr,
                 mgmt,
+                target.host.port,
                 &ctx.identity,
                 pin,
                 &row,
