@@ -31,6 +31,7 @@ use super::nvenc_session::{
 };
 use super::nvenc_status;
 use super::{AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps};
+use crate::cursor_cache::{CursorCache, Key, Verdict};
 use crate::env_knobs::Knobs;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use pf_frame::{CapturedFrame, DmabufFrame, FramePayload};
@@ -542,8 +543,6 @@ struct NvReframe {
     src: (u32, u32),
     /// One source-size slot per ring slot, same layout. Freed with the ring.
     staging: Vec<VkSlotRef>,
-    /// The cursor bitmap scaled by the reframe: `(serial, rgba, w, h)`.
-    cursor: Option<(u64, Vec<u8>, u32, u32)>,
 }
 
 pub struct NvencCudaEncoder {
@@ -565,7 +564,7 @@ pub struct NvencCudaEncoder {
     /// Lifetime submit count (never reset) — `PUNKTFUNK_PERF` sample cadence.
     frames: u64,
     /// Vulkan SPIR-V cursor blend (`vkslot.rs`). `None` = bring-up failed, ring is plain CUDA,
-    /// no cursor. `cursor_tried` is one-shot; `cursor_serial` is the uploaded bitmap.
+    /// no cursor. `cursor_tried` is one-shot; `cursor` is the uploaded bitmap.
     vk_blend: Option<VkSlotBlend>,
     /// Crop and scale ahead of the encode. Needs `vk_blend`.
     reframe: Option<NvReframe>,
@@ -573,7 +572,7 @@ pub struct NvencCudaEncoder {
     /// carry an overlay.
     blend_wanted: bool,
     cursor_tried: bool,
-    cursor_serial: u64,
+    cursor: CursorCache,
     /// Blend-warn latch: once per failure streak. A warn on every cursor frame would evict
     /// the log ring.
     cursor_blend_warned: bool,
@@ -582,7 +581,7 @@ pub struct NvencCudaEncoder {
     raw_wanted: bool,
     worker: Option<pf_zerocopy::Importer>,
     worker_slots: HashSet<usize>,
-    worker_cursor_serial: u64,
+    worker_cursor: CursorCache,
     /// The last raw frame the fused pass converted, and where it landed.
     last_raw: Option<LastRaw>,
     /// The worker's convert timeline in CUDA: each pass's value is waited on the copy stream
@@ -672,14 +671,14 @@ impl NvencCudaEncoder {
             reframe: None,
             blend_wanted: cursor_blend,
             cursor_tried: false,
-            cursor_serial: u64::MAX,
+            cursor: CursorCache::default(),
             cursor_blend_warned: false,
             // Capture's identity-scoped latch controls whether a dmabuf arrives; the encoder
             // only applies the raw-lane knob to that payload.
             raw_wanted: pf_zerocopy::nvenc_raw_enabled(),
             worker: None,
             worker_slots: HashSet::new(),
-            worker_cursor_serial: u64::MAX,
+            worker_cursor: CursorCache::default(),
             last_raw: None,
             convert_sem: None,
             convert_waited: 0,
@@ -816,14 +815,8 @@ impl NvencCudaEncoder {
             w.clear_cache();
         }
         self.worker_slots.clear();
-        // `clear_cache` dropped the worker's cursor bitmap; the next frame must upload it again.
-        self.worker_cursor_serial = u64::MAX;
-        // The host-side bitmap is keyed on the serial alone, but its PQ re-encode follows the
-        // input depth, which the rebuild may have changed: upload it again too.
-        self.cursor_serial = u64::MAX;
-        if let Some(r) = &mut self.reframe {
-            r.cursor = None;
-        }
+        self.worker_cursor.rebuild();
+        self.cursor.rebuild();
         self.last_raw = None;
         // A failed destroy can leak a slot toward the concurrent-session cap (per process;
         // only a restart clears it).
@@ -1281,9 +1274,9 @@ impl NvencCudaEncoder {
             if self.worker.take().is_some() {
                 super::vk_util::reject_dmabuf(d, "convert worker died");
             }
-            // The timeline and the slot registrations belonged to that process.
+            // The timeline, the slot registrations and the cursor bitmap belonged to that process.
             self.worker_slots.clear();
-            self.worker_cursor_serial = u64::MAX;
+            self.worker_cursor.rebuild();
             self.release_convert_sem();
             let now = std::time::Instant::now();
             if self.worker_retry_at.is_some_and(|at| now < at) {
@@ -1316,15 +1309,21 @@ impl NvencCudaEncoder {
         let cursor = match &captured.cursor {
             _ if chroma_plane(captured, d).is_some() => None,
             Some(ov) if ov.visible && ov.w > 0 && ov.h > 0 && !ov.rgba.is_empty() => {
-                if self.worker_cursor_serial != ov.serial {
+                // Keyed on the serial alone: a depth flip reaches it through teardown's rebuild.
+                let key = Key {
+                    serial: ov.serial,
+                    pq: false,
+                };
+                if self.worker_cursor.decide(key) == Verdict::Upload {
                     // A PQ frame takes the cursor re-encoded as PQ; sRGB bytes would be read as PQ.
                     let rgba = if pq_input(self.hdr_asked, captured.format) {
                         ov.pq_rgba()
                     } else {
                         ov.rgba.clone()
                     };
-                    worker.set_cursor(ov.serial, ov.w, ov.h, &rgba)?;
-                    self.worker_cursor_serial = ov.serial;
+                    worker
+                        .set_cursor(ov.serial, ov.w, ov.h, &rgba)
+                        .inspect_err(|_| self.worker_cursor.forget())?;
                 }
                 Some(pf_zerocopy::CursorRect {
                     x: ov.x,
@@ -1848,28 +1847,15 @@ impl NvencCudaEncoder {
         cursor_ordered: bool,
     ) {
         // A reframed picture takes the pointer scaled and moved with it.
-        let (cw, ch, cx, cy) = match &mut self.reframe {
+        let (cw, ch, cx, cy) = match &self.reframe {
             Some(r) => {
-                let [x, y, w, _] = r.crop;
+                let [x, y, w, h] = r.crop;
                 let (ow, oh) = r.out;
                 let scale = |v: i64, n: u32| (v * i64::from(n)).div_euclid(i64::from(w));
-                let h = r.crop[3];
                 let scale_y = |v: i64| (v * i64::from(oh)).div_euclid(i64::from(h));
-                if r.cursor.as_ref().map(|c| c.0) != Some(ov.serial) {
-                    let tw = (u64::from(ov.w) * u64::from(ow) / u64::from(w)).max(1) as u32;
-                    let th = (u64::from(ov.h) * u64::from(oh) / u64::from(h)).max(1) as u32;
-                    let src = if pq_input(self.hdr_asked, captured.format) {
-                        ov.pq_rgba()
-                    } else {
-                        ov.rgba.clone()
-                    };
-                    let scaled = shrink_rgba(&src, ov.w, ov.h, tw, th);
-                    r.cursor = Some((ov.serial, scaled, tw, th));
-                }
-                let (_, _, tw, th) = r.cursor.as_ref().expect("set above");
                 (
-                    *tw,
-                    *th,
+                    (u64::from(ov.w) * u64::from(ow) / u64::from(w)).max(1) as u32,
+                    (u64::from(ov.h) * u64::from(oh) / u64::from(h)).max(1) as u32,
                     scale(i64::from(ov.x) - i64::from(x), ow) as i32,
                     scale_y(i64::from(ov.y) - i64::from(y)) as i32,
                 )
@@ -1889,15 +1875,23 @@ impl NvencCudaEncoder {
             }
             return;
         };
-        if self.cursor_serial != ov.serial {
-            // Quiesces in-flight ordered blends before touching staging.
-            let pq = pq_input(self.hdr_asked, captured.format).then(|| ov.pq_rgba());
-            let bitmap = match &self.reframe {
-                Some(r) => r.cursor.as_ref().map_or(&[][..], |c| c.1.as_slice()),
-                None => pq.as_deref().unwrap_or(&ov.rgba).as_slice(),
+        // Keyed on the serial alone: a depth flip reaches it through teardown's rebuild.
+        let key = Key {
+            serial: ov.serial,
+            pq: false,
+        };
+        if self.cursor.decide(key) == Verdict::Upload {
+            let src = if pq_input(self.hdr_asked, captured.format) {
+                ov.pq_rgba()
+            } else {
+                ov.rgba.clone()
             };
-            vk.upload_cursor(bitmap, cw, ch);
-            self.cursor_serial = ov.serial;
+            let scaled = self
+                .reframe
+                .is_some()
+                .then(|| shrink_rgba(&src, ov.w, ov.h, cw, ch));
+            // Quiesces in-flight ordered blends before touching staging.
+            vk.upload_cursor(scaled.as_deref().unwrap_or(&src), cw, ch);
         }
         // `surfW` = content width. Pixels past content land in cropped padding.
         let (fmt, width) = (slot_fmt_of(self.s.buffer_fmt), self.s.width);
@@ -2016,7 +2010,6 @@ impl Encoder for NvencCudaEncoder {
             out,
             src: (0, 0),
             staging: Vec::new(),
-            cursor: None,
         });
         tracing::info!(crop = ?rect, ?out, "NVENC (Linux): cropping and scaling on the Vulkan slot queue");
         Ok(())

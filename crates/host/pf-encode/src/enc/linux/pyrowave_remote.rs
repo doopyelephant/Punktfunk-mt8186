@@ -16,6 +16,7 @@
 //! `grep` finds every rung.
 
 use super::worker::{self, FromWorker, PriorityOutcome, ToWorker, WireCursor};
+use crate::cursor_cache::{CursorCache, Key, Verdict};
 use crate::env_knobs::Knobs;
 use crate::pyrowave_wire::AuStream;
 use crate::{AuChunk, ChromaFormat, EncodedFrame, Encoder, EncoderCaps};
@@ -75,8 +76,8 @@ struct Link {
     rbuf: Vec<u8>,
     /// Dmabuf keys whose fd the worker already holds; the fd crosses only on first sight.
     sent_keys: HashSet<u64>,
-    /// Cursor bitmap `serial` the worker has pixels for. A moving pointer re-sends position only.
-    cursor_serial: Option<u64>,
+    /// The cursor bitmap the worker has pixels for. A moving pointer re-sends position only.
+    cursor: CursorCache,
 }
 
 impl Drop for Link {
@@ -105,8 +106,28 @@ impl Link {
     }
 
     /// Encode one frame. The reply is the buffer-release signal — the same lifetime as
-    /// `Encoder::submit`: the caller holds the frame until its AU comes back.
+    /// `Encoder::submit`: the caller holds the frame until its AU comes back. A frame that
+    /// carried a new bitmap and failed leaves the worker's copy unknown, so the next one sends it.
     fn encode(&mut self, frame: &CapturedFrame) -> Result<EncodedFrame, Fail> {
+        let send_bitmap = frame.cursor.as_ref().is_some_and(|c| {
+            let key = Key {
+                serial: c.serial,
+                pq: false,
+            };
+            self.cursor.decide(key) == Verdict::Upload
+        });
+        let r = self.send_frame(frame, send_bitmap);
+        if send_bitmap && r.is_err() {
+            self.cursor.forget();
+        }
+        r
+    }
+
+    fn send_frame(
+        &mut self,
+        frame: &CapturedFrame,
+        send_bitmap: bool,
+    ) -> Result<EncodedFrame, Fail> {
         let FramePayload::Dmabuf(d) = &frame.payload else {
             // `submit` routes every non-dmabuf payload in-process before this.
             return Err(Fail::Encode("not a dmabuf payload".into()));
@@ -117,7 +138,7 @@ impl Link {
         // Empty bitmaps upload too: the worker's invariant is "pixels for every serial asked",
         // and skipping empty would make "no upload" mean both new-and-empty and already-sent.
         let upload = match frame.cursor.as_ref() {
-            Some(c) if self.cursor_serial != Some(c.serial) => Some(
+            Some(c) if send_bitmap => Some(
                 worker::cursor_upload(&c.rgba)
                     .map_err(|e| Fail::Dead(anyhow::Error::from(e).context("stage the cursor")))?,
             ),
@@ -199,11 +220,6 @@ impl Link {
                 au_buf.read_exact_at(&mut data, 0).map_err(|e| {
                     Fail::Dead(anyhow::Error::from(e).context("read the AU return buffer"))
                 })?;
-                if let Some(c) = frame.cursor.as_ref() {
-                    if upload.is_some() {
-                        self.cursor_serial = Some(c.serial);
-                    }
-                }
                 tracing::trace!(len, encode_us, "pyrowave: AU from the encode worker");
                 Ok(EncodedFrame {
                     data,
@@ -268,7 +284,7 @@ fn spawn_link(exe: &Path, p: &Params, bitrate_bps: u64) -> Result<Handshake> {
             au_buf: None,
             rbuf: Vec::new(),
             sent_keys: HashSet::new(),
-            cursor_serial: None,
+            cursor: CursorCache::default(),
         },
         p,
         bitrate_bps,
@@ -855,7 +871,7 @@ mod tests {
             au_buf: Some(au_buf),
             rbuf: Vec::new(),
             sent_keys: HashSet::new(),
-            cursor_serial: None,
+            cursor: CursorCache::default(),
         }
     }
 

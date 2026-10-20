@@ -8,8 +8,8 @@
 //! held.
 //!
 //! The key is the bitmap's serial and its PQ re-encode. A depth or device change reaches the
-//! cache as a `rebuild`. Each row of `cursor_table` names the rule it pins. Design:
-//! `design/pf-encode-overhaul.md` §4.4.
+//! cache as a `rebuild`. Each row of `cursor_table` names the rule it pins; [`copy_rows`] lands
+//! a bitmap wider than its plane. Design: `design/pf-encode-overhaul.md` §4.4.
 
 /// What an uploaded bitmap was made from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +52,14 @@ impl CursorCache {
     /// The session dropped what it held: a rebuilt session, a cleared or respawned worker.
     pub(crate) fn rebuild(&mut self) {
         self.uploaded = None;
+    }
+}
+
+/// Fill `dst` row by row (`row` bytes each) from a bitmap whose rows are `src_row` apart: a
+/// wider bitmap lands as its top-left square, not as a sheared linear prefix.
+pub(crate) fn copy_rows(dst: &mut [u8], src: &[u8], row: usize, src_row: usize) {
+    for (d, s) in dst.chunks_exact_mut(row).zip(src.chunks_exact(src_row)) {
+        d.copy_from_slice(&s[..row]);
     }
 }
 
@@ -173,5 +181,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_wider_bitmap_lands_as_its_top_left_square() {
+        // Three pixels wide into a two-wide plane: plane row 2 starts where bitmap row 2 does.
+        let src: Vec<u8> = (0..3 * 2 * 4).map(|i| i as u8).collect();
+        let mut dst = [0u8; 2 * 2 * 4];
+        copy_rows(&mut dst, &src, 2 * 4, 3 * 4);
+        assert_eq!(&dst[..8], &src[..8]);
+        assert_eq!(&dst[8..], &src[12..20]);
     }
 }
