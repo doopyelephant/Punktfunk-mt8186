@@ -743,16 +743,17 @@ impl StreamState {
             &live_bitrate,
             &retarget_tx,
         );
+        // An adopted mode is not the one the control task's first config names: tell it what
+        // epoch 0 delivers. It sends only what the client does not hold, and corrects a client
+        // acked with another mode.
         if adopted_at_bringup {
             let actual = delivered_mode(frame.width, frame.height, interval);
-            if actual != mode {
-                let _ = reconfig_result_tx.send(crate::native::wiring::Delivered {
-                    mode: actual,
-                    format: format_of(&plan, &*capturer, bit_depth),
-                    epoch: 0,
-                    corrects: true,
-                });
-            }
+            let _ = reconfig_result_tx.send(crate::native::wiring::Delivered {
+                mode: actual,
+                format: format_of(&plan, &*capturer, bit_depth),
+                epoch: 0,
+                corrects: actual != mode,
+            });
         }
 
         let (game_shared, game_life) = spawn_launch_and_lease(
