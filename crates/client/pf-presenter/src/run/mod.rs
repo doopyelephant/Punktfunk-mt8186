@@ -48,6 +48,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod events;
+mod overlay_facts;
 mod pace;
 mod pace_step;
 mod restart;

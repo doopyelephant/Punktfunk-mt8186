@@ -1,6 +1,5 @@
 //! The window, presenter, overlay and pads the run loop owns.
 
-use super::stream::ring_facts;
 use super::*;
 
 impl Shell {
@@ -300,9 +299,9 @@ fn stream_window_rect(
 }
 
 impl Shell {
-    /// This pass's overlay: expire the access toast, render the console over the frame
-    /// context, and tell the damage tracker what changed. Browse needs the console, so a
-    /// frame error is fatal there.
+    /// This pass's overlay: expire the access toast, settle an End game, hold or release the
+    /// screen saver, gather the console's facts once and render its frame, then tell the
+    /// damage tracker what changed. Browse needs the console, so a frame error is fatal there.
     pub(super) fn overlay_tick(&mut self, stream: &mut Option<StreamState>) -> Result<()> {
         if let Some(st) = stream.as_mut() {
             if st
@@ -330,149 +329,23 @@ impl Shell {
                 }
             }
         }
-
-        if let Some(o) = self.overlay.as_mut() {
-            let (pw, ph) = self.window.size_in_pixels();
-            let (stats, hint) = match &stream {
-                Some(st) if st.connector.is_some() => {
-                    // No "click to capture" over a session with nothing to capture for, or
-                    // while another window has focus: the hint returns with the focus.
-                    let hint = match &st.capture {
-                        Some(cap) if !cap.captured() && cap.can_capture() && !self.focus_lost => {
-                            Some(if self.gamepad.active().is_some() {
-                                HINT_WITH_PAD
-                            } else {
-                                HINT_KEYBOARD
-                            })
+        self.screen_saver_tick(stream.as_ref());
+        if self.overlay.is_some() {
+            let facts = self.overlay_facts(stream.as_ref());
+            if let Some(o) = self.overlay.as_mut() {
+                match o.frame(&facts.ctx()) {
+                    Ok(f) => self.overlay_frame = f,
+                    Err(e) => {
+                        if self.browse {
+                            return Err(e).context("console UI frame (required for --browse)");
                         }
-                        _ => None,
-                    };
-                    (
-                        (self.stats_verbosity != StatsVerbosity::Off && !st.osd.is_empty())
-                            .then_some(st.osd.as_slice()),
-                        hint,
-                    )
-                }
-                _ => (None, None),
-            };
-            // Access chip: a standing pill in the stats overlay family. A pill that never
-            // goes away is chrome, so it rides the stats tier. `None` for a full-control
-            // permanent session — what a host that never sent access looks like.
-            let access_chip = match &stream {
-                Some(st)
-                    if st.connector.is_some() && self.stats_verbosity != StatsVerbosity::Off =>
-                {
-                    st.access.chip_text(Instant::now())
-                }
-                _ => None,
-            };
-            let session_notice = stream
-                .as_ref()
-                .filter(|st| st.connector.is_some())
-                .and_then(|st| st.session_notice.as_ref().map(|(n, _)| n.as_str()));
-            let pad = self.gamepad.active();
-            let pads = self.gamepad.pads();
-            let resizing = stream
-                .as_ref()
-                .is_some_and(|st| st.connector.is_some() && st.resize_overlay.active());
-            // Read live from the session's control rather than mirrored into StreamState:
-            // the pump knows whether an uplink exists, and a mirrored copy would go stale
-            // at session end.
-            let mic_muted = stream.as_ref().is_some_and(|st| st.handle.mic.muted());
-            // A switch inside a stream starts the notice's clock. A stream ending muted is
-            // not the player unmuting, so that edge clears it instead.
-            if mic_muted != self.mic_muted_seen {
-                self.mic_muted_seen = mic_muted;
-                self.mic_muted_at = stream.is_some().then(Instant::now);
-            }
-            let mic_notice = self
-                .mic_muted_at
-                .and_then(|at| punktfunk_core::client::mic_mute_notice(mic_muted, at.elapsed()));
-            // The badge clears itself once a local mute has been read; the mask's own clock
-            // lives here because only the frame loop knows when it last moved.
-            let audio_mute = stream
-                .as_ref()
-                .and_then(|st| st.connector.as_ref())
-                .and_then(|c| {
-                    let mask = c.audio_mute();
-                    if mask != self.audio_mute_seen {
-                        self.audio_mute_seen = mask;
-                        self.audio_mute_at = Instant::now();
+                        tracing::warn!(error = %format!("{e:#}"),
+                            "overlay frame failed — disabling the console UI");
+                        // The overlay's drop frees images the last present may still sample.
+                        self.presenter.wait_idle();
+                        self.overlay = None;
+                        self.overlay_frame = None;
                     }
-                    punktfunk_core::client::audio_mute_notice(mask, self.audio_mute_at.elapsed())
-                });
-            // SDL holds the screen saver off for as long as the window lives. A stream whose
-            // player turned "Keep screen awake" off gives it back once their input goes quiet,
-            // so the desktop's own saver runs over a game left alone. No stream holds as before.
-            let hold = stream
-                .as_ref()
-                .and_then(|st| Some((st, st.connector.as_ref()?)))
-                .is_none_or(|(st, c)| {
-                    punktfunk_core::client::holds_screen_awake(st.params.keep_awake, c.input_idle())
-                });
-            if hold != self.screen_held {
-                self.screen_held = hold;
-                let set = if hold {
-                    self.sdl_video.disable_screen_saver()
-                } else {
-                    self.sdl_video.enable_screen_saver()
-                };
-                if let Err(e) = set {
-                    tracing::debug!(error = %e, hold, "screen saver hold not changed");
-                }
-            }
-            let ring_facts = stream
-                .as_ref()
-                .filter(|st| st.connector.is_some())
-                .map(|st| {
-                    ring_facts(
-                        st,
-                        &self.opts,
-                        self.stats_verbosity,
-                        mic_muted,
-                        self.ring_opener,
-                        self.gamepad.kind_override(),
-                    )
-                });
-            let ctx = FrameCtx {
-                width: pw,
-                height: ph,
-                ten_bit: self.presenter.ten_bit(),
-                // Re-read per frame: dragging to a second monitor with a different scale
-                // updates this.
-                scale: overlay_scale(self.window.display_scale(), self.osd_scale_pref),
-                stats,
-                stats_corner: stream
-                    .as_ref()
-                    .map_or(punktfunk_core::hud::HudCorner::TopLeft, |st| {
-                        st.params.stats_corner
-                    }),
-                stats_scale: stream.as_ref().map_or(1.0, |st| st.params.stats_scale),
-                exit_hint: stream.as_ref().is_some_and(|st| st.params.exit_hint),
-                hint,
-                access: access_chip.as_deref(),
-                notice: session_notice,
-                mic_notice,
-                audio_mute,
-                resizing,
-                pad: pad.as_ref().map(|p| p.name.as_str()),
-                pad_pref: pad.as_ref().map(|p| p.pref),
-                pads: &pads,
-                ring: ring_facts.as_ref(),
-                native: self.native,
-            };
-            match o.frame(&ctx) {
-                Ok(f) => self.overlay_frame = f,
-                Err(e) => {
-                    if self.browse {
-                        return Err(e).context("console UI frame (required for --browse)");
-                    }
-                    tracing::warn!(error = %format!("{e:#}"),
-                        "overlay frame failed — disabling the console UI");
-                    // The overlay's drop frees images the last present may still sample.
-                    self.presenter.wait_idle();
-                    self.overlay = None;
-                    self.overlay_frame = None;
                 }
             }
         }
@@ -482,6 +355,28 @@ impl Shell {
         self.presenter
             .sync_native_overlay(self.overlay_frame.as_ref(), self.window.size());
         Ok(())
+    }
+
+    /// SDL holds the screen saver off while the window lives. A stream whose player turned
+    /// "Keep screen awake" off gives it back once their input goes quiet, so the desktop's
+    /// own saver runs over a game left alone. No stream holds.
+    fn screen_saver_tick(&mut self, stream: Option<&StreamState>) {
+        let hold = stream
+            .and_then(|st| Some((st, st.connector.as_ref()?)))
+            .is_none_or(|(st, c)| {
+                punktfunk_core::client::holds_screen_awake(st.params.keep_awake, c.input_idle())
+            });
+        if hold != self.screen_held {
+            self.screen_held = hold;
+            let set = if hold {
+                self.sdl_video.disable_screen_saver()
+            } else {
+                self.sdl_video.enable_screen_saver()
+            };
+            if let Err(e) = set {
+                tracing::debug!(error = %e, hold, "screen saver hold not changed");
+            }
+        }
     }
 }
 
