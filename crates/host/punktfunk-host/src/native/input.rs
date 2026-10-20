@@ -247,6 +247,17 @@ impl Pads {
         since.elapsed() < ARRIVAL_WAIT
     }
 
+    /// The device pad `idx` is: the kind it was built as, else the one it will be built as
+    /// (the declared kind as this host resolves it). A DualSense the host folds to Xbox 360
+    /// has no speaker to stream to.
+    fn device_kind(&self, idx: usize) -> Option<GamepadPref> {
+        self.owner
+            .get(idx)
+            .copied()
+            .flatten()
+            .or_else(|| self.kinds.get(idx).copied())
+    }
+
     /// This pad as the Controllers feed reports it: the device the host built, the
     /// kind the client asked for, and the state this thread just applied.
     fn feed_frame(&self, idx: usize, wire: &WirePads) -> crate::pad_feed::PadFrame {
@@ -254,7 +265,11 @@ impl Pads {
         crate::pad_feed::PadFrame {
             pad: idx as u8,
             ts_ms: crate::clock::unix_ms(),
-            device: self.kinds[idx].as_str().to_string(),
+            device: self
+                .device_kind(idx)
+                .unwrap_or(GamepadPref::Xbox360)
+                .as_str()
+                .to_string(),
             declared: self.declared[idx].map(|k| k.as_str().to_string()),
             slot: self.slots.slot_of(idx),
             present: mask & (1 << idx) != 0,
@@ -1024,9 +1039,13 @@ fn declare_pad(
     if !pad_audio_on {
         return;
     }
-    // DualSense-family with renderer bits. A re-declare without bits, or a kind with no
-    // pad audio, stops the streamer.
-    let dualsense = matches!(kind, GamepadPref::DualSense | GamepadPref::DualSenseEdge);
+    // A DualSense-family device with renderer bits. A re-declare without bits, or a device
+    // with no pad audio, stops the streamer.
+    let device = pads.device_kind(idx);
+    let dualsense = matches!(
+        device,
+        Some(GamepadPref::DualSense | GamepadPref::DualSenseEdge)
+    );
     let want = if dualsense { audio_caps } else { 0 };
     // The streamer captures what the pad's OS slot names, and the first frame that would
     // claim the slot may be seconds away, so the declaration reserves it. No slot = no device.
@@ -1041,7 +1060,7 @@ fn declare_pad(
             pad,
             slot,
             want,
-            matches!(kind, GamepadPref::DualSenseEdge),
+            device == Some(GamepadPref::DualSenseEdge),
         ),
         None => streams.stop(idx),
     }
@@ -1551,6 +1570,23 @@ mod tests {
         pads.kinds[3] = GamepadPref::SteamController2;
         pads.identity_since[3] = Some(std::time::Instant::now() - IDENTITY_WAIT);
         assert!(!pads.waits_for_identity(3), "the wait ends");
+    }
+
+    /// Pad audio and the Controllers page follow the device: a pad already built as Xbox 360
+    /// that later declares a DualSense stays an Xbox 360 pad, with no speaker to stream to.
+    #[test]
+    fn a_pad_is_the_device_it_was_built_as() {
+        let mut pads = Pads::new(GamepadPref::Xbox360, PadIdentity::anonymous());
+        pads.owner[0] = Some(GamepadPref::Xbox360);
+        pads.set_kind(0, GamepadPref::DualSense);
+        assert_eq!(pads.device_kind(0), Some(GamepadPref::Xbox360));
+        pads.set_kind(1, GamepadPref::Xbox360);
+        assert_eq!(
+            pads.device_kind(1),
+            Some(GamepadPref::Xbox360),
+            "unbuilt: as resolved"
+        );
+        assert_eq!(pads.device_kind(MAX_WIRE_PADS), None);
     }
 
     /// The thread polls as fast as its live devices need, not as its managers ever did: a
