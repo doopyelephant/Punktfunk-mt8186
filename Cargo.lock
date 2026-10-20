@@ -3308,6 +3308,7 @@ dependencies = [
  "libc",
  "pf-dmabuf",
  "pf-driver-proto",
+ "pf-encode-core",
  "pf-encode-win",
  "pf-frame",
  "pf-gpu",
