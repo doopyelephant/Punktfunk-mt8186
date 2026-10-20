@@ -14,10 +14,12 @@
 //! was handled is not. Nothing here may assume the former.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ash::vk;
+
+use crate::glass::{asks_after, Event};
 
 pub(super) const NAME: &std::ffi::CStr = c"VK_EXT_present_timing";
 /// `VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT`.
@@ -270,8 +272,8 @@ pub(crate) struct Engine {
     /// The live swapchain's clock: `VkTimeDomainKHR` and the id presents name it by.
     domain: AtomicI32,
     domain_id: AtomicU64,
-    /// Presents asked for a stamp and not yet reported.
-    asked: AtomicUsize,
+    /// Presents asked for a stamp and not yet reported ([`asks_after`]).
+    asked: AtomicU32,
     pub(crate) refresh: Arc<Refresh>,
 }
 
@@ -352,7 +354,7 @@ impl Engine {
             stages,
             domain: AtomicI32::new(0),
             domain_id: AtomicU64::new(0),
-            asked: AtomicUsize::new(0),
+            asked: AtomicU32::new(0),
             refresh: Arc::new(Refresh::default()),
         })
     }
@@ -413,14 +415,30 @@ impl Engine {
         self.outstanding() + 2 < QUEUE as usize
     }
 
+    /// Forget the stamps asked for: a swapchain made without the timing flag answers none,
+    /// and the waiter polls only while some are outstanding.
+    pub(crate) fn disarm(&self) {
+        self.asked.store(0, Ordering::Release);
+    }
+
     /// Presents asked for a stamp whose result has not been read.
     pub(crate) fn outstanding(&self) -> usize {
-        self.asked.load(Ordering::Acquire)
+        self.asked.load(Ordering::Acquire) as usize
     }
 
     /// A present that asked for a stamp was queued.
     pub(crate) fn note_asked(&self) {
-        self.asked.fetch_add(1, Ordering::AcqRel);
+        self.count(Event::Asked);
+    }
+
+    /// Move the ask count by the glass lifecycle's rule; the presenter and the waiter both
+    /// move it.
+    fn count(&self, e: Event) {
+        self.asked
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |a| {
+                Some(asks_after(a, e))
+            })
+            .ok();
     }
 
     /// # Safety
@@ -531,11 +549,7 @@ impl Engine {
             if t.report_complete != vk::TRUE {
                 continue;
             }
-            self.asked
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |a| {
-                    Some(a.saturating_sub(1))
-                })
-                .ok();
+            self.count(Event::Reported);
             let count = (t.present_stage_count as usize).min(4);
             tracing::trace!(
                 id = t.present_id,
@@ -553,20 +567,32 @@ impl Engine {
                         .find(|s| s.stage == *want && s.time != 0)
                         .copied()
                 });
-            let displayed_ns = shown.and_then(|s| {
-                let key = (t.time_domain.as_raw(), t.time_domain_id, s.stage);
-                if offset.age >= RECALIBRATE || offset.key != key {
-                    // SAFETY: the caller's contract.
-                    offset.ns = unsafe { self.calibrate(swapchain, key) }?;
-                    offset.key = key;
-                    offset.age = 0;
-                }
-                offset.age += 1;
-                u64::try_from(i128::from(s.time) + offset.ns).ok()
-            });
+            let Some(s) = shown else {
+                out.push(Stamp {
+                    present_id: t.present_id,
+                    displayed_ns: None,
+                });
+                continue;
+            };
+            let key = (t.time_domain.as_raw(), t.time_domain_id, s.stage);
+            if offset.age >= RECALIBRATE || offset.key != key {
+                // SAFETY: the caller's contract.
+                let Some(ns) = (unsafe { self.calibrate(swapchain, key) }) else {
+                    // Shown, on a clock this device will not calibrate: no word, so the
+                    // waiter's wake time stands in. "Never shown" would drop the frame.
+                    continue;
+                };
+                offset.ns = ns;
+                offset.key = key;
+                offset.age = 0;
+            }
+            offset.age += 1;
+            let Ok(displayed_ns) = u64::try_from(i128::from(s.time) + offset.ns) else {
+                continue;
+            };
             out.push(Stamp {
                 present_id: t.present_id,
-                displayed_ns,
+                displayed_ns: Some(displayed_ns),
             });
         }
         if n > 0 {

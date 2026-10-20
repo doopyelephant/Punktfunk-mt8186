@@ -289,9 +289,17 @@ fn set_channel_mask_fn() -> Option<SetChannelMaskFn> {
 /// From API 29 a count alone opens more than two channels as an index mask, with no speaker
 /// positions, so a stereo output keeps FL/FR and drops the rest. AAudio's mask bits are WASAPI's,
 /// in wire order. API 29–31 have no mask, and surround plays through [`crate::audio_track`].
+///
+/// Surround also takes a session ID, which AAudio serves only off MMAP. A shared MMAP endpoint
+/// opens at its first stream's layout and leaves a 5.1 mix to the HAL; off MMAP, AudioFlinger
+/// downmixes it or routes it to a multichannel output.
 fn with_layout(builder: AudioStreamBuilder, channels: u8) -> AudioStreamBuilder {
     let builder = builder.channel_count(i32::from(channels));
-    if let (true, Some(set_mask)) = (channels > 2, set_channel_mask_fn()) {
+    if channels <= 2 {
+        return builder;
+    }
+    let builder = builder.session_id(None);
+    if let Some(set_mask) = set_channel_mask_fn() {
         // SAFETY: the pointer is the live builder `builder` owns. A mask set after the count wins.
         unsafe {
             set_mask(

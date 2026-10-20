@@ -11,9 +11,12 @@ pub(crate) struct ScrollRouting {
     native: Option<WaylandScroll>,
     #[cfg(target_os = "linux")]
     events: Vec<InputEvent>,
-    native_active: bool,
-    captured_before: bool,
-    blocked: bool,
+    /// The native path takes this batch's wheel over the main window's surface.
+    pub(crate) native_active: bool,
+    /// Capture held the input when this batch began.
+    pub(crate) captured_before: bool,
+    /// The SDL wheel is blocked this batch: the console took one, focus left, the ring is up.
+    pub(crate) blocked: bool,
 }
 
 impl ScrollRouting {
@@ -71,15 +74,6 @@ impl ScrollRouting {
 
     pub(crate) fn focus_lost(&mut self) {
         self.blocked = true;
-    }
-
-    pub(crate) fn wheel(&self, capture: Option<&mut Capture>, dx: f32, dy: f32) {
-        if self.native_active || self.blocked || !self.captured_before {
-            return;
-        }
-        if let Some(capture) = capture {
-            capture.on_wheel(dx, dy);
-        }
     }
 
     pub(crate) fn finish(&mut self, capture: Option<&mut Capture>, overlay: Option<&dyn Overlay>) {

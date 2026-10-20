@@ -131,7 +131,10 @@ impl Stamps {
             .stash
             .iter()
             .position(|s| s.present_id == job.present_id)?;
-        let stamp = self.stash.drain(..=at).next_back()?;
+        let stamp = self.stash.remove(at)?;
+        // Older ids are stale; a later id reported first (`PAST_OUT_OF_ORDER`) waits for
+        // its job.
+        self.stash.retain(|s| s.present_id > job.present_id);
         if self.off_clock >= DISTRUST_AFTER {
             return None;
         }

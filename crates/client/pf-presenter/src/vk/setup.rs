@@ -4,11 +4,8 @@
 //! [`probe_decode`] both read a [`DecodeProbe`] into [`video_decode_gate`], so a probe
 //! cannot report a capability the session then refuses.
 //!
-//! Pinning: `PUNKTFUNK_VK_DEVICE=<index>` is raw `vkEnumeratePhysicalDevices` order;
-//! `PUNKTFUNK_VK_ADAPTER=<name>` matches the marketing name, then discrete-first;
-//! `PUNKTFUNK_PRESENT_MODE=` fifo|mailbox|immediate|fifo_relaxed; `PUNKTFUNK_VRR_FIFO=1`
-//! selects the FIFO-first VRR ladder when LATEST_READY is absent; `PUNKTFUNK_HDR10=0`
-//! refuses the HDR10 swapchain.
+//! Pinning: the `vk_device`, `vk_adapter`, `present_mode`, `vrr_fifo` and `hdr10` knobs
+//! ([`Knobs`]), read once by the shell.
 //!
 //! Evidence: [`present_mode_chain`], [`pick_device`], [`AdapterDecode::index`].
 
@@ -21,6 +18,7 @@ use super::{OverlayPipe, Presenter};
 use crate::csc::CscPass;
 #[cfg(target_os = "linux")]
 use crate::dmabuf;
+use crate::knobs::Knobs;
 use anyhow::{anyhow, bail, Context as _, Result};
 use ash::vk;
 use ash::vk::Handle as _;
@@ -415,13 +413,15 @@ impl DeviceCaps {
     /// Query `pdev` and decide what to enable on it. `caps2` is the per-surface query
     /// table, there when the instance enabled `VK_KHR_get_surface_capabilities2`;
     /// present-wait2, present timing and exclusive fullscreen ask through it. Logs each
-    /// optional lane's verdict. `qfi` is the decode queue's fallback.
+    /// optional lane's verdict. `qfi` is the decode queue's fallback. The `present_wait2`
+    /// and `present_timing` knobs opt into those two.
     fn probe(
         instance: &ash::Instance,
         pdev: vk::PhysicalDevice,
         qfi: u32,
         surface: vk::SurfaceKHR,
         caps2: Option<&ash::khr::get_surface_capabilities2::Instance>,
+        knobs: &Knobs,
     ) -> Result<DeviceCaps> {
         // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let available = unsafe { instance.enumerate_device_extension_properties(pdev) }?;
@@ -496,7 +496,7 @@ impl DeviceCaps {
         let timing_stages = match caps2 {
             Some(caps2)
                 if present_wait2_ok
-                    && present_timing_wanted()
+                    && knobs.present_timing.unwrap_or(cfg!(target_os = "linux"))
                     && has(timing_ext::NAME)
                     && has(ash::khr::calibrated_timestamps::NAME) =>
             {
@@ -507,7 +507,7 @@ impl DeviceCaps {
         let (present_wait_ok, use_wait2) = present_wait_generation(
             present_wait_ok,
             present_wait2_ok,
-            present_wait2_opt_in() || timing_stages != 0,
+            knobs.present_wait2 || timing_stages != 0,
         );
         // PyroWave is Vulkan 1.3 compute on this device — no video extensions.
         // Probe here so a capable device enables the features and advertises the codec.
@@ -751,11 +751,14 @@ fn video_ext_names(
 
 impl Presenter {
     /// Instance → surface → device pick → `DeviceCaps` → device → swapchain over an SDL
-    /// window. `instance_extensions` is `VideoSubsystem::vulkan_instance_extensions()`.
-    pub fn new(
+    /// window. `instance_extensions` is `VideoSubsystem::vulkan_instance_extensions()`;
+    /// `knobs` are the shell's, kept for the per-frame and rebuild paths. Each object lands
+    /// in a [`Bringup`] as it is made, so a failed step destroys everything before it.
+    pub(crate) fn new(
         window: &sdl3::video::Window,
         instance_extensions: &[String],
         pref: PresentPref,
+        knobs: &Knobs,
     ) -> Result<Presenter> {
         // SAFETY: dlopens libvulkan; no instance exists yet.
         let entry = unsafe { ash::Entry::load() }.context("libvulkan not loadable")?;
@@ -763,14 +766,19 @@ impl Presenter {
         let (instance, instance_extensions, has_colorspace_ext, has_caps2_ext) =
             create_instance(&entry, instance_extensions)?;
         #[cfg(windows)]
-        let want_fse = fullscreen_exclusive_opt_in();
+        let want_fse = knobs.fullscreen_exclusive;
         let surface_i = ash::khr::surface::Instance::new(&entry, &instance);
+        // Declared after `entry`, so libvulkan outlives its `Drop`.
+        let mut b = Bringup::default();
+        b.instance = Some(instance.clone());
+        b.surface_i = Some(surface_i.clone());
 
         // SAFETY: CREATE — `instance` is live; SDL returns a surface we own and later destroy.
         let surface = unsafe { window.vulkan_create_surface(instance.handle()) }
             .map_err(|e| anyhow!("SDL_Vulkan_CreateSurface: {e}"))?;
+        b.surface = surface;
 
-        let (pdev, qfi) = pick_device(&instance, &surface_i, surface)?;
+        let (pdev, qfi) = pick_device(&instance, &surface_i, surface, knobs)?;
         // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(pdev) };
         {
@@ -785,7 +793,7 @@ impl Presenter {
 
         let caps2_i = has_caps2_ext
             .then(|| ash::khr::get_surface_capabilities2::Instance::new(&entry, &instance));
-        let caps = DeviceCaps::probe(&instance, pdev, qfi, surface, caps2_i.as_ref())?;
+        let caps = DeviceCaps::probe(&instance, pdev, qfi, surface, caps2_i.as_ref(), knobs)?;
         // Exclusive fullscreen, opt-in and fullscreen sessions only.
         #[cfg(windows)]
         let caps = DeviceCaps {
@@ -793,6 +801,7 @@ impl Presenter {
             ..caps
         };
         let (device, queue_families) = create_device(&instance, pdev, qfi, &caps)?;
+        b.device = Some(device.clone());
         let swap_d = ash::khr::swapchain::Device::new(&instance, &device);
         let (timing, present_timer, present_id2) = present_timing(&instance, &device, &caps);
         // No present-wait in use: the output's vblank stands in for the ledger and the VRR
@@ -809,6 +818,11 @@ impl Presenter {
                 active = vblank_timer.is_some(),
                 "glass clock from the output's vblank (estimated stamps)"
             );
+        }
+        b.made.present_timer = present_timer;
+        #[cfg(windows)]
+        {
+            b.made.vblank_timer = vblank_timer;
         }
         #[cfg(windows)]
         let fse = caps
@@ -835,18 +849,20 @@ impl Presenter {
         // SAFETY: `device` is live; queue 0 of `qfi` was requested at create.
         let queue = unsafe { device.get_device_queue(qfi, 0) };
         #[cfg(target_os = "linux")]
-        let hw = caps
-            .hw_capable
-            .then(|| hw_ctx(&instance, pdev, &device, &caps));
+        {
+            b.made.hw = caps
+                .hw_capable
+                .then(|| hw_ctx(&instance, pdev, &device, &caps));
+        }
         #[cfg(windows)]
         let hw_win = caps.win_capable.then(|| HwCtxWin {
             ext_mem_win32: ash::khr::external_memory_win32::Device::new(&instance, &device),
             imports: crate::d3d11::ImportCache::default(),
         });
-        let csc = CscPass::new(&device, super::VIDEO_FORMAT)?;
+        b.made.csc = CscPass::new(&device, super::VIDEO_FORMAT)?;
         // Writes the same intermediate as `csc`. Always built: the software decode rung
         // renders through it. Gating on the pyrowave probe would hide software frames.
-        let csc_planar = CscPass::new_planar(&device, super::VIDEO_FORMAT)?;
+        b.made.csc_planar = CscPass::new_planar(&device, super::VIDEO_FORMAT)?;
 
         // Export the selected device facts when any consumer needs the handles; on Linux
         // always, since every consumer gates its lane on the booleans. One `queue_lock` per
@@ -873,21 +889,24 @@ impl Presenter {
         #[cfg(windows)]
         let mut video_export = video_export;
 
-        let (format, hdr10_format) = pick_formats(&surface_i, pdev, surface, has_colorspace_ext)?;
+        let (format, hdr10_format) =
+            pick_formats(&surface_i, pdev, surface, has_colorspace_ext, knobs)?;
         // D3D11VA may emit its RGB10 PQ ring only when this device imports 10-bit and the
         // surface offers an HDR10 swapchain. Planar NV12/P010 slots need the planar import
         // and a vendor that survives it (`planar_allowed`).
         #[cfg(windows)]
         if let Some(v) = video_export.as_mut() {
             v.d3d11_hdr10 = caps.win_capable && caps.import.rgb10 && hdr10_format.is_some();
-            let planar = caps.win_capable && crate::d3d11::planar_allowed(v.vendor_id);
+            let planar =
+                caps.win_capable && crate::d3d11::planar_allowed(v.vendor_id, knobs.d3d11_planar);
             v.d3d11_nv12 = planar && caps.import.nv12;
             v.d3d11_p010 = planar && caps.import.p010;
         }
         let mut pref = pref;
-        pref.vrr_fifo_opt_in = vrr_fifo_opt_in();
+        pref.vrr_fifo_opt_in = knobs.vrr_fifo;
         pref.fifo_latest_ready = caps.flr_ok;
-        let present_mode = pick_present_mode(&surface_i, pdev, surface, pref)?;
+        let pinned = knobs.present_mode.as_deref();
+        let present_mode = pick_present_mode(&surface_i, pdev, surface, pref, pinned)?;
         tracing::info!(
             ?format,
             ?hdr10_format,
@@ -898,20 +917,20 @@ impl Presenter {
             hdr_metadata = caps.has_hdr_metadata,
             "swapchain config"
         );
-        let overlay_pipe = OverlayPipe::new(&device, format.format, false)?;
-        let scale = crate::scale::ScalePass::new(&device, format.format)?;
-        let direct = crate::csc::DirectPass::new(
+        b.made.overlay_pipe = OverlayPipe::new(&device, format.format, false)?;
+        b.made.scale = crate::scale::ScalePass::new(&device, format.format)?;
+        b.made.direct = crate::csc::DirectPass::new(
             &device,
             format.format,
-            csc.pipeline_layout,
-            csc_planar.pipeline_layout,
+            b.made.csc.pass.pipeline_layout,
+            b.made.csc_planar.pass.pipeline_layout,
         )?;
+        frame_sync(&device, qfi, caps.timeline_semaphore, &mut b.made)?;
 
-        let (cmd_pool, cmd_buf, acquire_sem, done_sem, fence) =
-            frame_sync(&device, qfi, caps.timeline_semaphore)?;
-
+        // Every fallible step is behind: the presenter takes each object over.
+        let m = b.into_parts();
         #[cfg(target_os = "linux")]
-        let native_timelines = hw.as_ref().is_some_and(|h| h.timelines.is_some());
+        let native_timelines = m.hw.as_ref().is_some_and(|h| h.timelines.is_some());
         let mut p = Presenter {
             entry,
             instance,
@@ -924,16 +943,16 @@ impl Presenter {
             queue,
             qfi,
             #[cfg(target_os = "linux")]
-            hw,
+            hw: m.hw,
             #[cfg(windows)]
             hw_win,
-            csc,
-            csc_planar,
+            csc: m.csc,
+            csc_planar: m.csc_planar,
             cpu_planes: None,
             video_export,
-            overlay_pipe,
-            scale,
-            direct,
+            overlay_pipe: m.overlay_pipe,
+            scale: m.scale,
+            direct: m.direct,
             cpu_direct: None,
             retired_hw: None,
             #[cfg(windows)]
@@ -944,7 +963,6 @@ impl Presenter {
             last_acquire_us: 0,
             last_present_us: 0,
             queue_lock,
-            format,
             hdr10_format,
             hdr_active: false,
             hdr_downgrade_warned: false,
@@ -952,46 +970,38 @@ impl Presenter {
             hdr_meta: None,
             pref,
             present_mode,
-            swapchain: vk::SwapchainKHR::null(),
-            images: Vec::new(),
-            extent: vk::Extent2D::default(),
-            render_sems: Vec::new(),
-            acquire_sem,
-            done_sem,
-            fence,
-            cmd_pool,
-            cmd_buf,
+            targets: super::targets::Targets {
+                format,
+                ..Default::default()
+            },
+            acquire_sem: m.acquire_sem,
+            done_sem: m.done_sem,
+            fence: m.fence,
+            cmd_pool: m.cmd_pool,
+            cmd_buf: m.cmd_buf,
             staging: None,
             video: None,
+            owner: crate::reconfig_model::Owner::Swapchain,
             state: crate::swapchain_state::SwapchainState::new(),
-            present_timer,
-            present_id2,
-            timing,
-            #[cfg(windows)]
-            vblank_timer,
+            glass: {
+                let glass = crate::glass::GlassClock::new(timing, m.present_timer, present_id2);
+                #[cfg(windows)]
+                let glass = glass.with_vblank(m.vblank_timer);
+                #[cfg(target_os = "linux")]
+                let glass = glass.with_feedback(if knobs.surface_feedback {
+                    crate::wl_feedback::SurfaceFeedback::new(window).unwrap_or_else(|e| {
+                        tracing::warn!(error = %format!("{e:#}"), "surface feedback unavailable");
+                        None
+                    })
+                } else {
+                    None
+                });
+                glass
+            },
             #[cfg(windows)]
             fse,
-            next_present_id: 0,
-            last_presented: None,
             video_fit: Default::default(),
             placement_logged: None,
-            #[cfg(target_os = "linux")]
-            feedback: if crate::wl_feedback::enabled() {
-                crate::wl_feedback::SurfaceFeedback::new(window).unwrap_or_else(|e| {
-                    tracing::warn!(error = %format!("{e:#}"), "surface feedback unavailable");
-                    None
-                })
-            } else {
-                None
-            },
-            #[cfg(target_os = "linux")]
-            scanout: (0, 0),
-            #[cfg(target_os = "linux")]
-            scanout_reported: false,
-            #[cfg(target_os = "linux")]
-            compositor_stamps: std::collections::HashMap::new(),
-            #[cfg(target_os = "linux")]
-            held: Vec::new(),
             #[cfg(target_os = "linux")]
             native: if crate::wl_native::enabled() {
                 crate::wl_native::NativeLane::new(window, native_timelines).unwrap_or_else(|e| {
@@ -1018,8 +1028,10 @@ impl Presenter {
             #[cfg(target_os = "linux")]
             native_keys: Vec::new(),
             #[cfg(target_os = "linux")]
-            native_flip: crate::wl_native::flip_mode().then(std::time::Instant::now),
+            native_flip: (knobs.native_scanout.as_deref() == Some("flip"))
+                .then(std::time::Instant::now),
             overlay_blocks_native: false,
+            knobs: knobs.clone(),
         };
         p.recreate_swapchain(window)?;
         Ok(p)
@@ -1351,20 +1363,10 @@ fn decode_export(
 }
 
 /// The one command buffer, the acquire semaphore, the `done_sem` timeline (null without
-/// `timeline`), and the submit fence.
-fn frame_sync(
-    device: &ash::Device,
-    qfi: u32,
-    timeline: bool,
-) -> Result<(
-    vk::CommandPool,
-    vk::CommandBuffer,
-    vk::Semaphore,
-    vk::Semaphore,
-    vk::Fence,
-)> {
-    // SAFETY: CREATE — CreateInfo is a local; the pool is owned by the Presenter being built.
-    let cmd_pool = unsafe {
+/// `timeline`), and the submit fence, each into `made` as it is created.
+fn frame_sync(device: &ash::Device, qfi: u32, timeline: bool, made: &mut Made) -> Result<()> {
+    // SAFETY: CREATE — CreateInfo is a local; the pool is owned by the bring-up.
+    made.cmd_pool = unsafe {
         device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
                 .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
@@ -1373,40 +1375,126 @@ fn frame_sync(
         )
     }?;
     // SAFETY: ALLOCATE — the pool is ours and empty; we take the single primary buffer.
-    let cmd_buf = unsafe {
+    made.cmd_buf = unsafe {
         device.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default()
-                .command_pool(cmd_pool)
+                .command_pool(made.cmd_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1),
         )
     }?[0];
-    let acquire_sem =
-        // SAFETY: CREATE — CreateInfo is a local; the handle is stored on the Presenter.
+    made.acquire_sem =
+        // SAFETY: CREATE — CreateInfo is a local; the handle is owned by the bring-up.
         unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
     let mut timeline_type = vk::SemaphoreTypeCreateInfo::default()
         .semaphore_type(vk::SemaphoreType::TIMELINE)
         .initial_value(0);
     // Null without the timeline feature: the waiter then keeps latch whole.
-    let done_sem = if timeline {
-        // SAFETY: CREATE — CreateInfo chains a local; the handle is stored on the Presenter.
-        unsafe {
+    if timeline {
+        // SAFETY: CREATE — CreateInfo chains a local; the handle is owned by the bring-up.
+        made.done_sem = unsafe {
             device.create_semaphore(
                 &vk::SemaphoreCreateInfo::default().push_next(&mut timeline_type),
                 None,
             )
-        }?
-    } else {
-        vk::Semaphore::null()
-    };
+        }?;
+    }
     // SAFETY: CREATE — CreateInfo is a local; SIGNALED so the first wait is a no-op.
-    let fence = unsafe {
+    made.fence = unsafe {
         device.create_fence(
             &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
             None,
         )
     }?;
-    Ok((cmd_pool, cmd_buf, acquire_sem, done_sem, fence))
+    Ok(())
+}
+
+/// What [`Presenter::new`] owns before the presenter exists: the waiters, the import
+/// context, the passes and the frame's sync objects. Null handles until made.
+#[derive(Default)]
+struct Made {
+    present_timer: Option<super::present_timing::PresentTimer>,
+    #[cfg(windows)]
+    vblank_timer: Option<super::vblank_timing::VblankTimer>,
+    #[cfg(target_os = "linux")]
+    hw: Option<HwCtx>,
+    csc: CscPass,
+    csc_planar: CscPass,
+    overlay_pipe: OverlayPipe,
+    scale: crate::scale::ScalePass,
+    direct: crate::csc::DirectPass,
+    cmd_pool: vk::CommandPool,
+    cmd_buf: vk::CommandBuffer,
+    acquire_sem: vk::Semaphore,
+    done_sem: vk::Semaphore,
+    fence: vk::Fence,
+}
+
+/// The bring-up's guard: a failed step in [`Presenter::new`] drops it, and its `Drop`
+/// destroys what was made, in reverse order. `instance`, `surface_i`, `surface` and
+/// `device` mirror the bring-up's own handles; `made` is owned here until
+/// [`Bringup::into_parts`] hands it on and clears the mirrors, after which the drop
+/// destroys nothing.
+#[derive(Default)]
+struct Bringup {
+    instance: Option<ash::Instance>,
+    surface_i: Option<ash::khr::surface::Instance>,
+    surface: vk::SurfaceKHR,
+    device: Option<ash::Device>,
+    made: Made,
+}
+
+impl Bringup {
+    /// Disarm: the presenter owns every object from here, so nothing is left to destroy.
+    fn into_parts(mut self) -> Made {
+        self.instance = None;
+        self.surface = vk::SurfaceKHR::null();
+        self.device = None;
+        std::mem::take(&mut self.made)
+    }
+}
+
+impl Drop for Bringup {
+    fn drop(&mut self) {
+        // The waiters hold a device clone: they join before the device goes.
+        self.made.present_timer = None;
+        #[cfg(windows)]
+        {
+            self.made.vblank_timer = None;
+        }
+        if let Some(device) = self.device.take() {
+            let m = &mut self.made;
+            // SAFETY: DESTROY — nothing was ever submitted on this device (the first submit is
+            // the presenter's), so the GPU uses none of it; null handles are no-ops. Each is
+            // destroyed once: after `into_parts` the mirrors are cleared and `made` is empty.
+            unsafe {
+                #[cfg(target_os = "linux")]
+                if let Some(s) = m.hw.take().and_then(|h| h.sync) {
+                    s.destroy(&device);
+                }
+                m.direct.destroy(&device);
+                m.scale.destroy(&device);
+                m.overlay_pipe.destroy(&device);
+                m.csc_planar.destroy(&device);
+                m.csc.destroy(&device);
+                device.destroy_fence(m.fence, None);
+                device.destroy_semaphore(m.done_sem, None);
+                device.destroy_semaphore(m.acquire_sem, None);
+                device.destroy_command_pool(m.cmd_pool, None); // frees `cmd_buf`
+                device.destroy_device(None);
+            }
+        }
+        if let Some(instance) = self.instance.take() {
+            // SAFETY: DESTROY — the device made from this instance is gone above; the surface
+            // is ours and no swapchain was built on it. A null surface is a no-op.
+            unsafe {
+                if let Some(si) = &self.surface_i {
+                    si.destroy_surface(self.surface, None);
+                }
+                instance.destroy_instance(None);
+            }
+        }
+    }
 }
 
 /// Every physical device's Vulkan Video decode capability
@@ -1434,7 +1522,7 @@ pub fn probe_decode() -> Result<Vec<AdapterDecode>> {
     // SAFETY: read-only query on the live instance; result by value.
     let devices = unsafe { instance.enumerate_physical_devices() }?;
     let mut out: Vec<(u8, AdapterDecode)> = Vec::with_capacity(devices.len());
-    // `enumerate()` before filtering or sorting: this index is `PUNKTFUNK_VK_DEVICE`.
+    // `enumerate()` before filtering or sorting: this index is the one `knobs.vk_device` names.
     for (raw_index, pdev) in devices.into_iter().enumerate() {
         // SAFETY: read-only query on the live instance; `pdev` was enumerated from it.
         let props = unsafe { instance.get_physical_device_properties(pdev) };
@@ -1538,28 +1626,28 @@ pub fn list_adapters() -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// First physical device with a graphics+present queue family here.
-/// `PUNKTFUNK_VK_DEVICE=<index>` overrides (raw enumeration order).
+/// First physical device with a graphics+present queue family here. The `vk_device`
+/// knob overrides (raw enumeration order).
 fn pick_device(
     instance: &ash::Instance,
     surface_i: &ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
+    knobs: &Knobs,
 ) -> Result<(vk::PhysicalDevice, u32)> {
     // SAFETY: read-only query on the live instance; result by value.
     let devices = unsafe { instance.enumerate_physical_devices() }?;
-    let forced: Option<usize> = std::env::var("PUNKTFUNK_VK_DEVICE")
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let forced = knobs.vk_device;
     let mut candidates: Vec<vk::PhysicalDevice> = match forced {
         Some(i) => devices.get(i).copied().into_iter().collect(),
         None => devices,
     };
     // Rank when the index override is absent (stable sort):
-    // 1. `PUNKTFUNK_VK_ADAPTER` marketing name: exact, then substring; unmatched keeps order.
+    // 1. The `vk_adapter` marketing name: exact, then substring; unmatched keeps order.
     // 2. Discrete over integrated — enumeration puts the iGPU first on some hybrids.
     if forced.is_none() {
-        let want = std::env::var("PUNKTFUNK_VK_ADAPTER")
-            .ok()
+        let want = knobs
+            .vk_adapter
+            .as_deref()
             .map(|w| w.trim().to_lowercase())
             .filter(|w| !w.is_empty());
         candidates.sort_by_key(|d| {
@@ -1599,21 +1687,21 @@ fn pick_device(
 /// format. 10-bit first: the console's gradients band in 8. UNORM not SRGB — decoded RGBA is
 /// already display-referred; an SRGB blit would re-encode it.
 /// HDR: a 10-bit UNORM + HDR10/ST.2084 colorspace when the instance ext and surface
-/// offer one; otherwise the shader tonemaps.
+/// offer one; otherwise the shader tonemaps. The `hdr10` knob can refuse HDR10; `sdr_8bit`
+/// keeps SDR to 8 bits.
 pub(super) fn pick_formats(
     surface_i: &ash::khr::surface::Instance,
     pdev: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
     colorspace_ext: bool,
+    knobs: &Knobs,
 ) -> Result<(vk::SurfaceFormatKHR, Option<vk::SurfaceFormatKHR>)> {
-    // `PUNKTFUNK_HDR10=0` refuses the HDR10 swapchain; PQ stays shader-tonemapped.
-    // Compositors advertise HDR10 on SDR desktops.
-    let colorspace_ext = colorspace_ext && pf_client_core::env_on("PUNKTFUNK_HDR10") != Some(false);
+    // Compositors advertise HDR10 on SDR desktops; the knob refuses it.
+    let colorspace_ext = colorspace_ext && knobs.hdr10;
     // SAFETY: read-only query; `pdev` and `surface` are live on this instance.
     let formats = unsafe { surface_i.get_physical_device_surface_formats(pdev, surface) }?;
     let mut sdr = None;
-    // `PUNKTFUNK_SDR_8BIT=1`: an 8-bit SDR swapchain. A compositor may scan out only those.
-    let eight_bit = pf_client_core::env_on("PUNKTFUNK_SDR_8BIT") == Some(true);
+    let eight_bit = knobs.sdr_8bit;
     let ranked: &[vk::Format] = if eight_bit {
         &[vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM]
     } else {
@@ -1677,7 +1765,7 @@ pub struct PresentPref {
     pub vsync: bool,
     /// Variable-refresh follows the stream cadence (`allow_vrr`, default on).
     pub allow_vrr: bool,
-    /// Opt-in for the VRR FIFO-first ladder (`PUNKTFUNK_VRR_FIFO=1`). Default off.
+    /// Opt-in for the VRR FIFO-first ladder (`knobs.vrr_fifo`). Default off.
     pub vrr_fifo_opt_in: bool,
     /// Device enabled `VK_EXT_present_mode_fifo_latest_ready`; the mode may be requested.
     /// Set during device creation, never by callers.
@@ -1691,7 +1779,7 @@ pub struct PresentPref {
 ///
 /// V-sync on admits no tearing rung: IMMEDIATE and FIFO_RELAXED stay out, so a
 /// surface offering neither MAILBOX nor LATEST_READY lands on FIFO.
-/// V-sync + VRR + fullscreen with LATEST_READY or `PUNKTFUNK_VRR_FIFO=1`:
+/// V-sync + VRR + fullscreen with LATEST_READY or `knobs.vrr_fifo`:
 /// vblank-locked family first — MAILBOX would re-quantize to the compositor.
 /// LATEST_READY is newest-wins in the driver; plain FIFO waits a full refresh,
 /// so without LATEST_READY that rung is opt-in.
@@ -1727,40 +1815,18 @@ fn serve_offered(pref: PresentPref, modes: &[vk::PresentModeKHR]) -> PresentPref
     }
 }
 
-/// `PUNKTFUNK_VRR_FIFO=1` opts into the FIFO-first ladder for variable-refresh panels.
-fn vrr_fifo_opt_in() -> bool {
-    pf_client_core::env_on("PUNKTFUNK_VRR_FIFO") == Some(true)
-}
-
-/// `PUNKTFUNK_PRESENT_WAIT2=1`: time presents with `VK_KHR_present_wait2`.
-fn present_wait2_opt_in() -> bool {
-    pf_client_core::env_on("PUNKTFUNK_PRESENT_WAIT2") == Some(true)
-}
-
-/// Whether to read the engine's display stamps (`VK_EXT_present_timing`) where the surface
-/// reports them. On by default on Linux; `PUNKTFUNK_PRESENT_TIMING=1` or `0` decides
-/// anywhere.
-fn present_timing_wanted() -> bool {
-    pf_client_core::env_on("PUNKTFUNK_PRESENT_TIMING").unwrap_or(cfg!(target_os = "linux"))
-}
-
-/// `PUNKTFUNK_FULLSCREEN_EXCLUSIVE=1`: take the monitor with `VK_EXT_full_screen_exclusive`.
-#[cfg(windows)]
-fn fullscreen_exclusive_opt_in() -> bool {
-    pf_client_core::env_on("PUNKTFUNK_FULLSCREEN_EXCLUSIVE") == Some(true)
-}
-
-/// Resolve the present mode. `PUNKTFUNK_PRESENT_MODE` pins one; otherwise the first
-/// entry of [`present_mode_chain`] the surface offers.
+/// Resolve the present mode. `pinned` (the `present_mode` knob) picks one; otherwise the
+/// first entry of [`present_mode_chain`] the surface offers.
 pub(super) fn pick_present_mode(
     surface_i: &ash::khr::surface::Instance,
     pdev: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
     pref: PresentPref,
+    pinned: Option<&str>,
 ) -> Result<vk::PresentModeKHR> {
     // SAFETY: read-only query; `pdev` and `surface` are live on this instance.
     let modes = unsafe { surface_i.get_physical_device_surface_present_modes(pdev, surface) }?;
-    let pinned = match std::env::var("PUNKTFUNK_PRESENT_MODE").ok().as_deref() {
+    let pinned = match pinned {
         Some("fifo") => Some(vk::PresentModeKHR::FIFO),
         Some("immediate") => Some(vk::PresentModeKHR::IMMEDIATE),
         Some("fifo_relaxed") => Some(vk::PresentModeKHR::FIFO_RELAXED),
