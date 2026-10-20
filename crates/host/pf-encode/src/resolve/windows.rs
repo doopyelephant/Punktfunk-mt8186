@@ -11,8 +11,11 @@ use crate::env_knobs::Knobs;
 pub(crate) struct Probes {
     /// [`Resolved::backend`].
     pub(crate) backend: OnceLock<WindowsBackend>,
-    /// The resolved backend's codec probe ([`probe_codec_support`]).
+    /// The resolved backend's codec probe ([`probe_codec_support`]), kept only once it finds a
+    /// codec.
     pub(crate) codecs: OnceLock<CodecSupport>,
+    /// Set when the `codecs` probe found nothing, so the miss warns once.
+    pub(crate) codecs_missed: OnceLock<()>,
 }
 
 /// The pf-vdisplay driver holds the only Windows encoder: it opens the backend on the pooled
@@ -49,7 +52,9 @@ pub(crate) fn wire_caps(r: &Resolved) -> u8 {
     let base = if backend == WindowsBackend::Software {
         punktfunk_core::quic::CODEC_H264
     } else if r.is_probed() {
-        codec_support_wire_mask(r.codecs()).unwrap_or(GPU_SUPERSET)
+        r.codecs()
+            .and_then(codec_support_wire_mask)
+            .unwrap_or(GPU_SUPERSET)
     } else {
         GPU_SUPERSET
     };
@@ -58,7 +63,7 @@ pub(crate) fn wire_caps(r: &Resolved) -> u8 {
 
 /// [`Resolved::advertised`] on Windows: the probe, where the backend has one.
 pub(crate) fn advertised(r: &Resolved) -> Option<CodecSupport> {
-    r.is_probed().then(|| r.codecs())
+    r.is_probed().then(|| r.codecs()).flatten()
 }
 
 /// HEVC 4:4:4 on the resolved backend. Only NVENC probes: VCN has no 4:4:4 encode
@@ -144,12 +149,14 @@ impl Resolved {
     }
 
     /// The resolved backend's codec probe. Ask only when [`Self::is_probed`]. AV1 and HEVC must
-    /// be probed, not assumed.
-    fn codecs(&self) -> CodecSupport {
-        *self
-            .probes
-            .codecs
-            .get_or_init(|| probe_codec_support(self.backend()))
+    /// be probed, not assumed. `None` while the probe finds nothing; it runs again next ask.
+    fn codecs(&self) -> Option<CodecSupport> {
+        probe_until_found(
+            &self.probes.codecs,
+            &self.probes.codecs_missed,
+            "Windows",
+            || probe_codec_support(self.backend()),
+        )
     }
 }
 
@@ -251,13 +258,15 @@ fn probe_codec_support(backend: WindowsBackend) -> CodecSupport {
             av1: probe_one(Codec::Av1),
         },
     };
-    tracing::info!(
-        ?backend,
-        h264 = caps.h264,
-        h265 = caps.h265,
-        av1 = caps.av1,
-        "Windows encode capabilities probed"
-    );
+    if caps.h264 || caps.h265 || caps.av1 {
+        tracing::info!(
+            ?backend,
+            h264 = caps.h264,
+            h265 = caps.h265,
+            av1 = caps.av1,
+            "Windows encode capabilities probed"
+        );
+    }
     caps
 }
 
@@ -289,10 +298,9 @@ mod tests {
     }
 
     /// `wire_caps` reads one resolution (sweep R5-08): software is H.264 without PyroWave, a
-    /// probed set is its mask, and an empty or absent probe is the superset.
+    /// probed set is its mask, and a backend this build has no probe for is the superset.
     #[test]
     fn wire_caps_reads_one_resolution() {
-        let superset = CODEC_H264 | CODEC_HEVC | CODEC_AV1;
         assert_eq!(
             resolved(WindowsBackend::Software, FULL).wire_caps(),
             CODEC_H264
@@ -307,29 +315,15 @@ mod tests {
             })
             .expect("unset");
         assert_eq!(amf.wire_caps(), CODEC_H264 | CODEC_HEVC | CODEC_PYROWAVE);
-        let quiet = Features {
-            pyrowave: false,
-            ..FULL
-        };
-        let empty = resolved(WindowsBackend::Amf, quiet);
-        empty
-            .probes
-            .codecs
-            .set(CodecSupport {
-                h264: false,
-                h265: false,
-                av1: false,
-            })
-            .expect("unset");
-        assert_eq!(empty.wire_caps(), superset);
         let qsv = resolved(
             WindowsBackend::Qsv,
             Features {
                 qsv: false,
-                ..quiet
+                pyrowave: false,
+                ..FULL
             },
         );
-        assert_eq!(qsv.wire_caps(), superset);
+        assert_eq!(qsv.wire_caps(), CODEC_H264 | CODEC_HEVC | CODEC_AV1);
         assert!(qsv.advertised().is_none());
     }
 }

@@ -17,8 +17,11 @@ pub(crate) struct Probes {
     pub(crate) auto_is_vaapi: OnceLock<bool>,
     /// The direct SDK's codec list, 4:4:4 and 10-bit caps.
     pub(crate) nvenc: OnceLock<NvencFacts>,
-    /// The AMD/Intel plane's 8-bit codec set ([`Resolved::probe_vaapi_codec_support`]).
+    /// The AMD/Intel plane's 8-bit codec set ([`Resolved::probe_vaapi_codec_support`]), kept
+    /// only once it finds a codec.
     pub(crate) vaapi: OnceLock<CodecSupport>,
+    /// Set when the `vaapi` probe found nothing, so the miss warns once.
+    pub(crate) vaapi_missed: OnceLock<()>,
     /// libva's 10-bit encode entrypoints, HEVC then AV1.
     pub(crate) vaapi_ten_bit: [OnceLock<bool>; 2],
     /// Vulkan Video encode caps, HEVC then AV1.
@@ -575,12 +578,14 @@ impl Resolved {
 
     /// What the AMD/Intel plane can encode: the native VAAPI session for H.264 and HEVC,
     /// Vulkan Video for HEVC and AV1 — the two arms the open tries, so nothing is advertised
-    /// that would die at open.
-    fn vaapi_codec_support(&self) -> CodecSupport {
-        *self
-            .probes
-            .vaapi
-            .get_or_init(|| self.probe_vaapi_codec_support())
+    /// that would die at open. `None` while the probe finds nothing; it runs again next ask.
+    fn vaapi_codec_support(&self) -> Option<CodecSupport> {
+        probe_until_found(
+            &self.probes.vaapi,
+            &self.probes.vaapi_missed,
+            "VAAPI",
+            || self.probe_vaapi_codec_support(),
+        )
     }
 
     /// The probe behind [`Self::vaapi_codec_support`].
@@ -598,12 +603,14 @@ impl Resolved {
             h265: probe(Codec::H265) || vulkan(Codec::H265),
             av1: vulkan(Codec::Av1),
         };
-        tracing::info!(
-            h264 = caps.h264,
-            h265 = caps.h265,
-            av1 = caps.av1,
-            "VAAPI encode capabilities probed"
-        );
+        if caps.h264 || caps.h265 || caps.av1 {
+            tracing::info!(
+                h264 = caps.h264,
+                h265 = caps.h265,
+                av1 = caps.av1,
+                "VAAPI encode capabilities probed"
+            );
+        }
         caps
     }
 
@@ -614,7 +621,7 @@ impl Resolved {
         let probed = match backend {
             // openh264, and it never probes.
             LinuxBackend::Software => None,
-            _ if self.zero_copy_is_vaapi() => Some(self.vaapi_codec_support()),
+            _ if self.zero_copy_is_vaapi() => self.vaapi_codec_support(),
             // Driver GUID list, like the VAAPI arm.
             LinuxBackend::Nvenc if self.inputs.features.nvenc => Some(self.nvenc().codecs),
             _ => None,

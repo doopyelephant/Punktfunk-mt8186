@@ -266,6 +266,32 @@ fn resolve_in(
     r
 }
 
+/// `probe` until it finds a codec. `None` leaves `cell` empty, so the next ask probes again,
+/// and warns once per `missed`; the caller advertises its superset meanwhile.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn probe_until_found(
+    cell: &OnceLock<CodecSupport>,
+    missed: &OnceLock<()>,
+    what: &'static str,
+    probe: impl FnOnce() -> CodecSupport,
+) -> Option<CodecSupport> {
+    if let Some(caps) = cell.get() {
+        return Some(*caps);
+    }
+    let caps = probe();
+    if caps.h264 || caps.h265 || caps.av1 {
+        return Some(*cell.get_or_init(|| caps));
+    }
+    missed.get_or_init(|| {
+        tracing::warn!(
+            probe = what,
+            "encode probe found no codec — advertising the superset and probing again on the \
+             next ask"
+        );
+    });
+    None
+}
+
 /// `quic::CODEC_*` bits of a [`CodecSupport`] probe, or `None` when it found
 /// nothing — GPU unusable at probe time, not "zero codecs". Caller falls back
 /// to the static superset.
@@ -438,5 +464,29 @@ mod tests {
             av1: false,
         };
         assert_eq!(codec_support_wire_mask(none), None);
+    }
+
+    /// A codec set that found nothing is not kept: the next ask probes again, and the miss
+    /// warns once (sweep R5-03). A found set is kept and never probed again.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn a_probe_that_found_nothing_runs_again() {
+        let (cell, missed) = (OnceLock::new(), OnceLock::new());
+        let nothing = CodecSupport {
+            h264: false,
+            h265: false,
+            av1: false,
+        };
+        let hevc = CodecSupport {
+            h264: false,
+            h265: true,
+            av1: false,
+        };
+        assert!(probe_until_found(&cell, &missed, "test", || nothing).is_none());
+        assert!(cell.get().is_none() && missed.get().is_some());
+        let found = probe_until_found(&cell, &missed, "test", || hevc).expect("found");
+        assert!(found.h265 && !found.h264);
+        let kept = probe_until_found(&cell, &missed, "test", || panic!("a found set is kept"));
+        assert!(kept.is_some_and(|c| c.h265));
     }
 }
