@@ -504,7 +504,7 @@ fn group_len<T: AsRef<[u8]>>(pkts: &[T], max_bytes: usize, max_packets: usize) -
 }
 
 /// `PUNKTFUNK_FRAME_DRIVEN=0` restores the fixed-cadence tick. On, the loop wakes on
-/// the capturer's arrival ([`pf_capture::Capturer::supports_arrival_wait`]) or on the
+/// a feed's arrival ([`pf_capture::Feed::wait_arrival`]) or on the
 /// next access unit of an encoder that publishes its own; a backend with neither
 /// keeps the tick. Shared by both video planes.
 pub(crate) fn frame_driven_enabled() -> bool {
@@ -623,7 +623,7 @@ pub(crate) fn wait_next_tick(
     if !frame_driven_enabled() {
         return sleep_to_grid(next);
     }
-    if capturer.supports_arrival_wait() {
+    if let Some(feed) = capturer.feed() {
         // Anchor the 0.9× floor to the capture, not `next`: a sync encoder folds encode into cadence.
         if let Some(t_cap) = fresh {
             credit.charge();
@@ -637,7 +637,7 @@ pub(crate) fn wait_next_tick(
         } else {
             credit.note_repeat();
         }
-        capturer.wait_arrival(*next + keepalive_wait(interval, src_period_ns, credit.idle));
+        feed.wait_arrival(*next + keepalive_wait(interval, src_period_ns, credit.idle));
     } else if owed_aus(frame, enc, *next).is_none() {
         return sleep_to_grid(next);
     }

@@ -28,7 +28,7 @@ pub(crate) fn preflight(management_cli: bool) {
     if !management_cli {
         // SAFETY: `startup` runs this before any subcommand, and nothing earlier in `real_main`
         // creates a DXGI factory.
-        unsafe { crate::capture::dxgi::install_gpu_pref_hook() };
+        unsafe { crate::capture::gpu_pref::install_gpu_pref_hook() };
     }
 }
 
@@ -106,7 +106,7 @@ fn hdr_p010_selftest(args: &[String]) -> Result<()> {
             }
         }
     }
-    crate::capture::dxgi::hdr_p010_selftest_at(size.0, size.1, vendor)
+    crate::encode::convert::hdr_p010_selftest_at(size.0, size.1, vendor)
 }
 
 pub(crate) fn print_usage() {

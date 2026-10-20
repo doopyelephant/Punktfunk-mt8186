@@ -1,6 +1,6 @@
 //! The bytes of the win32u GPU-preference patch: what it writes, and what it may overwrite.
 //!
-//! `dxgi::install_gpu_pref_hook` replaces the head of a win32u export with a jump. It
+//! `gpu_pref::install_gpu_pref_hook` replaces the head of a win32u export with a jump. It
 //! writes only over a head [`is_syscall_stub`] recognises. Pure byte tables, so the test
 //! runs on every target; the patch itself is x86-64 Windows only.
 

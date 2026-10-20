@@ -126,8 +126,8 @@ fn note_cursor_id(cursor: &mut CursorState, id: u32) -> bool {
 /// Read the newest `SPA_META_Cursor` into `cursor`. Runs before stale-frame
 /// filtering so metadata-only pointer moves still update position.
 /// Producer offsets and bitmap geometry are bounded before every read.
-/// `bitmap_offset == 0` keeps the last complete bitmap and its hotspot; a 0×0
-/// or fully transparent bitmap is a hide.
+/// `bitmap_offset == 0` and a bitmap of format 0 keep the last complete bitmap
+/// and its hotspot; a 0×0, pixel-less or fully transparent bitmap is a hide.
 pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sys::spa_buffer) {
     // SAFETY: `spa_buf` is the live dequeued buffer (not yet requeued).
     // `find_meta` (not `find_meta_data`) yields the region's real `size`.
@@ -188,6 +188,10 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
         bmp.stride.max(0) as usize,
         bmp.offset as usize,
     );
+    // SPA: format 0 is "no new bitmap information", not a sprite.
+    if vfmt == spa::sys::SPA_VIDEO_FORMAT_UNKNOWN {
+        return;
+    }
     // An empty sprite is the producer's hide (Mutter's null cursor).
     if bw == 0 || bh == 0 {
         cursor.bitmap_hidden = true;
@@ -199,9 +203,11 @@ pub(super) fn update_cursor_meta(cursor: &mut CursorState, spa_buf: *mut spa::sy
         return;
     }
     // Distinct from `bitmap_offset == 0` (position-only): `spa_meta_bitmap.offset
-    // == 0` means no pixels. Treating 0 as a pixel offset would start the
+    // == 0` is SPA's invisible pointer. Read as a pixel offset it would start the
     // extent at the bitmap header and cache those words as the cursor.
     if pix_off == 0 {
+        cursor.bitmap_hidden = true;
+        cursor.visible = false;
         return;
     }
     let row = bw as usize * 4;
@@ -429,6 +435,17 @@ mod tests {
     /// One buffer carrying `SPA_META_Cursor` laid out as the producers write it: the cursor
     /// header, then (for a bitmap) the bitmap header and tightly packed RGBA.
     fn feed(c: &mut CursorState, pos: (i32, i32), hot: (i32, i32), bmp: Option<(u32, u32, &[u8])>) {
+        feed_with(c, pos, hot, bmp, |_| {});
+    }
+
+    /// [`feed`], with `edit` applied to the bitmap header before it is written.
+    fn feed_with(
+        c: &mut CursorState,
+        pos: (i32, i32),
+        hot: (i32, i32),
+        bmp: Option<(u32, u32, &[u8])>,
+        edit: impl Fn(&mut spa::sys::spa_meta_bitmap),
+    ) {
         use spa::sys::{spa_buffer, spa_meta, spa_meta_bitmap, spa_meta_cursor};
         let (head, bmp_head) = (
             std::mem::size_of::<spa_meta_cursor>(),
@@ -448,6 +465,7 @@ mod tests {
             (b.size.width, b.size.height) = (w, h);
             b.stride = (w * 4) as i32;
             b.offset = bmp_head as u32;
+            edit(&mut b);
             // SAFETY: `region` holds `head + bmp_head` bytes before the pixels.
             unsafe {
                 region
@@ -497,6 +515,25 @@ mod tests {
         // An Xwayland blank cursor: a real-size bitmap with nothing in it.
         feed(&mut c, (30, 30), (0, 0), Some((2, 2, &[0; 16])));
         assert!(!c.overlay().expect("bitmap").visible);
+    }
+
+    /// SPA's two header-only signals: format 0 is no new bitmap, pixel offset 0 an
+    /// invisible pointer.
+    #[test]
+    fn a_format_zero_bitmap_keeps_the_sprite_and_a_pixel_less_one_hides_it() {
+        let arrow = [255u8; 2 * 2 * 4];
+        let mut c = CursorState::new(false);
+        feed(&mut c, (10, 10), (1, 1), Some((2, 2, &arrow)));
+        let serial = c.serial;
+        feed_with(&mut c, (20, 20), (0, 0), Some((0, 0, &[])), |b| {
+            b.format = 0
+        });
+        assert!(c.overlay().expect("bitmap").visible, "not a null cursor");
+        assert_eq!(c.serial, serial, "not a new sprite either");
+        feed_with(&mut c, (20, 20), (1, 1), Some((2, 2, &arrow)), |b| {
+            b.offset = 0
+        });
+        assert!(!c.overlay().expect("cached").visible);
     }
 
     #[test]

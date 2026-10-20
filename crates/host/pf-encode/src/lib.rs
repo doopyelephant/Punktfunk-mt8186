@@ -574,8 +574,7 @@ pub mod worker;
 ))]
 #[path = "enc/linux/test_frames.rs"]
 mod test_frames;
-// Live tests pairing a `pf_encode_win` backend with what only this crate has
-// (pf-capture's P010 converter).
+// Live tests pairing a `pf_encode_win` backend with the P010 converter's real output.
 #[cfg(all(test, target_os = "windows"))]
 #[path = "enc/windows/live_tests.rs"]
 mod live_tests;

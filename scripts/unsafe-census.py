@@ -330,7 +330,7 @@ FORBID = re.compile(r'#!\s*\[\s*forbid\s*\(\s*unsafe_code')
 REPRC = re.compile(r'#\s*\[\s*repr\s*\(\s*C')
 # NOTE: the `const _: () = { ... };` BLOCK form is as common in this tree as the direct
 # `const _: () = assert!(...)` form (18 files use it, incl. the C ABI, gamepad.rs and
-# idd_push/probes.rs). An earlier version of this regex matched only the direct form and
+# idd/probes.rs). An earlier version of this regex matched only the direct form and
 # therefore reported 102 unguarded repr(C) declarations where the true number is 60 —
 # it counted three well-guarded files as defenceless. Keep both alternatives.
 LAYOUT_ASSERT = re.compile(

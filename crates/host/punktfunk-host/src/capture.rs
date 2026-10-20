@@ -1,10 +1,8 @@
-//! Frame-capture facade over `pf-capture`.
+//! Frame-capture facade over `pf-capture`, at the historical `crate::capture::*` paths.
 //!
-//! Re-exports the shared frame types and capturer traits at the historical
-//! `crate::capture::*` paths. Host-only entry points — [`open_portal_monitor`],
-//! [`capture_virtual_output`] — resolve [`pf_capture::ZeroCopyPolicy`] and, on
-//! Windows, the driver-IOCTL senders so the capturer never reaches back into
-//! encode or vdisplay.
+//! The Linux opens resolve [`pf_capture::ZeroCopyPolicy`] here, so capture never reaches back
+//! into encode. The Windows opens live in `crate::windows::idd`, beside the display manager
+//! whose control device they send through.
 
 use anyhow::Result;
 
@@ -19,7 +17,7 @@ pub use pf_frame::PixelFormat;
 pub use pf_capture::FastSyntheticCapturer;
 pub use pf_capture::{capturer_supports_444, Capturer, SyntheticCapturer};
 #[cfg(target_os = "windows")]
-pub use pf_capture::{dxgi, synthetic_nv12};
+pub use pf_capture::{gpu_pref, synthetic_nv12};
 
 /// What the session's encoder proved it can import, per capture fourcc. SDR
 /// asks the packed-RGB pair, HDR the packed 10-bit pair; empty verdicts carry
@@ -127,21 +125,14 @@ pub fn open_portal_monitor(
     anyhow::bail!("portal capture requires Linux (xdg-desktop-portal + PipeWire)")
 }
 
-/// Streamed head's mode for the pointer warp (`pf_inject::set_stream_extent`), in pixels.
-/// A display mode never exceeds `u16`; anything that does is not one, so it publishes nothing.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn head_extent(mode: Option<(u32, u32, u32)>) -> Option<(u16, u16)> {
-    let (w, h, _) = mode?;
-    Some((u16::try_from(w).ok()?, u16::try_from(h).ok()?))
-}
-
 /// One [`capture_virtual_output`] request, shared by every platform
 /// implementation so the facade takes two arguments. `codec` is the session's
 /// resolved encoder — Linux uses it to seed the gamescope tiled offer, other
 /// platforms ignore it. `kwin`/`gamescope` carry PipeWire producer contracts
 /// node ids and remote fds cannot reveal. `stream_hz` is the wire rate, which a display
 /// created at a multiple of it cannot tell the capture. `screen` is the session's screen the
-/// output shows, `0` the first: absolute input for it aims at this head.
+/// output shows, `0` the first: absolute input for it aims at this head. `gamescope_cursor`
+/// reads the pointer from the output's nested Xwaylands (Linux; ignored elsewhere).
 pub(crate) struct VirtualCaptureRequest {
     pub output: OutputFormat,
     pub codec: Option<crate::encode::Codec>,
@@ -150,36 +141,7 @@ pub(crate) struct VirtualCaptureRequest {
     pub gamescope: bool,
     pub stream_hz: u32,
     pub screen: u8,
-}
-
-/// Aim absolute input for screen `screen` at the head its capture attached to: the first
-/// screen's by name and with a warp, a further one's into its own slot.
-#[cfg(target_os = "linux")]
-fn aim_at_head(screen: u8, name: Option<String>, extent: Option<(u16, u16)>) {
-    if screen == 0 {
-        // The extent goes first: the output bumps the aim generation, and a warp that reads it
-        // must find this head's size.
-        crate::inject::set_stream_extent(extent);
-        crate::inject::set_stream_output(name);
-    } else {
-        crate::inject::set_screen_head(screen, name, extent);
-    }
-}
-
-/// [`aim_at_head`] by CCD target.
-#[cfg(target_os = "windows")]
-fn aim_at_target(
-    screen: u8,
-    key: pf_win_display::win_display::CcdTargetKey,
-    extent: Option<(u16, u16)>,
-) {
-    if screen == 0 {
-        crate::inject::set_stream_extent(extent);
-        crate::inject::set_stream_target(Some(key));
-    } else {
-        crate::inject::set_screen_head(screen, None, extent);
-        crate::inject::set_screen_target(screen, Some(key));
-    }
+    pub gamescope_cursor: bool,
 }
 
 /// A live output's metadata without its keepalive: what [`capture_virtual_output`] needs to
@@ -238,10 +200,10 @@ impl OutputLease {
     }
 }
 
-/// Capturer from an already-created [`crate::vdisplay::VirtualOutput`].
-/// The capturer owns the output keepalive. Direct capture probes its consumer;
-/// PipeWire probes only level-21 gamescope and non-gamescope PyroWave. Ordinary
-/// KWin, Mutter, and older gamescope keep their unchanged LINEAR offer.
+/// Capturer from an already-created [`crate::vdisplay::VirtualOutput`], which it owns. A
+/// named output is offered to direct capture first; `pf_capture::open_virtual_output` picks.
+/// Direct capture probes its consumer; PipeWire probes only level-21 gamescope and
+/// non-gamescope PyroWave. Ordinary KWin, Mutter, and older gamescope keep their LINEAR offer.
 #[cfg(target_os = "linux")]
 pub fn capture_virtual_output(
     vout: crate::vdisplay::VirtualOutput,
@@ -255,28 +217,20 @@ pub fn capture_virtual_output(
         gamescope,
         stream_hz,
         screen,
+        gamescope_cursor,
     } = request;
-    // Portal negotiates its own pixel format, so `want.gpu` gates GPU zero-copy
-    // (this path is always the portal; `CaptureBackend` is Windows-only dispatch)
-    // and `want.chroma_444` selects planar-YUV444 GPU convert. `gpu = false`
-    // forces CPU mmap so the encoder gets CPU-resident RGB for YUV444P.
-
-    // `want.hdr` offers 10-bit PQ/BT.2020. Handshake already resolved it through
-    // [`capturer_supports_hdr_for`]; only gamescope off `pipewire-hdr` is HDR.
-
+    // `want.hdr` was resolved by [`capturer_supports_hdr_for`] before the Welcome.
     // Aim absolute input at THIS head: EXTEND backends sit beside the operator's
     // screens. `None` (Mutter/gamescope) CLEARS a stale name, e.g. after a Game-Mode
     // switch Hyprland → gamescope has removed `PF-…`.
-    aim_at_head(
+    crate::inject::aim_at_head(
         screen,
         vout.output_name.clone().or(vout.input_output.clone()),
-        head_extent(vout.preferred_mode),
+        vout.preferred_mode,
     );
     // The encoder modifier probe keys on bit depth: HDR and 10-bit SDR both ride
     // the packed 10-bit fourccs.
     let bit_depth = if want.hdr || want.ten_bit_sdr { 10 } else { 8 };
-    // PipeWire probes only where modifiers are offered: level-21 gamescope, or
-    // non-gamescope PyroWave. Direct capture needs the same exact consumer lists.
     let gamescope_tiled = gamescope && pf_vdisplay::gamescope_tiled_capture(None);
     // NVENC copies a producer's planar frame; an older gamescope composites it through system
     // RAM, which costs more than the conversion it saves. VAAPI keeps its own rule.
@@ -291,34 +245,23 @@ pub fn capture_virtual_output(
     } else {
         None
     };
-    // Direct capture first where the compositor has it: the portal's re-request timer
-    // halves the rate above ~140 Hz. GPU consumers only — this delivers dmabufs, and a
-    // software encoder wants the portal's CPU pixels. Any failure falls through.
-    let mut keepalive = vout.keepalive;
-    if let (Some(name), true) = (
-        vout.output_name.clone(),
-        want.gpu && pf_capture::direct_capture(),
-    ) {
-        match pf_capture::open_direct_output(
-            name.clone(),
-            keepalive,
-            zero_copy_policy(want.pyrowave, nv12_native, codec, bit_depth, want.hdr),
-            want.hdr,
-        ) {
-            Ok(c) => {
-                tracing::info!(output = %name, "capturing the compositor output directly");
-                return Ok(c);
-            }
-            Err((e, handed_back)) => {
-                keepalive = handed_back;
-                tracing::info!(
-                    output = %name,
-                    reason = %format!("{e:#}"),
-                    "no direct capture on this compositor — using the ScreenCast portal"
-                )
-            }
-        }
-    }
+    // Direct capture's modifier lists come from the session codec, PipeWire's from
+    // `modifier_codec`.
+    let (pyrowave, hdr) = (want.pyrowave, want.hdr);
+    let direct = vout
+        .output_name
+        .clone()
+        .map(|output_name| pf_capture::DirectOutput {
+            output_name,
+            policy: Box::new(move || {
+                zero_copy_policy(pyrowave, nv12_native, codec, bit_depth, hdr)
+            }),
+        });
+    let seat = vout.seat.clone();
+    let gamescope_cursor = gamescope_cursor.then(|| {
+        std::sync::Arc::new(move || pf_vdisplay::gamescope_xwayland_cursor_targets(seat.as_deref()))
+            as pf_capture::GamescopeCursorTargets
+    });
     let producer = if kwin {
         pf_capture::Producer::Kwin
     } else if gamescope {
@@ -330,7 +273,7 @@ pub fn capture_virtual_output(
         vout.remote_fd,
         vout.node_id,
         vout.preferred_mode,
-        keepalive,
+        vout.keepalive,
         pf_capture::VirtualOutputOpts {
             allow_zerocopy: want.gpu,
             want_444: want.chroma_444,
@@ -340,17 +283,14 @@ pub fn capture_virtual_output(
             expect_exact_dims: vout.expect_exact_dims,
             producer,
             stream_hz,
-            policy: pf_capture::ZeroCopyPolicy {
-                // No route here. A wrong "foreign" only keeps the LINEAR offer.
-                gamescope_tiled,
-                ..zero_copy_policy(
-                    want.pyrowave,
-                    nv12_native,
-                    modifier_codec,
-                    bit_depth,
-                    want.hdr,
-                )
-            },
+            gamescope_cursor,
+            direct,
+            ..Default::default()
+        },
+        // No route here. A wrong "foreign" only keeps the LINEAR offer.
+        move || pf_capture::ZeroCopyPolicy {
+            gamescope_tiled,
+            ..zero_copy_policy(pyrowave, nv12_native, modifier_codec, bit_depth, hdr)
         },
     )
 }
@@ -434,252 +374,9 @@ pub fn capturer_delivers_sdr10_for(
     }
 }
 
+// The Windows opens live with the display manager's other session touch points.
 #[cfg(target_os = "windows")]
-pub fn capture_virtual_output(
-    vout: crate::vdisplay::VirtualOutput,
-    request: VirtualCaptureRequest,
-) -> Result<Box<dyn Capturer>> {
-    let VirtualCaptureRequest {
-        output: want,
-        // Linux-only (encoder-proved tiled offer); IDD-push negotiates no dmabuf modifiers.
-        codec: _codec,
-        capture: _capture,
-        // Linux-only (`SPA_META_Cursor`, pool depth). IDD-push has no such meta; hide is
-        // CURSOR_SUPPRESSED.
-        kwin: _kwin,
-        gamescope: _gamescope,
-        // The driver paces its own encodes (`pf_frame::pace`).
-        stream_hz,
-        screen,
-    } = request;
-    // A monitor this host did not create is captured by a worker; the driver has no part in it.
-    if vout.ownership == crate::vdisplay::DisplayOwnership::External {
-        return capture_external_output(vout, want, stream_hz, screen);
-    }
-    let target = vout.win_capture.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "pf-vdisplay target not yet an active display path (activation failed — see the \
-             virtual-display warnings above)"
-        )
-    })?;
-    // Aim the injectors' absolute mapping (pen/touch/abs-mouse) at THIS display: the wire
-    // normalizes over the streamed frame, and mapping it over the whole virtual desktop is wrong
-    // the moment a physical monitor shares the desktop (Extend topology, or an Exclusive isolate
-    // degraded to the keep-physicals fallback) — the pen-offset field bug.
-    aim_at_target(
-        screen,
-        pf_win_display::win_display::CcdTargetKey::new(target.adapter_luid, target.target_id),
-        head_extent(vout.preferred_mode),
-    );
-    let pref = vout.preferred_mode;
-    let keep = vout.keepalive;
-    // Resolve the pf-vdisplay control device once and wrap its cursor IOCTLs for the
-    // IDD-push capturer. This is the one host reach into `crate::vdisplay` the capturer
-    // would otherwise make.
-    let control = crate::vdisplay::manager::control_device_handle().ok_or_else(|| {
-        anyhow::anyhow!(
-            "pf-vdisplay control device not open (monitor not created via the manager?)"
-        )
-    })?;
-    // Each closure clones the `Arc<ControlDevice>`, so the handle stays open for the closure's
-    // life and closes when the manager retires it and the last session drops. An open control
-    // handle vetoes the wake-from-sleep PnP cycle.
-
-    // Presence of this closure opts the session into v5 cursor-channel delivery (capturer
-    // creates CursorShm; driver declares the IddCx hardware cursor). An already-excluded target
-    // gets one too — it is the shape source the pool's blend needs. Whether a CLIENT draws the
-    // pointer is `want.hw_cursor`, passed separately: the channel alone does not say.
-    let control_cursor = control.clone();
-    let want_channel = want.hw_cursor || target.cursor_excluded;
-    let cursor_sender: Option<pf_capture::CursorChannelSender> = want_channel.then(|| {
-        std::sync::Arc::new(
-            move |req: &pf_driver_proto::control::SetCursorChannelRequest| {
-                crate::vdisplay::driver::send_cursor_channel(&control_cursor, req)
-            },
-        ) as pf_capture::CursorChannelSender
-    });
-    // The cursor render model (`IOCTL_SET_CURSOR_FORWARD`): `false` = the client draws no
-    // pointer (capture model, UAC/Winlogon), so the driver blends the excluded one into its
-    // frames. Built for every session: a channel-less reuse can still have a live cursor
-    // worker from an earlier session. Never-declared targets answer NOT_FOUND, which the
-    // capturer logs and ignores.
-    let target_id = target.target_id;
-    let cursor_forward: Option<pf_capture::CursorForwardSender> = Some({
-        std::sync::Arc::new(move |enable: bool| {
-            let req = pf_driver_proto::control::SetCursorForwardRequest {
-                target_id,
-                enable: enable as u32,
-            };
-            crate::vdisplay::driver::send_cursor_forward(&control, &req)
-        }) as pf_capture::CursorForwardSender
-    });
-    let opts = pf_capture::IddPushOpts {
-        want_hdr: want.hdr,
-        ten_bit_sdr: want.ten_bit_sdr,
-        want_444: want.chroma_444,
-        pyrowave: want.pyrowave,
-        cursor_sender,
-        cursor_forward,
-        forwards_to_client: want.hw_cursor,
-    };
-    pf_capture::open_idd_push(target, pref, keep, opts)
-        .map_err(|(e, _keep)| e.context("IDD-push capture open (no fallback)"))
-}
-
-/// Capture a monitor this session does not own: start a capture worker as the signed-in user
-/// and open the monitor in it. The absolute-input aim moves to that monitor, as the IDD-push
-/// open does for its own.
-///
-/// A mirror's worker gets the GPU scheduling class a session's encoder gets. A viewer of
-/// another session's display keeps the default, below the driver that encodes for its owner.
-#[cfg(target_os = "windows")]
-fn capture_external_output(
-    vout: crate::vdisplay::VirtualOutput,
-    want: OutputFormat,
-    stream_hz: u32,
-    screen: u8,
-) -> Result<Box<dyn Capturer>> {
-    use anyhow::Context as _;
-    let target = vout
-        .win_capture
-        .clone()
-        .context("the mirrored monitor carries no capture target")?;
-    let key = pf_win_display::win_display::CcdTargetKey::new(target.adapter_luid, target.target_id);
-    let hdr = pf_win_display::display_events::snapshot_or_query()
-        .target(key)
-        .and_then(|t| t.hdr)
-        .unwrap_or(false);
-    aim_at_target(screen, key, head_extent(vout.preferred_mode));
-    let worker = crate::windows::capture_worker::spawn().context("start the capture worker")?;
-    let source = pf_capture::WgcSource {
-        gdi_name: target.gdi_name,
-        target_id: target.target_id,
-        hdr,
-    };
-    let own_priority = crate::session_plan::mirrored();
-    pf_capture::open_wgc(
-        worker,
-        source,
-        want.hdr,
-        stream_hz,
-        own_priority,
-        vout.keepalive,
-    )
-    .context("WGC capture open (no fallback)")
-}
-
-/// Open the in-driver encoder for an IDD-push session: the plan as the driver numbers it, at the
-/// depth the display composes now, the resolved Windows backend ahead of any fallback rung, the
-/// two IOCTL senders over the manager's control handle, and the `pf_gpu` session record. The
-/// heap is sized from the opening rate; ABR climbs past twice it eat the burst margin.
-/// `client_hdr` replaces the capturer's HDR baseline, as the stream loop does, so the first IDR
-/// carries the client's panel.
-#[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-pub fn open_driver_encoder(
-    plan: &crate::session_plan::SessionPlan,
-    capturer: &dyn Capturer,
-    size: (u32, u32),
-    fps: u32,
-    bitrate_bps: u64,
-    bit_depth: u8,
-    client_hdr: Option<pf_frame::HdrMeta>,
-    wire_seq_base: u32,
-) -> Result<Box<dyn crate::encode::Encoder>> {
-    use crate::encode::{Codec, WindowsBackend};
-    use pf_driver_proto::encode::{backend as be, codec as cc};
-    let backend = match plan.codec {
-        Codec::PyroWave => be::PYROWAVE,
-        _ => match crate::encode::windows_resolved_backend() {
-            WindowsBackend::Nvenc => be::NVENC,
-            WindowsBackend::Amf => be::AMF,
-            WindowsBackend::Qsv => be::QSV,
-            WindowsBackend::MediaFoundation => be::MEDIA_FOUNDATION,
-            WindowsBackend::Software => anyhow::bail!(
-                "driver encode: the resolved backend is software, which the driver cannot run"
-            ),
-        },
-    };
-    // The capturer reports HDR metadata exactly while the display composes FP16.
-    let (hdr, bit_depth) =
-        crate::session_plan::live_depth(plan.hdr, capturer.hdr_meta().is_some(), bit_depth);
-    // Media Foundation is the second rung for an H.26x session a missing `amfrt64.dll` or a
-    // declined native open would otherwise end, but only inside its 8-bit 4:2:0 ceiling: the
-    // plan is already negotiated here, so a wider one would open and then refuse every frame.
-    let mf_fits = !hdr && !plan.chroma.is_444() && bit_depth <= 8;
-    let fallback = u32::from(!matches!(backend, be::PYROWAVE | be::MEDIA_FOUNDATION) && mf_fits)
-        * be::MEDIA_FOUNDATION;
-    let params = pf_capture::DriverEncodeParams {
-        codec: match plan.codec {
-            Codec::H264 => cc::H264,
-            Codec::H265 => cc::HEVC,
-            Codec::Av1 => cc::AV1,
-            Codec::PyroWave => cc::PYROWAVE,
-        },
-        chroma: u32::from(plan.chroma.is_444()),
-        bit_depth: u32::from(bit_depth),
-        width: size.0,
-        height: size.1,
-        fps,
-        bitrate_kbps: (bitrate_bps / 1000).min(u64::from(u32::MAX)) as u32,
-        hdr,
-        hdr_meta: capturer.hdr_meta().map(|m| client_hdr.unwrap_or(m)),
-        sdr_fp16: !hdr && capturer.composes_sdr_fp16(),
-        slices: plan.slices,
-        wire_chunk_bytes: plan.wire_chunk.unwrap_or(0) as u32,
-        backends: [backend, fallback, 0, 0],
-        wire_seq_base,
-    };
-    // The capturer says where its encoder runs: a capture worker's source opens there.
-    let worker = capturer.worker_endpoint();
-    let enc = match &worker {
-        Some(worker) => pf_capture::open_worker_encoder(worker, &params)?,
-        None => open_in_driver(capturer, &params)?,
-    };
-    // The list was walked on the other side, so the record names what actually opened —
-    // reading back the request's first choice would hide every fallback.
-    let label = match (worker.is_some(), enc.telemetry().map(|t| t.backend)) {
-        (false, Some("nvenc")) => "driver-nvenc",
-        (false, Some("amf")) => "driver-amf",
-        (false, Some("qsv")) => "driver-qsv",
-        (false, Some("pyrowave")) => "driver-pyrowave",
-        (false, Some("mf")) => "driver-mf",
-        (false, _) => "driver",
-        (true, Some("nvenc")) => "worker-nvenc",
-        (true, Some("amf")) => "worker-amf",
-        (true, Some("qsv")) => "worker-qsv",
-        (true, Some("pyrowave")) => "worker-pyrowave",
-        (true, Some("mf")) => "worker-mf",
-        (true, _) => "worker",
-    };
-    Ok(crate::encode::track_session(enc, label))
-}
-
-/// The in-driver open: the two IOCTL senders over the manager's control handle.
-#[cfg(target_os = "windows")]
-fn open_in_driver(
-    capturer: &dyn Capturer,
-    params: &pf_capture::DriverEncodeParams,
-) -> Result<Box<dyn crate::encode::Encoder>> {
-    let endpoint = capturer
-        .driver_endpoint()
-        .ok_or_else(|| anyhow::anyhow!("driver encode: the capture source is not IDD-push"))?;
-    let control = crate::vdisplay::manager::control_device_handle().ok_or_else(|| {
-        anyhow::anyhow!(
-            "pf-vdisplay control device not open (monitor not created via the manager?)"
-        )
-    })?;
-    let control_open = control.clone();
-    let set_encode: pf_capture::SetEncodeSender =
-        std::sync::Arc::new(move |req: &pf_driver_proto::encode::SetEncodeRequest| {
-            crate::vdisplay::driver::send_set_encode(&control_open, req)
-        });
-    let encode_ctl: pf_capture::EncodeCtlSender =
-        std::sync::Arc::new(move |req: &pf_driver_proto::encode::EncodeCtlRequest| {
-            crate::vdisplay::driver::send_encode_ctl(&control, req)
-        });
-    pf_capture::open_driver_encoder(endpoint, params, set_encode, encode_ctl)
-}
+pub(crate) use crate::windows::idd::{capture_virtual_output, open_driver_encoder};
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub fn capture_virtual_output(
@@ -694,270 +391,7 @@ pub fn capture_virtual_output(
         gamescope: _gamescope,
         stream_hz: _stream_hz,
         screen: _screen,
+        gamescope_cursor: _gamescope_cursor,
     } = request;
     anyhow::bail!("virtual-output capture requires Linux or Windows")
-}
-
-#[cfg(all(test, target_os = "windows"))]
-mod live_tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-
-    /// Live IDD-push ring: a session-shaped capturer must deliver Source frames.
-    /// Elevated console session; host service stopped.
-    #[test]
-    #[ignore = "live: needs the pf-vdisplay driver, a console session, the host service stopped"]
-    fn live_idd_push_ring_delivers_source_frames() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new("info,pf_capture=debug"))
-            .with_test_writer()
-            .try_init();
-        let mut vd = crate::vdisplay::open(crate::vdisplay::Compositor::Windows)
-            .expect("open the pf-vdisplay backend");
-        let vout = vd
-            .create(punktfunk_core::Mode {
-                width: 1920,
-                height: 1080,
-                refresh_hz: 60,
-            })
-            .expect("create a virtual display");
-        let want = OutputFormat {
-            gpu: true,
-            hdr: false,
-            ten_bit_sdr: false,
-            sdr10_native: false,
-            chroma_444: false,
-            pyrowave: false,
-            nv12_native: false,
-            hw_cursor: false,
-        };
-        let mut cap = capture_virtual_output(
-            vout,
-            VirtualCaptureRequest {
-                output: want,
-                codec: None,
-                capture: crate::session_plan::CaptureBackend::IddPush,
-                kwin: false,
-                gamescope: false,
-                stream_hz: 60,
-                screen: 0,
-            },
-        )
-        .expect("open the IDD-push capturer");
-        // A static desktop composes nothing: walk the pointer so every tick has a new image.
-        let (mut source, mut regen, mut repeat, mut errors) = (0u32, 0u32, 0u32, 0u32);
-        // `PF_LIVE_RING_SECS` stretches the run (default 12 s) so slower behaviours — the
-        // exclusive watchdog's breaker on a relight fight — have time to show in the log.
-        let secs: u64 = std::env::var("PF_LIVE_RING_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(12);
-        let start = Instant::now();
-        let mut x = 100i32;
-        while start.elapsed() < Duration::from_secs(secs) {
-            x = 100 + ((x - 100 + 7) % 600);
-            // SAFETY: plain FFI; the pointer is parked on the operator's desktop for the test.
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::SetCursorPos(x, 100 + x / 3);
-            }
-            if cap.supports_arrival_wait() {
-                cap.wait_arrival(Instant::now() + Duration::from_millis(40));
-            }
-            match cap.try_latest() {
-                Ok(Some(f)) => match f.provenance.origin {
-                    pf_frame::FrameOrigin::Source => source += 1,
-                    _ => regen += 1,
-                },
-                Ok(None) => {
-                    repeat += 1;
-                    std::thread::sleep(Duration::from_millis(8));
-                }
-                Err(e) => {
-                    errors += 1;
-                    assert!(errors <= 3, "the ring keeps failing: {e:#}");
-                }
-            }
-        }
-        assert!(
-            source >= 60,
-            "expected a steady stream of NEW source frames from the ring, got {source} \
-             (regen={regen} repeat={repeat} errors={errors} in {:?})",
-            start.elapsed()
-        );
-        drop(cap);
-        drop(vd);
-    }
-
-    /// Freeze `pid` for `hold` by debugger attach (every thread stops at the attach event and
-    /// stays stopped until the SAME thread detaches), on a helper thread. `attached` flips once
-    /// the freeze took; kill-on-exit is off so a test panic never takes the debuggee down.
-    fn freeze_for(
-        pid: u32,
-        hold: Duration,
-        attached: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> std::thread::JoinHandle<()> {
-        use windows::Win32::System::Diagnostics::Debug::{
-            DebugActiveProcess, DebugActiveProcessStop, DebugSetProcessKillOnExit,
-        };
-        std::thread::spawn(move || {
-            // SAFETY: plain debug-API FFI on a pid the caller owns for the test's life.
-            unsafe {
-                let _ = DebugSetProcessKillOnExit(false);
-                if DebugActiveProcess(pid).is_err() {
-                    return;
-                }
-                attached.store(true, std::sync::atomic::Ordering::SeqCst);
-                std::thread::sleep(hold);
-                let _ = DebugActiveProcessStop(pid);
-            }
-        })
-    }
-
-    /// Live WUDFHost freeze: the same capturer must recover or end with a typed fault.
-    /// Default hold 18 s (`PF_LIVE_FREEZE_SECS`). Elevated console; host service stopped.
-    #[test]
-    #[ignore = "live: freezes the pf-vdisplay WUDFHost for ~18 s; elevated console session, host service stopped"]
-    fn live_frozen_driver_host_ends_the_plane_with_a_typed_fault() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new("info,pf_capture=debug"))
-            .with_test_writer()
-            .try_init();
-        let hold = Duration::from_secs(
-            std::env::var("PF_LIVE_FREEZE_SECS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(18),
-        );
-        let mut vd = crate::vdisplay::open(crate::vdisplay::Compositor::Windows)
-            .expect("open the pf-vdisplay backend");
-        let vout = vd
-            .create(punktfunk_core::Mode {
-                width: 1920,
-                height: 1080,
-                refresh_hz: 60,
-            })
-            .expect("create a virtual display");
-        let pid = vout
-            .win_capture
-            .as_ref()
-            .expect("the virtual display carries its capture target")
-            .wudf_pid;
-        assert_ne!(pid, 0, "the driver reported no WUDFHost pid");
-        let want = OutputFormat {
-            gpu: true,
-            hdr: false,
-            ten_bit_sdr: false,
-            sdr10_native: false,
-            chroma_444: false,
-            pyrowave: false,
-            nv12_native: false,
-            hw_cursor: false,
-        };
-        let mut cap = capture_virtual_output(
-            vout,
-            VirtualCaptureRequest {
-                output: want,
-                codec: None,
-                capture: crate::session_plan::CaptureBackend::IddPush,
-                kwin: false,
-                gamescope: false,
-                stream_hz: 60,
-                screen: 0,
-            },
-        )
-        .expect("open the IDD-push capturer");
-        let mut x = 100i32;
-        let mut step = |cap: &mut Box<dyn Capturer>| -> Result<bool> {
-            x = 100 + ((x - 100 + 7) % 600);
-            // SAFETY: plain FFI; the pointer is parked on the operator's desktop for the test.
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::SetCursorPos(x, 100 + x / 3);
-            }
-            if cap.supports_arrival_wait() {
-                cap.wait_arrival(Instant::now() + Duration::from_millis(40));
-            }
-            match cap.try_latest()? {
-                Some(f) => Ok(f.provenance.origin == pf_frame::FrameOrigin::Source),
-                None => {
-                    std::thread::sleep(Duration::from_millis(8));
-                    Ok(false)
-                }
-            }
-        };
-        // Warm: the ring must be delivering before anything is broken.
-        let warm_until = Instant::now() + Duration::from_secs(3);
-        let mut warm = 0u32;
-        while Instant::now() < warm_until {
-            if step(&mut cap).expect("capture before the fault") {
-                warm += 1;
-            }
-        }
-        assert!(warm >= 10, "no steady source before the fault (got {warm})");
-        // Attaching to WUDFHost (LocalService) needs it even from an elevated console.
-        pf_frame::privilege::enable("SeDebugPrivilege").expect("enable SeDebugPrivilege");
-        let attached = Arc::new(AtomicBool::new(false));
-        let freezer = freeze_for(pid, hold, attached.clone());
-        let t_freeze = Instant::now();
-        while !attached.load(Ordering::SeqCst) && t_freeze.elapsed() < Duration::from_secs(3) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            attached.load(Ordering::SeqCst),
-            "debugger attach to WUDFHost pid {pid} did not take"
-        );
-        let (mut during, mut after, mut outage, mut error) = (0u32, 0u32, None, None);
-        let mut first_after: Option<Duration> = None;
-        while t_freeze.elapsed() < hold + Duration::from_secs(60) {
-            match step(&mut cap) {
-                Ok(true) if t_freeze.elapsed() < hold => during += 1,
-                Ok(true) => {
-                    after += 1;
-                    first_after.get_or_insert(t_freeze.elapsed());
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    error = Some(format!("{e:#}"));
-                    break;
-                }
-            }
-            if let Some(o) = cap.take_recovered_outage() {
-                outage = Some(o);
-                break;
-            }
-        }
-        let ended = t_freeze.elapsed();
-        let _ = freezer.join();
-        // An in-flight slot or two can still drain after the attach; more means the worker ran.
-        assert!(
-            during <= 2,
-            "a frozen worker cannot keep publishing: {during} source frames during the freeze \
-             (after={after} first_after={first_after:?} outage={outage:?} error={error:?} \
-             ended_after={ended:?})"
-        );
-        match (outage, &error) {
-            (Some(outage), _) => {
-                assert!(
-                    outage >= Duration::from_secs(15),
-                    "a recovered outage must span the stall floor, got {outage:?}"
-                );
-                assert!(after >= 3, "real source frames must resume after the thaw");
-            }
-            (None, Some(e)) => {
-                // Death watch ("WUDFHost … exited") or `SourceStalled` ("no source frame for Ns").
-                assert!(
-                    e.contains("WUDFHost") || e.contains("no source frame"),
-                    "the plane must end with a typed driver/source fault, got: {e}"
-                );
-            }
-            (None, None) => panic!(
-                "neither a recovery nor a typed end within {:?} — the stale plane is exactly \
-                 what must never happen",
-                hold + Duration::from_secs(60)
-            ),
-        }
-        drop(cap);
-        drop(vd);
-    }
 }

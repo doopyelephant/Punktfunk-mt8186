@@ -107,7 +107,7 @@ pub(crate) struct SessionShared {
     /// `true` = the client draws the cursor (exclude + forward), `false` = the host composites.
     /// Stays `true`, and inert, for a session without the cursor cap.
     pub(crate) cursor_client_draws: Arc<AtomicBool>,
-    /// The capturer's arrival poke ([`pf_capture::Capturer::arrival_poke`]), set by the
+    /// The capturer's arrival poke ([`pf_capture::Feed::arrival_poke`]), set by the
     /// stream loop for each capturer it runs; the control task fires it with a recovery ask.
     pub(crate) arrival_poke: ArrivalPoke,
     /// UDP send offload for the media sender. The control task's loss guard clears it once

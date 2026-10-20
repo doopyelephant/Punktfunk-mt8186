@@ -249,14 +249,16 @@ impl StreamState {
             *self
                 .capture_health
                 .lock()
-                .unwrap_or_else(|e| e.into_inner()) = self.capturer.health();
+                .unwrap_or_else(|e| e.into_inner()) =
+                self.capturer.supervised().map(|s| s.health());
             // A client that roamed shares a path with whoever is at its new address now.
             crate::session_status::refresh_peer(
                 self.live_session.id,
                 self.conn.remote_address().ip(),
             );
         }
-        if let Some(outage) = self.capturer.take_recovered_outage() {
+        self.asks.drain(&mut *self.capturer);
+        if let Some(outage) = self.asks.outage.take() {
             let outage_ms = outage.as_millis().min(u32::MAX as u128) as u32;
             tracing::info!(
                 outage_ms,
@@ -271,7 +273,7 @@ impl StreamState {
             self.clock.last_forced_idr = Some(std::time::Instant::now());
             announce_pipeline_gap(&self.gap_tx, outage_ms);
         }
-        if self.capturer.take_reference_risk() {
+        if std::mem::take(&mut self.asks.idr) {
             tracing::info!(
                 "capture re-held a re-sent buffer — forcing an IDR over the reference it may \
                  have torn"

@@ -130,7 +130,9 @@ impl StreamState {
     pub(super) fn tick_cursor(&mut self) {
         if let Some(fwd) = self.cursor_fwd.as_mut() {
             let client_draws = self.cursor_client_draws.load(Ordering::Relaxed);
-            self.capturer.set_cursor_forward(client_draws);
+            if let Some(c) = self.capturer.cursor() {
+                c.set_forward(client_draws);
+            }
             if client_draws != self.cursor_client_drew {
                 self.cursor_client_drew = client_draws;
                 tracing::info!(
@@ -149,7 +151,7 @@ impl StreamState {
                 }
             }
             if client_draws {
-                let live = self.capturer.cursor();
+                let live = self.capturer.cursor().and_then(|c| c.overlay());
                 let reframe = *self.frame_map.lock().unwrap_or_else(|e| e.into_inner());
                 fwd.tick(
                     live.as_ref().or(self.frame.cursor.as_ref()),
@@ -169,7 +171,9 @@ impl StreamState {
         } else if self.gamescope_composite || self.metadata_composite {
             #[cfg(not(target_os = "windows"))]
             {
-                self.capturer.set_cursor_forward(false);
+                if let Some(c) = self.capturer.cursor() {
+                    c.set_forward(false);
+                }
                 self.composite_live_cursor(
                     "host-composite active but the capture has no live cursor overlay yet (no \
                      SPA_META_Cursor bitmap) — the stream is cursorless until one arrives",
@@ -184,7 +188,7 @@ impl StreamState {
     /// Hand the capture's live overlay to the encoder blend. Each of the two outcomes is logged once.
     #[cfg(not(target_os = "windows"))]
     fn composite_live_cursor(&mut self, none_msg: &'static str) {
-        match self.capturer.cursor() {
+        match self.capturer.cursor().and_then(|c| c.overlay()) {
             Some(live) => {
                 if !self.composite_log.saw_overlay {
                     self.composite_log.saw_overlay = true;
@@ -224,7 +228,7 @@ impl StreamState {
         let unconditional = if client_steers { 1 } else { 2 };
         let composite_starved = ((self.cursor_fwd.is_some() && !client_steers)
             || self.metadata_composite)
-            && self.capturer.cursor().is_none()
+            && self.capturer.cursor().and_then(|c| c.overlay()).is_none()
             && self.no_overlay_means_off_output;
         if self.park_attempts < unconditional || composite_starved {
             park_pointer(&self.input_tx, self.frame.width, self.frame.height);

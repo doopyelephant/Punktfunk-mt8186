@@ -7,7 +7,7 @@ use super::*;
 
 /// The pf-vdisplay driver holds the only Windows encoder: it opens the backend on the pooled
 /// device inside WUDFHost and publishes access units into the session's AU section, which
-/// `pf_capture::open_driver_encoder` wraps as the loop's `Encoder`. Reaching here means a
+/// the source's `pf_capture::RemoteEncoder` wraps as the loop's `Encoder`. Reaching here means a
 /// session resolved to a non-IDD-push capture source, which no longer exists.
 pub(crate) fn open(_: &OpenParams) -> Result<(Box<dyn Encoder>, &'static str)> {
     anyhow::bail!(

@@ -11,7 +11,7 @@
 //! in one pyrowave submission (`VK_QUEUE_FAMILY_EXTERNAL`). Every AU is a
 //! keyframe; framing is [`crate::pyrowave_wire`].
 //!
-//! Capture: `pf-capture` `windows/idd_push.rs`. Y on `D3d11Frame::texture`,
+//! Capture: `pf-capture` `windows/idd/mod.rs`. Y on `D3d11Frame::texture`,
 //! CbCr + fence on `D3d11Frame::pyro`.
 // `unsafe_op_in_unsafe_fn` off: this file is pyrowave-sys + D3D11/Vulkan interop.
 // Clearing it means deleting markers with no caller contract, not wrapping each call.

@@ -245,6 +245,7 @@ pub fn run(opts: Options) -> Result<()> {
                     gamescope: compositor == crate::vdisplay::Compositor::Gamescope,
                     stream_hz: opts.fps,
                     screen: 0,
+                    gamescope_cursor: false,
                 },
             )
             .context("capture virtual output")?
@@ -252,11 +253,15 @@ pub fn run(opts: Options) -> Result<()> {
     };
 
     // Portal/PipeWire delivers frames only while `active`; idle by default so reconnects are cheap.
-    capturer.set_active(true);
+    if let Some(feed) = capturer.feed() {
+        feed.set_active(true);
+    }
 
-    let first = capturer.next_frame().context("capture first frame")?;
+    let first = capturer
+        .next_frame(pf_capture::FirstFrame::Default)
+        .context("capture first frame")?;
     // The gate is what the display composes: the encoder follows an SDR display down to 8-bit.
-    if hdr && capturer.hdr_meta().is_none() {
+    if hdr && capturer.colour().hdr_meta.is_none() {
         anyhow::bail!("--hdr: the display composes SDR, not HDR");
     }
     let (w, h) = (first.width, first.height);
@@ -336,7 +341,9 @@ pub fn run(opts: Options) -> Result<()> {
         if done {
             break;
         }
-        frame = capturer.next_frame().context("capture frame")?;
+        frame = capturer
+            .next_frame(pf_capture::FirstFrame::Default)
+            .context("capture frame")?;
     }
 
     if !driver_encode {

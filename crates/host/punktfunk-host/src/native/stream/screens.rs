@@ -547,8 +547,8 @@ fn stream_screen(
             rate = now_rate;
             enc.reconfigure_bitrate(u64::from(rate.1.enc_kbps(rate.0)) * 1000);
         }
-        if capturer.supports_arrival_wait() {
-            capturer.wait_arrival(next);
+        if let Some(feed) = capturer.feed() {
+            feed.wait_arrival(next);
         } else if let Some(wait) = next.checked_duration_since(std::time::Instant::now()) {
             std::thread::sleep(wait);
         }

@@ -16,7 +16,7 @@
 //! Pin: `pick_active`, `focus_index` and [`scale_to_frame`] tests in this module.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -32,6 +32,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 
+use super::{CursorSlot, Negotiation};
 use crate::GamescopeCursorTargets;
 
 const MIT_MAGIC_COOKIE_1: &[u8] = b"MIT-MAGIC-COOKIE-1";
@@ -68,45 +69,29 @@ pub(super) struct XFixesCursorSource {
 
 impl XFixesCursorSource {
     /// Publish overlays into `slot` from the nested Xwayland gamescope is drawing.
-    /// `targets` is re-run every [`REDISCOVER`]; `frame_size` is `(w << 32) | h`,
-    /// `0` until the first negotiation (see [`scale_to_frame`]).
+    /// `targets` is re-run every [`REDISCOVER`]; `negotiation` gives the frame size the
+    /// pointer scales into (see [`scale_to_frame`]).
     ///
     /// `None` only if the thread cannot spawn. An empty target list is not a
     /// failure: the worker idles and retries so a stream that starts before the
     /// game still converges.
     pub(super) fn spawn(
         targets: GamescopeCursorTargets,
-        slot: Arc<Mutex<Option<CursorOverlay>>>,
-        frame_size: Arc<AtomicU64>,
+        slot: CursorSlot,
+        negotiation: Arc<Mutex<Negotiation>>,
     ) -> Option<Self> {
-        // Connect here so the log below is the live set, not "starting…".
-        let mut displays = Vec::new();
-        rediscover(&mut displays, &targets, true);
-        let names: Vec<&str> = displays.iter().map(|d| d.name.as_str()).collect();
-        let feedback = displays.iter().any(|d| d.gs_visible.is_some());
-        if displays.is_empty() {
-            tracing::warn!(
-                "gamescope cursor: no usable nested Xwayland yet — retrying every {}s (a game's \
-                 Xwayland appears when it launches)",
-                REDISCOVER.as_secs()
-            );
-        } else {
-            tracing::info!(
-                displays = ?names,
-                cursor_feedback = feedback,
-                "gamescope cursor: XFixes source live — following the Xwayland gamescope draws the \
-                 pointer on (cursor_feedback=false ⇒ this gamescope publishes no \
-                 GAMESCOPE_CURSOR_VISIBLE_FEEDBACK, degrading to the pointer-motion heuristic)"
-            );
-        }
-
         let stop = Arc::new(AtomicBool::new(false));
         let stop_worker = Arc::clone(&stop);
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let join = std::thread::Builder::new()
             .name("pf-gs-cursor".into())
             .spawn(move || {
-                run(displays, slot, stop_worker, targets, frame_size);
+                // On this thread, not the caller's: an Xwayland that accepts and never
+                // answers holds the X handshake, which has no read timeout.
+                let mut displays = Vec::new();
+                rediscover(&mut displays, &targets, true);
+                log_live_set(&displays);
+                run(displays, slot, stop_worker, targets, negotiation);
                 let _ = done_tx.send(());
             })
             .ok()?;
@@ -136,6 +121,27 @@ impl Drop for XFixesCursorSource {
                 );
             }
         }
+    }
+}
+
+/// The first connect's result: the displays followed, or that none is usable yet.
+fn log_live_set(displays: &[XDisplay]) {
+    let names: Vec<&str> = displays.iter().map(|d| d.name.as_str()).collect();
+    let feedback = displays.iter().any(|d| d.gs_visible.is_some());
+    if displays.is_empty() {
+        tracing::warn!(
+            "gamescope cursor: no usable nested Xwayland yet — retrying every {}s (a game's \
+             Xwayland appears when it launches)",
+            REDISCOVER.as_secs()
+        );
+    } else {
+        tracing::info!(
+            displays = ?names,
+            cursor_feedback = feedback,
+            "gamescope cursor: XFixes source live — following the Xwayland gamescope draws the \
+             pointer on (cursor_feedback=false ⇒ this gamescope publishes no \
+             GAMESCOPE_CURSOR_VISIBLE_FEEDBACK, degrading to the pointer-motion heuristic)"
+        );
     }
 }
 
@@ -524,10 +530,10 @@ fn scale_to_frame((x, y): (i32, i32), root: (u16, u16), frame: (u32, u32)) -> (i
 
 fn run(
     mut displays: Vec<XDisplay>,
-    slot: Arc<Mutex<Option<CursorOverlay>>>,
+    slot: CursorSlot,
     stop: Arc<AtomicBool>,
     targets: GamescopeCursorTargets,
-    frame_size: Arc<AtomicU64>,
+    negotiation: Arc<Mutex<Negotiation>>,
 ) {
     let mut last_discover = std::time::Instant::now();
     let mut warned_scale = false;
@@ -603,10 +609,12 @@ fn run(
         // `None` would leave the last visible overlay standing on repeat frames.
         let d = &displays[active];
         let drawn = d.shape.visible && !hidden_by_gamescope;
-        // Negotiated size from PipeWire `param_changed`, packed `(w << 32) | h`;
-        // `0` = not negotiated yet.
-        let packed = frame_size.load(Ordering::Relaxed);
-        let frame = ((packed >> 32) as u32, packed as u32);
+        // The size PipeWire fixated; `(0, 0)` until it has.
+        let fixated = negotiation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fixated;
+        let frame = fixated.map_or((0, 0), |f| f.size);
         if !warned_scale
             && frame.0 != 0
             && (u32::from(d.root_size.0), u32::from(d.root_size.1)) != frame
@@ -630,7 +638,7 @@ fn run(
             drawn,
             &mut serial,
         );
-        if let Ok(mut s) = slot.lock() {
+        if let Ok(mut s) = slot.live.lock() {
             *s = overlay;
         }
 

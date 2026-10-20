@@ -1,18 +1,18 @@
 //! The per-tick data path: capture, submit, poll into the send thread, the encode-stall watch,
-//! the IDD pipeline-depth adaptation, and the pacing sleep. The drain after the loop is here too.
+//! the encode-cadence adaptation, and the pacing sleep. The drain after the loop is here too.
 
 use super::state::{Flow, StreamState, Tick};
 use super::*;
 use crate::encode_recovery::{
-    on_submit_error, reset_stalled_encoder, run_parked_stage, MAX_ENCODER_RESETS,
+    grab_frame, on_submit_error, reset_stalled_encoder, run_parked_stage, MAX_ENCODER_RESETS,
 };
 use crate::stats_recorder::DriverSample;
 
 // ~20 net behind-frames (≈0.3 s) escalates; warmup skips the first ~1 s of bring-up.
-const DEPTH_ESCALATE: u32 = 20;
-const DEPTH_BEHIND_CAP: u32 = 60;
-const DEPTH_WARMUP_FRAMES: u64 = 60;
-const DEPTH_DEGRADE: u32 = 10;
+const ESCALATE_BEHIND_SCORE: u32 = 20;
+const BEHIND_SCORE_CAP: u32 = 60;
+const CADENCE_WARMUP_FRAMES: u64 = 60;
+const DEGRADE_BEHIND_SCORE: u32 = 10;
 // ~5 s clean at 120 fps earns one wind-back. Backoff 1 → 5 → 25 min; never a permanent latch.
 const DEESCALATE_CLEAN_FRAMES: u32 = 600;
 pub(super) const DEESCALATE_BACKOFF_START: std::time::Duration = std::time::Duration::from_secs(60);
@@ -39,9 +39,8 @@ fn mark_recovery_boundary(ir_wave_pos: &mut u32, is_keyframe: bool, period: u32)
     }
 }
 
-/// Depth-1 by default: depth-2 holds a ready AU a whole interval unpolled (~13 ms extra at 60 fps).
-/// Escalate to the capturer's max only when cadence cannot hold at depth-1 (GPU contention).
-/// `PUNKTFUNK_IDD_ADAPTIVE=0` pins the capturer's full depth. Off when max depth is already 1.
+/// On by default. `PUNKTFUNK_IDD_ADAPTIVE=0` skips `adapt_to_cadence`: no cadence verdict for
+/// the ABR climb gate, and the encoder never escalates to pipelined retrieve.
 fn idd_adaptive_enabled() -> bool {
     crate::send_pacing::env_once!(
         bool,
@@ -165,8 +164,9 @@ impl SourceStamps {
 }
 
 impl StreamState {
-    /// Pull the newest frame, run any recovery rung the capturer's ladder chose, and on a
-    /// capture error rebuild ([`Self::on_capture_lost`]). `Ok(None)` ends the session cleanly.
+    /// Grab the newest frame ([`grab_frame`]), run any recovery rung the capturer's ladder
+    /// chose, and on a capture error rebuild ([`Self::on_capture_lost`]). `Ok(None)` ends the
+    /// session cleanly.
     pub(super) fn capture_tick(&mut self) -> Result<Option<Tick>> {
         let measure = self.perf || self.stats.is_armed();
         let t_cap = std::time::Instant::now();
@@ -175,8 +175,7 @@ impl StreamState {
             self.driver_dropped
                 .store(t.dropped_total, Ordering::Relaxed);
         }
-        self.capturer.observe_encoder(telemetry);
-        let cap_result = self.capturer.try_latest();
+        let cap_result = grab_frame(&mut *self.capturer, &mut self.asks, telemetry);
         let cap_us = if measure {
             t_cap.elapsed().as_micros() as u32
         } else {
@@ -187,6 +186,7 @@ impl StreamState {
         }
         run_parked_stage(
             &mut *self.capturer,
+            &mut self.asks,
             &mut *self.enc,
             &mut self.clock.watchdog,
             || self.clock.inflight.clear(),
@@ -314,19 +314,14 @@ impl StreamState {
         } = tick;
         let hdr_meta = self
             .capturer
-            .hdr_meta()
+            .colour()
+            .hdr_meta
             .map(|m| self.client_hdr.unwrap_or(m));
         self.enc.set_hdr_meta(hdr_meta);
         let mut resend_meta = hdr_meta != self.last_hdr_meta;
         if resend_meta {
             self.last_hdr_meta = hdr_meta;
         }
-        let max_depth = self.capturer.pipeline_depth().max(1);
-        let depth = if idd_adaptive_enabled() {
-            self.pipelining.cur_depth.clamp(1, max_depth)
-        } else {
-            max_depth
-        };
         let submit_ns = now_ns();
         // SyntheticCapturer counts from 0, not the epoch — fall back to "now".
         let age_ns = submit_ns.saturating_sub(self.frame.pts_ns);
@@ -346,15 +341,14 @@ impl StreamState {
             .au_seq
             .wrapping_add(self.clock.inflight.len() as u32);
         // A pixel-less frame's encoder (the Windows driver) already holds `owed` access units —
-        // waited for after a fresh frame, never on a repeat — and drains them at depth 1; every
-        // other backend takes this tick's frame.
+        // waited for after a fresh frame, never on a repeat; every other backend takes this
+        // tick's frame.
         let au_wait = if repeat {
             t_submit
         } else {
             t_submit + self.interval
         };
         let owed = crate::send_pacing::owed_aus(&self.frame, &mut *self.enc, au_wait);
-        let depth = if owed.is_some() { 1 } else { depth };
         // Every backend gets the floor, the pixel-less driver encoder too: without it the
         // driver's AMF/QSV/NVENC keep referencing frames the client never confirmed.
         let floor = self.loss_mode.floor(
@@ -385,7 +379,7 @@ impl StreamState {
         if self.perf {
             self.st_submit.push(submit_us);
         }
-        self.next = if frame_driven_enabled() && self.capturer.supports_arrival_wait() {
+        self.next = if frame_driven_enabled() && self.capturer.feed().is_some() {
             std::time::Instant::now() + self.interval
         } else {
             self.next + self.interval
@@ -404,7 +398,7 @@ impl StreamState {
         };
         let mut send_gone = false;
         let mut poll_err: Option<anyhow::Error> = None;
-        while self.clock.inflight.len() >= depth {
+        while !self.clock.inflight.is_empty() {
             if self.streamed_wire && self.enc.supports_chunked_poll() {
                 match self.poll_chunked(&stamps, &mut resend_meta) {
                     Polled::Au => continue,
@@ -440,12 +434,12 @@ impl StreamState {
             }
             return Ok(Flow::Break);
         }
-        self.check_encode_stall(depth, poll_err)?;
+        self.check_encode_stall(poll_err)?;
         Ok(Flow::Next)
     }
 
     /// Fold this poll's elapsed time into the tick's longest submit+poll chain —
-    /// the backend-neutral pressure input `adapt_depth` reads. Driver-owned AUs
+    /// the backend-neutral pressure input `adapt_to_cadence` reads. Driver-owned AUs
     /// carry no host submit, so they never count.
     fn note_encode_chain(&mut self, st: &Stamps, t_wait: std::time::Instant) {
         if st.owed {
@@ -644,11 +638,11 @@ impl StreamState {
 
     /// A poll failure, or owed frames with no AU for the stall window: rebuild the encoder in
     /// place, up to [`MAX_ENCODER_RESETS`] times.
-    fn check_encode_stall(&mut self, depth: usize, poll_err: Option<anyhow::Error>) -> Result<()> {
+    fn check_encode_stall(&mut self, poll_err: Option<anyhow::Error>) -> Result<()> {
         let stalled = self
             .clock
             .watchdog
-            .stalled(self.clock.inflight.len(), depth, self.interval);
+            .stalled(self.clock.inflight.len(), 1, self.interval);
         let why = match (&poll_err, stalled) {
             (Some(e), _) => format!("poll failed: {e:#}"),
             (None, Some(why)) => why,
@@ -666,32 +660,31 @@ impl StreamState {
         Ok(())
     }
 
-    /// IDD pipeline depth / pipelined-retrieve escalation on a sustained behind-cadence score,
-    /// wound back after a clean run with a growing backoff; pipelined retrieve is judged on a
-    /// full-budget chain (see [`encode_chain_pressure`]). Also publishes the cadence verdict
-    /// the ABR climb gate reads.
-    pub(super) fn adapt_depth(&mut self) {
+    /// Pipelined-retrieve escalation on a sustained behind-cadence score, wound back after a
+    /// clean run with a growing backoff; pipelined retrieve is judged on a full-budget chain
+    /// (see [`encode_chain_pressure`]). Also publishes the cadence verdict the ABR climb gate
+    /// reads.
+    pub(super) fn adapt_to_cadence(&mut self) {
         if !idd_adaptive_enabled() {
             return;
         }
         let p = &mut self.pipelining;
         p.depth_frames += 1;
-        if p.depth_frames <= DEPTH_WARMUP_FRAMES {
+        if p.depth_frames <= CADENCE_WARMUP_FRAMES {
             return;
         }
-        let max_depth = self.capturer.pipeline_depth().max(1);
         let budget = cadence_budget(self.interval, self.src_period_ns);
         let schedule_behind = std::time::Instant::now() >= self.next + (budget - self.interval);
         let encode_pressure =
             encode_chain_pressure(budget, self.encode_chain_ns, p.pipelined_active);
         let behind = schedule_behind || encode_pressure;
         p.behind_score = if behind {
-            (p.behind_score + 1).min(DEPTH_BEHIND_CAP)
+            (p.behind_score + 1).min(BEHIND_SCORE_CAP)
         } else {
             p.behind_score.saturating_sub(1)
         };
-        let escalated = p.cur_depth > 1 || p.pipelined_active || p.deescalating;
-        let degraded = encode_behind_cadence(escalated, p.behind_score, DEPTH_DEGRADE);
+        let escalated = p.pipelined_active || p.deescalating;
+        let degraded = encode_behind_cadence(escalated, p.behind_score, DEGRADE_BEHIND_SCORE);
         self.cadence_degraded.store(degraded, Ordering::Relaxed);
         self.cadence_behind_score
             .store(p.behind_score, Ordering::Relaxed);
@@ -742,27 +735,15 @@ impl StreamState {
                 p.depth_frames = 0;
                 p.ahead_run = 0;
             }
-        } else if p.behind_score >= DEPTH_ESCALATE && (p.cur_depth < max_depth || !p.pipeline_asked)
-        {
-            if p.cur_depth < max_depth {
-                p.cur_depth = max_depth;
+        } else if p.behind_score >= ESCALATE_BEHIND_SCORE && !p.pipeline_asked {
+            p.pipeline_asked = true;
+            p.pipelined_active = self.enc.set_pipelined(true);
+            if p.pipelined_active {
                 tracing::info!(
-                    depth = p.cur_depth,
-                    "IDD pipeline depth escalated — encode can't hold cadence at depth-1 \
-                     (GPU contention); pipelining until cadence holds clean (latency \
-                     trade for throughput)"
+                    "encoder pipelined retrieve escalated — encode can't hold cadence; \
+                     the encode wait moves off the loop until cadence holds clean \
+                     (latency trade for throughput)"
                 );
-            } else {
-                p.pipeline_asked = true;
-                p.pipelined_active = self.enc.set_pipelined(true);
-                if p.pipelined_active {
-                    tracing::info!(
-                        "encoder pipelined retrieve escalated — encode can't hold \
-                         cadence and the capturer has no depth to give; the encode wait \
-                         moves off the loop until cadence holds clean (latency trade \
-                         for throughput)"
-                    );
-                }
             }
             p.behind_score = 0;
             p.ahead_run = 0;
@@ -775,22 +756,11 @@ impl StreamState {
                 p.ahead_run = 0;
                 p.deescalate_not_before = Some(std::time::Instant::now() + p.deescalate_backoff);
                 p.deescalate_backoff = (p.deescalate_backoff * 5).min(DEESCALATE_BACKOFF_MAX);
-                if p.pipelined_active {
-                    tracing::info!(
-                        "cadence held clean while escalated — winding the pipelined \
-                         retrieve back (latency recovery; costs one IDR)"
-                    );
-                    p.deescalating = true;
-                } else if p.cur_depth > 1 {
-                    p.cur_depth = 1;
-                    tracing::info!(
-                        depth = p.cur_depth,
-                        "IDD pipeline depth de-escalated — cadence held clean at the \
-                         escalated depth (latency recovery)"
-                    );
-                    p.behind_score = 0;
-                    p.depth_frames = 0;
-                }
+                tracing::info!(
+                    "cadence held clean while escalated — winding the pipelined \
+                     retrieve back (latency recovery; costs one IDR)"
+                );
+                p.deescalating = true;
             }
         }
     }
