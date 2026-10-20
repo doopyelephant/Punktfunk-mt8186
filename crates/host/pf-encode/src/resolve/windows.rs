@@ -243,17 +243,3 @@ fn probe_codec_support(backend: WindowsBackend) -> CodecSupport {
     );
     caps
 }
-
-/// Whether one more encode session fits the hardware budget. Display admission
-/// declines rather than silently degrading a live sibling. NVENC is the only
-/// hard cap today. See `design/windows-parallel-virtual-displays.md`.
-pub fn can_open_another_session() -> bool {
-    #[cfg(feature = "nvenc")]
-    {
-        nvenc::can_open_another_session()
-    }
-    #[cfg(not(feature = "nvenc"))]
-    {
-        true
-    }
-}

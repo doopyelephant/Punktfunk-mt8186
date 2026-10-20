@@ -22,6 +22,7 @@ use super::vk_util::{
     imported_release_barrier, make_host_buffer, make_plain_image, make_view, normalize_cpu_rgb,
     pixel_to_vk, reject_dmabuf, ImportCache,
 };
+use crate::env_knobs::Knobs;
 use crate::rfi::{
     plan_frame, FramePlan, FrameRef, MidWave, Pending, Recovery, RecoveryPolicy, Wave,
 };
@@ -94,55 +95,6 @@ const RING_DEFAULT: usize = 2;
 const ENCODE_FENCE_TIMEOUT_NS: u64 = 5_000_000_000;
 /// AV1 base quantizer (0..=255). CBR overrides per frame; used as the seed and for constant-Q.
 const AV1_BASE_Q_IDX: u8 = 128;
-
-fn ring_depth() -> usize {
-    std::env::var("PUNKTFUNK_VULKAN_INFLIGHT")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .map(|n| n.clamp(2, 6))
-        .unwrap_or(RING_DEFAULT)
-}
-
-/// `PUNKTFUNK_VULKAN_QUALITY` (default 0), clamped to `maxQualityLevels` at open. Spec order is
-/// fastest→best. Without an explicit `ENCODE_QUALITY_LEVEL` control RADV never sends a VCN preset
-/// op, so the session always installs the resolved level on its first frame.
-fn quality_request() -> u32 {
-    std::env::var("PUNKTFUNK_VULKAN_QUALITY")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(0)
-}
-
-/// `PUNKTFUNK_VULKAN_RGB_DIRECT` for the RGB-direct encode source
-/// (`design/vulkan-rgb-direct-encode.md`). Captured RGB is the encode source; VCN EFC does the
-/// 709-narrow CSC inline. Default ON wherever the probe passes, except cursor-blend sessions
-/// (EFC cannot composite; see [`VulkanVideoEncoder::open`]). `=0` disables; `=1` forces on
-/// non-cursor sessions; unset = default. A cursor-blend session ignores `=1`.
-/// Unrecognised / empty / whitespace falls back to default — do not treat anything-but-`"0"`
-/// as force-on (a trailing space on `=0` would enable it).
-fn rgb_request() -> Option<bool> {
-    parse_rgb_request(std::env::var("PUNKTFUNK_VULKAN_RGB_DIRECT").ok().as_deref())
-}
-
-/// Pure half of [`rgb_request`]: the registry's boolean grammar, any case, without mutating
-/// the process environment (parallel tests cannot).
-fn parse_rgb_request(raw: Option<&str>) -> Option<bool> {
-    pf_host_config::registry::parse_bool(&raw?.trim().to_ascii_lowercase())
-}
-
-/// Unaligned RGB-direct true-extent (default ON; `PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT=0` restores
-/// padded-copy staging): import the visible-size capture with TRUE-SIZE source `codedExtent` so
-/// RADV derives nonzero VCN firmware padding (see [`RgbDirect::true_extent`]). EFC exists on
-/// Mesa ≥ 26, where `codedExtent`-driven `session_init` is guaranteed.
-fn rgb_true_extent_request() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_VULKAN_RGB_TRUE_EXTENT").unwrap_or(true)
-}
-
-/// `PUNKTFUNK_VULKAN_DIRECT_PLANES=0`: keep the scratch-plane copies even where the driver lists
-/// the picture format as a storage target (the A/B for a driver that lists it and misrenders).
-fn direct_planes_request() -> bool {
-    pf_host_config::env_on("PUNKTFUNK_VULKAN_DIRECT_PLANES").unwrap_or(true)
-}
 
 /// `VK_KHR_video_encode_intra_refresh` latched at open (see [`intra_refresh_caps`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -308,6 +260,7 @@ fn log_rgb_direct_source(
     rgb_probe: &Result<(u32, u32), &'static str>,
     want_rgb: bool,
     rgb_cfg: &Option<RgbDirect>,
+    rgb_request: Option<bool>,
 ) {
     tracing::info!(
         rgb_direct = match (rgb_probe, want_rgb, rgb_cfg) {
@@ -325,7 +278,7 @@ fn log_rgb_direct_source(
             (_, _, Some(RgbDirect { padded: true, .. })) =>
                 "active(padded-copy: mode is not 64x16-aligned — staging blit + edge \
                  duplication instead of the direct import)",
-            (Ok(_), false, None) => match rgb_request() {
+            (Ok(_), false, None) => match rgb_request {
                 Some(false) => "available(off: PUNKTFUNK_VULKAN_RGB_DIRECT=0)",
                 _ =>
                     "available(off: this session composites the pointer, which EFC \
@@ -1024,7 +977,7 @@ struct Frame {
 
 /// What a session opens for. [`VulkanVideoEncoder::open`] resolves it once and the session keeps
 /// it, so a reopen restates only what changes.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct OpenSpec {
     codec: Codec,
     /// Source size before alignment: AV1 render_size, the HEVC conformance window.
@@ -1050,6 +1003,8 @@ struct OpenSpec {
     is_hdr: bool,
     /// The captured format as the RGB-direct picture format.
     src_rgb_fmt: vk::Format,
+    /// The env knobs the session opened with.
+    knobs: Knobs,
 }
 
 pub struct VulkanVideoEncoder {
@@ -1124,8 +1079,8 @@ pub struct VulkanVideoEncoder {
     /// `VkVideoEncodeCapabilitiesKHR::maxBitrate`. Bounds `bitrate` at open and every retarget.
     /// 0 means "not filled in" — treated as unbounded.
     hw_max_bitrate: u64,
-    /// Resolved quality level ([`quality_request`]). First-frame `ENCODE_QUALITY_LEVEL` and
-    /// session-parameters must match.
+    /// Resolved quality level ([`Knobs::vulkan_quality`], clamped). First-frame
+    /// `ENCODE_QUALITY_LEVEL` and session-parameters must match.
     quality_level: u32,
     /// `PUNKTFUNK_PERF` timestamp period (ns). 0.0 = disabled or unsupported.
     ts_period_ns: f64,
@@ -1185,7 +1140,7 @@ impl VulkanVideoEncoder {
     /// Open a session. `cursor_blend` means the encoder may receive cursor bitmaps to composite.
     /// EFC cannot blend, so those sessions default to CSC; everywhere else RGB-direct is the
     /// default wherever the probe passes. `PUNKTFUNK_VULKAN_RGB_DIRECT` overrides both ways
-    /// (see [`rgb_request`]).
+    /// (see [`Knobs::vulkan_rgb_direct`]).
     pub fn open(
         codec: Codec,
         format: PixelFormat,
@@ -1200,6 +1155,7 @@ impl VulkanVideoEncoder {
         // The session's colour: BT.2020 PQ, else BT.709. Not read off `format`: gamescope's
         // P010 and packed 10-bit are SDR too.
         hdr: bool,
+        knobs: &Knobs,
     ) -> Result<Self> {
         // A producer's own planar picture: NV12 at eight bits, P010 at ten.
         let native_nv12 = matches!(format, PixelFormat::Nv12 | PixelFormat::P010);
@@ -1219,13 +1175,13 @@ impl VulkanVideoEncoder {
         let src_rgb_fmt = pixel_to_vk(format).unwrap_or(vk::Format::B8G8R8A8_UNORM);
         // Cursor-blend outranks an explicit RGB-direct pin: EFC cannot composite, and
         // negotiation promised the client a composited pointer.
-        if cursor_blend && rgb_request() == Some(true) {
+        if cursor_blend && knobs.vulkan_rgb_direct == Some(true) {
             tracing::info!(
                 "PUNKTFUNK_VULKAN_RGB_DIRECT=1 ignored for this session — it composites the \
                  pointer, which the EFC front-end cannot; using the compute-CSC path"
             );
         }
-        let want_rgb = !native_nv12 && !cursor_blend && rgb_request().unwrap_or(true);
+        let want_rgb = !native_nv12 && !cursor_blend && knobs.vulkan_rgb_direct.unwrap_or(true);
         let mut enc = Self::open_opts_inner(OpenSpec {
             codec,
             width,
@@ -1238,9 +1194,12 @@ impl VulkanVideoEncoder {
             ten_bit,
             is_hdr,
             src_rgb_fmt,
+            knobs: knobs.clone(),
         })?;
-        enc.cursor_switch =
-            cursor_blend && !native_nv12 && rgb_request() != Some(false) && enc.rgb_capable;
+        enc.cursor_switch = cursor_blend
+            && !native_nv12
+            && knobs.vulkan_rgb_direct != Some(false)
+            && enc.rgb_capable;
         Ok(enc)
     }
 
@@ -1321,7 +1280,7 @@ impl VulkanVideoEncoder {
         OpenSpec {
             want_rgb,
             bitrate: self.pending_bitrate.unwrap_or(self.bitrate),
-            ..self.spec
+            ..self.spec.clone()
         }
     }
 
@@ -1378,6 +1337,7 @@ impl VulkanVideoEncoder {
             } else {
                 vk::Format::B8G8R8A8_UNORM
             },
+            knobs: Knobs::from_env(),
         })
     }
 
@@ -1480,7 +1440,7 @@ impl VulkanVideoEncoder {
         };
         let rgb_cfg: Option<RgbDirect> = match (&rgb_probe, want_rgb) {
             (Ok((x, y)), true) => {
-                let true_extent = !aligned && rgb_true_extent_request();
+                let true_extent = !aligned && spec.knobs.vulkan_rgb_true_extent;
                 Some(RgbDirect {
                     x_offset: *x,
                     y_offset: *y,
@@ -1493,7 +1453,7 @@ impl VulkanVideoEncoder {
         if native_nv12 {
             log_native_nv12_source(native_fmt, (rw, rh), (w, h));
         } else {
-            log_rgb_direct_source(&rgb_probe, want_rgb, &rgb_cfg);
+            log_rgb_direct_source(&rgb_probe, want_rgb, &rgb_cfg, spec.knobs.vulkan_rgb_direct);
         }
 
         // Encode profile, from the same constructor every later image profile uses. A device
@@ -1518,7 +1478,13 @@ impl VulkanVideoEncoder {
             intra_refresh,
         } = query_encode_caps(&instance, &vq_inst, pd, &profile, av1, &dev_ext_props)?;
         // Spec: valid levels are 0..maxQualityLevels, ordered fastest→best (`maxQualityLevels >= 1`).
-        let quality_level = quality_request().min(max_quality_levels.saturating_sub(1));
+        // RADV sends a VCN preset op only under an explicit level control, so the session
+        // installs this level on its first frame.
+        let quality_level = spec
+            .knobs
+            .vulkan_quality
+            .unwrap_or(0)
+            .min(max_quality_levels.saturating_sub(1));
         tracing::info!(
             quality_level,
             max_quality_levels,
@@ -1526,7 +1492,7 @@ impl VulkanVideoEncoder {
         );
         let (rc_mode, vbv_ms, bitrate) = rc_plan(
             rate_control_modes,
-            std::env::var("PUNKTFUNK_VULKAN_RC").ok().as_deref(),
+            spec.knobs.vulkan_rc.as_deref(),
             fps,
             bitrate,
             hw_max_bitrate,
@@ -1716,7 +1682,7 @@ impl VulkanVideoEncoder {
         guard.sampler = sampler;
         let (csc_dsl, csc_layout, csc_pipe) =
             build_csc_pipeline(&device, &mut guard, ten_bit, is_hdr)?;
-        let nframes = ring_depth();
+        let nframes = spec.knobs.vulkan_inflight.unwrap_or(RING_DEFAULT);
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -1754,7 +1720,7 @@ impl VulkanVideoEncoder {
         // otherwise it writes scratch planes copied into the picture (two extra 4K copies).
         let csc = rgb_cfg.is_none() && !native_nv12;
         let direct_planes = csc
-            && direct_planes_request()
+            && spec.knobs.vulkan_direct_planes
             && probe_yuv_storage_planes(&vq_inst, pd, &profile, yuv_format(ten_bit));
         if csc {
             tracing::info!(

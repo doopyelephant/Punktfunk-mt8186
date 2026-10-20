@@ -25,6 +25,7 @@ use super::vk_util::{
     imported_release_barrier, make_host_buffer, make_plain_image, normalize_cpu_rgb, pixel_to_vk,
     reject_dmabuf, select_physical_device, ImportCache, ImportRejected,
 };
+use crate::env_knobs::Knobs;
 use crate::pyrowave_ffi::{packetize, pw_check};
 use crate::pyrowave_wire::{AuStream, FrameBudget};
 use crate::{EncodedFrame, Encoder, EncoderCaps};
@@ -696,7 +697,8 @@ impl PyroWaveEncoder {
 
     /// `bit_depth` is the negotiated stream depth (8 or 10); `hdr` marks a BT.2020 PQ
     /// session (HDR colour volume + `stamp_color_bits`). 10-bit without `hdr` is
-    /// 10-bit SDR — the CSC widens the 8-bit capture to BT.709 10-bit itself.
+    /// 10-bit SDR — the CSC widens the 8-bit capture to BT.709 10-bit itself. In-process, the
+    /// queue-priority intent is this process's own knob, and this process owns the inert warn.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         width: u32,
@@ -706,9 +708,8 @@ impl PyroWaveEncoder {
         chroma: crate::ChromaFormat,
         bit_depth: u8,
         hdr: bool,
+        knobs: &Knobs,
     ) -> Result<Self> {
-        // In-process path reads intent from its own environment and owns the inert warn.
-        let intent = std::env::var("PYROWAVE_QUEUE_PRIORITY").ok();
         Self::open_checked(
             width,
             height,
@@ -717,7 +718,7 @@ impl PyroWaveEncoder {
             chroma.is_444(),
             bit_depth,
             hdr,
-            intent.as_deref(),
+            knobs.queue_priority.as_deref(),
             true,
         )
     }

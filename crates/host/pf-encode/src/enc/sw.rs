@@ -12,6 +12,7 @@
 //! in the tests below.
 
 use super::{EncodedFrame, Encoder};
+use crate::env_knobs::Knobs;
 use anyhow::{bail, ensure, Context, Result};
 use openh264::encoder::{
     BitRate, Complexity, Encoder as Oh264, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
@@ -66,6 +67,7 @@ impl OpenH264Encoder {
         height: u32,
         fps: u32,
         bitrate_bps: u64,
+        knobs: &Knobs,
     ) -> Result<Self> {
         // `validate_dimensions` already passed (even, ≤ 4096). Refuse here, at
         // `open`, the 4096-wide modes this encoder cannot serve.
@@ -83,9 +85,12 @@ impl OpenH264Encoder {
             .rate_control_mode(RateControlMode::Bitrate)
             .bitrate(BitRate::from_bps(bps))
             .skip_frames(false)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(intra_period_frames(fps)))
+            .intra_frame_period(IntraFramePeriod::from_num_frames(intra_period_frames(
+                fps,
+                knobs.oh264_gop,
+            )))
             .sps_pps_strategy(SpsPpsStrategy::ConstantId) // SPS/PPS in-band on every IDR
-            .num_threads(num_threads())
+            .num_threads(knobs.oh264_threads.unwrap_or(2)) // latency over throughput
             .scene_change_detect(false) // no surprise IDRs (bitrate spikes / freeze)
             .adaptive_quantization(true)
             .complexity(Complexity::Low) // latency over BD-rate
@@ -254,23 +259,10 @@ impl Encoder for OpenH264Encoder {
     }
 }
 
-/// Rare automatic IDRs (recovery is `request_keyframe` / RFI). Env
-/// `PUNKTFUNK_OH264_GOP` overrides (0 = encoder-auto).
-fn intra_period_frames(fps: u32) -> u32 {
-    if let Ok(v) = std::env::var("PUNKTFUNK_OH264_GOP") {
-        if let Ok(n) = v.trim().parse::<u32>() {
-            return n;
-        }
-    }
-    fps.max(1).saturating_mul(600) // ~10 min between automatic IDRs
-}
-
-/// Encode threads. Env `PUNKTFUNK_OH264_THREADS` overrides; default 2 (latency over throughput).
-fn num_threads() -> u16 {
-    std::env::var("PUNKTFUNK_OH264_THREADS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-        .unwrap_or(2)
+/// Rare automatic IDRs (recovery is `request_keyframe` / RFI). `gop`
+/// (`PUNKTFUNK_OH264_GOP`) overrides (0 = encoder-auto).
+fn intra_period_frames(fps: u32, gop: Option<u32>) -> u32 {
+    gop.unwrap_or_else(|| fps.max(1).saturating_mul(600)) // ~10 min between automatic IDRs
 }
 
 #[cfg(test)]
@@ -304,7 +296,8 @@ mod tests {
     fn converts_flat_gray_to_neutral_planes() {
         let (w, h) = (16u32, 8u32);
         let mut enc =
-            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, 60, 1_000_000).expect("open openh264");
+            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, 60, 1_000_000, &Knobs::from_env())
+                .expect("open openh264");
         let bytes = vec![0x80u8; (w * h * 4) as usize];
         enc.convert_bt709(&bytes, 4, 2, 1, 0);
         // 16 + 128·(219/255) = 125.9 → 126.
@@ -321,7 +314,8 @@ mod tests {
     fn encodes_synthetic_frame_to_annexb_idr() {
         let (w, h, fps) = (1280u32, 720u32, 60u32);
         let mut enc =
-            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 8_000_000).expect("open openh264");
+            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 8_000_000, &Knobs::from_env())
+                .expect("open openh264");
         let frame = CapturedFrame {
             provenance: Default::default(),
             width: w,
@@ -458,7 +452,8 @@ mod tests {
     fn sps_signals_bt709_limited() {
         let (w, h, fps) = (1280u32, 720u32, 60u32);
         let mut enc =
-            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 8_000_000).expect("open openh264");
+            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 8_000_000, &Knobs::from_env())
+                .expect("open openh264");
         let frame = CapturedFrame {
             provenance: Default::default(),
             width: w,
@@ -483,7 +478,8 @@ mod tests {
     fn the_client_shows_each_picture_in_its_own_au() {
         let (w, h, fps) = (640u32, 480u32, 60u32);
         let mut enc =
-            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 2_000_000).expect("open openh264");
+            OpenH264Encoder::open(PixelFormat::Bgrx, w, h, fps, 2_000_000, &Knobs::from_env())
+                .expect("open openh264");
         let mut planner = pf_vaapi::H264Planner::new();
         for i in 0..20u64 {
             let frame = CapturedFrame {
@@ -528,7 +524,14 @@ mod tests {
     #[test]
     fn open_refuses_a_mode_openh264_cannot_encode() {
         // Match, not `expect_err`: `OpenH264Encoder` is not `Debug` (raw C handle).
-        let err = match OpenH264Encoder::open(PixelFormat::Bgra, 4096, 2160, 60, 20_000_000) {
+        let err = match OpenH264Encoder::open(
+            PixelFormat::Bgra,
+            4096,
+            2160,
+            60,
+            20_000_000,
+            &Knobs::from_env(),
+        ) {
             Ok(_) => panic!("4096x2160 exceeds openh264's long-edge ceiling and must be refused"),
             Err(e) => e,
         };

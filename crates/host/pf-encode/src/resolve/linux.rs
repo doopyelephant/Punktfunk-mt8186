@@ -3,6 +3,8 @@
 //! must agree with it.
 
 use super::*;
+use crate::env_knobs::Knobs;
+use pf_frame::PixelFormat;
 
 pub use crate::vk_util::anv_video_encode_flag;
 
@@ -108,6 +110,7 @@ fn open_video_backend_linux(
                 chroma,
                 bit_depth,
                 hdr,
+                &p.knobs,
             )
             .map(|e| (e, "pyrowave"));
         }
@@ -138,6 +141,7 @@ fn open_video_backend_linux(
                 p.cursor_blend,
                 bit_depth,
                 hdr,
+                &p.knobs,
             ) {
                 Ok(e) => {
                     tracing::info!(
@@ -165,6 +169,7 @@ fn open_video_backend_linux(
             bit_depth,
             chroma,
             hdr,
+            &p.knobs,
         )
         .map(|e| (Box::new(e) as Box<dyn Encoder>, "vaapi-native"))
     };
@@ -212,6 +217,7 @@ fn open_video_backend_linux(
                     ChromaFormat::Yuv420,
                     bit_depth,
                     hdr,
+                    &p.knobs,
                 )
                 .map(|e| (e, "pyrowave"))
             }
@@ -237,6 +243,7 @@ fn open_video_backend_linux(
                 height,
                 fps,
                 bitrate_bps.min(SW_BITRATE_CEIL),
+                &p.knobs,
             )
             .map(|e| (Box::new(e) as Box<dyn Encoder>, "software"))
         }
@@ -269,6 +276,7 @@ fn open_nvenc(p: &OpenParams) -> Result<Box<dyn Encoder>> {
             p.chroma,
             p.cursor_blend,
             p.slices,
+            &p.knobs,
         )?) as Box<dyn Encoder>)
     }
     #[cfg(not(feature = "nvenc"))]
@@ -279,14 +287,6 @@ fn open_nvenc(p: &OpenParams) -> Result<Box<dyn Encoder>> {
             p.codec.label()
         )
     }
-}
-
-/// Vulkan Video HEVC/AV1 on AMD/Intel. Default on.
-/// The `PUNKTFUNK_VULKAN_ENCODE` row off is the VAAPI hatch.
-/// A failed open falls back to VAAPI. See `design/linux-vulkan-video-encode.md`.
-#[cfg(feature = "vulkan-encode")]
-fn vulkan_encode_enabled() -> bool {
-    pf_host_config::row_bool("PUNKTFUNK_VULKAN_ENCODE")
 }
 
 /// Whether a native planar source can carry this depth and colour: 8-bit SDR is NV12, HDR is
@@ -323,7 +323,7 @@ pub fn linux_native_nv12_ok(
     match codec {
         Codec::H264 | Codec::H265 => true,
         #[cfg(feature = "vulkan-encode")]
-        Codec::Av1 => vulkan_encode_enabled() && vulkan_encode_available(codec),
+        Codec::Av1 => vulkan_row() && vulkan_encode_available(codec),
         _ => false,
     }
 }
@@ -389,7 +389,7 @@ pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool, hdr
             } else {
                 // An explicit Vulkan pref opens Vulkan at the negotiated depth.
                 matches!(codec, Codec::H265 | Codec::Av1)
-                    && vulkan_encode_enabled()
+                    && vulkan_row()
                     && vulkan_encode_available_at(codec, ten_bit)
             }
         }
@@ -418,7 +418,7 @@ fn amd_intel_vulkan_depth(codec: Codec, ten_bit: bool, _hdr: bool) -> Option<boo
 #[cfg(feature = "vulkan-encode")]
 fn amd_intel_opens_vulkan(codec: Codec, ten_bit: bool, hdr: bool) -> bool {
     amd_intel_vulkan_depth(codec, ten_bit, hdr)
-        .is_some_and(|ten| vulkan_encode_enabled() && vulkan_encode_available_at(codec, ten))
+        .is_some_and(|ten| vulkan_row() && vulkan_encode_available_at(codec, ten))
 }
 
 /// Dispatch-mirroring core of [`cursor_blend_capable`], device-free for tests.
@@ -574,7 +574,7 @@ fn linux_resolved_backend() -> LinuxBackend {
 /// Dmabuf modifiers PyroWave's Vulkan device imports for the capture fourcc.
 /// VAAPI LINEAR-only starves tiled Mutter+NVIDIA allocations.
 #[cfg(feature = "pyrowave")]
-pub fn pyrowave_capture_modifiers(fourcc: u32) -> Vec<u64> {
+pub(crate) fn pyrowave_capture_modifiers(fourcc: u32) -> Vec<u64> {
     pyrowave::capture_modifiers(fourcc)
 }
 
@@ -635,7 +635,7 @@ fn linux_zero_copy_is_vaapi_for(backend: LinuxBackend) -> bool {
 /// the direct backend opens on shared `cuda::context()` (device 0). Fail-open
 /// contract: see [`nvenc_cuda::probe_support`].
 #[cfg(feature = "nvenc")]
-pub fn nvenc_codec_support() -> CodecSupport {
+pub(crate) fn nvenc_codec_support() -> CodecSupport {
     use std::sync::OnceLock;
     static LOGGED: OnceLock<()> = OnceLock::new();
     let probed = nvenc_cuda::probe_support();
@@ -659,10 +659,9 @@ pub fn nvenc_codec_support() -> CodecSupport {
 /// Cached per selected GPU, like [`windows_codec_support`]: a console
 /// preference change moves the render node and the Vulkan device both probes
 /// open. The Vulkan encoding row keys it too: it applies at the next session.
-pub fn vaapi_codec_support() -> CodecSupport {
+pub(crate) fn vaapi_codec_support() -> CodecSupport {
     static CACHE: ProbeCache<(String, bool), CodecSupport> = OnceLock::new();
-    let vulkan = pf_host_config::row_bool("PUNKTFUNK_VULKAN_ENCODE");
-    let key = (pf_gpu::selection_key(), vulkan);
+    let key = (pf_gpu::selection_key(), vulkan_row());
     probe_cached(&CACHE, key, probe_vaapi_codec_support)
 }
 
@@ -673,7 +672,7 @@ fn probe_vaapi_codec_support() -> CodecSupport {
     let vulkan = |c| {
         #[cfg(feature = "vulkan-encode")]
         {
-            vulkan_encode_enabled() && vulkan_encode_available_at(c, false)
+            vulkan_row() && vulkan_encode_available_at(c, false)
         }
         #[cfg(not(feature = "vulkan-encode"))]
         {
@@ -770,7 +769,7 @@ fn narrow_to_openable(backend: LinuxBackend, probed: Option<CodecSupport>) -> Co
 /// gates route here; the probe is cached per (GPU, codec).
 #[cfg(feature = "vulkan-encode")]
 fn vulkan_10bit_available(codec: Codec) -> bool {
-    vulkan_encode_enabled() && vulkan_encode_available_at(codec, true)
+    vulkan_row() && vulkan_encode_available_at(codec, true)
 }
 #[cfg(not(feature = "vulkan-encode"))]
 fn vulkan_10bit_available(_codec: Codec) -> bool {
@@ -804,7 +803,7 @@ pub(crate) fn sdr10(codec: Codec) -> bool {
 /// [`open_video`] resolves a backend from `PUNKTFUNK_ENCODER`, which the host reads **once** and
 /// latches — so a caller that decides later cannot steer it, and `auto` never picks software
 /// anyway. The browser plane is exactly that caller: it serves a GPU-less host and wants this
-/// encoder specifically, not whatever the ladder would have chosen.
+/// encoder specifically. Like [`open_video`], it reads the env knobs once per open.
 pub fn open_software_h264(
     format: PixelFormat,
     width: u32,
@@ -812,8 +811,15 @@ pub fn open_software_h264(
     fps: u32,
     bitrate_bps: u64,
 ) -> Result<Box<dyn Encoder>> {
-    sw::OpenH264Encoder::open(format, width, height, fps, bitrate_bps.min(SW_BITRATE_CEIL))
-        .map(|e| Box::new(e) as Box<dyn Encoder>)
+    sw::OpenH264Encoder::open(
+        format,
+        width,
+        height,
+        fps,
+        bitrate_bps.min(SW_BITRATE_CEIL),
+        &Knobs::from_env(),
+    )
+    .map(|e| Box::new(e) as Box<dyn Encoder>)
 }
 
 #[cfg(test)]
@@ -960,6 +966,7 @@ mod tests {
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
             slices: 4,
+            knobs: Knobs::from_env(),
         };
         let (enc, label) =
             open_video_backend_linux("software", &sw).expect("software arm must open GPU-free");
@@ -995,6 +1002,7 @@ mod tests {
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
             slices: 4,
+            knobs: Knobs::from_env(),
         };
         match open_video_backend_linux("vulkan", &hevc) {
             Ok((_, label)) => assert!(matches!(label, "vulkan" | "vaapi-native"), "{label}"),
@@ -1022,6 +1030,7 @@ mod tests {
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
             slices: 4,
+            knobs: Knobs::from_env(),
         };
         let (enc, backend) = open_video_backend_linux("auto", &p).expect("open");
         assert_eq!(backend, "vaapi-native");

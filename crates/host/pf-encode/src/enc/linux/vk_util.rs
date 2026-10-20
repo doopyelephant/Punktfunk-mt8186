@@ -27,7 +27,8 @@ pub fn anv_video_encode_flag() -> Option<String> {
     if !cfg!(feature = "vulkan-encode") {
         return None;
     }
-    let value = with_token(std::env::var("ANV_DEBUG").ok().as_deref(), "video-encode")?;
+    let current = crate::env_knobs::Knobs::anv_debug();
+    let value = with_token(current.as_deref(), "video-encode")?;
     ANV_ENCODE_OURS.store(true, std::sync::atomic::Ordering::Relaxed);
     Some(value)
 }
