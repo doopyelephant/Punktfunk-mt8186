@@ -146,7 +146,8 @@ mod tests {
 
     #[test]
     fn import_table() {
-        // A failed `fstat` keys the import per frame; the slot's own key is `None` then.
+        // A failed `fstat` keys the import per frame. The slot stores that same sentinel as its
+        // key, so the in-flight rule protects the import.
         let (s1, s2, s3) = ((u64::MAX, 1), (u64::MAX, 2), (u64::MAX, 3));
         let rows: Vec<Row> = vec![
             (

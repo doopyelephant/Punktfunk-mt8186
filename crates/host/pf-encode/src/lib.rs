@@ -1,15 +1,22 @@
-//! Hardware video encode. Binds the vendor SDKs; never rewrites codecs.
-//! Low-latency preset, B-frames off.
+//! Video encode behind one [`Encoder`] trait, opened by [`open_video`]. Pin a backend with
+//! `PUNKTFUNK_ENCODER`. The Windows backends are `pf-encode-win`'s, re-exported here. Capture to
+//! encode is one-way: this crate never depends on capture.
 //!
-//! One [`Encoder`] trait, selected in [`open_video`]. Per-GPU backends: NVENC
-//! (NVIDIA; GPU RGB→YUV, no host CSC), VAAPI (AMD/Intel; CPU RGB→NV12 or
-//! dmabuf into a VA surface), plus optional Vulkan Video, direct-SDK NVENC,
-//! AMF, QSV, PyroWave, and software openh264.
+//! - `open`: `open_video`, `OpenParams`, `TrackedEncoder`.
+//! - `resolve` and its `resolve/{linux,windows}` arms: `ResolveInputs`, `Resolved`, `resolve()`.
+//! - `env_knobs`: `Knobs`, every environment read. `cursor_cache`: when a bitmap uploads again.
+//! - `cpu_ingest`: the stage every CPU frame passes. `enc/sw`: openh264.
+//! - `enc/linux/nvenc_cuda` (shell), `nvenc_lane` (the lane, blend and retrieve model).
+//! - `enc/linux/vulkan_video` (shell), `vk_ring` (ring model), `vk_record` (per-frame stages),
+//!   `vk_build` (open builders), `vk_util` (device pick, `ImportCache`), `vk_import` (its policy),
+//!   `vk_csc` (CSC and cursor plane), `vk_reframe` (crop and scale), and the vendored
+//!   `vk_av1_encode`, `vk_valve_rgb`, `vk_intra_refresh`.
+//! - `enc/linux/pyrowave` (shell), `pyrowave_open` (open plan), `pyrowave_remote` (host half),
+//!   `worker` (the `punktfunk-encode-worker` half). `enc/linux/vaapi_native`: native VAAPI.
 //!
-//! Capture→encode is one-way: this crate depends on `pf-frame` and
-//! `pf-zerocopy`, never on capture. Pin with `PUNKTFUNK_ENCODER`.
-//! Evidence: `design/linux-direct-nvenc.md`, `design/linux-vulkan-video-encode.md`,
-//! `design/native-amf-encoder.md`, `design/native-qsv-encoder.md`.
+//! Model and shell: enum state, pure `step`, fix-named table rows; a model builds on every target.
+//! Resolve once: `resolve()` per host entry, `open_video(&Resolved, ..)`; ADR 0002 in `docs/adr/`.
+//! Knobs once: `env_knobs.rs` is the only environment reader.
 
 // The `Encoder` contract and the pieces every backend shares, plus the Windows
 // backends, which re-export the same contract. One namespace: `pf_encode::*`.
