@@ -210,12 +210,12 @@ impl Presenter {
         };
         // View + framebuffer always: Vulkan Video needs the CSC pass on every device.
         let attachments = [view];
-        // SAFETY: `device` is live; `view`/`csc.render_pass` are owned here;
+        // SAFETY: `device` is live; `view`/`csc.pass.render_pass` are owned here;
         // create-info is a local that outlives the call.
         let framebuffer = unsafe {
             self.device.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
-                    .render_pass(self.csc.render_pass)
+                    .render_pass(self.csc.pass.render_pass)
                     .attachments(&attachments)
                     .width(width)
                     .height(height)

@@ -1,8 +1,39 @@
-//! Low-level GPU helpers: memory allocation, decode-image barriers, geometry.
+//! Low-level GPU helpers: memory allocation, the pass objects, decode-image barriers, geometry.
 
 use super::Presenter;
 use anyhow::{Context as _, Result};
 use ash::vk;
+
+/// What a fullscreen-triangle pass owns and frees: its render pass, pipeline and layouts, the
+/// pool its sets come from, the immutable sampler. A pass with more (a second pipeline, its
+/// sets, an intermediate image) keeps that beside its `Pass`.
+#[derive(Default)]
+pub(crate) struct Pass {
+    pub(crate) render_pass: vk::RenderPass,
+    pub(crate) pipeline: vk::Pipeline,
+    pub(crate) pipeline_layout: vk::PipelineLayout,
+    pub(crate) set_layout: vk::DescriptorSetLayout,
+    pub(crate) desc_pool: vk::DescriptorPool,
+    pub(crate) sampler: vk::Sampler,
+}
+
+impl Pass {
+    /// Only once the GPU is done with every command buffer that recorded the pass. Null
+    /// handles are skipped, so a part-built pass unwinds here; every handle is null after.
+    pub(crate) fn destroy(&mut self, device: &ash::Device) {
+        let p = std::mem::take(self);
+        // SAFETY: DESTROY per the crate contract: the caller's GPU-idle proof covers these.
+        // The pool frees the sets allocated from it.
+        unsafe {
+            device.destroy_pipeline(p.pipeline, None);
+            device.destroy_pipeline_layout(p.pipeline_layout, None);
+            device.destroy_descriptor_pool(p.desc_pool, None);
+            device.destroy_descriptor_set_layout(p.set_layout, None);
+            device.destroy_sampler(p.sampler, None);
+            device.destroy_render_pass(p.render_pass, None);
+        }
+    }
+}
 
 impl Presenter {
     /// Wait our in-flight fence, not `vkDeviceWaitIdle`. The pump thread submits

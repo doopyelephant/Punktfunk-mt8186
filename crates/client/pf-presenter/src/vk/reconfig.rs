@@ -432,8 +432,8 @@ impl Presenter {
         let new_direct = match crate::csc::DirectPass::new(
             &self.device,
             target.format,
-            self.csc.pipeline_layout,
-            self.csc_planar.pipeline_layout,
+            self.csc.pass.pipeline_layout,
+            self.csc_planar.pass.pipeline_layout,
         ) {
             Ok(d) => d,
             Err(e) => {

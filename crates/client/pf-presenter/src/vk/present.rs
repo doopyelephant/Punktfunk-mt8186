@@ -1115,7 +1115,7 @@ impl Presenter {
             self.device.cmd_begin_render_pass(
                 self.cmd_buf,
                 &vk::RenderPassBeginInfo::default()
-                    .render_pass(self.overlay_pipe.render_pass)
+                    .render_pass(self.overlay_pipe.pass.render_pass)
                     .framebuffer(self.targets.overlay.framebuffers[index])
                     .render_area(full),
                 vk::SubpassContents::INLINE,
@@ -1123,7 +1123,7 @@ impl Presenter {
             self.device.cmd_bind_pipeline(
                 self.cmd_buf,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.overlay_pipe.pipeline,
+                self.overlay_pipe.pass.pipeline,
             );
             self.device.cmd_set_viewport(
                 self.cmd_buf,
@@ -1141,7 +1141,7 @@ impl Presenter {
             self.device.cmd_bind_descriptor_sets(
                 self.cmd_buf,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.overlay_pipe.pipeline_layout,
+                self.overlay_pipe.pass.pipeline_layout,
                 0,
                 &[self.overlay_pipe.desc_set],
                 &[],
@@ -1532,7 +1532,7 @@ impl Presenter {
         depth: u8,
         msb_packed: bool,
     ) {
-        let pass = if planar { &self.csc_planar } else { &self.csc };
+        let csc = if planar { &self.csc_planar } else { &self.csc };
         let full = |extent: vk::Extent2D| vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent,
@@ -1542,8 +1542,8 @@ impl Presenter {
                 framebuffer,
                 extent,
             } => (
-                pass.render_pass,
-                pass.pipeline,
+                csc.pass.render_pass,
+                csc.pass.pipeline,
                 framebuffer,
                 full(extent),
                 full(extent),
@@ -1604,9 +1604,9 @@ impl Presenter {
             self.device.cmd_bind_descriptor_sets(
                 self.cmd_buf,
                 vk::PipelineBindPoint::GRAPHICS,
-                pass.pipeline_layout,
+                csc.pass.pipeline_layout,
                 0,
-                &[pass.desc_set],
+                &[csc.desc_set],
                 &[],
             );
             let rows = csc_rows(color, depth, msb_packed);
@@ -1627,7 +1627,7 @@ impl Presenter {
             let bytes = words.as_flattened();
             self.device.cmd_push_constants(
                 self.cmd_buf,
-                pass.pipeline_layout,
+                csc.pass.pipeline_layout,
                 vk::ShaderStageFlags::FRAGMENT,
                 0,
                 bytes,

@@ -190,13 +190,8 @@ enum DirectSrc {
 /// Recorded only when an overlay frame arrives.
 #[derive(Default)]
 struct OverlayPipe {
-    render_pass: vk::RenderPass,
-    set_layout: vk::DescriptorSetLayout,
-    pipeline_layout: vk::PipelineLayout,
-    pipeline: vk::Pipeline,
-    desc_pool: vk::DescriptorPool,
+    pass: gpu::Pass,
     desc_set: vk::DescriptorSet,
-    sampler: vk::Sampler,
 }
 
 /// Three R8 images the CPU I420 is uploaded into. Owned here, not in `Retired`: nothing

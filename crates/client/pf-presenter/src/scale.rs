@@ -7,7 +7,7 @@
 //! here: a NEAREST blit is exact and costs nothing extra.
 
 use crate::csc::{build_fullscreen_pipeline, color_pass, fill_or_destroy};
-use crate::vk::gpu::image_with_memory;
+use crate::vk::gpu::{image_with_memory, Pass};
 use anyhow::{Context as _, Result};
 use ash::vk;
 use punktfunk_core::video_fit::{Kernel, Placement};
@@ -68,16 +68,12 @@ impl Mid {
 
 #[derive(Default)]
 pub struct ScalePass {
-    set_layout: vk::DescriptorSetLayout,
-    pipeline_layout: vk::PipelineLayout,
-    sampler: vk::Sampler,
-    desc_pool: vk::DescriptorPool,
+    /// The output pass into the swapchain image; its layouts serve the mid pass too.
+    pass: Pass,
     set_src: vk::DescriptorSet,
     set_mid: vk::DescriptorSet,
     mid_pass: vk::RenderPass,
     mid_pipeline: vk::Pipeline,
-    out_pass: vk::RenderPass,
-    out_pipeline: vk::Pipeline,
     mid: Option<Mid>,
 }
 
@@ -100,12 +96,12 @@ impl ScalePass {
     /// overlay's per-image framebuffers serve it. A failed step destroys what was made.
     pub fn new(device: &ash::Device, out_format: vk::Format) -> Result<ScalePass> {
         let fill = |p: &mut ScalePass| p.fill(device, out_format);
-        fill_or_destroy(device, fill, |p, d| p.destroy(d))
+        fill_or_destroy(device, fill, Self::destroy)
     }
 
     fn fill(&mut self, device: &ash::Device, out_format: vk::Format) -> Result<()> {
         // SAFETY: CREATE per the crate contract.
-        self.sampler = unsafe {
+        self.pass.sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::NEAREST)
@@ -115,7 +111,7 @@ impl ScalePass {
                 None,
             )
         }?;
-        let samplers = [self.sampler];
+        let samplers = [self.pass.sampler];
         let bindings = [vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -123,18 +119,18 @@ impl ScalePass {
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .immutable_samplers(&samplers)];
         // SAFETY: CREATE per the crate contract.
-        self.set_layout = unsafe {
+        self.pass.set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                 None,
             )
         }?;
-        let set_layouts = [self.set_layout];
+        let set_layouts = [self.pass.set_layout];
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .size(std::mem::size_of::<Params>() as u32)];
         // SAFETY: CREATE per the crate contract.
-        self.pipeline_layout = unsafe {
+        self.pass.pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&set_layouts)
@@ -146,7 +142,7 @@ impl ScalePass {
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(2)];
         // SAFETY: CREATE per the crate contract.
-        self.desc_pool = unsafe {
+        self.pass.desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(2)
@@ -154,12 +150,12 @@ impl ScalePass {
                 None,
             )
         }?;
-        let two_layouts = [self.set_layout, self.set_layout];
+        let two_layouts = [self.pass.set_layout; 2];
         // SAFETY: ALLOCATE per the crate contract; the pool holds two sets.
         let sets = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(self.desc_pool)
+                    .descriptor_pool(self.pass.desc_pool)
                     .set_layouts(&two_layouts),
             )
         }?;
@@ -172,7 +168,7 @@ impl ScalePass {
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         )?;
-        self.out_pass = color_pass(
+        self.pass.render_pass = color_pass(
             device,
             out_format,
             vk::AttachmentLoadOp::CLEAR,
@@ -180,10 +176,10 @@ impl ScalePass {
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         )?;
         let frag = pf_client_core::video_csc_spv::SCALE_FRAG;
-        self.mid_pipeline =
-            build_fullscreen_pipeline(device, self.mid_pass, self.pipeline_layout, frag, false)?;
-        self.out_pipeline =
-            build_fullscreen_pipeline(device, self.out_pass, self.pipeline_layout, frag, false)?;
+        let layout = self.pass.pipeline_layout;
+        self.mid_pipeline = build_fullscreen_pipeline(device, self.mid_pass, layout, frag, false)?;
+        self.pass.pipeline =
+            build_fullscreen_pipeline(device, self.pass.render_pass, layout, frag, false)?;
         Ok(())
     }
 
@@ -327,7 +323,7 @@ impl ScalePass {
             self.draw(
                 device,
                 cmd,
-                (self.out_pass, self.out_pipeline, target),
+                (self.pass.render_pass, self.pass.pipeline, target),
                 full,
                 dst,
                 self.set_mid,
@@ -386,14 +382,14 @@ impl ScalePass {
             device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
+                self.pass.pipeline_layout,
                 0,
                 &[set],
                 &[],
             );
             device.cmd_push_constants(
                 cmd,
-                self.pipeline_layout,
+                self.pass.pipeline_layout,
                 vk::ShaderStageFlags::FRAGMENT,
                 0,
                 words.as_flattened(),
@@ -472,15 +468,10 @@ impl ScalePass {
         self.destroy_mid(device);
         // SAFETY: DESTROY — the caller's GPU-idle proof covers these.
         unsafe {
-            device.destroy_pipeline(self.out_pipeline, None);
             device.destroy_pipeline(self.mid_pipeline, None);
-            device.destroy_render_pass(self.out_pass, None);
             device.destroy_render_pass(self.mid_pass, None);
-            device.destroy_pipeline_layout(self.pipeline_layout, None);
-            device.destroy_descriptor_pool(self.desc_pool, None);
-            device.destroy_descriptor_set_layout(self.set_layout, None);
-            device.destroy_sampler(self.sampler, None);
         }
+        self.pass.destroy(device);
     }
 }
 
@@ -842,7 +833,7 @@ mod tests {
                     d.unmap_memory(up_mem);
                     let fb = d.create_framebuffer(
                         &vk::FramebufferCreateInfo::default()
-                            .render_pass(scale.out_pass)
+                            .render_pass(scale.pass.render_pass)
                             .attachments(&[dst_view])
                             .width(view.0)
                             .height(view.1)

@@ -6,6 +6,7 @@
 //! and range handling varies by driver. Coefficients live in
 //! `pf_client_core::video::csc_rows` (shared with D3D11 and the Apple port).
 
+use crate::vk::gpu::Pass;
 use anyhow::{Context as _, Result};
 use ash::vk;
 
@@ -15,13 +16,8 @@ pub use pf_client_core::video::csc_rows;
 /// image). No device handle is stored; [`CscPass::destroy`] runs from the presenter's `Drop`.
 #[derive(Default)]
 pub struct CscPass {
-    pub render_pass: vk::RenderPass,
-    pub set_layout: vk::DescriptorSetLayout,
-    pub pipeline_layout: vk::PipelineLayout,
-    pub pipeline: vk::Pipeline,
-    pub desc_pool: vk::DescriptorPool,
+    pub pass: Pass,
     pub desc_set: vk::DescriptorSet,
-    pub sampler: vk::Sampler,
 }
 
 impl CscPass {
@@ -56,7 +52,7 @@ impl CscPass {
         frag_spv: &[u8],
     ) -> Result<CscPass> {
         let fill = |p: &mut CscPass| p.fill(device, attachment_format, plane_bindings, frag_spv);
-        fill_or_destroy(device, fill, |p, d| p.destroy(d))
+        fill_or_destroy(device, fill, Self::destroy)
     }
 
     fn fill(
@@ -99,7 +95,7 @@ impl CscPass {
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
         ];
         // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
-        self.render_pass = unsafe {
+        self.pass.render_pass = unsafe {
             device.create_render_pass(
                 &vk::RenderPassCreateInfo::default()
                     .attachments(&attachment)
@@ -111,7 +107,7 @@ impl CscPass {
         .context("CSC render pass")?;
 
         // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
-        self.sampler = unsafe {
+        self.pass.sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
                     .mag_filter(vk::Filter::LINEAR)
@@ -123,7 +119,7 @@ impl CscPass {
             )
         }?;
 
-        let samplers = [self.sampler];
+        let samplers = [self.pass.sampler];
         let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..plane_bindings)
             .map(|b| {
                 vk::DescriptorSetLayoutBinding::default()
@@ -135,18 +131,18 @@ impl CscPass {
             })
             .collect();
         // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
-        self.set_layout = unsafe {
+        self.pass.set_layout = unsafe {
             device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
                 None,
             )
         }?;
-        let set_layouts = [self.set_layout];
+        let set_layouts = [self.pass.set_layout];
         let push = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .size(64)]; // three vec4 rows + a params vec4 (mode, tonemap peak)
                         // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
-        self.pipeline_layout = unsafe {
+        self.pass.pipeline_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
                     .set_layouts(&set_layouts)
@@ -159,7 +155,7 @@ impl CscPass {
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(plane_bindings)];
         // SAFETY: handles owned by this type live for the call; builder structs are locals that outlive it.
-        self.desc_pool = unsafe {
+        self.pass.desc_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .max_sets(1)
@@ -171,15 +167,15 @@ impl CscPass {
         self.desc_set = unsafe {
             device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(self.desc_pool)
+                    .descriptor_pool(self.pass.desc_pool)
                     .set_layouts(&set_layouts),
             )
         }?[0];
 
-        self.pipeline = build_fullscreen_pipeline(
+        self.pass.pipeline = build_fullscreen_pipeline(
             device,
-            self.render_pass,
-            self.pipeline_layout,
+            self.pass.render_pass,
+            self.pass.pipeline_layout,
             frag_spv,
             false, // opaque: CSC output is the video
         )?;
@@ -238,17 +234,9 @@ impl CscPass {
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 
-    pub fn destroy(&self, device: &ash::Device) {
-        // SAFETY: this type owns these objects; the GPU is idle for them
-        // (fence/queue-wait on this path, or the swapchain retired).
-        unsafe {
-            device.destroy_pipeline(self.pipeline, None);
-            device.destroy_pipeline_layout(self.pipeline_layout, None);
-            device.destroy_descriptor_pool(self.desc_pool, None);
-            device.destroy_descriptor_set_layout(self.set_layout, None);
-            device.destroy_sampler(self.sampler, None);
-            device.destroy_render_pass(self.render_pass, None);
-        }
+    /// [`Pass::destroy`]: the set goes with the pool.
+    pub fn destroy(&mut self, device: &ash::Device) {
+        self.pass.destroy(device);
     }
 }
 
