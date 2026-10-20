@@ -831,33 +831,22 @@ mod tests {
         }
     }
 
-    /// A synthetic source lit HDR.
-    struct Lit(crate::capture::SyntheticCapturer);
-
-    impl crate::capture::Capturer for Lit {
-        fn next_frame(
-            &mut self,
-            budget: pf_capture::FirstFrame,
-        ) -> Result<crate::capture::CapturedFrame> {
-            self.0.next_frame(budget)
-        }
-        fn colour(&self) -> pf_capture::ColourFacts {
-            pf_capture::ColourFacts {
-                hdr_meta: Some(pf_frame::hdr::generic_hdr10()),
-                sdr_fp16: false,
-            }
-        }
-    }
-
     /// Native opens a 4:4:4 HDR session at its own depth and a rate per encoded size;
     /// GameStream a 4:2:0 one at the client's slice count, the frame's depth and one rate.
     /// Over a source gone SDR the HDR session opens 8-bit SDR.
     #[test]
     fn both_loops_open_the_encoder_their_plan_names() {
-        let mut cap = Lit(crate::capture::SyntheticCapturer::new(64, 32, 60));
-        let frame = cap
+        let frame = crate::capture::SyntheticCapturer::new(64, 32, 60)
             .next_frame(pf_capture::FirstFrame::Default)
             .expect("a synthetic frame");
+        // A source lit HDR.
+        let cap = pf_capture::FakeCapturer {
+            colour: pf_capture::ColourFacts {
+                hdr_meta: Some(pf_frame::hdr::generic_hdr10()),
+                sdr_fp16: false,
+            },
+            ..Default::default()
+        };
         let want =
             |plan: &crate::session_plan::SessionPlan, hz, bitrate_bps, bit_depth| VideoOpen {
                 codec: plan.codec,

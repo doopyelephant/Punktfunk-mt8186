@@ -13,10 +13,14 @@
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
 
 mod capturer;
+#[cfg(any(test, feature = "test-support"))]
+mod fake;
 mod knobs;
 mod open;
 mod synthetic;
 pub use capturer::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use fake::{FakeCapturer, FakeCursor, FakeFeed, FakeSupervised};
 #[cfg(target_os = "linux")]
 pub use knobs::direct_capture;
 pub use open::*;

@@ -90,5 +90,9 @@ windows = { version = "0.62", features = [
 # The driver proxy's method guard is a pf-encode-core test helper.
 pf-encode-core = { path = "../pf-encode-core", features = ["test-support"] }
 
+[features]
+# `FakeCapturer`, the scripted source the host's stream-loop tests drive. Never in a shipped build.
+test-support = []
+
 [lints]
 workspace = true

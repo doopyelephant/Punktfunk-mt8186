@@ -214,6 +214,8 @@ h2 = "0.4"
 tempfile = "3"
 # The C ABI, driven from Rust by the native plane's connection round-trip tests (native.rs).
 punktfunk-ffi = { path = "../../client/punktfunk-ffi", features = ["quic"] }
+# The scripted `FakeCapturer` the stream-loop tests drive.
+pf-capture = { path = "../pf-capture", features = ["test-support"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # A bus-less connection pair for the seat's session switch test (`seats/session_switch.rs`).
