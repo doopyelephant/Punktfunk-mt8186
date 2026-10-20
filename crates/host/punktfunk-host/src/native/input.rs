@@ -892,9 +892,15 @@ impl WirePads {
         Some(idx)
     }
 
-    /// A newer snapshot replaces the pad. An unchanged refresh (~100 ms) advances the
-    /// gate but returns `None`: re-emitting it churns the XInput packet number.
-    fn snapshot(&mut self, snap: punktfunk_core::input::GamepadSnapshot) -> Option<usize> {
+    /// A newer snapshot replaces the pad. An unchanged refresh (~100 ms) of a `built` pad
+    /// advances the gate but returns `None`: re-emitting it churns the XInput packet number.
+    /// A pad with no device yet (its arrival, identity or slot still owed) gets every refresh,
+    /// so its build is retried without waiting for the player to move it.
+    fn snapshot(
+        &mut self,
+        snap: punktfunk_core::input::GamepadSnapshot,
+        built: bool,
+    ) -> Option<usize> {
         let idx = snap.pad as usize;
         if idx >= MAX_WIRE_PADS
             || !punktfunk_core::input::GamepadSnapshot::seq_newer(snap.seq, self.seq[idx])
@@ -907,7 +913,7 @@ impl WirePads {
             seq: 0,
             ..snap
         };
-        if self.mask & (1 << idx) != 0 && self.state[idx] == state {
+        if built && self.mask & (1 << idx) != 0 && self.state[idx] == state {
             return None;
         }
         self.state[idx] = state;
@@ -1257,7 +1263,11 @@ pub(super) fn input_thread(
                                      sent none"
                                 );
                             }
-                            if let Some(idx) = wire.snapshot(snap) {
+                            let built = pads
+                                .owner
+                                .get(snap.pad as usize)
+                                .is_some_and(Option::is_some);
+                            if let Some(idx) = wire.snapshot(snap, built) {
                                 pad_uplink.note_change(idx);
                                 pads.apply_wire(&wire, idx, &pad_feed);
                             }
@@ -1665,7 +1675,7 @@ mod tests {
             ls_y: -100,
             ..Default::default()
         };
-        assert_eq!(wire.snapshot(snap), Some(1));
+        assert_eq!(wire.snapshot(snap, true), Some(1));
         let f = wire.frame(1);
         assert_eq!(
             (f.index, f.buttons, f.left_trigger),
@@ -1678,11 +1688,21 @@ mod tests {
             left_trigger: 10,
             ..snap
         };
-        assert_eq!(wire.snapshot(stale), None, "a reorder rolled state back");
+        assert_eq!(
+            wire.snapshot(stale, true),
+            None,
+            "a reorder rolled state back"
+        );
         assert_eq!(wire.frame(1).left_trigger, 255);
         // An unchanged refresh advances the gate but emits nothing.
-        assert_eq!(wire.snapshot(GamepadSnapshot { seq: 2, ..snap }), None);
-        assert_eq!(wire.snapshot(GamepadSnapshot { seq: 2, ..stale }), None);
+        assert_eq!(
+            wire.snapshot(GamepadSnapshot { seq: 2, ..snap }, true),
+            None
+        );
+        assert_eq!(
+            wire.snapshot(GamepadSnapshot { seq: 2, ..stale }, true),
+            None
+        );
 
         assert_eq!(wire.remove(1, 2), None, "a removal older than the gate");
         assert_eq!(wire.remove(1, 3), Some(true));
@@ -1694,8 +1714,32 @@ mod tests {
             seq: 5,
             ..Default::default()
         };
-        assert_eq!(wire.snapshot(replug), Some(1));
+        assert_eq!(wire.snapshot(replug, true), Some(1));
         assert_eq!(wire.attached().collect::<Vec<_>>(), [1]);
+    }
+
+    /// A pad whose build was deferred (its arrival or identity late, no slot free) is handed
+    /// to the backends again on the next unchanged beacon; a built one is not.
+    #[test]
+    fn an_unbuilt_pad_is_retried_on_an_unchanged_beacon() {
+        use punktfunk_core::input::GamepadSnapshot;
+        let mut wire = WirePads::default();
+        let beacon = |seq| GamepadSnapshot {
+            pad: 0,
+            seq,
+            ..Default::default()
+        };
+        assert_eq!(wire.snapshot(beacon(1), false), Some(0));
+        assert_eq!(
+            wire.snapshot(beacon(2), false),
+            Some(0),
+            "the deferred pad is retried"
+        );
+        assert_eq!(
+            wire.snapshot(beacon(3), true),
+            None,
+            "a built pad's refresh churns nothing"
+        );
     }
 
     /// The client's gate: accepts a seq newer than the last it applied.
