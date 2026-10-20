@@ -299,7 +299,9 @@ pub fn probe_can_encode(codec: Codec, ten_bit: bool) -> bool {
     {
         Ok(d) => d,
         Err(e) => {
-            tracing::info!(error = %format!("{e:#}"), "no VAAPI display to probe");
+            // A codec set that found nothing is probed again on the next ask; the resolution
+            // warns once per entry, so this line stays at debug.
+            tracing::debug!(error = %format!("{e:#}"), "no VAAPI display to probe");
             return false;
         }
     };
