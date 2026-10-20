@@ -1,6 +1,6 @@
 //! Swapchain recreate, resize, and SDR↔HDR10 flip.
 
-use super::setup::{pick_formats, pick_present_mode};
+use super::setup::{pick_formats, pick_present_mode, PresentPref};
 use super::{OverlayPipe, Presenter};
 use anyhow::{anyhow, Context as _, Result};
 use ash::vk;
@@ -37,10 +37,15 @@ impl Presenter {
         if (p.vsync, p.allow_vrr, p.fullscreen) == (vsync, allow_vrr, fullscreen) {
             return Ok(());
         }
-        self.pref.vsync = vsync;
-        self.pref.allow_vrr = allow_vrr;
-        self.pref.fullscreen = fullscreen;
-        let mode = pick_present_mode(&self.surface_i, self.pdev, self.surface, self.pref)?;
+        let pref = PresentPref {
+            vsync,
+            allow_vrr,
+            fullscreen,
+            ..self.pref
+        };
+        // The pref lands with its mode: a failed pick must not make the next call a no-op.
+        let mode = pick_present_mode(&self.surface_i, self.pdev, self.surface, pref)?;
+        self.pref = pref;
         if mode == self.present_mode {
             return Ok(());
         }
