@@ -694,7 +694,7 @@ impl Shell {
             );
         }
         let mut screens = screens::ScreenWindows::default();
-        params.screens = self.plan_screens(&mut screens, params.mode);
+        params.screens = self.plan_screens(&mut screens, params.shows_screens, params.mode);
         let mut st = StreamState::new(
             params,
             force_software,

@@ -46,6 +46,8 @@ pub struct SettingsOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video_fit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub screens: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub codec: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hdr_enabled: Option<bool>,
@@ -130,6 +132,9 @@ impl SettingsOverlay {
         }
         if let Some(v) = &self.video_fit {
             s.video_fit = v.clone();
+        }
+        if let Some(v) = &self.screens {
+            s.screens = v.clone();
         }
         if let Some(v) = &self.codec {
             s.codec = v.clone();
@@ -227,6 +232,7 @@ impl SettingsOverlay {
             "pyrowave_bpp" => self.pyrowave_bpp = None,
             "render_scale" => self.render_scale = None,
             "video_fit" => self.video_fit = None,
+            "screens" => self.screens = None,
             "codec" => self.codec = None,
             "hdr_enabled" => self.hdr_enabled = None,
             "enable_444" => self.enable_444 = None,
@@ -275,6 +281,7 @@ impl SettingsOverlay {
             "pyrowave_bpp" => self.pyrowave_bpp = Some(s.pyrowave_bpp),
             "render_scale" => self.render_scale = Some(s.render_scale),
             "video_fit" => self.video_fit = Some(s.video_fit.clone()),
+            "screens" => self.screens = Some(s.screens.clone()),
             "codec" => self.codec = Some(s.codec.clone()),
             "hdr_enabled" => self.hdr_enabled = Some(s.hdr_enabled),
             "enable_444" => self.enable_444 = Some(s.enable_444),
@@ -319,6 +326,7 @@ impl SettingsOverlay {
             "pyrowave_bpp" => self.pyrowave_bpp.is_some(),
             "render_scale" => self.render_scale.is_some(),
             "video_fit" => self.video_fit.is_some(),
+            "screens" => self.screens.is_some(),
             "codec" => self.codec.is_some(),
             "hdr_enabled" => self.hdr_enabled.is_some(),
             "enable_444" => self.enable_444.is_some(),
@@ -576,6 +584,7 @@ pub(crate) mod tests {
             "pyrowave_bpp",
             "render_scale",
             "video_fit",
+            "screens",
             "codec",
             "hdr_enabled",
             "enable_444",

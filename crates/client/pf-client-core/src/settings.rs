@@ -157,6 +157,10 @@ pub struct Settings {
     /// unknown reads as fit.
     #[serde(default = "default_video_fit")]
     pub video_fit: String,
+    /// `"this"` (default): the stream shows on the window's monitor. `"all"`: one host screen
+    /// on each of this computer's monitors, asked for again as monitors come and go.
+    #[serde(default = "default_screens")]
+    pub screens: String,
     pub gamepad: String,
     /// Forward this device's controllers. Default on.
     ///
@@ -427,6 +431,10 @@ fn default_video_fit() -> String {
     "fit".into()
 }
 
+fn default_screens() -> String {
+    "this".into()
+}
+
 fn default_touch_mode() -> String {
     "trackpad".into()
 }
@@ -586,6 +594,11 @@ impl Settings {
         MouseMode::from_name(&self.mouse_mode)
     }
 
+    /// The stream asks for a screen per monitor; any other value is this monitor.
+    pub fn all_screens(&self) -> bool {
+        self.screens == "all"
+    }
+
     pub fn present_priority(&self) -> PresentPriority {
         PresentPriority::resolve(&self.present_priority, self.smooth_buffer)
     }
@@ -635,6 +648,7 @@ impl Default for Settings {
             pyrowave_bpp: default_pyrowave_bpp(),
             render_scale: 1.0,
             video_fit: default_video_fit(),
+            screens: default_screens(),
             gamepad: "auto".into(),
             gamepad_forwarding: true,
             forward_pad: String::new(),

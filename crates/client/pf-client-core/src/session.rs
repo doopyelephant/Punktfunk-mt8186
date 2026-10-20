@@ -150,7 +150,9 @@ pub struct SessionParams {
     /// Every monitor the stream shows, the window's first; empty for one. Further screens'
     /// frames come through [`start_screen`].
     pub screens: Vec<punktfunk_core::quic::v2::msg::Screen>,
-    /// The embedder opens a window per screen, so a stream started on one may ask for more.
+    /// The player wants a host screen per monitor ([`Settings::all_screens`](crate::trust::Settings::all_screens)):
+    /// the stream asks for them and keeps asking as monitors come and go. Only an embedder that
+    /// opens a window per screen reads it.
     pub shows_screens: bool,
 }
 
@@ -277,7 +279,7 @@ impl SessionParams {
             render_scale: settings.render_scale,
             render_scale_max_dim: punktfunk_core::render_scale::max_dimension(&settings.codec),
             screens: Vec::new(),
-            shows_screens: false,
+            shows_screens: settings.all_screens(),
         }
     }
 

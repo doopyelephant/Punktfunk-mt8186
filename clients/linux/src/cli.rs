@@ -81,7 +81,7 @@ pub fn exec_session() -> glib::ExitCode {
     let mut cmd = std::process::Command::new(crate::app::spawn::session_binary());
     let mut args = std::env::args().skip(1).peekable();
     while let Some(a) = args.next() {
-        if a == "--fullscreen" || a == "--stats" {
+        if a == "--fullscreen" || a == "--stats" || a == "--all-screens" {
             cmd.arg(a);
         } else if forward.contains(&a.as_str()) {
             cmd.arg(&a);
