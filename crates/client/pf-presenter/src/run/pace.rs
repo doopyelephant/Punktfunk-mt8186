@@ -19,7 +19,11 @@ impl Shell {
         // Without a glass clock too: the compositor queues a feedback answer per present.
         let samples = self.presenter.take_presented_samples();
         if !samples.is_empty() {
-            st.fold_glass(&samples, self.presenter.vblank_locked());
+            st.fold_glass(
+                &samples,
+                self.presenter.vblank_locked(),
+                self.presenter.glass_estimated(),
+            );
         }
         st.intake();
         self.presenter.begin_present_turn(st.newest_turn);
@@ -275,11 +279,13 @@ impl Shell {
 impl StreamState {
     /// Fold present-wait completions into the latch clock, the VRR probe, and this window's
     /// misses and steps. `vblank_locked`: the present mode waits for vblank, which the VRR
-    /// probe needs.
+    /// probe needs. `estimated`: the stamps are the vblank waiter's estimate, which never
+    /// trains the latch clock — on a variable panel those vblanks follow our own presents.
     pub(super) fn fold_glass(
         &mut self,
         samples: &[crate::vk::PresentedSample],
         vblank_locked: bool,
+        estimated: bool,
     ) {
         let clock_offset_ns = self.clock_offset_ns();
         let period = self.clock.period_ns();
@@ -357,7 +363,9 @@ impl StreamState {
                 glass.push((s.displayed_ns, s.pts_ns));
             }
         }
-        self.clock.note_batch(&stamps, self.store.is_smoothing());
+        if !estimated {
+            self.clock.note_batch(&stamps, self.store.is_smoothing());
+        }
         // VRR probe: healthy-window stamps only, against the display mode's period (the
         // learned one adopts a slow stream's cadence as "the grid").
         let healthy = self.last_forced == 0;
