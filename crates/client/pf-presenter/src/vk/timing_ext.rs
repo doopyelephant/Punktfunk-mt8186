@@ -559,20 +559,32 @@ impl Engine {
                         .find(|s| s.stage == *want && s.time != 0)
                         .copied()
                 });
-            let displayed_ns = shown.and_then(|s| {
-                let key = (t.time_domain.as_raw(), t.time_domain_id, s.stage);
-                if offset.age >= RECALIBRATE || offset.key != key {
-                    // SAFETY: the caller's contract.
-                    offset.ns = unsafe { self.calibrate(swapchain, key) }?;
-                    offset.key = key;
-                    offset.age = 0;
-                }
-                offset.age += 1;
-                u64::try_from(i128::from(s.time) + offset.ns).ok()
-            });
+            let Some(s) = shown else {
+                out.push(Stamp {
+                    present_id: t.present_id,
+                    displayed_ns: None,
+                });
+                continue;
+            };
+            let key = (t.time_domain.as_raw(), t.time_domain_id, s.stage);
+            if offset.age >= RECALIBRATE || offset.key != key {
+                // SAFETY: the caller's contract.
+                let Some(ns) = (unsafe { self.calibrate(swapchain, key) }) else {
+                    // Shown, on a clock this device will not calibrate: no word, so the
+                    // waiter's wake time stands in. "Never shown" would drop the frame.
+                    continue;
+                };
+                offset.ns = ns;
+                offset.key = key;
+                offset.age = 0;
+            }
+            offset.age += 1;
+            let Ok(displayed_ns) = u64::try_from(i128::from(s.time) + offset.ns) else {
+                continue;
+            };
             out.push(Stamp {
                 present_id: t.present_id,
-                displayed_ns,
+                displayed_ns: Some(displayed_ns),
             });
         }
         if n > 0 {
