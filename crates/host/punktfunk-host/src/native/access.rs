@@ -60,11 +60,12 @@ pub(super) async fn access_lifecycle(
     controls: crate::session_status::SessionControls,
     clip_enabled: Arc<AtomicBool>,
     access_tx: tokio::sync::mpsc::UnboundedSender<AccessUpdate>,
-    mut deadline: Option<i64>,
     device: crate::events::DeviceRef,
     life: crate::lifecycle::Lifecycle,
 ) {
     let operator = crate::events::SessionEndReason::StoppedByOperator;
+    // The admission deadline, as the per-session routes read it; 0 is none.
+    let mut deadline = Some(controls.deadline_unix.load(Ordering::Relaxed)).filter(|&d| d != 0);
     let mut warned = spent_warnings(deadline, crate::clock::unix_secs());
     // `power.*` ending every session: typed close so the client does not see a transport error.
     let mut power_rx = crate::power::closing_rx();
