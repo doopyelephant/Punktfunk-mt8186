@@ -632,8 +632,9 @@ fn try_passthrough(ud: &mut UserData, a: &mut Arrival) -> bool {
 /// imported here only when this pool can never hold. An in-process importer always imports
 /// here: its GL context is current on this thread. A producer NV12 rides only a hold, with
 /// its chroma plane: the importer reads packed RGB, so an unheld one feeds the raw latch,
-/// which withdraws the planar offer. `true` = the frame ends here; `false` = take the CPU
-/// de-pad.
+/// which withdraws the planar offer. A tiled 10-bit frame without the tiled raw lane
+/// rebuilds the capture: the de-tile blit is 8-bit and the CPU de-pad reads LINEAR only.
+/// `true` = the frame ends here; `false` = take the CPU de-pad.
 fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
     if !ud.signals.has_importer.load(Ordering::Relaxed) {
         return false;
@@ -643,12 +644,14 @@ fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
     };
     let hdr_tiled = fmt.is_rgb10() && ud.modifier != 0;
     if hdr_tiled && !ud.hdr_tiled_raw {
-        warn_once(
-            "10-bit frame arrived with a tiled modifier — the GPU de-tile blit is 8-bit, \
-             so this stream falls back to the CPU path (the producer ignored our \
-             LINEAR-only 10-bit offer)",
-        );
-        return false;
+        if ud.signals.health.refuse(pf_zerocopy::Refusal::HdrTiled) {
+            tracing::warn!(
+                "10-bit frame arrived with a tiled modifier the producer was not offered — \
+                 capture rebuilds on LINEAR"
+            );
+        }
+        ud.signals.broken.store(true, Ordering::Relaxed);
+        return true;
     }
     let datas = &*a.datas;
     if datas[0].type_() != pw::spa::buffer::DataType::DmaBuf {

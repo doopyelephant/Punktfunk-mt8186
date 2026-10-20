@@ -1686,6 +1686,21 @@ mod callbacks {
         assert_eq!(rig.back(), [pool[0]]);
     }
 
+    /// A tiled 10-bit frame the raw lane does not take is never de-padded as LINEAR: the
+    /// capture refuses the tiled offer and rebuilds.
+    #[test]
+    fn a_tiled_10bit_frame_without_the_raw_lane_rebuilds() {
+        let pool = dmabufs::<4>();
+        let mut rig = Rig::new();
+        rig.ud.signals.has_importer.store(true, Relaxed);
+        rig.negotiate(VideoFormat::xBGR_210LE, (16, 4), 0x0200_0000_0000_0001);
+        rig.allocate(&pool);
+        rig.process(&pool[..1]);
+        assert!(rig.take().is_none(), "no scrambled frame");
+        assert!(rig.ud.signals.broken.load(Relaxed));
+        assert!(rig.ud.signals.health.hdr_tiled_refused());
+    }
+
     /// Renegotiation frees the pool under its holds, and the next pool reuses the
     /// addresses. A hold of the old pool releases nothing: not while its buffer is
     /// freed, and not once the address has a new tenant.
