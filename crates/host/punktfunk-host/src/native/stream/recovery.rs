@@ -128,7 +128,12 @@ impl StreamState {
             self.live_bitrate.store(applied_kbps, Ordering::Relaxed);
             return;
         }
-        self.close_open_frame();
+        // The open frame is closed only once the new encoder exists: a failed open keeps the
+        // old encoder, whose tail is still owed. The new one numbers its first AU past it.
+        let wire_seq_base = self
+            .clock
+            .au_seq
+            .wrapping_add(u32::from(self.clock.wire_frame_open));
         let hz = interval_hz(self.interval);
         let rebuild_t0 = std::time::Instant::now();
         match open_session_encoder(
@@ -141,7 +146,7 @@ impl StreamState {
             |_, _| ed.enc_kbps(new_kbps) as u64 * 1000,
             self.bit_depth,
             self.client_hdr,
-            self.clock.au_seq,
+            wire_seq_base,
         ) {
             Ok((new_enc, reframe)) => {
                 let applied_kbps = new_enc
@@ -161,6 +166,7 @@ impl StreamState {
                     reframe,
                     resized: None,
                 };
+                self.close_open_frame();
                 self.swap_pipeline(next, SwapReason::Bitrate);
                 self.note_applied_rate(new_kbps, applied_kbps);
                 self.counters.note_bitrate(applied_kbps);
@@ -177,7 +183,20 @@ impl StreamState {
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), to_kbps = new_kbps,
                     "bitrate-change encoder rebuild failed — keeping the current rate");
-                self.note_applied_rate(new_kbps, self.bitrate_kbps);
+                announce_pipeline_gap(
+                    &self.gap_tx,
+                    rebuild_t0.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                );
+                if new_kbps > self.bitrate_kbps {
+                    // A refusal that cost no encoder still teaches the ceiling.
+                    self.note_applied_rate(new_kbps, self.bitrate_kbps);
+                } else {
+                    // Down, there is no ceiling to learn; the client was acked a rate the
+                    // session is not running and is told the one it is.
+                    let _ = self
+                        .retarget_tx
+                        .send((self.bitrate_kbps, AckReason::EncoderLimit));
+                }
             }
         }
     }
@@ -955,6 +974,35 @@ mod tests {
         fn request_keyframe(&mut self) {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// A downward rate the encoder could not be rebuilt at leaves the session on its old rate,
+    /// and the client is told so; the frame on the wire stays open for the encoder it belongs to.
+    #[test]
+    fn a_failed_rate_rebuild_tells_the_client_the_rate_kept() {
+        let mut f = super::super::swap::tests::fake();
+        let (tx, rx) = std::sync::mpsc::channel();
+        f.st.bitrate_rx = rx;
+        let (retarget_tx, mut retarget_rx) = tokio::sync::mpsc::unbounded_channel();
+        f.st.retarget_tx = retarget_tx;
+        f.st.clock.wire_frame_open = true;
+        let (kept, au_seq) = (f.st.bitrate_kbps, f.st.clock.au_seq);
+        tx.send(kept / 2).expect("the loop's end is open");
+        f.st.on_bitrate_request();
+        assert_eq!(
+            f.st.bitrate_kbps, kept,
+            "the test encoder opened; this check needs a refusal"
+        );
+        assert_eq!(
+            retarget_rx.try_recv().ok(),
+            Some((kept, AckReason::EncoderLimit)),
+            "the client still believes the lower rate"
+        );
+        assert_eq!(
+            f.st.clock.au_seq, au_seq,
+            "a failed open closed the old encoder's frame"
+        );
+        assert!(f.st.clock.wire_frame_open);
     }
 
     /// A torn reference raised inside the cooldown of the IDR before it is repaired once that
