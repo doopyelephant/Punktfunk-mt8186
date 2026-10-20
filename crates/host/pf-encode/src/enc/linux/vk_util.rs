@@ -271,6 +271,19 @@ pub(crate) fn find_readback_mem(
     .or_else(|_| find_mem(mp, bits, F::HOST_VISIBLE | F::HOST_COHERENT).map(|i| (i, true)))
 }
 
+/// The size of an invalidate from offset 0 that covers `[0, end)` of a readback buffer of
+/// `size` bytes bound at memory offset 0: `end` rounded up to `atom` (`nonCoherentAtomSize`),
+/// or the whole mapping once that passes the buffer. Both are valid range ends.
+#[cfg_attr(not(feature = "vulkan-encode"), allow(dead_code))]
+pub(crate) fn readback_invalidate_size(end: u64, atom: u64, size: u64) -> u64 {
+    let rounded = end.div_ceil(atom) * atom;
+    if rounded <= size {
+        rounded
+    } else {
+        vk::WHOLE_SIZE
+    }
+}
+
 pub(crate) fn pixel_to_vk(fmt: PixelFormat) -> Option<vk::Format> {
     match fmt {
         PixelFormat::Bgrx | PixelFormat::Bgra => Some(vk::Format::B8G8R8A8_UNORM),
@@ -755,6 +768,19 @@ mod tests {
         mp.memory_types[5].property_flags = F::HOST_VISIBLE | F::HOST_CACHED;
         assert_eq!(find_readback_mem(&mp, 0b111111).unwrap(), (5, false));
         assert!(find_readback_mem(&mp, 0b000011).is_err());
+    }
+
+    #[test]
+    fn readback_invalidate_covers_the_access_unit_in_whole_atoms() {
+        const BUF: u64 = 24_948_736; // 4K: 3 × 3840 × 2160 + 64 KiB
+        assert_eq!(readback_invalidate_size(200_000, 64, BUF), 200_000);
+        assert_eq!(readback_invalidate_size(200_001, 64, BUF), 200_064);
+        assert_eq!(readback_invalidate_size(BUF, 64, BUF), BUF);
+        // Rounding past the buffer's end takes the whole mapping instead.
+        assert_eq!(
+            readback_invalidate_size(BUF - 1, 256, BUF - 100),
+            vk::WHOLE_SIZE
+        );
     }
 
     #[test]
