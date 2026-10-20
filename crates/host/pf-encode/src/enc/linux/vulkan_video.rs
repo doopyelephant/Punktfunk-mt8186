@@ -31,7 +31,7 @@ use crate::{Codec, EncodedFrame, Encoder, EncoderCaps};
 use anyhow::{bail, ensure, Context, Result};
 use ash::vk;
 use pf_frame::{CapturedFrame, FramePayload, PixelFormat};
-use pf_zerocopy::vkdev::{MappedMemory, VkBufferAlloc, VkImageAlloc};
+use pf_zerocopy::vkdev::{VkBufferAlloc, VkImageAlloc};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::os::fd::AsFd;
@@ -961,7 +961,8 @@ struct Frame {
     // CPU staging, keyed on (format, width, height) — not format alone. CSC sizes the image
     // to the SOURCE frame; a format-only key copies past the allocation on a size change.
     cpu_img: Option<(VkImageAlloc, vk::Format, u32, u32)>,
-    cpu_stage: Option<(VkBufferAlloc, u64)>,
+    /// The upload buffer, its size and its mapping, kept until `vkFreeMemory` unmaps it.
+    cpu_stage: Option<(VkBufferAlloc, u64, *mut u8)>,
     cursor: CursorPlane,
     pts_ns: u64,
     keyframe: bool,
@@ -2038,10 +2039,10 @@ impl VulkanVideoEncoder {
         }
         if self.frames[slot]
             .cpu_stage
-            .map(|(_, s)| s < need)
+            .map(|(_, s, _)| s < need)
             .unwrap_or(true)
         {
-            if let Some((old, _)) = self.frames[slot].cpu_stage.take() {
+            if let Some((old, ..)) = self.frames[slot].cpu_stage.take() {
                 old.destroy(&dev);
             }
             let buf = make_host_buffer(
@@ -2050,9 +2051,12 @@ impl VulkanVideoEncoder {
                 need,
                 vk::BufferUsageFlags::TRANSFER_SRC,
             )?;
-            self.frames[slot].cpu_stage = Some((buf, need));
+            // HOST_COHERENT, so a write through the mapping needs no flush.
+            let mapped = dev.map_memory(buf.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty());
+            let base = mapped.inspect_err(|_| buf.destroy(&dev))?.cast::<u8>();
+            self.frames[slot].cpu_stage = Some((buf, need, base));
         }
-        let (stage, _) = self.frames[slot].cpu_stage.unwrap();
+        let (_, _, base) = self.frames[slot].cpu_stage.unwrap();
         // RGB-direct uploads the image the encoder reads, so an undersized source must be
         // padded (edge duplicate). CSC keeps the raw copy (shader clamps). Guards below must
         // not be hoisted — they are only sound because `self.rgb.is_some()`.
@@ -2096,9 +2100,9 @@ impl VulkanVideoEncoder {
             None
         };
         let len = pad.map_or(bytes.len().min(need as usize), |(_, _, dst_len)| dst_len);
-        // The slot's staging memory: host-visible, kept only when at least `need` bytes, and
-        // mapped only here. HOST_COHERENT, so no explicit flush.
-        let mut dst = MappedMemory::map(&dev, stage.memory, len)?;
+        // `base` maps at least `need >= len` bytes. The ring handed out this slot after its
+        // last copy out of them retired, so nothing else reads or writes them now.
+        let dst = std::slice::from_raw_parts_mut(base, len);
         match pad {
             Some((sw, sh, _)) => {
                 let (dw, dh) = (w as usize, h as usize);
@@ -2701,7 +2705,7 @@ impl Drop for VkTeardown {
                     if let Some((img, ..)) = f.cpu_img {
                         img.destroy(&device);
                     }
-                    if let Some((stage, _)) = f.cpu_stage {
+                    if let Some((stage, ..)) = f.cpu_stage {
                         stage.destroy(&device);
                     }
                     f.cursor.destroy(&device);
