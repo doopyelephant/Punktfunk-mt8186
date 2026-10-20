@@ -2,6 +2,7 @@
 
 use super::events::touch_devices;
 use super::pace::{bump_stats_tier, frame_interval_ns};
+use super::restart::{restart_for, Dial, Restart, RestartFacts};
 use super::*;
 
 impl StreamState {
@@ -390,9 +391,10 @@ pub(super) fn cycle_pad_mouse(c: &NativeClient, ring_opener: Option<u8>) {
 }
 
 impl Shell {
-    /// Drain the pump's session events. A browse stream ending, a codec fallback, a lost
-    /// link or a not-ready host replaces `stream` mid-drain, so each event re-borrows it and
-    /// a terminal one stops the drain. `Break` is a single-mode stream ending the loop.
+    /// Drain the pump's session events. A terminal event restarts the stream
+    /// ([`restart_for`]) or ends it; either replaces `stream` mid-drain, so each event
+    /// re-borrows it and a terminal one stops the drain. `Break` is a single-mode stream
+    /// ending the loop.
     pub(super) fn drain_session_events(
         &mut self,
         stream: &mut Option<StreamState>,
@@ -401,43 +403,11 @@ impl Shell {
             let Ok(ev) = st.handle.events.try_recv() else {
                 break;
             };
-            // A lost link dials the same host again on the shared schedule, and a redial
-            // that fails to dial is the next attempt. The redial carries the lost session's
-            // resume id. A spent schedule, or a cancel, ends the stream as before.
-            let lost = match &ev {
-                SessionEvent::Lost(_) => true,
-                SessionEvent::Failed {
-                    trust_rejected: false,
-                    refused: None,
-                    ..
-                } => st.redials > 0,
-                _ => false,
-            };
-            let wait = PunktfunkEndReason::Lost.redial_delay(st.redials);
-            if let Some(wait) = wait.filter(|_| lost && !st.canceled) {
-                let attempt = st.redials + 1;
-                tracing::info!(
-                    attempt,
-                    wait_ms = wait.as_millis() as u64,
-                    "connection lost — dialing the host again"
-                );
-                if matches!(ev, SessionEvent::Lost(_)) {
-                    self.release_stream(st);
-                }
-                let mut params = st.params.clone();
-                if let Some(c) = &st.connector {
-                    params.mode = c.mode();
-                }
-                params.redial_wait = wait;
-                let force_software = Arc::new(AtomicBool::new(false));
-                params.force_software = force_software.clone();
-                self.end_stream(
-                    stream,
-                    SessionPhase::Reconnecting("Lost the connection — reconnecting."),
-                );
-                let mut next = self.start_stream(params, force_software);
-                next.redials = attempt;
-                *stream = Some(next);
+            if let SessionEvent::HostNotReady(said) = &ev {
+                tracing::info!(host_said = %said, "host not ready to stream");
+            }
+            if let Some(r) = restart_for(&ev, &RestartFacts::of(st)) {
+                self.restart(stream, r);
                 break;
             }
             match ev {
@@ -458,59 +428,13 @@ impl Shell {
                     self.on_connected(st, connector, mode, fingerprint)
                 }
                 SessionEvent::DecodeFacts(f) => st.facts = f,
-                // Welcome advert first, then every mid-session AccessUpdate. Re-gate live
-                // capture: a removed POINTER/KEYBOARD bit releases the lock it backed;
-                // with neither class left the capture drops (auto-release, so a later
-                // re-grant re-engages on click).
-                SessionEvent::Notice(n) => {
-                    st.session_notice = Some((n, Instant::now()));
-                }
-                SessionEvent::Access { access, notice } => {
-                    st.access = access;
-                    if let Some(n) = notice {
-                        tracing::info!(notice = %n, "session access changed");
-                        st.session_notice = Some((n, Instant::now()));
-                    }
-                    if let Some(cap) = st.capture.as_mut() {
-                        cap.set_grants(access.grants);
-                        if cap.captured() {
-                            // With the ring up the pointer stays the ring's; its close re-applies.
-                            if cap.can_capture() && !self.ring_was_open {
-                                self.capture_on(cap);
-                            } else if !cap.can_capture() {
-                                cap.release(false);
-                                self.capture_off();
-                            }
-                        }
-                    }
-                }
+                SessionEvent::Notice(n) => st.session_notice = Some((n, Instant::now())),
+                SessionEvent::Access { access, notice } => self.on_access(st, access, notice),
                 SessionEvent::Failed {
                     msg,
                     trust_rejected,
                     refused,
-                } => {
-                    if !self.browse {
-                        return ControlFlow::Break(Outcome::ConnectFailed {
-                            msg,
-                            trust_rejected,
-                            refused,
-                        });
-                    }
-                    tracing::warn!(%msg, "connect failed — back to the console");
-                    if refused == Some(punktfunk_core::reject::RejectReason::ProfileUnknown)
-                        && let Some(o) = self.overlay.as_mut()
-                    {
-                        o.profile_gone();
-                    }
-                    let phase = if st.canceled {
-                        SessionPhase::Ended(None)
-                    } else {
-                        SessionPhase::Failed(&msg)
-                    };
-                    self.capture_off();
-                    self.end_stream(stream, phase);
-                    break;
-                }
+                } => return self.on_failed(stream, msg, trust_rejected, refused),
                 SessionEvent::Ended(reason) | SessionEvent::Lost(reason) => {
                     self.release_stream(st);
                     if !self.browse {
@@ -522,70 +446,126 @@ impl Shell {
                     self.end_stream(stream, phase);
                     break;
                 }
-                // A woken host that answered before it could stream: dial it again. The
-                // window opens at the first refusal; past it the pump ends as usual.
-                SessionEvent::HostNotReady(said) => {
-                    tracing::info!(host_said = %said, "host not ready to stream — dialing again");
+                // A restart the model declined: the player cancelled the dial.
+                SessionEvent::HostNotReady(_) | SessionEvent::CodecFallback { .. } => {
                     self.release_stream(st);
-                    if st.canceled {
-                        self.end_stream(stream, SessionPhase::Ended(None));
-                        break;
-                    }
-                    let mut params = st.params.clone();
-                    params
-                        .settle_until
-                        .get_or_insert_with(|| Instant::now() + session::WAKE_SETTLE);
-                    let force_software = Arc::new(AtomicBool::new(false));
-                    params.force_software = force_software.clone();
-                    self.end_stream(
-                        stream,
-                        SessionPhase::Reconnecting(
-                            "The host isn't ready to stream yet — trying again.",
-                        ),
-                    );
-                    *stream = Some(self.start_stream(params, force_software));
-                    break;
-                }
-                // The negotiated codec ran out of decode rungs: re-dial the same host
-                // with that codec removed from advertised caps. The pump left nothing of
-                // its own running before sending this, so this is a clean start, not an
-                // overlap. Applies in both modes — single has no console to fall back to.
-                SessionEvent::CodecFallback {
-                    exclude_codecs,
-                    retry_caps,
-                    msg,
-                } => {
-                    tracing::warn!(
-                        %msg,
-                        exclude_codecs,
-                        retry_caps,
-                        "decode ladder exhausted — reconnecting with reduced codec caps"
-                    );
-                    self.release_stream(st);
-                    // Widen the exclusion rather than replace it: a second fallback must
-                    // not re-offer what the first already ruled out.
-                    let mut params = st.params.clone();
-                    params.exclude_codecs |= exclude_codecs;
-                    // The mode this session ended on, not the one it dialled with: a
-                    // mid-session `Reconfigure` lives only in the connector, and
-                    // `st.params` is a launch clone. `start_stream` then fits the window.
-                    if let Some(c) = &st.connector {
-                        params.mode = c.mode();
-                    }
-                    // A fresh demote flag, like `ActionOutcome::Start` — never the old
-                    // session's. Inheriting it would open a software decoder on good hardware.
-                    let force_software = Arc::new(AtomicBool::new(false));
-                    params.force_software = force_software.clone();
-                    // `params.launch` rides along verbatim. Dropping it would miss
-                    // `pf-vdisplay`'s reuse key (it includes the launch command) and
-                    // orphan the running game inside the lingering display. A `gog:`/
-                    // `custom:` target may start a second copy; Steam/Epic URIs dedupe.
-                    self.end_stream(stream, SessionPhase::Reconnecting(&msg));
-                    *stream = Some(self.start_stream(params, force_software));
+                    self.end_stream(stream, SessionPhase::Ended(None));
                     break;
                 }
             }
         }
+        ControlFlow::Continue(())
+    }
+
+    /// Dial the stream's host again as `r` says, on a clone of its params with a fresh
+    /// demote flag: the old one would open a software decoder on good hardware. The host,
+    /// port and `launch` ride along verbatim: the resume id is keyed on the host and port,
+    /// and pf-vdisplay's reuse key includes the launch command, so the running game stays.
+    fn restart(&mut self, stream: &mut Option<StreamState>, r: Restart<'_>) {
+        let Some(st) = stream.as_mut() else {
+            return;
+        };
+        if r.keep_mic_muted {
+            tracing::info!("mic mute not carried: the next session starts unmuted");
+        }
+        if r.release {
+            self.release_stream(st);
+        }
+        let mut params = st.params.clone();
+        if r.connector_mode
+            && let Some(c) = &st.connector
+        {
+            params.mode = c.mode();
+        }
+        params.redial_wait = r.dial.wait();
+        let redials = match r.dial {
+            Dial::Redial { wait, attempt } => {
+                tracing::info!(
+                    attempt,
+                    wait_ms = wait.as_millis() as u64,
+                    "connection lost — dialing the host again"
+                );
+                attempt
+            }
+            Dial::Wake { settle_until } => {
+                params.settle_until = Some(settle_until);
+                0
+            }
+            Dial::Fallback { exclude } => {
+                tracing::warn!(
+                    msg = r.phase,
+                    exclude_codecs = exclude,
+                    "decode ladder exhausted — reconnecting with reduced codec caps"
+                );
+                params.exclude_codecs = exclude;
+                0
+            }
+        };
+        let force_software = Arc::new(AtomicBool::new(false));
+        params.force_software = force_software.clone();
+        self.end_stream(stream, SessionPhase::Reconnecting(r.phase));
+        let mut next = self.start_stream(params, force_software);
+        next.redials = redials;
+        *stream = Some(next);
+    }
+
+    /// Welcome's access first, then every mid-session update. Live capture is re-gated: a
+    /// removed pointer or keyboard grant releases the lock it backed, and with neither left
+    /// the capture drops (auto-release, so a later re-grant re-engages on click).
+    fn on_access(
+        &mut self,
+        st: &mut StreamState,
+        access: pf_client_core::access::SessionAccess,
+        notice: Option<String>,
+    ) {
+        st.access = access;
+        if let Some(n) = notice {
+            tracing::info!(notice = %n, "session access changed");
+            st.session_notice = Some((n, Instant::now()));
+        }
+        if let Some(cap) = st.capture.as_mut() {
+            cap.set_grants(access.grants);
+            if cap.captured() {
+                // With the ring up the pointer stays the ring's; its close re-applies.
+                if cap.can_capture() && !self.ring_was_open {
+                    self.capture_on(cap);
+                } else if !cap.can_capture() {
+                    cap.release(false);
+                    self.capture_off();
+                }
+            }
+        }
+    }
+
+    /// A dial that is not dialled again. Single mode ends on it; browse shows it on the
+    /// console, or nothing when the player cancelled the dial.
+    fn on_failed(
+        &mut self,
+        stream: &mut Option<StreamState>,
+        msg: String,
+        trust_rejected: bool,
+        refused: Option<punktfunk_core::reject::RejectReason>,
+    ) -> ControlFlow<Outcome> {
+        if !self.browse {
+            return ControlFlow::Break(Outcome::ConnectFailed {
+                msg,
+                trust_rejected,
+                refused,
+            });
+        }
+        tracing::warn!(%msg, "connect failed — back to the console");
+        if refused == Some(punktfunk_core::reject::RejectReason::ProfileUnknown)
+            && let Some(o) = self.overlay.as_mut()
+        {
+            o.profile_gone();
+        }
+        let phase = if stream.as_ref().is_some_and(|st| st.canceled) {
+            SessionPhase::Ended(None)
+        } else {
+            SessionPhase::Failed(&msg)
+        };
+        self.capture_off();
+        self.end_stream(stream, phase);
         ControlFlow::Continue(())
     }
 

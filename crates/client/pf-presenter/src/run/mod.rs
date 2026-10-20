@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 mod events;
 mod pace;
 mod pace_step;
+mod restart;
 mod screens;
 mod shell;
 mod stream;
