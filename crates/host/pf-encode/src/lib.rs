@@ -110,7 +110,7 @@ pub fn hdr_meta_to_wire(m: pf_frame::HdrMeta) -> punktfunk_core::quic::HdrMeta {
 #[path = "enc/linux/nvenc_cuda.rs"]
 mod nvenc_cuda;
 // The lane, blend and retrieve decisions `nvenc_cuda` steps. Pure, so its table runs on every target.
-#[allow(dead_code)]
+#[cfg_attr(not(all(target_os = "linux", feature = "nvenc")), allow(dead_code))]
 #[path = "enc/linux/nvenc_lane.rs"]
 mod nvenc_lane;
 // Software (openh264) H.264 — the GPU-less Linux path. Windows has none: the driver
