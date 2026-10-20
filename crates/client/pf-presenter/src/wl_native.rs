@@ -328,6 +328,11 @@ impl Dispatch<params::ZwpLinuxBufferParamsV1, ()> for LaneState {
         _: &QueueHandle<Self>,
     ) {
         let Some(key) = state.pending.remove(&prm.id().protocol_id()) else {
+            // Forgotten before the compositor answered: a buffer it made anyway is a
+            // server-side import nobody will attach.
+            if let params::Event::Created { buffer } = event {
+                buffer.destroy();
+            }
             return;
         };
         match event {
@@ -552,6 +557,9 @@ pub struct NativeLane {
     globals: Option<GlobalList>,
     surface: wl_surface::WlSurface,
     dmabuf: dmabuf::ZwpLinuxDmabufV1,
+    /// The surface's format feedback; destroyed with the lane, or its re-sent batches queue
+    /// a format-table fd each into a handle nobody reads.
+    feedback: feedback::ZwpLinuxDmabufFeedbackV1,
     presentation: wp_presentation::WpPresentation,
     color_repr: Option<crm::WpColorRepresentationManagerV1>,
     repr: Option<crs::WpColorRepresentationSurfaceV1>,
@@ -645,7 +653,7 @@ impl NativeLane {
             _ => None,
         };
         let surface = sdl.surface_proxy(&conn)?;
-        dmabuf.get_surface_feedback(&surface, &qh, ());
+        let feedback = dmabuf.get_surface_feedback(&surface, &qh, ());
         let mut state = LaneState::default();
         for _ in 0..4 {
             queue
@@ -683,6 +691,7 @@ impl NativeLane {
             globals: Some(globals),
             surface,
             dmabuf,
+            feedback,
             presentation,
             color_repr,
             repr: None,
@@ -1298,6 +1307,10 @@ impl Drop for NativeLane {
         if let Some(m) = self.color_mgr.take() {
             m.destroy();
         }
+        if let Some(m) = self.color_repr.take() {
+            m.destroy();
+        }
+        self.feedback.destroy();
         if let Some(g) = self.hud_globals.take() {
             g.subcompositor.destroy();
             g.viewporter.destroy();
