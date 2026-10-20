@@ -2118,8 +2118,9 @@ impl VirtualDisplayManager {
     /// to, and takes the oldest of any: it follows the display, not the size. The output is
     /// [`DisplayOwnership::External`]: the joiner captures it and owns none of it, and its
     /// lease gives back only the reference, so the monitor outlives whichever of the two
-    /// leaves first. `None` when no other client's monitor is live. A seat's clients all
-    /// resolve to its one slot, so there the joiner's own slot is the owner's.
+    /// leaves first. `None` when no other client's monitor is live. A slot other clients share
+    /// (a seat's, or slot 0) is not the joiner's own: skipping it hands the joiner the owner's
+    /// monitor as its own, and a second driver encoder on it starves the owner.
     ///
     /// The joiner's quit is not passed on: a viewer that stops must not tear the display down
     /// under its owner's linger policy.
@@ -2128,9 +2129,12 @@ impl VirtualDisplayManager {
         mode: Mode,
         client_fp: Option<[u8; 32]>,
     ) -> Option<VirtualOutput> {
-        let own = match process_slot_plan() {
-            Ok(plan) if plan.seat_slot().is_some() => None,
-            _ => resolve_slot_id(client_fp, (mode.width, mode.height)).ok(),
+        let own = match (
+            process_slot_plan(),
+            resolve_slot_id(client_fp, (mode.width, mode.height)),
+        ) {
+            (Ok(plan), Ok(slot)) => plan.own_slot(slot),
+            _ => None,
         };
         let mut inner = self.state.lock().unwrap();
         let slot = inner
