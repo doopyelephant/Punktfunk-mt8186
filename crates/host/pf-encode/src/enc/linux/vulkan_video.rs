@@ -3862,6 +3862,9 @@ impl VulkanVideoEncoder {
         let unspent = (self.pending_loss, self.wave);
         if let Err(e) = self.record_submit(slot, frame, wire) {
             (self.pending_loss, self.wave) = unspent;
+            // The slot never entered `in_flight`: the retry takes it again, or the one after
+            // next would land on a slot whose fence is still pending.
+            self.ring = slot;
             return Err(e);
         }
         self.in_flight.push_back(slot);
