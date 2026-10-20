@@ -246,6 +246,12 @@ impl Presenter {
                 }
             }
         }
+        // A rebuild that failed past its create left the targets short of the images: build
+        // again before an acquire can index past them.
+        if self.render_sems.len() != self.images.len() {
+            self.recreate_swapchain(window)?;
+            return Ok(Presented::Stale);
+        }
         let input = match self.glass_gate(window, input)? {
             ControlFlow::Continue(input) => input,
             ControlFlow::Break(done) => return Ok(done),
