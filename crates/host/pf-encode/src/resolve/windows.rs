@@ -260,3 +260,76 @@ fn probe_codec_support(backend: WindowsBackend) -> CodecSupport {
     );
     caps
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use punktfunk_core::quic::{CODEC_AV1, CODEC_H264, CODEC_HEVC, CODEC_PYROWAVE};
+
+    const FULL: Features = Features {
+        nvenc: true,
+        vulkan_encode: false,
+        pyrowave: true,
+        qsv: true,
+    };
+
+    fn resolved(backend: WindowsBackend, features: Features) -> Resolved {
+        let r = Resolved::new(ResolveInputs {
+            pref: String::new(),
+            gpu: String::new(),
+            vulkan_row: false,
+            nvidia: false,
+            features,
+        });
+        r.probes
+            .backend
+            .set(backend)
+            .expect("a row fills each cell once");
+        r
+    }
+
+    /// `wire_caps` reads one resolution (sweep R5-08): software is H.264 without PyroWave, a
+    /// probed set is its mask, and an empty or absent probe is the superset.
+    #[test]
+    fn wire_caps_reads_one_resolution() {
+        let superset = CODEC_H264 | CODEC_HEVC | CODEC_AV1;
+        assert_eq!(
+            resolved(WindowsBackend::Software, FULL).wire_caps(),
+            CODEC_H264
+        );
+        let amf = resolved(WindowsBackend::Amf, FULL);
+        amf.probes
+            .codecs
+            .set(CodecSupport {
+                h264: true,
+                h265: true,
+                av1: false,
+            })
+            .expect("unset");
+        assert_eq!(amf.wire_caps(), CODEC_H264 | CODEC_HEVC | CODEC_PYROWAVE);
+        let quiet = Features {
+            pyrowave: false,
+            ..FULL
+        };
+        let empty = resolved(WindowsBackend::Amf, quiet);
+        empty
+            .probes
+            .codecs
+            .set(CodecSupport {
+                h264: false,
+                h265: false,
+                av1: false,
+            })
+            .expect("unset");
+        assert_eq!(empty.wire_caps(), superset);
+        let qsv = resolved(
+            WindowsBackend::Qsv,
+            Features {
+                qsv: false,
+                ..quiet
+            },
+        );
+        assert_eq!(qsv.wire_caps(), superset);
+        assert!(qsv.advertised().is_none());
+    }
+}

@@ -390,6 +390,28 @@ mod tests {
         assert_eq!(windows_backend_vendor_id(MediaFoundation), None);
     }
 
+    /// The cache key is the whole input: the same inputs share one resolution, and a change to
+    /// the Encoder row or the selected GPU resolves afresh.
+    #[test]
+    fn the_same_inputs_share_one_resolution() {
+        let cache = Mutex::new(HashMap::new());
+        let inputs = |pref: &str| ResolveInputs {
+            pref: pref.into(),
+            gpu: "card0".into(),
+            vulkan_row: true,
+            nvidia: false,
+            features: Features::BUILT,
+        };
+        let auto = resolve_in(&cache, inputs("auto"));
+        assert!(Arc::ptr_eq(&auto, &resolve_in(&cache, inputs("auto"))));
+        assert!(!Arc::ptr_eq(&auto, &resolve_in(&cache, inputs("vaapi"))));
+        let other_gpu = ResolveInputs {
+            gpu: "card1".into(),
+            ..inputs("auto")
+        };
+        assert!(!Arc::ptr_eq(&auto, &resolve_in(&cache, other_gpu)));
+    }
+
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn codec_support_wire_mask_maps_the_probe_to_bits() {

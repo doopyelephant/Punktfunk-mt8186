@@ -1068,4 +1068,247 @@ mod tests {
         assert_eq!(backend, "vaapi-native");
         assert!(enc.caps().supports_rfi);
     }
+
+    // The resolution table: hand-filled cells, no GPU, no config.
+
+    const ALL: CodecSupport = CodecSupport {
+        h264: true,
+        h265: true,
+        av1: true,
+    };
+
+    /// Every encode feature on, so a row can turn one off.
+    const FULL: Features = Features {
+        nvenc: true,
+        vulkan_encode: true,
+        pyrowave: true,
+        qsv: false,
+    };
+
+    fn inputs(pref: &str, features: Features) -> ResolveInputs {
+        ResolveInputs {
+            pref: pref.into(),
+            gpu: "card0".into(),
+            vulkan_row: true,
+            nvidia: false,
+            features,
+        }
+    }
+
+    fn fill<T: std::fmt::Debug>(cell: &OnceLock<T>, v: T) {
+        cell.set(v).expect("a row fills each cell once");
+    }
+
+    fn vulkan(eight_bit: bool, ten_bit: bool) -> VulkanFacts {
+        VulkanFacts {
+            supported: eight_bit || ten_bit,
+            eight_bit,
+            ten_bit,
+        }
+    }
+
+    fn nvenc(hevc_444: bool, ten_bit: bool) -> NvencFacts {
+        NvencFacts {
+            codecs: ALL,
+            hevc_444,
+            ten_bit: CodecSupport {
+                h264: false,
+                h265: ten_bit,
+                av1: ten_bit,
+            },
+        }
+    }
+
+    /// `/serverinfo` polls with the Encoder row as set: an explicit pref answers every question
+    /// without the `auto` probe, even on a box with NVIDIA's nodes.
+    #[test]
+    fn an_explicit_pref_never_runs_the_auto_probe() {
+        for pref in ["vaapi", "nvenc", "pyrowave"] {
+            let r = Resolved::new(ResolveInputs {
+                nvidia: true,
+                ..inputs(pref, FULL)
+            });
+            fill(&r.probes.vaapi, ALL);
+            fill(&r.probes.nvenc, nvenc(false, false));
+            let _ = (r.wire_caps(), r.is_gpu(), r.zero_copy_is_vaapi());
+            assert!(r.probes.auto_is_vaapi.get().is_none(), "{pref}");
+        }
+        let vaapi_on_nvidia = Resolved::new(ResolveInputs {
+            nvidia: true,
+            ..inputs("vaapi", FULL)
+        });
+        assert!(vaapi_on_nvidia.zero_copy_is_vaapi() && !vaapi_on_nvidia.hdr_cuda_ok());
+    }
+
+    /// `auto` takes NVENC where NVIDIA drives it, and only in a build with the direct SDK; a
+    /// build without it never asks.
+    #[test]
+    fn auto_takes_nvenc_only_with_the_direct_sdk() {
+        let nvidia = Resolved::new(inputs("auto", FULL));
+        fill(&nvidia.probes.auto_is_vaapi, false);
+        assert!(!nvidia.zero_copy_is_vaapi() && nvidia.hdr_cuda_ok());
+        let amd = Resolved::new(inputs("auto", FULL));
+        fill(&amd.probes.auto_is_vaapi, true);
+        assert!(amd.zero_copy_is_vaapi());
+        let no_sdk = Resolved::new(inputs(
+            "auto",
+            Features {
+                nvenc: false,
+                ..FULL
+            },
+        ));
+        assert!(no_sdk.zero_copy_is_vaapi() && !no_sdk.hdr_cuda_ok());
+        assert!(no_sdk.probes.auto_is_vaapi.get().is_none());
+    }
+
+    /// An unknown pref answers as `auto` for the advertisement and still fails at open.
+    #[test]
+    fn an_unknown_pref_answers_auto_and_fails_the_open() {
+        let r = Resolved::new(inputs("banana", FULL));
+        fill(&r.probes.auto_is_vaapi, true);
+        assert!(r.zero_copy_is_vaapi() && r.is_gpu());
+        let err = match open(&r, &params(Codec::H264), &Knobs::from_env()) {
+            Ok(_) => panic!("an unknown pref must not open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("unknown PUNKTFUNK_ENCODER"),
+            "{err:#}"
+        );
+    }
+
+    /// A pin advertises only what this build can open: no H.26x for a `vulkan` pin without
+    /// Vulkan Video, nothing for an `nvenc` pin without the direct SDK (sweep R5-04).
+    #[test]
+    fn a_pin_advertises_only_what_the_build_opens() {
+        let codecs = punktfunk_core::quic::CODEC_H264
+            | punktfunk_core::quic::CODEC_HEVC
+            | punktfunk_core::quic::CODEC_AV1;
+        let vulkan_pin = Resolved::new(inputs(
+            "vulkan",
+            Features {
+                vulkan_encode: false,
+                ..FULL
+            },
+        ));
+        fill(&vulkan_pin.probes.auto_is_vaapi, true);
+        fill(&vulkan_pin.probes.vaapi, ALL);
+        assert_eq!(vulkan_pin.wire_caps() & codecs, 0);
+        let nvenc_pin = Resolved::new(inputs(
+            "nvenc",
+            Features {
+                nvenc: false,
+                pyrowave: false,
+                ..FULL
+            },
+        ));
+        assert_eq!(nvenc_pin.wire_caps(), 0);
+        let with_pyrowave = Resolved::new(inputs(
+            "nvenc",
+            Features {
+                nvenc: false,
+                ..FULL
+            },
+        ));
+        assert_eq!(
+            with_pyrowave.wire_caps(),
+            punktfunk_core::quic::CODEC_PYROWAVE
+        );
+    }
+
+    /// A `software` pin is H.264 on the CPU, and never offers PyroWave.
+    #[test]
+    fn a_software_pin_is_h264_on_the_cpu() {
+        let r = Resolved::new(inputs("software", FULL));
+        assert_eq!(r.wire_caps(), punktfunk_core::quic::CODEC_H264);
+        assert!(!r.is_gpu());
+    }
+
+    /// The Encoder row keys the resolution: a 4:4:4 verdict probed under `nvenc` never answers
+    /// for `vaapi` on the same GPU (sweep R5-01).
+    #[test]
+    fn an_encoder_row_flip_resolves_afresh() {
+        let cache = Mutex::new(HashMap::new());
+        let nv = resolve_in(&cache, inputs("nvenc", FULL));
+        fill(&nv.probes.nvenc, nvenc(true, true));
+        assert!(nv.can_encode_444(Codec::H265));
+        let va = resolve_in(&cache, inputs("vaapi", FULL));
+        assert!(!Arc::ptr_eq(&nv, &va));
+        assert!(!va.can_encode_444(Codec::H265));
+        assert!(Arc::ptr_eq(&nv, &resolve_in(&cache, inputs("nvenc", FULL))));
+    }
+
+    /// The Vulkan row decides what AMD/Intel opens: with it HEVC 10-bit and AV1 native NV12
+    /// come from Vulkan Video, without it libva answers alone (10-02).
+    #[test]
+    fn the_vulkan_row_decides_the_amd_answers() {
+        let cache = Mutex::new(HashMap::new());
+        let on = resolve_in(&cache, inputs("vaapi", FULL));
+        let off = resolve_in(
+            &cache,
+            ResolveInputs {
+                vulkan_row: false,
+                ..inputs("vaapi", FULL)
+            },
+        );
+        assert!(!Arc::ptr_eq(&on, &off));
+        for r in [&on, &off] {
+            fill(&r.probes.vulkan[0], vulkan(true, true));
+            fill(&r.probes.vulkan[1], vulkan(true, false));
+            fill(&r.probes.vaapi_ten_bit[0], false);
+        }
+        assert!(on.can_encode_10bit(Codec::H265) && !off.can_encode_10bit(Codec::H265));
+        assert!(on.native_nv12_ok(Codec::Av1, 8, false, false, false));
+        assert!(!off.native_nv12_ok(Codec::Av1, 8, false, false, false));
+        assert!(off.native_nv12_ok(Codec::H265, 8, false, false, false));
+    }
+
+    /// Which backend writes 10-bit from an 8-bit SDR surface.
+    #[test]
+    fn the_sdr10_carry_follows_the_backend() {
+        let amd = Resolved::new(inputs("vaapi", FULL));
+        fill(&amd.probes.vulkan[1], vulkan(true, false));
+        assert!(amd.carries_sdr10(Codec::H265));
+        assert!(
+            !amd.carries_sdr10(Codec::Av1),
+            "AV1 needs Vulkan's 10-bit profile"
+        );
+        let amd_av1 = Resolved::new(inputs("vaapi", FULL));
+        fill(&amd_av1.probes.vulkan[1], vulkan(true, true));
+        assert!(amd_av1.carries_sdr10(Codec::Av1));
+        assert!(Resolved::new(inputs("nvenc", FULL)).carries_sdr10(Codec::H265));
+        let no_sdk = Features {
+            nvenc: false,
+            ..FULL
+        };
+        assert!(!Resolved::new(inputs("nvenc", no_sdk)).carries_sdr10(Codec::H265));
+        let vulkan_pin = Resolved::new(inputs("vulkan", FULL));
+        fill(&vulkan_pin.probes.vulkan[0], vulkan(true, true));
+        assert!(vulkan_pin.carries_sdr10(Codec::H265) && !vulkan_pin.carries_sdr10(Codec::H264));
+        assert!(!Resolved::new(inputs("software", FULL)).carries_sdr10(Codec::H265));
+        assert!(Resolved::new(inputs("software", FULL)).carries_sdr10(Codec::PyroWave));
+        let no_pyrowave = Features {
+            pyrowave: false,
+            ..FULL
+        };
+        assert!(!Resolved::new(inputs("software", no_pyrowave)).carries_sdr10(Codec::PyroWave));
+    }
+
+    /// 4:4:4 is NVENC's cap on HEVC, PyroWave's always, nobody's on H.264 or AMD/Intel.
+    #[test]
+    fn the_444_verdict_follows_the_backend() {
+        let nv = Resolved::new(inputs("nvenc", FULL));
+        fill(&nv.probes.nvenc, nvenc(true, false));
+        assert!(nv.can_encode_444(Codec::H265) && !nv.can_encode_444(Codec::H264));
+        assert!(nv.can_encode_444(Codec::PyroWave));
+        let no_cap = Resolved::new(inputs("nvenc", FULL));
+        fill(&no_cap.probes.nvenc, nvenc(false, false));
+        assert!(!no_cap.can_encode_444(Codec::H265));
+        let no_sdk = Features {
+            nvenc: false,
+            ..FULL
+        };
+        assert!(!Resolved::new(inputs("nvenc", no_sdk)).can_encode_444(Codec::H265));
+        assert!(!Resolved::new(inputs("vaapi", FULL)).can_encode_444(Codec::H265));
+    }
 }
