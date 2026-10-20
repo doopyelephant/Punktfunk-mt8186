@@ -4,12 +4,26 @@
 //! negotiate and to plan capture.
 
 use super::*;
+use crate::env_knobs::Knobs;
+
+/// What resolution found on Windows. Each cell is filled the first time an answer needs it.
+#[derive(Debug, Default)]
+pub(crate) struct Probes {
+    /// [`Resolved::backend`].
+    pub(crate) backend: OnceLock<WindowsBackend>,
+    /// The resolved backend's codec probe ([`probe_codec_support`]).
+    pub(crate) codecs: OnceLock<CodecSupport>,
+}
 
 /// The pf-vdisplay driver holds the only Windows encoder: it opens the backend on the pooled
 /// device inside WUDFHost and publishes access units into the session's AU section, which
 /// `pf_capture::open_driver_encoder` wraps as the loop's `Encoder`. Reaching here means a
 /// session resolved to a non-IDD-push capture source, which no longer exists.
-pub(crate) fn open(_: &OpenParams) -> Result<(Box<dyn Encoder>, &'static str)> {
+pub(crate) fn open(
+    _: &Resolved,
+    _: &OpenParams,
+    _: &Knobs,
+) -> Result<(Box<dyn Encoder>, &'static str)> {
     anyhow::bail!(
         "on Windows the pf-vdisplay driver encodes; the host opens no local video encoder \
          (the session must come from the IDD-push capture source)"
@@ -21,31 +35,36 @@ const GPU_SUPERSET: u8 = punktfunk_core::quic::CODEC_H264
     | punktfunk_core::quic::CODEC_HEVC
     | punktfunk_core::quic::CODEC_AV1;
 
-/// [`crate::host_wire_caps`] on Windows.
-pub(crate) fn wire_caps() -> u8 {
+/// [`Resolved::wire_caps`] on Windows, over one resolution of the backend.
+pub(crate) fn wire_caps(r: &Resolved) -> u8 {
+    let backend = r.backend();
     // PyroWave: its own Vulkan device by render-GPU id; the H.26x backend is irrelevant, and
     // software keeps the bit off. Interop is confirmed at encoder open
     // (`pyrowave_device_confirm_interop_support`); a failed open renegotiates to HEVC.
-    let pyro =
-        if cfg!(feature = "pyrowave") && windows_resolved_backend() != WindowsBackend::Software {
-            punktfunk_core::quic::CODEC_PYROWAVE
-        } else {
-            0
-        };
-    let base = if windows_resolved_backend() == WindowsBackend::Software {
+    let pyro = if r.inputs.features.pyrowave && backend != WindowsBackend::Software {
+        punktfunk_core::quic::CODEC_PYROWAVE
+    } else {
+        0
+    };
+    let base = if backend == WindowsBackend::Software {
         punktfunk_core::quic::CODEC_H264
-    } else if windows_backend_is_probed() {
-        codec_support_wire_mask(windows_codec_support()).unwrap_or(GPU_SUPERSET)
+    } else if r.is_probed() {
+        codec_support_wire_mask(r.codecs()).unwrap_or(GPU_SUPERSET)
     } else {
         GPU_SUPERSET
     };
     base | pyro
 }
 
+/// [`Resolved::advertised`] on Windows: the probe, where the backend has one.
+pub(crate) fn advertised(r: &Resolved) -> Option<CodecSupport> {
+    r.is_probed().then(|| r.codecs())
+}
+
 /// HEVC 4:4:4 on the resolved backend. Only NVENC probes: VCN has no 4:4:4 encode
 /// (`design/native-amf-encoder.md`), VPL has no 4:4:4 query wired, and no MFT encodes it.
-pub(crate) fn hevc_444() -> bool {
-    match windows_resolved_backend() {
+pub(crate) fn hevc_444(r: &Resolved) -> bool {
+    match r.backend() {
         #[cfg(feature = "nvenc")]
         WindowsBackend::Nvenc => {
             nvenc::probe_can_encode_444(Codec::H265, pf_gpu::resolve_render_adapter_luid())
@@ -56,8 +75,8 @@ pub(crate) fn hevc_444() -> bool {
 
 /// 10-bit `codec` on the resolved backend. A backend compiled out of this build answers
 /// `false`, and Media Foundation is 8-bit 4:2:0 only: it rejects P010 at open.
-pub(crate) fn ten_bit(codec: Codec) -> bool {
-    match windows_resolved_backend() {
+pub(crate) fn ten_bit(r: &Resolved, codec: Codec) -> bool {
+    match r.backend() {
         #[cfg(feature = "nvenc")]
         WindowsBackend::Nvenc => {
             nvenc::probe_can_encode_10bit(codec, pf_gpu::resolve_render_adapter_luid())
@@ -73,18 +92,18 @@ pub(crate) fn ten_bit(codec: Codec) -> bool {
     }
 }
 
-/// [`crate::resolved_backend_is_gpu`] on Windows.
-pub(crate) fn is_gpu() -> bool {
-    !matches!(windows_resolved_backend(), WindowsBackend::Software)
+/// [`Resolved::is_gpu`] on Windows.
+pub(crate) fn is_gpu(r: &Resolved) -> bool {
+    !matches!(r.backend(), WindowsBackend::Software)
 }
 
 /// Only NVENC ingests RGB and converts to 4:4:4 itself.
-pub(crate) fn ingests_rgb_444() -> bool {
-    windows_resolved_backend() == WindowsBackend::Nvenc
+pub(crate) fn ingests_rgb_444(r: &Resolved) -> bool {
+    r.backend() == WindowsBackend::Nvenc
 }
 
-/// [`crate::backend_carries_sdr10`] on Windows.
-pub(crate) fn sdr10(codec: Codec) -> bool {
+/// [`Resolved::carries_sdr10`] on Windows.
+pub(crate) fn sdr10(r: &Resolved, codec: Codec) -> bool {
     // The driver's PyroWave writes 16-bit planes from the FP16 SDR wide-colour desktop; the
     // handshake admits it only with that source.
     if codec == Codec::PyroWave {
@@ -93,10 +112,44 @@ pub(crate) fn sdr10(codec: Codec) -> bool {
     // NVENC widens 8→10 from packed RGB. AMF and QSV take a BT.709 P010 the driver produces
     // (`EncodeInput::P010Sdr`, or `P010Wcg` from wide colour). HEVC Main10 and AV1 alike;
     // `can_encode_10bit` still gates on the real probe.
-    match windows_resolved_backend() {
+    match r.backend() {
         WindowsBackend::Nvenc => true,
         WindowsBackend::Amf | WindowsBackend::Qsv => matches!(codec, Codec::H265 | Codec::Av1),
         _ => false,
+    }
+}
+
+impl Resolved {
+    /// The Windows backend: `auto` → the selected adapter's vendor; a contradicting pin is
+    /// overridden ([`resolve_windows_backend`]). Resolved once per inputs; the session plan and
+    /// the driver encoder read it.
+    pub fn backend(&self) -> WindowsBackend {
+        *self
+            .probes
+            .backend
+            .get_or_init(|| windows_resolved_backend(&self.inputs.pref))
+    }
+
+    /// True if the codec advertisement comes from a real GPU probe ([`Self::codecs`]) rather
+    /// than the static superset. AMF always; QSV with `qsv`; NVENC with `nvenc`.
+    fn is_probed(&self) -> bool {
+        match self.backend() {
+            WindowsBackend::Amf => true,
+            WindowsBackend::Qsv => self.inputs.features.qsv,
+            WindowsBackend::Nvenc => self.inputs.features.nvenc,
+            // MFT enumeration is the probe, and it needs no feature.
+            WindowsBackend::MediaFoundation => true,
+            WindowsBackend::Software => false,
+        }
+    }
+
+    /// The resolved backend's codec probe. Ask only when [`Self::is_probed`]. AV1 and HEVC must
+    /// be probed, not assumed.
+    fn codecs(&self) -> CodecSupport {
+        *self
+            .probes
+            .codecs
+            .get_or_init(|| probe_codec_support(self.backend()))
     }
 }
 
@@ -108,9 +161,8 @@ enum GpuVendor {
 }
 
 /// Explicit `PUNKTFUNK_ENCODER` pin. `None` for `auto`, unset, and unknown.
-fn windows_pinned_backend() -> Option<WindowsBackend> {
-    // Latched in HostConfig; do not re-read the env.
-    match pf_host_config::config().encoder_pref.as_str() {
+fn windows_pinned_backend(pref: &str) -> Option<WindowsBackend> {
+    match pref {
         "nvenc" | "hw" | "nvidia" | "cuda" => Some(WindowsBackend::Nvenc),
         "amf" | "amd" => Some(WindowsBackend::Amf),
         "qsv" | "intel" => Some(WindowsBackend::Qsv),
@@ -120,22 +172,10 @@ fn windows_pinned_backend() -> Option<WindowsBackend> {
     }
 }
 
-/// Has the selected adapter a hardware MFT? Cached per selected GPU, like
-/// [`can_encode_444`]: [`windows_resolved_backend`] is uncached and runs on every
-/// `/serverinfo` poll, where an `MFTEnum2` walk plus an adapter resolve would block the
-/// async executor and log on each one.
-fn mf_has_hardware_encoder() -> bool {
-    static CACHE: ProbeCache<String, bool> = OnceLock::new();
-    probe_cached(&CACHE, pf_gpu::selection_key(), || {
-        mf::probe_has_hardware_encoder(pf_gpu::resolve_render_adapter_luid())
-    })
-}
-
-/// Active Windows backend. `auto` → selected adapter's vendor; a contradicting
-/// pin is overridden ([`resolve_windows_backend`]). Shared with GameStream.
-pub fn windows_resolved_backend() -> WindowsBackend {
-    let pinned = windows_pinned_backend();
-    // Vendor query only to reconcile a pin — auto stays one inventory walk.
+/// The backend for `pref` on the selected adapter. The vendor query runs only to reconcile a
+/// pin, so `auto` stays one inventory walk; the MFT walk runs only with no known vendor.
+fn windows_resolved_backend(pref: &str) -> WindowsBackend {
+    let pinned = windows_pinned_backend(pref);
     let selected = if pinned.is_some() {
         pf_gpu::selected_gpu().map(|s| s.info.vendor_id)
     } else {
@@ -148,29 +188,16 @@ pub fn windows_resolved_backend() -> WindowsBackend {
         // No vendor with a native SDK. An adapter that still has a hardware MFT (Adreno)
         // is a GPU backend, and must resolve to one: `Software` here would also flip the
         // capturer to CPU staging, so the D3D11 input MF needs would never materialise.
-        None if mf_has_hardware_encoder() => WindowsBackend::MediaFoundation,
+        None if mf::probe_has_hardware_encoder(pf_gpu::resolve_render_adapter_luid()) => {
+            WindowsBackend::MediaFoundation
+        }
         None => WindowsBackend::Software,
     })
 }
 
-/// True if the Windows codec advertisement comes from a real GPU probe
-/// ([`windows_codec_support`]) rather than the static superset. AMF always;
-/// QSV with `qsv`; NVENC with `nvenc`.
-pub fn windows_backend_is_probed() -> bool {
-    match windows_resolved_backend() {
-        WindowsBackend::Amf => true,
-        WindowsBackend::Qsv => cfg!(feature = "qsv"),
-        WindowsBackend::Nvenc => cfg!(feature = "nvenc"),
-        // MFT enumeration is the probe, and it needs no feature.
-        WindowsBackend::MediaFoundation => true,
-        WindowsBackend::Software => false,
-    }
-}
-
 /// Encode-GPU vendor from the **selected** render adapter — the same one
 /// capture and the IddCx pin sit on. Do not scan DXGI adapter 0: on hybrid
-/// boxes that is often the iGPU while textures live on the dGPU. Uncached
-/// (preference-dependent; session setup only). Unknown vendor → first known.
+/// boxes that is often the iGPU while textures live on the dGPU. Unknown vendor → first known.
 fn windows_gpu_vendor() -> Option<GpuVendor> {
     fn by_id(vendor_id: u32) -> Option<GpuVendor> {
         match vendor_id {
@@ -185,20 +212,10 @@ fn windows_gpu_vendor() -> Option<GpuVendor> {
         .or_else(|| pf_gpu::enumerate().iter().find_map(|g| by_id(g.vendor_id)))
 }
 
-/// Windows encode-codec probe, cached per (backend, selected GPU) so a
-/// console preference change re-probes. Call only when
-/// [`windows_backend_is_probed`]. AV1 and HEVC must be probed, not assumed.
+/// The probe behind [`Resolved::codecs`], for the backend it resolved.
 ///
 /// AMD: native factory probe (the path the session opens). QSV: native VPL
 /// Query. NVIDIA: the driver's GUID list.
-pub fn windows_codec_support() -> CodecSupport {
-    static CACHE: ProbeCache<String, CodecSupport> = OnceLock::new();
-    let backend = windows_resolved_backend();
-    let key = format!("{backend:?}:{}", pf_gpu::selection_key());
-    probe_cached(&CACHE, key, || probe_codec_support(backend))
-}
-
-/// The uncached half of [`windows_codec_support`], for the backend it resolved.
 fn probe_codec_support(backend: WindowsBackend) -> CodecSupport {
     let probe_one = |codec: Codec| -> bool {
         match backend {

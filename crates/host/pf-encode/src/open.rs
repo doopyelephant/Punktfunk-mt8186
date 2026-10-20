@@ -1,17 +1,18 @@
 //! Opening a session's encoder: the checks every backend shares, the per-OS ladder in
-//! [`crate::resolve`], and the live-session record every opened encoder carries.
+//! `resolve`, which opens the backend a [`Resolved`] names, and the live-session record every
+//! opened encoder carries.
 
 use crate::env_knobs::Knobs;
 use crate::{
     validate_dimensions, Acked, AuChunk, ChromaFormat, Codec, EncodedFrame, Encoder, EncoderCaps,
+    Resolved,
 };
 use anyhow::Result;
 use pf_frame::{CapturedFrame, PixelFormat};
 
-/// Open the encoder the Encoder row resolves to (`auto` picks by GPU) for `format` and mode.
-/// `cuda` is GPU frames from the NVIDIA zero-copy path, derived by the caller from the first
-/// captured frame; otherwise packed RGB/BGR CPU frames. The crate's env knobs are read here,
-/// once per open.
+/// Open the encoder the resolution in force names, for `params`. `params.cuda` is GPU frames
+/// from the NVIDIA zero-copy path, derived by the caller from the first captured frame;
+/// otherwise packed RGB/BGR CPU frames. The crate's env knobs are read here, once per open.
 #[allow(clippy::too_many_arguments)]
 pub fn open_video(
     codec: Codec,
@@ -22,33 +23,38 @@ pub fn open_video(
     bitrate_bps: u64,
     cuda: bool,
     bit_depth: u8,
-    // The handshake's HDR verdict; 10-bit without it is BT.709.
     hdr: bool,
     chroma: ChromaFormat,
-    // Backends whose fast path can't blend (Vulkan EFC) key off `cursor_blend`.
     cursor_blend: bool,
-    // H.264/HEVC slices per frame the client takes. 1 = single-slice (some TVs wedge on
-    // multi-slice AUs). Only NVENC slices; `PUNKTFUNK_NVENC_SLICES` overrides.
     slices: u32,
 ) -> Result<Box<dyn Encoder>> {
-    let (inner, backend) = open_video_backend(OpenParams {
+    let params = OpenParams {
         codec,
         format,
         width,
         height,
         fps,
-        bitrate_bps: bitrate_bps.max(MIN_BITRATE_BPS),
+        bitrate_bps,
         cuda,
         bit_depth,
         hdr,
         chroma,
         cursor_blend,
         slices,
-        knobs: Knobs::from_env(),
-    })?;
+    };
+    let resolved: &Resolved = &crate::resolve();
+    let knobs = Knobs::from_env();
+    let (inner, backend) = open_video_backend(
+        resolved,
+        OpenParams {
+            bitrate_bps: params.bitrate_bps.max(MIN_BITRATE_BPS),
+            ..params
+        },
+        &knobs,
+    )?;
     // Open-time fallback (Vulkan→VAAPI) and gamescope (no embedded cursor) still
     // reach here. `open_video` cannot re-plan capture, so a warning is all it does.
-    if cursor_blend && !inner.caps().blends_cursor {
+    if params.cursor_blend && !inner.caps().blends_cursor {
         tracing::warn!(
             backend,
             "session negotiated a composited cursor but this encode backend does not blend \
@@ -184,33 +190,36 @@ impl Encoder for TrackedEncoder {
 /// matching the host's own 500 kbps ABR floor.
 pub const MIN_BITRATE_BPS: u64 = 500_000;
 
-/// What a session asks [`open_video`] for, as one value the per-OS openers read. Only Linux
-/// direct-SDK NVENC reads every field; other builds leave some unread.
-#[derive(Clone)]
-#[cfg_attr(not(all(target_os = "linux", feature = "nvenc")), allow(dead_code))]
-pub(crate) struct OpenParams {
-    pub(crate) codec: Codec,
-    pub(crate) format: PixelFormat,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) fps: u32,
-    pub(crate) bitrate_bps: u64,
-    pub(crate) cuda: bool,
-    pub(crate) bit_depth: u8,
+/// What a session asks [`open_video`] for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OpenParams {
+    pub codec: Codec,
+    pub format: PixelFormat,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_bps: u64,
+    pub cuda: bool,
+    pub bit_depth: u8,
     /// The session's colour: BT.2020 PQ, else BT.709 at either depth. Never read off the
     /// format — gamescope hands 10-bit SDR over as P010 or packed RGB too.
-    pub(crate) hdr: bool,
-    pub(crate) chroma: ChromaFormat,
-    pub(crate) cursor_blend: bool,
-    pub(crate) slices: u32,
-    /// The environment, read once for this open.
-    pub(crate) knobs: Knobs,
+    pub hdr: bool,
+    pub chroma: ChromaFormat,
+    /// Backends whose fast path can't blend (Vulkan EFC) key off it.
+    pub cursor_blend: bool,
+    /// H.264/HEVC slices per frame the client takes. 1 = single-slice (some TVs wedge on
+    /// multi-slice AUs). Only NVENC slices; `PUNKTFUNK_NVENC_SLICES` overrides.
+    pub slices: u32,
 }
 
 /// Open the platform encoder. The display label is the branch that opened
 /// (`nvenc`/`vaapi`/`vulkan`/`amf`/`qsv`/`software`), including internal
 /// fallbacks (Vulkan Video → VAAPI). Feeds the mgmt live-session record.
-fn open_video_backend(p: OpenParams) -> Result<(Box<dyn Encoder>, &'static str)> {
+fn open_video_backend(
+    resolved: &Resolved,
+    p: OpenParams,
+    knobs: &Knobs,
+) -> Result<(Box<dyn Encoder>, &'static str)> {
     let OpenParams {
         codec,
         width,
@@ -236,7 +245,7 @@ fn open_video_backend(p: OpenParams) -> Result<(Box<dyn Encoder>, &'static str)>
     } else {
         chroma
     };
-    crate::resolve::open(&OpenParams { chroma, ..p })
+    crate::resolve::open(resolved, &OpenParams { chroma, ..p }, knobs)
 }
 
 #[cfg(test)]

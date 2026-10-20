@@ -1,6 +1,6 @@
 //! Linux backend selection: the `PUNKTFUNK_ENCODER` resolver, the open ladder (direct-SDK
-//! NVENC, Vulkan Video, native VAAPI, PyroWave, openh264) and every capability mirror that
-//! must agree with it.
+//! NVENC, Vulkan Video, native VAAPI, PyroWave, openh264) and every capability answer that
+//! must agree with it, each read off one [`Resolved`].
 
 use super::*;
 use crate::env_knobs::Knobs;
@@ -8,79 +8,126 @@ use pf_frame::PixelFormat;
 
 pub use crate::vk_util::anv_video_encode_flag;
 
-/// [`crate::open_video`]'s backend half.
-pub(crate) fn open(p: &OpenParams) -> Result<(Box<dyn Encoder>, &'static str)> {
-    open_video_backend_linux(pf_host_config::config().encoder_pref.as_str(), p)
+/// What resolution found on Linux. Each cell is filled the first time an answer needs it.
+#[derive(Debug, Default)]
+pub(crate) struct Probes {
+    /// The backend the capability answers read ([`Resolved::linux_resolved_backend`]).
+    pub(crate) backend: OnceLock<LinuxBackend>,
+    /// `auto` reads VAAPI ([`linux_auto_is_vaapi`]).
+    pub(crate) auto_is_vaapi: OnceLock<bool>,
+    /// The direct SDK's codec list, 4:4:4 and 10-bit caps.
+    pub(crate) nvenc: OnceLock<NvencFacts>,
+    /// The AMD/Intel plane's 8-bit codec set ([`Resolved::probe_vaapi_codec_support`]).
+    pub(crate) vaapi: OnceLock<CodecSupport>,
+    /// libva's 10-bit encode entrypoints, HEVC then AV1.
+    pub(crate) vaapi_ten_bit: [OnceLock<bool>; 2],
+    /// Vulkan Video encode caps, HEVC then AV1.
+    pub(crate) vulkan: [OnceLock<VulkanFacts>; 2],
+    /// pf-zerocopy's raw lane: `PUNKTFUNK_NVENC_RAW`, and a box that runs the fused convert.
+    pub(crate) nvenc_raw: OnceLock<bool>,
 }
 
-/// [`crate::host_wire_caps`] on Linux. Resolves the backend once: this path is polled, and the
-/// auto arm samples live GPU-preference state.
-pub(crate) fn wire_caps() -> u8 {
-    let backend = linux_resolved_backend();
-    // PyroWave ORs onto the H.26x set whenever a GPU backend could open its Vulkan device;
-    // software keeps it off. `resolve_codec` ignores the bit unless the client prefers it.
-    let pyro = if cfg!(feature = "pyrowave") && backend != LinuxBackend::Software {
+/// The direct SDK's answers. Codecs fail open (all-`false` is unanswered); 4:4:4 and 10-bit
+/// fail closed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NvencFacts {
+    pub(crate) codecs: CodecSupport,
+    pub(crate) hevc_444: bool,
+    pub(crate) ten_bit: CodecSupport,
+}
+
+/// Vulkan Video encode for one codec: an encode queue, and the profile at each depth. A device
+/// can offer HEVC Main10 and still decline 10-bit AV1.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct VulkanFacts {
+    pub(crate) supported: bool,
+    pub(crate) eight_bit: bool,
+    pub(crate) ten_bit: bool,
+}
+
+/// [`Resolved::wire_caps`] on Linux: the narrowed probe `/serverinfo` advertises too, so the
+/// two cannot drift. PyroWave ORs onto the H.26x set whenever a GPU backend could open its
+/// Vulkan device; `resolve_codec` ignores the bit unless the client prefers it.
+pub(crate) fn wire_caps(r: &Resolved) -> u8 {
+    let pyro = if r.inputs.features.pyrowave && r.backend() != LinuxBackend::Software {
         punktfunk_core::quic::CODEC_PYROWAVE
     } else {
         0
     };
-    // Shared with `/serverinfo`, so the two advertisements cannot drift.
-    codec_support_wire_mask(linux_advertised_codec_support_for(backend)).unwrap_or(0) | pyro
+    codec_support_wire_mask(r.advertised_codecs()).unwrap_or(0) | pyro
+}
+
+/// [`Resolved::advertised`] on Linux: every backend answers, narrowed.
+pub(crate) fn advertised(r: &Resolved) -> Option<CodecSupport> {
+    Some(r.advertised_codecs())
 }
 
 /// HEVC 4:4:4 on the resolved backend: the direct SDK's `YUV444_ENCODE` cap. The native VAAPI
 /// session is 4:2:0 only.
-pub(crate) fn hevc_444() -> bool {
-    #[cfg(feature = "nvenc")]
-    {
-        !linux_zero_copy_is_vaapi() && nvenc_cuda::probe_support().hevc_444
+pub(crate) fn hevc_444(r: &Resolved) -> bool {
+    r.inputs.features.nvenc && !r.zero_copy_is_vaapi() && r.nvenc().hevc_444
+}
+
+/// 10-bit `codec` on the resolved backend, the Encoder row honoured. AMD/Intel tries Vulkan then
+/// VAAPI, so 10-bit is there if either says yes; NVIDIA asks the driver's `10BIT_ENCODE` cap.
+pub(crate) fn ten_bit(r: &Resolved, codec: Codec) -> bool {
+    if r.zero_copy_is_vaapi() {
+        return r.vulkan_10bit_available(codec) || r.vaapi_ten_bit(codec);
     }
-    #[cfg(not(feature = "nvenc"))]
-    {
-        false
+    if !r.inputs.features.nvenc {
+        return false;
+    }
+    let t = r.nvenc().ten_bit;
+    match codec {
+        Codec::H265 => t.h265,
+        Codec::Av1 => t.av1,
+        _ => false,
     }
 }
 
-/// 10-bit `codec` on the resolved backend. [`linux_zero_copy_is_vaapi`], not
-/// [`linux_auto_is_vaapi`], so `encoder_pref` is honoured. AMD/Intel tries Vulkan then VAAPI, so
-/// 10-bit is there if either says yes; NVIDIA asks the driver's `10BIT_ENCODE` cap.
-pub(crate) fn ten_bit(codec: Codec) -> bool {
-    if linux_zero_copy_is_vaapi() {
-        return vulkan_10bit_available(codec) || vaapi_native::probe_can_encode(codec, true);
-    }
-    #[cfg(feature = "nvenc")]
-    {
-        let t = nvenc_cuda::probe_support().ten_bit;
-        match codec {
-            Codec::H265 => t.h265,
-            Codec::Av1 => t.av1,
-            _ => false,
-        }
-    }
-    #[cfg(not(feature = "nvenc"))]
-    {
-        false
-    }
-}
-
-/// [`crate::resolved_backend_is_gpu`] on Linux.
-pub(crate) fn is_gpu() -> bool {
-    linux_resolved_backend() != LinuxBackend::Software
+/// [`Resolved::is_gpu`] on Linux.
+pub(crate) fn is_gpu(r: &Resolved) -> bool {
+    r.backend() != LinuxBackend::Software
 }
 
 /// Linux 4:4:4 is capture-side (portal RGB → `yuv444p`); no encoder ingests RGB for it.
-pub(crate) fn ingests_rgb_444() -> bool {
+pub(crate) fn ingests_rgb_444(_: &Resolved) -> bool {
     false
+}
+
+/// [`Resolved::carries_sdr10`] on Linux.
+pub(crate) fn sdr10(r: &Resolved, codec: Codec) -> bool {
+    // PyroWave's own CSC widens packed RGB to 10-bit (`rgb2yuv10_709.comp` / the 4:4:4
+    // twin) on its private Vulkan device — the resolved H.26x backend is irrelevant.
+    if codec == Codec::PyroWave {
+        return r.inputs.features.pyrowave;
+    }
+    // Direct NVENC (HEVC + AV1) widens 8→10 from packed RGB. On AMD/Intel, Vulkan Video carries
+    // HEVC Main10 and AV1 10-bit SDR (`rgb2yuv10_709.comp`) where the device offers the 10-bit
+    // profile, and VAAPI carries HEVC Main10 under BT.709 as the fallback. The encoder degrades a
+    // planar surface to 8-bit if some path delivers one.
+    match r.backend() {
+        LinuxBackend::Nvenc => r.inputs.features.nvenc,
+        LinuxBackend::AmdIntel => {
+            codec == Codec::H265 || (codec == Codec::Av1 && r.vulkan_10bit_available(codec))
+        }
+        LinuxBackend::Vulkan => {
+            matches!(codec, Codec::H265 | Codec::Av1) && r.vulkan_10bit_available(codec)
+        }
+        _ => false,
+    }
 }
 
 /// openh264 rate-control misconfigures if handed a hardware-session bitrate.
 const SW_BITRATE_CEIL: u64 = 100_000_000;
 
-/// [`open`] with the pref injected. `set_var` races `getenv` in parallel tests, and
-/// `pf_host_config::config()` latches once. Shared dim/fps/chroma checks stay in the caller.
-fn open_video_backend_linux(
-    pref: &str,
+/// [`crate::open_video`]'s backend half: the resolver over `resolved`'s pref and `auto` answer,
+/// so a CUDA frame still opens NVENC under `auto` and an unknown pref still fails here. Shared
+/// dim/fps/chroma checks stay in the caller.
+pub(crate) fn open(
+    resolved: &Resolved,
     p: &OpenParams,
+    knobs: &Knobs,
 ) -> Result<(Box<dyn Encoder>, &'static str)> {
     let OpenParams {
         codec,
@@ -110,7 +157,7 @@ fn open_video_backend_linux(
                 chroma,
                 bit_depth,
                 hdr,
-                &p.knobs,
+                knobs,
             )
             .map(|e| (e, "pyrowave"));
         }
@@ -130,7 +177,7 @@ fn open_video_backend_linux(
         #[cfg(not(feature = "vulkan-encode"))]
         let _ = pinned;
         #[cfg(feature = "vulkan-encode")]
-        if pinned || amd_intel_opens_vulkan(codec, bit_depth == 10, hdr) {
+        if pinned || resolved.amd_intel_opens_vulkan(codec, bit_depth == 10, hdr) {
             match vulkan_video::VulkanVideoEncoder::open(
                 codec,
                 format,
@@ -141,7 +188,7 @@ fn open_video_backend_linux(
                 p.cursor_blend,
                 bit_depth,
                 hdr,
-                &p.knobs,
+                knobs,
             ) {
                 Ok(e) => {
                     tracing::info!(
@@ -169,13 +216,14 @@ fn open_video_backend_linux(
             bit_depth,
             chroma,
             hdr,
-            &p.knobs,
+            knobs,
         )
         .map(|e| (Box::new(e) as Box<dyn Encoder>, "vaapi-native"))
     };
-    let open_nvidia = || open_nvenc(p).map(|e| (e, "nvenc"));
-    // Same resolver the capability mirrors consult, so the alias table exists once.
-    match resolve_linux_backend(pref, linux_auto_is_vaapi, cuda) {
+    let open_nvidia = || open_nvenc(p, knobs).map(|e| (e, "nvenc"));
+    let pref = resolved.inputs.pref.as_str();
+    // Same resolver the capability answers consult, so the alias table exists once.
+    match resolve_linux_backend(pref, || resolved.auto_is_vaapi(), cuda) {
         Some(LinuxBackend::Nvenc) => open_nvidia(),
         Some(LinuxBackend::AmdIntel) => open_amd_intel(false),
         Some(LinuxBackend::Vulkan) => {
@@ -217,7 +265,7 @@ fn open_video_backend_linux(
                     ChromaFormat::Yuv420,
                     bit_depth,
                     hdr,
-                    &p.knobs,
+                    knobs,
                 )
                 .map(|e| (e, "pyrowave"))
             }
@@ -243,7 +291,7 @@ fn open_video_backend_linux(
                 height,
                 fps,
                 bitrate_bps.min(SW_BITRATE_CEIL),
-                &p.knobs,
+                knobs,
             )
             .map(|e| (Box::new(e) as Box<dyn Encoder>, "software"))
         }
@@ -255,7 +303,7 @@ fn open_video_backend_linux(
 
 /// NVIDIA: the direct-SDK session (`--features nvenc`), which takes CUDA
 /// frames zero-copy and uploads CPU frames itself. Without it there is no NVENC.
-fn open_nvenc(p: &OpenParams) -> Result<Box<dyn Encoder>> {
+fn open_nvenc(p: &OpenParams, knobs: &Knobs) -> Result<Box<dyn Encoder>> {
     #[cfg(feature = "nvenc")]
     {
         tracing::info!(
@@ -276,11 +324,12 @@ fn open_nvenc(p: &OpenParams) -> Result<Box<dyn Encoder>> {
             p.chroma,
             p.cursor_blend,
             p.slices,
-            &p.knobs,
+            knobs,
         )?) as Box<dyn Encoder>)
     }
     #[cfg(not(feature = "nvenc"))]
     {
+        let _ = knobs;
         anyhow::bail!(
             "{} on NVIDIA needs the direct-SDK NVENC backend, which this build left out — \
              build with --features punktfunk-host/nvenc",
@@ -297,131 +346,355 @@ const fn native_planar_depth_matches(bit_depth: u8, hdr: bool, sdr10_native: boo
     bit_depth < 10 || hdr || sdr10_native
 }
 
-/// Whether this session can ingest a producer's own NV12 without a host pass. Both AMD/Intel
-/// lanes can: Vulkan Video imports it as its picture, the native libva session encodes it as
-/// imported. AV1 is Vulkan Video's alone there, and neither has a pass to blend a pointer
-/// into, so a `cursor_blend` session captures RGB. NVENC's raw lane copies the two planes into
-/// its own slot. It blends a pointer into NV12 but not P010, so a P010 session (HDR, or
-/// gamescope's 10-bit SDR) needs no blend.
-pub fn linux_native_nv12_ok(
-    codec: Codec,
-    bit_depth: u8,
-    hdr: bool,
-    cursor_blend: bool,
-    sdr10_native: bool,
-) -> bool {
-    if !native_planar_depth_matches(bit_depth, hdr, sdr10_native) {
-        return false;
+impl Resolved {
+    /// Whether this session can ingest a producer's own NV12 without a host pass. Both
+    /// AMD/Intel lanes can: Vulkan Video imports it as its picture, the native libva session
+    /// encodes it as imported. AV1 is Vulkan Video's alone there, and neither has a pass to
+    /// blend a pointer into, so a `cursor_blend` session captures RGB. NVENC's raw lane copies
+    /// the two planes into its own slot. It blends a pointer into NV12 but not P010, so a P010
+    /// session (HDR, or gamescope's 10-bit SDR) needs no blend.
+    pub fn native_nv12_ok(
+        &self,
+        codec: Codec,
+        bit_depth: u8,
+        hdr: bool,
+        cursor_blend: bool,
+        sdr10_native: bool,
+    ) -> bool {
+        if !native_planar_depth_matches(bit_depth, hdr, sdr10_native) {
+            return false;
+        }
+        if !self.zero_copy_is_vaapi() {
+            let p010 = hdr || (bit_depth == 10 && sdr10_native);
+            return !(p010 && cursor_blend)
+                && codec != Codec::PyroWave
+                && self.nvenc_raw_dmabuf_ok();
+        }
+        if cursor_blend {
+            return false;
+        }
+        match codec {
+            Codec::H264 | Codec::H265 => true,
+            Codec::Av1 => {
+                self.inputs.features.vulkan_encode
+                    && self.inputs.vulkan_row
+                    && self.vulkan_encode_available(codec)
+            }
+            _ => false,
+        }
     }
-    if !linux_zero_copy_is_vaapi() {
-        let p010 = hdr || (bit_depth == 10 && sdr10_native);
-        return !(p010 && cursor_blend) && codec != Codec::PyroWave && linux_nvenc_raw_dmabuf_ok();
-    }
-    if cursor_blend {
-        return false;
-    }
-    match codec {
-        Codec::H264 | Codec::H265 => true,
-        #[cfg(feature = "vulkan-encode")]
-        Codec::Av1 => vulkan_row() && vulkan_encode_available(codec),
-        _ => false,
-    }
-}
 
-/// May capture plan the NVENC raw-dmabuf lane? Its identity-scoped health applies the
-/// failure latch later, where the node id is known. Off without direct-SDK NVENC or on
-/// the AMD/Intel plane.
-pub fn linux_nvenc_raw_dmabuf_ok() -> bool {
-    #[cfg(feature = "nvenc")]
-    {
-        !linux_zero_copy_is_vaapi()
-            && pf_zerocopy::nvenc_raw_enabled()
-            && pf_zerocopy::fused_convert_available()
+    /// May capture plan the NVENC raw-dmabuf lane? Its identity-scoped health applies the
+    /// failure latch later, where the node id is known. Off without direct-SDK NVENC or on
+    /// the AMD/Intel plane.
+    pub fn nvenc_raw_dmabuf_ok(&self) -> bool {
+        self.inputs.features.nvenc
+            && !self.zero_copy_is_vaapi()
+            && *self.probes.nvenc_raw.get_or_init(|| {
+                pf_zerocopy::nvenc_raw_enabled() && pf_zerocopy::fused_convert_available()
+            })
     }
-    #[cfg(not(feature = "nvenc"))]
-    {
-        false
-    }
-}
 
-/// May an HDR capture stay zero-copy on NVIDIA (packed 10-bit PQ/BT.2020 CUDA)?
-///
-/// Only direct-SDK NVENC can: it registers `ARGB10`/`ABGR10` and CSCs in the
-/// encoder. When it is compiled out, the capturer must not build the HDR
-/// importer.
-pub fn linux_hdr_cuda_ok() -> bool {
-    #[cfg(feature = "nvenc")]
-    {
-        !linux_zero_copy_is_vaapi()
+    /// May an HDR capture stay zero-copy on NVIDIA (packed 10-bit PQ/BT.2020 CUDA)? Only
+    /// direct-SDK NVENC can: it registers `ARGB10`/`ABGR10` and CSCs in the encoder. Without it
+    /// the capturer must not build the HDR importer.
+    pub fn hdr_cuda_ok(&self) -> bool {
+        self.inputs.features.nvenc && !self.zero_copy_is_vaapi()
     }
-    #[cfg(not(feature = "nvenc"))]
-    {
-        false
-    }
-}
 
-/// Whether the resolved backend composites [`CapturedFrame::cursor`]. Answered
-/// before capture opens: blend-capable backends take cursor-as-metadata; else
-/// the compositor must embed the pointer.
-///
-/// `cuda_planned` is the caller's CUDA-payload prediction, which picks the backend;
-/// `ten_bit` the negotiated depth and `hdr` the colour verdict. NVENC blends any
-/// payload while its Vulkan slot device is up, the rule its `caps()` states; the slot
-/// device is predicted up. The AMD/Intel arm asks [`amd_intel_opens_vulkan`], the rule
-/// the open takes, so the prediction names the encoder the session gets.
-pub fn cursor_blend_capable(codec: Codec, cuda_planned: bool, ten_bit: bool, hdr: bool) -> bool {
-    // Negotiated PyroWave is selected before the pref; its CSC composites the cursor.
-    if codec == Codec::PyroWave {
-        return true;
-    }
-    let direct_nvenc = cfg!(feature = "nvenc");
-    let backend = resolve_linux_backend(
-        pf_host_config::config().encoder_pref.as_str(),
-        linux_auto_is_vaapi,
-        cuda_planned,
-    );
-    let vulkan_csc = {
+    /// Whether the resolved backend composites [`CapturedFrame::cursor`]. Answered
+    /// before capture opens: blend-capable backends take cursor-as-metadata; else
+    /// the compositor must embed the pointer.
+    ///
+    /// `cuda_planned` is the caller's CUDA-payload prediction, which picks the backend;
+    /// `ten_bit` the negotiated depth and `hdr` the colour verdict. NVENC blends any
+    /// payload while its Vulkan slot device is up, the rule its `caps()` states; the slot
+    /// device is predicted up. The AMD/Intel arm asks the rule the open takes, so the
+    /// prediction names the encoder the session gets.
+    ///
+    /// [`CapturedFrame::cursor`]: pf_frame::CapturedFrame::cursor
+    pub fn cursor_blend_capable(
+        &self,
+        codec: Codec,
+        cuda_planned: bool,
+        ten_bit: bool,
+        hdr: bool,
+    ) -> bool {
+        // Negotiated PyroWave is selected before the pref; its CSC composites the cursor.
+        if codec == Codec::PyroWave {
+            return true;
+        }
+        let backend =
+            resolve_linux_backend(&self.inputs.pref, || self.auto_is_vaapi(), cuda_planned);
         // Compute-CSC arm (the one that blends). Probe last: it opens a Vulkan instance.
-        #[cfg(feature = "vulkan-encode")]
-        {
-            if matches!(backend, Some(LinuxBackend::AmdIntel)) {
-                amd_intel_opens_vulkan(codec, ten_bit, hdr)
+        let vulkan_csc = self.inputs.features.vulkan_encode
+            && if matches!(backend, Some(LinuxBackend::AmdIntel)) {
+                self.amd_intel_opens_vulkan(codec, ten_bit, hdr)
             } else {
                 // An explicit Vulkan pref opens Vulkan at the negotiated depth.
                 matches!(codec, Codec::H265 | Codec::Av1)
-                    && vulkan_row()
-                    && vulkan_encode_available_at(codec, ten_bit)
-            }
+                    && self.inputs.vulkan_row
+                    && self.vulkan_encode_available_at(codec, ten_bit)
+            };
+        cursor_blend_capable_for(backend, self.inputs.features.nvenc, vulkan_csc)
+    }
+
+    /// Tiled dmabuf modifiers the session's encoder lane proved it can import for
+    /// the capture `fourcc` — what the gamescope producer's tiled offer narrows to.
+    /// Empty means LINEAR-only. Each lane returns its own proved list: Vulkan
+    /// Video answers come from the packed-usage probes, VAAPI answers from
+    /// `Display::import_dmabuf` + VPP, never one lane filtered by the other.
+    pub fn capture_modifiers(
+        &self,
+        codec: Codec,
+        fourcc: u32,
+        bit_depth: u8,
+        hdr: bool,
+    ) -> Vec<u64> {
+        #[cfg(feature = "pyrowave")]
+        if codec == Codec::PyroWave {
+            return pyrowave_capture_modifiers(fourcc);
+        }
+        // A build without PyroWave has no module to ask; advertise LINEAR.
+        #[cfg(not(feature = "pyrowave"))]
+        if codec == Codec::PyroWave {
+            return Vec::new();
+        }
+        // The rule the open takes, so the capture answers come from the encoder that opens.
+        #[cfg(feature = "vulkan-encode")]
+        if self.amd_intel_opens_vulkan(codec, bit_depth >= 10, hdr) {
+            return vulkan_video::vulkan_capture_modifiers(codec, fourcc, bit_depth >= 10);
         }
         #[cfg(not(feature = "vulkan-encode"))]
-        {
-            let _ = (ten_bit, hdr); // they only ever narrow the Vulkan arm
-            false
-        }
-    };
-    cursor_blend_capable_for(backend, direct_nvenc, vulkan_csc)
-}
+        let _ = (bit_depth, hdr);
+        let candidates = vk_util::sampled_capture_modifiers(fourcc);
+        vaapi_native::vaapi_capture_modifiers(fourcc, &candidates)
+    }
 
-/// The depth the AMD/Intel arm asks Vulkan Video for, or `None` when it goes straight to VAAPI.
-/// HEVC and AV1 take Vulkan at the negotiated depth, HDR or SDR alike: 10-bit SDR is HEVC Main10
-/// or AV1 10-bit under BT.709 through `rgb2yuv10_709.comp`. H.264 has no Vulkan path. The
-/// colour verdict rides along for the callers that already carry it; the depth is the rule.
-#[cfg(feature = "vulkan-encode")]
-fn amd_intel_vulkan_depth(codec: Codec, ten_bit: bool, _hdr: bool) -> Option<bool> {
-    match codec {
-        Codec::H265 | Codec::Av1 => Some(ten_bit),
-        _ => None,
+    /// True if the Linux GPU backend is VAAPI rather than NVENC — so capture picks dmabuf
+    /// passthrough vs EGL→CUDA. Mirrors [`crate::open_video`].
+    pub fn zero_copy_is_vaapi(&self) -> bool {
+        match self.backend() {
+            LinuxBackend::Nvenc => false,
+            LinuxBackend::AmdIntel => true,
+            // Raw dmabuf on any vendor — never the EGL→CUDA import.
+            LinuxBackend::Pyrowave => true,
+            // Preserved `_` fallthrough, not endorsed. Vulkan-on-NVIDIA is a known
+            // mismatch (EGL→CUDA for a dmabuf importer); software is latent (H.264).
+            LinuxBackend::Vulkan | LinuxBackend::Software => self.auto_is_vaapi(),
+        }
+    }
+
+    /// The backend every capability answer reads, resolved once.
+    fn backend(&self) -> LinuxBackend {
+        *self
+            .probes
+            .backend
+            .get_or_init(|| self.linux_resolved_backend())
+    }
+
+    /// The resolver with an unknown pref answering as `auto`, and `cuda = false`: these answer
+    /// pre-session questions.
+    fn linux_resolved_backend(&self) -> LinuxBackend {
+        resolve_linux_backend(&self.inputs.pref, || self.auto_is_vaapi(), false).unwrap_or_else(
+            || {
+                if self.auto_is_vaapi() {
+                    LinuxBackend::AmdIntel
+                } else {
+                    LinuxBackend::Nvenc
+                }
+            },
+        )
+    }
+
+    /// `auto`'s answer. A build without `nvenc` carries no NVIDIA arm at all, so it always
+    /// answers VAAPI — whose Vulkan Video leg the NVIDIA driver serves too.
+    fn auto_is_vaapi(&self) -> bool {
+        !self.inputs.features.nvenc
+            || *self
+                .probes
+                .auto_is_vaapi
+                .get_or_init(|| linux_auto_is_vaapi(self.inputs.nvidia))
+    }
+
+    /// The direct SDK's answers, probed once per process by the backend.
+    fn nvenc(&self) -> NvencFacts {
+        *self.probes.nvenc.get_or_init(probe_nvenc)
+    }
+
+    /// Whether the open's AMD/Intel arm tries Vulkan Video. The open, the cursor prediction and
+    /// the capture modifiers all read it.
+    fn amd_intel_opens_vulkan(&self, codec: Codec, ten_bit: bool, hdr: bool) -> bool {
+        self.inputs.features.vulkan_encode
+            && amd_intel_vulkan_depth(codec, ten_bit, hdr).is_some_and(|ten| {
+                self.inputs.vulkan_row && self.vulkan_encode_available_at(codec, ten)
+            })
+    }
+
+    /// Vulkan Video encode caps for `codec`. The probe opens its own Vulkan instance; callers
+    /// check the feature and the row first.
+    fn vulkan(&self, codec: Codec) -> VulkanFacts {
+        match codec_slot(codec) {
+            Some(i) => *self.probes.vulkan[i].get_or_init(|| probe_vulkan_encode_caps(codec)),
+            None => VulkanFacts::default(),
+        }
+    }
+
+    /// Can this GPU open a Vulkan Video encode session for `codec`? Only
+    /// [`Self::native_nv12_ok`] asks (no fallback there).
+    fn vulkan_encode_available(&self, codec: Codec) -> bool {
+        self.vulkan(codec).supported
+    }
+
+    /// Can Vulkan Video encode `codec` at this depth on the selected GPU?
+    fn vulkan_encode_available_at(&self, codec: Codec, ten_bit: bool) -> bool {
+        let caps = self.vulkan(codec);
+        caps.supported
+            && if ten_bit {
+                caps.ten_bit
+            } else {
+                caps.eight_bit
+            }
+    }
+
+    /// Can Vulkan Video encode `codec` at 10-bit on the selected GPU, and is it enabled? Both
+    /// 10-bit gates route here.
+    fn vulkan_10bit_available(&self, codec: Codec) -> bool {
+        self.inputs.features.vulkan_encode
+            && self.inputs.vulkan_row
+            && self.vulkan_encode_available_at(codec, true)
+    }
+
+    /// libva's 10-bit entrypoint for `codec` (HEVC Main10; nothing else).
+    fn vaapi_ten_bit(&self, codec: Codec) -> bool {
+        codec_slot(codec).is_some_and(|i| {
+            *self.probes.vaapi_ten_bit[i]
+                .get_or_init(|| vaapi_native::probe_can_encode(codec, true))
+        })
+    }
+
+    /// What the AMD/Intel plane can encode: the native VAAPI session for H.264 and HEVC,
+    /// Vulkan Video for HEVC and AV1 — the two arms the open tries, so nothing is advertised
+    /// that would die at open.
+    fn vaapi_codec_support(&self) -> CodecSupport {
+        *self
+            .probes
+            .vaapi
+            .get_or_init(|| self.probe_vaapi_codec_support())
+    }
+
+    /// The probe behind [`Self::vaapi_codec_support`].
+    fn probe_vaapi_codec_support(&self) -> CodecSupport {
+        // The same query the open makes, at the depth it opens with. AV1 has no
+        // native VAAPI path at all, so this is the only thing that can say yes.
+        let vulkan = |c| {
+            self.inputs.features.vulkan_encode
+                && self.inputs.vulkan_row
+                && self.vulkan_encode_available_at(c, false)
+        };
+        let probe = |c| vaapi_native::probe_can_encode(c, false);
+        let caps = CodecSupport {
+            h264: probe(Codec::H264),
+            h265: probe(Codec::H265) || vulkan(Codec::H265),
+            av1: vulkan(Codec::Av1),
+        };
+        tracing::info!(
+            h264 = caps.h264,
+            h265 = caps.h265,
+            av1 = caps.av1,
+            "VAAPI encode capabilities probed"
+        );
+        caps
+    }
+
+    /// The codec set a Linux host may advertise: the resolved backend's probe,
+    /// narrowed to what that backend can open.
+    fn advertised_codecs(&self) -> CodecSupport {
+        let backend = self.backend();
+        let probed = match backend {
+            // openh264, and it never probes.
+            LinuxBackend::Software => None,
+            _ if self.zero_copy_is_vaapi() => Some(self.vaapi_codec_support()),
+            // Driver GUID list, like the VAAPI arm.
+            LinuxBackend::Nvenc if self.inputs.features.nvenc => Some(self.nvenc().codecs),
+            _ => None,
+        };
+        narrow_to_openable(backend, probed, self.inputs.features)
     }
 }
 
-/// Whether `open_amd_intel` tries Vulkan Video. The open and the cursor prediction both read it.
-#[cfg(feature = "vulkan-encode")]
-fn amd_intel_opens_vulkan(codec: Codec, ten_bit: bool, hdr: bool) -> bool {
-    amd_intel_vulkan_depth(codec, ten_bit, hdr)
-        .is_some_and(|ten| vulkan_row() && vulkan_encode_available_at(codec, ten))
+/// The direct SDK's answers, logged once per process. Fail-open contract: see
+/// `nvenc_cuda::probe_support`. Without `nvenc` nothing is probed.
+fn probe_nvenc() -> NvencFacts {
+    #[cfg(feature = "nvenc")]
+    {
+        static LOGGED: OnceLock<()> = OnceLock::new();
+        let probed = nvenc_cuda::probe_support();
+        LOGGED.get_or_init(|| {
+            tracing::info!(
+                h264 = probed.codecs.h264,
+                h265 = probed.codecs.h265,
+                av1 = probed.codecs.av1,
+                hevc_444 = probed.hevc_444,
+                "NVENC encode capabilities probed"
+            );
+        });
+        NvencFacts {
+            codecs: probed.codecs,
+            hevc_444: probed.hevc_444,
+            ten_bit: probed.ten_bit,
+        }
+    }
+    #[cfg(not(feature = "nvenc"))]
+    {
+        let none = CodecSupport {
+            h264: false,
+            h265: false,
+            av1: false,
+        };
+        NvencFacts {
+            codecs: none,
+            hevc_444: false,
+            ten_bit: none,
+        }
+    }
 }
 
-/// Dispatch-mirroring core of [`cursor_blend_capable`], device-free for tests.
+/// One Vulkan Video caps probe, one log line. Without `vulkan-encode` nothing is probed.
+fn probe_vulkan_encode_caps(codec: Codec) -> VulkanFacts {
+    #[cfg(feature = "vulkan-encode")]
+    {
+        let caps = vulkan_video::probe_encode_caps(codec);
+        if caps.supported {
+            tracing::info!(
+                ?codec,
+                eight_bit = caps.eight_bit,
+                ten_bit = caps.ten_bit,
+                "Vulkan Video encode probed — producer-native NV12 capture is eligible, and a \
+                 10-bit session keeps this backend (real RFI + the compute CSC's cursor blend) \
+                 where the device accepts the profile"
+            );
+        } else {
+            tracing::info!(
+                ?codec,
+                "Vulkan Video encode unavailable (no encode queue for this codec) — keeping the \
+                 packed-RGB capture negotiation (the native-NV12 path has no VAAPI fallback)"
+            );
+        }
+        VulkanFacts {
+            supported: caps.supported,
+            eight_bit: caps.eight_bit,
+            ten_bit: caps.ten_bit,
+        }
+    }
+    #[cfg(not(feature = "vulkan-encode"))]
+    {
+        let _ = codec;
+        VulkanFacts::default()
+    }
+}
+
+/// Dispatch-mirroring core of [`Resolved::cursor_blend_capable`], device-free for tests.
 /// `direct_nvenc` / `vulkan_csc` are the blend-capable arms, already gated.
 fn cursor_blend_capable_for(
     backend: Option<LinuxBackend>,
@@ -441,90 +714,34 @@ fn cursor_blend_capable_for(
     }
 }
 
-/// Can this GPU open a Vulkan Video encode session for `codec`? Cached per
-/// (selected GPU, codec); probe runs outside the lock.
-///
-/// Only [`linux_native_nv12_ok`] consults this (no-fallback). Not wired into
-/// [`open_video`]: non-NV12 already degrades to VAAPI on a failed open.
-#[cfg(feature = "vulkan-encode")]
-fn vulkan_encode_available(codec: Codec) -> bool {
-    vulkan_encode_caps(codec).supported
-}
-
-/// Can Vulkan Video encode `codec` at this depth on the selected GPU? Per
-/// codec: a device can advertise HEVC Main10 and still decline 10-bit AV1.
-#[cfg(feature = "vulkan-encode")]
-fn vulkan_encode_available_at(codec: Codec, ten_bit: bool) -> bool {
-    let caps = vulkan_encode_caps(codec);
-    caps.supported
-        && if ten_bit {
-            caps.ten_bit
-        } else {
-            caps.eight_bit
-        }
-}
-
-/// Vulkan Video encode caps for `codec`, cached per (selected GPU, codec) so
-/// a console GPU change re-probes. The probe opens its own Vulkan instance.
-///
-/// Cfg must include `vulkan-encode`: the return type lives in `vulkan_video`.
-#[cfg(feature = "vulkan-encode")]
-fn vulkan_encode_caps(codec: Codec) -> vulkan_video::VulkanEncodeCaps {
-    static CACHE: ProbeCache<(String, &'static str), vulkan_video::VulkanEncodeCaps> =
-        OnceLock::new();
-    let key = (pf_gpu::selection_key(), codec.label());
-    probe_cached(&CACHE, key, || probe_vulkan_encode_caps(codec))
-}
-
-/// The uncached half of [`vulkan_encode_caps`]: one probe, one log line.
-#[cfg(feature = "vulkan-encode")]
-fn probe_vulkan_encode_caps(codec: Codec) -> vulkan_video::VulkanEncodeCaps {
-    let caps = vulkan_video::probe_encode_caps(codec);
-    if caps.supported {
-        tracing::info!(
-            ?codec,
-            eight_bit = caps.eight_bit,
-            ten_bit = caps.ten_bit,
-            "Vulkan Video encode probed — producer-native NV12 capture is eligible, and a 10-bit \
-             session keeps this backend (real RFI + the compute CSC's cursor blend) where the \
-             device accepts the profile"
-        );
-    } else {
-        tracing::info!(
-            ?codec,
-            "Vulkan Video encode unavailable (no encode queue for this codec) — keeping the \
-             packed-RGB capture negotiation (the native-NV12 path has no VAAPI fallback)"
-        );
+/// The depth the AMD/Intel arm asks Vulkan Video for, or `None` when it goes straight to VAAPI.
+/// HEVC and AV1 take Vulkan at the negotiated depth, HDR or SDR alike: 10-bit SDR is HEVC Main10
+/// or AV1 10-bit under BT.709 through `rgb2yuv10_709.comp`. H.264 has no Vulkan path. The
+/// colour verdict rides along for the callers that already carry it; the depth is the rule.
+fn amd_intel_vulkan_depth(codec: Codec, ten_bit: bool, _hdr: bool) -> Option<bool> {
+    match codec {
+        Codec::H265 | Codec::Av1 => Some(ten_bit),
+        _ => None,
     }
-    caps
 }
 
-/// The `auto` Linux backend decision, shared by [`open_video`] and
-/// [`linux_zero_copy_is_vaapi`]. Manual GPU preference picks that vendor's
-/// backend (NVIDIA still needs the proprietary device nodes); else the
-/// presence probe. A build without `nvenc` carries no NVIDIA arm at all, so it
-/// always answers VAAPI — whose Vulkan Video leg the NVIDIA driver serves too.
-///
-/// Resolves **`auto` only** — ignores `encoder_pref`. Capability probes must
-/// use [`linux_zero_copy_is_vaapi`], which layers the pref on top.
-fn linux_auto_is_vaapi() -> bool {
-    if !cfg!(feature = "nvenc") {
-        return true;
-    }
+/// The `auto` decision on a build with `nvenc`: a manual GPU picks its vendor's backend (NVIDIA
+/// still needs its device nodes, `nvidia`); else NVIDIA's presence. Resolves **`auto` only** —
+/// [`Resolved::zero_copy_is_vaapi`] layers the Encoder row on top.
+fn linux_auto_is_vaapi(nvidia: bool) -> bool {
     if let Some(g) = pf_gpu::manual_selection() {
         if g.vendor_id == pf_gpu::VENDOR_NVIDIA {
-            return !pf_gpu::nvidia_present();
+            return !nvidia;
         }
         return true;
     }
-    !pf_gpu::nvidia_present()
+    !nvidia
 }
 
-/// Resolved Linux encode backend. One alias table for [`open_video_backend`]
-/// and every capability/advertisement mirror. Labels come from the open
-/// sites — this picks which arm runs, not what actually opened.
+/// Resolved Linux encode backend. One alias table for the open and every capability answer.
+/// Labels come from the open sites — this picks which arm runs, not what actually opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LinuxBackend {
+pub(crate) enum LinuxBackend {
     Nvenc,
     AmdIntel,
     Vulkan,
@@ -532,9 +749,8 @@ enum LinuxBackend {
     Software,
 }
 
-/// Pure core. `None` = unknown pref: [`open_video_backend`] bails, capability
-/// mirrors map it to auto via [`linux_resolved_backend`]. `auto_is_vaapi` is
-/// lazy — `/serverinfo` polls these mirrors; explicit prefs must not probe.
+/// Pure core. `None` = unknown pref: the open bails, capability answers map it to auto.
+/// `auto_is_vaapi` is lazy — `/serverinfo` polls these answers; explicit prefs must not probe.
 fn resolve_linux_backend(
     pref: &str,
     auto_is_vaapi: impl FnOnce() -> bool,
@@ -558,19 +774,6 @@ fn resolve_linux_backend(
     })
 }
 
-/// Capability-mirror wrapper: unknown pref → auto. `cuda = false` because
-/// these answer pre-session questions.
-fn linux_resolved_backend() -> LinuxBackend {
-    let pref = pf_host_config::config().encoder_pref.as_str();
-    resolve_linux_backend(pref, linux_auto_is_vaapi, false).unwrap_or_else(|| {
-        if linux_auto_is_vaapi() {
-            LinuxBackend::AmdIntel
-        } else {
-            LinuxBackend::Nvenc
-        }
-    })
-}
-
 /// Dmabuf modifiers PyroWave's Vulkan device imports for the capture fourcc.
 /// VAAPI LINEAR-only starves tiled Mutter+NVIDIA allocations.
 #[cfg(feature = "pyrowave")]
@@ -578,149 +781,15 @@ pub(crate) fn pyrowave_capture_modifiers(fourcc: u32) -> Vec<u64> {
     pyrowave::capture_modifiers(fourcc)
 }
 
-/// Tiled dmabuf modifiers the session's encoder lane proved it can import for
-/// the capture `fourcc` — what the gamescope producer's tiled offer narrows to.
-/// Empty means LINEAR-only. Each lane returns its own proved list: Vulkan
-/// Video answers come from the packed-usage probes, VAAPI answers from
-/// `Display::import_dmabuf` + VPP, never one lane filtered by the other.
-pub fn linux_capture_modifiers(codec: Codec, fourcc: u32, bit_depth: u8, hdr: bool) -> Vec<u64> {
-    #[cfg(feature = "pyrowave")]
-    if codec == Codec::PyroWave {
-        return pyrowave_capture_modifiers(fourcc);
-    }
-    // A build without PyroWave has no module to ask; advertise LINEAR.
-    #[cfg(not(feature = "pyrowave"))]
-    if codec == Codec::PyroWave {
-        return Vec::new();
-    }
-    // The rule `open_amd_intel` takes, so the capture answers come from the encoder that opens.
-    #[cfg(not(feature = "vulkan-encode"))]
-    let _ = (bit_depth, hdr);
-    #[cfg(feature = "vulkan-encode")]
-    let ten_bit = bit_depth >= 10;
-    #[cfg(feature = "vulkan-encode")]
-    let vulkan_lane = amd_intel_opens_vulkan(codec, ten_bit, hdr);
-    #[cfg(not(feature = "vulkan-encode"))]
-    let vulkan_lane = false;
-    if vulkan_lane {
-        #[cfg(feature = "vulkan-encode")]
-        {
-            return vulkan_video::vulkan_capture_modifiers(codec, fourcc, ten_bit);
-        }
-    }
-    let candidates = vk_util::sampled_capture_modifiers(fourcc);
-    vaapi_native::vaapi_capture_modifiers(fourcc, &candidates)
-}
-
-/// True if the Linux GPU backend is VAAPI rather than NVENC — so capture
-/// picks dmabuf passthrough vs EGL→CUDA. Mirrors [`open_video`].
-pub fn linux_zero_copy_is_vaapi() -> bool {
-    linux_zero_copy_is_vaapi_for(linux_resolved_backend())
-}
-/// Zero-copy plane for an already-resolved backend, so a polled caller
-/// (`host_wire_caps`) pays for resolution once.
-fn linux_zero_copy_is_vaapi_for(backend: LinuxBackend) -> bool {
-    match backend {
-        LinuxBackend::Nvenc => false,
-        LinuxBackend::AmdIntel => true,
-        // Raw dmabuf on any vendor — never the EGL→CUDA import.
-        LinuxBackend::Pyrowave => true,
-        // Preserved `_` fallthrough, not endorsed. Vulkan-on-NVIDIA is a known
-        // mismatch (EGL→CUDA for a dmabuf importer); software is latent (H.264).
-        LinuxBackend::Vulkan | LinuxBackend::Software => linux_auto_is_vaapi(),
-    }
-}
-
-/// NVIDIA encode-GUID list (cached once per process). Process-wide because
-/// the direct backend opens on shared `cuda::context()` (device 0). Fail-open
-/// contract: see [`nvenc_cuda::probe_support`].
-#[cfg(feature = "nvenc")]
-pub(crate) fn nvenc_codec_support() -> CodecSupport {
-    use std::sync::OnceLock;
-    static LOGGED: OnceLock<()> = OnceLock::new();
-    let probed = nvenc_cuda::probe_support();
-    LOGGED.get_or_init(|| {
-        tracing::info!(
-            h264 = probed.codecs.h264,
-            h265 = probed.codecs.h265,
-            av1 = probed.codecs.av1,
-            hevc_444 = probed.hevc_444,
-            "NVENC encode capabilities probed"
-        );
-    });
-    probed.codecs
-}
-
-/// What the AMD/Intel plane can encode: the native VAAPI session for H.264 and
-/// HEVC, Vulkan Video for HEVC and AV1 — the two arms [`open_video`] tries, so
-/// nothing is advertised that would die at open. NVIDIA uses
-/// [`nvenc_codec_support`]; callers gate on [`linux_zero_copy_is_vaapi`].
-///
-/// Cached per selected GPU, like [`windows_codec_support`]: a console
-/// preference change moves the render node and the Vulkan device both probes
-/// open. The Vulkan encoding row keys it too: it applies at the next session.
-pub(crate) fn vaapi_codec_support() -> CodecSupport {
-    static CACHE: ProbeCache<(String, bool), CodecSupport> = OnceLock::new();
-    let key = (pf_gpu::selection_key(), vulkan_row());
-    probe_cached(&CACHE, key, probe_vaapi_codec_support)
-}
-
-/// The uncached half of [`vaapi_codec_support`].
-fn probe_vaapi_codec_support() -> CodecSupport {
-    // The same query the open makes, at the depth it opens with. AV1 has no
-    // native VAAPI path at all, so this is the only thing that can say yes.
-    let vulkan = |c| {
-        #[cfg(feature = "vulkan-encode")]
-        {
-            vulkan_row() && vulkan_encode_available_at(c, false)
-        }
-        #[cfg(not(feature = "vulkan-encode"))]
-        {
-            let _: Codec = c;
-            false
-        }
-    };
-    let probe = |c| vaapi_native::probe_can_encode(c, false);
-    let caps = CodecSupport {
-        h264: probe(Codec::H264),
-        h265: probe(Codec::H265) || vulkan(Codec::H265),
-        av1: vulkan(Codec::Av1),
-    };
-    tracing::info!(
-        h264 = caps.h264,
-        h265 = caps.h265,
-        av1 = caps.av1,
-        "VAAPI encode capabilities probed"
-    );
-    caps
-}
-
-/// The codec set a Linux host may advertise: the resolved backend's probe,
-/// narrowed to what that backend can open.
-pub fn linux_advertised_codec_support() -> CodecSupport {
-    linux_advertised_codec_support_for(linux_resolved_backend())
-}
-
-/// [`linux_advertised_codec_support`] for an already-resolved backend, so a
-/// polled caller pays for resolution once.
-fn linux_advertised_codec_support_for(backend: LinuxBackend) -> CodecSupport {
-    let probed = match backend {
-        // openh264, and it never probes.
-        LinuxBackend::Software => None,
-        _ if linux_zero_copy_is_vaapi_for(backend) => Some(vaapi_codec_support()),
-        // Driver GUID list, like the VAAPI arm.
-        #[cfg(feature = "nvenc")]
-        LinuxBackend::Nvenc => Some(nvenc_codec_support()),
-        _ => None,
-    };
-    narrow_to_openable(backend, probed)
-}
-
-/// A probe narrowed by what `backend` can open at all. An all-`false` probe
-/// means the GPU was unusable at probe time, not that it encodes nothing, so
-/// it fails open to the superset — narrowing can then only take codecs away.
-/// Pure, so the ceilings are testable without a GPU.
-fn narrow_to_openable(backend: LinuxBackend, probed: Option<CodecSupport>) -> CodecSupport {
+/// A probe narrowed by what `backend` can open in a build with `features`. An all-`false`
+/// probe means the GPU was unusable at probe time, not that it encodes nothing, so it fails
+/// open to the superset — narrowing can then only take codecs away. Pure, so the ceilings are
+/// testable without a GPU.
+fn narrow_to_openable(
+    backend: LinuxBackend,
+    probed: Option<CodecSupport>,
+    features: Features,
+) -> CodecSupport {
     // A forced-vulkan pref is a ceiling, never a replacement: the arm encodes
     // HEVC/AV1 only (H.264 dies at open), and only in a build that has it.
     // A static HEVC|AV1 would add AV1 on GPUs whose probe withholds it.
@@ -730,10 +799,10 @@ fn narrow_to_openable(backend: LinuxBackend, probed: Option<CodecSupport>) -> Co
             h265: false,
             av1: false,
         },
-        // The resolver knows the pref is vulkan; only this `cfg!` knows the
-        // build can open it. Else: advertise-then-die-at-open.
+        // The resolver knows the pref is vulkan; only the build's features know it can
+        // open it. Else: advertise-then-die-at-open.
         LinuxBackend::Vulkan => {
-            let built = cfg!(feature = "vulkan-encode");
+            let built = features.vulkan_encode;
             CodecSupport {
                 h264: false,
                 h265: built,
@@ -742,7 +811,7 @@ fn narrow_to_openable(backend: LinuxBackend, probed: Option<CodecSupport>) -> Co
         }
         // An nvenc pin likewise: its probe arm is compiled out with the feature.
         LinuxBackend::Nvenc => {
-            let built = cfg!(feature = "nvenc");
+            let built = features.nvenc;
             CodecSupport {
                 h264: built,
                 h265: built,
@@ -765,45 +834,12 @@ fn narrow_to_openable(backend: LinuxBackend, probed: Option<CodecSupport>) -> Co
     }
 }
 
-/// Can Vulkan Video encode `codec` at 10-bit on the selected GPU, and is it enabled? Both 10-bit
-/// gates route here; the probe is cached per (GPU, codec).
-#[cfg(feature = "vulkan-encode")]
-fn vulkan_10bit_available(codec: Codec) -> bool {
-    vulkan_row() && vulkan_encode_available_at(codec, true)
-}
-#[cfg(not(feature = "vulkan-encode"))]
-fn vulkan_10bit_available(_codec: Codec) -> bool {
-    false
-}
-/// [`crate::backend_carries_sdr10`] on Linux.
-pub(crate) fn sdr10(codec: Codec) -> bool {
-    // PyroWave's own CSC widens packed RGB to 10-bit (`rgb2yuv10_709.comp` / the 4:4:4
-    // twin) on its private Vulkan device — the resolved H.26x backend is irrelevant.
-    if codec == Codec::PyroWave {
-        return cfg!(feature = "pyrowave");
-    }
-    // Direct NVENC (HEVC + AV1) widens 8→10 from packed RGB. On AMD/Intel, Vulkan Video carries
-    // HEVC Main10 and AV1 10-bit SDR (`rgb2yuv10_709.comp`) where the device offers the 10-bit
-    // profile, and VAAPI carries HEVC Main10 under BT.709 as the fallback. The encoder degrades a
-    // planar surface to 8-bit if some path delivers one.
-    match linux_resolved_backend() {
-        LinuxBackend::Nvenc => cfg!(feature = "nvenc"),
-        LinuxBackend::AmdIntel => {
-            codec == Codec::H265 || (codec == Codec::Av1 && vulkan_10bit_available(codec))
-        }
-        LinuxBackend::Vulkan => {
-            matches!(codec, Codec::H265 | Codec::Av1) && vulkan_10bit_available(codec)
-        }
-        _ => false,
-    }
-}
-
 /// Open the software H.264 encoder by name, bypassing the backend ladder.
 ///
-/// [`open_video`] resolves a backend from `PUNKTFUNK_ENCODER`, which the host reads **once** and
-/// latches — so a caller that decides later cannot steer it, and `auto` never picks software
-/// anyway. The browser plane is exactly that caller: it serves a GPU-less host and wants this
-/// encoder specifically. Like [`open_video`], it reads the env knobs once per open.
+/// [`crate::open_video`] opens the backend [`Resolved`] names from `PUNKTFUNK_ENCODER`, and
+/// `auto` never picks software. The browser plane decides later and wants this encoder
+/// specifically: it serves a GPU-less host. Like [`crate::open_video`], it reads the env knobs
+/// once per open.
 pub fn open_software_h264(
     format: PixelFormat,
     width: u32,
@@ -826,21 +862,33 @@ pub fn open_software_h264(
 mod tests {
     use super::*;
 
+    /// A resolution of `pref` on no selected GPU, no NVIDIA, the Vulkan row on, this build.
+    fn resolved(pref: &str) -> Resolved {
+        Resolved::new(ResolveInputs {
+            pref: pref.into(),
+            gpu: String::new(),
+            vulkan_row: true,
+            nvidia: false,
+            features: Features::BUILT,
+        })
+    }
+
     #[test]
     fn the_advertisement_never_offers_what_the_backend_cannot_open() {
         use LinuxBackend::*;
         let caps = |h264, h265, av1| CodecSupport { h264, h265, av1 };
+        let built = Features::BUILT;
         let probed = caps(true, true, false);
         // A GPU probe passes through on the vendor backends.
         assert_eq!(
             (
-                narrow_to_openable(AmdIntel, Some(probed)).h264,
-                narrow_to_openable(AmdIntel, Some(probed)).av1
+                narrow_to_openable(AmdIntel, Some(probed), built).h264,
+                narrow_to_openable(AmdIntel, Some(probed), built).av1
             ),
             (true, false)
         );
         // A vulkan pin drops H.264 (it bails at open) and keeps what the probe found.
-        let vulkan = narrow_to_openable(Vulkan, Some(caps(true, true, true)));
+        let vulkan = narrow_to_openable(Vulkan, Some(caps(true, true, true)), built);
         assert_eq!(
             (vulkan.h264, vulkan.h265, vulkan.av1),
             (
@@ -850,16 +898,16 @@ mod tests {
             )
         );
         // An nvenc pin advertises only what this build can open.
-        let built = cfg!(feature = "nvenc");
-        let nv = narrow_to_openable(Nvenc, None);
-        assert_eq!((nv.h264, nv.h265, nv.av1), (built, built, built));
+        let nvenc = cfg!(feature = "nvenc");
+        let nv = narrow_to_openable(Nvenc, None, built);
+        assert_eq!((nv.h264, nv.h265, nv.av1), (nvenc, nvenc, nvenc));
         // openh264 is H.264 whatever a GPU probe says.
-        let sw = narrow_to_openable(Software, Some(caps(true, true, true)));
+        let sw = narrow_to_openable(Software, Some(caps(true, true, true)), built);
         assert_eq!((sw.h264, sw.h265, sw.av1), (true, false, false));
         // An unusable probe fails open to the superset, still narrowed.
-        let unprobed = narrow_to_openable(AmdIntel, None);
+        let unprobed = narrow_to_openable(AmdIntel, None, built);
         assert!(unprobed.h264 && unprobed.h265 && unprobed.av1);
-        let empty = narrow_to_openable(AmdIntel, Some(caps(false, false, false)));
+        let empty = narrow_to_openable(AmdIntel, Some(caps(false, false, false)), built);
         assert!(empty.h264 && empty.h265 && empty.av1);
     }
 
@@ -886,7 +934,6 @@ mod tests {
         assert!(!cursor_blend_capable_for(None, true, true));
     }
 
-    #[cfg(feature = "vulkan-encode")]
     #[test]
     fn amd_intel_hevc_takes_vulkan_at_either_depth() {
         assert_eq!(
@@ -949,12 +996,9 @@ mod tests {
         assert!(native_planar_depth_matches(10, false, true));
     }
 
-    /// Linux dispatch through the resolver, GPU-free via the software arm.
-    /// Pref is injected — `set_var` races `getenv` in parallel tests.
-    #[test]
-    fn open_video_backend_dispatches_software() {
-        let sw = OpenParams {
-            codec: Codec::H264,
+    fn params(codec: Codec) -> OpenParams {
+        OpenParams {
+            codec,
             format: PixelFormat::Bgrx,
             width: 64,
             height: 64,
@@ -966,17 +1010,19 @@ mod tests {
             chroma: ChromaFormat::Yuv420,
             cursor_blend: false,
             slices: 4,
-            knobs: Knobs::from_env(),
-        };
+        }
+    }
+
+    /// Linux dispatch through the resolver, GPU-free via the software arm.
+    #[test]
+    fn open_video_backend_dispatches_software() {
+        let sw = resolved("software");
+        let knobs = Knobs::from_env();
         let (enc, label) =
-            open_video_backend_linux("software", &sw).expect("software arm must open GPU-free");
+            open(&sw, &params(Codec::H264), &knobs).expect("software arm must open GPU-free");
         assert_eq!(label, "software");
         drop(enc);
-        let h265 = OpenParams {
-            codec: Codec::H265,
-            ..sw
-        };
-        let err = match open_video_backend_linux("software", &h265) {
+        let err = match open(&sw, &params(Codec::H265), &knobs) {
             // `expect_err` needs `Ok: Debug`; `Box<dyn Encoder>` isn't.
             Ok(_) => panic!("software emits H.264 only; an H.265 session must be refused"),
             Err(e) => e,
@@ -989,22 +1035,11 @@ mod tests {
     #[cfg(feature = "vulkan-encode")]
     #[test]
     fn a_vulkan_pin_falls_back_to_vaapi() {
-        let hevc = OpenParams {
-            codec: Codec::H265,
-            format: PixelFormat::Bgrx,
-            width: 64,
-            height: 64,
-            fps: 30,
-            bitrate_bps: 1_000_000,
-            cuda: false,
-            bit_depth: 8,
-            hdr: false,
-            chroma: ChromaFormat::Yuv420,
-            cursor_blend: false,
-            slices: 4,
-            knobs: Knobs::from_env(),
-        };
-        match open_video_backend_linux("vulkan", &hevc) {
+        match open(
+            &resolved("vulkan"),
+            &params(Codec::H265),
+            &Knobs::from_env(),
+        ) {
             Ok((_, label)) => assert!(matches!(label, "vulkan" | "vaapi-native"), "{label}"),
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -1018,21 +1053,18 @@ mod tests {
     #[ignore = "needs a real VAAPI device"]
     fn auto_opens_the_native_vaapi_session() {
         let p = OpenParams {
-            codec: Codec::H264,
             format: PixelFormat::Bgra,
             width: 320,
             height: 240,
             fps: 60,
             bitrate_bps: 2_000_000,
-            cuda: false,
-            bit_depth: 8,
-            hdr: false,
-            chroma: ChromaFormat::Yuv420,
-            cursor_blend: false,
-            slices: 4,
-            knobs: Knobs::from_env(),
+            ..params(Codec::H264)
         };
-        let (enc, backend) = open_video_backend_linux("auto", &p).expect("open");
+        let auto = Resolved::new(ResolveInputs {
+            nvidia: pf_gpu::nvidia_present(),
+            ..resolved("auto").inputs
+        });
+        let (enc, backend) = open(&auto, &p, &Knobs::from_env()).expect("open");
         assert_eq!(backend, "vaapi-native");
         assert!(enc.caps().supports_rfi);
     }
