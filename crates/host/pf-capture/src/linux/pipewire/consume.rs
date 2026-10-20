@@ -1,21 +1,21 @@
-//! One PipeWire buffer to one published frame: the wire stamp, the producer fence, then raw
-//! passthrough, a held dmabuf for the GPU import, or the CPU de-pad.
+//! One PipeWire buffer to one published frame: the wire stamp and the producer fence, then
+//! the [`delivery`] lanes under this stream's rules ([`Portal`]).
 
 use super::ledger::{holds_possible, zerocopy_hold_enabled};
 use super::plan::{
     gpu_import, passthrough_fallback_action, ImportOutcome, PassthroughFallback,
     PassthroughFallbackAction,
 };
-use super::queue::{RenderFence, RENDER_GUARD};
+use super::queue::RenderFence;
 use super::UserData;
-use crate::linux::pw_cursor::composite_cursor;
+use crate::linux::delivery::{self, warn_once, Buffer, GpuLane, Lanes, Memory, NoHold, Path};
+use crate::linux::pw_cursor::CursorState;
 use crate::linux::sync_timeline::{plane_count, StreamBuffers, SyncPoints};
-use crate::linux::StreamStatus;
-use crate::{CapturedFrame, FramePayload, PixelFormat};
-use pf_dmabuf::{ReadMap, Share};
+use crate::linux::{StreamShared, StreamStatus};
+use crate::PixelFormat;
 use pipewire as pw;
 use pw::spa;
-use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{BorrowedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -177,17 +177,6 @@ fn handle_passthrough_fallback(ud: &mut UserData, reason: PassthroughFallback) -
     }
 }
 
-/// Log a frame-drop reason once per process (`.process` runs per frame).
-fn warn_once(msg: &'static str) {
-    use std::sync::Mutex;
-    static SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap();
-    if !seen.contains(&msg) {
-        seen.push(msg);
-        tracing::warn!("{msg}");
-    }
-}
-
 fn supported_data_plane_count(count: u32) -> Option<usize> {
     (1..=2).contains(&count).then_some(count as usize)
 }
@@ -217,22 +206,6 @@ pub(in crate::linux) fn realtime_minus_monotonic_ns() -> i64 {
     rt - (ts.tv_sec * 1_000_000_000 + ts.tv_nsec)
 }
 
-/// `data`'s fd, borrowed for as long as `data` is. `None` when the data carries no fd.
-fn data_fd(data: &pw::spa::buffer::Data) -> Option<BorrowedFd<'_>> {
-    let fd = RawFd::try_from(data.as_raw().fd)
-        .ok()
-        .filter(|&fd| fd >= 0)?;
-    // SAFETY: `data` borrows a `spa_data` of a buffer this side holds; its fd stays open
-    // while that borrow lives, and a non-negative fd is a valid `BorrowedFd`.
-    Some(unsafe { BorrowedFd::borrow_raw(fd) })
-}
-
-/// A CLOEXEC dup of `data`'s fd, so a published frame keeps the dmabuf past the requeue.
-/// `None`: the data carries no fd, or the process is out of descriptors.
-fn dup_data_fd(data: &pw::spa::buffer::Data) -> Option<OwnedFd> {
-    data_fd(data)?.try_clone_to_owned().ok()
-}
-
 /// Whether the selected GPU's driver rounds a linear import pitch: iHD does; an unknown
 /// selection is treated as one, a CPU copy being the cheaper mistake.
 fn linear_pitch_rounds() -> bool {
@@ -242,36 +215,14 @@ fn linear_pitch_rounds() -> bool {
     })
 }
 
-fn packed_frame_geometry(
-    width: usize,
-    height: usize,
-    bytes_per_pixel: usize,
-    reported_stride: usize,
-) -> Option<(usize, usize, usize, usize)> {
-    if height == 0 {
-        return None;
-    }
-    let row = width.checked_mul(bytes_per_pixel)?;
-    let stride = if reported_stride == 0 {
-        row
-    } else {
-        reported_stride
-    };
-    if stride < row {
-        return None;
-    }
-    let needed = stride.checked_mul(height - 1)?.checked_add(row)?;
-    let tight = row.checked_mul(height)?;
-    Some((row, stride, needed, tight))
-}
-
 /// De-pad / import one PipeWire buffer and push it to the encoder.
 ///
 /// Called from `.process` with the newest drained buffer. `datas` uses the same transparent
 /// cast as libspa's `Buffer::datas_mut`, so the safe `Data` accessors keep working. `pw_buf`
 /// is identity for [`UserData::try_defer`] only — never dereferenced here. `stream` is the
 /// stream running this `.process`; `try_defer` requeues a stale held buffer on it.
-/// The lanes in order: [`try_passthrough`], [`try_gpu_hold`], then [`cpu_depad`].
+/// The lanes in order: passthrough under VAAPI or PyroWave, the GPU lane while an importer
+/// is present, then the CPU de-pad.
 pub(super) fn consume_frame(
     ud: &mut UserData,
     spa_buf: *mut spa::sys::spa_buffer,
@@ -306,9 +257,9 @@ pub(super) fn consume_frame(
             &mut []
         }
     };
-    if datas.is_empty() {
+    let Some((d0, rest)) = datas.split_first_mut() else {
         return;
-    }
+    };
     let sz = ud.info.size();
     let (w, h) = (sz.width as usize, sz.height as usize);
     if w == 0 || h == 0 {
@@ -316,46 +267,185 @@ pub(super) fn consume_frame(
     }
 
     let pts_ns = stamp_frame(ud, hdr_pts_ns);
-    let fence = if datas[0].type_() == pw::spa::buffer::DataType::DmaBuf {
-        render_fence(ud, pw_buf as usize, sync_points, data_fd(&datas[0]))
-    } else {
-        None
-    };
-    let mut arrival = Arrival {
-        datas,
-        w,
-        h,
-        pts_ns,
-        pw_buf,
-        stream,
-        fence,
-    };
-    if ud.vaapi_passthrough && try_passthrough(ud, &mut arrival) {
-        return;
+    let mut buf = buffer(d0, rest.first(), ud, (w, h), pts_ns);
+    if buf.memory == Memory::DmaBuf {
+        buf.fence = render_fence(ud, pw_buf as usize, sync_points, buf.fd);
     }
-    if try_gpu_hold(ud, &mut arrival) {
-        return;
-    }
-    cpu_depad(ud, arrival);
+    let importer = &ud.importer;
+    let lanes = Lanes {
+        passthrough: ud.vaapi_passthrough,
+        gpu: importer.present.load(Ordering::Relaxed).then(|| GpuLane {
+            // An in-process importer's GL context is current on this thread only.
+            consumer_imports: !importer.in_process.load(Ordering::Relaxed),
+            rebuild_tiled_ten_bit: !ud.hdr_tiled_raw,
+        }),
+        cpu: true,
+    };
+    delivery::deliver(lanes, buf, &mut Portal { ud, pw_buf, stream });
 }
 
-/// One arrival: its planes, size and wire stamp, the identity [`UserData::try_defer`]
-/// holds it by, and the fence on its pixels. A lane that publishes the dmabuf passes the
-/// fence on; a lane that reads the pixels here waits it out first.
-struct Arrival<'a> {
-    datas: &'a mut [pw::spa::buffer::Data],
-    w: usize,
-    h: usize,
+/// Plane 0 (`d0`) and plane 1 of one arrival as a [`Buffer`], with no fence yet.
+fn buffer<'a>(
+    d0: &'a mut pw::spa::buffer::Data,
+    d1: Option<&pw::spa::buffer::Data>,
+    ud: &UserData,
+    (width, height): (usize, usize),
     pts_ns: u64,
-    pw_buf: *mut pw::sys::pw_buffer,
-    stream: &'a dyn StreamBuffers,
-    fence: Option<RenderFence>,
+) -> Buffer<'a> {
+    use pw::spa::buffer::DataType;
+    let memory = match d0.type_() {
+        DataType::Invalid => Memory::Invalid,
+        DataType::MemPtr => Memory::MemPtr,
+        DataType::MemFd => Memory::MemFd,
+        DataType::DmaBuf => Memory::DmaBuf,
+        DataType::MemId => Memory::MemId,
+        _ => Memory::Unknown,
+    };
+    let chunk = d0.chunk();
+    let (offset, stride, size) = (chunk.offset(), chunk.stride().max(0) as u32, chunk.size());
+    let mapoffset = d0.as_raw().mapoffset;
+    let raw_fd = RawFd::try_from(d0.as_raw().fd).ok().filter(|&fd| fd >= 0);
+    // SAFETY: `d0` borrows, for `'a`, a `spa_data` of a buffer this callback holds; its fd
+    // stays open while that borrow lives, and a non-negative fd is a valid `BorrowedFd`.
+    let fd = raw_fd.map(|fd| unsafe { BorrowedFd::borrow_raw(fd) });
+    let plane1 = d1.filter(|d| d.fd() > 0).map(|d| {
+        let c = d.chunk();
+        (d.fd(), c.offset(), c.stride().max(0) as u32)
+    });
+    Buffer {
+        width,
+        height,
+        format: ud.format,
+        pts_ns,
+        memory,
+        fd,
+        modifier: ud.modifier,
+        offset,
+        stride,
+        size,
+        mapoffset,
+        mapped: d0.data().map(|data| &*data),
+        plane1,
+        fence: None,
+    }
 }
 
-/// Wait the render out on the loop thread: the pixels are read before `.process` returns.
-fn wait_here(fence: Option<RenderFence>) {
-    if let Some(f) = fence {
-        let _ = f.wait(RENDER_GUARD);
+/// The PipeWire stream's side of the lanes: the pool ledger's holds, the frame queue, and
+/// this stream's fallback and import rules.
+struct Portal<'a, 's> {
+    ud: &'a mut UserData,
+    pw_buf: *mut pw::sys::pw_buffer,
+    stream: &'s dyn StreamBuffers,
+}
+
+impl Path for Portal<'_, '_> {
+    fn shared(&self) -> &StreamShared {
+        &self.ud.shared
+    }
+
+    /// The hold cap is the pool census, so a shortage means the census is wrong, not that
+    /// every hold is with the encoder: the frame drops, the guard for that count. A CPU copy
+    /// here would starve the requeues, and a tiled rebuild asks KWin for a new output each
+    /// time. Only a pool that can never hold falls through, or nothing would stream.
+    fn hold(&mut self) -> Result<pf_frame::FrameHold, NoHold> {
+        if let Some(hold) = self.ud.try_defer(self.pw_buf, self.stream) {
+            return Ok(hold);
+        }
+        if holds_possible(zerocopy_hold_enabled(), self.ud.pool.live) {
+            self.ud.held_drops += 1;
+            return Err(NoHold::Short);
+        }
+        Err(NoHold::Never)
+    }
+
+    fn publish(&mut self, frame: crate::CapturedFrame, fence: Option<RenderFence>) {
+        self.ud.publish(frame, fence);
+    }
+
+    /// RGB→NV12 backends blend cursor-as-metadata. Gamescope burns the pointer in;
+    /// native NV12/P010 has none.
+    fn cursor(&self) -> Option<pf_frame::CursorOverlay> {
+        self.ud.cursor.overlay()
+    }
+
+    /// The latched pointer, unless the host places it: a baked copy would double it.
+    fn baked_cursor(&self) -> Option<&CursorState> {
+        let host_places = self.ud.cursor_slot.host_places.load(Ordering::Relaxed);
+        (!host_places).then_some(&self.ud.cursor)
+    }
+
+    /// iHD reads a linear import at a pitch rounded to 64 bytes, so an odd pitch shears
+    /// the picture. Mutter's RENDERING-only GBM buffers pad only for SCANOUT. The CPU de-pad
+    /// uploads through a driver-allocated surface instead.
+    fn refuses_passthrough(
+        &self,
+        buf: &Buffer,
+        plane1: Option<(u32, u32)>,
+    ) -> Option<PassthroughFallback> {
+        let odd = buf.stride % 64 != 0 || plane1.is_some_and(|(_, s)| s % 64 != 0);
+        (buf.modifier == 0 && linear_pitch_rounds() && odd)
+            .then_some(PassthroughFallback::UnalignedPitch)
+    }
+
+    /// Once per geometry, not once: a resize renegotiates the pool, and a stale stride
+    /// against a new size is a sheared picture.
+    fn passed_through(&mut self, buf: &Buffer, fmt: PixelFormat, fourcc: u32) {
+        static LAST: std::sync::Mutex<(usize, usize, u32, u32)> =
+            std::sync::Mutex::new((0, 0, 0, 0));
+        let geometry = (buf.width, buf.height, buf.offset, buf.stride);
+        let changed = std::mem::replace(
+            &mut *LAST.lock().unwrap_or_else(|e| e.into_inner()),
+            geometry,
+        ) != geometry;
+        if changed {
+            tracing::info!(
+                w = buf.width,
+                h = buf.height,
+                offset = buf.offset,
+                stride = buf.stride,
+                // The held buffer's own fd: the consumer may already have closed the dup.
+                fd_size = buf.fd.map_or(0, |fd| pf_dmabuf::byte_len(fd).unwrap_or(0)),
+                modifier = buf.modifier,
+                fourcc = format_args!("{:#010x}", fourcc),
+                source = match fmt {
+                    PixelFormat::Nv12 => "producer-native NV12",
+                    PixelFormat::P010 => "producer-native P010",
+                    _ => "packed RGB (encoder GPU CSC)",
+                },
+                "zero-copy: handing the raw DMA-BUF to the encoder"
+            );
+        }
+    }
+
+    fn fell_back(&mut self, reason: PassthroughFallback) -> bool {
+        handle_passthrough_fallback(self.ud, reason)
+    }
+
+    /// Through the shared importer, graded by [`gpu_import`]. A LINEAR failure retires it,
+    /// and later arrivals take the CPU lane.
+    fn import(
+        &mut self,
+        plane: pf_zerocopy::DmabufPlane,
+        fmt: PixelFormat,
+        w: u32,
+        h: u32,
+        modifier: u64,
+    ) -> Option<ImportOutcome> {
+        let ud = &mut *self.ud;
+        let cell = ud.importer.slot.clone();
+        let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
+        let importer = guard.as_mut()?;
+        let policy = ud.import_policy;
+        let state = &mut ud.import_state;
+        let outcome = gpu_import(
+            importer, policy, state, &ud.shared, fmt, w, h, plane, modifier,
+        );
+        if matches!(outcome, ImportOutcome::ImporterLost) {
+            *guard = None;
+            drop(guard);
+            ud.importer.present.store(false, Ordering::Relaxed);
+        }
+        Some(outcome)
     }
 }
 
@@ -467,402 +557,9 @@ fn render_fence(
     }
 }
 
-/// A producer NV12/P010's chroma `(offset, stride)`: plane 1's chunk, in the same buffer
-/// object as plane 0. BO identity is inode, not fd number. `Err` = a two-BO frame, which
-/// cannot travel the single-fd import; the caller drops it. `Ok(None)` for packed RGB.
-#[allow(clippy::result_unit_err)]
-fn second_plane(
-    fmt: PixelFormat,
-    datas: &[pw::spa::buffer::Data],
-) -> Result<Option<(u32, u32)>, ()> {
-    let planar = matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010);
-    if !planar || datas.len() < 2 || datas[1].fd() <= 0 {
-        return Ok(None);
-    }
-    // SAFETY: zeroed `libc::stat` is a valid POD initializer; both fds are owned by the live
-    // PipeWire buffer for this callback, and `fstat` only writes the out-param structs, whose
-    // fields are read only after the `== 0` success checks.
-    let same_bo = unsafe {
-        let mut s0: libc::stat = std::mem::zeroed();
-        let mut s1: libc::stat = std::mem::zeroed();
-        libc::fstat(datas[0].fd(), &mut s0) == 0
-            && libc::fstat(datas[1].fd(), &mut s1) == 0
-            && (s0.st_dev, s0.st_ino) == (s1.st_dev, s1.st_ino)
-    };
-    if !same_bo {
-        warn_once(
-            "the planes live in different buffer objects — frames dropped (single-fd import only)",
-        );
-        return Err(());
-    }
-    let c1 = datas[1].chunk();
-    Ok(Some((c1.offset(), c1.stride().max(0) as u32)))
-}
-
-/// What became of a frame offered under a hold ([`publish_held`]).
-enum Held {
-    /// Published as a held dmabuf: the frame ends here.
-    Published,
-    /// No hold was free while this pool can hold, so the census counts fewer buffers than the
-    /// pool has: dropped and counted in `held_drops`.
-    Dropped,
-    /// This pool can never hold: the caller's fallback takes the frame.
-    NoHold,
-}
-
-/// Publish `dup` as a held dmabuf, so the producer cannot rewrite a buffer the encoder still
-/// reads. The hold cap is the pool census, so a shortage means the census is wrong, not that
-/// every hold is with the encoder: the frame drops, the guard for that count. A CPU copy here
-/// would starve the requeues, and a tiled rebuild asks KWin for a new output each time. Only a
-/// pool that can never hold falls through, or nothing would stream.
-fn publish_held(
-    ud: &mut UserData,
-    a: &mut Arrival,
-    fmt: PixelFormat,
-    fourcc: u32,
-    dup: OwnedFd,
-    (offset, stride): (u32, u32),
-    plane1: Option<(u32, u32)>,
-) -> Held {
-    let Some(hold) = ud.try_defer(a.pw_buf, a.stream) else {
-        if holds_possible(zerocopy_hold_enabled(), ud.pool.live) {
-            ud.held_drops += 1;
-            return Held::Dropped;
-        }
-        return Held::NoHold;
-    };
-    let frame = CapturedFrame {
-        provenance: Default::default(),
-        width: a.w as u32,
-        height: a.h as u32,
-        pts_ns: a.pts_ns,
-        format: fmt,
-        payload: FramePayload::Dmabuf(ud.shared.held_dmabuf(
-            dup,
-            fourcc,
-            ud.modifier,
-            (offset, stride),
-            plane1,
-            hold,
-        )),
-        // RGB→NV12 backends blend cursor-as-metadata. Gamescope burns the pointer in;
-        // native NV12/P010 has none.
-        cursor: ud.cursor.overlay(),
-    };
-    ud.publish(frame, a.fence.take());
-    Held::Published
-}
-
-/// Raw DMA-BUF passthrough: packed RGB for GPU CSC, or producer NV12/P010 without another
-/// convert. `true` = the frame ends here, published or dropped; `false` = take the CPU de-pad.
-/// A broken frame names its reason: a silent fall-through CPU-touches every frame on a session
-/// that negotiated zero-copy.
-fn try_passthrough(ud: &mut UserData, a: &mut Arrival) -> bool {
-    let (w, h) = (a.w, a.h);
-    let reason = 'passthrough: {
-        let datas = &*a.datas;
-        let Some(fmt) = ud.format else {
-            break 'passthrough PassthroughFallback::NoFormat;
-        };
-        if datas[0].type_() != pw::spa::buffer::DataType::DmaBuf {
-            break 'passthrough PassthroughFallback::NotDmabuf;
-        }
-        let Some(fourcc) = pf_frame::drm_fourcc(fmt) else {
-            break 'passthrough PassthroughFallback::NoFourcc;
-        };
-        let chunk = datas[0].chunk();
-        let offset = chunk.offset();
-        let stride = chunk.stride().max(0) as u32;
-        // Dropped, not downgraded: de-padding as linear would scramble chroma.
-        let Ok(plane1) = second_plane(fmt, datas) else {
-            return true;
-        };
-        // iHD reads a linear import at a pitch rounded to 64 bytes, so an odd pitch shears
-        // the picture. Mutter's RENDERING-only GBM buffers pad only for SCANOUT. The
-        // de-pad copy below uploads through a driver-allocated surface instead.
-        if ud.modifier == 0
-            && linear_pitch_rounds()
-            && (stride % 64 != 0 || plane1.is_some_and(|(_, s)| s % 64 != 0))
-        {
-            break 'passthrough PassthroughFallback::UnalignedPitch;
-        }
-        // Dup so the fd outlives SPA recycle; `publish_held` keeps the content stable.
-        // No hold (shallow pool or PUNKTFUNK_ZEROCOPY_HOLD=0) is a safe CPU fallback.
-        let Some(dup) = dup_data_fd(&datas[0]) else {
-            break 'passthrough PassthroughFallback::DupFailed;
-        };
-        match publish_held(ud, a, fmt, fourcc, dup, (offset, stride), plane1) {
-            Held::Published => {}
-            Held::Dropped => return true,
-            Held::NoHold => break 'passthrough PassthroughFallback::NoHold,
-        }
-        // Once per geometry, not once: a resize renegotiates the pool, and a stale
-        // stride against a new size is a sheared picture.
-        static LAST: std::sync::Mutex<(usize, usize, u32, u32)> =
-            std::sync::Mutex::new((0, 0, 0, 0));
-        let geometry = (w, h, offset, stride);
-        let changed = std::mem::replace(
-            &mut *LAST.lock().unwrap_or_else(|e| e.into_inner()),
-            geometry,
-        ) != geometry;
-        if changed {
-            tracing::info!(
-                w,
-                h,
-                offset,
-                stride,
-                // The held buffer's own fd: the consumer may already have closed the dup.
-                fd_size = data_fd(&a.datas[0]).map_or(0, |fd| pf_dmabuf::byte_len(fd).unwrap_or(0)),
-                modifier = ud.modifier,
-                fourcc = format_args!("{:#010x}", fourcc),
-                source = match fmt {
-                    PixelFormat::Nv12 => "producer-native NV12",
-                    PixelFormat::P010 => "producer-native P010",
-                    _ => "packed RGB (encoder GPU CSC)",
-                },
-                "zero-copy: handing the raw DMA-BUF to the encoder"
-            );
-        }
-        return true;
-    };
-    !handle_passthrough_fallback(ud, reason)
-}
-
-/// dmabuf + importer: hand the held buffer to the consumer, which imports at its own tick
-/// (`import_held`), so arrivals above the wire rate cost nothing here. A buffer that cannot be
-/// held is dropped while holds are possible at all (every hold is with the encoder) and
-/// imported here only when this pool can never hold. An in-process importer always imports
-/// here: its GL context is current on this thread. A producer NV12 rides only a hold, with
-/// its chroma plane: the importer reads packed RGB, so an unheld one feeds the raw latch,
-/// which withdraws the planar offer. A tiled 10-bit frame without the tiled raw lane
-/// rebuilds the capture: the de-tile blit is 8-bit and the CPU de-pad reads LINEAR only.
-/// `true` = the frame ends here; `false` = take the CPU de-pad.
-fn try_gpu_hold(ud: &mut UserData, a: &mut Arrival) -> bool {
-    if !ud.importer.present.load(Ordering::Relaxed) {
-        return false;
-    }
-    let Some(fmt) = ud.format else {
-        return false;
-    };
-    let hdr_tiled = fmt.is_rgb10() && ud.modifier != 0;
-    if hdr_tiled && !ud.hdr_tiled_raw {
-        if ud.shared.health.refuse(pf_zerocopy::Refusal::HdrTiled) {
-            tracing::warn!(
-                "10-bit frame arrived with a tiled modifier the producer was not offered — \
-                 capture rebuilds on LINEAR"
-            );
-        }
-        ud.shared.mark_broken();
-        return true;
-    }
-    let datas = &*a.datas;
-    if datas[0].type_() != pw::spa::buffer::DataType::DmaBuf {
-        return false;
-    }
-    let Some(fourcc) = pf_frame::drm_fourcc(fmt) else {
-        return true; // format has no DRM fourcc mapping — skip the frame
-    };
-    let plane = pf_zerocopy::DmabufPlane {
-        fd: datas[0].fd(),
-        offset: datas[0].chunk().offset(),
-        stride: datas[0].chunk().stride().max(0) as u32,
-    };
-    let Ok(plane1) = second_plane(fmt, datas) else {
-        return true;
-    };
-    // An in-process importer's GL context is current on this thread only.
-    let consumer_imports = !ud.importer.in_process.load(Ordering::Relaxed);
-    if let Some(dup) = consumer_imports.then(|| dup_data_fd(&datas[0])).flatten() {
-        let held = publish_held(
-            ud,
-            a,
-            fmt,
-            fourcc,
-            dup,
-            (plane.offset, plane.stride),
-            plane1,
-        );
-        if !matches!(held, Held::NoHold) {
-            return true;
-        }
-    }
-    if matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010) {
-        let health = &ud.shared.health;
-        if health.note_raw_import_failure(ud.modifier, "producer NV12 without a hold") {
-            ud.shared.mark_broken();
-        }
-        return true;
-    }
-    wait_here(a.fence.take());
-    let cell = ud.importer.slot.clone();
-    let mut guard = cell.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(importer) = guard.as_mut() else {
-        return false;
-    };
-    match gpu_import(
-        importer,
-        ud.import_policy,
-        &mut ud.import_state,
-        &ud.shared,
-        fmt,
-        a.w as u32,
-        a.h as u32,
-        plane,
-        ud.modifier,
-    ) {
-        ImportOutcome::Frame(devbuf, out_fmt) => {
-            let frame = CapturedFrame {
-                provenance: Default::default(),
-                width: a.w as u32,
-                height: a.h as u32,
-                pts_ns: a.pts_ns,
-                format: out_fmt,
-                payload: FramePayload::Cuda(devbuf),
-                cursor: ud.cursor.overlay(),
-            };
-            ud.publish(frame, None);
-            true
-        }
-        ImportOutcome::Dropped => true,
-        ImportOutcome::ImporterLost => {
-            *guard = None;
-            drop(guard);
-            ud.importer.present.store(false, Ordering::Relaxed);
-            false
-        }
-    }
-}
-
-/// The CPU lane: wait the render out, de-pad one packed plane out of the mapped buffer, blit
-/// the pointer unless the host places it, and publish.
-fn cpu_depad(ud: &mut UserData, a: Arrival) {
-    let Arrival {
-        datas,
-        w,
-        h,
-        pts_ns,
-        fence,
-        ..
-    } = a;
-    wait_here(fence);
-    let d = &mut datas[0];
-    // LINEAR dmabufs also land here (gamescope).
-    let data_type = d.type_();
-    // `mapoffset` is this spa_data's start in the fd — non-zero when one fd is pooled.
-    // PipeWire's MAP_BUFFERS slice already starts there; our self-mmap maps from 0, so
-    // add it (`region_off`). Skip it and we index the wrong buffer; `needed > avail` cannot
-    // catch that because `avail` is the whole-fd mapping.
-    let map_off = d.as_raw().mapoffset as usize;
-    let (size, chunk_off, stride) = {
-        let c = d.chunk();
-        (
-            c.size() as usize,
-            c.offset() as usize,
-            c.stride().max(0) as usize,
-        )
-    };
-    let Some(fmt) = ud.format else { return }; // unsupported/not negotiated
-                                               // This de-pad assumes one packed plane. `bytes_per_pixel` reports 4 for NV12, so a
-                                               // native NV12 buffer (`stride ≈ w`, two planes) always trips `stride < row` and blames
-                                               // the producer. The second plane is not in `datas[0]`; arriving here is a host bug
-                                               // (NV12 offer without the raw-dmabuf passthrough that consumes it).
-    if matches!(fmt, PixelFormat::Nv12 | PixelFormat::P010) {
-        warn_once(
-            "negotiated a producer-native planar format but this capture fell back to the CPU \
-             de-pad path, which handles single-plane packed formats only — frames dropped (the \
-             planar offer is only valid under the raw-dmabuf passthrough that imports it)",
-        );
-        return;
-    }
-    let bpp = fmt.bytes_per_pixel();
-    let Some((row, stride, needed, tight_len)) = packed_frame_geometry(w, h, bpp, stride) else {
-        warn_once("invalid or overflowing packed-frame geometry — frames dropped");
-        return;
-    };
-    // dmabuf chunks commonly report size 0; fall back to the computed span.
-    let size = if size == 0 { needed } else { size };
-    // mmap the fd ourselves at fstat length. xdg-desktop-portal-wlr MemFd reports
-    // `data.maxsize` past the mapped bytes — reading to maxsize segfaults. Also covers
-    // MAP_BUFFERS skipping Vulkan dmabufs. MemPtr (no fd) is same-process: trust `d.data()`.
-    let fd = data_fd(d).filter(|fd| fd.as_raw_fd() > 0);
-    let fd_len = fd
-        .and_then(|fd| pf_dmabuf::byte_len(fd).ok())
-        .and_then(|n| usize::try_from(n).ok())
-        .filter(|&n| n > 0);
-    // Prefer our fstat-sized mmap; else PipeWire's MAP_BUFFERS slice. `fd_len` is required:
-    // falling back to `offset + needed` maps a producer-invented length and can SIGBUS past
-    // the object. Without a real length, decline to self-map.
-    let mapping = fd
-        .zip(fd_len)
-        .and_then(|(fd, len)| ReadMap::new(fd, len, Share::Shared).ok());
-    let self_mapped = mapping.as_ref().map(ReadMap::bytes);
-    // Self-mmap starts at fd offset 0, so this spa_data begins at `mapoffset`; MAP_BUFFERS
-    // already begins there. Checked add — both halves are producer-controlled.
-    let (buf, region_off): (&[u8], usize) = if let Some(b) = self_mapped {
-        match map_off.checked_add(chunk_off) {
-            Some(off) => (b, off),
-            None => {
-                warn_once("mapoffset + chunk offset overflows — frames dropped");
-                return;
-            }
-        }
-    } else if let Some(data) = d.data() {
-        (data, chunk_off)
-    } else {
-        warn_once("buffer has no mappable data — frames dropped");
-        return;
-    };
-    // Need stride*(h-1)+row valid bytes within [region_off, region_off+size).
-    if region_off > buf.len() {
-        return;
-    }
-    let avail = buf.len() - region_off;
-    {
-        // First-frame geometry — a compositor/GPU layout mismatch is otherwise silent here.
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static ONCE: AtomicBool = AtomicBool::new(true);
-        if ONCE.swap(false, Ordering::Relaxed) {
-            tracing::info!(
-                stride, size, chunk_off, map_off, region_off, buf_len = buf.len(), needed,
-                data_type = ?data_type, fd_len = ?fd_len, self_mapped = self_mapped.is_some(),
-                "capture CPU de-pad geometry (first frame)"
-            );
-        }
-    }
-    if needed > avail || needed > size {
-        warn_once("buffer smaller than frame span — frames dropped");
-        return;
-    }
-    let region = &buf[region_off..region_off + size.min(avail)];
-    // Appended row by row, not zero-filled first: the fill is a full-frame memset.
-    let mut tight = Vec::with_capacity(tight_len);
-    for y in 0..h {
-        tight.extend_from_slice(&region[y * stride..y * stride + row]);
-    }
-    // Blit the latched pointer (no-op when hidden or not packed RGB) unless the host places it:
-    // a baked copy would double the forwarded or blended one. The producer's hardware cursor
-    // plane stays out of the captured buffer.
-    if !ud.cursor_slot.host_places.load(Ordering::Relaxed) {
-        composite_cursor(&mut tight, w, h, fmt, &ud.cursor);
-    }
-    let frame = CapturedFrame {
-        provenance: Default::default(),
-        width: w as u32,
-        height: h as u32,
-        pts_ns,
-        format: fmt,
-        payload: FramePayload::Cpu(tight),
-        // Already composited into `tight` — nothing for the encoder to blend.
-        cursor: None,
-    };
-    ud.publish(frame, None);
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        packed_frame_geometry, supported_data_plane_count, FenceWaitStats, FENCE_WAIT_BUCKETS_US,
-    };
+    use super::{supported_data_plane_count, FenceWaitStats, FENCE_WAIT_BUCKETS_US};
 
     #[test]
     fn only_supported_pipewire_plane_counts_become_slice_lengths() {
@@ -871,18 +568,6 @@ mod tests {
         assert_eq!(supported_data_plane_count(2), Some(2));
         assert_eq!(supported_data_plane_count(3), None);
         assert_eq!(supported_data_plane_count(u32::MAX), None);
-    }
-
-    #[test]
-    fn packed_frame_geometry_rejects_overflow_and_short_stride() {
-        assert_eq!(packed_frame_geometry(4, 3, 4, 0), Some((16, 16, 48, 48)));
-        assert_eq!(packed_frame_geometry(4, 3, 4, 15), None);
-        assert_eq!(packed_frame_geometry(1, 0, 4, 4), None);
-        assert_eq!(packed_frame_geometry(usize::MAX, 2, 4, 0), None);
-        assert_eq!(
-            packed_frame_geometry(usize::MAX / 2, 3, 1, usize::MAX / 2),
-            None
-        );
     }
 
     // A p99 one bucket low would call the wait free; one bucket high would justify moving

@@ -1,8 +1,10 @@
 //! The zero-copy negotiation, resolved once per pipeline, and the CUDA import both
 //! threads grade alike. Pure except [`gpu_import`].
 
+use crate::linux::delivery::import_once;
+pub(in crate::linux) use crate::linux::delivery::{ImportOutcome, PassthroughFallback};
 use crate::PixelFormat;
-use pf_zerocopy::{Evidence, ImportKind, Lane, Refusal};
+use pf_zerocopy::{ImportKind, Lane, Refusal};
 use std::sync::atomic::Ordering;
 
 /// Facts the zero-copy decision needs, sampled at one instant so the decision is a pure
@@ -58,14 +60,6 @@ impl ImportPolicy {
         }
         self
     }
-}
-
-/// [`gpu_import`]'s verdict. `ImporterLost` is a LINEAR failure: the caller retires the
-/// importer and the stream continues on the CPU path.
-pub(in crate::linux) enum ImportOutcome {
-    Frame(pf_zerocopy::DeviceBuffer, PixelFormat),
-    Dropped,
-    ImporterLost,
 }
 
 /// Zero-copy negotiation, resolved once and consumed by the PipeWire thread and `spawn_pipewire`.
@@ -253,87 +247,6 @@ pub(super) fn consumer_kind(
     }
 }
 
-/// Why a raw-dmabuf passthrough frame fell through to the CPU de-pad path.
-///
-/// Each variant is a different diagnosis. Without this, the `if` fell out silently and a
-/// zero-copy session could pay CPU on every frame while logging a healthy open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PassthroughFallback {
-    /// No format yet — transient around renegotiation.
-    NoFormat,
-    /// Producer delivered SHM/MemFd, not a dmabuf.
-    NotDmabuf,
-    /// Negotiated format has no DRM fourcc, so the encoder cannot describe it.
-    NoFourcc,
-    /// `F_DUPFD_CLOEXEC` failed (fd-limit, not graphics).
-    DupFailed,
-    /// A linear pitch off 64 bytes: iHD imports it at a rounded pitch and the picture shears.
-    UnalignedPitch,
-    /// This pool can never spare a deferred-requeue hold (depth ≤ reserve, or
-    /// `PUNKTFUNK_ZEROCOPY_HOLD=0`), so no raw frame is safe to publish. A transient shortage
-    /// on a pool that can hold never gets here: `.process` drops that arrival (`held_drops`).
-    NoHold,
-}
-
-impl PassthroughFallback {
-    fn bit(self) -> u8 {
-        match self {
-            PassthroughFallback::NoFormat => 1 << 0,
-            PassthroughFallback::NotDmabuf => 1 << 1,
-            PassthroughFallback::NoFourcc => 1 << 2,
-            PassthroughFallback::DupFailed => 1 << 3,
-            PassthroughFallback::UnalignedPitch => 1 << 4,
-            PassthroughFallback::NoHold => 1 << 5,
-        }
-    }
-
-    pub(super) fn as_str(self) -> &'static str {
-        match self {
-            PassthroughFallback::NoFormat => "no format negotiated yet",
-            PassthroughFallback::NotDmabuf => "the producer delivered an SHM/MemFd buffer",
-            PassthroughFallback::NoFourcc => "the negotiated format has no DRM fourcc",
-            PassthroughFallback::DupFailed => "F_DUPFD_CLOEXEC failed on the dmabuf fd",
-            PassthroughFallback::UnalignedPitch => {
-                "the dmabuf's pitch is not a multiple of 64 bytes"
-            }
-            PassthroughFallback::NoHold => {
-                "this producer pool can never spare a deferred-requeue hold"
-            }
-        }
-    }
-
-    /// `NoFormat` drops the frame (CPU path needs `ud.format` too); the rest downgrade to CPU.
-    pub(super) fn falls_back_to_cpu(self) -> bool {
-        !matches!(self, PassthroughFallback::NoFormat)
-    }
-
-    pub(super) fn hint(self) -> &'static str {
-        match self {
-            PassthroughFallback::NoFormat => {
-                "harmless if it stops: the first buffers can arrive before param_changed"
-            }
-            PassthroughFallback::NotDmabuf => {
-                "the compositor accepted the dmabuf offer and is serving memory anyway — check \
-                 PUNKTFUNK_FORCE_SHM and the compositor's allocator"
-            }
-            PassthroughFallback::NoFourcc => {
-                "a capture format the encoder path cannot describe — file it, the negotiation \
-                 should not have accepted it"
-            }
-            PassthroughFallback::DupFailed => "out of file descriptors — raise the host's NOFILE",
-            PassthroughFallback::UnalignedPitch => {
-                "the compositor pads linear buffers only for scanout, and iHD reads an odd pitch \
-                 rounded — this width streams through the CPU copy instead of the raw import"
-            }
-            PassthroughFallback::NoHold => {
-                "the pool is at or below the reserve, or PUNKTFUNK_ZEROCOPY_HOLD=0 — every frame \
-                 takes the CPU copy rather than letting the producer rewrite a DMA-BUF the \
-                 encoder still reads"
-            }
-        }
-    }
-}
-
 /// Per-session tally of raw-passthrough fall-throughs, one log line per distinct reason.
 ///
 /// `.process` runs per frame; per-reason so a transient `NoFormat` at open does not spend
@@ -413,8 +326,9 @@ fn import_kind(
     }
 }
 
-/// One dmabuf → CUDA import: tiled through EGL, LINEAR through the Vulkan bridge, NV12 or
-/// YUV444 where the policy asks. [`import_failure`] grades a failure, so both threads act alike.
+/// The PipeWire stream's dmabuf → CUDA import: tiled through EGL, LINEAR through the Vulkan
+/// bridge, NV12 or YUV444 where the policy asks, each attempt through [`import_once`].
+/// [`import_failure`] grades a failure, so the arrival and the consumer act alike.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::linux) fn gpu_import(
     importer: &mut pf_zerocopy::Importer,
@@ -448,19 +362,18 @@ pub(in crate::linux) fn gpu_import(
         ten_bit,
         state.linear_nv12_failed,
     );
-    let mut imported = importer.import(kind, &plane, w, h, fourcc, modifier);
+    let mut imported = import_once(importer, kind, &plane, w, h, fourcc, modifier, shared);
     if let (ImportKind::LinearNv12, Err(e)) = (kind, &imported) {
         state.linear_nv12_failed = true;
         tracing::warn!(error = %format!("{e:#}"),
             "LINEAR NV12 compute CSC failed — RGB for the rest of this \
              stream (NVENC does the CSC internally)");
         kind = ImportKind::Linear;
-        imported = importer.import(kind, &plane, w, h, fourcc, modifier);
+        imported = import_once(importer, kind, &plane, w, h, fourcc, modifier, shared);
     }
     match imported {
         Ok(devbuf) => {
             state.fail_streak = 0;
-            shared.health.note(&[Evidence::Imported(Lane::Gpu)]);
             static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
             if ONCE.swap(false, Ordering::Relaxed) {
                 tracing::info!(
